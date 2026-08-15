@@ -16,6 +16,8 @@ use tokio::net::TcpStream;
 
 use aloo::crypto::KeyPair;
 use aloo::idstore::IdStore;
+use aloo::p2p::{P2pEvent, PeerLinkManager};
+use aloo::p2p_proto::PunchDatagram;
 use aloo::proto::{Envelope, ServerMessage, UserId};
 use aloo::rekey::{RemoteKeys, ResumeVerification};
 use aloo::server::{Outgoing, Registry};
@@ -72,6 +74,12 @@ pub fn keypair_for(who: &str) -> KeyPair {
 pub struct ClientState {
     pub stream: Option<TcpStream>,
     pub received: Vec<ServerMessage>,
+    /// This client's direct peer-to-peer transport (`aloo::p2p`), bound
+    /// lazily the first time a scenario needs it (`server::ensure_peer_link`)
+    /// - message/voice content now travels here, never through `stream`.
+    pub peer_link: Option<PeerLinkManager>,
+    pub p2p_raw_rx: Option<tokio::sync::mpsc::UnboundedReceiver<(SocketAddr, PunchDatagram)>>,
+    pub p2p_events_rx: Option<tokio::sync::mpsc::UnboundedReceiver<P2pEvent>>,
 }
 
 #[derive(World, Default)]

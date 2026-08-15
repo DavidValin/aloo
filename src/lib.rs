@@ -8,6 +8,9 @@ pub mod global_ptt;
 pub mod idstore;
 pub mod netstats;
 pub mod own_next_keys;
+pub mod p2p;
+pub mod p2p_proto;
+pub mod p2p_reliable;
 pub mod platform;
 pub mod proto;
 pub mod rekey;
@@ -15,6 +18,8 @@ pub mod session;
 pub mod settings;
 pub mod sysstats;
 pub mod voice;
+#[cfg(target_env = "musl")]
+mod voice_pulse;
 pub mod voice_stream;
 pub mod server;
 pub mod ui;

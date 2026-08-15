@@ -1,6 +1,7 @@
 use aloo::file_transfer::{
     default_download_dir, safe_filename, truncate_filename, FileOfferPayload, FILE_CHUNK_BYTES, MAX_FILENAME_CHARS,
 };
+use aloo::p2p_proto::SAFE_DATAGRAM_BYTES;
 use aloo::proto;
 
 /// @requirement TB-123
@@ -71,16 +72,23 @@ fn truncate_filename_counts_unicode_scalar_values_not_bytes() {
     assert!(cropped.is_char_boundary(cropped.len()));
 }
 
-/// @requirement TB-125
+/// @requirement TB-125, TB-148
 #[test]
-fn file_chunk_bytes_is_well_under_the_frame_limit() {
+fn file_chunk_bytes_stays_under_the_p2p_safe_datagram_budget() {
     // Worst-case RSA-OAEP expansion (2048-bit key, docs/PROTOCOL.md §8.1)
-    // is ~256/190 per chunk; a single-recipient `FileChunk` frame must stay
-    // comfortably under `proto::MAX_FRAME_LEN`.
+    // is ~256/190 per chunk. A `FileChunk` now travels as one direct
+    // peer-to-peer UDP datagram (`docs/PROTOCOL.md` §7.0/§7.6), not a
+    // TCP-relayed frame, so the constraint that actually matters is
+    // `p2p_proto::SAFE_DATAGRAM_BYTES`, not the old `proto::MAX_FRAME_LEN`
+    // (which a 64 KiB chunk would clear trivially without saying anything
+    // about UDP safety). Leaves a 300-byte margin for the
+    // `PunchDatagram::Reliable`/`P2pPayload::FileChunk` framing overhead
+    // around the raw ciphertext bytes.
     let worst_case_ciphertext = (FILE_CHUNK_BYTES as f64) * (256.0 / 190.0);
+    let framing_overhead = 300.0;
     assert!(
-        worst_case_ciphertext < proto::MAX_FRAME_LEN as f64,
-        "worst-case {worst_case_ciphertext} must stay under MAX_FRAME_LEN {}",
-        proto::MAX_FRAME_LEN
+        worst_case_ciphertext + framing_overhead < SAFE_DATAGRAM_BYTES as f64,
+        "worst-case {worst_case_ciphertext} + {framing_overhead} framing overhead must stay under SAFE_DATAGRAM_BYTES {}",
+        SAFE_DATAGRAM_BYTES
     );
 }

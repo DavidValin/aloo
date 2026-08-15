@@ -8,15 +8,26 @@
 //!
 //! The pure PCM<->bytes conversion, resampling, and duration formatting
 //! below are unit tested directly. `Recorder`/`Mixer` talk to a real audio
-//! device via `cpal` and are exercised manually (there's no
-//! microphone/speaker in a CI sandbox), not by the automated test suite.
+//! device and are exercised manually (there's no microphone/speaker in a CI
+//! sandbox), not by the automated test suite.
+//!
+//! Two backends provide `Recorder`/`spawn_mixer`, chosen by `target_env`:
+//! everywhere except musl, both are implemented here on top of `cpal`'s
+//! ALSA host. On musl they're re-exported from `crate::voice_pulse`
+//! instead, which talks to PulseAudio/PipeWire directly - see that module's
+//! doc comment for why. Both backends share the platform-independent
+//! mixing logic below (`MixSource`, `mix_output`, `apply_mixer_cmd`) so the
+//! jitter-buffer/multi-source-summing behavior is identical either way.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+#[cfg(not(target_env = "musl"))]
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+#[cfg(not(target_env = "musl"))]
 use cpal::{SampleFormat, StreamConfig};
+#[cfg(not(target_env = "musl"))]
 use tokio::sync::mpsc::UnboundedSender;
 
 /// Mono capture/playback rate. Low enough to keep RSA-chunked voice
@@ -29,8 +40,17 @@ pub const SAMPLE_RATE_HZ: u32 = 16_000;
 /// same regardless of this value (it's purely bytes-of-audio /
 /// bytes-per-block); a shorter interval only lowers perceived latency at
 /// the cost of more (smaller) messages, so this is tuned for latency, not
-/// crypto cost.
-pub const CHUNK_INTERVAL: Duration = Duration::from_millis(100);
+/// crypto cost - *and*, since chunks now travel the direct peer-to-peer
+/// transport (`docs/PROTOCOL.md` §7.0) as raw UDP datagrams rather than
+/// TCP-framed bytes, for keeping each chunk's encrypted size under
+/// `p2p_proto::SAFE_DATAGRAM_BYTES` too, with a comfortable margin left for
+/// framing overhead rather than cutting it close. 15ms (in the same
+/// real-time-audio framing range RTP/Opus/G.711 conventionally use) is
+/// `SAMPLE_RATE_HZ`'s 32 bytes/ms × 15ms = 480 bytes plaintext, at most 3
+/// OAEP blocks (256 bytes each) at the worst-case 2048-bit key size - 768
+/// bytes ciphertext (see `test/voice_test.rs`'s
+/// `chunk_interval_stays_under_the_p2p_safe_datagram_budget`).
+pub const CHUNK_INTERVAL: Duration = Duration::from_millis(15);
 
 /// Hard cap on one voice message's length, in seconds - a recording stops
 /// itself automatically on reaching it
@@ -82,6 +102,12 @@ pub enum VoiceError {
 /// doesn't exist (non-Linux, or Linux without PulseAudio/PipeWire's pulse
 /// shim): the search just finds nothing and this falls through to
 /// `default`.
+///
+/// musl doesn't use this at all (see `crate::voice_pulse`): it talks to the
+/// same PulseAudio/PipeWire server this is trying to reach via ALSA's
+/// dlopen'd plugin, just directly, so the plugin-preference dance is
+/// unnecessary there.
+#[cfg(not(target_env = "musl"))]
 fn prefer_pulse(devices: impl Iterator<Item = cpal::Device>, default: Option<cpal::Device>) -> Option<cpal::Device> {
     let mut devices: Vec<cpal::Device> = devices.collect();
     let pulse_pos = devices
@@ -93,11 +119,13 @@ fn prefer_pulse(devices: impl Iterator<Item = cpal::Device>, default: Option<cpa
     }
 }
 
+#[cfg(not(target_env = "musl"))]
 fn preferred_input_device(host: &cpal::Host) -> Option<cpal::Device> {
     let devices = host.input_devices().ok().into_iter().flatten();
     prefer_pulse(devices, host.default_input_device())
 }
 
+#[cfg(not(target_env = "musl"))]
 fn preferred_output_device(host: &cpal::Host) -> Option<cpal::Device> {
     let devices = host.output_devices().ok().into_iter().flatten();
     prefer_pulse(devices, host.default_output_device())
@@ -281,6 +309,11 @@ pub fn format_duration_label(duration_ms: u32) -> String {
 /// periodically by the caller's record-stream worker to flush chunks to
 /// the network, and the `Recorder` is simply dropped (closing the input
 /// stream) once recording stops.
+///
+/// musl gets a different `Recorder` entirely - see `crate::voice_pulse`,
+/// re-exported below as this same name so callers never need to know
+/// which backend is active.
+#[cfg(not(target_env = "musl"))]
 pub struct Recorder {
     // Never read again after `start` - held only so its `Drop` stops
     // capture when the `Recorder` itself is dropped.
@@ -290,6 +323,7 @@ pub struct Recorder {
     sample_rate: u32,
 }
 
+#[cfg(not(target_env = "musl"))]
 impl Recorder {
     /// `on_stream_error` reports errors raised asynchronously by the audio
     /// callback (e.g. a buffer under/overrun, or the device disappearing
@@ -372,8 +406,8 @@ impl Recorder {
 /// audible gap. A source that's already `finished` (a whole clip, or a
 /// live stream that already ended) skips this wait entirely - there's no
 /// more audio coming to wait for.
-const JITTER_PREBUFFER_MS: u64 = 150;
-const JITTER_MAX_WAIT_MS: u64 = 300;
+pub(crate) const JITTER_PREBUFFER_MS: u64 = 150;
+pub(crate) const JITTER_MAX_WAIT_MS: u64 = 300;
 
 pub enum MixerCmd {
     /// `samples` are mono PCM16 at `SAMPLE_RATE_HZ`; the mixer resamples
@@ -388,7 +422,7 @@ pub enum MixerCmd {
     Stop { id: u64 },
 }
 
-struct MixSource {
+pub(crate) struct MixSource {
     queue: VecDeque<i16>,
     finished: bool,
     started: bool,
@@ -396,8 +430,54 @@ struct MixSource {
 }
 
 impl MixSource {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self { queue: VecDeque::new(), finished: false, started: false, first_seen: Instant::now() }
+    }
+
+    /// A `Finish` with no prior `Push` (an empty clip, or a stream that
+    /// ended before its first chunk) - already-finished and empty, so
+    /// `mix_output` drops it on the next tick.
+    pub(crate) fn new_finished() -> Self {
+        Self { finished: true, ..Self::new() }
+    }
+
+    pub(crate) fn extend(&mut self, samples: &[i16]) {
+        self.queue.extend(samples);
+    }
+
+    pub(crate) fn mark_finished(&mut self) {
+        self.finished = true;
+    }
+}
+
+/// Applies one `MixerCmd` to the shared source map - the command-handling
+/// logic both the cpal and PulseAudio mixer backends share verbatim, so
+/// their jitter-buffer/multi-source bookkeeping can never drift apart.
+/// `out_rate` is the backend's actual output rate (device-negotiated for
+/// cpal, always `SAMPLE_RATE_HZ` for `voice_pulse` since that backend asks
+/// PulseAudio for `SAMPLE_RATE_HZ` directly), used to resample `Push`ed
+/// audio once here rather than in every caller.
+pub(crate) fn apply_mixer_cmd(sources: &Mutex<HashMap<u64, MixSource>>, out_rate: u32, cmd: MixerCmd) {
+    match cmd {
+        MixerCmd::Push { id, samples } => {
+            let resampled = resample(&samples, SAMPLE_RATE_HZ, out_rate);
+            sources.lock().unwrap().entry(id).or_insert_with(MixSource::new).extend(&resampled);
+        }
+        MixerCmd::Finish { id } => {
+            let mut map = sources.lock().unwrap();
+            match map.get_mut(&id) {
+                Some(src) => src.mark_finished(),
+                None => {
+                    map.insert(id, MixSource::new_finished());
+                }
+            }
+        }
+        MixerCmd::Stop { id } => {
+            // Dropped outright, not just marked finished - a
+            // finished-but-not-yet-drained source would still play out its
+            // queued tail; Stop means silence right away.
+            sources.lock().unwrap().remove(&id);
+        }
     }
 }
 
@@ -410,6 +490,10 @@ impl MixSource {
 /// this one mixer, so multiple simultaneous sources (e.g. two people
 /// using push-to-talk near-simultaneously) actually mix together instead
 /// of queuing behind one another.
+///
+/// musl gets a different `spawn_mixer` entirely - see `crate::voice_pulse`,
+/// re-exported below as this same name.
+#[cfg(not(target_env = "musl"))]
 pub fn spawn_mixer(
     on_stream_error: impl Fn(String) + Send + Clone + 'static,
     on_finished: impl Fn(u64) + Send + Clone + 'static,
@@ -444,36 +528,13 @@ pub fn spawn_mixer(
                 continue;
             }
             let out_rate = out_rate.expect("set just above when open succeeds");
-            match cmd {
-                MixerCmd::Push { id, samples } => {
-                    let resampled = resample(&samples, SAMPLE_RATE_HZ, out_rate);
-                    sources.lock().unwrap().entry(id).or_insert_with(MixSource::new).queue.extend(resampled);
-                }
-                MixerCmd::Finish { id } => {
-                    let mut map = sources.lock().unwrap();
-                    match map.get_mut(&id) {
-                        Some(src) => src.finished = true,
-                        // Finish with no prior Push (an empty clip, or a
-                        // stream that ended before its first chunk) -
-                        // insert an already-finished, empty placeholder;
-                        // `mix_output` drops it on the next callback tick.
-                        None => {
-                            map.insert(id, MixSource { finished: true, ..MixSource::new() });
-                        }
-                    }
-                }
-                MixerCmd::Stop { id } => {
-                    // Dropped outright, not just marked finished - a
-                    // finished-but-not-yet-drained source would still play
-                    // out its queued tail; Stop means silence right away.
-                    sources.lock().unwrap().remove(&id);
-                }
-            }
+            apply_mixer_cmd(&sources, out_rate, cmd);
         }
     });
     tx
 }
 
+#[cfg(not(target_env = "musl"))]
 fn try_open_mixer_stream(
     sources: Arc<Mutex<HashMap<u64, MixSource>>>,
     on_stream_error: impl Fn(String) + Send + 'static,
@@ -528,9 +589,11 @@ fn try_open_mixer_stream(
 /// to avoid wraparound distortion when multiple sources overlap loudly,
 /// and duplicates the mixed mono sample across every output channel -
 /// output devices are very often stereo-or-more even though sources are
-/// always mono. Runs on cpal's realtime callback thread, so it only pops
-/// pre-resampled samples and sums - no allocation, no resampling here.
-fn mix_output<T: Copy>(
+/// always mono. Runs on the realtime output callback/thread (cpal's own
+/// callback thread, or `voice_pulse`'s dedicated writer thread), so it
+/// only pops pre-resampled samples and sums - no allocation, no
+/// resampling here.
+pub(crate) fn mix_output<T: Copy>(
     data: &mut [T],
     out_channels: u16,
     out_rate: u32,
@@ -571,3 +634,6 @@ fn mix_output<T: Copy>(
         }
     }
 }
+
+#[cfg(target_env = "musl")]
+pub use crate::voice_pulse::{Recorder, spawn_mixer};

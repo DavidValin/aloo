@@ -352,7 +352,7 @@ so_that = "we can hold a conversation"
 [[user_story.acceptance_criteria]]
 id = "AC-024"
 description = "A channel message reaches every addressed member unchanged, and no one else."
-evidence = "docs/PROTOCOL.md 7.1; tests end_to_end_two_clients_join_and_exchange_channel_message, channel_message_is_delivered_only_to_addressed_channel_members"
+evidence = "docs/PROTOCOL.md 7.1; delivered over the direct peer-to-peer link (US-024) rather than server relay - tests direct_link_handshake_and_reliable_message_end_to_end, message_delivery.feature 'A channel message reaches the member it was addressed to, unchanged'"
 
 [[user_story.acceptance_criteria]]
 id = "AC-025"
@@ -368,16 +368,6 @@ evidence = "tests enter_before_channel_is_joined_does_not_send_and_keeps_the_typ
 id = "TB-028"
 description = "The sender addresses every other current member individually and excludes itself from the recipient list."
 evidence = "docs/PROTOCOL.md 7.1, 8; test typing_and_enter_sends_channel_text_excluding_self"
-
-[[user_story.technical_behavior]]
-id = "TB-029"
-description = "An addressed recipient who is not a member of the channel is silently dropped rather than erroring."
-evidence = "docs/PROTOCOL.md 7.1; test channel_message_is_delivered_only_to_addressed_channel_members"
-
-[[user_story.technical_behavior]]
-id = "TB-030"
-description = "A channel message from a non-member, or naming a channel that does not exist, is rejected with an error to the sender only."
-evidence = "docs/PROTOCOL.md 7.1, 7.4; tests channel_message_from_non_member_is_rejected, channel_message_to_unknown_channel_is_rejected"
 
 [[user_story.technical_behavior]]
 id = "TB-031"
@@ -397,7 +387,7 @@ so_that = "we can talk without the rest of the channel"
 [[user_story.acceptance_criteria]]
 id = "AC-027"
 description = "A direct message reaches its recipient unchanged."
-evidence = "docs/PROTOCOL.md 7.2; tests end_to_end_direct_message_between_two_clients, direct_message_is_delivered_to_recipient"
+evidence = "docs/PROTOCOL.md 7.2; delivered over the direct peer-to-peer link (US-024) rather than server relay - test direct_link_handshake_and_reliable_message_end_to_end, private_delivery.feature 'A private message reaches its recipient unchanged'"
 
 [[user_story.acceptance_criteria]]
 id = "AC-028"
@@ -418,11 +408,6 @@ evidence = "docs/SPEC.md Functionality #3; tests sidebar_shows_no_envelope_for_a
 id = "AC-031"
 description = "A private room cannot be opened with yourself."
 evidence = "test cannot_open_dm_with_yourself"
-
-[[user_story.technical_behavior]]
-id = "TB-032"
-description = "A direct message to a UserId that is not currently connected is rejected with an error."
-evidence = "docs/PROTOCOL.md 7.2; test direct_message_to_unknown_recipient_is_rejected"
 
 [[user_story.technical_behavior]]
 id = "TB-033"
@@ -492,22 +477,12 @@ evidence = "docs/SPEC.md Functionality #4 'Failure handling'; tests render_shows
 [[user_story.acceptance_criteria]]
 id = "AC-039"
 description = "Voice chunks reach the recipient in the order they were sent, framed by a start and an end."
-evidence = "docs/PROTOCOL.md 7.3; test end_to_end_channel_voice_stream_arrives_in_order"
+evidence = "docs/PROTOCOL.md 7.3; delivered over the direct peer-to-peer link (US-024), unreliable/unordered by design (accepted RTP-style tradeoff) - voice_delivery.feature 'Voice arrives as an ordered start, chunk and end' (loopback, so ordering holds in practice)"
 
 [[user_story.technical_behavior]]
 id = "TB-037"
-description = "A stream is Start then Chunks then End sharing one stream_id; channel Start/End are broadcast to current members excluding the sender, and the direct variants go to the one recipient."
-evidence = "docs/PROTOCOL.md 7.3; tests channel_stream_start_broadcasts_to_members_excluding_sender, channel_stream_end_broadcasts_to_members_excluding_sender, direct_stream_start_chunk_end_delivered_to_recipient"
-
-[[user_story.technical_behavior]]
-id = "TB-038"
-description = "A channel chunk is delivered only to the members the sender addressed; a non-member in that list is silently dropped."
-evidence = "docs/PROTOCOL.md 7.3; test channel_stream_chunk_delivered_only_to_addressed_members"
-
-[[user_story.technical_behavior]]
-id = "TB-039"
-description = "A stream message from a non-member, naming an unknown channel, or addressed to an unknown recipient is rejected."
-evidence = "docs/PROTOCOL.md 7.3; tests channel_stream_start_from_non_member_is_rejected, channel_stream_start_to_unknown_channel_is_rejected, channel_stream_chunk_from_non_member_is_rejected, channel_stream_chunk_to_unknown_channel_is_rejected, direct_stream_start_to_unknown_recipient_is_rejected"
+description = "A stream is Start then Chunks then End sharing one stream_id; Start/End are sent reliably over the direct peer-to-peer link (US-024) to every ready recipient (fanned out client-side for a channel, single recipient for a DM), while chunks themselves are sent unreliably."
+evidence = "docs/PROTOCOL.md 7.3; voice_delivery.feature 'Voice arrives as an ordered start, chunk and end'"
 
 [[user_story.technical_behavior]]
 id = "TB-040"
@@ -1222,12 +1197,12 @@ evidence = "docs/SPEC.md Functionality #10; tests selecting_a_file_in_the_browse
 [[user_story.acceptance_criteria]]
 id = "AC-075"
 description = "Confirming Send file stats (never reads) the file and sends one FileOffer per ready recipient - a channel send is N independent point-to-point offers, one per member, each its own stream_id - encrypted the same per-recipient way a text message is; nothing is read from disk until that recipient individually accepts."
-evidence = "docs/PROTOCOL.md's file transfer section; tests sending_a_file_to_a_channel_produces_sendfilechannel_with_path_and_size, sending_a_file_to_a_dm_peer_produces_sendfiledirect_with_path_and_size, file_offer_relays_point_to_point_carrying_channel_through, file_offer_to_an_unknown_recipient_is_rejected"
+evidence = "docs/PROTOCOL.md's file transfer section; tests sending_a_file_to_a_channel_produces_sendfilechannel_with_path_and_size, sending_a_file_to_a_dm_peer_produces_sendfiledirect_with_path_and_size; the offer itself now travels the direct peer-to-peer link (US-024, TB-141) rather than a server relay"
 
 [[user_story.acceptance_criteria]]
 id = "AC-076"
 description = "Once accepted, a file streams to ~/.aloo/downloads chunk by chunk (never held whole in memory on either side) with a live progress bar on both the sender's and receiver's log row; once every byte has moved it renders as a plain paperclip and the filename."
-evidence = "docs/SPEC.md Functionality #10; tests accepting_a_channel_offer_creates_an_in_progress_row, a_progress_update_advances_the_bar_and_completion_finalizes_it, file_chunk_and_end_relay_point_to_point"
+evidence = "docs/SPEC.md Functionality #10; tests accepting_a_channel_offer_creates_an_in_progress_row, a_progress_update_advances_the_bar_and_completion_finalizes_it; chunk streaming itself now travels the direct peer-to-peer link (US-024, TB-141) rather than a server relay"
 
 [[user_story.acceptance_criteria]]
 id = "AC-077"
@@ -1247,7 +1222,7 @@ evidence = "docs/SPEC.md Functionality #10; tests an_incoming_offer_opens_a_popu
 [[user_story.acceptance_criteria]]
 id = "AC-096"
 description = "Rejecting an offer shows as rejected in the sender's log row rather than the transfer silently vanishing; a channel send's rows are independent per recipient, each naming who it's addressed to, so one recipient rejecting doesn't affect another's row."
-evidence = "docs/SPEC.md Functionality #10; tests toggling_focus_then_enter_rejects, rejection_and_failure_are_reflected_on_the_matching_row, a_channel_file_send_logs_one_row_per_recipient_naming_them, file_accept_and_reject_relay_to_the_original_sender"
+evidence = "docs/SPEC.md Functionality #10; tests toggling_focus_then_enter_rejects, rejection_and_failure_are_reflected_on_the_matching_row, a_channel_file_send_logs_one_row_per_recipient_naming_them; the accept/reject notice itself now travels the direct peer-to-peer link (US-024, TB-141) rather than a server relay"
 
 [[user_story.acceptance_criteria]]
 id = "AC-097"
@@ -1266,8 +1241,8 @@ evidence = "src/file_transfer.rs safe_filename, default_download_dir; tests safe
 
 [[user_story.technical_behavior]]
 id = "TB-125"
-description = "FILE_CHUNK_BYTES is a single named constant, sized so one recipient's FileChunk frame stays comfortably under MAX_FRAME_LEN even at 2048-bit RSA-OAEP's worst-case ciphertext expansion - unlike the old MAX_FILE_BYTES, this bounds one chunk, not the whole file, since total file size is no longer capped (AC-077)."
-evidence = "src/file_transfer.rs FILE_CHUNK_BYTES; test file_chunk_bytes_is_well_under_the_frame_limit"
+description = "FILE_CHUNK_BYTES is a single named constant, sized so one recipient's FileChunk stays comfortably under the direct peer-to-peer transport's safe UDP datagram budget (SAFE_DATAGRAM_BYTES, TB-148) even at 2048-bit RSA-OAEP's worst-case ciphertext expansion - unlike the old MAX_FILE_BYTES, this bounds one chunk, not the whole file, since total file size is no longer capped (AC-077)."
+evidence = "src/file_transfer.rs FILE_CHUNK_BYTES; test file_chunk_bytes_stays_under_the_p2p_safe_datagram_budget"
 
 [[user_story.technical_behavior]]
 id = "TB-140"
@@ -1276,8 +1251,8 @@ evidence = "src/file_transfer.rs truncate_filename, MAX_FILENAME_CHARS; tests tr
 
 [[user_story.technical_behavior]]
 id = "TB-141"
-description = "Every message in the file-transfer family (FileOffer/FileAccept/FileReject/FileChunk/FileEnd) is addressed point-to-point (to/from), exactly like the existing StreamDirect* family, and relayed by the server with only an existence check on the recipient - never a channel-membership check, even when the transfer originated from a channel send."
-evidence = "src/server.rs Registry::route_file_offer/route_file_accept/route_file_reject/route_file_chunk/route_file_end; src/proto.rs ClientMessage/ServerMessage File* variants; tests file_transfer_message_family_roundtrips, file_offer_relays_point_to_point_carrying_channel_through, file_offer_to_an_unknown_recipient_is_rejected, file_accept_and_reject_relay_to_the_original_sender, file_chunk_and_end_relay_point_to_point"
+description = "Every message in the file-transfer family (FileOffer/FileAccept/FileReject/FileChunk/FileEnd) is addressed point-to-point, exactly like the existing StreamStart/StreamEnd family, and travels over the direct peer-to-peer link (US-024) - the server is never involved, not even for an existence check, since a link can only exist to a peer the sender already knows about."
+evidence = "src/p2p_proto.rs P2pPayload File* variants; test file_transfer_message_family_roundtrips"
 
 # ============================================================================
 # US-020 - Communicate with post-quantum hybrid encryption
@@ -1458,3 +1433,48 @@ evidence = "src/settings.rs; tests round_trips_password_auth_through_save_and_lo
 id = "TB-139"
 description = "run_server resolves each of bind/port/auth CLI-flag-first, falling back to whatever Settings::load_or_create returned for that field, then re-saves the merged result before binding - so a flag actually passed this run becomes what the next flag-less run inherits, and passing only one flag leaves the other persisted fields untouched."
 evidence = "src/main.rs run_server; tests an_explicit_flag_overrides_and_persists_over_a_previous_value, server_bind_and_port_flags_are_parsed_into_the_listen_address"
+
+# ============================================================================
+# US-024 - Direct peer-to-peer transport
+# ============================================================================
+[[user_story]]
+id = "US-024"
+title = "Direct peer-to-peer transport"
+as_a = "connected user"
+i_want = "my messages, voice, and files to travel directly to the people I'm talking with"
+so_that = "the server only ever coordinates who's talking to whom, and never carries or could inspect my content"
+
+[[user_story.acceptance_criteria]]
+id = "AC-100"
+description = "When a client first addresses another one (a channel/DM send, a call, a file offer), the server relays only a proposal of candidate addresses between them (never message content); both clients then punch a direct UDP link to each other, and once it's active, every channel/DM message, voice chunk, and file chunk for that pair travels only over that link - never through the server, not even as ciphertext."
+evidence = "docs/PROTOCOL.md's 'Direct peer-to-peer transport' section; src/server.rs Registry::route_peer_link_request; src/p2p.rs PeerLinkManager; tests peer_link_request_relays_candidates_to_the_named_peer, direct_link_handshake_and_reliable_message_end_to_end; message_delivery.feature/private_delivery.feature/voice_delivery.feature (content now delivered end to end over this link)"
+
+[[user_story.acceptance_criteria]]
+id = "AC-101"
+description = "If a direct UDP link can't be punched open within the punch timeout (e.g. a symmetric NAT or a peer that never answers), whatever was pending against that peer fails visibly to the user - there is no relay-through-the-server fallback to silently paper over it."
+evidence = "docs/PROTOCOL.md's 'Direct peer-to-peer transport' section; src/p2p.rs PeerLinkManager::tick_at, src/ui/ui.rs UiState::p2p_link_failed; test punch_timeout_fails_the_link_and_emits_link_failed"
+
+[[user_story.technical_behavior]]
+id = "TB-143"
+description = "RequestPeerLink/PeerCandidates is an existence-check-only relay exactly like RotateKey's recipient check - the server neither validates nor stores the candidate addresses or link_nonce it relays."
+evidence = "src/server.rs Registry::route_peer_link_request; tests peer_link_request_relays_candidates_to_the_named_peer, peer_link_request_to_an_unknown_recipient_is_rejected, request_peer_link_and_peer_candidates_roundtrip"
+
+[[user_story.technical_behavior]]
+id = "TB-144"
+description = "The reliable-delivery layer's receiver (ArqReceiver) delivers frames in order regardless of arrival order, drops duplicates without redelivering, and fails the link (rather than growing unbounded) once its reorder buffer is exceeded by a persistently out-of-order sender."
+evidence = "src/p2p_reliable.rs ArqReceiver; tests in_order_frames_deliver_immediately, out_of_order_frames_are_buffered_then_delivered_once_the_gap_fills, duplicate_frames_are_dropped_without_redelivering, reorder_buffer_bound_fails_the_link_rather_than_growing_unbounded"
+
+[[user_story.technical_behavior]]
+id = "TB-145"
+description = "The reliable-delivery layer's sender (ArqSender) retransmits an unacked frame only after its backoff elapses, never retransmits an acked one, and gives up (failing the whole send) once a frame exceeds MAX_RETRIES - there is no relay fallback to fall back on instead."
+evidence = "src/p2p_reliable.rs ArqSender; tests unacked_frame_is_not_retransmitted_before_its_backoff_elapses, acked_frame_is_never_retransmitted, unacked_frame_is_retransmitted_after_its_backoff_elapses, frame_exceeding_max_retries_fails_the_sender"
+
+[[user_story.technical_behavior]]
+id = "TB-146"
+description = "PeerLinkManager completes the full RequestPeerLink -> PeerCandidates -> Ping/Pong -> Active handshake over real (loopback) UDP sockets, delivers a reliable P2pPayload end to end once Active, and fails a link with a P2pEvent::LinkFailed once PUNCH_TIMEOUT elapses with nothing having answered."
+evidence = "src/p2p.rs PeerLinkManager; tests direct_link_handshake_and_reliable_message_end_to_end, punch_timeout_fails_the_link_and_emits_link_failed (loopback only - see docs/TESTING.md known coverage gaps for real cross-NAT verification)"
+
+[[user_story.technical_behavior]]
+id = "TB-148"
+description = "For every RSA-family (Rsa/Password/None/PerMessage) recipient, a single voice chunk (CHUNK_INTERVAL-sized) or file chunk (FILE_CHUNK_BYTES-sized), once worst-case RSA-OAEP encrypted and wrapped for the direct peer-to-peer transport, stays comfortably under p2p_proto::SAFE_DATAGRAM_BYTES - a conservative UDP payload ceiling chosen to avoid IP fragmentation, which many NATs/firewalls simply drop on any lost fragment. pq_hybrid is an explicit, documented exception: its per-chunk key-setup overhead is fixed and large regardless of chunk size (docs/PROTOCOL.md §13.3), so no chunk-size choice can bring it under this budget - see docs/TESTING.md's known coverage gaps."
+evidence = "src/p2p_proto.rs SAFE_DATAGRAM_BYTES; src/file_transfer.rs FILE_CHUNK_BYTES; src/voice.rs CHUNK_INTERVAL; tests file_chunk_bytes_stays_under_the_p2p_safe_datagram_budget, chunk_interval_stays_under_the_p2p_safe_datagram_budget"

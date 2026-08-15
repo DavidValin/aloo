@@ -82,7 +82,7 @@ pub async fn run_client_inner(
         }
 
         match connect_and_handshake(&request).await {
-            Ok((rd, wr, you, identity, key_mode)) => {
+            Ok((rd, wr, you, identity, key_mode, server_addr)) => {
                 let id_store = load_id_store(&request.id_store_path);
                 let own_next_keys = match &request.my_key {
                     MyKeySelection::RsaPerMessage { own_next_keys_path } => {
@@ -102,6 +102,7 @@ pub async fn run_client_inner(
                     id_store,
                     own_next_keys,
                     hotkey_rx,
+                    server_addr,
                 )
                 .await;
             }
@@ -145,11 +146,26 @@ fn run_connect_popup(
 /// caller can retry instead of treating it as fatal.
 async fn connect_and_handshake(
     request: &ui_connect_popup::ConnectRequest,
-) -> Result<(tokio::io::ReadHalf<TcpStream>, tokio::io::WriteHalf<TcpStream>, proto::UserId, ResolvedIdentity, KeyMode), BoxError>
-{
+) -> Result<
+    (
+        tokio::io::ReadHalf<TcpStream>,
+        tokio::io::WriteHalf<TcpStream>,
+        proto::UserId,
+        ResolvedIdentity,
+        KeyMode,
+        std::net::SocketAddr,
+    ),
+    BoxError,
+> {
     let (identity, key_mode) = resolve_my_keypair(&request.my_key)?;
 
     let stream = TcpStream::connect((request.host.as_str(), request.port)).await?;
+    // The server's UDP rendezvous socket binds the same numeric port on the
+    // same address (`server::run`) - captured here, before the stream
+    // splits, since `peer_addr` needs the whole `TcpStream` and this is the
+    // resolved address (DNS already settled), not just whatever hostname
+    // the user typed.
+    let server_addr = stream.peer_addr()?;
     let (mut rd, mut wr) = tokio::io::split(stream);
 
     let Some(ServerMessage::Hello { auth, challenge }) = proto::read_message(&mut rd).await? else {
@@ -183,7 +199,7 @@ async fn connect_and_handshake(
     }
     let you = you.ok_or("server accepted identify but returned no user id")?;
 
-    Ok((rd, wr, you, identity, key_mode))
+    Ok((rd, wr, you, identity, key_mode, server_addr))
 }
 
 /// `rsa_per_msg` (`MyKeySelection::RsaPerMessage`) always autogenerates a

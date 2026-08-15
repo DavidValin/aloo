@@ -17,7 +17,8 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use crate::file_transfer::FILE_CHUNK_BYTES;
-use crate::proto::{ClientMessage, UserId};
+use crate::p2p::P2pOutbound;
+use crate::proto::UserId;
 use crate::voice_stream::{self, ChunkDecryptor, DecryptJob, DirectStreamKey, IncomingStreamKey};
 
 /// What a currently-sending (our own) file transfer is addressed to,
@@ -62,17 +63,17 @@ pub(crate) enum FileEvent {
 /// Runs on a dedicated thread for the lifetime of one accepted send: reads
 /// `path` incrementally (never the whole file at once - memory use stays
 /// bounded to one `FILE_CHUNK_BYTES` chunk regardless of total file size),
-/// encrypting and sending each chunk as a `ClientMessage::FileChunk`, then a
+/// encrypting and sending each chunk as a `P2pOutbound::FileChunk`, then a
 /// final `FileEnd`. `out_tx` is `SessionState::record_out_tx` - the same
-/// generic "write this `ClientMessage` to the wire" channel the voice
-/// recording worker already drains through, so no new select-loop arm is
-/// needed for sending.
+/// generic "send this over the direct link" channel the voice recording
+/// worker already drains through, so no new select-loop arm is needed for
+/// sending.
 pub(crate) fn spawn_send_file_worker(
     path: PathBuf,
     key: DirectStreamKey,
     to: UserId,
     stream_id: u64,
-    out_tx: tokio::sync::mpsc::UnboundedSender<ClientMessage>,
+    out_tx: tokio::sync::mpsc::UnboundedSender<P2pOutbound>,
     events_tx: tokio::sync::mpsc::UnboundedSender<FileEvent>,
 ) {
     std::thread::spawn(move || {
@@ -102,14 +103,14 @@ pub(crate) fn spawn_send_file_worker(
                 let _ = events_tx.send(FileEvent::SendFailed { stream_id });
                 return;
             };
-            if out_tx.send(ClientMessage::FileChunk { to, stream_id, seq, blocks }).is_err() {
+            if out_tx.send(P2pOutbound::FileChunk { to, stream_id, seq, blocks }).is_err() {
                 return;
             }
             sent += n as u64;
             seq += 1;
             let _ = events_tx.send(FileEvent::SendProgress { stream_id, bytes: sent });
         }
-        let _ = out_tx.send(ClientMessage::FileEnd { to, stream_id });
+        let _ = out_tx.send(P2pOutbound::FileEnd { to, stream_id });
         let _ = events_tx.send(FileEvent::SendDone { stream_id });
     });
 }

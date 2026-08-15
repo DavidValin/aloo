@@ -4,6 +4,7 @@ use cucumber::{given, then, when};
 use aloo::crypto::{
     self, KeyPair, decrypt_chunked, encrypt_chunked, max_chunk_len, public_key_to_der,
 };
+use aloo::p2p_proto::P2pPayload;
 use aloo::proto::{
     ChannelInfo, ChannelKind, ClientMessage, Content, Envelope, KeyMode, ServerMessage, UserId,
     UserInfo, decode, encode,
@@ -146,10 +147,14 @@ async fn roundtrip_every_message(w: &mut AlooWorld) {
             public_key_der: vec![1, 2, 3, 4],
             key_mode: KeyMode::Rsa,
         },
-        ClientMessage::SendDirect { to: UserId(7), envelope: envelope.clone() },
         ClientMessage::JoinChannel { name: "general".into(), kind: ChannelKind::Public },
         ClientMessage::LeaveChannel { name: "general".into() },
         ClientMessage::RotateKey { to: UserId(3), new_public_key_der: vec![1, 2, 3], signature: vec![9, 9] },
+        ClientMessage::RequestPeerLink {
+            peer: UserId(7),
+            candidates: vec!["127.0.0.1:4000".parse().unwrap(), "203.0.113.5:4000".parse().unwrap()],
+            link_nonce: 42,
+        },
     ];
     for msg in &client {
         let decoded: ClientMessage = decode(&encode(msg).expect("encode")).expect("decode");
@@ -162,6 +167,11 @@ async fn roundtrip_every_message(w: &mut AlooWorld) {
             ChannelInfo { name: "secret-room".into(), kind: ChannelKind::Private },
         ]),
         ServerMessage::KeyRotated { from: UserId(3), new_public_key_der: vec![1, 2, 3], signature: vec![9, 9] },
+        ServerMessage::PeerCandidates {
+            from: UserId(7),
+            candidates: vec!["127.0.0.1:4000".parse().unwrap()],
+            link_nonce: 42,
+        },
     ];
     for msg in &server {
         let decoded: ServerMessage = decode(&encode(msg).expect("encode")).expect("decode");
@@ -177,6 +187,19 @@ async fn roundtrip_every_message(w: &mut AlooWorld) {
     let decoded: UserInfo = decode(&encode(&user).expect("encode")).expect("decode");
     assert_eq!(decoded, user, "UserInfo did not survive the round trip");
 
+    // Message content itself now travels over the direct link, not the
+    // wire types above - `P2pPayload::Envelope` is where an `Envelope`
+    // actually gets sent, so that's what needs the round-trip check.
+    let payload = P2pPayload::Envelope { channel: None, envelope: envelope.clone() };
+    let decoded: P2pPayload = decode(&encode(&payload).expect("encode")).expect("decode");
+    match decoded {
+        P2pPayload::Envelope { channel, envelope: got } => {
+            assert_eq!(channel, None);
+            assert_eq!(got, envelope, "envelope did not survive the round trip");
+        }
+        _ => panic!("wrong P2pPayload variant after round trip"),
+    }
+
     w.envelope = Some(envelope);
 }
 
@@ -186,16 +209,16 @@ async fn every_field_intact(w: &mut AlooWorld) {
     // pins the envelope specifically, since it is the one value that carries
     // opaque ciphertext the server must never reinterpret.
     let envelope = w.envelope.as_ref().expect("no envelope round-tripped");
-    let msg = ClientMessage::SendDirect { to: UserId(7), envelope: envelope.clone() };
-    let decoded: ClientMessage = decode(&encode(&msg).unwrap()).unwrap();
+    let msg = P2pPayload::Envelope { channel: Some("general".into()), envelope: envelope.clone() };
+    let decoded: P2pPayload = decode(&encode(&msg).unwrap()).unwrap();
     match decoded {
-        ClientMessage::SendDirect { to, envelope: got } => {
-            assert_eq!(to, UserId(7), "recipient must survive");
+        P2pPayload::Envelope { channel, envelope: got } => {
+            assert_eq!(channel.as_deref(), Some("general"), "channel routing metadata must survive");
             assert_eq!(&got, envelope, "the encrypted body must survive byte for byte");
             assert_eq!(got.content, Content::Text);
             assert_eq!(got.blocks, vec![vec![9, 9, 9], vec![8, 8]], "block boundaries must be preserved");
         }
-        other => panic!("wrong variant after round trip: {other:?}"),
+        _ => panic!("wrong variant after round trip"),
     }
 }
 

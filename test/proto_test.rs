@@ -1,3 +1,4 @@
+use aloo::p2p_proto::{P2pPayload, PunchDatagram, RendezvousMessage};
 use aloo::proto::{
     decode, encode, frame, parse_frame, read_message, write_message, AuthKind, AuthResponse,
     ChannelInfo, ChannelKind, ClientMessage, Content, Envelope, KeyMode, ProtoError, ServerMessage,
@@ -54,23 +55,27 @@ fn encode_decode_roundtrip_server_message() {
     assert_eq!(msg, decoded);
 }
 
+/// Message content now travels as a `p2p_proto::P2pPayload` over the direct
+/// link, not a `ClientMessage` relayed by the server - see
+/// `docs/PROTOCOL.md`'s "Direct peer-to-peer transport" section.
+///
 /// @requirement AC-043, TB-060
 #[test]
 fn envelope_roundtrips() {
     let env = Envelope { content: Content::Text, blocks: vec![vec![9, 9, 9], vec![8, 8]] };
-    let msg = ClientMessage::SendDirect { to: UserId(7), envelope: env.clone() };
+    let msg = P2pPayload::Envelope { channel: None, envelope: env.clone() };
     let bytes = encode(&msg).unwrap();
-    let decoded: ClientMessage = decode(&bytes).unwrap();
+    let decoded: P2pPayload = decode(&bytes).unwrap();
     match decoded {
-        ClientMessage::SendDirect { to, envelope } => {
-            assert_eq!(to, UserId(7));
+        P2pPayload::Envelope { channel, envelope } => {
+            assert_eq!(channel, None);
             assert_eq!(envelope, env);
         }
         _ => panic!("wrong variant"),
     }
 }
 
-/// A `Content::FileOffer` envelope, carried by `ClientMessage::FileOffer`,
+/// A `Content::FileOffer` envelope, carried by `P2pPayload::FileOffer`,
 /// round-trips exactly like `Content::Text` (docs/PROTOCOL.md's file
 /// transfer section) - no special-casing anywhere in the wire codec.
 ///
@@ -78,12 +83,11 @@ fn envelope_roundtrips() {
 #[test]
 fn content_file_offer_envelope_roundtrips() {
     let env = Envelope { content: Content::FileOffer, blocks: vec![vec![1, 2, 3]] };
-    let msg = ClientMessage::FileOffer { to: UserId(2), stream_id: 7, channel: Some("general".into()), envelope: env.clone() };
+    let msg = P2pPayload::FileOffer { channel: Some("general".into()), stream_id: 7, envelope: env.clone() };
     let bytes = encode(&msg).unwrap();
-    let decoded: ClientMessage = decode(&bytes).unwrap();
+    let decoded: P2pPayload = decode(&bytes).unwrap();
     match decoded {
-        ClientMessage::FileOffer { to, stream_id, channel, envelope } => {
-            assert_eq!(to, UserId(2));
+        P2pPayload::FileOffer { channel, stream_id, envelope } => {
             assert_eq!(stream_id, 7);
             assert_eq!(channel.as_deref(), Some("general"));
             assert_eq!(envelope, env);
@@ -92,66 +96,63 @@ fn content_file_offer_envelope_roundtrips() {
     }
 }
 
-// ---------------------------------------------------------------------
-// Live-streamed voice
-// ---------------------------------------------------------------------
-
-/// @requirement TB-060
+/// @requirement TB-143
 #[test]
-fn stream_channel_start_chunk_end_roundtrip() {
-    let start = ClientMessage::StreamChannelStart { channel: "general".into(), stream_id: 42 };
-    assert_eq!(decode::<ClientMessage>(&encode(&start).unwrap()).unwrap(), start);
+fn request_peer_link_and_peer_candidates_roundtrip() {
+    let candidates = vec!["127.0.0.1:4000".parse().unwrap(), "203.0.113.5:51820".parse().unwrap()];
+    let request = ClientMessage::RequestPeerLink { peer: UserId(7), candidates: candidates.clone(), link_nonce: 42 };
+    assert_eq!(decode::<ClientMessage>(&encode(&request).unwrap()).unwrap(), request);
 
-    let chunk = ClientMessage::StreamChannelChunk {
-        channel: "general".into(),
-        stream_id: 42,
-        seq: 3,
-        per_recipient: vec![(UserId(2), vec![vec![1, 2, 3], vec![4]])],
-    };
-    assert_eq!(decode::<ClientMessage>(&encode(&chunk).unwrap()).unwrap(), chunk);
-
-    let end = ClientMessage::StreamChannelEnd { channel: "general".into(), stream_id: 42, duration_ms: 9000 };
-    assert_eq!(decode::<ClientMessage>(&encode(&end).unwrap()).unwrap(), end);
+    let relayed = ServerMessage::PeerCandidates { from: UserId(3), candidates, link_nonce: 42 };
+    assert_eq!(decode::<ServerMessage>(&encode(&relayed).unwrap()).unwrap(), relayed);
 }
 
-/// @requirement TB-060
+// ---------------------------------------------------------------------
+// Direct peer-to-peer transport wire types (crate::p2p_proto)
+// ---------------------------------------------------------------------
+
+/// @requirement TB-143
 #[test]
-fn stream_direct_start_chunk_end_roundtrip() {
-    let start = ClientMessage::StreamDirectStart { to: UserId(9), stream_id: 7 };
-    assert_eq!(decode::<ClientMessage>(&encode(&start).unwrap()).unwrap(), start);
+fn rendezvous_messages_roundtrip() {
+    let request = RendezvousMessage::BindingRequest { token: 7 };
+    assert_eq!(decode::<RendezvousMessage>(&encode(&request).unwrap()).unwrap(), request);
 
-    let chunk = ClientMessage::StreamDirectChunk { to: UserId(9), stream_id: 7, seq: 1, blocks: vec![vec![5]] };
-    assert_eq!(decode::<ClientMessage>(&encode(&chunk).unwrap()).unwrap(), chunk);
-
-    let end = ClientMessage::StreamDirectEnd { to: UserId(9), stream_id: 7, duration_ms: 500 };
-    assert_eq!(decode::<ClientMessage>(&encode(&end).unwrap()).unwrap(), end);
+    let response = RendezvousMessage::BindingResponse { token: 7, observed: "203.0.113.5:4000".parse().unwrap() };
+    assert_eq!(decode::<RendezvousMessage>(&encode(&response).unwrap()).unwrap(), response);
 }
 
-/// @requirement TB-060
+/// @requirement TB-143
 #[test]
-fn server_stream_variants_roundtrip() {
+fn punch_datagrams_roundtrip() {
     let msgs = vec![
-        ServerMessage::ChannelStreamStart {
-            channel: "general".into(),
-            from: UserId(1),
-            from_name: "alice".into(),
-            stream_id: 42,
-        },
-        ServerMessage::ChannelStreamChunk {
-            channel: "general".into(),
-            from: UserId(1),
-            stream_id: 42,
-            seq: 0,
-            blocks: vec![vec![1]],
-        },
-        ServerMessage::ChannelStreamEnd { channel: "general".into(), from: UserId(1), stream_id: 42, duration_ms: 100 },
-        ServerMessage::DirectStreamStart { from: UserId(1), from_name: "alice".into(), stream_id: 7 },
-        ServerMessage::DirectStreamChunk { from: UserId(1), stream_id: 7, seq: 0, blocks: vec![vec![2]] },
-        ServerMessage::DirectStreamEnd { from: UserId(1), stream_id: 7, duration_ms: 50 },
+        PunchDatagram::Ping { link_nonce: 1 },
+        PunchDatagram::Pong { link_nonce: 1 },
+        PunchDatagram::Keepalive { link_nonce: 1 },
+        PunchDatagram::Ack { seq: 5 },
+        PunchDatagram::Reliable { seq: 5, payload: vec![1, 2, 3] },
+        PunchDatagram::Unreliable { stream_id: 42, seq: 0, blocks: vec![vec![1, 2, 3]] },
     ];
     for msg in msgs {
-        assert_eq!(decode::<ServerMessage>(&encode(&msg).unwrap()).unwrap(), msg, "roundtrip failed for {msg:?}");
+        let decoded: PunchDatagram = decode(&encode(&msg).unwrap()).unwrap();
+        assert_eq!(decoded, msg, "roundtrip failed for {msg:?}");
     }
+}
+
+// ---------------------------------------------------------------------
+// Live-streamed voice / stream lifecycle (now carried as P2pPayload)
+// ---------------------------------------------------------------------
+
+/// @requirement TB-060
+#[test]
+fn stream_start_and_end_roundtrip() {
+    let start = P2pPayload::StreamStart { channel: Some("general".into()), stream_id: 42 };
+    assert_eq!(decode::<P2pPayload>(&encode(&start).unwrap()).unwrap(), start);
+
+    let end = P2pPayload::StreamEnd { stream_id: 42, duration_ms: 9000 };
+    assert_eq!(decode::<P2pPayload>(&encode(&end).unwrap()).unwrap(), end);
+
+    let direct_start = P2pPayload::StreamStart { channel: None, stream_id: 7 };
+    assert_eq!(decode::<P2pPayload>(&encode(&direct_start).unwrap()).unwrap(), direct_start);
 }
 
 /// @requirement TB-062
@@ -347,35 +348,23 @@ fn format_with_name_puts_every_tag_after_the_name() {
 }
 
 /// The rest of the file-transfer message family (`docs/PROTOCOL.md`'s file
-/// transfer section) round-trips the same way every other `ClientMessage`/
-/// `ServerMessage` variant does - `FileAccept`/`FileReject`/`FileChunk`/
-/// `FileEnd` are always addressed point-to-point (`to`/`from`, never a
-/// channel), same shape as the existing `StreamDirect*` family.
+/// transfer section) round-trips the same way every other `P2pPayload`
+/// variant does - `FileAccept`/`FileReject`/`FileChunk`/`FileEnd` are
+/// always addressed point-to-point (identified by which link they arrived
+/// on, never a channel), same shape as `StreamStart`/`StreamEnd`.
 ///
 /// @requirement TB-141
 #[test]
 fn file_transfer_message_family_roundtrips() {
-    let accept = ClientMessage::FileAccept { to: UserId(2), stream_id: 7 };
-    assert_eq!(decode::<ClientMessage>(&encode(&accept).unwrap()).unwrap(), accept);
+    let accept = P2pPayload::FileAccept { stream_id: 7 };
+    assert_eq!(decode::<P2pPayload>(&encode(&accept).unwrap()).unwrap(), accept);
 
-    let reject = ClientMessage::FileReject { to: UserId(2), stream_id: 7 };
-    assert_eq!(decode::<ClientMessage>(&encode(&reject).unwrap()).unwrap(), reject);
+    let reject = P2pPayload::FileReject { stream_id: 7 };
+    assert_eq!(decode::<P2pPayload>(&encode(&reject).unwrap()).unwrap(), reject);
 
-    let chunk = ClientMessage::FileChunk { to: UserId(2), stream_id: 7, seq: 3, blocks: vec![vec![1, 2], vec![3]] };
-    assert_eq!(decode::<ClientMessage>(&encode(&chunk).unwrap()).unwrap(), chunk);
+    let chunk = P2pPayload::FileChunk { stream_id: 7, seq: 3, blocks: vec![vec![1, 2], vec![3]] };
+    assert_eq!(decode::<P2pPayload>(&encode(&chunk).unwrap()).unwrap(), chunk);
 
-    let end = ClientMessage::FileEnd { to: UserId(2), stream_id: 7 };
-    assert_eq!(decode::<ClientMessage>(&encode(&end).unwrap()).unwrap(), end);
-
-    let accepted = ServerMessage::FileAccepted { from: UserId(2), stream_id: 7 };
-    assert_eq!(decode::<ServerMessage>(&encode(&accepted).unwrap()).unwrap(), accepted);
-
-    let rejected = ServerMessage::FileRejected { from: UserId(2), stream_id: 7 };
-    assert_eq!(decode::<ServerMessage>(&encode(&rejected).unwrap()).unwrap(), rejected);
-
-    let server_chunk = ServerMessage::FileChunk { from: UserId(2), stream_id: 7, seq: 3, blocks: vec![vec![9]] };
-    assert_eq!(decode::<ServerMessage>(&encode(&server_chunk).unwrap()).unwrap(), server_chunk);
-
-    let server_end = ServerMessage::FileEnd { from: UserId(2), stream_id: 7 };
-    assert_eq!(decode::<ServerMessage>(&encode(&server_end).unwrap()).unwrap(), server_end);
+    let end = P2pPayload::FileEnd { stream_id: 7 };
+    assert_eq!(decode::<P2pPayload>(&encode(&end).unwrap()).unwrap(), end);
 }

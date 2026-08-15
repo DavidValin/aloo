@@ -2,17 +2,25 @@
 
 This document specifies the client↔server protocol implemented in
 `src/proto.rs` (message framing and types) and `src/server.rs` (routing
-and connection lifecycle). It is a description of the *wire format and
-server behavior*, precise enough to implement an interoperable client or
-server from scratch. Application-level UI/UX behavior (keybindings,
-rendering, how a client chooses to chunk a recording, etc.) is documented
-in `SPEC.md`/`README.md`, not here, except where noted as informative
+and connection lifecycle), and the direct client↔client transport
+implemented in `src/p2p.rs`/`src/p2p_proto.rs`/`src/p2p_reliable.rs`
+(§7.0). It is a description of the *wire format and server behavior*,
+precise enough to implement an interoperable client or server from
+scratch. Application-level UI/UX behavior (keybindings, rendering, how a
+client chooses to chunk a recording, etc.) is documented in
+`SPEC.md`/`README.md`, not here, except where noted as informative
 context.
 
-The server is a dumb relay: it authenticates connections, tracks channel
-membership, and forwards already-encrypted bytes between clients. It
-never decrypts, inspects, or persists message content, and holds no state
-beyond the current process's memory (nothing survives a restart).
+The server is a pure medium of connection *setup*, never of content: it
+authenticates connections, tracks channel membership/presence, relays
+`rsa_per_msg` key-rotation notices, and relays the candidate exchange that
+lets two clients punch a direct UDP link to each other (§7.0). Every
+actual message, voice stream, and file transfer travels over that direct
+link once it's established - never through the server, not even as
+ciphertext. The server holds no state beyond the current process's memory
+(nothing survives a restart), and there is no relay-of-last-resort: if a
+direct link can't be established, the send fails visibly rather than
+falling back to a server relay (§7.0.4).
 
 ## 1. Transport
 
@@ -494,106 +502,210 @@ Reference implementation: `server::Registry::join_channel`, `leave_channel`,
 ## 7. Messaging
 
 All message content - text and voice alike - is encrypted **per
-recipient** before it reaches the server; the server only ever relays
-opaque `blocks`/`Envelope` values it cannot decrypt (see §8 for why no
-shared/session key is used, and what that costs).
+recipient** (see §8 for why no shared/session key is used, and what that
+costs) *and* delivered directly, client to client, over the punched UDP
+link §7.0 establishes. The server is never in this data path at all - not
+as a relay of ciphertext, not even briefly - it only ever helps two
+clients find each other's address in the first place.
 
-### 7.1 `SendChannel { channel, per_recipient: Vec<(UserId, Envelope)> }`
+### 7.0 Direct peer-to-peer transport
 
-The sender addresses each intended recipient explicitly and individually
-- `per_recipient` is not "one envelope, broadcast"; it is literally a
-list of (who, their own separately-encrypted copy). Server-side
-(`route_channel_message`):
+Before any message/voice/file content can move between two clients, they
+need a direct UDP path to each other. This section covers how that path
+is found and used; §7.1-§7.6 cover what actually travels over it once
+it exists.
 
-- Rejected (`Error` back to the sender) if `channel` doesn't exist, or if
-  the sender is not currently a member of it.
-- Otherwise, for each `(to, envelope)` pair: if `to` is currently a
-  member of `channel`, the server relays
-  `ChannelMessage { channel, from: <sender>, from_name, envelope }` to
-  them; if `to` is *not* (or no longer) a member, that pair is silently
-  dropped - not an error, just skipped.
-- A sender is expected to include every other current member of the
-  channel in `per_recipient` themselves (the server does not expand or
-  validate the list against membership beyond the per-recipient
-  membership check above) - if a client only encrypts for some members,
-  only those receive it.
+**Trigger**: lazy, on the first time a client addresses a specific peer (a
+text send, a file offer, starting a voice recording) - not eagerly when
+two clients merely end up sharing a channel. A peer who receives a
+candidate proposal (below) for the first time treats it as an implicit
+invitation and punches back, so being addressed first works without that
+side needing to have sent anything itself.
 
-### 7.2 `SendDirect { to, envelope: Envelope }`
+**1. Candidate gathering** (once per session): each client binds one UDP
+socket for the whole session and gathers two kinds of candidate address
+for it - its own local interface addresses (`if-addrs`, pairing every
+interface with the bound port), and a *server-reflexive* address learned
+via a stateless STUN-Binding-style exchange with the server's own UDP
+socket (bound on the same numeric port as its TCP listener):
 
-A single-recipient message, no channel involved. Rejected (`Error`) if
-`to` is not a currently-connected `UserId`. On success, relayed as
-`DirectMessage { from, from_name, envelope }`.
+```rust
+// client -> server UDP socket, and back - never touches Registry/TCP
+enum RendezvousMessage {
+    BindingRequest  { token: u64 },
+    BindingResponse { token: u64, observed: SocketAddr },
+}
+```
+
+The server echoes back exactly the address the request arrived from -
+this is the client's own public (NAT-mapped) address, which it has no way
+to learn about itself. No auth, no state kept between requests: this
+reveals nothing about a sender beyond what any UDP packet it sends
+already reveals to whoever receives it, the same threat model as a public
+STUN server. A client that gets no reply within a short timeout (old
+server, outbound UDP blocked, ...) proceeds with host candidates alone.
+
+**2. Signaling the peer, over the existing TCP connection**:
+
+```rust
+// client -> server
+RequestPeerLink { peer: UserId, candidates: Vec<SocketAddr>, link_nonce: u64 }
+
+// server -> client (existence-check-only relay, Registry::route_peer_link_request -
+// same shape as §7.5's RotateKey/KeyRotated: an unknown recipient is an Error,
+// nothing else is validated or stored)
+PeerCandidates { from: UserId, candidates: Vec<SocketAddr>, link_nonce: u64 }
+```
+
+The initiator's own candidates are relayed to the peer; if the peer has
+no link state yet for this sender, it replies in kind with its own
+`RequestPeerLink` (same `link_nonce`, echoed) - one extra round trip gives
+both sides the other's full candidate list.
+
+**3. Punching**, entirely direct between the two clients (the server is
+no longer involved at all from this point on):
+
+```rust
+enum PunchDatagram {
+    Ping      { link_nonce: u64 },
+    Pong      { link_nonce: u64 },
+    Keepalive { link_nonce: u64 },
+    Ack       { seq: u32 },
+    Reliable   { seq: u32, payload: Vec<u8> },   // see §7.0.1
+    Unreliable { stream_id: u64, seq: u32, blocks: Vec<Vec<u8>> },
+}
+```
+
+Each side sends `Ping{my_own_link_nonce}` to every one of the other's
+candidates in parallel, repeating every tick (~150ms) while unconfirmed.
+Receiving *any* `Ping` (regardless of its nonce) gets an immediate
+`Pong` echoing that same nonce back - this is what opens the reverse NAT
+mapping even if only one direction's mapping opened first. A side only
+trusts a `Pong` whose nonce matches its own current attempt; the first
+one it receives locks in that candidate address as the link's active
+address, and the link is now `Active`.
+
+**4. No fallback - failure is visible.** If neither the candidate reply
+nor a confirmed `Ping`/`Pong` round trip arrives within `PUNCH_TIMEOUT`
+(5 seconds), the link is `Failed`: whatever was pending against that peer
+fails with a clear error shown to the user (`could not establish a direct
+connection`), and a short cooldown (30s) elapses before a fresh send
+retries the whole handshake. There is deliberately no relay-of-last-resort
+through the server - see the top of this document. Once `Active`, an idle
+link gets a `Keepalive` datagram after 15 seconds of no other traffic, to
+keep the NAT/firewall mapping from expiring.
+
+Reference implementation: `src/p2p.rs` (`PeerLinkManager`), `src/p2p_proto.rs`.
+
+#### 7.0.1 Reliable delivery over the punched link
+
+UDP gives no ordering or delivery guarantee, so text and file content -
+which must arrive complete and in order, unlike voice (§7.3) - get a
+small hand-rolled reliable layer on top (`src/p2p_reliable.rs`), carried
+inside `PunchDatagram::Reliable { seq, payload }`:
+
+- **Sender** (`ArqSender`): assigns an increasing `seq` to each outgoing
+  payload, retransmits on a timeout with capped exponential backoff
+  (400ms initial, doubling up to 3s), and gives up - failing the link
+  entirely, per §7.0's no-fallback rule - after 10 retries with no ack.
+- **Receiver** (`ArqReceiver`): acks every `Reliable` frame it sees
+  immediately, even a duplicate or an out-of-order one; delivers frames to
+  the application in order, buffering ones that arrive ahead of the
+  expected sequence (bounded to 64 buffered frames - exceeding that fails
+  the link rather than growing unbounded) and dropping duplicates.
+
+This is deliberately minimal - no congestion control, no selective-repeat,
+no cumulative acks - since it operates at chat-message/file-chunk
+granularity, not bulk throughput.
+
+**Datagram size.** A `Reliable`/`Unreliable` frame is one raw UDP datagram
+- there's no length-prefixed framing to split an oversized payload across
+multiple sends the way TCP's own segmentation would (§1.1's `MAX_FRAME_LEN`
+governs the old TCP path, not this one). A datagram larger than a path's
+MTU gets IP-fragmented, and plenty of real-world NATs/firewalls drop a
+fragmented UDP datagram outright the moment any one fragment goes missing
+- worse than just keeping every datagram small in the first place.
+`p2p_proto::SAFE_DATAGRAM_BYTES` (1200 bytes) is the target ceiling every
+sender is expected to stay under; `file_transfer::FILE_CHUNK_BYTES` (§7.6)
+and `voice::CHUNK_INTERVAL` (§7.3) are both sized so an RSA-family
+recipient's worst-case ciphertext clears it comfortably. `pq_hybrid` is the
+one content type that can't: see §7.3/§7.6/§13.3 for why its fixed
+per-chunk overhead makes this unavoidable regardless of chunk size.
+
+`payload` (once reassembled) decodes to:
+
+```rust
+enum P2pPayload {
+    Envelope    { channel: Option<String>, envelope: Envelope },       // §7.1/§7.2
+    FileOffer   { channel: Option<String>, stream_id: u64, envelope: Envelope }, // §7.6
+    StreamStart { channel: Option<String>, stream_id: u64 },           // §7.3
+    StreamEnd   { stream_id: u64, duration_ms: u32 },                  // §7.3
+    FileAccept  { stream_id: u64 },                                    // §7.6
+    FileReject  { stream_id: u64 },                                    // §7.6
+    FileChunk   { stream_id: u64, seq: u32, blocks: Vec<Vec<u8>> },    // §7.6
+    FileEnd     { stream_id: u64 },                                    // §7.6
+}
+```
+
+None of these carry a `to`/`from` - the punched link's own address
+already identifies which peer sent it. `channel: Some(name)` addresses a
+channel send (kept purely for the receiver's own UI bucketing - there is
+no server-side membership check to lean on anymore, so a client is
+trusted to only address peers it actually intends to); `None` is a DM.
+
+Voice chunks (`PunchDatagram::Unreliable`) bypass this layer entirely -
+see §7.3.
+
+### 7.1 Sending a channel or direct text message
+
+The sender addresses each intended recipient individually - a channel
+send is one independently-encrypted `Envelope` per member, each delivered
+over that member's own punched link, not one message broadcast by a
+relay. There is no `ClientMessage`/`ServerMessage` variant for this
+anymore: it's `P2pPayload::Envelope { channel, envelope }` (§7.0.1), sent
+reliably, queued automatically if the link isn't `Active` yet and flushed
+once it is (text is never dropped just because punching is still in
+progress - contrast with voice, §7.3). `channel: Some(name)` is a channel
+message; `None` is a DM. A sender is expected to address every other
+current member of the channel itself - there is no server-side membership
+list to expand or validate against anymore.
+
+### 7.2 (folded into §7.1)
 
 ### 7.3 Voice streaming
 
 Voice is never sent as a single whole `Envelope`/`Content` value. Instead
 it's a **Start, then zero or more Chunks, then an End**, sharing one
-`stream_id: u64` for the lifetime of that one recording:
+`stream_id: u64` for the lifetime of that one recording, all traveling
+directly over the punched link to each recipient (§7.0):
 
 ```
-sender                         server                        recipient(s)
-  |                              |                                |
-  |-- StreamChannelStart ------->|                                |
-  |   { channel, stream_id }     |-- ChannelStreamStart --------->|
-  |                              |   { channel, from, from_name,  |
-  |                              |     stream_id }                |
-  |                              |                                |
-  |-- StreamChannelChunk ------->|                                |
-  |   { channel, stream_id,      |-- ChannelStreamChunk --------->|
-  |     seq, per_recipient }     |   { channel, from, stream_id,  |
-  |    (repeats, 0+ times)       |     seq, blocks }              |
-  |                              |    (one relay per recipient    |
-  |                              |     per chunk, same rules as   |
-  |                              |     §7.1)                      |
-  |                              |                                |
-  |-- StreamChannelEnd --------->|                                |
-  |   { channel, stream_id,      |-- ChannelStreamEnd ----------->|
-  |     duration_ms }            |   { channel, from, stream_id,  |
-  |                              |     duration_ms }              |
+sender                                          recipient
+  |                                                 |
+  |-- P2pPayload::StreamStart (reliable) --------->|
+  |   { channel, stream_id }                        |
+  |                                                 |
+  |-- PunchDatagram::Unreliable (repeats) --------->|
+  |   { stream_id, seq, blocks }                    |
+  |                                                 |
+  |-- P2pPayload::StreamEnd (reliable) ------------>|
+  |   { stream_id, duration_ms }                    |
 ```
 
-(`StreamDirect{Start,Chunk,End}` → `DirectStream{Start,Chunk,End}` is the
-exact same shape, minus the channel-membership plumbing - see the type
-definitions below.)
-
-```rust
-// client -> server
-StreamChannelStart { channel: String, stream_id: u64 }
-StreamChannelChunk { channel: String, stream_id: u64, seq: u32, per_recipient: Vec<(UserId, Vec<Vec<u8>>)> }
-StreamChannelEnd   { channel: String, stream_id: u64, duration_ms: u32 }
-StreamDirectStart  { to: UserId, stream_id: u64 }
-StreamDirectChunk  { to: UserId, stream_id: u64, seq: u32, blocks: Vec<Vec<u8>> }
-StreamDirectEnd    { to: UserId, stream_id: u64, duration_ms: u32 }
-
-// server -> client (mirrored relay)
-ChannelStreamStart { channel: String, from: UserId, from_name: String, stream_id: u64 }
-ChannelStreamChunk { channel: String, from: UserId, stream_id: u64, seq: u32, blocks: Vec<Vec<u8>> }
-ChannelStreamEnd   { channel: String, from: UserId, stream_id: u64, duration_ms: u32 }
-DirectStreamStart  { from: UserId, from_name: String, stream_id: u64 }
-DirectStreamChunk  { from: UserId, stream_id: u64, seq: u32, blocks: Vec<Vec<u8>> }
-DirectStreamEnd    { from: UserId, stream_id: u64, duration_ms: u32 }
-```
-
-**Routing rules**, per message (`server::Registry::route_*_stream_*`):
-
-- `*Start`/`*End` for a channel are **not** addressed by the sender at
-  all (no `per_recipient` field) - the server derives the recipient list
-  itself from current channel membership at the moment of that call,
-  excluding the sender (who doesn't need their own notice). This means
-  membership is evaluated freshly for Start, for every Chunk, and again
-  for End - a client that joins mid-stream *can* start receiving
-  `ChannelStreamChunk`s for a stream_id they never saw a
-  `ChannelStreamStart` for (see below), and a client that leaves
-  mid-stream simply stops being included in subsequent Chunk relays.
-- `*Chunk` for a channel *is* addressed by the sender
-  (`per_recipient: Vec<(UserId, Vec<Vec<u8>>)>`, one already-encrypted
-  copy of that chunk's plaintext per intended recipient) - same
-  membership-filtering and silent-drop-if-not-a-member behavior as §7.1.
-- `Direct*` variants are rejected outright (`Error`) if `to` is not a
-  currently-connected `UserId` - there is no membership concept for DMs,
-  just "does this user exist right now."
-- A channel `*Start`/`*Chunk`/`*End` from a sender who is not currently a
-  member of `channel` is rejected (`Error`) exactly like §7.1.
+For a channel stream, `StreamStart`/`StreamEnd` are sent reliably to
+*every* recipient whose link is already `Active` at record-start time -
+unlike text, **voice is never queued**: a recipient whose link is still
+punching (or has failed) is simply left out of that particular stream,
+exactly like a `rsa_per_msg` recipient without a fresh key (§11.6) - the
+punch can take up to `PUNCH_TIMEOUT` seconds, too long to make a live
+recording wait on. Each chunk is then sent unreliably
+(`PunchDatagram::Unreliable`, no ack, no retransmit) to each of those same
+recipients - a dropped or reordered chunk simply isn't retried, an
+accepted RTP-style tradeoff (a stalled retransmit-and-wait would hurt live
+playback more than an occasional dropped frame). This is safe because a
+chunk's AEAD nonce is derived from `(stream_id, seq)` rather than arrival
+order, so out-of-order or lost chunks still decrypt correctly on their
+own; only live playback ordering is affected.
 
 **Stream identity - critical, easy to get wrong**: `stream_id` is
 generated by the sending client as a simple per-connection counter
@@ -605,29 +717,23 @@ legitimately collide (e.g. both send their first-ever stream as
 - indexing incoming chunks/state by `stream_id` by itself will
 misattribute audio between two different senders' simultaneous streams.
 
-**`seq: u32`** is advisory/diagnostic only, not load-bearing for
-correctness: the server relays via one per-connection outbound queue
-drained by a single writer task (§4's "connected" phase, `dispatch` →
-per-recipient `mpsc` channel → one `write_message` per queued
-`ServerMessage`), and TCP itself guarantees in-order, reliable delivery
-within a connection - so a chunk for a given `(from, stream_id)` will
-always be *received* by a given recipient in the same order it was sent,
-with no drops (short of the connection dying entirely, in which case
-everything after that point is simply never delivered - there is no
-retransmission at this layer). A receiver does not need to reorder or
-deduplicate on `seq`; it exists for logging/debugging, not protocol
-correctness.
+**`seq: u32`** is load-bearing here in a way it wasn't under the old
+server-relayed design: chunks travel unreliable/unordered UDP, so a
+receiver may see them out of order or may not see all of them - `seq`
+(combined with `stream_id`) is what lets the AEAD nonce derivation
+recover each chunk's plaintext independent of arrival order. It is *not*
+used to reorder chunks before mixing them into live playback; they're
+simply mixed in arrival order.
 
 **There is no cancellation message.** A stream that never gets an `*End`
 (e.g. the sender's connection dies mid-recording) is - from the wire
-protocol's perspective - simply a stream that stops receiving `*Chunk`
-relays forever; the server sends nothing to signal this explicitly (no
-"sender disconnected" notice tied to a specific `stream_id`). A robust
-receiver-side implementation needs its own idle timeout to decide when to
-give up waiting for more chunks of a given `(from, stream_id)` and
-finalize with whatever partial data arrived (the reference client's is 5
-seconds of silence per stream - an implementation detail, not part of the
-wire protocol, since the server never tells a peer to give up).
+protocol's perspective - simply a stream that stops receiving chunks
+forever; nothing signals this explicitly. A robust receiver-side
+implementation needs its own idle timeout to decide when to give up
+waiting for more chunks of a given `(from, stream_id)` and finalize with
+whatever partial data arrived (the reference client's is 5 seconds of
+silence per stream - an implementation detail, not part of the wire
+protocol).
 
 **No content/rate/format field.** Unlike `Envelope`, chunk payloads carry
 no `Content` tag and no sample-rate/channel-count metadata - the
@@ -690,8 +796,11 @@ Server-side (`Registry::route_key_rotation`):
   `PerMessage` (a non-rotating `Rsa`/`Password`/`None` client has no
   business rotating).
 - Otherwise relayed verbatim as `KeyRotated { from: <sender>,
-  new_public_key_der, signature }` to `to`, addressed exactly like
-  `SendDirect` (§7.2) - one recipient, no channel/membership involved.
+  new_public_key_der, signature }` to `to` - one recipient, no
+  channel/membership involved. Unlike §7.1-§7.3/§7.6, key rotation stays
+  server-relayed rather than moving to the direct link (§7.0) - it's
+  small, infrequent identity metadata, not the "content" the direct
+  transport exists to keep off the server.
 - The server does **not** verify `signature` - exactly like `Envelope`
   blocks, this is opaque payload as far as the server is concerned; §11
   covers how the *receiving client* validates it before trusting the new
@@ -708,68 +817,42 @@ connection.
 A file transfer is **consent-gated and streamed**: the receiver must
 explicitly `FileAccept` before a single byte of file data is sent, and once
 accepted the file moves as a live Start/Chunk/End-shaped stream, exactly
-like voice (§7.3) rather than text's one-shot `SendChannel`/`SendDirect`.
-Unlike voice, a transfer is always **point-to-point** - `(from, stream_id)`-
-identified the same way, but addressed `to`/`from` one recipient at a time,
-never broadcast to a whole channel's membership. A channel file send is
+like voice (§7.3) - except reliably (§7.0.1), since a dropped file chunk
+is never an acceptable loss the way a dropped audio frame is. Unlike
+voice, a transfer is always **point-to-point** and every frame in it is
+sent reliably, including the chunks themselves. A channel file send is
 simply the sending client fanning out N independent offers, one per
-recipient, each with its own `stream_id` (drawn from the same per-connection
-counter voice already uses) - this is what lets one recipient accept while
-another rejects without the two interfering, and is why every message below
-carries `to`/`from` rather than a channel-wide recipient list the way
-`SendChannel`/`StreamChannelChunk` do.
+recipient, each with its own `stream_id` (drawn from the same
+per-connection counter voice already uses) over that recipient's own
+punched link - this is what lets one recipient accept while another
+rejects without the two interfering.
 
 ```
-sender                                   server                 recipient
-  |                                        |                        |
-  |-- FileOffer -------------------------->|                        |
-  |   { to, stream_id, channel,            |-- FileOffer ---------->|
-  |     envelope }                         |   { from, from_name,   |
-  |                                        |     stream_id, channel,|
-  |                                        |     envelope }         |
-  |                                        |                        |
-  |                                        |<-- FileAccept ---------|
-  |<-- FileAccepted -----------------------|    { to, stream_id }   |
-  |    { from, stream_id }                 |                        |
-  |         (or FileReject/FileRejected,   |                        |
-  |          ending the exchange here)     |                        |
-  |                                        |                        |
-  |-- FileChunk (repeats) ---------------->|                        |
-  |   { to, stream_id, seq, blocks }       |-- FileChunk ---------->|
-  |                                        |   { from, stream_id,   |
-  |                                        |     seq, blocks }      |
-  |                                        |                        |
-  |-- FileEnd ----------------------------->|                       |
-  |   { to, stream_id }                    |-- FileEnd ------------>|
-  |                                        |   { from, stream_id }  |
+sender                                          recipient
+  |                                                 |
+  |-- P2pPayload::FileOffer (reliable) ----------->|
+  |   { channel, stream_id, envelope }              |
+  |                                                 |
+  |<-- P2pPayload::FileAccept (reliable) -----------|
+  |    { stream_id }                                |
+  |         (or FileReject, ending the exchange     |
+  |          here)                                  |
+  |                                                 |
+  |-- P2pPayload::FileChunk (reliable, repeats) -->|
+  |   { stream_id, seq, blocks }                    |
+  |                                                 |
+  |-- P2pPayload::FileEnd (reliable) -------------->|
+  |   { stream_id }                                 |
 ```
 
-```rust
-// client -> server
-FileOffer  { to: UserId, stream_id: u64, channel: Option<String>, envelope: Envelope }
-FileAccept { to: UserId, stream_id: u64 }
-FileReject { to: UserId, stream_id: u64 }
-FileChunk  { to: UserId, stream_id: u64, seq: u32, blocks: Vec<Vec<u8>> }
-FileEnd    { to: UserId, stream_id: u64 }
-
-// server -> client (mirrored relay)
-FileOffer    { from: UserId, from_name: String, stream_id: u64, channel: Option<String>, envelope: Envelope }
-FileAccepted { from: UserId, stream_id: u64 }
-FileRejected { from: UserId, stream_id: u64 }
-FileChunk    { from: UserId, stream_id: u64, seq: u32, blocks: Vec<Vec<u8>> }
-FileEnd      { from: UserId, stream_id: u64 }
-```
-
-**Routing** (`server::Registry::route_file_offer`/`route_file_accept`/
-`route_file_reject`/`route_file_chunk`/`route_file_end`): every one of these
-is relayed exactly like `SendDirect`/`StreamDirect*` (§7.2/§7.3) - an
-existence check on the recipient (`to`), nothing else. There is no
-channel-membership validation anywhere in this family, even when `channel`
-is `Some(_)` - `channel` is purely informational routing metadata for the
-receiving *client* (which log to eventually show the accepted transfer in),
-never enforced by the server. This needs **zero new server-side logic**
-beyond these five thin relay functions - no different in kind from the
-`StreamDirect*` family already there.
+All five (`FileOffer`/`FileAccept`/`FileReject`/`FileChunk`/`FileEnd`) are
+`P2pPayload` variants (§7.0.1) - there is no `ClientMessage`/
+`ServerMessage` counterpart anymore, and no server-side logic for this
+family at all: a link can only exist to a peer the sender already knows
+about (§7.0), so there's nothing left for an "unknown recipient" check to
+do. `channel: Option<String>` on `FileOffer` is purely informational
+routing metadata for the receiving *client* (which log to eventually show
+the accepted transfer in).
 
 **`FileOffer`'s plaintext**: like text, `envelope.content` is
 `Content::FileOffer` and `envelope.blocks` decrypts (§8.1, identical
@@ -783,23 +866,28 @@ struct FileOfferPayload {
 ```
 
 Bundling `filename`/`size` into the encrypted plaintext (rather than
-cleartext fields on `ClientMessage::FileOffer`) keeps them as private as
-the rest of the message - the server never learns a filename or exact size,
-only that some recipient was offered an envelope of roughly that size
-(§10, unchanged). Once accepted, the actual file bytes are **never**
+cleartext fields on `P2pPayload::FileOffer`) keeps them as private as the
+rest of the message - the server never sees any of it at all anymore
+(§10), not even ciphertext size, since the offer travels the direct link
+(§7.0), not the server. Once accepted, the actual file bytes are **never**
 wrapped in a struct at all - each `FileChunk`'s `blocks` is the RSA-OAEP (or
 PQ-hybrid, §13) encryption of a raw slice of the file, exactly like voice's
 raw-PCM chunk convention (§7.3's "no content/rate/format field").
 
 **No size bound.** Because a transfer is chunked exactly like voice rather
 than sent as one whole-file `Envelope`, the old reasoning for a size cap
-(fitting one `SendChannel` frame carrying every recipient's copy under
+(fitting one server-relayed frame carrying every recipient's copy under
 `MAX_FRAME_LEN`, §1.1) no longer applies - each `FileChunk` frame is small
 and single-recipient regardless of total file size. The reference client
-reads and encrypts `file_transfer::FILE_CHUNK_BYTES` (64 KiB) of plaintext
-at a time, keeping both sender and receiver memory use bounded to roughly
-one chunk no matter how large the file is; the sender never reads any of
-the file into memory until `FileAccepted` arrives.
+reads and encrypts `file_transfer::FILE_CHUNK_BYTES` (512 bytes) of
+plaintext at a time, keeping both sender and receiver memory use bounded to
+roughly one chunk no matter how large the file is; the sender never reads
+any of the file into memory until the recipient's `FileAccept` arrives.
+512 bytes is deliberately small for a *different* reason than the old
+whole-file cap: each `FileChunk` is now one direct-link UDP datagram
+(§7.0), so it's sized to keep worst-case RSA-OAEP ciphertext under
+`p2p_proto::SAFE_DATAGRAM_BYTES` (§7.0.1) rather than to bound memory use
+alone - memory use would be just as bounded at a much larger chunk size.
 
 **Filename length**: the reference client crops `FileOfferPayload.filename`
 to `file_transfer::MAX_FILENAME_CHARS` (230 Unicode scalar values) both
@@ -890,11 +978,12 @@ Reference implementation: `crypto::max_chunk_len`, `encrypt_chunked`,
 
 Total RSA work is proportional to bytes of plaintext, **independent of
 how finely that plaintext is chunked** for streaming (§7.3): encrypting
-one 3200-byte chunk in 17 blocks costs the same total RSA-encrypt work as
-encrypting the same 3200 bytes as one theoretical un-chunked blob would,
-modulo OAEP's fixed per-block overhead (at most one block worth of
-padding "waste" per chunk boundary - negligible in practice, since 190
-bytes divides fairly evenly into typical chunk sizes). What chunking
+one 480-byte chunk (`voice::CHUNK_INTERVAL`'s 15ms at 16kHz mono 16-bit)
+in 3 blocks costs the same total RSA-encrypt work as encrypting the same
+480 bytes as one theoretical un-chunked blob would, modulo OAEP's fixed
+per-block overhead (at most one block worth of padding "waste" per chunk
+boundary - negligible in practice, since 190 bytes divides fairly evenly
+into typical chunk sizes). What chunking
 *does* affect is latency (finer chunks land sooner) and message-count
 overhead (more frames, more per-message framing/relay cost) - not total
 crypto cost. For a channel with `N` other members, a sender pays `N`× the
@@ -959,13 +1048,22 @@ into exactly the following, and nothing else -
   joined/left) - channel *names* for private channels are known to the
   server (it has to route by them) even though they're never advertised
   to other clients via `ChannelList`.
-- The **size** (block count) and **timing** of every message/chunk,
-  and **who it's addressed to** - since routing requires a `UserId`,
-  the server always knows who's talking to whom and roughly how much,
-  even though it can't read a byte of what was said.
+- **That two specific clients are setting up a direct link** (§7.0): a
+  `RequestPeerLink`/`PeerCandidates` exchange names both `UserId`s and
+  each side's candidate IP:port addresses, and the timing of that
+  exchange - so the server can tell *who is about to talk to whom*, and
+  roughly when a conversation between two people starts.
+
+Since §7.0, this is now strictly **less** than before: the server used to
+also see the size (block count) and timing of *every individual*
+message/chunk, because it had to route each one by `UserId`. That's gone
+- once a link is `Active`, every message, voice chunk, and file chunk for
+that pair travels entirely off the server's wire, so it learns nothing
+further about how much was said, how often, or when, only that the
+conversation exists at all.
 
 It never sees: message plaintext (text or voice), voice audio content,
-or any private key.
+file names or contents, or any private key.
 
 ## 11. Per-message key rotation (`rsa_per_msg`)
 
@@ -1009,10 +1107,10 @@ received from that peer (a live voice stream counts as a single message
 for this purpose - see §11.6, not one rotation per chunk). Concretely,
 after either:
 
-- successfully sending a `SendChannel`/`SendDirect` envelope addressed to
+- successfully sending a `P2pPayload::Envelope` (§7.0.1) addressed to
   peer `P`, or
-- successfully decrypting an incoming `ChannelMessage`/`DirectMessage`
-  envelope from peer `P`,
+- successfully decrypting an incoming `P2pPayload::Envelope` from peer
+  `P`,
 
 the user generates a brand-new RSA keypair - at `crypto::RSA_PER_MSG_KEY_BITS`
 (4096 bits, larger than the `RSA_KEY_BITS` = 2048 used everywhere else in
@@ -1077,7 +1175,7 @@ Live voice (§7.3) is not compatible with per-chunk rotation - RSA key
 generation at `rsa_per_msg`'s 4096-bit size (§11.9) is far too slow
 (commonly a few hundred milliseconds, sometimes low seconds - notably
 slower than the 2048-bit keys used everywhere else in this app) to repeat
-every `voice::CHUNK_INTERVAL` (100ms) without stalling capture.
+every `voice::CHUNK_INTERVAL` (15ms) without stalling capture.
 Instead, an entire stream (`*Start` through `*End`) is treated as a
 single message for every purpose in this section:
 
@@ -1346,7 +1444,7 @@ and on a byte difference:
    §6-§11 completely unaffected. Specifically, while a peer's review is
    `Pending` or `Rejected` (`ui::IdentityStatus`):
    - This client will not encrypt anything **to** them: excluded from a
-     channel `SendChannel`/voice-stream recipient list (the message still
+     channel message/voice-stream recipient list (the message still
      reaches every other, verified member), and a direct room with them
      cannot be opened or typed into at all (Enter on their sidebar entry
      reopens the review popup instead of a private room).
@@ -1895,9 +1993,19 @@ members.
 `pq_hybrid` voice is not just "supported" but a *better* fit than every
 RSA method: the expensive asymmetric work (ML-DSA-87 sign, ML-KEM-1024
 encapsulate, RSA-4096 operations) happens once per stream, not once per
-100ms chunk - unlike `rsa_per_msg`, which has to exempt voice from its
+15ms chunk - unlike `rsa_per_msg`, which has to exempt voice from its
 own per-message rotation entirely because 4096-bit RSA keygen is far too
 slow to repeat every chunk (§11.6).
+
+That said, `pq_hybrid` is the one content type §7.0.1's
+`SAFE_DATAGRAM_BYTES` budget doesn't reach: `HybridStreamKeySetup`
+(kem_ciphertext + two signatures, §13.3) is several kilobytes on its own
+and is repeated on *every* chunk regardless of `CHUNK_INTERVAL`/
+`FILE_CHUNK_BYTES` - shrinking either just means paying that same fixed
+cost more often, not a smaller datagram. A `pq_hybrid` voice/file chunk
+will IP-fragment on most paths; this is a pre-existing property of this
+section's wire format, not something a chunk-size choice can fix (see
+`docs/TESTING.md`'s known coverage gaps).
 
 Everything in this section is written in terms of voice, but a `pq_hybrid`
 recipient's accepted file transfer (§7.6) reuses the identical mechanism
@@ -1923,10 +2031,9 @@ does, so instead of signing `data`, the sender signs
 `stream_id.to_be_bytes() ++ k_data` (`crypto::pq::wrap_key_for_stream`) -
 proving both "this stream's key really came from this identity" and "for
 this specific `stream_id`", so a captured key-setup can't be replayed
-against a different recording. No new `ClientMessage`/`ServerMessage`
-variant is needed for this - `StreamChannelStart`/`StreamDirectStart`
-stay unaddressed exactly as §7.3 describes; the key-setup travels inside
-the first chunk instead (next paragraph).
+against a different recording. No new `P2pPayload` variant is needed for
+this - `StreamStart` stays unaddressed exactly as §7.3 describes; the
+key-setup travels inside the first chunk instead (next paragraph).
 
 **Every chunk**, for a `pq_hybrid` recipient:
 
@@ -1935,8 +2042,9 @@ struct HybridVoiceChunk { key_setup: HybridStreamKeySetup, ciphertext: Vec<u8> }
 ```
 
 bincode-encoded as the single element of that chunk's `blocks` (the
-`per_recipient: Vec<(UserId, Vec<Vec<u8>>)>` shape on `StreamChannelChunk`/
-`StreamDirectChunk` is completely unchanged - scheme-agnostic already).
+`per_recipient: Vec<(UserId, Vec<Vec<u8>>)>` shape client-side voice
+fan-out uses to build each recipient's `PunchDatagram::Unreliable` is
+completely unchanged - scheme-agnostic already).
 `ciphertext` is `pcm` encrypted with AES-256-GCM under `k_data` and a
 **deterministic nonce**, `stream_id.to_be_bytes() ++ seq.to_be_bytes()`
 (`crypto::pq::chunk_nonce`) - unique for the life of one stream's `k_data`
@@ -1949,9 +2057,12 @@ wire (`seq`).
 `key_setup` is **repeated verbatim in every chunk**, not sent once at
 `*Start` - a deliberate, documented tradeoff: real bandwidth overhead
 (roughly the size of two RSA-4096 ciphertexts plus an ML-KEM-1024
-ciphertext and two signatures, repeated every 100ms) traded for zero
-wire-protocol restructuring of `*Start`/`*Chunk`. A future revision could
-move it into `*Start` alone if bandwidth becomes a concern.
+ciphertext and two signatures, repeated every 15ms) traded for zero
+wire-protocol restructuring of `*Start`/`*Chunk`. Since §7.0's direct
+peer-to-peer transport, this is no longer just a bandwidth tradeoff: it's
+also why a `pq_hybrid` chunk can't fit under `SAFE_DATAGRAM_BYTES`
+(§7.0.1/§13.7) regardless of how small `pcm`/the file slice is. A future
+revision moving it into `*Start` alone would fix both at once.
 
 **Receiver side**: on the *first* chunk seen for a given `(from,
 stream_id)`, recover and authenticate `k_data`

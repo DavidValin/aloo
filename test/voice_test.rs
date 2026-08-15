@@ -1,7 +1,34 @@
+use aloo::p2p_proto::SAFE_DATAGRAM_BYTES;
 use aloo::voice::{
     decode_wav_to_mono, downmix_f32_to_mono_i16, downmix_i16_to_mono, end_chime_samples, format_duration_label,
-    pcm_from_bytes, pcm_to_bytes, recording_at_max, resample, MAX_RECORDING_SAMPLES, MAX_RECORDING_SECS, SAMPLE_RATE_HZ,
+    pcm_from_bytes, pcm_to_bytes, recording_at_max, resample, CHUNK_INTERVAL, MAX_RECORDING_SAMPLES, MAX_RECORDING_SECS,
+    SAMPLE_RATE_HZ,
 };
+
+/// @requirement TB-148
+#[test]
+fn chunk_interval_stays_under_the_p2p_safe_datagram_budget() {
+    // A voice chunk now travels as one direct peer-to-peer UDP datagram
+    // (`docs/PROTOCOL.md` §7.0/§7.3), sent unreliably but still subject to
+    // the same UDP-safety budget the reliable frames are - a fragmented
+    // datagram is just as likely to be dropped either way. Worst-case
+    // RSA-OAEP expansion (2048-bit key, `docs/PROTOCOL.md` §8.1) is
+    // ~256/190 per block; leaves a 300-byte margin for
+    // `PunchDatagram::Unreliable`'s framing overhead around the raw
+    // ciphertext bytes.
+    let bytes_per_ms = (SAMPLE_RATE_HZ as f64 / 1000.0) * 2.0; // mono, 16-bit
+    let plaintext_per_chunk = CHUNK_INTERVAL.as_millis() as f64 * bytes_per_ms;
+    let blocks_per_chunk = (plaintext_per_chunk / 190.0).ceil();
+    let worst_case_ciphertext = blocks_per_chunk * 256.0;
+    let framing_overhead = 300.0;
+    assert!(
+        worst_case_ciphertext + framing_overhead < SAFE_DATAGRAM_BYTES as f64,
+        "worst-case {worst_case_ciphertext} + {framing_overhead} framing overhead must stay under SAFE_DATAGRAM_BYTES {} \
+         for a {:?} CHUNK_INTERVAL",
+        SAFE_DATAGRAM_BYTES,
+        CHUNK_INTERVAL
+    );
+}
 
 /// @requirement AC-099
 #[test]

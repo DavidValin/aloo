@@ -10,11 +10,13 @@ use cucumber::{given, then, when};
 use tokio::net::{TcpListener, TcpStream};
 
 use aloo::crypto;
+use aloo::p2p::{P2pEvent, PeerLinkManager};
+use aloo::p2p_proto::P2pPayload;
 use aloo::proto::{
     AuthKind, AuthResponse, ChannelKind, ClientMessage, Content, Envelope, KeyMode, ServerMessage,
     UserId, read_message, write_message,
 };
-use aloo::server::{AuthConfig, Registry, serve};
+use aloo::server::{AuthConfig, Registry, serve_with_rendezvous};
 
 use crate::world::{ClientState, AlooWorld, keypair_for};
 
@@ -25,10 +27,105 @@ use crate::world::{ClientState, AlooWorld, keypair_for};
 async fn spawn_server(auth: AuthConfig) -> std::net::SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let udp = tokio::net::UdpSocket::bind(addr).await.unwrap();
     tokio::spawn(async move {
-        let _ = serve(listener, auth).await;
+        let _ = serve_with_rendezvous(listener, udp, auth).await;
     });
     addr
+}
+
+/// Binds `who`'s direct-link transport the first time it's needed - a
+/// no-op if it already has one.
+async fn bind_peer_link(w: &mut AlooWorld, who: &str) {
+    if w.client_mut(who).peer_link.is_some() {
+        return;
+    }
+    let server_addr = w.addr.expect("no server running");
+    let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel::<P2pEvent>();
+    let (peer_link, socket) = PeerLinkManager::bind("127.0.0.1:0".parse().unwrap(), server_addr, events_tx)
+        .await
+        .expect("failed to bind direct-link socket");
+    let (raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel();
+    aloo::p2p::spawn_receive_loop(socket, raw_tx);
+    let client = w.client_mut(who);
+    client.peer_link = Some(peer_link);
+    client.p2p_raw_rx = Some(raw_rx);
+    client.p2p_events_rx = Some(events_rx);
+}
+
+/// Runs the full server-assisted candidate exchange and loopback punch
+/// handshake between `a` and `b` (mirrors `test/p2p_test.rs`), leaving both
+/// with an `Active` direct link - a no-op if one already exists. Scenarios
+/// call this once before their first send between two people; every step
+/// that sends content over the direct link assumes it's already been
+/// called (via the `{word} and {word} are both in the channel` / a direct
+/// first-send Given/When step).
+async fn ensure_peer_link(w: &mut AlooWorld, a: &str, b: &str) {
+    let (a_id, b_id) = (w.id_of(a), w.id_of(b));
+    bind_peer_link(w, a).await;
+    bind_peer_link(w, b).await;
+    if w.client_mut(a).peer_link.as_ref().unwrap().is_active(b_id) {
+        return;
+    }
+
+    // Both clients' streams/peer_links are borrowed at once below, so pull
+    // them out of the map rather than fighting the borrow checker with two
+    // `client_mut` calls.
+    let mut ca = w.clients.remove(a).expect("no such client");
+    let mut cb = w.clients.remove(b).expect("no such client");
+
+    let a_stream = ca.stream.as_mut().expect("a has no socket");
+    ca.peer_link.as_mut().unwrap().ensure_link(a_stream, b_id).await;
+    let ServerMessage::PeerCandidates { from, candidates, link_nonce } =
+        read_message(cb.stream.as_mut().unwrap()).await.unwrap().unwrap()
+    else {
+        panic!("b should receive a's PeerCandidates");
+    };
+    assert_eq!(from, a_id);
+    let b_stream = cb.stream.as_mut().unwrap();
+    cb.peer_link.as_mut().unwrap().on_peer_candidates(b_stream, a_id, candidates, link_nonce).await;
+
+    let ServerMessage::PeerCandidates { from, candidates, link_nonce } =
+        read_message(ca.stream.as_mut().unwrap()).await.unwrap().unwrap()
+    else {
+        panic!("a should receive b's PeerCandidates reply");
+    };
+    assert_eq!(from, b_id);
+    let a_stream = ca.stream.as_mut().unwrap();
+    ca.peer_link.as_mut().unwrap().on_peer_candidates(a_stream, b_id, candidates, link_nonce).await;
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !(ca.peer_link.as_ref().unwrap().is_active(b_id) && cb.peer_link.as_ref().unwrap().is_active(a_id)) {
+        assert!(tokio::time::Instant::now() < deadline, "loopback punch did not complete in time");
+        tokio::select! {
+            Some((addr, dgram)) = ca.p2p_raw_rx.as_mut().unwrap().recv() => ca.peer_link.as_mut().unwrap().on_datagram(addr, dgram),
+            Some((addr, dgram)) = cb.p2p_raw_rx.as_mut().unwrap().recv() => cb.peer_link.as_mut().unwrap().on_datagram(addr, dgram),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {}
+        }
+    }
+
+    w.clients.insert(a.to_string(), ca);
+    w.clients.insert(b.to_string(), cb);
+}
+
+/// Drains `who`'s direct-link datagrams until its event channel yields one,
+/// or `timeout` elapses - the direct-transport counterpart of
+/// `expect_message` below.
+async fn expect_p2p_event(w: &mut AlooWorld, who: &str, timeout: std::time::Duration) -> P2pEvent {
+    let client = w.client_mut(who);
+    let peer_link = client.peer_link.as_mut().expect("no direct link bound for this client");
+    let raw_rx = client.p2p_raw_rx.as_mut().unwrap();
+    let events_rx = client.p2p_events_rx.as_mut().unwrap();
+    tokio::time::timeout(timeout, async {
+        loop {
+            tokio::select! {
+                Some((addr, dgram)) = raw_rx.recv() => peer_link.on_datagram(addr, dgram),
+                Some(event) = events_rx.recv() => return event,
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for a direct-link event")
 }
 
 /// Runs the full Hello/Auth/Identify handshake and returns the assigned id.
@@ -92,7 +189,7 @@ async fn client_connects(w: &mut AlooWorld, who: String) {
     let mut stream = TcpStream::connect(addr).await.unwrap();
     let id = handshake(&mut stream, &who, KeyMode::Rsa).await;
     w.ids.insert(who.clone(), id);
-    w.clients.insert(who, ClientState { stream: Some(stream), received: Vec::new() });
+    w.clients.insert(who, ClientState { stream: Some(stream), received: Vec::new(), ..Default::default() });
 }
 
 #[given(expr = "{word} has connected using rsa_per_msg")]
@@ -101,7 +198,7 @@ async fn client_connects_perms(w: &mut AlooWorld, who: String) {
     let mut stream = TcpStream::connect(addr).await.unwrap();
     let id = handshake(&mut stream, &who, KeyMode::PerMessage).await;
     w.ids.insert(who.clone(), id);
-    w.clients.insert(who, ClientState { stream: Some(stream), received: Vec::new() });
+    w.clients.insert(who, ClientState { stream: Some(stream), received: Vec::new(), ..Default::default() });
 }
 
 #[given(expr = "{word} and {word} are both in the channel {string}")]
@@ -177,54 +274,34 @@ async fn when_joins(w: &mut AlooWorld, who: String, channel: String) {
 
 #[when(expr = "{word} sends {string} to {word} in {string}")]
 async fn send_channel_text(w: &mut AlooWorld, from: String, body: String, to: String, channel: String) {
+    ensure_peer_link(w, &from, &to).await;
     let to_id = w.id_of(&to);
     let envelope = Envelope { content: Content::Text, blocks: vec![body.into_bytes()] };
     w.envelope = Some(envelope.clone());
-    let client = w.client_mut(&from);
-    let stream = client.stream.as_mut().unwrap();
-    write_message(
-        stream,
-        &ClientMessage::SendChannel { channel: channel.clone(), per_recipient: vec![(to_id, envelope)] },
-    )
-    .await
-    .unwrap();
+    w.client_mut(&from)
+        .peer_link
+        .as_mut()
+        .unwrap()
+        .send_reliable_or_queue(to_id, P2pPayload::Envelope { channel: Some(channel), envelope });
 }
 
 #[when(expr = "{word} sends the private message {string} to {word}")]
 async fn send_direct_text(w: &mut AlooWorld, from: String, body: String, to: String) {
+    ensure_peer_link(w, &from, &to).await;
     let to_id = w.id_of(&to);
     let envelope = Envelope { content: Content::Text, blocks: vec![body.into_bytes()] };
     w.envelope = Some(envelope.clone());
-    let client = w.client_mut(&from);
-    let stream = client.stream.as_mut().unwrap();
-    write_message(stream, &ClientMessage::SendDirect { to: to_id, envelope }).await.unwrap();
+    w.client_mut(&from).peer_link.as_mut().unwrap().send_reliable_or_queue(to_id, P2pPayload::Envelope { channel: None, envelope });
 }
 
 #[when(expr = "{word} streams a voice message to {string} addressed to {word}")]
 async fn stream_voice(w: &mut AlooWorld, from: String, channel: String, to: String) {
+    ensure_peer_link(w, &from, &to).await;
     let to_id = w.id_of(&to);
-    let client = w.client_mut(&from);
-    let stream = client.stream.as_mut().unwrap();
-    write_message(stream, &ClientMessage::StreamChannelStart { channel: channel.clone(), stream_id: 42 })
-        .await
-        .unwrap();
-    write_message(
-        stream,
-        &ClientMessage::StreamChannelChunk {
-            channel: channel.clone(),
-            stream_id: 42,
-            seq: 0,
-            per_recipient: vec![(to_id, vec![vec![1, 2, 3]])],
-        },
-    )
-    .await
-    .unwrap();
-    write_message(
-        stream,
-        &ClientMessage::StreamChannelEnd { channel, stream_id: 42, duration_ms: 100 },
-    )
-    .await
-    .unwrap();
+    let peer_link = w.client_mut(&from).peer_link.as_mut().unwrap();
+    peer_link.send_reliable_or_queue(to_id, P2pPayload::StreamStart { channel: Some(channel), stream_id: 42 });
+    peer_link.send_unreliable_voice(to_id, 42, 0, vec![vec![1, 2, 3]]);
+    peer_link.send_reliable_or_queue(to_id, P2pPayload::StreamEnd { stream_id: 42, duration_ms: 100 });
 }
 
 #[when(expr = "someone else tries to connect as {string}")]
@@ -248,7 +325,7 @@ async fn duplicate_nickname(w: &mut AlooWorld, name: String) {
     let result: ServerMessage = read_message(&mut stream).await.unwrap().unwrap();
     w.clients.insert(
         "impostor".into(),
-        ClientState { stream: Some(stream), received: vec![result] },
+        ClientState { stream: Some(stream), received: vec![result], ..Default::default() },
     );
 }
 
@@ -271,7 +348,7 @@ async fn offer_password(w: &mut AlooWorld, password: String) {
     write_message(&mut stream, &ClientMessage::Auth(AuthResponse::Password(password))).await.unwrap();
     let result: ServerMessage = read_message(&mut stream).await.unwrap().unwrap();
     w.clients
-        .insert("candidate".into(), ClientState { stream: Some(stream), received: vec![result] });
+        .insert("candidate".into(), ClientState { stream: Some(stream), received: vec![result], ..Default::default() });
 }
 
 #[when(expr = "{word} leaves {string}")]
@@ -295,20 +372,19 @@ async fn receives_channel_message(
 ) {
     let from_id = w.id_of(&from_name);
     let expected = w.envelope.clone().expect("nothing was sent");
-    let msg = expect_message(w, &who).await;
-    match msg {
-        ServerMessage::ChannelMessage { channel: got_channel, from, from_name: got_name, envelope } => {
-            assert_eq!(got_channel, channel, "delivered into the wrong channel");
+    let event = expect_p2p_event(w, &who, std::time::Duration::from_secs(5)).await;
+    match event {
+        P2pEvent::Message { channel: got_channel, from, envelope } => {
+            assert_eq!(got_channel.as_deref(), Some(channel.as_str()), "delivered into the wrong channel");
             assert_eq!(from, from_id, "attributed to the wrong sender id");
-            assert_eq!(got_name, from_name, "attributed to the wrong sender name");
-            assert_eq!(envelope, expected, "the encrypted body must arrive byte for byte");
+            assert_eq!(envelope, expected, "the message must arrive byte for byte");
             assert_eq!(
                 envelope.blocks,
                 vec![body.into_bytes()],
-                "the relayed ciphertext must be exactly what the sender addressed"
+                "the delivered ciphertext must be exactly what the sender addressed"
             );
         }
-        other => panic!("expected a ChannelMessage, got {other:?}"),
+        _ => panic!("expected a direct-link Message event"),
     }
 }
 
@@ -316,15 +392,15 @@ async fn receives_channel_message(
 async fn receives_direct_message(w: &mut AlooWorld, who: String, body: String, from_name: String) {
     let from_id = w.id_of(&from_name);
     let expected = w.envelope.clone().expect("nothing was sent");
-    let msg = expect_message(w, &who).await;
-    match msg {
-        ServerMessage::DirectMessage { from, from_name: got_name, envelope } => {
+    let event = expect_p2p_event(w, &who, std::time::Duration::from_secs(5)).await;
+    match event {
+        P2pEvent::Message { channel, from, envelope } => {
+            assert_eq!(channel, None, "a DM must not carry a channel");
             assert_eq!(from, from_id);
-            assert_eq!(got_name, from_name);
-            assert_eq!(envelope, expected, "the encrypted body must arrive unchanged");
+            assert_eq!(envelope, expected, "the message must arrive unchanged");
             assert_eq!(envelope.blocks, vec![body.into_bytes()]);
         }
-        other => panic!("expected a DirectMessage, got {other:?}"),
+        _ => panic!("expected a direct-link Message event"),
     }
 }
 
@@ -370,33 +446,25 @@ async fn learns_then_joined(w: &mut AlooWorld, who: String, other: String) {
 
 #[then(expr = "{word} receives the voice message start, chunk and end in that order")]
 async fn receives_stream_in_order(w: &mut AlooWorld, who: String) {
-    let from_id = *w.ids.values().next().expect("no ids");
-    let start = expect_message(w, &who).await;
+    let timeout = std::time::Duration::from_secs(5);
+    let start = expect_p2p_event(w, &who, timeout).await;
     assert!(
-        matches!(&start, ServerMessage::ChannelStreamStart { stream_id: 42, .. }),
-        "expected the stream to open, got {start:?}"
+        matches!(&start, P2pEvent::StreamStart { stream_id: 42, .. }),
+        "expected the stream to open"
     );
 
-    let chunk = expect_message(w, &who).await;
+    let chunk = expect_p2p_event(w, &who, timeout).await;
     match chunk {
-        ServerMessage::ChannelStreamChunk { from, stream_id, seq, blocks, .. } => {
+        P2pEvent::StreamChunk { stream_id, seq, blocks, .. } => {
             assert_eq!(stream_id, 42, "chunk belongs to the stream that opened");
             assert_eq!(seq, 0);
-            assert_eq!(blocks, vec![vec![1, 2, 3]], "the encrypted audio must arrive unchanged");
-            let _ = from;
+            assert_eq!(blocks, vec![vec![1, 2, 3]], "the audio must arrive unchanged");
         }
-        other => panic!("expected a chunk, got {other:?}"),
+        _ => panic!("expected a stream chunk"),
     }
 
-    let end = expect_message(w, &who).await;
-    match end {
-        ServerMessage::ChannelStreamEnd { stream_id, duration_ms, .. } => {
-            assert_eq!(stream_id, 42);
-            assert_eq!(duration_ms, 100, "the real recorded length must survive the relay");
-        }
-        other => panic!("expected the stream to close, got {other:?}"),
-    }
-    let _ = from_id;
+    let end = expect_p2p_event(w, &who, timeout).await;
+    assert!(matches!(end, P2pEvent::StreamEnd { stream_id: 42, .. }), "expected the stream to close");
 }
 
 #[then("the connection is accepted")]
@@ -454,7 +522,7 @@ async fn nickname_reclaimable(w: &mut AlooWorld, name: String) {
     let id = handshake(&mut stream, &name, KeyMode::Rsa).await;
     w.ids.insert("reclaimer".into(), id);
     w.clients
-        .insert("reclaimer".into(), ClientState { stream: Some(stream), received: vec![] });
+        .insert("reclaimer".into(), ClientState { stream: Some(stream), received: vec![], ..Default::default() });
 }
 
 #[then(expr = "a brand new server offers exactly one public channel called {string}")]

@@ -218,134 +218,31 @@ fn leave_channel_still_sends_userleft_while_the_user_stays_connected() {
     assert!(reg.user_info(alice).is_some());
 }
 
-/// @requirement AC-024, TB-029
+// ---------------------------------------------------------------------
+// Direct-link signaling: candidate-exchange relay (crate::p2p)
+// ---------------------------------------------------------------------
+
+/// @requirement AC-100, TB-143
 #[test]
-fn channel_message_is_delivered_only_to_addressed_channel_members() {
+fn peer_link_request_relays_candidates_to_the_named_peer() {
     let mut reg = Registry::new();
     let alice = reg.register("alice".into(), vec![], KeyMode::Rsa);
     let bob = reg.register("bob".into(), vec![], KeyMode::Rsa);
-    let mallory = reg.register("mallory".into(), vec![], KeyMode::Rsa); // never joins
-    reg.join_channel(alice, "general", ChannelKind::Public).unwrap();
-    reg.join_channel(bob, "general", ChannelKind::Public).unwrap();
+    let candidates = vec!["127.0.0.1:4000".parse().unwrap(), "203.0.113.5:51820".parse().unwrap()];
 
-    let env = Envelope { content: Content::Text, blocks: vec![vec![1, 2, 3]] };
-    let out = reg
-        .route_channel_message(alice, "general", vec![(bob, env.clone()), (mallory, env)])
-        .expect("route ok");
-
-    assert_eq!(out.len(), 1, "mallory is not a member, must be dropped: {out:?}");
-    assert_eq!(out[0].to, bob);
-    assert!(matches!(&out[0].message, ServerMessage::ChannelMessage{channel, from, ..}
-        if channel == "general" && *from == alice));
-}
-
-/// A `FileOffer` is a point-to-point relay, addressed exactly like
-/// `SendDirect` (`docs/PROTOCOL.md`'s file transfer section) - unaffected
-/// by whether `to` and `from` share a channel, and carrying `channel`
-/// through untouched as cleartext routing metadata.
-///
-/// @requirement AC-075
-#[test]
-fn file_offer_relays_point_to_point_carrying_channel_through() {
-    let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::Rsa);
-    let bob = reg.register("bob".into(), vec![], KeyMode::Rsa);
-
-    let env = Envelope { content: Content::FileOffer, blocks: vec![vec![1, 2, 3]] };
-    let out = reg.route_file_offer(alice, bob, 7, Some("general".into()), env.clone()).expect("route ok");
+    let out = reg.route_peer_link_request(alice, bob, candidates.clone(), 42).expect("route ok");
 
     assert_eq!(out.to, bob);
-    assert!(matches!(
-        &out.message,
-        ServerMessage::FileOffer { from, from_name, stream_id: 7, channel: Some(c), envelope }
-            if *from == alice && from_name == "alice" && c == "general" && envelope == &env
-    ));
+    assert!(matches!(&out.message, ServerMessage::PeerCandidates { from, candidates: got, link_nonce: 42 }
+        if *from == alice && got == &candidates));
 }
 
-/// @requirement TB-141
+/// @requirement TB-143
 #[test]
-fn file_offer_to_an_unknown_recipient_is_rejected() {
+fn peer_link_request_to_an_unknown_recipient_is_rejected() {
     let mut reg = Registry::new();
     let alice = reg.register("alice".into(), vec![], KeyMode::Rsa);
-    let env = Envelope { content: Content::FileOffer, blocks: vec![vec![1]] };
-    assert!(reg.route_file_offer(alice, UserId(999), 1, None, env).is_err());
-}
-
-/// @requirement AC-096
-#[test]
-fn file_accept_and_reject_relay_to_the_original_sender() {
-    let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::Rsa);
-    let bob = reg.register("bob".into(), vec![], KeyMode::Rsa);
-
-    let accepted = reg.route_file_accept(bob, alice, 7).expect("route ok");
-    assert_eq!(accepted.to, alice);
-    assert!(matches!(accepted.message, ServerMessage::FileAccepted { from, stream_id: 7 } if from == bob));
-
-    let rejected = reg.route_file_reject(bob, alice, 8).expect("route ok");
-    assert_eq!(rejected.to, alice);
-    assert!(matches!(rejected.message, ServerMessage::FileRejected { from, stream_id: 8 } if from == bob));
-}
-
-/// @requirement AC-076
-#[test]
-fn file_chunk_and_end_relay_point_to_point() {
-    let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::Rsa);
-    let bob = reg.register("bob".into(), vec![], KeyMode::Rsa);
-
-    let chunk = reg.route_file_chunk(alice, bob, 7, 0, vec![vec![9, 9]]).expect("route ok");
-    assert_eq!(chunk.to, bob);
-    assert!(matches!(chunk.message, ServerMessage::FileChunk { from, stream_id: 7, seq: 0, .. } if from == alice));
-
-    let end = reg.route_file_end(alice, bob, 7).expect("route ok");
-    assert_eq!(end.to, bob);
-    assert!(matches!(end.message, ServerMessage::FileEnd { from, stream_id: 7 } if from == alice));
-}
-
-/// @requirement TB-030
-#[test]
-fn channel_message_from_non_member_is_rejected() {
-    let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::Rsa);
-    let bob = reg.register("bob".into(), vec![], KeyMode::Rsa);
-    reg.join_channel(bob, "general", ChannelKind::Public).unwrap();
-
-    let env = Envelope { content: Content::Text, blocks: vec![vec![1]] };
-    let err = reg.route_channel_message(alice, "general", vec![(bob, env)]).unwrap_err();
-    assert!(err.contains("not a member"));
-}
-
-/// @requirement TB-030
-#[test]
-fn channel_message_to_unknown_channel_is_rejected() {
-    let reg = Registry::new();
-    let env = Envelope { content: Content::Text, blocks: vec![vec![1]] };
-    let err = reg
-        .route_channel_message(UserId(1), "does-not-exist", vec![(UserId(2), env)])
-        .unwrap_err();
-    assert!(err.contains("no such channel"));
-}
-
-/// @requirement AC-027
-#[test]
-fn direct_message_is_delivered_to_recipient() {
-    let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::Rsa);
-    let bob = reg.register("bob".into(), vec![], KeyMode::Rsa);
-    let env = Envelope { content: Content::Text, blocks: vec![vec![7]] };
-    let out = reg.route_direct_message(alice, bob, env).expect("route ok");
-    assert_eq!(out.to, bob);
-    assert!(matches!(&out.message, ServerMessage::DirectMessage{from, ..} if *from == alice));
-}
-
-/// @requirement TB-032
-#[test]
-fn direct_message_to_unknown_recipient_is_rejected() {
-    let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::Rsa);
-    let env = Envelope { content: Content::Text, blocks: vec![] };
-    let err = reg.route_direct_message(alice, UserId(9999), env).unwrap_err();
+    let err = reg.route_peer_link_request(alice, UserId(9999), vec![], 1).unwrap_err();
     assert!(err.contains("unknown recipient"));
 }
 
@@ -401,135 +298,6 @@ fn key_rotation_from_unknown_sender_is_rejected() {
     let bob = reg.register("bob".into(), vec![], KeyMode::Rsa);
     let err = reg.route_key_rotation(UserId(9999), bob, vec![], vec![]).unwrap_err();
     assert!(err.contains("unknown sender"));
-}
-
-// ---------------------------------------------------------------------
-// Live-streamed voice: Registry routing
-// ---------------------------------------------------------------------
-
-/// @requirement TB-037
-#[test]
-fn channel_stream_start_broadcasts_to_members_excluding_sender() {
-    let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::Rsa);
-    let bob = reg.register("bob".into(), vec![], KeyMode::Rsa);
-    reg.join_channel(alice, "general", ChannelKind::Public).unwrap();
-    reg.join_channel(bob, "general", ChannelKind::Public).unwrap();
-
-    let out = reg.route_channel_stream_start(alice, "general", 42).expect("route ok");
-    assert_eq!(out.len(), 1, "only bob should be notified, not alice herself: {out:?}");
-    assert_eq!(out[0].to, bob);
-    assert!(matches!(&out[0].message, ServerMessage::ChannelStreamStart { channel, from, stream_id, .. }
-        if channel == "general" && *from == alice && *stream_id == 42));
-}
-
-/// @requirement TB-039
-#[test]
-fn channel_stream_start_from_non_member_is_rejected() {
-    let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::Rsa);
-    let bob = reg.register("bob".into(), vec![], KeyMode::Rsa);
-    reg.join_channel(bob, "general", ChannelKind::Public).unwrap();
-
-    let err = reg.route_channel_stream_start(alice, "general", 1).unwrap_err();
-    assert!(err.contains("not a member"));
-}
-
-/// @requirement TB-039
-#[test]
-fn channel_stream_start_to_unknown_channel_is_rejected() {
-    let reg = Registry::new();
-    let err = reg.route_channel_stream_start(UserId(1), "does-not-exist", 1).unwrap_err();
-    assert!(err.contains("no such channel"));
-}
-
-/// @requirement TB-038
-#[test]
-fn channel_stream_chunk_delivered_only_to_addressed_members() {
-    let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::Rsa);
-    let bob = reg.register("bob".into(), vec![], KeyMode::Rsa);
-    let mallory = reg.register("mallory".into(), vec![], KeyMode::Rsa); // never joins
-    reg.join_channel(alice, "general", ChannelKind::Public).unwrap();
-    reg.join_channel(bob, "general", ChannelKind::Public).unwrap();
-
-    let blocks = vec![vec![1, 2, 3]];
-    let out = reg
-        .route_channel_stream_chunk(alice, "general", 42, 0, vec![(bob, blocks.clone()), (mallory, blocks)])
-        .expect("route ok");
-
-    assert_eq!(out.len(), 1, "mallory is not a member, must be dropped: {out:?}");
-    assert_eq!(out[0].to, bob);
-    assert!(matches!(&out[0].message, ServerMessage::ChannelStreamChunk{channel, from, stream_id, seq, ..}
-        if channel == "general" && *from == alice && *stream_id == 42 && *seq == 0));
-}
-
-/// @requirement TB-039
-#[test]
-fn channel_stream_chunk_from_non_member_is_rejected() {
-    let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::Rsa);
-    let bob = reg.register("bob".into(), vec![], KeyMode::Rsa);
-    reg.join_channel(bob, "general", ChannelKind::Public).unwrap();
-
-    let err = reg.route_channel_stream_chunk(alice, "general", 1, 0, vec![(bob, vec![])]).unwrap_err();
-    assert!(err.contains("not a member"));
-}
-
-/// @requirement TB-039
-#[test]
-fn channel_stream_chunk_to_unknown_channel_is_rejected() {
-    let reg = Registry::new();
-    let err = reg.route_channel_stream_chunk(UserId(1), "does-not-exist", 1, 0, vec![]).unwrap_err();
-    assert!(err.contains("no such channel"));
-}
-
-/// @requirement TB-037
-#[test]
-fn channel_stream_end_broadcasts_to_members_excluding_sender() {
-    let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::Rsa);
-    let bob = reg.register("bob".into(), vec![], KeyMode::Rsa);
-    reg.join_channel(alice, "general", ChannelKind::Public).unwrap();
-    reg.join_channel(bob, "general", ChannelKind::Public).unwrap();
-
-    let out = reg.route_channel_stream_end(alice, "general", 42, 3200).expect("route ok");
-    assert_eq!(out.len(), 1);
-    assert_eq!(out[0].to, bob);
-    assert!(matches!(&out[0].message, ServerMessage::ChannelStreamEnd{channel, from, stream_id, duration_ms}
-        if channel == "general" && *from == alice && *stream_id == 42 && *duration_ms == 3200));
-}
-
-/// @requirement TB-037
-#[test]
-fn direct_stream_start_chunk_end_delivered_to_recipient() {
-    let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::Rsa);
-    let bob = reg.register("bob".into(), vec![], KeyMode::Rsa);
-
-    let start = reg.route_direct_stream_start(alice, bob, 7).expect("route ok");
-    assert_eq!(start.to, bob);
-    assert!(matches!(&start.message, ServerMessage::DirectStreamStart{from, stream_id, ..}
-        if *from == alice && *stream_id == 7));
-
-    let chunk = reg.route_direct_stream_chunk(alice, bob, 7, 0, vec![vec![9]]).expect("route ok");
-    assert_eq!(chunk.to, bob);
-    assert!(matches!(&chunk.message, ServerMessage::DirectStreamChunk{from, stream_id, seq, ..}
-        if *from == alice && *stream_id == 7 && *seq == 0));
-
-    let end = reg.route_direct_stream_end(alice, bob, 7, 1500).expect("route ok");
-    assert_eq!(end.to, bob);
-    assert!(matches!(&end.message, ServerMessage::DirectStreamEnd{from, stream_id, duration_ms}
-        if *from == alice && *stream_id == 7 && *duration_ms == 1500));
-}
-
-/// @requirement TB-039
-#[test]
-fn direct_stream_start_to_unknown_recipient_is_rejected() {
-    let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::Rsa);
-    let err = reg.route_direct_stream_start(alice, UserId(9999), 1).unwrap_err();
-    assert!(err.contains("unknown recipient"));
 }
 
 // ---------------------------------------------------------------------
@@ -631,7 +399,7 @@ async fn spawn_test_server(auth: AuthConfig) -> std::net::SocketAddr {
 
 /// @requirement AC-019, AC-024
 #[tokio::test]
-async fn end_to_end_two_clients_join_and_exchange_channel_message() {
+async fn end_to_end_two_clients_join_and_learn_about_each_other() {
     let addr = spawn_test_server(AuthConfig::None).await;
 
     let mut a = TcpStream::connect(addr).await.unwrap();
@@ -659,108 +427,6 @@ async fn end_to_end_two_clients_join_and_exchange_channel_message() {
     assert!(matches!(bob_snapshot, ServerMessage::UserJoined { user, .. } if user.id == alice_id));
     let bob_joined: ServerMessage = read_message(&mut b).await.unwrap().unwrap();
     assert!(matches!(bob_joined, ServerMessage::Joined { .. }));
-
-    // alice sends a channel message addressed only to bob
-    let env = Envelope { content: Content::Text, blocks: vec![b"hi bob".to_vec()] };
-    write_message(
-        &mut a,
-        &ClientMessage::SendChannel { channel: "general".into(), per_recipient: vec![(bob_id, env.clone())] },
-    )
-    .await
-    .unwrap();
-
-    let received: ServerMessage = read_message(&mut b).await.unwrap().unwrap();
-    match received {
-        ServerMessage::ChannelMessage { channel, from, from_name, envelope } => {
-            assert_eq!(channel, "general");
-            assert_eq!(from, alice_id);
-            assert_eq!(from_name, "alice");
-            assert_eq!(envelope, env);
-        }
-        other => panic!("expected ChannelMessage, got {other:?}"),
-    }
-}
-
-/// @requirement AC-027
-#[tokio::test]
-async fn end_to_end_direct_message_between_two_clients() {
-    let addr = spawn_test_server(AuthConfig::None).await;
-
-    let mut a = TcpStream::connect(addr).await.unwrap();
-    let alice_id = handshake_no_auth(&mut a, "alice").await;
-    let mut b = TcpStream::connect(addr).await.unwrap();
-    let bob_id = handshake_no_auth(&mut b, "bob").await;
-
-    let env = Envelope { content: Content::Text, blocks: vec![vec![1, 2, 3]] };
-    write_message(&mut a, &ClientMessage::SendDirect { to: bob_id, envelope: env.clone() }).await.unwrap();
-
-    let received: ServerMessage = read_message(&mut b).await.unwrap().unwrap();
-    match received {
-        ServerMessage::DirectMessage { from, from_name, envelope } => {
-            assert_eq!(from, alice_id);
-            assert_eq!(from_name, "alice");
-            assert_eq!(envelope, env);
-        }
-        other => panic!("expected DirectMessage, got {other:?}"),
-    }
-}
-
-/// @requirement AC-039
-#[tokio::test]
-async fn end_to_end_channel_voice_stream_arrives_in_order() {
-    let addr = spawn_test_server(AuthConfig::None).await;
-
-    let mut a = TcpStream::connect(addr).await.unwrap();
-    let alice_id = handshake_no_auth(&mut a, "alice").await;
-    let mut b = TcpStream::connect(addr).await.unwrap();
-    let bob_id = handshake_no_auth(&mut b, "bob").await;
-
-    write_message(&mut a, &ClientMessage::JoinChannel { name: "general".into(), kind: ChannelKind::Public })
-        .await
-        .unwrap();
-    let _: ServerMessage = read_message(&mut a).await.unwrap().unwrap(); // Joined
-    write_message(&mut b, &ClientMessage::JoinChannel { name: "general".into(), kind: ChannelKind::Public })
-        .await
-        .unwrap();
-    let _: ServerMessage = read_message(&mut a).await.unwrap().unwrap(); // alice sees bob join
-    let _: ServerMessage = read_message(&mut b).await.unwrap().unwrap(); // bob's snapshot of alice
-    let _: ServerMessage = read_message(&mut b).await.unwrap().unwrap(); // bob's own Joined
-
-    write_message(&mut a, &ClientMessage::StreamChannelStart { channel: "general".into(), stream_id: 42 })
-        .await
-        .unwrap();
-    write_message(
-        &mut a,
-        &ClientMessage::StreamChannelChunk {
-            channel: "general".into(),
-            stream_id: 42,
-            seq: 0,
-            per_recipient: vec![(bob_id, vec![vec![1, 2, 3]])],
-        },
-    )
-    .await
-    .unwrap();
-    write_message(&mut a, &ClientMessage::StreamChannelEnd { channel: "general".into(), stream_id: 42, duration_ms: 100 })
-        .await
-        .unwrap();
-
-    let start: ServerMessage = read_message(&mut b).await.unwrap().unwrap();
-    assert!(matches!(start, ServerMessage::ChannelStreamStart { from, stream_id: 42, .. } if from == alice_id));
-
-    let chunk: ServerMessage = read_message(&mut b).await.unwrap().unwrap();
-    match chunk {
-        ServerMessage::ChannelStreamChunk { from, stream_id, seq, blocks, .. } => {
-            assert_eq!(from, alice_id);
-            assert_eq!(stream_id, 42);
-            assert_eq!(seq, 0);
-            assert_eq!(blocks, vec![vec![1, 2, 3]]);
-        }
-        other => panic!("expected ChannelStreamChunk, got {other:?}"),
-    }
-
-    let end: ServerMessage = read_message(&mut b).await.unwrap().unwrap();
-    assert!(matches!(end, ServerMessage::ChannelStreamEnd { from, stream_id: 42, duration_ms: 100, .. }
-        if from == alice_id));
 }
 
 /// @requirement TB-082

@@ -40,10 +40,23 @@ pub const MAX_FILENAME_CHARS: usize = 230;
 /// `FileChunk` frame - small enough to keep both sender and receiver memory
 /// use bounded to roughly one chunk regardless of total file size (unlike
 /// the old whole-file-in-one-`Envelope` approach this replaces), and what
-/// drives the progress bar's granularity. 64 KiB plaintext expands to
-/// ~345 OAEP blocks (256 bytes each) at a 2048-bit key - comfortably under
-/// `proto::MAX_FRAME_LEN` for a single-recipient frame.
-pub const FILE_CHUNK_BYTES: usize = 64 * 1024;
+/// drives the progress bar's granularity.
+///
+/// Sized for the direct peer-to-peer transport (`docs/PROTOCOL.md` §7.0),
+/// not for the old TCP-relayed design this used to serve: a `FileChunk` is
+/// now a single UDP datagram (`p2p_proto::PunchDatagram::Reliable`), not a
+/// length-prefixed TCP frame, so what matters is `p2p_proto::SAFE_DATAGRAM_BYTES`,
+/// not `proto::MAX_FRAME_LEN`. 512 bytes plaintext expands to at most 3 OAEP
+/// blocks (256 bytes each) at the worst-case 2048-bit key size - ~768 bytes
+/// ciphertext, comfortably under budget once the reliable-frame/datagram
+/// framing overhead is added (see `test/file_transfer_test.rs`'s
+/// `file_chunk_bytes_stays_under_the_p2p_safe_datagram_budget`). Smaller
+/// chunks than the old 64 KiB mean more frames (and thus more acks) per
+/// byte transferred, but the reliable layer pipelines multiple in-flight
+/// frames rather than waiting for each ack before sending the next, so this
+/// isn't a stop-and-wait throughput hit - just a deliberate trade of a
+/// little overhead for never risking IP-fragmentation-related loss.
+pub const FILE_CHUNK_BYTES: usize = 512;
 
 /// `~/.aloo/downloads` (`platform::aloo_dir()` joined with `downloads`),
 /// same convention as `idstore::default_path`/`own_next_keys::default_path`

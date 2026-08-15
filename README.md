@@ -2,7 +2,7 @@
 
 ![aloo](aloo.png)
 
-Walky talky in your terminal! aloo is a terminal chat app for talking with people privately and securely — text, voice, and file sharing, all end-to-end encrypted, all running in your terminal. A server connects you with the people you talk to and relays your traffic, but it only ever sees already-encrypted bytes — it can't read your messages. No accounts, no tracking.
+Walky talky in your terminal! aloo is a terminal chat app for talking with people privately and securely — text, voice, and file sharing, all end-to-end encrypted, all running in your terminal. A server connects you with the people you talk to and helps your app punch a direct connection to theirs, but your actual messages travel peer-to-peer — the server never carries them, encrypted or otherwise. No accounts, no tracking.
 
 Just you, your terminal, and the people you're talking to.
 
@@ -16,7 +16,7 @@ Just you, your terminal, and the people you're talking to.
 - 📢 **Public channels** — join the channels the server advertises, shown as tabs across the top.
 - 🔒 **Private channels** — create or join a channel that isn't advertised to anyone; you just need to know its name.
 - ✉️  **Private messages (DMs)** — open a one-on-one conversation with anyone in the sidebar.
-- 🌐 **Server-coordinated, never server-read** — the server tracks who's connected to which channel and relays your end-to-end encrypted traffic to them; it only ever handles already-encrypted bytes, never message content.
+- 🌐 **Server-coordinated, never server-carried** — the server tracks who's connected to which channel and helps two clients punch a direct connection to each other; once that's up, your messages, voice, and files travel peer-to-peer, never through the server at all.
 
 - 🛡️  **Everything above is end-to-end encrypted**. See the "Encryption" section below for how.
 - 💾 **Chat history isn't saved to disk.** Text and voice messages only ever live in memory for as long as the app is running — close it or disconnect, and they're gone. A file you've accepted is the one exception: that's the point of a file transfer, so it's written to `~/.aloo/downloads`.
@@ -70,7 +70,7 @@ Nicknames are case-sensitive and must be free — if someone else is already con
 
 ## Encryption
 
-Every message — text, voice, or file — is encrypted on your device before it ever leaves it, individually for each person who's meant to read it. **The server never sees plaintext.** It only relays already-encrypted bytes and keeps track of who's in which channel — it's a mail carrier that can't open the envelopes it delivers.
+Every message — text, voice, or file — is encrypted on your device before it ever leaves it, individually for each person who's meant to read it, and delivered directly to them over a peer-to-peer connection your two apps punch through NAT with the server's help. **The server never sees your messages at all** — not the plaintext, not even the encrypted bytes. It only helps clients find each other and keeps track of who's in which channel.
 
 There are two separate places encryption shows up: how *you* prove who you are, and how *your messages* get locked. You pick both when you connect.
 

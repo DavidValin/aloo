@@ -853,6 +853,15 @@ impl UiState {
         self.audio_error = Some(reason);
     }
 
+    /// Called when a direct peer-to-peer link (`crate::p2p`) fails to
+    /// establish or dies mid-session - there is no relay fallback, so
+    /// whatever was pending against `peer_name` (a message, a call, a file)
+    /// did not go through. Reuses the same error banner `recording_failed`/
+    /// `playback_failed` use rather than inventing a new UI surface for it.
+    pub fn p2p_link_failed(&mut self, peer_name: &str, reason: &str) {
+        self.audio_error = Some(format!("direct connection to {peer_name} failed: {reason}"));
+    }
+
     pub fn set_own_id(&mut self, id: UserId) {
         self.own_id = Some(id);
     }

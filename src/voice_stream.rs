@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use rsa::{RsaPrivateKey, RsaPublicKey};
 
 use crate::crypto;
-use crate::proto::{self, ClientMessage, KeyMode, UserId};
+use crate::proto::{self, KeyMode, UserId};
 use crate::session::SessionState;
 use crate::voice;
 
@@ -86,7 +86,7 @@ pub(crate) enum DirectStreamKey {
 /// and `PqHybrid` recipients at once - each gets whichever scheme their own
 /// `KeyMode` needs, independent of the others (`docs/PROTOCOL.md` §13).
 pub(crate) enum StreamRecipients {
-    Channel { channel: String, rsa: Vec<(UserId, RsaPublicKey)>, pq: Option<PqStreamOut> },
+    Channel { rsa: Vec<(UserId, RsaPublicKey)>, pq: Option<PqStreamOut> },
     Direct { to: UserId, key: DirectStreamKey },
 }
 
@@ -169,10 +169,26 @@ pub(crate) fn encrypt_direct_chunk(key: &DirectStreamKey, stream_id: u64, seq: u
     }
 }
 
+/// Every `UserId` a stream's `target` addresses - RSA and PQ recipients
+/// combined for a channel stream, the single recipient for a DM. Used at
+/// `*End` time to fan `P2pOutbound::VoiceEnd` out to the same recipient set
+/// `*Start` reached, since (unlike the old server-relayed broadcast) there's
+/// no membership list to derive it from on the receiving end anymore.
+fn stream_recipient_ids(target: &StreamRecipients) -> Vec<UserId> {
+    match target {
+        StreamRecipients::Channel { rsa, pq, .. } => rsa
+            .iter()
+            .map(|(id, _)| *id)
+            .chain(pq.iter().flat_map(|pq| pq.per_recipient.iter().map(|(id, _)| *id)))
+            .collect(),
+        StreamRecipients::Direct { to, .. } => vec![*to],
+    }
+}
+
 /// Runs on a dedicated `std::thread` for the lifetime of one recording:
 /// every `voice::CHUNK_INTERVAL`, flushes newly-captured samples, encrypts
 /// them for each pre-resolved recipient (`build_chunk_recipients`), and
-/// hands a ready-to-write `ClientMessage` back to the main loop - no crypto
+/// hands a ready-to-send `P2pOutbound` back to the main loop - no crypto
 /// ever runs on the async `tokio::select!` loop. `stop_rx.recv_timeout`
 /// doubles as both the sleep and the wake-on-release signal, since tokio's
 /// channels have no blocking-with-timeout primitive usable from a plain
@@ -182,7 +198,7 @@ pub(crate) fn spawn_record_stream_worker(
     recorder: voice::Recorder,
     target: StreamRecipients,
     stream_id: u64,
-    out_tx: tokio::sync::mpsc::UnboundedSender<ClientMessage>,
+    out_tx: tokio::sync::mpsc::UnboundedSender<crate::p2p::P2pOutbound>,
     done_tx: tokio::sync::mpsc::UnboundedSender<(u64, u32, Vec<u8>)>,
     stop_rx: std::sync::mpsc::Receiver<()>,
     // Notified (once) if this recording stops itself on reaching
@@ -213,13 +229,13 @@ pub(crate) fn spawn_record_stream_worker(
 
                 let per_recipient = build_chunk_recipients(&target, stream_id, seq, &pcm);
                 let msg = match &target {
-                    StreamRecipients::Channel { channel, .. } => {
-                        Some(ClientMessage::StreamChannelChunk { channel: channel.clone(), stream_id, seq, per_recipient })
+                    StreamRecipients::Channel { .. } => {
+                        Some(crate::p2p::P2pOutbound::ChannelVoiceChunk { stream_id, seq, per_recipient })
                     }
                     StreamRecipients::Direct { to, .. } => per_recipient
                         .into_iter()
                         .next()
-                        .map(|(_, blocks)| ClientMessage::StreamDirectChunk { to: *to, stream_id, seq, blocks }),
+                        .map(|(_, blocks)| crate::p2p::P2pOutbound::DirectVoiceChunk { to: *to, stream_id, seq, blocks }),
                 };
                 if let Some(msg) = msg {
                     let _ = out_tx.send(msg);
@@ -238,15 +254,8 @@ pub(crate) fn spawn_record_stream_worker(
 
             if stopped {
                 let duration_ms = ((total_samples * 1000) / voice::SAMPLE_RATE_HZ as u64) as u32;
-                let end_msg = match &target {
-                    StreamRecipients::Channel { channel, .. } => {
-                        ClientMessage::StreamChannelEnd { channel: channel.clone(), stream_id, duration_ms }
-                    }
-                    StreamRecipients::Direct { to, .. } => {
-                        ClientMessage::StreamDirectEnd { to: *to, stream_id, duration_ms }
-                    }
-                };
-                let _ = out_tx.send(end_msg);
+                let recipients = stream_recipient_ids(&target);
+                let _ = out_tx.send(crate::p2p::P2pOutbound::VoiceEnd { stream_id, duration_ms, recipients });
                 let _ = done_tx.send((stream_id, duration_ms, plaintext_accum));
                 break; // `recorder` drops here, closing the input stream.
             }

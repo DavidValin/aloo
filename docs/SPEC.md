@@ -147,7 +147,7 @@ When a tab is selected, the user joins that channel. The join is broadcast to al
    - If there are unread messages from that user, the envelope blinks instead of staying solid; reopening their room (marking it read) stops the blinking but does not remove the envelope, since there's still history.
    - Outgoing DM messages are encrypted with the receiver's public key; incoming DM messages are decrypted with the user's own private key.
 
-4. **Send a voice message** by holding Space (while focus is not on the compose bar - Space there just types a literal space) and releasing it to stop, up to `voice::MAX_RECORDING_SECS` (4 minutes) long. Voice is streamed live, not recorded-then-sent: while Space is held, captured audio is chunked (`voice::CHUNK_INTERVAL`, 100ms) and sent to the network as it's captured, and the receiving side plays each chunk as it arrives, rather than waiting for the whole message. While recording, a 🎤 "recording..." indicator appears inline at the end of the input bar and the bar's border turns red.
+4. **Send a voice message** by holding Space (while focus is not on the compose bar - Space there just types a literal space) and releasing it to stop, up to `voice::MAX_RECORDING_SECS` (4 minutes) long. Voice is streamed live, not recorded-then-sent: while Space is held, captured audio is chunked (`voice::CHUNK_INTERVAL`, 15ms) and sent to the network as it's captured, and the receiving side plays each chunk as it arrives, rather than waiting for the whole message. While recording, a 🎤 "recording..." indicator appears inline at the end of the input bar and the bar's border turns red.
    - **Live appearance and finalization.** Both directions show the in-progress message immediately (a pulsing "streaming..." block in the log) and it turns into a normal, replayable voice block only once the stream ends. The user can replay a finished voice message later by scrolling through the channel/DM history and pressing Enter on it, which renders in bold red, marked with a 🔴 and labeled with its actual recorded duration, e.g. `🔴 voice (12sec)` — the duration shown always reflects the real length of that specific message, not a fixed value. Any partial second rounds up (1ms shows as `1sec`, 1001ms as `2sec`), except a genuinely instantaneous 0ms recording, which shows `0sec` rather than rounding up to `1sec`. **While a replay is playing, pressing Escape stops it** immediately, instead of Escape's usual meaning of closing the current private room — Escape reverts to that usual meaning again the moment nothing is being replayed.
    - **Release detection** works on any terminal. At startup the client queries whether the terminal actually supports the Kitty keyboard protocol's release reporting (`crossterm::terminal::supports_keyboard_enhancement`, not just whether enabling it succeeded — a terminal can accept the escape sequence without honoring it). If it does, stopping relies solely on that genuine `Release` event: recording continues through any pause or silence for as long as Space is physically held, and only stops when it's actually released. If it doesn't, there is no way to observe a release directly, so the app falls back to watching for the OS's keyboard auto-repeat (a steady stream of `Press` events roughly every 30-50ms once repeating, after an initial OS repeat-delay commonly in the 500-650ms range) and treats ~900ms of silence since the last one as "released" — an approximation, used only when nothing better is available. Both stopping mechanisms are no-ops when nothing is actually being recorded: a `Release` event with no matching prior `Press` (e.g. one delivered right as a channel switch or DM close ends a recording some other way) does nothing, and so does the idle-timeout check firing with no recording in progress.
    - **Length cap.** A recording that reaches `voice::MAX_RECORDING_SECS` (4 minutes) stops itself automatically — the indicator clears and the end-of-message chime plays, exactly as if Space had just been released, whether or not it's still actually held. This is a client-side courtesy limit on the *sending* side; the receiving side independently enforces the identical cap regardless of what the sender did (`docs/PROTOCOL.md` §7.3) — an incoming stream is force-finalized with whatever arrived once it reaches 4 minutes of audio, so a modified or misbehaving peer can never make a receiver accept, or keep decrypting, a longer one.
@@ -164,7 +164,7 @@ When a tab is selected, the user joins that channel. The join is broadcast to al
    - A fresh RSA keypair is generated locally (never shelled out to an external command) for each peer relationship, and re-generated every time a message is sent to or received from that specific peer — so the key protecting any one already-exchanged message is retired shortly after and never reused. These keys are 4096 bits — larger than the 2048-bit keys every other `my_key` type uses — trading slower key generation for a bigger security margin per (typically short-lived) key.
    - Every rotation is signed with the key it replaces, so peers can tell a genuine new key from a forged one before trusting it; the very first key for a peer (announced on joining a channel, same as today) is trusted on first use, same as static mode.
    - This is invisible in the UI beyond ordinary send latency: if you send a message to someone using `rsa_per_msg` before their next fresh key has arrived, it isn't dropped — it's held in memory and sent automatically the moment that key shows up, in the order it was typed. There's no separate "pending" indicator; the message simply appears in the log once it goes out.
-   - Live voice messages (Functionality #4) are exempt from per-chunk rotation (regenerating a 4096-bit RSA key fast enough for 100ms audio chunks isn't feasible) — an entire voice message counts as one exchange for rotation purposes, and a recipient without a ready key at the moment you start recording is simply not sent that particular voice message (same as the existing partial-delivery behavior when a client only has keys for some channel members).
+   - Live voice messages (Functionality #4) are exempt from per-chunk rotation (regenerating a 4096-bit RSA key fast enough for 15ms audio chunks isn't feasible) — an entire voice message counts as one exchange for rotation purposes, and a recipient without a ready key at the moment you start recording is simply not sent that particular voice message (same as the existing partial-delivery behavior when a client only has keys for some channel members).
    - Rotating a key doesn't freeze the UI: the actual key generation runs on a dedicated background thread (`docs/PROTOCOL.md` §11.10), not on the same task that redraws the screen and processes incoming messages. Ending a voice message addressed to several `rsa_per_msg` recipients, or sending a channel text message to several of them, queues one rotation per recipient on that background thread rather than generating them one after another in front of the UI.
    - **Regeneration spinner.** While at least one rotation is in flight on that background thread, an animated white ASCII spinner (`_ - \ | / -`, one frame advanced per UI tick) is shown at the top right of the screen, immediately after the `Ctrl+H: Help` hint (itself dimmed gray), separated from it by two spaces (`Ctrl+H: Help  _`). It disappears the instant no rotation is pending, and always starts again from the first frame (`_`) the next time one begins, rather than resuming mid-cycle. This is purely a client-local UI cue — it has no wire-protocol meaning and isn't sent to or expected from peers.
    - **Surviving a reconnect.** This client's current per-peer key for each `rsa_per_msg` relationship is also saved to the `own_next_keys` file (see "Not connected UI" above). If you disconnect and reconnect, the moment you see a peer you'd previously rotated with again, that same key is re-asserted to them automatically — before you've typed anything — so their client can recognize you as the same identity as before instead of a stranger who happens to share your nickname. See Functionality #9 for the receiving side of this.
@@ -205,7 +205,7 @@ When a tab is selected, the user joins that channel. The join is broadcast to al
     - **The connect popup remembers your `pq_hybrid` identity per server.** After connecting (attempted or not - whichever files were used to try), `~/.aloo/.cache` records that `(host, port)`'s `file_pub`/`file_priv`. Reopening the app, or returning to the same server later in one session, prefills the exact same identity automatically - a different server you haven't used before still gets its own freshly-assigned location the first time.
     - Text, file, and voice messages are all signed with **both** ML-DSA-87 and RSA-4096 before being encrypted — a receiver only accepts a message if **both** signatures check out, so a break in either primitive alone isn't enough to forge one. The bulk data is AES-256-GCM-encrypted once per send (not re-encrypted per recipient the way RSA methods are), and that one-time key is separately wrapped for each recipient by combining an ML-KEM-1024 exchange with a second, independent RSA-4096 encryption — recovering it needs breaking both, not just one.
     - **Only another `pq_hybrid` user can send to a `pq_hybrid` user.** Producing a valid message to a `pq_hybrid` recipient needs the *sender's* own ML-DSA-87/RSA-sign identity, which no other `my_key` type has — a channel member using `rsa`/`password`/`none`/`rsa_per_msg` simply can't reach a `pq_hybrid` peer, the same silent exclusion as any other unreachable recipient (an offline member, a channel member `rsa_per_msg` hasn't finished a key exchange with yet). A `pq_hybrid` user can still message everyone else normally.
-    - Voice messages work the same way as text — the expensive signing/key-exchange work happens once per recording, not per 100ms chunk, so holding Space to talk feels identical to any other method.
+    - Voice messages work the same way as text — the expensive signing/key-exchange work happens once per recording, not per 15ms chunk, so holding Space to talk feels identical to any other method.
     - Its identity is static (loaded from the keybundle file, not regenerated every session) and file-backed, so it's pinned in `id_store` exactly like `rsa`/`password` (Functionality #9) — a `pq_hybrid` nickname reconnecting under a different keybundle triggers the same identity review popup a changed `rsa` key would.
 
 ## Encryption: how each method actually works
@@ -234,7 +234,7 @@ primitives live in `crypto/pq.rs`, covered in its own subsection below.
 
 The four RSA-based `my_key` methods differ **only in where the RSA keypair
 comes from**. `none` is not plaintext despite its `[🚨 PLAIN]` tag — see the
-tag table above. The single branch point is `connect.rs:205` `resolve_my_keypair`
+tag table above. The single branch point is `connect.rs:221` `resolve_my_keypair`
 (which also has `pq_hybrid`'s own arm, loading a keybundle instead of a
 plain RSA keypair - see below):
 
@@ -261,34 +261,34 @@ around the `ResolvedIdentity` match in `run_connected_session`) - see
 
 | | Channel | DM |
 | --- | --- | --- |
-| Send | `channel.rs:31` `handle_send_text` | `direct_message.rs:37` `handle_send_text` |
-| Encrypt (RSA methods) | `channel.rs:201` `encrypt_for_each` — loops recipients | `session.rs:678` `encrypt_for_one` — one recipient |
-| Encrypt (`pq_hybrid`) | same `encrypt_for_each`, dispatching to `session.rs:691` `encrypt_hybrid_envelope_for` per `pq_hybrid` recipient | `direct_message.rs` `encrypt_for_recipient`, same dispatch |
-| Wire message | `ClientMessage::SendChannel`, one `Envelope` per member | `ClientMessage::SendDirect`, one `Envelope` |
-| Server relay (no decrypt) | `server.rs` `route_channel_message` | `server.rs` `route_direct_message` |
-| Receive + decrypt | `session.rs:1227` `decrypt_envelope_for` → `rekey.rs` `decrypt_from` (RSA) or `crypto/pq.rs` `decrypt_hybrid` (`pq_hybrid`, dispatched by *our own* `own_key_mode`) | same |
+| Send | `channel.rs:33` `handle_send_text` | `direct_message.rs:37` `handle_send_text` |
+| Encrypt (RSA methods) | `channel.rs:212` `encrypt_for_each` — loops recipients | `session.rs:718` `encrypt_for_one` — one recipient |
+| Encrypt (`pq_hybrid`) | same `encrypt_for_each`, dispatching to `session.rs:731` `encrypt_hybrid_envelope_for` per `pq_hybrid` recipient | `direct_message.rs` `encrypt_for_recipient`, same dispatch |
+| Wire message | `P2pPayload::Envelope { channel: Some(_), .. }`, one per member | `P2pPayload::Envelope { channel: None, .. }` |
+| Delivery | direct peer-to-peer link, one per recipient (`docs/PROTOCOL.md` §7.0/§7.1) — the server relays only the initial candidate exchange, never the message itself | same |
+| Receive + decrypt | `session.rs` `decrypt_envelope_for` → `rekey.rs` `decrypt_from` (RSA) or `crypto/pq.rs` `decrypt_hybrid` (`pq_hybrid`, dispatched by *our own* `own_key_mode`) | same |
 
-A channel message is therefore encrypted N times for N members — the server
-forwards each member only their own `Envelope` and cannot read any of them.
+A channel message is therefore encrypted N times for N members and delivered
+over N independent direct links — the server never sees any of them.
 `pq_hybrid` recipients that a non-`pq_hybrid` sender can't address at all
-(`channel.rs:79` `can_address`) are excluded before encryption even starts -
+(`channel.rs:83` `can_address`) are excluded before encryption even starts -
 see "What `pq_hybrid` adds" below.
 
 ### Voice messages
 
 Voice is streamed live, not recorded-then-sent (Functionality #4), so
-encryption happens per 100ms chunk (`voice.rs:33` `CHUNK_INTERVAL`) on a
+encryption happens per 15ms chunk (`voice.rs:53` `CHUNK_INTERVAL`) on a
 dedicated thread — never on the async event loop.
 
 | Stage | Where |
 | --- | --- |
-| Recipients' public keys parsed **once** at record-start | `channel.rs:179` `parse_recipients` / `direct_message.rs:96` `handle_voice_record_start` |
-| Record + encrypt loop (own thread) | `voice_stream.rs:181` `spawn_record_stream_worker` |
-| Encrypt a chunk — channel (per recipient) | `voice_stream.rs:217` → `StreamChannelChunk` |
-| Encrypt a chunk — DM | `voice_stream.rs:222` → `StreamDirectChunk` |
-| Server relay (no decrypt) | `server.rs:367`/`:395`/`:426` (channel), `server.rs:453`/`:467`/`:481` (DM) |
-| Receiving: pick the private key **once** for the whole stream | `voice_stream.rs:434` `resolve_incoming_key` → `rekey.rs:283` `candidate_privates_for` |
-| Decrypt loop (one thread per incoming stream) | `voice_stream.rs:308` `spawn_stream_decrypt_worker`, decrypt at `:329` |
+| Recipients' public keys parsed **once** at record-start | `channel.rs:190` `parse_recipients` / `direct_message.rs:96` `handle_voice_record_start` |
+| Record + encrypt loop (own thread) | `voice_stream.rs:197` `spawn_record_stream_worker` |
+| Encrypt a chunk — channel (per recipient) | `voice_stream.rs` `build_chunk_recipients` → `p2p::P2pOutbound::ChannelVoiceChunk` |
+| Encrypt a chunk — DM | same, → `p2p::P2pOutbound::DirectVoiceChunk` |
+| Delivery | direct peer-to-peer link, unreliable/unordered per chunk (`docs/PROTOCOL.md` §7.0/§7.3) — never touches the server |
+| Receiving: pick the private key **once** for the whole stream | `voice_stream.rs:443` `resolve_incoming_key` → `rekey.rs:283` `candidate_privates_for` |
+| Decrypt loop (one thread per incoming stream) | `voice_stream.rs:317` `spawn_stream_decrypt_worker`, decrypt at `:338` |
 
 Each incoming stream gets its own decrypt thread because RSA private-key
 decrypt is much costlier than public-key encrypt — one shared thread would fall
@@ -306,16 +306,16 @@ its RSA/PQ dispatch types directly rather than duplicating them.
 
 | Stage | Where |
 | --- | --- |
-| Offer, one per ready recipient — channel | `channel.rs:95` `handle_send_file` |
-| Offer — DM | `direct_message.rs:63` `handle_send_file` |
-| Server relay (no decrypt, existence check only) | `server.rs` `route_file_offer`/`route_file_accept`/`route_file_reject`/`route_file_chunk`/`route_file_end` |
-| Incoming offer: decrypt, trust-gate, queue + bell | `session.rs:1240` `decrypt_file_offer`, `session.rs:1267` `handle_incoming_file_offer` |
-| Accept: spawn the receive worker, log the row | `session.rs:648` `accept_file_offer` |
-| Sender learns of Accept: spawn the send worker | `session.rs:796` (`ServerMessage::FileAccepted` arm) |
-| Send worker — reads/encrypts/sends one chunk at a time | `file_stream.rs:70` `spawn_send_file_worker` |
-| Receive worker — decrypts/writes one chunk at a time | `file_stream.rs:124` `spawn_receive_file_worker` |
-| Forward an incoming chunk/end to its worker | `file_stream.rs:183`/`:198` `forward_chunk`/`end_incoming_transfer`, called from `session.rs:818`/`:821` |
-| Progress/completion/failure → log row | `session.rs:1293` `handle_file_event` → `UiState::set_file_progress`/`set_file_completed`/`set_file_rejected`/`set_file_failed` |
+| Offer, one per ready recipient — channel | `channel.rs` `handle_send_file` |
+| Offer — DM | `direct_message.rs` `handle_send_file` |
+| Delivery (offer, accept/reject, chunks, end) | direct peer-to-peer link, reliable (`docs/PROTOCOL.md` §7.0.1/§7.6) — the server is never involved, not even for an existence check |
+| Incoming offer: decrypt, trust-gate, queue + bell | `session.rs` `decrypt_file_offer`, `handle_incoming_file_offer` |
+| Accept: spawn the receive worker, log the row | `session.rs` `accept_file_offer` |
+| Sender learns of Accept: spawn the send worker | `session.rs` (`P2pEvent::FileAccepted` arm) |
+| Send worker — reads/encrypts/sends one chunk at a time | `file_stream.rs:71` `spawn_send_file_worker` |
+| Receive worker — decrypts/writes one chunk at a time | `file_stream.rs:125` `spawn_receive_file_worker` |
+| Forward an incoming chunk/end to its worker | `file_stream.rs:184`/`:199` `forward_chunk`/`end_incoming_transfer`, called from `session.rs:879`/`:882` |
+| Progress/completion/failure → log row | `session.rs:1339` `handle_file_event` → `UiState::set_file_progress`/`set_file_completed`/`set_file_rejected`/`set_file_failed` |
 
 Line numbers are as of the commit that added this section; a drifted number
 still resolves via the named function, same convention as the tables above.
@@ -329,15 +329,16 @@ key is current at each moment. Full model in `docs/PROTOCOL.md` §11.
 | --- | --- |
 | Sign a new key with the key it replaces (PKCS#1 v1.5 + SHA-256) | `rekey.rs:38` `rotation_signing_payload`, `:46` `sign_rotation` → `crypto/mod.rs:235` `sign` |
 | Verify a peer's rotation | `rekey.rs:52` `verify_rotation`, `:59` `verify_and_parse_rotation` → `crypto/mod.rs:243` `verify` |
-| Keygen, off the event loop | `rekey.rs:134` `generate_and_sign_rotation`, run by `session.rs:180` `spawn_rotation_worker`, queued via `session.rs:1046` `request_rotation_if_per_message` |
+| Keygen, off the event loop | `rekey.rs:134` `generate_and_sign_rotation`, run by `session.rs:194` `spawn_rotation_worker`, queued via `session.rs:1111` `request_rotation_if_per_message` |
 | Own per-peer keys + retained old keys | `rekey.rs:161` `OwnKeys` (retention bound `rekey.rs:31`) |
 | Is a peer's key fresh? queue if not | `rekey.rs:317` `RemoteKeys` — `try_use:343`, `enqueue:358`, `on_rotated:368` |
-| Apply an incoming rotation, flush the queue | `session.rs:1099` `handle_key_rotated` |
-| Reconnect continuity (persisted keys) | `own_next_keys.rs` + `session.rs:974` `send_resume_rotation_if_available` (prove), `idstore.rs:158` `get` + `rekey.rs:106` `verify_with_fallback` (verify), both surfaced by `session.rs:1099` `handle_key_rotated` — *and*, for a `PerMessage` nickname that already has a continuity key pinned, gated on sight by `check_identity` (`session.rs:886`) itself, before any rotation attempt (`docs/PROTOCOL.md` §12.6.3) |
+| Apply an incoming rotation, flush the queue | `session.rs:1164` `handle_key_rotated` |
+| Reconnect continuity (persisted keys) | `own_next_keys.rs` + `session.rs:1039` `send_resume_rotation_if_available` (prove), `idstore.rs:158` `get` + `rekey.rs:106` `verify_with_fallback` (verify), both surfaced by `session.rs:1164` `handle_key_rotated` — *and*, for a `PerMessage` nickname that already has a continuity key pinned, gated on sight by `check_identity` (`session.rs:951`) itself, before any rotation attempt (`docs/PROTOCOL.md` §12.6.3) |
 
 Voice is exempt from per-chunk rotation (§11.6): one key snapshot covers a whole
-stream (`voice_stream.rs:181`), and a recipient without a fresh key is dropped
-from that stream (`channel.rs:151` in `handle_voice_record_start`) or the DM recording is refused outright
+stream (`voice_stream.rs:197`), and a recipient without a fresh key (or whose
+direct link isn't `Active` yet, `docs/PROTOCOL.md` §7.0/§7.3) is dropped
+from that stream (`channel.rs:159` in `handle_voice_record_start`) or the DM recording is refused outright
 (`direct_message.rs:106`).
 
 ### What `pq_hybrid` adds
@@ -356,8 +357,8 @@ material and a different, self-contained primitive set. Full model in
 | Decrypt + dual-signature verify | `crypto/pq.rs` `decrypt_hybrid`, `unwrap_key`, `verify_body` |
 | Voice: per-stream key + per-chunk cipher | `crypto/pq.rs` `fresh_data_key`, `wrap_key_for_stream` (signs `stream_id++k_data` once), `encrypt_hybrid_voice_chunk`/`decrypt_hybrid_chunk` (deterministic nonce from `stream_id`+`seq`), `unwrap_key_for_stream` (verified once, cached) |
 | Own key material in the live session | `session.rs` `SessionState::own_pq_private` (mirrors `own_keys`, populated instead of it when `own_key_mode == PqHybrid`) |
-| Who can be addressed | `channel.rs:79` `can_address` - a `pq_hybrid` recipient needs a `pq_hybrid` sender (their own ML-DSA-87/RSA-sign identity); everyone else is reachable by any sender, as always |
-| `id_store` pinning | `session.rs:882` `uses_byte_comparison_pinning` - `pq_hybrid` joins `rsa`/`password` on the plain-byte-comparison side, unlike `rsa_per_msg`'s signature-based resume |
+| Who can be addressed | `channel.rs:83` `can_address` - a `pq_hybrid` recipient needs a `pq_hybrid` sender (their own ML-DSA-87/RSA-sign identity); everyone else is reachable by any sender, as always |
+| `id_store` pinning | `session.rs:947` `uses_byte_comparison_pinning` - `pq_hybrid` joins `rsa`/`password` on the plain-byte-comparison side, unlike `rsa_per_msg`'s signature-based resume |
 | Auto-generate keys if missing | `crypto/pq.rs` `ensure_bundle_at`, called from `connect.rs` `resolve_my_keypair`'s `PqHybrid` arm (`docs/PROTOCOL.md` §13.9) |
 | Connect-popup cache (`~/.aloo/.cache`) | `connect.rs` `ConnectCache`, `cache_path`, `random_prefix`, `fresh_pq_hybrid_paths_in`, `prefill_connect_defaults` |
 
@@ -365,15 +366,15 @@ material and a different, self-contained primitive set. Full model in
 
 Authenticating *to the server* is unrelated to the message encryption above and
 has only three options (`ui_connect_popup.rs:148` `ServerKeySelection`,
-`proto.rs:200` `AuthKind`). Client side: `connect.rs:230` `build_auth_response`.
-Server side: `server.rs:54` `AuthConfig::verify`.
+`proto.rs:200` `AuthKind`). Client side: `connect.rs:246` `build_auth_response`.
+Server side: `server.rs:62` `AuthConfig::verify`.
 
 | Option | Check |
 | --- | --- |
 | `none` | passes unconditionally |
 | `password` | sent as-is and compared byte-for-byte in constant time (`crypto/mod.rs:259` `constant_time_eq`) — it is **not** hashed |
-| `rsa` | server sends a random nonce (`crypto/mod.rs:250` `random_bytes`, `server.rs:43` `make_challenge`); client encrypts it with the server's public key; server decrypts and compares |
+| `rsa` | server sends a random nonce (`crypto/mod.rs:250` `random_bytes`, `server.rs:51` `make_challenge`); client encrypts it with the server's public key; server decrypts and compares |
 
 ## Server responsibilities
 
-The server is only a medium of connections: it manages client connections, channel membership/broadcast, and relays encrypted blobs (join notifications, public key exchange, text/voice messages) between clients. It does not decrypt or persist message content — chat/DM history lives only in each client's memory for the session. It does enforce nickname uniqueness, since that's connection bookkeeping rather than message content. It distinguishes a client explicitly leaving one channel from its connection closing entirely (Functionality #8), notifying peers with a different message for each (`docs/PROTOCOL.md` §6.2, §6.4) — but the *decision* of whether to keep an offline user's name around (grayed out) or drop it is made entirely client-side, based on that client's own private-message history, which the server has no visibility into.
+The server is only a medium of connection *setup*: it manages client connections, channel membership/broadcast, relays public key exchange (join notifications), and relays the candidate exchange that lets two clients punch a direct peer-to-peer link to each other (`docs/PROTOCOL.md` §7.0). Text, voice, and file content travel only over that direct link once it's established — the server never sees any of it, not even as ciphertext. It does not persist anything — chat/DM history lives only in each client's memory for the session. It does enforce nickname uniqueness, since that's connection bookkeeping rather than message content. It distinguishes a client explicitly leaving one channel from its connection closing entirely (Functionality #8), notifying peers with a different message for each (`docs/PROTOCOL.md` §6.2, §6.4) — but the *decision* of whether to keep an offline user's name around (grayed out) or drop it is made entirely client-side, based on that client's own private-message history, which the server has no visibility into.

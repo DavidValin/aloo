@@ -28,20 +28,220 @@ pre-build = [
 # every object in the final binary must be position-independent. alsa-lib's
 # own build doesn't add that flag, so without it the link fails later with
 # "relocation R_X86_64_32 ... can not be used when making a PIE object".
+# cargo's pkg-config crate (used by alsa-sys, libpulse-sys, libpulse-simple-sys)
+# refuses to probe anything when it thinks it's cross-compiling - which, inside
+# a `cross` container, it always is, since the container's own HOST triple is
+# glibc/x86_64 while TARGET is this musl triple - unless PKG_CONFIG_ALLOW_CROSS
+# is set. `cross` never sets this on its own; it has to be forwarded in from
+# whatever invokes `cross build` (see release.yml). Scoped to this target only
+# so it can't silently change behavior for any other target.
+#
+# PKG_CONFIG_ALL_STATIC matters for a different reason: libpulse.pc's
+# `Libs.private: -lpulsecommon-14.2` (a second, separate static archive
+# libpulse/libpulse-simple's own symbols depend on - see the PulseAudio
+# pre-build step below) is only emitted by pkg-config in `--static` mode,
+# which the `pkg-config` crate only requests when this is set. Without it,
+# the final binary link fails with "undefined reference to
+# `pa_log_level_meta`"/`pa_init_i18n` (real symbols, just from the archive
+# nothing told the linker to pull in). Harmless for alsa-sys, which has no
+# such private dependency to begin with.
+[target.x86_64-unknown-linux-musl.env]
+passthrough = ["PKG_CONFIG_ALLOW_CROSS", "PKG_CONFIG_ALL_STATIC"]
+
 [target.x86_64-unknown-linux-musl]
 pre-build = [
-    "apt-get update && apt-get install --assume-yes wget make bzip2",
-    "wget -q -P /tmp https://www.alsa-project.org/files/pub/lib/alsa-lib-1.2.16.1.tar.bz2",
+    "curl -sSL -o /tmp/alsa-lib-1.2.16.1.tar.bz2 https://www.alsa-project.org/files/pub/lib/alsa-lib-1.2.16.1.tar.bz2",
     "echo 'f740db7f488255944ffd4428416ee3390a96742856916433df468c281436480e  /tmp/alsa-lib-1.2.16.1.tar.bz2' | sha256sum -c -",
     "tar xjf /tmp/alsa-lib-1.2.16.1.tar.bz2 -C /tmp",
     "cd /tmp/alsa-lib-1.2.16.1 && CC=x86_64-linux-musl-gcc AR=x86_64-linux-musl-ar RANLIB=x86_64-linux-musl-ranlib CFLAGS=-fPIE ./configure --host=x86_64-linux-musl --disable-shared --enable-static --disable-python --with-configdir=/usr/share/alsa --with-plugindir=/usr/lib/alsa-lib && make -j$(nproc) && make install",
+
+    # --- PulseAudio client library (libpulse, libpulse-simple), static ---
+    #
+    # `voice_pulse.rs` talks to a running PulseAudio/PipeWire-pulse server
+    # directly over libpulse's own protocol instead of going through cpal's
+    # ALSA backend, because ALSA only reaches PulseAudio/PipeWire via a PCM
+    # plugin (libasound_module_pcm_pulse.so) that ALSA dlopen()s at runtime -
+    # and a fully static musl binary can never dlopen anything (musl's dlopen
+    # is a hard stub returning "Dynamic loading not supported" in a static
+    # link; this is a libc property, not something alsa.conf/plugindir paths
+    # can work around). Statically linking libpulse directly sidesteps the
+    # dlopen step entirely: no plugin is loaded at runtime, the protocol
+    # client code is just part of the binary.
+    #
+    # PulseAudio dropped autotools for Meson in 15.0, and Meson's own
+    # meson.build hardcodes shared_library() for libpulse/libpulse-simple
+    # with no --default-library=static equivalent, so matching this file's
+    # `--disable-shared --enable-static` pattern requires the last
+    # autotools release, 14.2 (2020-09). Its client protocol is unchanged
+    # since. Source is fetched from the GitHub mirror's tag archive rather
+    # than the official freedesktop.org release tarball purely so every
+    # source in this file is a plain .tar.gz - the official tarball is
+    # .tar.xz only, and this image has no `xz` binary (only `tar`, which
+    # shells out to one). The GitHub tag archive has no pre-generated
+    # `./configure`, so it's regenerated below with autoreconf.
+    "curl -sSL https://github.com/pulseaudio/pulseaudio/archive/refs/tags/v14.2.tar.gz -o /tmp/pulseaudio.tar.gz",
+    "echo '5368b7a7e1dd7b0bd7734611309e46f6b3685c4213a3b72fc88d38b4b00ce62c  /tmp/pulseaudio.tar.gz' | sha256sum -c -",
+    "tar xzf /tmp/pulseaudio.tar.gz -C /tmp",
+
+    # libsndfile: an unconditional build dependency of libpulsecommon (used
+    # for the daemon's sample-cache/file-playback modules) even though the
+    # client-only pieces we actually link, pa_simple's record/playback API,
+    # never touch file I/O - there's no configure flag to drop it. Built via
+    # its CMake support rather than autotools (simpler cross setup, and it's
+    # a normal library() build unlike PulseAudio's own Meson script), with
+    # every optional codec (FLAC/Vorbis/Opus/MP3) disabled since none of
+    # libsndfile's own format support is ever exercised here either -
+    # PulseAudio only needs the library to link against, not to decode
+    # anything through it.
+    "curl -sSL https://github.com/libsndfile/libsndfile/archive/refs/tags/1.2.2.tar.gz -o /tmp/libsndfile.tar.gz",
+    "echo 'ffe12ef8add3eaca876f04087734e6e8e029350082f3251f565fa9da55b52121  /tmp/libsndfile.tar.gz' | sha256sum -c -",
+    "tar xzf /tmp/libsndfile.tar.gz -C /tmp",
+    "mkdir -p /tmp/libsndfile-1.2.2/build && cd /tmp/libsndfile-1.2.2/build && cmake .. -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=x86_64 -DCMAKE_C_COMPILER=x86_64-linux-musl-gcc -DCMAKE_AR=/usr/local/bin/x86_64-linux-musl-ar -DCMAKE_RANLIB=/usr/local/bin/x86_64-linux-musl-ranlib -DCMAKE_C_FLAGS=-fPIE -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local -DBUILD_SHARED_LIBS=OFF -DENABLE_EXTERNAL_LIBS=OFF -DENABLE_MPEG=OFF -DBUILD_PROGRAMS=OFF -DBUILD_EXAMPLES=OFF -DBUILD_TESTING=OFF -DENABLE_CPACK=OFF && make -j$(nproc) && make install",
+
+    # libltdl: PulseAudio's ./configure unconditionally hard-requires it
+    # (AC_CHECK_LIB([ltdl], [lt_dladvise_init], ...) with no fallback,
+    # `configure.ac:397`) for the daemon's own module-loading system, even
+    # though we only build the two client libraries that never call into
+    # it. It ships as a small standalone package inside libtool's own
+    # source tree (`libltdl/`), normally embedded read-only into a parent
+    # project's build (which is why plain `./configure && make install`
+    # from that directory installs nothing usable) - `--enable-ltdl-install`
+    # is what tells its build system this is a real standalone install
+    # rather than an in-tree convenience library.
+    "curl -sSL https://ftp.gnu.org/gnu/libtool/libtool-2.4.7.tar.gz -o /tmp/libtool.tar.gz",
+    "echo '04e96c2404ea70c590c546eba4202a4e12722c640016c12b9b2f1ce3d481e9a8  /tmp/libtool.tar.gz' | sha256sum -c -",
+    "tar xzf /tmp/libtool.tar.gz -C /tmp",
+    "cd /tmp/libtool-2.4.7/libltdl && CC=x86_64-linux-musl-gcc AR=x86_64-linux-musl-ar RANLIB=x86_64-linux-musl-ranlib CFLAGS=-fPIE ./configure --host=x86_64-linux-musl --prefix=/usr/local --disable-shared --enable-static --enable-ltdl-install && make -j$(nproc) && make install",
+
+    # PulseAudio's ./configure.ac unconditionally calls AM_GNU_GETTEXT for
+    # translated daemon/tool strings we don't need (only the client
+    # libraries are built here) - autoreconf needs that macro's .m4
+    # definition to exist somewhere findable even to determine there's
+    # nothing to do, and glibc's copy isn't installed in this image, isn't
+    # packaged for musl in the first place, and can't be apt-installed here
+    # (this image's apt sources fail signature verification). gettext-tiny
+    # is a from-scratch, musl-oriented reimplementation of gettext's build
+    # tooling that vendors that macro (and its dependency macros, e.g.
+    # AM_ICONV) verbatim - only its m4/ directory is used below, not its C
+    # library, since dropping AM_GNU_GETTEXT/AM_GNU_GETTEXT_VERSION from
+    # configure.ac entirely (see the two sed calls below) means
+    # `src/pulsecore/i18n.h` never defines ENABLE_NLS and so falls back to
+    # its own no-op `#define dgettext(Domain,String) (String)` etc - no
+    # libintl needed either way.
+    "curl -sSL https://codeload.github.com/sabotage-linux/gettext-tiny/tar.gz/refs/tags/v0.3.3 -o /tmp/gettext-tiny.tar.gz",
+    "echo 'daff8b4a7863745710ec0b02657fd20bda2d90398f54945751259bb94d6ebffd  /tmp/gettext-tiny.tar.gz' | sha256sum -c -",
+    "tar xzf /tmp/gettext-tiny.tar.gz -C /tmp",
+    "cp /tmp/gettext-tiny-0.3.3/m4/*.m4 /tmp/pulseaudio-14.2/m4/",
+
+    # build-aux/config.rpath is generated by GNU gettext's `autopoint` from
+    # a copy it keeps in sync with gnulib's own; gettext-tiny's autopoint
+    # reimplementation doesn't vendor this particular file (it's for
+    # detecting a *shared*-library runtime search path, which a
+    # --disable-shared build never needs, but autoreconf still errors on
+    # the missing AC_CONFIG_FILES input if it's absent), so it's fetched
+    # directly from gnulib, its canonical upstream source, pinned to one
+    # commit for reproducibility rather than a moving branch head.
+    # `build-aux/` itself doesn't exist in this tarball yet - autoreconf
+    # normally creates it (via libtoolize) - so it's made explicitly first
+    # rather than relying on `curl -o` to create the parent directory,
+    # which it doesn't.
+    "mkdir -p /tmp/pulseaudio-14.2/build-aux",
+    "curl -sSL https://raw.githubusercontent.com/coreutils/gnulib/9388edc18a2c1de1ae9f58cef2446e1c1116bf36/build-aux/config.rpath -o /tmp/pulseaudio-14.2/build-aux/config.rpath",
+    "echo 'fc70d6138bc62e8ea8080602b607f38d56c4def03ec4d523d516b338cff41df9  /tmp/pulseaudio-14.2/build-aux/config.rpath' | sha256sum -c -",
+
+    # Drop the po/ (translations) subdirectory and the AM_GNU_GETTEXT*
+    # macro calls that wire it up (see the gettext-tiny comment above) -
+    # everything client-side degrades gracefully to untranslated strings
+    # without them, and this avoids needing the much larger machinery
+    # (po/Makefile.in.in, ABOUT-NLS, a real msgfmt) that a genuine gettext
+    # install would otherwise pull in for building/installing .mo files we
+    # don't ship.
+    "sed -i 's/^SUBDIRS = src doxygen man po$/SUBDIRS = src doxygen man/' /tmp/pulseaudio-14.2/Makefile.am",
+    "sed -i '/^AM_GNU_GETTEXT_VERSION/d;/^AM_GNU_GETTEXT(/d' /tmp/pulseaudio-14.2/configure.ac",
+    "sed -i '/^po\\/Makefile.in$/d' /tmp/pulseaudio-14.2/configure.ac",
+
+    # AC_INIT's version comes from `m4_esyscmd(./git-version-gen
+    # .tarball-version)`, evaluated once at autoreconf time - this is a
+    # source tarball with neither a .git directory nor a real release's
+    # pre-populated .tarball-version, so that call fails and configure.ac
+    # never even reaches PACKAGE_VERSION without this.
+    "echo 14.2 > /tmp/pulseaudio-14.2/.tarball-version",
+    "cd /tmp/pulseaudio-14.2 && autoreconf -fi",
+
+    # --disable-maintainer-mode: skips a redundant git-version-gen
+    # re-check at configure time (same tarball-not-a-git-checkout issue as
+    # above, but for a check baked into the generated `configure` itself
+    # rather than autoreconf). CPPFLAGS/LDFLAGS point at /usr/local
+    # explicitly because this musl cross gcc only searches its own
+    # sysroot's include/lib dirs by default, not /usr/local - unlike
+    # pkg-config-mediated discovery (alsa.pc, sndfile.pc), which embeds
+    # absolute -I/-L paths and doesn't depend on the compiler's default
+    # search path at all. Everything else disabled below is either a
+    # daemon/module-only feature (ALSA/OSS/BlueZ/JACK/X11/D-Bus/udev/
+    # systemd/GLib/Gtk/...) that the two client libraries never reference,
+    # or an optional daemon-side resampler/echo-canceller (fftw/speex/
+    # soxr) - none of it is reachable from pa_simple's record/playback
+    # calls, which is all `voice_pulse.rs` uses.
+    "cd /tmp/pulseaudio-14.2 && CC=x86_64-linux-musl-gcc AR=x86_64-linux-musl-ar RANLIB=x86_64-linux-musl-ranlib CFLAGS=-fPIE CPPFLAGS=-I/usr/local/include LDFLAGS=-L/usr/local/lib ./configure --host=x86_64-linux-musl --disable-maintainer-mode --disable-shared --enable-static --disable-tests --disable-manpages --disable-x11 --disable-glib2 --disable-gtk3 --disable-gsettings --disable-gconf --disable-avahi --disable-jack --disable-asyncns --disable-tcpwrap --disable-lirc --disable-dbus --disable-bluez5 --disable-udev --disable-hal-compat --disable-openssl --disable-systemd-daemon --disable-systemd-login --disable-systemd-journal --disable-oss-output --disable-oss-wrapper --disable-esound --disable-solaris --disable-waveout --disable-alsa --without-fftw --without-speex --without-soxr --with-database=simple --without-caps",
+
+    # Only the two client libraries are built/installed, never the
+    # `pulseaudio` daemon itself or its modules - nothing here runs a
+    # server, it only talks to whatever server (PipeWire's pulse shim or
+    # real PulseAudio) is already listening on the target machine.
+    "cd /tmp/pulseaudio-14.2/src && make libpulse.la libpulse-simple.la -j$(nproc) && make install-libLTLIBRARIES install-pulseincludeHEADERS",
+    "cp /tmp/pulseaudio-14.2/libpulse.pc /tmp/pulseaudio-14.2/libpulse-simple.pc /usr/local/lib/pkgconfig/",
 ]
+
+# Mirrors [target.x86_64-unknown-linux-musl] above verbatim, arch triplet
+# swapped - see that block's comments for why each step exists. NOT YET
+# BUILT OR VERIFIED: this was written by porting the proven x86_64 steps
+# rather than by running a real aarch64 cross-build (no aarch64 hardware/
+# emulation resources available at the time), so treat it as a draft until
+# a `cross build --target aarch64-unknown-linux-musl` actually succeeds and
+# the resulting binary is confirmed static (`readelf -d`/`ldd`) - the same
+# two checks x86_64 itself is still pending as of this writing.
+[target.aarch64-unknown-linux-musl.env]
+passthrough = ["PKG_CONFIG_ALLOW_CROSS", "PKG_CONFIG_ALL_STATIC"]
 
 [target.aarch64-unknown-linux-musl]
 pre-build = [
-    "apt-get update && apt-get install --assume-yes wget make bzip2",
-    "wget -q -P /tmp https://www.alsa-project.org/files/pub/lib/alsa-lib-1.2.16.1.tar.bz2",
+    "curl -sSL -o /tmp/alsa-lib-1.2.16.1.tar.bz2 https://www.alsa-project.org/files/pub/lib/alsa-lib-1.2.16.1.tar.bz2",
     "echo 'f740db7f488255944ffd4428416ee3390a96742856916433df468c281436480e  /tmp/alsa-lib-1.2.16.1.tar.bz2' | sha256sum -c -",
     "tar xjf /tmp/alsa-lib-1.2.16.1.tar.bz2 -C /tmp",
     "cd /tmp/alsa-lib-1.2.16.1 && CC=aarch64-linux-musl-gcc AR=aarch64-linux-musl-ar RANLIB=aarch64-linux-musl-ranlib CFLAGS=-fPIE ./configure --host=aarch64-linux-musl --disable-shared --enable-static --disable-python --with-configdir=/usr/share/alsa --with-plugindir=/usr/lib/alsa-lib && make -j$(nproc) && make install",
+
+    "curl -sSL https://github.com/pulseaudio/pulseaudio/archive/refs/tags/v14.2.tar.gz -o /tmp/pulseaudio.tar.gz",
+    "echo '5368b7a7e1dd7b0bd7734611309e46f6b3685c4213a3b72fc88d38b4b00ce62c  /tmp/pulseaudio.tar.gz' | sha256sum -c -",
+    "tar xzf /tmp/pulseaudio.tar.gz -C /tmp",
+
+    "curl -sSL https://github.com/libsndfile/libsndfile/archive/refs/tags/1.2.2.tar.gz -o /tmp/libsndfile.tar.gz",
+    "echo 'ffe12ef8add3eaca876f04087734e6e8e029350082f3251f565fa9da55b52121  /tmp/libsndfile.tar.gz' | sha256sum -c -",
+    "tar xzf /tmp/libsndfile.tar.gz -C /tmp",
+    "mkdir -p /tmp/libsndfile-1.2.2/build && cd /tmp/libsndfile-1.2.2/build && cmake .. -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=aarch64 -DCMAKE_C_COMPILER=aarch64-linux-musl-gcc -DCMAKE_AR=/usr/local/bin/aarch64-linux-musl-ar -DCMAKE_RANLIB=/usr/local/bin/aarch64-linux-musl-ranlib -DCMAKE_C_FLAGS=-fPIE -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local -DBUILD_SHARED_LIBS=OFF -DENABLE_EXTERNAL_LIBS=OFF -DENABLE_MPEG=OFF -DBUILD_PROGRAMS=OFF -DBUILD_EXAMPLES=OFF -DBUILD_TESTING=OFF -DENABLE_CPACK=OFF && make -j$(nproc) && make install",
+
+    "curl -sSL https://ftp.gnu.org/gnu/libtool/libtool-2.4.7.tar.gz -o /tmp/libtool.tar.gz",
+    "echo '04e96c2404ea70c590c546eba4202a4e12722c640016c12b9b2f1ce3d481e9a8  /tmp/libtool.tar.gz' | sha256sum -c -",
+    "tar xzf /tmp/libtool.tar.gz -C /tmp",
+    "cd /tmp/libtool-2.4.7/libltdl && CC=aarch64-linux-musl-gcc AR=aarch64-linux-musl-ar RANLIB=aarch64-linux-musl-ranlib CFLAGS=-fPIE ./configure --host=aarch64-linux-musl --prefix=/usr/local --disable-shared --enable-static --enable-ltdl-install && make -j$(nproc) && make install",
+
+    "curl -sSL https://codeload.github.com/sabotage-linux/gettext-tiny/tar.gz/refs/tags/v0.3.3 -o /tmp/gettext-tiny.tar.gz",
+    "echo 'daff8b4a7863745710ec0b02657fd20bda2d90398f54945751259bb94d6ebffd  /tmp/gettext-tiny.tar.gz' | sha256sum -c -",
+    "tar xzf /tmp/gettext-tiny.tar.gz -C /tmp",
+    "cp /tmp/gettext-tiny-0.3.3/m4/*.m4 /tmp/pulseaudio-14.2/m4/",
+
+    "mkdir -p /tmp/pulseaudio-14.2/build-aux",
+    "curl -sSL https://raw.githubusercontent.com/coreutils/gnulib/9388edc18a2c1de1ae9f58cef2446e1c1116bf36/build-aux/config.rpath -o /tmp/pulseaudio-14.2/build-aux/config.rpath",
+    "echo 'fc70d6138bc62e8ea8080602b607f38d56c4def03ec4d523d516b338cff41df9  /tmp/pulseaudio-14.2/build-aux/config.rpath' | sha256sum -c -",
+
+    "sed -i 's/^SUBDIRS = src doxygen man po$/SUBDIRS = src doxygen man/' /tmp/pulseaudio-14.2/Makefile.am",
+    "sed -i '/^AM_GNU_GETTEXT_VERSION/d;/^AM_GNU_GETTEXT(/d' /tmp/pulseaudio-14.2/configure.ac",
+    "sed -i '/^po\\/Makefile.in$/d' /tmp/pulseaudio-14.2/configure.ac",
+
+    "echo 14.2 > /tmp/pulseaudio-14.2/.tarball-version",
+    "cd /tmp/pulseaudio-14.2 && autoreconf -fi",
+
+    "cd /tmp/pulseaudio-14.2 && CC=aarch64-linux-musl-gcc AR=aarch64-linux-musl-ar RANLIB=aarch64-linux-musl-ranlib CFLAGS=-fPIE CPPFLAGS=-I/usr/local/include LDFLAGS=-L/usr/local/lib ./configure --host=aarch64-linux-musl --disable-maintainer-mode --disable-shared --enable-static --disable-tests --disable-manpages --disable-x11 --disable-glib2 --disable-gtk3 --disable-gsettings --disable-gconf --disable-avahi --disable-jack --disable-asyncns --disable-tcpwrap --disable-lirc --disable-dbus --disable-bluez5 --disable-udev --disable-hal-compat --disable-openssl --disable-systemd-daemon --disable-systemd-login --disable-systemd-journal --disable-oss-output --disable-oss-wrapper --disable-esound --disable-solaris --disable-waveout --disable-alsa --without-fftw --without-speex --without-soxr --with-database=simple --without-caps",
+
+    "cd /tmp/pulseaudio-14.2/src && make libpulse.la libpulse-simple.la -j$(nproc) && make install-libLTLIBRARIES install-pulseincludeHEADERS",
+    "cp /tmp/pulseaudio-14.2/libpulse.pc /tmp/pulseaudio-14.2/libpulse-simple.pc /usr/local/lib/pkgconfig/",
 ]

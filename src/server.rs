@@ -1,10 +1,17 @@
-//! The server: purely a medium of connections. It relays already-encrypted
-//! envelopes between clients and tracks channel membership; it never sees
-//! plaintext and never persists anything past the current process's memory.
+//! The server: purely a medium of connection setup, never of content. It
+//! authenticates clients, tracks channel membership/presence, relays
+//! `rsa_per_msg` key-rotation notices, and relays the candidate exchange
+//! that lets two clients punch a direct UDP link to each other
+//! (`crate::p2p`) - but every actual message, voice stream, and file
+//! transfer travels over that direct link, never through here. See
+//! `docs/PROTOCOL.md`'s "Direct peer-to-peer transport" section.
 //!
 //! `Registry` holds the pure membership/routing logic and is unit tested
 //! directly, with no sockets involved. `serve`/`run` wire that logic to
-//! real TCP connections.
+//! real TCP connections, plus a stateless UDP rendezvous socket
+//! (`udp_rendezvous_loop`) that helps a client learn its own public address
+//! for hole punching - the one place this module touches UDP at all, and
+//! it never sees anything from the punched links themselves.
 
 use std::collections::{BTreeSet, HashMap};
 use std::net::SocketAddr;
@@ -12,12 +19,13 @@ use std::sync::Arc;
 
 use rsa::RsaPrivateKey;
 use tokio::io::AsyncRead;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, Mutex};
 
 use crate::crypto;
+use crate::p2p_proto::RendezvousMessage;
 use crate::proto::{
-    self, AuthKind, AuthResponse, ChannelInfo, ChannelKind, ClientMessage, Envelope, KeyMode,
+    self, AuthKind, AuthResponse, ChannelInfo, ChannelKind, ClientMessage, KeyMode,
     ServerMessage, UserId, UserInfo,
 };
 
@@ -278,60 +286,6 @@ impl Registry {
             .collect()
     }
 
-    /// Relays each recipient's own pre-encrypted envelope to them.
-    /// Envelopes addressed to a `UserId` that isn't (or is no longer) a
-    /// member of the channel are silently dropped.
-    pub fn route_channel_message(
-        &self,
-        from: UserId,
-        channel: &str,
-        per_recipient: Vec<(UserId, Envelope)>,
-    ) -> Result<Vec<Outgoing>, String> {
-        let rec = self.channels.get(channel).ok_or_else(|| format!("no such channel: {channel}"))?;
-        if !rec.members.contains(&from) {
-            return Err("sender is not a member of this channel".to_string());
-        }
-        let from_name = self
-            .clients
-            .get(&from)
-            .map(|c| c.name.clone())
-            .ok_or_else(|| "unknown sender".to_string())?;
-
-        let mut outgoing = Vec::new();
-        for (to, envelope) in per_recipient {
-            if !rec.members.contains(&to) {
-                continue;
-            }
-            outgoing.push(Outgoing {
-                to,
-                message: ServerMessage::ChannelMessage {
-                    channel: channel.to_string(),
-                    from,
-                    from_name: from_name.clone(),
-                    envelope,
-                },
-            });
-        }
-        Ok(outgoing)
-    }
-
-    pub fn route_direct_message(
-        &self,
-        from: UserId,
-        to: UserId,
-        envelope: Envelope,
-    ) -> Result<Outgoing, String> {
-        if !self.clients.contains_key(&to) {
-            return Err("unknown recipient".to_string());
-        }
-        let from_name = self
-            .clients
-            .get(&from)
-            .map(|c| c.name.clone())
-            .ok_or_else(|| "unknown sender".to_string())?;
-        Ok(Outgoing { to, message: ServerMessage::DirectMessage { from, from_name, envelope } })
-    }
-
     /// Relays a `rsa_per_msg` key rotation (PROTOCOL.md §7.5/§11) point to
     /// point, exactly like `route_direct_message`. The server never
     /// inspects `signature` - that's the receiving client's job (§11.4) -
@@ -356,197 +310,21 @@ impl Registry {
         Ok(Outgoing { to, message: ServerMessage::KeyRotated { from, new_public_key_der, signature } })
     }
 
-    // -------------------------------------------------------------
-    // Live-streamed voice: Start/End have no per-recipient payload, so
-    // (unlike Chunk) they're broadcast the same way `join_channel`
-    // broadcasts `UserJoined` - derived from current membership, not a
-    // client-supplied list - excluding the sender, who doesn't need their
-    // own notice.
-    // -------------------------------------------------------------
-
-    pub fn route_channel_stream_start(
-        &self,
-        from: UserId,
-        channel: &str,
-        stream_id: u64,
-    ) -> Result<Vec<Outgoing>, String> {
-        let rec = self.channels.get(channel).ok_or_else(|| format!("no such channel: {channel}"))?;
-        if !rec.members.contains(&from) {
-            return Err("sender is not a member of this channel".to_string());
-        }
-        let from_name =
-            self.clients.get(&from).map(|c| c.name.clone()).ok_or_else(|| "unknown sender".to_string())?;
-        Ok(rec
-            .members
-            .iter()
-            .filter(|&&m| m != from)
-            .map(|&to| Outgoing {
-                to,
-                message: ServerMessage::ChannelStreamStart {
-                    channel: channel.to_string(),
-                    from,
-                    from_name: from_name.clone(),
-                    stream_id,
-                },
-            })
-            .collect())
-    }
-
-    pub fn route_channel_stream_chunk(
-        &self,
-        from: UserId,
-        channel: &str,
-        stream_id: u64,
-        seq: u32,
-        per_recipient: Vec<(UserId, Vec<Vec<u8>>)>,
-    ) -> Result<Vec<Outgoing>, String> {
-        let rec = self.channels.get(channel).ok_or_else(|| format!("no such channel: {channel}"))?;
-        if !rec.members.contains(&from) {
-            return Err("sender is not a member of this channel".to_string());
-        }
-        let mut outgoing = Vec::new();
-        for (to, blocks) in per_recipient {
-            if !rec.members.contains(&to) {
-                continue;
-            }
-            outgoing.push(Outgoing {
-                to,
-                message: ServerMessage::ChannelStreamChunk {
-                    channel: channel.to_string(),
-                    from,
-                    stream_id,
-                    seq,
-                    blocks,
-                },
-            });
-        }
-        Ok(outgoing)
-    }
-
-    pub fn route_channel_stream_end(
-        &self,
-        from: UserId,
-        channel: &str,
-        stream_id: u64,
-        duration_ms: u32,
-    ) -> Result<Vec<Outgoing>, String> {
-        let rec = self.channels.get(channel).ok_or_else(|| format!("no such channel: {channel}"))?;
-        if !rec.members.contains(&from) {
-            return Err("sender is not a member of this channel".to_string());
-        }
-        Ok(rec
-            .members
-            .iter()
-            .filter(|&&m| m != from)
-            .map(|&to| Outgoing {
-                to,
-                message: ServerMessage::ChannelStreamEnd {
-                    channel: channel.to_string(),
-                    from,
-                    stream_id,
-                    duration_ms,
-                },
-            })
-            .collect())
-    }
-
-    pub fn route_direct_stream_start(
+    /// Relays a direct-link candidate proposal (or reply) to `to` -
+    /// existence-check-only, exactly like `route_key_rotation`'s recipient
+    /// check. The server neither validates nor stores `candidates`/
+    /// `link_nonce`; see `crate::p2p` for what happens with them next.
+    pub fn route_peer_link_request(
         &self,
         from: UserId,
         to: UserId,
-        stream_id: u64,
+        candidates: Vec<SocketAddr>,
+        link_nonce: u64,
     ) -> Result<Outgoing, String> {
         if !self.clients.contains_key(&to) {
             return Err("unknown recipient".to_string());
         }
-        let from_name =
-            self.clients.get(&from).map(|c| c.name.clone()).ok_or_else(|| "unknown sender".to_string())?;
-        Ok(Outgoing { to, message: ServerMessage::DirectStreamStart { from, from_name, stream_id } })
-    }
-
-    pub fn route_direct_stream_chunk(
-        &self,
-        from: UserId,
-        to: UserId,
-        stream_id: u64,
-        seq: u32,
-        blocks: Vec<Vec<u8>>,
-    ) -> Result<Outgoing, String> {
-        if !self.clients.contains_key(&to) {
-            return Err("unknown recipient".to_string());
-        }
-        Ok(Outgoing { to, message: ServerMessage::DirectStreamChunk { from, stream_id, seq, blocks } })
-    }
-
-    pub fn route_direct_stream_end(
-        &self,
-        from: UserId,
-        to: UserId,
-        stream_id: u64,
-        duration_ms: u32,
-    ) -> Result<Outgoing, String> {
-        if !self.clients.contains_key(&to) {
-            return Err("unknown recipient".to_string());
-        }
-        Ok(Outgoing { to, message: ServerMessage::DirectStreamEnd { from, stream_id, duration_ms } })
-    }
-
-    // -------------------------------------------------------------
-    // File transfer: always point-to-point (`docs/PROTOCOL.md`'s file
-    // transfer section) - a channel send is just N independent offers, one
-    // per recipient, so every one of these is an existence-check-only relay
-    // exactly like `route_direct_message`/`route_direct_stream_*` above, no
-    // channel-membership validation involved.
-    // -------------------------------------------------------------
-
-    pub fn route_file_offer(
-        &self,
-        from: UserId,
-        to: UserId,
-        stream_id: u64,
-        channel: Option<String>,
-        envelope: Envelope,
-    ) -> Result<Outgoing, String> {
-        if !self.clients.contains_key(&to) {
-            return Err("unknown recipient".to_string());
-        }
-        let from_name = self.clients.get(&from).map(|c| c.name.clone()).ok_or_else(|| "unknown sender".to_string())?;
-        Ok(Outgoing { to, message: ServerMessage::FileOffer { from, from_name, stream_id, channel, envelope } })
-    }
-
-    pub fn route_file_accept(&self, from: UserId, to: UserId, stream_id: u64) -> Result<Outgoing, String> {
-        if !self.clients.contains_key(&to) {
-            return Err("unknown recipient".to_string());
-        }
-        Ok(Outgoing { to, message: ServerMessage::FileAccepted { from, stream_id } })
-    }
-
-    pub fn route_file_reject(&self, from: UserId, to: UserId, stream_id: u64) -> Result<Outgoing, String> {
-        if !self.clients.contains_key(&to) {
-            return Err("unknown recipient".to_string());
-        }
-        Ok(Outgoing { to, message: ServerMessage::FileRejected { from, stream_id } })
-    }
-
-    pub fn route_file_chunk(
-        &self,
-        from: UserId,
-        to: UserId,
-        stream_id: u64,
-        seq: u32,
-        blocks: Vec<Vec<u8>>,
-    ) -> Result<Outgoing, String> {
-        if !self.clients.contains_key(&to) {
-            return Err("unknown recipient".to_string());
-        }
-        Ok(Outgoing { to, message: ServerMessage::FileChunk { from, stream_id, seq, blocks } })
-    }
-
-    pub fn route_file_end(&self, from: UserId, to: UserId, stream_id: u64) -> Result<Outgoing, String> {
-        if !self.clients.contains_key(&to) {
-            return Err("unknown recipient".to_string());
-        }
-        Ok(Outgoing { to, message: ServerMessage::FileEnd { from, stream_id } })
+        Ok(Outgoing { to, message: ServerMessage::PeerCandidates { from, candidates, link_nonce } })
     }
 }
 
@@ -556,16 +334,33 @@ impl Registry {
 
 type Senders = Arc<Mutex<HashMap<UserId, mpsc::UnboundedSender<ServerMessage>>>>;
 
-/// Binds `addr` and serves forever.
+/// Binds `addr` (both TCP and, for the UDP rendezvous socket, the same
+/// numeric port - independent port namespaces, so this needs no separate
+/// flag) and serves forever.
 pub async fn run(addr: SocketAddr, auth: AuthConfig) -> std::io::Result<()> {
     let listener = TcpListener::bind(addr).await?;
-    serve(listener, auth).await
+    let udp = UdpSocket::bind(addr).await?;
+    serve_with_rendezvous(listener, udp, auth).await
 }
 
-/// Accepts connections on an already-bound listener and serves forever.
-/// Split out from `run` so tests can bind to an ephemeral port (`:0`) and
+/// Accepts connections on an already-bound listener and serves forever,
+/// with no UDP rendezvous socket - only used by tests that don't exercise
+/// direct-link candidate discovery and want one less socket to bind. Split
+/// out from `run` so tests can bind to an ephemeral port (`:0`) and
 /// discover the real address via `TcpListener::local_addr`.
 pub async fn serve(listener: TcpListener, auth: AuthConfig) -> std::io::Result<()> {
+    serve_tcp(listener, auth).await
+}
+
+/// `serve`, plus a UDP rendezvous socket bound alongside it (see
+/// `udp_rendezvous_loop`) - what `run` actually uses, and what
+/// direct-link/hole-punch tests bind explicitly.
+pub async fn serve_with_rendezvous(listener: TcpListener, udp: UdpSocket, auth: AuthConfig) -> std::io::Result<()> {
+    tokio::spawn(udp_rendezvous_loop(udp));
+    serve_tcp(listener, auth).await
+}
+
+async fn serve_tcp(listener: TcpListener, auth: AuthConfig) -> std::io::Result<()> {
     let registry = Arc::new(Mutex::new(Registry::new()));
     let senders: Senders = Arc::new(Mutex::new(HashMap::new()));
     let auth = Arc::new(auth);
@@ -580,6 +375,24 @@ pub async fn serve(listener: TcpListener, auth: AuthConfig) -> std::io::Result<(
                 eprintln!("aloo: connection {peer} ended: {e}");
             }
         });
+    }
+}
+
+/// Stateless STUN-Binding-style rendezvous: echoes back the address a
+/// `RendezvousMessage::BindingRequest` datagram actually arrived from, which
+/// is exactly the sender's own server-reflexive (public) address - the one
+/// piece of information a client can't learn about itself. No
+/// authentication, no `Registry` access, no state kept between datagrams:
+/// this reveals nothing about a sender beyond what any packet it sends
+/// already reveals to this server, the same threat model as a public STUN
+/// server. See `crate::p2p::learn_reflexive_candidate`.
+async fn udp_rendezvous_loop(socket: UdpSocket) {
+    let mut buf = [0u8; 512];
+    loop {
+        let Ok((n, from)) = socket.recv_from(&mut buf).await else { break };
+        let Ok(RendezvousMessage::BindingRequest { token }) = proto::decode(&buf[..n]) else { continue };
+        let Ok(response) = proto::encode(&RendezvousMessage::BindingResponse { token, observed: from }) else { continue };
+        let _ = socket.send_to(&response, from).await;
     }
 }
 
@@ -691,58 +504,6 @@ async fn client_loop<R: AsyncRead + Unpin>(
                     })
                 }
                 ClientMessage::LeaveChannel { name } => reg.leave_channel(id, &name),
-                ClientMessage::SendChannel { channel, per_recipient } => {
-                    reg.route_channel_message(id, &channel, per_recipient).unwrap_or_else(|reason| {
-                        vec![Outgoing { to: id, message: ServerMessage::Error { message: reason } }]
-                    })
-                }
-                ClientMessage::SendDirect { to, envelope } => {
-                    match reg.route_direct_message(id, to, envelope) {
-                        Ok(o) => vec![o],
-                        Err(reason) => {
-                            vec![Outgoing { to: id, message: ServerMessage::Error { message: reason } }]
-                        }
-                    }
-                }
-                ClientMessage::StreamChannelStart { channel, stream_id } => {
-                    reg.route_channel_stream_start(id, &channel, stream_id).unwrap_or_else(|reason| {
-                        vec![Outgoing { to: id, message: ServerMessage::Error { message: reason } }]
-                    })
-                }
-                ClientMessage::StreamChannelChunk { channel, stream_id, seq, per_recipient } => reg
-                    .route_channel_stream_chunk(id, &channel, stream_id, seq, per_recipient)
-                    .unwrap_or_else(|reason| {
-                        vec![Outgoing { to: id, message: ServerMessage::Error { message: reason } }]
-                    }),
-                ClientMessage::StreamChannelEnd { channel, stream_id, duration_ms } => reg
-                    .route_channel_stream_end(id, &channel, stream_id, duration_ms)
-                    .unwrap_or_else(|reason| {
-                        vec![Outgoing { to: id, message: ServerMessage::Error { message: reason } }]
-                    }),
-                ClientMessage::StreamDirectStart { to, stream_id } => {
-                    match reg.route_direct_stream_start(id, to, stream_id) {
-                        Ok(o) => vec![o],
-                        Err(reason) => {
-                            vec![Outgoing { to: id, message: ServerMessage::Error { message: reason } }]
-                        }
-                    }
-                }
-                ClientMessage::StreamDirectChunk { to, stream_id, seq, blocks } => {
-                    match reg.route_direct_stream_chunk(id, to, stream_id, seq, blocks) {
-                        Ok(o) => vec![o],
-                        Err(reason) => {
-                            vec![Outgoing { to: id, message: ServerMessage::Error { message: reason } }]
-                        }
-                    }
-                }
-                ClientMessage::StreamDirectEnd { to, stream_id, duration_ms } => {
-                    match reg.route_direct_stream_end(id, to, stream_id, duration_ms) {
-                        Ok(o) => vec![o],
-                        Err(reason) => {
-                            vec![Outgoing { to: id, message: ServerMessage::Error { message: reason } }]
-                        }
-                    }
-                }
                 ClientMessage::RotateKey { to, new_public_key_der, signature } => {
                     match reg.route_key_rotation(id, to, new_public_key_der, signature) {
                         Ok(o) => vec![o],
@@ -751,34 +512,14 @@ async fn client_loop<R: AsyncRead + Unpin>(
                         }
                     }
                 }
-                ClientMessage::FileOffer { to, stream_id, channel, envelope } => {
-                    match reg.route_file_offer(id, to, stream_id, channel, envelope) {
+                ClientMessage::RequestPeerLink { peer, candidates, link_nonce } => {
+                    match reg.route_peer_link_request(id, peer, candidates, link_nonce) {
                         Ok(o) => vec![o],
                         Err(reason) => {
                             vec![Outgoing { to: id, message: ServerMessage::Error { message: reason } }]
                         }
                     }
                 }
-                ClientMessage::FileAccept { to, stream_id } => match reg.route_file_accept(id, to, stream_id) {
-                    Ok(o) => vec![o],
-                    Err(reason) => vec![Outgoing { to: id, message: ServerMessage::Error { message: reason } }],
-                },
-                ClientMessage::FileReject { to, stream_id } => match reg.route_file_reject(id, to, stream_id) {
-                    Ok(o) => vec![o],
-                    Err(reason) => vec![Outgoing { to: id, message: ServerMessage::Error { message: reason } }],
-                },
-                ClientMessage::FileChunk { to, stream_id, seq, blocks } => {
-                    match reg.route_file_chunk(id, to, stream_id, seq, blocks) {
-                        Ok(o) => vec![o],
-                        Err(reason) => {
-                            vec![Outgoing { to: id, message: ServerMessage::Error { message: reason } }]
-                        }
-                    }
-                }
-                ClientMessage::FileEnd { to, stream_id } => match reg.route_file_end(id, to, stream_id) {
-                    Ok(o) => vec![o],
-                    Err(reason) => vec![Outgoing { to: id, message: ServerMessage::Error { message: reason } }],
-                },
                 ClientMessage::Auth(_) | ClientMessage::Identify { .. } => vec![Outgoing {
                     to: id,
                     message: ServerMessage::Error {

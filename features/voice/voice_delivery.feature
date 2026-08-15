@@ -7,9 +7,11 @@ Feature: Streaming a voice message to the channel
 
   Voice is never one whole message: it is a Start, then chunks as they are
   captured, then an End carrying the real duration - all sharing one
-  stream_id. See docs/PROTOCOL.md section 7.3.
+  stream_id, delivered over a peer-to-peer link punched between the two
+  clients (Start/End reliably, chunks unreliably). See docs/PROTOCOL.md
+  section 7.3 and "Direct peer-to-peer transport".
 
-  @AC-039 @TB-037
+  @AC-039 @TB-037 @AC-100
   Scenario: Voice arrives as an ordered start, chunk and end
     Given a server that anyone may connect to
     And alice has connected

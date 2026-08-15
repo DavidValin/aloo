@@ -27,6 +27,16 @@ readme = "README.md"
 # resolves one copy rather than two.
 windows-sys = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation"] }
 
+# `voice_pulse.rs`, used only on musl (see that module's doc comment for why
+# cpal's ALSA/dlopen path can't reach PulseAudio/PipeWire from a fully static
+# binary). `target_env` rather than `target_os`: every musl target here is
+# already Linux-only, but this is the cfg that actually names the property
+# that matters (libc, not OS) and matches `#[cfg(target_env = "musl")]` in
+# the source and `Cross.toml`'s static libpulse build.
+[target.'cfg(target_env = "musl")'.dependencies]
+libpulse-binding = "2.30"
+libpulse-simple-binding = "2.29"
+
 [dependencies]
 aes-gcm = "0.11"
 bincode = { version = "2", features = ["serde"] }
@@ -36,6 +46,10 @@ crossterm = "0.29.0"
 global-hotkey = "0.8"
 hkdf = "0.12"
 hmac = "0.12"
+# Local interface enumeration for direct peer-to-peer UDP hole punching's
+# host candidates (`src/p2p.rs`) - std has no cross-platform way to list a
+# machine's own network interfaces.
+if-addrs = "0.13"
 ml-dsa = "0.1"
 ml-kem = { version = "0.3", features = ["getrandom"] }
 pbkdf2 = { version = "0.12", features = ["simple"] }
@@ -125,6 +139,14 @@ path = "test/server_test.rs"
 [[test]]
 name = "rekey_test"
 path = "test/rekey_test.rs"
+
+[[test]]
+name = "p2p_reliable_test"
+path = "test/p2p_reliable_test.rs"
+
+[[test]]
+name = "p2p_test"
+path = "test/p2p_test.rs"
 
 [[test]]
 name = "hybrid_crypto_test"

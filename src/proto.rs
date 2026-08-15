@@ -239,6 +239,14 @@ pub enum Content {
 }
 
 /// Messages the client sends to the server.
+///
+/// Everyone's actual message/voice/file *content* used to be relayed here
+/// too (`SendChannel`/`SendDirect`, the `Stream*`/`File*` families) - see
+/// `docs/PROTOCOL.md`'s "Direct peer-to-peer transport" section for why
+/// that moved to a direct, server-assisted-but-not-server-carried UDP link
+/// (`crate::p2p`, `crate::p2p_proto`) instead. The server's job here is now
+/// pure signaling: auth, identify, channel membership, and helping two
+/// clients find each other's address.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClientMessage {
     /// First message after connecting, answering the server's `Hello`.
@@ -255,36 +263,6 @@ pub enum ClientMessage {
     /// `ChannelKind::Private`.
     JoinChannel { name: String, kind: ChannelKind },
     LeaveChannel { name: String },
-    /// One independently-encrypted envelope per recipient in the channel.
-    SendChannel {
-        channel: String,
-        per_recipient: Vec<(UserId, Envelope)>,
-    },
-    SendDirect { to: UserId, envelope: Envelope },
-
-    // -------------------------------------------------------------
-    // Live-streamed voice: a Start, then zero or more Chunks, then an
-    // End, in that order, all sharing one `stream_id`. `stream_id` alone
-    // is only unique per sender (a simple per-connection counter) - every
-    // consumer must key by `(from, stream_id)`, never `stream_id` alone,
-    // since two different senders' counters can coincidentally collide.
-    // Chunks carry raw RSA-OAEP `blocks` rather than a full `Envelope`:
-    // there's no meaningful per-chunk `Content` to attach. `seq` is
-    // advisory only - TCP plus the server's single-writer relay already
-    // guarantee in-order delivery, so receivers just accumulate in
-    // arrival order rather than reordering or rejecting on it.
-    // -------------------------------------------------------------
-    StreamChannelStart { channel: String, stream_id: u64 },
-    StreamChannelChunk {
-        channel: String,
-        stream_id: u64,
-        seq: u32,
-        per_recipient: Vec<(UserId, Vec<Vec<u8>>)>,
-    },
-    StreamChannelEnd { channel: String, stream_id: u64, duration_ms: u32 },
-    StreamDirectStart { to: UserId, stream_id: u64 },
-    StreamDirectChunk { to: UserId, stream_id: u64, seq: u32, blocks: Vec<Vec<u8>> },
-    StreamDirectEnd { to: UserId, stream_id: u64, duration_ms: u32 },
 
     /// `rsa_per_msg` only (`KeyMode::PerMessage`, PROTOCOL.md §11): tells
     /// `to` to trust a freshly-rotated per-peer key from now on.
@@ -297,22 +275,14 @@ pub enum ClientMessage {
         signature: Vec<u8>,
     },
 
-    // -------------------------------------------------------------
-    // File transfer (`docs/PROTOCOL.md`'s file transfer section):
-    // consent-gated and streamed, modeled as one independent
-    // point-to-point stream per recipient - `(from, stream_id)`-identified
-    // exactly like voice (§7.3), even when the send originated from a
-    // channel (a channel send is just N independent offers, one per
-    // recipient, each with its own `stream_id` from the sender's usual
-    // per-connection counter). `FileOffer`'s `envelope` carries a
-    // `Content::FileOffer` plaintext (`file_transfer::FileOfferPayload`);
-    // nothing is read off disk or sent until `FileAccept` arrives.
-    // -------------------------------------------------------------
-    FileOffer { to: UserId, stream_id: u64, channel: Option<String>, envelope: Envelope },
-    FileAccept { to: UserId, stream_id: u64 },
-    FileReject { to: UserId, stream_id: u64 },
-    FileChunk { to: UserId, stream_id: u64, seq: u32, blocks: Vec<Vec<u8>> },
-    FileEnd { to: UserId, stream_id: u64 },
+    /// Proposes (or accepts, when replying to one already received) a
+    /// direct UDP link to `peer`: `candidates` is this client's own host
+    /// and server-reflexive addresses, `link_nonce` is this client's own
+    /// opaque token for the attempt (echoed in its own `Ping`s - see
+    /// `p2p_proto::PunchDatagram`). The server only ever relays this to
+    /// `peer` (`Registry::route_peer_link_request`) - it never sees
+    /// anything from the resulting link itself. See `crate::p2p`.
+    RequestPeerLink { peer: UserId, candidates: Vec<std::net::SocketAddr>, link_nonce: u64 },
 }
 
 /// Messages the server sends to a client.
@@ -347,27 +317,6 @@ pub enum ServerMessage {
     /// history with `user_id` keeps them listed (grayed out) rather than
     /// removing them.
     UserOffline { user_id: UserId },
-    ChannelMessage {
-        channel: String,
-        from: UserId,
-        from_name: String,
-        envelope: Envelope,
-    },
-    DirectMessage {
-        from: UserId,
-        from_name: String,
-        envelope: Envelope,
-    },
-
-    /// Relayed mirror of the `ClientMessage::Stream*` family - see there
-    /// for the `(from, stream_id)` identity and `seq` caveats.
-    ChannelStreamStart { channel: String, from: UserId, from_name: String, stream_id: u64 },
-    ChannelStreamChunk { channel: String, from: UserId, stream_id: u64, seq: u32, blocks: Vec<Vec<u8>> },
-    ChannelStreamEnd { channel: String, from: UserId, stream_id: u64, duration_ms: u32 },
-    DirectStreamStart { from: UserId, from_name: String, stream_id: u64 },
-    DirectStreamChunk { from: UserId, stream_id: u64, seq: u32, blocks: Vec<Vec<u8>> },
-    DirectStreamEnd { from: UserId, stream_id: u64, duration_ms: u32 },
-
     /// Relayed mirror of `ClientMessage::RotateKey` - the `to` field isn't
     /// repeated since it's implicitly "whoever the server delivers this
     /// to" (see PROTOCOL.md §11.3/§11.4 for how the recipient reconstructs
@@ -378,12 +327,10 @@ pub enum ServerMessage {
         signature: Vec<u8>,
     },
 
-    /// Relayed mirror of the `ClientMessage::File*` family - see there.
-    FileOffer { from: UserId, from_name: String, stream_id: u64, channel: Option<String>, envelope: Envelope },
-    FileAccepted { from: UserId, stream_id: u64 },
-    FileRejected { from: UserId, stream_id: u64 },
-    FileChunk { from: UserId, stream_id: u64, seq: u32, blocks: Vec<Vec<u8>> },
-    FileEnd { from: UserId, stream_id: u64 },
+    /// Relayed mirror of `ClientMessage::RequestPeerLink` - see there and
+    /// `crate::p2p`. `from`'s candidates are exactly what `from` sent; the
+    /// server neither validates nor stores them.
+    PeerCandidates { from: UserId, candidates: Vec<std::net::SocketAddr>, link_nonce: u64 },
 
     Error { message: String },
 }

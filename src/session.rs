@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::io::Stdout;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -23,6 +24,8 @@ use crate::file_stream;
 use crate::idstore;
 use crate::netstats;
 use crate::own_next_keys;
+use crate::p2p::{self, P2pEvent, P2pOutbound, PeerLinkManager};
+use crate::p2p_proto::P2pPayload;
 use crate::proto::{self, ClientMessage, Content, Envelope, KeyMode, ServerMessage, UserId, UserInfo};
 use crate::rekey;
 use crate::sysstats;
@@ -63,7 +66,12 @@ pub(crate) struct SessionState {
     /// `spawn_receive_file_worker`) reports progress/completion/failure,
     /// polled by `run_connected_session`'s select loop (`handle_file_event`).
     pub(crate) file_events_tx: tokio::sync::mpsc::UnboundedSender<file_stream::FileEvent>,
-    pub(crate) record_out_tx: tokio::sync::mpsc::UnboundedSender<ClientMessage>,
+    /// Outgoing voice/file-chunk traffic from a background thread (the
+    /// recorder, the file sender) - drained by `run_connected_session`'s
+    /// select loop into `peer_link.dispatch_outbound`. Direct-transport
+    /// counterpart of what used to be a raw `ClientMessage` written
+    /// straight to the TCP socket.
+    pub(crate) record_out_tx: tokio::sync::mpsc::UnboundedSender<P2pOutbound>,
     pub(crate) own_stream_done_tx: tokio::sync::mpsc::UnboundedSender<(u64, u32, Vec<u8>)>,
     pub(crate) mixer_tx: tokio::sync::mpsc::UnboundedSender<voice::MixerCmd>,
     pub(crate) stream_finished_tx: tokio::sync::mpsc::UnboundedSender<(UserId, u64, u32, Vec<u8>)>,
@@ -142,6 +150,12 @@ pub(crate) struct SessionState {
     /// once that source actually drains on its own. `None` whenever nothing
     /// is being replayed.
     pub(crate) active_replay_id: Option<u64>,
+    /// The session's one direct client<->client UDP transport - see
+    /// `crate::p2p`. Every text/voice/file send that used to go to the
+    /// server now goes through this instead; the server keeps handling
+    /// only auth/identify/channel-membership/presence and the initial
+    /// candidate exchange this relies on.
+    pub(crate) peer_link: PeerLinkManager,
 }
 
 /// Runs on one dedicated thread for the whole session, processing
@@ -215,6 +229,7 @@ pub(crate) async fn run_connected_session(
     id_store: idstore::IdStore,
     own_next_keys: Option<own_next_keys::OwnNextKeys>,
     mut hotkey_rx: Option<tokio::sync::mpsc::UnboundedReceiver<crate::global_ptt::GlobalPttEvent>>,
+    server_addr: SocketAddr,
 ) -> Result<(), BoxError> {
     let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
     std::thread::spawn(move || loop {
@@ -263,13 +278,29 @@ pub(crate) async fn run_connected_session(
         },
     );
 
-    let (record_out_tx, mut record_out_rx) = tokio::sync::mpsc::unbounded_channel::<ClientMessage>();
+    let (record_out_tx, mut record_out_rx) = tokio::sync::mpsc::unbounded_channel::<P2pOutbound>();
     let (own_stream_done_tx, mut own_stream_done_rx) =
         tokio::sync::mpsc::unbounded_channel::<(u64, u32, Vec<u8>)>();
     let (stream_finished_tx, mut stream_finished_rx) =
         tokio::sync::mpsc::unbounded_channel::<(UserId, u64, u32, Vec<u8>)>();
     let (file_events_tx, mut file_events_rx) = tokio::sync::mpsc::unbounded_channel::<file_stream::FileEvent>();
     let (auto_stop_tx, mut auto_stop_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+
+    // The session's one direct client<->client UDP transport (`crate::p2p`).
+    // Bound on the same address family as the server so the reflexive-
+    // address probe below can actually reach it; the port is ephemeral
+    // (`:0`) since only the server needs a fixed, well-known port.
+    let bind_addr: SocketAddr = if server_addr.is_ipv6() {
+        SocketAddr::new(std::net::Ipv6Addr::UNSPECIFIED.into(), 0)
+    } else {
+        SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), 0)
+    };
+    let (p2p_events_tx, mut p2p_events_rx) = tokio::sync::mpsc::unbounded_channel::<P2pEvent>();
+    let (peer_link, p2p_socket) = PeerLinkManager::bind(bind_addr, server_addr, p2p_events_tx)
+        .await
+        .map_err(|e| format!("failed to open the direct-link UDP socket: {e}"))?;
+    let (p2p_raw_tx, mut p2p_raw_rx) = tokio::sync::mpsc::unbounded_channel::<(SocketAddr, crate::p2p_proto::PunchDatagram)>();
+    p2p::spawn_receive_loop(p2p_socket, p2p_raw_tx);
 
     // `PqHybrid` has no single RSA key to seed `rekey::OwnKeys` with and
     // never rotates (it's a static identity, like `Rsa`/`Password`/`None`
@@ -316,6 +347,7 @@ pub(crate) async fn run_connected_session(
         conn_stats: netstats::ConnStats::new(),
         auto_stop_tx,
         active_replay_id: None,
+        peer_link,
     };
 
     let mut ui_state = UiState::new(display_name);
@@ -353,8 +385,15 @@ pub(crate) async fn run_connected_session(
             }
             msg = record_out_rx.recv() => {
                 let Some(msg) = msg else { break };
-                proto::write_message(&mut wr, &msg).await?;
-                session.conn_stats.record_event(Instant::now());
+                session.peer_link.dispatch_outbound(msg);
+            }
+            dgram = p2p_raw_rx.recv() => {
+                let Some((addr, dgram)) = dgram else { break };
+                session.peer_link.on_datagram(addr, dgram);
+            }
+            event = p2p_events_rx.recv() => {
+                let Some(event) = event else { break };
+                handle_p2p_event(event, &mut ui_state, &mut session);
             }
             msg = rotate_out_rx.recv() => {
                 let Some(msg) = msg else { break };
@@ -488,6 +527,7 @@ pub(crate) async fn run_connected_session(
                 for stream in session.active_streams.values().filter(|s| s.last_seen < cutoff) {
                     let _ = stream.job_tx.send(voice_stream::DecryptJob::End);
                 }
+                session.peer_link.tick();
             }
         }
         terminal.draw(|f| ui::render(f, &ui_state))?;
@@ -634,8 +674,8 @@ async fn handle_ui_action(
         }
         UiAction::RejectFileOffer { from, stream_id } => {
             ui_state.take_file_offer(from, stream_id);
-            proto::write_message(wr, &ClientMessage::FileReject { to: from, stream_id }).await?;
-            session.conn_stats.record_event(Instant::now());
+            session.peer_link.ensure_link(wr, from).await;
+            session.peer_link.send_reliable_or_queue(from, P2pPayload::FileReject { stream_id });
         }
     }
     Ok(())
@@ -670,8 +710,8 @@ async fn accept_file_offer(
             ui_state.on_direct_file_offer_accepted(from, offer.from_name.clone(), stream_id, offer.filename.clone(), offer.size);
         }
     }
-    proto::write_message(wr, &ClientMessage::FileAccept { to: from, stream_id }).await?;
-    session.conn_stats.record_event(Instant::now());
+    session.peer_link.ensure_link(wr, from).await;
+    session.peer_link.send_reliable_or_queue(from, P2pPayload::FileAccept { stream_id });
     Ok(())
 }
 
@@ -762,38 +802,62 @@ async fn handle_server_message(
             ui_state.on_user_joined(&channel, user);
         }
         ServerMessage::UserLeft { channel, user_id } => ui_state.on_user_left(&channel, user_id),
-        ServerMessage::UserOffline { user_id } => ui_state.on_user_offline(user_id),
-        ServerMessage::ChannelMessage { channel, from, from_name, envelope } => {
-            crate::channel::on_message(ui_state, session, channel, from, from_name, envelope);
-        }
-        ServerMessage::DirectMessage { from, from_name, envelope } => {
-            crate::direct_message::on_message(ui_state, session, from, from_name, envelope);
-        }
-        ServerMessage::ChannelStreamStart { channel, from, from_name, stream_id } => {
-            crate::channel::on_stream_start(ui_state, session, channel, from, from_name, stream_id);
-        }
-        ServerMessage::ChannelStreamChunk { from, stream_id, seq, blocks, .. } => {
-            crate::channel::on_stream_chunk(session, from, stream_id, seq, blocks);
-        }
-        ServerMessage::ChannelStreamEnd { from, stream_id, .. } => {
-            crate::channel::on_stream_end(session, from, stream_id);
-        }
-        ServerMessage::DirectStreamStart { from, from_name, stream_id } => {
-            crate::direct_message::on_stream_start(ui_state, session, from, from_name, stream_id);
-        }
-        ServerMessage::DirectStreamChunk { from, stream_id, seq, blocks } => {
-            crate::direct_message::on_stream_chunk(session, from, stream_id, seq, blocks);
-        }
-        ServerMessage::DirectStreamEnd { from, stream_id, .. } => {
-            crate::direct_message::on_stream_end(session, from, stream_id);
+        ServerMessage::UserOffline { user_id } => {
+            ui_state.on_user_offline(user_id);
+            // A full disconnect is always the end of any relationship with
+            // them - unlike `UserLeft` (one channel, possibly still shared
+            // elsewhere or via an open DM), so this is the one case safe to
+            // forget the link unconditionally.
+            session.peer_link.forget(user_id);
         }
         ServerMessage::KeyRotated { from, new_public_key_der, signature } => {
             handle_key_rotated(ui_state, you, wr, session, from, new_public_key_der, signature).await?;
         }
-        ServerMessage::FileOffer { from, from_name, stream_id, channel, envelope } => {
+        ServerMessage::PeerCandidates { from, candidates, link_nonce } => {
+            session.peer_link.on_peer_candidates(wr, from, candidates, link_nonce).await;
+        }
+        ServerMessage::Error { message } => eprintln!("aloo: server error: {message}"),
+    }
+    Ok(None)
+}
+
+/// Applies one incoming direct-link event (`crate::p2p::P2pEvent`) - the
+/// direct-transport counterpart of `handle_server_message`'s old content
+/// arms (`ChannelMessage`/`DirectMessage`/`Stream*`/`File*`). `from_name` is
+/// resolved locally from `ui_state.known_users` rather than carried on the
+/// wire: the server used to attach it from its own registry, but a peer we
+/// have a link to is necessarily one whose `UserInfo` (learned via
+/// `UserJoined`) we already hold.
+fn handle_p2p_event(event: P2pEvent, ui_state: &mut UiState, session: &mut SessionState) {
+    let name_of = |ui_state: &UiState, id: UserId| ui_state.known_users.get(&id).map(|u| u.name.clone()).unwrap_or_default();
+    match event {
+        P2pEvent::Message { channel: Some(channel), from, envelope } => {
+            let from_name = name_of(ui_state, from);
+            crate::channel::on_message(ui_state, session, channel, from, from_name, envelope);
+        }
+        P2pEvent::Message { channel: None, from, envelope } => {
+            let from_name = name_of(ui_state, from);
+            crate::direct_message::on_message(ui_state, session, from, from_name, envelope);
+        }
+        P2pEvent::StreamStart { channel: Some(channel), from, stream_id } => {
+            let from_name = name_of(ui_state, from);
+            crate::channel::on_stream_start(ui_state, session, channel, from, from_name, stream_id);
+        }
+        P2pEvent::StreamStart { channel: None, from, stream_id } => {
+            let from_name = name_of(ui_state, from);
+            crate::direct_message::on_stream_start(ui_state, session, from, from_name, stream_id);
+        }
+        P2pEvent::StreamChunk { from, stream_id, seq, blocks } => {
+            voice_stream::forward_chunk(session, from, stream_id, seq, blocks);
+        }
+        P2pEvent::StreamEnd { from, stream_id } => {
+            voice_stream::end_incoming_stream(session, from, stream_id);
+        }
+        P2pEvent::FileOffer { channel, from, stream_id, envelope } => {
+            let from_name = name_of(ui_state, from);
             handle_incoming_file_offer(ui_state, session, from, from_name, stream_id, channel, envelope);
         }
-        ServerMessage::FileAccepted { from, stream_id } => {
+        P2pEvent::FileAccepted { stream_id } => {
             if let Some(target) = session.own_file_targets.remove(&stream_id) {
                 let me = ui_state.own_id.unwrap_or(UserId(0));
                 ui_state.set_file_progress(me, stream_id, 0);
@@ -806,23 +870,24 @@ async fn handle_server_message(
                     session.file_events_tx.clone(),
                 );
             }
-            let _ = from; // `from` is the accepter, i.e. `target.to` - nothing else needed.
         }
-        ServerMessage::FileRejected { from, stream_id } => {
+        P2pEvent::FileRejected { stream_id } => {
             session.own_file_targets.remove(&stream_id);
             let me = ui_state.own_id.unwrap_or(UserId(0));
             ui_state.set_file_rejected(me, stream_id);
-            let _ = from;
         }
-        ServerMessage::FileChunk { from, stream_id, seq, blocks } => {
+        P2pEvent::FileChunk { from, stream_id, seq, blocks } => {
             file_stream::forward_chunk(&mut session.active_file_transfers, from, stream_id, seq, blocks);
         }
-        ServerMessage::FileEnd { from, stream_id } => {
+        P2pEvent::FileEnd { from, stream_id } => {
             file_stream::end_incoming_transfer(&mut session.active_file_transfers, from, stream_id);
         }
-        ServerMessage::Error { message } => eprintln!("aloo: server error: {message}"),
+        P2pEvent::LinkFailed { peer, reason } => {
+            let name = name_of(ui_state, peer);
+            let peer_name = if name.is_empty() { format!("{peer:?}") } else { name };
+            ui_state.p2p_link_failed(&peer_name, &reason);
+        }
     }
-    Ok(None)
 }
 
 /// Checks a newly-learned peer's announced identity against the local
@@ -1180,34 +1245,15 @@ async fn install_trusted_rotation(
     let mut sent_any = false;
     for item in batch {
         let Some(der) = ui_state.known_users.get(&peer).map(|u| u.public_key_der.clone()) else { continue };
-        let sent = match item {
-            rekey::QueuedOutbound::Direct { plaintext } => {
-                if let Some(envelope) = encrypt_for_one(&der, plaintext.as_bytes(), Content::Text) {
-                    proto::write_message(wr, &ClientMessage::SendDirect { to: peer, envelope }).await?;
-                    session.conn_stats.record_event(Instant::now());
-                    true
-                } else {
-                    false
-                }
-            }
-            rekey::QueuedOutbound::Channel { channel, plaintext } => {
-                if let Some(envelope) = encrypt_for_one(&der, plaintext.as_bytes(), Content::Text) {
-                    proto::write_message(
-                        wr,
-                        &ClientMessage::SendChannel { channel, per_recipient: vec![(peer, envelope)] },
-                    )
-                    .await?;
-                    session.conn_stats.record_event(Instant::now());
-                    true
-                } else {
-                    false
-                }
-            }
+        let (channel, plaintext) = match item {
+            rekey::QueuedOutbound::Direct { plaintext } => (None, plaintext),
+            rekey::QueuedOutbound::Channel { channel, plaintext } => (Some(channel), plaintext),
         };
-        if sent {
-            sent_any = true;
-            request_rotation_if_per_message(session, peer);
-        }
+        let Some(envelope) = encrypt_for_one(&der, plaintext.as_bytes(), Content::Text) else { continue };
+        session.peer_link.ensure_link(wr, peer).await;
+        session.peer_link.send_reliable_or_queue(peer, P2pPayload::Envelope { channel, envelope });
+        sent_any = true;
+        request_rotation_if_per_message(session, peer);
     }
     if sent_any {
         session.remote_keys.mark_used(peer);

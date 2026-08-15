@@ -10,6 +10,8 @@ use rsa::RsaPublicKey;
 use tokio::io::AsyncWrite;
 
 use crate::crypto;
+use crate::p2p::LinkReadiness;
+use crate::p2p_proto::P2pPayload;
 use crate::proto::{self, ChannelInfo, ChannelKind, ClientMessage, Content, Envelope, KeyMode, UserId};
 use crate::rekey;
 use crate::session::SessionState;
@@ -56,8 +58,10 @@ pub(crate) async fn handle_send_text(
     }
     if !ready.is_empty() {
         let per_recipient = encrypt_for_each(session, &ready, plaintext.as_bytes(), Content::Text);
-        proto::write_message(wr, &ClientMessage::SendChannel { channel, per_recipient }).await?;
-        session.conn_stats.record_event(Instant::now());
+        for (id, envelope) in per_recipient {
+            session.peer_link.ensure_link(wr, id).await;
+            session.peer_link.send_reliable_or_queue(id, P2pPayload::Envelope { channel: Some(channel.clone()), envelope });
+        }
         for (id, ..) in ready {
             crate::session::request_rotation_if_per_message(session, id);
         }
@@ -125,9 +129,11 @@ pub(crate) async fn handle_send_file(
         let to_name = ui_state.known_users.get(&id).map(|u| u.name.clone()).unwrap_or_default();
         ui_state.log_own_file_offer_channel(&channel, &to_name, stream_id, filename.clone(), size);
         session.own_file_targets.insert(stream_id, crate::file_stream::OwnFileTarget { to: id, path: path.clone(), key });
-        proto::write_message(wr, &ClientMessage::FileOffer { to: id, stream_id, channel: Some(channel.clone()), envelope })
-            .await?;
-        session.conn_stats.record_event(Instant::now());
+        session.peer_link.ensure_link(wr, id).await;
+        session.peer_link.send_reliable_or_queue(
+            id,
+            P2pPayload::FileOffer { channel: Some(channel.clone()), stream_id, envelope },
+        );
         crate::session::request_rotation_if_per_message(session, id);
     }
     Ok(())
@@ -142,14 +148,18 @@ pub(crate) async fn handle_voice_record_start(
     channel: String,
     recipients: Vec<Recipient>,
 ) -> proto::Result<()> {
-    // Voice streams are never queued (PROTOCOL.md
-    // §11.6): a rsa_per_msg recipient without a
-    // fresh key right now is simply left out of
-    // this particular stream, same as any other
+    // Voice streams are never queued (PROTOCOL.md §11.6): a rsa_per_msg
+    // recipient without a fresh key right now, or one whose direct link
+    // isn't already `Active` right now (no relay fallback, and punching can
+    // take up to several seconds - too long to make a live recording wait
+    // on), is simply left out of this particular stream, same as any other
     // partial-delivery case.
     let mut ready = Vec::new();
     for (id, key_mode, der) in recipients {
-        if can_address(key_mode, session.own_key_mode) && session.remote_keys.try_use(id) {
+        if !can_address(key_mode, session.own_key_mode) || !session.remote_keys.try_use(id) {
+            continue;
+        }
+        if session.peer_link.ensure_link(wr, id).await == LinkReadiness::Active {
             ready.push((id, key_mode, der));
         }
     }
@@ -157,8 +167,9 @@ pub(crate) async fn handle_voice_record_start(
     let rsa = parse_recipients(&ready);
     let pq = voice_stream::build_pq_stream_out(session, stream_id, &parse_pq_recipients(&ready));
     ui_state.log_own_voice_stream_start_channel(&channel, stream_id);
-    proto::write_message(wr, &ClientMessage::StreamChannelStart { channel: channel.clone(), stream_id }).await?;
-    session.conn_stats.record_event(Instant::now());
+    for &id in &ready_ids {
+        session.peer_link.send_reliable_or_queue(id, P2pPayload::StreamStart { channel: Some(channel.clone()), stream_id });
+    }
     let (stop_tx, stop_rx) = std::sync::mpsc::channel();
     session.active_recording = Some(stop_tx);
     session
@@ -166,7 +177,7 @@ pub(crate) async fn handle_voice_record_start(
         .insert(stream_id, voice_stream::OwnStreamTarget::Channel { channel: channel.clone(), recipients: ready_ids });
     voice_stream::spawn_record_stream_worker(
         recorder,
-        voice_stream::StreamRecipients::Channel { channel, rsa, pq },
+        voice_stream::StreamRecipients::Channel { rsa, pq },
         stream_id,
         session.record_out_tx.clone(),
         session.own_stream_done_tx.clone(),
@@ -262,14 +273,6 @@ pub(crate) fn on_stream_start(
     let sender_public_key_der = ui_state.known_users.get(&from).map(|u| u.public_key_der.clone()).unwrap_or_default();
     ui_state.on_channel_stream_start(&channel, from, from_name, stream_id);
     voice_stream::start_incoming_stream(session, from, stream_id, Some(channel), suppress_playback, &sender_public_key_der);
-}
-
-pub(crate) fn on_stream_chunk(session: &mut SessionState, from: UserId, stream_id: u64, seq: u32, blocks: Vec<Vec<u8>>) {
-    voice_stream::forward_chunk(session, from, stream_id, seq, blocks);
-}
-
-pub(crate) fn on_stream_end(session: &mut SessionState, from: UserId, stream_id: u64) {
-    voice_stream::end_incoming_stream(session, from, stream_id);
 }
 
 // Extracted verbatim from the `OwnStreamTarget::Channel` match arm that

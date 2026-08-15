@@ -6,9 +6,11 @@ Feature: Delivering a private message
   So that we can talk without the rest of the channel
 
   A direct message involves no channel at all - it is addressed to a UserId
-  and relayed to exactly that connection. See docs/PROTOCOL.md section 7.2.
+  and delivered directly over a peer-to-peer link punched between the two
+  clients, never through the server. See docs/PROTOCOL.md section 7.2 and
+  "Direct peer-to-peer transport".
 
-  @AC-027
+  @AC-027 @AC-100
   Scenario: A private message reaches its recipient unchanged
     Given a server that anyone may connect to
     And alice has connected

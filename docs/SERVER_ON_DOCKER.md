@@ -56,7 +56,8 @@ build.
 docker run -d \
   --name aloo-server \
   --restart unless-stopped \
-  -p 7878:7878 \
+  -p 7878:7878/tcp \
+  -p 7878:7878/udp \
   -v aloo-data:/home/aloo/.aloo \
   -e ALOO_PASSWORD=mypassword \
   aloo-server
@@ -65,8 +66,15 @@ docker run -d \
 - `--restart unless-stopped` — covers the container itself dying (e.g.
   OOM-killed). See "Crash recovery" for how a crash of just the `aloo`
   process inside a still-running container is handled.
-- `-p 7878:7878` — publish the port aloo listens on. If you change
-  `ALOO_PORT` (below), update this mapping to match — `-p <host>:<ALOO_PORT>`.
+- `-p 7878:7878/tcp -p 7878:7878/udp` — publish **both** protocols on the
+  port aloo listens on: TCP for client connections, and UDP for the
+  rendezvous socket clients use to discover their own public address for
+  direct peer-to-peer hole punching (`docs/PROTOCOL.md` §7.0) — a bare
+  `-p 7878:7878` only publishes TCP and silently breaks that discovery
+  step (clients still connect and chat fine, but fall back to host
+  candidates only, which can't punch across two different NATs). If you
+  change `ALOO_PORT` (below), update both mappings to match —
+  `-p <host>:<ALOO_PORT>/tcp -p <host>:<ALOO_PORT>/udp`.
 - `-v aloo-data:/home/aloo/.aloo` — see "The `~/.aloo` mount point" below.
 
 ## Parameters
@@ -98,7 +106,8 @@ docker run --rm -v aloo-data:/home/aloo/.aloo alpine:3.20 sh -c \
    chown 100:101 /home/aloo/.aloo /home/aloo/.aloo/server_key"
 
 docker run -d --name aloo-server --restart unless-stopped \
-  -p 7878:7878 \
+  -p 7878:7878/tcp \
+  -p 7878:7878/udp \
   -v aloo-data:/home/aloo/.aloo \
   -e ALOO_ENC_TYPE=rsa \
   -e ALOO_ENC_KEYFILE=/home/aloo/.aloo/server_key \

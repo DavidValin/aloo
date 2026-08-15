@@ -4,12 +4,12 @@
 //! `handle_ui_action`/`handle_server_message`; the generic
 //! live-voice-streaming plumbing they use lives in `crate::voice_stream`.
 
-use std::time::Instant;
-
 use tokio::io::AsyncWrite;
 
 use crate::crypto;
-use crate::proto::{self, ClientMessage, Content, Envelope, KeyMode, UserId};
+use crate::p2p::LinkReadiness;
+use crate::p2p_proto::P2pPayload;
+use crate::proto::{self, Content, Envelope, KeyMode, UserId};
 use crate::rekey;
 use crate::session::SessionState;
 use crate::ui::ui::UiState;
@@ -46,8 +46,8 @@ pub(crate) async fn handle_send_text(
         if let Some(envelope) =
             encrypt_for_recipient(session, recipient_key_mode, &recipient_pubkey_der, plaintext.as_bytes(), Content::Text)
         {
-            proto::write_message(wr, &ClientMessage::SendDirect { to, envelope }).await?;
-            session.conn_stats.record_event(Instant::now());
+            session.peer_link.ensure_link(wr, to).await;
+            session.peer_link.send_reliable_or_queue(to, P2pPayload::Envelope { channel: None, envelope });
             crate::session::request_rotation_if_per_message(session, to);
         }
     } else {
@@ -87,8 +87,8 @@ pub(crate) async fn handle_send_file(
     session.next_stream_id += 1;
     ui_state.log_own_file_offer_dm(to, stream_id, filename.clone(), size);
     session.own_file_targets.insert(stream_id, crate::file_stream::OwnFileTarget { to, path, key });
-    proto::write_message(wr, &ClientMessage::FileOffer { to, stream_id, channel: None, envelope }).await?;
-    session.conn_stats.record_event(Instant::now());
+    session.peer_link.ensure_link(wr, to).await;
+    session.peer_link.send_reliable_or_queue(to, P2pPayload::FileOffer { channel: None, stream_id, envelope });
     crate::session::request_rotation_if_per_message(session, to);
     Ok(())
 }
@@ -105,6 +105,13 @@ pub(crate) async fn handle_voice_record_start(
 ) -> proto::Result<()> {
     if !crate::channel::can_address(recipient_key_mode, session.own_key_mode) || !session.remote_keys.try_use(to) {
         ui_state.recording_failed("recipient's key isn't ready yet".to_string());
+        return Ok(());
+    }
+    // Voice is never queued (PROTOCOL.md §11.6) - a link that isn't already
+    // `Active` right now (no relay fallback, and punching can take several
+    // seconds) fails this recording outright, same as an unready key above.
+    if session.peer_link.ensure_link(wr, to).await != LinkReadiness::Active {
+        ui_state.recording_failed("no direct connection to recipient yet".to_string());
         return Ok(());
     }
     let key = match recipient_key_mode {
@@ -128,8 +135,7 @@ pub(crate) async fn handle_voice_record_start(
         },
     };
     ui_state.log_own_voice_stream_start_dm(to, stream_id);
-    proto::write_message(wr, &ClientMessage::StreamDirectStart { to, stream_id }).await?;
-    session.conn_stats.record_event(Instant::now());
+    session.peer_link.send_reliable_or_queue(to, P2pPayload::StreamStart { channel: None, stream_id });
     let (stop_tx, stop_rx) = std::sync::mpsc::channel();
     session.active_recording = Some(stop_tx);
     session.own_stream_targets.insert(stream_id, voice_stream::OwnStreamTarget::Direct(to));
@@ -172,14 +178,6 @@ pub(crate) fn on_stream_start(
     let sender_public_key_der = ui_state.known_users.get(&from).map(|u| u.public_key_der.clone()).unwrap_or_default();
     ui_state.on_direct_stream_start(from, from, from_name, stream_id);
     voice_stream::start_incoming_stream(session, from, stream_id, None, suppress_playback, &sender_public_key_der);
-}
-
-pub(crate) fn on_stream_chunk(session: &mut SessionState, from: UserId, stream_id: u64, seq: u32, blocks: Vec<Vec<u8>>) {
-    voice_stream::forward_chunk(session, from, stream_id, seq, blocks);
-}
-
-pub(crate) fn on_stream_end(session: &mut SessionState, from: UserId, stream_id: u64) {
-    voice_stream::end_incoming_stream(session, from, stream_id);
 }
 
 pub(crate) fn on_own_stream_finished(

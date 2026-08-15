@@ -6,10 +6,12 @@ Feature: Delivering a message to the people it was addressed to
   So that we can hold a conversation
 
   The sender addresses each recipient individually with their own separately
-  encrypted copy; the server relays opaque bytes it cannot read and drops any
-  addressee who is not a member. See docs/PROTOCOL.md sections 7.1 and 8.
+  encrypted copy, delivered directly over a peer-to-peer link punched between
+  the two clients - the server only ever helps them find each other, never
+  the message itself. See docs/PROTOCOL.md sections 7.1, 8, and "Direct
+  peer-to-peer transport".
 
-  @AC-024
+  @AC-024 @AC-100
   Scenario: A channel message reaches the member it was addressed to, unchanged
     Given a server that anyone may connect to
     And alice has connected
