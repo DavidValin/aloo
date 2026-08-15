@@ -840,3 +840,46 @@ fn render_with_open_file_browser_does_not_panic() {
     terminal.draw(|f| render(f, &state)).unwrap();
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// @requirement AC-093
+#[test]
+fn file_browser_render_scrolls_to_keep_the_selection_visible() {
+    // More files than fit in the browser popup's visible height, so a
+    // selection near the end starts out scrolled off screen.
+    let root = std::env::temp_dir().join(format!("aloo-ui-popup-scroll-test-{}-{}", std::process::id(), fastrand_seed()));
+    std::fs::create_dir_all(&root).unwrap();
+    for i in 0..30 {
+        std::fs::write(root.join(format!("file{i:02}.txt")), b"x").unwrap();
+    }
+
+    let mut browser = FileBrowserState::open(root.clone()).unwrap();
+    // entries: "..", file00.txt, ..., file29.txt (31 total) - move selection
+    // all the way to the last one.
+    for _ in 0..30 {
+        browser.select_next();
+    }
+    assert_eq!(browser.selected_entry().unwrap().name, "file29.txt");
+
+    let mut state = ConnectPopupState::new();
+    state.server_key.key_type = KeyType::Rsa;
+    state.browser = Some((aloo::ui::ui_connect_popup::FileBrowserTarget::ServerKeyFile, browser));
+
+    let backend = TestBackend::new(80, 24);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| render(f, &state)).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    let rows: Vec<String> = (0..buffer.area.height)
+        .map(|y| (0..buffer.area.width).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+        .collect();
+
+    assert!(
+        rows.iter().any(|r| r.contains("file29.txt")),
+        "the selected entry must have scrolled into view: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|r| r.contains("file00.txt")),
+        "an unselected entry far from the current scroll position should not still be shown: {rows:?}"
+    );
+
+    std::fs::remove_dir_all(&root).ok();
+}

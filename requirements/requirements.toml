@@ -99,6 +99,11 @@ id = "AC-012"
 description = "The focused Connect button is highlighted without the highlight bleeding into its border."
 evidence = "docs/SPEC.md 'Not connected UI'; test connect_button_highlight_does_not_bleed_into_its_border"
 
+[[user_story.acceptance_criteria]]
+id = "AC-093"
+description = "The file browser scrolls its list to keep the selected entry on screen, so pressing Down past the last row that fits in the popup keeps advancing through off-screen entries instead of stalling once the highlight reaches the bottom edge; the same fix applies everywhere this widget is reused, including the /file send flow's browser (US-019)."
+evidence = "docs/SPEC.md 'File browser'; test file_browser_render_scrolls_to_keep_the_selection_visible"
+
 [[user_story.technical_behavior]]
 id = "TB-001"
 description = "server_key's key type cycles rsa -> password -> none -> rsa and defaults to none."
@@ -1388,3 +1393,28 @@ evidence = "src/global_ptt.rs resolve_hotkey; tests resolve_hotkey_parses_a_vali
 id = "TB-137"
 description = "global_ptt::is_wayland_session flags a Wayland session from either XDG_SESSION_TYPE=wayland or a set WAYLAND_DISPLAY (case-insensitively), and only those - so aloo can warn once and skip registering the global shortcut instead of attempting (and silently failing) X11-only registration under Wayland."
 evidence = "src/global_ptt.rs is_wayland_session; tests is_wayland_session_detects_session_type_wayland, is_wayland_session_detects_a_set_wayland_display_even_without_session_type, is_wayland_session_false_for_a_plain_x11_session"
+
+# ============================================================================
+# US-023 - Recover server settings after a crash
+# ============================================================================
+[[user_story]]
+id = "US-023"
+title = "Recover server settings after a crash"
+as_a = "server operator"
+i_want = "the server to remember the --bind/--port/auth it was last started with"
+so_that = "restarting it after a crash doesn't require re-typing the original flags, and it doesn't silently fall back to open access on the default port"
+
+[[user_story.acceptance_criteria]]
+id = "AC-094"
+description = "Starting the server with any of --bind/--port/--enc/--password persists the resolved bind address, port, and auth method to ~/.aloo/settings; starting it again with none of those flags reuses exactly what was last persisted - including a persisted rsa auth's keyfile path or a persisted shared password - instead of resetting to the CLI defaults (open access on 0.0.0.0:7878)."
+evidence = "docs/SPEC.md 'Server startup'; tests server_with_no_flags_reuses_the_previously_persisted_bind_and_port, server_with_no_flags_reuses_previously_persisted_password_auth"
+
+[[user_story.technical_behavior]]
+id = "TB-138"
+description = "Settings::server_auth (none/password/rsa) round-trips through ~/.aloo/settings as server_auth_type plus its one associated value (server_auth_password or server_auth_rsa_keyfile); a server_auth_type naming password or rsa whose associated value line is missing falls back to None rather than panicking or half-applying."
+evidence = "src/settings.rs; tests round_trips_password_auth_through_save_and_load, round_trips_rsa_auth_through_save_and_load, a_malformed_server_auth_type_with_no_matching_value_falls_back_to_none"
+
+[[user_story.technical_behavior]]
+id = "TB-139"
+description = "run_server resolves each of bind/port/auth CLI-flag-first, falling back to whatever Settings::load_or_create returned for that field, then re-saves the merged result before binding - so a flag actually passed this run becomes what the next flag-less run inherits, and passing only one flag leaves the other persisted fields untouched."
+evidence = "src/main.rs run_server; tests an_explicit_flag_overrides_and_persists_over_a_previous_value, server_bind_and_port_flags_are_parsed_into_the_listen_address"

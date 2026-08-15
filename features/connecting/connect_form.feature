@@ -141,6 +141,14 @@ Feature: Filling in the connect form
     When I walk into the sub-directory and back out again
     Then the browser can step back and then forward again
 
+  @AC-093
+  Scenario: The file browser scrolls to keep the selection visible
+    Given the connect form is open
+    And a directory holding more files than fit in the file browser popup
+    When I open the file browser on that directory and select the last entry
+    Then the last entry is visible in the file browser
+    And the first entry has scrolled out of view
+
   @AC-012
   Scenario: The focused Connect button highlights its label, not its frame
     Given the connect form is open

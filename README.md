@@ -6,6 +6,8 @@ Walky talky in your terminal! aloo is a terminal chat app for talking with peopl
 
 Just you, your terminal, and the people you're talking to.
 
+* [⬇️ Download](https://github.com/DavidValin/aloo/releases) (⭐ MacOS ⭐ Linux and ⭐ Windows supported)
+
 ## Features
 
 - 💬 **Text chat** — type and hit `Enter`, just like any chat app.
@@ -39,6 +41,8 @@ aloo --server --enc rsa server_key     # people need a matching RSA key to conne
 ```
 
 The server always starts with one public channel called `general`.
+
+Whatever `--bind`/`--port`/`--password`/`--enc` you run it with gets saved to `~/.aloo/settings`; a bare `aloo --server` afterwards (e.g. after a crash) reuses the last configuration you started it with, auth included, instead of resetting to open access on the default port.
 
 ### 3. Connect
 

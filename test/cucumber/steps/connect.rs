@@ -92,6 +92,16 @@ async fn a_directory_tree(w: &mut AlooWorld) {
     w.browser_root = Some(root);
 }
 
+#[given("a directory holding more files than fit in the file browser popup")]
+async fn a_directory_with_many_files(w: &mut AlooWorld) {
+    let root = w.temp_path("browser-scroll");
+    std::fs::create_dir_all(&root).unwrap();
+    for i in 0..30 {
+        std::fs::write(root.join(format!("file{i:02}.txt")), b"x").unwrap();
+    }
+    w.browser_root = Some(root);
+}
+
 // ---------------------------------------------------------------------
 // When
 // ---------------------------------------------------------------------
@@ -149,6 +159,16 @@ async fn browse_and_pick(w: &mut AlooWorld) {
     p.handle_key(KeyCode::Down).unwrap();
     p.handle_key(KeyCode::Down).unwrap();
     p.handle_key(KeyCode::Enter).unwrap();
+}
+
+#[when("I open the file browser on that directory and select the last entry")]
+async fn browse_and_select_last(w: &mut AlooWorld) {
+    let root = w.browser_root.clone().expect("no directory tree");
+    let mut browser = FileBrowserState::open(root).unwrap();
+    let last = browser.entries.len() - 1;
+    browser.selected = last;
+    w.popup_mut().server_key.key_type = KeyType::Rsa;
+    w.popup_mut().browser = Some((FileBrowserTarget::ServerKeyFile, browser));
 }
 
 #[when("I walk into the sub-directory and back out again")]
@@ -329,6 +349,26 @@ async fn browser_back_forward(w: &mut AlooWorld) {
 
     assert!(browser.go_forward().unwrap(), "forward should return where we came from");
     assert_eq!(browser.current_dir, root.join("subdir"));
+}
+
+#[then("the last entry is visible in the file browser")]
+async fn last_entry_visible(w: &mut AlooWorld) {
+    let state = w.popup.as_ref().expect("no form");
+    let rows = popup_rows(state, 80, 24);
+    assert!(
+        rows.iter().any(|r| r.contains("file29.txt")),
+        "the selected (last) entry must have scrolled into view: {rows:?}"
+    );
+}
+
+#[then("the first entry has scrolled out of view")]
+async fn first_entry_out_of_view(w: &mut AlooWorld) {
+    let state = w.popup.as_ref().expect("no form");
+    let rows = popup_rows(state, 80, 24);
+    assert!(
+        !rows.iter().any(|r| r.contains("file00.txt")),
+        "an entry far from the current scroll position should not still be shown: {rows:?}"
+    );
 }
 
 #[then("a fresh browser has nowhere to step back or forward to")]

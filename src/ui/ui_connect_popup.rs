@@ -13,7 +13,7 @@ use crossterm::event::KeyCode;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -870,6 +870,13 @@ fn render_connect_button(frame: &mut Frame, area: Rect, focused: bool) {
 /// send-a-file browser - the same generic, fs-backed directory browser
 /// (`FileBrowserState`), just titled differently for whichever popup is
 /// currently using it (`"Select file"` here, `"Send file"` there).
+///
+/// Uses `ListState` rather than a fixed style-per-item (same fix as
+/// `ui::render_message_log`'s `list_state`): without it, `List` always
+/// starts drawing at entry 0 and simply clips whatever doesn't fit, so
+/// selecting past the bottom of the visible area moved `browser.selected`
+/// but never scrolled the view to show it - `ListState` makes ratatui
+/// compute whatever offset keeps the selected entry on screen.
 pub(crate) fn render_file_browser(frame: &mut Frame, area: Rect, browser: &FileBrowserState, title_prefix: &str) {
     let popup = centered_rect(60, 20, area);
     let title = format!("{title_prefix} - {}", browser.current_dir.display());
@@ -880,12 +887,12 @@ pub(crate) fn render_file_browser(frame: &mut Frame, area: Rect, browser: &FileB
     let items: Vec<ListItem> = browser
         .entries
         .iter()
-        .enumerate()
-        .map(|(i, e)| {
-            let label = if e.is_dir { format!("{}/", e.name) } else { e.name.clone() };
-            let style = if i == browser.selected { Style::default().add_modifier(Modifier::REVERSED) } else { Style::default() };
-            ListItem::new(label).style(style)
-        })
+        .map(|e| ListItem::new(if e.is_dir { format!("{}/", e.name) } else { e.name.clone() }))
         .collect();
-    frame.render_widget(List::new(items), inner);
+    let list = List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    let mut list_state = ListState::default();
+    if !browser.entries.is_empty() {
+        list_state.select(Some(browser.selected.min(browser.entries.len() - 1)));
+    }
+    frame.render_stateful_widget(list, inner, &mut list_state);
 }

@@ -28,12 +28,15 @@ struct Cli {
     server: bool,
 
     /// Port to bind (server) / default-fill in the connect popup (client).
-    #[arg(long, default_value_t = 7878)]
-    port: u16,
+    /// Defaults to 7878 - server mode falls back to whatever
+    /// `~/.aloo/settings` last recorded if this flag is omitted.
+    #[arg(long)]
+    port: Option<u16>,
 
-    /// Server-only: address to bind to.
-    #[arg(long, default_value = "0.0.0.0")]
-    bind: String,
+    /// Server-only: address to bind to. Defaults to 0.0.0.0 - falls back to
+    /// whatever `~/.aloo/settings` last recorded if this flag is omitted.
+    #[arg(long)]
+    bind: Option<String>,
 
     /// Server-only auth: `--enc rsa <keyfile>` requires clients to prove
     /// they hold the matching public key.
@@ -205,18 +208,43 @@ fn run_keygen_pq_hybrid(prefix: &str) -> Result<(), BoxError> {
 // Server mode
 // ---------------------------------------------------------------------
 
+/// Resolves bind/port/auth CLI-flag-first, falling back to whatever
+/// `~/.aloo/settings` last recorded for any flag not given this run, then
+/// re-saves the merged result before starting - so a flag actually passed
+/// this run becomes what the next flag-less run (e.g. a supervisor
+/// restarting the server after a crash) inherits.
 async fn run_server(cli: Cli) -> Result<(), BoxError> {
-    let addr: SocketAddr = format!("{}:{}", cli.bind, cli.port).parse()?;
+    let mut settings = load_settings();
+    let bind = cli.bind.clone().unwrap_or_else(|| settings.server_bind.clone());
+    let port = cli.port.unwrap_or(settings.server_port);
+
     let auth = match (&cli.enc, &cli.password) {
         (Some(v), None) if v[0] == "rsa" => {
-            let key = crypto::load_private_key(&PathBuf::from(&v[1]))?;
+            let keyfile = PathBuf::from(&v[1]);
+            let key = crypto::load_private_key(&keyfile)?;
+            settings.server_auth = settings::ServerAuth::Rsa(keyfile);
             AuthConfig::Rsa(Box::new(key))
         }
         (Some(v), None) => return Err(format!("unsupported --enc type: {}", v[0]).into()),
-        (None, Some(pw)) => AuthConfig::Password(pw.clone()),
-        (None, None) => AuthConfig::None,
+        (None, Some(pw)) => {
+            settings.server_auth = settings::ServerAuth::Password(pw.clone());
+            AuthConfig::Password(pw.clone())
+        }
+        (None, None) => match settings.server_auth.clone() {
+            settings::ServerAuth::None => AuthConfig::None,
+            settings::ServerAuth::Password(pw) => AuthConfig::Password(pw),
+            settings::ServerAuth::Rsa(keyfile) => AuthConfig::Rsa(Box::new(crypto::load_private_key(&keyfile)?)),
+        },
         (Some(_), Some(_)) => return Err("--enc and --password are mutually exclusive".into()),
     };
+
+    settings.server_bind = bind.clone();
+    settings.server_port = port;
+    if let Err(e) = settings.save(&settings::default_path()) {
+        eprintln!("aloo: could not persist server settings to ~/.aloo/settings ({e})");
+    }
+
+    let addr: SocketAddr = format!("{bind}:{port}").parse()?;
     println!("aloo: server listening on {addr}");
     server::run(addr, auth).await?;
     Ok(())
@@ -231,7 +259,8 @@ async fn run_client(
     hotkey_rx: Option<tokio::sync::mpsc::UnboundedReceiver<global_ptt::GlobalPttEvent>>,
 ) -> Result<(), BoxError> {
     let (mut terminal, keyboard_release_reporting) = setup_terminal()?;
-    let result = connect::run_client_inner(&mut terminal, cli.port, keyboard_release_reporting, hotkey_rx).await;
+    let port = cli.port.unwrap_or(settings::DEFAULT_PORT);
+    let result = connect::run_client_inner(&mut terminal, port, keyboard_release_reporting, hotkey_rx).await;
     restore_terminal(&mut terminal)?;
     result
 }

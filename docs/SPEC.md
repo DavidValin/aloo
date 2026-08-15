@@ -61,6 +61,8 @@ The server is started as:
 
 Other server flags: `--bind <ADDR>` (default `0.0.0.0`), `--port <PORT>` (default `7878`). The server always seeds one default public channel, `general`, so a freshly started server has something for the first-connected client to join.
 
+Every server start persists its resolved `--bind`/`--port`/auth choice to `~/.aloo/settings` (`server_bind`, `server_port`, `server_auth_type` + its one associated value). Any of `--bind`, `--port`, `--enc`, `--password` given on the command line wins and gets persisted; whichever of these flags is *not* given falls back to what's already in `~/.aloo/settings`. So `aloo --server` alone reuses this machine's last server configuration in full - including auth - and a supervisor that restarts a crashed server with the exact same bare `aloo --server` command comes back up listening the same way, without needing to remember or re-pass the original flags.
+
 ## UI
 
 ### Not connected UI
@@ -88,7 +90,7 @@ Every focused text field (host/port/nickname, and a `password`-type `server_key`
 
 The `my_key` type controls how the user's own key material is sourced/protected locally, and — for `rsa_per_msg` only — also switches on an ongoing key-rotation behavior for the rest of the session (Functionality #6). Every type but `pq_hybrid` uses an RSA keypair for actual channel/DM encryption — the public-key exchange that happens on joining a channel (see below) always applies; `pq_hybrid` instead uses the hybrid scheme in Functionality #11.
 
-**File browser**: a custom in-TUI widget (not an OS dialog) that supports back/forward navigation through directories and file selection.
+**File browser**: a custom in-TUI widget (not an OS dialog) that supports back/forward navigation through directories and file selection. Reused as-is for the `/file` send flow's own browser (`docs/SPEC.md` Functionality below). The visible list scrolls to keep the selected entry on screen, so a directory with more entries than fit in the popup's height can still be navigated all the way to its last entry with Up/Down, not just the ones that happen to fit on first open.
 
 **Nickname rejection**: if the server rejects the nickname as already taken, the client returns to this popup with an error message shown and focus already on the nickname field — every other field (host, port, keys) is preserved, so the user only needs to change the nickname and press Connect again.
 
