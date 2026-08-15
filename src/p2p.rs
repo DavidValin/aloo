@@ -396,11 +396,27 @@ impl PeerLinkManager {
             }
         }
         for (peer, reason) in failed {
+            // Only actually worth telling the user about if something was
+            // genuinely stuck waiting on this link - a queued reliable
+            // send (text/file, `send_reliable_or_queue`). A link that was
+            // only ever pre-warmed (`session.rs`'s `UserJoined` handler
+            // starts punching to every newly-learned peer, well before
+            // anyone tries to talk to them - see its own doc comment)
+            // failing is unremarkable and expected for plenty of
+            // channel-mates nobody ever actually addresses; surfacing a
+            // "direct connection to X failed" banner for every one of
+            // those would be noise, not signal. Voice's own failure
+            // surfacing (`recording_failed`) is independent of this and
+            // still fires at the moment someone actually tries to record
+            // to an unreachable peer, regardless of `had_pending` here.
+            let had_pending = self.links.get(&peer).is_some_and(|link| !link.pending.is_empty());
             if let Some(link) = self.links.get_mut(&peer) {
                 link.pending.clear();
                 link.state = PeerLinkState::Failed { since: now, reason: reason.clone() };
             }
-            let _ = self.events_tx.send(P2pEvent::LinkFailed { peer, reason });
+            if had_pending {
+                let _ = self.events_tx.send(P2pEvent::LinkFailed { peer, reason });
+            }
         }
         // Re-send pings for every link still punching, every tick - cheap,
         // small packets, and simpler than tracking a separate per-link

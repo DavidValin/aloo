@@ -314,8 +314,8 @@ its RSA/PQ dispatch types directly rather than duplicating them.
 | Sender learns of Accept: spawn the send worker | `session.rs` (`P2pEvent::FileAccepted` arm) |
 | Send worker — reads/encrypts/sends one chunk at a time | `file_stream.rs:71` `spawn_send_file_worker` |
 | Receive worker — decrypts/writes one chunk at a time | `file_stream.rs:125` `spawn_receive_file_worker` |
-| Forward an incoming chunk/end to its worker | `file_stream.rs:184`/`:199` `forward_chunk`/`end_incoming_transfer`, called from `session.rs:879`/`:882` |
-| Progress/completion/failure → log row | `session.rs:1339` `handle_file_event` → `UiState::set_file_progress`/`set_file_completed`/`set_file_rejected`/`set_file_failed` |
+| Forward an incoming chunk/end to its worker | `file_stream.rs:184`/`:199` `forward_chunk`/`end_incoming_transfer`, called from `session.rs:898`/`:901` |
+| Progress/completion/failure → log row | `session.rs:1358` `handle_file_event` → `UiState::set_file_progress`/`set_file_completed`/`set_file_rejected`/`set_file_failed` |
 
 Line numbers are as of the commit that added this section; a drifted number
 still resolves via the named function, same convention as the tables above.
@@ -329,11 +329,11 @@ key is current at each moment. Full model in `docs/PROTOCOL.md` §11.
 | --- | --- |
 | Sign a new key with the key it replaces (PKCS#1 v1.5 + SHA-256) | `rekey.rs:38` `rotation_signing_payload`, `:46` `sign_rotation` → `crypto/mod.rs:235` `sign` |
 | Verify a peer's rotation | `rekey.rs:52` `verify_rotation`, `:59` `verify_and_parse_rotation` → `crypto/mod.rs:243` `verify` |
-| Keygen, off the event loop | `rekey.rs:134` `generate_and_sign_rotation`, run by `session.rs:194` `spawn_rotation_worker`, queued via `session.rs:1111` `request_rotation_if_per_message` |
+| Keygen, off the event loop | `rekey.rs:134` `generate_and_sign_rotation`, run by `session.rs:194` `spawn_rotation_worker`, queued via `session.rs:1130` `request_rotation_if_per_message` |
 | Own per-peer keys + retained old keys | `rekey.rs:161` `OwnKeys` (retention bound `rekey.rs:31`) |
 | Is a peer's key fresh? queue if not | `rekey.rs:317` `RemoteKeys` — `try_use:343`, `enqueue:358`, `on_rotated:368` |
-| Apply an incoming rotation, flush the queue | `session.rs:1164` `handle_key_rotated` |
-| Reconnect continuity (persisted keys) | `own_next_keys.rs` + `session.rs:1039` `send_resume_rotation_if_available` (prove), `idstore.rs:158` `get` + `rekey.rs:106` `verify_with_fallback` (verify), both surfaced by `session.rs:1164` `handle_key_rotated` — *and*, for a `PerMessage` nickname that already has a continuity key pinned, gated on sight by `check_identity` (`session.rs:951`) itself, before any rotation attempt (`docs/PROTOCOL.md` §12.6.3) |
+| Apply an incoming rotation, flush the queue | `session.rs:1183` `handle_key_rotated` |
+| Reconnect continuity (persisted keys) | `own_next_keys.rs` + `session.rs:1058` `send_resume_rotation_if_available` (prove), `idstore.rs:158` `get` + `rekey.rs:106` `verify_with_fallback` (verify), both surfaced by `session.rs:1183` `handle_key_rotated` — *and*, for a `PerMessage` nickname that already has a continuity key pinned, gated on sight by `check_identity` (`session.rs:970`) itself, before any rotation attempt (`docs/PROTOCOL.md` §12.6.3) |
 
 Voice is exempt from per-chunk rotation (§11.6): one key snapshot covers a whole
 stream (`voice_stream.rs:197`), and a recipient without a fresh key (or whose
@@ -358,7 +358,7 @@ material and a different, self-contained primitive set. Full model in
 | Voice: per-stream key + per-chunk cipher | `crypto/pq.rs` `fresh_data_key`, `wrap_key_for_stream` (signs `stream_id++k_data` once), `encrypt_hybrid_voice_chunk`/`decrypt_hybrid_chunk` (deterministic nonce from `stream_id`+`seq`), `unwrap_key_for_stream` (verified once, cached) |
 | Own key material in the live session | `session.rs` `SessionState::own_pq_private` (mirrors `own_keys`, populated instead of it when `own_key_mode == PqHybrid`) |
 | Who can be addressed | `channel.rs:83` `can_address` - a `pq_hybrid` recipient needs a `pq_hybrid` sender (their own ML-DSA-87/RSA-sign identity); everyone else is reachable by any sender, as always |
-| `id_store` pinning | `session.rs:947` `uses_byte_comparison_pinning` - `pq_hybrid` joins `rsa`/`password` on the plain-byte-comparison side, unlike `rsa_per_msg`'s signature-based resume |
+| `id_store` pinning | `session.rs:966` `uses_byte_comparison_pinning` - `pq_hybrid` joins `rsa`/`password` on the plain-byte-comparison side, unlike `rsa_per_msg`'s signature-based resume |
 | Auto-generate keys if missing | `crypto/pq.rs` `ensure_bundle_at`, called from `connect.rs` `resolve_my_keypair`'s `PqHybrid` arm (`docs/PROTOCOL.md` §13.9) |
 | Connect-popup cache (`~/.aloo/.cache`) | `connect.rs` `ConnectCache`, `cache_path`, `random_prefix`, `fresh_pq_hybrid_paths_in`, `prefill_connect_defaults` |
 

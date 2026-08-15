@@ -515,12 +515,29 @@ need a direct UDP path to each other. This section covers how that path
 is found and used; §7.1-§7.6 cover what actually travels over it once
 it exists.
 
-**Trigger**: lazy, on the first time a client addresses a specific peer (a
-text send, a file offer, starting a voice recording) - not eagerly when
-two clients merely end up sharing a channel. A peer who receives a
-candidate proposal (below) for the first time treats it as an implicit
-invitation and punches back, so being addressed first works without that
-side needing to have sent anything itself.
+**Trigger**: eager, the moment a client first learns a peer exists at all
+(`ServerMessage::UserJoined` - covers both "they're already in a channel
+you just joined" and "someone new joined a channel you're in", and
+implicitly covers DMs too, since you can only open one with someone
+you've already learned about this way). Revised from an earlier
+lazy-on-first-send design once testing showed the gap it left: text and
+file sends tolerate a not-yet-`Active` link by queuing (§7.1/§7.6), but
+voice does not (§7.3) - a `Rsa`/`Password`/`None`/`PerMessage` recipient
+whose link is still mid-punch at the exact moment someone starts a
+recording is excluded from it outright, so a purely lazy trigger meant
+the *first* voice message to any brand-new peer was reliably missing them
+entirely, even though the punch itself typically finishes in well under a
+second. Triggering the handshake as soon as the peer is known instead
+gives it the whole gap between "you learn about them" and "you actually
+press record" as a head start - on any reasonable network that's normally
+far longer than the handshake needs. A peer who receives a candidate
+proposal (below) - whether prompted by this eager trigger or an explicit
+send - treats it as an implicit invitation and punches back if it hasn't
+already started its own attempt, so being addressed first works either
+way. A failed *eager* attempt (nobody ever actually tried to reach that
+peer) fails silently - no visible error - since most co-channel members
+are never actually addressed; §7.0.4's visible failure is reserved for a
+link something was genuinely waiting on.
 
 **1. Candidate gathering** (once per session): each client binds one UDP
 socket for the whole session and gathers two kinds of candidate address

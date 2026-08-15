@@ -798,6 +798,25 @@ async fn handle_server_message(
                 if session.own_key_mode == KeyMode::PerMessage {
                     send_resume_rotation_if_available(session, wr, user.id, &user.name).await?;
                 }
+                // Start punching a direct link to this peer the moment we
+                // know they exist, rather than waiting for the first
+                // send (`docs/PROTOCOL.md` §7.0) - voice is never queued
+                // (§11.6-style partial delivery, `channel::handle_voice_record_start`/
+                // `direct_message::handle_voice_record_start`), so a link
+                // that's still `Requested`/`Punching` at the moment
+                // someone starts recording gets that recipient excluded
+                // outright, not just delayed. Kicking the handshake off
+                // here instead of at first-send gives it the time between
+                // "you learn about a channel-mate" and "you actually
+                // press Space to talk to them" to reach `Active` - on any
+                // reasonable network that's normally well over a second,
+                // where the handshake itself typically completes in low
+                // tens of milliseconds. Harmless to call unconditionally:
+                // `ensure_link` is a no-op if a link already exists, and
+                // any resulting failure is silent here - it only becomes
+                // a visible `LinkFailed` once something is actually
+                // queued against this peer and the link never recovers.
+                session.peer_link.ensure_link(wr, user.id).await;
             }
             ui_state.on_user_joined(&channel, user);
         }

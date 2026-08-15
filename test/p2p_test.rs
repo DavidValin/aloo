@@ -152,6 +152,10 @@ async fn punch_timeout_fails_the_link_and_emits_link_failed() {
     let (mut alice, _socket) = PeerLinkManager::bind("127.0.0.1:0".parse().unwrap(), server_addr, events_tx).await.unwrap();
     alice.ensure_link(&mut a, bob_id).await;
     assert!(!alice.is_active(bob_id));
+    // Something is actually waiting on this link (a real send, not just a
+    // pre-warm) - only this makes the eventual failure worth surfacing to
+    // the user, see `PeerLinkManager::tick_at`'s own doc.
+    alice.send_reliable_or_queue(bob_id, P2pPayload::Envelope { channel: None, envelope: Envelope { content: Content::Text, blocks: vec![vec![1]] } });
 
     alice.tick_at(tokio::time::Instant::now().into_std() + Duration::from_secs(6));
 
@@ -164,4 +168,37 @@ async fn punch_timeout_fails_the_link_and_emits_link_failed() {
         _ => panic!("expected P2pEvent::LinkFailed"),
     }
     assert!(!alice.is_active(bob_id));
+}
+
+/// `session.rs`'s `UserJoined` handler pre-warms a link to every
+/// newly-learned peer well before anyone tries to talk to them
+/// (`docs/PROTOCOL.md` §7.0's "trigger" - eager on learning about a peer,
+/// not lazy-on-first-send, precisely to give real sends like voice a head
+/// start on reaching `Active`). Most channel-mates are never actually
+/// addressed, so a pre-warm-only link that fails to punch must stay
+/// silent - no `P2pEvent::LinkFailed` - rather than showing a "direct
+/// connection failed" banner for people nobody ever tried to reach.
+///
+/// @requirement TB-149
+#[tokio::test]
+async fn punch_timeout_with_nothing_pending_fails_silently() {
+    let server_addr = spawn_test_server().await;
+
+    let mut a = TcpStream::connect(server_addr).await.unwrap();
+    let _alice_id = handshake(&mut a, "alice").await;
+    let mut b = TcpStream::connect(server_addr).await.unwrap();
+    let bob_id = handshake(&mut b, "bob").await;
+
+    let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel::<P2pEvent>();
+    let (mut alice, _socket) = PeerLinkManager::bind("127.0.0.1:0".parse().unwrap(), server_addr, events_tx).await.unwrap();
+    // A bare pre-warm - nothing ever queued against this link.
+    alice.ensure_link(&mut a, bob_id).await;
+
+    alice.tick_at(tokio::time::Instant::now().into_std() + Duration::from_secs(6));
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), events_rx.recv()).await.is_err(),
+        "a pre-warm-only failure must not emit a user-visible LinkFailed event"
+    );
+    assert!(!alice.is_active(bob_id), "the link must still actually be marked Failed internally");
 }
