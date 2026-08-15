@@ -1,0 +1,148 @@
+name: Release
+
+# Triggers when a tag is pushed. A guard job verifies the tagged
+# commit is reachable from the main branch before building.
+on:
+  push:
+    tags:
+      - '*'
+
+permissions:
+  contents: write
+
+jobs:
+  guard:
+    name: Verify tag is on main
+    runs-on: ubuntu-latest
+    outputs:
+      ok: ${{ steps.check.outputs.ok }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: check
+        run: |
+          if git branch -r --contains "$GITHUB_REF" | grep -qE '(^|/)main$'; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Tag $GITHUB_REF is not reachable from main. Skipping release." >&2
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs: guard
+    if: needs.guard.outputs.ok == 'true'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          # Linux glibc
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            artifact: aloo-x86_64_linux
+            use_cross: false
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+            artifact: aloo-aarch64_linux
+            use_cross: true
+          # Linux musl (static)
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+            artifact: aloo-x86_64_linux_musl
+            use_cross: true
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-latest
+            artifact: aloo-aarch64_linux_musl
+            use_cross: true
+          # macOS
+          - target: x86_64-apple-darwin
+            runner: macos-14
+            artifact: aloo-x86_64_macos-intel
+            use_cross: false
+          - target: aarch64-apple-darwin
+            runner: macos-14
+            artifact: aloo-aarch64_macos
+            use_cross: false
+          # Windows
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            artifact: aloo-x86_64_windows
+            use_cross: false
+          - target: aarch64-pc-windows-msvc
+            runner: windows-11-arm
+            artifact: aloo-aarch64_windows
+            use_cross: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # cpal's ALSA backend needs the system dev headers to link against on
+      # native (non-cross) Linux builds; cross's Docker images bring their
+      # own sysroot for the cross-compiled targets below.
+      - name: Install ALSA dev headers (Linux, native build only)
+        if: matrix.runner == 'ubuntu-latest' && matrix.use_cross == false
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+
+      - name: Install cross
+        if: matrix.use_cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Build (cross)
+        if: matrix.use_cross
+        run: cross build --release --locked --target ${{ matrix.target }}
+
+      - name: Build (native)
+        if: matrix.use_cross == false
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Archive artifact (unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p staging
+          cp target/${{ matrix.target }}/release/aloo staging/aloo
+          chmod +x staging/aloo
+          tar -czf "${{ matrix.artifact }}.tar.gz" -C staging aloo
+
+      - name: Archive artifact (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path staging | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/aloo.exe" "staging/aloo.exe"
+          Compress-Archive -Path "staging/aloo.exe" -DestinationPath "${{ matrix.artifact }}.zip" -Force
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            ${{ matrix.artifact }}.tar.gz
+            ${{ matrix.artifact }}.zip
+
+  release:
+    name: Create release & upload assets
+    needs: [guard, build]
+    if: always() && needs.guard.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+
+      - name: Create release and upload assets
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: assets/*

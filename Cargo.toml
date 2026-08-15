@@ -1,0 +1,163 @@
+[package]
+name = "aloo"
+version = "0.1.0-alpha.1"
+edition = "2024"
+
+authors = ["David Valin <hola@davidvalin.com>"]
+homepage = "https://crates.io/crates/aloo"
+repository = "https://github.com/DavidValin/aloo"
+description = "secure terminal walky-talky / chat / file transfer"
+license-file = "LICENSE"
+readme = "README.md"
+
+# PQ-hybrid `my_key` (KeyMode::PqHybrid, see crypto/pq.rs): `ml-dsa`/`ml-kem`/`aes-gcm`
+# sit on RustCrypto's newer trait generation (crypto-common 0.2, signature 3,
+# hybrid-array, rand_core 0.10 - pulled in transitively, never named directly here
+# since crypto/pq.rs only ever calls each crate's own zero-arg `getrandom`-feature
+# convenience methods, e.g. `SigningKey::generate()`/`ek.encapsulate()`), while
+# `rsa`/`sha2`/`pbkdf2`/`hmac` below stay pinned to the older generation
+# (crypto-common 0.1, signature 2, rand_core 0.6). Cargo resolves both generations
+# side by side fine; crypto/pq.rs bridges the two only via raw `Vec<u8>`/`[u8; N]`
+# bytes, never shared trait impls. `hkdf` stays on the *old* generation (built on
+# the existing sha2 0.10/digest 0.10), so the HKDF combiner step has no version
+# friction with the rest of this file.
+[dependencies]
+aes-gcm = "0.11"
+bincode = { version = "2", features = ["serde"] }
+clap = { version = "4.6.6", features = ["derive"] }
+cpal = "0.18.1"
+crossterm = "0.29.0"
+hkdf = "0.12"
+hmac = "0.12"
+ml-dsa = "0.1"
+ml-kem = { version = "0.3", features = ["getrandom"] }
+pbkdf2 = { version = "0.12", features = ["simple"] }
+rand_chacha = "0.3"
+rand_core = { version = "0.6", features = ["getrandom", "std"] }
+ratatui = "0.30.2"
+rsa = { version = "0.9.10", features = ["pem"] }
+serde = { version = "1.0.229", features = ["derive"] }
+sha2 = { version = "0.10", features = ["oid"] }
+sysinfo = "0.33"
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["full"] }
+
+# Test-only. None of these reach the shipped `aloo` binary or library.
+[dev-dependencies]
+# Gherkin runner for the acceptance layer in `features/`.
+cucumber = "0.23"
+# Parses `requirements/requirements.toml`, the requirement model that the
+# traceability tool validates the suite against.
+toml = "0.9"
+
+
+[lib]
+name = "aloo"
+path = "src/lib.rs"
+
+[[bin]]
+name = "aloo"
+path = "src/main.rs"
+
+[[test]]
+name = "crypto_test"
+path = "test/crypto_test.rs"
+
+[[test]]
+name = "file_transfer_test"
+path = "test/file_transfer_test.rs"
+
+[[test]]
+name = "connect_test"
+path = "test/connect_test.rs"
+
+[[test]]
+name = "idstore_test"
+path = "test/idstore_test.rs"
+
+[[test]]
+name = "own_next_keys_test"
+path = "test/own_next_keys_test.rs"
+
+[[test]]
+name = "platform_test"
+path = "test/platform_test.rs"
+
+[[test]]
+name = "proto_test"
+path = "test/proto_test.rs"
+
+[[test]]
+name = "main_test"
+path = "test/main_test.rs"
+
+[[test]]
+name = "voice_test"
+path = "test/voice_test.rs"
+
+[[test]]
+name = "sysstats_test"
+path = "test/sysstats_test.rs"
+
+[[test]]
+name = "netstats_test"
+path = "test/netstats_test.rs"
+
+[[test]]
+name = "server_test"
+path = "test/server_test.rs"
+
+[[test]]
+name = "rekey_test"
+path = "test/rekey_test.rs"
+
+[[test]]
+name = "hybrid_crypto_test"
+path = "test/hybrid_crypto_test.rs"
+
+[[test]]
+name = "ui_connect_popup_test"
+path = "test/ui_connect_popup_test.rs"
+
+[[test]]
+name = "ui_test"
+path = "test/ui_test.rs"
+
+[[test]]
+name = "ui_channel_test"
+path = "test/ui_channel_test.rs"
+
+[[test]]
+name = "ui_direct_message_test"
+path = "test/ui_direct_message_test.rs"
+
+[[test]]
+name = "ui_file_send_test"
+path = "test/ui_file_send_test.rs"
+
+# Behaviour-driven acceptance layer: Gherkin scenarios in `features/` executed
+# by cucumber-rs. `harness = false` because cucumber supplies its own runner
+# instead of libtest's.
+[[test]]
+name = "cucumber"
+path = "test/cucumber/main.rs"
+harness = false
+
+# Traceability validation + report generation (docs/TESTING.md).
+# A test target rather than a binary so it needs only dev-dependencies and
+# runs as part of the suite - a traceability model that is not checked by CI
+# decays into decorative documentation.
+[[test]]
+name = "traceability"
+path = "test/traceability/main.rs"
+
+# Build dependencies optimised even in dev/test builds, while this crate's own
+# code stays unoptimised and debuggable.
+#
+# RSA key generation is pure Rust (`rsa` + `num-bigint`) and is punishingly slow
+# when those crates are compiled at opt-level 0 - it is what made the test suite
+# take over half an hour. This affects the dev profile only; release builds were
+# already optimised, so shipped behaviour is untouched.
+[profile.dev.package."*"]
+opt-level = 3
+

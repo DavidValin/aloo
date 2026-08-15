@@ -1,0 +1,1340 @@
+# aloo requirement model
+# ============================================================================
+# The single source of truth for *requirement definitions*: which user
+# stories exist, which acceptance criteria and technical behaviours belong to
+# each, and what each one means.
+#
+# It deliberately does NOT list which tests cover what. That linkage lives
+# next to the executable code and is derived from it:
+#
+#   * Gherkin scenarios  -> `@AC-001` / `@TB-051` tags in `features/**/*.feature`
+#   * Rust tests         -> `/// @requirement AC-001, TB-051` above the test fn
+#
+# `cargo test --test traceability` reads all three sources, cross-checks them,
+# and regenerates the reports under `target/traceability/`. Keeping the links
+# in one place (the code) and the definitions in another (here) is what stops
+# the matrix from being a second copy of the truth that silently rots.
+#
+# Every entry below carries `evidence`, naming where the requirement was
+# reconstructed from - a documentation section, a production-code contract, or
+# the pre-migration test that encoded it. Nothing here was invented: see
+# docs/TESTING.md#known-coverage-gaps for behaviour that looked like a
+# requirement but lacked the evidence to become one.
+#
+# ID namespaces are flat and global: US-xxx, AC-xxx, TB-xxx. IDs are stable -
+# renumbering one breaks every link to it, so retire an ID rather than reuse it.
+
+# ============================================================================
+# US-001 - Connect to a server
+# ============================================================================
+[[user_story]]
+id = "US-001"
+title = "Connect to a server"
+as_a = "user starting the client"
+i_want = "to say where the server is, who I am, and how my key material is sourced"
+so_that = "I can join a conversation on it"
+
+[[user_story.acceptance_criteria]]
+id = "AC-001"
+description = "The connect form opens with the host field focused and a cursor sitting in it."
+evidence = "docs/SPEC.md 'Not connected UI'; test popup_opens_with_the_cursor_focused_in_the_host_box"
+
+[[user_story.acceptance_criteria]]
+id = "AC-002"
+description = "Host, port and nickname are each presented as their own titled, bordered box, and typing fills the focused one."
+evidence = "docs/SPEC.md 'Not connected UI'; tests host_port_and_nickname_are_each_individually_bordered, typing_fills_host_field"
+
+[[user_story.acceptance_criteria]]
+id = "AC-003"
+description = "A nickname is capped at 10 characters and refuses whitespace; typing past the cap does nothing."
+evidence = "docs/SPEC.md Functionality #5; tests nickname_field_is_capped_at_ten_characters, typing_fills_nickname_field_and_rejects_whitespace"
+
+[[user_story.acceptance_criteria]]
+id = "AC-004"
+description = "The port field accepts digits only."
+evidence = "test port_field_only_accepts_digits"
+
+[[user_story.acceptance_criteria]]
+id = "AC-005"
+description = "The id_store path is prefilled with its default and stays freely editable."
+evidence = "docs/PROTOCOL.md 12.5; tests id_store_path_is_prefilled_from_the_default_path, id_store_path_field_is_freely_editable"
+
+[[user_story.acceptance_criteria]]
+id = "AC-006"
+description = "The own_next_keys path is prefilled and freely editable, and is offered only when my_key is rsa_per_msg."
+evidence = "docs/PROTOCOL.md 12.6.5; tests own_next_keys_path_is_prefilled_from_the_default_path, own_next_keys_path_is_only_focusable_when_my_key_is_rsa_per_msg"
+
+[[user_story.acceptance_criteria]]
+id = "AC-070"
+description = "my_key defaults to pq_hybrid when the connect form opens, so a new user gets this app's strongest (quantum-resistant, RSA-4096-hedged) identity by default - at the cost of needing a keybundle prepared with aloo --keygen-pq-hybrid before the form can actually validate, unlike the previous rsa_per_msg default."
+evidence = "docs/SPEC.md 'Not connected UI'; tests my_key_type_defaults_to_pq_hybrid, connect_form.feature 'my_key defaults to pq_hybrid, this app's strongest identity'"
+
+[[user_story.acceptance_criteria]]
+id = "AC-007"
+description = "A visible Connect button, activated with Enter on a valid form, starts connecting with the entered details."
+evidence = "docs/SPEC.md 'Not connected UI'; tests enter_on_connect_field_with_valid_form_returns_connect_action, render_shows_a_connect_button"
+
+[[user_story.acceptance_criteria]]
+id = "AC-008"
+description = "Enter on the Connect button with an incomplete form shows a validation error instead of connecting."
+evidence = "docs/SPEC.md 'Not connected UI'; test enter_on_connect_field_with_invalid_form_sets_error_and_does_not_connect"
+
+[[user_story.acceptance_criteria]]
+id = "AC-009"
+description = "Esc cancels the connect popup."
+evidence = "README.md 'Running the client'; test escape_cancels"
+
+[[user_story.acceptance_criteria]]
+id = "AC-010"
+description = "An rsa key field opens the in-app file browser, and the file picked there fills that field."
+evidence = "docs/SPEC.md 'File browser'; tests enter_on_rsa_server_key_value_opens_file_browser, selecting_a_file_in_browser_applies_it_to_the_popup_field"
+
+[[user_story.acceptance_criteria]]
+id = "AC-011"
+description = "The file browser walks into directories and back and forward through navigation history."
+evidence = "docs/SPEC.md 'File browser'; tests file_browser_navigates_into_subdir_and_back, file_browser_go_back_with_no_history_returns_false"
+
+[[user_story.acceptance_criteria]]
+id = "AC-012"
+description = "The focused Connect button is highlighted without the highlight bleeding into its border."
+evidence = "docs/SPEC.md 'Not connected UI'; test connect_button_highlight_does_not_bleed_into_its_border"
+
+[[user_story.technical_behavior]]
+id = "TB-001"
+description = "server_key's key type cycles rsa -> password -> none -> rsa and defaults to none."
+evidence = "src/ui/ui_connect_popup.rs KeyType; tests key_type_cycles_rsa_password_none_and_back, key_type_defaults_to_none"
+
+[[user_story.technical_behavior]]
+id = "TB-002"
+description = "my_key's key type cycles rsa -> password -> none -> rsa_per_msg -> pq_hybrid -> rsa, defaults to pq_hybrid, and labels each stop correctly ('rsa_per_msg', 'pq_hybrid', ...)."
+evidence = "docs/SPEC.md 'Not connected UI'; tests my_key_type_cycles_through_all_five_and_back, my_key_type_defaults_to_pq_hybrid, my_key_type_label_includes_rsa_per_msg, my_key_type_label_includes_pq_hybrid"
+
+[[user_story.technical_behavior]]
+id = "TB-003"
+description = "The focus order lists exactly the value fields the two selected key types require, and a field orphaned by a type change stops being editable."
+evidence = "src/ui/ui_connect_popup.rs focus_order; tests focus_order_*, changing_my_key_type_away_from_rsa_reassigns_focus_if_orphaned, password_field_only_editable_when_key_type_is_password"
+
+[[user_story.technical_behavior]]
+id = "TB-004"
+description = "Focus movement wraps around the field list in both directions, driven by Tab and BackTab."
+evidence = "docs/SPEC.md 'Not connected UI'; tests focus_next_and_prev_wrap_around, tab_key_advances_focus"
+
+[[user_story.technical_behavior]]
+id = "TB-005"
+description = "build_request rejects an incomplete form field by field, naming the offending field: host, port, nickname, server_key file, id_store, own_next_keys."
+evidence = "tests build_request_rejects_*"
+
+[[user_story.technical_behavior]]
+id = "TB-006"
+description = "build_request maps a valid form onto a ConnectRequest carrying the right selection for each key-type combination, including custom store paths."
+evidence = "tests build_request_succeeds_*, build_request_carries_a_custom_*"
+
+[[user_story.technical_behavior]]
+id = "TB-007"
+description = "The file browser lists '..' first, then directories, then files."
+evidence = "test file_browser_lists_parent_dirs_then_files_sorted"
+
+[[user_story.technical_behavior]]
+id = "TB-008"
+description = "File browser selection wraps at both ends and '..' resolves to the parent directory."
+evidence = "tests file_browser_select_next_prev_wrap_around, file_browser_selected_path_resolves_dotdot_to_parent"
+
+[[user_story.technical_behavior]]
+id = "TB-009"
+description = "Navigating somewhere new invalidates the forward history."
+evidence = "test file_browser_new_navigation_clears_forward_history"
+
+[[user_story.technical_behavior]]
+id = "TB-010"
+description = "The connect popup renders without panicking for every key-type combination, and with the file browser open."
+evidence = "tests render_does_not_panic_for_every_key_type_combination, render_with_open_file_browser_does_not_panic, render_draws_something_when_popup_is_shown"
+
+[[user_story.technical_behavior]]
+id = "TB-011"
+description = "The connect popup targets 64 columns wide, clamped to the terminal's own width if narrower, and either way is noticeably wider than the original 50-column box."
+evidence = "docs/SPEC.md 'Not connected UI'; test popup_is_wider_than_the_original_fifty_columns"
+
+[[user_story.technical_behavior]]
+id = "TB-012"
+description = "A focused free-text field appends typed characters and Backspace removes the last one."
+evidence = "src/ui/ui_connect_popup.rs handle_key; tests typing_fills_host_field, id_store_path_field_is_freely_editable, own_next_keys_path_field_is_freely_editable"
+
+# ============================================================================
+# US-002 - Authenticate to the server
+# ============================================================================
+[[user_story]]
+id = "US-002"
+title = "Authenticate to the server"
+as_a = "server operator"
+i_want = "to gate who may connect, by shared password or RSA keypair"
+so_that = "only clients I have authorised can join"
+
+[[user_story.acceptance_criteria]]
+id = "AC-013"
+description = "A client presenting the correct credential is let in; one presenting a wrong credential is rejected."
+evidence = "docs/PROTOCOL.md 5; tests password_auth_accepts_correct_and_rejects_wrong, rsa_auth_accepts_valid_challenge_response_and_rejects_wrong_key, end_to_end_wrong_password_is_rejected"
+
+[[user_story.acceptance_criteria]]
+id = "AC-014"
+description = "A server started with no auth accepts any client without a credential."
+evidence = "docs/PROTOCOL.md 5.1; test none_auth_kind_and_no_challenge"
+
+[[user_story.technical_behavior]]
+id = "TB-013"
+description = "The advertised AuthKind matches the configured mode, and a challenge nonce is issued for rsa only."
+evidence = "docs/PROTOCOL.md 5.1-5.3; tests none_auth_kind_and_no_challenge, password_auth_accepts_correct_and_rejects_wrong, rsa_auth_accepts_valid_challenge_response_and_rejects_wrong_key"
+
+[[user_story.technical_behavior]]
+id = "TB-014"
+description = "An AuthResponse of the wrong variant for the advertised AuthKind is treated as an authentication failure."
+evidence = "docs/PROTOCOL.md 5; tests rsa_auth_rejects_response_of_the_wrong_kind, none_auth_kind_and_no_challenge"
+
+[[user_story.technical_behavior]]
+id = "TB-015"
+description = "Credential comparison is constant-time, including for unequal lengths and empty inputs."
+evidence = "docs/PROTOCOL.md 5.2; src/crypto.rs constant_time_eq; test constant_time_eq_matches_regular_equality"
+
+[[user_story.technical_behavior]]
+id = "TB-016"
+description = "A challenge nonce is freshly drawn random bytes of the requested length, differing between draws."
+evidence = "docs/PROTOCOL.md 5.3 (32 random bytes per connection); test random_bytes_have_requested_length_and_are_not_trivially_constant"
+
+[[user_story.technical_behavior]]
+id = "TB-112"
+description = "A stray Auth or Identify sent after the handshake is already complete gets Error { message: \"unexpected message after handshake\" }, and the connection stays open afterward - unlike the pre-handshake failures, which close it."
+evidence = "docs/PROTOCOL.md 4; test end_to_end_stray_auth_and_identify_after_handshake_error_but_stay_connected"
+
+[[user_story.technical_behavior]]
+id = "TB-114"
+description = "The server's --bind and --port flags default to 0.0.0.0 and 7878 respectively, and are parsed into the address it listens on."
+evidence = "docs/SPEC.md 'Server startup'; tests help_advertises_the_documented_bind_and_port_defaults, server_bind_and_port_flags_are_parsed_into_the_listen_address"
+
+# ============================================================================
+# US-003 - Claim a unique nickname
+# ============================================================================
+[[user_story]]
+id = "US-003"
+title = "Claim a unique nickname"
+as_a = "user joining a server"
+i_want = "my chosen nickname to be mine alone while I am connected"
+so_that = "other users can tell who they are talking to"
+
+[[user_story.acceptance_criteria]]
+id = "AC-015"
+description = "Connecting with a nickname another connected client already holds is rejected, and the connection is closed."
+evidence = "docs/SPEC.md Functionality #5, docs/PROTOCOL.md 5.4; tests end_to_end_duplicate_nickname_is_rejected_and_connection_closes, try_register_rejects_a_nickname_already_in_use"
+
+[[user_story.acceptance_criteria]]
+id = "AC-016"
+description = "A nickname becomes available again as soon as its holder disconnects."
+evidence = "docs/PROTOCOL.md 5.4; tests end_to_end_nickname_is_free_again_after_the_holder_disconnects, try_register_allows_the_name_again_once_the_holder_is_gone"
+
+[[user_story.acceptance_criteria]]
+id = "AC-017"
+description = "Rejecting a duplicate nickname leaves the existing holder's session completely unaffected."
+evidence = "test end_to_end_duplicate_nickname_is_rejected_and_connection_closes"
+
+[[user_story.technical_behavior]]
+id = "TB-017"
+description = "Registration records the client's display name, public key and key mode, and reports them back via user_info."
+evidence = "docs/PROTOCOL.md 3 UserInfo; tests register_stores_user_info, user_info_reflects_registered_key_mode"
+
+[[user_story.technical_behavior]]
+id = "TB-018"
+description = "Nickname matching is case-sensitive and reflects only currently-registered clients."
+evidence = "docs/PROTOCOL.md 5.4; test name_taken_reflects_currently_registered_clients"
+
+[[user_story.technical_behavior]]
+id = "TB-019"
+description = "A rejected registration does not register a second holder, leaving the original entry intact."
+evidence = "docs/PROTOCOL.md 5.4 (atomic check-and-register); test try_register_rejects_a_nickname_already_in_use"
+
+[[user_story.technical_behavior]]
+id = "TB-020"
+description = "A UserId is never reused, so the same nickname reconnecting is always a brand-new identity."
+evidence = "docs/PROTOCOL.md 3; tests end_to_end_resume_rotation_after_reconnect_verifies_against_the_continuity_key, user_offline_is_permanent_for_the_session_since_a_user_id_is_never_reused"
+
+# ============================================================================
+# US-004 - Join, leave and switch channels
+# ============================================================================
+[[user_story]]
+id = "US-004"
+title = "Join, leave and switch channels"
+as_a = "connected user"
+i_want = "to move between the server's channels and open private ones by name"
+so_that = "I can take part in the conversation I care about"
+
+[[user_story.acceptance_criteria]]
+id = "AC-018"
+description = "The server's public channels are offered as tabs, and a freshly started server always offers 'general'."
+evidence = "docs/SPEC.md 'Server startup', docs/PROTOCOL.md 6; tests fresh_registry_has_default_public_general_channel, channel_list_adds_unjoined_channels_without_duplicating"
+
+[[user_story.acceptance_criteria]]
+id = "AC-019"
+description = "Joining a channel tells the joiner about every member already there, and tells each of them about the joiner."
+evidence = "docs/SPEC.md 'Channels', docs/PROTOCOL.md 6.1; tests second_joiner_gets_snapshot_and_first_gets_notified, end_to_end_two_clients_join_and_exchange_channel_message"
+
+[[user_story.acceptance_criteria]]
+id = "AC-020"
+description = "']' and '[' move between channel tabs immediately, and the join itself happens after dwelling on a tab for three seconds."
+evidence = "docs/SPEC.md Functionality #2; tests bracket_key_selects_next_channel_immediately_but_does_not_join_yet, opening_bracket_selects_the_previous_channel, dwell_fires_join_after_three_seconds"
+
+[[user_story.acceptance_criteria]]
+id = "AC-021"
+description = "Ctrl+J opens a popup that joins or creates a private channel by name, and cancels cleanly on Esc or a blank name."
+evidence = "docs/SPEC.md Functionality #2; tests ctrl_j_then_typing_and_enter_requests_private_channel_join, ctrl_j_popup_escape_cancels_without_action, ctrl_j_popup_enter_with_blank_name_produces_no_action"
+
+[[user_story.acceptance_criteria]]
+id = "AC-022"
+description = "A private channel is never advertised to other clients; its name must already be known to join it."
+evidence = "docs/PROTOCOL.md 6.3; test private_channel_is_created_on_join_but_not_listed"
+
+[[user_story.acceptance_criteria]]
+id = "AC-023"
+description = "Leaving a channel notifies the members who remain in it, while the leaver stays connected."
+evidence = "docs/PROTOCOL.md 6.2; tests leaving_notifies_remaining_members, leave_channel_still_sends_userleft_while_the_user_stays_connected"
+
+[[user_story.technical_behavior]]
+id = "TB-021"
+description = "Joining a channel you are already a member of is a no-op that sends nothing at all."
+evidence = "docs/PROTOCOL.md 6.1; test rejoining_a_channel_is_a_noop"
+
+[[user_story.technical_behavior]]
+id = "TB-022"
+description = "The joiner receives one UserJoined per existing member, followed last by exactly one Joined confirmation."
+evidence = "docs/PROTOCOL.md 6.1; tests joining_new_channel_sends_confirmation_and_no_peer_events, second_joiner_gets_snapshot_and_first_gets_notified"
+
+[[user_story.technical_behavior]]
+id = "TB-023"
+description = "An emptied private channel is deleted outright while an emptied public channel stays listed."
+evidence = "docs/PROTOCOL.md 6.2; test empty_private_channel_is_deleted_but_empty_public_channel_persists"
+
+[[user_story.technical_behavior]]
+id = "TB-024"
+description = "The client's channel list de-duplicates repeated announcements and only marks a channel joined once it actually is."
+evidence = "tests channel_list_adds_unjoined_channels_without_duplicating, on_joined_marks_existing_channel_joined_or_creates_it"
+
+[[user_story.technical_behavior]]
+id = "TB-025"
+description = "The dwell timer does not re-fire a join for a channel that has already been joined."
+evidence = "test dwell_does_not_refire_for_an_already_joined_channel"
+
+[[user_story.technical_behavior]]
+id = "TB-026"
+description = "Switching channel tabs closes any open private room."
+evidence = "test switching_tabs_closes_any_open_private_room"
+
+[[user_story.technical_behavior]]
+id = "TB-027"
+description = "A channel's member list tracks joins and leaves, while known_users retains a departed user so old DMs stay addressable."
+evidence = "test user_joined_and_left_update_members_and_known_users"
+
+[[user_story.technical_behavior]]
+id = "TB-113"
+description = "The only failure path for a JoinChannel in practice - the requesting user not being registered - results in ChannelJoinFailed { name, reason } sent to the requester only."
+evidence = "docs/PROTOCOL.md 6.1; test join_channel_fails_for_an_unregistered_user"
+
+# ============================================================================
+# US-005 - Send a text message to a channel
+# ============================================================================
+[[user_story]]
+id = "US-005"
+title = "Send a text message to a channel"
+as_a = "member of a channel"
+i_want = "to type a message and have every other member receive it"
+so_that = "we can hold a conversation"
+
+[[user_story.acceptance_criteria]]
+id = "AC-024"
+description = "A channel message reaches every addressed member unchanged, and no one else."
+evidence = "docs/PROTOCOL.md 7.1; tests end_to_end_two_clients_join_and_exchange_channel_message, channel_message_is_delivered_only_to_addressed_channel_members"
+
+[[user_story.acceptance_criteria]]
+id = "AC-025"
+description = "Typing and pressing Enter sends to the selected channel, clears the compose bar, and logs the message locally as outgoing."
+evidence = "test typing_and_enter_sends_channel_text_excluding_self"
+
+[[user_story.acceptance_criteria]]
+id = "AC-026"
+description = "Nothing is sent before a channel is joined or when the compose bar is empty, and unsent text is never silently discarded."
+evidence = "tests enter_before_channel_is_joined_does_not_send_and_keeps_the_typed_text, enter_with_empty_input_does_not_send"
+
+[[user_story.technical_behavior]]
+id = "TB-028"
+description = "The sender addresses every other current member individually and excludes itself from the recipient list."
+evidence = "docs/PROTOCOL.md 7.1, 8; test typing_and_enter_sends_channel_text_excluding_self"
+
+[[user_story.technical_behavior]]
+id = "TB-029"
+description = "An addressed recipient who is not a member of the channel is silently dropped rather than erroring."
+evidence = "docs/PROTOCOL.md 7.1; test channel_message_is_delivered_only_to_addressed_channel_members"
+
+[[user_story.technical_behavior]]
+id = "TB-030"
+description = "A channel message from a non-member, or naming a channel that does not exist, is rejected with an error to the sender only."
+evidence = "docs/PROTOCOL.md 7.1, 7.4; tests channel_message_from_non_member_is_rejected, channel_message_to_unknown_channel_is_rejected"
+
+[[user_story.technical_behavior]]
+id = "TB-031"
+description = "An incoming channel message is appended to that channel's own log, attributed to its sender."
+evidence = "test channel_message_is_appended_to_the_right_channel_log"
+
+# ============================================================================
+# US-006 - Send a private message to a user
+# ============================================================================
+[[user_story]]
+id = "US-006"
+title = "Send a private message to a user"
+as_a = "connected user"
+i_want = "a one-to-one room with another user"
+so_that = "we can talk without the rest of the channel"
+
+[[user_story.acceptance_criteria]]
+id = "AC-027"
+description = "A direct message reaches its recipient unchanged."
+evidence = "docs/PROTOCOL.md 7.2; tests end_to_end_direct_message_between_two_clients, direct_message_is_delivered_to_recipient"
+
+[[user_story.acceptance_criteria]]
+id = "AC-028"
+description = "Enter on a user in the sidebar opens a private room with them, and Esc returns to the channel view."
+evidence = "docs/SPEC.md Functionality #3; tests opening_dm_from_sidebar_and_sending_a_message, escape_closes_private_room"
+
+[[user_story.acceptance_criteria]]
+id = "AC-029"
+description = "A DM arriving while its room is not being viewed is marked unread; reopening the room clears that."
+evidence = "docs/SPEC.md Functionality #3; tests direct_message_creates_room_and_marks_unread_when_not_actively_viewed, direct_message_does_not_mark_unread_when_that_room_is_active, reopening_dm_clears_unread_flag"
+
+[[user_story.acceptance_criteria]]
+id = "AC-030"
+description = "A user is marked with an envelope in the sidebar once their room holds at least one message; it blinks only while unread and stays solid afterwards, never disappearing."
+evidence = "docs/SPEC.md Functionality #3; tests sidebar_shows_no_envelope_for_a_dm_room_that_has_no_messages_yet, sidebar_shows_a_solid_envelope_once_an_outgoing_message_exists_even_after_leaving_the_room, sidebar_blinks_the_envelope_only_while_a_dm_message_is_unread, sidebar_envelope_stops_blinking_and_stays_solid_once_the_dm_is_reopened"
+
+[[user_story.acceptance_criteria]]
+id = "AC-031"
+description = "A private room cannot be opened with yourself."
+evidence = "test cannot_open_dm_with_yourself"
+
+[[user_story.technical_behavior]]
+id = "TB-032"
+description = "A direct message to a UserId that is not currently connected is rejected with an error."
+evidence = "docs/PROTOCOL.md 7.2; test direct_message_to_unknown_recipient_is_rejected"
+
+[[user_story.technical_behavior]]
+id = "TB-033"
+description = "Opening a private room moves focus to the compose bar."
+evidence = "test opening_dm_from_sidebar_and_sending_a_message"
+
+[[user_story.technical_behavior]]
+id = "TB-034"
+description = "An outgoing DM never marks its own room unread."
+evidence = "test sidebar_shows_a_solid_envelope_once_an_outgoing_message_exists_even_after_leaving_the_room"
+
+[[user_story.technical_behavior]]
+id = "TB-035"
+description = "The private room titles itself 'Private: ' followed by the peer's name carrying their encryption tag."
+evidence = "docs/SPEC.md 'Connected UI'; test private_room_title_shows_the_peers_rsa_per_msg_tag_after_their_name"
+
+[[user_story.technical_behavior]]
+id = "TB-036"
+description = "A full-screen private room renders without panicking, with or without the help overlay on top."
+evidence = "tests render_private_room_full_screen_does_not_panic, render_does_not_panic_with_help_open_over_a_private_room"
+
+# ============================================================================
+# US-007 - Send a voice message live
+# ============================================================================
+[[user_story]]
+id = "US-007"
+title = "Send a voice message live"
+as_a = "connected user"
+i_want = "to hold a key and have my voice stream to the channel or private room as I speak"
+so_that = "the other side hears me without waiting for me to finish"
+
+[[user_story.acceptance_criteria]]
+id = "AC-032"
+description = "Holding Space starts streaming a voice message to whatever is being viewed - the selected channel, or an open private room - and releasing it stops."
+evidence = "docs/SPEC.md Functionality #4; tests space_press_and_release_starts_and_stops_recording_for_channel, space_release_targets_active_private_room_instead_of_channel"
+
+[[user_story.acceptance_criteria]]
+id = "AC-033"
+description = "Space inside the compose bar types a literal space instead of starting a recording."
+evidence = "docs/SPEC.md Functionality #4; test space_types_a_literal_space_while_composing_a_message"
+
+[[user_story.acceptance_criteria]]
+id = "AC-034"
+description = "Pressing Space with nowhere to address a stream to starts no recording."
+evidence = "docs/SPEC.md Functionality #4 'Failure handling'; test space_press_without_a_joined_channel_or_active_dm_does_not_start_recording_and_shows_an_error"
+
+[[user_story.acceptance_criteria]]
+id = "AC-035"
+description = "An in-progress voice message appears immediately as a streaming placeholder on both sides and turns into a replayable voice block in place once the stream ends."
+evidence = "docs/SPEC.md Functionality #4 'Live appearance and finalization'; tests on_channel_stream_start_and_finished_swap_the_placeholder_body_in_place, on_direct_stream_start_and_finished_swap_the_placeholder_body_in_place, log_own_voice_stream_start_channel_appears_immediately_and_finalizes"
+
+[[user_story.acceptance_criteria]]
+id = "AC-036"
+description = "Enter on a finished voice message in the log replays it; Enter on a text message does nothing."
+evidence = "docs/SPEC.md Functionality #4; tests enter_on_voice_message_in_messages_focus_requests_replay, enter_on_text_message_in_messages_focus_does_nothing"
+
+[[user_story.acceptance_criteria]]
+id = "AC-037"
+description = "A voice message is labelled with the real length of that specific recording, not a fixed value."
+evidence = "docs/SPEC.md Functionality #4; tests format_duration_label_matches_spec_example, format_duration_label_reflects_actual_length_not_a_fixed_value"
+
+[[user_story.acceptance_criteria]]
+id = "AC-038"
+description = "A recording indicator is shown while recording, and transient audio failures are never rendered on screen."
+evidence = "docs/SPEC.md Functionality #4 'Failure handling'; tests render_shows_recording_indicator_while_recording, render_does_not_show_recording_or_playback_errors"
+
+[[user_story.acceptance_criteria]]
+id = "AC-039"
+description = "Voice chunks reach the recipient in the order they were sent, framed by a start and an end."
+evidence = "docs/PROTOCOL.md 7.3; test end_to_end_channel_voice_stream_arrives_in_order"
+
+[[user_story.technical_behavior]]
+id = "TB-037"
+description = "A stream is Start then Chunks then End sharing one stream_id; channel Start/End are broadcast to current members excluding the sender, and the direct variants go to the one recipient."
+evidence = "docs/PROTOCOL.md 7.3; tests channel_stream_start_broadcasts_to_members_excluding_sender, channel_stream_end_broadcasts_to_members_excluding_sender, direct_stream_start_chunk_end_delivered_to_recipient"
+
+[[user_story.technical_behavior]]
+id = "TB-038"
+description = "A channel chunk is delivered only to the members the sender addressed; a non-member in that list is silently dropped."
+evidence = "docs/PROTOCOL.md 7.3; test channel_stream_chunk_delivered_only_to_addressed_members"
+
+[[user_story.technical_behavior]]
+id = "TB-039"
+description = "A stream message from a non-member, naming an unknown channel, or addressed to an unknown recipient is rejected."
+evidence = "docs/PROTOCOL.md 7.3; tests channel_stream_start_from_non_member_is_rejected, channel_stream_start_to_unknown_channel_is_rejected, channel_stream_chunk_from_non_member_is_rejected, channel_stream_chunk_to_unknown_channel_is_rejected, direct_stream_start_to_unknown_recipient_is_rejected"
+
+[[user_story.technical_behavior]]
+id = "TB-040"
+description = "A stream is identified by the pair (sender, stream_id), never stream_id alone, so two senders reusing a number do not collide."
+evidence = "docs/PROTOCOL.md 7.3 'Stream identity'; test finalize_matches_by_from_and_stream_id_not_stream_id_alone"
+
+[[user_story.technical_behavior]]
+id = "TB-041"
+description = "Recording continues while the key is held: on a terminal reporting real releases only a Release stops it, otherwise a RECORD_HOLD_TIMEOUT gap with no further press is treated as the release."
+evidence = "docs/SPEC.md Functionality #4 'Release detection'; tests repeated_space_presses_do_not_auto_stop_before_the_timeout, idle_gap_past_the_timeout_auto_stops_and_sends, a_fresh_press_resets_the_idle_clock, keyboard_release_reporting_disables_the_idle_timeout_entirely, explicit_release_event_still_stops_immediately_without_waiting_for_the_timeout"
+
+[[user_story.technical_behavior]]
+id = "TB-042"
+description = "The idle auto-stop and a stray release are no-ops when no recording is in progress."
+evidence = "docs/SPEC.md Functionality #4 'Release detection'; tests tick_recording_timeout_is_a_noop_when_not_recording, space_release_without_prior_press_does_nothing"
+
+[[user_story.technical_behavior]]
+id = "TB-043"
+description = "A failed recorder start clears the recording indicator and records the reason, and starting a new recording clears a stale one."
+evidence = "docs/SPEC.md Functionality #4 'Failure handling'; tests recording_failed_clears_the_misleading_recording_indicator_and_shows_why, starting_a_new_recording_clears_a_previous_audio_error"
+
+[[user_story.technical_behavior]]
+id = "TB-044"
+description = "A playback failure is recorded without disturbing an in-progress recording."
+evidence = "test playback_failed_shows_the_reason_without_touching_recording_state"
+
+[[user_story.technical_behavior]]
+id = "TB-045"
+description = "PCM samples survive a bytes round trip, and a trailing odd byte is dropped rather than panicking."
+evidence = "docs/PROTOCOL.md 7.3 (signed 16-bit LE mono PCM); tests pcm_bytes_roundtrip, pcm_from_bytes_drops_trailing_odd_byte_instead_of_panicking"
+
+[[user_story.technical_behavior]]
+id = "TB-046"
+description = "Multi-channel capture is downmixed by averaging each frame's channels into one mono sample per moment in time."
+evidence = "docs/SPEC.md Functionality #4 'Device handling'; tests downmix_i16_*, downmix_f32_*"
+
+[[user_story.technical_behavior]]
+id = "TB-047"
+description = "Resampling scales the sample count proportionally to the rate change and preserves a constant signal."
+evidence = "src/voice.rs resample; tests resample_same_rate_is_a_no_op, resample_upsampling_produces_proportionally_more_samples, resample_downsampling_produces_proportionally_fewer_samples, resample_preserves_a_constant_signal, resample_round_trip_stays_close_to_original_duration"
+
+[[user_story.technical_behavior]]
+id = "TB-048"
+description = "Resampling degenerate input - empty samples, or a zero rate on either side - is a safe no-op rather than a panic or a divide by zero."
+evidence = "tests resample_empty_input_stays_empty, resample_zero_rate_is_a_safe_no_op_not_a_panic"
+
+[[user_story.technical_behavior]]
+id = "TB-049"
+description = "The duration label rounds partial seconds up, except that zero stays zero."
+evidence = "docs/SPEC.md Functionality #4; tests format_duration_label_rounds_up_partial_seconds, format_duration_label_zero_is_zero_not_rounded_up"
+
+[[user_story.technical_behavior]]
+id = "TB-050"
+description = "The end-of-message chime decodes from a bundled WAV, walking chunks generically, downmixing to mono and resampling to SAMPLE_RATE_HZ, and rejecting non-WAV input."
+evidence = "docs/SPEC.md Functionality #4 'End-of-message chime'; tests decode_wav_*, end_chime_samples_decodes_the_bundled_asset_and_is_non_empty"
+
+# ============================================================================
+# US-008 - Keep message content readable only by its recipient
+# ============================================================================
+[[user_story]]
+id = "US-008"
+title = "Keep message content readable only by its recipient"
+as_a = "user of an end-to-end encrypted chat"
+i_want = "every message encrypted separately for each recipient"
+so_that = "neither the server nor anyone else can read what I said"
+
+[[user_story.acceptance_criteria]]
+id = "AC-040"
+description = "A message encrypted for one recipient is readable by that recipient and by no one else."
+evidence = "docs/PROTOCOL.md 8, docs/SPEC.md Functionality #1; tests encrypt_decrypt_roundtrip_short_message, wrong_key_cannot_decrypt"
+
+[[user_story.acceptance_criteria]]
+id = "AC-041"
+description = "A message of any length, including an empty one and one far larger than a single RSA block, survives the encrypt/decrypt round trip byte for byte."
+evidence = "docs/PROTOCOL.md 8.1; tests encrypt_decrypt_roundtrip_empty_message, long_message_is_split_into_multiple_blocks_and_reassembled"
+
+[[user_story.acceptance_criteria]]
+id = "AC-042"
+description = "The same password always reproduces the same keypair on any machine, and different passwords produce unrelated ones."
+evidence = "docs/PROTOCOL.md 8.3; tests password_derived_keypair_is_deterministic, different_passwords_derive_different_keypairs"
+
+[[user_story.technical_behavior]]
+id = "TB-051"
+description = "A payload longer than one OAEP block is split into several independently-encrypted blocks and rejoined in order."
+evidence = "docs/PROTOCOL.md 8.1; test long_message_is_split_into_multiple_blocks_and_reassembled"
+
+[[user_story.technical_behavior]]
+id = "TB-052"
+description = "An empty plaintext still produces exactly one block, so blocks is never empty for a valid envelope."
+evidence = "docs/PROTOCOL.md 8.1; test encrypt_decrypt_roundtrip_empty_message"
+
+[[user_story.technical_behavior]]
+id = "TB-053"
+description = "Generated keys are RSA_KEY_BITS by default and RSA_PER_MSG_KEY_BITS when that size is requested, and remain usable at either size."
+evidence = "docs/PROTOCOL.md 8.1, 11.9; tests generate_uses_the_default_rsa_key_bits, generate_with_bits_produces_a_key_of_the_requested_size_and_is_still_usable"
+
+[[user_story.technical_behavior]]
+id = "TB-054"
+description = "A public or private key survives a DER round trip and is still usable for encryption and decryption afterwards."
+evidence = "docs/PROTOCOL.md 3, 12.6.5; tests public_key_der_roundtrip_preserves_usability, private_key_der_roundtrip_preserves_usability"
+
+[[user_story.technical_behavior]]
+id = "TB-055"
+description = "Bytes that are not a valid DER key are rejected with an error rather than parsed."
+evidence = "test private_key_from_der_rejects_garbage"
+
+[[user_story.technical_behavior]]
+id = "TB-056"
+description = "A keypair survives a save-then-load round trip through PEM files."
+evidence = "README.md 'Generating RSA keys'; test save_and_load_keypair_files_roundtrip"
+
+[[user_story.technical_behavior]]
+id = "TB-057"
+description = "A fingerprint is a stable 64-character SHA-256 hex digest that distinguishes different keys, and matches whether computed from a parsed key or its DER bytes."
+evidence = "docs/PROTOCOL.md 12.2; tests fingerprint_is_stable_and_distinguishes_keys, fingerprint_der_matches_fingerprint_of_the_parsed_key"
+
+[[user_story.technical_behavior]]
+id = "TB-058"
+description = "fingerprint_der is infallible even on bytes that are not a valid key, so a corrupted store entry can still be displayed."
+evidence = "src/crypto.rs fingerprint_der doc comment; test fingerprint_der_is_infallible_even_on_garbage_bytes"
+
+[[user_story.technical_behavior]]
+id = "TB-059"
+description = "Signing is deterministic PKCS#1 v1.5 over SHA-256, and verification rejects tampered data, a foreign key, and garbage or empty signature bytes."
+evidence = "docs/PROTOCOL.md 11.3; tests sign_verify_roundtrip, verify_rejects_tampered_data, verify_rejects_signature_from_a_different_key, verify_rejects_garbage_signature_bytes, sign_is_deterministic_pkcs1v15"
+
+[[user_story.technical_behavior]]
+id = "TB-115"
+description = "encrypt_chunked rejects a key too small to fit even a zero-length OAEP/SHA-256 block, rather than panicking or silently producing unusable output."
+evidence = "src/crypto.rs encrypt_chunked; test encrypt_chunked_rejects_a_key_too_small_for_oaep"
+
+# ============================================================================
+# US-009 - Exchange messages over the wire protocol
+# ============================================================================
+[[user_story]]
+id = "US-009"
+title = "Exchange messages over the wire protocol"
+as_a = "client or server implementation"
+i_want = "every protocol message to survive framing, encoding and decoding intact"
+so_that = "two peers built from the same definitions interoperate"
+
+[[user_story.acceptance_criteria]]
+id = "AC-043"
+description = "Every message a client or server can send survives an encode/decode round trip with all its fields intact."
+evidence = "docs/PROTOCOL.md 2, 9; tests encode_decode_roundtrip_client_message, encode_decode_roundtrip_server_message, envelope_roundtrips, user_info_and_channel_info_roundtrip"
+
+[[user_story.technical_behavior]]
+id = "TB-060"
+description = "Every ClientMessage and ServerMessage variant, including the six voice-stream variants and RotateKey/KeyRotated, survives an encode/decode round trip."
+evidence = "docs/PROTOCOL.md 7; tests encode_decode_roundtrip_*, envelope_roundtrips, rotate_key_and_key_rotated_roundtrip, stream_channel_start_chunk_end_roundtrip, stream_direct_start_chunk_end_roundtrip, server_stream_variants_roundtrip, user_info_and_channel_info_roundtrip"
+
+[[user_story.technical_behavior]]
+id = "TB-061"
+description = "Every KeyMode variant round-trips, including PerMessage, in both Identify and UserInfo."
+evidence = "docs/PROTOCOL.md 3; tests identify_roundtrips_with_per_message_key_mode, user_info_roundtrips_with_per_message_key_mode, user_info_roundtrips_with_every_key_mode_variant"
+
+[[user_story.technical_behavior]]
+id = "TB-062"
+description = "A frame is a big-endian u32 length prefix, not counting itself, followed by exactly that many payload bytes."
+evidence = "docs/PROTOCOL.md 1.1; test frame_roundtrip_exact_buffer"
+
+[[user_story.technical_behavior]]
+id = "TB-063"
+description = "A buffer holding only part of a frame is reported as incomplete rather than decoded or erroring."
+evidence = "docs/PROTOCOL.md 1.1; test parse_frame_reports_incomplete_data"
+
+[[user_story.technical_behavior]]
+id = "TB-064"
+description = "A length prefix above MAX_FRAME_LEN is a hard protocol error, so no attacker-controlled buffer is allocated."
+evidence = "docs/PROTOCOL.md 1.1; test parse_frame_rejects_oversized_length_prefix"
+
+[[user_story.technical_behavior]]
+id = "TB-065"
+description = "Frames concatenated back to back are parsed sequentially from one buffer, and arrive in send order over a stream."
+evidence = "docs/PROTOCOL.md 1.1; tests multiple_frames_can_be_parsed_sequentially_from_one_buffer, async_stream_carries_multiple_messages_in_order"
+
+[[user_story.technical_behavior]]
+id = "TB-066"
+description = "An asynchronous write followed by a read reproduces the original message."
+evidence = "test async_write_then_read_message_roundtrip"
+
+[[user_story.technical_behavior]]
+id = "TB-067"
+description = "A clean close exactly at a frame boundary reads as end-of-stream rather than an error."
+evidence = "docs/PROTOCOL.md 1.1; tests async_read_returns_none_on_clean_close_before_next_frame, async_stream_carries_multiple_messages_in_order"
+
+[[user_story.technical_behavior]]
+id = "TB-111"
+description = "An EOF in the middle of a frame - right after the length prefix, or partway through the payload - is a hard I/O error, not treated as a clean close."
+evidence = "docs/PROTOCOL.md 1.1; tests eof_immediately_after_a_complete_length_prefix_is_a_hard_io_error, eof_partway_through_the_payload_is_a_hard_io_error"
+
+# ============================================================================
+# US-010 - Rotate my key for every message (rsa_per_msg)
+# ============================================================================
+[[user_story]]
+id = "US-010"
+title = "Rotate my key for every message (rsa_per_msg)"
+as_a = "user who picked rsa_per_msg"
+i_want = "a fresh keypair per peer, replaced on every message and signed by the key it replaces"
+so_that = "a key that protected an old message no longer exists to be stolen"
+
+[[user_story.acceptance_criteria]]
+id = "AC-044"
+description = "Each new key a peer rotates to is signed by the key it replaces, so a forged or tampered key is refused and the previously-trusted key is kept."
+evidence = "docs/PROTOCOL.md 11.3, 11.4; tests verify_rotation_accepts_a_valid_signature, verify_rotation_rejects_tampered_key_bytes, verify_and_parse_rotation_returns_none_on_bad_signature"
+
+[[user_story.acceptance_criteria]]
+id = "AC-045"
+description = "A message typed for an rsa_per_msg peer whose next key has not arrived is held, then sent automatically in the order typed once it does."
+evidence = "docs/SPEC.md Functionality #6, docs/PROTOCOL.md 11.5; tests queued_messages_flush_in_fifo_order_on_rotation, full_lifecycle_track_use_queue_rotate_flush"
+
+[[user_story.acceptance_criteria]]
+id = "AC-046"
+description = "While a key regeneration is in flight an animated spinner is shown at the top right just after the help hint, and it disappears once none is pending."
+evidence = "docs/SPEC.md Functionality #6 'Regeneration spinner'; tests header_shows_no_spinner_when_no_key_is_being_regenerated, header_shows_the_spinner_right_after_the_help_hint_separated_by_two_spaces, header_spinner_animates_across_ticks"
+
+[[user_story.technical_behavior]]
+id = "TB-068"
+description = "A rotation is signed over the recipient's UserId bytes concatenated with the new key's DER, so the payload differs per recipient."
+evidence = "docs/PROTOCOL.md 11.3; test rotation_signing_payload_differs_by_recipient"
+
+[[user_story.technical_behavior]]
+id = "TB-069"
+description = "A rotation signed for one peer does not verify when replayed as if addressed to another, through the direct or the fallback path."
+evidence = "docs/PROTOCOL.md 11.3; tests verify_rotation_rejects_replay_against_a_different_recipient, fallback_does_not_verify_continuity_signature_replayed_against_a_different_recipient"
+
+[[user_story.technical_behavior]]
+id = "TB-070"
+description = "verify_and_parse_rotation yields a usable public key only when the signature checks out, and None otherwise."
+evidence = "docs/PROTOCOL.md 11.4; tests verify_and_parse_rotation_returns_a_usable_key_on_success, verify_and_parse_rotation_returns_none_on_bad_signature"
+
+[[user_story.technical_behavior]]
+id = "TB-071"
+description = "The first rotation for a peer is signed with the bootstrap key; later ones are signed with that peer's previous per-peer key."
+evidence = "docs/PROTOCOL.md 11.2, 11.3; tests rotate_for_peer_signs_with_bootstrap_on_first_rotation, rotate_for_peer_signs_second_rotation_with_the_first_per_peer_key"
+
+[[user_story.technical_behavior]]
+id = "TB-072"
+description = "Every keypair a rotation generates is RSA_PER_MSG_KEY_BITS, larger than the app's usual size."
+evidence = "docs/PROTOCOL.md 11.9; tests rotate_for_peer_generates_keys_at_the_rsa_per_msg_key_size, generate_and_sign_rotation_produces_a_verifiable_4096_bit_key"
+
+[[user_story.technical_behavior]]
+id = "TB-073"
+description = "Rotation state is independent per peer: rotating for one peer neither consumes nor changes another peer's key."
+evidence = "docs/PROTOCOL.md 11.1; test rotate_for_peer_is_independent_per_peer"
+
+[[user_story.technical_behavior]]
+id = "TB-074"
+description = "Key generation and installation are separable, so the expensive keygen can run with no lock held and only the cheap install needs synchronised access."
+evidence = "docs/PROTOCOL.md 11.10; tests generate_and_sign_rotation_produces_a_verifiable_4096_bit_key, install_rotated_key_alone_updates_state_the_same_way_rotate_for_peer_does"
+
+[[user_story.technical_behavior]]
+id = "TB-075"
+description = "Decryption tries the current per-peer key, then retired-but-retained keys newest first, then the shared bootstrap key."
+evidence = "docs/PROTOCOL.md 11.7; tests decrypt_from_uses_bootstrap_key_before_any_rotation, decrypt_from_works_with_the_newly_rotated_key, decrypt_from_falls_back_to_a_recently_retired_key, decrypt_from_still_falls_back_to_bootstrap_after_rotating_for_a_peer"
+
+[[user_story.technical_behavior]]
+id = "TB-076"
+description = "Key retention is bounded at KEY_RETENTION, so a key retired long enough ago stops decrypting - an accepted, documented limit."
+evidence = "docs/PROTOCOL.md 11.7; test retention_window_is_bounded_and_oldest_keys_eventually_become_undecryptable"
+
+[[user_story.technical_behavior]]
+id = "TB-077"
+description = "A rotation is packaged as a RotateKey message addressed to the peer it was generated for, carrying a non-empty key and signature."
+evidence = "docs/PROTOCOL.md 7.5; test rotate_and_build_message_produces_a_rotate_key_client_message_addressed_correctly"
+
+[[user_story.technical_behavior]]
+id = "TB-078"
+description = "No per-peer public key is advertised for a peer before that relationship's first rotation."
+evidence = "docs/PROTOCOL.md 11.2; test current_public_der_for_is_none_before_any_rotation"
+
+[[user_story.technical_behavior]]
+id = "TB-079"
+description = "A peer not using rsa_per_msg is never gated on key freshness and is always sendable."
+evidence = "docs/PROTOCOL.md 11; test untracked_peer_is_always_sendable"
+
+[[user_story.technical_behavior]]
+id = "TB-080"
+description = "A tracked peer's key is usable exactly once and then stale until the next rotation; re-tracking does not resurrect a stale key, and a batch flush consumes freshness like any other send."
+evidence = "docs/PROTOCOL.md 11.4, 11.5; tests tracked_peer_is_fresh_once_then_stale, track_is_idempotent_and_does_not_reset_freshness, on_rotated_marks_fresh_and_mark_used_consumes_it_again"
+
+[[user_story.technical_behavior]]
+id = "TB-081"
+description = "Queueing for, or receiving a rotation from, a peer that was never tracked starts tracking them - stale when queued, fresh when rotated."
+evidence = "src/rekey.rs RemoteKeys; tests on_rotated_on_a_never_tracked_peer_starts_tracking_it, enqueue_on_untracked_peer_starts_tracking_it_as_stale"
+
+[[user_story.technical_behavior]]
+id = "TB-082"
+description = "The server relays RotateKey verbatim, but only from a sender registered as PerMessage and only to a currently-connected recipient."
+evidence = "docs/PROTOCOL.md 7.5; tests key_rotation_is_delivered_to_recipient, key_rotation_from_a_static_mode_sender_is_rejected, key_rotation_to_unknown_recipient_is_rejected, key_rotation_from_unknown_sender_is_rejected, end_to_end_key_rotation_is_relayed_and_rejected_appropriately"
+
+[[user_story.technical_behavior]]
+id = "TB-083"
+description = "An applied rotation updates every cached copy of that peer's public key - known_users, each channel's member list, and an open private room's peer."
+evidence = "src/ui/ui.rs on_user_key_rotated; tests key_rotation_updates_known_users_and_channel_member_copies, key_rotation_updates_an_open_private_room_peer_copy"
+
+[[user_story.technical_behavior]]
+id = "TB-084"
+description = "A rotation naming a user this client has never heard of is a harmless no-op."
+evidence = "test key_rotation_for_an_unknown_user_is_a_harmless_noop"
+
+[[user_story.technical_behavior]]
+id = "TB-085"
+description = "The spinner cycles the six documented ASCII frames one per tick, wrapping around, and always restarts from the first frame after a stop."
+evidence = "docs/SPEC.md Functionality #6; tests spinner_frames_match_the_documented_ascii_sequence, tick_spinner_sets_key_regenerating_and_starts_at_the_first_frame, tick_spinner_advances_one_frame_per_call_and_wraps_around, tick_spinner_resets_to_the_first_frame_once_regeneration_stops_and_restarts"
+
+# ============================================================================
+# US-011 - Recognise a peer across reconnects (identity pinning)
+# ============================================================================
+[[user_story]]
+id = "US-011"
+title = "Recognise a peer across reconnects (identity pinning)"
+as_a = "user talking to the same people over time"
+i_want = "to be told when a familiar nickname comes back under a key it cannot prove is still theirs"
+so_that = "I can judge whether it is really them"
+
+[[user_story.acceptance_criteria]]
+id = "AC-047"
+description = "A nickname seen for the first time, or seen again with the key it was pinned to, is accepted silently."
+evidence = "docs/PROTOCOL.md 12.4; tests first_sighting_of_a_nickname_is_new, same_nickname_same_key_is_a_match"
+
+[[user_story.acceptance_criteria]]
+id = "AC-048"
+description = "A nickname returning under a different, unverifiable key opens a blocking Accept/Reject review naming the user - see US-017 for what Accept/Reject actually do."
+evidence = "docs/PROTOCOL.md 12.4; tests same_nickname_different_key_is_a_mismatch, push_identity_review_opens_a_popup_naming_the_peer_in_the_channel_view, identity_review_popup_also_shows_over_an_open_private_room"
+
+[[user_story.acceptance_criteria]]
+id = "AC-049"
+description = "A nickname mismatch with nothing yet pending is never shown, and resolving one opens the next queued review rather than several at once - see US-017 for the queueing model."
+evidence = "docs/PROTOCOL.md 12.4; tests no_identity_review_popup_is_shown_when_nothing_is_pending, a_second_mismatch_queues_behind_the_open_one_and_is_shown_once_it_resolves"
+
+[[user_story.acceptance_criteria]]
+id = "AC-050"
+description = "An rsa_per_msg peer that proves continuity after reconnecting is recognised silently, with no warning."
+evidence = "docs/PROTOCOL.md 12.6.3; tests fallback_verifies_via_continuity_when_there_is_no_live_key_at_all, fallback_a_self_reasserted_key_verifies_the_same_way_as_a_freshly_rotated_one, end_to_end_resume_rotation_after_reconnect_verifies_against_the_continuity_key"
+
+[[user_story.technical_behavior]]
+id = "TB-086"
+description = "A mismatch re-pins the nickname to the newly-seen key regardless, and hands the previous key to the caller as the only place it survives."
+evidence = "docs/PROTOCOL.md 12.4; test same_nickname_different_key_is_a_mismatch"
+
+[[user_story.technical_behavior]]
+id = "TB-087"
+description = "Nicknames are pinned independently of one another in both stores."
+evidence = "tests different_nicknames_are_tracked_independently (idstore and own_next_keys)"
+
+[[user_story.technical_behavior]]
+id = "TB-088"
+description = "A store round-trips the full key bytes through save and load, including arbitrary non-UTF-8 DER, and the restored key still works."
+evidence = "docs/PROTOCOL.md 12.2, 12.5; tests save_then_load_round_trips_the_full_key_bytes, save_then_load_round_trips_a_usable_private_key"
+
+[[user_story.technical_behavior]]
+id = "TB-089"
+description = "Saving a store creates any missing parent directories."
+evidence = "docs/PROTOCOL.md 12.5; tests save_creates_missing_parent_directories (both stores)"
+
+[[user_story.technical_behavior]]
+id = "TB-090"
+description = "A nickname containing the file's own delimiters is never stored, so a remote peer cannot inject records into a local trust file."
+evidence = "docs/PROTOCOL.md 12.5; tests a_nickname_containing_a_tab_is_never_pinned, a_nickname_containing_a_tab_is_never_stored"
+
+[[user_story.technical_behavior]]
+id = "TB-091"
+description = "The on-disk format is one 'nickname<TAB>lowercase-hex' line per entry, and the default path always resolves under ~/.aloo - never a loose file in the current working directory."
+evidence = "docs/PROTOCOL.md 12.5, 12.6.5; tests on_disk_format_is_hex_encoded_not_raw_or_base64, default_path_always_resolves_under_the_dot_aloo_home_directory (both stores)"
+
+[[user_story.technical_behavior]]
+id = "TB-092"
+description = "A line that is malformed, has an undecodable hex half, or is not a real key is skipped on load rather than failing the whole store."
+evidence = "docs/PROTOCOL.md 12.5; tests corrupted_lines_in_an_existing_file_are_skipped_not_fatal (both stores)"
+
+[[user_story.technical_behavior]]
+id = "TB-093"
+description = "A store file that does not exist yet loads as empty rather than erroring, and an empty in-memory store can still be saved."
+evidence = "docs/PROTOCOL.md 12.5; tests loading_a_missing_file_starts_empty_not_an_error (both stores), new_empty_starts_with_nothing_and_can_still_save (both stores)"
+
+[[user_story.technical_behavior]]
+id = "TB-094"
+description = "Reading a pinned entry does not pin, re-pin, or otherwise mutate the store, and an unknown nickname reads as absent."
+evidence = "docs/PROTOCOL.md 12.6.3; tests get_reads_a_pinned_entry_without_mutating_anything, get_on_an_unknown_nickname_is_none"
+
+[[user_story.technical_behavior]]
+id = "TB-095"
+description = "own_next_keys keeps only the single current private key per nickname, overwriting the previous one so it is no longer reachable."
+evidence = "docs/PROTOCOL.md 12.6.1; tests set_then_get_returns_a_usable_key, set_overwrites_the_previous_key_for_the_same_nickname"
+
+[[user_story.technical_behavior]]
+id = "TB-096"
+description = "An incoming rotation is checked against the live in-session key first and only then against the persisted continuity key, reporting which anchor verified it."
+evidence = "docs/PROTOCOL.md 12.6.3; tests fallback_prefers_the_live_key_when_it_verifies, fallback_falls_through_to_continuity_when_live_check_fails, fallback_verifies_via_continuity_when_there_is_no_live_key_at_all"
+
+[[user_story.technical_behavior]]
+id = "TB-097"
+description = "Verification fails when neither anchor verifies - whether missing, wrong, forged, or against tampered key bytes."
+evidence = "docs/PROTOCOL.md 12.6.3; tests fallback_fails_when_neither_anchor_is_available, fallback_fails_when_both_anchors_are_present_but_neither_verifies, fallback_fails_when_live_is_none_and_continuity_check_fails, fallback_rejects_tampered_new_key_bytes_via_either_anchor"
+
+[[user_story.technical_behavior]]
+id = "TB-098"
+description = "A resume re-asserts the persisted key signed by itself, wire-identical to an ordinary rotation, and needs no new protocol message or server support."
+evidence = "docs/PROTOCOL.md 12.6.2; tests fallback_a_self_reasserted_key_verifies_the_same_way_as_a_freshly_rotated_one, end_to_end_resume_rotation_after_reconnect_verifies_against_the_continuity_key"
+
+# ============================================================================
+# US-012 - See who is present and how their identity is protected
+# ============================================================================
+[[user_story]]
+id = "US-012"
+title = "See who is present and how their identity is protected"
+as_a = "connected user"
+i_want = "each user shown with a tag for how durable their identity is"
+so_that = "I can tell a file-backed identity from one regenerated every session"
+
+[[user_story.acceptance_criteria]]
+id = "AC-051"
+description = "Each user is shown with the encryption tag for their my_key type, trailing their name - one shared convention across all five my_key types - in the sidebar and in a private room's title."
+evidence = "docs/SPEC.md 'Encryption tag convention', docs/PROTOCOL.md 3; tests key_mode_label_matches_the_documented_tag_convention, format_with_name_puts_every_tag_after_the_name, sidebar_shows_each_users_encryption_tag_after_their_name, private_room_title_shows_the_peers_rsa_per_msg_tag_after_their_name, pq_hybrid_tag_is_the_shield"
+
+[[user_story.technical_behavior]]
+id = "TB-099"
+description = "KeyMode::label returns exactly the documented tag string for each of the five variants, with no brackets or surrounding whitespace of its own."
+evidence = "docs/PROTOCOL.md 3; tests key_mode_label_matches_the_documented_tag_convention, pq_hybrid_tag_is_the_shield"
+
+[[user_story.technical_behavior]]
+id = "TB-100"
+description = "format_with_name places every KeyMode's tag after the name, the same convention for all five variants."
+evidence = "docs/PROTOCOL.md 3; tests format_with_name_puts_every_tag_after_the_name, pq_hybrid_tag_is_the_shield"
+
+[[user_story.technical_behavior]]
+id = "TB-101"
+description = "The connected view renders without panicking - empty, with members and messages, with a voice entry, with the identity banner, and with the join popup over it."
+evidence = "tests render_channel_view_does_not_panic, render_with_identity_banner_does_not_panic, render_join_popup_overlay_does_not_panic, render_empty_state_does_not_panic"
+
+# ============================================================================
+# US-013 - Keep history reachable when a peer goes offline
+# ============================================================================
+[[user_story]]
+id = "US-013"
+title = "Keep history reachable when a peer goes offline"
+as_a = "user who has been talking to someone"
+i_want = "their history to stay reachable once they disconnect, without pretending they are still around"
+so_that = "I can read back what we said"
+
+[[user_story.acceptance_criteria]]
+id = "AC-052"
+description = "A user who goes offline stays listed in soft gray if there is DM history with them, and is removed like an explicit leave if there is not."
+evidence = "docs/SPEC.md Functionality #8; tests user_offline_with_dm_history_keeps_them_in_every_channel_they_were_in, user_offline_without_dm_history_is_removed_from_channels_like_an_explicit_leave, sidebar_renders_an_offline_member_in_gray_instead_of_green"
+
+[[user_story.acceptance_criteria]]
+id = "AC-053"
+description = "An offline peer's private room replaces the compose bar with '(user offline)' in red and accepts no typing or sending."
+evidence = "docs/SPEC.md Functionality #8; tests compose_bar_ignores_typing_and_enter_while_the_open_dm_peer_is_offline, private_room_input_bar_shows_a_red_offline_notice_instead_of_the_compose_bar"
+
+[[user_story.acceptance_criteria]]
+id = "AC-054"
+description = "Holding Space in an offline peer's private room does nothing at all."
+evidence = "docs/SPEC.md Functionality #8; test space_press_with_an_offline_dm_peer_is_ignored_and_does_not_start_recording"
+
+[[user_story.acceptance_criteria]]
+id = "AC-055"
+description = "Going offline is permanent for the rest of the session; the same person reconnecting is a new identity."
+evidence = "docs/SPEC.md Functionality #8, docs/PROTOCOL.md 3; test user_offline_is_permanent_for_the_session_since_a_user_id_is_never_reused"
+
+[[user_story.technical_behavior]]
+id = "TB-102"
+description = "A full disconnect notifies peers with UserOffline, which is reserved for exactly that; an explicit single-channel leave sends UserLeft instead."
+evidence = "docs/PROTOCOL.md 6.4; tests unregister_removes_user_from_every_channel_it_was_in, leave_channel_still_sends_userleft_while_the_user_stays_connected"
+
+[[user_story.technical_behavior]]
+id = "TB-103"
+description = "A peer sharing several channels with the disconnecting client receives exactly one UserOffline, not one per shared channel."
+evidence = "docs/PROTOCOL.md 6.4; test unregister_sends_exactly_one_useroffline_per_peer_even_if_shared_multiple_channels"
+
+[[user_story.technical_behavior]]
+id = "TB-104"
+description = "Retention keys off actual message history, not merely having opened the room - an opened-but-empty DM does not keep a user listed."
+evidence = "docs/SPEC.md Functionality #3, #8; test user_offline_with_an_open_but_empty_dm_room_is_still_removed_from_channels"
+
+[[user_story.technical_behavior]]
+id = "TB-105"
+description = "Offline blocking is scoped to the offline peer only, leaving other peers' rooms fully usable."
+evidence = "docs/SPEC.md Functionality #8; test compose_bar_works_normally_again_after_leaving_and_reopening_an_online_peers_dm"
+
+# ============================================================================
+# US-014 - Get help without leaving the app
+# ============================================================================
+[[user_story]]
+id = "US-014"
+title = "Get help without leaving the app"
+as_a = "user who has forgotten a keybinding"
+i_want = "a help overlay available from anywhere"
+so_that = "I do not have to leave the app to look something up"
+
+[[user_story.acceptance_criteria]]
+id = "AC-056"
+description = "Ctrl+H opens and closes a help overlay from any view or mode, in either letter case."
+evidence = "docs/SPEC.md Functionality #7; tests ctrl_h_opens_and_closes_the_help_overlay, ctrl_h_uppercase_also_toggles_help, ctrl_h_works_regardless_of_current_view_or_mode"
+
+[[user_story.acceptance_criteria]]
+id = "AC-057"
+description = "The overlay covers joining a hidden channel, sending a voice message, sending/receiving a file, what the encryption tags mean, and identity pinning."
+evidence = "docs/SPEC.md Functionality #7; test render_help_popup_shows_expected_content_when_open"
+
+[[user_story.acceptance_criteria]]
+id = "AC-058"
+description = "A 'Ctrl+H: Help' hint sits at the top right, past the end of the channel tabs, as a reminder it is always available."
+evidence = "docs/SPEC.md Functionality #7; tests render_channel_view_shows_the_ctrl_h_hint_after_the_channel_tabs, header_shows_no_spinner_when_no_key_is_being_regenerated"
+
+[[user_story.technical_behavior]]
+id = "TB-106"
+description = "While help is open every key besides the scroll keys is absorbed - no typing reaches the compose bar, no focus moves - and Esc specifically does not close it or the private room underneath."
+evidence = "docs/SPEC.md Functionality #7; tests help_absorbs_other_keys_while_open, esc_while_help_open_only_closes_help_not_the_private_room_underneath"
+
+[[user_story.technical_behavior]]
+id = "TB-107"
+description = "The Release half of the Ctrl+H keystroke is absorbed rather than treated as a second toggle."
+evidence = "test ctrl_h_release_event_does_not_re_toggle_help"
+
+[[user_story.technical_behavior]]
+id = "TB-108"
+description = "The help popup widens enough to show its longest line unclipped but never exceeds 90% of the terminal width."
+evidence = "tests help_popup_widens_enough_to_show_its_longest_line_without_clipping_it, help_popup_never_exceeds_90_percent_of_the_terminal_width"
+
+[[user_story.technical_behavior]]
+id = "TB-126"
+description = "The help popup is scrollable (Up/Down one line, PageUp/PageDown by HELP_SCROLL_PAGE lines, Home/End to either end), clamped so it can never scroll past the top or bottom of its own content, and always reopens scrolled to the top rather than wherever it was left."
+evidence = "docs/SPEC.md Functionality #7; tests help_scroll_moves_by_one_line_and_by_a_page_and_clamps_at_both_ends, help_always_reopens_scrolled_to_the_top; scenario features/help/in_app_help.feature 'The overlay scrolls, and always reopens at the top'"
+
+# ============================================================================
+# US-015 - Read back message history
+# ============================================================================
+[[user_story]]
+id = "US-015"
+title = "Read back message history"
+as_a = "user catching up"
+i_want = "to scroll back through a channel or private room without being yanked around by new traffic"
+so_that = "I can read history while the conversation continues"
+
+[[user_story.acceptance_criteria]]
+id = "AC-059"
+description = "Opening a channel or a private room starts on its newest message."
+evidence = "docs/SPEC.md 'Connected UI'; tests message_selection_defaults_to_the_newest_entry, opening_a_private_room_with_existing_history_starts_on_the_newest_message"
+
+[[user_story.acceptance_criteria]]
+id = "AC-060"
+description = "A new message pulls the view along only if the newest message was already being shown; a scrolled-back reader is left where they are."
+evidence = "docs/SPEC.md 'Connected UI'; tests new_messages_auto_follow_when_already_viewing_the_bottom, scrolled_up_history_is_not_yanked_down_by_a_new_message"
+
+[[user_story.acceptance_criteria]]
+id = "AC-061"
+description = "Up/Down move one message, PageUp/PageDown jump by ten, Home/End go to the oldest/newest, all clamped at the ends rather than wrapping."
+evidence = "docs/SPEC.md 'Connected UI'; tests up_down_clamp_at_the_ends_instead_of_wrapping, page_up_page_down_home_and_end_jump_the_selection"
+
+[[user_story.technical_behavior]]
+id = "TB-109"
+description = "The rendered viewport follows the selection rather than always showing the top of the log."
+evidence = "test the_rendered_viewport_follows_the_selection_instead_of_always_showing_the_top"
+
+[[user_story.technical_behavior]]
+id = "TB-110"
+description = "Traffic arriving in a channel other than the selected one does not move the current selection."
+evidence = "test a_message_arriving_in_a_different_channel_does_not_move_the_current_selection"
+
+# ============================================================================
+# US-016 - Move around the connected UI
+# ============================================================================
+[[user_story]]
+id = "US-016"
+title = "Move around the connected UI"
+as_a = "connected user"
+i_want = "to move keyboard focus between the parts of the screen"
+so_that = "I can reach the sidebar, the log and the compose bar without a mouse"
+
+[[user_story.acceptance_criteria]]
+id = "AC-062"
+description = "Tab cycles focus between the sidebar, the message log and the compose bar, starting at the compose bar."
+evidence = "docs/SPEC.md 'Connected UI', README keybindings; test tab_cycles_focus_sidebar_messages_input"
+
+[[user_story.acceptance_criteria]]
+id = "AC-063"
+description = "Up and Down move the selected user in the sidebar, wrapping around at both ends."
+evidence = "README keybindings; test sidebar_up_down_wraps_selection"
+
+# ============================================================================
+# US-017 - Decide whether to trust a peer whose identity looks wrong
+# ============================================================================
+[[user_story]]
+id = "US-017"
+title = "Decide whether to trust a peer whose identity looks wrong"
+as_a = "user who has been warned a peer's identity doesn't check out"
+i_want = "an explicit Accept/Reject decision instead of the app quietly trusting them anyway"
+so_that = "I control whether messaging with that peer resumes, not the app"
+
+[[user_story.acceptance_criteria]]
+id = "AC-064"
+description = "A mismatch (an rsa/password byte change, or an rsa_per_msg peer whose identity hasn't been verified against a previously-pinned continuity key - whether because a resume was attempted and failed, or because none was ever attempted at all) opens an Accept/Reject popup naming the peer, worded for the specific case; nothing is shown when there is nothing pending."
+evidence = "docs/PROTOCOL.md 12.4, 12.6.3-12.6.4; tests identity_review_popup_auto_opens_and_shows_the_case_specific_message, no_identity_review_popup_is_shown_when_nothing_is_pending, push_identity_review_opens_a_popup_naming_the_peer_in_the_channel_view, identity_review_popup_also_shows_over_an_open_private_room"
+
+[[user_story.acceptance_criteria]]
+id = "AC-065"
+description = "Accept trusts the new key going forward (persisted to id_store) and reveals any messages held while the peer was unresolved, in arrival order; Reject leaves the previous pin untouched on disk and keeps those messages held."
+evidence = "docs/PROTOCOL.md 12.4, 12.6.2; tests accepting_an_identity_review_clears_it_and_reveals_held_messages, rejecting_an_identity_review_keeps_it_and_leaves_messages_held"
+
+[[user_story.acceptance_criteria]]
+id = "AC-066"
+description = "Selecting a Pending or Rejected member (Enter on their sidebar entry) opens their review popup instead of a private room, and their sidebar entry renders red for as long as they stay unresolved or rejected - taking priority over the offline color."
+evidence = "docs/SPEC.md 'Connected UI'; tests enter_on_a_trust_gated_sidebar_member_reopens_the_review_popup_instead_of_the_dm, sidebar_renders_a_trust_gated_member_in_red_taking_priority_over_offline"
+
+[[user_story.acceptance_criteria]]
+id = "AC-067"
+description = "A mismatch detected while another peer's review is already showing waits its turn; resolving the open one (Accept or Reject either) reveals the next queued review automatically."
+evidence = "docs/SPEC.md 'Connected UI'; test a_second_mismatch_queues_behind_the_open_one_and_is_shown_once_it_resolves"
+
+[[user_story.acceptance_criteria]]
+id = "AC-068"
+description = "A channel text/voice message still reaches every other, verified member while one member is Pending/Rejected - only that member is excluded from the send. A direct message to a Pending/Rejected peer cannot be sent or typed at all."
+evidence = "docs/PROTOCOL.md 12; test sending_a_channel_message_excludes_a_pending_or_rejected_member"
+
+[[user_story.acceptance_criteria]]
+id = "AC-069"
+description = "A nickname reconnecting via rsa_per_msg that already has a continuity key pinned is gated the instant it's seen again, before any resume/rotation is even attempted - an ordinary self-consistent in-session rotation alone (proof only that a rotation matches what this same connection just announced, not proof of who announced it) never silently clears that gate; only a signature that verifies against the pinned continuity key, or a person's explicit Accept, does. Closes the gap where a peer that simply never attempts to prove continuity - an impersonator who doesn't bother, or a legitimate user who lost own_next_keys - would otherwise be silently trusted."
+evidence = "docs/PROTOCOL.md 12.6.3; test identity_pinning.feature 'A familiar nickname reconnecting via rsa_per_msg is gated on sight, before it even tries to prove continuity'"
+
+[[user_story.technical_behavior]]
+id = "TB-116"
+description = "This client's own rsa_per_msg decrypt-key selection for a live voice stream tries the current per-peer key, then retained keys, then the shared bootstrap key - the same fallback chain decrypt_from already uses for text - rather than a single key with no recourse."
+evidence = "docs/PROTOCOL.md 11.7; tests candidate_privates_for_lists_current_retained_and_bootstrap_in_priority_order, candidate_privates_for_an_untracked_peer_is_bootstrap_only"
+
+[[user_story.technical_behavior]]
+id = "TB-117"
+description = "Silently resolving a peer's identity review (a verified rsa_per_msg resume, not a person's Accept/Reject) removes that specific peer from the review queue wherever it is, not only when it's the one currently shown - a second peer's continuity can verify while a first peer's review is still on screen without disturbing it."
+evidence = "docs/PROTOCOL.md 12.6.3; test a_silently_resolved_review_is_removed_even_when_it_is_not_the_one_shown"
+
+# ============================================================================
+# US-018 - See system and connection health at a glance
+# ============================================================================
+[[user_story]]
+id = "US-018"
+title = "See system and connection health at a glance"
+as_a = "connected user"
+i_want = "my own CPU load and a rough read on how lively the connection is, shown right in the channel view"
+so_that = "I can tell whether something feels slow because of my machine or the network"
+
+[[user_story.acceptance_criteria]]
+id = "AC-071"
+description = "The channel view's header shows 'CPU:<pct>%' immediately before the Ctrl+H hint, refreshed roughly every 300ms, colored green below CPU_HEALTHY_MAX_PCT or red at/above it."
+evidence = "docs/SPEC.md 'Connected UI'; tests header_shows_cpu_usage_right_before_the_ctrl_h_hint, cpu_usage_renders_green_below_the_healthy_threshold_and_red_at_or_above_it"
+
+[[user_story.acceptance_criteria]]
+id = "AC-072"
+description = "The channel view's header shows 'Conn:<-|BAD|NORMAL|GOOD>' immediately before the CPU indicator, refreshed once a second, colored white/red/yellow/green respectively, defaulting to '-' in white before any protocol message has been exchanged."
+evidence = "docs/SPEC.md 'Connected UI'; tests header_shows_conn_quality_right_before_the_cpu_indicator, header_defaults_conn_quality_to_a_white_dash_before_any_traffic, conn_quality_renders_one_color_per_variant"
+
+[[user_story.technical_behavior]]
+id = "TB-118"
+description = "The CPU indicator's color threshold is CPU_HEALTHY_MAX_PCT: green strictly below it, red at or above it, decided against the same rounded value shown on screen so the color and the displayed percentage never disagree at a rounding boundary."
+evidence = "src/ui/channel.rs cpu_color, cpu_pct_rounded; test cpu_usage_renders_green_below_the_healthy_threshold_and_red_at_or_above_it"
+
+[[user_story.technical_behavior]]
+id = "TB-119"
+description = "CpuMonitor::refresh reports system-wide CPU usage as a percentage in 0.0..=100.0 on Linux, macOS and Windows alike, via sysinfo."
+evidence = "src/sysstats.rs CpuMonitor; test refresh_reports_a_percentage_in_range"
+
+[[user_story.technical_behavior]]
+id = "TB-120"
+description = "ConnStats averages the gaps between at most the CONN_STATS_MAX_SAMPLES most recently observed protocol messages (sent or received), evicting older gaps once that many are held, and reports no average at all until at least two messages have been seen."
+evidence = "src/netstats.rs ConnStats; tests average_interval_is_still_none_after_a_single_event, average_interval_averages_up_to_three_most_recent_gaps, older_gaps_are_evicted_once_more_than_max_samples_are_recorded, an_out_of_order_timestamp_does_not_panic_or_record_a_negative_interval"
+
+[[user_story.technical_behavior]]
+id = "TB-121"
+description = "ConnStats::quality classifies the current average inter-message interval as Good at or below CONN_GOOD_MAX_INTERVAL, Bad at or above CONN_BAD_MIN_INTERVAL, Normal strictly between the two, and Unknown before any interval has been observed."
+evidence = "src/netstats.rs ConnQuality; tests quality_is_unknown_with_no_events, quality_is_good_at_or_below_the_good_threshold, quality_is_bad_at_or_above_the_bad_threshold, quality_is_normal_between_the_two_thresholds"
+
+[[user_story.technical_behavior]]
+id = "TB-122"
+description = "The ~/.aloo home directory resolves via $HOME first, then %USERPROFILE%, treating a set-but-empty value as absent, and falls back to a relative .aloo directory only when neither is usable - never a bare loose file - so id_store/own_next_keys resolve consistently on Linux, macOS and Windows."
+evidence = "docs/PROTOCOL.md 12.5, 12.6.5; src/platform.rs resolve_home_dir, aloo_dir; tests resolve_home_dir_prefers_home_over_userprofile, resolve_home_dir_falls_back_to_userprofile_when_home_is_unset, resolve_home_dir_treats_an_empty_home_as_unset_and_falls_back, resolve_home_dir_treats_an_empty_userprofile_as_unset, resolve_home_dir_is_none_when_neither_is_set, aloo_dir_resolves_under_the_real_process_home_directory"
+
+# ============================================================================
+# US-019 - Send a file to a channel or a user
+# ============================================================================
+[[user_story]]
+id = "US-019"
+title = "Send a file to a channel or a user"
+as_a = "connected user"
+i_want = "to send a local file to the current channel or an open DM, and save one I receive"
+so_that = "I can share something beyond plain text without leaving the terminal"
+
+[[user_story.acceptance_criteria]]
+id = "AC-073"
+description = "Typing /file and pressing Enter in the compose bar opens a centered file browser popup when addressable (joined to the current channel, or a non-offline, non-trust-gated DM room is open); otherwise it does nothing and leaves /file typed in the compose bar."
+evidence = "docs/SPEC.md Functionality #10; tests file_command_opens_the_browser_when_a_channel_is_joined, file_command_does_nothing_when_no_channel_is_joined_and_no_dm_is_open"
+
+[[user_story.acceptance_criteria]]
+id = "AC-074"
+description = "Selecting a file in the browser replaces it with a Send file/Discard confirmation naming the file and destination, Discard focused by default; choosing Discard (or Esc) returns to the browser at the same directory rather than closing the whole flow."
+evidence = "docs/SPEC.md Functionality #10; tests selecting_a_file_in_the_browser_opens_a_send_confirmation_defaulting_to_discard, discard_returns_to_the_browser_at_the_same_directory"
+
+[[user_story.acceptance_criteria]]
+id = "AC-075"
+description = "Confirming Send file reads the file, encrypts it per recipient exactly like a text message (Content::File, reusing SendChannel/SendDirect with no new wire message types), and logs it locally straight away as an outgoing entry."
+evidence = "docs/PROTOCOL.md 7.6; tests sending_a_file_to_a_channel_produces_sendfilechannel_and_logs_it_optimistically, sending_a_file_to_a_dm_peer_produces_sendfiledirect_and_logs_it_optimistically, content_file_envelope_relays_through_route_channel_message_like_any_other_content"
+
+[[user_story.acceptance_criteria]]
+id = "AC-076"
+description = "A received file renders as a paperclip and its filename; pressing Enter on it opens a save-location popup prefilled with ~/.aloo/download/<filename> (reduced to just its final path component), editable, saving to whatever path is currently typed on Enter."
+evidence = "docs/SPEC.md Functionality #10; tests enter_on_a_file_log_entry_opens_the_save_popup_prefilled_with_the_default_path, saving_writes_the_file_to_the_typed_path"
+
+[[user_story.acceptance_criteria]]
+id = "AC-077"
+description = "A file larger than MAX_FILE_BYTES is rejected with an inline error on the confirmation box rather than sent, and the flow stays open so a different file can be picked."
+evidence = "docs/PROTOCOL.md 7.6; test an_oversized_file_shows_an_inline_error_and_is_not_sent"
+
+[[user_story.acceptance_criteria]]
+id = "AC-078"
+description = "A file from a peer with a Pending/Rejected identity review is decrypted but held rather than shown, exactly like text, and revealed once they are Accepted."
+evidence = "docs/PROTOCOL.md 12; test a_file_from_a_trust_gated_sender_is_held_and_revealed_on_accept"
+
+[[user_story.technical_behavior]]
+id = "TB-123"
+description = "Content::File's plaintext is a FilePayload (filename + data) encoded with the same generic proto::encode/decode every other wire type uses, so it round-trips exactly like Content::Text's plaintext."
+evidence = "src/file_transfer.rs FilePayload; src/proto.rs Content; tests file_payload_round_trips_through_proto_encode_decode, content_file_envelope_roundtrips"
+
+[[user_story.technical_behavior]]
+id = "TB-124"
+description = "The default save-path prefill reduces a peer-supplied filename to just its final path component before ever joining it to the download directory, falling back to a fixed default for a name that yields nothing usable, so a crafted filename cannot steer the default save location outside it."
+evidence = "src/file_transfer.rs safe_filename; tests safe_filename_reduces_a_path_to_its_final_component, safe_filename_falls_back_to_a_default_for_an_unusable_name"
+
+[[user_story.technical_behavior]]
+id = "TB-125"
+description = "MAX_FILE_BYTES is a single named constant, sized so a SendChannel carrying one Envelope per member of a generously-sized channel still stays under MAX_FRAME_LEN even at 2048-bit RSA-OAEP's worst-case ciphertext expansion."
+evidence = "docs/PROTOCOL.md 7.6; src/file_transfer.rs MAX_FILE_BYTES; test max_file_bytes_keeps_a_generously_sized_channel_under_the_frame_limit"
+
+# ============================================================================
+# US-020 - Communicate with post-quantum hybrid encryption
+# ============================================================================
+[[user_story]]
+id = "US-020"
+title = "Communicate with post-quantum hybrid encryption"
+as_a = "user who wants a quantum-resistant identity"
+i_want = "a fifth my_key method combining ML-DSA-87+RSA4096 signing, ML-KEM-1024+RSA4096 key-wrap, and AES-256-GCM bulk encryption"
+so_that = "my messages stay confidential and authentic even against a future quantum-capable attacker, with RSA-4096 as a hedge if either PQ primitive turns out to be flawed"
+
+[[user_story.acceptance_criteria]]
+id = "AC-079"
+description = "A pq_hybrid text or file message encrypted by one pq_hybrid client decrypts and both-signatures-verify correctly on another, for both channel and DM delivery."
+evidence = "docs/PROTOCOL.md 13; tests encrypt_then_decrypt_hybrid_round_trips, encrypt_hybrid_for_one_round_trips_via_wire_encoding"
+
+[[user_story.acceptance_criteria]]
+id = "AC-080"
+description = "Tampering with the ciphertext, either signature, or swapping the sender's claimed public bundle for a different one, causes decryption/verification to fail closed (None), never a partial or silently-unverified accept."
+evidence = "docs/PROTOCOL.md 13; tests tampered_ciphertext_is_rejected, tampered_signature_is_rejected, wrong_sender_public_bundle_is_rejected, wrong_recipient_cannot_decrypt"
+
+[[user_story.acceptance_criteria]]
+id = "AC-081"
+description = "A pq_hybrid peer's identity is byte-comparison-pinned in id_store exactly like rsa/password (it is a static, file-loaded identity, not a rotating one), and renders the shield tag after their name."
+evidence = "docs/PROTOCOL.md 13; src/proto.rs KeyMode::label, src/session.rs check_identity; test key_mode_pq_hybrid_participates_in_byte_comparison_pinning_like_rsa"
+
+[[user_story.acceptance_criteria]]
+id = "AC-082"
+description = "A recipient announcing KeyMode::PqHybrid can only be addressed by a sender whose own my_key is also pq_hybrid (the hybrid scheme's signing step needs the sender's own ML-DSA-87/RSA-sign identity, which no other my_key type has) - such a recipient is silently excluded from a non-pq_hybrid sender's channel/DM/file/voice send, the same partial-delivery pattern as any other unreachable recipient. A pq_hybrid sender can still address any non-pq_hybrid recipient normally (RSA-OAEP needs no sender identity)."
+evidence = "docs/PROTOCOL.md 13; src/channel.rs can_address; test a_non_pq_hybrid_sender_cannot_address_a_pq_hybrid_recipient"
+
+[[user_story.acceptance_criteria]]
+id = "AC-083"
+description = "A live voice stream between two pq_hybrid peers round-trips correctly: each chunk decrypts to the original PCM, and the once-per-stream key-setup signature is verified before the first chunk is ever accepted."
+evidence = "docs/PROTOCOL.md 13; tests hybrid_voice_chunk_round_trips, wrap_key_for_stream_and_unwrap_key_for_stream_round_trip, unwrap_key_for_stream_rejects_a_tampered_commitment"
+
+[[user_story.acceptance_criteria]]
+id = "AC-084"
+description = "`aloo --keygen-pq-hybrid <prefix>` writes a loadable <prefix> (private) and <prefix>.pub (public) keybundle, mirroring openssl's my_key/my_key.pub convention for rsa; the connect popup's pq_hybrid my_key type reuses rsa's file_pub/file_priv shape to point at them."
+evidence = "docs/PROTOCOL.md 13; README.md 'Generating PQ-hybrid keys'; tests save_and_load_bundle_files_roundtrip, my_key_type_label_includes_pq_hybrid, focus_order_includes_both_my_key_files_when_pq_hybrid, build_request_succeeds_with_pq_hybrid_files, build_request_rejects_missing_pq_hybrid_files"
+
+[[user_story.technical_behavior]]
+id = "TB-127"
+description = "The per-recipient AES key wrap combines an ML-KEM-1024 shared secret and an independently RSA-OAEP-wrapped random secret via HKDF-SHA256, so recovering the wrapped AES key needs both - a break of ML-KEM-1024 alone, or of RSA-4096 alone, is not sufficient."
+evidence = "docs/PROTOCOL.md 13; src/crypto/pq.rs hkdf_combine, wrap_key_for, unwrap_key; test wrap_key_for_and_unwrap_key_round_trip"
+
+[[user_story.technical_behavior]]
+id = "TB-128"
+description = "A voice chunk's AES-256-GCM nonce is deterministic (big-endian stream_id ++ seq), unique for the life of one stream's freshly-random k_data - never reused across chunks of the same stream, and never needing fresh OS randomness per 100ms chunk."
+evidence = "docs/PROTOCOL.md 13; src/crypto/pq.rs chunk_nonce; test same_plaintext_produces_different_ciphertext_under_different_seq"
+
+[[user_story.technical_behavior]]
+id = "TB-129"
+description = "A voice stream's key-wrap material (HybridStreamKeySetup) signs stream_id++k_data once at record-start; a receiver verifies it once, on the first chunk of a (from, stream_id) pair, and caches k_data for every later chunk rather than re-verifying or re-unwrapping per chunk."
+evidence = "docs/PROTOCOL.md 13; src/crypto/pq.rs wrap_key_for_stream, unwrap_key_for_stream; src/voice_stream.rs spawn_stream_decrypt_worker; test unwrap_key_for_stream_rejects_a_tampered_commitment"
+
+[[user_story.technical_behavior]]
+id = "TB-130"
+description = "A saved PQ-hybrid private keybundle file is restricted to owner-only permissions (0o600) on unix, since it is the one my_key file this app itself ever writes to disk (every other type's key file is produced externally)."
+evidence = "docs/PROTOCOL.md 13; src/crypto/pq.rs save_private_bundle; test save_private_bundle_sets_owner_only_permissions_on_unix"
+
+[[user_story.technical_behavior]]
+id = "TB-131"
+description = "PqPublicBundle/HybridEnvelope are carried opaquely inside the existing public_key_der/Envelope.blocks fields (bincode-encoded) - no wire schema change to UserInfo, Identify, or Envelope itself for this KeyMode."
+evidence = "docs/PROTOCOL.md 13; src/proto.rs Envelope, UserInfo (unchanged shape); src/crypto/pq.rs PqPublicBundle, HybridEnvelope; test encrypt_hybrid_for_one_round_trips_via_wire_encoding"
+
+# ============================================================================
+# US-021 - Connect with pq_hybrid without any manual key preparation
+# ============================================================================
+[[user_story]]
+id = "US-021"
+title = "Connect with pq_hybrid without any manual key preparation"
+as_a = "user connecting with the default pq_hybrid identity"
+i_want = "the connect popup to always have a usable keybundle location, and to remember which one I used per server"
+so_that = "I never have to run a separate command before I can connect, and reconnecting to a server keeps using the same identity"
+
+[[user_story.acceptance_criteria]]
+id = "AC-085"
+description = "A freshly-opened connect popup with no ~/.aloo/.cache yet has pq_hybrid's file_pub/file_priv fields prefilled with a freshly-assigned, not-yet-generated location under ~/.aloo/, so pressing Connect immediately with the default my_key type doesn't fail validation."
+evidence = "docs/PROTOCOL.md 13.9; tests prefill_connect_defaults_assigns_a_fresh_location_when_the_cache_is_empty, fresh_pq_hybrid_paths_in_produces_a_pub_and_priv_pair_under_the_given_directory, random_prefix_is_four_lowercase_alphanumeric_characters"
+
+[[user_story.acceptance_criteria]]
+id = "AC-086"
+description = "Connecting with pq_hybrid when the configured file_pub/file_priv don't yet exist transparently generates a fresh keybundle at those exact paths before loading it, rather than failing to connect."
+evidence = "docs/PROTOCOL.md 13.9; tests ensure_bundle_at_generates_a_bundle_when_missing, resolve_my_keypair_autogenerates_a_missing_pq_hybrid_bundle"
+
+[[user_story.acceptance_criteria]]
+id = "AC-087"
+description = "After a pq_hybrid connect attempt, ~/.aloo/.cache remembers that (host, port)'s file_pub/file_priv; the next time the popup opens, it's prefilled from the most recently used entry (host, port, and file paths all restored)."
+evidence = "docs/PROTOCOL.md 13.9; tests connect_cache_round_trips_through_save_and_load, prefill_connect_defaults_restores_the_most_recent_cache_entry"
+
+[[user_story.technical_behavior]]
+id = "TB-132"
+description = "ConnectCache is a flat host<TAB>port<TAB>file_pub<TAB>file_priv-per-line store at ~/.aloo/.cache, tolerant of a missing file and of malformed lines, mirroring idstore/own_next_keys' load conventions; recording an existing (host,port) pair moves it to the end (most-recently-used) rather than duplicating it."
+evidence = "src/connect.rs ConnectCache; tests connect_cache_record_moves_an_existing_pair_to_most_recent, connect_cache_load_skips_malformed_lines, connect_cache_load_of_a_missing_file_is_empty_not_an_error, connect_cache_record_rejects_fields_containing_the_delimiter"
+
+[[user_story.technical_behavior]]
+id = "TB-133"
+description = "fresh_pq_hybrid_paths_in retries (bounded) if a randomly-assigned prefix's files already exist under the given directory, so a freshly-assigned pq_hybrid location never silently reuses a stray existing identity."
+evidence = "src/connect.rs fresh_pq_hybrid_paths_in; test fresh_pq_hybrid_paths_in_avoids_an_existing_colliding_prefix"
+
+[[user_story.technical_behavior]]
+id = "TB-134"
+description = "crypto::pq::ensure_bundle_at treats either file missing as neither being usable and (re)generates both together, never salvaging a lone surviving half, so a partially-deleted keybundle is never loaded as a mismatched pub/priv pair."
+evidence = "src/crypto/pq.rs ensure_bundle_at; tests ensure_bundle_at_regenerates_both_when_only_one_file_exists, ensure_bundle_at_is_a_no_op_when_both_files_already_exist"

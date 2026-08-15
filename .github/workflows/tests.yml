@@ -1,0 +1,81 @@
+name: Tests
+
+# The migrated suite: ordinary Rust tests, the Gherkin acceptance layer, and
+# the traceability gate that ties both to `requirements/requirements.toml`.
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  test:
+    name: Test suite and traceability
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # cpal's ALSA backend needs the system dev headers to link against.
+      - name: Install ALSA dev headers
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The traceability gate is pure source analysis and takes well under a
+      # second, so run it first: a broken requirement link should fail in
+      # seconds rather than after the whole suite.
+      - name: Traceability gate
+        run: cargo trace
+
+      - name: Acceptance layer (Gherkin)
+        run: cargo bdd
+
+      # Captured so the report can show real PASS/FAIL per requirement rather
+      # than "NOT RUN". `--no-fail-fast` keeps every target running, so one
+      # failing target still yields a complete picture.
+      #
+      # The default output format is required: it prints `test <name> ... ok`,
+      # which is what the report matches against requirement links. `--format
+      # terse` prints one character per test and would leave every requirement
+      # reporting NOT RUN.
+      - name: Full test suite
+        run: |
+          set -o pipefail
+          cargo test --no-fail-fast 2>&1 | tee test-output.txt
+
+      # The 12 #[ignore]d tests are real RSA-4096 keygen, excluded from the run
+      # above so a normal `cargo test` stays quick. With dependencies built at
+      # opt-level 3 they take about a minute, so CI blocks on them - six
+      # technical behaviours are covered by nothing else.
+      - name: Slow key-generation tests
+        run: cargo slow > ignored-output.txt 2>&1 || (cat ignored-output.txt; exit 1)
+
+      - name: Regenerate reports with results
+        if: always()
+        env:
+          ALOO_TEST_RESULTS: test-output.txt:ignored-output.txt:target/traceability/cucumber-results.txt
+        run: cargo trace -- --nocapture
+
+      - name: Upload traceability reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: traceability-reports
+          path: |
+            target/traceability/report.html
+            target/traceability/traceability.json
+            target/traceability/traceability-matrix.md
+
+      - name: Summarise
+        if: always()
+        run: |
+          {
+            echo "## Traceability"
+            echo
+            head -n 12 target/traceability/traceability-matrix.md
+          } >> "$GITHUB_STEP_SUMMARY"

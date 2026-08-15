@@ -1,0 +1,14 @@
+# Shortcuts for the test layers.
+[alias]
+# Every Gherkin scenario under `features/`. Reports land in target/traceability/.
+bdd = "test --test cucumber"
+
+# Requirement traceability gate + report generation.
+trace = "test --test traceability"
+
+# The RSA-4096 (and, for hybrid_crypto_test, ML-DSA-87/ML-KEM-1024 too)
+# key-generation tests, which carry #[ignore] so a plain `cargo test` stays
+# quick. Only the targets that have any are named: the cucumber target
+# supplies its own runner and rejects libtest's `--ignored` flag, so
+# `cargo test -- --ignored` fails on it.
+slow = ["test", "--test", "crypto_test", "--test", "rekey_test", "--test", "hybrid_crypto_test", "--test", "connect_test", "--", "--ignored"]
