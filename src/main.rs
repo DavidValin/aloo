@@ -8,12 +8,15 @@ use std::path::PathBuf;
 use clap::Parser;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::event::{KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
+use global_hotkey::hotkey::HotKey;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
 use aloo::connect;
 use aloo::crypto;
+use aloo::global_ptt;
 use aloo::server::{self, AuthConfig};
+use aloo::settings;
 
 type BoxError = Box<dyn std::error::Error>;
 
@@ -50,17 +53,131 @@ struct Cli {
     keygen_pq_hybrid: Option<String>,
 }
 
-#[tokio::main]
-async fn main() -> Result<(), BoxError> {
+/// Not `#[tokio::main]`: on macOS, delivering the global push-to-talk
+/// shortcut (`crate::global_ptt`) needs the process's *real* OS main
+/// thread free to pump a `CFRunLoop` - something `#[tokio::main]` would
+/// immediately claim for its own `block_on`. Every other path
+/// (`--server`, `--keygen-pq-hybrid`, and the client on Windows/Linux)
+/// builds its own runtime and behaves exactly as it did before; see
+/// `run_client_entry`/`run_client_macos` for the one case that differs.
+fn main() -> Result<(), BoxError> {
     let cli = Cli::parse();
     if let Some(prefix) = &cli.keygen_pq_hybrid {
         return run_keygen_pq_hybrid(prefix);
     }
     if cli.server {
-        run_server(cli).await
-    } else {
-        run_client(cli).await
+        return build_runtime()?.block_on(run_server(cli));
     }
+    run_client_entry(cli)
+}
+
+/// A full multi-thread runtime with all drivers enabled - the same flavor
+/// `#[tokio::main]` builds by default (this crate's `tokio` dependency
+/// already has the `full` feature on), just constructed explicitly so
+/// `main` can choose *which* thread runs it.
+fn build_runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread().enable_all().build()
+}
+
+/// Loads `~/.aloo/settings` (creating it with defaults on first run - see
+/// `settings::Settings::load_or_create`); a read/parse failure other than
+/// "missing" falls back to in-memory defaults rather than refusing to
+/// start the app over an optional preferences file.
+fn load_settings() -> settings::Settings {
+    match settings::Settings::load_or_create(&settings::default_path()) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("aloo: could not read/create ~/.aloo/settings ({e}); using defaults");
+            settings::Settings::default()
+        }
+    }
+}
+
+/// The hotkey to register for global push-to-talk, or `None` if it
+/// shouldn't be registered at all this run - either the user turned it off
+/// (`global_ptt_enabled = false`) or (Linux only) this session is running
+/// under Wayland, which `global_hotkey` has no backend for at all
+/// (`global_ptt::is_wayland`). Printed once at startup in the Wayland
+/// case per the user's own choice: warn, don't retry, don't crash - Space
+/// still works normally while the app is focused either way.
+fn hotkey_to_register(settings: &settings::Settings) -> Option<HotKey> {
+    if !settings.global_ptt_enabled {
+        return None;
+    }
+    if global_ptt::is_wayland() {
+        eprintln!(
+            "aloo: global push-to-talk ({}) needs X11 and isn't available under Wayland - Space still works while aloo is focused",
+            settings.global_ptt_shortcut
+        );
+        return None;
+    }
+    Some(global_ptt::resolve_hotkey(&settings.global_ptt_shortcut))
+}
+
+/// Client entry point, platform-dispatching only where it has to
+/// (`run_client_macos` - see its doc comment). Everywhere else this is
+/// exactly what `#[tokio::main]` used to do: build a runtime, block on
+/// `run_client`.
+fn run_client_entry(cli: Cli) -> Result<(), BoxError> {
+    let settings = load_settings();
+    let hotkey = hotkey_to_register(&settings);
+
+    #[cfg(target_os = "macos")]
+    return run_client_macos(cli, hotkey);
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let hotkey_rx = hotkey.and_then(global_ptt::spawn);
+        build_runtime()?.block_on(run_client(cli, hotkey_rx))
+    }
+}
+
+/// macOS-only: Carbon's `RegisterEventHotKey` (what `global_ptt` uses
+/// under the hood) only delivers events via the process's real main
+/// thread's `CFRunLoop` - see `global_ptt`'s module docs. So on this OS
+/// alone, the roles are swapped from every other platform: the actual
+/// `main()` thread stays free to register the hotkey and pump that run
+/// loop, while the entire client (`run_client`, under its own `tokio`
+/// runtime) moves to a spawned thread instead. `run_client` itself is
+/// identical either way - it has no idea which thread produced its
+/// `hotkey_rx`.
+#[cfg(target_os = "macos")]
+fn run_client_macos(cli: Cli, hotkey: Option<HotKey>) -> Result<(), BoxError> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let (manager, hotkey_rx) = match hotkey.and_then(global_ptt::register_on_current_thread) {
+        Some((manager, rx)) => (Some(manager), Some(rx)),
+        None => (None, None),
+    };
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_for_client = shutdown.clone();
+    let handle = std::thread::spawn(move || -> Result<(), BoxError> {
+        // The closure boundary guarantees `shutdown` is set on every exit
+        // path (including `build_runtime()` itself failing), so the main
+        // thread's pump loop below can never be left waiting forever.
+        let result = (|| -> Result<(), BoxError> {
+            let rt = build_runtime()?;
+            rt.block_on(run_client(cli, hotkey_rx))
+        })();
+        shutdown_for_client.store(true, Ordering::Relaxed);
+        result
+    });
+
+    // Harmless to keep pumping even if `manager` is `None` (disabled, or
+    // registration failed above) - there's simply nothing registered for
+    // it to deliver, and this is still what waits for the client thread.
+    global_ptt::pump_main_thread(&shutdown);
+
+    let result = match handle.join() {
+        Ok(result) => result,
+        Err(_) => Err("aloo: client thread panicked".into()),
+    };
+    // Keeps the hotkey registered for the whole run above - `manager`'s
+    // `Drop` unregisters it, so it must outlive the pump loop.
+    drop(manager);
+    result
 }
 
 // ---------------------------------------------------------------------
@@ -109,9 +226,12 @@ async fn run_server(cli: Cli) -> Result<(), BoxError> {
 // Client mode
 // ---------------------------------------------------------------------
 
-async fn run_client(cli: Cli) -> Result<(), BoxError> {
+async fn run_client(
+    cli: Cli,
+    hotkey_rx: Option<tokio::sync::mpsc::UnboundedReceiver<global_ptt::GlobalPttEvent>>,
+) -> Result<(), BoxError> {
     let (mut terminal, keyboard_release_reporting) = setup_terminal()?;
-    let result = connect::run_client_inner(&mut terminal, cli.port, keyboard_release_reporting).await;
+    let result = connect::run_client_inner(&mut terminal, cli.port, keyboard_release_reporting, hotkey_rx).await;
     restore_terminal(&mut terminal)?;
     result
 }

@@ -152,6 +152,26 @@ fn space_release_targets_active_private_room_instead_of_channel() {
     assert_eq!(stop, Some(UiAction::VoiceRecordStop));
 }
 
+/// @requirement AC-089
+#[test]
+fn global_record_start_targets_the_active_private_room() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.focus = Focus::Sidebar;
+    press(&mut state, KeyCode::Enter); // open DM with bob
+
+    let start = state.global_record_start();
+    match start {
+        Some(UiAction::VoiceRecordStart(VoiceTarget::Direct { to, recipient_key_mode, recipient_pubkey_der })) => {
+            assert_eq!(to, UserId(2));
+            assert_eq!(recipient_key_mode, KeyMode::Rsa);
+            assert_eq!(recipient_pubkey_der, user(2, "bob").public_key_der);
+        }
+        other => panic!("expected VoiceRecordStart(Direct), got {other:?}"),
+    }
+    let stop = state.global_record_stop();
+    assert_eq!(stop, Some(UiAction::VoiceRecordStop));
+}
+
 /// @requirement AC-054
 #[test]
 fn space_press_with_an_offline_dm_peer_is_ignored_and_does_not_start_recording() {

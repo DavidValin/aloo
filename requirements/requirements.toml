@@ -1338,3 +1338,53 @@ evidence = "src/connect.rs fresh_pq_hybrid_paths_in; test fresh_pq_hybrid_paths_
 id = "TB-134"
 description = "crypto::pq::ensure_bundle_at treats either file missing as neither being usable and (re)generates both together, never salvaging a lone surviving half, so a partially-deleted keybundle is never loaded as a mismatched pub/priv pair."
 evidence = "src/crypto/pq.rs ensure_bundle_at; tests ensure_bundle_at_regenerates_both_when_only_one_file_exists, ensure_bundle_at_is_a_no_op_when_both_files_already_exist"
+
+# ============================================================================
+# US-022 - Send a voice message from anywhere
+# ============================================================================
+[[user_story]]
+id = "US-022"
+title = "Send a voice message from anywhere"
+as_a = "connected user"
+i_want = "a systemwide shortcut that streams my voice to whatever I was last looking at in aloo, even while some other window is focused"
+so_that = "I don't have to switch back to the terminal just to talk"
+
+[[user_story.acceptance_criteria]]
+id = "AC-088"
+description = "On first run, ~/.aloo/settings doesn't exist yet - aloo creates it immediately with the global push-to-talk shortcut enabled and defaulted to Ctrl+Alt+P; later runs load exactly what's on disk, including a shortcut or enabled/disabled state the user edited."
+evidence = "docs/SPEC.md Functionality #4; tests default_path_resolves_under_the_aloo_dir, missing_file_is_created_with_documented_defaults, round_trips_through_save_and_load"
+
+[[user_story.acceptance_criteria]]
+id = "AC-089"
+description = "Holding the global shortcut starts streaming a voice message to whatever is currently active - the selected channel, or an open private room - the same as holding Space; releasing it stops. Works regardless of this app's own terminal focus."
+evidence = "docs/SPEC.md Functionality #4; tests global_record_start_and_stop_streams_to_the_active_channel, global_record_start_targets_the_active_private_room; scenarios in features/voice/global_push_to_talk.feature"
+
+[[user_story.acceptance_criteria]]
+id = "AC-090"
+description = "Pressing the global shortcut with nowhere to address a stream to starts no recording, mirroring AC-034's Space behavior."
+evidence = "docs/SPEC.md Functionality #4 'Failure handling'; test global_record_start_without_a_joined_channel_or_active_dm_does_nothing; scenario in features/voice/global_push_to_talk.feature"
+
+[[user_story.acceptance_criteria]]
+id = "AC-091"
+description = "Space and the global shortcut can never stop a recording the other one started, and a second press of the global shortcut while already recording is a no-op - each trigger only ever ends the recording it itself began."
+evidence = "docs/SPEC.md Functionality #4; tests global_record_start_is_a_no_op_while_already_recording, global_record_stop_does_nothing_to_a_space_started_recording, space_release_does_nothing_to_a_global_started_recording; scenario in features/voice/global_push_to_talk.feature"
+
+[[user_story.acceptance_criteria]]
+id = "AC-092"
+description = "A recording started by the global shortcut is never auto-stopped by the idle-silence timeout that exists only to guess when Space (which many terminals report no real release for) has been let go - it only ever ends on the shortcut's own release."
+evidence = "docs/SPEC.md Functionality #4; test tick_recording_timeout_never_touches_a_global_started_recording"
+
+[[user_story.technical_behavior]]
+id = "TB-135"
+description = "Settings::load_or_create tolerates unknown keys, malformed lines, and an empty value the same way idstore/own_next_keys tolerate a corrupted store - by skipping the bad line and keeping the default for that field, rather than failing the whole load."
+evidence = "src/settings.rs; tests load_skips_unparseable_or_unknown_lines_and_keeps_the_rest, an_empty_shortcut_value_is_ignored_in_favor_of_the_default"
+
+[[user_story.technical_behavior]]
+id = "TB-136"
+description = "global_ptt::resolve_hotkey parses the configured shortcut string as a global_hotkey combo, falling back to the compiled-in default (Ctrl+Alt+P) rather than failing to start when the configured value doesn't parse."
+evidence = "src/global_ptt.rs resolve_hotkey; tests resolve_hotkey_parses_a_valid_configured_shortcut, resolve_hotkey_falls_back_to_the_default_on_an_invalid_shortcut, resolve_hotkey_of_the_documented_default_matches_the_default_directly"
+
+[[user_story.technical_behavior]]
+id = "TB-137"
+description = "global_ptt::is_wayland_session flags a Wayland session from either XDG_SESSION_TYPE=wayland or a set WAYLAND_DISPLAY (case-insensitively), and only those - so aloo can warn once and skip registering the global shortcut instead of attempting (and silently failing) X11-only registration under Wayland."
+evidence = "src/global_ptt.rs is_wayland_session; tests is_wayland_session_detects_session_type_wayland, is_wayland_session_detects_a_set_wayland_display_even_without_session_type, is_wayland_session_false_for_a_plain_x11_session"

@@ -9,7 +9,7 @@ Just you, your terminal, and the people you're talking to.
 ## Features
 
 - 💬 **Text chat** — type and hit `Enter`, just like any chat app.
-- 🎙️ **Walkie-talkie voice messages** — hold `Space` to talk, let go to send. Just like a real walkie-talkie, it auto-plays live on the other end as you're talking — no play button, nothing to tap, they just hear you. You can also replay it later: scroll to it in the log and press `Enter` to hear it again.
+- 🎙️ **Walkie-talkie voice messages** — hold `Space` to talk, let go to send. Just like a real walkie-talkie, it auto-plays live on the other end as you're talking — no play button, nothing to tap, they just hear you. You can also replay it later: scroll to it in the log and press `Enter` to hear it again. `Ctrl+Alt+P` does the same thing globally, even while aloo isn't focused.
 - 📎 **File transfer** — send files straight from the app with a built-in file browser, no external tools needed. Capped at 1 MiB per file — it's built for quick attachments, not large files.
 - 📢 **Public channels** — join the channels the server advertises, shown as tabs across the top.
 - 🔒 **Private channels** — create or join a channel that isn't advertised to anyone; you just need to know its name.
@@ -22,7 +22,7 @@ Just you, your terminal, and the people you're talking to.
 
 ### 1. Installation
 
-* Easy way: [Download](https://www.github.com/DavidValin/aloo/releases)
+* Easy way: [Download](https://www.github.com/aloo/releases)
 * From git source code: `cargo build --release` (will be built at `target/release/aloo`)
 * From crates.io: `cargo install aloo`
 
@@ -57,6 +57,7 @@ Nicknames are case-sensitive and must be free — if someone else is already con
 - **Tab** moves you between the sidebar, the message log, and the compose bar.
 - Type a message and press **Enter** to send it to the current channel.
 - Press **Space** and hold it to record and send a voice message live — let go to stop.
+- Press **Ctrl+Alt+P** to do the same thing from anywhere — even if aloo isn't the focused window. Enabled by default; edit `~/.aloo/settings` (`global_ptt_shortcut`, `global_ptt_enabled`) to change the combo or turn it off. Needs X11 on Linux — not available under Wayland.
 - Type `/file` and press **Enter** to send a file.
 - Pick someone in the sidebar and press **Enter** to open a DM with them.
 - Press `]` / `[` to switch between channel tabs, `Ctrl+J` to join or create a private channel.

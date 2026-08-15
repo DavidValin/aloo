@@ -55,6 +55,7 @@ pub async fn run_client_inner(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     port: u16,
     keyboard_release_reporting: bool,
+    hotkey_rx: Option<tokio::sync::mpsc::UnboundedReceiver<crate::global_ptt::GlobalPttEvent>>,
 ) -> Result<(), BoxError> {
     let mut popup = ConnectPopupState::new();
     popup.port = port.to_string();
@@ -100,6 +101,7 @@ pub async fn run_client_inner(
                     keyboard_release_reporting,
                     id_store,
                     own_next_keys,
+                    hotkey_rx,
                 )
                 .await;
             }

@@ -33,6 +33,30 @@ async fn release_space(w: &mut AlooWorld) {
     }
 }
 
+// Global (works-anywhere, see `aloo::global_ptt`) push-to-talk. Deliberately
+// exercises `UiState::global_record_start`/`global_record_stop` directly
+// rather than `handle_key` - unlike Space, this trigger has no notion of
+// terminal focus at all (it fires from the OS while some other window is
+// focused), so there's no key event to synthesize.
+
+#[when("I hold Ctrl+Alt+P")]
+async fn hold_global_shortcut(w: &mut AlooWorld) {
+    let action = w.ui_mut().global_record_start();
+    w.action_was_none = action.is_none();
+    if action.is_some() {
+        w.last_action = action;
+    }
+}
+
+#[when("I release Ctrl+Alt+P")]
+async fn release_global_shortcut(w: &mut AlooWorld) {
+    let action = w.ui_mut().global_record_stop();
+    w.action_was_none = action.is_none();
+    if action.is_some() {
+        w.last_action = action;
+    }
+}
+
 #[given(expr = "{word} starts streaming a voice message into the channel")]
 async fn peer_starts_stream(w: &mut AlooWorld, name: String) {
     let id = UserId(id_for(&name));

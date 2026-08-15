@@ -21,12 +21,19 @@ readme = "README.md"
 # bytes, never shared trait impls. `hkdf` stays on the *old* generation (built on
 # the existing sha2 0.10/digest 0.10), so the HKDF combiner step has no version
 # friction with the rest of this file.
+[target.'cfg(target_os = "windows")'.dependencies]
+# Only for the global push-to-talk shortcut's message pump - see
+# `src/global_ptt.rs`. Same version `global-hotkey` itself pins, so cargo
+# resolves one copy rather than two.
+windows-sys = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation"] }
+
 [dependencies]
 aes-gcm = "0.11"
 bincode = { version = "2", features = ["serde"] }
 clap = { version = "4.6.6", features = ["derive"] }
 cpal = "0.18.1"
 crossterm = "0.29.0"
+global-hotkey = "0.8"
 hkdf = "0.12"
 hmac = "0.12"
 ml-dsa = "0.1"
@@ -74,6 +81,14 @@ path = "test/connect_test.rs"
 [[test]]
 name = "idstore_test"
 path = "test/idstore_test.rs"
+
+[[test]]
+name = "settings_test"
+path = "test/settings_test.rs"
+
+[[test]]
+name = "global_ptt_test"
+path = "test/global_ptt_test.rs"
 
 [[test]]
 name = "own_next_keys_test"

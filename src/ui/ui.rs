@@ -98,6 +98,7 @@ const HELP_BODY: &[&str] = &[
     "",
     "Voice messages",
     "  Space      hold to record & send live (not while composing); release to stop",
+    "  Ctrl+Alt+P same, from anywhere - edit/disable in ~/.aloo/settings",
     "  Enter      replay a voice message (messages focused)",
     "",
     "File transfer",
@@ -304,6 +305,21 @@ pub enum UiAction {
     SendFileDirect { to: UserId, filename: String, data: Vec<u8>, recipient_key_mode: KeyMode, recipient_pubkey_der: Vec<u8> },
 }
 
+/// Which trigger started the current recording - `handle_key`'s Space
+/// branch and `global_record_start`/`global_record_stop` (the global
+/// Ctrl+Alt+P shortcut, see `crate::global_ptt`) both drive the same
+/// `recording`/`VoiceRecordStart`/`VoiceRecordStop` machinery, but need to
+/// stay distinguishable: `tick_recording_timeout`'s idle-silence guess
+/// must never apply to a `Global` recording (there's no repeat-keypress
+/// heartbeat for a held OS hotkey to go quiet - it only ever ends on a
+/// real `Released` event), and each trigger should only ever be able to
+/// stop a recording it itself started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecordSource {
+    Space,
+    Global,
+}
+
 pub struct UiState {
     pub own_id: Option<UserId>,
     pub own_name: String,
@@ -336,6 +352,9 @@ pub struct UiState {
     /// Mode::FileSave` - see `open_file_save_popup`.
     pub file_save: Option<FileSaveState>,
     pub recording: bool,
+    /// Which trigger started the current recording - `None` whenever
+    /// `recording` is `false`. See `RecordSource`.
+    pub(crate) recording_source: Option<RecordSource>,
     /// Timestamp of the most recent Space press/repeat while recording;
     /// `tick_recording_timeout` watches this to detect release on
     /// terminals that never send `KeyEventKind::Release`.
@@ -448,6 +467,7 @@ impl UiState {
             file_send: None,
             file_save: None,
             recording: false,
+            recording_source: None,
             recording_last_seen: None,
             keyboard_release_reporting: false,
             audio_error: None,
@@ -614,6 +634,7 @@ impl UiState {
     /// instead of waiting for the user to release Space, and surfaces why.
     pub fn recording_failed(&mut self, reason: String) {
         self.recording = false;
+        self.recording_source = None;
         self.recording_last_seen = None;
         self.audio_error = Some(reason);
     }
@@ -780,6 +801,7 @@ impl UiState {
                         match self.current_voice_target() {
                             Some(target) => {
                                 self.recording = true;
+                                self.recording_source = Some(RecordSource::Space);
                                 self.audio_error = None;
                                 Some(UiAction::VoiceRecordStart(target))
                             }
@@ -790,8 +812,12 @@ impl UiState {
                         }
                     }
                 }
-                KeyEventKind::Release if self.recording => {
+                // Only ends a recording Space itself started - a
+                // Global-triggered one (see `global_record_stop`) only
+                // ever ends on its own release, never on Space.
+                KeyEventKind::Release if self.recording && self.recording_source == Some(RecordSource::Space) => {
                     self.recording = false;
+                    self.recording_source = None;
                     self.recording_last_seen = None;
                     Some(UiAction::VoiceRecordStop)
                 }
@@ -1044,6 +1070,48 @@ impl UiState {
         }
     }
 
+    /// Starts a recording from the global (works-anywhere) Ctrl+Alt+P
+    /// shortcut - `session::run_connected_session`'s `hotkey_rx` select arm
+    /// calls this on every `GlobalPttEvent::Pressed`. Deliberately mirrors
+    /// `handle_key`'s Space branch (same target resolution, same "nowhere
+    /// to send it" bail-out as AC-034) rather than sharing code with it:
+    /// the two differ in exactly one place (`RecordSource` tagging) and
+    /// Space's branch also has to interleave with focus/mode handling that
+    /// has no meaning for a shortcut that fires while this app isn't even
+    /// the focused window. A no-op while a recording (from either source)
+    /// is already in progress, so a second press can't stomp on it.
+    pub fn global_record_start(&mut self) -> Option<UiAction> {
+        if self.recording {
+            return None;
+        }
+        match self.current_voice_target() {
+            Some(target) => {
+                self.recording = true;
+                self.recording_source = Some(RecordSource::Global);
+                self.audio_error = None;
+                Some(UiAction::VoiceRecordStart(target))
+            }
+            None => {
+                self.audio_error = Some("not joined to a channel yet".to_string());
+                None
+            }
+        }
+    }
+
+    /// Stops a recording the global shortcut itself started - a no-op if
+    /// nothing is recording, or if the current recording was started by
+    /// Space instead (that one only ever ends on Space's own release; see
+    /// `handle_key`).
+    pub fn global_record_stop(&mut self) -> Option<UiAction> {
+        if !self.recording || self.recording_source != Some(RecordSource::Global) {
+            return None;
+        }
+        self.recording = false;
+        self.recording_source = None;
+        self.recording_last_seen = None;
+        Some(UiAction::VoiceRecordStop)
+    }
+
     fn current_log(&self) -> &[LogEntry] {
         if let Some(peer_id) = self.active_private_room {
             self.private_rooms.get(&peer_id).map(|r| r.log.as_slice()).unwrap_or(&[])
@@ -1059,8 +1127,16 @@ impl UiState {
     /// `Release` event is guaranteed, so this idle guess is never needed
     /// and must never fire - the recording keeps going through any pause
     /// or silence and only ends when Space is actually let go.
+    ///
+    /// Also a no-op for a `Global`-sourced recording (`RecordSource`),
+    /// unconditionally - there's no repeat-keypress heartbeat for a held
+    /// OS-level hotkey to go quiet, so `recording_last_seen` is never
+    /// refreshed for one, and every platform backend behind the global
+    /// shortcut delivers a real release event, so this idle guess is both
+    /// meaningless and unsafe to apply there (it would auto-stop the
+    /// recording ~`RECORD_HOLD_TIMEOUT` after it started, every time).
     pub fn tick_recording_timeout(&mut self, now: Instant) -> Option<UiAction> {
-        if !self.recording || self.keyboard_release_reporting {
+        if !self.recording || self.keyboard_release_reporting || self.recording_source != Some(RecordSource::Space) {
             return None;
         }
         let last = self.recording_last_seen?;
@@ -1068,6 +1144,7 @@ impl UiState {
             return None;
         }
         self.recording = false;
+        self.recording_source = None;
         self.recording_last_seen = None;
         Some(UiAction::VoiceRecordStop)
     }

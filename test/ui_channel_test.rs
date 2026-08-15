@@ -174,6 +174,28 @@ fn space_press_and_release_starts_and_stops_recording_for_channel() {
     assert!(!state.recording);
 }
 
+/// @requirement AC-089
+#[test]
+fn global_record_start_and_stop_streams_to_the_active_channel() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    // Deliberately not touching `state.focus` - the global shortcut fires
+    // from the OS regardless of what this app's own internal focus is,
+    // unlike Space which only matters while the terminal itself has it.
+    let start = state.global_record_start();
+    match start {
+        Some(UiAction::VoiceRecordStart(VoiceTarget::Channel { channel, recipients })) => {
+            assert_eq!(channel, "general");
+            assert_eq!(recipients, vec![(UserId(2), KeyMode::Rsa, user(2, "bob").public_key_der)]);
+        }
+        other => panic!("expected VoiceRecordStart(Channel), got {other:?}"),
+    }
+    assert!(state.recording);
+
+    let stop = state.global_record_stop();
+    assert_eq!(stop, Some(UiAction::VoiceRecordStop));
+    assert!(!state.recording);
+}
+
 // ---------------------------------------------------------------------
 // [ / ] dwell-to-join
 // ---------------------------------------------------------------------

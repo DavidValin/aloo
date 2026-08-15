@@ -192,6 +192,7 @@ pub(crate) async fn run_connected_session(
     keyboard_release_reporting: bool,
     id_store: idstore::IdStore,
     own_next_keys: Option<own_next_keys::OwnNextKeys>,
+    mut hotkey_rx: Option<tokio::sync::mpsc::UnboundedReceiver<crate::global_ptt::GlobalPttEvent>>,
 ) -> Result<(), BoxError> {
     let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
     std::thread::spawn(move || loop {
@@ -371,6 +372,39 @@ pub(crate) async fn run_connected_session(
             err = audio_err_rx.recv() => {
                 let Some(err) = err else { break };
                 ui_state.playback_failed(err);
+            }
+            // `hotkey_rx` being `None` (the feature disabled, unsupported
+            // on this platform, or registration failed at startup - see
+            // `crate::global_ptt`) parks this branch forever via
+            // `pending()`. Unlike `input_rx`/`net_rx`, the sender side
+            // going away here (the background thread that owns the OS
+            // hotkey manager dying) is *not* fatal to the session - it
+            // just means this one optional feature stops, so instead of
+            // `break`ing, this arm sets `hotkey_rx` to `None` itself so
+            // the branch parks forever from then on.
+            hotkey_ev = async {
+                match hotkey_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                let Some(hotkey_ev) = hotkey_ev else {
+                    hotkey_rx = None;
+                    continue;
+                };
+                match hotkey_ev {
+                    crate::global_ptt::GlobalPttEvent::Pressed => {
+                        if let Some(action @ UiAction::VoiceRecordStart(_)) = ui_state.global_record_start() {
+                            voice_stream::play_end_chime(&mut session);
+                            handle_ui_action(action, &mut wr, &mut ui_state, &mut session).await?;
+                        }
+                    }
+                    crate::global_ptt::GlobalPttEvent::Released => {
+                        if let Some(action) = ui_state.global_record_stop() {
+                            handle_ui_action(action, &mut wr, &mut ui_state, &mut session).await?;
+                        }
+                    }
+                }
             }
             _ = ticker.tick() => {
                 tick_count = tick_count.wrapping_add(1);

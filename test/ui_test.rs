@@ -392,6 +392,67 @@ fn space_press_without_a_joined_channel_or_active_dm_does_not_start_recording_an
     assert_eq!(state.audio_error.as_deref(), Some("not joined to a channel yet"));
 }
 
+/// @requirement AC-090
+#[test]
+fn global_record_start_without_a_joined_channel_or_active_dm_does_nothing() {
+    let mut state = UiState::new("me".into()); // no channels joined, no active DM
+    let action = state.global_record_start();
+    assert_eq!(action, None, "there's nowhere to address a stream to, so no recording should start");
+    assert!(!state.recording);
+    assert_eq!(state.audio_error.as_deref(), Some("not joined to a channel yet"));
+}
+
+/// @requirement AC-091
+#[test]
+fn global_record_start_is_a_no_op_while_already_recording() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    assert!(state.global_record_start().is_some());
+    assert!(state.recording);
+    assert_eq!(state.global_record_start(), None, "a second press must not start a second stream");
+}
+
+/// @requirement AC-091
+#[test]
+fn global_record_stop_does_nothing_to_a_space_started_recording() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.focus = Focus::Messages;
+    state.handle_key(KeyCode::Char(' '), KeyModifiers::NONE, KeyEventKind::Press);
+    assert!(state.recording);
+
+    assert_eq!(state.global_record_stop(), None, "the global shortcut must only ever stop a recording it itself started");
+    assert!(state.recording, "a Space-started recording must keep going");
+}
+
+/// @requirement AC-091
+#[test]
+fn space_release_does_nothing_to_a_global_started_recording() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.focus = Focus::Messages;
+    assert!(state.global_record_start().is_some());
+    assert!(state.recording);
+
+    let action = state.handle_key(KeyCode::Char(' '), KeyModifiers::NONE, KeyEventKind::Release);
+    assert_eq!(action, None, "Space letting go must not stop a recording it never started");
+    assert!(state.recording, "a globally-started recording must keep going");
+}
+
+/// @requirement AC-092
+#[test]
+fn tick_recording_timeout_never_touches_a_global_started_recording() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    assert!(state.global_record_start().is_some());
+    assert!(state.recording);
+
+    // There's no repeat-keypress heartbeat for a held OS-level hotkey, so
+    // `recording_last_seen` is never refreshed for a Global recording - if
+    // the idle-silence guess applied here it would auto-stop this almost
+    // immediately. It must not: only a real `Released` event
+    // (`global_record_stop`) may end it.
+    let far_future = Instant::now() + RECORD_HOLD_TIMEOUT * 100;
+    assert_eq!(state.tick_recording_timeout(far_future), None);
+    assert!(state.recording, "a global recording must never be auto-stopped by the idle-silence guess");
+}
+
 /// @requirement TB-043
 #[test]
 fn recording_failed_clears_the_misleading_recording_indicator_and_shows_why() {
