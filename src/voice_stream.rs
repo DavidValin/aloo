@@ -147,18 +147,25 @@ fn build_chunk_recipients(target: &StreamRecipients, stream_id: u64, seq: u32, p
             }
             out
         }
-        StreamRecipients::Direct { to, key } => match key {
-            DirectStreamKey::Rsa(k) => {
-                crypto::encrypt_chunked(k, pcm).ok().map(|b| vec![(*to, b)]).unwrap_or_default()
-            }
-            DirectStreamKey::Pq(pq) => match pq.per_recipient.first() {
-                Some((_, setup)) => {
-                    let blob = crypto::pq::encrypt_hybrid_voice_chunk(setup, &pq.k_data, stream_id, seq, pcm);
-                    vec![(*to, vec![blob])]
-                }
-                None => Vec::new(),
-            },
-        },
+        StreamRecipients::Direct { to, key } => {
+            encrypt_direct_chunk(key, stream_id, seq, pcm).map(|blocks| vec![(*to, blocks)]).unwrap_or_default()
+        }
+    }
+}
+
+/// One recipient's worth of `build_chunk_recipients`' `Direct` arm, pulled
+/// out so `file_stream`'s sending worker can reuse the exact same RSA/PQ
+/// dispatch without duplicating it - a file transfer is always a single
+/// `DirectStreamKey` recipient (`docs/PROTOCOL.md`'s file transfer
+/// section), same shape as a DM voice stream.
+pub(crate) fn encrypt_direct_chunk(key: &DirectStreamKey, stream_id: u64, seq: u32, data: &[u8]) -> Option<Vec<Vec<u8>>> {
+    match key {
+        DirectStreamKey::Rsa(k) => crypto::encrypt_chunked(k, data).ok(),
+        DirectStreamKey::Pq(pq) => {
+            let (_, setup) = pq.per_recipient.first()?;
+            let blob = crypto::pq::encrypt_hybrid_voice_chunk(setup, &pq.k_data, stream_id, seq, data);
+            Some(vec![blob])
+        }
     }
 }
 
@@ -231,6 +238,51 @@ pub(crate) fn spawn_record_stream_worker(
     });
 }
 
+/// Decrypts successive chunks of one incoming stream/transfer, keyed once
+/// at start (`resolve_incoming_key`) - shared by voice's
+/// `spawn_stream_decrypt_worker` and `file_stream`'s receive worker so the
+/// RSA-candidates-retry / PQ-`k_data`-cache-from-first-chunk logic isn't
+/// duplicated between them.
+pub(crate) struct ChunkDecryptor {
+    key: IncomingStreamKey,
+    // `PqHybrid` only: the stream's `k_data`, recovered and
+    // signature-verified from the *first* chunk's `HybridStreamKeySetup`
+    // (`crypto::pq::unwrap_key_for_stream`) and cached here - every later
+    // chunk only pays for cheap AES-256-GCM, never re-verifying or
+    // re-unwrapping (`HybridStreamKeySetup`'s doc explains why the wire
+    // still repeats it every chunk regardless).
+    pq_k_data: Option<[u8; 32]>,
+}
+
+impl ChunkDecryptor {
+    pub(crate) fn new(key: IncomingStreamKey) -> Self {
+        Self { key, pq_k_data: None }
+    }
+
+    /// Decrypts one chunk's `blocks`, `None` on any failure (wrong/stale
+    /// key, corrupted chunk, bad AEAD tag, ...).
+    pub(crate) fn decrypt(&mut self, stream_id: u64, seq: u32, blocks: &[Vec<u8>]) -> Option<Vec<u8>> {
+        match &self.key {
+            // Tries each candidate key in turn (current, retained,
+            // bootstrap - see `rekey::OwnKeys::candidate_privates_for`)
+            // rather than a single key snapshotted at start, so a stream
+            // started right after an optimistically-installed-but-not-yet-
+            // accepted rsa_per_msg resume still decrypts correctly instead
+            // of silently failing every chunk.
+            IncomingStreamKey::Rsa(privates) => privates.iter().find_map(|k| crypto::decrypt_chunked(k, blocks).ok()),
+            IncomingStreamKey::Pq { my_private, sender_public } => {
+                let blob = blocks.first()?;
+                let chunk: crypto::pq::HybridVoiceChunk = proto::decode(blob).ok()?;
+                if self.pq_k_data.is_none() {
+                    self.pq_k_data = crypto::pq::unwrap_key_for_stream(my_private, sender_public, stream_id, &chunk.key_setup);
+                }
+                let k_data = self.pq_k_data.as_ref()?;
+                crypto::pq::decrypt_hybrid_chunk(k_data, stream_id, seq, &chunk.ciphertext)
+            }
+        }
+    }
+}
+
 /// Runs on a dedicated thread for the lifetime of one incoming stream -
 /// each stream gets its own, rather than sharing one decrypt thread across
 /// every incoming stream, because private-key decrypt (RSA) or unwrap+AEAD
@@ -254,39 +306,11 @@ pub(crate) fn spawn_stream_decrypt_worker(
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DecryptJob>();
     std::thread::spawn(move || {
         let mut plaintext_accum: Vec<u8> = Vec::new();
-        // `PqHybrid` only: the stream's `k_data`, recovered and
-        // signature-verified from the *first* chunk's `HybridStreamKeySetup`
-        // (`crypto::pq::unwrap_key_for_stream`) and cached here - every
-        // later chunk only pays for cheap AES-256-GCM, never re-verifying
-        // or re-unwrapping (`HybridStreamKeySetup`'s doc explains why the
-        // wire still repeats it every chunk regardless).
-        let mut pq_k_data: Option<[u8; 32]> = None;
+        let mut decryptor = ChunkDecryptor::new(key);
         while let Some(job) = rx.blocking_recv() {
             match job {
                 DecryptJob::Chunk(seq, blocks) => {
-                    let pcm = match &key {
-                        // Tries each candidate key in turn (current,
-                        // retained, bootstrap - see
-                        // `rekey::OwnKeys::candidate_privates_for`) rather
-                        // than a single key snapshotted at `*Start`, so a
-                        // stream started right after an optimistically-
-                        // installed-but-not-yet-accepted rsa_per_msg resume
-                        // still decrypts correctly instead of silently
-                        // failing every chunk.
-                        IncomingStreamKey::Rsa(privates) => {
-                            privates.iter().find_map(|k| crypto::decrypt_chunked(k, &blocks).ok())
-                        }
-                        IncomingStreamKey::Pq { my_private, sender_public } => (|| {
-                            let blob = blocks.first()?;
-                            let chunk: crypto::pq::HybridVoiceChunk = proto::decode(blob).ok()?;
-                            if pq_k_data.is_none() {
-                                pq_k_data =
-                                    crypto::pq::unwrap_key_for_stream(my_private, sender_public, stream_id, &chunk.key_setup);
-                            }
-                            let k_data = pq_k_data.as_ref()?;
-                            crypto::pq::decrypt_hybrid_chunk(k_data, stream_id, seq, &chunk.ciphertext)
-                        })(),
-                    };
+                    let pcm = decryptor.decrypt(stream_id, seq, &blocks);
                     if let Some(pcm) = pcm {
                         plaintext_accum.extend_from_slice(&pcm);
                         if !suppress_playback {
@@ -323,6 +347,80 @@ pub(crate) fn play_end_chime(session: &mut SessionState) {
     let _ = session.mixer_tx.send(voice::MixerCmd::Finish { id });
 }
 
+/// Plays the incoming-file-offer notification sound, same `Push`/`Finish`
+/// pattern as `play_end_chime` - called whenever a new file-offer popup
+/// becomes the one shown (`docs/PROTOCOL.md`'s file transfer section).
+pub(crate) fn play_bell_chime(session: &mut SessionState) {
+    let samples = voice::bell_chime_samples();
+    if samples.is_empty() {
+        return;
+    }
+    let id = session.next_mixer_id;
+    session.next_mixer_id += 1;
+    let _ = session.mixer_tx.send(voice::MixerCmd::Push { id, samples });
+    let _ = session.mixer_tx.send(voice::MixerCmd::Finish { id });
+}
+
+/// Resolves one recipient's outgoing key material for a point-to-point
+/// stream - shared by `file_stream`'s sending setup (`channel`/
+/// `direct_message`'s `handle_send_file`). Unlike
+/// `direct_message::handle_voice_record_start`'s own inline version, a
+/// resolution failure here (malformed `PqHybrid` public key, or an
+/// unbuildable PQ stream setup - e.g. we aren't ourselves `PqHybrid`) has
+/// no per-failure error message to surface: it's just `None`, and the
+/// caller silently excludes that recipient, same as any other
+/// partial-delivery case in this app (an offline member, a not-yet-fresh
+/// `rsa_per_msg` key, ...) - a file send has no single "recording" UI
+/// element for a failure reason to attach to the way voice's
+/// `audio_error` does.
+pub(crate) fn resolve_direct_key(
+    session: &SessionState,
+    stream_id: u64,
+    to: UserId,
+    recipient_key_mode: KeyMode,
+    recipient_pubkey_der: &[u8],
+) -> Option<DirectStreamKey> {
+    match recipient_key_mode {
+        KeyMode::PqHybrid => {
+            let public: crypto::pq::PqPublicBundle = proto::decode(recipient_pubkey_der).ok()?;
+            let pq = build_pq_stream_out(session, stream_id, &[(to, public)])?;
+            Some(DirectStreamKey::Pq(pq))
+        }
+        _ => crypto::public_key_from_der(recipient_pubkey_der).ok().map(DirectStreamKey::Rsa),
+    }
+}
+
+/// Resolves which key(s) to try for an incoming stream/transfer from
+/// `from`, decided by *our own* `session.own_key_mode` (a stream addressed
+/// to us was necessarily encrypted against whichever public key material
+/// *we* announced, regardless of the sender's own `my_key` - see
+/// `IncomingStreamKey`'s doc). Shared by `start_incoming_stream` (voice) and
+/// `file_stream`'s incoming-transfer setup, both of which snapshot this
+/// once at start rather than per chunk (PROTOCOL.md §11.6).
+///
+/// `sender_public_key_der` is the sender's `UserInfo.public_key_der`
+/// (whatever `key_mode` they announced) - only actually used when *our own*
+/// `own_key_mode` is `PqHybrid`, to verify the once-per-stream signature.
+pub(crate) fn resolve_incoming_key(session: &SessionState, from: UserId, sender_public_key_der: &[u8]) -> IncomingStreamKey {
+    if session.own_key_mode == KeyMode::PqHybrid {
+        match (session.own_pq_private.clone(), proto::decode(sender_public_key_der)) {
+            (Some(my_private), Ok(sender_public)) => IncomingStreamKey::Pq { my_private, sender_public },
+            // Malformed sender key, or (shouldn't happen) no own PQ
+            // identity despite `own_key_mode == PqHybrid` - nothing
+            // decryptable either way, so every chunk will just fail to
+            // decrypt below rather than crashing anything.
+            _ => IncomingStreamKey::Rsa(Vec::new()),
+        }
+    } else {
+        let candidates = session
+            .own_keys
+            .as_ref()
+            .map(|own_keys| own_keys.lock().unwrap().candidate_privates_for(from))
+            .unwrap_or_default();
+        IncomingStreamKey::Rsa(candidates)
+    }
+}
+
 pub(crate) fn start_incoming_stream(
     session: &mut SessionState,
     from: UserId,
@@ -339,26 +437,8 @@ pub(crate) fn start_incoming_stream(
     let mixer_id = session.next_mixer_id;
     session.next_mixer_id += 1;
     // The whole stream stays on one key snapshot (PROTOCOL.md §11.6), so
-    // this is resolved once here rather than per chunk. Which scheme to
-    // resolve is decided by *our own* `own_key_mode` - see
-    // `IncomingStreamKey`'s doc.
-    let key = if session.own_key_mode == KeyMode::PqHybrid {
-        match (session.own_pq_private.clone(), proto::decode(sender_public_key_der)) {
-            (Some(my_private), Ok(sender_public)) => IncomingStreamKey::Pq { my_private, sender_public },
-            // Malformed sender key, or (shouldn't happen) no own PQ
-            // identity despite `own_key_mode == PqHybrid` - nothing
-            // decryptable either way, so every chunk will just fail to
-            // decrypt below rather than crashing anything.
-            _ => IncomingStreamKey::Rsa(Vec::new()),
-        }
-    } else {
-        let candidates = session
-            .own_keys
-            .as_ref()
-            .map(|own_keys| own_keys.lock().unwrap().candidate_privates_for(from))
-            .unwrap_or_default();
-        IncomingStreamKey::Rsa(candidates)
-    };
+    // this is resolved once here rather than per chunk.
+    let key = resolve_incoming_key(session, from, sender_public_key_der);
     let job_tx = spawn_stream_decrypt_worker(
         key,
         session.mixer_tx.clone(),

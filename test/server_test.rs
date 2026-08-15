@@ -239,24 +239,68 @@ fn channel_message_is_delivered_only_to_addressed_channel_members() {
         if channel == "general" && *from == alice));
 }
 
-/// A `Content::File` envelope relays exactly like `Content::Text` - the
-/// server never branches on `Content` at all (docs/PROTOCOL.md §7.6).
+/// A `FileOffer` is a point-to-point relay, addressed exactly like
+/// `SendDirect` (`docs/PROTOCOL.md`'s file transfer section) - unaffected
+/// by whether `to` and `from` share a channel, and carrying `channel`
+/// through untouched as cleartext routing metadata.
 ///
 /// @requirement AC-075
 #[test]
-fn content_file_envelope_relays_through_route_channel_message_like_any_other_content() {
+fn file_offer_relays_point_to_point_carrying_channel_through() {
     let mut reg = Registry::new();
     let alice = reg.register("alice".into(), vec![], KeyMode::Rsa);
     let bob = reg.register("bob".into(), vec![], KeyMode::Rsa);
-    reg.join_channel(alice, "general", ChannelKind::Public).unwrap();
-    reg.join_channel(bob, "general", ChannelKind::Public).unwrap();
 
-    let env = Envelope { content: Content::File, blocks: vec![vec![1, 2, 3]] };
-    let out = reg.route_channel_message(alice, "general", vec![(bob, env.clone())]).expect("route ok");
+    let env = Envelope { content: Content::FileOffer, blocks: vec![vec![1, 2, 3]] };
+    let out = reg.route_file_offer(alice, bob, 7, Some("general".into()), env.clone()).expect("route ok");
 
-    assert_eq!(out.len(), 1);
-    assert_eq!(out[0].to, bob);
-    assert!(matches!(&out[0].message, ServerMessage::ChannelMessage { envelope, .. } if envelope == &env));
+    assert_eq!(out.to, bob);
+    assert!(matches!(
+        &out.message,
+        ServerMessage::FileOffer { from, from_name, stream_id: 7, channel: Some(c), envelope }
+            if *from == alice && from_name == "alice" && c == "general" && envelope == &env
+    ));
+}
+
+/// @requirement TB-141
+#[test]
+fn file_offer_to_an_unknown_recipient_is_rejected() {
+    let mut reg = Registry::new();
+    let alice = reg.register("alice".into(), vec![], KeyMode::Rsa);
+    let env = Envelope { content: Content::FileOffer, blocks: vec![vec![1]] };
+    assert!(reg.route_file_offer(alice, UserId(999), 1, None, env).is_err());
+}
+
+/// @requirement AC-096
+#[test]
+fn file_accept_and_reject_relay_to_the_original_sender() {
+    let mut reg = Registry::new();
+    let alice = reg.register("alice".into(), vec![], KeyMode::Rsa);
+    let bob = reg.register("bob".into(), vec![], KeyMode::Rsa);
+
+    let accepted = reg.route_file_accept(bob, alice, 7).expect("route ok");
+    assert_eq!(accepted.to, alice);
+    assert!(matches!(accepted.message, ServerMessage::FileAccepted { from, stream_id: 7 } if from == bob));
+
+    let rejected = reg.route_file_reject(bob, alice, 8).expect("route ok");
+    assert_eq!(rejected.to, alice);
+    assert!(matches!(rejected.message, ServerMessage::FileRejected { from, stream_id: 8 } if from == bob));
+}
+
+/// @requirement AC-076
+#[test]
+fn file_chunk_and_end_relay_point_to_point() {
+    let mut reg = Registry::new();
+    let alice = reg.register("alice".into(), vec![], KeyMode::Rsa);
+    let bob = reg.register("bob".into(), vec![], KeyMode::Rsa);
+
+    let chunk = reg.route_file_chunk(alice, bob, 7, 0, vec![vec![9, 9]]).expect("route ok");
+    assert_eq!(chunk.to, bob);
+    assert!(matches!(chunk.message, ServerMessage::FileChunk { from, stream_id: 7, seq: 0, .. } if from == alice));
+
+    let end = reg.route_file_end(alice, bob, 7).expect("route ok");
+    assert_eq!(end.to, bob);
+    assert!(matches!(end.message, ServerMessage::FileEnd { from, stream_id: 7 } if from == alice));
 }
 
 /// @requirement TB-030

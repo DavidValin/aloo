@@ -1191,8 +1191,8 @@ evidence = "docs/PROTOCOL.md 12.5, 12.6.5; src/platform.rs resolve_home_dir, alo
 id = "US-019"
 title = "Send a file to a channel or a user"
 as_a = "connected user"
-i_want = "to send a local file to the current channel or an open DM, and save one I receive"
-so_that = "I can share something beyond plain text without leaving the terminal"
+i_want = "to send a local file to the current channel or an open DM with the recipient's explicit consent, and have an accepted file stream straight to disk"
+so_that = "I can share something beyond plain text without leaving the terminal, and without either side risking an unwanted transfer"
 
 [[user_story.acceptance_criteria]]
 id = "AC-073"
@@ -1206,38 +1206,63 @@ evidence = "docs/SPEC.md Functionality #10; tests selecting_a_file_in_the_browse
 
 [[user_story.acceptance_criteria]]
 id = "AC-075"
-description = "Confirming Send file reads the file, encrypts it per recipient exactly like a text message (Content::File, reusing SendChannel/SendDirect with no new wire message types), and logs it locally straight away as an outgoing entry."
-evidence = "docs/PROTOCOL.md 7.6; tests sending_a_file_to_a_channel_produces_sendfilechannel_and_logs_it_optimistically, sending_a_file_to_a_dm_peer_produces_sendfiledirect_and_logs_it_optimistically, content_file_envelope_relays_through_route_channel_message_like_any_other_content"
+description = "Confirming Send file stats (never reads) the file and sends one FileOffer per ready recipient - a channel send is N independent point-to-point offers, one per member, each its own stream_id - encrypted the same per-recipient way a text message is; nothing is read from disk until that recipient individually accepts."
+evidence = "docs/PROTOCOL.md's file transfer section; tests sending_a_file_to_a_channel_produces_sendfilechannel_with_path_and_size, sending_a_file_to_a_dm_peer_produces_sendfiledirect_with_path_and_size, file_offer_relays_point_to_point_carrying_channel_through, file_offer_to_an_unknown_recipient_is_rejected"
 
 [[user_story.acceptance_criteria]]
 id = "AC-076"
-description = "A received file renders as a paperclip and its filename; pressing Enter on it opens a save-location popup prefilled with ~/.aloo/download/<filename> (reduced to just its final path component), editable, saving to whatever path is currently typed on Enter."
-evidence = "docs/SPEC.md Functionality #10; tests enter_on_a_file_log_entry_opens_the_save_popup_prefilled_with_the_default_path, saving_writes_the_file_to_the_typed_path"
+description = "Once accepted, a file streams to ~/.aloo/downloads chunk by chunk (never held whole in memory on either side) with a live progress bar on both the sender's and receiver's log row; once every byte has moved it renders as a plain paperclip and the filename."
+evidence = "docs/SPEC.md Functionality #10; tests accepting_a_channel_offer_creates_an_in_progress_row, a_progress_update_advances_the_bar_and_completion_finalizes_it, file_chunk_and_end_relay_point_to_point"
 
 [[user_story.acceptance_criteria]]
 id = "AC-077"
-description = "A file larger than MAX_FILE_BYTES is rejected with an inline error on the confirmation box rather than sent, and the flow stays open so a different file can be picked."
-evidence = "docs/PROTOCOL.md 7.6; test an_oversized_file_shows_an_inline_error_and_is_not_sent"
+description = "There is no application-imposed cap on how large a file can be sent - streaming (AC-076) removed the reason the old MAX_FILE_BYTES limit existed (fitting one whole-file Envelope under MAX_FRAME_LEN)."
+evidence = "docs/PROTOCOL.md's file transfer section; test there_is_no_size_cap_on_a_file_send"
 
 [[user_story.acceptance_criteria]]
 id = "AC-078"
-description = "A file from a peer with a Pending/Rejected identity review is decrypted but held rather than shown, exactly like text, and revealed once they are Accepted."
-evidence = "docs/PROTOCOL.md 12; test a_file_from_a_trust_gated_sender_is_held_and_revealed_on_accept"
+description = "A file offer from a peer with a Pending/Rejected identity review is decrypted but held rather than shown as a popup, exactly like a message, and queued for real (popup + bell) once they are Accepted."
+evidence = "docs/PROTOCOL.md 12; test an_offer_from_a_trust_gated_sender_is_held_and_revealed_on_accept"
+
+[[user_story.acceptance_criteria]]
+id = "AC-095"
+description = "Before any file bytes arrive, the receiver sees a popup - accompanied by assets/bell.wav - naming the sender, the filename, and its size, with Accept/Reject buttons (Accept focused by default, the opposite of this app's usual safety-first default, since accepting is the common case)."
+evidence = "docs/SPEC.md Functionality #10; tests an_incoming_offer_opens_a_popup_with_accept_focused_by_default, pressing_enter_on_the_offer_popup_accepts_by_default, a_second_offer_queues_behind_the_first"
+
+[[user_story.acceptance_criteria]]
+id = "AC-096"
+description = "Rejecting an offer shows as rejected in the sender's log row rather than the transfer silently vanishing; a channel send's rows are independent per recipient, each naming who it's addressed to, so one recipient rejecting doesn't affect another's row."
+evidence = "docs/SPEC.md Functionality #10; tests toggling_focus_then_enter_rejects, rejection_and_failure_are_reflected_on_the_matching_row, a_channel_file_send_logs_one_row_per_recipient_naming_them, file_accept_and_reject_relay_to_the_original_sender"
+
+[[user_story.acceptance_criteria]]
+id = "AC-097"
+description = "A filename longer than 230 characters is cropped at the end - enforced both when the sender builds the offer and independently on whatever filename actually arrives receiver-side, so a peer that skips the sender-side crop can't defeat it."
+evidence = "src/file_transfer.rs truncate_filename; tests a_long_filename_is_truncated_before_being_offered, truncate_filename_crops_a_long_name_at_the_end, truncate_filename_counts_unicode_scalar_values_not_bytes"
 
 [[user_story.technical_behavior]]
 id = "TB-123"
-description = "Content::File's plaintext is a FilePayload (filename + data) encoded with the same generic proto::encode/decode every other wire type uses, so it round-trips exactly like Content::Text's plaintext."
-evidence = "src/file_transfer.rs FilePayload; src/proto.rs Content; tests file_payload_round_trips_through_proto_encode_decode, content_file_envelope_roundtrips"
+description = "Content::FileOffer's plaintext is a FileOfferPayload (filename + size) encoded with the same generic proto::encode/decode every other wire type uses, so it round-trips exactly like Content::Text's plaintext; the actual file bytes are never wrapped in a struct at all, sent as raw FileChunk blocks like voice's PCM."
+evidence = "src/file_transfer.rs FileOfferPayload; src/proto.rs Content; tests file_offer_payload_round_trips_through_proto_encode_decode, content_file_offer_envelope_roundtrips"
 
 [[user_story.technical_behavior]]
 id = "TB-124"
-description = "The default save-path prefill reduces a peer-supplied filename to just its final path component before ever joining it to the download directory, falling back to a fixed default for a name that yields nothing usable, so a crafted filename cannot steer the default save location outside it."
-evidence = "src/file_transfer.rs safe_filename; tests safe_filename_reduces_a_path_to_its_final_component, safe_filename_falls_back_to_a_default_for_an_unusable_name"
+description = "The download path reduces a peer-supplied filename to just its final path component before ever joining it to ~/.aloo/downloads, falling back to a fixed default for a name that yields nothing usable, so a crafted filename cannot steer the save location outside it."
+evidence = "src/file_transfer.rs safe_filename, default_download_dir; tests safe_filename_reduces_a_path_to_its_final_component, safe_filename_falls_back_to_a_default_for_an_unusable_name, default_download_dir_is_under_aloo_dir"
 
 [[user_story.technical_behavior]]
 id = "TB-125"
-description = "MAX_FILE_BYTES is a single named constant, sized so a SendChannel carrying one Envelope per member of a generously-sized channel still stays under MAX_FRAME_LEN even at 2048-bit RSA-OAEP's worst-case ciphertext expansion."
-evidence = "docs/PROTOCOL.md 7.6; src/file_transfer.rs MAX_FILE_BYTES; test max_file_bytes_keeps_a_generously_sized_channel_under_the_frame_limit"
+description = "FILE_CHUNK_BYTES is a single named constant, sized so one recipient's FileChunk frame stays comfortably under MAX_FRAME_LEN even at 2048-bit RSA-OAEP's worst-case ciphertext expansion - unlike the old MAX_FILE_BYTES, this bounds one chunk, not the whole file, since total file size is no longer capped (AC-077)."
+evidence = "src/file_transfer.rs FILE_CHUNK_BYTES; test file_chunk_bytes_is_well_under_the_frame_limit"
+
+[[user_story.technical_behavior]]
+id = "TB-140"
+description = "truncate_filename crops by character count (not raw byte length), so a multi-byte UTF-8 character is never split mid-encoding, and a name already at or under the limit is left untouched."
+evidence = "src/file_transfer.rs truncate_filename, MAX_FILENAME_CHARS; tests truncate_filename_leaves_a_short_name_untouched, truncate_filename_crops_a_long_name_at_the_end, truncate_filename_counts_unicode_scalar_values_not_bytes"
+
+[[user_story.technical_behavior]]
+id = "TB-141"
+description = "Every message in the file-transfer family (FileOffer/FileAccept/FileReject/FileChunk/FileEnd) is addressed point-to-point (to/from), exactly like the existing StreamDirect* family, and relayed by the server with only an existence check on the recipient - never a channel-membership check, even when the transfer originated from a channel send."
+evidence = "src/server.rs Registry::route_file_offer/route_file_accept/route_file_reject/route_file_chunk/route_file_end; src/proto.rs ClientMessage/ServerMessage File* variants; tests file_transfer_message_family_roundtrips, file_offer_relays_point_to_point_carrying_channel_through, file_offer_to_an_unknown_recipient_is_rejected, file_accept_and_reject_relay_to_the_original_sender, file_chunk_and_end_relay_point_to_point"
 
 # ============================================================================
 # US-020 - Communicate with post-quantum hybrid encryption

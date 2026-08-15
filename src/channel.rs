@@ -80,21 +80,26 @@ pub fn can_address(recipient_key_mode: KeyMode, own_key_mode: KeyMode) -> bool {
     recipient_key_mode != KeyMode::PqHybrid || own_key_mode == KeyMode::PqHybrid
 }
 
-/// Sends a whole file as one ordinary `SendChannel`, exactly like text
-/// (`docs/PROTOCOL.md`'s file transfer section) - not streamed, since a
-/// file is already a complete, on-disk blob rather than a live capture.
-/// Readiness is a snapshot-and-exclude, same as `handle_voice_record_start`
-/// below (PROTOCOL.md §11.6): a `rsa_per_msg` recipient without a fresh key
-/// right now is simply left out of this send, not queued the way
-/// `handle_send_text` queues unready recipients - a file send is a single
-/// complete deliverable decided now, closer to voice's shape than text's
-/// steady trickle.
+/// Sends one `FileOffer` per ready recipient (`docs/PROTOCOL.md`'s file
+/// transfer section) - a channel file send is N independent point-to-point
+/// transfers, one per member, each with its own `stream_id` and its own
+/// pending log row (`UiState::log_own_file_offer_channel`), rather than one
+/// broadcast the way voice's channel streams work: accept/reject/progress
+/// is inherently per-recipient here, so each row tracks its own recipient's
+/// decision independently. Readiness is a snapshot-and-exclude, same as
+/// `handle_voice_record_start` below (PROTOCOL.md §11.6): a `rsa_per_msg`
+/// recipient without a fresh key right now is simply left out. Nothing is
+/// read from `path` here - only once each recipient individually accepts
+/// (`session::handle_server_message`'s `FileAccepted` arm).
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_send_file(
     wr: &mut (impl AsyncWrite + Unpin),
+    ui_state: &mut UiState,
     session: &mut SessionState,
     channel: String,
+    path: std::path::PathBuf,
     filename: String,
-    data: Vec<u8>,
+    size: u64,
     recipients: Vec<Recipient>,
 ) -> proto::Result<()> {
     let mut ready = Vec::new();
@@ -103,15 +108,26 @@ pub(crate) async fn handle_send_file(
             ready.push((id, key_mode, der));
         }
     }
-    if ready.is_empty() {
-        return Ok(());
-    }
-    let payload = crate::file_transfer::FilePayload { filename, data };
+    let payload = crate::file_transfer::FileOfferPayload { filename: filename.clone(), size };
     let Ok(plaintext) = proto::encode(&payload) else { return Ok(()) };
-    let per_recipient = encrypt_for_each(session, &ready, &plaintext, Content::File);
-    proto::write_message(wr, &ClientMessage::SendChannel { channel, per_recipient }).await?;
-    session.conn_stats.record_event(Instant::now());
-    for (id, ..) in ready {
+    for (id, key_mode, der) in ready {
+        let envelope = match key_mode {
+            KeyMode::PqHybrid => session
+                .own_pq_private
+                .as_ref()
+                .and_then(|signing| crate::session::encrypt_hybrid_envelope_for(signing, &der, &plaintext, Content::FileOffer)),
+            _ => crate::session::encrypt_for_one(&der, &plaintext, Content::FileOffer),
+        };
+        let Some(envelope) = envelope else { continue };
+        let stream_id = session.next_stream_id;
+        let Some(key) = voice_stream::resolve_direct_key(session, stream_id, id, key_mode, &der) else { continue };
+        session.next_stream_id += 1;
+        let to_name = ui_state.known_users.get(&id).map(|u| u.name.clone()).unwrap_or_default();
+        ui_state.log_own_file_offer_channel(&channel, &to_name, stream_id, filename.clone(), size);
+        session.own_file_targets.insert(stream_id, crate::file_stream::OwnFileTarget { to: id, path: path.clone(), key });
+        proto::write_message(wr, &ClientMessage::FileOffer { to: id, stream_id, channel: Some(channel.clone()), envelope })
+            .await?;
+        session.conn_stats.record_event(Instant::now());
         crate::session::request_rotation_if_per_message(session, id);
     }
     Ok(())

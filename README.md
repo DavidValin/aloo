@@ -12,13 +12,13 @@ Just you, your terminal, and the people you're talking to.
 
 - 💬 **Text chat** — type and hit `Enter`, just like any chat app.
 - 🎙️ **Walkie-talkie voice messages** — hold `Space` to talk, let go to send. Just like a real walkie-talkie, it auto-plays live on the other end as you're talking — no play button, nothing to tap, they just hear you. You can also replay it later: scroll to it in the log and press `Enter` to hear it again. `Ctrl+Alt+P` does the same thing globally, even while aloo isn't focused.
-- 📎 **File transfer** — send files straight from the app with a built-in file browser, no external tools needed. Capped at 1 MiB per file — it's built for quick attachments, not large files.
+- 📎 **File transfer, with consent** — send files straight from the app with a built-in file browser, no external tools needed. The recipient sees a popup (with a chime) naming you and the file before a single byte moves, Accept focused by default; accepting streams it straight to `~/.aloo/downloads` with a live progress bar, no size cap.
 - 📢 **Public channels** — join the channels the server advertises, shown as tabs across the top.
 - 🔒 **Private channels** — create or join a channel that isn't advertised to anyone; you just need to know its name.
 - ✉️  **Private messages (DMs)** — open a one-on-one conversation with anyone in the sidebar.
 
 - 🛡️  **Everything above is end-to-end encrypted**. See the "Encryption" section below for how.
-- 💾 **Nothing is saved to disk.** Chat history — text, voice, files, all of it — only ever lives in memory for as long as the app is running. Close it or disconnect, and it's gone; there's no local chat log sitting around to find later.
+- 💾 **Chat history isn't saved to disk.** Text and voice messages only ever live in memory for as long as the app is running — close it or disconnect, and they're gone. A file you've accepted is the one exception: that's the point of a file transfer, so it's written to `~/.aloo/downloads`.
 
 ## Getting started
 

@@ -490,6 +490,64 @@ impl Registry {
         }
         Ok(Outgoing { to, message: ServerMessage::DirectStreamEnd { from, stream_id, duration_ms } })
     }
+
+    // -------------------------------------------------------------
+    // File transfer: always point-to-point (`docs/PROTOCOL.md`'s file
+    // transfer section) - a channel send is just N independent offers, one
+    // per recipient, so every one of these is an existence-check-only relay
+    // exactly like `route_direct_message`/`route_direct_stream_*` above, no
+    // channel-membership validation involved.
+    // -------------------------------------------------------------
+
+    pub fn route_file_offer(
+        &self,
+        from: UserId,
+        to: UserId,
+        stream_id: u64,
+        channel: Option<String>,
+        envelope: Envelope,
+    ) -> Result<Outgoing, String> {
+        if !self.clients.contains_key(&to) {
+            return Err("unknown recipient".to_string());
+        }
+        let from_name = self.clients.get(&from).map(|c| c.name.clone()).ok_or_else(|| "unknown sender".to_string())?;
+        Ok(Outgoing { to, message: ServerMessage::FileOffer { from, from_name, stream_id, channel, envelope } })
+    }
+
+    pub fn route_file_accept(&self, from: UserId, to: UserId, stream_id: u64) -> Result<Outgoing, String> {
+        if !self.clients.contains_key(&to) {
+            return Err("unknown recipient".to_string());
+        }
+        Ok(Outgoing { to, message: ServerMessage::FileAccepted { from, stream_id } })
+    }
+
+    pub fn route_file_reject(&self, from: UserId, to: UserId, stream_id: u64) -> Result<Outgoing, String> {
+        if !self.clients.contains_key(&to) {
+            return Err("unknown recipient".to_string());
+        }
+        Ok(Outgoing { to, message: ServerMessage::FileRejected { from, stream_id } })
+    }
+
+    pub fn route_file_chunk(
+        &self,
+        from: UserId,
+        to: UserId,
+        stream_id: u64,
+        seq: u32,
+        blocks: Vec<Vec<u8>>,
+    ) -> Result<Outgoing, String> {
+        if !self.clients.contains_key(&to) {
+            return Err("unknown recipient".to_string());
+        }
+        Ok(Outgoing { to, message: ServerMessage::FileChunk { from, stream_id, seq, blocks } })
+    }
+
+    pub fn route_file_end(&self, from: UserId, to: UserId, stream_id: u64) -> Result<Outgoing, String> {
+        if !self.clients.contains_key(&to) {
+            return Err("unknown recipient".to_string());
+        }
+        Ok(Outgoing { to, message: ServerMessage::FileEnd { from, stream_id } })
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -693,6 +751,34 @@ async fn client_loop<R: AsyncRead + Unpin>(
                         }
                     }
                 }
+                ClientMessage::FileOffer { to, stream_id, channel, envelope } => {
+                    match reg.route_file_offer(id, to, stream_id, channel, envelope) {
+                        Ok(o) => vec![o],
+                        Err(reason) => {
+                            vec![Outgoing { to: id, message: ServerMessage::Error { message: reason } }]
+                        }
+                    }
+                }
+                ClientMessage::FileAccept { to, stream_id } => match reg.route_file_accept(id, to, stream_id) {
+                    Ok(o) => vec![o],
+                    Err(reason) => vec![Outgoing { to: id, message: ServerMessage::Error { message: reason } }],
+                },
+                ClientMessage::FileReject { to, stream_id } => match reg.route_file_reject(id, to, stream_id) {
+                    Ok(o) => vec![o],
+                    Err(reason) => vec![Outgoing { to: id, message: ServerMessage::Error { message: reason } }],
+                },
+                ClientMessage::FileChunk { to, stream_id, seq, blocks } => {
+                    match reg.route_file_chunk(id, to, stream_id, seq, blocks) {
+                        Ok(o) => vec![o],
+                        Err(reason) => {
+                            vec![Outgoing { to: id, message: ServerMessage::Error { message: reason } }]
+                        }
+                    }
+                }
+                ClientMessage::FileEnd { to, stream_id } => match reg.route_file_end(id, to, stream_id) {
+                    Ok(o) => vec![o],
+                    Err(reason) => vec![Outgoing { to: id, message: ServerMessage::Error { message: reason } }],
+                },
                 ClientMessage::Auth(_) | ClientMessage::Identify { .. } => vec![Outgoing {
                     to: id,
                     message: ServerMessage::Error {

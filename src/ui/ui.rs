@@ -103,11 +103,12 @@ const HELP_BODY: &[&str] = &[
     "",
     "File transfer",
     "  /file      type this and press Enter to browse for a file to send",
-    "  Enter      pick a file in the browser; on a received file, open the save popup",
     "  Left/Right/Tab   choose Send file / Discard on the confirmation box (Discard by default)",
-    "  Encrypted the same way as a text message. Files over 1 MiB are",
-    "  rejected rather than sent. Saving defaults to ~/.aloo/download,",
-    "  editable before you confirm.",
+    "  The recipient sees a popup (with a chime) naming you and the file,",
+    "  Accept focused by default; Left/Right/Tab/Enter same as above.",
+    "  Accepting streams the file straight to ~/.aloo/downloads with a",
+    "  live progress bar - nothing is held whole in memory on either side,",
+    "  and there is no size cap. Declining shows as rejected in your log.",
     "",
     "Encryption (tag shown after each username)",
     "  name \u{1F512} RSAPM  rsa_per_msg: a fresh key every message, signed by the one it replaces",
@@ -131,6 +132,28 @@ const HELP_BODY: &[&str] = &[
     "  Ctrl+C  quit      Ctrl+H  toggle this help      Up/Down  scroll",
 ];
 
+/// Where one file transfer's log row currently stands
+/// (`docs/PROTOCOL.md`'s file transfer section) - `Pending` only ever shown
+/// on the *sender's* side (the receiver never gets a row at all until they
+/// decide; see `PendingFileOffer`/`file_offer_queue`), the other three
+/// apply to either direction.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FileTransferStatus {
+    /// Offer sent, waiting for the recipient's Accept/Reject.
+    Pending,
+    /// Accepted; bytes are actively flowing (sent, if this is our own
+    /// outgoing row, or written to disk, if incoming).
+    InProgress { bytes: u64 },
+    /// Every byte sent (outgoing) or written to `~/.aloo/downloads`
+    /// (incoming).
+    Completed,
+    /// The recipient declined the offer - outgoing rows only.
+    Rejected,
+    /// A local error ended the transfer early (disk/read/write failure) -
+    /// surfaced rather than left stuck mid-progress forever.
+    Failed,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum MessageBody {
     Text(String),
@@ -145,18 +168,24 @@ pub enum MessageBody {
     /// entry's `from`, since two different senders' independent
     /// per-connection counters can coincidentally collide.
     VoiceStreaming { stream_id: u64 },
-    /// A finished file transfer (`docs/PROTOCOL.md`'s file transfer
-    /// section, `Content::File`) - `data` is decrypted and ready to save;
-    /// there is no in-progress placeholder the way `VoiceStreaming` has,
-    /// since a file send is one complete, already-on-disk blob rather than
-    /// a live capture.
-    File { filename: String, data: Vec<u8> },
+    /// One file transfer, consent-gated and streamed
+    /// (`docs/PROTOCOL.md`'s file transfer section) - `stream_id` identifies
+    /// it the same way `VoiceStreaming`'s does (paired with the entry's
+    /// `from`, never alone), so a later progress/completion event can find
+    /// and update this exact row (`UiState::update_file_entry`).
+    File { filename: String, total: u64, stream_id: u64, status: FileTransferStatus },
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct LogEntry {
     pub from: UserId,
     pub from_name: String,
+    /// Set only for an outgoing file-transfer row addressed to one specific
+    /// recipient (a channel file send creates one row per recipient - see
+    /// `docs/PROTOCOL.md`'s file transfer section) - lets that row render
+    /// who it's addressed to. `None` for every other kind of entry,
+    /// including a DM file send (the room itself already names the peer).
+    pub to_name: Option<String>,
     pub body: MessageBody,
     pub outgoing: bool,
 }
@@ -248,22 +277,34 @@ pub enum Mode {
     /// `crate::ui::file_send`. Data lives in `UiState::file_send`, not
     /// here, same split `JoinPrivatePopup`/`join_popup_input` already use.
     FileSend,
-    /// The receiving side's save-location popup (Enter on a `MessageBody::
-    /// File` log entry) is open. Data lives in `UiState::file_save`.
-    FileSave,
 }
 
-/// The receiving side's save-location popup state (Enter on a
-/// `MessageBody::File` log entry) - a single editable path field, same
-/// established convention as this app's other path fields (`id_store`,
-/// `own_next_keys`, the connect popup's host/port), rather than another
-/// nested directory browser: the user can already type any location they
-/// want, they just need somewhere to start from.
+/// One incoming file offer awaiting an Accept/Reject decision
+/// (`docs/PROTOCOL.md`'s file transfer section) - shown as a popup (with
+/// `assets/bell.wav`) the instant it becomes the front of
+/// `UiState::file_offer_queue`, mirroring the identity review popup's
+/// modal-queue idiom. Nothing is written to disk, and no log row exists,
+/// until this is resolved - `Accept` is what creates both.
 #[derive(Debug, Clone, PartialEq)]
-pub struct FileSaveState {
+pub struct PendingFileOffer {
+    pub from: UserId,
+    pub from_name: String,
     pub filename: String,
-    pub data: Vec<u8>,
-    pub path_input: String,
+    pub size: u64,
+    pub stream_id: u64,
+    /// `Some(channel)` if this offer arrived via a channel send, `None` for
+    /// a DM - decides which log the accepted row goes into.
+    pub channel: Option<String>,
+}
+
+/// Which button is focused in the file-offer popup - `Accept` by default
+/// (the opposite of the identity review popup's `Reject`-first default),
+/// per the file transfer spec: accepting an offer is the common case and
+/// shouldn't need an extra keystroke past Enter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileOfferChoice {
+    Accept,
+    Reject,
 }
 
 /// A recipient's addressing info: their id, announced `KeyMode` (which
@@ -297,12 +338,26 @@ pub enum UiAction {
     AcceptIdentity(UserId),
     RejectIdentity(UserId),
     /// A file send confirmed in the `/file` popup (`crate::ui::file_send`) -
-    /// `crate::channel::handle_send_file` reads, encrypts and sends `data`
-    /// under `filename` to every ready recipient (rsa_per_msg readiness is
-    /// snapshotted here, same as a voice stream's recipients - see
-    /// `docs/PROTOCOL.md`'s file transfer section).
-    SendFileChannel { channel: String, filename: String, data: Vec<u8>, recipients: Vec<Recipient> },
-    SendFileDirect { to: UserId, filename: String, data: Vec<u8>, recipient_key_mode: KeyMode, recipient_pubkey_der: Vec<u8> },
+    /// `crate::channel::handle_send_file` builds and sends one `FileOffer`
+    /// per ready recipient (rsa_per_msg readiness is snapshotted here, same
+    /// as a voice stream's recipients - see `docs/PROTOCOL.md`'s file
+    /// transfer section); nothing is read from `path` until each recipient
+    /// individually accepts.
+    SendFileChannel { channel: String, path: std::path::PathBuf, filename: String, size: u64, recipients: Vec<Recipient> },
+    SendFileDirect {
+        to: UserId,
+        path: std::path::PathBuf,
+        filename: String,
+        size: u64,
+        recipient_key_mode: KeyMode,
+        recipient_pubkey_der: Vec<u8>,
+    },
+    /// The user confirmed Accept/Reject in the file-offer popup for
+    /// `(from, stream_id)` - `session::handle_ui_action` does the actual
+    /// `FileAccept`/`FileReject` wire send and, on Accept, spawns the
+    /// receiving worker (`UiState` has no access to the network or disk).
+    AcceptFileOffer { from: UserId, stream_id: u64 },
+    RejectFileOffer { from: UserId, stream_id: u64 },
 }
 
 /// Which trigger started the current recording - `handle_key`'s Space
@@ -348,9 +403,25 @@ pub struct UiState {
     /// directory after `start_file_send` opens one at the process's real
     /// current directory (see that struct's tests).
     pub file_send: Option<super::file_send::FileSendState>,
-    /// The receiving side's save-location popup state, while `mode ==
-    /// Mode::FileSave` - see `open_file_save_popup`.
-    pub file_save: Option<FileSaveState>,
+    /// Every incoming file offer currently awaiting a decision, keyed by
+    /// `(from, stream_id)` - the popup always shows whichever's at the
+    /// front of `file_offer_queue`. Analogous to `identity_reviews`/
+    /// `identity_review_queue`, but simpler: a decision here is final
+    /// (`Accept`/`Reject` both remove the entry outright), there is no
+    /// `Rejected`-but-reconsiderable state the way an identity review has.
+    pub file_offers: HashMap<(UserId, u64), PendingFileOffer>,
+    file_offer_queue: VecDeque<(UserId, u64)>,
+    /// Reset to `Accept` every time a different offer becomes the one
+    /// shown, same "always starts on the safe/common default" precedent
+    /// `identity_review_focus` sets (there, `Reject`; here, `Accept` - see
+    /// `PendingFileOffer`'s doc for why the default flips).
+    file_offer_focus: FileOfferChoice,
+    /// File offers received from a `Pending`/`Rejected` identity-review
+    /// sender (`docs/PROTOCOL.md` §12), held back the same way
+    /// `pending_messages` holds ordinary messages - queued for real
+    /// (`push_file_offer`, popup + bell) only once that sender is
+    /// `Accept`ed (`resolve_identity_accept`).
+    pending_file_offers: HashMap<UserId, Vec<PendingFileOffer>>,
     pub recording: bool,
     /// Which trigger started the current recording - `None` whenever
     /// `recording` is `false`. See `RecordSource`.
@@ -465,7 +536,10 @@ impl UiState {
             mode: Mode::Normal,
             join_popup_input: String::new(),
             file_send: None,
-            file_save: None,
+            file_offers: HashMap::new(),
+            file_offer_queue: VecDeque::new(),
+            file_offer_focus: FileOfferChoice::Accept,
+            pending_file_offers: HashMap::new(),
             recording: false,
             recording_source: None,
             recording_last_seen: None,
@@ -544,6 +618,13 @@ impl UiState {
         self.pending_messages.entry(from).or_default().push(HeldMessage { channel, entry });
     }
 
+    /// Held-message counterpart for an incoming file offer from a
+    /// `Pending`/`Rejected` identity-review sender - see
+    /// `pending_file_offers`'s doc.
+    pub fn hold_file_offer(&mut self, offer: PendingFileOffer) {
+        self.pending_file_offers.entry(offer.from).or_default().push(offer);
+    }
+
     /// Removes `peer` from the review queue, wherever it is - not
     /// necessarily the front - and resets focus for whatever's now shown if
     /// the popup on screen actually changed. Shared by
@@ -568,39 +649,52 @@ impl UiState {
     /// (`session::handle_ui_action`'s `AcceptIdentity` arm has already
     /// installed the key and persisted `id_store`) - removes `peer` from
     /// review entirely (back to normal/trusted), drains anything held for
-    /// them into the real channel/DM logs in arrival order, and opens the
-    /// next queued review if any.
-    pub fn resolve_identity_accept(&mut self, peer: UserId) {
+    /// them (messages into the real channel/DM logs, file offers into
+    /// `file_offer_queue`) in arrival order, and opens the next queued
+    /// review if any. Returns whether the caller (which owns audio) should
+    /// play the file-offer bell - true iff a held offer just became the
+    /// front of `file_offer_queue`.
+    pub fn resolve_identity_accept(&mut self, peer: UserId) -> bool {
         self.identity_reviews.remove(&peer);
         self.remove_from_identity_review_queue(peer);
-        let Some(held) = self.pending_messages.remove(&peer) else { return };
-        for HeldMessage { channel, entry } in held {
-            match channel {
-                Some(name) => {
-                    let is_current = self.is_viewing_channel(&name);
-                    if let Some(tab) = self.channels.iter_mut().find(|c| c.name == name) {
-                        push_log_entry(&mut tab.log, &mut self.message_selected, is_current, entry);
+        if let Some(held) = self.pending_messages.remove(&peer) {
+            for HeldMessage { channel, entry } in held {
+                match channel {
+                    Some(name) => {
+                        let is_current = self.is_viewing_channel(&name);
+                        if let Some(tab) = self.channels.iter_mut().find(|c| c.name == name) {
+                            push_log_entry(&mut tab.log, &mut self.message_selected, is_current, entry);
+                        }
                     }
-                }
-                None => {
-                    // The room may not exist yet - a held DM never creates
-                    // one (mirrors `on_direct_message`'s trust-gated path).
-                    let is_current = self.active_private_room == Some(peer);
-                    let from_name = entry.from_name.clone();
-                    let fallback_peer = self.known_users.get(&peer).cloned().unwrap_or_else(|| UserInfo {
-                        id: peer,
-                        name: from_name,
-                        public_key_der: Vec::new(),
-                        key_mode: crate::proto::KeyMode::None,
-                    });
-                    let room = self
-                        .private_rooms
-                        .entry(peer)
-                        .or_insert_with(|| PrivateRoom { peer: fallback_peer, log: Vec::new(), unread: false });
-                    push_log_entry(&mut room.log, &mut self.message_selected, is_current, entry);
+                    None => {
+                        // The room may not exist yet - a held DM never creates
+                        // one (mirrors `on_direct_message`'s trust-gated path).
+                        let is_current = self.active_private_room == Some(peer);
+                        let from_name = entry.from_name.clone();
+                        let fallback_peer = self.known_users.get(&peer).cloned().unwrap_or_else(|| UserInfo {
+                            id: peer,
+                            name: from_name,
+                            public_key_der: Vec::new(),
+                            key_mode: crate::proto::KeyMode::None,
+                        });
+                        let room = self
+                            .private_rooms
+                            .entry(peer)
+                            .or_insert_with(|| PrivateRoom { peer: fallback_peer, log: Vec::new(), unread: false });
+                        push_log_entry(&mut room.log, &mut self.message_selected, is_current, entry);
+                    }
                 }
             }
         }
+        let mut play_bell = false;
+        if let Some(offers) = self.pending_file_offers.remove(&peer) {
+            for offer in offers {
+                if self.push_file_offer(offer) {
+                    play_bell = true;
+                }
+            }
+        }
+        play_bell
     }
 
     /// Applies a Reject decision: flips `peer`'s review to `Rejected` (kept,
@@ -626,6 +720,102 @@ impl UiState {
         self.identity_review_queue.retain(|p| *p != peer);
         self.identity_review_queue.push_front(peer);
         self.identity_review_focus = IdentityChoice::Reject;
+    }
+
+    // -------------------------------------------------------------
+    // File transfer (`docs/PROTOCOL.md`'s file transfer section):
+    // consent-gated Accept/Reject, same modal-queue idiom as identity
+    // review above.
+    // -------------------------------------------------------------
+
+    /// Queues `offer` and, if nothing else is currently showing, makes it
+    /// the one shown right away. Returns whether it became the front of
+    /// the queue - the caller (`session.rs`, which owns audio) uses this to
+    /// decide whether to play the bell.
+    pub fn push_file_offer(&mut self, offer: PendingFileOffer) -> bool {
+        let key = (offer.from, offer.stream_id);
+        self.file_offers.insert(key, offer);
+        self.file_offer_queue.push_back(key);
+        let is_front = self.file_offer_queue.front() == Some(&key);
+        if is_front {
+            self.file_offer_focus = FileOfferChoice::Accept;
+        }
+        is_front
+    }
+
+    /// The offer currently shown in the popup, if any.
+    pub fn file_offer_open(&self) -> Option<&PendingFileOffer> {
+        let key = self.file_offer_queue.front()?;
+        self.file_offers.get(key)
+    }
+
+    /// Removes and returns the offer for `(from, stream_id)` - a decision
+    /// here is always final (unlike an identity review, there's no
+    /// `Rejected`-but-reconsiderable state), so nothing is kept around
+    /// afterward.
+    pub fn take_file_offer(&mut self, from: UserId, stream_id: u64) -> Option<PendingFileOffer> {
+        let key = (from, stream_id);
+        self.file_offer_queue.retain(|k| *k != key);
+        self.file_offer_focus = FileOfferChoice::Accept;
+        self.file_offers.remove(&key)
+    }
+
+    /// Finds the file-transfer log row matching `(from, stream_id)`
+    /// (embedded in `MessageBody::File`, same `(from, stream_id)` matching
+    /// `finalize_stream_entry` already uses for voice) wherever it lives -
+    /// a channel tab or a private room - and applies `f` to its body.
+    /// Nothing tracks which one a given transfer's row is in, so every
+    /// tab/room is checked; a no-op if the row isn't found (e.g. already
+    /// scrolled out - it never actually leaves the log, just stops
+    /// matching once found once).
+    fn update_file_entry(&mut self, from: UserId, stream_id: u64, f: impl FnOnce(&mut MessageBody)) {
+        let matches = |e: &&mut LogEntry| {
+            e.from == from && matches!(&e.body, MessageBody::File { stream_id: sid, .. } if *sid == stream_id)
+        };
+        for tab in &mut self.channels {
+            if let Some(entry) = tab.log.iter_mut().find(matches) {
+                f(&mut entry.body);
+                return;
+            }
+        }
+        for room in self.private_rooms.values_mut() {
+            if let Some(entry) = room.log.iter_mut().find(matches) {
+                f(&mut entry.body);
+                return;
+            }
+        }
+    }
+
+    pub fn set_file_progress(&mut self, from: UserId, stream_id: u64, bytes: u64) {
+        self.update_file_entry(from, stream_id, |body| {
+            if let MessageBody::File { status, .. } = body {
+                *status = FileTransferStatus::InProgress { bytes };
+            }
+        });
+    }
+
+    pub fn set_file_completed(&mut self, from: UserId, stream_id: u64) {
+        self.update_file_entry(from, stream_id, |body| {
+            if let MessageBody::File { status, .. } = body {
+                *status = FileTransferStatus::Completed;
+            }
+        });
+    }
+
+    pub fn set_file_rejected(&mut self, from: UserId, stream_id: u64) {
+        self.update_file_entry(from, stream_id, |body| {
+            if let MessageBody::File { status, .. } = body {
+                *status = FileTransferStatus::Rejected;
+            }
+        });
+    }
+
+    pub fn set_file_failed(&mut self, from: UserId, stream_id: u64) {
+        self.update_file_entry(from, stream_id, |body| {
+            if let MessageBody::File { status, .. } = body {
+                *status = FileTransferStatus::Failed;
+            }
+        });
     }
 
     /// Called by the caller (`session`/`channel`/`direct_message`) when
@@ -741,6 +931,31 @@ impl UiState {
             };
         }
 
+        // An outstanding file offer is next-highest priority - below an
+        // identity review (trust is the more fundamental concern) but
+        // above everything else, including Ctrl+H, same reasoning and same
+        // shape as the identity review block above: every other key is
+        // absorbed while one is showing.
+        if let Some(&(from, stream_id)) = self.file_offer_queue.front() {
+            return match kind {
+                KeyEventKind::Press | KeyEventKind::Repeat => match code {
+                    KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
+                        self.file_offer_focus = match self.file_offer_focus {
+                            FileOfferChoice::Accept => FileOfferChoice::Reject,
+                            FileOfferChoice::Reject => FileOfferChoice::Accept,
+                        };
+                        None
+                    }
+                    KeyCode::Enter => match self.file_offer_focus {
+                        FileOfferChoice::Accept => Some(UiAction::AcceptFileOffer { from, stream_id }),
+                        FileOfferChoice::Reject => Some(UiAction::RejectFileOffer { from, stream_id }),
+                    },
+                    _ => None,
+                },
+                _ => None,
+            };
+        }
+
         // Ctrl+H toggles the help overlay and takes priority over
         // everything else below, so it works from any view/mode/focus,
         // even mid-recording or with another popup already open. Gated on
@@ -830,9 +1045,6 @@ impl UiState {
         }
         if self.mode == Mode::FileSend {
             return self.handle_file_send_key(code);
-        }
-        if self.mode == Mode::FileSave {
-            return self.handle_file_save_key(code);
         }
 
         match code {
@@ -1028,13 +1240,13 @@ impl UiState {
                 }
                 None
             }
+            // A file entry has nothing left to do on Enter - it's already
+            // either mid-transfer or saved under `~/.aloo/downloads` (or
+            // rejected/failed); unlike the old whole-file-in-memory
+            // approach, there's no separate save step to trigger here.
             KeyCode::Enter => match self.current_log().get(self.message_selected) {
                 Some(LogEntry { body: MessageBody::Voice { duration_ms, pcm }, .. }) => {
                     Some(UiAction::ReplayVoice { duration_ms: *duration_ms, pcm: pcm.clone() })
-                }
-                Some(LogEntry { body: MessageBody::File { filename, data }, .. }) => {
-                    self.open_file_save_popup(filename.clone(), data.clone());
-                    None
                 }
                 _ => None,
             },
@@ -1147,83 +1359,6 @@ impl UiState {
         self.recording_source = None;
         self.recording_last_seen = None;
         Some(UiAction::VoiceRecordStop)
-    }
-
-    // -------------------------------------------------------------
-    // Receiving side: save-location popup for a `MessageBody::File`
-    // -------------------------------------------------------------
-
-    /// Opens the save-location popup for a received (or replayed-from-log)
-    /// file, prefilled with `file_transfer::default_download_dir()` joined
-    /// with the sender's filename reduced to just its final path component
-    /// (`file_transfer::safe_filename`) - never the raw, peer-supplied
-    /// name, so a maliciously-crafted filename (e.g. containing `..` or a
-    /// leading `/`) can't steer the *default* save location outside the
-    /// download directory. The field stays freely editable from there.
-    pub(crate) fn open_file_save_popup(&mut self, filename: String, data: Vec<u8>) {
-        let default_path = crate::file_transfer::default_download_dir()
-            .join(crate::file_transfer::safe_filename(&filename))
-            .display()
-            .to_string();
-        self.file_save = Some(FileSaveState { filename, data, path_input: default_path });
-        self.mode = Mode::FileSave;
-    }
-
-    fn handle_file_save_key(&mut self, code: KeyCode) -> Option<UiAction> {
-        if self.file_save.is_none() {
-            return None;
-        }
-        match code {
-            KeyCode::Esc => {
-                self.file_save = None;
-                self.mode = Mode::Normal;
-                None
-            }
-            KeyCode::Backspace => {
-                if let Some(state) = self.file_save.as_mut() {
-                    state.path_input.pop();
-                }
-                None
-            }
-            KeyCode::Char(c) => {
-                if let Some(state) = self.file_save.as_mut() {
-                    state.path_input.push(c);
-                }
-                None
-            }
-            KeyCode::Enter => {
-                self.save_current_file();
-                None
-            }
-            _ => None,
-        }
-    }
-
-    /// Writes the file to whatever path is currently typed into the popup,
-    /// creating parent directories as needed - the same `create_dir_all`-
-    /// then-write pattern `idstore::IdStore::save` already uses for its own
-    /// lazily-created `~/.aloo` directory. A write failure (bad path,
-    /// permissions, ...) is logged to stderr rather than surfaced on
-    /// screen, same precedent as `channel::on_join_failed`. Either way the
-    /// popup closes - there's no retry-in-place flow here, matching how
-    /// this app's other file operations (loading `id_store`/
-    /// `own_next_keys`) also just fall back and move on rather than
-    /// blocking on a local filesystem problem.
-    fn save_current_file(&mut self) {
-        let Some(state) = self.file_save.take() else { return };
-        self.mode = Mode::Normal;
-        let path = std::path::PathBuf::from(state.path_input.trim());
-        let result = (|| -> std::io::Result<()> {
-            if let Some(parent) = path.parent()
-                && !parent.as_os_str().is_empty()
-            {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(&path, &state.data)
-        })();
-        if let Err(e) = result {
-            eprintln!("aloo: failed to save file to {}: {e}", path.display());
-        }
     }
 
     // -------------------------------------------------------------
@@ -1340,14 +1475,16 @@ pub fn render(frame: &mut Frame, state: &UiState) {
     if state.mode == Mode::FileSend {
         super::file_send::render_file_send_popup(frame, area, state);
     }
-    if state.mode == Mode::FileSave {
-        render_file_save_popup(frame, area, state);
-    }
     // Drawn last, and independent of `mode`/the private-vs-channel view
     // above, so it overlays whatever's currently showing rather than
     // replacing it - matches `Ctrl+H` working from any view (`handle_key`).
     if state.help_open {
         render_help_popup(frame, area, state);
+    }
+    // A file offer sits above help but below an identity review, same
+    // priority order `handle_key` applies.
+    if let Some(offer) = state.file_offer_open() {
+        render_file_offer_popup(frame, area, offer, state.file_offer_focus);
     }
     // Drawn last of all - takes priority over even the help overlay, same
     // as it does in `handle_key`, so it's always interactable regardless
@@ -1355,6 +1492,70 @@ pub fn render(frame: &mut Frame, state: &UiState) {
     if let Some(review) = state.identity_review_open() {
         render_identity_review_popup(frame, area, review, state.identity_review_focus);
     }
+}
+
+/// The Accept/Reject popup for one incoming file offer
+/// (`docs/PROTOCOL.md`'s file transfer section) - visual shape mirrors
+/// `render_identity_review_popup`, `Accept` focused by default (see
+/// `FileOfferChoice`'s doc for why the default flips from the identity
+/// review's `Reject`-first one).
+fn render_file_offer_popup(frame: &mut Frame, area: Rect, offer: &PendingFileOffer, focus: FileOfferChoice) {
+    let title = format!("Incoming file from {}", offer.from_name);
+    let popup = centered_rect(64, 9, area);
+    let block = Block::default().title(title).borders(Borders::ALL);
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(3)])
+        .split(inner);
+
+    let location = match &offer.channel {
+        Some(name) => format!("#{name}"),
+        None => "a private message".to_string(),
+    };
+    let message = format!(
+        "{} is sending \"{}\" ({}) via {location}. Do you accept it?",
+        offer.from_name,
+        offer.filename,
+        format_file_size(offer.size)
+    );
+    frame.render_widget(Paragraph::new(message).wrap(ratatui::widgets::Wrap { trim: true }), rows[0]);
+
+    let button_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(rows[1]);
+    render_identity_button(frame, button_cols[0], "Accept", focus == FileOfferChoice::Accept);
+    render_identity_button(frame, button_cols[1], "Reject", focus == FileOfferChoice::Reject);
+}
+
+/// Renders a byte count as a short human-readable size, e.g. `842 B`,
+/// `128.0 KB`, `4.2 MB`, `1.10 GB` - used only for the file-offer popup and
+/// in-progress log rows, so this doesn't need to handle anything past GB.
+pub(crate) fn format_file_size(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    let b = bytes as f64;
+    if b < KB {
+        format!("{bytes} B")
+    } else if b < MB {
+        format!("{:.1} KB", b / KB)
+    } else if b < GB {
+        format!("{:.1} MB", b / MB)
+    } else {
+        format!("{:.2} GB", b / GB)
+    }
+}
+
+/// A fixed-width ASCII progress bar, e.g. `[####------]`, for an
+/// in-progress file transfer's log row.
+fn progress_bar(pct: u32) -> String {
+    const WIDTH: u32 = 10;
+    let filled = (pct.min(100) * WIDTH / 100) as usize;
+    format!("[{}{}]", "#".repeat(filled), "-".repeat(WIDTH as usize - filled))
 }
 
 /// The Accept/Reject popup for one peer's identity mismatch
@@ -1460,13 +1661,42 @@ pub(crate) fn render_messages(frame: &mut Frame, area: Rect, state: &UiState, dm
                         ),
                     ])
                 }
-                MessageBody::File { filename, .. } => Line::from(vec![
-                    Span::raw(format!("{}: ", entry.from_name)),
-                    Span::styled(
-                        format!("\u{1F4CE} {filename}"),
-                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                    ),
-                ]),
+                MessageBody::File { filename, total, status, .. } => {
+                    let mut spans = vec![Span::raw(format!("{}: ", entry.from_name))];
+                    if let Some(to_name) = &entry.to_name {
+                        spans.push(Span::raw(format!("\u{2192} {to_name} ")));
+                    }
+                    match status {
+                        FileTransferStatus::Pending => spans.push(Span::styled(
+                            format!("\u{1F4CE} {filename} (waiting for accept...)"),
+                            Style::default().fg(Color::Cyan),
+                        )),
+                        FileTransferStatus::InProgress { bytes } => {
+                            let pct = if *total == 0 {
+                                100
+                            } else {
+                                ((*bytes as f64 / *total as f64) * 100.0).clamp(0.0, 100.0) as u32
+                            };
+                            spans.push(Span::styled(
+                                format!("\u{1F4CE} {filename} {} {pct}%", progress_bar(pct)),
+                                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                            ));
+                        }
+                        FileTransferStatus::Completed => spans.push(Span::styled(
+                            format!("\u{1F4CE} {filename}"),
+                            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                        )),
+                        FileTransferStatus::Rejected => spans.push(Span::styled(
+                            format!("\u{1F4CE} {filename} (rejected)"),
+                            Style::default().fg(Color::DarkGray),
+                        )),
+                        FileTransferStatus::Failed => spans.push(Span::styled(
+                            format!("\u{1F4CE} {filename} (failed)"),
+                            Style::default().fg(Color::Red),
+                        )),
+                    }
+                    Line::from(spans)
+                }
             };
             ListItem::new(line)
         })
@@ -1527,18 +1757,6 @@ pub(crate) fn render_input_bar(frame: &mut Frame, area: Rect, state: &UiState) {
         let cursor_x = inner.x + (state.input.chars().count() as u16).min(inner.width.saturating_sub(1));
         frame.set_cursor_position((cursor_x, inner.y));
     }
-}
-
-/// The receiving side's save-location popup (`open_file_save_popup`) - a
-/// single editable path field, same visual shape as
-/// `channel::render_join_popup`.
-fn render_file_save_popup(frame: &mut Frame, area: Rect, state: &UiState) {
-    let Some(fs) = &state.file_save else { return };
-    let popup = centered_rect(64, 3, area);
-    let title = format!("Save '{}' (Enter to confirm, Esc to cancel)", fs.filename);
-    let block = Block::default().title(title).borders(Borders::ALL);
-    let text = format!("> {}", fs.path_input);
-    frame.render_widget(Paragraph::new(text).block(block), popup);
 }
 
 /// Border style shared by every bordered region: yellow while it holds

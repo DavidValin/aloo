@@ -757,13 +757,14 @@ fn render_help_popup_shows_expected_content_when_open() {
     assert!(rows.iter().any(|r| r.contains("Ctrl+J")), "expected help on joining a hidden channel: {rows:?}");
     assert!(rows.iter().any(|r| r.contains("Space")), "expected help on sending a voice message: {rows:?}");
     assert!(rows.iter().any(|r| r.contains("/file")), "expected help on sending a file: {rows:?}");
-    assert!(rows.iter().any(|r| r.contains("RSAPM")), "expected the encryption tags explained: {rows:?}");
 
-    // Identity pinning sits far enough down the (now longer) help text
-    // that a typical terminal does not show it without scrolling - see
-    // docs/SPEC.md Functionality #7's scrollable overlay.
+    // The encryption tags and identity pinning both sit far enough down the
+    // (now longer) help text that a typical terminal does not show them
+    // without scrolling - see docs/SPEC.md Functionality #7's scrollable
+    // overlay.
     press(&mut state, KeyCode::End);
     let rows = rendered_rows(&state);
+    assert!(rows.iter().any(|r| r.contains("RSAPM")), "expected the encryption tags explained: {rows:?}");
     assert!(
         rows.iter().any(|r| r.contains("Identity pinning")),
         "expected id_store identity pinning explained after scrolling to the bottom: {rows:?}"
@@ -965,13 +966,17 @@ fn sending_a_channel_message_excludes_a_pending_or_rejected_member() {
 /// @requirement TB-108
 #[test]
 fn help_popup_widens_enough_to_show_its_longest_line_without_clipping_it() {
-    // The rsa_per_msg encryption line is the longest line in the help
-    // text (86 terminal cells including its emoji) - on a 100-wide
-    // terminal the old fixed 74-wide popup clipped it. Checked without the
-    // emoji itself, since a 2-cell-wide emoji leaves a padding cell in
-    // ratatui's buffer that would otherwise break a plain substring match.
+    // The rsa_per_msg encryption line (86 terminal cells including its
+    // emoji) is a good proxy for whether the popup widened correctly - on
+    // a 100-wide terminal the old fixed 74-wide popup clipped it. Checked
+    // without the emoji itself, since a 2-cell-wide emoji leaves a padding
+    // cell in ratatui's buffer that would otherwise break a plain substring
+    // match. It now sits below the fold on the first screen (the help text
+    // has grown since this was written), so this scrolls to it first -
+    // same precedent as `render_help_popup_shows_expected_content_when_open`.
     let mut state = joined_general_with(vec![]);
     state.help_open = true;
+    press(&mut state, KeyCode::End);
     let rows = rendered_rows(&state);
     let tail = "rsa_per_msg: a fresh key every message, signed by the one it replaces";
     assert!(rows.iter().any(|r| r.contains(tail)), "expected the longest help line in full, unclipped: {rows:?}");

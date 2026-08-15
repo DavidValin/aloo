@@ -20,7 +20,7 @@ use ratatui::Frame;
 
 use crate::proto::UserId;
 
-use super::ui::{centered_rect, focus_border_style, MessageBody, Mode, UiAction, UiState};
+use super::ui::{centered_rect, focus_border_style, Mode, UiAction, UiState};
 use super::ui_connect_popup::{render_file_browser, FileBrowserState};
 
 /// Who a file send is addressed to - just the identity, not a frozen
@@ -55,10 +55,12 @@ pub struct FileSendState {
     /// than closing the whole flow.
     pub confirm: Option<PathBuf>,
     pub confirm_focus: FileConfirmChoice,
-    /// Set when the selected file fails a pre-send check (currently: too
-    /// large - see `file_transfer::MAX_FILE_BYTES`) - shown inline on the
-    /// confirmation box, same convention as `ui_connect_popup::
-    /// ConnectPopupState::error`.
+    /// Set when the selected file can't even be stat'd (e.g. removed or
+    /// permissions changed between being picked in the browser and Send
+    /// being confirmed) - shown inline on the confirmation box, same
+    /// convention as `ui_connect_popup::ConnectPopupState::error`. There is
+    /// no size cap to fail here (`docs/PROTOCOL.md`'s file transfer
+    /// section) - a file transfer is streamed, not read whole.
     pub error: Option<String>,
 }
 
@@ -179,10 +181,15 @@ impl UiState {
         }
     }
 
-    /// Reads the selected file and, if it passes the size check, emits the
-    /// send action - closing the whole `/file` flow and pushing an
-    /// optimistic outgoing log entry, the same immediate-echo treatment
-    /// text sends already get (`push_outgoing_channel`/`push_outgoing_dm`).
+    /// Stats the selected file (never reads its contents - a file transfer
+    /// is streamed from disk only once the recipient accepts,
+    /// `docs/PROTOCOL.md`'s file transfer section) and emits the send
+    /// action, closing the whole `/file` flow. Unlike a text send, the
+    /// outgoing log row(s) aren't pushed here: the `stream_id` each row is
+    /// keyed by isn't allocated until `crate::channel::handle_send_file`/
+    /// `crate::direct_message::handle_send_file` run (same reasoning
+    /// `handle_voice_record_start` already established for voice - the
+    /// caller that allocates the stream id is the one that logs the row).
     /// Recipients are resolved fresh here rather than reusing whatever was
     /// current when `/file` was first typed, since the browse+confirm
     /// detour can take a while and membership/offline/trust state keeps
@@ -191,28 +198,8 @@ impl UiState {
     fn confirm_file_send(&mut self) -> Option<UiAction> {
         let path = self.file_send.as_ref()?.confirm.clone()?;
 
-        match std::fs::metadata(&path) {
-            Ok(meta) if meta.len() > crate::file_transfer::MAX_FILE_BYTES => {
-                if let Some(state) = self.file_send.as_mut() {
-                    state.error = Some(format!(
-                        "file too large ({} bytes, max {})",
-                        meta.len(),
-                        crate::file_transfer::MAX_FILE_BYTES
-                    ));
-                }
-                return None;
-            }
-            Ok(_) => {}
-            Err(e) => {
-                if let Some(state) = self.file_send.as_mut() {
-                    state.error = Some(format!("{e}"));
-                }
-                return None;
-            }
-        }
-
-        let data = match std::fs::read(&path) {
-            Ok(d) => d,
+        let size = match std::fs::metadata(&path) {
+            Ok(meta) => meta.len(),
             Err(e) => {
                 if let Some(state) = self.file_send.as_mut() {
                     state.error = Some(format!("{e}"));
@@ -220,21 +207,16 @@ impl UiState {
                 return None;
             }
         };
+
         let filename = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "file".to_string());
+        let filename = crate::file_transfer::truncate_filename(&filename);
 
         let target = self.file_send.as_ref()?.target.clone();
         let action = match target {
             FileSendTarget::Channel(name) => {
                 let tab = self.channels.iter().find(|c| c.name == name)?;
                 let recipients = self.recipients_for_channel(tab);
-                let action = UiAction::SendFileChannel {
-                    channel: name.clone(),
-                    filename: filename.clone(),
-                    data: data.clone(),
-                    recipients,
-                };
-                self.push_outgoing_channel(&name, MessageBody::File { filename, data });
-                action
+                UiAction::SendFileChannel { channel: name, path, filename, size, recipients }
             }
             FileSendTarget::Direct(peer_id) => {
                 if self.offline.contains(&peer_id) || self.is_trust_gated(peer_id) {
@@ -243,15 +225,14 @@ impl UiState {
                     return None;
                 }
                 let peer = self.known_users.get(&peer_id)?.clone();
-                let action = UiAction::SendFileDirect {
+                UiAction::SendFileDirect {
                     to: peer_id,
-                    filename: filename.clone(),
-                    data: data.clone(),
+                    path,
+                    filename,
+                    size,
                     recipient_key_mode: peer.key_mode,
                     recipient_pubkey_der: peer.public_key_der,
-                };
-                self.push_outgoing_dm(peer_id, MessageBody::File { filename, data });
-                action
+                }
             }
         };
 

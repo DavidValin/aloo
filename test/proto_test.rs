@@ -70,20 +70,23 @@ fn envelope_roundtrips() {
     }
 }
 
-/// A `Content::File` envelope round-trips exactly like `Content::Text`
-/// (docs/PROTOCOL.md §7.6) - no special-casing anywhere in the wire codec.
+/// A `Content::FileOffer` envelope, carried by `ClientMessage::FileOffer`,
+/// round-trips exactly like `Content::Text` (docs/PROTOCOL.md's file
+/// transfer section) - no special-casing anywhere in the wire codec.
 ///
 /// @requirement TB-123
 #[test]
-fn content_file_envelope_roundtrips() {
-    let env = Envelope { content: Content::File, blocks: vec![vec![1, 2, 3]] };
-    let msg = ClientMessage::SendChannel { channel: "general".into(), per_recipient: vec![(UserId(2), env.clone())] };
+fn content_file_offer_envelope_roundtrips() {
+    let env = Envelope { content: Content::FileOffer, blocks: vec![vec![1, 2, 3]] };
+    let msg = ClientMessage::FileOffer { to: UserId(2), stream_id: 7, channel: Some("general".into()), envelope: env.clone() };
     let bytes = encode(&msg).unwrap();
     let decoded: ClientMessage = decode(&bytes).unwrap();
     match decoded {
-        ClientMessage::SendChannel { channel, per_recipient } => {
-            assert_eq!(channel, "general");
-            assert_eq!(per_recipient, vec![(UserId(2), env)]);
+        ClientMessage::FileOffer { to, stream_id, channel, envelope } => {
+            assert_eq!(to, UserId(2));
+            assert_eq!(stream_id, 7);
+            assert_eq!(channel.as_deref(), Some("general"));
+            assert_eq!(envelope, env);
         }
         _ => panic!("wrong variant"),
     }
@@ -341,4 +344,38 @@ fn format_with_name_puts_every_tag_after_the_name() {
     assert_eq!(KeyMode::Password.format_with_name("dan"), "dan \u{1F6A8} PWD");
     assert_eq!(KeyMode::None.format_with_name("eve"), "eve \u{1F6A8} PLAIN");
     assert_eq!(KeyMode::PqHybrid.format_with_name("frank"), "frank \u{1F6E1}\u{FE0F} PQH");
+}
+
+/// The rest of the file-transfer message family (`docs/PROTOCOL.md`'s file
+/// transfer section) round-trips the same way every other `ClientMessage`/
+/// `ServerMessage` variant does - `FileAccept`/`FileReject`/`FileChunk`/
+/// `FileEnd` are always addressed point-to-point (`to`/`from`, never a
+/// channel), same shape as the existing `StreamDirect*` family.
+///
+/// @requirement TB-141
+#[test]
+fn file_transfer_message_family_roundtrips() {
+    let accept = ClientMessage::FileAccept { to: UserId(2), stream_id: 7 };
+    assert_eq!(decode::<ClientMessage>(&encode(&accept).unwrap()).unwrap(), accept);
+
+    let reject = ClientMessage::FileReject { to: UserId(2), stream_id: 7 };
+    assert_eq!(decode::<ClientMessage>(&encode(&reject).unwrap()).unwrap(), reject);
+
+    let chunk = ClientMessage::FileChunk { to: UserId(2), stream_id: 7, seq: 3, blocks: vec![vec![1, 2], vec![3]] };
+    assert_eq!(decode::<ClientMessage>(&encode(&chunk).unwrap()).unwrap(), chunk);
+
+    let end = ClientMessage::FileEnd { to: UserId(2), stream_id: 7 };
+    assert_eq!(decode::<ClientMessage>(&encode(&end).unwrap()).unwrap(), end);
+
+    let accepted = ServerMessage::FileAccepted { from: UserId(2), stream_id: 7 };
+    assert_eq!(decode::<ServerMessage>(&encode(&accepted).unwrap()).unwrap(), accepted);
+
+    let rejected = ServerMessage::FileRejected { from: UserId(2), stream_id: 7 };
+    assert_eq!(decode::<ServerMessage>(&encode(&rejected).unwrap()).unwrap(), rejected);
+
+    let server_chunk = ServerMessage::FileChunk { from: UserId(2), stream_id: 7, seq: 3, blocks: vec![vec![9]] };
+    assert_eq!(decode::<ServerMessage>(&encode(&server_chunk).unwrap()).unwrap(), server_chunk);
+
+    let server_end = ServerMessage::FileEnd { from: UserId(2), stream_id: 7 };
+    assert_eq!(decode::<ServerMessage>(&encode(&server_end).unwrap()).unwrap(), server_end);
 }

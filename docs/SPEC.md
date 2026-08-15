@@ -19,11 +19,12 @@ src/session.rs            <-- the live connected session: event loop, session st
 src/channel.rs             <-- channel-addressed send/receive handling for the session
 src/direct_message.rs       <-- DM-addressed send/receive handling for the session
 src/voice_stream.rs          <-- live voice streaming plumbing shared by channels and DMs
+src/file_stream.rs            <-- consent-gated, streamed file transfer plumbing, Functionality #10
 src/proto.rs        <-- implements the communication protocol
 src/voice.rs         <-- handles capture / live playback (mixer)
 src/crypto.rs         <-- handles encryption / decryption
 src/rekey.rs           <-- rsa_per_msg per-peer key rotation state (pure logic, no I/O)
-src/file_transfer.rs     <-- Content::File plaintext shape, size bound, default save dir, Functionality #10
+src/file_transfer.rs     <-- FileOfferPayload plaintext shape, chunking/filename constants, download dir, Functionality #10
 src/idstore.rs          <-- identity-pinning store (nickname -> public key), Functionality #9
 src/own_next_keys.rs     <-- this client's own per-peer continuity keys, Functionality #6/#9
 src/platform.rs           <-- cross-platform ~/.aloo home-directory resolution, shared by idstore.rs/own_next_keys.rs
@@ -191,12 +192,12 @@ When a tab is selected, the user joins that channel. The join is broadcast to al
    - Until a peer's review is resolved (`Pending`), and for as long as it stays `Rejected`, messaging with them is gated: this client won't send them anything (excluded from a channel send, and their private room can't be opened or typed into at all), and anything they send is held rather than displayed — decrypted normally, since that only needs *this client's* own key, but not shown until they're `Accept`ed. Their sidebar entry renders red the whole time, taking priority over the offline-gray color. A channel message is otherwise unaffected: it still reaches every other, verified member.
    - Several peers can be unresolved at once; the popup shows one at a time, in the order their mismatches were detected — resolving the one showing (either button) opens the next automatically.
 
-10. **Send a file to a channel or a user.** Type `/file` in the compose bar and press Enter (must be joined to a channel, or have a non-offline, verified DM room open — otherwise this does nothing and the typed `/file` stays put, same as Space with nowhere to record voice to). A popup file browser opens, centered on screen — the same in-TUI widget (`Up`/`Down` select, `Enter` open a directory or pick a file, `Left`/`Right` back/forward, `Esc` cancel) the connect popup's `rsa` key fields already use.
-    - **Confirmation.** Selecting a file (Enter on it, not a directory) replaces the browser with a confirmation box: `Send "<filename>" to #<channel>?` or `Send "<filename>" to <username>?`, with two buttons, **Send file** and **Discard** — `Discard` focused by default, same reasoning as the identity review popup's `Reject`-first default (Functionality #9): sending should never be one accidental Enter away. `Left`/`Right`/`Tab` move focus, `Enter` confirms. Choosing **Discard** returns to the file browser at the same directory (not all the way back to the compose bar); pressing `Esc` on the confirmation box does the same. `Esc` on the browser itself cancels the whole `/file` flow.
-    - **Sending.** Choosing **Send file** reads the file from disk and sends it as one message — not streamed like voice, since a file is already a complete blob rather than a live capture. It's encrypted exactly like a text message: RSA-OAEP per recipient, split into blocks the same way (`docs/PROTOCOL.md` §7.6/§8.1). A file over 1 MiB is rejected with an inline error on the confirmation box rather than sent (`docs/PROTOCOL.md` §7.6 explains the size math) — the browser and selection stay in place so a different, smaller file can be picked instead.
-    - **Appearance.** Both sides render the message as a paperclip and the filename, e.g. `📎 report.pdf`, in the channel/DM log — no live "sending..." placeholder the way voice has, since there's nothing to stream.
-    - **Saving.** Pressing `Enter` on a file entry (message log focused) opens a save-location popup, prefilled with `~/.aloo/download/<filename>` (the filename reduced to just its own name, never a path the sender might have tried to sneak in) — a single editable text field, same convention as the connect popup's `id_store`/`own_next_keys` fields, rather than another nested directory browser. `Enter` saves to whatever path is currently typed (creating parent directories as needed); `Esc` cancels.
-    - **Trust gating and offline peers** work exactly like text (Functionality #8/#9): a file from a `Pending`/`Rejected` sender is decrypted but held until they're `Accept`ed; a gated or offline channel member is simply excluded from that send's recipients, same as text/voice; an offline or gated DM peer's room can't receive one at all (same gate that already blocks `/file` from starting in the first place).
+10. **Send a file to a channel or a user, with the recipient's consent.** Type `/file` in the compose bar and press Enter (must be joined to a channel, or have a non-offline, verified DM room open — otherwise this does nothing and the typed `/file` stays put, same as Space with nowhere to record voice to). A popup file browser opens, centered on screen — the same in-TUI widget (`Up`/`Down` select, `Enter` open a directory or pick a file, `Left`/`Right` back/forward, `Esc` cancel) the connect popup's `rsa` key fields already use.
+    - **Confirmation.** Selecting a file (Enter on it, not a directory) replaces the browser with a confirmation box: `Send "<filename>" to #<channel>?` or `Send "<filename>" to <username>?`, with two buttons, **Send file** and **Discard** — `Discard` focused by default, same reasoning as the identity review popup's `Reject`-first default (Functionality #9): sending should never be one accidental Enter away. `Left`/`Right`/`Tab` move focus, `Enter` confirms. Choosing **Discard** returns to the file browser at the same directory (not all the way back to the compose bar); pressing `Esc` on the confirmation box does the same. `Esc` on the browser itself cancels the whole `/file` flow. Filenames longer than 230 characters are cropped at the end before being offered (`docs/PROTOCOL.md`'s file transfer section) — the receiving client independently crops again on whatever it actually receives.
+    - **Offering.** Choosing **Send file** sends an *offer* — filename and size, encrypted exactly like a text message (RSA-OAEP per recipient, split into blocks the same way, `docs/PROTOCOL.md` §8.1) — to every ready recipient; nothing is read from disk yet. There is no size cap: since the file itself is streamed in small chunks only once accepted (below), the old whole-file-in-one-message limit no longer applies. A channel send is one independent offer per member, each shown as its own row in your log (below) — one recipient accepting doesn't wait on, or get affected by, another rejecting.
+    - **The recipient's popup.** Before any file bytes arrive, the receiving side sees a centered popup — accompanied by a chime (`assets/bell.wav`) — reading `<nickname> is sending "<filename>" (<size>) via #<channel>` (or "via a private message" for a DM). Two buttons, **Accept** and **Reject** — **Accept focused by default**, the opposite of this app's usual safety-first default (Functionality #9's identity review, this flow's own Discard-first confirmation above): accepting an incoming file is the common case here, so it shouldn't cost an extra keystroke. `Left`/`Right`/`Tab` move focus, `Enter` confirms. Several offers arriving close together queue and show one at a time, same as identity reviews.
+    - **Appearance and progress.** Both sides render the message as a paperclip and the filename, e.g. `📎 report.pdf`, in the channel/DM log — a channel send's per-recipient rows also name who each is addressed to. Before a decision, the sender's row reads "(waiting for accept...)"; once **Accept**ed, the file streams in small chunks straight to `~/.aloo/downloads` (never held whole in memory on either side) and both sides' rows show a live progress bar and percentage until every byte has moved, at which point the row settles back to the plain paperclip-and-filename look. Choosing **Reject** ends it there — the sender's row shows "(rejected)" instead, so declining a file is as visible to them as accepting one.
+    - **Trust gating and offline peers** work exactly like text (Functionality #8/#9): an offer from a `Pending`/`Rejected` sender is decrypted but held — no popup, no chime — until they're `Accept`ed, at which point it's queued for real; a gated or offline channel member is simply not offered the file at all, same as text/voice; an offline or gated DM peer's room can't receive one at all (same gate that already blocks `/file` from starting in the first place).
 
 11. **`pq_hybrid`: a post-quantum hybrid encryption method** — ML-DSA-87+RSA4096 signing, ML-KEM-1024+RSA4096 key-wrap, AES-256-GCM bulk encryption. Full model in `docs/PROTOCOL.md` §13; from the user's point of view:
     - Selected as the `my_key` type in the connect popup - and selected by default. Unlike every other type, its keys aren't generated fresh in-process at connect time; they live in a keybundle file pair (`file_pub`/`file_priv`, the same shape `rsa` uses). Unlike `rsa`, though, you don't have to prepare that pair yourself: the popup prefills the fields (from `~/.aloo/.cache`'s most-recently-used entry for a server you've connected to before, or otherwise a freshly-assigned location under `~/.aloo/`), and connecting transparently generates the actual keys at that location the first time it's used, if they don't already exist (`docs/PROTOCOL.md` §13.9). `aloo --keygen-pq-hybrid <prefix>` (writes `<prefix>` and `<prefix>.pub`, mirroring `openssl`'s `my_key`/`my_key.pub` convention for `rsa`) is still there if you want to generate one yourself - e.g. to point both files at a specific, memorable location, or to produce one to move to another machine - but it's optional now, not required.
@@ -291,6 +292,32 @@ dedicated thread — never on the async event loop.
 Each incoming stream gets its own decrypt thread because RSA private-key
 decrypt is much costlier than public-key encrypt — one shared thread would fall
 behind real time with two or three simultaneous speakers.
+
+### File transfer
+
+Consent-gated and streamed (Functionality #10, `docs/PROTOCOL.md`'s file
+transfer section) - the offer is sent/encrypted like text, then an accepted
+transfer's bytes move like voice's chunk stream, except always
+point-to-point (never a channel broadcast) since accept/reject/progress is
+inherently per-recipient. `file_stream.rs` mirrors `voice_stream.rs`'s
+plumbing but moves bytes to/from disk instead of the audio mixer, reusing
+its RSA/PQ dispatch types directly rather than duplicating them.
+
+| Stage | Where |
+| --- | --- |
+| Offer, one per ready recipient — channel | `channel.rs:95` `handle_send_file` |
+| Offer — DM | `direct_message.rs:63` `handle_send_file` |
+| Server relay (no decrypt, existence check only) | `server.rs` `route_file_offer`/`route_file_accept`/`route_file_reject`/`route_file_chunk`/`route_file_end` |
+| Incoming offer: decrypt, trust-gate, queue + bell | `session.rs:1201` `decrypt_file_offer`, `session.rs:1228` `handle_incoming_file_offer` |
+| Accept: spawn the receive worker, log the row | `session.rs:609` `accept_file_offer` |
+| Sender learns of Accept: spawn the send worker | `session.rs:757` (`ServerMessage::FileAccepted` arm) |
+| Send worker — reads/encrypts/sends one chunk at a time | `file_stream.rs:70` `spawn_send_file_worker` |
+| Receive worker — decrypts/writes one chunk at a time | `file_stream.rs:124` `spawn_receive_file_worker` |
+| Forward an incoming chunk/end to its worker | `file_stream.rs:183`/`:198` `forward_chunk`/`end_incoming_transfer`, called from `session.rs:778`/`:781` |
+| Progress/completion/failure → log row | `session.rs:1254` `handle_file_event` → `UiState::set_file_progress`/`set_file_completed`/`set_file_rejected`/`set_file_failed` |
+
+Line numbers are as of the commit that added this section; a drifted number
+still resolves via the named function, same convention as the tables above.
 
 ### What `rsa_per_msg` adds on top
 

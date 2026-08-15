@@ -222,20 +222,20 @@ pub struct Envelope {
     pub blocks: Vec<Vec<u8>>,
 }
 
-/// Live-streamed voice never goes through `Envelope` (see §7.3) - `File` is
-/// the "future non-streamed content type" this enum was always meant to
-/// grow (see the doc comment above): a whole file is a discrete, already
-/// complete blob, so it's sent exactly like `Text` - one ordinary
-/// `SendChannel`/`SendDirect`, no new wire message types. The plaintext
-/// recovered by decrypting `Envelope::blocks` is, by convention (mirroring
-/// how voice's raw-PCM plaintext convention is documented rather than
-/// wire-enforced, §7.3), a bincode encoding (`proto::encode`/`decode`) of
-/// `crate::file_transfer::FilePayload` - see `docs/PROTOCOL.md`'s file
-/// transfer section.
+/// `FileOffer` is the one non-streamed content type this enum carries - the
+/// *offer* of a file transfer (`docs/PROTOCOL.md`'s file transfer section),
+/// sent as one ordinary `SendChannel`/`SendDirect`-style envelope so the
+/// offer itself (who's sending what, how big) gets the same per-recipient
+/// RSA/PQ privacy as a text message. The actual file bytes are never
+/// wrapped in an `Envelope` at all - once accepted, they're streamed as raw
+/// `FileChunk` blocks, exactly like voice's PCM (§7.3), so there's no
+/// `Content::File` variant. The plaintext recovered by decrypting
+/// `Envelope::blocks` for `FileOffer` is a bincode encoding
+/// (`proto::encode`/`decode`) of `crate::file_transfer::FileOfferPayload`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Content {
     Text,
-    File,
+    FileOffer,
 }
 
 /// Messages the client sends to the server.
@@ -296,6 +296,23 @@ pub enum ClientMessage {
         new_public_key_der: Vec<u8>,
         signature: Vec<u8>,
     },
+
+    // -------------------------------------------------------------
+    // File transfer (`docs/PROTOCOL.md`'s file transfer section):
+    // consent-gated and streamed, modeled as one independent
+    // point-to-point stream per recipient - `(from, stream_id)`-identified
+    // exactly like voice (§7.3), even when the send originated from a
+    // channel (a channel send is just N independent offers, one per
+    // recipient, each with its own `stream_id` from the sender's usual
+    // per-connection counter). `FileOffer`'s `envelope` carries a
+    // `Content::FileOffer` plaintext (`file_transfer::FileOfferPayload`);
+    // nothing is read off disk or sent until `FileAccept` arrives.
+    // -------------------------------------------------------------
+    FileOffer { to: UserId, stream_id: u64, channel: Option<String>, envelope: Envelope },
+    FileAccept { to: UserId, stream_id: u64 },
+    FileReject { to: UserId, stream_id: u64 },
+    FileChunk { to: UserId, stream_id: u64, seq: u32, blocks: Vec<Vec<u8>> },
+    FileEnd { to: UserId, stream_id: u64 },
 }
 
 /// Messages the server sends to a client.
@@ -360,6 +377,13 @@ pub enum ServerMessage {
         new_public_key_der: Vec<u8>,
         signature: Vec<u8>,
     },
+
+    /// Relayed mirror of the `ClientMessage::File*` family - see there.
+    FileOffer { from: UserId, from_name: String, stream_id: u64, channel: Option<String>, envelope: Envelope },
+    FileAccepted { from: UserId, stream_id: u64 },
+    FileRejected { from: UserId, stream_id: u64 },
+    FileChunk { from: UserId, stream_id: u64, seq: u32, blocks: Vec<Vec<u8>> },
+    FileEnd { from: UserId, stream_id: u64 },
 
     Error { message: String },
 }

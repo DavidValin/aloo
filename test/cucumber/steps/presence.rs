@@ -144,19 +144,20 @@ async fn help_content(w: &mut AlooWorld) {
         ("Ctrl+J", "how to join a hidden channel"),
         ("Space", "how to send a voice message"),
         ("/file", "how to send a file"),
-        ("RSAPM", "what the encryption tags mean"),
     ] {
         assert!(rows.iter().any(|r| r.contains(needle)), "expected {what}: {rows:?}");
     }
 }
 
-/// Identity pinning is far enough down the (now longer) help text that a
-/// typical terminal does not show it without scrolling - see
-/// `docs/SPEC.md` Functionality #7's scrollable overlay.
+/// The encryption tags and identity pinning are both far enough down the
+/// (now longer) help text that a typical terminal does not show them
+/// without scrolling - see `docs/SPEC.md` Functionality #7's scrollable
+/// overlay.
 #[then("scrolling to the bottom reveals identity pinning")]
 async fn help_content_scrolled(w: &mut AlooWorld) {
     press_key(w, KeyCode::End, KeyModifiers::NONE);
     let rows = ui_rows(w.ui_ref());
+    assert!(rows.iter().any(|r| r.contains("RSAPM")), "expected the encryption tags explained: {rows:?}");
     assert!(rows.iter().any(|r| r.contains("Identity pinning")), "expected identity pinning: {rows:?}");
 }
 
@@ -194,8 +195,12 @@ async fn room_untouched(w: &mut AlooWorld) {
     );
 }
 
+/// The rsa_per_msg encryption line now sits below the fold on the first
+/// screen (the help text has grown since this was written) - scrolls to it
+/// first, same precedent as `help_content_scrolled`.
 #[then("the help popup shows its longest line unclipped")]
 async fn help_unclipped(w: &mut AlooWorld) {
+    press_key(w, KeyCode::End, KeyModifiers::NONE);
     let rows = ui_rows(w.ui_ref());
     let tail = "rsa_per_msg: a fresh key every message, signed by the one it replaces";
     assert!(rows.iter().any(|r| r.contains(tail)), "expected the longest help line in full: {rows:?}");

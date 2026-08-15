@@ -56,27 +56,40 @@ pub(crate) async fn handle_send_text(
     Ok(())
 }
 
-/// DM counterpart of `channel::handle_send_file` - see there for why
-/// readiness is a snapshot-and-exclude rather than text's queue-if-not-ready.
+/// DM counterpart of `channel::handle_send_file` - see there for the
+/// offer/accept/reject/stream shape. A DM has only one recipient, so this
+/// is a single transfer rather than a fan-out.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_send_file(
     wr: &mut (impl AsyncWrite + Unpin),
+    ui_state: &mut UiState,
     session: &mut SessionState,
     to: UserId,
+    path: std::path::PathBuf,
     filename: String,
-    data: Vec<u8>,
+    size: u64,
     recipient_key_mode: KeyMode,
     recipient_pubkey_der: Vec<u8>,
 ) -> proto::Result<()> {
-    if !session.remote_keys.try_use(to) {
+    if !crate::channel::can_address(recipient_key_mode, session.own_key_mode) || !session.remote_keys.try_use(to) {
         return Ok(());
     }
-    let payload = crate::file_transfer::FilePayload { filename, data };
+    let payload = crate::file_transfer::FileOfferPayload { filename: filename.clone(), size };
     let Ok(plaintext) = proto::encode(&payload) else { return Ok(()) };
-    if let Some(envelope) = encrypt_for_recipient(session, recipient_key_mode, &recipient_pubkey_der, &plaintext, Content::File) {
-        proto::write_message(wr, &ClientMessage::SendDirect { to, envelope }).await?;
-        session.conn_stats.record_event(Instant::now());
-        crate::session::request_rotation_if_per_message(session, to);
-    }
+    let Some(envelope) = encrypt_for_recipient(session, recipient_key_mode, &recipient_pubkey_der, &plaintext, Content::FileOffer)
+    else {
+        return Ok(());
+    };
+    let stream_id = session.next_stream_id;
+    let Some(key) = voice_stream::resolve_direct_key(session, stream_id, to, recipient_key_mode, &recipient_pubkey_der) else {
+        return Ok(());
+    };
+    session.next_stream_id += 1;
+    ui_state.log_own_file_offer_dm(to, stream_id, filename.clone(), size);
+    session.own_file_targets.insert(stream_id, crate::file_stream::OwnFileTarget { to, path, key });
+    proto::write_message(wr, &ClientMessage::FileOffer { to, stream_id, channel: None, envelope }).await?;
+    session.conn_stats.record_event(Instant::now());
+    crate::session::request_rotation_if_per_message(session, to);
     Ok(())
 }
 

@@ -10,8 +10,8 @@ use ratatui::Frame;
 use crate::proto::{KeyMode, UserId, UserInfo};
 
 use super::ui::{
-    finalize_held_stream, finalize_stream_entry, push_log_entry, render_input_bar, render_messages, Focus,
-    LogEntry, MessageBody, UiState,
+    finalize_held_stream, finalize_stream_entry, push_log_entry, render_input_bar, render_messages, FileTransferStatus,
+    Focus, LogEntry, MessageBody, UiState,
 };
 
 #[derive(Debug, Clone)]
@@ -61,7 +61,7 @@ impl UiState {
     }
 
     pub fn on_direct_message(&mut self, from: UserId, from_name: String, body: MessageBody) {
-        let entry = LogEntry { from, from_name: from_name.clone(), body, outgoing: false };
+        let entry = LogEntry { from, from_name: from_name.clone(), to_name: None, body, outgoing: false };
         // Same hold-and-reveal treatment as a channel message
         // (docs/PROTOCOL.md §12) - decrypts fine (our own key), but not
         // shown until `from` is Accepted. The room still isn't created yet
@@ -102,7 +102,7 @@ impl UiState {
                 &mut room.log,
                 &mut self.message_selected,
                 is_current,
-                LogEntry { from, from_name, body: MessageBody::Voice { duration_ms, pcm }, outgoing: true },
+                LogEntry { from, from_name, to_name: None, body: MessageBody::Voice { duration_ms, pcm }, outgoing: true },
             );
         }
     }
@@ -116,13 +116,14 @@ impl UiState {
                 &mut room.log,
                 &mut self.message_selected,
                 is_current,
-                LogEntry { from, from_name, body: MessageBody::VoiceStreaming { stream_id }, outgoing: true },
+                LogEntry { from, from_name, to_name: None, body: MessageBody::VoiceStreaming { stream_id }, outgoing: true },
             );
         }
     }
 
     pub fn on_direct_stream_start(&mut self, peer_id: UserId, from: UserId, from_name: String, stream_id: u64) {
-        let entry = LogEntry { from, from_name: from_name.clone(), body: MessageBody::VoiceStreaming { stream_id }, outgoing: false };
+        let entry =
+            LogEntry { from, from_name: from_name.clone(), to_name: None, body: MessageBody::VoiceStreaming { stream_id }, outgoing: false };
         if self.is_trust_gated(peer_id) {
             self.hold_message(peer_id, None, entry);
             return;
@@ -179,8 +180,62 @@ impl UiState {
                 &mut room.log,
                 &mut self.message_selected,
                 is_current,
-                LogEntry { from, from_name, body, outgoing: true },
+                LogEntry { from, from_name, to_name: None, body, outgoing: true },
             );
+        }
+    }
+
+    /// DM counterpart of `channel::log_own_file_offer_channel` - a DM room
+    /// only ever has one recipient, so there's nothing for `to_name` to
+    /// name (the room itself already does).
+    pub fn log_own_file_offer_dm(&mut self, to: UserId, stream_id: u64, filename: String, total: u64) {
+        let from = self.own_id.unwrap_or(UserId(0));
+        let from_name = self.own_name.clone();
+        let is_current = self.is_viewing_dm(to);
+        if let Some(room) = self.private_rooms.get_mut(&to) {
+            push_log_entry(
+                &mut room.log,
+                &mut self.message_selected,
+                is_current,
+                LogEntry {
+                    from,
+                    from_name,
+                    to_name: None,
+                    body: MessageBody::File { filename, total, stream_id, status: FileTransferStatus::Pending },
+                    outgoing: true,
+                },
+            );
+        }
+    }
+
+    /// DM counterpart of `channel::on_channel_file_offer_accepted`.
+    pub fn on_direct_file_offer_accepted(&mut self, from: UserId, from_name: String, stream_id: u64, filename: String, total: u64) {
+        let unread = self.active_private_room != Some(from);
+        let is_current = self.is_viewing_dm(from);
+        let fallback_peer = self.known_users.get(&from).cloned().unwrap_or_else(|| UserInfo {
+            id: from,
+            name: from_name.clone(),
+            public_key_der: Vec::new(),
+            key_mode: KeyMode::None,
+        });
+        let room = self
+            .private_rooms
+            .entry(from)
+            .or_insert_with(|| PrivateRoom { peer: fallback_peer, log: Vec::new(), unread: false });
+        push_log_entry(
+            &mut room.log,
+            &mut self.message_selected,
+            is_current,
+            LogEntry {
+                from,
+                from_name,
+                to_name: None,
+                body: MessageBody::File { filename, total, stream_id, status: FileTransferStatus::InProgress { bytes: 0 } },
+                outgoing: false,
+            },
+        );
+        if unread {
+            room.unread = true;
         }
     }
 }

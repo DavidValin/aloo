@@ -20,7 +20,7 @@ use crate::sysstats::CPU_HEALTHY_MAX_PCT;
 
 use super::ui::{
     finalize_held_stream, finalize_stream_entry, focus_border_style, push_log_entry, render_input_bar,
-    render_messages, LogEntry, MessageBody, Mode, UiAction, UiState,
+    render_messages, FileTransferStatus, LogEntry, MessageBody, Mode, UiAction, UiState,
 };
 
 /// How long a tab has to stay selected (`[`/`]`) before it's actually
@@ -195,7 +195,7 @@ impl UiState {
     }
 
     pub fn on_channel_message(&mut self, channel: &str, from: UserId, from_name: String, body: MessageBody) {
-        let entry = LogEntry { from, from_name, body, outgoing: false };
+        let entry = LogEntry { from, from_name, to_name: None, body, outgoing: false };
         // A Pending/Rejected sender's message decrypts fine (it's encrypted
         // with *our* key, not theirs) but is held back rather than shown -
         // docs/PROTOCOL.md §12 "hold and reveal" - until they're Accepted.
@@ -218,7 +218,7 @@ impl UiState {
                 &mut tab.log,
                 &mut self.message_selected,
                 is_current,
-                LogEntry { from, from_name, body: MessageBody::Voice { duration_ms, pcm }, outgoing: true },
+                LogEntry { from, from_name, to_name: None, body: MessageBody::Voice { duration_ms, pcm }, outgoing: true },
             );
         }
     }
@@ -236,7 +236,7 @@ impl UiState {
                 &mut tab.log,
                 &mut self.message_selected,
                 is_current,
-                LogEntry { from, from_name, body: MessageBody::VoiceStreaming { stream_id }, outgoing: true },
+                LogEntry { from, from_name, to_name: None, body: MessageBody::VoiceStreaming { stream_id }, outgoing: true },
             );
         }
     }
@@ -249,7 +249,7 @@ impl UiState {
     /// not yet trusted; `on_channel_stream_finished` finds it there and
     /// finalizes it in place, same as the visible-log case.
     pub fn on_channel_stream_start(&mut self, channel: &str, from: UserId, from_name: String, stream_id: u64) {
-        let entry = LogEntry { from, from_name, body: MessageBody::VoiceStreaming { stream_id }, outgoing: false };
+        let entry = LogEntry { from, from_name, to_name: None, body: MessageBody::VoiceStreaming { stream_id }, outgoing: false };
         if self.is_trust_gated(from) {
             self.hold_message(from, Some(channel.to_string()), entry);
             return;
@@ -302,7 +302,64 @@ impl UiState {
                 &mut tab.log,
                 &mut self.message_selected,
                 is_current,
-                LogEntry { from, from_name, body, outgoing: true },
+                LogEntry { from, from_name, to_name: None, body, outgoing: true },
+            );
+        }
+    }
+
+    /// Creates one recipient's pending outgoing file-transfer row in the
+    /// channel log, straight away (before that recipient's Accept/Reject
+    /// response arrives) - mirrors `log_own_voice_stream_start_channel`'s
+    /// "show it live" precedent. A channel file send creates one of these
+    /// per recipient (`docs/PROTOCOL.md`'s file transfer section), `to_name`
+    /// naming which one this row is addressed to; later
+    /// progress/completion events find it again by `(from, stream_id)`
+    /// (`update_file_entry`).
+    pub fn log_own_file_offer_channel(&mut self, channel: &str, to_name: &str, stream_id: u64, filename: String, total: u64) {
+        let from = self.own_id.unwrap_or(UserId(0));
+        let from_name = self.own_name.clone();
+        let is_current = self.is_viewing_channel(channel);
+        if let Some(tab) = self.channels.iter_mut().find(|c| c.name == channel) {
+            push_log_entry(
+                &mut tab.log,
+                &mut self.message_selected,
+                is_current,
+                LogEntry {
+                    from,
+                    from_name,
+                    to_name: Some(to_name.to_string()),
+                    body: MessageBody::File { filename, total, stream_id, status: FileTransferStatus::Pending },
+                    outgoing: true,
+                },
+            );
+        }
+    }
+
+    /// Creates the receiving side's row the moment a file offer is
+    /// accepted (`docs/PROTOCOL.md`'s file transfer section) - there is no
+    /// row at all while it was only `Pending` in the offer popup.
+    pub fn on_channel_file_offer_accepted(
+        &mut self,
+        channel: &str,
+        from: UserId,
+        from_name: String,
+        stream_id: u64,
+        filename: String,
+        total: u64,
+    ) {
+        let is_current = self.is_viewing_channel(channel);
+        if let Some(tab) = self.channels.iter_mut().find(|c| c.name == channel) {
+            push_log_entry(
+                &mut tab.log,
+                &mut self.message_selected,
+                is_current,
+                LogEntry {
+                    from,
+                    from_name,
+                    to_name: None,
+                    body: MessageBody::File { filename, total, stream_id, status: FileTransferStatus::InProgress { bytes: 0 } },
+                    outgoing: false,
+                },
             );
         }
     }

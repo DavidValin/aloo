@@ -178,6 +178,22 @@ pub fn end_chime_samples() -> Vec<i16> {
     END_CHIME_SAMPLES.get_or_init(|| decode_wav_to_mono(END_CHIME_WAV).unwrap_or_default()).clone()
 }
 
+/// Bundled the same way as `END_CHIME_WAV` - a plain WAV, no MP3-decoding
+/// crate needed.
+const BELL_CHIME_WAV: &[u8] = include_bytes!("../assets/bell.wav");
+
+static BELL_CHIME_SAMPLES: OnceLock<Vec<i16>> = OnceLock::new();
+
+/// Mono PCM16 samples, at `SAMPLE_RATE_HZ`, for the incoming-file-offer
+/// notification sound (`docs/PROTOCOL.md`'s file transfer section) - played
+/// once whenever a new file-offer popup becomes the one shown
+/// (`voice_stream::play_bell_chime`), the same `MixerCmd::Push`/`Finish`
+/// pattern `play_end_chime` already uses. Empty if the bundled asset is
+/// ever missing/malformed, same fallback as `end_chime_samples`.
+pub fn bell_chime_samples() -> Vec<i16> {
+    BELL_CHIME_SAMPLES.get_or_init(|| decode_wav_to_mono(BELL_CHIME_WAV).unwrap_or_default()).clone()
+}
+
 /// Decodes a canonical PCM WAV file's audio into mono samples at
 /// `SAMPLE_RATE_HZ`. Walks chunks generically rather than assuming fixed
 /// offsets, so extra metadata chunks before `data` (e.g. ffmpeg's

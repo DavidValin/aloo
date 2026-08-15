@@ -243,13 +243,14 @@ struct Envelope {
     blocks: Vec<Vec<u8>>,
 }
 
-enum Content { Text, File }
+enum Content { Text, FileOffer }
 ```
 `Envelope` is the unit of one complete, whole (non-streamed) encrypted
 message body, addressed to exactly one recipient. Voice is never sent as a
-whole `Envelope` (see §7.3); `File` is the non-streamed content type this
-enum was always meant to grow for a file attachment (§7.6) - added without
-changing `Envelope`'s shape at all, exactly as anticipated here.
+whole `Envelope` (see §7.3); neither is a file's actual bytes, once
+accepted - `FileOffer` is only the *offer* that precedes a file transfer
+(§7.6), the one part of that exchange that fits this shape (a discrete,
+one-shot decision, unlike the stream of chunks that follows it).
 
 ## 4. Connection lifecycle
 
@@ -686,53 +687,122 @@ connection.
 
 ### 7.6 File transfer
 
-A file is sent as one ordinary `SendChannel`/`SendDirect` (§7.1/§7.2) -
-**no new wire message types** - with `Envelope.content` set to
-`Content::File` instead of `Content::Text`. Unlike voice (§7.3), a file is
-never streamed: it's a discrete, already-complete blob sitting on disk, so
-it fits the same one-shot model as text rather than voice's Start/Chunk/End
-shape. This also means it needs **zero server-side changes**:
-`route_channel_message`/`route_direct_message` (§7.1/§7.2) already relay any
-`Envelope` opaquely regardless of `Content`.
+A file transfer is **consent-gated and streamed**: the receiver must
+explicitly `FileAccept` before a single byte of file data is sent, and once
+accepted the file moves as a live Start/Chunk/End-shaped stream, exactly
+like voice (§7.3) rather than text's one-shot `SendChannel`/`SendDirect`.
+Unlike voice, a transfer is always **point-to-point** - `(from, stream_id)`-
+identified the same way, but addressed `to`/`from` one recipient at a time,
+never broadcast to a whole channel's membership. A channel file send is
+simply the sending client fanning out N independent offers, one per
+recipient, each with its own `stream_id` (drawn from the same per-connection
+counter voice already uses) - this is what lets one recipient accept while
+another rejects without the two interfering, and is why every message below
+carries `to`/`from` rather than a channel-wide recipient list the way
+`SendChannel`/`StreamChannelChunk` do.
 
-The plaintext recovered by decrypting `Envelope.blocks` (§8.1, identical
-RSA-OAEP chunking to text) is, by convention between cooperating clients -
-the same informal-convention approach voice's raw-PCM plaintext already
-uses (§7.3) - a bincode encoding of:
+```
+sender                                   server                 recipient
+  |                                        |                        |
+  |-- FileOffer -------------------------->|                        |
+  |   { to, stream_id, channel,            |-- FileOffer ---------->|
+  |     envelope }                         |   { from, from_name,   |
+  |                                        |     stream_id, channel,|
+  |                                        |     envelope }         |
+  |                                        |                        |
+  |                                        |<-- FileAccept ---------|
+  |<-- FileAccepted -----------------------|    { to, stream_id }   |
+  |    { from, stream_id }                 |                        |
+  |         (or FileReject/FileRejected,   |                        |
+  |          ending the exchange here)     |                        |
+  |                                        |                        |
+  |-- FileChunk (repeats) ---------------->|                        |
+  |   { to, stream_id, seq, blocks }       |-- FileChunk ---------->|
+  |                                        |   { from, stream_id,   |
+  |                                        |     seq, blocks }      |
+  |                                        |                        |
+  |-- FileEnd ----------------------------->|                       |
+  |   { to, stream_id }                    |-- FileEnd ------------>|
+  |                                        |   { from, stream_id }  |
+```
 
 ```rust
-struct FilePayload {
+// client -> server
+FileOffer  { to: UserId, stream_id: u64, channel: Option<String>, envelope: Envelope }
+FileAccept { to: UserId, stream_id: u64 }
+FileReject { to: UserId, stream_id: u64 }
+FileChunk  { to: UserId, stream_id: u64, seq: u32, blocks: Vec<Vec<u8>> }
+FileEnd    { to: UserId, stream_id: u64 }
+
+// server -> client (mirrored relay)
+FileOffer    { from: UserId, from_name: String, stream_id: u64, channel: Option<String>, envelope: Envelope }
+FileAccepted { from: UserId, stream_id: u64 }
+FileRejected { from: UserId, stream_id: u64 }
+FileChunk    { from: UserId, stream_id: u64, seq: u32, blocks: Vec<Vec<u8>> }
+FileEnd      { from: UserId, stream_id: u64 }
+```
+
+**Routing** (`server::Registry::route_file_offer`/`route_file_accept`/
+`route_file_reject`/`route_file_chunk`/`route_file_end`): every one of these
+is relayed exactly like `SendDirect`/`StreamDirect*` (§7.2/§7.3) - an
+existence check on the recipient (`to`), nothing else. There is no
+channel-membership validation anywhere in this family, even when `channel`
+is `Some(_)` - `channel` is purely informational routing metadata for the
+receiving *client* (which log to eventually show the accepted transfer in),
+never enforced by the server. This needs **zero new server-side logic**
+beyond these five thin relay functions - no different in kind from the
+`StreamDirect*` family already there.
+
+**`FileOffer`'s plaintext**: like text, `envelope.content` is
+`Content::FileOffer` and `envelope.blocks` decrypts (§8.1, identical
+RSA-OAEP chunking) to a bincode encoding of:
+
+```rust
+struct FileOfferPayload {
     filename: String,
-    data: Vec<u8>,
+    size: u64,
 }
 ```
 
-Bundling `filename` into the encrypted plaintext (rather than a cleartext
-field on `Envelope`/`Content`, the way voice's `duration_ms` is cleartext
-metadata on `*End`) keeps it as private as the rest of the message - the
-server never learns a filename, only that some recipient received an
-envelope of roughly that size (§10, unchanged).
+Bundling `filename`/`size` into the encrypted plaintext (rather than
+cleartext fields on `ClientMessage::FileOffer`) keeps them as private as
+the rest of the message - the server never learns a filename or exact size,
+only that some recipient was offered an envelope of roughly that size
+(§10, unchanged). Once accepted, the actual file bytes are **never**
+wrapped in a struct at all - each `FileChunk`'s `blocks` is the RSA-OAEP (or
+PQ-hybrid, §13) encryption of a raw slice of the file, exactly like voice's
+raw-PCM chunk convention (§7.3's "no content/rate/format field").
 
-**Size bound**: a `SendChannel` frame carries one independently-encrypted
-`Envelope` per channel member in a single frame (§7.1), so unlike voice
-(whose chunking keeps any one frame small regardless of total message size,
-§7.3) a file's total encrypted size scales with both file size and
-recipient count, and must stay under `MAX_FRAME_LEN` (§1.1, 64 MiB). The
-reference client enforces a **1 MiB** cap on raw (pre-encryption) file size
-(`file_transfer::MAX_FILE_BYTES`) before ever attempting to encrypt -
-comfortably under the frame limit even for a generously-sized channel,
-accounting for RSA-OAEP's worst-case ~1.35x ciphertext expansion at a
-2048-bit key (§8.1). This is a client-side courtesy limit, not a
-protocol-level one - the wire format itself places no size restriction on
-`Content::File` beyond the same `MAX_FRAME_LEN` any other message is
-already bound by.
+**No size bound.** Because a transfer is chunked exactly like voice rather
+than sent as one whole-file `Envelope`, the old reasoning for a size cap
+(fitting one `SendChannel` frame carrying every recipient's copy under
+`MAX_FRAME_LEN`, §1.1) no longer applies - each `FileChunk` frame is small
+and single-recipient regardless of total file size. The reference client
+reads and encrypts `file_transfer::FILE_CHUNK_BYTES` (64 KiB) of plaintext
+at a time, keeping both sender and receiver memory use bounded to roughly
+one chunk no matter how large the file is; the sender never reads any of
+the file into memory until `FileAccepted` arrives.
 
-**`rsa_per_msg` readiness**: handled the same way as voice's recipient list
-(§11.6), not text's queue (§11.5) - a recipient whose rotating key isn't
-currently fresh is simply excluded from this one-shot send, never queued
-for later delivery once a fresh key arrives. Sending still triggers this
-client's own per-peer rotation for every recipient actually reached (§11.3),
-same as text/voice.
+**Filename length**: the reference client crops `FileOfferPayload.filename`
+to `file_transfer::MAX_FILENAME_CHARS` (230 Unicode scalar values) both
+before building the offer (sender) and again on whatever filename actually
+arrives (receiver) - the receiver-side crop is not just defensive
+redundancy, since nothing on the wire stops a modified/hostile peer from
+sending a longer name than it claims to.
+
+**`rsa_per_msg` readiness**: handled the same way as voice's recipient
+readiness (§11.6), not text's queue (§11.5) - a recipient whose rotating
+key isn't currently fresh is simply not offered the file at all, never
+queued for a later offer once a fresh key arrives. Sending an offer still
+triggers this client's own per-peer rotation for the recipient actually
+reached (§11.3), same as text/voice.
+
+**Where the bytes land**: an accepted file is written straight to
+`file_transfer::default_download_dir()` (`~/.aloo/downloads`) as chunks
+arrive - `safe_filename` (unchanged: reduces a peer-supplied name to just
+its final path component) still guards the on-disk path against a
+maliciously-crafted filename, applied after the length crop above. There is
+no separate save-location prompt; accepting *is* saving.
 
 ## 8. Encryption model
 
@@ -1671,14 +1741,15 @@ via `openssl`, or never touches disk at all).
 `public_key_der` in `Identify`/`UserInfo` carries `bincode::encode(PqPublicBundle)`
 for this `KeyMode` - reusing the existing field opaquely, the same trick
 already used for `rsa_per_msg`'s resume mechanism (§12.6) and file
-transfer's `FilePayload` convention (§7.6). No wire schema change to
+transfer's `FileOfferPayload` convention (§7.6). No wire schema change to
 `Identify` or `UserInfo` at all.
 
 ### 13.3 Encrypting one message: sign, encrypt once, wrap per recipient
 
-Given plaintext `data` (a text message, a bincode-encoded `FilePayload`
-for a file, or raw PCM for one voice chunk - see §13.7 for how voice
-differs):
+Given plaintext `data` (a text message, a bincode-encoded `FileOfferPayload`
+for a file *offer*, or raw PCM for one voice chunk - see §13.7 for how
+voice differs, and how an accepted file transfer's chunks reuse that exact
+same per-stream mechanism rather than this one):
 
 **Step 1 - sign** (`crypto::pq::sign_body`): sign `data` with *both* of the
 sender's signing keys.
@@ -1801,7 +1872,7 @@ asymmetrically per sender: a `pq_hybrid` member's message reaches everyone;
 a non-`pq_hybrid` member's message reaches everyone *except* the `pq_hybrid`
 members.
 
-### 13.7 Voice streaming
+### 13.7 Voice streaming (and file transfer chunks)
 
 `pq_hybrid` voice is not just "supported" but a *better* fit than every
 RSA method: the expensive asymmetric work (ML-DSA-87 sign, ML-KEM-1024
@@ -1809,6 +1880,15 @@ encapsulate, RSA-4096 operations) happens once per stream, not once per
 100ms chunk - unlike `rsa_per_msg`, which has to exempt voice from its
 own per-message rotation entirely because 4096-bit RSA keygen is far too
 slow to repeat every chunk (§11.6).
+
+Everything in this section is written in terms of voice, but a `pq_hybrid`
+recipient's accepted file transfer (§7.6) reuses the identical mechanism
+for its `FileChunk` stream, unmodified: `data`/`pcm` below is just whatever
+bytes that chunk carries (raw PCM for voice, a raw slice of the file for a
+transfer) - the wrap/sign-once-at-start, repeat-`key_setup`-every-chunk,
+deterministic-nonce-per-`(stream_id, seq)` shape doesn't care which. Only
+`FileOffer` itself (a discrete, one-shot decision, not a stream) uses
+§13.3's whole-message scheme instead.
 
 **Once, at record-start** (mirroring the RSA path's "recipients' public
 keys parsed once at record-start", unchanged by this section): for each

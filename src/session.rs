@@ -19,13 +19,14 @@ use tokio::net::TcpStream;
 
 use crate::connect::ResolvedIdentity;
 use crate::crypto;
+use crate::file_stream;
 use crate::idstore;
 use crate::netstats;
 use crate::own_next_keys;
 use crate::proto::{self, ClientMessage, Content, Envelope, KeyMode, ServerMessage, UserId, UserInfo};
 use crate::rekey;
 use crate::sysstats;
-use crate::ui::ui::{self, IdentityCase, UiAction, UiState, VoiceTarget};
+use crate::ui::ui::{self, IdentityCase, PendingFileOffer, UiAction, UiState, VoiceTarget};
 use crate::voice;
 use crate::voice_stream;
 use crate::BoxError;
@@ -52,6 +53,16 @@ pub(crate) struct SessionState {
     pub(crate) next_mixer_id: u64,
     pub(crate) own_stream_targets: HashMap<u64, voice_stream::OwnStreamTarget>,
     pub(crate) active_streams: HashMap<(UserId, u64), voice_stream::ActiveStream>,
+    /// File-transfer counterparts of the two maps above - see
+    /// `file_stream::OwnFileTarget`/`ActiveFileTransfer`. Keyed the same
+    /// way: `own_file_targets` by our own `stream_id` alone (it's always
+    /// our stream), `active_file_transfers` by `(from, stream_id)`.
+    pub(crate) own_file_targets: HashMap<u64, file_stream::OwnFileTarget>,
+    pub(crate) active_file_transfers: HashMap<(UserId, u64), file_stream::ActiveFileTransfer>,
+    /// Where a file-transfer worker thread (`file_stream::spawn_send_file_worker`/
+    /// `spawn_receive_file_worker`) reports progress/completion/failure,
+    /// polled by `run_connected_session`'s select loop (`handle_file_event`).
+    pub(crate) file_events_tx: tokio::sync::mpsc::UnboundedSender<file_stream::FileEvent>,
     pub(crate) record_out_tx: tokio::sync::mpsc::UnboundedSender<ClientMessage>,
     pub(crate) own_stream_done_tx: tokio::sync::mpsc::UnboundedSender<(u64, u32, Vec<u8>)>,
     pub(crate) mixer_tx: tokio::sync::mpsc::UnboundedSender<voice::MixerCmd>,
@@ -240,6 +251,7 @@ pub(crate) async fn run_connected_session(
         tokio::sync::mpsc::unbounded_channel::<(u64, u32, Vec<u8>)>();
     let (stream_finished_tx, mut stream_finished_rx) =
         tokio::sync::mpsc::unbounded_channel::<(UserId, u64, u32, Vec<u8>)>();
+    let (file_events_tx, mut file_events_rx) = tokio::sync::mpsc::unbounded_channel::<file_stream::FileEvent>();
 
     // `PqHybrid` has no single RSA key to seed `rekey::OwnKeys` with and
     // never rotates (it's a static identity, like `Rsa`/`Password`/`None`
@@ -267,6 +279,9 @@ pub(crate) async fn run_connected_session(
         next_mixer_id: 1,
         own_stream_targets: HashMap::new(),
         active_streams: HashMap::new(),
+        own_file_targets: HashMap::new(),
+        active_file_transfers: HashMap::new(),
+        file_events_tx,
         record_out_tx,
         own_stream_done_tx,
         mixer_tx,
@@ -369,6 +384,10 @@ pub(crate) async fn run_connected_session(
                     request_rotation_if_per_message(&session, from);
                 }
             }
+            event = file_events_rx.recv() => {
+                let Some(event) = event else { break };
+                handle_file_event(&mut ui_state, &mut session, event);
+            }
             err = audio_err_rx.recv() => {
                 let Some(err) = err else { break };
                 ui_state.playback_failed(err);
@@ -461,12 +480,22 @@ async fn handle_ui_action(
             crate::direct_message::handle_send_text(wr, session, to, plaintext, recipient_key_mode, recipient_pubkey_der)
                 .await?;
         }
-        UiAction::SendFileChannel { channel, filename, data, recipients } => {
-            crate::channel::handle_send_file(wr, session, channel, filename, data, recipients).await?;
+        UiAction::SendFileChannel { channel, path, filename, size, recipients } => {
+            crate::channel::handle_send_file(wr, ui_state, session, channel, path, filename, size, recipients).await?;
         }
-        UiAction::SendFileDirect { to, filename, data, recipient_key_mode, recipient_pubkey_der } => {
-            crate::direct_message::handle_send_file(wr, session, to, filename, data, recipient_key_mode, recipient_pubkey_der)
-                .await?;
+        UiAction::SendFileDirect { to, path, filename, size, recipient_key_mode, recipient_pubkey_der } => {
+            crate::direct_message::handle_send_file(
+                wr,
+                ui_state,
+                session,
+                to,
+                path,
+                filename,
+                size,
+                recipient_key_mode,
+                recipient_pubkey_der,
+            )
+            .await?;
         }
         UiAction::VoiceRecordStart(target) => {
             let err_tx = session.audio_err_tx.clone();
@@ -551,7 +580,9 @@ async fn handle_ui_action(
                     }
                 }
             }
-            ui_state.resolve_identity_accept(peer);
+            if ui_state.resolve_identity_accept(peer) {
+                voice_stream::play_bell_chime(session);
+            }
         }
         UiAction::RejectIdentity(peer) => {
             // No `id_store`/`rekey` writes at all - the previous pin (if
@@ -559,7 +590,49 @@ async fn handle_ui_action(
             // (docs/PROTOCOL.md §12).
             ui_state.resolve_identity_reject(peer);
         }
+        UiAction::AcceptFileOffer { from, stream_id } => {
+            accept_file_offer(wr, ui_state, session, from, stream_id).await?;
+        }
+        UiAction::RejectFileOffer { from, stream_id } => {
+            ui_state.take_file_offer(from, stream_id);
+            proto::write_message(wr, &ClientMessage::FileReject { to: from, stream_id }).await?;
+            session.conn_stats.record_event(Instant::now());
+        }
     }
+    Ok(())
+}
+
+/// Carries out an `AcceptFileOffer` decision: resolves which key to decrypt
+/// incoming chunks with (same `voice_stream::resolve_incoming_key` a voice
+/// stream uses), spawns the receiving worker, creates the log row, and
+/// tells the sender to start streaming.
+async fn accept_file_offer(
+    wr: &mut (impl AsyncWrite + Unpin),
+    ui_state: &mut UiState,
+    session: &mut SessionState,
+    from: UserId,
+    stream_id: u64,
+) -> proto::Result<()> {
+    let Some(offer) = ui_state.take_file_offer(from, stream_id) else { return Ok(()) };
+    let sender_public_key_der = ui_state.known_users.get(&from).map(|u| u.public_key_der.clone()).unwrap_or_default();
+    let key = voice_stream::resolve_incoming_key(session, from, &sender_public_key_der);
+    let dest_name = crate::file_transfer::safe_filename(&crate::file_transfer::truncate_filename(&offer.filename));
+    let dest_path = crate::file_transfer::default_download_dir().join(dest_name);
+    let job_tx =
+        file_stream::spawn_receive_file_worker(key, dest_path, from, stream_id, session.file_events_tx.clone());
+    session
+        .active_file_transfers
+        .insert((from, stream_id), file_stream::ActiveFileTransfer { job_tx, last_seen: Instant::now() });
+    match &offer.channel {
+        Some(channel) => {
+            ui_state.on_channel_file_offer_accepted(channel, from, offer.from_name.clone(), stream_id, offer.filename.clone(), offer.size);
+        }
+        None => {
+            ui_state.on_direct_file_offer_accepted(from, offer.from_name.clone(), stream_id, offer.filename.clone(), offer.size);
+        }
+    }
+    proto::write_message(wr, &ClientMessage::FileAccept { to: from, stream_id }).await?;
+    session.conn_stats.record_event(Instant::now());
     Ok(())
 }
 
@@ -574,7 +647,7 @@ pub(crate) fn encrypt_for_one(pubkey_der: &[u8], plaintext: &[u8], content: Cont
 /// `docs/PROTOCOL.md` §13), `recipient_pubkey_der` is the recipient's
 /// bincode-encoded `crypto::pq::PqPublicBundle`. The whole hybrid blob is
 /// boxed as `Envelope`'s single `blocks` element, same trick already used
-/// for file transfer's `FilePayload` convention (§7.6) - `Envelope`'s own
+/// for file transfer's `FileOfferPayload` convention - `Envelope`'s own
 /// shape needs no change.
 pub(crate) fn encrypt_hybrid_envelope_for(
     sender_signing: &crypto::pq::PqPrivateBundle,
@@ -677,6 +750,36 @@ async fn handle_server_message(
         }
         ServerMessage::KeyRotated { from, new_public_key_der, signature } => {
             handle_key_rotated(ui_state, you, wr, session, from, new_public_key_der, signature).await?;
+        }
+        ServerMessage::FileOffer { from, from_name, stream_id, channel, envelope } => {
+            handle_incoming_file_offer(ui_state, session, from, from_name, stream_id, channel, envelope);
+        }
+        ServerMessage::FileAccepted { from, stream_id } => {
+            if let Some(target) = session.own_file_targets.remove(&stream_id) {
+                let me = ui_state.own_id.unwrap_or(UserId(0));
+                ui_state.set_file_progress(me, stream_id, 0);
+                file_stream::spawn_send_file_worker(
+                    target.path,
+                    target.key,
+                    target.to,
+                    stream_id,
+                    session.record_out_tx.clone(),
+                    session.file_events_tx.clone(),
+                );
+            }
+            let _ = from; // `from` is the accepter, i.e. `target.to` - nothing else needed.
+        }
+        ServerMessage::FileRejected { from, stream_id } => {
+            session.own_file_targets.remove(&stream_id);
+            let me = ui_state.own_id.unwrap_or(UserId(0));
+            ui_state.set_file_rejected(me, stream_id);
+            let _ = from;
+        }
+        ServerMessage::FileChunk { from, stream_id, seq, blocks } => {
+            file_stream::forward_chunk(&mut session.active_file_transfers, from, stream_id, seq, blocks);
+        }
+        ServerMessage::FileEnd { from, stream_id } => {
+            file_stream::end_incoming_transfer(&mut session.active_file_transfers, from, stream_id);
         }
         ServerMessage::Error { message } => eprintln!("aloo: server error: {message}"),
     }
@@ -981,8 +1084,8 @@ async fn handle_key_rotated(
             // exactly what clears it: resolve the review the same way an
             // `Accept` would (held messages included), just silently.
             install_trusted_rotation(ui_state, wr, session, peer, &nickname, new_public_key_der).await?;
-            if was_gated {
-                ui_state.resolve_identity_accept(peer);
+            if was_gated && ui_state.resolve_identity_accept(peer) {
+                voice_stream::play_bell_chime(session);
             }
             Ok(())
         }
@@ -1083,19 +1186,85 @@ async fn install_trusted_rotation(
 /// `sender.key_mode` only matters here to know what shape their signing
 /// public key is in.
 pub(crate) fn decrypt_envelope_for(envelope: Envelope, from: UserId, sender: &UserInfo, session: &SessionState) -> Option<ui::MessageBody> {
-    let plaintext = if session.own_key_mode == KeyMode::PqHybrid {
+    if envelope.content != Content::Text {
+        return None;
+    }
+    let plaintext = decrypt_own_envelope(&envelope, from, sender, session)?;
+    Some(ui::MessageBody::Text(String::from_utf8_lossy(&plaintext).into_owned()))
+}
+
+/// Decrypts a `FileOffer` envelope addressed to us into its
+/// `FileOfferPayload` - the offer counterpart of `decrypt_envelope_for`,
+/// same RSA/PQ dispatch, different output shape (there's no `MessageBody`
+/// for an unresolved offer, only for the row an `Accept` eventually
+/// creates - see `handle_incoming_file_offer`).
+fn decrypt_file_offer(envelope: &Envelope, from: UserId, sender: &UserInfo, session: &SessionState) -> Option<crate::file_transfer::FileOfferPayload> {
+    if envelope.content != Content::FileOffer {
+        return None;
+    }
+    let plaintext = decrypt_own_envelope(envelope, from, sender, session)?;
+    proto::decode(&plaintext).ok()
+}
+
+/// The RSA/PQ dispatch shared by `decrypt_envelope_for` and
+/// `decrypt_file_offer` - decrypts `envelope.blocks` addressed to us,
+/// regardless of `envelope.content` (callers check that themselves first).
+fn decrypt_own_envelope(envelope: &Envelope, from: UserId, sender: &UserInfo, session: &SessionState) -> Option<Vec<u8>> {
+    if session.own_key_mode == KeyMode::PqHybrid {
         let my_private = session.own_pq_private.as_ref()?;
         let sender_public: crypto::pq::PqPublicBundle = proto::decode(&sender.public_key_der).ok()?;
         let blob = envelope.blocks.first()?;
-        crypto::pq::decrypt_hybrid(my_private, &sender_public, blob)?
+        crypto::pq::decrypt_hybrid(my_private, &sender_public, blob)
     } else {
-        session.own_keys.as_ref()?.lock().unwrap().decrypt_from(from, &envelope.blocks)?
-    };
-    match envelope.content {
-        Content::Text => Some(ui::MessageBody::Text(String::from_utf8_lossy(&plaintext).into_owned())),
-        Content::File => {
-            let payload: crate::file_transfer::FilePayload = proto::decode(&plaintext).ok()?;
-            Some(ui::MessageBody::File { filename: payload.filename, data: payload.data })
+        session.own_keys.as_ref()?.lock().unwrap().decrypt_from(from, &envelope.blocks)
+    }
+}
+
+/// Applies an incoming `FileOffer`: decrypts it, and either holds it
+/// (`Pending`/`Rejected` sender, `docs/PROTOCOL.md` §12 - same "held until
+/// Accepted" precedent as a message/stream) or queues it for the
+/// Accept/Reject popup, playing the bell if it's the one that ends up
+/// shown right away.
+fn handle_incoming_file_offer(
+    ui_state: &mut UiState,
+    session: &mut SessionState,
+    from: UserId,
+    from_name: String,
+    stream_id: u64,
+    channel: Option<String>,
+    envelope: Envelope,
+) {
+    let Some(sender) = ui_state.known_users.get(&from).cloned() else { return };
+    let Some(payload) = decrypt_file_offer(&envelope, from, &sender, session) else { return };
+    let filename = crate::file_transfer::truncate_filename(&payload.filename);
+    let offer = PendingFileOffer { from, from_name, filename, size: payload.size, stream_id, channel };
+    if ui_state.is_trust_gated(from) {
+        ui_state.hold_file_offer(offer);
+        return;
+    }
+    if ui_state.push_file_offer(offer) {
+        voice_stream::play_bell_chime(session);
+    }
+}
+
+/// Dispatches one file-transfer progress/completion/failure event
+/// (`file_stream::FileEvent`) into the matching log row - see
+/// `UiState::update_file_entry` for how a row is found from just
+/// `(from, stream_id)`.
+fn handle_file_event(ui_state: &mut UiState, session: &mut SessionState, event: file_stream::FileEvent) {
+    let me = ui_state.own_id.unwrap_or(UserId(0));
+    match event {
+        file_stream::FileEvent::SendProgress { stream_id, bytes } => ui_state.set_file_progress(me, stream_id, bytes),
+        file_stream::FileEvent::SendDone { stream_id } => ui_state.set_file_completed(me, stream_id),
+        file_stream::FileEvent::SendFailed { stream_id } => ui_state.set_file_failed(me, stream_id),
+        file_stream::FileEvent::ReceiveProgress { from, stream_id, bytes } => ui_state.set_file_progress(from, stream_id, bytes),
+        file_stream::FileEvent::ReceiveDone { from, stream_id, .. } => {
+            session.active_file_transfers.remove(&(from, stream_id));
+            ui_state.set_file_completed(from, stream_id);
+        }
+        file_stream::FileEvent::ReceiveFailed { from, stream_id } => {
+            session.active_file_transfers.remove(&(from, stream_id));
+            ui_state.set_file_failed(from, stream_id);
         }
     }
 }

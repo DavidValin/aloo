@@ -393,7 +393,9 @@ async fn accept_review(w: &mut AlooWorld) {
     press_key(w, KeyCode::Tab, KeyModifiers::NONE);
     press_key(w, KeyCode::Enter, KeyModifiers::NONE);
     match w.last_action {
-        Some(UiAction::AcceptIdentity(peer)) => w.ui_mut().resolve_identity_accept(peer),
+        Some(UiAction::AcceptIdentity(peer)) => {
+            w.ui_mut().resolve_identity_accept(peer);
+        }
         ref other => panic!("expected AcceptIdentity, got {other:?}"),
     }
 }
