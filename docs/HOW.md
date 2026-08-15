@@ -16,6 +16,6 @@ Important files:
 Practical approach:
   * [ ] Update Gherkin features + cucumber steps
   * [ ] Update requirements.toml
-  * [ ] Update docs: PROTOCOL.md, SPEC.md, README.md
   * [ ] Implement
+  * [ ] Update docs: PROTOCOL.md, SPEC.md, README.md if affected (ensure the <function_name>:<line_number> references are in sync
   * [ ] Run full verification: cargo trace, cargo bdd, cargo test
