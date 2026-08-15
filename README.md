@@ -13,8 +13,8 @@ Just you, your terminal, and the people you're talking to.
 - 💬 **Text chat** — type and hit `Enter`, just like any chat app.
 - 🎙️ **Walkie-talkie voice messages** — hold `Space` from messages list or `Control+Alt+p` globally while in other app to talk, release to send it. Just like a real walkie-talkie, it auto-plays live on the other end as you're talking — no play button, nothing to tap, they just hear you. You can also replay it later: scroll to it in the log and press `Enter` to hear it again. `Ctrl+Alt+P` does the same thing globally, even while aloo isn't focused.
 - 📎 **File transfer, with consent** — send files straight from the app with a built-in file browser, no external tools needed. The recipient sees a popup (with a chime) naming you and the file before a single byte moves, Accept focused by default; accepting streams it straight to `~/.aloo/downloads` with a live progress bar, no size cap.
-- 📢 **Public channels** — join the channels the server advertises, shown as tabs across the top.
-- 🔒 **Private channels** — create or join a channel that isn't advertised to anyone; you just need to know its name.
+- 📢 **Public channels** — join the channels the server advertises, shown as tabs across the top; a channel created after you connect shows up live, no reconnect needed.
+- 🔒 **Private channels** — create or join a channel that isn't advertised to anyone; you just need to know its name, and optionally a password its creator set.
 - ✉️  **Private messages (DMs)** — open a one-on-one conversation with anyone in the sidebar.
 - 🌐 **Server-coordinated, never server-carried** — the server tracks who's connected to which channel and helps two clients punch a direct connection to each other; once that's up, your messages, voice, and files travel peer-to-peer, never through the server at all.
 
@@ -41,7 +41,7 @@ aloo --server --password MYPASSWORD    # people need this password to connect
 aloo --server --enc rsa server_key     # people need a matching RSA key to connect
 ```
 
-The server always starts with one public channel called `general`.
+The server always starts with one public channel called `the-hall`.
 
 Whatever `--bind`/`--port`/`--password`/`--enc` you run it with gets saved to `~/.aloo/settings`; a bare `aloo --server` afterwards (e.g. after a crash) reuses the last configuration you started it with, auth included, instead of resetting to open access on the default port.
 
@@ -64,8 +64,9 @@ Nicknames are case-sensitive and must be free — if someone else is already con
 - Press **Space** and hold it to record and send a voice message live — let go to stop.
 - Press **Ctrl+Alt+P** to do the same thing from anywhere — even if aloo isn't the focused window. Enabled by default; edit `~/.aloo/settings` (`global_ptt_shortcut`, `global_ptt_enabled`) to change the combo or turn it off. Needs X11 on Linux — not available under Wayland.
 - Type `/file` and press **Enter** to send a file.
+- Type `/leave` and press **Enter** to leave the selected channel — a private one's tab disappears, a public one stays (rejoin it with Enter) but you're no longer a member.
 - Pick someone in the sidebar and press **Enter** to open a DM with them.
-- Press `]` / `[` to switch between channel tabs, `Ctrl+J` to join or create a private channel.
+- Press `]` / `[` to switch between channel tabs, `Ctrl+J` to join or create a channel — public or private, optionally password-protected.
 - Press `Ctrl+H` anytime for an in-app help screen with all of this.
 
 ## Encryption

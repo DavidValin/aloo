@@ -9,7 +9,9 @@ pub mod pq;
 
 use rand_chacha::ChaCha20Rng;
 use rand_core::{OsRng, RngCore, SeedableRng};
-use rsa::pkcs8::{DecodePrivateKey, DecodePublicKey, EncodePrivateKey, EncodePublicKey, LineEnding};
+use rsa::pkcs8::{
+    DecodePrivateKey, DecodePublicKey, EncodePrivateKey, EncodePublicKey, LineEnding,
+};
 use rsa::traits::PublicKeyParts;
 use rsa::{Oaep, Pkcs1v15Sign, RsaPrivateKey, RsaPublicKey};
 use sha2::{Digest, Sha256};
@@ -74,7 +76,8 @@ impl KeyPair {
     /// size - used for `rsa_per_msg`'s `RSA_PER_MSG_KEY_BITS`.
     pub fn generate_with_bits(bits: usize) -> Result<Self> {
         let mut rng = OsRng;
-        let private = RsaPrivateKey::new(&mut rng, bits).map_err(|e| CryptoError::Key(e.to_string()))?;
+        let private =
+            RsaPrivateKey::new(&mut rng, bits).map_err(|e| CryptoError::Key(e.to_string()))?;
         let public = private.to_public_key();
         Ok(Self { private, public })
     }
@@ -84,7 +87,12 @@ impl KeyPair {
     /// different (for all practical purposes, unrelated) keypairs.
     pub fn from_password(password: &str) -> Result<Self> {
         let mut seed = [0u8; 32];
-        pbkdf2::pbkdf2_hmac::<Sha256>(password.as_bytes(), PASSWORD_KEY_SALT, PBKDF2_ROUNDS, &mut seed);
+        pbkdf2::pbkdf2_hmac::<Sha256>(
+            password.as_bytes(),
+            PASSWORD_KEY_SALT,
+            PBKDF2_ROUNDS,
+            &mut seed,
+        );
         let mut rng = ChaCha20Rng::from_seed(seed);
         let private = RsaPrivateKey::new(&mut rng, RSA_KEY_BITS)
             .map_err(|e| CryptoError::Key(e.to_string()))?;
@@ -154,7 +162,9 @@ pub fn public_key_from_der(bytes: &[u8]) -> Result<RsaPublicKey> {
 /// one-line-per-entry file format), the same way `public_key_to_der`
 /// already does for public keys embedded in wire messages.
 pub fn private_key_to_der(key: &RsaPrivateKey) -> Result<Vec<u8>> {
-    let doc = key.to_pkcs8_der().map_err(|e| CryptoError::Key(e.to_string()))?;
+    let doc = key
+        .to_pkcs8_der()
+        .map_err(|e| CryptoError::Key(e.to_string()))?;
     Ok(doc.as_bytes().to_vec())
 }
 
@@ -197,7 +207,9 @@ pub fn max_chunk_len(key: &RsaPublicKey) -> usize {
 pub fn encrypt_chunked(key: &RsaPublicKey, data: &[u8]) -> Result<Vec<Vec<u8>>> {
     let chunk_size = max_chunk_len(key);
     if chunk_size == 0 {
-        return Err(CryptoError::Encrypt("key too small for OAEP/SHA-256".into()));
+        return Err(CryptoError::Encrypt(
+            "key too small for OAEP/SHA-256".into(),
+        ));
     }
     let mut rng = OsRng;
     let mut blocks = Vec::new();
@@ -234,7 +246,8 @@ pub fn decrypt_chunked(key: &RsaPrivateKey, blocks: &[Vec<u8>]) -> Result<Vec<u8
 /// public key (`rekey::rotate_for_peer`) with the private key it replaces.
 pub fn sign(key: &RsaPrivateKey, data: &[u8]) -> Result<Vec<u8>> {
     let digest = Sha256::digest(data);
-    key.sign(Pkcs1v15Sign::new::<Sha256>(), &digest).map_err(|e| CryptoError::Encrypt(e.to_string()))
+    key.sign(Pkcs1v15Sign::new::<Sha256>(), &digest)
+        .map_err(|e| CryptoError::Encrypt(e.to_string()))
 }
 
 /// Verifies a signature produced by `sign`. Returns `false` (never an
@@ -242,7 +255,8 @@ pub fn sign(key: &RsaPrivateKey, data: &[u8]) -> Result<Vec<u8>> {
 /// trustworthy, not why verification failed.
 pub fn verify(key: &RsaPublicKey, data: &[u8], signature: &[u8]) -> bool {
     let digest = Sha256::digest(data);
-    key.verify(Pkcs1v15Sign::new::<Sha256>(), &digest, signature).is_ok()
+    key.verify(Pkcs1v15Sign::new::<Sha256>(), &digest, signature)
+        .is_ok()
 }
 
 /// Generates `len` cryptographically random bytes, used for auth challenge

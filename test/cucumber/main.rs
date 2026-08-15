@@ -44,7 +44,9 @@ async fn main() {
                 // scenario is written but not implemented, which the report
                 // shows as NOT IMPLEMENTED rather than quietly as a pass.
                 ScenarioFinished::StepSkipped => "undefined",
-                ScenarioFinished::StepFailed(..) | ScenarioFinished::BeforeHookFailed(..) => "FAILED",
+                ScenarioFinished::StepFailed(..) | ScenarioFinished::BeforeHookFailed(..) => {
+                    "FAILED"
+                }
             };
             let mut out = OUTCOMES.lock().expect("outcomes lock");
             out.push(format!("test {name} ... {verdict}"));
@@ -65,10 +67,16 @@ fn write_outcomes() {
         return;
     }
     let path = dir.join("cucumber-results.txt");
-    let Ok(mut file) = std::fs::File::create(&path) else { return };
+    let Ok(mut file) = std::fs::File::create(&path) else {
+        return;
+    };
     let out = OUTCOMES.lock().expect("outcomes lock");
     for line in out.iter() {
         let _ = writeln!(file, "{line}");
     }
-    println!("\ncucumber: {} scenario outcome(s) written to {}", out.len() / 2, path.display());
+    println!(
+        "\ncucumber: {} scenario outcome(s) written to {}",
+        out.len() / 2,
+        path.display()
+    );
 }

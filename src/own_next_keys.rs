@@ -56,7 +56,10 @@ impl OwnNextKeys {
     /// fallback when `load` fails for a reason other than the file simply
     /// not existing yet, mirroring `idstore::IdStore::new_empty`.
     pub fn new_empty(path: PathBuf) -> Self {
-        Self { path, entries: HashMap::new() }
+        Self {
+            path,
+            entries: HashMap::new(),
+        }
     }
 
     /// Loads `path` if it exists; a missing file isn't an error (first run)
@@ -82,7 +85,10 @@ impl OwnNextKeys {
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
         }
-        Ok(Self { path: path.to_path_buf(), entries })
+        Ok(Self {
+            path: path.to_path_buf(),
+            entries,
+        })
     }
 
     /// The private key currently on file for `nickname`, if this client has

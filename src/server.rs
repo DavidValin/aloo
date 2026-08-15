@@ -14,20 +14,22 @@
 //! it never sees anything from the punched links themselves.
 
 use std::collections::{BTreeSet, HashMap};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use rsa::RsaPrivateKey;
 use tokio::io::AsyncRead;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 
 use crate::crypto;
 use crate::p2p_proto::RendezvousMessage;
 use crate::proto::{
-    self, AuthKind, AuthResponse, ChannelInfo, ChannelKind, ClientMessage, KeyMode,
-    ServerMessage, UserId, UserInfo,
+    self, AuthKind, AuthResponse, ChannelInfo, ChannelJoinRejection, ChannelKind, ClientMessage,
+    KeyMode, ServerMessage, UserId, UserInfo,
 };
+use crate::validation;
 
 /// How the server was started: `--enc rsa <keyfile>`, `--password <pass>`,
 /// or neither (open access).
@@ -93,7 +95,40 @@ struct ClientRecord {
 struct ChannelRecord {
     kind: ChannelKind,
     members: BTreeSet<UserId>,
+    /// Set only for a private channel created with a non-empty password
+    /// (Ctrl+J's popup, Private selected, password field non-empty).
+    /// `None` for a public channel (any password a hostile client sends
+    /// alongside `ChannelKind::Public` is silently ignored - there is no
+    /// code path that ever sets this for `Public`) or a private one
+    /// created without one. Fixed at creation, exactly like `kind` - there
+    /// is no message to change a channel's password after creation.
+    password: Option<String>,
 }
+
+/// Brute-force tracking for one (source IP, channel name) pair's wrong
+/// private-channel-password attempts (US-025).
+struct PasswordAttemptRecord {
+    /// Consecutive wrong attempts since the last reset (a successful join
+    /// to this channel from this IP, or this record not existing yet).
+    wrong_attempts: u32,
+    /// Set once `wrong_attempts` exceeds `CHANNEL_MAX_PASSWORD_ATTEMPTS`;
+    /// checked via `.elapsed() < CHANNEL_PASSWORD_BAN_DURATION`, mirroring
+    /// `crate::p2p`'s `Instant`/`Duration` cooldown style (its
+    /// `FAILURE_COOLDOWN` pattern) - the first use of that style
+    /// server-side.
+    banned_at: Option<Instant>,
+}
+
+/// More than this many wrong-password attempts against one (source IP,
+/// channel name) pair trips `CHANNEL_PASSWORD_BAN_DURATION`.
+/// The one channel `Registry::new()` always seeds and `remove_member` never
+/// deletes, even when empty - every other channel (public or private) is
+/// unregistered the instant its last member leaves.
+pub const DEFAULT_CHANNEL_NAME: &str = "the-hall";
+
+pub const CHANNEL_MAX_PASSWORD_ATTEMPTS: u32 = 7;
+/// How long a brute-force ban (`CHANNEL_MAX_PASSWORD_ATTEMPTS`) lasts.
+pub const CHANNEL_PASSWORD_BAN_DURATION: Duration = Duration::from_secs(2 * 60 * 60);
 
 /// Pure connection/channel bookkeeping, with no I/O of its own. Every
 /// mutation returns the list of messages that need to go out as a result,
@@ -102,6 +137,12 @@ pub struct Registry {
     clients: HashMap<UserId, ClientRecord>,
     channels: HashMap<String, ChannelRecord>,
     next_id: u64,
+    /// Brute-force protection for private-channel passwords (US-025):
+    /// keyed by (source IP, channel name) rather than `UserId`, because a
+    /// `UserId` is never reused (TB-020) - a reconnect always gets a fresh
+    /// one, so a per-`UserId` ban would be trivially bypassed by
+    /// reconnecting. In-memory only; lost on server restart.
+    channel_password_attempts: HashMap<(IpAddr, String), PasswordAttemptRecord>,
 }
 
 impl Default for Registry {
@@ -116,16 +157,32 @@ impl Registry {
     pub fn new() -> Self {
         let mut channels = HashMap::new();
         channels.insert(
-            "general".to_string(),
-            ChannelRecord { kind: ChannelKind::Public, members: BTreeSet::new() },
+            DEFAULT_CHANNEL_NAME.to_string(),
+            ChannelRecord {
+                kind: ChannelKind::Public,
+                members: BTreeSet::new(),
+                password: None,
+            },
         );
-        Self { clients: HashMap::new(), channels, next_id: 1 }
+        Self {
+            clients: HashMap::new(),
+            channels,
+            next_id: 1,
+            channel_password_attempts: HashMap::new(),
+        }
     }
 
     pub fn register(&mut self, name: String, public_key_der: Vec<u8>, key_mode: KeyMode) -> UserId {
         let id = UserId(self.next_id);
         self.next_id += 1;
-        self.clients.insert(id, ClientRecord { name, public_key_der, key_mode });
+        self.clients.insert(
+            id,
+            ClientRecord {
+                name,
+                public_key_der,
+                key_mode,
+            },
+        );
         id
     }
 
@@ -166,7 +223,10 @@ impl Registry {
             .channels
             .iter()
             .filter(|(_, rec)| rec.kind == ChannelKind::Public)
-            .map(|(name, rec)| ChannelInfo { name: name.clone(), kind: rec.kind })
+            .map(|(name, rec)| ChannelInfo {
+                name: name.clone(),
+                kind: rec.kind,
+            })
             .collect();
         v.sort_by(|a, b| a.name.cmp(&b.name));
         v
@@ -177,59 +237,191 @@ impl Registry {
     /// no-op. On success, returns `UserJoined` for every existing member
     /// sent to the joiner, `UserJoined` for the joiner sent to every
     /// existing member, and a `Joined` confirmation sent to the joiner.
+    ///
+    /// `name` is validated server-side regardless of what the client's own
+    /// UI already enforces (`validation::channel_name_is_valid`) - the
+    /// server never trusts the client. `password` sets a new private
+    /// channel's password at creation, or is compared (constant-time)
+    /// against an already-set one at join time; see docs/PROTOCOL.md §6.5.
+    /// `source_ip` scopes the brute-force ban (§6.6, `Outgoing` addressed
+    /// to `id` only either way, never leaking the channel's password state
+    /// to anyone else).
     pub fn join_channel(
         &mut self,
         id: UserId,
         name: &str,
         kind: ChannelKind,
+        password: Option<&str>,
+        source_ip: IpAddr,
     ) -> Result<Vec<Outgoing>, String> {
-        let user = self.user_info(id).ok_or_else(|| "unknown user".to_string())?;
+        let user = self
+            .user_info(id)
+            .ok_or_else(|| "unknown user".to_string())?;
 
-        let (existing_members, channel_kind, already_member) = {
+        if !validation::channel_name_is_valid(name) {
+            return Err(format!(
+                "channel name must be 1-{} characters of letters, digits, and '-'",
+                validation::CHANNEL_NAME_MAX_LEN
+            ));
+        }
+        if !self.channels.contains_key(name)
+            && let Some(pw) = password
+            && !validation::channel_password_is_valid(pw)
+        {
+            return Err(format!(
+                "channel password must be at most {} characters of letters, digits, and the allowed symbols",
+                validation::CHANNEL_PASSWORD_MAX_LEN
+            ));
+        }
+
+        let existed_before = self.channels.contains_key(name);
+
+        let (existing_members, channel_kind, channel_password, already_member) = {
             let rec = self
                 .channels
                 .entry(name.to_string())
-                .or_insert_with(|| ChannelRecord { kind, members: BTreeSet::new() });
+                .or_insert_with(|| ChannelRecord {
+                    kind,
+                    members: BTreeSet::new(),
+                    password: match kind {
+                        ChannelKind::Private => {
+                            password.filter(|p| !p.is_empty()).map(str::to_owned)
+                        }
+                        ChannelKind::Public => None,
+                    },
+                });
             let existing: Vec<UserId> = rec.members.iter().copied().collect();
             let already = rec.members.contains(&id);
-            if !already {
-                rec.members.insert(id);
-            }
-            (existing, rec.kind, already)
+            (existing, rec.kind, rec.password.clone(), already)
         };
+
+        if !already_member && let Some(expected) = &channel_password {
+            let attempt_key = (source_ip, name.to_string());
+            let banned = self
+                .channel_password_attempts
+                .get(&attempt_key)
+                .and_then(|rec| rec.banned_at)
+                .is_some_and(|t| t.elapsed() < CHANNEL_PASSWORD_BAN_DURATION);
+            if banned {
+                return Ok(vec![Outgoing {
+                    to: id,
+                    message: ServerMessage::ChannelJoinRejected {
+                        name: name.to_string(),
+                        kind: ChannelJoinRejection::Banned,
+                    },
+                }]);
+            }
+            match password {
+                None => {
+                    return Ok(vec![Outgoing {
+                        to: id,
+                        message: ServerMessage::ChannelJoinRejected {
+                            name: name.to_string(),
+                            kind: ChannelJoinRejection::PasswordRequired,
+                        },
+                    }]);
+                }
+                Some(given) if !crypto::constant_time_eq(expected.as_bytes(), given.as_bytes()) => {
+                    let rec = self
+                        .channel_password_attempts
+                        .entry(attempt_key)
+                        .or_insert_with(|| PasswordAttemptRecord {
+                            wrong_attempts: 0,
+                            banned_at: None,
+                        });
+                    rec.wrong_attempts += 1;
+                    let rejection = if rec.wrong_attempts > CHANNEL_MAX_PASSWORD_ATTEMPTS {
+                        rec.banned_at = Some(Instant::now());
+                        ChannelJoinRejection::Banned
+                    } else {
+                        ChannelJoinRejection::WrongPassword
+                    };
+                    return Ok(vec![Outgoing {
+                        to: id,
+                        message: ServerMessage::ChannelJoinRejected {
+                            name: name.to_string(),
+                            kind: rejection,
+                        },
+                    }]);
+                }
+                Some(_) => {
+                    self.channel_password_attempts.remove(&attempt_key);
+                }
+            }
+        }
 
         if already_member {
             return Ok(Vec::new());
         }
+        self.channels
+            .get_mut(name)
+            .expect("just looked up above")
+            .members
+            .insert(id);
 
         let mut outgoing = Vec::new();
         for member_id in existing_members {
             if let Some(info) = self.user_info(member_id) {
                 outgoing.push(Outgoing {
                     to: id,
-                    message: ServerMessage::UserJoined { channel: name.to_string(), user: info },
+                    message: ServerMessage::UserJoined {
+                        channel: name.to_string(),
+                        user: info,
+                    },
                 });
             }
             outgoing.push(Outgoing {
                 to: member_id,
-                message: ServerMessage::UserJoined { channel: name.to_string(), user: user.clone() },
+                message: ServerMessage::UserJoined {
+                    channel: name.to_string(),
+                    user: user.clone(),
+                },
             });
         }
         outgoing.push(Outgoing {
             to: id,
             message: ServerMessage::Joined {
-                channel: ChannelInfo { name: name.to_string(), kind: channel_kind },
+                channel: ChannelInfo {
+                    name: name.to_string(),
+                    kind: channel_kind,
+                },
             },
         });
+
+        // A brand-new *public* channel is announced to every other
+        // connected client - the one-time ChannelList snapshot at connect
+        // time otherwise never updates, so this is the only way anyone else
+        // ever learns it exists (docs/PROTOCOL.md §6.1/§6.3). A private
+        // channel never triggers this - it stays unadvertised exactly as
+        // before. The joiner already has `Joined` above, so it's excluded
+        // here.
+        if !existed_before && channel_kind == ChannelKind::Public {
+            for &other_id in self.clients.keys() {
+                if other_id != id {
+                    outgoing.push(Outgoing {
+                        to: other_id,
+                        message: ServerMessage::ChannelCreated {
+                            channel: ChannelInfo {
+                                name: name.to_string(),
+                                kind: channel_kind,
+                            },
+                        },
+                    });
+                }
+            }
+        }
+
         Ok(outgoing)
     }
 
     /// Removes `id` from `name`'s membership set, if present, deleting the
-    /// channel outright if that empties a **private** one. Returns the
-    /// members who remained (i.e. who should be notified), or an empty
-    /// `Vec` if `name` doesn't exist or `id` wasn't a member. Shared by
-    /// `leave_channel` (`UserLeft`) and `unregister` (`UserOffline`), which
-    /// differ only in which message they wrap this in.
+    /// channel outright if that empties it - unless `name` is
+    /// `DEFAULT_CHANNEL_NAME`, which survives emptying regardless of kind.
+    /// Returns the members who remained (i.e. who should be notified), or
+    /// an empty `Vec` if `name` doesn't exist or `id` wasn't a member.
+    /// Shared by `leave_channel` (`UserLeft`) and `unregister`
+    /// (`UserOffline`), which differ only in which message they wrap this
+    /// in.
     fn remove_member(&mut self, id: UserId, name: &str) -> Vec<UserId> {
         let (remaining, should_delete) = {
             let Some(rec) = self.channels.get_mut(name) else {
@@ -239,7 +431,7 @@ impl Registry {
                 return Vec::new();
             }
             let remaining: Vec<UserId> = rec.members.iter().copied().collect();
-            let should_delete = rec.members.is_empty() && rec.kind == ChannelKind::Private;
+            let should_delete = rec.members.is_empty() && name != DEFAULT_CHANNEL_NAME;
             (remaining, should_delete)
         };
         if should_delete {
@@ -256,7 +448,10 @@ impl Registry {
             .into_iter()
             .map(|member_id| Outgoing {
                 to: member_id,
-                message: ServerMessage::UserLeft { channel: name.to_string(), user_id: id },
+                message: ServerMessage::UserLeft {
+                    channel: name.to_string(),
+                    user_id: id,
+                },
             })
             .collect()
     }
@@ -282,7 +477,10 @@ impl Registry {
         self.clients.remove(&id);
         recipients
             .into_iter()
-            .map(|to| Outgoing { to, message: ServerMessage::UserOffline { user_id: id } })
+            .map(|to| Outgoing {
+                to,
+                message: ServerMessage::UserOffline { user_id: id },
+            })
             .collect()
     }
 
@@ -300,14 +498,24 @@ impl Registry {
         new_public_key_der: Vec<u8>,
         signature: Vec<u8>,
     ) -> Result<Outgoing, String> {
-        let sender = self.clients.get(&from).ok_or_else(|| "unknown sender".to_string())?;
+        let sender = self
+            .clients
+            .get(&from)
+            .ok_or_else(|| "unknown sender".to_string())?;
         if sender.key_mode != KeyMode::PerMessage {
             return Err("sender is not in rsa_per_msg mode".to_string());
         }
         if !self.clients.contains_key(&to) {
             return Err("unknown recipient".to_string());
         }
-        Ok(Outgoing { to, message: ServerMessage::KeyRotated { from, new_public_key_der, signature } })
+        Ok(Outgoing {
+            to,
+            message: ServerMessage::KeyRotated {
+                from,
+                new_public_key_der,
+                signature,
+            },
+        })
     }
 
     /// Relays a direct-link candidate proposal (or reply) to `to` -
@@ -324,7 +532,14 @@ impl Registry {
         if !self.clients.contains_key(&to) {
             return Err("unknown recipient".to_string());
         }
-        Ok(Outgoing { to, message: ServerMessage::PeerCandidates { from, candidates, link_nonce } })
+        Ok(Outgoing {
+            to,
+            message: ServerMessage::PeerCandidates {
+                from,
+                candidates,
+                link_nonce,
+            },
+        })
     }
 }
 
@@ -355,7 +570,11 @@ pub async fn serve(listener: TcpListener, auth: AuthConfig) -> std::io::Result<(
 /// `serve`, plus a UDP rendezvous socket bound alongside it (see
 /// `udp_rendezvous_loop`) - what `run` actually uses, and what
 /// direct-link/hole-punch tests bind explicitly.
-pub async fn serve_with_rendezvous(listener: TcpListener, udp: UdpSocket, auth: AuthConfig) -> std::io::Result<()> {
+pub async fn serve_with_rendezvous(
+    listener: TcpListener,
+    udp: UdpSocket,
+    auth: AuthConfig,
+) -> std::io::Result<()> {
     tokio::spawn(udp_rendezvous_loop(udp));
     serve_tcp(listener, auth).await
 }
@@ -371,7 +590,7 @@ async fn serve_tcp(listener: TcpListener, auth: AuthConfig) -> std::io::Result<(
         let senders = senders.clone();
         let auth = auth.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(socket, registry, senders, auth).await {
+            if let Err(e) = handle_connection(socket, peer, registry, senders, auth).await {
                 eprintln!("aloo: connection {peer} ended: {e}");
             }
         });
@@ -389,29 +608,49 @@ async fn serve_tcp(listener: TcpListener, auth: AuthConfig) -> std::io::Result<(
 async fn udp_rendezvous_loop(socket: UdpSocket) {
     let mut buf = [0u8; 512];
     loop {
-        let Ok((n, from)) = socket.recv_from(&mut buf).await else { break };
-        let Ok(RendezvousMessage::BindingRequest { token }) = proto::decode(&buf[..n]) else { continue };
-        let Ok(response) = proto::encode(&RendezvousMessage::BindingResponse { token, observed: from }) else { continue };
+        let Ok((n, from)) = socket.recv_from(&mut buf).await else {
+            break;
+        };
+        let Ok(RendezvousMessage::BindingRequest { token }) = proto::decode(&buf[..n]) else {
+            continue;
+        };
+        let Ok(response) = proto::encode(&RendezvousMessage::BindingResponse {
+            token,
+            observed: from,
+        }) else {
+            continue;
+        };
         let _ = socket.send_to(&response, from).await;
     }
 }
 
 async fn handle_connection(
     socket: TcpStream,
+    peer_addr: SocketAddr,
     registry: Arc<Mutex<Registry>>,
     senders: Senders,
     auth: Arc<AuthConfig>,
 ) -> proto::Result<()> {
+    let peer_ip = peer_addr.ip();
     let (mut rd, mut wr) = tokio::io::split(socket);
 
     let challenge = auth.make_challenge();
-    proto::write_message(&mut wr, &ServerMessage::Hello { auth: auth.kind(), challenge: challenge.clone() })
-        .await?;
+    proto::write_message(
+        &mut wr,
+        &ServerMessage::Hello {
+            auth: auth.kind(),
+            challenge: challenge.clone(),
+        },
+    )
+    .await?;
 
     let Some(ClientMessage::Auth(response)) = proto::read_message(&mut rd).await? else {
         let _ = proto::write_message(
             &mut wr,
-            &ServerMessage::AuthResult { ok: false, reason: Some("expected auth message".into()) },
+            &ServerMessage::AuthResult {
+                ok: false,
+                reason: Some("expected auth message".into()),
+            },
         )
         .await;
         return Ok(());
@@ -419,19 +658,34 @@ async fn handle_connection(
     if !auth.verify(challenge.as_deref(), &response) {
         let _ = proto::write_message(
             &mut wr,
-            &ServerMessage::AuthResult { ok: false, reason: Some("authentication failed".into()) },
+            &ServerMessage::AuthResult {
+                ok: false,
+                reason: Some("authentication failed".into()),
+            },
         )
         .await;
         return Ok(());
     }
-    proto::write_message(&mut wr, &ServerMessage::AuthResult { ok: true, reason: None }).await?;
+    proto::write_message(
+        &mut wr,
+        &ServerMessage::AuthResult {
+            ok: true,
+            reason: None,
+        },
+    )
+    .await?;
 
-    let Some(ClientMessage::Identify { display_name, public_key_der, key_mode }) =
-        proto::read_message(&mut rd).await?
+    let Some(ClientMessage::Identify {
+        display_name,
+        public_key_der,
+        key_mode,
+    }) = proto::read_message(&mut rd).await?
     else {
         let _ = proto::write_message(
             &mut wr,
-            &ServerMessage::Error { message: "expected identify message".into() },
+            &ServerMessage::Error {
+                message: "expected identify message".into(),
+            },
         )
         .await;
         return Ok(());
@@ -445,7 +699,11 @@ async fn handle_connection(
                 drop(reg);
                 let _ = proto::write_message(
                     &mut wr,
-                    &ServerMessage::IdentifyResult { ok: false, you: None, reason: Some(reason) },
+                    &ServerMessage::IdentifyResult {
+                        ok: false,
+                        you: None,
+                        reason: Some(reason),
+                    },
                 )
                 .await;
                 return Ok(());
@@ -456,7 +714,11 @@ async fn handle_connection(
     let (tx, mut rx) = mpsc::unbounded_channel::<ServerMessage>();
     senders.lock().await.insert(id, tx.clone());
 
-    let _ = tx.send(ServerMessage::IdentifyResult { ok: true, you: Some(id), reason: None });
+    let _ = tx.send(ServerMessage::IdentifyResult {
+        ok: true,
+        you: Some(id),
+        reason: None,
+    });
     let channel_list = registry.lock().await.channel_list();
     let _ = tx.send(ServerMessage::ChannelList(channel_list));
 
@@ -468,7 +730,7 @@ async fn handle_connection(
         }
     });
 
-    let result = client_loop(id, &mut rd, &registry, &senders).await;
+    let result = client_loop(id, &mut rd, &registry, &senders, peer_ip).await;
 
     {
         let mut reg = registry.lock().await;
@@ -486,6 +748,7 @@ async fn client_loop<R: AsyncRead + Unpin>(
     rd: &mut R,
     registry: &Arc<Mutex<Registry>>,
     senders: &Senders,
+    source_ip: IpAddr,
 ) -> proto::Result<()> {
     loop {
         let Some(msg) = proto::read_message::<_, ClientMessage>(rd).await? else {
@@ -494,32 +757,50 @@ async fn client_loop<R: AsyncRead + Unpin>(
         let outgoing = {
             let mut reg = registry.lock().await;
             match msg {
-                ClientMessage::JoinChannel { name, kind } => {
+                ClientMessage::JoinChannel {
+                    name,
+                    kind,
+                    password,
+                } => {
                     let name_for_err = name.clone();
-                    reg.join_channel(id, &name, kind).unwrap_or_else(|reason| {
-                        vec![Outgoing {
-                            to: id,
-                            message: ServerMessage::ChannelJoinFailed { name: name_for_err, reason },
-                        }]
-                    })
+                    reg.join_channel(id, &name, kind, password.as_deref(), source_ip)
+                        .unwrap_or_else(|reason| {
+                            vec![Outgoing {
+                                to: id,
+                                message: ServerMessage::ChannelJoinFailed {
+                                    name: name_for_err,
+                                    reason,
+                                },
+                            }]
+                        })
                 }
                 ClientMessage::LeaveChannel { name } => reg.leave_channel(id, &name),
-                ClientMessage::RotateKey { to, new_public_key_der, signature } => {
-                    match reg.route_key_rotation(id, to, new_public_key_der, signature) {
-                        Ok(o) => vec![o],
-                        Err(reason) => {
-                            vec![Outgoing { to: id, message: ServerMessage::Error { message: reason } }]
-                        }
+                ClientMessage::RotateKey {
+                    to,
+                    new_public_key_der,
+                    signature,
+                } => match reg.route_key_rotation(id, to, new_public_key_der, signature) {
+                    Ok(o) => vec![o],
+                    Err(reason) => {
+                        vec![Outgoing {
+                            to: id,
+                            message: ServerMessage::Error { message: reason },
+                        }]
                     }
-                }
-                ClientMessage::RequestPeerLink { peer, candidates, link_nonce } => {
-                    match reg.route_peer_link_request(id, peer, candidates, link_nonce) {
-                        Ok(o) => vec![o],
-                        Err(reason) => {
-                            vec![Outgoing { to: id, message: ServerMessage::Error { message: reason } }]
-                        }
+                },
+                ClientMessage::RequestPeerLink {
+                    peer,
+                    candidates,
+                    link_nonce,
+                } => match reg.route_peer_link_request(id, peer, candidates, link_nonce) {
+                    Ok(o) => vec![o],
+                    Err(reason) => {
+                        vec![Outgoing {
+                            to: id,
+                            message: ServerMessage::Error { message: reason },
+                        }]
                     }
-                }
+                },
                 ClientMessage::Auth(_) | ClientMessage::Identify { .. } => vec![Outgoing {
                     to: id,
                     message: ServerMessage::Error {
@@ -540,4 +821,3 @@ async fn dispatch(senders: &Senders, outgoing: Vec<Outgoing>) {
         }
     }
 }
-

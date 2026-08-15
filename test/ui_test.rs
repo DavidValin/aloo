@@ -4,11 +4,12 @@ use ui_common::*;
 
 use aloo::proto::UserId;
 use aloo::ui::ui::{
-    render, Focus, IdentityCase, MessageBody, Mode, UiAction, UiState, RECORD_HOLD_TIMEOUT, SPINNER_FRAMES,
+    Focus, IdentityCase, MessageBody, Mode, RECORD_HOLD_TIMEOUT, SPINNER_FRAMES, UiAction, UiState,
+    render,
 };
 use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
-use ratatui::backend::TestBackend;
 use ratatui::Terminal;
+use ratatui::backend::TestBackend;
 use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------
@@ -25,7 +26,11 @@ fn user_offline_with_dm_history_keeps_them_in_every_channel_they_were_in() {
     state.on_user_offline(UserId(2));
 
     assert!(state.offline.contains(&UserId(2)));
-    assert_eq!(state.channels[0].members.len(), 1, "bob should still be listed - there's DM history with him");
+    assert_eq!(
+        state.channels[0].members.len(),
+        1,
+        "bob should still be listed - there's DM history with him"
+    );
     assert_eq!(state.channels[0].members[0].id, UserId(2));
 }
 
@@ -33,11 +38,17 @@ fn user_offline_with_dm_history_keeps_them_in_every_channel_they_were_in() {
 #[test]
 fn user_offline_without_dm_history_is_removed_from_channels_like_an_explicit_leave() {
     let mut state = joined_general_with(vec![user(2, "bob")]);
-    assert!(!state.private_rooms.contains_key(&UserId(2)), "no DM history with bob yet");
+    assert!(
+        !state.private_rooms.contains_key(&UserId(2)),
+        "no DM history with bob yet"
+    );
 
     state.on_user_offline(UserId(2));
 
-    assert!(state.offline.contains(&UserId(2)), "still tracked as offline even though removed from the sidebar");
+    assert!(
+        state.offline.contains(&UserId(2)),
+        "still tracked as offline even though removed from the sidebar"
+    );
     assert!(state.channels[0].members.is_empty());
 }
 
@@ -74,11 +85,17 @@ fn user_offline_is_permanent_for_the_session_since_a_user_id_is_never_reused() {
 fn key_rotation_updates_known_users_and_channel_member_copies() {
     let mut state = joined_general_with(vec![per_msg_user(2, "bob")]);
     // sanity: the channel member is a separate clone from known_users
-    assert_eq!(state.channels[0].members[0].public_key_der, vec![2, 2, 2, 2]);
+    assert_eq!(
+        state.channels[0].members[0].public_key_der,
+        vec![2, 2, 2, 2]
+    );
 
     state.on_user_key_rotated(UserId(2), vec![9, 9, 9]);
 
-    assert_eq!(state.known_users.get(&UserId(2)).unwrap().public_key_der, vec![9, 9, 9]);
+    assert_eq!(
+        state.known_users.get(&UserId(2)).unwrap().public_key_der,
+        vec![9, 9, 9]
+    );
     assert_eq!(
         state.channels[0].members[0].public_key_der,
         vec![9, 9, 9],
@@ -97,7 +114,12 @@ fn key_rotation_updates_an_open_private_room_peer_copy() {
     state.on_user_key_rotated(UserId(2), vec![7, 7, 7]);
 
     assert_eq!(
-        state.private_rooms.get(&UserId(2)).unwrap().peer.public_key_der,
+        state
+            .private_rooms
+            .get(&UserId(2))
+            .unwrap()
+            .peer
+            .public_key_der,
         vec![7, 7, 7],
         "an open private room caches its own UserInfo clone and must be updated too"
     );
@@ -170,11 +192,22 @@ fn ctrl_h_release_event_does_not_re_toggle_help() {
     // keystroke also reaches handle_key - it must be absorbed, not treated
     // as a second toggle that immediately cancels the Press.
     let mut state = UiState::new("me".into());
-    state.handle_key(KeyCode::Char('h'), KeyModifiers::CONTROL, KeyEventKind::Press);
+    state.handle_key(
+        KeyCode::Char('h'),
+        KeyModifiers::CONTROL,
+        KeyEventKind::Press,
+    );
     assert!(state.help_open);
-    let action = state.handle_key(KeyCode::Char('h'), KeyModifiers::CONTROL, KeyEventKind::Release);
+    let action = state.handle_key(
+        KeyCode::Char('h'),
+        KeyModifiers::CONTROL,
+        KeyEventKind::Release,
+    );
     assert_eq!(action, None);
-    assert!(state.help_open, "the paired Release must not flip help back off");
+    assert!(
+        state.help_open,
+        "the paired Release must not flip help back off"
+    );
 }
 
 /// @requirement TB-106
@@ -186,12 +219,21 @@ fn help_absorbs_other_keys_while_open() {
 
     let focus_before = state.focus;
     let action = press(&mut state, KeyCode::Tab);
-    assert_eq!(action, None, "keys other than Ctrl+H must be swallowed while help is open");
-    assert_eq!(state.focus, focus_before, "focus must not change while help absorbs input");
+    assert_eq!(
+        action, None,
+        "keys other than Ctrl+H must be swallowed while help is open"
+    );
+    assert_eq!(
+        state.focus, focus_before,
+        "focus must not change while help absorbs input"
+    );
     assert!(state.help_open);
 
     type_str(&mut state, "hello");
-    assert!(state.input.is_empty(), "typing must not reach the compose bar while help is open");
+    assert!(
+        state.input.is_empty(),
+        "typing must not reach the compose bar while help is open"
+    );
 }
 
 /// @requirement TB-106
@@ -210,7 +252,11 @@ fn esc_while_help_open_only_closes_help_not_the_private_room_underneath() {
     // normal "Esc closes the private room" handling underneath.
     press(&mut state, KeyCode::Esc);
     assert!(state.help_open, "Esc must not close help");
-    assert_eq!(state.active_private_room, Some(UserId(2)), "the private room underneath must be untouched");
+    assert_eq!(
+        state.active_private_room,
+        Some(UserId(2)),
+        "the private room underneath must be untouched"
+    );
 }
 
 /// @requirement AC-056
@@ -221,7 +267,10 @@ fn ctrl_h_works_regardless_of_current_view_or_mode() {
     ctrl(&mut state, KeyCode::Char('j'));
     assert_eq!(state.mode, Mode::JoinPrivatePopup);
     ctrl(&mut state, KeyCode::Char('h'));
-    assert!(state.help_open, "Ctrl+H should open help even with the join popup active");
+    assert!(
+        state.help_open,
+        "Ctrl+H should open help even with the join popup active"
+    );
 
     // from an open private room
     ctrl(&mut state, KeyCode::Char('h')); // close it again
@@ -230,7 +279,10 @@ fn ctrl_h_works_regardless_of_current_view_or_mode() {
     press(&mut state, KeyCode::Enter);
     assert!(state.active_private_room.is_some());
     ctrl(&mut state, KeyCode::Char('h'));
-    assert!(state.help_open, "Ctrl+H should open help from inside a private room");
+    assert!(
+        state.help_open,
+        "Ctrl+H should open help from inside a private room"
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -270,8 +322,13 @@ fn tick_spinner_advances_one_frame_per_call_and_wraps_around() {
         state.tick_spinner(true);
         rows_seen.push(spinner_char_shown(&state));
     }
-    let expected: Vec<char> = (0..SPINNER_FRAMES.len() * 2).map(|n| SPINNER_FRAMES[n % SPINNER_FRAMES.len()]).collect();
-    assert_eq!(rows_seen, expected, "expected the frame to cycle through all six and wrap around");
+    let expected: Vec<char> = (0..SPINNER_FRAMES.len() * 2)
+        .map(|n| SPINNER_FRAMES[n % SPINNER_FRAMES.len()])
+        .collect();
+    assert_eq!(
+        rows_seen, expected,
+        "expected the frame to cycle through all six and wrap around"
+    );
 }
 
 /// @requirement TB-085
@@ -302,7 +359,9 @@ fn tick_spinner_resets_to_the_first_frame_once_regeneration_stops_and_restarts()
 fn after_help_hint(state: &UiState) -> String {
     let rows = rendered_rows(state);
     let header = rows.first().expect("header row").clone();
-    let idx = header.find("Ctrl+H: Help").expect("expected the help hint on the header row");
+    let idx = header
+        .find("Ctrl+H: Help")
+        .expect("expected the help hint on the header row");
     header[idx + "Ctrl+H: Help".len()..].trim_end().to_string()
 }
 
@@ -325,7 +384,10 @@ fn header_shows_no_spinner_when_no_key_is_being_regenerated() {
     let state = joined_general_with(vec![]);
     let rows = rendered_rows(&state);
     let header = rows.first().expect("header row");
-    assert!(header.contains("Ctrl+H: Help"), "expected the help hint: {header:?}");
+    assert!(
+        header.contains("Ctrl+H: Help"),
+        "expected the help hint: {header:?}"
+    );
     assert!(
         after_help_hint(&state).is_empty(),
         "nothing (in particular no spinner frame) should follow the help hint while key_regenerating is false: {:?}",
@@ -341,7 +403,10 @@ fn header_shows_the_spinner_right_after_the_help_hint_separated_by_two_spaces() 
     let rows = rendered_rows(&state);
     let header = rows.first().expect("header row");
     let expected = format!("Ctrl+H: Help  {}", SPINNER_FRAMES[0]);
-    assert!(header.contains(&expected), "expected {expected:?} on the header row: {header:?}");
+    assert!(
+        header.contains(&expected),
+        "expected {expected:?} on the header row: {header:?}"
+    );
 }
 
 /// @requirement AC-046
@@ -352,7 +417,10 @@ fn header_spinner_animates_across_ticks() {
     let first = spinner_char_shown(&state);
     state.tick_spinner(true);
     let second = spinner_char_shown(&state);
-    assert_ne!(first, second, "the spinner should visibly change between consecutive ticks");
+    assert_ne!(
+        first, second,
+        "the spinner should visibly change between consecutive ticks"
+    );
     assert_eq!(first, SPINNER_FRAMES[0]);
     assert_eq!(second, SPINNER_FRAMES[1]);
 }
@@ -387,9 +455,15 @@ fn space_press_without_a_joined_channel_or_active_dm_does_not_start_recording_an
     let mut state = UiState::new("me".into()); // no channels joined, no active DM
     state.focus = Focus::Messages;
     let action = state.handle_key(KeyCode::Char(' '), KeyModifiers::NONE, KeyEventKind::Press);
-    assert_eq!(action, None, "there's nowhere to address a stream to, so no recording should start");
+    assert_eq!(
+        action, None,
+        "there's nowhere to address a stream to, so no recording should start"
+    );
     assert!(!state.recording);
-    assert_eq!(state.audio_error.as_deref(), Some("not joined to a channel yet"));
+    assert_eq!(
+        state.audio_error.as_deref(),
+        Some("not joined to a channel yet")
+    );
 }
 
 /// @requirement AC-090
@@ -397,9 +471,15 @@ fn space_press_without_a_joined_channel_or_active_dm_does_not_start_recording_an
 fn global_record_start_without_a_joined_channel_or_active_dm_does_nothing() {
     let mut state = UiState::new("me".into()); // no channels joined, no active DM
     let action = state.global_record_start();
-    assert_eq!(action, None, "there's nowhere to address a stream to, so no recording should start");
+    assert_eq!(
+        action, None,
+        "there's nowhere to address a stream to, so no recording should start"
+    );
     assert!(!state.recording);
-    assert_eq!(state.audio_error.as_deref(), Some("not joined to a channel yet"));
+    assert_eq!(
+        state.audio_error.as_deref(),
+        Some("not joined to a channel yet")
+    );
 }
 
 /// @requirement AC-091
@@ -408,7 +488,11 @@ fn global_record_start_is_a_no_op_while_already_recording() {
     let mut state = joined_general_with(vec![user(2, "bob")]);
     assert!(state.global_record_start().is_some());
     assert!(state.recording);
-    assert_eq!(state.global_record_start(), None, "a second press must not start a second stream");
+    assert_eq!(
+        state.global_record_start(),
+        None,
+        "a second press must not start a second stream"
+    );
 }
 
 /// @requirement AC-091
@@ -419,7 +503,11 @@ fn global_record_stop_does_nothing_to_a_space_started_recording() {
     state.handle_key(KeyCode::Char(' '), KeyModifiers::NONE, KeyEventKind::Press);
     assert!(state.recording);
 
-    assert_eq!(state.global_record_stop(), None, "the global shortcut must only ever stop a recording it itself started");
+    assert_eq!(
+        state.global_record_stop(),
+        None,
+        "the global shortcut must only ever stop a recording it itself started"
+    );
     assert!(state.recording, "a Space-started recording must keep going");
 }
 
@@ -431,9 +519,19 @@ fn space_release_does_nothing_to_a_global_started_recording() {
     assert!(state.global_record_start().is_some());
     assert!(state.recording);
 
-    let action = state.handle_key(KeyCode::Char(' '), KeyModifiers::NONE, KeyEventKind::Release);
-    assert_eq!(action, None, "Space letting go must not stop a recording it never started");
-    assert!(state.recording, "a globally-started recording must keep going");
+    let action = state.handle_key(
+        KeyCode::Char(' '),
+        KeyModifiers::NONE,
+        KeyEventKind::Release,
+    );
+    assert_eq!(
+        action, None,
+        "Space letting go must not stop a recording it never started"
+    );
+    assert!(
+        state.recording,
+        "a globally-started recording must keep going"
+    );
 }
 
 /// @requirement AC-092
@@ -450,7 +548,10 @@ fn tick_recording_timeout_never_touches_a_global_started_recording() {
     // (`global_record_stop`) may end it.
     let far_future = Instant::now() + RECORD_HOLD_TIMEOUT * 100;
     assert_eq!(state.tick_recording_timeout(far_future), None);
-    assert!(state.recording, "a global recording must never be auto-stopped by the idle-silence guess");
+    assert!(
+        state.recording,
+        "a global recording must never be auto-stopped by the idle-silence guess"
+    );
 }
 
 /// @requirement TB-043
@@ -462,8 +563,14 @@ fn recording_failed_clears_the_misleading_recording_indicator_and_shows_why() {
     assert!(state.recording);
 
     state.recording_failed("no input device available".into());
-    assert!(!state.recording, "a failed start must not leave the UI claiming to record");
-    assert_eq!(state.audio_error.as_deref(), Some("no input device available"));
+    assert!(
+        !state.recording,
+        "a failed start must not leave the UI claiming to record"
+    );
+    assert_eq!(
+        state.audio_error.as_deref(),
+        Some("no input device available")
+    );
 }
 
 /// @requirement TB-043
@@ -486,8 +593,14 @@ fn playback_failed_shows_the_reason_without_touching_recording_state() {
     assert!(state.recording);
 
     state.playback_failed("no output device available".into());
-    assert_eq!(state.audio_error.as_deref(), Some("no output device available"));
-    assert!(state.recording, "a playback failure is unrelated to an in-progress recording");
+    assert_eq!(
+        state.audio_error.as_deref(),
+        Some("no output device available")
+    );
+    assert!(
+        state.recording,
+        "a playback failure is unrelated to an in-progress recording"
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -513,7 +626,10 @@ fn repeated_space_presses_do_not_auto_stop_before_the_timeout() {
     // still well inside the timeout window - simulating OS key-repeat
     let soon = Instant::now();
     assert_eq!(state.tick_recording_timeout(soon), None);
-    assert!(state.recording, "a held key must not be treated as released early");
+    assert!(
+        state.recording,
+        "a held key must not be treated as released early"
+    );
 }
 
 /// @requirement TB-041
@@ -526,7 +642,10 @@ fn idle_gap_past_the_timeout_auto_stops_and_sends() {
 
     let released_by_now = Instant::now() + RECORD_HOLD_TIMEOUT + Duration::from_millis(1);
     let action = state.tick_recording_timeout(released_by_now);
-    assert!(!state.recording, "idle past the timeout must be treated as released");
+    assert!(
+        !state.recording,
+        "idle past the timeout must be treated as released"
+    );
     assert_eq!(action, Some(UiAction::VoiceRecordStop));
 }
 
@@ -566,9 +685,16 @@ fn keyboard_release_reporting_disables_the_idle_timeout_entirely() {
     // No amount of silence should stop it - only a genuine Release may.
     let far_future = Instant::now() + RECORD_HOLD_TIMEOUT * 100;
     assert_eq!(state.tick_recording_timeout(far_future), None);
-    assert!(state.recording, "must keep recording through silence when release reporting is trustworthy");
+    assert!(
+        state.recording,
+        "must keep recording through silence when release reporting is trustworthy"
+    );
 
-    let action = state.handle_key(KeyCode::Char(' '), KeyModifiers::NONE, KeyEventKind::Release);
+    let action = state.handle_key(
+        KeyCode::Char(' '),
+        KeyModifiers::NONE,
+        KeyEventKind::Release,
+    );
     assert!(!state.recording);
     assert!(matches!(action, Some(UiAction::VoiceRecordStop)));
 }
@@ -579,11 +705,18 @@ fn explicit_release_event_still_stops_immediately_without_waiting_for_the_timeou
     let mut state = joined_general_with(vec![user(2, "bob")]);
     state.focus = Focus::Messages;
     state.handle_key(KeyCode::Char(' '), KeyModifiers::NONE, KeyEventKind::Press);
-    let action = state.handle_key(KeyCode::Char(' '), KeyModifiers::NONE, KeyEventKind::Release);
+    let action = state.handle_key(
+        KeyCode::Char(' '),
+        KeyModifiers::NONE,
+        KeyEventKind::Release,
+    );
     assert!(!state.recording);
     assert!(matches!(action, Some(UiAction::VoiceRecordStop)));
     // and the now-defused idle timer must not fire a second stop later
-    assert_eq!(state.tick_recording_timeout(Instant::now() + RECORD_HOLD_TIMEOUT * 10), None);
+    assert_eq!(
+        state.tick_recording_timeout(Instant::now() + RECORD_HOLD_TIMEOUT * 10),
+        None
+    );
 }
 
 /// @requirement TB-042
@@ -591,7 +724,11 @@ fn explicit_release_event_still_stops_immediately_without_waiting_for_the_timeou
 fn space_release_without_prior_press_does_nothing() {
     let mut state = joined_general_with(vec![]);
     state.focus = Focus::Messages;
-    let action = state.handle_key(KeyCode::Char(' '), KeyModifiers::NONE, KeyEventKind::Release);
+    let action = state.handle_key(
+        KeyCode::Char(' '),
+        KeyModifiers::NONE,
+        KeyEventKind::Release,
+    );
     assert_eq!(action, None);
 }
 
@@ -610,7 +747,10 @@ fn space_release_without_prior_press_does_nothing() {
 fn message_selection_defaults_to_the_newest_entry() {
     let mut state = joined_general_with(vec![user(2, "bob")]);
     push_n_channel_texts(&mut state, 5);
-    assert_eq!(state.message_selected, 4, "should be following the newest message by default");
+    assert_eq!(
+        state.message_selected, 4,
+        "should be following the newest message by default"
+    );
 }
 
 /// @requirement AC-060
@@ -620,7 +760,10 @@ fn new_messages_auto_follow_when_already_viewing_the_bottom() {
     push_n_channel_texts(&mut state, 3);
     assert_eq!(state.message_selected, 2);
     push_n_channel_texts(&mut state, 1);
-    assert_eq!(state.message_selected, 3, "a 4th message should pull the selection along with it");
+    assert_eq!(
+        state.message_selected, 3,
+        "a 4th message should pull the selection along with it"
+    );
 }
 
 /// @requirement AC-060
@@ -633,7 +776,10 @@ fn scrolled_up_history_is_not_yanked_down_by_a_new_message() {
     assert_eq!(state.message_selected, 0);
 
     push_n_channel_texts(&mut state, 1);
-    assert_eq!(state.message_selected, 0, "a new message must not jerk a scrolled-up view back to the bottom");
+    assert_eq!(
+        state.message_selected, 0,
+        "a new message must not jerk a scrolled-up view back to the bottom"
+    );
 }
 
 /// @requirement AC-061
@@ -647,13 +793,19 @@ fn up_down_clamp_at_the_ends_instead_of_wrapping() {
     press(&mut state, KeyCode::Up);
     assert_eq!(state.message_selected, 0);
     press(&mut state, KeyCode::Up);
-    assert_eq!(state.message_selected, 0, "Up at the top must clamp, not wrap to the bottom");
+    assert_eq!(
+        state.message_selected, 0,
+        "Up at the top must clamp, not wrap to the bottom"
+    );
 
     press(&mut state, KeyCode::Down);
     press(&mut state, KeyCode::Down);
     assert_eq!(state.message_selected, 1);
     press(&mut state, KeyCode::Down);
-    assert_eq!(state.message_selected, 1, "Down at the bottom must clamp, not wrap to the top");
+    assert_eq!(
+        state.message_selected, 1,
+        "Down at the bottom must clamp, not wrap to the top"
+    );
 }
 
 /// @requirement AC-061
@@ -675,7 +827,10 @@ fn page_up_page_down_home_and_end_jump_the_selection() {
     assert_eq!(state.message_selected, total - 1);
 
     press(&mut state, KeyCode::PageUp);
-    assert_eq!(state.message_selected, total - 1 - aloo::ui::ui::MESSAGE_PAGE_JUMP);
+    assert_eq!(
+        state.message_selected,
+        total - 1 - aloo::ui::ui::MESSAGE_PAGE_JUMP
+    );
 }
 
 /// @requirement TB-109
@@ -690,7 +845,11 @@ fn the_rendered_viewport_follows_the_selection_instead_of_always_showing_the_top
     terminal.draw(|f| render(f, &state)).unwrap();
     let buffer = terminal.backend().buffer().clone();
     let rows: Vec<String> = (0..buffer.area.height)
-        .map(|y| (0..buffer.area.width).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
         .collect();
 
     assert!(
@@ -708,10 +867,20 @@ fn the_rendered_viewport_follows_the_selection_instead_of_always_showing_the_top
     terminal.draw(|f| render(f, &state)).unwrap();
     let buffer = terminal.backend().buffer().clone();
     let rows: Vec<String> = (0..buffer.area.height)
-        .map(|y| (0..buffer.area.width).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
         .collect();
-    assert!(rows.iter().any(|r| r.contains("msg0")), "scrolling to Home should bring the oldest message into view: {rows:?}");
-    assert!(!rows.iter().any(|r| r.contains("msg39")), "the newest message should have scrolled out of view: {rows:?}");
+    assert!(
+        rows.iter().any(|r| r.contains("msg0")),
+        "scrolling to Home should bring the oldest message into view: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|r| r.contains("msg39")),
+        "the newest message should have scrolled out of view: {rows:?}"
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -726,22 +895,45 @@ fn enter_on_voice_message_in_messages_focus_requests_replay() {
         "general",
         UserId(2),
         "bob".into(),
-        MessageBody::Voice { duration_ms: 4200, pcm: vec![1, 2, 3, 4] },
+        MessageBody::Voice {
+            duration_ms: 4200,
+            pcm: vec![1, 2, 3, 4],
+        },
     );
     state.focus = Focus::Messages;
     let action = press(&mut state, KeyCode::Enter).unwrap();
-    assert_eq!(action, UiAction::ReplayVoice { duration_ms: 4200, pcm: vec![1, 2, 3, 4] });
-    assert!(state.replaying, "a non-empty clip should be tracked as playing");
+    assert_eq!(
+        action,
+        UiAction::ReplayVoice {
+            duration_ms: 4200,
+            pcm: vec![1, 2, 3, 4]
+        }
+    );
+    assert!(
+        state.replaying,
+        "a non-empty clip should be tracked as playing"
+    );
 }
 
 /// @requirement AC-036
 #[test]
 fn replaying_an_empty_clip_does_not_set_the_replaying_flag() {
     let mut state = joined_general_with(vec![user(2, "bob")]);
-    state.on_channel_message("general", UserId(2), "bob".into(), MessageBody::Voice { duration_ms: 0, pcm: vec![] });
+    state.on_channel_message(
+        "general",
+        UserId(2),
+        "bob".into(),
+        MessageBody::Voice {
+            duration_ms: 0,
+            pcm: vec![],
+        },
+    );
     state.focus = Focus::Messages;
     press(&mut state, KeyCode::Enter);
-    assert!(!state.replaying, "nothing actually starts playing for an empty clip - Escape must not be hijacked");
+    assert!(
+        !state.replaying,
+        "nothing actually starts playing for an empty clip - Escape must not be hijacked"
+    );
 }
 
 /// @requirement AC-098
@@ -752,7 +944,10 @@ fn escape_stops_playback_of_a_voice_message_being_replayed() {
         "general",
         UserId(2),
         "bob".into(),
-        MessageBody::Voice { duration_ms: 4200, pcm: vec![1, 2, 3, 4] },
+        MessageBody::Voice {
+            duration_ms: 4200,
+            pcm: vec![1, 2, 3, 4],
+        },
     );
     state.focus = Focus::Messages;
     press(&mut state, KeyCode::Enter);
@@ -775,7 +970,14 @@ fn escape_release_after_stopping_playback_does_not_also_close_the_room() {
     state.focus = Focus::Sidebar;
     press(&mut state, KeyCode::Enter); // opens a private room with bob
     assert!(state.active_private_room.is_some());
-    state.on_direct_message(UserId(2), "bob".into(), MessageBody::Voice { duration_ms: 500, pcm: vec![9, 9] });
+    state.on_direct_message(
+        UserId(2),
+        "bob".into(),
+        MessageBody::Voice {
+            duration_ms: 500,
+            pcm: vec![9, 9],
+        },
+    );
     state.focus = Focus::Messages;
     press(&mut state, KeyCode::Enter); // start replay
     assert!(state.replaying);
@@ -784,14 +986,22 @@ fn escape_release_after_stopping_playback_does_not_also_close_the_room() {
     assert_eq!(press_action, Some(UiAction::StopPlayback));
     let release_action = state.handle_key(KeyCode::Esc, KeyModifiers::NONE, KeyEventKind::Release);
     assert_eq!(release_action, None);
-    assert!(state.active_private_room.is_some(), "the room must still be open after the trailing Release");
+    assert!(
+        state.active_private_room.is_some(),
+        "the room must still be open after the trailing Release"
+    );
 }
 
 /// @requirement AC-036
 #[test]
 fn enter_on_text_message_in_messages_focus_does_nothing() {
     let mut state = joined_general_with(vec![user(2, "bob")]);
-    state.on_channel_message("general", UserId(2), "bob".into(), MessageBody::Text("hi".into()));
+    state.on_channel_message(
+        "general",
+        UserId(2),
+        "bob".into(),
+        MessageBody::Text("hi".into()),
+    );
     state.focus = Focus::Messages;
     let action = press(&mut state, KeyCode::Enter);
     assert_eq!(action, None);
@@ -807,10 +1017,22 @@ fn render_help_popup_shows_expected_content_when_open() {
     let mut state = joined_general_with(vec![]);
     state.help_open = true;
     let rows = rendered_rows(&state);
-    assert!(rows.iter().any(|r| r.contains("Help")), "expected a help popup title: {rows:?}");
-    assert!(rows.iter().any(|r| r.contains("Ctrl+J")), "expected help on joining a hidden channel: {rows:?}");
-    assert!(rows.iter().any(|r| r.contains("Space")), "expected help on sending a voice message: {rows:?}");
-    assert!(rows.iter().any(|r| r.contains("/file")), "expected help on sending a file: {rows:?}");
+    assert!(
+        rows.iter().any(|r| r.contains("Help")),
+        "expected a help popup title: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|r| r.contains("Ctrl+J")),
+        "expected help on joining a hidden channel: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|r| r.contains("Space")),
+        "expected help on sending a voice message: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|r| r.contains("/file")),
+        "expected help on sending a file: {rows:?}"
+    );
 
     // The encryption tags and identity pinning both sit far enough down the
     // (now longer) help text that a typical terminal does not show them
@@ -818,7 +1040,10 @@ fn render_help_popup_shows_expected_content_when_open() {
     // overlay.
     press(&mut state, KeyCode::End);
     let rows = rendered_rows(&state);
-    assert!(rows.iter().any(|r| r.contains("RSAPM")), "expected the encryption tags explained: {rows:?}");
+    assert!(
+        rows.iter().any(|r| r.contains("RSAPM")),
+        "expected the encryption tags explained: {rows:?}"
+    );
     assert!(
         rows.iter().any(|r| r.contains("Identity pinning")),
         "expected id_store identity pinning explained after scrolling to the bottom: {rows:?}"
@@ -840,15 +1065,30 @@ fn help_scroll_moves_by_one_line_and_by_a_page_and_clamps_at_both_ends() {
     assert_eq!(state.help_scroll(), 0, "Up at the top must not go negative");
 
     press(&mut state, KeyCode::PageDown);
-    assert_eq!(state.help_scroll(), aloo::ui::ui::HELP_SCROLL_PAGE, "PageDown jumps a full page");
+    assert_eq!(
+        state.help_scroll(),
+        aloo::ui::ui::HELP_SCROLL_PAGE,
+        "PageDown jumps a full page"
+    );
 
     press(&mut state, KeyCode::End);
     let bottom = state.help_scroll();
-    assert!(bottom > aloo::ui::ui::HELP_SCROLL_PAGE, "End should jump past a single page");
+    assert!(
+        bottom > aloo::ui::ui::HELP_SCROLL_PAGE,
+        "End should jump past a single page"
+    );
     press(&mut state, KeyCode::PageDown);
-    assert_eq!(state.help_scroll(), bottom, "PageDown at the bottom must not scroll past the last line");
+    assert_eq!(
+        state.help_scroll(),
+        bottom,
+        "PageDown at the bottom must not scroll past the last line"
+    );
     press(&mut state, KeyCode::Down);
-    assert_eq!(state.help_scroll(), bottom, "Down at the bottom must not scroll past the last line either");
+    assert_eq!(
+        state.help_scroll(),
+        bottom,
+        "Down at the bottom must not scroll past the last line either"
+    );
 
     press(&mut state, KeyCode::Home);
     assert_eq!(state.help_scroll(), 0, "Home jumps back to the top");
@@ -866,7 +1106,11 @@ fn help_always_reopens_scrolled_to_the_top() {
     assert!(!state.help_open);
     ctrl(&mut state, KeyCode::Char('h')); // reopen
     assert!(state.help_open);
-    assert_eq!(state.help_scroll(), 0, "reopening must not resume wherever it was left last time");
+    assert_eq!(
+        state.help_scroll(),
+        0,
+        "reopening must not resume wherever it was left last time"
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -874,7 +1118,10 @@ fn help_always_reopens_scrolled_to_the_top() {
 // ---------------------------------------------------------------------
 
 fn static_mismatch() -> IdentityCase {
-    IdentityCase::StaticMismatch { new_public_key_der: vec![9, 9, 9], previous_public_key_der: vec![1, 1, 1] }
+    IdentityCase::StaticMismatch {
+        new_public_key_der: vec![9, 9, 9],
+        previous_public_key_der: vec![1, 1, 1],
+    }
 }
 
 /// @requirement AC-049, AC-064
@@ -883,63 +1130,133 @@ fn no_identity_review_popup_is_shown_when_nothing_is_pending() {
     let state = joined_general_with(vec![]);
     assert!(state.identity_review_open().is_none());
     let rows = rendered_rows(&state);
-    assert!(!rows.iter().any(|r| r.contains("Identity review")), "no popup should render without a pending review");
+    assert!(
+        !rows.iter().any(|r| r.contains("Identity review")),
+        "no popup should render without a pending review"
+    );
 }
 
 /// @requirement AC-064
 #[test]
 fn identity_review_popup_auto_opens_and_shows_the_case_specific_message() {
     let mut state = joined_general_with(vec![user(2, "bob")]);
-    state.push_identity_review(UserId(2), "bob".into(), "bob's key changed unexpectedly".into(), static_mismatch());
+    state.push_identity_review(
+        UserId(2),
+        "bob".into(),
+        "bob's key changed unexpectedly".into(),
+        static_mismatch(),
+    );
 
-    assert_eq!(state.identity_review_open().map(|r| r.nickname.as_str()), Some("bob"));
+    assert_eq!(
+        state.identity_review_open().map(|r| r.nickname.as_str()),
+        Some("bob")
+    );
     let rows = rendered_rows(&state);
-    assert!(rows.iter().any(|r| r.contains("Identity review: bob")), "expected a popup titled with the nickname: {rows:?}");
     assert!(
-        rows.iter().any(|r| r.contains("bob's key changed unexpectedly")),
+        rows.iter().any(|r| r.contains("Identity review: bob")),
+        "expected a popup titled with the nickname: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|r| r.contains("bob's key changed unexpectedly")),
         "expected the case-specific message: {rows:?}"
     );
-    assert!(rows.iter().any(|r| r.contains("Accept")), "expected an Accept button: {rows:?}");
-    assert!(rows.iter().any(|r| r.contains("Reject")), "expected a Reject button: {rows:?}");
+    assert!(
+        rows.iter().any(|r| r.contains("Accept")),
+        "expected an Accept button: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|r| r.contains("Reject")),
+        "expected a Reject button: {rows:?}"
+    );
 }
 
 /// @requirement AC-065
 #[test]
 fn accepting_an_identity_review_clears_it_and_reveals_held_messages() {
     let mut state = joined_general_with(vec![user(2, "bob")]);
-    state.push_identity_review(UserId(2), "bob".into(), "mismatch".into(), static_mismatch());
+    state.push_identity_review(
+        UserId(2),
+        "bob".into(),
+        "mismatch".into(),
+        static_mismatch(),
+    );
     // A message from bob while he's Pending is held, not shown.
-    state.on_channel_message("general", UserId(2), "bob".into(), MessageBody::Text("hi".into()));
-    assert!(state.channels[0].log.is_empty(), "held message must not appear in the visible log yet");
+    state.on_channel_message(
+        "general",
+        UserId(2),
+        "bob".into(),
+        MessageBody::Text("hi".into()),
+    );
+    assert!(
+        state.channels[0].log.is_empty(),
+        "held message must not appear in the visible log yet"
+    );
     assert!(state.is_trust_gated(UserId(2)));
 
     state.resolve_identity_accept(UserId(2));
 
-    assert!(!state.is_trust_gated(UserId(2)), "accepted peer is trusted again");
+    assert!(
+        !state.is_trust_gated(UserId(2)),
+        "accepted peer is trusted again"
+    );
     assert!(state.identity_review_open().is_none());
-    assert_eq!(state.channels[0].log.len(), 1, "the held message must be revealed on accept");
-    assert_eq!(state.channels[0].log[0].body, MessageBody::Text("hi".into()));
+    assert_eq!(
+        state.channels[0].log.len(),
+        1,
+        "the held message must be revealed on accept"
+    );
+    assert_eq!(
+        state.channels[0].log[0].body,
+        MessageBody::Text("hi".into())
+    );
 }
 
 /// @requirement AC-065
 #[test]
 fn rejecting_an_identity_review_keeps_it_and_leaves_messages_held() {
     let mut state = joined_general_with(vec![user(2, "bob")]);
-    state.push_identity_review(UserId(2), "bob".into(), "mismatch".into(), static_mismatch());
-    state.on_channel_message("general", UserId(2), "bob".into(), MessageBody::Text("hi".into()));
+    state.push_identity_review(
+        UserId(2),
+        "bob".into(),
+        "mismatch".into(),
+        static_mismatch(),
+    );
+    state.on_channel_message(
+        "general",
+        UserId(2),
+        "bob".into(),
+        MessageBody::Text("hi".into()),
+    );
 
     state.resolve_identity_reject(UserId(2));
 
-    assert!(state.is_trust_gated(UserId(2)), "a rejected peer is still not trusted");
-    assert!(state.channels[0].log.is_empty(), "a rejected sender's message stays held, never revealed");
-    assert!(state.pending_messages.get(&UserId(2)).is_some_and(|h| !h.is_empty()));
+    assert!(
+        state.is_trust_gated(UserId(2)),
+        "a rejected peer is still not trusted"
+    );
+    assert!(
+        state.channels[0].log.is_empty(),
+        "a rejected sender's message stays held, never revealed"
+    );
+    assert!(
+        state
+            .pending_messages
+            .get(&UserId(2))
+            .is_some_and(|h| !h.is_empty())
+    );
 }
 
 /// @requirement AC-066
 #[test]
 fn enter_on_a_trust_gated_sidebar_member_reopens_the_review_popup_instead_of_the_dm() {
     let mut state = joined_general_with(vec![user(2, "bob")]);
-    state.push_identity_review(UserId(2), "bob".into(), "mismatch".into(), static_mismatch());
+    state.push_identity_review(
+        UserId(2),
+        "bob".into(),
+        "mismatch".into(),
+        static_mismatch(),
+    );
     state.resolve_identity_reject(UserId(2)); // popup closes, bob stays Rejected
     assert!(state.identity_review_open().is_none());
 
@@ -947,18 +1264,38 @@ fn enter_on_a_trust_gated_sidebar_member_reopens_the_review_popup_instead_of_the
     state.sidebar_selected = 0;
     press(&mut state, KeyCode::Enter);
 
-    assert_eq!(state.identity_review_open().map(|r| r.nickname.as_str()), Some("bob"));
-    assert_eq!(state.active_private_room, None, "must not open the private room for an unverified peer");
+    assert_eq!(
+        state.identity_review_open().map(|r| r.nickname.as_str()),
+        Some("bob")
+    );
+    assert_eq!(
+        state.active_private_room, None,
+        "must not open the private room for an unverified peer"
+    );
 }
 
 /// @requirement AC-049, AC-067
 #[test]
 fn a_second_mismatch_queues_behind_the_open_one_and_is_shown_once_it_resolves() {
     let mut state = joined_general_with(vec![user(2, "bob"), user(3, "carol")]);
-    state.push_identity_review(UserId(2), "bob".into(), "bob mismatch".into(), static_mismatch());
-    state.push_identity_review(UserId(3), "carol".into(), "carol mismatch".into(), static_mismatch());
+    state.push_identity_review(
+        UserId(2),
+        "bob".into(),
+        "bob mismatch".into(),
+        static_mismatch(),
+    );
+    state.push_identity_review(
+        UserId(3),
+        "carol".into(),
+        "carol mismatch".into(),
+        static_mismatch(),
+    );
 
-    assert_eq!(state.identity_review_open().map(|r| r.nickname.as_str()), Some("bob"), "bob's arrived first");
+    assert_eq!(
+        state.identity_review_open().map(|r| r.nickname.as_str()),
+        Some("bob"),
+        "bob's arrived first"
+    );
 
     state.resolve_identity_reject(UserId(2));
 
@@ -973,9 +1310,23 @@ fn a_second_mismatch_queues_behind_the_open_one_and_is_shown_once_it_resolves() 
 #[test]
 fn a_silently_resolved_review_is_removed_even_when_it_is_not_the_one_shown() {
     let mut state = joined_general_with(vec![user(2, "bob"), user(3, "carol")]);
-    state.push_identity_review(UserId(2), "bob".into(), "bob unverified".into(), static_mismatch());
-    state.push_identity_review(UserId(3), "carol".into(), "carol unverified".into(), static_mismatch());
-    assert_eq!(state.identity_review_open().map(|r| r.nickname.as_str()), Some("bob"), "bob's arrived first");
+    state.push_identity_review(
+        UserId(2),
+        "bob".into(),
+        "bob unverified".into(),
+        static_mismatch(),
+    );
+    state.push_identity_review(
+        UserId(3),
+        "carol".into(),
+        "carol unverified".into(),
+        static_mismatch(),
+    );
+    assert_eq!(
+        state.identity_review_open().map(|r| r.nickname.as_str()),
+        Some("bob"),
+        "bob's arrived first"
+    );
 
     // Carol's identity gets silently confirmed (e.g. a verified
     // `rsa_per_msg` resume - `session::handle_key_rotated`'s `Resumed` arm
@@ -984,7 +1335,10 @@ fn a_silently_resolved_review_is_removed_even_when_it_is_not_the_one_shown() {
     // specifically, not whichever review happens to be at the front.
     state.resolve_identity_accept(UserId(3));
 
-    assert!(!state.is_trust_gated(UserId(3)), "carol should be trusted again");
+    assert!(
+        !state.is_trust_gated(UserId(3)),
+        "carol should be trusted again"
+    );
     assert_eq!(
         state.identity_review_open().map(|r| r.nickname.as_str()),
         Some("bob"),
@@ -996,7 +1350,12 @@ fn a_silently_resolved_review_is_removed_even_when_it_is_not_the_one_shown() {
 #[test]
 fn sending_a_channel_message_excludes_a_pending_or_rejected_member() {
     let mut state = joined_general_with(vec![user(2, "bob"), user(3, "carol")]);
-    state.push_identity_review(UserId(2), "bob".into(), "mismatch".into(), static_mismatch());
+    state.push_identity_review(
+        UserId(2),
+        "bob".into(),
+        "mismatch".into(),
+        static_mismatch(),
+    );
     // Resolve the review (as if the user had already answered the popup)
     // before exercising the send path - while a review is genuinely
     // pending, the popup absorbs every keystroke (see
@@ -1010,8 +1369,14 @@ fn sending_a_channel_message_excludes_a_pending_or_rejected_member() {
 
     match action {
         Some(UiAction::SendChannelText { recipients, .. }) => {
-            assert!(!recipients.iter().any(|(id, ..)| *id == UserId(2)), "the pending member must be excluded");
-            assert!(recipients.iter().any(|(id, ..)| *id == UserId(3)), "everyone else still gets the message");
+            assert!(
+                !recipients.iter().any(|(id, ..)| *id == UserId(2)),
+                "the pending member must be excluded"
+            );
+            assert!(
+                recipients.iter().any(|(id, ..)| *id == UserId(3)),
+                "everyone else still gets the message"
+            );
         }
         other => panic!("expected SendChannelText, got {other:?}"),
     }
@@ -1033,7 +1398,10 @@ fn help_popup_widens_enough_to_show_its_longest_line_without_clipping_it() {
     press(&mut state, KeyCode::End);
     let rows = rendered_rows(&state);
     let tail = "rsa_per_msg: a fresh key every message, signed by the one it replaces";
-    assert!(rows.iter().any(|r| r.contains(tail)), "expected the longest help line in full, unclipped: {rows:?}");
+    assert!(
+        rows.iter().any(|r| r.contains(tail)),
+        "expected the longest help line in full, unclipped: {rows:?}"
+    );
 }
 
 /// @requirement TB-108
@@ -1049,7 +1417,11 @@ fn help_popup_never_exceeds_90_percent_of_the_terminal_width() {
     terminal.draw(|f| render(f, &state)).unwrap();
     let buffer = terminal.backend().buffer().clone();
     let rows: Vec<String> = (0..buffer.area.height)
-        .map(|y| (0..buffer.area.width).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
         .collect();
     // The popup's own top-left corner sits directly against its title (no
     // gap, e.g. "┌Help (Ctrl+H to close)---┐") - locate the corner-title
@@ -1064,11 +1436,21 @@ fn help_popup_never_exceeds_90_percent_of_the_terminal_width() {
         .expect("expected the popup's title row");
     let row_chars: Vec<char> = border_row.chars().collect();
     let title: Vec<char> = "Help (Ctrl+H to close, arrows to scroll)".chars().collect();
-    let title_start = row_chars.windows(title.len()).position(|w| w == title.as_slice()).expect("title in row");
-    assert_eq!(row_chars[title_start - 1], '┌', "expected the corner right before the title: {border_row:?}");
+    let title_start = row_chars
+        .windows(title.len())
+        .position(|w| w == title.as_slice())
+        .expect("title in row");
+    assert_eq!(
+        row_chars[title_start - 1],
+        '┌',
+        "expected the corner right before the title: {border_row:?}"
+    );
     let popup_start = title_start - 1;
-    let popup_end =
-        row_chars[popup_start..].iter().position(|&c| c == '┐').expect("closing corner") + popup_start;
+    let popup_end = row_chars[popup_start..]
+        .iter()
+        .position(|&c| c == '┐')
+        .expect("closing corner")
+        + popup_start;
     let popup_width = popup_end - popup_start + 1;
     let max_allowed = (width as u32 * 9 / 10) as usize;
     assert!(
@@ -1084,7 +1466,10 @@ fn render_shows_recording_indicator_while_recording() {
     state.focus = Focus::Messages;
     state.handle_key(KeyCode::Char(' '), KeyModifiers::NONE, KeyEventKind::Press);
     let rows = rendered_rows(&state);
-    assert!(rows.iter().any(|r| r.contains("recording")), "expected a recording indicator: {rows:?}");
+    assert!(
+        rows.iter().any(|r| r.contains("recording")),
+        "expected a recording indicator: {rows:?}"
+    );
 }
 
 /// @requirement AC-038
@@ -1100,11 +1485,19 @@ fn render_does_not_show_recording_or_playback_errors() {
     let mut state = joined_general_with(vec![user(2, "bob")]);
     state.recording_failed("no input device available".into());
     let rows = rendered_rows(&state);
-    assert!(!rows.iter().any(|r| r.contains("no input device available")), "{rows:?}");
+    assert!(
+        !rows.iter().any(|r| r.contains("no input device available")),
+        "{rows:?}"
+    );
 
     state.playback_failed("no output device available".into());
     let rows = rendered_rows(&state);
-    assert!(!rows.iter().any(|r| r.contains("no output device available")), "{rows:?}");
+    assert!(
+        !rows
+            .iter()
+            .any(|r| r.contains("no output device available")),
+        "{rows:?}"
+    );
 }
 
 /// @requirement TB-101

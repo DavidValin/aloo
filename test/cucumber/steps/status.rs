@@ -40,11 +40,18 @@ async fn header_shows_colored(w: &mut AlooWorld, text: String, color_name: Strin
     let expected = color_from_name(&color_name);
     let buffer = ui_buffer(w.ui_ref(), 100, 30);
     let (x, y) = find_text_start(&buffer, &text);
-    assert_eq!(buffer[(x, y)].fg, expected, "{text:?} should render {color_name}");
+    assert_eq!(
+        buffer[(x, y)].fg,
+        expected,
+        "{text:?} should render {color_name}"
+    );
 }
 
 #[then(expr = "the header shows {string} right before {string}")]
 async fn header_shows_before(w: &mut AlooWorld, before: String, after: String) {
     let rows = ui_rows(w.ui_ref());
-    assert!(appears_before(&rows, &before, &after), "expected {before:?} right before {after:?}: {rows:?}");
+    assert!(
+        appears_before(&rows, &before, &after),
+        "expected {before:?} right before {after:?}: {rows:?}"
+    );
 }

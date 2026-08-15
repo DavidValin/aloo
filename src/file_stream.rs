@@ -52,12 +52,29 @@ pub(crate) struct ActiveFileTransfer {
 /// polled by `session::run_connected_session`'s select loop and dispatched
 /// into `UiState`'s log-row updates.
 pub(crate) enum FileEvent {
-    SendProgress { stream_id: u64, bytes: u64 },
-    SendDone { stream_id: u64 },
-    SendFailed { stream_id: u64 },
-    ReceiveProgress { from: UserId, stream_id: u64, bytes: u64 },
-    ReceiveDone { from: UserId, stream_id: u64 },
-    ReceiveFailed { from: UserId, stream_id: u64 },
+    SendProgress {
+        stream_id: u64,
+        bytes: u64,
+    },
+    SendDone {
+        stream_id: u64,
+    },
+    SendFailed {
+        stream_id: u64,
+    },
+    ReceiveProgress {
+        from: UserId,
+        stream_id: u64,
+        bytes: u64,
+    },
+    ReceiveDone {
+        from: UserId,
+        stream_id: u64,
+    },
+    ReceiveFailed {
+        from: UserId,
+        stream_id: u64,
+    },
 }
 
 /// Runs on a dedicated thread for the lifetime of one accepted send: reads
@@ -99,16 +116,28 @@ pub(crate) fn spawn_send_file_worker(
                     return;
                 }
             };
-            let Some(blocks) = voice_stream::encrypt_direct_chunk(&key, stream_id, seq, &buf[..n]) else {
+            let Some(blocks) = voice_stream::encrypt_direct_chunk(&key, stream_id, seq, &buf[..n])
+            else {
                 let _ = events_tx.send(FileEvent::SendFailed { stream_id });
                 return;
             };
-            if out_tx.send(P2pOutbound::FileChunk { to, stream_id, seq, blocks }).is_err() {
+            if out_tx
+                .send(P2pOutbound::FileChunk {
+                    to,
+                    stream_id,
+                    seq,
+                    blocks,
+                })
+                .is_err()
+            {
                 return;
             }
             sent += n as u64;
             seq += 1;
-            let _ = events_tx.send(FileEvent::SendProgress { stream_id, bytes: sent });
+            let _ = events_tx.send(FileEvent::SendProgress {
+                stream_id,
+                bytes: sent,
+            });
         }
         let _ = out_tx.send(P2pOutbound::FileEnd { to, stream_id });
         let _ = events_tx.send(FileEvent::SendDone { stream_id });
@@ -135,7 +164,10 @@ pub(crate) fn spawn_receive_file_worker(
             && !parent.as_os_str().is_empty()
             && let Err(e) = std::fs::create_dir_all(parent)
         {
-            eprintln!("aloo: failed to create download directory {}: {e}", parent.display());
+            eprintln!(
+                "aloo: failed to create download directory {}: {e}",
+                parent.display()
+            );
             let _ = events_tx.send(FileEvent::ReceiveFailed { from, stream_id });
             return;
         }
@@ -164,7 +196,11 @@ pub(crate) fn spawn_receive_file_worker(
                             continue;
                         }
                         written += data.len() as u64;
-                        let _ = events_tx.send(FileEvent::ReceiveProgress { from, stream_id, bytes: written });
+                        let _ = events_tx.send(FileEvent::ReceiveProgress {
+                            from,
+                            stream_id,
+                            bytes: written,
+                        });
                     }
                 }
                 DecryptJob::End => {

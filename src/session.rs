@@ -13,11 +13,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, KeyCode, KeyModifiers};
-use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
 use tokio::io::AsyncWrite;
 use tokio::net::TcpStream;
 
+use crate::BoxError;
 use crate::connect::ResolvedIdentity;
 use crate::crypto;
 use crate::file_stream;
@@ -26,13 +27,14 @@ use crate::netstats;
 use crate::own_next_keys;
 use crate::p2p::{self, P2pEvent, P2pOutbound, PeerLinkManager};
 use crate::p2p_proto::P2pPayload;
-use crate::proto::{self, ClientMessage, Content, Envelope, KeyMode, ServerMessage, UserId, UserInfo};
+use crate::proto::{
+    self, ClientMessage, Content, Envelope, KeyMode, ServerMessage, UserId, UserInfo,
+};
 use crate::rekey;
 use crate::sysstats;
 use crate::ui::ui::{self, IdentityCase, PendingFileOffer, UiAction, UiState, VoiceTarget};
 use crate::voice;
 use crate::voice_stream;
-use crate::BoxError;
 
 /// How long an incoming stream can go without a chunk/end before it's
 /// treated as abandoned - see `voice_stream::STREAM_IDLE_TIMEOUT`.
@@ -202,8 +204,16 @@ fn spawn_rotation_worker(
             let old_private = own_keys.lock().unwrap().current_private_for(peer);
             match rekey::generate_and_sign_rotation(&old_private, peer) {
                 Ok((new_public_key_der, signature, new_private)) => {
-                    own_keys.lock().unwrap().install_rotated_key(peer, new_private, new_public_key_der.clone());
-                    let _ = out_tx.send(ClientMessage::RotateKey { to: peer, new_public_key_der, signature });
+                    own_keys.lock().unwrap().install_rotated_key(
+                        peer,
+                        new_private,
+                        new_public_key_der.clone(),
+                    );
+                    let _ = out_tx.send(ClientMessage::RotateKey {
+                        to: peer,
+                        new_public_key_der,
+                        signature,
+                    });
                 }
                 Err(e) => eprintln!("aloo: rsa_per_msg key rotation for {peer:?} failed: {e}"),
             }
@@ -232,14 +242,16 @@ pub(crate) async fn run_connected_session(
     server_addr: SocketAddr,
 ) -> Result<(), BoxError> {
     let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
-    std::thread::spawn(move || loop {
-        match crossterm::event::read() {
-            Ok(ev) => {
-                if input_tx.send(ev).is_err() {
-                    break;
+    std::thread::spawn(move || {
+        loop {
+            match crossterm::event::read() {
+                Ok(ev) => {
+                    if input_tx.send(ev).is_err() {
+                        break;
+                    }
                 }
+                Err(_) => break,
             }
-            Err(_) => break,
         }
     });
 
@@ -283,7 +295,8 @@ pub(crate) async fn run_connected_session(
         tokio::sync::mpsc::unbounded_channel::<(u64, u32, Vec<u8>)>();
     let (stream_finished_tx, mut stream_finished_rx) =
         tokio::sync::mpsc::unbounded_channel::<(UserId, u64, u32, Vec<u8>)>();
-    let (file_events_tx, mut file_events_rx) = tokio::sync::mpsc::unbounded_channel::<file_stream::FileEvent>();
+    let (file_events_tx, mut file_events_rx) =
+        tokio::sync::mpsc::unbounded_channel::<file_stream::FileEvent>();
     let (auto_stop_tx, mut auto_stop_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
     // The session's one direct client<->client UDP transport (`crate::p2p`).
@@ -299,7 +312,8 @@ pub(crate) async fn run_connected_session(
     let (peer_link, p2p_socket) = PeerLinkManager::bind(bind_addr, server_addr, p2p_events_tx)
         .await
         .map_err(|e| format!("failed to open the direct-link UDP socket: {e}"))?;
-    let (p2p_raw_tx, mut p2p_raw_rx) = tokio::sync::mpsc::unbounded_channel::<(SocketAddr, crate::p2p_proto::PunchDatagram)>();
+    let (p2p_raw_tx, mut p2p_raw_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(SocketAddr, crate::p2p_proto::PunchDatagram)>();
     p2p::spawn_receive_loop(p2p_socket, p2p_raw_tx);
 
     // `PqHybrid` has no single RSA key to seed `rekey::OwnKeys` with and
@@ -307,13 +321,19 @@ pub(crate) async fn run_connected_session(
     // but with its own separate key material) - see `SessionState::own_keys`/
     // `own_pq_private`.
     let (own_keys, own_pq_private) = match my_identity {
-        ResolvedIdentity::Rsa(kp) => (Some(Arc::new(Mutex::new(rekey::OwnKeys::new(kp.private)))), None),
+        ResolvedIdentity::Rsa(kp) => (
+            Some(Arc::new(Mutex::new(rekey::OwnKeys::new(kp.private)))),
+            None,
+        ),
         ResolvedIdentity::Pq { private, .. } => (None, Some(private)),
     };
-    let (rotate_out_tx, mut rotate_out_rx) = tokio::sync::mpsc::unbounded_channel::<ClientMessage>();
+    let (rotate_out_tx, mut rotate_out_rx) =
+        tokio::sync::mpsc::unbounded_channel::<ClientMessage>();
     let rotation_pending = Arc::new(AtomicUsize::new(0));
     let rotate_request_tx = match &own_keys {
-        Some(own_keys) => spawn_rotation_worker(own_keys.clone(), rotate_out_tx, rotation_pending.clone()),
+        Some(own_keys) => {
+            spawn_rotation_worker(own_keys.clone(), rotate_out_tx, rotation_pending.clone())
+        }
         // No worker needed: `request_rotation_if_per_message` only ever
         // sends on this channel when `own_key_mode == PerMessage`, which
         // always has `own_keys: Some(_)` above - so for `PqHybrid` (the
@@ -543,20 +563,59 @@ async fn handle_ui_action(
     session: &mut SessionState,
 ) -> proto::Result<()> {
     match action {
-        UiAction::JoinChannel { name, kind } => {
-            crate::channel::handle_join(wr, session, name, kind).await?;
+        UiAction::JoinChannel {
+            name,
+            kind,
+            password,
+        } => {
+            crate::channel::handle_join(wr, session, name, kind, password).await?;
         }
-        UiAction::SendChannelText { channel, plaintext, recipients } => {
+        UiAction::LeaveChannel { name } => {
+            crate::channel::handle_leave(wr, ui_state, session, name).await?;
+        }
+        UiAction::SendChannelText {
+            channel,
+            plaintext,
+            recipients,
+        } => {
             crate::channel::handle_send_text(wr, session, channel, plaintext, recipients).await?;
         }
-        UiAction::SendDirectText { to, plaintext, recipient_key_mode, recipient_pubkey_der } => {
-            crate::direct_message::handle_send_text(wr, session, to, plaintext, recipient_key_mode, recipient_pubkey_der)
-                .await?;
+        UiAction::SendDirectText {
+            to,
+            plaintext,
+            recipient_key_mode,
+            recipient_pubkey_der,
+        } => {
+            crate::direct_message::handle_send_text(
+                wr,
+                session,
+                to,
+                plaintext,
+                recipient_key_mode,
+                recipient_pubkey_der,
+            )
+            .await?;
         }
-        UiAction::SendFileChannel { channel, path, filename, size, recipients } => {
-            crate::channel::handle_send_file(wr, ui_state, session, channel, path, filename, size, recipients).await?;
+        UiAction::SendFileChannel {
+            channel,
+            path,
+            filename,
+            size,
+            recipients,
+        } => {
+            crate::channel::handle_send_file(
+                wr, ui_state, session, channel, path, filename, size, recipients,
+            )
+            .await?;
         }
-        UiAction::SendFileDirect { to, path, filename, size, recipient_key_mode, recipient_pubkey_der } => {
+        UiAction::SendFileDirect {
+            to,
+            path,
+            filename,
+            size,
+            recipient_key_mode,
+            recipient_pubkey_der,
+        } => {
             crate::direct_message::handle_send_file(
                 wr,
                 ui_state,
@@ -580,13 +639,20 @@ async fn handle_ui_action(
                     let stream_id = session.next_stream_id;
                     session.next_stream_id += 1;
                     match target {
-                        VoiceTarget::Channel { channel, recipients } => {
+                        VoiceTarget::Channel {
+                            channel,
+                            recipients,
+                        } => {
                             crate::channel::handle_voice_record_start(
                                 wr, ui_state, session, recorder, stream_id, channel, recipients,
                             )
                             .await?;
                         }
-                        VoiceTarget::Direct { to, recipient_key_mode, recipient_pubkey_der } => {
+                        VoiceTarget::Direct {
+                            to,
+                            recipient_key_mode,
+                            recipient_pubkey_der,
+                        } => {
                             crate::direct_message::handle_voice_record_start(
                                 wr,
                                 ui_state,
@@ -638,8 +704,12 @@ async fn handle_ui_action(
                     // this exact key, set unconditionally by `on_user_joined`
                     // when the peer joined (docs/PROTOCOL.md §12.4); nothing
                     // else was withheld from it, only the local pin.
-                    IdentityCase::StaticMismatch { new_public_key_der, .. } => {
-                        session.id_store.check_and_pin(&review.nickname, &new_public_key_der);
+                    IdentityCase::StaticMismatch {
+                        new_public_key_der, ..
+                    } => {
+                        session
+                            .id_store
+                            .check_and_pin(&review.nickname, &new_public_key_der);
                         if let Err(e) = session.id_store.save() {
                             eprintln!("aloo: failed to save id_store: {e}");
                         }
@@ -654,8 +724,15 @@ async fn handle_ui_action(
                     // rotation gets, just for whichever key was most
                     // recently offered.
                     IdentityCase::ResumeFailed { new_public_key_der } => {
-                        install_trusted_rotation(ui_state, wr, session, peer, &review.nickname, new_public_key_der)
-                            .await?;
+                        install_trusted_rotation(
+                            ui_state,
+                            wr,
+                            session,
+                            peer,
+                            &review.nickname,
+                            new_public_key_der,
+                        )
+                        .await?;
                     }
                 }
             }
@@ -675,7 +752,9 @@ async fn handle_ui_action(
         UiAction::RejectFileOffer { from, stream_id } => {
             ui_state.take_file_offer(from, stream_id);
             session.peer_link.ensure_link(wr, from).await;
-            session.peer_link.send_reliable_or_queue(from, P2pPayload::FileReject { stream_id });
+            session
+                .peer_link
+                .send_reliable_or_queue(from, P2pPayload::FileReject { stream_id });
         }
     }
     Ok(())
@@ -692,30 +771,66 @@ async fn accept_file_offer(
     from: UserId,
     stream_id: u64,
 ) -> proto::Result<()> {
-    let Some(offer) = ui_state.take_file_offer(from, stream_id) else { return Ok(()) };
-    let sender_public_key_der = ui_state.known_users.get(&from).map(|u| u.public_key_der.clone()).unwrap_or_default();
+    let Some(offer) = ui_state.take_file_offer(from, stream_id) else {
+        return Ok(());
+    };
+    let sender_public_key_der = ui_state
+        .known_users
+        .get(&from)
+        .map(|u| u.public_key_der.clone())
+        .unwrap_or_default();
     let key = voice_stream::resolve_incoming_key(session, from, &sender_public_key_der);
-    let dest_name = crate::file_transfer::safe_filename(&crate::file_transfer::truncate_filename(&offer.filename));
+    let dest_name = crate::file_transfer::safe_filename(&crate::file_transfer::truncate_filename(
+        &offer.filename,
+    ));
     let dest_path = crate::file_transfer::default_download_dir().join(dest_name);
-    let job_tx =
-        file_stream::spawn_receive_file_worker(key, dest_path, from, stream_id, session.file_events_tx.clone());
-    session
-        .active_file_transfers
-        .insert((from, stream_id), file_stream::ActiveFileTransfer { job_tx, last_seen: Instant::now() });
+    let job_tx = file_stream::spawn_receive_file_worker(
+        key,
+        dest_path,
+        from,
+        stream_id,
+        session.file_events_tx.clone(),
+    );
+    session.active_file_transfers.insert(
+        (from, stream_id),
+        file_stream::ActiveFileTransfer {
+            job_tx,
+            last_seen: Instant::now(),
+        },
+    );
     match &offer.channel {
         Some(channel) => {
-            ui_state.on_channel_file_offer_accepted(channel, from, offer.from_name.clone(), stream_id, offer.filename.clone(), offer.size);
+            ui_state.on_channel_file_offer_accepted(
+                channel,
+                from,
+                offer.from_name.clone(),
+                stream_id,
+                offer.filename.clone(),
+                offer.size,
+            );
         }
         None => {
-            ui_state.on_direct_file_offer_accepted(from, offer.from_name.clone(), stream_id, offer.filename.clone(), offer.size);
+            ui_state.on_direct_file_offer_accepted(
+                from,
+                offer.from_name.clone(),
+                stream_id,
+                offer.filename.clone(),
+                offer.size,
+            );
         }
     }
     session.peer_link.ensure_link(wr, from).await;
-    session.peer_link.send_reliable_or_queue(from, P2pPayload::FileAccept { stream_id });
+    session
+        .peer_link
+        .send_reliable_or_queue(from, P2pPayload::FileAccept { stream_id });
     Ok(())
 }
 
-pub(crate) fn encrypt_for_one(pubkey_der: &[u8], plaintext: &[u8], content: Content) -> Option<Envelope> {
+pub(crate) fn encrypt_for_one(
+    pubkey_der: &[u8],
+    plaintext: &[u8],
+    content: Content,
+) -> Option<Envelope> {
     let pk = crypto::public_key_from_der(pubkey_der).ok()?;
     let blocks = crypto::encrypt_chunked(&pk, plaintext).ok()?;
     Some(Envelope { content, blocks })
@@ -735,9 +850,13 @@ pub(crate) fn encrypt_hybrid_envelope_for(
     content: Content,
 ) -> Option<Envelope> {
     let recipient_public: crypto::pq::PqPublicBundle = proto::decode(recipient_pubkey_der).ok()?;
-    let hybrid = crypto::pq::encrypt_hybrid_for_one(sender_signing, &recipient_public, plaintext).ok()?;
+    let hybrid =
+        crypto::pq::encrypt_hybrid_for_one(sender_signing, &recipient_public, plaintext).ok()?;
     let block = proto::encode(&hybrid).ok()?;
-    Some(Envelope { content, blocks: vec![block] })
+    Some(Envelope {
+        content,
+        blocks: vec![block],
+    })
 }
 
 /// Applies one incoming server message to `ui_state` and, for live voice
@@ -764,7 +883,9 @@ async fn handle_server_message(
     // point every variant already passes through.
     session.conn_stats.record_event(Instant::now());
     match msg {
-        ServerMessage::Hello { .. } | ServerMessage::AuthResult { .. } | ServerMessage::IdentifyResult { .. } => {
+        ServerMessage::Hello { .. }
+        | ServerMessage::AuthResult { .. }
+        | ServerMessage::IdentifyResult { .. } => {
             // only expected during the handshake in connect::connect_and_handshake
         }
         ServerMessage::ChannelList(list) => {
@@ -773,7 +894,16 @@ async fn handle_server_message(
             }
         }
         ServerMessage::Joined { channel } => crate::channel::on_joined(ui_state, channel),
-        ServerMessage::ChannelJoinFailed { name, reason } => crate::channel::on_join_failed(name, reason),
+        // Reuses the plain, dedup-safe appender directly - unlike
+        // `crate::channel::on_list` (only for the connect-time snapshot
+        // above), this must never auto-join anything.
+        ServerMessage::ChannelCreated { channel } => ui_state.on_channel_list(vec![channel]),
+        ServerMessage::ChannelJoinFailed { name, reason } => {
+            crate::channel::on_join_failed(name, reason)
+        }
+        ServerMessage::ChannelJoinRejected { name, kind } => {
+            crate::channel::on_join_rejected(ui_state, name, kind)
+        }
         ServerMessage::UserJoined { channel, user } => {
             // rsa_per_msg peers need freshness/queue tracking from the
             // moment we learn about them (§11.5), whether that's this
@@ -820,7 +950,15 @@ async fn handle_server_message(
             }
             ui_state.on_user_joined(&channel, user);
         }
-        ServerMessage::UserLeft { channel, user_id } => ui_state.on_user_left(&channel, user_id),
+        ServerMessage::UserLeft { channel, user_id } => {
+            ui_state.on_user_left(&channel, user_id);
+            // Unlike `UserOffline` below, a `UserLeft` peer may still share
+            // another channel with us or have an open DM - only forget the
+            // link once neither is true anymore (docs/PROTOCOL.md §7.0.3).
+            if !ui_state.has_reason_to_keep_link(user_id) {
+                session.peer_link.forget(user_id);
+            }
+        }
         ServerMessage::UserOffline { user_id } => {
             ui_state.on_user_offline(user_id);
             // A full disconnect is always the end of any relationship with
@@ -829,11 +967,39 @@ async fn handle_server_message(
             // forget the link unconditionally.
             session.peer_link.forget(user_id);
         }
-        ServerMessage::KeyRotated { from, new_public_key_der, signature } => {
-            handle_key_rotated(ui_state, you, wr, session, from, new_public_key_der, signature).await?;
+        ServerMessage::KeyRotated {
+            from,
+            new_public_key_der,
+            signature,
+        } => {
+            handle_key_rotated(
+                ui_state,
+                you,
+                wr,
+                session,
+                from,
+                new_public_key_der,
+                signature,
+            )
+            .await?;
         }
-        ServerMessage::PeerCandidates { from, candidates, link_nonce } => {
-            session.peer_link.on_peer_candidates(wr, from, candidates, link_nonce).await;
+        ServerMessage::PeerCandidates {
+            from,
+            candidates,
+            link_nonce,
+        } => {
+            // Trust boundary (docs/PROTOCOL.md §7.0.2): the server's relay
+            // performs no relationship checking of its own - any registered
+            // client can name any other UserId as `peer`. Only respond to a
+            // request from someone we currently share a joined channel
+            // with; a stranger's request is dropped before any PeerLink
+            // state is touched at all.
+            if ui_state.shares_a_joined_channel(from) {
+                session
+                    .peer_link
+                    .on_peer_candidates(wr, from, candidates, link_nonce)
+                    .await;
+            }
         }
         ServerMessage::Error { message } => eprintln!("aloo: server error: {message}"),
     }
@@ -848,33 +1014,67 @@ async fn handle_server_message(
 /// have a link to is necessarily one whose `UserInfo` (learned via
 /// `UserJoined`) we already hold.
 fn handle_p2p_event(event: P2pEvent, ui_state: &mut UiState, session: &mut SessionState) {
-    let name_of = |ui_state: &UiState, id: UserId| ui_state.known_users.get(&id).map(|u| u.name.clone()).unwrap_or_default();
+    let name_of = |ui_state: &UiState, id: UserId| {
+        ui_state
+            .known_users
+            .get(&id)
+            .map(|u| u.name.clone())
+            .unwrap_or_default()
+    };
     match event {
-        P2pEvent::Message { channel: Some(channel), from, envelope } => {
+        P2pEvent::Message {
+            channel: Some(channel),
+            from,
+            envelope,
+        } => {
             let from_name = name_of(ui_state, from);
             crate::channel::on_message(ui_state, session, channel, from, from_name, envelope);
         }
-        P2pEvent::Message { channel: None, from, envelope } => {
+        P2pEvent::Message {
+            channel: None,
+            from,
+            envelope,
+        } => {
             let from_name = name_of(ui_state, from);
             crate::direct_message::on_message(ui_state, session, from, from_name, envelope);
         }
-        P2pEvent::StreamStart { channel: Some(channel), from, stream_id } => {
+        P2pEvent::StreamStart {
+            channel: Some(channel),
+            from,
+            stream_id,
+        } => {
             let from_name = name_of(ui_state, from);
             crate::channel::on_stream_start(ui_state, session, channel, from, from_name, stream_id);
         }
-        P2pEvent::StreamStart { channel: None, from, stream_id } => {
+        P2pEvent::StreamStart {
+            channel: None,
+            from,
+            stream_id,
+        } => {
             let from_name = name_of(ui_state, from);
             crate::direct_message::on_stream_start(ui_state, session, from, from_name, stream_id);
         }
-        P2pEvent::StreamChunk { from, stream_id, seq, blocks } => {
+        P2pEvent::StreamChunk {
+            from,
+            stream_id,
+            seq,
+            blocks,
+        } => {
             voice_stream::forward_chunk(session, from, stream_id, seq, blocks);
         }
         P2pEvent::StreamEnd { from, stream_id } => {
             voice_stream::end_incoming_stream(session, from, stream_id);
         }
-        P2pEvent::FileOffer { channel, from, stream_id, envelope } => {
+        P2pEvent::FileOffer {
+            channel,
+            from,
+            stream_id,
+            envelope,
+        } => {
             let from_name = name_of(ui_state, from);
-            handle_incoming_file_offer(ui_state, session, from, from_name, stream_id, channel, envelope);
+            handle_incoming_file_offer(
+                ui_state, session, from, from_name, stream_id, channel, envelope,
+            );
         }
         P2pEvent::FileAccepted { stream_id } => {
             if let Some(target) = session.own_file_targets.remove(&stream_id) {
@@ -895,15 +1095,30 @@ fn handle_p2p_event(event: P2pEvent, ui_state: &mut UiState, session: &mut Sessi
             let me = ui_state.own_id.unwrap_or(UserId(0));
             ui_state.set_file_rejected(me, stream_id);
         }
-        P2pEvent::FileChunk { from, stream_id, seq, blocks } => {
-            file_stream::forward_chunk(&mut session.active_file_transfers, from, stream_id, seq, blocks);
+        P2pEvent::FileChunk {
+            from,
+            stream_id,
+            seq,
+            blocks,
+        } => {
+            file_stream::forward_chunk(
+                &mut session.active_file_transfers,
+                from,
+                stream_id,
+                seq,
+                blocks,
+            );
         }
         P2pEvent::FileEnd { from, stream_id } => {
             file_stream::end_incoming_transfer(&mut session.active_file_transfers, from, stream_id);
         }
         P2pEvent::LinkFailed { peer, reason } => {
             let name = name_of(ui_state, peer);
-            let peer_name = if name.is_empty() { format!("{peer:?}") } else { name };
+            let peer_name = if name.is_empty() {
+                format!("{peer:?}")
+            } else {
+                name
+            };
             ui_state.p2p_link_failed(&peer_name, &reason);
         }
     }
@@ -964,7 +1179,10 @@ fn handle_p2p_event(event: P2pEvent, ui_state: &mut UiState, session: &mut Sessi
 /// `None` (no continuity mechanism at all, by design). A pure predicate so
 /// it's directly unit-testable (`test/hybrid_crypto_test.rs`).
 pub fn uses_byte_comparison_pinning(key_mode: KeyMode) -> bool {
-    matches!(key_mode, KeyMode::Rsa | KeyMode::Password | KeyMode::PqHybrid)
+    matches!(
+        key_mode,
+        KeyMode::Rsa | KeyMode::Password | KeyMode::PqHybrid
+    )
 }
 
 fn check_identity(session: &mut SessionState, ui_state: &mut UiState, user: &UserInfo) {
@@ -974,42 +1192,56 @@ fn check_identity(session: &mut SessionState, ui_state: &mut UiState, user: &Use
     // the matching decoder rather than always assuming RSA, or a `PqHybrid`
     // peer would always fail this check and never get pinned at all.
     let parses = match user.key_mode {
-        KeyMode::PqHybrid => proto::decode::<crypto::pq::PqPublicBundle>(&user.public_key_der).is_ok(),
+        KeyMode::PqHybrid => {
+            proto::decode::<crypto::pq::PqPublicBundle>(&user.public_key_der).is_ok()
+        }
         _ => crypto::public_key_from_der(&user.public_key_der).is_ok(),
     };
     if !parses {
         return;
     }
     match user.key_mode {
-        key_mode if uses_byte_comparison_pinning(key_mode) => match session.id_store.get(&user.name) {
-            None => {
-                // First-ever sighting: nothing to compare against, so this is
-                // never suspicious - pin it immediately, same as before.
-                session.id_store.check_and_pin(&user.name, &user.public_key_der);
-                if let Err(e) = session.id_store.save() {
-                    eprintln!("aloo: failed to save id_store: {e}");
+        key_mode if uses_byte_comparison_pinning(key_mode) => {
+            match session.id_store.get(&user.name) {
+                None => {
+                    // First-ever sighting: nothing to compare against, so this is
+                    // never suspicious - pin it immediately, same as before.
+                    session
+                        .id_store
+                        .check_and_pin(&user.name, &user.public_key_der);
+                    if let Err(e) = session.id_store.save() {
+                        eprintln!("aloo: failed to save id_store: {e}");
+                    }
+                }
+                Some(previous) if previous == user.public_key_der.as_slice() => {}
+                Some(previous) => {
+                    let previous_public_key_der = previous.to_vec();
+                    let message = format!(
+                        "'{}' connected with a different key than last time (was {}, now {}) - possible impersonation. Accept their new key, or reject it.",
+                        user.name,
+                        short_fingerprint(&crypto::fingerprint_der(&previous_public_key_der)),
+                        short_fingerprint(&crypto::fingerprint_der(&user.public_key_der)),
+                    );
+                    ui_state.push_identity_review(
+                        user.id,
+                        user.name.clone(),
+                        message,
+                        IdentityCase::StaticMismatch {
+                            new_public_key_der: user.public_key_der.clone(),
+                            previous_public_key_der,
+                        },
+                    );
                 }
             }
-            Some(previous) if previous == user.public_key_der.as_slice() => {}
-            Some(previous) => {
-                let previous_public_key_der = previous.to_vec();
-                let message = format!(
-                    "'{}' connected with a different key than last time (was {}, now {}) - possible impersonation. Accept their new key, or reject it.",
-                    user.name,
-                    short_fingerprint(&crypto::fingerprint_der(&previous_public_key_der)),
-                    short_fingerprint(&crypto::fingerprint_der(&user.public_key_der)),
-                );
-                ui_state.push_identity_review(
-                    user.id,
-                    user.name.clone(),
-                    message,
-                    IdentityCase::StaticMismatch { new_public_key_der: user.public_key_der.clone(), previous_public_key_der },
-                );
-            }
-        },
+        }
         KeyMode::PerMessage => {
             if session.id_store.get(&user.name).is_some() {
-                push_unverified_resume_review(ui_state, user.id, &user.name, user.public_key_der.clone());
+                push_unverified_resume_review(
+                    ui_state,
+                    user.id,
+                    &user.name,
+                    user.public_key_der.clone(),
+                );
             }
         }
         // KeyMode::None, plus an unreachable fallback for the guard arm
@@ -1028,11 +1260,21 @@ fn check_identity(session: &mut SessionState, ui_state: &mut UiState, user: &Use
 /// already gated for this same reason - self-consistency alone still isn't
 /// proof, so the review stays open, just pointed at whichever key was most
 /// recently offered).
-fn push_unverified_resume_review(ui_state: &mut UiState, peer: UserId, nickname: &str, new_public_key_der: Vec<u8>) {
+fn push_unverified_resume_review(
+    ui_state: &mut UiState,
+    peer: UserId,
+    nickname: &str,
+    new_public_key_der: Vec<u8>,
+) {
     let message = format!(
         "'{nickname}' is using rsa_per_msg under a nickname previously linked to a different session's key, and hasn't proven continuity with it - possible impersonation. Accept their new key, or reject it."
     );
-    ui_state.push_identity_review(peer, nickname.to_string(), message, IdentityCase::ResumeFailed { new_public_key_der });
+    ui_state.push_identity_review(
+        peer,
+        nickname.to_string(),
+        message,
+        IdentityCase::ResumeFailed { new_public_key_der },
+    );
 }
 
 /// Shortens a full SHA-256 hex fingerprint (`crypto::fingerprint`) to its
@@ -1061,7 +1303,12 @@ async fn send_resume_rotation_if_available(
     peer: UserId,
     nickname: &str,
 ) -> proto::Result<()> {
-    let Some(private) = session.own_next_keys.as_ref().and_then(|s| s.get(nickname)).cloned() else {
+    let Some(private) = session
+        .own_next_keys
+        .as_ref()
+        .and_then(|s| s.get(nickname))
+        .cloned()
+    else {
         return Ok(());
     };
     let public_der = match crypto::public_key_to_der(&private.to_public_key()) {
@@ -1076,10 +1323,22 @@ async fn send_resume_rotation_if_available(
     // Only reachable when `own_key_mode == PerMessage` (the caller already
     // gates on that), which always has `own_keys: Some(_)` - see
     // `SessionState::own_keys`.
-    let Some(own_keys) = session.own_keys.as_ref() else { return Ok(()) };
-    own_keys.lock().unwrap().install_rotated_key(peer, private, public_der.clone());
-    proto::write_message(wr, &ClientMessage::RotateKey { to: peer, new_public_key_der: public_der, signature })
-        .await?;
+    let Some(own_keys) = session.own_keys.as_ref() else {
+        return Ok(());
+    };
+    own_keys
+        .lock()
+        .unwrap()
+        .install_rotated_key(peer, private, public_der.clone());
+    proto::write_message(
+        wr,
+        &ClientMessage::RotateKey {
+            to: peer,
+            new_public_key_der: public_der,
+            signature,
+        },
+    )
+    .await?;
     session.conn_stats.record_event(Instant::now());
     persist_own_continuity_key(session, nickname, peer);
     Ok(())
@@ -1096,11 +1355,15 @@ async fn send_resume_rotation_if_available(
 /// on the following reconnect simply won't verify (falls back to an
 /// ordinary first-sighting-shaped case), never a false alarm.
 fn persist_own_continuity_key(session: &mut SessionState, nickname: &str, peer: UserId) {
-    let Some(own_next_keys) = session.own_next_keys.as_mut() else { return };
+    let Some(own_next_keys) = session.own_next_keys.as_mut() else {
+        return;
+    };
     // Only reachable when `own_key_mode == PerMessage` (every caller of this
     // fn is itself only reached in that case), which always has `own_keys:
     // Some(_)` - see `SessionState::own_keys`.
-    let Some(own_keys) = session.own_keys.as_ref() else { return };
+    let Some(own_keys) = session.own_keys.as_ref() else {
+        return;
+    };
     let private = own_keys.lock().unwrap().current_private_for(peer);
     own_next_keys.set(nickname, private);
     if let Err(e) = own_next_keys.save() {
@@ -1197,16 +1460,25 @@ async fn handle_key_rotated(
         .get(&peer)
         .and_then(|u| crypto::public_key_from_der(&u.public_key_der).ok());
     let continuity_pinned = session.id_store.get(&nickname).map(|d| d.to_vec());
-    let continuity_trusted = continuity_pinned.as_deref().and_then(|d| crypto::public_key_from_der(d).ok());
+    let continuity_trusted = continuity_pinned
+        .as_deref()
+        .and_then(|d| crypto::public_key_from_der(d).ok());
     let was_gated = ui_state.is_trust_gated(peer);
 
-    match rekey::verify_with_fallback(live_trusted.as_ref(), continuity_trusted.as_ref(), you, &new_public_key_der, &signature) {
+    match rekey::verify_with_fallback(
+        live_trusted.as_ref(),
+        continuity_trusted.as_ref(),
+        you,
+        &new_public_key_der,
+        &signature,
+    ) {
         rekey::ResumeVerification::Resumed(_) => {
             // An actual proof of continuity - install it, and if
             // `check_identity` had this nickname gated, that proof is
             // exactly what clears it: resolve the review the same way an
             // `Accept` would (held messages included), just silently.
-            install_trusted_rotation(ui_state, wr, session, peer, &nickname, new_public_key_der).await?;
+            install_trusted_rotation(ui_state, wr, session, peer, &nickname, new_public_key_der)
+                .await?;
             if was_gated && ui_state.resolve_identity_accept(peer) {
                 voice_stream::play_bell_chime(session);
             }
@@ -1216,7 +1488,8 @@ async fn handle_key_rotated(
             // Nothing was pinned for this nickname (or it was already
             // fully trusted this session) - an ordinary rotation, exactly
             // as trustworthy as it's ever been.
-            install_trusted_rotation(ui_state, wr, session, peer, &nickname, new_public_key_der).await
+            install_trusted_rotation(ui_state, wr, session, peer, &nickname, new_public_key_der)
+                .await
         }
         rekey::ResumeVerification::Live(_) => {
             // Gated already, and self-consistency alone doesn't clear
@@ -1231,7 +1504,12 @@ async fn handle_key_rotated(
                 let message = format!(
                     "'{nickname}' reconnected but couldn't prove continuity with a previous session (invalid resume signature) - possible impersonation. Accept their new key, or reject it."
                 );
-                ui_state.push_identity_review(peer, nickname, message, IdentityCase::ResumeFailed { new_public_key_der });
+                ui_state.push_identity_review(
+                    peer,
+                    nickname,
+                    message,
+                    IdentityCase::ResumeFailed { new_public_key_der },
+                );
             }
             Ok(())
         }
@@ -1255,7 +1533,9 @@ async fn install_trusted_rotation(
     new_public_key_der: Vec<u8>,
 ) -> proto::Result<()> {
     ui_state.on_user_key_rotated(peer, new_public_key_der.clone());
-    session.id_store.check_and_pin(nickname, &new_public_key_der);
+    session
+        .id_store
+        .check_and_pin(nickname, &new_public_key_der);
     if let Err(e) = session.id_store.save() {
         eprintln!("aloo: failed to save id_store: {e}");
     }
@@ -1263,14 +1543,24 @@ async fn install_trusted_rotation(
     let batch = session.remote_keys.on_rotated(peer);
     let mut sent_any = false;
     for item in batch {
-        let Some(der) = ui_state.known_users.get(&peer).map(|u| u.public_key_der.clone()) else { continue };
+        let Some(der) = ui_state
+            .known_users
+            .get(&peer)
+            .map(|u| u.public_key_der.clone())
+        else {
+            continue;
+        };
         let (channel, plaintext) = match item {
             rekey::QueuedOutbound::Direct { plaintext } => (None, plaintext),
             rekey::QueuedOutbound::Channel { channel, plaintext } => (Some(channel), plaintext),
         };
-        let Some(envelope) = encrypt_for_one(&der, plaintext.as_bytes(), Content::Text) else { continue };
+        let Some(envelope) = encrypt_for_one(&der, plaintext.as_bytes(), Content::Text) else {
+            continue;
+        };
         session.peer_link.ensure_link(wr, peer).await;
-        session.peer_link.send_reliable_or_queue(peer, P2pPayload::Envelope { channel, envelope });
+        session
+            .peer_link
+            .send_reliable_or_queue(peer, P2pPayload::Envelope { channel, envelope });
         sent_any = true;
         request_rotation_if_per_message(session, peer);
     }
@@ -1289,12 +1579,19 @@ async fn install_trusted_rotation(
 /// `docs/PROTOCOL.md` §13's "who can send to a `PqHybrid` peer" note) -
 /// `sender.key_mode` only matters here to know what shape their signing
 /// public key is in.
-pub(crate) fn decrypt_envelope_for(envelope: Envelope, from: UserId, sender: &UserInfo, session: &SessionState) -> Option<ui::MessageBody> {
+pub(crate) fn decrypt_envelope_for(
+    envelope: Envelope,
+    from: UserId,
+    sender: &UserInfo,
+    session: &SessionState,
+) -> Option<ui::MessageBody> {
     if envelope.content != Content::Text {
         return None;
     }
     let plaintext = decrypt_own_envelope(&envelope, from, sender, session)?;
-    Some(ui::MessageBody::Text(String::from_utf8_lossy(&plaintext).into_owned()))
+    Some(ui::MessageBody::Text(
+        String::from_utf8_lossy(&plaintext).into_owned(),
+    ))
 }
 
 /// Decrypts a `FileOffer` envelope addressed to us into its
@@ -1302,7 +1599,12 @@ pub(crate) fn decrypt_envelope_for(envelope: Envelope, from: UserId, sender: &Us
 /// same RSA/PQ dispatch, different output shape (there's no `MessageBody`
 /// for an unresolved offer, only for the row an `Accept` eventually
 /// creates - see `handle_incoming_file_offer`).
-fn decrypt_file_offer(envelope: &Envelope, from: UserId, sender: &UserInfo, session: &SessionState) -> Option<crate::file_transfer::FileOfferPayload> {
+fn decrypt_file_offer(
+    envelope: &Envelope,
+    from: UserId,
+    sender: &UserInfo,
+    session: &SessionState,
+) -> Option<crate::file_transfer::FileOfferPayload> {
     if envelope.content != Content::FileOffer {
         return None;
     }
@@ -1313,14 +1615,25 @@ fn decrypt_file_offer(envelope: &Envelope, from: UserId, sender: &UserInfo, sess
 /// The RSA/PQ dispatch shared by `decrypt_envelope_for` and
 /// `decrypt_file_offer` - decrypts `envelope.blocks` addressed to us,
 /// regardless of `envelope.content` (callers check that themselves first).
-fn decrypt_own_envelope(envelope: &Envelope, from: UserId, sender: &UserInfo, session: &SessionState) -> Option<Vec<u8>> {
+fn decrypt_own_envelope(
+    envelope: &Envelope,
+    from: UserId,
+    sender: &UserInfo,
+    session: &SessionState,
+) -> Option<Vec<u8>> {
     if session.own_key_mode == KeyMode::PqHybrid {
         let my_private = session.own_pq_private.as_ref()?;
-        let sender_public: crypto::pq::PqPublicBundle = proto::decode(&sender.public_key_der).ok()?;
+        let sender_public: crypto::pq::PqPublicBundle =
+            proto::decode(&sender.public_key_der).ok()?;
         let blob = envelope.blocks.first()?;
         crypto::pq::decrypt_hybrid(my_private, &sender_public, blob)
     } else {
-        session.own_keys.as_ref()?.lock().unwrap().decrypt_from(from, &envelope.blocks)
+        session
+            .own_keys
+            .as_ref()?
+            .lock()
+            .unwrap()
+            .decrypt_from(from, &envelope.blocks)
     }
 }
 
@@ -1338,10 +1651,21 @@ fn handle_incoming_file_offer(
     channel: Option<String>,
     envelope: Envelope,
 ) {
-    let Some(sender) = ui_state.known_users.get(&from).cloned() else { return };
-    let Some(payload) = decrypt_file_offer(&envelope, from, &sender, session) else { return };
+    let Some(sender) = ui_state.known_users.get(&from).cloned() else {
+        return;
+    };
+    let Some(payload) = decrypt_file_offer(&envelope, from, &sender, session) else {
+        return;
+    };
     let filename = crate::file_transfer::truncate_filename(&payload.filename);
-    let offer = PendingFileOffer { from, from_name, filename, size: payload.size, stream_id, channel };
+    let offer = PendingFileOffer {
+        from,
+        from_name,
+        filename,
+        size: payload.size,
+        stream_id,
+        channel,
+    };
     if ui_state.is_trust_gated(from) {
         ui_state.hold_file_offer(offer);
         return;
@@ -1355,14 +1679,28 @@ fn handle_incoming_file_offer(
 /// (`file_stream::FileEvent`) into the matching log row - see
 /// `UiState::update_file_entry` for how a row is found from just
 /// `(from, stream_id)`.
-fn handle_file_event(ui_state: &mut UiState, session: &mut SessionState, event: file_stream::FileEvent) {
+fn handle_file_event(
+    ui_state: &mut UiState,
+    session: &mut SessionState,
+    event: file_stream::FileEvent,
+) {
     let me = ui_state.own_id.unwrap_or(UserId(0));
     match event {
-        file_stream::FileEvent::SendProgress { stream_id, bytes } => ui_state.set_file_progress(me, stream_id, bytes),
-        file_stream::FileEvent::SendDone { stream_id } => ui_state.set_file_completed(me, stream_id),
+        file_stream::FileEvent::SendProgress { stream_id, bytes } => {
+            ui_state.set_file_progress(me, stream_id, bytes)
+        }
+        file_stream::FileEvent::SendDone { stream_id } => {
+            ui_state.set_file_completed(me, stream_id)
+        }
         file_stream::FileEvent::SendFailed { stream_id } => ui_state.set_file_failed(me, stream_id),
-        file_stream::FileEvent::ReceiveProgress { from, stream_id, bytes } => ui_state.set_file_progress(from, stream_id, bytes),
-        file_stream::FileEvent::ReceiveDone { from, stream_id, .. } => {
+        file_stream::FileEvent::ReceiveProgress {
+            from,
+            stream_id,
+            bytes,
+        } => ui_state.set_file_progress(from, stream_id, bytes),
+        file_stream::FileEvent::ReceiveDone {
+            from, stream_id, ..
+        } => {
             session.active_file_transfers.remove(&(from, stream_id));
             ui_state.set_file_completed(from, stream_id);
         }

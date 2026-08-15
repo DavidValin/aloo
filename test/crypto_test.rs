@@ -1,11 +1,11 @@
 use aloo::crypto::{
-    constant_time_eq, decrypt_chunked, encrypt_chunked, fingerprint, fingerprint_der, max_chunk_len,
-    private_key_from_der, private_key_to_der, public_key_from_der, public_key_to_der, random_bytes, sign,
-    verify, CryptoError, KeyPair, RSA_KEY_BITS, RSA_PER_MSG_KEY_BITS,
+    CryptoError, KeyPair, RSA_KEY_BITS, RSA_PER_MSG_KEY_BITS, constant_time_eq, decrypt_chunked,
+    encrypt_chunked, fingerprint, fingerprint_der, max_chunk_len, private_key_from_der,
+    private_key_to_der, public_key_from_der, public_key_to_der, random_bytes, sign, verify,
 };
 use rand_core::OsRng;
-use rsa::traits::PublicKeyParts;
 use rsa::RsaPrivateKey;
+use rsa::traits::PublicKeyParts;
 
 /// @requirement AC-040, AC-041
 #[test]
@@ -35,7 +35,11 @@ fn long_message_is_split_into_multiple_blocks_and_reassembled() {
     // enough bytes to require at least 3 blocks
     let msg: Vec<u8> = (0..chunk * 2 + 37).map(|i| (i % 256) as u8).collect();
     let blocks = encrypt_chunked(&kp.public, &msg).expect("encrypt");
-    assert!(blocks.len() >= 3, "expected multiple blocks, got {}", blocks.len());
+    assert!(
+        blocks.len() >= 3,
+        "expected multiple blocks, got {}",
+        blocks.len()
+    );
     let out = decrypt_chunked(&kp.private, &blocks).expect("decrypt");
     assert_eq!(out, msg);
 }
@@ -88,7 +92,10 @@ fn encrypt_chunked_rejects_a_key_too_small_for_oaep() {
     assert_eq!(max_chunk_len(&public), 0);
 
     let err = encrypt_chunked(&public, b"hi").unwrap_err();
-    assert!(matches!(err, CryptoError::Encrypt(_)), "expected an Encrypt error, got {err:?}");
+    assert!(
+        matches!(err, CryptoError::Encrypt(_)),
+        "expected an Encrypt error, got {err:?}"
+    );
 }
 
 /// @requirement TB-054
@@ -236,7 +243,8 @@ fn generate_uses_the_default_rsa_key_bits() {
 #[test]
 #[ignore = "real RSA-4096 keygen, 60s+ in this environment - run with `cargo test -- --ignored`"]
 fn generate_with_bits_produces_a_key_of_the_requested_size_and_is_still_usable() {
-    let kp = KeyPair::generate_with_bits(RSA_PER_MSG_KEY_BITS).expect("keygen at rsa_per_msg's size");
+    let kp =
+        KeyPair::generate_with_bits(RSA_PER_MSG_KEY_BITS).expect("keygen at rsa_per_msg's size");
     assert_eq!(kp.public.size() * 8, RSA_PER_MSG_KEY_BITS);
 
     let blocks = encrypt_chunked(&kp.public, b"round trip at 4096 bits").expect("encrypt");
@@ -250,5 +258,8 @@ fn sign_is_deterministic_pkcs1v15() {
     let kp = KeyPair::generate().expect("keygen");
     let sig1 = sign(&kp.private, b"same payload every time").expect("sign 1");
     let sig2 = sign(&kp.private, b"same payload every time").expect("sign 2");
-    assert_eq!(sig1, sig2, "PKCS#1 v1.5 signing has no randomness, unlike OAEP encryption");
+    assert_eq!(
+        sig1, sig2,
+        "PKCS#1 v1.5 signing has no randomness, unlike OAEP encryption"
+    );
 }

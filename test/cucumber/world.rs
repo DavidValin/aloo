@@ -64,7 +64,10 @@ pub fn keypair_for(who: &str) -> KeyPair {
         let kp = KeyPair::generate_with_bits(SCENARIO_KEY_BITS).expect("scenario keygen");
         (kp.private, kp.public)
     });
-    KeyPair { private: private.clone(), public: public.clone() }
+    KeyPair {
+        private: private.clone(),
+        public: public.clone(),
+    }
 }
 
 /// State for a single simulated client in a multi-client scenario. The
@@ -164,7 +167,9 @@ impl AlooWorld {
     }
 
     pub fn ui_mut(&mut self) -> &mut UiState {
-        self.ui.as_mut().expect("no connected UI in this scenario - a Given step should create one")
+        self.ui
+            .as_mut()
+            .expect("no connected UI in this scenario - a Given step should create one")
     }
 
     pub fn ui_ref(&self) -> &UiState {
@@ -176,10 +181,12 @@ impl AlooWorld {
     }
 
     pub fn id_of(&self, name: &str) -> UserId {
-        *self
-            .ids
-            .get(name)
-            .unwrap_or_else(|| panic!("no registered user called {name:?}; known: {:?}", self.ids.keys()))
+        *self.ids.get(name).unwrap_or_else(|| {
+            panic!(
+                "no registered user called {name:?}; known: {:?}",
+                self.ids.keys()
+            )
+        })
     }
 
     pub fn client_mut(&mut self, name: &str) -> &mut ClientState {
@@ -191,9 +198,14 @@ impl AlooWorld {
     /// A unique path under the system temp dir, removed when the scenario ends.
     pub fn temp_path(&mut self, tag: &str) -> std::path::PathBuf {
         use std::time::{SystemTime, UNIX_EPOCH};
-        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-        let path =
-            std::env::temp_dir().join(format!("aloo-cucumber-{tag}-{}-{nanos}", std::process::id()));
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "aloo-cucumber-{tag}-{}-{nanos}",
+            std::process::id()
+        ));
         self.temp_files.push(path.clone());
         path
     }

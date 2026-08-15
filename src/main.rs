@@ -6,11 +6,15 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use clap::Parser;
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
-use crossterm::event::{KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
+use crossterm::event::{
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
 use global_hotkey::hotkey::HotKey;
-use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
 
 use aloo::connect;
 use aloo::crypto;
@@ -21,7 +25,10 @@ use aloo::settings;
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 #[derive(Parser, Debug)]
-#[command(name = "aloo", about = "Terminal chat with encrypted text/voice channels")]
+#[command(
+    name = "aloo",
+    about = "Terminal chat with encrypted text/voice channels"
+)]
 struct Cli {
     /// Run as the server instead of the client.
     #[arg(long)]
@@ -79,7 +86,9 @@ fn main() -> Result<(), BoxError> {
 /// already has the `full` feature on), just constructed explicitly so
 /// `main` can choose *which* thread runs it.
 fn build_runtime() -> std::io::Result<tokio::runtime::Runtime> {
-    tokio::runtime::Builder::new_multi_thread().enable_all().build()
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
 }
 
 /// Loads `~/.aloo/settings` (creating it with defaults on first run - see
@@ -146,8 +155,8 @@ fn run_client_entry(cli: Cli) -> Result<(), BoxError> {
 /// `hotkey_rx`.
 #[cfg(target_os = "macos")]
 fn run_client_macos(cli: Cli, hotkey: Option<HotKey>) -> Result<(), BoxError> {
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     let (manager, hotkey_rx) = match hotkey.and_then(global_ptt::register_on_current_thread) {
         Some((manager, rx)) => (Some(manager), Some(rx)),
@@ -197,7 +206,11 @@ fn run_keygen_pq_hybrid(prefix: &str) -> Result<(), BoxError> {
     crypto::pq::save_private_bundle(&private, &priv_path)?;
     crypto::pq::save_public_bundle(&public, &pub_path)?;
 
-    println!("wrote {} (private, keep this secret) and {} (public)", priv_path.display(), pub_path.display());
+    println!(
+        "wrote {} (private, keep this secret) and {} (public)",
+        priv_path.display(),
+        pub_path.display()
+    );
     println!(
         "in the connect popup, set my_key type to pq_hybrid and point file_priv/file_pub at these two files."
     );
@@ -215,7 +228,10 @@ fn run_keygen_pq_hybrid(prefix: &str) -> Result<(), BoxError> {
 /// restarting the server after a crash) inherits.
 async fn run_server(cli: Cli) -> Result<(), BoxError> {
     let mut settings = load_settings();
-    let bind = cli.bind.clone().unwrap_or_else(|| settings.server_bind.clone());
+    let bind = cli
+        .bind
+        .clone()
+        .unwrap_or_else(|| settings.server_bind.clone());
     let port = cli.port.unwrap_or(settings.server_port);
 
     let auth = match (&cli.enc, &cli.password) {
@@ -233,7 +249,9 @@ async fn run_server(cli: Cli) -> Result<(), BoxError> {
         (None, None) => match settings.server_auth.clone() {
             settings::ServerAuth::None => AuthConfig::None,
             settings::ServerAuth::Password(pw) => AuthConfig::Password(pw),
-            settings::ServerAuth::Rsa(keyfile) => AuthConfig::Rsa(Box::new(crypto::load_private_key(&keyfile)?)),
+            settings::ServerAuth::Rsa(keyfile) => {
+                AuthConfig::Rsa(Box::new(crypto::load_private_key(&keyfile)?))
+            }
         },
         (Some(_), Some(_)) => return Err("--enc and --password are mutually exclusive".into()),
     };
@@ -260,7 +278,8 @@ async fn run_client(
 ) -> Result<(), BoxError> {
     let (mut terminal, keyboard_release_reporting) = setup_terminal()?;
     let port = cli.port.unwrap_or(settings::DEFAULT_PORT);
-    let result = connect::run_client_inner(&mut terminal, port, keyboard_release_reporting, hotkey_rx).await;
+    let result =
+        connect::run_client_inner(&mut terminal, port, keyboard_release_reporting, hotkey_rx).await;
     restore_terminal(&mut terminal)?;
     result
 }
@@ -276,7 +295,8 @@ fn setup_terminal() -> Result<(Terminal<CrosstermBackend<Stdout>>, bool), BoxErr
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     crossterm::execute!(stdout, EnterAlternateScreen)?;
-    let keyboard_release_reporting = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
+    let keyboard_release_reporting =
+        crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
     if keyboard_release_reporting {
         crossterm::execute!(
             stdout,

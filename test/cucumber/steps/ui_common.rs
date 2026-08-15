@@ -3,8 +3,8 @@
 //! cucumber registers steps globally, so these phrasings are available to all
 //! the feature files regardless of which module a scenario "belongs" to.
 
-use cucumber::{given, then, when};
 use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
+use cucumber::{given, then, when};
 
 use aloo::proto::{ChannelInfo, ChannelKind, KeyMode, UserId, UserInfo};
 use aloo::ui::ui::{Focus, MessageBody, UiState};
@@ -12,7 +12,12 @@ use aloo::ui::ui::{Focus, MessageBody, UiState};
 use crate::world::AlooWorld;
 
 pub fn user_with_mode(id: u64, name: &str, key_mode: KeyMode) -> UserInfo {
-    UserInfo { id: UserId(id), name: name.to_string(), public_key_der: vec![id as u8; 4], key_mode }
+    UserInfo {
+        id: UserId(id),
+        name: name.to_string(),
+        public_key_der: vec![id as u8; 4],
+        key_mode,
+    }
 }
 
 /// Stable ids so scenarios can name people rather than numbers. `me` is 1,
@@ -48,8 +53,14 @@ fn key_mode_named(mode: &str) -> KeyMode {
 async fn connected_viewing(w: &mut AlooWorld) {
     let mut state = UiState::new("me".into());
     state.set_own_id(UserId(1));
-    state.on_channel_list(vec![ChannelInfo { name: "general".into(), kind: ChannelKind::Public }]);
-    state.on_joined(ChannelInfo { name: "general".into(), kind: ChannelKind::Public });
+    state.on_channel_list(vec![ChannelInfo {
+        name: "general".into(),
+        kind: ChannelKind::Public,
+    }]);
+    state.on_joined(ChannelInfo {
+        name: "general".into(),
+        kind: ChannelKind::Public,
+    });
     w.ui = Some(state);
 }
 
@@ -65,8 +76,14 @@ async fn connected_two_channels(w: &mut AlooWorld) {
     let mut state = UiState::new("me".into());
     state.set_own_id(UserId(1));
     state.on_channel_list(vec![
-        ChannelInfo { name: "general".into(), kind: ChannelKind::Public },
-        ChannelInfo { name: "random".into(), kind: ChannelKind::Public },
+        ChannelInfo {
+            name: "general".into(),
+            kind: ChannelKind::Public,
+        },
+        ChannelInfo {
+            name: "random".into(),
+            kind: ChannelKind::Public,
+        },
     ]);
     w.ui = Some(state);
 }
@@ -85,7 +102,33 @@ async fn member_present_mode(w: &mut AlooWorld, name: String, mode: String) {
 
 #[given(expr = "the channel already has joined {string}")]
 async fn already_joined(w: &mut AlooWorld, channel: String) {
-    w.ui_mut().on_joined(ChannelInfo { name: channel, kind: ChannelKind::Public });
+    w.ui_mut().on_joined(ChannelInfo {
+        name: channel,
+        kind: ChannelKind::Public,
+    });
+}
+
+#[given(expr = "I have joined the private channel {string}")]
+async fn already_joined_private(w: &mut AlooWorld, channel: String) {
+    w.ui_mut().on_joined(ChannelInfo {
+        name: channel,
+        kind: ChannelKind::Private,
+    });
+}
+
+#[when(expr = "I select the channel {string}")]
+async fn select_channel(w: &mut AlooWorld, channel: String) {
+    let state = w.ui_mut();
+    state.selected_channel = state
+        .channels
+        .iter()
+        .position(|c| c.name == channel)
+        .unwrap_or_else(|| panic!("no such channel {channel:?}"));
+}
+
+#[given(expr = "I have left the channel {string}")]
+async fn already_left(w: &mut AlooWorld, channel: String) {
+    w.ui_mut().leave_channel_locally(&channel);
 }
 
 #[given(expr = "the message log holds {int} messages")]
@@ -120,7 +163,8 @@ async fn log_holds_a_page_and_a_half(w: &mut AlooWorld) {
 #[given(expr = "{word} has sent me the private message {string}")]
 async fn peer_sent_dm(w: &mut AlooWorld, name: String, body: String) {
     let id = UserId(id_for(&name));
-    w.ui_mut().on_direct_message(id, name, MessageBody::Text(body));
+    w.ui_mut()
+        .on_direct_message(id, name, MessageBody::Text(body));
 }
 
 #[given(expr = "{word} has sent me {int} private messages")]
@@ -154,7 +198,10 @@ async fn set_focus(w: &mut AlooWorld, area: String) {
 /// its own near-identical wording.
 pub fn press_key(w: &mut AlooWorld, code: KeyCode, mods: KeyModifiers) {
     if w.popup.is_some() {
-        let action = w.popup_mut().handle_key(code).expect("popup key handling should not fail");
+        let action = w
+            .popup_mut()
+            .handle_key(code)
+            .expect("popup key handling should not fail");
         w.popup_error = w.popup_mut().error.clone();
         w.action_was_none = matches!(action, aloo::ui::ui_connect_popup::Action::None);
         w.popup_action = Some(action);
@@ -231,7 +278,10 @@ async fn open_private_room(w: &mut AlooWorld, name: String) {
 
 #[then("nothing happens")]
 async fn nothing_happens(w: &mut AlooWorld) {
-    assert!(w.action_was_none, "the key press should not have produced any action");
+    assert!(
+        w.action_was_none,
+        "the key press should not have produced any action"
+    );
 }
 
 #[then(expr = "the compose bar holds {string}")]

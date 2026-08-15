@@ -20,8 +20,14 @@ use crate::world::AlooWorld;
 const STREAM_ID: u64 = 1;
 
 fn write_temp_file(filename: &str, contents: &[u8]) -> std::path::PathBuf {
-    let suffix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-    let dir = std::env::temp_dir().join(format!("aloo-cucumber-file-transfer-{}-{suffix}", std::process::id()));
+    let suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "aloo-cucumber-file-transfer-{}-{suffix}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(filename);
     std::fs::write(&path, contents).unwrap();
@@ -35,8 +41,13 @@ fn write_temp_file(filename: &str, contents: &[u8]) -> std::path::PathBuf {
 /// once a file has been picked.
 fn open_confirm(w: &mut AlooWorld, target: FileSendTarget, path: std::path::PathBuf) {
     let browser = FileBrowserState::open(path.parent().unwrap().to_path_buf()).unwrap();
-    w.ui_mut().file_send =
-        Some(FileSendState { target, browser, confirm: Some(path), confirm_focus: FileConfirmChoice::Discard, error: None });
+    w.ui_mut().file_send = Some(FileSendState {
+        target,
+        browser,
+        confirm: Some(path),
+        confirm_focus: FileConfirmChoice::Discard,
+        error: None,
+    });
     w.ui_mut().mode = Mode::FileSend;
 }
 
@@ -65,10 +76,22 @@ async fn selected_long_named_file(w: &mut AlooWorld) {
     open_confirm(w, FileSendTarget::Channel("general".into()), path);
 }
 
-#[then(expr = "sending {string} as a file to the channel is requested, addressed to {word} and {word}")]
-async fn file_send_requested_channel_addressed(w: &mut AlooWorld, filename: String, a: String, b: String) {
+#[then(
+    expr = "sending {string} as a file to the channel is requested, addressed to {word} and {word}"
+)]
+async fn file_send_requested_channel_addressed(
+    w: &mut AlooWorld,
+    filename: String,
+    a: String,
+    b: String,
+) {
     match w.last_action.as_ref().expect("no action was produced") {
-        UiAction::SendFileChannel { channel, filename: f, recipients, .. } => {
+        UiAction::SendFileChannel {
+            channel,
+            filename: f,
+            recipients,
+            ..
+        } => {
             assert_eq!(channel, "general");
             assert_eq!(f, &filename);
             let ids: Vec<UserId> = recipients.iter().map(|(id, _, _)| *id).collect();
@@ -81,7 +104,11 @@ async fn file_send_requested_channel_addressed(w: &mut AlooWorld, filename: Stri
 #[then(expr = "sending {string} as a file to the channel is requested")]
 async fn file_send_requested_channel(w: &mut AlooWorld, filename: String) {
     match w.last_action.as_ref().expect("no action was produced") {
-        UiAction::SendFileChannel { channel, filename: f, .. } => {
+        UiAction::SendFileChannel {
+            channel,
+            filename: f,
+            ..
+        } => {
             assert_eq!(channel, "general");
             assert_eq!(f, &filename);
         }
@@ -93,7 +120,9 @@ async fn file_send_requested_channel(w: &mut AlooWorld, filename: String) {
 async fn file_send_requested_dm(w: &mut AlooWorld, filename: String, name: String) {
     let want = UserId(id_for(&name));
     match w.last_action.as_ref().expect("no action was produced") {
-        UiAction::SendFileDirect { to, filename: f, .. } => {
+        UiAction::SendFileDirect {
+            to, filename: f, ..
+        } => {
             assert_eq!(*to, want);
             assert_eq!(f, &filename);
         }
@@ -104,14 +133,23 @@ async fn file_send_requested_dm(w: &mut AlooWorld, filename: String, name: Strin
 #[then("the file selection is discarded, returning to the browser")]
 async fn file_discarded(w: &mut AlooWorld) {
     assert!(w.action_was_none);
-    let fs = w.ui_ref().file_send.as_ref().expect("still in the /file flow, not bounced out of it");
-    assert!(fs.confirm.is_none(), "Discard should return to the browser, not stay on the confirmation box");
+    let fs = w
+        .ui_ref()
+        .file_send
+        .as_ref()
+        .expect("still in the /file flow, not bounced out of it");
+    assert!(
+        fs.confirm.is_none(),
+        "Discard should return to the browser, not stay on the confirmation box"
+    );
 }
 
 #[then("the offered filename is cropped to 230 characters")]
 async fn filename_cropped(w: &mut AlooWorld) {
     match w.last_action.as_ref().expect("no action was produced") {
-        UiAction::SendFileChannel { filename, .. } => assert_eq!(filename.chars().count(), MAX_FILENAME_CHARS),
+        UiAction::SendFileChannel { filename, .. } => {
+            assert_eq!(filename.chars().count(), MAX_FILENAME_CHARS)
+        }
         other => panic!("expected SendFileChannel, got {other:?}"),
     }
 }
@@ -124,7 +162,14 @@ async fn filename_cropped(w: &mut AlooWorld) {
 #[when(expr = "{word} offers me the file {string} of {int} bytes in the channel")]
 async fn peer_offers_file_channel(w: &mut AlooWorld, name: String, filename: String, size: u64) {
     let id = UserId(id_for(&name));
-    let offer = PendingFileOffer { from: id, from_name: name, filename, size, stream_id: STREAM_ID, channel: Some("general".into()) };
+    let offer = PendingFileOffer {
+        from: id,
+        from_name: name,
+        filename,
+        size,
+        stream_id: STREAM_ID,
+        channel: Some("general".into()),
+    };
     if w.ui_ref().is_trust_gated(id) {
         w.ui_mut().hold_file_offer(offer);
     } else {
@@ -134,13 +179,17 @@ async fn peer_offers_file_channel(w: &mut AlooWorld, name: String, filename: Str
 
 #[then(expr = "a file offer popup from {word} for {string} of {int} bytes is shown")]
 async fn offer_popup_shown(w: &mut AlooWorld, name: String, filename: String, size: u64) {
-    let offer = w.ui_ref().file_offer_open().expect("no file offer popup is open");
+    let offer = w
+        .ui_ref()
+        .file_offer_open()
+        .expect("no file offer popup is open");
     assert_eq!(offer.from_name, name);
     assert_eq!(offer.filename, filename);
     assert_eq!(offer.size, size);
     let rows = ui_rows_wide(w.ui_ref());
     assert!(
-        rows.iter().any(|r| r.contains(&name) && r.contains(&filename)),
+        rows.iter()
+            .any(|r| r.contains(&name) && r.contains(&filename)),
         "expected the offer text to render: {rows:?}"
     );
 }
@@ -148,7 +197,10 @@ async fn offer_popup_shown(w: &mut AlooWorld, name: String, filename: String, si
 #[then(expr = "bob's file offer for {string} is held, not shown")]
 async fn offer_held(w: &mut AlooWorld, filename: String) {
     let id = UserId(id_for("bob"));
-    assert!(w.ui_ref().file_offer_open().is_none(), "a held offer must not show a popup yet");
+    assert!(
+        w.ui_ref().file_offer_open().is_none(),
+        "a held offer must not show a popup yet"
+    );
     assert!(w.ui_ref().is_trust_gated(id));
     let _ = filename;
 }
@@ -165,7 +217,9 @@ async fn offer_accepted_by_default(w: &mut AlooWorld, name: String, filename: St
             assert_eq!(from, want);
             assert_eq!(stream_id, STREAM_ID);
         }
-        ref other => panic!("expected AcceptFileOffer (Accept must be focused by default), got {other:?}"),
+        ref other => {
+            panic!("expected AcceptFileOffer (Accept must be focused by default), got {other:?}")
+        }
     }
     let _ = filename;
 }
@@ -180,8 +234,18 @@ async fn accept_file_offer(w: &mut AlooWorld) {
     press_key(w, KeyCode::Enter, KeyModifiers::NONE);
     match w.last_action {
         Some(UiAction::AcceptFileOffer { from, stream_id }) => {
-            let offer = w.ui_mut().take_file_offer(from, stream_id).expect("offer should still be queued");
-            w.ui_mut().on_channel_file_offer_accepted("general", from, offer.from_name, stream_id, offer.filename, offer.size);
+            let offer = w
+                .ui_mut()
+                .take_file_offer(from, stream_id)
+                .expect("offer should still be queued");
+            w.ui_mut().on_channel_file_offer_accepted(
+                "general",
+                from,
+                offer.from_name,
+                stream_id,
+                offer.filename,
+                offer.size,
+            );
         }
         ref other => panic!("expected AcceptFileOffer, got {other:?}"),
     }
@@ -203,11 +267,22 @@ async fn transfer_completes(w: &mut AlooWorld) {
 #[then(expr = "the message log shows an in-progress file {string} from {word}")]
 async fn log_shows_in_progress(w: &mut AlooWorld, filename: String, name: String) {
     let state = w.ui_ref();
-    let entry = state.channels[0].log.iter().find(|e| e.from == UserId(id_for(&name))).expect("no log entry");
+    let entry = state.channels[0]
+        .log
+        .iter()
+        .find(|e| e.from == UserId(id_for(&name)))
+        .expect("no log entry");
     match &entry.body {
-        MessageBody::File { filename: f, status, .. } => {
+        MessageBody::File {
+            filename: f,
+            status,
+            ..
+        } => {
             assert_eq!(f, &filename);
-            assert!(matches!(status, FileTransferStatus::InProgress { .. }), "expected InProgress, got {status:?}");
+            assert!(
+                matches!(status, FileTransferStatus::InProgress { .. }),
+                "expected InProgress, got {status:?}"
+            );
         }
         other => panic!("expected a file message, got {other:?}"),
     }
@@ -217,7 +292,8 @@ async fn log_shows_in_progress(w: &mut AlooWorld, filename: String, name: String
 async fn log_shows_percent(w: &mut AlooWorld, filename: String, pct: u32) {
     let rows = ui_rows_wide(w.ui_ref());
     assert!(
-        rows.iter().any(|r| r.contains(&filename) && r.contains(&format!("{pct}%"))),
+        rows.iter()
+            .any(|r| r.contains(&filename) && r.contains(&format!("{pct}%"))),
         "expected {filename} at {pct}%: {rows:?}"
     );
 }
@@ -231,14 +307,21 @@ async fn log_shows_file(w: &mut AlooWorld, filename: String, name: String) {
         .find(|e| e.from == UserId(id_for(&name)))
         .unwrap_or_else(|| panic!("no log entry from {name}"));
     match &entry.body {
-        MessageBody::File { filename: f, status, .. } => {
+        MessageBody::File {
+            filename: f,
+            status,
+            ..
+        } => {
             assert_eq!(f, &filename);
             assert_eq!(*status, FileTransferStatus::Completed);
         }
         other => panic!("expected a file message, got {other:?}"),
     }
     let rows = ui_rows_wide(state);
-    assert!(rows.iter().any(|r| r.contains('\u{1F4CE}')), "expected the paperclip icon to render: {rows:?}");
+    assert!(
+        rows.iter().any(|r| r.contains('\u{1F4CE}')),
+        "expected the paperclip icon to render: {rows:?}"
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -252,10 +335,20 @@ async fn log_shows_file(w: &mut AlooWorld, filename: String, name: String) {
 /// doc) and then flipping it to `Rejected`.
 #[when("bob rejects my file offer")]
 async fn bob_rejects(w: &mut AlooWorld) {
-    let Some(UiAction::SendFileChannel { channel, filename, size, .. }) = w.last_action.clone() else {
-        panic!("expected a prior SendFileChannel action, got {:?}", w.last_action);
+    let Some(UiAction::SendFileChannel {
+        channel,
+        filename,
+        size,
+        ..
+    }) = w.last_action.clone()
+    else {
+        panic!(
+            "expected a prior SendFileChannel action, got {:?}",
+            w.last_action
+        );
     };
-    w.ui_mut().log_own_file_offer_channel(&channel, "bob", STREAM_ID, filename, size);
+    w.ui_mut()
+        .log_own_file_offer_channel(&channel, "bob", STREAM_ID, filename, size);
     let me = w.ui_ref().own_id.unwrap();
     w.ui_mut().set_file_rejected(me, STREAM_ID);
 }
@@ -263,9 +356,17 @@ async fn bob_rejects(w: &mut AlooWorld) {
 #[then(expr = "my file {string} to bob is shown as rejected")]
 async fn my_file_shown_rejected(w: &mut AlooWorld, filename: String) {
     let state = w.ui_ref();
-    let entry = state.channels[0].log.iter().find(|e| e.outgoing).expect("no outgoing log entry");
+    let entry = state.channels[0]
+        .log
+        .iter()
+        .find(|e| e.outgoing)
+        .expect("no outgoing log entry");
     match &entry.body {
-        MessageBody::File { filename: f, status, .. } => {
+        MessageBody::File {
+            filename: f,
+            status,
+            ..
+        } => {
             assert_eq!(f, &filename);
             assert_eq!(*status, FileTransferStatus::Rejected);
         }

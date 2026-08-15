@@ -12,16 +12,16 @@
 use std::path::PathBuf;
 
 use crossterm::event::KeyCode;
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
-use ratatui::Frame;
 
 use crate::proto::UserId;
 
-use super::ui::{centered_rect, focus_border_style, Mode, UiAction, UiState};
-use super::ui_connect_popup::{render_file_browser, FileBrowserState};
+use super::ui::{Mode, UiAction, UiState, centered_rect, focus_border_style};
+use super::ui_connect_popup::{FileBrowserState, render_file_browser};
 
 /// Who a file send is addressed to - just the identity, not a frozen
 /// recipient list: recipients are recomputed fresh at confirm-time (see
@@ -93,14 +93,23 @@ impl UiState {
         let start_dir = std::env::current_dir().ok()?;
         let browser = FileBrowserState::open(start_dir).ok()?;
         self.input.clear();
-        self.file_send =
-            Some(FileSendState { target, browser, confirm: None, confirm_focus: FileConfirmChoice::Discard, error: None });
+        self.file_send = Some(FileSendState {
+            target,
+            browser,
+            confirm: None,
+            confirm_focus: FileConfirmChoice::Discard,
+            error: None,
+        });
         self.mode = Mode::FileSend;
         None
     }
 
     pub(crate) fn handle_file_send_key(&mut self, code: KeyCode) -> Option<UiAction> {
-        let is_confirming = self.file_send.as_ref().map(|s| s.confirm.is_some()).unwrap_or(false);
+        let is_confirming = self
+            .file_send
+            .as_ref()
+            .map(|s| s.confirm.is_some())
+            .unwrap_or(false);
         if is_confirming {
             return self.handle_file_confirm_key(code);
         }
@@ -108,7 +117,9 @@ impl UiState {
     }
 
     fn handle_file_browser_key(&mut self, code: KeyCode) -> Option<UiAction> {
-        let Some(state) = self.file_send.as_mut() else { return None };
+        let Some(state) = self.file_send.as_mut() else {
+            return None;
+        };
         match code {
             KeyCode::Up => {
                 state.browser.select_prev();
@@ -132,7 +143,9 @@ impl UiState {
                 None
             }
             KeyCode::Enter => {
-                let Some(entry) = state.browser.selected_entry() else { return None };
+                let Some(entry) = state.browser.selected_entry() else {
+                    return None;
+                };
                 if entry.is_dir {
                     let _ = state.browser.navigate_into_selected();
                 } else if let Some(path) = state.browser.selected_path() {
@@ -208,7 +221,10 @@ impl UiState {
             }
         };
 
-        let filename = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "file".to_string());
+        let filename = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "file".to_string());
         let filename = crate::file_transfer::truncate_filename(&filename);
 
         let target = self.file_send.as_ref()?.target.clone();
@@ -216,7 +232,13 @@ impl UiState {
             FileSendTarget::Channel(name) => {
                 let tab = self.channels.iter().find(|c| c.name == name)?;
                 let recipients = self.recipients_for_channel(tab);
-                UiAction::SendFileChannel { channel: name, path, filename, size, recipients }
+                UiAction::SendFileChannel {
+                    channel: name,
+                    path,
+                    filename,
+                    size,
+                    recipients,
+                }
             }
             FileSendTarget::Direct(peer_id) => {
                 if self.offline.contains(&peer_id) || self.is_trust_gated(peer_id) {
@@ -254,8 +276,17 @@ pub(crate) fn render_file_send_popup(frame: &mut Frame, area: Rect, state: &UiSt
     }
 }
 
-fn render_confirm(frame: &mut Frame, area: Rect, state: &UiState, fs: &FileSendState, path: &std::path::Path) {
-    let filename = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "file".to_string());
+fn render_confirm(
+    frame: &mut Frame,
+    area: Rect,
+    state: &UiState,
+    fs: &FileSendState,
+    path: &std::path::Path,
+) {
+    let filename = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".to_string());
     let target_label = match &fs.target {
         FileSendTarget::Channel(name) => format!("#{name}"),
         FileSendTarget::Direct(peer_id) => state
@@ -275,10 +306,15 @@ fn render_confirm(frame: &mut Frame, area: Rect, state: &UiState, fs: &FileSendS
         .constraints([Constraint::Min(3), Constraint::Length(3)])
         .split(inner);
 
-    let mut lines = vec![Line::from(format!("Send \"{filename}\" to {target_label}?"))];
+    let mut lines = vec![Line::from(format!(
+        "Send \"{filename}\" to {target_label}?"
+    ))];
     if let Some(err) = &fs.error {
         lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(err.as_str(), Style::default().fg(Color::Red))));
+        lines.push(Line::from(Span::styled(
+            err.as_str(),
+            Style::default().fg(Color::Red),
+        )));
     }
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), rows[0]);
 
@@ -286,21 +322,41 @@ fn render_confirm(frame: &mut Frame, area: Rect, state: &UiState, fs: &FileSendS
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(rows[1]);
-    render_confirm_button(frame, button_cols[0], "Send file", fs.confirm_focus == FileConfirmChoice::Send);
-    render_confirm_button(frame, button_cols[1], "Discard", fs.confirm_focus == FileConfirmChoice::Discard);
+    render_confirm_button(
+        frame,
+        button_cols[0],
+        "Send file",
+        fs.confirm_focus == FileConfirmChoice::Send,
+    );
+    render_confirm_button(
+        frame,
+        button_cols[1],
+        "Discard",
+        fs.confirm_focus == FileConfirmChoice::Discard,
+    );
 }
 
 /// Same border-vs-fill focus convention as `ui::render_identity_button`/
 /// `ui_connect_popup::render_connect_button`.
 fn render_confirm_button(frame: &mut Frame, area: Rect, label: &str, focused: bool) {
     let popup = centered_rect(18, 3, area);
-    let block = Block::default().borders(Borders::ALL).border_style(focus_border_style(focused));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(focus_border_style(focused));
     let text_style = if focused {
-        Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().add_modifier(Modifier::BOLD)
     };
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
-    frame.render_widget(Paragraph::new(label).alignment(ratatui::layout::Alignment::Center).style(text_style), inner);
+    frame.render_widget(
+        Paragraph::new(label)
+            .alignment(ratatui::layout::Alignment::Center)
+            .style(text_style),
+        inner,
+    );
 }

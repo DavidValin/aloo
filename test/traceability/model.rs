@@ -154,13 +154,19 @@ pub enum TestOutcome {
 impl Model {
     /// Every test that names `id` among its requirements.
     pub fn tests_for(&self, id: &str) -> Vec<&TestLink> {
-        self.tests.iter().filter(|t| t.requirements.iter().any(|r| r == id)).collect()
+        self.tests
+            .iter()
+            .filter(|t| t.requirements.iter().any(|r| r == id))
+            .collect()
     }
 
     /// Every requirement id belonging to `story`, acceptance criteria first.
     pub fn requirements_of(&self, story: &str) -> Vec<&RequirementEntry> {
-        let mut out: Vec<&RequirementEntry> =
-            self.requirements.values().filter(|r| r.story == story).collect();
+        let mut out: Vec<&RequirementEntry> = self
+            .requirements
+            .values()
+            .filter(|r| r.story == story)
+            .collect();
         out.sort_by_key(|r| (r.kind, r.id.clone()));
         out
     }
@@ -241,7 +247,9 @@ pub fn load() -> Model {
 
 /// Walks `dir` recursively, yielding files whose extension matches `ext`.
 fn walk(dir: &Path, ext: &str, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     let mut paths: Vec<PathBuf> = entries.filter_map(|e| e.ok()).map(|e| e.path()).collect();
     paths.sort();
     for path in paths {
@@ -284,7 +292,11 @@ fn scan_rust_tests(dir: &Path, tests: &mut Vec<TestLink>, unlinked: &mut Vec<Unl
             continue;
         }
 
-        let source = file.file_stem().and_then(|s| s.to_str()).unwrap_or("unknown").to_string();
+        let source = file
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
+            .to_string();
         let text = std::fs::read_to_string(&file).expect("read test file");
 
         let mut pending: Vec<String> = Vec::new();
@@ -309,7 +321,11 @@ fn scan_rust_tests(dir: &Path, tests: &mut Vec<TestLink>, unlinked: &mut Vec<Unl
             // Attributes and doc comments between the marker and the fn are
             // transparent; anything else resets a dangling marker so a stray
             // comment cannot attach itself to an unrelated fn far below.
-            if trimmed.starts_with("#[") || trimmed.starts_with("///") || trimmed.starts_with("//") || trimmed.is_empty() {
+            if trimmed.starts_with("#[")
+                || trimmed.starts_with("///")
+                || trimmed.starts_with("//")
+                || trimmed.is_empty()
+            {
                 continue;
             }
 
@@ -372,7 +388,10 @@ fn parse_fn_name(trimmed: &str) -> Option<String> {
         .or_else(|| trimmed.strip_prefix("async fn "))
         .or_else(|| trimmed.strip_prefix("pub fn "))
         .or_else(|| trimmed.strip_prefix("fn "))?;
-    let name: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+    let name: String = rest
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
     if name.is_empty() { None } else { Some(name) }
 }
 
@@ -391,7 +410,11 @@ fn scan_features(dir: &Path, tests: &mut Vec<TestLink>, unlinked: &mut Vec<Unlin
     for file in files {
         let relative = rel(&root, &file);
         let text = std::fs::read_to_string(&file).expect("read feature file");
-        let source = file.file_stem().and_then(|s| s.to_str()).unwrap_or("feature").to_string();
+        let source = file
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("feature")
+            .to_string();
 
         let mut feature_tags: Vec<String> = Vec::new();
         let mut pending: Vec<String> = Vec::new();
@@ -451,8 +474,12 @@ fn scan_features(dir: &Path, tests: &mut Vec<TestLink>, unlinked: &mut Vec<Unlin
 }
 
 fn is_requirement_id(tag: &str) -> bool {
-    let Some((prefix, number)) = tag.split_once('-') else { return false };
-    matches!(prefix, "US" | "AC" | "TB") && !number.is_empty() && number.chars().all(|c| c.is_ascii_digit())
+    let Some((prefix, number)) = tag.split_once('-') else {
+        return false;
+    };
+    matches!(prefix, "US" | "AC" | "TB")
+        && !number.is_empty()
+        && number.chars().all(|c| c.is_ascii_digit())
 }
 
 // ---------------------------------------------------------------------
@@ -466,10 +493,14 @@ fn is_requirement_id(tag: &str) -> bool {
 /// has actually run something.
 fn load_results() -> BTreeMap<String, TestOutcome> {
     let mut out = BTreeMap::new();
-    let Ok(paths) = std::env::var("ALOO_TEST_RESULTS") else { return out };
+    let Ok(paths) = std::env::var("ALOO_TEST_RESULTS") else {
+        return out;
+    };
 
     for path in paths.split(':').filter(|p| !p.is_empty()) {
-        let Ok(text) = std::fs::read_to_string(path) else { continue };
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
         let mut current_binary = String::new();
         for line in text.lines() {
             let trimmed = line.trim();
@@ -487,8 +518,12 @@ fn load_results() -> BTreeMap<String, TestOutcome> {
                 continue;
             }
 
-            let Some(rest) = trimmed.strip_prefix("test ") else { continue };
-            let Some((name, verdict)) = rest.rsplit_once(" ... ") else { continue };
+            let Some(rest) = trimmed.strip_prefix("test ") else {
+                continue;
+            };
+            let Some((name, verdict)) = rest.rsplit_once(" ... ") else {
+                continue;
+            };
             let name = name.trim();
             let outcome = match verdict.trim() {
                 "ok" => TestOutcome::Passed,

@@ -1,8 +1,8 @@
 use aloo::p2p_proto::SAFE_DATAGRAM_BYTES;
 use aloo::voice::{
-    decode_wav_to_mono, downmix_f32_to_mono_i16, downmix_i16_to_mono, end_chime_samples, format_duration_label,
-    pcm_from_bytes, pcm_to_bytes, recording_at_max, resample, CHUNK_INTERVAL, MAX_RECORDING_SAMPLES, MAX_RECORDING_SECS,
-    SAMPLE_RATE_HZ,
+    CHUNK_INTERVAL, MAX_RECORDING_SAMPLES, MAX_RECORDING_SECS, SAMPLE_RATE_HZ, decode_wav_to_mono,
+    downmix_f32_to_mono_i16, downmix_i16_to_mono, end_chime_samples, format_duration_label,
+    pcm_from_bytes, pcm_to_bytes, recording_at_max, resample,
 };
 
 /// @requirement TB-148
@@ -114,7 +114,10 @@ fn downmix_f32_stereo_averages_and_converts_to_i16() {
 #[test]
 fn downmix_f32_mono_input_is_a_straight_conversion() {
     let samples = vec![1.0f32, -1.0, 0.0];
-    assert_eq!(downmix_f32_to_mono_i16(&samples, 1), vec![i16::MAX, i16::MIN + 1, 0]);
+    assert_eq!(
+        downmix_f32_to_mono_i16(&samples, 1),
+        vec![i16::MAX, i16::MIN + 1, 0]
+    );
 }
 
 /// @requirement AC-037
@@ -141,8 +144,14 @@ fn format_duration_label_zero_is_zero_not_rounded_up() {
 /// @requirement AC-037
 #[test]
 fn format_duration_label_reflects_actual_length_not_a_fixed_value() {
-    let labels: Vec<String> = [3_000, 12_000, 47_000].iter().map(|&ms| format_duration_label(ms)).collect();
-    assert_eq!(labels, vec!["voice (3sec)", "voice (12sec)", "voice (47sec)"]);
+    let labels: Vec<String> = [3_000, 12_000, 47_000]
+        .iter()
+        .map(|&ms| format_duration_label(ms))
+        .collect();
+    assert_eq!(
+        labels,
+        vec!["voice (3sec)", "voice (12sec)", "voice (47sec)"]
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -208,7 +217,11 @@ fn resample_round_trip_stays_close_to_original_duration() {
     let back = resample(&up, 48_000, 16_000);
     // rounding at each step means it won't be pixel-perfect, but should
     // be within a handful of samples of the original length
-    assert!((back.len() as i64 - original.len() as i64).abs() <= 2, "{}", back.len());
+    assert!(
+        (back.len() as i64 - original.len() as i64).abs() <= 2,
+        "{}",
+        back.len()
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -275,7 +288,11 @@ fn decode_wav_resamples_a_different_rate_to_sample_rate_hz() {
     let samples = vec![0i16; 44_100]; // 1 second at 44.1kHz
     let wav = build_wav(44_100, 1, &samples);
     let decoded = decode_wav_to_mono(&wav).expect("valid wav");
-    assert_eq!(decoded.len(), SAMPLE_RATE_HZ as usize, "should now be 1 second at SAMPLE_RATE_HZ");
+    assert_eq!(
+        decoded.len(),
+        SAMPLE_RATE_HZ as usize,
+        "should now be 1 second at SAMPLE_RATE_HZ"
+    );
 }
 
 /// @requirement TB-050
@@ -289,7 +306,10 @@ fn decode_wav_rejects_non_wav_input() {
 #[test]
 fn end_chime_samples_decodes_the_bundled_asset_and_is_non_empty() {
     let samples = end_chime_samples();
-    assert!(!samples.is_empty(), "assets/end.wav should decode to a non-empty chime");
+    assert!(
+        !samples.is_empty(),
+        "assets/end.wav should decode to a non-empty chime"
+    );
     // calling again should return the same cached samples
     assert_eq!(end_chime_samples(), samples);
 }

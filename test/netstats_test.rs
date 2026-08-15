@@ -1,6 +1,8 @@
 use std::time::{Duration, Instant};
 
-use aloo::netstats::{ConnQuality, ConnStats, CONN_BAD_MIN_INTERVAL, CONN_GOOD_MAX_INTERVAL, CONN_STATS_MAX_SAMPLES};
+use aloo::netstats::{
+    CONN_BAD_MIN_INTERVAL, CONN_GOOD_MAX_INTERVAL, CONN_STATS_MAX_SAMPLES, ConnQuality, ConnStats,
+};
 
 /// @requirement TB-121
 #[test]
@@ -16,7 +18,11 @@ fn quality_is_unknown_with_no_events() {
 fn average_interval_is_still_none_after_a_single_event() {
     let mut stats = ConnStats::new();
     stats.record_event(Instant::now());
-    assert_eq!(stats.average_interval(), None, "one timestamp alone has no gap to measure");
+    assert_eq!(
+        stats.average_interval(),
+        None,
+        "one timestamp alone has no gap to measure"
+    );
 }
 
 /// @requirement TB-120
@@ -39,17 +45,28 @@ fn older_gaps_are_evicted_once_more_than_max_samples_are_recorded() {
     // Four events -> three gaps of 300ms each. Capacity is
     // CONN_STATS_MAX_SAMPLES (3), so nothing is evicted yet here - this
     // pins the capacity itself before the next step proves eviction.
-    assert_eq!(CONN_STATS_MAX_SAMPLES, 3, "the rest of this test assumes a capacity of 3");
+    assert_eq!(
+        CONN_STATS_MAX_SAMPLES, 3,
+        "the rest of this test assumes a capacity of 3"
+    );
     stats.record_event(t0);
     stats.record_event(t0 + Duration::from_millis(300));
     stats.record_event(t0 + Duration::from_millis(600));
     stats.record_event(t0 + Duration::from_millis(900));
-    assert_eq!(stats.average_interval(), Some(Duration::from_millis(300)), "(300+300+300)/3");
+    assert_eq!(
+        stats.average_interval(),
+        Some(Duration::from_millis(300)),
+        "(300+300+300)/3"
+    );
 
     // A fifth event pushes a fourth gap (90ms) and must evict the oldest
     // 300ms gap, not just grow unbounded.
     stats.record_event(t0 + Duration::from_millis(990));
-    assert_eq!(stats.average_interval(), Some(Duration::from_millis(230)), "(300+300+90)/3, oldest 300ms gap evicted");
+    assert_eq!(
+        stats.average_interval(),
+        Some(Duration::from_millis(230)),
+        "(300+300+90)/3, oldest 300ms gap evicted"
+    );
 }
 
 /// @requirement TB-121
@@ -95,5 +112,9 @@ fn an_out_of_order_timestamp_does_not_panic_or_record_a_negative_interval() {
     // happen with a monotonic clock, but must not panic (Instant
     // subtraction panics if it would go negative) or corrupt the stats.
     stats.record_event(t0);
-    assert_eq!(stats.average_interval(), None, "the out-of-order pair contributes no interval");
+    assert_eq!(
+        stats.average_interval(),
+        None,
+        "the out-of-order pair contributes no interval"
+    );
 }

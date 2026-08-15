@@ -29,7 +29,10 @@ pub(crate) const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 /// actually received this stream, needed again at finish time to fire our
 /// own per-peer rotation (`rekey::OwnKeys`) once per recipient.
 pub(crate) enum OwnStreamTarget {
-    Channel { channel: String, recipients: Vec<UserId> },
+    Channel {
+        channel: String,
+        recipients: Vec<UserId>,
+    },
     Direct(UserId),
 }
 
@@ -65,12 +68,19 @@ pub(crate) fn build_pq_stream_out(
     let k_data = crypto::pq::fresh_data_key();
     let per_recipient: Vec<(UserId, crypto::pq::HybridStreamKeySetup)> = recipients
         .iter()
-        .filter_map(|(id, public)| crypto::pq::wrap_key_for_stream(signing, public, stream_id, &k_data).ok().map(|s| (*id, s)))
+        .filter_map(|(id, public)| {
+            crypto::pq::wrap_key_for_stream(signing, public, stream_id, &k_data)
+                .ok()
+                .map(|s| (*id, s))
+        })
         .collect();
     if per_recipient.is_empty() {
         return None;
     }
-    Some(PqStreamOut { k_data, per_recipient })
+    Some(PqStreamOut {
+        k_data,
+        per_recipient,
+    })
 }
 
 /// A DM voice stream's single recipient is either RSA-family or `PqHybrid`
@@ -86,8 +96,14 @@ pub(crate) enum DirectStreamKey {
 /// and `PqHybrid` recipients at once - each gets whichever scheme their own
 /// `KeyMode` needs, independent of the others (`docs/PROTOCOL.md` §13).
 pub(crate) enum StreamRecipients {
-    Channel { rsa: Vec<(UserId, RsaPublicKey)>, pq: Option<PqStreamOut> },
-    Direct { to: UserId, key: DirectStreamKey },
+    Channel {
+        rsa: Vec<(UserId, RsaPublicKey)>,
+        pq: Option<PqStreamOut>,
+    },
+    Direct {
+        to: UserId,
+        key: DirectStreamKey,
+    },
 }
 
 /// One chunk-decrypt job for an incoming stream's dedicated worker thread.
@@ -116,7 +132,10 @@ pub(crate) enum IncomingStreamKey {
     /// `sender_public` is needed to verify the once-per-stream signature
     /// inside the first `HybridStreamKeySetup` seen (`k_data` is then
     /// cached for the rest of the stream - see `spawn_stream_decrypt_worker`).
-    Pq { my_private: crypto::pq::PqPrivateBundle, sender_public: crypto::pq::PqPublicBundle },
+    Pq {
+        my_private: crypto::pq::PqPrivateBundle,
+        sender_public: crypto::pq::PqPublicBundle,
+    },
 }
 
 /// Bookkeeping for one currently-arriving incoming stream.
@@ -134,22 +153,31 @@ pub(crate) struct ActiveStream {
 /// asymmetric crypto per chunk). The wire shape (`Vec<(UserId, Vec<Vec<u8>>)>`)
 /// is scheme-agnostic already - a PQ recipient's "blocks" is just a single
 /// bincode-encoded blob instead of N OAEP blocks.
-fn build_chunk_recipients(target: &StreamRecipients, stream_id: u64, seq: u32, pcm: &[u8]) -> Vec<(UserId, Vec<Vec<u8>>)> {
+fn build_chunk_recipients(
+    target: &StreamRecipients,
+    stream_id: u64,
+    seq: u32,
+    pcm: &[u8],
+) -> Vec<(UserId, Vec<Vec<u8>>)> {
     match target {
         StreamRecipients::Channel { rsa, pq, .. } => {
-            let mut out: Vec<(UserId, Vec<Vec<u8>>)> =
-                rsa.iter().filter_map(|(id, key)| crypto::encrypt_chunked(key, pcm).ok().map(|b| (*id, b))).collect();
+            let mut out: Vec<(UserId, Vec<Vec<u8>>)> = rsa
+                .iter()
+                .filter_map(|(id, key)| crypto::encrypt_chunked(key, pcm).ok().map(|b| (*id, b)))
+                .collect();
             if let Some(pq) = pq {
                 for (id, setup) in &pq.per_recipient {
-                    let blob = crypto::pq::encrypt_hybrid_voice_chunk(setup, &pq.k_data, stream_id, seq, pcm);
+                    let blob = crypto::pq::encrypt_hybrid_voice_chunk(
+                        setup, &pq.k_data, stream_id, seq, pcm,
+                    );
                     out.push((*id, vec![blob]));
                 }
             }
             out
         }
-        StreamRecipients::Direct { to, key } => {
-            encrypt_direct_chunk(key, stream_id, seq, pcm).map(|blocks| vec![(*to, blocks)]).unwrap_or_default()
-        }
+        StreamRecipients::Direct { to, key } => encrypt_direct_chunk(key, stream_id, seq, pcm)
+            .map(|blocks| vec![(*to, blocks)])
+            .unwrap_or_default(),
     }
 }
 
@@ -158,12 +186,18 @@ fn build_chunk_recipients(target: &StreamRecipients, stream_id: u64, seq: u32, p
 /// dispatch without duplicating it - a file transfer is always a single
 /// `DirectStreamKey` recipient (`docs/PROTOCOL.md`'s file transfer
 /// section), same shape as a DM voice stream.
-pub(crate) fn encrypt_direct_chunk(key: &DirectStreamKey, stream_id: u64, seq: u32, data: &[u8]) -> Option<Vec<Vec<u8>>> {
+pub(crate) fn encrypt_direct_chunk(
+    key: &DirectStreamKey,
+    stream_id: u64,
+    seq: u32,
+    data: &[u8],
+) -> Option<Vec<Vec<u8>>> {
     match key {
         DirectStreamKey::Rsa(k) => crypto::encrypt_chunked(k, data).ok(),
         DirectStreamKey::Pq(pq) => {
             let (_, setup) = pq.per_recipient.first()?;
-            let blob = crypto::pq::encrypt_hybrid_voice_chunk(setup, &pq.k_data, stream_id, seq, data);
+            let blob =
+                crypto::pq::encrypt_hybrid_voice_chunk(setup, &pq.k_data, stream_id, seq, data);
             Some(vec![blob])
         }
     }
@@ -179,7 +213,10 @@ fn stream_recipient_ids(target: &StreamRecipients) -> Vec<UserId> {
         StreamRecipients::Channel { rsa, pq, .. } => rsa
             .iter()
             .map(|(id, _)| *id)
-            .chain(pq.iter().flat_map(|pq| pq.per_recipient.iter().map(|(id, _)| *id)))
+            .chain(
+                pq.iter()
+                    .flat_map(|pq| pq.per_recipient.iter().map(|(id, _)| *id)),
+            )
             .collect(),
         StreamRecipients::Direct { to, .. } => vec![*to],
     }
@@ -230,12 +267,22 @@ pub(crate) fn spawn_record_stream_worker(
                 let per_recipient = build_chunk_recipients(&target, stream_id, seq, &pcm);
                 let msg = match &target {
                     StreamRecipients::Channel { .. } => {
-                        Some(crate::p2p::P2pOutbound::ChannelVoiceChunk { stream_id, seq, per_recipient })
+                        Some(crate::p2p::P2pOutbound::ChannelVoiceChunk {
+                            stream_id,
+                            seq,
+                            per_recipient,
+                        })
                     }
-                    StreamRecipients::Direct { to, .. } => per_recipient
-                        .into_iter()
-                        .next()
-                        .map(|(_, blocks)| crate::p2p::P2pOutbound::DirectVoiceChunk { to: *to, stream_id, seq, blocks }),
+                    StreamRecipients::Direct { to, .. } => {
+                        per_recipient.into_iter().next().map(|(_, blocks)| {
+                            crate::p2p::P2pOutbound::DirectVoiceChunk {
+                                to: *to,
+                                stream_id,
+                                seq,
+                                blocks,
+                            }
+                        })
+                    }
                 };
                 if let Some(msg) = msg {
                     let _ = out_tx.send(msg);
@@ -255,7 +302,11 @@ pub(crate) fn spawn_record_stream_worker(
             if stopped {
                 let duration_ms = ((total_samples * 1000) / voice::SAMPLE_RATE_HZ as u64) as u32;
                 let recipients = stream_recipient_ids(&target);
-                let _ = out_tx.send(crate::p2p::P2pOutbound::VoiceEnd { stream_id, duration_ms, recipients });
+                let _ = out_tx.send(crate::p2p::P2pOutbound::VoiceEnd {
+                    stream_id,
+                    duration_ms,
+                    recipients,
+                });
                 let _ = done_tx.send((stream_id, duration_ms, plaintext_accum));
                 break; // `recorder` drops here, closing the input stream.
             }
@@ -281,12 +332,20 @@ pub(crate) struct ChunkDecryptor {
 
 impl ChunkDecryptor {
     pub(crate) fn new(key: IncomingStreamKey) -> Self {
-        Self { key, pq_k_data: None }
+        Self {
+            key,
+            pq_k_data: None,
+        }
     }
 
     /// Decrypts one chunk's `blocks`, `None` on any failure (wrong/stale
     /// key, corrupted chunk, bad AEAD tag, ...).
-    pub(crate) fn decrypt(&mut self, stream_id: u64, seq: u32, blocks: &[Vec<u8>]) -> Option<Vec<u8>> {
+    pub(crate) fn decrypt(
+        &mut self,
+        stream_id: u64,
+        seq: u32,
+        blocks: &[Vec<u8>],
+    ) -> Option<Vec<u8>> {
         match &self.key {
             // Tries each candidate key in turn (current, retained,
             // bootstrap - see `rekey::OwnKeys::candidate_privates_for`)
@@ -294,12 +353,22 @@ impl ChunkDecryptor {
             // started right after an optimistically-installed-but-not-yet-
             // accepted rsa_per_msg resume still decrypts correctly instead
             // of silently failing every chunk.
-            IncomingStreamKey::Rsa(privates) => privates.iter().find_map(|k| crypto::decrypt_chunked(k, blocks).ok()),
-            IncomingStreamKey::Pq { my_private, sender_public } => {
+            IncomingStreamKey::Rsa(privates) => privates
+                .iter()
+                .find_map(|k| crypto::decrypt_chunked(k, blocks).ok()),
+            IncomingStreamKey::Pq {
+                my_private,
+                sender_public,
+            } => {
                 let blob = blocks.first()?;
                 let chunk: crypto::pq::HybridVoiceChunk = proto::decode(blob).ok()?;
                 if self.pq_k_data.is_none() {
-                    self.pq_k_data = crypto::pq::unwrap_key_for_stream(my_private, sender_public, stream_id, &chunk.key_setup);
+                    self.pq_k_data = crypto::pq::unwrap_key_for_stream(
+                        my_private,
+                        sender_public,
+                        stream_id,
+                        &chunk.key_setup,
+                    );
                 }
                 let k_data = self.pq_k_data.as_ref()?;
                 crypto::pq::decrypt_hybrid_chunk(k_data, stream_id, seq, &chunk.ciphertext)
@@ -340,7 +409,10 @@ pub(crate) fn spawn_stream_decrypt_worker(
                         plaintext_accum.extend_from_slice(&pcm);
                         if !suppress_playback {
                             let samples = voice::pcm_from_bytes(&pcm);
-                            let _ = mixer_tx.send(voice::MixerCmd::Push { id: mixer_id, samples });
+                            let _ = mixer_tx.send(voice::MixerCmd::Push {
+                                id: mixer_id,
+                                samples,
+                            });
                         }
                         // Defense in depth (docs/PROTOCOL.md §7.3): never
                         // accept more than `voice::MAX_RECORDING_SAMPLES` of
@@ -351,9 +423,11 @@ pub(crate) fn spawn_stream_decrypt_worker(
                         // as if a real `*End` had just arrived.
                         let sample_count = (plaintext_accum.len() / 2) as u64;
                         if voice::recording_at_max(sample_count) {
-                            let duration_ms = ((sample_count * 1000) / voice::SAMPLE_RATE_HZ as u64) as u32;
+                            let duration_ms =
+                                ((sample_count * 1000) / voice::SAMPLE_RATE_HZ as u64) as u32;
                             let _ = mixer_tx.send(voice::MixerCmd::Finish { id: mixer_id });
-                            let _ = finished_tx.send((from, stream_id, duration_ms, plaintext_accum));
+                            let _ =
+                                finished_tx.send((from, stream_id, duration_ms, plaintext_accum));
                             break;
                         }
                     }
@@ -425,7 +499,9 @@ pub(crate) fn resolve_direct_key(
             let pq = build_pq_stream_out(session, stream_id, &[(to, public)])?;
             Some(DirectStreamKey::Pq(pq))
         }
-        _ => crypto::public_key_from_der(recipient_pubkey_der).ok().map(DirectStreamKey::Rsa),
+        _ => crypto::public_key_from_der(recipient_pubkey_der)
+            .ok()
+            .map(DirectStreamKey::Rsa),
     }
 }
 
@@ -440,10 +516,20 @@ pub(crate) fn resolve_direct_key(
 /// `sender_public_key_der` is the sender's `UserInfo.public_key_der`
 /// (whatever `key_mode` they announced) - only actually used when *our own*
 /// `own_key_mode` is `PqHybrid`, to verify the once-per-stream signature.
-pub(crate) fn resolve_incoming_key(session: &SessionState, from: UserId, sender_public_key_der: &[u8]) -> IncomingStreamKey {
+pub(crate) fn resolve_incoming_key(
+    session: &SessionState,
+    from: UserId,
+    sender_public_key_der: &[u8],
+) -> IncomingStreamKey {
     if session.own_key_mode == KeyMode::PqHybrid {
-        match (session.own_pq_private.clone(), proto::decode(sender_public_key_der)) {
-            (Some(my_private), Ok(sender_public)) => IncomingStreamKey::Pq { my_private, sender_public },
+        match (
+            session.own_pq_private.clone(),
+            proto::decode(sender_public_key_der),
+        ) {
+            (Some(my_private), Ok(sender_public)) => IncomingStreamKey::Pq {
+                my_private,
+                sender_public,
+            },
             // Malformed sender key, or (shouldn't happen) no own PQ
             // identity despite `own_key_mode == PqHybrid` - nothing
             // decryptable either way, so every chunk will just fail to
@@ -487,10 +573,23 @@ pub(crate) fn start_incoming_stream(
         suppress_playback,
         session.stream_finished_tx.clone(),
     );
-    session.active_streams.insert((from, stream_id), ActiveStream { job_tx, channel, last_seen: Instant::now() });
+    session.active_streams.insert(
+        (from, stream_id),
+        ActiveStream {
+            job_tx,
+            channel,
+            last_seen: Instant::now(),
+        },
+    );
 }
 
-pub(crate) fn forward_chunk(session: &mut SessionState, from: UserId, stream_id: u64, seq: u32, blocks: Vec<Vec<u8>>) {
+pub(crate) fn forward_chunk(
+    session: &mut SessionState,
+    from: UserId,
+    stream_id: u64,
+    seq: u32,
+    blocks: Vec<Vec<u8>>,
+) {
     if let Some(s) = session.active_streams.get_mut(&(from, stream_id)) {
         s.last_seen = Instant::now();
         let _ = s.job_tx.send(DecryptJob::Chunk(seq, blocks));

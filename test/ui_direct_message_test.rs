@@ -3,10 +3,10 @@ mod ui_common;
 use ui_common::*;
 
 use aloo::proto::{KeyMode, UserId};
-use aloo::ui::ui::{render, Focus, IdentityCase, MessageBody, UiAction, VoiceTarget};
+use aloo::ui::ui::{Focus, IdentityCase, MessageBody, UiAction, VoiceTarget, render};
 use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
-use ratatui::backend::TestBackend;
 use ratatui::Terminal;
+use ratatui::backend::TestBackend;
 
 /// @requirement AC-029
 #[test]
@@ -44,7 +44,12 @@ fn opening_dm_from_sidebar_and_sending_a_message() {
     type_str(&mut state, "just us");
     let action = press(&mut state, KeyCode::Enter).unwrap();
     match action {
-        UiAction::SendDirectText { to, plaintext, recipient_key_mode, recipient_pubkey_der } => {
+        UiAction::SendDirectText {
+            to,
+            plaintext,
+            recipient_key_mode,
+            recipient_pubkey_der,
+        } => {
             assert_eq!(to, UserId(2));
             assert_eq!(plaintext, "just us");
             assert_eq!(recipient_key_mode, KeyMode::Rsa);
@@ -100,11 +105,21 @@ fn compose_bar_ignores_typing_and_enter_while_the_open_dm_peer_is_offline() {
     assert_eq!(state.focus, Focus::Input);
 
     type_str(&mut state, "are you there");
-    assert_eq!(state.input, "", "typing must be a no-op while the DM peer is offline");
+    assert_eq!(
+        state.input, "",
+        "typing must be a no-op while the DM peer is offline"
+    );
 
     let action = press(&mut state, KeyCode::Enter);
-    assert_eq!(action, None, "Enter must not send while the DM peer is offline");
-    assert_eq!(state.private_rooms[&UserId(2)].log.len(), 1, "only bob's earlier message, nothing sent by us");
+    assert_eq!(
+        action, None,
+        "Enter must not send while the DM peer is offline"
+    );
+    assert_eq!(
+        state.private_rooms[&UserId(2)].log.len(),
+        1,
+        "only bob's earlier message, nothing sent by us"
+    );
 }
 
 /// @requirement TB-105
@@ -141,14 +156,22 @@ fn space_release_targets_active_private_room_instead_of_channel() {
 
     let start = state.handle_key(KeyCode::Char(' '), KeyModifiers::NONE, KeyEventKind::Press);
     match start {
-        Some(UiAction::VoiceRecordStart(VoiceTarget::Direct { to, recipient_key_mode, recipient_pubkey_der })) => {
+        Some(UiAction::VoiceRecordStart(VoiceTarget::Direct {
+            to,
+            recipient_key_mode,
+            recipient_pubkey_der,
+        })) => {
             assert_eq!(to, UserId(2));
             assert_eq!(recipient_key_mode, KeyMode::Rsa);
             assert_eq!(recipient_pubkey_der, user(2, "bob").public_key_der);
         }
         other => panic!("expected VoiceRecordStart(Direct), got {other:?}"),
     }
-    let stop = state.handle_key(KeyCode::Char(' '), KeyModifiers::NONE, KeyEventKind::Release);
+    let stop = state.handle_key(
+        KeyCode::Char(' '),
+        KeyModifiers::NONE,
+        KeyEventKind::Release,
+    );
     assert_eq!(stop, Some(UiAction::VoiceRecordStop));
 }
 
@@ -161,7 +184,11 @@ fn global_record_start_targets_the_active_private_room() {
 
     let start = state.global_record_start();
     match start {
-        Some(UiAction::VoiceRecordStart(VoiceTarget::Direct { to, recipient_key_mode, recipient_pubkey_der })) => {
+        Some(UiAction::VoiceRecordStart(VoiceTarget::Direct {
+            to,
+            recipient_key_mode,
+            recipient_pubkey_der,
+        })) => {
             assert_eq!(to, UserId(2));
             assert_eq!(recipient_key_mode, KeyMode::Rsa);
             assert_eq!(recipient_pubkey_der, user(2, "bob").public_key_der);
@@ -183,7 +210,10 @@ fn space_press_with_an_offline_dm_peer_is_ignored_and_does_not_start_recording()
     state.focus = Focus::Messages; // push-to-talk is only live outside the compose bar
 
     let action = state.handle_key(KeyCode::Char(' '), KeyModifiers::NONE, KeyEventKind::Press);
-    assert_eq!(action, None, "voice recording to an offline peer must be ignored, not started");
+    assert_eq!(
+        action, None,
+        "voice recording to an offline peer must be ignored, not started"
+    );
     assert!(!state.recording);
 }
 
@@ -197,11 +227,20 @@ fn on_direct_stream_start_and_finished_swap_the_placeholder_body_in_place() {
     let mut state = joined_general_with(vec![user(2, "bob")]);
     state.on_direct_stream_start(UserId(2), UserId(2), "bob".into(), 5);
     let room = state.private_rooms.get(&UserId(2)).unwrap();
-    assert_eq!(room.log[0].body, MessageBody::VoiceStreaming { stream_id: 5 });
+    assert_eq!(
+        room.log[0].body,
+        MessageBody::VoiceStreaming { stream_id: 5 }
+    );
 
     state.on_direct_stream_finished(UserId(2), UserId(2), 5, 1000, vec![1]);
     let room = state.private_rooms.get(&UserId(2)).unwrap();
-    assert_eq!(room.log[0].body, MessageBody::Voice { duration_ms: 1000, pcm: vec![1] });
+    assert_eq!(
+        room.log[0].body,
+        MessageBody::Voice {
+            duration_ms: 1000,
+            pcm: vec![1]
+        }
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -219,7 +258,10 @@ fn opening_a_private_room_with_existing_history_starts_on_the_newest_message() {
     state.focus = Focus::Sidebar;
     press(&mut state, KeyCode::Enter); // opens the DM with bob
     assert_eq!(state.active_private_room, Some(UserId(2)));
-    assert_eq!(state.message_selected, 2, "opening the room should land on its newest message, not entry 0");
+    assert_eq!(
+        state.message_selected, 2,
+        "opening the room should land on its newest message, not entry 0"
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -233,7 +275,10 @@ fn private_room_title_shows_the_peers_rsa_per_msg_tag_after_their_name() {
     state.focus = Focus::Sidebar;
     press(&mut state, KeyCode::Enter); // opens DM with bob
     let rows = rendered_rows(&state);
-    assert!(rows.iter().any(|r| r.contains("Private: bob")), "expected the title to lead with the name: {rows:?}");
+    assert!(
+        rows.iter().any(|r| r.contains("Private: bob")),
+        "expected the title to lead with the name: {rows:?}"
+    );
     assert!(
         appears_before(&rows, "bob", "RSAPM"),
         "expected the private room title to show bob's tag after his name: {rows:?}"
@@ -281,7 +326,10 @@ fn identity_review_popup_also_shows_over_an_open_private_room() {
         UserId(3),
         "carol".into(),
         "'carol' connected with a different key than last time".into(),
-        IdentityCase::StaticMismatch { new_public_key_der: vec![9, 9, 9], previous_public_key_der: vec![1, 1, 1] },
+        IdentityCase::StaticMismatch {
+            new_public_key_der: vec![9, 9, 9],
+            previous_public_key_der: vec![1, 1, 1],
+        },
     );
     let rows = rendered_rows(&state);
     assert!(

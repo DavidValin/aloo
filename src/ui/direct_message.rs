@@ -4,14 +4,14 @@
 //! stays in `crate::ui::ui`; channel-tab state/rendering is the mirror
 //! image in `crate::ui::channel`.
 
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::Frame;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 
 use crate::proto::{KeyMode, UserId, UserInfo};
 
 use super::ui::{
-    finalize_held_stream, finalize_stream_entry, push_log_entry, render_input_bar, render_messages, FileTransferStatus,
-    Focus, LogEntry, MessageBody, UiState,
+    FileTransferStatus, Focus, LogEntry, MessageBody, UiState, finalize_held_stream,
+    finalize_stream_entry, push_log_entry, render_input_bar, render_messages,
 };
 
 #[derive(Debug, Clone)]
@@ -27,7 +27,9 @@ impl UiState {
     /// (`render_input_bar`). `false` whenever no private room is open, so
     /// callers don't need to check `active_private_room` separately.
     pub(crate) fn active_dm_peer_offline(&self) -> bool {
-        self.active_private_room.map(|id| self.offline.contains(&id)).unwrap_or(false)
+        self.active_private_room
+            .map(|id| self.offline.contains(&id))
+            .unwrap_or(false)
     }
 
     /// Whether the currently-open private room's peer has a Pending/Rejected
@@ -35,16 +37,19 @@ impl UiState {
     /// `active_dm_peer_offline`, for a room that was already open before the
     /// mismatch arrived (normal navigation can no longer open a new one).
     pub(crate) fn active_dm_peer_trust_gated(&self) -> bool {
-        self.active_private_room.map(|id| self.is_trust_gated(id)).unwrap_or(false)
+        self.active_private_room
+            .map(|id| self.is_trust_gated(id))
+            .unwrap_or(false)
     }
 
     pub(crate) fn open_private_room(&mut self, peer: UserInfo) {
         let id = peer.id;
         self.known_users.insert(id, peer.clone());
-        let room = self
-            .private_rooms
-            .entry(id)
-            .or_insert_with(|| PrivateRoom { peer: peer.clone(), log: Vec::new(), unread: false });
+        let room = self.private_rooms.entry(id).or_insert_with(|| PrivateRoom {
+            peer: peer.clone(),
+            log: Vec::new(),
+            unread: false,
+        });
         room.peer = peer;
         room.unread = false;
         let log_len = room.log.len();
@@ -61,7 +66,13 @@ impl UiState {
     }
 
     pub fn on_direct_message(&mut self, from: UserId, from_name: String, body: MessageBody) {
-        let entry = LogEntry { from, from_name: from_name.clone(), to_name: None, body, outgoing: false };
+        let entry = LogEntry {
+            from,
+            from_name: from_name.clone(),
+            to_name: None,
+            body,
+            outgoing: false,
+        };
         // Same hold-and-reveal treatment as a channel message
         // (docs/PROTOCOL.md §12) - decrypts fine (our own key), but not
         // shown until `from` is Accepted. The room still isn't created yet
@@ -86,7 +97,11 @@ impl UiState {
         let room = self
             .private_rooms
             .entry(from)
-            .or_insert_with(|| PrivateRoom { peer: fallback_peer, log: Vec::new(), unread: false });
+            .or_insert_with(|| PrivateRoom {
+                peer: fallback_peer,
+                log: Vec::new(),
+                unread: false,
+            });
         push_log_entry(&mut room.log, &mut self.message_selected, is_current, entry);
         if unread {
             room.unread = true;
@@ -102,7 +117,13 @@ impl UiState {
                 &mut room.log,
                 &mut self.message_selected,
                 is_current,
-                LogEntry { from, from_name, to_name: None, body: MessageBody::Voice { duration_ms, pcm }, outgoing: true },
+                LogEntry {
+                    from,
+                    from_name,
+                    to_name: None,
+                    body: MessageBody::Voice { duration_ms, pcm },
+                    outgoing: true,
+                },
             );
         }
     }
@@ -116,22 +137,42 @@ impl UiState {
                 &mut room.log,
                 &mut self.message_selected,
                 is_current,
-                LogEntry { from, from_name, to_name: None, body: MessageBody::VoiceStreaming { stream_id }, outgoing: true },
+                LogEntry {
+                    from,
+                    from_name,
+                    to_name: None,
+                    body: MessageBody::VoiceStreaming { stream_id },
+                    outgoing: true,
+                },
             );
         }
     }
 
-    pub fn on_direct_stream_start(&mut self, peer_id: UserId, from: UserId, from_name: String, stream_id: u64) {
-        let entry =
-            LogEntry { from, from_name: from_name.clone(), to_name: None, body: MessageBody::VoiceStreaming { stream_id }, outgoing: false };
+    pub fn on_direct_stream_start(
+        &mut self,
+        peer_id: UserId,
+        from: UserId,
+        from_name: String,
+        stream_id: u64,
+    ) {
+        let entry = LogEntry {
+            from,
+            from_name: from_name.clone(),
+            to_name: None,
+            body: MessageBody::VoiceStreaming { stream_id },
+            outgoing: false,
+        };
         if self.is_trust_gated(peer_id) {
             self.hold_message(peer_id, None, entry);
             return;
         }
         let unread = self.active_private_room != Some(peer_id);
         let is_current = self.is_viewing_dm(peer_id);
-        let fallback_peer =
-            self.known_users.get(&peer_id).cloned().unwrap_or_else(|| UserInfo {
+        let fallback_peer = self
+            .known_users
+            .get(&peer_id)
+            .cloned()
+            .unwrap_or_else(|| UserInfo {
                 id: peer_id,
                 name: from_name.clone(),
                 public_key_der: Vec::new(),
@@ -140,7 +181,11 @@ impl UiState {
         let room = self
             .private_rooms
             .entry(peer_id)
-            .or_insert_with(|| PrivateRoom { peer: fallback_peer, log: Vec::new(), unread: false });
+            .or_insert_with(|| PrivateRoom {
+                peer: fallback_peer,
+                log: Vec::new(),
+                unread: false,
+            });
         push_log_entry(&mut room.log, &mut self.message_selected, is_current, entry);
         if unread {
             room.unread = true;
@@ -180,7 +225,13 @@ impl UiState {
                 &mut room.log,
                 &mut self.message_selected,
                 is_current,
-                LogEntry { from, from_name, to_name: None, body, outgoing: true },
+                LogEntry {
+                    from,
+                    from_name,
+                    to_name: None,
+                    body,
+                    outgoing: true,
+                },
             );
         }
     }
@@ -188,7 +239,13 @@ impl UiState {
     /// DM counterpart of `channel::log_own_file_offer_channel` - a DM room
     /// only ever has one recipient, so there's nothing for `to_name` to
     /// name (the room itself already does).
-    pub fn log_own_file_offer_dm(&mut self, to: UserId, stream_id: u64, filename: String, total: u64) {
+    pub fn log_own_file_offer_dm(
+        &mut self,
+        to: UserId,
+        stream_id: u64,
+        filename: String,
+        total: u64,
+    ) {
         let from = self.own_id.unwrap_or(UserId(0));
         let from_name = self.own_name.clone();
         let is_current = self.is_viewing_dm(to);
@@ -201,7 +258,12 @@ impl UiState {
                     from,
                     from_name,
                     to_name: None,
-                    body: MessageBody::File { filename, total, stream_id, status: FileTransferStatus::Pending },
+                    body: MessageBody::File {
+                        filename,
+                        total,
+                        stream_id,
+                        status: FileTransferStatus::Pending,
+                    },
                     outgoing: true,
                 },
             );
@@ -209,19 +271,34 @@ impl UiState {
     }
 
     /// DM counterpart of `channel::on_channel_file_offer_accepted`.
-    pub fn on_direct_file_offer_accepted(&mut self, from: UserId, from_name: String, stream_id: u64, filename: String, total: u64) {
+    pub fn on_direct_file_offer_accepted(
+        &mut self,
+        from: UserId,
+        from_name: String,
+        stream_id: u64,
+        filename: String,
+        total: u64,
+    ) {
         let unread = self.active_private_room != Some(from);
         let is_current = self.is_viewing_dm(from);
-        let fallback_peer = self.known_users.get(&from).cloned().unwrap_or_else(|| UserInfo {
-            id: from,
-            name: from_name.clone(),
-            public_key_der: Vec::new(),
-            key_mode: KeyMode::None,
-        });
+        let fallback_peer = self
+            .known_users
+            .get(&from)
+            .cloned()
+            .unwrap_or_else(|| UserInfo {
+                id: from,
+                name: from_name.clone(),
+                public_key_der: Vec::new(),
+                key_mode: KeyMode::None,
+            });
         let room = self
             .private_rooms
             .entry(from)
-            .or_insert_with(|| PrivateRoom { peer: fallback_peer, log: Vec::new(), unread: false });
+            .or_insert_with(|| PrivateRoom {
+                peer: fallback_peer,
+                log: Vec::new(),
+                unread: false,
+            });
         push_log_entry(
             &mut room.log,
             &mut self.message_selected,
@@ -230,7 +307,12 @@ impl UiState {
                 from,
                 from_name,
                 to_name: None,
-                body: MessageBody::File { filename, total, stream_id, status: FileTransferStatus::InProgress { bytes: 0 } },
+                body: MessageBody::File {
+                    filename,
+                    total,
+                    stream_id,
+                    status: FileTransferStatus::InProgress { bytes: 0 },
+                },
                 outgoing: false,
             },
         );
@@ -246,7 +328,10 @@ impl UiState {
 
 pub(crate) fn render_private_room(frame: &mut Frame, area: Rect, state: &UiState, peer_id: UserId) {
     let constraints = [Constraint::Min(3), Constraint::Length(3)];
-    let rows = Layout::default().direction(Direction::Vertical).constraints(constraints).split(area);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(area);
     render_messages(frame, rows[0], state, Some(peer_id));
     render_input_bar(frame, rows[1], state);
 }

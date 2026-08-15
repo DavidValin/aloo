@@ -1,11 +1,11 @@
 use aloo::ui::ui_connect_popup::{
-    render, Action, ConnectPopupState, ConnectRequest, Field, FileBrowserState, KeyType, MyKeySelection,
-    MyKeyType, ServerKeySelection, NICKNAME_MAX_LEN,
+    Action, ConnectPopupState, ConnectRequest, Field, FileBrowserState, KeyType, MyKeySelection,
+    MyKeyType, NICKNAME_MAX_LEN, ServerKeySelection, render,
 };
 use crossterm::event::KeyCode;
+use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::style::Color;
-use ratatui::Terminal;
 use std::path::PathBuf;
 
 fn type_str(state: &mut ConnectPopupState, s: &str) {
@@ -132,7 +132,11 @@ fn focus_next_and_prev_wrap_around() {
     let mut state = ConnectPopupState::new();
     assert_eq!(state.focus, Field::Host);
     state.focus_prev();
-    assert_eq!(state.focus, Field::Connect, "prev from the first field wraps to the last");
+    assert_eq!(
+        state.focus,
+        Field::Connect,
+        "prev from the first field wraps to the last"
+    );
     state.focus_next();
     assert_eq!(state.focus, Field::Host);
 }
@@ -181,7 +185,10 @@ fn typing_fills_nickname_field_and_rejects_whitespace() {
     let mut state = ConnectPopupState::new();
     state.focus = Field::Nickname;
     type_str(&mut state, "dave the");
-    assert_eq!(state.nickname, "davethe", "spaces must not be allowed in a nickname");
+    assert_eq!(
+        state.nickname, "davethe",
+        "spaces must not be allowed in a nickname"
+    );
 }
 
 /// @requirement AC-003
@@ -212,13 +219,22 @@ fn own_next_keys_path_is_prefilled_from_the_default_path() {
 #[test]
 fn own_next_keys_path_is_only_focusable_when_my_key_is_rsa_per_msg() {
     let mut state = ConnectPopupState::new();
-    assert!(!state.focus_order().contains(&Field::OwnNextKeysPath), "not shown for the default (pq_hybrid) type");
+    assert!(
+        !state.focus_order().contains(&Field::OwnNextKeysPath),
+        "not shown for the default (pq_hybrid) type"
+    );
     state.my_key.key_type = MyKeyType::RsaPerMessage;
     assert!(state.focus_order().contains(&Field::OwnNextKeysPath));
     state.my_key.key_type = MyKeyType::None;
-    assert!(!state.focus_order().contains(&Field::OwnNextKeysPath), "not shown for none");
+    assert!(
+        !state.focus_order().contains(&Field::OwnNextKeysPath),
+        "not shown for none"
+    );
     state.my_key.key_type = MyKeyType::Rsa;
-    assert!(!state.focus_order().contains(&Field::OwnNextKeysPath), "not shown for rsa either");
+    assert!(
+        !state.focus_order().contains(&Field::OwnNextKeysPath),
+        "not shown for rsa either"
+    );
     state.my_key.key_type = MyKeyType::RsaPerMessage;
     assert!(state.focus_order().contains(&Field::OwnNextKeysPath));
 }
@@ -277,17 +293,30 @@ fn render_shows_own_next_keys_field_when_rsa_per_msg_is_selected() {
     terminal.draw(|f| render(f, &state)).unwrap();
     let buffer = terminal.backend().buffer().clone();
     let rows: Vec<String> = (0..buffer.area.height)
-        .map(|y| (0..buffer.area.width).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
         .collect();
-    assert!(rows.iter().any(|r| r.contains("own_next_keys")), "expected the own_next_keys field: {rows:?}");
+    assert!(
+        rows.iter().any(|r| r.contains("own_next_keys")),
+        "expected the own_next_keys field: {rows:?}"
+    );
 }
 
 /// @requirement AC-005
 #[test]
 fn id_store_path_is_prefilled_from_the_default_path() {
     let state = ConnectPopupState::new();
-    assert!(!state.id_store_path.is_empty(), "id_store should be prefilled, not left blank");
-    assert_eq!(state.id_store_path, aloo::idstore::default_path().display().to_string());
+    assert!(
+        !state.id_store_path.is_empty(),
+        "id_store should be prefilled, not left blank"
+    );
+    assert_eq!(
+        state.id_store_path,
+        aloo::idstore::default_path().display().to_string()
+    );
 }
 
 /// @requirement AC-005, TB-012
@@ -435,10 +464,15 @@ fn build_request_succeeds_with_rsa_per_msg_using_the_prefilled_own_next_keys_pat
     state.port = "9000".into();
     state.nickname = "dave".into();
     state.my_key.key_type = MyKeyType::RsaPerMessage;
-    let req = state.build_request().expect("rsa_per_msg's own_next_keys_path is prefilled, so no typing needed");
+    let req = state
+        .build_request()
+        .expect("rsa_per_msg's own_next_keys_path is prefilled, so no typing needed");
     match req.my_key {
         MyKeySelection::RsaPerMessage { own_next_keys_path } => {
-            assert_eq!(own_next_keys_path, PathBuf::from(&state.my_key.own_next_keys_path));
+            assert_eq!(
+                own_next_keys_path,
+                PathBuf::from(&state.my_key.own_next_keys_path)
+            );
             assert!(!own_next_keys_path.as_os_str().is_empty());
         }
         other => panic!("expected RsaPerMessage, got {other:?}"),
@@ -464,7 +498,10 @@ fn build_request_succeeds_with_password_and_rsa_mix() {
     state.my_key.file_priv = "/keys/id_rsa".into();
 
     let req = state.build_request().expect("should be valid");
-    assert_eq!(req.server_key, ServerKeySelection::Password("hunter2".into()));
+    assert_eq!(
+        req.server_key,
+        ServerKeySelection::Password("hunter2".into())
+    );
     assert_eq!(
         req.my_key,
         MyKeySelection::Rsa {
@@ -559,7 +596,11 @@ fn enter_on_rsa_server_key_value_opens_file_browser() {
 // ---------------------------------------------------------------------
 
 fn make_tree() -> PathBuf {
-    let root = std::env::temp_dir().join(format!("aloo-ui-popup-test-{}-{}", std::process::id(), fastrand_seed()));
+    let root = std::env::temp_dir().join(format!(
+        "aloo-ui-popup-test-{}-{}",
+        std::process::id(),
+        fastrand_seed()
+    ));
     let sub = root.join("subdir");
     std::fs::create_dir_all(&sub).unwrap();
     std::fs::write(root.join("file.txt"), b"hello").unwrap();
@@ -570,7 +611,10 @@ fn make_tree() -> PathBuf {
 // tiny non-cryptographic unique suffix so parallel test runs don't collide
 fn fastrand_seed() -> u128 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
 }
 
 /// @requirement TB-007
@@ -626,7 +670,10 @@ fn file_browser_new_navigation_clears_forward_history() {
     // now there is forward history (subdir); navigating elsewhere should clear it
     browser.selected = 0; // ".." — navigate to parent, a fresh navigation
     browser.navigate_into_selected().unwrap();
-    assert!(!browser.go_forward().unwrap(), "forward history should have been invalidated");
+    assert!(
+        !browser.go_forward().unwrap(),
+        "forward history should have been invalidated"
+    );
     std::fs::remove_dir_all(&root).ok();
 }
 
@@ -636,7 +683,10 @@ fn file_browser_selected_path_resolves_dotdot_to_parent() {
     let root = make_tree();
     let browser = FileBrowserState::open(root.clone()).unwrap();
     assert_eq!(browser.selected_entry().unwrap().name, "..");
-    assert_eq!(browser.selected_path().unwrap(), root.parent().unwrap().to_path_buf());
+    assert_eq!(
+        browser.selected_path().unwrap(),
+        root.parent().unwrap().to_path_buf()
+    );
     std::fs::remove_dir_all(&root).ok();
 }
 
@@ -672,8 +722,14 @@ fn selecting_a_file_in_browser_applies_it_to_the_popup_field() {
     state.handle_key(KeyCode::Down).unwrap();
     state.handle_key(KeyCode::Enter).unwrap();
 
-    assert!(state.browser.is_none(), "selecting a file should close the browser");
-    assert_eq!(state.server_key.file, root.join("file.txt").display().to_string());
+    assert!(
+        state.browser.is_none(),
+        "selecting a file should close the browser"
+    );
+    assert_eq!(
+        state.server_key.file,
+        root.join("file.txt").display().to_string()
+    );
 
     std::fs::remove_dir_all(&root).ok();
 }
@@ -689,7 +745,13 @@ fn render_does_not_panic_for_every_key_type_combination() {
     let backend = TestBackend::new(80, 24);
     let mut terminal = Terminal::new(backend).unwrap();
     for server_kind in [KeyType::None, KeyType::Password, KeyType::Rsa] {
-        for my_kind in [MyKeyType::None, MyKeyType::Password, MyKeyType::Rsa, MyKeyType::RsaPerMessage, MyKeyType::PqHybrid] {
+        for my_kind in [
+            MyKeyType::None,
+            MyKeyType::Password,
+            MyKeyType::Rsa,
+            MyKeyType::RsaPerMessage,
+            MyKeyType::PqHybrid,
+        ] {
             let mut state = ConnectPopupState::new();
             state.server_key.key_type = server_kind;
             state.my_key.key_type = my_kind;
@@ -726,14 +788,21 @@ fn render_shows_a_connect_button() {
         }
         rows.push(row);
     }
-    assert!(rows.iter().any(|row| row.contains("Connect")), "expected a visible Connect button");
+    assert!(
+        rows.iter().any(|row| row.contains("Connect")),
+        "expected a visible Connect button"
+    );
 }
 
 /// @requirement AC-001
 #[test]
 fn popup_opens_with_the_cursor_focused_in_the_host_box() {
     let state = ConnectPopupState::new();
-    assert_eq!(state.focus, Field::Host, "host must be the default focus when the popup opens");
+    assert_eq!(
+        state.focus,
+        Field::Host,
+        "host must be the default focus when the popup opens"
+    );
 
     let backend = TestBackend::new(80, 30);
     let mut terminal = Terminal::new(backend).unwrap();
@@ -744,11 +813,22 @@ fn popup_opens_with_the_cursor_focused_in_the_host_box() {
     // top border.
     let buffer = terminal.backend().buffer().clone();
     let host_title_row = (0..buffer.area.height)
-        .find(|&y| (0..buffer.area.width).map(|x| buffer[(x, y)].symbol()).collect::<String>().contains("host"))
+        .find(|&y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+                .contains("host")
+        })
         .expect("expected a visible \"host\" box title");
 
-    let cursor = terminal.get_cursor_position().expect("cursor should be set while a text field is focused");
-    assert_eq!(cursor.y, host_title_row + 1, "cursor should sit on the host field's content row");
+    let cursor = terminal
+        .get_cursor_position()
+        .expect("cursor should be set while a text field is focused");
+    assert_eq!(
+        cursor.y,
+        host_title_row + 1,
+        "cursor should sit on the host field's content row"
+    );
 }
 
 /// @requirement AC-002
@@ -760,17 +840,27 @@ fn host_port_and_nickname_are_each_individually_bordered() {
     terminal.draw(|f| render(f, &state)).unwrap();
     let buffer = terminal.backend().buffer().clone();
     let rows: Vec<String> = (0..buffer.area.height)
-        .map(|y| (0..buffer.area.width).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
         .collect();
 
     for title in ["host", "port", "nickname"] {
-        assert!(rows.iter().any(|r| r.contains(title)), "expected a \"{title}\" box title: {rows:?}");
+        assert!(
+            rows.iter().any(|r| r.contains(title)),
+            "expected a \"{title}\" box title: {rows:?}"
+        );
     }
     // each titled box is bordered on its own, not just sharing the outer
     // popup border - i.e. there's more than one box-drawing top-left
     // corner in the popup besides the outer one.
     let corner_rows = rows.iter().filter(|r| r.contains('┌')).count();
-    assert!(corner_rows >= 4, "expected the outer popup plus host/port/nickname to each have their own top border: {rows:?}");
+    assert!(
+        corner_rows >= 4,
+        "expected the outer popup plus host/port/nickname to each have their own top border: {rows:?}"
+    );
 }
 
 /// @requirement TB-011
@@ -783,10 +873,17 @@ fn popup_is_wider_than_the_original_fifty_columns() {
     let buffer = terminal.backend().buffer().clone();
 
     let top_border_width = (0..buffer.area.height)
-        .map(|y| (0..buffer.area.width).filter(|&x| buffer[(x, y)].symbol() == "─").count())
+        .map(|y| {
+            (0..buffer.area.width)
+                .filter(|&x| buffer[(x, y)].symbol() == "─")
+                .count()
+        })
         .max()
         .unwrap_or(0);
-    assert!(top_border_width > 48, "popup should be wider than the original 50-column box: {top_border_width}");
+    assert!(
+        top_border_width > 48,
+        "popup should be wider than the original 50-column box: {top_border_width}"
+    );
 }
 
 /// @requirement AC-012
@@ -808,7 +905,9 @@ fn connect_button_highlight_does_not_bleed_into_its_border() {
     let mut last_match: Option<(u16, u16)> = None;
     for y in 1..buffer.area.height {
         for x in 0..buffer.area.width.saturating_sub(6) {
-            let word: String = (0..7).map(|i| buffer[(x + i, y)].symbol().to_string()).collect();
+            let word: String = (0..7)
+                .map(|i| buffer[(x + i, y)].symbol().to_string())
+                .collect();
             if word == "Connect" {
                 last_match = Some((x, y));
             }
@@ -816,7 +915,11 @@ fn connect_button_highlight_does_not_bleed_into_its_border() {
     }
     let (x, y) = last_match.expect("expected to find the rendered \"Connect\" button label");
     let text_bg = buffer[(x, y)].style().bg;
-    assert_eq!(text_bg, Some(Color::Green), "the focused button's text should be highlighted");
+    assert_eq!(
+        text_bg,
+        Some(Color::Green),
+        "the focused button's text should be highlighted"
+    );
     let border_bg = buffer[(x, y - 1)].style().bg;
     assert_ne!(
         border_bg,
@@ -846,7 +949,11 @@ fn render_with_open_file_browser_does_not_panic() {
 fn file_browser_render_scrolls_to_keep_the_selection_visible() {
     // More files than fit in the browser popup's visible height, so a
     // selection near the end starts out scrolled off screen.
-    let root = std::env::temp_dir().join(format!("aloo-ui-popup-scroll-test-{}-{}", std::process::id(), fastrand_seed()));
+    let root = std::env::temp_dir().join(format!(
+        "aloo-ui-popup-scroll-test-{}-{}",
+        std::process::id(),
+        fastrand_seed()
+    ));
     std::fs::create_dir_all(&root).unwrap();
     for i in 0..30 {
         std::fs::write(root.join(format!("file{i:02}.txt")), b"x").unwrap();
@@ -862,14 +969,21 @@ fn file_browser_render_scrolls_to_keep_the_selection_visible() {
 
     let mut state = ConnectPopupState::new();
     state.server_key.key_type = KeyType::Rsa;
-    state.browser = Some((aloo::ui::ui_connect_popup::FileBrowserTarget::ServerKeyFile, browser));
+    state.browser = Some((
+        aloo::ui::ui_connect_popup::FileBrowserTarget::ServerKeyFile,
+        browser,
+    ));
 
     let backend = TestBackend::new(80, 24);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal.draw(|f| render(f, &state)).unwrap();
     let buffer = terminal.backend().buffer().clone();
     let rows: Vec<String> = (0..buffer.area.height)
-        .map(|y| (0..buffer.area.width).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
         .collect();
 
     assert!(

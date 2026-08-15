@@ -14,15 +14,16 @@ pub mod p2p_reliable;
 pub mod platform;
 pub mod proto;
 pub mod rekey;
+pub mod server;
 pub mod session;
 pub mod settings;
 pub mod sysstats;
+pub mod ui;
+pub mod validation;
 pub mod voice;
 #[cfg(target_env = "musl")]
 mod voice_pulse;
 pub mod voice_stream;
-pub mod server;
-pub mod ui;
 
 /// Shared catch-all error type for the client's connection/session flow
 /// (`connect`, `session`) - not a meaningful domain error, just whatever

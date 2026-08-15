@@ -43,14 +43,30 @@ pub fn rotation_signing_payload(to: UserId, new_public_key_der: &[u8]) -> Vec<u8
 }
 
 /// Signs a rotation to `to` with the private key it replaces.
-pub fn sign_rotation(old_private: &RsaPrivateKey, to: UserId, new_public_key_der: &[u8]) -> crypto::Result<Vec<u8>> {
-    crypto::sign(old_private, &rotation_signing_payload(to, new_public_key_der))
+pub fn sign_rotation(
+    old_private: &RsaPrivateKey,
+    to: UserId,
+    new_public_key_der: &[u8],
+) -> crypto::Result<Vec<u8>> {
+    crypto::sign(
+        old_private,
+        &rotation_signing_payload(to, new_public_key_der),
+    )
 }
 
 /// Verifies a rotation addressed to `to` (the verifier's own id) against
 /// the public key currently trusted for its sender.
-pub fn verify_rotation(trusted_public: &RsaPublicKey, to: UserId, new_public_key_der: &[u8], signature: &[u8]) -> bool {
-    crypto::verify(trusted_public, &rotation_signing_payload(to, new_public_key_der), signature)
+pub fn verify_rotation(
+    trusted_public: &RsaPublicKey,
+    to: UserId,
+    new_public_key_der: &[u8],
+    signature: &[u8],
+) -> bool {
+    crypto::verify(
+        trusted_public,
+        &rotation_signing_payload(to, new_public_key_der),
+        signature,
+    )
 }
 
 /// Verifies a rotation and, only if valid, parses the new DER-encoded
@@ -165,7 +181,10 @@ pub struct OwnKeys {
 
 impl OwnKeys {
     pub fn new(bootstrap: RsaPrivateKey) -> Self {
-        Self { bootstrap, per_peer: HashMap::new() }
+        Self {
+            bootstrap,
+            per_peer: HashMap::new(),
+        }
     }
 
     /// Tries the private key currently active for `peer` first, then
@@ -218,7 +237,12 @@ impl OwnKeys {
     /// into the bounded retention ring (§11.7). No RSA computation happens
     /// here - just `HashMap`/`VecDeque` updates - so this is safe and fast
     /// to call while holding a shared lock (`session.rs`'s `Arc<Mutex<OwnKeys>>`).
-    pub fn install_rotated_key(&mut self, peer: UserId, new_private: RsaPrivateKey, new_public_der: Vec<u8>) {
+    pub fn install_rotated_key(
+        &mut self,
+        peer: UserId,
+        new_private: RsaPrivateKey,
+        new_public_der: Vec<u8>,
+    ) {
         match self.per_peer.get_mut(&peer) {
             Some(state) => {
                 let previous = std::mem::replace(&mut state.current, new_private);
@@ -229,7 +253,11 @@ impl OwnKeys {
             None => {
                 self.per_peer.insert(
                     peer,
-                    OwnPeerKeys { current: new_private, current_public_der: new_public_der, retained: VecDeque::new() },
+                    OwnPeerKeys {
+                        current: new_private,
+                        current_public_der: new_public_der,
+                        retained: VecDeque::new(),
+                    },
                 );
             }
         }
@@ -238,13 +266,19 @@ impl OwnKeys {
     /// `rotate_for_peer`, packaged as the `ClientMessage` ready to send.
     pub fn rotate_and_build_message(&mut self, peer: UserId) -> crypto::Result<ClientMessage> {
         let (new_public_key_der, signature) = self.rotate_for_peer(peer)?;
-        Ok(ClientMessage::RotateKey { to: peer, new_public_key_der, signature })
+        Ok(ClientMessage::RotateKey {
+            to: peer,
+            new_public_key_der,
+            signature,
+        })
     }
 
     /// The public key currently advertised to `peer`, if we've rotated for
     /// them at least once (test/debug convenience).
     pub fn current_public_der_for(&self, peer: UserId) -> Option<&[u8]> {
-        self.per_peer.get(&peer).map(|s| s.current_public_der.as_slice())
+        self.per_peer
+            .get(&peer)
+            .map(|s| s.current_public_der.as_slice())
     }
 
     /// The private key that would currently decrypt a brand-new message
@@ -327,7 +361,10 @@ impl RemoteKeys {
     /// tracked. Their bootstrap key (already known via `UserInfo`) is
     /// immediately usable once, so starts fresh. Idempotent.
     pub fn track(&mut self, peer: UserId) {
-        self.peers.entry(peer).or_insert_with(|| RemotePeerState { fresh: true, queue: VecDeque::new() });
+        self.peers.entry(peer).or_insert_with(|| RemotePeerState {
+            fresh: true,
+            queue: VecDeque::new(),
+        });
     }
 
     pub fn is_tracked(&self, peer: UserId) -> bool {
@@ -356,7 +393,14 @@ impl RemoteKeys {
     /// first we've heard of them (defensive - `track` should already have
     /// run from their `UserJoined`).
     pub fn enqueue(&mut self, peer: UserId, item: QueuedOutbound) {
-        self.peers.entry(peer).or_insert_with(|| RemotePeerState { fresh: false, queue: VecDeque::new() }).queue.push_back(item);
+        self.peers
+            .entry(peer)
+            .or_insert_with(|| RemotePeerState {
+                fresh: false,
+                queue: VecDeque::new(),
+            })
+            .queue
+            .push_back(item);
     }
 
     /// Call once a `KeyRotated` from `peer` has been validated and
@@ -366,7 +410,10 @@ impl RemoteKeys {
     /// anything from the returned batch, it must call `mark_used`
     /// afterward.
     pub fn on_rotated(&mut self, peer: UserId) -> Vec<QueuedOutbound> {
-        let state = self.peers.entry(peer).or_insert_with(|| RemotePeerState { fresh: true, queue: VecDeque::new() });
+        let state = self.peers.entry(peer).or_insert_with(|| RemotePeerState {
+            fresh: true,
+            queue: VecDeque::new(),
+        });
         state.fresh = true;
         std::mem::take(&mut state.queue).into_iter().collect()
     }

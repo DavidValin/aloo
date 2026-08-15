@@ -1,5 +1,6 @@
 use aloo::file_transfer::{
-    default_download_dir, safe_filename, truncate_filename, FileOfferPayload, FILE_CHUNK_BYTES, MAX_FILENAME_CHARS,
+    FILE_CHUNK_BYTES, FileOfferPayload, MAX_FILENAME_CHARS, default_download_dir, safe_filename,
+    truncate_filename,
 };
 use aloo::p2p_proto::SAFE_DATAGRAM_BYTES;
 use aloo::proto;
@@ -7,7 +8,10 @@ use aloo::proto;
 /// @requirement TB-123
 #[test]
 fn file_offer_payload_round_trips_through_proto_encode_decode() {
-    let payload = FileOfferPayload { filename: "report.pdf".to_string(), size: 12345 };
+    let payload = FileOfferPayload {
+        filename: "report.pdf".to_string(),
+        size: 12345,
+    };
     let bytes = proto::encode(&payload).expect("encode");
     let decoded: FileOfferPayload = proto::decode(&bytes).expect("decode");
     assert_eq!(decoded, payload);
@@ -57,7 +61,10 @@ fn truncate_filename_crops_a_long_name_at_the_end() {
     let exact = "b".repeat(MAX_FILENAME_CHARS);
     assert_eq!(truncate_filename(&exact), exact);
     let one_over = "b".repeat(MAX_FILENAME_CHARS + 1);
-    assert_eq!(truncate_filename(&one_over).chars().count(), MAX_FILENAME_CHARS);
+    assert_eq!(
+        truncate_filename(&one_over).chars().count(),
+        MAX_FILENAME_CHARS
+    );
 }
 
 /// @requirement TB-140

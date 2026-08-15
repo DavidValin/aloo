@@ -411,17 +411,37 @@ Reference implementation: `server::AuthConfig`, `server::Registry::try_register`
 A channel is identified purely by its `name: String` (no separate numeric
 ID) and is created implicitly by the first `JoinChannel` that references
 it - there is no separate "create channel" message. The server always
-seeds one channel, `"general"` (`ChannelKind::Public`), before any client
-connects.
+seeds one channel, `DEFAULT_CHANNEL_NAME` (`"the-hall"`, `ChannelKind::
+Public`), before any client connects - the one channel that survives being
+emptied (§6.2).
 
-### 6.1 `JoinChannel { name, kind }`
+A channel tab is shown prefixed with an emoji naming its kind at a glance,
+followed by a space before the name: 🌍 for public, 🔒 for private
+(`ui::channel::render_channel_view`).
 
-- If `name` doesn't exist yet, it's created with the given `kind`.
+### 6.1 `JoinChannel { name, kind, password }`
+
+- `name` must pass `validation::channel_name_is_valid`: non-empty, at most
+  `CHANNEL_NAME_MAX_LEN` (21) characters, and every character an ASCII
+  letter, digit, or `-`. This is enforced identically by the client (a
+  per-keystroke guard in the Ctrl+J popup that simply refuses to type an
+  invalid character or grow past the cap) and, independently, by the
+  server (`Registry::join_channel`, since the server never trusts the
+  client) - both call the same `validation` module so the two can't
+  silently disagree. A server-side rejection is `ChannelJoinFailed { name,
+  reason }`, same as any other failure below.
+- If `name` doesn't exist yet, it's created with the given `kind`, and
+  `password` (if `Some` and non-empty) becomes that channel's password -
+  see §6.5. A password given alongside `ChannelKind::Public` is silently
+  ignored; public channels are never password-protected.
 - If `name` already exists, the given `kind` is ignored - the channel
   keeps whatever kind it was created with. (There is no message to
-  change a channel's kind after creation.)
+  change a channel's kind or password after creation.) If it's a
+  password-protected private channel, `password` is instead checked
+  against the stored one - see §6.5.
 - Joining a channel you're already a member of is a no-op: no messages
-  are sent, not even a repeat `Joined`.
+  are sent, not even a repeat `Joined`. (A password is not re-checked for
+  an already-joined channel.)
 - On a genuinely new join, the server sends (there is no ordering
   guarantee *between* different recipients' messages - each client's
   outbound queue is independent - but the ordering *within* each
@@ -433,34 +453,60 @@ connects.
     them (§8) - followed, last, by exactly one
     `Joined { channel: ChannelInfo { name, kind } }`, the confirmation
     that the join itself succeeded. The joiner never receives a
-    `UserJoined` about themselves.
+    `UserJoined` about themselves. Since this snapshot arrives *before*
+    `Joined`, and a client may not have a local notion of `name` yet at
+    that point (a private channel is never pre-known via `ChannelList`; a
+    public one typed directly into Ctrl+J may not be either), the client
+    must create its local channel record on the first `UserJoined` for an
+    unrecognized name, not wait for `Joined` - `ui::UiState::on_user_joined`
+    does this (TB-159); waiting would silently lose the whole snapshot.
   - **Each existing member** receives exactly one
     `UserJoined { channel: name, user: <the new member's UserInfo> }`,
     telling them about the joiner (and the joiner's `public_key_der`, so
     they can now encrypt to the joiner too).
-- A `JoinChannel` for a `name` that fails for any reason (currently: the
-  only failure path is `join_channel`'s user-not-found case, which in
-  practice can't happen for an already-identified connection) results in
-  `ChannelJoinFailed { name, reason }` sent to the requester only.
+- A `JoinChannel` for a `name` that fails for a reason unrelated to a
+  channel password (currently: an invalid name, or `join_channel`'s
+  user-not-found case, which in practice can't happen for an
+  already-identified connection) results in `ChannelJoinFailed { name,
+  reason }` sent to the requester only. The password-specific outcomes
+  (§6.5/§6.6) instead use the typed `ChannelJoinRejected` variant.
 
 ### 6.2 `LeaveChannel { name }`
 
 Removes the sender from `name`'s membership, if they were a member (a
 no-op, no messages sent, if `name` doesn't exist or they weren't a
-member). Every *remaining* member receives `UserLeft { channel: name, user_id }`.
-An empty **private** channel is deleted outright (its next `JoinChannel`
-recreates it fresh, with no memory of previous membership). An empty
-**public** channel is *not* deleted - it stays listed in `ChannelList`
-forever (until server restart), simply with zero members.
+member). Every *remaining* member receives `UserLeft { channel: name,
+user_id }` - the leaver themselves gets no acknowledgment at all. An
+emptied channel is deleted outright - public or private alike - *unless*
+`name` is `DEFAULT_CHANNEL_NAME` (`"the-hall"`), which survives being
+empty forever (until server restart); any other channel's next
+`JoinChannel` recreates it fresh, with no memory of previous membership.
 
-### 6.3 `ChannelList(Vec<ChannelInfo>)`
+Since there's no server acknowledgment to the leaver, the client applies
+`/leave` optimistically: the moment it's submitted (`UiState::
+leave_channel_locally`), before the `LeaveChannel` write even reaches the
+server. A **private** channel's tab is removed from the client entirely -
+it's never re-advertised, so a ghost tab has nothing to reconnect it to. A
+**public** channel's tab instead stays, marked `left`: selecting it shows
+a rejoin prompt instead of the normal view (SPEC.md Functionality), and
+the dwell timer (§6's `[`/`]`) won't silently re-join it - only an
+explicit rejoin does. See §7.0.3 for what leaving does to any P2P links
+that were only justified by that channel's membership.
 
-Sent once, right after `IdentifyResult` (§4) - **public channels only**,
-sorted by name. There is no follow-up push when a new public channel is
-created by someone else joining it for the first time; a client only
-learns about channels it's told about at connect time or that it
-explicitly joins/is invited to know the name of (for private channels,
-purely out-of-band - the protocol has no "invite" message).
+### 6.3 `ChannelList(Vec<ChannelInfo>)` / `ChannelCreated { channel }`
+
+`ChannelList` is sent once, right after `IdentifyResult` (§4) - **public
+channels only**, sorted by name. `ChannelCreated { channel: ChannelInfo }`
+is the live follow-up: sent to every *other* currently-connected client
+the instant a genuinely new public channel is created (`Registry::
+join_channel`, `!existed_before && kind == Public`), so a channel created
+after the initial snapshot doesn't stay invisible to everyone who didn't
+create or join it. A **private** channel creation never triggers this -
+it stays unadvertised exactly as `ChannelList` already keeps it. Joining
+an *already-existing* channel (public or private) never re-triggers it
+either - only genuine creation does. Like every other channel-membership
+message, a client learns about a private channel only out-of-band (the
+protocol has no "invite" message).
 
 ### 6.4 `UserOffline { user_id }` - full disconnect
 
@@ -495,6 +541,78 @@ reachable, but still someone you've talked to." A client with no such
 history is free to (and, in the reference implementation, does) drop
 `user_id` from its channel member lists exactly as it would for
 `UserLeft`.
+
+### 6.5 Password-protected private channels
+
+A private channel may optionally be created with a password (Ctrl+J's
+popup, Private selected, a non-empty password typed). The password is
+fixed at creation, exactly like `kind` - there is no message to change or
+remove it afterward, and it is stored on the server only, never persisted
+to disk and never sent to anyone but the client that set it (the joiner
+still needs to already know it, out of band, exactly as they need to
+already know the channel's name).
+
+**Format** (`validation::channel_password_is_valid`, enforced identically
+client- and server-side, same reasoning as §6.1's name validation): at
+most `CHANNEL_PASSWORD_MAX_LEN` (50) characters, each an ASCII letter,
+digit, or one of `! @ # $ % ^ & * - _ + = . ,`. This applies only when a
+password is being *set* (channel creation) - a join-time guess is never
+format-checked, since any string is a valid attempt, right or wrong, and
+`crypto::constant_time_eq` simply returns false for a malformed one; a
+separate "malformed guess" error would be redundant with plain
+`WrongPassword` below.
+
+**Comparison** is constant-time (`crypto::constant_time_eq`, the same
+function and rationale as §5.2/TB-015's auth credential check), so a
+private channel's password can't be brute-forced by timing.
+
+**Outcomes**, on a `JoinChannel` against an existing password-protected
+channel by a non-member, before the ordinary join logic ever runs:
+
+```
+ChannelJoinRejected { name: String, kind: ChannelJoinRejection }
+
+enum ChannelJoinRejection {
+    PasswordRequired,  // no password was supplied at all
+    WrongPassword,      // a password was supplied but didn't match
+    Banned,              // see §6.6 - refused without even comparing
+}
+```
+
+sent to the requester only - like `ChannelJoinFailed`, nothing about a
+private channel's existence, membership, or password state leaks to
+anyone else through this. `PasswordRequired` does not count toward §6.6's
+attempt limit (an honest first-timer who didn't know a password was
+needed yet hasn't actually *guessed* wrong); only an actual mismatched
+guess does. A successful join resets that channel's attempt counter for
+the joining address to zero.
+
+Client-side, receiving any `ChannelJoinRejected` opens a dedicated
+password-entry popup (`Mode::ChannelPasswordPopup`) naming the channel and
+showing a message for `WrongPassword`/`Banned` (blank for a fresh
+`PasswordRequired`), distinct from the free-text `ChannelJoinFailed`
+popup-less path - letting the user retype and resubmit the same
+`JoinChannel` without re-typing the channel name.
+
+### 6.6 Brute-force protection
+
+More than `CHANNEL_MAX_PASSWORD_ATTEMPTS` (7) wrong-password attempts
+against one **(source IP address, channel name)** pair bans further
+attempts against that specific channel from that specific address for
+`CHANNEL_PASSWORD_BAN_DURATION` (2 hours) - every attempt during the ban,
+right password or wrong, is refused as `ChannelJoinRejected { kind:
+Banned }` without even being compared.
+
+Keyed by source IP, not `UserId`: a `UserId` is never reused (§3, TB-020)
+- a client that disconnects and reconnects always gets a brand new one, so
+a ban keyed by `UserId` alone would be trivially bypassed by simply
+reconnecting. The IP is taken from the already-open TCP connection
+(`SocketAddr::ip()`), not anything the client asserts.
+
+Tracked in server memory only (`Registry::channel_password_attempts`), not
+persisted to disk - a server restart clears every ban, the same scope
+tradeoff `AuthConfig`'s in-memory-only session state already makes
+elsewhere in this document.
 
 Reference implementation: `server::Registry::join_channel`, `leave_channel`,
 `unregister`, `channel_list`.
@@ -672,6 +790,59 @@ trusted to only address peers it actually intends to); `None` is a DM.
 
 Voice chunks (`PunchDatagram::Unreliable`) bypass this layer entirely -
 see §7.3.
+
+#### 7.0.2 Trust boundary: responding only within a shared channel
+
+`RequestPeerLink`/`PeerCandidates` (step 2 above) is an existence-check-only
+relay (`Registry::route_peer_link_request`) - the server checks that `peer`
+is a currently-connected `UserId` and nothing more, so any registered
+client can address a link request to any other registered `UserId`,
+whether or not the two have ever shared a channel. Left unchecked, this
+would let a stranger who merely learns someone's `UserId` get that
+person's client to respond to punch traffic at all.
+
+The receiving client closes this gap itself, since the server has no
+membership list left to validate against (§7.1's note above): on an
+incoming `PeerCandidates`, before doing anything else - not even creating
+`PeerLink` state - it checks whether the sender is a member of any channel
+it has actually joined right now (`ui::UiState::shares_a_joined_channel`).
+A request from someone who isn't is dropped silently, leaving nothing
+behind for a follow-up message to probe.
+
+This check is **not** applied symmetrically to the *initiating* side
+(`PeerLinkManager::ensure_link`) - every call site that proactively opens a
+link is already reachable only after legitimate prior contact: the eager
+trigger above fires directly off a `UserJoined` for a shared channel; the
+file-offer accept/reject and key-rotation-install paths only run for a
+peer that already reached this client through an existing link or a
+verified rotation. Gating those too would be pure redundancy, and would
+actively break the supported case of still messaging someone in an open DM
+after they've left every channel you shared (SPEC.md's "Offline users").
+
+#### 7.0.3 Tearing down a link once it no longer serves a purpose
+
+§7.0.2 gates *forming* a link; this is the mirror image - *tearing one
+down* once a channel departure could have made it purposeless. A link is
+kept only as long as there's still a reason to reach that peer at all:
+`UiState::has_reason_to_keep_link` is true when either a currently-joined
+channel is shared with them, or there's DM history with them (the same bar
+`on_user_offline` already uses to decide whether to keep a departed user
+listed - an *opened but still-empty* DM room does not count).
+
+This is checked at every point a channel departure could tip the balance:
+
+- **Locally, via `/leave`** (§6.2): `channel::handle_leave` runs the check
+  against every former member of the left channel, right after applying
+  the local state change, forgetting (`PeerLinkManager::forget`) any of
+  them who fail it.
+- **A peer's `UserLeft`** (§6.2): the same check runs against that one
+  peer once their membership is updated client-side.
+
+`UserOffline` (§6.4) is unaffected by this and keeps its own,
+unconditional `forget` - a full disconnect ends the link either way, no
+relevance check needed. Neither path sends anything over the wire; this
+is purely local bookkeeping; the peer's own client independently reaches
+the same conclusion (or doesn't) about the link from its own side.
 
 ### 7.1 Sending a channel or direct text message
 

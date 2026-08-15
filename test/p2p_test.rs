@@ -13,7 +13,7 @@ use std::time::Duration;
 use aloo::p2p::{P2pEvent, PeerLinkManager};
 use aloo::p2p_proto::P2pPayload;
 use aloo::proto::*;
-use aloo::server::{serve_with_rendezvous, AuthConfig};
+use aloo::server::{AuthConfig, serve_with_rendezvous};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
 async fn spawn_test_server() -> SocketAddr {
@@ -28,17 +28,34 @@ async fn spawn_test_server() -> SocketAddr {
 
 async fn handshake(stream: &mut TcpStream, name: &str) -> UserId {
     let hello: ServerMessage = read_message(stream).await.unwrap().unwrap();
-    assert!(matches!(hello, ServerMessage::Hello { auth: AuthKind::None, .. }));
-    write_message(stream, &ClientMessage::Auth(AuthResponse::None)).await.unwrap();
+    assert!(matches!(
+        hello,
+        ServerMessage::Hello {
+            auth: AuthKind::None,
+            ..
+        }
+    ));
+    write_message(stream, &ClientMessage::Auth(AuthResponse::None))
+        .await
+        .unwrap();
     let _: ServerMessage = read_message(stream).await.unwrap().unwrap(); // AuthResult
     write_message(
         stream,
-        &ClientMessage::Identify { display_name: name.into(), public_key_der: vec![], key_mode: KeyMode::Rsa },
+        &ClientMessage::Identify {
+            display_name: name.into(),
+            public_key_der: vec![],
+            key_mode: KeyMode::Rsa,
+        },
     )
     .await
     .unwrap();
     let identify_result: ServerMessage = read_message(stream).await.unwrap().unwrap();
-    let ServerMessage::IdentifyResult { ok: true, you: Some(you), .. } = identify_result else {
+    let ServerMessage::IdentifyResult {
+        ok: true,
+        you: Some(you),
+        ..
+    } = identify_result
+    else {
         panic!("expected a successful IdentifyResult, got {identify_result:?}");
     };
     let _: ServerMessage = read_message(stream).await.unwrap().unwrap(); // ChannelList
@@ -57,8 +74,14 @@ async fn direct_link_handshake_and_reliable_message_end_to_end() {
 
     let (a_events_tx, mut a_events_rx) = tokio::sync::mpsc::unbounded_channel::<P2pEvent>();
     let (b_events_tx, mut b_events_rx) = tokio::sync::mpsc::unbounded_channel::<P2pEvent>();
-    let (mut alice, a_socket) = PeerLinkManager::bind("127.0.0.1:0".parse().unwrap(), server_addr, a_events_tx).await.unwrap();
-    let (mut bob, b_socket) = PeerLinkManager::bind("127.0.0.1:0".parse().unwrap(), server_addr, b_events_tx).await.unwrap();
+    let (mut alice, a_socket) =
+        PeerLinkManager::bind("127.0.0.1:0".parse().unwrap(), server_addr, a_events_tx)
+            .await
+            .unwrap();
+    let (mut bob, b_socket) =
+        PeerLinkManager::bind("127.0.0.1:0".parse().unwrap(), server_addr, b_events_tx)
+            .await
+            .unwrap();
 
     let (a_raw_tx, mut a_raw_rx) = tokio::sync::mpsc::unbounded_channel();
     let (b_raw_tx, mut b_raw_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -67,22 +90,36 @@ async fn direct_link_handshake_and_reliable_message_end_to_end() {
 
     // alice proposes a link to bob - relayed by the server as PeerCandidates.
     alice.ensure_link(&mut a, bob_id).await;
-    let ServerMessage::PeerCandidates { from, candidates, link_nonce } = read_message(&mut b).await.unwrap().unwrap() else {
+    let ServerMessage::PeerCandidates {
+        from,
+        candidates,
+        link_nonce,
+    } = read_message(&mut b).await.unwrap().unwrap()
+    else {
         panic!("bob should receive alice's PeerCandidates");
     };
     assert_eq!(from, alice_id);
 
     // bob replies in kind (relayed back to alice) and starts punching.
-    bob.on_peer_candidates(&mut b, alice_id, candidates, link_nonce).await;
-    let ServerMessage::PeerCandidates { from, candidates, link_nonce } = read_message(&mut a).await.unwrap().unwrap() else {
+    bob.on_peer_candidates(&mut b, alice_id, candidates, link_nonce)
+        .await;
+    let ServerMessage::PeerCandidates {
+        from,
+        candidates,
+        link_nonce,
+    } = read_message(&mut a).await.unwrap().unwrap()
+    else {
         panic!("alice should receive bob's PeerCandidates reply");
     };
     assert_eq!(from, bob_id);
-    alice.on_peer_candidates(&mut a, bob_id, candidates, link_nonce).await;
+    alice
+        .on_peer_candidates(&mut a, bob_id, candidates, link_nonce)
+        .await;
 
     // Both sides now exchange Ping/Pong over loopback UDP until each has a
     // confirmed, bidirectional Active link to the other.
-    let both_active = |a: &PeerLinkManager, b: &PeerLinkManager| a.is_active(bob_id) && b.is_active(alice_id);
+    let both_active =
+        |a: &PeerLinkManager, b: &PeerLinkManager| a.is_active(bob_id) && b.is_active(alice_id);
     let timeout = Duration::from_secs(2);
     let deadline = tokio::time::Instant::now() + timeout;
     while !both_active(&alice, &bob) {
@@ -97,8 +134,17 @@ async fn direct_link_handshake_and_reliable_message_end_to_end() {
     }
 
     // alice sends a channel-addressed text envelope reliably to bob.
-    let envelope = Envelope { content: Content::Text, blocks: vec![b"hi bob, direct".to_vec()] };
-    alice.send_reliable_or_queue(bob_id, P2pPayload::Envelope { channel: Some("general".into()), envelope: envelope.clone() });
+    let envelope = Envelope {
+        content: Content::Text,
+        blocks: vec![b"hi bob, direct".to_vec()],
+    };
+    alice.send_reliable_or_queue(
+        bob_id,
+        P2pPayload::Envelope {
+            channel: Some("general".into()),
+            envelope: envelope.clone(),
+        },
+    );
 
     // Drain both sides (bob needs the Reliable frame; alice needs its Ack)
     // until bob's event channel actually reports the message.
@@ -115,7 +161,11 @@ async fn direct_link_handshake_and_reliable_message_end_to_end() {
     .expect("bob should receive alice's message within the timeout");
 
     match received {
-        P2pEvent::Message { channel, from, envelope: got } => {
+        P2pEvent::Message {
+            channel,
+            from,
+            envelope: got,
+        } => {
             assert_eq!(channel.as_deref(), Some("general"));
             assert_eq!(from, alice_id);
             assert_eq!(got, envelope);
@@ -149,13 +199,25 @@ async fn punch_timeout_fails_the_link_and_emits_link_failed() {
     let bob_id = handshake(&mut b, "bob").await;
 
     let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel::<P2pEvent>();
-    let (mut alice, _socket) = PeerLinkManager::bind("127.0.0.1:0".parse().unwrap(), server_addr, events_tx).await.unwrap();
+    let (mut alice, _socket) =
+        PeerLinkManager::bind("127.0.0.1:0".parse().unwrap(), server_addr, events_tx)
+            .await
+            .unwrap();
     alice.ensure_link(&mut a, bob_id).await;
     assert!(!alice.is_active(bob_id));
     // Something is actually waiting on this link (a real send, not just a
     // pre-warm) - only this makes the eventual failure worth surfacing to
     // the user, see `PeerLinkManager::tick_at`'s own doc.
-    alice.send_reliable_or_queue(bob_id, P2pPayload::Envelope { channel: None, envelope: Envelope { content: Content::Text, blocks: vec![vec![1]] } });
+    alice.send_reliable_or_queue(
+        bob_id,
+        P2pPayload::Envelope {
+            channel: None,
+            envelope: Envelope {
+                content: Content::Text,
+                blocks: vec![vec![1]],
+            },
+        },
+    );
 
     alice.tick_at(tokio::time::Instant::now().into_std() + Duration::from_secs(6));
 
@@ -190,15 +252,23 @@ async fn punch_timeout_with_nothing_pending_fails_silently() {
     let bob_id = handshake(&mut b, "bob").await;
 
     let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel::<P2pEvent>();
-    let (mut alice, _socket) = PeerLinkManager::bind("127.0.0.1:0".parse().unwrap(), server_addr, events_tx).await.unwrap();
+    let (mut alice, _socket) =
+        PeerLinkManager::bind("127.0.0.1:0".parse().unwrap(), server_addr, events_tx)
+            .await
+            .unwrap();
     // A bare pre-warm - nothing ever queued against this link.
     alice.ensure_link(&mut a, bob_id).await;
 
     alice.tick_at(tokio::time::Instant::now().into_std() + Duration::from_secs(6));
 
     assert!(
-        tokio::time::timeout(Duration::from_millis(200), events_rx.recv()).await.is_err(),
+        tokio::time::timeout(Duration::from_millis(200), events_rx.recv())
+            .await
+            .is_err(),
         "a pre-warm-only failure must not emit a user-visible LinkFailed event"
     );
-    assert!(!alice.is_active(bob_id), "the link must still actually be marked Failed internally");
+    assert!(
+        !alice.is_active(bob_id),
+        "the link must still actually be marked Failed internally"
+    );
 }

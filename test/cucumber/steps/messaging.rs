@@ -16,7 +16,11 @@ use crate::world::AlooWorld;
 #[then(expr = "sending {string} to the channel is requested, addressed to {word} and {word}")]
 async fn send_requested(w: &mut AlooWorld, body: String, a: String, b: String) {
     match w.last_action.as_ref().expect("no action was produced") {
-        UiAction::SendChannelText { channel, plaintext, recipients } => {
+        UiAction::SendChannelText {
+            channel,
+            plaintext,
+            recipients,
+        } => {
             assert_eq!(channel, "general");
             assert_eq!(plaintext, &body);
             let ids: Vec<UserId> = recipients.iter().map(|(id, _, _)| *id).collect();
@@ -38,8 +42,15 @@ async fn send_requested(w: &mut AlooWorld, body: String, a: String, b: String) {
 async fn own_message_logged(w: &mut AlooWorld) {
     let state = w.ui_ref();
     let log = &state.channels[0].log;
-    assert_eq!(log.len(), 1, "my own message should be logged locally straight away");
-    assert!(log[0].outgoing, "and marked as outgoing rather than received");
+    assert_eq!(
+        log.len(),
+        1,
+        "my own message should be logged locally straight away"
+    );
+    assert!(
+        log[0].outgoing,
+        "and marked as outgoing rather than received"
+    );
 }
 
 #[then("nothing is sent")]
@@ -67,19 +78,32 @@ async fn room_not_open(w: &mut AlooWorld) {
 
 #[then("focus moves to the compose bar")]
 async fn focus_on_compose(w: &mut AlooWorld) {
-    assert_eq!(w.ui_ref().focus, Focus::Input, "opening a room should leave me ready to type");
+    assert_eq!(
+        w.ui_ref().focus,
+        Focus::Input,
+        "opening a room should leave me ready to type"
+    );
 }
 
 #[then("I am back in the channel view")]
 async fn back_in_channel(w: &mut AlooWorld) {
-    assert_eq!(w.ui_ref().active_private_room, None, "Esc should close the private room");
+    assert_eq!(
+        w.ui_ref().active_private_room,
+        None,
+        "Esc should close the private room"
+    );
 }
 
 #[then(expr = "sending the private message {string} to {word} is requested")]
 async fn dm_send_requested(w: &mut AlooWorld, body: String, name: String) {
     let want = UserId(id_for(&name));
     match w.last_action.as_ref().expect("no action was produced") {
-        UiAction::SendDirectText { to, plaintext, recipient_key_mode: _, recipient_pubkey_der } => {
+        UiAction::SendDirectText {
+            to,
+            plaintext,
+            recipient_key_mode: _,
+            recipient_pubkey_der,
+        } => {
             assert_eq!(*to, want);
             assert_eq!(plaintext, &body);
             assert_eq!(
@@ -92,7 +116,11 @@ async fn dm_send_requested(w: &mut AlooWorld, body: String, name: String) {
     }
     let state = w.ui_ref();
     assert!(
-        state.private_rooms[&want].log.last().expect("nothing logged").outgoing,
+        state.private_rooms[&want]
+            .log
+            .last()
+            .expect("nothing logged")
+            .outgoing,
         "my own DM should be logged in that room as outgoing"
     );
 }
@@ -100,23 +128,44 @@ async fn dm_send_requested(w: &mut AlooWorld, body: String, name: String) {
 #[then(expr = "{word}'s room is marked unread")]
 async fn room_unread(w: &mut AlooWorld, name: String) {
     let id = UserId(id_for(&name));
-    let room = w.ui_ref().private_rooms.get(&id).expect("no room for that user");
-    assert!(room.unread, "a message arriving while I am elsewhere should be flagged unread");
-    assert!(!room.log.is_empty(), "and the message itself should be in the room's history");
+    let room = w
+        .ui_ref()
+        .private_rooms
+        .get(&id)
+        .expect("no room for that user");
+    assert!(
+        room.unread,
+        "a message arriving while I am elsewhere should be flagged unread"
+    );
+    assert!(
+        !room.log.is_empty(),
+        "and the message itself should be in the room's history"
+    );
 }
 
 #[then(expr = "{word}'s room is not marked unread")]
 async fn room_read(w: &mut AlooWorld, name: String) {
     let id = UserId(id_for(&name));
-    let room = w.ui_ref().private_rooms.get(&id).expect("no room for that user");
+    let room = w
+        .ui_ref()
+        .private_rooms
+        .get(&id)
+        .expect("no room for that user");
     assert!(!room.unread, "the room should not be flagged unread");
 }
 
 #[then(expr = "{word}'s earlier messages are still in the room")]
 async fn history_kept(w: &mut AlooWorld, name: String) {
     let id = UserId(id_for(&name));
-    let room = w.ui_ref().private_rooms.get(&id).expect("no room for that user");
-    assert!(!room.log.is_empty(), "marking a room read must not discard its history");
+    let room = w
+        .ui_ref()
+        .private_rooms
+        .get(&id)
+        .expect("no room for that user");
+    assert!(
+        !room.log.is_empty(),
+        "marking a room read must not discard its history"
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -151,7 +200,10 @@ async fn steady_envelope(w: &mut AlooWorld, name: String) {
 
 #[then(expr = "{word}'s envelope blinks")]
 async fn blinking_envelope(w: &mut AlooWorld, name: String) {
-    assert!(envelope_shown(w, true, &name), "the envelope should be visible on the blink-on frame");
+    assert!(
+        envelope_shown(w, true, &name),
+        "the envelope should be visible on the blink-on frame"
+    );
     assert!(
         !envelope_shown(w, false, &name),
         "and hidden on the blink-off frame while there is something unread"
@@ -175,7 +227,11 @@ async fn newest_selected(w: &mut AlooWorld) {
         None => state.channels[state.selected_channel].log.len(),
     };
     assert!(len > 0, "there should be something in the log to select");
-    assert_eq!(state.message_selected, len - 1, "the view should open on the newest message");
+    assert_eq!(
+        state.message_selected,
+        len - 1,
+        "the view should open on the newest message"
+    );
 }
 
 #[then(expr = "the selection is {int} entries below the newest")]
@@ -207,14 +263,21 @@ async fn one_page_from_newest(w: &mut AlooWorld) {
 
 #[then("the oldest message is selected")]
 async fn oldest_selected(w: &mut AlooWorld) {
-    assert_eq!(w.ui_ref().message_selected, 0, "Home should jump to the oldest message");
+    assert_eq!(
+        w.ui_ref().message_selected,
+        0,
+        "Home should jump to the oldest message"
+    );
 }
 
 #[then("the oldest message is visible and the newest has scrolled away")]
 async fn viewport_follows(w: &mut AlooWorld) {
     let state = w.ui_ref();
     let rows = crate::support::rows_of(&crate::support::ui_buffer(state, 100, 15));
-    assert!(rows.iter().any(|r| r.contains("msg0")), "scrolling home should bring the oldest into view: {rows:?}");
+    assert!(
+        rows.iter().any(|r| r.contains("msg0")),
+        "scrolling home should bring the oldest into view: {rows:?}"
+    );
     assert!(
         !rows.iter().any(|r| r.contains("msg39")),
         "and push the newest out of the viewport: {rows:?}"
@@ -225,7 +288,10 @@ async fn viewport_follows(w: &mut AlooWorld) {
 async fn viewport_at_bottom(w: &mut AlooWorld) {
     let state = w.ui_ref();
     let rows = crate::support::rows_of(&crate::support::ui_buffer(state, 100, 15));
-    assert!(rows.iter().any(|r| r.contains("msg39")), "the newest message should be on screen: {rows:?}");
+    assert!(
+        rows.iter().any(|r| r.contains("msg39")),
+        "the newest message should be on screen: {rows:?}"
+    );
     assert!(
         !rows.iter().any(|r| r.contains("msg0")),
         "the oldest should have scrolled out of view: {rows:?}"

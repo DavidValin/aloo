@@ -8,17 +8,17 @@ use std::io::Stdout;
 use std::path::{Path, PathBuf};
 
 use crossterm::event::{Event, KeyEventKind};
-use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
 use tokio::net::TcpStream;
 
+use crate::BoxError;
 use crate::crypto;
 use crate::idstore;
 use crate::own_next_keys;
 use crate::proto::{self, AuthKind, AuthResponse, ClientMessage, KeyMode, ServerMessage};
 use crate::session;
 use crate::ui::ui_connect_popup::{self, ConnectPopupState, MyKeySelection, ServerKeySelection};
-use crate::BoxError;
 
 /// This client's own resolved key material, whichever `my_key` type
 /// produced it. Replaces a bare `RsaPrivateKey` return once `PqHybrid`
@@ -74,8 +74,17 @@ pub async fn run_client_inner(
         // last successful connection") - a wrong password or an
         // unreachable host doesn't mean the pq_hybrid identity chosen was
         // wrong.
-        if let MyKeySelection::PqHybrid { file_pub, file_priv } = &request.my_key {
-            cache.record(&request.host, request.port, &file_pub.display().to_string(), &file_priv.display().to_string());
+        if let MyKeySelection::PqHybrid {
+            file_pub,
+            file_priv,
+        } = &request.my_key
+        {
+            cache.record(
+                &request.host,
+                request.port,
+                &file_pub.display().to_string(),
+                &file_priv.display().to_string(),
+            );
             if let Err(e) = cache.save() {
                 eprintln!("aloo: failed to save connect cache: {e}");
             }
@@ -126,7 +135,9 @@ fn run_connect_popup(
 ) -> Result<Option<ui_connect_popup::ConnectRequest>, BoxError> {
     loop {
         terminal.draw(|f| ui_connect_popup::render(f, popup))?;
-        let Event::Key(key) = crossterm::event::read()? else { continue };
+        let Event::Key(key) = crossterm::event::read()? else {
+            continue;
+        };
         if key.kind == KeyEventKind::Release {
             continue;
         }
@@ -187,15 +198,23 @@ async fn connect_and_handshake(
     };
     proto::write_message(
         &mut wr,
-        &ClientMessage::Identify { display_name: request.nickname.clone(), public_key_der, key_mode },
+        &ClientMessage::Identify {
+            display_name: request.nickname.clone(),
+            public_key_der,
+            key_mode,
+        },
     )
     .await?;
 
-    let Some(ServerMessage::IdentifyResult { ok, you, reason }) = proto::read_message(&mut rd).await? else {
+    let Some(ServerMessage::IdentifyResult { ok, you, reason }) =
+        proto::read_message(&mut rd).await?
+    else {
         return Err("server closed the connection during identify".into());
     };
     if !ok {
-        return Err(Box::new(NicknameTakenError(reason.unwrap_or_else(|| "nickname rejected".to_string()))));
+        return Err(Box::new(NicknameTakenError(
+            reason.unwrap_or_else(|| "nickname rejected".to_string()),
+        )));
     }
     let you = you.ok_or("server accepted identify but returned no user id")?;
 
@@ -220,16 +239,31 @@ async fn connect_and_handshake(
 /// `connect.rs` exception).
 pub fn resolve_my_keypair(sel: &MyKeySelection) -> Result<(ResolvedIdentity, KeyMode), BoxError> {
     match sel {
-        MyKeySelection::None => Ok((ResolvedIdentity::Rsa(crypto::KeyPair::generate()?), KeyMode::None)),
-        MyKeySelection::Password(pw) => Ok((ResolvedIdentity::Rsa(crypto::KeyPair::from_password(pw)?), KeyMode::Password)),
-        MyKeySelection::Rsa { file_pub, file_priv } => {
-            Ok((ResolvedIdentity::Rsa(crypto::KeyPair::load_from_files(file_priv, file_pub)?), KeyMode::Rsa))
-        }
+        MyKeySelection::None => Ok((
+            ResolvedIdentity::Rsa(crypto::KeyPair::generate()?),
+            KeyMode::None,
+        )),
+        MyKeySelection::Password(pw) => Ok((
+            ResolvedIdentity::Rsa(crypto::KeyPair::from_password(pw)?),
+            KeyMode::Password,
+        )),
+        MyKeySelection::Rsa {
+            file_pub,
+            file_priv,
+        } => Ok((
+            ResolvedIdentity::Rsa(crypto::KeyPair::load_from_files(file_priv, file_pub)?),
+            KeyMode::Rsa,
+        )),
         MyKeySelection::RsaPerMessage { .. } => Ok((
-            ResolvedIdentity::Rsa(crypto::KeyPair::generate_with_bits(crypto::RSA_PER_MSG_KEY_BITS)?),
+            ResolvedIdentity::Rsa(crypto::KeyPair::generate_with_bits(
+                crypto::RSA_PER_MSG_KEY_BITS,
+            )?),
             KeyMode::PerMessage,
         )),
-        MyKeySelection::PqHybrid { file_pub, file_priv } => {
+        MyKeySelection::PqHybrid {
+            file_pub,
+            file_priv,
+        } => {
             // Transparently generates a fresh keybundle at these exact
             // paths if either is missing - covers both a freshly-assigned,
             // not-yet-generated location (`fresh_pq_hybrid_paths_in`) and a
@@ -238,7 +272,13 @@ pub fn resolve_my_keypair(sel: &MyKeySelection) -> Result<(ResolvedIdentity, Key
             let private = crypto::pq::load_private_bundle(file_priv)?;
             let public = crypto::pq::load_public_bundle(file_pub)?;
             let public_der = proto::encode(&public)?;
-            Ok((ResolvedIdentity::Pq { private, public_der }, KeyMode::PqHybrid))
+            Ok((
+                ResolvedIdentity::Pq {
+                    private,
+                    public_der,
+                },
+                KeyMode::PqHybrid,
+            ))
         }
     }
 }
@@ -250,19 +290,26 @@ fn build_auth_response(
 ) -> Result<AuthResponse, BoxError> {
     match (auth_kind, server_key) {
         (AuthKind::None, _) => Ok(AuthResponse::None),
-        (AuthKind::Password, ServerKeySelection::Password(pw)) => Ok(AuthResponse::Password(pw.clone())),
+        (AuthKind::Password, ServerKeySelection::Password(pw)) => {
+            Ok(AuthResponse::Password(pw.clone()))
+        }
         (AuthKind::Rsa, ServerKeySelection::Rsa(path)) => {
             let server_pub = crypto::load_public_key(path)?;
             let nonce = challenge.ok_or("server requires rsa auth but sent no challenge")?;
             let blocks = crypto::encrypt_chunked(&server_pub, &nonce)?;
             Ok(AuthResponse::Rsa { blocks })
         }
-        (kind, _) => Err(format!("server requires {kind:?} auth but no matching server_key was provided").into()),
+        (kind, _) => Err(format!(
+            "server requires {kind:?} auth but no matching server_key was provided"
+        )
+        .into()),
     }
 }
 
 fn local_display_name() -> String {
-    std::env::var("USER").or_else(|_| std::env::var("USERNAME")).unwrap_or_else(|_| "anon".to_string())
+    std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_else(|_| "anon".to_string())
 }
 
 /// Loads the local identity-pinning store from the connect popup's
@@ -359,7 +406,10 @@ impl ConnectCache {
     /// fallback when `load` fails for a reason other than the file simply
     /// not existing yet, mirroring `idstore::IdStore::new_empty`.
     pub fn new_empty(path: PathBuf) -> Self {
-        Self { path, entries: Vec::new() }
+        Self {
+            path,
+            entries: Vec::new(),
+        }
     }
 
     /// Loads `path` if it exists; a missing file isn't an error (first run
@@ -388,12 +438,22 @@ impl ConnectCache {
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
         }
-        Ok(Self { path: path.to_path_buf(), entries })
+        Ok(Self {
+            path: path.to_path_buf(),
+            entries,
+        })
     }
 
     /// The most recently used entry, if any: `(host, port, file_pub, file_priv)`.
     pub fn most_recent(&self) -> Option<(&str, u16, &str, &str)> {
-        self.entries.last().map(|e| (e.host.as_str(), e.port, e.pq_file_pub.as_str(), e.pq_file_priv.as_str()))
+        self.entries.last().map(|e| {
+            (
+                e.host.as_str(),
+                e.port,
+                e.pq_file_pub.as_str(),
+                e.pq_file_priv.as_str(),
+            )
+        })
     }
 
     /// Records `(host, port) -> (file_pub, file_priv)` as the most recently
@@ -458,7 +518,10 @@ fn load_connect_cache() -> ConnectCache {
     match ConnectCache::load(&path) {
         Ok(cache) => cache,
         Err(e) => {
-            eprintln!("aloo: failed to load connect cache at {}: {e} (continuing without it)", path.display());
+            eprintln!(
+                "aloo: failed to load connect cache at {}: {e} (continuing without it)",
+                path.display()
+            );
             ConnectCache::new_empty(path)
         }
     }
@@ -470,7 +533,10 @@ fn load_connect_cache() -> ConnectCache {
 /// files at once.
 pub fn random_prefix() -> String {
     const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
-    crypto::random_bytes(4).iter().map(|b| ALPHABET[*b as usize % ALPHABET.len()] as char).collect()
+    crypto::random_bytes(4)
+        .iter()
+        .map(|b| ALPHABET[*b as usize % ALPHABET.len()] as char)
+        .collect()
 }
 
 /// Picks a `(file_pub, file_priv)` pair under `dir` that doesn't collide
@@ -492,7 +558,10 @@ pub fn fresh_pq_hybrid_paths_in(dir: &Path) -> (PathBuf, PathBuf) {
         }
     }
     let prefix = random_prefix();
-    (dir.join(format!("{prefix}.pub")), dir.join(format!("{prefix}.priv")))
+    (
+        dir.join(format!("{prefix}.pub")),
+        dir.join(format!("{prefix}.priv")),
+    )
 }
 
 /// Prefills `popup`'s host/port/`pq_hybrid` file fields, once, before it's

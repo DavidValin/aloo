@@ -12,7 +12,9 @@ use tokio::io::AsyncWrite;
 use crate::crypto;
 use crate::p2p::LinkReadiness;
 use crate::p2p_proto::P2pPayload;
-use crate::proto::{self, ChannelInfo, ChannelKind, ClientMessage, Content, Envelope, KeyMode, UserId};
+use crate::proto::{
+    self, ChannelInfo, ChannelKind, ClientMessage, Content, Envelope, KeyMode, UserId,
+};
 use crate::rekey;
 use crate::session::SessionState;
 use crate::ui::ui::{Recipient, UiState};
@@ -24,9 +26,40 @@ pub(crate) async fn handle_join(
     session: &mut SessionState,
     name: String,
     kind: ChannelKind,
+    password: Option<String>,
 ) -> proto::Result<()> {
-    proto::write_message(wr, &ClientMessage::JoinChannel { name, kind }).await?;
+    proto::write_message(
+        wr,
+        &ClientMessage::JoinChannel {
+            name,
+            kind,
+            password,
+        },
+    )
+    .await?;
     session.conn_stats.record_event(Instant::now());
+    Ok(())
+}
+
+/// `LeaveChannel` has no server-side acknowledgment to the leaver - the
+/// server only notifies the members who *remain* (docs/PROTOCOL.md §6.2) -
+/// so the local half is applied optimistically, client-side, the moment
+/// `/leave` is submitted (`UiState::leave_channel_locally`). Any peer from
+/// that channel who's no longer reachable through any other joined channel
+/// or an open DM (`UiState::has_reason_to_keep_link`) has its P2P link torn
+/// down too (§7.0.3).
+pub(crate) async fn handle_leave(
+    wr: &mut (impl AsyncWrite + Unpin),
+    ui_state: &mut UiState,
+    session: &mut SessionState,
+    name: String,
+) -> proto::Result<()> {
+    proto::write_message(wr, &ClientMessage::LeaveChannel { name: name.clone() }).await?;
+    for peer in ui_state.leave_channel_locally(&name) {
+        if !ui_state.has_reason_to_keep_link(peer) {
+            session.peer_link.forget(peer);
+        }
+    }
     Ok(())
 }
 
@@ -52,7 +85,10 @@ pub(crate) async fn handle_send_text(
         } else {
             session.remote_keys.enqueue(
                 id,
-                rekey::QueuedOutbound::Channel { channel: channel.clone(), plaintext: plaintext.clone() },
+                rekey::QueuedOutbound::Channel {
+                    channel: channel.clone(),
+                    plaintext: plaintext.clone(),
+                },
             );
         }
     }
@@ -60,7 +96,13 @@ pub(crate) async fn handle_send_text(
         let per_recipient = encrypt_for_each(session, &ready, plaintext.as_bytes(), Content::Text);
         for (id, envelope) in per_recipient {
             session.peer_link.ensure_link(wr, id).await;
-            session.peer_link.send_reliable_or_queue(id, P2pPayload::Envelope { channel: Some(channel.clone()), envelope });
+            session.peer_link.send_reliable_or_queue(
+                id,
+                P2pPayload::Envelope {
+                    channel: Some(channel.clone()),
+                    envelope,
+                },
+            );
         }
         for (id, ..) in ready {
             crate::session::request_rotation_if_per_message(session, id);
@@ -112,27 +154,54 @@ pub(crate) async fn handle_send_file(
             ready.push((id, key_mode, der));
         }
     }
-    let payload = crate::file_transfer::FileOfferPayload { filename: filename.clone(), size };
-    let Ok(plaintext) = proto::encode(&payload) else { return Ok(()) };
+    let payload = crate::file_transfer::FileOfferPayload {
+        filename: filename.clone(),
+        size,
+    };
+    let Ok(plaintext) = proto::encode(&payload) else {
+        return Ok(());
+    };
     for (id, key_mode, der) in ready {
         let envelope = match key_mode {
-            KeyMode::PqHybrid => session
-                .own_pq_private
-                .as_ref()
-                .and_then(|signing| crate::session::encrypt_hybrid_envelope_for(signing, &der, &plaintext, Content::FileOffer)),
+            KeyMode::PqHybrid => session.own_pq_private.as_ref().and_then(|signing| {
+                crate::session::encrypt_hybrid_envelope_for(
+                    signing,
+                    &der,
+                    &plaintext,
+                    Content::FileOffer,
+                )
+            }),
             _ => crate::session::encrypt_for_one(&der, &plaintext, Content::FileOffer),
         };
         let Some(envelope) = envelope else { continue };
         let stream_id = session.next_stream_id;
-        let Some(key) = voice_stream::resolve_direct_key(session, stream_id, id, key_mode, &der) else { continue };
+        let Some(key) = voice_stream::resolve_direct_key(session, stream_id, id, key_mode, &der)
+        else {
+            continue;
+        };
         session.next_stream_id += 1;
-        let to_name = ui_state.known_users.get(&id).map(|u| u.name.clone()).unwrap_or_default();
+        let to_name = ui_state
+            .known_users
+            .get(&id)
+            .map(|u| u.name.clone())
+            .unwrap_or_default();
         ui_state.log_own_file_offer_channel(&channel, &to_name, stream_id, filename.clone(), size);
-        session.own_file_targets.insert(stream_id, crate::file_stream::OwnFileTarget { to: id, path: path.clone(), key });
+        session.own_file_targets.insert(
+            stream_id,
+            crate::file_stream::OwnFileTarget {
+                to: id,
+                path: path.clone(),
+                key,
+            },
+        );
         session.peer_link.ensure_link(wr, id).await;
         session.peer_link.send_reliable_or_queue(
             id,
-            P2pPayload::FileOffer { channel: Some(channel.clone()), stream_id, envelope },
+            P2pPayload::FileOffer {
+                channel: Some(channel.clone()),
+                stream_id,
+                envelope,
+            },
         );
         crate::session::request_rotation_if_per_message(session, id);
     }
@@ -168,13 +237,23 @@ pub(crate) async fn handle_voice_record_start(
     let pq = voice_stream::build_pq_stream_out(session, stream_id, &parse_pq_recipients(&ready));
     ui_state.log_own_voice_stream_start_channel(&channel, stream_id);
     for &id in &ready_ids {
-        session.peer_link.send_reliable_or_queue(id, P2pPayload::StreamStart { channel: Some(channel.clone()), stream_id });
+        session.peer_link.send_reliable_or_queue(
+            id,
+            P2pPayload::StreamStart {
+                channel: Some(channel.clone()),
+                stream_id,
+            },
+        );
     }
     let (stop_tx, stop_rx) = std::sync::mpsc::channel();
     session.active_recording = Some(stop_tx);
-    session
-        .own_stream_targets
-        .insert(stream_id, voice_stream::OwnStreamTarget::Channel { channel: channel.clone(), recipients: ready_ids });
+    session.own_stream_targets.insert(
+        stream_id,
+        voice_stream::OwnStreamTarget::Channel {
+            channel: channel.clone(),
+            recipients: ready_ids,
+        },
+    );
     voice_stream::spawn_record_stream_worker(
         recorder,
         voice_stream::StreamRecipients::Channel { rsa, pq },
@@ -209,14 +288,24 @@ fn parse_pq_recipients(recipients: &[Recipient]) -> Vec<(UserId, crypto::pq::PqP
 /// *our own* signing identity, `session.own_pq_private` - callers must have
 /// already excluded recipients this session can't address, see
 /// `can_address`).
-fn encrypt_for_each(session: &SessionState, recipients: &[Recipient], plaintext: &[u8], content: Content) -> Vec<(UserId, Envelope)> {
+fn encrypt_for_each(
+    session: &SessionState,
+    recipients: &[Recipient],
+    plaintext: &[u8],
+    content: Content,
+) -> Vec<(UserId, Envelope)> {
     recipients
         .iter()
         .filter_map(|(id, key_mode, pubkey_der)| {
             let envelope = match key_mode {
                 KeyMode::PqHybrid => {
                     let signing = session.own_pq_private.as_ref()?;
-                    crate::session::encrypt_hybrid_envelope_for(signing, pubkey_der, plaintext, content.clone())?
+                    crate::session::encrypt_hybrid_envelope_for(
+                        signing,
+                        pubkey_der,
+                        plaintext,
+                        content.clone(),
+                    )?
                 }
                 _ => crate::session::encrypt_for_one(pubkey_der, plaintext, content.clone())?,
             };
@@ -225,12 +314,19 @@ fn encrypt_for_each(session: &SessionState, recipients: &[Recipient], plaintext:
         .collect()
 }
 
-pub(crate) fn on_list(ui_state: &mut UiState, list: Vec<ChannelInfo>) -> Option<crate::ui::ui::UiAction> {
+pub(crate) fn on_list(
+    ui_state: &mut UiState,
+    list: Vec<ChannelInfo>,
+) -> Option<crate::ui::ui::UiAction> {
     let was_empty = ui_state.channels.is_empty();
     ui_state.on_channel_list(list);
     if was_empty {
         if let Some(first) = ui_state.channels.first() {
-            return Some(crate::ui::ui::UiAction::JoinChannel { name: first.name.clone(), kind: first.kind });
+            return Some(crate::ui::ui::UiAction::JoinChannel {
+                name: first.name.clone(),
+                kind: first.kind,
+                password: None,
+            });
         }
     }
     None
@@ -244,6 +340,18 @@ pub(crate) fn on_join_failed(name: String, reason: String) {
     eprintln!("aloo: failed to join {name}: {reason}");
 }
 
+/// Handles `ServerMessage::ChannelJoinRejected` - the password-flow-specific
+/// counterpart to `on_join_failed`, distinguished so the client can open the
+/// password popup (or show a wrong-password/banned message on it) instead of
+/// just logging to stderr.
+pub(crate) fn on_join_rejected(
+    ui_state: &mut UiState,
+    name: String,
+    kind: proto::ChannelJoinRejection,
+) {
+    ui_state.on_channel_join_rejected(name, kind);
+}
+
 pub(crate) fn on_message(
     ui_state: &mut UiState,
     session: &mut SessionState,
@@ -252,7 +360,9 @@ pub(crate) fn on_message(
     from_name: String,
     envelope: Envelope,
 ) {
-    let Some(sender) = ui_state.known_users.get(&from).cloned() else { return };
+    let Some(sender) = ui_state.known_users.get(&from).cloned() else {
+        return;
+    };
     if let Some(body) = crate::session::decrypt_envelope_for(envelope, from, &sender, session) {
         ui_state.on_channel_message(&channel, from, from_name, body);
         crate::session::request_rotation_if_per_message(session, from);
@@ -270,9 +380,20 @@ pub(crate) fn on_stream_start(
     // Snapshotted once, same as the decrypt key set itself (PROTOCOL.md
     // §11.6/§12): a Pending/Rejected sender's stream is never played live.
     let suppress_playback = ui_state.is_trust_gated(from);
-    let sender_public_key_der = ui_state.known_users.get(&from).map(|u| u.public_key_der.clone()).unwrap_or_default();
+    let sender_public_key_der = ui_state
+        .known_users
+        .get(&from)
+        .map(|u| u.public_key_der.clone())
+        .unwrap_or_default();
     ui_state.on_channel_stream_start(&channel, from, from_name, stream_id);
-    voice_stream::start_incoming_stream(session, from, stream_id, Some(channel), suppress_playback, &sender_public_key_der);
+    voice_stream::start_incoming_stream(
+        session,
+        from,
+        stream_id,
+        Some(channel),
+        suppress_playback,
+        &sender_public_key_der,
+    );
 }
 
 // Extracted verbatim from the `OwnStreamTarget::Channel` match arm that

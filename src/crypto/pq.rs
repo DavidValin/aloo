@@ -28,8 +28,8 @@ use aes_gcm::{Aes256Gcm, Key as AesKey, KeyInit as AesKeyInit, Nonce as AesNonce
 use hkdf::Hkdf;
 use ml_dsa::signature::{Keypair as MlDsaKeypair, Signer, Verifier};
 use ml_dsa::{
-    Generate as MlDsaGenerate, KeyExport as MlDsaKeyExport, MlDsa87,
-    Signature as MlDsaSignature, SigningKey as MlDsaSigningKey, VerifyingKey as MlDsaVerifyingKey,
+    Generate as MlDsaGenerate, KeyExport as MlDsaKeyExport, MlDsa87, Signature as MlDsaSignature,
+    SigningKey as MlDsaSigningKey, VerifyingKey as MlDsaVerifyingKey,
 };
 // `ml_kem`'s `KeyExport`/`KeyInit` are the identical `crypto_common` traits
 // already imported above via `ml_dsa` - only the ones with no `ml_dsa`
@@ -141,7 +141,13 @@ pub fn wrap_key_for_stream(
     let rsa_sk = super::private_key_from_der(&sender_signing.rsa_sign_private_der)?;
     let rsa_sig = super::sign(&rsa_sk, &commitment)?;
 
-    Ok(HybridStreamKeySetup { kem_ciphertext, wrapped_key, wrapped_key_rsa, mldsa_sig, rsa_sig })
+    Ok(HybridStreamKeySetup {
+        kem_ciphertext,
+        wrapped_key,
+        wrapped_key_rsa,
+        mldsa_sig,
+        rsa_sig,
+    })
 }
 
 /// Recovers and authenticates `k_data` from one chunk's `HybridStreamKeySetup`
@@ -156,7 +162,12 @@ pub fn unwrap_key_for_stream(
     stream_id: u64,
     setup: &HybridStreamKeySetup,
 ) -> Option<[u8; 32]> {
-    let k_data = unwrap_key(my_private, &setup.kem_ciphertext, &setup.wrapped_key, &setup.wrapped_key_rsa)?;
+    let k_data = unwrap_key(
+        my_private,
+        &setup.kem_ciphertext,
+        &setup.wrapped_key,
+        &setup.wrapped_key_rsa,
+    )?;
     let commitment = stream_commitment(stream_id, &k_data);
 
     let vk = decode_mldsa_verifying(sender_public).ok()?;
@@ -343,7 +354,10 @@ fn verify_body(sender_public: &PqPublicBundle, plaintext: &[u8]) -> Option<Vec<u
 /// doc): sign `data`, then AES-256-GCM-encrypt it once under a freshly
 /// random `K_data`. Called once per outgoing `Envelope` or once per voice
 /// stream - never per recipient, never per chunk.
-pub fn encrypt_hybrid_body(sender_signing: &PqPrivateBundle, data: &[u8]) -> Result<([u8; 32], [u8; 12], Vec<u8>)> {
+pub fn encrypt_hybrid_body(
+    sender_signing: &PqPrivateBundle,
+    data: &[u8],
+) -> Result<([u8; 32], [u8; 12], Vec<u8>)> {
     let signed = sign_body(sender_signing, data)?;
 
     let mut k_data = [0u8; 32];
@@ -362,7 +376,10 @@ pub fn encrypt_hybrid_body(sender_signing: &PqPrivateBundle, data: &[u8]) -> Res
 /// The recipient-specific half (step 3): wrap `k_data` for one recipient's
 /// public bundle via ML-KEM-1024 + RSA-4096, combined through the HKDF
 /// combiner above.
-pub fn wrap_key_for(recipient_public: &PqPublicBundle, k_data: &[u8; 32]) -> Result<(Vec<u8>, [u8; 32], Vec<u8>)> {
+pub fn wrap_key_for(
+    recipient_public: &PqPublicBundle,
+    k_data: &[u8; 32],
+) -> Result<(Vec<u8>, [u8; 32], Vec<u8>)> {
     let ek = decode_mlkem_encaps(recipient_public)?;
     let (kem_ciphertext, kem_shared) = ek.encapsulate();
 
@@ -377,7 +394,11 @@ pub fn wrap_key_for(recipient_public: &PqPublicBundle, k_data: &[u8; 32]) -> Res
         wrapped_key[i] = k_data[i] ^ k_wrap[i];
     }
 
-    Ok((kem_ciphertext.as_slice().to_vec(), wrapped_key, wrapped_key_rsa))
+    Ok((
+        kem_ciphertext.as_slice().to_vec(),
+        wrapped_key,
+        wrapped_key_rsa,
+    ))
 }
 
 /// Convenience for the single-recipient (DM) case: body + wrap in one call.
@@ -401,7 +422,12 @@ pub fn encrypt_hybrid_for_one(
 /// own private bundle - shared by text/file decrypt (`decrypt_hybrid`) and
 /// voice stream setup (`voice_stream.rs`, which caches the result for the
 /// life of one stream instead of calling this per chunk).
-pub fn unwrap_key(my_private: &PqPrivateBundle, kem_ciphertext: &[u8], wrapped_key: &[u8; 32], wrapped_key_rsa: &[u8]) -> Option<[u8; 32]> {
+pub fn unwrap_key(
+    my_private: &PqPrivateBundle,
+    kem_ciphertext: &[u8],
+    wrapped_key: &[u8; 32],
+    wrapped_key_rsa: &[u8],
+) -> Option<[u8; 32]> {
     let dk = decode_mlkem_decaps(my_private).ok()?;
     let kem_ct = ml_kem::Ciphertext::<MlKem1024>::try_from(kem_ciphertext).ok()?;
     let kem_shared = dk.decapsulate(&kem_ct);
@@ -421,12 +447,23 @@ pub fn unwrap_key(my_private: &PqPrivateBundle, kem_ciphertext: &[u8], wrapped_k
 /// Full decrypt+verify pipeline for a text/file `Envelope.blocks[0]` blob.
 /// `None` on any failure (bad AEAD tag, bad signature, malformed bytes) -
 /// mirrors `decrypt_envelope_for`'s existing RSA failure path, never panics.
-pub fn decrypt_hybrid(my_private: &PqPrivateBundle, sender_public: &PqPublicBundle, blob: &[u8]) -> Option<Vec<u8>> {
+pub fn decrypt_hybrid(
+    my_private: &PqPrivateBundle,
+    sender_public: &PqPublicBundle,
+    blob: &[u8],
+) -> Option<Vec<u8>> {
     let env: HybridEnvelope = bincode_decode(blob).ok()?;
-    let k_data = unwrap_key(my_private, &env.kem_ciphertext, &env.wrapped_key, &env.wrapped_key_rsa)?;
+    let k_data = unwrap_key(
+        my_private,
+        &env.kem_ciphertext,
+        &env.wrapped_key,
+        &env.wrapped_key_rsa,
+    )?;
 
     let cipher = Aes256Gcm::new(&AesKey::<Aes256Gcm>::from(k_data));
-    let plaintext = cipher.decrypt(&AesNonce::from(env.nonce), env.ciphertext.as_slice()).ok()?;
+    let plaintext = cipher
+        .decrypt(&AesNonce::from(env.nonce), env.ciphertext.as_slice())
+        .ok()?;
 
     verify_body(sender_public, &plaintext)
 }
@@ -454,7 +491,12 @@ pub fn encrypt_hybrid_chunk(k_data: &[u8; 32], stream_id: u64, seq: u32, pcm: &[
 
 /// Decrypts one voice chunk. `None` on a bad AEAD tag (wrong key, corrupted
 /// chunk, or a `(stream_id, seq)` nonce mismatch).
-pub fn decrypt_hybrid_chunk(k_data: &[u8; 32], stream_id: u64, seq: u32, ciphertext: &[u8]) -> Option<Vec<u8>> {
+pub fn decrypt_hybrid_chunk(
+    k_data: &[u8; 32],
+    stream_id: u64,
+    seq: u32,
+    ciphertext: &[u8],
+) -> Option<Vec<u8>> {
     let nonce = chunk_nonce(stream_id, seq);
     let cipher = Aes256Gcm::new(&AesKey::<Aes256Gcm>::from(*k_data));
     cipher.decrypt(&AesNonce::from(nonce), ciphertext).ok()
@@ -486,8 +528,18 @@ pub struct HybridVoiceChunk {
 /// Builds one chunk's wire blob: encrypts `pcm` under `k_data` (cheap, no
 /// asymmetric crypto) and pairs it with the cached `key_setup` from
 /// record-start.
-pub fn encrypt_hybrid_voice_chunk(key_setup: &HybridStreamKeySetup, k_data: &[u8; 32], stream_id: u64, seq: u32, pcm: &[u8]) -> Vec<u8> {
+pub fn encrypt_hybrid_voice_chunk(
+    key_setup: &HybridStreamKeySetup,
+    k_data: &[u8; 32],
+    stream_id: u64,
+    seq: u32,
+    pcm: &[u8],
+) -> Vec<u8> {
     let ciphertext = encrypt_hybrid_chunk(k_data, stream_id, seq, pcm);
-    let chunk = HybridVoiceChunk { key_setup: key_setup.clone(), ciphertext };
-    bincode_encode(&chunk).expect("HybridVoiceChunk is plain data - bincode-encoding it cannot fail")
+    let chunk = HybridVoiceChunk {
+        key_setup: key_setup.clone(),
+        ciphertext,
+    };
+    bincode_encode(&chunk)
+        .expect("HybridVoiceChunk is plain data - bincode-encoding it cannot fail")
 }

@@ -25,9 +25,9 @@ mod validate;
 use std::sync::OnceLock;
 
 use validate::{
-    Report, Severity, RULE_AC_WITHOUT_SCENARIO, RULE_DUPLICATE_REQUIREMENT_ID, RULE_DUPLICATE_TEST_ID,
+    RULE_AC_WITHOUT_SCENARIO, RULE_DUPLICATE_REQUIREMENT_ID, RULE_DUPLICATE_TEST_ID,
     RULE_ONLY_IGNORED_TESTS, RULE_REQUIREMENT_WITHOUT_TEST, RULE_STORY_WITHOUT_CHILDREN,
-    RULE_TEST_WITHOUT_REQUIREMENT, RULE_UNKNOWN_REQUIREMENT_ID,
+    RULE_TEST_WITHOUT_REQUIREMENT, RULE_UNKNOWN_REQUIREMENT_ID, Report, Severity,
 };
 
 struct Loaded {
@@ -50,9 +50,17 @@ fn expect_none(rule: &str, explanation: &str) {
     if found.is_empty() {
         return;
     }
-    let mut msg = format!("\n{} finding(s) for `{rule}`\n{explanation}\n\n", found.len());
+    let mut msg = format!(
+        "\n{} finding(s) for `{rule}`\n{explanation}\n\n",
+        found.len()
+    );
     for f in &found {
-        msg.push_str(&format!("  [{}] {} - {}\n", f.severity.label(), f.subject, f.detail));
+        msg.push_str(&format!(
+            "  [{}] {} - {}\n",
+            f.severity.label(),
+            f.subject,
+            f.detail
+        ));
     }
     panic!("{msg}");
 }
@@ -117,7 +125,11 @@ fn every_user_story_has_requirements_beneath_it() {
 #[test]
 fn warnings_are_reported_for_review() {
     let report = &loaded().report;
-    for rule in [RULE_TEST_WITHOUT_REQUIREMENT, RULE_AC_WITHOUT_SCENARIO, RULE_ONLY_IGNORED_TESTS] {
+    for rule in [
+        RULE_TEST_WITHOUT_REQUIREMENT,
+        RULE_AC_WITHOUT_SCENARIO,
+        RULE_ONLY_IGNORED_TESTS,
+    ] {
         let found = report.of(rule);
         if found.is_empty() {
             continue;
@@ -147,17 +159,32 @@ fn reports_are_generated() {
         "  {} user stories, {} acceptance criteria, {} technical behaviours",
         t.stories, t.acceptance, t.technical
     );
-    println!("  {} rust tests, {} scenarios ({} ignored)", t.rust_tests, t.scenarios, t.ignored);
+    println!(
+        "  {} rust tests, {} scenarios ({} ignored)",
+        t.rust_tests, t.scenarios, t.ignored
+    );
     for (status, count) in &t.by_status {
         println!("  {status}: {count}");
     }
 
-    assert!(dir.join("report.html").is_file(), "report.html should exist");
-    assert!(dir.join("traceability.json").is_file(), "traceability.json should exist");
-    assert!(dir.join("traceability-matrix.md").is_file(), "traceability-matrix.md should exist");
+    assert!(
+        dir.join("report.html").is_file(),
+        "report.html should exist"
+    );
+    assert!(
+        dir.join("traceability.json").is_file(),
+        "traceability.json should exist"
+    );
+    assert!(
+        dir.join("traceability-matrix.md").is_file(),
+        "traceability-matrix.md should exist"
+    );
 
     // A model that loaded nothing would make every other check vacuously pass.
-    assert!(t.stories >= 1, "requirements.toml should define user stories");
+    assert!(
+        t.stories >= 1,
+        "requirements.toml should define user stories"
+    );
     assert!(
         t.rust_tests + t.scenarios > 0,
         "no executable tests were discovered - the scanners are probably looking in the wrong place"
@@ -197,7 +224,11 @@ fn error_rules_keep_error_severity() {
         RULE_STORY_WITHOUT_CHILDREN,
     ] {
         for f in report.of(rule) {
-            assert_eq!(f.severity, Severity::Error, "rule `{rule}` must stay an error");
+            assert_eq!(
+                f.severity,
+                Severity::Error,
+                "rule `{rule}` must stay an error"
+            );
         }
     }
 }

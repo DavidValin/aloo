@@ -1,7 +1,7 @@
 //! Key rotation and identity pinning (US-010, US-011).
 
-use cucumber::{given, then, when};
 use crossterm::event::{KeyCode, KeyModifiers};
+use cucumber::{given, then, when};
 
 use aloo::crypto::{self, public_key_to_der};
 use aloo::idstore::{IdCheck, IdStore};
@@ -10,7 +10,7 @@ use aloo::rekey::{
     QueuedOutbound, RemoteKeys, ResumeVerification, sign_rotation, verify_and_parse_rotation,
     verify_rotation, verify_with_fallback,
 };
-use aloo::ui::ui::{IdentityCase, MessageBody, UiAction, SPINNER_FRAMES};
+use aloo::ui::ui::{IdentityCase, MessageBody, SPINNER_FRAMES, UiAction};
 
 use crate::steps::ui_common::{id_for, press_key, user_with_mode};
 use crate::support::ui_rows;
@@ -57,8 +57,9 @@ async fn rotation_accepted(w: &mut AlooWorld) {
         verify_rotation(&old.public, UserId(1), &w.rotation_der, &w.rotation_sig),
         "a rotation signed by the key it replaces must verify"
     );
-    let parsed = verify_and_parse_rotation(&old.public, UserId(1), &w.rotation_der, &w.rotation_sig)
-        .expect("a valid rotation should parse into a usable key");
+    let parsed =
+        verify_and_parse_rotation(&old.public, UserId(1), &w.rotation_der, &w.rotation_sig)
+            .expect("a valid rotation should parse into a usable key");
     // Usable in the only sense that matters: it can encrypt to the new key.
     let next = w.derived.get("bob-next").expect("no rotated key recorded");
     let blocks = crypto::encrypt_chunked(&parsed, b"hello via rotated key").unwrap();
@@ -74,7 +75,8 @@ async fn rotation_refused(w: &mut AlooWorld) {
         "a rotation that is not signed by the trusted key must not verify"
     );
     assert!(
-        verify_and_parse_rotation(&old.public, UserId(1), &w.rotation_der, &w.rotation_sig).is_none(),
+        verify_and_parse_rotation(&old.public, UserId(1), &w.rotation_der, &w.rotation_sig)
+            .is_none(),
         "and it must yield no key at all, so the previous one stays in place"
     );
 }
@@ -100,7 +102,10 @@ async fn replay_refused(w: &mut AlooWorld) {
 async fn bob_key_used(w: &mut AlooWorld) {
     let mut remote = RemoteKeys::new();
     remote.track(UserId(2));
-    assert!(remote.try_use(UserId(2)), "his bootstrap key should be good for exactly one message");
+    assert!(
+        remote.try_use(UserId(2)),
+        "his bootstrap key should be good for exactly one message"
+    );
     assert!(!remote.try_use(UserId(2)), "and stale immediately after");
     w.remote_keys = Some(remote);
 }
@@ -111,14 +116,21 @@ async fn queue_two(w: &mut AlooWorld, first: String, second: String) {
     remote.enqueue(UserId(2), QueuedOutbound::Direct { plaintext: first });
     remote.enqueue(
         UserId(2),
-        QueuedOutbound::Channel { channel: "general".into(), plaintext: second },
+        QueuedOutbound::Channel {
+            channel: "general".into(),
+            plaintext: second,
+        },
     );
 }
 
 #[then(expr = "both messages are held, not sent")]
 async fn both_held(w: &mut AlooWorld) {
     let remote = w.remote_keys.as_ref().expect("no rotation state");
-    assert_eq!(remote.queue_len(UserId(2)), 2, "both should be waiting for his next key");
+    assert_eq!(
+        remote.queue_len(UserId(2)),
+        2,
+        "both should be waiting for his next key"
+    );
 }
 
 #[when("bob's next key arrives")]
@@ -134,18 +146,28 @@ async fn flushed_in_order(w: &mut AlooWorld, first: String, second: String) {
         w.flushed,
         vec![
             QueuedOutbound::Direct { plaintext: first },
-            QueuedOutbound::Channel { channel: "general".into(), plaintext: second },
+            QueuedOutbound::Channel {
+                channel: "general".into(),
+                plaintext: second
+            },
         ],
         "the whole queue flushes at once, in the order it was typed"
     );
     let remote = w.remote_keys.as_ref().expect("no rotation state");
-    assert_eq!(remote.queue_len(UserId(2)), 0, "the queue must be drained, not merely read");
+    assert_eq!(
+        remote.queue_len(UserId(2)),
+        0,
+        "the queue must be drained, not merely read"
+    );
 }
 
 #[then("his key is stale again until the next rotation")]
 async fn stale_again(w: &mut AlooWorld) {
     let remote = w.remote_keys.as_mut().expect("no rotation state");
-    assert!(!remote.try_use(UserId(2)), "flushing a batch consumes freshness like any other send");
+    assert!(
+        !remote.try_use(UserId(2)),
+        "flushing a batch consumes freshness like any other send"
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -161,13 +183,19 @@ async fn stale_again(w: &mut AlooWorld) {
 fn after_help_hint(w: &AlooWorld) -> String {
     let rows = ui_rows(w.ui_ref());
     let header = rows.first().expect("header row").clone();
-    let idx = header.find("Ctrl+H: Help").expect("expected the help hint on the header row");
+    let idx = header
+        .find("Ctrl+H: Help")
+        .expect("expected the help hint on the header row");
     header[idx + "Ctrl+H: Help".len()..].trim_end().to_string()
 }
 
 fn spinner_on_header(w: &AlooWorld) -> Option<char> {
     let after = after_help_hint(w);
-    after.trim_start_matches(' ').chars().next().filter(|c| SPINNER_FRAMES.contains(c))
+    after
+        .trim_start_matches(' ')
+        .chars()
+        .next()
+        .filter(|c| SPINNER_FRAMES.contains(c))
 }
 
 #[when("a key regeneration starts")]
@@ -199,16 +227,25 @@ async fn spinner_after_hint(w: &mut AlooWorld) {
 #[then("the spinner has moved on to its next frame")]
 async fn spinner_advanced(w: &mut AlooWorld) {
     let shown = spinner_on_header(w).expect("no spinner frame on the header row");
-    assert_eq!(shown, SPINNER_FRAMES[1], "each tick should advance exactly one frame");
+    assert_eq!(
+        shown, SPINNER_FRAMES[1],
+        "each tick should advance exactly one frame"
+    );
 }
 
 #[then("no spinner is shown")]
 async fn no_spinner(w: &mut AlooWorld) {
     let rows = ui_rows(w.ui_ref());
     let header = rows.first().expect("header row");
-    assert!(header.contains("Ctrl+H: Help"), "the help hint itself should still be there: {header:?}");
+    assert!(
+        header.contains("Ctrl+H: Help"),
+        "the help hint itself should still be there: {header:?}"
+    );
     let after = after_help_hint(w);
-    assert!(after.is_empty(), "no spinner frame should be visible when nothing is regenerating: {after:?}");
+    assert!(
+        after.is_empty(),
+        "no spinner frame should be visible when nothing is regenerating: {after:?}"
+    );
 }
 
 #[then("a restarted spinner begins from the first frame again")]
@@ -239,19 +276,29 @@ async fn seen_with_key(w: &mut AlooWorld, name: String, key: String) {
 
 #[then("it is a first sighting")]
 async fn first_sighting(w: &mut AlooWorld) {
-    assert_eq!(w.id_check, Some(IdCheck::New), "a nickname never seen before is simply pinned");
+    assert_eq!(
+        w.id_check,
+        Some(IdCheck::New),
+        "a nickname never seen before is simply pinned"
+    );
 }
 
 #[then("it matches what was pinned")]
 async fn pin_matches(w: &mut AlooWorld) {
-    assert_eq!(w.id_check, Some(IdCheck::Match), "the same key as last time is not a warning");
+    assert_eq!(
+        w.id_check,
+        Some(IdCheck::Match),
+        "the same key as last time is not a warning"
+    );
 }
 
 #[then(expr = "it is flagged as a mismatch against the previous key {string}")]
 async fn pin_mismatch(w: &mut AlooWorld, previous: String) {
     assert_eq!(
         w.id_check,
-        Some(IdCheck::Mismatch { previous_public_key_der: previous.into_bytes() }),
+        Some(IdCheck::Mismatch {
+            previous_public_key_der: previous.into_bytes()
+        }),
         "a different key must be reported, carrying the key it replaced"
     );
 }
@@ -294,8 +341,13 @@ async fn recognised_resumed(w: &mut AlooWorld) {
     let continuity = w.derived.get("continuity").expect("no continuity key");
     // No live in-session key exists: a reconnecting peer has a brand-new
     // UserId, which is exactly why the fallback anchor has to carry it.
-    let result =
-        verify_with_fallback(None, Some(&continuity.public), UserId(5), &w.rotation_der, &w.rotation_sig);
+    let result = verify_with_fallback(
+        None,
+        Some(&continuity.public),
+        UserId(5),
+        &w.rotation_der,
+        &w.rotation_sig,
+    );
     assert!(
         matches!(result, ResumeVerification::Resumed(_)),
         "a self-asserted continuity key must verify as a resume, got {result:?}"
@@ -306,8 +358,13 @@ async fn recognised_resumed(w: &mut AlooWorld) {
 #[then("nothing vouches for him and the reconnect is not trusted")]
 async fn resume_failed(w: &mut AlooWorld) {
     let continuity = w.derived.get("continuity").expect("no continuity key");
-    let result =
-        verify_with_fallback(None, Some(&continuity.public), UserId(5), &w.rotation_der, &w.rotation_sig);
+    let result = verify_with_fallback(
+        None,
+        Some(&continuity.public),
+        UserId(5),
+        &w.rotation_der,
+        &w.rotation_sig,
+    );
     assert_eq!(
         result,
         ResumeVerification::Failed,
@@ -323,7 +380,13 @@ async fn live_preferred(w: &mut AlooWorld) {
     let new_der = public_key_to_der(&new.public).unwrap();
     let sig = sign_rotation(&live.private, UserId(1), &new_der).unwrap();
 
-    let result = verify_with_fallback(Some(&live.public), Some(&continuity.public), UserId(1), &new_der, &sig);
+    let result = verify_with_fallback(
+        Some(&live.public),
+        Some(&continuity.public),
+        UserId(1),
+        &new_der,
+        &sig,
+    );
     match result {
         ResumeVerification::Live(k) => {
             assert_eq!(
@@ -352,7 +415,10 @@ async fn identity_mismatches(w: &mut AlooWorld, name: String) {
     let message = format!(
         "'{name}' connected with a different key than last time (was aaaaaaaaaaaaaaaa, now bbbbbbbbbbbbbbbb) - possible impersonation. Accept their new key, or reject it."
     );
-    let case = IdentityCase::StaticMismatch { new_public_key_der: b"new-key".to_vec(), previous_public_key_der: b"old-key".to_vec() };
+    let case = IdentityCase::StaticMismatch {
+        new_public_key_der: b"new-key".to_vec(),
+        previous_public_key_der: b"old-key".to_vec(),
+    };
     w.ui_mut().push_identity_review(id, name, message, case);
 }
 
@@ -361,14 +427,16 @@ async fn identity_mismatches(w: &mut AlooWorld, name: String) {
 #[when(expr = "{word} sends the channel message {string} while unresolved")]
 async fn sends_while_unresolved(w: &mut AlooWorld, name: String, body: String) {
     let id = UserId(id_for(&name));
-    w.ui_mut().on_channel_message("general", id, name, MessageBody::Text(body));
+    w.ui_mut()
+        .on_channel_message("general", id, name, MessageBody::Text(body));
 }
 
 #[then(expr = "the message {string} is not shown yet")]
 async fn message_not_shown(w: &mut AlooWorld, body: String) {
     let log = &w.ui_ref().channels[0].log;
     assert!(
-        !log.iter().any(|e| e.body == MessageBody::Text(body.clone())),
+        !log.iter()
+            .any(|e| e.body == MessageBody::Text(body.clone())),
         "a held message must not be in the visible log yet"
     );
 }
@@ -377,7 +445,8 @@ async fn message_not_shown(w: &mut AlooWorld, body: String) {
 async fn message_now_shown(w: &mut AlooWorld, body: String) {
     let log = &w.ui_ref().channels[0].log;
     assert!(
-        log.iter().any(|e| e.body == MessageBody::Text(body.clone())),
+        log.iter()
+            .any(|e| e.body == MessageBody::Text(body.clone())),
         "the held message must be revealed once its sender is accepted: {log:?}"
     );
 }
@@ -413,29 +482,50 @@ async fn reject_review(w: &mut AlooWorld) {
 #[then(expr = "a review popup names {word} with Accept and Reject buttons")]
 async fn review_names(w: &mut AlooWorld, name: String) {
     assert_eq!(
-        w.ui_ref().identity_review_open().map(|r| r.nickname.as_str()),
+        w.ui_ref()
+            .identity_review_open()
+            .map(|r| r.nickname.as_str()),
         Some(name.as_str()),
         "expected the popup to be showing {name}'s review"
     );
     let rows = ui_rows(w.ui_ref());
-    assert!(rows.iter().any(|r| r.contains(&format!("Identity review: {name}"))), "expected a titled popup: {rows:?}");
-    assert!(rows.iter().any(|r| r.contains("Accept")), "expected an Accept button: {rows:?}");
-    assert!(rows.iter().any(|r| r.contains("Reject")), "expected a Reject button: {rows:?}");
+    assert!(
+        rows.iter()
+            .any(|r| r.contains(&format!("Identity review: {name}"))),
+        "expected a titled popup: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|r| r.contains("Accept")),
+        "expected an Accept button: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|r| r.contains("Reject")),
+        "expected a Reject button: {rows:?}"
+    );
 }
 
 #[then("no review popup is shown")]
 async fn no_review_popup(w: &mut AlooWorld) {
-    assert!(w.ui_ref().identity_review_open().is_none(), "no review should be open");
+    assert!(
+        w.ui_ref().identity_review_open().is_none(),
+        "no review should be open"
+    );
 }
 
 #[then(expr = "{word} is no longer flagged")]
 async fn no_longer_flagged(w: &mut AlooWorld, name: String) {
-    assert!(!w.ui_ref().is_trust_gated(UserId(id_for(&name))), "{name} should be trusted again after being accepted");
+    assert!(
+        !w.ui_ref().is_trust_gated(UserId(id_for(&name))),
+        "{name} should be trusted again after being accepted"
+    );
 }
 
 #[then(expr = "{word} is still flagged as unverified")]
 async fn still_flagged(w: &mut AlooWorld, name: String) {
-    assert!(w.ui_ref().is_trust_gated(UserId(id_for(&name))), "{name} should still be untrusted after a reject");
+    assert!(
+        w.ui_ref().is_trust_gated(UserId(id_for(&name))),
+        "{name} should still be untrusted after a reject"
+    );
 }
 
 // "no private room is open" is already defined in `channels.rs` - reused
@@ -447,8 +537,14 @@ async fn send_excludes(w: &mut AlooWorld, excluded: String, included: String) {
     match w.last_action.as_ref().expect("no action was produced") {
         UiAction::SendChannelText { recipients, .. } => {
             let ids: Vec<UserId> = recipients.iter().map(|(id, _, _)| *id).collect();
-            assert!(!ids.contains(&UserId(id_for(&excluded))), "{excluded} is unverified and must be excluded");
-            assert!(ids.contains(&UserId(id_for(&included))), "{included} should still receive the message");
+            assert!(
+                !ids.contains(&UserId(id_for(&excluded))),
+                "{excluded} is unverified and must be excluded"
+            );
+            assert!(
+                ids.contains(&UserId(id_for(&included))),
+                "{included} should still receive the message"
+            );
         }
         other => panic!("expected SendChannelText, got {other:?}"),
     }
@@ -481,6 +577,8 @@ async fn rejoins_unverified(w: &mut AlooWorld, name: String) {
     let message = format!(
         "'{name}' is using rsa_per_msg under a nickname previously linked to a different session's key, and hasn't proven continuity with it - possible impersonation. Accept their new key, or reject it."
     );
-    let case = IdentityCase::ResumeFailed { new_public_key_der: info.public_key_der };
+    let case = IdentityCase::ResumeFailed {
+        new_public_key_der: info.public_key_der,
+    };
     w.ui_mut().push_identity_review(id, name, message, case);
 }

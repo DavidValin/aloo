@@ -1,7 +1,7 @@
 //! Push-to-talk voice steps (US-007, client side).
 
-use cucumber::{given, then, when};
 use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
+use cucumber::{given, then, when};
 
 use aloo::proto::{KeyMode, UserId};
 use aloo::ui::ui::{MessageBody, UiAction, VoiceTarget};
@@ -17,7 +17,9 @@ use crate::world::AlooWorld;
 
 #[when("I hold Space")]
 async fn hold_space(w: &mut AlooWorld) {
-    let action = w.ui_mut().handle_key(KeyCode::Char(' '), KeyModifiers::NONE, KeyEventKind::Press);
+    let action = w
+        .ui_mut()
+        .handle_key(KeyCode::Char(' '), KeyModifiers::NONE, KeyEventKind::Press);
     w.action_was_none = action.is_none();
     if action.is_some() {
         w.last_action = action;
@@ -26,7 +28,11 @@ async fn hold_space(w: &mut AlooWorld) {
 
 #[when("I release Space")]
 async fn release_space(w: &mut AlooWorld) {
-    let action = w.ui_mut().handle_key(KeyCode::Char(' '), KeyModifiers::NONE, KeyEventKind::Release);
+    let action = w.ui_mut().handle_key(
+        KeyCode::Char(' '),
+        KeyModifiers::NONE,
+        KeyEventKind::Release,
+    );
     w.action_was_none = action.is_none();
     if action.is_some() {
         w.last_action = action;
@@ -72,13 +78,15 @@ async fn peer_starts_dm_stream(w: &mut AlooWorld, name: String) {
 #[when(expr = "{word}'s voice message finishes after {int} milliseconds")]
 async fn peer_stream_finishes(w: &mut AlooWorld, name: String, duration: u32) {
     let id = UserId(id_for(&name));
-    w.ui_mut().on_channel_stream_finished("general", id, 42, duration, vec![1, 2, 3, 4]);
+    w.ui_mut()
+        .on_channel_stream_finished("general", id, 42, duration, vec![1, 2, 3, 4]);
 }
 
 #[when(expr = "{word}'s private voice message finishes after {int} milliseconds")]
 async fn peer_dm_stream_finishes(w: &mut AlooWorld, name: String, duration: u32) {
     let id = UserId(id_for(&name));
-    w.ui_mut().on_direct_stream_finished(id, id, 5, duration, vec![1]);
+    w.ui_mut()
+        .on_direct_stream_finished(id, id, 5, duration, vec![1]);
 }
 
 #[when("my own voice message starts streaming into the channel")]
@@ -88,7 +96,8 @@ async fn own_stream_starts(w: &mut AlooWorld) {
 
 #[when(expr = "my own voice message finishes after {int} milliseconds")]
 async fn own_stream_finishes(w: &mut AlooWorld, duration: u32) {
-    w.ui_mut().on_channel_stream_finished("general", UserId(1), 7, duration, vec![9, 9]);
+    w.ui_mut()
+        .on_channel_stream_finished("general", UserId(1), 7, duration, vec![9, 9]);
 }
 
 #[when(expr = "the recorder fails with {string}")]
@@ -108,24 +117,42 @@ async fn playback_fails(w: &mut AlooWorld, reason: String) {
 #[then(expr = "a voice message starts streaming to the channel, addressed to {word}")]
 async fn stream_to_channel(w: &mut AlooWorld, name: String) {
     match w.last_action.as_ref().expect("no action was produced") {
-        UiAction::VoiceRecordStart(VoiceTarget::Channel { channel, recipients }) => {
+        UiAction::VoiceRecordStart(VoiceTarget::Channel {
+            channel,
+            recipients,
+        }) => {
             assert_eq!(channel, "general");
             assert_eq!(
                 recipients,
-                &vec![(UserId(id_for(&name)), KeyMode::Rsa, vec![id_for(&name) as u8; 4])],
+                &vec![(
+                    UserId(id_for(&name)),
+                    KeyMode::Rsa,
+                    vec![id_for(&name) as u8; 4]
+                )],
                 "the stream must be addressed to that member, carrying their key"
             );
         }
         other => panic!("expected a channel voice recording to start, got {other:?}"),
     }
-    assert!(w.ui_ref().recording, "the UI should now consider itself recording");
+    assert!(
+        w.ui_ref().recording,
+        "the UI should now consider itself recording"
+    );
 }
 
 #[then(expr = "a voice message starts streaming privately to {word}")]
 async fn stream_to_dm(w: &mut AlooWorld, name: String) {
     match w.last_action.as_ref().expect("no action was produced") {
-        UiAction::VoiceRecordStart(VoiceTarget::Direct { to, recipient_pubkey_der, .. }) => {
-            assert_eq!(*to, UserId(id_for(&name)), "a recording in a private room goes to that peer");
+        UiAction::VoiceRecordStart(VoiceTarget::Direct {
+            to,
+            recipient_pubkey_der,
+            ..
+        }) => {
+            assert_eq!(
+                *to,
+                UserId(id_for(&name)),
+                "a recording in a private room goes to that peer"
+            );
             assert_eq!(recipient_pubkey_der, &vec![id_for(&name) as u8; 4]);
         }
         other => panic!("expected a direct voice recording to start, got {other:?}"),
@@ -139,19 +166,28 @@ async fn voice_sent(w: &mut AlooWorld) {
         Some(&UiAction::VoiceRecordStop),
         "releasing the key should end the stream"
     );
-    assert!(!w.ui_ref().recording, "and the UI should stop claiming to record");
+    assert!(
+        !w.ui_ref().recording,
+        "and the UI should stop claiming to record"
+    );
 }
 
 #[then("no recording starts")]
 async fn no_recording(w: &mut AlooWorld) {
     assert!(w.action_was_none, "nothing should have been requested");
-    assert!(!w.ui_ref().recording, "and the UI must not claim to be recording");
+    assert!(
+        !w.ui_ref().recording,
+        "and the UI must not claim to be recording"
+    );
 }
 
 #[then("a recording indicator is shown")]
 async fn indicator_shown(w: &mut AlooWorld) {
     let rows = ui_rows(w.ui_ref());
-    assert!(rows.iter().any(|r| r.contains("recording")), "expected a recording indicator: {rows:?}");
+    assert!(
+        rows.iter().any(|r| r.contains("recording")),
+        "expected a recording indicator: {rows:?}"
+    );
 }
 
 #[then(expr = "the channel log shows a streaming placeholder from {word}")]
@@ -181,11 +217,21 @@ async fn own_placeholder(w: &mut AlooWorld) {
 async fn becomes_replayable(w: &mut AlooWorld, duration: u32) {
     let state = w.ui_ref();
     let log = &state.channels[0].log;
-    assert_eq!(log.len(), 1, "finishing must swap the placeholder in place, not append a second entry");
+    assert_eq!(
+        log.len(),
+        1,
+        "finishing must swap the placeholder in place, not append a second entry"
+    );
     match &log[0].body {
         MessageBody::Voice { duration_ms, pcm } => {
-            assert_eq!(*duration_ms, duration, "the real recorded length must be kept");
-            assert!(!pcm.is_empty(), "the finished message should carry its audio for replay");
+            assert_eq!(
+                *duration_ms, duration,
+                "the real recorded length must be kept"
+            );
+            assert!(
+                !pcm.is_empty(),
+                "the finished message should carry its audio for replay"
+            );
         }
         other => panic!("expected a finished voice message, got {other:?}"),
     }
@@ -194,9 +240,22 @@ async fn becomes_replayable(w: &mut AlooWorld, duration: u32) {
 #[then(expr = "the private room shows a replayable voice message of {int} milliseconds")]
 async fn dm_becomes_replayable(w: &mut AlooWorld, duration: u32) {
     let state = w.ui_ref();
-    let room = state.private_rooms.get(&UserId(2)).expect("no private room");
-    assert_eq!(room.log.len(), 1, "the placeholder must be swapped in place");
-    assert_eq!(room.log[0].body, MessageBody::Voice { duration_ms: duration, pcm: vec![1] });
+    let room = state
+        .private_rooms
+        .get(&UserId(2))
+        .expect("no private room");
+    assert_eq!(
+        room.log.len(),
+        1,
+        "the placeholder must be swapped in place"
+    );
+    assert_eq!(
+        room.log[0].body,
+        MessageBody::Voice {
+            duration_ms: duration,
+            pcm: vec![1]
+        }
+    );
 }
 
 #[then("replaying that voice message is requested")]
@@ -204,7 +263,11 @@ async fn replay_requested(w: &mut AlooWorld) {
     match w.last_action.as_ref().expect("no action was produced") {
         UiAction::ReplayVoice { duration_ms, pcm } => {
             assert_eq!(*duration_ms, 4200);
-            assert_eq!(pcm, &vec![1, 2, 3, 4], "replay must be handed the audio it recorded");
+            assert_eq!(
+                pcm,
+                &vec![1, 2, 3, 4],
+                "replay must be handed the audio it recorded"
+            );
         }
         other => panic!("expected a replay request, got {other:?}"),
     }
@@ -216,19 +279,30 @@ async fn finished_voice_from_bob(w: &mut AlooWorld) {
         "general",
         UserId(2),
         "bob".into(),
-        MessageBody::Voice { duration_ms: 4200, pcm: vec![1, 2, 3, 4] },
+        MessageBody::Voice {
+            duration_ms: 4200,
+            pcm: vec![1, 2, 3, 4],
+        },
     );
 }
 
 #[then("playback is stopped")]
 async fn playback_stopped(w: &mut AlooWorld) {
     assert_eq!(w.last_action, Some(UiAction::StopPlayback));
-    assert!(!w.ui_ref().replaying, "the replaying flag should be cleared once Escape stops it");
+    assert!(
+        !w.ui_ref().replaying,
+        "the replaying flag should be cleared once Escape stops it"
+    );
 }
 
 #[given("bob has left me a text message")]
 async fn text_from_bob(w: &mut AlooWorld) {
-    w.ui_mut().on_channel_message("general", UserId(2), "bob".into(), MessageBody::Text("hi".into()));
+    w.ui_mut().on_channel_message(
+        "general",
+        UserId(2),
+        "bob".into(),
+        MessageBody::Text("hi".into()),
+    );
 }
 
 #[then(expr = "a voice message of {int} milliseconds is labelled {string}")]
@@ -256,10 +330,16 @@ async fn failure_not_rendered(w: &mut AlooWorld, reason: String) {
 
 #[then("the UI stops claiming to record")]
 async fn stops_claiming(w: &mut AlooWorld) {
-    assert!(!w.ui_ref().recording, "a failed start must not leave a misleading indicator up");
+    assert!(
+        !w.ui_ref().recording,
+        "a failed start must not leave a misleading indicator up"
+    );
 }
 
 #[then("the recording carries on regardless")]
 async fn recording_continues(w: &mut AlooWorld) {
-    assert!(w.ui_ref().recording, "a playback failure is unrelated to an in-progress recording");
+    assert!(
+        w.ui_ref().recording,
+        "a playback failure is unrelated to an in-progress recording"
+    );
 }

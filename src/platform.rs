@@ -19,7 +19,10 @@ use std::path::PathBuf;
 /// neither environment variable is usable, a degenerate case this app has
 /// no real answer for.
 pub fn aloo_dir() -> PathBuf {
-    match resolve_home_dir(std::env::var_os("HOME").as_deref(), std::env::var_os("USERPROFILE").as_deref()) {
+    match resolve_home_dir(
+        std::env::var_os("HOME").as_deref(),
+        std::env::var_os("USERPROFILE").as_deref(),
+    ) {
         Some(home) => home.join(".aloo"),
         None => PathBuf::from(".aloo"),
     }
@@ -35,5 +38,9 @@ pub fn aloo_dir() -> PathBuf {
 /// same as unset, rather than resolving to a bare `.aloo` at the
 /// filesystem root.
 pub fn resolve_home_dir(home: Option<&OsStr>, userprofile: Option<&OsStr>) -> Option<PathBuf> {
-    [home, userprofile].into_iter().flatten().find(|v| !v.is_empty()).map(PathBuf::from)
+    [home, userprofile]
+        .into_iter()
+        .flatten()
+        .find(|v| !v.is_empty())
+        .map(PathBuf::from)
 }

@@ -26,7 +26,11 @@ where
 
 pub fn rows_of(buffer: &Buffer) -> Vec<String> {
     (0..buffer.area.height)
-        .map(|y| (0..buffer.area.width).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
         .collect()
 }
 
@@ -45,7 +49,9 @@ pub fn ui_rows_wide(state: &UiState) -> Vec<String> {
 }
 
 pub fn popup_rows(state: &ConnectPopupState, width: u16, height: u16) -> Vec<String> {
-    rows_of(&buffer_of(width, height, |f| aloo::ui::ui_connect_popup::render(f, state)))
+    rows_of(&buffer_of(width, height, |f| {
+        aloo::ui::ui_connect_popup::render(f, state)
+    }))
 }
 
 /// Whether `before` appears strictly earlier than `after` on the same row.

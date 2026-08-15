@@ -60,7 +60,7 @@ The server is started as:
 - `aloo --server --enc rsa <keyfile>` — server holds an RSA keypair loaded from `<keyfile>`; clients authenticate/encrypt against it.
 - `aloo --server --password <MYPASSWORD>` — server checks a single shared password against every connecting client.
 
-Other server flags: `--bind <ADDR>` (default `0.0.0.0`), `--port <PORT>` (default `7878`). The server always seeds one default public channel, `general`, so a freshly started server has something for the first-connected client to join.
+Other server flags: `--bind <ADDR>` (default `0.0.0.0`), `--port <PORT>` (default `7878`). The server always seeds one default public channel, `the-hall`, so a freshly started server has something for the first-connected client to join.
 
 Every server start persists its resolved `--bind`/`--port`/auth choice to `~/.aloo/settings` (`server_bind`, `server_port`, `server_auth_type` + its one associated value). Any of `--bind`, `--port`, `--enc`, `--password` given on the command line wins and gets persisted; whichever of these flags is *not* given falls back to what's already in `~/.aloo/settings`. So `aloo --server` alone reuses this machine's last server configuration in full - including auth - and a supervisor that restarts a crashed server with the exact same bare `aloo --server` command comes back up listening the same way, without needing to remember or re-pass the original flags.
 
@@ -99,7 +99,7 @@ The `my_key` type controls how the user's own key material is sourced/protected 
 
 The UI is composed of:
 
-- **Top area** (full width) — tabs with the channels the user has joined (one tab selected at a time), followed right-aligned at the end of the tab row by, in order: a **Conn:`<-|BAD|NORMAL|GOOD>`** indicator, two spaces, a **CPU:`<pct>`%** indicator, two spaces, the **Ctrl+H: Help** hint (Functionality #7), and then a two-space gap and an animated key-regeneration spinner whenever `rsa_per_msg` is actively rotating a key in the background (Functionality #6). Borderless.
+- **Top area** (full width) — tabs with the channels the user has joined (one tab selected at a time), each prefixed with an emoji naming its kind at a glance — 🌍 for public, 🔒 for private — followed right-aligned at the end of the tab row by, in order: a **Conn:`<-|BAD|NORMAL|GOOD>`** indicator, two spaces, a **CPU:`<pct>`%** indicator, two spaces, the **Ctrl+H: Help** hint (Functionality #7), and then a two-space gap and an animated key-regeneration spinner whenever `rsa_per_msg` is actively rotating a key in the background (Functionality #6). Borderless.
   - **CPU:`<pct>`%** — this client's own system-wide CPU usage, resampled roughly every 300ms. Rendered green below 25%, red at 25% and above.
   - **Conn:`<-|BAD|NORMAL|GOOD>`** — a rough read on how lively the connection feels, resampled once a second from the average gap between the last 1-3 protocol messages actually seen moving over the socket in either direction (there is no ping/pong in the wire protocol, so this is message cadence, not a true round-trip time). `-` (white) before any message has been exchanged yet this session; otherwise `BAD` (red), `NORMAL` (yellow) or `GOOD` (green) by how short that average gap is.
 - **Left area / sidebar** (20% wide) — list of users in the selected channel, each shown with an encryption tag next to their name (position depends on `my_key` type — see below; a narrow terminal clips this like any other overlong sidebar entry). Connected users are rendered in green; a user who has gone offline but is kept listed (Functionality #8) is rendered in soft gray instead; a user whose identity hasn't been verified yet, or was explicitly rejected (Functionality #9), is rendered in red regardless of offline status — the more urgent of the two.
@@ -129,18 +129,24 @@ A border wraps the sidebar, the main area, and the bottom bar. Whichever of the 
 
 Channels are dynamic:
 
-- **Public channels** are broadcast by the server and appear automatically as tabs for all connected clients.
-- **Private channels** are joined by pressing **Ctrl+J**, which opens a popup to type the channel name.
+- **Public channels** are broadcast by the server and appear automatically as tabs for all connected clients — both the initial snapshot at connect time and, live, the moment anyone creates a new one afterward (no reconnect needed).
+- **Private channels** are joined by pressing **Ctrl+J**, which opens a popup to type the channel name, choose Public or Private, and — while Private is selected — optionally set a password.
+
+A channel name is limited to letters, digits, and `-`, up to 21 characters (`CHANNEL_NAME_MAX_LEN`) — enforced both as the user types and, independently, by the server. A private channel's optional password is limited to letters, digits, and a documented set of basic symbols, up to 50 characters (`CHANNEL_PASSWORD_MAX_LEN`), likewise enforced on both sides (`docs/PROTOCOL.md` §6.1/§6.5).
 
 When connected, the server sends the list of available (public) channels, which render as top tabs (no border on this tab row); the first tab is selected and immediately joined automatically (no dwell delay for this first, automatic join — the 3-second dwell only applies to later `[`/`]` switches, see Functionality #2).
 
 When a tab is selected, the user joins that channel. The join is broadcast to all users already in the channel, and each of those users sends their public key to the newly joined user, who stores it in memory (used to encrypt messages sent to them). In practice this key exchange is relayed through the server as part of channel membership events (the server already knows every connected client's public key from `Identify`), not a direct peer-to-peer transfer — the server still never decrypts or reads message content, only relays already-public identity metadata.
 
+**Password-protected private channels.** Joining an existing private channel that was created with a password, without supplying one or with the wrong one, opens a dedicated password-entry popup naming the channel — blank for "you need a password", or showing "wrong password" for a retry — letting the user type one and resubmit. More than 7 wrong attempts against one channel from one address bans further attempts against that channel for 2 hours, reported distinctly ("too many attempts") rather than as another wrong-password message (`docs/PROTOCOL.md` §6.5/§6.6).
+
+**Leaving a channel.** Typing `/leave` and pressing Enter leaves whichever channel tab is currently selected (no argument — it's never a different one). Leaving a private channel removes its tab entirely — it was never re-advertised, so there's nothing to reconnect a stale tab to. Leaving a public channel keeps its tab, but selecting it now shows a single centered screen — *"You left this public channel. Do you want to join?"* — instead of the usual sidebar/messages/compose view; pressing Enter there rejoins it. Dwelling on a left channel (`[`/`]`) never silently rejoins it the way a never-joined one does — only that explicit Enter does. Every channel other than the default (`the-hall`) is unregistered from the server the instant its last member leaves it, public or private alike; `the-hall` itself is never removed, even with no members — a client that dwells onto a stale tab for a since-deleted channel simply recreates it fresh (`docs/PROTOCOL.md` §6.2).
+
 ## Functionality
 
 1. **Send a text message to the channel.** The message is encrypted separately for each recipient, using that recipient's RSA public key — no AES/hybrid encryption is used. Note: since raw RSA only encrypts small fixed-size blocks (190 bytes of plaintext per block with a 2048-bit key under OAEP/SHA-256 — `256 - 2*32 - 2`, see `crypto::max_chunk_len` and `docs/PROTOCOL.md` §8.1), longer payloads are split into multiple blocks, each encrypted per recipient.
 
-2. **Join a different channel.** Press `]` to move to the next channel or `[` for the previous one; after remaining on that tab for 3 seconds, the user joins it. (Ctrl+J opens the popup to join/create a private channel by name.)
+2. **Join a different channel.** Press `]` to move to the next channel or `[` for the previous one; after remaining on that tab for 3 seconds, the user joins it. (Ctrl+J opens a popup to join or create a channel by name — Tab cycles between the name field, a Public/Private selector, and, while Private is selected, an optional password field; Left/Right toggles the selector.)
 
 3. **Send a private message to a user.** Move through the list of users in a channel and press Enter to open a full-screen private room with that user. Press Escape to return to the channel view. Messages exchanged remain in memory for the session. The private room can be reopened by selecting the same user again and pressing Enter.
    - In the channel view, a user is preceded by an envelope emoji once there's at least one message (sent or received) in their private room — not merely because that room was opened; opening an empty DM and leaving it again shows no envelope until an actual message exists. The envelope stays visible (solid) for the rest of the session once earned, whether the messages in it have been read or not, including after the room is reopened and marked read.
@@ -208,6 +214,8 @@ When a tab is selected, the user joins that channel. The join is broadcast to al
     - Voice messages work the same way as text — the expensive signing/key-exchange work happens once per recording, not per 15ms chunk, so holding Space to talk feels identical to any other method.
     - Its identity is static (loaded from the keybundle file, not regenerated every session) and file-backed, so it's pinned in `id_store` exactly like `rsa`/`password` (Functionality #9) — a `pq_hybrid` nickname reconnecting under a different keybundle triggers the same identity review popup a changed `rsa` key would.
 
+12. **Leave a channel with `/leave`.** Type it in the compose bar and press Enter — no argument, it always targets the currently selected channel tab (must actually be joined, same "leaves the typed command in place if it can't act" behavior as `/file`). Leaving a private channel removes its tab outright; leaving a public channel keeps the tab but marks it not-joined, and selecting it now shows a centered rejoin prompt instead of the usual view (Enter there re-requests joining). The dwell timer (Functionality #2) never silently rejoins a channel left this way. Full model in `docs/PROTOCOL.md` §6.2/§7.0.3.
+
 ## Encryption: how each method actually works
 
 Implementation map for the five `my_key` methods and the two things they
@@ -227,14 +235,14 @@ primitives live in `crypto/pq.rs`, covered in its own subsection below.
 
 | Step | Where |
 | --- | --- |
-| Bytes-per-block for a key | `crypto/mod.rs:187` `max_chunk_len` |
-| Encrypt (splits into blocks) | `crypto/mod.rs:197` `encrypt_chunked` |
-| Decrypt (rejoins blocks) | `crypto/mod.rs:221` `decrypt_chunked` |
-| Wire shape of one encrypted body | `proto.rs:218` `Envelope` |
+| Bytes-per-block for a key | `crypto/mod.rs:197` `max_chunk_len` |
+| Encrypt (splits into blocks) | `crypto/mod.rs:207` `encrypt_chunked` |
+| Decrypt (rejoins blocks) | `crypto/mod.rs:233` `decrypt_chunked` |
+| Wire shape of one encrypted body | `proto.rs:241` `Envelope` |
 
 The four RSA-based `my_key` methods differ **only in where the RSA keypair
 comes from**. `none` is not plaintext despite its `[🚨 PLAIN]` tag — see the
-tag table above. The single branch point is `connect.rs:221` `resolve_my_keypair`
+tag table above. The single branch point is `connect.rs:240` `resolve_my_keypair`
 (which also has `pq_hybrid`'s own arm, loading a keybundle instead of a
 plain RSA keypair - see below):
 
@@ -261,9 +269,9 @@ around the `ResolvedIdentity` match in `run_connected_session`) - see
 
 | | Channel | DM |
 | --- | --- | --- |
-| Send | `channel.rs:33` `handle_send_text` | `direct_message.rs:37` `handle_send_text` |
-| Encrypt (RSA methods) | `channel.rs:212` `encrypt_for_each` — loops recipients | `session.rs:718` `encrypt_for_one` — one recipient |
-| Encrypt (`pq_hybrid`) | same `encrypt_for_each`, dispatching to `session.rs:731` `encrypt_hybrid_envelope_for` per `pq_hybrid` recipient | `direct_message.rs` `encrypt_for_recipient`, same dispatch |
+| Send | `channel.rs:66` `handle_send_text` | `direct_message.rs:43` `handle_send_text` |
+| Encrypt (RSA methods) | `channel.rs:291` `encrypt_for_each` — loops recipients | `session.rs:829` `encrypt_for_one` — one recipient |
+| Encrypt (`pq_hybrid`) | same `encrypt_for_each`, dispatching to `session.rs:846` `encrypt_hybrid_envelope_for` per `pq_hybrid` recipient | `direct_message.rs` `encrypt_for_recipient`, same dispatch |
 | Wire message | `P2pPayload::Envelope { channel: Some(_), .. }`, one per member | `P2pPayload::Envelope { channel: None, .. }` |
 | Delivery | direct peer-to-peer link, one per recipient (`docs/PROTOCOL.md` §7.0/§7.1) — the server relays only the initial candidate exchange, never the message itself | same |
 | Receive + decrypt | `session.rs` `decrypt_envelope_for` → `rekey.rs` `decrypt_from` (RSA) or `crypto/pq.rs` `decrypt_hybrid` (`pq_hybrid`, dispatched by *our own* `own_key_mode`) | same |
@@ -271,7 +279,7 @@ around the `ResolvedIdentity` match in `run_connected_session`) - see
 A channel message is therefore encrypted N times for N members and delivered
 over N independent direct links — the server never sees any of them.
 `pq_hybrid` recipients that a non-`pq_hybrid` sender can't address at all
-(`channel.rs:83` `can_address`) are excluded before encryption even starts -
+(`channel.rs:125` `can_address`) are excluded before encryption even starts -
 see "What `pq_hybrid` adds" below.
 
 ### Voice messages
@@ -282,13 +290,13 @@ dedicated thread — never on the async event loop.
 
 | Stage | Where |
 | --- | --- |
-| Recipients' public keys parsed **once** at record-start | `channel.rs:190` `parse_recipients` / `direct_message.rs:96` `handle_voice_record_start` |
-| Record + encrypt loop (own thread) | `voice_stream.rs:197` `spawn_record_stream_worker` |
+| Recipients' public keys parsed **once** at record-start | `channel.rs:269` `parse_recipients` / `direct_message.rs:142` `handle_voice_record_start` |
+| Record + encrypt loop (own thread) | `voice_stream.rs:234` `spawn_record_stream_worker` |
 | Encrypt a chunk — channel (per recipient) | `voice_stream.rs` `build_chunk_recipients` → `p2p::P2pOutbound::ChannelVoiceChunk` |
 | Encrypt a chunk — DM | same, → `p2p::P2pOutbound::DirectVoiceChunk` |
 | Delivery | direct peer-to-peer link, unreliable/unordered per chunk (`docs/PROTOCOL.md` §7.0/§7.3) — never touches the server |
-| Receiving: pick the private key **once** for the whole stream | `voice_stream.rs:443` `resolve_incoming_key` → `rekey.rs:283` `candidate_privates_for` |
-| Decrypt loop (one thread per incoming stream) | `voice_stream.rs:317` `spawn_stream_decrypt_worker`, decrypt at `:338` |
+| Receiving: pick the private key **once** for the whole stream | `voice_stream.rs:519` `resolve_incoming_key` → `rekey.rs:317` `candidate_privates_for` |
+| Decrypt loop (one thread per incoming stream) | `voice_stream.rs:386` `spawn_stream_decrypt_worker`, decrypt at `:407` |
 
 Each incoming stream gets its own decrypt thread because RSA private-key
 decrypt is much costlier than public-key encrypt — one shared thread would fall
@@ -312,10 +320,10 @@ its RSA/PQ dispatch types directly rather than duplicating them.
 | Incoming offer: decrypt, trust-gate, queue + bell | `session.rs` `decrypt_file_offer`, `handle_incoming_file_offer` |
 | Accept: spawn the receive worker, log the row | `session.rs` `accept_file_offer` |
 | Sender learns of Accept: spawn the send worker | `session.rs` (`P2pEvent::FileAccepted` arm) |
-| Send worker — reads/encrypts/sends one chunk at a time | `file_stream.rs:71` `spawn_send_file_worker` |
-| Receive worker — decrypts/writes one chunk at a time | `file_stream.rs:125` `spawn_receive_file_worker` |
-| Forward an incoming chunk/end to its worker | `file_stream.rs:184`/`:199` `forward_chunk`/`end_incoming_transfer`, called from `session.rs:898`/`:901` |
-| Progress/completion/failure → log row | `session.rs:1358` `handle_file_event` → `UiState::set_file_progress`/`set_file_completed`/`set_file_rejected`/`set_file_failed` |
+| Send worker — reads/encrypts/sends one chunk at a time | `file_stream.rs:88` `spawn_send_file_worker` |
+| Receive worker — decrypts/writes one chunk at a time | `file_stream.rs:154` `spawn_receive_file_worker` |
+| Forward an incoming chunk/end to its worker | `file_stream.rs:220`/`:235` `forward_chunk`/`end_incoming_transfer`, called from `session.rs:1104`/`:1113` |
+| Progress/completion/failure → log row | `session.rs:1682` `handle_file_event` → `UiState::set_file_progress`/`set_file_completed`/`set_file_rejected`/`set_file_failed` |
 
 Line numbers are as of the commit that added this section; a drifted number
 still resolves via the named function, same convention as the tables above.
@@ -327,19 +335,19 @@ key is current at each moment. Full model in `docs/PROTOCOL.md` §11.
 
 | Piece | Where |
 | --- | --- |
-| Sign a new key with the key it replaces (PKCS#1 v1.5 + SHA-256) | `rekey.rs:38` `rotation_signing_payload`, `:46` `sign_rotation` → `crypto/mod.rs:235` `sign` |
-| Verify a peer's rotation | `rekey.rs:52` `verify_rotation`, `:59` `verify_and_parse_rotation` → `crypto/mod.rs:243` `verify` |
-| Keygen, off the event loop | `rekey.rs:134` `generate_and_sign_rotation`, run by `session.rs:194` `spawn_rotation_worker`, queued via `session.rs:1130` `request_rotation_if_per_message` |
-| Own per-peer keys + retained old keys | `rekey.rs:161` `OwnKeys` (retention bound `rekey.rs:31`) |
-| Is a peer's key fresh? queue if not | `rekey.rs:317` `RemoteKeys` — `try_use:343`, `enqueue:358`, `on_rotated:368` |
-| Apply an incoming rotation, flush the queue | `session.rs:1183` `handle_key_rotated` |
-| Reconnect continuity (persisted keys) | `own_next_keys.rs` + `session.rs:1058` `send_resume_rotation_if_available` (prove), `idstore.rs:158` `get` + `rekey.rs:106` `verify_with_fallback` (verify), both surfaced by `session.rs:1183` `handle_key_rotated` — *and*, for a `PerMessage` nickname that already has a continuity key pinned, gated on sight by `check_identity` (`session.rs:970`) itself, before any rotation attempt (`docs/PROTOCOL.md` §12.6.3) |
+| Sign a new key with the key it replaces (PKCS#1 v1.5 + SHA-256) | `rekey.rs:38` `rotation_signing_payload`, `:46` `sign_rotation` → `crypto/mod.rs:247` `sign` |
+| Verify a peer's rotation | `rekey.rs:59` `verify_rotation`, `:75` `verify_and_parse_rotation` → `crypto/mod.rs:256` `verify` |
+| Keygen, off the event loop | `rekey.rs:150` `generate_and_sign_rotation`, run by `session.rs:196` `spawn_rotation_worker`, queued via `session.rs:1393` `request_rotation_if_per_message` |
+| Own per-peer keys + retained old keys | `rekey.rs:177` `OwnKeys` (retention bound `rekey.rs:31`) |
+| Is a peer's key fresh? queue if not | `rekey.rs:351` `RemoteKeys` — `try_use:380`, `enqueue:395`, `on_rotated:412` |
+| Apply an incoming rotation, flush the queue | `session.rs:1446` `handle_key_rotated` |
+| Reconnect continuity (persisted keys) | `own_next_keys.rs` + `session.rs:1300` `send_resume_rotation_if_available` (prove), `idstore.rs:169` `get` + `rekey.rs:122` `verify_with_fallback` (verify), both surfaced by `session.rs:1446` `handle_key_rotated` — *and*, for a `PerMessage` nickname that already has a continuity key pinned, gated on sight by `check_identity` (`session.rs:1188`) itself, before any rotation attempt (`docs/PROTOCOL.md` §12.6.3) |
 
 Voice is exempt from per-chunk rotation (§11.6): one key snapshot covers a whole
-stream (`voice_stream.rs:197`), and a recipient without a fresh key (or whose
+stream (`voice_stream.rs:234`), and a recipient without a fresh key (or whose
 direct link isn't `Active` yet, `docs/PROTOCOL.md` §7.0/§7.3) is dropped
-from that stream (`channel.rs:159` in `handle_voice_record_start`) or the DM recording is refused outright
-(`direct_message.rs:106`).
+from that stream (`channel.rs:228` in `handle_voice_record_start`) or the DM recording is refused outright
+(`direct_message.rs:152`).
 
 ### What `pq_hybrid` adds
 
@@ -357,8 +365,8 @@ material and a different, self-contained primitive set. Full model in
 | Decrypt + dual-signature verify | `crypto/pq.rs` `decrypt_hybrid`, `unwrap_key`, `verify_body` |
 | Voice: per-stream key + per-chunk cipher | `crypto/pq.rs` `fresh_data_key`, `wrap_key_for_stream` (signs `stream_id++k_data` once), `encrypt_hybrid_voice_chunk`/`decrypt_hybrid_chunk` (deterministic nonce from `stream_id`+`seq`), `unwrap_key_for_stream` (verified once, cached) |
 | Own key material in the live session | `session.rs` `SessionState::own_pq_private` (mirrors `own_keys`, populated instead of it when `own_key_mode == PqHybrid`) |
-| Who can be addressed | `channel.rs:83` `can_address` - a `pq_hybrid` recipient needs a `pq_hybrid` sender (their own ML-DSA-87/RSA-sign identity); everyone else is reachable by any sender, as always |
-| `id_store` pinning | `session.rs:966` `uses_byte_comparison_pinning` - `pq_hybrid` joins `rsa`/`password` on the plain-byte-comparison side, unlike `rsa_per_msg`'s signature-based resume |
+| Who can be addressed | `channel.rs:125` `can_address` - a `pq_hybrid` recipient needs a `pq_hybrid` sender (their own ML-DSA-87/RSA-sign identity); everyone else is reachable by any sender, as always |
+| `id_store` pinning | `session.rs:1181` `uses_byte_comparison_pinning` - `pq_hybrid` joins `rsa`/`password` on the plain-byte-comparison side, unlike `rsa_per_msg`'s signature-based resume |
 | Auto-generate keys if missing | `crypto/pq.rs` `ensure_bundle_at`, called from `connect.rs` `resolve_my_keypair`'s `PqHybrid` arm (`docs/PROTOCOL.md` §13.9) |
 | Connect-popup cache (`~/.aloo/.cache`) | `connect.rs` `ConnectCache`, `cache_path`, `random_prefix`, `fresh_pq_hybrid_paths_in`, `prefill_connect_defaults` |
 
@@ -366,14 +374,14 @@ material and a different, self-contained primitive set. Full model in
 
 Authenticating *to the server* is unrelated to the message encryption above and
 has only three options (`ui_connect_popup.rs:148` `ServerKeySelection`,
-`proto.rs:200` `AuthKind`). Client side: `connect.rs:246` `build_auth_response`.
-Server side: `server.rs:62` `AuthConfig::verify`.
+`proto.rs:221` `AuthKind`). Client side: `connect.rs:286` `build_auth_response`.
+Server side: `server.rs:64` `AuthConfig::verify`.
 
 | Option | Check |
 | --- | --- |
 | `none` | passes unconditionally |
-| `password` | sent as-is and compared byte-for-byte in constant time (`crypto/mod.rs:259` `constant_time_eq`) — it is **not** hashed |
-| `rsa` | server sends a random nonce (`crypto/mod.rs:250` `random_bytes`, `server.rs:51` `make_challenge`); client encrypts it with the server's public key; server decrypts and compares |
+| `password` | sent as-is and compared byte-for-byte in constant time (`crypto/mod.rs:273` `constant_time_eq`) — it is **not** hashed |
+| `rsa` | server sends a random nonce (`crypto/mod.rs:264` `random_bytes`, `server.rs:53` `make_challenge`); client encrypts it with the server's public key; server decrypts and compares |
 
 ## Server responsibilities
 

@@ -8,14 +8,20 @@ use aloo::platform::resolve_home_dir;
 fn resolve_home_dir_prefers_home_over_userprofile() {
     let home = OsStr::new("/home/dave");
     let userprofile = OsStr::new(r"C:\Users\dave");
-    assert_eq!(resolve_home_dir(Some(home), Some(userprofile)), Some(PathBuf::from("/home/dave")));
+    assert_eq!(
+        resolve_home_dir(Some(home), Some(userprofile)),
+        Some(PathBuf::from("/home/dave"))
+    );
 }
 
 /// @requirement TB-122
 #[test]
 fn resolve_home_dir_falls_back_to_userprofile_when_home_is_unset() {
     let userprofile = OsStr::new(r"C:\Users\dave");
-    assert_eq!(resolve_home_dir(None, Some(userprofile)), Some(PathBuf::from(r"C:\Users\dave")));
+    assert_eq!(
+        resolve_home_dir(None, Some(userprofile)),
+        Some(PathBuf::from(r"C:\Users\dave"))
+    );
 }
 
 /// @requirement TB-122

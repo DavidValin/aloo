@@ -271,8 +271,8 @@ so_that = "I can take part in the conversation I care about"
 
 [[user_story.acceptance_criteria]]
 id = "AC-018"
-description = "The server's public channels are offered as tabs, and a freshly started server always offers 'general'."
-evidence = "docs/SPEC.md 'Server startup', docs/PROTOCOL.md 6; tests fresh_registry_has_default_public_general_channel, channel_list_adds_unjoined_channels_without_duplicating"
+description = "The server's public channels are offered as tabs, and a freshly started server always offers 'the-hall'."
+evidence = "docs/SPEC.md 'Server startup', docs/PROTOCOL.md 6; tests fresh_registry_has_default_public_the_hall_channel, channel_list_adds_unjoined_channels_without_duplicating"
 
 [[user_story.acceptance_criteria]]
 id = "AC-019"
@@ -311,8 +311,8 @@ evidence = "docs/PROTOCOL.md 6.1; tests joining_new_channel_sends_confirmation_a
 
 [[user_story.technical_behavior]]
 id = "TB-023"
-description = "An emptied private channel is deleted outright while an emptied public channel stays listed."
-evidence = "docs/PROTOCOL.md 6.2; test empty_private_channel_is_deleted_but_empty_public_channel_persists"
+description = "An emptied channel is deleted outright, whether public or private, unless it is DEFAULT_CHANNEL_NAME (the-hall), which survives being empty forever."
+evidence = "docs/PROTOCOL.md 6.2; test empty_channel_is_deleted_unless_it_is_the_default_channel"
 
 [[user_story.technical_behavior]]
 id = "TB-024"
@@ -338,6 +338,41 @@ evidence = "test user_joined_and_left_update_members_and_known_users"
 id = "TB-113"
 description = "The only failure path for a JoinChannel in practice - the requesting user not being registered - results in ChannelJoinFailed { name, reason } sent to the requester only."
 evidence = "docs/PROTOCOL.md 6.1; test join_channel_fails_for_an_unregistered_user"
+
+[[user_story.acceptance_criteria]]
+id = "AC-102"
+description = "Ctrl+J's channel-name field refuses to type a character outside letters/digits/'-' or past CHANNEL_NAME_MAX_LEN characters, and the server independently refuses any JoinChannel whose name fails the same rule, naming the problem."
+evidence = "docs/PROTOCOL.md 6.1; src/validation.rs channel_name_is_valid; tests join_channel_rejects_a_name_over_the_length_cap, join_channel_rejects_a_name_with_disallowed_characters, channel_name_is_valid_accepts_letters_digits_and_hyphen, channel_name_is_valid_rejects_over_the_length_cap, channel_name_is_valid_rejects_disallowed_characters, channel_name_is_valid_rejects_empty"
+
+[[user_story.acceptance_criteria]]
+id = "AC-103"
+description = "A channel tab is prefixed with an emoji naming its kind at a glance, followed by a space before the name: the globe for public, the lock for private."
+evidence = "docs/SPEC.md 'Connected UI'; src/ui/channel.rs render_channel_view; test channel_tabs_are_prefixed_by_kind"
+
+[[user_story.technical_behavior]]
+id = "TB-150"
+description = "Channel-name and channel-password validation (charset, length) is implemented once in a shared module and used identically by the client's input guard and the server's JoinChannel handling, so the two can never silently disagree about what's acceptable."
+evidence = "src/validation.rs; tests channel_name_is_valid_counts_unicode_scalar_values_not_bytes, channel_password_is_valid_accepts_the_documented_symbol_set, channel_password_is_valid_rejects_a_symbol_outside_the_set, channel_password_is_valid_rejects_over_the_length_cap, channel_password_is_valid_accepts_empty, join_channel_with_password_roundtrips, join_channel_without_password_roundtrips"
+
+[[user_story.acceptance_criteria]]
+id = "AC-107"
+description = "A channel other than DEFAULT_CHANNEL_NAME (the-hall) is unregistered from the server the instant its last member leaves, whether public or private; the-hall itself is never removed, even when it has no members."
+evidence = "docs/PROTOCOL.md 6.2; src/server.rs Registry::remove_member, DEFAULT_CHANNEL_NAME; test empty_channel_is_deleted_unless_it_is_the_default_channel"
+
+[[user_story.acceptance_criteria]]
+id = "AC-108"
+description = "The instant a new public channel is created, every other currently-connected client is told about it and it appears in their channel list, without waiting for a reconnect."
+evidence = "docs/PROTOCOL.md 6.1; src/server.rs Registry::join_channel; src/session.rs ChannelCreated arm; tests a_newly_created_public_channel_is_broadcast_to_other_connected_clients, end_to_end_a_second_client_sees_a_newly_created_public_channel"
+
+[[user_story.technical_behavior]]
+id = "TB-156"
+description = "Creating a private channel never triggers the ChannelCreated broadcast - it stays unadvertised exactly as before, the same guarantee AC-022/TB-154 already give every other channel-membership message."
+evidence = "docs/PROTOCOL.md 6.1, 6.3; src/server.rs Registry::join_channel; test creating_a_private_channel_never_broadcasts_channelcreated"
+
+[[user_story.technical_behavior]]
+id = "TB-159"
+description = "A UserJoined for a channel the client has no local tab for yet creates one on the spot, rather than silently dropping the membership - the server sends an already-populated channel's existing-member snapshot before the final Joined confirmation, and the joiner has no local tab yet the first time that happens for a private channel (never pre-known via ChannelList) or a public one joined by name rather than dwelled into."
+evidence = "docs/PROTOCOL.md 6.1; src/ui/channel.rs UiState::on_user_joined; tests on_user_joined_creates_the_tab_if_a_join_snapshot_arrives_before_joined, on_user_joined_does_not_duplicate_an_existing_tab"
 
 # ============================================================================
 # US-005 - Send a text message to a channel
@@ -1483,3 +1518,83 @@ evidence = "src/p2p_proto.rs SAFE_DATAGRAM_BYTES; src/file_transfer.rs FILE_CHUN
 id = "TB-149"
 description = "A direct link's punch handshake is triggered eagerly, the moment a peer is first learned about (ServerMessage::UserJoined), rather than lazily on first send - since voice (unlike text/file) excludes a recipient outright if its link isn't already Active at record-start, a lazy trigger meant the first voice message to any brand-new peer reliably missed them. A pre-warmed link that fails to punch with nothing ever queued against it fails silently (no visible LinkFailed banner) - only a link something was genuinely waiting on surfaces a visible failure."
 evidence = "src/session.rs handle_server_message's UserJoined arm (ensure_link call); src/p2p.rs PeerLinkManager::tick_at (had_pending gate on emitting P2pEvent::LinkFailed); test punch_timeout_with_nothing_pending_fails_silently"
+
+[[user_story.technical_behavior]]
+id = "TB-155"
+description = "A client only responds to an incoming PeerCandidates (the P2P link handshake) from a peer it currently shares a joined channel with; a request from anyone else is silently dropped before it ever reaches PeerLinkManager, since the server's own relay performs no relationship checking of its own."
+evidence = "docs/PROTOCOL.md 7.0.2; src/session.rs handle_server_message's PeerCandidates arm; src/ui/channel.rs UiState::shares_a_joined_channel"
+
+# ============================================================================
+# US-025 - Protect a private channel with a password
+# ============================================================================
+[[user_story]]
+id = "US-025"
+title = "Protect a private channel with a password"
+as_a = "user creating or rejoining a private channel"
+i_want = "to set a password when I create it, and be asked for it again to rejoin"
+so_that = "someone who merely learns or guesses its name can't join it"
+
+[[user_story.acceptance_criteria]]
+id = "AC-104"
+description = "Ctrl+J's popup offers a Public/Private selector and, while Private is selected, an optional password field capped at CHANNEL_PASSWORD_MAX_LEN characters of letters, digits, and a documented set of basic symbols; creating a private channel with a password lets a later client join it by supplying the same password."
+evidence = "docs/SPEC.md Functionality #2; src/ui/channel.rs handle_join_popup_key, render_join_popup; tests private_channel_created_with_a_password_can_be_joined_by_a_second_client_with_the_right_one, end_to_end_password_protected_channel_join_flow, join_channel_with_password_roundtrips"
+
+[[user_story.acceptance_criteria]]
+id = "AC-105"
+description = "Joining a password-protected private channel with no password, or the wrong one, opens a dedicated password-entry popup naming which problem occurred, distinct from any other join failure, and lets the user retype and resubmit."
+evidence = "docs/PROTOCOL.md 6.5; src/ui/ui.rs Mode::ChannelPasswordPopup; src/ui/channel.rs handle_channel_password_popup_key, on_channel_join_rejected; tests private_channel_created_with_a_password_rejects_a_join_with_no_password, private_channel_created_with_a_password_rejects_a_join_with_the_wrong_password, end_to_end_password_protected_channel_join_flow, channel_join_rejected_roundtrips_all_three_kinds"
+
+[[user_story.acceptance_criteria]]
+id = "AC-106"
+description = "More than CHANNEL_MAX_PASSWORD_ATTEMPTS wrong attempts to join one private channel from one source address bans further attempts against that channel from that address for CHANNEL_PASSWORD_BAN_DURATION, reported distinctly from a plain wrong-password reply."
+evidence = "docs/PROTOCOL.md 6.6; src/server.rs Registry::join_channel, CHANNEL_MAX_PASSWORD_ATTEMPTS, CHANNEL_PASSWORD_BAN_DURATION; test more_than_seven_wrong_attempts_from_one_ip_bans_that_ip_for_that_channel"
+
+[[user_story.technical_behavior]]
+id = "TB-151"
+description = "Channel password comparison is constant-time, mirroring the credential check TB-015 already requires for server auth."
+evidence = "docs/PROTOCOL.md 5.2, 6.5; src/crypto.rs constant_time_eq; src/server.rs Registry::join_channel"
+
+[[user_story.technical_behavior]]
+id = "TB-152"
+description = "A successful password join resets that (source address, channel) pair's wrong-attempt counter to zero, so an earlier mistake never contributes toward a later, unrelated ban."
+evidence = "src/server.rs Registry::join_channel; test a_successful_password_join_resets_the_attempt_counter"
+
+[[user_story.technical_behavior]]
+id = "TB-153"
+description = "The brute-force ban is keyed by (source IP address, channel name), not UserId, and tracked in server memory only with no persistence across a restart - a UserId is never reused (TB-020), so a per-UserId ban would be trivially bypassed by reconnecting."
+evidence = "docs/PROTOCOL.md 6.6; src/server.rs Registry::channel_password_attempts; test a_ban_is_scoped_to_ip_and_channel_not_userid"
+
+[[user_story.technical_behavior]]
+id = "TB-154"
+description = "A ChannelJoinRejected (password-required, wrong-password, or banned) is sent to the requester only - a private channel's existence, membership, or password state never leaks to anyone else through this flow, the same guarantee TB-113 already gives ChannelJoinFailed."
+evidence = "docs/PROTOCOL.md 6.3, 6.5; src/server.rs Registry::join_channel; test channel_join_rejected_is_sent_to_the_requester_only"
+
+# ============================================================================
+# US-026 - Leave a channel
+# ============================================================================
+[[user_story]]
+id = "US-026"
+title = "Leave a channel"
+as_a = "member of a channel"
+i_want = "to stop being a member of it without disconnecting entirely"
+so_that = "I can step away from a conversation I'm done with while staying connected to the rest"
+
+[[user_story.acceptance_criteria]]
+id = "AC-109"
+description = "Typing /leave and pressing Enter leaves the currently selected channel tab, public or private. Leaving a private channel removes its tab entirely; leaving a public channel keeps its tab but the client is no longer a member of it."
+evidence = "docs/SPEC.md Functionality; src/ui/ui.rs submit_input's /leave branch; src/ui/channel.rs UiState::leave_channel_locally; tests slash_leave_on_a_private_channel_removes_its_tab, slash_leave_on_a_public_channel_keeps_the_tab_but_marks_it_left"
+
+[[user_story.acceptance_criteria]]
+id = "AC-110"
+description = "Selecting a public channel tab you've left shows a single centered screen - 'You left this public channel. Do you want to join?' - instead of the normal sidebar/messages/compose view, and pressing Enter there requests rejoining it."
+evidence = "docs/SPEC.md Functionality; src/ui/channel.rs render_left_channel_screen; src/ui/ui.rs handle_key's left-channel branch; test left_channel_screen_enter_requests_rejoin"
+
+[[user_story.technical_behavior]]
+id = "TB-157"
+description = "The dwell timer never re-fires a join for a channel the user explicitly left (ChannelTab::left) - only a channel that was simply never joined yet still dwell-auto-joins; a left channel only rejoins via the explicit Enter-to-rejoin action."
+evidence = "src/ui/channel.rs UiState::tick_dwell; test dwell_does_not_refire_for_a_left_channel"
+
+[[user_story.technical_behavior]]
+id = "TB-158"
+description = "Leaving a channel - locally via /leave, or being told a peer left via UserLeft - drops the P2P link to any peer with whom no joined channel or DM history remains (UiState::has_reason_to_keep_link), the same bar on_user_offline already uses to decide whether to keep a departed user listed."
+evidence = "docs/PROTOCOL.md 7.0.3; src/channel.rs handle_leave; src/session.rs UserLeft arm; tests has_reason_to_keep_link_is_true_for_a_shared_channel, has_reason_to_keep_link_is_true_for_dm_history, has_reason_to_keep_link_is_false_with_neither"

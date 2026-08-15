@@ -108,11 +108,18 @@ pub enum VoiceError {
 /// dlopen'd plugin, just directly, so the plugin-preference dance is
 /// unnecessary there.
 #[cfg(not(target_env = "musl"))]
-fn prefer_pulse(devices: impl Iterator<Item = cpal::Device>, default: Option<cpal::Device>) -> Option<cpal::Device> {
+fn prefer_pulse(
+    devices: impl Iterator<Item = cpal::Device>,
+    default: Option<cpal::Device>,
+) -> Option<cpal::Device> {
     let mut devices: Vec<cpal::Device> = devices.collect();
-    let pulse_pos = devices
-        .iter()
-        .position(|d| d.description().ok().and_then(|desc| desc.driver().map(str::to_string)).as_deref() == Some("pulse"));
+    let pulse_pos = devices.iter().position(|d| {
+        d.description()
+            .ok()
+            .and_then(|desc| desc.driver().map(str::to_string))
+            .as_deref()
+            == Some("pulse")
+    });
     match pulse_pos {
         Some(pos) => Some(devices.swap_remove(pos)),
         None => default,
@@ -171,7 +178,11 @@ pub fn resample(samples: &[i16], from_rate: u32, to_rate: u32) -> Vec<i16> {
         let frac = src_pos - idx as f64;
         let a = samples.get(idx).copied().unwrap_or(0) as f64;
         let b = samples.get(idx + 1).copied().unwrap_or(a as i16) as f64;
-        out.push((a + (b - a) * frac).round().clamp(i16::MIN as f64, i16::MAX as f64) as i16);
+        out.push(
+            (a + (b - a) * frac)
+                .round()
+                .clamp(i16::MIN as f64, i16::MAX as f64) as i16,
+        );
     }
     out
 }
@@ -228,7 +239,9 @@ static END_CHIME_SAMPLES: OnceLock<Vec<i16>> = OnceLock::new();
 /// ever missing/malformed, rather than failing the whole app over a
 /// decorative sound effect.
 pub fn end_chime_samples() -> Vec<i16> {
-    END_CHIME_SAMPLES.get_or_init(|| decode_wav_to_mono(END_CHIME_WAV).unwrap_or_default()).clone()
+    END_CHIME_SAMPLES
+        .get_or_init(|| decode_wav_to_mono(END_CHIME_WAV).unwrap_or_default())
+        .clone()
 }
 
 /// Bundled the same way as `END_CHIME_WAV` - a plain WAV, no MP3-decoding
@@ -244,7 +257,9 @@ static BELL_CHIME_SAMPLES: OnceLock<Vec<i16>> = OnceLock::new();
 /// pattern `play_end_chime` already uses. Empty if the bundled asset is
 /// ever missing/malformed, same fallback as `end_chime_samples`.
 pub fn bell_chime_samples() -> Vec<i16> {
-    BELL_CHIME_SAMPLES.get_or_init(|| decode_wav_to_mono(BELL_CHIME_WAV).unwrap_or_default()).clone()
+    BELL_CHIME_SAMPLES
+        .get_or_init(|| decode_wav_to_mono(BELL_CHIME_WAV).unwrap_or_default())
+        .clone()
 }
 
 /// Decodes a canonical PCM WAV file's audio into mono samples at
@@ -360,7 +375,9 @@ impl Recorder {
             SampleFormat::I16 => device.build_input_stream(
                 stream_config,
                 move |data: &[i16], _| {
-                    buf.lock().unwrap().extend(downmix_i16_to_mono(data, channels));
+                    buf.lock()
+                        .unwrap()
+                        .extend(downmix_i16_to_mono(data, channels));
                 },
                 move |err| on_stream_error(err.to_string()),
                 None,
@@ -368,7 +385,9 @@ impl Recorder {
             SampleFormat::F32 => device.build_input_stream(
                 stream_config,
                 move |data: &[f32], _| {
-                    buf.lock().unwrap().extend(downmix_f32_to_mono_i16(data, channels));
+                    buf.lock()
+                        .unwrap()
+                        .extend(downmix_f32_to_mono_i16(data, channels));
                 },
                 move |err| on_stream_error(err.to_string()),
                 None,
@@ -377,9 +396,15 @@ impl Recorder {
         }
         .map_err(|e| VoiceError::Device(e.to_string()))?;
 
-        stream.play().map_err(|e| VoiceError::Device(e.to_string()))?;
+        stream
+            .play()
+            .map_err(|e| VoiceError::Device(e.to_string()))?;
 
-        Ok(Self { stream, buffer, sample_rate })
+        Ok(Self {
+            stream,
+            buffer,
+            sample_rate,
+        })
     }
 
     /// Drains everything captured since the last call (or since `start`),
@@ -431,14 +456,22 @@ pub(crate) struct MixSource {
 
 impl MixSource {
     pub(crate) fn new() -> Self {
-        Self { queue: VecDeque::new(), finished: false, started: false, first_seen: Instant::now() }
+        Self {
+            queue: VecDeque::new(),
+            finished: false,
+            started: false,
+            first_seen: Instant::now(),
+        }
     }
 
     /// A `Finish` with no prior `Push` (an empty clip, or a stream that
     /// ended before its first chunk) - already-finished and empty, so
     /// `mix_output` drops it on the next tick.
     pub(crate) fn new_finished() -> Self {
-        Self { finished: true, ..Self::new() }
+        Self {
+            finished: true,
+            ..Self::new()
+        }
     }
 
     pub(crate) fn extend(&mut self, samples: &[i16]) {
@@ -457,11 +490,20 @@ impl MixSource {
 /// cpal, always `SAMPLE_RATE_HZ` for `voice_pulse` since that backend asks
 /// PulseAudio for `SAMPLE_RATE_HZ` directly), used to resample `Push`ed
 /// audio once here rather than in every caller.
-pub(crate) fn apply_mixer_cmd(sources: &Mutex<HashMap<u64, MixSource>>, out_rate: u32, cmd: MixerCmd) {
+pub(crate) fn apply_mixer_cmd(
+    sources: &Mutex<HashMap<u64, MixSource>>,
+    out_rate: u32,
+    cmd: MixerCmd,
+) {
     match cmd {
         MixerCmd::Push { id, samples } => {
             let resampled = resample(&samples, SAMPLE_RATE_HZ, out_rate);
-            sources.lock().unwrap().entry(id).or_insert_with(MixSource::new).extend(&resampled);
+            sources
+                .lock()
+                .unwrap()
+                .entry(id)
+                .or_insert_with(MixSource::new)
+                .extend(&resampled);
         }
         MixerCmd::Finish { id } => {
             let mut map = sources.lock().unwrap();
@@ -509,7 +551,11 @@ pub fn spawn_mixer(
 
         while let Some(cmd) = rx.blocking_recv() {
             if out_rate.is_none() && !open_failed {
-                match try_open_mixer_stream(sources.clone(), on_stream_error.clone(), on_finished.clone()) {
+                match try_open_mixer_stream(
+                    sources.clone(),
+                    on_stream_error.clone(),
+                    on_finished.clone(),
+                ) {
                     Ok((stream, rate)) => {
                         out_rate = Some(rate);
                         _stream = Some(stream);
@@ -560,7 +606,16 @@ fn try_open_mixer_stream(
             let on_finished_cb = on_finished;
             device.build_output_stream(
                 stream_config,
-                move |data: &mut [i16], _| mix_output(data, out_channels, out_rate, &sources_cb, &on_finished_cb, |s| s),
+                move |data: &mut [i16], _| {
+                    mix_output(
+                        data,
+                        out_channels,
+                        out_rate,
+                        &sources_cb,
+                        &on_finished_cb,
+                        |s| s,
+                    )
+                },
                 move |err| on_stream_error(err.to_string()),
                 None,
             )
@@ -571,7 +626,14 @@ fn try_open_mixer_stream(
             device.build_output_stream(
                 stream_config,
                 move |data: &mut [f32], _| {
-                    mix_output(data, out_channels, out_rate, &sources_cb, &on_finished_cb, |s| s as f32 / i16::MAX as f32)
+                    mix_output(
+                        data,
+                        out_channels,
+                        out_rate,
+                        &sources_cb,
+                        &on_finished_cb,
+                        |s| s as f32 / i16::MAX as f32,
+                    )
                 },
                 move |err| on_stream_error(err.to_string()),
                 None,
@@ -581,7 +643,9 @@ fn try_open_mixer_stream(
     }
     .map_err(|e| VoiceError::Device(e.to_string()))?;
 
-    stream.play().map_err(|e| VoiceError::Device(e.to_string()))?;
+    stream
+        .play()
+        .map_err(|e| VoiceError::Device(e.to_string()))?;
     Ok((stream, out_rate))
 }
 
@@ -607,12 +671,15 @@ pub(crate) fn mix_output<T: Copy>(
         for src in map.values_mut() {
             if !src.started {
                 let queued_ms = (src.queue.len() as u64 * 1000) / out_rate.max(1) as u64;
-                let waited_enough = src.first_seen.elapsed().as_millis() as u64 >= JITTER_MAX_WAIT_MS;
+                let waited_enough =
+                    src.first_seen.elapsed().as_millis() as u64 >= JITTER_MAX_WAIT_MS;
                 if src.finished || queued_ms >= JITTER_PREBUFFER_MS || waited_enough {
                     src.started = true;
                 }
             }
-            if src.started && let Some(s) = src.queue.pop_front() {
+            if src.started
+                && let Some(s) = src.queue.pop_front()
+            {
                 sum += s as i32;
             }
         }

@@ -37,7 +37,8 @@ use libpulse_simple_binding::Simple;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::voice::{
-    MixSource, MixerCmd, Result, SAMPLE_RATE_HZ, VoiceError, apply_mixer_cmd, mix_output, pcm_from_bytes, pcm_to_bytes,
+    MixSource, MixerCmd, Result, SAMPLE_RATE_HZ, VoiceError, apply_mixer_cmd, mix_output,
+    pcm_from_bytes, pcm_to_bytes,
 };
 
 /// Every stream this module opens is mono PCM16 at `SAMPLE_RATE_HZ` -
@@ -47,7 +48,11 @@ use crate::voice::{
 /// are no-ops (kept anyway for structural parity with the cpal backend,
 /// and as a safety net if that ever stops being true).
 fn spec() -> Spec {
-    Spec { format: Format::S16le, channels: 1, rate: SAMPLE_RATE_HZ }
+    Spec {
+        format: Format::S16le,
+        channels: 1,
+        rate: SAMPLE_RATE_HZ,
+    }
 }
 
 /// How many mono PCM16 frames one `Simple::read`/`write` call moves - 20ms
@@ -73,8 +78,17 @@ impl Recorder {
     /// mirroring the cpal backend's contract (see its `Recorder::start`
     /// doc comment for why this can't just be an `eprintln!`).
     pub fn start(on_stream_error: impl Fn(String) + Send + 'static) -> Result<Self> {
-        let simple = Simple::new(None, "aloo", Direction::Record, None, "voice capture", &spec(), None, None)
-            .map_err(|e| VoiceError::Device(format!("{e}")))?;
+        let simple = Simple::new(
+            None,
+            "aloo",
+            Direction::Record,
+            None,
+            "voice capture",
+            &spec(),
+            None,
+            None,
+        )
+        .map_err(|e| VoiceError::Device(format!("{e}")))?;
 
         let buffer = Arc::new(Mutex::new(Vec::new()));
         let buf = buffer.clone();
@@ -138,7 +152,16 @@ pub fn spawn_mixer(
     std::thread::spawn(move || {
         let sources: Arc<Mutex<HashMap<u64, MixSource>>> = Arc::new(Mutex::new(HashMap::new()));
 
-        let simple = match Simple::new(None, "aloo", Direction::Playback, None, "voice playback", &spec(), None, None) {
+        let simple = match Simple::new(
+            None,
+            "aloo",
+            Direction::Playback,
+            None,
+            "voice playback",
+            &spec(),
+            None,
+            None,
+        ) {
             Ok(s) => s,
             Err(e) => {
                 // Mirrors the cpal backend's "device unavailable for the
@@ -156,7 +179,14 @@ pub fn spawn_mixer(
         std::thread::spawn(move || {
             let mut buf = vec![0i16; chunk_frames()];
             loop {
-                mix_output(&mut buf, 1, SAMPLE_RATE_HZ, &writer_sources, &writer_on_finished, |s| s);
+                mix_output(
+                    &mut buf,
+                    1,
+                    SAMPLE_RATE_HZ,
+                    &writer_sources,
+                    &writer_on_finished,
+                    |s| s,
+                );
                 if let Err(e) = simple.write(&pcm_to_bytes(&buf)) {
                     writer_on_error(format!("{e}"));
                     break;

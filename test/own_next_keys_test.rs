@@ -1,14 +1,21 @@
 use aloo::crypto::{self, KeyPair};
-use aloo::own_next_keys::{default_path, OwnNextKeys};
+use aloo::own_next_keys::{OwnNextKeys, default_path};
 use std::path::PathBuf;
 
 fn temp_store_path() -> PathBuf {
-    std::env::temp_dir().join(format!("aloo-own-next-keys-test-{}-{}", std::process::id(), fastrand_seed()))
+    std::env::temp_dir().join(format!(
+        "aloo-own-next-keys-test-{}-{}",
+        std::process::id(),
+        fastrand_seed()
+    ))
 }
 
 fn fastrand_seed() -> u128 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
 }
 
 /// @requirement TB-093
@@ -45,7 +52,10 @@ fn set_overwrites_the_previous_key_for_the_same_nickname() {
     let der2 = crypto::private_key_to_der(&kp2.private).unwrap();
 
     store.set("alice", kp1.private);
-    assert_eq!(crypto::private_key_to_der(store.get("alice").unwrap()).unwrap(), der1);
+    assert_eq!(
+        crypto::private_key_to_der(store.get("alice").unwrap()).unwrap(),
+        der1
+    );
 
     store.set("alice", kp2.private);
     let current = crypto::private_key_to_der(store.get("alice").unwrap()).unwrap();
@@ -66,8 +76,14 @@ fn different_nicknames_are_tracked_independently() {
     store.set("alice", kp_alice.private);
     store.set("bob", kp_bob.private);
 
-    assert_eq!(crypto::private_key_to_der(store.get("alice").unwrap()).unwrap(), der_alice);
-    assert_eq!(crypto::private_key_to_der(store.get("bob").unwrap()).unwrap(), der_bob);
+    assert_eq!(
+        crypto::private_key_to_der(store.get("alice").unwrap()).unwrap(),
+        der_alice
+    );
+    assert_eq!(
+        crypto::private_key_to_der(store.get("bob").unwrap()).unwrap(),
+        der_bob
+    );
 }
 
 /// @requirement TB-088
@@ -94,8 +110,11 @@ fn save_then_load_round_trips_a_usable_private_key() {
 /// @requirement TB-089
 #[test]
 fn save_creates_missing_parent_directories() {
-    let dir =
-        std::env::temp_dir().join(format!("aloo-own-next-keys-dir-test-{}-{}", std::process::id(), fastrand_seed()));
+    let dir = std::env::temp_dir().join(format!(
+        "aloo-own-next-keys-dir-test-{}-{}",
+        std::process::id(),
+        fastrand_seed()
+    ));
     let path = dir.join("nested").join("own_next_keys");
     let mut store = OwnNextKeys::load(&path).unwrap();
     store.set("alice", KeyPair::generate().unwrap().private);
@@ -117,7 +136,11 @@ fn a_nickname_containing_a_tab_is_never_stored() {
 #[test]
 fn default_path_always_resolves_under_the_dot_aloo_home_directory() {
     let path = default_path();
-    assert_eq!(path.file_name(), Some(std::ffi::OsStr::new("own_next_keys")), "unexpected file name: {path:?}");
+    assert_eq!(
+        path.file_name(),
+        Some(std::ffi::OsStr::new("own_next_keys")),
+        "unexpected file name: {path:?}"
+    );
     assert_eq!(
         path.parent().and_then(|p| p.file_name()),
         Some(std::ffi::OsStr::new(".aloo")),
@@ -140,9 +163,18 @@ fn corrupted_lines_in_an_existing_file_are_skipped_not_fatal() {
     )
     .unwrap();
     let store = OwnNextKeys::load(&path).expect("a partially-corrupt file should still load");
-    assert!(store.get("alice").is_some(), "the one genuinely valid entry should load");
-    assert!(store.get("carol").is_none(), "odd-length hex should be skipped");
-    assert!(store.get("bob").is_none(), "valid hex that isn't a real PKCS8 key should be skipped");
+    assert!(
+        store.get("alice").is_some(),
+        "the one genuinely valid entry should load"
+    );
+    assert!(
+        store.get("carol").is_none(),
+        "odd-length hex should be skipped"
+    );
+    assert!(
+        store.get("bob").is_none(),
+        "valid hex that isn't a real PKCS8 key should be skipped"
+    );
     std::fs::remove_file(&path).ok();
 }
 

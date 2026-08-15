@@ -85,6 +85,10 @@ name = "crypto_test"
 path = "test/crypto_test.rs"
 
 [[test]]
+name = "validation_test"
+path = "test/validation_test.rs"
+
+[[test]]
 name = "file_transfer_test"
 path = "test/file_transfer_test.rs"
 

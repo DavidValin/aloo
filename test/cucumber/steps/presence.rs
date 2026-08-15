@@ -1,8 +1,8 @@
 //! Who is present, who has gone, and the help overlay
 //! (US-012, US-013, US-014, US-016).
 
-use cucumber::{given, then, when};
 use crossterm::event::{KeyCode, KeyModifiers};
+use cucumber::{given, then, when};
 use ratatui::style::Color;
 
 use aloo::proto::UserId;
@@ -36,7 +36,10 @@ async fn tag_after(w: &mut AlooWorld, name: String) {
 #[then(expr = "the private room title reads {string} with the rsa_per_msg tag after the name")]
 async fn room_title_tag(w: &mut AlooWorld, title: String) {
     let rows = ui_rows(w.ui_ref());
-    assert!(rows.iter().any(|r| r.contains(&title)), "expected the title to lead with the name: {rows:?}");
+    assert!(
+        rows.iter().any(|r| r.contains(&title)),
+        "expected the title to lead with the name: {rows:?}"
+    );
     assert!(
         appears_before(&rows, "bob", "RSAPM"),
         "the peer's tag belongs after their name in the title too: {rows:?}"
@@ -61,7 +64,10 @@ async fn still_listed(w: &mut AlooWorld, name: String) {
         state.channels[0].members.iter().any(|m| m.id == id),
         "someone I have history with stays listed rather than vanishing"
     );
-    assert!(state.offline.contains(&id), "and is still tracked as offline");
+    assert!(
+        state.offline.contains(&id),
+        "and is still tracked as offline"
+    );
 }
 
 #[then(expr = "{word} is dropped from the channel list")]
@@ -72,7 +78,10 @@ async fn dropped(w: &mut AlooWorld, name: String) {
         !state.channels[0].members.iter().any(|m| m.id == id),
         "with no history to keep them around for, they are removed like an explicit leave"
     );
-    assert!(state.offline.contains(&id), "but they are still remembered as offline");
+    assert!(
+        state.offline.contains(&id),
+        "but they are still remembered as offline"
+    );
 }
 
 #[then(expr = "{word} is rendered in gray while {word} stays green")]
@@ -85,12 +94,20 @@ async fn gray_vs_green(w: &mut AlooWorld, offline: String, online: String) {
         "an offline member should be rendered in soft gray"
     );
     let (nx, ny) = find_text_start(&buffer, &online);
-    assert_eq!(buffer[(nx, ny)].fg, Color::Green, "a still-connected member should stay green");
+    assert_eq!(
+        buffer[(nx, ny)].fg,
+        Color::Green,
+        "a still-connected member should stay green"
+    );
 }
 
 #[then("the compose bar refuses everything I type")]
 async fn compose_refuses(w: &mut AlooWorld) {
-    assert_eq!(w.ui_ref().input, "", "typing must be a no-op while the peer is offline");
+    assert_eq!(
+        w.ui_ref().input,
+        "",
+        "typing must be a no-op while the peer is offline"
+    );
 }
 
 #[then(expr = "the private room holds only {int} message")]
@@ -108,13 +125,18 @@ async fn room_message_count(w: &mut AlooWorld, n: usize) {
 async fn offline_notice(w: &mut AlooWorld) {
     let buffer = ui_buffer(w.ui_ref(), 100, 15);
     let (x, y) = find_text_start(&buffer, "(user offline)");
-    assert_eq!(buffer[(x, y)].fg, Color::Red, "the offline notice should be red");
+    assert_eq!(
+        buffer[(x, y)].fg,
+        Color::Red,
+        "the offline notice should be red"
+    );
 }
 
 #[then(expr = "{word} stays offline even if a join for them arrives again")]
 async fn offline_is_permanent(w: &mut AlooWorld, name: String) {
     let id = UserId(id_for(&name));
-    let info = crate::steps::ui_common::user_with_mode(id_for(&name), &name, aloo::proto::KeyMode::Rsa);
+    let info =
+        crate::steps::ui_common::user_with_mode(id_for(&name), &name, aloo::proto::KeyMode::Rsa);
     w.ui_mut().on_user_joined("general", info);
     assert!(
         w.ui_ref().offline.contains(&id),
@@ -145,7 +167,10 @@ async fn help_content(w: &mut AlooWorld) {
         ("Space", "how to send a voice message"),
         ("/file", "how to send a file"),
     ] {
-        assert!(rows.iter().any(|r| r.contains(needle)), "expected {what}: {rows:?}");
+        assert!(
+            rows.iter().any(|r| r.contains(needle)),
+            "expected {what}: {rows:?}"
+        );
     }
 }
 
@@ -157,22 +182,32 @@ async fn help_content(w: &mut AlooWorld) {
 async fn help_content_scrolled(w: &mut AlooWorld) {
     press_key(w, KeyCode::End, KeyModifiers::NONE);
     let rows = ui_rows(w.ui_ref());
-    assert!(rows.iter().any(|r| r.contains("RSAPM")), "expected the encryption tags explained: {rows:?}");
-    assert!(rows.iter().any(|r| r.contains("Identity pinning")), "expected identity pinning: {rows:?}");
+    assert!(
+        rows.iter().any(|r| r.contains("RSAPM")),
+        "expected the encryption tags explained: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|r| r.contains("Identity pinning")),
+        "expected identity pinning: {rows:?}"
+    );
 }
 
 #[then("the help hint sits at the top right")]
 async fn help_hint(w: &mut AlooWorld) {
     let rows = ui_rows(w.ui_ref());
     assert!(
-        rows.iter().any(|r| r.contains("Ctrl+H") && r.contains("Help")),
+        rows.iter()
+            .any(|r| r.contains("Ctrl+H") && r.contains("Help")),
         "the hint should always be there as a reminder: {rows:?}"
     );
 }
 
 #[then("my typing does not reach the compose bar")]
 async fn typing_absorbed(w: &mut AlooWorld) {
-    assert!(w.ui_ref().input.is_empty(), "help absorbs every other key while it is open");
+    assert!(
+        w.ui_ref().input.is_empty(),
+        "help absorbs every other key while it is open"
+    );
 }
 
 #[then(expr = "focus is still on the {word}")]
@@ -183,7 +218,11 @@ async fn focus_unchanged(w: &mut AlooWorld, area: String) {
         "compose" | "input" => Focus::Input,
         other => panic!("unknown focus target {other:?}"),
     };
-    assert_eq!(w.ui_ref().focus, expected, "no navigation should happen underneath the overlay");
+    assert_eq!(
+        w.ui_ref().focus,
+        expected,
+        "no navigation should happen underneath the overlay"
+    );
 }
 
 #[then("the private room underneath is untouched")]
@@ -203,7 +242,10 @@ async fn help_unclipped(w: &mut AlooWorld) {
     press_key(w, KeyCode::End, KeyModifiers::NONE);
     let rows = ui_rows(w.ui_ref());
     let tail = "rsa_per_msg: a fresh key every message, signed by the one it replaces";
-    assert!(rows.iter().any(|r| r.contains(tail)), "expected the longest help line in full: {rows:?}");
+    assert!(
+        rows.iter().any(|r| r.contains(tail)),
+        "expected the longest help line in full: {rows:?}"
+    );
 }
 
 #[then("the help popup stays within 90 percent of a narrow terminal")]
@@ -221,12 +263,21 @@ async fn help_width_capped(w: &mut AlooWorld) {
         .expect("expected the popup's title row");
     let row_chars: Vec<char> = border_row.chars().collect();
     let title: Vec<char> = "Help (Ctrl+H to close, arrows to scroll)".chars().collect();
-    let title_start =
-        row_chars.windows(title.len()).position(|c| c == title.as_slice()).expect("title in row");
-    assert_eq!(row_chars[title_start - 1], '┌', "expected the corner right before the title");
+    let title_start = row_chars
+        .windows(title.len())
+        .position(|c| c == title.as_slice())
+        .expect("title in row");
+    assert_eq!(
+        row_chars[title_start - 1],
+        '┌',
+        "expected the corner right before the title"
+    );
     let popup_start = title_start - 1;
-    let popup_end =
-        row_chars[popup_start..].iter().position(|&c| c == '┐').expect("closing corner") + popup_start;
+    let popup_end = row_chars[popup_start..]
+        .iter()
+        .position(|&c| c == '┐')
+        .expect("closing corner")
+        + popup_start;
     let popup_width = popup_end - popup_start + 1;
     let max_allowed = (width as u32 * 9 / 10) as usize;
     assert!(
@@ -242,13 +293,20 @@ async fn given_help_open(w: &mut AlooWorld) {
 
 #[then("the help overlay is scrolled down")]
 async fn help_scrolled_down(w: &mut AlooWorld) {
-    assert!(w.ui_ref().help_scroll() > 0, "End should have scrolled past the top");
+    assert!(
+        w.ui_ref().help_scroll() > 0,
+        "End should have scrolled past the top"
+    );
 }
 
 #[then("the help overlay is scrolled to the top")]
 async fn help_scrolled_to_top(w: &mut AlooWorld) {
     assert!(w.ui_ref().help_open, "should have reopened");
-    assert_eq!(w.ui_ref().help_scroll(), 0, "reopening must not resume wherever it was left last time");
+    assert_eq!(
+        w.ui_ref().help_scroll(),
+        0,
+        "reopening must not resume wherever it was left last time"
+    );
 }
 
 // ---------------------------------------------------------------------

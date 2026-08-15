@@ -48,7 +48,15 @@ impl ArqSender {
     pub fn send(&mut self, payload: Vec<u8>) -> u32 {
         let seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1);
-        self.unacked.insert(seq, Unacked { payload, sent_at: Instant::now(), backoff: INITIAL_RETRANSMIT, retries: 0 });
+        self.unacked.insert(
+            seq,
+            Unacked {
+                payload,
+                sent_at: Instant::now(),
+                backoff: INITIAL_RETRANSMIT,
+                retries: 0,
+            },
+        );
         seq
     }
 

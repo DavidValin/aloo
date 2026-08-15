@@ -48,7 +48,10 @@ pub enum GlobalPttEvent {
 /// only Linux has more than one windowing system to distinguish between.
 pub fn is_wayland() -> bool {
     cfg!(target_os = "linux")
-        && is_wayland_session(env::var("XDG_SESSION_TYPE").ok().as_deref(), env::var_os("WAYLAND_DISPLAY").is_some())
+        && is_wayland_session(
+            env::var("XDG_SESSION_TYPE").ok().as_deref(),
+            env::var_os("WAYLAND_DISPLAY").is_some(),
+        )
 }
 
 /// Pure session-type check split out from `is_wayland` so it's testable
@@ -56,7 +59,10 @@ pub fn is_wayland() -> bool {
 /// environment (unsafe to touch from parallel tests) - same reasoning as
 /// `platform::resolve_home_dir`.
 pub fn is_wayland_session(xdg_session_type: Option<&str>, wayland_display_set: bool) -> bool {
-    xdg_session_type.map(|v| v.eq_ignore_ascii_case("wayland")).unwrap_or(false) || wayland_display_set
+    xdg_session_type
+        .map(|v| v.eq_ignore_ascii_case("wayland"))
+        .unwrap_or(false)
+        || wayland_display_set
 }
 
 /// Parses `configured` (as stored in `~/.aloo/settings`) into a `HotKey`,
@@ -151,7 +157,9 @@ pub fn spawn(hotkey: HotKey) -> Option<UnboundedReceiver<GlobalPttEvent>> {
 /// for as long as the shortcut should keep working) and the event channel,
 /// or `None` if registration failed.
 #[cfg(target_os = "macos")]
-pub fn register_on_current_thread(hotkey: HotKey) -> Option<(GlobalHotKeyManager, UnboundedReceiver<GlobalPttEvent>)> {
+pub fn register_on_current_thread(
+    hotkey: HotKey,
+) -> Option<(GlobalHotKeyManager, UnboundedReceiver<GlobalPttEvent>)> {
     let (tx, rx) = mpsc::unbounded_channel();
     let manager = match GlobalHotKeyManager::new() {
         Ok(m) => m,
@@ -183,7 +191,9 @@ pub fn pump_main_thread(shutdown: &std::sync::atomic::AtomicBool) {
 
 #[cfg(target_os = "windows")]
 mod windows_pump {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{DispatchMessageW, GetMessageW, TranslateMessage, MSG};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        DispatchMessageW, GetMessageW, MSG, TranslateMessage,
+    };
 
     /// Runs a standard Win32 message pump forever on the calling thread.
     /// See the module doc: `WM_HOTKEY` only reaches this thread's queue if
@@ -224,7 +234,11 @@ mod macos_cf {
     #[link(name = "CoreFoundation", kind = "framework")]
     unsafe extern "C" {
         fn CFRunLoopGetMain() -> CFRunLoopRef;
-        fn CFRunLoopRunInMode(mode: CFStringRef, seconds: CFTimeInterval, return_after_source_handled: Boolean) -> i32;
+        fn CFRunLoopRunInMode(
+            mode: CFStringRef,
+            seconds: CFTimeInterval,
+            return_after_source_handled: Boolean,
+        ) -> i32;
         static kCFRunLoopDefaultMode: CFStringRef;
     }
 

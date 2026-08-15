@@ -53,20 +53,35 @@ pub enum PunchDatagram {
     /// Sent to every candidate address while punching. `link_nonce` is the
     /// sender's own token for its current attempt - the receiver just
     /// echoes it back in `Pong`, it never validates it against anything.
-    Ping { link_nonce: u64 },
+    Ping {
+        link_nonce: u64,
+    },
     /// Echoes the `link_nonce` from whichever `Ping` this answers. A side
     /// only trusts a `Pong` whose nonce matches its own current attempt.
-    Pong { link_nonce: u64 },
+    Pong {
+        link_nonce: u64,
+    },
     /// Keeps a NAT/firewall mapping open on an otherwise-idle active link.
-    Keepalive { link_nonce: u64 },
-    Ack { seq: u32 },
+    Keepalive {
+        link_nonce: u64,
+    },
+    Ack {
+        seq: u32,
+    },
     /// A reliably-delivered frame (text/file content) - `payload` is a
     /// bincode encoding of `P2pPayload`. See `crate::p2p_reliable`.
-    Reliable { seq: u32, payload: Vec<u8> },
+    Reliable {
+        seq: u32,
+        payload: Vec<u8>,
+    },
     /// An unreliable, unordered frame (voice PCM chunk) - no ack, no
     /// retransmit; safe because voice chunk decryption derives its AEAD
     /// nonce from `(stream_id, seq)` rather than arrival order.
-    Unreliable { stream_id: u64, seq: u32, blocks: Vec<Vec<u8>> },
+    Unreliable {
+        stream_id: u64,
+        seq: u32,
+        blocks: Vec<Vec<u8>>,
+    },
 }
 
 /// What a `Reliable` frame's `payload` decodes to - the direct-transport
@@ -79,12 +94,35 @@ pub enum PunchDatagram {
 /// to lean on anymore); `None` is a DM.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum P2pPayload {
-    Envelope { channel: Option<String>, envelope: Envelope },
-    FileOffer { channel: Option<String>, stream_id: u64, envelope: Envelope },
-    StreamStart { channel: Option<String>, stream_id: u64 },
-    StreamEnd { stream_id: u64, duration_ms: u32 },
-    FileAccept { stream_id: u64 },
-    FileReject { stream_id: u64 },
-    FileChunk { stream_id: u64, seq: u32, blocks: Vec<Vec<u8>> },
-    FileEnd { stream_id: u64 },
+    Envelope {
+        channel: Option<String>,
+        envelope: Envelope,
+    },
+    FileOffer {
+        channel: Option<String>,
+        stream_id: u64,
+        envelope: Envelope,
+    },
+    StreamStart {
+        channel: Option<String>,
+        stream_id: u64,
+    },
+    StreamEnd {
+        stream_id: u64,
+        duration_ms: u32,
+    },
+    FileAccept {
+        stream_id: u64,
+    },
+    FileReject {
+        stream_id: u64,
+    },
+    FileChunk {
+        stream_id: u64,
+        seq: u32,
+        blocks: Vec<Vec<u8>>,
+    },
+    FileEnd {
+        stream_id: u64,
+    },
 }

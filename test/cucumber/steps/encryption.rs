@@ -1,6 +1,5 @@
 //! Encryption and wire-protocol steps (US-008, US-009).
 
-use cucumber::{given, then, when};
 use aloo::crypto::{
     self, KeyPair, decrypt_chunked, encrypt_chunked, max_chunk_len, public_key_to_der,
 };
@@ -9,6 +8,7 @@ use aloo::proto::{
     ChannelInfo, ChannelKind, ClientMessage, Content, Envelope, KeyMode, ServerMessage, UserId,
     UserInfo, decode, encode,
 };
+use cucumber::{given, then, when};
 
 use crate::world::{AlooWorld, keypair_for};
 
@@ -75,15 +75,22 @@ async fn encrypt_long(w: &mut AlooWorld, who: String) {
 #[then(expr = "{word} reads back exactly what was sent")]
 async fn reads_back(w: &mut AlooWorld, who: String) {
     let kp = w.derived.get(&who).expect("recipient has no key");
-    let out = decrypt_chunked(&kp.private, &w.blocks).expect("the intended recipient must be able to decrypt");
-    assert_eq!(out, w.plaintext, "decrypted bytes differ from what was encrypted");
+    let out = decrypt_chunked(&kp.private, &w.blocks)
+        .expect("the intended recipient must be able to decrypt");
+    assert_eq!(
+        out, w.plaintext,
+        "decrypted bytes differ from what was encrypted"
+    );
 }
 
 #[then(expr = "{word} cannot read it at all")]
 async fn cannot_read(w: &mut AlooWorld, who: String) {
     let kp = w.derived.get(&who).expect("outsider has no key");
     let result = decrypt_chunked(&kp.private, &w.blocks);
-    assert!(result.is_err(), "a key the message was not encrypted for must not decrypt it");
+    assert!(
+        result.is_err(),
+        "a key the message was not encrypted for must not decrypt it"
+    );
 }
 
 #[then(expr = "it was split into at least {int} separately encrypted blocks")]
@@ -117,7 +124,10 @@ async fn same_key(w: &mut AlooWorld, a: String, b: String) {
     // Not just equal bytes: the two halves must genuinely interoperate.
     let blocks = encrypt_chunked(&kb.public, b"round trip").unwrap();
     let out = decrypt_chunked(&ka.private, &blocks).unwrap();
-    assert_eq!(out, b"round trip", "keys that compare equal must also work interchangeably");
+    assert_eq!(
+        out, b"round trip",
+        "keys that compare equal must also work interchangeably"
+    );
 }
 
 #[then(expr = "{word} and {word} end up with different keys")]
@@ -139,7 +149,10 @@ async fn different_key(w: &mut AlooWorld, a: String, b: String) {
 async fn roundtrip_every_message(w: &mut AlooWorld) {
     // One representative of each shape the protocol can carry, checked
     // individually so a failure names the variant that broke.
-    let envelope = Envelope { content: Content::Text, blocks: vec![vec![9, 9, 9], vec![8, 8]] };
+    let envelope = Envelope {
+        content: Content::Text,
+        blocks: vec![vec![9, 9, 9], vec![8, 8]],
+    };
 
     let client: Vec<ClientMessage> = vec![
         ClientMessage::Identify {
@@ -147,26 +160,52 @@ async fn roundtrip_every_message(w: &mut AlooWorld) {
             public_key_der: vec![1, 2, 3, 4],
             key_mode: KeyMode::Rsa,
         },
-        ClientMessage::JoinChannel { name: "general".into(), kind: ChannelKind::Public },
-        ClientMessage::LeaveChannel { name: "general".into() },
-        ClientMessage::RotateKey { to: UserId(3), new_public_key_der: vec![1, 2, 3], signature: vec![9, 9] },
+        ClientMessage::JoinChannel {
+            name: "general".into(),
+            kind: ChannelKind::Public,
+            password: None,
+        },
+        ClientMessage::LeaveChannel {
+            name: "general".into(),
+        },
+        ClientMessage::RotateKey {
+            to: UserId(3),
+            new_public_key_der: vec![1, 2, 3],
+            signature: vec![9, 9],
+        },
         ClientMessage::RequestPeerLink {
             peer: UserId(7),
-            candidates: vec!["127.0.0.1:4000".parse().unwrap(), "203.0.113.5:4000".parse().unwrap()],
+            candidates: vec![
+                "127.0.0.1:4000".parse().unwrap(),
+                "203.0.113.5:4000".parse().unwrap(),
+            ],
             link_nonce: 42,
         },
     ];
     for msg in &client {
         let decoded: ClientMessage = decode(&encode(msg).expect("encode")).expect("decode");
-        assert_eq!(&decoded, msg, "client message did not survive the round trip: {msg:?}");
+        assert_eq!(
+            &decoded, msg,
+            "client message did not survive the round trip: {msg:?}"
+        );
     }
 
     let server: Vec<ServerMessage> = vec![
         ServerMessage::ChannelList(vec![
-            ChannelInfo { name: "general".into(), kind: ChannelKind::Public },
-            ChannelInfo { name: "secret-room".into(), kind: ChannelKind::Private },
+            ChannelInfo {
+                name: "general".into(),
+                kind: ChannelKind::Public,
+            },
+            ChannelInfo {
+                name: "secret-room".into(),
+                kind: ChannelKind::Private,
+            },
         ]),
-        ServerMessage::KeyRotated { from: UserId(3), new_public_key_der: vec![1, 2, 3], signature: vec![9, 9] },
+        ServerMessage::KeyRotated {
+            from: UserId(3),
+            new_public_key_der: vec![1, 2, 3],
+            signature: vec![9, 9],
+        },
         ServerMessage::PeerCandidates {
             from: UserId(7),
             candidates: vec!["127.0.0.1:4000".parse().unwrap()],
@@ -175,7 +214,10 @@ async fn roundtrip_every_message(w: &mut AlooWorld) {
     ];
     for msg in &server {
         let decoded: ServerMessage = decode(&encode(msg).expect("encode")).expect("decode");
-        assert_eq!(&decoded, msg, "server message did not survive the round trip: {msg:?}");
+        assert_eq!(
+            &decoded, msg,
+            "server message did not survive the round trip: {msg:?}"
+        );
     }
 
     let user = UserInfo {
@@ -190,10 +232,16 @@ async fn roundtrip_every_message(w: &mut AlooWorld) {
     // Message content itself now travels over the direct link, not the
     // wire types above - `P2pPayload::Envelope` is where an `Envelope`
     // actually gets sent, so that's what needs the round-trip check.
-    let payload = P2pPayload::Envelope { channel: None, envelope: envelope.clone() };
+    let payload = P2pPayload::Envelope {
+        channel: None,
+        envelope: envelope.clone(),
+    };
     let decoded: P2pPayload = decode(&encode(&payload).expect("encode")).expect("decode");
     match decoded {
-        P2pPayload::Envelope { channel, envelope: got } => {
+        P2pPayload::Envelope {
+            channel,
+            envelope: got,
+        } => {
             assert_eq!(channel, None);
             assert_eq!(got, envelope, "envelope did not survive the round trip");
         }
@@ -209,14 +257,31 @@ async fn every_field_intact(w: &mut AlooWorld) {
     // pins the envelope specifically, since it is the one value that carries
     // opaque ciphertext the server must never reinterpret.
     let envelope = w.envelope.as_ref().expect("no envelope round-tripped");
-    let msg = P2pPayload::Envelope { channel: Some("general".into()), envelope: envelope.clone() };
+    let msg = P2pPayload::Envelope {
+        channel: Some("general".into()),
+        envelope: envelope.clone(),
+    };
     let decoded: P2pPayload = decode(&encode(&msg).unwrap()).unwrap();
     match decoded {
-        P2pPayload::Envelope { channel, envelope: got } => {
-            assert_eq!(channel.as_deref(), Some("general"), "channel routing metadata must survive");
-            assert_eq!(&got, envelope, "the encrypted body must survive byte for byte");
+        P2pPayload::Envelope {
+            channel,
+            envelope: got,
+        } => {
+            assert_eq!(
+                channel.as_deref(),
+                Some("general"),
+                "channel routing metadata must survive"
+            );
+            assert_eq!(
+                &got, envelope,
+                "the encrypted body must survive byte for byte"
+            );
             assert_eq!(got.content, Content::Text);
-            assert_eq!(got.blocks, vec![vec![9, 9, 9], vec![8, 8]], "block boundaries must be preserved");
+            assert_eq!(
+                got.blocks,
+                vec![vec![9, 9, 9], vec![8, 8]],
+                "block boundaries must be preserved"
+            );
         }
         _ => panic!("wrong variant after round trip"),
     }
@@ -224,9 +289,19 @@ async fn every_field_intact(w: &mut AlooWorld) {
 
 #[then("a user announced under any key mode arrives with that same key mode")]
 async fn key_mode_survives(_w: &mut AlooWorld) {
-    for key_mode in [KeyMode::Rsa, KeyMode::Password, KeyMode::None, KeyMode::PerMessage, KeyMode::PqHybrid] {
-        let user =
-            UserInfo { id: UserId(1), name: "alice".into(), public_key_der: vec![1, 2, 3], key_mode };
+    for key_mode in [
+        KeyMode::Rsa,
+        KeyMode::Password,
+        KeyMode::None,
+        KeyMode::PerMessage,
+        KeyMode::PqHybrid,
+    ] {
+        let user = UserInfo {
+            id: UserId(1),
+            name: "alice".into(),
+            public_key_der: vec![1, 2, 3],
+            key_mode,
+        };
         let decoded: UserInfo = decode(&encode(&user).unwrap()).unwrap();
         assert_eq!(decoded, user, "round trip failed for {key_mode:?}");
 
@@ -236,7 +311,10 @@ async fn key_mode_survives(_w: &mut AlooWorld) {
             key_mode,
         };
         let decoded: ClientMessage = decode(&encode(&identify).unwrap()).unwrap();
-        assert_eq!(decoded, identify, "Identify round trip failed for {key_mode:?}");
+        assert_eq!(
+            decoded, identify,
+            "Identify round trip failed for {key_mode:?}"
+        );
     }
 }
 

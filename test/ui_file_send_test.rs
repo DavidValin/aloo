@@ -5,12 +5,18 @@ use ui_common::*;
 use aloo::file_transfer::{self, MAX_FILENAME_CHARS};
 use aloo::proto::{KeyMode, UserId};
 use aloo::ui::file_send::{FileConfirmChoice, FileSendTarget};
-use aloo::ui::ui::{FileOfferChoice, FileTransferStatus, Focus, IdentityCase, MessageBody, Mode, PendingFileOffer, UiAction};
+use aloo::ui::ui::{
+    FileOfferChoice, FileTransferStatus, Focus, IdentityCase, MessageBody, Mode, PendingFileOffer,
+    UiAction,
+};
 use aloo::ui::ui_connect_popup::FileBrowserState;
 use crossterm::event::KeyCode;
 
 fn unique_dir(label: &str) -> std::path::PathBuf {
-    let suffix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
     std::env::temp_dir().join(format!("aloo-{label}-{}-{suffix}", std::process::id()))
 }
 
@@ -27,7 +33,10 @@ fn file_command_opens_the_browser_when_a_channel_is_joined() {
     assert!(action.is_none());
     assert_eq!(state.mode, Mode::FileSend);
     assert!(state.file_send.is_some());
-    assert_eq!(state.input, "", "the /file command itself must not remain in the compose bar");
+    assert_eq!(
+        state.input, "",
+        "the /file command itself must not remain in the compose bar"
+    );
 }
 
 /// @requirement AC-073
@@ -39,7 +48,10 @@ fn file_command_does_nothing_when_no_channel_is_joined_and_no_dm_is_open() {
     assert!(action.is_none());
     assert_eq!(state.mode, Mode::Normal);
     assert!(state.file_send.is_none());
-    assert_eq!(state.input, "/file", "left in place so the user can see what they typed");
+    assert_eq!(
+        state.input, "/file",
+        "left in place so the user can see what they typed"
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -69,7 +81,10 @@ fn selecting_a_file_in_the_browser_opens_a_send_confirmation_defaulting_to_disca
     press(&mut state, KeyCode::Enter); // select it
 
     let fs = state.file_send.as_ref().expect("still in the /file flow");
-    assert_eq!(fs.confirm.as_deref(), Some(root.join("file.txt")).as_deref());
+    assert_eq!(
+        fs.confirm.as_deref(),
+        Some(root.join("file.txt")).as_deref()
+    );
     assert_eq!(fs.confirm_focus, FileConfirmChoice::Discard);
 
     std::fs::remove_dir_all(&root).ok();
@@ -88,7 +103,10 @@ fn discard_returns_to_the_browser_at_the_same_directory() {
     let action = press(&mut state, KeyCode::Enter); // confirm Discard
     assert!(action.is_none());
 
-    let fs = state.file_send.as_ref().expect("Discard returns to the browser, not Normal mode");
+    let fs = state
+        .file_send
+        .as_ref()
+        .expect("Discard returns to the browser, not Normal mode");
     assert!(fs.confirm.is_none());
     assert_eq!(fs.browser.current_dir, root);
     assert_eq!(state.mode, Mode::FileSend);
@@ -115,13 +133,23 @@ fn sending_a_file_to_a_channel_produces_sendfilechannel_with_path_and_size() {
     let action = press(&mut state, KeyCode::Enter);
 
     match action {
-        Some(UiAction::SendFileChannel { channel, path, filename, size, recipients }) => {
+        Some(UiAction::SendFileChannel {
+            channel,
+            path,
+            filename,
+            size,
+            recipients,
+        }) => {
             assert_eq!(channel, "general");
             assert_eq!(path, root.join("file.txt"));
             assert_eq!(filename, "file.txt");
             assert_eq!(size, b"hello file transfer".len() as u64);
             let ids: Vec<UserId> = recipients.iter().map(|(id, _, _)| *id).collect();
-            assert_eq!(ids, vec![UserId(2), UserId(3)], "every other member is addressed");
+            assert_eq!(
+                ids,
+                vec![UserId(2), UserId(3)],
+                "every other member is addressed"
+            );
         }
         other => panic!("expected SendFileChannel, got {other:?}"),
     }
@@ -152,7 +180,14 @@ fn sending_a_file_to_a_dm_peer_produces_sendfiledirect_with_path_and_size() {
     let action = press(&mut state, KeyCode::Enter);
 
     match action {
-        Some(UiAction::SendFileDirect { to, path, filename, size, recipient_key_mode, recipient_pubkey_der }) => {
+        Some(UiAction::SendFileDirect {
+            to,
+            path,
+            filename,
+            size,
+            recipient_key_mode,
+            recipient_pubkey_der,
+        }) => {
             assert_eq!(to, UserId(2));
             assert_eq!(path, root.join("file.txt"));
             assert_eq!(filename, "file.txt");
@@ -214,7 +249,10 @@ fn there_is_no_size_cap_on_a_file_send() {
         Some(UiAction::SendFileChannel { size, .. }) => assert_eq!(size, 5 * 1024 * 1024),
         other => panic!("expected SendFileChannel, got {other:?}"),
     }
-    assert!(state.file_send.is_none(), "no inline error should have kept the flow open");
+    assert!(
+        state.file_send.is_none(),
+        "no inline error should have kept the flow open"
+    );
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -247,15 +285,31 @@ fn a_channel_file_send_logs_one_row_per_recipient_naming_them() {
     }
 
     let rows = rendered_rows(&state);
-    assert!(rows.iter().any(|r| r.contains('\u{1F4CE}')), "expected the paperclip icon to render: {rows:?}");
+    assert!(
+        rows.iter().any(|r| r.contains('\u{1F4CE}')),
+        "expected the paperclip icon to render: {rows:?}"
+    );
 }
 
 // ---------------------------------------------------------------------
 // Receiving: the Accept/Reject popup (bell + Accept-default)
 // ---------------------------------------------------------------------
 
-fn incoming_offer(from: u64, name: &str, stream_id: u64, filename: &str, size: u64) -> PendingFileOffer {
-    PendingFileOffer { from: UserId(from), from_name: name.into(), filename: filename.into(), size, stream_id, channel: None }
+fn incoming_offer(
+    from: u64,
+    name: &str,
+    stream_id: u64,
+    filename: &str,
+    size: u64,
+) -> PendingFileOffer {
+    PendingFileOffer {
+        from: UserId(from),
+        from_name: name.into(),
+        filename: filename.into(),
+        size,
+        stream_id,
+        channel: None,
+    }
 }
 
 /// @requirement AC-095
@@ -270,7 +324,11 @@ fn an_incoming_offer_opens_a_popup_with_accept_focused_by_default() {
     assert_eq!(offer.size, 2048);
 
     let rows = rendered_rows(&state);
-    assert!(rows.iter().any(|r| r.contains("bob") && r.contains("photo.png")), "expected the offer text to render: {rows:?}");
+    assert!(
+        rows.iter()
+            .any(|r| r.contains("bob") && r.contains("photo.png")),
+        "expected the offer text to render: {rows:?}"
+    );
 }
 
 /// @requirement AC-095
@@ -280,7 +338,13 @@ fn pressing_enter_on_the_offer_popup_accepts_by_default() {
     state.push_file_offer(incoming_offer(2, "bob", 7, "photo.png", 2048));
 
     let action = press(&mut state, KeyCode::Enter);
-    assert_eq!(action, Some(UiAction::AcceptFileOffer { from: UserId(2), stream_id: 7 }));
+    assert_eq!(
+        action,
+        Some(UiAction::AcceptFileOffer {
+            from: UserId(2),
+            stream_id: 7
+        })
+    );
 }
 
 /// @requirement AC-096
@@ -291,7 +355,13 @@ fn toggling_focus_then_enter_rejects() {
 
     press(&mut state, KeyCode::Left);
     let action = press(&mut state, KeyCode::Enter);
-    assert_eq!(action, Some(UiAction::RejectFileOffer { from: UserId(2), stream_id: 7 }));
+    assert_eq!(
+        action,
+        Some(UiAction::RejectFileOffer {
+            from: UserId(2),
+            stream_id: 7
+        })
+    );
 }
 
 /// @requirement AC-095
@@ -301,11 +371,20 @@ fn a_second_offer_queues_behind_the_first() {
     let first_front = state.push_file_offer(incoming_offer(2, "bob", 1, "a.txt", 10));
     let second_front = state.push_file_offer(incoming_offer(3, "carol", 1, "b.txt", 20));
     assert!(first_front);
-    assert!(!second_front, "a second offer must not jump ahead of the one already showing");
-    assert_eq!(state.file_offer_open().map(|o| o.filename.as_str()), Some("a.txt"));
+    assert!(
+        !second_front,
+        "a second offer must not jump ahead of the one already showing"
+    );
+    assert_eq!(
+        state.file_offer_open().map(|o| o.filename.as_str()),
+        Some("a.txt")
+    );
 
     state.take_file_offer(UserId(2), 1);
-    assert_eq!(state.file_offer_open().map(|o| o.filename.as_str()), Some("b.txt"));
+    assert_eq!(
+        state.file_offer_open().map(|o| o.filename.as_str()),
+        Some("b.txt")
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -316,13 +395,25 @@ fn a_second_offer_queues_behind_the_first() {
 #[test]
 fn accepting_a_channel_offer_creates_an_in_progress_row() {
     let mut state = joined_general_with(vec![user(2, "bob")]);
-    state.on_channel_file_offer_accepted("general", UserId(2), "bob".into(), 7, "photo.png".into(), 2048);
+    state.on_channel_file_offer_accepted(
+        "general",
+        UserId(2),
+        "bob".into(),
+        7,
+        "photo.png".into(),
+        2048,
+    );
 
     assert_eq!(state.channels[0].log.len(), 1);
     let entry = &state.channels[0].log[0];
     assert!(!entry.outgoing);
     match &entry.body {
-        MessageBody::File { status, total, filename, .. } => {
+        MessageBody::File {
+            status,
+            total,
+            filename,
+            ..
+        } => {
             assert_eq!(*status, FileTransferStatus::InProgress { bytes: 0 });
             assert_eq!(*total, 2048);
             assert_eq!(filename, "photo.png");
@@ -335,15 +426,27 @@ fn accepting_a_channel_offer_creates_an_in_progress_row() {
 #[test]
 fn a_progress_update_advances_the_bar_and_completion_finalizes_it() {
     let mut state = joined_general_with(vec![user(2, "bob")]);
-    state.on_channel_file_offer_accepted("general", UserId(2), "bob".into(), 7, "photo.png".into(), 100);
+    state.on_channel_file_offer_accepted(
+        "general",
+        UserId(2),
+        "bob".into(),
+        7,
+        "photo.png".into(),
+        100,
+    );
 
     state.set_file_progress(UserId(2), 7, 50);
     match &state.channels[0].log[0].body {
-        MessageBody::File { status, .. } => assert_eq!(*status, FileTransferStatus::InProgress { bytes: 50 }),
+        MessageBody::File { status, .. } => {
+            assert_eq!(*status, FileTransferStatus::InProgress { bytes: 50 })
+        }
         other => panic!("expected a file entry, got {other:?}"),
     }
     let rows = rendered_rows(&state);
-    assert!(rows.iter().any(|r| r.contains("50%")), "expected a 50% progress indicator: {rows:?}");
+    assert!(
+        rows.iter().any(|r| r.contains("50%")),
+        "expected a 50% progress indicator: {rows:?}"
+    );
 
     state.set_file_completed(UserId(2), 7);
     match &state.channels[0].log[0].body {
@@ -392,14 +495,23 @@ fn an_offer_from_a_trust_gated_sender_is_held_and_revealed_on_accept() {
         UserId(2),
         "bob".into(),
         "mismatch".into(),
-        IdentityCase::StaticMismatch { new_public_key_der: vec![9, 9, 9], previous_public_key_der: vec![1, 1, 1] },
+        IdentityCase::StaticMismatch {
+            new_public_key_der: vec![9, 9, 9],
+            previous_public_key_der: vec![1, 1, 1],
+        },
     );
 
     state.hold_file_offer(incoming_offer(2, "bob", 7, "secret.docx", 4096));
-    assert!(state.file_offer_open().is_none(), "a held offer must not show a popup yet");
+    assert!(
+        state.file_offer_open().is_none(),
+        "a held offer must not show a popup yet"
+    );
 
     let played_bell = state.resolve_identity_accept(UserId(2));
-    assert!(played_bell, "the freshly-revealed offer should become the front of the queue");
+    assert!(
+        played_bell,
+        "the freshly-revealed offer should become the front of the queue"
+    );
 
     let offer = state.file_offer_open().expect("offer should now be queued");
     assert_eq!(offer.filename, "secret.docx");
@@ -413,8 +525,14 @@ fn an_offer_from_a_trust_gated_sender_is_held_and_revealed_on_accept() {
 // frozen recipient snapshot - see `FileSendTarget`'s doc comment for why.
 #[test]
 fn file_send_target_is_equality_comparable() {
-    assert_eq!(FileSendTarget::Channel("general".into()), FileSendTarget::Channel("general".into()));
-    assert_ne!(FileSendTarget::Direct(UserId(2)), FileSendTarget::Direct(UserId(3)));
+    assert_eq!(
+        FileSendTarget::Channel("general".into()),
+        FileSendTarget::Channel("general".into())
+    );
+    assert_ne!(
+        FileSendTarget::Direct(UserId(2)),
+        FileSendTarget::Direct(UserId(3))
+    );
 }
 
 #[test]

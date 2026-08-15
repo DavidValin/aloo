@@ -47,11 +47,17 @@ impl Report {
     }
 
     pub fn errors(&self) -> Vec<&Finding> {
-        self.findings.iter().filter(|f| f.severity == Severity::Error).collect()
+        self.findings
+            .iter()
+            .filter(|f| f.severity == Severity::Error)
+            .collect()
     }
 
     pub fn warnings(&self) -> Vec<&Finding> {
-        self.findings.iter().filter(|f| f.severity == Severity::Warning).collect()
+        self.findings
+            .iter()
+            .filter(|f| f.severity == Severity::Warning)
+            .collect()
     }
 }
 
@@ -81,7 +87,8 @@ pub fn validate(model: &Model) -> Report {
             severity: Severity::Error,
             rule: RULE_DUPLICATE_TEST_ID,
             subject: id.clone(),
-            detail: "two tests resolve to the same qualified id, so their coverage is ambiguous".into(),
+            detail: "two tests resolve to the same qualified id, so their coverage is ambiguous"
+                .into(),
         });
     }
 
@@ -115,7 +122,10 @@ pub fn validate(model: &Model) -> Report {
                 severity: Severity::Error,
                 rule: RULE_REQUIREMENT_WITHOUT_TEST,
                 subject: entry.id.clone(),
-                detail: format!("no test or scenario is linked to it - {}", entry.description),
+                detail: format!(
+                    "no test or scenario is linked to it - {}",
+                    entry.description
+                ),
             });
             continue;
         }
@@ -137,8 +147,7 @@ pub fn validate(model: &Model) -> Report {
 
         // An acceptance criterion describes observable behaviour, so it should
         // normally have a Gherkin scenario as well as any technical tests.
-        if entry.kind == ReqKind::Acceptance
-            && !tests.iter().any(|t| t.kind == TestKind::Scenario)
+        if entry.kind == ReqKind::Acceptance && !tests.iter().any(|t| t.kind == TestKind::Scenario)
         {
             findings.push(Finding {
                 severity: Severity::Warning,
@@ -150,7 +159,11 @@ pub fn validate(model: &Model) -> Report {
     }
 
     // -- stories with nothing under them --------------------------------
-    let owned: BTreeSet<&str> = model.requirements.values().map(|r| r.story.as_str()).collect();
+    let owned: BTreeSet<&str> = model
+        .requirements
+        .values()
+        .map(|r| r.story.as_str())
+        .collect();
     for story in &model.stories {
         let has_children = model
             .requirements

@@ -59,7 +59,10 @@ pub struct ConnStats {
 
 impl ConnStats {
     pub fn new() -> Self {
-        Self { last_event: None, intervals: VecDeque::with_capacity(CONN_STATS_MAX_SAMPLES) }
+        Self {
+            last_event: None,
+            intervals: VecDeque::with_capacity(CONN_STATS_MAX_SAMPLES),
+        }
     }
 
     /// Records one message (sent or received) observed at `now`. The very

@@ -2,8 +2,8 @@
 
 use std::path::PathBuf;
 
-use cucumber::{given, then, when};
 use crossterm::event::KeyCode;
+use cucumber::{given, then, when};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::style::Color;
@@ -67,7 +67,11 @@ async fn my_key_is(w: &mut AlooWorld, kind: String) {
 
 #[then(expr = "my_key defaults to {word}")]
 async fn my_key_defaults_to(w: &mut AlooWorld, kind: String) {
-    assert_eq!(w.popup_mut().my_key.key_type, my_key_type_named(&kind), "unexpected default my_key type");
+    assert_eq!(
+        w.popup_mut().my_key.key_type,
+        my_key_type_named(&kind),
+        "unexpected default my_key type"
+    );
 }
 
 #[given(expr = "server_key is set to {word}")]
@@ -151,10 +155,16 @@ async fn browse_and_pick(w: &mut AlooWorld) {
     p.server_key.key_type = KeyType::Rsa;
     p.focus = Field::ServerKeyValue;
     p.handle_key(KeyCode::Enter).unwrap();
-    assert!(p.browser.is_some(), "Enter on an rsa file field must open the in-app browser");
+    assert!(
+        p.browser.is_some(),
+        "Enter on an rsa file field must open the in-app browser"
+    );
 
     // Point it at the known tree so the scenario does not depend on the cwd.
-    p.browser = Some((FileBrowserTarget::ServerKeyFile, FileBrowserState::open(root).unwrap()));
+    p.browser = Some((
+        FileBrowserTarget::ServerKeyFile,
+        FileBrowserState::open(root).unwrap(),
+    ));
     // entries are "..", "subdir", "file.txt"
     p.handle_key(KeyCode::Down).unwrap();
     p.handle_key(KeyCode::Down).unwrap();
@@ -176,7 +186,11 @@ async fn walk_in_and_out(w: &mut AlooWorld) {
     let root = w.browser_root.clone().expect("no directory tree");
     let mut browser = FileBrowserState::open(root).unwrap();
     browser.selected = 1;
-    assert_eq!(browser.selected_entry().unwrap().name, "subdir", "index 1 should be the sub-directory");
+    assert_eq!(
+        browser.selected_entry().unwrap().name,
+        "subdir",
+        "index 1 should be the sub-directory"
+    );
     browser.navigate_into_selected().unwrap();
     assert!(
         browser.entries.iter().any(|e| e.name == "nested.txt"),
@@ -192,7 +206,11 @@ async fn walk_in_and_out(w: &mut AlooWorld) {
 #[then("the host field has the cursor in it")]
 async fn host_has_cursor(w: &mut AlooWorld) {
     let state = w.popup.as_ref().expect("no form");
-    assert_eq!(state.focus, Field::Host, "host must be the default focus when the form opens");
+    assert_eq!(
+        state.focus,
+        Field::Host,
+        "host must be the default focus when the form opens"
+    );
 
     let backend = TestBackend::new(80, 30);
     let mut terminal = Terminal::new(backend).unwrap();
@@ -200,7 +218,10 @@ async fn host_has_cursor(w: &mut AlooWorld) {
     let buffer = terminal.backend().buffer().clone();
     let host_title_row = (0..buffer.area.height)
         .find(|&y| {
-            (0..buffer.area.width).map(|x| buffer[(x, y)].symbol()).collect::<String>().contains("host")
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+                .contains("host")
         })
         .expect("expected a visible \"host\" box title");
     let cursor = terminal
@@ -231,15 +252,25 @@ async fn field_contains(w: &mut AlooWorld, name: String, expected: String) {
 #[then(expr = "the nickname is capped at {int} characters")]
 async fn nickname_capped(w: &mut AlooWorld, cap: usize) {
     let p = w.popup.as_ref().expect("no form");
-    assert_eq!(cap, NICKNAME_MAX_LEN, "the scenario and the constant must agree");
-    assert_eq!(p.nickname.chars().count(), NICKNAME_MAX_LEN, "nickname should be exactly at the cap");
+    assert_eq!(
+        cap, NICKNAME_MAX_LEN,
+        "the scenario and the constant must agree"
+    );
+    assert_eq!(
+        p.nickname.chars().count(),
+        NICKNAME_MAX_LEN,
+        "nickname should be exactly at the cap"
+    );
 }
 
 #[then("host, port and nickname are each in their own titled box")]
 async fn each_boxed(w: &mut AlooWorld) {
     let rows = popup_rows(w.popup.as_ref().expect("no form"), 80, 30);
     for title in ["host", "port", "nickname"] {
-        assert!(rows.iter().any(|r| r.contains(title)), "expected a {title:?} box title: {rows:?}");
+        assert!(
+            rows.iter().any(|r| r.contains(title)),
+            "expected a {title:?} box title: {rows:?}"
+        );
     }
     // Each titled box is bordered in its own right rather than sharing the
     // outer popup border, so there is more than one top-left corner.
@@ -253,8 +284,14 @@ async fn each_boxed(w: &mut AlooWorld) {
 #[then(expr = "the id_store path is prefilled with the default {word} location")]
 async fn id_store_prefilled(w: &mut AlooWorld, _which: String) {
     let p = w.popup.as_ref().expect("no form");
-    assert!(!p.id_store_path.is_empty(), "id_store should be prefilled, not left blank");
-    assert_eq!(p.id_store_path, aloo::idstore::default_path().display().to_string());
+    assert!(
+        !p.id_store_path.is_empty(),
+        "id_store should be prefilled, not left blank"
+    );
+    assert_eq!(
+        p.id_store_path,
+        aloo::idstore::default_path().display().to_string()
+    );
 }
 
 #[then("the own_next_keys path is prefilled with its default location")]
@@ -270,17 +307,28 @@ async fn own_next_prefilled(w: &mut AlooWorld) {
 #[then("the own_next_keys field is offered")]
 async fn own_next_offered(w: &mut AlooWorld) {
     assert!(
-        w.popup.as_ref().unwrap().focus_order().contains(&Field::OwnNextKeysPath),
+        w.popup
+            .as_ref()
+            .unwrap()
+            .focus_order()
+            .contains(&Field::OwnNextKeysPath),
         "own_next_keys must be reachable for rsa_per_msg"
     );
     let rows = popup_rows(w.popup.as_ref().unwrap(), 80, 30);
-    assert!(rows.iter().any(|r| r.contains("own_next_keys")), "expected the field on screen: {rows:?}");
+    assert!(
+        rows.iter().any(|r| r.contains("own_next_keys")),
+        "expected the field on screen: {rows:?}"
+    );
 }
 
 #[then("the own_next_keys field is not offered")]
 async fn own_next_not_offered(w: &mut AlooWorld) {
     assert!(
-        !w.popup.as_ref().unwrap().focus_order().contains(&Field::OwnNextKeysPath),
+        !w.popup
+            .as_ref()
+            .unwrap()
+            .focus_order()
+            .contains(&Field::OwnNextKeysPath),
         "own_next_keys is only meaningful for rsa_per_msg"
     );
 }
@@ -300,36 +348,56 @@ async fn connecting_begins(w: &mut AlooWorld) {
 #[then("a visible Connect button is offered")]
 async fn connect_button_visible(w: &mut AlooWorld) {
     let rows = popup_rows(w.popup.as_ref().expect("no form"), 80, 30);
-    assert!(rows.iter().any(|r| r.contains("Connect")), "expected a visible Connect button: {rows:?}");
+    assert!(
+        rows.iter().any(|r| r.contains("Connect")),
+        "expected a visible Connect button: {rows:?}"
+    );
 }
 
 #[then(expr = "connecting is refused with an error mentioning {string}")]
 async fn refused_with(w: &mut AlooWorld, needle: String) {
-    assert_eq!(w.popup_action, Some(Action::None), "an invalid form must not connect");
+    assert_eq!(
+        w.popup_action,
+        Some(Action::None),
+        "an invalid form must not connect"
+    );
     let err = w
         .popup
         .as_ref()
         .and_then(|p| p.error.clone())
         .expect("an invalid form must show a validation error");
-    assert!(err.contains(&needle), "error {err:?} should mention {needle:?}");
+    assert!(
+        err.contains(&needle),
+        "error {err:?} should mention {needle:?}"
+    );
 }
 
 #[then(expr = "building the request fails mentioning {string}")]
 async fn build_fails(w: &mut AlooWorld, needle: String) {
     let err = w.popup.as_ref().unwrap().build_request().unwrap_err();
-    assert!(err.contains(&needle), "error {err:?} should mention {needle:?}");
+    assert!(
+        err.contains(&needle),
+        "error {err:?} should mention {needle:?}"
+    );
 }
 
 #[then("the form is cancelled")]
 async fn form_cancelled(w: &mut AlooWorld) {
-    assert_eq!(w.popup_action, Some(Action::Cancel), "Esc must cancel the connect popup");
+    assert_eq!(
+        w.popup_action,
+        Some(Action::Cancel),
+        "Esc must cancel the connect popup"
+    );
 }
 
 #[then("the picked file fills the server_key field")]
 async fn picked_file_fills(w: &mut AlooWorld) {
     let root = w.browser_root.clone().expect("no directory tree");
     let p = w.popup.as_ref().expect("no form");
-    assert!(p.browser.is_none(), "picking a file should close the browser");
+    assert!(
+        p.browser.is_none(),
+        "picking a file should close the browser"
+    );
     assert_eq!(
         p.server_key.file,
         root.join("file.txt").display().to_string(),
@@ -342,12 +410,22 @@ async fn browser_back_forward(w: &mut AlooWorld) {
     let root = w.browser_root.clone().expect("no directory tree");
     let p = w.popup_mut();
     let (_, browser) = p.browser.as_mut().expect("no open browser");
-    assert_eq!(browser.current_dir, root.join("subdir"), "should be inside the sub-directory");
+    assert_eq!(
+        browser.current_dir,
+        root.join("subdir"),
+        "should be inside the sub-directory"
+    );
 
-    assert!(browser.go_back().unwrap(), "back should succeed when there is history");
+    assert!(
+        browser.go_back().unwrap(),
+        "back should succeed when there is history"
+    );
     assert_eq!(browser.current_dir, root, "back should land in the parent");
 
-    assert!(browser.go_forward().unwrap(), "forward should return where we came from");
+    assert!(
+        browser.go_forward().unwrap(),
+        "forward should return where we came from"
+    );
     assert_eq!(browser.current_dir, root.join("subdir"));
 }
 
@@ -375,7 +453,10 @@ async fn first_entry_out_of_view(w: &mut AlooWorld) {
 async fn browser_no_history(w: &mut AlooWorld) {
     let root = w.browser_root.clone().expect("no directory tree");
     let mut browser = FileBrowserState::open(root).unwrap();
-    assert!(!browser.go_back().unwrap(), "no history means back does nothing, rather than erroring");
+    assert!(
+        !browser.go_back().unwrap(),
+        "no history means back does nothing, rather than erroring"
+    );
     assert!(!browser.go_forward().unwrap(), "and neither does forward");
 }
 
@@ -389,7 +470,9 @@ async fn highlight_not_bleeding(w: &mut AlooWorld) {
     let mut last_match: Option<(u16, u16)> = None;
     for y in 1..buffer.area.height {
         for x in 0..buffer.area.width.saturating_sub(6) {
-            let word: String = (0..7).map(|i| buffer[(x + i, y)].symbol().to_string()).collect();
+            let word: String = (0..7)
+                .map(|i| buffer[(x + i, y)].symbol().to_string())
+                .collect();
             if word == "Connect" {
                 last_match = Some((x, y));
             }
@@ -410,7 +493,12 @@ async fn highlight_not_bleeding(w: &mut AlooWorld) {
 
 #[then(expr = "the request carries the own_next_keys path {string}")]
 async fn request_carries_own_next(w: &mut AlooWorld, expected: String) {
-    let req = w.popup.as_ref().unwrap().build_request().expect("form should be valid");
+    let req = w
+        .popup
+        .as_ref()
+        .unwrap()
+        .build_request()
+        .expect("form should be valid");
     match req.my_key {
         MyKeySelection::RsaPerMessage { own_next_keys_path } => {
             assert_eq!(own_next_keys_path, PathBuf::from(&expected));
@@ -421,7 +509,12 @@ async fn request_carries_own_next(w: &mut AlooWorld, expected: String) {
 
 #[then("the request carries no key material for either key")]
 async fn request_carries_none(w: &mut AlooWorld) {
-    let req = w.popup.as_ref().unwrap().build_request().expect("form should be valid");
+    let req = w
+        .popup
+        .as_ref()
+        .unwrap()
+        .build_request()
+        .expect("form should be valid");
     assert_eq!(req.server_key, ServerKeySelection::None);
     assert_eq!(req.my_key, MyKeySelection::None);
     assert_eq!(req.host, "chat.example.com");

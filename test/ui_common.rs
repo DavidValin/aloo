@@ -8,23 +8,43 @@
 use aloo::proto::{ChannelInfo, ChannelKind, KeyMode, UserId, UserInfo};
 use aloo::ui::ui::{MessageBody, UiAction, UiState};
 use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
-use ratatui::backend::TestBackend;
 use ratatui::Terminal;
+use ratatui::backend::TestBackend;
 
 pub fn user(id: u64, name: &str) -> UserInfo {
-    UserInfo { id: UserId(id), name: name.to_string(), public_key_der: vec![id as u8; 4], key_mode: KeyMode::Rsa }
+    UserInfo {
+        id: UserId(id),
+        name: name.to_string(),
+        public_key_der: vec![id as u8; 4],
+        key_mode: KeyMode::Rsa,
+    }
 }
 
 pub fn per_msg_user(id: u64, name: &str) -> UserInfo {
-    UserInfo { id: UserId(id), name: name.to_string(), public_key_der: vec![id as u8; 4], key_mode: KeyMode::PerMessage }
+    UserInfo {
+        id: UserId(id),
+        name: name.to_string(),
+        public_key_der: vec![id as u8; 4],
+        key_mode: KeyMode::PerMessage,
+    }
 }
 
 pub fn password_user(id: u64, name: &str) -> UserInfo {
-    UserInfo { id: UserId(id), name: name.to_string(), public_key_der: vec![id as u8; 4], key_mode: KeyMode::Password }
+    UserInfo {
+        id: UserId(id),
+        name: name.to_string(),
+        public_key_der: vec![id as u8; 4],
+        key_mode: KeyMode::Password,
+    }
 }
 
 pub fn plain_user(id: u64, name: &str) -> UserInfo {
-    UserInfo { id: UserId(id), name: name.to_string(), public_key_der: vec![id as u8; 4], key_mode: KeyMode::None }
+    UserInfo {
+        id: UserId(id),
+        name: name.to_string(),
+        public_key_der: vec![id as u8; 4],
+        key_mode: KeyMode::None,
+    }
 }
 
 pub fn press(state: &mut UiState, code: KeyCode) -> Option<UiAction> {
@@ -44,8 +64,14 @@ pub fn type_str(state: &mut UiState, s: &str) {
 pub fn joined_general_with(members: Vec<UserInfo>) -> UiState {
     let mut state = UiState::new("me".into());
     state.set_own_id(UserId(1));
-    state.on_channel_list(vec![ChannelInfo { name: "general".into(), kind: ChannelKind::Public }]);
-    state.on_joined(ChannelInfo { name: "general".into(), kind: ChannelKind::Public });
+    state.on_channel_list(vec![ChannelInfo {
+        name: "general".into(),
+        kind: ChannelKind::Public,
+    }]);
+    state.on_joined(ChannelInfo {
+        name: "general".into(),
+        kind: ChannelKind::Public,
+    });
     for m in members {
         state.on_user_joined("general", m);
     }
@@ -58,7 +84,12 @@ pub fn joined_general_with(members: Vec<UserInfo>) -> UiState {
 /// `crate::ui::ui`'s, shared by the private-room view.
 pub fn push_n_channel_texts(state: &mut UiState, n: usize) {
     for i in 0..n {
-        state.on_channel_message("general", UserId(2), "bob".into(), MessageBody::Text(format!("msg{i}")));
+        state.on_channel_message(
+            "general",
+            UserId(2),
+            "bob".into(),
+            MessageBody::Text(format!("msg{i}")),
+        );
     }
 }
 
@@ -73,7 +104,10 @@ pub fn make_temp_file_tree() -> std::path::PathBuf {
     let root = std::env::temp_dir().join(format!(
         "aloo-ui-file-send-test-{}-{}",
         std::process::id(),
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
     ));
     let sub = root.join("subdir");
     std::fs::create_dir_all(&sub).unwrap();
@@ -88,7 +122,11 @@ pub fn rendered_rows(state: &UiState) -> Vec<String> {
     terminal.draw(|f| aloo::ui::ui::render(f, state)).unwrap();
     let buffer = terminal.backend().buffer().clone();
     (0..buffer.area.height)
-        .map(|y| (0..buffer.area.width).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
         .collect()
 }
 

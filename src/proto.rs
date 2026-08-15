@@ -35,7 +35,8 @@ fn bincode_config() -> impl bincode::config::Config {
 
 /// Bincode-encodes `msg` (no length prefix).
 pub fn encode<T: Serialize>(msg: &T) -> Result<Vec<u8>> {
-    bincode::serde::encode_to_vec(msg, bincode_config()).map_err(|e| ProtoError::Encode(e.to_string()))
+    bincode::serde::encode_to_vec(msg, bincode_config())
+        .map_err(|e| ProtoError::Encode(e.to_string()))
 }
 
 /// Decodes a value previously produced by `encode`.
@@ -78,7 +79,10 @@ pub fn parse_frame(buf: &[u8]) -> Result<Option<(&[u8], usize)>> {
 }
 
 /// Encodes and writes one framed message to an async stream.
-pub async fn write_message<W: AsyncWrite + Unpin, T: Serialize>(writer: &mut W, msg: &T) -> Result<()> {
+pub async fn write_message<W: AsyncWrite + Unpin, T: Serialize>(
+    writer: &mut W,
+    msg: &T,
+) -> Result<()> {
     let payload = encode(msg)?;
     let framed = frame(&payload)?;
     writer.write_all(&framed).await?;
@@ -195,6 +199,23 @@ pub struct ChannelInfo {
     pub kind: ChannelKind,
 }
 
+/// Why a password-protected private channel's `JoinChannel` was rejected
+/// (see `ServerMessage::ChannelJoinRejected`, docs/PROTOCOL.md §6.5/§6.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChannelJoinRejection {
+    /// The channel is password-protected and this `JoinChannel` carried no
+    /// password at all - the client should open the password-entry popup
+    /// so the user can type one and resubmit.
+    PasswordRequired,
+    /// A password was supplied but it doesn't match.
+    WrongPassword,
+    /// `CHANNEL_MAX_PASSWORD_ATTEMPTS` wrong attempts against this (source
+    /// address, channel name) pair already tripped the ban within the last
+    /// `CHANNEL_PASSWORD_BAN_DURATION` - further attempts are refused
+    /// without even checking the password given.
+    Banned,
+}
+
 /// What kind of `server_key` credential the server expects on connect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AuthKind {
@@ -209,7 +230,9 @@ pub enum AuthResponse {
     Password(String),
     /// The auth challenge nonce, encrypted (in one or more OAEP blocks)
     /// with the server's public key.
-    Rsa { blocks: Vec<Vec<u8>> },
+    Rsa {
+        blocks: Vec<Vec<u8>>,
+    },
 }
 
 /// One message body (text, file, or voice), encrypted for a single
@@ -260,9 +283,18 @@ pub enum ClientMessage {
     /// Joins `name`, creating it first if it doesn't exist yet. `kind`
     /// only matters for creation: selecting an existing top tab (public)
     /// sends `ChannelKind::Public`, Ctrl+J's popup sends
-    /// `ChannelKind::Private`.
-    JoinChannel { name: String, kind: ChannelKind },
-    LeaveChannel { name: String },
+    /// `ChannelKind::Private`. `password` is `Some` only when Ctrl+J's
+    /// popup had Private selected and a non-empty password typed - it
+    /// either sets a new private channel's password (creation) or is
+    /// compared against an existing one (join); see docs/PROTOCOL.md §6.5.
+    JoinChannel {
+        name: String,
+        kind: ChannelKind,
+        password: Option<String>,
+    },
+    LeaveChannel {
+        name: String,
+    },
 
     /// `rsa_per_msg` only (`KeyMode::PerMessage`, PROTOCOL.md §11): tells
     /// `to` to trust a freshly-rotated per-peer key from now on.
@@ -282,7 +314,11 @@ pub enum ClientMessage {
     /// `p2p_proto::PunchDatagram`). The server only ever relays this to
     /// `peer` (`Registry::route_peer_link_request`) - it never sees
     /// anything from the resulting link itself. See `crate::p2p`.
-    RequestPeerLink { peer: UserId, candidates: Vec<std::net::SocketAddr>, link_nonce: u64 },
+    RequestPeerLink {
+        peer: UserId,
+        candidates: Vec<std::net::SocketAddr>,
+        link_nonce: u64,
+    },
 }
 
 /// Messages the server sends to a client.
@@ -294,7 +330,10 @@ pub enum ServerMessage {
         /// client must encrypt with the server's public key and echo back.
         challenge: Option<Vec<u8>>,
     },
-    AuthResult { ok: bool, reason: Option<String> },
+    AuthResult {
+        ok: bool,
+        reason: Option<String>,
+    },
     /// Answers `Identify`. Nicknames must be unique among currently
     /// connected clients; `ok: false` (e.g. "nickname already taken") means
     /// the server closes the connection right after sending this - the
@@ -302,12 +341,47 @@ pub enum ServerMessage {
     /// success, `you` is the `UserId` the server assigned, needed so the
     /// client can exclude itself when building a channel message's
     /// per-recipient list.
-    IdentifyResult { ok: bool, you: Option<UserId>, reason: Option<String> },
+    IdentifyResult {
+        ok: bool,
+        you: Option<UserId>,
+        reason: Option<String>,
+    },
     ChannelList(Vec<ChannelInfo>),
-    Joined { channel: ChannelInfo },
-    ChannelJoinFailed { name: String, reason: String },
-    UserJoined { channel: String, user: UserInfo },
-    UserLeft { channel: String, user_id: UserId },
+    Joined {
+        channel: ChannelInfo,
+    },
+    ChannelJoinFailed {
+        name: String,
+        reason: String,
+    },
+    /// A typed alternative to `ChannelJoinFailed`'s free-text `reason`,
+    /// specific to the password-protected-private-channel flow (§6.5/§6.6),
+    /// so the client can branch on *why* (open the password popup, show a
+    /// "wrong password" message, or show a "too many attempts" message)
+    /// rather than parsing English. Sent to the requester only - like
+    /// `ChannelJoinFailed`, nothing about a private channel's existence or
+    /// password state leaks to anyone else through this.
+    ChannelJoinRejected {
+        name: String,
+        kind: ChannelJoinRejection,
+    },
+    /// Sent to every other currently-connected client the instant a new
+    /// *public* channel is created - never for a private one, which stays
+    /// unadvertised (§6.3) exactly as before. `ChannelList` (above) is only
+    /// ever sent once, right after `IdentifyResult`, so without this a
+    /// channel created after that snapshot would stay permanently invisible
+    /// to anyone who didn't create or join it themselves.
+    ChannelCreated {
+        channel: ChannelInfo,
+    },
+    UserJoined {
+        channel: String,
+        user: UserInfo,
+    },
+    UserLeft {
+        channel: String,
+        user_id: UserId,
+    },
     /// Sent once per peer who shares any channel with `user_id`, when
     /// `user_id`'s connection closes entirely (as opposed to `UserLeft`,
     /// which means they left one specific channel while staying
@@ -316,7 +390,9 @@ pub enum ServerMessage {
     /// see SPEC.md's "offline" behavior: a client with private-message
     /// history with `user_id` keeps them listed (grayed out) rather than
     /// removing them.
-    UserOffline { user_id: UserId },
+    UserOffline {
+        user_id: UserId,
+    },
     /// Relayed mirror of `ClientMessage::RotateKey` - the `to` field isn't
     /// repeated since it's implicitly "whoever the server delivers this
     /// to" (see PROTOCOL.md §11.3/§11.4 for how the recipient reconstructs
@@ -330,7 +406,13 @@ pub enum ServerMessage {
     /// Relayed mirror of `ClientMessage::RequestPeerLink` - see there and
     /// `crate::p2p`. `from`'s candidates are exactly what `from` sent; the
     /// server neither validates nor stores them.
-    PeerCandidates { from: UserId, candidates: Vec<std::net::SocketAddr>, link_nonce: u64 },
+    PeerCandidates {
+        from: UserId,
+        candidates: Vec<std::net::SocketAddr>,
+        link_nonce: u64,
+    },
 
-    Error { message: String },
+    Error {
+        message: String,
+    },
 }

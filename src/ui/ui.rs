@@ -20,11 +20,11 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
-use ratatui::Frame;
 
 use crate::proto::{ChannelKind, KeyMode, UserId, UserInfo};
 
@@ -84,8 +84,10 @@ const HELP_HEADINGS: [&str; 7] = [
 ];
 const HELP_BODY: &[&str] = &[
     "Channels",
+    "  \u{1F30D} public / \u{1F512} private   tab prefix shows a channel's kind at a glance",
     "  ]  /  [    switch tabs (joins after staying on one for 3s)",
-    "  Ctrl+J     join or create a hidden (private) channel by name",
+    "  Ctrl+J     join/create a channel: name, Public/Private (Left/Right), optional password",
+    "  /leave     leave the selected channel tab (a public one stays, offering to rejoin)",
     "",
     "Messaging",
     "  Tab        cycle focus: sidebar -> messages -> compose bar",
@@ -162,7 +164,10 @@ pub enum MessageBody {
     Text(String),
     /// A finished voice message: `pcm` is decoded, decrypted PCM16 (see
     /// `voice::pcm_from_bytes`), ready to replay through `voice::MixerCmd`.
-    Voice { duration_ms: u32, pcm: Vec<u8> },
+    Voice {
+        duration_ms: u32,
+        pcm: Vec<u8>,
+    },
     /// A voice message that's still being recorded/received live - see
     /// `log_own_voice_stream_start_channel`/`on_channel_stream_start` and
     /// their `_finished` counterparts, which swap this in place for a
@@ -170,13 +175,20 @@ pub enum MessageBody {
     /// which stream this is - callers must always also match on the
     /// entry's `from`, since two different senders' independent
     /// per-connection counters can coincidentally collide.
-    VoiceStreaming { stream_id: u64 },
+    VoiceStreaming {
+        stream_id: u64,
+    },
     /// One file transfer, consent-gated and streamed
     /// (`docs/PROTOCOL.md`'s file transfer section) - `stream_id` identifies
     /// it the same way `VoiceStreaming`'s does (paired with the entry's
     /// `from`, never alone), so a later progress/completion event can find
     /// and update this exact row (`UiState::update_file_entry`).
-    File { filename: String, total: u64, stream_id: u64, status: FileTransferStatus },
+    File {
+        filename: String,
+        total: u64,
+        stream_id: u64,
+        status: FileTransferStatus,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -213,8 +225,13 @@ pub struct LogEntry {
 /// not silently clear a gate that was opened because of it.
 #[derive(Debug, Clone, PartialEq)]
 pub enum IdentityCase {
-    StaticMismatch { new_public_key_der: Vec<u8>, previous_public_key_der: Vec<u8> },
-    ResumeFailed { new_public_key_der: Vec<u8> },
+    StaticMismatch {
+        new_public_key_der: Vec<u8>,
+        previous_public_key_der: Vec<u8>,
+    },
+    ResumeFailed {
+        new_public_key_der: Vec<u8>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -276,10 +293,23 @@ pub enum Focus {
 pub enum Mode {
     Normal,
     JoinPrivatePopup,
+    /// Shown after a `ChannelJoinRejected` (`PasswordRequired`/
+    /// `WrongPassword`/`Banned`) naming `UiState::channel_password_target` -
+    /// lets the user type a password and resubmit the same `JoinChannel`.
+    /// See `crate::ui::channel::handle_channel_password_popup_key`.
+    ChannelPasswordPopup,
     /// The `/file` send flow (browse -> confirm) is open - see
     /// `crate::ui::file_send`. Data lives in `UiState::file_send`, not
     /// here, same split `JoinPrivatePopup`/`join_popup_input` already use.
     FileSend,
+}
+
+/// Which field is focused inside the Ctrl+J popup - Tab/BackTab cycles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JoinPopupFocus {
+    Name,
+    Kind,
+    Password,
 }
 
 /// One incoming file offer awaiting an Accept/Reject decision
@@ -319,21 +349,49 @@ pub type Recipient = (UserId, KeyMode, Vec<u8>);
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum VoiceTarget {
-    Channel { channel: String, recipients: Vec<Recipient> },
-    Direct { to: UserId, recipient_key_mode: KeyMode, recipient_pubkey_der: Vec<u8> },
+    Channel {
+        channel: String,
+        recipients: Vec<Recipient>,
+    },
+    Direct {
+        to: UserId,
+        recipient_key_mode: KeyMode,
+        recipient_pubkey_der: Vec<u8>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum UiAction {
-    JoinChannel { name: String, kind: ChannelKind },
-    SendChannelText { channel: String, plaintext: String, recipients: Vec<Recipient> },
-    SendDirectText { to: UserId, plaintext: String, recipient_key_mode: KeyMode, recipient_pubkey_der: Vec<u8> },
+    JoinChannel {
+        name: String,
+        kind: ChannelKind,
+        password: Option<String>,
+    },
+    /// Sent by the `/leave` command (`submit_input`) for the currently
+    /// selected channel tab.
+    LeaveChannel {
+        name: String,
+    },
+    SendChannelText {
+        channel: String,
+        plaintext: String,
+        recipients: Vec<Recipient>,
+    },
+    SendDirectText {
+        to: UserId,
+        plaintext: String,
+        recipient_key_mode: KeyMode,
+        recipient_pubkey_der: Vec<u8>,
+    },
     /// The target is captured at press-time (not release-time): live
     /// streaming needs to know who to address the wire `StreamXStart` to
     /// the moment recording starts, not just once it's done.
     VoiceRecordStart(VoiceTarget),
     VoiceRecordStop,
-    ReplayVoice { duration_ms: u32, pcm: Vec<u8> },
+    ReplayVoice {
+        duration_ms: u32,
+        pcm: Vec<u8>,
+    },
     /// Escape while a replayed (previously-received) voice message is
     /// playing - `session::handle_ui_action` stops it on the mixer, since
     /// `UiState` has no access to audio.
@@ -350,7 +408,13 @@ pub enum UiAction {
     /// as a voice stream's recipients - see `docs/PROTOCOL.md`'s file
     /// transfer section); nothing is read from `path` until each recipient
     /// individually accepts.
-    SendFileChannel { channel: String, path: std::path::PathBuf, filename: String, size: u64, recipients: Vec<Recipient> },
+    SendFileChannel {
+        channel: String,
+        path: std::path::PathBuf,
+        filename: String,
+        size: u64,
+        recipients: Vec<Recipient>,
+    },
     SendFileDirect {
         to: UserId,
         path: std::path::PathBuf,
@@ -363,8 +427,14 @@ pub enum UiAction {
     /// `(from, stream_id)` - `session::handle_ui_action` does the actual
     /// `FileAccept`/`FileReject` wire send and, on Accept, spawns the
     /// receiving worker (`UiState` has no access to the network or disk).
-    AcceptFileOffer { from: UserId, stream_id: u64 },
-    RejectFileOffer { from: UserId, stream_id: u64 },
+    AcceptFileOffer {
+        from: UserId,
+        stream_id: u64,
+    },
+    RejectFileOffer {
+        from: UserId,
+        stream_id: u64,
+    },
 }
 
 /// Which trigger started the current recording - `handle_key`'s Space
@@ -403,6 +473,26 @@ pub struct UiState {
     pub input: String,
     pub mode: Mode,
     pub join_popup_input: String,
+    /// Ctrl+J popup's Public/Private selector - defaults to `Private`,
+    /// matching this popup's pre-existing (private-only) behavior before
+    /// this selector existed.
+    pub join_popup_kind: ChannelKind,
+    /// Ctrl+J popup's optional password field, shown/typeable only while
+    /// `join_popup_kind == ChannelKind::Private`. Plaintext in memory,
+    /// masked (`"*".repeat(...)`) at render time only - mirrors
+    /// `ui_connect_popup::ServerKeyFields::password`.
+    pub join_popup_password: String,
+    pub(crate) join_popup_focus: JoinPopupFocus,
+    /// Which channel name the password-entry popup
+    /// (`Mode::ChannelPasswordPopup`) is currently retrying - set by
+    /// `on_channel_join_rejected`, cleared on Esc or on submitting.
+    pub channel_password_target: Option<String>,
+    /// The password-entry popup's typed input.
+    pub channel_password_input: String,
+    /// A short message ("wrong password" / "too many attempts - try again
+    /// later") shown on the popup - `None` on a fresh `PasswordRequired`
+    /// with no prior guess yet.
+    pub channel_password_error: Option<String>,
     /// The `/file` send flow's state (browse -> confirm), while `mode ==
     /// Mode::FileSend` - see `crate::ui::file_send`. `pub`, not
     /// `pub(crate)`, same as `ui_connect_popup::ConnectPopupState::browser`
@@ -551,6 +641,12 @@ impl UiState {
             input: String::new(),
             mode: Mode::Normal,
             join_popup_input: String::new(),
+            join_popup_kind: ChannelKind::Private,
+            join_popup_password: String::new(),
+            join_popup_focus: JoinPopupFocus::Name,
+            channel_password_target: None,
+            channel_password_input: String::new(),
+            channel_password_error: None,
             file_send: None,
             file_offers: HashMap::new(),
             file_offer_queue: VecDeque::new(),
@@ -603,9 +699,23 @@ impl UiState {
     /// was decided), its case/message are updated in place and it's
     /// re-queued as `Pending` rather than duplicated - always reflects the
     /// *latest* attempt.
-    pub fn push_identity_review(&mut self, peer: UserId, nickname: String, message: String, case: IdentityCase) {
+    pub fn push_identity_review(
+        &mut self,
+        peer: UserId,
+        nickname: String,
+        message: String,
+        case: IdentityCase,
+    ) {
         let already_queued = self.identity_review_queue.contains(&peer);
-        self.identity_reviews.insert(peer, IdentityReview { nickname, message, case, status: IdentityStatus::Pending });
+        self.identity_reviews.insert(
+            peer,
+            IdentityReview {
+                nickname,
+                message,
+                case,
+                status: IdentityStatus::Pending,
+            },
+        );
         if !already_queued {
             self.identity_review_queue.push_back(peer);
         }
@@ -632,14 +742,20 @@ impl UiState {
     /// `on_channel_message`/`on_direct_message` and their stream
     /// counterparts whenever `is_trust_gated(from)`.
     pub(crate) fn hold_message(&mut self, from: UserId, channel: Option<String>, entry: LogEntry) {
-        self.pending_messages.entry(from).or_default().push(HeldMessage { channel, entry });
+        self.pending_messages
+            .entry(from)
+            .or_default()
+            .push(HeldMessage { channel, entry });
     }
 
     /// Held-message counterpart for an incoming file offer from a
     /// `Pending`/`Rejected` identity-review sender - see
     /// `pending_file_offers`'s doc.
     pub fn hold_file_offer(&mut self, offer: PendingFileOffer) {
-        self.pending_file_offers.entry(offer.from).or_default().push(offer);
+        self.pending_file_offers
+            .entry(offer.from)
+            .or_default()
+            .push(offer);
     }
 
     /// Removes `peer` from the review queue, wherever it is - not
@@ -680,7 +796,12 @@ impl UiState {
                     Some(name) => {
                         let is_current = self.is_viewing_channel(&name);
                         if let Some(tab) = self.channels.iter_mut().find(|c| c.name == name) {
-                            push_log_entry(&mut tab.log, &mut self.message_selected, is_current, entry);
+                            push_log_entry(
+                                &mut tab.log,
+                                &mut self.message_selected,
+                                is_current,
+                                entry,
+                            );
                         }
                     }
                     None => {
@@ -688,17 +809,30 @@ impl UiState {
                         // one (mirrors `on_direct_message`'s trust-gated path).
                         let is_current = self.active_private_room == Some(peer);
                         let from_name = entry.from_name.clone();
-                        let fallback_peer = self.known_users.get(&peer).cloned().unwrap_or_else(|| UserInfo {
-                            id: peer,
-                            name: from_name,
-                            public_key_der: Vec::new(),
-                            key_mode: crate::proto::KeyMode::None,
-                        });
+                        let fallback_peer =
+                            self.known_users
+                                .get(&peer)
+                                .cloned()
+                                .unwrap_or_else(|| UserInfo {
+                                    id: peer,
+                                    name: from_name,
+                                    public_key_der: Vec::new(),
+                                    key_mode: crate::proto::KeyMode::None,
+                                });
                         let room = self
                             .private_rooms
                             .entry(peer)
-                            .or_insert_with(|| PrivateRoom { peer: fallback_peer, log: Vec::new(), unread: false });
-                        push_log_entry(&mut room.log, &mut self.message_selected, is_current, entry);
+                            .or_insert_with(|| PrivateRoom {
+                                peer: fallback_peer,
+                                log: Vec::new(),
+                                unread: false,
+                            });
+                        push_log_entry(
+                            &mut room.log,
+                            &mut self.message_selected,
+                            is_current,
+                            entry,
+                        );
                     }
                 }
             }
@@ -785,9 +919,15 @@ impl UiState {
     /// tab/room is checked; a no-op if the row isn't found (e.g. already
     /// scrolled out - it never actually leaves the log, just stops
     /// matching once found once).
-    fn update_file_entry(&mut self, from: UserId, stream_id: u64, f: impl FnOnce(&mut MessageBody)) {
+    fn update_file_entry(
+        &mut self,
+        from: UserId,
+        stream_id: u64,
+        f: impl FnOnce(&mut MessageBody),
+    ) {
         let matches = |e: &&mut LogEntry| {
-            e.from == from && matches!(&e.body, MessageBody::File { stream_id: sid, .. } if *sid == stream_id)
+            e.from == from
+                && matches!(&e.body, MessageBody::File { stream_id: sid, .. } if *sid == stream_id)
         };
         for tab in &mut self.channels {
             if let Some(entry) = tab.log.iter_mut().find(matches) {
@@ -930,7 +1070,12 @@ impl UiState {
     /// once that goes quiet for
     /// `RECORD_HOLD_TIMEOUT`. A real `Release`, when a terminal does send
     /// one, still stops it immediately as a fast path.
-    pub fn handle_key(&mut self, code: KeyCode, modifiers: KeyModifiers, kind: KeyEventKind) -> Option<UiAction> {
+    pub fn handle_key(
+        &mut self,
+        code: KeyCode,
+        modifiers: KeyModifiers,
+        kind: KeyEventKind,
+    ) -> Option<UiAction> {
         // An outstanding identity review takes priority over *everything*
         // else, including Ctrl+H - a peer's identity needs an explicit
         // decision before anything else happens, and unlike the help
@@ -973,8 +1118,12 @@ impl UiState {
                         None
                     }
                     KeyCode::Enter => match self.file_offer_focus {
-                        FileOfferChoice::Accept => Some(UiAction::AcceptFileOffer { from, stream_id }),
-                        FileOfferChoice::Reject => Some(UiAction::RejectFileOffer { from, stream_id }),
+                        FileOfferChoice::Accept => {
+                            Some(UiAction::AcceptFileOffer { from, stream_id })
+                        }
+                        FileOfferChoice::Reject => {
+                            Some(UiAction::RejectFileOffer { from, stream_id })
+                        }
                     },
                     _ => None,
                 },
@@ -992,7 +1141,9 @@ impl UiState {
         // Both `Press` and `Release` return `None` here unconditionally,
         // so the `Release` is absorbed rather than falling through to
         // whatever a bare `KeyCode::Char('h')` might otherwise do.
-        if modifiers.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('h') | KeyCode::Char('H')) {
+        if modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(code, KeyCode::Char('h') | KeyCode::Char('H'))
+        {
             if kind == KeyEventKind::Press {
                 self.help_open = !self.help_open;
                 // Always reopen at the top rather than wherever it was
@@ -1014,8 +1165,12 @@ impl UiState {
             match code {
                 KeyCode::Up => self.help_scroll = self.help_scroll.saturating_sub(1),
                 KeyCode::Down => self.help_scroll = (self.help_scroll + 1).min(max_scroll),
-                KeyCode::PageUp => self.help_scroll = self.help_scroll.saturating_sub(HELP_SCROLL_PAGE),
-                KeyCode::PageDown => self.help_scroll = (self.help_scroll + HELP_SCROLL_PAGE).min(max_scroll),
+                KeyCode::PageUp => {
+                    self.help_scroll = self.help_scroll.saturating_sub(HELP_SCROLL_PAGE)
+                }
+                KeyCode::PageDown => {
+                    self.help_scroll = (self.help_scroll + HELP_SCROLL_PAGE).min(max_scroll)
+                }
                 KeyCode::Home => self.help_scroll = 0,
                 KeyCode::End => self.help_scroll = max_scroll,
                 _ => {}
@@ -1056,7 +1211,9 @@ impl UiState {
                 // Only ends a recording Space itself started - a
                 // Global-triggered one (see `global_record_stop`) only
                 // ever ends on its own release, never on Space.
-                KeyEventKind::Release if self.recording && self.recording_source == Some(RecordSource::Space) => {
+                KeyEventKind::Release
+                    if self.recording && self.recording_source == Some(RecordSource::Space) =>
+                {
                     self.recording = false;
                     self.recording_source = None;
                     self.recording_last_seen = None;
@@ -1068,6 +1225,9 @@ impl UiState {
 
         if self.mode == Mode::JoinPrivatePopup {
             return self.handle_join_popup_key(code);
+        }
+        if self.mode == Mode::ChannelPasswordPopup {
+            return self.handle_channel_password_popup_key(code);
         }
         if self.mode == Mode::FileSend {
             return self.handle_file_send_key(code);
@@ -1090,10 +1250,33 @@ impl UiState {
                 KeyCode::Char('j') | KeyCode::Char('J') => {
                     self.mode = Mode::JoinPrivatePopup;
                     self.join_popup_input.clear();
+                    self.join_popup_kind = ChannelKind::Private;
+                    self.join_popup_password.clear();
+                    self.join_popup_focus = JoinPopupFocus::Name;
                     return None;
                 }
                 _ => {}
             }
+        }
+
+        // A public channel tab we've explicitly `/leave`t shows a rejoin
+        // prompt instead of the normal sidebar+messages+compose view
+        // (`render_left_channel_screen`) - the only thing Enter here does
+        // is re-request joining it; every other key (besides `[`/`]`/
+        // Ctrl+H/Ctrl+J, already handled above) is inert, since none of
+        // the panes those would otherwise operate on are shown.
+        if self.active_private_room.is_none()
+            && let Some(channel) = self.channels.get(self.selected_channel)
+            && channel.left
+        {
+            return match code {
+                KeyCode::Enter => Some(UiAction::JoinChannel {
+                    name: channel.name.clone(),
+                    kind: ChannelKind::Public,
+                    password: None,
+                }),
+                _ => None,
+            };
         }
 
         if code == KeyCode::Esc {
@@ -1173,6 +1356,19 @@ impl UiState {
             // left wondering where their typed command went.
             return self.start_file_send();
         }
+        if self.input.trim() == "/leave" {
+            // Always the currently selected channel tab - `/leave` takes
+            // no argument. A no-op if that tab isn't actually joined (an
+            // unjoined public tab, or one already `left`) - nothing to
+            // leave.
+            let channel = self.channels.get(self.selected_channel)?;
+            if !channel.joined {
+                return None;
+            }
+            let name = channel.name.clone();
+            self.input.clear();
+            return Some(UiAction::LeaveChannel { name });
+        }
         if let Some(peer_id) = self.active_private_room {
             // Defensive: normal navigation can no longer reach a compose
             // bar for a Pending/Rejected peer's room (Enter on their
@@ -1200,8 +1396,11 @@ impl UiState {
             let name = channel.name.clone();
             let recipients = self.recipients_for_channel(channel);
             let text = std::mem::take(&mut self.input);
-            let action =
-                UiAction::SendChannelText { channel: name.clone(), plaintext: text.clone(), recipients };
+            let action = UiAction::SendChannelText {
+                channel: name.clone(),
+                plaintext: text.clone(),
+                recipients,
+            };
             self.push_outgoing_channel(&name, MessageBody::Text(text));
             Some(action)
         }
@@ -1266,7 +1465,8 @@ impl UiState {
             }
             KeyCode::PageDown => {
                 if len > 0 {
-                    self.message_selected = (self.message_selected + MESSAGE_PAGE_JUMP).min(len - 1);
+                    self.message_selected =
+                        (self.message_selected + MESSAGE_PAGE_JUMP).min(len - 1);
                 }
                 None
             }
@@ -1286,7 +1486,10 @@ impl UiState {
             // approach, there's no separate save step to trigger here.
             KeyCode::Enter => {
                 let replay = match self.current_log().get(self.message_selected) {
-                    Some(LogEntry { body: MessageBody::Voice { duration_ms, pcm }, .. }) => Some((*duration_ms, pcm.clone())),
+                    Some(LogEntry {
+                        body: MessageBody::Voice { duration_ms, pcm },
+                        ..
+                    }) => Some((*duration_ms, pcm.clone())),
                     _ => None,
                 };
                 replay.map(|(duration_ms, pcm)| {
@@ -1394,9 +1597,15 @@ impl UiState {
 
     fn current_log(&self) -> &[LogEntry] {
         if let Some(peer_id) = self.active_private_room {
-            self.private_rooms.get(&peer_id).map(|r| r.log.as_slice()).unwrap_or(&[])
+            self.private_rooms
+                .get(&peer_id)
+                .map(|r| r.log.as_slice())
+                .unwrap_or(&[])
         } else {
-            self.channels.get(self.selected_channel).map(|c| c.log.as_slice()).unwrap_or(&[])
+            self.channels
+                .get(self.selected_channel)
+                .map(|c| c.log.as_slice())
+                .unwrap_or(&[])
         }
     }
 
@@ -1416,7 +1625,10 @@ impl UiState {
     /// meaningless and unsafe to apply there (it would auto-stop the
     /// recording ~`RECORD_HOLD_TIMEOUT` after it started, every time).
     pub fn tick_recording_timeout(&mut self, now: Instant) -> Option<UiAction> {
-        if !self.recording || self.keyboard_release_reporting || self.recording_source != Some(RecordSource::Space) {
+        if !self.recording
+            || self.keyboard_release_reporting
+            || self.recording_source != Some(RecordSource::Space)
+        {
             return None;
         }
         let last = self.recording_last_seen?;
@@ -1443,7 +1655,11 @@ impl UiState {
     /// recording regardless of channel membership.
     pub fn on_user_offline(&mut self, user_id: UserId) {
         self.offline.insert(user_id);
-        let has_dm_history = self.private_rooms.get(&user_id).map(|r| !r.log.is_empty()).unwrap_or(false);
+        let has_dm_history = self
+            .private_rooms
+            .get(&user_id)
+            .map(|r| !r.log.is_empty())
+            .unwrap_or(false);
         if !has_dm_history {
             for tab in &mut self.channels {
                 tab.members.retain(|m| m.id != user_id);
@@ -1482,7 +1698,12 @@ impl UiState {
 /// history. Leaves `*message_selected` untouched otherwise (including
 /// whenever `!is_current`, since it then refers to a *different* log
 /// entirely and has nothing to do with this push).
-pub(crate) fn push_log_entry(log: &mut Vec<LogEntry>, message_selected: &mut usize, is_current: bool, entry: LogEntry) {
+pub(crate) fn push_log_entry(
+    log: &mut Vec<LogEntry>,
+    message_selected: &mut usize,
+    is_current: bool,
+    entry: LogEntry,
+) {
     let follow = is_current && (log.is_empty() || *message_selected + 1 >= log.len());
     log.push(entry);
     if follow {
@@ -1505,7 +1726,8 @@ pub(crate) fn finalize_stream_entry(
     pcm: Vec<u8>,
 ) -> bool {
     if let Some(entry) = log.iter_mut().find(|e| {
-        e.from == from && matches!(e.body, MessageBody::VoiceStreaming { stream_id: sid } if sid == stream_id)
+        e.from == from
+            && matches!(e.body, MessageBody::VoiceStreaming { stream_id: sid } if sid == stream_id)
     }) {
         entry.body = MessageBody::Voice { duration_ms, pcm };
         true
@@ -1518,7 +1740,13 @@ pub(crate) fn finalize_stream_entry(
 /// (`docs/PROTOCOL.md` §12 "hold and reveal") - same matching rule, applied
 /// to a `Pending`/`Rejected` sender's `VoiceStreaming` placeholder instead
 /// of the visible log.
-pub(crate) fn finalize_held_stream(held: &mut [HeldMessage], from: UserId, stream_id: u64, duration_ms: u32, pcm: Vec<u8>) {
+pub(crate) fn finalize_held_stream(
+    held: &mut [HeldMessage],
+    from: UserId,
+    stream_id: u64,
+    duration_ms: u32,
+    pcm: Vec<u8>,
+) {
     if let Some(hm) = held.iter_mut().find(|h| {
         h.entry.from == from && matches!(h.entry.body, MessageBody::VoiceStreaming { stream_id: sid } if sid == stream_id)
     }) {
@@ -1539,6 +1767,9 @@ pub fn render(frame: &mut Frame, state: &UiState) {
     }
     if state.mode == Mode::JoinPrivatePopup {
         super::channel::render_join_popup(frame, area, state);
+    }
+    if state.mode == Mode::ChannelPasswordPopup {
+        super::channel::render_channel_password_popup(frame, area, state);
     }
     if state.mode == Mode::FileSend {
         super::file_send::render_file_send_popup(frame, area, state);
@@ -1567,7 +1798,12 @@ pub fn render(frame: &mut Frame, state: &UiState) {
 /// `render_identity_review_popup`, `Accept` focused by default (see
 /// `FileOfferChoice`'s doc for why the default flips from the identity
 /// review's `Reject`-first one).
-fn render_file_offer_popup(frame: &mut Frame, area: Rect, offer: &PendingFileOffer, focus: FileOfferChoice) {
+fn render_file_offer_popup(
+    frame: &mut Frame,
+    area: Rect,
+    offer: &PendingFileOffer,
+    focus: FileOfferChoice,
+) {
     let title = format!("Incoming file from {}", offer.from_name);
     let popup = centered_rect(64, 9, area);
     let block = Block::default().title(title).borders(Borders::ALL);
@@ -1589,14 +1825,27 @@ fn render_file_offer_popup(frame: &mut Frame, area: Rect, offer: &PendingFileOff
         offer.filename,
         format_file_size(offer.size)
     );
-    frame.render_widget(Paragraph::new(message).wrap(ratatui::widgets::Wrap { trim: true }), rows[0]);
+    frame.render_widget(
+        Paragraph::new(message).wrap(ratatui::widgets::Wrap { trim: true }),
+        rows[0],
+    );
 
     let button_cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(rows[1]);
-    render_identity_button(frame, button_cols[0], "Accept", focus == FileOfferChoice::Accept);
-    render_identity_button(frame, button_cols[1], "Reject", focus == FileOfferChoice::Reject);
+    render_identity_button(
+        frame,
+        button_cols[0],
+        "Accept",
+        focus == FileOfferChoice::Accept,
+    );
+    render_identity_button(
+        frame,
+        button_cols[1],
+        "Reject",
+        focus == FileOfferChoice::Reject,
+    );
 }
 
 /// Renders a byte count as a short human-readable size, e.g. `842 B`,
@@ -1623,7 +1872,11 @@ pub(crate) fn format_file_size(bytes: u64) -> String {
 fn progress_bar(pct: u32) -> String {
     const WIDTH: u32 = 10;
     let filled = (pct.min(100) * WIDTH / 100) as usize;
-    format!("[{}{}]", "#".repeat(filled), "-".repeat(WIDTH as usize - filled))
+    format!(
+        "[{}{}]",
+        "#".repeat(filled),
+        "-".repeat(WIDTH as usize - filled)
+    )
 }
 
 /// The Accept/Reject popup for one peer's identity mismatch
@@ -1632,7 +1885,12 @@ fn progress_bar(pct: u32) -> String {
 /// help popup (bordered box, centered) and the connect popup's single
 /// button (`ui_connect_popup::render_connect_button`): a plain border, a
 /// solid-fill interior when focused.
-fn render_identity_review_popup(frame: &mut Frame, area: Rect, review: &IdentityReview, focus: IdentityChoice) {
+fn render_identity_review_popup(
+    frame: &mut Frame,
+    area: Rect,
+    review: &IdentityReview,
+    focus: IdentityChoice,
+) {
     let title = format!("Identity review: {}", review.nickname);
     let popup = centered_rect(64, 9, area);
     let block = Block::default().title(title).borders(Borders::ALL);
@@ -1652,14 +1910,27 @@ fn render_identity_review_popup(frame: &mut Frame, area: Rect, review: &Identity
             Style::default().fg(Color::Red),
         )));
     }
-    frame.render_widget(Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: true }), rows[0]);
+    frame.render_widget(
+        Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: true }),
+        rows[0],
+    );
 
     let button_cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(rows[1]);
-    render_identity_button(frame, button_cols[0], "Accept", focus == IdentityChoice::Accept);
-    render_identity_button(frame, button_cols[1], "Reject", focus == IdentityChoice::Reject);
+    render_identity_button(
+        frame,
+        button_cols[0],
+        "Accept",
+        focus == IdentityChoice::Accept,
+    );
+    render_identity_button(
+        frame,
+        button_cols[1],
+        "Reject",
+        focus == IdentityChoice::Reject,
+    );
 }
 
 /// One Accept/Reject button - same border-vs-fill focus convention as
@@ -1669,21 +1940,33 @@ fn render_identity_review_popup(frame: &mut Frame, area: Rect, review: &Identity
 /// `.style()` rather than a separate widget underneath it.
 fn render_identity_button(frame: &mut Frame, area: Rect, label: &str, focused: bool) {
     let popup = centered_rect(16, 3, area);
-    let block = Block::default().borders(Borders::ALL).border_style(focus_border_style(focused));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(focus_border_style(focused));
     let text_style = if focused {
-        Style::default().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().add_modifier(Modifier::BOLD)
     };
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
     frame.render_widget(
-        Paragraph::new(label).alignment(ratatui::layout::Alignment::Center).style(text_style),
+        Paragraph::new(label)
+            .alignment(ratatui::layout::Alignment::Center)
+            .style(text_style),
         inner,
     );
 }
 
-pub(crate) fn render_messages(frame: &mut Frame, area: Rect, state: &UiState, dm_peer: Option<UserId>) {
+pub(crate) fn render_messages(
+    frame: &mut Frame,
+    area: Rect,
+    state: &UiState,
+    dm_peer: Option<UserId>,
+) {
     let title = if let Some(id) = dm_peer {
         state
             .known_users
@@ -1694,14 +1977,25 @@ pub(crate) fn render_messages(frame: &mut Frame, area: Rect, state: &UiState, dm
         "Messages".to_string()
     };
     let border_style = focus_border_style(state.focus == Focus::Messages);
-    let block = Block::default().title(title).borders(Borders::ALL).border_style(border_style);
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(border_style);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
     let log: &[LogEntry] = if let Some(peer) = dm_peer {
-        state.private_rooms.get(&peer).map(|r| r.log.as_slice()).unwrap_or(&[])
+        state
+            .private_rooms
+            .get(&peer)
+            .map(|r| r.log.as_slice())
+            .unwrap_or(&[])
     } else {
-        state.channels.get(state.selected_channel).map(|c| c.log.as_slice()).unwrap_or(&[])
+        state
+            .channels
+            .get(state.selected_channel)
+            .map(|c| c.log.as_slice())
+            .unwrap_or(&[])
     };
 
     let items: Vec<ListItem> = log
@@ -1720,7 +2014,11 @@ pub(crate) fn render_messages(frame: &mut Frame, area: Rect, state: &UiState, dm
                     ])
                 }
                 MessageBody::VoiceStreaming { .. } => {
-                    let dot = if state.blink_on { "\u{1F534}" } else { "\u{26AA}" };
+                    let dot = if state.blink_on {
+                        "\u{1F534}"
+                    } else {
+                        "\u{26AA}"
+                    };
                     Line::from(vec![
                         Span::raw(format!("{}: ", entry.from_name)),
                         Span::styled(
@@ -1729,7 +2027,12 @@ pub(crate) fn render_messages(frame: &mut Frame, area: Rect, state: &UiState, dm
                         ),
                     ])
                 }
-                MessageBody::File { filename, total, status, .. } => {
+                MessageBody::File {
+                    filename,
+                    total,
+                    status,
+                    ..
+                } => {
                     let mut spans = vec![Span::raw(format!("{}: ", entry.from_name))];
                     if let Some(to_name) = &entry.to_name {
                         spans.push(Span::raw(format!("\u{2192} {to_name} ")));
@@ -1747,12 +2050,16 @@ pub(crate) fn render_messages(frame: &mut Frame, area: Rect, state: &UiState, dm
                             };
                             spans.push(Span::styled(
                                 format!("\u{1F4CE} {filename} {} {pct}%", progress_bar(pct)),
-                                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                                Style::default()
+                                    .fg(Color::Cyan)
+                                    .add_modifier(Modifier::BOLD),
                             ));
                         }
                         FileTransferStatus::Completed => spans.push(Span::styled(
                             format!("\u{1F4CE} {filename}"),
-                            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
                         )),
                         FileTransferStatus::Rejected => spans.push(Span::styled(
                             format!("\u{1F4CE} {filename} (rejected)"),
@@ -1776,8 +2083,11 @@ pub(crate) fn render_messages(frame: &mut Frame, area: Rect, state: &UiState, dm
     // needed to keep `message_selected` on screen, rather than always
     // starting the view at the oldest message and cutting off anything
     // that doesn't fit.
-    let highlight_style =
-        if state.focus == Focus::Messages { Style::default().add_modifier(Modifier::REVERSED) } else { Style::default() };
+    let highlight_style = if state.focus == Focus::Messages {
+        Style::default().add_modifier(Modifier::REVERSED)
+    } else {
+        Style::default()
+    };
     let list = List::new(items).highlight_style(highlight_style);
     let mut list_state = ListState::default();
     if !log.is_empty() {
@@ -1789,13 +2099,20 @@ pub(crate) fn render_messages(frame: &mut Frame, area: Rect, state: &UiState, dm
 pub(crate) fn render_input_bar(frame: &mut Frame, area: Rect, state: &UiState) {
     let dm_peer_offline = state.active_dm_peer_offline();
     let dm_peer_trust_gated = state.active_dm_peer_trust_gated();
-    let title = if state.recording { "Recording..." } else { "Message" };
+    let title = if state.recording {
+        "Recording..."
+    } else {
+        "Message"
+    };
     let border_style = if state.recording {
         Style::default().fg(Color::Red)
     } else {
         focus_border_style(state.focus == Focus::Input)
     };
-    let block = Block::default().title(title).borders(Borders::ALL).border_style(border_style);
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(border_style);
     let inner = block.inner(area);
 
     // An offline DM peer can't receive anything typed here (`handle_input_key`
@@ -1804,9 +2121,15 @@ pub(crate) fn render_input_bar(frame: &mut Frame, area: Rect, state: &UiState) {
     // silently does nothing. Same treatment for a Pending/Rejected identity
     // (docs/PROTOCOL.md §12).
     let mut spans = if dm_peer_offline {
-        vec![Span::styled("(user offline)", Style::default().fg(Color::Red))]
+        vec![Span::styled(
+            "(user offline)",
+            Style::default().fg(Color::Red),
+        )]
     } else if dm_peer_trust_gated {
-        vec![Span::styled("(identity not verified)", Style::default().fg(Color::Red))]
+        vec![Span::styled(
+            "(identity not verified)",
+            Style::default().fg(Color::Red),
+        )]
     } else {
         vec![Span::raw(state.input.as_str())]
     };
@@ -1821,8 +2144,13 @@ pub(crate) fn render_input_bar(frame: &mut Frame, area: Rect, state: &UiState) {
     // Only show a blinking cursor here when this bar is actually focused,
     // nothing else (e.g. the join-channel popup) is drawn on top of it, and
     // there's actually text to edit (not the offline notice above).
-    if state.focus == Focus::Input && state.mode == Mode::Normal && !dm_peer_offline && !dm_peer_trust_gated {
-        let cursor_x = inner.x + (state.input.chars().count() as u16).min(inner.width.saturating_sub(1));
+    if state.focus == Focus::Input
+        && state.mode == Mode::Normal
+        && !dm_peer_offline
+        && !dm_peer_trust_gated
+    {
+        let cursor_x =
+            inner.x + (state.input.chars().count() as u16).min(inner.width.saturating_sub(1));
         frame.set_cursor_position((cursor_x, inner.y));
     }
 }
@@ -1843,7 +2171,10 @@ pub(crate) fn focus_border_style(focused: bool) -> Style {
 /// character in here is a normal 1-cell one. Used only to size the help
 /// popup to fit its own longest line; see `render_help_popup`.
 fn display_width(s: &str) -> u16 {
-    let wide = s.chars().filter(|c| matches!(*c, '\u{1F512}' | '\u{1F6A8}')).count();
+    let wide = s
+        .chars()
+        .filter(|c| matches!(*c, '\u{1F512}' | '\u{1F6A8}'))
+        .count();
     (s.chars().count() + wide) as u16
 }
 
@@ -1852,13 +2183,18 @@ fn render_help_popup(frame: &mut Frame, area: Rect, state: &UiState) {
     // 1-column breathing margin on each side, but capped at 90% of the
     // available width even if that clips the longest lines - a popup that
     // fills the whole screen is worse than one that clips a little text.
-    let content_width = HELP_BODY.iter().map(|l| display_width(l)).max().unwrap_or(0);
+    let content_width = HELP_BODY
+        .iter()
+        .map(|l| display_width(l))
+        .max()
+        .unwrap_or(0);
     let max_allowed = (area.width as u32 * 9 / 10) as u16;
     let popup_width = (content_width + 4).min(max_allowed);
 
     let popup = centered_rect(popup_width, 32, area);
-    let block =
-        Block::default().title("Help (Ctrl+H to close, arrows to scroll)").borders(Borders::ALL);
+    let block = Block::default()
+        .title("Help (Ctrl+H to close, arrows to scroll)")
+        .borders(Borders::ALL);
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
@@ -1878,7 +2214,10 @@ fn render_help_popup(frame: &mut Frame, area: Rect, state: &UiState) {
         .iter()
         .map(|&text| {
             if HELP_HEADINGS.contains(&text) {
-                Line::from(Span::styled(text, Style::default().add_modifier(Modifier::BOLD)))
+                Line::from(Span::styled(
+                    text,
+                    Style::default().add_modifier(Modifier::BOLD),
+                ))
             } else {
                 Line::from(text)
             }
@@ -1892,5 +2231,10 @@ pub(crate) fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     let height = height.min(area.height);
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
-    Rect { x, y, width, height }
+    Rect {
+        x,
+        y,
+        width,
+        height,
+    }
 }

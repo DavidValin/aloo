@@ -21,7 +21,13 @@ use crate::voice_stream;
 /// single-recipient DM counterpart). Returns `None` if the recipient is
 /// `PqHybrid` and we can't address them (`channel::can_address`), or if
 /// encryption itself fails.
-fn encrypt_for_recipient(session: &SessionState, key_mode: KeyMode, pubkey_der: &[u8], plaintext: &[u8], content: Content) -> Option<Envelope> {
+fn encrypt_for_recipient(
+    session: &SessionState,
+    key_mode: KeyMode,
+    pubkey_der: &[u8],
+    plaintext: &[u8],
+    content: Content,
+) -> Option<Envelope> {
     if !crate::channel::can_address(key_mode, session.own_key_mode) {
         return None;
     }
@@ -43,15 +49,27 @@ pub(crate) async fn handle_send_text(
     recipient_pubkey_der: Vec<u8>,
 ) -> proto::Result<()> {
     if session.remote_keys.try_use(to) {
-        if let Some(envelope) =
-            encrypt_for_recipient(session, recipient_key_mode, &recipient_pubkey_der, plaintext.as_bytes(), Content::Text)
-        {
+        if let Some(envelope) = encrypt_for_recipient(
+            session,
+            recipient_key_mode,
+            &recipient_pubkey_der,
+            plaintext.as_bytes(),
+            Content::Text,
+        ) {
             session.peer_link.ensure_link(wr, to).await;
-            session.peer_link.send_reliable_or_queue(to, P2pPayload::Envelope { channel: None, envelope });
+            session.peer_link.send_reliable_or_queue(
+                to,
+                P2pPayload::Envelope {
+                    channel: None,
+                    envelope,
+                },
+            );
             crate::session::request_rotation_if_per_message(session, to);
         }
     } else {
-        session.remote_keys.enqueue(to, rekey::QueuedOutbound::Direct { plaintext });
+        session
+            .remote_keys
+            .enqueue(to, rekey::QueuedOutbound::Direct { plaintext });
     }
     Ok(())
 }
@@ -71,24 +89,52 @@ pub(crate) async fn handle_send_file(
     recipient_key_mode: KeyMode,
     recipient_pubkey_der: Vec<u8>,
 ) -> proto::Result<()> {
-    if !crate::channel::can_address(recipient_key_mode, session.own_key_mode) || !session.remote_keys.try_use(to) {
+    if !crate::channel::can_address(recipient_key_mode, session.own_key_mode)
+        || !session.remote_keys.try_use(to)
+    {
         return Ok(());
     }
-    let payload = crate::file_transfer::FileOfferPayload { filename: filename.clone(), size };
-    let Ok(plaintext) = proto::encode(&payload) else { return Ok(()) };
-    let Some(envelope) = encrypt_for_recipient(session, recipient_key_mode, &recipient_pubkey_der, &plaintext, Content::FileOffer)
-    else {
+    let payload = crate::file_transfer::FileOfferPayload {
+        filename: filename.clone(),
+        size,
+    };
+    let Ok(plaintext) = proto::encode(&payload) else {
+        return Ok(());
+    };
+    let Some(envelope) = encrypt_for_recipient(
+        session,
+        recipient_key_mode,
+        &recipient_pubkey_der,
+        &plaintext,
+        Content::FileOffer,
+    ) else {
         return Ok(());
     };
     let stream_id = session.next_stream_id;
-    let Some(key) = voice_stream::resolve_direct_key(session, stream_id, to, recipient_key_mode, &recipient_pubkey_der) else {
+    let Some(key) = voice_stream::resolve_direct_key(
+        session,
+        stream_id,
+        to,
+        recipient_key_mode,
+        &recipient_pubkey_der,
+    ) else {
         return Ok(());
     };
     session.next_stream_id += 1;
     ui_state.log_own_file_offer_dm(to, stream_id, filename.clone(), size);
-    session.own_file_targets.insert(stream_id, crate::file_stream::OwnFileTarget { to, path, key });
+    session.own_file_targets.insert(
+        stream_id,
+        crate::file_stream::OwnFileTarget { to, path, key },
+    );
     session.peer_link.ensure_link(wr, to).await;
-    session.peer_link.send_reliable_or_queue(to, P2pPayload::FileOffer { channel: None, stream_id, envelope });
+    session.peer_link.send_reliable_or_queue(
+        to,
+        P2pPayload::FileOffer {
+            channel: None,
+            stream_id,
+            envelope,
+        },
+    );
     crate::session::request_rotation_if_per_message(session, to);
     Ok(())
 }
@@ -103,7 +149,9 @@ pub(crate) async fn handle_voice_record_start(
     recipient_key_mode: KeyMode,
     recipient_pubkey_der: Vec<u8>,
 ) -> proto::Result<()> {
-    if !crate::channel::can_address(recipient_key_mode, session.own_key_mode) || !session.remote_keys.try_use(to) {
+    if !crate::channel::can_address(recipient_key_mode, session.own_key_mode)
+        || !session.remote_keys.try_use(to)
+    {
         ui_state.recording_failed("recipient's key isn't ready yet".to_string());
         return Ok(());
     }
@@ -116,11 +164,14 @@ pub(crate) async fn handle_voice_record_start(
     }
     let key = match recipient_key_mode {
         KeyMode::PqHybrid => {
-            let Ok(public): Result<crypto::pq::PqPublicBundle, _> = proto::decode(&recipient_pubkey_der) else {
+            let Ok(public): Result<crypto::pq::PqPublicBundle, _> =
+                proto::decode(&recipient_pubkey_der)
+            else {
                 ui_state.recording_failed("malformed pq_hybrid public key".to_string());
                 return Ok(());
             };
-            let Some(pq) = voice_stream::build_pq_stream_out(session, stream_id, &[(to, public)]) else {
+            let Some(pq) = voice_stream::build_pq_stream_out(session, stream_id, &[(to, public)])
+            else {
                 ui_state.recording_failed("failed to prepare pq_hybrid stream key".to_string());
                 return Ok(());
             };
@@ -135,10 +186,18 @@ pub(crate) async fn handle_voice_record_start(
         },
     };
     ui_state.log_own_voice_stream_start_dm(to, stream_id);
-    session.peer_link.send_reliable_or_queue(to, P2pPayload::StreamStart { channel: None, stream_id });
+    session.peer_link.send_reliable_or_queue(
+        to,
+        P2pPayload::StreamStart {
+            channel: None,
+            stream_id,
+        },
+    );
     let (stop_tx, stop_rx) = std::sync::mpsc::channel();
     session.active_recording = Some(stop_tx);
-    session.own_stream_targets.insert(stream_id, voice_stream::OwnStreamTarget::Direct(to));
+    session
+        .own_stream_targets
+        .insert(stream_id, voice_stream::OwnStreamTarget::Direct(to));
     voice_stream::spawn_record_stream_worker(
         recorder,
         voice_stream::StreamRecipients::Direct { to, key },
@@ -158,7 +217,9 @@ pub(crate) fn on_message(
     from_name: String,
     envelope: Envelope,
 ) {
-    let Some(sender) = ui_state.known_users.get(&from).cloned() else { return };
+    let Some(sender) = ui_state.known_users.get(&from).cloned() else {
+        return;
+    };
     if let Some(body) = crate::session::decrypt_envelope_for(envelope, from, &sender, session) {
         ui_state.on_direct_message(from, from_name, body);
         crate::session::request_rotation_if_per_message(session, from);
@@ -175,9 +236,20 @@ pub(crate) fn on_stream_start(
     // Snapshotted once, same as the decrypt key set itself (PROTOCOL.md
     // §11.6/§12): a Pending/Rejected sender's stream is never played live.
     let suppress_playback = ui_state.is_trust_gated(from);
-    let sender_public_key_der = ui_state.known_users.get(&from).map(|u| u.public_key_der.clone()).unwrap_or_default();
+    let sender_public_key_der = ui_state
+        .known_users
+        .get(&from)
+        .map(|u| u.public_key_der.clone())
+        .unwrap_or_default();
     ui_state.on_direct_stream_start(from, from, from_name, stream_id);
-    voice_stream::start_incoming_stream(session, from, stream_id, None, suppress_playback, &sender_public_key_der);
+    voice_stream::start_incoming_stream(
+        session,
+        from,
+        stream_id,
+        None,
+        suppress_playback,
+        &sender_public_key_der,
+    );
 }
 
 pub(crate) fn on_own_stream_finished(
@@ -193,6 +265,12 @@ pub(crate) fn on_own_stream_finished(
     crate::session::request_rotation_if_per_message(session, to);
 }
 
-pub(crate) fn on_stream_finished(ui_state: &mut UiState, from: UserId, stream_id: u64, duration_ms: u32, pcm: Vec<u8>) {
+pub(crate) fn on_stream_finished(
+    ui_state: &mut UiState,
+    from: UserId,
+    stream_id: u64,
+    duration_ms: u32,
+    pcm: Vec<u8>,
+) {
     ui_state.on_direct_stream_finished(from, from, stream_id, duration_ms, pcm);
 }

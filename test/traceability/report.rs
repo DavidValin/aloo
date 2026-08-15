@@ -70,7 +70,10 @@ pub fn status_of_requirement(model: &Model, id: &str) -> Status {
     }
     // A scenario with no matching steps is worse than an untested requirement
     // dressed up as a passing one, so it outranks any sibling that did pass.
-    if outcomes.iter().any(|o| *o == Some(TestOutcome::NotImplemented)) {
+    if outcomes
+        .iter()
+        .any(|o| *o == Some(TestOutcome::NotImplemented))
+    {
         return Status::NotImplemented;
     }
     if outcomes.iter().any(|o| *o == Some(TestOutcome::Passed)) {
@@ -115,7 +118,8 @@ pub fn write_all(model: &Model, report: &Report) -> PathBuf {
     std::fs::create_dir_all(&dir).expect("create target/traceability");
     std::fs::write(dir.join("report.html"), html(model, report)).expect("write report.html");
     std::fs::write(dir.join("traceability.json"), json(model, report)).expect("write json");
-    std::fs::write(dir.join("traceability-matrix.md"), matrix(model, report)).expect("write matrix");
+    std::fs::write(dir.join("traceability-matrix.md"), matrix(model, report))
+        .expect("write matrix");
     dir
 }
 
@@ -139,14 +143,32 @@ pub fn totals(model: &Model) -> Totals {
         if entry.kind == ReqKind::Story {
             continue;
         }
-        *by_status.entry(status_of_requirement(model, &entry.id).label()).or_insert(0) += 1;
+        *by_status
+            .entry(status_of_requirement(model, &entry.id).label())
+            .or_insert(0) += 1;
     }
     Totals {
         stories: model.stories.len(),
-        acceptance: model.requirements.values().filter(|r| r.kind == ReqKind::Acceptance).count(),
-        technical: model.requirements.values().filter(|r| r.kind == ReqKind::Technical).count(),
-        rust_tests: model.tests.iter().filter(|t| t.kind == TestKind::Rust).count(),
-        scenarios: model.tests.iter().filter(|t| t.kind == TestKind::Scenario).count(),
+        acceptance: model
+            .requirements
+            .values()
+            .filter(|r| r.kind == ReqKind::Acceptance)
+            .count(),
+        technical: model
+            .requirements
+            .values()
+            .filter(|r| r.kind == ReqKind::Technical)
+            .count(),
+        rust_tests: model
+            .tests
+            .iter()
+            .filter(|t| t.kind == TestKind::Rust)
+            .count(),
+        scenarios: model
+            .tests
+            .iter()
+            .filter(|t| t.kind == TestKind::Scenario)
+            .count(),
         ignored: model.tests.iter().filter(|t| t.ignored).count(),
         by_status,
     }
@@ -157,7 +179,10 @@ pub fn totals(model: &Model) -> Totals {
 // ---------------------------------------------------------------------
 
 fn esc(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 fn html(model: &Model, report: &Report) -> String {
@@ -233,7 +258,10 @@ footer{color:var(--muted);font-size:12px;margin-top:32px}
     // summary cards
     h.push_str("<div class=\"cards\">");
     let card = |h: &mut String, n: usize, l: &str, cls: &str| {
-        let _ = write!(h, "<div class=\"card\"><b class=\"{cls}\">{n}</b><span>{l}</span></div>");
+        let _ = write!(
+            h,
+            "<div class=\"card\"><b class=\"{cls}\">{n}</b><span>{l}</span></div>"
+        );
     };
     card(&mut h, t.stories, "user stories", "");
     card(&mut h, t.acceptance, "acceptance criteria", "");
@@ -257,7 +285,11 @@ footer{color:var(--muted);font-size:12px;margin-top:32px}
     if !report.findings.is_empty() {
         h.push_str("<div class=\"findings\"><h2 style=\"font-size:17px\">Validation findings</h2><div class=\"scroll\"><table><tr><th>Severity</th><th>Rule</th><th>Subject</th><th>Detail</th></tr>");
         for f in &report.findings {
-            let cls = if f.severity == Severity::Error { "fail" } else { "skip" };
+            let cls = if f.severity == Severity::Error {
+                "fail"
+            } else {
+                "skip"
+            };
             let _ = write!(
                 h,
                 "<tr><td><span class=\"badge {cls}\">{}</span></td><td class=\"id\">{}</td><td class=\"id\">{}</td><td>{}</td></tr>",
@@ -316,7 +348,11 @@ footer{color:var(--muted);font-size:12px;margin-top:32px}
                 "{} {} {}",
                 entry.id,
                 entry.description,
-                tests.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(" ")
+                tests
+                    .iter()
+                    .map(|t| t.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ")
             );
             let _ = write!(
                 h,
@@ -332,7 +368,9 @@ footer{color:var(--muted);font-size:12px;margin-top:32px}
             );
 
             if tests.is_empty() {
-                h.push_str("<p class=\"none\">No executable test is linked to this requirement.</p>");
+                h.push_str(
+                    "<p class=\"none\">No executable test is linked to this requirement.</p>",
+                );
             } else {
                 h.push_str("<ul class=\"tests\">");
                 for test in tests {
@@ -346,7 +384,11 @@ footer{color:var(--muted);font-size:12px;margin-top:32px}
                         test.kind.label(),
                         esc(&test.file.display().to_string()),
                         test.line,
-                        if test.ignored { " &middot; #[ignore]" } else { "" },
+                        if test.ignored {
+                            " &middot; #[ignore]"
+                        } else {
+                            ""
+                        },
                     );
                 }
                 h.push_str("</ul>");
@@ -362,7 +404,11 @@ footer{color:var(--muted);font-size:12px;margin-top:32px}
     let _ = write!(
         h,
         "<footer>{} requirement links across {} rust tests and {} scenarios; {} test(s) are <code>#[ignore]</code>d.</footer>",
-        model.tests.iter().map(|t| t.requirements.len()).sum::<usize>(),
+        model
+            .tests
+            .iter()
+            .map(|t| t.requirements.len())
+            .sum::<usize>(),
         t.rust_tests,
         t.scenarios,
         t.ignored
@@ -446,8 +492,11 @@ fn json(model: &Model, report: &Report) -> String {
             jstr(&story.so_that),
             jstr(story_status(model, &story.id).label())
         );
-        let reqs: Vec<_> =
-            model.requirements_of(&story.id).into_iter().filter(|r| r.kind != ReqKind::Story).collect();
+        let reqs: Vec<_> = model
+            .requirements_of(&story.id)
+            .into_iter()
+            .filter(|r| r.kind != ReqKind::Story)
+            .collect();
         for (ri, entry) in reqs.iter().enumerate() {
             let tests = model.tests_for(&entry.id);
             let _ = write!(

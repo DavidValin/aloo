@@ -101,7 +101,10 @@ impl IdStore {
     /// run the session with pinning checks disabled for it rather than
     /// refusing to connect at all.
     pub fn new_empty(path: PathBuf) -> Self {
-        Self { path, entries: HashMap::new() }
+        Self {
+            path,
+            entries: HashMap::new(),
+        }
     }
 
     /// Loads `path` if it exists; a missing file isn't an error (first run
@@ -125,7 +128,10 @@ impl IdStore {
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
         }
-        Ok(Self { path: path.to_path_buf(), entries })
+        Ok(Self {
+            path: path.to_path_buf(),
+            entries,
+        })
     }
 
     /// Checks `nickname`'s announced `public_key_der` against what's pinned
@@ -143,10 +149,15 @@ impl IdStore {
         if !is_storable(nickname) {
             return IdCheck::New;
         }
-        match self.entries.insert(nickname.to_string(), public_key_der.to_vec()) {
+        match self
+            .entries
+            .insert(nickname.to_string(), public_key_der.to_vec())
+        {
             None => IdCheck::New,
             Some(previous) if previous == public_key_der => IdCheck::Match,
-            Some(previous) => IdCheck::Mismatch { previous_public_key_der: previous },
+            Some(previous) => IdCheck::Mismatch {
+                previous_public_key_der: previous,
+            },
         }
     }
 

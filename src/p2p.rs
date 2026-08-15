@@ -51,27 +51,63 @@ const RENDEZVOUS_TIMEOUT: Duration = Duration::from_millis(800);
 pub enum P2pEvent {
     /// `channel: Some(name)` is a channel message, `None` a DM - mirrors
     /// `p2p_proto::P2pPayload::Envelope`.
-    Message { channel: Option<String>, from: UserId, envelope: crate::proto::Envelope },
-    StreamStart { channel: Option<String>, from: UserId, stream_id: u64 },
-    StreamChunk { from: UserId, stream_id: u64, seq: u32, blocks: Vec<Vec<u8>> },
+    Message {
+        channel: Option<String>,
+        from: UserId,
+        envelope: crate::proto::Envelope,
+    },
+    StreamStart {
+        channel: Option<String>,
+        from: UserId,
+        stream_id: u64,
+    },
+    StreamChunk {
+        from: UserId,
+        stream_id: u64,
+        seq: u32,
+        blocks: Vec<Vec<u8>>,
+    },
     /// `duration_ms` isn't carried through - like the server-relayed
     /// version before it, the receiver finalizes with whatever plaintext
     /// was actually accumulated rather than trusting the sender's claimed
     /// duration (see `voice_stream::end_incoming_stream`).
-    StreamEnd { from: UserId, stream_id: u64 },
-    FileOffer { channel: Option<String>, from: UserId, stream_id: u64, envelope: crate::proto::Envelope },
+    StreamEnd {
+        from: UserId,
+        stream_id: u64,
+    },
+    FileOffer {
+        channel: Option<String>,
+        from: UserId,
+        stream_id: u64,
+        envelope: crate::proto::Envelope,
+    },
     /// The accepter/rejecter is always exactly whoever we offered the file
     /// to (there is only ever one, per `stream_id`), so unlike `Message`/
     /// `FileOffer` this doesn't need a `from` to disambiguate anything.
-    FileAccepted { stream_id: u64 },
-    FileRejected { stream_id: u64 },
-    FileChunk { from: UserId, stream_id: u64, seq: u32, blocks: Vec<Vec<u8>> },
-    FileEnd { from: UserId, stream_id: u64 },
+    FileAccepted {
+        stream_id: u64,
+    },
+    FileRejected {
+        stream_id: u64,
+    },
+    FileChunk {
+        from: UserId,
+        stream_id: u64,
+        seq: u32,
+        blocks: Vec<Vec<u8>>,
+    },
+    FileEnd {
+        from: UserId,
+        stream_id: u64,
+    },
     /// A link to `peer` failed to establish (punch timed out) or died
     /// (retransmit budget exhausted) while something was pending against
     /// it - there is no relay fallback, so this is a terminal failure the
     /// UI must surface, not something to retry silently.
-    LinkFailed { peer: UserId, reason: String },
+    LinkFailed {
+        peer: UserId,
+        reason: String,
+    },
 }
 
 /// Outgoing traffic originating on a background thread (the voice recorder,
@@ -85,11 +121,32 @@ pub enum P2pEvent {
 /// (a file transfer has no acceptable-loss tradeoff the way live audio
 /// does).
 pub enum P2pOutbound {
-    ChannelVoiceChunk { stream_id: u64, seq: u32, per_recipient: Vec<(UserId, Vec<Vec<u8>>)> },
-    DirectVoiceChunk { to: UserId, stream_id: u64, seq: u32, blocks: Vec<Vec<u8>> },
-    VoiceEnd { stream_id: u64, duration_ms: u32, recipients: Vec<UserId> },
-    FileChunk { to: UserId, stream_id: u64, seq: u32, blocks: Vec<Vec<u8>> },
-    FileEnd { to: UserId, stream_id: u64 },
+    ChannelVoiceChunk {
+        stream_id: u64,
+        seq: u32,
+        per_recipient: Vec<(UserId, Vec<Vec<u8>>)>,
+    },
+    DirectVoiceChunk {
+        to: UserId,
+        stream_id: u64,
+        seq: u32,
+        blocks: Vec<Vec<u8>>,
+    },
+    VoiceEnd {
+        stream_id: u64,
+        duration_ms: u32,
+        recipients: Vec<UserId>,
+    },
+    FileChunk {
+        to: UserId,
+        stream_id: u64,
+        seq: u32,
+        blocks: Vec<Vec<u8>>,
+    },
+    FileEnd {
+        to: UserId,
+        stream_id: u64,
+    },
 }
 
 /// What a caller gets back from `ensure_link`: whether it's safe to send
@@ -109,12 +166,23 @@ enum PeerLinkState {
     /// We've asked the server to relay our candidates to this peer and are
     /// waiting for their reply (their own `RequestPeerLink`, relayed back
     /// as `ServerMessage::PeerCandidates`).
-    Requested { started: Instant },
+    Requested {
+        started: Instant,
+    },
     /// We know the peer's candidates and are exchanging `Ping`/`Pong` with
     /// all of them, looking for one that works in both directions.
-    Punching { started: Instant, candidates: Vec<SocketAddr> },
-    Active { addr: SocketAddr, last_sent: Instant },
-    Failed { since: Instant, reason: String },
+    Punching {
+        started: Instant,
+        candidates: Vec<SocketAddr>,
+    },
+    Active {
+        addr: SocketAddr,
+        last_sent: Instant,
+    },
+    Failed {
+        since: Instant,
+        reason: String,
+    },
 }
 
 struct PeerLink {
@@ -134,7 +202,13 @@ struct PeerLink {
 
 impl PeerLink {
     fn new(my_nonce: u64, state: PeerLinkState) -> Self {
-        Self { my_nonce, state, pending: Vec::new(), arq_tx: ArqSender::new(), arq_rx: ArqReceiver::new() }
+        Self {
+            my_nonce,
+            state,
+            pending: Vec::new(),
+            arq_tx: ArqSender::new(),
+            arq_rx: ArqReceiver::new(),
+        }
     }
 }
 
@@ -180,7 +254,13 @@ impl PeerLinkManager {
         }
 
         Ok((
-            Self { socket: socket.clone(), local_candidates: candidates, links: HashMap::new(), addr_index: HashMap::new(), events_tx },
+            Self {
+                socket: socket.clone(),
+                local_candidates: candidates,
+                links: HashMap::new(),
+                addr_index: HashMap::new(),
+                events_tx,
+            },
             socket,
         ))
     }
@@ -189,7 +269,11 @@ impl PeerLinkManager {
     /// is the first time `peer` is addressed - or restarting one whose
     /// previous attempt has finished its `FAILURE_COOLDOWN`), and reports
     /// whether it's safe to send on it right now.
-    pub async fn ensure_link(&mut self, wr: &mut (impl AsyncWrite + Unpin), peer: UserId) -> LinkReadiness {
+    pub async fn ensure_link(
+        &mut self,
+        wr: &mut (impl AsyncWrite + Unpin),
+        peer: UserId,
+    ) -> LinkReadiness {
         if let Some(link) = self.links.get(&peer) {
             match &link.state {
                 PeerLinkState::Active { .. } => return LinkReadiness::Active,
@@ -205,10 +289,22 @@ impl PeerLinkManager {
         let my_nonce = random_token();
         let _ = proto::write_message(
             wr,
-            &ClientMessage::RequestPeerLink { peer, candidates: self.local_candidates.clone(), link_nonce: my_nonce },
+            &ClientMessage::RequestPeerLink {
+                peer,
+                candidates: self.local_candidates.clone(),
+                link_nonce: my_nonce,
+            },
         )
         .await;
-        self.links.insert(peer, PeerLink::new(my_nonce, PeerLinkState::Requested { started: Instant::now() }));
+        self.links.insert(
+            peer,
+            PeerLink::new(
+                my_nonce,
+                PeerLinkState::Requested {
+                    started: Instant::now(),
+                },
+            ),
+        );
         LinkReadiness::Pending
     }
 
@@ -225,30 +321,54 @@ impl PeerLinkManager {
         candidates: Vec<SocketAddr>,
         link_nonce: u64,
     ) {
-        if matches!(self.links.get(&from).map(|l| &l.state), Some(PeerLinkState::Active { .. })) {
+        if matches!(
+            self.links.get(&from).map(|l| &l.state),
+            Some(PeerLinkState::Active { .. })
+        ) {
             return;
         }
         if !self.links.contains_key(&from) {
             let _ = proto::write_message(
                 wr,
-                &ClientMessage::RequestPeerLink { peer: from, candidates: self.local_candidates.clone(), link_nonce },
+                &ClientMessage::RequestPeerLink {
+                    peer: from,
+                    candidates: self.local_candidates.clone(),
+                    link_nonce,
+                },
             )
             .await;
-            self.links.insert(from, PeerLink::new(link_nonce, PeerLinkState::Requested { started: Instant::now() }));
+            self.links.insert(
+                from,
+                PeerLink::new(
+                    link_nonce,
+                    PeerLinkState::Requested {
+                        started: Instant::now(),
+                    },
+                ),
+            );
         }
         for addr in &candidates {
             self.addr_index.insert(*addr, from);
         }
         if let Some(link) = self.links.get_mut(&from) {
-            link.state = PeerLinkState::Punching { started: Instant::now(), candidates: candidates.clone() };
+            link.state = PeerLinkState::Punching {
+                started: Instant::now(),
+                candidates: candidates.clone(),
+            };
         }
         self.send_pings(from);
     }
 
     fn send_pings(&self, peer: UserId) {
-        let Some(link) = self.links.get(&peer) else { return };
-        let PeerLinkState::Punching { candidates, .. } = &link.state else { return };
-        let dgram = encode_dgram(&PunchDatagram::Ping { link_nonce: link.my_nonce });
+        let Some(link) = self.links.get(&peer) else {
+            return;
+        };
+        let PeerLinkState::Punching { candidates, .. } = &link.state else {
+            return;
+        };
+        let dgram = encode_dgram(&PunchDatagram::Ping {
+            link_nonce: link.my_nonce,
+        });
         for addr in candidates {
             let _ = self.socket.try_send_to(&dgram, *addr);
         }
@@ -260,7 +380,9 @@ impl PeerLinkManager {
     /// link itself) - a `payload` for a peer with no link state at all is
     /// simply dropped, since there is nothing to flush it later.
     pub fn send_reliable_or_queue(&mut self, peer: UserId, payload: P2pPayload) {
-        let Some(link) = self.links.get_mut(&peer) else { return };
+        let Some(link) = self.links.get_mut(&peer) else {
+            return;
+        };
         if matches!(link.state, PeerLinkState::Active { .. }) {
             Self::transmit_reliable(&self.socket, link, &payload);
         } else {
@@ -272,19 +394,38 @@ impl PeerLinkManager {
     /// once a caller has already confirmed `LinkReadiness::Active` via
     /// `ensure_link` (voice is never queued, see `LinkReadiness`'s doc), so
     /// a link that isn't `Active` here simply drops the chunk.
-    pub fn send_unreliable_voice(&mut self, peer: UserId, stream_id: u64, seq: u32, blocks: Vec<Vec<u8>>) {
-        let Some(link) = self.links.get_mut(&peer) else { return };
-        let PeerLinkState::Active { addr, last_sent } = &mut link.state else { return };
-        let dgram = encode_dgram(&PunchDatagram::Unreliable { stream_id, seq, blocks });
+    pub fn send_unreliable_voice(
+        &mut self,
+        peer: UserId,
+        stream_id: u64,
+        seq: u32,
+        blocks: Vec<Vec<u8>>,
+    ) {
+        let Some(link) = self.links.get_mut(&peer) else {
+            return;
+        };
+        let PeerLinkState::Active { addr, last_sent } = &mut link.state else {
+            return;
+        };
+        let dgram = encode_dgram(&PunchDatagram::Unreliable {
+            stream_id,
+            seq,
+            blocks,
+        });
         let _ = self.socket.try_send_to(&dgram, *addr);
         *last_sent = Instant::now();
     }
 
     fn transmit_reliable(socket: &UdpSocket, link: &mut PeerLink, payload: &P2pPayload) {
-        let PeerLinkState::Active { addr, last_sent } = &mut link.state else { return };
+        let PeerLinkState::Active { addr, last_sent } = &mut link.state else {
+            return;
+        };
         let bytes = proto::encode(payload).unwrap_or_default();
         let seq = link.arq_tx.send(bytes.clone());
-        let dgram = encode_dgram(&PunchDatagram::Reliable { seq, payload: bytes });
+        let dgram = encode_dgram(&PunchDatagram::Reliable {
+            seq,
+            payload: bytes,
+        });
         let _ = socket.try_send_to(&dgram, *addr);
         *last_sent = Instant::now();
     }
@@ -295,10 +436,14 @@ impl PeerLinkManager {
     /// candidate from a link that's since moved on, ...) is silently
     /// ignored.
     pub fn on_datagram(&mut self, addr: SocketAddr, dgram: PunchDatagram) {
-        let Some(&peer) = self.addr_index.get(&addr) else { return };
+        let Some(&peer) = self.addr_index.get(&addr) else {
+            return;
+        };
         match dgram {
             PunchDatagram::Ping { link_nonce } => {
-                let _ = self.socket.try_send_to(&encode_dgram(&PunchDatagram::Pong { link_nonce }), addr);
+                let _ = self
+                    .socket
+                    .try_send_to(&encode_dgram(&PunchDatagram::Pong { link_nonce }), addr);
             }
             PunchDatagram::Pong { link_nonce } => self.on_pong(peer, addr, link_nonce),
             PunchDatagram::Keepalive { .. } => {}
@@ -308,18 +453,32 @@ impl PeerLinkManager {
                 }
             }
             PunchDatagram::Reliable { seq, payload } => self.on_reliable(peer, addr, seq, payload),
-            PunchDatagram::Unreliable { stream_id, seq, blocks } => {
-                let _ = self.events_tx.send(P2pEvent::StreamChunk { from: peer, stream_id, seq, blocks });
+            PunchDatagram::Unreliable {
+                stream_id,
+                seq,
+                blocks,
+            } => {
+                let _ = self.events_tx.send(P2pEvent::StreamChunk {
+                    from: peer,
+                    stream_id,
+                    seq,
+                    blocks,
+                });
             }
         }
     }
 
     fn on_pong(&mut self, peer: UserId, addr: SocketAddr, link_nonce: u64) {
-        let Some(link) = self.links.get_mut(&peer) else { return };
+        let Some(link) = self.links.get_mut(&peer) else {
+            return;
+        };
         if link.my_nonce != link_nonce || matches!(link.state, PeerLinkState::Active { .. }) {
             return;
         }
-        link.state = PeerLinkState::Active { addr, last_sent: Instant::now() };
+        link.state = PeerLinkState::Active {
+            addr,
+            last_sent: Instant::now(),
+        };
         let pending = std::mem::take(&mut link.pending);
         for payload in pending {
             Self::transmit_reliable(&self.socket, link, &payload);
@@ -327,25 +486,55 @@ impl PeerLinkManager {
     }
 
     fn on_reliable(&mut self, peer: UserId, addr: SocketAddr, seq: u32, payload: Vec<u8>) {
-        let _ = self.socket.try_send_to(&encode_dgram(&PunchDatagram::Ack { seq }), addr);
-        let Some(link) = self.links.get_mut(&peer) else { return };
+        let _ = self
+            .socket
+            .try_send_to(&encode_dgram(&PunchDatagram::Ack { seq }), addr);
+        let Some(link) = self.links.get_mut(&peer) else {
+            return;
+        };
         for delivered in link.arq_rx.receive(seq, payload) {
-            let Ok(p2p_payload) = proto::decode::<P2pPayload>(&delivered) else { continue };
+            let Ok(p2p_payload) = proto::decode::<P2pPayload>(&delivered) else {
+                continue;
+            };
             self.emit_payload(peer, p2p_payload);
         }
     }
 
     fn emit_payload(&self, from: UserId, payload: P2pPayload) {
         let event = match payload {
-            P2pPayload::Envelope { channel, envelope } => P2pEvent::Message { channel, from, envelope },
-            P2pPayload::FileOffer { channel, stream_id, envelope } => {
-                P2pEvent::FileOffer { channel, from, stream_id, envelope }
-            }
-            P2pPayload::StreamStart { channel, stream_id } => P2pEvent::StreamStart { channel, from, stream_id },
+            P2pPayload::Envelope { channel, envelope } => P2pEvent::Message {
+                channel,
+                from,
+                envelope,
+            },
+            P2pPayload::FileOffer {
+                channel,
+                stream_id,
+                envelope,
+            } => P2pEvent::FileOffer {
+                channel,
+                from,
+                stream_id,
+                envelope,
+            },
+            P2pPayload::StreamStart { channel, stream_id } => P2pEvent::StreamStart {
+                channel,
+                from,
+                stream_id,
+            },
             P2pPayload::StreamEnd { stream_id, .. } => P2pEvent::StreamEnd { from, stream_id },
             P2pPayload::FileAccept { stream_id } => P2pEvent::FileAccepted { stream_id },
             P2pPayload::FileReject { stream_id } => P2pEvent::FileRejected { stream_id },
-            P2pPayload::FileChunk { stream_id, seq, blocks } => P2pEvent::FileChunk { from, stream_id, seq, blocks },
+            P2pPayload::FileChunk {
+                stream_id,
+                seq,
+                blocks,
+            } => P2pEvent::FileChunk {
+                from,
+                stream_id,
+                seq,
+                blocks,
+            },
             P2pPayload::FileEnd { stream_id } => P2pEvent::FileEnd { from, stream_id },
         };
         let _ = self.events_tx.send(event);
@@ -378,7 +567,10 @@ impl PeerLinkManager {
                     match link.arq_tx.due_for_retransmit(now) {
                         Ok(due) => {
                             for (seq, payload) in due {
-                                let _ = self.socket.try_send_to(&encode_dgram(&PunchDatagram::Reliable { seq, payload }), addr);
+                                let _ = self.socket.try_send_to(
+                                    &encode_dgram(&PunchDatagram::Reliable { seq, payload }),
+                                    addr,
+                                );
                                 *last_sent = now;
                             }
                         }
@@ -388,7 +580,12 @@ impl PeerLinkManager {
                         failed.push((peer, "too many out-of-order messages".to_string()));
                     }
                     if now.duration_since(*last_sent) >= KEEPALIVE_INTERVAL {
-                        let _ = self.socket.try_send_to(&encode_dgram(&PunchDatagram::Keepalive { link_nonce: link.my_nonce }), addr);
+                        let _ = self.socket.try_send_to(
+                            &encode_dgram(&PunchDatagram::Keepalive {
+                                link_nonce: link.my_nonce,
+                            }),
+                            addr,
+                        );
                         *last_sent = now;
                     }
                 }
@@ -409,10 +606,16 @@ impl PeerLinkManager {
             // surfacing (`recording_failed`) is independent of this and
             // still fires at the moment someone actually tries to record
             // to an unreachable peer, regardless of `had_pending` here.
-            let had_pending = self.links.get(&peer).is_some_and(|link| !link.pending.is_empty());
+            let had_pending = self
+                .links
+                .get(&peer)
+                .is_some_and(|link| !link.pending.is_empty());
             if let Some(link) = self.links.get_mut(&peer) {
                 link.pending.clear();
-                link.state = PeerLinkState::Failed { since: now, reason: reason.clone() };
+                link.state = PeerLinkState::Failed {
+                    since: now,
+                    reason: reason.clone(),
+                };
             }
             if had_pending {
                 let _ = self.events_tx.send(P2pEvent::LinkFailed { peer, reason });
@@ -421,8 +624,12 @@ impl PeerLinkManager {
         // Re-send pings for every link still punching, every tick - cheap,
         // small packets, and simpler than tracking a separate per-link
         // retry timer at ~150ms tick granularity.
-        let punching: Vec<UserId> =
-            self.links.iter().filter(|(_, l)| matches!(l.state, PeerLinkState::Punching { .. })).map(|(&id, _)| id).collect();
+        let punching: Vec<UserId> = self
+            .links
+            .iter()
+            .filter(|(_, l)| matches!(l.state, PeerLinkState::Punching { .. }))
+            .map(|(&id, _)| id)
+            .collect();
         for peer in punching {
             self.send_pings(peer);
         }
@@ -437,21 +644,52 @@ impl PeerLinkManager {
     /// does.
     pub fn dispatch_outbound(&mut self, msg: P2pOutbound) {
         match msg {
-            P2pOutbound::ChannelVoiceChunk { stream_id, seq, per_recipient } => {
+            P2pOutbound::ChannelVoiceChunk {
+                stream_id,
+                seq,
+                per_recipient,
+            } => {
                 for (id, blocks) in per_recipient {
                     self.send_unreliable_voice(id, stream_id, seq, blocks);
                 }
             }
-            P2pOutbound::DirectVoiceChunk { to, stream_id, seq, blocks } => {
+            P2pOutbound::DirectVoiceChunk {
+                to,
+                stream_id,
+                seq,
+                blocks,
+            } => {
                 self.send_unreliable_voice(to, stream_id, seq, blocks);
             }
-            P2pOutbound::VoiceEnd { stream_id, duration_ms, recipients } => {
+            P2pOutbound::VoiceEnd {
+                stream_id,
+                duration_ms,
+                recipients,
+            } => {
                 for id in recipients {
-                    self.send_reliable_or_queue(id, P2pPayload::StreamEnd { stream_id, duration_ms });
+                    self.send_reliable_or_queue(
+                        id,
+                        P2pPayload::StreamEnd {
+                            stream_id,
+                            duration_ms,
+                        },
+                    );
                 }
             }
-            P2pOutbound::FileChunk { to, stream_id, seq, blocks } => {
-                self.send_reliable_or_queue(to, P2pPayload::FileChunk { stream_id, seq, blocks });
+            P2pOutbound::FileChunk {
+                to,
+                stream_id,
+                seq,
+                blocks,
+            } => {
+                self.send_reliable_or_queue(
+                    to,
+                    P2pPayload::FileChunk {
+                        stream_id,
+                        seq,
+                        blocks,
+                    },
+                );
             }
             P2pOutbound::FileEnd { to, stream_id } => {
                 self.send_reliable_or_queue(to, P2pPayload::FileEnd { stream_id });
@@ -463,7 +701,10 @@ impl PeerLinkManager {
     /// helper (see `test/p2p_test.rs`'s loopback handshake test); ordinary
     /// send paths go through `ensure_link`'s `LinkReadiness` instead.
     pub fn is_active(&self, peer: UserId) -> bool {
-        matches!(self.links.get(&peer).map(|l| &l.state), Some(PeerLinkState::Active { .. }))
+        matches!(
+            self.links.get(&peer).map(|l| &l.state),
+            Some(PeerLinkState::Active { .. })
+        )
     }
 
     /// Drops a peer's link entirely (stops its keepalives, frees its ARQ
@@ -493,7 +734,12 @@ fn random_token() -> u64 {
 /// same-machine sessions (tests, or two local clients) punch trivially.
 fn host_candidates(local_port: u16) -> Vec<SocketAddr> {
     if_addrs::get_if_addrs()
-        .map(|ifaces| ifaces.into_iter().map(|iface| SocketAddr::new(iface.ip(), local_port)).collect())
+        .map(|ifaces| {
+            ifaces
+                .into_iter()
+                .map(|iface| SocketAddr::new(iface.ip(), local_port))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -503,7 +749,10 @@ fn host_candidates(local_port: u16) -> Vec<SocketAddr> {
 /// its `BindingResponse`. `None` on any failure (old server with no UDP
 /// rendezvous socket, no outbound UDP allowed, no reply in time, ...) -
 /// callers proceed with host candidates alone in that case.
-async fn learn_reflexive_candidate(socket: &UdpSocket, server_udp_addr: SocketAddr) -> Option<SocketAddr> {
+async fn learn_reflexive_candidate(
+    socket: &UdpSocket,
+    server_udp_addr: SocketAddr,
+) -> Option<SocketAddr> {
     let token: u64 = random_token();
     let request = encode_dgram_rendezvous(&RendezvousMessage::BindingRequest { token });
     let _ = socket.send_to(&request, server_udp_addr).await;
@@ -515,11 +764,20 @@ async fn learn_reflexive_candidate(socket: &UdpSocket, server_udp_addr: SocketAd
         if remaining.is_zero() {
             return None;
         }
-        let Ok(Ok((n, from))) = tokio::time::timeout(remaining, socket.recv_from(&mut buf)).await else { return None };
+        let Ok(Ok((n, from))) = tokio::time::timeout(remaining, socket.recv_from(&mut buf)).await
+        else {
+            return None;
+        };
         if from != server_udp_addr {
             continue;
         }
-        let Ok(RendezvousMessage::BindingResponse { token: got_token, observed }) = proto::decode(&buf[..n]) else { continue };
+        let Ok(RendezvousMessage::BindingResponse {
+            token: got_token,
+            observed,
+        }) = proto::decode(&buf[..n])
+        else {
+            continue;
+        };
         if got_token == token {
             return Some(observed);
         }
@@ -536,7 +794,10 @@ fn encode_dgram_rendezvous(msg: &RendezvousMessage) -> Vec<u8> {
 /// as a thin decode-and-forward task rather than driving `PeerLinkManager`
 /// itself, so all link-state mutation stays on the single-threaded session
 /// loop.
-pub fn spawn_receive_loop(socket: Arc<UdpSocket>, raw_tx: UnboundedSender<(SocketAddr, PunchDatagram)>) {
+pub fn spawn_receive_loop(
+    socket: Arc<UdpSocket>,
+    raw_tx: UnboundedSender<(SocketAddr, PunchDatagram)>,
+) {
     tokio::spawn(async move {
         let mut buf = vec![0u8; 64 * 1024];
         loop {
@@ -555,7 +816,9 @@ pub fn spawn_receive_loop(socket: Arc<UdpSocket>, raw_tx: UnboundedSender<(Socke
                 // session down" principle applied to the global hotkey
                 // (`global_ptt::spawn`) and every other optional subsystem.
                 Err(e) => {
-                    eprintln!("aloo: direct-link UDP receive error (ignoring, still listening): {e}");
+                    eprintln!(
+                        "aloo: direct-link UDP receive error (ignoring, still listening): {e}"
+                    );
                     // A brief pause before retrying - purely a safety net
                     // against a hypothetical permanently-broken socket
                     // returning an error instantly forever, which would
@@ -567,7 +830,9 @@ pub fn spawn_receive_loop(socket: Arc<UdpSocket>, raw_tx: UnboundedSender<(Socke
                     continue;
                 }
             };
-            let Ok(dgram) = proto::decode::<PunchDatagram>(&buf[..n]) else { continue };
+            let Ok(dgram) = proto::decode::<PunchDatagram>(&buf[..n]) else {
+                continue;
+            };
             if raw_tx.send((addr, dgram)).is_err() {
                 // The receiving end (`session.rs`'s `p2p_raw_rx`) is gone,
                 // meaning the whole session has already ended - nothing

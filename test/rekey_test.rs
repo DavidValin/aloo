@@ -1,9 +1,9 @@
 use aloo::crypto::{self, KeyPair, RSA_PER_MSG_KEY_BITS};
 use aloo::proto::{ClientMessage, UserId};
 use aloo::rekey::{
+    KEY_RETENTION, OwnKeys, QueuedOutbound, RemoteKeys, ResumeVerification,
     generate_and_sign_rotation, rotation_signing_payload, sign_rotation, verify_and_parse_rotation,
-    verify_rotation, verify_with_fallback, OwnKeys, QueuedOutbound, RemoteKeys, ResumeVerification,
-    KEY_RETENTION,
+    verify_rotation, verify_with_fallback,
 };
 use rsa::traits::PublicKeyParts;
 
@@ -61,7 +61,10 @@ fn verify_rotation_rejects_tampered_key_bytes() {
 #[test]
 fn rotation_signing_payload_differs_by_recipient() {
     let der = b"some-der-bytes".to_vec();
-    assert_ne!(rotation_signing_payload(UserId(1), &der), rotation_signing_payload(UserId(2), &der));
+    assert_ne!(
+        rotation_signing_payload(UserId(1), &der),
+        rotation_signing_payload(UserId(2), &der)
+    );
 }
 
 /// @requirement TB-070
@@ -103,7 +106,13 @@ fn fallback_prefers_the_live_key_when_it_verifies() {
     let new_der = crypto::public_key_to_der(&new_kp.public).unwrap();
     let sig = sign_rotation(&live.private, UserId(1), &new_der).unwrap();
 
-    let result = verify_with_fallback(Some(&live.public), Some(&continuity.public), UserId(1), &new_der, &sig);
+    let result = verify_with_fallback(
+        Some(&live.public),
+        Some(&continuity.public),
+        UserId(1),
+        &new_der,
+        &sig,
+    );
     match result {
         ResumeVerification::Live(k) => assert_eq!(crypto::public_key_to_der(&k).unwrap(), new_der),
         other => panic!("expected Live, got {other:?}"),
@@ -123,10 +132,17 @@ fn fallback_falls_through_to_continuity_when_live_check_fails() {
     // with the persisted continuity key they're actually resuming with.
     let sig = sign_rotation(&continuity.private, UserId(1), &new_der).unwrap();
 
-    let result =
-        verify_with_fallback(Some(&wrong_live.public), Some(&continuity.public), UserId(1), &new_der, &sig);
+    let result = verify_with_fallback(
+        Some(&wrong_live.public),
+        Some(&continuity.public),
+        UserId(1),
+        &new_der,
+        &sig,
+    );
     match result {
-        ResumeVerification::Resumed(k) => assert_eq!(crypto::public_key_to_der(&k).unwrap(), new_der),
+        ResumeVerification::Resumed(k) => {
+            assert_eq!(crypto::public_key_to_der(&k).unwrap(), new_der)
+        }
         other => panic!("expected Resumed, got {other:?}"),
     }
 }
@@ -154,7 +170,10 @@ fn fallback_fails_when_neither_anchor_is_available() {
     let unrelated = KeyPair::generate().unwrap();
     let sig = sign_rotation(&unrelated.private, UserId(1), &new_der).unwrap();
 
-    assert_eq!(verify_with_fallback(None, None, UserId(1), &new_der, &sig), ResumeVerification::Failed);
+    assert_eq!(
+        verify_with_fallback(None, None, UserId(1), &new_der, &sig),
+        ResumeVerification::Failed
+    );
 }
 
 /// @requirement TB-097
@@ -167,7 +186,13 @@ fn fallback_fails_when_both_anchors_are_present_but_neither_verifies() {
     let forger = KeyPair::generate().unwrap(); // neither live's nor continuity's key
     let sig = sign_rotation(&forger.private, UserId(1), &new_der).unwrap();
 
-    let result = verify_with_fallback(Some(&live.public), Some(&continuity.public), UserId(1), &new_der, &sig);
+    let result = verify_with_fallback(
+        Some(&live.public),
+        Some(&continuity.public),
+        UserId(1),
+        &new_der,
+        &sig,
+    );
     assert_eq!(result, ResumeVerification::Failed);
 }
 
@@ -216,7 +241,13 @@ fn fallback_rejects_tampered_new_key_bytes_via_either_anchor() {
     tampered[0] ^= 0xFF;
 
     assert_eq!(
-        verify_with_fallback(Some(&live.public), Some(&continuity.public), UserId(1), &tampered, &sig),
+        verify_with_fallback(
+            Some(&live.public),
+            Some(&continuity.public),
+            UserId(1),
+            &tampered,
+            &sig
+        ),
         ResumeVerification::Failed
     );
 }
@@ -248,7 +279,10 @@ fn decrypt_from_uses_bootstrap_key_before_any_rotation() {
     let own = OwnKeys::new(bootstrap.private);
 
     let blocks = crypto::encrypt_chunked(&bootstrap_public, b"first ever message").unwrap();
-    assert_eq!(own.decrypt_from(UserId(1), &blocks).as_deref(), Some(b"first ever message".as_slice()));
+    assert_eq!(
+        own.decrypt_from(UserId(1), &blocks).as_deref(),
+        Some(b"first ever message".as_slice())
+    );
 }
 
 /// @requirement TB-071
@@ -260,8 +294,16 @@ fn rotate_for_peer_signs_with_bootstrap_on_first_rotation() {
     let mut own = OwnKeys::new(bootstrap.private);
 
     let (new_der, sig) = own.rotate_for_peer(UserId(1)).unwrap();
-    assert!(verify_rotation(&bootstrap_public, UserId(1), &new_der, &sig));
-    assert_eq!(own.current_public_der_for(UserId(1)), Some(new_der.as_slice()));
+    assert!(verify_rotation(
+        &bootstrap_public,
+        UserId(1),
+        &new_der,
+        &sig
+    ));
+    assert_eq!(
+        own.current_public_der_for(UserId(1)),
+        Some(new_der.as_slice())
+    );
 }
 
 /// @requirement TB-072
@@ -294,9 +336,15 @@ fn rotate_for_peer_generates_keys_at_the_rsa_per_msg_key_size() {
 #[ignore = "real RSA-4096 keygen, 60s+ in this environment - see module doc"]
 fn generate_and_sign_rotation_produces_a_verifiable_4096_bit_key() {
     let old = KeyPair::generate().unwrap();
-    let (new_der, signature, new_private) = generate_and_sign_rotation(&old.private, UserId(1)).unwrap();
+    let (new_der, signature, new_private) =
+        generate_and_sign_rotation(&old.private, UserId(1)).unwrap();
 
-    assert!(verify_rotation(&old.public, UserId(1), &new_der, &signature));
+    assert!(verify_rotation(
+        &old.public,
+        UserId(1),
+        &new_der,
+        &signature
+    ));
 
     let new_public = crypto::public_key_from_der(&new_der).unwrap();
     assert_eq!(new_public.size() * 8, RSA_PER_MSG_KEY_BITS);
@@ -319,16 +367,32 @@ fn install_rotated_key_alone_updates_state_the_same_way_rotate_for_peer_does() {
     // sign against, generate+sign with no OwnKeys access at all, then only
     // touch OwnKeys again for the cheap bookkeeping step.
     let old_private = own.current_private_for(UserId(1));
-    let (new_der, signature, new_private) = generate_and_sign_rotation(&old_private, UserId(1)).unwrap();
-    assert!(verify_rotation(&bootstrap_public, UserId(1), &new_der, &signature));
+    let (new_der, signature, new_private) =
+        generate_and_sign_rotation(&old_private, UserId(1)).unwrap();
+    assert!(verify_rotation(
+        &bootstrap_public,
+        UserId(1),
+        &new_der,
+        &signature
+    ));
 
-    assert_eq!(own.current_public_der_for(UserId(1)), None, "not installed yet");
+    assert_eq!(
+        own.current_public_der_for(UserId(1)),
+        None,
+        "not installed yet"
+    );
     own.install_rotated_key(UserId(1), new_private, new_der.clone());
-    assert_eq!(own.current_public_der_for(UserId(1)), Some(new_der.as_slice()));
+    assert_eq!(
+        own.current_public_der_for(UserId(1)),
+        Some(new_der.as_slice())
+    );
 
     let new_public = crypto::public_key_from_der(&new_der).unwrap();
     let blocks = crypto::encrypt_chunked(&new_public, b"installed separately").unwrap();
-    assert_eq!(own.decrypt_from(UserId(1), &blocks).as_deref(), Some(b"installed separately".as_slice()));
+    assert_eq!(
+        own.decrypt_from(UserId(1), &blocks).as_deref(),
+        Some(b"installed separately".as_slice())
+    );
 }
 
 /// @requirement TB-071
@@ -343,7 +407,12 @@ fn rotate_for_peer_signs_second_rotation_with_the_first_per_peer_key() {
 
     let (second_der, second_sig) = own.rotate_for_peer(UserId(1)).unwrap();
     // must verify against the *first* per-peer key, not the bootstrap key
-    assert!(verify_rotation(&first_public, UserId(1), &second_der, &second_sig));
+    assert!(verify_rotation(
+        &first_public,
+        UserId(1),
+        &second_der,
+        &second_sig
+    ));
 }
 
 /// @requirement TB-073
@@ -356,8 +425,14 @@ fn rotate_for_peer_is_independent_per_peer() {
     let (der_for_bob, _) = own.rotate_for_peer(UserId(1)).unwrap();
     let (der_for_carol, _) = own.rotate_for_peer(UserId(2)).unwrap();
     assert_ne!(der_for_bob, der_for_carol);
-    assert_eq!(own.current_public_der_for(UserId(1)), Some(der_for_bob.as_slice()));
-    assert_eq!(own.current_public_der_for(UserId(2)), Some(der_for_carol.as_slice()));
+    assert_eq!(
+        own.current_public_der_for(UserId(1)),
+        Some(der_for_bob.as_slice())
+    );
+    assert_eq!(
+        own.current_public_der_for(UserId(2)),
+        Some(der_for_carol.as_slice())
+    );
 }
 
 /// @requirement TB-075
@@ -370,7 +445,10 @@ fn decrypt_from_works_with_the_newly_rotated_key() {
     let (new_der, _) = own.rotate_for_peer(UserId(1)).unwrap();
     let new_public = crypto::public_key_from_der(&new_der).unwrap();
     let blocks = crypto::encrypt_chunked(&new_public, b"after rotation").unwrap();
-    assert_eq!(own.decrypt_from(UserId(1), &blocks).as_deref(), Some(b"after rotation".as_slice()));
+    assert_eq!(
+        own.decrypt_from(UserId(1), &blocks).as_deref(),
+        Some(b"after rotation".as_slice())
+    );
 }
 
 /// @requirement TB-075
@@ -408,7 +486,8 @@ fn decrypt_from_still_falls_back_to_bootstrap_after_rotating_for_a_peer() {
 
     // a message from a *different*, not-yet-rotated peer, still under the
     // shared bootstrap key.
-    let blocks = crypto::encrypt_chunked(&bootstrap_public, b"from a peer who hasn't rotated").unwrap();
+    let blocks =
+        crypto::encrypt_chunked(&bootstrap_public, b"from a peer who hasn't rotated").unwrap();
     assert_eq!(
         own.decrypt_from(UserId(2), &blocks).as_deref(),
         Some(b"from a peer who hasn't rotated".as_slice())
@@ -453,7 +532,8 @@ fn candidate_privates_for_lists_current_retained_and_bootstrap_in_priority_order
         "retained key must be second"
     );
 
-    let bootstrap_blocks = crypto::encrypt_chunked(&bootstrap_public, b"under bootstrap key").unwrap();
+    let bootstrap_blocks =
+        crypto::encrypt_chunked(&bootstrap_public, b"under bootstrap key").unwrap();
     assert_eq!(
         crypto::decrypt_chunked(&candidates[2], &bootstrap_blocks).unwrap(),
         b"under bootstrap key",
@@ -466,7 +546,11 @@ fn candidate_privates_for_lists_current_retained_and_bootstrap_in_priority_order
 fn candidate_privates_for_an_untracked_peer_is_bootstrap_only() {
     let bootstrap = KeyPair::generate().unwrap();
     let own = OwnKeys::new(bootstrap.private);
-    assert_eq!(own.candidate_privates_for(UserId(1)).len(), 1, "no per-peer state yet - bootstrap alone");
+    assert_eq!(
+        own.candidate_privates_for(UserId(1)).len(),
+        1,
+        "no per-peer state yet - bootstrap alone"
+    );
 }
 
 /// @requirement TB-076
@@ -500,7 +584,11 @@ fn rotate_and_build_message_produces_a_rotate_key_client_message_addressed_corre
 
     let msg = own.rotate_and_build_message(UserId(42)).unwrap();
     match msg {
-        ClientMessage::RotateKey { to, new_public_key_der, signature } => {
+        ClientMessage::RotateKey {
+            to,
+            new_public_key_der,
+            signature,
+        } => {
             assert_eq!(to, UserId(42));
             assert!(!new_public_key_der.is_empty());
             assert!(!signature.is_empty());
@@ -526,7 +614,10 @@ fn current_public_der_for_is_none_before_any_rotation() {
 fn untracked_peer_is_always_sendable() {
     let mut remote = RemoteKeys::new();
     assert!(remote.try_use(UserId(1)));
-    assert!(remote.try_use(UserId(1)), "an untracked (Static) peer is never gated");
+    assert!(
+        remote.try_use(UserId(1)),
+        "an untracked (Static) peer is never gated"
+    );
     assert!(!remote.is_tracked(UserId(1)));
 }
 
@@ -535,8 +626,14 @@ fn untracked_peer_is_always_sendable() {
 fn tracked_peer_is_fresh_once_then_stale() {
     let mut remote = RemoteKeys::new();
     remote.track(UserId(1));
-    assert!(remote.try_use(UserId(1)), "bootstrap key should be usable once");
-    assert!(!remote.try_use(UserId(1)), "key must not be reused after one send");
+    assert!(
+        remote.try_use(UserId(1)),
+        "bootstrap key should be usable once"
+    );
+    assert!(
+        !remote.try_use(UserId(1)),
+        "key must not be reused after one send"
+    );
 }
 
 /// @requirement TB-080
@@ -546,7 +643,10 @@ fn track_is_idempotent_and_does_not_reset_freshness() {
     remote.track(UserId(1));
     assert!(remote.try_use(UserId(1)));
     remote.track(UserId(1)); // re-track, e.g. re-joining a channel
-    assert!(!remote.try_use(UserId(1)), "re-tracking must not resurrect a stale key");
+    assert!(
+        !remote.try_use(UserId(1)),
+        "re-tracking must not resurrect a stale key"
+    );
 }
 
 /// @requirement AC-045
@@ -556,19 +656,39 @@ fn queued_messages_flush_in_fifo_order_on_rotation() {
     remote.track(UserId(1));
     assert!(remote.try_use(UserId(1))); // consume the initial fresh key
 
-    remote.enqueue(UserId(1), QueuedOutbound::Direct { plaintext: "first".into() });
-    remote.enqueue(UserId(1), QueuedOutbound::Channel { channel: "general".into(), plaintext: "second".into() });
+    remote.enqueue(
+        UserId(1),
+        QueuedOutbound::Direct {
+            plaintext: "first".into(),
+        },
+    );
+    remote.enqueue(
+        UserId(1),
+        QueuedOutbound::Channel {
+            channel: "general".into(),
+            plaintext: "second".into(),
+        },
+    );
     assert_eq!(remote.queue_len(UserId(1)), 2);
 
     let flushed = remote.on_rotated(UserId(1));
     assert_eq!(
         flushed,
         vec![
-            QueuedOutbound::Direct { plaintext: "first".into() },
-            QueuedOutbound::Channel { channel: "general".into(), plaintext: "second".into() },
+            QueuedOutbound::Direct {
+                plaintext: "first".into()
+            },
+            QueuedOutbound::Channel {
+                channel: "general".into(),
+                plaintext: "second".into()
+            },
         ]
     );
-    assert_eq!(remote.queue_len(UserId(1)), 0, "queue must be drained, not just peeked");
+    assert_eq!(
+        remote.queue_len(UserId(1)),
+        0,
+        "queue must be drained, not just peeked"
+    );
 }
 
 /// @requirement TB-080
@@ -585,11 +705,19 @@ fn on_rotated_marks_fresh_and_mark_used_consumes_it_again() {
 
     // simulate a second rotation with something queued, batch-flushed and marked used
     assert!(!remote.try_use(UserId(1)));
-    remote.enqueue(UserId(1), QueuedOutbound::Direct { plaintext: "queued".into() });
+    remote.enqueue(
+        UserId(1),
+        QueuedOutbound::Direct {
+            plaintext: "queued".into(),
+        },
+    );
     let flushed = remote.on_rotated(UserId(1));
     assert_eq!(flushed.len(), 1);
     remote.mark_used(UserId(1));
-    assert!(!remote.try_use(UserId(1)), "batch flush must consume freshness like any other send");
+    assert!(
+        !remote.try_use(UserId(1)),
+        "batch flush must consume freshness like any other send"
+    );
 }
 
 /// @requirement TB-081
@@ -606,9 +734,17 @@ fn on_rotated_on_a_never_tracked_peer_starts_tracking_it() {
 #[test]
 fn enqueue_on_untracked_peer_starts_tracking_it_as_stale() {
     let mut remote = RemoteKeys::new();
-    remote.enqueue(UserId(5), QueuedOutbound::Direct { plaintext: "x".into() });
+    remote.enqueue(
+        UserId(5),
+        QueuedOutbound::Direct {
+            plaintext: "x".into(),
+        },
+    );
     assert!(remote.is_tracked(UserId(5)));
-    assert!(!remote.try_use(UserId(5)), "a peer we just had to queue for should not appear fresh");
+    assert!(
+        !remote.try_use(UserId(5)),
+        "a peer we just had to queue for should not appear fresh"
+    );
     assert_eq!(remote.queue_len(UserId(5)), 1);
 }
 
@@ -623,9 +759,19 @@ fn full_lifecycle_track_use_queue_rotate_flush() {
 
     // two more typed while waiting for the peer's next key
     assert!(!remote.try_use(UserId(1)));
-    remote.enqueue(UserId(1), QueuedOutbound::Direct { plaintext: "a".into() });
+    remote.enqueue(
+        UserId(1),
+        QueuedOutbound::Direct {
+            plaintext: "a".into(),
+        },
+    );
     assert!(!remote.try_use(UserId(1)));
-    remote.enqueue(UserId(1), QueuedOutbound::Direct { plaintext: "b".into() });
+    remote.enqueue(
+        UserId(1),
+        QueuedOutbound::Direct {
+            plaintext: "b".into(),
+        },
+    );
 
     // the peer's rotation finally arrives: flush both at once
     let batch = remote.on_rotated(UserId(1));

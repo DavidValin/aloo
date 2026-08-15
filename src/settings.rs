@@ -109,7 +109,9 @@ impl Settings {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            let Some((key, value)) = line.split_once('=') else { continue };
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
             let value = value.trim();
             match key.trim() {
                 "global_ptt_enabled" => {
@@ -130,13 +132,17 @@ impl Settings {
                 }
                 "server_auth_type" => auth_type = Some(value),
                 "server_auth_password" => auth_password = Some(value.to_string()),
-                "server_auth_rsa_keyfile" if !value.is_empty() => auth_rsa_keyfile = Some(value.to_string()),
+                "server_auth_rsa_keyfile" if !value.is_empty() => {
+                    auth_rsa_keyfile = Some(value.to_string())
+                }
                 _ => {}
             }
         }
         settings.server_auth = match auth_type {
             Some("password") => auth_password.map(ServerAuth::Password).unwrap_or_default(),
-            Some("rsa") => auth_rsa_keyfile.map(|f| ServerAuth::Rsa(PathBuf::from(f))).unwrap_or_default(),
+            Some("rsa") => auth_rsa_keyfile
+                .map(|f| ServerAuth::Rsa(PathBuf::from(f)))
+                .unwrap_or_default(),
             _ => ServerAuth::None,
         };
         settings
