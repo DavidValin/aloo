@@ -222,7 +222,7 @@ mod macos_cf {
     type Boolean = u8;
 
     #[link(name = "CoreFoundation", kind = "framework")]
-    extern "C" {
+    unsafe extern "C" {
         fn CFRunLoopGetMain() -> CFRunLoopRef;
         fn CFRunLoopRunInMode(mode: CFStringRef, seconds: CFTimeInterval, return_after_source_handled: Boolean) -> i32;
         static kCFRunLoopDefaultMode: CFStringRef;
