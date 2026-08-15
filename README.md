@@ -2,7 +2,7 @@
 
 ![aloo](aloo.png)
 
-Walky talky in your terminal! aloo is a terminal chat app for talking with people privately and securely — text, voice, and file sharing, all end-to-end encrypted, all running in your terminal. No servers reading your messages, no accounts, no tracking.
+Walky talky in your terminal! aloo is a terminal chat app for talking with people privately and securely — text, voice, and file sharing, all end-to-end encrypted, all running in your terminal. A server connects you with the people you talk to and relays your traffic, but it only ever sees already-encrypted bytes — it can't read your messages. No accounts, no tracking.
 
 Just you, your terminal, and the people you're talking to.
 
@@ -16,6 +16,7 @@ Just you, your terminal, and the people you're talking to.
 - 📢 **Public channels** — join the channels the server advertises, shown as tabs across the top.
 - 🔒 **Private channels** — create or join a channel that isn't advertised to anyone; you just need to know its name.
 - ✉️  **Private messages (DMs)** — open a one-on-one conversation with anyone in the sidebar.
+- 🌐 **Server-coordinated, never server-read** — the server tracks who's connected to which channel and relays your end-to-end encrypted traffic to them; it only ever handles already-encrypted bytes, never message content.
 
 - 🛡️  **Everything above is end-to-end encrypted**. See the "Encryption" section below for how.
 - 💾 **Chat history isn't saved to disk.** Text and voice messages only ever live in memory for as long as the app is running — close it or disconnect, and they're gone. A file you've accepted is the one exception: that's the point of a file transfer, so it's written to `~/.aloo/downloads`.
@@ -107,6 +108,17 @@ Whichever identity type you and everyone else picks shows up as a little tag nex
 
 By default, everything aloo writes to disk on its own — your auto-generated PQ-Hybrid keys, identity-pinning files, downloaded files — lives under `~/.aloo`. It never writes anywhere else unless you deliberately point a field (like an RSA key file) somewhere else yourself.
 
+### Generating RSA keys
+
+Only needed if you're using an RSA-based method — server auth (`--enc rsa`) or identity type `RSA, file`. Every other method (`None`, `Password`, `RSAPM`, `PQ-Hybrid`) generates its own keys automatically; skip this otherwise.
+
+```sh
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:4096 -out key
+openssl rsa -pubout -in key -out key.pub
+```
+
+`key` is the private key — pass it to `--enc rsa key` (server) or as `file_priv` (your identity). `key.pub` is the matching public key — hand it out to clients (server) or set it as `file_pub` (your identity).
+
 ## Knowing who you're really talking to
 
 Nicknames aren't proof of identity — anyone could reconnect as "alice" the moment the real alice disconnects. To handle this, aloo remembers people the same way SSH remembers servers in `known_hosts`:
@@ -125,3 +137,4 @@ This README is the friendly tour. For the full nuts and bolts:
 - [`docs/SPEC.md`](docs/SPEC.md) — the complete application specification.
 - [`docs/PROTOCOL.md`](docs/PROTOCOL.md) — the wire protocol, message framing, and cryptographic design in full detail.
 - [`docs/TESTING.md`](docs/TESTING.md) — how the project is tested.
+- [`docs/SERVER_ON_DOCKER.md`](docs/SERVER_ON_DOCKER.md) — running `aloo --server` in Docker.

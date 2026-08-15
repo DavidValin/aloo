@@ -1,0 +1,66 @@
+# Runs `aloo --server` on Alpine, using the prebuilt static musl binary from
+# this project's GitHub releases. Self-contained build context.
+#
+# Usage:
+#   docker build -f docker-server/Dockerfile-server -t aloo-server docker-server
+#   # building a version other than the default below:
+#   #   --build-arg ALOO_VERSION=<tag from https://github.com/DavidValin/aloo/releases>
+#   docker run -d --name aloo-server --restart unless-stopped \
+#     -p 7878:7878 \
+#     -v aloo-data:/home/aloo/.aloo \
+#     -e ALOO_PASSWORD=mypassword \
+#     aloo-server
+#
+# See the ENV block below for every parameter this image exposes.
+
+# ---- fetch stage ----------------------------------------------------------
+FROM alpine:3.20 AS fetcher
+
+RUN apk add --no-cache curl
+
+WORKDIR /fetch
+
+# Release tag to fetch; bump this or pass --build-arg ALOO_VERSION=... for a
+# newer aloo release.
+ARG ALOO_VERSION=0.1.0-alpha.1
+RUN set -eu; \
+    case "$(uname -m)" in \
+        x86_64) arch=x86_64 ;; \
+        aarch64) arch=aarch64 ;; \
+        *) echo "aloo-server: unsupported build architecture $(uname -m)" >&2; exit 1 ;; \
+    esac; \
+    url="https://github.com/DavidValin/aloo/releases/download/${ALOO_VERSION}/aloo-${arch}_linux_musl.tar.gz"; \
+    echo "aloo-server: fetching $url" >&2; \
+    curl -fsSL "$url" -o aloo.tar.gz; \
+    tar -xzf aloo.tar.gz; \
+    chmod +x aloo
+
+# ---- runtime stage ---------------------------------------------------------
+FROM alpine:3.20
+
+RUN addgroup -S aloo && adduser -S aloo -G aloo -h /home/aloo
+
+COPY --from=fetcher /fetch/aloo /usr/local/bin/aloo
+COPY aloo-server-entrypoint.sh /usr/local/bin/aloo-server-entrypoint.sh
+RUN chmod 755 /usr/local/bin/aloo /usr/local/bin/aloo-server-entrypoint.sh
+
+# Chowned so a fresh named volume mounted here inherits "aloo" ownership.
+RUN mkdir -p /home/aloo/.aloo && chown aloo:aloo /home/aloo/.aloo
+
+USER aloo
+WORKDIR /home/aloo
+ENV HOME=/home/aloo
+
+# Everything aloo writes on its own lives here; see docs/SERVER_ON_DOCKER.md.
+VOLUME ["/home/aloo/.aloo"]
+
+# See docs/SERVER_ON_DOCKER.md "Parameters" for what each maps to.
+ENV ALOO_PORT=""
+ENV ALOO_BIND=""
+ENV ALOO_PASSWORD=""
+ENV ALOO_ENC_TYPE=""
+ENV ALOO_ENC_KEYFILE=""
+
+EXPOSE 7878/tcp
+
+ENTRYPOINT ["/usr/local/bin/aloo-server-entrypoint.sh"]
