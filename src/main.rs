@@ -18,7 +18,7 @@ use aloo::global_ptt;
 use aloo::server::{self, AuthConfig};
 use aloo::settings;
 
-type BoxError = Box<dyn std::error::Error>;
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 #[derive(Parser, Debug)]
 #[command(name = "aloo", about = "Terminal chat with encrypted text/voice channels")]
