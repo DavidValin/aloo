@@ -1,23 +1,24 @@
-# aloo 💬
+# aloo
+
+![aloo](aloo.png)
 
 Walky talky in your terminal! aloo is a terminal chat app for talking with people privately and securely — text, voice, and file sharing, all end-to-end encrypted, all running in your terminal. No servers reading your messages, no accounts, no tracking.
 
 Just you, your terminal, and the people you're talking to.
 
-## What can it do? ✨
+## Features
 
 - 💬 **Text chat** — type and hit `Enter`, just like any chat app.
 - 🎙️ **Walkie-talkie voice messages** — hold `Space` to talk, let go to send. Just like a real walkie-talkie, it auto-plays live on the other end as you're talking — no play button, nothing to tap, they just hear you. You can also replay it later: scroll to it in the log and press `Enter` to hear it again.
 - 📎 **File transfer** — send files straight from the app with a built-in file browser, no external tools needed. Capped at 1 MiB per file — it's built for quick attachments, not large files.
 - 📢 **Public channels** — join the channels the server advertises, shown as tabs across the top.
 - 🔒 **Private channels** — create or join a channel that isn't advertised to anyone; you just need to know its name.
-- ✉️ **Private messages (DMs)** — open a one-on-one conversation with anyone in the sidebar.
+- ✉️  **Private messages (DMs)** — open a one-on-one conversation with anyone in the sidebar.
 
-Everything above is encrypted end-to-end. See the "Encryption" section below for how.
+- 🛡️  **Everything above is end-to-end encrypted**. See the "Encryption" section below for how.
+- 💾 **Nothing is saved to disk.** Chat history — text, voice, files, all of it — only ever lives in memory for as long as the app is running. Close it or disconnect, and it's gone; there's no local chat log sitting around to find later.
 
-💾 **Nothing is saved to disk.** Chat history — text, voice, files, all of it — only ever lives in memory for as long as the app is running. Close it or disconnect, and it's gone; there's no local chat log sitting around to find later.
-
-## Getting started 🚀
+## Getting started
 
 ### 1. Installation
 
@@ -61,13 +62,13 @@ Nicknames are case-sensitive and must be free — if someone else is already con
 - Press `]` / `[` to switch between channel tabs, `Ctrl+J` to join or create a private channel.
 - Press `Ctrl+H` anytime for an in-app help screen with all of this.
 
-## Encryption 🔐
+## Encryption
 
 Every message — text, voice, or file — is encrypted on your device before it ever leaves it, individually for each person who's meant to read it. **The server never sees plaintext.** It only relays already-encrypted bytes and keeps track of who's in which channel — it's a mail carrier that can't open the envelopes it delivers.
 
 There are two separate places encryption shows up: how *you* prove who you are, and how *your messages* get locked. You pick both when you connect.
 
-### 🖥️  Talking to the server (authentication)
+### Talking to the server (authentication)
 
 How you prove you're allowed to connect:
 
@@ -75,7 +76,7 @@ How you prove you're allowed to connect:
 - 🔑 **Password** — a shared password the server owner gives out.
 - 🗝️ **RSA key** — the server owner hands you their public key file; only people with a matching key can connect.
 
-### 👤 Your identity & message encryption
+### Your identity & message encryption
 
 How your own messages get locked so only the intended reader can open them:
 
@@ -101,7 +102,7 @@ Whichever identity type you and everyone else picks shows up as a little tag nex
 
 By default, everything aloo writes to disk on its own — your auto-generated PQ-Hybrid keys, identity-pinning files, downloaded files — lives under `~/.aloo`. It never writes anywhere else unless you deliberately point a field (like an RSA key file) somewhere else yourself.
 
-## Knowing who you're really talking to 🪪
+## Knowing who you're really talking to
 
 Nicknames aren't proof of identity — anyone could reconnect as "alice" the moment the real alice disconnects. To handle this, aloo remembers people the same way SSH remembers servers in `known_hosts`:
 
@@ -112,7 +113,7 @@ Nicknames aren't proof of identity — anyone could reconnect as "alice" the mom
 
 This only applies to identity types that actually stay the same across reconnects (`Password`, `RSA (file)`, `PQ-Hybrid`, and `RSA rotating per message` in its own way) — the `None` type has no persistent identity to pin in the first place, so there's nothing to compare.
 
-## Want the technical details? 🔧
+## Want the technical details?
 
 This README is the friendly tour. For the full nuts and bolts:
 
