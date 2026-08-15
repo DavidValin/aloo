@@ -395,7 +395,6 @@ pub(crate) async fn run_connected_session(
                 match hotkey_ev {
                     crate::global_ptt::GlobalPttEvent::Pressed => {
                         if let Some(action @ UiAction::VoiceRecordStart(_)) = ui_state.global_record_start() {
-                            voice_stream::play_end_chime(&mut session);
                             handle_ui_action(action, &mut wr, &mut ui_state, &mut session).await?;
                         }
                     }
