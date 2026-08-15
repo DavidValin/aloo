@@ -196,6 +196,24 @@ fn global_record_start_and_stop_streams_to_the_active_channel() {
     assert!(!state.recording);
 }
 
+/// `force_stop_recording` is what `session::run_connected_session`'s
+/// `auto_stop_rx` arm calls when a recording hits
+/// `voice::MAX_RECORDING_SAMPLES` - unlike `global_record_stop`, it stops
+/// whatever is recording regardless of which trigger started it.
+///
+/// @requirement AC-099
+#[test]
+fn force_stop_recording_stops_regardless_of_trigger_and_is_a_noop_when_idle() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    assert_eq!(state.force_stop_recording(), None, "nothing to stop when idle");
+
+    state.global_record_start();
+    assert!(state.recording);
+    let action = state.force_stop_recording();
+    assert_eq!(action, Some(UiAction::VoiceRecordStop));
+    assert!(!state.recording);
+}
+
 // ---------------------------------------------------------------------
 // [ / ] dwell-to-join
 // ---------------------------------------------------------------------

@@ -641,6 +641,24 @@ sample-format convention would not be interoperable with clients using
 this one, and the protocol gives a receiver no way to detect that
 mismatch from the bytes alone.
 
+**Length cap, enforced on both ends independently.** The reference client
+caps one recording at `voice::MAX_RECORDING_SECS` (4 minutes,
+`voice::MAX_RECORDING_SAMPLES` at `SAMPLE_RATE_HZ`): the sending side stops
+itself and sends `*End` automatically on reaching it, exactly as if the
+user had released Space/the global shortcut right then
+(`voice_stream::spawn_record_stream_worker`). This is a client-side
+courtesy, not a protocol-level limit - the wire format itself places no
+cap on how many chunks a stream may have - so the receiving side enforces
+the identical cap independently rather than trusting the sender to have
+applied it: the moment an incoming stream's accumulated audio reaches
+`MAX_RECORDING_SAMPLES`, the receiver force-finalizes it with whatever
+arrived so far (exactly as if a real `*End` had arrived) and stops
+processing any further chunks for that `(from, stream_id)`
+(`voice_stream::spawn_stream_decrypt_worker`, `voice::recording_at_max`).
+This is defense in depth: a modified or hostile peer that ignores its own
+cap, or simply never sends `*End`, still can't make a receiver accept or
+keep decrypting more than 4 minutes of one voice message.
+
 ### 7.4 `Error { message: String }`
 
 Sent to the *originating* client only (never broadcast), whenever a

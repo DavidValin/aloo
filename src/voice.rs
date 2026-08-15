@@ -32,6 +32,31 @@ pub const SAMPLE_RATE_HZ: u32 = 16_000;
 /// crypto cost.
 pub const CHUNK_INTERVAL: Duration = Duration::from_millis(100);
 
+/// Hard cap on one voice message's length, in seconds - a recording stops
+/// itself automatically on reaching it
+/// (`voice_stream::spawn_record_stream_worker`), rather than waiting
+/// indefinitely for Space to be released. An incoming stream is
+/// independently force-finalized with whatever arrived so far if it ever
+/// exceeds this much audio (`voice_stream::spawn_stream_decrypt_worker`) -
+/// defense in depth against a modified/hostile peer that ignores its own
+/// cap, so the receiving side never accepts more than this regardless of
+/// what the sender claims.
+pub const MAX_RECORDING_SECS: u64 = 4 * 60;
+
+/// `MAX_RECORDING_SECS` expressed as a sample count at `SAMPLE_RATE_HZ`,
+/// what the recording/decrypt workers actually compare against as audio
+/// accumulates.
+pub const MAX_RECORDING_SAMPLES: u64 = SAMPLE_RATE_HZ as u64 * MAX_RECORDING_SECS;
+
+/// Whether a recording/incoming stream that has accumulated `total_samples`
+/// so far has reached `MAX_RECORDING_SAMPLES` and must stop - a pure
+/// predicate shared by both the sending and receiving workers (see
+/// `MAX_RECORDING_SECS`'s doc), directly unit-testable without a thread or
+/// audio device.
+pub fn recording_at_max(total_samples: u64) -> bool {
+    total_samples >= MAX_RECORDING_SAMPLES
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum VoiceError {
     #[error("no default audio device available")]
@@ -357,6 +382,10 @@ pub enum MixerCmd {
     /// No more `Push`es will come for `id` - once its queue drains, drop it
     /// instead of waiting on a jitter prebuffer that will never fill.
     Finish { id: u64 },
+    /// Immediately silences and drops `id`'s queued audio, rather than
+    /// letting it drain - used to let the user interrupt a replay early
+    /// (Escape while a previously-received voice message is playing).
+    Stop { id: u64 },
 }
 
 struct MixSource {
@@ -381,7 +410,10 @@ impl MixSource {
 /// this one mixer, so multiple simultaneous sources (e.g. two people
 /// using push-to-talk near-simultaneously) actually mix together instead
 /// of queuing behind one another.
-pub fn spawn_mixer(on_stream_error: impl Fn(String) + Send + Clone + 'static) -> UnboundedSender<MixerCmd> {
+pub fn spawn_mixer(
+    on_stream_error: impl Fn(String) + Send + Clone + 'static,
+    on_finished: impl Fn(u64) + Send + Clone + 'static,
+) -> UnboundedSender<MixerCmd> {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<MixerCmd>();
     std::thread::spawn(move || {
         let sources: Arc<Mutex<HashMap<u64, MixSource>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -393,7 +425,7 @@ pub fn spawn_mixer(on_stream_error: impl Fn(String) + Send + Clone + 'static) ->
 
         while let Some(cmd) = rx.blocking_recv() {
             if out_rate.is_none() && !open_failed {
-                match try_open_mixer_stream(sources.clone(), on_stream_error.clone()) {
+                match try_open_mixer_stream(sources.clone(), on_stream_error.clone(), on_finished.clone()) {
                     Ok((stream, rate)) => {
                         out_rate = Some(rate);
                         _stream = Some(stream);
@@ -430,6 +462,12 @@ pub fn spawn_mixer(on_stream_error: impl Fn(String) + Send + Clone + 'static) ->
                         }
                     }
                 }
+                MixerCmd::Stop { id } => {
+                    // Dropped outright, not just marked finished - a
+                    // finished-but-not-yet-drained source would still play
+                    // out its queued tail; Stop means silence right away.
+                    sources.lock().unwrap().remove(&id);
+                }
             }
         }
     });
@@ -439,6 +477,7 @@ pub fn spawn_mixer(on_stream_error: impl Fn(String) + Send + Clone + 'static) ->
 fn try_open_mixer_stream(
     sources: Arc<Mutex<HashMap<u64, MixSource>>>,
     on_stream_error: impl Fn(String) + Send + 'static,
+    on_finished: impl Fn(u64) + Send + 'static,
 ) -> Result<(cpal::Stream, u32)> {
     let host = cpal::default_host();
     let device = preferred_output_device(&host).ok_or(VoiceError::NoDevice)?;
@@ -457,19 +496,21 @@ fn try_open_mixer_stream(
     let stream = match sample_format {
         SampleFormat::I16 => {
             let sources_cb = sources.clone();
+            let on_finished_cb = on_finished;
             device.build_output_stream(
                 stream_config,
-                move |data: &mut [i16], _| mix_output(data, out_channels, out_rate, &sources_cb, |s| s),
+                move |data: &mut [i16], _| mix_output(data, out_channels, out_rate, &sources_cb, &on_finished_cb, |s| s),
                 move |err| on_stream_error(err.to_string()),
                 None,
             )
         }
         SampleFormat::F32 => {
             let sources_cb = sources.clone();
+            let on_finished_cb = on_finished;
             device.build_output_stream(
                 stream_config,
                 move |data: &mut [f32], _| {
-                    mix_output(data, out_channels, out_rate, &sources_cb, |s| s as f32 / i16::MAX as f32)
+                    mix_output(data, out_channels, out_rate, &sources_cb, &on_finished_cb, |s| s as f32 / i16::MAX as f32)
                 },
                 move |err| on_stream_error(err.to_string()),
                 None,
@@ -494,6 +535,7 @@ fn mix_output<T: Copy>(
     out_channels: u16,
     out_rate: u32,
     sources: &Arc<Mutex<HashMap<u64, MixSource>>>,
+    on_finished: &(impl Fn(u64) + Send + 'static),
     convert: impl Fn(i16) -> T,
 ) {
     let mut map = sources.lock().unwrap();
@@ -511,7 +553,18 @@ fn mix_output<T: Copy>(
                 sum += s as i32;
             }
         }
-        map.retain(|_, src| !(src.started && src.finished && src.queue.is_empty()));
+        // A source retired here drained naturally (as opposed to
+        // `MixerCmd::Stop`, which removes it outright elsewhere) - reported
+        // via `on_finished` so a caller tracking "is a specific id still
+        // playing" (e.g. `session::SessionState::active_replay_id`) finds
+        // out without polling.
+        map.retain(|id, src| {
+            let done = src.started && src.finished && src.queue.is_empty();
+            if done {
+                on_finished(*id);
+            }
+            !done
+        });
         let s = convert(sum.clamp(i16::MIN as i32, i16::MAX as i32) as i16);
         for out in frame.iter_mut() {
             *out = s;

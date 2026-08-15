@@ -79,6 +79,16 @@ Feature: Sending a voice message by holding a key
     When I press Enter
     Then replaying that voice message is requested
 
+  @AC-098
+  Scenario: Escape stops a voice message while it is being replayed
+    Given I am connected and viewing a channel
+    And bob is in the channel with me
+    And bob has left me a finished voice message
+    And focus is on the log
+    And I press Enter
+    When I press Escape
+    Then playback is stopped
+
   @AC-036
   Scenario: Enter on a text message replays nothing
     Given I am connected and viewing a channel

@@ -1,7 +1,22 @@
 use aloo::voice::{
     decode_wav_to_mono, downmix_f32_to_mono_i16, downmix_i16_to_mono, end_chime_samples, format_duration_label,
-    pcm_from_bytes, pcm_to_bytes, resample, SAMPLE_RATE_HZ,
+    pcm_from_bytes, pcm_to_bytes, recording_at_max, resample, MAX_RECORDING_SAMPLES, MAX_RECORDING_SECS, SAMPLE_RATE_HZ,
 };
+
+/// @requirement AC-099
+#[test]
+fn max_recording_samples_is_four_minutes_at_the_capture_rate() {
+    assert_eq!(MAX_RECORDING_SECS, 240);
+    assert_eq!(MAX_RECORDING_SAMPLES, SAMPLE_RATE_HZ as u64 * 240);
+}
+
+/// @requirement TB-142
+#[test]
+fn recording_at_max_triggers_exactly_at_the_boundary_not_before() {
+    assert!(!recording_at_max(MAX_RECORDING_SAMPLES - 1));
+    assert!(recording_at_max(MAX_RECORDING_SAMPLES));
+    assert!(recording_at_max(MAX_RECORDING_SAMPLES + 1));
+}
 
 /// @requirement TB-045
 #[test]

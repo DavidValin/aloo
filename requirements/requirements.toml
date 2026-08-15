@@ -564,6 +564,21 @@ id = "TB-050"
 description = "The end-of-message chime decodes from a bundled WAV, walking chunks generically, downmixing to mono and resampling to SAMPLE_RATE_HZ, and rejecting non-WAV input."
 evidence = "docs/SPEC.md Functionality #4 'End-of-message chime'; tests decode_wav_*, end_chime_samples_decodes_the_bundled_asset_and_is_non_empty"
 
+[[user_story.acceptance_criteria]]
+id = "AC-098"
+description = "Escape stops a previously-received voice message while it is being replayed, instead of its usual meaning (closing the current private room); a Release event trailing the same keystroke is absorbed rather than acted on a second time, and Escape falls back to its usual meaning once nothing is playing."
+evidence = "docs/SPEC.md Functionality #4; tests escape_stops_playback_of_a_voice_message_being_replayed, escape_release_after_stopping_playback_does_not_also_close_the_room; scenario features/voice/push_to_talk.feature 'Escape stops a voice message while it is being replayed'"
+
+[[user_story.acceptance_criteria]]
+id = "AC-099"
+description = "A voice message is capped at MAX_RECORDING_SECS (4 minutes) - recording stops itself automatically on reaching it, the same as an explicit Space/global-shortcut release, rather than continuing indefinitely."
+evidence = "docs/SPEC.md Functionality #4; docs/PROTOCOL.md 7.3; tests max_recording_samples_is_four_minutes_at_the_capture_rate, force_stop_recording_stops_regardless_of_trigger_and_is_a_noop_when_idle"
+
+[[user_story.technical_behavior]]
+id = "TB-142"
+description = "An incoming voice stream is independently force-finalized with whatever arrived so far the moment it accumulates MAX_RECORDING_SAMPLES of audio, regardless of what the sender's own cap did - the receiving side never accepts more than 4 minutes of one stream even from a modified/hostile peer."
+evidence = "docs/PROTOCOL.md 7.3; src/voice_stream.rs spawn_stream_decrypt_worker; test recording_at_max_triggers_exactly_at_the_boundary_not_before"
+
 # ============================================================================
 # US-008 - Keep message content readable only by its recipient
 # ============================================================================

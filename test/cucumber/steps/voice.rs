@@ -220,6 +220,12 @@ async fn finished_voice_from_bob(w: &mut AlooWorld) {
     );
 }
 
+#[then("playback is stopped")]
+async fn playback_stopped(w: &mut AlooWorld) {
+    assert_eq!(w.last_action, Some(UiAction::StopPlayback));
+    assert!(!w.ui_ref().replaying, "the replaying flag should be cleared once Escape stops it");
+}
+
 #[given("bob has left me a text message")]
 async fn text_from_bob(w: &mut AlooWorld) {
     w.ui_mut().on_channel_message("general", UserId(2), "bob".into(), MessageBody::Text("hi".into()));

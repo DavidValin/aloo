@@ -140,6 +140,7 @@ pub(crate) async fn handle_voice_record_start(
         session.record_out_tx.clone(),
         session.own_stream_done_tx.clone(),
         stop_rx,
+        session.auto_stop_tx.clone(),
     );
     Ok(())
 }

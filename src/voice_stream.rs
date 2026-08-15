@@ -185,6 +185,13 @@ pub(crate) fn spawn_record_stream_worker(
     out_tx: tokio::sync::mpsc::UnboundedSender<ClientMessage>,
     done_tx: tokio::sync::mpsc::UnboundedSender<(u64, u32, Vec<u8>)>,
     stop_rx: std::sync::mpsc::Receiver<()>,
+    // Notified (once) if this recording stops itself on reaching
+    // `voice::MAX_RECORDING_SAMPLES`, rather than via an explicit Space/
+    // global-shortcut release - the main loop uses this to reset the
+    // recording indicator and play the end chime immediately, the same as
+    // any other stop, instead of leaving the UI claiming to still be
+    // recording until the next release event.
+    auto_stop_tx: tokio::sync::mpsc::UnboundedSender<()>,
 ) {
     std::thread::spawn(move || {
         let mut seq: u32 = 0;
@@ -192,7 +199,7 @@ pub(crate) fn spawn_record_stream_worker(
         let mut plaintext_accum: Vec<u8> = Vec::new();
 
         loop {
-            let stopped = match stop_rx.recv_timeout(voice::CHUNK_INTERVAL) {
+            let mut stopped = match stop_rx.recv_timeout(voice::CHUNK_INTERVAL) {
                 Ok(()) => true,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => false,
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => true,
@@ -218,6 +225,15 @@ pub(crate) fn spawn_record_stream_worker(
                     let _ = out_tx.send(msg);
                 }
                 seq += 1;
+            }
+
+            // Hard cap: stop as if Space had just been released, but only
+            // if nothing already requested a stop this tick - an explicit
+            // release racing the cap on the same `CHUNK_INTERVAL` tick is
+            // just an ordinary stop, no separate notification needed.
+            if !stopped && voice::recording_at_max(total_samples) {
+                stopped = true;
+                let _ = auto_stop_tx.send(());
             }
 
             if stopped {
@@ -316,6 +332,20 @@ pub(crate) fn spawn_stream_decrypt_worker(
                         if !suppress_playback {
                             let samples = voice::pcm_from_bytes(&pcm);
                             let _ = mixer_tx.send(voice::MixerCmd::Push { id: mixer_id, samples });
+                        }
+                        // Defense in depth (docs/PROTOCOL.md §7.3): never
+                        // accept more than `voice::MAX_RECORDING_SAMPLES` of
+                        // audio for one stream, regardless of what the
+                        // sender's own recording-length cap says - force-
+                        // finalize with whatever arrived so far and stop
+                        // accepting further chunks for this stream, exactly
+                        // as if a real `*End` had just arrived.
+                        let sample_count = (plaintext_accum.len() / 2) as u64;
+                        if voice::recording_at_max(sample_count) {
+                            let duration_ms = ((sample_count * 1000) / voice::SAMPLE_RATE_HZ as u64) as u32;
+                            let _ = mixer_tx.send(voice::MixerCmd::Finish { id: mixer_id });
+                            let _ = finished_tx.send((from, stream_id, duration_ms, plaintext_accum));
+                            break;
                         }
                     }
                 }

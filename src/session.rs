@@ -131,6 +131,17 @@ pub(crate) struct SessionState {
     /// `run_connected_session`'s ticker reads `.quality()` off it once a
     /// second into `UiState::conn_quality`.
     pub(crate) conn_stats: netstats::ConnStats,
+    /// Where `voice_stream::spawn_record_stream_worker` reports that a
+    /// recording stopped itself on reaching `voice::MAX_RECORDING_SAMPLES`,
+    /// polled by `run_connected_session`'s `auto_stop_rx` select arm.
+    pub(crate) auto_stop_tx: tokio::sync::mpsc::UnboundedSender<()>,
+    /// The mixer id of the voice message currently being replayed (Enter on
+    /// a finished `MessageBody::Voice` entry), if any - set by
+    /// `handle_ui_action`'s `ReplayVoice` arm, read (and cleared) by
+    /// `StopPlayback` (Escape) and by the mixer's `on_finished` callback
+    /// once that source actually drains on its own. `None` whenever nothing
+    /// is being replayed.
+    pub(crate) active_replay_id: Option<u64>,
 }
 
 /// Runs on one dedicated thread for the whole session, processing
@@ -242,9 +253,15 @@ pub(crate) async fn run_connected_session(
     // output stream lazily and keeps it open for the session, actually
     // summing simultaneous sources instead of queuing one behind another.
     let mixer_err_tx = audio_err_tx.clone();
-    let mixer_tx = voice::spawn_mixer(move |e| {
-        let _ = mixer_err_tx.send(e);
-    });
+    let (mixer_finished_tx, mut mixer_finished_rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
+    let mixer_tx = voice::spawn_mixer(
+        move |e| {
+            let _ = mixer_err_tx.send(e);
+        },
+        move |id| {
+            let _ = mixer_finished_tx.send(id);
+        },
+    );
 
     let (record_out_tx, mut record_out_rx) = tokio::sync::mpsc::unbounded_channel::<ClientMessage>();
     let (own_stream_done_tx, mut own_stream_done_rx) =
@@ -252,6 +269,7 @@ pub(crate) async fn run_connected_session(
     let (stream_finished_tx, mut stream_finished_rx) =
         tokio::sync::mpsc::unbounded_channel::<(UserId, u64, u32, Vec<u8>)>();
     let (file_events_tx, mut file_events_rx) = tokio::sync::mpsc::unbounded_channel::<file_stream::FileEvent>();
+    let (auto_stop_tx, mut auto_stop_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
     // `PqHybrid` has no single RSA key to seed `rekey::OwnKeys` with and
     // never rotates (it's a static identity, like `Rsa`/`Password`/`None`
@@ -296,6 +314,8 @@ pub(crate) async fn run_connected_session(
         id_store,
         own_next_keys,
         conn_stats: netstats::ConnStats::new(),
+        auto_stop_tx,
+        active_replay_id: None,
     };
 
     let mut ui_state = UiState::new(display_name);
@@ -387,6 +407,19 @@ pub(crate) async fn run_connected_session(
             event = file_events_rx.recv() => {
                 let Some(event) = event else { break };
                 handle_file_event(&mut ui_state, &mut session, event);
+            }
+            stopped = auto_stop_rx.recv() => {
+                let Some(()) = stopped else { break };
+                if let Some(action) = ui_state.force_stop_recording() {
+                    handle_ui_action(action, &mut wr, &mut ui_state, &mut session).await?;
+                }
+            }
+            finished_id = mixer_finished_rx.recv() => {
+                let Some(finished_id) = finished_id else { break };
+                if session.active_replay_id == Some(finished_id) {
+                    session.active_replay_id = None;
+                    ui_state.replaying = false;
+                }
             }
             err = audio_err_rx.recv() => {
                 let Some(err) = err else { break };
@@ -547,8 +580,14 @@ async fn handle_ui_action(
             if !samples.is_empty() {
                 let id = session.next_mixer_id;
                 session.next_mixer_id += 1;
+                session.active_replay_id = Some(id);
                 let _ = session.mixer_tx.send(voice::MixerCmd::Push { id, samples });
                 let _ = session.mixer_tx.send(voice::MixerCmd::Finish { id });
+            }
+        }
+        UiAction::StopPlayback => {
+            if let Some(id) = session.active_replay_id.take() {
+                let _ = session.mixer_tx.send(voice::MixerCmd::Stop { id });
             }
         }
         UiAction::AcceptIdentity(peer) => {

@@ -731,6 +731,60 @@ fn enter_on_voice_message_in_messages_focus_requests_replay() {
     state.focus = Focus::Messages;
     let action = press(&mut state, KeyCode::Enter).unwrap();
     assert_eq!(action, UiAction::ReplayVoice { duration_ms: 4200, pcm: vec![1, 2, 3, 4] });
+    assert!(state.replaying, "a non-empty clip should be tracked as playing");
+}
+
+/// @requirement AC-036
+#[test]
+fn replaying_an_empty_clip_does_not_set_the_replaying_flag() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.on_channel_message("general", UserId(2), "bob".into(), MessageBody::Voice { duration_ms: 0, pcm: vec![] });
+    state.focus = Focus::Messages;
+    press(&mut state, KeyCode::Enter);
+    assert!(!state.replaying, "nothing actually starts playing for an empty clip - Escape must not be hijacked");
+}
+
+/// @requirement AC-098
+#[test]
+fn escape_stops_playback_of_a_voice_message_being_replayed() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.on_channel_message(
+        "general",
+        UserId(2),
+        "bob".into(),
+        MessageBody::Voice { duration_ms: 4200, pcm: vec![1, 2, 3, 4] },
+    );
+    state.focus = Focus::Messages;
+    press(&mut state, KeyCode::Enter);
+    assert!(state.replaying);
+
+    let action = press(&mut state, KeyCode::Esc);
+    assert_eq!(action, Some(UiAction::StopPlayback));
+    assert!(!state.replaying);
+}
+
+/// A terminal reporting genuine key-up events sends both `Press` and
+/// `Release` for one physical keystroke - the `Release` must be absorbed,
+/// not treated as a second Escape that falls through to closing the private
+/// room now that `replaying` was already cleared by the `Press`.
+///
+/// @requirement AC-098
+#[test]
+fn escape_release_after_stopping_playback_does_not_also_close_the_room() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.focus = Focus::Sidebar;
+    press(&mut state, KeyCode::Enter); // opens a private room with bob
+    assert!(state.active_private_room.is_some());
+    state.on_direct_message(UserId(2), "bob".into(), MessageBody::Voice { duration_ms: 500, pcm: vec![9, 9] });
+    state.focus = Focus::Messages;
+    press(&mut state, KeyCode::Enter); // start replay
+    assert!(state.replaying);
+
+    let press_action = state.handle_key(KeyCode::Esc, KeyModifiers::NONE, KeyEventKind::Press);
+    assert_eq!(press_action, Some(UiAction::StopPlayback));
+    let release_action = state.handle_key(KeyCode::Esc, KeyModifiers::NONE, KeyEventKind::Release);
+    assert_eq!(release_action, None);
+    assert!(state.active_private_room.is_some(), "the room must still be open after the trailing Release");
 }
 
 /// @requirement AC-036

@@ -100,6 +100,9 @@ const HELP_BODY: &[&str] = &[
     "  Space      hold to record & send live (not while composing); release to stop",
     "  Ctrl+Alt+P same, from anywhere - edit/disable in ~/.aloo/settings",
     "  Enter      replay a voice message (messages focused)",
+    "  Esc        stop a replay while it is playing",
+    "  Capped at 4 minutes - recording stops itself on reaching it, and a",
+    "  received stream longer than that is never accepted past 4 minutes.",
     "",
     "File transfer",
     "  /file      type this and press Enter to browse for a file to send",
@@ -331,6 +334,10 @@ pub enum UiAction {
     VoiceRecordStart(VoiceTarget),
     VoiceRecordStop,
     ReplayVoice { duration_ms: u32, pcm: Vec<u8> },
+    /// Escape while a replayed (previously-received) voice message is
+    /// playing - `session::handle_ui_action` stops it on the mixer, since
+    /// `UiState` has no access to audio.
+    StopPlayback,
     /// The user confirmed Accept/Reject in the identity review popup for
     /// this peer (`docs/PROTOCOL.md` §12) - `session::handle_ui_action`
     /// does the actual `id_store`/`rekey` side effects, since `UiState`
@@ -422,6 +429,15 @@ pub struct UiState {
     /// (`push_file_offer`, popup + bell) only once that sender is
     /// `Accept`ed (`resolve_identity_accept`).
     pending_file_offers: HashMap<UserId, Vec<PendingFileOffer>>,
+    /// Whether a previously-received voice message is currently being
+    /// replayed (Enter on a `MessageBody::Voice` log entry) - while `true`,
+    /// Escape stops that playback instead of its usual meaning (closing the
+    /// current private room). Set when `ReplayVoice` is produced, cleared
+    /// either by Escape itself or by `session.rs` once the mixer reports
+    /// that source has actually finished playing
+    /// (`voice::MixerCmd`'s `on_finished` callback) - so this stays
+    /// accurate even if the clip finishes on its own.
+    pub replaying: bool,
     pub recording: bool,
     /// Which trigger started the current recording - `None` whenever
     /// `recording` is `false`. See `RecordSource`.
@@ -540,6 +556,7 @@ impl UiState {
             file_offer_queue: VecDeque::new(),
             file_offer_focus: FileOfferChoice::Accept,
             pending_file_offers: HashMap::new(),
+            replaying: false,
             recording: false,
             recording_source: None,
             recording_last_seen: None,
@@ -1071,6 +1088,20 @@ impl UiState {
         }
 
         if code == KeyCode::Esc {
+            // Gated on `Press` only (same reasoning as the Ctrl+H toggle
+            // above): a terminal that also reports `Release` for this key
+            // must not act on it a second time, which matters here because
+            // - unlike the plain `active_private_room = None` below,
+            // idempotent either way - stopping playback is a real state
+            // transition that a second, redundant firing must not follow
+            // through the fallback branch and additionally close the room.
+            if kind != KeyEventKind::Press {
+                return None;
+            }
+            if self.replaying {
+                self.replaying = false;
+                return Some(UiAction::StopPlayback);
+            }
             self.active_private_room = None;
             return None;
         }
@@ -1244,12 +1275,23 @@ impl UiState {
             // either mid-transfer or saved under `~/.aloo/downloads` (or
             // rejected/failed); unlike the old whole-file-in-memory
             // approach, there's no separate save step to trigger here.
-            KeyCode::Enter => match self.current_log().get(self.message_selected) {
-                Some(LogEntry { body: MessageBody::Voice { duration_ms, pcm }, .. }) => {
-                    Some(UiAction::ReplayVoice { duration_ms: *duration_ms, pcm: pcm.clone() })
-                }
-                _ => None,
-            },
+            KeyCode::Enter => {
+                let replay = match self.current_log().get(self.message_selected) {
+                    Some(LogEntry { body: MessageBody::Voice { duration_ms, pcm }, .. }) => Some((*duration_ms, pcm.clone())),
+                    _ => None,
+                };
+                replay.map(|(duration_ms, pcm)| {
+                    // An empty clip (0 playable samples) never actually
+                    // starts anything on the mixer (see `handle_ui_action`'s
+                    // `ReplayVoice` arm) - `replaying` must not be set in
+                    // that case, or Escape would be stuck stealing its
+                    // "stop playback" meaning with nothing to stop.
+                    if !pcm.is_empty() {
+                        self.replaying = true;
+                    }
+                    UiAction::ReplayVoice { duration_ms, pcm }
+                })
+            }
             _ => None,
         }
     }
@@ -1316,6 +1358,23 @@ impl UiState {
     /// `handle_key`).
     pub fn global_record_stop(&mut self) -> Option<UiAction> {
         if !self.recording || self.recording_source != Some(RecordSource::Global) {
+            return None;
+        }
+        self.recording = false;
+        self.recording_source = None;
+        self.recording_last_seen = None;
+        Some(UiAction::VoiceRecordStop)
+    }
+
+    /// Stops whatever recording is currently in progress, regardless of
+    /// which trigger started it (unlike `global_record_stop`, which only
+    /// ever stops one it itself started) or whether the physical key is
+    /// still held. Used when the recording worker hits
+    /// `voice::MAX_RECORDING_SAMPLES` and needs to end on its own instead
+    /// of waiting for a release event that may not come for a while yet -
+    /// see `session::run_connected_session`'s `auto_stop_rx` arm.
+    pub fn force_stop_recording(&mut self) -> Option<UiAction> {
+        if !self.recording {
             return None;
         }
         self.recording = false;

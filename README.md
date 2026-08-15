@@ -11,7 +11,7 @@ Just you, your terminal, and the people you're talking to.
 ## Features
 
 - 💬 **Text chat** — type and hit `Enter`, just like any chat app.
-- 🎙️ **Walkie-talkie voice messages** — hold `Space` to talk, let go to send. Just like a real walkie-talkie, it auto-plays live on the other end as you're talking — no play button, nothing to tap, they just hear you. You can also replay it later: scroll to it in the log and press `Enter` to hear it again. `Ctrl+Alt+P` does the same thing globally, even while aloo isn't focused.
+- 🎙️ **Walkie-talkie voice messages** — hold `Space` from messages list or `Control+Alt+p` globally while in other app to talk, release to send it. Just like a real walkie-talkie, it auto-plays live on the other end as you're talking — no play button, nothing to tap, they just hear you. You can also replay it later: scroll to it in the log and press `Enter` to hear it again. `Ctrl+Alt+P` does the same thing globally, even while aloo isn't focused.
 - 📎 **File transfer, with consent** — send files straight from the app with a built-in file browser, no external tools needed. The recipient sees a popup (with a chime) naming you and the file before a single byte moves, Accept focused by default; accepting streams it straight to `~/.aloo/downloads` with a live progress bar, no size cap.
 - 📢 **Public channels** — join the channels the server advertises, shown as tabs across the top.
 - 🔒 **Private channels** — create or join a channel that isn't advertised to anyone; you just need to know its name.
