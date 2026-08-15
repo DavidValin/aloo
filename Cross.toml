@@ -23,13 +23,18 @@ pre-build = [
 # prefix. That's a best-effort default, not a guarantee: a target machine
 # with no alsa-lib/alsa-plugins installed at all still won't have working
 # audio, same as any other ALSA-using binary.
+#
+# CFLAGS=-fPIE: rustc links these musl targets as -static-pie by default, so
+# every object in the final binary must be position-independent. alsa-lib's
+# own build doesn't add that flag, so without it the link fails later with
+# "relocation R_X86_64_32 ... can not be used when making a PIE object".
 [target.x86_64-unknown-linux-musl]
 pre-build = [
     "apt-get update && apt-get install --assume-yes wget make bzip2",
     "wget -q -P /tmp https://www.alsa-project.org/files/pub/lib/alsa-lib-1.2.16.1.tar.bz2",
     "echo 'f740db7f488255944ffd4428416ee3390a96742856916433df468c281436480e  /tmp/alsa-lib-1.2.16.1.tar.bz2' | sha256sum -c -",
     "tar xjf /tmp/alsa-lib-1.2.16.1.tar.bz2 -C /tmp",
-    "cd /tmp/alsa-lib-1.2.16.1 && CC=x86_64-linux-musl-gcc AR=x86_64-linux-musl-ar RANLIB=x86_64-linux-musl-ranlib ./configure --host=x86_64-linux-musl --disable-shared --enable-static --disable-python --with-configdir=/usr/share/alsa --with-plugindir=/usr/lib/alsa-lib && make -j$(nproc) && make install",
+    "cd /tmp/alsa-lib-1.2.16.1 && CC=x86_64-linux-musl-gcc AR=x86_64-linux-musl-ar RANLIB=x86_64-linux-musl-ranlib CFLAGS=-fPIE ./configure --host=x86_64-linux-musl --disable-shared --enable-static --disable-python --with-configdir=/usr/share/alsa --with-plugindir=/usr/lib/alsa-lib && make -j$(nproc) && make install",
 ]
 
 [target.aarch64-unknown-linux-musl]
@@ -38,5 +43,5 @@ pre-build = [
     "wget -q -P /tmp https://www.alsa-project.org/files/pub/lib/alsa-lib-1.2.16.1.tar.bz2",
     "echo 'f740db7f488255944ffd4428416ee3390a96742856916433df468c281436480e  /tmp/alsa-lib-1.2.16.1.tar.bz2' | sha256sum -c -",
     "tar xjf /tmp/alsa-lib-1.2.16.1.tar.bz2 -C /tmp",
-    "cd /tmp/alsa-lib-1.2.16.1 && CC=aarch64-linux-musl-gcc AR=aarch64-linux-musl-ar RANLIB=aarch64-linux-musl-ranlib ./configure --host=aarch64-linux-musl --disable-shared --enable-static --disable-python --with-configdir=/usr/share/alsa --with-plugindir=/usr/lib/alsa-lib && make -j$(nproc) && make install",
+    "cd /tmp/alsa-lib-1.2.16.1 && CC=aarch64-linux-musl-gcc AR=aarch64-linux-musl-ar RANLIB=aarch64-linux-musl-ranlib CFLAGS=-fPIE ./configure --host=aarch64-linux-musl --disable-shared --enable-static --disable-python --with-configdir=/usr/share/alsa --with-plugindir=/usr/lib/alsa-lib && make -j$(nproc) && make install",
 ]
