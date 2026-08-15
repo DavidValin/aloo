@@ -22,7 +22,7 @@ Just you, your terminal, and the people you're talking to.
 
 ### 1. Installation
 
-* Easy way: [Download](https://www.github.com/aloo/releases)
+* Easy way: [Download](https://www.github.com/DavidValin/aloo/releases)
 * From git source code: `cargo build --release` (will be built at `target/release/aloo`)
 * From crates.io: `cargo install aloo`
 
