@@ -232,6 +232,37 @@ fn verify_rejects_garbage_signature_bytes() {
     assert!(!verify(&kp.public, b"payload", &[]));
 }
 
+/// RSA-PSS salts every signature, so signing the same bytes twice gives
+/// two different signatures that both verify. Nothing in this app ever
+/// compares signatures for equality - it only ever verifies them - so the
+/// randomness costs nothing and is what distinguishes PSS from the
+/// deterministic PKCS#1 v1.5 scheme it replaced.
+/// @requirement TB-162
+#[test]
+fn signing_the_same_payload_twice_gives_different_signatures() {
+    let kp = KeyPair::generate().expect("keygen");
+    let first = sign(&kp.private, b"same payload").expect("sign");
+    let second = sign(&kp.private, b"same payload").expect("sign again");
+
+    assert_ne!(
+        first, second,
+        "PSS is randomised - two signatures over one payload must differ"
+    );
+    assert!(verify(&kp.public, b"same payload", &first));
+    assert!(verify(&kp.public, b"same payload", &second));
+}
+
+/// @requirement TB-162
+#[test]
+fn a_pss_signature_does_not_verify_against_tampered_bytes() {
+    let kp = KeyPair::generate().expect("keygen");
+    let sig = sign(&kp.private, b"the original bytes").expect("sign");
+    let mut tampered = sig.clone();
+    tampered[0] ^= 0xFF;
+
+    assert!(!verify(&kp.public, b"the original bytes", &tampered));
+}
+
 /// @requirement TB-053
 #[test]
 fn generate_uses_the_default_rsa_key_bits() {
@@ -252,14 +283,17 @@ fn generate_with_bits_produces_a_key_of_the_requested_size_and_is_still_usable()
     assert_eq!(out, b"round trip at 4096 bits");
 }
 
-/// @requirement TB-059
+/// Signatures are verified, never compared, so nothing in this app depends
+/// on signing being reproducible - which is what lets `sign` use PSS's
+/// random salt. The property that *is* depended on is covered by
+/// `signing_the_same_payload_twice_gives_different_signatures`.
+/// @requirement TB-059, TB-162
 #[test]
-fn sign_is_deterministic_pkcs1v15() {
+fn a_signature_verifies_no_matter_which_signing_call_produced_it() {
     let kp = KeyPair::generate().expect("keygen");
     let sig1 = sign(&kp.private, b"same payload every time").expect("sign 1");
     let sig2 = sign(&kp.private, b"same payload every time").expect("sign 2");
-    assert_eq!(
-        sig1, sig2,
-        "PKCS#1 v1.5 signing has no randomness, unlike OAEP encryption"
-    );
+
+    assert!(verify(&kp.public, b"same payload every time", &sig1));
+    assert!(verify(&kp.public, b"same payload every time", &sig2));
 }

@@ -7,6 +7,7 @@ use aloo::server::{
     AuthConfig, CHANNEL_MAX_PASSWORD_ATTEMPTS, CHANNEL_PASSWORD_BAN_DURATION, DEFAULT_CHANNEL_NAME,
     Outgoing, Registry, serve,
 };
+use aloo::control::ControlEndpoint;
 use tokio::net::{TcpListener, TcpStream};
 
 const TEST_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
@@ -697,16 +698,43 @@ fn key_rotation_is_delivered_to_recipient() {
     );
 }
 
-/// @requirement TB-082
+/// @requirement TB-082, TB-167
 #[test]
 fn key_rotation_from_a_static_mode_sender_is_rejected() {
+    for mode in [KeyMode::Rsa, KeyMode::Password, KeyMode::None] {
+        let mut reg = Registry::new();
+        let alice = reg.register("alice".into(), vec![], mode);
+        let bob = reg.register("bob".into(), vec![], KeyMode::Rsa);
+        let err = reg
+            .route_key_rotation(alice, bob, vec![], vec![])
+            .unwrap_err();
+        assert!(
+            err.contains("does not rotate"),
+            "a {mode:?} sender has no keys to rotate, so the relay must refuse: {err}"
+        );
+    }
+}
+
+/// Both rotating modes may relay - `rsa_per_msg` rotates its identity key,
+/// `pq_hybrid` its encryption keys - and the server still verifies nothing
+/// about either payload.
+/// @requirement TB-167
+#[test]
+fn rotate_key_is_rejected_from_a_non_rotating_sender() {
+    for mode in [KeyMode::PerMessage, KeyMode::PqHybrid] {
+        let mut reg = Registry::new();
+        let alice = reg.register("alice".into(), vec![], mode);
+        let bob = reg.register("bob".into(), vec![], KeyMode::PqHybrid);
+        assert!(
+            reg.route_key_rotation(alice, bob, vec![7], vec![8]).is_ok(),
+            "a {mode:?} sender rotates keys and must be relayed"
+        );
+    }
+
     let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::Rsa);
-    let bob = reg.register("bob".into(), vec![], KeyMode::Rsa);
-    let err = reg
-        .route_key_rotation(alice, bob, vec![], vec![])
-        .unwrap_err();
-    assert!(err.contains("rsa_per_msg"));
+    let alice = reg.register("alice".into(), vec![], KeyMode::None);
+    let bob = reg.register("bob".into(), vec![], KeyMode::PqHybrid);
+    assert!(reg.route_key_rotation(alice, bob, vec![7], vec![8]).is_err());
 }
 
 /// @requirement TB-082
@@ -794,33 +822,30 @@ fn rsa_auth_rejects_response_of_the_wrong_kind() {
 // End-to-end over real TCP
 // ---------------------------------------------------------------------
 
-async fn handshake_no_auth(stream: &mut TcpStream, name: &str) -> UserId {
+async fn handshake_no_auth(stream: &mut ControlEndpoint<TcpStream>, name: &str) -> UserId {
     handshake_no_auth_with_mode(stream, name, KeyMode::Rsa).await
 }
 
 async fn handshake_no_auth_with_mode(
-    stream: &mut TcpStream,
+    stream: &mut ControlEndpoint<TcpStream>,
     name: &str,
     key_mode: KeyMode,
 ) -> UserId {
-    let hello: ServerMessage = read_message(stream).await.unwrap().unwrap();
-    assert!(matches!(
-        hello,
-        ServerMessage::Hello {
-            auth: AuthKind::None,
-            challenge: None
-        }
-    ));
+    let (auth, challenge) = stream
+        .client_handshake(None)
+        .await
+        .unwrap()
+        .expect("server closed during handshake");
+    assert_eq!(auth, AuthKind::None);
+    assert_eq!(challenge, None);
 
-    write_message(stream, &ClientMessage::Auth(AuthResponse::None))
+    stream.send(&ClientMessage::Auth(AuthResponse::None))
         .await
         .unwrap();
-    let result: ServerMessage = read_message(stream).await.unwrap().unwrap();
+    let result: ServerMessage = stream.recv().await.unwrap().unwrap();
     assert!(matches!(result, ServerMessage::AuthResult { ok: true, .. }));
 
-    write_message(
-        stream,
-        &ClientMessage::Identify {
+    stream.send(&ClientMessage::Identify {
             display_name: name.into(),
             public_key_der: vec![],
             key_mode,
@@ -829,7 +854,7 @@ async fn handshake_no_auth_with_mode(
     .await
     .unwrap();
 
-    let identify_result: ServerMessage = read_message(stream).await.unwrap().unwrap();
+    let identify_result: ServerMessage = stream.recv().await.unwrap().unwrap();
     let ServerMessage::IdentifyResult {
         ok: true,
         you: Some(you),
@@ -839,7 +864,7 @@ async fn handshake_no_auth_with_mode(
         panic!("expected a successful IdentifyResult, got {identify_result:?}");
     };
 
-    let channel_list: ServerMessage = read_message(stream).await.unwrap().unwrap();
+    let channel_list: ServerMessage = stream.recv().await.unwrap().unwrap();
     assert!(matches!(channel_list, ServerMessage::ChannelList(_)));
 
     you
@@ -859,15 +884,13 @@ async fn spawn_test_server(auth: AuthConfig) -> std::net::SocketAddr {
 async fn end_to_end_two_clients_join_and_learn_about_each_other() {
     let addr = spawn_test_server(AuthConfig::None).await;
 
-    let mut a = TcpStream::connect(addr).await.unwrap();
+    let mut a = ControlEndpoint::new(TcpStream::connect(addr).await.unwrap());
     let alice_id = handshake_no_auth(&mut a, "alice").await;
 
-    let mut b = TcpStream::connect(addr).await.unwrap();
+    let mut b = ControlEndpoint::new(TcpStream::connect(addr).await.unwrap());
     let bob_id = handshake_no_auth(&mut b, "bob").await;
 
-    write_message(
-        &mut a,
-        &ClientMessage::JoinChannel {
+    a.send(&ClientMessage::JoinChannel {
             name: "general".into(),
             kind: ChannelKind::Public,
             password: None,
@@ -875,20 +898,18 @@ async fn end_to_end_two_clients_join_and_learn_about_each_other() {
     )
     .await
     .unwrap();
-    let joined: ServerMessage = read_message(&mut a).await.unwrap().unwrap();
+    let joined: ServerMessage = a.recv().await.unwrap().unwrap();
     assert!(matches!(joined, ServerMessage::Joined { .. }));
 
     // "general" didn't exist yet (the server only ever seeds "the-hall") -
     // alice creating it broadcasts ChannelCreated to bob, who's already
     // connected (AC-108), before he ever joins it himself.
-    let created: ServerMessage = read_message(&mut b).await.unwrap().unwrap();
+    let created: ServerMessage = b.recv().await.unwrap().unwrap();
     assert!(
         matches!(created, ServerMessage::ChannelCreated { channel } if channel.name == "general")
     );
 
-    write_message(
-        &mut b,
-        &ClientMessage::JoinChannel {
+    b.send(&ClientMessage::JoinChannel {
             name: "general".into(),
             kind: ChannelKind::Public,
             password: None,
@@ -898,13 +919,13 @@ async fn end_to_end_two_clients_join_and_learn_about_each_other() {
     .unwrap();
 
     // alice should be told bob joined
-    let notif: ServerMessage = read_message(&mut a).await.unwrap().unwrap();
+    let notif: ServerMessage = a.recv().await.unwrap().unwrap();
     assert!(matches!(notif, ServerMessage::UserJoined { user, .. } if user.id == bob_id));
 
     // bob should learn about alice (snapshot), then get his own Joined confirmation
-    let bob_snapshot: ServerMessage = read_message(&mut b).await.unwrap().unwrap();
+    let bob_snapshot: ServerMessage = b.recv().await.unwrap().unwrap();
     assert!(matches!(bob_snapshot, ServerMessage::UserJoined { user, .. } if user.id == alice_id));
-    let bob_joined: ServerMessage = read_message(&mut b).await.unwrap().unwrap();
+    let bob_joined: ServerMessage = b.recv().await.unwrap().unwrap();
     assert!(matches!(bob_joined, ServerMessage::Joined { .. }));
 }
 
@@ -913,14 +934,12 @@ async fn end_to_end_two_clients_join_and_learn_about_each_other() {
 async fn end_to_end_a_second_client_sees_a_newly_created_public_channel() {
     let addr = spawn_test_server(AuthConfig::None).await;
 
-    let mut a = TcpStream::connect(addr).await.unwrap();
+    let mut a = ControlEndpoint::new(TcpStream::connect(addr).await.unwrap());
     handshake_no_auth(&mut a, "alice").await;
-    let mut b = TcpStream::connect(addr).await.unwrap();
+    let mut b = ControlEndpoint::new(TcpStream::connect(addr).await.unwrap());
     handshake_no_auth(&mut b, "bob").await;
 
-    write_message(
-        &mut a,
-        &ClientMessage::JoinChannel {
+    a.send(&ClientMessage::JoinChannel {
             name: "watercooler".into(),
             kind: ChannelKind::Public,
             password: None,
@@ -928,11 +947,11 @@ async fn end_to_end_a_second_client_sees_a_newly_created_public_channel() {
     )
     .await
     .unwrap();
-    let joined: ServerMessage = read_message(&mut a).await.unwrap().unwrap();
+    let joined: ServerMessage = a.recv().await.unwrap().unwrap();
     assert!(matches!(joined, ServerMessage::Joined { .. }));
 
     // bob never joined "watercooler" - he should still be told it exists.
-    let created: ServerMessage = read_message(&mut b).await.unwrap().unwrap();
+    let created: ServerMessage = b.recv().await.unwrap().unwrap();
     match created {
         ServerMessage::ChannelCreated { channel } => {
             assert_eq!(channel.name, "watercooler");
@@ -947,14 +966,12 @@ async fn end_to_end_a_second_client_sees_a_newly_created_public_channel() {
 async fn end_to_end_password_protected_channel_join_flow() {
     let addr = spawn_test_server(AuthConfig::None).await;
 
-    let mut a = TcpStream::connect(addr).await.unwrap();
+    let mut a = ControlEndpoint::new(TcpStream::connect(addr).await.unwrap());
     handshake_no_auth(&mut a, "alice").await;
-    let mut b = TcpStream::connect(addr).await.unwrap();
+    let mut b = ControlEndpoint::new(TcpStream::connect(addr).await.unwrap());
     handshake_no_auth(&mut b, "bob").await;
 
-    write_message(
-        &mut a,
-        &ClientMessage::JoinChannel {
+    a.send(&ClientMessage::JoinChannel {
             name: "vault".into(),
             kind: ChannelKind::Private,
             password: Some("s3cret!".into()),
@@ -962,13 +979,11 @@ async fn end_to_end_password_protected_channel_join_flow() {
     )
     .await
     .unwrap();
-    let joined: ServerMessage = read_message(&mut a).await.unwrap().unwrap();
+    let joined: ServerMessage = a.recv().await.unwrap().unwrap();
     assert!(matches!(joined, ServerMessage::Joined { .. }));
 
     // bob tries with no password: told a password is required.
-    write_message(
-        &mut b,
-        &ClientMessage::JoinChannel {
+    b.send(&ClientMessage::JoinChannel {
             name: "vault".into(),
             kind: ChannelKind::Private,
             password: None,
@@ -976,7 +991,7 @@ async fn end_to_end_password_protected_channel_join_flow() {
     )
     .await
     .unwrap();
-    let rejected: ServerMessage = read_message(&mut b).await.unwrap().unwrap();
+    let rejected: ServerMessage = b.recv().await.unwrap().unwrap();
     assert!(matches!(
         rejected,
         ServerMessage::ChannelJoinRejected {
@@ -986,9 +1001,7 @@ async fn end_to_end_password_protected_channel_join_flow() {
     ));
 
     // bob retries with the right password.
-    write_message(
-        &mut b,
-        &ClientMessage::JoinChannel {
+    b.send(&ClientMessage::JoinChannel {
             name: "vault".into(),
             kind: ChannelKind::Private,
             password: Some("s3cret!".into()),
@@ -996,9 +1009,9 @@ async fn end_to_end_password_protected_channel_join_flow() {
     )
     .await
     .unwrap();
-    let bob_snapshot: ServerMessage = read_message(&mut b).await.unwrap().unwrap();
+    let bob_snapshot: ServerMessage = b.recv().await.unwrap().unwrap();
     assert!(matches!(bob_snapshot, ServerMessage::UserJoined { .. }));
-    let bob_joined: ServerMessage = read_message(&mut b).await.unwrap().unwrap();
+    let bob_joined: ServerMessage = b.recv().await.unwrap().unwrap();
     assert!(matches!(bob_joined, ServerMessage::Joined { .. }));
 }
 
@@ -1007,15 +1020,13 @@ async fn end_to_end_password_protected_channel_join_flow() {
 async fn end_to_end_key_rotation_is_relayed_and_rejected_appropriately() {
     let addr = spawn_test_server(AuthConfig::None).await;
 
-    let mut a = TcpStream::connect(addr).await.unwrap();
+    let mut a = ControlEndpoint::new(TcpStream::connect(addr).await.unwrap());
     let alice_id = handshake_no_auth_with_mode(&mut a, "alice", KeyMode::PerMessage).await;
-    let mut b = TcpStream::connect(addr).await.unwrap();
+    let mut b = ControlEndpoint::new(TcpStream::connect(addr).await.unwrap());
     let bob_id = handshake_no_auth_with_mode(&mut b, "bob", KeyMode::Rsa).await;
 
     // alice (rsa_per_msg) rotates her key for bob - relayed as KeyRotated.
-    write_message(
-        &mut a,
-        &ClientMessage::RotateKey {
+    a.send(&ClientMessage::RotateKey {
             to: bob_id,
             new_public_key_der: vec![4, 5, 6],
             signature: vec![7, 8],
@@ -1023,7 +1034,7 @@ async fn end_to_end_key_rotation_is_relayed_and_rejected_appropriately() {
     )
     .await
     .unwrap();
-    let rotated: ServerMessage = read_message(&mut b).await.unwrap().unwrap();
+    let rotated: ServerMessage = b.recv().await.unwrap().unwrap();
     match rotated {
         ServerMessage::KeyRotated {
             from,
@@ -1038,9 +1049,7 @@ async fn end_to_end_key_rotation_is_relayed_and_rejected_appropriately() {
     }
 
     // bob (Static) is not allowed to rotate: server sends him an Error back.
-    write_message(
-        &mut b,
-        &ClientMessage::RotateKey {
+    b.send(&ClientMessage::RotateKey {
             to: alice_id,
             new_public_key_der: vec![],
             signature: vec![],
@@ -1048,8 +1057,10 @@ async fn end_to_end_key_rotation_is_relayed_and_rejected_appropriately() {
     )
     .await
     .unwrap();
-    let err: ServerMessage = read_message(&mut b).await.unwrap().unwrap();
-    assert!(matches!(&err, ServerMessage::Error { message } if message.contains("rsa_per_msg")));
+    let err: ServerMessage = b.recv().await.unwrap().unwrap();
+    assert!(
+        matches!(&err, ServerMessage::Error { message } if message.contains("does not rotate"))
+    );
 }
 
 /// The wire-level foundation of the `rsa_per_msg` continuity/resume
@@ -1069,22 +1080,20 @@ async fn end_to_end_key_rotation_is_relayed_and_rejected_appropriately() {
 async fn end_to_end_resume_rotation_after_reconnect_verifies_against_the_continuity_key() {
     let addr = spawn_test_server(AuthConfig::None).await;
 
-    let mut b = TcpStream::connect(addr).await.unwrap();
+    let mut b = ControlEndpoint::new(TcpStream::connect(addr).await.unwrap());
     let bob_id = handshake_no_auth_with_mode(&mut b, "bob", KeyMode::None).await;
 
     // First session: alice (rsa_per_msg) establishes a per-peer key with
     // bob - this is what a real client would later persist to
     // own_next_keys as the continuity key for "bob".
-    let mut a1 = TcpStream::connect(addr).await.unwrap();
+    let mut a1 = ControlEndpoint::new(TcpStream::connect(addr).await.unwrap());
     let alice_id_1 = handshake_no_auth_with_mode(&mut a1, "alice", KeyMode::PerMessage).await;
 
     let continuity = KeyPair::generate().unwrap();
     let continuity_der = crypto::public_key_to_der(&continuity.public).unwrap();
     let bootstrap_signed =
         rekey::sign_rotation(&continuity.private, bob_id, &continuity_der).unwrap();
-    write_message(
-        &mut a1,
-        &ClientMessage::RotateKey {
+    a1.send(&ClientMessage::RotateKey {
             to: bob_id,
             new_public_key_der: continuity_der.clone(),
             signature: bootstrap_signed,
@@ -1092,7 +1101,7 @@ async fn end_to_end_resume_rotation_after_reconnect_verifies_against_the_continu
     )
     .await
     .unwrap();
-    let first: ServerMessage = read_message(&mut b).await.unwrap().unwrap();
+    let first: ServerMessage = b.recv().await.unwrap().unwrap();
     match first {
         ServerMessage::KeyRotated {
             from,
@@ -1108,7 +1117,7 @@ async fn end_to_end_resume_rotation_after_reconnect_verifies_against_the_continu
     // alice disconnects entirely (not just leaves a channel) and
     // reconnects - a brand new UserId, unrelated to alice_id_1.
     drop(a1);
-    let mut a2 = TcpStream::connect(addr).await.unwrap();
+    let mut a2 = ControlEndpoint::new(TcpStream::connect(addr).await.unwrap());
     let alice_id_2 = handshake_no_auth_with_mode(&mut a2, "alice", KeyMode::PerMessage).await;
     assert_ne!(
         alice_id_1, alice_id_2,
@@ -1118,9 +1127,7 @@ async fn end_to_end_resume_rotation_after_reconnect_verifies_against_the_continu
     // Resume: self-assert the same continuity key, addressed to bob's
     // still-live UserId, signed by that same key (proof of possession).
     let resume_sig = rekey::sign_rotation(&continuity.private, bob_id, &continuity_der).unwrap();
-    write_message(
-        &mut a2,
-        &ClientMessage::RotateKey {
+    a2.send(&ClientMessage::RotateKey {
             to: bob_id,
             new_public_key_der: continuity_der.clone(),
             signature: resume_sig.clone(),
@@ -1128,7 +1135,7 @@ async fn end_to_end_resume_rotation_after_reconnect_verifies_against_the_continu
     )
     .await
     .unwrap();
-    let resumed: ServerMessage = read_message(&mut b).await.unwrap().unwrap();
+    let resumed: ServerMessage = b.recv().await.unwrap().unwrap();
     match resumed {
         ServerMessage::KeyRotated {
             from,
@@ -1160,24 +1167,20 @@ async fn end_to_end_resume_rotation_after_reconnect_verifies_against_the_continu
 #[tokio::test]
 async fn end_to_end_wrong_password_is_rejected() {
     let addr = spawn_test_server(AuthConfig::Password("s3cret".into())).await;
-    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let mut stream = ControlEndpoint::new(TcpStream::connect(addr).await.unwrap());
 
-    let hello: ServerMessage = read_message(&mut stream).await.unwrap().unwrap();
-    assert!(matches!(
-        hello,
-        ServerMessage::Hello {
-            auth: AuthKind::Password,
-            ..
-        }
-    ));
+    let (auth, _) = stream
+        .client_handshake(None)
+        .await
+        .unwrap()
+        .expect("server closed during handshake");
+    assert_eq!(auth, AuthKind::Password);
 
-    write_message(
-        &mut stream,
-        &ClientMessage::Auth(AuthResponse::Password("wrong".into())),
+    stream.send(&ClientMessage::Auth(AuthResponse::Password("wrong".into())),
     )
     .await
     .unwrap();
-    let result: ServerMessage = read_message(&mut stream).await.unwrap().unwrap();
+    let result: ServerMessage = stream.recv().await.unwrap().unwrap();
     assert!(matches!(
         result,
         ServerMessage::AuthResult { ok: false, .. }
@@ -1188,14 +1191,14 @@ async fn end_to_end_wrong_password_is_rejected() {
 #[tokio::test]
 async fn end_to_end_stray_auth_and_identify_after_handshake_error_but_stay_connected() {
     let addr = spawn_test_server(AuthConfig::None).await;
-    let mut a = TcpStream::connect(addr).await.unwrap();
+    let mut a = ControlEndpoint::new(TcpStream::connect(addr).await.unwrap());
     handshake_no_auth(&mut a, "dave").await;
 
     // a stray Auth once already connected: an Error, not a close
-    write_message(&mut a, &ClientMessage::Auth(AuthResponse::None))
+    a.send(&ClientMessage::Auth(AuthResponse::None))
         .await
         .unwrap();
-    let after_auth: ServerMessage = read_message(&mut a).await.unwrap().unwrap();
+    let after_auth: ServerMessage = a.recv().await.unwrap().unwrap();
     match after_auth {
         ServerMessage::Error { message } => {
             assert!(message.contains("unexpected message after handshake"))
@@ -1204,9 +1207,7 @@ async fn end_to_end_stray_auth_and_identify_after_handshake_error_but_stay_conne
     }
 
     // a stray Identify right after: also an Error, connection still open
-    write_message(
-        &mut a,
-        &ClientMessage::Identify {
+    a.send(&ClientMessage::Identify {
             display_name: "dave2".into(),
             public_key_der: vec![],
             key_mode: KeyMode::Rsa,
@@ -1214,7 +1215,7 @@ async fn end_to_end_stray_auth_and_identify_after_handshake_error_but_stay_conne
     )
     .await
     .unwrap();
-    let after_identify: ServerMessage = read_message(&mut a).await.unwrap().unwrap();
+    let after_identify: ServerMessage = a.recv().await.unwrap().unwrap();
     match after_identify {
         ServerMessage::Error { message } => {
             assert!(message.contains("unexpected message after handshake"))
@@ -1223,9 +1224,7 @@ async fn end_to_end_stray_auth_and_identify_after_handshake_error_but_stay_conne
     }
 
     // the connection is still fully usable afterward
-    write_message(
-        &mut a,
-        &ClientMessage::JoinChannel {
+    a.send(&ClientMessage::JoinChannel {
             name: "general".into(),
             kind: ChannelKind::Public,
             password: None,
@@ -1233,7 +1232,7 @@ async fn end_to_end_stray_auth_and_identify_after_handshake_error_but_stay_conne
     )
     .await
     .unwrap();
-    let joined: ServerMessage = read_message(&mut a).await.unwrap().unwrap();
+    let joined: ServerMessage = a.recv().await.unwrap().unwrap();
     assert!(matches!(joined, ServerMessage::Joined { .. }));
 }
 
@@ -1242,31 +1241,27 @@ async fn end_to_end_stray_auth_and_identify_after_handshake_error_but_stay_conne
 async fn end_to_end_duplicate_nickname_is_rejected_and_connection_closes() {
     let addr = spawn_test_server(AuthConfig::None).await;
 
-    let mut a = TcpStream::connect(addr).await.unwrap();
+    let mut a = ControlEndpoint::new(TcpStream::connect(addr).await.unwrap());
     let _alice_id = handshake_no_auth(&mut a, "dave").await;
 
     // a second client tries to identify with the same nickname
-    let mut b = TcpStream::connect(addr).await.unwrap();
-    let hello: ServerMessage = read_message(&mut b).await.unwrap().unwrap();
-    assert!(matches!(
-        hello,
-        ServerMessage::Hello {
-            auth: AuthKind::None,
-            ..
-        }
-    ));
-    write_message(&mut b, &ClientMessage::Auth(AuthResponse::None))
+    let mut b = ControlEndpoint::new(TcpStream::connect(addr).await.unwrap());
+    let (auth, _) = b
+        .client_handshake(None)
+        .await
+        .unwrap()
+        .expect("server closed during handshake");
+    assert_eq!(auth, AuthKind::None);
+    b.send(&ClientMessage::Auth(AuthResponse::None))
         .await
         .unwrap();
-    let auth_result: ServerMessage = read_message(&mut b).await.unwrap().unwrap();
+    let auth_result: ServerMessage = b.recv().await.unwrap().unwrap();
     assert!(matches!(
         auth_result,
         ServerMessage::AuthResult { ok: true, .. }
     ));
 
-    write_message(
-        &mut b,
-        &ClientMessage::Identify {
+    b.send(&ClientMessage::Identify {
             display_name: "dave".into(),
             public_key_der: vec![],
             key_mode: KeyMode::Rsa,
@@ -1275,7 +1270,7 @@ async fn end_to_end_duplicate_nickname_is_rejected_and_connection_closes() {
     .await
     .unwrap();
 
-    let identify_result: ServerMessage = read_message(&mut b).await.unwrap().unwrap();
+    let identify_result: ServerMessage = b.recv().await.unwrap().unwrap();
     match identify_result {
         ServerMessage::IdentifyResult {
             ok: false,
@@ -1288,16 +1283,14 @@ async fn end_to_end_duplicate_nickname_is_rejected_and_connection_closes() {
     }
 
     // the server closes the connection after rejecting the nickname
-    let after: Option<ServerMessage> = read_message(&mut b).await.unwrap();
+    let after: Option<ServerMessage> = b.recv().await.unwrap();
     assert!(
         after.is_none(),
         "server should close the connection after rejecting the nickname"
     );
 
     // meanwhile the original "dave" is completely unaffected
-    write_message(
-        &mut a,
-        &ClientMessage::JoinChannel {
+    a.send(&ClientMessage::JoinChannel {
             name: "general".into(),
             kind: ChannelKind::Public,
             password: None,
@@ -1305,7 +1298,7 @@ async fn end_to_end_duplicate_nickname_is_rejected_and_connection_closes() {
     )
     .await
     .unwrap();
-    let joined: ServerMessage = read_message(&mut a).await.unwrap().unwrap();
+    let joined: ServerMessage = a.recv().await.unwrap().unwrap();
     assert!(matches!(joined, ServerMessage::Joined { .. }));
 }
 
@@ -1315,7 +1308,7 @@ async fn end_to_end_nickname_is_free_again_after_the_holder_disconnects() {
     let addr = spawn_test_server(AuthConfig::None).await;
 
     {
-        let mut a = TcpStream::connect(addr).await.unwrap();
+        let mut a = ControlEndpoint::new(TcpStream::connect(addr).await.unwrap());
         handshake_no_auth(&mut a, "dave").await;
         // `a` drops here, closing the connection
     }
@@ -1325,6 +1318,6 @@ async fn end_to_end_nickname_is_free_again_after_the_holder_disconnects() {
 
     // succeeds without the server rejecting it as a duplicate; a hang or a
     // rejection here would fail this test via handshake_no_auth's asserts
-    let mut b = TcpStream::connect(addr).await.unwrap();
+    let mut b = ControlEndpoint::new(TcpStream::connect(addr).await.unwrap());
     handshake_no_auth(&mut b, "dave").await;
 }

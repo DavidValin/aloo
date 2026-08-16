@@ -7,7 +7,6 @@
 use std::time::Instant;
 
 use rsa::RsaPublicKey;
-use tokio::io::AsyncWrite;
 
 use crate::crypto;
 use crate::client::p2p::LinkReadiness;
@@ -22,15 +21,13 @@ use crate::client::voice;
 use crate::client::voice_stream;
 
 pub(crate) async fn handle_join(
-    wr: &mut (impl AsyncWrite + Unpin),
+    wr: &mut impl crate::control::ControlSink,
     session: &mut SessionState,
     name: String,
     kind: ChannelKind,
     password: Option<String>,
 ) -> proto::Result<()> {
-    proto::write_message(
-        wr,
-        &ClientMessage::JoinChannel {
+    wr.send_control(&ClientMessage::JoinChannel {
             name,
             kind,
             password,
@@ -47,14 +44,14 @@ pub(crate) async fn handle_join(
 /// `/leave` is submitted (`UiState::leave_channel_locally`). Any peer from
 /// that channel who's no longer reachable through any other joined channel
 /// or an open DM (`UiState::has_reason_to_keep_link`) has its P2P link torn
-/// down too (§7.0.3).
+/// down too (§7.1.3).
 pub(crate) async fn handle_leave(
-    wr: &mut (impl AsyncWrite + Unpin),
+    wr: &mut impl crate::control::ControlSink,
     ui_state: &mut UiState,
     session: &mut SessionState,
     name: String,
 ) -> proto::Result<()> {
-    proto::write_message(wr, &ClientMessage::LeaveChannel { name: name.clone() }).await?;
+    wr.send_control(&ClientMessage::LeaveChannel { name: name.clone() }).await?;
     for peer in ui_state.leave_channel_locally(&name) {
         if !ui_state.has_reason_to_keep_link(peer) {
             session.peer_link.forget(peer);
@@ -64,7 +61,7 @@ pub(crate) async fn handle_leave(
 }
 
 pub(crate) async fn handle_send_text(
-    wr: &mut (impl AsyncWrite + Unpin),
+    wr: &mut impl crate::control::ControlSink,
     session: &mut SessionState,
     channel: String,
     plaintext: String,
@@ -93,7 +90,16 @@ pub(crate) async fn handle_send_text(
         }
     }
     if !ready.is_empty() {
-        let per_recipient = encrypt_for_each(session, &ready, plaintext.as_bytes(), Content::Text);
+        let send_id = session.next_stream_id;
+        session.next_stream_id += 1;
+        let per_recipient = encrypt_for_each(
+            session,
+            &ready,
+            Some(channel.clone()),
+            send_id,
+            plaintext.as_bytes(),
+            Content::Text,
+        );
         for (id, envelope) in per_recipient {
             session.peer_link.ensure_link(wr, id).await;
             session.peer_link.send_reliable_or_queue(
@@ -105,7 +111,7 @@ pub(crate) async fn handle_send_text(
             );
         }
         for (id, ..) in ready {
-            crate::client::session::request_rotation_if_per_message(session, id);
+            crate::client::session::request_rotation(session, id);
         }
     }
     Ok(())
@@ -120,7 +126,7 @@ pub(crate) async fn handle_send_text(
 /// individually accepts.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_send_file(
-    wr: &mut (impl AsyncWrite + Unpin),
+    wr: &mut impl crate::control::ControlSink,
     ui_state: &mut UiState,
     session: &mut SessionState,
     channel: String,
@@ -143,15 +149,18 @@ pub(crate) async fn handle_send_file(
         return Ok(());
     };
     for (id, key_mode, der) in ready {
+        let stream_id = session.next_stream_id;
         let envelope = crate::client::envelope::encrypt_envelope_for(
             session.own_pq_private.as_ref(),
+            session.pq_peer_keys.encap_for(id),
             key_mode,
             &der,
+            Some(channel.clone()),
+            stream_id,
             &plaintext,
             Content::FileOffer,
         );
         let Some(envelope) = envelope else { continue };
-        let stream_id = session.next_stream_id;
         let Some(key) = voice_stream::resolve_direct_key(session, stream_id, id, key_mode, &der)
         else {
             continue;
@@ -180,13 +189,13 @@ pub(crate) async fn handle_send_file(
                 envelope,
             },
         );
-        crate::client::session::request_rotation_if_per_message(session, id);
+        crate::client::session::request_rotation(session, id);
     }
     Ok(())
 }
 
 pub(crate) async fn handle_voice_record_start(
-    wr: &mut (impl AsyncWrite + Unpin),
+    wr: &mut impl crate::control::ControlSink,
     ui_state: &mut UiState,
     session: &mut SessionState,
     recorder: voice::Recorder,
@@ -211,7 +220,12 @@ pub(crate) async fn handle_voice_record_start(
     }
     let ready_ids: Vec<UserId> = ready.iter().map(|(id, ..)| *id).collect();
     let rsa = parse_recipients(&ready);
-    let pq = voice_stream::build_pq_stream_out(session, stream_id, &parse_pq_recipients(&ready));
+    let pq = voice_stream::build_pq_stream_out(
+        session,
+        Some(channel.clone()),
+        stream_id,
+        &parse_pq_recipients(&ready),
+    );
     ui_state.log_own_voice_stream_start_channel(&channel, stream_id);
     for &id in &ready_ids {
         session.peer_link.send_reliable_or_queue(
@@ -221,6 +235,15 @@ pub(crate) async fn handle_voice_record_start(
                 stream_id,
             },
         );
+    }
+    // Each pq_hybrid recipient's setup follows its `StreamStart`, once and
+    // reliably - the chunks after it carry ciphertext only.
+    if let Some(pq) = &pq {
+        for (id, setup) in pq.setups() {
+            session
+                .peer_link
+                .send_reliable_or_queue(id, P2pPayload::StreamKeySetup { stream_id, setup });
+        }
     }
     let (stop_tx, stop_rx) = std::sync::mpsc::channel();
     session.active_recording = Some(stop_tx);
@@ -251,20 +274,29 @@ fn parse_recipients(recipients: &[Recipient]) -> Vec<(UserId, RsaPublicKey)> {
         .collect()
 }
 
-fn parse_pq_recipients(recipients: &[Recipient]) -> Vec<(UserId, crypto::pq::PqPublicBundle)> {
+/// The `pq_hybrid` recipients, paired with the bundle bytes they announced
+/// - `build_pq_stream_out` needs those only for the identity fingerprint,
+/// and looks up what to actually encrypt to in `SessionState::pq_peer_keys`.
+fn parse_pq_recipients(recipients: &[Recipient]) -> Vec<(UserId, Vec<u8>)> {
     recipients
         .iter()
         .filter(|(_, key_mode, _)| *key_mode == KeyMode::PqHybrid)
-        .filter_map(|(id, _, der)| proto::decode(der).ok().map(|b| (*id, b)))
+        .map(|(id, _, der)| (*id, der.clone()))
         .collect()
 }
 
 /// Encrypts `plaintext` once per recipient via
 /// `envelope::encrypt_envelope_for` - callers must have already excluded
 /// recipients this session can't address, see `can_address`.
+///
+/// Every recipient's copy is bound to the same `channel` and `send_id`, but
+/// each is sealed against that recipient's own identity, so one member's
+/// copy cannot be re-wrapped and passed to another (`crypto::pq::SendBinding`).
 fn encrypt_for_each(
     session: &SessionState,
     recipients: &[Recipient],
+    channel: Option<String>,
+    send_id: u64,
     plaintext: &[u8],
     content: Content,
 ) -> Vec<(UserId, Envelope)> {
@@ -273,8 +305,11 @@ fn encrypt_for_each(
         .filter_map(|(id, key_mode, pubkey_der)| {
             let envelope = crate::client::envelope::encrypt_envelope_for(
                 session.own_pq_private.as_ref(),
+                session.pq_peer_keys.encap_for(*id),
                 *key_mode,
                 pubkey_der,
+                channel.clone(),
+                send_id,
                 plaintext,
                 content.clone(),
             )?;
@@ -332,9 +367,15 @@ pub(crate) fn on_message(
     let Some(sender) = ui_state.known_users.get(&from).cloned() else {
         return;
     };
-    if let Some(body) = crate::client::session::decrypt_envelope_for(envelope, from, &sender, session) {
+    if let Some(body) = crate::client::session::decrypt_envelope_for(
+        envelope,
+        from,
+        &sender,
+        Some(&channel),
+        session,
+    ) {
         ui_state.on_channel_message(&channel, from, from_name, body);
-        crate::client::session::request_rotation_if_per_message(session, from);
+        crate::client::session::request_rotation(session, from);
     }
 }
 
@@ -369,7 +410,7 @@ pub(crate) fn on_stream_start(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn on_own_stream_finished(
     ui_state: &mut UiState,
-    session: &SessionState,
+    session: &mut SessionState,
     you: UserId,
     channel: String,
     recipients: Vec<UserId>,
@@ -382,7 +423,7 @@ pub(crate) fn on_own_stream_finished(
     // reached, at the stream's natural end - not per
     // chunk (PROTOCOL.md §11.6).
     for peer in recipients {
-        crate::client::session::request_rotation_if_per_message(session, peer);
+        crate::client::session::request_rotation(session, peer);
     }
 }
 

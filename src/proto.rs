@@ -29,8 +29,20 @@ pub enum ProtoError {
 
 pub type Result<T> = std::result::Result<T, ProtoError>;
 
+/// The decode limit is not decoration - without it, decoding is a remote
+/// denial of service.
+///
+/// Bincode reads a length prefix before every `Vec`/`String` and reserves
+/// that much straight away. Those prefixes are inside the payload, so
+/// `MAX_FRAME_LEN` never sees them: a frame of a dozen bytes can claim a
+/// vector of billions and abort the process on the failed allocation
+/// before a single field is read. Capping the decoder at the largest a
+/// frame may legitimately be turns that into an ordinary decode error.
+///
+/// Encoding shares the config, which is right: a message too large to
+/// decode is one there is no point sending.
 fn bincode_config() -> impl bincode::config::Config {
-    bincode::config::standard()
+    bincode::config::standard().with_limit::<{ MAX_FRAME_LEN as usize }>()
 }
 
 /// Bincode-encodes `msg` (no length prefix).
@@ -259,7 +271,12 @@ pub enum Content {
 /// `crate::p2p_proto`, PROTOCOL.md "Direct peer-to-peer transport").
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClientMessage {
-    /// First message after connecting, answering the server's `Hello`.
+    /// Transports a secret to the server's `Hello` offer, turning the
+    /// control channel on. Must be the client's first message; everything
+    /// after it, in both directions, is sealed (`crate::control`).
+    SecureChannel(crate::control::ControlAccept),
+    /// Answers the server's `Hello` challenge - the first message sent
+    /// *inside* the tunnel `SecureChannel` established.
     Auth(AuthResponse),
     /// Sent once auth succeeds: chosen display name and `my_key` public key.
     Identify {
@@ -311,6 +328,10 @@ pub enum ServerMessage {
         /// Present only when `auth == AuthKind::Rsa`: a random nonce the
         /// client must encrypt with the server's public key and echo back.
         challenge: Option<Vec<u8>>,
+        /// Ephemeral encryption keys for this connection's control channel
+        /// (`crate::control`), signed with the server's long-term key when
+        /// it has one. The last thing either side sends in the clear.
+        control: crate::control::ControlOffer,
     },
     AuthResult {
         ok: bool,

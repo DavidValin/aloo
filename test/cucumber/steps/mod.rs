@@ -11,10 +11,14 @@
 
 pub mod channels;
 pub mod connect;
+pub mod control_channel;
 pub mod encryption;
 pub mod file_transfer;
 pub mod identity;
+pub mod identity_continuity;
+pub mod malformed_input;
 pub mod messaging;
+pub mod pq_hybrid;
 pub mod presence;
 pub mod server;
 pub mod status;

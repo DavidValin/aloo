@@ -10,12 +10,60 @@
 
 use aloo::client::keymode_policy::can_address;
 use aloo::crypto::pq::{
-    decrypt_hybrid, decrypt_hybrid_chunk, encrypt_hybrid_chunk, encrypt_hybrid_for_one,
-    ensure_bundle_at, generate_bundle, load_private_bundle, load_public_bundle,
-    save_private_bundle, save_public_bundle, unwrap_key_for_stream, wrap_key_for_stream,
+    PqPrivateBundle, PqPublicBundle, bundle_fingerprint, ensure_bundle_at, generate_bundle,
+    load_private_bundle, load_public_bundle, open_chunk, open_send, open_setup, save_private_bundle,
+    save_public_bundle, seal_chunk, seal_send, seal_setup,
 };
 use aloo::proto::{self, KeyMode};
 use aloo::client::keymode_policy::uses_byte_comparison_pinning;
+
+/// Opens a sealed send the way a receiving client does: with the
+/// recipient's *own* identity fingerprint, which the binding inside must
+/// name for the send to be accepted at all. Returns just the plaintext -
+/// tests that care about the binding call `open_send` directly.
+fn open_for(
+    recipient_private: &PqPrivateBundle,
+    recipient_public: &PqPublicBundle,
+    sender_public: &PqPublicBundle,
+    blob: &[u8],
+) -> Option<Vec<u8>> {
+    let fp = bundle_fingerprint(recipient_public).expect("fingerprint");
+    let decaps = [recipient_private.bootstrap_decap().clone()];
+    open_send(&decaps, &fp, sender_public, blob).map(|(_, plaintext)| plaintext)
+}
+
+/// Seals to a recipient's *bootstrap* keys - what a peer encrypts to
+/// before the relationship has rotated. Rotation itself is covered by
+/// `pq_rekey_test.rs`.
+fn seal_to(
+    sender_signing: &PqPrivateBundle,
+    recipient_public: &PqPublicBundle,
+    channel: Option<String>,
+    send_id: u64,
+    data: &[u8],
+) -> Vec<u8> {
+    seal_send(
+        sender_signing,
+        recipient_public.bootstrap_encap(),
+        bundle_fingerprint(recipient_public).expect("fingerprint"),
+        channel,
+        send_id,
+        data,
+    )
+    .expect("seal")
+}
+
+/// `open_send` against a recipient's bootstrap keys, keeping the binding.
+fn open_bound(
+    recipient_private: &PqPrivateBundle,
+    recipient_public: &PqPublicBundle,
+    sender_public: &PqPublicBundle,
+    blob: &[u8],
+) -> Option<(aloo::crypto::pq::SendBinding, Vec<u8>)> {
+    let fp = bundle_fingerprint(recipient_public).expect("fingerprint");
+    let decaps = [recipient_private.bootstrap_decap().clone()];
+    open_send(&decaps, &fp, sender_public, blob)
+}
 
 // ---------------------------------------------------------------------
 // Chunk-level (voice) primitives - fast, no bundle/keygen needed
@@ -25,8 +73,8 @@ use aloo::client::keymode_policy::uses_byte_comparison_pinning;
 #[test]
 fn same_plaintext_produces_different_ciphertext_under_different_seq() {
     let k_data = [7u8; 32];
-    let c0 = encrypt_hybrid_chunk(&k_data, 42, 0, b"pcm-chunk");
-    let c1 = encrypt_hybrid_chunk(&k_data, 42, 1, b"pcm-chunk");
+    let c0 = seal_chunk(&k_data, 42, 0, b"pcm-chunk");
+    let c1 = seal_chunk(&k_data, 42, 1, b"pcm-chunk");
     assert_ne!(
         c0, c1,
         "different seq must produce a different nonce, hence different ciphertext"
@@ -37,9 +85,9 @@ fn same_plaintext_produces_different_ciphertext_under_different_seq() {
 #[test]
 fn hybrid_voice_chunk_round_trips() {
     let k_data = [9u8; 32];
-    let ciphertext = encrypt_hybrid_chunk(&k_data, 100, 5, b"raw pcm bytes");
+    let ciphertext = seal_chunk(&k_data, 100, 5, b"raw pcm bytes");
     let plaintext =
-        decrypt_hybrid_chunk(&k_data, 100, 5, &ciphertext).expect("decrypt should succeed");
+        open_chunk(&k_data, 100, 5, &ciphertext).expect("decrypt should succeed");
     assert_eq!(plaintext, b"raw pcm bytes");
 }
 
@@ -47,9 +95,9 @@ fn hybrid_voice_chunk_round_trips() {
 #[test]
 fn decrypting_a_chunk_with_the_wrong_seq_fails() {
     let k_data = [3u8; 32];
-    let ciphertext = encrypt_hybrid_chunk(&k_data, 1, 0, b"pcm");
+    let ciphertext = seal_chunk(&k_data, 1, 0, b"pcm");
     assert!(
-        decrypt_hybrid_chunk(&k_data, 1, 1, &ciphertext).is_none(),
+        open_chunk(&k_data, 1, 1, &ciphertext).is_none(),
         "wrong seq means wrong nonce, must not decrypt"
     );
 }
@@ -58,8 +106,8 @@ fn decrypting_a_chunk_with_the_wrong_seq_fails() {
 #[test]
 fn decrypting_a_chunk_with_the_wrong_stream_id_fails() {
     let k_data = [3u8; 32];
-    let ciphertext = encrypt_hybrid_chunk(&k_data, 1, 0, b"pcm");
-    assert!(decrypt_hybrid_chunk(&k_data, 2, 0, &ciphertext).is_none());
+    let ciphertext = seal_chunk(&k_data, 1, 0, b"pcm");
+    assert!(open_chunk(&k_data, 2, 0, &ciphertext).is_none());
 }
 
 /// @requirement TB-128
@@ -67,8 +115,8 @@ fn decrypting_a_chunk_with_the_wrong_stream_id_fails() {
 fn decrypting_a_chunk_with_the_wrong_key_fails() {
     let k_data_a = [1u8; 32];
     let k_data_b = [2u8; 32];
-    let ciphertext = encrypt_hybrid_chunk(&k_data_a, 1, 0, b"pcm");
-    assert!(decrypt_hybrid_chunk(&k_data_b, 1, 0, &ciphertext).is_none());
+    let ciphertext = seal_chunk(&k_data_a, 1, 0, b"pcm");
+    assert!(open_chunk(&k_data_b, 1, 0, &ciphertext).is_none());
 }
 
 // ---------------------------------------------------------------------
@@ -153,12 +201,51 @@ fn encrypt_then_decrypt_hybrid_round_trips() {
     let (bob_public, bob_private) = generate_bundle().expect("bob bundle");
 
     let msg = b"a message long enough to span more than one internal AES block, for good measure";
-    let envelope = encrypt_hybrid_for_one(&alice_private, &bob_public, msg).expect("encrypt");
-    let blob = proto::encode(&envelope).expect("encode envelope");
+    let blob = seal_to(&alice_private, &bob_public, None, 1, msg);
 
-    let out =
-        decrypt_hybrid(&bob_private, &alice_public, &blob).expect("decrypt+verify should succeed");
+    let out = open_for(&bob_private, &bob_public, &alice_public, &blob)
+        .expect("open+verify should succeed");
     assert_eq!(out, msg);
+}
+
+/// A send is bound to the room it belongs to: the same sealed bytes
+/// presented as if they came from a channel must not open. This is the
+/// replay a legitimate recipient could otherwise perform on their own
+/// message history.
+/// @requirement AC-113
+#[test]
+#[ignore = "real keygen - see module doc, run with cargo slow"]
+fn a_private_send_does_not_open_as_a_channel_send() {
+    let (alice_public, alice_private) = generate_bundle().expect("alice bundle");
+    let (bob_public, bob_private) = generate_bundle().expect("bob bundle");
+
+    let blob = seal_to(&alice_private, &bob_public, None, 1, b"just between us");
+    let (binding, _) = open_bound(&bob_private, &bob_public, &alice_public, &blob).expect("open");
+
+    assert_eq!(
+        binding.channel, None,
+        "a DM must report no channel, which is what the receiving side compares against"
+    );
+}
+
+/// The cross-recipient re-wrap: a legitimate recipient cannot make one of
+/// alice's messages look like a message alice sent to somebody else.
+/// @requirement AC-112
+#[test]
+#[ignore = "real keygen - see module doc, run with cargo slow"]
+fn a_send_sealed_for_one_recipient_does_not_open_for_another() {
+    let (alice_public, alice_private) = generate_bundle().expect("alice bundle");
+    let (bob_public, _bob_private) = generate_bundle().expect("bob bundle");
+    let (carol_public, carol_private) = generate_bundle().expect("carol bundle");
+
+    let blob = seal_to(&alice_private, &bob_public, None, 1, b"for bob only");
+
+    // Carol presents bob's sealed send as though it were hers. Even holding
+    // her own private bundle, the binding names bob - so it fails closed.
+    assert!(
+        open_bound(&carol_private, &carol_public, &alice_public, &blob).is_none(),
+        "a send names who it was sealed for; presenting it as someone else's must fail"
+    );
 }
 
 /// @requirement AC-079, TB-131
@@ -176,20 +263,14 @@ fn encrypt_hybrid_for_one_round_trips_via_wire_encoding() {
     let bob_public_decoded: aloo::crypto::pq::PqPublicBundle =
         proto::decode(&bob_public_der).expect("decode");
 
-    let envelope = encrypt_hybrid_for_one(
-        &alice_private,
-        &bob_public_decoded,
-        b"hello via wire encoding",
-    )
-    .expect("encrypt");
-    let block = proto::encode(&envelope).expect("encode");
+    let block = seal_to(&alice_private, &bob_public_decoded, None, 1, b"hello via wire encoding");
     assert_eq!(
         vec![block.clone()].len(),
         1,
-        "the whole hybrid blob is one Envelope.blocks element"
+        "the whole sealed send is one Envelope.blocks element"
     );
 
-    let out = decrypt_hybrid(&bob_private, &alice_public, &block).expect("decrypt");
+    let out = open_for(&bob_private, &bob_public, &alice_public, &block).expect("open");
     assert_eq!(out, b"hello via wire encoding");
 }
 
@@ -201,13 +282,14 @@ fn tampered_ciphertext_is_rejected() {
     let (bob_public, bob_private) = generate_bundle().expect("bob bundle");
     let _ = &alice_public;
 
-    let mut envelope =
-        encrypt_hybrid_for_one(&alice_private, &bob_public, b"original").expect("encrypt");
-    envelope.ciphertext[0] ^= 0xFF;
-    let blob = proto::encode(&envelope).expect("encode");
+    let mut blob = seal_to(&alice_private, &bob_public, None, 1, b"original");
+    // Flip a byte near the end, which lands in the ciphertext rather than
+    // the setup that precedes it.
+    let last = blob.len() - 1;
+    blob[last] ^= 0xFF;
 
     assert!(
-        decrypt_hybrid(&bob_private, &alice_public, &blob).is_none(),
+        open_for(&bob_private, &bob_public, &alice_public, &blob).is_none(),
         "a flipped ciphertext byte must fail the AEAD tag"
     );
 }
@@ -228,13 +310,10 @@ fn tampered_signature_is_rejected() {
 
     // Mallory signs and sends her own envelope, but claims to be alice by
     // having bob verify against alice's public bundle instead of hers.
-    let envelope =
-        encrypt_hybrid_for_one(&mallory_private, &bob_public, b"pretend this is from alice")
-            .expect("encrypt");
-    let blob = proto::encode(&envelope).expect("encode");
+    let blob = seal_to(&mallory_private, &bob_public, None, 1, b"pretend this is from alice");
 
     assert!(
-        decrypt_hybrid(&bob_private, &alice_public, &blob).is_none(),
+        open_for(&bob_private, &bob_public, &alice_public, &blob).is_none(),
         "a message signed by mallory must not verify against alice's public bundle"
     );
     let _ = mallory_public;
@@ -248,12 +327,10 @@ fn wrong_sender_public_bundle_is_rejected() {
     let (carol_public, _carol_private) = generate_bundle().expect("carol bundle");
     let (bob_public, bob_private) = generate_bundle().expect("bob bundle");
 
-    let envelope =
-        encrypt_hybrid_for_one(&alice_private, &bob_public, b"from alice").expect("encrypt");
-    let blob = proto::encode(&envelope).expect("encode");
+    let blob = seal_to(&alice_private, &bob_public, None, 1, b"from alice");
 
     // bob mistakenly verifies against carol's public bundle instead of alice's.
-    assert!(decrypt_hybrid(&bob_private, &carol_public, &blob).is_none());
+    assert!(open_for(&bob_private, &bob_public, &carol_public, &blob).is_none());
     let _ = alice_public;
 }
 
@@ -266,12 +343,10 @@ fn wrong_recipient_cannot_decrypt() {
     let (mallory_public, mallory_private) = generate_bundle().expect("mallory bundle");
     let _ = mallory_public;
 
-    let envelope =
-        encrypt_hybrid_for_one(&alice_private, &bob_public, b"only for bob").expect("encrypt");
-    let blob = proto::encode(&envelope).expect("encode");
+    let blob = seal_to(&alice_private, &bob_public, None, 1, b"only for bob");
 
     assert!(
-        decrypt_hybrid(&mallory_private, &alice_public, &blob).is_none(),
+        open_for(&mallory_private, &mallory_public, &alice_public, &blob).is_none(),
         "mallory holds neither bob's ML-KEM-1024 nor RSA-4096-enc private key"
     );
 }
@@ -283,13 +358,13 @@ fn wrap_key_for_and_unwrap_key_round_trip() {
     let (bob_public, bob_private) = generate_bundle().expect("bob bundle");
     let k_data = aloo::crypto::pq::fresh_data_key();
 
-    let (kem_ciphertext, wrapped_key, wrapped_key_rsa) =
-        aloo::crypto::pq::wrap_key_for(&bob_public, &k_data).expect("wrap");
+    let (kem_ciphertext, wrapped_key, eph_x25519_pub) =
+        aloo::crypto::pq::wrap_key_for(bob_public.bootstrap_encap(), &k_data).expect("wrap");
     let recovered = aloo::crypto::pq::unwrap_key(
-        &bob_private,
+        bob_private.bootstrap_decap(),
         &kem_ciphertext,
         &wrapped_key,
-        &wrapped_key_rsa,
+        &eph_x25519_pub,
     )
     .expect("unwrap");
 
@@ -299,36 +374,90 @@ fn wrap_key_for_and_unwrap_key_round_trip() {
 /// @requirement AC-083, TB-129
 #[test]
 #[ignore = "real keygen - see module doc, run with cargo slow"]
-fn wrap_key_for_stream_and_unwrap_key_for_stream_round_trip() {
+fn seal_setup_and_open_setup_round_trip() {
     let (alice_public, alice_private) = generate_bundle().expect("alice bundle");
     let (bob_public, bob_private) = generate_bundle().expect("bob bundle");
 
-    let stream_id = 4242u64;
-    let k_data = aloo::crypto::pq::fresh_data_key();
-    let setup = wrap_key_for_stream(&alice_private, &bob_public, stream_id, &k_data)
-        .expect("wrap for stream");
+    let send_id = 4242u64;
+    let (setup, k_data) =
+        seal_setup(
+            &alice_private,
+            bob_public.bootstrap_encap(),
+            bundle_fingerprint(&bob_public).expect("fingerprint"),
+            None,
+            send_id,
+        )
+        .expect("seal setup");
 
-    let recovered = unwrap_key_for_stream(&bob_private, &alice_public, stream_id, &setup)
-        .expect("unwrap+verify should succeed");
+    let bob_fp = bundle_fingerprint(&bob_public).expect("fingerprint");
+    let recovered = open_setup(&[bob_private.bootstrap_decap().clone()], &bob_fp, &alice_public, &setup)
+        .expect("open+verify should succeed");
     assert_eq!(recovered, k_data);
 }
 
+/// A stream's whole content hangs off one setup, so a setup that fails to
+/// verify must yield nothing at all - the receiving worker has no key to
+/// decrypt a single chunk with.
 /// @requirement AC-080, TB-129
 #[test]
 #[ignore = "real keygen - see module doc, run with cargo slow"]
-fn unwrap_key_for_stream_rejects_a_tampered_commitment() {
+fn open_setup_rejects_a_setup_sealed_for_someone_else() {
+    let (alice_public, alice_private) = generate_bundle().expect("alice bundle");
+    let (bob_public, _bob_private) = generate_bundle().expect("bob bundle");
+    let (carol_public, carol_private) = generate_bundle().expect("carol bundle");
+
+    let (setup, _) = seal_setup(
+        &alice_private,
+        bob_public.bootstrap_encap(),
+        bundle_fingerprint(&bob_public).expect("fingerprint"),
+        None,
+        1,
+    )
+    .expect("seal setup");
+
+    let carol_fp = bundle_fingerprint(&carol_public).expect("fingerprint");
+    assert!(
+        open_setup(&[carol_private.bootstrap_decap().clone()], &carol_fp, &alice_public, &setup).is_none(),
+        "a stream setup names its recipient exactly like a text send does"
+    );
+}
+
+/// Every chunk of a stream rides on the one key its setup authorised, and
+/// the `(send_id, seq)` nonce keeps each chunk distinct.
+/// @requirement AC-115, TB-160
+#[test]
+#[ignore = "real keygen - see module doc, run with cargo slow"]
+fn a_stream_of_chunks_opens_under_its_setups_key() {
     let (alice_public, alice_private) = generate_bundle().expect("alice bundle");
     let (bob_public, bob_private) = generate_bundle().expect("bob bundle");
 
-    let stream_id = 1u64;
-    let k_data = aloo::crypto::pq::fresh_data_key();
-    let setup = wrap_key_for_stream(&alice_private, &bob_public, stream_id, &k_data)
-        .expect("wrap for stream");
+    let send_id = 7u64;
+    let (setup, k_data) =
+        seal_setup(
+            &alice_private,
+            bob_public.bootstrap_encap(),
+            bundle_fingerprint(&bob_public).expect("fingerprint"),
+            Some("the-hall".into()),
+            send_id,
+        )
+        .expect("seal setup");
+    let chunks: Vec<Vec<u8>> = (0..3u32)
+        .map(|seq| seal_chunk(&k_data, send_id, seq, format!("chunk {seq}").as_bytes()))
+        .collect();
 
-    // Bob receives the setup but for the wrong stream_id (e.g. a replayed
-    // key-setup against a different recording) - the signed commitment
-    // binds stream_id, so this must fail to verify.
-    assert!(unwrap_key_for_stream(&bob_private, &alice_public, stream_id + 1, &setup).is_none());
+    let bob_fp = bundle_fingerprint(&bob_public).expect("fingerprint");
+    let recovered = open_setup(&[bob_private.bootstrap_decap().clone()], &bob_fp, &alice_public, &setup).expect("open setup");
+    for (seq, ciphertext) in chunks.iter().enumerate() {
+        let seq = seq as u32;
+        let plaintext =
+            open_chunk(&recovered, send_id, seq, ciphertext).expect("chunk should open");
+        assert_eq!(plaintext, format!("chunk {seq}").into_bytes());
+    }
+    assert_eq!(
+        setup.binding.channel.as_deref(),
+        Some("the-hall"),
+        "a channel stream carries the channel it belongs to"
+    );
 }
 
 /// @requirement AC-084, TB-130
@@ -347,10 +476,8 @@ fn save_and_load_bundle_files_roundtrip() {
     let loaded_private = load_private_bundle(&priv_path).expect("load private");
     let loaded_public = load_public_bundle(&pub_path).expect("load public");
 
-    let envelope = encrypt_hybrid_for_one(&loaded_private, &loaded_public, b"round trip via files")
-        .expect("encrypt");
-    let blob = proto::encode(&envelope).expect("encode");
-    let out = decrypt_hybrid(&loaded_private, &loaded_public, &blob).expect("decrypt");
+    let blob = seal_to(&loaded_private, &loaded_public, None, 1, b"round trip via files");
+    let out = open_for(&loaded_private, &loaded_public, &loaded_public, &blob).expect("open");
     assert_eq!(out, b"round trip via files");
 
     std::fs::remove_dir_all(&dir).ok();
@@ -391,10 +518,8 @@ fn ensure_bundle_at_generates_a_bundle_when_missing() {
 
     let public = load_public_bundle(&pub_path).expect("load public");
     let private = load_private_bundle(&priv_path).expect("load private");
-    let envelope =
-        encrypt_hybrid_for_one(&private, &public, b"self-addressed round trip").expect("encrypt");
-    let blob = proto::encode(&envelope).expect("encode");
-    let out = decrypt_hybrid(&private, &public, &blob).expect("decrypt");
+    let blob = seal_to(&private, &public, None, 1, b"self-addressed round trip");
+    let out = open_for(&private, &public, &public, &blob).expect("open");
     assert_eq!(out, b"self-addressed round trip");
 
     std::fs::remove_dir_all(&dir).ok();
@@ -447,10 +572,8 @@ fn ensure_bundle_at_regenerates_both_when_only_one_file_exists() {
     // The freshly (re)generated pair must actually work together.
     let public = load_public_bundle(&pub_path).expect("load public");
     let private = load_private_bundle(&priv_path).expect("load private");
-    let envelope = encrypt_hybrid_for_one(&private, &public, b"still works after partial deletion")
-        .expect("encrypt");
-    let blob = proto::encode(&envelope).expect("encode");
-    let out = decrypt_hybrid(&private, &public, &blob).expect("decrypt");
+    let blob = seal_to(&private, &public, None, 1, b"still works after partial deletion");
+    let out = open_for(&private, &public, &public, &blob).expect("open");
     assert_eq!(out, b"still works after partial deletion");
 
     std::fs::remove_dir_all(&dir).ok();

@@ -91,7 +91,7 @@ How your own messages get locked so only the intended reader can open them:
 - 🚨 **PWD** (`Password`) — your key is derived from a password, so the same password always gives you the same identity, from any machine.
 - 🔒 **RSA** (`RSA, file`) — a key pair saved to disk, reused every time you connect, so people recognize you as the same person session after session.
 - 🔒 **RSAPM** (`RSA, rotating per message`) — instead of one long-term key, aloo quietly generates a fresh key *for each person you talk to*, and swaps it out every time you send or receive a message with them. Nothing to prepare before connecting — the first key is generated automatically. aloo does keep one small file (`own_next_keys`) so a peer can still tell you're the same person after you disconnect and reconnect; treat it like any other private key file.
-- 🛡️ **PQH** (`PQ-Hybrid`, quantum-resistant) — the strongest option, and the **default**. It combines four things at once: ML-DSA-87 + RSA-4096 to sign and prove a message really came from you, ML-KEM-1024 + RSA-4096 to securely share a one-time key, and AES-256-GCM to actually lock the message content. Even if one of the newer post-quantum algorithms turns out to have a weakness someday, the classical RSA half still has to be broken too. You don't have to set anything up: if the keys don't exist yet, aloo generates them for you automatically the first time you connect.
+- 🛡️ **PQH** (`PQ-Hybrid`, quantum-resistant) — the strongest option, and the **default**. It combines four things at once: ML-DSA-87 + RSA-4096 to sign and prove a message really came from you *and was meant for the person reading it*, ML-KEM-1024 + X25519 to securely share a one-time key, and AES-256-GCM to actually lock the message content. The keys that unlock your messages are also regenerated as you chat and the old ones thrown away, so someone who steals your key file later still can't read what you already said. Even if one of the newer post-quantum algorithms turns out to have a weakness someday, the classical RSA half still has to be broken too. You don't have to set anything up: if the keys don't exist yet, aloo generates them for you automatically the first time you connect.
 
 These are the exact tags aloo shows next to a person's name, so you always know how someone's messages are protected just by looking at them.
 
@@ -136,6 +136,9 @@ This only applies to identity types that actually stay the same across reconnect
 This README is the friendly tour. For the full nuts and bolts:
 
 - [`docs/SPEC.md`](docs/SPEC.md) — the complete application specification.
-- [`docs/PROTOCOL.md`](docs/PROTOCOL.md) — the wire protocol, message framing, and cryptographic design in full detail.
+If you ever need to replace your keys, use `aloo --rekey-pq-hybrid <old-prefix> <new-prefix>` rather than generating a fresh set: the new keys carry a certificate signed by the old ones, so people who already know you won't be warned that you might be an impostor. And `aloo --export-identity-card <prefix> <your-nickname>` writes a small file you can send to a friend by any means — once they import it, they have you verified before you've even spoken.
+
+- [`docs/SECURITY.md`](docs/SECURITY.md) — what aloo protects, what it does not, and how much of that is actually checked. Read this before trusting it with anything that matters.
+- [`docs/PROTOCOL.md`](docs/PROTOCOL.md) — the wire protocol, message framing, and cryptographic design in full detail. Written without reference to any implementation, so it stands on its own if you want to build a second one; section 14 compares the four encryption methods side by side and section 15 collects every message sequence.
 - [`docs/TESTING.md`](docs/TESTING.md) — how the project is tested.
 - [`docs/SERVER_ON_DOCKER.md`](docs/SERVER_ON_DOCKER.md) — running `aloo --server` in Docker.

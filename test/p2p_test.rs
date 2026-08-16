@@ -14,6 +14,7 @@ use aloo::client::p2p::{P2pEvent, PeerLinkManager};
 use aloo::p2p_proto::P2pPayload;
 use aloo::proto::*;
 use aloo::server::{AuthConfig, serve_with_rendezvous};
+use aloo::control::ControlEndpoint;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
 async fn spawn_test_server() -> SocketAddr {
@@ -26,22 +27,18 @@ async fn spawn_test_server() -> SocketAddr {
     addr
 }
 
-async fn handshake(stream: &mut TcpStream, name: &str) -> UserId {
-    let hello: ServerMessage = read_message(stream).await.unwrap().unwrap();
-    assert!(matches!(
-        hello,
-        ServerMessage::Hello {
-            auth: AuthKind::None,
-            ..
-        }
-    ));
-    write_message(stream, &ClientMessage::Auth(AuthResponse::None))
+async fn handshake(stream: &mut ControlEndpoint<TcpStream>, name: &str) -> UserId {
+    let (auth, _) = stream
+        .client_handshake(None)
+        .await
+        .unwrap()
+        .expect("server closed during handshake");
+    assert_eq!(auth, AuthKind::None);
+    stream.send(&ClientMessage::Auth(AuthResponse::None))
         .await
         .unwrap();
-    let _: ServerMessage = read_message(stream).await.unwrap().unwrap(); // AuthResult
-    write_message(
-        stream,
-        &ClientMessage::Identify {
+    let _: ServerMessage = stream.recv().await.unwrap().unwrap(); // AuthResult
+    stream.send(&ClientMessage::Identify {
             display_name: name.into(),
             public_key_der: vec![],
             key_mode: KeyMode::Rsa,
@@ -49,7 +46,7 @@ async fn handshake(stream: &mut TcpStream, name: &str) -> UserId {
     )
     .await
     .unwrap();
-    let identify_result: ServerMessage = read_message(stream).await.unwrap().unwrap();
+    let identify_result: ServerMessage = stream.recv().await.unwrap().unwrap();
     let ServerMessage::IdentifyResult {
         ok: true,
         you: Some(you),
@@ -58,7 +55,7 @@ async fn handshake(stream: &mut TcpStream, name: &str) -> UserId {
     else {
         panic!("expected a successful IdentifyResult, got {identify_result:?}");
     };
-    let _: ServerMessage = read_message(stream).await.unwrap().unwrap(); // ChannelList
+    let _: ServerMessage = stream.recv().await.unwrap().unwrap(); // ChannelList
     you
 }
 
@@ -67,9 +64,9 @@ async fn handshake(stream: &mut TcpStream, name: &str) -> UserId {
 async fn direct_link_handshake_and_reliable_message_end_to_end() {
     let server_addr = spawn_test_server().await;
 
-    let mut a = TcpStream::connect(server_addr).await.unwrap();
+    let mut a = ControlEndpoint::new(TcpStream::connect(server_addr).await.unwrap());
     let alice_id = handshake(&mut a, "alice").await;
-    let mut b = TcpStream::connect(server_addr).await.unwrap();
+    let mut b = ControlEndpoint::new(TcpStream::connect(server_addr).await.unwrap());
     let bob_id = handshake(&mut b, "bob").await;
 
     let (a_events_tx, mut a_events_rx) = tokio::sync::mpsc::unbounded_channel::<P2pEvent>();
@@ -94,7 +91,7 @@ async fn direct_link_handshake_and_reliable_message_end_to_end() {
         from,
         candidates,
         link_nonce,
-    } = read_message(&mut b).await.unwrap().unwrap()
+    } = b.recv().await.unwrap().unwrap()
     else {
         panic!("bob should receive alice's PeerCandidates");
     };
@@ -107,7 +104,7 @@ async fn direct_link_handshake_and_reliable_message_end_to_end() {
         from,
         candidates,
         link_nonce,
-    } = read_message(&mut a).await.unwrap().unwrap()
+    } = a.recv().await.unwrap().unwrap()
     else {
         panic!("alice should receive bob's PeerCandidates reply");
     };
@@ -190,12 +187,12 @@ async fn direct_link_handshake_and_reliable_message_end_to_end() {
 async fn punch_timeout_fails_the_link_and_emits_link_failed() {
     let server_addr = spawn_test_server().await;
 
-    let mut a = TcpStream::connect(server_addr).await.unwrap();
+    let mut a = ControlEndpoint::new(TcpStream::connect(server_addr).await.unwrap());
     let _alice_id = handshake(&mut a, "alice").await;
     // Registered so the RequestPeerLink itself is accepted by the server,
     // but this connection never does anything with it - nobody ever
     // answers alice's candidate proposal.
-    let mut b = TcpStream::connect(server_addr).await.unwrap();
+    let mut b = ControlEndpoint::new(TcpStream::connect(server_addr).await.unwrap());
     let bob_id = handshake(&mut b, "bob").await;
 
     let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel::<P2pEvent>();
@@ -234,7 +231,7 @@ async fn punch_timeout_fails_the_link_and_emits_link_failed() {
 
 /// `session.rs`'s `UserJoined` handler pre-warms a link to every
 /// newly-learned peer well before anyone tries to talk to them
-/// (`docs/PROTOCOL.md` §7.0's "trigger" - eager on learning about a peer,
+/// (`docs/PROTOCOL.md` §7.1's "trigger" - eager on learning about a peer,
 /// not lazy-on-first-send, precisely to give real sends like voice a head
 /// start on reaching `Active`). Most channel-mates are never actually
 /// addressed, so a pre-warm-only link that fails to punch must stay
@@ -246,9 +243,9 @@ async fn punch_timeout_fails_the_link_and_emits_link_failed() {
 async fn punch_timeout_with_nothing_pending_fails_silently() {
     let server_addr = spawn_test_server().await;
 
-    let mut a = TcpStream::connect(server_addr).await.unwrap();
+    let mut a = ControlEndpoint::new(TcpStream::connect(server_addr).await.unwrap());
     let _alice_id = handshake(&mut a, "alice").await;
-    let mut b = TcpStream::connect(server_addr).await.unwrap();
+    let mut b = ControlEndpoint::new(TcpStream::connect(server_addr).await.unwrap());
     let bob_id = handshake(&mut b, "bob").await;
 
     let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel::<P2pEvent>();

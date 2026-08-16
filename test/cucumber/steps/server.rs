@@ -9,6 +9,7 @@
 use std::net::{IpAddr, Ipv4Addr};
 
 use cucumber::{given, then, when};
+use aloo::control::ControlEndpoint;
 use tokio::net::{TcpListener, TcpStream};
 
 use aloo::crypto;
@@ -16,7 +17,7 @@ use aloo::client::p2p::{P2pEvent, PeerLinkManager};
 use aloo::p2p_proto::P2pPayload;
 use aloo::proto::{
     AuthKind, AuthResponse, ChannelKind, ClientMessage, Content, Envelope, KeyMode, ServerMessage,
-    UserId, read_message, write_message,
+    UserId,
 };
 use aloo::server::{AuthConfig, Registry, serve_with_rendezvous};
 
@@ -89,7 +90,7 @@ async fn ensure_peer_link(w: &mut AlooWorld, a: &str, b: &str) {
         from,
         candidates,
         link_nonce,
-    } = read_message(cb.stream.as_mut().unwrap())
+    } = cb.stream.as_mut().unwrap().recv()
         .await
         .unwrap()
         .unwrap()
@@ -108,7 +109,7 @@ async fn ensure_peer_link(w: &mut AlooWorld, a: &str, b: &str) {
         from,
         candidates,
         link_nonce,
-    } = read_message(ca.stream.as_mut().unwrap())
+    } = ca.stream.as_mut().unwrap().recv()
         .await
         .unwrap()
         .unwrap()
@@ -169,31 +170,28 @@ async fn expect_p2p_event(w: &mut AlooWorld, who: &str, timeout: std::time::Dura
 /// Asserts the documented ordering as it goes: `IdentifyResult` then
 /// `ChannelList`, back to back, as the first two messages after a successful
 /// `Identify`.
-async fn handshake(stream: &mut TcpStream, name: &str, key_mode: KeyMode) -> UserId {
-    let hello: ServerMessage = read_message(stream).await.unwrap().unwrap();
-    assert!(
-        matches!(
-            hello,
-            ServerMessage::Hello {
-                auth: AuthKind::None,
-                challenge: None
-            }
-        ),
-        "an open server should advertise no auth and no challenge, got {hello:?}"
+async fn handshake(stream: &mut ControlEndpoint<TcpStream>, name: &str, key_mode: KeyMode) -> UserId {
+    let (auth, challenge) = stream
+        .client_handshake(None)
+        .await
+        .unwrap()
+        .expect("server closed during handshake");
+    assert_eq!(
+        (auth, challenge),
+        (AuthKind::None, None),
+        "an open server should advertise no auth and no challenge"
     );
 
-    write_message(stream, &ClientMessage::Auth(AuthResponse::None))
+    stream.send(&ClientMessage::Auth(AuthResponse::None))
         .await
         .unwrap();
-    let result: ServerMessage = read_message(stream).await.unwrap().unwrap();
+    let result: ServerMessage = stream.recv().await.unwrap().unwrap();
     assert!(
         matches!(result, ServerMessage::AuthResult { ok: true, .. }),
         "auth should succeed"
     );
 
-    write_message(
-        stream,
-        &ClientMessage::Identify {
+    stream.send(&ClientMessage::Identify {
             display_name: name.into(),
             public_key_der: vec![],
             key_mode,
@@ -202,7 +200,7 @@ async fn handshake(stream: &mut TcpStream, name: &str, key_mode: KeyMode) -> Use
     .await
     .unwrap();
 
-    let identify: ServerMessage = read_message(stream).await.unwrap().unwrap();
+    let identify: ServerMessage = stream.recv().await.unwrap().unwrap();
     let ServerMessage::IdentifyResult {
         ok: true,
         you: Some(you),
@@ -211,7 +209,7 @@ async fn handshake(stream: &mut TcpStream, name: &str, key_mode: KeyMode) -> Use
     else {
         panic!("expected a successful IdentifyResult, got {identify:?}");
     };
-    let list: ServerMessage = read_message(stream).await.unwrap().unwrap();
+    let list: ServerMessage = stream.recv().await.unwrap().unwrap();
     assert!(
         matches!(list, ServerMessage::ChannelList(_)),
         "ChannelList must follow IdentifyResult immediately, got {list:?}"
@@ -243,7 +241,7 @@ async fn registry_fresh(w: &mut AlooWorld) {
 #[given(expr = "{word} has connected")]
 async fn client_connects(w: &mut AlooWorld, who: String) {
     let addr = w.addr.expect("no server running");
-    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let mut stream = ControlEndpoint::new(TcpStream::connect(addr).await.unwrap());
     let id = handshake(&mut stream, &who, KeyMode::Rsa).await;
     w.ids.insert(who.clone(), id);
     w.clients.insert(
@@ -259,7 +257,7 @@ async fn client_connects(w: &mut AlooWorld, who: String) {
 #[given(expr = "{word} has connected using rsa_per_msg")]
 async fn client_connects_perms(w: &mut AlooWorld, who: String) {
     let addr = w.addr.expect("no server running");
-    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let mut stream = ControlEndpoint::new(TcpStream::connect(addr).await.unwrap());
     let id = handshake(&mut stream, &who, KeyMode::PerMessage).await;
     w.ids.insert(who.clone(), id);
     w.clients.insert(
@@ -321,9 +319,7 @@ async fn both_joined_registry(w: &mut AlooWorld, a: String, b: String, channel: 
 async fn join_channel(w: &mut AlooWorld, who: &str, channel: &str) {
     let client = w.client_mut(who);
     let stream = client.stream.as_mut().expect("client has no socket");
-    write_message(
-        stream,
-        &ClientMessage::JoinChannel {
+    stream.send(&ClientMessage::JoinChannel {
             name: channel.into(),
             kind: ChannelKind::Public,
             password: None,
@@ -337,7 +333,7 @@ async fn expect_message(w: &mut AlooWorld, who: &str) -> ServerMessage {
     let client = w.client_mut(who);
     let stream = client.stream.as_mut().expect("client has no socket");
     let msg: ServerMessage =
-        tokio::time::timeout(std::time::Duration::from_secs(5), read_message(stream))
+        tokio::time::timeout(std::time::Duration::from_secs(5), stream.recv())
             .await
             .expect("timed out waiting for a server message")
             .unwrap()
@@ -426,28 +422,24 @@ async fn stream_voice(w: &mut AlooWorld, from: String, channel: String, to: Stri
 #[when(expr = "someone else tries to connect as {string}")]
 async fn duplicate_nickname(w: &mut AlooWorld, name: String) {
     let addr = w.addr.expect("no server running");
-    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let mut stream = ControlEndpoint::new(TcpStream::connect(addr).await.unwrap());
 
-    let hello: ServerMessage = read_message(&mut stream).await.unwrap().unwrap();
-    assert!(matches!(
-        hello,
-        ServerMessage::Hello {
-            auth: AuthKind::None,
-            ..
-        }
-    ));
-    write_message(&mut stream, &ClientMessage::Auth(AuthResponse::None))
+    let (auth_kind, _) = stream
+        .client_handshake(None)
+        .await
+        .unwrap()
+        .expect("server closed during handshake");
+    assert_eq!(auth_kind, AuthKind::None);
+    stream.send(&ClientMessage::Auth(AuthResponse::None))
         .await
         .unwrap();
-    let auth: ServerMessage = read_message(&mut stream).await.unwrap().unwrap();
+    let auth: ServerMessage = stream.recv().await.unwrap().unwrap();
     assert!(
         matches!(auth, ServerMessage::AuthResult { ok: true, .. }),
         "auth itself should still pass"
     );
 
-    write_message(
-        &mut stream,
-        &ClientMessage::Identify {
+    stream.send(&ClientMessage::Identify {
             display_name: name,
             public_key_der: vec![],
             key_mode: KeyMode::Rsa,
@@ -456,7 +448,7 @@ async fn duplicate_nickname(w: &mut AlooWorld, name: String) {
     .await
     .unwrap();
 
-    let result: ServerMessage = read_message(&mut stream).await.unwrap().unwrap();
+    let result: ServerMessage = stream.recv().await.unwrap().unwrap();
     w.clients.insert(
         "impostor".into(),
         ClientState {
@@ -477,25 +469,22 @@ async fn disconnects(w: &mut AlooWorld, who: String) {
 #[when(expr = "a client offers the password {string}")]
 async fn offer_password(w: &mut AlooWorld, password: String) {
     let addr = w.addr.expect("no server running");
-    let mut stream = TcpStream::connect(addr).await.unwrap();
-    let hello: ServerMessage = read_message(&mut stream).await.unwrap().unwrap();
-    assert!(
-        matches!(
-            hello,
-            ServerMessage::Hello {
-                auth: AuthKind::Password,
-                challenge: None
-            }
-        ),
-        "a password-protected server should advertise Password and issue no challenge, got {hello:?}"
+    let mut stream = ControlEndpoint::new(TcpStream::connect(addr).await.unwrap());
+    let (auth, challenge) = stream
+        .client_handshake(None)
+        .await
+        .unwrap()
+        .expect("server closed during handshake");
+    assert_eq!(
+        (auth, challenge),
+        (AuthKind::Password, None),
+        "a password-protected server should advertise Password and issue no challenge"
     );
-    write_message(
-        &mut stream,
-        &ClientMessage::Auth(AuthResponse::Password(password)),
+    stream.send(&ClientMessage::Auth(AuthResponse::Password(password)),
     )
     .await
     .unwrap();
-    let result: ServerMessage = read_message(&mut stream).await.unwrap().unwrap();
+    let result: ServerMessage = stream.recv().await.unwrap().unwrap();
     w.clients.insert(
         "candidate".into(),
         ClientState {
@@ -698,7 +687,7 @@ async fn nickname_refused(w: &mut AlooWorld, name: String) {
 async fn connection_closed(w: &mut AlooWorld) {
     let client = w.client_mut("impostor");
     let stream = client.stream.as_mut().unwrap();
-    let after: Option<ServerMessage> = read_message(stream).await.unwrap();
+    let after: Option<ServerMessage> = stream.recv().await.unwrap();
     assert!(
         after.is_none(),
         "the server should close the connection after rejecting the nickname"
@@ -718,7 +707,7 @@ async fn unaffected(w: &mut AlooWorld, who: String, channel: String) {
 #[then(expr = "the nickname {string} can be claimed again")]
 async fn nickname_reclaimable(w: &mut AlooWorld, name: String) {
     let addr = w.addr.expect("no server running");
-    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let mut stream = ControlEndpoint::new(TcpStream::connect(addr).await.unwrap());
     // A rejection or a hang here fails the scenario through handshake's asserts.
     let id = handshake(&mut stream, &name, KeyMode::Rsa).await;
     w.ids.insert("reclaimer".into(), id);

@@ -15,7 +15,9 @@ use rsa::{RsaPrivateKey, RsaPublicKey};
 use tokio::net::TcpStream;
 
 use aloo::crypto::KeyPair;
+use aloo::crypto::pq::{PqPrivateBundle, PqPublicBundle};
 use aloo::client::idstore::IdStore;
+use aloo::client::replay::ReplayGuard;
 use aloo::client::p2p::{P2pEvent, PeerLinkManager};
 use aloo::p2p_proto::PunchDatagram;
 use aloo::proto::{Envelope, ServerMessage, UserId};
@@ -70,12 +72,34 @@ pub fn keypair_for(who: &str) -> KeyPair {
     }
 }
 
+/// Real PQ-hybrid identities for scenarios, pooled per name exactly like
+/// `keypair_for` and for the same reason.
+///
+/// The ML-DSA-87 and ML-KEM-1024 halves are the real, full-strength
+/// parameter sets - they generate in microseconds. Only the classical RSA
+/// hedge is shrunk (`generate_bundle_with_bits`), because two RSA-4096
+/// keygens per identity would take this suite from seconds to minutes and
+/// no scenario here asserts anything about RSA modulus size.
+/// `hybrid_crypto_test.rs` still exercises the real 4096-bit bundles under
+/// `cargo slow`.
+pub fn pq_bundle_for(who: &str) -> (PqPublicBundle, PqPrivateBundle) {
+    static POOL: OnceLock<Mutex<HashMap<String, (PqPublicBundle, PqPrivateBundle)>>> =
+        OnceLock::new();
+    let pool = POOL.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = pool.lock().expect("pq bundle pool lock");
+    let entry = guard.entry(who.to_string()).or_insert_with(|| {
+        aloo::crypto::pq::generate_bundle_with_bits(SCENARIO_KEY_BITS)
+            .expect("scenario pq keygen")
+    });
+    entry.clone()
+}
+
 /// State for a single simulated client in a multi-client scenario. The
 /// client's own `UserId` lives in `AlooWorld::ids`, keyed by the same
 /// handle, so it is not duplicated here.
 #[derive(Default)]
 pub struct ClientState {
-    pub stream: Option<TcpStream>,
+    pub stream: Option<aloo::control::ControlEndpoint<TcpStream>>,
     pub received: Vec<ServerMessage>,
     /// This client's direct peer-to-peer transport (`aloo::client::p2p`), bound
     /// lazily the first time a scenario needs it (`server::ensure_peer_link`)
@@ -116,6 +140,53 @@ pub struct AlooWorld {
 
     // -- wire protocol -------------------------------------------------
     pub envelope: Option<Envelope>,
+
+    // -- pq_hybrid sealed sends ----------------------------------------
+    /// The most recently sealed send, as it would sit on the wire.
+    pub sealed: Vec<u8>,
+    /// Each chunk of a sealed stream, in order.
+    pub sealed_chunks: Vec<Vec<u8>>,
+    /// The stream setup that authorises `sealed_chunks`.
+    pub sealed_setup: Option<aloo::crypto::pq::SendSetup>,
+    /// What the receiving side made of the last thing handed to it.
+    pub opened: Option<Vec<u8>>,
+    pub refused: bool,
+    /// The receiving side's replay state, so a scenario can hand it the
+    /// same send twice.
+    pub replay: ReplayGuard,
+
+    // -- pq_hybrid rotation --------------------------------------------
+    /// The receiving side's rotating decryption keys.
+    pub pq_own_keys: Option<aloo::client::pq_rekey::PqOwnKeys>,
+    /// The encryption keys most recently rotated to.
+    pub pq_rotated_encap: Option<aloo::crypto::pq::PqEncapKeys>,
+    /// The last rotation offered, as it would travel: encoded + signed.
+    pub pq_rotation: Option<(Vec<u8>, Vec<u8>)>,
+    /// Several messages sealed under one key.
+    pub sealed_burst: Vec<Vec<u8>>,
+
+    // -- identity continuity -------------------------------------------
+    /// The identity currently pinned for a peer.
+    pub pinned_bundle: Option<aloo::crypto::pq::PqPublicBundle>,
+    /// The identity being offered in its place.
+    pub replacement_bundle: Option<aloo::crypto::pq::PqPublicBundle>,
+    /// A card being exported, shared and imported.
+    pub identity_card: Option<aloo::crypto::pq::IdentityCard>,
+
+    // -- control channel -----------------------------------------------
+    pub control_offer: Option<aloo::control::ControlOffer>,
+    pub control_decap: Option<aloo::crypto::pq::PqDecapKeys>,
+    pub client_control_keys: Option<aloo::control::ControlKeys>,
+    pub server_control_keys: Option<aloo::control::ControlKeys>,
+    /// What actually went on the wire, for scenarios that inspect it.
+    pub control_bytes: Vec<u8>,
+    /// The server's long-term keypair, when a scenario needs one to sign
+    /// its offer with.
+    pub server_keypair: Option<KeyPair>,
+
+    // -- malformed input -----------------------------------------------
+    pub survived_malformed: bool,
+    pub oversized_frame_refused: bool,
 
     // -- key rotation --------------------------------------------------
     pub remote_keys: Option<RemoteKeys>,

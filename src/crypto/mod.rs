@@ -6,6 +6,7 @@ use std::path::Path;
 /// material or primitives with the RSA-only code below - see its module doc
 /// for the full design, and `docs/PROTOCOL.md` §13.
 pub mod pq;
+pub mod safety;
 
 use rand_chacha::ChaCha20Rng;
 use rand_core::{OsRng, RngCore, SeedableRng};
@@ -13,7 +14,7 @@ use rsa::pkcs8::{
     DecodePrivateKey, DecodePublicKey, EncodePrivateKey, EncodePublicKey, LineEnding,
 };
 use rsa::traits::PublicKeyParts;
-use rsa::{Oaep, Pkcs1v15Sign, RsaPrivateKey, RsaPublicKey};
+use rsa::{Oaep, Pss, RsaPrivateKey, RsaPublicKey};
 use sha2::{Digest, Sha256};
 
 /// RSA modulus size used for every keypair this app generates, except
@@ -237,12 +238,22 @@ pub fn decrypt_chunked(key: &RsaPrivateKey, blocks: &[Vec<u8>]) -> Result<Vec<u8
     Ok(out)
 }
 
-/// Signs `data` with `key` using RSA PKCS#1 v1.5 + SHA-256 - deterministic
-/// (no RNG involved), used to authenticate a freshly-rotated `rsa_per_msg`
-/// public key (`rekey::rotate_for_peer`) with the private key it replaces.
+/// Signs `data` with `key` using RSA-PSS + SHA-256, with a random salt.
+///
+/// The one place this app produces an RSA signature: a freshly-rotated
+/// `rsa_per_msg` public key signed by the key it replaces
+/// (`rekey::rotate_for_peer`), and the classical half of a `pq_hybrid` send
+/// commitment (`crypto::pq::seal_setup`). PSS rather than PKCS#1 v1.5
+/// because it is the modern scheme with a security proof behind it; v1.5 is
+/// kept alive elsewhere in the world only for compatibility this app has no
+/// reason to want (`docs/PROTOCOL.md`: no backwards compatibility).
+///
+/// Randomised, so signing the same bytes twice gives different signatures -
+/// nothing here ever compares two signatures for equality, only verifies
+/// them.
 pub fn sign(key: &RsaPrivateKey, data: &[u8]) -> Result<Vec<u8>> {
     let digest = Sha256::digest(data);
-    key.sign(Pkcs1v15Sign::new::<Sha256>(), &digest)
+    key.sign_with_rng(&mut OsRng, Pss::new::<Sha256>(), &digest)
         .map_err(|e| CryptoError::Encrypt(e.to_string()))
 }
 
@@ -251,8 +262,7 @@ pub fn sign(key: &RsaPrivateKey, data: &[u8]) -> Result<Vec<u8>> {
 /// trustworthy, not why verification failed.
 pub fn verify(key: &RsaPublicKey, data: &[u8], signature: &[u8]) -> bool {
     let digest = Sha256::digest(data);
-    key.verify(Pkcs1v15Sign::new::<Sha256>(), &digest, signature)
-        .is_ok()
+    key.verify(Pss::new::<Sha256>(), &digest, signature).is_ok()
 }
 
 /// Generates `len` cryptographically random bytes, used for auth challenge

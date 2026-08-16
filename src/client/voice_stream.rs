@@ -35,14 +35,27 @@ pub(crate) enum OwnStreamTarget {
     Direct(UserId),
 }
 
-/// The once-per-stream `PqHybrid` setup: a fresh `k_data` plus each PQ
-/// recipient's key-wrap+signature (`crypto::pq::HybridStreamKeySetup`),
-/// computed once at record-start and repeated verbatim in every chunk to
-/// that recipient - see `HybridStreamKeySetup`'s doc for the bandwidth
-/// tradeoff.
+/// The once-per-stream `PqHybrid` setup: each PQ recipient's own sealed
+/// `SendSetup` and the `k_data` it authorises, computed once at
+/// record-start. The setup travels once, as `P2pPayload::StreamKeySetup`;
+/// the chunks that follow are ciphertext only.
+///
+/// Unlike a text send, each recipient here gets an independent `k_data`:
+/// a setup is bound to one recipient, so sharing a key across them would
+/// mean sharing a binding too.
 pub(crate) struct PqStreamOut {
-    k_data: [u8; 32],
-    per_recipient: Vec<(UserId, crypto::pq::HybridStreamKeySetup)>,
+    per_recipient: Vec<(UserId, [u8; 32], crypto::pq::SendSetup)>,
+}
+
+impl PqStreamOut {
+    /// Every recipient's encoded setup, for sending as `StreamKeySetup`
+    /// right after `StreamStart`.
+    pub(crate) fn setups(&self) -> Vec<(UserId, Vec<u8>)> {
+        self.per_recipient
+            .iter()
+            .filter_map(|(id, _, setup)| crate::proto::encode(setup).ok().map(|b| (*id, b)))
+            .collect()
+    }
 }
 
 /// Builds the once-per-stream `PqHybrid` setup for `recipients` (already
@@ -51,31 +64,36 @@ pub(crate) struct PqStreamOut {
 /// rules out before this is called. A recipient whose wrap fails
 /// (malformed public bundle) is simply left out, same partial-delivery
 /// pattern as an RSA recipient with an unparseable key.
+///
+/// `recipients` pairs each peer with the encoded bundle they announced -
+/// used only for their identity fingerprint. What the stream is actually
+/// encrypted to is their *current* rotating key
+/// (`SessionState::pq_peer_keys`), so a recipient we have no current key
+/// for is left out rather than encrypted to a stale one.
 pub(crate) fn build_pq_stream_out(
     session: &SessionState,
+    channel: Option<String>,
     stream_id: u64,
-    recipients: &[(UserId, crypto::pq::PqPublicBundle)],
+    recipients: &[(UserId, Vec<u8>)],
 ) -> Option<PqStreamOut> {
     if recipients.is_empty() {
         return None;
     }
     let signing = session.own_pq_private.as_ref()?;
-    let k_data = crypto::pq::fresh_data_key();
-    let per_recipient: Vec<(UserId, crypto::pq::HybridStreamKeySetup)> = recipients
+    let per_recipient: Vec<(UserId, [u8; 32], crypto::pq::SendSetup)> = recipients
         .iter()
-        .filter_map(|(id, public)| {
-            crypto::pq::wrap_key_for_stream(signing, public, stream_id, &k_data)
+        .filter_map(|(id, public_der)| {
+            let encap = session.pq_peer_keys.encap_for(*id)?;
+            let fp = crypto::pq::fingerprint_of_encoded(public_der)?;
+            crypto::pq::seal_setup(signing, encap, fp, channel.clone(), stream_id)
                 .ok()
-                .map(|s| (*id, s))
+                .map(|(setup, k_data)| (*id, k_data, setup))
         })
         .collect();
     if per_recipient.is_empty() {
         return None;
     }
-    Some(PqStreamOut {
-        k_data,
-        per_recipient,
-    })
+    Some(PqStreamOut { per_recipient })
 }
 
 /// A DM voice stream's single recipient is either RSA-family or `PqHybrid`
@@ -108,6 +126,9 @@ pub(crate) enum StreamRecipients {
 /// relevant, since a worker doesn't know its own scheme until it inspects
 /// its `IncomingStreamKey`.
 pub(crate) enum DecryptJob {
+    /// A `pq_hybrid` stream's encoded `crypto::pq::SendSetup`, arriving
+    /// once - nothing in the stream decrypts until it does.
+    KeySetup(Vec<u8>),
     Chunk(u32, Vec<Vec<u8>>),
     /// No more chunks are coming (a real `...End` arrived, or the idle
     /// sweep gave up on this stream) - finalize with whatever plaintext
@@ -122,13 +143,19 @@ pub(crate) enum DecryptJob {
 /// encrypted against whichever public key material *we* announced,
 /// regardless of the sender's own `my_key` - same reasoning as
 /// `session::decrypt_envelope_for`).
-pub(crate) enum IncomingStreamKey {
+pub enum IncomingStreamKey {
     Rsa(Vec<RsaPrivateKey>),
-    /// `sender_public` is needed to verify the once-per-stream signature
-    /// inside the first `HybridStreamKeySetup` seen (`k_data` is then
-    /// cached for the rest of the stream - see `spawn_stream_decrypt_worker`).
+    /// `sender_public` verifies the stream's `StreamKeySetup` signature and
+    /// `my_fp` proves the setup was sealed for *us* (`k_data` is then cached
+    /// for the rest of the stream - see `spawn_stream_decrypt_worker`).
+    ///
+    /// `my_decaps` is the snapshot of candidate decryption keys taken at
+    /// stream start (`pq_rekey::PqOwnKeys::candidates_for`), not a single
+    /// key: a stream begun just before we rotate must still open, which is
+    /// what the retention window is for.
     Pq {
-        my_private: crypto::pq::PqPrivateBundle,
+        my_decaps: Vec<crypto::pq::PqDecapKeys>,
+        my_fp: [u8; 32],
         sender_public: crypto::pq::PqPublicBundle,
     },
 }
@@ -161,10 +188,8 @@ fn build_chunk_recipients(
                 .filter_map(|(id, key)| crypto::encrypt_chunked(key, pcm).ok().map(|b| (*id, b)))
                 .collect();
             if let Some(pq) = pq {
-                for (id, setup) in &pq.per_recipient {
-                    let blob = crypto::pq::encrypt_hybrid_voice_chunk(
-                        setup, &pq.k_data, stream_id, seq, pcm,
-                    );
+                for (id, k_data, _) in &pq.per_recipient {
+                    let blob = crypto::pq::seal_chunk(k_data, stream_id, seq, pcm);
                     out.push((*id, vec![blob]));
                 }
             }
@@ -190,9 +215,8 @@ pub(crate) fn encrypt_direct_chunk(
     match key {
         DirectStreamKey::Rsa(k) => crypto::encrypt_chunked(k, data).ok(),
         DirectStreamKey::Pq(pq) => {
-            let (_, setup) = pq.per_recipient.first()?;
-            let blob =
-                crypto::pq::encrypt_hybrid_voice_chunk(setup, &pq.k_data, stream_id, seq, data);
+            let (_, k_data, _) = pq.per_recipient.first()?;
+            let blob = crypto::pq::seal_chunk(k_data, stream_id, seq, data);
             Some(vec![blob])
         }
     }
@@ -210,7 +234,7 @@ fn stream_recipient_ids(target: &StreamRecipients) -> Vec<UserId> {
             .map(|(id, _)| *id)
             .chain(
                 pq.iter()
-                    .flat_map(|pq| pq.per_recipient.iter().map(|(id, _)| *id)),
+                    .flat_map(|pq| pq.per_recipient.iter().map(|(id, ..)| *id)),
             )
             .collect(),
         StreamRecipients::Direct { to, .. } => vec![*to],
@@ -312,28 +336,75 @@ pub(crate) fn spawn_record_stream_worker(
 /// `spawn_stream_decrypt_worker` and `file_transfer`'s receive worker so the
 /// RSA-candidates-retry / PQ-`k_data`-cache-from-first-chunk logic isn't
 /// duplicated between them.
-pub(crate) struct ChunkDecryptor {
+/// How many chunks of a not-yet-set-up stream are held before the rest are
+/// dropped. Voice chunks travel unreliably and can outrun the reliable
+/// `StreamKeySetup` they belong to, so a handful must be able to wait; a
+/// stream whose setup never arrives at all must not grow without bound.
+/// Mirrors `p2p_reliable::ArqReceiver`'s own bounded-buffer rule.
+const MAX_PENDING_CHUNKS: usize = 128;
+
+pub struct ChunkDecryptor {
     key: IncomingStreamKey,
     // `PqHybrid` only: the stream's `k_data`, recovered and
-    // signature-verified from the *first* chunk's `HybridStreamKeySetup`
-    // (`crypto::pq::unwrap_key_for_stream`) and cached here - every later
-    // chunk only pays for cheap AES-256-GCM, never re-verifying or
-    // re-unwrapping (`HybridStreamKeySetup`'s doc explains why the wire
-    // still repeats it every chunk regardless).
+    // signature-verified once from its `StreamKeySetup`
+    // (`crypto::pq::open_setup`) and cached here - every chunk after that
+    // only pays for cheap AES-256-GCM, never re-verifying or re-unwrapping.
     pq_k_data: Option<[u8; 32]>,
+    // Chunks that arrived before the setup did, replayed in arrival order
+    // once it lands. Empty for an RSA stream, which needs no setup.
+    pending: Vec<(u32, Vec<Vec<u8>>)>,
 }
 
 impl ChunkDecryptor {
-    pub(crate) fn new(key: IncomingStreamKey) -> Self {
+    pub fn new(key: IncomingStreamKey) -> Self {
         Self {
             key,
             pq_k_data: None,
+            pending: Vec::new(),
         }
     }
 
+    /// Verifies and installs a `pq_hybrid` stream's setup, returning the
+    /// chunks that had been waiting on it (already decrypted, in arrival
+    /// order). `None` if the setup fails to verify - a stream whose setup
+    /// isn't authentic decrypts nothing at all, the same fail-closed
+    /// behaviour as a bad signature on a text message.
+    pub fn install_setup(
+        &mut self,
+        stream_id: u64,
+        blob: &[u8],
+    ) -> Option<Vec<(u32, Vec<u8>)>> {
+        let IncomingStreamKey::Pq {
+            my_decaps,
+            my_fp,
+            sender_public,
+        } = &self.key
+        else {
+            return None;
+        };
+        let setup: crypto::pq::SendSetup = proto::decode(blob).ok()?;
+        if setup.binding.send_id != stream_id {
+            return None;
+        }
+        let k_data = crypto::pq::open_setup(my_decaps, my_fp, sender_public, &setup)?;
+        self.pq_k_data = Some(k_data);
+
+        let waiting = std::mem::take(&mut self.pending);
+        Some(
+            waiting
+                .into_iter()
+                .filter_map(|(seq, blocks)| {
+                    self.decrypt(stream_id, seq, &blocks).map(|pt| (seq, pt))
+                })
+                .collect(),
+        )
+    }
+
     /// Decrypts one chunk's `blocks`, `None` on any failure (wrong/stale
-    /// key, corrupted chunk, bad AEAD tag, ...).
-    pub(crate) fn decrypt(
+    /// key, corrupted chunk, bad AEAD tag, or - for `pq_hybrid` - a setup
+    /// that hasn't arrived yet, in which case the chunk is held for
+    /// `install_setup` to replay).
+    pub fn decrypt(
         &mut self,
         stream_id: u64,
         seq: u32,
@@ -349,22 +420,15 @@ impl ChunkDecryptor {
             IncomingStreamKey::Rsa(privates) => privates
                 .iter()
                 .find_map(|k| crypto::decrypt_chunked(k, blocks).ok()),
-            IncomingStreamKey::Pq {
-                my_private,
-                sender_public,
-            } => {
+            IncomingStreamKey::Pq { .. } => {
                 let blob = blocks.first()?;
-                let chunk: crypto::pq::HybridVoiceChunk = proto::decode(blob).ok()?;
-                if self.pq_k_data.is_none() {
-                    self.pq_k_data = crypto::pq::unwrap_key_for_stream(
-                        my_private,
-                        sender_public,
-                        stream_id,
-                        &chunk.key_setup,
-                    );
-                }
-                let k_data = self.pq_k_data.as_ref()?;
-                crypto::pq::decrypt_hybrid_chunk(k_data, stream_id, seq, &chunk.ciphertext)
+                let Some(k_data) = self.pq_k_data else {
+                    if self.pending.len() < MAX_PENDING_CHUNKS {
+                        self.pending.push((seq, blocks.to_vec()));
+                    }
+                    return None;
+                };
+                crypto::pq::open_chunk(&k_data, stream_id, seq, blob)
             }
         }
     }
@@ -394,25 +458,51 @@ pub(crate) fn spawn_stream_decrypt_worker(
     std::thread::spawn(move || {
         let mut plaintext_accum: Vec<u8> = Vec::new();
         let mut decryptor = ChunkDecryptor::new(key);
+        // Accumulates one decrypted chunk and reports whether the stream has
+        // hit its own length cap. Shared by chunks that decrypt on arrival
+        // and chunks replayed out of `install_setup`'s backlog, so both
+        // paths enforce the cap identically.
+        let accept_pcm = |pcm: Vec<u8>, plaintext_accum: &mut Vec<u8>| -> bool {
+            plaintext_accum.extend_from_slice(&pcm);
+            if !suppress_playback {
+                let samples = voice::pcm_from_bytes(&pcm);
+                let _ = mixer_tx.send(voice::MixerCmd::Push {
+                    id: mixer_id,
+                    samples,
+                });
+            }
+            // Defense in depth (§7.3): never accept more than
+            // `voice::MAX_RECORDING_SAMPLES` per stream regardless of the
+            // sender's own cap - force-finalize as if a real `*End` had
+            // arrived.
+            voice::recording_at_max((plaintext_accum.len() / 2) as u64)
+        };
         while let Some(job) = rx.blocking_recv() {
             match job {
+                DecryptJob::KeySetup(blob) => {
+                    let mut at_max = false;
+                    if let Some(waiting) = decryptor.install_setup(stream_id, &blob) {
+                        for (_, pcm) in waiting {
+                            if accept_pcm(pcm, &mut plaintext_accum) {
+                                at_max = true;
+                                break;
+                            }
+                        }
+                    }
+                    if at_max {
+                        let sample_count = (plaintext_accum.len() / 2) as u64;
+                        let duration_ms =
+                            ((sample_count * 1000) / voice::SAMPLE_RATE_HZ as u64) as u32;
+                        let _ = mixer_tx.send(voice::MixerCmd::Finish { id: mixer_id });
+                        let _ = finished_tx.send((from, stream_id, duration_ms, plaintext_accum));
+                        break;
+                    }
+                }
                 DecryptJob::Chunk(seq, blocks) => {
                     let pcm = decryptor.decrypt(stream_id, seq, &blocks);
                     if let Some(pcm) = pcm {
-                        plaintext_accum.extend_from_slice(&pcm);
-                        if !suppress_playback {
-                            let samples = voice::pcm_from_bytes(&pcm);
-                            let _ = mixer_tx.send(voice::MixerCmd::Push {
-                                id: mixer_id,
-                                samples,
-                            });
-                        }
-                        // Defense in depth (§7.3): never accept more than
-                        // `voice::MAX_RECORDING_SAMPLES` per stream
-                        // regardless of the sender's own cap - force-
-                        // finalize as if a real `*End` had arrived.
-                        let sample_count = (plaintext_accum.len() / 2) as u64;
-                        if voice::recording_at_max(sample_count) {
+                        if accept_pcm(pcm, &mut plaintext_accum) {
+                            let sample_count = (plaintext_accum.len() / 2) as u64;
                             let duration_ms =
                                 ((sample_count * 1000) / voice::SAMPLE_RATE_HZ as u64) as u32;
                             let _ = mixer_tx.send(voice::MixerCmd::Finish { id: mixer_id });
@@ -479,8 +569,14 @@ pub(crate) fn resolve_direct_key(
 ) -> Option<DirectStreamKey> {
     match recipient_key_mode {
         KeyMode::PqHybrid => {
-            let public: crypto::pq::PqPublicBundle = proto::decode(recipient_pubkey_der).ok()?;
-            let pq = build_pq_stream_out(session, stream_id, &[(to, public)])?;
+            // A direct stream belongs to no channel - the same binding a DM
+            // text message carries, and what keeps it out of one.
+            let pq = build_pq_stream_out(
+                session,
+                None,
+                stream_id,
+                &[(to, recipient_pubkey_der.to_vec())],
+            )?;
             Some(DirectStreamKey::Pq(pq))
         }
         _ => crypto::public_key_from_der(recipient_pubkey_der)
@@ -503,13 +599,16 @@ pub(crate) fn resolve_incoming_key(
 ) -> IncomingStreamKey {
     if session.own_key_mode == KeyMode::PqHybrid {
         match (
-            session.own_pq_private.clone(),
+            session.own_pq_keys.as_ref(),
             proto::decode(sender_public_key_der),
         ) {
-            (Some(my_private), Ok(sender_public)) => IncomingStreamKey::Pq {
-                my_private,
-                sender_public,
-            },
+            (Some(own), Ok(sender_public)) if session.own_pq_fp.is_some() => {
+                IncomingStreamKey::Pq {
+                    my_decaps: own.candidates_for(from),
+                    my_fp: session.own_pq_fp.expect("guarded by the match arm above"),
+                    sender_public,
+                }
+            }
             // Malformed sender key, or (shouldn't happen) no own PQ
             // identity despite `own_key_mode == PqHybrid` - nothing
             // decryptable either way, so every chunk will just fail to
@@ -573,6 +672,21 @@ pub(crate) fn forward_chunk(
     if let Some(s) = session.active_streams.get_mut(&(from, stream_id)) {
         s.last_seen = Instant::now();
         let _ = s.job_tx.send(DecryptJob::Chunk(seq, blocks));
+    }
+}
+
+/// Hands a `pq_hybrid` stream's key setup to its decrypt worker. Like
+/// `forward_chunk`, a setup for a stream we never started (or already
+/// finished) is simply dropped.
+pub(crate) fn forward_key_setup(
+    session: &mut SessionState,
+    from: UserId,
+    stream_id: u64,
+    setup: Vec<u8>,
+) {
+    if let Some(s) = session.active_streams.get_mut(&(from, stream_id)) {
+        s.last_seen = Instant::now();
+        let _ = s.job_tx.send(DecryptJob::KeySetup(setup));
     }
 }
 

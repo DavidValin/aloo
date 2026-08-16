@@ -4,7 +4,6 @@
 //! `handle_ui_action`/`handle_server_message`; the generic
 //! live-voice-streaming plumbing they use lives in `crate::client::voice_stream`.
 
-use tokio::io::AsyncWrite;
 
 use crate::crypto;
 use crate::client::p2p::LinkReadiness;
@@ -23,8 +22,10 @@ use crate::client::voice_stream;
 /// encryption itself fails.
 fn encrypt_for_recipient(
     session: &SessionState,
+    to: UserId,
     key_mode: KeyMode,
     pubkey_der: &[u8],
+    send_id: u64,
     plaintext: &[u8],
     content: Content,
 ) -> Option<Envelope> {
@@ -33,15 +34,20 @@ fn encrypt_for_recipient(
     }
     crate::client::envelope::encrypt_envelope_for(
         session.own_pq_private.as_ref(),
+        session.pq_peer_keys.encap_for(to),
         key_mode,
         pubkey_der,
+        // A DM is bound to no channel - which is itself the binding, and
+        // what stops this being replayed into one.
+        None,
+        send_id,
         plaintext,
         content,
     )
 }
 
 pub(crate) async fn handle_send_text(
-    wr: &mut (impl AsyncWrite + Unpin),
+    wr: &mut impl crate::control::ControlSink,
     session: &mut SessionState,
     to: UserId,
     plaintext: String,
@@ -49,10 +55,14 @@ pub(crate) async fn handle_send_text(
     recipient_pubkey_der: Vec<u8>,
 ) -> proto::Result<()> {
     if session.remote_keys.try_use(to) {
+        let send_id = session.next_stream_id;
+        session.next_stream_id += 1;
         if let Some(envelope) = encrypt_for_recipient(
             session,
+            to,
             recipient_key_mode,
             &recipient_pubkey_der,
+            send_id,
             plaintext.as_bytes(),
             Content::Text,
         ) {
@@ -64,7 +74,7 @@ pub(crate) async fn handle_send_text(
                     envelope,
                 },
             );
-            crate::client::session::request_rotation_if_per_message(session, to);
+            crate::client::session::request_rotation(session, to);
         }
     } else {
         session
@@ -79,7 +89,7 @@ pub(crate) async fn handle_send_text(
 /// is a single transfer rather than a fan-out.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_send_file(
-    wr: &mut (impl AsyncWrite + Unpin),
+    wr: &mut impl crate::control::ControlSink,
     ui_state: &mut UiState,
     session: &mut SessionState,
     to: UserId,
@@ -101,16 +111,18 @@ pub(crate) async fn handle_send_file(
     let Ok(plaintext) = proto::encode(&payload) else {
         return Ok(());
     };
+    let stream_id = session.next_stream_id;
     let Some(envelope) = encrypt_for_recipient(
         session,
+        to,
         recipient_key_mode,
         &recipient_pubkey_der,
+        stream_id,
         &plaintext,
         Content::FileOffer,
     ) else {
         return Ok(());
     };
-    let stream_id = session.next_stream_id;
     let Some(key) = voice_stream::resolve_direct_key(
         session,
         stream_id,
@@ -135,12 +147,12 @@ pub(crate) async fn handle_send_file(
             envelope,
         },
     );
-    crate::client::session::request_rotation_if_per_message(session, to);
+    crate::client::session::request_rotation(session, to);
     Ok(())
 }
 
 pub(crate) async fn handle_voice_record_start(
-    wr: &mut (impl AsyncWrite + Unpin),
+    wr: &mut impl crate::control::ControlSink,
     ui_state: &mut UiState,
     session: &mut SessionState,
     recorder: voice::Recorder,
@@ -164,14 +176,12 @@ pub(crate) async fn handle_voice_record_start(
     }
     let key = match recipient_key_mode {
         KeyMode::PqHybrid => {
-            let Ok(public): Result<crypto::pq::PqPublicBundle, _> =
-                proto::decode(&recipient_pubkey_der)
-            else {
-                ui_state.recording_failed("malformed pq_hybrid public key".to_string());
-                return Ok(());
-            };
-            let Some(pq) = voice_stream::build_pq_stream_out(session, stream_id, &[(to, public)])
-            else {
+            let Some(pq) = voice_stream::build_pq_stream_out(
+                session,
+                None,
+                stream_id,
+                &[(to, recipient_pubkey_der.clone())],
+            ) else {
                 ui_state.recording_failed("failed to prepare pq_hybrid stream key".to_string());
                 return Ok(());
             };
@@ -193,6 +203,15 @@ pub(crate) async fn handle_voice_record_start(
             stream_id,
         },
     );
+    // A pq_hybrid recipient's setup follows `StreamStart`, once and
+    // reliably - see the channel counterpart for why it isn't per chunk.
+    if let voice_stream::DirectStreamKey::Pq(pq) = &key {
+        for (id, setup) in pq.setups() {
+            session
+                .peer_link
+                .send_reliable_or_queue(id, P2pPayload::StreamKeySetup { stream_id, setup });
+        }
+    }
     let (stop_tx, stop_rx) = std::sync::mpsc::channel();
     session.active_recording = Some(stop_tx);
     session
@@ -220,9 +239,11 @@ pub(crate) fn on_message(
     let Some(sender) = ui_state.known_users.get(&from).cloned() else {
         return;
     };
-    if let Some(body) = crate::client::session::decrypt_envelope_for(envelope, from, &sender, session) {
+    if let Some(body) =
+        crate::client::session::decrypt_envelope_for(envelope, from, &sender, None, session)
+    {
         ui_state.on_direct_message(from, from_name, body);
-        crate::client::session::request_rotation_if_per_message(session, from);
+        crate::client::session::request_rotation(session, from);
     }
 }
 
@@ -254,7 +275,7 @@ pub(crate) fn on_stream_start(
 
 pub(crate) fn on_own_stream_finished(
     ui_state: &mut UiState,
-    session: &SessionState,
+    session: &mut SessionState,
     you: UserId,
     to: UserId,
     stream_id: u64,
@@ -262,7 +283,7 @@ pub(crate) fn on_own_stream_finished(
     pcm: Vec<u8>,
 ) {
     ui_state.on_direct_stream_finished(to, you, stream_id, duration_ms, pcm);
-    crate::client::session::request_rotation_if_per_message(session, to);
+    crate::client::session::request_rotation(session, to);
 }
 
 pub(crate) fn on_stream_finished(

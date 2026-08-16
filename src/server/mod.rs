@@ -50,6 +50,17 @@ impl AuthConfig {
 
     /// A fresh nonce to send as part of `ServerMessage::Hello` when this
     /// config requires RSA auth; `None` otherwise.
+    /// The long-term key this server can vouch for its per-connection
+    /// control-channel offer with (`control::make_offer`). Only RSA auth
+    /// has one - the other modes leave the channel encrypted but
+    /// unauthenticated, which is documented rather than hidden.
+    pub fn signing_key(&self) -> Option<&RsaPrivateKey> {
+        match self {
+            AuthConfig::Rsa(key) => Some(key),
+            _ => None,
+        }
+    }
+
     pub fn make_challenge(&self) -> Option<Vec<u8>> {
         match self {
             AuthConfig::Rsa(_) => Some(crypto::random_bytes(32)),
@@ -488,8 +499,12 @@ impl Registry {
             .clients
             .get(&from)
             .ok_or_else(|| "unknown sender".to_string())?;
-        if sender.key_mode != KeyMode::PerMessage {
-            return Err("sender is not in rsa_per_msg mode".to_string());
+        // Both rotating modes may relay: rsa_per_msg rotates its identity
+        // key (§11), pq_hybrid its encryption keys (§13.10). The static
+        // modes have nothing to rotate and so have no business here. The
+        // server still verifies nothing about the payload itself.
+        if !matches!(sender.key_mode, KeyMode::PerMessage | KeyMode::PqHybrid) {
+            return Err("sender does not rotate keys".to_string());
         }
         if !self.clients.contains_key(&to) {
             return Err("unknown recipient".to_string());
@@ -616,21 +631,37 @@ async fn handle_connection(
     auth: Arc<AuthConfig>,
 ) -> proto::Result<()> {
     let peer_ip = peer_addr.ip();
-    let (mut rd, mut wr) = tokio::io::split(socket);
+    let (rd, wr) = tokio::io::split(socket);
+    let mut rd = crate::control::ControlReader::new(rd);
+    let mut wr = crate::control::ControlWriter::new(wr);
+
+    // Ephemeral per connection, so recording a session and later stealing
+    // the server's long-term key still does not decrypt it.
+    let (encap, decap) = crate::crypto::pq::generate_encryption_keys();
+    let control = crate::control::make_offer(encap, auth.signing_key())?;
 
     let challenge = auth.make_challenge();
-    proto::write_message(
-        &mut wr,
-        &ServerMessage::Hello {
-            auth: auth.kind(),
-            challenge: challenge.clone(),
-        },
-    )
+    wr.send(&ServerMessage::Hello {
+        auth: auth.kind(),
+        challenge: challenge.clone(),
+        control,
+    })
     .await?;
 
-    let Some(ClientMessage::Auth(response)) = proto::read_message(&mut rd).await? else {
-        let _ = proto::write_message(
-            &mut wr,
+    // Everything from here on is sealed. A client that sends anything but
+    // `SecureChannel` first cannot be talked to at all - there is no
+    // plaintext fallback, since one would be a downgrade attack.
+    let Some(ClientMessage::SecureChannel(accept)) = rd.recv().await? else {
+        return Ok(());
+    };
+    let Some(keys) = crate::control::open_accept(&decap, &accept) else {
+        return Ok(());
+    };
+    wr.enable(keys.send);
+    rd.enable(keys.recv);
+
+    let Some(ClientMessage::Auth(response)) = rd.recv().await? else {
+        let _ = wr.send(
             &ServerMessage::AuthResult {
                 ok: false,
                 reason: Some("expected auth message".into()),
@@ -640,9 +671,7 @@ async fn handle_connection(
         return Ok(());
     };
     if !auth.verify(challenge.as_deref(), &response) {
-        let _ = proto::write_message(
-            &mut wr,
-            &ServerMessage::AuthResult {
+        let _ = wr.send(&ServerMessage::AuthResult {
                 ok: false,
                 reason: Some("authentication failed".into()),
             },
@@ -650,9 +679,7 @@ async fn handle_connection(
         .await;
         return Ok(());
     }
-    proto::write_message(
-        &mut wr,
-        &ServerMessage::AuthResult {
+    wr.send(&ServerMessage::AuthResult {
             ok: true,
             reason: None,
         },
@@ -663,11 +690,9 @@ async fn handle_connection(
         display_name,
         public_key_der,
         key_mode,
-    }) = proto::read_message(&mut rd).await?
+    }) = rd.recv().await?
     else {
-        let _ = proto::write_message(
-            &mut wr,
-            &ServerMessage::Error {
+        let _ = wr.send(&ServerMessage::Error {
                 message: "expected identify message".into(),
             },
         )
@@ -681,9 +706,7 @@ async fn handle_connection(
             Ok(id) => id,
             Err(reason) => {
                 drop(reg);
-                let _ = proto::write_message(
-                    &mut wr,
-                    &ServerMessage::IdentifyResult {
+                let _ = wr.send(&ServerMessage::IdentifyResult {
                         ok: false,
                         you: None,
                         reason: Some(reason),
@@ -708,7 +731,7 @@ async fn handle_connection(
 
     let writer_task = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
-            if proto::write_message(&mut wr, &msg).await.is_err() {
+            if wr.send(&msg).await.is_err() {
                 break;
             }
         }
@@ -729,13 +752,13 @@ async fn handle_connection(
 
 async fn client_loop<R: AsyncRead + Unpin>(
     id: UserId,
-    rd: &mut R,
+    rd: &mut crate::control::ControlReader<R>,
     registry: &Arc<Mutex<Registry>>,
     senders: &Senders,
     source_ip: IpAddr,
 ) -> proto::Result<()> {
     loop {
-        let Some(msg) = proto::read_message::<_, ClientMessage>(rd).await? else {
+        let Some(msg) = rd.recv::<ClientMessage>().await? else {
             return Ok(());
         };
         let outgoing = {
@@ -785,7 +808,9 @@ async fn client_loop<R: AsyncRead + Unpin>(
                         }]
                     }
                 },
-                ClientMessage::Auth(_) | ClientMessage::Identify { .. } => vec![Outgoing {
+                ClientMessage::SecureChannel(_)
+                | ClientMessage::Auth(_)
+                | ClientMessage::Identify { .. } => vec![Outgoing {
                     to: id,
                     message: ServerMessage::Error {
                         message: "unexpected message after handshake".into(),

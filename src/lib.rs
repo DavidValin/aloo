@@ -1,4 +1,5 @@
 pub mod client;
+pub mod control;
 pub mod crypto;
 pub mod p2p_proto;
 pub mod platform;

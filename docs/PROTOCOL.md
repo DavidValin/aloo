@@ -1,26 +1,212 @@
 # aloo wire protocol
 
-This document specifies the client↔server protocol implemented in
-`src/proto.rs` (message framing and types) and `src/server/mod.rs` (routing
-and connection lifecycle), and the direct client↔client transport
-implemented in `src/client/p2p.rs`/`src/p2p_proto.rs`/`src/client/p2p_reliable.rs`
-(§7.0). It is a description of the *wire format and server behavior*,
-precise enough to implement an interoperable client or server from
-scratch. Application-level UI/UX behavior (keybindings, rendering, how a
-client chooses to chunk a recording, etc.) is documented in
-`SPEC.md`/`README.md`, not here, except where noted as informative
-context.
+This document specifies the client↔server protocol and the direct
+client↔client transport (§7.1). It describes the *wire format and server
+behaviour* precisely enough to implement an interoperable client or server
+from scratch. Application-level behaviour - keybindings, rendering, how a
+client chooses to chunk a recording - is documented in `SPEC.md`/
+`README.md`, not here, except where noted as informative context.
+
+This document describes the protocol, not its implementation: no Rust
+appears in it, message shapes are given in neutral pseudocode, and no
+function or file is named. `docs/SPEC.md` carries the mapping from every
+term used here to the item that implements it, so a reader working on the
+code can cross over and a reader writing a second implementation need not.
 
 The server is a pure medium of connection *setup*, never of content: it
 authenticates connections, tracks channel membership/presence, relays
 `rsa_per_msg` key-rotation notices, and relays the candidate exchange that
-lets two clients punch a direct UDP link to each other (§7.0). Every
+lets two clients punch a direct UDP link to each other (§7.1). Every
 actual message, voice stream, and file transfer travels over that direct
 link once it's established - never through the server, not even as
 ciphertext. The server holds no state beyond the current process's memory
 (nothing survives a restart), and there is no relay-of-last-resort: if a
 direct link can't be established, the send fails visibly rather than
-falling back to a server relay (§7.0.4).
+falling back to a server relay (§7.1).
+
+## Contents
+
+- [Overview: the connections, and what travels on each](#overview-the-connections-and-what-travels-on-each)
+  - [Every message, by connection](#every-message-by-connection)
+- [1. Transport](#1-transport)
+  - [1.1 Framing](#11-framing)
+  - [1.2 Why length-prefixed framing](#12-why-length-prefixed-framing)
+  - [1.3 The control channel is encrypted](#13-the-control-channel-is-encrypted)
+- [2. Serialization](#2-serialization)
+- [3. Domain types](#3-domain-types)
+- [4. Connection lifecycle](#4-connection-lifecycle)
+- [5. Authentication](#5-authentication)
+  - [5.1 `AuthKind::None`](#51-authkindnone)
+  - [5.2 `AuthKind::Password`](#52-authkindpassword)
+  - [5.3 `AuthKind::Rsa`](#53-authkindrsa)
+  - [5.4 Identify / nicknames](#54-identify-nicknames)
+- [6. Channels](#6-channels)
+  - [6.1 `JoinChannel { name, kind, password }`](#61-joinchannel-name-kind-password)
+  - [6.2 `LeaveChannel { name }`](#62-leavechannel-name)
+  - [6.3 `ChannelList(list<ChannelInfo>)` / `ChannelCreated { channel }`](#63-channellistlistchannelinfo-channelcreated-channel)
+  - [6.4 `UserOffline { user_id }` - full disconnect](#64-useroffline-user_id---full-disconnect)
+  - [6.5 Password-protected private channels](#65-password-protected-private-channels)
+  - [6.6 Brute-force protection](#66-brute-force-protection)
+- [7. Messaging](#7-messaging)
+  - [7.1 Direct peer-to-peer transport](#71-direct-peer-to-peer-transport)
+    - [7.1.1 Reliable delivery over the punched link](#711-reliable-delivery-over-the-punched-link)
+    - [7.1.2 Trust boundary: responding only within a shared channel](#712-trust-boundary-responding-only-within-a-shared-channel)
+    - [7.1.3 Tearing down a link once it no longer serves a purpose](#713-tearing-down-a-link-once-it-no-longer-serves-a-purpose)
+  - [7.2 Sending a channel or direct text message](#72-sending-a-channel-or-direct-text-message)
+  - [7.3 Voice streaming](#73-voice-streaming)
+  - [7.4 `Error { message: String }`](#74-error-message-string)
+  - [7.5 `RotateKey` / `KeyRotated` - per-peer key rotation relay](#75-rotatekey-keyrotated---per-peer-key-rotation-relay)
+  - [7.6 File transfer](#76-file-transfer)
+- [8. Encryption model](#8-encryption-model)
+  - [8.1 RSA-OAEP chunking](#81-rsa-oaep-chunking)
+  - [8.2 Cost implication for voice](#82-cost-implication-for-voice)
+  - [8.3 Password-derived keys](#83-password-derived-keys)
+  - [8.4 RSA signatures](#84-rsa-signatures)
+- [9. Versioning and compatibility](#9-versioning-and-compatibility)
+- [10. What the server never sees](#10-what-the-server-never-sees)
+- [11. Per-message key rotation (`rsa_per_msg`)](#11-per-message-key-rotation-rsa_per_msg)
+  - [11.1 Granularity: per peer relationship, not global](#111-granularity-per-peer-relationship-not-global)
+  - [11.2 Bootstrap (trust-on-first-use)](#112-bootstrap-trust-on-first-use)
+  - [11.3 Rotation trigger and signing](#113-rotation-trigger-and-signing)
+  - [11.4 Receiver-side verification and freshness](#114-receiver-side-verification-and-freshness)
+  - [11.5 Queueing while waiting for a fresh key](#115-queueing-while-waiting-for-a-fresh-key)
+  - [11.6 Voice streams count as one message](#116-voice-streams-count-as-one-message)
+  - [11.7 Retained keys for late/batched decryption](#117-retained-keys-for-latebatched-decryption)
+  - [11.8 What `rsa_per_msg` changes about the threat model](#118-what-rsa_per_msg-changes-about-the-threat-model)
+  - [11.9 Key size: 4096 bits, not the app's usual 2048](#119-key-size-4096-bits-not-the-apps-usual-2048)
+  - [11.10 Rotation keygen runs off the event-loop task (client implementation detail)](#1110-rotation-keygen-runs-off-the-event-loop-task-client-implementation-detail)
+- [12. Client-side identity pinning (`id_store`)](#12-client-side-identity-pinning-id_store)
+  - [12.1 The gap this closes](#121-the-gap-this-closes)
+  - [12.2 What gets pinned, and what doesn't](#122-what-gets-pinned-and-what-doesnt)
+  - [12.3 When the check happens](#123-when-the-check-happens)
+  - [12.4 What happens on a mismatch](#124-what-happens-on-a-mismatch)
+  - [12.5 Store format and location](#125-store-format-and-location)
+  - [12.6 Extending identity pinning to `rsa_per_msg` (`own_next_keys`)](#126-extending-identity-pinning-to-rsa_per_msg-own_next_keys)
+    - [12.6.1 What's persisted, on each side](#1261-whats-persisted-on-each-side)
+    - [12.6.2 Sending: resuming on reconnect](#1262-sending-resuming-on-reconnect)
+    - [12.6.3 Verifying: gate on sight, only a proof clears it](#1263-verifying-gate-on-sight-only-a-proof-clears-it)
+    - [12.6.4 Why this is a different kind of "mismatch" than §12.2-§12.5](#1264-why-this-is-a-different-kind-of-mismatch-than-122-125)
+    - [12.6.5 Store format and location (`own_next_keys`)](#1265-store-format-and-location-own_next_keys)
+  - [12.7 Making a pin worth more than "these bytes differ"](#127-making-a-pin-worth-more-than-these-bytes-differ)
+- [13. Post-quantum hybrid encryption (`pq_hybrid`)](#13-post-quantum-hybrid-encryption-pq_hybrid)
+  - [13.1 Why a fifth method, and why it looks different](#131-why-a-fifth-method-and-why-it-looks-different)
+  - [13.2 Key material: an identity that stays, keys that move](#132-key-material-an-identity-that-stays-keys-that-move)
+  - [13.3 One layout for everything: a setup, then chunks](#133-one-layout-for-everything-a-setup-then-chunks)
+  - [13.4 Opening a send: unwrap, verify, then check the binding](#134-opening-a-send-unwrap-verify-then-check-the-binding)
+  - [13.5 Key size and parameter choices](#135-key-size-and-parameter-choices)
+  - [13.6 Who can send to whom](#136-who-can-send-to-whom)
+  - [13.7 Voice streaming (and file transfer chunks)](#137-voice-streaming-and-file-transfer-chunks)
+  - [13.8 Identity pinning](#138-identity-pinning)
+  - [13.9 Client convenience: auto-generated keys and the connect-popup cache](#139-client-convenience-auto-generated-keys-and-the-connect-popup-cache)
+  - [13.10 Rotating encryption keys (forward secrecy)](#1310-rotating-encryption-keys-forward-secrecy)
+- [14. The four encryption methods, side by side](#14-the-four-encryption-methods-side-by-side)
+- [15. Sequences](#15-sequences)
+
+## Overview: the connections, and what travels on each
+
+A running client holds **one continuous connection to the server** and
+**one direct connection per peer** it actually communicates with — so
+between zero and N of them, N being the number of people it is talking to,
+not the number of channels it has joined.
+
+```
+                        ┌────────────┐
+                        │   server   │
+                        └──────┬─────┘
+                    one TCP connection,
+                  continuous, encrypted (§1.3)
+                               │
+                        ┌──────┴─────┐
+                        │  me        │
+                        └──┬───┬───┬─┘
+                           │   │   │      one direct UDP link per peer,
+                           │   │   │      punched, carries everything (§7.1)
+                      ┌────┘   │   └────┐
+                   ┌──┴──┐  ┌──┴──┐  ┌──┴──┐
+                   │alice│  │ bob │  │carol│
+                   └─────┘  └─────┘  └─────┘
+```
+
+**The server connection** is opened once and held for the life of the
+session. It sets things up and nothing more: authentication, nicknames,
+channel membership and presence, relaying key rotations, and relaying the
+address exchange that lets two clients find each other. **No message
+content of any kind crosses it** — not text, not voice, not files, not
+even as ciphertext (§7.1, §10).
+
+**A peer connection** is one direct UDP link per *peer*, established by
+hole punching (§7.1) the first time that peer is learned about. It is not
+per channel and not per conversation: a single link to alice carries every
+channel message she is a recipient of, every direct message, every voice
+stream and every file transfer between the two of you. Two people who
+share four channels still have exactly one link. If a link cannot be
+established the send fails visibly — there is no relay of last resort.
+
+A third, minor path exists: a **stateless UDP exchange with the server**
+used only to learn one's own public address before punching (§7.1, step 1).
+It carries no user data and keeps no state.
+
+### Every message, by connection
+
+**Server connection** — TCP, length-prefixed frames (§1.1), sealed after
+the handshake (§1.3).
+
+| Client → server | Purpose |
+|---|---|
+| `SecureChannel` | Turns the control channel on; must be first (§1.3) |
+| `Auth` | Answers the server's challenge (§5) |
+| `Identify` | Claims a nickname, announces a public key and method (§5.4) |
+| `JoinChannel` | Joins or implicitly creates a channel (§6.1) |
+| `LeaveChannel` | Leaves one channel (§6.2) |
+| `RotateKey` | Offers a peer fresh key material (§7.5, §11, §13.10) |
+| `RequestPeerLink` | Asks the server to pass candidates to a peer (§7.1) |
+
+| Server → client | Purpose |
+|---|---|
+| `Hello` | Auth mode, challenge, control-channel offer (§1.3, §4) |
+| `AuthResult` | Whether authentication succeeded (§5) |
+| `IdentifyResult` | Whether the nickname was granted, and this client's `UserId` (§5.4) |
+| `ChannelList` | The public channels, once, after identifying (§6.3) |
+| `Joined` | Confirms a join, last in the join snapshot (§6.1) |
+| `ChannelJoinFailed` | A join failed for a non-password reason (§6.1) |
+| `ChannelJoinRejected` | A join needs a password, guessed wrong, or is banned (§6.5, §6.6) |
+| `ChannelCreated` | A new public channel now exists (§6.3) |
+| `UserJoined` | A peer is in a shared channel — carries their key (§6.1) |
+| `UserLeft` | A peer left one channel (§6.2) |
+| `UserOffline` | A peer's connection ended entirely (§6.4) |
+| `KeyRotated` | A peer's relayed key rotation (§7.5, §11, §13.10) |
+| `PeerCandidates` | A peer's relayed addresses, to punch against (§7.1) |
+| `Error` | A soft, recoverable failure; the connection stays open (§7.4) |
+
+**Peer connection** — UDP, punched. Two layers: the datagram itself, and
+the payload carried inside a reliable or unreliable one.
+
+| Punch datagram | Purpose |
+|---|---|
+| `Ping` / `Pong` | Opens and confirms the NAT mapping (§7.1) |
+| `Keepalive` | Stops an idle mapping expiring (§7.1) |
+| `Reliable` / `Ack` | The retransmitting layer text and files ride on (§7.1.1) |
+| `Unreliable` | Voice chunks, which are not worth retransmitting (§7.3) |
+
+| Peer payload | Carried | Purpose |
+|---|---|---|
+| `Envelope` | reliably | One text message, channel or direct (§7.2) |
+| `FileOffer` | reliably | Offers a file; nothing is sent until accepted (§7.6) |
+| `FileAccept` / `FileReject` | reliably | The recipient's decision (§7.6) |
+| `FileChunk` / `FileEnd` | reliably | The file itself, once accepted (§7.6) |
+| `StreamStart` / `StreamEnd` | reliably | Brackets one voice recording (§7.3) |
+| `StreamKeySetup` | reliably | A `pq_hybrid` stream's key setup, sent once (§13.3) |
+| *(voice chunks)* | unreliably | The audio, as `Unreliable` datagrams (§7.3) |
+
+**Server UDP socket** — stateless, no user data.
+
+| Message | Purpose |
+|---|---|
+| `BindingRequest` / `BindingResponse` | Learn this client's own public address (§7.1) |
+
+§15 collects every one of these into end-to-end sequence diagrams —
+connecting, meeting a peer, sending text, voice, file transfer, key
+rotation, and replacing an identity.
 
 ## 1. Transport
 
@@ -29,7 +215,7 @@ falling back to a server relay (§7.0.4).
   frame format) but asymmetric in message types: a client only ever sends
   `ClientMessage` values and only ever receives `ServerMessage` values.
 - There is no protocol version negotiation. Client and server are
-  expected to be built from the same `proto.rs` definitions; there is no
+  expected to be built from the same message definitions; there is no
   compatibility mechanism for mismatched versions (see §9 for what
   actually happens on a decode mismatch).
 
@@ -58,8 +244,6 @@ Every message, in either direction, is sent as one frame:
   a connection ends. An EOF in the middle of a frame (after the length
   prefix or partway through the payload) is a hard I/O error.
 
-Reference implementation: `proto::frame`, `proto::parse_frame`,
-`proto::write_message`, `proto::read_message`.
 
 ### 1.2 Why length-prefixed framing
 
@@ -69,10 +253,89 @@ message" before attempting to decode it - without this, a reader would
 have to speculatively try decoding an arbitrary prefix of the stream,
 which bincode's schema-less format doesn't support safely.
 
+### 1.3 The control channel is encrypted
+
+Everything on this TCP connection is sealed, from the client's second
+message onward. Only two frames ever travel in the clear - the server's
+`Hello` and the client's `SecureChannel` - because they are what establish
+the seal.
+
+```
+ client                                   server
+   |<-- Hello { auth, challenge,            |   (in the clear)
+   |            control: ControlOffer } ----|
+   |                                        |
+   |--- SecureChannel(ControlAccept) ------>|   (in the clear)
+   |                                        |
+   |=== everything after this is sealed ====|
+```
+
+```
+ControlOffer  { encap: PqEncapKeys, signature: optional<bytes> }
+ControlAccept { kem_ciphertext: bytes, wrapped_key: bytes[32],
+                eph_x25519_pub: bytes[32] }
+```
+
+**Why.** Message content never touches the server at all (§7.1, §10), but
+the conversation that sets a session up always travelled as plain TCP - and
+it carries a `--password` credential in the clear (§5.2), nicknames,
+which channels exist, who is in them, and the timing of every key rotation.
+Sealing it changes nothing about what the *server* learns, since it still
+has to route by these; it changes what anyone in between learns.
+
+**How.** The construction is deliberately not new. The server's `encap` is
+an ephemeral ML-KEM-1024 + X25519 pair, freshly generated per connection;
+the client transports a random 32-byte secret to it through the identical
+hybrid wrap a message send uses (§13.3), inheriting the same "a break of
+either primitive alone is not enough" property. Both sides then derive two
+keys from that secret:
+
+```
+c2s = HKDF-SHA256(secret, "aloo/control/v1/client-to-server")
+s2c = HKDF-SHA256(secret, "aloo/control/v1/server-to-client")
+```
+
+A frame's *payload* is AES-256-GCM-sealed under the key for its direction,
+with the direction's own message counter as the nonce; the length-prefixed
+framing of §1.1 is untouched, and `length` simply counts the sealed bytes.
+Separate keys per direction mean a captured frame cannot be reflected back
+at its sender. A frame that fails its authentication tag is a hard error,
+never a skipped message - on a sealed channel that means either tampering
+or desynchronised counters, and both are fatal.
+
+There is **no plaintext fallback**. A client whose first message is not
+`SecureChannel` is not talked to at all; a fallback would be a downgrade
+attack waiting to be used.
+
+**Authenticating the server.** An ephemeral offer needs something
+long-lived to vouch for it, or a man in the middle substitutes their own
+and reads everything. When the deployment uses RSA auth (§5.3) the client
+already holds the server's public key out of band, so the server signs its
+offer with the matching private key:
+
+```
+signature = RSA-PSS over "aloo/control/v1/offer" ++ encode(encap)
+```
+
+and a client holding that key **requires** a valid one. An unsigned offer,
+one signed by a different key, or one whose `encap` was swapped after
+signing are all refused - each is exactly what an interceptor would
+produce. This is the same shape as a TLS handshake signing an ephemeral key
+exchange with a long-term identity.
+
+Under `AuthKind::None` or `AuthKind::Password` there is no such key, and
+the channel is then **encrypted but not authenticated**: it defeats a
+passive observer, not an active man in the middle. That is a real limit of
+those modes and is stated as one rather than implied away.
+
+Because the offer is per connection and thrown away with it, recording a
+session and later stealing the server's long-term key still does not
+decrypt it - that key only ever signs, never encrypts.
+
 ## 2. Serialization
 
 Payloads are encoded with [bincode](https://docs.rs/bincode) v2, using
-`bincode::config::standard()`:
+its standard configuration:
 
 - **Little-endian** integers.
 - **Variable-length integer encoding** ("varint"): for an unsigned
@@ -95,12 +358,12 @@ Payloads are encoded with [bincode](https://docs.rs/bincode) v2, using
   enum in this protocol, since none has anywhere near 251 variants),
   followed by that variant's fields in declaration order. There is no
   variant name on the wire.
-- **`Option<T>`**: one byte, `0` for `None` or `1` for `Some`, followed by
+- **`optional<T>`**: one byte, `0` for absent or `1` for present, followed by
   the encoded `T` if `Some`.
-- **`String`, `Vec<T>`, `Vec<u8>`**: a varint-encoded length (element/byte
+- **`string`, `list<T>`, `bytes`**: a varint-encoded length (element/byte
   count, not byte-length-of-encoding), followed by the encoded elements
   (raw UTF-8 bytes for `String`/byte strings; each element's own encoding,
-  concatenated, for `Vec<T>`).
+  concatenated, for `list<T>`).
 - **Structs and tuples**: fields encoded in declaration order, back to
   back, with no field names, type tags, or padding on the wire.
 
@@ -113,15 +376,13 @@ variant-index-for-variant-index. Reordering, adding, or removing a field
 or enum variant changes the wire format and breaks compatibility with any
 peer built from the old definitions - see §9.
 
-Reference implementation: `proto::encode`, `proto::decode`,
-`proto::bincode_config`.
 
 ## 3. Domain types
 
 These are referenced throughout the message definitions below.
 
-```rust
-struct UserId(pub u64);
+```
+UserId = u64
 ```
 Server-assigned on a successful `Identify` (§5.4), from a simple
 per-server counter (`next_id`, starting at 1, incremented on every
@@ -133,49 +394,43 @@ resets to 1 on a server restart). This is a different thing from the
 holder disconnects (§5.4) - two different clients can be assigned the
 same nickname over time, but never the same live `UserId`.
 
-```rust
-struct UserInfo {
-    id: UserId,
-    name: String,
-    /// DER-encoded RSA SubjectPublicKeyInfo for every `KeyMode` except
-    /// `PqHybrid`, whose identity is four keypairs rather than one - see
-    /// §13, which carries its `PqPublicBundle` opaquely in this same field
-    /// (bincode-encoded) rather than growing the wire shape. Under
-    /// `KeyMode::PerMessage` this is only ever the *bootstrap* key from
-    /// that user's `Identify` (§5.4) - the per-peer keys that supersede it
-    /// for individual relationships are never reflected here, only relayed
-    /// directly via `KeyRotated` (§7.5, §11).
-    public_key_der: Vec<u8>,
-    key_mode: KeyMode,
+```
+UserInfo {
+    id:             UserId
+    name:           string
+    public_key_der: bytes     // see below
+    key_mode:       KeyMode
 }
 ```
 
-```rust
-enum KeyMode {
-    /// `my_key` type `rsa`: a static keypair loaded from a file.
-    Rsa,
-    /// `my_key` type `password`: a static keypair deterministically
-    /// derived from a password (§8.3).
-    Password,
-    /// `my_key` type `none`: a static keypair freshly autogenerated at
-    /// connect time (not loaded, not password-derived), kept for the
-    /// whole session.
-    None,
-    /// `rsa_per_msg`: this user rotates to a fresh, freshly-autogenerated
-    /// RSA keypair *per peer relationship* on every message sent or
-    /// received with that peer, broadcasting each new public half signed
-    /// by the key it replaces. See §11 for the full model - this variant
-    /// is what tells a peer to expect `KeyRotated` messages instead of
-    /// treating `public_key_der` as good forever.
-    PerMessage,
-    /// `pq_hybrid`: a static keybundle loaded from a file, like `Rsa` (not
-    /// rotating like `PerMessage`) - but four keypairs instead of one:
-    /// ML-DSA-87 + a signing-only RSA-4096 for authentication, ML-KEM-1024 +
-    /// a separate encryption-only RSA-4096 for key exchange, wrapping a
-    /// per-message AES-256-GCM key. See §13 for the full model.
-    PqHybrid,
-}
+`public_key_der` is a DER-encoded RSA SubjectPublicKeyInfo for every
+`KeyMode` except `pq_hybrid`, whose identity is a keybundle rather than one
+key - it carries its encoded key bundle in this same field (§13) rather
+than growing the wire shape. Under `rsa_per_msg` this is only ever the
+*bootstrap* key from that user's `Identify` (§5.4): the per-peer keys that
+supersede it are never reflected here, only relayed via `KeyRotated`
+(§7.5, §11). Under `pq_hybrid` likewise, the bundle carries only bootstrap
+encryption keys (§13.10).
+
 ```
+KeyMode = Rsa | Password | None | PerMessage | PqHybrid
+```
+
+The five values name how a client's own `my_key` was obtained, and whether
+it changes:
+
+| value | `my_key` type | key material | changes? |
+|---|---|---|---|
+| `Rsa` | `rsa` | one keypair loaded from a file | no |
+| `Password` | `password` | one keypair derived from a password (§8.3) | no |
+| `None` | `none` | one keypair generated at connect time | no |
+| `PerMessage` | `rsa_per_msg` | a rotating keypair per peer (§11) | every message |
+| `PqHybrid` | `pq_hybrid` | a keybundle loaded from a file (§13) | signing half no, encryption half every message (§13.10) |
+
+`PerMessage` is what tells a peer to expect `KeyRotated` rather than
+treating `public_key_der` as good for the session; `PqHybrid` sends
+`KeyRotated` too, but for its encryption keys only (§13.10). §14 compares
+the four *methods* these five values describe.
 
 `Rsa`, `Password`, `None`, and `PqHybrid` are all "static" for protocol
 purposes - exactly one keybundle for the whole session, no rotation - and
@@ -216,42 +471,35 @@ the keypair (§8.3) - this is a genuine (if small) protocol change: every
 peer must be rebuilt from the same `KeyMode` definition (§9), same as any
 other change to this enum.
 
-```rust
-enum ChannelKind { Public, Private }
+```
+ChannelKind = Public | Private
 
-struct ChannelInfo {
-    name: String,
-    kind: ChannelKind,
-}
+ChannelInfo { name: string, kind: ChannelKind }
 ```
 `Public` channels are advertised to every client via `ChannelList` (§6.3);
 `Private` channels are never advertised - a client must already know the
 exact name to join one.
 
-```rust
-enum AuthKind { None, Password, Rsa }
+```
+AuthKind = None | Password | Rsa
 ```
 What the server requires to authenticate a new connection - see §5.
 
-```rust
-enum AuthResponse {
-    None,
-    Password(String),
-    /// The auth challenge nonce, RSA-OAEP encrypted (§8) with the
-    /// server's public key, in one or more blocks.
-    Rsa { blocks: Vec<Vec<u8>> },
-}
+```
+AuthResponse =
+    | None
+    | Password(string)
+    | Rsa { blocks: list<bytes> }   // the challenge nonce, RSA-OAEP
+                                    // encrypted with the server's key (§8)
 ```
 
-```rust
-struct Envelope {
-    content: Content,
-    /// RSA-OAEP encrypted blocks (§8); concatenating the decryption of
-    /// each block yields the plaintext.
-    blocks: Vec<Vec<u8>>,
+```
+Envelope {
+    content: Content        // Text | FileOffer
+    blocks:  list<bytes>    // what these bytes are depends on the
+                            // recipient's method: N RSA-OAEP blocks
+                            // (§8.1) or one sealed send (§13.3)
 }
-
-enum Content { Text, FileOffer }
 ```
 `Envelope` is the unit of one complete, whole (non-streamed) encrypted
 message body, addressed to exactly one recipient. Voice is never sent as a
@@ -323,8 +571,6 @@ one-shot decision, unlike the stream of chunks that follows it).
   connected elsewhere - then forgets the client's `UserId`/nickname/public
   key entirely.
 
-Reference implementation: `server::handle_connection`,
-`server::client_loop`.
 
 ## 5. Authentication
 
@@ -344,16 +590,19 @@ credential.
 ### 5.2 `AuthKind::Password`
 
 `Hello.challenge` is `None`. The client must respond
-`Auth(AuthResponse::Password(plaintext_password))` - the password is sent
-in cleartext inside the (unencrypted-at-the-frame-level, see §10) TCP
-stream. The server compares it against its configured `--password` value
-using a constant-time comparison (`crypto::constant_time_eq`) to avoid
+`Auth(AuthResponse::Password(plaintext_password))`. The password is
+plaintext *inside the frame*, but the frame itself is sealed (§1.3) - this
+message travels after `SecureChannel`, so it is not on the wire in the
+clear. Note the limit that goes with it: a `--password` server has no
+long-term key to sign its control offer with, so that channel is encrypted
+but unauthenticated (§1.3). The server compares it against its configured `--password` value
+using a constant-time comparison (a constant-time comparison) to avoid
 leaking a timing side-channel about where the strings first differ.
 
 ### 5.3 `AuthKind::Rsa`
 
 `Hello.challenge` is `Some(nonce)`, a fresh 32 random bytes generated per
-connection (`crypto::random_bytes(32)`). The client must:
+connection (32 random bytes). The client must:
 
 1. Encrypt `nonce` with the server's public key (which the client must
    already possess out-of-band, as its configured `server_key` file, see
@@ -371,8 +620,8 @@ started with, without the private key ever crossing the wire.
 
 After a successful `Auth`, the client sends exactly one `Identify`:
 
-```rust
-Identify { display_name: String, public_key_der: Vec<u8>, key_mode: KeyMode }
+```
+Identify { display_name: string, public_key_der: bytes, key_mode: KeyMode }
 ```
 
 `public_key_der` is the client's own DER-encoded RSA public key (its
@@ -380,7 +629,7 @@ Identify { display_name: String, public_key_der: Vec<u8>, key_mode: KeyMode }
 was used for the `server_key` challenge in §5.3, if any) - or, for
 `key_mode == PqHybrid`, a bincode-encoded `PqPublicBundle` instead (§13) -
 other clients
-use this to encrypt messages addressed to this user (§7.1, §7.2, §8).
+use this to encrypt messages addressed to this user (§7.2, §8).
 
 `key_mode` (§3) tells every peer, up front, whether `public_key_der` is
 good for the whole session (`Rsa`/`Password`/`None`) or is only a
@@ -404,7 +653,6 @@ after - the client must reconnect (a new TCP connection, restarting from
 `Hello`) with a different `display_name` to retry. A nickname becomes
 available again as soon as its holder's connection closes (see §4).
 
-Reference implementation: `server::AuthConfig`, `server::Registry::try_register`.
 
 ## 6. Channels
 
@@ -417,16 +665,16 @@ emptied (§6.2).
 
 A channel tab is shown prefixed with an emoji naming its kind at a glance,
 followed by a space before the name: 🌍 for public, 🔒 for private
-(`ui::channel::render_channel_view`).
+(the channel view).
 
 ### 6.1 `JoinChannel { name, kind, password }`
 
-- `name` must pass `validation::channel_name_is_valid`: non-empty, at most
+- `name` must pass the channel-name rule: non-empty, at most
   `CHANNEL_NAME_MAX_LEN` (21) characters, and every character an ASCII
   letter, digit, or `-`. This is enforced identically by the client (a
   per-keystroke guard in the Ctrl+J popup that simply refuses to type an
   invalid character or grow past the cap) and, independently, by the
-  server (`Registry::join_channel`, since the server never trusts the
+  server (the join path, since the server never trusts the
   client) - both call the same `validation` module so the two can't
   silently disagree. A server-side rejection is `ChannelJoinFailed { name,
   reason }`, same as any other failure below.
@@ -447,7 +695,7 @@ followed by a space before the name: 🌍 for public, 🔒 for private
   outbound queue is independent - but the ordering *within* each
   recipient's own stream, described below, is guaranteed):
   - **The new joiner** receives one `UserJoined { channel: name, user: <info> }`
-    per existing member, iterated in `BTreeSet<UserId>` order (ascending
+    per existing member, iterated in ascending-`UserId` order (ascending
     `UserId`, not join order) - this is how the joiner learns every other
     current member's `public_key_der` (§3), needed to encrypt messages to
     them (§8) - followed, last, by exactly one
@@ -458,7 +706,7 @@ followed by a space before the name: 🌍 for public, 🔒 for private
     that point (a private channel is never pre-known via `ChannelList`; a
     public one typed directly into Ctrl+J may not be either), the client
     must create its local channel record on the first `UserJoined` for an
-    unrecognized name, not wait for `Joined` - `ui::UiState::on_user_joined`
+    unrecognized name, not wait for `Joined` - the client
     does this (TB-159); waiting would silently lose the whole snapshot.
   - **Each existing member** receives exactly one
     `UserJoined { channel: name, user: <the new member's UserInfo> }`,
@@ -490,10 +738,10 @@ it's never re-advertised, so a ghost tab has nothing to reconnect it to. A
 **public** channel's tab instead stays, marked `left`: selecting it shows
 a rejoin prompt instead of the normal view (SPEC.md Functionality), and
 the dwell timer (§6's `[`/`]`) won't silently re-join it - only an
-explicit rejoin does. See §7.0.3 for what leaving does to any P2P links
+explicit rejoin does. See §7.1.3 for what leaving does to any P2P links
 that were only justified by that channel's membership.
 
-### 6.3 `ChannelList(Vec<ChannelInfo>)` / `ChannelCreated { channel }`
+### 6.3 `ChannelList(list<ChannelInfo>)` / `ChannelCreated { channel }`
 
 `ChannelList` is sent once, right after `IdentifyResult` (§4) - **public
 channels only**, sorted by name. `ChannelCreated { channel: ChannelInfo }`
@@ -552,17 +800,17 @@ to disk and never sent to anyone but the client that set it (the joiner
 still needs to already know it, out of band, exactly as they need to
 already know the channel's name).
 
-**Format** (`validation::channel_password_is_valid`, enforced identically
+**Format** (the channel-password rule, enforced identically
 client- and server-side, same reasoning as §6.1's name validation): at
 most `CHANNEL_PASSWORD_MAX_LEN` (50) characters, each an ASCII letter,
 digit, or one of `! @ # $ % ^ & * - _ + = . ,`. This applies only when a
 password is being *set* (channel creation) - a join-time guess is never
 format-checked, since any string is a valid attempt, right or wrong, and
-`crypto::constant_time_eq` simply returns false for a malformed one; a
+a constant-time comparison simply returns false for a malformed one; a
 separate "malformed guess" error would be redundant with plain
 `WrongPassword` below.
 
-**Comparison** is constant-time (`crypto::constant_time_eq`, the same
+**Comparison** is constant-time (a constant-time comparison, the same
 function and rationale as §5.2/TB-015's auth credential check), so a
 private channel's password can't be brute-forced by timing.
 
@@ -588,7 +836,7 @@ guess does. A successful join resets that channel's attempt counter for
 the joining address to zero.
 
 Client-side, receiving any `ChannelJoinRejected` opens a dedicated
-password-entry popup (`Mode::ChannelPasswordPopup`) naming the channel and
+password-entry popup (a password-entry popup) naming the channel and
 showing a message for `WrongPassword`/`Banned` (blank for a fresh
 `PasswordRequired`), distinct from the free-text `ChannelJoinFailed`
 popup-less path - letting the user retype and resubmit the same
@@ -607,30 +855,28 @@ Keyed by source IP, not `UserId`: a `UserId` is never reused (§3, TB-020)
 - a client that disconnects and reconnects always gets a brand new one, so
 a ban keyed by `UserId` alone would be trivially bypassed by simply
 reconnecting. The IP is taken from the already-open TCP connection
-(`SocketAddr::ip()`), not anything the client asserts.
+(the connection's source address), not anything the client asserts.
 
-Tracked in server memory only (`Registry::channel_password_attempts`), not
+Tracked in server memory only (the attempt counter), not
 persisted to disk - a server restart clears every ban, the same scope
 tradeoff `AuthConfig`'s in-memory-only session state already makes
 elsewhere in this document.
 
-Reference implementation: `server::Registry::join_channel`, `leave_channel`,
-`unregister`, `channel_list`.
 
 ## 7. Messaging
 
 All message content - text and voice alike - is encrypted **per
 recipient** (see §8 for why no shared/session key is used, and what that
 costs) *and* delivered directly, client to client, over the punched UDP
-link §7.0 establishes. The server is never in this data path at all - not
+link §7.1 establishes. The server is never in this data path at all - not
 as a relay of ciphertext, not even briefly - it only ever helps two
 clients find each other's address in the first place.
 
-### 7.0 Direct peer-to-peer transport
+### 7.1 Direct peer-to-peer transport
 
 Before any message/voice/file content can move between two clients, they
 need a direct UDP path to each other. This section covers how that path
-is found and used; §7.1-§7.6 cover what actually travels over it once
+is found and used; §7.2-§7.6 cover what actually travels over it once
 it exists.
 
 **Trigger**: eager, the moment a client first learns a peer exists at all
@@ -639,7 +885,7 @@ you just joined" and "someone new joined a channel you're in", and
 implicitly covers DMs too, since you can only open one with someone
 you've already learned about this way). Revised from an earlier
 lazy-on-first-send design once testing showed the gap it left: text and
-file sends tolerate a not-yet-`Active` link by queuing (§7.1/§7.6), but
+file sends tolerate a not-yet-`Active` link by queuing (§7.2/§7.6), but
 voice does not (§7.3) - a `Rsa`/`Password`/`None`/`PerMessage` recipient
 whose link is still mid-punch at the exact moment someone starts a
 recording is excluded from it outright, so a purely lazy trigger meant
@@ -654,7 +900,7 @@ send - treats it as an implicit invitation and punches back if it hasn't
 already started its own attempt, so being addressed first works either
 way. A failed *eager* attempt (nobody ever actually tried to reach that
 peer) fails silently - no visible error - since most co-channel members
-are never actually addressed; §7.0.4's visible failure is reserved for a
+are never actually addressed; §7.1's visible failure is reserved for a
 link something was genuinely waiting on.
 
 **1. Candidate gathering** (once per session): each client binds one UDP
@@ -664,12 +910,12 @@ interface with the bound port), and a *server-reflexive* address learned
 via a stateless STUN-Binding-style exchange with the server's own UDP
 socket (bound on the same numeric port as its TCP listener):
 
-```rust
-// client -> server UDP socket, and back - never touches Registry/TCP
-enum RendezvousMessage {
-    BindingRequest  { token: u64 },
-    BindingResponse { token: u64, observed: SocketAddr },
-}
+```
+// client -> server UDP socket and back; never touches the TCP connection
+// or any server state
+RendezvousMessage =
+    | BindingRequest  { token: u64 }
+    | BindingResponse { token: u64, observed: SocketAddr }
 ```
 
 The server echoes back exactly the address the request arrived from -
@@ -682,15 +928,17 @@ server, outbound UDP blocked, ...) proceeds with host candidates alone.
 
 **2. Signaling the peer, over the existing TCP connection**:
 
-```rust
-// client -> server
-RequestPeerLink { peer: UserId, candidates: Vec<SocketAddr>, link_nonce: u64 }
-
-// server -> client (existence-check-only relay, Registry::route_peer_link_request -
-// same shape as §7.5's RotateKey/KeyRotated: an unknown recipient is an Error,
-// nothing else is validated or stored)
-PeerCandidates { from: UserId, candidates: Vec<SocketAddr>, link_nonce: u64 }
 ```
+// client -> server
+RequestPeerLink { peer: UserId, candidates: list<SocketAddr>, link_nonce: u64 }
+
+// server -> client
+PeerCandidates  { from: UserId, candidates: list<SocketAddr>, link_nonce: u64 }
+```
+
+The relay checks only that `peer` is currently connected - an unknown
+recipient is an `Error`, and nothing else is validated or stored. Same
+shape as §7.5's `RotateKey`/`KeyRotated`.
 
 The initiator's own candidates are relayed to the peer; if the peer has
 no link state yet for this sender, it replies in kind with its own
@@ -700,15 +948,14 @@ both sides the other's full candidate list.
 **3. Punching**, entirely direct between the two clients (the server is
 no longer involved at all from this point on):
 
-```rust
-enum PunchDatagram {
-    Ping      { link_nonce: u64 },
-    Pong      { link_nonce: u64 },
-    Keepalive { link_nonce: u64 },
-    Ack       { seq: u32 },
-    Reliable   { seq: u32, payload: Vec<u8> },   // see §7.0.1
-    Unreliable { stream_id: u64, seq: u32, blocks: Vec<Vec<u8>> },
-}
+```
+PunchDatagram =
+    | Ping       { link_nonce: u64 }
+    | Pong       { link_nonce: u64 }
+    | Keepalive  { link_nonce: u64 }
+    | Ack        { seq: u32 }
+    | Reliable   { seq: u32, payload: bytes }              // §7.1.1
+    | Unreliable { stream_id: u64, seq: u32, blocks: list<bytes> }
 ```
 
 Each side sends `Ping{my_own_link_nonce}` to every one of the other's
@@ -730,20 +977,19 @@ through the server - see the top of this document. Once `Active`, an idle
 link gets a `Keepalive` datagram after 15 seconds of no other traffic, to
 keep the NAT/firewall mapping from expiring.
 
-Reference implementation: `src/client/p2p.rs` (`PeerLinkManager`), `src/p2p_proto.rs`.
 
-#### 7.0.1 Reliable delivery over the punched link
+#### 7.1.1 Reliable delivery over the punched link
 
 UDP gives no ordering or delivery guarantee, so text and file content -
 which must arrive complete and in order, unlike voice (§7.3) - get a
-small hand-rolled reliable layer on top (`src/client/p2p_reliable.rs`), carried
+small hand-rolled reliable layer on top, carried
 inside `PunchDatagram::Reliable { seq, payload }`:
 
-- **Sender** (`ArqSender`): assigns an increasing `seq` to each outgoing
+- **Sender** (the sender): assigns an increasing `seq` to each outgoing
   payload, retransmits on a timeout with capped exponential backoff
   (400ms initial, doubling up to 3s), and gives up - failing the link
-  entirely, per §7.0's no-fallback rule - after 10 retries with no ack.
-- **Receiver** (`ArqReceiver`): acks every `Reliable` frame it sees
+  entirely, per §7.1's no-fallback rule - after 10 retries with no ack.
+- **Receiver** (the receiver): acks every `Reliable` frame it sees
   immediately, even a duplicate or an out-of-order one; delivers frames to
   the application in order, buffering ones that arrive ahead of the
   expected sequence (bounded to 64 buffered frames - exceeding that fails
@@ -760,27 +1006,34 @@ governs the old TCP path, not this one). A datagram larger than a path's
 MTU gets IP-fragmented, and plenty of real-world NATs/firewalls drop a
 fragmented UDP datagram outright the moment any one fragment goes missing
 - worse than just keeping every datagram small in the first place.
-`p2p_proto::SAFE_DATAGRAM_BYTES` (1200 bytes) is the target ceiling every
-sender is expected to stay under; `file_transfer::FILE_CHUNK_BYTES` (§7.6)
-and `voice::CHUNK_INTERVAL` (§7.3) are both sized so an RSA-family
+`SAFE_DATAGRAM_BYTES` (1200 bytes) is the target ceiling every
+sender is expected to stay under; `FILE_CHUNK_BYTES` (§7.6)
+and `CHUNK_INTERVAL` (§7.3) are both sized so an RSA-family
 recipient's worst-case ciphertext clears it comfortably. `pq_hybrid` is the
 one content type that can't: see §7.3/§7.6/§13.3 for why its fixed
 per-chunk overhead makes this unavoidable regardless of chunk size.
 
 `payload` (once reassembled) decodes to:
 
-```rust
-enum P2pPayload {
-    Envelope    { channel: Option<String>, envelope: Envelope },       // §7.1/§7.2
-    FileOffer   { channel: Option<String>, stream_id: u64, envelope: Envelope }, // §7.6
-    StreamStart { channel: Option<String>, stream_id: u64 },           // §7.3
-    StreamEnd   { stream_id: u64, duration_ms: u32 },                  // §7.3
-    FileAccept  { stream_id: u64 },                                    // §7.6
-    FileReject  { stream_id: u64 },                                    // §7.6
-    FileChunk   { stream_id: u64, seq: u32, blocks: Vec<Vec<u8>> },    // §7.6
-    FileEnd     { stream_id: u64 },                                    // §7.6
-}
 ```
+P2pPayload =
+    | Envelope       { channel: optional<string>, envelope: Envelope }        // §7.2
+    | FileOffer      { channel: optional<string>, stream_id: u64,
+                       envelope: Envelope }                                  // §7.6
+    | StreamStart    { channel: optional<string>, stream_id: u64 }           // §7.3
+    | StreamKeySetup { stream_id: u64, setup: bytes }                        // §13.3
+    | StreamEnd      { stream_id: u64, duration_ms: u32 }                    // §7.3
+    | FileAccept     { stream_id: u64 }                                      // §7.6
+    | FileReject     { stream_id: u64 }                                      // §7.6
+    | FileChunk      { stream_id: u64, seq: u32, blocks: list<bytes> }       // §7.6
+    | FileEnd        { stream_id: u64 }                                      // §7.6
+```
+
+`StreamKeySetup` carries a `pq_hybrid` stream's `SendSetup` (§13.3),
+reliably and exactly once per recipient, immediately after `StreamStart`
+(and, for a file transfer, immediately after the recipient's
+`FileAccept`). Only `pq_hybrid` recipients ever receive it - an RSA-family
+recipient's chunks need no setup at all.
 
 None of these carry a `to`/`from` - the punched link's own address
 already identifies which peer sent it. `channel: Some(name)` addresses a
@@ -791,10 +1044,10 @@ trusted to only address peers it actually intends to); `None` is a DM.
 Voice chunks (`PunchDatagram::Unreliable`) bypass this layer entirely -
 see §7.3.
 
-#### 7.0.2 Trust boundary: responding only within a shared channel
+#### 7.1.2 Trust boundary: responding only within a shared channel
 
 `RequestPeerLink`/`PeerCandidates` (step 2 above) is an existence-check-only
-relay (`Registry::route_peer_link_request`) - the server checks that `peer`
+relay (the relay) - the server checks that `peer`
 is a currently-connected `UserId` and nothing more, so any registered
 client can address a link request to any other registered `UserId`,
 whether or not the two have ever shared a channel. Left unchecked, this
@@ -802,15 +1055,15 @@ would let a stranger who merely learns someone's `UserId` get that
 person's client to respond to punch traffic at all.
 
 The receiving client closes this gap itself, since the server has no
-membership list left to validate against (§7.1's note above): on an
+membership list left to validate against (§7.2's note above): on an
 incoming `PeerCandidates`, before doing anything else - not even creating
 `PeerLink` state - it checks whether the sender is a member of any channel
-it has actually joined right now (`ui::UiState::shares_a_joined_channel`).
+it has actually joined right now (a shared-channel check).
 A request from someone who isn't is dropped silently, leaving nothing
 behind for a follow-up message to probe.
 
 This check is **not** applied symmetrically to the *initiating* side
-(`PeerLinkManager::ensure_link`) - every call site that proactively opens a
+(the initiating side) - every call site that proactively opens a
 link is already reachable only after legitimate prior contact: the eager
 trigger above fires directly off a `UserJoined` for a shared channel; the
 file-offer accept/reject and key-rotation-install paths only run for a
@@ -819,21 +1072,21 @@ verified rotation. Gating those too would be pure redundancy, and would
 actively break the supported case of still messaging someone in an open DM
 after they've left every channel you shared (SPEC.md's "Offline users").
 
-#### 7.0.3 Tearing down a link once it no longer serves a purpose
+#### 7.1.3 Tearing down a link once it no longer serves a purpose
 
-§7.0.2 gates *forming* a link; this is the mirror image - *tearing one
+§7.1.2 gates *forming* a link; this is the mirror image - *tearing one
 down* once a channel departure could have made it purposeless. A link is
 kept only as long as there's still a reason to reach that peer at all:
-`UiState::has_reason_to_keep_link` is true when either a currently-joined
+the relevance check is true when either a currently-joined
 channel is shared with them, or there's DM history with them (the same bar
 `on_user_offline` already uses to decide whether to keep a departed user
 listed - an *opened but still-empty* DM room does not count).
 
 This is checked at every point a channel departure could tip the balance:
 
-- **Locally, via `/leave`** (§6.2): `channel::handle_leave` runs the check
+- **Locally, via `/leave`** (§6.2): the leave path runs the check
   against every former member of the left channel, right after applying
-  the local state change, forgetting (`PeerLinkManager::forget`) any of
+  the local state change, forgetting (forgetting the link) any of
   them who fail it.
 - **A peer's `UserLeft`** (§6.2): the same check runs against that one
   peer once their membership is updated client-side.
@@ -844,13 +1097,13 @@ relevance check needed. Neither path sends anything over the wire; this
 is purely local bookkeeping; the peer's own client independently reaches
 the same conclusion (or doesn't) about the link from its own side.
 
-### 7.1 Sending a channel or direct text message
+### 7.2 Sending a channel or direct text message
 
 The sender addresses each intended recipient individually - a channel
 send is one independently-encrypted `Envelope` per member, each delivered
 over that member's own punched link, not one message broadcast by a
 relay. There is no `ClientMessage`/`ServerMessage` variant for this
-anymore: it's `P2pPayload::Envelope { channel, envelope }` (§7.0.1), sent
+anymore: it's `P2pPayload::Envelope { channel, envelope }` (§7.1.1), sent
 reliably, queued automatically if the link isn't `Active` yet and flushed
 once it is (text is never dropped just because punching is still in
 progress - contrast with voice, §7.3). `channel: Some(name)` is a channel
@@ -858,14 +1111,12 @@ message; `None` is a DM. A sender is expected to address every other
 current member of the channel itself - there is no server-side membership
 list to expand or validate against anymore.
 
-### 7.2 (folded into §7.1)
-
 ### 7.3 Voice streaming
 
 Voice is never sent as a single whole `Envelope`/`Content` value. Instead
 it's a **Start, then zero or more Chunks, then an End**, sharing one
 `stream_id: u64` for the lifetime of that one recording, all traveling
-directly over the punched link to each recipient (§7.0):
+directly over the punched link to each recipient (§7.1):
 
 ```
 sender                                          recipient
@@ -936,11 +1187,11 @@ this one, and the protocol gives a receiver no way to detect that
 mismatch from the bytes alone.
 
 **Length cap, enforced on both ends independently.** The reference client
-caps one recording at `voice::MAX_RECORDING_SECS` (4 minutes,
-`voice::MAX_RECORDING_SAMPLES` at `SAMPLE_RATE_HZ`): the sending side stops
+caps one recording at `MAX_RECORDING_SECS` (4 minutes,
+`MAX_RECORDING_SAMPLES` at `SAMPLE_RATE_HZ`): the sending side stops
 itself and sends `*End` automatically on reaching it, exactly as if the
 user had released Space/the global shortcut right then
-(`voice_stream::spawn_record_stream_worker`). This is a client-side
+(the sending side). This is a client-side
 courtesy, not a protocol-level limit - the wire format itself places no
 cap on how many chunks a stream may have - so the receiving side enforces
 the identical cap independently rather than trusting the sender to have
@@ -948,7 +1199,7 @@ applied it: the moment an incoming stream's accumulated audio reaches
 `MAX_RECORDING_SAMPLES`, the receiver force-finalizes it with whatever
 arrived so far (exactly as if a real `*End` had arrived) and stops
 processing any further chunks for that `(from, stream_id)`
-(`voice_stream::spawn_stream_decrypt_worker`, `voice::recording_at_max`).
+(the receiving side, the length cap).
 This is defense in depth: a modified or hostile peer that ignores its own
 cap, or simply never sends `*End`, still can't make a receiver accept or
 keep decrypting more than 4 minutes of one voice message.
@@ -969,15 +1220,15 @@ connection.
 Only meaningful between a sender whose own `key_mode == PerMessage`
 (§3, §11) and one specific recipient; unrelated to channel membership.
 
-```rust
+```
 // client -> server
-RotateKey { to: UserId, new_public_key_der: Vec<u8>, signature: Vec<u8> }
+RotateKey  { to: UserId,   new_public_key_der: bytes, signature: bytes }
 
 // server -> client
-KeyRotated { from: UserId, new_public_key_der: Vec<u8>, signature: Vec<u8> }
+KeyRotated { from: UserId, new_public_key_der: bytes, signature: bytes }
 ```
 
-Server-side (`Registry::route_key_rotation`):
+Server-side:
 
 - Rejected (`Error` back to the sender) if `to` is not a currently-connected
   `UserId`, or if the sender's own registered `key_mode` is not
@@ -985,8 +1236,8 @@ Server-side (`Registry::route_key_rotation`):
   business rotating).
 - Otherwise relayed verbatim as `KeyRotated { from: <sender>,
   new_public_key_der, signature }` to `to` - one recipient, no
-  channel/membership involved. Unlike §7.1-§7.3/§7.6, key rotation stays
-  server-relayed rather than moving to the direct link (§7.0) - it's
+  channel/membership involved. Unlike §7.2-§7.3/§7.6, key rotation stays
+  server-relayed rather than moving to the direct link (§7.1) - it's
   small, infrequent identity metadata, not the "content" the direct
   transport exists to keep off the server.
 - The server does **not** verify `signature` - exactly like `Envelope`
@@ -1005,7 +1256,7 @@ connection.
 A file transfer is **consent-gated and streamed**: the receiver must
 explicitly `FileAccept` before a single byte of file data is sent, and once
 accepted the file moves as a live Start/Chunk/End-shaped stream, exactly
-like voice (§7.3) - except reliably (§7.0.1), since a dropped file chunk
+like voice (§7.3) - except reliably (§7.1.1), since a dropped file chunk
 is never an acceptable loss the way a dropped audio frame is. Unlike
 voice, a transfer is always **point-to-point** and every frame in it is
 sent reliably, including the chunks themselves. A channel file send is
@@ -1034,11 +1285,11 @@ sender                                          recipient
 ```
 
 All five (`FileOffer`/`FileAccept`/`FileReject`/`FileChunk`/`FileEnd`) are
-`P2pPayload` variants (§7.0.1) - there is no `ClientMessage`/
+`P2pPayload` variants (§7.1.1) - there is no `ClientMessage`/
 `ServerMessage` counterpart anymore, and no server-side logic for this
 family at all: a link can only exist to a peer the sender already knows
-about (§7.0), so there's nothing left for an "unknown recipient" check to
-do. `channel: Option<String>` on `FileOffer` is purely informational
+about (§7.1), so there's nothing left for an "unknown recipient" check to
+do. `channel: optional<string>` on `FileOffer` is purely informational
 routing metadata for the receiving *client* (which log to eventually show
 the accepted transfer in).
 
@@ -1046,18 +1297,15 @@ the accepted transfer in).
 `Content::FileOffer` and `envelope.blocks` decrypts (§8.1, identical
 RSA-OAEP chunking) to a bincode encoding of:
 
-```rust
-struct FileOfferPayload {
-    filename: String,
-    size: u64,
-}
+```
+FileOfferPayload { filename: string, size: u64 }
 ```
 
 Bundling `filename`/`size` into the encrypted plaintext (rather than
 cleartext fields on `P2pPayload::FileOffer`) keeps them as private as the
 rest of the message - the server never sees any of it at all anymore
 (§10), not even ciphertext size, since the offer travels the direct link
-(§7.0), not the server. Once accepted, the actual file bytes are **never**
+(§7.1), not the server. Once accepted, the actual file bytes are **never**
 wrapped in a struct at all - each `FileChunk`'s `blocks` is the RSA-OAEP (or
 PQ-hybrid, §13) encryption of a raw slice of the file, exactly like voice's
 raw-PCM chunk convention (§7.3's "no content/rate/format field").
@@ -1067,18 +1315,18 @@ than sent as one whole-file `Envelope`, the old reasoning for a size cap
 (fitting one server-relayed frame carrying every recipient's copy under
 `MAX_FRAME_LEN`, §1.1) no longer applies - each `FileChunk` frame is small
 and single-recipient regardless of total file size. The reference client
-reads and encrypts `file_transfer::FILE_CHUNK_BYTES` (512 bytes) of
+reads and encrypts `FILE_CHUNK_BYTES` (512 bytes) of
 plaintext at a time, keeping both sender and receiver memory use bounded to
 roughly one chunk no matter how large the file is; the sender never reads
 any of the file into memory until the recipient's `FileAccept` arrives.
 512 bytes is deliberately small for a *different* reason than the old
 whole-file cap: each `FileChunk` is now one direct-link UDP datagram
-(§7.0), so it's sized to keep worst-case RSA-OAEP ciphertext under
-`p2p_proto::SAFE_DATAGRAM_BYTES` (§7.0.1) rather than to bound memory use
+(§7.1), so it's sized to keep worst-case RSA-OAEP ciphertext under
+`SAFE_DATAGRAM_BYTES` (§7.1.1) rather than to bound memory use
 alone - memory use would be just as bounded at a much larger chunk size.
 
 **Filename length**: the reference client crops `FileOfferPayload.filename`
-to `file_transfer::MAX_FILENAME_CHARS` (230 Unicode scalar values) both
+to `MAX_FILENAME_CHARS` (230 Unicode scalar values) both
 before building the offer (sender) and again on whatever filename actually
 arrives (receiver) - the receiver-side crop is not just defensive
 redundancy, since nothing on the wire stops a modified/hostile peer from
@@ -1092,7 +1340,7 @@ triggers this client's own per-peer rotation for the recipient actually
 reached (§11.3), same as text/voice.
 
 **Where the bytes land**: an accepted file is written straight to
-`file_transfer::default_download_dir()` (`~/.aloo/downloads`) as chunks
+the download directory (`~/.aloo/downloads`) as chunks
 arrive - `safe_filename` (unchanged: reduces a peer-supplied name to just
 its final path component) still guards the on-disk path against a
 maliciously-crafted filename, applied after the length crop above. There is
@@ -1143,7 +1391,7 @@ their decryptions in order:
   the RSA modulus size - 256 bytes for a 2048-bit key, the size this
   app's own keygen produces by default, per `crypto::RSA_KEY_BITS = 2048`
   (512 bytes for `rsa_per_msg`'s 4096-bit keys, per
-  `crypto::RSA_PER_MSG_KEY_BITS` - see §11.9); externally-supplied PEM
+  `RSA_PER_MSG_KEY_BITS` - see §11.9); externally-supplied PEM
   keys, per README's "Generating RSA keys", may use a different size, and
   the protocol itself places no fixed size requirement on keys - two peers
   just need compatible RSA key sizes for whichever DER/PEM keys they
@@ -1155,18 +1403,16 @@ their decryptions in order:
 - An empty plaintext (`data.is_empty()`) still produces exactly one block
   (OAEP-encrypting zero bytes) rather than zero blocks - `blocks` is
   never empty for a validly-encrypted `Envelope`/chunk.
-- `blocks: Vec<Vec<u8>>` on the wire is simply these blocks in order;
+- `blocks: list<bytes>` on the wire is simply these blocks in order;
   decryption is: decrypt each block independently with the recipient's
   RSA private key, then concatenate the plaintexts in the same order.
 
-Reference implementation: `crypto::max_chunk_len`, `encrypt_chunked`,
-`decrypt_chunked`.
 
 ### 8.2 Cost implication for voice
 
 Total RSA work is proportional to bytes of plaintext, **independent of
 how finely that plaintext is chunked** for streaming (§7.3): encrypting
-one 480-byte chunk (`voice::CHUNK_INTERVAL`'s 15ms at 16kHz mono 16-bit)
+one 480-byte chunk (`CHUNK_INTERVAL`'s 15ms at 16kHz mono 16-bit)
 in 3 blocks costs the same total RSA-encrypt work as encrypting the same
 480 bytes as one theoretical un-chunked blob would, modulo OAEP's fixed
 per-block overhead (at most one block worth of padding "waste" per chunk
@@ -1183,7 +1429,7 @@ only ever pays 1× the RSA-decrypt cost for their own copy.
 
 A client's `my_key` (§5.4's `public_key_der`) can be sourced from an RSA
 keypair file, or deterministically derived from a password
-(`crypto::KeyPair::from_password`: PBKDF2-HMAC-SHA256, 100,000 rounds,
+(the password derivation: PBKDF2-HMAC-SHA256, 100,000 rounds,
 fixed non-secret salt, seeding a ChaCha20 CSPRNG that generates the RSA
 keypair) so the same password reproduces the same keypair on any machine.
 This only affects how a client *obtains* the keypair whose public half it
@@ -1196,13 +1442,29 @@ was chosen (`Rsa` vs `Password` vs `None`), but purely as a display label
 for peers to show next to that user's name - it has no bearing on how any
 message is actually encrypted or decrypted.
 
+### 8.4 RSA signatures
+
+There is exactly one RSA signing primitive in this protocol, used in two
+places: authenticating a freshly-rotated `rsa_per_msg` public key with the
+key it replaces (§11.3), and the classical half of a `pq_hybrid` send
+commitment (§13.3).
+
+It is **RSA-PSS with SHA-256 and a random salt**. PSS rather than PKCS#1
+v1.5 because it is the modern scheme with a security proof behind it; v1.5
+survives elsewhere in the world only for backwards compatibility, which
+this protocol explicitly does not want (§9).
+
+Being randomised, signing the same bytes twice produces two different
+signatures. That is not a problem here because nothing ever compares two
+signatures for equality - a signature is only ever verified.
+
 ## 9. Versioning and compatibility
 
 There is no version field anywhere in this protocol - no magic number, no
 schema hash, nothing in `Hello` identifying a protocol revision. Framing
 (§1) is stable and independent of the message schema, but the *payload*
 inside a frame is decoded by assuming a specific, hardcoded Rust type
-(`ClientMessage`/`ServerMessage` as currently defined in `proto.rs`) at
+(`ClientMessage`/`ServerMessage` as currently defined) at
 each point in the exchange. Consequences:
 
 - Two peers must be built from *identical* `ClientMessage`/`ServerMessage`
@@ -1212,7 +1474,7 @@ each point in the exchange. Consequences:
   at best it decodes into semantically wrong data (e.g. reading a `seq`
   field's bytes as part of a `Vec` length), at worst the length/variant
   values it reads are nonsensical and decoding errors out
-  (`ProtoError::Decode`) or a frame length wildly exceeds
+  (a decode error) or a frame length wildly exceeds
   `MAX_FRAME_LEN` and the connection is simply dropped.
 - Adding a *new* enum variant safely requires every peer to update
   together - there's no reserved/unknown-variant fallback.
@@ -1222,11 +1484,14 @@ each point in the exchange. Consequences:
 ## 10. What the server never sees
 
 To restate the core privacy property precisely: the server has visibility
-into exactly the following, and nothing else -
+into exactly the following, and nothing else. Note this is what the
+*server* sees; since §1.3 everything below except the connection metadata
+is sealed on the wire, so a passive observer between the two sees strictly
+less than this list -
 
 - Connection metadata: source address, connection lifetime.
-- Auth material as sent (a `--password`-mode password arrives in
-  cleartext over the TCP stream, though not persisted beyond the
+- Auth material as sent (a `--password`-mode password reaches the server
+  as plaintext inside a sealed frame, though not persisted beyond the
   comparison in §5.2; RSA-mode auth never exposes any private key, only a
   ciphertext of a nonce it already generated itself).
 - Display names and DER-encoded public keys (both inherently
@@ -1236,13 +1501,13 @@ into exactly the following, and nothing else -
   joined/left) - channel *names* for private channels are known to the
   server (it has to route by them) even though they're never advertised
   to other clients via `ChannelList`.
-- **That two specific clients are setting up a direct link** (§7.0): a
+- **That two specific clients are setting up a direct link** (§7.1): a
   `RequestPeerLink`/`PeerCandidates` exchange names both `UserId`s and
   each side's candidate IP:port addresses, and the timing of that
   exchange - so the server can tell *who is about to talk to whom*, and
   roughly when a conversation between two people starts.
 
-Since §7.0, this is now strictly **less** than before: the server used to
+Since §7.1, this is now strictly **less** than before: the server used to
 also see the size (block count) and timing of *every individual*
 message/chunk, because it had to route each one by `UserId`. That's gone
 - once a link is `Active`, every message, voice chunk, and file chunk for
@@ -1295,12 +1560,12 @@ received from that peer (a live voice stream counts as a single message
 for this purpose - see §11.6, not one rotation per chunk). Concretely,
 after either:
 
-- successfully sending a `P2pPayload::Envelope` (§7.0.1) addressed to
+- successfully sending a `P2pPayload::Envelope` (§7.1.1) addressed to
   peer `P`, or
 - successfully decrypting an incoming `P2pPayload::Envelope` from peer
   `P`,
 
-the user generates a brand-new RSA keypair - at `crypto::RSA_PER_MSG_KEY_BITS`
+the user generates a brand-new RSA keypair - at `RSA_PER_MSG_KEY_BITS`
 (4096 bits, larger than the `RSA_KEY_BITS` = 2048 used everywhere else in
 this app - see §11.9), autogenerated in-process via the same OS-RNG path
 as any other freshly-generated `my_key` (§8.3), never shelling out to an
@@ -1314,8 +1579,8 @@ to.0.to_be_bytes() ++ new_public_key_der
 (`to`'s raw `u64` bytes, big-endian, concatenated with the new key's DER
 bytes - not itself re-transmitted since `KeyRotated`'s implicit `to` is
 just "whoever the server delivers it to"), SHA-256-hashed and signed with
-RSA PKCS#1 v1.5 (`Pkcs1v15Sign` + SHA-256) using **the private key this
-rotation is replacing** for peer `P` - i.e. the previous per-peer key if
+RSA-PSS + SHA-256 (the signing primitive (§8.4), the one signing primitive this app has -
+see §8.4) using **the private key this rotation is replacing** for peer `P` - i.e. the previous per-peer key if
 one has already been established for `P`, or the bootstrap private key
 (§11.2) if this is the first rotation for `P`. Binding `to` into the
 signed bytes matters: without it, a rotation signed while the bootstrap
@@ -1363,14 +1628,14 @@ Live voice (§7.3) is not compatible with per-chunk rotation - RSA key
 generation at `rsa_per_msg`'s 4096-bit size (§11.9) is far too slow
 (commonly a few hundred milliseconds, sometimes low seconds - notably
 slower than the 2048-bit keys used everywhere else in this app) to repeat
-every `voice::CHUNK_INTERVAL` (15ms) without stalling capture.
+every `CHUNK_INTERVAL` (15ms) without stalling capture.
 Instead, an entire stream (`*Start` through `*End`) is treated as a
 single message for every purpose in this section:
 
 - Recipient readiness is decided once, at `*Start`: a `PerMessage`
   recipient without a fresh key at that moment is simply left out of the
   stream's recipient list entirely (silently, same as any other
-  partial-delivery case in §7.1) rather than queued - queueing audio for
+  partial-delivery case in §7.2) rather than queued - queueing audio for
   indeterminate later delivery has no sensible playback semantics.
 - Every chunk in the stream is encrypted with the one key snapshot taken
   at `*Start` for each included recipient - no rotation happens mid-stream.
@@ -1392,7 +1657,7 @@ telling a receiver how many messages a sender flushed under one key, so
 a receiver cannot know exactly how long to keep an old key alive.
 
 The reference implementation resolves this with a bounded retention
-window per peer relationship (`rekey::KEY_RETENTION`, currently 8):
+window per peer relationship (`KEY_RETENTION`, currently 8):
 instead of discarding a private key the instant it rotates away from it,
 it keeps the last `KEY_RETENTION` superseded keys for that peer and tries
 them, most-recent-first, whenever the current key fails to decrypt an
@@ -1424,7 +1689,7 @@ Every RSA keypair `rsa_per_msg` ever generates - the bootstrap keypair
 announced in `Identify` (§11.2) and every keypair `rotate_for_peer`
 produces afterward (§11.3) - uses `crypto::RSA_PER_MSG_KEY_BITS = 4096`,
 not the `crypto::RSA_KEY_BITS = 2048` used for a non-rotating
-`Rsa`/`Password`/`None` `my_key` (§8.1). `crypto::KeyPair::generate_with_bits`
+`Rsa`/`Password`/`None` `my_key` (§8.1). key generation
 is the same OS-RNG keygen path either way; only the requested modulus size
 differs. This is a deliberate asymmetry, not an oversight: a non-rotating
 key lives for the whole session, while a `rsa_per_msg` key is often discarded after
@@ -1442,7 +1707,7 @@ structure it differently, but it's worth documenting since getting it
 wrong produces a real, user-visible defect.
 
 §11.9's 4096-bit keygen is too slow (commonly 100ms to low seconds) to
-run inline on `session.rs::run_connected_session`'s single `tokio::select!`
+run inline on `session.rs::run_connected_session`'s single the event loop
 event-loop task, which
 also owns terminal redraw and all other network processing - every
 rotation (`request_rotation_if_per_message`) needs to happen once per
@@ -1456,7 +1721,7 @@ background thread, started once per session, fed a queue of "rotate for
 this peer" requests over an unbounded channel and processing them
 strictly one at a time:
 
-1. Briefly lock `OwnKeys` (shared with the main task via `Arc<Mutex<_>>`)
+1. Briefly lock `OwnKeys` (shared with the main task via shared state)
    just long enough to read the private key to sign against
    (`current_private_for`).
 2. Generate the new keypair and sign it (`generate_and_sign_rotation`) -
@@ -1483,11 +1748,11 @@ acceptable trade, since rotation is background housekeeping, not
 something a human is directly waiting on.
 
 The main task tracks how many requests have been handed to the worker but
-not yet finished with a plain `Arc<AtomicUsize>` (`SessionState::rotation_pending`,
+not yet finished with a plain a shared counter (a pending-rotation count,
 incremented in `request_rotation_if_per_message` before the send, decremented
 by the worker after it finishes processing one). Each UI tick reads this
 counter to drive the top-right spinner described in `docs/SPEC.md`
-Functionality #6 (`UiState::tick_spinner`) - purely a local read of a
+Functionality #6 (the spinner) - purely a local read of a
 count, not a channel round-trip, since the UI only ever needs the current
 value at redraw time.
 
@@ -1542,7 +1807,7 @@ either direction - the human reviewing it decides, the app never guesses.
 ### 12.2 What gets pinned, and what doesn't
 
 **Scope: this section is about byte-comparison pinning only** - the
-`IdStore::check_and_pin` path `session::check_identity` drives, where the
+the pin-and-compare path path the identity check drives, where the
 alarm condition is "these bytes differ from last time". §12.6 adds a second,
 signature-based mechanism over the same store for `PerMessage` peers, whose
 key is *supposed* to differ every time; read both before concluding what is
@@ -1555,7 +1820,7 @@ across two separate connections can be checked - not merely
 | `KeyMode` | Checked? | Why |
 |---|---|---|
 | `Rsa` | yes | `resolve_my_keypair` loads the `public_key_der` from a file (`my_key`'s `file_pub`/`file_priv`) - the same file produces the same key on every connect, for as long as it exists |
-| `Password` | yes | `resolve_my_keypair` re-derives the keypair from the password via `crypto::KeyPair::from_password` (§8.3: PBKDF2 into a deterministic CSPRNG seed) - same password in, same keypair out, every time |
+| `Password` | yes | `resolve_my_keypair` re-derives the keypair from the password via the password derivation (§8.3: PBKDF2 into a deterministic CSPRNG seed) - same password in, same keypair out, every time |
 | `PerMessage` | no — **but see §12.6** | `resolve_my_keypair` autogenerates `PerMessage`'s *bootstrap* keypair fresh, at `RSA_PER_MSG_KEY_BITS`, on every single connect - exactly like `None` below, not like `Rsa`/`Password` above. Nothing persists it between sessions, so the very same legitimate user reconnecting announces a genuinely different bootstrap key every time. Comparing it would flag a false "possible impersonation" on every single reconnect - worse than not checking at all, since a warning that fires constantly for no reason trains a user to dismiss it, including the one time it's real. (The keys `rotate_for_peer`, §11.3, produces *after* the bootstrap key are equally unsuited to comparison, for the same underlying reason - they're supposed to change.) |
 | `None` | no | autogenerated fresh every connect by design (§3) - same reasoning as `PerMessage`'s bootstrap key above, and with no §12.6-style continuity mechanism to fall back on either |
 
@@ -1572,9 +1837,9 @@ document leaves genuinely unprotected - it has neither a stable key to
 compare nor a rotation chain to resume.
 
 **The store pins the full `public_key_der` bytes, not a hash of them** -
-`IdStore::check_and_pin` compares raw DER byte-for-byte, and `IdStore::save`
+the pin-and-compare path compares raw DER byte-for-byte, and saving the store
 persists the complete key (§12.5). A SHA-256 fingerprint
-(`crypto::fingerprint`/`fingerprint_der`) is exactly as reliable for
+(the fingerprint/`fingerprint_der`) is exactly as reliable for
 *detecting* a change - two different real keys colliding to the same
 fingerprint isn't a practical concern - but only the full key lets a user
 actually verify a pinned identity against a `.pub` file handed to them
@@ -1597,21 +1862,21 @@ which is exactly what needs checking - there is no reason to re-check the
 same live connection's key against the store a second time just because
 it happens to be a member of more than one shared channel.
 
-The reference implementation (`session.rs::check_identity`) gates this on
-whether `UserId` is already present in `UiState::known_users` at the
+The reference implementation (the identity check) gates this on
+whether `UserId` is already present in the client's record of connected peers at the
 moment `UserJoined` arrives, which is populated by the very next thing
-that happens to that message (`UiState::on_user_joined`) - so the check
+that happens to that message (the client) - so the check
 runs before the peer is recorded as known, exactly once.
 
 ### 12.4 What happens on a mismatch
 
 If the nickname was already pinned to a public key that doesn't
 byte-for-byte match the one just announced, the client
-(`session.rs::check_identity`) does **not** re-pin or persist anything yet
+(the identity check) does **not** re-pin or persist anything yet
 - unlike §12.2-era behavior, a mismatch no longer writes to `id_store` on
 its own; only an explicit `Accept` does (below). Concretely, `check_identity`
-reads the pinned key with `IdStore::get` (which never mutates) rather than
-calling `IdStore::check_and_pin` (which always would), compares it by hand,
+reads the pinned key with a read of the store (which never mutates) rather than
+calling the pin-and-compare path (which always would), compares it by hand,
 and on a byte difference:
 
 1. Opens (or queues, if another peer's review is already showing - see
@@ -1619,10 +1884,10 @@ and on a byte difference:
    with the message `'alice' connected with a different key than last time
    (was <fp>, now <fp>) - possible impersonation. Accept their new key, or
    reject it.`, where each `<fp>` is a 16-hex-character prefix of
-   `crypto::fingerprint_der` computed on-the-fly from the old and new key
+   the fingerprint computed on-the-fly from the old and new key
    bytes purely for compact display - the fingerprint itself is never
    what's stored or compared (§12.2). Two buttons, `Accept` and `Reject`,
-   are shown; `Reject` is focused by default (`ui::IdentityChoice`) so
+   are shown; `Reject` is focused by default (the review buttons) so
    accepting always takes a deliberate move off the safer default rather
    than an accidental confirm. This is purely a local UI cue, exactly like
    the `rsa_per_msg` regeneration spinner (§11.10) - it has no
@@ -1630,7 +1895,7 @@ and on a byte difference:
 2. Gates messaging with that peer until the popup is resolved (see below) -
    a real behavior change from the passive banner this replaced, which left
    §6-§11 completely unaffected. Specifically, while a peer's review is
-   `Pending` or `Rejected` (`ui::IdentityStatus`):
+   `Pending` or `Rejected` (the review status):
    - This client will not encrypt anything **to** them: excluded from a
      channel message/voice-stream recipient list (the message still
      reaches every other, verified member), and a direct room with them
@@ -1648,7 +1913,7 @@ and on a byte difference:
      green/offline-gray coloring.
 3. On `Accept` (`session.rs::handle_ui_action`'s `AcceptIdentity` arm):
    pins the new key and **saves the store to disk immediately,
-   synchronously** (`IdStore::save`, same as the old immediate-save
+   synchronously** (saving the store, same as the old immediate-save
    policy) - the on-disk file reflects the new pinning the instant the
    decision is made, not batched or deferred. Every message held per
    point 2 is then revealed into the real log, in arrival order, and the
@@ -1683,8 +1948,8 @@ The store is a small flat file, one line per pinned nickname:
 ```
 
 e.g. `alice\t30820122300d06092a864886f70d01010105000382010f00...\n` - the
-full DER bytes, lowercase-hex-encoded (`crypto::hex_encode`, the same
-encoding `crypto::fingerprint` already uses, not base64 or raw bytes) so
+full DER bytes, lowercase-hex-encoded (lowercase hex, the same
+encoding the fingerprint already uses, not base64 or raw bytes) so
 the file stays plain text no matter what the key bytes are. Entries are written in sorted-by-nickname order on save so the
 file diffs cleanly under version control or manual inspection.
 
@@ -1698,13 +1963,13 @@ either delimiter no matter what the underlying bytes are, so any
 DER-encodable key is always storable. A line whose key half fails to
 hex-decode (odd length, non-hex character - e.g. hand-editing damage) is
 skipped on load, same as a line missing the `\t` separator entirely -
-`IdStore::load` never fails the whole store over one bad line.
+loading the store never fails the whole store over one bad line.
 
 The path is set per-connection in the connect popup's `id_store` field
 (`docs/SPEC.md`'s "Not connected UI"), prefilled with `idstore::
 default_path()`'s result - always `~/.aloo/ids_store`
 (`$HOME`/`%USERPROFILE%` joined with `.aloo/ids_store`, via
-`platform::aloo_dir` - `$HOME` preferred, `%USERPROFILE%` as the Windows
+the app directory - `$HOME` preferred, `%USERPROFILE%` as the Windows
 fallback, and a variable that's set but empty treated the same as unset),
 created (including the `.aloo` directory, if missing) the first time
 anything is actually pinned and saved - but freely editable before
@@ -1726,8 +1991,6 @@ refuse a connection outright, since that would make identity pinning less
 safe overall (a user working around a startup failure by disabling the
 feature entirely) rather than more.
 
-Reference implementation: `idstore::IdStore`, `idstore::default_path`,
-`idstore::IdCheck`, `session.rs::check_identity`, `connect.rs::load_id_store`.
 
 ### 12.6 Extending identity pinning to `rsa_per_msg` (`own_next_keys`)
 
@@ -1743,7 +2006,7 @@ client-side persistence and decision logic layered on top of them.
 **The core idea**: reuse the *existing* per-peer rotation chain (§11.3/
 §11.4) as the verification mechanism, but give it something to survive a
 reconnect on. `UserId` resets every connection, so the whole in-session
-chain for a peer relationship - everything `rekey::OwnKeys`/`RemoteKeys`
+chain for a peer relationship - everything the sender's own rotating keys/`RemoteKeys`
 track - dies with the connection today (§11.8's forward secrecy, by
 design). §12.6 persists just enough to *resume* that chain from where it
 left off, once, right after reconnecting - not to extend its lifetime
@@ -1757,11 +2020,11 @@ a reconnect, nicknames are the only stable handle across one):
 
 - **Sending**: this client's own *current* per-peer private key for each
   `rsa_per_msg` relationship it has established, in a new local store,
-  `own_next_keys::OwnNextKeys` - the literal private key `rekey::OwnKeys`
+  the continuity store - the literal private key the sender's own rotating keys
   already holds in memory for that peer, mirrored to disk. Only relevant
   when this session's own `key_mode` is `PerMessage`.
 - **Verifying**: the peer's last-verified rolling public key, pinned in
-  the **same** `idstore::IdStore` that already handles `rsa`/`password`
+  the **same** the identity store that already handles `rsa`/`password`
   (§12.2-§12.5) - reused unchanged, just invoked from a different trigger
   point (§12.6.3) and with different handling of what a "mismatch" means
   (§12.6.4). Relevant regardless of this client's own `key_mode` - you can
@@ -1769,7 +2032,7 @@ a reconnect, nicknames are the only stable handle across one):
   something else entirely.
 
 Only ever the single *current* key on either side - never a history. A
-`rekey::OwnKeys`-style retention buffer (`KEY_RETENTION = 8`, §11.7) exists
+the sender's own rotating keys-style retention buffer (`KEY_RETENTION = 8`, §11.7) exists
 for a completely different reason - tolerating a small in-flight backlog
 of queued messages within one live connection - and has no bearing here:
 once a connection ends, there is no backlog left to bridge, only a single
@@ -1799,7 +2062,7 @@ this connection - via `UserJoined`, the same first-sighting gate
 matching that peer's nickname. If there is one:
 
 1. Installs that persisted private key as the *current* key for the
-   peer's brand-new `UserId` in `rekey::OwnKeys` (`install_rotated_key`'s
+   peer's brand-new `UserId` in the sender's own rotating keys (`install_rotated_key`'s
    existing "no prior state for this peer" branch, unchanged - seeding a
    fresh `UserId` this way is indistinguishable to it from a genuinely
    first-ever rotation).
@@ -1823,13 +2086,13 @@ A receiver's existing `handle_key_rotated` only ever checked an incoming
 `KeyRotated` against whatever key is currently live-registered for the
 sender's `UserId` (§11.4). For a genuine resume, that check necessarily
 fails - a reconnecting peer has a brand-new `UserId` with no live rotation
-state at all yet. `rekey::verify_with_fallback` is the fix: it tries the
+state at all yet. the two-anchor check is the fix: it tries the
 live in-session key first, and only if that fails, tries the sender's
 nickname against `id_store`'s pinned continuity key. Returns which anchor
 (if either) verified it - `Live`, `Resumed`, or `Failed`
-(`rekey::ResumeVerification`) - pure decision logic, no I/O, fully
+(the resume outcome) - pure decision logic, no I/O, fully
 unit-testable independent of the async orchestration around it
-(`test/rekey_test.rs`).
+(covered by the resume tests).
 
 **`Live` alone is not proof of cross-session identity, and must never be
 treated as if it were.** It only says a rotation is self-consistent with
@@ -1846,7 +2109,7 @@ identity is gated the moment it's seen again, **before** any rotation is
 attempted, and only a genuine proof - never mere self-consistency - clears
 that gate:
 
-- `session.rs::check_identity` runs this check itself now, not only
+- the identity check runs this check itself now, not only
   `handle_key_rotated`: the instant a `PerMessage` peer's `UserJoined`
   arrives (§12.3's usual "first time this `UserId` is seen" gate), if
   `id_store` already has a continuity key pinned for their nickname, it
@@ -1860,7 +2123,7 @@ that gate:
   incoming `KeyRotated` does to that gate:
   - `Resumed` - an actual signature verified against the pinned
     continuity key - installs the new key via `install_trusted_rotation`
-    (`UiState::on_user_key_rotated`, refreshes and saves the `id_store`
+    (the client, refreshes and saves the `id_store`
     pin, flushes any messages queued for this peer's key - §11.5) and, if
     `check_identity` had a review open for them, silently resolves it
     exactly as an `Accept` would (held messages included) - genuinely
@@ -1900,7 +2163,7 @@ peer whose review isn't the one currently shown in the popup (a second
 peer's continuity can verify while a first peer's review is still open -
 §12.4's queue), resolving a review removes that specific peer from the
 queue wherever they are, not only when they're at the front
-(`UiState::resolve_identity_accept`/`remove_from_identity_review_queue`).
+(accepting a review/`remove_from_identity_review_queue`).
 
 #### 12.6.4 Why this is a different kind of "mismatch" than §12.2-§12.5
 
@@ -1909,7 +2172,7 @@ is supposed to never change, full stop. Reusing `id_store` here works
 *because* `rsa_per_msg` peers are checked differently: every legitimate
 rotation - whether an ordinary in-session one or a resume - genuinely
 changes the pinned bytes, on purpose, constantly. The byte comparison
-`IdStore::check_and_pin` performs is therefore never itself the alarm
+the pin-and-compare path performs is therefore never itself the alarm
 condition for `PerMessage` peers; it's just bookkeeping, called only once a
 key is already trusted (by an anchor, or by a person via `Accept`) - never
 *before*, the way a bare byte comparison would be. The alarm condition here
@@ -1923,7 +2186,7 @@ continuity" (`Live` while already gated) - neither is something
 which is why `handle_key_rotated` branches on `ResumeVerification` first
 and only *afterward* (on a `Resumed` success) touches `id_store` -
 structurally the same discipline §12.4's `rsa`/`password` path now follows
-too (compare via `IdStore::get` first, only `check_and_pin` on a trusted
+too (compare via a read of the store first, only `check_and_pin` on a trusted
 outcome), even though the two paths reach that outcome differently: §12.4
 needs a human's `Accept`, §12.6.3 can also reach it automatically, but only
 via a genuinely verified `Resumed` - `Live` no longer suffices once a
@@ -1958,11 +2221,85 @@ otherwise-unreadable file behaves exactly as §12.5 describes for
 `id_store` - never blocks connecting, falls back to an empty, in-memory-
 only store for that session instead (`connect.rs::load_own_next_keys`).
 
-Reference implementation: `own_next_keys::OwnNextKeys`,
-`own_next_keys::default_path`, `rekey::verify_with_fallback`,
-`rekey::ResumeVerification`, `idstore::IdStore::get`,
-`session.rs::send_resume_rotation_if_available`,
-`session.rs::persist_own_continuity_key`, `session.rs::handle_key_rotated`.
+
+### 12.7 Making a pin worth more than "these bytes differ"
+
+Everything above can only say that a key changed. It cannot say *why*, and
+the two reasons are not remotely alike: a friend who regenerated their
+keybundle, and a stranger who took their nickname, produce exactly the same
+signal. Asking the user about both is what teaches people to dismiss the
+question - so three mechanisms narrow it. All are client-local; only the
+continuity certificate is wire-visible, and only as an extra field inside a
+`pq_hybrid` bundle.
+
+**Safety phrases.** A 32-byte identity fingerprint renders as eight words
+drawn from a fixed 256-word list. Two people read it to each other over any
+channel they already trust and confirm they see the same thing. Eight words
+is 64 bits - not the full fingerprint, deliberately, because it is what
+someone will actually read aloud; forging a match still means finding a
+second identity colliding in those 64 bits.
+
+The fingerprint covers the identity's *keys* - ML-DSA verifying key, RSA
+signing key, bootstrap encryption keys - and **not** the continuity
+certificate below. Otherwise a certificate would have to sign the
+fingerprint of a bundle that already contained it, and attaching one would
+pointlessly change the phrase every contact had already checked.
+
+**Verified pins.** A pin records how much it is worth:
+
+| | meaning | a mismatch means |
+|---|---|---|
+| `tofu` | believed because it turned up first; nobody checked it | "this differs from whatever arrived first" |
+| `verified` | a human confirmed it out of band | "this differs from what a person checked" |
+
+The store's line format gains a third column (§12.5):
+`nickname<TAB>hex<TAB>tofu|verified`. A store written before the column
+existed loads as `tofu` rather than being discarded - throwing away a
+user's pins would cost real security, not just convenience. Re-pinning
+never silently demotes a `verified` entry.
+
+**Continuity certificates.** A `pq_hybrid` identity generated by
+`aloo --rekey-pq-hybrid <old> <new>` carries, inside its bundle:
+
+```
+ContinuitySig { previous_fp: bytes[32], mldsa_sig: bytes, rsa_sig: bytes }
+
+signed over: "aloo/pq-hybrid/v2/continuity" ++ previous_fp ++ new_fp
+```
+
+signed by the identity being **retired**. A contact who has the old
+identity pinned verifies it and moves the pin across silently, noting it on
+the status line; no review is opened. Producing one requires the old
+private keys, so knowing a fingerprint - which anyone who has met that
+person does - buys nothing. A certificate that names a different
+predecessor, is signed by other keys, or has been lifted onto a different
+successor all fail, and a failure leaves the pin exactly as it was and
+opens the ordinary review. The RSA modes cannot do this at all: they have
+no signing identity separable from the key being replaced.
+
+**Identity cards.** `aloo --export-identity-card <prefix> <nickname>`
+writes a small self-signed file pairing a nickname with an identity:
+
+```
+IdentityCard { nickname: string, bundle: PqPublicBundle, mldsa_sig, rsa_sig }
+
+signed over: "aloo/pq-hybrid/v2/card" ++ len(nickname) ++ nickname ++ fingerprint
+```
+
+Importing one pins that nickname as `verified` **before first contact** -
+the one thing pinning alone can never do, since a first sighting has
+nothing to compare against and is believed by default. The nickname is
+length-prefixed in the commitment so it cannot be shifted into the
+fingerprint.
+
+A card is self-signed, which is precisely what it claims: whoever holds
+these keys asked to be known by this name. What makes it worth trusting is
+the channel it arrived over, not the signature - the signature only ensures
+that what arrived is what was sent.
+
+**What remains open.** None of this authenticates a first contact that
+arrives with no card and no prior pin; that is still trust-on-first-use,
+and the protocol has no way around it without an anchor outside itself.
 
 ## 13. Post-quantum hybrid encryption (`pq_hybrid`)
 
@@ -2010,146 +2347,220 @@ messages are still only as broken as plain RSA-4096 already would be -
 never fully unauthenticated or fully readable from a single primitive's
 failure alone.
 
-### 13.2 Key material: four keypairs, two files
+### 13.2 Key material: an identity that stays, keys that move
 
-One `pq_hybrid` identity is four keypairs, generated together by
-`aloo --keygen-pq-hybrid <prefix>` (there is no `openssl`-equivalent for
-ML-DSA/ML-KEM, unlike `rsa`'s keys - see README.md "Generating PQ-hybrid
-keys"):
+One `pq_hybrid` identity is generated by `aloo --keygen-pq-hybrid <prefix>`
+(there is no `openssl`-equivalent for ML-DSA/ML-KEM, unlike `rsa`'s keys -
+see README.md "Generating PQ-hybrid keys"). It has two halves, and the
+distinction between them is the whole of §13.10:
+
+**The signing half - durable, on disk, pinned by contacts:**
 
 - An ML-DSA-87 signing keypair.
-- A signing-only RSA-4096 keypair - paired with ML-DSA-87 for step 1.
-  **Never** the same keypair as the encryption one below: reusing one RSA
-  key for both PKCS#1v1.5 signing and OAEP encryption is a known
-  cross-protocol anti-pattern.
+- A signing-only RSA-4096 keypair, paired with it. **Never** the same
+  keypair as anything used for encryption: reusing one RSA key for both
+  signing and encryption is a known cross-protocol anti-pattern.
+
+This half never changes. It is what proves a message came from you, what
+`id_store` pins (§13.8), and what signs every key rotation (§13.10).
+
+**The encryption half - rotating, in memory:**
+
 - An ML-KEM-1024 encapsulation/decapsulation keypair.
-- An encryption-only RSA-4096 keypair - paired with ML-KEM-1024 for step 3.
+- An X25519 keypair, paired with it.
+
+Two primitives again, so a break of either alone is not enough. X25519
+rather than RSA-4096 here because this half is regenerated per peer, per
+message, and X25519 keygen is microseconds where RSA-4096's is hundreds of
+milliseconds - the same reason `rsa_per_msg` (§11.9) needs a background
+worker and a carve-out for voice, and this does not. The pairing is the
+same shape as the IETF's X-Wing construction, at a higher ML-KEM parameter
+set.
+
+The keybundle file holds exactly one encryption keypair: the **bootstrap**
+pair, used only until a relationship rotates for the first time. Every key
+after that lives in memory and is destroyed when superseded.
+
+```
+PqPublicBundle  { mldsa_verifying, rsa_sign_public_der, bootstrap_encap }
+PqPrivateBundle { mldsa_signing,   rsa_sign_private_der, bootstrap_decap }
+
+PqEncapKeys { mlkem_encaps, x25519_pub }    // what a peer encrypts to
+PqDecapKeys { mlkem_decaps, x25519_priv }   // the private half
+```
 
 Bundled into exactly two files, mirroring `rsa`'s `file_pub`/`file_priv`
 shape so the connect popup needs no new UI beyond a new `my_key` type
-selection (`docs/SPEC.md`'s "Not connected UI"):
+selection (`docs/SPEC.md`'s "Not connected UI"). Both are plain
+bincode-encoded, written as raw bytes - there is no PEM convention for
+ML-DSA/ML-KEM keys the way there is for RSA. The private bundle file is
+written with `0o600` permissions on unix - the one `my_key` file this app
+itself ever writes to disk.
 
-```rust
-struct PqPublicBundle { mldsa_verifying, rsa_sign_public_der, mlkem_encaps, rsa_enc_public_der }
-struct PqPrivateBundle { mldsa_signing, rsa_sign_private_der, mlkem_decaps, rsa_enc_private_der }
+`public_key_der` in `Identify`/`UserInfo` carries the encoded
+`PqPublicBundle` for this `KeyMode` - reusing the existing field opaquely,
+the same trick already used for `rsa_per_msg`'s resume mechanism (§12.6)
+and file transfer's `FileOfferPayload` convention (§7.6). No wire schema
+change to `Identify` or `UserInfo` at all.
+
+### 13.3 One layout for everything: a setup, then chunks
+
+Every `pq_hybrid` send uses the **same** shape, whatever it carries: a
+per-recipient **setup** that names who the content is for and hands over
+the key, followed by one or more **chunks** encrypted under that key. A
+text message is simply a send whose stream is one chunk long; a voice
+recording is the identical construction with more of them.
+
+```
+SendBinding {
+    recipient_fp: bytes[32],       // SHA-256 of the recipient's public bundle
+    channel:      optional<string>, // Some(name) = channel send, None = DM
+    send_id:      u64,              // sender's per-connection send counter
+}
+
+SendSetup {
+    binding:         SendBinding,
+    kem_ciphertext:  bytes,       // ML-KEM-1024 encapsulation to the recipient
+    wrapped_key:     bytes[32],   // k_data XOR K_wrap
+    eph_x25519_pub:  bytes[32],   // sender's throwaway X25519 key, the classical hedge
+    mldsa_sig:       bytes,       // ML-DSA-87 over the commitment below
+    rsa_sig:         bytes,       // RSA-4096-PSS over the same commitment
+}
+
+HybridSend { setup: SendSetup, ciphertext: bytes }   // a one-chunk send
 ```
 
-Both are plain bincode-encoded structs (`crypto::pq::{save,load}_{public,private}_bundle`),
-written to disk as raw bytes - there is no PEM convention for ML-DSA/ML-KEM
-keys the way there is for RSA. The private bundle file is written with
-`0o600` permissions on unix - the one `my_key` file this app itself ever
-writes to disk (every other type's key file is produced externally, e.g.
-via `openssl`, or never touches disk at all).
+**Sealing a send**, per recipient:
 
-`public_key_der` in `Identify`/`UserInfo` carries `bincode::encode(PqPublicBundle)`
-for this `KeyMode` - reusing the existing field opaquely, the same trick
-already used for `rsa_per_msg`'s resume mechanism (§12.6) and file
-transfer's `FileOfferPayload` convention (§7.6). No wire schema change to
-`Identify` or `UserInfo` at all.
+1. Generate a fresh random 32-byte `k_data`.
+2. Build the `SendBinding` for this recipient.
+3. Wrap `k_data`: ML-KEM-1024-encapsulate to the recipient's `mlkem_encaps`
+   key, and separately do an X25519 exchange between a **throwaway
+   keypair generated for this send** and their X25519 key; combine both
+   into a one-time
+   `K_wrap = HKDF-SHA256(kem_shared ++ x25519_shared, "aloo/pq-hybrid/v2/key-wrap")`;
+   ship `k_data XOR K_wrap` alongside the throwaway public key. Recovering
+   `k_data` needs **both** halves - a break of ML-KEM-1024 alone, or
+   X25519 alone, is not enough. The sender keeps no part of the throwaway
+   keypair, so it contributes forward secrecy of its own on top of the
+   recipient's rotation (§13.10).
+4. Sign the **commitment**
+   `"aloo/pq-hybrid/v2/send" ++ encode(binding) ++ k_data`
+   with both the ML-DSA-87 and RSA-4096-PSS signing keys. Encoding the
+   binding with length-prefixed fields is what keeps two different
+   bindings from ever producing the same commitment bytes.
+5. Encrypt each chunk with AES-256-GCM under `k_data`, nonce
+   `send_id (8 bytes, big-endian) ++ seq (4 bytes, big-endian)`. The nonce
+   needs no randomness because `k_data` is fresh per send, so `(send_id,
+   seq)` never repeats under one key.
 
-### 13.3 Encrypting one message: sign, encrypt once, wrap per recipient
+**What the binding buys.** The signature covers who the send is for, not
+just what it says. Three attacks that the content signature alone did not
+stop:
 
-Given plaintext `data` (a text message, a bincode-encoded `FileOfferPayload`
-for a file *offer*, or raw PCM for one voice chunk - see §13.7 for how
-voice differs, and how an accepted file transfer's chunks reuse that exact
-same per-stream mechanism rather than this one):
+- **Re-wrap for a third party.** A legitimate recipient knows `k_data`, so
+  they could once re-wrap a sender's content for somebody else and pass it
+  off as a message that sender addressed to *them*. Now the commitment
+  names `recipient_fp`, so it only verifies for the recipient it was
+  sealed for. Everyone else fails closed.
+- **Moving a message between rooms.** `channel` binds a send to the room
+  it belongs to, so a private message cannot be replayed into a channel,
+  or the reverse.
+- **Replay onto the same link.** `send_id` must strictly exceed everything
+  already accepted from that peer (§13.4).
 
-**Step 1 - sign** (`crypto::pq::sign_body`): sign `data` with *both* of the
-sender's signing keys.
+`recipient_fp` is an *identity* fingerprint, not a connection one - stable
+across reconnects, unlike a `UserId`. Gaps in `send_id` are ordinary and
+accepted: the counter is per connection rather than per recipient, so a
+channel message addressed to five people consumes one value for all of
+them and a message to somebody else consumes a value this peer never sees.
 
-```rust
-struct SignedBody { data: Vec<u8>, mldsa_sig: Vec<u8>, rsa_sig: Vec<u8> }
-```
+**How the two shapes travel.**
 
-`mldsa_sig` is an ML-DSA-87 signature over `data` (deterministic - no RNG
-involved, unlike ML-DSA-87's optional randomized/"hedged" mode). `rsa_sig`
-is RSA PKCS#1v1.5+SHA-256 over `data` (`crypto::sign`, the same primitive
-`rsa_per_msg` rotation already uses to sign a new key, §11.3). A receiver
-must verify **both** before trusting `data` at all - see §13.4.
+- **Text and file offers** put the whole `HybridSend` - setup and its
+  single chunk - as the one element of `Envelope.blocks`. `Envelope`'s own
+  shape is unchanged; only the *meaning* of `blocks` differs by `KeyMode`.
+- **Voice streams and file transfers** send the `SendSetup` on its own,
+  once, as `P2pPayload::StreamKeySetup` (§7.1.1, reliable), and every
+  chunk after it carries ciphertext only.
 
-**Step 2 - encrypt once** (`crypto::pq::encrypt_hybrid_body`): bincode-encode
-`SignedBody`, then AES-256-GCM-encrypt it **once**, under a freshly random
-32-byte `K_data` and a random 12-byte nonce - regardless of how many
-recipients this send has. This is the one place `pq_hybrid` is cheaper than
-every RSA method: those re-encrypt the *entire* plaintext, per recipient,
-every time (§8); `pq_hybrid` only re-does the cheap step 3 below per
-recipient.
+That split is why a `pq_hybrid` chunk now fits `SAFE_DATAGRAM_BYTES`
+(§7.1.1). Previously the setup was repeated verbatim in *every* chunk -
+several kilobytes of ML-KEM ciphertext, RSA ciphertext and two signatures,
+re-sent every 15ms - which both wasted bandwidth and guaranteed IP
+fragmentation no chunk size could fix. Sent once, the problem disappears.
 
-**Step 3 - wrap `K_data` per recipient** (`crypto::pq::wrap_key_for`), for
-each recipient's `PqPublicBundle`:
+Since voice chunks travel unreliably (§7.3) they can outrun the reliable
+setup they depend on. A receiver therefore **holds** chunks that arrive
+early - bounded, mirroring §7.1.1's own buffering rule - and replays them
+in arrival order the moment the setup verifies. Beyond that bound further
+chunks are dropped rather than buffered without limit. A stream whose
+setup never arrives, or never verifies, decrypts nothing at all: there is
+no key to try.
 
-1. ML-KEM-1024-encapsulate to the recipient's `mlkem_encaps` public key →
-   `(kem_ciphertext, kem_shared)`.
-2. Generate 32 fresh random bytes `rsa_secret`; RSA-OAEP-encrypt it to the
-   recipient's `rsa_enc_public_der` key → `wrapped_key_rsa` (via
-   `crypto::encrypt_chunked`, §8.1 - always exactly one block, since 32
-   bytes is far under a 4096-bit key's OAEP capacity).
-3. Combine: `K_wrap = HKDF-SHA256(ikm = kem_shared ++ rsa_secret, info = "aloo/pq-hybrid/v1/key-wrap")`.
-4. `wrapped_key = K_data XOR K_wrap` - sound because `K_wrap` is single-use,
-   uniformly-random HKDF output (a one-time-pad wrap).
+**Per-recipient cost.** Each recipient of one send gets an independent
+`k_data`, because a setup is bound to one recipient and sharing a key
+across them would mean sharing a binding too. A channel send to N members
+therefore does N seals rather than encrypting once and wrapping N times.
+That is a deliberate trade: it costs one AES pass per recipient (cheap,
+symmetric) to buy the binding property above, and it is still far cheaper
+than the RSA modes, which re-encrypt the *entire plaintext* per recipient
+with public-key crypto (§8).
 
-Recovering `K_data` needs **both** `kem_shared` and `rsa_secret` - a break
-of ML-KEM-1024 alone, or of RSA-4096 alone, is not sufficient (this is the
-concrete meaning of "RSA-4096 as a hedge" for the key-exchange half; §13.4
-covers the signing half's equivalent property).
+### 13.4 Opening a send: unwrap, verify, then check the binding
 
-The resulting per-recipient wire blob:
+Given the recipient's own private bundle and the *sender's* public bundle:
 
-```rust
-struct HybridEnvelope { nonce: [u8; 12], ciphertext: Vec<u8>, kem_ciphertext: Vec<u8>, wrapped_key: [u8; 32], wrapped_key_rsa: Vec<u8> }
-```
+1. X25519-exchange the recipient's own private key with the sender's
+   `eph_x25519_pub`, recovering `x25519_shared`.
+2. ML-KEM-1024-decapsulate `kem_ciphertext` with their `mlkem_decaps`
+   private key, recovering `kem_shared`.
+3. Recompute `K_wrap` (same HKDF as §13.3) and `k_data = wrapped_key XOR K_wrap`.
+4. Recompute the commitment from the binding and `k_data`, and verify
+   **both** `mldsa_sig` against the sender's ML-DSA-87 key **and**
+   `rsa_sig` against their RSA-4096 signing key. Both must pass - a break
+   of one primitive alone must not be enough to forge a send.
+5. Check `binding.recipient_fp` is *our own* fingerprint. This is the step
+   that refuses a send re-wrapped for somebody else.
+6. Decrypt each chunk with AES-256-GCM under `k_data` and its
+   `(send_id, seq)` nonce.
 
-bincode-encoded and placed as the **single element** of `Envelope.blocks`
-(`vec![bincode::encode(hybrid_envelope)]`) - `Envelope`'s own shape (`content`,
-`blocks: Vec<Vec<u8>>`) is completely unchanged; only the *meaning* of
-`blocks` differs by `KeyMode`, exactly as it already does between `Rsa`'s
-N-OAEP-blocks convention and this one-opaque-blob convention.
+Two further checks belong to the receiving client rather than the crypto
+layer, because only it knows the context:
 
-**Accepted tradeoff**: `nonce`/`ciphertext` are identical across every
-recipient of one send (steps 1-2 don't depend on the recipient at all), but
-the wire format still duplicates them inside each recipient's own
-`Envelope` rather than restructuring `per_recipient: Vec<(UserId, Envelope)>`
-to separate shared-from-per-recipient data. Still strictly cheaper than
-every RSA mode's full per-recipient re-encryption; a future protocol
-revision could split it further.
+- **Channel**: `binding.channel` must equal the channel the payload
+  actually arrived on (`None` for a DM).
+- **Replay**: `binding.send_id` must strictly exceed the highest already
+  accepted from that peer. State is kept per live `UserId` and only for the
+  life of the session - deliberately, since a peer who reconnects gets a
+  fresh `UserId` and restarts their counter, and keying this by identity
+  instead would reject everything they sent after reconnecting.
 
-### 13.4 Decrypting: unwrap, then verify both signatures
+Any failure at any step - bad AEAD tag, either signature, a binding naming
+someone else or the wrong room, a replayed `send_id`, malformed bytes -
+drops the message. Fail-closed throughout, mirroring every other
+`KeyMode`'s decrypt failure path: never a partial accept, never a panic.
 
-`crypto::pq::decrypt_hybrid`, given the recipient's own `PqPrivateBundle`
-and the *sender's* `PqPublicBundle`:
+**Which scheme a client uses for an incoming send is decided by that
+client's *own* `key_mode`, never the sender's** - a message addressed to
+you was necessarily encrypted against whichever public key material *you*
+announced, regardless of what `my_key` the sender runs. The sender's
+`key_mode` only matters for knowing the shape of their signing public key
+when verifying.
 
-1. RSA-OAEP-decrypt `wrapped_key_rsa` with the recipient's `rsa_enc`
-   private key → `rsa_secret`.
-2. ML-KEM-1024-decapsulate `kem_ciphertext` with the recipient's `mlkem_decaps`
-   private key → `kem_shared`.
-3. Recompute `K_wrap` (same HKDF as §13.3), `K_data = wrapped_key XOR K_wrap`.
-4. AES-256-GCM-decrypt `ciphertext` with `K_data`/`nonce` → bincode-decode
-   `SignedBody`.
-5. Verify `mldsa_sig` against the sender's `mldsa_verifying` key, **and**
-   `rsa_sig` against the sender's `rsa_sign_public_der` key. Both must
-   succeed.
 
-Any failure at any step (bad AEAD tag, either signature, malformed bytes)
-returns `None` - fail-closed, mirroring every other `KeyMode`'s decrypt
-failure path (`session.rs::decrypt_envelope_for`) - never a partial accept,
-never panics.
+### 13.5 Key size and parameter choices
 
-**Which decryption scheme a client uses for an incoming `Envelope` is
-decided by that client's *own* `own_key_mode`, never the sender's** - a
-message addressed to you was necessarily encrypted against whichever
-public key material *you* announced, regardless of what `my_key` the
-sender themselves runs. `sender.key_mode` only matters for knowing the
-*shape* of their signing public key when verifying.
+The RSA signing key is 4096 bits - the same size `rsa_per_msg` uses
+(§11.9), chosen for the same reason: extra security margin, at the cost of
+slower keygen, paid once at `aloo --keygen-pq-hybrid` time rather than per
+message. It is the only RSA key a `pq_hybrid` identity has; the encryption
+side's classical hedge is X25519 (§13.2), because that half rotates and
+RSA keygen is far too slow to repeat per message.
 
-### 13.5 Key size and modulus choices
-
-Both RSA halves are 4096 bits - the same size `rsa_per_msg` uses (§11.9),
-chosen for the same reason: extra security margin, at the cost of slower
-keygen (paid once, at `aloo --keygen-pq-hybrid` time, not per-message)
-and larger OAEP blocks. ML-DSA-87 and ML-KEM-1024 are each the highest
-security-category parameter set NIST standardized (FIPS 204/203) - the
-whole point of this method is the strongest tier available, not the
-fastest.
+ML-DSA-87 and ML-KEM-1024 are each the highest security-category parameter
+set NIST standardized (FIPS 204/203) - the whole point of this method is
+the strongest tier available, not the fastest.
 
 ### 13.6 Who can send to whom
 
@@ -2158,11 +2569,11 @@ Because step 1 needs the *sender's* ML-DSA-87/RSA-sign identity, and only a
 
 - **A `pq_hybrid` recipient can only be addressed by a `pq_hybrid`
   sender.** A sender whose own `my_key` is `rsa`/`password`/`none`/
-  `rsa_per_msg` has no way to produce a valid `HybridEnvelope` - such a
+  `rsa_per_msg` has no way to produce a valid `SendSetup` signature - such a
   recipient is silently excluded from that sender's channel/DM/file/voice
   send, the same partial-delivery pattern as any other unreachable
   recipient in this app (an offline member, a not-yet-fresh `rsa_per_msg`
-  key, §11.5/§11.6). `keymode_policy::can_address` is the reference
+  key, §11.5/§11.6). the addressing rule is the reference
   implementation of this check.
 - **A `pq_hybrid` sender can still address any non-`pq_hybrid` recipient
   normally** - RSA-OAEP (§8) needs no sender identity at all, so a
@@ -2177,105 +2588,59 @@ members.
 
 ### 13.7 Voice streaming (and file transfer chunks)
 
-`pq_hybrid` voice is not just "supported" but a *better* fit than every
-RSA method: the expensive asymmetric work (ML-DSA-87 sign, ML-KEM-1024
+`pq_hybrid` voice is not just "supported" but a *better* fit than every RSA
+method: the expensive asymmetric work (ML-DSA-87 sign, ML-KEM-1024
 encapsulate, RSA-4096 operations) happens once per stream, not once per
-15ms chunk - unlike `rsa_per_msg`, which has to exempt voice from its
-own per-message rotation entirely because 4096-bit RSA keygen is far too
-slow to repeat every chunk (§11.6).
+15ms chunk - unlike `rsa_per_msg`, which has to exempt voice from its own
+per-message rotation entirely because 4096-bit RSA keygen is far too slow
+to repeat every chunk (§11.6).
 
-That said, `pq_hybrid` is the one content type §7.0.1's
-`SAFE_DATAGRAM_BYTES` budget doesn't reach: `HybridStreamKeySetup`
-(kem_ciphertext + two signatures, §13.3) is several kilobytes on its own
-and is repeated on *every* chunk regardless of `CHUNK_INTERVAL`/
-`FILE_CHUNK_BYTES` - shrinking either just means paying that same fixed
-cost more often, not a smaller datagram. A `pq_hybrid` voice/file chunk
-will IP-fragment on most paths; this is a pre-existing property of this
-section's wire format, not something a chunk-size choice can fix (see
-`docs/TESTING.md`'s known coverage gaps).
+A stream is sealed by exactly the construction §13.3 describes, so there is
+little left to say here that isn't already said there:
 
-Everything in this section is written in terms of voice, but a `pq_hybrid`
-recipient's accepted file transfer (§7.6) reuses the identical mechanism
-for its `FileChunk` stream, unmodified: `data`/`pcm` below is just whatever
-bytes that chunk carries (raw PCM for voice, a raw slice of the file for a
-transfer) - the wrap/sign-once-at-start, repeat-`key_setup`-every-chunk,
-deterministic-nonce-per-`(stream_id, seq)` shape doesn't care which. Only
-`FileOffer` itself (a discrete, one-shot decision, not a stream) uses
-§13.3's whole-message scheme instead.
+- **Once, at record-start** (mirroring the RSA path's "recipients' public
+  keys parsed once at record-start"): one `SendSetup` per `pq_hybrid`
+  recipient, sent as `P2pPayload::StreamKeySetup` (§7.1.1) right after
+  `StreamStart`. For a file transfer the same setup goes out on
+  `FileAccept`, before the first `FileChunk`.
+- **Every chunk** carries ciphertext only - `pcm` (or a raw slice of the
+  file) under AES-256-GCM with the `(send_id, seq)` nonce, where `send_id`
+  is that stream's `stream_id`. Nothing else. §7.3's "`stream_id` is only
+  unique per sender" caveat still applies: a receiver keys everything by
+  `(from, stream_id)`, never `stream_id` alone.
+- **Receiver side**: verify and unwrap the setup once, cache `k_data`, and
+  pay only cheap AES-256-GCM per chunk thereafter. Chunks that arrive
+  before the setup are held (bounded) and replayed in arrival order once it
+  verifies; a stream whose setup never verifies decrypts nothing.
 
-**Once, at record-start** (mirroring the RSA path's "recipients' public
-keys parsed once at record-start", unchanged by this section): for each
-`pq_hybrid` recipient, generate one fresh per-stream `k_data` and, per
-recipient, wrap+sign it:
+Because the setup no longer rides on every chunk, a `pq_hybrid` voice or
+file chunk now fits comfortably under `SAFE_DATAGRAM_BYTES` (§7.1.1) with
+only AES-GCM's own overhead on top of the plaintext - the guaranteed IP
+fragmentation this section used to warn about is gone.
 
-```rust
-struct HybridStreamKeySetup { kem_ciphertext: Vec<u8>, wrapped_key: [u8; 32], wrapped_key_rsa: Vec<u8>, mldsa_sig: Vec<u8>, rsa_sig: Vec<u8> }
-```
-
-The wrap half is identical to §13.3 step 3. The signature half is new: a
-voice stream has no single upfront `data` the way a text/file `Envelope`
-does, so instead of signing `data`, the sender signs
-`stream_id.to_be_bytes() ++ k_data` (`crypto::pq::wrap_key_for_stream`) -
-proving both "this stream's key really came from this identity" and "for
-this specific `stream_id`", so a captured key-setup can't be replayed
-against a different recording. No new `P2pPayload` variant is needed for
-this - `StreamStart` stays unaddressed exactly as §7.3 describes; the
-key-setup travels inside the first chunk instead (next paragraph).
-
-**Every chunk**, for a `pq_hybrid` recipient:
-
-```rust
-struct HybridVoiceChunk { key_setup: HybridStreamKeySetup, ciphertext: Vec<u8> }
-```
-
-bincode-encoded as the single element of that chunk's `blocks` (the
-`per_recipient: Vec<(UserId, Vec<Vec<u8>>)>` shape client-side voice
-fan-out uses to build each recipient's `PunchDatagram::Unreliable` is
-completely unchanged - scheme-agnostic already).
-`ciphertext` is `pcm` encrypted with AES-256-GCM under `k_data` and a
-**deterministic nonce**, `stream_id.to_be_bytes() ++ seq.to_be_bytes()`
-(`crypto::pq::chunk_nonce`) - unique for the life of one stream's `k_data`
-since `(stream_id, seq)` never repeats within one sender's stream (§7.3's
-"stream_id only unique per sender" caveat still applies: a receiver keys
-everything by `(from, stream_id)`, never `stream_id` alone). No fresh OS
-randomness is needed per chunk, only a counter that already exists on the
-wire (`seq`).
-
-`key_setup` is **repeated verbatim in every chunk**, not sent once at
-`*Start` - a deliberate, documented tradeoff: real bandwidth overhead
-(roughly the size of two RSA-4096 ciphertexts plus an ML-KEM-1024
-ciphertext and two signatures, repeated every 15ms) traded for zero
-wire-protocol restructuring of `*Start`/`*Chunk`. Since §7.0's direct
-peer-to-peer transport, this is no longer just a bandwidth tradeoff: it's
-also why a `pq_hybrid` chunk can't fit under `SAFE_DATAGRAM_BYTES`
-(§7.0.1/§13.7) regardless of how small `pcm`/the file slice is. A future
-revision moving it into `*Start` alone would fix both at once.
-
-**Receiver side**: on the *first* chunk seen for a given `(from,
-stream_id)`, recover and authenticate `k_data`
-(`crypto::pq::unwrap_key_for_stream` - unwraps exactly like §13.4 steps
-1-3, then verifies both signatures against the sender's public bundle over
-the reconstructed `stream_id ++ k_data` commitment) and cache it for the
-rest of the stream. Every later chunk only pays for cheap AES-256-GCM
-decrypt - the key-setup's repeated presence is never re-verified or
-re-unwrapped once `k_data` is cached. A failed unwrap/verify on the first
-chunk (bad signature, wrong stream_id, corrupted wrap) means that chunk -
-and every subsequent one, since there is nothing to decrypt them with -
-simply fails to decrypt, the same silent-drop behavior as a corrupted RSA
-chunk.
+Everything here is written in terms of voice, but a `pq_hybrid` recipient's
+accepted file transfer (§7.6) reuses the identical mechanism for its
+`FileChunk` stream, unmodified - the chunk payload is just whatever bytes
+that chunk carries. Only `FileOffer` itself (a discrete, one-shot decision,
+not a stream) travels as a one-chunk send instead.
 
 ### 13.8 Identity pinning
 
-`pq_hybrid` is a static, file-loaded identity - stable across reconnects by
-construction, exactly like `rsa` (a key file) and `password` (a
-deterministic re-derivation). It participates in `id_store`'s ordinary
-byte-comparison pinning unchanged (§12.2's table gains a `PqHybrid: yes`
-row) - `keymode_policy::uses_byte_comparison_pinning` is the single predicate
-`check_identity` now consults, covering exactly `Rsa`/`Password`/`PqHybrid`.
+A `pq_hybrid` *identity* is static and file-loaded - stable across
+reconnects by construction, exactly like `rsa` (a key file) and `password`
+(a deterministic re-derivation). Rotation (§13.10) does not change that:
+what rotates is the encryption half, which is not what gets pinned.
+
+So the bundle participates in `id_store`'s ordinary byte-comparison pinning
+unchanged (§12.2's table gains a `PqHybrid: yes` row) -
+the pinning predicate is the single predicate
+`check_identity` consults, covering exactly `Rsa`/`Password`/`PqHybrid`.
+
 It has **no** need for `rsa_per_msg`'s resume mechanism (§12.6,
 `own_next_keys`) - that machinery exists purely to bridge a bootstrap key
-that changes every reconnect; `pq_hybrid`'s bundle doesn't change at all
-between reconnects, so a plain byte comparison is already definitive.
+that changes every reconnect. A `pq_hybrid` bundle does not change between
+reconnects, so a plain byte comparison is already definitive, and every
+rotation is separately verifiable against that same pinned bundle.
 
 ### 13.9 Client convenience: auto-generated keys and the connect-popup cache
 
@@ -2292,7 +2657,7 @@ running `aloo --keygen-pq-hybrid` externally, and reopening the form -
 real friction for what's this app's default `my_key` type. Two pieces close
 that gap:
 
-**Auto-generation at connect time** (`crypto::pq::ensure_bundle_at`, called
+**Auto-generation at connect time** (the auto-generation step, called
 from `connect.rs::resolve_my_keypair`'s `PqHybrid` arm): if either
 `file_pub` or `file_priv` doesn't exist on disk, a fresh keybundle is
 generated and written to those *exact* paths before loading - whether
@@ -2317,8 +2682,8 @@ the key material, the first time that location is used to connect.
 remembers, per `(host, port)`, the `pq_hybrid` `file_pub`/`file_priv` last
 used to connect there - a flat `host<TAB>port<TAB>file_pub<TAB>file_priv`-
 per-line file, oldest-used first, tolerant of a missing file (first run) or
-a malformed line, the same conventions `idstore::IdStore`/
-`own_next_keys::OwnNextKeys` already use. Every submitted `pq_hybrid`
+a malformed line, the same conventions the identity store/
+the continuity store already use. Every submitted `pq_hybrid`
 connect attempt records/updates its `(host, port)` entry (moving it to
 "most recently used") *before* the connection attempt itself, regardless of
 whether that attempt succeeds - this remembers "the last values used in the
@@ -2336,6 +2701,198 @@ once before the popup is ever shown - not reactively as the user edits
 host/port afterward, the same convention `id_store`/`own_next_keys`/the
 nickname field already use for their own prefills.
 
-Reference implementation: `crypto::pq::ensure_bundle_at`,
-`connect::ConnectCache`, `connect::cache_path`, `connect::random_prefix`,
-`connect::fresh_pq_hybrid_paths_in`, `connect::prefill_connect_defaults`.
+
+### 13.10 Rotating encryption keys (forward secrecy)
+
+A `pq_hybrid` identity's signing half never changes; its **encryption half
+rotates per peer relationship**, once for every message sent to that peer
+and once for every message received from them. Each superseded key is
+destroyed. That is the whole mechanism, and what it buys is this: someone
+who later steals the keybundle file gets your identity, not your history.
+
+The shape is deliberately the one §11 already established for
+`rsa_per_msg` - rotate per message, keep a bounded window of superseded
+keys, count a whole voice stream as one message - so there is one model to
+learn rather than two. What differs:
+
+| | `rsa_per_msg` (§11) | `pq_hybrid` (here) |
+|---|---|---|
+| What rotates | the identity key itself | the encryption keys only |
+| What signs a rotation | the key being replaced | the durable identity |
+| Verifying across a reconnect | needs the §12.6 resume mechanism | nothing special - the verifying key never changed |
+| Keygen cost | RSA-4096: 100ms to seconds | ML-KEM + X25519: microseconds |
+| Scheduling | background worker (§11.10) | inline; no worker, no spinner |
+| Voice | exempt from per-message rotation (§11.6) | not exempt; rotation is cheap |
+
+**Bootstrap.** Before a relationship has rotated even once, a peer
+encrypts to the bootstrap keys from the `PqPublicBundle` they announced.
+Unlike §11.2's bootstrap this one is *signed material from a pinned
+identity*, not trust-on-first-use in its own right - but it is the one
+encryption key the keybundle file holds, so **a first message exchanged
+before either side rotates is not forward-secret**. This is stated plainly
+rather than glossed: forward secrecy begins at the first rotation, which
+is triggered by that very first message.
+
+**Rotating and offering.** A rotation is carried by the existing
+`RotateKey`/`KeyRotated` relay (§7.5), whose opaque fields carry:
+
+```
+PqRotation { encap: PqEncapKeys, generation: u64 }
+
+signature = sign_both(
+    "aloo/pq-hybrid/v2/rotate" ++ to ++ recipient_fp ++ encode(rotation)
+)
+```
+
+signed with the sender's ML-DSA-87 and RSA-4096-PSS keys - the durable
+identity, not the key being replaced. Binding both `to` (the live
+connection) and `recipient_fp` (the durable identity) is what stops one
+peer replaying a rotation as though it had been addressed to them.
+
+The server's only change is which senders it will relay for: both rotating
+modes may, the static ones may not. It still verifies nothing.
+
+**Receiving one.** Verify both signatures against the identity already
+pinned for that peer, check the rotation names us, and refuse any
+`generation` not newer than the last accepted - which stops a captured
+rotation being re-injected to drag a peer back onto a key an attacker has
+since obtained. A rotation that fails any of these is dropped and the
+previously trusted keys are left exactly as they were, so a forged
+rotation can neither strand a relationship nor downgrade it. A successful
+install makes that peer *fresh* again, releasing anything queued for them
+(§11.5's queueing, reused unchanged).
+
+**Retention.** Superseded decryption keys are kept, newest first, up to
+`PQ_KEY_RETENTION` (8) per peer - long enough that a burst flushed under
+one key, or a message already in flight when we rotate, still opens.
+Beyond that they are dropped, and **the bound is the guarantee**: a key
+that falls out of the window is gone, so nothing that survives can reopen
+what it protected. The same reasoning and the same value as §11.7.
+
+When a peer's connection ends, everything remembered for them - their
+current keys, ours for them, their replay counter - is discarded. A later
+connection is a different `UserId` starting over.
+
+**What this does and does not give.** Forward secrecy: yes, bounded by the
+retention window and starting from the first rotation. Post-compromise
+security: only partial. An attacker who steals the *signing* half can sign
+rotations and impersonate the identity indefinitely; recovering from that
+needs a new keybundle and re-pinning, not a ratchet. That gap is real and
+is the one place MLS-style group ratcheting remains stronger.
+
+## 14. The four encryption methods, side by side
+
+Everything above describes mechanisms; this is the summary of what a user
+actually picks between. There are four methods. `KeyMode` (§3) has five
+values because `rsa` has a rotating variant, but `rsa` and `rsa_per_msg`
+are the same method with one property changed - same primitive, same
+per-recipient encryption, same everything except how long a key lives.
+
+| | **plain** (`none`) | **password** | **rsa** (and `rsa_per_msg`) | **pq-hybrid** |
+|---|---|---|---|---|
+| Tag shown | `🚨 PLAIN` | `🚨 PWD` | `🔒 RSA` / `🔒 RSAPM` | `🛡️ PQH` |
+| Where the key comes from | generated at connect | derived from a password (§8.3) | loaded from a file | loaded from a keybundle file |
+| Message encryption | RSA-OAEP per recipient (§8) | same | same | ML-KEM-1024 + X25519 wrap, AES-256-GCM content (§13.3) |
+| Signed by the sender? | no | no | no | yes - ML-DSA-87 **and** RSA-4096-PSS, both must verify |
+| Post-quantum? | no | no | no | yes, key exchange and signatures both |
+| Identity survives a reconnect? | no | yes | yes | yes |
+| Byte-comparison pinning (§12)? | no | yes | `rsa` yes, `rsa_per_msg` no (§12.6) | yes |
+| Forward secrecy? | no | no | `rsa_per_msg` only (§11) | yes (§13.10) |
+| Recipient/room binding, replay protection? | no | no | no | yes (§13.3) |
+| Who can address it? | anyone | anyone | anyone | only another `pq_hybrid` sender (§13.6) |
+
+Reading the table honestly:
+
+- **plain** exists for trying the app out. It encrypts every message for
+  real, but the identity behind it is thrown away at disconnect, so
+  nothing distinguishes a returning contact from a stranger.
+- **password** buys a reproducible identity with nothing to carry around,
+  at the cost that anyone who learns the password *is* you.
+- **rsa** is the conventional choice: a durable key file, pinned by
+  contacts. `rsa_per_msg` adds forward secrecy by rotating the identity
+  key itself, which is why it cannot be pinned by comparison and needs
+  §12.6's resume machinery.
+- **pq-hybrid** is the default and the only one that is post-quantum,
+  signed, bound to its recipient and room, replay-protected, and forward
+  secret at once. Its cost is that it only talks to its own kind (§13.6).
+
+The three RSA-family methods share §8's model entirely; only their key
+*sourcing* and lifetime differ. `pq_hybrid` is a different construction
+throughout, which is why §13 is self-contained rather than a variation on
+§8.
+
+## 15. Sequences
+
+Every flow in one place, for a reader implementing this from scratch.
+Details are in the sections referenced.
+
+**Connecting** (§1.3, §4, §5)
+
+```
+ client                                        server
+   |--- TCP connect --------------------------->|
+   |<-- Hello { auth, challenge, control } -----|   in the clear
+   |--- SecureChannel(accept) ----------------->|   in the clear
+   |=========== everything below is sealed =====|
+   |--- Auth(response) ------------------------>|
+   |<-- AuthResult { ok } ----------------------|
+   |--- Identify { name, key, key_mode } ------>|
+   |<-- IdentifyResult { ok, you } -------------|
+   |<-- ChannelList(public channels) -----------|
+```
+
+**Meeting a peer and opening a direct link** (§7.1)
+
+```
+ alice                    server                     bob
+   |<-- UserJoined(bob) -----|                        |
+   |--- RequestPeerLink ---->|--- PeerCandidates ---->|
+   |<-- PeerCandidates ------|<-- RequestPeerLink ----|
+   |............ Ping / Pong, directly ...............|
+   |=============== link Active ======================|
+```
+
+**Sending text** (§7.2) - one sealed copy per recipient, over each link
+
+```
+ alice                                              bob
+   |--- Envelope { channel, envelope } (reliable) --->|
+```
+
+**Voice** (§7.3, §13.3) - setup once, then unreliable chunks
+
+```
+ alice                                              bob
+   |--- StreamStart { channel, stream_id } ---------->|  reliable
+   |--- StreamKeySetup { stream_id, setup } --------->|  reliable, pq only
+   |--- (chunks) { stream_id, seq, blocks } --------->|  unreliable, repeats
+   |--- StreamEnd { stream_id, duration_ms } -------->|  reliable
+```
+
+**File transfer** (§7.6) - consent first, then the same stream shape
+
+```
+ alice                                              bob
+   |--- FileOffer { channel, stream_id, envelope } -->|
+   |<-- FileAccept { stream_id } ---------------------|   (or FileReject)
+   |--- StreamKeySetup { stream_id, setup } --------->|   pq only
+   |--- FileChunk { stream_id, seq, blocks } -------->|   reliable, repeats
+   |--- FileEnd { stream_id } ----------------------->|
+```
+
+**Rotating a key** (§7.5, §11, §13.10) - relayed, never verified by the server
+
+```
+ alice                    server                     bob
+   |--- RotateKey { to } --->|--- KeyRotated { from } ->|
+```
+
+**Replacing an identity** (§12.7) - no protocol exchange at all
+
+```
+  aloo --rekey-pq-hybrid old new     # signs the new identity with the old
+       |
+       v
+  bob sees a different key, finds a valid certificate from the identity he
+  pinned, moves the pin across, and is not asked anything
+```

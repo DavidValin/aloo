@@ -96,6 +96,22 @@ pub enum P2pPayload {
         channel: Option<String>,
         stream_id: u64,
     },
+    /// The `pq_hybrid` key setup for one stream, sent reliably once per
+    /// recipient right after `StreamStart` - a bincode-encoded
+    /// `crypto::pq::SendSetup`.
+    ///
+    /// Carried on its own rather than inside every chunk: the setup is
+    /// several kilobytes (an ML-KEM ciphertext, an RSA ciphertext and two
+    /// signatures, one of them ML-DSA-87), so repeating it per chunk both
+    /// wasted bandwidth and pushed every chunk past `SAFE_DATAGRAM_BYTES`
+    /// into guaranteed IP fragmentation. Sent once, chunks stay small.
+    ///
+    /// Only `pq_hybrid` recipients ever receive this; an RSA-family
+    /// recipient's chunks need no setup at all.
+    StreamKeySetup {
+        stream_id: u64,
+        setup: Vec<u8>,
+    },
     StreamEnd {
         stream_id: u64,
         duration_ms: u32,

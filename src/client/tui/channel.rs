@@ -236,7 +236,7 @@ impl UiState {
     /// Whether `peer` is a member of any channel `self` has actually
     /// joined (`ChannelTab::joined`, not merely known-about from the
     /// server's list) - the trust boundary a P2P link request must clear
-    /// before this client will respond to it (docs/PROTOCOL.md §7.0.2):
+    /// before this client will respond to it (docs/PROTOCOL.md §7.1.2):
     /// the server's `PeerCandidates` relay performs no relationship
     /// checking of its own (any registered client can name any other
     /// `UserId` as the peer), so this is the only place that boundary is
@@ -253,7 +253,7 @@ impl UiState {
     /// departed user listed (`!log.is_empty()`, not merely "a room was
     /// opened"). Checked the instant a channel departure (ours, via
     /// `/leave`, or theirs, via `UserLeft`) could have made a link
-    /// purposeless (docs/PROTOCOL.md §7.0.3) - unlike `UserOffline`, which
+    /// purposeless (docs/PROTOCOL.md §7.1.3) - unlike `UserOffline`, which
     /// always forgets the link unconditionally since the peer is gone
     /// either way.
     pub fn has_reason_to_keep_link(&self, peer: UserId) -> bool {

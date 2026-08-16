@@ -15,7 +15,6 @@ use std::time::{Duration, Instant};
 use crossterm::event::{Event, KeyCode, KeyModifiers};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use tokio::io::AsyncWrite;
 use tokio::net::TcpStream;
 
 use crate::BoxError;
@@ -26,6 +25,7 @@ use crate::client::idstore;
 use crate::client::netstats;
 use crate::client::own_next_keys;
 use crate::client::p2p::{self, P2pEvent, P2pOutbound, PeerLinkManager};
+use crate::control::ControlSink;
 use crate::p2p_proto::P2pPayload;
 use crate::proto::{
     self, ClientMessage, Content, Envelope, KeyMode, ServerMessage, UserId, UserInfo,
@@ -79,7 +79,7 @@ pub(crate) struct SessionState {
     pub(crate) stream_finished_tx: tokio::sync::mpsc::UnboundedSender<(UserId, u64, u32, Vec<u8>)>,
     pub(crate) audio_err_tx: tokio::sync::mpsc::UnboundedSender<String>,
     /// Whether *this* client's own `my_key` is `rsa_per_msg` - gates
-    /// whether `request_rotation_if_per_message` ever actually does
+    /// whether `request_rotation` ever actually does
     /// anything.
     pub(crate) own_key_mode: KeyMode,
     /// This client's own rotating per-peer keypairs (`rekey::OwnKeys`).
@@ -96,10 +96,29 @@ pub(crate) struct SessionState {
     /// is a static identity (no rotation), so unlike `own_keys` this is
     /// never wrapped for a background rotation worker to touch.
     pub(crate) own_pq_private: Option<crate::crypto::pq::PqPrivateBundle>,
+    /// Our own PQ-hybrid identity fingerprint - what an incoming send's
+    /// binding must name as its recipient for us to accept it at all
+    /// (`crypto::pq::open_setup`). `Some` exactly when `own_pq_private` is.
+    pub(crate) own_pq_fp: Option<[u8; 32]>,
+    /// Our rotating `pq_hybrid` decryption keys, one set per peer
+    /// (`docs/PROTOCOL.md` §13.10). `Some` exactly when `own_pq_private`
+    /// is. Unlike `own_keys` this needs no `Arc<Mutex<_>>`: ML-KEM/X25519
+    /// keygen is fast enough to run inline, so no background worker shares
+    /// it.
+    pub(crate) own_pq_keys: Option<crate::client::pq_rekey::PqOwnKeys>,
+    /// Which `pq_hybrid` encryption keys each peer currently wants us to
+    /// use, and how far along their rotation counter we have seen.
+    pub(crate) pq_peer_keys: crate::client::pq_rekey::PqPeerKeys,
+    /// Where a rotation to send is queued for the main loop to write.
+    /// Shared with `spawn_rotation_worker`, which uses it for the
+    /// `rsa_per_msg` rotations it produces off-thread.
+    pub(crate) rotate_out_tx: tokio::sync::mpsc::UnboundedSender<ClientMessage>,
+    /// Refuses a send that already arrived once - see `replay::ReplayGuard`.
+    pub(crate) replay: crate::client::replay::ReplayGuard,
     /// Freshness/queueing for peers who use `rsa_per_msg`, independent of
     /// our own `key_mode` (PROTOCOL.md §11.5).
     pub(crate) remote_keys: rekey::RemoteKeys,
-    /// Where `request_rotation_if_per_message` sends "please rotate for
+    /// Where `request_rotation` sends "please rotate for
     /// this peer" requests - consumed one at a time by
     /// `spawn_rotation_worker`'s dedicated thread, which is what actually
     /// keeps rotations off the event-loop task.
@@ -167,7 +186,7 @@ pub(crate) struct SessionState {
 /// `install_rotated_key`; the keygen itself runs with no lock held.
 /// `pending` is decremented once a request is handled (success or
 /// failure), pairing with the increment in
-/// `request_rotation_if_per_message` to drive the UI spinner.
+/// `request_rotation` to drive the UI spinner.
 fn spawn_rotation_worker(
     own_keys: Arc<Mutex<rekey::OwnKeys>>,
     out_tx: tokio::sync::mpsc::UnboundedSender<ClientMessage>,
@@ -204,8 +223,8 @@ fn spawn_rotation_worker(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_connected_session(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    mut rd: tokio::io::ReadHalf<TcpStream>,
-    mut wr: tokio::io::WriteHalf<TcpStream>,
+    mut rd: crate::control::ControlReader<tokio::io::ReadHalf<TcpStream>>,
+    mut wr: crate::control::ControlWriter<tokio::io::WriteHalf<TcpStream>>,
     display_name: String,
     you: UserId,
     my_identity: ResolvedIdentity,
@@ -221,7 +240,7 @@ pub(crate) async fn run_connected_session(
     let (net_tx, mut net_rx) = tokio::sync::mpsc::unbounded_channel::<ServerMessage>();
     tokio::spawn(async move {
         loop {
-            match proto::read_message::<_, ServerMessage>(&mut rd).await {
+            match rd.recv::<ServerMessage>().await {
                 Ok(Some(msg)) => {
                     if net_tx.send(msg).is_err() {
                         break;
@@ -280,21 +299,35 @@ pub(crate) async fn run_connected_session(
     // never rotates (it's a static identity, like `Rsa`/`Password`/`None`
     // but with its own separate key material) - see `SessionState::own_keys`/
     // `own_pq_private`.
-    let (own_keys, own_pq_private) = match my_identity {
+    let (own_keys, own_pq_private, own_pq_fp, own_pq_keys) = match my_identity {
         ResolvedIdentity::Rsa(kp) => (
             Some(Arc::new(Mutex::new(rekey::OwnKeys::new(kp.private)))),
             None,
+            None,
+            None,
         ),
-        ResolvedIdentity::Pq { private, .. } => (None, Some(private)),
+        ResolvedIdentity::Pq {
+            private,
+            public_der,
+        } => {
+            let rotating =
+                crate::client::pq_rekey::PqOwnKeys::new(private.bootstrap_decap().clone());
+            (
+                None,
+                Some(private),
+                crate::crypto::pq::fingerprint_of_encoded(&public_der),
+                Some(rotating),
+            )
+        }
     };
     let (rotate_out_tx, mut rotate_out_rx) =
         tokio::sync::mpsc::unbounded_channel::<ClientMessage>();
     let rotation_pending = Arc::new(AtomicUsize::new(0));
     let rotate_request_tx = match &own_keys {
         Some(own_keys) => {
-            spawn_rotation_worker(own_keys.clone(), rotate_out_tx, rotation_pending.clone())
+            spawn_rotation_worker(own_keys.clone(), rotate_out_tx.clone(), rotation_pending.clone())
         }
-        // No worker needed: `request_rotation_if_per_message` only ever
+        // No worker needed: `request_rotation` only ever
         // sends on this channel when `own_key_mode == PerMessage`, which
         // always has `own_keys: Some(_)` above - so for `PqHybrid` (the
         // only case reaching here) nothing is ever sent, and a dropped
@@ -319,6 +352,11 @@ pub(crate) async fn run_connected_session(
         own_key_mode: key_mode,
         own_keys,
         own_pq_private,
+        own_pq_fp,
+        own_pq_keys,
+        pq_peer_keys: crate::client::pq_rekey::PqPeerKeys::new(),
+        rotate_out_tx: rotate_out_tx.clone(),
+        replay: crate::client::replay::ReplayGuard::new(),
         remote_keys: rekey::RemoteKeys::new(),
         rotate_request_tx,
         rotation_pending,
@@ -377,7 +415,7 @@ pub(crate) async fn run_connected_session(
             }
             msg = rotate_out_rx.recv() => {
                 let Some(msg) = msg else { break };
-                proto::write_message(&mut wr, &msg).await?;
+                wr.send_control(&msg).await?;
                 session.conn_stats.record_event(Instant::now());
                 if let ClientMessage::RotateKey { to, .. } = &msg
                     && let Some(nickname) = ui_state.known_users.get(to).map(|u| u.name.clone())
@@ -390,10 +428,10 @@ pub(crate) async fn run_connected_session(
                 if let Some(target) = session.own_stream_targets.remove(&stream_id) {
                     match target {
                         voice_stream::OwnStreamTarget::Channel { channel, recipients } => {
-                            crate::client::channel::on_own_stream_finished(&mut ui_state, &session, you, channel, recipients, stream_id, duration_ms, pcm);
+                            crate::client::channel::on_own_stream_finished(&mut ui_state, &mut session, you, channel, recipients, stream_id, duration_ms, pcm);
                         }
                         voice_stream::OwnStreamTarget::Direct(to) => {
-                            crate::client::direct_message::on_own_stream_finished(&mut ui_state, &session, you, to, stream_id, duration_ms, pcm);
+                            crate::client::direct_message::on_own_stream_finished(&mut ui_state, &mut session, you, to, stream_id, duration_ms, pcm);
                         }
                     }
                 }
@@ -416,7 +454,7 @@ pub(crate) async fn run_connected_session(
                     if was_heard {
                         voice_stream::play_end_chime(&mut session);
                     }
-                    request_rotation_if_per_message(&session, from);
+                    request_rotation(&mut session, from);
                 }
             }
             event = file_events_rx.recv() => {
@@ -510,7 +548,7 @@ pub(crate) async fn run_connected_session(
 
 async fn handle_ui_action(
     action: UiAction,
-    wr: &mut (impl AsyncWrite + Unpin),
+    wr: &mut impl crate::control::ControlSink,
     ui_state: &mut UiState,
     session: &mut SessionState,
 ) -> proto::Result<()> {
@@ -713,7 +751,7 @@ async fn handle_ui_action(
 /// stream uses), spawns the receiving worker, creates the log row, and
 /// tells the sender to start streaming.
 async fn accept_file_offer(
-    wr: &mut (impl AsyncWrite + Unpin),
+    wr: &mut impl crate::control::ControlSink,
     ui_state: &mut UiState,
     session: &mut SessionState,
     from: UserId,
@@ -786,7 +824,7 @@ async fn handle_server_message(
     msg: ServerMessage,
     ui_state: &mut UiState,
     you: UserId,
-    wr: &mut (impl AsyncWrite + Unpin),
+    wr: &mut impl crate::control::ControlSink,
     session: &mut SessionState,
 ) -> proto::Result<Option<UiAction>> {
     // Feeds the header's Conn:<quality> indicator (docs/SPEC.md "Connected
@@ -822,6 +860,19 @@ async fn handle_server_message(
             if user.key_mode == KeyMode::PerMessage {
                 session.remote_keys.track(user.id);
             }
+            // A pq_hybrid peer's bundle carries only their *bootstrap*
+            // encryption keys (§13.10) - what to encrypt to until the
+            // relationship rotates. Recorded here, superseded by the first
+            // `KeyRotated` they send us.
+            if user.key_mode == KeyMode::PqHybrid
+                && let Ok(bundle) =
+                    proto::decode::<crate::crypto::pq::PqPublicBundle>(&user.public_key_der)
+                && let Ok(fingerprint) = crate::crypto::pq::bundle_fingerprint(&bundle)
+            {
+                session
+                    .pq_peer_keys
+                    .bootstrap(user.id, bundle.bootstrap_encap().clone(), fingerprint);
+            }
             // Pin/check identity exactly once per connection - the first
             // time we ever see this UserId, before `on_user_joined` below
             // records it in `known_users` (which is what gates this
@@ -840,7 +891,7 @@ async fn handle_server_message(
                     send_resume_rotation_if_available(session, wr, user.id, &user.name).await?;
                 }
                 // Start punching a direct link the moment we learn this
-                // peer exists rather than at first send (§7.0): voice is
+                // peer exists rather than at first send (§7.1): voice is
                 // never queued, so a link still `Punching` when someone
                 // starts recording excludes that recipient outright. The
                 // gap between learning about a channel-mate and pressing
@@ -856,7 +907,7 @@ async fn handle_server_message(
             ui_state.on_user_left(&channel, user_id);
             // Unlike `UserOffline` below, a `UserLeft` peer may still share
             // another channel with us or have an open DM - only forget the
-            // link once neither is true anymore (docs/PROTOCOL.md §7.0.3).
+            // link once neither is true anymore (docs/PROTOCOL.md §7.1.3).
             if !ui_state.has_reason_to_keep_link(user_id) {
                 session.peer_link.forget(user_id);
             }
@@ -868,6 +919,15 @@ async fn handle_server_message(
             // elsewhere or via an open DM), so this is the one case safe to
             // forget the link unconditionally.
             session.peer_link.forget(user_id);
+            // Their rotating encryption keys, and ours for them, end with
+            // the connection: a later one is a different `UserId` starting
+            // its rotation counter over (§13.10), and the keys we held are
+            // of no further use to anyone - including us.
+            session.pq_peer_keys.forget(user_id);
+            if let Some(own) = session.own_pq_keys.as_mut() {
+                own.forget(user_id);
+            }
+            session.replay.forget(user_id);
         }
         ServerMessage::KeyRotated {
             from,
@@ -890,7 +950,7 @@ async fn handle_server_message(
             candidates,
             link_nonce,
         } => {
-            // Trust boundary (docs/PROTOCOL.md §7.0.2): the server's relay
+            // Trust boundary (docs/PROTOCOL.md §7.1.2): the server's relay
             // performs no relationship checking of its own - any registered
             // client can name any other UserId as `peer`. Only respond to a
             // request from someone we currently share a joined channel
@@ -956,6 +1016,13 @@ fn handle_p2p_event(event: P2pEvent, ui_state: &mut UiState, session: &mut Sessi
             let from_name = name_of(ui_state, from);
             crate::client::direct_message::on_stream_start(ui_state, session, from, from_name, stream_id);
         }
+        P2pEvent::StreamKeySetup {
+            from,
+            stream_id,
+            setup,
+        } => {
+            voice_stream::forward_key_setup(session, from, stream_id, setup);
+        }
         P2pEvent::StreamChunk {
             from,
             stream_id,
@@ -982,6 +1049,16 @@ fn handle_p2p_event(event: P2pEvent, ui_state: &mut UiState, session: &mut Sessi
             if let Some(target) = session.own_file_targets.remove(&stream_id) {
                 let me = ui_state.own_id.unwrap_or(UserId(0));
                 ui_state.set_file_progress(me, stream_id, 0);
+                // A pq_hybrid transfer's setup goes out before its first
+                // chunk, exactly as a voice stream's does after
+                // `StreamStart` - the chunks themselves are ciphertext only.
+                if let voice_stream::DirectStreamKey::Pq(pq) = &target.key {
+                    for (id, setup) in pq.setups() {
+                        session
+                            .peer_link
+                            .send_reliable_or_queue(id, P2pPayload::StreamKeySetup { stream_id, setup });
+                    }
+                }
                 file_transfer::spawn_send_file_worker(
                     target.path,
                     target.key,
@@ -1050,6 +1127,27 @@ fn handle_p2p_event(event: P2pEvent, ui_state: &mut UiState, session: &mut Sessi
 /// for next time regardless of what the user decides - a `Reject` must
 /// leave the old pin untouched until `AcceptIdentity` explicitly re-pins.
 /// `IdStore::get` reads without mutating, so the comparison is by hand.
+/// Whether `user`'s newly announced identity carries a continuity
+/// certificate (§12.7) signed by the one currently pinned for them - i.e.
+/// whether this key change was deliberately made by whoever held the old
+/// keys, rather than being an unexplained substitution.
+///
+/// Only `pq_hybrid` identities can prove this; the RSA modes have no
+/// signing identity separable from the key being replaced, so for them a
+/// changed key is always a question for the user.
+fn continuity_proven(pinned_der: &[u8], user: &UserInfo) -> bool {
+    if user.key_mode != KeyMode::PqHybrid {
+        return false;
+    }
+    let (Ok(pinned), Ok(announced)) = (
+        proto::decode::<crypto::pq::PqPublicBundle>(pinned_der),
+        proto::decode::<crypto::pq::PqPublicBundle>(&user.public_key_der),
+    ) else {
+        return false;
+    };
+    crypto::pq::verify_continuity(&pinned, &announced)
+}
+
 /// A malformed `public_key_der` is silently skipped - this is a local
 /// safety net, not protocol validation.
 fn check_identity(session: &mut SessionState, ui_state: &mut UiState, user: &UserInfo) {
@@ -1081,6 +1179,26 @@ fn check_identity(session: &mut SessionState, ui_state: &mut UiState, user: &Use
                     }
                 }
                 Some(previous) if previous == user.public_key_der.as_slice() => {}
+                // A key change that proves itself is not an alarm. If this
+                // peer's new bundle carries a certificate signed by the
+                // identity we already pinned (§12.7), they deliberately
+                // retired the old keys - move the pin across and say so on
+                // the status line rather than opening a review. Reserving
+                // the review for genuinely unexplained changes is what
+                // keeps it meaningful; one that fires on every legitimate
+                // rekey teaches people to dismiss it.
+                Some(previous) if continuity_proven(previous, user) => {
+                    let name = user.name.clone();
+                    session
+                        .id_store
+                        .check_and_pin(&name, &user.public_key_der);
+                    if let Err(e) = session.id_store.save() {
+                        eprintln!("aloo: failed to save id_store: {e}");
+                    }
+                    ui_state.push_notice(format!(
+                        "{name} moved to a new identity and proved it - pin updated"
+                    ));
+                }
                 Some(previous) => {
                     let previous_public_key_der = previous.to_vec();
                     let message = format!(
@@ -1161,7 +1279,7 @@ fn short_fingerprint(fp: &str) -> &str {
 /// on the next real message.
 async fn send_resume_rotation_if_available(
     session: &mut SessionState,
-    wr: &mut (impl AsyncWrite + Unpin),
+    wr: &mut impl crate::control::ControlSink,
     peer: UserId,
     nickname: &str,
 ) -> proto::Result<()> {
@@ -1192,9 +1310,7 @@ async fn send_resume_rotation_if_available(
         .lock()
         .unwrap()
         .install_rotated_key(peer, private, public_der.clone());
-    proto::write_message(
-        wr,
-        &ClientMessage::RotateKey {
+    wr.send_control(&ClientMessage::RotateKey {
             to: peer,
             new_public_key_der: public_der,
             signature,
@@ -1237,7 +1353,93 @@ fn persist_own_continuity_key(session: &mut SessionState, nickname: &str, peer: 
 /// RSA-4096 keygen off this event-loop task. Increments
 /// `session.rotation_pending` here rather than in the worker on dequeue,
 /// so the spinner reflects the whole queued-plus-in-flight batch.
-pub(crate) fn request_rotation_if_per_message(session: &SessionState, peer: UserId) {
+/// Rotates our `pq_hybrid` encryption keys for `peer` and offers them the
+/// new ones - a no-op unless this session is `PqHybrid`, so callers invoke
+/// it unconditionally after any send or receive, exactly like
+/// `request_rotation` (§13.10).
+///
+/// Unlike that one, this rotates **inline**: ML-KEM-1024 and X25519 keygen
+/// are microseconds, so there is nothing here worth handing to a background
+/// worker, and no spinner to drive. The key it supersedes is dropped the
+/// moment it falls out of the retention window, which is what forward
+/// secrecy actually consists of here.
+/// Installs a `pq_hybrid` peer's offer of fresh encryption keys (§13.10),
+/// having verified it against the identity we already pinned for them.
+///
+/// Dropped silently on a bad signature, a rotation addressed to somebody
+/// else, or a generation we have already moved past - the previously
+/// trusted keys are left exactly as they were, so a forged or replayed
+/// rotation cannot strand a relationship or drag it back onto an older key.
+///
+/// A successful install makes the peer *fresh* again, which releases
+/// anything queued for them while they had no usable key.
+fn handle_pq_key_rotated(
+    ui_state: &mut UiState,
+    session: &mut SessionState,
+    peer: UserId,
+    rotation_bytes: Vec<u8>,
+    signature: Vec<u8>,
+) {
+    let Some(you) = ui_state.own_id else { return };
+    let Some(my_fp) = session.own_pq_fp else { return };
+    let Some(sender_public) = ui_state
+        .known_users
+        .get(&peer)
+        .and_then(|u| proto::decode::<crate::crypto::pq::PqPublicBundle>(&u.public_key_der).ok())
+    else {
+        return;
+    };
+    let Some(rotation) = crate::crypto::pq::verify_rotation(
+        &sender_public,
+        you,
+        &my_fp,
+        &rotation_bytes,
+        &signature,
+    ) else {
+        return;
+    };
+    if session.pq_peer_keys.install(peer, rotation) {
+        session.remote_keys.on_rotated(peer);
+    }
+}
+
+pub(crate) fn request_rotation_if_pq_hybrid(session: &mut SessionState, peer: UserId) {
+    if session.own_key_mode != KeyMode::PqHybrid {
+        return;
+    }
+    let Some(signing) = session.own_pq_private.clone() else {
+        return;
+    };
+    let Some(peer_fp) = session.pq_peer_keys.fingerprint_for(peer) else {
+        return;
+    };
+    let Some(own) = session.own_pq_keys.as_mut() else {
+        return;
+    };
+    let rotation = own.rotate_for(peer);
+    let Ok((encoded, signature)) =
+        crate::crypto::pq::sign_rotation(&signing, peer, &peer_fp, &rotation)
+    else {
+        return;
+    };
+    // Handed to the main loop to write, the same route the rsa_per_msg
+    // worker's rotations take.
+    let _ = session.rotate_out_tx.send(ClientMessage::RotateKey {
+        to: peer,
+        new_public_key_der: encoded,
+        signature,
+    });
+}
+
+/// Rotates our own key material for `peer`, whichever scheme this session
+/// uses - the single trigger every send and receive path calls, so neither
+/// `rsa_per_msg` nor `pq_hybrid` needs its own sprinkling of call sites.
+/// A no-op for the static modes, which have nothing to rotate.
+pub(crate) fn request_rotation(session: &mut SessionState, peer: UserId) {
+    if session.own_key_mode == KeyMode::PqHybrid {
+        request_rotation_if_pq_hybrid(session, peer);
+        return;
+    }
     if session.own_key_mode == KeyMode::PerMessage {
         session.rotation_pending.fetch_add(1, Ordering::SeqCst);
         if session.rotate_request_tx.send(peer).is_err() {
@@ -1277,12 +1479,19 @@ pub(crate) fn request_rotation_if_per_message(session: &SessionState, peer: User
 async fn handle_key_rotated(
     ui_state: &mut UiState,
     you: UserId,
-    wr: &mut (impl AsyncWrite + Unpin),
+    wr: &mut impl crate::control::ControlSink,
     session: &mut SessionState,
     peer: UserId,
     new_public_key_der: Vec<u8>,
     signature: Vec<u8>,
 ) -> proto::Result<()> {
+    // A pq_hybrid peer rotates encryption keys, not identity, and signs
+    // each rotation with the identity we already pinned - so none of the
+    // RSA path's chain-of-custody or §12.6 resume reasoning applies.
+    if ui_state.known_users.get(&peer).map(|u| u.key_mode) == Some(KeyMode::PqHybrid) {
+        handle_pq_key_rotated(ui_state, session, peer, new_public_key_der, signature);
+        return Ok(());
+    }
     let Some(nickname) = ui_state.known_users.get(&peer).map(|u| u.name.clone()) else {
         return Ok(());
     };
@@ -1357,7 +1566,7 @@ async fn handle_key_rotated(
 /// trusting.
 async fn install_trusted_rotation(
     ui_state: &mut UiState,
-    wr: &mut (impl AsyncWrite + Unpin),
+    wr: &mut impl crate::control::ControlSink,
     session: &mut SessionState,
     peer: UserId,
     nickname: &str,
@@ -1393,7 +1602,7 @@ async fn install_trusted_rotation(
             .peer_link
             .send_reliable_or_queue(peer, P2pPayload::Envelope { channel, envelope });
         sent_any = true;
-        request_rotation_if_per_message(session, peer);
+        request_rotation(session, peer);
     }
     if sent_any {
         session.remote_keys.mark_used(peer);
@@ -1414,12 +1623,13 @@ pub(crate) fn decrypt_envelope_for(
     envelope: Envelope,
     from: UserId,
     sender: &UserInfo,
-    session: &SessionState,
+    channel: Option<&str>,
+    session: &mut SessionState,
 ) -> Option<ui::MessageBody> {
     if envelope.content != Content::Text {
         return None;
     }
-    let plaintext = decrypt_own_envelope(&envelope, from, sender, session)?;
+    let plaintext = decrypt_own_envelope(&envelope, from, sender, channel, session)?;
     Some(ui::MessageBody::Text(
         String::from_utf8_lossy(&plaintext).into_owned(),
     ))
@@ -1434,30 +1644,47 @@ fn decrypt_file_offer(
     envelope: &Envelope,
     from: UserId,
     sender: &UserInfo,
-    session: &SessionState,
+    channel: Option<&str>,
+    session: &mut SessionState,
 ) -> Option<crate::client::file_transfer::FileOfferPayload> {
     if envelope.content != Content::FileOffer {
         return None;
     }
-    let plaintext = decrypt_own_envelope(envelope, from, sender, session)?;
+    let plaintext = decrypt_own_envelope(envelope, from, sender, channel, session)?;
     proto::decode(&plaintext).ok()
 }
 
 /// The RSA/PQ dispatch shared by `decrypt_envelope_for` and
 /// `decrypt_file_offer` - decrypts `envelope.blocks` addressed to us,
 /// regardless of `envelope.content` (callers check that themselves first).
+///
+/// The PQ path additionally enforces everything a signature alone can't:
+/// that the send was sealed for *us*, that it arrived where it claims to
+/// belong (`channel`), and that it isn't a replay of one already accepted
+/// from this peer. Any of those failing is an ordinary decrypt failure -
+/// the message is dropped, exactly like a bad AEAD tag.
 fn decrypt_own_envelope(
     envelope: &Envelope,
     from: UserId,
     sender: &UserInfo,
-    session: &SessionState,
+    channel: Option<&str>,
+    session: &mut SessionState,
 ) -> Option<Vec<u8>> {
     if session.own_key_mode == KeyMode::PqHybrid {
-        let my_private = session.own_pq_private.as_ref()?;
+        let my_fp = session.own_pq_fp?;
+        let candidates = session.own_pq_keys.as_ref()?.candidates_for(from);
         let sender_public: crypto::pq::PqPublicBundle =
             proto::decode(&sender.public_key_der).ok()?;
         let blob = envelope.blocks.first()?;
-        crypto::pq::decrypt_hybrid(my_private, &sender_public, blob)
+        let (binding, plaintext) =
+            crypto::pq::open_send(&candidates, &my_fp, &sender_public, blob)?;
+        if binding.channel.as_deref() != channel {
+            return None;
+        }
+        if !session.replay.accept(from, binding.send_id) {
+            return None;
+        }
+        Some(plaintext)
     } else {
         session
             .own_keys
@@ -1467,6 +1694,7 @@ fn decrypt_own_envelope(
             .decrypt_from(from, &envelope.blocks)
     }
 }
+
 
 /// Applies an incoming `FileOffer`: decrypts it, and either holds it
 /// (`Pending`/`Rejected` sender, `docs/PROTOCOL.md` §12 - same "held until
@@ -1485,7 +1713,8 @@ fn handle_incoming_file_offer(
     let Some(sender) = ui_state.known_users.get(&from).cloned() else {
         return;
     };
-    let Some(payload) = decrypt_file_offer(&envelope, from, &sender, session) else {
+    let Some(payload) = decrypt_file_offer(&envelope, from, &sender, channel.as_deref(), session)
+    else {
         return;
     };
     let filename = crate::client::file_transfer::truncate_filename(&payload.filename);

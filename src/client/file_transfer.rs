@@ -253,25 +253,46 @@ pub(crate) fn spawn_receive_file_worker(
         let mut decryptor = ChunkDecryptor::new(key);
         let mut written: u64 = 0;
         let mut failed = false;
+        // One decrypted slice of the file, written and reported. Shared by
+        // chunks decrypted on arrival and any replayed once the setup lands
+        // (a file's chunks are reliable and ordered, so the backlog is
+        // normally empty - but the decryptor's contract is the same either
+        // way).
+        let write_data = |data: Vec<u8>,
+                              file: &mut File,
+                              written: &mut u64,
+                              failed: &mut bool| {
+            if let Err(e) = file.write_all(&data) {
+                eprintln!("aloo: write error saving {}: {e}", dest_path.display());
+                *failed = true;
+                let _ = events_tx.send(FileEvent::ReceiveFailed { from, stream_id });
+                return;
+            }
+            *written += data.len() as u64;
+            let _ = events_tx.send(FileEvent::ReceiveProgress {
+                from,
+                stream_id,
+                bytes: *written,
+            });
+        };
         while let Some(job) = rx.blocking_recv() {
             match job {
+                DecryptJob::KeySetup(blob) => {
+                    if failed {
+                        continue;
+                    }
+                    if let Some(waiting) = decryptor.install_setup(stream_id, &blob) {
+                        for (_, data) in waiting {
+                            write_data(data, &mut file, &mut written, &mut failed);
+                        }
+                    }
+                }
                 DecryptJob::Chunk(seq, blocks) => {
                     if failed {
                         continue;
                     }
                     if let Some(data) = decryptor.decrypt(stream_id, seq, &blocks) {
-                        if let Err(e) = file.write_all(&data) {
-                            eprintln!("aloo: write error saving {}: {e}", dest_path.display());
-                            failed = true;
-                            let _ = events_tx.send(FileEvent::ReceiveFailed { from, stream_id });
-                            continue;
-                        }
-                        written += data.len() as u64;
-                        let _ = events_tx.send(FileEvent::ReceiveProgress {
-                            from,
-                            stream_id,
-                            bytes: written,
-                        });
+                        write_data(data, &mut file, &mut written, &mut failed);
                     }
                 }
                 DecryptJob::End => {

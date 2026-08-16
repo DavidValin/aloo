@@ -84,7 +84,7 @@ fn truncate_filename_counts_unicode_scalar_values_not_bytes() {
 fn file_chunk_bytes_stays_under_the_p2p_safe_datagram_budget() {
     // Worst-case RSA-OAEP expansion (2048-bit key, docs/PROTOCOL.md §8.1)
     // is ~256/190 per chunk. A `FileChunk` now travels as one direct
-    // peer-to-peer UDP datagram (`docs/PROTOCOL.md` §7.0/§7.6), not a
+    // peer-to-peer UDP datagram (`docs/PROTOCOL.md` §7.1/§7.6), not a
     // TCP-relayed frame, so the constraint that actually matters is
     // `p2p_proto::SAFE_DATAGRAM_BYTES`, not the old `proto::MAX_FRAME_LEN`
     // (which a 64 KiB chunk would clear trivially without saying anything

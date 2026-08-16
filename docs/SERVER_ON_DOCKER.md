@@ -69,7 +69,7 @@ docker run -d \
 - `-p 7878:7878/tcp -p 7878:7878/udp` — publish **both** protocols on the
   port aloo listens on: TCP for client connections, and UDP for the
   rendezvous socket clients use to discover their own public address for
-  direct peer-to-peer hole punching (`docs/PROTOCOL.md` §7.0) — a bare
+  direct peer-to-peer hole punching (`docs/PROTOCOL.md` §7.1) — a bare
   `-p 7878:7878` only publishes TCP and silently breaks that discovery
   step (clients still connect and chat fine, but fall back to host
   candidates only, which can't punch across two different NATs). If you

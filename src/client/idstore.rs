@@ -57,11 +57,52 @@ pub enum IdCheck {
     Mismatch { previous_public_key_der: Vec<u8> },
 }
 
+/// How much a pin is actually worth.
+///
+/// The distinction matters because a mismatch means very different things
+/// in each case. On a `Tofu` pin it means "this differs from whatever
+/// turned up first", which is worth a question. On a `Verified` pin it
+/// means "this differs from what a human confirmed out of band", which is
+/// worth a much louder one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Trust {
+    /// Believed because it was the first thing seen under this nickname -
+    /// nobody has checked it against anything.
+    #[default]
+    Tofu,
+    /// Confirmed out of band: a safety phrase compared, or an identity
+    /// card imported.
+    Verified,
+}
+
+impl Trust {
+    fn as_str(self) -> &'static str {
+        match self {
+            Trust::Tofu => "tofu",
+            Trust::Verified => "verified",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "tofu" => Some(Trust::Tofu),
+            "verified" => Some(Trust::Verified),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Entry {
+    key: Vec<u8>,
+    trust: Trust,
+}
+
 /// A nickname -> full-public-key pinning store, backed by a small flat file
-/// (`nickname<TAB><hex-encoded DER>` per line).
+/// (`nickname<TAB><hex-encoded DER><TAB><trust>` per line).
 pub struct IdStore {
     path: PathBuf,
-    entries: HashMap<String, Vec<u8>>,
+    entries: HashMap<String, Entry>,
 }
 
 impl IdStore {
@@ -87,11 +128,21 @@ impl IdStore {
         match fs::read_to_string(path) {
             Ok(contents) => {
                 for line in contents.lines() {
-                    if let Some((name, hex)) = line.split_once('\t')
-                        && is_storable(name)
+                    // The trust column is optional on the way in: a store
+                    // written before it existed is read as trust-on-first-use
+                    // rather than discarded, since throwing away a user's
+                    // pins would lose real security, not just convenience.
+                    let Some((name, rest)) = line.split_once('\t') else {
+                        continue;
+                    };
+                    let (hex, trust) = match rest.split_once('\t') {
+                        Some((hex, trust)) => (hex, Trust::parse(trust).unwrap_or_default()),
+                        None => (rest, Trust::default()),
+                    };
+                    if is_storable(name)
                         && let Some(der) = hex_decode(hex)
                     {
-                        entries.insert(name.to_string(), der);
+                        entries.insert(name.to_string(), Entry { key: der, trust });
                     }
                 }
             }
@@ -113,19 +164,57 @@ impl IdStore {
     /// into this local file. The key itself is stored hex-encoded, which
     /// can't collide with either delimiter.
     pub fn check_and_pin(&mut self, nickname: &str, public_key_der: &[u8]) -> IdCheck {
+        self.check_and_pin_with(nickname, public_key_der, Trust::Tofu)
+    }
+
+    /// `check_and_pin`, saying how much the new pin is worth. Re-pinning an
+    /// already-`Verified` nickname never quietly demotes it to `Tofu`: only
+    /// an explicit `Verified` write, or a fresh nickname, sets the level.
+    pub fn check_and_pin_with(
+        &mut self,
+        nickname: &str,
+        public_key_der: &[u8],
+        trust: Trust,
+    ) -> IdCheck {
         if !is_storable(nickname) {
             return IdCheck::New;
         }
-        match self
-            .entries
-            .insert(nickname.to_string(), public_key_der.to_vec())
-        {
+        let previous = self.entries.get(nickname).cloned();
+        let trust = match (&previous, trust) {
+            (Some(prev), Trust::Tofu) => prev.trust,
+            _ => trust,
+        };
+        self.entries.insert(
+            nickname.to_string(),
+            Entry {
+                key: public_key_der.to_vec(),
+                trust,
+            },
+        );
+        match previous {
             None => IdCheck::New,
-            Some(previous) if previous == public_key_der => IdCheck::Match,
-            Some(previous) => IdCheck::Mismatch {
-                previous_public_key_der: previous,
+            Some(prev) if prev.key == public_key_der => IdCheck::Match,
+            Some(prev) => IdCheck::Mismatch {
+                previous_public_key_der: prev.key,
             },
         }
+    }
+
+    /// Marks what is already pinned for `nickname` as confirmed out of
+    /// band. Returns whether there was anything to mark.
+    pub fn mark_verified(&mut self, nickname: &str) -> bool {
+        match self.entries.get_mut(nickname) {
+            Some(entry) => {
+                entry.trust = Trust::Verified;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// How much `nickname`'s pin is worth, if anything is pinned at all.
+    pub fn trust(&self, nickname: &str) -> Option<Trust> {
+        self.entries.get(nickname).map(|e| e.trust)
     }
 
     /// Reads whatever is currently pinned for `nickname`, without pinning
@@ -134,7 +223,7 @@ impl IdStore {
     /// anchor *before* deciding whether an incoming rotation is legitimate,
     /// which `check_and_pin` alone can't do (it always writes).
     pub fn get(&self, nickname: &str) -> Option<&[u8]> {
-        self.entries.get(nickname).map(|v| v.as_slice())
+        self.entries.get(nickname).map(|e| e.key.as_slice())
     }
 
     /// Persists the current entries to `path`, creating parent directories
@@ -153,9 +242,12 @@ impl IdStore {
         names.sort();
         let mut out = String::new();
         for name in names {
+            let entry = &self.entries[name];
             out.push_str(name);
             out.push('\t');
-            out.push_str(&hex_encode(&self.entries[name]));
+            out.push_str(&hex_encode(&entry.key));
+            out.push('\t');
+            out.push_str(entry.trust.as_str());
             out.push('\n');
         }
         fs::write(&self.path, out)

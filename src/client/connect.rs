@@ -188,8 +188,8 @@ async fn connect_and_handshake(
     request: &ConnectRequest,
 ) -> Result<
     (
-        tokio::io::ReadHalf<TcpStream>,
-        tokio::io::WriteHalf<TcpStream>,
+        crate::control::ControlReader<tokio::io::ReadHalf<TcpStream>>,
+        crate::control::ControlWriter<tokio::io::WriteHalf<TcpStream>>,
         proto::UserId,
         ResolvedIdentity,
         KeyMode,
@@ -206,15 +206,39 @@ async fn connect_and_handshake(
     // resolved address (DNS already settled), not just whatever hostname
     // the user typed.
     let server_addr = stream.peer_addr()?;
-    let (mut rd, mut wr) = tokio::io::split(stream);
+    let (rd, wr) = tokio::io::split(stream);
+    let mut rd = crate::control::ControlReader::new(rd);
+    let mut wr = crate::control::ControlWriter::new(wr);
 
-    let Some(ServerMessage::Hello { auth, challenge }) = proto::read_message(&mut rd).await? else {
+    let Some(ServerMessage::Hello {
+        auth,
+        challenge,
+        control,
+    }) = rd.recv().await?
+    else {
         return Err("server closed the connection during handshake".into());
     };
-    let response = build_auth_response(auth, challenge, &request.server_key)?;
-    proto::write_message(&mut wr, &ClientMessage::Auth(response)).await?;
 
-    let Some(ServerMessage::AuthResult { ok, reason }) = proto::read_message(&mut rd).await? else {
+    // A client that holds the server's public key requires the offer to be
+    // signed by it. An unsigned or wrongly-signed offer from a server we
+    // *can* authenticate is exactly what a man in the middle would send,
+    // so it is refused rather than silently accepted unauthenticated.
+    let server_public = match &request.server_key {
+        ServerKeySelection::Rsa(path) => Some(crypto::load_public_key(path)?),
+        _ => None,
+    };
+    if !crate::control::verify_offer(&control, server_public.as_ref()) {
+        return Err("the server could not prove it is the one this key belongs to".into());
+    }
+    let (accept, keys) = crate::control::accept_offer(&control)?;
+    wr.send(&ClientMessage::SecureChannel(accept)).await?;
+    wr.enable(keys.send);
+    rd.enable(keys.recv);
+
+    let response = build_auth_response(auth, challenge, &request.server_key)?;
+    wr.send(&ClientMessage::Auth(response)).await?;
+
+    let Some(ServerMessage::AuthResult { ok, reason }) = rd.recv().await? else {
         return Err("server closed the connection during authentication".into());
     };
     if !ok {
@@ -225,19 +249,14 @@ async fn connect_and_handshake(
         ResolvedIdentity::Rsa(kp) => crypto::public_key_to_der(&kp.public)?,
         ResolvedIdentity::Pq { public_der, .. } => public_der.clone(),
     };
-    proto::write_message(
-        &mut wr,
-        &ClientMessage::Identify {
-            display_name: request.nickname.clone(),
-            public_key_der,
-            key_mode,
-        },
-    )
+    wr.send(&ClientMessage::Identify {
+        display_name: request.nickname.clone(),
+        public_key_der,
+        key_mode,
+    })
     .await?;
 
-    let Some(ServerMessage::IdentifyResult { ok, you, reason }) =
-        proto::read_message(&mut rd).await?
-    else {
+    let Some(ServerMessage::IdentifyResult { ok, you, reason }) = rd.recv().await? else {
         return Err("server closed the connection during identify".into());
     };
     if !ok {

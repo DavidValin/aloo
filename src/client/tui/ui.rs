@@ -981,6 +981,19 @@ impl UiState {
         self.audio_error = Some(format!("direct connection to {peer_name} failed: {reason}"));
     }
 
+    /// Notes something the user should see but need not act on - currently
+    /// only a peer moving to a new identity and proving it (§12.7), which
+    /// deliberately does *not* open a review.
+    ///
+    /// Shares the banner `recording_failed`/`p2p_link_failed` use rather
+    /// than adding a second transient surface. That banner is already the
+    /// app's one "here is something that just happened" line despite its
+    /// field name, and a note that quietly said nothing would defeat the
+    /// point: the user should know their pin moved, just not be stopped.
+    pub fn push_notice(&mut self, message: String) {
+        self.audio_error = Some(message);
+    }
+
     pub fn set_own_id(&mut self, id: UserId) {
         self.own_id = Some(id);
     }

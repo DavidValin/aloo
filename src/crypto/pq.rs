@@ -1,22 +1,28 @@
-//! ML-DSA-87+RSA4096 (sign) / ML-KEM-1024+RSA4096 (key-wrap) / AES-256-GCM
-//! (bulk) hybrid encryption for `KeyMode::PqHybrid`. See `docs/PROTOCOL.md`
-//! §13 for the full wire-level design; this module is the primitive layer
-//! `session.rs`/`channel.rs`/`direct_message.rs`/`voice_stream.rs` build on.
+//! Post-quantum hybrid encryption for `KeyMode::PqHybrid`: ML-DSA-87 +
+//! RSA-4096 to sign, ML-KEM-1024 + X25519 to share a key, AES-256-GCM to
+//! encrypt. See `docs/PROTOCOL.md` §13 for the wire-level design; this
+//! module is the primitive layer `session.rs`/`channel.rs`/
+//! `direct_message.rs`/`voice_stream.rs` build on.
 //!
 //! Unlike the RSA `my_key` methods (§8: no shared/session key anywhere),
-//! this one *needs* a shared symmetric key per message, so it is
-//! sign-then-encrypt-then-wrap:
+//! this one needs a shared symmetric key per send, so every send is a
+//! **setup plus chunks** - one shape for text, voice, files alike (§13.3):
 //!
-//! 1. Sign `data` with both ML-DSA-87 and RSA-4096 (a signing-only
-//!    keypair, never the encryption one) - receivers must verify **both**.
-//! 2. AES-256-GCM-encrypt the signed bundle **once** with a fresh random
-//!    32-byte `K_data`, regardless of recipient count.
-//! 3. Per recipient: ML-KEM-1024-encapsulate to their KEM key
-//!    (`kem_shared`) and separately RSA-OAEP-encrypt a fresh secret
-//!    (`rsa_secret`) to their encryption RSA-4096 key; combine
-//!    `HKDF-SHA256(kem_shared ++ rsa_secret)` into a one-time `K_wrap` and
-//!    ship `K_data XOR K_wrap`. Recovering `K_data` needs *both* halves -
-//!    a break of ML-KEM-1024 alone, or RSA-4096 alone, isn't enough.
+//! 1. Generate a fresh `k_data` and a `SendBinding` naming who the send is
+//!    for, which room it belongs to, and which send it is.
+//! 2. Wrap `k_data` for that recipient: ML-KEM-1024-encapsulate to their
+//!    KEM key, X25519-exchange a throwaway keypair with their X25519 key,
+//!    and combine both through HKDF-SHA256 into a one-time `K_wrap`; ship
+//!    `k_data XOR K_wrap`. Recovering it needs *both* halves - a break of
+//!    ML-KEM-1024 alone, or X25519 alone, isn't enough.
+//! 3. Sign the binding and `k_data` with **both** ML-DSA-87 and RSA-PSS -
+//!    receivers verify both, so neither primitive alone can forge a send.
+//! 4. Encrypt each chunk under `k_data` with a deterministic
+//!    `(send_id, seq)` nonce.
+//!
+//! The keys in steps 2 rotate per peer relationship and are destroyed as
+//! they are superseded (`client::pq_rekey`, §13.10) - the signing keys of
+//! step 3 are the durable identity and do not.
 
 use std::path::Path;
 
@@ -37,17 +43,24 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
 use super::{CryptoError, Result};
+use crate::proto::UserId;
 
-/// RSA modulus size for both RSA-4096 halves of a PQ-hybrid identity (the
-/// signing pair and, separately, the encryption pair). Same size as
-/// `RSA_PER_MSG_KEY_BITS` - reused rather than re-chosen, since 4096 bits is
-/// already this app's established "long-lived, extra security margin" size.
+/// RSA modulus size for a PQ-hybrid identity's signing key - the only RSA
+/// key it has, the encryption side being ML-KEM + X25519 (§13.2). Same size
+/// as `RSA_PER_MSG_KEY_BITS`, reused rather than re-chosen, since 4096 bits
+/// is already this app's established "long-lived, extra margin" size.
 pub const PQ_RSA_BITS: usize = super::RSA_PER_MSG_KEY_BITS;
 
 /// HKDF `info` string binding the key-wrap combiner to this exact
 /// construction - changing it would silently break interop with a peer
 /// still using the old binding, which is the point of domain separation.
-const KEY_WRAP_INFO: &[u8] = b"aloo/pq-hybrid/v1/key-wrap";
+const KEY_WRAP_INFO: &[u8] = b"aloo/pq-hybrid/v2/key-wrap";
+
+/// Domain-separation prefix for what a `SendSetup`'s two signatures actually
+/// commit to. Keeps a send commitment from ever being mistaken for a
+/// signature this app produces anywhere else (a key rotation, say) even if
+/// the remaining bytes somehow lined up.
+const SEND_DOMAIN: &[u8] = b"aloo/pq-hybrid/v2/send";
 
 /// One PQ-hybrid identity's public half: everything a peer needs to encrypt
 /// to, or verify a signature from, this identity. Carried opaquely inside
@@ -58,8 +71,16 @@ const KEY_WRAP_INFO: &[u8] = b"aloo/pq-hybrid/v1/key-wrap";
 pub struct PqPublicBundle {
     mldsa_verifying: Vec<u8>,
     rsa_sign_public_der: Vec<u8>,
-    mlkem_encaps: Vec<u8>,
-    rsa_enc_public_der: Vec<u8>,
+    /// The **bootstrap** encryption keys - what a peer encrypts to before
+    /// this relationship has rotated even once. Superseded per peer as soon
+    /// as it has (§13.10); never used again for that peer afterwards.
+    bootstrap_encap: PqEncapKeys,
+    /// Present when this identity deliberately replaced an earlier one: the
+    /// retired identity's signature over this one, so contacts move their
+    /// pin across without being asked (§12.7). Absent for an identity that
+    /// replaced nothing.
+    #[serde(default)]
+    continuity: Option<ContinuitySig>,
 }
 
 /// One PQ-hybrid identity's private half - loaded from the file the connect
@@ -72,60 +93,204 @@ pub struct PqPublicBundle {
 pub struct PqPrivateBundle {
     mldsa_signing: Vec<u8>,
     rsa_sign_private_der: Vec<u8>,
-    mlkem_decaps: Vec<u8>,
-    rsa_enc_private_der: Vec<u8>,
+    /// The private half of `PqPublicBundle::bootstrap_encap`. This is the
+    /// only encryption key that ever touches disk - every key that
+    /// supersedes it is generated in memory and destroyed there, which is
+    /// what stops this file opening past traffic (§13.10).
+    bootstrap_decap: PqDecapKeys,
 }
 
-/// The recipient-specific wire blob carried as the single element of
-/// `Envelope.blocks` (`vec![bincode::encode(this)]`) for a `PqHybrid` text
-/// or file message. `nonce`/`ciphertext` are identical across every
-/// recipient of one send (see module doc); only `kem_ciphertext`/
-/// `wrapped_key`/`wrapped_key_rsa` differ per recipient.
-#[derive(Serialize, Deserialize)]
-pub struct HybridEnvelope {
-    pub nonce: [u8; 12],
-    pub ciphertext: Vec<u8>,
-    pub kem_ciphertext: Vec<u8>,
-    pub wrapped_key: [u8; 32],
-    pub wrapped_key_rsa: Vec<u8>,
+/// The public half of one PQ-hybrid **encryption** keypair: what a peer
+/// encapsulates to. Rotates per peer relationship (§13.10), unlike the
+/// signing keys, which are the durable identity.
+///
+/// Two primitives, so a break of either alone is not enough: ML-KEM-1024
+/// for the post-quantum half, X25519 for the classical hedge. That pairing
+/// is the same shape as the IETF's X-Wing construction, at a higher ML-KEM
+/// parameter set.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct PqEncapKeys {
+    pub mlkem_encaps: Vec<u8>,
+    pub x25519_pub: [u8; 32],
 }
 
-/// The recipient-specific key-wrap material for one voice stream, computed
-/// once at record-start and repeated verbatim in every chunk to that
-/// recipient (see `voice_stream.rs`). Unlike `HybridEnvelope` it carries a
-/// signature: a stream has no single upfront "data" to sign, so the signed
-/// payload is `stream_id ++ k_data` - proving the key came from this
-/// sender *for this specific stream*, so a captured key-setup can't be
-/// replayed against a different one.
+/// The private half of a `PqEncapKeys`.
 #[derive(Serialize, Deserialize, Clone)]
-pub struct HybridStreamKeySetup {
+pub struct PqDecapKeys {
+    mlkem_decaps: Vec<u8>,
+    x25519_priv: [u8; 32],
+}
+
+/// Generates one fresh encryption keypair. Fast - ML-KEM-1024 and X25519
+/// keygen are microseconds apiece, which is precisely what makes rotating
+/// per message practical here where `rsa_per_msg`'s 4096-bit RSA keygen
+/// (§11.9, hundreds of milliseconds) forced a background worker and a
+/// carve-out for voice.
+pub fn generate_encryption_keys() -> (PqEncapKeys, PqDecapKeys) {
+    let (mlkem_decaps, mlkem_encaps) = MlKem1024::generate_keypair();
+    let x_secret = x25519_dalek::StaticSecret::random_from_rng(rand_core::OsRng);
+    let x_public = x25519_dalek::PublicKey::from(&x_secret);
+    (
+        PqEncapKeys {
+            mlkem_encaps: mlkem_encaps.to_bytes().as_slice().to_vec(),
+            x25519_pub: x_public.to_bytes(),
+        },
+        PqDecapKeys {
+            mlkem_decaps: mlkem_decaps.to_bytes().as_slice().to_vec(),
+            x25519_priv: x_secret.to_bytes(),
+        },
+    )
+}
+
+impl PqPublicBundle {
+    /// The encryption keys to use for a peer that has not rotated yet.
+    pub fn bootstrap_encap(&self) -> &PqEncapKeys {
+        &self.bootstrap_encap
+    }
+
+    /// The certificate from the identity this one replaced, if any.
+    pub fn continuity(&self) -> Option<&ContinuitySig> {
+        self.continuity.as_ref()
+    }
+
+    /// Attaches a continuity certificate, producing the bundle that will be
+    /// written to disk and announced. Consumes and returns so a caller
+    /// cannot forget to use the result.
+    pub fn with_continuity(mut self, cert: ContinuitySig) -> Self {
+        self.continuity = Some(cert);
+        self
+    }
+}
+
+impl PqPrivateBundle {
+    /// The decryption keys matching `PqPublicBundle::bootstrap_encap`.
+    pub fn bootstrap_decap(&self) -> &PqDecapKeys {
+        &self.bootstrap_decap
+    }
+}
+
+/// What a send's signatures commit to, beyond the content itself: **who**
+/// it is for, **which room** it belongs to, and **which send** it is.
+///
+/// This is what stops a legitimate recipient from re-wrapping a sender's
+/// content for somebody else and passing it off as a message addressed to
+/// them: the signature covers `recipient_fp`, so a re-wrap no longer
+/// verifies for anyone but the original recipient. `channel` keeps a
+/// private message from being replayed into a channel (or the reverse), and
+/// `send_id` - the sender's own per-connection counter, already used to tell
+/// one stream from another - doubles as the anti-replay sequence a receiver
+/// requires to strictly increase per sender.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct SendBinding {
+    /// `bundle_fingerprint` of the recipient's public bundle. The identity,
+    /// not the connection: stable across reconnects, unlike a `UserId`.
+    pub recipient_fp: [u8; 32],
+    /// `Some(name)` for a channel send, `None` for a direct message.
+    pub channel: Option<String>,
+    /// The sender's per-connection send counter. Also the basis of every
+    /// chunk nonce in this send (`chunk_nonce`).
+    pub send_id: u64,
+}
+
+/// The per-recipient key material and authentication for one send - the
+/// single shape every kind of `pq_hybrid` content is introduced by, whether
+/// it carries one chunk (a text message, a file offer) or thousands (a voice
+/// stream, a file transfer).
+///
+/// A stream sends this once, ahead of its chunks; a text message carries it
+/// inline alongside its only chunk (`HybridSend`). Either way it is the one
+/// place a signature is verified and a `k_data` recovered - never per chunk.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct SendSetup {
+    pub binding: SendBinding,
     pub kem_ciphertext: Vec<u8>,
     pub wrapped_key: [u8; 32],
-    pub wrapped_key_rsa: Vec<u8>,
+    /// The sender's throwaway X25519 public key for this send - the
+    /// classical half of the wrap. Ephemeral per send, so it contributes
+    /// forward secrecy of its own on top of the recipient's rotation.
+    pub eph_x25519_pub: [u8; 32],
     pub mldsa_sig: Vec<u8>,
     pub rsa_sig: Vec<u8>,
 }
 
-fn stream_commitment(stream_id: u64, k_data: &[u8; 32]) -> Vec<u8> {
-    let mut v = Vec::with_capacity(8 + 32);
-    v.extend_from_slice(&stream_id.to_be_bytes());
-    v.extend_from_slice(k_data);
-    v
+/// A complete one-chunk send: the setup plus its only chunk. Carried as the
+/// single element of `Envelope.blocks` for `PqHybrid` text and file offers.
+/// Streams don't use this - they send the `SendSetup` on its own and the
+/// chunks after it.
+#[derive(Serialize, Deserialize)]
+pub struct HybridSend {
+    pub setup: SendSetup,
+    pub ciphertext: Vec<u8>,
 }
 
-/// Wraps a fresh per-stream `k_data` for one recipient (like `wrap_key_for`)
-/// and signs the `(stream_id, k_data)` binding with both of the sender's
-/// signing keys - called once per recipient at record-start, never per
-/// chunk (`docs/PROTOCOL.md` §11.6's "no rotation happens mid-stream"
-/// precedent, applied here to "no re-signing mid-stream" instead).
-pub fn wrap_key_for_stream(
+/// Stable identifier for one PQ-hybrid identity: SHA-256 over the encoded
+/// public bundle. Used as `SendBinding::recipient_fp`, and by callers that
+/// need to recognise an identity across connections.
+/// Covers the identity itself - the signing keys and the bootstrap
+/// encryption keys - and deliberately **not** the continuity certificate.
+///
+/// A certificate is metadata about how this identity came to replace an
+/// earlier one, not part of who it is. Excluding it is what lets the
+/// certificate sign its own bundle's fingerprint without chasing its tail,
+/// and means attaching one never changes the safety phrase a user reads
+/// out or the fingerprint their contacts pin.
+pub fn bundle_fingerprint(bundle: &PqPublicBundle) -> Result<[u8; 32]> {
+    use sha2::Digest;
+    let identity = bincode_encode(&(
+        &bundle.mldsa_verifying,
+        &bundle.rsa_sign_public_der,
+        &bundle.bootstrap_encap,
+    ))?;
+    let digest = Sha256::digest(&identity);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    Ok(out)
+}
+
+/// `bundle_fingerprint` for a bundle still in its announced form - what
+/// `Identify`/`UserInfo` carry in `public_key_der` for this `KeyMode`.
+/// `None` if those bytes are not a bundle at all.
+pub fn fingerprint_of_encoded(encoded: &[u8]) -> Option<[u8; 32]> {
+    let bundle: PqPublicBundle = bincode_decode(encoded).ok()?;
+    bundle_fingerprint(&bundle).ok()
+}
+
+/// The exact bytes both signatures are computed over: a domain tag, the
+/// binding, and the data key the binding authorises. Encoding the binding
+/// with bincode (length-prefixed strings, fixed field order) is what keeps
+/// two different bindings from ever producing the same commitment bytes.
+/// Part of the wire contract - the exact bytes both signatures cover,
+/// pinned by test vectors (`docs/SECURITY.md`).
+pub fn send_commitment(binding: &SendBinding, k_data: &[u8; 32]) -> Result<Vec<u8>> {
+    let encoded = bincode_encode(binding)?;
+    let mut v = Vec::with_capacity(SEND_DOMAIN.len() + encoded.len() + 32);
+    v.extend_from_slice(SEND_DOMAIN);
+    v.extend_from_slice(&encoded);
+    v.extend_from_slice(k_data);
+    Ok(v)
+}
+
+/// Opens one send: generates a fresh `k_data`, wraps it for `recipient_public`
+/// and signs `(binding, k_data)` with both of the sender's signing keys.
+/// Returns the setup to put on the wire and the `k_data` to seal chunks with.
+///
+/// Called once per recipient per send - a channel message with five members
+/// produces five setups, each bound to its own recipient.
+pub fn seal_setup(
     sender_signing: &PqPrivateBundle,
-    recipient_public: &PqPublicBundle,
-    stream_id: u64,
-    k_data: &[u8; 32],
-) -> Result<HybridStreamKeySetup> {
-    let (kem_ciphertext, wrapped_key, wrapped_key_rsa) = wrap_key_for(recipient_public, k_data)?;
-    let commitment = stream_commitment(stream_id, k_data);
+    recipient_encap: &PqEncapKeys,
+    recipient_fp: [u8; 32],
+    channel: Option<String>,
+    send_id: u64,
+) -> Result<(SendSetup, [u8; 32])> {
+    let k_data = fresh_data_key();
+    let binding = SendBinding {
+        recipient_fp,
+        channel,
+        send_id,
+    };
+    let (kem_ciphertext, wrapped_key, eph_x25519_pub) = wrap_key_for(recipient_encap, &k_data)?;
+    let commitment = send_commitment(&binding, &k_data)?;
 
     let mldsa_sig = {
         let sk = decode_mldsa_signing(sender_signing)?;
@@ -134,52 +299,341 @@ pub fn wrap_key_for_stream(
     let rsa_sk = super::private_key_from_der(&sender_signing.rsa_sign_private_der)?;
     let rsa_sig = super::sign(&rsa_sk, &commitment)?;
 
-    Ok(HybridStreamKeySetup {
-        kem_ciphertext,
-        wrapped_key,
-        wrapped_key_rsa,
+    Ok((
+        SendSetup {
+            binding,
+            kem_ciphertext,
+            wrapped_key,
+            eph_x25519_pub,
+            mldsa_sig,
+            rsa_sig,
+        },
+        k_data,
+    ))
+}
+
+/// Recovers and authenticates a send's `k_data`. `None` - fail closed - if
+/// the wrap doesn't unwrap, if either signature fails against `sender_public`,
+/// or if the setup was not sealed **for this recipient** (`my_fp`).
+///
+/// That last check is the one that makes a re-wrapped message from a
+/// legitimate recipient useless to anyone else: the signature covers the
+/// fingerprint of whoever it was really for, so presenting it to a third
+/// party fails here rather than decrypting into a message they were never
+/// sent. Callers still enforce the parts only they know: that `channel`
+/// matches the payload it arrived on, and that `send_id` has not been seen
+/// before from this sender.
+/// `my_decaps` is every decryption key still worth trying for this peer -
+/// the current one first, then recently superseded ones, then the bootstrap
+/// (`client::pq_rekey::PqOwnKeys::candidates_for`). A send encrypted just
+/// before a rotation must still open, which is what the retained keys are
+/// for; anything older than the retention window is gone for good, and that
+/// is the forward secrecy (§13.10).
+pub fn open_setup(
+    my_decaps: &[PqDecapKeys],
+    my_fp: &[u8; 32],
+    sender_public: &PqPublicBundle,
+    setup: &SendSetup,
+) -> Option<[u8; 32]> {
+    if &setup.binding.recipient_fp != my_fp {
+        return None;
+    }
+    let k_data = my_decaps.iter().find_map(|decap| {
+        unwrap_key(
+            decap,
+            &setup.kem_ciphertext,
+            &setup.wrapped_key,
+            &setup.eph_x25519_pub,
+        )
+        .filter(|candidate| {
+            // Unwrapping never fails loudly - a wrong key just yields
+            // wrong bytes - so the signature is what actually decides
+            // whether this key was the right one.
+            send_commitment(&setup.binding, candidate)
+                .ok()
+                .is_some_and(|c| verify_both(sender_public, &c, setup))
+        })
+    })?;
+    let commitment = send_commitment(&setup.binding, &k_data).ok()?;
+
+    if !verify_both(sender_public, &commitment, setup) {
+        return None;
+    }
+    Some(k_data)
+}
+
+/// Verifies **both** of a setup's signatures over `commitment`. A break of
+/// ML-DSA-87 alone, or RSA-4096 alone, must not be enough to forge a send.
+fn verify_both(sender_public: &PqPublicBundle, commitment: &[u8], setup: &SendSetup) -> bool {
+    let Ok(vk) = decode_mldsa_verifying(sender_public) else {
+        return false;
+    };
+    let Ok(sig) = MlDsaSignature::<MlDsa87>::try_from(setup.mldsa_sig.as_slice()) else {
+        return false;
+    };
+    if vk.verify(commitment, &sig).is_err() {
+        return false;
+    }
+    let Ok(rsa_pk) = super::public_key_from_der(&sender_public.rsa_sign_public_der) else {
+        return false;
+    };
+    super::verify(&rsa_pk, commitment, &setup.rsa_sig)
+}
+
+/// Domain tag for a rotation signature, kept distinct from a send
+/// commitment's so neither could ever be mistaken for the other.
+const ROTATION_DOMAIN: &[u8] = b"aloo/pq-hybrid/v2/rotate";
+
+/// Domain tag for a continuity certificate - the old identity vouching for
+/// the new one.
+const CONTINUITY_DOMAIN: &[u8] = b"aloo/pq-hybrid/v2/continuity";
+
+/// Domain tag for an identity card - an identity vouching for its own
+/// pairing with a nickname.
+const CARD_DOMAIN: &[u8] = b"aloo/pq-hybrid/v2/card";
+
+/// A retiring identity's signature over the one replacing it.
+///
+/// Without this, a user who regenerates their keybundle is indistinguishable
+/// from a stranger who took their nickname: both just look like "different
+/// bytes than last time", and both get the same alarm. With it, a planned
+/// change proves itself and re-pins silently, so the alarm is left to mean
+/// what it says.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct ContinuitySig {
+    /// Fingerprint of the identity being retired - what a contact should
+    /// already have pinned.
+    pub previous_fp: [u8; 32],
+    pub mldsa_sig: Vec<u8>,
+    pub rsa_sig: Vec<u8>,
+}
+
+fn continuity_commitment(previous_fp: &[u8; 32], new_fp: &[u8; 32]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(CONTINUITY_DOMAIN.len() + 64);
+    v.extend_from_slice(CONTINUITY_DOMAIN);
+    v.extend_from_slice(previous_fp);
+    v.extend_from_slice(new_fp);
+    v
+}
+
+/// Signs `new_public` with the identity being retired, so contacts who
+/// pinned the old one can move to the new one without being asked.
+///
+/// Note what is *not* possible: forging this needs the old private keys.
+/// Someone who merely knows a nickname and the old public fingerprint can
+/// produce nothing that verifies.
+pub fn sign_continuity(
+    previous_private: &PqPrivateBundle,
+    previous_public: &PqPublicBundle,
+    new_public: &PqPublicBundle,
+) -> Result<ContinuitySig> {
+    let previous_fp = bundle_fingerprint(previous_public)?;
+    let new_fp = bundle_fingerprint(new_public)?;
+    let commitment = continuity_commitment(&previous_fp, &new_fp);
+
+    let mldsa_sig = {
+        let sk = decode_mldsa_signing(previous_private)?;
+        sk.sign(&commitment).encode().as_slice().to_vec()
+    };
+    let rsa_sk = super::private_key_from_der(&previous_private.rsa_sign_private_der)?;
+    let rsa_sig = super::sign(&rsa_sk, &commitment)?;
+
+    Ok(ContinuitySig {
+        previous_fp,
         mldsa_sig,
         rsa_sig,
     })
 }
 
-/// Recovers and authenticates `k_data` from one chunk's `HybridStreamKeySetup`
-/// - `None` if either signature fails to verify against `sender_public`, or
-/// the wrap material itself doesn't unwrap. A caller only needs to call this
-/// once per `(from, stream_id)` (on the first chunk/key-setup seen for it)
-/// and cache the result, exactly like the RSA path's "resolved once, not per
-/// chunk" `candidate_privates_for` snapshot.
-pub fn unwrap_key_for_stream(
-    my_private: &PqPrivateBundle,
+/// Checks that `new_public` really was vouched for by the identity pinned
+/// as `pinned_public`. `false` - and so, an ordinary unexplained key
+/// change - if there is no certificate, if it names a different predecessor,
+/// or if either signature fails.
+pub fn verify_continuity(pinned_public: &PqPublicBundle, new_public: &PqPublicBundle) -> bool {
+    let Some(cert) = new_public.continuity.as_ref() else {
+        return false;
+    };
+    let (Ok(pinned_fp), Ok(new_fp)) = (
+        bundle_fingerprint(pinned_public),
+        bundle_fingerprint(new_public),
+    ) else {
+        return false;
+    };
+    if cert.previous_fp != pinned_fp {
+        return false;
+    }
+    let commitment = continuity_commitment(&cert.previous_fp, &new_fp);
+
+    let Ok(vk) = decode_mldsa_verifying(pinned_public) else {
+        return false;
+    };
+    let Ok(sig) = MlDsaSignature::<MlDsa87>::try_from(cert.mldsa_sig.as_slice()) else {
+        return false;
+    };
+    if vk.verify(&commitment, &sig).is_err() {
+        return false;
+    }
+    let Ok(rsa_pk) = super::public_key_from_der(&pinned_public.rsa_sign_public_der) else {
+        return false;
+    };
+    super::verify(&rsa_pk, &commitment, &cert.rsa_sig)
+}
+
+/// An identity vouching for its own pairing with a nickname, shareable by
+/// any means at all - email, a message on another app, a USB stick.
+///
+/// Importing one pins that nickname as verified *before* first contact,
+/// which is the one thing pinning alone can never do: a first sighting has
+/// nothing to compare against, so it is believed by default. This replaces
+/// that leap of faith with something checkable.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct IdentityCard {
+    pub nickname: String,
+    pub bundle: PqPublicBundle,
+    mldsa_sig: Vec<u8>,
+    rsa_sig: Vec<u8>,
+}
+
+fn card_commitment(nickname: &str, fp: &[u8; 32]) -> Vec<u8> {
+    let name = nickname.as_bytes();
+    let mut v = Vec::with_capacity(CARD_DOMAIN.len() + 8 + name.len() + 32);
+    v.extend_from_slice(CARD_DOMAIN);
+    // Length-prefixed so a nickname can't be shifted into the fingerprint.
+    v.extend_from_slice(&(name.len() as u64).to_be_bytes());
+    v.extend_from_slice(name);
+    v.extend_from_slice(fp);
+    v
+}
+
+/// Builds a card for this identity under `nickname`.
+pub fn make_identity_card(
+    private: &PqPrivateBundle,
+    public: &PqPublicBundle,
+    nickname: &str,
+) -> Result<IdentityCard> {
+    let fp = bundle_fingerprint(public)?;
+    let commitment = card_commitment(nickname, &fp);
+
+    let mldsa_sig = {
+        let sk = decode_mldsa_signing(private)?;
+        sk.sign(&commitment).encode().as_slice().to_vec()
+    };
+    let rsa_sk = super::private_key_from_der(&private.rsa_sign_private_der)?;
+    let rsa_sig = super::sign(&rsa_sk, &commitment)?;
+
+    Ok(IdentityCard {
+        nickname: nickname.to_string(),
+        bundle: public.clone(),
+        mldsa_sig,
+        rsa_sig,
+    })
+}
+
+/// Checks a card is internally consistent - the bundle inside really did
+/// sign this nickname. `None` if not, so a card altered anywhere between
+/// its author and here is refused rather than pinned.
+///
+/// A card is self-signed, which is exactly as much as it claims: it proves
+/// whoever holds these keys asked to be known by this name. What makes it
+/// worth trusting is the channel it arrived on, not the signature alone.
+pub fn open_identity_card(card: &IdentityCard) -> Option<(&str, &PqPublicBundle)> {
+    let fp = bundle_fingerprint(&card.bundle).ok()?;
+    let commitment = card_commitment(&card.nickname, &fp);
+
+    let vk = decode_mldsa_verifying(&card.bundle).ok()?;
+    let sig = MlDsaSignature::<MlDsa87>::try_from(card.mldsa_sig.as_slice()).ok()?;
+    vk.verify(&commitment, &sig).ok()?;
+
+    let rsa_pk = super::public_key_from_der(&card.bundle.rsa_sign_public_der).ok()?;
+    if !super::verify(&rsa_pk, &commitment, &card.rsa_sig) {
+        return None;
+    }
+    Some((&card.nickname, &card.bundle))
+}
+
+pub fn save_identity_card(card: &IdentityCard, path: &Path) -> Result<()> {
+    std::fs::write(path, bincode_encode(card)?)?;
+    Ok(())
+}
+
+pub fn load_identity_card(path: &Path) -> Result<IdentityCard> {
+    bincode_decode(&std::fs::read(path)?)
+}
+
+/// One offer of fresh encryption keys to one peer (§13.10). Travels
+/// opaquely inside `RotateKey`/`KeyRotated`'s existing `new_public_key_der`
+/// field - the same trick `PqPublicBundle` already uses on `Identify`, so
+/// no new message type is needed.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct PqRotation {
+    pub encap: PqEncapKeys,
+    /// Counts up per peer relationship, so a receiver can refuse an older
+    /// rotation that arrives late or is re-injected.
+    pub generation: u64,
+}
+
+/// What a rotation's two signatures commit to: the domain, who it is for
+/// (both the live connection and the durable identity), and the keys being
+/// offered. Binding the recipient is what stops one peer replaying a
+/// rotation as though it had been addressed to them.
+fn rotation_commitment(to: UserId, recipient_fp: &[u8; 32], rotation: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(ROTATION_DOMAIN.len() + 8 + 32 + rotation.len());
+    v.extend_from_slice(ROTATION_DOMAIN);
+    v.extend_from_slice(&to.0.to_be_bytes());
+    v.extend_from_slice(recipient_fp);
+    v.extend_from_slice(rotation);
+    v
+}
+
+/// Signs a rotation with the sender's **durable identity** - not with the
+/// key being replaced.
+///
+/// This is the one real simplification over `rsa_per_msg`'s chain (§11.3):
+/// there, each rotation is signed by the key it supersedes, so a broken
+/// link anywhere strands the relationship and a reconnect needs the whole
+/// §12.6 resume mechanism to re-anchor. Here the verifying key is the
+/// pinned identity and never changes, so every rotation is independently
+/// verifiable and a reconnect needs nothing special.
+pub fn sign_rotation(
+    signing: &PqPrivateBundle,
+    to: UserId,
+    recipient_fp: &[u8; 32],
+    rotation: &PqRotation,
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    let encoded = bincode_encode(rotation)?;
+    let commitment = rotation_commitment(to, recipient_fp, &encoded);
+
+    let mldsa_sig = {
+        let sk = decode_mldsa_signing(signing)?;
+        sk.sign(&commitment).encode().as_slice().to_vec()
+    };
+    let rsa_sk = super::private_key_from_der(&signing.rsa_sign_private_der)?;
+    let rsa_sig = super::sign(&rsa_sk, &commitment)?;
+    Ok((encoded, bincode_encode(&(mldsa_sig, rsa_sig))?))
+}
+
+/// Verifies a rotation against the sender's pinned identity and returns it.
+/// `None` - fail closed - on a bad signature, a rotation addressed to
+/// somebody else, or malformed bytes.
+pub fn verify_rotation(
     sender_public: &PqPublicBundle,
-    stream_id: u64,
-    setup: &HybridStreamKeySetup,
-) -> Option<[u8; 32]> {
-    let k_data = unwrap_key(
-        my_private,
-        &setup.kem_ciphertext,
-        &setup.wrapped_key,
-        &setup.wrapped_key_rsa,
-    )?;
-    let commitment = stream_commitment(stream_id, &k_data);
+    to: UserId,
+    recipient_fp: &[u8; 32],
+    rotation_bytes: &[u8],
+    signature: &[u8],
+) -> Option<PqRotation> {
+    let (mldsa_sig, rsa_sig): (Vec<u8>, Vec<u8>) = bincode_decode(signature).ok()?;
+    let commitment = rotation_commitment(to, recipient_fp, rotation_bytes);
 
     let vk = decode_mldsa_verifying(sender_public).ok()?;
-    let sig = MlDsaSignature::<MlDsa87>::try_from(setup.mldsa_sig.as_slice()).ok()?;
+    let sig = MlDsaSignature::<MlDsa87>::try_from(mldsa_sig.as_slice()).ok()?;
     vk.verify(&commitment, &sig).ok()?;
 
     let rsa_pk = super::public_key_from_der(&sender_public.rsa_sign_public_der).ok()?;
-    if !super::verify(&rsa_pk, &commitment, &setup.rsa_sig) {
+    if !super::verify(&rsa_pk, &commitment, &rsa_sig) {
         return None;
     }
-
-    Some(k_data)
-}
-
-#[derive(Serialize, Deserialize)]
-struct SignedBody {
-    data: Vec<u8>,
-    mldsa_sig: Vec<u8>,
-    rsa_sig: Vec<u8>,
+    bincode_decode(rotation_bytes).ok()
 }
 
 fn bincode_encode<T: Serialize>(v: &T) -> Result<Vec<u8>> {
@@ -195,25 +649,32 @@ fn bincode_decode<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T> {
 /// keypair. Slow (real RSA-4096 keygen x2 plus ML-DSA-87/ML-KEM-1024) - only
 /// called from `aloo --keygen-pq-hybrid` and `cargo slow`-tagged tests.
 pub fn generate_bundle() -> Result<(PqPublicBundle, PqPrivateBundle)> {
+    generate_bundle_with_bits(PQ_RSA_BITS)
+}
+
+/// `generate_bundle` with the RSA modulus size spelled out, mirroring
+/// `KeyPair::generate_with_bits` and existing for the same reason: the
+/// acceptance layer needs real, working identities, but RSA-4096 keygen
+/// twice per identity is enough to stop people running it at all. The PQ
+/// halves are always the real ML-DSA-87/ML-KEM-1024 parameter sets - only
+/// the classical hedge shrinks, and only for tests that never assert on it.
+pub fn generate_bundle_with_bits(bits: usize) -> Result<(PqPublicBundle, PqPrivateBundle)> {
     let mldsa_signing = MlDsaSigningKey::<MlDsa87>::generate();
     let mldsa_verifying = mldsa_signing.verifying_key();
 
-    let rsa_sign = super::KeyPair::generate_with_bits(PQ_RSA_BITS)?;
-    let rsa_enc = super::KeyPair::generate_with_bits(PQ_RSA_BITS)?;
-
-    let (mlkem_decaps, mlkem_encaps) = MlKem1024::generate_keypair();
+    let rsa_sign = super::KeyPair::generate_with_bits(bits)?;
+    let (bootstrap_encap, bootstrap_decap) = generate_encryption_keys();
 
     let public = PqPublicBundle {
         mldsa_verifying: mldsa_verifying.to_bytes().as_slice().to_vec(),
         rsa_sign_public_der: super::public_key_to_der(&rsa_sign.public)?,
-        mlkem_encaps: mlkem_encaps.to_bytes().as_slice().to_vec(),
-        rsa_enc_public_der: super::public_key_to_der(&rsa_enc.public)?,
+        bootstrap_encap,
+        continuity: None,
     };
     let private = PqPrivateBundle {
         mldsa_signing: mldsa_signing.to_bytes().as_slice().to_vec(),
         rsa_sign_private_der: super::private_key_to_der(&rsa_sign.private)?,
-        mlkem_decaps: mlkem_decaps.to_bytes().as_slice().to_vec(),
-        rsa_enc_private_der: super::private_key_to_der(&rsa_enc.private)?,
+        bootstrap_decap,
     };
     Ok((public, private))
 }
@@ -278,13 +739,13 @@ fn decode_mldsa_verifying(b: &PqPublicBundle) -> Result<MlDsaVerifyingKey<MlDsa8
         .map_err(|e| CryptoError::Key(e.to_string()))
 }
 
-fn decode_mlkem_decaps(b: &PqPrivateBundle) -> Result<ml_kem::DecapsulationKey<MlKem1024>> {
-    ml_kem::DecapsulationKey::<MlKem1024>::new_from_slice(&b.mlkem_decaps)
+fn decode_mlkem_decaps(k: &PqDecapKeys) -> Result<ml_kem::DecapsulationKey<MlKem1024>> {
+    ml_kem::DecapsulationKey::<MlKem1024>::new_from_slice(&k.mlkem_decaps)
         .map_err(|e| CryptoError::Key(e.to_string()))
 }
 
-fn decode_mlkem_encaps(b: &PqPublicBundle) -> Result<ml_kem::EncapsulationKey<MlKem1024>> {
-    ml_kem::EncapsulationKey::<MlKem1024>::new_from_slice(&b.mlkem_encaps)
+fn decode_mlkem_encaps(k: &PqEncapKeys) -> Result<ml_kem::EncapsulationKey<MlKem1024>> {
+    ml_kem::EncapsulationKey::<MlKem1024>::new_from_slice(&k.mlkem_encaps)
         .map_err(|e| CryptoError::Key(e.to_string()))
 }
 
@@ -292,7 +753,10 @@ fn decode_mlkem_encaps(b: &PqPublicBundle) -> Result<ml_kem::EncapsulationKey<Ml
 
 /// HKDF-SHA256 combiner: neither `kem_shared` alone nor `rsa_secret` alone
 /// determines the result.
-fn hkdf_combine(kem_shared: &[u8], rsa_secret: &[u8]) -> [u8; 32] {
+/// Part of the wire contract - pinned by test vectors
+/// (`docs/SECURITY.md`). The second argument is the classical shared
+/// secret: an X25519 exchange since §13.10, an RSA-wrapped secret before it.
+pub fn hkdf_combine(kem_shared: &[u8], rsa_secret: &[u8]) -> [u8; 32] {
     let mut ikm = Vec::with_capacity(kem_shared.len() + rsa_secret.len());
     ikm.extend_from_slice(kem_shared);
     ikm.extend_from_slice(rsa_secret);
@@ -303,79 +767,25 @@ fn hkdf_combine(kem_shared: &[u8], rsa_secret: &[u8]) -> [u8; 32] {
     out
 }
 
-fn sign_body(sender_signing: &PqPrivateBundle, data: &[u8]) -> Result<Vec<u8>> {
-    let mldsa_sig = {
-        let sk = decode_mldsa_signing(sender_signing)?;
-        sk.sign(data).encode().as_slice().to_vec()
-    };
-    let rsa_sk = super::private_key_from_der(&sender_signing.rsa_sign_private_der)?;
-    let rsa_sig = super::sign(&rsa_sk, data)?;
-
-    let body = SignedBody {
-        data: data.to_vec(),
-        mldsa_sig,
-        rsa_sig,
-    };
-    bincode_encode(&body)
-}
-
-/// Verifies **both** signatures against `sender_public` and returns the
-/// original `data` only if both check out - a break in ML-DSA-87 alone, or
-/// RSA-4096 alone, must not be enough to forge a message.
-fn verify_body(sender_public: &PqPublicBundle, plaintext: &[u8]) -> Option<Vec<u8>> {
-    let body: SignedBody = bincode_decode(plaintext).ok()?;
-
-    let vk = decode_mldsa_verifying(sender_public).ok()?;
-    let sig = MlDsaSignature::<MlDsa87>::try_from(body.mldsa_sig.as_slice()).ok()?;
-    vk.verify(&body.data, &sig).ok()?;
-
-    let rsa_pk = super::public_key_from_der(&sender_public.rsa_sign_public_der).ok()?;
-    if !super::verify(&rsa_pk, &body.data, &body.rsa_sig) {
-        return None;
-    }
-
-    Some(body.data)
-}
-
-/// The recipient-independent half of a hybrid send (step 1-2 of the module
-/// doc): sign `data`, then AES-256-GCM-encrypt it once under a freshly
-/// random `K_data`. Called once per outgoing `Envelope` or once per voice
-/// stream - never per recipient, never per chunk.
-pub fn encrypt_hybrid_body(
-    sender_signing: &PqPrivateBundle,
-    data: &[u8],
-) -> Result<([u8; 32], [u8; 12], Vec<u8>)> {
-    let signed = sign_body(sender_signing, data)?;
-
-    let mut k_data = [0u8; 32];
-    k_data.copy_from_slice(&super::random_bytes(32));
-    let mut nonce = [0u8; 12];
-    nonce.copy_from_slice(&super::random_bytes(12));
-
-    let cipher = Aes256Gcm::new(&AesKey::<Aes256Gcm>::from(k_data));
-    let ciphertext = cipher
-        .encrypt(&AesNonce::from(nonce), signed.as_slice())
-        .map_err(|e| CryptoError::Encrypt(e.to_string()))?;
-
-    Ok((k_data, nonce, ciphertext))
-}
-
 /// The recipient-specific half (step 3): wrap `k_data` for one recipient's
 /// public bundle via ML-KEM-1024 + RSA-4096, combined through the HKDF
 /// combiner above.
 pub fn wrap_key_for(
-    recipient_public: &PqPublicBundle,
+    recipient_encap: &PqEncapKeys,
     k_data: &[u8; 32],
-) -> Result<(Vec<u8>, [u8; 32], Vec<u8>)> {
-    let ek = decode_mlkem_encaps(recipient_public)?;
+) -> Result<(Vec<u8>, [u8; 32], [u8; 32])> {
+    let ek = decode_mlkem_encaps(recipient_encap)?;
     let (kem_ciphertext, kem_shared) = ek.encapsulate();
 
-    let rsa_pk = super::public_key_from_der(&recipient_public.rsa_enc_public_der)?;
-    let rsa_secret = super::random_bytes(32);
-    let wrapped_key_rsa_blocks = super::encrypt_chunked(&rsa_pk, &rsa_secret)?;
-    let wrapped_key_rsa = bincode_encode(&wrapped_key_rsa_blocks)?;
+    // A throwaway X25519 keypair per send: the shared secret exists only
+    // for this wrap and neither side keeps the secret half.
+    let eph_secret = x25519_dalek::EphemeralSecret::random_from_rng(rand_core::OsRng);
+    let eph_x25519_pub = x25519_dalek::PublicKey::from(&eph_secret).to_bytes();
+    let x_shared = eph_secret.diffie_hellman(&x25519_dalek::PublicKey::from(
+        recipient_encap.x25519_pub,
+    ));
 
-    let k_wrap = hkdf_combine(kem_shared.as_slice(), &rsa_secret);
+    let k_wrap = hkdf_combine(kem_shared.as_slice(), x_shared.as_bytes());
     let mut wrapped_key = [0u8; 32];
     for i in 0..32 {
         wrapped_key[i] = k_data[i] ^ k_wrap[i];
@@ -384,25 +794,50 @@ pub fn wrap_key_for(
     Ok((
         kem_ciphertext.as_slice().to_vec(),
         wrapped_key,
-        wrapped_key_rsa,
+        eph_x25519_pub,
     ))
 }
 
-/// Convenience for the single-recipient (DM) case: body + wrap in one call.
-pub fn encrypt_hybrid_for_one(
+/// Seals a whole one-chunk send (a text message, a file offer) for one
+/// recipient: `seal_setup` followed by that setup's only chunk, encoded as
+/// the single `Envelope.blocks` element the wire carries.
+///
+/// A text message is not a special case of anything here - it is simply a
+/// send whose stream happens to be one chunk long, sealed by the same code
+/// a four-minute voice recording uses.
+pub fn seal_send(
     sender_signing: &PqPrivateBundle,
-    recipient_public: &PqPublicBundle,
+    recipient_encap: &PqEncapKeys,
+    recipient_fp: [u8; 32],
+    channel: Option<String>,
+    send_id: u64,
     data: &[u8],
-) -> Result<HybridEnvelope> {
-    let (k_data, nonce, ciphertext) = encrypt_hybrid_body(sender_signing, data)?;
-    let (kem_ciphertext, wrapped_key, wrapped_key_rsa) = wrap_key_for(recipient_public, &k_data)?;
-    Ok(HybridEnvelope {
-        nonce,
-        ciphertext,
-        kem_ciphertext,
-        wrapped_key,
-        wrapped_key_rsa,
-    })
+) -> Result<Vec<u8>> {
+    let (setup, k_data) = seal_setup(
+        sender_signing,
+        recipient_encap,
+        recipient_fp,
+        channel,
+        send_id,
+    )?;
+    let ciphertext = seal_chunk(&k_data, send_id, 0, data);
+    bincode_encode(&HybridSend { setup, ciphertext })
+}
+
+/// Opens a whole one-chunk send, returning what it was bound to alongside
+/// the plaintext so the caller can check the parts only it knows (that
+/// `channel` matches where this arrived, and that `send_id` is newer than
+/// anything already accepted from this sender).
+pub fn open_send(
+    my_decaps: &[PqDecapKeys],
+    my_fp: &[u8; 32],
+    sender_public: &PqPublicBundle,
+    blob: &[u8],
+) -> Option<(SendBinding, Vec<u8>)> {
+    let send: HybridSend = bincode_decode(blob).ok()?;
+    let k_data = open_setup(my_decaps, my_fp, sender_public, &send.setup)?;
+    let plaintext = open_chunk(&k_data, send.setup.binding.send_id, 0, &send.ciphertext)?;
+    Some((send.setup.binding, plaintext))
 }
 
 /// Recovers `K_data` from a recipient-specific key-wrap using this client's
@@ -410,20 +845,19 @@ pub fn encrypt_hybrid_for_one(
 /// voice stream setup (`voice_stream.rs`, which caches the result for the
 /// life of one stream instead of calling this per chunk).
 pub fn unwrap_key(
-    my_private: &PqPrivateBundle,
+    my_decap: &PqDecapKeys,
     kem_ciphertext: &[u8],
     wrapped_key: &[u8; 32],
-    wrapped_key_rsa: &[u8],
+    eph_x25519_pub: &[u8; 32],
 ) -> Option<[u8; 32]> {
-    let dk = decode_mlkem_decaps(my_private).ok()?;
+    let dk = decode_mlkem_decaps(my_decap).ok()?;
     let kem_ct = ml_kem::Ciphertext::<MlKem1024>::try_from(kem_ciphertext).ok()?;
     let kem_shared = dk.decapsulate(&kem_ct);
 
-    let wrapped_rsa_blocks: Vec<Vec<u8>> = bincode_decode(wrapped_key_rsa).ok()?;
-    let rsa_sk = super::private_key_from_der(&my_private.rsa_enc_private_der).ok()?;
-    let rsa_secret = super::decrypt_chunked(&rsa_sk, &wrapped_rsa_blocks).ok()?;
+    let my_secret = x25519_dalek::StaticSecret::from(my_decap.x25519_priv);
+    let x_shared = my_secret.diffie_hellman(&x25519_dalek::PublicKey::from(*eph_x25519_pub));
 
-    let k_wrap = hkdf_combine(kem_shared.as_slice(), &rsa_secret);
+    let k_wrap = hkdf_combine(kem_shared.as_slice(), x_shared.as_bytes());
     let mut k_data = [0u8; 32];
     for i in 0..32 {
         k_data[i] = wrapped_key[i] ^ k_wrap[i];
@@ -431,102 +865,48 @@ pub fn unwrap_key(
     Some(k_data)
 }
 
-/// Full decrypt+verify pipeline for a text/file `Envelope.blocks[0]` blob.
-/// `None` on any failure (bad AEAD tag, bad signature, malformed bytes) -
-/// mirrors `decrypt_envelope_for`'s existing RSA failure path, never panics.
-pub fn decrypt_hybrid(
-    my_private: &PqPrivateBundle,
-    sender_public: &PqPublicBundle,
-    blob: &[u8],
-) -> Option<Vec<u8>> {
-    let env: HybridEnvelope = bincode_decode(blob).ok()?;
-    let k_data = unwrap_key(
-        my_private,
-        &env.kem_ciphertext,
-        &env.wrapped_key,
-        &env.wrapped_key_rsa,
-    )?;
-
-    let cipher = Aes256Gcm::new(&AesKey::<Aes256Gcm>::from(k_data));
-    let plaintext = cipher
-        .decrypt(&AesNonce::from(env.nonce), env.ciphertext.as_slice())
-        .ok()?;
-
-    verify_body(sender_public, &plaintext)
-}
-
-/// Deterministic per-chunk nonce for a voice stream: unique for the life of
-/// `k_data` (which is fresh per stream) since `(stream_id, seq)` never
-/// repeats within one sender's stream - safe without needing fresh OS
-/// randomness on every 100ms chunk.
-fn chunk_nonce(stream_id: u64, seq: u32) -> [u8; 12] {
+/// Deterministic per-chunk nonce: unique for the life of one send's
+/// `k_data` (which is fresh per send) because `(send_id, seq)` never repeats
+/// within one sender's send - so no chunk needs fresh OS randomness, only
+/// the counter already on the wire.
+/// Part of the wire contract: an independent implementation must derive
+/// the identical nonce, so this is public and pinned by test vectors
+/// (`docs/SECURITY.md`).
+pub fn chunk_nonce(send_id: u64, seq: u32) -> [u8; 12] {
     let mut n = [0u8; 12];
-    n[..8].copy_from_slice(&stream_id.to_be_bytes());
+    n[..8].copy_from_slice(&send_id.to_be_bytes());
     n[8..].copy_from_slice(&seq.to_be_bytes());
     n
 }
 
-/// Encrypts one voice chunk's raw PCM under a stream's already-established
-/// `k_data` (see `HybridStreamKeySetup`) - cheap, no asymmetric crypto.
-pub fn encrypt_hybrid_chunk(k_data: &[u8; 32], stream_id: u64, seq: u32, pcm: &[u8]) -> Vec<u8> {
-    let nonce = chunk_nonce(stream_id, seq);
+/// Seals one chunk of a send under its already-established `k_data` - cheap,
+/// no asymmetric crypto. Used for every kind of content: a text message's
+/// only chunk, one 15ms slice of voice, one 512-byte slice of a file.
+pub fn seal_chunk(k_data: &[u8; 32], send_id: u64, seq: u32, data: &[u8]) -> Vec<u8> {
+    let nonce = chunk_nonce(send_id, seq);
     let cipher = Aes256Gcm::new(&AesKey::<Aes256Gcm>::from(*k_data));
     cipher
-        .encrypt(&AesNonce::from(nonce), pcm)
-        .expect("aes-gcm encrypt of one voice chunk cannot fail")
+        .encrypt(&AesNonce::from(nonce), data)
+        .expect("aes-gcm encrypt of one chunk cannot fail")
 }
 
-/// Decrypts one voice chunk. `None` on a bad AEAD tag (wrong key, corrupted
-/// chunk, or a `(stream_id, seq)` nonce mismatch).
-pub fn decrypt_hybrid_chunk(
+/// Opens one chunk. `None` on a bad AEAD tag - a wrong key, a corrupted
+/// chunk, or a `(send_id, seq)` that doesn't match what it was sealed under.
+pub fn open_chunk(
     k_data: &[u8; 32],
-    stream_id: u64,
+    send_id: u64,
     seq: u32,
     ciphertext: &[u8],
 ) -> Option<Vec<u8>> {
-    let nonce = chunk_nonce(stream_id, seq);
+    let nonce = chunk_nonce(send_id, seq);
     let cipher = Aes256Gcm::new(&AesKey::<Aes256Gcm>::from(*k_data));
     cipher.decrypt(&AesNonce::from(nonce), ciphertext).ok()
 }
 
-/// A fresh, random per-stream data key - the voice-streaming counterpart of
-/// the `K_data` `encrypt_hybrid_body` generates for text/file, but with no
-/// "body" to sign-then-encrypt alongside it (a stream has no single upfront
-/// plaintext; `wrap_key_for_stream`'s per-recipient signature over
-/// `(stream_id, k_data)` is what authenticates it instead).
+/// A fresh, random per-send data key. Every send gets its own, which is what
+/// makes the deterministic `(send_id, seq)` chunk nonce safe.
 pub fn fresh_data_key() -> [u8; 32] {
     let mut k = [0u8; 32];
     k.copy_from_slice(&super::random_bytes(32));
     k
-}
-
-/// The wire blob for one `PqHybrid` voice chunk (`Envelope.blocks`-style
-/// single-element `Vec<Vec<u8>>` on `StreamChannelChunk`/`StreamDirectChunk`)
-/// - `key_setup` is the same `HybridStreamKeySetup` for every chunk of one
-/// stream to one recipient (repeated verbatim, see `HybridStreamKeySetup`'s
-/// doc for the accepted bandwidth tradeoff this implies), `ciphertext` is
-/// this specific chunk's AES-256-GCM output.
-#[derive(Serialize, Deserialize)]
-pub struct HybridVoiceChunk {
-    pub key_setup: HybridStreamKeySetup,
-    pub ciphertext: Vec<u8>,
-}
-
-/// Builds one chunk's wire blob: encrypts `pcm` under `k_data` (cheap, no
-/// asymmetric crypto) and pairs it with the cached `key_setup` from
-/// record-start.
-pub fn encrypt_hybrid_voice_chunk(
-    key_setup: &HybridStreamKeySetup,
-    k_data: &[u8; 32],
-    stream_id: u64,
-    seq: u32,
-    pcm: &[u8],
-) -> Vec<u8> {
-    let ciphertext = encrypt_hybrid_chunk(k_data, stream_id, seq, pcm);
-    let chunk = HybridVoiceChunk {
-        key_setup: key_setup.clone(),
-        ciphertext,
-    };
-    bincode_encode(&chunk)
-        .expect("HybridVoiceChunk is plain data - bincode-encoding it cannot fail")
 }

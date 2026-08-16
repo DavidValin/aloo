@@ -137,7 +137,7 @@ The private-message room (Functionality #3) titles itself the same way: `Private
 | `none` | `🚨 PLAIN` | after the name: `name 🚨 PLAIN` |
 | `pq_hybrid` | `🛡️ PQH` | after the name: `name 🛡️ PQH` |
 
-Every tag is unbracketed and trails the name, reading as an annotation on it - one shared convention across all five `my_key` types, the way `rsa_per_msg`'s always has (its identity is a moving target, a new key every message). 🔒 marks a persistent or rotating RSA identity (`rsa` file, `rsa_per_msg`); 🚨 flags the two less-durable sourcings (`password`-derived, `none`/auto-generated) that don't carry an identity across separate connections; 🛡️ is `pq_hybrid`'s own icon — file-backed and durable like `rsa`, but marked as the strongest tier (quantum-resistant signing and key exchange, each hedged with RSA-4096 — `docs/PROTOCOL.md` §13). Every tag still means real per-recipient encryption (Functionality #1, #11); the icon is about identity durability, not "unencrypted".
+Every tag is unbracketed and trails the name, reading as an annotation on it - one shared convention across all five `my_key` types, the way `rsa_per_msg`'s always has (its identity is a moving target, a new key every message). 🔒 marks a persistent or rotating RSA identity (`rsa` file, `rsa_per_msg`); 🚨 flags the two less-durable sourcings (`password`-derived, `none`/auto-generated) that don't carry an identity across separate connections; 🛡️ is `pq_hybrid`'s own icon — a file-backed, durable *identity* like `rsa`, marked as the strongest tier: quantum-resistant signing hedged with RSA-4096, and quantum-resistant key exchange hedged with X25519 whose keys rotate per peer as messages are exchanged, so a stolen keybundle does not open past traffic (`docs/PROTOCOL.md` §13, §13.10). Every tag still means real per-recipient encryption (Functionality #1, #11); the icon is about identity durability, not "unencrypted".
 
 A border wraps the sidebar, the main area, and the bottom bar. Whichever of the three currently holds keyboard focus is highlighted with a yellow border so it's clear where input goes; the bottom bar overrides this with a red border while actively recording a voice message.
 
@@ -232,7 +232,44 @@ When a tab is selected, the user joins that channel. The join is broadcast to al
     - Voice messages work the same way as text — the expensive signing/key-exchange work happens once per recording, not per 15ms chunk, so holding Space to talk feels identical to any other method.
     - Its identity is static (loaded from the keybundle file, not regenerated every session) and file-backed, so it's pinned in `id_store` exactly like `rsa`/`password` (Functionality #9) — a `pq_hybrid` nickname reconnecting under a different keybundle triggers the same identity review popup a changed `rsa` key would.
 
-12. **Leave a channel with `/leave`.** Type it in the compose bar and press Enter — no argument, it always targets the currently selected channel tab (must actually be joined, same "leaves the typed command in place if it can't act" behavior as `/file`). Leaving a private channel removes its tab outright; leaving a public channel keeps the tab but marks it not-joined, and selecting it now shows a centered rejoin prompt instead of the usual view (Enter there re-requests joining). The dwell timer (Functionality #2) never silently rejoins a channel left this way. Full model in `docs/PROTOCOL.md` §6.2/§7.0.3.
+12. **Leave a channel with `/leave`.** Type it in the compose bar and press Enter — no argument, it always targets the currently selected channel tab (must actually be joined, same "leaves the typed command in place if it can't act" behavior as `/file`). Leaving a private channel removes its tab outright; leaving a public channel keeps the tab but marks it not-joined, and selecting it now shows a centered rejoin prompt instead of the usual view (Enter there re-requests joining). The dwell timer (Functionality #2) never silently rejoins a channel left this way. Full model in `docs/PROTOCOL.md` §6.2/§7.1.3.
+
+## Protocol terms, and what implements them
+
+`docs/PROTOCOL.md` describes the protocol without naming a single Rust
+item, so that a second implementation never has to read this codebase.
+This is the bridge back: every term that document uses, against the thing
+here that implements it. If a name changes on one side, it changes on both.
+
+| Protocol term (PROTOCOL.md) | Implemented by |
+|---|---|
+| Framing, `MAX_FRAME_LEN` | `proto.rs` `frame`, `parse_frame`, `MAX_FRAME_LEN` |
+| Encoding rules (§2) | `proto.rs` `encode`, `decode`, `bincode_config` (capped at `MAX_FRAME_LEN` — see TB-172) |
+| `ClientMessage`, `ServerMessage`, `Envelope`, `UserInfo`, `KeyMode` | `proto.rs` |
+| Control channel (§1.3) | `control.rs` `ControlOffer`, `ControlAccept`, `accept_offer`, `open_accept`, `derive`, `ControlWriter`/`ControlReader`/`ControlEndpoint`, `ControlSink` |
+| Connection lifecycle (§4), auth (§5) | `server/mod.rs` `handle_connection`, `AuthConfig`; `client/connect.rs` `connect_and_handshake` |
+| Registration, nicknames (§5.4) | `server/mod.rs` `Registry::try_register` |
+| Channels (§6), password bans (§6.6) | `server/mod.rs` `Registry::{join_channel, leave_channel, unregister, channel_list, channel_password_attempts}`; `validation.rs` |
+| Direct link, candidates, punching (§7.1) | `client/p2p.rs` `PeerLinkManager`; `p2p_proto.rs` `PunchDatagram`, `RendezvousMessage`, `SAFE_DATAGRAM_BYTES` |
+| Reliable layer (§7.1.1) | `client/p2p_reliable.rs` `ArqSender`, `ArqReceiver` |
+| `P2pPayload` variants (§7.2/§7.3/§7.6) | `p2p_proto.rs` `P2pPayload` |
+| Per-recipient OAEP, chunking (§8/§8.1) | `crypto/mod.rs` `encrypt_chunked`, `decrypt_chunked`, `max_chunk_len` |
+| Password-derived keys (§8.3) | `crypto/mod.rs` `KeyPair::from_password` |
+| RSA-PSS signing (§8.4) | `crypto/mod.rs` `sign`, `verify` |
+| `rsa_per_msg` rotation (§11) | `client/rekey.rs` `OwnKeys`, `RemoteKeys`, `KEY_RETENTION`; `client/session.rs` `spawn_rotation_worker`, `request_rotation` |
+| Identity pinning (§12) | `client/idstore.rs` `IdStore`, `Trust`, `IdCheck`; `client/session.rs` `check_identity` |
+| `rsa_per_msg` resume (§12.6) | `client/own_next_keys.rs` `OwnNextKeys`; `client/rekey.rs` `verify_with_fallback` |
+| Safety phrases (§12.7) | `crypto/safety.rs` `phrase`, `WORDS` |
+| Continuity certificates (§12.7) | `crypto/pq.rs` `ContinuitySig`, `sign_continuity`, `verify_continuity`; `main.rs` `run_rekey_pq_hybrid` |
+| Identity cards (§12.7) | `crypto/pq.rs` `IdentityCard`, `make_identity_card`, `open_identity_card`; `main.rs` `run_export_identity_card` |
+| Key bundles (§13.2) | `crypto/pq.rs` `PqPublicBundle`, `PqPrivateBundle`, `PqEncapKeys`, `PqDecapKeys`, `generate_bundle` |
+| `SendBinding`, `SendSetup`, sealed sends (§13.3) | `crypto/pq.rs` `SendBinding`, `SendSetup`, `HybridSend`, `seal_setup`, `seal_send`, `seal_chunk` |
+| Opening a send (§13.4) | `crypto/pq.rs` `open_setup`, `open_send`, `open_chunk`; `client/session.rs` `decrypt_own_envelope` |
+| Replay refusal (§13.4) | `client/replay.rs` `ReplayGuard` |
+| Addressing rule (§13.6) | `client/keymode_policy.rs` `can_address` |
+| Encryption-key rotation (§13.10) | `client/pq_rekey.rs` `PqOwnKeys`, `PqPeerKeys`, `PQ_KEY_RETENTION`; `crypto/pq.rs` `PqRotation`, `sign_rotation`, `verify_rotation` |
+| Fingerprints (§12.7/§13.3) | `crypto/pq.rs` `bundle_fingerprint`, `fingerprint_of_encoded` |
+| Wire-contract constants pinned by vectors | `crypto/pq.rs` `chunk_nonce`, `hkdf_combine`, `send_commitment`; `control.rs` `derive` — see `docs/SECURITY.md`, "Test vectors" |
 
 ## Encryption: how each method actually works
 
@@ -291,8 +328,8 @@ around the `ResolvedIdentity` match in `run_connected_session`) - see
 | Encrypt (RSA methods) | `channel.rs` `encrypt_for_each` — loops recipients | `envelope.rs` `encrypt_for_one` — one recipient |
 | Encrypt (`pq_hybrid`) | same `encrypt_for_each`, dispatching via `envelope.rs` `encrypt_envelope_for` to `encrypt_hybrid_envelope_for` per `pq_hybrid` recipient | `direct_message.rs` `encrypt_for_recipient`, same dispatch |
 | Wire message | `P2pPayload::Envelope { channel: Some(_), .. }`, one per member | `P2pPayload::Envelope { channel: None, .. }` |
-| Delivery | direct peer-to-peer link, one per recipient (`docs/PROTOCOL.md` §7.0/§7.1) — the server relays only the initial candidate exchange, never the message itself | same |
-| Receive + decrypt | `session.rs` `decrypt_envelope_for` → `rekey.rs` `decrypt_from` (RSA) or `crypto/pq.rs` `decrypt_hybrid` (`pq_hybrid`, dispatched by *our own* `own_key_mode`) | same |
+| Delivery | direct peer-to-peer link, one per recipient (`docs/PROTOCOL.md` §7.1/§7.2) — the server relays only the initial candidate exchange, never the message itself | same |
+| Receive + decrypt | `session.rs` `decrypt_envelope_for` → `rekey.rs` `decrypt_from` (RSA) or `crypto/pq.rs` `open_send` (`pq_hybrid`, dispatched by *our own* `own_key_mode`, then the binding's channel and `ReplayGuard` are checked) | same |
 
 A channel message is therefore encrypted N times for N members and delivered
 over N independent direct links — the server never sees any of them.
@@ -312,7 +349,7 @@ dedicated thread — never on the async event loop.
 | Record + encrypt loop (own thread) | `voice_stream.rs` `spawn_record_stream_worker` |
 | Encrypt a chunk — channel (per recipient) | `voice_stream.rs` `build_chunk_recipients` → `p2p::P2pOutbound::ChannelVoiceChunk` |
 | Encrypt a chunk — DM | same, → `p2p::P2pOutbound::DirectVoiceChunk` |
-| Delivery | direct peer-to-peer link, unreliable/unordered per chunk (`docs/PROTOCOL.md` §7.0/§7.3) — never touches the server |
+| Delivery | direct peer-to-peer link, unreliable/unordered per chunk (`docs/PROTOCOL.md` §7.1/§7.3) — never touches the server |
 | Receiving: pick the private key **once** for the whole stream | `voice_stream.rs` `resolve_incoming_key` → `rekey.rs` `candidate_privates_for` |
 | Decrypt loop (one thread per incoming stream) | `voice_stream.rs` `spawn_stream_decrypt_worker`, decrypt in `ChunkDecryptor::decrypt` |
 
@@ -335,7 +372,7 @@ duplicating them.
 | --- | --- |
 | Offer, one per ready recipient — channel | `channel.rs` `handle_send_file` |
 | Offer — DM | `direct_message.rs` `handle_send_file` |
-| Delivery (offer, accept/reject, chunks, end) | direct peer-to-peer link, reliable (`docs/PROTOCOL.md` §7.0.1/§7.6) — the server is never involved, not even for an existence check |
+| Delivery (offer, accept/reject, chunks, end) | direct peer-to-peer link, reliable (`docs/PROTOCOL.md` §7.1.1/§7.6) — the server is never involved, not even for an existence check |
 | Incoming offer: decrypt, trust-gate, queue + bell | `session.rs` `decrypt_file_offer`, `handle_incoming_file_offer` |
 | Accept: spawn the receive worker, log the row | `session.rs` `accept_file_offer` |
 | Sender learns of Accept: spawn the send worker | `session.rs` (`P2pEvent::FileAccepted` arm) |
@@ -351,9 +388,9 @@ key is current at each moment. Full model in `docs/PROTOCOL.md` §11.
 
 | Piece | Where |
 | --- | --- |
-| Sign a new key with the key it replaces (PKCS#1 v1.5 + SHA-256) | `rekey.rs` `rotation_signing_payload`, `sign_rotation` → `crypto/mod.rs` `sign` |
+| Sign a new key with the key it replaces (RSA-PSS + SHA-256) | `rekey.rs` `rotation_signing_payload`, `sign_rotation` → `crypto/mod.rs` `sign` |
 | Verify a peer's rotation | `rekey.rs` `verify_rotation`, `verify_and_parse_rotation` → `crypto/mod.rs` `verify` |
-| Keygen, off the event loop | `rekey.rs` `generate_and_sign_rotation`, run by `session.rs` `spawn_rotation_worker`, queued via `session.rs` `request_rotation_if_per_message` |
+| Keygen, off the event loop | `rekey.rs` `generate_and_sign_rotation`, run by `session.rs` `spawn_rotation_worker`, queued via `session.rs` `request_rotation` |
 | Own per-peer keys + retained old keys | `rekey.rs` `OwnKeys` (retention bound `rekey.rs` `KEY_RETENTION`) |
 | Is a peer's key fresh? queue if not | `rekey.rs` `RemoteKeys` — `try_use`, `enqueue`, `on_rotated` |
 | Apply an incoming rotation, flush the queue | `session.rs` `handle_key_rotated` |
@@ -361,7 +398,7 @@ key is current at each moment. Full model in `docs/PROTOCOL.md` §11.
 
 Voice is exempt from per-chunk rotation (§11.6): one key snapshot covers a whole
 stream (`voice_stream.rs`), and a recipient without a fresh key (or whose
-direct link isn't `Active` yet, `docs/PROTOCOL.md` §7.0/§7.3) is dropped
+direct link isn't `Active` yet, `docs/PROTOCOL.md` §7.1/§7.3) is dropped
 from that stream (`channel.rs` in `handle_voice_record_start`) or the DM recording is refused outright
 (`direct_message.rs`).
 
@@ -374,12 +411,25 @@ material and a different, self-contained primitive set. Full model in
 
 | Piece | Where |
 | --- | --- |
-| Key bundle types + keygen | `crypto/pq.rs` `PqPublicBundle`, `PqPrivateBundle`, `generate_bundle` |
+| Key bundle types + keygen | `crypto/pq.rs` `PqPublicBundle`, `PqPrivateBundle`, `generate_bundle` (`generate_bundle_with_bits` for tests, which need real identities but not RSA-4096 keygen) — the durable signing half plus one bootstrap encryption pair |
+| Rotating encryption keys (forward secrecy) | `crypto/pq.rs` `PqEncapKeys`, `PqDecapKeys`, `generate_encryption_keys`; `client/pq_rekey.rs` `PqOwnKeys` (ours, per peer, with `PQ_KEY_RETENTION` superseded keys kept), `PqPeerKeys` (theirs, with rotation generations) |
+| Offer/accept a rotation | `crypto/pq.rs` `PqRotation`, `sign_rotation`, `verify_rotation` (signed by the durable identity, not the key replaced); `session.rs` `request_rotation` (one trigger for both rotating modes), `handle_pq_key_rotated` |
+| Safety phrase (eight words from a fingerprint) | `crypto/safety.rs` `phrase`, `WORDS` |
+| Encrypted control channel | `control.rs` `ControlOffer`/`ControlAccept` (handshake), `accept_offer`/`open_accept` (key transport, reusing `crypto::pq`'s hybrid wrap), `ControlWriter`/`ControlReader` (split, for the live client and server), `ControlEndpoint` (sequential, with `client_handshake`), `ControlSink` (the seam send paths take) |
+| Server proving its identity | `control.rs` `make_offer`/`verify_offer`; `server/mod.rs` `AuthConfig::signing_key` — signed only when the deployment has an RSA server key |
+| How much a pin is worth | `client/idstore.rs` `Trust` (`tofu`/`verified`), `check_and_pin_with`, `mark_verified`, `trust` — third column of the store file |
+| Retire an identity for a new one | `crypto/pq.rs` `ContinuitySig`, `sign_continuity`, `verify_continuity`, `PqPublicBundle::with_continuity`; `main.rs` `run_rekey_pq_hybrid` (`--rekey-pq-hybrid`); `session.rs` `continuity_proven` — a proven change re-pins with a status note instead of a review |
+| Identity card (pin before first contact) | `crypto/pq.rs` `IdentityCard`, `make_identity_card`, `open_identity_card`, `save_identity_card`, `load_identity_card`; `main.rs` `run_export_identity_card` (`--export-identity-card`) |
 | Save/load bundle files (private one `0o600` on unix) | `crypto/pq.rs` `save_public_bundle`, `load_public_bundle`, `save_private_bundle`, `load_private_bundle` |
 | CLI keygen (no `openssl` equivalent exists) | `main.rs` `run_keygen_pq_hybrid`, `--keygen-pq-hybrid` |
-| Sign-then-encrypt-then-wrap (text/file) | `crypto/pq.rs` `encrypt_hybrid_body` (sign + AES-256-GCM, once), `wrap_key_for` (ML-KEM-1024 + RSA-4096, per recipient), `encrypt_hybrid_for_one` (both together) |
-| Decrypt + dual-signature verify | `crypto/pq.rs` `decrypt_hybrid`, `unwrap_key`, `verify_body` |
-| Voice: per-stream key + per-chunk cipher | `crypto/pq.rs` `fresh_data_key`, `wrap_key_for_stream` (signs `stream_id++k_data` once), `encrypt_hybrid_voice_chunk`/`decrypt_hybrid_chunk` (deterministic nonce from `stream_id`+`seq`), `unwrap_key_for_stream` (verified once, cached) |
+| Key bundle fingerprint (identity, stable across reconnects) | `crypto/pq.rs` `bundle_fingerprint`, `fingerprint_of_encoded` |
+| Seal one send's key, bound to recipient/room/counter | `crypto/pq.rs` `SendBinding`, `SendSetup`, `seal_setup` (ML-KEM-1024 + ephemeral X25519 wrap, then ML-DSA-87 + RSA-PSS over the commitment) |
+| Open a send's key, verifying both signatures and the binding | `crypto/pq.rs` `open_setup` (refuses a setup sealed for anyone but us) |
+| Seal/open one chunk (any content type) | `crypto/pq.rs` `seal_chunk`, `open_chunk`, `chunk_nonce` (deterministic `send_id`+`seq`) |
+| One-chunk send (text, file offer) | `crypto/pq.rs` `HybridSend`, `seal_send`, `open_send`; `client/envelope.rs` `encrypt_hybrid_envelope_for` |
+| Stream setup on the wire, once per recipient | `p2p_proto.rs` `P2pPayload::StreamKeySetup`; `voice_stream.rs` `PqStreamOut::setups`, `forward_key_setup` |
+| Hold chunks that outrun their setup, replay once it verifies | `voice_stream.rs` `ChunkDecryptor::install_setup`, `MAX_PENDING_CHUNKS` |
+| Refuse a send that already arrived | `client/replay.rs` `ReplayGuard`; `session.rs` `decrypt_own_envelope` (also checks the binding's channel) |
 | Own key material in the live session | `session.rs` `SessionState::own_pq_private` (mirrors `own_keys`, populated instead of it when `own_key_mode == PqHybrid`) |
 | Who can be addressed | `keymode_policy.rs` `can_address` - a `pq_hybrid` recipient needs a `pq_hybrid` sender (their own ML-DSA-87/RSA-sign identity); everyone else is reachable by any sender, as always |
 | `id_store` pinning | `keymode_policy.rs` `uses_byte_comparison_pinning` - `pq_hybrid` joins `rsa`/`password` on the plain-byte-comparison side, unlike `rsa_per_msg`'s signature-based resume |
@@ -401,4 +451,4 @@ Server side: `server/mod.rs` `AuthConfig::verify`.
 
 ## Server responsibilities
 
-The server is only a medium of connection *setup*: it manages client connections, channel membership/broadcast, relays public key exchange (join notifications), and relays the candidate exchange that lets two clients punch a direct peer-to-peer link to each other (`docs/PROTOCOL.md` §7.0). Text, voice, and file content travel only over that direct link once it's established — the server never sees any of it, not even as ciphertext. It does not persist anything — chat/DM history lives only in each client's memory for the session. It does enforce nickname uniqueness, since that's connection bookkeeping rather than message content. It distinguishes a client explicitly leaving one channel from its connection closing entirely (Functionality #8), notifying peers with a different message for each (`docs/PROTOCOL.md` §6.2, §6.4) — but the *decision* of whether to keep an offline user's name around (grayed out) or drop it is made entirely client-side, based on that client's own private-message history, which the server has no visibility into.
+The server is only a medium of connection *setup*: it manages client connections, channel membership/broadcast, relays public key exchange (join notifications), and relays the candidate exchange that lets two clients punch a direct peer-to-peer link to each other (`docs/PROTOCOL.md` §7.1). Text, voice, and file content travel only over that direct link once it's established — the server never sees any of it, not even as ciphertext. It does not persist anything — chat/DM history lives only in each client's memory for the session. It does enforce nickname uniqueness, since that's connection bookkeeping rather than message content. It distinguishes a client explicitly leaving one channel from its connection closing entirely (Functionality #8), notifying peers with a different message for each (`docs/PROTOCOL.md` §6.2, §6.4) — but the *decision* of whether to keep an offline user's name around (grayed out) or drop it is made entirely client-side, based on that client's own private-message history, which the server has no visibility into.

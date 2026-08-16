@@ -17,7 +17,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::io::AsyncWrite;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -60,6 +59,13 @@ pub enum P2pEvent {
         channel: Option<String>,
         from: UserId,
         stream_id: u64,
+    },
+    /// A `pq_hybrid` stream's key setup, arriving reliably once, ahead of
+    /// (or racing) its chunks - see `p2p_proto::P2pPayload::StreamKeySetup`.
+    StreamKeySetup {
+        from: UserId,
+        stream_id: u64,
+        setup: Vec<u8>,
     },
     StreamChunk {
         from: UserId,
@@ -269,7 +275,7 @@ impl PeerLinkManager {
     /// whether it's safe to send on it right now.
     pub async fn ensure_link(
         &mut self,
-        wr: &mut (impl AsyncWrite + Unpin),
+        wr: &mut impl crate::control::ControlSink,
         peer: UserId,
     ) -> LinkReadiness {
         if let Some(link) = self.links.get(&peer) {
@@ -285,9 +291,7 @@ impl PeerLinkManager {
             }
         }
         let my_nonce = random_token();
-        let _ = proto::write_message(
-            wr,
-            &ClientMessage::RequestPeerLink {
+        let _ = wr.send_control(&ClientMessage::RequestPeerLink {
                 peer,
                 candidates: self.local_candidates.clone(),
                 link_nonce: my_nonce,
@@ -314,7 +318,7 @@ impl PeerLinkManager {
     /// nothing (no need to redo a working link).
     pub async fn on_peer_candidates(
         &mut self,
-        wr: &mut (impl AsyncWrite + Unpin),
+        wr: &mut impl crate::control::ControlSink,
         from: UserId,
         candidates: Vec<SocketAddr>,
         link_nonce: u64,
@@ -326,9 +330,7 @@ impl PeerLinkManager {
             return;
         }
         if !self.links.contains_key(&from) {
-            let _ = proto::write_message(
-                wr,
-                &ClientMessage::RequestPeerLink {
+            let _ = wr.send_control(&ClientMessage::RequestPeerLink {
                     peer: from,
                     candidates: self.local_candidates.clone(),
                     link_nonce,
@@ -519,6 +521,11 @@ impl PeerLinkManager {
                 channel,
                 from,
                 stream_id,
+            },
+            P2pPayload::StreamKeySetup { stream_id, setup } => P2pEvent::StreamKeySetup {
+                from,
+                stream_id,
+                setup,
             },
             P2pPayload::StreamEnd { stream_id, .. } => P2pEvent::StreamEnd { from, stream_id },
             P2pPayload::FileAccept { stream_id } => P2pEvent::FileAccepted { stream_id },

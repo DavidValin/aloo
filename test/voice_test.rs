@@ -10,7 +10,7 @@ use aloo::p2p_proto::SAFE_DATAGRAM_BYTES;
 #[test]
 fn chunk_interval_stays_under_the_p2p_safe_datagram_budget() {
     // A voice chunk now travels as one direct peer-to-peer UDP datagram
-    // (`docs/PROTOCOL.md` §7.0/§7.3), sent unreliably but still subject to
+    // (`docs/PROTOCOL.md` §7.1/§7.3), sent unreliably but still subject to
     // the same UDP-safety budget the reliable frames are - a fragmented
     // datagram is just as likely to be dropped either way. Worst-case
     // RSA-OAEP expansion (2048-bit key, `docs/PROTOCOL.md` §8.1) is

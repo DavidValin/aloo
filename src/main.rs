@@ -52,6 +52,21 @@ struct Cli {
     /// `openssl`-equivalent for ML-DSA-87/ML-KEM-1024, hence this flag.
     #[arg(long, value_name = "PREFIX")]
     keygen_pq_hybrid: Option<String>,
+
+    /// Retire an existing PQ-hybrid keybundle for a fresh one, carrying a
+    /// continuity certificate signed by the old keys - so contacts who
+    /// already pinned you move their pin across silently instead of being
+    /// asked whether you might be an impostor. Takes the old prefix and the
+    /// new one. Keep the old files until your contacts have reconnected.
+    #[arg(long, value_names = ["OLD_PREFIX", "NEW_PREFIX"], num_args = 2)]
+    rekey_pq_hybrid: Option<Vec<String>>,
+
+    /// Write an identity card for a PQ-hybrid keybundle: a small signed
+    /// file pairing your nickname with your identity, shareable by any
+    /// means. Whoever imports it has you pinned and verified before you
+    /// ever speak. Takes the keybundle prefix and the nickname.
+    #[arg(long, value_names = ["PREFIX", "NICKNAME"], num_args = 2)]
+    export_identity_card: Option<Vec<String>>,
 }
 
 /// Not `#[tokio::main]`: on macOS, delivering the global push-to-talk
@@ -65,6 +80,12 @@ fn main() -> Result<(), BoxError> {
     let cli = Cli::parse();
     if let Some(prefix) = &cli.keygen_pq_hybrid {
         return run_keygen_pq_hybrid(prefix);
+    }
+    if let Some(args) = &cli.rekey_pq_hybrid {
+        return run_rekey_pq_hybrid(&args[0], &args[1]);
+    }
+    if let Some(args) = &cli.export_identity_card {
+        return run_export_identity_card(&args[0], &args[1]);
     }
     if cli.server {
         return build_runtime()?.block_on(run_server(cli));
@@ -180,6 +201,63 @@ fn run_keygen_pq_hybrid(prefix: &str) -> Result<(), BoxError> {
     println!(
         "in the connect popup, set my_key type to pq_hybrid and point file_priv/file_pub at these two files."
     );
+    Ok(())
+}
+
+/// Generates a replacement keybundle that can prove it succeeded the old
+/// one. The certificate is signed by the keys being retired, so only
+/// someone who actually holds them can produce it - which is exactly what
+/// distinguishes a planned key change from someone taking your nickname.
+fn run_rekey_pq_hybrid(old_prefix: &str, new_prefix: &str) -> Result<(), BoxError> {
+    let old_priv = PathBuf::from(old_prefix);
+    let old_pub = PathBuf::from(format!("{old_prefix}.pub"));
+    let old_private = crypto::pq::load_private_bundle(&old_priv)?;
+    let old_public = crypto::pq::load_public_bundle(&old_pub)?;
+
+    println!("aloo: generating a replacement PQ-hybrid keybundle...");
+    println!("this involves real 4096-bit RSA keygen and can take a while.");
+    let (new_public, new_private) = crypto::pq::generate_bundle()?;
+
+    let cert = crypto::pq::sign_continuity(&old_private, &old_public, &new_public)?;
+    let new_public = new_public.with_continuity(cert);
+
+    let new_priv_path = PathBuf::from(new_prefix);
+    let new_pub_path = PathBuf::from(format!("{new_prefix}.pub"));
+    crypto::pq::save_private_bundle(&new_private, &new_priv_path)?;
+    crypto::pq::save_public_bundle(&new_public, &new_pub_path)?;
+
+    println!(
+        "wrote {} (private, keep this secret) and {} (public)",
+        new_priv_path.display(),
+        new_pub_path.display()
+    );
+    println!(
+        "the new identity carries a certificate signed by the old one, so contacts who already"
+    );
+    println!(
+        "pinned you will move across without being asked. Point the connect popup at the new files."
+    );
+    Ok(())
+}
+
+/// Writes a shareable identity card. Self-signed, which is all it claims:
+/// it proves whoever holds these keys asked to be known by this name. What
+/// makes it worth anything is the channel you send it over.
+fn run_export_identity_card(prefix: &str, nickname: &str) -> Result<(), BoxError> {
+    let private = crypto::pq::load_private_bundle(&PathBuf::from(prefix))?;
+    let public = crypto::pq::load_public_bundle(&PathBuf::from(format!("{prefix}.pub")))?;
+
+    let card = crypto::pq::make_identity_card(&private, &public, nickname)?;
+    let path = PathBuf::from(format!("{nickname}.aloo-card"));
+    crypto::pq::save_identity_card(&card, &path)?;
+
+    let fp = crypto::pq::bundle_fingerprint(&public)?;
+    println!("wrote {}", path.display());
+    println!("safety phrase: {}", crypto::safety::phrase(&fp));
+    println!(
+        "send this file however you like. Whoever imports it has you pinned and verified"
+    );
+    println!("before you have ever spoken.");
     Ok(())
 }
 

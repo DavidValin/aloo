@@ -387,7 +387,7 @@ so_that = "we can hold a conversation"
 [[user_story.acceptance_criteria]]
 id = "AC-024"
 description = "A channel message reaches every addressed member unchanged, and no one else."
-evidence = "docs/PROTOCOL.md 7.1; delivered over the direct peer-to-peer link (US-024) rather than server relay - tests direct_link_handshake_and_reliable_message_end_to_end, message_delivery.feature 'A channel message reaches the member it was addressed to, unchanged'"
+evidence = "docs/PROTOCOL.md 7.2; delivered over the direct peer-to-peer link (US-024) rather than server relay - tests direct_link_handshake_and_reliable_message_end_to_end, message_delivery.feature 'A channel message reaches the member it was addressed to, unchanged'"
 
 [[user_story.acceptance_criteria]]
 id = "AC-025"
@@ -402,7 +402,7 @@ evidence = "tests enter_before_channel_is_joined_does_not_send_and_keeps_the_typ
 [[user_story.technical_behavior]]
 id = "TB-028"
 description = "The sender addresses every other current member individually and excludes itself from the recipient list."
-evidence = "docs/PROTOCOL.md 7.1, 8; test typing_and_enter_sends_channel_text_excluding_self"
+evidence = "docs/PROTOCOL.md 7.2, 8; test typing_and_enter_sends_channel_text_excluding_self"
 
 [[user_story.technical_behavior]]
 id = "TB-031"
@@ -1355,6 +1355,266 @@ description = "PqPublicBundle/HybridEnvelope are carried opaquely inside the exi
 evidence = "docs/PROTOCOL.md 13; src/proto.rs Envelope, UserInfo (unchanged shape); src/crypto/pq.rs PqPublicBundle, HybridEnvelope; test encrypt_hybrid_for_one_round_trips_via_wire_encoding"
 
 # ============================================================================
+# US-027 - One sealed layout for every kind of pq_hybrid content
+# ============================================================================
+[[user_story]]
+id = "US-027"
+title = "One sealed layout for every kind of pq_hybrid content"
+as_a = "user of the quantum-resistant identity"
+i_want = "everything I receive to name me as its intended recipient, whatever kind of content it is"
+so_that = "nothing I am shown was ever meant for somebody else, and nothing I already read can be pushed at me again"
+
+[[user_story.acceptance_criteria]]
+id = "AC-111"
+description = "A pq_hybrid send - text, file offer, voice stream or file transfer - is sealed as one setup naming its recipient, its room and its send counter, plus the content in chunks under the key that setup authorises. A one-chunk send is the whole of a text message; a stream is the same construction with more chunks."
+evidence = "docs/PROTOCOL.md; src/crypto/pq.rs seal_send, seal_setup, seal_chunk; pq_hybrid_sends.feature 'A sealed message reaches the person it was sealed for'; tests encrypt_then_decrypt_hybrid_round_trips, a_stream_of_chunks_opens_under_its_setups_key"
+
+[[user_story.acceptance_criteria]]
+id = "AC-112"
+description = "A send names the identity it was sealed for, so a legitimate recipient cannot re-wrap it and pass it off as a message addressed to somebody else - the third party's own open fails closed rather than yielding a message they were never sent."
+evidence = "docs/PROTOCOL.md; src/crypto/pq.rs SendBinding.recipient_fp, open_setup; pq_hybrid_sends.feature 'A message sealed for someone else is refused'; tests a_send_sealed_for_one_recipient_does_not_open_for_another, open_setup_rejects_a_setup_sealed_for_someone_else"
+
+[[user_story.acceptance_criteria]]
+id = "AC-113"
+description = "A send is bound to the room it belongs to: a private message replayed into a channel (or a channel message into a private room) is refused, because the receiving side compares the binding's channel against the payload the send actually arrived on."
+evidence = "docs/PROTOCOL.md; src/crypto/pq.rs SendBinding.channel; src/client/session.rs decrypt_own_envelope; pq_hybrid_sends.feature 'A private message replayed into a channel is refused'; test a_private_send_does_not_open_as_a_channel_send"
+
+[[user_story.acceptance_criteria]]
+id = "AC-114"
+description = "A send that already arrived once is refused if it arrives again: a send_id must strictly exceed everything already accepted from that peer. Gaps are expected and accepted, since the counter is per connection rather than per recipient."
+evidence = "docs/PROTOCOL.md; src/client/replay.rs ReplayGuard; pq_hybrid_sends.feature 'A message that already arrived once is refused the second time'; tests a_repeated_send_id_is_refused, a_gap_in_send_ids_is_accepted"
+
+[[user_story.acceptance_criteria]]
+id = "AC-115"
+description = "A voice or file stream is sealed by the identical construction a text message uses: one setup, then chunks. The setup travels once (P2pPayload::StreamKeySetup, reliably) rather than being repeated in every chunk, so a chunk carries ciphertext only and stays under SAFE_DATAGRAM_BYTES instead of fragmenting."
+evidence = "docs/PROTOCOL.md; src/p2p_proto.rs P2pPayload::StreamKeySetup; src/client/voice_stream.rs PqStreamOut, ChunkDecryptor::install_setup; pq_hybrid_sends.feature 'Streamed content is sealed exactly like a text message'; test a_stream_of_chunks_opens_under_its_setups_key"
+
+[[user_story.technical_behavior]]
+id = "TB-160"
+description = "There is one seal/open pair for every pq_hybrid content type - text, file offers, voice and file chunks all go through seal_setup/open_setup plus seal_chunk/open_chunk, with seal_send/open_send as the one-chunk convenience. No content type has a layout of its own."
+evidence = "docs/PROTOCOL.md; src/crypto/pq.rs (SendSetup, HybridSend); src/client/envelope.rs encrypt_hybrid_envelope_for; src/client/voice_stream.rs build_chunk_recipients; pq_hybrid_sends.feature 'Streamed content is sealed exactly like a text message'"
+
+[[user_story.technical_behavior]]
+id = "TB-161"
+description = "Every chunk's AES-256-GCM nonce is the deterministic big-endian send_id ++ seq, unique for the life of one send's freshly-random k_data - so no chunk needs fresh OS randomness, and two chunks of one send never repeat a nonce."
+evidence = "docs/PROTOCOL.md; src/crypto/pq.rs chunk_nonce; pq_hybrid_sends.feature 'Two chunks of one send never repeat a nonce'; tests same_plaintext_produces_different_ciphertext_under_different_seq, decrypting_a_chunk_with_the_wrong_seq_fails"
+
+[[user_story.technical_behavior]]
+id = "TB-162"
+description = "Every RSA signature this app produces uses RSA-PSS with SHA-256 and a random salt (crypto::sign/verify), not PKCS#1 v1.5 - covering both the pq_hybrid send commitment's classical half and rsa_per_msg's key-rotation signature, since both go through that one pair."
+evidence = "docs/PROTOCOL.md; src/crypto/mod.rs sign, verify; tests signing_the_same_payload_twice_gives_different_signatures, a_pss_signature_does_not_verify_against_tampered_bytes, sign_verify_roundtrip"
+
+[[user_story.technical_behavior]]
+id = "TB-163"
+description = "A pq_hybrid stream's chunks may outrun the reliable setup they depend on (voice chunks travel unreliably), so a receiver holds up to MAX_PENDING_CHUNKS of them and replays the backlog in arrival order once the setup verifies; beyond that bound further chunks are dropped rather than buffered without limit."
+evidence = "docs/PROTOCOL.md; src/client/voice_stream.rs ChunkDecryptor (MAX_PENDING_CHUNKS, install_setup); test chunks_arriving_before_the_setup_are_replayed_once_it_lands"
+
+# ============================================================================
+# US-028 - Losing a key today does not expose what was said yesterday
+# ============================================================================
+[[user_story]]
+id = "US-028"
+title = "Losing a key today does not expose what was said yesterday"
+as_a = "user of the quantum-resistant identity"
+i_want = "the keys that unlock my messages thrown away as I go"
+so_that = "someone who later steals my keybundle still cannot read what I already said"
+
+[[user_story.acceptance_criteria]]
+id = "AC-116"
+description = "A pq_hybrid identity splits into a durable signing half (ML-DSA-87 + RSA-4096, in the keybundle file, pinned by contacts, never rotated) and an encryption half (ML-KEM-1024 + X25519) that is regenerated per peer relationship as messages are exchanged. Messages seal to the peer's current rotated key; a peer who has not rotated yet is still reachable on the bootstrap key from their bundle. Each relationship rotates independently."
+evidence = "docs/PROTOCOL.md 13.10; src/crypto/pq.rs PqEncapKeys, generate_encryption_keys; src/client/pq_rekey.rs PqOwnKeys, PqPeerKeys; pq_hybrid_forward_secrecy.feature 'A message still reaches its recipient after keys have rotated'; tests a_message_opens_under_the_key_the_peer_rotated_to, the_bootstrap_key_still_opens_a_message_from_a_peer_who_never_rotated, rotation_is_independent_per_peer"
+
+[[user_story.acceptance_criteria]]
+id = "AC-117"
+description = "A superseded encryption key is destroyed once it falls out of the retention window, so neither the keys still held nor the keybundle file on disk can open a message that was sealed to it. The exception, documented rather than hidden, is a first message exchanged before either side has rotated: that one is sealed to the bootstrap key the file does hold."
+evidence = "docs/PROTOCOL.md 13.10; src/client/pq_rekey.rs PqOwnKeys::rotate_for, candidates_for, PQ_KEY_RETENTION; pq_hybrid_forward_secrecy.feature 'A stolen keybundle does not open yesterday''s message'; tests a_key_pushed_out_of_the_retention_window_cannot_open_its_message, forgetting_a_peer_drops_their_keys"
+
+[[user_story.acceptance_criteria]]
+id = "AC-118"
+description = "Every rotation is signed by the sender's durable identity (both ML-DSA-87 and RSA-PSS) rather than by the key it replaces, so each one is independently verifiable against the bundle a contact already pinned - no chain to break, and no resume mechanism needed across a reconnect. A rotation signed by anyone else, or one whose generation is not newer than the last accepted, is dropped and leaves the trusted key untouched."
+evidence = "docs/PROTOCOL.md 13.10; src/crypto/pq.rs sign_rotation, verify_rotation; src/client/pq_rekey.rs PqPeerKeys::install; src/client/session.rs handle_pq_key_rotated; pq_hybrid_forward_secrecy.feature 'A rotation is only trusted if the identity itself signed it'; tests a_rotation_is_trusted_only_if_the_identity_signed_it, an_older_rotation_generation_is_not_installed"
+
+[[user_story.acceptance_criteria]]
+id = "AC-119"
+description = "A rotation commits to who it is for - both the recipient's live UserId and their durable identity fingerprint - so one peer cannot replay a rotation addressed to another as though it were meant for them."
+evidence = "docs/PROTOCOL.md 13.10; src/crypto/pq.rs rotation_commitment; pq_hybrid_forward_secrecy.feature 'A rotation names who it is for'; test a_rotation_meant_for_one_peer_is_refused_by_another"
+
+[[user_story.technical_behavior]]
+id = "TB-164"
+description = "Up to PQ_KEY_RETENTION superseded decryption keys are kept per peer so a burst of messages sent under one key, or a message already in flight when we rotate, still opens; anything older is discarded, and that bound is what the forward-secrecy guarantee rests on. Same value and reasoning as rekey::KEY_RETENTION."
+evidence = "docs/PROTOCOL.md 13.10; src/client/pq_rekey.rs PQ_KEY_RETENTION, candidates_for; pq_hybrid_forward_secrecy.feature 'A few recent keys are kept so a burst of messages still opens'; test recent_keys_are_retained_so_a_burst_still_opens"
+
+[[user_story.technical_behavior]]
+id = "TB-165"
+description = "The per-recipient key wrap combines an ML-KEM-1024 shared secret with an X25519 shared secret from a per-send ephemeral keypair, via HKDF-SHA256 - so recovering the wrapped key needs both, and the ephemeral half gives forward secrecy on the sender's side too. This replaces the RSA-OAEP classical half used before rotation existed: X25519 keygen is fast enough to rotate per message, which RSA-4096 is not (the same pairing X-Wing uses, at a higher ML-KEM parameter set). RSA-4096 remains the classical hedge on the signing side."
+evidence = "docs/PROTOCOL.md 13.3/13.10; src/crypto/pq.rs wrap_key_for, unwrap_key, hkdf_combine; tests the_wrap_needs_both_the_kem_and_the_x25519_halves, wrap_key_for_and_unwrap_key_round_trip"
+
+[[user_story.technical_behavior]]
+id = "TB-166"
+description = "Rotation runs inline on the event loop rather than on rekey's dedicated worker thread, because ML-KEM-1024 and X25519 keygen are microseconds against RSA-4096's hundreds of milliseconds - so pq_hybrid needs neither the rotation spinner nor rsa_per_msg's carve-out exempting voice from per-message rotation. One trigger, session::request_rotation, serves both rotating modes and is a no-op for the static ones."
+evidence = "docs/PROTOCOL.md 13.10; src/client/session.rs request_rotation, request_rotation_if_pq_hybrid; src/client/pq_rekey.rs (module doc); test every_rotation_produces_new_keys_with_no_machinery_behind_it"
+
+[[user_story.technical_behavior]]
+id = "TB-167"
+description = "The server relays RotateKey for both rotating modes (rsa_per_msg and pq_hybrid) and refuses it from the static ones, which have nothing to rotate; it still verifies nothing about the payload or signature, exactly as before."
+evidence = "docs/PROTOCOL.md 7.5/13.10; src/server/mod.rs route_key_rotation; test rotate_key_is_rejected_from_a_non_rotating_sender"
+
+# ============================================================================
+# US-029 - Proving an identity is still the same one
+# ============================================================================
+[[user_story]]
+id = "US-029"
+title = "Proving an identity is still the same one"
+as_a = "user who has talked to someone before"
+i_want = "a planned key change to prove itself, and a real identity to be verifiable"
+so_that = "the warning I get means something when it finally appears"
+
+[[user_story.acceptance_criteria]]
+id = "AC-120"
+description = "An identity's fingerprint renders as an eight-word safety phrase drawn from a fixed 256-word list, stable for a given identity and different for a different one, so two people can confirm each other over any channel they already trust. The fingerprint covers the identity's keys only, not the continuity certificate, so attaching one never changes the phrase a user reads out."
+evidence = "docs/PROTOCOL.md 12.7; src/crypto/safety.rs phrase, WORDS; src/crypto/pq.rs bundle_fingerprint; identity_continuity.feature 'The same identity always reads out the same safety phrase'; tests a_safety_phrase_is_stable_and_distinguishes_identities, a_safety_phrase_is_eight_readable_words, a_single_changed_byte_changes_the_phrase, the_word_list_has_no_duplicates"
+
+[[user_story.acceptance_criteria]]
+id = "AC-121"
+description = "A pin records how much it is worth: `tofu` for something believed because it turned up first, `verified` once a human has confirmed it out of band. Re-pinning never silently demotes a verified pin, the level survives save/load, and a store written before the column existed loads as `tofu` rather than being discarded - losing a user's pins would cost real security."
+evidence = "docs/PROTOCOL.md 12.7; src/client/idstore.rs Trust, check_and_pin_with, mark_verified, trust; identity_continuity.feature 'A pin can be raised from trusted-on-sight to verified'; tests a_pin_starts_trusted_on_sight_and_can_be_raised_to_verified, re_pinning_does_not_silently_demote_a_verified_pin, trust_survives_a_save_and_load_round_trip, a_store_without_a_trust_column_loads_as_trusted_on_sight, on_disk_format_is_hex_encoded_not_raw_or_base64"
+
+[[user_story.acceptance_criteria]]
+id = "AC-122"
+description = "A pq_hybrid identity generated by `aloo --rekey-pq-hybrid <old> <new>` carries a continuity certificate: the retired identity's ML-DSA-87 + RSA-PSS signature over the replacement's fingerprint. A peer holding the old pin verifies it and moves the pin across silently, with a status note and no review popup - so the review is left to mean 'this change is unexplained'."
+evidence = "docs/PROTOCOL.md 12.7; src/crypto/pq.rs ContinuitySig, sign_continuity, verify_continuity, with_continuity; src/main.rs run_rekey_pq_hybrid; src/client/session.rs continuity_proven, check_identity; identity_continuity.feature 'A planned key change proves itself and raises no alarm'; tests a_replacement_identity_proves_it_succeeded_the_pinned_one, continuity_holds_across_successive_rekeys"
+
+[[user_story.acceptance_criteria]]
+id = "AC-123"
+description = "Forging continuity needs the retired identity's private keys, which knowing its public fingerprint does not give. A bundle with no certificate, one signed by different keys, or a genuine certificate lifted onto another bundle all fail to verify, and a failure leaves the existing pin exactly as it was and opens the ordinary review."
+evidence = "docs/PROTOCOL.md 12.7; src/crypto/pq.rs verify_continuity; identity_continuity.feature 'A stranger taking the nickname cannot fake continuity'; tests an_unrelated_identity_cannot_prove_continuity, a_certificate_signed_by_the_wrong_keys_is_refused, a_certificate_does_not_transfer_to_another_bundle"
+
+[[user_story.acceptance_criteria]]
+id = "AC-124"
+description = "`aloo --export-identity-card <prefix> <nickname>` writes a small self-signed file pairing a nickname with an identity, shareable by any means. Importing one pins that nickname as verified before first contact - the one thing pinning alone can never do, since a first sighting has nothing to compare against."
+evidence = "docs/PROTOCOL.md 12.7; src/crypto/pq.rs IdentityCard, make_identity_card, open_identity_card, save_identity_card, load_identity_card; src/main.rs run_export_identity_card; identity_continuity.feature 'An identity card pins someone before you ever speak'; tests an_identity_card_round_trips_and_names_its_owner, an_identity_card_survives_being_written_and_read_back"
+
+[[user_story.acceptance_criteria]]
+id = "AC-125"
+description = "A card whose nickname was altered, whose bundle was swapped for someone else's, or whose bytes are corrupt is refused rather than pinned - the signature covers both the nickname and the identity fingerprint together."
+evidence = "docs/PROTOCOL.md 12.7; src/crypto/pq.rs card_commitment, open_identity_card; identity_continuity.feature 'A tampered identity card is refused'; tests a_card_whose_nickname_was_altered_is_refused, a_card_whose_bundle_was_swapped_is_refused, a_corrupted_card_file_is_refused_rather_than_trusted"
+
+[[user_story.technical_behavior]]
+id = "TB-168"
+description = "bundle_fingerprint covers the identity fields (ML-DSA verifying key, RSA signing key, bootstrap encryption keys) and excludes the continuity certificate - otherwise a certificate would have to sign the fingerprint of a bundle that already contains it. fingerprint_of_encoded is the same value computed from a bundle still in announced form, returning None if those bytes are not a bundle."
+evidence = "docs/PROTOCOL.md 12.7/13.3; src/crypto/pq.rs bundle_fingerprint, fingerprint_of_encoded; test a_replacement_identity_proves_it_succeeded_the_pinned_one"
+
+# ============================================================================
+# US-030 - Keeping the setup conversation off the wire too
+# ============================================================================
+[[user_story]]
+id = "US-030"
+title = "Keeping the setup conversation off the wire too"
+as_a = "user on a network I do not control"
+i_want = "the conversation that sets my session up encrypted as well"
+so_that = "someone watching the wire learns neither my password nor who I talk to"
+
+[[user_story.acceptance_criteria]]
+id = "AC-126"
+description = "The server opens each connection with an ephemeral ML-KEM-1024 + X25519 offer in its Hello; the client transports a random secret to it (reusing crypto::pq's hybrid wrap, so recovering it needs both primitives) as ClientMessage::SecureChannel, and both sides derive two directional AES-256-GCM keys. Every frame after that, in both directions, is sealed; the length-prefix framing is unchanged. A client that sends anything but SecureChannel first is not talked to at all - there is no plaintext fallback to downgrade to."
+evidence = "docs/PROTOCOL.md 1.3; src/control.rs ControlOffer, accept_offer, open_accept, ControlWriter, ControlReader, ControlEndpoint; src/server/mod.rs handle_connection; src/client/connect.rs connect_and_handshake; control_channel.feature 'The setup conversation is encrypted before anything is said'; tests both_sides_agree_on_the_same_keys, frames_are_sealed_once_the_tunnel_is_on, the_endpoint_handshake_turns_the_channel_on"
+
+[[user_story.acceptance_criteria]]
+id = "AC-127"
+description = "The credential a --password deployment sends, previously in the clear, no longer appears anywhere in the bytes on the wire; the same applies to nicknames, channel names, membership and key-rotation traffic, all of which now travel inside the tunnel. What the server itself learns is unchanged (it still routes by these) - only what an observer in between learns."
+evidence = "docs/PROTOCOL.md 1.3/10; src/control.rs (module doc), ControlWriter::send; control_channel.feature 'A password does not appear on the wire'; test the_password_is_not_recoverable_from_the_sealed_bytes"
+
+[[user_story.acceptance_criteria]]
+id = "AC-128"
+description = "A server started with an RSA server key signs its per-connection offer with it, and a client configured with that key requires a valid signature - an unsigned offer, one signed by another key, or one whose keys were swapped after signing are all refused, since each is what a man in the middle would produce. A client with no server key has nothing to check against and accepts the offer: encrypted, but not authenticated, which is documented as the limit of that mode rather than implied away."
+evidence = "docs/PROTOCOL.md 1.3; src/control.rs make_offer, verify_offer, offer_commitment; src/server/mod.rs AuthConfig::signing_key; control_channel.feature 'A server that can be identified must prove it'; tests a_client_holding_the_server_key_requires_a_valid_signature, an_offer_signed_by_another_key_is_refused, swapping_the_keys_inside_a_signed_offer_is_refused, a_client_without_a_server_key_accepts_any_offer"
+
+[[user_story.technical_behavior]]
+id = "TB-169"
+description = "Each direction has its own key (so a captured frame cannot be reflected back) and its own counter, which forms the AES-GCM nonce - so identical plaintext sealed twice never produces identical bytes. A frame that fails its authentication tag is a hard error, never a skipped message: on an encrypted channel that means tampering or desynchronised counters, and both are fatal."
+evidence = "docs/PROTOCOL.md 1.3; src/control.rs derive, nonce, seal, open; control_channel.feature 'The same message twice does not look the same twice'; tests repeating_a_message_does_not_repeat_the_ciphertext, a_tampered_frame_fails_to_authenticate"
+
+[[user_story.technical_behavior]]
+id = "TB-170"
+description = "The server's control-channel keys are ephemeral per connection and discarded with it, so recording a session and later stealing the server's long-term key does not decrypt it. The long-term key only ever signs the offer, never encrypts anything."
+evidence = "docs/PROTOCOL.md 1.3; src/server/mod.rs handle_connection (generate_encryption_keys per connection); src/control.rs (module doc); test a_different_server_cannot_recover_the_secret (TB-170)"
+
+[[user_story.technical_behavior]]
+id = "TB-171"
+description = "Client send paths (joining a channel, requesting a peer link, rotating a key) take the control::ControlSink trait rather than naming a concrete writer, so the live client's split-stream ControlWriter and anything driving a connection sequentially (ControlEndpoint) share one set of call paths instead of duplicated ones."
+evidence = "src/control.rs ControlSink; src/client/channel.rs, src/client/direct_message.rs, src/client/p2p.rs (send paths); test the_endpoint_handshake_turns_the_channel_on (TB-171)"
+
+# ============================================================================
+# US-031 - Surviving input nobody meant to send
+# ============================================================================
+[[user_story]]
+id = "US-031"
+title = "Surviving input nobody meant to send"
+as_a = "user whose client talks to strangers over a network"
+i_want = "malformed, truncated or hostile input to fail as an error"
+so_that = "nobody can crash my client by sending it nonsense"
+
+[[user_story.acceptance_criteria]]
+id = "AC-129"
+description = "Every decode path reachable by a remote peer or a local file - protocol messages, P2P payloads, punch datagrams, key bundles, send setups, rotations, control offers, frames, DER keys, hex - refuses random bytes, truncations and bit flips as errors rather than panicking or aborting."
+evidence = "docs/SECURITY.md 'Robustness'; test/robustness_test.rs (random_bytes_never_panic_any_decoder, truncating_a_valid_message_never_panics, bit_flips_in_valid_messages_never_panic, opening_garbage_chunks_never_panics); malformed_input.feature 'Nonsense from a stranger is refused, not fatal'"
+
+[[user_story.technical_behavior]]
+id = "TB-172"
+description = "The bincode decoder is capped at MAX_FRAME_LEN. Without the cap, decoding is a remote denial of service: bincode reserves whatever a length prefix claims, and those prefixes sit *inside* the payload where the frame-length check never sees them, so a dozen crafted bytes could abort the process on a failed allocation before any field was read. A length prefix past the cap is likewise a frame error, not an allocation."
+evidence = "docs/SECURITY.md; src/proto.rs bincode_config (with_limit), parse_frame; tests random_bytes_never_panic_any_decoder, an_absurd_length_prefix_is_refused_not_allocated, bit_flips_in_valid_messages_never_panic"
+
+[[user_story.technical_behavior]]
+id = "TB-173"
+description = "Local files a user may hand-edit or that arrive from elsewhere - the identity store and identity cards - load whatever survived rather than failing or crashing, and a card assembled from noise never verifies."
+evidence = "docs/SECURITY.md; src/client/idstore.rs load; src/crypto/pq.rs load_identity_card, open_identity_card; tests a_damaged_identity_store_still_loads, a_garbage_identity_card_file_is_refused_without_panicking, a_card_decoded_from_noise_never_verifies"
+
+[[user_story.technical_behavior]]
+id = "TB-174"
+description = "aloo's own constructions - the key-wrap combiner, send commitments, chunk nonces, control-channel key derivation and safety phrases - are pinned by committed test vectors, so an independent implementation can check itself and the wire format cannot drift unnoticed. The standard primitives (ML-KEM-1024, ML-DSA-87) are deliberately not re-tested here: their crates cover the NIST vectors upstream, and duplicating that would prove nothing about this codebase."
+evidence = "docs/SECURITY.md 'Test vectors'; test/vectors_test.rs (chunk_nonce_vectors, key_wrap_combiner_vectors, send_commitment_vectors, sealed_chunk_vector, control_channel_key_vectors, safety_phrase_vectors)"
+
+# ============================================================================
+# US-032 - Documentation that can be trusted and acted on
+# ============================================================================
+[[user_story]]
+id = "US-032"
+title = "Documentation that can be trusted and acted on"
+as_a = "person implementing this protocol, or deciding whether to trust it"
+i_want = "the protocol described without reference to its implementation, and the bridge back kept accurate"
+so_that = "I can write a second implementation without reading this codebase, and find the code when I need it"
+
+[[user_story.acceptance_criteria]]
+id = "AC-130"
+description = "docs/PROTOCOL.md describes the protocol in neutral pseudocode with sequence diagrams and names no Rust item, type, syntax or source path; docs/SPEC.md carries a mapping from every protocol term to the item implementing it, and every mapped item exists in src/; docs/SECURITY.md keeps stating its limits (no independent review, partial post-compromise security, trust-on-first-use, no deniability) and not only its strengths. All three are machine-checked, because each is easy to break by accident and invisible in review."
+evidence = "docs/PROTOCOL.md; docs/SPEC.md 'Protocol terms, and what implements them'; docs/SECURITY.md; test/docs_test.rs (the_protocol_document_contains_no_rust, every_mapped_item_exists_in_the_source, the_security_document_states_its_limits)"
+
+[[user_story.acceptance_criteria]]
+id = "AC-131"
+description = "PROTOCOL.md opens with an overview of what connects to what - one continuous server connection plus one direct link per peer (not per channel), carrying that peer's channel messages, DMs, voice and files alike - followed by a table of every message on each connection, and a pointer to the sequence diagrams in section 15. The tables are checked against the message enums themselves, so a message cannot be added to the protocol without appearing in the overview."
+evidence = "docs/PROTOCOL.md 'Overview: the connections, and what travels on each', 15; test/docs_test.rs (the_overview_lists_every_message, the_overview_states_the_connection_shape_and_links_the_diagrams)"
+
+[[user_story.acceptance_criteria]]
+id = "AC-132"
+description = "PROTOCOL.md's section numbers run consecutively from 1 with no gaps at every level, and it opens with a linked contents list that matches its sections exactly, anchors included. Both are machine-checked: a gap means a section was deleted without regard for what pointed at it, and a drifted contents list sends readers somewhere wrong, which is worse than having none."
+evidence = "docs/PROTOCOL.md 'Contents'; test/docs_test.rs (section_numbers_run_consecutively_with_no_gaps, the_contents_list_matches_the_sections)"
+
+[[user_story.acceptance_criteria]]
+id = "AC-133"
+description = "Every PROTOCOL.md section cited from anywhere - the other documents, the requirements, source comments, tests, and PROTOCOL.md itself - refers to a section that exists. Checked rather than trusted, because a reference to a moved section still reads fine in a diff and only misleads whoever follows it later; an audit of this kind found one such reference that had survived a long time."
+evidence = "test/docs_test.rs (every_referenced_protocol_section_exists); docs/PROTOCOL.md; docs/SPEC.md; requirements/requirements.toml"
+
+[[user_story.acceptance_criteria]]
+id = "AC-134"
+description = "Every code reference in the documents or the sources - a path and line, or a backticked item name and the line it is declared on, the convention docs/HOW.md asks contributors to keep in sync - points somewhere real: the file exists, the line is within it and is not blank, and a named item is declared on exactly that line. References inside fenced code blocks are not references (shell arguments and image tags share the shape). Because the tree currently holds none, a companion test pins the checker's own behaviour, so a broken scanner and a clean tree cannot look alike."
+evidence = "docs/HOW.md (the convention); test/docs_test.rs (every_file_and_line_reference_points_somewhere_real, the_reference_check_detects_a_broken_reference)"
+
+[[user_story.technical_behavior]]
+id = "TB-175"
+description = "PROTOCOL.md section numbering is stable: 142 requirement evidence strings and ~188 source comments reference sections by number, so the document is reorganised by adding sections (14: the four methods side by side, 15: sequences) rather than renumbering wholesale, since stale cross-references mislead worse than an imperfect structure. The one renumbering done deliberately - section 7's subsections, closing a 7.0 start and a 7.2 tombstone - was applied to every reference across docs, source and requirements in the same change."
+evidence = "docs/PROTOCOL.md 14, 15; requirements/requirements.toml (evidence strings referencing PROTOCOL sections); test the_protocol_document_contains_no_rust"
+
+# ============================================================================
 # US-021 - Connect with pq_hybrid without any manual key preparation
 # ============================================================================
 [[user_story]]
@@ -1522,7 +1782,7 @@ evidence = "src/client/session.rs handle_server_message's UserJoined arm (ensure
 [[user_story.technical_behavior]]
 id = "TB-155"
 description = "A client only responds to an incoming PeerCandidates (the P2P link handshake) from a peer it currently shares a joined channel with; a request from anyone else is silently dropped before it ever reaches PeerLinkManager, since the server's own relay performs no relationship checking of its own."
-evidence = "docs/PROTOCOL.md 7.0.2; src/client/session.rs handle_server_message's PeerCandidates arm; src/client/tui/channel.rs UiState::shares_a_joined_channel"
+evidence = "docs/PROTOCOL.md 7.1.2; src/client/session.rs handle_server_message's PeerCandidates arm; src/client/tui/channel.rs UiState::shares_a_joined_channel"
 
 # ============================================================================
 # US-025 - Protect a private channel with a password
@@ -1597,4 +1857,4 @@ evidence = "src/client/tui/channel.rs UiState::tick_dwell; test dwell_does_not_r
 [[user_story.technical_behavior]]
 id = "TB-158"
 description = "Leaving a channel - locally via /leave, or being told a peer left via UserLeft - drops the P2P link to any peer with whom no joined channel or DM history remains (UiState::has_reason_to_keep_link), the same bar on_user_offline already uses to decide whether to keep a departed user listed."
-evidence = "docs/PROTOCOL.md 7.0.3; src/client/channel.rs handle_leave; src/client/session.rs UserLeft arm; tests has_reason_to_keep_link_is_true_for_a_shared_channel, has_reason_to_keep_link_is_true_for_dm_history, has_reason_to_keep_link_is_false_with_neither"
+evidence = "docs/PROTOCOL.md 7.1.3; src/client/channel.rs handle_leave; src/client/session.rs UserLeft arm; tests has_reason_to_keep_link_is_true_for_a_shared_channel, has_reason_to_keep_link_is_true_for_dm_history, has_reason_to_keep_link_is_false_with_neither"

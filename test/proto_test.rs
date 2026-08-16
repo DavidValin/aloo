@@ -339,9 +339,11 @@ fn multiple_frames_can_be_parsed_sequentially_from_one_buffer() {
 async fn async_write_then_read_message_roundtrip() {
     let (mut client, mut server) = tokio::io::duplex(4096);
 
+    let (encap, _) = aloo::crypto::pq::generate_encryption_keys();
     let hello = ServerMessage::Hello {
         auth: AuthKind::Rsa,
         challenge: Some(vec![1, 2, 3]),
+        control: aloo::control::make_offer(encap, None).expect("offer"),
     };
     write_message(&mut server, &hello).await.expect("write");
 
