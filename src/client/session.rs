@@ -1,9 +1,9 @@
 //! The live, connected session: the event loop, session-wide state, and
 //! the rsa_per_msg key-rotation / identity-pinning bookkeeping that isn't
 //! specific to a channel or a DM. Per-conversation-type send/receive
-//! handling lives in `crate::channel` and `crate::direct_message`; the
+//! handling lives in `crate::client::channel` and `crate::client::direct_message`; the
 //! generic live-voice-streaming plumbing they both share lives in
-//! `crate::voice_stream`.
+//! `crate::client::voice_stream`.
 
 use std::collections::HashMap;
 use std::io::Stdout;
@@ -19,22 +19,22 @@ use tokio::io::AsyncWrite;
 use tokio::net::TcpStream;
 
 use crate::BoxError;
-use crate::connect::ResolvedIdentity;
+use crate::client::connect::ResolvedIdentity;
 use crate::crypto;
-use crate::file_stream;
-use crate::idstore;
-use crate::netstats;
-use crate::own_next_keys;
-use crate::p2p::{self, P2pEvent, P2pOutbound, PeerLinkManager};
+use crate::client::file_stream;
+use crate::client::idstore;
+use crate::client::netstats;
+use crate::client::own_next_keys;
+use crate::client::p2p::{self, P2pEvent, P2pOutbound, PeerLinkManager};
 use crate::p2p_proto::P2pPayload;
 use crate::proto::{
     self, ClientMessage, Content, Envelope, KeyMode, ServerMessage, UserId, UserInfo,
 };
-use crate::rekey;
-use crate::sysstats;
-use crate::ui::ui::{self, IdentityCase, PendingFileOffer, UiAction, UiState, VoiceTarget};
-use crate::voice;
-use crate::voice_stream;
+use crate::client::rekey;
+use crate::client::sysstats;
+use crate::client::tui::ui::{self, IdentityCase, PendingFileOffer, UiAction, UiState, VoiceTarget};
+use crate::client::voice;
+use crate::client::voice_stream;
 
 /// How long an incoming stream can go without a chunk/end before it's
 /// treated as abandoned - see `voice_stream::STREAM_IDLE_TIMEOUT`.
@@ -153,7 +153,7 @@ pub(crate) struct SessionState {
     /// is being replayed.
     pub(crate) active_replay_id: Option<u64>,
     /// The session's one direct client<->client UDP transport - see
-    /// `crate::p2p`. Every text/voice/file send that used to go to the
+    /// `crate::client::p2p`. Every text/voice/file send that used to go to the
     /// server now goes through this instead; the server keeps handling
     /// only auth/identify/channel-membership/presence and the initial
     /// candidate exchange this relies on.
@@ -238,22 +238,10 @@ pub(crate) async fn run_connected_session(
     keyboard_release_reporting: bool,
     id_store: idstore::IdStore,
     own_next_keys: Option<own_next_keys::OwnNextKeys>,
-    mut hotkey_rx: Option<tokio::sync::mpsc::UnboundedReceiver<crate::global_ptt::GlobalPttEvent>>,
+    mut hotkey_rx: Option<tokio::sync::mpsc::UnboundedReceiver<crate::client::global_ptt::GlobalPttEvent>>,
     server_addr: SocketAddr,
 ) -> Result<(), BoxError> {
-    let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
-    std::thread::spawn(move || {
-        loop {
-            match crossterm::event::read() {
-                Ok(ev) => {
-                    if input_tx.send(ev).is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-    });
+    let mut input_rx = crate::client::tui::input::spawn_input_thread();
 
     let (net_tx, mut net_rx) = tokio::sync::mpsc::unbounded_channel::<ServerMessage>();
     tokio::spawn(async move {
@@ -299,7 +287,7 @@ pub(crate) async fn run_connected_session(
         tokio::sync::mpsc::unbounded_channel::<file_stream::FileEvent>();
     let (auto_stop_tx, mut auto_stop_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
-    // The session's one direct client<->client UDP transport (`crate::p2p`).
+    // The session's one direct client<->client UDP transport (`crate::client::p2p`).
     // Bound on the same address family as the server so the reflexive-
     // address probe below can actually reach it; the port is ephemeral
     // (`:0`) since only the server needs a fixed, well-known port.
@@ -430,10 +418,10 @@ pub(crate) async fn run_connected_session(
                 if let Some(target) = session.own_stream_targets.remove(&stream_id) {
                     match target {
                         voice_stream::OwnStreamTarget::Channel { channel, recipients } => {
-                            crate::channel::on_own_stream_finished(&mut ui_state, &session, you, channel, recipients, stream_id, duration_ms, pcm);
+                            crate::client::channel::on_own_stream_finished(&mut ui_state, &session, you, channel, recipients, stream_id, duration_ms, pcm);
                         }
                         voice_stream::OwnStreamTarget::Direct(to) => {
-                            crate::direct_message::on_own_stream_finished(&mut ui_state, &session, you, to, stream_id, duration_ms, pcm);
+                            crate::client::direct_message::on_own_stream_finished(&mut ui_state, &session, you, to, stream_id, duration_ms, pcm);
                         }
                     }
                 }
@@ -454,8 +442,8 @@ pub(crate) async fn run_connected_session(
                     // a correctness issue.
                     let was_heard = !ui_state.is_trust_gated(from);
                     match active.channel {
-                        Some(channel) => crate::channel::on_stream_finished(&mut ui_state, &channel, from, stream_id, duration_ms, pcm),
-                        None => crate::direct_message::on_stream_finished(&mut ui_state, from, stream_id, duration_ms, pcm),
+                        Some(channel) => crate::client::channel::on_stream_finished(&mut ui_state, &channel, from, stream_id, duration_ms, pcm),
+                        None => crate::client::direct_message::on_stream_finished(&mut ui_state, from, stream_id, duration_ms, pcm),
                     }
                     if was_heard {
                         voice_stream::play_end_chime(&mut session);
@@ -486,7 +474,7 @@ pub(crate) async fn run_connected_session(
             }
             // `hotkey_rx` being `None` (the feature disabled, unsupported
             // on this platform, or registration failed at startup - see
-            // `crate::global_ptt`) parks this branch forever via
+            // `crate::client::global_ptt`) parks this branch forever via
             // `pending()`. Unlike `input_rx`/`net_rx`, the sender side
             // going away here (the background thread that owns the OS
             // hotkey manager dying) is *not* fatal to the session - it
@@ -504,12 +492,12 @@ pub(crate) async fn run_connected_session(
                     continue;
                 };
                 match hotkey_ev {
-                    crate::global_ptt::GlobalPttEvent::Pressed => {
+                    crate::client::global_ptt::GlobalPttEvent::Pressed => {
                         if let Some(action @ UiAction::VoiceRecordStart(_)) = ui_state.global_record_start() {
                             handle_ui_action(action, &mut wr, &mut ui_state, &mut session).await?;
                         }
                     }
-                    crate::global_ptt::GlobalPttEvent::Released => {
+                    crate::client::global_ptt::GlobalPttEvent::Released => {
                         if let Some(action) = ui_state.global_record_stop() {
                             handle_ui_action(action, &mut wr, &mut ui_state, &mut session).await?;
                         }
@@ -568,17 +556,17 @@ async fn handle_ui_action(
             kind,
             password,
         } => {
-            crate::channel::handle_join(wr, session, name, kind, password).await?;
+            crate::client::channel::handle_join(wr, session, name, kind, password).await?;
         }
         UiAction::LeaveChannel { name } => {
-            crate::channel::handle_leave(wr, ui_state, session, name).await?;
+            crate::client::channel::handle_leave(wr, ui_state, session, name).await?;
         }
         UiAction::SendChannelText {
             channel,
             plaintext,
             recipients,
         } => {
-            crate::channel::handle_send_text(wr, session, channel, plaintext, recipients).await?;
+            crate::client::channel::handle_send_text(wr, session, channel, plaintext, recipients).await?;
         }
         UiAction::SendDirectText {
             to,
@@ -586,7 +574,7 @@ async fn handle_ui_action(
             recipient_key_mode,
             recipient_pubkey_der,
         } => {
-            crate::direct_message::handle_send_text(
+            crate::client::direct_message::handle_send_text(
                 wr,
                 session,
                 to,
@@ -603,7 +591,7 @@ async fn handle_ui_action(
             size,
             recipients,
         } => {
-            crate::channel::handle_send_file(
+            crate::client::channel::handle_send_file(
                 wr, ui_state, session, channel, path, filename, size, recipients,
             )
             .await?;
@@ -616,7 +604,7 @@ async fn handle_ui_action(
             recipient_key_mode,
             recipient_pubkey_der,
         } => {
-            crate::direct_message::handle_send_file(
+            crate::client::direct_message::handle_send_file(
                 wr,
                 ui_state,
                 session,
@@ -643,7 +631,7 @@ async fn handle_ui_action(
                             channel,
                             recipients,
                         } => {
-                            crate::channel::handle_voice_record_start(
+                            crate::client::channel::handle_voice_record_start(
                                 wr, ui_state, session, recorder, stream_id, channel, recipients,
                             )
                             .await?;
@@ -653,7 +641,7 @@ async fn handle_ui_action(
                             recipient_key_mode,
                             recipient_pubkey_der,
                         } => {
-                            crate::direct_message::handle_voice_record_start(
+                            crate::client::direct_message::handle_voice_record_start(
                                 wr,
                                 ui_state,
                                 session,
@@ -780,10 +768,10 @@ async fn accept_file_offer(
         .map(|u| u.public_key_der.clone())
         .unwrap_or_default();
     let key = voice_stream::resolve_incoming_key(session, from, &sender_public_key_der);
-    let dest_name = crate::file_transfer::safe_filename(&crate::file_transfer::truncate_filename(
+    let dest_name = crate::client::file_transfer::safe_filename(&crate::client::file_transfer::truncate_filename(
         &offer.filename,
     ));
-    let dest_path = crate::file_transfer::default_download_dir().join(dest_name);
+    let dest_path = crate::client::file_transfer::default_download_dir().join(dest_name);
     let job_tx = file_stream::spawn_receive_file_worker(
         key,
         dest_path,
@@ -826,39 +814,6 @@ async fn accept_file_offer(
     Ok(())
 }
 
-pub(crate) fn encrypt_for_one(
-    pubkey_der: &[u8],
-    plaintext: &[u8],
-    content: Content,
-) -> Option<Envelope> {
-    let pk = crypto::public_key_from_der(pubkey_der).ok()?;
-    let blocks = crypto::encrypt_chunked(&pk, plaintext).ok()?;
-    Some(Envelope { content, blocks })
-}
-
-/// `PqHybrid` counterpart of `encrypt_for_one` - `sender_signing` is *our
-/// own* signing identity (`session.own_pq_private`, required for step 1 of
-/// `docs/PROTOCOL.md` §13), `recipient_pubkey_der` is the recipient's
-/// bincode-encoded `crypto::pq::PqPublicBundle`. The whole hybrid blob is
-/// boxed as `Envelope`'s single `blocks` element, same trick already used
-/// for file transfer's `FileOfferPayload` convention - `Envelope`'s own
-/// shape needs no change.
-pub(crate) fn encrypt_hybrid_envelope_for(
-    sender_signing: &crypto::pq::PqPrivateBundle,
-    recipient_pubkey_der: &[u8],
-    plaintext: &[u8],
-    content: Content,
-) -> Option<Envelope> {
-    let recipient_public: crypto::pq::PqPublicBundle = proto::decode(recipient_pubkey_der).ok()?;
-    let hybrid =
-        crypto::pq::encrypt_hybrid_for_one(sender_signing, &recipient_public, plaintext).ok()?;
-    let block = proto::encode(&hybrid).ok()?;
-    Some(Envelope {
-        content,
-        blocks: vec![block],
-    })
-}
-
 /// Applies one incoming server message to `ui_state` and, for live voice
 /// streams, spawns/feeds the per-stream decrypt worker. Returns an action
 /// the caller must also carry out over the network - currently only used
@@ -889,20 +844,20 @@ async fn handle_server_message(
             // only expected during the handshake in connect::connect_and_handshake
         }
         ServerMessage::ChannelList(list) => {
-            if let Some(action) = crate::channel::on_list(ui_state, list) {
+            if let Some(action) = crate::client::channel::on_list(ui_state, list) {
                 return Ok(Some(action));
             }
         }
-        ServerMessage::Joined { channel } => crate::channel::on_joined(ui_state, channel),
+        ServerMessage::Joined { channel } => crate::client::channel::on_joined(ui_state, channel),
         // Reuses the plain, dedup-safe appender directly - unlike
-        // `crate::channel::on_list` (only for the connect-time snapshot
+        // `crate::client::channel::on_list` (only for the connect-time snapshot
         // above), this must never auto-join anything.
         ServerMessage::ChannelCreated { channel } => ui_state.on_channel_list(vec![channel]),
         ServerMessage::ChannelJoinFailed { name, reason } => {
-            crate::channel::on_join_failed(name, reason)
+            crate::client::channel::on_join_failed(name, reason)
         }
         ServerMessage::ChannelJoinRejected { name, kind } => {
-            crate::channel::on_join_rejected(ui_state, name, kind)
+            crate::client::channel::on_join_rejected(ui_state, name, kind)
         }
         ServerMessage::UserJoined { channel, user } => {
             // rsa_per_msg peers need freshness/queue tracking from the
@@ -1006,7 +961,7 @@ async fn handle_server_message(
     Ok(None)
 }
 
-/// Applies one incoming direct-link event (`crate::p2p::P2pEvent`) - the
+/// Applies one incoming direct-link event (`crate::client::p2p::P2pEvent`) - the
 /// direct-transport counterpart of `handle_server_message`'s old content
 /// arms (`ChannelMessage`/`DirectMessage`/`Stream*`/`File*`). `from_name` is
 /// resolved locally from `ui_state.known_users` rather than carried on the
@@ -1028,7 +983,7 @@ fn handle_p2p_event(event: P2pEvent, ui_state: &mut UiState, session: &mut Sessi
             envelope,
         } => {
             let from_name = name_of(ui_state, from);
-            crate::channel::on_message(ui_state, session, channel, from, from_name, envelope);
+            crate::client::channel::on_message(ui_state, session, channel, from, from_name, envelope);
         }
         P2pEvent::Message {
             channel: None,
@@ -1036,7 +991,7 @@ fn handle_p2p_event(event: P2pEvent, ui_state: &mut UiState, session: &mut Sessi
             envelope,
         } => {
             let from_name = name_of(ui_state, from);
-            crate::direct_message::on_message(ui_state, session, from, from_name, envelope);
+            crate::client::direct_message::on_message(ui_state, session, from, from_name, envelope);
         }
         P2pEvent::StreamStart {
             channel: Some(channel),
@@ -1044,7 +999,7 @@ fn handle_p2p_event(event: P2pEvent, ui_state: &mut UiState, session: &mut Sessi
             stream_id,
         } => {
             let from_name = name_of(ui_state, from);
-            crate::channel::on_stream_start(ui_state, session, channel, from, from_name, stream_id);
+            crate::client::channel::on_stream_start(ui_state, session, channel, from, from_name, stream_id);
         }
         P2pEvent::StreamStart {
             channel: None,
@@ -1052,7 +1007,7 @@ fn handle_p2p_event(event: P2pEvent, ui_state: &mut UiState, session: &mut Sessi
             stream_id,
         } => {
             let from_name = name_of(ui_state, from);
-            crate::direct_message::on_stream_start(ui_state, session, from, from_name, stream_id);
+            crate::client::direct_message::on_stream_start(ui_state, session, from, from_name, stream_id);
         }
         P2pEvent::StreamChunk {
             from,
@@ -1169,22 +1124,6 @@ fn handle_p2p_event(event: P2pEvent, ui_state: &mut UiState, session: &mut Sessi
 /// client, but nothing stops a modified/hostile one from sending garbage)
 /// is silently skipped rather than treated as an error - this check is a
 /// local safety net, not a protocol validation step.
-/// Whether `key_mode` participates in `id_store`'s simple byte-comparison
-/// pinning (`check_identity` below) - true for every static identity whose
-/// key is stable across reconnects by construction (`Rsa`: loaded from a
-/// file; `Password`: re-derived from the same password; `PqHybrid`: loaded
-/// from a keybundle file, `docs/PROTOCOL.md` §13 - the same reasoning as
-/// `Rsa`). `false` for `PerMessage` (its own signature-based §12.6
-/// mechanism, since its key is *supposed* to change every rotation) and
-/// `None` (no continuity mechanism at all, by design). A pure predicate so
-/// it's directly unit-testable (`test/hybrid_crypto_test.rs`).
-pub fn uses_byte_comparison_pinning(key_mode: KeyMode) -> bool {
-    matches!(
-        key_mode,
-        KeyMode::Rsa | KeyMode::Password | KeyMode::PqHybrid
-    )
-}
-
 fn check_identity(session: &mut SessionState, ui_state: &mut UiState, user: &UserInfo) {
     // `public_key_der` holds different bytes depending on scheme (an RSA
     // SPKI DER blob for every mode except `PqHybrid`, a bincode-encoded
@@ -1201,7 +1140,7 @@ fn check_identity(session: &mut SessionState, ui_state: &mut UiState, user: &Use
         return;
     }
     match user.key_mode {
-        key_mode if uses_byte_comparison_pinning(key_mode) => {
+        key_mode if crate::client::keymode_policy::uses_byte_comparison_pinning(key_mode) => {
             match session.id_store.get(&user.name) {
                 None => {
                     // First-ever sighting: nothing to compare against, so this is
@@ -1554,7 +1493,7 @@ async fn install_trusted_rotation(
             rekey::QueuedOutbound::Direct { plaintext } => (None, plaintext),
             rekey::QueuedOutbound::Channel { channel, plaintext } => (Some(channel), plaintext),
         };
-        let Some(envelope) = encrypt_for_one(&der, plaintext.as_bytes(), Content::Text) else {
+        let Some(envelope) = crate::client::envelope::encrypt_for_one(&der, plaintext.as_bytes(), Content::Text) else {
             continue;
         };
         session.peer_link.ensure_link(wr, peer).await;
@@ -1604,7 +1543,7 @@ fn decrypt_file_offer(
     from: UserId,
     sender: &UserInfo,
     session: &SessionState,
-) -> Option<crate::file_transfer::FileOfferPayload> {
+) -> Option<crate::client::file_transfer::FileOfferPayload> {
     if envelope.content != Content::FileOffer {
         return None;
     }
@@ -1657,7 +1596,7 @@ fn handle_incoming_file_offer(
     let Some(payload) = decrypt_file_offer(&envelope, from, &sender, session) else {
         return;
     };
-    let filename = crate::file_transfer::truncate_filename(&payload.filename);
+    let filename = crate::client::file_transfer::truncate_filename(&payload.filename);
     let offer = PendingFileOffer {
         from,
         from_name,

@@ -254,7 +254,7 @@ pub struct Envelope {
 /// `FileChunk` blocks, exactly like voice's PCM (§7.3), so there's no
 /// `Content::File` variant. The plaintext recovered by decrypting
 /// `Envelope::blocks` for `FileOffer` is a bincode encoding
-/// (`proto::encode`/`decode`) of `crate::file_transfer::FileOfferPayload`.
+/// (`proto::encode`/`decode`) of `crate::client::file_transfer::FileOfferPayload`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Content {
     Text,
@@ -267,7 +267,7 @@ pub enum Content {
 /// too (`SendChannel`/`SendDirect`, the `Stream*`/`File*` families) - see
 /// `docs/PROTOCOL.md`'s "Direct peer-to-peer transport" section for why
 /// that moved to a direct, server-assisted-but-not-server-carried UDP link
-/// (`crate::p2p`, `crate::p2p_proto`) instead. The server's job here is now
+/// (`crate::client::p2p`, `crate::p2p_proto`) instead. The server's job here is now
 /// pure signaling: auth, identify, channel membership, and helping two
 /// clients find each other's address.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -313,7 +313,7 @@ pub enum ClientMessage {
     /// opaque token for the attempt (echoed in its own `Ping`s - see
     /// `p2p_proto::PunchDatagram`). The server only ever relays this to
     /// `peer` (`Registry::route_peer_link_request`) - it never sees
-    /// anything from the resulting link itself. See `crate::p2p`.
+    /// anything from the resulting link itself. See `crate::client::p2p`.
     RequestPeerLink {
         peer: UserId,
         candidates: Vec<std::net::SocketAddr>,
@@ -404,7 +404,7 @@ pub enum ServerMessage {
     },
 
     /// Relayed mirror of `ClientMessage::RequestPeerLink` - see there and
-    /// `crate::p2p`. `from`'s candidates are exactly what `from` sent; the
+    /// `crate::client::p2p`. `from`'s candidates are exactly what `from` sent; the
     /// server neither validates nor stores them.
     PeerCandidates {
         from: UserId,

@@ -3,7 +3,7 @@
 use cucumber::then;
 
 use aloo::proto::UserId;
-use aloo::ui::ui::{Focus, UiAction};
+use aloo::client::tui::ui::{Focus, UiAction};
 
 use crate::steps::ui_common::id_for;
 use crate::support::{row_containing, ui_rows_wide};
@@ -245,7 +245,7 @@ async fn selection_below_newest(w: &mut AlooWorld, offset: usize) {
 async fn one_page_from_oldest(w: &mut AlooWorld) {
     assert_eq!(
         w.ui_ref().message_selected,
-        aloo::ui::ui::MESSAGE_PAGE_JUMP,
+        aloo::client::tui::ui::MESSAGE_PAGE_JUMP,
         "PageDown from the oldest should move exactly one page"
     );
 }
@@ -256,7 +256,7 @@ async fn one_page_from_newest(w: &mut AlooWorld) {
     let len = state.channels[state.selected_channel].log.len();
     assert_eq!(
         state.message_selected,
-        len - 1 - aloo::ui::ui::MESSAGE_PAGE_JUMP,
+        len - 1 - aloo::client::tui::ui::MESSAGE_PAGE_JUMP,
         "PageUp from the newest should move exactly one page"
     );
 }

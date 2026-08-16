@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use aloo::netstats::{
+use aloo::client::netstats::{
     CONN_BAD_MIN_INTERVAL, CONN_GOOD_MAX_INTERVAL, CONN_STATS_MAX_SAMPLES, ConnQuality, ConnStats,
 };
 

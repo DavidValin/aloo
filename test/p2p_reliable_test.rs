@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use aloo::p2p_reliable::{ArqReceiver, ArqSender, MAX_RETRIES};
+use aloo::client::p2p_reliable::{ArqReceiver, ArqSender, MAX_RETRIES};
 
 // ---------------------------------------------------------------------
 // ArqReceiver: in-order delivery under reordering/duplication

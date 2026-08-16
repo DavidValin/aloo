@@ -1,8 +1,8 @@
 //! Channel-specific send/receive handling for the connected session:
 //! joining, sending text/voice to a channel, and applying incoming
-//! channel-addressed server messages. `crate::session` dispatches into
+//! channel-addressed server messages. `crate::client::session` dispatches into
 //! these from its `handle_ui_action`/`handle_server_message`; the generic
-//! live-voice-streaming plumbing they use lives in `crate::voice_stream`.
+//! live-voice-streaming plumbing they use lives in `crate::client::voice_stream`.
 
 use std::time::Instant;
 
@@ -10,16 +10,16 @@ use rsa::RsaPublicKey;
 use tokio::io::AsyncWrite;
 
 use crate::crypto;
-use crate::p2p::LinkReadiness;
+use crate::client::p2p::LinkReadiness;
 use crate::p2p_proto::P2pPayload;
 use crate::proto::{
     self, ChannelInfo, ChannelKind, ClientMessage, Content, Envelope, KeyMode, UserId,
 };
-use crate::rekey;
-use crate::session::SessionState;
-use crate::ui::ui::{Recipient, UiState};
-use crate::voice;
-use crate::voice_stream;
+use crate::client::rekey;
+use crate::client::session::SessionState;
+use crate::client::tui::ui::{Recipient, UiState};
+use crate::client::voice;
+use crate::client::voice_stream;
 
 pub(crate) async fn handle_join(
     wr: &mut (impl AsyncWrite + Unpin),
@@ -77,7 +77,7 @@ pub(crate) async fn handle_send_text(
     // arrives (`session::handle_key_rotated`).
     let mut ready = Vec::new();
     for (id, key_mode, der) in recipients {
-        if !can_address(key_mode, session.own_key_mode) {
+        if !crate::client::keymode_policy::can_address(key_mode, session.own_key_mode) {
             continue;
         }
         if session.remote_keys.try_use(id) {
@@ -105,25 +105,10 @@ pub(crate) async fn handle_send_text(
             );
         }
         for (id, ..) in ready {
-            crate::session::request_rotation_if_per_message(session, id);
+            crate::client::session::request_rotation_if_per_message(session, id);
         }
     }
     Ok(())
-}
-
-/// A `PqHybrid` recipient can only be addressed by a `PqHybrid` sender - the
-/// hybrid scheme's signing step (`docs/PROTOCOL.md` §13) needs *our own*
-/// ML-DSA-87+RSA-sign identity, which only exists when our own `my_key` is
-/// also `pq_hybrid`. Every other `KeyMode` pair works exactly as before
-/// (RSA-OAEP needs no sender identity at all). An unreachable recipient is
-/// silently excluded, same as any other partial-delivery case in this app
-/// (an offline member, a not-yet-fresh `rsa_per_msg` key, ...).
-///
-/// A pure, `SessionState`-free predicate (just the two `KeyMode`s involved)
-/// so it's directly unit-testable without a live session
-/// (`test/hybrid_crypto_test.rs`).
-pub fn can_address(recipient_key_mode: KeyMode, own_key_mode: KeyMode) -> bool {
-    recipient_key_mode != KeyMode::PqHybrid || own_key_mode == KeyMode::PqHybrid
 }
 
 /// Sends one `FileOffer` per ready recipient (`docs/PROTOCOL.md`'s file
@@ -150,11 +135,11 @@ pub(crate) async fn handle_send_file(
 ) -> proto::Result<()> {
     let mut ready = Vec::new();
     for (id, key_mode, der) in recipients {
-        if can_address(key_mode, session.own_key_mode) && session.remote_keys.try_use(id) {
+        if crate::client::keymode_policy::can_address(key_mode, session.own_key_mode) && session.remote_keys.try_use(id) {
             ready.push((id, key_mode, der));
         }
     }
-    let payload = crate::file_transfer::FileOfferPayload {
+    let payload = crate::client::file_transfer::FileOfferPayload {
         filename: filename.clone(),
         size,
     };
@@ -164,14 +149,14 @@ pub(crate) async fn handle_send_file(
     for (id, key_mode, der) in ready {
         let envelope = match key_mode {
             KeyMode::PqHybrid => session.own_pq_private.as_ref().and_then(|signing| {
-                crate::session::encrypt_hybrid_envelope_for(
+                crate::client::envelope::encrypt_hybrid_envelope_for(
                     signing,
                     &der,
                     &plaintext,
                     Content::FileOffer,
                 )
             }),
-            _ => crate::session::encrypt_for_one(&der, &plaintext, Content::FileOffer),
+            _ => crate::client::envelope::encrypt_for_one(&der, &plaintext, Content::FileOffer),
         };
         let Some(envelope) = envelope else { continue };
         let stream_id = session.next_stream_id;
@@ -188,7 +173,7 @@ pub(crate) async fn handle_send_file(
         ui_state.log_own_file_offer_channel(&channel, &to_name, stream_id, filename.clone(), size);
         session.own_file_targets.insert(
             stream_id,
-            crate::file_stream::OwnFileTarget {
+            crate::client::file_stream::OwnFileTarget {
                 to: id,
                 path: path.clone(),
                 key,
@@ -203,7 +188,7 @@ pub(crate) async fn handle_send_file(
                 envelope,
             },
         );
-        crate::session::request_rotation_if_per_message(session, id);
+        crate::client::session::request_rotation_if_per_message(session, id);
     }
     Ok(())
 }
@@ -225,7 +210,7 @@ pub(crate) async fn handle_voice_record_start(
     // partial-delivery case.
     let mut ready = Vec::new();
     for (id, key_mode, der) in recipients {
-        if !can_address(key_mode, session.own_key_mode) || !session.remote_keys.try_use(id) {
+        if !crate::client::keymode_policy::can_address(key_mode, session.own_key_mode) || !session.remote_keys.try_use(id) {
             continue;
         }
         if session.peer_link.ensure_link(wr, id).await == LinkReadiness::Active {
@@ -283,8 +268,8 @@ fn parse_pq_recipients(recipients: &[Recipient]) -> Vec<(UserId, crypto::pq::PqP
 }
 
 /// Encrypts `plaintext` once per recipient, dispatching by *their*
-/// `KeyMode` - RSA-OAEP (`session::encrypt_for_one`, needs nothing of ours)
-/// or the PQ-hybrid scheme (`session::encrypt_hybrid_envelope_for`, needs
+/// `KeyMode` - RSA-OAEP (`envelope::encrypt_for_one`, needs nothing of ours)
+/// or the PQ-hybrid scheme (`envelope::encrypt_hybrid_envelope_for`, needs
 /// *our own* signing identity, `session.own_pq_private` - callers must have
 /// already excluded recipients this session can't address, see
 /// `can_address`).
@@ -300,14 +285,14 @@ fn encrypt_for_each(
             let envelope = match key_mode {
                 KeyMode::PqHybrid => {
                     let signing = session.own_pq_private.as_ref()?;
-                    crate::session::encrypt_hybrid_envelope_for(
+                    crate::client::envelope::encrypt_hybrid_envelope_for(
                         signing,
                         pubkey_der,
                         plaintext,
                         content.clone(),
                     )?
                 }
-                _ => crate::session::encrypt_for_one(pubkey_der, plaintext, content.clone())?,
+                _ => crate::client::envelope::encrypt_for_one(pubkey_der, plaintext, content.clone())?,
             };
             Some((*id, envelope))
         })
@@ -317,12 +302,12 @@ fn encrypt_for_each(
 pub(crate) fn on_list(
     ui_state: &mut UiState,
     list: Vec<ChannelInfo>,
-) -> Option<crate::ui::ui::UiAction> {
+) -> Option<crate::client::tui::ui::UiAction> {
     let was_empty = ui_state.channels.is_empty();
     ui_state.on_channel_list(list);
     if was_empty {
         if let Some(first) = ui_state.channels.first() {
-            return Some(crate::ui::ui::UiAction::JoinChannel {
+            return Some(crate::client::tui::ui::UiAction::JoinChannel {
                 name: first.name.clone(),
                 kind: first.kind,
                 password: None,
@@ -363,9 +348,9 @@ pub(crate) fn on_message(
     let Some(sender) = ui_state.known_users.get(&from).cloned() else {
         return;
     };
-    if let Some(body) = crate::session::decrypt_envelope_for(envelope, from, &sender, session) {
+    if let Some(body) = crate::client::session::decrypt_envelope_for(envelope, from, &sender, session) {
         ui_state.on_channel_message(&channel, from, from_name, body);
-        crate::session::request_rotation_if_per_message(session, from);
+        crate::client::session::request_rotation_if_per_message(session, from);
     }
 }
 
@@ -416,7 +401,7 @@ pub(crate) fn on_own_stream_finished(
     // reached, at the stream's natural end - not per
     // chunk (PROTOCOL.md §11.6).
     for peer in recipients {
-        crate::session::request_rotation_if_per_message(session, peer);
+        crate::client::session::request_rotation_if_per_message(session, peer);
     }
 }
 

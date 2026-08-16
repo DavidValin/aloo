@@ -1,6 +1,6 @@
 //! Tracks how quickly protocol messages are moving over this session's
 //! socket, in either direction, as the channel view's `Conn:<quality>`
-//! header indicator (`crate::ui::channel::render_channel_view`, see
+//! header indicator (`crate::client::tui::channel::render_channel_view`, see
 //! `docs/SPEC.md` "Connected UI"). There's no ping/pong or RTT measurement
 //! in the wire protocol (`docs/PROTOCOL.md`), so this measures the
 //! interval between consecutive protocol messages actually observed - sent

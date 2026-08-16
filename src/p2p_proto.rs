@@ -4,7 +4,7 @@
 //! `ServerMessage::PeerCandidates`, `proto.rs`) still goes over the existing
 //! TCP connection - only the payloads listed here ever travel over the
 //! punched UDP path itself. See `docs/PROTOCOL.md`'s "Direct peer-to-peer
-//! transport" section and `crate::p2p`.
+//! transport" section and `crate::client::p2p`.
 
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
@@ -69,7 +69,7 @@ pub enum PunchDatagram {
         seq: u32,
     },
     /// A reliably-delivered frame (text/file content) - `payload` is a
-    /// bincode encoding of `P2pPayload`. See `crate::p2p_reliable`.
+    /// bincode encoding of `P2pPayload`. See `crate::client::p2p_reliable`.
     Reliable {
         seq: u32,
         payload: Vec<u8>,

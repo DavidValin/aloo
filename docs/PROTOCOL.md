@@ -1,9 +1,9 @@
 # aloo wire protocol
 
 This document specifies the client↔server protocol implemented in
-`src/proto.rs` (message framing and types) and `src/server.rs` (routing
+`src/proto.rs` (message framing and types) and `src/server/mod.rs` (routing
 and connection lifecycle), and the direct client↔client transport
-implemented in `src/p2p.rs`/`src/p2p_proto.rs`/`src/p2p_reliable.rs`
+implemented in `src/client/p2p.rs`/`src/p2p_proto.rs`/`src/client/p2p_reliable.rs`
 (§7.0). It is a description of the *wire format and server behavior*,
 precise enough to implement an interoperable client or server from
 scratch. Application-level UI/UX behavior (keybindings, rendering, how a
@@ -730,13 +730,13 @@ through the server - see the top of this document. Once `Active`, an idle
 link gets a `Keepalive` datagram after 15 seconds of no other traffic, to
 keep the NAT/firewall mapping from expiring.
 
-Reference implementation: `src/p2p.rs` (`PeerLinkManager`), `src/p2p_proto.rs`.
+Reference implementation: `src/client/p2p.rs` (`PeerLinkManager`), `src/p2p_proto.rs`.
 
 #### 7.0.1 Reliable delivery over the punched link
 
 UDP gives no ordering or delivery guarantee, so text and file content -
 which must arrive complete and in order, unlike voice (§7.3) - get a
-small hand-rolled reliable layer on top (`src/p2p_reliable.rs`), carried
+small hand-rolled reliable layer on top (`src/client/p2p_reliable.rs`), carried
 inside `PunchDatagram::Reliable { seq, payload }`:
 
 - **Sender** (`ArqSender`): assigns an increasing `seq` to each outgoing
@@ -2163,7 +2163,7 @@ Because step 1 needs the *sender's* ML-DSA-87/RSA-sign identity, and only a
   recipient is silently excluded from that sender's channel/DM/file/voice
   send, the same partial-delivery pattern as any other unreachable
   recipient in this app (an offline member, a not-yet-fresh `rsa_per_msg`
-  key, §11.5/§11.6). `channel::can_address` is the reference
+  key, §11.5/§11.6). `keymode_policy::can_address` is the reference
   implementation of this check.
 - **A `pq_hybrid` sender can still address any non-`pq_hybrid` recipient
   normally** - RSA-OAEP (§8) needs no sender identity at all, so a
@@ -2271,7 +2271,7 @@ chunk.
 construction, exactly like `rsa` (a key file) and `password` (a
 deterministic re-derivation). It participates in `id_store`'s ordinary
 byte-comparison pinning unchanged (§12.2's table gains a `PqHybrid: yes`
-row) - `session::uses_byte_comparison_pinning` is the single predicate
+row) - `keymode_policy::uses_byte_comparison_pinning` is the single predicate
 `check_identity` now consults, covering exactly `Rsa`/`Password`/`PqHybrid`.
 It has **no** need for `rsa_per_msg`'s resume mechanism (§12.6,
 `own_next_keys`) - that machinery exists purely to bridge a bootstrap key

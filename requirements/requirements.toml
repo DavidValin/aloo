@@ -107,7 +107,7 @@ evidence = "docs/SPEC.md 'File browser'; test file_browser_render_scrolls_to_kee
 [[user_story.technical_behavior]]
 id = "TB-001"
 description = "server_key's key type cycles rsa -> password -> none -> rsa and defaults to none."
-evidence = "src/ui/ui_connect_popup.rs KeyType; tests key_type_cycles_rsa_password_none_and_back, key_type_defaults_to_none"
+evidence = "src/client/tui/ui_connect_popup.rs KeyType; tests key_type_cycles_rsa_password_none_and_back, key_type_defaults_to_none"
 
 [[user_story.technical_behavior]]
 id = "TB-002"
@@ -117,7 +117,7 @@ evidence = "docs/SPEC.md 'Not connected UI'; tests my_key_type_cycles_through_al
 [[user_story.technical_behavior]]
 id = "TB-003"
 description = "The focus order lists exactly the value fields the two selected key types require, and a field orphaned by a type change stops being editable."
-evidence = "src/ui/ui_connect_popup.rs focus_order; tests focus_order_*, changing_my_key_type_away_from_rsa_reassigns_focus_if_orphaned, password_field_only_editable_when_key_type_is_password"
+evidence = "src/client/tui/ui_connect_popup.rs focus_order; tests focus_order_*, changing_my_key_type_away_from_rsa_reassigns_focus_if_orphaned, password_field_only_editable_when_key_type_is_password"
 
 [[user_story.technical_behavior]]
 id = "TB-004"
@@ -162,7 +162,7 @@ evidence = "docs/SPEC.md 'Not connected UI'; test popup_is_wider_than_the_origin
 [[user_story.technical_behavior]]
 id = "TB-012"
 description = "A focused free-text field appends typed characters and Backspace removes the last one."
-evidence = "src/ui/ui_connect_popup.rs handle_key; tests typing_fills_host_field, id_store_path_field_is_freely_editable, own_next_keys_path_field_is_freely_editable"
+evidence = "src/client/tui/ui_connect_popup.rs handle_key; tests typing_fills_host_field, id_store_path_field_is_freely_editable, own_next_keys_path_field_is_freely_editable"
 
 # ============================================================================
 # US-002 - Authenticate to the server
@@ -197,7 +197,7 @@ evidence = "docs/PROTOCOL.md 5; tests rsa_auth_rejects_response_of_the_wrong_kin
 [[user_story.technical_behavior]]
 id = "TB-015"
 description = "Credential comparison is constant-time, including for unequal lengths and empty inputs."
-evidence = "docs/PROTOCOL.md 5.2; src/crypto.rs constant_time_eq; test constant_time_eq_matches_regular_equality"
+evidence = "docs/PROTOCOL.md 5.2; src/crypto/mod.rs constant_time_eq; test constant_time_eq_matches_regular_equality"
 
 [[user_story.technical_behavior]]
 id = "TB-016"
@@ -347,7 +347,7 @@ evidence = "docs/PROTOCOL.md 6.1; src/validation.rs channel_name_is_valid; tests
 [[user_story.acceptance_criteria]]
 id = "AC-103"
 description = "A channel tab is prefixed with an emoji naming its kind at a glance, followed by a space before the name: the globe for public, the lock for private."
-evidence = "docs/SPEC.md 'Connected UI'; src/ui/channel.rs render_channel_view; test channel_tabs_are_prefixed_by_kind"
+evidence = "docs/SPEC.md 'Connected UI'; src/client/tui/channel.rs render_channel_view; test channel_tabs_are_prefixed_by_kind"
 
 [[user_story.technical_behavior]]
 id = "TB-150"
@@ -357,22 +357,22 @@ evidence = "src/validation.rs; tests channel_name_is_valid_counts_unicode_scalar
 [[user_story.acceptance_criteria]]
 id = "AC-107"
 description = "A channel other than DEFAULT_CHANNEL_NAME (the-hall) is unregistered from the server the instant its last member leaves, whether public or private; the-hall itself is never removed, even when it has no members."
-evidence = "docs/PROTOCOL.md 6.2; src/server.rs Registry::remove_member, DEFAULT_CHANNEL_NAME; test empty_channel_is_deleted_unless_it_is_the_default_channel"
+evidence = "docs/PROTOCOL.md 6.2; src/server/mod.rs Registry::remove_member, DEFAULT_CHANNEL_NAME; test empty_channel_is_deleted_unless_it_is_the_default_channel"
 
 [[user_story.acceptance_criteria]]
 id = "AC-108"
 description = "The instant a new public channel is created, every other currently-connected client is told about it and it appears in their channel list, without waiting for a reconnect."
-evidence = "docs/PROTOCOL.md 6.1; src/server.rs Registry::join_channel; src/session.rs ChannelCreated arm; tests a_newly_created_public_channel_is_broadcast_to_other_connected_clients, end_to_end_a_second_client_sees_a_newly_created_public_channel"
+evidence = "docs/PROTOCOL.md 6.1; src/server/mod.rs Registry::join_channel; src/client/session.rs ChannelCreated arm; tests a_newly_created_public_channel_is_broadcast_to_other_connected_clients, end_to_end_a_second_client_sees_a_newly_created_public_channel"
 
 [[user_story.technical_behavior]]
 id = "TB-156"
 description = "Creating a private channel never triggers the ChannelCreated broadcast - it stays unadvertised exactly as before, the same guarantee AC-022/TB-154 already give every other channel-membership message."
-evidence = "docs/PROTOCOL.md 6.1, 6.3; src/server.rs Registry::join_channel; test creating_a_private_channel_never_broadcasts_channelcreated"
+evidence = "docs/PROTOCOL.md 6.1, 6.3; src/server/mod.rs Registry::join_channel; test creating_a_private_channel_never_broadcasts_channelcreated"
 
 [[user_story.technical_behavior]]
 id = "TB-159"
 description = "A UserJoined for a channel the client has no local tab for yet creates one on the spot, rather than silently dropping the membership - the server sends an already-populated channel's existing-member snapshot before the final Joined confirmation, and the joiner has no local tab yet the first time that happens for a private channel (never pre-known via ChannelList) or a public one joined by name rather than dwelled into."
-evidence = "docs/PROTOCOL.md 6.1; src/ui/channel.rs UiState::on_user_joined; tests on_user_joined_creates_the_tab_if_a_join_snapshot_arrives_before_joined, on_user_joined_does_not_duplicate_an_existing_tab"
+evidence = "docs/PROTOCOL.md 6.1; src/client/tui/channel.rs UiState::on_user_joined; tests on_user_joined_creates_the_tab_if_a_join_snapshot_arrives_before_joined, on_user_joined_does_not_duplicate_an_existing_tab"
 
 # ============================================================================
 # US-005 - Send a text message to a channel
@@ -557,7 +557,7 @@ evidence = "docs/SPEC.md Functionality #4 'Device handling'; tests downmix_i16_*
 [[user_story.technical_behavior]]
 id = "TB-047"
 description = "Resampling scales the sample count proportionally to the rate change and preserves a constant signal."
-evidence = "src/voice.rs resample; tests resample_same_rate_is_a_no_op, resample_upsampling_produces_proportionally_more_samples, resample_downsampling_produces_proportionally_fewer_samples, resample_preserves_a_constant_signal, resample_round_trip_stays_close_to_original_duration"
+evidence = "src/client/voice.rs resample; tests resample_same_rate_is_a_no_op, resample_upsampling_produces_proportionally_more_samples, resample_downsampling_produces_proportionally_fewer_samples, resample_preserves_a_constant_signal, resample_round_trip_stays_close_to_original_duration"
 
 [[user_story.technical_behavior]]
 id = "TB-048"
@@ -587,7 +587,7 @@ evidence = "docs/SPEC.md Functionality #4; docs/PROTOCOL.md 7.3; tests max_recor
 [[user_story.technical_behavior]]
 id = "TB-142"
 description = "An incoming voice stream is independently force-finalized with whatever arrived so far the moment it accumulates MAX_RECORDING_SAMPLES of audio, regardless of what the sender's own cap did - the receiving side never accepts more than 4 minutes of one stream even from a modified/hostile peer."
-evidence = "docs/PROTOCOL.md 7.3; src/voice_stream.rs spawn_stream_decrypt_worker; test recording_at_max_triggers_exactly_at_the_boundary_not_before"
+evidence = "docs/PROTOCOL.md 7.3; src/client/voice_stream.rs spawn_stream_decrypt_worker; test recording_at_max_triggers_exactly_at_the_boundary_not_before"
 
 # ============================================================================
 # US-008 - Keep message content readable only by its recipient
@@ -652,7 +652,7 @@ evidence = "docs/PROTOCOL.md 12.2; tests fingerprint_is_stable_and_distinguishes
 [[user_story.technical_behavior]]
 id = "TB-058"
 description = "fingerprint_der is infallible even on bytes that are not a valid key, so a corrupted store entry can still be displayed."
-evidence = "src/crypto.rs fingerprint_der doc comment; test fingerprint_der_is_infallible_even_on_garbage_bytes"
+evidence = "src/crypto/mod.rs fingerprint_der doc comment; test fingerprint_der_is_infallible_even_on_garbage_bytes"
 
 [[user_story.technical_behavior]]
 id = "TB-059"
@@ -662,7 +662,7 @@ evidence = "docs/PROTOCOL.md 11.3; tests sign_verify_roundtrip, verify_rejects_t
 [[user_story.technical_behavior]]
 id = "TB-115"
 description = "encrypt_chunked rejects a key too small to fit even a zero-length OAEP/SHA-256 block, rather than panicking or silently producing unusable output."
-evidence = "src/crypto.rs encrypt_chunked; test encrypt_chunked_rejects_a_key_too_small_for_oaep"
+evidence = "src/crypto/mod.rs encrypt_chunked; test encrypt_chunked_rejects_a_key_too_small_for_oaep"
 
 # ============================================================================
 # US-009 - Exchange messages over the wire protocol
@@ -817,7 +817,7 @@ evidence = "docs/PROTOCOL.md 11.4, 11.5; tests tracked_peer_is_fresh_once_then_s
 [[user_story.technical_behavior]]
 id = "TB-081"
 description = "Queueing for, or receiving a rotation from, a peer that was never tracked starts tracking them - stale when queued, fresh when rotated."
-evidence = "src/rekey.rs RemoteKeys; tests on_rotated_on_a_never_tracked_peer_starts_tracking_it, enqueue_on_untracked_peer_starts_tracking_it_as_stale"
+evidence = "src/client/rekey.rs RemoteKeys; tests on_rotated_on_a_never_tracked_peer_starts_tracking_it, enqueue_on_untracked_peer_starts_tracking_it_as_stale"
 
 [[user_story.technical_behavior]]
 id = "TB-082"
@@ -827,7 +827,7 @@ evidence = "docs/PROTOCOL.md 7.5; tests key_rotation_is_delivered_to_recipient, 
 [[user_story.technical_behavior]]
 id = "TB-083"
 description = "An applied rotation updates every cached copy of that peer's public key - known_users, each channel's member list, and an open private room's peer."
-evidence = "src/ui/ui.rs on_user_key_rotated; tests key_rotation_updates_known_users_and_channel_member_copies, key_rotation_updates_an_open_private_room_peer_copy"
+evidence = "src/client/tui/ui.rs on_user_key_rotated; tests key_rotation_updates_known_users_and_channel_member_copies, key_rotation_updates_an_open_private_room_peer_copy"
 
 [[user_story.technical_behavior]]
 id = "TB-084"
@@ -1187,22 +1187,22 @@ evidence = "docs/SPEC.md 'Connected UI'; tests header_shows_conn_quality_right_b
 [[user_story.technical_behavior]]
 id = "TB-118"
 description = "The CPU indicator's color threshold is CPU_HEALTHY_MAX_PCT: green strictly below it, red at or above it, decided against the same rounded value shown on screen so the color and the displayed percentage never disagree at a rounding boundary."
-evidence = "src/ui/channel.rs cpu_color, cpu_pct_rounded; test cpu_usage_renders_green_below_the_healthy_threshold_and_red_at_or_above_it"
+evidence = "src/client/tui/channel.rs cpu_color, cpu_pct_rounded; test cpu_usage_renders_green_below_the_healthy_threshold_and_red_at_or_above_it"
 
 [[user_story.technical_behavior]]
 id = "TB-119"
 description = "CpuMonitor::refresh reports system-wide CPU usage as a percentage in 0.0..=100.0 on Linux, macOS and Windows alike, via sysinfo."
-evidence = "src/sysstats.rs CpuMonitor; test refresh_reports_a_percentage_in_range"
+evidence = "src/client/sysstats.rs CpuMonitor; test refresh_reports_a_percentage_in_range"
 
 [[user_story.technical_behavior]]
 id = "TB-120"
 description = "ConnStats averages the gaps between at most the CONN_STATS_MAX_SAMPLES most recently observed protocol messages (sent or received), evicting older gaps once that many are held, and reports no average at all until at least two messages have been seen."
-evidence = "src/netstats.rs ConnStats; tests average_interval_is_still_none_after_a_single_event, average_interval_averages_up_to_three_most_recent_gaps, older_gaps_are_evicted_once_more_than_max_samples_are_recorded, an_out_of_order_timestamp_does_not_panic_or_record_a_negative_interval"
+evidence = "src/client/netstats.rs ConnStats; tests average_interval_is_still_none_after_a_single_event, average_interval_averages_up_to_three_most_recent_gaps, older_gaps_are_evicted_once_more_than_max_samples_are_recorded, an_out_of_order_timestamp_does_not_panic_or_record_a_negative_interval"
 
 [[user_story.technical_behavior]]
 id = "TB-121"
 description = "ConnStats::quality classifies the current average inter-message interval as Good at or below CONN_GOOD_MAX_INTERVAL, Bad at or above CONN_BAD_MIN_INTERVAL, Normal strictly between the two, and Unknown before any interval has been observed."
-evidence = "src/netstats.rs ConnQuality; tests quality_is_unknown_with_no_events, quality_is_good_at_or_below_the_good_threshold, quality_is_bad_at_or_above_the_bad_threshold, quality_is_normal_between_the_two_thresholds"
+evidence = "src/client/netstats.rs ConnQuality; tests quality_is_unknown_with_no_events, quality_is_good_at_or_below_the_good_threshold, quality_is_bad_at_or_above_the_bad_threshold, quality_is_normal_between_the_two_thresholds"
 
 [[user_story.technical_behavior]]
 id = "TB-122"
@@ -1262,27 +1262,27 @@ evidence = "docs/SPEC.md Functionality #10; tests toggling_focus_then_enter_reje
 [[user_story.acceptance_criteria]]
 id = "AC-097"
 description = "A filename longer than 230 characters is cropped at the end - enforced both when the sender builds the offer and independently on whatever filename actually arrives receiver-side, so a peer that skips the sender-side crop can't defeat it."
-evidence = "src/file_transfer.rs truncate_filename; tests a_long_filename_is_truncated_before_being_offered, truncate_filename_crops_a_long_name_at_the_end, truncate_filename_counts_unicode_scalar_values_not_bytes"
+evidence = "src/client/file_transfer.rs truncate_filename; tests a_long_filename_is_truncated_before_being_offered, truncate_filename_crops_a_long_name_at_the_end, truncate_filename_counts_unicode_scalar_values_not_bytes"
 
 [[user_story.technical_behavior]]
 id = "TB-123"
 description = "Content::FileOffer's plaintext is a FileOfferPayload (filename + size) encoded with the same generic proto::encode/decode every other wire type uses, so it round-trips exactly like Content::Text's plaintext; the actual file bytes are never wrapped in a struct at all, sent as raw FileChunk blocks like voice's PCM."
-evidence = "src/file_transfer.rs FileOfferPayload; src/proto.rs Content; tests file_offer_payload_round_trips_through_proto_encode_decode, content_file_offer_envelope_roundtrips"
+evidence = "src/client/file_transfer.rs FileOfferPayload; src/proto.rs Content; tests file_offer_payload_round_trips_through_proto_encode_decode, content_file_offer_envelope_roundtrips"
 
 [[user_story.technical_behavior]]
 id = "TB-124"
 description = "The download path reduces a peer-supplied filename to just its final path component before ever joining it to ~/.aloo/downloads, falling back to a fixed default for a name that yields nothing usable, so a crafted filename cannot steer the save location outside it."
-evidence = "src/file_transfer.rs safe_filename, default_download_dir; tests safe_filename_reduces_a_path_to_its_final_component, safe_filename_falls_back_to_a_default_for_an_unusable_name, default_download_dir_is_under_aloo_dir"
+evidence = "src/client/file_transfer.rs safe_filename, default_download_dir; tests safe_filename_reduces_a_path_to_its_final_component, safe_filename_falls_back_to_a_default_for_an_unusable_name, default_download_dir_is_under_aloo_dir"
 
 [[user_story.technical_behavior]]
 id = "TB-125"
 description = "FILE_CHUNK_BYTES is a single named constant, sized so one recipient's FileChunk stays comfortably under the direct peer-to-peer transport's safe UDP datagram budget (SAFE_DATAGRAM_BYTES, TB-148) even at 2048-bit RSA-OAEP's worst-case ciphertext expansion - unlike the old MAX_FILE_BYTES, this bounds one chunk, not the whole file, since total file size is no longer capped (AC-077)."
-evidence = "src/file_transfer.rs FILE_CHUNK_BYTES; test file_chunk_bytes_stays_under_the_p2p_safe_datagram_budget"
+evidence = "src/client/file_transfer.rs FILE_CHUNK_BYTES; test file_chunk_bytes_stays_under_the_p2p_safe_datagram_budget"
 
 [[user_story.technical_behavior]]
 id = "TB-140"
 description = "truncate_filename crops by character count (not raw byte length), so a multi-byte UTF-8 character is never split mid-encoding, and a name already at or under the limit is left untouched."
-evidence = "src/file_transfer.rs truncate_filename, MAX_FILENAME_CHARS; tests truncate_filename_leaves_a_short_name_untouched, truncate_filename_crops_a_long_name_at_the_end, truncate_filename_counts_unicode_scalar_values_not_bytes"
+evidence = "src/client/file_transfer.rs truncate_filename, MAX_FILENAME_CHARS; tests truncate_filename_leaves_a_short_name_untouched, truncate_filename_crops_a_long_name_at_the_end, truncate_filename_counts_unicode_scalar_values_not_bytes"
 
 [[user_story.technical_behavior]]
 id = "TB-141"
@@ -1312,12 +1312,12 @@ evidence = "docs/PROTOCOL.md 13; tests tampered_ciphertext_is_rejected, tampered
 [[user_story.acceptance_criteria]]
 id = "AC-081"
 description = "A pq_hybrid peer's identity is byte-comparison-pinned in id_store exactly like rsa/password (it is a static, file-loaded identity, not a rotating one), and renders the shield tag after their name."
-evidence = "docs/PROTOCOL.md 13; src/proto.rs KeyMode::label, src/session.rs check_identity; test key_mode_pq_hybrid_participates_in_byte_comparison_pinning_like_rsa"
+evidence = "docs/PROTOCOL.md 13; src/proto.rs KeyMode::label, src/client/session.rs check_identity; test key_mode_pq_hybrid_participates_in_byte_comparison_pinning_like_rsa"
 
 [[user_story.acceptance_criteria]]
 id = "AC-082"
 description = "A recipient announcing KeyMode::PqHybrid can only be addressed by a sender whose own my_key is also pq_hybrid (the hybrid scheme's signing step needs the sender's own ML-DSA-87/RSA-sign identity, which no other my_key type has) - such a recipient is silently excluded from a non-pq_hybrid sender's channel/DM/file/voice send, the same partial-delivery pattern as any other unreachable recipient. A pq_hybrid sender can still address any non-pq_hybrid recipient normally (RSA-OAEP needs no sender identity)."
-evidence = "docs/PROTOCOL.md 13; src/channel.rs can_address; test a_non_pq_hybrid_sender_cannot_address_a_pq_hybrid_recipient"
+evidence = "docs/PROTOCOL.md 13; src/client/keymode_policy.rs can_address; test a_non_pq_hybrid_sender_cannot_address_a_pq_hybrid_recipient"
 
 [[user_story.acceptance_criteria]]
 id = "AC-083"
@@ -1342,7 +1342,7 @@ evidence = "docs/PROTOCOL.md 13; src/crypto/pq.rs chunk_nonce; test same_plainte
 [[user_story.technical_behavior]]
 id = "TB-129"
 description = "A voice stream's key-wrap material (HybridStreamKeySetup) signs stream_id++k_data once at record-start; a receiver verifies it once, on the first chunk of a (from, stream_id) pair, and caches k_data for every later chunk rather than re-verifying or re-unwrapping per chunk."
-evidence = "docs/PROTOCOL.md 13; src/crypto/pq.rs wrap_key_for_stream, unwrap_key_for_stream; src/voice_stream.rs spawn_stream_decrypt_worker; test unwrap_key_for_stream_rejects_a_tampered_commitment"
+evidence = "docs/PROTOCOL.md 13; src/crypto/pq.rs wrap_key_for_stream, unwrap_key_for_stream; src/client/voice_stream.rs spawn_stream_decrypt_worker; test unwrap_key_for_stream_rejects_a_tampered_commitment"
 
 [[user_story.technical_behavior]]
 id = "TB-130"
@@ -1382,12 +1382,12 @@ evidence = "docs/PROTOCOL.md 13.9; tests connect_cache_round_trips_through_save_
 [[user_story.technical_behavior]]
 id = "TB-132"
 description = "ConnectCache is a flat host<TAB>port<TAB>file_pub<TAB>file_priv-per-line store at ~/.aloo/.cache, tolerant of a missing file and of malformed lines, mirroring idstore/own_next_keys' load conventions; recording an existing (host,port) pair moves it to the end (most-recently-used) rather than duplicating it."
-evidence = "src/connect.rs ConnectCache; tests connect_cache_record_moves_an_existing_pair_to_most_recent, connect_cache_load_skips_malformed_lines, connect_cache_load_of_a_missing_file_is_empty_not_an_error, connect_cache_record_rejects_fields_containing_the_delimiter"
+evidence = "src/client/connect.rs ConnectCache; tests connect_cache_record_moves_an_existing_pair_to_most_recent, connect_cache_load_skips_malformed_lines, connect_cache_load_of_a_missing_file_is_empty_not_an_error, connect_cache_record_rejects_fields_containing_the_delimiter"
 
 [[user_story.technical_behavior]]
 id = "TB-133"
 description = "fresh_pq_hybrid_paths_in retries (bounded) if a randomly-assigned prefix's files already exist under the given directory, so a freshly-assigned pq_hybrid location never silently reuses a stray existing identity."
-evidence = "src/connect.rs fresh_pq_hybrid_paths_in; test fresh_pq_hybrid_paths_in_avoids_an_existing_colliding_prefix"
+evidence = "src/client/connect.rs fresh_pq_hybrid_paths_in; test fresh_pq_hybrid_paths_in_avoids_an_existing_colliding_prefix"
 
 [[user_story.technical_behavior]]
 id = "TB-134"
@@ -1437,12 +1437,12 @@ evidence = "src/settings.rs; tests load_skips_unparseable_or_unknown_lines_and_k
 [[user_story.technical_behavior]]
 id = "TB-136"
 description = "global_ptt::resolve_hotkey parses the configured shortcut string as a global_hotkey combo, falling back to the compiled-in default (Ctrl+Alt+P) rather than failing to start when the configured value doesn't parse."
-evidence = "src/global_ptt.rs resolve_hotkey; tests resolve_hotkey_parses_a_valid_configured_shortcut, resolve_hotkey_falls_back_to_the_default_on_an_invalid_shortcut, resolve_hotkey_of_the_documented_default_matches_the_default_directly"
+evidence = "src/client/global_ptt.rs resolve_hotkey; tests resolve_hotkey_parses_a_valid_configured_shortcut, resolve_hotkey_falls_back_to_the_default_on_an_invalid_shortcut, resolve_hotkey_of_the_documented_default_matches_the_default_directly"
 
 [[user_story.technical_behavior]]
 id = "TB-137"
 description = "global_ptt::is_wayland_session flags a Wayland session from either XDG_SESSION_TYPE=wayland or a set WAYLAND_DISPLAY (case-insensitively), and only those - so aloo can warn once and skip registering the global shortcut instead of attempting (and silently failing) X11-only registration under Wayland."
-evidence = "src/global_ptt.rs is_wayland_session; tests is_wayland_session_detects_session_type_wayland, is_wayland_session_detects_a_set_wayland_display_even_without_session_type, is_wayland_session_false_for_a_plain_x11_session"
+evidence = "src/client/global_ptt.rs is_wayland_session; tests is_wayland_session_detects_session_type_wayland, is_wayland_session_detects_a_set_wayland_display_even_without_session_type, is_wayland_session_false_for_a_plain_x11_session"
 
 # ============================================================================
 # US-023 - Recover server settings after a crash
@@ -1482,47 +1482,47 @@ so_that = "the server only ever coordinates who's talking to whom, and never car
 [[user_story.acceptance_criteria]]
 id = "AC-100"
 description = "When a client first addresses another one (a channel/DM send, a call, a file offer), the server relays only a proposal of candidate addresses between them (never message content); both clients then punch a direct UDP link to each other, and once it's active, every channel/DM message, voice chunk, and file chunk for that pair travels only over that link - never through the server, not even as ciphertext."
-evidence = "docs/PROTOCOL.md's 'Direct peer-to-peer transport' section; src/server.rs Registry::route_peer_link_request; src/p2p.rs PeerLinkManager; tests peer_link_request_relays_candidates_to_the_named_peer, direct_link_handshake_and_reliable_message_end_to_end; message_delivery.feature/private_delivery.feature/voice_delivery.feature (content now delivered end to end over this link)"
+evidence = "docs/PROTOCOL.md's 'Direct peer-to-peer transport' section; src/server/mod.rs Registry::route_peer_link_request; src/client/p2p.rs PeerLinkManager; tests peer_link_request_relays_candidates_to_the_named_peer, direct_link_handshake_and_reliable_message_end_to_end; message_delivery.feature/private_delivery.feature/voice_delivery.feature (content now delivered end to end over this link)"
 
 [[user_story.acceptance_criteria]]
 id = "AC-101"
 description = "If a direct UDP link can't be punched open within the punch timeout (e.g. a symmetric NAT or a peer that never answers), whatever was pending against that peer fails visibly to the user - there is no relay-through-the-server fallback to silently paper over it."
-evidence = "docs/PROTOCOL.md's 'Direct peer-to-peer transport' section; src/p2p.rs PeerLinkManager::tick_at, src/ui/ui.rs UiState::p2p_link_failed; test punch_timeout_fails_the_link_and_emits_link_failed"
+evidence = "docs/PROTOCOL.md's 'Direct peer-to-peer transport' section; src/client/p2p.rs PeerLinkManager::tick_at, src/client/tui/ui.rs UiState::p2p_link_failed; test punch_timeout_fails_the_link_and_emits_link_failed"
 
 [[user_story.technical_behavior]]
 id = "TB-143"
 description = "RequestPeerLink/PeerCandidates is an existence-check-only relay exactly like RotateKey's recipient check - the server neither validates nor stores the candidate addresses or link_nonce it relays."
-evidence = "src/server.rs Registry::route_peer_link_request; tests peer_link_request_relays_candidates_to_the_named_peer, peer_link_request_to_an_unknown_recipient_is_rejected, request_peer_link_and_peer_candidates_roundtrip"
+evidence = "src/server/mod.rs Registry::route_peer_link_request; tests peer_link_request_relays_candidates_to_the_named_peer, peer_link_request_to_an_unknown_recipient_is_rejected, request_peer_link_and_peer_candidates_roundtrip"
 
 [[user_story.technical_behavior]]
 id = "TB-144"
 description = "The reliable-delivery layer's receiver (ArqReceiver) delivers frames in order regardless of arrival order, drops duplicates without redelivering, and fails the link (rather than growing unbounded) once its reorder buffer is exceeded by a persistently out-of-order sender."
-evidence = "src/p2p_reliable.rs ArqReceiver; tests in_order_frames_deliver_immediately, out_of_order_frames_are_buffered_then_delivered_once_the_gap_fills, duplicate_frames_are_dropped_without_redelivering, reorder_buffer_bound_fails_the_link_rather_than_growing_unbounded"
+evidence = "src/client/p2p_reliable.rs ArqReceiver; tests in_order_frames_deliver_immediately, out_of_order_frames_are_buffered_then_delivered_once_the_gap_fills, duplicate_frames_are_dropped_without_redelivering, reorder_buffer_bound_fails_the_link_rather_than_growing_unbounded"
 
 [[user_story.technical_behavior]]
 id = "TB-145"
 description = "The reliable-delivery layer's sender (ArqSender) retransmits an unacked frame only after its backoff elapses, never retransmits an acked one, and gives up (failing the whole send) once a frame exceeds MAX_RETRIES - there is no relay fallback to fall back on instead."
-evidence = "src/p2p_reliable.rs ArqSender; tests unacked_frame_is_not_retransmitted_before_its_backoff_elapses, acked_frame_is_never_retransmitted, unacked_frame_is_retransmitted_after_its_backoff_elapses, frame_exceeding_max_retries_fails_the_sender"
+evidence = "src/client/p2p_reliable.rs ArqSender; tests unacked_frame_is_not_retransmitted_before_its_backoff_elapses, acked_frame_is_never_retransmitted, unacked_frame_is_retransmitted_after_its_backoff_elapses, frame_exceeding_max_retries_fails_the_sender"
 
 [[user_story.technical_behavior]]
 id = "TB-146"
 description = "PeerLinkManager completes the full RequestPeerLink -> PeerCandidates -> Ping/Pong -> Active handshake over real (loopback) UDP sockets, delivers a reliable P2pPayload end to end once Active, and fails a link with a P2pEvent::LinkFailed once PUNCH_TIMEOUT elapses with nothing having answered."
-evidence = "src/p2p.rs PeerLinkManager; tests direct_link_handshake_and_reliable_message_end_to_end, punch_timeout_fails_the_link_and_emits_link_failed (loopback only - see docs/TESTING.md known coverage gaps for real cross-NAT verification)"
+evidence = "src/client/p2p.rs PeerLinkManager; tests direct_link_handshake_and_reliable_message_end_to_end, punch_timeout_fails_the_link_and_emits_link_failed (loopback only - see docs/TESTING.md known coverage gaps for real cross-NAT verification)"
 
 [[user_story.technical_behavior]]
 id = "TB-148"
 description = "For every RSA-family (Rsa/Password/None/PerMessage) recipient, a single voice chunk (CHUNK_INTERVAL-sized) or file chunk (FILE_CHUNK_BYTES-sized), once worst-case RSA-OAEP encrypted and wrapped for the direct peer-to-peer transport, stays comfortably under p2p_proto::SAFE_DATAGRAM_BYTES - a conservative UDP payload ceiling chosen to avoid IP fragmentation, which many NATs/firewalls simply drop on any lost fragment. pq_hybrid is an explicit, documented exception: its per-chunk key-setup overhead is fixed and large regardless of chunk size (docs/PROTOCOL.md §13.3), so no chunk-size choice can bring it under this budget - see docs/TESTING.md's known coverage gaps."
-evidence = "src/p2p_proto.rs SAFE_DATAGRAM_BYTES; src/file_transfer.rs FILE_CHUNK_BYTES; src/voice.rs CHUNK_INTERVAL; tests file_chunk_bytes_stays_under_the_p2p_safe_datagram_budget, chunk_interval_stays_under_the_p2p_safe_datagram_budget"
+evidence = "src/p2p_proto.rs SAFE_DATAGRAM_BYTES; src/client/file_transfer.rs FILE_CHUNK_BYTES; src/client/voice.rs CHUNK_INTERVAL; tests file_chunk_bytes_stays_under_the_p2p_safe_datagram_budget, chunk_interval_stays_under_the_p2p_safe_datagram_budget"
 
 [[user_story.technical_behavior]]
 id = "TB-149"
 description = "A direct link's punch handshake is triggered eagerly, the moment a peer is first learned about (ServerMessage::UserJoined), rather than lazily on first send - since voice (unlike text/file) excludes a recipient outright if its link isn't already Active at record-start, a lazy trigger meant the first voice message to any brand-new peer reliably missed them. A pre-warmed link that fails to punch with nothing ever queued against it fails silently (no visible LinkFailed banner) - only a link something was genuinely waiting on surfaces a visible failure."
-evidence = "src/session.rs handle_server_message's UserJoined arm (ensure_link call); src/p2p.rs PeerLinkManager::tick_at (had_pending gate on emitting P2pEvent::LinkFailed); test punch_timeout_with_nothing_pending_fails_silently"
+evidence = "src/client/session.rs handle_server_message's UserJoined arm (ensure_link call); src/client/p2p.rs PeerLinkManager::tick_at (had_pending gate on emitting P2pEvent::LinkFailed); test punch_timeout_with_nothing_pending_fails_silently"
 
 [[user_story.technical_behavior]]
 id = "TB-155"
 description = "A client only responds to an incoming PeerCandidates (the P2P link handshake) from a peer it currently shares a joined channel with; a request from anyone else is silently dropped before it ever reaches PeerLinkManager, since the server's own relay performs no relationship checking of its own."
-evidence = "docs/PROTOCOL.md 7.0.2; src/session.rs handle_server_message's PeerCandidates arm; src/ui/channel.rs UiState::shares_a_joined_channel"
+evidence = "docs/PROTOCOL.md 7.0.2; src/client/session.rs handle_server_message's PeerCandidates arm; src/client/tui/channel.rs UiState::shares_a_joined_channel"
 
 # ============================================================================
 # US-025 - Protect a private channel with a password
@@ -1537,37 +1537,37 @@ so_that = "someone who merely learns or guesses its name can't join it"
 [[user_story.acceptance_criteria]]
 id = "AC-104"
 description = "Ctrl+J's popup offers a Public/Private selector and, while Private is selected, an optional password field capped at CHANNEL_PASSWORD_MAX_LEN characters of letters, digits, and a documented set of basic symbols; creating a private channel with a password lets a later client join it by supplying the same password."
-evidence = "docs/SPEC.md Functionality #2; src/ui/channel.rs handle_join_popup_key, render_join_popup; tests private_channel_created_with_a_password_can_be_joined_by_a_second_client_with_the_right_one, end_to_end_password_protected_channel_join_flow, join_channel_with_password_roundtrips"
+evidence = "docs/SPEC.md Functionality #2; src/client/tui/channel.rs handle_join_popup_key, render_join_popup; tests private_channel_created_with_a_password_can_be_joined_by_a_second_client_with_the_right_one, end_to_end_password_protected_channel_join_flow, join_channel_with_password_roundtrips"
 
 [[user_story.acceptance_criteria]]
 id = "AC-105"
 description = "Joining a password-protected private channel with no password, or the wrong one, opens a dedicated password-entry popup naming which problem occurred, distinct from any other join failure, and lets the user retype and resubmit."
-evidence = "docs/PROTOCOL.md 6.5; src/ui/ui.rs Mode::ChannelPasswordPopup; src/ui/channel.rs handle_channel_password_popup_key, on_channel_join_rejected; tests private_channel_created_with_a_password_rejects_a_join_with_no_password, private_channel_created_with_a_password_rejects_a_join_with_the_wrong_password, end_to_end_password_protected_channel_join_flow, channel_join_rejected_roundtrips_all_three_kinds"
+evidence = "docs/PROTOCOL.md 6.5; src/client/tui/ui.rs Mode::ChannelPasswordPopup; src/client/tui/channel.rs handle_channel_password_popup_key, on_channel_join_rejected; tests private_channel_created_with_a_password_rejects_a_join_with_no_password, private_channel_created_with_a_password_rejects_a_join_with_the_wrong_password, end_to_end_password_protected_channel_join_flow, channel_join_rejected_roundtrips_all_three_kinds"
 
 [[user_story.acceptance_criteria]]
 id = "AC-106"
 description = "More than CHANNEL_MAX_PASSWORD_ATTEMPTS wrong attempts to join one private channel from one source address bans further attempts against that channel from that address for CHANNEL_PASSWORD_BAN_DURATION, reported distinctly from a plain wrong-password reply."
-evidence = "docs/PROTOCOL.md 6.6; src/server.rs Registry::join_channel, CHANNEL_MAX_PASSWORD_ATTEMPTS, CHANNEL_PASSWORD_BAN_DURATION; test more_than_seven_wrong_attempts_from_one_ip_bans_that_ip_for_that_channel"
+evidence = "docs/PROTOCOL.md 6.6; src/server/mod.rs Registry::join_channel, CHANNEL_MAX_PASSWORD_ATTEMPTS, CHANNEL_PASSWORD_BAN_DURATION; test more_than_seven_wrong_attempts_from_one_ip_bans_that_ip_for_that_channel"
 
 [[user_story.technical_behavior]]
 id = "TB-151"
 description = "Channel password comparison is constant-time, mirroring the credential check TB-015 already requires for server auth."
-evidence = "docs/PROTOCOL.md 5.2, 6.5; src/crypto.rs constant_time_eq; src/server.rs Registry::join_channel"
+evidence = "docs/PROTOCOL.md 5.2, 6.5; src/crypto/mod.rs constant_time_eq; src/server/mod.rs Registry::join_channel"
 
 [[user_story.technical_behavior]]
 id = "TB-152"
 description = "A successful password join resets that (source address, channel) pair's wrong-attempt counter to zero, so an earlier mistake never contributes toward a later, unrelated ban."
-evidence = "src/server.rs Registry::join_channel; test a_successful_password_join_resets_the_attempt_counter"
+evidence = "src/server/mod.rs Registry::join_channel; test a_successful_password_join_resets_the_attempt_counter"
 
 [[user_story.technical_behavior]]
 id = "TB-153"
 description = "The brute-force ban is keyed by (source IP address, channel name), not UserId, and tracked in server memory only with no persistence across a restart - a UserId is never reused (TB-020), so a per-UserId ban would be trivially bypassed by reconnecting."
-evidence = "docs/PROTOCOL.md 6.6; src/server.rs Registry::channel_password_attempts; test a_ban_is_scoped_to_ip_and_channel_not_userid"
+evidence = "docs/PROTOCOL.md 6.6; src/server/mod.rs Registry::channel_password_attempts; test a_ban_is_scoped_to_ip_and_channel_not_userid"
 
 [[user_story.technical_behavior]]
 id = "TB-154"
 description = "A ChannelJoinRejected (password-required, wrong-password, or banned) is sent to the requester only - a private channel's existence, membership, or password state never leaks to anyone else through this flow, the same guarantee TB-113 already gives ChannelJoinFailed."
-evidence = "docs/PROTOCOL.md 6.3, 6.5; src/server.rs Registry::join_channel; test channel_join_rejected_is_sent_to_the_requester_only"
+evidence = "docs/PROTOCOL.md 6.3, 6.5; src/server/mod.rs Registry::join_channel; test channel_join_rejected_is_sent_to_the_requester_only"
 
 # ============================================================================
 # US-026 - Leave a channel
@@ -1582,19 +1582,19 @@ so_that = "I can step away from a conversation I'm done with while staying conne
 [[user_story.acceptance_criteria]]
 id = "AC-109"
 description = "Typing /leave and pressing Enter leaves the currently selected channel tab, public or private. Leaving a private channel removes its tab entirely; leaving a public channel keeps its tab but the client is no longer a member of it."
-evidence = "docs/SPEC.md Functionality; src/ui/ui.rs submit_input's /leave branch; src/ui/channel.rs UiState::leave_channel_locally; tests slash_leave_on_a_private_channel_removes_its_tab, slash_leave_on_a_public_channel_keeps_the_tab_but_marks_it_left"
+evidence = "docs/SPEC.md Functionality; src/client/tui/ui.rs submit_input's /leave branch; src/client/tui/channel.rs UiState::leave_channel_locally; tests slash_leave_on_a_private_channel_removes_its_tab, slash_leave_on_a_public_channel_keeps_the_tab_but_marks_it_left"
 
 [[user_story.acceptance_criteria]]
 id = "AC-110"
 description = "Selecting a public channel tab you've left shows a single centered screen - 'You left this public channel. Do you want to join?' - instead of the normal sidebar/messages/compose view, and pressing Enter there requests rejoining it."
-evidence = "docs/SPEC.md Functionality; src/ui/channel.rs render_left_channel_screen; src/ui/ui.rs handle_key's left-channel branch; test left_channel_screen_enter_requests_rejoin"
+evidence = "docs/SPEC.md Functionality; src/client/tui/channel.rs render_left_channel_screen; src/client/tui/ui.rs handle_key's left-channel branch; test left_channel_screen_enter_requests_rejoin"
 
 [[user_story.technical_behavior]]
 id = "TB-157"
 description = "The dwell timer never re-fires a join for a channel the user explicitly left (ChannelTab::left) - only a channel that was simply never joined yet still dwell-auto-joins; a left channel only rejoins via the explicit Enter-to-rejoin action."
-evidence = "src/ui/channel.rs UiState::tick_dwell; test dwell_does_not_refire_for_a_left_channel"
+evidence = "src/client/tui/channel.rs UiState::tick_dwell; test dwell_does_not_refire_for_a_left_channel"
 
 [[user_story.technical_behavior]]
 id = "TB-158"
 description = "Leaving a channel - locally via /leave, or being told a peer left via UserLeft - drops the P2P link to any peer with whom no joined channel or DM history remains (UiState::has_reason_to_keep_link), the same bar on_user_offline already uses to decide whether to keep a departed user listed."
-evidence = "docs/PROTOCOL.md 7.0.3; src/channel.rs handle_leave; src/session.rs UserLeft arm; tests has_reason_to_keep_link_is_true_for_a_shared_channel, has_reason_to_keep_link_is_true_for_dm_history, has_reason_to_keep_link_is_false_with_neither"
+evidence = "docs/PROTOCOL.md 7.0.3; src/client/channel.rs handle_leave; src/client/session.rs UserLeft arm; tests has_reason_to_keep_link_is_true_for_a_shared_channel, has_reason_to_keep_link_is_true_for_dm_history, has_reason_to_keep_link_is_false_with_neither"

@@ -6,7 +6,7 @@
 //! minimal, with no congestion control, no selective-repeat, and no
 //! cumulative acks, since this operates at chat-message/file-chunk
 //! granularity, not bulk throughput. Pure state/logic, no sockets -
-//! `crate::p2p` drives it.
+//! `crate::client::p2p` drives it.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};

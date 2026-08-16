@@ -2,16 +2,18 @@
 //! and the compose bar - plus the full-screen private-message room.
 //!
 //! `UiState` is pure interaction/presentation state: it never touches the
-//! network or does any crypto. It hands back `UiAction`s (e.g.
+//! network or does any crypto (its one filesystem touch is stat-ing the
+//! file chosen in the `/file` flow - `file_send`; directory listing itself
+//! lives in `crate::client::file_browser`). It hands back `UiAction`s (e.g.
 //! "send this plaintext to these recipients") for the caller
-//! (`crate::session`, dispatching into `crate::channel` /
-//! `crate::direct_message`) to actually encrypt and put on the wire, and
+//! (`crate::client::session`, dispatching into `crate::client::channel` /
+//! `crate::client::direct_message`) to actually encrypt and put on the wire, and
 //! is fed incoming server
 //! events (already decrypted) through `on_*` methods. That split is what
 //! makes it unit testable without a socket or an audio device.
 //!
-//! Channel-tab state/rendering lives in `crate::ui::channel`, private-room
-//! (DM) state/rendering in `crate::ui::direct_message` - both add their
+//! Channel-tab state/rendering lives in `crate::client::tui::channel`, private-room
+//! (DM) state/rendering in `crate::client::tui::direct_message` - both add their
 //! own `impl UiState` blocks on top of the struct defined here. This file
 //! keeps the shared/mixed plumbing: the struct itself, focus/mode/dwell-
 //! agnostic key handling, and rendering helpers used by both views.
@@ -34,7 +36,7 @@ use super::direct_message::PrivateRoom;
 /// Animation frames for the "regenerating a key" spinner shown at the top
 /// right of the screen, right after the `Ctrl+H: Help` hint - see
 /// `UiState::tick_spinner`. One full cycle per 6 calls to `tick_spinner`
-/// while regenerating. Rendered in white (see `crate::ui::channel::render_channel_view`),
+/// while regenerating. Rendered in white (see `crate::client::tui::channel::render_channel_view`),
 /// regardless of the surrounding hint text's own (dimmer) color.
 pub const SPINNER_FRAMES: [char; 6] = ['_', '-', '\\', '|', '/', '-'];
 
@@ -296,10 +298,10 @@ pub enum Mode {
     /// Shown after a `ChannelJoinRejected` (`PasswordRequired`/
     /// `WrongPassword`/`Banned`) naming `UiState::channel_password_target` -
     /// lets the user type a password and resubmit the same `JoinChannel`.
-    /// See `crate::ui::channel::handle_channel_password_popup_key`.
+    /// See `crate::client::tui::channel::handle_channel_password_popup_key`.
     ChannelPasswordPopup,
     /// The `/file` send flow (browse -> confirm) is open - see
-    /// `crate::ui::file_send`. Data lives in `UiState::file_send`, not
+    /// `crate::client::tui::file_send`. Data lives in `UiState::file_send`, not
     /// here, same split `JoinPrivatePopup`/`join_popup_input` already use.
     FileSend,
 }
@@ -341,8 +343,8 @@ pub enum FileOfferChoice {
 }
 
 /// A recipient's addressing info: their id, announced `KeyMode` (which
-/// scheme to encrypt under - see `session::encrypt_for_one` vs
-/// `session::encrypt_hybrid_envelope_for`), and their raw public key bytes
+/// scheme to encrypt under - see `envelope::encrypt_for_one` vs
+/// `envelope::encrypt_hybrid_envelope_for`), and their raw public key bytes
 /// (RSA DER, or a bincode-encoded `crypto::pq::PqPublicBundle` for
 /// `KeyMode::PqHybrid` - opaque either way until paired with `KeyMode`).
 pub type Recipient = (UserId, KeyMode, Vec<u8>);
@@ -402,8 +404,8 @@ pub enum UiAction {
     /// has no access to either.
     AcceptIdentity(UserId),
     RejectIdentity(UserId),
-    /// A file send confirmed in the `/file` popup (`crate::ui::file_send`) -
-    /// `crate::channel::handle_send_file` builds and sends one `FileOffer`
+    /// A file send confirmed in the `/file` popup (`crate::client::tui::file_send`) -
+    /// `crate::client::channel::handle_send_file` builds and sends one `FileOffer`
     /// per ready recipient (rsa_per_msg readiness is snapshotted here, same
     /// as a voice stream's recipients - see `docs/PROTOCOL.md`'s file
     /// transfer section); nothing is read from `path` until each recipient
@@ -439,7 +441,7 @@ pub enum UiAction {
 
 /// Which trigger started the current recording - `handle_key`'s Space
 /// branch and `global_record_start`/`global_record_stop` (the global
-/// Ctrl+Alt+P shortcut, see `crate::global_ptt`) both drive the same
+/// Ctrl+Alt+P shortcut, see `crate::client::global_ptt`) both drive the same
 /// `recording`/`VoiceRecordStart`/`VoiceRecordStop` machinery, but need to
 /// stay distinguishable: `tick_recording_timeout`'s idle-silence guess
 /// must never apply to a `Global` recording (there's no repeat-keypress
@@ -494,7 +496,7 @@ pub struct UiState {
     /// with no prior guess yet.
     pub channel_password_error: Option<String>,
     /// The `/file` send flow's state (browse -> confirm), while `mode ==
-    /// Mode::FileSend` - see `crate::ui::file_send`. `pub`, not
+    /// Mode::FileSend` - see `crate::client::tui::file_send`. `pub`, not
     /// `pub(crate)`, same as `ui_connect_popup::ConnectPopupState::browser`
     /// - tests need to overwrite the browser with a deterministic temp
     /// directory after `start_file_send` opens one at the process's real
@@ -620,7 +622,7 @@ pub struct UiState {
     /// and shown in the header as `Conn:<quality>`, right before the CPU
     /// indicator. Defaults to `Unknown` (rendered `-`) until the first
     /// message of the session is observed.
-    pub conn_quality: crate::netstats::ConnQuality,
+    pub conn_quality: crate::client::netstats::ConnQuality,
 }
 
 impl UiState {
@@ -668,7 +670,7 @@ impl UiState {
             identity_review_focus: IdentityChoice::Reject,
             pending_messages: HashMap::new(),
             cpu_usage_pct: 0.0,
-            conn_quality: crate::netstats::ConnQuality::Unknown,
+            conn_quality: crate::client::netstats::ConnQuality::Unknown,
         }
     }
 
@@ -684,7 +686,7 @@ impl UiState {
 
     /// Called once a second by `session::run_connected_session` with the
     /// freshly-classified connection quality (`netstats::ConnStats::quality`).
-    pub fn set_conn_quality(&mut self, quality: crate::netstats::ConnQuality) {
+    pub fn set_conn_quality(&mut self, quality: crate::client::netstats::ConnQuality) {
         self.conn_quality = quality;
     }
 
@@ -993,7 +995,7 @@ impl UiState {
         self.audio_error = Some(reason);
     }
 
-    /// Called when a direct peer-to-peer link (`crate::p2p`) fails to
+    /// Called when a direct peer-to-peer link (`crate::client::p2p`) fails to
     /// establish or dies mid-session - there is no relay fallback, so
     /// whatever was pending against `peer_name` (a message, a call, a file)
     /// did not go through. Reuses the same error banner `recording_failed`/
@@ -1008,7 +1010,7 @@ impl UiState {
 
     /// Called once per session (`session::run_connected_session`) with the
     /// result of querying the terminal's actual Kitty keyboard protocol
-    /// support, as determined by `main.rs::setup_terminal`. When `true`,
+    /// support, as determined by `super::terminal::setup`. When `true`,
     /// `tick_recording_timeout` stops guessing from silence and leaves
     /// stopping entirely to the real `KeyEventKind::Release` event.
     pub fn set_keyboard_release_reporting(&mut self, supported: bool) {
@@ -1848,6 +1850,18 @@ fn render_file_offer_popup(
     );
 }
 
+/// Renders the label the UI shows on a finalized voice message block, e.g.
+/// `voice (12sec)`. A non-zero duration under one second still rounds up
+/// to `1sec` so a short clip is never shown as `0sec`.
+pub fn format_duration_label(duration_ms: u32) -> String {
+    let secs = if duration_ms == 0 {
+        0
+    } else {
+        (duration_ms as f64 / 1000.0).ceil() as u32
+    };
+    format!("voice ({secs}sec)")
+}
+
 /// Renders a byte count as a short human-readable size, e.g. `842 B`,
 /// `128.0 KB`, `4.2 MB`, `1.10 GB` - used only for the file-offer popup and
 /// in-progress log rows, so this doesn't need to handle anything past GB.
@@ -2004,7 +2018,7 @@ pub(crate) fn render_messages(
             let line = match &entry.body {
                 MessageBody::Text(text) => Line::from(format!("{}: {}", entry.from_name, text)),
                 MessageBody::Voice { duration_ms, .. } => {
-                    let label = crate::voice::format_duration_label(*duration_ms);
+                    let label = format_duration_label(*duration_ms);
                     Line::from(vec![
                         Span::raw(format!("{}: ", entry.from_name)),
                         Span::styled(

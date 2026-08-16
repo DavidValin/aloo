@@ -1,9 +1,10 @@
-use aloo::p2p_proto::SAFE_DATAGRAM_BYTES;
-use aloo::voice::{
+use aloo::client::tui::ui::format_duration_label;
+use aloo::client::voice::{
     CHUNK_INTERVAL, MAX_RECORDING_SAMPLES, MAX_RECORDING_SECS, SAMPLE_RATE_HZ, decode_wav_to_mono,
-    downmix_f32_to_mono_i16, downmix_i16_to_mono, end_chime_samples, format_duration_label,
-    pcm_from_bytes, pcm_to_bytes, recording_at_max, resample,
+    downmix_f32_to_mono_i16, downmix_i16_to_mono, end_chime_samples, pcm_from_bytes, pcm_to_bytes,
+    recording_at_max, resample,
 };
+use aloo::p2p_proto::SAFE_DATAGRAM_BYTES;
 
 /// @requirement TB-148
 #[test]

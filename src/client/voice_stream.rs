@@ -1,6 +1,6 @@
 //! Live voice streaming: the generic, target-agnostic session-scoped state
 //! and background workers shared by both channel and DM voice messages
-//! (`crate::channel`/`crate::direct_message` only add the thin "which log
+//! (`crate::client::channel`/`crate::client::direct_message` only add the thin "which log
 //! entry does this stream belong to" bookkeeping on top of this).
 
 use std::time::{Duration, Instant};
@@ -9,8 +9,8 @@ use rsa::{RsaPrivateKey, RsaPublicKey};
 
 use crate::crypto;
 use crate::proto::{self, KeyMode, UserId};
-use crate::session::SessionState;
-use crate::voice;
+use crate::client::session::SessionState;
+use crate::client::voice;
 
 /// How long an incoming stream can go without a chunk/end before it's
 /// treated as abandoned (e.g. the sender disconnected mid-recording) and
@@ -52,7 +52,7 @@ pub(crate) struct PqStreamOut {
 /// filtered to `KeyMode::PqHybrid` peers - see `channel::parse_pq_recipients`),
 /// signed with our own PQ identity (`session.own_pq_private` - `None` if we
 /// aren't ourselves `PqHybrid`, in which case there's nothing to build:
-/// `channel::can_address` already excludes `PqHybrid` recipients for a
+/// `keymode_policy::can_address` already excludes `PqHybrid` recipients for a
 /// non-`PqHybrid` sender before this is ever called). A recipient whose
 /// wrap fails (malformed public bundle) is simply left out, same
 /// partial-delivery pattern as an RSA recipient with an unparseable key.
@@ -235,7 +235,7 @@ pub(crate) fn spawn_record_stream_worker(
     recorder: voice::Recorder,
     target: StreamRecipients,
     stream_id: u64,
-    out_tx: tokio::sync::mpsc::UnboundedSender<crate::p2p::P2pOutbound>,
+    out_tx: tokio::sync::mpsc::UnboundedSender<crate::client::p2p::P2pOutbound>,
     done_tx: tokio::sync::mpsc::UnboundedSender<(u64, u32, Vec<u8>)>,
     stop_rx: std::sync::mpsc::Receiver<()>,
     // Notified (once) if this recording stops itself on reaching
@@ -267,7 +267,7 @@ pub(crate) fn spawn_record_stream_worker(
                 let per_recipient = build_chunk_recipients(&target, stream_id, seq, &pcm);
                 let msg = match &target {
                     StreamRecipients::Channel { .. } => {
-                        Some(crate::p2p::P2pOutbound::ChannelVoiceChunk {
+                        Some(crate::client::p2p::P2pOutbound::ChannelVoiceChunk {
                             stream_id,
                             seq,
                             per_recipient,
@@ -275,7 +275,7 @@ pub(crate) fn spawn_record_stream_worker(
                     }
                     StreamRecipients::Direct { to, .. } => {
                         per_recipient.into_iter().next().map(|(_, blocks)| {
-                            crate::p2p::P2pOutbound::DirectVoiceChunk {
+                            crate::client::p2p::P2pOutbound::DirectVoiceChunk {
                                 to: *to,
                                 stream_id,
                                 seq,
@@ -302,7 +302,7 @@ pub(crate) fn spawn_record_stream_worker(
             if stopped {
                 let duration_ms = ((total_samples * 1000) / voice::SAMPLE_RATE_HZ as u64) as u32;
                 let recipients = stream_recipient_ids(&target);
-                let _ = out_tx.send(crate::p2p::P2pOutbound::VoiceEnd {
+                let _ = out_tx.send(crate::client::p2p::P2pOutbound::VoiceEnd {
                     stream_id,
                     duration_ms,
                     recipients,

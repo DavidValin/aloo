@@ -12,7 +12,7 @@ use cucumber::{given, then, when};
 use tokio::net::{TcpListener, TcpStream};
 
 use aloo::crypto;
-use aloo::p2p::{P2pEvent, PeerLinkManager};
+use aloo::client::p2p::{P2pEvent, PeerLinkManager};
 use aloo::p2p_proto::P2pPayload;
 use aloo::proto::{
     AuthKind, AuthResponse, ChannelKind, ClientMessage, Content, Envelope, KeyMode, ServerMessage,
@@ -51,7 +51,7 @@ async fn bind_peer_link(w: &mut AlooWorld, who: &str) {
             .await
             .expect("failed to bind direct-link socket");
     let (raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel();
-    aloo::p2p::spawn_receive_loop(socket, raw_tx);
+    aloo::client::p2p::spawn_receive_loop(socket, raw_tx);
     let client = w.client_mut(who);
     client.peer_link = Some(peer_link);
     client.p2p_raw_rx = Some(raw_rx);

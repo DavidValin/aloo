@@ -1,4 +1,4 @@
-use aloo::idstore::{IdCheck, IdStore, default_path};
+use aloo::client::idstore::{IdCheck, IdStore, default_path};
 use std::path::PathBuf;
 
 fn temp_store_path() -> PathBuf {

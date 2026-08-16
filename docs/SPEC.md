@@ -10,42 +10,62 @@ When run with `--server`, it starts a server instead.
 
 ## Files
 
+`src/` is organized in tiers: `server/` (everything server-side), `client/`
+(everything client-side, non-UI), `client/tui/` (the terminal UI), and a
+handful of genuinely shared modules at the `src/` top level that both the
+server and the client compile against (the wire protocol, crypto,
+validation rules, settings).
+
 ```
 src/
 src/lib.rs              <-- library root: the module list `main.rs` and the tests build against
-src/main.rs             <-- CLI entry point: arg parsing, terminal setup/teardown
-src/connect.rs           <-- client bootstrap: connect popup, auth + identify handshake, local store loading
-src/session.rs            <-- the live connected session: event loop, session state, key rotation / identity pinning
-src/channel.rs             <-- channel-addressed send/receive handling for the session
-src/direct_message.rs       <-- DM-addressed send/receive handling for the session
-src/voice_stream.rs          <-- live voice streaming plumbing shared by channels and DMs
-src/file_stream.rs            <-- consent-gated, streamed file transfer plumbing, Functionality #10
-src/proto.rs        <-- implements the communication protocol
-src/voice.rs         <-- handles capture / live playback (mixer)
-src/crypto.rs         <-- handles encryption / decryption
-src/rekey.rs           <-- rsa_per_msg per-peer key rotation state (pure logic, no I/O)
-src/file_transfer.rs     <-- FileOfferPayload plaintext shape, chunking/filename constants, download dir, Functionality #10
-src/idstore.rs          <-- identity-pinning store (nickname -> public key), Functionality #9
-src/own_next_keys.rs     <-- this client's own per-peer continuity keys, Functionality #6/#9
-src/platform.rs           <-- cross-platform ~/.aloo home-directory resolution, shared by idstore.rs/own_next_keys.rs
-src/sysstats.rs            <-- CPU usage sampling for the header's CPU:<pct>% indicator
-src/netstats.rs             <-- connection-speed statistic for the header's Conn:<quality> indicator
-src/server.rs             <-- the server; contains a simple protocol for operations
-src/ui/mod.rs            <-- the `ui` module list (no logic of its own)
-src/ui/ui_connect_popup.rs  <-- the connect popup
-src/ui/ui.rs           <-- the UI once the user is connected: shared state, key handling, log/input rendering
-src/ui/channel.rs       <-- channel-tab state and rendering (adds `impl UiState` on top of `ui.rs`)
-src/ui/direct_message.rs <-- private-room (DM) state and rendering (likewise)
-src/ui/file_send.rs      <-- /file send flow: browse + confirm state and rendering (likewise), Functionality #10
+src/main.rs             <-- CLI entry point: arg parsing, client/server mode dispatch
+src/proto.rs        <-- implements the communication protocol (shared: both sides of the wire)
+src/p2p_proto.rs     <-- wire format for the direct P2P link + client<->server UDP rendezvous (shared)
+src/validation.rs     <-- channel-name/password rules the client and server must agree on (shared)
+src/crypto/            <-- handles encryption / decryption (mod.rs: RSA/AES; pq.rs: PQ-hybrid) (shared)
+src/settings.rs         <-- ~/.aloo/settings store: client prefs + persisted server bind/port/auth (shared)
+src/platform.rs          <-- cross-platform ~/.aloo home-directory resolution (shared)
+src/server/mod.rs       <-- the server; contains a simple protocol for operations
+src/client/mod.rs        <-- the `client` module list (no logic of its own)
+src/client/connect.rs      <-- client bootstrap: ConnectRequest types, auth + identify handshake, local store loading
+src/client/session.rs       <-- the live connected session: event loop, session state, key rotation / identity pinning
+src/client/channel.rs        <-- channel-addressed send/receive handling for the session
+src/client/direct_message.rs  <-- DM-addressed send/receive handling for the session
+src/client/envelope.rs         <-- builds outgoing proto::Envelopes (session-state-free crypto+proto glue)
+src/client/keymode_policy.rs    <-- client-side KeyMode policy predicates (addressability, identity pinning)
+src/client/voice_stream.rs       <-- live voice streaming plumbing shared by channels and DMs
+src/client/file_stream.rs         <-- consent-gated, streamed file transfer plumbing, Functionality #10
+src/client/file_transfer.rs        <-- FileOfferPayload plaintext shape, chunking/filename constants, download dir, Functionality #10
+src/client/file_browser.rs   <-- fs-backed directory-listing model with back/forward history (rendering lives in tui/)
+src/client/voice.rs           <-- handles capture / live playback (mixer)
+src/client/voice_pulse.rs      <-- musl-only PulseAudio backend replacing voice.rs's cpal path
+src/client/rekey.rs             <-- rsa_per_msg per-peer key rotation state (pure logic, no I/O)
+src/client/p2p.rs                <-- UDP hole punching and the direct peer link
+src/client/p2p_reliable.rs        <-- seq/ack/retransmit state machine for the P2P link
+src/client/idstore.rs        <-- identity-pinning store (nickname -> public key), Functionality #9
+src/client/own_next_keys.rs   <-- this client's own per-peer continuity keys, Functionality #6/#9
+src/client/global_ptt.rs       <-- OS-level global push-to-talk hotkey
+src/client/sysstats.rs          <-- CPU usage sampling for the header's CPU:<pct>% indicator
+src/client/netstats.rs           <-- connection-speed statistic for the header's Conn:<quality> indicator
+src/client/tui/mod.rs            <-- the `tui` module list (no logic of its own)
+src/client/tui/terminal.rs        <-- terminal lifecycle: raw mode + alternate screen setup/restore
+src/client/tui/input.rs            <-- the blocking crossterm input-reader thread feeding the session loop
+src/client/tui/ui_connect_popup.rs  <-- the connect popup
+src/client/tui/ui.rs           <-- the UI once the user is connected: shared state, key handling, log/input rendering
+src/client/tui/channel.rs       <-- channel-tab state and rendering (adds `impl UiState` on top of `ui.rs`)
+src/client/tui/direct_message.rs <-- private-room (DM) state and rendering (likewise)
+src/client/tui/file_send.rs      <-- /file send flow: browse + confirm state and rendering (likewise), Functionality #10
 ```
 
 The client half is split by *conversation type* on both sides of the network/UI
-boundary: `channel.rs`/`direct_message.rs` handle the wire side (encrypt, send,
-apply incoming), `ui/channel.rs`/`ui/direct_message.rs` the presentation side.
-Both pairs are thin layers over shared plumbing (`session.rs`, `voice_stream.rs`,
-`ui/ui.rs`) rather than independent stacks.
+boundary: `client/channel.rs`/`client/direct_message.rs` handle the wire side
+(encrypt, send, apply incoming), `client/tui/channel.rs`/`client/tui/direct_message.rs`
+the presentation side. Both pairs are thin layers over shared plumbing
+(`client/session.rs`, `client/voice_stream.rs`, `client/tui/ui.rs`) rather than
+independent stacks.
 
-Tests live under `./test/`, one file per `src` module that has one (`test/crypto_test.rs` for `src/crypto.rs`, etc.), wired up as explicit `[[test]]` targets in `Cargo.toml`. Two exceptions: the client-side modules that need a live socket and audio device (`main.rs`, `connect.rs`, `session.rs`, `channel.rs`, `direct_message.rs`, `voice_stream.rs`) have no test file of their own — their testable logic is exercised through `test/server_test.rs`'s end-to-end tests and the UI tests; and `test/ui_common.rs` is shared scaffolding for the three UI test files (included via `#[path] mod ui_common;`), not a `[[test]]` target.
+Tests live under `./test/`, one file per `src` module that has one (`test/crypto_test.rs` for `src/crypto/`, `test/ui_test.rs` for `src/client/tui/ui.rs`, etc. — test file names keep the flat module name, not the tier path), wired up as explicit `[[test]]` targets in `Cargo.toml`. Two exceptions: the client-side modules that need a live socket and audio device (`main.rs`, `client/connect.rs`, `client/session.rs`, `client/channel.rs`, `client/direct_message.rs`, `client/voice_stream.rs`) have no test file of their own — their testable logic is exercised through `test/server_test.rs`'s end-to-end tests and the UI tests; and `test/ui_common.rs` is shared scaffolding for the three UI test files (included via `#[path] mod ui_common;`), not a `[[test]]` target.
 
 Two further `[[test]]` targets sit alongside the per-module ones and don't follow the one-file-per-module rule, because neither tests a single module:
 
@@ -242,7 +262,7 @@ primitives live in `crypto/pq.rs`, covered in its own subsection below.
 
 The four RSA-based `my_key` methods differ **only in where the RSA keypair
 comes from**. `none` is not plaintext despite its `[🚨 PLAIN]` tag — see the
-tag table above. The single branch point is `connect.rs:240` `resolve_my_keypair`
+tag table above. The single branch point is `connect.rs:271` `resolve_my_keypair`
 (which also has `pq_hybrid`'s own arm, loading a keybundle instead of a
 plain RSA keypair - see below):
 
@@ -270,8 +290,8 @@ around the `ResolvedIdentity` match in `run_connected_session`) - see
 | | Channel | DM |
 | --- | --- | --- |
 | Send | `channel.rs:66` `handle_send_text` | `direct_message.rs:43` `handle_send_text` |
-| Encrypt (RSA methods) | `channel.rs:291` `encrypt_for_each` — loops recipients | `session.rs:829` `encrypt_for_one` — one recipient |
-| Encrypt (`pq_hybrid`) | same `encrypt_for_each`, dispatching to `session.rs:846` `encrypt_hybrid_envelope_for` per `pq_hybrid` recipient | `direct_message.rs` `encrypt_for_recipient`, same dispatch |
+| Encrypt (RSA methods) | `channel.rs` `encrypt_for_each` — loops recipients | `envelope.rs` `encrypt_for_one` — one recipient |
+| Encrypt (`pq_hybrid`) | same `encrypt_for_each`, dispatching to `envelope.rs` `encrypt_hybrid_envelope_for` per `pq_hybrid` recipient | `direct_message.rs` `encrypt_for_recipient`, same dispatch |
 | Wire message | `P2pPayload::Envelope { channel: Some(_), .. }`, one per member | `P2pPayload::Envelope { channel: None, .. }` |
 | Delivery | direct peer-to-peer link, one per recipient (`docs/PROTOCOL.md` §7.0/§7.1) — the server relays only the initial candidate exchange, never the message itself | same |
 | Receive + decrypt | `session.rs` `decrypt_envelope_for` → `rekey.rs` `decrypt_from` (RSA) or `crypto/pq.rs` `decrypt_hybrid` (`pq_hybrid`, dispatched by *our own* `own_key_mode`) | same |
@@ -279,7 +299,7 @@ around the `ResolvedIdentity` match in `run_connected_session`) - see
 A channel message is therefore encrypted N times for N members and delivered
 over N independent direct links — the server never sees any of them.
 `pq_hybrid` recipients that a non-`pq_hybrid` sender can't address at all
-(`channel.rs:125` `can_address`) are excluded before encryption even starts -
+(`keymode_policy.rs` `can_address`) are excluded before encryption even starts -
 see "What `pq_hybrid` adds" below.
 
 ### Voice messages
@@ -290,7 +310,7 @@ dedicated thread — never on the async event loop.
 
 | Stage | Where |
 | --- | --- |
-| Recipients' public keys parsed **once** at record-start | `channel.rs:269` `parse_recipients` / `direct_message.rs:142` `handle_voice_record_start` |
+| Recipients' public keys parsed **once** at record-start | `channel.rs:254` `parse_recipients` / `direct_message.rs:142` `handle_voice_record_start` |
 | Record + encrypt loop (own thread) | `voice_stream.rs:234` `spawn_record_stream_worker` |
 | Encrypt a chunk — channel (per recipient) | `voice_stream.rs` `build_chunk_recipients` → `p2p::P2pOutbound::ChannelVoiceChunk` |
 | Encrypt a chunk — DM | same, → `p2p::P2pOutbound::DirectVoiceChunk` |
@@ -322,8 +342,8 @@ its RSA/PQ dispatch types directly rather than duplicating them.
 | Sender learns of Accept: spawn the send worker | `session.rs` (`P2pEvent::FileAccepted` arm) |
 | Send worker — reads/encrypts/sends one chunk at a time | `file_stream.rs:88` `spawn_send_file_worker` |
 | Receive worker — decrypts/writes one chunk at a time | `file_stream.rs:154` `spawn_receive_file_worker` |
-| Forward an incoming chunk/end to its worker | `file_stream.rs:220`/`:235` `forward_chunk`/`end_incoming_transfer`, called from `session.rs:1104`/`:1113` |
-| Progress/completion/failure → log row | `session.rs:1682` `handle_file_event` → `UiState::set_file_progress`/`set_file_completed`/`set_file_rejected`/`set_file_failed` |
+| Forward an incoming chunk/end to its worker | `file_stream.rs:220`/`:235` `forward_chunk`/`end_incoming_transfer`, called from `session.rs:1059`/`:1068` |
+| Progress/completion/failure → log row | `session.rs:1621` `handle_file_event` → `UiState::set_file_progress`/`set_file_completed`/`set_file_rejected`/`set_file_failed` |
 
 Line numbers are as of the commit that added this section; a drifted number
 still resolves via the named function, same convention as the tables above.
@@ -337,16 +357,16 @@ key is current at each moment. Full model in `docs/PROTOCOL.md` §11.
 | --- | --- |
 | Sign a new key with the key it replaces (PKCS#1 v1.5 + SHA-256) | `rekey.rs:38` `rotation_signing_payload`, `:46` `sign_rotation` → `crypto/mod.rs:247` `sign` |
 | Verify a peer's rotation | `rekey.rs:59` `verify_rotation`, `:75` `verify_and_parse_rotation` → `crypto/mod.rs:256` `verify` |
-| Keygen, off the event loop | `rekey.rs:150` `generate_and_sign_rotation`, run by `session.rs:196` `spawn_rotation_worker`, queued via `session.rs:1393` `request_rotation_if_per_message` |
+| Keygen, off the event loop | `rekey.rs:150` `generate_and_sign_rotation`, run by `session.rs:196` `spawn_rotation_worker`, queued via `session.rs:1332` `request_rotation_if_per_message` |
 | Own per-peer keys + retained old keys | `rekey.rs:177` `OwnKeys` (retention bound `rekey.rs:31`) |
 | Is a peer's key fresh? queue if not | `rekey.rs:351` `RemoteKeys` — `try_use:380`, `enqueue:395`, `on_rotated:412` |
-| Apply an incoming rotation, flush the queue | `session.rs:1446` `handle_key_rotated` |
-| Reconnect continuity (persisted keys) | `own_next_keys.rs` + `session.rs:1300` `send_resume_rotation_if_available` (prove), `idstore.rs:169` `get` + `rekey.rs:122` `verify_with_fallback` (verify), both surfaced by `session.rs:1446` `handle_key_rotated` — *and*, for a `PerMessage` nickname that already has a continuity key pinned, gated on sight by `check_identity` (`session.rs:1188`) itself, before any rotation attempt (`docs/PROTOCOL.md` §12.6.3) |
+| Apply an incoming rotation, flush the queue | `session.rs:1385` `handle_key_rotated` |
+| Reconnect continuity (persisted keys) | `own_next_keys.rs` + `session.rs:1239` `send_resume_rotation_if_available` (prove), `idstore.rs:169` `get` + `rekey.rs:122` `verify_with_fallback` (verify), both surfaced by `session.rs:1385` `handle_key_rotated` — *and*, for a `PerMessage` nickname that already has a continuity key pinned, gated on sight by `check_identity` (`session.rs:1127`) itself, before any rotation attempt (`docs/PROTOCOL.md` §12.6.3) |
 
 Voice is exempt from per-chunk rotation (§11.6): one key snapshot covers a whole
 stream (`voice_stream.rs:234`), and a recipient without a fresh key (or whose
 direct link isn't `Active` yet, `docs/PROTOCOL.md` §7.0/§7.3) is dropped
-from that stream (`channel.rs:228` in `handle_voice_record_start`) or the DM recording is refused outright
+from that stream (`channel.rs:213` in `handle_voice_record_start`) or the DM recording is refused outright
 (`direct_message.rs:152`).
 
 ### What `pq_hybrid` adds
@@ -365,23 +385,23 @@ material and a different, self-contained primitive set. Full model in
 | Decrypt + dual-signature verify | `crypto/pq.rs` `decrypt_hybrid`, `unwrap_key`, `verify_body` |
 | Voice: per-stream key + per-chunk cipher | `crypto/pq.rs` `fresh_data_key`, `wrap_key_for_stream` (signs `stream_id++k_data` once), `encrypt_hybrid_voice_chunk`/`decrypt_hybrid_chunk` (deterministic nonce from `stream_id`+`seq`), `unwrap_key_for_stream` (verified once, cached) |
 | Own key material in the live session | `session.rs` `SessionState::own_pq_private` (mirrors `own_keys`, populated instead of it when `own_key_mode == PqHybrid`) |
-| Who can be addressed | `channel.rs:125` `can_address` - a `pq_hybrid` recipient needs a `pq_hybrid` sender (their own ML-DSA-87/RSA-sign identity); everyone else is reachable by any sender, as always |
-| `id_store` pinning | `session.rs:1181` `uses_byte_comparison_pinning` - `pq_hybrid` joins `rsa`/`password` on the plain-byte-comparison side, unlike `rsa_per_msg`'s signature-based resume |
+| Who can be addressed | `keymode_policy.rs` `can_address` - a `pq_hybrid` recipient needs a `pq_hybrid` sender (their own ML-DSA-87/RSA-sign identity); everyone else is reachable by any sender, as always |
+| `id_store` pinning | `keymode_policy.rs` `uses_byte_comparison_pinning` - `pq_hybrid` joins `rsa`/`password` on the plain-byte-comparison side, unlike `rsa_per_msg`'s signature-based resume |
 | Auto-generate keys if missing | `crypto/pq.rs` `ensure_bundle_at`, called from `connect.rs` `resolve_my_keypair`'s `PqHybrid` arm (`docs/PROTOCOL.md` §13.9) |
 | Connect-popup cache (`~/.aloo/.cache`) | `connect.rs` `ConnectCache`, `cache_path`, `random_prefix`, `fresh_pq_hybrid_paths_in`, `prefill_connect_defaults` |
 
 ### `server_key` — a separate axis
 
 Authenticating *to the server* is unrelated to the message encryption above and
-has only three options (`ui_connect_popup.rs:148` `ServerKeySelection`,
-`proto.rs:221` `AuthKind`). Client side: `connect.rs:286` `build_auth_response`.
-Server side: `server.rs:64` `AuthConfig::verify`.
+has only three options (`connect.rs:23` `ServerKeySelection`,
+`proto.rs:221` `AuthKind`). Client side: `connect.rs:317` `build_auth_response`.
+Server side: `server/mod.rs:64` `AuthConfig::verify`.
 
 | Option | Check |
 | --- | --- |
 | `none` | passes unconditionally |
 | `password` | sent as-is and compared byte-for-byte in constant time (`crypto/mod.rs:273` `constant_time_eq`) — it is **not** hashed |
-| `rsa` | server sends a random nonce (`crypto/mod.rs:264` `random_bytes`, `server.rs:53` `make_challenge`); client encrypts it with the server's public key; server decrypts and compares |
+| `rsa` | server sends a random nonce (`crypto/mod.rs:264` `random_bytes`, `server/mod.rs:53` `make_challenge`); client encrypts it with the server's public key; server decrypts and compares |
 
 ## Server responsibilities
 

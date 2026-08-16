@@ -1,5 +1,5 @@
 //! Loopback integration test for the direct peer-to-peer transport
-//! (`src/p2p.rs`): a real server (TCP + UDP rendezvous) plus two real
+//! (`src/client/p2p.rs`): a real server (TCP + UDP rendezvous) plus two real
 //! `PeerLinkManager`s exercising the full `RequestPeerLink` ->
 //! `PeerCandidates` -> `Ping`/`Pong` -> `Active` handshake, then a reliable
 //! text send end to end. Loopback trivially succeeds at punching (there's
@@ -10,7 +10,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use aloo::p2p::{P2pEvent, PeerLinkManager};
+use aloo::client::p2p::{P2pEvent, PeerLinkManager};
 use aloo::p2p_proto::P2pPayload;
 use aloo::proto::*;
 use aloo::server::{AuthConfig, serve_with_rendezvous};
@@ -85,8 +85,8 @@ async fn direct_link_handshake_and_reliable_message_end_to_end() {
 
     let (a_raw_tx, mut a_raw_rx) = tokio::sync::mpsc::unbounded_channel();
     let (b_raw_tx, mut b_raw_rx) = tokio::sync::mpsc::unbounded_channel();
-    aloo::p2p::spawn_receive_loop(a_socket, a_raw_tx);
-    aloo::p2p::spawn_receive_loop(b_socket, b_raw_tx);
+    aloo::client::p2p::spawn_receive_loop(a_socket, a_raw_tx);
+    aloo::client::p2p::spawn_receive_loop(b_socket, b_raw_tx);
 
     // alice proposes a link to bob - relayed by the server as PeerCandidates.
     alice.ensure_link(&mut a, bob_id).await;

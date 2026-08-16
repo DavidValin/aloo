@@ -3,11 +3,11 @@
 
 use cucumber::{given, then, when};
 
-use aloo::file_transfer::MAX_FILENAME_CHARS;
+use aloo::client::file_transfer::MAX_FILENAME_CHARS;
 use aloo::proto::UserId;
-use aloo::ui::file_send::{FileConfirmChoice, FileSendState, FileSendTarget};
-use aloo::ui::ui::{FileTransferStatus, MessageBody, Mode, PendingFileOffer, UiAction};
-use aloo::ui::ui_connect_popup::FileBrowserState;
+use aloo::client::tui::file_send::{FileConfirmChoice, FileSendState, FileSendTarget};
+use aloo::client::tui::ui::{FileTransferStatus, MessageBody, Mode, PendingFileOffer, UiAction};
+use aloo::client::file_browser::FileBrowserState;
 use crossterm::event::{KeyCode, KeyModifiers};
 
 use crate::steps::ui_common::{id_for, press_key};

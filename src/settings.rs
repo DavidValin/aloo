@@ -3,7 +3,7 @@
 //! plain-text-under-`~/.aloo` convention as `idstore`/`own_next_keys`
 //! rather than pulling in a config-format crate for a handful of fields.
 //!
-//! Holds the global push-to-talk preferences (see `crate::global_ptt`):
+//! Holds the global push-to-talk preferences (see `crate::client::global_ptt`):
 //! whether it's enabled, and which shortcut to register. Unlike `IdStore`,
 //! this file is written proactively - on first run there is no session
 //! data to defer writing until, and the whole point is that a user can
@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 
 /// The default global push-to-talk shortcut, in the same syntax
 /// `global_hotkey::hotkey::HotKey` parses directly (see
-/// `crate::global_ptt::resolve_hotkey`).
+/// `crate::client::global_ptt::resolve_hotkey`).
 pub const DEFAULT_GLOBAL_PTT_SHORTCUT: &str = "ctrl+alt+p";
 
 /// The default server bind address and port (`docs/SPEC.md` "Server

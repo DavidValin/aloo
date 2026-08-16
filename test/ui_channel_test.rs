@@ -2,10 +2,10 @@
 mod ui_common;
 use ui_common::*;
 
-use aloo::netstats::ConnQuality;
+use aloo::client::netstats::ConnQuality;
 use aloo::proto::{ChannelInfo, ChannelKind, KeyMode, UserId};
-use aloo::ui::channel::DWELL_DURATION;
-use aloo::ui::ui::{Focus, IdentityCase, MessageBody, UiAction, UiState, VoiceTarget, render};
+use aloo::client::tui::channel::DWELL_DURATION;
+use aloo::client::tui::ui::{Focus, IdentityCase, MessageBody, UiAction, UiState, VoiceTarget, render};
 use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -210,7 +210,7 @@ fn enter_before_channel_is_joined_does_not_send_and_keeps_the_typed_text() {
 fn ctrl_j_then_typing_and_enter_requests_private_channel_join() {
     let mut state = UiState::new("me".into());
     ctrl(&mut state, KeyCode::Char('j'));
-    assert_eq!(state.mode, aloo::ui::ui::Mode::JoinPrivatePopup);
+    assert_eq!(state.mode, aloo::client::tui::ui::Mode::JoinPrivatePopup);
     type_str(&mut state, "secret-room");
     let action = press(&mut state, KeyCode::Enter).unwrap();
     assert_eq!(
@@ -221,7 +221,7 @@ fn ctrl_j_then_typing_and_enter_requests_private_channel_join() {
             password: None
         }
     );
-    assert_eq!(state.mode, aloo::ui::ui::Mode::Normal);
+    assert_eq!(state.mode, aloo::client::tui::ui::Mode::Normal);
 }
 
 /// @requirement AC-021
@@ -232,7 +232,7 @@ fn ctrl_j_popup_escape_cancels_without_action() {
     type_str(&mut state, "abandoned");
     let action = press(&mut state, KeyCode::Esc);
     assert_eq!(action, None);
-    assert_eq!(state.mode, aloo::ui::ui::Mode::Normal);
+    assert_eq!(state.mode, aloo::client::tui::ui::Mode::Normal);
     assert_eq!(state.join_popup_input, "");
 }
 
@@ -551,7 +551,7 @@ fn finalize_matches_by_from_and_stream_id_not_stream_id_alone() {
 // Message log scrolling, channel-specific part
 //
 // The generic selection/scrolling behavior itself lives in
-// `crate::ui::ui` (shared with the private-room view), so its tests are in
+// `crate::client::tui::ui` (shared with the private-room view), so its tests are in
 // `ui_test.rs` - only the "which channel's log am I even looking at"
 // interaction belongs here.
 // ---------------------------------------------------------------------

@@ -1,5 +1,5 @@
 use aloo::crypto::{self, KeyPair};
-use aloo::own_next_keys::{OwnNextKeys, default_path};
+use aloo::client::own_next_keys::{OwnNextKeys, default_path};
 use std::path::PathBuf;
 
 fn temp_store_path() -> PathBuf {

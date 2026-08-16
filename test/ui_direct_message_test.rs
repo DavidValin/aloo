@@ -3,7 +3,7 @@ mod ui_common;
 use ui_common::*;
 
 use aloo::proto::{KeyMode, UserId};
-use aloo::ui::ui::{Focus, IdentityCase, MessageBody, UiAction, VoiceTarget, render};
+use aloo::client::tui::ui::{Focus, IdentityCase, MessageBody, UiAction, VoiceTarget, render};
 use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;

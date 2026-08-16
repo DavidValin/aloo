@@ -2,7 +2,7 @@ use std::net::{IpAddr, Ipv4Addr};
 
 use aloo::crypto::{self, KeyPair};
 use aloo::proto::*;
-use aloo::rekey;
+use aloo::client::rekey;
 use aloo::server::{
     AuthConfig, CHANNEL_MAX_PASSWORD_ATTEMPTS, CHANNEL_PASSWORD_BAN_DURATION, DEFAULT_CHANNEL_NAME,
     Outgoing, Registry, serve,

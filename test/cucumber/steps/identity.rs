@@ -4,13 +4,13 @@ use crossterm::event::{KeyCode, KeyModifiers};
 use cucumber::{given, then, when};
 
 use aloo::crypto::{self, public_key_to_der};
-use aloo::idstore::{IdCheck, IdStore};
+use aloo::client::idstore::{IdCheck, IdStore};
 use aloo::proto::{KeyMode, UserId};
-use aloo::rekey::{
+use aloo::client::rekey::{
     QueuedOutbound, RemoteKeys, ResumeVerification, sign_rotation, verify_and_parse_rotation,
     verify_rotation, verify_with_fallback,
 };
-use aloo::ui::ui::{IdentityCase, MessageBody, SPINNER_FRAMES, UiAction};
+use aloo::client::tui::ui::{IdentityCase, MessageBody, SPINNER_FRAMES, UiAction};
 
 use crate::steps::ui_common::{id_for, press_key, user_with_mode};
 use crate::support::ui_rows;
@@ -178,7 +178,7 @@ async fn stale_again(w: &mut AlooWorld) {
 /// of the two separating spaces - scoped rather than scanning the whole
 /// header for a `SPINNER_FRAMES` character, because `-` is both a spinner
 /// frame and the header's own `Conn:-` "no traffic yet" glyph
-/// (`aloo::netstats::ConnQuality::Unknown`); a whole-row scan would
+/// (`aloo::client::netstats::ConnQuality::Unknown`); a whole-row scan would
 /// mistake that `-` for a spinner that isn't actually there.
 fn after_help_hint(w: &AlooWorld) -> String {
     let rows = ui_rows(w.ui_ref());

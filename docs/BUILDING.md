@@ -83,7 +83,7 @@ these targets need more than `cross build` alone to get working audio:
   that plugin, this isn't a corner case - a naively-built static binary
   gets no audio at all on most desktops.
 
-  The fix is `src/voice_pulse.rs`: on musl only (`cfg(target_env =
+  The fix is `src/client/voice_pulse.rs`: on musl only (`cfg(target_env =
   "musl")`), it talks to PulseAudio/PipeWire directly over `libpulse`'s own
   protocol instead of through ALSA, using `libpulse`/`libpulse-simple`
   statically linked into the binary (also built from source in

@@ -8,8 +8,8 @@ use cucumber::{given, then, when};
 
 use aloo::proto::{ChannelJoinRejection, ChannelKind, UserId};
 use aloo::server::CHANNEL_MAX_PASSWORD_ATTEMPTS;
-use aloo::ui::channel::DWELL_DURATION;
-use aloo::ui::ui::{Mode, UiAction};
+use aloo::client::tui::channel::DWELL_DURATION;
+use aloo::client::tui::ui::{Mode, UiAction};
 
 use crate::steps::ui_common::id_for;
 use crate::world::AlooWorld;

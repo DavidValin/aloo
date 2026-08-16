@@ -23,7 +23,7 @@ readme = "README.md"
 # friction with the rest of this file.
 [target.'cfg(target_os = "windows")'.dependencies]
 # Only for the global push-to-talk shortcut's message pump - see
-# `src/global_ptt.rs`. Same version `global-hotkey` itself pins, so cargo
+# `src/client/global_ptt.rs`. Same version `global-hotkey` itself pins, so cargo
 # resolves one copy rather than two.
 windows-sys = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation"] }
 
@@ -47,7 +47,7 @@ global-hotkey = "0.8"
 hkdf = "0.12"
 hmac = "0.12"
 # Local interface enumeration for direct peer-to-peer UDP hole punching's
-# host candidates (`src/p2p.rs`) - std has no cross-platform way to list a
+# host candidates (`src/client/p2p.rs`) - std has no cross-platform way to list a
 # machine's own network interfaces.
 if-addrs = "0.13"
 ml-dsa = "0.1"

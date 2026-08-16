@@ -1,6 +1,6 @@
 //! Push-to-talk voice messages, streamed live: audio captured while Space
 //! is held is chunked and handed off (by the caller, in
-//! `crate::voice_stream`) to the
+//! `crate::client::voice_stream`) to the
 //! network roughly every `CHUNK_INTERVAL`, rather than waiting for release
 //! to send one whole clip. Playback mirrors that: decoded chunks are
 //! pushed into the `Mixer` as they arrive and heard immediately, instead
@@ -13,7 +13,7 @@
 //!
 //! Two backends provide `Recorder`/`spawn_mixer`, chosen by `target_env`:
 //! everywhere except musl, both are implemented here on top of `cpal`'s
-//! ALSA host. On musl they're re-exported from `crate::voice_pulse`
+//! ALSA host. On musl they're re-exported from `crate::client::voice_pulse`
 //! instead, which talks to PulseAudio/PipeWire directly - see that module's
 //! doc comment for why. Both backends share the platform-independent
 //! mixing logic below (`MixSource`, `mix_output`, `apply_mixer_cmd`) so the
@@ -103,7 +103,7 @@ pub enum VoiceError {
 /// shim): the search just finds nothing and this falls through to
 /// `default`.
 ///
-/// musl doesn't use this at all (see `crate::voice_pulse`): it talks to the
+/// musl doesn't use this at all (see `crate::client::voice_pulse`): it talks to the
 /// same PulseAudio/PipeWire server this is trying to reach via ALSA's
 /// dlopen'd plugin, just directly, so the plugin-preference dance is
 /// unnecessary there.
@@ -226,7 +226,7 @@ pub fn downmix_f32_to_mono_i16(samples: &[f32], channels: u16) -> Vec<i16> {
 /// Bundled as WAV rather than the project's original `assets/end.mp3` so
 /// it can be decoded without pulling in an MP3-decoding crate: a WAV's
 /// PCM payload can be read directly, no decoding library needed.
-const END_CHIME_WAV: &[u8] = include_bytes!("../assets/end.wav");
+const END_CHIME_WAV: &[u8] = include_bytes!("../../assets/end.wav");
 
 static END_CHIME_SAMPLES: OnceLock<Vec<i16>> = OnceLock::new();
 
@@ -246,7 +246,7 @@ pub fn end_chime_samples() -> Vec<i16> {
 
 /// Bundled the same way as `END_CHIME_WAV` - a plain WAV, no MP3-decoding
 /// crate needed.
-const BELL_CHIME_WAV: &[u8] = include_bytes!("../assets/bell.wav");
+const BELL_CHIME_WAV: &[u8] = include_bytes!("../../assets/bell.wav");
 
 static BELL_CHIME_SAMPLES: OnceLock<Vec<i16>> = OnceLock::new();
 
@@ -307,25 +307,13 @@ pub fn decode_wav_to_mono(wav: &[u8]) -> Option<Vec<i16>> {
     Some(resample(&mono, sample_rate, SAMPLE_RATE_HZ))
 }
 
-/// Renders the label the UI shows on a finalized voice message block, e.g.
-/// `voice (12sec)`. A non-zero duration under one second still rounds up
-/// to `1sec` so a short clip is never shown as `0sec`.
-pub fn format_duration_label(duration_ms: u32) -> String {
-    let secs = if duration_ms == 0 {
-        0
-    } else {
-        (duration_ms as f64 / 1000.0).ceil() as u32
-    };
-    format!("voice ({secs}sec)")
-}
-
 /// Captures microphone audio into an in-memory buffer while alive.
 /// Created when the user presses Space; `take_pending` is called
 /// periodically by the caller's record-stream worker to flush chunks to
 /// the network, and the `Recorder` is simply dropped (closing the input
 /// stream) once recording stops.
 ///
-/// musl gets a different `Recorder` entirely - see `crate::voice_pulse`,
+/// musl gets a different `Recorder` entirely - see `crate::client::voice_pulse`,
 /// re-exported below as this same name so callers never need to know
 /// which backend is active.
 #[cfg(not(target_env = "musl"))]
@@ -533,7 +521,7 @@ pub(crate) fn apply_mixer_cmd(
 /// using push-to-talk near-simultaneously) actually mix together instead
 /// of queuing behind one another.
 ///
-/// musl gets a different `spawn_mixer` entirely - see `crate::voice_pulse`,
+/// musl gets a different `spawn_mixer` entirely - see `crate::client::voice_pulse`,
 /// re-exported below as this same name.
 #[cfg(not(target_env = "musl"))]
 pub fn spawn_mixer(
@@ -703,4 +691,4 @@ pub(crate) fn mix_output<T: Copy>(
 }
 
 #[cfg(target_env = "musl")]
-pub use crate::voice_pulse::{Recorder, spawn_mixer};
+pub use crate::client::voice_pulse::{Recorder, spawn_mixer};

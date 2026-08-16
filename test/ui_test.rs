@@ -3,7 +3,7 @@ mod ui_common;
 use ui_common::*;
 
 use aloo::proto::UserId;
-use aloo::ui::ui::{
+use aloo::client::tui::ui::{
     Focus, IdentityCase, MessageBody, Mode, RECORD_HOLD_TIMEOUT, SPINNER_FRAMES, UiAction, UiState,
     render,
 };
@@ -737,7 +737,7 @@ fn space_release_without_prior_press_does_nothing() {
 //
 // SPEC.md: "both the channel view and the private-message room" - the
 // selection/scrolling logic under test (`handle_messages_key`,
-// `current_log`, `render_messages`) is defined here in `crate::ui::ui`,
+// `current_log`, `render_messages`) is defined here in `crate::client::tui::ui`,
 // not in either view's own module. A channel is used only as the cheapest
 // fixture for getting entries into a log.
 // ---------------------------------------------------------------------
@@ -812,7 +812,7 @@ fn up_down_clamp_at_the_ends_instead_of_wrapping() {
 #[test]
 fn page_up_page_down_home_and_end_jump_the_selection() {
     let mut state = joined_general_with(vec![user(2, "bob")]);
-    let total = aloo::ui::ui::MESSAGE_PAGE_JUMP + 5;
+    let total = aloo::client::tui::ui::MESSAGE_PAGE_JUMP + 5;
     push_n_channel_texts(&mut state, total);
     state.focus = Focus::Messages;
     assert_eq!(state.message_selected, total - 1);
@@ -821,7 +821,7 @@ fn page_up_page_down_home_and_end_jump_the_selection() {
     assert_eq!(state.message_selected, 0);
 
     press(&mut state, KeyCode::PageDown);
-    assert_eq!(state.message_selected, aloo::ui::ui::MESSAGE_PAGE_JUMP);
+    assert_eq!(state.message_selected, aloo::client::tui::ui::MESSAGE_PAGE_JUMP);
 
     press(&mut state, KeyCode::End);
     assert_eq!(state.message_selected, total - 1);
@@ -829,7 +829,7 @@ fn page_up_page_down_home_and_end_jump_the_selection() {
     press(&mut state, KeyCode::PageUp);
     assert_eq!(
         state.message_selected,
-        total - 1 - aloo::ui::ui::MESSAGE_PAGE_JUMP
+        total - 1 - aloo::client::tui::ui::MESSAGE_PAGE_JUMP
     );
 }
 
@@ -1067,14 +1067,14 @@ fn help_scroll_moves_by_one_line_and_by_a_page_and_clamps_at_both_ends() {
     press(&mut state, KeyCode::PageDown);
     assert_eq!(
         state.help_scroll(),
-        aloo::ui::ui::HELP_SCROLL_PAGE,
+        aloo::client::tui::ui::HELP_SCROLL_PAGE,
         "PageDown jumps a full page"
     );
 
     press(&mut state, KeyCode::End);
     let bottom = state.help_scroll();
     assert!(
-        bottom > aloo::ui::ui::HELP_SCROLL_PAGE,
+        bottom > aloo::client::tui::ui::HELP_SCROLL_PAGE,
         "End should jump past a single page"
     );
     press(&mut state, KeyCode::PageDown);

@@ -1,10 +1,10 @@
 //! Consent-gated, streamed file transfer: the sending/receiving background
 //! workers and session-scoped bookkeeping for one file transfer
 //! (`docs/PROTOCOL.md`'s file transfer section). Mirrors
-//! `crate::voice_stream`'s shared plumbing, but a transfer is always a
+//! `crate::client::voice_stream`'s shared plumbing, but a transfer is always a
 //! single point-to-point recipient (never a channel broadcast - a channel
 //! send is just N independent transfers, one per recipient, see
-//! `crate::channel::handle_send_file`) and moves bytes to/from disk instead
+//! `crate::client::channel::handle_send_file`) and moves bytes to/from disk instead
 //! of the audio mixer. Reuses `voice_stream`'s RSA/PQ dispatch
 //! (`DirectStreamKey`, `IncomingStreamKey`, `ChunkDecryptor`,
 //! `encrypt_direct_chunk`, `resolve_incoming_key`) rather than duplicating
@@ -16,10 +16,10 @@ use std::io::{BufReader, Read, Write};
 use std::path::PathBuf;
 use std::time::Instant;
 
-use crate::file_transfer::FILE_CHUNK_BYTES;
-use crate::p2p::P2pOutbound;
+use crate::client::file_transfer::FILE_CHUNK_BYTES;
+use crate::client::p2p::P2pOutbound;
 use crate::proto::UserId;
-use crate::voice_stream::{self, ChunkDecryptor, DecryptJob, DirectStreamKey, IncomingStreamKey};
+use crate::client::voice_stream::{self, ChunkDecryptor, DecryptJob, DirectStreamKey, IncomingStreamKey};
 
 /// What a currently-sending (our own) file transfer is addressed to,
 /// remembered from the moment its `FileOffer` is sent so a later

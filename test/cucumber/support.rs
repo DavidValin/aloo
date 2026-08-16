@@ -11,8 +11,8 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 
-use aloo::ui::ui::UiState;
-use aloo::ui::ui_connect_popup::ConnectPopupState;
+use aloo::client::tui::ui::UiState;
+use aloo::client::tui::ui_connect_popup::ConnectPopupState;
 
 pub fn buffer_of<F>(width: u16, height: u16, draw: F) -> Buffer
 where
@@ -35,7 +35,7 @@ pub fn rows_of(buffer: &Buffer) -> Vec<String> {
 }
 
 pub fn ui_buffer(state: &UiState, width: u16, height: u16) -> Buffer {
-    buffer_of(width, height, |f| aloo::ui::ui::render(f, state))
+    buffer_of(width, height, |f| aloo::client::tui::ui::render(f, state))
 }
 
 pub fn ui_rows(state: &UiState) -> Vec<String> {
@@ -50,7 +50,7 @@ pub fn ui_rows_wide(state: &UiState) -> Vec<String> {
 
 pub fn popup_rows(state: &ConnectPopupState, width: u16, height: u16) -> Vec<String> {
     rows_of(&buffer_of(width, height, |f| {
-        aloo::ui::ui_connect_popup::render(f, state)
+        aloo::client::tui::ui_connect_popup::render(f, state)
     }))
 }
 

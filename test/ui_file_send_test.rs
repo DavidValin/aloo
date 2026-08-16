@@ -2,14 +2,14 @@
 mod ui_common;
 use ui_common::*;
 
-use aloo::file_transfer::{self, MAX_FILENAME_CHARS};
+use aloo::client::file_transfer::{self, MAX_FILENAME_CHARS};
 use aloo::proto::{KeyMode, UserId};
-use aloo::ui::file_send::{FileConfirmChoice, FileSendTarget};
-use aloo::ui::ui::{
+use aloo::client::tui::file_send::{FileConfirmChoice, FileSendTarget};
+use aloo::client::tui::ui::{
     FileOfferChoice, FileTransferStatus, Focus, IdentityCase, MessageBody, Mode, PendingFileOffer,
     UiAction,
 };
-use aloo::ui::ui_connect_popup::FileBrowserState;
+use aloo::client::file_browser::FileBrowserState;
 use crossterm::event::KeyCode;
 
 fn unique_dir(label: &str) -> std::path::PathBuf {
@@ -42,7 +42,7 @@ fn file_command_opens_the_browser_when_a_channel_is_joined() {
 /// @requirement AC-073
 #[test]
 fn file_command_does_nothing_when_no_channel_is_joined_and_no_dm_is_open() {
-    let mut state = aloo::ui::ui::UiState::new("me".into());
+    let mut state = aloo::client::tui::ui::UiState::new("me".into());
     type_str(&mut state, "/file");
     let action = press(&mut state, KeyCode::Enter);
     assert!(action.is_none());
@@ -62,7 +62,7 @@ fn file_command_does_nothing_when_no_channel_is_joined_and_no_dm_is_open() {
 /// real current directory) with a deterministic temp tree - same technique
 /// `ui_connect_popup_test.rs::selecting_a_file_in_browser_applies_it_to_the_popup_field`
 /// already uses for the connect popup's own browser.
-fn open_file_send_with_temp_tree(state: &mut aloo::ui::ui::UiState, root: &std::path::Path) {
+fn open_file_send_with_temp_tree(state: &mut aloo::client::tui::ui::UiState, root: &std::path::Path) {
     type_str(state, "/file");
     press(state, KeyCode::Enter);
     state.file_send.as_mut().unwrap().browser = FileBrowserState::open(root.to_path_buf()).unwrap();
@@ -258,7 +258,7 @@ fn there_is_no_size_cap_on_a_file_send() {
 }
 
 // ---------------------------------------------------------------------
-// Sending-side log rows (`crate::ui::channel`/`direct_message`'s
+// Sending-side log rows (`crate::client::tui::channel`/`direct_message`'s
 // `log_own_file_offer_*`, called once `handle_send_file` allocates a
 // stream_id - AC-075/AC-096)
 // ---------------------------------------------------------------------

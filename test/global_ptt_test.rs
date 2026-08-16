@@ -1,4 +1,4 @@
-use aloo::global_ptt::{is_wayland_session, resolve_hotkey};
+use aloo::client::global_ptt::{is_wayland_session, resolve_hotkey};
 use aloo::settings::DEFAULT_GLOBAL_PTT_SHORTCUT;
 use global_hotkey::hotkey::HotKey;
 

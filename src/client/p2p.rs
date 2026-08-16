@@ -1,5 +1,5 @@
 //! Direct client<->client transport: server-assisted UDP hole punching, plus
-//! the reliable (text/file, `crate::p2p_reliable`) and unreliable (voice)
+//! the reliable (text/file, `crate::client::p2p_reliable`) and unreliable (voice)
 //! delivery built on top of the resulting punched link. See
 //! `docs/PROTOCOL.md`'s "Direct peer-to-peer transport" section.
 //!
@@ -22,7 +22,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::p2p_proto::{P2pPayload, PunchDatagram, RendezvousMessage};
-use crate::p2p_reliable::{ArqReceiver, ArqSender};
+use crate::client::p2p_reliable::{ArqReceiver, ArqSender};
 use crate::proto::{self, ClientMessage, UserId};
 
 /// Total time a link is allowed to spend either waiting for the peer's

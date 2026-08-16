@@ -1,6 +1,7 @@
-use aloo::ui::ui_connect_popup::{
-    Action, ConnectPopupState, ConnectRequest, Field, FileBrowserState, KeyType, MyKeySelection,
-    MyKeyType, NICKNAME_MAX_LEN, ServerKeySelection, render,
+use aloo::client::connect::{ConnectRequest, MyKeySelection, ServerKeySelection};
+use aloo::client::file_browser::FileBrowserState;
+use aloo::client::tui::ui_connect_popup::{
+    Action, ConnectPopupState, Field, KeyType, MyKeyType, NICKNAME_MAX_LEN, render,
 };
 use crossterm::event::KeyCode;
 use ratatui::Terminal;
@@ -211,7 +212,7 @@ fn own_next_keys_path_is_prefilled_from_the_default_path() {
     assert!(!state.my_key.own_next_keys_path.is_empty());
     assert_eq!(
         state.my_key.own_next_keys_path,
-        aloo::own_next_keys::default_path().display().to_string()
+        aloo::client::own_next_keys::default_path().display().to_string()
     );
 }
 
@@ -315,7 +316,7 @@ fn id_store_path_is_prefilled_from_the_default_path() {
     );
     assert_eq!(
         state.id_store_path,
-        aloo::idstore::default_path().display().to_string()
+        aloo::client::idstore::default_path().display().to_string()
     );
 }
 
@@ -714,7 +715,7 @@ fn selecting_a_file_in_browser_applies_it_to_the_popup_field() {
 
     // force the browser into our known temp tree so the test is deterministic
     state.browser = Some((
-        aloo::ui::ui_connect_popup::FileBrowserTarget::ServerKeyFile,
+        aloo::client::tui::ui_connect_popup::FileBrowserTarget::ServerKeyFile,
         FileBrowserState::open(root.clone()).unwrap(),
     ));
     // move selection to "file.txt" (index 2: "..", "subdir", "file.txt")
@@ -935,7 +936,7 @@ fn render_with_open_file_browser_does_not_panic() {
     let mut state = ConnectPopupState::new();
     state.server_key.key_type = KeyType::Rsa;
     state.browser = Some((
-        aloo::ui::ui_connect_popup::FileBrowserTarget::ServerKeyFile,
+        aloo::client::tui::ui_connect_popup::FileBrowserTarget::ServerKeyFile,
         FileBrowserState::open(root.clone()).unwrap(),
     ));
     let backend = TestBackend::new(80, 24);
@@ -970,7 +971,7 @@ fn file_browser_render_scrolls_to_keep_the_selection_visible() {
     let mut state = ConnectPopupState::new();
     state.server_key.key_type = KeyType::Rsa;
     state.browser = Some((
-        aloo::ui::ui_connect_popup::FileBrowserTarget::ServerKeyFile,
+        aloo::client::tui::ui_connect_popup::FileBrowserTarget::ServerKeyFile,
         browser,
     ));
 

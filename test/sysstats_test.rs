@@ -1,6 +1,6 @@
 use std::thread::sleep;
 
-use aloo::sysstats::{CPU_HEALTHY_MAX_PCT, CpuMonitor};
+use aloo::client::sysstats::{CPU_HEALTHY_MAX_PCT, CpuMonitor};
 
 /// @requirement TB-119
 #[test]

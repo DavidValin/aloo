@@ -8,9 +8,11 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::style::Color;
 
-use aloo::ui::ui_connect_popup::{
-    Action, ConnectPopupState, Field, FileBrowserState, FileBrowserTarget, KeyType, MyKeySelection,
-    MyKeyType, NICKNAME_MAX_LEN, ServerKeySelection, render,
+use aloo::client::connect::{MyKeySelection, ServerKeySelection};
+use aloo::client::file_browser::FileBrowserState;
+use aloo::client::tui::ui_connect_popup::{
+    Action, ConnectPopupState, Field, FileBrowserTarget, KeyType, MyKeyType, NICKNAME_MAX_LEN,
+    render,
 };
 
 use crate::support::popup_rows;
@@ -290,7 +292,7 @@ async fn id_store_prefilled(w: &mut AlooWorld, _which: String) {
     );
     assert_eq!(
         p.id_store_path,
-        aloo::idstore::default_path().display().to_string()
+        aloo::client::idstore::default_path().display().to_string()
     );
 }
 
@@ -300,7 +302,7 @@ async fn own_next_prefilled(w: &mut AlooWorld) {
     assert!(!p.my_key.own_next_keys_path.is_empty());
     assert_eq!(
         p.my_key.own_next_keys_path,
-        aloo::own_next_keys::default_path().display().to_string()
+        aloo::client::own_next_keys::default_path().display().to_string()
     );
 }
 

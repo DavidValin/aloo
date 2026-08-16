@@ -6,7 +6,7 @@
 #![allow(dead_code)]
 
 use aloo::proto::{ChannelInfo, ChannelKind, KeyMode, UserId, UserInfo};
-use aloo::ui::ui::{MessageBody, UiAction, UiState};
+use aloo::client::tui::ui::{MessageBody, UiAction, UiState};
 use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -81,7 +81,7 @@ pub fn joined_general_with(members: Vec<UserInfo>) -> UiState {
 /// Fills `general`'s log with `n` distinct incoming texts (`msg0`, `msg1`,
 /// ...). A channel is just the cheapest way to get entries into a message
 /// log - the scrolling behavior this feeds in `ui_test.rs` is
-/// `crate::ui::ui`'s, shared by the private-room view.
+/// `crate::client::tui::ui`'s, shared by the private-room view.
 pub fn push_n_channel_texts(state: &mut UiState, n: usize) {
     for i in 0..n {
         state.on_channel_message(
@@ -95,7 +95,7 @@ pub fn push_n_channel_texts(state: &mut UiState, n: usize) {
 
 /// A small, deterministic temp directory tree (one file, one subdirectory
 /// with a nested file) for tests that need to drive the in-TUI file browser
-/// (`ui_connect_popup::FileBrowserState`) without depending on whatever
+/// (`file_browser::FileBrowserState`) without depending on whatever
 /// happens to be in the process's real current directory - same pattern
 /// `ui_connect_popup_test.rs::make_tree` already uses for the connect
 /// popup's own browser tests. Each call gets a unique path (PID + a
@@ -119,7 +119,7 @@ pub fn make_temp_file_tree() -> std::path::PathBuf {
 pub fn rendered_rows(state: &UiState) -> Vec<String> {
     let backend = TestBackend::new(100, 30);
     let mut terminal = Terminal::new(backend).unwrap();
-    terminal.draw(|f| aloo::ui::ui::render(f, state)).unwrap();
+    terminal.draw(|f| aloo::client::tui::ui::render(f, state)).unwrap();
     let buffer = terminal.backend().buffer().clone();
     (0..buffer.area.height)
         .map(|y| {

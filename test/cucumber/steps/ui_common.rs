@@ -7,7 +7,7 @@ use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 use cucumber::{given, then, when};
 
 use aloo::proto::{ChannelInfo, ChannelKind, KeyMode, UserId, UserInfo};
-use aloo::ui::ui::{Focus, MessageBody, UiState};
+use aloo::client::tui::ui::{Focus, MessageBody, UiState};
 
 use crate::world::AlooWorld;
 
@@ -148,7 +148,7 @@ async fn log_holds(w: &mut AlooWorld, n: usize) {
 
 #[given(expr = "the message log holds more than a page of messages")]
 async fn log_holds_a_page_and_a_half(w: &mut AlooWorld) {
-    let total = aloo::ui::ui::MESSAGE_PAGE_JUMP + 5;
+    let total = aloo::client::tui::ui::MESSAGE_PAGE_JUMP + 5;
     let state = w.ui_mut();
     for i in 0..total {
         state.on_channel_message(
@@ -203,7 +203,7 @@ pub fn press_key(w: &mut AlooWorld, code: KeyCode, mods: KeyModifiers) {
             .handle_key(code)
             .expect("popup key handling should not fail");
         w.popup_error = w.popup_mut().error.clone();
-        w.action_was_none = matches!(action, aloo::ui::ui_connect_popup::Action::None);
+        w.action_was_none = matches!(action, aloo::client::tui::ui_connect_popup::Action::None);
         w.popup_action = Some(action);
         return;
     }

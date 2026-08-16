@@ -3,7 +3,7 @@
 use cucumber::{then, when};
 use ratatui::style::Color;
 
-use aloo::netstats::ConnQuality;
+use aloo::client::netstats::ConnQuality;
 
 use crate::support::{appears_before, find_text_start, ui_buffer, ui_rows};
 use crate::world::AlooWorld;

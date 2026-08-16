@@ -1,25 +1,25 @@
 //! DM-specific send/receive handling for the connected session: sending
 //! text/voice to a peer, and applying incoming DM-addressed server
-//! messages. `crate::session` dispatches into these from its
+//! messages. `crate::client::session` dispatches into these from its
 //! `handle_ui_action`/`handle_server_message`; the generic
-//! live-voice-streaming plumbing they use lives in `crate::voice_stream`.
+//! live-voice-streaming plumbing they use lives in `crate::client::voice_stream`.
 
 use tokio::io::AsyncWrite;
 
 use crate::crypto;
-use crate::p2p::LinkReadiness;
+use crate::client::p2p::LinkReadiness;
 use crate::p2p_proto::P2pPayload;
 use crate::proto::{self, Content, Envelope, KeyMode, UserId};
-use crate::rekey;
-use crate::session::SessionState;
-use crate::ui::ui::UiState;
-use crate::voice;
-use crate::voice_stream;
+use crate::client::rekey;
+use crate::client::session::SessionState;
+use crate::client::tui::ui::UiState;
+use crate::client::voice;
+use crate::client::voice_stream;
 
 /// Encrypts `plaintext` for one recipient, dispatching by their `KeyMode` -
 /// see `channel::encrypt_for_each`'s doc for the same split (this is its
 /// single-recipient DM counterpart). Returns `None` if the recipient is
-/// `PqHybrid` and we can't address them (`channel::can_address`), or if
+/// `PqHybrid` and we can't address them (`keymode_policy::can_address`), or if
 /// encryption itself fails.
 fn encrypt_for_recipient(
     session: &SessionState,
@@ -28,15 +28,15 @@ fn encrypt_for_recipient(
     plaintext: &[u8],
     content: Content,
 ) -> Option<Envelope> {
-    if !crate::channel::can_address(key_mode, session.own_key_mode) {
+    if !crate::client::keymode_policy::can_address(key_mode, session.own_key_mode) {
         return None;
     }
     match key_mode {
         KeyMode::PqHybrid => {
             let signing = session.own_pq_private.as_ref()?;
-            crate::session::encrypt_hybrid_envelope_for(signing, pubkey_der, plaintext, content)
+            crate::client::envelope::encrypt_hybrid_envelope_for(signing, pubkey_der, plaintext, content)
         }
-        _ => crate::session::encrypt_for_one(pubkey_der, plaintext, content),
+        _ => crate::client::envelope::encrypt_for_one(pubkey_der, plaintext, content),
     }
 }
 
@@ -64,7 +64,7 @@ pub(crate) async fn handle_send_text(
                     envelope,
                 },
             );
-            crate::session::request_rotation_if_per_message(session, to);
+            crate::client::session::request_rotation_if_per_message(session, to);
         }
     } else {
         session
@@ -89,12 +89,12 @@ pub(crate) async fn handle_send_file(
     recipient_key_mode: KeyMode,
     recipient_pubkey_der: Vec<u8>,
 ) -> proto::Result<()> {
-    if !crate::channel::can_address(recipient_key_mode, session.own_key_mode)
+    if !crate::client::keymode_policy::can_address(recipient_key_mode, session.own_key_mode)
         || !session.remote_keys.try_use(to)
     {
         return Ok(());
     }
-    let payload = crate::file_transfer::FileOfferPayload {
+    let payload = crate::client::file_transfer::FileOfferPayload {
         filename: filename.clone(),
         size,
     };
@@ -124,7 +124,7 @@ pub(crate) async fn handle_send_file(
     ui_state.log_own_file_offer_dm(to, stream_id, filename.clone(), size);
     session.own_file_targets.insert(
         stream_id,
-        crate::file_stream::OwnFileTarget { to, path, key },
+        crate::client::file_stream::OwnFileTarget { to, path, key },
     );
     session.peer_link.ensure_link(wr, to).await;
     session.peer_link.send_reliable_or_queue(
@@ -135,7 +135,7 @@ pub(crate) async fn handle_send_file(
             envelope,
         },
     );
-    crate::session::request_rotation_if_per_message(session, to);
+    crate::client::session::request_rotation_if_per_message(session, to);
     Ok(())
 }
 
@@ -149,7 +149,7 @@ pub(crate) async fn handle_voice_record_start(
     recipient_key_mode: KeyMode,
     recipient_pubkey_der: Vec<u8>,
 ) -> proto::Result<()> {
-    if !crate::channel::can_address(recipient_key_mode, session.own_key_mode)
+    if !crate::client::keymode_policy::can_address(recipient_key_mode, session.own_key_mode)
         || !session.remote_keys.try_use(to)
     {
         ui_state.recording_failed("recipient's key isn't ready yet".to_string());
@@ -220,9 +220,9 @@ pub(crate) fn on_message(
     let Some(sender) = ui_state.known_users.get(&from).cloned() else {
         return;
     };
-    if let Some(body) = crate::session::decrypt_envelope_for(envelope, from, &sender, session) {
+    if let Some(body) = crate::client::session::decrypt_envelope_for(envelope, from, &sender, session) {
         ui_state.on_direct_message(from, from_name, body);
-        crate::session::request_rotation_if_per_message(session, from);
+        crate::client::session::request_rotation_if_per_message(session, from);
     }
 }
 
@@ -262,7 +262,7 @@ pub(crate) fn on_own_stream_finished(
     pcm: Vec<u8>,
 ) {
     ui_state.on_direct_stream_finished(to, you, stream_id, duration_ms, pcm);
-    crate::session::request_rotation_if_per_message(session, to);
+    crate::client::session::request_rotation_if_per_message(session, to);
 }
 
 pub(crate) fn on_stream_finished(

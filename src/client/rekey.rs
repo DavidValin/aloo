@@ -1,5 +1,5 @@
 //! `rsa_per_msg` (`KeyMode::PerMessage`, PROTOCOL.md §11): per-peer RSA key
-//! rotation. Pure state/logic, no I/O - the caller (`crate::session`) is
+//! rotation. Pure state/logic, no I/O - the caller (`crate::client::session`) is
 //! responsible for actually writing `ClientMessage::RotateKey` to the wire
 //! and for sourcing the "currently trusted" public key for a peer (which
 //! lives in `ui::UiState`'s `known_users`/`channel.members`, kept in sync

@@ -1,13 +1,13 @@
 //! System CPU sampling for the channel view's `CPU:<pct>%` header
 //! indicator (`docs/SPEC.md` "Connected UI") - wraps `sysinfo::System` so
-//! `crate::ui` never needs to know how CPU usage is actually measured on
+//! `crate::client::tui` never needs to know how CPU usage is actually measured on
 //! the underlying OS. `sysinfo` covers Linux, macOS and Windows itself, so
 //! there's no per-platform branching here.
 
 use sysinfo::System;
 
 /// Below this percentage the header renders `CPU:<pct>%` in green; at or
-/// above it, red - see `crate::ui::channel::cpu_color`.
+/// above it, red - see `crate::client::tui::channel::cpu_color`.
 pub const CPU_HEALTHY_MAX_PCT: f32 = 25.0;
 
 /// Samples system-wide CPU usage on demand.

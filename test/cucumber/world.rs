@@ -15,14 +15,14 @@ use rsa::{RsaPrivateKey, RsaPublicKey};
 use tokio::net::TcpStream;
 
 use aloo::crypto::KeyPair;
-use aloo::idstore::IdStore;
-use aloo::p2p::{P2pEvent, PeerLinkManager};
+use aloo::client::idstore::IdStore;
+use aloo::client::p2p::{P2pEvent, PeerLinkManager};
 use aloo::p2p_proto::PunchDatagram;
 use aloo::proto::{Envelope, ServerMessage, UserId};
-use aloo::rekey::{RemoteKeys, ResumeVerification};
+use aloo::client::rekey::{RemoteKeys, ResumeVerification};
 use aloo::server::{Outgoing, Registry};
-use aloo::ui::ui::{UiAction, UiState};
-use aloo::ui::ui_connect_popup::ConnectPopupState;
+use aloo::client::tui::ui::{UiAction, UiState};
+use aloo::client::tui::ui_connect_popup::ConnectPopupState;
 
 /// Modulus size for the scenario key pool below.
 ///
@@ -77,7 +77,7 @@ pub fn keypair_for(who: &str) -> KeyPair {
 pub struct ClientState {
     pub stream: Option<TcpStream>,
     pub received: Vec<ServerMessage>,
-    /// This client's direct peer-to-peer transport (`aloo::p2p`), bound
+    /// This client's direct peer-to-peer transport (`aloo::client::p2p`), bound
     /// lazily the first time a scenario needs it (`server::ensure_peer_link`)
     /// - message/voice content now travels here, never through `stream`.
     pub peer_link: Option<PeerLinkManager>,
@@ -91,7 +91,7 @@ pub struct AlooWorld {
     // -- connect popup -------------------------------------------------
     pub popup: Option<ConnectPopupState>,
     pub popup_error: Option<String>,
-    pub popup_action: Option<aloo::ui::ui_connect_popup::Action>,
+    pub popup_action: Option<aloo::client::tui::ui_connect_popup::Action>,
     pub browser_root: Option<std::path::PathBuf>,
 
     // -- connected UI --------------------------------------------------
@@ -122,11 +122,11 @@ pub struct AlooWorld {
     pub rotation_der: Vec<u8>,
     pub rotation_sig: Vec<u8>,
     pub verification: Option<ResumeVerification>,
-    pub flushed: Vec<aloo::rekey::QueuedOutbound>,
+    pub flushed: Vec<aloo::client::rekey::QueuedOutbound>,
 
     // -- identity pinning ----------------------------------------------
     pub id_store: Option<IdStore>,
-    pub id_check: Option<aloo::idstore::IdCheck>,
+    pub id_check: Option<aloo::client::idstore::IdCheck>,
     pub temp_files: Vec<std::path::PathBuf>,
 }
 

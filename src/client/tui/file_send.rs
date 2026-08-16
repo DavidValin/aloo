@@ -1,11 +1,11 @@
 //! The `/file` send flow: browse the local filesystem for a file, then
 //! confirm ("Send file" / "Discard", Discard focused by default) before it's
-//! actually read, encrypted and sent. Mirrors `crate::ui::channel`/
-//! `crate::ui::direct_message`'s split (state/rendering for one concern,
-//! `impl UiState` on top of the struct defined in `crate::ui::ui`) rather
+//! actually read, encrypted and sent. Mirrors `crate::client::tui::channel`/
+//! `crate::client::tui::direct_message`'s split (state/rendering for one concern,
+//! `impl UiState` on top of the struct defined in `crate::client::tui::ui`) rather
 //! than living inline there.
 //!
-//! Reuses `ui_connect_popup::FileBrowserState` as-is (already a generic,
+//! Reuses `crate::client::file_browser::FileBrowserState` as-is (a generic,
 //! fs-backed directory browser with back/forward history) instead of a
 //! second copy of the same widget.
 
@@ -21,7 +21,8 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use crate::proto::UserId;
 
 use super::ui::{Mode, UiAction, UiState, centered_rect, focus_border_style};
-use super::ui_connect_popup::{FileBrowserState, render_file_browser};
+use super::ui_connect_popup::render_file_browser;
+use crate::client::file_browser::FileBrowserState;
 
 /// Who a file send is addressed to - just the identity, not a frozen
 /// recipient list: recipients are recomputed fresh at confirm-time (see
@@ -199,8 +200,8 @@ impl UiState {
     /// `docs/PROTOCOL.md`'s file transfer section) and emits the send
     /// action, closing the whole `/file` flow. Unlike a text send, the
     /// outgoing log row(s) aren't pushed here: the `stream_id` each row is
-    /// keyed by isn't allocated until `crate::channel::handle_send_file`/
-    /// `crate::direct_message::handle_send_file` run (same reasoning
+    /// keyed by isn't allocated until `crate::client::channel::handle_send_file`/
+    /// `crate::client::direct_message::handle_send_file` run (same reasoning
     /// `handle_voice_record_start` already established for voice - the
     /// caller that allocates the stream id is the one that logs the row).
     /// Recipients are resolved fresh here rather than reusing whatever was
@@ -225,7 +226,7 @@ impl UiState {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "file".to_string());
-        let filename = crate::file_transfer::truncate_filename(&filename);
+        let filename = crate::client::file_transfer::truncate_filename(&filename);
 
         let target = self.file_send.as_ref()?.target.clone();
         let action = match target {

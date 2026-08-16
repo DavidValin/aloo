@@ -1,24 +1,15 @@
 //! CLI entry point: acts as the client (terminal UI) by default, or as the
 //! server when run with `--server`.
 
-use std::io::Stdout;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use clap::Parser;
-use crossterm::event::{
-    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
-};
-use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-};
-use global_hotkey::hotkey::HotKey;
-use ratatui::Terminal;
-use ratatui::backend::CrosstermBackend;
 
-use aloo::connect;
+use aloo::client::connect;
+use aloo::client::global_ptt;
+use aloo::client::tui::terminal;
 use aloo::crypto;
-use aloo::global_ptt;
 use aloo::server::{self, AuthConfig};
 use aloo::settings;
 
@@ -64,7 +55,7 @@ struct Cli {
 }
 
 /// Not `#[tokio::main]`: on macOS, delivering the global push-to-talk
-/// shortcut (`crate::global_ptt`) needs the process's *real* OS main
+/// shortcut (`crate::client::global_ptt`) needs the process's *real* OS main
 /// thread free to pump a `CFRunLoop` - something `#[tokio::main]` would
 /// immediately claim for its own `block_on`. Every other path
 /// (`--server`, `--keygen-pq-hybrid`, and the client on Windows/Linux)
@@ -105,34 +96,13 @@ fn load_settings() -> settings::Settings {
     }
 }
 
-/// The hotkey to register for global push-to-talk, or `None` if it
-/// shouldn't be registered at all this run - either the user turned it off
-/// (`global_ptt_enabled = false`) or (Linux only) this session is running
-/// under Wayland, which `global_hotkey` has no backend for at all
-/// (`global_ptt::is_wayland`). Printed once at startup in the Wayland
-/// case per the user's own choice: warn, don't retry, don't crash - Space
-/// still works normally while the app is focused either way.
-fn hotkey_to_register(settings: &settings::Settings) -> Option<HotKey> {
-    if !settings.global_ptt_enabled {
-        return None;
-    }
-    if global_ptt::is_wayland() {
-        eprintln!(
-            "aloo: global push-to-talk ({}) needs X11 and isn't available under Wayland - Space still works while aloo is focused",
-            settings.global_ptt_shortcut
-        );
-        return None;
-    }
-    Some(global_ptt::resolve_hotkey(&settings.global_ptt_shortcut))
-}
-
 /// Client entry point, platform-dispatching only where it has to
 /// (`run_client_macos` - see its doc comment). Everywhere else this is
 /// exactly what `#[tokio::main]` used to do: build a runtime, block on
 /// `run_client`.
 fn run_client_entry(cli: Cli) -> Result<(), BoxError> {
     let settings = load_settings();
-    let hotkey = hotkey_to_register(&settings);
+    let hotkey = global_ptt::hotkey_to_register(&settings);
 
     #[cfg(target_os = "macos")]
     return run_client_macos(cli, hotkey);
@@ -154,7 +124,7 @@ fn run_client_entry(cli: Cli) -> Result<(), BoxError> {
 /// identical either way - it has no idea which thread produced its
 /// `hotkey_rx`.
 #[cfg(target_os = "macos")]
-fn run_client_macos(cli: Cli, hotkey: Option<HotKey>) -> Result<(), BoxError> {
+fn run_client_macos(cli: Cli, hotkey: Option<global_hotkey::hotkey::HotKey>) -> Result<(), BoxError> {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -276,41 +246,10 @@ async fn run_client(
     cli: Cli,
     hotkey_rx: Option<tokio::sync::mpsc::UnboundedReceiver<global_ptt::GlobalPttEvent>>,
 ) -> Result<(), BoxError> {
-    let (mut terminal, keyboard_release_reporting) = setup_terminal()?;
+    let (mut term, keyboard_release_reporting) = terminal::setup()?;
     let port = cli.port.unwrap_or(settings::DEFAULT_PORT);
     let result =
-        connect::run_client_inner(&mut terminal, port, keyboard_release_reporting, hotkey_rx).await;
-    restore_terminal(&mut terminal)?;
+        connect::run_client_inner(&mut term, port, keyboard_release_reporting, hotkey_rx).await;
+    terminal::restore(&mut term)?;
     result
-}
-
-/// Besides the terminal itself, returns whether this terminal actually
-/// reports real key releases (Kitty keyboard protocol), queried directly
-/// rather than just assumed from the `Push`/`PopKeyboardEnhancementFlags`
-/// calls succeeding - a terminal can accept those escape sequences without
-/// honoring them, and `UiState::tick_recording_timeout` needs a trustworthy
-/// answer to know whether it's ever allowed to auto-stop a recording on
-/// its own instead of waiting for a genuine release.
-fn setup_terminal() -> Result<(Terminal<CrosstermBackend<Stdout>>, bool), BoxError> {
-    enable_raw_mode()?;
-    let mut stdout = std::io::stdout();
-    crossterm::execute!(stdout, EnterAlternateScreen)?;
-    let keyboard_release_reporting =
-        crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
-    if keyboard_release_reporting {
-        crossterm::execute!(
-            stdout,
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::REPORT_EVENT_TYPES)
-        )?;
-    }
-    let backend = CrosstermBackend::new(stdout);
-    Ok((Terminal::new(backend)?, keyboard_release_reporting))
-}
-
-fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<(), BoxError> {
-    let _ = crossterm::execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
-    crossterm::execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    disable_raw_mode()?;
-    terminal.show_cursor()?;
-    Ok(())
 }

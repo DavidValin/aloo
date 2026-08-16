@@ -6,7 +6,7 @@ use cucumber::{given, then, when};
 use ratatui::style::Color;
 
 use aloo::proto::UserId;
-use aloo::ui::ui::Focus;
+use aloo::client::tui::ui::Focus;
 
 use crate::steps::ui_common::{id_for, press_key};
 use crate::support::{appears_before, find_text_start, ui_buffer, ui_rows, ui_rows_wide};

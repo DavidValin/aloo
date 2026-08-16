@@ -1,6 +1,6 @@
 use aloo::crypto::{self, KeyPair, RSA_PER_MSG_KEY_BITS};
 use aloo::proto::{ClientMessage, UserId};
-use aloo::rekey::{
+use aloo::client::rekey::{
     KEY_RETENTION, OwnKeys, QueuedOutbound, RemoteKeys, ResumeVerification,
     generate_and_sign_rotation, rotation_signing_payload, sign_rotation, verify_and_parse_rotation,
     verify_rotation, verify_with_fallback,

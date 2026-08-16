@@ -4,8 +4,8 @@ use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 use cucumber::{given, then, when};
 
 use aloo::proto::{KeyMode, UserId};
-use aloo::ui::ui::{MessageBody, UiAction, VoiceTarget};
-use aloo::voice::format_duration_label;
+use aloo::client::tui::ui::{MessageBody, UiAction, VoiceTarget};
+use aloo::client::tui::ui::format_duration_label;
 
 use crate::steps::ui_common::id_for;
 use crate::support::ui_rows;
@@ -39,7 +39,7 @@ async fn release_space(w: &mut AlooWorld) {
     }
 }
 
-// Global (works-anywhere, see `aloo::global_ptt`) push-to-talk. Deliberately
+// Global (works-anywhere, see `aloo::client::global_ptt`) push-to-talk. Deliberately
 // exercises `UiState::global_record_start`/`global_record_stop` directly
 // rather than `handle_key` - unlike Space, this trigger has no notion of
 // terminal focus at all (it fires from the OS while some other window is

@@ -84,6 +84,27 @@ pub fn resolve_hotkey(configured: &str) -> HotKey {
     }
 }
 
+/// The hotkey to register for global push-to-talk, or `None` if it
+/// shouldn't be registered at all this run - either the user turned it off
+/// (`global_ptt_enabled = false`) or (Linux only) this session is running
+/// under Wayland, which `global_hotkey` has no backend for at all
+/// (`is_wayland`). Printed once at startup in the Wayland case per the
+/// user's own choice: warn, don't retry, don't crash - Space still works
+/// normally while the app is focused either way.
+pub fn hotkey_to_register(settings: &crate::settings::Settings) -> Option<HotKey> {
+    if !settings.global_ptt_enabled {
+        return None;
+    }
+    if is_wayland() {
+        eprintln!(
+            "aloo: global push-to-talk ({}) needs X11 and isn't available under Wayland - Space still works while aloo is focused",
+            settings.global_ptt_shortcut
+        );
+        return None;
+    }
+    Some(resolve_hotkey(&settings.global_ptt_shortcut))
+}
+
 /// Installs the process-wide handler that turns every `GlobalHotKeyEvent`
 /// into a `GlobalPttEvent` on `tx`. This app only ever registers one
 /// hotkey, so events aren't filtered by id. Must only be called once per

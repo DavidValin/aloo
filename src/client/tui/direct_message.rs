@@ -1,8 +1,8 @@
 //! Private-room (DM) state and rendering: the `PrivateRoom` log model and
 //! the full-screen private-room view. Shared/mixed UI plumbing (`UiState`
 //! itself, `Focus`, `Mode`, message-log rendering, the input bar, ...)
-//! stays in `crate::ui::ui`; channel-tab state/rendering is the mirror
-//! image in `crate::ui::channel`.
+//! stays in `crate::client::tui::ui`; channel-tab state/rendering is the mirror
+//! image in `crate::client::tui::channel`.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};

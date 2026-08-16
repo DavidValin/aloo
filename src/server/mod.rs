@@ -2,7 +2,7 @@
 //! authenticates clients, tracks channel membership/presence, relays
 //! `rsa_per_msg` key-rotation notices, and relays the candidate exchange
 //! that lets two clients punch a direct UDP link to each other
-//! (`crate::p2p`) - but every actual message, voice stream, and file
+//! (`crate::client::p2p`) - but every actual message, voice stream, and file
 //! transfer travels over that direct link, never through here. See
 //! `docs/PROTOCOL.md`'s "Direct peer-to-peer transport" section.
 //!
@@ -113,7 +113,7 @@ struct PasswordAttemptRecord {
     wrong_attempts: u32,
     /// Set once `wrong_attempts` exceeds `CHANNEL_MAX_PASSWORD_ATTEMPTS`;
     /// checked via `.elapsed() < CHANNEL_PASSWORD_BAN_DURATION`, mirroring
-    /// `crate::p2p`'s `Instant`/`Duration` cooldown style (its
+    /// `crate::client::p2p`'s `Instant`/`Duration` cooldown style (its
     /// `FAILURE_COOLDOWN` pattern) - the first use of that style
     /// server-side.
     banned_at: Option<Instant>,
@@ -521,7 +521,7 @@ impl Registry {
     /// Relays a direct-link candidate proposal (or reply) to `to` -
     /// existence-check-only, exactly like `route_key_rotation`'s recipient
     /// check. The server neither validates nor stores `candidates`/
-    /// `link_nonce`; see `crate::p2p` for what happens with them next.
+    /// `link_nonce`; see `crate::client::p2p` for what happens with them next.
     pub fn route_peer_link_request(
         &self,
         from: UserId,
@@ -604,7 +604,7 @@ async fn serve_tcp(listener: TcpListener, auth: AuthConfig) -> std::io::Result<(
 /// authentication, no `Registry` access, no state kept between datagrams:
 /// this reveals nothing about a sender beyond what any packet it sends
 /// already reveals to this server, the same threat model as a public STUN
-/// server. See `crate::p2p::learn_reflexive_candidate`.
+/// server. See `crate::client::p2p::learn_reflexive_candidate`.
 async fn udp_rendezvous_loop(socket: UdpSocket) {
     let mut buf = [0u8; 512];
     loop {

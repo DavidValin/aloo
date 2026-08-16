@@ -5,11 +5,12 @@
 
 use std::path::PathBuf;
 
-use aloo::connect::{
+use aloo::client::connect::{
     ConnectCache, ResolvedIdentity, cache_path, fresh_pq_hybrid_paths_in, prefill_connect_defaults,
     random_prefix, resolve_my_keypair,
 };
-use aloo::ui::ui_connect_popup::{ConnectPopupState, MyKeySelection, MyKeyType};
+use aloo::client::connect::MyKeySelection;
+use aloo::client::tui::ui_connect_popup::{ConnectPopupState, MyKeyType};
 
 fn temp_path(label: &str) -> PathBuf {
     std::env::temp_dir().join(format!(

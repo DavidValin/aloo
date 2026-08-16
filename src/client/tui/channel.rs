@@ -2,8 +2,8 @@
 //! dwell-to-join tab switching, and the channel view / sidebar / Ctrl+J
 //! popup rendering. Shared/mixed UI plumbing (`UiState` itself, `Focus`,
 //! `Mode`, message-log rendering, the input bar, ...) stays in
-//! `crate::ui::ui`; DM-room state/rendering is the mirror image in
-//! `crate::ui::direct_message`.
+//! `crate::client::tui::ui`; DM-room state/rendering is the mirror image in
+//! `crate::client::tui::direct_message`.
 
 use std::time::{Duration, Instant};
 
@@ -14,9 +14,9 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Tabs};
 
-use crate::netstats::ConnQuality;
+use crate::client::netstats::ConnQuality;
 use crate::proto::{ChannelInfo, ChannelJoinRejection, ChannelKind, UserId, UserInfo};
-use crate::sysstats::CPU_HEALTHY_MAX_PCT;
+use crate::client::sysstats::CPU_HEALTHY_MAX_PCT;
 use crate::validation;
 
 use super::ui::{
@@ -206,7 +206,7 @@ impl UiState {
     pub(crate) fn recipients_for_channel(
         &self,
         channel: &ChannelTab,
-    ) -> Vec<crate::ui::ui::Recipient> {
+    ) -> Vec<crate::client::tui::ui::Recipient> {
         channel
             .members
             .iter()
@@ -565,7 +565,7 @@ impl UiState {
     }
 
     /// Logs an outgoing entry of any body type (text, or a file send - see
-    /// `crate::ui::file_send`) as our own, straight away rather than
+    /// `crate::client::tui::file_send`) as our own, straight away rather than
     /// waiting for a server round-trip - the same optimistic-echo pattern
     /// `log_own_voice_channel` already uses for voice.
     pub(crate) fn push_outgoing_channel(&mut self, channel: &str, body: MessageBody) {

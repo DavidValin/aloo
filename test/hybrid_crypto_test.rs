@@ -8,14 +8,14 @@
 //! `cargo slow`. The chunk-level tests need no bundle at all (just a raw
 //! `[u8; 32]` key), so they stay fast and ungated.
 
-use aloo::channel::can_address;
+use aloo::client::keymode_policy::can_address;
 use aloo::crypto::pq::{
     decrypt_hybrid, decrypt_hybrid_chunk, encrypt_hybrid_chunk, encrypt_hybrid_for_one,
     ensure_bundle_at, generate_bundle, load_private_bundle, load_public_bundle,
     save_private_bundle, save_public_bundle, unwrap_key_for_stream, wrap_key_for_stream,
 };
 use aloo::proto::{self, KeyMode};
-use aloo::session::uses_byte_comparison_pinning;
+use aloo::client::keymode_policy::uses_byte_comparison_pinning;
 
 // ---------------------------------------------------------------------
 // Chunk-level (voice) primitives - fast, no bundle/keygen needed

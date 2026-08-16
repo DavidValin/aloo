@@ -1,11 +1,11 @@
 //! `Recorder`/`spawn_mixer` for musl targets, talking to PulseAudio (or
 //! PipeWire's PulseAudio-compatible server) directly via `libpulse`'s own
-//! protocol, instead of `crate::voice`'s default `cpal`-on-ALSA backend.
+//! protocol, instead of `crate::client::voice`'s default `cpal`-on-ALSA backend.
 //!
 //! Why: on Linux, `cpal`'s ALSA backend only reaches a running
 //! PulseAudio/PipeWire server through an ALSA PCM plugin
 //! (`libasound_module_pcm_pulse.so`) that ALSA loads with `dlopen()` at
-//! runtime - see `crate::voice`'s `prefer_pulse` doc comment for why that
+//! runtime - see `crate::client::voice`'s `prefer_pulse` doc comment for why that
 //! matters (exclusive-device-access without it). A fully static musl
 //! binary (`Cross.toml`'s `x86_64-unknown-linux-musl`/
 //! `aarch64-unknown-linux-musl` targets, built `-static-pie` for
@@ -25,7 +25,7 @@
 //! client code is simply part of the binary. This module is the only
 //! thing that talks to those crates; every pure PCM/mixing helper it uses
 //! (`resample`, `mix_output`, `MixSource`, `apply_mixer_cmd`, ...) lives in
-//! `crate::voice` and is shared verbatim with the cpal backend.
+//! `crate::client::voice` and is shared verbatim with the cpal backend.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -36,7 +36,7 @@ use libpulse_binding::stream::Direction;
 use libpulse_simple_binding::Simple;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::voice::{
+use crate::client::voice::{
     MixSource, MixerCmd, Result, SAMPLE_RATE_HZ, VoiceError, apply_mixer_cmd, mix_output,
     pcm_from_bytes, pcm_to_bytes,
 };
@@ -44,7 +44,7 @@ use crate::voice::{
 /// Every stream this module opens is mono PCM16 at `SAMPLE_RATE_HZ` -
 /// requested directly from the server rather than negotiated like cpal
 /// does with a hardware device, so PulseAudio/PipeWire does any
-/// rate-conversion itself and `crate::voice::resample` calls on this path
+/// rate-conversion itself and `crate::client::voice::resample` calls on this path
 /// are no-ops (kept anyway for structural parity with the cpal backend,
 /// and as a safety net if that ever stops being true).
 fn spec() -> Spec {
@@ -65,7 +65,7 @@ fn chunk_frames() -> usize {
 }
 
 /// Captures microphone audio into an in-memory buffer while alive, the
-/// same contract as `crate::voice`'s cpal-backed `Recorder` (re-exported
+/// same contract as `crate::client::voice`'s cpal-backed `Recorder` (re-exported
 /// under that name on musl - see `voice.rs`).
 pub struct Recorder {
     buffer: Arc<Mutex<Vec<i16>>>,
@@ -131,7 +131,7 @@ impl Drop for Recorder {
 }
 
 /// Spawns the one persistent audio-output thread for the process, the same
-/// contract as `crate::voice`'s cpal-backed `spawn_mixer` (re-exported
+/// contract as `crate::client::voice`'s cpal-backed `spawn_mixer` (re-exported
 /// under that name on musl - see `voice.rs`'s doc comment on its own
 /// `spawn_mixer` for why one persistent stream rather than one per
 /// message).
@@ -143,7 +143,7 @@ impl Drop for Recorder {
 /// function owns (it blocks until the server has buffer space, which
 /// paces this loop the same way cpal's callback timing does). Both share
 /// the exact same command handling and mixing logic
-/// (`crate::voice::apply_mixer_cmd`, `crate::voice::mix_output`).
+/// (`crate::client::voice::apply_mixer_cmd`, `crate::client::voice::mix_output`).
 pub fn spawn_mixer(
     on_stream_error: impl Fn(String) + Send + Clone + 'static,
     on_finished: impl Fn(u64) + Send + Clone + 'static,

@@ -1,4 +1,4 @@
-use aloo::file_transfer::{
+use aloo::client::file_transfer::{
     FILE_CHUNK_BYTES, FileOfferPayload, MAX_FILENAME_CHARS, default_download_dir, safe_filename,
     truncate_filename,
 };
