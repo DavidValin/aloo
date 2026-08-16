@@ -110,6 +110,9 @@ protocol/security reasoning (identity gating, key-rotation races, hybrid
 crypto scheme), platform quirks (musl `dlopen`, terminal key-release
 detection, ALSA device sharing), and tuning rationale (datagram budgets,
 timeouts) all survive in condensed form. `Cargo.toml`/`.cargo` comments
-were left untouched per the configuration freeze, and `docs/SPEC.md`'s
-`file:line` references were re-synced to the shifted line numbers (each
-verified to point at its named function).
+were left untouched per the configuration freeze. `docs/SPEC.md`'s
+`file:line` references were initially re-synced to the shifted line
+numbers, but a review found several still stale (the re-sync mishandled
+doc lines carrying multiple function references), so the line numbers
+were dropped entirely - references are now file + function name only,
+which cannot rot on future refactors.

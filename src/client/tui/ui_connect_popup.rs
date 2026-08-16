@@ -529,9 +529,6 @@ fn key_field_line(label: &str, value: &str, focused: bool) -> Line<'static> {
     ])
 }
 
-/// Border style shared by every bordered element in this popup: yellow
-/// while focused, same convention as the connected-session UI
-/// (`ui::focus_border_style`).
 /// Renders `value` in its own titled, bordered box - used for the
 /// top-level `host`/`port`/`nickname` inputs (SPEC.md: "styled with a
 /// border around the box"). Returns the box's inner `Rect`, which the

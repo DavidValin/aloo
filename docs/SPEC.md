@@ -239,8 +239,8 @@ When a tab is selected, the user joins that channel. The join is broadcast to al
 Implementation map for the five `my_key` methods and the two things they
 encrypt (text and voice), across both destinations (channel and DM). Wire-level
 rules live in `docs/PROTOCOL.md`; this section is the "where is it in the code"
-index. Line numbers are accurate as of the commit that added this section —
-each entry names its function too, so a drifted line number still resolves.
+index. Entries reference file + function name (no line numbers - they rot
+on every refactor; the name is the stable handle).
 
 ### One primitive, four key sourcings — plus `pq_hybrid`'s own
 
@@ -253,14 +253,14 @@ primitives live in `crypto/pq.rs`, covered in its own subsection below.
 
 | Step | Where |
 | --- | --- |
-| Bytes-per-block for a key | `crypto/mod.rs:197` `max_chunk_len` |
-| Encrypt (splits into blocks) | `crypto/mod.rs:207` `encrypt_chunked` |
-| Decrypt (rejoins blocks) | `crypto/mod.rs:233` `decrypt_chunked` |
-| Wire shape of one encrypted body | `proto.rs:235` `Envelope` |
+| Bytes-per-block for a key | `crypto/mod.rs` `max_chunk_len` |
+| Encrypt (splits into blocks) | `crypto/mod.rs` `encrypt_chunked` |
+| Decrypt (rejoins blocks) | `crypto/mod.rs` `decrypt_chunked` |
+| Wire shape of one encrypted body | `proto.rs` `Envelope` |
 
 The four RSA-based `my_key` methods differ **only in where the RSA keypair
 comes from**. `none` is not plaintext despite its `[🚨 PLAIN]` tag — see the
-tag table above. The single branch point is `connect.rs:261` `resolve_my_keypair`
+tag table above. The single branch point is `connect.rs` `resolve_my_keypair`
 (which also has `pq_hybrid`'s own arm, loading a keybundle instead of a
 plain RSA keypair - see below):
 
@@ -287,7 +287,7 @@ around the `ResolvedIdentity` match in `run_connected_session`) - see
 
 | | Channel | DM |
 | --- | --- | --- |
-| Send | `channel.rs:66` `handle_send_text` | `direct_message.rs:43` `handle_send_text` |
+| Send | `channel.rs` `handle_send_text` | `direct_message.rs` `handle_send_text` |
 | Encrypt (RSA methods) | `channel.rs` `encrypt_for_each` — loops recipients | `envelope.rs` `encrypt_for_one` — one recipient |
 | Encrypt (`pq_hybrid`) | same `encrypt_for_each`, dispatching via `envelope.rs` `encrypt_envelope_for` to `encrypt_hybrid_envelope_for` per `pq_hybrid` recipient | `direct_message.rs` `encrypt_for_recipient`, same dispatch |
 | Wire message | `P2pPayload::Envelope { channel: Some(_), .. }`, one per member | `P2pPayload::Envelope { channel: None, .. }` |
@@ -303,18 +303,18 @@ see "What `pq_hybrid` adds" below.
 ### Voice messages
 
 Voice is streamed live, not recorded-then-sent (Functionality #4), so
-encryption happens per 15ms chunk (`voice.rs:46` `CHUNK_INTERVAL`) on a
+encryption happens per 15ms chunk (`voice.rs` `CHUNK_INTERVAL`) on a
 dedicated thread — never on the async event loop.
 
 | Stage | Where |
 | --- | --- |
-| Recipients' public keys parsed **once** at record-start | `channel.rs:246` `parse_recipients` / `direct_message.rs:142` `handle_voice_record_start` |
-| Record + encrypt loop (own thread) | `voice_stream.rs:227` `spawn_record_stream_worker` |
+| Recipients' public keys parsed **once** at record-start | `channel.rs` `parse_recipients` / `direct_message.rs` `handle_voice_record_start` |
+| Record + encrypt loop (own thread) | `voice_stream.rs` `spawn_record_stream_worker` |
 | Encrypt a chunk — channel (per recipient) | `voice_stream.rs` `build_chunk_recipients` → `p2p::P2pOutbound::ChannelVoiceChunk` |
 | Encrypt a chunk — DM | same, → `p2p::P2pOutbound::DirectVoiceChunk` |
 | Delivery | direct peer-to-peer link, unreliable/unordered per chunk (`docs/PROTOCOL.md` §7.0/§7.3) — never touches the server |
-| Receiving: pick the private key **once** for the whole stream | `voice_stream.rs:499` `resolve_incoming_key` → `rekey.rs:288` `candidate_privates_for` |
-| Decrypt loop (one thread per incoming stream) | `voice_stream.rs:379` `spawn_stream_decrypt_worker`, decrypt at `:407` |
+| Receiving: pick the private key **once** for the whole stream | `voice_stream.rs` `resolve_incoming_key` → `rekey.rs` `candidate_privates_for` |
+| Decrypt loop (one thread per incoming stream) | `voice_stream.rs` `spawn_stream_decrypt_worker`, decrypt in `ChunkDecryptor::decrypt` |
 
 Each incoming stream gets its own decrypt thread because RSA private-key
 decrypt is much costlier than public-key encrypt — one shared thread would fall
@@ -339,13 +339,10 @@ duplicating them.
 | Incoming offer: decrypt, trust-gate, queue + bell | `session.rs` `decrypt_file_offer`, `handle_incoming_file_offer` |
 | Accept: spawn the receive worker, log the row | `session.rs` `accept_file_offer` |
 | Sender learns of Accept: spawn the send worker | `session.rs` (`P2pEvent::FileAccepted` arm) |
-| Send worker — reads/encrypts/sends one chunk at a time | `file_transfer.rs:161` `spawn_send_file_worker` |
-| Receive worker — decrypts/writes one chunk at a time | `file_transfer.rs:225` `spawn_receive_file_worker` |
-| Forward an incoming chunk/end to its worker | `file_transfer.rs:291`/`:306` `forward_chunk`/`end_incoming_transfer`, called from `session.rs:1006`/`:1015` |
-| Progress/completion/failure → log row | `session.rs:1513` `handle_file_event` → `UiState::set_file_progress`/`set_file_completed`/`set_file_rejected`/`set_file_failed` |
-
-Line numbers are as of the commit that added this section; a drifted number
-still resolves via the named function, same convention as the tables above.
+| Send worker — reads/encrypts/sends one chunk at a time | `file_transfer.rs` `spawn_send_file_worker` |
+| Receive worker — decrypts/writes one chunk at a time | `file_transfer.rs` `spawn_receive_file_worker` |
+| Forward an incoming chunk/end to its worker | `file_transfer.rs` `forward_chunk`/`end_incoming_transfer`, called from `session.rs` |
+| Progress/completion/failure → log row | `session.rs` `handle_file_event` → `UiState::set_file_progress`/`set_file_completed`/`set_file_rejected`/`set_file_failed` |
 
 ### What `rsa_per_msg` adds on top
 
@@ -354,19 +351,19 @@ key is current at each moment. Full model in `docs/PROTOCOL.md` §11.
 
 | Piece | Where |
 | --- | --- |
-| Sign a new key with the key it replaces (PKCS#1 v1.5 + SHA-256) | `rekey.rs:31` `rotation_signing_payload`, `:46` `sign_rotation` → `crypto/mod.rs:247` `sign` |
-| Verify a peer's rotation | `rekey.rs:52` `verify_rotation`, `:75` `verify_and_parse_rotation` → `crypto/mod.rs:256` `verify` |
-| Keygen, off the event loop | `rekey.rs:139` `generate_and_sign_rotation`, run by `session.rs:171` `spawn_rotation_worker`, queued via `session.rs:171` `request_rotation_if_per_message` |
-| Own per-peer keys + retained old keys | `rekey.rs:166` `OwnKeys` (retention bound `rekey.rs:166`) |
-| Is a peer's key fresh? queue if not | `rekey.rs:322` `RemoteKeys` — `try_use:380`, `enqueue:395`, `on_rotated:412` |
-| Apply an incoming rotation, flush the queue | `session.rs:1277` `handle_key_rotated` |
-| Reconnect continuity (persisted keys) | `own_next_keys.rs` + `session.rs:1162` `send_resume_rotation_if_available` (prove), `idstore.rs:136` `get` + `rekey.rs:112` `verify_with_fallback` (verify), both surfaced by `session.rs:1162` `handle_key_rotated` — *and*, for a `PerMessage` nickname that already has a continuity key pinned, gated on sight by `check_identity` (`session.rs:1162`) itself, before any rotation attempt (`docs/PROTOCOL.md` §12.6.3) |
+| Sign a new key with the key it replaces (PKCS#1 v1.5 + SHA-256) | `rekey.rs` `rotation_signing_payload`, `sign_rotation` → `crypto/mod.rs` `sign` |
+| Verify a peer's rotation | `rekey.rs` `verify_rotation`, `verify_and_parse_rotation` → `crypto/mod.rs` `verify` |
+| Keygen, off the event loop | `rekey.rs` `generate_and_sign_rotation`, run by `session.rs` `spawn_rotation_worker`, queued via `session.rs` `request_rotation_if_per_message` |
+| Own per-peer keys + retained old keys | `rekey.rs` `OwnKeys` (retention bound `rekey.rs` `KEY_RETENTION`) |
+| Is a peer's key fresh? queue if not | `rekey.rs` `RemoteKeys` — `try_use`, `enqueue`, `on_rotated` |
+| Apply an incoming rotation, flush the queue | `session.rs` `handle_key_rotated` |
+| Reconnect continuity (persisted keys) | `own_next_keys.rs` + `session.rs` `send_resume_rotation_if_available` (prove), `idstore.rs` `get` + `rekey.rs` `verify_with_fallback` (verify), both surfaced by `session.rs` `handle_key_rotated` — *and*, for a `PerMessage` nickname that already has a continuity key pinned, gated on sight by `check_identity` (`session.rs`) itself, before any rotation attempt (`docs/PROTOCOL.md` §12.6.3) |
 
 Voice is exempt from per-chunk rotation (§11.6): one key snapshot covers a whole
-stream (`voice_stream.rs:234`), and a recipient without a fresh key (or whose
+stream (`voice_stream.rs`), and a recipient without a fresh key (or whose
 direct link isn't `Active` yet, `docs/PROTOCOL.md` §7.0/§7.3) is dropped
-from that stream (`channel.rs:203` in `handle_voice_record_start`) or the DM recording is refused outright
-(`direct_message.rs:152`).
+from that stream (`channel.rs` in `handle_voice_record_start`) or the DM recording is refused outright
+(`direct_message.rs`).
 
 ### What `pq_hybrid` adds
 
@@ -392,15 +389,15 @@ material and a different, self-contained primitive set. Full model in
 ### `server_key` — a separate axis
 
 Authenticating *to the server* is unrelated to the message encryption above and
-has only three options (`connect.rs:24` `ServerKeySelection`,
-`proto.rs:215` `AuthKind`). Client side: `connect.rs:307` `build_auth_response`.
-Server side: `server/mod.rs:64` `AuthConfig::verify`.
+has only three options (`connect.rs` `ServerKeySelection`,
+`proto.rs` `AuthKind`). Client side: `connect.rs` `build_auth_response`.
+Server side: `server/mod.rs` `AuthConfig::verify`.
 
 | Option | Check |
 | --- | --- |
 | `none` | passes unconditionally |
-| `password` | sent as-is and compared byte-for-byte in constant time (`crypto/mod.rs:273` `constant_time_eq`) — it is **not** hashed |
-| `rsa` | server sends a random nonce (`crypto/mod.rs:264` `random_bytes`, `server/mod.rs:53` `make_challenge`); client encrypts it with the server's public key; server decrypts and compares |
+| `password` | sent as-is and compared byte-for-byte in constant time (`crypto/mod.rs` `constant_time_eq`) — it is **not** hashed |
+| `rsa` | server sends a random nonce (`crypto/mod.rs` `random_bytes`, `server/mod.rs` `make_challenge`); client encrypts it with the server's public key; server decrypts and compares |
 
 ## Server responsibilities
 
