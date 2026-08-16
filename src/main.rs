@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use clap::Parser;
+use clap::builder::styling::{AnsiColor, Styles};
 
 use aloo::client::connect;
 use aloo::client::global_ptt;
@@ -15,10 +16,21 @@ use aloo::settings;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
+/// Clap's own defaults, with flag/parameter names (`--port`, and the
+/// `<PORT>` placeholder that goes with it) in yellow rather than plain bold.
+const HELP_STYLES: Styles = Styles::styled()
+    .literal(AnsiColor::Yellow.on_default().bold())
+    .placeholder(AnsiColor::Yellow.on_default());
+
 #[derive(Parser, Debug)]
 #[command(
     name = "aloo",
-    about = "Terminal chat with encrypted text/voice channels"
+    about = concat!(
+        "aloo v",
+        env!("CARGO_PKG_VERSION"),
+        " - Terminal chat with encrypted text/voice channels."
+    ),
+    styles = HELP_STYLES
 )]
 struct Cli {
     /// Run as the server instead of the client.
