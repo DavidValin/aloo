@@ -7,7 +7,7 @@
 #   # pinning an exact version instead (must match the clients that connect):
 #   #   --build-arg ALOO_VERSION=<tag from https://github.com/DavidValin/aloo/releases>
 #   docker run -d --name aloo-server --restart unless-stopped \
-#     -p 7878:7878 \
+#     -p 7878:7878/tcp -p 7878:7878/udp \
 #     -v aloo-data:/home/aloo/.aloo \
 #     -e ALOO_PASSWORD=mypassword \
 #     aloo-server
@@ -87,6 +87,11 @@ ENV ALOO_PASSWORD=""
 ENV ALOO_ENC_TYPE=""
 ENV ALOO_ENC_KEYFILE=""
 
+# TCP carries client connections; UDP is the rendezvous socket clients use
+# to discover their own public address for hole punching (docs/PROTOCOL.md
+# 7.1). Publishing only TCP leaves clients able to connect and see each
+# other while nothing they send ever arrives - see docs/SERVER_ON_DOCKER.md.
 EXPOSE 7878/tcp
+EXPOSE 7878/udp
 
 ENTRYPOINT ["/usr/local/bin/aloo-server-entrypoint.sh"]

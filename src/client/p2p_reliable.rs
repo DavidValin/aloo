@@ -90,6 +90,20 @@ impl ArqSender {
     pub fn has_pending(&self) -> bool {
         !self.unacked.is_empty()
     }
+
+    /// Clears all state and hands back every still-unacked payload, oldest
+    /// first, for the caller to re-queue. Called when a link is re-punched:
+    /// the sequence space belongs to one punched link, so a new one has to
+    /// start from zero on both sides - but the content that was in flight
+    /// when the old one died was never delivered and must not be lost with
+    /// it (`p2p::PeerLinkManager::reset_transport`).
+    pub fn reset(&mut self) -> Vec<Vec<u8>> {
+        self.next_seq = 0;
+        std::mem::take(&mut self.unacked)
+            .into_values()
+            .map(|u| u.payload)
+            .collect()
+    }
 }
 
 /// One peer link's incoming reliable frames: reassembles them into delivery
@@ -142,6 +156,15 @@ impl ArqReceiver {
 
     pub fn failed(&self) -> bool {
         self.failed
+    }
+
+    /// Clears all state, including the `failed` latch, so a re-punched
+    /// link starts expecting sequence zero again - the counterpart of
+    /// `ArqSender::reset` on the receiving side.
+    pub fn reset(&mut self) {
+        self.expected = 0;
+        self.reorder.clear();
+        self.failed = false;
     }
 }
 

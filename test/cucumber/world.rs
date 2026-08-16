@@ -19,7 +19,7 @@ use aloo::crypto::pq::{PqPrivateBundle, PqPublicBundle};
 use aloo::client::idstore::IdStore;
 use aloo::client::replay::ReplayGuard;
 use aloo::client::p2p::{P2pEvent, PeerLinkManager};
-use aloo::p2p_proto::PunchDatagram;
+use aloo::client::p2p::InboundDatagram;
 use aloo::proto::{Envelope, ServerMessage, UserId};
 use aloo::client::rekey::{RemoteKeys, ResumeVerification};
 use aloo::server::{Outgoing, Registry};
@@ -105,7 +105,7 @@ pub struct ClientState {
     /// lazily the first time a scenario needs it (`server::ensure_peer_link`)
     /// - message/voice content now travels here, never through `stream`.
     pub peer_link: Option<PeerLinkManager>,
-    pub p2p_raw_rx: Option<tokio::sync::mpsc::UnboundedReceiver<(SocketAddr, PunchDatagram)>>,
+    pub p2p_raw_rx: Option<tokio::sync::mpsc::UnboundedReceiver<(SocketAddr, InboundDatagram)>>,
     pub p2p_events_rx: Option<tokio::sync::mpsc::UnboundedReceiver<P2pEvent>>,
 }
 

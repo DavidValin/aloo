@@ -3,6 +3,7 @@ mod ui_common;
 use ui_common::*;
 
 use aloo::client::netstats::ConnQuality;
+use aloo::client::p2p::LinkStatus;
 use aloo::proto::{ChannelInfo, ChannelKind, KeyMode, UserId};
 use aloo::client::tui::channel::DWELL_DURATION;
 use aloo::client::tui::ui::{Focus, IdentityCase, MessageBody, UiAction, UiState, VoiceTarget, render};
@@ -737,6 +738,9 @@ fn sidebar_renders_an_offline_member_in_gray_instead_of_green() {
     let mut state = joined_general_with(vec![user(2, "bob"), user(3, "carol")]);
     state.on_direct_message(UserId(2), "bob".into(), MessageBody::Text("hi".into())); // gives bob DM history
     state.on_user_offline(UserId(2)); // bob goes offline, carol stays online
+    // Green means "reachable over a direct link" (AC-135), so carol needs
+    // one for this test's "still green" half to mean what it says.
+    state.set_link_status(UserId(3), LinkStatus::Active);
 
     let backend = TestBackend::new(160, 30);
     let mut terminal = Terminal::new(backend).unwrap();
@@ -755,6 +759,66 @@ fn sidebar_renders_an_offline_member_in_gray_instead_of_green() {
         buffer[(cx, cy)].fg,
         ratatui::style::Color::Green,
         "still-connected member should stay green"
+    );
+}
+
+/// The sidebar's colour is the state of the *direct link* to each person,
+/// not merely their presence on the server (AC-135): someone can be
+/// perfectly online and completely unreachable, which is exactly the case
+/// worth showing. Green once messages can actually reach them, red once
+/// they can't, yellow while the punch is still being worked out.
+///
+/// @requirement AC-135
+#[test]
+fn sidebar_colours_each_member_by_the_state_of_the_direct_link_to_them() {
+    let mut state = joined_general_with(vec![
+        user(2, "bob"),
+        user(3, "carol"),
+        user(4, "dave"),
+    ]);
+    state.set_link_status(UserId(2), LinkStatus::Active);
+    state.set_link_status(UserId(3), LinkStatus::Lost);
+    state.set_link_status(UserId(4), LinkStatus::Connecting);
+
+    let backend = TestBackend::new(160, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| render(f, &state)).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+
+    for (name, expected) in [
+        ("bob", ratatui::style::Color::Green),
+        ("carol", ratatui::style::Color::Red),
+        ("dave", ratatui::style::Color::Yellow),
+    ] {
+        let (x, y) = find_text_start(&buffer, name);
+        assert_eq!(
+            buffer[(x, y)].fg, expected,
+            "{name} should render in {expected:?} for their link state"
+        );
+    }
+}
+
+/// A peer nobody has a link record for yet reads the same as one being
+/// established - never green. A pre-warm starts the moment they are
+/// learned about (§7.1), so "no record" means the handshake has not got
+/// anywhere yet, and showing green there would promise a delivery path
+/// that does not exist.
+///
+/// @requirement AC-135
+#[test]
+fn a_member_with_no_link_record_yet_is_not_shown_as_reachable() {
+    let state = joined_general_with(vec![user(2, "bob")]);
+
+    let backend = TestBackend::new(160, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| render(f, &state)).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+
+    let (x, y) = find_text_start(&buffer, "bob");
+    assert_eq!(
+        buffer[(x, y)].fg,
+        ratatui::style::Color::Yellow,
+        "an unknown link state must not claim the peer is reachable"
     );
 }
 
@@ -953,6 +1017,7 @@ fn sidebar_renders_a_trust_gated_member_in_red_taking_priority_over_offline() {
         "mismatch".into(),
         static_mismatch(),
     );
+    state.set_link_status(UserId(3), LinkStatus::Active);
 
     let backend = TestBackend::new(160, 30);
     let mut terminal = Terminal::new(backend).unwrap();

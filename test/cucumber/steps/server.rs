@@ -52,7 +52,7 @@ async fn bind_peer_link(w: &mut AlooWorld, who: &str) {
             .await
             .expect("failed to bind direct-link socket");
     let (raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel();
-    aloo::client::p2p::spawn_receive_loop(socket, raw_tx);
+    aloo::client::p2p::spawn_receive_loop(socket, server_addr, raw_tx);
     let client = w.client_mut(who);
     client.peer_link = Some(peer_link);
     client.p2p_raw_rx = Some(raw_rx);
@@ -133,8 +133,8 @@ async fn ensure_peer_link(w: &mut AlooWorld, a: &str, b: &str) {
             "loopback punch did not complete in time"
         );
         tokio::select! {
-            Some((addr, dgram)) = ca.p2p_raw_rx.as_mut().unwrap().recv() => ca.peer_link.as_mut().unwrap().on_datagram(addr, dgram),
-            Some((addr, dgram)) = cb.p2p_raw_rx.as_mut().unwrap().recv() => cb.peer_link.as_mut().unwrap().on_datagram(addr, dgram),
+            Some((addr, dgram)) = ca.p2p_raw_rx.as_mut().unwrap().recv() => ca.peer_link.as_mut().unwrap().on_inbound(addr, dgram),
+            Some((addr, dgram)) = cb.p2p_raw_rx.as_mut().unwrap().recv() => cb.peer_link.as_mut().unwrap().on_inbound(addr, dgram),
             _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {}
         }
     }
@@ -157,8 +157,19 @@ async fn expect_p2p_event(w: &mut AlooWorld, who: &str, timeout: std::time::Dura
     tokio::time::timeout(timeout, async {
         loop {
             tokio::select! {
-                Some((addr, dgram)) = raw_rx.recv() => peer_link.on_datagram(addr, dgram),
-                Some(event) = events_rx.recv() => return event,
+                Some((addr, dgram)) = raw_rx.recv() => peer_link.on_inbound(addr, dgram),
+                Some(event) = events_rx.recv() => {
+                    // Link-state bookkeeping (§7.1's continuous
+                    // establishment) is not what any scenario using this
+                    // helper is waiting for - they want the content event.
+                    if matches!(
+                        event,
+                        P2pEvent::LinkStatusChanged { .. } | P2pEvent::Signal { .. }
+                    ) {
+                        continue;
+                    }
+                    return event;
+                }
             }
         }
     })

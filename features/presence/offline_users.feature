@@ -16,6 +16,7 @@ Feature: When someone's connection closes
     And bob is in the channel with me
     And carol is in the channel with me
     And bob has sent me the private message "hi"
+    And I have a direct connection to carol
     When bob goes offline
     Then bob is still listed in the channel
     And bob is rendered in gray while carol stays green

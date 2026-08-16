@@ -292,8 +292,8 @@ pub(crate) async fn run_connected_session(
         .await
         .map_err(|e| format!("failed to open the direct-link UDP socket: {e}"))?;
     let (p2p_raw_tx, mut p2p_raw_rx) =
-        tokio::sync::mpsc::unbounded_channel::<(SocketAddr, crate::p2p_proto::PunchDatagram)>();
-    p2p::spawn_receive_loop(p2p_socket, p2p_raw_tx);
+        tokio::sync::mpsc::unbounded_channel::<(SocketAddr, p2p::InboundDatagram)>();
+    p2p::spawn_receive_loop(p2p_socket, server_addr, p2p_raw_tx);
 
     // `PqHybrid` has no single RSA key to seed `rekey::OwnKeys` with and
     // never rotates (it's a static identity, like `Rsa`/`Password`/`None`
@@ -407,11 +407,11 @@ pub(crate) async fn run_connected_session(
             }
             dgram = p2p_raw_rx.recv() => {
                 let Some((addr, dgram)) = dgram else { break };
-                session.peer_link.on_datagram(addr, dgram);
+                session.peer_link.on_inbound(addr, dgram);
             }
             event = p2p_events_rx.recv() => {
                 let Some(event) = event else { break };
-                handle_p2p_event(event, &mut ui_state, &mut session);
+                handle_p2p_event(event, &mut ui_state, &mut wr, &mut session).await?;
             }
             msg = rotate_out_rx.recv() => {
                 let Some(msg) = msg else { break };
@@ -910,6 +910,7 @@ async fn handle_server_message(
             // link once neither is true anymore (docs/PROTOCOL.md §7.1.3).
             if !ui_state.has_reason_to_keep_link(user_id) {
                 session.peer_link.forget(user_id);
+                ui_state.forget_link_status(user_id);
             }
         }
         ServerMessage::UserOffline { user_id } => {
@@ -919,6 +920,7 @@ async fn handle_server_message(
             // elsewhere or via an open DM), so this is the one case safe to
             // forget the link unconditionally.
             session.peer_link.forget(user_id);
+            ui_state.forget_link_status(user_id);
             // Their rotating encryption keys, and ours for them, end with
             // the connection: a later one is a different `UserId` starting
             // its rotation counter over (§13.10), and the keys we held are
@@ -975,7 +977,18 @@ async fn handle_server_message(
 /// wire: the server used to attach it from its own registry, but a peer we
 /// have a link to is necessarily one whose `UserInfo` (learned via
 /// `UserJoined`) we already hold.
-fn handle_p2p_event(event: P2pEvent, ui_state: &mut UiState, session: &mut SessionState) {
+///
+/// Async (and given `wr`) for the one event that has to reach the network:
+/// `Signal`, the manager asking for a candidate list to be relayed. It
+/// can't send that itself - `tick_at` has no control sink, deliberately,
+/// so link state stays testable without one - so the round trip to the
+/// server for an automatic re-punch lands here (docs/PROTOCOL.md §7.1).
+async fn handle_p2p_event(
+    event: P2pEvent,
+    ui_state: &mut UiState,
+    wr: &mut impl crate::control::ControlSink,
+    session: &mut SessionState,
+) -> proto::Result<()> {
     let name_of = |ui_state: &UiState, id: UserId| {
         ui_state
             .known_users
@@ -1100,7 +1113,24 @@ fn handle_p2p_event(event: P2pEvent, ui_state: &mut UiState, session: &mut Sessi
             };
             ui_state.p2p_link_failed(&peer_name, &reason);
         }
+        P2pEvent::Signal {
+            peer,
+            candidates,
+            link_nonce,
+        } => {
+            wr.send_control(&ClientMessage::RequestPeerLink {
+                peer,
+                candidates,
+                link_nonce,
+            })
+            .await?;
+            session.conn_stats.record_event(Instant::now());
+        }
+        P2pEvent::LinkStatusChanged { peer, status } => {
+            ui_state.set_link_status(peer, status);
+        }
     }
+    Ok(())
 }
 
 /// Checks a newly-learned peer's announced identity against the local

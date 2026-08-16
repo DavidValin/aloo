@@ -52,6 +52,7 @@ falling back to a server relay (§7.1).
     - [7.1.1 Reliable delivery over the punched link](#711-reliable-delivery-over-the-punched-link)
     - [7.1.2 Trust boundary: responding only within a shared channel](#712-trust-boundary-responding-only-within-a-shared-channel)
     - [7.1.3 Tearing down a link once it no longer serves a purpose](#713-tearing-down-a-link-once-it-no-longer-serves-a-purpose)
+    - [7.1.4 Showing which peers are actually reachable](#714-showing-which-peers-are-actually-reachable)
   - [7.2 Sending a channel or direct text message](#72-sending-a-channel-or-direct-text-message)
   - [7.3 Voice streaming](#73-voice-streaming)
   - [7.4 `Error { message: String }`](#74-error-message-string)
@@ -900,8 +901,10 @@ send - treats it as an implicit invitation and punches back if it hasn't
 already started its own attempt, so being addressed first works either
 way. A failed *eager* attempt (nobody ever actually tried to reach that
 peer) fails silently - no visible error - since most co-channel members
-are never actually addressed; §7.1's visible failure is reserved for a
-link something was genuinely waiting on.
+are never actually addressed; §7.1's visible failure is reserved for
+content that was genuinely waiting on a link. The attempt itself is
+retried regardless (step 4), and the peer's sidebar colour tracks it
+either way (§7.1.4).
 
 **1. Candidate gathering** (once per session): each client binds one UDP
 socket for the whole session and gathers two kinds of candidate address
@@ -958,24 +961,80 @@ PunchDatagram =
     | Unreliable { stream_id: u64, seq: u32, blocks: list<bytes> }
 ```
 
-Each side sends `Ping{my_own_link_nonce}` to every one of the other's
+`link_nonce` is one value shared by both sides of a link, not a
+per-side token: the responder echoes the initiator's, and when both
+initiate at once - the normal case, since both pre-warm on `UserJoined` -
+both take the numerically smaller of the two. Against an already-`Active`
+link a *differing* nonce means the peer gave up and started a fresh
+attempt, and is followed rather than tie-broken. It is 64 random bits
+that only ever travel over the authenticated TCP control connection, so
+an off-path attacker cannot guess one; this is the role ICE's
+ufrag/pwd plays.
+
+Each side sends `Ping{link_nonce}` to every one of the other's
 candidates in parallel, repeating every tick (~150ms) while unconfirmed.
-Receiving *any* `Ping` (regardless of its nonce) gets an immediate
-`Pong` echoing that same nonce back - this is what opens the reverse NAT
-mapping even if only one direction's mapping opened first. A side only
-trusts a `Pong` whose nonce matches its own current attempt; the first
-one it receives locks in that candidate address as the link's active
+A `Ping` or `Pong` is attributed to a link by its *source address* where
+that is already known, and otherwise by its `link_nonce` against a link
+currently being established - and in that second case the source address
+is adopted as a **peer-reflexive candidate**, probed from then on like
+any other, and usable for data frames. This is what makes a peer behind a
+NAT that maps a different external port per destination (symmetric or
+carrier-grade NAT) reachable at all: their probe arrives from an address
+neither side could have advertised, and without learning it the link can
+never open in that direction. Attribution by nonce is deliberately
+limited to links being established - letting an unauthenticated datagram
+move an already-`Active` link's address would be a hijack primitive,
+whereas a peer that genuinely remaps mid-session is caught by the
+liveness check in step 4 and re-punched from scratch. A probe whose nonce
+matches no link being established is ignored rather than answered, so
+this never becomes a reflector for anyone scanning the socket. Data
+frames (`Ack`/`Reliable`/`Unreliable`) carry no nonce and are only ever
+attributed by source address.
+
+A side only trusts a `Pong` whose nonce matches its own current attempt;
+the first one it receives locks in *the address it actually came from* -
+frequently not any address that was advertised - as the link's active
 address, and the link is now `Active`.
 
-**4. No fallback - failure is visible.** If neither the candidate reply
-nor a confirmed `Ping`/`Pong` round trip arrives within `PUNCH_TIMEOUT`
-(5 seconds), the link is `Failed`: whatever was pending against that peer
-fails with a clear error shown to the user (`could not establish a direct
-connection`), and a short cooldown (30s) elapses before a fresh send
-retries the whole handshake. There is deliberately no relay-of-last-resort
-through the server - see the top of this document. Once `Active`, an idle
-link gets a `Keepalive` datagram after 15 seconds of no other traffic, to
-keep the NAT/firewall mapping from expiring.
+**4. Establishment is continuous, and there is still no fallback.**
+A link that does not open (no candidate reply within `SIGNAL_TIMEOUT`, or
+no confirmed `Ping`/`Pong` round trip within `PUNCH_TIMEOUT`, both 10
+seconds) is not abandoned. It is re-signalled through the server
+automatically, on a backoff doubling from `RETRY_BASE` (1s) and capped at
+`RETRY_MAX` (30s), for as long as the peer is still known at all - only
+losing every shared channel and DM with them (§7.1.3) stops it. A peer
+being online means a direct path may become possible at any moment: their
+NAT rebinding, a VPN dropping, a firewall rule changing. A user-initiated
+send skips the remaining backoff, and a peer's own fresh invite re-arms a
+lost link immediately.
+
+Once `Active`, an idle link gets a `Keepalive` datagram after
+`KEEPALIVE_INTERVAL` (15 seconds) of no other traffic, to keep the
+NAT/firewall mapping from expiring. Those beats are also what make the
+link's *liveness* observable: receiving nothing at all - keepalives
+included, not just content - for `LINK_IDLE_TIMEOUT` (45 seconds, three
+missed beats) means the link died without either side noticing, so it is
+marked lost and re-punched like any other failed attempt.
+
+Content addressed to a link that is not up is held, not dropped, and
+flushed in order once it opens (§7.1.1). What surfaces to the user is
+therefore not "the punch failed" - which is routine and usually
+recovers - but "this content could not be delivered": once something has
+been queued undeliverably for `PENDING_MAX_AGE` (60 seconds) it is
+dropped and reported, naming why. There is deliberately no
+relay-of-last-resort through the server - see the top of this document.
+
+**5. Keeping our own address true.** The server-reflexive candidate is
+re-learned every `REFLEXIVE_REFRESH_INTERVAL` (15 seconds) for the whole
+session, not once at startup. This does two jobs: it keeps the NAT
+mapping that address names from expiring while the client sits idle -
+without it, a client that connects and waits advertises a mapping its NAT
+dropped minutes ago - and it keeps the advertised address true. An
+observed address that has changed replaces it and re-signals every link
+that is not already up. Links that *are* up are left alone: on a
+symmetric NAT the server-facing mapping is independent of the peer-facing
+ones, so a change here says nothing about whether a working peer path
+still works, and the liveness check above catches it if it does not.
 
 
 #### 7.1.1 Reliable delivery over the punched link
@@ -987,13 +1046,20 @@ inside `PunchDatagram::Reliable { seq, payload }`:
 
 - **Sender** (the sender): assigns an increasing `seq` to each outgoing
   payload, retransmits on a timeout with capped exponential backoff
-  (400ms initial, doubling up to 3s), and gives up - failing the link
-  entirely, per §7.1's no-fallback rule - after 10 retries with no ack.
+  (400ms initial, doubling up to 3s), and after 10 retries with no ack
+  treats the link as dead - which per §7.1 means re-punching it, not
+  giving up on the content: anything still unacknowledged goes back onto
+  the pending queue to be re-sent once the link reopens.
 - **Receiver** (the receiver): acks every `Reliable` frame it sees
   immediately, even a duplicate or an out-of-order one; delivers frames to
   the application in order, buffering ones that arrive ahead of the
   expected sequence (bounded to 64 buffered frames - exceeding that fails
   the link rather than growing unbounded) and dropping duplicates.
+
+The sequence space belongs to one punched link: both sides restart it
+from zero when a link is re-punched, which they can do safely because
+neither can transmit on the new link until both have entered the new
+attempt.
 
 This is deliberately minimal - no congestion control, no selective-repeat,
 no cumulative acks - since it operates at chat-message/file-chunk
@@ -1096,6 +1162,29 @@ unconditional `forget` - a full disconnect ends the link either way, no
 relevance check needed. Neither path sends anything over the wire; this
 is purely local bookkeeping; the peer's own client independently reaches
 the same conclusion (or doesn't) about the link from its own side.
+
+#### 7.1.4 Showing which peers are actually reachable
+
+Being present on the server and being reachable are different things, and
+only the second one decides whether anything sent arrives. Each link is
+therefore surfaced to the UI in one of three states, and the sidebar
+colours a peer's name by it (`docs/SPEC.md`'s "Connected UI"):
+
+| State | Meaning | Sidebar |
+| --- | --- | --- |
+| `Connecting` | Being established or re-established; content is queued | Yellow |
+| `Active` | Punched and confirmed live in both directions | Green |
+| `Lost` | Never opened, or has gone quiet; a retry is scheduled | Red |
+
+A peer with no link record at all reads as `Connecting`, never as
+reachable: one is pre-warmed the moment they're learned about, so "no
+record" means the handshake simply hasn't got anywhere yet. A trust-gated
+peer (§12) stays red and an offline one (§6.4) stays grey regardless -
+those states are about *who* the peer is and whether they're there at all,
+which outranks how well the transport to them is doing.
+
+This is purely local: nothing about link state is ever sent over the wire,
+and each side reaches its own conclusion about its own half.
 
 ### 7.2 Sending a channel or direct text message
 

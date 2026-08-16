@@ -1746,8 +1746,8 @@ evidence = "docs/PROTOCOL.md's 'Direct peer-to-peer transport' section; src/serv
 
 [[user_story.acceptance_criteria]]
 id = "AC-101"
-description = "If a direct UDP link can't be punched open within the punch timeout (e.g. a symmetric NAT or a peer that never answers), whatever was pending against that peer fails visibly to the user - there is no relay-through-the-server fallback to silently paper over it."
-evidence = "docs/PROTOCOL.md's 'Direct peer-to-peer transport' section; src/client/p2p.rs PeerLinkManager::tick_at, src/client/tui/ui.rs UiState::p2p_link_failed; test punch_timeout_fails_the_link_and_emits_link_failed"
+description = "If a direct UDP link can't be punched open, content addressed to that peer is held and the link keeps being retried rather than being dropped on the floor; once that content has been undeliverable for PENDING_MAX_AGE it fails visibly to the user, naming why. There is no relay-through-the-server fallback to silently paper over any of it."
+evidence = "docs/PROTOCOL.md's 'Direct peer-to-peer transport' section; src/client/p2p.rs PeerLinkManager::tick_at, expire_pending, src/client/tui/ui.rs UiState::p2p_link_failed; test undeliverable_queued_content_is_reported_once_it_ages_out"
 
 [[user_story.technical_behavior]]
 id = "TB-143"
@@ -1777,12 +1777,47 @@ evidence = "src/p2p_proto.rs SAFE_DATAGRAM_BYTES; src/client/file_transfer.rs FI
 [[user_story.technical_behavior]]
 id = "TB-149"
 description = "A direct link's punch handshake is triggered eagerly, the moment a peer is first learned about (ServerMessage::UserJoined), rather than lazily on first send - since voice (unlike text/file) excludes a recipient outright if its link isn't already Active at record-start, a lazy trigger meant the first voice message to any brand-new peer reliably missed them. A pre-warmed link that fails to punch with nothing ever queued against it fails silently (no visible LinkFailed banner) - only a link something was genuinely waiting on surfaces a visible failure."
-evidence = "src/client/session.rs handle_server_message's UserJoined arm (ensure_link call); src/client/p2p.rs PeerLinkManager::tick_at (had_pending gate on emitting P2pEvent::LinkFailed); test punch_timeout_with_nothing_pending_fails_silently"
+evidence = "src/client/session.rs handle_server_message's UserJoined arm (ensure_link call); src/client/p2p.rs PeerLinkManager::expire_pending (only content that was actually queued can age out into a P2pEvent::LinkFailed); test punch_timeout_with_nothing_pending_fails_silently"
 
 [[user_story.technical_behavior]]
 id = "TB-155"
 description = "A client only responds to an incoming PeerCandidates (the P2P link handshake) from a peer it currently shares a joined channel with; a request from anyone else is silently dropped before it ever reaches PeerLinkManager, since the server's own relay performs no relationship checking of its own."
 evidence = "docs/PROTOCOL.md 7.1.2; src/client/session.rs handle_server_message's PeerCandidates arm; src/client/tui/channel.rs UiState::shares_a_joined_channel"
+
+[[user_story.acceptance_criteria]]
+id = "AC-135"
+description = "Each person in the sidebar is coloured by the state of the direct link to them rather than by their presence on the server: green once that link is established and content can actually reach them, red once it is lost, and neither while it is still being established. A trust-gated or offline peer keeps its own existing colour, which takes priority."
+evidence = "docs/SPEC.md 'Connected UI'; docs/PROTOCOL.md 7.1; src/client/p2p.rs LinkStatus, src/client/tui/ui.rs UiState::set_link_status/link_status_of, src/client/tui/channel.rs render_sidebar; tests sidebar_colours_each_member_by_the_state_of_the_direct_link_to_them, a_member_with_no_link_record_yet_is_not_shown_as_reachable; direct_link_state.feature"
+
+[[user_story.technical_behavior]]
+id = "TB-176"
+description = "A Ping or Pong arriving from an address nobody advertised is attributed by its link_nonce to a link currently being established, that source is adopted as a peer-reflexive candidate, and it becomes usable for data frames - which is what makes a peer behind a NAT that maps a different external port per destination (symmetric/carrier-grade NAT) reachable at all. Attribution by nonce is limited to links being established, never an already-Active one, so an unauthenticated datagram can't move a live link's address; and a probe whose nonce matches no such link is ignored rather than answered, so this never becomes a reflector for anyone scanning the socket."
+evidence = "docs/PROTOCOL.md 7.1; src/client/p2p.rs PeerLinkManager::attribute, adopt_candidate, on_datagram_at; tests a_ping_from_an_unadvertised_source_is_answered_and_adopted_as_a_candidate, a_pong_from_an_unadvertised_source_activates_the_link, a_ping_matching_no_link_is_ignored"
+
+[[user_story.technical_behavior]]
+id = "TB-177"
+description = "Both sides converge on one shared link_nonce, which is what lets it serve as a link identifier for TB-176's attribution: the responder echoes the initiator's, and when both initiate at once - the normal case, since both pre-warm on UserJoined (TB-149) - both take the numerically smaller of the two while still establishing. Against an already-Active link a differing nonce instead means the peer has restarted, and is followed rather than tie-broken."
+evidence = "docs/PROTOCOL.md 7.1; src/client/p2p.rs PeerLinkManager::on_peer_candidates; test simultaneous_open_converges_on_one_shared_nonce"
+
+[[user_story.technical_behavior]]
+id = "TB-178"
+description = "Establishing a link is continuous, not a single attempt: a link that could not be punched is re-signalled through the server automatically on a backoff doubling from RETRY_BASE and capped at RETRY_MAX, with no user action and nothing queued against it, for as long as the peer is still known - only PeerLinkManager::forget (losing every shared channel and DM with them) stops it. A user-initiated send skips the remaining backoff, and a peer's own fresh invite re-arms a lost link immediately rather than being ignored."
+evidence = "docs/PROTOCOL.md 7.1; src/client/p2p.rs PeerLinkManager::retry_due, mark_lost, retry_delay, ensure_link, on_peer_candidates; tests a_lost_link_is_re_signalled_automatically_on_a_backoff, the_retry_backoff_grows_and_stays_capped, a_lost_link_still_answers_a_fresh_invite_from_the_peer"
+
+[[user_story.technical_behavior]]
+id = "TB-179"
+description = "An Active link's liveness is measured by anything received on it, Keepalive datagrams included rather than content alone, so a link that dies without either side sending (a NAT rebinding, a route changing) is noticed: receiving nothing for LINK_IDLE_TIMEOUT marks the link lost and puts it back into establishment, while a peer's keepalive beat alone is enough to keep an otherwise idle link up."
+evidence = "docs/PROTOCOL.md 7.1; src/client/p2p.rs PeerLinkManager::note_received, tick_at (LINK_IDLE_TIMEOUT arm); tests an_active_link_that_goes_quiet_is_lost_and_re_established, a_peers_keepalive_keeps_an_otherwise_idle_link_alive"
+
+[[user_story.technical_behavior]]
+id = "TB-180"
+description = "Content queued against a link that is not up survives that link failing and being punched again, and is flushed in order once it reopens - including frames that were still unacknowledged when the old link died, which are re-queued rather than lost with it. The ARQ sequence space belongs to one punched link and restarts with it on both sides, and the queue is bounded by PENDING_MAX and PENDING_MAX_AGE so nothing accumulates without bound or disappears without the user being told."
+evidence = "docs/PROTOCOL.md 7.1.1; src/client/p2p.rs PeerLinkManager::send_reliable_or_queue, reset_transport, expire_pending; src/client/p2p_reliable.rs ArqSender::reset, ArqReceiver::reset; test content_queued_while_the_link_is_down_is_flushed_when_it_recovers"
+
+[[user_story.technical_behavior]]
+id = "TB-181"
+description = "The client's own server-reflexive candidate is re-learned every REFLEXIVE_REFRESH_INTERVAL for the whole session rather than once at startup, which both keeps the NAT mapping it names from expiring while the client sits idle and keeps the address it advertises true. An observed address that has changed replaces it and re-signals every link that is not already up; links that are up are deliberately left alone, since on a symmetric NAT the server-facing mapping is independent of the peer-facing ones."
+evidence = "docs/PROTOCOL.md 7.1; src/client/p2p.rs PeerLinkManager::refresh_reflexive, on_rendezvous, learn_reflexive_candidate; test a_changed_reflexive_address_re_signals_links_that_are_not_up"
 
 # ============================================================================
 # US-025 - Protect a private channel with a password

@@ -15,6 +15,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Tabs};
 
 use crate::client::netstats::ConnQuality;
+use crate::client::p2p::LinkStatus;
 use crate::proto::{ChannelInfo, ChannelJoinRejection, ChannelKind, UserId, UserInfo};
 use crate::client::sysstats::CPU_HEALTHY_MAX_PCT;
 use crate::validation;
@@ -874,20 +875,32 @@ fn render_sidebar(frame: &mut Frame, area: Rect, state: &UiState) {
             };
             let label = format!("{envelope}{}", m.key_mode.format_with_name(&m.name));
             // A Pending/Rejected identity (docs/PROTOCOL.md §12) takes
-            // priority over the offline dimming below - it's the more
-            // urgent, actionable state (open the review popup via Enter),
-            // whether or not they also happen to be offline right now.
+            // priority over everything below - it's the most urgent,
+            // actionable state (open the review popup via Enter), whether
+            // or not they also happen to be offline or unreachable.
             // Offline members are otherwise only ever kept around because
             // there's DM history worth preserving (`on_user_offline`) -
-            // shown in a soft gray instead of the usual green for a
-            // connected user, same dim tone the help hint/spinner label
-            // already use elsewhere in this screen.
+            // shown in a soft gray, the same dim tone the help
+            // hint/spinner label already use elsewhere in this screen.
+            //
+            // For everyone still connected, the colour is the state of the
+            // *direct link* to them (§7.1), not merely their presence on
+            // the server: green once messages can actually reach them, red
+            // once they can't, yellow while the punch is still being
+            // worked out. Presence alone would be the misleading thing to
+            // show here - a peer can be perfectly online and completely
+            // unreachable, which is exactly the case this is here to make
+            // visible.
             let mut style = if state.is_trust_gated(m.id) {
                 Style::default().fg(Color::Red)
             } else if state.offline.contains(&m.id) {
                 Style::default().fg(Color::DarkGray)
             } else {
-                Style::default().fg(Color::Green)
+                match state.link_status_of(m.id) {
+                    LinkStatus::Active => Style::default().fg(Color::Green),
+                    LinkStatus::Lost => Style::default().fg(Color::Red),
+                    LinkStatus::Connecting => Style::default().fg(Color::Yellow),
+                }
             };
             if state.focus == super::ui::Focus::Sidebar && i == state.sidebar_selected {
                 style = style.add_modifier(Modifier::REVERSED);

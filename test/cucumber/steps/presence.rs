@@ -5,6 +5,7 @@ use crossterm::event::{KeyCode, KeyModifiers};
 use cucumber::{given, then, when};
 use ratatui::style::Color;
 
+use aloo::client::p2p::LinkStatus;
 use aloo::proto::UserId;
 use aloo::client::tui::ui::Focus;
 
@@ -81,6 +82,39 @@ async fn dropped(w: &mut AlooWorld, name: String) {
     assert!(
         state.offline.contains(&id),
         "but they are still remembered as offline"
+    );
+}
+
+/// Green in the sidebar means "a direct link to this person is up"
+/// (AC-135), not merely "they are connected to the server" - so a scenario
+/// that asserts green has to establish one first.
+#[given(expr = "I have a direct connection to {word}")]
+async fn have_direct_connection(w: &mut AlooWorld, name: String) {
+    w.ui_mut()
+        .set_link_status(UserId(id_for(&name)), LinkStatus::Active);
+}
+
+#[given(expr = "the direct connection to {word} has been lost")]
+#[when(expr = "the direct connection to {word} is lost")]
+async fn direct_connection_lost(w: &mut AlooWorld, name: String) {
+    w.ui_mut()
+        .set_link_status(UserId(id_for(&name)), LinkStatus::Lost);
+}
+
+#[then(expr = "{word}'s name is shown in {word}")]
+async fn name_colour(w: &mut AlooWorld, name: String, colour: String) {
+    let expected = match colour.as_str() {
+        "green" => Color::Green,
+        "red" => Color::Red,
+        "yellow" => Color::Yellow,
+        other => panic!("unknown colour {other:?} - expected green/red/yellow"),
+    };
+    let buffer = ui_buffer(w.ui_ref(), 160, 30);
+    let (x, y) = find_text_start(&buffer, &name);
+    assert_eq!(
+        buffer[(x, y)].fg,
+        expected,
+        "{name} should be rendered {colour} for their direct-link state"
     );
 }
 

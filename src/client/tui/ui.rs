@@ -28,6 +28,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 
+use crate::client::p2p::LinkStatus;
 use crate::proto::{ChannelKind, KeyMode, UserId, UserInfo};
 
 use super::channel::{ChannelTab, DwellState};
@@ -450,6 +451,12 @@ pub struct UiState {
     /// once inserted here an entry is never removed for the rest of the
     /// session - there's no way for the same identity to come back online.
     pub offline: HashSet<UserId>,
+    /// The state of the direct peer-to-peer link to each peer, as reported
+    /// by `p2p::PeerLinkManager` through `P2pEvent::LinkStatusChanged` -
+    /// what colours a name in the sidebar (`render_sidebar`). A peer with
+    /// no entry has no link yet, which reads the same as `Connecting`:
+    /// content addressed to them is queued, not delivered.
+    pub link_status: HashMap<UserId, LinkStatus>,
     pub private_rooms: HashMap<UserId, PrivateRoom>,
     pub active_private_room: Option<UserId>,
     pub focus: Focus,
@@ -618,6 +625,7 @@ impl UiState {
             dwell: None,
             known_users: HashMap::new(),
             offline: HashSet::new(),
+            link_status: HashMap::new(),
             private_rooms: HashMap::new(),
             active_private_room: None,
             focus: Focus::Input,
@@ -979,6 +987,32 @@ impl UiState {
     /// `playback_failed` use rather than inventing a new UI surface for it.
     pub fn p2p_link_failed(&mut self, peer_name: &str, reason: &str) {
         self.audio_error = Some(format!("direct connection to {peer_name} failed: {reason}"));
+    }
+
+    /// Records the current state of the direct link to `peer`, which is
+    /// what `render_sidebar` colours their name by: green once messages
+    /// can actually reach them, red once they can't.
+    pub fn set_link_status(&mut self, peer: UserId, status: LinkStatus) {
+        self.link_status.insert(peer, status);
+    }
+
+    /// Forgets a peer's link state, for when the link itself is dropped
+    /// (`p2p::PeerLinkManager::forget`) - a stale entry would otherwise
+    /// keep colouring a name by a link that no longer exists.
+    pub fn forget_link_status(&mut self, peer: UserId) {
+        self.link_status.remove(&peer);
+    }
+
+    /// How `peer`'s direct link should be shown right now. A peer we have
+    /// no link record for at all is `Connecting`: one is pre-warmed the
+    /// moment they're learned about (§7.1), so "no record" means the
+    /// handshake simply hasn't got anywhere yet, never that content would
+    /// reach them.
+    pub fn link_status_of(&self, peer: UserId) -> LinkStatus {
+        self.link_status
+            .get(&peer)
+            .copied()
+            .unwrap_or(LinkStatus::Connecting)
     }
 
     /// Notes something the user should see but need not act on - currently

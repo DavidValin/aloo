@@ -11,6 +11,7 @@ Important files:
   * `docs/PROTOCOL.md`: the current specification of the messaging protocol
   * `docs/SPEC.md`: a generic text-based specification of the application
   * `docs/TESTING.md`: a document describing how to perform test driven changes to the application
+  * `docs/SECURIRY.md`
   * `README.md`
 
 Practical approach:
