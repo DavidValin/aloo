@@ -1481,6 +1481,22 @@ each point in the exchange. Consequences:
 - In practice, this protocol is versioned by "build from the same
   commit" rather than by anything self-describing on the wire.
 
+Since §1.3, one common skew at least fails *early and consistently*: the
+first message decoded on any connection is now `Hello`, and it carries a
+field older servers do not send. A server predating the control channel
+opens with `{ auth, challenge }`; a peer expecting
+`{ auth, challenge, control }` reads both known fields, reaches for the
+third, and finds the frame already spent - so the connection dies during the
+opening exchange, before authentication, rather than at some later message.
+It fails that way for every auth mode and every `my_key` type, which makes it
+look unrelated to whatever was being configured at the time.
+
+That is a symptom, not a mechanism: it is what one particular skew happens to
+produce, not a check this protocol performs. Any other schema mismatch still
+fails in one of the ways listed above, and one that decodes into
+wrong-but-plausible data still fails silently. The remedy is unchanged -
+build both sides from the same commit.
+
 ## 10. What the server never sees
 
 To restate the core privacy property precisely: the server has visibility

@@ -32,23 +32,49 @@ docker build -f docker-server/Dockerfile-server -t aloo-server docker-server
 Note the build context at the end is `docker-server`, not `.` — the
 Dockerfile only needs its own directory.
 
-This builds whichever aloo version is set as the `ALOO_VERSION` build arg's
-default (check `docker-server/Dockerfile-server` for the current value — it
-tracks the version in `Cargo.toml` at the time the Dockerfile was last
-updated, but the two can drift). To build a different released version:
+This builds the **newest** release: the `ALOO_VERSION` build arg defaults to
+`latest`, which the build resolves against the
+[releases page](https://github.com/DavidValin/aloo/releases) each time it
+runs. To build a specific released version instead:
 
 ```sh
 docker build -f docker-server/Dockerfile-server -t aloo-server \
-  --build-arg ALOO_VERSION=0.1.0-alpha.1 \
+  --build-arg ALOO_VERSION=0.1.0-alpha.5 \
   docker-server
 ```
 
-`ALOO_VERSION` must match a tag that has `aloo-x86_64_linux_musl.tar.gz` /
-`aloo-aarch64_linux_musl.tar.gz` assets on the
-[releases page](https://github.com/DavidValin/aloo/releases). The build
-picks x86_64 vs aarch64 from the build machine's own architecture (`uname
--m`), so it also resolves correctly under an emulated (QEMU) `--platform`
-build.
+`ALOO_VERSION` must then match a tag that has `aloo-x86_64_linux_musl.tar.gz`
+/ `aloo-aarch64_linux_musl.tar.gz` assets on that page. The build picks
+x86_64 vs aarch64 from the build machine's own architecture (`uname -m`), so
+it also resolves correctly under an emulated (QEMU) `--platform` build.
+
+Either way the build log names the exact version it fetched, and that version
+is recorded in the image (see "Which version am I running?" below).
+
+### The server's version must match its clients'
+
+aloo has **no protocol version negotiation** — client and server are expected
+to be built from the same message definitions, and there is no compatibility
+mechanism for a mismatch (see [`PROTOCOL.md`](PROTOCOL.md) §1 and §9). A
+server one release behind its clients is not degraded, it is unreachable:
+clients fail during the opening handshake, before authenticating.
+
+That is why the default is `latest` rather than a tag written into the
+Dockerfile — a pinned default quietly becomes a server nobody can connect to
+as soon as the next release ships. If you do pin `ALOO_VERSION`, pin your
+clients to the same tag, and rebuild the image (with `--no-cache`, or after
+`docker pull`ing a fresh base) whenever you upgrade them.
+
+## Which version am I running?
+
+```sh
+docker exec aloo-server cat /etc/aloo-version   # baked in at build time
+docker exec aloo-server aloo --help | head -1   # what the binary reports
+```
+
+Both should agree. Compare either against the client's own `aloo --help`
+header when a connection is refused for no obvious reason — see
+"Troubleshooting" below.
 
 ## Running the container
 
@@ -173,3 +199,41 @@ docker logs -f aloo-server
 Restarts are logged by the entrypoint itself (`aloo-server: crashed (exit
 <code>), restarting in <n>s`), so a crash loop is visible directly in
 `docker logs` rather than only in `docker ps`'s restart count.
+
+## Troubleshooting
+
+### `Error: Decode("UnexpectedEnd { additional: 1 }")` on connect
+
+The client exits with this the moment it connects, whatever `my_key` type or
+password it was given, and the server logs nothing unusual. The container is
+running an aloo older than the client — almost always one predating the
+encrypted control channel ([`PROTOCOL.md`](PROTOCOL.md) §1.3), which added a
+field to the server's opening `Hello`. The client decodes the two fields it
+knows, reaches for the third, and runs one byte short.
+
+Nothing about the message is specific to that field: any mismatch in the
+`ClientMessage`/`ServerMessage` definitions can end this way (§9). This
+particular error is just the one an old container produces, because `Hello`
+is the very first thing decoded.
+
+Compare the two versions:
+
+```sh
+docker exec aloo-server cat /etc/aloo-version
+aloo --help | head -1        # on the machine running the client
+```
+
+If they differ, rebuild the image (see "Building the image" — the default
+`ALOO_VERSION=latest` picks up the newest release) and recreate the
+container:
+
+```sh
+docker build --no-cache -f docker-server/Dockerfile-server -t aloo-server docker-server
+docker rm -f aloo-server && docker run -d ...   # same flags as before
+```
+
+The `~/.aloo` volume carries the server's settings and key material across
+this, so recreating the container keeps its configuration and identity.
+
+Images built before `/etc/aloo-version` existed won't have that file; use the
+`aloo --help` line for both sides in that case.

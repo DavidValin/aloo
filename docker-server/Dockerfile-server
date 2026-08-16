@@ -2,8 +2,9 @@
 # this project's GitHub releases. Self-contained build context.
 #
 # Usage:
+#   # builds the newest release, which is what a freshly-installed client is:
 #   docker build -f docker-server/Dockerfile-server -t aloo-server docker-server
-#   # building a version other than the default below:
+#   # pinning an exact version instead (must match the clients that connect):
 #   #   --build-arg ALOO_VERSION=<tag from https://github.com/DavidValin/aloo/releases>
 #   docker run -d --name aloo-server --restart unless-stopped \
 #     -p 7878:7878 \
@@ -20,20 +21,44 @@ RUN apk add --no-cache curl
 
 WORKDIR /fetch
 
-# Release tag to fetch; bump this or pass --build-arg ALOO_VERSION=... for a
-# newer aloo release.
-ARG ALOO_VERSION=0.1.0-alpha.1
+# Release tag to fetch. `latest` resolves, at build time, to whatever the
+# newest release is; pass --build-arg ALOO_VERSION=<tag> to pin an exact one.
+#
+# The default is deliberately not a hardcoded tag. There is no protocol
+# version negotiation (docs/PROTOCOL.md 9): a server and its clients must be
+# built from the same message definitions or they cannot talk at all, and a
+# tag baked in here silently rots into a server nobody can connect to one
+# release later. Tracking the newest release keeps a `docker build` with no
+# arguments matching a freshly-installed client.
+#
+# `latest` is resolved through /releases/latest, which redirects to
+# /releases/tag/<newest>, rather than by downloading via
+# /releases/latest/download/: resolving the tag first means the exact version
+# fetched is echoed in the build log and recorded in the image as
+# /etc/aloo-version, so an operator can always tell what a container is
+# running (see docs/SERVER_ON_DOCKER.md "Which version am I running?").
+ARG ALOO_VERSION=latest
 RUN set -eu; \
     case "$(uname -m)" in \
         x86_64) arch=x86_64 ;; \
         aarch64) arch=aarch64 ;; \
         *) echo "aloo-server: unsupported build architecture $(uname -m)" >&2; exit 1 ;; \
     esac; \
-    url="https://github.com/DavidValin/aloo/releases/download/${ALOO_VERSION}/aloo-${arch}_linux_musl.tar.gz"; \
+    if [ "$ALOO_VERSION" = latest ]; then \
+        version="$(curl -fsSI -o /dev/null -w '%{redirect_url}' \
+            https://github.com/DavidValin/aloo/releases/latest | sed 's#.*/tag/##')"; \
+        if [ -z "$version" ]; then \
+            echo "aloo-server: could not resolve the latest aloo release" >&2; exit 1; \
+        fi; \
+    else \
+        version="$ALOO_VERSION"; \
+    fi; \
+    url="https://github.com/DavidValin/aloo/releases/download/${version}/aloo-${arch}_linux_musl.tar.gz"; \
     echo "aloo-server: fetching $url" >&2; \
     curl -fsSL "$url" -o aloo.tar.gz; \
     tar -xzf aloo.tar.gz; \
-    chmod +x aloo
+    chmod +x aloo; \
+    printf '%s\n' "$version" > version
 
 # ---- runtime stage ---------------------------------------------------------
 FROM alpine:3.20
@@ -41,6 +66,7 @@ FROM alpine:3.20
 RUN addgroup -S aloo && adduser -S aloo -G aloo -h /home/aloo
 
 COPY --from=fetcher /fetch/aloo /usr/local/bin/aloo
+COPY --from=fetcher /fetch/version /etc/aloo-version
 COPY aloo-server-entrypoint.sh /usr/local/bin/aloo-server-entrypoint.sh
 RUN chmod 755 /usr/local/bin/aloo /usr/local/bin/aloo-server-entrypoint.sh
 
