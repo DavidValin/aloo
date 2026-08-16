@@ -1,11 +1,12 @@
-//! Terminal lifecycle for the TUI: raw mode + alternate screen on the way
-//! in, the exact inverse on the way out. Lives in the TUI tier so `main.rs`
-//! needs no `crossterm`/`ratatui` imports of its own.
+//! Terminal I/O for the TUI: raw mode + alternate screen on the way in,
+//! the exact inverse on the way out, and the blocking input-reader thread
+//! for the connected session. Lives in the TUI tier so `main.rs` needs no
+//! `crossterm`/`ratatui` imports of its own.
 
 use std::io::Stdout;
 
 use crossterm::event::{
-    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    Event, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -44,4 +45,27 @@ pub fn restore(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<(), 
     disable_raw_mode()?;
     terminal.show_cursor()?;
     Ok(())
+}
+
+/// The blocking terminal-input reader for the connected session:
+/// `crossterm::event::read()` can't be awaited, so a dedicated OS thread
+/// forwards every event onto a tokio channel that
+/// `session::run_connected_session`'s select loop can consume. The thread
+/// exits on its own once the receiver is dropped (send fails) or the
+/// terminal goes away (read fails).
+pub fn spawn_input_thread() -> tokio::sync::mpsc::UnboundedReceiver<Event> {
+    let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
+    std::thread::spawn(move || {
+        loop {
+            match crossterm::event::read() {
+                Ok(ev) => {
+                    if input_tx.send(ev).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    input_rx
 }

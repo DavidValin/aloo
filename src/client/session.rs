@@ -21,7 +21,7 @@ use tokio::net::TcpStream;
 use crate::BoxError;
 use crate::client::connect::ResolvedIdentity;
 use crate::crypto;
-use crate::client::file_stream;
+use crate::client::file_transfer;
 use crate::client::idstore;
 use crate::client::netstats;
 use crate::client::own_next_keys;
@@ -59,15 +59,15 @@ pub(crate) struct SessionState {
     pub(crate) own_stream_targets: HashMap<u64, voice_stream::OwnStreamTarget>,
     pub(crate) active_streams: HashMap<(UserId, u64), voice_stream::ActiveStream>,
     /// File-transfer counterparts of the two maps above - see
-    /// `file_stream::OwnFileTarget`/`ActiveFileTransfer`. Keyed the same
+    /// `file_transfer::OwnFileTarget`/`ActiveFileTransfer`. Keyed the same
     /// way: `own_file_targets` by our own `stream_id` alone (it's always
     /// our stream), `active_file_transfers` by `(from, stream_id)`.
-    pub(crate) own_file_targets: HashMap<u64, file_stream::OwnFileTarget>,
-    pub(crate) active_file_transfers: HashMap<(UserId, u64), file_stream::ActiveFileTransfer>,
-    /// Where a file-transfer worker thread (`file_stream::spawn_send_file_worker`/
+    pub(crate) own_file_targets: HashMap<u64, file_transfer::OwnFileTarget>,
+    pub(crate) active_file_transfers: HashMap<(UserId, u64), file_transfer::ActiveFileTransfer>,
+    /// Where a file-transfer worker thread (`file_transfer::spawn_send_file_worker`/
     /// `spawn_receive_file_worker`) reports progress/completion/failure,
     /// polled by `run_connected_session`'s select loop (`handle_file_event`).
-    pub(crate) file_events_tx: tokio::sync::mpsc::UnboundedSender<file_stream::FileEvent>,
+    pub(crate) file_events_tx: tokio::sync::mpsc::UnboundedSender<file_transfer::FileEvent>,
     /// Outgoing voice/file-chunk traffic from a background thread (the
     /// recorder, the file sender) - drained by `run_connected_session`'s
     /// select loop into `peer_link.dispatch_outbound`. Direct-transport
@@ -83,18 +83,12 @@ pub(crate) struct SessionState {
     /// anything.
     pub(crate) own_key_mode: KeyMode,
     /// This client's own rotating per-peer keypairs (`rekey::OwnKeys`).
-    /// Built and used for every `KeyMode` except `PqHybrid` (even under a
-    /// non-`PerMessage` mode, where it simply never rotates and behaves
-    /// exactly like the single static key this app has always used) so the
-    /// decrypt path only needs to branch on our own mode once, not scatter
-    /// RSA-specific logic everywhere. `None` for `PqHybrid`, which has no
-    /// single RSA key to seed this with and never rotates - see
-    /// `own_pq_private` instead. Shared with `spawn_rotation_worker`'s
-    /// dedicated thread (`Arc<Mutex<_>>`) - the lock is only ever held for
-    /// the brief, fast operations (`decrypt_from`, `current_private_for`,
-    /// `install_rotated_key`), never for the expensive RSA-4096 keygen
-    /// itself, so it never turns into the stall this design replaces (see
-    /// `spawn_rotation_worker`).
+    /// Built for every `KeyMode` except `PqHybrid` (under a
+    /// non-`PerMessage` mode it simply never rotates), so the decrypt path
+    /// branches on our own mode once instead of scattering RSA logic.
+    /// `None` for `PqHybrid` - see `own_pq_private`. Shared with
+    /// `spawn_rotation_worker`'s thread (`Arc<Mutex<_>>`); the lock is
+    /// only held for brief operations, never for RSA-4096 keygen itself.
     pub(crate) own_keys: Option<Arc<Mutex<rekey::OwnKeys>>>,
     /// This client's own PQ-hybrid private keybundle (`crypto::pq`,
     /// `docs/PROTOCOL.md` §13) - `Some` only when `own_key_mode ==
@@ -110,15 +104,11 @@ pub(crate) struct SessionState {
     /// `spawn_rotation_worker`'s dedicated thread, which is what actually
     /// keeps rotations off the event-loop task.
     pub(crate) rotate_request_tx: tokio::sync::mpsc::UnboundedSender<UserId>,
-    /// Count of rotation requests that have been handed to
-    /// `spawn_rotation_worker` (`request_rotation_if_per_message`) but not
-    /// yet finished (incremented there, decremented by the worker once it
-    /// finishes processing one - see `spawn_rotation_worker`). Read each
-    /// tick to drive `UiState::tick_spinner`: > 0 means the spinner
-    /// animates, exactly while a key is actually being regenerated in the
-    /// background. A plain `Arc<AtomicUsize>` rather than another channel:
-    /// the UI only ever needs the current count at redraw time, never a
-    /// history of every increment/decrement.
+    /// Rotation requests handed to `spawn_rotation_worker` but not yet
+    /// finished; > 0 drives `UiState::tick_spinner`, so the spinner
+    /// animates exactly while a key is being regenerated. An
+    /// `Arc<AtomicUsize>` rather than a channel: the UI only needs the
+    /// current count at redraw time.
     pub(crate) rotation_pending: Arc<AtomicUsize>,
     /// Local nickname -> full-public-key pinning store (`docs/PROTOCOL.md`
     /// §12), checked whenever a peer's identity is first learned
@@ -161,38 +151,23 @@ pub(crate) struct SessionState {
 }
 
 /// Runs on one dedicated thread for the whole session, processing
-/// `rsa_per_msg` rotation requests (PROTOCOL.md §11.3) one at a time. This
-/// is what actually keeps RSA-4096 keygen (commonly 100ms to low seconds -
-/// the same cost PROTOCOL.md §11.6 already documents as the reason voice
-/// skips per-chunk rotation) off the async event-loop task: without it,
-/// `request_rotation_if_per_message` would have to call `OwnKeys` directly
-/// and block `run_connected_session`'s `tokio::select!` loop - and hence
-/// UI redraw and all other network processing - for however long keygen
-/// takes, once per peer, every time a message is sent or received.
+/// `rsa_per_msg` rotation requests (§11.3) one at a time - keeping
+/// RSA-4096 keygen (100ms to low seconds) off the async event-loop task,
+/// which would otherwise stall UI redraw and network processing on every
+/// message sent or received.
 ///
-/// Deliberately a *single* worker rather than one thread per request: two
-/// rotations for the same peer racing each other would each sign their new
-/// key against whatever "current" key they happened to read first, and a
-/// receiver can only ever validate against the one key it actually still
-/// trusts (§11.4) - the loser's `RotateKey` would be silently dropped as
-/// an invalid signature. Processing requests strictly one at a time here
-/// makes that race structurally impossible, at the cost of rotations for
-/// different peers queueing behind each other rather than running in
-/// parallel - an acceptable trade since rotation is a background
-/// housekeeping operation, not something a human is directly waiting on.
+/// Deliberately a *single* worker: two rotations for the same peer racing
+/// would each sign against whatever "current" key they read first, and
+/// the receiver validates against the one key it still trusts (§11.4) -
+/// the loser's `RotateKey` would be silently dropped. Strict one-at-a-time
+/// processing makes that race structurally impossible, at the acceptable
+/// cost of different peers' rotations queueing.
 ///
-/// `own_keys` is shared with the main task (`Arc<Mutex<_>>`): this thread
-/// only holds the lock for `current_private_for` (read the key to sign
-/// against) and `install_rotated_key` (cheap bookkeeping) - the actual
-/// `generate_and_sign_rotation` keygen call runs with no lock held at all,
-/// so it never blocks the main task's own `decrypt_from`/
-/// `current_private_for` calls.
-///
-/// `pending` is decremented here once a request is fully handled
-/// (success or failure) - paired with the increment in
-/// `request_rotation_if_per_message`, this is what lets the UI's spinner
-/// (`UiState::tick_spinner`) reflect "a key is being regenerated right
-/// now" without this thread needing to know anything about rendering.
+/// The `own_keys` lock is held only for `current_private_for` and
+/// `install_rotated_key`; the keygen itself runs with no lock held.
+/// `pending` is decremented once a request is handled (success or
+/// failure), pairing with the increment in
+/// `request_rotation_if_per_message` to drive the UI spinner.
 fn spawn_rotation_worker(
     own_keys: Arc<Mutex<rekey::OwnKeys>>,
     out_tx: tokio::sync::mpsc::UnboundedSender<ClientMessage>,
@@ -241,7 +216,7 @@ pub(crate) async fn run_connected_session(
     mut hotkey_rx: Option<tokio::sync::mpsc::UnboundedReceiver<crate::client::global_ptt::GlobalPttEvent>>,
     server_addr: SocketAddr,
 ) -> Result<(), BoxError> {
-    let mut input_rx = crate::client::tui::input::spawn_input_thread();
+    let mut input_rx = crate::client::tui::terminal::spawn_input_thread();
 
     let (net_tx, mut net_rx) = tokio::sync::mpsc::unbounded_channel::<ServerMessage>();
     tokio::spawn(async move {
@@ -259,14 +234,11 @@ pub(crate) async fn run_connected_session(
 
     let (audio_err_tx, mut audio_err_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
-    // One persistent mixer thread for the whole session, rather than
-    // opening a new output stream per message: several sources arriving
-    // close together (a live stream overlapping a history replay, or two
-    // people talking near-simultaneously) previously meant multiple
-    // concurrent opens against the same device - a common way to make
-    // ALSA/dmix fail with "unable to open slave". The mixer opens its one
-    // output stream lazily and keeps it open for the session, actually
-    // summing simultaneous sources instead of queuing one behind another.
+    // One persistent mixer thread for the whole session - per-message
+    // stream opens against the same device are a common way to make
+    // ALSA/dmix fail with "unable to open slave", and the one mixer sums
+    // simultaneous sources instead of queuing them (see
+    // `voice::spawn_mixer`).
     let mixer_err_tx = audio_err_tx.clone();
     let (mixer_finished_tx, mut mixer_finished_rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
     let mixer_tx = voice::spawn_mixer(
@@ -284,7 +256,7 @@ pub(crate) async fn run_connected_session(
     let (stream_finished_tx, mut stream_finished_rx) =
         tokio::sync::mpsc::unbounded_channel::<(UserId, u64, u32, Vec<u8>)>();
     let (file_events_tx, mut file_events_rx) =
-        tokio::sync::mpsc::unbounded_channel::<file_stream::FileEvent>();
+        tokio::sync::mpsc::unbounded_channel::<file_transfer::FileEvent>();
     let (auto_stop_tx, mut auto_stop_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
     // The session's one direct client<->client UDP transport (`crate::client::p2p`).
@@ -429,17 +401,13 @@ pub(crate) async fn run_connected_session(
             finished = stream_finished_rx.recv() => {
                 let Some((from, stream_id, duration_ms, pcm)) = finished else { break };
                 if let Some(active) = session.active_streams.remove(&(from, stream_id)) {
-                    // Best-effort re-check of the same trust state
-                    // `on_stream_start` snapshotted into `suppress_playback`
-                    // - skips the "message ended" chime for a sender who
-                    // was never actually heard. Doesn't thread the original
-                    // snapshot through `ActiveStream` for one boolean, so a
-                    // mismatch newly detected for `from` in the handful of
-                    // messages between this stream's `*Start` and `*End`
-                    // (rare - identity checks only fire on `UserJoined`/
-                    // `KeyRotated`) could still play the chime for audio
-                    // that was in fact suppressed; a harmless UX quirk, not
-                    // a correctness issue.
+                    // Best-effort re-check of the trust state
+                    // `on_stream_start` snapshotted - skips the "message
+                    // ended" chime for a sender who was never heard. Not
+                    // threaded through `ActiveStream`, so a mismatch newly
+                    // detected mid-stream (rare) could still chime for
+                    // suppressed audio - a harmless UX quirk, not a
+                    // correctness issue.
                     let was_heard = !ui_state.is_trust_gated(from);
                     match active.channel {
                         Some(channel) => crate::client::channel::on_stream_finished(&mut ui_state, &channel, from, stream_id, duration_ms, pcm),
@@ -472,15 +440,11 @@ pub(crate) async fn run_connected_session(
                 let Some(err) = err else { break };
                 ui_state.playback_failed(err);
             }
-            // `hotkey_rx` being `None` (the feature disabled, unsupported
-            // on this platform, or registration failed at startup - see
-            // `crate::client::global_ptt`) parks this branch forever via
-            // `pending()`. Unlike `input_rx`/`net_rx`, the sender side
-            // going away here (the background thread that owns the OS
-            // hotkey manager dying) is *not* fatal to the session - it
-            // just means this one optional feature stops, so instead of
-            // `break`ing, this arm sets `hotkey_rx` to `None` itself so
-            // the branch parks forever from then on.
+            // `hotkey_rx` being `None` (feature disabled, unsupported, or
+            // registration failed) parks this branch forever via
+            // `pending()`. Unlike `input_rx`/`net_rx`, the sender dying is
+            // *not* fatal to the session - this arm just sets `hotkey_rx`
+            // to `None` itself so the branch parks from then on.
             hotkey_ev = async {
                 match hotkey_rx.as_mut() {
                     Some(rx) => rx.recv().await,
@@ -702,15 +666,11 @@ async fn handle_ui_action(
                             eprintln!("aloo: failed to save id_store: {e}");
                         }
                     }
-                    // A rolling key that was never installed anywhere -
-                    // whether because `check_identity` gated this nickname
-                    // on sight (no attempt yet), `handle_key_rotated` saw
-                    // only a self-consistent `Live` rotation while already
-                    // gated, or an explicit resume signature failed to
-                    // verify. Accepting it needs the exact same
-                    // install+persist+flush sequence an ordinary successful
-                    // rotation gets, just for whichever key was most
-                    // recently offered.
+                    // A rolling key never installed anywhere - gated on
+                    // sight, a `Live`-only rotation while gated, or a
+                    // failed resume signature. Accepting it needs the same
+                    // install+persist+flush sequence an ordinary rotation
+                    // gets, for whichever key was most recently offered.
                     IdentityCase::ResumeFailed { new_public_key_der } => {
                         install_trusted_rotation(
                             ui_state,
@@ -772,7 +732,7 @@ async fn accept_file_offer(
         &offer.filename,
     ));
     let dest_path = crate::client::file_transfer::default_download_dir().join(dest_name);
-    let job_tx = file_stream::spawn_receive_file_worker(
+    let job_tx = file_transfer::spawn_receive_file_worker(
         key,
         dest_path,
         from,
@@ -781,7 +741,7 @@ async fn accept_file_offer(
     );
     session.active_file_transfers.insert(
         (from, stream_id),
-        file_stream::ActiveFileTransfer {
+        file_transfer::ActiveFileTransfer {
             job_tx,
             last_seen: Instant::now(),
         },
@@ -814,18 +774,14 @@ async fn accept_file_offer(
     Ok(())
 }
 
-/// Applies one incoming server message to `ui_state` and, for live voice
-/// streams, spawns/feeds the per-stream decrypt worker. Returns an action
-/// the caller must also carry out over the network - currently only used
-/// so that the very first channel list triggers an immediate join of the
-/// first (auto-selected) tab, matching the spec: "the first tab is
-/// selected" implies joined, not just displayed. Later tab switches join
-/// via the `[`/`]` dwell timer instead (see `UiState::tick_dwell`).
-///
-/// Async (and given `wr`) because two `rsa_per_msg` side effects need to
-/// write to the network right here: our own per-peer rotation after
-/// receiving a text message (§11.3), and validating+flushing a peer's
-/// `KeyRotated` (§11.4/§11.5, `handle_key_rotated`).
+/// Applies one incoming server message to `ui_state`. Returns an action
+/// the caller must carry out over the network - only used so the very
+/// first channel list triggers an immediate join of the auto-selected
+/// first tab ("selected" implies joined); later tab switches join via the
+/// dwell timer (`UiState::tick_dwell`). Async (and given `wr`) because
+/// two `rsa_per_msg` side effects write to the network right here: our
+/// own rotation after receiving a text (§11.3), and validating+flushing a
+/// peer's `KeyRotated` (§11.4/§11.5).
 async fn handle_server_message(
     msg: ServerMessage,
     ui_state: &mut UiState,
@@ -883,24 +839,15 @@ async fn handle_server_message(
                 if session.own_key_mode == KeyMode::PerMessage {
                     send_resume_rotation_if_available(session, wr, user.id, &user.name).await?;
                 }
-                // Start punching a direct link to this peer the moment we
-                // know they exist, rather than waiting for the first
-                // send (`docs/PROTOCOL.md` §7.0) - voice is never queued
-                // (§11.6-style partial delivery, `channel::handle_voice_record_start`/
-                // `direct_message::handle_voice_record_start`), so a link
-                // that's still `Requested`/`Punching` at the moment
-                // someone starts recording gets that recipient excluded
-                // outright, not just delayed. Kicking the handshake off
-                // here instead of at first-send gives it the time between
-                // "you learn about a channel-mate" and "you actually
-                // press Space to talk to them" to reach `Active` - on any
-                // reasonable network that's normally well over a second,
-                // where the handshake itself typically completes in low
-                // tens of milliseconds. Harmless to call unconditionally:
-                // `ensure_link` is a no-op if a link already exists, and
-                // any resulting failure is silent here - it only becomes
-                // a visible `LinkFailed` once something is actually
-                // queued against this peer and the link never recovers.
+                // Start punching a direct link the moment we learn this
+                // peer exists rather than at first send (§7.0): voice is
+                // never queued, so a link still `Punching` when someone
+                // starts recording excludes that recipient outright. The
+                // gap between learning about a channel-mate and pressing
+                // Space is normally far longer than the handshake needs.
+                // Harmless unconditionally: `ensure_link` is a no-op on an
+                // existing link, and failure stays silent until something
+                // is actually queued against this peer.
                 session.peer_link.ensure_link(wr, user.id).await;
             }
             ui_state.on_user_joined(&channel, user);
@@ -1035,7 +982,7 @@ fn handle_p2p_event(event: P2pEvent, ui_state: &mut UiState, session: &mut Sessi
             if let Some(target) = session.own_file_targets.remove(&stream_id) {
                 let me = ui_state.own_id.unwrap_or(UserId(0));
                 ui_state.set_file_progress(me, stream_id, 0);
-                file_stream::spawn_send_file_worker(
+                file_transfer::spawn_send_file_worker(
                     target.path,
                     target.key,
                     target.to,
@@ -1056,7 +1003,7 @@ fn handle_p2p_event(event: P2pEvent, ui_state: &mut UiState, session: &mut Sessi
             seq,
             blocks,
         } => {
-            file_stream::forward_chunk(
+            file_transfer::forward_chunk(
                 &mut session.active_file_transfers,
                 from,
                 stream_id,
@@ -1065,7 +1012,7 @@ fn handle_p2p_event(event: P2pEvent, ui_state: &mut UiState, session: &mut Sessi
             );
         }
         P2pEvent::FileEnd { from, stream_id } => {
-            file_stream::end_incoming_transfer(&mut session.active_file_transfers, from, stream_id);
+            file_transfer::end_incoming_transfer(&mut session.active_file_transfers, from, stream_id);
         }
         P2pEvent::LinkFailed { peer, reason } => {
             let name = name_of(ui_state, peer);
@@ -1080,50 +1027,31 @@ fn handle_p2p_event(event: P2pEvent, ui_state: &mut UiState, session: &mut Sessi
 }
 
 /// Checks a newly-learned peer's announced identity against the local
-/// pinning store (`docs/PROTOCOL.md` §12), and opens a blocking Accept/
-/// Reject review if their nickname was previously pinned to a key this
-/// connection hasn't yet proven itself a continuation of. `KeyMode::None`
-/// is skipped - its key is freshly autogenerated every session by design
-/// with no continuity mechanism at all (§12.2), so there's nothing to check
-/// it against, ever.
+/// pinning store (§12), opening a blocking Accept/Reject review if their
+/// nickname was previously pinned to a key this connection hasn't proven
+/// itself a continuation of. `KeyMode::None` is skipped - no continuity
+/// mechanism by design (§12.2). Two different checks, branched by
+/// `key_mode`:
 ///
-/// Two genuinely different checks live here, branched by `key_mode`:
+/// - `Rsa`/`Password`: their key is stable by construction, so a byte
+///   comparison against the pin is definitive (`StaticMismatch` arm).
+/// - `PerMessage`: the bootstrap key is fresh every connect and never
+///   itself compared - but a nickname with a §12.6 continuity pin is
+///   gated the instant it's seen again, *before* any resume or rotation
+///   attempt. `handle_key_rotated`'s `Live` check only proves
+///   self-consistency with this connection's own announced key (true of
+///   anyone the first time a fresh `UserId` rotates), so silently
+///   trusting would let a peer who never *tries* to prove continuity
+///   sail through. Only a genuinely verified `Resumed` anchor clears the
+///   gate silently.
 ///
-/// - `Rsa`/`Password`: their key is stable for the whole session by
-///   construction (loaded from a file, or re-derived from a password), so a
-///   straight byte comparison against the pin is definitive on its own -
-///   see the `StaticMismatch` arm below.
-/// - `PerMessage`: the bootstrap `public_key_der` here (`UserInfo`,
-///   `docs/PROTOCOL.md` §3, §11.2) is freshly autogenerated every connect
-///   and is *never* itself compared - but if this nickname already has a
-///   continuity key pinned from a previous session (§12.6), silently
-///   trusting whoever just showed up under it would defeat the entire
-///   point of §12.6: `handle_key_rotated`'s `Live` check only proves a
-///   rotation is self-consistent with *this connection's own* announced
-///   key, which is trivially true for anyone at all, honest or not,
-///   the very first time a fresh `UserId` rotates - it was never a
-///   cross-session identity check to begin with. So a previously-pinned
-///   nickname is gated the instant it's seen again, before any resume or
-///   rotation attempt - closing the gap where a peer that simply never
-///   *tries* to prove continuity (an impersonator who doesn't bother, or a
-///   legitimate user who lost `own_next_keys`) would otherwise sail
-///   through unchecked. `handle_key_rotated` is what can still clear this
-///   silently, but only via a genuinely verified `Resumed` anchor; a merely
-///   self-consistent `Live` rotation leaves it gated (see there).
-///
-/// Deliberately does **not** call `IdStore::check_and_pin` on a mismatch
-/// the way it used to: that method always re-pins in memory as a side
-/// effect, which would make the new key immediately "trusted" for next
-/// time regardless of what the user decides here - a genuine `Reject` must
-/// leave the previously-pinned key completely untouched, on disk and in
-/// memory, until `AcceptIdentity` explicitly re-pins it
-/// (`session::handle_ui_action`). `IdStore::get` reads without mutating,
-/// so the comparison here is done by hand instead.
-///
-/// A malformed `public_key_der` (should not happen from this app's own
-/// client, but nothing stops a modified/hostile one from sending garbage)
-/// is silently skipped rather than treated as an error - this check is a
-/// local safety net, not a protocol validation step.
+/// Deliberately does **not** use `IdStore::check_and_pin` on a mismatch:
+/// that always re-pins as a side effect, which would trust the new key
+/// for next time regardless of what the user decides - a `Reject` must
+/// leave the old pin untouched until `AcceptIdentity` explicitly re-pins.
+/// `IdStore::get` reads without mutating, so the comparison is by hand.
+/// A malformed `public_key_der` is silently skipped - this is a local
+/// safety net, not protocol validation.
 fn check_identity(session: &mut SessionState, ui_state: &mut UiState, user: &UserInfo) {
     // `public_key_der` holds different bytes depending on scheme (an RSA
     // SPKI DER blob for every mode except `PqHybrid`, a bincode-encoded
@@ -1224,18 +1152,13 @@ fn short_fingerprint(fp: &str) -> &str {
     fp.get(..16).unwrap_or(fp)
 }
 
-/// The sending half of `rsa_per_msg` continuity (`docs/PROTOCOL.md` §12.6):
-/// if this client has a persisted continuity private key for `nickname`
-/// (from a previous session's rotation with them), proves "it's still me"
-/// to their brand-new `UserId` right away - before any application message
-/// is exchanged - by re-asserting that same key, self-signed and bound to
-/// `peer`. A no-op if nothing is persisted for `nickname` yet (first-ever
-/// contact, or this client's own `own_next_keys` store is empty).
-///
-/// Deliberately re-announces the *same* key rather than generating a fresh
-/// one: no RSA-4096 keygen needed here (`crypto::sign` alone is fast), and
-/// ordinary per-message rotation (§11.3) picks up again from this point
-/// exactly as it always has, on the next real message with this peer.
+/// The sending half of `rsa_per_msg` continuity (§12.6): with a persisted
+/// continuity key for `nickname`, proves "it's still me" to their
+/// brand-new `UserId` right away by re-asserting that same key,
+/// self-signed and bound to `peer`; a no-op if nothing is persisted yet.
+/// Deliberately the *same* key rather than a fresh one: no keygen needed
+/// (`crypto::sign` is fast), and ordinary rotation (§11.3) picks up again
+/// on the next real message.
 async fn send_resume_rotation_if_available(
     session: &mut SessionState,
     wr: &mut (impl AsyncWrite + Unpin),
@@ -1283,16 +1206,13 @@ async fn send_resume_rotation_if_available(
     Ok(())
 }
 
-/// Persists this client's current per-peer private key for `peer` (looked
-/// up in `rekey::OwnKeys`, already installed by whatever just rotated -
-/// either an ordinary in-session rotation or `send_resume_rotation_if_available`
-/// above) into `own_next_keys`, keyed by `nickname` - so the *next*
-/// reconnect has something fresh to resume from. A no-op if this session's
-/// own `key_mode` isn't `PerMessage` (`session.own_next_keys` is `None`).
-/// Called after *every* rotation, not just at reconnect: crash-safety over
-/// write-frequency - if the process dies before the next one, the resume
-/// on the following reconnect simply won't verify (falls back to an
-/// ordinary first-sighting-shaped case), never a false alarm.
+/// Persists this client's current per-peer private key for `peer` into
+/// `own_next_keys`, keyed by `nickname`, so the *next* reconnect has
+/// something fresh to resume from. A no-op unless this session is
+/// `PerMessage`. Called after *every* rotation - crash-safety over
+/// write-frequency: if the process dies first, the next resume simply
+/// won't verify (an ordinary first-sighting-shaped case), never a false
+/// alarm.
 fn persist_own_continuity_key(session: &mut SessionState, nickname: &str, peer: UserId) {
     let Some(own_next_keys) = session.own_next_keys.as_mut() else {
         return;
@@ -1310,25 +1230,13 @@ fn persist_own_continuity_key(session: &mut SessionState, nickname: &str, peer: 
     }
 }
 
-/// Requests that our own per-peer key for `peer` be rotated, but only when
-/// this session's own `key_mode` is `PerMessage` - a no-op otherwise, so
-/// callers can call this unconditionally after any send/receive involving
-/// `peer` (PROTOCOL.md §11.3) without checking the mode themselves.
-///
-/// Does *not* do the rotation itself: it just hands `peer` to
-/// `spawn_rotation_worker`'s dedicated thread and returns immediately. The
-/// actual RSA-4096 keygen (commonly 100ms to low seconds) happens there,
-/// off this task, so this call never blocks `run_connected_session`'s
-/// `tokio::select!` loop - unlike the previous synchronous-keygen-inline
-/// version, which stalled UI redraw and all other network processing for
-/// however long keygen took, once per peer, right on this event-loop task.
-///
-/// Increments `session.rotation_pending` before handing the request off
-/// (the worker decrements it once done), which is what drives the
-/// top-right spinner (`UiState::tick_spinner`) - it's incremented here
-/// rather than by the worker on dequeue so the spinner reflects the whole
-/// queued-plus-in-flight batch, not just whichever single request happens
-/// to be actively generating at a given instant.
+/// Requests rotation of our own per-peer key for `peer` - a no-op unless
+/// this session is `PerMessage`, so callers can invoke it unconditionally
+/// after any send/receive (§11.3). Does *not* rotate itself: it hands
+/// `peer` to `spawn_rotation_worker` and returns immediately, keeping the
+/// RSA-4096 keygen off this event-loop task. Increments
+/// `session.rotation_pending` here rather than in the worker on dequeue,
+/// so the spinner reflects the whole queued-plus-in-flight batch.
 pub(crate) fn request_rotation_if_per_message(session: &SessionState, peer: UserId) {
     if session.own_key_mode == KeyMode::PerMessage {
         session.rotation_pending.fetch_add(1, Ordering::SeqCst);
@@ -1341,47 +1249,31 @@ pub(crate) fn request_rotation_if_per_message(session: &SessionState, peer: User
     }
 }
 
-/// Validates an incoming `KeyRotated` against the public key we currently
-/// trust for `peer` (§11.4) - and, as a fallback when that fails, against
-/// the peer's *persisted cross-session continuity key*, if we have one
-/// pinned in `id_store` for their nickname (§12.6). The fallback is what
-/// makes a legitimate reconnect (a brand-new `UserId`, so the live check
-/// can never pass) verifiable at all.
+/// Validates an incoming `KeyRotated` against the key we currently trust
+/// for `peer` (§11.4), falling back to their persisted cross-session
+/// continuity pin in `id_store` (§12.6) - the fallback is what makes a
+/// legitimate reconnect (brand-new `UserId`, so the live check can never
+/// pass) verifiable at all.
 ///
 /// A verified `Resumed` is the *only* thing that silently installs a key
-/// for a nickname that has a continuity pin: it's an actual signature
-/// proving continuity with the key we already trust for that name. `Live`
-/// alone only proves the rotation is self-consistent with whatever this
-/// same connection announced a moment ago - true of any rotation from
-/// anyone, honest or not, the first time a fresh `UserId` rotates, so on
-/// its own it is *not* evidence of cross-session identity. `check_identity`
-/// already gates a previously-pinned nickname the instant it's seen again
-/// (§12.6.3), before any of this runs; this function's job for such a peer
-/// is only ever to *clear* that gate (via a genuine `Resumed`) or leave it
-/// exactly as it was (`Live` alone, or an outright `Failed`), never to open
-/// it - `check_identity` already did, or there was nothing pinned to begin
-/// with and none of this applies.
+/// for a pinned nickname - an actual signature proving continuity. `Live`
+/// alone only proves self-consistency with what this same connection
+/// announced (true of anyone the first time a fresh `UserId` rotates), so
+/// it is not cross-session evidence. For a gated peer this function only
+/// ever *clears* the gate (genuine `Resumed`) or leaves it as-is - never
+/// opens it; `check_identity` already did.
 ///
-/// On `Resumed`, installs the new key everywhere it's cached
-/// (`UiState::on_user_key_rotated`), silently keeps `id_store`'s continuity
-/// pin for this nickname fresh for next time, flushes any messages that
-/// were queued waiting for it (one at a time in FIFO order, each followed
-/// by our own rotation for `peer` if we're `PerMessage` too - §11.3), and -
-/// if this peer had an outstanding review from `check_identity`'s gate -
-/// silently resolves it exactly like an `Accept` would, reveals whatever
-/// of theirs was held meanwhile. `Live` for a peer with *no* continuity pin
-/// (the ordinary case: either a first-ever nickname, or one already fully
-/// trusted this session) gets the identical treatment, since there was
-/// nothing to prove in the first place. `Live` for a peer who *does* have a
-/// pin - i.e. one `check_identity` already gated - installs nothing and
-/// refreshes the open review to point at this latest attempt instead,
-/// still `Pending`. `Failed` installs nothing either way; if there's a
-/// continuity pin (whether or not `check_identity` already opened a review
-/// for it) it opens or refreshes one, worded for an explicit failed proof
-/// rather than "hasn't tried yet". An unknown sender, or a signature that
-/// verifies against neither anchor with nothing pinned to begin with, is
-/// silently dropped - never treated as suspicious just because there was
-/// nothing to check (docs/PROTOCOL.md §12.6.3).
+/// On `Resumed`: installs the key everywhere it's cached, refreshes the
+/// continuity pin, flushes queued messages FIFO (each followed by our own
+/// rotation if we're `PerMessage` - §11.3), and silently resolves any
+/// outstanding review like an `Accept`, revealing held messages. `Live`
+/// with *no* pin (the ordinary case) gets identical treatment - nothing
+/// to prove. `Live` with a pin installs nothing and refreshes the open
+/// review to point at this latest attempt. `Failed` installs nothing; if
+/// there's a pin it opens/refreshes a review worded for an explicit
+/// failed proof. An unknown sender, or a no-anchor signature with nothing
+/// pinned, is silently dropped - never suspicious just because there was
+/// nothing to check (§12.6.3).
 async fn handle_key_rotated(
     ui_state: &mut UiState,
     you: UserId,
@@ -1615,35 +1507,35 @@ fn handle_incoming_file_offer(
 }
 
 /// Dispatches one file-transfer progress/completion/failure event
-/// (`file_stream::FileEvent`) into the matching log row - see
+/// (`file_transfer::FileEvent`) into the matching log row - see
 /// `UiState::update_file_entry` for how a row is found from just
 /// `(from, stream_id)`.
 fn handle_file_event(
     ui_state: &mut UiState,
     session: &mut SessionState,
-    event: file_stream::FileEvent,
+    event: file_transfer::FileEvent,
 ) {
     let me = ui_state.own_id.unwrap_or(UserId(0));
     match event {
-        file_stream::FileEvent::SendProgress { stream_id, bytes } => {
+        file_transfer::FileEvent::SendProgress { stream_id, bytes } => {
             ui_state.set_file_progress(me, stream_id, bytes)
         }
-        file_stream::FileEvent::SendDone { stream_id } => {
+        file_transfer::FileEvent::SendDone { stream_id } => {
             ui_state.set_file_completed(me, stream_id)
         }
-        file_stream::FileEvent::SendFailed { stream_id } => ui_state.set_file_failed(me, stream_id),
-        file_stream::FileEvent::ReceiveProgress {
+        file_transfer::FileEvent::SendFailed { stream_id } => ui_state.set_file_failed(me, stream_id),
+        file_transfer::FileEvent::ReceiveProgress {
             from,
             stream_id,
             bytes,
         } => ui_state.set_file_progress(from, stream_id, bytes),
-        file_stream::FileEvent::ReceiveDone {
+        file_transfer::FileEvent::ReceiveDone {
             from, stream_id, ..
         } => {
             session.active_file_transfers.remove(&(from, stream_id));
             ui_state.set_file_completed(from, stream_id);
         }
-        file_stream::FileEvent::ReceiveFailed { from, stream_id } => {
+        file_transfer::FileEvent::ReceiveFailed { from, stream_id } => {
             session.active_file_transfers.remove(&(from, stream_id));
             ui_state.set_file_failed(from, stream_id);
         }

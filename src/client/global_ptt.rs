@@ -1,32 +1,21 @@
-//! Global (works even while `aloo` isn't the focused window) push-to-talk,
-//! bound by default to Ctrl+Alt+P and configurable via `~/.aloo/settings`
-//! (`crate::settings`). Reuses the exact same "start/stop a voice stream to
-//! whatever's currently active" path Space already drives locally
-//! (`ui::UiState::global_record_start`/`global_record_stop`,
-//! `session::run_connected_session`'s `hotkey_rx` select arm) - this module
-//! is only responsible for turning an OS-level key combo into
-//! `Pressed`/`Released` events on a channel.
+//! Global (unfocused-window) push-to-talk, default Ctrl+Alt+P,
+//! configurable via `~/.aloo/settings`. Reuses the same start/stop path
+//! Space drives locally - this module only turns an OS-level key combo
+//! into `Pressed`/`Released` events on a channel.
 //!
-//! Platform reality, verified against `global-hotkey` 0.8.0's own source
-//! (not just its docs):
+//! Platform reality, verified against `global-hotkey` 0.8.0's own source:
 //!
-//! - **Windows**: `RegisterHotKey` delivers `WM_HOTKEY` only to the message
-//!   queue of the thread that owns the hidden window `GlobalHotKeyManager`
-//!   creates, so *we* have to pump that queue - nothing in the crate does
-//!   it for us. See `windows_pump::pump_forever`.
-//! - **Linux**: X11 only. The crate's X11 backend owns its own connection
-//!   and event thread internally - `spawn` here just has to keep the
-//!   `GlobalHotKeyManager` alive (its `Drop` unregisters everything).
-//!   Wayland has no equivalent at all; `is_wayland` lets the caller skip
-//!   registration and warn once instead of silently failing later.
-//! - **macOS**: uses Carbon `RegisterEventHotKey`, which - unlike the
-//!   crate's separate CGEventTap-based *media-key* path - needs no
-//!   Accessibility/Input Monitoring permission. It does need the process's
-//!   real main thread's `CFRunLoop` to be running, which conflicts with
-//!   this app's normal `tokio` main loop - see `main.rs` for how that's
-//!   reconciled. This module only exposes the pieces `main.rs` needs
-//!   (`register_on_current_thread`, `pump_main_thread`); it does not spawn
-//!   anything itself on macOS.
+//! - **Windows**: `WM_HOTKEY` lands only on the message queue of the
+//!   thread owning the crate's hidden window, and nothing in the crate
+//!   pumps it - see `windows_pump::pump_forever`.
+//! - **Linux**: X11 only; the crate's backend runs its own event thread,
+//!   so `spawn` just keeps the `GlobalHotKeyManager` alive. Wayland has no
+//!   equivalent at all - `is_wayland` lets the caller skip registration
+//!   and warn once instead of silently failing later.
+//! - **macOS**: Carbon `RegisterEventHotKey` (no Accessibility permission
+//!   needed, unlike the crate's media-key path), but it requires the real
+//!   main thread's `CFRunLoop` - see `main.rs` for how that's reconciled;
+//!   this module spawns nothing itself on macOS.
 
 use std::env;
 
@@ -84,13 +73,11 @@ pub fn resolve_hotkey(configured: &str) -> HotKey {
     }
 }
 
-/// The hotkey to register for global push-to-talk, or `None` if it
-/// shouldn't be registered at all this run - either the user turned it off
-/// (`global_ptt_enabled = false`) or (Linux only) this session is running
-/// under Wayland, which `global_hotkey` has no backend for at all
-/// (`is_wayland`). Printed once at startup in the Wayland case per the
-/// user's own choice: warn, don't retry, don't crash - Space still works
-/// normally while the app is focused either way.
+/// The hotkey to register, or `None` if registration should be skipped -
+/// the user turned it off, or (Linux) the session runs under Wayland,
+/// which `global_hotkey` has no backend for. The Wayland case warns once
+/// at startup: don't retry, don't crash - Space still works while the app
+/// is focused.
 pub fn hotkey_to_register(settings: &crate::settings::Settings) -> Option<HotKey> {
     if !settings.global_ptt_enabled {
         return None;
@@ -120,17 +107,12 @@ fn forward_events(tx: UnboundedSender<GlobalPttEvent>) {
     }));
 }
 
-/// Registers `hotkey` and hands back the channel it'll deliver
-/// `Pressed`/`Released` on, spawning one dedicated background thread that
-/// owns the `GlobalHotKeyManager` for the rest of the process's life.
-/// `None` if registration failed (e.g. the combo is already grabbed by
-/// another application) - the caller treats that exactly like the feature
-/// being disabled.
-///
-/// Not used on macOS: there, `GlobalHotKeyManager` must live on the
-/// process's actual main thread (see module docs), which `main.rs`
-/// arranges directly via `register_on_current_thread` instead of through a
-/// spawned thread.
+/// Registers `hotkey` and hands back the channel it delivers
+/// `Pressed`/`Released` on, spawning one background thread that owns the
+/// `GlobalHotKeyManager` for the process's life. `None` if registration
+/// failed (combo already grabbed) - treated like the feature being
+/// disabled. Not used on macOS, where the manager must live on the real
+/// main thread (`register_on_current_thread`).
 #[cfg(not(target_os = "macos"))]
 pub fn spawn(hotkey: HotKey) -> Option<UnboundedReceiver<GlobalPttEvent>> {
     let (tx, rx) = mpsc::unbounded_channel();

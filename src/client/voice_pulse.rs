@@ -1,31 +1,18 @@
-//! `Recorder`/`spawn_mixer` for musl targets, talking to PulseAudio (or
-//! PipeWire's PulseAudio-compatible server) directly via `libpulse`'s own
-//! protocol, instead of `crate::client::voice`'s default `cpal`-on-ALSA backend.
+//! `Recorder`/`spawn_mixer` for musl targets, talking to
+//! PulseAudio/PipeWire directly via `libpulse` instead of
+//! `crate::client::voice`'s `cpal`-on-ALSA backend.
 //!
-//! Why: on Linux, `cpal`'s ALSA backend only reaches a running
-//! PulseAudio/PipeWire server through an ALSA PCM plugin
-//! (`libasound_module_pcm_pulse.so`) that ALSA loads with `dlopen()` at
-//! runtime - see `crate::client::voice`'s `prefer_pulse` doc comment for why that
-//! matters (exclusive-device-access without it). A fully static musl
-//! binary (`Cross.toml`'s `x86_64-unknown-linux-musl`/
-//! `aarch64-unknown-linux-musl` targets, built `-static-pie` for
-//! single-file portability) can never `dlopen()` anything - musl's libc
-//! hard-codes `dlopen` to fail with "Dynamic loading not supported" in a
-//! static link, unconditionally. That's not fixable by installing
-//! alsa-plugins on the target machine or adjusting `alsa.conf` search
-//! paths; it means a static ALSA-based binary cannot reach
-//! PulseAudio/PipeWire's ALSA shim at all, on any distro, ever - and most
-//! desktop Linux distros route their *default* ALSA device through
-//! exactly that shim, so this isn't limited to whatever explicitly asks
-//! for a "pulse" device.
-//!
-//! Statically linking `libpulse`/`libpulse-simple` themselves (built from
-//! source for musl in `Cross.toml`) sidesteps the problem entirely: no
-//! plugin is `dlopen()`'d at runtime, because the PulseAudio protocol
-//! client code is simply part of the binary. This module is the only
-//! thing that talks to those crates; every pure PCM/mixing helper it uses
-//! (`resample`, `mix_output`, `MixSource`, `apply_mixer_cmd`, ...) lives in
-//! `crate::client::voice` and is shared verbatim with the cpal backend.
+//! Why: cpal's ALSA backend only reaches PulseAudio/PipeWire through an
+//! ALSA plugin that ALSA `dlopen()`s at runtime, and a fully static musl
+//! binary can never `dlopen()` anything (musl hard-codes it to fail in a
+//! static link - not fixable by installing alsa-plugins on the target).
+//! Most distros route the *default* ALSA device through exactly that
+//! shim, so a static ALSA binary can't do audio at all. Statically
+//! linking `libpulse`/`libpulse-simple` themselves (built for musl in
+//! `Cross.toml`) sidesteps the problem: the protocol client is simply
+//! part of the binary. Every pure PCM/mixing helper (`resample`,
+//! `mix_output`, `apply_mixer_cmd`, ...) is shared verbatim with the cpal
+//! backend via `crate::client::voice`.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -130,20 +117,14 @@ impl Drop for Recorder {
     }
 }
 
-/// Spawns the one persistent audio-output thread for the process, the same
-/// contract as `crate::client::voice`'s cpal-backed `spawn_mixer` (re-exported
-/// under that name on musl - see `voice.rs`'s doc comment on its own
-/// `spawn_mixer` for why one persistent stream rather than one per
-/// message).
-///
-/// Structurally different from the cpal version because of *how* audio
-/// reaches the OS: cpal is callback-driven (it calls back into
-/// `mix_output` whenever its output device wants more data), while
-/// `pa_simple`'s blocking `write` is pull-driven from a thread this
-/// function owns (it blocks until the server has buffer space, which
-/// paces this loop the same way cpal's callback timing does). Both share
-/// the exact same command handling and mixing logic
-/// (`crate::client::voice::apply_mixer_cmd`, `crate::client::voice::mix_output`).
+/// Spawns the one persistent audio-output thread for the process - same
+/// contract as `crate::client::voice`'s cpal-backed `spawn_mixer` (see its
+/// doc for why one persistent stream). Structurally different because of
+/// how audio reaches the OS: cpal is callback-driven, while `pa_simple`'s
+/// blocking `write` is pull-driven from a thread this function owns (the
+/// block-until-buffer-space paces the loop like cpal's callback timing).
+/// Command handling and mixing logic are shared
+/// (`voice::apply_mixer_cmd`/`mix_output`).
 pub fn spawn_mixer(
     on_stream_error: impl Fn(String) + Send + Clone + 'static,
     on_finished: impl Fn(u64) + Send + Clone + 'static,

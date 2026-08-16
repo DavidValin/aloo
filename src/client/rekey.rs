@@ -1,22 +1,15 @@
-//! `rsa_per_msg` (`KeyMode::PerMessage`, PROTOCOL.md §11): per-peer RSA key
-//! rotation. Pure state/logic, no I/O - the caller (`crate::client::session`) is
-//! responsible for actually writing `ClientMessage::RotateKey` to the wire
-//! and for sourcing the "currently trusted" public key for a peer (which
-//! lives in `ui::UiState`'s `known_users`/`channel.members`, kept in sync
-//! via `ui::UiState::on_user_key_rotated`).
+//! `rsa_per_msg` (`KeyMode::PerMessage`, PROTOCOL.md §11): per-peer RSA
+//! key rotation. Pure state/logic, no I/O - `crate::client::session` writes
+//! `ClientMessage::RotateKey` to the wire and sources the currently
+//! trusted public key per peer. Two independent pieces of state, since a
+//! client can be a `PerMessage` sender while also receiving from
+//! `PerMessage` peers regardless of its own mode:
 //!
-//! Two independent pieces of state, since a client can be a `PerMessage`
-//! sender to some peers while also *receiving from* `PerMessage` peers
-//! regardless of its own mode:
-//!
-//! - [`OwnKeys`]: only used when *this* client's own `key_mode` is
-//!   `PerMessage`. Tracks one rotating keypair per peer relationship, plus
-//!   enough retired keys to decrypt a small batch of late-arriving
+//! - [`OwnKeys`]: only when *this* client is `PerMessage` - one rotating
+//!   keypair per peer, plus enough retired keys to decrypt late-arriving
 //!   messages (§11.7).
-//! - [`RemoteKeys`]: tracks, for any peer whose `key_mode` is
-//!   `PerMessage` (regardless of this client's own mode), whether the key
-//!   currently on file for them is fresh (unused) or stale, and queues
-//!   outgoing messages while stale (§11.5).
+//! - [`RemoteKeys`]: for any `PerMessage` peer - whether their key on file
+//!   is fresh or stale, queueing outgoing messages while stale (§11.5).
 
 use std::collections::{HashMap, VecDeque};
 
@@ -84,16 +77,13 @@ pub fn verify_and_parse_rotation(
     crypto::public_key_from_der(new_public_key_der).ok()
 }
 
-/// The result of checking an incoming `KeyRotated` against the two anchors
-/// a receiver might have for its sender: whatever key is currently trusted
-/// *within this live connection* (`live_trusted` - the ordinary, already-
-/// established in-session chain, §11.3/§11.4), and, independently, a
-/// cross-session continuity key persisted for that sender's *nickname*
-/// (`continuity_trusted` - see `docs/PROTOCOL.md` §12.6, `own_next_keys`).
-/// `UserId` resets on every reconnect, so a legitimate peer reconnecting
-/// necessarily fails the `live_trusted` check (there is no live state for
-/// their brand-new connection yet) - `continuity_trusted` is what lets that
-/// specific, expected case be told apart from an actual forged claim.
+/// The result of checking an incoming `KeyRotated` against the receiver's
+/// two anchors: the key trusted *within this live connection*
+/// (`live_trusted`, §11.3/§11.4) and the cross-session continuity key
+/// pinned for the sender's *nickname* (`continuity_trusted`, §12.6).
+/// `UserId` resets on reconnect, so a legitimate reconnecting peer
+/// necessarily fails `live_trusted` - `continuity_trusted` is what tells
+/// that expected case apart from a forged claim.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResumeVerification {
     /// Verified against the ordinary in-session key - ranges over every
@@ -139,14 +129,13 @@ pub fn verify_with_fallback(
     ResumeVerification::Failed
 }
 
-/// The CPU-heavy half of a rotation: generates a fresh `RSA_PER_MSG_KEY_BITS`
-/// keypair and signs its public half with `old_private` (the key it's
-/// about to replace for `peer`). Deliberately takes no `OwnKeys` access at
-/// all and returns everything the caller needs (including the new private
-/// key) so it can run on a background thread without holding any lock for
-/// the expensive part - only the subsequent `OwnKeys::install_rotated_key`
-/// call needs synchronized access, and that's cheap. See
-/// `session.rs::spawn_rotation_worker`.
+/// The CPU-heavy half of a rotation: generates a fresh
+/// `RSA_PER_MSG_KEY_BITS` keypair and signs its public half with
+/// `old_private`. Deliberately takes no `OwnKeys` access and returns
+/// everything the caller needs, so it can run on a background thread
+/// without holding any lock - only the cheap
+/// `OwnKeys::install_rotated_key` call afterward needs synchronization
+/// (`session.rs::spawn_rotation_worker`).
 pub fn generate_and_sign_rotation(
     old_private: &RsaPrivateKey,
     peer: UserId,
@@ -207,24 +196,15 @@ impl OwnKeys {
     }
 
     /// Generates a fresh keypair for `peer`, signs it with whichever key
-    /// was active for `peer` before this call (the per-peer key if one
-    /// already exists, otherwise the bootstrap key), and returns
-    /// `(new_public_key_der, signature)` for the caller to wrap in a
-    /// `ClientMessage::RotateKey` - see `rotate_and_build_message`, the
-    /// usual entry point.
-    ///
-    /// This does the RSA-4096 keygen (`generate_and_sign_rotation`)
-    /// synchronously, in line - fine for tests and other short-lived
-    /// callers, but `session.rs` does **not** call this directly on its
-    /// event-loop task: keygen at that size commonly takes on the order of
-    /// 100ms-1s+, and running it inline would stall UI redraw and network
-    /// processing for that long (PROTOCOL.md §11.6 already documents this
-    /// cost as the reason voice is exempted from per-chunk rotation; the
-    /// same cost applies to the per-message rotation this method performs,
-    /// just less frequently). Instead, `session.rs` runs
-    /// `generate_and_sign_rotation` on a dedicated background thread and
-    /// only calls `install_rotated_key` - a fast, lock-brief operation -
-    /// back on the shared `OwnKeys` (see `spawn_rotation_worker`).
+    /// was active before this call (per-peer key, else bootstrap), and
+    /// returns `(new_public_key_der, signature)` to wrap in a
+    /// `ClientMessage::RotateKey` (`rotate_and_build_message` is the usual
+    /// entry point). Runs RSA-4096 keygen synchronously - fine for tests,
+    /// but `session.rs` never calls this on its event-loop task: keygen
+    /// takes 100ms-1s+ and would stall redraw and network processing, so
+    /// it runs `generate_and_sign_rotation` on a background thread and
+    /// only the cheap `install_rotated_key` touches the shared `OwnKeys`
+    /// (`spawn_rotation_worker`).
     pub fn rotate_for_peer(&mut self, peer: UserId) -> crypto::Result<(Vec<u8>, Vec<u8>)> {
         let old_private = self.current_private_for(peer);
         let (new_der, signature, new_private) = generate_and_sign_rotation(&old_private, peer)?;
@@ -294,26 +274,17 @@ impl OwnKeys {
         }
     }
 
-    /// Every private key worth trying to decrypt an incoming message from
-    /// `peer` with, in the same priority order `decrypt_from` already uses
-    /// (current, then retained newest-first, then bootstrap) - cheap to
-    /// clone (no RSA computation, just moving key material already held in
-    /// memory).
+    /// Every private key worth trying against an incoming message from
+    /// `peer`, in `decrypt_from`'s priority order (current, retained
+    /// newest-first, bootstrap) - cheap to clone, no RSA computation.
     ///
-    /// Live voice (`voice_stream::start_incoming_stream`) snapshots a
-    /// single key once at stream `*Start` rather than retrying per chunk
-    /// the way `decrypt_from` can for text (PROTOCOL.md §11.6 keeps a
-    /// whole stream on one key). `current_private_for` alone isn't safe for
-    /// that snapshot: `session::send_resume_rotation_if_available`
-    /// installs a resumed key into `OwnKeys` optimistically, before the
-    /// peer has had any chance to accept or reject it (PROTOCOL.md
-    /// §12.6.2) - if they don't, the peer keeps encrypting with whatever it
-    /// still trusts (typically our bootstrap key), while `current_private_for`
-    /// would keep pointing at the rejected resumed key, silently failing
-    /// every chunk of the stream with no recourse. This method hands the
-    /// caller the whole candidate list up front so a stream's decrypt
-    /// worker can try each in turn per chunk, exactly mirroring what
-    /// `decrypt_from` already does for text.
+    /// Exists because a stream's decrypt worker can't rely on
+    /// `current_private_for` alone: a §12.6.2 resumed key is installed
+    /// optimistically before the peer accepts it, and a peer that rejects
+    /// it keeps encrypting with what it still trusts (typically our
+    /// bootstrap key) - snapshotting only the current key would then
+    /// silently fail every chunk. Handing over the whole list lets the
+    /// worker try each per chunk, mirroring `decrypt_from` for text.
     pub fn candidate_privates_for(&self, peer: UserId) -> Vec<RsaPrivateKey> {
         let mut keys = Vec::new();
         if let Some(state) = self.per_peer.get(&peer) {

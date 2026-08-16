@@ -1,8 +1,8 @@
 //! A directory-listing model with browser-style back/forward history -
 //! the filesystem half of the in-TUI file browser. Shared by the connect
 //! popup's key-file picker and `/file`'s send flow
-//! (`tui::ui_connect_popup`, `tui::file_send`); rendering lives with those
-//! popups (`tui::ui_connect_popup::render_file_browser`), this module only
+//! (`tui::ui_connect_popup`, `tui::file_send`); rendering lives in the
+//! shared TUI base (`tui::ui::render_file_browser`), this module only
 //! reads directories and tracks navigation.
 
 use std::io;

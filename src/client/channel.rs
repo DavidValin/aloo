@@ -111,17 +111,13 @@ pub(crate) async fn handle_send_text(
     Ok(())
 }
 
-/// Sends one `FileOffer` per ready recipient (`docs/PROTOCOL.md`'s file
-/// transfer section) - a channel file send is N independent point-to-point
-/// transfers, one per member, each with its own `stream_id` and its own
-/// pending log row (`UiState::log_own_file_offer_channel`), rather than one
-/// broadcast the way voice's channel streams work: accept/reject/progress
-/// is inherently per-recipient here, so each row tracks its own recipient's
-/// decision independently. Readiness is a snapshot-and-exclude, same as
-/// `handle_voice_record_start` below (PROTOCOL.md §11.6): a `rsa_per_msg`
-/// recipient without a fresh key right now is simply left out. Nothing is
-/// read from `path` here - only once each recipient individually accepts
-/// (`session::handle_server_message`'s `FileAccepted` arm).
+/// Sends one `FileOffer` per ready recipient - a channel file send is N
+/// independent point-to-point transfers, each with its own `stream_id` and
+/// log row (accept/reject/progress is inherently per-recipient), never a
+/// broadcast like voice's channel streams. Readiness is snapshot-and-
+/// exclude (PROTOCOL.md §11.6): an unready `rsa_per_msg` recipient is
+/// simply left out. Nothing is read from `path` until a recipient
+/// individually accepts.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_send_file(
     wr: &mut (impl AsyncWrite + Unpin),
@@ -147,17 +143,13 @@ pub(crate) async fn handle_send_file(
         return Ok(());
     };
     for (id, key_mode, der) in ready {
-        let envelope = match key_mode {
-            KeyMode::PqHybrid => session.own_pq_private.as_ref().and_then(|signing| {
-                crate::client::envelope::encrypt_hybrid_envelope_for(
-                    signing,
-                    &der,
-                    &plaintext,
-                    Content::FileOffer,
-                )
-            }),
-            _ => crate::client::envelope::encrypt_for_one(&der, &plaintext, Content::FileOffer),
-        };
+        let envelope = crate::client::envelope::encrypt_envelope_for(
+            session.own_pq_private.as_ref(),
+            key_mode,
+            &der,
+            &plaintext,
+            Content::FileOffer,
+        );
         let Some(envelope) = envelope else { continue };
         let stream_id = session.next_stream_id;
         let Some(key) = voice_stream::resolve_direct_key(session, stream_id, id, key_mode, &der)
@@ -173,7 +165,7 @@ pub(crate) async fn handle_send_file(
         ui_state.log_own_file_offer_channel(&channel, &to_name, stream_id, filename.clone(), size);
         session.own_file_targets.insert(
             stream_id,
-            crate::client::file_stream::OwnFileTarget {
+            crate::client::file_transfer::OwnFileTarget {
                 to: id,
                 path: path.clone(),
                 key,
@@ -267,12 +259,9 @@ fn parse_pq_recipients(recipients: &[Recipient]) -> Vec<(UserId, crypto::pq::PqP
         .collect()
 }
 
-/// Encrypts `plaintext` once per recipient, dispatching by *their*
-/// `KeyMode` - RSA-OAEP (`envelope::encrypt_for_one`, needs nothing of ours)
-/// or the PQ-hybrid scheme (`envelope::encrypt_hybrid_envelope_for`, needs
-/// *our own* signing identity, `session.own_pq_private` - callers must have
-/// already excluded recipients this session can't address, see
-/// `can_address`).
+/// Encrypts `plaintext` once per recipient via
+/// `envelope::encrypt_envelope_for` - callers must have already excluded
+/// recipients this session can't address, see `can_address`.
 fn encrypt_for_each(
     session: &SessionState,
     recipients: &[Recipient],
@@ -282,18 +271,13 @@ fn encrypt_for_each(
     recipients
         .iter()
         .filter_map(|(id, key_mode, pubkey_der)| {
-            let envelope = match key_mode {
-                KeyMode::PqHybrid => {
-                    let signing = session.own_pq_private.as_ref()?;
-                    crate::client::envelope::encrypt_hybrid_envelope_for(
-                        signing,
-                        pubkey_der,
-                        plaintext,
-                        content.clone(),
-                    )?
-                }
-                _ => crate::client::envelope::encrypt_for_one(pubkey_der, plaintext, content.clone())?,
-            };
+            let envelope = crate::client::envelope::encrypt_envelope_for(
+                session.own_pq_private.as_ref(),
+                *key_mode,
+                pubkey_der,
+                plaintext,
+                content.clone(),
+            )?;
             Some((*id, envelope))
         })
         .collect()
@@ -381,10 +365,7 @@ pub(crate) fn on_stream_start(
     );
 }
 
-// Extracted verbatim from the `OwnStreamTarget::Channel` match arm that
-// used to live inline in main.rs's event loop, where these were just
-// locals, not function parameters - same shape of pre-existing exception
-// as `session::run_connected_session`'s.
+// Same pre-existing arity exception as `session::run_connected_session`'s.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn on_own_stream_finished(
     ui_state: &mut UiState,

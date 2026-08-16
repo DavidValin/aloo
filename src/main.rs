@@ -114,15 +114,11 @@ fn run_client_entry(cli: Cli) -> Result<(), BoxError> {
     }
 }
 
-/// macOS-only: Carbon's `RegisterEventHotKey` (what `global_ptt` uses
-/// under the hood) only delivers events via the process's real main
-/// thread's `CFRunLoop` - see `global_ptt`'s module docs. So on this OS
-/// alone, the roles are swapped from every other platform: the actual
-/// `main()` thread stays free to register the hotkey and pump that run
-/// loop, while the entire client (`run_client`, under its own `tokio`
-/// runtime) moves to a spawned thread instead. `run_client` itself is
-/// identical either way - it has no idea which thread produced its
-/// `hotkey_rx`.
+/// macOS-only: Carbon's `RegisterEventHotKey` (what `global_ptt` uses)
+/// only delivers events via the real main thread's `CFRunLoop`, so on
+/// this OS alone the roles are swapped: `main()` stays free to register
+/// the hotkey and pump that run loop while the entire client runs on a
+/// spawned thread. `run_client` itself is identical either way.
 #[cfg(target_os = "macos")]
 fn run_client_macos(cli: Cli, hotkey: Option<global_hotkey::hotkey::HotKey>) -> Result<(), BoxError> {
     use std::sync::Arc;

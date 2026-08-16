@@ -20,14 +20,11 @@ impl CpuMonitor {
         Self { sys: System::new() }
     }
 
-    /// Re-samples CPU usage and returns the new system-wide percentage,
-    /// clamped to `0.0..=100.0` as a defensive bound against whatever the
-    /// underlying OS API might hand back. `sysinfo` needs consecutive
-    /// calls spaced at least `sysinfo::MINIMUM_CPU_UPDATE_INTERVAL` apart
-    /// to report a real number - the very first call after construction
-    /// always reads `0.0`, which happens to double as a harmless initial
-    /// value for `UiState::cpu_usage_pct` (renders green, not misleadingly
-    /// red) until the first real sample lands.
+    /// Re-samples system-wide CPU usage, clamped to `0.0..=100.0` against
+    /// whatever the OS hands back. `sysinfo` needs calls spaced at least
+    /// `MINIMUM_CPU_UPDATE_INTERVAL` apart for a real number - the first
+    /// call always reads `0.0`, a harmless initial value (renders green,
+    /// not misleadingly red) until the first real sample lands.
     pub fn refresh(&mut self) -> f32 {
         self.sys.refresh_cpu_usage();
         self.sys.global_cpu_usage().clamp(0.0, 100.0)

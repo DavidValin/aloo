@@ -1683,10 +1683,9 @@ The store is a small flat file, one line per pinned nickname:
 ```
 
 e.g. `alice\t30820122300d06092a864886f70d01010105000382010f00...\n` - the
-full DER bytes, lowercase-hex-encoded (`idstore`'s own `hex_encode`, the
-same encoding `crypto::fingerprint` already used elsewhere in this app, not
-base64 or raw bytes) so the file stays plain text no matter what the key
-bytes are. Entries are written in sorted-by-nickname order on save so the
+full DER bytes, lowercase-hex-encoded (`crypto::hex_encode`, the same
+encoding `crypto::fingerprint` already uses, not base64 or raw bytes) so
+the file stays plain text no matter what the key bytes are. Entries are written in sorted-by-nickname order on save so the
 file diffs cleanly under version control or manual inspection.
 
 A nickname containing a tab, `\n`, or `\r` is never pinned (silently

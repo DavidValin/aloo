@@ -35,32 +35,21 @@ use tokio::sync::mpsc::UnboundedSender;
 /// bulk/session-key shortcut), high enough to stay intelligible.
 pub const SAMPLE_RATE_HZ: u32 = 16_000;
 
-/// How often a live recording flushes newly-captured samples to the
-/// network as a chunk. Total RSA-encrypt work per second of audio is the
-/// same regardless of this value (it's purely bytes-of-audio /
-/// bytes-per-block); a shorter interval only lowers perceived latency at
-/// the cost of more (smaller) messages, so this is tuned for latency, not
-/// crypto cost - *and*, since chunks now travel the direct peer-to-peer
-/// transport (`docs/PROTOCOL.md` §7.0) as raw UDP datagrams rather than
-/// TCP-framed bytes, for keeping each chunk's encrypted size under
-/// `p2p_proto::SAFE_DATAGRAM_BYTES` too, with a comfortable margin left for
-/// framing overhead rather than cutting it close. 15ms (in the same
-/// real-time-audio framing range RTP/Opus/G.711 conventionally use) is
-/// `SAMPLE_RATE_HZ`'s 32 bytes/ms × 15ms = 480 bytes plaintext, at most 3
-/// OAEP blocks (256 bytes each) at the worst-case 2048-bit key size - 768
-/// bytes ciphertext (see `test/voice_test.rs`'s
-/// `chunk_interval_stays_under_the_p2p_safe_datagram_budget`).
+/// How often a live recording flushes captured samples to the network as
+/// a chunk. Total RSA-encrypt work per second of audio is the same
+/// regardless (bytes-of-audio / bytes-per-block), so this is tuned for
+/// latency and for keeping each chunk's encrypted size under
+/// `p2p_proto::SAFE_DATAGRAM_BYTES` with margin: 15ms (the RTP/Opus
+/// real-time framing range) is 32 bytes/ms × 15ms = 480 bytes plaintext,
+/// at most 3 OAEP blocks (~768 bytes ciphertext) at the worst-case
+/// 2048-bit key size (see `test/voice_test.rs`).
 pub const CHUNK_INTERVAL: Duration = Duration::from_millis(15);
 
 /// Hard cap on one voice message's length, in seconds - a recording stops
-/// itself automatically on reaching it
-/// (`voice_stream::spawn_record_stream_worker`), rather than waiting
-/// indefinitely for Space to be released. An incoming stream is
-/// independently force-finalized with whatever arrived so far if it ever
-/// exceeds this much audio (`voice_stream::spawn_stream_decrypt_worker`) -
-/// defense in depth against a modified/hostile peer that ignores its own
-/// cap, so the receiving side never accepts more than this regardless of
-/// what the sender claims.
+/// itself on reaching it rather than waiting for Space forever. An
+/// incoming stream is independently force-finalized past the same cap
+/// (`voice_stream::spawn_stream_decrypt_worker`): defense in depth
+/// against a hostile peer that ignores its own cap.
 pub const MAX_RECORDING_SECS: u64 = 4 * 60;
 
 /// `MAX_RECORDING_SECS` expressed as a sample count at `SAMPLE_RATE_HZ`,
@@ -87,26 +76,14 @@ pub enum VoiceError {
     UnsupportedFormat,
 }
 
-/// Prefers a device driven by PulseAudio's ALSA plugin (`cpal` exposes its
-/// ALSA PCM id, "pulse", via `description().driver()`) over whatever
-/// `default_*_device` returns, when one is present. `cpal`'s own docs spell
-/// out why this matters on Linux: "the ALSA host API ... requires that
-/// each process have exclusive access to the devices with which they
-/// establish streams. PulseAudio ... solve[s] this issue by providing
-/// user-space mixing." Two `aloo` clients on the same machine (the normal
-/// way to test a channel/DM locally) both need to open the same physical
-/// mic/speaker; going through the raw ALSA default reliably makes the
-/// second one fail with a "device busy" error, while going through
-/// "pulse" lets both play/record at once, confirmed by hand against this
-/// project's own dev environment. Harmless everywhere a "pulse" device
-/// doesn't exist (non-Linux, or Linux without PulseAudio/PipeWire's pulse
-/// shim): the search just finds nothing and this falls through to
-/// `default`.
-///
-/// musl doesn't use this at all (see `crate::client::voice_pulse`): it talks to the
-/// same PulseAudio/PipeWire server this is trying to reach via ALSA's
-/// dlopen'd plugin, just directly, so the plugin-preference dance is
-/// unnecessary there.
+/// Prefers a device driven by PulseAudio's ALSA plugin ("pulse") over
+/// `default_*_device` when present: raw ALSA requires exclusive device
+/// access, so two `aloo` clients on one machine (the normal way to test
+/// locally) reliably fail with "device busy" through the ALSA default,
+/// while "pulse" gets user-space mixing and both work at once. Harmless
+/// where no "pulse" device exists - the search finds nothing and falls
+/// through to the default. musl doesn't use this at all
+/// (`crate::client::voice_pulse` talks to PulseAudio directly).
 #[cfg(not(target_env = "musl"))]
 fn prefer_pulse(
     devices: impl Iterator<Item = cpal::Device>,
@@ -187,16 +164,12 @@ pub fn resample(samples: &[i16], from_rate: u32, to_rate: u32) -> Vec<i16> {
     out
 }
 
-/// Averages interleaved input frames (however many channels the device
-/// negotiated) down to one mono sample per frame. Without this, an input
-/// device that defaults to stereo-or-more (very common even for a
-/// physically mono mic) leaves the raw interleaved buffer with twice (or
-/// more) as many "samples" as there are real time steps; every downstream
-/// consumer (`Recorder::take_pending`, `resample`) treats one buffer
-/// entry as one moment in time, so the extra entries stretch the apparent
-/// duration - playing back at a fraction of the correct speed and pitch,
-/// and garbled on top of that since unrelated channels get treated as
-/// consecutive time steps.
+/// Averages interleaved input frames down to one mono sample per frame.
+/// Input devices commonly default to stereo-or-more even for a physically
+/// mono mic; downstream consumers treat one buffer entry as one moment in
+/// time, so without this the extra entries stretch the apparent duration -
+/// playback at a fraction of the right speed and pitch, garbled since
+/// unrelated channels become consecutive time steps.
 pub fn downmix_i16_to_mono(samples: &[i16], channels: u16) -> Vec<i16> {
     if channels <= 1 {
         return samples.to_vec();
@@ -343,16 +316,8 @@ impl Recorder {
             .map_err(|e| VoiceError::Device(e.to_string()))?;
         let sample_rate = config.sample_rate();
         let sample_format = config.sample_format();
-        // Input devices very often default to stereo-or-more even for a
-        // physically mono mic (confirmed on this project's own dev
-        // machine: the HDA analog input negotiates 2 channels by
-        // default). Every downstream consumer of `buffer` (`take_pending`,
-        // `resample`) treats it as one sample per moment in time, so the
-        // interleaved frames must be averaged down to mono right here -
-        // otherwise the buffer ends up with twice as many "samples" as
-        // there are real time steps, which plays back at half speed and
-        // half pitch (and garbled, since unrelated channels get treated
-        // as consecutive time steps).
+        // Interleaved frames must be averaged down to mono right here -
+        // see `downmix_i16_to_mono`'s doc for what goes wrong otherwise.
         let channels = config.channels();
         let stream_config: StreamConfig = config.into();
 
@@ -395,14 +360,11 @@ impl Recorder {
         })
     }
 
-    /// Drains everything captured since the last call (or since `start`),
-    /// resampled to `SAMPLE_RATE_HZ`. The device's default input config is
-    /// not necessarily `SAMPLE_RATE_HZ` (44.1/48kHz is far more common
-    /// hardware default), so without this normalization every chunk would
-    /// carry mismatched-rate PCM and play back pitch/speed-distorted on
-    /// the receiving end - the wire format has no per-chunk rate field to
-    /// carry the real rate instead. Safe to call repeatedly while still
-    /// recording; leaves the input stream itself running.
+    /// Drains everything captured since the last call, resampled to
+    /// `SAMPLE_RATE_HZ` - hardware commonly defaults to 44.1/48kHz, and
+    /// the wire format has no per-chunk rate field, so unnormalized chunks
+    /// would play back pitch/speed-distorted. Safe to call repeatedly
+    /// while recording; leaves the input stream running.
     pub fn take_pending(&self) -> Vec<i16> {
         let raw = std::mem::take(&mut *self.buffer.lock().unwrap());
         resample(&raw, self.sample_rate, SAMPLE_RATE_HZ)
@@ -511,18 +473,13 @@ pub(crate) fn apply_mixer_cmd(
     }
 }
 
-/// Spawns the one persistent audio-output thread for the process: opens a
-/// single `cpal` output stream lazily on first use and keeps it open for
-/// the rest of the session, rather than per message - repeatedly opening
-/// concurrent output streams against the same device is a common cause of
-/// ALSA/dmix failing with "unable to open slave". Every playback source -
-/// live stream chunks and whole-clip history replay alike - goes through
-/// this one mixer, so multiple simultaneous sources (e.g. two people
-/// using push-to-talk near-simultaneously) actually mix together instead
-/// of queuing behind one another.
-///
-/// musl gets a different `spawn_mixer` entirely - see `crate::client::voice_pulse`,
-/// re-exported below as this same name.
+/// Spawns the one persistent audio-output thread for the process: a
+/// single `cpal` output stream opened lazily and kept for the session -
+/// concurrent per-message opens are a common cause of ALSA/dmix "unable
+/// to open slave". Every playback source (live chunks and history replay)
+/// goes through this one mixer, so simultaneous sources actually mix
+/// instead of queuing. musl gets a different `spawn_mixer` entirely
+/// (`crate::client::voice_pulse`, re-exported under this name).
 #[cfg(not(target_env = "musl"))]
 pub fn spawn_mixer(
     on_stream_error: impl Fn(String) + Send + Clone + 'static,

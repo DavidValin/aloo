@@ -21,13 +21,11 @@ use sha2::{Digest, Sha256};
 pub const RSA_KEY_BITS: usize = 2048;
 
 /// RSA modulus size for `rsa_per_msg` (`KeyMode::PerMessage`) keypairs -
-/// both the bootstrap keypair announced in `Identify` and every key
-/// `rekey::OwnKeys::rotate_for_peer` generates afterward. Larger than
-/// `RSA_KEY_BITS` since these keys are short-lived by design (PROTOCOL.md
-/// §11) and the whole point of the mode is a stronger security margin per
-/// key; the tradeoff is slower keygen on every rotation (already the
-/// documented reason live voice is exempted from per-chunk rotation, see
-/// §11.6 - that cost only gets more pronounced at 4096 bits).
+/// the bootstrap key and every rotation after it. Larger than
+/// `RSA_KEY_BITS` because the mode's whole point is a stronger margin per
+/// short-lived key (PROTOCOL.md §11); the tradeoff is slower keygen per
+/// rotation - the documented reason live voice skips per-chunk rotation
+/// (§11.6).
 pub const RSA_PER_MSG_KEY_BITS: usize = 4096;
 
 /// Rounds used to stretch a `my_key` password into the seed for a
@@ -179,13 +177,11 @@ pub fn fingerprint(key: &RsaPublicKey) -> Result<String> {
     Ok(fingerprint_der(&der))
 }
 
-/// Same as `fingerprint`, but hashes raw DER bytes directly rather than a
-/// parsed `RsaPublicKey` - infallible, since it never needs the bytes to
-/// actually be a valid key. Used for display purposes on key material that
-/// might not parse (e.g. `idstore::IdStore` showing a fingerprint for
-/// whatever bytes were pinned, even from a hand-edited or corrupted store
-/// entry) where `fingerprint`'s `Result` would otherwise force a caller to
-/// decide what to show on `Err`.
+/// Same as `fingerprint`, but hashes raw DER bytes directly - infallible,
+/// since the bytes never need to be a valid key. Used for display on key
+/// material that might not parse (e.g. a hand-edited pinned store entry)
+/// where `fingerprint`'s `Result` would force a caller to decide what to
+/// show on `Err`.
 pub fn fingerprint_der(der: &[u8]) -> String {
     let digest = Sha256::digest(der);
     hex_encode(&digest)
@@ -281,10 +277,31 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
+/// Lowercase-hex encoding, shared by fingerprints and the flat-file stores
+/// (`idstore`, `own_next_keys`), which persist key material one
+/// hex-encoded line per entry.
+pub fn hex_encode(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
         s.push_str(&format!("{:02x}", b));
     }
     s
+}
+
+/// Decodes a lowercase-hex string back to bytes; `None` on any malformed
+/// input (odd length, non-hex character) rather than panicking, so a
+/// corrupted line in a hand-edited store is simply dropped by its loader
+/// instead of taking down the whole store.
+pub fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(s.len() / 2);
+    let bytes = s.as_bytes();
+    for chunk in bytes.chunks(2) {
+        let hi = (chunk[0] as char).to_digit(16)?;
+        let lo = (chunk[1] as char).to_digit(16)?;
+        out.push((hi as u8) << 4 | lo as u8);
+    }
+    Some(out)
 }

@@ -1,25 +1,18 @@
-//! A small local preferences store, backed by a flat `key=value` file at
-//! `~/.aloo/settings` (`crate::platform::aloo_dir()`), following the same
-//! plain-text-under-`~/.aloo` convention as `idstore`/`own_next_keys`
-//! rather than pulling in a config-format crate for a handful of fields.
+//! A small local preferences store: a flat `key=value` file at
+//! `~/.aloo/settings`, same plain-text convention as the other stores
+//! rather than a config-format crate for a handful of fields.
 //!
-//! Holds the global push-to-talk preferences (see `crate::client::global_ptt`):
-//! whether it's enabled, and which shortcut to register. Unlike `IdStore`,
-//! this file is written proactively - on first run there is no session
-//! data to defer writing until, and the whole point is that a user can
-//! find and edit the file even before ever changing anything, so
-//! `load_or_create` creates it with the defaults immediately rather than
-//! only in memory.
+//! Holds the global push-to-talk preferences (`crate::client::global_ptt`).
+//! Unlike `IdStore` this file is written proactively - `load_or_create`
+//! writes the defaults on first run so a user can find and edit the file
+//! before ever changing anything.
 //!
-//! Also holds the server's last-used `--bind`/`--port`/auth configuration
-//! (`server_bind`, `server_port`, `server_auth`) - written every time
-//! `--server` starts, so a server that crashes and gets relaunched with no
-//! flags comes back up on the same address with the same auth instead of
-//! resetting to the CLI defaults (see `main.rs::run_server`). Following
-//! this file's existing plain-text convention, a `password` auth is
-//! persisted as plaintext, same as every other field here - anyone who can
-//! read `~/.aloo/settings` already controls this user's account on this
-//! machine.
+//! Also holds the server's last-used `--bind`/`--port`/auth configuration,
+//! written every time `--server` starts, so a crashed server relaunched
+//! with no flags comes back on the same address with the same auth. A
+//! `password` auth is persisted as plaintext like every other field -
+//! anyone who can read `~/.aloo/settings` already controls this user's
+//! account on this machine.
 
 use std::fs;
 use std::io;
@@ -76,13 +69,10 @@ impl Default for Settings {
 }
 
 impl Settings {
-    /// Loads `path` if it exists; if it doesn't (first run), writes the
-    /// defaults to it immediately and returns them, so the file is always
-    /// present - and editable - after this returns successfully. Lines
-    /// that aren't a recognized `key=value` pair, or whose value doesn't
-    /// parse, are skipped rather than failing the whole load, same
-    /// tolerance as `IdStore::load` for a hand-edited or partially
-    /// corrupted file.
+    /// Loads `path`, writing (and returning) the defaults if it doesn't
+    /// exist yet, so the file is always present and editable afterward.
+    /// Unrecognized or unparseable lines are skipped rather than failing
+    /// the load - same tolerance as `IdStore::load`.
     pub fn load_or_create(path: &Path) -> io::Result<Self> {
         match fs::read_to_string(path) {
             Ok(contents) => Ok(Self::parse(&contents)),

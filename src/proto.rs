@@ -131,11 +131,9 @@ pub struct UserInfo {
 
 /// Which `my_key` type a user connected with - broadcast (via `Identify`
 /// → `UserInfo`) so every peer can show it next to that user's name
-/// (SPEC.md Functionality #3/#6's `name icon TAG` convention, `label()`
-/// below). `Rsa`/`Password`/`None` are all "static" for protocol purposes,
-/// meaning exactly one keypair for the whole session with no rotation,
-/// and behave identically everywhere except this label; only
-/// `PerMessage` (i.e. `rsa_per_msg`) changes actual wire behavior (§11).
+/// (`label()` below). `Rsa`/`Password`/`None` are all "static" - one
+/// keypair for the whole session, identical everywhere except this label;
+/// only `PerMessage` (`rsa_per_msg`) changes actual wire behavior (§11).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum KeyMode {
     /// `my_key` type `rsa`: a static keypair loaded from a file.
@@ -157,17 +155,13 @@ pub enum KeyMode {
 }
 
 impl KeyMode {
-    /// This mode's tag, exactly as rendered (SPEC.md Functionality
-    /// #3/#6), with no surrounding brackets or whitespace of its own -
-    /// `format_with_name` is what actually combines it with a name. `🔒`
-    /// marks a persistent or rotating RSA identity (`Rsa`, `PerMessage`);
-    /// `🚨` flags the two weaker/less-durable sourcings (`Password`,
-    /// `None`) - every `KeyMode` still encrypts every message with real
-    /// RSA (§8.3), the icon is about identity durability, not
-    /// "unencrypted". `🛡️` is `PqHybrid` alone: also a persistent,
-    /// file-loaded identity like `Rsa`, but deliberately given its own icon
-    /// to read as the strongest tier (quantum-resistant signing *and*
-    /// key exchange, each additionally hedged with RSA-4096 - see §13).
+    /// This mode's tag, exactly as rendered (SPEC.md Functionality #3/#6);
+    /// `format_with_name` combines it with a name. `🔒` = persistent or
+    /// rotating RSA identity (`Rsa`, `PerMessage`); `🚨` = the weaker
+    /// sourcings (`Password`, `None`) - about identity durability, not
+    /// "unencrypted": every `KeyMode` still encrypts with real RSA (§8.3).
+    /// `🛡️` = `PqHybrid` alone, the strongest tier (quantum-resistant
+    /// signing *and* key exchange, each hedged with RSA-4096 - §13).
     pub fn label(self) -> &'static str {
         match self {
             KeyMode::PerMessage => "\u{1F512} RSAPM",
@@ -245,31 +239,24 @@ pub struct Envelope {
     pub blocks: Vec<Vec<u8>>,
 }
 
-/// `FileOffer` is the one non-streamed content type this enum carries - the
-/// *offer* of a file transfer (`docs/PROTOCOL.md`'s file transfer section),
-/// sent as one ordinary `SendChannel`/`SendDirect`-style envelope so the
-/// offer itself (who's sending what, how big) gets the same per-recipient
-/// RSA/PQ privacy as a text message. The actual file bytes are never
-/// wrapped in an `Envelope` at all - once accepted, they're streamed as raw
-/// `FileChunk` blocks, exactly like voice's PCM (§7.3), so there's no
-/// `Content::File` variant. The plaintext recovered by decrypting
-/// `Envelope::blocks` for `FileOffer` is a bincode encoding
-/// (`proto::encode`/`decode`) of `crate::client::file_transfer::FileOfferPayload`.
+/// `FileOffer` carries the *offer* of a file transfer as an ordinary
+/// envelope, giving the offer (who's sending what, how big) the same
+/// per-recipient RSA/PQ privacy as a text message; its decrypted plaintext
+/// is a bincode-encoded `file_transfer::FileOfferPayload`. The file bytes
+/// themselves are never enveloped - once accepted they stream as raw
+/// `FileChunk` blocks like voice's PCM (§7.3), so there's no
+/// `Content::File` variant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Content {
     Text,
     FileOffer,
 }
 
-/// Messages the client sends to the server.
-///
-/// Everyone's actual message/voice/file *content* used to be relayed here
-/// too (`SendChannel`/`SendDirect`, the `Stream*`/`File*` families) - see
-/// `docs/PROTOCOL.md`'s "Direct peer-to-peer transport" section for why
-/// that moved to a direct, server-assisted-but-not-server-carried UDP link
-/// (`crate::client::p2p`, `crate::p2p_proto`) instead. The server's job here is now
-/// pure signaling: auth, identify, channel membership, and helping two
-/// clients find each other's address.
+/// Messages the client sends to the server - pure signaling: auth,
+/// identify, channel membership, and helping two clients find each
+/// other's address. Message/voice/file *content* never passes through
+/// here; it travels the direct UDP link instead (`crate::client::p2p`,
+/// `crate::p2p_proto`, PROTOCOL.md "Direct peer-to-peer transport").
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClientMessage {
     /// First message after connecting, answering the server's `Hello`.
@@ -280,13 +267,10 @@ pub enum ClientMessage {
         public_key_der: Vec<u8>,
         key_mode: KeyMode,
     },
-    /// Joins `name`, creating it first if it doesn't exist yet. `kind`
-    /// only matters for creation: selecting an existing top tab (public)
-    /// sends `ChannelKind::Public`, Ctrl+J's popup sends
-    /// `ChannelKind::Private`. `password` is `Some` only when Ctrl+J's
-    /// popup had Private selected and a non-empty password typed - it
-    /// either sets a new private channel's password (creation) or is
-    /// compared against an existing one (join); see docs/PROTOCOL.md §6.5.
+    /// Joins `name`, creating it first if needed. `kind` only matters for
+    /// creation. `password` is `Some` only for a private join/create with
+    /// a password typed - it either sets a new private channel's password
+    /// or is compared against the existing one (docs/PROTOCOL.md §6.5).
     JoinChannel {
         name: String,
         kind: ChannelKind,
@@ -307,13 +291,11 @@ pub enum ClientMessage {
         signature: Vec<u8>,
     },
 
-    /// Proposes (or accepts, when replying to one already received) a
-    /// direct UDP link to `peer`: `candidates` is this client's own host
-    /// and server-reflexive addresses, `link_nonce` is this client's own
-    /// opaque token for the attempt (echoed in its own `Ping`s - see
-    /// `p2p_proto::PunchDatagram`). The server only ever relays this to
-    /// `peer` (`Registry::route_peer_link_request`) - it never sees
-    /// anything from the resulting link itself. See `crate::client::p2p`.
+    /// Proposes (or accepts, when replying to one) a direct UDP link to
+    /// `peer`: `candidates` are this client's host and server-reflexive
+    /// addresses, `link_nonce` its opaque token for the attempt (echoed in
+    /// its `Ping`s). The server only relays this - it never sees anything
+    /// from the resulting link itself. See `crate::client::p2p`.
     RequestPeerLink {
         peer: UserId,
         candidates: Vec<std::net::SocketAddr>,
@@ -334,12 +316,10 @@ pub enum ServerMessage {
         ok: bool,
         reason: Option<String>,
     },
-    /// Answers `Identify`. Nicknames must be unique among currently
-    /// connected clients; `ok: false` (e.g. "nickname already taken") means
-    /// the server closes the connection right after sending this - the
-    /// client should reconnect with a different `display_name`. On
-    /// success, `you` is the `UserId` the server assigned, needed so the
-    /// client can exclude itself when building a channel message's
+    /// Answers `Identify`. Nicknames must be unique among connected
+    /// clients; `ok: false` means the server closes the connection right
+    /// after sending this. On success `you` is the assigned `UserId`,
+    /// needed so the client can exclude itself from a channel message's
     /// per-recipient list.
     IdentifyResult {
         ok: bool,
@@ -354,13 +334,11 @@ pub enum ServerMessage {
         name: String,
         reason: String,
     },
-    /// A typed alternative to `ChannelJoinFailed`'s free-text `reason`,
-    /// specific to the password-protected-private-channel flow (§6.5/§6.6),
-    /// so the client can branch on *why* (open the password popup, show a
-    /// "wrong password" message, or show a "too many attempts" message)
-    /// rather than parsing English. Sent to the requester only - like
-    /// `ChannelJoinFailed`, nothing about a private channel's existence or
-    /// password state leaks to anyone else through this.
+    /// A typed alternative to `ChannelJoinFailed`'s free-text `reason` for
+    /// the password-protected-channel flow (§6.5/§6.6), so the client can
+    /// branch on *why* rather than parsing English. Sent to the requester
+    /// only - nothing about a private channel's existence or password
+    /// state leaks to anyone else.
     ChannelJoinRejected {
         name: String,
         kind: ChannelJoinRejection,
@@ -382,14 +360,11 @@ pub enum ServerMessage {
         channel: String,
         user_id: UserId,
     },
-    /// Sent once per peer who shares any channel with `user_id`, when
-    /// `user_id`'s connection closes entirely (as opposed to `UserLeft`,
-    /// which means they left one specific channel while staying
-    /// connected elsewhere). Unlike `UserLeft`, this does *not* mean the
-    /// recipient should drop `user_id` from its channel membership lists -
-    /// see SPEC.md's "offline" behavior: a client with private-message
-    /// history with `user_id` keeps them listed (grayed out) rather than
-    /// removing them.
+    /// Sent once per peer sharing any channel with `user_id` when their
+    /// connection closes entirely (vs `UserLeft`: left one channel, still
+    /// connected). Unlike `UserLeft`, the recipient does *not* drop
+    /// `user_id` from membership lists - a client with DM history keeps
+    /// them listed, grayed out (SPEC.md "offline" behavior).
     UserOffline {
         user_id: UserId,
     },

@@ -11,27 +11,17 @@ use std::net::SocketAddr;
 
 use crate::proto::Envelope;
 
-/// Target ceiling for one whole UDP datagram sent over the direct link
-/// (a `PunchDatagram`, fully bincode-encoded) - chosen to avoid IP
-/// fragmentation across the great majority of real-world paths: the
-/// common Ethernet MTU is 1500 bytes, but VPNs/tunnels/PPPoE routinely
-/// carry a smaller effective MTU, and a fragmented UDP datagram is
-/// dropped outright by plenty of NATs/firewalls the moment any one
-/// fragment goes missing - worse than just sending a smaller datagram in
-/// the first place. 1200 is the same conservative "stays under basically
-/// every real path's MTU" budget QUIC and other UDP-based protocols use.
-///
-/// `file_transfer::FILE_CHUNK_BYTES` and `voice::CHUNK_INTERVAL` are both
-/// sized (see their own doc comments) so that a single RSA-family
-/// (`Rsa`/`Password`/`None`/`PerMessage`) recipient's encrypted chunk,
-/// once wrapped in `PunchDatagram::Reliable`/`Unreliable`, stays
-/// comfortably under this. `pq_hybrid` is the one exception: its
-/// per-chunk `HybridStreamKeySetup` (`docs/PROTOCOL.md` §13.3) is several
-/// kilobytes on its own, repeated on *every* chunk regardless of how
-/// small the plaintext is - no chunk-size choice can bring a `pq_hybrid`
-/// voice/file chunk under this budget. That's a pre-existing property of
-/// the hybrid wire format, not something introduced or fixable here; see
-/// `docs/TESTING.md`'s known-coverage-gaps entry for it.
+/// Target ceiling for one whole UDP datagram on the direct link (a
+/// `PunchDatagram`, fully bincode-encoded), chosen to avoid IP
+/// fragmentation: VPNs/tunnels/PPPoE routinely carry less than Ethernet's
+/// 1500-byte MTU, and many NATs/firewalls drop a fragmented datagram the
+/// moment one fragment goes missing. 1200 is the same conservative budget
+/// QUIC uses. `file_transfer::FILE_CHUNK_BYTES` and
+/// `voice::CHUNK_INTERVAL` are sized so an RSA-family recipient's
+/// encrypted chunk stays under this. `pq_hybrid` is the one exception:
+/// its per-chunk `HybridStreamKeySetup` (§13.3) is several kilobytes on
+/// its own, so no chunk-size choice can fit it - a pre-existing property
+/// of the hybrid wire format (see `docs/TESTING.md`'s coverage-gaps entry).
 pub const SAFE_DATAGRAM_BYTES: usize = 1200;
 
 /// Client <-> server UDP rendezvous socket only: a stateless STUN-Binding
@@ -85,10 +75,9 @@ pub enum PunchDatagram {
 }
 
 /// What a `Reliable` frame's `payload` decodes to - the direct-transport
-/// stand-ins for the content `ClientMessage` variants that used to be
-/// relayed by the server (`SendChannel`/`SendDirect`/`FileOffer`/...). The
-/// sending peer's UDP source address already identifies who sent it and
-/// which link it belongs to, so none of these carry a `to`/`from` either.
+/// content messages. The sending peer's UDP source address already
+/// identifies who sent it and which link it belongs to, so none of these
+/// carry a `to`/`from`.
 /// `channel: Some(name)` addresses a channel send (kept purely for the
 /// receiver's own UI bucketing - there is no server-side membership check
 /// to lean on anymore); `None` is a DM.

@@ -18,9 +18,9 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Borders, Paragraph};
 
-use super::ui::{centered_rect, focus_border_style};
+use super::ui::{centered_rect, focus_border_style, render_file_browser};
 use crate::client::connect::{ConnectRequest, MyKeySelection, ServerKeySelection};
 use crate::client::file_browser::FileBrowserState;
 
@@ -65,16 +65,14 @@ pub enum MyKeyType {
     /// password before they can connect at all.
     RsaPerMessage,
     /// The default `my_key` selection: ML-DSA-87+RSA4096 signing,
-    /// ML-KEM-1024+RSA4096 key-wrap, AES-256-GCM bulk encryption
-    /// (`docs/PROTOCOL.md` §13) - a static, file-loaded keybundle like
-    /// `Rsa` (not rotating like `RsaPerMessage`), generated with
-    /// `aloo --keygen-pq-hybrid` since there's no `openssl` for
-    /// ML-DSA/ML-KEM. Reuses `Rsa`'s exact `file_pub`/`file_priv` shape.
-    /// Unlike the previous default (`RsaPerMessage`), this one needs a
-    /// keybundle prepared *before* connecting - chosen anyway as the
-    /// default because it's the strongest identity this app can offer, at
-    /// the cost of a first-time user needing to run `aloo
-    /// --keygen-pq-hybrid` before the form can actually validate.
+    /// ML-KEM-1024+RSA4096 key-wrap, AES-256-GCM bulk encryption (§13) - a
+    /// static, file-loaded keybundle like `Rsa`, reusing its exact
+    /// `file_pub`/`file_priv` shape. Generated with
+    /// `aloo --keygen-pq-hybrid` (no `openssl` exists for ML-DSA/ML-KEM),
+    /// though connecting auto-generates a missing bundle
+    /// (`crypto::pq::ensure_bundle_at`), so no manual step is required.
+    /// Chosen as the default because it's the strongest identity this app
+    /// offers.
     #[default]
     PqHybrid,
 }
@@ -843,46 +841,4 @@ fn render_connect_button(frame: &mut Frame, area: Rect, focused: bool) {
             .style(text_style),
         inner,
     );
-}
-
-/// Shared by this popup's own `render` above and `ui::file_send`'s
-/// send-a-file browser - the same generic, fs-backed directory browser
-/// (`FileBrowserState`), just titled differently for whichever popup is
-/// currently using it (`"Select file"` here, `"Send file"` there).
-///
-/// Uses `ListState` rather than a fixed style-per-item (same fix as
-/// `ui::render_message_log`'s `list_state`): without it, `List` always
-/// starts drawing at entry 0 and simply clips whatever doesn't fit, so
-/// selecting past the bottom of the visible area moved `browser.selected`
-/// but never scrolled the view to show it - `ListState` makes ratatui
-/// compute whatever offset keeps the selected entry on screen.
-pub(crate) fn render_file_browser(
-    frame: &mut Frame,
-    area: Rect,
-    browser: &FileBrowserState,
-    title_prefix: &str,
-) {
-    let popup = centered_rect(60, 20, area);
-    let title = format!("{title_prefix} - {}", browser.current_dir.display());
-    let block = Block::default().title(title).borders(Borders::ALL);
-    let inner = block.inner(popup);
-    frame.render_widget(block, popup);
-
-    let items: Vec<ListItem> = browser
-        .entries
-        .iter()
-        .map(|e| {
-            ListItem::new(if e.is_dir {
-                format!("{}/", e.name)
-            } else {
-                e.name.clone()
-            })
-        })
-        .collect();
-    let list = List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
-    let mut list_state = ListState::default();
-    if !browser.entries.is_empty() {
-        list_state.select(Some(browser.selected.min(browser.entries.len() - 1)));
-    }
-    frame.render_stateful_widget(list, inner, &mut list_state);
 }

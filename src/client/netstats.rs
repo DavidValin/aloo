@@ -1,14 +1,9 @@
-//! Tracks how quickly protocol messages are moving over this session's
-//! socket, in either direction, as the channel view's `Conn:<quality>`
-//! header indicator (`crate::client::tui::channel::render_channel_view`, see
-//! `docs/SPEC.md` "Connected UI"). There's no ping/pong or RTT measurement
-//! in the wire protocol (`docs/PROTOCOL.md`), so this measures the
-//! interval between consecutive protocol messages actually observed - sent
-//! or received, text or voice-stream chunks alike - rather than a true
-//! round trip time: a live conversation with frequent back-and-forth
-//! traffic reads as `Good`, and a connection that has gone quiet (whether
-//! from network trouble or simply nobody typing) reads as `Bad`, the same
-//! way it would look to someone watching the log scroll.
+//! Feeds the channel view's `Conn:<quality>` header indicator. The wire
+//! protocol has no ping/pong or RTT, so this measures the interval between
+//! consecutive protocol messages observed (sent or received) rather than a
+//! true round trip: frequent traffic reads as `Good`, a connection gone
+//! quiet - network trouble or simply nobody typing - reads as `Bad`, the
+//! same way it would look to someone watching the log scroll.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -65,16 +60,12 @@ impl ConnStats {
         }
     }
 
-    /// Records one message (sent or received) observed at `now`. The very
-    /// first call has nothing to compare against and only seeds
-    /// `last_event`; every call after that pushes the gap since the
-    /// previous one, evicting the oldest once more than
-    /// `CONN_STATS_MAX_SAMPLES` are held. A `now` that is not after the
-    /// last recorded event - should not happen with a monotonic clock, but
-    /// `Instant` subtraction panics if it ever went backwards - is treated
-    /// as a no-op for the interval itself, while still moving `last_event`
-    /// forward so a single out-of-order timestamp can't wedge every future
-    /// call.
+    /// Records one message observed at `now`: the first call only seeds
+    /// `last_event`; later calls push the gap since the previous one,
+    /// evicting the oldest past `CONN_STATS_MAX_SAMPLES`. A `now` not
+    /// after the last event (`Instant` subtraction would panic) skips the
+    /// interval but still advances `last_event`, so one out-of-order
+    /// timestamp can't wedge every future call.
     pub fn record_event(&mut self, now: Instant) {
         if let Some(prev) = self.last_event
             && now >= prev

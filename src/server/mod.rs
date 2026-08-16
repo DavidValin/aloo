@@ -95,13 +95,11 @@ struct ClientRecord {
 struct ChannelRecord {
     kind: ChannelKind,
     members: BTreeSet<UserId>,
-    /// Set only for a private channel created with a non-empty password
-    /// (Ctrl+J's popup, Private selected, password field non-empty).
-    /// `None` for a public channel (any password a hostile client sends
-    /// alongside `ChannelKind::Public` is silently ignored - there is no
-    /// code path that ever sets this for `Public`) or a private one
-    /// created without one. Fixed at creation, exactly like `kind` - there
-    /// is no message to change a channel's password after creation.
+    /// Set only for a private channel created with a non-empty password;
+    /// `None` for a public channel (a password sent alongside
+    /// `ChannelKind::Public` is silently ignored) or a private one created
+    /// without one. Fixed at creation like `kind` - there is no message to
+    /// change a channel's password afterward.
     password: Option<String>,
 }
 
@@ -232,20 +230,15 @@ impl Registry {
         v
     }
 
-    /// Joins `id` to `name`, creating the channel (as `kind`) if it doesn't
-    /// exist yet. Idempotent: re-joining a channel you're already in is a
-    /// no-op. On success, returns `UserJoined` for every existing member
-    /// sent to the joiner, `UserJoined` for the joiner sent to every
-    /// existing member, and a `Joined` confirmation sent to the joiner.
-    ///
-    /// `name` is validated server-side regardless of what the client's own
-    /// UI already enforces (`validation::channel_name_is_valid`) - the
-    /// server never trusts the client. `password` sets a new private
-    /// channel's password at creation, or is compared (constant-time)
-    /// against an already-set one at join time; see docs/PROTOCOL.md §6.5.
-    /// `source_ip` scopes the brute-force ban (§6.6, `Outgoing` addressed
-    /// to `id` only either way, never leaking the channel's password state
-    /// to anyone else).
+    /// Joins `id` to `name`, creating the channel (as `kind`) if needed;
+    /// idempotent for a channel you're already in. On success returns the
+    /// membership snapshot for the joiner, `UserJoined` for every existing
+    /// member, and a `Joined` confirmation. `name` is validated
+    /// server-side regardless of the client's UI - the server never trusts
+    /// the client. `password` sets a new private channel's password or is
+    /// compared (constant-time) against the existing one (§6.5);
+    /// `source_ip` scopes the brute-force ban (§6.6) - either way replies
+    /// go to `id` only, never leaking password state to anyone else.
     pub fn join_channel(
         &mut self,
         id: UserId,
@@ -388,13 +381,11 @@ impl Registry {
             },
         });
 
-        // A brand-new *public* channel is announced to every other
-        // connected client - the one-time ChannelList snapshot at connect
-        // time otherwise never updates, so this is the only way anyone else
-        // ever learns it exists (docs/PROTOCOL.md §6.1/§6.3). A private
-        // channel never triggers this - it stays unadvertised exactly as
-        // before. The joiner already has `Joined` above, so it's excluded
-        // here.
+        // A brand-new *public* channel is announced to every other client -
+        // the one-time ChannelList snapshot at connect otherwise never
+        // updates, so this is the only way anyone learns it exists
+        // (§6.1/§6.3). A private channel stays unadvertised; the joiner
+        // already has `Joined` above.
         if !existed_before && channel_kind == ChannelKind::Public {
             for &other_id in self.clients.keys() {
                 if other_id != id {
@@ -414,14 +405,12 @@ impl Registry {
         Ok(outgoing)
     }
 
-    /// Removes `id` from `name`'s membership set, if present, deleting the
-    /// channel outright if that empties it - unless `name` is
-    /// `DEFAULT_CHANNEL_NAME`, which survives emptying regardless of kind.
-    /// Returns the members who remained (i.e. who should be notified), or
-    /// an empty `Vec` if `name` doesn't exist or `id` wasn't a member.
+    /// Removes `id` from `name`'s membership, deleting the channel if that
+    /// empties it - unless `name` is `DEFAULT_CHANNEL_NAME`, which
+    /// survives emptying. Returns the remaining members (who should be
+    /// notified); empty if `name` doesn't exist or `id` wasn't a member.
     /// Shared by `leave_channel` (`UserLeft`) and `unregister`
-    /// (`UserOffline`), which differ only in which message they wrap this
-    /// in.
+    /// (`UserOffline`), which differ only in the wrapping message.
     fn remove_member(&mut self, id: UserId, name: &str) -> Vec<UserId> {
         let (remaining, should_delete) = {
             let Some(rec) = self.channels.get_mut(name) else {
@@ -456,13 +445,11 @@ impl Registry {
             .collect()
     }
 
-    /// Removes `id` from every channel it was in and forgets it entirely
-    /// (on disconnect). Notifies every peer who shared *any* of those
-    /// channels with `id` via `UserOffline` rather than `UserLeft` - a
-    /// full disconnect, not a one-channel departure (SPEC.md's "offline"
-    /// behavior; see `ServerMessage::UserOffline`). Each affected peer
-    /// gets exactly one `UserOffline`, no matter how many channels it
-    /// shared with `id`.
+    /// Removes `id` from every channel and forgets it entirely (on
+    /// disconnect). Peers who shared *any* channel with `id` get exactly
+    /// one `UserOffline` each (a full disconnect, not a one-channel
+    /// `UserLeft` - see `ServerMessage::UserOffline`), no matter how many
+    /// channels they shared.
     pub fn unregister(&mut self, id: UserId) -> Vec<Outgoing> {
         let channel_names: Vec<String> = self
             .channels
@@ -485,12 +472,11 @@ impl Registry {
     }
 
     /// Relays a `rsa_per_msg` key rotation (PROTOCOL.md §7.5/§11) point to
-    /// point, exactly like `route_direct_message`. The server never
-    /// inspects `signature` - that's the receiving client's job (§11.4) -
-    /// and never updates its own stored `public_key_der` for `from`, which
-    /// stays as whatever `Identify` sent for the life of the connection
-    /// (it only ever serves as the *bootstrap* key for peers who haven't
-    /// exchanged a message with `from` yet).
+    /// point. The server never inspects `signature` - that's the receiving
+    /// client's job (§11.4) - and never updates its stored
+    /// `public_key_der` for `from`, which stays as whatever `Identify`
+    /// sent (it only ever serves as the *bootstrap* key for peers who
+    /// haven't exchanged a message with `from` yet).
     pub fn route_key_rotation(
         &self,
         from: UserId,
@@ -598,13 +584,11 @@ async fn serve_tcp(listener: TcpListener, auth: AuthConfig) -> std::io::Result<(
 }
 
 /// Stateless STUN-Binding-style rendezvous: echoes back the address a
-/// `RendezvousMessage::BindingRequest` datagram actually arrived from, which
-/// is exactly the sender's own server-reflexive (public) address - the one
-/// piece of information a client can't learn about itself. No
-/// authentication, no `Registry` access, no state kept between datagrams:
-/// this reveals nothing about a sender beyond what any packet it sends
-/// already reveals to this server, the same threat model as a public STUN
-/// server. See `crate::client::p2p::learn_reflexive_candidate`.
+/// `BindingRequest` datagram arrived from - the sender's server-reflexive
+/// (public) address, the one thing a client can't learn about itself. No
+/// authentication, no `Registry` access, no state between datagrams: same
+/// threat model as a public STUN server. See
+/// `crate::client::p2p::learn_reflexive_candidate`.
 async fn udp_rendezvous_loop(socket: UdpSocket) {
     let mut buf = [0u8; 512];
     loop {

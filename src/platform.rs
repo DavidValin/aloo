@@ -1,14 +1,10 @@
 //! Cross-platform resolution of this app's `~/.aloo` directory, shared by
-//! `idstore::default_path` and `own_next_keys::default_path` (see
-//! `docs/SPEC.md` "Not connected UI", `id_store`/`own_next_keys` fields).
-//!
-//! Both stores must always resolve under the user's home directory - never
-//! a loose file in the current working directory - on Linux, macOS *and*
-//! Windows, without pulling in a whole crate just for that. `$HOME` covers
-//! Linux/macOS (and is also set by most Windows shells, e.g. Git Bash);
-//! `%USERPROFILE%` is Windows' own native convention. `std::env::home_dir`
-//! is deliberately not used here - it's been documented-deprecated since
-//! Rust 1.29 for giving wrong answers on Windows in exactly this scenario.
+//! every local store's `default_path`. Always under the user's home
+//! directory, never the current working directory, without pulling in a
+//! crate just for that: `$HOME` covers Linux/macOS (and most Windows
+//! shells), `%USERPROFILE%` is Windows' native convention.
+//! `std::env::home_dir` is deliberately avoided - documented-deprecated
+//! since Rust 1.29 for giving wrong answers on Windows.
 
 use std::ffi::OsStr;
 use std::path::PathBuf;
@@ -28,15 +24,12 @@ pub fn aloo_dir() -> PathBuf {
     }
 }
 
-/// Pure home-directory resolution, split out from `aloo_dir` so it's
-/// testable against synthetic values for every OS's convention without
-/// touching the real process environment (global mutable state shared
-/// across every test binary, and thus unsafe to mutate from a parallel
-/// test run). `home` (`$HOME`) is preferred; `userprofile`
-/// (`%USERPROFILE%`) is the fallback. A variable that is *set but empty* -
-/// a real quirk of some container/service environments - is treated the
-/// same as unset, rather than resolving to a bare `.aloo` at the
-/// filesystem root.
+/// Pure home-directory resolution, split from `aloo_dir` so it's testable
+/// against synthetic values without mutating the real process environment
+/// (unsafe under parallel tests). `home` is preferred, `userprofile` the
+/// fallback; a variable that is *set but empty* (a real quirk of some
+/// container environments) counts as unset rather than resolving to a
+/// bare `.aloo` at the filesystem root.
 pub fn resolve_home_dir(home: Option<&OsStr>, userprofile: Option<&OsStr>) -> Option<PathBuf> {
     [home, userprofile]
         .into_iter()

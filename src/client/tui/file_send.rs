@@ -14,14 +14,13 @@ use std::path::PathBuf;
 use crossterm::event::KeyCode;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::proto::UserId;
 
-use super::ui::{Mode, UiAction, UiState, centered_rect, focus_border_style};
-use super::ui_connect_popup::render_file_browser;
+use super::ui::{Mode, UiAction, UiState, centered_rect, render_file_browser, render_popup_button};
 use crate::client::file_browser::FileBrowserState;
 
 /// Who a file send is addressed to - just the identity, not a frozen
@@ -66,17 +65,12 @@ pub struct FileSendState {
 }
 
 impl UiState {
-    /// Entry point for typing `/file` and pressing Enter
-    /// (`UiState::submit_input`). Resolves a target using the same
-    /// addressability guards `current_voice_target` already applies (must
-    /// be joined to the selected channel, or have a non-offline,
-    /// non-trust-gated DM room open), then opens the browser rooted at the
-    /// process's current directory - `FileBrowserState::open` does real
-    /// filesystem I/O directly here, the same precedent `ui_connect_popup::
-    /// ConnectPopupState::open_browser` already establishes for this app's
-    /// popup-opening code. On any failure (nothing addressable, or the
-    /// directory listing itself failed), `input` is left untouched so the
-    /// user can see what they typed and retry.
+    /// Entry point for `/file` + Enter (`UiState::submit_input`). Resolves
+    /// a target with the same addressability guards as
+    /// `current_voice_target`, then opens the browser rooted at the
+    /// current directory (real filesystem I/O, same precedent as
+    /// `ConnectPopupState::open_browser`). On any failure, `input` is left
+    /// untouched so the user can see what they typed and retry.
     pub(crate) fn start_file_send(&mut self) -> Option<UiAction> {
         let target = if let Some(peer_id) = self.active_private_room {
             if self.offline.contains(&peer_id) || self.is_trust_gated(peer_id) {
@@ -195,20 +189,14 @@ impl UiState {
         }
     }
 
-    /// Stats the selected file (never reads its contents - a file transfer
-    /// is streamed from disk only once the recipient accepts,
-    /// `docs/PROTOCOL.md`'s file transfer section) and emits the send
-    /// action, closing the whole `/file` flow. Unlike a text send, the
-    /// outgoing log row(s) aren't pushed here: the `stream_id` each row is
-    /// keyed by isn't allocated until `crate::client::channel::handle_send_file`/
-    /// `crate::client::direct_message::handle_send_file` run (same reasoning
-    /// `handle_voice_record_start` already established for voice - the
-    /// caller that allocates the stream id is the one that logs the row).
-    /// Recipients are resolved fresh here rather than reusing whatever was
-    /// current when `/file` was first typed, since the browse+confirm
-    /// detour can take a while and membership/offline/trust state keeps
-    /// updating in the background the whole time (the event loop keeps
-    /// processing server messages regardless of which popup has focus).
+    /// Stats the selected file (never reads its contents - streaming only
+    /// starts once the recipient accepts) and emits the send action,
+    /// closing the `/file` flow. Outgoing log rows aren't pushed here: the
+    /// `stream_id` they're keyed by isn't allocated until the
+    /// `handle_send_file`s run - whoever allocates the stream id logs the
+    /// row, as with voice. Recipients are resolved fresh rather than from
+    /// when `/file` was typed: the browse+confirm detour can take a while
+    /// and membership/offline/trust state keeps updating meanwhile.
     fn confirm_file_send(&mut self) -> Option<UiAction> {
         let path = self.file_send.as_ref()?.confirm.clone()?;
 
@@ -323,41 +311,18 @@ fn render_confirm(
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(rows[1]);
-    render_confirm_button(
+    render_popup_button(
         frame,
         button_cols[0],
+        18,
         "Send file",
         fs.confirm_focus == FileConfirmChoice::Send,
     );
-    render_confirm_button(
+    render_popup_button(
         frame,
         button_cols[1],
+        18,
         "Discard",
         fs.confirm_focus == FileConfirmChoice::Discard,
-    );
-}
-
-/// Same border-vs-fill focus convention as `ui::render_identity_button`/
-/// `ui_connect_popup::render_connect_button`.
-fn render_confirm_button(frame: &mut Frame, area: Rect, label: &str, focused: bool) {
-    let popup = centered_rect(18, 3, area);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(focus_border_style(focused));
-    let text_style = if focused {
-        Style::default()
-            .fg(Color::Black)
-            .bg(Color::Yellow)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().add_modifier(Modifier::BOLD)
-    };
-    let inner = block.inner(popup);
-    frame.render_widget(block, popup);
-    frame.render_widget(
-        Paragraph::new(label)
-            .alignment(ratatui::layout::Alignment::Center)
-            .style(text_style),
-        inner,
     );
 }

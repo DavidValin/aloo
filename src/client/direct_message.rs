@@ -31,13 +31,13 @@ fn encrypt_for_recipient(
     if !crate::client::keymode_policy::can_address(key_mode, session.own_key_mode) {
         return None;
     }
-    match key_mode {
-        KeyMode::PqHybrid => {
-            let signing = session.own_pq_private.as_ref()?;
-            crate::client::envelope::encrypt_hybrid_envelope_for(signing, pubkey_der, plaintext, content)
-        }
-        _ => crate::client::envelope::encrypt_for_one(pubkey_der, plaintext, content),
-    }
+    crate::client::envelope::encrypt_envelope_for(
+        session.own_pq_private.as_ref(),
+        key_mode,
+        pubkey_der,
+        plaintext,
+        content,
+    )
 }
 
 pub(crate) async fn handle_send_text(
@@ -124,7 +124,7 @@ pub(crate) async fn handle_send_file(
     ui_state.log_own_file_offer_dm(to, stream_id, filename.clone(), size);
     session.own_file_targets.insert(
         stream_id,
-        crate::client::file_stream::OwnFileTarget { to, path, key },
+        crate::client::file_transfer::OwnFileTarget { to, path, key },
     );
     session.peer_link.ensure_link(wr, to).await;
     session.peer_link.send_reliable_or_queue(

@@ -3,7 +3,6 @@ pub mod connect;
 pub mod direct_message;
 pub mod envelope;
 pub mod file_browser;
-pub mod file_stream;
 pub mod file_transfer;
 pub mod global_ptt;
 pub mod idstore;

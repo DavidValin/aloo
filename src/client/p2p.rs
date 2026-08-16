@@ -110,16 +110,14 @@ pub enum P2pEvent {
     },
 }
 
-/// Outgoing traffic originating on a background thread (the voice recorder,
-/// the file-sender) rather than directly from an async handler that already
-/// holds `&mut PeerLinkManager` - handed to `session.rs`'s
-/// `record_out_tx`/`record_out_rx` channel exactly like the old
-/// `ClientMessage`-typed version of that channel, then dispatched into
-/// `PeerLinkManager` from the single-threaded select loop. Voice chunks are
-/// unreliable; `VoiceEnd`'s `recipients` covers both a channel stream's fan-
-/// out and a DM's single recipient uniformly. File chunks/end are reliable
-/// (a file transfer has no acceptable-loss tradeoff the way live audio
-/// does).
+/// Outgoing traffic originating on a background thread (the voice
+/// recorder, the file sender) - handed to `session.rs`'s
+/// `record_out_tx`/`record_out_rx` channel, then dispatched into
+/// `PeerLinkManager` from the single-threaded select loop. Voice chunks
+/// are unreliable; file chunks/end are reliable (a transfer has no
+/// acceptable-loss tradeoff the way live audio does). `VoiceEnd`'s
+/// `recipients` covers channel fan-out and a DM's single recipient
+/// uniformly.
 pub enum P2pOutbound {
     ChannelVoiceChunk {
         stream_id: u64,
@@ -593,19 +591,13 @@ impl PeerLinkManager {
             }
         }
         for (peer, reason) in failed {
-            // Only actually worth telling the user about if something was
-            // genuinely stuck waiting on this link - a queued reliable
-            // send (text/file, `send_reliable_or_queue`). A link that was
-            // only ever pre-warmed (`session.rs`'s `UserJoined` handler
-            // starts punching to every newly-learned peer, well before
-            // anyone tries to talk to them - see its own doc comment)
-            // failing is unremarkable and expected for plenty of
-            // channel-mates nobody ever actually addresses; surfacing a
-            // "direct connection to X failed" banner for every one of
-            // those would be noise, not signal. Voice's own failure
-            // surfacing (`recording_failed`) is independent of this and
-            // still fires at the moment someone actually tries to record
-            // to an unreachable peer, regardless of `had_pending` here.
+            // Only worth telling the user about if something was genuinely
+            // stuck waiting on this link (a queued reliable send). A
+            // pre-warmed link failing (punching starts on `UserJoined`,
+            // long before anyone talks) is unremarkable for channel-mates
+            // nobody addresses - a banner for each would be noise. Voice's
+            // own `recording_failed` still fires independently when
+            // someone actually records to an unreachable peer.
             let had_pending = self
                 .links
                 .get(&peer)
@@ -635,13 +627,11 @@ impl PeerLinkManager {
         }
     }
 
-    /// Routes one background-thread-originated `P2pOutbound` message to the
-    /// right link(s) - the counterpart of `session.rs`'s old
-    /// `record_out_rx` arm that wrote a `ClientMessage` straight to the TCP
-    /// socket. Voice chunks/end assume their link is already `Active`
-    /// (voice is never queued - see `LinkReadiness`'s doc) and are simply
-    /// dropped otherwise; file chunks/end use the same reliable path text
-    /// does.
+    /// Routes one background-thread-originated `P2pOutbound` message to
+    /// the right link(s). Voice chunks/end assume their link is already
+    /// `Active` (voice is never queued - see `LinkReadiness`) and are
+    /// simply dropped otherwise; file chunks/end use the same reliable
+    /// path text does.
     pub fn dispatch_outbound(&mut self, msg: P2pOutbound) {
         match msg {
             P2pOutbound::ChannelVoiceChunk {
@@ -803,29 +793,21 @@ pub fn spawn_receive_loop(
         loop {
             let (n, addr) = match socket.recv_from(&mut buf).await {
                 Ok(ok) => ok,
-                // A single failed `recv_from` is never fatal to this loop -
-                // punching deliberately sends `Ping`s to candidates nobody
-                // may be listening on, which on some platforms surfaces as
-                // a transient I/O error here (e.g. an ICMP port-unreachable)
-                // rather than just silently going nowhere. Exiting the loop
-                // here would drop `raw_tx`, which would in turn make
-                // `session.rs`'s `p2p_raw_rx.recv()` return `None` and end
-                // the *entire client session* over what's really just one
-                // peer's link having a bad moment - so this logs and keeps
-                // listening instead, same "degrade, never take the whole
-                // session down" principle applied to the global hotkey
-                // (`global_ptt::spawn`) and every other optional subsystem.
+                // A single failed `recv_from` is never fatal: punching
+                // pings candidates nobody may be listening on, which can
+                // surface here as a transient error (e.g. ICMP
+                // port-unreachable). Exiting would drop `raw_tx` and end
+                // the *entire client session* over one peer's bad moment,
+                // so log and keep listening - same "degrade, never take
+                // the session down" principle as every optional subsystem.
                 Err(e) => {
                     eprintln!(
                         "aloo: direct-link UDP receive error (ignoring, still listening): {e}"
                     );
-                    // A brief pause before retrying - purely a safety net
-                    // against a hypothetical permanently-broken socket
-                    // returning an error instantly forever, which would
-                    // otherwise busy-spin this task at 100% of one core
-                    // instead of just degrading. Ordinary transient errors
-                    // (the common case this is actually for) don't notice
-                    // a 50ms delay.
+                    // Safety net against a permanently-broken socket
+                    // erroring instantly forever, which would busy-spin
+                    // this task at 100% of a core; transient errors don't
+                    // notice 50ms.
                     tokio::time::sleep(Duration::from_millis(50)).await;
                     continue;
                 }

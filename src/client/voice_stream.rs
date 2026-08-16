@@ -13,12 +13,11 @@ use crate::client::session::SessionState;
 use crate::client::voice;
 
 /// How long an incoming stream can go without a chunk/end before it's
-/// treated as abandoned (e.g. the sender disconnected mid-recording) and
-/// force-finalized with whatever partial audio arrived. Without this, a
-/// dropped sender would leave the receiver's placeholder blinking
-/// "streaming..." forever and leak the decrypt worker thread - the server
-/// has no per-stream state of its own to notify from (by design, see
-/// `server.rs`), so this has to be detected client-side.
+/// treated as abandoned and force-finalized with whatever partial audio
+/// arrived. Without this, a dropped sender would leave the placeholder
+/// blinking "streaming..." forever and leak the decrypt worker thread -
+/// the server keeps no per-stream state to notify from (by design), so
+/// abandonment has to be detected client-side.
 pub(crate) const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// What a currently-recording (our own) stream is addressed to, remembered
@@ -36,26 +35,22 @@ pub(crate) enum OwnStreamTarget {
     Direct(UserId),
 }
 
-/// The recipient-independent, once-per-stream `PqHybrid` setup: a fresh
-/// `k_data` plus each PQ recipient's key-wrap+signature
-/// (`crypto::pq::HybridStreamKeySetup`), computed once at record-start
-/// (mirrors the RSA path's "recipients' public keys parsed once at
-/// record-start", `docs/PROTOCOL.md` §7.3/§11.6) and repeated verbatim in
-/// every chunk sent to that recipient - see `HybridStreamKeySetup`'s doc
-/// for the accepted bandwidth tradeoff.
+/// The once-per-stream `PqHybrid` setup: a fresh `k_data` plus each PQ
+/// recipient's key-wrap+signature (`crypto::pq::HybridStreamKeySetup`),
+/// computed once at record-start and repeated verbatim in every chunk to
+/// that recipient - see `HybridStreamKeySetup`'s doc for the bandwidth
+/// tradeoff.
 pub(crate) struct PqStreamOut {
     k_data: [u8; 32],
     per_recipient: Vec<(UserId, crypto::pq::HybridStreamKeySetup)>,
 }
 
 /// Builds the once-per-stream `PqHybrid` setup for `recipients` (already
-/// filtered to `KeyMode::PqHybrid` peers - see `channel::parse_pq_recipients`),
-/// signed with our own PQ identity (`session.own_pq_private` - `None` if we
-/// aren't ourselves `PqHybrid`, in which case there's nothing to build:
-/// `keymode_policy::can_address` already excludes `PqHybrid` recipients for a
-/// non-`PqHybrid` sender before this is ever called). A recipient whose
-/// wrap fails (malformed public bundle) is simply left out, same
-/// partial-delivery pattern as an RSA recipient with an unparseable key.
+/// filtered to `PqHybrid` peers), signed with our own PQ identity -
+/// `None` if we aren't ourselves `PqHybrid`, which `can_address` already
+/// rules out before this is called. A recipient whose wrap fails
+/// (malformed public bundle) is simply left out, same partial-delivery
+/// pattern as an RSA recipient with an unparseable key.
 pub(crate) fn build_pq_stream_out(
     session: &SessionState,
     stream_id: u64,
@@ -182,7 +177,7 @@ fn build_chunk_recipients(
 }
 
 /// One recipient's worth of `build_chunk_recipients`' `Direct` arm, pulled
-/// out so `file_stream`'s sending worker can reuse the exact same RSA/PQ
+/// out so `file_transfer`'s sending worker can reuse the exact same RSA/PQ
 /// dispatch without duplicating it - a file transfer is always a single
 /// `DirectStreamKey` recipient (`docs/PROTOCOL.md`'s file transfer
 /// section), same shape as a DM voice stream.
@@ -222,15 +217,13 @@ fn stream_recipient_ids(target: &StreamRecipients) -> Vec<UserId> {
     }
 }
 
-/// Runs on a dedicated `std::thread` for the lifetime of one recording:
-/// every `voice::CHUNK_INTERVAL`, flushes newly-captured samples, encrypts
-/// them for each pre-resolved recipient (`build_chunk_recipients`), and
-/// hands a ready-to-send `P2pOutbound` back to the main loop - no crypto
-/// ever runs on the async `tokio::select!` loop. `stop_rx.recv_timeout`
-/// doubles as both the sleep and the wake-on-release signal, since tokio's
-/// channels have no blocking-with-timeout primitive usable from a plain
-/// thread; this also means release is reflected almost instantly rather
-/// than waiting out a full extra `CHUNK_INTERVAL`.
+/// Runs on a dedicated `std::thread` for one recording: every
+/// `voice::CHUNK_INTERVAL`, flushes captured samples, encrypts them per
+/// recipient, and hands a ready-to-send `P2pOutbound` to the main loop -
+/// no crypto ever runs on the async select loop. `stop_rx.recv_timeout`
+/// doubles as sleep and wake-on-release signal (tokio channels have no
+/// blocking-with-timeout usable from a plain thread), which also means
+/// release is reflected almost instantly.
 pub(crate) fn spawn_record_stream_worker(
     recorder: voice::Recorder,
     target: StreamRecipients,
@@ -316,7 +309,7 @@ pub(crate) fn spawn_record_stream_worker(
 
 /// Decrypts successive chunks of one incoming stream/transfer, keyed once
 /// at start (`resolve_incoming_key`) - shared by voice's
-/// `spawn_stream_decrypt_worker` and `file_stream`'s receive worker so the
+/// `spawn_stream_decrypt_worker` and `file_transfer`'s receive worker so the
 /// RSA-candidates-retry / PQ-`k_data`-cache-from-first-chunk logic isn't
 /// duplicated between them.
 pub(crate) struct ChunkDecryptor {
@@ -414,13 +407,10 @@ pub(crate) fn spawn_stream_decrypt_worker(
                                 samples,
                             });
                         }
-                        // Defense in depth (docs/PROTOCOL.md §7.3): never
-                        // accept more than `voice::MAX_RECORDING_SAMPLES` of
-                        // audio for one stream, regardless of what the
-                        // sender's own recording-length cap says - force-
-                        // finalize with whatever arrived so far and stop
-                        // accepting further chunks for this stream, exactly
-                        // as if a real `*End` had just arrived.
+                        // Defense in depth (§7.3): never accept more than
+                        // `voice::MAX_RECORDING_SAMPLES` per stream
+                        // regardless of the sender's own cap - force-
+                        // finalize as if a real `*End` had arrived.
                         let sample_count = (plaintext_accum.len() / 2) as u64;
                         if voice::recording_at_max(sample_count) {
                             let duration_ms =
@@ -475,17 +465,11 @@ pub(crate) fn play_bell_chime(session: &mut SessionState) {
 }
 
 /// Resolves one recipient's outgoing key material for a point-to-point
-/// stream - shared by `file_stream`'s sending setup (`channel`/
-/// `direct_message`'s `handle_send_file`). Unlike
-/// `direct_message::handle_voice_record_start`'s own inline version, a
-/// resolution failure here (malformed `PqHybrid` public key, or an
-/// unbuildable PQ stream setup - e.g. we aren't ourselves `PqHybrid`) has
-/// no per-failure error message to surface: it's just `None`, and the
-/// caller silently excludes that recipient, same as any other
-/// partial-delivery case in this app (an offline member, a not-yet-fresh
-/// `rsa_per_msg` key, ...) - a file send has no single "recording" UI
-/// element for a failure reason to attach to the way voice's
-/// `audio_error` does.
+/// stream - shared by `channel`/`direct_message`'s `handle_send_file`.
+/// A resolution failure is just `None` and the caller silently excludes
+/// that recipient, like any other partial-delivery case - a file send has
+/// no single "recording" UI element for a failure reason to attach to the
+/// way voice's `audio_error` does.
 pub(crate) fn resolve_direct_key(
     session: &SessionState,
     stream_id: u64,
@@ -506,16 +490,12 @@ pub(crate) fn resolve_direct_key(
 }
 
 /// Resolves which key(s) to try for an incoming stream/transfer from
-/// `from`, decided by *our own* `session.own_key_mode` (a stream addressed
-/// to us was necessarily encrypted against whichever public key material
-/// *we* announced, regardless of the sender's own `my_key` - see
-/// `IncomingStreamKey`'s doc). Shared by `start_incoming_stream` (voice) and
-/// `file_stream`'s incoming-transfer setup, both of which snapshot this
-/// once at start rather than per chunk (PROTOCOL.md §11.6).
-///
-/// `sender_public_key_der` is the sender's `UserInfo.public_key_der`
-/// (whatever `key_mode` they announced) - only actually used when *our own*
-/// `own_key_mode` is `PqHybrid`, to verify the once-per-stream signature.
+/// `from`, decided by *our own* `session.own_key_mode` - a stream
+/// addressed to us was encrypted against whatever *we* announced,
+/// regardless of the sender's `my_key`. Shared by voice and file
+/// transfer, both snapshotting once at start rather than per chunk
+/// (§11.6). `sender_public_key_der` is only used when we are `PqHybrid`,
+/// to verify the once-per-stream signature.
 pub(crate) fn resolve_incoming_key(
     session: &SessionState,
     from: UserId,

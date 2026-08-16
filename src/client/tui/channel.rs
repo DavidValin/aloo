@@ -392,20 +392,14 @@ impl UiState {
         }
     }
 
-    /// Records `user` as a member of `channel`, creating a tab for it if
-    /// none exists yet. The tab must be created here, not just found -
-    /// when *we* are the one joining an already-populated channel, the
-    /// server sends the existing-member snapshot's `UserJoined`s *before*
-    /// the final `Joined` confirmation (`docs/PROTOCOL.md` §6.1), and we
-    /// have no local tab yet the first time one of those arrives (a
-    /// private channel is never pre-known via `ChannelList`, and even a
-    /// public one typed directly into Ctrl+J rather than dwelled into may
-    /// not be). Silently dropping that membership info here used to mean
-    /// `on_joined` then created the tab fresh and empty right after,
-    /// permanently losing every member who was already in it. `kind` is a
-    /// placeholder (`Public`) when created this way - `on_joined`
-    /// unconditionally corrects it moments later from the authoritative
-    /// `ChannelInfo`.
+    /// Records `user` as a member of `channel`, creating a tab if none
+    /// exists yet. The tab must be *created* here, not just found: when we
+    /// join an already-populated channel, the existing-member `UserJoined`
+    /// snapshot arrives *before* the `Joined` confirmation (§6.1), and no
+    /// local tab exists yet - dropping that info would lose every member
+    /// already in the channel. `kind` is a placeholder (`Public`) when
+    /// created this way; `on_joined` corrects it moments later from the
+    /// authoritative `ChannelInfo`.
     pub fn on_user_joined(&mut self, channel: &str, user: UserInfo) {
         self.known_users.insert(user.id, user.clone());
         let tab = match self.channels.iter().position(|c| c.name == channel) {
@@ -535,17 +529,13 @@ impl UiState {
         }
     }
 
-    /// Swaps the `VoiceStreaming{stream_id}` placeholder left by
-    /// `log_own_voice_stream_start_channel`/`on_channel_stream_start` for
-    /// a finished `Voice{duration_ms, pcm}` in place, once the stream
-    /// ends (from either direction - our own or a remote sender's).
-    /// Matches on **both** `from` and `stream_id`: `stream_id` alone
-    /// isn't unique, since it's just a per-connection counter and two
-    /// different senders' counters can coincidentally collide. Checks the
-    /// visible log first, then the held buffer (`on_channel_stream_start`
-    /// may have placed the placeholder in either, depending on the
-    /// sender's trust state *at the time the stream started* - which can
-    /// change mid-stream).
+    /// Swaps the `VoiceStreaming{stream_id}` placeholder for a finished
+    /// `Voice{duration_ms, pcm}` in place once the stream ends (own or
+    /// remote). Matches on **both** `from` and `stream_id` - `stream_id`
+    /// is a per-connection counter, so two senders' counters can collide.
+    /// Checks the visible log first, then the held buffer (the
+    /// placeholder may be in either, depending on the sender's trust
+    /// state *when the stream started* - which can change mid-stream).
     pub fn on_channel_stream_finished(
         &mut self,
         channel: &str,

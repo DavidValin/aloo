@@ -3,23 +3,20 @@
 //! §13 for the full wire-level design; this module is the primitive layer
 //! `session.rs`/`channel.rs`/`direct_message.rs`/`voice_stream.rs` build on.
 //!
-//! Unlike every RSA `my_key` method (§8: "no shared/session key anywhere"),
-//! this one *needs* a shared symmetric key per message - that is the whole
-//! point of steps 2-3 below - so it is deliberately sign-then-encrypt-then-
-//! wrap rather than bent to fit the RSA-OAEP-per-recipient model:
+//! Unlike the RSA `my_key` methods (§8: no shared/session key anywhere),
+//! this one *needs* a shared symmetric key per message, so it is
+//! sign-then-encrypt-then-wrap:
 //!
-//! 1. Sign `data` with both ML-DSA-87 and RSA-4096 (a separate signing-only
-//!    RSA-4096 keypair, never the encryption one below) - a receiver must
-//!    verify **both** before trusting `data` at all.
+//! 1. Sign `data` with both ML-DSA-87 and RSA-4096 (a signing-only
+//!    keypair, never the encryption one) - receivers must verify **both**.
 //! 2. AES-256-GCM-encrypt the signed bundle **once** with a fresh random
 //!    32-byte `K_data`, regardless of recipient count.
-//! 3. For each recipient: ML-KEM-1024-encapsulate to their KEM public key
-//!    (`kem_shared`), and separately RSA-OAEP-encrypt a fresh random secret
-//!    (`rsa_secret`) to their *encryption* RSA-4096 key (distinct from the
-//!    signing one above). Combine `HKDF-SHA256(kem_shared ++ rsa_secret)`
-//!    into a one-time wrapping key `K_wrap`, and ship `K_data XOR K_wrap`.
-//!    Recovering `K_data` needs *both* `kem_shared` and `rsa_secret` - a
-//!    break of ML-KEM-1024 alone, or of RSA-4096 alone, isn't enough.
+//! 3. Per recipient: ML-KEM-1024-encapsulate to their KEM key
+//!    (`kem_shared`) and separately RSA-OAEP-encrypt a fresh secret
+//!    (`rsa_secret`) to their encryption RSA-4096 key; combine
+//!    `HKDF-SHA256(kem_shared ++ rsa_secret)` into a one-time `K_wrap` and
+//!    ship `K_data XOR K_wrap`. Recovering `K_data` needs *both* halves -
+//!    a break of ML-KEM-1024 alone, or RSA-4096 alone, isn't enough.
 
 use std::path::Path;
 
@@ -94,16 +91,12 @@ pub struct HybridEnvelope {
 }
 
 /// The recipient-specific key-wrap material for one voice stream, computed
-/// once at record-start (mirrors the RSA path's "recipients' public keys
-/// parsed once at record-start", `docs/PROTOCOL.md` §7.3) and repeated
-/// verbatim in every chunk sent to that recipient - see `voice_stream.rs`.
-/// Unlike `HybridEnvelope`, this also carries a signature: a voice stream
-/// has no single upfront "data" to sign the way a text/file `Envelope`
-/// does (§13's step 1 needs *something* to bind the signature to), so the
-/// signed payload here is `stream_id ++ k_data` instead - proving both
-/// "this stream's key really came from this sender" and "for this specific
-/// `stream_id`", so a captured key-setup can't be replayed against a
-/// different stream.
+/// once at record-start and repeated verbatim in every chunk to that
+/// recipient (see `voice_stream.rs`). Unlike `HybridEnvelope` it carries a
+/// signature: a stream has no single upfront "data" to sign, so the signed
+/// payload is `stream_id ++ k_data` - proving the key came from this
+/// sender *for this specific stream*, so a captured key-setup can't be
+/// replayed against a different one.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct HybridStreamKeySetup {
     pub kem_ciphertext: Vec<u8>,
@@ -253,18 +246,12 @@ pub fn load_private_bundle(path: &Path) -> Result<PqPrivateBundle> {
 }
 
 /// Ensures a usable keybundle exists at `pub_path`/`priv_path`, generating
-/// one first if either is missing - a no-op if both already exist. Used by
-/// `connect.rs::resolve_my_keypair`'s `PqHybrid` arm so connecting never
-/// hard-fails just because the configured files don't exist yet (whether
-/// that's a fresh, not-yet-generated location the connect popup assigned,
-/// or a path the user typed by hand).
-///
-/// Deliberately treats "either file missing" as "neither is usable" and
-/// (re)generates *both* together, rather than trying to salvage a lone
-/// surviving half - loading a public bundle that doesn't actually pair with
-/// the private one (e.g. after one file was manually deleted and the other
-/// wasn't) would silently produce an identity that can't decrypt its own
-/// incoming messages, a far worse outcome than just regenerating.
+/// one if either is missing (no-op if both exist) - so connecting never
+/// hard-fails just because the configured files don't exist yet.
+/// Deliberately regenerates *both* together rather than salvaging a lone
+/// surviving half: a public bundle that doesn't pair with the private one
+/// would silently produce an identity that can't decrypt its own incoming
+/// messages - far worse than regenerating.
 pub fn ensure_bundle_at(pub_path: &Path, priv_path: &Path) -> Result<()> {
     if pub_path.exists() && priv_path.exists() {
         return Ok(());

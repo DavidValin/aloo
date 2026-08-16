@@ -40,26 +40,16 @@ use super::direct_message::PrivateRoom;
 /// regardless of the surrounding hint text's own (dimmer) color.
 pub const SPINNER_FRAMES: [char; 6] = ['_', '-', '\\', '|', '/', '-'];
 
-/// How long to wait, after the most recent Space press/repeat, before
-/// concluding the key was released. Most terminals only ever send
-/// `KeyEventKind::Press` (never `Release`) for a physically held key, but
-/// they *do* forward the OS's keyboard auto-repeat as a stream of Press
-/// events while the key stays down - so an idle gap longer than the
-/// widest realistic gap *between* those events means the key genuinely
-/// came up. This is what makes push-to-talk work on any terminal, not
-/// just ones that support the Kitty keyboard protocol's release
-/// reporting.
-///
-/// Must be comfortably longer than the OS's initial repeat delay, not
-/// just its steady-state repeat rate: after the first Press, the OS
-/// waits one delay period (commonly 500-650ms - Linux/GNOME defaults to
-/// 500ms, Windows and macOS default in the same range) before the
-/// *first* repeat, and only then settles into the fast ~30-50ms cadence.
-/// A threshold shorter than that initial delay (400ms was tried and
-/// measurably too short) fires while the key is still held, sending a
-/// truncated clip and then mistaking the eventual first repeat for a
-/// brand new press - producing a burst of short clips instead of one
-/// continuous recording for as long as Space stays down.
+/// How long after the most recent Space press/repeat to conclude the key
+/// was released. Most terminals never send `Release` for a held key but
+/// do forward OS auto-repeat as a stream of Press events, so an idle gap
+/// wider than any realistic gap between repeats means the key came up -
+/// this is what makes push-to-talk work beyond Kitty-protocol terminals.
+/// Must exceed the OS's *initial* repeat delay (commonly 500-650ms before
+/// the first repeat, only then the fast cadence), not just the
+/// steady-state rate: 400ms was tried and measurably too short, firing
+/// mid-hold and producing a burst of short clips instead of one
+/// continuous recording.
 pub const RECORD_HOLD_TIMEOUT: Duration = Duration::from_millis(900);
 
 /// How many entries `PageUp`/`PageDown` move the message-log selection by
@@ -208,23 +198,16 @@ pub struct LogEntry {
 }
 
 /// Which anchor a peer's identity mismatch failed against - drives the
-/// case-specific wording `render_identity_review_popup` shows, and what
-/// `session::handle_ui_action`'s `AcceptIdentity` arm needs to install the
-/// new key. `docs/PROTOCOL.md` §12.4 (`StaticMismatch`, `rsa`/`password`)
-/// and §12.6.3/§12.6.4 (`ResumeFailed`, `rsa_per_msg`) are two genuinely
-/// different checks - a byte comparison vs. a signature that failed (or
-/// simply hasn't yet happened) to verify against either anchor - so there's
-/// no single "old key" to show for the resume case the way there is for a
-/// static one. `ResumeFailed` covers three trigger points that all end up
-/// needing the identical Accept behavior (install whatever key is
-/// currently attached): an explicit resume signature that failed to verify
-/// (`handle_key_rotated`'s `Failed` arm), a nickname with a pinned
-/// continuity key seen again with no resume attempt at all yet
-/// (`check_identity`'s `PerMessage` branch, checked the instant it's seen -
-/// see §12.6.3), and an ordinary self-consistent (`Live`) rotation arriving
-/// for a peer who's *already* gated for either of the first two reasons -
-/// self-consistency alone never proves cross-session identity, so it must
-/// not silently clear a gate that was opened because of it.
+/// review popup's case-specific wording and what `AcceptIdentity` needs
+/// to install the new key. `StaticMismatch` (§12.4, `rsa`/`password`) is
+/// a byte comparison with a definite "old key" to show; `ResumeFailed`
+/// (§12.6.3/§12.6.4, `rsa_per_msg`) is a signature that failed - or
+/// hasn't yet happened - so there is no single old key. `ResumeFailed`
+/// covers three triggers that all need identical Accept behavior: a
+/// failed resume signature, a pinned nickname seen again with no resume
+/// attempt yet, and a merely self-consistent `Live` rotation for a peer
+/// already gated - self-consistency never proves cross-session identity,
+/// so it must not clear a gate opened because of that.
 #[derive(Debug, Clone, PartialEq)]
 pub enum IdentityCase {
     StaticMismatch {
@@ -760,18 +743,12 @@ impl UiState {
             .push(offer);
     }
 
-    /// Removes `peer` from the review queue, wherever it is - not
-    /// necessarily the front - and resets focus for whatever's now shown if
-    /// the popup on screen actually changed. Shared by
-    /// `resolve_identity_accept`/`resolve_identity_reject`.
-    ///
-    /// A person's Accept/Reject always targets `identity_review_queue.front()`
-    /// (the only review the popup ever lets them act on), but `rsa_per_msg`'s
-    /// silent auto-trust (`docs/PROTOCOL.md` §12.6.3, `session::
-    /// handle_key_rotated`'s `Resumed` case calling `resolve_identity_accept`
-    /// directly) can resolve *any* queued peer - a second peer's resume can
-    /// verify while a first peer's review is still the one on screen. A
-    /// plain `pop_front` here would silently disappear the wrong review.
+    /// Removes `peer` from the review queue wherever it is - not
+    /// necessarily the front - resetting focus if the popup on screen
+    /// changed. A person's Accept/Reject always targets the front, but
+    /// `rsa_per_msg`'s silent auto-trust (§12.6.3) can resolve *any*
+    /// queued peer while another's review is on screen - a plain
+    /// `pop_front` would silently disappear the wrong review.
     fn remove_from_identity_review_queue(&mut self, peer: UserId) {
         let was_front = self.identity_review_queue.front() == Some(&peer);
         self.identity_review_queue.retain(|p| *p != peer);
@@ -1061,17 +1038,12 @@ impl UiState {
     // -------------------------------------------------------------
 
     /// Handles one key event. Space is push-to-talk everywhere *except*
-    /// while focus is on the compose bar, where it types a literal space
-    /// instead (otherwise you could never put a space in a message).
-    ///
-    /// Actually detecting "released" doesn't rely on
-    /// `KeyEventKind::Release` (which only terminals supporting the Kitty
-    /// keyboard protocol ever send) - every Press/Repeat just refreshes
-    /// `recording_last_seen`, and `tick_recording_timeout` (polled
-    /// periodically by `session::run_connected_session`'s tick) auto-stops
-    /// once that goes quiet for
-    /// `RECORD_HOLD_TIMEOUT`. A real `Release`, when a terminal does send
-    /// one, still stops it immediately as a fast path.
+    /// with focus on the compose bar, where it types a literal space.
+    /// Release detection doesn't rely on `KeyEventKind::Release` (Kitty
+    /// terminals only): every Press/Repeat refreshes `recording_last_seen`
+    /// and `tick_recording_timeout` auto-stops once that goes quiet for
+    /// `RECORD_HOLD_TIMEOUT`; a real `Release` still stops immediately as
+    /// a fast path.
     pub fn handle_key(
         &mut self,
         code: KeyCode,
@@ -1133,16 +1105,12 @@ impl UiState {
             };
         }
 
-        // Ctrl+H toggles the help overlay and takes priority over
-        // everything else below, so it works from any view/mode/focus,
-        // even mid-recording or with another popup already open. Gated on
-        // `Press`: on a terminal with the Kitty keyboard protocol enabled
-        // (see `set_keyboard_release_reporting`), the matching `Release`
-        // for this same keystroke also reaches here - toggling on both
-        // would open it and immediately close it again in one keystroke.
-        // Both `Press` and `Release` return `None` here unconditionally,
-        // so the `Release` is absorbed rather than falling through to
-        // whatever a bare `KeyCode::Char('h')` might otherwise do.
+        // Ctrl+H toggles the help overlay from any view/mode/focus, taking
+        // priority over everything below. Gated on `Press`: on a Kitty
+        // terminal the matching `Release` also reaches here, and toggling
+        // on both would open and instantly close it. Both kinds return
+        // `None` so the `Release` is absorbed rather than falling through
+        // to a bare 'h'.
         if modifiers.contains(KeyModifiers::CONTROL)
             && matches!(code, KeyCode::Char('h') | KeyCode::Char('H'))
         {
@@ -1538,16 +1506,13 @@ impl UiState {
         }
     }
 
-    /// Starts a recording from the global (works-anywhere) Ctrl+Alt+P
-    /// shortcut - `session::run_connected_session`'s `hotkey_rx` select arm
-    /// calls this on every `GlobalPttEvent::Pressed`. Deliberately mirrors
-    /// `handle_key`'s Space branch (same target resolution, same "nowhere
-    /// to send it" bail-out as AC-034) rather than sharing code with it:
-    /// the two differ in exactly one place (`RecordSource` tagging) and
-    /// Space's branch also has to interleave with focus/mode handling that
-    /// has no meaning for a shortcut that fires while this app isn't even
-    /// the focused window. A no-op while a recording (from either source)
-    /// is already in progress, so a second press can't stomp on it.
+    /// Starts a recording from the global Ctrl+Alt+P shortcut. Deliberately
+    /// mirrors `handle_key`'s Space branch (same target resolution, same
+    /// "nowhere to send it" bail-out) rather than sharing code: they
+    /// differ only in `RecordSource` tagging, and Space's branch
+    /// interleaves with focus/mode handling that's meaningless for a
+    /// shortcut fired while the app isn't focused. A no-op while any
+    /// recording is in progress.
     pub fn global_record_start(&mut self) -> Option<UiAction> {
         if self.recording {
             return None;
@@ -1611,21 +1576,14 @@ impl UiState {
         }
     }
 
-    /// Call periodically from the UI loop; auto-stops a recording once
-    /// Space has been quiet for `RECORD_HOLD_TIMEOUT`, for terminals that
-    /// never send `KeyEventKind::Release` (see `handle_key`). A no-op when
-    /// `keyboard_release_reporting` is `true`: on those terminals, a real
-    /// `Release` event is guaranteed, so this idle guess is never needed
-    /// and must never fire - the recording keeps going through any pause
-    /// or silence and only ends when Space is actually let go.
-    ///
-    /// Also a no-op for a `Global`-sourced recording (`RecordSource`),
-    /// unconditionally - there's no repeat-keypress heartbeat for a held
-    /// OS-level hotkey to go quiet, so `recording_last_seen` is never
-    /// refreshed for one, and every platform backend behind the global
-    /// shortcut delivers a real release event, so this idle guess is both
-    /// meaningless and unsafe to apply there (it would auto-stop the
-    /// recording ~`RECORD_HOLD_TIMEOUT` after it started, every time).
+    /// Call periodically; auto-stops a recording once Space has been quiet
+    /// for `RECORD_HOLD_TIMEOUT`, for terminals that never send `Release`
+    /// (see `handle_key`). A no-op when `keyboard_release_reporting` is
+    /// `true` - a real `Release` is guaranteed there, so the guess must
+    /// never fire. Also a no-op for a `Global`-sourced recording: a held
+    /// OS hotkey has no repeat heartbeat to go quiet, and its backends all
+    /// deliver a real release - the idle guess would wrongly auto-stop
+    /// every global recording after ~`RECORD_HOLD_TIMEOUT`.
     pub fn tick_recording_timeout(&mut self, now: Instant) -> Option<UiAction> {
         if !self.recording
             || self.keyboard_release_reporting
@@ -1836,15 +1794,17 @@ fn render_file_offer_popup(
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(rows[1]);
-    render_identity_button(
+    render_popup_button(
         frame,
         button_cols[0],
+        16,
         "Accept",
         focus == FileOfferChoice::Accept,
     );
-    render_identity_button(
+    render_popup_button(
         frame,
         button_cols[1],
+        16,
         "Reject",
         focus == FileOfferChoice::Reject,
     );
@@ -1933,27 +1893,37 @@ fn render_identity_review_popup(
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(rows[1]);
-    render_identity_button(
+    render_popup_button(
         frame,
         button_cols[0],
+        16,
         "Accept",
         focus == IdentityChoice::Accept,
     );
-    render_identity_button(
+    render_popup_button(
         frame,
         button_cols[1],
+        16,
         "Reject",
         focus == IdentityChoice::Reject,
     );
 }
 
-/// One Accept/Reject button - same border-vs-fill focus convention as
+/// One popup button (identity review's and the file offer's Accept/Reject,
+/// file send's Send/Discard) - same border-vs-fill focus convention as
 /// `ui_connect_popup::render_connect_button`: the border (block) always
 /// keeps its own plain/yellow-focus style, and only the *inner* area gets
 /// the solid highlight fill when focused, via the `Paragraph`'s own
-/// `.style()` rather than a separate widget underneath it.
-fn render_identity_button(frame: &mut Frame, area: Rect, label: &str, focused: bool) {
-    let popup = centered_rect(16, 3, area);
+/// `.style()` rather than a separate widget underneath it. `width` is the
+/// button's fixed width, centered in `area`.
+pub(crate) fn render_popup_button(
+    frame: &mut Frame,
+    area: Rect,
+    width: u16,
+    label: &str,
+    focused: bool,
+) {
+    let popup = centered_rect(width, 3, area);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(focus_border_style(focused));
@@ -2251,4 +2221,46 @@ pub(crate) fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
         width,
         height,
     }
+}
+
+/// Shared by `ui_connect_popup`'s key-file picker and `file_send`'s
+/// send-a-file browser - the same generic, fs-backed directory browser
+/// (`FileBrowserState`), just titled differently for whichever popup is
+/// currently using it (`"Select file"` there, `"Send file"` here).
+///
+/// Uses `ListState` rather than a fixed style-per-item (same fix as
+/// `render_messages`' `list_state`): without it, `List` always starts
+/// drawing at entry 0 and simply clips whatever doesn't fit, so selecting
+/// past the bottom of the visible area moved `browser.selected` but never
+/// scrolled the view to show it - `ListState` makes ratatui compute
+/// whatever offset keeps the selected entry on screen.
+pub(crate) fn render_file_browser(
+    frame: &mut Frame,
+    area: Rect,
+    browser: &crate::client::file_browser::FileBrowserState,
+    title_prefix: &str,
+) {
+    let popup = centered_rect(60, 20, area);
+    let title = format!("{title_prefix} - {}", browser.current_dir.display());
+    let block = Block::default().title(title).borders(Borders::ALL);
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let items: Vec<ListItem> = browser
+        .entries
+        .iter()
+        .map(|e| {
+            ListItem::new(if e.is_dir {
+                format!("{}/", e.name)
+            } else {
+                e.name.clone()
+            })
+        })
+        .collect();
+    let list = List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    let mut list_state = ListState::default();
+    if !browser.entries.is_empty() {
+        list_state.select(Some(browser.selected.min(browser.entries.len() - 1)));
+    }
+    frame.render_stateful_widget(list, inner, &mut list_state);
 }
