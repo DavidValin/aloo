@@ -75,15 +75,15 @@ language. This is intentional, not duplication to be cleaned up.
 cargo trace     # requirement traceability gate + reports   (~0.1 s)
 cargo bdd       # all Gherkin acceptance scenarios          (~3-5 s)
 cargo test      # the whole suite: Rust tests + both of the above  (~15-35 s)
-cargo slow      # the #[ignore]d RSA-4096 tests              (~50-70 s)
+cargo slow      # the #[ignore]d RSA-4096/PQ-hybrid-key tests (~50-70 s)
 ```
 
 These are aliases defined in `.cargo/config.toml` — shorthand for
 `cargo test --test traceability`, `cargo test --test cucumber`, and
-`cargo test --test crypto_test --test rekey_test -- --ignored`. `cargo slow`
-names its two targets explicitly rather than using `cargo test -- --ignored`
-because the cucumber target supplies its own runner and rejects libtest
-flags (see below).
+`cargo test --test crypto_test --test hybrid_crypto_test --test
+connect_test -- --ignored`. `cargo slow` names its targets explicitly
+rather than using `cargo test -- --ignored` because the cucumber target
+supplies its own runner and rejects libtest flags (see below).
 
 Runtimes assume dependencies have been built once, and are only this quick
 because `[profile.dev.package."*"]` in `Cargo.toml` builds dependencies at
@@ -213,9 +213,9 @@ the test happens to live. Precedent from borderline calls made so far:
 - A wire round trip is AC *only* insofar as `docs/PROTOCOL.md`'s audience
   (someone writing an interoperable client) can observe it — "every message
   survives the trip intact." Per-variant framing detail stays TB.
-- The `rsa_per_msg` regeneration spinner is AC despite being a purely local
-  UI cue with no wire meaning, because it's on-screen and documented as
-  user-facing. Its exact frame sequence is TB.
+- The identity review popup's Accept/Reject default is AC despite being a
+  purely local UI cue with no wire meaning, because it's on-screen and
+  documented as user-facing. Which anchor verified a rotation is TB.
 - Deduplicated `UserOffline` is TB: a user only notices their friend went
   grey, never that exactly one message was sent instead of one per shared
   channel.
@@ -244,7 +244,7 @@ separate approval step, but keep `evidence` accurate and keep the id stable
 even if the description changes materially.
 
 Prefer naming a tunable constant over hardcoding its current value (e.g.
-`TB-076`: *"bounded at `KEY_RETENTION`"*, not *"bounded at 8"*) — that way a
+`TB-164`: *"bounded at `PQ_KEY_RETENTION`"*, not *"bounded at 8"*) — that way a
 future change to the constant doesn't also require rewording the
 requirement it's mentioned in.
 
@@ -356,10 +356,9 @@ Documented behaviour with no automated test, and why:
 | Jitter buffer and mixing of simultaneous incoming streams | `docs/SPEC.md` #4 | needs a real output device |
 | PulseAudio device preference over raw ALSA on Linux | `docs/SPEC.md` #4 | needs a real device; noted in README "Known limitations" |
 | End-of-message chime playing on both send and receive | `docs/SPEC.md` #4 | the decode half is tested; the playback half needs a real output device |
-| Rotation keygen running off the event loop, one at a time | `docs/PROTOCOL.md` §11.10 | `spawn_rotation_worker` is a private fn in `session.rs`; proving the serialization needs a threading test harness disproportionate to the behaviour's protocol impact |
 | The nickname-rejection flow returning to the popup with fields preserved and focus on nickname | `docs/SPEC.md` #5 | lives inside `run_client_inner`'s loop over a real `Terminal<CrosstermBackend<Stdout>>`; testing it needs a real refactor, not just a new test |
 | A trust-gated sender's live voice stream is decrypted/accumulated but never forwarded to the mixer | `docs/PROTOCOL.md` §12.4 | the suppression itself (`voice_stream::spawn_stream_decrypt_worker`'s `suppress_playback` flag) needs a real output device to observe, same as the jitter buffer above; the *held-and-revealed* text/voice-entry side of "hold and reveal" is covered at the `UiState` level (`test/ui_test.rs`'s `accepting_an_identity_review_clears_it_and_reveals_held_messages`/`rejecting_...`) |
-| `AcceptIdentity`/`RejectIdentity`'s network-facing side effects (`id_store` persist, `rekey::OwnKeys` install, queued-send flush) | `docs/PROTOCOL.md` §12.4 | lives in `session.rs::handle_ui_action`/`install_trusted_rotation`, which - like the rest of `session.rs` - has no test file of its own (needs a live socket); the pure `UiState` bookkeeping half (`resolve_identity_accept`/`resolve_identity_reject`) is covered directly |
+| `AcceptIdentity`/`RejectIdentity`'s network-facing side effects (`id_store` persist, queued-send flush) | `docs/PROTOCOL.md` §12.4 | lives in `session.rs::handle_ui_action`, which - like the rest of `session.rs` - has no test file of its own (needs a live socket); the pure `UiState` bookkeeping half (`resolve_identity_accept`/`resolve_identity_reject`) is covered directly |
 | AC-094 (server settings persisted to and reloaded from `~/.aloo/settings` across a flag-less restart) | `docs/SPEC.md` "Server startup" | inherently a CLI/process/filesystem behavior (real `--server` flags, a real `$HOME`, a real restart), exercised in `test/main_test.rs` by spawning the compiled binary directly - the cucumber layer's steps all drive in-process `UiState`/`ConnectPopupState`/`Registry` structs and none of them spawn the real binary, so there's no existing seam to reuse instead of adding a new one for a single AC |
 | Real cross-NAT UDP hole punching (two clients on genuinely different networks, symmetric NATs, restrictive firewalls) | `docs/PROTOCOL.md` §7.1 | `test/p2p_test.rs`/the cucumber direct-link steps only ever punch over loopback (`127.0.0.1`), which trivially succeeds with no real NAT involved - they prove the protocol mechanics (candidate exchange, `Ping`/`Pong`, reliable delivery, punch-timeout failure), not real-world traversal success rate; that needs manual verification on two actually-separate networks |
 | A single transient UDP receive error doesn't end the whole client session (`p2p::spawn_receive_loop` logs and keeps listening rather than exiting its loop) | `src/client/p2p.rs` `spawn_receive_loop` | the actual OS-level trigger (e.g. Windows' well-documented `WSAECONNRESET` delivered to an *unconnected* UDP socket after an ICMP port-unreachable from an earlier `send_to` a candidate nobody answered) doesn't reproduce portably - confirmed on this project's Linux dev environment that an unconnected socket's `recv_from` simply times out rather than erroring after sending to a dead port, so a real regression test would only exercise the platforms it's run on, not the one it's for; the fix (never let one bad datagram end the loop) is defensive regardless of which platform actually triggers it |
@@ -371,11 +370,6 @@ Documented behaviour with no automated test, and why:
 These are candidate requirements, not requirements — adding one means
 writing the test first, otherwise the model would claim coverage that
 doesn't exist.
-
-Separately, six technical behaviours (`TB-071` through `TB-074`, `TB-076`,
-`TB-077`) are covered *only* by the `#[ignore]`d RSA-4096 tests — real but
-slow coverage, reported by the gate as `covered-only-by-ignored-tests` and
-exercised by `cargo slow`, which CI runs as a blocking step.
 
 ## CI
 

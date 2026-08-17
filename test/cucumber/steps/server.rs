@@ -253,23 +253,7 @@ async fn registry_fresh(w: &mut AlooWorld) {
 async fn client_connects(w: &mut AlooWorld, who: String) {
     let addr = w.addr.expect("no server running");
     let mut stream = ControlEndpoint::new(TcpStream::connect(addr).await.unwrap());
-    let id = handshake(&mut stream, &who, KeyMode::Rsa).await;
-    w.ids.insert(who.clone(), id);
-    w.clients.insert(
-        who,
-        ClientState {
-            stream: Some(stream),
-            received: Vec::new(),
-            ..Default::default()
-        },
-    );
-}
-
-#[given(expr = "{word} has connected using rsa_per_msg")]
-async fn client_connects_perms(w: &mut AlooWorld, who: String) {
-    let addr = w.addr.expect("no server running");
-    let mut stream = ControlEndpoint::new(TcpStream::connect(addr).await.unwrap());
-    let id = handshake(&mut stream, &who, KeyMode::PerMessage).await;
+    let id = handshake(&mut stream, &who, KeyMode::Password).await;
     w.ids.insert(who.clone(), id);
     w.clients.insert(
         who,
@@ -300,8 +284,8 @@ async fn both_in_channel(w: &mut AlooWorld, a: String, b: String, channel: Strin
 #[given(expr = "{word} and {word} are registered users")]
 async fn two_registered(w: &mut AlooWorld, a: String, b: String) {
     let reg = w.registry_mut();
-    let ida = reg.register(a.clone(), vec![9], KeyMode::Rsa);
-    let idb = reg.register(b.clone(), vec![8], KeyMode::Rsa);
+    let ida = reg.register(a.clone(), vec![9], KeyMode::Password);
+    let idb = reg.register(b.clone(), vec![8], KeyMode::Password);
     w.ids.insert(a, ida);
     w.ids.insert(b, idb);
 }
@@ -309,7 +293,7 @@ async fn two_registered(w: &mut AlooWorld, a: String, b: String) {
 #[given(expr = "{word} is a registered user who never joins anything")]
 async fn one_registered_outsider(w: &mut AlooWorld, who: String) {
     let reg = w.registry_mut();
-    let id = reg.register(who.clone(), vec![7], KeyMode::Rsa);
+    let id = reg.register(who.clone(), vec![7], KeyMode::Password);
     w.ids.insert(who, id);
 }
 
@@ -453,7 +437,7 @@ async fn duplicate_nickname(w: &mut AlooWorld, name: String) {
     stream.send(&ClientMessage::Identify {
             display_name: name,
             public_key_der: vec![],
-            key_mode: KeyMode::Rsa,
+            key_mode: KeyMode::Password,
         },
     )
     .await
@@ -720,7 +704,7 @@ async fn nickname_reclaimable(w: &mut AlooWorld, name: String) {
     let addr = w.addr.expect("no server running");
     let mut stream = ControlEndpoint::new(TcpStream::connect(addr).await.unwrap());
     // A rejection or a hang here fails the scenario through handshake's asserts.
-    let id = handshake(&mut stream, &name, KeyMode::Rsa).await;
+    let id = handshake(&mut stream, &name, KeyMode::Password).await;
     w.ids.insert("reclaimer".into(), id);
     w.clients.insert(
         "reclaimer".into(),

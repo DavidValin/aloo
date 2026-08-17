@@ -339,8 +339,8 @@ fn the_wrap_needs_both_the_kem_and_the_x25519_halves() {
 
 /// Rotation is self-contained: one call produces genuinely new keys and
 /// advances the generation, with no worker, queue or shared state behind
-/// it. That is what lets it run inline on the event loop where
-/// `rsa_per_msg`'s RSA-4096 keygen cannot.
+/// it. That is what lets it run inline on the event loop, where RSA-4096
+/// keygen would not be fast enough to.
 /// @requirement TB-166
 #[test]
 fn every_rotation_produces_new_keys_with_no_machinery_behind_it() {

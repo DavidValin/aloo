@@ -2,25 +2,18 @@
 //! keybundle useless against traffic already captured (`docs/PROTOCOL.md`
 //! §13.10).
 //!
-//! The shape mirrors `rekey`, deliberately: rotate once per message sent to
-//! and once per message received from a peer, keep a bounded window of
-//! superseded keys so a burst sent under one key still opens, and treat a
-//! whole voice stream as a single message. What differs is what rotates and
-//! what signs it.
+//! Rotates once per message sent to and once per message received from a
+//! peer, keeps a bounded window of superseded keys so a burst sent under
+//! one key still opens, and treats a whole voice stream as a single
+//! message. The identity itself (ML-DSA-87 + RSA-4096) never rotates and
+//! stays pinned; only the *encryption* keys move, and every rotation is
+//! signed by that unchanging identity - so each one is independently
+//! verifiable, and reconnecting needs nothing special.
 //!
-//! - **`rekey` rotates the identity itself.** Each new RSA key is signed by
-//!   the key it replaces, so the chain is the identity, a broken link
-//!   strands the relationship, and a reconnect needs `own_next_keys`'
-//!   resume machinery to re-anchor.
-//! - **Here the identity never rotates.** ML-DSA-87 + RSA-4096 stay in the
-//!   keybundle and stay pinned; only the *encryption* keys move, and every
-//!   rotation is signed by that unchanging identity. Each one is therefore
-//!   independently verifiable, and reconnecting needs nothing special.
-//!
-//! The other practical difference is speed: ML-KEM-1024 and X25519 keygen
-//! are microseconds, against hundreds of milliseconds for RSA-4096 (§11.9).
-//! Rotation runs inline on the event loop rather than needing `rekey`'s
-//! dedicated worker thread, and voice needs no carve-out.
+//! ML-KEM-1024 and X25519 keygen are microseconds, so rotation runs inline
+//! on the event loop rather than needing a background worker, and voice
+//! needs no carve-out. Freshness/queueing while a rotation is in flight is
+//! tracked separately, by `rekey::RemoteKeys`.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -33,8 +26,7 @@ use crate::proto::UserId;
 /// key that falls out of this window is gone, so nothing can reopen what it
 /// protected. Kept at all because a sender can flush several queued
 /// messages under one key (`rekey::RemoteKeys::on_rotated`) and because a
-/// message already in flight when we rotate must still open. Same value and
-/// same reasoning as `rekey::KEY_RETENTION`.
+/// message already in flight when we rotate must still open.
 pub const PQ_KEY_RETENTION: usize = 8;
 
 struct PeerKeys {

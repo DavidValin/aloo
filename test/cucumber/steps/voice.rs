@@ -126,7 +126,7 @@ async fn stream_to_channel(w: &mut AlooWorld, name: String) {
                 recipients,
                 &vec![(
                     UserId(id_for(&name)),
-                    KeyMode::Rsa,
+                    KeyMode::Password,
                     vec![id_for(&name) as u8; 4]
                 )],
                 "the stream must be addressed to that member, carrying their key"

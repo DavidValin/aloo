@@ -21,8 +21,6 @@ use crate::world::AlooWorld;
 async fn tag_after(w: &mut AlooWorld, name: String) {
     let rows = ui_rows_wide(w.ui_ref());
     let tag = match name.as_str() {
-        "bob" => "RSA",
-        "carol" => "RSAPM",
         "dan" => "PWD",
         "eve" => "PLAIN",
         "frank" => "PQH",
@@ -34,7 +32,7 @@ async fn tag_after(w: &mut AlooWorld, name: String) {
     );
 }
 
-#[then(expr = "the private room title reads {string} with the rsa_per_msg tag after the name")]
+#[then(expr = "the private room title reads {string} with the pq_hybrid tag after the name")]
 async fn room_title_tag(w: &mut AlooWorld, title: String) {
     let rows = ui_rows(w.ui_ref());
     assert!(
@@ -42,7 +40,7 @@ async fn room_title_tag(w: &mut AlooWorld, title: String) {
         "expected the title to lead with the name: {rows:?}"
     );
     assert!(
-        appears_before(&rows, "bob", "RSAPM"),
+        appears_before(&rows, "bob", "PQH"),
         "the peer's tag belongs after their name in the title too: {rows:?}"
     );
 }
@@ -169,8 +167,11 @@ async fn offline_notice(w: &mut AlooWorld) {
 #[then(expr = "{word} stays offline even if a join for them arrives again")]
 async fn offline_is_permanent(w: &mut AlooWorld, name: String) {
     let id = UserId(id_for(&name));
-    let info =
-        crate::steps::ui_common::user_with_mode(id_for(&name), &name, aloo::proto::KeyMode::Rsa);
+    let info = crate::steps::ui_common::user_with_mode(
+        id_for(&name),
+        &name,
+        aloo::proto::KeyMode::Password,
+    );
     w.ui_mut().on_user_joined("general", info);
     assert!(
         w.ui_ref().offline.contains(&id),
@@ -217,7 +218,7 @@ async fn help_content_scrolled(w: &mut AlooWorld) {
     press_key(w, KeyCode::End, KeyModifiers::NONE);
     let rows = ui_rows(w.ui_ref());
     assert!(
-        rows.iter().any(|r| r.contains("RSAPM")),
+        rows.iter().any(|r| r.contains("PQH")),
         "expected the encryption tags explained: {rows:?}"
     );
     assert!(
@@ -268,14 +269,16 @@ async fn room_untouched(w: &mut AlooWorld) {
     );
 }
 
-/// The rsa_per_msg encryption line now sits below the fold on the first
+/// The pq_hybrid encryption line now sits below the fold on the first
 /// screen (the help text has grown since this was written) - scrolls to it
-/// first, same precedent as `help_content_scrolled`.
+/// first, same precedent as `help_content_scrolled`. Rendered wide (via
+/// `ui_rows_wide`) so the line's width comfortably clears the popup's own
+/// 90%-of-terminal cap.
 #[then("the help popup shows its longest line unclipped")]
 async fn help_unclipped(w: &mut AlooWorld) {
     press_key(w, KeyCode::End, KeyModifiers::NONE);
-    let rows = ui_rows(w.ui_ref());
-    let tail = "rsa_per_msg: a fresh key every message, signed by the one it replaces";
+    let rows = ui_rows_wide(w.ui_ref());
+    let tail = "static: ML-DSA-87+RSA4096/ML-KEM-1024+RSA4096/AES-256-GCM, loaded from a file";
     assert!(
         rows.iter().any(|r| r.contains(tail)),
         "expected the longest help line in full: {rows:?}"

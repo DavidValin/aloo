@@ -15,7 +15,7 @@ code can cross over and a reader writing a second implementation need not.
 
 The server is a pure medium of connection *setup*, never of content: it
 authenticates connections, tracks channel membership/presence, relays
-`rsa_per_msg` key-rotation notices, and relays the candidate exchange that
+`pq_hybrid` key-rotation notices, and relays the candidate exchange that
 lets two clients punch a direct UDP link to each other (§7.1). Every
 actual message, voice stream, and file transfer travels over that direct
 link once it's established - never through the server, not even as
@@ -65,32 +65,18 @@ falling back to a server relay (§7.1).
   - [8.4 RSA signatures](#84-rsa-signatures)
 - [9. Versioning and compatibility](#9-versioning-and-compatibility)
 - [10. What the server never sees](#10-what-the-server-never-sees)
-- [11. Per-message key rotation (`rsa_per_msg`)](#11-per-message-key-rotation-rsa_per_msg)
-  - [11.1 Granularity: per peer relationship, not global](#111-granularity-per-peer-relationship-not-global)
-  - [11.2 Bootstrap (trust-on-first-use)](#112-bootstrap-trust-on-first-use)
-  - [11.3 Rotation trigger and signing](#113-rotation-trigger-and-signing)
-  - [11.4 Receiver-side verification and freshness](#114-receiver-side-verification-and-freshness)
-  - [11.5 Queueing while waiting for a fresh key](#115-queueing-while-waiting-for-a-fresh-key)
-  - [11.6 Voice streams count as one message](#116-voice-streams-count-as-one-message)
-  - [11.7 Retained keys for late/batched decryption](#117-retained-keys-for-latebatched-decryption)
-  - [11.8 What `rsa_per_msg` changes about the threat model](#118-what-rsa_per_msg-changes-about-the-threat-model)
-  - [11.9 Key size: 4096 bits, not the app's usual 2048](#119-key-size-4096-bits-not-the-apps-usual-2048)
-  - [11.10 Rotation keygen runs off the event-loop task (client implementation detail)](#1110-rotation-keygen-runs-off-the-event-loop-task-client-implementation-detail)
+- [11. Rotating a peer's key during a session](#11-rotating-a-peers-key-during-a-session)
+  - [11.1 Queueing while waiting for a fresh key](#111-queueing-while-waiting-for-a-fresh-key)
+  - [11.2 Voice streams count as one message](#112-voice-streams-count-as-one-message)
 - [12. Client-side identity pinning (`id_store`)](#12-client-side-identity-pinning-id_store)
   - [12.1 The gap this closes](#121-the-gap-this-closes)
   - [12.2 What gets pinned, and what doesn't](#122-what-gets-pinned-and-what-doesnt)
   - [12.3 When the check happens](#123-when-the-check-happens)
   - [12.4 What happens on a mismatch](#124-what-happens-on-a-mismatch)
   - [12.5 Store format and location](#125-store-format-and-location)
-  - [12.6 Extending identity pinning to `rsa_per_msg` (`own_next_keys`)](#126-extending-identity-pinning-to-rsa_per_msg-own_next_keys)
-    - [12.6.1 What's persisted, on each side](#1261-whats-persisted-on-each-side)
-    - [12.6.2 Sending: resuming on reconnect](#1262-sending-resuming-on-reconnect)
-    - [12.6.3 Verifying: gate on sight, only a proof clears it](#1263-verifying-gate-on-sight-only-a-proof-clears-it)
-    - [12.6.4 Why this is a different kind of "mismatch" than §12.2-§12.5](#1264-why-this-is-a-different-kind-of-mismatch-than-122-125)
-    - [12.6.5 Store format and location (`own_next_keys`)](#1265-store-format-and-location-own_next_keys)
-  - [12.7 Making a pin worth more than "these bytes differ"](#127-making-a-pin-worth-more-than-these-bytes-differ)
+  - [12.6 Making a pin worth more than "these bytes differ"](#126-making-a-pin-worth-more-than-these-bytes-differ)
 - [13. Post-quantum hybrid encryption (`pq_hybrid`)](#13-post-quantum-hybrid-encryption-pq_hybrid)
-  - [13.1 Why a fifth method, and why it looks different](#131-why-a-fifth-method-and-why-it-looks-different)
+  - [13.1 Why this method, and why it looks different](#131-why-this-method-and-why-it-looks-different)
   - [13.2 Key material: an identity that stays, keys that move](#132-key-material-an-identity-that-stays-keys-that-move)
   - [13.3 One layout for everything: a setup, then chunks](#133-one-layout-for-everything-a-setup-then-chunks)
   - [13.4 Opening a send: unwrap, verify, then check the binding](#134-opening-a-send-unwrap-verify-then-check-the-binding)
@@ -100,7 +86,7 @@ falling back to a server relay (§7.1).
   - [13.8 Identity pinning](#138-identity-pinning)
   - [13.9 Client convenience: auto-generated keys and the connect-popup cache](#139-client-convenience-auto-generated-keys-and-the-connect-popup-cache)
   - [13.10 Rotating encryption keys (forward secrecy)](#1310-rotating-encryption-keys-forward-secrecy)
-- [14. The four encryption methods, side by side](#14-the-four-encryption-methods-side-by-side)
+- [14. The three encryption methods, side by side](#14-the-three-encryption-methods-side-by-side)
 - [15. Sequences](#15-sequences)
 
 ## Overview: the connections, and what travels on each
@@ -407,70 +393,55 @@ UserInfo {
 `public_key_der` is a DER-encoded RSA SubjectPublicKeyInfo for every
 `KeyMode` except `pq_hybrid`, whose identity is a keybundle rather than one
 key - it carries its encoded key bundle in this same field (§13) rather
-than growing the wire shape. Under `rsa_per_msg` this is only ever the
-*bootstrap* key from that user's `Identify` (§5.4): the per-peer keys that
-supersede it are never reflected here, only relayed via `KeyRotated`
-(§7.5, §11). Under `pq_hybrid` likewise, the bundle carries only bootstrap
-encryption keys (§13.10).
+than growing the wire shape. Under `pq_hybrid`, the bundle carries only
+bootstrap encryption keys - the keys that supersede them as the
+relationship rotates are never reflected here, only relayed via
+`KeyRotated` (§7.5, §13.10).
 
 ```
-KeyMode = Rsa | Password | None | PerMessage | PqHybrid
+KeyMode = Password | None | PqHybrid
 ```
 
-The five values name how a client's own `my_key` was obtained, and whether
+The three values name how a client's own `my_key` was obtained, and whether
 it changes:
 
 | value | `my_key` type | key material | changes? |
 |---|---|---|---|
-| `Rsa` | `rsa` | one keypair loaded from a file | no |
 | `Password` | `password` | one keypair derived from a password (§8.3) | no |
 | `None` | `none` | one keypair generated at connect time | no |
-| `PerMessage` | `rsa_per_msg` | a rotating keypair per peer (§11) | every message |
 | `PqHybrid` | `pq_hybrid` | a keybundle loaded from a file (§13) | signing half no, encryption half every message (§13.10) |
 
-`PerMessage` is what tells a peer to expect `KeyRotated` rather than
-treating `public_key_der` as good for the session; `PqHybrid` sends
-`KeyRotated` too, but for its encryption keys only (§13.10). §14 compares
-the four *methods* these five values describe.
+`PqHybrid` is what tells a peer to expect `KeyRotated`, for its encryption
+keys only (§13.10) - `public_key_der`/the identity itself stays good for
+the whole session regardless of `KeyMode`. §14 compares the three
+*methods* these values describe.
 
-`Rsa`, `Password`, `None`, and `PqHybrid` are all "static" for protocol
-purposes - exactly one keybundle for the whole session, no rotation - and
-behave identically everywhere in this document except two things: which of
-the five they are is broadcast (via `Identify` → `UserInfo`, unchanged wire
-shape from before, only the enum grew variants) precisely so every peer can
-render the right tag next to that user's name (sidebar, private-room
-title - SPEC.md Functionality #3/#6); and `PqHybrid` alone changes what
-`public_key_der` actually contains and how `Envelope.blocks` is produced -
-see §13.
+All three are "static" for protocol purposes - exactly one keybundle for
+the whole session, the identity itself never rotates - and behave
+identically everywhere in this document except two things: which of the
+three they are is broadcast (via `Identify` → `UserInfo`) precisely so
+every peer can render the right tag next to that user's name (sidebar,
+private-room title - SPEC.md Functionality #3); and `PqHybrid` alone
+changes what `public_key_der` actually contains and how `Envelope.blocks`
+is produced - see §13.
 
 | `KeyMode`    | Tag           | Position (`KeyMode::format_with_name`) |
 |--------------|---------------|------------------------------------------|
-| `PerMessage` | `🔒 RSAPM`    | after the name: `name 🔒 RSAPM`          |
-| `Rsa`        | `🔒 RSA`      | after the name: `name 🔒 RSA`            |
 | `Password`   | `🚨 PWD`      | after the name: `name 🚨 PWD`            |
 | `None`       | `🚨 PLAIN`    | after the name: `name 🚨 PLAIN`          |
 | `PqHybrid`   | `🛡️ PQH`      | after the name: `name 🛡️ PQH`            |
 
 (`KeyMode::label()` returns just the tag, unbracketed; `format_with_name`
-composes it with a name, tag trailing, the same position for all five
+composes it with a name, tag trailing, the same position for all three
 variants.) Every tag trails the name as an annotation on it, not a
-classification label sitting in front - `PerMessage` is the moving-target
-case that always worked this way (a new key every message), and the other
-four now read the same way for consistency. The icon is about identity
+classification label sitting in front. The icon is about identity
 *durability*, not "unencrypted" - every `KeyMode` still encrypts every
 message with real per-recipient encryption (RSA, or for `PqHybrid` the
 hybrid scheme in §13); `🚨` just flags the two sourcings (`Password`,
 `None`) that don't persist an identity across separate connections the way
-a saved `rsa` keypair file does. `🛡️` is `PqHybrid`'s own icon rather than
-reusing `🔒` - it is file-backed and durable like `Rsa`, but deliberately
-given a distinct mark to read as the strongest tier (quantum-resistant
-signing *and* key exchange, each additionally hedged with RSA-4096). Prior
-to `PqHybrid`, only two states (`Static`/`PerMessage`) were
-wire-visible and a peer's specific `rsa`/
-`password`/`none` choice was locally forgotten immediately after resolving
-the keypair (§8.3) - this is a genuine (if small) protocol change: every
-peer must be rebuilt from the same `KeyMode` definition (§9), same as any
-other change to this enum.
+`PqHybrid`'s saved keybundle file does. `🛡️` is `PqHybrid`'s own icon,
+read as the strongest tier (quantum-resistant signing *and* key exchange,
+each additionally hedged with RSA-4096).
 
 ```
 ChannelKind = Public | Private
@@ -633,10 +604,10 @@ other clients
 use this to encrypt messages addressed to this user (§7.2, §8).
 
 `key_mode` (§3) tells every peer, up front, whether `public_key_der` is
-good for the whole session (`Rsa`/`Password`/`None`) or is only a
-*bootstrap* key that individual peer relationships will supersede via
-`KeyRotated` the first time a message is exchanged with them (`PerMessage`
-- `rsa_per_msg`; see §11). The server itself does not branch on `key_mode`
+good for the whole session (`Password`/`None`) or is a *bootstrap*
+encryption key that individual peer relationships will supersede via
+`KeyRotated` the first time a message is exchanged with them (`PqHybrid`;
+see §13.10). The server itself does not branch on `key_mode`
 beyond storing and relaying it as part of `UserInfo`, and using it to
 validate `RotateKey` (§7.5) - it never gates ordinary messaging on it.
 
@@ -887,7 +858,7 @@ implicitly covers DMs too, since you can only open one with someone
 you've already learned about this way). Revised from an earlier
 lazy-on-first-send design once testing showed the gap it left: text and
 file sends tolerate a not-yet-`Active` link by queuing (§7.2/§7.6), but
-voice does not (§7.3) - a `Rsa`/`Password`/`None`/`PerMessage` recipient
+voice does not (§7.3) - a recipient of any `KeyMode`
 whose link is still mid-punch at the exact moment someone starts a
 recording is excluded from it outright, so a purely lazy trigger meant
 the *first* voice message to any brand-new peer was reliably missing them
@@ -1224,7 +1195,7 @@ For a channel stream, `StreamStart`/`StreamEnd` are sent reliably to
 *every* recipient whose link is already `Active` at record-start time -
 unlike text, **voice is never queued**: a recipient whose link is still
 punching (or has failed) is simply left out of that particular stream,
-exactly like a `rsa_per_msg` recipient without a fresh key (§11.6) - the
+exactly like a rotating-key recipient without a fresh key (§11.2) - the
 punch can take up to `PUNCH_TIMEOUT` seconds, too long to make a live
 recording wait on. Each chunk is then sent unreliably
 (`PunchDatagram::Unreliable`, no ack, no retransmit) to each of those same
@@ -1306,8 +1277,8 @@ connection.
 
 ### 7.5 `RotateKey` / `KeyRotated` - per-peer key rotation relay
 
-Only meaningful between a sender whose own `key_mode == PerMessage`
-(§3, §11) and one specific recipient; unrelated to channel membership.
+Only meaningful between a sender whose own `key_mode == PqHybrid`
+(§3, §13.10) and one specific recipient; unrelated to channel membership.
 
 ```
 // client -> server
@@ -1321,8 +1292,8 @@ Server-side:
 
 - Rejected (`Error` back to the sender) if `to` is not a currently-connected
   `UserId`, or if the sender's own registered `key_mode` is not
-  `PerMessage` (a non-rotating `Rsa`/`Password`/`None` client has no
-  business rotating).
+  `PqHybrid` (a non-rotating `Password`/`None` client has no business
+  rotating).
 - Otherwise relayed verbatim as `KeyRotated { from: <sender>,
   new_public_key_der, signature }` to `to` - one recipient, no
   channel/membership involved. Unlike §7.2-§7.3/§7.6, key rotation stays
@@ -1330,14 +1301,14 @@ Server-side:
   small, infrequent identity metadata, not the "content" the direct
   transport exists to keep off the server.
 - The server does **not** verify `signature` - exactly like `Envelope`
-  blocks, this is opaque payload as far as the server is concerned; §11
-  covers how the *receiving client* validates it before trusting the new
-  key.
+  blocks, this is opaque payload as far as the server is concerned;
+  §13.10 covers how the *receiving client* validates it before trusting
+  the new key.
 
 There is no server-side bookkeeping of the rotated key itself: the
 registry's own copy of the sender's `public_key_der` (used to bootstrap a
-*new* peer who joins later, see §11) is never updated by `RotateKey` - it
-stays as whatever `Identify` originally sent, for the lifetime of the
+*new* peer who joins later, see §13.10) is never updated by `RotateKey` -
+it stays as whatever `Identify` originally sent, for the lifetime of the
 connection.
 
 ### 7.6 File transfer
@@ -1421,12 +1392,12 @@ arrives (receiver) - the receiver-side crop is not just defensive
 redundancy, since nothing on the wire stops a modified/hostile peer from
 sending a longer name than it claims to.
 
-**`rsa_per_msg` readiness**: handled the same way as voice's recipient
-readiness (§11.6), not text's queue (§11.5) - a recipient whose rotating
+**Rotating-key readiness**: handled the same way as voice's recipient
+readiness (§11.2), not text's queue (§11.1) - a recipient whose rotating
 key isn't currently fresh is simply not offered the file at all, never
 queued for a later offer once a fresh key arrives. Sending an offer still
-triggers this client's own per-peer rotation for the recipient actually
-reached (§11.3), same as text/voice.
+triggers this client's own rotation for the recipient actually reached
+(§13.10), same as text/voice.
 
 **Where the bytes land**: an accepted file is written straight to
 the download directory (`~/.aloo/downloads`) as chunks
@@ -1438,10 +1409,10 @@ no separate save-location prompt; accepting *is* saving.
 ## 8. Encryption model
 
 **There is no shared/session/hybrid key anywhere in this protocol for
-`Rsa`/`Password`/`None`/`PerMessage`.** (§13 covers the one exception,
-`PqHybrid`, which *does* use a per-message shared key - deliberately, for
-reasons explained there; everything below this paragraph describes the
-other four modes.) Every plaintext payload - a text message, or one voice
+`Password`/`None`.** (§13 covers the one exception, `PqHybrid`, which
+*does* use a per-message shared key - deliberately, for reasons explained
+there; everything below this paragraph describes the other two modes.)
+Every plaintext payload - a text message, or one voice
 chunk - is
 encrypted **separately for every individual recipient**, using that
 recipient's own RSA public key. The server relays exactly as many
@@ -1462,12 +1433,11 @@ shared secret by its very nature - a per-recipient-only scheme was never
 on the table for it the way it is for RSA-OAEP.
 
 A recipient's public key here is ordinarily good for the whole session
-(`KeyMode::Rsa`/`Password`/`None`/`PqHybrid` - the last one loaded from a
+(`KeyMode::Password`/`None`/`PqHybrid` - the last one loaded from a
 file rather than autogenerated or password-derived, but equally static
-for the whole session, see §13). §11 describes `KeyMode::PerMessage`
-(`rsa_per_msg`), an opt-in per-client mode where that key is instead
-rotated - per peer relationship, autogenerated in-process - on every
-message sent or received with that peer.
+for the whole session, see §13). `PqHybrid` additionally rotates its
+*encryption* keys - not the identity itself - per peer relationship, on
+every message sent or received with that peer; see §13.10.
 
 ### 8.1 RSA-OAEP chunking
 
@@ -1478,13 +1448,11 @@ their decryptions in order:
 
 - Ciphertext block size is always exactly `key_size_bytes` (i.e. exactly
   the RSA modulus size - 256 bytes for a 2048-bit key, the size this
-  app's own keygen produces by default, per `crypto::RSA_KEY_BITS = 2048`
-  (512 bytes for `rsa_per_msg`'s 4096-bit keys, per
-  `RSA_PER_MSG_KEY_BITS` - see §11.9); externally-supplied PEM
-  keys, per README's "Generating RSA keys", may use a different size, and
-  the protocol itself places no fixed size requirement on keys - two peers
-  just need compatible RSA key sizes for whichever DER/PEM keys they
-  actually exchange).
+  app's own keygen produces by default, per `crypto::RSA_KEY_BITS = 2048`;
+  externally-supplied PEM keys may use a different size, and the protocol
+  itself places no fixed size requirement on keys - two peers just need
+  compatible RSA key sizes for whichever DER/PEM keys they actually
+  exchange).
 - Maximum plaintext bytes per block, for OAEP with SHA-256:
   `key_size_bytes - 2 * 32 - 2` (32 = SHA-256's output size; the `2*hLen + 2`
   term is OAEP's own padding overhead). For a 2048-bit key: `256 - 66 = 190`
@@ -1533,10 +1501,9 @@ message is actually encrypted or decrypted.
 
 ### 8.4 RSA signatures
 
-There is exactly one RSA signing primitive in this protocol, used in two
-places: authenticating a freshly-rotated `rsa_per_msg` public key with the
-key it replaces (§11.3), and the classical half of a `pq_hybrid` send
-commitment (§13.3).
+There is exactly one RSA signing primitive in this protocol, used as the
+classical half of every `pq_hybrid` signature: a send commitment (§13.3)
+and an encryption-key rotation (§13.10) alike.
 
 It is **RSA-PSS with SHA-256 and a random salt**. PSS rather than PKCS#1
 v1.5 because it is the modern scheme with a security proof behind it; v1.5
@@ -1623,248 +1590,58 @@ conversation exists at all.
 It never sees: message plaintext (text or voice), voice audio content,
 file names or contents, or any private key.
 
-## 11. Per-message key rotation (`rsa_per_msg`)
+## 11. Rotating a peer's key during a session
 
-`KeyMode::PerMessage` (§3) is an alternative to the non-rotating
-`KeyMode::Rsa`/`Password`/`None` variants for a client's own `my_key`.
-Everything in §7-§8 about
-per-recipient RSA-OAEP encryption is unchanged - `rsa_per_msg` only
-changes *which* public key is currently correct to encrypt to a given
-user with, and how often that changes. It does not introduce a
-shared/session key, and it does not change how a message body itself is
-encrypted.
+Only `KeyMode::PqHybrid` (§3) rotates its encryption keys during a
+session - the trigger, signing, and receiver-side verification are all
+specific to that scheme and are covered in full in §13.10. This section
+covers the two pieces of client behavior around a rotating peer that
+apply generically, independent of which scheme is doing the rotating:
+what happens on the sending side while a recipient's key is momentarily
+stale, and why a live voice stream doesn't rotate mid-stream. A
+non-rotating (`Password`/`None`) peer never enters either of these paths
+- it is always considered ready.
 
-### 11.1 Granularity: per peer relationship, not global
+### 11.1 Queueing while waiting for a fresh key
 
-A `PerMessage` user does not have one active key shared by everyone who
-might message them. Instead they maintain an **independent rotating
-keypair per peer** (`UserId`) they've exchanged anything with. Two
-different peers of the same `PerMessage` user are given different current
-public keys and rotate independently - Bob messaging Alice does not
-consume or affect the key Alice has handed to Carol. This avoids
-cross-peer contention: Bob and Carol can each message Alice without
-waiting on each other.
+If a client wants to send to a peer whose key rotates (currently:
+`pq_hybrid`) and for whom it does not currently hold a fresh key (never
+received one yet, or already used the one it has), the message is
+**not** sent - it is held in an in-memory, per-peer FIFO queue instead.
+There is no wire message for "queued" state; this is purely local client
+behavior. A peer whose key never rotates is always considered ready and
+never queued.
 
-### 11.2 Bootstrap (trust-on-first-use)
-
-Every peer relationship starts from the *same* key: the `public_key_der`
-a `PerMessage` user announced in its own `Identify` (§5.4), learned by
-others the same way as a non-rotating user's key - via `UserInfo` in
-`UserJoined`/the join snapshot (§6.1). Like a non-rotating user's key
-today, this bootstrap key is **not signed by anything** - there is no prior key
-to sign it with. It remains valid, for any peer who hasn't yet exchanged
-a message with this user, for as long as that user's connection lasts;
-it is only superseded, per peer, once that specific relationship's first
-rotation happens (§11.3).
-
-### 11.3 Rotation trigger and signing
-
-A `PerMessage` user rotates their key **for one specific peer** exactly
-once for every message sent to that peer, and once for every message
-received from that peer (a live voice stream counts as a single message
-for this purpose - see §11.6, not one rotation per chunk). Concretely,
-after either:
-
-- successfully sending a `P2pPayload::Envelope` (§7.1.1) addressed to
-  peer `P`, or
-- successfully decrypting an incoming `P2pPayload::Envelope` from peer
-  `P`,
-
-the user generates a brand-new RSA keypair - at `RSA_PER_MSG_KEY_BITS`
-(4096 bits, larger than the `RSA_KEY_BITS` = 2048 used everywhere else in
-this app - see §11.9), autogenerated in-process via the same OS-RNG path
-as any other freshly-generated `my_key` (§8.3), never shelling out to an
-external tool - and sends `RotateKey { to: P,
-new_public_key_der, signature }` (§7.5). `signature` is computed over
-
-```
-to.0.to_be_bytes() ++ new_public_key_der
-```
-
-(`to`'s raw `u64` bytes, big-endian, concatenated with the new key's DER
-bytes - not itself re-transmitted since `KeyRotated`'s implicit `to` is
-just "whoever the server delivers it to"), SHA-256-hashed and signed with
-RSA-PSS + SHA-256 (the signing primitive (§8.4), the one signing primitive this app has -
-see §8.4) using **the private key this rotation is replacing** for peer `P` - i.e. the previous per-peer key if
-one has already been established for `P`, or the bootstrap private key
-(§11.2) if this is the first rotation for `P`. Binding `to` into the
-signed bytes matters: without it, a rotation signed while the bootstrap
-key was still shared by every not-yet-rotated peer could be replayed by
-one peer as if it were a rotation addressed to them (they'd currently
-trust the same bootstrap public key too).
-
-### 11.4 Receiver-side verification and freshness
-
-On receiving `KeyRotated { from, new_public_key_der, signature }`, a
-client:
-
-1. Reconstructs the signed payload using **its own** `UserId` (the
-   implicit `to`) and `new_public_key_der`.
-2. Verifies `signature` against whichever public key it currently trusts
-   for `from` (the bootstrap key, or the last key `from` successfully
-   rotated to for this relationship).
-3. On success, replaces its stored key for `from` with
-   `new_public_key_der` and marks it **fresh** (not yet used to encrypt
-   anything). On failure (bad signature, or `from` unknown), the message
-   is dropped - the previously-trusted key for `from` is left in place.
-
-A client may only encrypt a message to a `PerMessage` peer using a key it
-currently holds marked fresh; doing so immediately marks that key
-**stale**. A stale key is never reused - see §11.5.
-
-### 11.5 Queueing while waiting for a fresh key
-
-If a client wants to send to a `PerMessage` peer for whom it does not
-currently hold a fresh key (never received one yet, or already used the
-one it has), the message is **not** sent - it is held in an in-memory,
-per-peer FIFO queue instead. There is no wire message for "queued" state;
-this is purely local client behavior.
-
-When a `KeyRotated` for that peer is validated (§11.4), the **entire**
+When a `KeyRotated` for that peer is validated (§13.10), the **entire**
 queue for that peer is flushed at once: every queued message is
 encrypted under the one newly-fresh key and sent, in FIFO order, in the
 same batch, and only then is that key marked stale again. This means one
 rotation can legitimately cover several messages' worth of plaintext, not
-strictly one - see §11.7 for why the receiver has to tolerate that.
+strictly one - see §13.10's retention discussion for why the receiver has
+to tolerate that.
 
-### 11.6 Voice streams count as one message
+### 11.2 Voice streams count as one message
 
-Live voice (§7.3) is not compatible with per-chunk rotation - RSA key
-generation at `rsa_per_msg`'s 4096-bit size (§11.9) is far too slow
-(commonly a few hundred milliseconds, sometimes low seconds - notably
-slower than the 2048-bit keys used everywhere else in this app) to repeat
-every `CHUNK_INTERVAL` (15ms) without stalling capture.
-Instead, an entire stream (`*Start` through `*End`) is treated as a
-single message for every purpose in this section:
+Live voice (§7.3) does not rotate per chunk - an entire stream (`*Start`
+through `*End`) is treated as a single message for every purpose in this
+section:
 
-- Recipient readiness is decided once, at `*Start`: a `PerMessage`
+- Recipient readiness is decided once, at `*Start`: a rotating-key
   recipient without a fresh key at that moment is simply left out of the
   stream's recipient list entirely (silently, same as any other
   partial-delivery case in §7.2) rather than queued - queueing audio for
   indeterminate later delivery has no sensible playback semantics.
 - Every chunk in the stream is encrypted with the one key snapshot taken
   at `*Start` for each included recipient - no rotation happens mid-stream.
-- The sender's own per-peer rotation (§11.3) fires once per recipient, at
-  `*End`, not at `*Start` and not per chunk. Symmetrically, a receiver's
-  own rotation (§11.3's "received" trigger) fires once, when that
-  stream's `*End` arrives (or the receiver's own idle timeout finalizes
-  it), not per chunk.
-
-### 11.7 Retained keys for late/batched decryption
-
-Because §11.5 can flush more than one message under a single key, and a
-`PerMessage` user rotates (and is entitled to discard the old private
-key) as soon as it has decrypted *one* message under the current key,
-naively discarding a superseded private key immediately would break
-decryption of the second and later messages in a batch that arrives
-right behind the first. There is no field anywhere in this protocol
-telling a receiver how many messages a sender flushed under one key, so
-a receiver cannot know exactly how long to keep an old key alive.
-
-The reference implementation resolves this with a bounded retention
-window per peer relationship (`KEY_RETENTION`, currently 8):
-instead of discarding a private key the instant it rotates away from it,
-it keeps the last `KEY_RETENTION` superseded keys for that peer and tries
-them, most-recent-first, whenever the current key fails to decrypt an
-incoming envelope. The shared bootstrap private key (§11.2) is retained
-for the whole session regardless, since it may still be the active key
-for other peers who haven't rotated yet. A batch larger than the
-retention window will fail to decrypt its oldest members once enough
-further rotations have superseded them - an accepted, documented
-limitation rather than a solved problem, since ordinary interactive use
-rarely queues more than a couple of messages before a round trip
-completes.
-
-### 11.8 What `rsa_per_msg` changes about the threat model
-
-Compared to a non-rotating `Rsa`/`Password`/`None` key, a compromise of a `PerMessage` user's *current*
-private key for a given peer at some point in time does not expose any
-message already exchanged with that peer before the most recent
-rotation - each such message was encrypted under a key that (outside the
-bounded retention window of §11.7) no longer exists anywhere. It does
-**not** protect a message still sitting in the sender's queue (§11.5) at
-the moment of compromise, and it does not change anything about traffic
-metadata visibility (§10) - key rotation messages are relayed exactly
-like any other addressed message, so the server still sees the same
-who/when/how-much it always did.
-
-### 11.9 Key size: 4096 bits, not the app's usual 2048
-
-Every RSA keypair `rsa_per_msg` ever generates - the bootstrap keypair
-announced in `Identify` (§11.2) and every keypair `rotate_for_peer`
-produces afterward (§11.3) - uses `crypto::RSA_PER_MSG_KEY_BITS = 4096`,
-not the `crypto::RSA_KEY_BITS = 2048` used for a non-rotating
-`Rsa`/`Password`/`None` `my_key` (§8.1). key generation
-is the same OS-RNG keygen path either way; only the requested modulus size
-differs. This is a deliberate asymmetry, not an oversight: a non-rotating
-key lives for the whole session, while a `rsa_per_msg` key is often discarded after
-protecting a single message (§11.8), so it errs toward a larger security
-margin per key at the direct cost of slower keygen on every rotation
-(§11.6) and larger OAEP ciphertext blocks (§8.1, §8.2) - 512 bytes per
-block instead of 256, roughly doubling the per-recipient wire/CPU cost
-this mode already pays.
-
-### 11.10 Rotation keygen runs off the event-loop task (client implementation detail)
-
-This is purely about how the reference client schedules work locally - it
-has no wire-protocol effect and an interoperable implementation is free to
-structure it differently, but it's worth documenting since getting it
-wrong produces a real, user-visible defect.
-
-§11.9's 4096-bit keygen is too slow (commonly 100ms to low seconds) to
-run inline on `session.rs::run_connected_session`'s single the event loop
-event-loop task, which
-also owns terminal redraw and all other network processing - every
-rotation (`request_rotation_if_per_message`) needs to happen once per
-peer, per message sent or received (§11.3), so running keygen there
-directly would stall the UI and delay every other in-flight
-send/receive/redraw for however long that keygen takes, repeated once per
-recipient for a channel message reaching several `rsa_per_msg` peers.
-
-Instead, keygen runs on `session.rs::spawn_rotation_worker` - one dedicated
-background thread, started once per session, fed a queue of "rotate for
-this peer" requests over an unbounded channel and processing them
-strictly one at a time:
-
-1. Briefly lock `OwnKeys` (shared with the main task via shared state)
-   just long enough to read the private key to sign against
-   (`current_private_for`).
-2. Generate the new keypair and sign it (`generate_and_sign_rotation`) -
-   the slow part - with **no lock held**, so this never blocks the main
-   task's own `OwnKeys` access (`decrypt_from` for incoming messages,
-   `current_private_for` for starting an incoming voice stream's decrypt
-   worker, §11.6).
-3. Briefly lock `OwnKeys` again to install the result
-   (`install_rotated_key`) and hand the resulting `ClientMessage::RotateKey`
-   back to the main task (over a second channel) to actually write to the
-   socket.
-
-Processing requests one at a time on a single worker, rather than one
-thread per request, is load-bearing, not just simplicity: two rotations
-for the *same* peer racing each other would each read whatever "current"
-key happened to be installed first and sign against it independently: if
-both finish before either result reaches the peer, the peer can only
-validate the one it still trusts (§11.4) - the loser's `RotateKey` looks
-like a bad signature and is silently dropped, leaving that peer stuck
-until the next legitimate rotation. A single serialized worker makes that
-race structurally impossible, at the cost of rotations for different
-peers queueing behind each other rather than running concurrently - an
-acceptable trade, since rotation is background housekeeping, not
-something a human is directly waiting on.
-
-The main task tracks how many requests have been handed to the worker but
-not yet finished with a plain a shared counter (a pending-rotation count,
-incremented in `request_rotation_if_per_message` before the send, decremented
-by the worker after it finishes processing one). Each UI tick reads this
-counter to drive the top-right spinner described in `docs/SPEC.md`
-Functionality #6 (the spinner) - purely a local read of a
-count, not a channel round-trip, since the UI only ever needs the current
-value at redraw time.
+- The sender's own rotation fires once per recipient, at `*End`, not at
+  `*Start` and not per chunk. Symmetrically, a receiver's own rotation
+  fires once, when that stream's `*End` arrives (or the receiver's own
+  idle timeout finalizes it), not per chunk.
 
 ## 12. Client-side identity pinning (`id_store`)
 
 **This entire section is client-local behavior with no wire-protocol
-effect** - like §11.10, it's documented here because getting it wrong
+effect** - it's documented here because getting it wrong
 produces a real, security-relevant defect, not because it changes anything
 that crosses the network. No message, field, or enum variant described
 anywhere above in this document is affected; a server, or a peer that
@@ -1880,11 +1657,11 @@ familiar nickname." `UserId` (§3) is assigned fresh on every successful
 holder disconnects and immediately available to the next connection that
 asks for it (§5.4) - there is no requirement, or even a mechanism, for a
 name to keep being held by the same underlying identity across two
-separate connections. Every peer's `public_key_der` is trust-on-first-use,
-fresh, on every single connection (§11.2 describes this explicitly for
-`PerMessage`'s bootstrap key, but it's equally true of a non-rotating
-`Rsa`/`Password`/`None` key - nothing before this section gave any peer a
-reason to remember a name's key from one session to the next). Concretely:
+separate connections. Every peer's `public_key_der` is trust-on-first-use
+on every single connection - nothing before this section gave any peer a
+reason to remember a name's key from one session to the next, regardless
+of whether the underlying key material itself is stable (`Password`,
+`PqHybrid`) or freshly generated (`None`). Concretely:
 if "alice" disconnects and reconnects, or if a second, different client
 connects using the nickname "alice" the moment the first one's connection
 drops, every other client sees exactly the same thing either way - a
@@ -1913,10 +1690,9 @@ either direction - the human reviewing it decides, the app never guesses.
 
 **Scope: this section is about byte-comparison pinning only** - the
 the pin-and-compare path path the identity check drives, where the
-alarm condition is "these bytes differ from last time". §12.6 adds a second,
-signature-based mechanism over the same store for `PerMessage` peers, whose
-key is *supposed* to differ every time; read both before concluding what is
-and isn't protected.
+alarm condition is "these bytes differ from last time". It is the only
+pinning mechanism this app has: every `KeyMode` either participates in it
+or is left unprotected, covered below.
 
 Under byte comparison, only `KeyMode`s whose key is actually the *same* key
 across two separate connections can be checked - not merely
@@ -1924,22 +1700,17 @@ across two separate connections can be checked - not merely
 
 | `KeyMode` | Checked? | Why |
 |---|---|---|
-| `Rsa` | yes | `resolve_my_keypair` loads the `public_key_der` from a file (`my_key`'s `file_pub`/`file_priv`) - the same file produces the same key on every connect, for as long as it exists |
 | `Password` | yes | `resolve_my_keypair` re-derives the keypair from the password via the password derivation (§8.3: PBKDF2 into a deterministic CSPRNG seed) - same password in, same keypair out, every time |
-| `PerMessage` | no — **but see §12.6** | `resolve_my_keypair` autogenerates `PerMessage`'s *bootstrap* keypair fresh, at `RSA_PER_MSG_KEY_BITS`, on every single connect - exactly like `None` below, not like `Rsa`/`Password` above. Nothing persists it between sessions, so the very same legitimate user reconnecting announces a genuinely different bootstrap key every time. Comparing it would flag a false "possible impersonation" on every single reconnect - worse than not checking at all, since a warning that fires constantly for no reason trains a user to dismiss it, including the one time it's real. (The keys `rotate_for_peer`, §11.3, produces *after* the bootstrap key are equally unsuited to comparison, for the same underlying reason - they're supposed to change.) |
-| `None` | no | autogenerated fresh every connect by design (§3) - same reasoning as `PerMessage`'s bootstrap key above, and with no §12.6-style continuity mechanism to fall back on either |
+| `PqHybrid` | yes | the identity keybundle is loaded from a file (§13.2) - the same file produces the same bundle on every connect, for as long as it exists. Rotation (§13.10) only ever changes the encryption half, never the identity that gets pinned here |
+| `None` | no | autogenerated fresh every connect by design (§3) - nothing persists it between sessions, so the very same legitimate user reconnecting announces a genuinely different key every time. Comparing it would flag a false "possible impersonation" on every single reconnect - worse than not checking at all, since a warning that fires constantly for no reason trains a user to dismiss it, including the one time it's real |
 
 In short: byte comparison only works for the two `my_key` types backed by a
 secret the user actually holds onto between sessions (a key file, or a
 password they remember). For a `my_key` type whose key material is, by
 design, thrown away and regenerated at every connect, there is no stable
 byte string to compare - which is a statement about *this* mechanism, not
-about `id_store` as a whole. `PerMessage` gets its own answer in §12.6:
-rather than comparing the key, it re-establishes the rotation chain across
-the reconnect and verifies a *signature* against the previously pinned key,
-using the same store as the anchor. `None` is the only `KeyMode` this
-document leaves genuinely unprotected - it has neither a stable key to
-compare nor a rotation chain to resume.
+about `id_store` as a whole. `None` is the one `KeyMode` this document
+leaves genuinely unprotected - it has no stable key to compare.
 
 **The store pins the full `public_key_der` bytes, not a hash of them** -
 the pin-and-compare path compares raw DER byte-for-byte, and saving the store
@@ -1994,8 +1765,7 @@ and on a byte difference:
    what's stored or compared (§12.2). Two buttons, `Accept` and `Reject`,
    are shown; `Reject` is focused by default (the review buttons) so
    accepting always takes a deliberate move off the safer default rather
-   than an accidental confirm. This is purely a local UI cue, exactly like
-   the `rsa_per_msg` regeneration spinner (§11.10) - it has no
+   than an accidental confirm. This is purely a local UI cue - it has no
    wire-protocol meaning and isn't sent to or expected from peers.
 2. Gates messaging with that peer until the popup is resolved (see below) -
    a real behavior change from the passive banner this replaced, which left
@@ -2097,237 +1867,7 @@ safe overall (a user working around a startup failure by disabling the
 feature entirely) rather than more.
 
 
-### 12.6 Extending identity pinning to `rsa_per_msg` (`own_next_keys`)
-
-§12.2 excludes `PerMessage` from byte-comparison pinning: its bootstrap key is freshly
-autogenerated on every connect (`resolve_my_keypair`), so there is nothing
-byte-stable to pin the way `rsa`/`password` allow. That leaves a real gap
-`rsa_per_msg` users have no protection from at all - reconnecting is
-wire-indistinguishable from a stranger taking a familiar nickname. This
-section closes it, **without any wire-protocol change** - `RotateKey`/
-`KeyRotated` (§7.5) already carry everything needed; this is entirely new
-client-side persistence and decision logic layered on top of them.
-
-**The core idea**: reuse the *existing* per-peer rotation chain (§11.3/
-§11.4) as the verification mechanism, but give it something to survive a
-reconnect on. `UserId` resets every connection, so the whole in-session
-chain for a peer relationship - everything the sender's own rotating keys/`RemoteKeys`
-track - dies with the connection today (§11.8's forward secrecy, by
-design). §12.6 persists just enough to *resume* that chain from where it
-left off, once, right after reconnecting - not to extend its lifetime
-indefinitely, and not to weaken what it already protects.
-
-#### 12.6.1 What's persisted, on each side
-
-Two independent, symmetric pieces of state, each keyed by **nickname**
-(never `UserId`, for the same reason §12.1 gives: `UserId` doesn't survive
-a reconnect, nicknames are the only stable handle across one):
-
-- **Sending**: this client's own *current* per-peer private key for each
-  `rsa_per_msg` relationship it has established, in a new local store,
-  the continuity store - the literal private key the sender's own rotating keys
-  already holds in memory for that peer, mirrored to disk. Only relevant
-  when this session's own `key_mode` is `PerMessage`.
-- **Verifying**: the peer's last-verified rolling public key, pinned in
-  the **same** the identity store that already handles `rsa`/`password`
-  (§12.2-§12.5) - reused unchanged, just invoked from a different trigger
-  point (§12.6.3) and with different handling of what a "mismatch" means
-  (§12.6.4). Relevant regardless of this client's own `key_mode` - you can
-  verify an `rsa_per_msg` peer's continuity even if your own `my_key` is
-  something else entirely.
-
-Only ever the single *current* key on either side - never a history. A
-the sender's own rotating keys-style retention buffer (`KEY_RETENTION = 8`, §11.7) exists
-for a completely different reason - tolerating a small in-flight backlog
-of queued messages within one live connection - and has no bearing here:
-once a connection ends, there is no backlog left to bridge, only a single
-"whatever the key was when we last touched it" starting point for next
-time.
-
-**The accepted tradeoff**: this persists private key material that §11.8
-has always described as memory-only, discarded on rotation and on
-disconnect. A copy of `own_next_keys` stolen while its owner is offline
-lets an attacker impersonate the *continuation* of specifically the peer
-relationships recorded in it, on the owner's next reconnect - until the
-real owner reconnects too and re-establishes trust, or the victim notices.
-This is a materially smaller and more contained exposure than a single
-long-lived signing-only identity key would be (rejected during this
-feature's design in favor of this approach): a leak here compromises only
-already-established relationships recorded in the file, one at a time,
-never a client's entire identity toward everyone, past or future. Message
-*content* stays exactly as protected as before either way - the keys that
-actually decrypted past messages were superseded ones, and those are still
-never written anywhere.
-
-#### 12.6.2 Sending: resuming on reconnect
-
-The moment a client (own `key_mode == PerMessage`) first learns of a peer
-this connection - via `UserJoined`, the same first-sighting gate
-`check_identity` already uses - it checks `own_next_keys` for an entry
-matching that peer's nickname. If there is one:
-
-1. Installs that persisted private key as the *current* key for the
-   peer's brand-new `UserId` in the sender's own rotating keys (`install_rotated_key`'s
-   existing "no prior state for this peer" branch, unchanged - seeding a
-   fresh `UserId` this way is indistinguishable to it from a genuinely
-   first-ever rotation).
-2. Signs that same key's own public half with itself - a self-assertion,
-   proof of possession bound to the peer's new `UserId` via the same
-   `rotation_signing_payload` (§11.3) every ordinary rotation already
-   uses. No new keypair is generated for this step (unlike an ordinary
-   rotation) - there is nothing to rotate *to* yet, only a claim to
-   re-assert; ordinary per-message rotation (§11.3) resumes from here,
-   unmodified, on the next real message with that peer.
-3. Sends it as a perfectly ordinary `ClientMessage::RotateKey { to, new_public_key_der, signature }`
-   - wire-identical to any other rotation. No new message type, no new
-   field.
-
-This happens *before* any application message is exchanged with that
-peer, unprompted - not gated on the peer actually talking first.
-
-#### 12.6.3 Verifying: gate on sight, only a proof clears it
-
-A receiver's existing `handle_key_rotated` only ever checked an incoming
-`KeyRotated` against whatever key is currently live-registered for the
-sender's `UserId` (§11.4). For a genuine resume, that check necessarily
-fails - a reconnecting peer has a brand-new `UserId` with no live rotation
-state at all yet. the two-anchor check is the fix: it tries the
-live in-session key first, and only if that fails, tries the sender's
-nickname against `id_store`'s pinned continuity key. Returns which anchor
-(if either) verified it - `Live`, `Resumed`, or `Failed`
-(the resume outcome) - pure decision logic, no I/O, fully
-unit-testable independent of the async orchestration around it
-(covered by the resume tests).
-
-**`Live` alone is not proof of cross-session identity, and must never be
-treated as if it were.** It only says a rotation is self-consistent with
-whatever this same connection already announced - true of *any* rotation
-from *anyone*, honest or not, the first time a fresh `UserId` rotates,
-since nothing else has claimed that live slot yet. Trusting it
-unconditionally would mean a nickname's whole history in `id_store` counts
-for nothing the moment someone (attacker or a legitimate user who lost
-`own_next_keys`) reconnects under it without even attempting to claim
-continuity: their first ordinary, self-signed rotation would verify as
-`Live` and silently overwrite the real pin - exactly the gap this
-mechanism exists to close, just reopened at one remove. So a nickname's
-identity is gated the moment it's seen again, **before** any rotation is
-attempted, and only a genuine proof - never mere self-consistency - clears
-that gate:
-
-- the identity check runs this check itself now, not only
-  `handle_key_rotated`: the instant a `PerMessage` peer's `UserJoined`
-  arrives (§12.3's usual "first time this `UserId` is seen" gate), if
-  `id_store` already has a continuity key pinned for their nickname, it
-  opens a review immediately - `push_identity_review` (§12.4's mechanism,
-  reused verbatim), worded `'bob' is using rsa_per_msg under a nickname
-  previously linked to a different session's key, and hasn't proven
-  continuity with it - possible impersonation. Accept their new key, or
-  reject it.` A nickname with nothing pinned yet is untouched here, same as
-  always - first contact, still trust-on-first-use.
-- From then on, `handle_key_rotated` decides what (if anything) an
-  incoming `KeyRotated` does to that gate:
-  - `Resumed` - an actual signature verified against the pinned
-    continuity key - installs the new key via `install_trusted_rotation`
-    (the client, refreshes and saves the `id_store`
-    pin, flushes any messages queued for this peer's key - §11.5) and, if
-    `check_identity` had a review open for them, silently resolves it
-    exactly as an `Accept` would (held messages included) - genuinely
-    proven, so there is nothing left to ask a person.
-  - `Live` while **not** gated (nothing was ever pinned for this
-    nickname, or it's already fully trusted this session) gets the same
-    `install_trusted_rotation` treatment - there was nothing to prove in
-    the first place, so this is just an ordinary rotation.
-  - `Live` while **gated** installs nothing and does not clear the
-    review - self-consistency isn't proof - but does refresh it to point
-    at this newest key, so that an `Accept`, if a person gives one, still
-    installs something the peer can actually decrypt with rather than a
-    stale bootstrap key they may have already rotated away from.
-  - `Failed` installs nothing either way; if `id_store` had a continuity
-    key pinned for that nickname (whether or not `check_identity` had
-    already gated them for it), it opens or refreshes a review worded for
-    an outright failed proof rather than "hasn't tried yet": `'bob'
-    reconnected but couldn't prove continuity with a previous session
-    (invalid resume signature) - possible impersonation. Accept their new
-    key, or reject it.` There's no old-vs-new fingerprint pair to show
-    here the way a static mismatch has, since a rolling key is *supposed*
-    to change on every rotation.
-
-A first-ever `rsa_per_msg` contact has nothing pinned to gate against and
-is never treated as suspicious just for that - same as before. A peer
-whose own client doesn't implement resume at all is a genuinely different
-case from before this fix: if nothing was ever pinned for their nickname,
-they're still just an ordinary first contact; but if something *was*
-pinned, `check_identity`'s gate now catches them regardless of whether
-they ever attempt (or fail) a resume, since the gate no longer depends on
-an attempt happening at all. Accepting an open review, from any of the
-above, runs the identical `install_trusted_rotation` sequence a `Resumed`
-anchor's silent success gets, just triggered by a person instead; rejecting
-it installs nothing, same as `Live`-while-gated or `Failed` already leave
-in place on their own. Because a silent `Resumed` resolution can land on a
-peer whose review isn't the one currently shown in the popup (a second
-peer's continuity can verify while a first peer's review is still open -
-§12.4's queue), resolving a review removes that specific peer from the
-queue wherever they are, not only when they're at the front
-(accepting a review/`remove_from_identity_review_queue`).
-
-#### 12.6.4 Why this is a different kind of "mismatch" than §12.2-§12.5
-
-For `rsa`/`password`, any byte change at all is the alarm signal - the key
-is supposed to never change, full stop. Reusing `id_store` here works
-*because* `rsa_per_msg` peers are checked differently: every legitimate
-rotation - whether an ordinary in-session one or a resume - genuinely
-changes the pinned bytes, on purpose, constantly. The byte comparison
-the pin-and-compare path performs is therefore never itself the alarm
-condition for `PerMessage` peers; it's just bookkeeping, called only once a
-key is already trusted (by an anchor, or by a person via `Accept`) - never
-*before*, the way a bare byte comparison would be. The alarm condition here
-is two-sided, both halves keyed off the same fact ("a nickname we did have
-something pinned for"): `check_identity` raises it the instant such a
-nickname is seen again at all (§12.6.3), and separately,
-`handle_key_rotated` raises or refreshes it for "a signature that verifies
-against neither anchor" (`Failed`) or "only proves self-consistency, not
-continuity" (`Live` while already gated) - neither is something
-`id_store`'s own `IdCheck` return value has any way to express on its own,
-which is why `handle_key_rotated` branches on `ResumeVerification` first
-and only *afterward* (on a `Resumed` success) touches `id_store` -
-structurally the same discipline §12.4's `rsa`/`password` path now follows
-too (compare via a read of the store first, only `check_and_pin` on a trusted
-outcome), even though the two paths reach that outcome differently: §12.4
-needs a human's `Accept`, §12.6.3 can also reach it automatically, but only
-via a genuinely verified `Resumed` - `Live` no longer suffices once a
-nickname has real history to live up to.
-
-One consequence worth naming: `id_store.save()` (and, on the sending side,
-`own_next_keys.save()`) now happens on essentially every rotation for an
-active `rsa_per_msg` relationship - i.e. on every message exchanged with
-one, not just once per reconnect the way §12.4's `New`/`Mismatch`-gated
-saves do for `rsa`/`password`. This is a deliberate simplicity/robustness
-tradeoff over debouncing the writes: persisting on every rotation means a
-crash between rotations degrades gracefully (the next reconnect's resume
-attempt just fails to verify, falling back to an ordinary unverified
-first-sighting-shaped case - never a false alarm), at the cost of more
-frequent, small, local file writes than §12.4's mechanism needs.
-
-#### 12.6.5 Store format and location (`own_next_keys`)
-
-Same shape as `id_store` (§12.5), storing private keys instead of public
-ones:
-
-```
-<nickname><TAB><hex-encoded PKCS8 DER private key>\n
-```
-
-Resolved the same way, via the connect popup's `own_next_keys` field
-(shown only when `my_key` is `rsa_per_msg`, `docs/SPEC.md`'s "Not
-connected UI"): always `~/.aloo/own_next_keys`, same rule (and same
-"never a loose cwd file of its own accord") as `id_store` above - freely
-editable, never auto-preferred from the current directory. A missing or
-otherwise-unreadable file behaves exactly as §12.5 describes for
-`id_store` - never blocks connecting, falls back to an empty, in-memory-
-only store for that session instead (`connect.rs::load_own_next_keys`).
-
-
-### 12.7 Making a pin worth more than "these bytes differ"
+### 12.6 Making a pin worth more than "these bytes differ"
 
 Everything above can only say that a key changed. It cannot say *why*, and
 the two reasons are not remotely alike: a friend who regenerated their
@@ -2408,9 +1948,9 @@ and the protocol has no way around it without an anchor outside itself.
 
 ## 13. Post-quantum hybrid encryption (`pq_hybrid`)
 
-`KeyMode::PqHybrid` is a fifth `my_key` method: ML-DSA-87+RSA-4096 signing,
-ML-KEM-1024+RSA-4096 key-wrap, AES-256-GCM bulk encryption. Unlike every
-other method in this document, it is not built on RSA-OAEP-per-recipient at
+`KeyMode::PqHybrid` is the third `my_key` method: ML-DSA-87+RSA-4096 signing,
+ML-KEM-1024+RSA-4096 key-wrap, AES-256-GCM bulk encryption. Unlike the
+other methods in this document, it is not built on RSA-OAEP-per-recipient at
 all (§8) - it needs a shared symmetric key by construction, so it is
 documented here as its own, self-contained model rather than a variation on
 §7-§8's. Like §11/§12, this section has real wire-visible pieces (a new
@@ -2419,9 +1959,9 @@ contain for it) but otherwise reuses existing message types unchanged - no
 new `ClientMessage`/`ServerMessage` variant, no change to `Envelope`'s or
 `UserInfo`'s shape.
 
-### 13.1 Why a fifth method, and why it looks different
+### 13.1 Why this method, and why it looks different
 
-The other four methods share one property: RSA-OAEP encryption needs
+The other two methods share one property: RSA-OAEP encryption needs
 nothing from the *sender* except the recipient's public key - no identity,
 no private key, no signature. That is what lets any client encrypt to any
 recipient regardless of the sender's own `my_key` choice, and it is exactly
@@ -2477,8 +2017,8 @@ This half never changes. It is what proves a message came from you, what
 Two primitives again, so a break of either alone is not enough. X25519
 rather than RSA-4096 here because this half is regenerated per peer, per
 message, and X25519 keygen is microseconds where RSA-4096's is hundreds of
-milliseconds - the same reason `rsa_per_msg` (§11.9) needs a background
-worker and a carve-out for voice, and this does not. The pairing is the
+milliseconds - cheap enough to run inline on the event-loop task, with no
+background worker and no carve-out for voice needed. The pairing is the
 same shape as the IETF's X-Wing construction, at a higher ML-KEM parameter
 set.
 
@@ -2504,9 +2044,8 @@ itself ever writes to disk.
 
 `public_key_der` in `Identify`/`UserInfo` carries the encoded
 `PqPublicBundle` for this `KeyMode` - reusing the existing field opaquely,
-the same trick already used for `rsa_per_msg`'s resume mechanism (§12.6)
-and file transfer's `FileOfferPayload` convention (§7.6). No wire schema
-change to `Identify` or `UserInfo` at all.
+the same trick file transfer's `FileOfferPayload` convention (§7.6)
+already uses. No wire schema change to `Identify` or `UserInfo` at all.
 
 ### 13.3 One layout for everything: a setup, then chunks
 
@@ -2656,10 +2195,10 @@ when verifying.
 
 ### 13.5 Key size and parameter choices
 
-The RSA signing key is 4096 bits - the same size `rsa_per_msg` uses
-(§11.9), chosen for the same reason: extra security margin, at the cost of
-slower keygen, paid once at `aloo --keygen-pq-hybrid` time rather than per
-message. It is the only RSA key a `pq_hybrid` identity has; the encryption
+The RSA signing key is 4096 bits, larger than the 2048-bit keys this app
+uses elsewhere, for extra security margin - at the cost of slower keygen,
+paid once at `aloo --keygen-pq-hybrid` time rather than per message. It
+is the only RSA key a `pq_hybrid` identity has; the encryption
 side's classical hedge is X25519 (§13.2), because that half rotates and
 RSA keygen is far too slow to repeat per message.
 
@@ -2673,18 +2212,17 @@ Because step 1 needs the *sender's* ML-DSA-87/RSA-sign identity, and only a
 `pq_hybrid` client has one:
 
 - **A `pq_hybrid` recipient can only be addressed by a `pq_hybrid`
-  sender.** A sender whose own `my_key` is `rsa`/`password`/`none`/
-  `rsa_per_msg` has no way to produce a valid `SendSetup` signature - such a
-  recipient is silently excluded from that sender's channel/DM/file/voice
-  send, the same partial-delivery pattern as any other unreachable
-  recipient in this app (an offline member, a not-yet-fresh `rsa_per_msg`
-  key, §11.5/§11.6). the addressing rule is the reference
-  implementation of this check.
+  sender.** A sender whose own `my_key` is `password`/`none` has no way to
+  produce a valid `SendSetup` signature - such a recipient is silently
+  excluded from that sender's channel/DM/file/voice send, the same
+  partial-delivery pattern as any other unreachable recipient in this app
+  (an offline member, a not-yet-fresh rotating-key recipient, §11.1/§11.2).
+  the addressing rule is the reference implementation of this check.
 - **A `pq_hybrid` sender can still address any non-`pq_hybrid` recipient
   normally** - RSA-OAEP (§8) needs no sender identity at all, so a
   `pq_hybrid` client falls straight through to the ordinary `encrypt_for_one`
-  path for an `rsa`/`password`/`none`/`rsa_per_msg` recipient, exactly like
-  any other sender would.
+  path for a `password`/`none` recipient, exactly like any other sender
+  would.
 
 A mixed channel - some members `pq_hybrid`, some not - therefore behaves
 asymmetrically per sender: a `pq_hybrid` member's message reaches everyone;
@@ -2693,12 +2231,12 @@ members.
 
 ### 13.7 Voice streaming (and file transfer chunks)
 
-`pq_hybrid` voice is not just "supported" but a *better* fit than every RSA
-method: the expensive asymmetric work (ML-DSA-87 sign, ML-KEM-1024
-encapsulate, RSA-4096 operations) happens once per stream, not once per
-15ms chunk - unlike `rsa_per_msg`, which has to exempt voice from its own
-per-message rotation entirely because 4096-bit RSA keygen is far too slow
-to repeat every chunk (§11.6).
+`pq_hybrid` voice is a good fit for the same reason its rotation is cheap
+in general (§13.2): the expensive asymmetric work (ML-DSA-87 sign,
+ML-KEM-1024 encapsulate, RSA-4096 operations) happens once per stream, not
+once per 15ms chunk - it still respects the "voice counts as one message"
+rule (§11.2) rather than rotating mid-stream, even though its own keygen
+would be cheap enough to afford it.
 
 A stream is sealed by exactly the construction §13.3 describes, so there is
 little left to say here that isn't already said there:
@@ -2732,29 +2270,23 @@ not a stream) travels as a one-chunk send instead.
 ### 13.8 Identity pinning
 
 A `pq_hybrid` *identity* is static and file-loaded - stable across
-reconnects by construction, exactly like `rsa` (a key file) and `password`
-(a deterministic re-derivation). Rotation (§13.10) does not change that:
-what rotates is the encryption half, which is not what gets pinned.
+reconnects by construction, exactly like `password` (a deterministic
+re-derivation). Rotation (§13.10) does not change that: what rotates is
+the encryption half, which is not what gets pinned.
 
-So the bundle participates in `id_store`'s ordinary byte-comparison pinning
-unchanged (§12.2's table gains a `PqHybrid: yes` row) -
-the pinning predicate is the single predicate
-`check_identity` consults, covering exactly `Rsa`/`Password`/`PqHybrid`.
-
-It has **no** need for `rsa_per_msg`'s resume mechanism (§12.6,
-`own_next_keys`) - that machinery exists purely to bridge a bootstrap key
-that changes every reconnect. A `pq_hybrid` bundle does not change between
-reconnects, so a plain byte comparison is already definitive, and every
-rotation is separately verifiable against that same pinned bundle.
+So the bundle participates in `id_store`'s ordinary byte-comparison
+pinning unchanged (§12.2's table) - the pinning predicate is the single
+predicate `check_identity` consults, covering exactly `Password`/
+`PqHybrid`.
 
 ### 13.9 Client convenience: auto-generated keys and the connect-popup cache
 
-Like §11.10/§12, this is purely client-local behavior with no wire-protocol
+Like §12, this is purely client-local behavior with no wire-protocol
 effect - a server, or a peer whose client doesn't implement this section at
 all, is fully interoperable with one that does. It exists because `13.2`'s
 file-loaded keybundle would otherwise be the one `my_key` type that can't
-be used the moment you open the app for the first time - every other type
-either needs nothing prepared (`none`, `rsa_per_msg`'s bootstrap) or fails
+be used the moment you open the app for the first time - `none` needs
+nothing prepared, and every other type fails
 with an actionable, immediate error naming exactly which field is empty. A
 blank `file_pub`/`file_priv` for `pq_hybrid` would technically fail the
 same validation, but with no in-app way to fix it short of quitting,
@@ -2787,8 +2319,8 @@ the key material, the first time that location is used to connect.
 remembers, per `(host, port)`, the `pq_hybrid` `file_pub`/`file_priv` last
 used to connect there - a flat `host<TAB>port<TAB>file_pub<TAB>file_priv`-
 per-line file, oldest-used first, tolerant of a missing file (first run) or
-a malformed line, the same conventions the identity store/
-the continuity store already use. Every submitted `pq_hybrid`
+a malformed line, the same conventions the identity store already uses.
+Every submitted `pq_hybrid`
 connect attempt records/updates its `(host, port)` entry (moving it to
 "most recently used") *before* the connection attempt itself, regardless of
 whether that attempt succeeds - this remembers "the last values used in the
@@ -2803,40 +2335,32 @@ and each server keeps its own remembered identity rather than sharing one
 global default); otherwise (first run, empty cache) a fresh location is
 assigned per the previous paragraph. Both paths are one-shot, evaluated
 once before the popup is ever shown - not reactively as the user edits
-host/port afterward, the same convention `id_store`/`own_next_keys`/the
-nickname field already use for their own prefills.
+host/port afterward, the same convention `id_store`/the nickname field
+already use for their own prefills.
 
 
 ### 13.10 Rotating encryption keys (forward secrecy)
 
 A `pq_hybrid` identity's signing half never changes; its **encryption half
 rotates per peer relationship**, once for every message sent to that peer
-and once for every message received from them. Each superseded key is
-destroyed. That is the whole mechanism, and what it buys is this: someone
-who later steals the keybundle file gets your identity, not your history.
+and once for every message received from them (a live voice stream
+counts as a single message for this purpose - §11.2, not one rotation
+per chunk). Each superseded key is destroyed. That is the whole
+mechanism, and what it buys is this: someone who later steals the
+keybundle file gets your identity, not your history.
 
-The shape is deliberately the one §11 already established for
-`rsa_per_msg` - rotate per message, keep a bounded window of superseded
-keys, count a whole voice stream as one message - so there is one model to
-learn rather than two. What differs:
-
-| | `rsa_per_msg` (§11) | `pq_hybrid` (here) |
-|---|---|---|
-| What rotates | the identity key itself | the encryption keys only |
-| What signs a rotation | the key being replaced | the durable identity |
-| Verifying across a reconnect | needs the §12.6 resume mechanism | nothing special - the verifying key never changed |
-| Keygen cost | RSA-4096: 100ms to seconds | ML-KEM + X25519: microseconds |
-| Scheduling | background worker (§11.10) | inline; no worker, no spinner |
-| Voice | exempt from per-message rotation (§11.6) | not exempt; rotation is cheap |
+Rotation is cheap here - ML-KEM + X25519 keygen is microseconds, against
+the hundreds of milliseconds an RSA-4096 keygen would cost - so it runs
+inline on the client's event-loop task with no background worker needed.
 
 **Bootstrap.** Before a relationship has rotated even once, a peer
 encrypts to the bootstrap keys from the `PqPublicBundle` they announced.
-Unlike §11.2's bootstrap this one is *signed material from a pinned
-identity*, not trust-on-first-use in its own right - but it is the one
-encryption key the keybundle file holds, so **a first message exchanged
-before either side rotates is not forward-secret**. This is stated plainly
-rather than glossed: forward secrecy begins at the first rotation, which
-is triggered by that very first message.
+This is *signed material from a pinned identity*, not trust-on-first-use
+in its own right - but it is the one encryption key the keybundle file
+holds, so **a first message exchanged before either side rotates is not
+forward-secret**. This is stated plainly rather than glossed: forward
+secrecy begins at the first rotation, which is triggered by that very
+first message.
 
 **Rotating and offering.** A rotation is carried by the existing
 `RotateKey`/`KeyRotated` relay (§7.5), whose opaque fields carry:
@@ -2853,9 +2377,12 @@ signed with the sender's ML-DSA-87 and RSA-4096-PSS keys - the durable
 identity, not the key being replaced. Binding both `to` (the live
 connection) and `recipient_fp` (the durable identity) is what stops one
 peer replaying a rotation as though it had been addressed to them.
+Verifying across a reconnect needs nothing special, since the verifying
+key (the durable identity) never changes.
 
-The server's only change is which senders it will relay for: both rotating
-modes may, the static ones may not. It still verifies nothing.
+The server's only change is which senders it will relay for: only
+`pq_hybrid` senders may, the static modes may not. It still verifies
+nothing about the payload itself.
 
 **Receiving one.** Verify both signatures against the identity already
 pinned for that peer, check the rotation names us, and refuse any
@@ -2865,14 +2392,14 @@ since obtained. A rotation that fails any of these is dropped and the
 previously trusted keys are left exactly as they were, so a forged
 rotation can neither strand a relationship nor downgrade it. A successful
 install makes that peer *fresh* again, releasing anything queued for them
-(§11.5's queueing, reused unchanged).
+(§11.1's queueing, reused unchanged).
 
 **Retention.** Superseded decryption keys are kept, newest first, up to
 `PQ_KEY_RETENTION` (8) per peer - long enough that a burst flushed under
 one key, or a message already in flight when we rotate, still opens.
 Beyond that they are dropped, and **the bound is the guarantee**: a key
 that falls out of the window is gone, so nothing that survives can reopen
-what it protected. The same reasoning and the same value as §11.7.
+what it protected.
 
 When a peer's connection ends, everything remembered for them - their
 current keys, ours for them, their replay counter - is discarded. A later
@@ -2885,26 +2412,24 @@ rotations and impersonate the identity indefinitely; recovering from that
 needs a new keybundle and re-pinning, not a ratchet. That gap is real and
 is the one place MLS-style group ratcheting remains stronger.
 
-## 14. The four encryption methods, side by side
+## 14. The three encryption methods, side by side
 
 Everything above describes mechanisms; this is the summary of what a user
-actually picks between. There are four methods. `KeyMode` (§3) has five
-values because `rsa` has a rotating variant, but `rsa` and `rsa_per_msg`
-are the same method with one property changed - same primitive, same
-per-recipient encryption, same everything except how long a key lives.
+actually picks between. There are three methods, matching `KeyMode`'s
+(§3) three values one for one.
 
-| | **plain** (`none`) | **password** | **rsa** (and `rsa_per_msg`) | **pq-hybrid** |
-|---|---|---|---|---|
-| Tag shown | `🚨 PLAIN` | `🚨 PWD` | `🔒 RSA` / `🔒 RSAPM` | `🛡️ PQH` |
-| Where the key comes from | generated at connect | derived from a password (§8.3) | loaded from a file | loaded from a keybundle file |
-| Message encryption | RSA-OAEP per recipient (§8) | same | same | ML-KEM-1024 + X25519 wrap, AES-256-GCM content (§13.3) |
-| Signed by the sender? | no | no | no | yes - ML-DSA-87 **and** RSA-4096-PSS, both must verify |
-| Post-quantum? | no | no | no | yes, key exchange and signatures both |
-| Identity survives a reconnect? | no | yes | yes | yes |
-| Byte-comparison pinning (§12)? | no | yes | `rsa` yes, `rsa_per_msg` no (§12.6) | yes |
-| Forward secrecy? | no | no | `rsa_per_msg` only (§11) | yes (§13.10) |
-| Recipient/room binding, replay protection? | no | no | no | yes (§13.3) |
-| Who can address it? | anyone | anyone | anyone | only another `pq_hybrid` sender (§13.6) |
+| | **plain** (`none`) | **password** | **pq-hybrid** |
+|---|---|---|---|
+| Tag shown | `🚨 PLAIN` | `🚨 PWD` | `🛡️ PQH` |
+| Where the key comes from | generated at connect | derived from a password (§8.3) | loaded from a keybundle file |
+| Message encryption | RSA-OAEP per recipient (§8) | same | ML-KEM-1024 + X25519 wrap, AES-256-GCM content (§13.3) |
+| Signed by the sender? | no | no | yes - ML-DSA-87 **and** RSA-4096-PSS, both must verify |
+| Post-quantum? | no | no | yes, key exchange and signatures both |
+| Identity survives a reconnect? | no | yes | yes |
+| Byte-comparison pinning (§12)? | no | yes | yes |
+| Forward secrecy? | no | no | yes (§13.10) |
+| Recipient/room binding, replay protection? | no | no | yes (§13.3) |
+| Who can address it? | anyone | anyone | only another `pq_hybrid` sender (§13.6) |
 
 Reading the table honestly:
 
@@ -2913,16 +2438,12 @@ Reading the table honestly:
   nothing distinguishes a returning contact from a stranger.
 - **password** buys a reproducible identity with nothing to carry around,
   at the cost that anyone who learns the password *is* you.
-- **rsa** is the conventional choice: a durable key file, pinned by
-  contacts. `rsa_per_msg` adds forward secrecy by rotating the identity
-  key itself, which is why it cannot be pinned by comparison and needs
-  §12.6's resume machinery.
 - **pq-hybrid** is the default and the only one that is post-quantum,
   signed, bound to its recipient and room, replay-protected, and forward
   secret at once. Its cost is that it only talks to its own kind (§13.6).
 
-The three RSA-family methods share §8's model entirely; only their key
-*sourcing* and lifetime differ. `pq_hybrid` is a different construction
+**plain** and **password** share §8's RSA-OAEP model entirely; only their
+key *sourcing* differs. `pq_hybrid` is a different construction
 throughout, which is why §13 is self-contained rather than a variation on
 §8.
 
@@ -2992,7 +2513,7 @@ Details are in the sections referenced.
    |--- RotateKey { to } --->|--- KeyRotated { from } ->|
 ```
 
-**Replacing an identity** (§12.7) - no protocol exchange at all
+**Replacing an identity** (§12.6) - no protocol exchange at all
 
 ```
   aloo --rekey-pq-hybrid old new     # signs the new identity with the old

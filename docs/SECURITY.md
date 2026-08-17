@@ -42,7 +42,7 @@ finding of an audit.
 gets an attacker the *signing* half, which lets them sign rotations and
 impersonate that identity indefinitely. Recovering requires generating a
 new keybundle and having contacts re-pin it (a continuity certificate makes
-that painless, §12.7), not an automatic ratchet. MLS-style group ratcheting
+that painless, §12.6), not an automatic ratchet. MLS-style group ratcheting
 heals from compromise on its own; this does not. This is the largest
 remaining gap.
 
@@ -53,7 +53,7 @@ that file. Every message after the first rotation is not.
 
 **A first contact is trust-on-first-use.** With no prior pin and no
 identity card, there is nothing to check a stranger's identity against.
-Safety phrases and identity cards (§12.7) exist to close this, but they
+Safety phrases and identity cards (§12.6) exist to close this, but they
 require the user to do something out of band. No protocol can fix this
 without an anchor outside itself.
 

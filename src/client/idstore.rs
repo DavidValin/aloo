@@ -15,16 +15,12 @@
 //!
 //! Byte comparison (`check_and_pin` returning `Mismatch`, driven by
 //! `session::check_identity`) is only meaningful for `KeyMode`s whose key
-//! is stable across connections (`Rsa`/`PqHybrid`: file-loaded;
-//! `Password`: deterministically re-derived - see
-//! `keymode_policy::uses_byte_comparison_pinning`). `None`/`PerMessage`
-//! keys (including `PerMessage`'s bootstrap key) are freshly generated on
-//! every connect, so comparing them would raise a false impersonation
-//! warning on every reconnect - training users to dismiss the warning that
-//! matters. `PerMessage` peers still get entries, refreshed by
-//! `session::handle_key_rotated` and read back as the §12.6 resume
-//! verification anchor: for them a byte difference is expected and
-//! ignored - the alarm is a signature verifying against neither anchor.
+//! is stable across connections (`PqHybrid`: file-loaded; `Password`:
+//! deterministically re-derived - see
+//! `keymode_policy::uses_byte_comparison_pinning`). `None` keys are
+//! freshly generated on every connect, so comparing them would raise a
+//! false impersonation warning on every reconnect - training users to
+//! dismiss the warning that matters.
 
 use std::collections::HashMap;
 use std::fs;
@@ -218,9 +214,8 @@ impl IdStore {
     }
 
     /// Reads whatever is currently pinned for `nickname`, without pinning
-    /// or mutating anything - used by the `rsa_per_msg` continuity/resume
-    /// path (`docs/PROTOCOL.md` §12.6) to fetch a candidate verification
-    /// anchor *before* deciding whether an incoming rotation is legitimate,
+    /// or mutating anything - used by `session::check_identity` to compare
+    /// against an announced key without re-pinning it as a side effect,
     /// which `check_and_pin` alone can't do (it always writes).
     pub fn get(&self, nickname: &str) -> Option<&[u8]> {
         self.entries.get(nickname).map(|e| e.key.as_slice())

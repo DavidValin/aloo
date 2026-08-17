@@ -18,15 +18,13 @@ use rsa::{Oaep, Pss, RsaPrivateKey, RsaPublicKey};
 use sha2::{Digest, Sha256};
 
 /// RSA modulus size used for every keypair this app generates, except
-/// `rsa_per_msg` (see `RSA_PER_MSG_KEY_BITS`).
+/// `pq_hybrid`'s RSA-4096 hedge (see `RSA_PER_MSG_KEY_BITS`).
 pub const RSA_KEY_BITS: usize = 2048;
 
-/// RSA modulus size for `rsa_per_msg` (`KeyMode::PerMessage`) keypairs -
-/// the bootstrap key and every rotation after it. Larger than
-/// `RSA_KEY_BITS` because the mode's whole point is a stronger margin per
-/// short-lived key (PROTOCOL.md §11); the tradeoff is slower keygen per
-/// rotation - the documented reason live voice skips per-chunk rotation
-/// (§11.6).
+/// RSA modulus size for `pq_hybrid`'s classical RSA hedge
+/// (`crypto::pq::PQ_RSA_BITS`) - larger than `RSA_KEY_BITS` for a stronger
+/// margin on the identity that backs every signature and rotation for the
+/// life of the keybundle.
 pub const RSA_PER_MSG_KEY_BITS: usize = 4096;
 
 /// Rounds used to stretch a `my_key` password into the seed for a
@@ -72,7 +70,7 @@ impl KeyPair {
     }
 
     /// Generates a fresh keypair from OS randomness at a specific modulus
-    /// size - used for `rsa_per_msg`'s `RSA_PER_MSG_KEY_BITS`.
+    /// size - used for `pq_hybrid`'s `RSA_PER_MSG_KEY_BITS` hedge.
     pub fn generate_with_bits(bits: usize) -> Result<Self> {
         let mut rng = OsRng;
         let private =
@@ -155,11 +153,10 @@ pub fn public_key_from_der(bytes: &[u8]) -> Result<RsaPublicKey> {
     RsaPublicKey::from_public_key_der(bytes).map_err(|e| CryptoError::Key(e.to_string()))
 }
 
-/// Serializes a private key to PKCS8 DER bytes - used by `own_next_keys` to
-/// persist a per-peer `rsa_per_msg` continuity private key as a single
-/// hex-encoded line (a PEM's multiple lines/headers don't fit that
-/// one-line-per-entry file format), the same way `public_key_to_der`
-/// already does for public keys embedded in wire messages.
+/// Serializes a private key to PKCS8 DER bytes - used by `crypto::pq` to
+/// embed its RSA-4096 signing key inside a `PqPrivateBundle`, the same way
+/// `public_key_to_der` already does for public keys embedded in wire
+/// messages.
 pub fn private_key_to_der(key: &RsaPrivateKey) -> Result<Vec<u8>> {
     let doc = key
         .to_pkcs8_der()
@@ -240,13 +237,13 @@ pub fn decrypt_chunked(key: &RsaPrivateKey, blocks: &[Vec<u8>]) -> Result<Vec<u8
 
 /// Signs `data` with `key` using RSA-PSS + SHA-256, with a random salt.
 ///
-/// The one place this app produces an RSA signature: a freshly-rotated
-/// `rsa_per_msg` public key signed by the key it replaces
-/// (`rekey::rotate_for_peer`), and the classical half of a `pq_hybrid` send
-/// commitment (`crypto::pq::seal_setup`). PSS rather than PKCS#1 v1.5
-/// because it is the modern scheme with a security proof behind it; v1.5 is
-/// kept alive elsewhere in the world only for compatibility this app has no
-/// reason to want (`docs/PROTOCOL.md`: no backwards compatibility).
+/// Used by the server to sign its control-channel offer (`control::make_offer`,
+/// §5.3 server auth), and by `crypto::pq` for the classical half of a
+/// `pq_hybrid` send commitment (`crypto::pq::seal_setup`) and its other
+/// signed constructions. PSS rather than PKCS#1 v1.5 because it is the
+/// modern scheme with a security proof behind it; v1.5 is kept alive
+/// elsewhere in the world only for compatibility this app has no reason to
+/// want (`docs/PROTOCOL.md`: no backwards compatibility).
 ///
 /// Randomised, so signing the same bytes twice gives different signatures -
 /// nothing here ever compares two signatures for equality, only verifies
@@ -287,9 +284,8 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-/// Lowercase-hex encoding, shared by fingerprints and the flat-file stores
-/// (`idstore`, `own_next_keys`), which persist key material one
-/// hex-encoded line per entry.
+/// Lowercase-hex encoding, shared by fingerprints and the flat-file store
+/// `idstore`, which persists key material one hex-encoded line per entry.
 pub fn hex_encode(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {

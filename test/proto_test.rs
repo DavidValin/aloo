@@ -11,20 +11,7 @@ fn encode_decode_roundtrip_client_message() {
     let msg = ClientMessage::Identify {
         display_name: "dave".into(),
         public_key_der: vec![1, 2, 3, 4],
-        key_mode: KeyMode::Rsa,
-    };
-    let bytes = encode(&msg).expect("encode");
-    let decoded: ClientMessage = decode(&bytes).expect("decode");
-    assert_eq!(msg, decoded);
-}
-
-/// @requirement TB-061
-#[test]
-fn identify_roundtrips_with_per_message_key_mode() {
-    let msg = ClientMessage::Identify {
-        display_name: "dave".into(),
-        public_key_der: vec![1, 2, 3, 4],
-        key_mode: KeyMode::PerMessage,
+        key_mode: KeyMode::Password,
     };
     let bytes = encode(&msg).expect("encode");
     let decoded: ClientMessage = decode(&bytes).expect("decode");
@@ -443,21 +430,7 @@ fn user_info_and_channel_info_roundtrip() {
         id: UserId(42),
         name: "alice".into(),
         public_key_der: vec![0xde, 0xad, 0xbe, 0xef],
-        key_mode: KeyMode::Rsa,
-    };
-    let bytes = encode(&user).unwrap();
-    let decoded: UserInfo = decode(&bytes).unwrap();
-    assert_eq!(user, decoded);
-}
-
-/// @requirement TB-061
-#[test]
-fn user_info_roundtrips_with_per_message_key_mode() {
-    let user = UserInfo {
-        id: UserId(42),
-        name: "alice".into(),
-        public_key_der: vec![0xde, 0xad, 0xbe, 0xef],
-        key_mode: KeyMode::PerMessage,
+        key_mode: KeyMode::Password,
     };
     let bytes = encode(&user).unwrap();
     let decoded: UserInfo = decode(&bytes).unwrap();
@@ -467,13 +440,7 @@ fn user_info_roundtrips_with_per_message_key_mode() {
 /// @requirement TB-061
 #[test]
 fn user_info_roundtrips_with_every_key_mode_variant() {
-    for key_mode in [
-        KeyMode::Rsa,
-        KeyMode::Password,
-        KeyMode::None,
-        KeyMode::PerMessage,
-        KeyMode::PqHybrid,
-    ] {
+    for key_mode in [KeyMode::Password, KeyMode::None, KeyMode::PqHybrid] {
         let user = UserInfo {
             id: UserId(1),
             name: "alice".into(),
@@ -489,8 +456,6 @@ fn user_info_roundtrips_with_every_key_mode_variant() {
 /// @requirement AC-051, TB-099
 #[test]
 fn key_mode_label_matches_the_documented_tag_convention() {
-    assert_eq!(KeyMode::PerMessage.label(), "\u{1F512} RSAPM");
-    assert_eq!(KeyMode::Rsa.label(), "\u{1F512} RSA");
     assert_eq!(KeyMode::Password.label(), "\u{1F6A8} PWD");
     assert_eq!(KeyMode::None.label(), "\u{1F6A8} PLAIN");
     assert_eq!(KeyMode::PqHybrid.label(), "\u{1F6E1}\u{FE0F} PQH");
@@ -499,11 +464,6 @@ fn key_mode_label_matches_the_documented_tag_convention() {
 /// @requirement AC-051, TB-100
 #[test]
 fn format_with_name_puts_every_tag_after_the_name() {
-    assert_eq!(
-        KeyMode::PerMessage.format_with_name("carol"),
-        "carol \u{1F512} RSAPM"
-    );
-    assert_eq!(KeyMode::Rsa.format_with_name("bob"), "bob \u{1F512} RSA");
     assert_eq!(
         KeyMode::Password.format_with_name("dan"),
         "dan \u{1F6A8} PWD"

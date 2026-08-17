@@ -4,7 +4,7 @@ use ui_common::*;
 
 use aloo::proto::UserId;
 use aloo::client::tui::ui::{
-    Focus, IdentityCase, MessageBody, Mode, RECORD_HOLD_TIMEOUT, SPINNER_FRAMES, UiAction, UiState,
+    Focus, IdentityCase, MessageBody, Mode, RECORD_HOLD_TIMEOUT, UiAction, UiState,
     render,
 };
 use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
@@ -78,59 +78,6 @@ fn user_offline_is_permanent_for_the_session_since_a_user_id_is_never_reused() {
     // nothing in on_user_joined should clear the offline flag if it did)
     state.on_user_joined("general", user(2, "bob"));
     assert!(state.offline.contains(&UserId(2)));
-}
-
-/// @requirement TB-083
-#[test]
-fn key_rotation_updates_known_users_and_channel_member_copies() {
-    let mut state = joined_general_with(vec![per_msg_user(2, "bob")]);
-    // sanity: the channel member is a separate clone from known_users
-    assert_eq!(
-        state.channels[0].members[0].public_key_der,
-        vec![2, 2, 2, 2]
-    );
-
-    state.on_user_key_rotated(UserId(2), vec![9, 9, 9]);
-
-    assert_eq!(
-        state.known_users.get(&UserId(2)).unwrap().public_key_der,
-        vec![9, 9, 9]
-    );
-    assert_eq!(
-        state.channels[0].members[0].public_key_der,
-        vec![9, 9, 9],
-        "the channel member list caches its own UserInfo clone and must be updated too"
-    );
-}
-
-/// @requirement TB-083
-#[test]
-fn key_rotation_updates_an_open_private_room_peer_copy() {
-    let mut state = joined_general_with(vec![per_msg_user(2, "bob")]);
-    state.focus = Focus::Sidebar;
-    press(&mut state, KeyCode::Enter); // opens DM with bob
-    assert_eq!(state.active_private_room, Some(UserId(2)));
-
-    state.on_user_key_rotated(UserId(2), vec![7, 7, 7]);
-
-    assert_eq!(
-        state
-            .private_rooms
-            .get(&UserId(2))
-            .unwrap()
-            .peer
-            .public_key_der,
-        vec![7, 7, 7],
-        "an open private room caches its own UserInfo clone and must be updated too"
-    );
-}
-
-/// @requirement TB-084
-#[test]
-fn key_rotation_for_an_unknown_user_is_a_harmless_noop() {
-    let mut state = joined_general_with(vec![]);
-    state.on_user_key_rotated(UserId(999), vec![1, 2, 3]);
-    assert!(!state.known_users.contains_key(&UserId(999)));
 }
 
 // ---------------------------------------------------------------------
@@ -285,77 +232,8 @@ fn ctrl_h_works_regardless_of_current_view_or_mode() {
     );
 }
 
-// ---------------------------------------------------------------------
-// Key-regeneration spinner (top right, after the Ctrl+H hint)
-// ---------------------------------------------------------------------
-
-/// @requirement TB-085
-#[test]
-fn spinner_frames_match_the_documented_ascii_sequence() {
-    assert_eq!(SPINNER_FRAMES, ['_', '-', '\\', '|', '/', '-']);
-    assert_eq!(SPINNER_FRAMES.iter().collect::<String>(), "_-\\|/-");
-}
-
-/// @requirement TB-085
-#[test]
-fn tick_spinner_sets_key_regenerating_and_starts_at_the_first_frame() {
-    let mut state = UiState::new("me".into());
-    assert!(!state.key_regenerating);
-
-    state.tick_spinner(true);
-    assert!(state.key_regenerating);
-
-    state.tick_spinner(false);
-    assert!(!state.key_regenerating);
-}
-
-/// @requirement TB-085
-#[test]
-fn tick_spinner_advances_one_frame_per_call_and_wraps_around() {
-    let mut state = UiState::new("me".into());
-    // the *first* tick_spinner(true) after a stop shows frame 0 (so a
-    // freshly-started spinner is never seen skipping straight to frame 1);
-    // every subsequent call while still regenerating advances by one - so
-    // after N calls the visible frame is SPINNER_FRAMES[(N - 1) % SPINNER_FRAMES.len()].
-    let mut rows_seen = Vec::new();
-    for _ in 0..(SPINNER_FRAMES.len() * 2) {
-        state.tick_spinner(true);
-        rows_seen.push(spinner_char_shown(&state));
-    }
-    let expected: Vec<char> = (0..SPINNER_FRAMES.len() * 2)
-        .map(|n| SPINNER_FRAMES[n % SPINNER_FRAMES.len()])
-        .collect();
-    assert_eq!(
-        rows_seen, expected,
-        "expected the frame to cycle through all six and wrap around"
-    );
-}
-
-/// @requirement TB-085
-#[test]
-fn tick_spinner_resets_to_the_first_frame_once_regeneration_stops_and_restarts() {
-    let mut state = UiState::new("me".into());
-    state.tick_spinner(true); // first tick of a fresh run -> frame 0
-    state.tick_spinner(true); // still regenerating -> advances to frame 1
-    assert_eq!(spinner_char_shown(&state), SPINNER_FRAMES[1]);
-
-    state.tick_spinner(false); // stops
-    state.tick_spinner(true); // starts again - must not resume from frame 2
-    assert_eq!(
-        spinner_char_shown(&state),
-        SPINNER_FRAMES[0],
-        "restarting after a stop should begin the cycle over, not resume mid-cycle"
-    );
-}
-
 /// Renders `state` and returns whatever immediately follows "Ctrl+H: Help"
-/// on the header row (trimmed of the two separating spaces) - used to spot
-/// the spinner glyph, the same way a real user would see it: right after
-/// the help hint. Scoped to just that tail rather than scanning the whole
-/// header for any `SPINNER_FRAMES` character, because `-` is both a
-/// spinner frame and the header's own `Conn:-` "no traffic yet" glyph
-/// (`crate::netstats::ConnQuality::Unknown`) - a whole-row scan would find
-/// that `-` and mistake it for a spinner that isn't actually there.
+/// on the header row (trimmed of the two separating spaces).
 fn after_help_hint(state: &UiState) -> String {
     let rows = rendered_rows(state);
     let header = rows.first().expect("header row").clone();
@@ -365,22 +243,9 @@ fn after_help_hint(state: &UiState) -> String {
     header[idx + "Ctrl+H: Help".len()..].trim_end().to_string()
 }
 
-/// Renders `state` and returns the spinner glyph shown right after the
-/// help hint, panicking if there isn't one - `spinner_char()` is a private
-/// method, so tests observe the frame the same way a real user would.
-fn spinner_char_shown(state: &UiState) -> char {
-    let after = after_help_hint(state);
-    let trimmed = after.trim_start_matches(' ');
-    trimmed
-        .chars()
-        .next()
-        .filter(|c| SPINNER_FRAMES.contains(c))
-        .unwrap_or_else(|| panic!("no spinner frame found right after the help hint: {after:?}"))
-}
-
-/// @requirement AC-046, AC-058
+/// @requirement AC-058
 #[test]
-fn header_shows_no_spinner_when_no_key_is_being_regenerated() {
+fn header_shows_only_the_help_hint_after_conn_and_cpu() {
     let state = joined_general_with(vec![]);
     let rows = rendered_rows(&state);
     let header = rows.first().expect("header row");
@@ -390,39 +255,9 @@ fn header_shows_no_spinner_when_no_key_is_being_regenerated() {
     );
     assert!(
         after_help_hint(&state).is_empty(),
-        "nothing (in particular no spinner frame) should follow the help hint while key_regenerating is false: {:?}",
+        "nothing should follow the help hint: {:?}",
         after_help_hint(&state)
     );
-}
-
-/// @requirement AC-046
-#[test]
-fn header_shows_the_spinner_right_after_the_help_hint_separated_by_two_spaces() {
-    let mut state = joined_general_with(vec![]);
-    state.tick_spinner(true);
-    let rows = rendered_rows(&state);
-    let header = rows.first().expect("header row");
-    let expected = format!("Ctrl+H: Help  {}", SPINNER_FRAMES[0]);
-    assert!(
-        header.contains(&expected),
-        "expected {expected:?} on the header row: {header:?}"
-    );
-}
-
-/// @requirement AC-046
-#[test]
-fn header_spinner_animates_across_ticks() {
-    let mut state = joined_general_with(vec![]);
-    state.tick_spinner(true);
-    let first = spinner_char_shown(&state);
-    state.tick_spinner(true);
-    let second = spinner_char_shown(&state);
-    assert_ne!(
-        first, second,
-        "the spinner should visibly change between consecutive ticks"
-    );
-    assert_eq!(first, SPINNER_FRAMES[0]);
-    assert_eq!(second, SPINNER_FRAMES[1]);
 }
 
 // ---------------------------------------------------------------------
@@ -1041,7 +876,7 @@ fn render_help_popup_shows_expected_content_when_open() {
     press(&mut state, KeyCode::End);
     let rows = rendered_rows(&state);
     assert!(
-        rows.iter().any(|r| r.contains("RSAPM")),
+        rows.iter().any(|r| r.contains("PQH")),
         "expected the encryption tags explained: {rows:?}"
     );
     assert!(
@@ -1328,11 +1163,9 @@ fn a_silently_resolved_review_is_removed_even_when_it_is_not_the_one_shown() {
         "bob's arrived first"
     );
 
-    // Carol's identity gets silently confirmed (e.g. a verified
-    // `rsa_per_msg` resume - `session::handle_key_rotated`'s `Resumed` arm
-    // calls `resolve_identity_accept` directly, not through the popup)
-    // while bob's review is still the one on screen. Must clear carol
-    // specifically, not whichever review happens to be at the front.
+    // Carol's identity gets resolved programmatically (not through the
+    // popup) while bob's review is still the one on screen. Must clear
+    // carol specifically, not whichever review happens to be at the front.
     state.resolve_identity_accept(UserId(3));
 
     assert!(
@@ -1385,19 +1218,32 @@ fn sending_a_channel_message_excludes_a_pending_or_rejected_member() {
 /// @requirement TB-108
 #[test]
 fn help_popup_widens_enough_to_show_its_longest_line_without_clipping_it() {
-    // The rsa_per_msg encryption line (86 terminal cells including its
-    // emoji) is a good proxy for whether the popup widened correctly - on
-    // a 100-wide terminal the old fixed 74-wide popup clipped it. Checked
-    // without the emoji itself, since a 2-cell-wide emoji leaves a padding
-    // cell in ratatui's buffer that would otherwise break a plain substring
-    // match. It now sits below the fold on the first screen (the help text
-    // has grown since this was written), so this scrolls to it first -
-    // same precedent as `render_help_popup_shows_expected_content_when_open`.
+    // The pq_hybrid encryption line is a good proxy for whether the popup
+    // widened correctly - on a narrower terminal a fixed popup would clip
+    // it. Rendered at 130 columns (wider than the default 100 `rendered_rows`
+    // uses) so the line's ~98-cell width comfortably clears the popup's own
+    // 90%-of-terminal cap - that cap is exercised deliberately narrow by
+    // `help_popup_never_exceeds_90_percent_of_the_terminal_width` instead.
+    // Checked without the emoji itself, since a 2-cell-wide emoji leaves a
+    // padding cell in ratatui's buffer that would otherwise break a plain
+    // substring match. It sits below the fold on the first screen, so this
+    // scrolls to it first - same precedent as
+    // `render_help_popup_shows_expected_content_when_open`.
     let mut state = joined_general_with(vec![]);
     state.help_open = true;
     press(&mut state, KeyCode::End);
-    let rows = rendered_rows(&state);
-    let tail = "rsa_per_msg: a fresh key every message, signed by the one it replaces";
+    let backend = ratatui::backend::TestBackend::new(130, 30);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal.draw(|f| render(f, &state)).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    let rows: Vec<String> = (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect();
+    let tail = "static: ML-DSA-87+RSA4096/ML-KEM-1024+RSA4096/AES-256-GCM, loaded from a file";
     assert!(
         rows.iter().any(|r| r.contains(tail)),
         "expected the longest help line in full, unclipped: {rows:?}"

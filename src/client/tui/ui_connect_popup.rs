@@ -1,6 +1,6 @@
 //! The "not connected" screen: a centered modal collecting host/port and
 //! the `server_key` / `my_key` credentials, including an in-TUI file
-//! browser (no OS file dialog exists in a terminal) for RSA key files.
+//! browser (no OS file dialog exists in a terminal) for key files.
 //!
 //! State transitions (`ConnectPopupState::handle_key`,
 //! `crate::client::file_browser::FileBrowserState` navigation) are plain
@@ -51,23 +51,15 @@ impl KeyType {
 }
 
 /// `my_key`'s type selector is a separate enum from `server_key`'s
-/// (`KeyType`): only `my_key` can be `rsa_per_msg` (SPEC.md Functionality
-/// #6) - it controls the ongoing per-session key-rotation protocol
-/// (PROTOCOL.md §11), which has no meaning for the server auth challenge.
+/// (`KeyType`): only `my_key` can be `pq_hybrid`, which has no meaning for
+/// the server auth challenge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MyKeyType {
-    Rsa,
     Password,
     None,
-    /// Forward-secret (a fresh key every message, §11) and still
-    /// cross-session verifiable via `own_next_keys` (§12.6), without
-    /// requiring the user to already have a key file or remember a
-    /// password before they can connect at all.
-    RsaPerMessage,
     /// The default `my_key` selection: ML-DSA-87+RSA4096 signing,
     /// ML-KEM-1024+RSA4096 key-wrap, AES-256-GCM bulk encryption (§13) - a
-    /// static, file-loaded keybundle like `Rsa`, reusing its exact
-    /// `file_pub`/`file_priv` shape. Generated with
+    /// static, file-loaded keybundle. Generated with
     /// `aloo --keygen-pq-hybrid` (no `openssl` exists for ML-DSA/ML-KEM),
     /// though connecting auto-generates a missing bundle
     /// (`crypto::pq::ensure_bundle_at`), so no manual step is required.
@@ -80,20 +72,16 @@ pub enum MyKeyType {
 impl MyKeyType {
     pub fn cycle_next(self) -> Self {
         match self {
-            MyKeyType::Rsa => MyKeyType::Password,
             MyKeyType::Password => MyKeyType::None,
-            MyKeyType::None => MyKeyType::RsaPerMessage,
-            MyKeyType::RsaPerMessage => MyKeyType::PqHybrid,
-            MyKeyType::PqHybrid => MyKeyType::Rsa,
+            MyKeyType::None => MyKeyType::PqHybrid,
+            MyKeyType::PqHybrid => MyKeyType::Password,
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
-            MyKeyType::Rsa => "rsa",
             MyKeyType::Password => "password",
             MyKeyType::None => "none",
-            MyKeyType::RsaPerMessage => "rsa_per_msg",
             MyKeyType::PqHybrid => "pq_hybrid",
         }
     }
@@ -112,12 +100,6 @@ pub struct MyKeyFields {
     pub password: String,
     pub file_pub: String,
     pub file_priv: String,
-    /// `rsa_per_msg` only - path to this client's own per-peer continuity
-    /// key store (`aloo::own_next_keys`). Prefilled from
-    /// `own_next_keys::default_path()` at popup-open time, same as
-    /// `ConnectPopupState::id_store_path` - only actually shown/used once
-    /// `key_type` is `RsaPerMessage`, but harmless to have ready before then.
-    pub own_next_keys_path: String,
 }
 
 /// Nicknames are capped at this many characters (sidebar/private-room
@@ -136,10 +118,6 @@ pub enum Field {
     MyKeyType,
     MyKeyValuePub,
     MyKeyValuePriv,
-    /// Shown only when `my_key.key_type == MyKeyType::RsaPerMessage` -
-    /// occupies the same line `MyKeyValuePub`/`ServerKeyValue` would, since
-    /// it's the one field `rsa_per_msg` needs (`docs/PROTOCOL.md` §12.6).
-    OwnNextKeysPath,
     Connect,
 }
 
@@ -187,10 +165,7 @@ impl ConnectPopupState {
             nickname: String::new(),
             id_store_path: crate::client::idstore::default_path().display().to_string(),
             server_key: ServerKeyFields::default(),
-            my_key: MyKeyFields {
-                own_next_keys_path: crate::client::own_next_keys::default_path().display().to_string(),
-                ..MyKeyFields::default()
-            },
+            my_key: MyKeyFields::default(),
             focus: Field::Host,
             browser: None,
             error: None,
@@ -199,7 +174,7 @@ impl ConnectPopupState {
 
     /// The focusable fields for the *current* key type selections: a
     /// field only appears once it's actually shown (e.g. `MyKeyValuePriv`
-    /// only exists while `my_key.key_type == Rsa`).
+    /// only exists while `my_key.key_type == PqHybrid`).
     pub fn focus_order(&self) -> Vec<Field> {
         let mut v = vec![
             Field::Host,
@@ -214,9 +189,8 @@ impl ConnectPopupState {
         v.push(Field::MyKeyType);
         match self.my_key.key_type {
             MyKeyType::None => {}
-            MyKeyType::RsaPerMessage => v.push(Field::OwnNextKeysPath),
             MyKeyType::Password => v.push(Field::MyKeyValuePub),
-            MyKeyType::Rsa | MyKeyType::PqHybrid => {
+            MyKeyType::PqHybrid => {
                 v.push(Field::MyKeyValuePub);
                 v.push(Field::MyKeyValuePriv);
             }
@@ -300,14 +274,10 @@ impl ConnectPopupState {
             Field::ServerKeyValue if self.server_key.key_type == KeyType::Rsa => {
                 self.open_browser(FileBrowserTarget::ServerKeyFile)
             }
-            Field::MyKeyValuePub
-                if matches!(self.my_key.key_type, MyKeyType::Rsa | MyKeyType::PqHybrid) =>
-            {
+            Field::MyKeyValuePub if self.my_key.key_type == MyKeyType::PqHybrid => {
                 self.open_browser(FileBrowserTarget::MyKeyFilePub)
             }
-            Field::MyKeyValuePriv
-                if matches!(self.my_key.key_type, MyKeyType::Rsa | MyKeyType::PqHybrid) =>
-            {
+            Field::MyKeyValuePriv if self.my_key.key_type == MyKeyType::PqHybrid => {
                 self.open_browser(FileBrowserTarget::MyKeyFilePriv)
             }
             Field::Connect => match self.build_request() {
@@ -395,9 +365,6 @@ impl ConnectPopupState {
             Field::IdStorePath => {
                 self.id_store_path.pop();
             }
-            Field::OwnNextKeysPath => {
-                self.my_key.own_next_keys_path.pop();
-            }
             Field::ServerKeyValue if self.server_key.key_type == KeyType::Password => {
                 self.server_key.password.pop();
             }
@@ -418,7 +385,6 @@ impl ConnectPopupState {
                 self.nickname.push(c)
             }
             Field::IdStorePath => self.id_store_path.push(c),
-            Field::OwnNextKeysPath => self.my_key.own_next_keys_path.push(c),
             Field::ServerKeyValue if self.server_key.key_type == KeyType::Password => {
                 self.server_key.password.push(c)
             }
@@ -470,23 +436,6 @@ impl ConnectPopupState {
                     return Err("my_key password is required".to_string());
                 }
                 MyKeySelection::Password(self.my_key.password.clone())
-            }
-            MyKeyType::Rsa => {
-                if self.my_key.file_pub.is_empty() || self.my_key.file_priv.is_empty() {
-                    return Err("my_key file_pub and file_priv are both required".to_string());
-                }
-                MyKeySelection::Rsa {
-                    file_pub: PathBuf::from(&self.my_key.file_pub),
-                    file_priv: PathBuf::from(&self.my_key.file_priv),
-                }
-            }
-            MyKeyType::RsaPerMessage => {
-                if self.my_key.own_next_keys_path.trim().is_empty() {
-                    return Err("own_next_keys path is required".to_string());
-                }
-                MyKeySelection::RsaPerMessage {
-                    own_next_keys_path: PathBuf::from(&self.my_key.own_next_keys_path),
-                }
             }
             MyKeyType::PqHybrid => {
                 if self.my_key.file_pub.is_empty() || self.my_key.file_priv.is_empty() {
@@ -697,16 +646,6 @@ pub fn render(frame: &mut Frame, state: &ConnectPopupState) {
     );
     match state.my_key.key_type {
         MyKeyType::None => {}
-        MyKeyType::RsaPerMessage => {
-            frame.render_widget(
-                Paragraph::new(key_field_line(
-                    "own_next_keys",
-                    &state.my_key.own_next_keys_path,
-                    state.focus == Field::OwnNextKeysPath,
-                )),
-                my_key_lines[1],
-            );
-        }
         MyKeyType::Password => {
             let masked = "*".repeat(state.my_key.password.len());
             frame.render_widget(
@@ -718,7 +657,7 @@ pub fn render(frame: &mut Frame, state: &ConnectPopupState) {
                 my_key_lines[1],
             );
         }
-        MyKeyType::Rsa | MyKeyType::PqHybrid => {
+        MyKeyType::PqHybrid => {
             let pub_display = if state.my_key.file_pub.is_empty() {
                 "<press Enter to browse>".to_string()
             } else {
@@ -767,15 +706,6 @@ pub fn render(frame: &mut Frame, state: &ConnectPopupState) {
         Field::MyKeyValuePub if state.my_key.key_type == MyKeyType::Password => {
             let masked = "*".repeat(state.my_key.password.len());
             place_text_cursor(frame, my_key_lines[1], VALUE_LABEL_LEN, &masked)
-        }
-        Field::OwnNextKeysPath => {
-            const OWN_NEXT_KEYS_LABEL_LEN: u16 = 15; // "own_next_keys: "
-            place_text_cursor(
-                frame,
-                my_key_lines[1],
-                OWN_NEXT_KEYS_LABEL_LEN,
-                &state.my_key.own_next_keys_path,
-            )
         }
         _ => {}
     }

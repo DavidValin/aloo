@@ -21,7 +21,7 @@ use aloo::client::replay::ReplayGuard;
 use aloo::client::p2p::{P2pEvent, PeerLinkManager};
 use aloo::client::p2p::InboundDatagram;
 use aloo::proto::{Envelope, ServerMessage, UserId};
-use aloo::client::rekey::{RemoteKeys, ResumeVerification};
+use aloo::client::rekey::RemoteKeys;
 use aloo::server::{Outgoing, Registry};
 use aloo::client::tui::ui::{UiAction, UiState};
 use aloo::client::tui::ui_connect_popup::ConnectPopupState;
@@ -190,9 +190,6 @@ pub struct AlooWorld {
 
     // -- key rotation --------------------------------------------------
     pub remote_keys: Option<RemoteKeys>,
-    pub rotation_der: Vec<u8>,
-    pub rotation_sig: Vec<u8>,
-    pub verification: Option<ResumeVerification>,
     pub flushed: Vec<aloo::client::rekey::QueuedOutbound>,
 
     // -- identity pinning ----------------------------------------------

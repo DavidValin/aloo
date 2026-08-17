@@ -56,7 +56,7 @@ pub fn channel_password_is_valid(password: &str) -> bool {
 }
 
 /// Whether `s` is safe to use as a field in one of the client's
-/// tab-delimited flat-file stores (`idstore`, `own_next_keys`, `connect`'s
+/// tab-delimited flat-file stores (`idstore`, `connect`'s
 /// cache): no tab (field delimiter), no newline/carriage-return (record
 /// delimiter). Nicknames and hosts are attacker-controlled or user-typed,
 /// and accepting a delimiter would let records be injected into the local

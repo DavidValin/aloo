@@ -105,22 +105,3 @@ Feature: Recognising a peer across reconnects
     And I press Enter
     Then the outgoing channel message excludes bob but includes carol
 
-  @AC-050 @TB-096 @TB-098
-  Scenario: A reconnecting rsa_per_msg peer who can prove continuity is recognised silently
-    Given bob's continuity key is pinned from a previous session
-    When bob reconnects and re-asserts that same key, signed by itself
-    Then he is recognised as the same person, with no warning
-    And an ordinary in-session rotation is still preferred over the pinned key
-
-  @AC-050 @TB-097
-  Scenario: A reconnect nobody can vouch for is not quietly trusted
-    Given bob's continuity key is pinned from a previous session
-    When bob reconnects and presents a key nobody can vouch for
-    Then nothing vouches for him and the reconnect is not trusted
-
-  @AC-069
-  Scenario: A familiar nickname reconnecting via rsa_per_msg is gated on sight, before it even tries to prove continuity
-    Given I am connected and viewing a channel
-    And bob's nickname is already linked to a key from a previous session
-    When bob rejoins using rsa_per_msg without proving continuity
-    Then a review popup names bob with Accept and Reject buttons

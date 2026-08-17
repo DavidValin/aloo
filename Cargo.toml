@@ -142,10 +142,6 @@ name = "global_ptt_test"
 path = "test/global_ptt_test.rs"
 
 [[test]]
-name = "own_next_keys_test"
-path = "test/own_next_keys_test.rs"
-
-[[test]]
 name = "platform_test"
 path = "test/platform_test.rs"
 

@@ -232,7 +232,7 @@ pub enum InboundDatagram {
 }
 
 /// What a caller gets back from `ensure_link`: whether it's safe to send
-/// right now. Voice (never queued, PROTOCOL.md §11.6-style partial
+/// right now. Voice (never queued, PROTOCOL.md §11.2-style partial
 /// delivery) checks this directly and excludes a `Pending` recipient from
 /// the stream; text/file offers instead go through
 /// `PeerLinkManager::send_reliable_or_queue`, which queues on `Pending`

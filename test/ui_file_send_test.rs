@@ -192,7 +192,7 @@ fn sending_a_file_to_a_dm_peer_produces_sendfiledirect_with_path_and_size() {
             assert_eq!(path, root.join("file.txt"));
             assert_eq!(filename, "file.txt");
             assert_eq!(size, b"hello file transfer".len() as u64);
-            assert_eq!(recipient_key_mode, KeyMode::Rsa);
+            assert_eq!(recipient_key_mode, KeyMode::Password);
             assert_eq!(recipient_pubkey_der, vec![2u8; 4]);
         }
         other => panic!("expected SendFileDirect, got {other:?}"),

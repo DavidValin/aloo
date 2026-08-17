@@ -135,21 +135,17 @@ pub struct UserInfo {
     pub name: String,
     /// DER-encoded RSA public key, used by peers to encrypt messages to
     /// this user (see `crypto::encrypt_chunked` / `public_key_from_der`).
-    /// Under `KeyMode::PerMessage` this is only ever the bootstrap key
-    /// from that user's `Identify` - see `rekey` and PROTOCOL.md §11.
     pub public_key_der: Vec<u8>,
     pub key_mode: KeyMode,
 }
 
 /// Which `my_key` type a user connected with - broadcast (via `Identify`
 /// → `UserInfo`) so every peer can show it next to that user's name
-/// (`label()` below). `Rsa`/`Password`/`None` are all "static" - one
-/// keypair for the whole session, identical everywhere except this label;
-/// only `PerMessage` (`rsa_per_msg`) changes actual wire behavior (§11).
+/// (`label()` below). `Password`/`None` are both "static" - one keypair
+/// for the whole session, identical everywhere except this label; only
+/// `PqHybrid` rotates its encryption keys during the session (§13.10).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum KeyMode {
-    /// `my_key` type `rsa`: a static keypair loaded from a file.
-    Rsa,
     /// `my_key` type `password`: a static keypair deterministically
     /// derived from a password (§8.3).
     Password,
@@ -157,27 +153,22 @@ pub enum KeyMode {
     /// connect time (not loaded, not password-derived), kept for the
     /// whole session.
     None,
-    /// `rsa_per_msg`: see PROTOCOL.md §11.
-    PerMessage,
-    /// `pq_hybrid`: a static keybundle loaded from a file (like `Rsa`, not
-    /// rotating like `PerMessage`), signed with ML-DSA-87+RSA4096 and
-    /// encrypted with AES-256-GCM under an ML-KEM-1024+RSA4096-wrapped key.
-    /// See PROTOCOL.md §13.
+    /// `pq_hybrid`: a static keybundle loaded from a file, signed with
+    /// ML-DSA-87+RSA4096 and encrypted with AES-256-GCM under an
+    /// ML-KEM-1024+RSA4096-wrapped key. See PROTOCOL.md §13.
     PqHybrid,
 }
 
 impl KeyMode {
-    /// This mode's tag, exactly as rendered (SPEC.md Functionality #3/#6);
-    /// `format_with_name` combines it with a name. `🔒` = persistent or
-    /// rotating RSA identity (`Rsa`, `PerMessage`); `🚨` = the weaker
-    /// sourcings (`Password`, `None`) - about identity durability, not
-    /// "unencrypted": every `KeyMode` still encrypts with real RSA (§8.3).
-    /// `🛡️` = `PqHybrid` alone, the strongest tier (quantum-resistant
-    /// signing *and* key exchange, each hedged with RSA-4096 - §13).
+    /// This mode's tag, exactly as rendered (SPEC.md Functionality #3);
+    /// `format_with_name` combines it with a name. `🚨` = the weaker,
+    /// non-durable sourcings (`Password`, `None`) - about identity
+    /// durability, not "unencrypted": every `KeyMode` still encrypts with
+    /// real RSA (§8.3). `🛡️` = `PqHybrid` alone, the strongest tier
+    /// (quantum-resistant signing *and* key exchange, each hedged with
+    /// RSA-4096 - §13).
     pub fn label(self) -> &'static str {
         match self {
-            KeyMode::PerMessage => "\u{1F512} RSAPM",
-            KeyMode::Rsa => "\u{1F512} RSA",
             KeyMode::Password => "\u{1F6A8} PWD",
             KeyMode::None => "\u{1F6A8} PLAIN",
             KeyMode::PqHybrid => "\u{1F6E1}\u{FE0F} PQH",
@@ -185,9 +176,9 @@ impl KeyMode {
     }
 
     /// Combines `name` with this mode's tag: `name TAG`, one shared
-    /// convention for all five modes - the tag always trails the name as
-    /// an annotation on it, the way `PerMessage`'s always has, rather than
-    /// a classification label sitting in front of it.
+    /// convention for all three modes - the tag always trails the name as
+    /// an annotation on it, rather than a classification label sitting in
+    /// front of it.
     pub fn format_with_name(self, name: &str) -> String {
         format!("{name} {}", self.label())
     }
@@ -297,11 +288,11 @@ pub enum ClientMessage {
         name: String,
     },
 
-    /// `rsa_per_msg` only (`KeyMode::PerMessage`, PROTOCOL.md §11): tells
-    /// `to` to trust a freshly-rotated per-peer key from now on.
-    /// `signature` is computed over `to`'s raw bytes concatenated with
-    /// `new_public_key_der`, signed with the private key this rotation
-    /// replaces for `to` specifically - see `rekey::rotation_signing_payload`.
+    /// `pq_hybrid` only (`KeyMode::PqHybrid`, PROTOCOL.md §13.10): tells
+    /// `to` to trust a freshly-rotated encryption key from now on.
+    /// `new_public_key_der` and `signature` carry a bincode-encoded
+    /// `crypto::pq::PqRotation` and its signature respectively - see
+    /// `crypto::pq::sign_rotation`.
     RotateKey {
         to: UserId,
         new_public_key_der: Vec<u8>,
@@ -391,8 +382,8 @@ pub enum ServerMessage {
     },
     /// Relayed mirror of `ClientMessage::RotateKey` - the `to` field isn't
     /// repeated since it's implicitly "whoever the server delivers this
-    /// to" (see PROTOCOL.md §11.3/§11.4 for how the recipient reconstructs
-    /// the signed payload and verifies it before trusting the new key).
+    /// to" (see PROTOCOL.md §13.10 for how the recipient verifies the
+    /// signed rotation before trusting the new key).
     KeyRotated {
         from: UserId,
         new_public_key_der: Vec<u8>,

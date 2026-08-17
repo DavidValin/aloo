@@ -34,29 +34,21 @@ fn key_type_defaults_to_none() {
 }
 
 // ---------------------------------------------------------------------
-// MyKeyType (a separate, 5-variant cycle from server_key's KeyType)
+// MyKeyType (a separate, 3-variant cycle from server_key's KeyType)
 // ---------------------------------------------------------------------
 
 /// @requirement TB-002
 #[test]
-fn my_key_type_cycles_through_all_five_and_back() {
-    assert_eq!(MyKeyType::Rsa.cycle_next(), MyKeyType::Password);
+fn my_key_type_cycles_through_all_three_and_back() {
     assert_eq!(MyKeyType::Password.cycle_next(), MyKeyType::None);
-    assert_eq!(MyKeyType::None.cycle_next(), MyKeyType::RsaPerMessage);
-    assert_eq!(MyKeyType::RsaPerMessage.cycle_next(), MyKeyType::PqHybrid);
-    assert_eq!(MyKeyType::PqHybrid.cycle_next(), MyKeyType::Rsa);
+    assert_eq!(MyKeyType::None.cycle_next(), MyKeyType::PqHybrid);
+    assert_eq!(MyKeyType::PqHybrid.cycle_next(), MyKeyType::Password);
 }
 
 /// @requirement TB-002
 #[test]
 fn my_key_type_defaults_to_pq_hybrid() {
     assert_eq!(MyKeyType::default(), MyKeyType::PqHybrid);
-}
-
-/// @requirement TB-002
-#[test]
-fn my_key_type_label_includes_rsa_per_msg() {
-    assert_eq!(MyKeyType::RsaPerMessage.label(), "rsa_per_msg");
 }
 
 /// @requirement AC-084
@@ -95,16 +87,6 @@ fn focus_order_includes_server_key_value_when_not_none() {
     let mut state = ConnectPopupState::new();
     state.server_key.key_type = KeyType::Password;
     assert!(state.focus_order().contains(&Field::ServerKeyValue));
-}
-
-/// @requirement TB-003
-#[test]
-fn focus_order_includes_both_my_key_files_when_rsa() {
-    let mut state = ConnectPopupState::new();
-    state.my_key.key_type = MyKeyType::Rsa;
-    let order = state.focus_order();
-    assert!(order.contains(&Field::MyKeyValuePub));
-    assert!(order.contains(&Field::MyKeyValuePriv));
 }
 
 /// @requirement AC-084, TB-003
@@ -154,15 +136,15 @@ fn tab_key_advances_focus() {
 
 /// @requirement TB-003
 #[test]
-fn changing_my_key_type_away_from_rsa_reassigns_focus_if_orphaned() {
+fn changing_my_key_type_away_from_pq_hybrid_reassigns_focus_if_orphaned() {
     let mut state = ConnectPopupState::new();
-    state.my_key.key_type = MyKeyType::Rsa;
+    state.my_key.key_type = MyKeyType::PqHybrid;
     state.focus = Field::MyKeyValuePriv;
     state.handle_key(KeyCode::Left).unwrap(); // wrong field, no-op since focus != MyKeyType
     assert_eq!(state.focus, Field::MyKeyValuePriv);
 
     state.focus = Field::MyKeyType;
-    state.handle_key(KeyCode::Left).unwrap(); // Rsa -> Password, file_priv no longer shown
+    state.handle_key(KeyCode::Left).unwrap(); // PqHybrid -> Password, file_priv no longer shown
     assert_eq!(state.my_key.key_type, MyKeyType::Password);
 }
 
@@ -203,107 +185,6 @@ fn nickname_field_is_capped_at_ten_characters() {
     // once at the cap, further typing is a no-op, not silent truncation elsewhere
     type_str(&mut state, "x");
     assert_eq!(state.nickname, "davethegre");
-}
-
-/// @requirement AC-006
-#[test]
-fn own_next_keys_path_is_prefilled_from_the_default_path() {
-    let state = ConnectPopupState::new();
-    assert!(!state.my_key.own_next_keys_path.is_empty());
-    assert_eq!(
-        state.my_key.own_next_keys_path,
-        aloo::client::own_next_keys::default_path().display().to_string()
-    );
-}
-
-/// @requirement AC-006
-#[test]
-fn own_next_keys_path_is_only_focusable_when_my_key_is_rsa_per_msg() {
-    let mut state = ConnectPopupState::new();
-    assert!(
-        !state.focus_order().contains(&Field::OwnNextKeysPath),
-        "not shown for the default (pq_hybrid) type"
-    );
-    state.my_key.key_type = MyKeyType::RsaPerMessage;
-    assert!(state.focus_order().contains(&Field::OwnNextKeysPath));
-    state.my_key.key_type = MyKeyType::None;
-    assert!(
-        !state.focus_order().contains(&Field::OwnNextKeysPath),
-        "not shown for none"
-    );
-    state.my_key.key_type = MyKeyType::Rsa;
-    assert!(
-        !state.focus_order().contains(&Field::OwnNextKeysPath),
-        "not shown for rsa either"
-    );
-    state.my_key.key_type = MyKeyType::RsaPerMessage;
-    assert!(state.focus_order().contains(&Field::OwnNextKeysPath));
-}
-
-/// @requirement AC-006, TB-012
-#[test]
-fn own_next_keys_path_field_is_freely_editable() {
-    let mut state = ConnectPopupState::new();
-    state.my_key.key_type = MyKeyType::RsaPerMessage;
-    state.focus = Field::OwnNextKeysPath;
-    state.my_key.own_next_keys_path.clear();
-    type_str(&mut state, "/tmp/my_own_next_keys");
-    assert_eq!(state.my_key.own_next_keys_path, "/tmp/my_own_next_keys");
-    state.handle_key(KeyCode::Backspace).unwrap();
-    assert_eq!(state.my_key.own_next_keys_path, "/tmp/my_own_next_key");
-}
-
-/// @requirement TB-005
-#[test]
-fn build_request_rejects_empty_own_next_keys_path_for_rsa_per_msg() {
-    let mut state = ConnectPopupState::new();
-    state.host = "localhost".into();
-    state.port = "9000".into();
-    state.nickname = "dave".into();
-    state.my_key.key_type = MyKeyType::RsaPerMessage;
-    state.my_key.own_next_keys_path.clear();
-    let err = state.build_request().unwrap_err();
-    assert!(err.contains("own_next_keys"));
-}
-
-/// @requirement TB-006
-#[test]
-fn build_request_carries_a_custom_own_next_keys_path() {
-    let mut state = ConnectPopupState::new();
-    state.host = "localhost".into();
-    state.port = "9000".into();
-    state.nickname = "dave".into();
-    state.my_key.key_type = MyKeyType::RsaPerMessage;
-    state.my_key.own_next_keys_path = "/custom/own_next_keys".into();
-    let req = state.build_request().expect("should be valid");
-    match req.my_key {
-        MyKeySelection::RsaPerMessage { own_next_keys_path } => {
-            assert_eq!(own_next_keys_path, PathBuf::from("/custom/own_next_keys"))
-        }
-        other => panic!("expected RsaPerMessage, got {other:?}"),
-    }
-}
-
-/// @requirement AC-006
-#[test]
-fn render_shows_own_next_keys_field_when_rsa_per_msg_is_selected() {
-    let mut state = ConnectPopupState::new();
-    state.my_key.key_type = MyKeyType::RsaPerMessage;
-    let backend = TestBackend::new(80, 30);
-    let mut terminal = Terminal::new(backend).unwrap();
-    terminal.draw(|f| render(f, &state)).unwrap();
-    let buffer = terminal.backend().buffer().clone();
-    let rows: Vec<String> = (0..buffer.area.height)
-        .map(|y| {
-            (0..buffer.area.width)
-                .map(|x| buffer[(x, y)].symbol())
-                .collect::<String>()
-        })
-        .collect();
-    assert!(
-        rows.iter().any(|r| r.contains("own_next_keys")),
-        "expected the own_next_keys field: {rows:?}"
-    );
 }
 
 /// @requirement AC-005
@@ -459,44 +340,16 @@ fn build_request_succeeds_with_none_keys() {
 
 /// @requirement TB-006
 #[test]
-fn build_request_succeeds_with_rsa_per_msg_using_the_prefilled_own_next_keys_path() {
-    let mut state = ConnectPopupState::new();
-    state.host = "localhost".into();
-    state.port = "9000".into();
-    state.nickname = "dave".into();
-    state.my_key.key_type = MyKeyType::RsaPerMessage;
-    let req = state
-        .build_request()
-        .expect("rsa_per_msg's own_next_keys_path is prefilled, so no typing needed");
-    match req.my_key {
-        MyKeySelection::RsaPerMessage { own_next_keys_path } => {
-            assert_eq!(
-                own_next_keys_path,
-                PathBuf::from(&state.my_key.own_next_keys_path)
-            );
-            assert!(!own_next_keys_path.as_os_str().is_empty());
-        }
-        other => panic!("expected RsaPerMessage, got {other:?}"),
-    }
-    assert!(
-        !state.focus_order().contains(&Field::MyKeyValuePub),
-        "rsa_per_msg has no file_pub/password field, only own_next_keys_path"
-    );
-    assert!(state.focus_order().contains(&Field::OwnNextKeysPath));
-}
-
-/// @requirement TB-006
-#[test]
-fn build_request_succeeds_with_password_and_rsa_mix() {
+fn build_request_succeeds_with_password_and_pq_hybrid_mix() {
     let mut state = ConnectPopupState::new();
     state.host = "10.0.0.5".into();
     state.port = "4444".into();
     state.nickname = "dave".into();
     state.server_key.key_type = KeyType::Password;
     state.server_key.password = "hunter2".into();
-    state.my_key.key_type = MyKeyType::Rsa;
-    state.my_key.file_pub = "/keys/id_rsa.pub".into();
-    state.my_key.file_priv = "/keys/id_rsa".into();
+    state.my_key.key_type = MyKeyType::PqHybrid;
+    state.my_key.file_pub = "/keys/pq_hybrid.pub".into();
+    state.my_key.file_priv = "/keys/pq_hybrid.priv".into();
 
     let req = state.build_request().expect("should be valid");
     assert_eq!(
@@ -505,9 +358,9 @@ fn build_request_succeeds_with_password_and_rsa_mix() {
     );
     assert_eq!(
         req.my_key,
-        MyKeySelection::Rsa {
-            file_pub: PathBuf::from("/keys/id_rsa.pub"),
-            file_priv: PathBuf::from("/keys/id_rsa"),
+        MyKeySelection::PqHybrid {
+            file_pub: PathBuf::from("/keys/pq_hybrid.pub"),
+            file_priv: PathBuf::from("/keys/pq_hybrid.priv"),
         }
     );
 }
@@ -746,13 +599,7 @@ fn render_does_not_panic_for_every_key_type_combination() {
     let backend = TestBackend::new(80, 24);
     let mut terminal = Terminal::new(backend).unwrap();
     for server_kind in [KeyType::None, KeyType::Password, KeyType::Rsa] {
-        for my_kind in [
-            MyKeyType::None,
-            MyKeyType::Password,
-            MyKeyType::Rsa,
-            MyKeyType::RsaPerMessage,
-            MyKeyType::PqHybrid,
-        ] {
+        for my_kind in [MyKeyType::None, MyKeyType::Password, MyKeyType::PqHybrid] {
             let mut state = ConnectPopupState::new();
             state.server_key.key_type = server_kind;
             state.my_key.key_type = my_kind;

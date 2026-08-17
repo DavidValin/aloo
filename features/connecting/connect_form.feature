@@ -66,29 +66,6 @@ Feature: Filling in the connect form
     Given the connect form is open
     Then my_key defaults to pq_hybrid
 
-  @AC-006
-  Scenario: The continuity-key file is offered only for rsa_per_msg
-    Given the connect form is open
-    When my_key is set to rsa_per_msg
-    Then the own_next_keys field is offered
-    And the own_next_keys path is prefilled with its default location
-    When my_key is set to none
-    Then the own_next_keys field is not offered
-    When my_key is set to rsa
-    Then the own_next_keys field is not offered
-    When my_key is set to rsa_per_msg
-    Then the own_next_keys field is offered
-
-  @AC-006 @TB-012 @TB-006
-  Scenario: The continuity-key path can be pointed somewhere else
-    Given the connect form is open
-    And the connect form is filled in with valid details
-    And my_key is set to rsa_per_msg
-    When I focus the "own_next_keys" field
-    And I clear the "own_next_keys" field
-    And I type "/custom/own_next_keys" into the form
-    Then the request carries the own_next_keys path "/custom/own_next_keys"
-
   @AC-007 @TB-006
   Scenario: A completed form connects
     Given the connect form is open
@@ -114,11 +91,10 @@ Feature: Filling in the connect form
     Then building the request fails mentioning "<message>"
 
     Examples:
-      | field         | my_key      | message       |
-      | host          | none        | host          |
-      | nickname      | none        | nickname      |
-      | id_store      | none        | id_store      |
-      | own_next_keys | rsa_per_msg | own_next_keys |
+      | field    | my_key | message  |
+      | host     | none   | host     |
+      | nickname | none   | nickname |
+      | id_store | none   | id_store |
 
   @AC-009
   Scenario: Escape abandons the form

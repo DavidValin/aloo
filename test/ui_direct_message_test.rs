@@ -52,7 +52,7 @@ fn opening_dm_from_sidebar_and_sending_a_message() {
         } => {
             assert_eq!(to, UserId(2));
             assert_eq!(plaintext, "just us");
-            assert_eq!(recipient_key_mode, KeyMode::Rsa);
+            assert_eq!(recipient_key_mode, KeyMode::Password);
             assert_eq!(recipient_pubkey_der, user(2, "bob").public_key_der);
         }
         other => panic!("expected SendDirectText, got {other:?}"),
@@ -162,7 +162,7 @@ fn space_release_targets_active_private_room_instead_of_channel() {
             recipient_pubkey_der,
         })) => {
             assert_eq!(to, UserId(2));
-            assert_eq!(recipient_key_mode, KeyMode::Rsa);
+            assert_eq!(recipient_key_mode, KeyMode::Password);
             assert_eq!(recipient_pubkey_der, user(2, "bob").public_key_der);
         }
         other => panic!("expected VoiceRecordStart(Direct), got {other:?}"),
@@ -190,7 +190,7 @@ fn global_record_start_targets_the_active_private_room() {
             recipient_pubkey_der,
         })) => {
             assert_eq!(to, UserId(2));
-            assert_eq!(recipient_key_mode, KeyMode::Rsa);
+            assert_eq!(recipient_key_mode, KeyMode::Password);
             assert_eq!(recipient_pubkey_der, user(2, "bob").public_key_der);
         }
         other => panic!("expected VoiceRecordStart(Direct), got {other:?}"),
@@ -270,8 +270,8 @@ fn opening_a_private_room_with_existing_history_starts_on_the_newest_message() {
 
 /// @requirement AC-051, TB-035
 #[test]
-fn private_room_title_shows_the_peers_rsa_per_msg_tag_after_their_name() {
-    let mut state = joined_general_with(vec![per_msg_user(2, "bob")]);
+fn private_room_title_shows_the_peers_pq_hybrid_tag_after_their_name() {
+    let mut state = joined_general_with(vec![pq_hybrid_user(2, "bob")]);
     state.focus = Focus::Sidebar;
     press(&mut state, KeyCode::Enter); // opens DM with bob
     let rows = rendered_rows(&state);
@@ -280,7 +280,7 @@ fn private_room_title_shows_the_peers_rsa_per_msg_tag_after_their_name() {
         "expected the title to lead with the name: {rows:?}"
     );
     assert!(
-        appears_before(&rows, "bob", "RSAPM"),
+        appears_before(&rows, "bob", "PQH"),
         "expected the private room title to show bob's tag after his name: {rows:?}"
     );
 }

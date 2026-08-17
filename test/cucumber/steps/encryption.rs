@@ -158,7 +158,7 @@ async fn roundtrip_every_message(w: &mut AlooWorld) {
         ClientMessage::Identify {
             display_name: "dave".into(),
             public_key_der: vec![1, 2, 3, 4],
-            key_mode: KeyMode::Rsa,
+            key_mode: KeyMode::Password,
         },
         ClientMessage::JoinChannel {
             name: "general".into(),
@@ -224,7 +224,7 @@ async fn roundtrip_every_message(w: &mut AlooWorld) {
         id: UserId(42),
         name: "alice".into(),
         public_key_der: vec![0xde, 0xad, 0xbe, 0xef],
-        key_mode: KeyMode::Rsa,
+        key_mode: KeyMode::Password,
     };
     let decoded: UserInfo = decode(&encode(&user).expect("encode")).expect("decode");
     assert_eq!(decoded, user, "UserInfo did not survive the round trip");
@@ -289,13 +289,7 @@ async fn every_field_intact(w: &mut AlooWorld) {
 
 #[then("a user announced under any key mode arrives with that same key mode")]
 async fn key_mode_survives(_w: &mut AlooWorld) {
-    for key_mode in [
-        KeyMode::Rsa,
-        KeyMode::Password,
-        KeyMode::None,
-        KeyMode::PerMessage,
-        KeyMode::PqHybrid,
-    ] {
+    for key_mode in [KeyMode::Password, KeyMode::None, KeyMode::PqHybrid] {
         let user = UserInfo {
             id: UserId(1),
             name: "alice".into(),

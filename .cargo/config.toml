@@ -11,4 +11,4 @@ trace = "test --test traceability"
 # quick. Only the targets that have any are named: the cucumber target
 # supplies its own runner and rejects libtest's `--ignored` flag, so
 # `cargo test -- --ignored` fails on it.
-slow = ["test", "--test", "crypto_test", "--test", "rekey_test", "--test", "hybrid_crypto_test", "--test", "connect_test", "--", "--ignored"]
+slow = ["test", "--test", "crypto_test", "--test", "hybrid_crypto_test", "--test", "connect_test", "--", "--ignored"]

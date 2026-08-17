@@ -16,16 +16,16 @@ pub fn user(id: u64, name: &str) -> UserInfo {
         id: UserId(id),
         name: name.to_string(),
         public_key_der: vec![id as u8; 4],
-        key_mode: KeyMode::Rsa,
+        key_mode: KeyMode::Password,
     }
 }
 
-pub fn per_msg_user(id: u64, name: &str) -> UserInfo {
+pub fn pq_hybrid_user(id: u64, name: &str) -> UserInfo {
     UserInfo {
         id: UserId(id),
         name: name.to_string(),
         public_key_der: vec![id as u8; 4],
-        key_mode: KeyMode::PerMessage,
+        key_mode: KeyMode::PqHybrid,
     }
 }
 

@@ -8,7 +8,6 @@ pub mod global_ptt;
 pub mod idstore;
 pub mod keymode_policy;
 pub mod netstats;
-pub mod own_next_keys;
 pub mod p2p;
 pub mod p2p_reliable;
 pub mod pq_rekey;

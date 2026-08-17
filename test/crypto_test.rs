@@ -274,8 +274,8 @@ fn generate_uses_the_default_rsa_key_bits() {
 #[test]
 #[ignore = "real RSA-4096 keygen, 60s+ in this environment - run with `cargo test -- --ignored`"]
 fn generate_with_bits_produces_a_key_of_the_requested_size_and_is_still_usable() {
-    let kp =
-        KeyPair::generate_with_bits(RSA_PER_MSG_KEY_BITS).expect("keygen at rsa_per_msg's size");
+    let kp = KeyPair::generate_with_bits(RSA_PER_MSG_KEY_BITS)
+        .expect("keygen at pq_hybrid's RSA hedge size");
     assert_eq!(kp.public.size() * 8, RSA_PER_MSG_KEY_BITS);
 
     let blocks = encrypt_chunked(&kp.public, b"round trip at 4096 bits").expect("encrypt");

@@ -264,7 +264,7 @@ fn space_press_and_release_starts_and_stops_recording_for_channel() {
             assert_eq!(channel, "general");
             assert_eq!(
                 recipients,
-                vec![(UserId(2), KeyMode::Rsa, user(2, "bob").public_key_der)]
+                vec![(UserId(2), KeyMode::Password, user(2, "bob").public_key_der)]
             );
         }
         other => panic!("expected VoiceRecordStart(Channel), got {other:?}"),
@@ -296,7 +296,7 @@ fn global_record_start_and_stop_streams_to_the_active_channel() {
             assert_eq!(channel, "general");
             assert_eq!(
                 recipients,
-                vec![(UserId(2), KeyMode::Rsa, user(2, "bob").public_key_der)]
+                vec![(UserId(2), KeyMode::Password, user(2, "bob").public_key_der)]
             );
         }
         other => panic!("expected VoiceRecordStart(Channel), got {other:?}"),
@@ -595,8 +595,7 @@ fn a_message_arriving_in_a_different_channel_does_not_move_the_current_selection
 #[test]
 fn sidebar_shows_each_users_encryption_tag_after_their_name() {
     let state = joined_general_with(vec![
-        user(2, "bob"), // KeyMode::Rsa
-        per_msg_user(3, "carol"),
+        pq_hybrid_user(2, "bob"),
         password_user(4, "dan"),
         plain_user(5, "eve"),
     ]);
@@ -616,12 +615,8 @@ fn sidebar_shows_each_users_encryption_tag_after_their_name() {
         .collect();
 
     assert!(
-        appears_before(&rows, "bob", "RSA"),
+        appears_before(&rows, "bob", "PQH"),
         "expected bob's tag rendered after his name: {rows:?}"
-    );
-    assert!(
-        appears_before(&rows, "carol", "RSAPM"),
-        "expected carol's tag rendered after her name: {rows:?}"
     );
     assert!(
         appears_before(&rows, "dan", "PWD"),

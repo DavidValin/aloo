@@ -1,5 +1,5 @@
 //! Tests for the three things that make a pin worth more than
-//! "these bytes differ from last time" (`docs/PROTOCOL.md` §12.7):
+//! "these bytes differ from last time" (`docs/PROTOCOL.md` §12.6):
 //! verified pins, continuity certificates, and identity cards.
 
 use aloo::client::idstore::{IdStore, Trust};

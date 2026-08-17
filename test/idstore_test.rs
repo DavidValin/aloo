@@ -213,7 +213,7 @@ fn on_disk_format_is_hex_encoded_not_raw_or_base64() {
         store.save().unwrap();
     }
     let contents = std::fs::read_to_string(&path).unwrap();
-    // Third column is how much the pin is worth (docs/PROTOCOL.md 12.7);
+    // Third column is how much the pin is worth (docs/PROTOCOL.md 12.6);
     // a fresh sighting is trusted-on-first-use until a human says more.
     assert_eq!(contents, "alice\tdeadbeef\ttofu\n");
     std::fs::remove_file(&path).ok();

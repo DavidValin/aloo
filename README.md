@@ -91,8 +91,6 @@ How your own messages get locked so only the intended reader can open them:
 
 - 🚨 **PLAIN** (`None`) — a fresh key is generated for you automatically each time you connect. Simple, but nobody can tell it's really "you" across sessions.
 - 🚨 **PWD** (`Password`) — your key is derived from a password, so the same password always gives you the same identity, from any machine.
-- 🔒 **RSA** (`RSA, file`) — a key pair saved to disk, reused every time you connect, so people recognize you as the same person session after session.
-- 🔒 **RSAPM** (`RSA, rotating per message`) — instead of one long-term key, aloo quietly generates a fresh key *for each person you talk to*, and swaps it out every time you send or receive a message with them. Nothing to prepare before connecting — the first key is generated automatically. aloo does keep one small file (`own_next_keys`) so a peer can still tell you're the same person after you disconnect and reconnect; treat it like any other private key file.
 - 🛡️ **PQH** (`PQ-Hybrid`, quantum-resistant) — the strongest option, and the **default**. It combines four things at once: ML-DSA-87 + RSA-4096 to sign and prove a message really came from you *and was meant for the person reading it*, ML-KEM-1024 + X25519 to securely share a one-time key, and AES-256-GCM to actually lock the message content. The keys that unlock your messages are also regenerated as you chat and the old ones thrown away, so someone who steals your key file later still can't read what you already said. Even if one of the newer post-quantum algorithms turns out to have a weakness someday, the classical RSA half still has to be broken too. You don't have to set anything up: if the keys don't exist yet, aloo generates them for you automatically the first time you connect.
 
 These are the exact tags aloo shows next to a person's name, so you always know how someone's messages are protected just by looking at them.
@@ -101,26 +99,24 @@ These are the exact tags aloo shows next to a person's name, so you always know 
 | --- | --- | --- | --- |
 | 🚨 PLAIN | None | None | ❌ No |
 | 🚨 PWD | Password | Basic | ❌ No |
-| 🔒 RSA | RSA (file) | Secure | ❌ No |
-| 🔒 RSAPM | RSA, rotating per message | Secure | ❌ No |
 | 🛡️ PQH | PQ-Hybrid | Ultra secure | ✅ Yes |
 
 Whichever identity type you and everyone else picks shows up as a little tag next to your name in the app, so it's always clear how a person's messages are being protected.
 
-> **Heads up about PQH:** since it's the default, most people you meet will be using it — but it only talks to its own kind. A `PQH` user can message anyone, but can only *be messaged by* another `PQH` user. If a friend on `PLAIN`/`PWD`/`RSA`/`RSAPM` can't seem to reach you, that's why — one of you needs to switch to `pq_hybrid` too.
+> **Heads up about PQH:** since it's the default, most people you meet will be using it — but it only talks to its own kind. A `PQH` user can message anyone, but can only *be messaged by* another `PQH` user. If a friend on `PLAIN`/`PWD` can't seem to reach you, that's why — one of you needs to switch to `pq_hybrid` too.
 
-By default, everything aloo writes to disk on its own — your auto-generated PQ-Hybrid keys, identity-pinning files, downloaded files — lives under `~/.aloo`. It never writes anywhere else unless you deliberately point a field (like an RSA key file) somewhere else yourself.
+By default, everything aloo writes to disk on its own — your auto-generated PQ-Hybrid keys, identity-pinning files, downloaded files — lives under `~/.aloo`. It never writes anywhere else unless you deliberately point a field (like a server RSA key file) somewhere else yourself.
 
-### Generating RSA keys
+### Generating an RSA key for server authentication
 
-Only needed if you're using an RSA-based method — server auth (`--enc rsa`) or identity type `RSA, file`. Every other method (`None`, `Password`, `RSAPM`, `PQ-Hybrid`) generates its own keys automatically; skip this otherwise.
+Only needed if the server you're connecting to requires `--enc rsa`. Every identity type (`None`, `Password`, `PQ-Hybrid`) generates its own keys automatically; skip this otherwise.
 
 ```sh
 openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:4096 -out key
 openssl rsa -pubout -in key -out key.pub
 ```
 
-`key` is the private key — pass it to `--enc rsa key` (server) or as `file_priv` (your identity). `key.pub` is the matching public key — hand it out to clients (server) or set it as `file_pub` (your identity).
+`key` is the private key — pass it to `--enc rsa key` (server). `key.pub` is the matching public key — hand it out to clients.
 
 ## Knowing who you're really talking to
 
@@ -131,7 +127,7 @@ Nicknames aren't proof of identity — anyone could reconnect as "alice" the mom
 - If that nickname ever comes back with a **different, unrecognized key**, aloo stops and asks you: an identity review popup shows up with **Accept** or **Reject**. Until you decide, you can't send them anything, and any messages they send stay hidden instead of appearing in your log.
 - **Accept** if you've confirmed it's really them (new device, lost their old key, etc.) — the new key is pinned from then on. **Reject** if you're not sure — nothing is trusted, and you can revisit the decision later by opening a chat with them again.
 
-This only applies to identity types that actually stay the same across reconnects (`Password`, `RSA (file)`, `PQ-Hybrid`, and `RSA rotating per message` in its own way) — the `None` type has no persistent identity to pin in the first place, so there's nothing to compare.
+This only applies to identity types that actually stay the same across reconnects (`Password`, `PQ-Hybrid`) — the `None` type has no persistent identity to pin in the first place, so there's nothing to compare.
 
 ## Want the technical details?
 

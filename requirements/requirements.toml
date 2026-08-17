@@ -60,13 +60,8 @@ description = "The id_store path is prefilled with its default and stays freely 
 evidence = "docs/PROTOCOL.md 12.5; tests id_store_path_is_prefilled_from_the_default_path, id_store_path_field_is_freely_editable"
 
 [[user_story.acceptance_criteria]]
-id = "AC-006"
-description = "The own_next_keys path is prefilled and freely editable, and is offered only when my_key is rsa_per_msg."
-evidence = "docs/PROTOCOL.md 12.6.5; tests own_next_keys_path_is_prefilled_from_the_default_path, own_next_keys_path_is_only_focusable_when_my_key_is_rsa_per_msg"
-
-[[user_story.acceptance_criteria]]
 id = "AC-070"
-description = "my_key defaults to pq_hybrid when the connect form opens, so a new user gets this app's strongest (quantum-resistant, RSA-4096-hedged) identity by default - at the cost of needing a keybundle prepared with aloo --keygen-pq-hybrid before the form can actually validate, unlike the previous rsa_per_msg default."
+description = "my_key defaults to pq_hybrid when the connect form opens, so a new user gets this app's strongest (quantum-resistant, RSA-4096-hedged) identity by default - at the cost of needing a keybundle prepared with aloo --keygen-pq-hybrid before the form can actually validate."
 evidence = "docs/SPEC.md 'Not connected UI'; tests my_key_type_defaults_to_pq_hybrid, connect_form.feature 'my_key defaults to pq_hybrid, this app's strongest identity'"
 
 [[user_story.acceptance_criteria]]
@@ -111,13 +106,13 @@ evidence = "src/client/tui/ui_connect_popup.rs KeyType; tests key_type_cycles_rs
 
 [[user_story.technical_behavior]]
 id = "TB-002"
-description = "my_key's key type cycles rsa -> password -> none -> rsa_per_msg -> pq_hybrid -> rsa, defaults to pq_hybrid, and labels each stop correctly ('rsa_per_msg', 'pq_hybrid', ...)."
-evidence = "docs/SPEC.md 'Not connected UI'; tests my_key_type_cycles_through_all_five_and_back, my_key_type_defaults_to_pq_hybrid, my_key_type_label_includes_rsa_per_msg, my_key_type_label_includes_pq_hybrid"
+description = "my_key's key type cycles password -> none -> pq_hybrid -> password, defaults to pq_hybrid, and labels each stop correctly ('password', 'none', 'pq_hybrid')."
+evidence = "docs/SPEC.md 'Not connected UI'; tests my_key_type_cycles_through_all_three_and_back, my_key_type_defaults_to_pq_hybrid, my_key_type_label_includes_pq_hybrid"
 
 [[user_story.technical_behavior]]
 id = "TB-003"
 description = "The focus order lists exactly the value fields the two selected key types require, and a field orphaned by a type change stops being editable."
-evidence = "src/client/tui/ui_connect_popup.rs focus_order; tests focus_order_*, changing_my_key_type_away_from_rsa_reassigns_focus_if_orphaned, password_field_only_editable_when_key_type_is_password"
+evidence = "src/client/tui/ui_connect_popup.rs focus_order; tests focus_order_*, changing_my_key_type_away_from_pq_hybrid_reassigns_focus_if_orphaned, password_field_only_editable_when_key_type_is_password"
 
 [[user_story.technical_behavior]]
 id = "TB-004"
@@ -126,7 +121,7 @@ evidence = "docs/SPEC.md 'Not connected UI'; tests focus_next_and_prev_wrap_arou
 
 [[user_story.technical_behavior]]
 id = "TB-005"
-description = "build_request rejects an incomplete form field by field, naming the offending field: host, port, nickname, server_key file, id_store, own_next_keys."
+description = "build_request rejects an incomplete form field by field, naming the offending field: host, port, nickname, server_key file, id_store."
 evidence = "tests build_request_rejects_*"
 
 [[user_story.technical_behavior]]
@@ -162,7 +157,7 @@ evidence = "docs/SPEC.md 'Not connected UI'; test popup_is_wider_than_the_origin
 [[user_story.technical_behavior]]
 id = "TB-012"
 description = "A focused free-text field appends typed characters and Backspace removes the last one."
-evidence = "src/client/tui/ui_connect_popup.rs handle_key; tests typing_fills_host_field, id_store_path_field_is_freely_editable, own_next_keys_path_field_is_freely_editable"
+evidence = "src/client/tui/ui_connect_popup.rs handle_key; tests typing_fills_host_field, id_store_path_field_is_freely_editable"
 
 # ============================================================================
 # US-002 - Authenticate to the server
@@ -457,7 +452,7 @@ evidence = "test sidebar_shows_a_solid_envelope_once_an_outgoing_message_exists_
 [[user_story.technical_behavior]]
 id = "TB-035"
 description = "The private room titles itself 'Private: ' followed by the peer's name carrying their encryption tag."
-evidence = "docs/SPEC.md 'Connected UI'; test private_room_title_shows_the_peers_rsa_per_msg_tag_after_their_name"
+evidence = "docs/SPEC.md 'Connected UI'; test private_room_title_shows_the_peers_pq_hybrid_tag_after_their_name"
 
 [[user_story.technical_behavior]]
 id = "TB-036"
@@ -626,13 +621,13 @@ evidence = "docs/PROTOCOL.md 8.1; test encrypt_decrypt_roundtrip_empty_message"
 
 [[user_story.technical_behavior]]
 id = "TB-053"
-description = "Generated keys are RSA_KEY_BITS by default and RSA_PER_MSG_KEY_BITS when that size is requested, and remain usable at either size."
-evidence = "docs/PROTOCOL.md 8.1, 11.9; tests generate_uses_the_default_rsa_key_bits, generate_with_bits_produces_a_key_of_the_requested_size_and_is_still_usable"
+description = "Generated keys are RSA_KEY_BITS by default and RSA_PER_MSG_KEY_BITS (pq_hybrid's classical hedge size) when that size is requested, and remain usable at either size."
+evidence = "docs/PROTOCOL.md 8.1, 13.5; tests generate_uses_the_default_rsa_key_bits, generate_with_bits_produces_a_key_of_the_requested_size_and_is_still_usable"
 
 [[user_story.technical_behavior]]
 id = "TB-054"
 description = "A public or private key survives a DER round trip and is still usable for encryption and decryption afterwards."
-evidence = "docs/PROTOCOL.md 3, 12.6.5; tests public_key_der_roundtrip_preserves_usability, private_key_der_roundtrip_preserves_usability"
+evidence = "docs/PROTOCOL.md 3; tests public_key_der_roundtrip_preserves_usability, private_key_der_roundtrip_preserves_usability"
 
 [[user_story.technical_behavior]]
 id = "TB-055"
@@ -656,8 +651,8 @@ evidence = "src/crypto/mod.rs fingerprint_der doc comment; test fingerprint_der_
 
 [[user_story.technical_behavior]]
 id = "TB-059"
-description = "Signing is deterministic PKCS#1 v1.5 over SHA-256, and verification rejects tampered data, a foreign key, and garbage or empty signature bytes."
-evidence = "docs/PROTOCOL.md 11.3; tests sign_verify_roundtrip, verify_rejects_tampered_data, verify_rejects_signature_from_a_different_key, verify_rejects_garbage_signature_bytes, sign_is_deterministic_pkcs1v15"
+description = "Signing is RSA-PSS over SHA-256 with a random salt, and verification rejects tampered data, a foreign key, and garbage or empty signature bytes."
+evidence = "docs/PROTOCOL.md 8.4; tests sign_verify_roundtrip, verify_rejects_tampered_data, verify_rejects_signature_from_a_different_key, verify_rejects_garbage_signature_bytes"
 
 [[user_story.technical_behavior]]
 id = "TB-115"
@@ -725,94 +720,29 @@ description = "An EOF in the middle of a frame - right after the length prefix, 
 evidence = "docs/PROTOCOL.md 1.1; tests eof_immediately_after_a_complete_length_prefix_is_a_hard_io_error, eof_partway_through_the_payload_is_a_hard_io_error"
 
 # ============================================================================
-# US-010 - Rotate my key for every message (rsa_per_msg)
+# US-010 - Wait for a rotating peer's next key before sending
 # ============================================================================
 [[user_story]]
 id = "US-010"
-title = "Rotate my key for every message (rsa_per_msg)"
-as_a = "user who picked rsa_per_msg"
-i_want = "a fresh keypair per peer, replaced on every message and signed by the key it replaces"
-so_that = "a key that protected an old message no longer exists to be stolen"
-
-[[user_story.acceptance_criteria]]
-id = "AC-044"
-description = "Each new key a peer rotates to is signed by the key it replaces, so a forged or tampered key is refused and the previously-trusted key is kept."
-evidence = "docs/PROTOCOL.md 11.3, 11.4; tests verify_rotation_accepts_a_valid_signature, verify_rotation_rejects_tampered_key_bytes, verify_and_parse_rotation_returns_none_on_bad_signature"
+title = "Wait for a rotating peer's next key before sending"
+as_a = "user messaging a peer whose key rotates during the session"
+i_want = "a message typed while their key is momentarily stale to be held, not dropped"
+so_that = "nothing is lost while a peer's key is mid-rotation"
 
 [[user_story.acceptance_criteria]]
 id = "AC-045"
-description = "A message typed for an rsa_per_msg peer whose next key has not arrived is held, then sent automatically in the order typed once it does."
-evidence = "docs/SPEC.md Functionality #6, docs/PROTOCOL.md 11.5; tests queued_messages_flush_in_fifo_order_on_rotation, full_lifecycle_track_use_queue_rotate_flush"
-
-[[user_story.acceptance_criteria]]
-id = "AC-046"
-description = "While a key regeneration is in flight an animated spinner is shown at the top right just after the help hint, and it disappears once none is pending."
-evidence = "docs/SPEC.md Functionality #6 'Regeneration spinner'; tests header_shows_no_spinner_when_no_key_is_being_regenerated, header_shows_the_spinner_right_after_the_help_hint_separated_by_two_spaces, header_spinner_animates_across_ticks"
-
-[[user_story.technical_behavior]]
-id = "TB-068"
-description = "A rotation is signed over the recipient's UserId bytes concatenated with the new key's DER, so the payload differs per recipient."
-evidence = "docs/PROTOCOL.md 11.3; test rotation_signing_payload_differs_by_recipient"
-
-[[user_story.technical_behavior]]
-id = "TB-069"
-description = "A rotation signed for one peer does not verify when replayed as if addressed to another, through the direct or the fallback path."
-evidence = "docs/PROTOCOL.md 11.3; tests verify_rotation_rejects_replay_against_a_different_recipient, fallback_does_not_verify_continuity_signature_replayed_against_a_different_recipient"
-
-[[user_story.technical_behavior]]
-id = "TB-070"
-description = "verify_and_parse_rotation yields a usable public key only when the signature checks out, and None otherwise."
-evidence = "docs/PROTOCOL.md 11.4; tests verify_and_parse_rotation_returns_a_usable_key_on_success, verify_and_parse_rotation_returns_none_on_bad_signature"
-
-[[user_story.technical_behavior]]
-id = "TB-071"
-description = "The first rotation for a peer is signed with the bootstrap key; later ones are signed with that peer's previous per-peer key."
-evidence = "docs/PROTOCOL.md 11.2, 11.3; tests rotate_for_peer_signs_with_bootstrap_on_first_rotation, rotate_for_peer_signs_second_rotation_with_the_first_per_peer_key"
-
-[[user_story.technical_behavior]]
-id = "TB-072"
-description = "Every keypair a rotation generates is RSA_PER_MSG_KEY_BITS, larger than the app's usual size."
-evidence = "docs/PROTOCOL.md 11.9; tests rotate_for_peer_generates_keys_at_the_rsa_per_msg_key_size, generate_and_sign_rotation_produces_a_verifiable_4096_bit_key"
-
-[[user_story.technical_behavior]]
-id = "TB-073"
-description = "Rotation state is independent per peer: rotating for one peer neither consumes nor changes another peer's key."
-evidence = "docs/PROTOCOL.md 11.1; test rotate_for_peer_is_independent_per_peer"
-
-[[user_story.technical_behavior]]
-id = "TB-074"
-description = "Key generation and installation are separable, so the expensive keygen can run with no lock held and only the cheap install needs synchronised access."
-evidence = "docs/PROTOCOL.md 11.10; tests generate_and_sign_rotation_produces_a_verifiable_4096_bit_key, install_rotated_key_alone_updates_state_the_same_way_rotate_for_peer_does"
-
-[[user_story.technical_behavior]]
-id = "TB-075"
-description = "Decryption tries the current per-peer key, then retired-but-retained keys newest first, then the shared bootstrap key."
-evidence = "docs/PROTOCOL.md 11.7; tests decrypt_from_uses_bootstrap_key_before_any_rotation, decrypt_from_works_with_the_newly_rotated_key, decrypt_from_falls_back_to_a_recently_retired_key, decrypt_from_still_falls_back_to_bootstrap_after_rotating_for_a_peer"
-
-[[user_story.technical_behavior]]
-id = "TB-076"
-description = "Key retention is bounded at KEY_RETENTION, so a key retired long enough ago stops decrypting - an accepted, documented limit."
-evidence = "docs/PROTOCOL.md 11.7; test retention_window_is_bounded_and_oldest_keys_eventually_become_undecryptable"
-
-[[user_story.technical_behavior]]
-id = "TB-077"
-description = "A rotation is packaged as a RotateKey message addressed to the peer it was generated for, carrying a non-empty key and signature."
-evidence = "docs/PROTOCOL.md 7.5; test rotate_and_build_message_produces_a_rotate_key_client_message_addressed_correctly"
-
-[[user_story.technical_behavior]]
-id = "TB-078"
-description = "No per-peer public key is advertised for a peer before that relationship's first rotation."
-evidence = "docs/PROTOCOL.md 11.2; test current_public_der_for_is_none_before_any_rotation"
+description = "A message typed for a rotating-key peer whose next key has not arrived is held, then sent automatically in the order typed once it does."
+evidence = "docs/PROTOCOL.md 11.1; tests queued_messages_flush_in_fifo_order_on_rotation, full_lifecycle_track_use_queue_rotate_flush"
 
 [[user_story.technical_behavior]]
 id = "TB-079"
-description = "A peer not using rsa_per_msg is never gated on key freshness and is always sendable."
+description = "A peer whose key never rotates is never gated on key freshness and is always sendable."
 evidence = "docs/PROTOCOL.md 11; test untracked_peer_is_always_sendable"
 
 [[user_story.technical_behavior]]
 id = "TB-080"
 description = "A tracked peer's key is usable exactly once and then stale until the next rotation; re-tracking does not resurrect a stale key, and a batch flush consumes freshness like any other send."
-evidence = "docs/PROTOCOL.md 11.4, 11.5; tests tracked_peer_is_fresh_once_then_stale, track_is_idempotent_and_does_not_reset_freshness, on_rotated_marks_fresh_and_mark_used_consumes_it_again"
+evidence = "docs/PROTOCOL.md 11.1; tests tracked_peer_is_fresh_once_then_stale, track_is_idempotent_and_does_not_reset_freshness, on_rotated_marks_fresh_and_mark_used_consumes_it_again"
 
 [[user_story.technical_behavior]]
 id = "TB-081"
@@ -821,23 +751,8 @@ evidence = "src/client/rekey.rs RemoteKeys; tests on_rotated_on_a_never_tracked_
 
 [[user_story.technical_behavior]]
 id = "TB-082"
-description = "The server relays RotateKey verbatim, but only from a sender registered as PerMessage and only to a currently-connected recipient."
+description = "The server relays RotateKey verbatim, but only from a sender registered as PqHybrid and only to a currently-connected recipient."
 evidence = "docs/PROTOCOL.md 7.5; tests key_rotation_is_delivered_to_recipient, key_rotation_from_a_static_mode_sender_is_rejected, key_rotation_to_unknown_recipient_is_rejected, key_rotation_from_unknown_sender_is_rejected, end_to_end_key_rotation_is_relayed_and_rejected_appropriately"
-
-[[user_story.technical_behavior]]
-id = "TB-083"
-description = "An applied rotation updates every cached copy of that peer's public key - known_users, each channel's member list, and an open private room's peer."
-evidence = "src/client/tui/ui.rs on_user_key_rotated; tests key_rotation_updates_known_users_and_channel_member_copies, key_rotation_updates_an_open_private_room_peer_copy"
-
-[[user_story.technical_behavior]]
-id = "TB-084"
-description = "A rotation naming a user this client has never heard of is a harmless no-op."
-evidence = "test key_rotation_for_an_unknown_user_is_a_harmless_noop"
-
-[[user_story.technical_behavior]]
-id = "TB-085"
-description = "The spinner cycles the six documented ASCII frames one per tick, wrapping around, and always restarts from the first frame after a stop."
-evidence = "docs/SPEC.md Functionality #6; tests spinner_frames_match_the_documented_ascii_sequence, tick_spinner_sets_key_regenerating_and_starts_at_the_first_frame, tick_spinner_advances_one_frame_per_call_and_wraps_around, tick_spinner_resets_to_the_first_frame_once_regeneration_stops_and_restarts"
 
 # ============================================================================
 # US-011 - Recognise a peer across reconnects (identity pinning)
@@ -864,11 +779,6 @@ id = "AC-049"
 description = "A nickname mismatch with nothing yet pending is never shown, and resolving one opens the next queued review rather than several at once - see US-017 for the queueing model."
 evidence = "docs/PROTOCOL.md 12.4; tests no_identity_review_popup_is_shown_when_nothing_is_pending, a_second_mismatch_queues_behind_the_open_one_and_is_shown_once_it_resolves"
 
-[[user_story.acceptance_criteria]]
-id = "AC-050"
-description = "An rsa_per_msg peer that proves continuity after reconnecting is recognised silently, with no warning."
-evidence = "docs/PROTOCOL.md 12.6.3; tests fallback_verifies_via_continuity_when_there_is_no_live_key_at_all, fallback_a_self_reasserted_key_verifies_the_same_way_as_a_freshly_rotated_one, end_to_end_resume_rotation_after_reconnect_verifies_against_the_continuity_key"
-
 [[user_story.technical_behavior]]
 id = "TB-086"
 description = "A mismatch re-pins the nickname to the newly-seen key regardless, and hands the previous key to the caller as the only place it survives."
@@ -876,63 +786,43 @@ evidence = "docs/PROTOCOL.md 12.4; test same_nickname_different_key_is_a_mismatc
 
 [[user_story.technical_behavior]]
 id = "TB-087"
-description = "Nicknames are pinned independently of one another in both stores."
-evidence = "tests different_nicknames_are_tracked_independently (idstore and own_next_keys)"
+description = "Nicknames are pinned independently of one another."
+evidence = "test different_nicknames_are_tracked_independently"
 
 [[user_story.technical_behavior]]
 id = "TB-088"
-description = "A store round-trips the full key bytes through save and load, including arbitrary non-UTF-8 DER, and the restored key still works."
-evidence = "docs/PROTOCOL.md 12.2, 12.5; tests save_then_load_round_trips_the_full_key_bytes, save_then_load_round_trips_a_usable_private_key"
+description = "The store round-trips the full key bytes through save and load, including arbitrary non-UTF-8 DER."
+evidence = "docs/PROTOCOL.md 12.2, 12.5; test save_then_load_round_trips_the_full_key_bytes"
 
 [[user_story.technical_behavior]]
 id = "TB-089"
-description = "Saving a store creates any missing parent directories."
-evidence = "docs/PROTOCOL.md 12.5; tests save_creates_missing_parent_directories (both stores)"
+description = "Saving the store creates any missing parent directories."
+evidence = "docs/PROTOCOL.md 12.5; test save_creates_missing_parent_directories"
 
 [[user_story.technical_behavior]]
 id = "TB-090"
 description = "A nickname containing the file's own delimiters is never stored, so a remote peer cannot inject records into a local trust file."
-evidence = "docs/PROTOCOL.md 12.5; tests a_nickname_containing_a_tab_is_never_pinned, a_nickname_containing_a_tab_is_never_stored"
+evidence = "docs/PROTOCOL.md 12.5; test a_nickname_containing_a_tab_is_never_pinned"
 
 [[user_story.technical_behavior]]
 id = "TB-091"
 description = "The on-disk format is one 'nickname<TAB>lowercase-hex' line per entry, and the default path always resolves under ~/.aloo - never a loose file in the current working directory."
-evidence = "docs/PROTOCOL.md 12.5, 12.6.5; tests on_disk_format_is_hex_encoded_not_raw_or_base64, default_path_always_resolves_under_the_dot_aloo_home_directory (both stores)"
+evidence = "docs/PROTOCOL.md 12.5; tests on_disk_format_is_hex_encoded_not_raw_or_base64, default_path_always_resolves_under_the_dot_aloo_home_directory"
 
 [[user_story.technical_behavior]]
 id = "TB-092"
 description = "A line that is malformed, has an undecodable hex half, or is not a real key is skipped on load rather than failing the whole store."
-evidence = "docs/PROTOCOL.md 12.5; tests corrupted_lines_in_an_existing_file_are_skipped_not_fatal (both stores)"
+evidence = "docs/PROTOCOL.md 12.5; test corrupted_lines_in_an_existing_file_are_skipped_not_fatal"
 
 [[user_story.technical_behavior]]
 id = "TB-093"
 description = "A store file that does not exist yet loads as empty rather than erroring, and an empty in-memory store can still be saved."
-evidence = "docs/PROTOCOL.md 12.5; tests loading_a_missing_file_starts_empty_not_an_error (both stores), new_empty_starts_with_nothing_and_can_still_save (both stores)"
+evidence = "docs/PROTOCOL.md 12.5; tests loading_a_missing_file_starts_empty_not_an_error, new_empty_starts_with_nothing_and_can_still_save"
 
 [[user_story.technical_behavior]]
 id = "TB-094"
 description = "Reading a pinned entry does not pin, re-pin, or otherwise mutate the store, and an unknown nickname reads as absent."
-evidence = "docs/PROTOCOL.md 12.6.3; tests get_reads_a_pinned_entry_without_mutating_anything, get_on_an_unknown_nickname_is_none"
-
-[[user_story.technical_behavior]]
-id = "TB-095"
-description = "own_next_keys keeps only the single current private key per nickname, overwriting the previous one so it is no longer reachable."
-evidence = "docs/PROTOCOL.md 12.6.1; tests set_then_get_returns_a_usable_key, set_overwrites_the_previous_key_for_the_same_nickname"
-
-[[user_story.technical_behavior]]
-id = "TB-096"
-description = "An incoming rotation is checked against the live in-session key first and only then against the persisted continuity key, reporting which anchor verified it."
-evidence = "docs/PROTOCOL.md 12.6.3; tests fallback_prefers_the_live_key_when_it_verifies, fallback_falls_through_to_continuity_when_live_check_fails, fallback_verifies_via_continuity_when_there_is_no_live_key_at_all"
-
-[[user_story.technical_behavior]]
-id = "TB-097"
-description = "Verification fails when neither anchor verifies - whether missing, wrong, forged, or against tampered key bytes."
-evidence = "docs/PROTOCOL.md 12.6.3; tests fallback_fails_when_neither_anchor_is_available, fallback_fails_when_both_anchors_are_present_but_neither_verifies, fallback_fails_when_live_is_none_and_continuity_check_fails, fallback_rejects_tampered_new_key_bytes_via_either_anchor"
-
-[[user_story.technical_behavior]]
-id = "TB-098"
-description = "A resume re-asserts the persisted key signed by itself, wire-identical to an ordinary rotation, and needs no new protocol message or server support."
-evidence = "docs/PROTOCOL.md 12.6.2; tests fallback_a_self_reasserted_key_verifies_the_same_way_as_a_freshly_rotated_one, end_to_end_resume_rotation_after_reconnect_verifies_against_the_continuity_key"
+evidence = "docs/PROTOCOL.md 12.2; tests get_reads_a_pinned_entry_without_mutating_anything, get_on_an_unknown_nickname_is_none"
 
 # ============================================================================
 # US-012 - See who is present and how their identity is protected
@@ -947,7 +837,7 @@ so_that = "I can tell a file-backed identity from one regenerated every session"
 [[user_story.acceptance_criteria]]
 id = "AC-051"
 description = "Each user is shown with the encryption tag for their my_key type, trailing their name - one shared convention across all five my_key types - in the sidebar and in a private room's title."
-evidence = "docs/SPEC.md 'Encryption tag convention', docs/PROTOCOL.md 3; tests key_mode_label_matches_the_documented_tag_convention, format_with_name_puts_every_tag_after_the_name, sidebar_shows_each_users_encryption_tag_after_their_name, private_room_title_shows_the_peers_rsa_per_msg_tag_after_their_name, pq_hybrid_tag_is_the_shield"
+evidence = "docs/SPEC.md 'Encryption tag convention', docs/PROTOCOL.md 3; tests key_mode_label_matches_the_documented_tag_convention, format_with_name_puts_every_tag_after_the_name, sidebar_shows_each_users_encryption_tag_after_their_name, private_room_title_shows_the_peers_pq_hybrid_tag_after_their_name, pq_hybrid_tag_is_the_shield"
 
 [[user_story.technical_behavior]]
 id = "TB-099"
@@ -1126,13 +1016,13 @@ so_that = "I control whether messaging with that peer resumes, not the app"
 
 [[user_story.acceptance_criteria]]
 id = "AC-064"
-description = "A mismatch (an rsa/password byte change, or an rsa_per_msg peer whose identity hasn't been verified against a previously-pinned continuity key - whether because a resume was attempted and failed, or because none was ever attempted at all) opens an Accept/Reject popup naming the peer, worded for the specific case; nothing is shown when there is nothing pending."
-evidence = "docs/PROTOCOL.md 12.4, 12.6.3-12.6.4; tests identity_review_popup_auto_opens_and_shows_the_case_specific_message, no_identity_review_popup_is_shown_when_nothing_is_pending, push_identity_review_opens_a_popup_naming_the_peer_in_the_channel_view, identity_review_popup_also_shows_over_an_open_private_room"
+description = "A mismatch (a password/pq_hybrid byte change) opens an Accept/Reject popup naming the peer, worded for the specific case; nothing is shown when there is nothing pending."
+evidence = "docs/PROTOCOL.md 12.4; tests identity_review_popup_auto_opens_and_shows_the_case_specific_message, no_identity_review_popup_is_shown_when_nothing_is_pending, push_identity_review_opens_a_popup_naming_the_peer_in_the_channel_view, identity_review_popup_also_shows_over_an_open_private_room"
 
 [[user_story.acceptance_criteria]]
 id = "AC-065"
 description = "Accept trusts the new key going forward (persisted to id_store) and reveals any messages held while the peer was unresolved, in arrival order; Reject leaves the previous pin untouched on disk and keeps those messages held."
-evidence = "docs/PROTOCOL.md 12.4, 12.6.2; tests accepting_an_identity_review_clears_it_and_reveals_held_messages, rejecting_an_identity_review_keeps_it_and_leaves_messages_held"
+evidence = "docs/PROTOCOL.md 12.4; tests accepting_an_identity_review_clears_it_and_reveals_held_messages, rejecting_an_identity_review_keeps_it_and_leaves_messages_held"
 
 [[user_story.acceptance_criteria]]
 id = "AC-066"
@@ -1149,20 +1039,10 @@ id = "AC-068"
 description = "A channel text/voice message still reaches every other, verified member while one member is Pending/Rejected - only that member is excluded from the send. A direct message to a Pending/Rejected peer cannot be sent or typed at all."
 evidence = "docs/PROTOCOL.md 12; test sending_a_channel_message_excludes_a_pending_or_rejected_member"
 
-[[user_story.acceptance_criteria]]
-id = "AC-069"
-description = "A nickname reconnecting via rsa_per_msg that already has a continuity key pinned is gated the instant it's seen again, before any resume/rotation is even attempted - an ordinary self-consistent in-session rotation alone (proof only that a rotation matches what this same connection just announced, not proof of who announced it) never silently clears that gate; only a signature that verifies against the pinned continuity key, or a person's explicit Accept, does. Closes the gap where a peer that simply never attempts to prove continuity - an impersonator who doesn't bother, or a legitimate user who lost own_next_keys - would otherwise be silently trusted."
-evidence = "docs/PROTOCOL.md 12.6.3; test identity_pinning.feature 'A familiar nickname reconnecting via rsa_per_msg is gated on sight, before it even tries to prove continuity'"
-
-[[user_story.technical_behavior]]
-id = "TB-116"
-description = "This client's own rsa_per_msg decrypt-key selection for a live voice stream tries the current per-peer key, then retained keys, then the shared bootstrap key - the same fallback chain decrypt_from already uses for text - rather than a single key with no recourse."
-evidence = "docs/PROTOCOL.md 11.7; tests candidate_privates_for_lists_current_retained_and_bootstrap_in_priority_order, candidate_privates_for_an_untracked_peer_is_bootstrap_only"
-
 [[user_story.technical_behavior]]
 id = "TB-117"
-description = "Silently resolving a peer's identity review (a verified rsa_per_msg resume, not a person's Accept/Reject) removes that specific peer from the review queue wherever it is, not only when it's the one currently shown - a second peer's continuity can verify while a first peer's review is still on screen without disturbing it."
-evidence = "docs/PROTOCOL.md 12.6.3; test a_silently_resolved_review_is_removed_even_when_it_is_not_the_one_shown"
+description = "Resolving a peer's identity review programmatically, not through the popup, removes that specific peer from the review queue wherever it is, not only when it's the one currently shown - a second peer's review can resolve while a first peer's review is still on screen without disturbing it."
+evidence = "test a_silently_resolved_review_is_removed_even_when_it_is_not_the_one_shown"
 
 # ============================================================================
 # US-018 - See system and connection health at a glance
@@ -1206,8 +1086,8 @@ evidence = "src/client/netstats.rs ConnQuality; tests quality_is_unknown_with_no
 
 [[user_story.technical_behavior]]
 id = "TB-122"
-description = "The ~/.aloo home directory resolves via $HOME first, then %USERPROFILE%, treating a set-but-empty value as absent, and falls back to a relative .aloo directory only when neither is usable - never a bare loose file - so id_store/own_next_keys resolve consistently on Linux, macOS and Windows."
-evidence = "docs/PROTOCOL.md 12.5, 12.6.5; src/platform.rs resolve_home_dir, aloo_dir; tests resolve_home_dir_prefers_home_over_userprofile, resolve_home_dir_falls_back_to_userprofile_when_home_is_unset, resolve_home_dir_treats_an_empty_home_as_unset_and_falls_back, resolve_home_dir_treats_an_empty_userprofile_as_unset, resolve_home_dir_is_none_when_neither_is_set, aloo_dir_resolves_under_the_real_process_home_directory"
+description = "The ~/.aloo home directory resolves via $HOME first, then %USERPROFILE%, treating a set-but-empty value as absent, and falls back to a relative .aloo directory only when neither is usable - never a bare loose file - so id_store resolves consistently on Linux, macOS and Windows."
+evidence = "docs/PROTOCOL.md 12.5; src/platform.rs resolve_home_dir, aloo_dir; tests resolve_home_dir_prefers_home_over_userprofile, resolve_home_dir_falls_back_to_userprofile_when_home_is_unset, resolve_home_dir_treats_an_empty_home_as_unset_and_falls_back, resolve_home_dir_treats_an_empty_userprofile_as_unset, resolve_home_dir_is_none_when_neither_is_set, aloo_dir_resolves_under_the_real_process_home_directory"
 
 # ============================================================================
 # US-019 - Send a file to a channel or a user
@@ -1401,7 +1281,7 @@ evidence = "docs/PROTOCOL.md; src/crypto/pq.rs chunk_nonce; pq_hybrid_sends.feat
 
 [[user_story.technical_behavior]]
 id = "TB-162"
-description = "Every RSA signature this app produces uses RSA-PSS with SHA-256 and a random salt (crypto::sign/verify), not PKCS#1 v1.5 - covering both the pq_hybrid send commitment's classical half and rsa_per_msg's key-rotation signature, since both go through that one pair."
+description = "Every RSA signature this app produces uses RSA-PSS with SHA-256 and a random salt (crypto::sign/verify), not PKCS#1 v1.5 - covering the pq_hybrid send commitment's classical half and the server auth control-channel signature, since both go through that one pair."
 evidence = "docs/PROTOCOL.md; src/crypto/mod.rs sign, verify; tests signing_the_same_payload_twice_gives_different_signatures, a_pss_signature_does_not_verify_against_tampered_bytes, sign_verify_roundtrip"
 
 [[user_story.technical_behavior]]
@@ -1441,7 +1321,7 @@ evidence = "docs/PROTOCOL.md 13.10; src/crypto/pq.rs rotation_commitment; pq_hyb
 
 [[user_story.technical_behavior]]
 id = "TB-164"
-description = "Up to PQ_KEY_RETENTION superseded decryption keys are kept per peer so a burst of messages sent under one key, or a message already in flight when we rotate, still opens; anything older is discarded, and that bound is what the forward-secrecy guarantee rests on. Same value and reasoning as rekey::KEY_RETENTION."
+description = "Up to PQ_KEY_RETENTION superseded decryption keys are kept per peer so a burst of messages sent under one key, or a message already in flight when we rotate, still opens; anything older is discarded, and that bound is what the forward-secrecy guarantee rests on."
 evidence = "docs/PROTOCOL.md 13.10; src/client/pq_rekey.rs PQ_KEY_RETENTION, candidates_for; pq_hybrid_forward_secrecy.feature 'A few recent keys are kept so a burst of messages still opens'; test recent_keys_are_retained_so_a_burst_still_opens"
 
 [[user_story.technical_behavior]]
@@ -1451,12 +1331,12 @@ evidence = "docs/PROTOCOL.md 13.3/13.10; src/crypto/pq.rs wrap_key_for, unwrap_k
 
 [[user_story.technical_behavior]]
 id = "TB-166"
-description = "Rotation runs inline on the event loop rather than on rekey's dedicated worker thread, because ML-KEM-1024 and X25519 keygen are microseconds against RSA-4096's hundreds of milliseconds - so pq_hybrid needs neither the rotation spinner nor rsa_per_msg's carve-out exempting voice from per-message rotation. One trigger, session::request_rotation, serves both rotating modes and is a no-op for the static ones."
+description = "Rotation runs inline on the event loop rather than on a dedicated worker thread, because ML-KEM-1024 and X25519 keygen are microseconds - so pq_hybrid needs no rotation spinner and no carve-out exempting voice from per-message rotation. One trigger, session::request_rotation, drives it and is a no-op for the static modes."
 evidence = "docs/PROTOCOL.md 13.10; src/client/session.rs request_rotation, request_rotation_if_pq_hybrid; src/client/pq_rekey.rs (module doc); test every_rotation_produces_new_keys_with_no_machinery_behind_it"
 
 [[user_story.technical_behavior]]
 id = "TB-167"
-description = "The server relays RotateKey for both rotating modes (rsa_per_msg and pq_hybrid) and refuses it from the static ones, which have nothing to rotate; it still verifies nothing about the payload or signature, exactly as before."
+description = "The server relays RotateKey for the pq_hybrid mode and refuses it from the static ones, which have nothing to rotate; it still verifies nothing about the payload or signature, exactly as before."
 evidence = "docs/PROTOCOL.md 7.5/13.10; src/server/mod.rs route_key_rotation; test rotate_key_is_rejected_from_a_non_rotating_sender"
 
 # ============================================================================
@@ -1472,37 +1352,37 @@ so_that = "the warning I get means something when it finally appears"
 [[user_story.acceptance_criteria]]
 id = "AC-120"
 description = "An identity's fingerprint renders as an eight-word safety phrase drawn from a fixed 256-word list, stable for a given identity and different for a different one, so two people can confirm each other over any channel they already trust. The fingerprint covers the identity's keys only, not the continuity certificate, so attaching one never changes the phrase a user reads out."
-evidence = "docs/PROTOCOL.md 12.7; src/crypto/safety.rs phrase, WORDS; src/crypto/pq.rs bundle_fingerprint; identity_continuity.feature 'The same identity always reads out the same safety phrase'; tests a_safety_phrase_is_stable_and_distinguishes_identities, a_safety_phrase_is_eight_readable_words, a_single_changed_byte_changes_the_phrase, the_word_list_has_no_duplicates"
+evidence = "docs/PROTOCOL.md 12.6; src/crypto/safety.rs phrase, WORDS; src/crypto/pq.rs bundle_fingerprint; identity_continuity.feature 'The same identity always reads out the same safety phrase'; tests a_safety_phrase_is_stable_and_distinguishes_identities, a_safety_phrase_is_eight_readable_words, a_single_changed_byte_changes_the_phrase, the_word_list_has_no_duplicates"
 
 [[user_story.acceptance_criteria]]
 id = "AC-121"
 description = "A pin records how much it is worth: `tofu` for something believed because it turned up first, `verified` once a human has confirmed it out of band. Re-pinning never silently demotes a verified pin, the level survives save/load, and a store written before the column existed loads as `tofu` rather than being discarded - losing a user's pins would cost real security."
-evidence = "docs/PROTOCOL.md 12.7; src/client/idstore.rs Trust, check_and_pin_with, mark_verified, trust; identity_continuity.feature 'A pin can be raised from trusted-on-sight to verified'; tests a_pin_starts_trusted_on_sight_and_can_be_raised_to_verified, re_pinning_does_not_silently_demote_a_verified_pin, trust_survives_a_save_and_load_round_trip, a_store_without_a_trust_column_loads_as_trusted_on_sight, on_disk_format_is_hex_encoded_not_raw_or_base64"
+evidence = "docs/PROTOCOL.md 12.6; src/client/idstore.rs Trust, check_and_pin_with, mark_verified, trust; identity_continuity.feature 'A pin can be raised from trusted-on-sight to verified'; tests a_pin_starts_trusted_on_sight_and_can_be_raised_to_verified, re_pinning_does_not_silently_demote_a_verified_pin, trust_survives_a_save_and_load_round_trip, a_store_without_a_trust_column_loads_as_trusted_on_sight, on_disk_format_is_hex_encoded_not_raw_or_base64"
 
 [[user_story.acceptance_criteria]]
 id = "AC-122"
 description = "A pq_hybrid identity generated by `aloo --rekey-pq-hybrid <old> <new>` carries a continuity certificate: the retired identity's ML-DSA-87 + RSA-PSS signature over the replacement's fingerprint. A peer holding the old pin verifies it and moves the pin across silently, with a status note and no review popup - so the review is left to mean 'this change is unexplained'."
-evidence = "docs/PROTOCOL.md 12.7; src/crypto/pq.rs ContinuitySig, sign_continuity, verify_continuity, with_continuity; src/main.rs run_rekey_pq_hybrid; src/client/session.rs continuity_proven, check_identity; identity_continuity.feature 'A planned key change proves itself and raises no alarm'; tests a_replacement_identity_proves_it_succeeded_the_pinned_one, continuity_holds_across_successive_rekeys"
+evidence = "docs/PROTOCOL.md 12.6; src/crypto/pq.rs ContinuitySig, sign_continuity, verify_continuity, with_continuity; src/main.rs run_rekey_pq_hybrid; src/client/session.rs continuity_proven, check_identity; identity_continuity.feature 'A planned key change proves itself and raises no alarm'; tests a_replacement_identity_proves_it_succeeded_the_pinned_one, continuity_holds_across_successive_rekeys"
 
 [[user_story.acceptance_criteria]]
 id = "AC-123"
 description = "Forging continuity needs the retired identity's private keys, which knowing its public fingerprint does not give. A bundle with no certificate, one signed by different keys, or a genuine certificate lifted onto another bundle all fail to verify, and a failure leaves the existing pin exactly as it was and opens the ordinary review."
-evidence = "docs/PROTOCOL.md 12.7; src/crypto/pq.rs verify_continuity; identity_continuity.feature 'A stranger taking the nickname cannot fake continuity'; tests an_unrelated_identity_cannot_prove_continuity, a_certificate_signed_by_the_wrong_keys_is_refused, a_certificate_does_not_transfer_to_another_bundle"
+evidence = "docs/PROTOCOL.md 12.6; src/crypto/pq.rs verify_continuity; identity_continuity.feature 'A stranger taking the nickname cannot fake continuity'; tests an_unrelated_identity_cannot_prove_continuity, a_certificate_signed_by_the_wrong_keys_is_refused, a_certificate_does_not_transfer_to_another_bundle"
 
 [[user_story.acceptance_criteria]]
 id = "AC-124"
 description = "`aloo --export-identity-card <prefix> <nickname>` writes a small self-signed file pairing a nickname with an identity, shareable by any means. Importing one pins that nickname as verified before first contact - the one thing pinning alone can never do, since a first sighting has nothing to compare against."
-evidence = "docs/PROTOCOL.md 12.7; src/crypto/pq.rs IdentityCard, make_identity_card, open_identity_card, save_identity_card, load_identity_card; src/main.rs run_export_identity_card; identity_continuity.feature 'An identity card pins someone before you ever speak'; tests an_identity_card_round_trips_and_names_its_owner, an_identity_card_survives_being_written_and_read_back"
+evidence = "docs/PROTOCOL.md 12.6; src/crypto/pq.rs IdentityCard, make_identity_card, open_identity_card, save_identity_card, load_identity_card; src/main.rs run_export_identity_card; identity_continuity.feature 'An identity card pins someone before you ever speak'; tests an_identity_card_round_trips_and_names_its_owner, an_identity_card_survives_being_written_and_read_back"
 
 [[user_story.acceptance_criteria]]
 id = "AC-125"
 description = "A card whose nickname was altered, whose bundle was swapped for someone else's, or whose bytes are corrupt is refused rather than pinned - the signature covers both the nickname and the identity fingerprint together."
-evidence = "docs/PROTOCOL.md 12.7; src/crypto/pq.rs card_commitment, open_identity_card; identity_continuity.feature 'A tampered identity card is refused'; tests a_card_whose_nickname_was_altered_is_refused, a_card_whose_bundle_was_swapped_is_refused, a_corrupted_card_file_is_refused_rather_than_trusted"
+evidence = "docs/PROTOCOL.md 12.6; src/crypto/pq.rs card_commitment, open_identity_card; identity_continuity.feature 'A tampered identity card is refused'; tests a_card_whose_nickname_was_altered_is_refused, a_card_whose_bundle_was_swapped_is_refused, a_corrupted_card_file_is_refused_rather_than_trusted"
 
 [[user_story.technical_behavior]]
 id = "TB-168"
 description = "bundle_fingerprint covers the identity fields (ML-DSA verifying key, RSA signing key, bootstrap encryption keys) and excludes the continuity certificate - otherwise a certificate would have to sign the fingerprint of a bundle that already contains it. fingerprint_of_encoded is the same value computed from a bundle still in announced form, returning None if those bytes are not a bundle."
-evidence = "docs/PROTOCOL.md 12.7/13.3; src/crypto/pq.rs bundle_fingerprint, fingerprint_of_encoded; test a_replacement_identity_proves_it_succeeded_the_pinned_one"
+evidence = "docs/PROTOCOL.md 12.6/13.3; src/crypto/pq.rs bundle_fingerprint, fingerprint_of_encoded; test a_replacement_identity_proves_it_succeeded_the_pinned_one"
 
 # ============================================================================
 # US-030 - Keeping the setup conversation off the wire too
@@ -1641,7 +1521,7 @@ evidence = "docs/PROTOCOL.md 13.9; tests connect_cache_round_trips_through_save_
 
 [[user_story.technical_behavior]]
 id = "TB-132"
-description = "ConnectCache is a flat host<TAB>port<TAB>file_pub<TAB>file_priv-per-line store at ~/.aloo/.cache, tolerant of a missing file and of malformed lines, mirroring idstore/own_next_keys' load conventions; recording an existing (host,port) pair moves it to the end (most-recently-used) rather than duplicating it."
+description = "ConnectCache is a flat host<TAB>port<TAB>file_pub<TAB>file_priv-per-line store at ~/.aloo/.cache, tolerant of a missing file and of malformed lines, mirroring idstore's load conventions; recording an existing (host,port) pair moves it to the end (most-recently-used) rather than duplicating it."
 evidence = "src/client/connect.rs ConnectCache; tests connect_cache_record_moves_an_existing_pair_to_most_recent, connect_cache_load_skips_malformed_lines, connect_cache_load_of_a_missing_file_is_empty_not_an_error, connect_cache_record_rejects_fields_containing_the_delimiter"
 
 [[user_story.technical_behavior]]
@@ -1691,7 +1571,7 @@ evidence = "docs/SPEC.md Functionality #4; test tick_recording_timeout_never_tou
 
 [[user_story.technical_behavior]]
 id = "TB-135"
-description = "Settings::load_or_create tolerates unknown keys, malformed lines, and an empty value the same way idstore/own_next_keys tolerate a corrupted store - by skipping the bad line and keeping the default for that field, rather than failing the whole load."
+description = "Settings::load_or_create tolerates unknown keys, malformed lines, and an empty value the same way idstore tolerates a corrupted store - by skipping the bad line and keeping the default for that field, rather than failing the whole load."
 evidence = "src/settings.rs; tests load_skips_unparseable_or_unknown_lines_and_keeps_the_rest, an_empty_shortcut_value_is_ignored_in_favor_of_the_default"
 
 [[user_story.technical_behavior]]

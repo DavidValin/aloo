@@ -36,10 +36,8 @@ pub fn id_for(name: &str) -> u64 {
 
 fn key_mode_named(mode: &str) -> KeyMode {
     match mode {
-        "rsa" => KeyMode::Rsa,
         "password" => KeyMode::Password,
         "none" => KeyMode::None,
-        "rsa_per_msg" => KeyMode::PerMessage,
         "pq_hybrid" => KeyMode::PqHybrid,
         other => panic!("unknown key mode {other:?}"),
     }
@@ -90,7 +88,7 @@ async fn connected_two_channels(w: &mut AlooWorld) {
 
 #[given(expr = "{word} is in the channel with me")]
 async fn member_present(w: &mut AlooWorld, name: String) {
-    let info = user_with_mode(id_for(&name), &name, KeyMode::Rsa);
+    let info = user_with_mode(id_for(&name), &name, KeyMode::Password);
     w.ui_mut().on_user_joined("general", info);
 }
 

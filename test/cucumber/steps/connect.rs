@@ -1,7 +1,5 @@
 //! Connect-popup steps (US-001).
 
-use std::path::PathBuf;
-
 use crossterm::event::KeyCode;
 use cucumber::{given, then, when};
 use ratatui::Terminal;
@@ -24,7 +22,6 @@ fn field_of(name: &str) -> Field {
         "port" => Field::Port,
         "nickname" => Field::Nickname,
         "id_store" => Field::IdStorePath,
-        "own_next_keys" => Field::OwnNextKeysPath,
         "server_key value" => Field::ServerKeyValue,
         "Connect" => Field::Connect,
         other => panic!("unknown field {other:?}"),
@@ -50,10 +47,8 @@ async fn form_valid(w: &mut AlooWorld) {
 
 fn my_key_type_named(kind: &str) -> MyKeyType {
     match kind {
-        "rsa" => MyKeyType::Rsa,
         "password" => MyKeyType::Password,
         "none" => MyKeyType::None,
-        "rsa_per_msg" => MyKeyType::RsaPerMessage,
         "pq_hybrid" => MyKeyType::PqHybrid,
         other => panic!("unknown my_key type {other:?}"),
     }
@@ -125,7 +120,6 @@ async fn clear_field(w: &mut AlooWorld, name: String) {
         Field::Port => p.port.clear(),
         Field::Nickname => p.nickname.clear(),
         Field::IdStorePath => p.id_store_path.clear(),
-        Field::OwnNextKeysPath => p.my_key.own_next_keys_path.clear(),
         other => panic!("cannot clear {other:?}"),
     }
 }
@@ -244,7 +238,6 @@ async fn field_contains(w: &mut AlooWorld, name: String, expected: String) {
         Field::Port => &p.port,
         Field::Nickname => &p.nickname,
         Field::IdStorePath => &p.id_store_path,
-        Field::OwnNextKeysPath => &p.my_key.own_next_keys_path,
         Field::ServerKeyValue => &p.server_key.password,
         other => panic!("cannot read {other:?}"),
     };
@@ -293,45 +286,6 @@ async fn id_store_prefilled(w: &mut AlooWorld, _which: String) {
     assert_eq!(
         p.id_store_path,
         aloo::client::idstore::default_path().display().to_string()
-    );
-}
-
-#[then("the own_next_keys path is prefilled with its default location")]
-async fn own_next_prefilled(w: &mut AlooWorld) {
-    let p = w.popup.as_ref().expect("no form");
-    assert!(!p.my_key.own_next_keys_path.is_empty());
-    assert_eq!(
-        p.my_key.own_next_keys_path,
-        aloo::client::own_next_keys::default_path().display().to_string()
-    );
-}
-
-#[then("the own_next_keys field is offered")]
-async fn own_next_offered(w: &mut AlooWorld) {
-    assert!(
-        w.popup
-            .as_ref()
-            .unwrap()
-            .focus_order()
-            .contains(&Field::OwnNextKeysPath),
-        "own_next_keys must be reachable for rsa_per_msg"
-    );
-    let rows = popup_rows(w.popup.as_ref().unwrap(), 80, 30);
-    assert!(
-        rows.iter().any(|r| r.contains("own_next_keys")),
-        "expected the field on screen: {rows:?}"
-    );
-}
-
-#[then("the own_next_keys field is not offered")]
-async fn own_next_not_offered(w: &mut AlooWorld) {
-    assert!(
-        !w.popup
-            .as_ref()
-            .unwrap()
-            .focus_order()
-            .contains(&Field::OwnNextKeysPath),
-        "own_next_keys is only meaningful for rsa_per_msg"
     );
 }
 
@@ -491,22 +445,6 @@ async fn highlight_not_bleeding(w: &mut AlooWorld) {
         Some(Color::Green),
         "the button's border must stay outside the highlight, not be filled by it"
     );
-}
-
-#[then(expr = "the request carries the own_next_keys path {string}")]
-async fn request_carries_own_next(w: &mut AlooWorld, expected: String) {
-    let req = w
-        .popup
-        .as_ref()
-        .unwrap()
-        .build_request()
-        .expect("form should be valid");
-    match req.my_key {
-        MyKeySelection::RsaPerMessage { own_next_keys_path } => {
-            assert_eq!(own_next_keys_path, PathBuf::from(&expected));
-        }
-        other => panic!("expected RsaPerMessage, got {other:?}"),
-    }
 }
 
 #[then("the request carries no key material for either key")]

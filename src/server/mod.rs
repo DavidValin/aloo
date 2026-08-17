@@ -1,6 +1,6 @@
 //! The server: purely a medium of connection setup, never of content. It
 //! authenticates clients, tracks channel membership/presence, relays
-//! `rsa_per_msg` key-rotation notices, and relays the candidate exchange
+//! `pq_hybrid` key-rotation notices, and relays the candidate exchange
 //! that lets two clients punch a direct UDP link to each other
 //! (`crate::client::p2p`) - but every actual message, voice stream, and file
 //! transfer travels over that direct link, never through here. See
@@ -482,12 +482,12 @@ impl Registry {
             .collect()
     }
 
-    /// Relays a `rsa_per_msg` key rotation (PROTOCOL.md §7.5/§11) point to
+    /// Relays a `pq_hybrid` key rotation (PROTOCOL.md §7.5/§13.10) point to
     /// point. The server never inspects `signature` - that's the receiving
-    /// client's job (§11.4) - and never updates its stored
-    /// `public_key_der` for `from`, which stays as whatever `Identify`
-    /// sent (it only ever serves as the *bootstrap* key for peers who
-    /// haven't exchanged a message with `from` yet).
+    /// client's job - and never updates its stored `public_key_der` for
+    /// `from`, which stays as whatever `Identify` sent (it only ever
+    /// serves as the *bootstrap* key for peers who haven't exchanged a
+    /// message with `from` yet).
     pub fn route_key_rotation(
         &self,
         from: UserId,
@@ -499,11 +499,10 @@ impl Registry {
             .clients
             .get(&from)
             .ok_or_else(|| "unknown sender".to_string())?;
-        // Both rotating modes may relay: rsa_per_msg rotates its identity
-        // key (§11), pq_hybrid its encryption keys (§13.10). The static
+        // Only pq_hybrid rotates its encryption keys (§13.10). The static
         // modes have nothing to rotate and so have no business here. The
         // server still verifies nothing about the payload itself.
-        if !matches!(sender.key_mode, KeyMode::PerMessage | KeyMode::PqHybrid) {
+        if sender.key_mode != KeyMode::PqHybrid {
             return Err("sender does not rotate keys".to_string());
         }
         if !self.clients.contains_key(&to) {

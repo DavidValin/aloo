@@ -77,7 +77,7 @@ pub struct PqPublicBundle {
     bootstrap_encap: PqEncapKeys,
     /// Present when this identity deliberately replaced an earlier one: the
     /// retired identity's signature over this one, so contacts move their
-    /// pin across without being asked (§12.7). Absent for an identity that
+    /// pin across without being asked (§12.6). Absent for an identity that
     /// replaced nothing.
     #[serde(default)]
     continuity: Option<ContinuitySig>,
@@ -122,10 +122,9 @@ pub struct PqDecapKeys {
 }
 
 /// Generates one fresh encryption keypair. Fast - ML-KEM-1024 and X25519
-/// keygen are microseconds apiece, which is precisely what makes rotating
-/// per message practical here where `rsa_per_msg`'s 4096-bit RSA keygen
-/// (§11.9, hundreds of milliseconds) forced a background worker and a
-/// carve-out for voice.
+/// keygen are microseconds apiece, unlike a 4096-bit RSA keygen (hundreds
+/// of milliseconds), which is precisely what makes rotating inline on the
+/// event-loop task practical here, with no background worker needed.
 pub fn generate_encryption_keys() -> (PqEncapKeys, PqDecapKeys) {
     let (mlkem_decaps, mlkem_encaps) = MlKem1024::generate_keypair();
     let x_secret = x25519_dalek::StaticSecret::random_from_rng(rand_core::OsRng);
@@ -586,14 +585,9 @@ fn rotation_commitment(to: UserId, recipient_fp: &[u8; 32], rotation: &[u8]) -> 
 }
 
 /// Signs a rotation with the sender's **durable identity** - not with the
-/// key being replaced.
-///
-/// This is the one real simplification over `rsa_per_msg`'s chain (§11.3):
-/// there, each rotation is signed by the key it supersedes, so a broken
-/// link anywhere strands the relationship and a reconnect needs the whole
-/// §12.6 resume mechanism to re-anchor. Here the verifying key is the
-/// pinned identity and never changes, so every rotation is independently
-/// verifiable and a reconnect needs nothing special.
+/// key being replaced. The verifying key is the pinned identity and never
+/// changes, so every rotation is independently verifiable and a reconnect
+/// needs nothing special: no chain of prior keys to re-anchor.
 pub fn sign_rotation(
     signing: &PqPrivateBundle,
     to: UserId,

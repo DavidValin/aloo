@@ -1,20 +1,19 @@
 //! The live, connected session: the event loop, session-wide state, and
-//! the rsa_per_msg key-rotation / identity-pinning bookkeeping that isn't
-//! specific to a channel or a DM. Per-conversation-type send/receive
-//! handling lives in `crate::client::channel` and `crate::client::direct_message`; the
+//! the identity-pinning bookkeeping that isn't specific to a channel or a
+//! DM. Per-conversation-type send/receive handling lives in
+//! `crate::client::channel` and `crate::client::direct_message`; the
 //! generic live-voice-streaming plumbing they both share lives in
 //! `crate::client::voice_stream`.
 
 use std::collections::HashMap;
 use std::io::Stdout;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, KeyCode, KeyModifiers};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use rsa::RsaPrivateKey;
 use tokio::net::TcpStream;
 
 use crate::BoxError;
@@ -23,7 +22,6 @@ use crate::crypto;
 use crate::client::file_transfer;
 use crate::client::idstore;
 use crate::client::netstats;
-use crate::client::own_next_keys;
 use crate::client::p2p::{self, P2pEvent, P2pOutbound, PeerLinkManager};
 use crate::control::ControlSink;
 use crate::p2p_proto::P2pPayload;
@@ -78,18 +76,13 @@ pub(crate) struct SessionState {
     pub(crate) mixer_tx: tokio::sync::mpsc::UnboundedSender<voice::MixerCmd>,
     pub(crate) stream_finished_tx: tokio::sync::mpsc::UnboundedSender<(UserId, u64, u32, Vec<u8>)>,
     pub(crate) audio_err_tx: tokio::sync::mpsc::UnboundedSender<String>,
-    /// Whether *this* client's own `my_key` is `rsa_per_msg` - gates
-    /// whether `request_rotation` ever actually does
-    /// anything.
+    /// Whether *this* client's own `my_key` is `pq_hybrid` - gates whether
+    /// `request_rotation` ever actually does anything.
     pub(crate) own_key_mode: KeyMode,
-    /// This client's own rotating per-peer keypairs (`rekey::OwnKeys`).
-    /// Built for every `KeyMode` except `PqHybrid` (under a
-    /// non-`PerMessage` mode it simply never rotates), so the decrypt path
-    /// branches on our own mode once instead of scattering RSA logic.
-    /// `None` for `PqHybrid` - see `own_pq_private`. Shared with
-    /// `spawn_rotation_worker`'s thread (`Arc<Mutex<_>>`); the lock is
-    /// only held for brief operations, never for RSA-4096 keygen itself.
-    pub(crate) own_keys: Option<Arc<Mutex<rekey::OwnKeys>>>,
+    /// This client's own static RSA-family private key (`Password`/`None`
+    /// - neither ever rotates), used to decrypt anything addressed to us.
+    /// `None` for `PqHybrid` - see `own_pq_private`.
+    pub(crate) own_keys: Option<RsaPrivateKey>,
     /// This client's own PQ-hybrid private keybundle (`crypto::pq`,
     /// `docs/PROTOCOL.md` §13) - `Some` only when `own_key_mode ==
     /// KeyMode::PqHybrid`, the mirror image of `own_keys` above. `PqHybrid`
@@ -102,48 +95,25 @@ pub(crate) struct SessionState {
     pub(crate) own_pq_fp: Option<[u8; 32]>,
     /// Our rotating `pq_hybrid` decryption keys, one set per peer
     /// (`docs/PROTOCOL.md` §13.10). `Some` exactly when `own_pq_private`
-    /// is. Unlike `own_keys` this needs no `Arc<Mutex<_>>`: ML-KEM/X25519
-    /// keygen is fast enough to run inline, so no background worker shares
-    /// it.
+    /// is. ML-KEM/X25519 keygen is fast enough to run inline on the
+    /// event-loop task, so this needs no background worker.
     pub(crate) own_pq_keys: Option<crate::client::pq_rekey::PqOwnKeys>,
     /// Which `pq_hybrid` encryption keys each peer currently wants us to
     /// use, and how far along their rotation counter we have seen.
     pub(crate) pq_peer_keys: crate::client::pq_rekey::PqPeerKeys,
-    /// Where a rotation to send is queued for the main loop to write.
-    /// Shared with `spawn_rotation_worker`, which uses it for the
-    /// `rsa_per_msg` rotations it produces off-thread.
+    /// Where a `pq_hybrid` rotation to send is queued for the main loop to
+    /// write (`request_rotation_if_pq_hybrid`).
     pub(crate) rotate_out_tx: tokio::sync::mpsc::UnboundedSender<ClientMessage>,
     /// Refuses a send that already arrived once - see `replay::ReplayGuard`.
     pub(crate) replay: crate::client::replay::ReplayGuard,
-    /// Freshness/queueing for peers who use `rsa_per_msg`, independent of
-    /// our own `key_mode` (PROTOCOL.md §11.5).
+    /// Freshness/queueing for peers whose key rotates during the session
+    /// (currently `pq_hybrid` only), independent of our own `key_mode`.
     pub(crate) remote_keys: rekey::RemoteKeys,
-    /// Where `request_rotation` sends "please rotate for
-    /// this peer" requests - consumed one at a time by
-    /// `spawn_rotation_worker`'s dedicated thread, which is what actually
-    /// keeps rotations off the event-loop task.
-    pub(crate) rotate_request_tx: tokio::sync::mpsc::UnboundedSender<UserId>,
-    /// Rotation requests handed to `spawn_rotation_worker` but not yet
-    /// finished; > 0 drives `UiState::tick_spinner`, so the spinner
-    /// animates exactly while a key is being regenerated. An
-    /// `Arc<AtomicUsize>` rather than a channel: the UI only needs the
-    /// current count at redraw time.
-    pub(crate) rotation_pending: Arc<AtomicUsize>,
     /// Local nickname -> full-public-key pinning store (`docs/PROTOCOL.md`
     /// §12), checked whenever a peer's identity is first learned
     /// (`check_identity`) so a nickname reconnecting under a different key
-    /// can be flagged instead of silently trusted. Doubles as the
-    /// *verification* half of the `rsa_per_msg` continuity mechanism
-    /// (§12.6, `handle_key_rotated`) - a peer's rolling key gets pinned
-    /// here too, checked via signature rather than byte comparison.
+    /// can be flagged instead of silently trusted.
     pub(crate) id_store: idstore::IdStore,
-    /// This client's own per-peer `rsa_per_msg` continuity private keys
-    /// (`docs/PROTOCOL.md` §12.6, `own_next_keys::OwnNextKeys`) - the
-    /// *sending* half: what lets this client resume-prove "it's still me"
-    /// to a peer right after reconnecting. `None` unless this session's own
-    /// `key_mode` is `PerMessage` - only that mode has anything to persist
-    /// or resume here.
-    pub(crate) own_next_keys: Option<own_next_keys::OwnNextKeys>,
     /// Feeds the header's `Conn:<quality>` indicator (`docs/SPEC.md`
     /// "Connected UI") - every protocol message actually sent or received
     /// records an event here (`netstats::ConnStats::record_event`), and
@@ -169,57 +139,9 @@ pub(crate) struct SessionState {
     pub(crate) peer_link: PeerLinkManager,
 }
 
-/// Runs on one dedicated thread for the whole session, processing
-/// `rsa_per_msg` rotation requests (§11.3) one at a time - keeping
-/// RSA-4096 keygen (100ms to low seconds) off the async event-loop task,
-/// which would otherwise stall UI redraw and network processing on every
-/// message sent or received.
-///
-/// Deliberately a *single* worker: two rotations for the same peer racing
-/// would each sign against whatever "current" key they read first, and
-/// the receiver validates against the one key it still trusts (§11.4) -
-/// the loser's `RotateKey` would be silently dropped. Strict one-at-a-time
-/// processing makes that race structurally impossible, at the acceptable
-/// cost of different peers' rotations queueing.
-///
-/// The `own_keys` lock is held only for `current_private_for` and
-/// `install_rotated_key`; the keygen itself runs with no lock held.
-/// `pending` is decremented once a request is handled (success or
-/// failure), pairing with the increment in
-/// `request_rotation` to drive the UI spinner.
-fn spawn_rotation_worker(
-    own_keys: Arc<Mutex<rekey::OwnKeys>>,
-    out_tx: tokio::sync::mpsc::UnboundedSender<ClientMessage>,
-    pending: Arc<AtomicUsize>,
-) -> tokio::sync::mpsc::UnboundedSender<UserId> {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<UserId>();
-    std::thread::spawn(move || {
-        while let Some(peer) = rx.blocking_recv() {
-            let old_private = own_keys.lock().unwrap().current_private_for(peer);
-            match rekey::generate_and_sign_rotation(&old_private, peer) {
-                Ok((new_public_key_der, signature, new_private)) => {
-                    own_keys.lock().unwrap().install_rotated_key(
-                        peer,
-                        new_private,
-                        new_public_key_der.clone(),
-                    );
-                    let _ = out_tx.send(ClientMessage::RotateKey {
-                        to: peer,
-                        new_public_key_der,
-                        signature,
-                    });
-                }
-                Err(e) => eprintln!("aloo: rsa_per_msg key rotation for {peer:?} failed: {e}"),
-            }
-            pending.fetch_sub(1, Ordering::SeqCst);
-        }
-    });
-    tx
-}
-
-// `key_mode` (added for rsa_per_msg) pushed this past clippy's default
-// 7-argument threshold; grouping the handshake outputs into a struct would
-// be a larger, unrelated refactor of an already-established call site.
+// `key_mode` pushed this past clippy's default 7-argument threshold;
+// grouping the handshake outputs into a struct would be a larger,
+// unrelated refactor of an already-established call site.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_connected_session(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
@@ -231,7 +153,6 @@ pub(crate) async fn run_connected_session(
     key_mode: KeyMode,
     keyboard_release_reporting: bool,
     id_store: idstore::IdStore,
-    own_next_keys: Option<own_next_keys::OwnNextKeys>,
     mut hotkey_rx: Option<tokio::sync::mpsc::UnboundedReceiver<crate::client::global_ptt::GlobalPttEvent>>,
     server_addr: SocketAddr,
 ) -> Result<(), BoxError> {
@@ -295,17 +216,11 @@ pub(crate) async fn run_connected_session(
         tokio::sync::mpsc::unbounded_channel::<(SocketAddr, p2p::InboundDatagram)>();
     p2p::spawn_receive_loop(p2p_socket, server_addr, p2p_raw_tx);
 
-    // `PqHybrid` has no single RSA key to seed `rekey::OwnKeys` with and
-    // never rotates (it's a static identity, like `Rsa`/`Password`/`None`
-    // but with its own separate key material) - see `SessionState::own_keys`/
-    // `own_pq_private`.
+    // `PqHybrid` has no single RSA key here and never rotates it (it's a
+    // static identity, like `Password`/`None`, but with its own separate
+    // key material) - see `SessionState::own_keys`/`own_pq_private`.
     let (own_keys, own_pq_private, own_pq_fp, own_pq_keys) = match my_identity {
-        ResolvedIdentity::Rsa(kp) => (
-            Some(Arc::new(Mutex::new(rekey::OwnKeys::new(kp.private)))),
-            None,
-            None,
-            None,
-        ),
+        ResolvedIdentity::Rsa(kp) => (Some(kp.private), None, None, None),
         ResolvedIdentity::Pq {
             private,
             public_der,
@@ -322,18 +237,6 @@ pub(crate) async fn run_connected_session(
     };
     let (rotate_out_tx, mut rotate_out_rx) =
         tokio::sync::mpsc::unbounded_channel::<ClientMessage>();
-    let rotation_pending = Arc::new(AtomicUsize::new(0));
-    let rotate_request_tx = match &own_keys {
-        Some(own_keys) => {
-            spawn_rotation_worker(own_keys.clone(), rotate_out_tx.clone(), rotation_pending.clone())
-        }
-        // No worker needed: `request_rotation` only ever
-        // sends on this channel when `own_key_mode == PerMessage`, which
-        // always has `own_keys: Some(_)` above - so for `PqHybrid` (the
-        // only case reaching here) nothing is ever sent, and a dropped
-        // receiver is already handled gracefully there as "worker gone".
-        None => tokio::sync::mpsc::unbounded_channel::<UserId>().0,
-    };
 
     let mut session = SessionState {
         active_recording: None,
@@ -358,10 +261,7 @@ pub(crate) async fn run_connected_session(
         rotate_out_tx: rotate_out_tx.clone(),
         replay: crate::client::replay::ReplayGuard::new(),
         remote_keys: rekey::RemoteKeys::new(),
-        rotate_request_tx,
-        rotation_pending,
         id_store,
-        own_next_keys,
         conn_stats: netstats::ConnStats::new(),
         auto_stop_tx,
         active_replay_id: None,
@@ -397,7 +297,7 @@ pub(crate) async fn run_connected_session(
             }
             msg = net_rx.recv() => {
                 let Some(msg) = msg else { break };
-                if let Some(action) = handle_server_message(msg, &mut ui_state, you, &mut wr, &mut session).await? {
+                if let Some(action) = handle_server_message(msg, &mut ui_state, &mut wr, &mut session).await? {
                     handle_ui_action(action, &mut wr, &mut ui_state, &mut session).await?;
                 }
             }
@@ -417,11 +317,6 @@ pub(crate) async fn run_connected_session(
                 let Some(msg) = msg else { break };
                 wr.send_control(&msg).await?;
                 session.conn_stats.record_event(Instant::now());
-                if let ClientMessage::RotateKey { to, .. } = &msg
-                    && let Some(nickname) = ui_state.known_users.get(to).map(|u| u.name.clone())
-                {
-                    persist_own_continuity_key(&mut session, &nickname, *to);
-                }
             }
             done = own_stream_done_rx.recv() => {
                 let Some((stream_id, duration_ms, pcm)) = done else { break };
@@ -526,7 +421,6 @@ pub(crate) async fn run_connected_session(
                     ui_state.set_conn_quality(session.conn_stats.quality());
                     last_conn_sample = now;
                 }
-                ui_state.tick_spinner(session.rotation_pending.load(Ordering::SeqCst) > 0);
                 if let Some(action) = ui_state.tick_dwell(Instant::now()) {
                     handle_ui_action(action, &mut wr, &mut ui_state, &mut session).await?;
                 }
@@ -688,38 +582,19 @@ async fn handle_ui_action(
         }
         UiAction::AcceptIdentity(peer) => {
             if let Some(review) = ui_state.identity_reviews.get(&peer).cloned() {
-                match review.case {
-                    // A static key just needs pinning - `known_users` (and
-                    // hence what future sends encrypt with) already holds
-                    // this exact key, set unconditionally by `on_user_joined`
-                    // when the peer joined (docs/PROTOCOL.md §12.4); nothing
-                    // else was withheld from it, only the local pin.
-                    IdentityCase::StaticMismatch {
-                        new_public_key_der, ..
-                    } => {
-                        session
-                            .id_store
-                            .check_and_pin(&review.nickname, &new_public_key_der);
-                        if let Err(e) = session.id_store.save() {
-                            eprintln!("aloo: failed to save id_store: {e}");
-                        }
-                    }
-                    // A rolling key never installed anywhere - gated on
-                    // sight, a `Live`-only rotation while gated, or a
-                    // failed resume signature. Accepting it needs the same
-                    // install+persist+flush sequence an ordinary rotation
-                    // gets, for whichever key was most recently offered.
-                    IdentityCase::ResumeFailed { new_public_key_der } => {
-                        install_trusted_rotation(
-                            ui_state,
-                            wr,
-                            session,
-                            peer,
-                            &review.nickname,
-                            new_public_key_der,
-                        )
-                        .await?;
-                    }
+                // A static key just needs pinning - `known_users` (and
+                // hence what future sends encrypt with) already holds this
+                // exact key, set unconditionally by `on_user_joined` when
+                // the peer joined (docs/PROTOCOL.md §12.4); nothing else
+                // was withheld from it, only the local pin.
+                let IdentityCase::StaticMismatch {
+                    new_public_key_der, ..
+                } = review.case;
+                session
+                    .id_store
+                    .check_and_pin(&review.nickname, &new_public_key_der);
+                if let Err(e) = session.id_store.save() {
+                    eprintln!("aloo: failed to save id_store: {e}");
                 }
             }
             if ui_state.resolve_identity_accept(peer) {
@@ -817,13 +692,11 @@ async fn accept_file_offer(
 /// first channel list triggers an immediate join of the auto-selected
 /// first tab ("selected" implies joined); later tab switches join via the
 /// dwell timer (`UiState::tick_dwell`). Async (and given `wr`) because
-/// two `rsa_per_msg` side effects write to the network right here: our
-/// own rotation after receiving a text (§11.3), and validating+flushing a
-/// peer's `KeyRotated` (§11.4/§11.5).
+/// punching a direct link to a newly-learned peer writes to the network
+/// right here.
 async fn handle_server_message(
     msg: ServerMessage,
     ui_state: &mut UiState,
-    you: UserId,
     wr: &mut impl crate::control::ControlSink,
     session: &mut SessionState,
 ) -> proto::Result<Option<UiAction>> {
@@ -854,12 +727,6 @@ async fn handle_server_message(
             crate::client::channel::on_join_rejected(ui_state, name, kind)
         }
         ServerMessage::UserJoined { channel, user } => {
-            // rsa_per_msg peers need freshness/queue tracking from the
-            // moment we learn about them (§11.5), whether that's this
-            // join snapshot or a later arrival.
-            if user.key_mode == KeyMode::PerMessage {
-                session.remote_keys.track(user.id);
-            }
             // A pq_hybrid peer's bundle carries only their *bootstrap*
             // encryption keys (§13.10) - what to encrypt to until the
             // relationship rotates. Recorded here, superseded by the first
@@ -881,15 +748,6 @@ async fn handle_server_message(
             // channel with them).
             if !ui_state.known_users.contains_key(&user.id) {
                 check_identity(session, ui_state, &user);
-                // If *we* use rsa_per_msg and have a persisted continuity
-                // key for this nickname (docs/PROTOCOL.md §12.6), prove
-                // "it's still me" the moment we see them again - before
-                // any application message is exchanged, not waiting for
-                // one. A no-op otherwise (own key_mode isn't PerMessage,
-                // or nothing persisted for this nickname yet).
-                if session.own_key_mode == KeyMode::PerMessage {
-                    send_resume_rotation_if_available(session, wr, user.id, &user.name).await?;
-                }
                 // Start punching a direct link the moment we learn this
                 // peer exists rather than at first send (§7.1): voice is
                 // never queued, so a link still `Punching` when someone
@@ -936,16 +794,9 @@ async fn handle_server_message(
             new_public_key_der,
             signature,
         } => {
-            handle_key_rotated(
-                ui_state,
-                you,
-                wr,
-                session,
-                from,
-                new_public_key_der,
-                signature,
-            )
-            .await?;
+            // Only `pq_hybrid` peers ever rotate, so this is always their
+            // encryption-key offer (§13.10).
+            handle_pq_key_rotated(ui_state, session, from, new_public_key_der, signature);
         }
         ServerMessage::PeerCandidates {
             from,
@@ -1137,20 +988,9 @@ async fn handle_p2p_event(
 /// pinning store (§12), opening a blocking Accept/Reject review if their
 /// nickname was previously pinned to a key this connection hasn't proven
 /// itself a continuation of. `KeyMode::None` is skipped - no continuity
-/// mechanism by design (§12.2). Two different checks, branched by
-/// `key_mode`:
-///
-/// - `Rsa`/`Password`: their key is stable by construction, so a byte
-///   comparison against the pin is definitive (`StaticMismatch` arm).
-/// - `PerMessage`: the bootstrap key is fresh every connect and never
-///   itself compared - but a nickname with a §12.6 continuity pin is
-///   gated the instant it's seen again, *before* any resume or rotation
-///   attempt. `handle_key_rotated`'s `Live` check only proves
-///   self-consistency with this connection's own announced key (true of
-///   anyone the first time a fresh `UserId` rotates), so silently
-///   trusting would let a peer who never *tries* to prove continuity
-///   sail through. Only a genuinely verified `Resumed` anchor clears the
-///   gate silently.
+/// mechanism by design (§12.2). `Password`/`PqHybrid` keys are stable by
+/// construction, so a byte comparison against the pin is definitive
+/// (`StaticMismatch` arm).
 ///
 /// Deliberately does **not** use `IdStore::check_and_pin` on a mismatch:
 /// that always re-pins as a side effect, which would trust the new key
@@ -1158,7 +998,7 @@ async fn handle_p2p_event(
 /// leave the old pin untouched until `AcceptIdentity` explicitly re-pins.
 /// `IdStore::get` reads without mutating, so the comparison is by hand.
 /// Whether `user`'s newly announced identity carries a continuity
-/// certificate (§12.7) signed by the one currently pinned for them - i.e.
+/// certificate (§12.6) signed by the one currently pinned for them - i.e.
 /// whether this key change was deliberately made by whoever held the old
 /// keys, rather than being an unexplained substitution.
 ///
@@ -1211,7 +1051,7 @@ fn check_identity(session: &mut SessionState, ui_state: &mut UiState, user: &Use
                 Some(previous) if previous == user.public_key_der.as_slice() => {}
                 // A key change that proves itself is not an alarm. If this
                 // peer's new bundle carries a certificate signed by the
-                // identity we already pinned (§12.7), they deliberately
+                // identity we already pinned (§12.6), they deliberately
                 // retired the old keys - move the pin across and say so on
                 // the status line rather than opening a review. Reserving
                 // the review for genuinely unexplained changes is what
@@ -1249,47 +1089,11 @@ fn check_identity(session: &mut SessionState, ui_state: &mut UiState, user: &Use
                 }
             }
         }
-        KeyMode::PerMessage => {
-            if session.id_store.get(&user.name).is_some() {
-                push_unverified_resume_review(
-                    ui_state,
-                    user.id,
-                    &user.name,
-                    user.public_key_der.clone(),
-                );
-            }
-        }
         // KeyMode::None, plus an unreachable fallback for the guard arm
         // above (rustc can't statically know `uses_byte_comparison_pinning`
-        // covers exactly Rsa/Password/PqHybrid).
+        // covers exactly Password/PqHybrid).
         _ => {}
     }
-}
-
-/// Opens (or refreshes, if one's already queued - `push_identity_review`
-/// upserts) the review for an `rsa_per_msg` nickname that has a continuity
-/// key pinned but hasn't - yet, or ever - proven this connection is a
-/// continuation of it. Shared by `check_identity` (the instant such a
-/// nickname is seen again, before any rotation attempt at all) and
-/// `handle_key_rotated` (a `Live`-only rotation arriving for a peer who's
-/// already gated for this same reason - self-consistency alone still isn't
-/// proof, so the review stays open, just pointed at whichever key was most
-/// recently offered).
-fn push_unverified_resume_review(
-    ui_state: &mut UiState,
-    peer: UserId,
-    nickname: &str,
-    new_public_key_der: Vec<u8>,
-) {
-    let message = format!(
-        "'{nickname}' is using rsa_per_msg under a nickname previously linked to a different session's key, and hasn't proven continuity with it - possible impersonation. Accept their new key, or reject it."
-    );
-    ui_state.push_identity_review(
-        peer,
-        nickname.to_string(),
-        message,
-        IdentityCase::ResumeFailed { new_public_key_der },
-    );
 }
 
 /// Shortens a full SHA-256 hex fingerprint (`crypto::fingerprint`) to its
@@ -1300,99 +1104,6 @@ fn short_fingerprint(fp: &str) -> &str {
     fp.get(..16).unwrap_or(fp)
 }
 
-/// The sending half of `rsa_per_msg` continuity (§12.6): with a persisted
-/// continuity key for `nickname`, proves "it's still me" to their
-/// brand-new `UserId` right away by re-asserting that same key,
-/// self-signed and bound to `peer`; a no-op if nothing is persisted yet.
-/// Deliberately the *same* key rather than a fresh one: no keygen needed
-/// (`crypto::sign` is fast), and ordinary rotation (§11.3) picks up again
-/// on the next real message.
-async fn send_resume_rotation_if_available(
-    session: &mut SessionState,
-    wr: &mut impl crate::control::ControlSink,
-    peer: UserId,
-    nickname: &str,
-) -> proto::Result<()> {
-    let Some(private) = session
-        .own_next_keys
-        .as_ref()
-        .and_then(|s| s.get(nickname))
-        .cloned()
-    else {
-        return Ok(());
-    };
-    let public_der = match crypto::public_key_to_der(&private.to_public_key()) {
-        Ok(der) => der,
-        Err(_) => return Ok(()),
-    };
-    let signature = match rekey::sign_rotation(&private, peer, &public_der) {
-        Ok(sig) => sig,
-        Err(_) => return Ok(()),
-    };
-
-    // Only reachable when `own_key_mode == PerMessage` (the caller already
-    // gates on that), which always has `own_keys: Some(_)` - see
-    // `SessionState::own_keys`.
-    let Some(own_keys) = session.own_keys.as_ref() else {
-        return Ok(());
-    };
-    own_keys
-        .lock()
-        .unwrap()
-        .install_rotated_key(peer, private, public_der.clone());
-    wr.send_control(&ClientMessage::RotateKey {
-            to: peer,
-            new_public_key_der: public_der,
-            signature,
-        },
-    )
-    .await?;
-    session.conn_stats.record_event(Instant::now());
-    persist_own_continuity_key(session, nickname, peer);
-    Ok(())
-}
-
-/// Persists this client's current per-peer private key for `peer` into
-/// `own_next_keys`, keyed by `nickname`, so the *next* reconnect has
-/// something fresh to resume from. A no-op unless this session is
-/// `PerMessage`. Called after *every* rotation - crash-safety over
-/// write-frequency: if the process dies first, the next resume simply
-/// won't verify (an ordinary first-sighting-shaped case), never a false
-/// alarm.
-fn persist_own_continuity_key(session: &mut SessionState, nickname: &str, peer: UserId) {
-    let Some(own_next_keys) = session.own_next_keys.as_mut() else {
-        return;
-    };
-    // Only reachable when `own_key_mode == PerMessage` (every caller of this
-    // fn is itself only reached in that case), which always has `own_keys:
-    // Some(_)` - see `SessionState::own_keys`.
-    let Some(own_keys) = session.own_keys.as_ref() else {
-        return;
-    };
-    let private = own_keys.lock().unwrap().current_private_for(peer);
-    own_next_keys.set(nickname, private);
-    if let Err(e) = own_next_keys.save() {
-        eprintln!("aloo: failed to save own_next_keys: {e}");
-    }
-}
-
-/// Requests rotation of our own per-peer key for `peer` - a no-op unless
-/// this session is `PerMessage`, so callers can invoke it unconditionally
-/// after any send/receive (§11.3). Does *not* rotate itself: it hands
-/// `peer` to `spawn_rotation_worker` and returns immediately, keeping the
-/// RSA-4096 keygen off this event-loop task. Increments
-/// `session.rotation_pending` here rather than in the worker on dequeue,
-/// so the spinner reflects the whole queued-plus-in-flight batch.
-/// Rotates our `pq_hybrid` encryption keys for `peer` and offers them the
-/// new ones - a no-op unless this session is `PqHybrid`, so callers invoke
-/// it unconditionally after any send or receive, exactly like
-/// `request_rotation` (§13.10).
-///
-/// Unlike that one, this rotates **inline**: ML-KEM-1024 and X25519 keygen
-/// are microseconds, so there is nothing here worth handing to a background
-/// worker, and no spinner to drive. The key it supersedes is dropped the
-/// moment it falls out of the retention window, which is what forward
-/// secrecy actually consists of here.
 /// Installs a `pq_hybrid` peer's offer of fresh encryption keys (§13.10),
 /// having verified it against the identity we already pinned for them.
 ///
@@ -1433,6 +1144,14 @@ fn handle_pq_key_rotated(
     }
 }
 
+/// Rotates our `pq_hybrid` encryption keys for `peer` and offers them the
+/// new ones - a no-op unless this session is `PqHybrid`, so callers invoke
+/// it unconditionally after any send or receive, via `request_rotation`
+/// (§13.10). Rotates **inline**: ML-KEM-1024 and X25519 keygen are
+/// microseconds, so there is nothing here worth handing to a background
+/// worker. The key it supersedes is dropped the moment it falls out of the
+/// retention window, which is what forward secrecy actually consists of
+/// here.
 pub(crate) fn request_rotation_if_pq_hybrid(session: &mut SessionState, peer: UserId) {
     if session.own_key_mode != KeyMode::PqHybrid {
         return;
@@ -1452,8 +1171,7 @@ pub(crate) fn request_rotation_if_pq_hybrid(session: &mut SessionState, peer: Us
     else {
         return;
     };
-    // Handed to the main loop to write, the same route the rsa_per_msg
-    // worker's rotations take.
+    // Handed to the main loop to write.
     let _ = session.rotate_out_tx.send(ClientMessage::RotateKey {
         to: peer,
         new_public_key_der: encoded,
@@ -1461,183 +1179,14 @@ pub(crate) fn request_rotation_if_pq_hybrid(session: &mut SessionState, peer: Us
     });
 }
 
-/// Rotates our own key material for `peer`, whichever scheme this session
-/// uses - the single trigger every send and receive path calls, so neither
-/// `rsa_per_msg` nor `pq_hybrid` needs its own sprinkling of call sites.
-/// A no-op for the static modes, which have nothing to rotate.
+/// Rotates our own key material for `peer` - the single trigger every send
+/// and receive path calls, so `pq_hybrid` needs no sprinkling of call
+/// sites of its own. A no-op for the static modes, which have nothing to
+/// rotate.
 pub(crate) fn request_rotation(session: &mut SessionState, peer: UserId) {
     if session.own_key_mode == KeyMode::PqHybrid {
         request_rotation_if_pq_hybrid(session, peer);
-        return;
     }
-    if session.own_key_mode == KeyMode::PerMessage {
-        session.rotation_pending.fetch_add(1, Ordering::SeqCst);
-        if session.rotate_request_tx.send(peer).is_err() {
-            // The worker thread is gone (should only happen during
-            // shutdown) - undo the increment so a request that will never
-            // be processed doesn't leave the spinner animating forever.
-            session.rotation_pending.fetch_sub(1, Ordering::SeqCst);
-        }
-    }
-}
-
-/// Validates an incoming `KeyRotated` against the key we currently trust
-/// for `peer` (§11.4), falling back to their persisted cross-session
-/// continuity pin in `id_store` (§12.6) - the fallback is what makes a
-/// legitimate reconnect (brand-new `UserId`, so the live check can never
-/// pass) verifiable at all.
-///
-/// A verified `Resumed` is the *only* thing that silently installs a key
-/// for a pinned nickname - an actual signature proving continuity. `Live`
-/// alone only proves self-consistency with what this same connection
-/// announced (true of anyone the first time a fresh `UserId` rotates), so
-/// it is not cross-session evidence. For a gated peer this function only
-/// ever *clears* the gate (genuine `Resumed`) or leaves it as-is - never
-/// opens it; `check_identity` already did.
-///
-/// On `Resumed`: installs the key everywhere it's cached, refreshes the
-/// continuity pin, flushes queued messages FIFO (each followed by our own
-/// rotation if we're `PerMessage` - §11.3), and silently resolves any
-/// outstanding review like an `Accept`, revealing held messages. `Live`
-/// with *no* pin (the ordinary case) gets identical treatment - nothing
-/// to prove. `Live` with a pin installs nothing and refreshes the open
-/// review to point at this latest attempt. `Failed` installs nothing; if
-/// there's a pin it opens/refreshes a review worded for an explicit
-/// failed proof. An unknown sender, or a no-anchor signature with nothing
-/// pinned, is silently dropped - never suspicious just because there was
-/// nothing to check (§12.6.3).
-async fn handle_key_rotated(
-    ui_state: &mut UiState,
-    you: UserId,
-    wr: &mut impl crate::control::ControlSink,
-    session: &mut SessionState,
-    peer: UserId,
-    new_public_key_der: Vec<u8>,
-    signature: Vec<u8>,
-) -> proto::Result<()> {
-    // A pq_hybrid peer rotates encryption keys, not identity, and signs
-    // each rotation with the identity we already pinned - so none of the
-    // RSA path's chain-of-custody or §12.6 resume reasoning applies.
-    if ui_state.known_users.get(&peer).map(|u| u.key_mode) == Some(KeyMode::PqHybrid) {
-        handle_pq_key_rotated(ui_state, session, peer, new_public_key_der, signature);
-        return Ok(());
-    }
-    let Some(nickname) = ui_state.known_users.get(&peer).map(|u| u.name.clone()) else {
-        return Ok(());
-    };
-    let live_trusted = ui_state
-        .known_users
-        .get(&peer)
-        .and_then(|u| crypto::public_key_from_der(&u.public_key_der).ok());
-    let continuity_pinned = session.id_store.get(&nickname).map(|d| d.to_vec());
-    let continuity_trusted = continuity_pinned
-        .as_deref()
-        .and_then(|d| crypto::public_key_from_der(d).ok());
-    let was_gated = ui_state.is_trust_gated(peer);
-
-    match rekey::verify_with_fallback(
-        live_trusted.as_ref(),
-        continuity_trusted.as_ref(),
-        you,
-        &new_public_key_der,
-        &signature,
-    ) {
-        rekey::ResumeVerification::Resumed(_) => {
-            // An actual proof of continuity - install it, and if
-            // `check_identity` had this nickname gated, that proof is
-            // exactly what clears it: resolve the review the same way an
-            // `Accept` would (held messages included), just silently.
-            install_trusted_rotation(ui_state, wr, session, peer, &nickname, new_public_key_der)
-                .await?;
-            if was_gated && ui_state.resolve_identity_accept(peer) {
-                voice_stream::play_bell_chime(session);
-            }
-            Ok(())
-        }
-        rekey::ResumeVerification::Live(_) if !was_gated => {
-            // Nothing was pinned for this nickname (or it was already
-            // fully trusted this session) - an ordinary rotation, exactly
-            // as trustworthy as it's ever been.
-            install_trusted_rotation(ui_state, wr, session, peer, &nickname, new_public_key_der)
-                .await
-        }
-        rekey::ResumeVerification::Live(_) => {
-            // Gated already, and self-consistency alone doesn't clear
-            // that - refresh the review to point at this latest key so
-            // Accept, if it comes, installs something they can actually
-            // still decrypt, but stay Pending.
-            push_unverified_resume_review(ui_state, peer, &nickname, new_public_key_der);
-            Ok(())
-        }
-        rekey::ResumeVerification::Failed => {
-            if was_gated || continuity_pinned.is_some() {
-                let message = format!(
-                    "'{nickname}' reconnected but couldn't prove continuity with a previous session (invalid resume signature) - possible impersonation. Accept their new key, or reject it."
-                );
-                ui_state.push_identity_review(
-                    peer,
-                    nickname,
-                    message,
-                    IdentityCase::ResumeFailed { new_public_key_der },
-                );
-            }
-            Ok(())
-        }
-    }
-}
-
-/// Installs a `rsa_per_msg` peer's newly-trusted rolling key wherever it's
-/// cached, refreshes the `id_store` continuity pin, and flushes any
-/// messages that were queued waiting for it (`docs/PROTOCOL.md` §11.5,
-/// §12.6) - shared by `handle_key_rotated`'s ordinary `Live`/`Resumed`
-/// success path and a manual `AcceptIdentity` for a previously-`Failed`
-/// resume (`handle_ui_action`), since both end up doing exactly the same
-/// thing once the new key is trusted, whichever anchor (or person) did the
-/// trusting.
-async fn install_trusted_rotation(
-    ui_state: &mut UiState,
-    wr: &mut impl crate::control::ControlSink,
-    session: &mut SessionState,
-    peer: UserId,
-    nickname: &str,
-    new_public_key_der: Vec<u8>,
-) -> proto::Result<()> {
-    ui_state.on_user_key_rotated(peer, new_public_key_der.clone());
-    session
-        .id_store
-        .check_and_pin(nickname, &new_public_key_der);
-    if let Err(e) = session.id_store.save() {
-        eprintln!("aloo: failed to save id_store: {e}");
-    }
-
-    let batch = session.remote_keys.on_rotated(peer);
-    let mut sent_any = false;
-    for item in batch {
-        let Some(der) = ui_state
-            .known_users
-            .get(&peer)
-            .map(|u| u.public_key_der.clone())
-        else {
-            continue;
-        };
-        let (channel, plaintext) = match item {
-            rekey::QueuedOutbound::Direct { plaintext } => (None, plaintext),
-            rekey::QueuedOutbound::Channel { channel, plaintext } => (Some(channel), plaintext),
-        };
-        let Some(envelope) = crate::client::envelope::encrypt_for_one(&der, plaintext.as_bytes(), Content::Text) else {
-            continue;
-        };
-        session.peer_link.ensure_link(wr, peer).await;
-        session
-            .peer_link
-            .send_reliable_or_queue(peer, P2pPayload::Envelope { channel, envelope });
-        sent_any = true;
-        request_rotation(session, peer);
-    }
-    if sent_any {
-        session.remote_keys.mark_used(peer);
-    }
-    Ok(())
 }
 
 /// Decrypts `envelope`, addressed to *us*, from `from` (`sender`'s
@@ -1716,12 +1265,7 @@ fn decrypt_own_envelope(
         }
         Some(plaintext)
     } else {
-        session
-            .own_keys
-            .as_ref()?
-            .lock()
-            .unwrap()
-            .decrypt_from(from, &envelope.blocks)
+        crypto::decrypt_chunked(session.own_keys.as_ref()?, &envelope.blocks).ok()
     }
 }
 

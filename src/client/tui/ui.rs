@@ -34,13 +34,6 @@ use crate::proto::{ChannelKind, KeyMode, UserId, UserInfo};
 use super::channel::{ChannelTab, DwellState};
 use super::direct_message::PrivateRoom;
 
-/// Animation frames for the "regenerating a key" spinner shown at the top
-/// right of the screen, right after the `Ctrl+H: Help` hint - see
-/// `UiState::tick_spinner`. One full cycle per 6 calls to `tick_spinner`
-/// while regenerating. Rendered in white (see `crate::client::tui::channel::render_channel_view`),
-/// regardless of the surrounding hint text's own (dimmer) color.
-pub const SPINNER_FRAMES: [char; 6] = ['_', '-', '\\', '|', '/', '-'];
-
 /// How long after the most recent Space press/repeat to conclude the key
 /// was released. Most terminals never send `Release` for a held key but
 /// do forward OS auto-repeat as a stream of Press events, so an idle gap
@@ -73,7 +66,7 @@ const HELP_HEADINGS: [&str; 7] = [
     "Voice messages",
     "File transfer",
     "Encryption (tag shown after each username)",
-    "Identity pinning (id_store / own_next_keys)",
+    "Identity pinning (id_store)",
 ];
 const HELP_BODY: &[&str] = &[
     "Channels",
@@ -109,23 +102,19 @@ const HELP_BODY: &[&str] = &[
     "  and there is no size cap. Declining shows as rejected in your log.",
     "",
     "Encryption (tag shown after each username)",
-    "  name \u{1F512} RSAPM  rsa_per_msg: a fresh key every message, signed by the one it replaces",
-    "  name \u{1F512} RSA    static: one RSA keypair loaded from a file, for the whole session",
     "  name \u{1F6A8} PWD    static: one RSA keypair derived from a password",
     "  name \u{1F6A8} PLAIN  static: one RSA keypair auto-generated when you connected",
     "  name \u{1F6E1}\u{FE0F} PQH    static: ML-DSA-87+RSA4096/ML-KEM-1024+RSA4096/AES-256-GCM, loaded from a file",
     "",
-    "Identity pinning (id_store / own_next_keys)",
+    "Identity pinning (id_store)",
     "  Remembers each nickname's full public key across sessions (not",
-    "  just a hash) - exact match for rsa/password/pq_hybrid, or signature-",
-    "  verified continuity for rsa_per_msg via own_next_keys (its key",
-    "  changes every connect, so it needs proof, not comparison). none",
-    "  is untracked. A mismatch opens a popup naming the peer with",
+    "  just a hash) - exact match for password/pq_hybrid. none is",
+    "  untracked. A mismatch opens a popup naming the peer with",
     "  Accept/Reject buttons; messaging with them is blocked until you",
     "  decide. Accept saves to disk right away and reveals anything of",
     "  theirs held while unresolved; Reject saves nothing and isn't",
-    "  permanent - select them again to reconsider. Paths set in the",
-    "  connect popup's id_store / own_next_keys fields.",
+    "  permanent - select them again to reconsider. Path set in the",
+    "  connect popup's id_store field.",
     "",
     "  Ctrl+C  quit      Ctrl+H  toggle this help      Up/Down  scroll",
 ];
@@ -200,23 +189,13 @@ pub struct LogEntry {
 
 /// Which anchor a peer's identity mismatch failed against - drives the
 /// review popup's case-specific wording and what `AcceptIdentity` needs
-/// to install the new key. `StaticMismatch` (§12.4, `rsa`/`password`) is
-/// a byte comparison with a definite "old key" to show; `ResumeFailed`
-/// (§12.6.3/§12.6.4, `rsa_per_msg`) is a signature that failed - or
-/// hasn't yet happened - so there is no single old key. `ResumeFailed`
-/// covers three triggers that all need identical Accept behavior: a
-/// failed resume signature, a pinned nickname seen again with no resume
-/// attempt yet, and a merely self-consistent `Live` rotation for a peer
-/// already gated - self-consistency never proves cross-session identity,
-/// so it must not clear a gate opened because of that.
+/// to install the new key. `StaticMismatch` (§12.4, `password`/`pq_hybrid`)
+/// is a byte comparison with a definite "old key" to show.
 #[derive(Debug, Clone, PartialEq)]
 pub enum IdentityCase {
     StaticMismatch {
         new_public_key_der: Vec<u8>,
         previous_public_key_der: Vec<u8>,
-    },
-    ResumeFailed {
-        new_public_key_der: Vec<u8>,
     },
 }
 
@@ -390,8 +369,8 @@ pub enum UiAction {
     RejectIdentity(UserId),
     /// A file send confirmed in the `/file` popup (`crate::client::tui::file_send`) -
     /// `crate::client::channel::handle_send_file` builds and sends one `FileOffer`
-    /// per ready recipient (rsa_per_msg readiness is snapshotted here, same
-    /// as a voice stream's recipients - see `docs/PROTOCOL.md`'s file
+    /// per ready recipient (rotating-key readiness is snapshotted here,
+    /// same as a voice stream's recipients - see `docs/PROTOCOL.md`'s file
     /// transfer section); nothing is read from `path` until each recipient
     /// individually accepts.
     SendFileChannel {
@@ -563,16 +542,6 @@ pub struct UiState {
     /// (`render_help_popup`, against the popup's actual visible height,
     /// which `UiState` has no reason to know) - see there.
     help_scroll: usize,
-    /// Whether an `rsa_per_msg` key is currently being regenerated on
-    /// `session::spawn_rotation_worker`'s background thread right now -
-    /// drives the spinner shown at the top right of the screen. Set each
-    /// tick by `tick_spinner`, which `session::run_connected_session` calls
-    /// with whatever it reads off `SessionState`'s pending-rotation
-    /// counter; `UiState` itself has no idea what a rotation *is*, only
-    /// whether to animate.
-    pub key_regenerating: bool,
-    /// Index into `SPINNER_FRAMES`, advanced by `tick_spinner`.
-    spinner_frame: usize,
     /// Every peer with an outstanding or resolved-as-`Rejected` identity
     /// mismatch this session (`docs/PROTOCOL.md` §12) - absence means
     /// "trusted normally" (never mismatched, or `Accepted`, which removes
@@ -654,8 +623,6 @@ impl UiState {
             blink_on: false,
             help_open: false,
             help_scroll: 0,
-            key_regenerating: false,
-            spinner_frame: 0,
             identity_reviews: HashMap::new(),
             identity_review_queue: VecDeque::new(),
             identity_review_focus: IdentityChoice::Reject,
@@ -753,10 +720,9 @@ impl UiState {
 
     /// Removes `peer` from the review queue wherever it is - not
     /// necessarily the front - resetting focus if the popup on screen
-    /// changed. A person's Accept/Reject always targets the front, but
-    /// `rsa_per_msg`'s silent auto-trust (§12.6.3) can resolve *any*
-    /// queued peer while another's review is on screen - a plain
-    /// `pop_front` would silently disappear the wrong review.
+    /// changed. Removing by identity rather than a plain `pop_front` keeps
+    /// this correct even if a future resolution path ever resolves
+    /// something other than the front entry.
     fn remove_from_identity_review_queue(&mut self, peer: UserId) {
         let was_front = self.identity_review_queue.front() == Some(&peer);
         self.identity_review_queue.retain(|p| *p != peer);
@@ -1016,7 +982,7 @@ impl UiState {
     }
 
     /// Notes something the user should see but need not act on - currently
-    /// only a peer moving to a new identity and proving it (§12.7), which
+    /// only a peer moving to a new identity and proving it (§12.6), which
     /// deliberately does *not* open a review.
     ///
     /// Shares the banner `recording_failed`/`p2p_link_failed` use rather
@@ -1043,34 +1009,6 @@ impl UiState {
 
     pub fn toggle_blink(&mut self) {
         self.blink_on = !self.blink_on;
-    }
-
-    /// Call periodically (same cadence as `toggle_blink`) with whether a
-    /// key is being regenerated right now. Advances the spinner one frame
-    /// per call while `is_regenerating`; resets to the first frame as soon
-    /// as it stops, so the next time it starts it always begins from
-    /// `SPINNER_FRAMES[0]` rather than resuming mid-cycle.
-    pub fn tick_spinner(&mut self, is_regenerating: bool) {
-        if is_regenerating {
-            if self.key_regenerating {
-                // was already spinning as of the last call - advance.
-                self.spinner_frame = (self.spinner_frame + 1) % SPINNER_FRAMES.len();
-            }
-            // else: this is the first tick of a fresh run. `spinner_frame`
-            // is already 0 (either never touched, or reset by the last
-            // `false` call below), so the very first frame shown is
-            // always `SPINNER_FRAMES[0]`, never a skipped-ahead frame.
-        } else {
-            self.spinner_frame = 0;
-        }
-        self.key_regenerating = is_regenerating;
-    }
-
-    /// The spinner character for the current frame - only meaningful
-    /// while `key_regenerating` is `true`; renderers should check that
-    /// first rather than relying on this alone.
-    pub(crate) fn spinner_char(&self) -> char {
-        SPINNER_FRAMES[self.spinner_frame]
     }
 
     /// The help overlay's current scroll offset (first visible line index
@@ -1674,27 +1612,6 @@ impl UiState {
         }
     }
 
-    /// Applies a validated `rsa_per_msg` key rotation (PROTOCOL.md §11) for
-    /// `user_id`: every place a `UserInfo` for them is cached - not just
-    /// `known_users`, but every channel's `members` list and any open
-    /// `PrivateRoom`'s `peer` - is a separate clone (`on_user_joined`,
-    /// `open_private_room`), so all of them need updating in place or the
-    /// stale copies would keep being used to encrypt (`recipients_for_channel`,
-    /// `current_voice_target` both read from `channel.members`, not
-    /// `known_users`). A no-op if `user_id` isn't known yet.
-    pub fn on_user_key_rotated(&mut self, user_id: UserId, new_public_key_der: Vec<u8>) {
-        if let Some(user) = self.known_users.get_mut(&user_id) {
-            user.public_key_der = new_public_key_der.clone();
-        }
-        for tab in &mut self.channels {
-            if let Some(member) = tab.members.iter_mut().find(|m| m.id == user_id) {
-                member.public_key_der = new_public_key_der.clone();
-            }
-        }
-        if let Some(room) = self.private_rooms.get_mut(&user_id) {
-            room.peer.public_key_der = new_public_key_der;
-        }
-    }
 }
 
 /// Pushes `entry` onto `log`. If the caller is currently viewing this

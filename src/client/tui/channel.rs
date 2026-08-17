@@ -673,11 +673,10 @@ pub(crate) fn render_channel_view(frame: &mut Frame, area: Rect, state: &UiState
     let input_row = 2;
 
     // The tab row is split so the status area - Conn quality, CPU usage,
-    // the help hint, and (while a key is being regenerated) the spinner
-    // right after it - sits flush right, past the end of the channel
+    // and the help hint - sits flush right, past the end of the channel
     // tabs, regardless of how many tabs there are. Widest realistic
-    // content: "Conn:NORMAL  CPU:100%  Ctrl+H: Help  _" (38 cols); a
-    // little slack is kept above that.
+    // content: "Conn:NORMAL  CPU:100%  Ctrl+H: Help" (34 cols); a little
+    // slack is kept above that.
     let header_cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(0), Constraint::Length(40)])
@@ -712,21 +711,10 @@ pub(crate) fn render_channel_view(frame: &mut Frame, area: Rect, state: &UiState
         ),
         Span::raw("  "),
     ];
-    if state.key_regenerating {
-        status_spans.push(Span::styled(
-            "Ctrl+H: Help  ",
-            Style::default().fg(Color::DarkGray),
-        ));
-        status_spans.push(Span::styled(
-            state.spinner_char().to_string(),
-            Style::default().fg(Color::White),
-        ));
-    } else {
-        status_spans.push(Span::styled(
-            "Ctrl+H: Help",
-            Style::default().fg(Color::DarkGray),
-        ));
-    }
+    status_spans.push(Span::styled(
+        "Ctrl+H: Help",
+        Style::default().fg(Color::DarkGray),
+    ));
     let help_hint_line = Line::from(status_spans);
     frame.render_widget(
         Paragraph::new(help_hint_line).alignment(ratatui::layout::Alignment::Right),
@@ -880,8 +868,8 @@ fn render_sidebar(frame: &mut Frame, area: Rect, state: &UiState) {
             // or not they also happen to be offline or unreachable.
             // Offline members are otherwise only ever kept around because
             // there's DM history worth preserving (`on_user_offline`) -
-            // shown in a soft gray, the same dim tone the help
-            // hint/spinner label already use elsewhere in this screen.
+            // shown in a soft gray, the same dim tone the help hint
+            // already uses elsewhere in this screen.
             //
             // For everyone still connected, the colour is the state of the
             // *direct link* to them (§7.1), not merely their presence on

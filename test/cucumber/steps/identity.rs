@@ -1,104 +1,23 @@
-//! Key rotation and identity pinning (US-010, US-011).
+//! Freshness/queueing for a rotating peer, and identity pinning
+//! (US-010, US-011).
 
 use crossterm::event::{KeyCode, KeyModifiers};
 use cucumber::{given, then, when};
 
-use aloo::crypto::{self, public_key_to_der};
 use aloo::client::idstore::{IdCheck, IdStore};
-use aloo::proto::{KeyMode, UserId};
-use aloo::client::rekey::{
-    QueuedOutbound, RemoteKeys, ResumeVerification, sign_rotation, verify_and_parse_rotation,
-    verify_rotation, verify_with_fallback,
-};
-use aloo::client::tui::ui::{IdentityCase, MessageBody, SPINNER_FRAMES, UiAction};
+use aloo::proto::UserId;
+use aloo::client::rekey::{QueuedOutbound, RemoteKeys};
+use aloo::client::tui::ui::{IdentityCase, MessageBody, UiAction};
 
-use crate::steps::ui_common::{id_for, press_key, user_with_mode};
+use crate::steps::ui_common::{id_for, press_key};
 use crate::support::ui_rows;
-use crate::world::{AlooWorld, keypair_for};
-
-// ---------------------------------------------------------------------
-// Rotation signing and verification (US-010)
-// ---------------------------------------------------------------------
-
-#[given("bob holds a key I currently trust")]
-async fn bob_trusted_key(w: &mut AlooWorld) {
-    w.derived.insert("bob".into(), keypair_for("bob"));
-}
-
-#[when("bob rotates to a fresh key, signed with the one it replaces")]
-async fn bob_rotates(w: &mut AlooWorld) {
-    let old = w.derived.get("bob").expect("bob has no key");
-    let new = keypair_for("carol"); // stands in for the freshly generated key
-    let new_der = public_key_to_der(&new.public).unwrap();
-    let sig = sign_rotation(&old.private, UserId(1), &new_der).unwrap();
-    w.rotation_der = new_der;
-    w.rotation_sig = sig;
-    w.derived.insert("bob-next".into(), new);
-}
-
-#[when("someone forges a rotation with a key of their own")]
-async fn forged_rotation(w: &mut AlooWorld) {
-    let forger = keypair_for("mallory");
-    let new = keypair_for("carol");
-    let new_der = public_key_to_der(&new.public).unwrap();
-    w.rotation_sig = sign_rotation(&forger.private, UserId(1), &new_der).unwrap();
-    w.rotation_der = new_der;
-}
-
-#[when("the rotated key bytes are tampered with in flight")]
-async fn tamper_rotation(w: &mut AlooWorld) {
-    w.rotation_der[0] ^= 0xFF;
-}
-
-#[then("the rotation is accepted and the new key becomes usable")]
-async fn rotation_accepted(w: &mut AlooWorld) {
-    let old = w.derived.get("bob").expect("bob has no key");
-    assert!(
-        verify_rotation(&old.public, UserId(1), &w.rotation_der, &w.rotation_sig),
-        "a rotation signed by the key it replaces must verify"
-    );
-    let parsed =
-        verify_and_parse_rotation(&old.public, UserId(1), &w.rotation_der, &w.rotation_sig)
-            .expect("a valid rotation should parse into a usable key");
-    // Usable in the only sense that matters: it can encrypt to the new key.
-    let next = w.derived.get("bob-next").expect("no rotated key recorded");
-    let blocks = crypto::encrypt_chunked(&parsed, b"hello via rotated key").unwrap();
-    let out = crypto::decrypt_chunked(&next.private, &blocks).unwrap();
-    assert_eq!(out, b"hello via rotated key");
-}
-
-#[then("the rotation is refused and the old key stays trusted")]
-async fn rotation_refused(w: &mut AlooWorld) {
-    let old = w.derived.get("bob").expect("bob has no key");
-    assert!(
-        !verify_rotation(&old.public, UserId(1), &w.rotation_der, &w.rotation_sig),
-        "a rotation that is not signed by the trusted key must not verify"
-    );
-    assert!(
-        verify_and_parse_rotation(&old.public, UserId(1), &w.rotation_der, &w.rotation_sig)
-            .is_none(),
-        "and it must yield no key at all, so the previous one stays in place"
-    );
-}
-
-#[then("that same rotation does not verify when replayed at someone else")]
-async fn replay_refused(w: &mut AlooWorld) {
-    let old = w.derived.get("bob").expect("bob has no key");
-    assert!(
-        verify_rotation(&old.public, UserId(1), &w.rotation_der, &w.rotation_sig),
-        "sanity: it verifies for the recipient it was signed for"
-    );
-    assert!(
-        !verify_rotation(&old.public, UserId(2), &w.rotation_der, &w.rotation_sig),
-        "binding the recipient into the signature is what stops a rotation being replayed"
-    );
-}
+use crate::world::AlooWorld;
 
 // ---------------------------------------------------------------------
 // Queueing while waiting for a fresh key (US-010)
 // ---------------------------------------------------------------------
 
-#[given("bob uses rsa_per_msg and I have already used his current key")]
+#[given("bob uses a rotating key and I have already used his current key")]
 async fn bob_key_used(w: &mut AlooWorld) {
     let mut remote = RemoteKeys::new();
     remote.track(UserId(2));
@@ -171,94 +90,6 @@ async fn stale_again(w: &mut AlooWorld) {
 }
 
 // ---------------------------------------------------------------------
-// Regeneration spinner (US-010)
-// ---------------------------------------------------------------------
-
-/// Whatever immediately follows "Ctrl+H: Help" on the header row, trimmed
-/// of the two separating spaces - scoped rather than scanning the whole
-/// header for a `SPINNER_FRAMES` character, because `-` is both a spinner
-/// frame and the header's own `Conn:-` "no traffic yet" glyph
-/// (`aloo::client::netstats::ConnQuality::Unknown`); a whole-row scan would
-/// mistake that `-` for a spinner that isn't actually there.
-fn after_help_hint(w: &AlooWorld) -> String {
-    let rows = ui_rows(w.ui_ref());
-    let header = rows.first().expect("header row").clone();
-    let idx = header
-        .find("Ctrl+H: Help")
-        .expect("expected the help hint on the header row");
-    header[idx + "Ctrl+H: Help".len()..].trim_end().to_string()
-}
-
-fn spinner_on_header(w: &AlooWorld) -> Option<char> {
-    let after = after_help_hint(w);
-    after
-        .trim_start_matches(' ')
-        .chars()
-        .next()
-        .filter(|c| SPINNER_FRAMES.contains(c))
-}
-
-#[when("a key regeneration starts")]
-async fn regeneration_starts(w: &mut AlooWorld) {
-    w.ui_mut().tick_spinner(true);
-}
-
-#[when("the regeneration keeps running for another moment")]
-async fn regeneration_continues(w: &mut AlooWorld) {
-    w.ui_mut().tick_spinner(true);
-}
-
-#[when("every regeneration finishes")]
-async fn regeneration_finishes(w: &mut AlooWorld) {
-    w.ui_mut().tick_spinner(false);
-}
-
-#[then("a spinner appears right after the help hint")]
-async fn spinner_after_hint(w: &mut AlooWorld) {
-    let rows = ui_rows(w.ui_ref());
-    let header = rows.first().expect("header row");
-    let expected = format!("Ctrl+H: Help  {}", SPINNER_FRAMES[0]);
-    assert!(
-        header.contains(&expected),
-        "expected {expected:?} - two spaces after the hint, starting on the first frame: {header:?}"
-    );
-}
-
-#[then("the spinner has moved on to its next frame")]
-async fn spinner_advanced(w: &mut AlooWorld) {
-    let shown = spinner_on_header(w).expect("no spinner frame on the header row");
-    assert_eq!(
-        shown, SPINNER_FRAMES[1],
-        "each tick should advance exactly one frame"
-    );
-}
-
-#[then("no spinner is shown")]
-async fn no_spinner(w: &mut AlooWorld) {
-    let rows = ui_rows(w.ui_ref());
-    let header = rows.first().expect("header row");
-    assert!(
-        header.contains("Ctrl+H: Help"),
-        "the help hint itself should still be there: {header:?}"
-    );
-    let after = after_help_hint(w);
-    assert!(
-        after.is_empty(),
-        "no spinner frame should be visible when nothing is regenerating: {after:?}"
-    );
-}
-
-#[then("a restarted spinner begins from the first frame again")]
-async fn spinner_restarts(w: &mut AlooWorld) {
-    w.ui_mut().tick_spinner(true);
-    let shown = spinner_on_header(w).expect("no spinner frame on the header row");
-    assert_eq!(
-        shown, SPINNER_FRAMES[0],
-        "a fresh run must start the cycle over rather than resuming mid-cycle"
-    );
-}
-
-// ---------------------------------------------------------------------
 // Identity pinning (US-011)
 // ---------------------------------------------------------------------
 
@@ -313,98 +144,12 @@ async fn repinned(w: &mut AlooWorld, name: String) {
     );
 }
 
-#[given("bob's continuity key is pinned from a previous session")]
-async fn continuity_pinned(w: &mut AlooWorld) {
-    w.derived.insert("continuity".into(), keypair_for("bob"));
-}
-
-#[when("bob reconnects and re-asserts that same key, signed by itself")]
-async fn resume_asserted(w: &mut AlooWorld) {
-    let continuity = w.derived.get("continuity").expect("no continuity key");
-    let self_der = public_key_to_der(&continuity.public).unwrap();
-    let sig = sign_rotation(&continuity.private, UserId(5), &self_der).unwrap();
-    w.rotation_der = self_der;
-    w.rotation_sig = sig;
-}
-
-#[when("bob reconnects and presents a key nobody can vouch for")]
-async fn resume_unverifiable(w: &mut AlooWorld) {
-    let forger = keypair_for("mallory");
-    let new = keypair_for("carol");
-    let new_der = public_key_to_der(&new.public).unwrap();
-    w.rotation_sig = sign_rotation(&forger.private, UserId(5), &new_der).unwrap();
-    w.rotation_der = new_der;
-}
-
-#[then("he is recognised as the same person, with no warning")]
-async fn recognised_resumed(w: &mut AlooWorld) {
-    let continuity = w.derived.get("continuity").expect("no continuity key");
-    // No live in-session key exists: a reconnecting peer has a brand-new
-    // UserId, which is exactly why the fallback anchor has to carry it.
-    let result = verify_with_fallback(
-        None,
-        Some(&continuity.public),
-        UserId(5),
-        &w.rotation_der,
-        &w.rotation_sig,
-    );
-    assert!(
-        matches!(result, ResumeVerification::Resumed(_)),
-        "a self-asserted continuity key must verify as a resume, got {result:?}"
-    );
-    w.verification = Some(result);
-}
-
-#[then("nothing vouches for him and the reconnect is not trusted")]
-async fn resume_failed(w: &mut AlooWorld) {
-    let continuity = w.derived.get("continuity").expect("no continuity key");
-    let result = verify_with_fallback(
-        None,
-        Some(&continuity.public),
-        UserId(5),
-        &w.rotation_der,
-        &w.rotation_sig,
-    );
-    assert_eq!(
-        result,
-        ResumeVerification::Failed,
-        "a signature that verifies against neither anchor must not install a key"
-    );
-}
-
-#[then("an ordinary in-session rotation is still preferred over the pinned key")]
-async fn live_preferred(w: &mut AlooWorld) {
-    let live = keypair_for("alice");
-    let continuity = w.derived.get("continuity").expect("no continuity key");
-    let new = keypair_for("carol");
-    let new_der = public_key_to_der(&new.public).unwrap();
-    let sig = sign_rotation(&live.private, UserId(1), &new_der).unwrap();
-
-    let result = verify_with_fallback(
-        Some(&live.public),
-        Some(&continuity.public),
-        UserId(1),
-        &new_der,
-        &sig,
-    );
-    match result {
-        ResumeVerification::Live(k) => {
-            assert_eq!(
-                public_key_to_der(&k).unwrap(),
-                new_der,
-                "the live anchor should return the newly rotated key"
-            );
-        }
-        other => panic!("expected the live anchor to win, got {other:?}"),
-    }
-}
-
 // ---------------------------------------------------------------------
 // Identity review popup: manual Accept/Reject (US-011, US-017)
 // ---------------------------------------------------------------------
 
-/// Simulates `session::check_identity` detecting a static (`rsa`/`password`)
-/// key mismatch for an already-present channel member and opening a review
+/// Simulates `session::check_identity` detecting a static (`password`/
+/// `pq_hybrid`) key mismatch for an already-present channel member and opening a review
 /// for it - the same `IdentityCase::StaticMismatch` the real check builds,
 /// just with placeholder key bytes since these scenarios only care about
 /// the UI consequences, not the byte comparison itself (covered separately
@@ -550,35 +295,3 @@ async fn send_excludes(w: &mut AlooWorld, excluded: String, included: String) {
     }
 }
 
-// ---------------------------------------------------------------------
-// rsa_per_msg gated-on-sight reconnect (US-017, docs/PROTOCOL.md §12.6.3)
-// ---------------------------------------------------------------------
-
-/// Narrative-only scene-setter: establishes that the nickname used below is
-/// a *returning* one with real history, not a first-ever sighting - the
-/// `id_store` pin itself isn't modeled at this level, the same shortcut
-/// `identity_mismatches` above already takes for the `rsa`/`password` case.
-#[given(expr = "{word}'s nickname is already linked to a key from a previous session")]
-async fn nickname_already_linked(_w: &mut AlooWorld, _name: String) {}
-
-/// Simulates the `rsa_per_msg` join-time gate `session::check_identity` now
-/// applies (`docs/PROTOCOL.md` §12.6.3): a nickname that already has a
-/// continuity key pinned is gated the instant it's seen again, before any
-/// resume or rotation attempt at all - closing the gap where a peer (an
-/// impersonator, or one who simply lost `own_next_keys`) that never even
-/// tries to prove continuity would otherwise sail through untouched. Joins
-/// the channel exactly as the real `UserJoined` handling does, then opens
-/// the review the same way `check_identity`'s new `PerMessage` branch does.
-#[when(expr = "{word} rejoins using rsa_per_msg without proving continuity")]
-async fn rejoins_unverified(w: &mut AlooWorld, name: String) {
-    let id = UserId(id_for(&name));
-    let info = user_with_mode(id_for(&name), &name, KeyMode::PerMessage);
-    w.ui_mut().on_user_joined("general", info.clone());
-    let message = format!(
-        "'{name}' is using rsa_per_msg under a nickname previously linked to a different session's key, and hasn't proven continuity with it - possible impersonation. Accept their new key, or reject it."
-    );
-    let case = IdentityCase::ResumeFailed {
-        new_public_key_der: info.public_key_der,
-    };
-    w.ui_mut().push_identity_review(id, name, message, case);
-}

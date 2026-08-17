@@ -1,8 +1,7 @@
 use std::net::{IpAddr, Ipv4Addr};
 
-use aloo::crypto::{self, KeyPair};
+use aloo::crypto;
 use aloo::proto::*;
-use aloo::client::rekey;
 use aloo::server::{
     AuthConfig, CHANNEL_MAX_PASSWORD_ATTEMPTS, CHANNEL_PASSWORD_BAN_DURATION, DEFAULT_CHANNEL_NAME,
     Outgoing, Registry, serve,
@@ -45,7 +44,7 @@ fn fresh_registry_has_default_public_the_hall_channel() {
 #[test]
 fn register_stores_user_info() {
     let mut reg = Registry::new();
-    let id = reg.register("dave".into(), vec![1, 2, 3], KeyMode::Rsa);
+    let id = reg.register("dave".into(), vec![1, 2, 3], KeyMode::Password);
     let info = reg.user_info(id).expect("registered user");
     assert_eq!(info.name, "dave");
     assert_eq!(info.public_key_der, vec![1, 2, 3]);
@@ -56,7 +55,7 @@ fn register_stores_user_info() {
 fn name_taken_reflects_currently_registered_clients() {
     let mut reg = Registry::new();
     assert!(!reg.name_taken("dave"));
-    reg.register("dave".into(), vec![], KeyMode::Rsa);
+    reg.register("dave".into(), vec![], KeyMode::Password);
     assert!(reg.name_taken("dave"));
     assert!(
         !reg.name_taken("Dave"),
@@ -69,10 +68,10 @@ fn name_taken_reflects_currently_registered_clients() {
 fn try_register_rejects_a_nickname_already_in_use() {
     let mut reg = Registry::new();
     let first = reg
-        .try_register("dave".into(), vec![1], KeyMode::Rsa)
+        .try_register("dave".into(), vec![1], KeyMode::Password)
         .expect("first registration succeeds");
     let err = reg
-        .try_register("dave".into(), vec![2], KeyMode::Rsa)
+        .try_register("dave".into(), vec![2], KeyMode::Password)
         .unwrap_err();
     assert!(err.contains("dave"));
     assert!(err.contains("taken"));
@@ -86,11 +85,11 @@ fn try_register_rejects_a_nickname_already_in_use() {
 fn try_register_allows_the_name_again_once_the_holder_is_gone() {
     let mut reg = Registry::new();
     let first = reg
-        .try_register("dave".into(), vec![1], KeyMode::Rsa)
+        .try_register("dave".into(), vec![1], KeyMode::Password)
         .unwrap();
     reg.unregister(first);
     let second = reg
-        .try_register("dave".into(), vec![2], KeyMode::Rsa)
+        .try_register("dave".into(), vec![2], KeyMode::Password)
         .expect("name freed up after unregister");
     assert_eq!(reg.user_info(second).unwrap().public_key_der, vec![2]);
 }
@@ -99,7 +98,7 @@ fn try_register_allows_the_name_again_once_the_holder_is_gone() {
 #[test]
 fn joining_new_channel_sends_confirmation_and_no_peer_events() {
     let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::Rsa);
+    let alice = reg.register("alice".into(), vec![], KeyMode::Password);
     let out = reg
         .join_channel(alice, "general", ChannelKind::Public, None, TEST_IP)
         .unwrap();
@@ -115,8 +114,8 @@ fn joining_new_channel_sends_confirmation_and_no_peer_events() {
 #[test]
 fn second_joiner_gets_snapshot_and_first_gets_notified() {
     let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![9], KeyMode::Rsa);
-    let bob = reg.register("bob".into(), vec![8], KeyMode::Rsa);
+    let alice = reg.register("alice".into(), vec![9], KeyMode::Password);
+    let bob = reg.register("bob".into(), vec![8], KeyMode::Password);
     reg.join_channel(alice, "general", ChannelKind::Public, None, TEST_IP)
         .unwrap();
     let out = reg
@@ -154,7 +153,7 @@ fn second_joiner_gets_snapshot_and_first_gets_notified() {
 #[test]
 fn rejoining_a_channel_is_a_noop() {
     let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::Rsa);
+    let alice = reg.register("alice".into(), vec![], KeyMode::Password);
     reg.join_channel(alice, "general", ChannelKind::Public, None, TEST_IP)
         .unwrap();
     let out = reg
@@ -167,7 +166,7 @@ fn rejoining_a_channel_is_a_noop() {
 #[test]
 fn private_channel_is_created_on_join_but_not_listed() {
     let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::Rsa);
+    let alice = reg.register("alice".into(), vec![], KeyMode::Password);
     reg.join_channel(alice, "secret-room", ChannelKind::Private, None, TEST_IP)
         .unwrap();
     let list = reg.channel_list();
@@ -178,8 +177,8 @@ fn private_channel_is_created_on_join_but_not_listed() {
 #[test]
 fn leaving_notifies_remaining_members() {
     let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::Rsa);
-    let bob = reg.register("bob".into(), vec![], KeyMode::Rsa);
+    let alice = reg.register("alice".into(), vec![], KeyMode::Password);
+    let bob = reg.register("bob".into(), vec![], KeyMode::Password);
     reg.join_channel(alice, "general", ChannelKind::Public, None, TEST_IP)
         .unwrap();
     reg.join_channel(bob, "general", ChannelKind::Public, None, TEST_IP)
@@ -198,7 +197,7 @@ fn leaving_notifies_remaining_members() {
 #[test]
 fn empty_channel_is_deleted_unless_it_is_the_default_channel() {
     let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::Rsa);
+    let alice = reg.register("alice".into(), vec![], KeyMode::Password);
     reg.join_channel(
         alice,
         DEFAULT_CHANNEL_NAME,
@@ -251,8 +250,8 @@ fn empty_channel_is_deleted_unless_it_is_the_default_channel() {
 #[test]
 fn a_newly_created_public_channel_is_broadcast_to_other_connected_clients() {
     let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::Rsa);
-    let bob = reg.register("bob".into(), vec![], KeyMode::Rsa);
+    let alice = reg.register("alice".into(), vec![], KeyMode::Password);
+    let bob = reg.register("bob".into(), vec![], KeyMode::Password);
 
     let out = reg
         .join_channel(alice, "brand-new-room", ChannelKind::Public, None, TEST_IP)
@@ -276,8 +275,8 @@ fn a_newly_created_public_channel_is_broadcast_to_other_connected_clients() {
 #[test]
 fn creating_a_private_channel_never_broadcasts_channelcreated() {
     let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::Rsa);
-    let _bob = reg.register("bob".into(), vec![], KeyMode::Rsa);
+    let alice = reg.register("alice".into(), vec![], KeyMode::Password);
+    let _bob = reg.register("bob".into(), vec![], KeyMode::Password);
 
     let out = reg
         .join_channel(alice, "secret-room", ChannelKind::Private, None, TEST_IP)
@@ -293,9 +292,9 @@ fn creating_a_private_channel_never_broadcasts_channelcreated() {
 #[test]
 fn joining_an_already_existing_public_channel_does_not_rebroadcast_it() {
     let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::Rsa);
-    let bob = reg.register("bob".into(), vec![], KeyMode::Rsa);
-    let carol = reg.register("carol".into(), vec![], KeyMode::Rsa);
+    let alice = reg.register("alice".into(), vec![], KeyMode::Password);
+    let bob = reg.register("bob".into(), vec![], KeyMode::Password);
+    let carol = reg.register("carol".into(), vec![], KeyMode::Password);
 
     reg.join_channel(alice, "already-there", ChannelKind::Public, None, TEST_IP)
         .unwrap();
@@ -313,8 +312,8 @@ fn joining_an_already_existing_public_channel_does_not_rebroadcast_it() {
 #[test]
 fn unregister_removes_user_from_every_channel_it_was_in() {
     let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::Rsa);
-    let bob = reg.register("bob".into(), vec![], KeyMode::Rsa);
+    let alice = reg.register("alice".into(), vec![], KeyMode::Password);
+    let bob = reg.register("bob".into(), vec![], KeyMode::Password);
     reg.join_channel(alice, "general", ChannelKind::Public, None, TEST_IP)
         .unwrap();
     reg.join_channel(bob, "general", ChannelKind::Public, None, TEST_IP)
@@ -333,8 +332,8 @@ fn unregister_removes_user_from_every_channel_it_was_in() {
 #[test]
 fn unregister_sends_exactly_one_useroffline_per_peer_even_if_shared_multiple_channels() {
     let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::Rsa);
-    let bob = reg.register("bob".into(), vec![], KeyMode::Rsa);
+    let alice = reg.register("alice".into(), vec![], KeyMode::Password);
+    let bob = reg.register("bob".into(), vec![], KeyMode::Password);
     reg.join_channel(alice, "general", ChannelKind::Public, None, TEST_IP)
         .unwrap();
     reg.join_channel(bob, "general", ChannelKind::Public, None, TEST_IP)
@@ -360,8 +359,8 @@ fn unregister_sends_exactly_one_useroffline_per_peer_even_if_shared_multiple_cha
 #[test]
 fn leave_channel_still_sends_userleft_while_the_user_stays_connected() {
     let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::Rsa);
-    let bob = reg.register("bob".into(), vec![], KeyMode::Rsa);
+    let alice = reg.register("alice".into(), vec![], KeyMode::Password);
+    let bob = reg.register("bob".into(), vec![], KeyMode::Password);
     reg.join_channel(alice, "general", ChannelKind::Public, None, TEST_IP)
         .unwrap();
     reg.join_channel(bob, "general", ChannelKind::Public, None, TEST_IP)
@@ -384,7 +383,7 @@ fn leave_channel_still_sends_userleft_while_the_user_stays_connected() {
 #[test]
 fn join_channel_rejects_a_name_over_the_length_cap() {
     let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::Rsa);
+    let alice = reg.register("alice".into(), vec![], KeyMode::Password);
     let too_long = "a".repeat(22);
     let err = reg
         .join_channel(alice, &too_long, ChannelKind::Public, None, TEST_IP)
@@ -399,7 +398,7 @@ fn join_channel_rejects_a_name_over_the_length_cap() {
 #[test]
 fn join_channel_rejects_a_name_with_disallowed_characters() {
     let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::Rsa);
+    let alice = reg.register("alice".into(), vec![], KeyMode::Password);
     let err = reg
         .join_channel(alice, "has space", ChannelKind::Public, None, TEST_IP)
         .unwrap_err();
@@ -417,8 +416,8 @@ fn join_channel_rejects_a_name_with_disallowed_characters() {
 #[test]
 fn private_channel_created_with_a_password_can_be_joined_by_a_second_client_with_the_right_one() {
     let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::Rsa);
-    let bob = reg.register("bob".into(), vec![], KeyMode::Rsa);
+    let alice = reg.register("alice".into(), vec![], KeyMode::Password);
+    let bob = reg.register("bob".into(), vec![], KeyMode::Password);
     reg.join_channel(
         alice,
         "vault",
@@ -438,8 +437,8 @@ fn private_channel_created_with_a_password_can_be_joined_by_a_second_client_with
 #[test]
 fn private_channel_created_with_a_password_rejects_a_join_with_no_password() {
     let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::Rsa);
-    let bob = reg.register("bob".into(), vec![], KeyMode::Rsa);
+    let alice = reg.register("alice".into(), vec![], KeyMode::Password);
+    let bob = reg.register("bob".into(), vec![], KeyMode::Password);
     reg.join_channel(
         alice,
         "vault",
@@ -463,8 +462,8 @@ fn private_channel_created_with_a_password_rejects_a_join_with_no_password() {
 #[test]
 fn private_channel_created_with_a_password_rejects_a_join_with_the_wrong_password() {
     let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::Rsa);
-    let bob = reg.register("bob".into(), vec![], KeyMode::Rsa);
+    let alice = reg.register("alice".into(), vec![], KeyMode::Password);
+    let bob = reg.register("bob".into(), vec![], KeyMode::Password);
     reg.join_channel(
         alice,
         "vault",
@@ -488,8 +487,8 @@ fn private_channel_created_with_a_password_rejects_a_join_with_the_wrong_passwor
 #[test]
 fn a_successful_password_join_resets_the_attempt_counter() {
     let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::Rsa);
-    let bob = reg.register("bob".into(), vec![], KeyMode::Rsa);
+    let alice = reg.register("alice".into(), vec![], KeyMode::Password);
+    let bob = reg.register("bob".into(), vec![], KeyMode::Password);
     reg.join_channel(
         alice,
         "vault",
@@ -526,8 +525,8 @@ fn a_successful_password_join_resets_the_attempt_counter() {
 #[test]
 fn more_than_seven_wrong_attempts_from_one_ip_bans_that_ip_for_that_channel() {
     let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::Rsa);
-    let bob = reg.register("bob".into(), vec![], KeyMode::Rsa);
+    let alice = reg.register("alice".into(), vec![], KeyMode::Password);
+    let bob = reg.register("bob".into(), vec![], KeyMode::Password);
     reg.join_channel(
         alice,
         "vault",
@@ -569,8 +568,8 @@ fn more_than_seven_wrong_attempts_from_one_ip_bans_that_ip_for_that_channel() {
 #[test]
 fn a_ban_is_scoped_to_ip_and_channel_not_userid() {
     let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::Rsa);
-    let bob = reg.register("bob".into(), vec![], KeyMode::Rsa);
+    let alice = reg.register("alice".into(), vec![], KeyMode::Password);
+    let bob = reg.register("bob".into(), vec![], KeyMode::Password);
     reg.join_channel(
         alice,
         "vault",
@@ -609,8 +608,8 @@ fn a_ban_is_scoped_to_ip_and_channel_not_userid() {
 #[test]
 fn channel_join_rejected_is_sent_to_the_requester_only() {
     let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::Rsa);
-    let bob = reg.register("bob".into(), vec![], KeyMode::Rsa);
+    let alice = reg.register("alice".into(), vec![], KeyMode::Password);
+    let bob = reg.register("bob".into(), vec![], KeyMode::Password);
     reg.join_channel(
         alice,
         "vault",
@@ -639,8 +638,8 @@ fn channel_join_rejected_is_sent_to_the_requester_only() {
 #[test]
 fn peer_link_request_relays_candidates_to_the_named_peer() {
     let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::Rsa);
-    let bob = reg.register("bob".into(), vec![], KeyMode::Rsa);
+    let alice = reg.register("alice".into(), vec![], KeyMode::Password);
+    let bob = reg.register("bob".into(), vec![], KeyMode::Password);
     let candidates = vec![
         "127.0.0.1:4000".parse().unwrap(),
         "203.0.113.5:51820".parse().unwrap(),
@@ -661,7 +660,7 @@ fn peer_link_request_relays_candidates_to_the_named_peer() {
 #[test]
 fn peer_link_request_to_an_unknown_recipient_is_rejected() {
     let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::Rsa);
+    let alice = reg.register("alice".into(), vec![], KeyMode::Password);
     let err = reg
         .route_peer_link_request(alice, UserId(9999), vec![], 1)
         .unwrap_err();
@@ -669,25 +668,25 @@ fn peer_link_request_to_an_unknown_recipient_is_rejected() {
 }
 
 // ---------------------------------------------------------------------
-// rsa_per_msg: key_mode propagation and RotateKey relay
+// pq_hybrid: key_mode propagation and RotateKey relay
 // ---------------------------------------------------------------------
 
 /// @requirement TB-017
 #[test]
 fn user_info_reflects_registered_key_mode() {
     let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![1], KeyMode::PerMessage);
-    let bob = reg.register("bob".into(), vec![2], KeyMode::Rsa);
-    assert_eq!(reg.user_info(alice).unwrap().key_mode, KeyMode::PerMessage);
-    assert_eq!(reg.user_info(bob).unwrap().key_mode, KeyMode::Rsa);
+    let alice = reg.register("alice".into(), vec![1], KeyMode::PqHybrid);
+    let bob = reg.register("bob".into(), vec![2], KeyMode::Password);
+    assert_eq!(reg.user_info(alice).unwrap().key_mode, KeyMode::PqHybrid);
+    assert_eq!(reg.user_info(bob).unwrap().key_mode, KeyMode::Password);
 }
 
 /// @requirement TB-082
 #[test]
 fn key_rotation_is_delivered_to_recipient() {
     let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::PerMessage);
-    let bob = reg.register("bob".into(), vec![], KeyMode::Rsa);
+    let alice = reg.register("alice".into(), vec![], KeyMode::PqHybrid);
+    let bob = reg.register("bob".into(), vec![], KeyMode::Password);
     let out = reg
         .route_key_rotation(alice, bob, vec![9, 9, 9], vec![1, 1, 1])
         .expect("route ok");
@@ -701,10 +700,10 @@ fn key_rotation_is_delivered_to_recipient() {
 /// @requirement TB-082, TB-167
 #[test]
 fn key_rotation_from_a_static_mode_sender_is_rejected() {
-    for mode in [KeyMode::Rsa, KeyMode::Password, KeyMode::None] {
+    for mode in [KeyMode::Password, KeyMode::None] {
         let mut reg = Registry::new();
         let alice = reg.register("alice".into(), vec![], mode);
-        let bob = reg.register("bob".into(), vec![], KeyMode::Rsa);
+        let bob = reg.register("bob".into(), vec![], KeyMode::Password);
         let err = reg
             .route_key_rotation(alice, bob, vec![], vec![])
             .unwrap_err();
@@ -715,21 +714,18 @@ fn key_rotation_from_a_static_mode_sender_is_rejected() {
     }
 }
 
-/// Both rotating modes may relay - `rsa_per_msg` rotates its identity key,
-/// `pq_hybrid` its encryption keys - and the server still verifies nothing
-/// about either payload.
+/// Only `pq_hybrid` rotates its encryption keys - the server still
+/// verifies nothing about the payload itself.
 /// @requirement TB-167
 #[test]
 fn rotate_key_is_rejected_from_a_non_rotating_sender() {
-    for mode in [KeyMode::PerMessage, KeyMode::PqHybrid] {
-        let mut reg = Registry::new();
-        let alice = reg.register("alice".into(), vec![], mode);
-        let bob = reg.register("bob".into(), vec![], KeyMode::PqHybrid);
-        assert!(
-            reg.route_key_rotation(alice, bob, vec![7], vec![8]).is_ok(),
-            "a {mode:?} sender rotates keys and must be relayed"
-        );
-    }
+    let mut reg = Registry::new();
+    let alice = reg.register("alice".into(), vec![], KeyMode::PqHybrid);
+    let bob = reg.register("bob".into(), vec![], KeyMode::PqHybrid);
+    assert!(
+        reg.route_key_rotation(alice, bob, vec![7], vec![8]).is_ok(),
+        "a PqHybrid sender rotates keys and must be relayed"
+    );
 
     let mut reg = Registry::new();
     let alice = reg.register("alice".into(), vec![], KeyMode::None);
@@ -741,7 +737,7 @@ fn rotate_key_is_rejected_from_a_non_rotating_sender() {
 #[test]
 fn key_rotation_to_unknown_recipient_is_rejected() {
     let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::PerMessage);
+    let alice = reg.register("alice".into(), vec![], KeyMode::PqHybrid);
     let err = reg
         .route_key_rotation(alice, UserId(9999), vec![], vec![])
         .unwrap_err();
@@ -752,7 +748,7 @@ fn key_rotation_to_unknown_recipient_is_rejected() {
 #[test]
 fn key_rotation_from_unknown_sender_is_rejected() {
     let mut reg = Registry::new();
-    let bob = reg.register("bob".into(), vec![], KeyMode::Rsa);
+    let bob = reg.register("bob".into(), vec![], KeyMode::Password);
     let err = reg
         .route_key_rotation(UserId(9999), bob, vec![], vec![])
         .unwrap_err();
@@ -823,7 +819,7 @@ fn rsa_auth_rejects_response_of_the_wrong_kind() {
 // ---------------------------------------------------------------------
 
 async fn handshake_no_auth(stream: &mut ControlEndpoint<TcpStream>, name: &str) -> UserId {
-    handshake_no_auth_with_mode(stream, name, KeyMode::Rsa).await
+    handshake_no_auth_with_mode(stream, name, KeyMode::Password).await
 }
 
 async fn handshake_no_auth_with_mode(
@@ -1021,11 +1017,11 @@ async fn end_to_end_key_rotation_is_relayed_and_rejected_appropriately() {
     let addr = spawn_test_server(AuthConfig::None).await;
 
     let mut a = ControlEndpoint::new(TcpStream::connect(addr).await.unwrap());
-    let alice_id = handshake_no_auth_with_mode(&mut a, "alice", KeyMode::PerMessage).await;
+    let alice_id = handshake_no_auth_with_mode(&mut a, "alice", KeyMode::PqHybrid).await;
     let mut b = ControlEndpoint::new(TcpStream::connect(addr).await.unwrap());
-    let bob_id = handshake_no_auth_with_mode(&mut b, "bob", KeyMode::Rsa).await;
+    let bob_id = handshake_no_auth_with_mode(&mut b, "bob", KeyMode::Password).await;
 
-    // alice (rsa_per_msg) rotates her key for bob - relayed as KeyRotated.
+    // alice (pq_hybrid) rotates her key for bob - relayed as KeyRotated.
     a.send(&ClientMessage::RotateKey {
             to: bob_id,
             new_public_key_der: vec![4, 5, 6],
@@ -1061,106 +1057,6 @@ async fn end_to_end_key_rotation_is_relayed_and_rejected_appropriately() {
     assert!(
         matches!(&err, ServerMessage::Error { message } if message.contains("does not rotate"))
     );
-}
-
-/// The wire-level foundation of the `rsa_per_msg` continuity/resume
-/// mechanism (`docs/PROTOCOL.md` §12.6, `own_next_keys`): a rotation
-/// signed with a key established under one connection must relay and
-/// verify identically when re-announced from an entirely new connection
-/// (a fresh `UserId`) for the same nickname, addressed to a peer who never
-/// reconnected in between. The server has no special-case logic for this
-/// at all - it's the same `RotateKey`/`KeyRotated` relay every ordinary
-/// rotation already uses (§7.5); this test exists to pin down that the
-/// *server* side of "just reconnect and re-assert the old key" genuinely
-/// requires nothing new, only client-side bookkeeping (main.rs) and
-/// verification logic (rekey::verify_with_fallback, covered directly in
-/// rekey_test.rs) do.
-/// @requirement AC-050, TB-020, TB-098
-#[tokio::test]
-async fn end_to_end_resume_rotation_after_reconnect_verifies_against_the_continuity_key() {
-    let addr = spawn_test_server(AuthConfig::None).await;
-
-    let mut b = ControlEndpoint::new(TcpStream::connect(addr).await.unwrap());
-    let bob_id = handshake_no_auth_with_mode(&mut b, "bob", KeyMode::None).await;
-
-    // First session: alice (rsa_per_msg) establishes a per-peer key with
-    // bob - this is what a real client would later persist to
-    // own_next_keys as the continuity key for "bob".
-    let mut a1 = ControlEndpoint::new(TcpStream::connect(addr).await.unwrap());
-    let alice_id_1 = handshake_no_auth_with_mode(&mut a1, "alice", KeyMode::PerMessage).await;
-
-    let continuity = KeyPair::generate().unwrap();
-    let continuity_der = crypto::public_key_to_der(&continuity.public).unwrap();
-    let bootstrap_signed =
-        rekey::sign_rotation(&continuity.private, bob_id, &continuity_der).unwrap();
-    a1.send(&ClientMessage::RotateKey {
-            to: bob_id,
-            new_public_key_der: continuity_der.clone(),
-            signature: bootstrap_signed,
-        },
-    )
-    .await
-    .unwrap();
-    let first: ServerMessage = b.recv().await.unwrap().unwrap();
-    match first {
-        ServerMessage::KeyRotated {
-            from,
-            new_public_key_der,
-            ..
-        } => {
-            assert_eq!(from, alice_id_1);
-            assert_eq!(new_public_key_der, continuity_der);
-        }
-        other => panic!("expected KeyRotated, got {other:?}"),
-    }
-
-    // alice disconnects entirely (not just leaves a channel) and
-    // reconnects - a brand new UserId, unrelated to alice_id_1.
-    drop(a1);
-    let mut a2 = ControlEndpoint::new(TcpStream::connect(addr).await.unwrap());
-    let alice_id_2 = handshake_no_auth_with_mode(&mut a2, "alice", KeyMode::PerMessage).await;
-    assert_ne!(
-        alice_id_1, alice_id_2,
-        "UserId must not be reused across reconnects"
-    );
-
-    // Resume: self-assert the same continuity key, addressed to bob's
-    // still-live UserId, signed by that same key (proof of possession).
-    let resume_sig = rekey::sign_rotation(&continuity.private, bob_id, &continuity_der).unwrap();
-    a2.send(&ClientMessage::RotateKey {
-            to: bob_id,
-            new_public_key_der: continuity_der.clone(),
-            signature: resume_sig.clone(),
-        },
-    )
-    .await
-    .unwrap();
-    let resumed: ServerMessage = b.recv().await.unwrap().unwrap();
-    match resumed {
-        ServerMessage::KeyRotated {
-            from,
-            new_public_key_der,
-            signature,
-        } => {
-            assert_eq!(
-                from, alice_id_2,
-                "relayed from alice's new connection, not the old one"
-            );
-            assert_eq!(new_public_key_der, continuity_der);
-            // and it must actually verify against the continuity public
-            // key bob would have pinned from the first session - this is
-            // the exact check main.rs::handle_key_rotated's fallback path
-            // performs (rekey::verify_with_fallback, unit-tested directly
-            // in rekey_test.rs).
-            assert!(rekey::verify_rotation(
-                &continuity.public,
-                bob_id,
-                &new_public_key_der,
-                &signature
-            ));
-        }
-        other => panic!("expected KeyRotated, got {other:?}"),
-    }
 }
 
 /// @requirement AC-013
@@ -1210,7 +1106,7 @@ async fn end_to_end_stray_auth_and_identify_after_handshake_error_but_stay_conne
     a.send(&ClientMessage::Identify {
             display_name: "dave2".into(),
             public_key_der: vec![],
-            key_mode: KeyMode::Rsa,
+            key_mode: KeyMode::Password,
         },
     )
     .await
@@ -1264,7 +1160,7 @@ async fn end_to_end_duplicate_nickname_is_rejected_and_connection_closes() {
     b.send(&ClientMessage::Identify {
             display_name: "dave".into(),
             public_key_der: vec![],
-            key_mode: KeyMode::Rsa,
+            key_mode: KeyMode::Password,
         },
     )
     .await

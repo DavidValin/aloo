@@ -127,12 +127,10 @@ fn decrypting_a_chunk_with_the_wrong_key_fails() {
 #[test]
 fn a_non_pq_hybrid_sender_cannot_address_a_pq_hybrid_recipient() {
     assert!(
-        !can_address(KeyMode::PqHybrid, KeyMode::Rsa),
-        "an rsa sender has no ML-DSA-87/RSA-sign identity"
+        !can_address(KeyMode::PqHybrid, KeyMode::Password),
+        "a password sender has no ML-DSA-87/RSA-sign identity"
     );
-    assert!(!can_address(KeyMode::PqHybrid, KeyMode::Password));
     assert!(!can_address(KeyMode::PqHybrid, KeyMode::None));
-    assert!(!can_address(KeyMode::PqHybrid, KeyMode::PerMessage));
     assert!(
         can_address(KeyMode::PqHybrid, KeyMode::PqHybrid),
         "a pq_hybrid sender can address a pq_hybrid recipient"
@@ -142,19 +140,8 @@ fn a_non_pq_hybrid_sender_cannot_address_a_pq_hybrid_recipient() {
 /// @requirement AC-082
 #[test]
 fn every_sender_can_address_a_non_pq_hybrid_recipient() {
-    for recipient in [
-        KeyMode::Rsa,
-        KeyMode::Password,
-        KeyMode::None,
-        KeyMode::PerMessage,
-    ] {
-        for sender in [
-            KeyMode::Rsa,
-            KeyMode::Password,
-            KeyMode::None,
-            KeyMode::PerMessage,
-            KeyMode::PqHybrid,
-        ] {
+    for recipient in [KeyMode::Password, KeyMode::None] {
+        for sender in [KeyMode::Password, KeyMode::None, KeyMode::PqHybrid] {
             assert!(
                 can_address(recipient, sender),
                 "RSA-OAEP needs no sender identity at all"
@@ -165,14 +152,9 @@ fn every_sender_can_address_a_non_pq_hybrid_recipient() {
 
 /// @requirement AC-081
 #[test]
-fn key_mode_pq_hybrid_participates_in_byte_comparison_pinning_like_rsa() {
-    assert!(uses_byte_comparison_pinning(KeyMode::Rsa));
+fn key_mode_pq_hybrid_participates_in_byte_comparison_pinning_like_password() {
     assert!(uses_byte_comparison_pinning(KeyMode::Password));
     assert!(uses_byte_comparison_pinning(KeyMode::PqHybrid));
-    assert!(
-        !uses_byte_comparison_pinning(KeyMode::PerMessage),
-        "PerMessage has its own signature-based §12.6 mechanism"
-    );
     assert!(
         !uses_byte_comparison_pinning(KeyMode::None),
         "None has no continuity mechanism at all, by design"

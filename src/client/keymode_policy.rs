@@ -16,13 +16,9 @@ pub fn can_address(recipient_key_mode: KeyMode, own_key_mode: KeyMode) -> bool {
 
 /// Whether `key_mode` participates in `id_store`'s byte-comparison pinning
 /// (`session::check_identity`) - true for identities stable across
-/// reconnects by construction (`Rsa`/`PqHybrid`: file-loaded; `Password`:
-/// re-derived from the same password). `false` for `PerMessage` (its key
-/// is *supposed* to change - it has its own signature-based §12.6
-/// mechanism) and `None` (no continuity by design).
+/// reconnects by construction (`PqHybrid`: file-loaded; `Password`:
+/// re-derived from the same password). `false` for `None` (no continuity
+/// by design).
 pub fn uses_byte_comparison_pinning(key_mode: KeyMode) -> bool {
-    matches!(
-        key_mode,
-        KeyMode::Rsa | KeyMode::Password | KeyMode::PqHybrid
-    )
+    matches!(key_mode, KeyMode::Password | KeyMode::PqHybrid)
 }

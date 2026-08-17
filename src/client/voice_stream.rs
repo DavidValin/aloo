@@ -24,9 +24,9 @@ pub(crate) const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 /// from `VoiceRecordStart` so the eventual "recording finished" report
 /// (which only carries `stream_id`, `duration_ms`, and `pcm`) knows which
 /// `UiState` log to finalize. `Channel`'s `recipients` is the *readiness-
-/// filtered* snapshot taken at record-start (PROTOCOL.md §11.6) - who
-/// actually received this stream, needed again at finish time to fire our
-/// own per-peer rotation (`rekey::OwnKeys`) once per recipient.
+/// filtered* snapshot taken at record-start - who actually received this
+/// stream, needed again at finish time to fire our own `pq_hybrid`
+/// rotation once per recipient (`session::request_rotation`).
 pub(crate) enum OwnStreamTarget {
     Channel {
         channel: String,
@@ -411,12 +411,8 @@ impl ChunkDecryptor {
         blocks: &[Vec<u8>],
     ) -> Option<Vec<u8>> {
         match &self.key {
-            // Tries each candidate key in turn (current, retained,
-            // bootstrap - see `rekey::OwnKeys::candidate_privates_for`)
-            // rather than a single key snapshotted at start, so a stream
-            // started right after an optimistically-installed-but-not-yet-
-            // accepted rsa_per_msg resume still decrypts correctly instead
-            // of silently failing every chunk.
+            // `Password`/`None` never rotate, so this is always our one
+            // static private key, snapshotted at stream start.
             IncomingStreamKey::Rsa(privates) => privates
                 .iter()
                 .find_map(|k| crypto::decrypt_chunked(k, blocks).ok()),
@@ -446,7 +442,7 @@ pub(crate) fn spawn_stream_decrypt_worker(
     mixer_id: u64,
     from: UserId,
     stream_id: u64,
-    // Snapshotted once at `*Start` (docs/PROTOCOL.md §11.6/§12): a
+    // Snapshotted once at `*Start` (docs/PROTOCOL.md §11.2/§12): a
     // Pending/Rejected sender's audio is still decrypted and accumulated
     // (needed for the eventual `Voice` entry once revealed), just never
     // forwarded to the mixer, so nothing is heard live from someone not
@@ -585,13 +581,12 @@ pub(crate) fn resolve_direct_key(
     }
 }
 
-/// Resolves which key(s) to try for an incoming stream/transfer from
-/// `from`, decided by *our own* `session.own_key_mode` - a stream
-/// addressed to us was encrypted against whatever *we* announced,
-/// regardless of the sender's `my_key`. Shared by voice and file
-/// transfer, both snapshotting once at start rather than per chunk
-/// (§11.6). `sender_public_key_der` is only used when we are `PqHybrid`,
-/// to verify the once-per-stream signature.
+/// Resolves which key to try for an incoming stream/transfer from `from`,
+/// decided by *our own* `session.own_key_mode` - a stream addressed to us
+/// was encrypted against whatever *we* announced, regardless of the
+/// sender's `my_key`. Shared by voice and file transfer, both snapshotting
+/// once at start rather than per chunk. `sender_public_key_der` is only
+/// used when we are `PqHybrid`, to verify the once-per-stream signature.
 pub(crate) fn resolve_incoming_key(
     session: &SessionState,
     from: UserId,
@@ -616,11 +611,7 @@ pub(crate) fn resolve_incoming_key(
             _ => IncomingStreamKey::Rsa(Vec::new()),
         }
     } else {
-        let candidates = session
-            .own_keys
-            .as_ref()
-            .map(|own_keys| own_keys.lock().unwrap().candidate_privates_for(from))
-            .unwrap_or_default();
+        let candidates = session.own_keys.as_ref().cloned().into_iter().collect();
         IncomingStreamKey::Rsa(candidates)
     }
 }
@@ -640,7 +631,7 @@ pub(crate) fn start_incoming_stream(
 ) {
     let mixer_id = session.next_mixer_id;
     session.next_mixer_id += 1;
-    // The whole stream stays on one key snapshot (PROTOCOL.md §11.6), so
+    // The whole stream stays on one key snapshot (PROTOCOL.md §11.2), so
     // this is resolved once here rather than per chunk.
     let key = resolve_incoming_key(session, from, sender_public_key_der);
     let job_tx = spawn_stream_decrypt_worker(

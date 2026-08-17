@@ -156,13 +156,13 @@ fn the_protocol_documents_sections_are_stable() {
         "## 8. Encryption model",
         "### 8.4 RSA signatures",
         "## 10. What the server never sees",
-        "## 11. Per-message key rotation",
+        "## 11. Rotating a peer's key during a session",
         "## 12. Client-side identity pinning",
-        "### 12.7 Making a pin worth more",
+        "### 12.6 Making a pin worth more",
         "## 13. Post-quantum hybrid encryption",
         "### 13.3 One layout for everything",
         "### 13.10 Rotating encryption keys",
-        "## 14. The four encryption methods, side by side",
+        "## 14. The three encryption methods, side by side",
         "## 15. Sequences",
     ] {
         assert!(
@@ -176,14 +176,14 @@ fn the_protocol_documents_sections_are_stable() {
 /// happens to have five values for.
 /// @requirement AC-130
 #[test]
-fn the_four_encryption_methods_are_compared_in_one_place() {
+fn the_three_encryption_methods_are_compared_in_one_place() {
     let protocol = read("docs/PROTOCOL.md");
     let start = protocol
-        .find("## 14. The four encryption methods")
+        .find("## 14. The three encryption methods")
         .expect("section 14 must exist");
     let section = &protocol[start..];
 
-    for method in ["plain", "password", "rsa", "pq-hybrid"] {
+    for method in ["plain", "password", "pq-hybrid"] {
         assert!(
             section[..4000].contains(method),
             "section 14 must cover the {method} method"
@@ -309,7 +309,7 @@ fn section_numbers_run_consecutively_with_no_gaps() {
             numbered.push(digits.split('.').filter_map(|p| p.parse().ok()).collect());
         }
     }
-    assert!(numbered.len() > 60, "expected the numbered sections to be found");
+    assert!(numbered.len() > 50, "expected the numbered sections to be found");
 
     // Within each parent, children must start at 1 and step by 1.
     let mut seen: std::collections::BTreeMap<Vec<u32>, Vec<u32>> =
@@ -411,7 +411,7 @@ fn every_referenced_protocol_section_exists() {
         .collect();
 
     assert!(
-        existing.len() > 60,
+        existing.len() > 50,
         "expected to find the numbered sections, found {}",
         existing.len()
     );

@@ -167,7 +167,7 @@ pub(crate) async fn handle_voice_record_start(
         ui_state.recording_failed("recipient's key isn't ready yet".to_string());
         return Ok(());
     }
-    // Voice is never queued (PROTOCOL.md §11.6) - a link that isn't already
+    // Voice is never queued (PROTOCOL.md §11.2) - a link that isn't already
     // `Active` right now (no relay fallback, and punching can take several
     // seconds) fails this recording outright, same as an unready key above.
     if session.peer_link.ensure_link(wr, to).await != LinkReadiness::Active {
@@ -255,7 +255,7 @@ pub(crate) fn on_stream_start(
     stream_id: u64,
 ) {
     // Snapshotted once, same as the decrypt key set itself (PROTOCOL.md
-    // §11.6/§12): a Pending/Rejected sender's stream is never played live.
+    // §11.2/§12): a Pending/Rejected sender's stream is never played live.
     let suppress_playback = ui_state.is_trust_gated(from);
     let sender_public_key_der = ui_state
         .known_users

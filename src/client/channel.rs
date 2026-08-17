@@ -67,11 +67,11 @@ pub(crate) async fn handle_send_text(
     plaintext: String,
     recipients: Vec<Recipient>,
 ) -> proto::Result<()> {
-    // Split by whether each recipient's rsa_per_msg key (if any) is
-    // currently fresh (PROTOCOL.md §11.5) - a Static/untracked
-    // recipient is always ready. Anyone not ready is queued rather
-    // than dropped, and sent automatically once their next key
-    // arrives (`session::handle_key_rotated`).
+    // Split by whether each recipient's rotating key (pq_hybrid, if any)
+    // is currently fresh - a static/untracked recipient is always ready.
+    // Anyone not ready is queued rather than dropped, and sent
+    // automatically once their next key arrives
+    // (`session::handle_pq_key_rotated`).
     let mut ready = Vec::new();
     for (id, key_mode, der) in recipients {
         if !crate::client::keymode_policy::can_address(key_mode, session.own_key_mode) {
@@ -121,9 +121,8 @@ pub(crate) async fn handle_send_text(
 /// independent point-to-point transfers, each with its own `stream_id` and
 /// log row (accept/reject/progress is inherently per-recipient), never a
 /// broadcast like voice's channel streams. Readiness is snapshot-and-
-/// exclude (PROTOCOL.md §11.6): an unready `rsa_per_msg` recipient is
-/// simply left out. Nothing is read from `path` until a recipient
-/// individually accepts.
+/// exclude: an unready rotating-key recipient is simply left out. Nothing
+/// is read from `path` until a recipient individually accepts.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_send_file(
     wr: &mut impl crate::control::ControlSink,
@@ -203,8 +202,8 @@ pub(crate) async fn handle_voice_record_start(
     channel: String,
     recipients: Vec<Recipient>,
 ) -> proto::Result<()> {
-    // Voice streams are never queued (PROTOCOL.md §11.6): a rsa_per_msg
-    // recipient without a fresh key right now, or one whose direct link
+    // Voice streams are never queued: a rotating-key recipient without a
+    // fresh key right now, or one whose direct link
     // isn't already `Active` right now (no relay fallback, and punching can
     // take up to several seconds - too long to make a live recording wait
     // on), is simply left out of this particular stream, same as any other
@@ -388,7 +387,7 @@ pub(crate) fn on_stream_start(
     stream_id: u64,
 ) {
     // Snapshotted once, same as the decrypt key set itself (PROTOCOL.md
-    // §11.6/§12): a Pending/Rejected sender's stream is never played live.
+    // §11.2/§12): a Pending/Rejected sender's stream is never played live.
     let suppress_playback = ui_state.is_trust_gated(from);
     let sender_public_key_der = ui_state
         .known_users
@@ -421,7 +420,7 @@ pub(crate) fn on_own_stream_finished(
     ui_state.on_channel_stream_finished(&channel, you, stream_id, duration_ms, pcm);
     // one rotation per recipient this stream actually
     // reached, at the stream's natural end - not per
-    // chunk (PROTOCOL.md §11.6).
+    // chunk (PROTOCOL.md §11.2).
     for peer in recipients {
         crate::client::session::request_rotation(session, peer);
     }
