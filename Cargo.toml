@@ -1,6 +1,6 @@
 [package]
 name = "aloo"
-version = "0.1.0-alpha.7"
+version = "0.2.0-alpha.1"
 edition = "2024"
 
 authors = ["David Valin <hola@davidvalin.com>"]
