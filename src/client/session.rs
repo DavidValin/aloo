@@ -327,6 +327,7 @@ pub(crate) async fn run_connected_session(
     let mut cpu_monitor = sysstats::CpuMonitor::new();
     let mut last_cpu_sample = Instant::now();
     let mut last_conn_sample = Instant::now();
+    let mut last_otp_key_status_sample = Instant::now();
 
     terminal.draw(|f| ui::render(f, &ui_state))?;
 
@@ -483,6 +484,17 @@ pub(crate) async fn run_connected_session(
                 if now.duration_since(last_conn_sample) >= Duration::from_secs(1) {
                     ui_state.set_conn_quality(session.conn_stats.quality());
                     last_conn_sample = now;
+                }
+                // The OTP session header's live Seq/Offset/remaining figures
+                // (docs/PROTOCOL.md 16.5) refresh once a second too, and only
+                // for whichever DM is actually open right now - see
+                // `otp::poll_key_status`'s doc for why nothing else is
+                // polled.
+                if now.duration_since(last_otp_key_status_sample) >= Duration::from_secs(1) {
+                    if let Some(peer) = ui_state.active_private_room {
+                        crate::client::otp::poll_key_status(&session, &mut ui_state, peer).await;
+                    }
+                    last_otp_key_status_sample = now;
                 }
                 if let Some(action) = ui_state.tick_dwell(Instant::now()) {
                     handle_ui_action(action, &mut wr, &mut ui_state, &mut session).await?;

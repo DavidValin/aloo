@@ -124,6 +124,8 @@ The UI is composed of:
 
 The private-message room (Functionality #3) titles itself the same way: `Private: ` followed by the same tagged-name form.
 
+**OTP session header.** While a mutual-consent OTP session (`docs/PROTOCOL.md` §16) is active with a private room's peer, a 1-line header renders above that room's message log: `OTP SESSION with <nickname> - Receive Key (dec): <Seq> <Offset> <remaining>MB - Send Key (enc): <Seq> <Offset> <remaining>MB`. `OTP SESSION` is highlighted, `<nickname>` is yellow, each direction's `Seq`/`Offset` are grey, and `remaining` is green at or above 0.5MB, red below it. The figures come from the real `otp` command (`otp --show-contact`) and stay live: fetched once immediately when the session starts, again the instant this contact's pad is actually spent by a genuine send or receive in either direction, and roughly once a second besides as a safety net for as long as that room stays open (`docs/PROTOCOL.md` §16.5).
+
 **Encryption tag convention** (`aloo::proto::KeyMode::label`/`format_with_name`) — one of three, based on the `my_key` type that user connected with (see Functionality #10 for `pq_hybrid`'s wire implications):
 
 | `my_key` type | Tag | Position |
@@ -275,6 +277,7 @@ here that implements it. If a name changes on one side, it changes on both.
 | User-chosen pad size, shown to the peer (§16.1) | `crypto/otp.rs` `OTP_SIZE_MB_MIN`, `OTP_SIZE_MB_MAX`, `otp_size_mb_in_range`; `client/tui/ui.rs` `otp_size_input`, `UiAction::ConfirmOtpGenerate.size_mb`, `PendingOtpInvite.pad_size_mb`, `render_otp_size_popup`; `client/otp.rs` `confirm_generate` |
 | Recovering a stuck send via `otp --recover-last`, never re-encoding (§16.4) | `client/otp_cli.rs` `recover_last`, `recover_last_file`, `RecoverDirection`; `client/otp_store.rs` `OtpContactState.pending_content`, `PendingOtpContent`, `OtpStore::pending_sends`; `client/otp.rs` `recover_and_resend`, `recover_and_resend_text`, `recover_and_resend_file`, `recover_and_resend_voice`, `peer_for_contact_name`; `client/session.rs` `handle_p2p_event`'s `LinkStatusChanged` arm |
 | Rejecting a resent ciphertext before it touches the pad a second time (§16.4) | `client/otp_store.rs` `OtpStore::is_next_expected`; `client/otp.rs` `on_message` |
+| Live key-metadata header (§16.5) | `client/otp_cli.rs` `ContactDetail`, `show_contact`, `parse_show_contact`; `client/otp.rs` `refresh_otp_key_status`, `poll_key_status`; `client/tui/ui.rs` `UiState.otp_key_status`, `set_otp_key_status`, `otp_key_status_for`; `client/tui/direct_message.rs` `render_private_room`, `render_otp_header`, `push_otp_key_spans`, `OTP_KEY_LOW_THRESHOLD_BYTES`; `client/session.rs` tick loop |
 
 ## Encryption: how each method actually works
 

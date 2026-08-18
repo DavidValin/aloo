@@ -127,6 +127,9 @@ const HELP_BODY: &[&str] = &[
     "  under the pad while active - a file's name/size still travel unwrapped",
     "  (only its bytes are, once accepted); voice is recorded fully and sent",
     "  once instead of live, arriving playable once it fully lands.",
+    "  While active, a 1-line header above the messages shows both",
+    "  directions' Seq/Offset/remaining-MB live, updated about once a",
+    "  second - remaining turns red below 0.5MB per direction.",
     "",
     "Identity pinning (id_store)",
     "  Remembers each nickname's full public key across sessions (not",
@@ -680,6 +683,20 @@ pub struct UiState {
     /// wrap per-recipient under a contact's pad too, but a channel log has
     /// no single peer for a shield to describe.
     otp_active_peers: HashSet<UserId>,
+    /// Live `otp --show-contact` snapshots for peers in `otp_active_peers`,
+    /// driving the OTP session header's Seq/Offset/remaining figures
+    /// (`direct_message::render_otp_header`). Populated once immediately
+    /// when a session starts (`client::otp::accept_invite`/`on_key_setup_ack`),
+    /// then kept live two ways: event-driven, refreshed the instant this
+    /// contact's pad is actually spent in either direction (every genuine
+    /// send/receive in `client::otp.rs` calls `refresh_otp_key_status` right
+    /// after it succeeds), and as a roughly-once-a-second safety net for
+    /// whichever peer's private room is currently open (`session.rs`'s tick
+    /// loop, `otp::poll_key_status`) - covering anything that isn't this
+    /// app's own send/receive. Never cleared once set: a stale-but-correct
+    /// figure for a peer navigated away from and back to is a better first
+    /// frame than a blank one while the next update is in flight.
+    otp_key_status: HashMap<UserId, crate::client::otp_cli::ContactDetail>,
     /// Whether a previously-received voice message is currently being
     /// replayed (Enter on a `MessageBody::Voice` log entry) - while `true`,
     /// Escape stops that playback instead of its usual meaning (closing the
@@ -814,6 +831,7 @@ impl UiState {
             otp_invite_focus: OtpChoice::Accept,
             status_notice: None,
             otp_active_peers: HashSet::new(),
+            otp_key_status: HashMap::new(),
             replaying: false,
             recording: false,
             recording_source: None,
@@ -1178,6 +1196,20 @@ impl UiState {
     /// now.
     pub fn is_otp_active(&self, peer: UserId) -> bool {
         self.otp_active_peers.contains(&peer)
+    }
+
+    /// Records `peer`'s latest `otp --show-contact` snapshot - see
+    /// `otp_key_status`'s doc for who calls this and how often.
+    pub fn set_otp_key_status(&mut self, peer: UserId, detail: crate::client::otp_cli::ContactDetail) {
+        self.otp_key_status.insert(peer, detail);
+    }
+
+    /// `peer`'s most recently fetched key-metadata snapshot, if any -
+    /// `render_otp_header` falls back to `ContactDetail::default()` (all
+    /// zeros) when `None`, e.g. the brief window before a session's own
+    /// first fetch completes.
+    pub fn otp_key_status_for(&self, peer: UserId) -> Option<&crate::client::otp_cli::ContactDetail> {
+        self.otp_key_status.get(&peer)
     }
 
     /// Finds the file-transfer log row matching `(from, stream_id)`

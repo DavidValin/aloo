@@ -3,7 +3,7 @@
 //! cryptography or keychain formats itself, so these tests need the actual
 //! command installed and on `PATH` (or pointed at via `ALOO_OTP_BIN`).
 
-use aloo::client::otp_cli::{self, FileCliOutcome, OtpCliConfig, OtpCliOutcome, RecoverDirection};
+use aloo::client::otp_cli::{self, ContactDetail, FileCliOutcome, OtpCliConfig, OtpCliOutcome, RecoverDirection};
 use std::path::PathBuf;
 
 fn temp_dir(label: &str) -> PathBuf {
@@ -255,6 +255,58 @@ async fn a_removed_contacts_name_can_be_reprovisioned_from_scratch() {
     .await
     .expect("re-adding the same contact name should succeed now that the stale entry is gone");
     assert!(otp_cli::has_contact(&alice_cfg, "bob").await.unwrap());
+}
+
+/// @requirement AC-153, TB-192
+#[tokio::test]
+async fn show_contact_is_none_for_an_unknown_contact() {
+    if !require_otp() {
+        return;
+    }
+    let cfg = config_at(temp_dir("showcontact-none"));
+    assert!(otp_cli::show_contact(&cfg, "nobody").await.unwrap().is_none());
+}
+
+/// @requirement AC-153
+#[tokio::test]
+async fn show_contact_reports_the_initial_pad_position() {
+    if !require_otp() {
+        return;
+    }
+    let (alice_cfg, _bob_cfg) = provision_pair("showcontact-initial").await;
+    let detail: ContactDetail = otp_cli::show_contact(&alice_cfg, "bob")
+        .await
+        .unwrap()
+        .expect("a just-provisioned contact should be reported");
+
+    assert_eq!(detail.enc_sequence, 0);
+    assert_eq!(detail.enc_offset, 0);
+    assert_eq!(detail.enc_key_remaining, 1024 * 1024);
+    assert_eq!(detail.dec_sequence, 0);
+    assert_eq!(detail.dec_offset, 0);
+    assert_eq!(detail.dec_key_remaining, 1024 * 1024);
+}
+
+/// @requirement AC-153, TB-192
+#[tokio::test]
+async fn show_contact_advances_offset_and_sequence_after_an_encrypt() {
+    if !require_otp() {
+        return;
+    }
+    let (alice_cfg, _bob_cfg) = provision_pair("showcontact-advance").await;
+    match otp_cli::encrypt(&alice_cfg, "bob", b"hello", false).await.unwrap() {
+        OtpCliOutcome::Ok(_) => {}
+        other => panic!("expected Ok, got {other:?}"),
+    }
+
+    let detail = otp_cli::show_contact(&alice_cfg, "bob").await.unwrap().unwrap();
+    assert_eq!(detail.enc_sequence, 1);
+    assert_eq!(detail.enc_offset, 5, "offset should advance by the plaintext's own length");
+    assert_eq!(detail.enc_key_remaining, 1024 * 1024 - 5);
+    // The decrypt direction is untouched by an encrypt on this side.
+    assert_eq!(detail.dec_sequence, 0);
+    assert_eq!(detail.dec_offset, 0);
+    assert_eq!(detail.dec_key_remaining, 1024 * 1024);
 }
 
 /// @requirement TB-183, AC-147

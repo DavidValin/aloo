@@ -94,6 +94,7 @@ falling back to a server relay (§7.1).
   - [16.2 Sending under the pad](#162-sending-under-the-pad)
   - [16.3 Session visibility in the DM log](#163-session-visibility-in-the-dm-log)
   - [16.4 Recovering a send whose ciphertext already left](#164-recovering-a-send-whose-ciphertext-already-left)
+  - [16.5 Live key-metadata header](#165-live-key-metadata-header)
 
 ## Overview: the connections, and what travels on each
 
@@ -2893,3 +2894,44 @@ A recovery attempt that finds nothing to recover, or that fails for any
 reason, leaves the gate exactly as it was - it never falls back to
 building a fresh message, and the same check runs again on the next
 reconnect.
+
+### 16.5 Live key-metadata header
+
+While a mutual-consent session is active with a DM's peer (§16.1's
+"started" moment), a 1-line header renders above that room's message log:
+
+```
+OTP SESSION with bob - Receive Key (dec): 5 500 1.91MB - Send Key (enc): 3 300 1.91MB
+```
+
+`OTP SESSION` is highlighted, `with <nickname>` is yellow, and each
+direction's `<Seq> <Offset> <remaining>MB` triple follows the pad's own
+terms: `Seq` is that direction's message count, `Offset` is how many bytes
+of that direction's pad have been consumed, and `remaining` is what is
+left, in megabytes. `Seq`/`Offset` are always grey; `remaining` is green at
+or above 0.5MB and red below it, so a pad running low is visible before it
+actually runs out.
+
+This is purely local display, not a wire message - nothing here is sent to
+or read from the peer. The three figures come from `otp --show-contact
+<contact>`, the one `otp` command that reports each direction's pad
+offset (`--status --porcelain`, §16's other read path, does not carry it).
+`--show-contact` has no porcelain mode and its exit code cannot be used to
+detect a missing contact (verified directly against the installed binary:
+it still exits `0`, with the error on stderr) - unlike `--status`, so this
+one read is parsed from the command's ordinary `Label: value` output
+instead, checking for a leading `Contact:` line rather than trusting the
+exit code.
+
+The header's figures are fetched once immediately when a session starts, on
+both the initiator's and the accepter's side, and again the instant this
+contact's pad is actually spent in either direction from then on - every
+genuine send and receive (text, a file's offer or content phase, voice)
+re-fetches right after its own `otp --encrypt`/`--decrypt` succeeds, so the
+figures change the moment the action that changed them completes rather
+than waiting on a timer. A roughly-once-a-second refresh runs alongside
+this, for whichever peer's room stays the one open, as a safety net for
+anything that isn't this app's own send/receive (e.g. the same keychain
+used with `otp` directly, out of band) - never for a room that isn't
+currently on screen, so an idle session elsewhere in the app costs nothing
+beyond its own occasional safety-net fetch.

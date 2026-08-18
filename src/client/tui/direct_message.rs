@@ -6,6 +6,9 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::Paragraph;
 
 use crate::proto::{KeyMode, UserId, UserInfo};
 
@@ -402,11 +405,78 @@ impl UiState {
 // ---------------------------------------------------------------------
 
 pub(crate) fn render_private_room(frame: &mut Frame, area: Rect, state: &UiState, peer_id: UserId) {
-    let constraints = [Constraint::Min(3), Constraint::Length(3)];
+    let show_otp_header = state.is_otp_active(peer_id);
+    let mut constraints = Vec::with_capacity(3);
+    if show_otp_header {
+        constraints.push(Constraint::Length(1));
+    }
+    constraints.push(Constraint::Min(3));
+    constraints.push(Constraint::Length(3));
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints(constraints)
         .split(area);
-    render_messages(frame, rows[0], state, Some(peer_id));
-    render_input_bar(frame, rows[1], state);
+
+    let mut idx = 0;
+    if show_otp_header {
+        render_otp_header(frame, rows[idx], state, peer_id);
+        idx += 1;
+    }
+    render_messages(frame, rows[idx], state, Some(peer_id));
+    render_input_bar(frame, rows[idx + 1], state);
+}
+
+/// Below this many remaining bytes (0.5MB) a direction's key figure is
+/// rendered in red instead of green - the same "running low" line the pad
+/// itself has no concept of (it just refuses once truly empty), surfaced
+/// here so the user sees it coming.
+const OTP_KEY_LOW_THRESHOLD_BYTES: u64 = 512 * 1024;
+
+/// `<seq> <offset> <remaining>MB` - `remaining` on its own since only that
+/// figure gets the red/green threshold color; `seq`/`offset` are always
+/// grey.
+fn push_otp_key_spans(spans: &mut Vec<Span<'static>>, seq: u64, offset: u64, remaining_bytes: u64) {
+    spans.push(Span::styled(
+        format!("{seq} {offset} "),
+        Style::default().fg(Color::Gray),
+    ));
+    let remaining_color = if remaining_bytes < OTP_KEY_LOW_THRESHOLD_BYTES {
+        Color::Red
+    } else {
+        Color::Green
+    };
+    spans.push(Span::styled(
+        format!("{:.2}MB", remaining_bytes as f64 / (1024.0 * 1024.0)),
+        Style::default().fg(remaining_color),
+    ));
+}
+
+/// The 1-line OTP session header shown above the message log while this
+/// peer's session is active (`UiState::is_otp_active`) - see
+/// `UiState::otp_key_status`'s doc for how its figures stay live.
+fn render_otp_header(frame: &mut Frame, area: Rect, state: &UiState, peer_id: UserId) {
+    let nickname = state
+        .known_users
+        .get(&peer_id)
+        .map(|u| u.name.clone())
+        .unwrap_or_default();
+    let detail = state
+        .otp_key_status_for(peer_id)
+        .cloned()
+        .unwrap_or_default();
+
+    let mut spans = vec![
+        Span::styled(
+            "OTP SESSION",
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" with "),
+        Span::styled(nickname, Style::default().fg(Color::Yellow)),
+        Span::raw(" - Receive Key (dec): "),
+    ];
+    push_otp_key_spans(&mut spans, detail.dec_sequence, detail.dec_offset, detail.dec_key_remaining);
+    spans.push(Span::raw(" - Send Key (enc): "));
+    push_otp_key_spans(&mut spans, detail.enc_sequence, detail.enc_offset, detail.enc_key_remaining);
+
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }

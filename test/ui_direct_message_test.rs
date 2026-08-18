@@ -647,6 +647,93 @@ fn messages_in_a_dm_without_an_active_otp_session_get_no_shield() {
     );
 }
 
+/// @requirement AC-153
+#[test]
+fn the_otp_header_is_not_shown_without_an_active_session() {
+    let mut state = joined_general_with(vec![pq_hybrid_user(2, "bob")]);
+    state.active_private_room = Some(UserId(2));
+    state.on_direct_message(UserId(2), "bob".into(), MessageBody::Text("hello".into()));
+
+    let rows = rendered_rows(&state);
+    assert!(
+        !rows.iter().any(|r| r.contains("OTP SESSION")),
+        "no header should render without an active OTP session: {rows:?}"
+    );
+}
+
+/// @requirement AC-153
+#[test]
+fn the_otp_header_shows_the_highlighted_title_and_yellow_nickname() {
+    use aloo::client::otp_cli::ContactDetail;
+
+    let mut state = joined_general_with(vec![pq_hybrid_user(2, "bob")]);
+    state.active_private_room = Some(UserId(2));
+    state.mark_otp_active(UserId(2));
+    state.set_otp_key_status(
+        UserId(2),
+        ContactDetail {
+            enc_sequence: 3,
+            enc_offset: 300,
+            enc_key_remaining: 2_000_000,
+            dec_sequence: 5,
+            dec_offset: 500,
+            dec_key_remaining: 2_000_000,
+        },
+    );
+
+    let backend = TestBackend::new(100, 15);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| render(f, &state)).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    let rows: Vec<String> = (0..buffer.area.height)
+        .map(|y| (0..buffer.area.width).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+        .collect();
+
+    assert!(
+        rows.iter().any(|r| r.contains(
+            "OTP SESSION with bob - Receive Key (dec): 5 500 1.91MB - Send Key (enc): 3 300 1.91MB"
+        )),
+        "the header should show both directions' live figures: {rows:?}"
+    );
+
+    let (x, y) = find_text_start(&buffer, "OTP SESSION");
+    assert_eq!(buffer[(x, y)].fg, ratatui::style::Color::Cyan);
+
+    let (x, y) = find_text_start(&buffer, "bob");
+    assert_eq!(buffer[(x, y)].fg, ratatui::style::Color::Yellow);
+}
+
+/// @requirement AC-153
+#[test]
+fn the_otp_header_colors_remaining_key_red_below_the_threshold_and_green_at_or_above_it() {
+    use aloo::client::otp_cli::ContactDetail;
+
+    let mut state = joined_general_with(vec![pq_hybrid_user(2, "bob")]);
+    state.active_private_room = Some(UserId(2));
+    state.mark_otp_active(UserId(2));
+    state.set_otp_key_status(
+        UserId(2),
+        ContactDetail {
+            enc_sequence: 0,
+            enc_offset: 0,
+            enc_key_remaining: 100_000, // well under 0.5MB - red
+            dec_sequence: 0,
+            dec_offset: 0,
+            dec_key_remaining: 5_000_000, // well over 0.5MB - green
+        },
+    );
+
+    let backend = TestBackend::new(100, 15);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| render(f, &state)).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+
+    let (x, y) = find_text_start(&buffer, "0.10MB");
+    assert_eq!(buffer[(x, y)].fg, ratatui::style::Color::Red);
+    let (x, y) = find_text_start(&buffer, "4.77MB");
+    assert_eq!(buffer[(x, y)].fg, ratatui::style::Color::Green);
+}
+
 /// @requirement AC-143
 #[test]
 fn push_outgoing_dm_returns_the_index_the_entry_landed_at() {

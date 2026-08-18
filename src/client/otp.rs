@@ -942,6 +942,7 @@ pub(crate) async fn accept_invite(
 
     if accepted {
         ui_state.mark_otp_active(invite.from);
+        refresh_otp_key_status(&session.otp_cli_cfg, ui_state, invite.from, &invite.contact_name).await;
         notify(
             ui_state,
             invite.from,
@@ -1020,6 +1021,7 @@ pub(crate) async fn on_key_setup_ack(
         session.otp_store.mark_provisioned(&ack.contact_name);
         let _ = session.otp_store.save();
         ui_state.mark_otp_active(from);
+        refresh_otp_key_status(&session.otp_cli_cfg, ui_state, from, &ack.contact_name).await;
         notify(
             ui_state,
             from,
@@ -1060,6 +1062,51 @@ pub(crate) async fn on_key_setup_ack(
             false,
         );
     }
+}
+
+/// Fetches `contact_name`'s current `otp --show-contact` snapshot and
+/// stores it as `peer`'s live key-metadata (`UiState::otp_key_status`) - the
+/// header's actual "realtime" mechanism. Called from every place in this
+/// file that genuinely spends this contact's pad in either direction
+/// (`send_now`, `send_file_offer`, `send_voice_offer`,
+/// `start_outgoing_file_content`, `on_message`, `on_file_offer`,
+/// `finish_incoming_file`), right after that spend succeeds, so the figures
+/// change the instant the action that changed them completes - never
+/// waiting on `poll_key_status`'s timer for that. Also the one-shot fetch
+/// `accept_invite`/`on_key_setup_ack` make right when a session starts, so
+/// the header shows real numbers on its very first frame. A failed/erroring
+/// call just leaves whatever snapshot was already there rather than
+/// clearing it - a stale-but-real figure beats a blank one for a display
+/// that's cosmetic, not a security decision.
+async fn refresh_otp_key_status(
+    cfg: &otp_cli::OtpCliConfig,
+    ui_state: &mut UiState,
+    peer: UserId,
+    contact_name: &str,
+) {
+    if let Ok(Some(detail)) = otp_cli::show_contact(cfg, contact_name).await {
+        ui_state.set_otp_key_status(peer, detail);
+    }
+}
+
+/// `session.rs`'s tick loop calls this roughly once a second for whichever
+/// peer's private room is currently open - a safety-net refresh alongside
+/// the event-driven ones above, covering anything that isn't this app's own
+/// send/receive (e.g. the pad's remaining bytes changing because the user
+/// ran `otp` themselves against the same keychain out of band). A no-op
+/// whenever `peer`'s session isn't active or their contact name can't be
+/// resolved, so the caller doesn't need to check `is_otp_active` itself.
+pub(crate) async fn poll_key_status(session: &SessionState, ui_state: &mut UiState, peer: UserId) {
+    if !ui_state.is_otp_active(peer) {
+        return;
+    }
+    let Some(peer_pubkey) = ui_state.known_users.get(&peer).map(|u| u.public_key_der.clone()) else {
+        return;
+    };
+    let Some(contact_name) = contact_name_if_active(session, &peer_pubkey) else {
+        return;
+    };
+    refresh_otp_key_status(&session.otp_cli_cfg, ui_state, peer, &contact_name).await;
 }
 
 /// `crypto::otp::contact_name_for`, resolved from a peer's announced
@@ -1166,6 +1213,7 @@ async fn send_now(
         },
     );
     let _ = session.otp_store.save();
+    refresh_otp_key_status(&session.otp_cli_cfg, ui_state, to, contact_name).await;
     session.peer_link.ensure_link(wr, to).await;
     session.peer_link.send_reliable_or_queue(
         to,
@@ -1399,6 +1447,7 @@ pub(crate) async fn send_file_offer(
         },
     );
     let _ = session.otp_store.save();
+    refresh_otp_key_status(&session.otp_cli_cfg, ui_state, to, contact_name).await;
     ui_state.log_own_file_offer_dm(to, stream_id, filename.clone(), size);
     session.own_file_targets.insert(
         stream_id,
@@ -1553,6 +1602,7 @@ pub(crate) async fn send_voice_offer(
         crate::client::otp_store::PendingOtpContent::Voice { duration_ms },
     );
     let _ = session.otp_store.save();
+    refresh_otp_key_status(&session.otp_cli_cfg, ui_state, to, contact_name).await;
     session.otp_send_temp_files.insert(stream_id, cipher_path.clone());
     session.own_file_targets.insert(
         stream_id,
@@ -1609,6 +1659,7 @@ pub(crate) async fn on_message(
         return;
     }
     let _ = session.otp_store.save();
+    refresh_otp_key_status(&session.otp_cli_cfg, ui_state, from, &contact_name).await;
     let mut inner = envelope;
     inner.blocks = vec![pq_blob];
     if let Some(body) = crate::client::session::decrypt_envelope_for(
@@ -1673,6 +1724,7 @@ pub(crate) async fn on_file_offer(
         return;
     }
     let _ = session.otp_store.save();
+    refresh_otp_key_status(&session.otp_cli_cfg, ui_state, from, &contact_name).await;
     let mut inner = envelope;
     inner.blocks = vec![pq_blob];
     let Some(payload) = crate::client::session::decrypt_file_offer(
@@ -1925,6 +1977,7 @@ pub(crate) async fn start_outgoing_file_content(
                 crate::client::otp_store::PendingOtpContent::FileContent { stream_id },
             );
             let _ = session.otp_store.save();
+            refresh_otp_key_status(&session.otp_cli_cfg, ui_state, to, &contact_name).await;
             session
                 .peer_link
                 .send_reliable_or_queue(to, P2pPayload::OtpFileContentSeq { stream_id, seq });
@@ -2019,6 +2072,7 @@ pub(crate) async fn finish_incoming_file(
         );
         return;
     }
+    refresh_otp_key_status(&session.otp_cli_cfg, ui_state, from, &pending.contact_name).await;
     match pending.kind {
         OtpIncomingKind::File { .. } => ui_state.set_file_completed(from, stream_id),
         OtpIncomingKind::Voice { duration_ms } => {

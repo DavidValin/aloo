@@ -430,6 +430,65 @@ pub async fn status(cfg: &OtpCliConfig, contact: &str) -> io::Result<Option<Cont
     Ok(Some(parse_status_porcelain(&stdout)))
 }
 
+/// One contact's pad-position detail, parsed from `otp --show-contact
+/// <name>` - the only `otp` command that reports each direction's *offset*
+/// into its pad (bytes already consumed), which `--status --porcelain`
+/// does not expose. Drives the OTP session header's live `<Seq> <Offset>
+/// <remaining>` figures (`client::tui::direct_message::render_otp_header`).
+#[derive(Debug, Clone, Default)]
+pub struct ContactDetail {
+    pub enc_sequence: u64,
+    pub enc_offset: u64,
+    pub enc_key_remaining: u64,
+    pub dec_sequence: u64,
+    pub dec_offset: u64,
+    pub dec_key_remaining: u64,
+}
+
+/// `--show-contact` has no `--porcelain` mode (verified directly against
+/// the installed binary - passing the flag is silently ignored), so this
+/// parses its human-readable `Label: value` lines instead. Its exit code is
+/// always `0` even for a contact that doesn't exist (also verified
+/// directly - the error lands on stderr with nothing on stdout), so a
+/// missing `Contact:` line, not the exit code, is what this treats as "no
+/// such contact".
+fn parse_show_contact(text: &str) -> Option<ContactDetail> {
+    if !text.trim_start().starts_with("Contact:") {
+        return None;
+    }
+    let mut d = ContactDetail::default();
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(v) = line.strip_prefix("EncryptionKeyOffset:") {
+            d.enc_offset = v.trim().parse().unwrap_or(0);
+        } else if let Some(v) = line.strip_prefix("EncryptedSequence:") {
+            d.enc_sequence = v.trim().parse().unwrap_or(0);
+        } else if let Some(v) = line.strip_prefix("EncryptionKey:") {
+            d.enc_key_remaining = parse_bytes_in_parens(v).unwrap_or(0);
+        } else if let Some(v) = line.strip_prefix("DecryptionKeyOffset:") {
+            d.dec_offset = v.trim().parse().unwrap_or(0);
+        } else if let Some(v) = line.strip_prefix("DecryptedSequence:") {
+            d.dec_sequence = v.trim().parse().unwrap_or(0);
+        } else if let Some(v) = line.strip_prefix("DecryptionKey:") {
+            d.dec_key_remaining = parse_bytes_in_parens(v).unwrap_or(0);
+        }
+    }
+    Some(d)
+}
+
+/// Pulls the byte count out of `"******* (1048571 bytes)"`.
+fn parse_bytes_in_parens(s: &str) -> Option<u64> {
+    let inside = s.split('(').nth(1)?;
+    inside.trim_end().strip_suffix("bytes)")?.trim().parse().ok()
+}
+
+/// `None` when the contact doesn't exist - see `parse_show_contact`'s doc
+/// for why that's read from the output, not the exit code.
+pub async fn show_contact(cfg: &OtpCliConfig, contact: &str) -> io::Result<Option<ContactDetail>> {
+    let (_code, stdout, _stderr) = run(cfg, &["--show-contact", contact], &[]).await?;
+    Ok(parse_show_contact(&String::from_utf8_lossy(&stdout)))
+}
+
 pub enum RecoverDirection {
     Sent,
     Received,
