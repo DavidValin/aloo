@@ -1883,3 +1883,38 @@ evidence = "src/client/tui/channel.rs UiState::tick_dwell; test dwell_does_not_r
 id = "TB-158"
 description = "Leaving a channel - locally via /leave, or being told a peer left via UserLeft - drops the P2P link to any peer with whom no joined channel or DM history remains (UiState::has_reason_to_keep_link), the same bar on_user_offline already uses to decide whether to keep a departed user listed."
 evidence = "docs/PROTOCOL.md 7.1.3; src/client/channel.rs handle_leave; src/client/session.rs UserLeft arm; tests has_reason_to_keep_link_is_true_for_a_shared_channel, has_reason_to_keep_link_is_true_for_dm_history, has_reason_to_keep_link_is_false_with_neither"
+
+# ============================================================================
+# US-034 - See when someone joins, leaves, or disconnects
+# ============================================================================
+[[user_story]]
+id = "US-034"
+title = "See when someone joins, leaves, or disconnects"
+as_a = "user watching a channel or a private conversation"
+i_want = "a plain, timestamped notice when someone joins, leaves, or disconnects"
+so_that = "I know who is still around without having to guess from silence"
+
+[[user_story.acceptance_criteria]]
+id = "AC-149"
+description = "A live join of a channel already shared with someone else logs a yellow '<local time> <name> joined' line in that channel's log - but not for the existing-member snapshot a client's own first join into a channel receives."
+evidence = "docs/SPEC.md Functionality #7; src/client/tui/ui.rs MessageBody::Presence, render_messages; src/client/tui/channel.rs UiState::on_user_joined; tests a_live_join_logs_a_yellow_joined_presence_notice, presence_notice_is_rendered_in_yellow, on_user_joined_creates_the_tab_if_a_join_snapshot_arrives_before_joined; scenario features/presence/presence_notices.feature 'A live join is announced, timestamped and yellow'"
+
+[[user_story.acceptance_criteria]]
+id = "AC-150"
+description = "A member leaving a channel logs a yellow '<local time> <name> left' line in that channel's log."
+evidence = "docs/SPEC.md Functionality #7; src/client/tui/channel.rs UiState::on_user_left; test on_user_left_logs_a_yellow_left_presence_notice; scenario features/presence/presence_notices.feature 'Someone leaving the channel is announced'"
+
+[[user_story.acceptance_criteria]]
+id = "AC-151"
+description = "A user's connection closing entirely logs a yellow '<local time> <name> disconnected' line into every channel they were a member of, and into an already-open DM room with them - logged before membership bookkeeping runs, so it still happens even when they are then dropped from a channel's member list for lack of DM history."
+evidence = "docs/SPEC.md Functionality #7; src/client/tui/ui.rs UiState::on_user_offline; test user_offline_logs_a_disconnected_notice_in_every_shared_channel_and_an_open_dm; scenario features/presence/presence_notices.feature 'A disconnect is announced in every shared channel and an open DM'"
+
+[[user_story.technical_behavior]]
+id = "TB-189"
+description = "A presence notice is MessageBody::Presence, not System - distinct yellow (not gray/italic) styling, and excluded from the OTP shield prefix the same way System already is."
+evidence = "src/client/tui/ui.rs render_messages; test presence_notice_is_rendered_in_yellow"
+
+[[user_story.technical_behavior]]
+id = "TB-190"
+description = "A duplicate UserJoined for someone already listed as a member logs no second notice, and the existing-member snapshot a fresh join receives logs none at all - both keyed off whether the channel was already ChannelTab::joined before the call, mirroring the ordering TB-159 already establishes."
+evidence = "src/client/tui/channel.rs UiState::on_user_joined, UiState::seed_member; tests a_live_join_logs_a_yellow_joined_presence_notice, on_user_joined_creates_the_tab_if_a_join_snapshot_arrives_before_joined; scenario features/presence/presence_notices.feature 'The initial membership snapshot is not announced as a join'"

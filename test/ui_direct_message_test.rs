@@ -120,8 +120,8 @@ fn compose_bar_ignores_typing_and_enter_while_the_open_dm_peer_is_offline() {
     );
     assert_eq!(
         state.private_rooms[&UserId(2)].log.len(),
-        1,
-        "only bob's earlier message, nothing sent by us"
+        2,
+        "bob's earlier message plus his own disconnect notice - nothing sent by us"
     );
 }
 

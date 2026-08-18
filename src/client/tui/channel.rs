@@ -22,8 +22,8 @@ use crate::validation;
 
 use super::ui::{
     FileTransferStatus, JoinPopupFocus, LogEntry, MessageBody, Mode, UiAction, UiState,
-    finalize_held_stream, finalize_stream_entry, focus_border_style, push_log_entry,
-    render_input_bar, render_messages,
+    finalize_held_stream, finalize_stream_entry, focus_border_style, local_time_short,
+    push_log_entry, render_input_bar, render_messages,
 };
 
 /// How long a tab has to stay selected (`[`/`]`) before it's actually
@@ -394,14 +394,20 @@ impl UiState {
     }
 
     /// Records `user` as a member of `channel`, creating a tab if none
-    /// exists yet. The tab must be *created* here, not just found: when we
-    /// join an already-populated channel, the existing-member `UserJoined`
+    /// exists yet, without touching the log - shared by `on_user_joined`
+    /// below (the real, notice-emitting entry point) and test/scenario
+    /// setup (`test/ui_common.rs`, the cucumber `{word} is in the channel
+    /// with me` step) that wants to describe a channel's *starting*
+    /// roster rather than simulate a join happening during the test. The
+    /// tab must be *created* here, not just found: when we join an
+    /// already-populated channel, the existing-member `UserJoined`
     /// snapshot arrives *before* the `Joined` confirmation (§6.1), and no
     /// local tab exists yet - dropping that info would lose every member
     /// already in the channel. `kind` is a placeholder (`Public`) when
     /// created this way; `on_joined` corrects it moments later from the
-    /// authoritative `ChannelInfo`.
-    pub fn on_user_joined(&mut self, channel: &str, user: UserInfo) {
+    /// authoritative `ChannelInfo`. Returns whether `user` was actually new
+    /// to the channel (`false` on a duplicate join, which is a no-op here).
+    pub fn seed_member(&mut self, channel: &str, user: UserInfo) -> bool {
         self.known_users.insert(user.id, user.clone());
         let tab = match self.channels.iter().position(|c| c.name == channel) {
             Some(idx) => &mut self.channels[idx],
@@ -417,14 +423,89 @@ impl UiState {
                 self.channels.last_mut().expect("just pushed")
             }
         };
-        if !tab.members.iter().any(|m| m.id == user.id) {
+        let is_new = !tab.members.iter().any(|m| m.id == user.id);
+        if is_new {
             tab.members.push(user);
+        }
+        is_new
+    }
+
+    /// `seed_member` plus a yellow "`<time>` `<name>` joined" log entry
+    /// (`MessageBody::Presence`, `docs/SPEC.md` Functionality #7) - but only
+    /// when `channel` was already joined *before* this call, i.e. this is a
+    /// genuine live join rather than the existing-member snapshot a fresh
+    /// join receives (see `seed_member`'s doc): that snapshot's `UserJoined`
+    /// batch always arrives while the tab is still `joined == false`, since
+    /// the confirming `Joined` hasn't landed yet - the exact ordering
+    /// `on_user_joined_creates_the_tab_if_a_join_snapshot_arrives_before_joined`
+    /// (`test/ui_channel_test.rs`) pins down. This is the only entry point
+    /// `session.rs` calls for `ServerMessage::UserJoined`.
+    pub fn on_user_joined(&mut self, channel: &str, user: UserInfo) {
+        let already_joined = self
+            .channels
+            .iter()
+            .find(|c| c.name == channel)
+            .map(|c| c.joined)
+            .unwrap_or(false);
+        let id = user.id;
+        let name = user.name.clone();
+        let is_new = self.seed_member(channel, user);
+        if already_joined && is_new {
+            let text = format!("{} {name} joined", local_time_short());
+            let is_current = self.is_viewing_channel(channel);
+            if let Some(tab) = self.channels.iter_mut().find(|c| c.name == channel) {
+                push_log_entry(
+                    &mut tab.log,
+                    &mut self.message_selected,
+                    is_current,
+                    LogEntry {
+                        from: id,
+                        from_name: name,
+                        to_name: None,
+                        body: MessageBody::Presence(text),
+                        outgoing: false,
+                        failed: false,
+                    },
+                );
+            }
         }
     }
 
+    /// Removes `user_id` from `channel`'s member list and, if we knew their
+    /// name, logs a yellow "`<time>` `<name>` left" entry
+    /// (`MessageBody::Presence`) into that channel - always a genuine event
+    /// (unlike `on_user_joined`, a `UserLeft` is only ever sent for a
+    /// channel the recipient is already joined to, so there's no snapshot
+    /// case to exclude here).
     pub fn on_user_left(&mut self, channel: &str, user_id: UserId) {
+        let name = self
+            .channels
+            .iter()
+            .find(|c| c.name == channel)
+            .and_then(|c| c.members.iter().find(|m| m.id == user_id))
+            .map(|m| m.name.clone())
+            .or_else(|| self.known_users.get(&user_id).map(|u| u.name.clone()));
         if let Some(tab) = self.channels.iter_mut().find(|c| c.name == channel) {
             tab.members.retain(|m| m.id != user_id);
+        }
+        if let Some(name) = name {
+            let text = format!("{} {name} left", local_time_short());
+            let is_current = self.is_viewing_channel(channel);
+            if let Some(tab) = self.channels.iter_mut().find(|c| c.name == channel) {
+                push_log_entry(
+                    &mut tab.log,
+                    &mut self.message_selected,
+                    is_current,
+                    LogEntry {
+                        from: user_id,
+                        from_name: name,
+                        to_name: None,
+                        body: MessageBody::Presence(text),
+                        outgoing: false,
+                        failed: false,
+                    },
+                );
+            }
         }
     }
 

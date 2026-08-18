@@ -6,8 +6,8 @@ use cucumber::{given, then, when};
 use ratatui::style::Color;
 
 use aloo::client::p2p::LinkStatus;
-use aloo::proto::UserId;
-use aloo::client::tui::ui::Focus;
+use aloo::proto::{KeyMode, UserId};
+use aloo::client::tui::ui::{Focus, LogEntry, MessageBody};
 
 use crate::steps::ui_common::{id_for, press_key};
 use crate::support::{appears_before, find_text_start, ui_buffer, ui_rows, ui_rows_wide};
@@ -142,7 +142,7 @@ async fn compose_refuses(w: &mut AlooWorld) {
     );
 }
 
-#[then(expr = "the private room holds only {int} message")]
+#[then(expr = "the private room holds only {int} message(s)")]
 async fn room_message_count(w: &mut AlooWorld, n: usize) {
     let state = w.ui_ref();
     let id = state.active_private_room.expect("no private room open");
@@ -177,6 +177,63 @@ async fn offline_is_permanent(w: &mut AlooWorld, name: String) {
         w.ui_ref().offline.contains(&id),
         "a UserId is never reused, so nothing should ever move one back to online"
     );
+}
+
+// ---------------------------------------------------------------------
+// Presence notices in the log: join/left/disconnected (US-034)
+// ---------------------------------------------------------------------
+
+/// A genuine live join, distinct from `member_present` above
+/// (`{word} is in the channel with me`, which seeds the channel's starting
+/// roster without producing a notice) - this is the one that goes through
+/// `UiState::on_user_joined` and so does log a yellow "joined" line.
+#[when(expr = "{word} joins the channel with me")]
+async fn member_joins_live(w: &mut AlooWorld, name: String) {
+    let info =
+        crate::steps::ui_common::user_with_mode(id_for(&name), &name, KeyMode::Password);
+    w.ui_mut().on_user_joined("general", info);
+}
+
+#[when(expr = "{word} leaves the channel")]
+async fn member_leaves(w: &mut AlooWorld, name: String) {
+    w.ui_mut().on_user_left("general", UserId(id_for(&name)));
+}
+
+fn assert_presence_suffix(entry: Option<&LogEntry>, suffix: &str) {
+    let entry =
+        entry.unwrap_or_else(|| panic!("expected a presence notice ending {suffix:?}, log is empty"));
+    match &entry.body {
+        MessageBody::Presence(text) => assert!(
+            text.ends_with(suffix),
+            "expected the presence notice to end with {suffix:?}, got {text:?}"
+        ),
+        other => panic!("expected a Presence entry ending {suffix:?}, got {other:?}"),
+    }
+}
+
+#[then(expr = "the channel log ends with the presence notice {string}")]
+async fn channel_log_ends_with_presence(w: &mut AlooWorld, suffix: String) {
+    assert_presence_suffix(w.ui_ref().channels[0].log.last(), &suffix);
+}
+
+#[then("no presence notice appears in the channel log")]
+async fn no_presence_notice(w: &mut AlooWorld) {
+    assert!(
+        w.ui_ref().channels[0].log.is_empty(),
+        "expected no presence notice from the membership snapshot, got {:?}",
+        w.ui_ref().channels[0].log
+    );
+}
+
+#[then(expr = "{word}'s private room ends with the presence notice {string}")]
+async fn private_room_ends_with_presence(w: &mut AlooWorld, name: String, suffix: String) {
+    let id = UserId(id_for(&name));
+    let entry = w
+        .ui_ref()
+        .private_rooms
+        .get(&id)
+        .and_then(|r| r.log.last());
+    assert_presence_suffix(entry, &suffix);
 }
 
 // ---------------------------------------------------------------------

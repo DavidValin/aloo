@@ -207,6 +207,15 @@ pub enum MessageBody {
     /// redundant on a line that already names OTP explicitly, and the
     /// prefix is meant to mark *content*, not the app's own narration.
     System(String),
+    /// A peer joining a channel, leaving one, or disconnecting entirely -
+    /// rendered in yellow (`render_messages`), unlike the gray/italic
+    /// `System` above, so it stands out as a presence change rather than
+    /// app narration. Already-formatted text (`local_time_short` prefix
+    /// plus the peer's name and the event) built by
+    /// `channel::on_user_joined`/`on_user_left`/`ui::on_user_offline` -
+    /// see `docs/SPEC.md` Functionality #7. Excluded from the OTP shield
+    /// prefix for the same reason `System` is.
+    Presence(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2038,6 +2047,58 @@ impl UiState {
             .get(&user_id)
             .map(|r| !r.log.is_empty())
             .unwrap_or(false);
+        // Logged into every channel that had them as a member, and into an
+        // already-open DM room, before membership is touched below - a
+        // disconnect is global, unlike `on_user_left` (one channel), so it
+        // reaches every shared context at once (`docs/SPEC.md` Functionality
+        // #7). Skipped only if we never actually learned their name (should
+        // not happen in practice: `known_users` is populated the moment
+        // `on_user_joined` first sees them).
+        if let Some(name) = self.known_users.get(&user_id).map(|u| u.name.clone()) {
+            let text = format!("{} {name} disconnected", local_time_short());
+            let member_channels: Vec<String> = self
+                .channels
+                .iter()
+                .filter(|c| c.members.iter().any(|m| m.id == user_id))
+                .map(|c| c.name.clone())
+                .collect();
+            for channel in member_channels {
+                let is_current = self.is_viewing_channel(&channel);
+                if let Some(tab) = self.channels.iter_mut().find(|c| c.name == channel) {
+                    push_log_entry(
+                        &mut tab.log,
+                        &mut self.message_selected,
+                        is_current,
+                        LogEntry {
+                            from: user_id,
+                            from_name: name.clone(),
+                            to_name: None,
+                            body: MessageBody::Presence(text.clone()),
+                            outgoing: false,
+                            failed: false,
+                        },
+                    );
+                }
+            }
+            if self.private_rooms.contains_key(&user_id) {
+                let is_current = self.active_private_room == Some(user_id);
+                if let Some(room) = self.private_rooms.get_mut(&user_id) {
+                    push_log_entry(
+                        &mut room.log,
+                        &mut self.message_selected,
+                        is_current,
+                        LogEntry {
+                            from: user_id,
+                            from_name: name,
+                            to_name: None,
+                            body: MessageBody::Presence(text),
+                            outgoing: false,
+                            failed: false,
+                        },
+                    );
+                }
+            }
+        }
         if !has_dm_history {
             for tab in &mut self.channels {
                 tab.members.retain(|m| m.id != user_id);
@@ -2045,6 +2106,23 @@ impl UiState {
         }
     }
 
+}
+
+/// This machine's local wall-clock time as `HH:MM:SS`, for the presence
+/// notices in `MessageBody::Presence`. Falls back to UTC, labeled, on the
+/// rare platforms/thread-shapes where the local offset can't be read
+/// safely - same fallback, and the same reason, as `client::otp::format_now`.
+/// Deliberately hand-formatted rather than via `time`'s `format_description`
+/// machinery: only `hour`/`minute`/`second` accessors are needed, which
+/// avoids pulling in the crate's `macros` feature just for this.
+pub(crate) fn local_time_short() -> String {
+    match time::OffsetDateTime::now_local() {
+        Ok(dt) => format!("{:02}:{:02}:{:02}", dt.hour(), dt.minute(), dt.second()),
+        Err(_) => {
+            let dt = time::OffsetDateTime::now_utc();
+            format!("{:02}:{:02}:{:02} UTC", dt.hour(), dt.minute(), dt.second())
+        }
+    }
 }
 
 /// Pushes `entry` onto `log`. If the caller is currently viewing this
@@ -2629,8 +2707,13 @@ pub(crate) fn render_messages(
                     text.clone(),
                     Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
                 )),
+                MessageBody::Presence(text) => {
+                    Line::from(Span::styled(text.clone(), Style::default().fg(Color::Yellow)))
+                }
             };
-            if shield_active && !matches!(entry.body, MessageBody::System(_)) {
+            if shield_active
+                && !matches!(entry.body, MessageBody::System(_) | MessageBody::Presence(_))
+            {
                 line.spans.insert(0, Span::raw("\u{1F6E1}\u{FE0F} "));
             }
             // A row whose async send turned out to have failed

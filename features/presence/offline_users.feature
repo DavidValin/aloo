@@ -48,7 +48,7 @@ Feature: When someone's connection closes
     Then the compose bar refuses everything I type
     When I press Enter
     Then nothing is sent
-    And the private room holds only 1 message
+    And the private room holds only 2 messages
     And the compose bar shows an offline notice in red
 
   @AC-053 @TB-105

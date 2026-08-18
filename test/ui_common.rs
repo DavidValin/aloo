@@ -73,7 +73,10 @@ pub fn joined_general_with(members: Vec<UserInfo>) -> UiState {
         kind: ChannelKind::Public,
     });
     for m in members {
-        state.on_user_joined("general", m);
+        // `seed_member`, not `on_user_joined`: this describes the channel's
+        // starting roster, not a live join happening during the test - see
+        // `seed_member`'s doc.
+        state.seed_member("general", m);
     }
     state
 }

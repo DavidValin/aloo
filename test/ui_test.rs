@@ -52,6 +52,42 @@ fn user_offline_without_dm_history_is_removed_from_channels_like_an_explicit_lea
     assert!(state.channels[0].members.is_empty());
 }
 
+/// A disconnect logs a yellow, timestamped "disconnected" notice into every
+/// channel the user was a member of, and into an already-open DM room -
+/// docs/SPEC.md Functionality #7. Logged before membership is touched, so
+/// this holds even for the "no DM history" case where the peer is then
+/// dropped from the channel's member list.
+///
+/// @requirement AC-151
+#[test]
+fn user_offline_logs_a_disconnected_notice_in_every_shared_channel_and_an_open_dm() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.focus = Focus::Sidebar;
+    press(&mut state, KeyCode::Enter); // opens (and so creates) an empty DM room with bob
+
+    state.on_user_offline(UserId(2));
+
+    match &state.channels[0].log.last().expect("expected a notice").body {
+        MessageBody::Presence(text) => assert!(
+            text.ends_with("bob disconnected"),
+            "expected a disconnected notice in the channel, got {text:?}"
+        ),
+        other => panic!("expected MessageBody::Presence, got {other:?}"),
+    }
+    match &state.private_rooms[&UserId(2)]
+        .log
+        .last()
+        .expect("expected a notice")
+        .body
+    {
+        MessageBody::Presence(text) => assert!(
+            text.ends_with("bob disconnected"),
+            "expected a disconnected notice in the DM room, got {text:?}"
+        ),
+        other => panic!("expected MessageBody::Presence, got {other:?}"),
+    }
+}
+
 /// @requirement TB-104
 #[test]
 fn user_offline_with_an_open_but_empty_dm_room_is_still_removed_from_channels() {

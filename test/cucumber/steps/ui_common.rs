@@ -86,16 +86,24 @@ async fn connected_two_channels(w: &mut AlooWorld) {
     w.ui = Some(state);
 }
 
+// `seed_member`, not `on_user_joined`: these describe the channel's
+// starting roster (world-building for the scenario), not a live join
+// happening during it - see `seed_member`'s doc. Using `on_user_joined`
+// here would spuriously log a yellow "joined" notice into every scenario
+// using this near-universal step, since by the time it runs the channel
+// is normally already marked joined via "I am connected and viewing a
+// channel".
+
 #[given(expr = "{word} is in the channel with me")]
 async fn member_present(w: &mut AlooWorld, name: String) {
     let info = user_with_mode(id_for(&name), &name, KeyMode::Password);
-    w.ui_mut().on_user_joined("general", info);
+    w.ui_mut().seed_member("general", info);
 }
 
 #[given(expr = "{word} is in the channel with me using {word}")]
 async fn member_present_mode(w: &mut AlooWorld, name: String, mode: String) {
     let info = user_with_mode(id_for(&name), &name, key_mode_named(&mode));
-    w.ui_mut().on_user_joined("general", info);
+    w.ui_mut().seed_member("general", info);
 }
 
 #[given(expr = "the channel already has joined {string}")]

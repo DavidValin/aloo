@@ -97,7 +97,72 @@ fn user_joined_and_left_update_members_and_known_users() {
     assert!(state.known_users.contains_key(&UserId(2)));
 }
 
-/// @requirement TB-159
+/// A live join (the channel is already joined, so this is not the
+/// existing-member snapshot) logs a yellow, timestamped "joined" notice -
+/// docs/SPEC.md Functionality #7.
+///
+/// @requirement AC-149
+#[test]
+fn a_live_join_logs_a_yellow_joined_presence_notice() {
+    let mut state = joined_general_with(vec![]);
+    state.on_user_joined("general", user(2, "bob"));
+
+    assert_eq!(state.channels[0].log.len(), 1);
+    match &state.channels[0].log[0].body {
+        MessageBody::Presence(text) => assert!(
+            text.ends_with("bob joined"),
+            "expected a joined notice, got {text:?}"
+        ),
+        other => panic!("expected MessageBody::Presence, got {other:?}"),
+    }
+
+    // A duplicate join for an already-listed member logs no second notice.
+    state.on_user_joined("general", user(2, "bob"));
+    assert_eq!(
+        state.channels[0].log.len(),
+        1,
+        "a duplicate join must not log a second notice"
+    );
+}
+
+/// Someone leaving the channel logs a yellow, timestamped "left" notice.
+///
+/// @requirement AC-150
+#[test]
+fn on_user_left_logs_a_yellow_left_presence_notice() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.on_user_left("general", UserId(2));
+
+    assert_eq!(state.channels[0].log.len(), 1);
+    match &state.channels[0].log[0].body {
+        MessageBody::Presence(text) => assert!(
+            text.ends_with("bob left"),
+            "expected a left notice, got {text:?}"
+        ),
+        other => panic!("expected MessageBody::Presence, got {other:?}"),
+    }
+}
+
+/// A join/left presence notice is rendered in yellow - distinct from the
+/// gray/italic `MessageBody::System` OTP narration already uses
+/// (`render_messages`).
+///
+/// @requirement AC-149, TB-189
+#[test]
+fn presence_notice_is_rendered_in_yellow() {
+    let mut state = joined_general_with(vec![]);
+    state.on_user_joined("general", user(2, "bob"));
+
+    let backend = TestBackend::new(100, 15);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| render(f, &state)).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+
+    let (x, y) = find_text_start(&buffer, "bob joined");
+    assert_eq!(buffer[(x, y)].fg, ratatui::style::Color::Yellow);
+}
+
+/// @requirement TB-159, TB-190
 #[test]
 fn on_user_joined_creates_the_tab_if_a_join_snapshot_arrives_before_joined() {
     let mut state = UiState::new("me".into());
@@ -125,6 +190,10 @@ fn on_user_joined_creates_the_tab_if_a_join_snapshot_arrives_before_joined() {
         "bob must not be lost when the snapshot preceded Joined"
     );
     assert_eq!(tab.members[0].id, UserId(2));
+    assert!(
+        tab.log.is_empty(),
+        "the existing-member snapshot must not be logged as a join notice"
+    );
 }
 
 /// @requirement TB-159
