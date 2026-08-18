@@ -7,7 +7,12 @@ Feature: Claiming a unique nickname
 
   A nickname is only reserved for as long as its holder is connected. The
   check-and-register happens atomically, so two simultaneous attempts on one
-  name cannot both win. See docs/PROTOCOL.md section 5.4.
+  name cannot both win. See docs/PROTOCOL.md section 5.4. "Connected" is
+  never assumed from an open socket alone: the server also frees a
+  nickname whose connection goes silent for HEARTBEAT_TIMEOUT with no
+  disconnect ever arriving (section 4.1) - covered at the Rust layer
+  (`docs/TESTING.md` "Known coverage gaps") rather than here, since proving
+  it honestly needs the real timeout to elapse.
 
   @AC-015 @AC-017
   Scenario: A nickname already in use is refused, and its holder is untouched

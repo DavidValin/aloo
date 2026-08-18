@@ -318,6 +318,12 @@ pub(crate) async fn run_connected_session(
     // adding much latency; also drives the idle-stream sweep below.
     let mut ticker = tokio::time::interval(Duration::from_millis(150));
     let mut tick_count: u32 = 0;
+    // Keeps the server able to tell this session is still alive
+    // (docs/PROTOCOL.md §4.1) even across a long stretch where the user
+    // sends nothing - real chat/voice/file content never touches the
+    // server at all (it's peer-to-peer), so without this an idle-but-happy
+    // session would look identical to a dead one from the server's side.
+    let mut heartbeat_ticker = tokio::time::interval(proto::HEARTBEAT_INTERVAL);
     let mut cpu_monitor = sysstats::CpuMonitor::new();
     let mut last_cpu_sample = Instant::now();
     let mut last_conn_sample = Instant::now();
@@ -454,6 +460,9 @@ pub(crate) async fn run_connected_session(
                         }
                     }
                 }
+            }
+            _ = heartbeat_ticker.tick() => {
+                wr.send_control(&ClientMessage::Heartbeat).await?;
             }
             _ = ticker.tick() => {
                 tick_count = tick_count.wrapping_add(1);

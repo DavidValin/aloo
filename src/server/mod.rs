@@ -564,7 +564,7 @@ pub async fn run(addr: SocketAddr, auth: AuthConfig) -> std::io::Result<()> {
 /// out from `run` so tests can bind to an ephemeral port (`:0`) and
 /// discover the real address via `TcpListener::local_addr`.
 pub async fn serve(listener: TcpListener, auth: AuthConfig) -> std::io::Result<()> {
-    serve_tcp(listener, auth).await
+    serve_tcp(listener, auth, proto::HEARTBEAT_TIMEOUT).await
 }
 
 /// `serve`, plus a UDP rendezvous socket bound alongside it (see
@@ -576,10 +576,27 @@ pub async fn serve_with_rendezvous(
     auth: AuthConfig,
 ) -> std::io::Result<()> {
     tokio::spawn(udp_rendezvous_loop(udp));
-    serve_tcp(listener, auth).await
+    serve_tcp(listener, auth, proto::HEARTBEAT_TIMEOUT).await
 }
 
-async fn serve_tcp(listener: TcpListener, auth: AuthConfig) -> std::io::Result<()> {
+/// `serve`, with the liveness timeout (§4.1) overridden instead of using
+/// `proto::HEARTBEAT_TIMEOUT`. The real `HEARTBEAT_TIMEOUT` (30s) is far
+/// too slow to wait out in a test; this is what lets a test prove the
+/// timeout actually fires - and that ordinary traffic keeps resetting it -
+/// in milliseconds instead.
+pub async fn serve_with_heartbeat_timeout(
+    listener: TcpListener,
+    auth: AuthConfig,
+    heartbeat_timeout: Duration,
+) -> std::io::Result<()> {
+    serve_tcp(listener, auth, heartbeat_timeout).await
+}
+
+async fn serve_tcp(
+    listener: TcpListener,
+    auth: AuthConfig,
+    heartbeat_timeout: Duration,
+) -> std::io::Result<()> {
     let registry = Arc::new(Mutex::new(Registry::new()));
     let senders: Senders = Arc::new(Mutex::new(HashMap::new()));
     let auth = Arc::new(auth);
@@ -590,7 +607,9 @@ async fn serve_tcp(listener: TcpListener, auth: AuthConfig) -> std::io::Result<(
         let senders = senders.clone();
         let auth = auth.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(socket, peer, registry, senders, auth).await {
+            if let Err(e) =
+                handle_connection(socket, peer, registry, senders, auth, heartbeat_timeout).await
+            {
                 eprintln!("aloo: connection {peer} ended: {e}");
             }
         });
@@ -628,6 +647,7 @@ async fn handle_connection(
     registry: Arc<Mutex<Registry>>,
     senders: Senders,
     auth: Arc<AuthConfig>,
+    heartbeat_timeout: Duration,
 ) -> proto::Result<()> {
     let peer_ip = peer_addr.ip();
     let (rd, wr) = tokio::io::split(socket);
@@ -736,7 +756,7 @@ async fn handle_connection(
         }
     });
 
-    let result = client_loop(id, &mut rd, &registry, &senders, peer_ip).await;
+    let result = client_loop(id, &mut rd, &registry, &senders, peer_ip, heartbeat_timeout).await;
 
     {
         let mut reg = registry.lock().await;
@@ -755,9 +775,20 @@ async fn client_loop<R: AsyncRead + Unpin>(
     registry: &Arc<Mutex<Registry>>,
     senders: &Senders,
     source_ip: IpAddr,
+    heartbeat_timeout: Duration,
 ) -> proto::Result<()> {
     loop {
-        let Some(msg) = rd.recv::<ClientMessage>().await? else {
+        // Any message at all - `Heartbeat` or otherwise - proves the
+        // connection is alive and resets this. Nothing arriving within
+        // `heartbeat_timeout` (docs/PROTOCOL.md §4.1) is treated exactly
+        // like the client closing the connection: this simply returns,
+        // and the same unregister/cleanup path in `handle_connection` runs
+        // either way.
+        let Ok(recv) = tokio::time::timeout(heartbeat_timeout, rd.recv::<ClientMessage>()).await
+        else {
+            return Ok(());
+        };
+        let Some(msg) = recv? else {
             return Ok(());
         };
         let outgoing = {
@@ -807,6 +838,9 @@ async fn client_loop<R: AsyncRead + Unpin>(
                         }]
                     }
                 },
+                // Purely a liveness signal - already did its job just by
+                // arriving and resetting the timeout above.
+                ClientMessage::Heartbeat => Vec::new(),
                 ClientMessage::SecureChannel(_)
                 | ClientMessage::Auth(_)
                 | ClientMessage::Identify { .. } => vec![Outgoing {

@@ -15,6 +15,22 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// to stop a corrupt/hostile length prefix from exhausting memory.
 pub const MAX_FRAME_LEN: u32 = 64 * 1024 * 1024;
 
+/// How often a connected client sends `ClientMessage::Heartbeat` on the
+/// control channel (docs/PROTOCOL.md §4.1). Actual message content never
+/// touches the server (it travels peer-to-peer, §7.1), so without this a
+/// perfectly healthy session that is just quietly chatting would leave the
+/// control channel silent for its entire lifetime - the heartbeat is what
+/// gives the server anything at all to measure liveness by.
+pub const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long the server waits for *any* message - a heartbeat or otherwise -
+/// before deciding a client's connection is dead and disconnecting it (same
+/// cleanup path as a clean TCP close: §4, §6.4). Three missed heartbeats'
+/// worth, the same 1:3 interval-to-timeout ratio `client::p2p` uses between
+/// `KEEPALIVE_INTERVAL` and `LINK_IDLE_TIMEOUT`, so a couple of lost beats
+/// from network jitter alone don't cost a user their session.
+pub const HEARTBEAT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 #[derive(Debug, thiserror::Error)]
 pub enum ProtoError {
     #[error("io error: {0}")]
@@ -335,6 +351,14 @@ pub enum ClientMessage {
         candidates: Vec<std::net::SocketAddr>,
         link_nonce: u64,
     },
+
+    /// Sent every `HEARTBEAT_INTERVAL` for as long as the connection is
+    /// open, so the server always has *something* to measure liveness by
+    /// even during a session where no other control-channel message is
+    /// ever sent (§4.1). Carries no data and gets no reply - receiving it
+    /// (like receiving anything else) simply resets the server's
+    /// `HEARTBEAT_TIMEOUT` clock for this connection.
+    Heartbeat,
 }
 
 /// Messages the server sends to a client.

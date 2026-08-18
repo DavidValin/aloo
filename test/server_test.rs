@@ -4,7 +4,7 @@ use aloo::crypto;
 use aloo::proto::*;
 use aloo::server::{
     AuthConfig, CHANNEL_MAX_PASSWORD_ATTEMPTS, CHANNEL_PASSWORD_BAN_DURATION, DEFAULT_CHANNEL_NAME,
-    Outgoing, Registry, serve,
+    Outgoing, Registry, serve, serve_with_heartbeat_timeout,
 };
 use aloo::control::ControlEndpoint;
 use tokio::net::{TcpListener, TcpStream};
@@ -875,6 +875,21 @@ async fn spawn_test_server(auth: AuthConfig) -> std::net::SocketAddr {
     addr
 }
 
+/// Like `spawn_test_server`, but with a `heartbeat_timeout` (§4.1) short
+/// enough to actually wait out in a test - the real `HEARTBEAT_TIMEOUT`
+/// (30s) would make these tests unusably slow.
+async fn spawn_test_server_with_heartbeat_timeout(
+    auth: AuthConfig,
+    heartbeat_timeout: std::time::Duration,
+) -> std::net::SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = serve_with_heartbeat_timeout(listener, auth, heartbeat_timeout).await;
+    });
+    addr
+}
+
 /// @requirement AC-019, AC-024
 #[tokio::test]
 async fn end_to_end_two_clients_join_and_learn_about_each_other() {
@@ -1216,4 +1231,64 @@ async fn end_to_end_nickname_is_free_again_after_the_holder_disconnects() {
     // rejection here would fail this test via handshake_no_auth's asserts
     let mut b = ControlEndpoint::new(TcpStream::connect(addr).await.unwrap());
     handshake_no_auth(&mut b, "dave").await;
+}
+
+/// @requirement AC-152
+#[tokio::test]
+async fn heartbeat_timeout_frees_the_nickname_without_a_clean_disconnect() {
+    let heartbeat_timeout = std::time::Duration::from_millis(80);
+    let addr = spawn_test_server_with_heartbeat_timeout(AuthConfig::None, heartbeat_timeout).await;
+
+    // `a`'s socket is deliberately never closed or dropped for the rest of
+    // this test - the server has to notice the silence itself, not a FIN.
+    let mut a = ControlEndpoint::new(TcpStream::connect(addr).await.unwrap());
+    handshake_no_auth(&mut a, "dave").await;
+
+    tokio::time::sleep(heartbeat_timeout * 3).await;
+
+    // succeeds even though `a` is still technically connected - proving the
+    // server freed "dave" on its own via the heartbeat timeout, not via a
+    // closed socket it never got.
+    let mut b = ControlEndpoint::new(TcpStream::connect(addr).await.unwrap());
+    handshake_no_auth(&mut b, "dave").await;
+}
+
+/// @requirement TB-191
+#[tokio::test]
+async fn ordinary_traffic_resets_the_heartbeat_timeout_clock() {
+    let heartbeat_timeout = std::time::Duration::from_millis(150);
+    let addr = spawn_test_server_with_heartbeat_timeout(AuthConfig::None, heartbeat_timeout).await;
+
+    let mut a = ControlEndpoint::new(TcpStream::connect(addr).await.unwrap());
+    handshake_no_auth(&mut a, "dave").await;
+
+    // Spread well past `heartbeat_timeout`'s total span, but never silent
+    // for longer than it at a stretch - each Heartbeat should reset the
+    // clock, so the connection must survive the whole thing.
+    for _ in 0..4 {
+        tokio::time::sleep(heartbeat_timeout / 2).await;
+        a.send(&ClientMessage::Heartbeat).await.unwrap();
+    }
+
+    // still registered: a second "dave" is refused, not accepted.
+    let mut b = ControlEndpoint::new(TcpStream::connect(addr).await.unwrap());
+    let (auth, challenge) = b.client_handshake(None).await.unwrap().unwrap();
+    assert_eq!(auth, AuthKind::None);
+    assert_eq!(challenge, None);
+    b.send(&ClientMessage::Auth(AuthResponse::None))
+        .await
+        .unwrap();
+    let _: ServerMessage = b.recv().await.unwrap().unwrap();
+    b.send(&ClientMessage::Identify {
+        display_name: "dave".into(),
+        public_key_der: vec![],
+        key_mode: KeyMode::Password,
+    })
+    .await
+    .unwrap();
+    let identify_result: ServerMessage = b.recv().await.unwrap().unwrap();
+    assert!(
+        matches!(identify_result, ServerMessage::IdentifyResult { ok: false, .. }),
+        "dave's original connection should still be alive, kept so by its heartbeats: {identify_result:?}"
+    );
 }

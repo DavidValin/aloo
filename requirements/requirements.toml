@@ -234,6 +234,11 @@ id = "AC-017"
 description = "Rejecting a duplicate nickname leaves the existing holder's session completely unaffected."
 evidence = "test end_to_end_duplicate_nickname_is_rejected_and_connection_closes"
 
+[[user_story.acceptance_criteria]]
+id = "AC-152"
+description = "A nickname frees up within HEARTBEAT_TIMEOUT even when its holder's connection never closes cleanly, since the server treats HEARTBEAT_TIMEOUT with nothing received at all as a disconnect."
+evidence = "docs/PROTOCOL.md 4.1; test heartbeat_timeout_frees_the_nickname_without_a_clean_disconnect"
+
 [[user_story.technical_behavior]]
 id = "TB-017"
 description = "Registration records the client's display name, public key and key mode, and reports them back via user_info."
@@ -253,6 +258,11 @@ evidence = "docs/PROTOCOL.md 5.4 (atomic check-and-register); test try_register_
 id = "TB-020"
 description = "A UserId is never reused, so the same nickname reconnecting is always a brand-new identity."
 evidence = "docs/PROTOCOL.md 3; tests end_to_end_resume_rotation_after_reconnect_verifies_against_the_continuity_key, user_offline_is_permanent_for_the_session_since_a_user_id_is_never_reused"
+
+[[user_story.technical_behavior]]
+id = "TB-191"
+description = "Any message received on a connection, not only Heartbeat, resets the server's per-connection heartbeat-timeout clock."
+evidence = "docs/PROTOCOL.md 4.1; test ordinary_traffic_resets_the_heartbeat_timeout_clock"
 
 # ============================================================================
 # US-004 - Join, leave and switch channels

@@ -35,6 +35,7 @@ falling back to a server relay (§7.1).
 - [2. Serialization](#2-serialization)
 - [3. Domain types](#3-domain-types)
 - [4. Connection lifecycle](#4-connection-lifecycle)
+  - [4.1 Liveness: `Heartbeat`](#41-liveness-heartbeat)
 - [5. Authentication](#5-authentication)
   - [5.1 `AuthKind::None`](#51-authkindnone)
   - [5.2 `AuthKind::Password`](#52-authkindpassword)
@@ -152,6 +153,7 @@ the handshake (§1.3).
 | `LeaveChannel` | Leaves one channel (§6.2) |
 | `RotateKey` | Offers a peer fresh key material (§7.5, §11, §13.10) |
 | `RequestPeerLink` | Asks the server to pass candidates to a peer (§7.1) |
+| `Heartbeat` | Proves the connection is still alive (§4.1) |
 
 | Server → client | Purpose |
 |---|---|
@@ -550,7 +552,42 @@ one-shot decision, unlike the stream of chunks that follows it).
   `UserOffline { user_id }` (§6.4) - **not** `UserLeft`, which is reserved
   for an explicit single-channel `LeaveChannel` while the sender stays
   connected elsewhere - then forgets the client's `UserId`/nickname/public
-  key entirely.
+  key entirely. A connection that never closes cleanly at all - see §4.1 -
+  is torn down the same way, via the same cleanup.
+
+### 4.1 Liveness: `Heartbeat`
+
+A closed TCP connection is not the only way a client goes away. A machine
+that loses power, a laptop that sleeps mid-session, a network that drops
+without sending a FIN, or a client that stops driving its socket without
+actually closing it, all leave the connection sitting open from the
+server's point of view - nothing to read, but nothing telling it the
+client is gone either. Left alone, that means the disconnect in §4 never
+fires: the nickname stays held (§5.4) and peers never see `UserOffline`,
+for as long as the half-dead TCP connection happens to survive.
+
+`Heartbeat` closes that gap:
+
+```
+Heartbeat
+```
+
+- The client sends one every `HEARTBEAT_INTERVAL` (10s) for as long as the
+  connection is open, unconditionally - not only when otherwise idle.
+  Actual message content never touches the server at all (§7.1, §10), so a
+  session that is busily chatting is, from the server's perspective,
+  exactly as silent as one that has gone completely quiet; without this,
+  neither could be told apart from a dead connection.
+- The server does not reply. Receiving *any* message on a connection -
+  `Heartbeat` or otherwise - resets that connection's liveness clock.
+- If `HEARTBEAT_TIMEOUT` (30s - three missed heartbeats, tolerating a
+  couple of lost beats to ordinary network jitter) passes with nothing at
+  all received, the server treats the connection exactly as if it had
+  closed: same cleanup, same `UserOffline` broadcast (§6.4), same freeing
+  of the nickname (§5.4).
+- This is a server-side timeout only. The client neither expects nor waits
+  for an acknowledgement, and a `Heartbeat` arriving from a client the
+  server has no other reason to distrust is never itself an error.
 
 
 ## 5. Authentication
@@ -632,7 +669,8 @@ On a name collision, it responds
 reason names the taken nickname) and closes the connection immediately
 after - the client must reconnect (a new TCP connection, restarting from
 `Hello`) with a different `display_name` to retry. A nickname becomes
-available again as soon as its holder's connection closes (see §4).
+available again as soon as its holder's connection closes - cleanly (§4)
+or because the server's heartbeat check decided it was dead (§4.1).
 
 
 ## 6. Channels
