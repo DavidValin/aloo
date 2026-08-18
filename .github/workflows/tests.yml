@@ -24,6 +24,20 @@ jobs:
       - name: Install ALSA dev headers
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
 
+      # The OTP layer never reimplements one-time-pad crypto in aloo itself -
+      # it only shells out to the real `otp` CLI (see docs/SECURITY.md and
+      # src/client/otp_cli.rs). test/otp_cli_test.rs, test/otp_provisioning_test.rs
+      # and the `otp` Gherkin steps all need the actual binary on PATH, so
+      # build it from source here rather than skipping/mocking those tests.
+      # `make build` also runs otp-toolkit's own test suite as a sanity check
+      # on the freshly built binary before aloo's tests rely on it.
+      - name: Build and install otp-toolkit (required for OTP integration tests)
+        run: |
+          git clone --depth 1 https://github.com/DavidValin/otp-toolkit.git /tmp/otp-toolkit
+          make -C /tmp/otp-toolkit build
+          sudo make -C /tmp/otp-toolkit install
+          otp -h >/dev/null
+
       - uses: Swatinem/rust-cache@v2
 
       # The traceability gate is pure source analysis and takes well under a

@@ -37,6 +37,24 @@ fn config_at(dir: PathBuf) -> OtpCliConfig {
     }
 }
 
+/// Only the tests below that actually spawn the `otp` subprocess need this -
+/// see the matching helper (and rationale) in test/otp_cli_test.rs. The pure
+/// crypto/wire-encoding tests in this file don't touch the binary at all.
+fn require_otp() -> bool {
+    let probe = OtpCliConfig {
+        binary_path: PathBuf::from("otp"),
+        working_dir: std::env::temp_dir(),
+    };
+    if otp_cli::binary_available(&probe) {
+        return true;
+    }
+    eprintln!(
+        "skipping: 'otp' binary not found on PATH (or ALOO_OTP_BIN) - install otp-toolkit to \
+         run this test locally: https://github.com/DavidValin/otp-toolkit"
+    );
+    false
+}
+
 /// @requirement AC-136
 #[test]
 fn contact_name_is_order_independent() {
@@ -96,6 +114,9 @@ fn setup_payload_round_trips_through_the_wire_encoding() {
 /// @requirement AC-138
 #[tokio::test]
 async fn initiate_provisioning_and_apply_incoming_setup_leave_both_sides_usable() {
+    if !require_otp() {
+        return;
+    }
     let own_fp = fp(0x10);
     let peer_fp = fp(0x20);
     let alice_cfg = config_at(temp_dir("handshake-alice"));
@@ -119,6 +140,9 @@ async fn initiate_provisioning_and_apply_incoming_setup_leave_both_sides_usable(
 /// @requirement AC-138
 #[tokio::test]
 async fn detect_or_adopt_existing_finds_a_contact_provisioned_out_of_band() {
+    if !require_otp() {
+        return;
+    }
     let cfg = config_at(temp_dir("adopt"));
     let contact_name = "already-there";
 
@@ -159,6 +183,9 @@ async fn detect_or_adopt_existing_finds_a_contact_provisioned_out_of_band() {
 /// @requirement AC-142
 #[tokio::test]
 async fn asymmetric_provisioning_is_a_dead_end_without_recovery() {
+    if !require_otp() {
+        return;
+    }
     let own_fp = fp(0x30);
     let peer_fp = fp(0x40);
     let alice_cfg = config_at(temp_dir("asym-dead-end-alice"));
@@ -196,6 +223,9 @@ async fn asymmetric_provisioning_is_a_dead_end_without_recovery() {
 /// @requirement AC-142
 #[tokio::test]
 async fn asymmetric_provisioning_recovers_once_the_stale_contact_is_removed() {
+    if !require_otp() {
+        return;
+    }
     let own_fp = fp(0x50);
     let peer_fp = fp(0x60);
     let alice_cfg = config_at(temp_dir("asym-recover-alice"));
