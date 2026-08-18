@@ -72,6 +72,7 @@ impl UiState {
             to_name: None,
             body,
             outgoing: false,
+            failed: false,
         };
         // Same hold-and-reveal treatment as a channel message
         // (docs/PROTOCOL.md §12) - decrypts fine (our own key), but not
@@ -123,6 +124,7 @@ impl UiState {
                     to_name: None,
                     body: MessageBody::Voice { duration_ms, pcm },
                     outgoing: true,
+                    failed: false,
                 },
             );
         }
@@ -143,6 +145,7 @@ impl UiState {
                     to_name: None,
                     body: MessageBody::VoiceStreaming { stream_id },
                     outgoing: true,
+                    failed: false,
                 },
             );
         }
@@ -161,6 +164,7 @@ impl UiState {
             to_name: None,
             body: MessageBody::VoiceStreaming { stream_id },
             outgoing: false,
+            failed: false,
         };
         if self.is_trust_gated(peer_id) {
             self.hold_message(peer_id, None, entry);
@@ -214,25 +218,94 @@ impl UiState {
         }
     }
 
+    /// Logs an app-generated line (`MessageBody::System`) into `peer`'s DM
+    /// room - currently only the OTP layer's own errors/confirmations
+    /// (`client::otp::notify`), mirroring the same text already shown in
+    /// the top-right status notice so it survives in the conversation's own
+    /// history after that notice clears. Creates the room if it doesn't
+    /// exist yet (a peer can otherwise-silently propose or fail an OTP
+    /// session before the user has ever opened a DM with them), same as
+    /// `on_direct_message`.
+    pub fn push_otp_system_message(&mut self, peer: UserId, peer_name: &str, text: String) {
+        let unread = self.active_private_room != Some(peer);
+        let is_current = self.is_viewing_dm(peer);
+        let fallback_peer = self
+            .known_users
+            .get(&peer)
+            .cloned()
+            .unwrap_or_else(|| UserInfo {
+                id: peer,
+                name: peer_name.to_string(),
+                public_key_der: Vec::new(),
+                key_mode: KeyMode::None,
+            });
+        let room = self
+            .private_rooms
+            .entry(peer)
+            .or_insert_with(|| PrivateRoom {
+                peer: fallback_peer,
+                log: Vec::new(),
+                unread: false,
+            });
+        push_log_entry(
+            &mut room.log,
+            &mut self.message_selected,
+            is_current,
+            LogEntry {
+                from: peer,
+                from_name: peer_name.to_string(),
+                to_name: None,
+                body: MessageBody::System(text),
+                outgoing: false,
+                failed: false,
+            },
+        );
+        if unread {
+            room.unread = true;
+        }
+    }
+
     /// `push_outgoing_channel`'s DM counterpart - see there for why this
     /// takes a `MessageBody` rather than just `String` text.
-    pub(crate) fn push_outgoing_dm(&mut self, to: UserId, body: MessageBody) {
+    /// Returns the index this entry landed at in `to`'s room log - the
+    /// room's log is append-only (nothing ever inserts/removes into the
+    /// middle of it), so that index stays a valid, stable way to find this
+    /// exact row again later, e.g. to mark it failed
+    /// (`mark_dm_message_failed`) once an async send outcome comes back.
+    /// `None` only if the room doesn't exist yet, which shouldn't happen
+    /// for a room the compose bar was just used in.
+    pub fn push_outgoing_dm(&mut self, to: UserId, body: MessageBody) -> Option<usize> {
         let from = self.own_id.unwrap_or(UserId(0));
         let from_name = self.own_name.clone();
         let is_current = self.is_viewing_dm(to);
-        if let Some(room) = self.private_rooms.get_mut(&to) {
-            push_log_entry(
-                &mut room.log,
-                &mut self.message_selected,
-                is_current,
-                LogEntry {
-                    from,
-                    from_name,
-                    to_name: None,
-                    body,
-                    outgoing: true,
-                },
-            );
+        let room = self.private_rooms.get_mut(&to)?;
+        let index = room.log.len();
+        push_log_entry(
+            &mut room.log,
+            &mut self.message_selected,
+            is_current,
+            LogEntry {
+                from,
+                from_name,
+                to_name: None,
+                body,
+                outgoing: true,
+                failed: false,
+            },
+        );
+        Some(index)
+    }
+
+    /// Marks the log row at `log_index` in `peer`'s room failed (rendered
+    /// in red - `render_messages`) - the async-send-failed counterpart of
+    /// `push_outgoing_dm`'s optimistic log write. A no-op if the room or
+    /// that row no longer exists (defensive only; the log is append-only,
+    /// so in practice both always still exist).
+    pub fn mark_dm_message_failed(&mut self, peer: UserId, log_index: usize) {
+        if let Some(room) = self.private_rooms.get_mut(&peer)
+            && let Some(entry) = room.log.get_mut(log_index)
+        {
+            entry.failed = true;
         }
     }
 
@@ -265,6 +338,7 @@ impl UiState {
                         status: FileTransferStatus::Pending,
                     },
                     outgoing: true,
+                    failed: false,
                 },
             );
         }
@@ -314,6 +388,7 @@ impl UiState {
                     status: FileTransferStatus::InProgress { bytes: 0 },
                 },
                 outgoing: false,
+                failed: false,
             },
         );
         if unread {

@@ -253,6 +253,32 @@ pub struct Envelope {
 pub enum Content {
     Text,
     FileOffer,
+    /// Carries a bincode-encoded `crypto::otp::OtpKeySetupPayload`: one side
+    /// of the OTP-layer provisioning handshake, sent over an ordinary
+    /// `pq_hybrid` envelope (`client::otp::initiate_provisioning`). Trailing
+    /// and matched only via `!=` elsewhere in this codebase, so this is
+    /// non-breaking - an old peer that doesn't recognise it simply never
+    /// completes provisioning.
+    OtpKeySetup,
+    /// Carries a bincode-encoded `crypto::otp::OtpSessionRequestPayload`:
+    /// the "already have a key" branch of the `/otp` command - proposes
+    /// starting a session on an existing keychain contact, no key material
+    /// attached. Still requires an explicit accept, answered the same way
+    /// as `OtpKeySetup` is - via `OtpKeySetupAck`.
+    OtpSessionRequest,
+    /// Carries a bincode-encoded `crypto::otp::OtpKeySetupAckPayload`, the
+    /// reply to `OtpKeySetup` or `OtpSessionRequest`
+    /// (`client::otp::accept_invite`/`reject_invite`).
+    OtpKeySetupAck,
+    /// `FileOffer`'s voice counterpart, only ever sent when OTP is active
+    /// for the recipient (a non-OTP contact keeps live-streamed voice,
+    /// which has no offer/accept step at all). Its decrypted plaintext is
+    /// a bincode-encoded `client::otp::VoiceOfferPayload` - kept out of
+    /// this cleartext tag, same reasoning as `FileOffer`'s size/filename,
+    /// so an OTP voice message's duration isn't wire-visible either.
+    /// Always auto-accepted on arrival (`client::otp::on_voice_offer`) -
+    /// unlike a file offer, there's no reject path.
+    VoiceOffer,
 }
 
 /// Messages the client sends to the server - pure signaling: auth,

@@ -182,6 +182,40 @@ pub enum P2pEvent {
         peer: UserId,
         reason: String,
     },
+    /// OTP-wrapped counterpart of `Message` - mirrors
+    /// `p2p_proto::P2pPayload::OtpEnvelope`. `envelope`'s `blocks[0]` is
+    /// still OTP-wrapped at this point; `client::otp::unwrap_incoming` runs
+    /// before this can be handed to `session::decrypt_envelope_for`.
+    OtpMessage {
+        channel: Option<String>,
+        from: UserId,
+        seq: u64,
+        envelope: crate::proto::Envelope,
+    },
+    /// OTP-wrapped counterpart of `FileOffer`.
+    OtpFileOffer {
+        channel: Option<String>,
+        from: UserId,
+        stream_id: u64,
+        seq: u64,
+        envelope: crate::proto::Envelope,
+    },
+    /// A peer has confirmed successful local decode of the OTP message we
+    /// sent as sequence `seq` - the genuine network acknowledgement
+    /// `client::otp`'s send-path gating waits for before honestly passing
+    /// `-y` to `otp`'s next `--encrypt` for that contact.
+    OtpDeliveryAck {
+        from: UserId,
+        seq: u64,
+    },
+    /// OTP-wrapped counterpart of a voice offer - mirrors `OtpFileOffer`,
+    /// DM-only (unlike `FileOffer`, never carries a `channel`).
+    OtpVoiceOffer {
+        from: UserId,
+        stream_id: u64,
+        seq: u64,
+        envelope: crate::proto::Envelope,
+    },
 }
 
 /// Outgoing traffic originating on a background thread (the voice
@@ -927,6 +961,39 @@ impl PeerLinkManager {
                 blocks,
             },
             P2pPayload::FileEnd { stream_id } => P2pEvent::FileEnd { from, stream_id },
+            P2pPayload::OtpEnvelope {
+                channel,
+                seq,
+                envelope,
+            } => P2pEvent::OtpMessage {
+                channel,
+                from,
+                seq,
+                envelope,
+            },
+            P2pPayload::OtpFileOffer {
+                channel,
+                stream_id,
+                seq,
+                envelope,
+            } => P2pEvent::OtpFileOffer {
+                channel,
+                from,
+                stream_id,
+                seq,
+                envelope,
+            },
+            P2pPayload::OtpDeliveryAck { seq } => P2pEvent::OtpDeliveryAck { from, seq },
+            P2pPayload::OtpVoiceOffer {
+                stream_id,
+                seq,
+                envelope,
+            } => P2pEvent::OtpVoiceOffer {
+                from,
+                stream_id,
+                seq,
+                envelope,
+            },
         };
         let _ = self.events_tx.send(event);
     }

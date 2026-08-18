@@ -33,6 +33,16 @@ pub(crate) enum OwnStreamTarget {
         recipients: Vec<UserId>,
     },
     Direct(UserId),
+    /// A recording made under an active OTP session
+    /// (`client::otp::send_voice_offer`'s doc) - `spawn_record_accumulate_worker`
+    /// reports through this instead of `Direct` so `own_stream_done_rx`'s
+    /// handler sends it OTP-wrapped, once fully recorded, instead of
+    /// treating it as an already-live-streamed clip.
+    DirectOtp {
+        to: UserId,
+        contact_name: String,
+        recipient_pubkey_der: Vec<u8>,
+    },
 }
 
 /// The once-per-stream `PqHybrid` setup: each PQ recipient's own sealed
@@ -324,6 +334,51 @@ pub(crate) fn spawn_record_stream_worker(
                     duration_ms,
                     recipients,
                 });
+                let _ = done_tx.send((stream_id, duration_ms, plaintext_accum));
+                break; // `recorder` drops here, closing the input stream.
+            }
+        }
+    });
+}
+
+/// OTP counterpart of `spawn_record_stream_worker`: no live network sends,
+/// no per-recipient key material - it purely accumulates the recording
+/// (same `CHUNK_INTERVAL` polling and `MAX_RECORDING_SAMPLES` cap) and
+/// reports the finished PCM once stopped, via the exact same `done_tx`
+/// shape `spawn_record_stream_worker` uses. Voice under OTP isn't
+/// live-streamed at all (`client::otp::send_voice_offer`'s doc): it's
+/// recorded fully, encrypted whole, and only sent once recording stops.
+pub(crate) fn spawn_record_accumulate_worker(
+    recorder: voice::Recorder,
+    stream_id: u64,
+    done_tx: tokio::sync::mpsc::UnboundedSender<(u64, u32, Vec<u8>)>,
+    stop_rx: std::sync::mpsc::Receiver<()>,
+    auto_stop_tx: tokio::sync::mpsc::UnboundedSender<()>,
+) {
+    std::thread::spawn(move || {
+        let mut total_samples: u64 = 0;
+        let mut plaintext_accum: Vec<u8> = Vec::new();
+
+        loop {
+            let mut stopped = match stop_rx.recv_timeout(voice::CHUNK_INTERVAL) {
+                Ok(()) => true,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => false,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => true,
+            };
+
+            let pending = recorder.take_pending();
+            if !pending.is_empty() {
+                total_samples += pending.len() as u64;
+                plaintext_accum.extend_from_slice(&voice::pcm_to_bytes(&pending));
+            }
+
+            if !stopped && voice::recording_at_max(total_samples) {
+                stopped = true;
+                let _ = auto_stop_tx.send(());
+            }
+
+            if stopped {
+                let duration_ms = ((total_samples * 1000) / voice::SAMPLE_RATE_HZ as u64) as u32;
                 let _ = done_tx.send((stream_id, duration_ms, plaintext_accum));
                 break; // `recorder` drops here, closing the input stream.
             }
@@ -678,6 +733,20 @@ pub(crate) fn forward_key_setup(
     if let Some(s) = session.active_streams.get_mut(&(from, stream_id)) {
         s.last_seen = Instant::now();
         let _ = s.job_tx.send(DecryptJob::KeySetup(setup));
+        return;
+    }
+    // `StreamKeySetup` is shared wire framing for any pq_hybrid stream, not
+    // just voice (`p2p_proto::P2pPayload::StreamKeySetup`'s doc) - a file
+    // transfer's own `ChunkDecryptor` needs it applied exactly the same
+    // way, or its `pq_k_data` never gets set and every chunk sits in
+    // `ChunkDecryptor::pending` forever, silently, since nothing ever
+    // replays it. `next_stream_id` is one shared per-connection counter
+    // (never per-kind), so a given `(from, stream_id)` can only ever be a
+    // live entry in one of these two maps at a time - checking the second
+    // only when the first misses is unambiguous, not a fallback guess.
+    if let Some(t) = session.active_file_transfers.get_mut(&(from, stream_id)) {
+        t.last_seen = Instant::now();
+        let _ = t.job_tx.send(DecryptJob::KeySetup(setup));
     }
 }
 

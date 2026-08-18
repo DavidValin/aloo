@@ -86,6 +86,22 @@ filesystem permissions.
 service, and no rate limiting exists beyond the channel-password
 brute-force ban (§6.6).
 
+**The one-time-pad layer (§16) is only as good as its own keychain, and
+carries no integrity of its own.** All pad generation, storage and
+consumption is delegated entirely to the external `otp` command
+(github.com/DavidValin/otp-toolkit) - this codebase contains no independent review
+of that tool, and trusts its keychain and crash-recovery behaviour as-is.
+A one-time pad provides secrecy, not authenticity: a flipped ciphertext
+bit flips the same plaintext bit undetectably at that layer, which is why
+this app still runs the message through the signed, authenticated
+`pq_hybrid` seal underneath it rather than relying on the pad alone.
+Turning the layer on for a contact (`otp --add-contact`, whether via this
+app's handshake or done by the user directly) is itself trust-on-first-use
+with no independent verification that the pad material received really
+came from, and only from, the intended peer - the same limit §12
+describes for a first contact, applied a second time to this layer's own
+setup message.
+
 ## Assurance: how much of this is checked
 
 **Machine-checked.** Every requirement in `requirements/requirements.toml`

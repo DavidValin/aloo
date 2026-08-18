@@ -62,6 +62,16 @@ pub(crate) struct SessionState {
     /// our stream), `active_file_transfers` by `(from, stream_id)`.
     pub(crate) own_file_targets: HashMap<u64, file_transfer::OwnFileTarget>,
     pub(crate) active_file_transfers: HashMap<(UserId, u64), file_transfer::ActiveFileTransfer>,
+    /// One entry per currently-arriving OTP-protected transfer - see
+    /// `file_transfer::OtpIncomingFileReceive`'s doc. Removed once
+    /// `ReceiveDone`/`ReceiveFailed` finishes handling it.
+    pub(crate) otp_incoming_file_receives: HashMap<(UserId, u64), file_transfer::OtpIncomingFileReceive>,
+    /// The temp ciphertext path a sending OTP transfer is actually
+    /// streaming from (`P2pEvent::FileAccepted`'s OTP branch), kept only
+    /// long enough to delete it once the send finishes or fails
+    /// (`FileEvent::SendDone`/`SendFailed`) - the *real* file the user
+    /// picked is never touched or deleted.
+    pub(crate) otp_send_temp_files: HashMap<u64, std::path::PathBuf>,
     /// Where a file-transfer worker thread (`file_transfer::spawn_send_file_worker`/
     /// `spawn_receive_file_worker`) reports progress/completion/failure,
     /// polled by `run_connected_session`'s select loop (`handle_file_event`).
@@ -137,6 +147,25 @@ pub(crate) struct SessionState {
     /// only auth/identify/channel-membership/presence and the initial
     /// candidate exchange this relies on.
     pub(crate) peer_link: PeerLinkManager,
+    /// Where every `otp` CLI subprocess call this session makes is spawned
+    /// from - one stable working directory, resolved once at connect time
+    /// (`client::otp_cli::OtpCliConfig::resolve`).
+    pub(crate) otp_cli_cfg: crate::client::otp_cli::OtpCliConfig,
+    /// Per-contact OTP provisioning/ack-gate state, loaded from
+    /// `~/.aloo/otp_store` alongside `id_store` and saved synchronously
+    /// after every mutation - see `client::otp_store`'s module doc for why.
+    pub(crate) otp_store: crate::client::otp_store::OtpStore,
+    /// Outgoing OTP messages held back while their contact's previous
+    /// message is still awaiting a network ack - in-memory only, unlike
+    /// `otp_store` (`client::otp::OtpOutQueue`'s doc).
+    pub(crate) otp_out_queue: crate::client::otp::OtpOutQueue,
+    /// One entry per sender currently mid-way through sending us a fresh
+    /// OTP pad, accumulated chunk by chunk
+    /// (`crypto::otp::OtpKeySetupReassembly`'s doc). In-memory only, per
+    /// connection: if the sender reconnects mid-transfer the whole
+    /// handshake attempt has to restart anyway, same as any other
+    /// in-flight state tied to a `UserId`.
+    pub(crate) otp_incoming_setup: HashMap<UserId, crate::crypto::otp::OtpKeySetupReassembly>,
 }
 
 // `key_mode` pushed this past clippy's default 7-argument threshold;
@@ -246,6 +275,8 @@ pub(crate) async fn run_connected_session(
         active_streams: HashMap::new(),
         own_file_targets: HashMap::new(),
         active_file_transfers: HashMap::new(),
+        otp_incoming_file_receives: HashMap::new(),
+        otp_send_temp_files: HashMap::new(),
         file_events_tx,
         record_out_tx,
         own_stream_done_tx,
@@ -266,6 +297,17 @@ pub(crate) async fn run_connected_session(
         auto_stop_tx,
         active_replay_id: None,
         peer_link,
+        otp_cli_cfg: crate::client::otp_cli::OtpCliConfig::resolve(),
+        otp_store: crate::client::otp_store::OtpStore::load(
+            &crate::client::otp_store::OtpStore::default_path(),
+        )
+        .unwrap_or_else(|_| {
+            crate::client::otp_store::OtpStore::new_empty(
+                crate::client::otp_store::OtpStore::default_path(),
+            )
+        }),
+        otp_out_queue: crate::client::otp::OtpOutQueue::new(),
+        otp_incoming_setup: HashMap::new(),
     };
 
     let mut ui_state = UiState::new(display_name);
@@ -328,6 +370,18 @@ pub(crate) async fn run_connected_session(
                         voice_stream::OwnStreamTarget::Direct(to) => {
                             crate::client::direct_message::on_own_stream_finished(&mut ui_state, &mut session, you, to, stream_id, duration_ms, pcm);
                         }
+                        voice_stream::OwnStreamTarget::DirectOtp { to, contact_name, recipient_pubkey_der } => {
+                            // Finalized locally the same way a live stream's
+                            // own row is (we already hold the full plaintext
+                            // regardless of how the send itself turns out,
+                            // same as an optimistically-logged text send) -
+                            // `send_voice_offer` handles the actual OTP
+                            // encrypt-and-send, notifying on failure.
+                            ui_state.on_direct_stream_finished(to, you, stream_id, duration_ms, pcm.clone());
+                            crate::client::otp::send_voice_offer(
+                                &mut wr, &mut session, &mut ui_state, to, &contact_name, &recipient_pubkey_der, pcm, duration_ms,
+                            ).await?;
+                        }
                     }
                 }
             }
@@ -354,7 +408,7 @@ pub(crate) async fn run_connected_session(
             }
             event = file_events_rx.recv() => {
                 let Some(event) = event else { break };
-                handle_file_event(&mut ui_state, &mut session, event);
+                handle_file_event(&mut ui_state, &mut session, event).await;
             }
             stopped = auto_stop_rx.recv() => {
                 let Some(()) = stopped else { break };
@@ -462,21 +516,24 @@ async fn handle_ui_action(
             plaintext,
             recipients,
         } => {
-            crate::client::channel::handle_send_text(wr, session, channel, plaintext, recipients).await?;
+            crate::client::channel::handle_send_text(wr, ui_state, session, channel, plaintext, recipients).await?;
         }
         UiAction::SendDirectText {
             to,
             plaintext,
             recipient_key_mode,
             recipient_pubkey_der,
+            log_index,
         } => {
             crate::client::direct_message::handle_send_text(
                 wr,
+                ui_state,
                 session,
                 to,
                 plaintext,
                 recipient_key_mode,
                 recipient_pubkey_der,
+                log_index,
             )
             .await?;
         }
@@ -617,6 +674,26 @@ async fn handle_ui_action(
                 .peer_link
                 .send_reliable_or_queue(from, P2pPayload::FileReject { stream_id });
         }
+        UiAction::RequestOtpSession {
+            peer,
+            key_mode,
+            pubkey_der,
+        } => {
+            crate::client::otp::handle_otp_command(wr, ui_state, session, peer, key_mode, pubkey_der)
+                .await?;
+        }
+        UiAction::ConfirmOtpGenerate { size_mb } => {
+            crate::client::otp::confirm_generate(wr, session, ui_state, size_mb).await?;
+        }
+        UiAction::CancelOtpGenerate => {
+            crate::client::otp::cancel_generate(ui_state);
+        }
+        UiAction::AcceptOtpInvite => {
+            crate::client::otp::accept_invite(wr, session, ui_state).await?;
+        }
+        UiAction::RejectOtpInvite => {
+            crate::client::otp::reject_invite(wr, session, ui_state).await?;
+        }
     }
     Ok(())
 }
@@ -644,10 +721,33 @@ async fn accept_file_offer(
     let dest_name = crate::client::file_transfer::safe_filename(&crate::client::file_transfer::truncate_filename(
         &offer.filename,
     ));
-    let dest_path = crate::client::file_transfer::default_download_dir().join(dest_name);
+    let final_path = crate::client::file_transfer::default_download_dir().join(dest_name);
+    // An OTP-active offer's chunks are ordinary pq_hybrid ciphertext, same
+    // as any other transfer (see `client::otp::send_file_offer`'s doc) -
+    // only the destination differs: a temp file, decrypted whole into
+    // `final_path` once `handle_file_event`'s `ReceiveDone` runs
+    // `client::otp::finish_incoming_file`.
+    let worker_dest = match (&offer.otp_contact_name, offer.otp_seq) {
+        (Some(contact_name), Some(seq)) => {
+            let temp_path = crate::client::otp::temp_content_path(&session.otp_cli_cfg, "otp-recv");
+            session.otp_incoming_file_receives.insert(
+                (from, stream_id),
+                file_transfer::OtpIncomingFileReceive {
+                    contact_name: contact_name.clone(),
+                    seq,
+                    temp_path: temp_path.clone(),
+                    kind: file_transfer::OtpIncomingKind::File {
+                        final_path: final_path.clone(),
+                    },
+                },
+            );
+            temp_path
+        }
+        _ => final_path,
+    };
     let job_tx = file_transfer::spawn_receive_file_worker(
         key,
-        dest_path,
+        worker_dest,
         from,
         stream_id,
         session.file_events_tx.clone(),
@@ -862,7 +962,8 @@ async fn handle_p2p_event(
             envelope,
         } => {
             let from_name = name_of(ui_state, from);
-            crate::client::direct_message::on_message(ui_state, session, from, from_name, envelope);
+            crate::client::direct_message::on_message(ui_state, session, from, from_name, envelope)
+                .await;
         }
         P2pEvent::StreamStart {
             channel: Some(channel),
@@ -923,18 +1024,27 @@ async fn handle_p2p_event(
                             .send_reliable_or_queue(id, P2pPayload::StreamKeySetup { stream_id, setup });
                     }
                 }
-                file_transfer::spawn_send_file_worker(
-                    target.path,
-                    target.key,
-                    target.to,
-                    stream_id,
-                    session.record_out_tx.clone(),
-                    session.file_events_tx.clone(),
-                );
+                let file_transfer::OwnFileTarget { to, path, key, otp: otp_slot } = target;
+                if let Some(send_path) =
+                    crate::client::otp::prepare_outgoing_file_content(wr, session, ui_state, stream_id, to, &path, otp_slot).await?
+                {
+                    file_transfer::spawn_send_file_worker(
+                        send_path,
+                        key,
+                        to,
+                        stream_id,
+                        session.record_out_tx.clone(),
+                        session.file_events_tx.clone(),
+                    );
+                }
             }
         }
         P2pEvent::FileRejected { stream_id } => {
-            session.own_file_targets.remove(&stream_id);
+            if let Some(target) = session.own_file_targets.remove(&stream_id) {
+                if let Some((contact_name, _seq)) = target.otp {
+                    crate::client::otp::release_pending_and_drain(wr, ui_state, session, target.to, &contact_name).await?;
+                }
+            }
             let me = ui_state.own_id.unwrap_or(UserId(0));
             ui_state.set_file_rejected(me, stream_id);
         }
@@ -979,6 +1089,50 @@ async fn handle_p2p_event(
         }
         P2pEvent::LinkStatusChanged { peer, status } => {
             ui_state.set_link_status(peer, status);
+            if status == p2p::LinkStatus::Active {
+                // A send whose ciphertext already left the machine is
+                // recovered via `otp --recover-last`, never re-encoded -
+                // this is the one place that retry gets triggered, on every
+                // genuine reachability transition (reconnect, link flap,
+                // this app's own restart once the link comes back up).
+                // Scans every OTP contact with something outstanding, not
+                // just `peer` - cheap (a handful of contacts at most) and
+                // opportunistically recovers anyone else reachable too.
+                crate::client::otp::recover_and_resend(wr, session, ui_state).await?;
+            }
+        }
+        P2pEvent::OtpMessage {
+            channel,
+            from,
+            seq,
+            envelope,
+        } => {
+            let from_name = name_of(ui_state, from);
+            crate::client::otp::on_message(session, ui_state, channel, from, from_name, seq, envelope)
+                .await;
+        }
+        P2pEvent::OtpFileOffer {
+            channel,
+            from,
+            stream_id,
+            seq,
+            envelope,
+        } => {
+            let from_name = name_of(ui_state, from);
+            crate::client::otp::on_file_offer(
+                session, ui_state, channel, from, from_name, stream_id, seq, envelope,
+            );
+        }
+        P2pEvent::OtpDeliveryAck { from, seq } => {
+            crate::client::otp::on_delivery_ack(wr, ui_state, session, from, seq).await?;
+        }
+        P2pEvent::OtpVoiceOffer {
+            from,
+            stream_id,
+            seq,
+            envelope,
+        } => {
+            crate::client::otp::on_voice_offer(wr, session, ui_state, from, stream_id, seq, envelope).await;
         }
     }
     Ok(())
@@ -1219,7 +1373,7 @@ pub(crate) fn decrypt_envelope_for(
 /// same RSA/PQ dispatch, different output shape (there's no `MessageBody`
 /// for an unresolved offer, only for the row an `Accept` eventually
 /// creates - see `handle_incoming_file_offer`).
-fn decrypt_file_offer(
+pub(crate) fn decrypt_file_offer(
     envelope: &Envelope,
     from: UserId,
     sender: &UserInfo,
@@ -1233,6 +1387,22 @@ fn decrypt_file_offer(
     proto::decode(&plaintext).ok()
 }
 
+/// `decrypt_file_offer`'s voice counterpart, for `Content::VoiceOffer` -
+/// always a DM (voice-under-OTP has no channel path), so no `channel`
+/// parameter.
+pub(crate) fn decrypt_voice_offer(
+    envelope: &Envelope,
+    from: UserId,
+    sender: &UserInfo,
+    session: &mut SessionState,
+) -> Option<crate::client::file_transfer::VoiceOfferPayload> {
+    if envelope.content != Content::VoiceOffer {
+        return None;
+    }
+    let plaintext = decrypt_own_envelope(envelope, from, sender, None, session)?;
+    proto::decode(&plaintext).ok()
+}
+
 /// The RSA/PQ dispatch shared by `decrypt_envelope_for` and
 /// `decrypt_file_offer` - decrypts `envelope.blocks` addressed to us,
 /// regardless of `envelope.content` (callers check that themselves first).
@@ -1242,7 +1412,7 @@ fn decrypt_file_offer(
 /// belong (`channel`), and that it isn't a replay of one already accepted
 /// from this peer. Any of those failing is an ordinary decrypt failure -
 /// the message is dropped, exactly like a bad AEAD tag.
-fn decrypt_own_envelope(
+pub(crate) fn decrypt_own_envelope(
     envelope: &Envelope,
     from: UserId,
     sender: &UserInfo,
@@ -1299,6 +1469,8 @@ fn handle_incoming_file_offer(
         size: payload.size,
         stream_id,
         channel,
+        otp_contact_name: None,
+        otp_seq: None,
     };
     if ui_state.is_trust_gated(from) {
         ui_state.hold_file_offer(offer);
@@ -1313,7 +1485,7 @@ fn handle_incoming_file_offer(
 /// (`file_transfer::FileEvent`) into the matching log row - see
 /// `UiState::update_file_entry` for how a row is found from just
 /// `(from, stream_id)`.
-fn handle_file_event(
+async fn handle_file_event(
     ui_state: &mut UiState,
     session: &mut SessionState,
     event: file_transfer::FileEvent,
@@ -1324,9 +1496,17 @@ fn handle_file_event(
             ui_state.set_file_progress(me, stream_id, bytes)
         }
         file_transfer::FileEvent::SendDone { stream_id } => {
+            if let Some(temp) = session.otp_send_temp_files.remove(&stream_id) {
+                crate::client::otp::secure_remove_file(&temp);
+            }
             ui_state.set_file_completed(me, stream_id)
         }
-        file_transfer::FileEvent::SendFailed { stream_id } => ui_state.set_file_failed(me, stream_id),
+        file_transfer::FileEvent::SendFailed { stream_id } => {
+            if let Some(temp) = session.otp_send_temp_files.remove(&stream_id) {
+                crate::client::otp::secure_remove_file(&temp);
+            }
+            ui_state.set_file_failed(me, stream_id)
+        }
         file_transfer::FileEvent::ReceiveProgress {
             from,
             stream_id,
@@ -1336,10 +1516,18 @@ fn handle_file_event(
             from, stream_id, ..
         } => {
             session.active_file_transfers.remove(&(from, stream_id));
-            ui_state.set_file_completed(from, stream_id);
+            match session.otp_incoming_file_receives.remove(&(from, stream_id)) {
+                Some(pending) => {
+                    crate::client::otp::finish_incoming_file(session, ui_state, from, stream_id, pending).await;
+                }
+                None => ui_state.set_file_completed(from, stream_id),
+            }
         }
         file_transfer::FileEvent::ReceiveFailed { from, stream_id } => {
             session.active_file_transfers.remove(&(from, stream_id));
+            if let Some(pending) = session.otp_incoming_file_receives.remove(&(from, stream_id)) {
+                crate::client::otp::secure_remove_file(&pending.temp_path);
+            }
             ui_state.set_file_failed(from, stream_id);
         }
     }

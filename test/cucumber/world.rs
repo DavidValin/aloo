@@ -196,6 +196,35 @@ pub struct AlooWorld {
     pub id_store: Option<IdStore>,
     pub id_check: Option<aloo::client::idstore::IdCheck>,
     pub temp_files: Vec<std::path::PathBuf>,
+
+    // -- one-time-pad layer (US-033) -------------------------------------
+    /// Each side's own `otp` CLI working directory, keyed by handle
+    /// ("alice"/"bob"/...).
+    pub otp_cfgs: HashMap<String, aloo::client::otp_cli::OtpCliConfig>,
+    /// The contact name both sides converged on for the most recently
+    /// provisioned pair.
+    pub otp_contact_name: Option<String>,
+    /// The sending side's own ack-gate bookkeeping for that contact.
+    pub otp_store: Option<aloo::client::otp_store::OtpStore>,
+    /// Texts that were actually wrapped and handed to the transport, in
+    /// the order they went out.
+    pub otp_sent: Vec<String>,
+    /// Texts currently held back behind an unacknowledged send.
+    pub otp_held: Vec<String>,
+    /// The (text, seq) pair still awaiting a delivery ack, if any.
+    pub otp_outstanding: Option<(String, u64)>,
+    /// The most recently wrapped wire bytes, for a scenario that inspects
+    /// them directly.
+    pub otp_wrapped: Vec<u8>,
+    /// Whether `detect_or_adopt_existing` adopted a contact.
+    pub otp_adopted: bool,
+    /// Synthetic pad bytes for a chunking/reassembly scenario - not real
+    /// `otp` CLI output, since TB-186 is about the wire-transfer mechanics,
+    /// not the pad's own cryptographic origin (already covered elsewhere).
+    pub otp_pad_enc: Vec<u8>,
+    pub otp_pad_dec: Vec<u8>,
+    pub otp_chunks: Vec<aloo::crypto::otp::OtpKeySetupChunk>,
+    pub otp_reassembled: Option<(Vec<u8>, Vec<u8>)>,
 }
 
 impl std::fmt::Debug for AlooWorld {
@@ -261,6 +290,16 @@ impl AlooWorld {
         self.clients
             .get_mut(name)
             .unwrap_or_else(|| panic!("no connected client called {name:?}"))
+    }
+
+    /// The sending side's ack-gate store, created empty (backed by a
+    /// scenario-local temp path) the first time a scenario needs it.
+    pub fn otp_store_mut(&mut self) -> &mut aloo::client::otp_store::OtpStore {
+        if self.otp_store.is_none() {
+            let path = self.temp_path("otp-store");
+            self.otp_store = Some(aloo::client::otp_store::OtpStore::new_empty(path));
+        }
+        self.otp_store.as_mut().expect("just inserted above")
     }
 
     /// A unique path under the system temp dir, removed when the scenario ends.

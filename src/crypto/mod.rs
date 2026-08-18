@@ -5,6 +5,7 @@ use std::path::Path;
 /// (`KeyMode::PqHybrid`). Kept as its own module since it shares no key
 /// material or primitives with the RSA-only code below - see its module doc
 /// for the full design, and `docs/PROTOCOL.md` §13.
+pub mod otp;
 pub mod pq;
 pub mod safety;
 

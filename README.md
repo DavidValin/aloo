@@ -1,6 +1,14 @@
 # aloo
 
+<p align="center">
+
+* Status ⚠️ ALPHA (under heavy development and testing)
+
+</p>
+
 ![aloo](aloo.png)
+
+*Equipped with One-Time-Pad encryption (perfect secrecy) and quantum-resistant hybrid encryption.*
 
 Walky talky in your terminal! aloo is a terminal chat app for talking with people privately and securely — text, voice, and file sharing, all end-to-end encrypted, all running in your terminal. A server connects you with the people you talk to and helps your app punch a direct connection to theirs, but your actual messages travel peer-to-peer — the server never carries them, encrypted or otherwise. No accounts, no tracking.
 
@@ -10,15 +18,15 @@ Just you, your terminal, and the people you're talking to.
 
 ## Features
 
-- 💬 **Text chat** — type and hit `Enter`, just like any chat app.
 - 🎙️ **Walkie-talkie voice messages** — hold `Space` from messages list or `Control+Alt+p` globally while in other app to talk, release to send it. Just like a real walkie-talkie, it auto-plays live on the other end as you're talking — no play button, nothing to tap, they just hear you. You can also replay it later: scroll to it in the log and press `Enter` to hear it again. `Ctrl+Alt+P` does the same thing globally, even while aloo isn't focused.
+- 💬 **Text chat** — type and hit `Enter`, just like any chat app.
 - 📎 **File transfer, with consent** — send files straight from the app with a built-in file browser, no external tools needed. The recipient sees a popup (with a chime) naming you and the file before a single byte moves, Accept focused by default; accepting streams it straight to `~/.aloo/downloads` with a live progress bar, no size cap.
 - 📢 **Public channels** — join the channels the server advertises, shown as tabs across the top; a channel created after you connect shows up live, no reconnect needed.
 - 🔒 **Private channels** — create or join a channel that isn't advertised to anyone; you just need to know its name, and optionally a password its creator set.
 - ✉️  **Private messages (DMs)** — open a one-on-one conversation with anyone in the sidebar.
 - 🌐 **Server-coordinated, never server-carried** — the server tracks who's connected to which channel and helps two clients punch a direct connection to each other; once that's up, your messages, voice, and files travel peer-to-peer, never through the server at all.
 
-- 🛡️  **Everything above is end-to-end encrypted**. See the "Encryption" section below for how.
+- 🛡️  **Everything above is end-to-end encrypted**. See the "Encryption" section below for how. You can go a step further with `/otp` in a DM: an optional, one-time-pad-encrypted session layered on top, active only once both of you explicitly accept it (requires [otp-toolkit](https://github.com/DavidValin/otp-toolkit) installed).
 - 💾 **Chat history isn't saved to disk.** Text and voice messages only ever live in memory for as long as the app is running — close it or disconnect, and they're gone. A file you've accepted is the one exception: that's the point of a file transfer, so it's written to `~/.aloo/downloads`.
 
 ## Getting started
@@ -28,6 +36,7 @@ Just you, your terminal, and the people you're talking to.
 * Easy way: [Download](https://www.github.com/aloo/releases)
 * From git source code: `cargo build --release` (will be built at `target/release/aloo`)
 * From crates.io: `cargo install aloo`
+* If you need One Time Pad encryption, make sure the `otp` command is available on your system by installing [otp-toolkit](https://github.com/DavidValin/otp-toolkit)
 
 ### 2. Start (or join) a server
 
@@ -99,13 +108,15 @@ These are the exact tags aloo shows next to a person's name, so you always know 
 | --- | --- | --- | --- |
 | 🚨 PLAIN | None | None | ❌ No |
 | 🚨 PWD | Password | Basic | ❌ No |
-| 🛡️ PQH | PQ-Hybrid | Ultra secure | ✅ Yes |
+| 🛡️ PQH | PQ-Hybrid | Ultra secure | ✅ Yes (as of today) |
 
 Whichever identity type you and everyone else picks shows up as a little tag next to your name in the app, so it's always clear how a person's messages are being protected.
 
 > **Heads up about PQH:** since it's the default, most people you meet will be using it — but it only talks to its own kind. A `PQH` user can message anyone, but can only *be messaged by* another `PQH` user. If a friend on `PLAIN`/`PWD` can't seem to reach you, that's why — one of you needs to switch to `pq_hybrid` too.
 
-By default, everything aloo writes to disk on its own — your auto-generated PQ-Hybrid keys, identity-pinning files, downloaded files — lives under `~/.aloo`. It never writes anywhere else unless you deliberately point a field (like a server RSA key file) somewhere else yourself.
+> **Going further with `/otp`:** on top of any `PQH` conversation, you can layer real one-time-pad encryption — perfect secrecy, the only cipher proven mathematically unbreakable when used correctly — for one DM at a time. It's not another identity type: nothing changes about your tag. Type `/otp` in a private message; if no shared pad exists for that contact yet, you're asked to either generate one and share it automatically over the already-encrypted `PQH` channel, or exchange it with them offline (run `otp` yourself and place the keys under `~/.aloo/otp/.keychain/`, then try `/otp` again) if you'd rather not send it over the network at all. Either way, the session only starts once your peer explicitly accepts too — from then on, every message in that room is additionally wrapped under the pad and shown with a 🛡️ prefix for as long as it stays active. Requires [otp-toolkit](https://github.com/DavidValin/otp-toolkit) installed — see the in-app help (`Ctrl+H`) for the full flow.
+
+By default, everything aloo writes to disk on its own — your auto-generated PQ-Hybrid keys, identity-pinning files, downloaded files — lives under `~/.aloo`. It never writes anywhere else unless you deliberately point a field (like a server RSA key file) somewhere else yourself. Set the `ALOO_HOME` environment variable to use a different directory instead — handy for running more than one client on the same machine (e.g. testing in separate terminals), since two clients sharing one `~/.aloo` would otherwise collide.
 
 ### Generating an RSA key for server authentication
 

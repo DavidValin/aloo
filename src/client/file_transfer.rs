@@ -48,6 +48,16 @@ pub struct FileOfferPayload {
     pub size: u64,
 }
 
+/// `FileOfferPayload`'s voice counterpart, wrapped inside a
+/// `Content::VoiceOffer` envelope - only ever sent OTP-wrapped
+/// (`client::otp::send_voice_offer`), so `duration_ms` lives here rather
+/// than as a cleartext field, matching how `filename`/`size` stay out of
+/// the wire tag above.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VoiceOfferPayload {
+    pub duration_ms: u32,
+}
+
 /// Longest filename, in characters, this app will ever offer or accept -
 /// longer names are cropped at the end (`truncate_filename`), applied both
 /// when building the offer (sender) and again on whatever offer actually
@@ -110,6 +120,13 @@ pub(crate) struct OwnFileTarget {
     pub(crate) to: UserId,
     pub(crate) path: PathBuf,
     pub(crate) key: DirectStreamKey,
+    /// `Some((contact_name, seq))` if this transfer's *offer* already
+    /// reserved an OTP send-path slot (`client::otp::send_file_offer`) -
+    /// `FileAccepted` then OTP-encrypts `path` into a temp file and
+    /// streams that instead, exactly the content-protection
+    /// `client::otp`'s module doc describes. `None` for an ordinary
+    /// (non-OTP) transfer, unchanged from before this field existed.
+    pub(crate) otp: Option<(String, u64)>,
 }
 
 /// Bookkeeping for one currently-arriving incoming file transfer - mirrors
@@ -121,6 +138,31 @@ pub(crate) struct OwnFileTarget {
 pub(crate) struct ActiveFileTransfer {
     pub(crate) job_tx: tokio::sync::mpsc::UnboundedSender<DecryptJob>,
     pub(crate) last_seen: Instant,
+}
+
+/// What an OTP-protected incoming transfer's content becomes once
+/// decrypted - a file lands on disk at `final_path` exactly like a plain
+/// transfer; a voice message has no destination file at all, and instead
+/// becomes an ordinary `MessageBody::Voice` log entry once its bytes are
+/// decoded (`client::otp::finish_incoming_file`).
+pub(crate) enum OtpIncomingKind {
+    File { final_path: PathBuf },
+    Voice { duration_ms: u32 },
+}
+
+/// Bookkeeping for one currently-arriving OTP-protected transfer, kept
+/// alongside its `ActiveFileTransfer` entry (same `(UserId, u64)` key).
+/// The chunked receive worker writes to `temp_path` - ordinary ciphertext
+/// as far as it's concerned - rather than the final destination directly;
+/// once `FileEvent::ReceiveDone` fires, `client::otp`'s handling runs
+/// `otp_cli::decrypt_file` from `temp_path` and finalizes per `kind`,
+/// removes the temp file, and only then acknowledges `seq` back to the
+/// sender.
+pub(crate) struct OtpIncomingFileReceive {
+    pub(crate) contact_name: String,
+    pub(crate) seq: u64,
+    pub(crate) temp_path: PathBuf,
+    pub(crate) kind: OtpIncomingKind,
 }
 
 /// Progress/completion events for both directions of file transfer,

@@ -1,7 +1,7 @@
 use std::ffi::OsStr;
 use std::path::PathBuf;
 
-use aloo::platform::resolve_home_dir;
+use aloo::platform::{resolve_aloo_dir, resolve_home_dir};
 
 /// @requirement TB-122
 #[test]
@@ -45,6 +45,38 @@ fn resolve_home_dir_treats_an_empty_userprofile_as_unset() {
 #[test]
 fn resolve_home_dir_is_none_when_neither_is_set() {
     assert_eq!(resolve_home_dir(None, None), None);
+}
+
+/// @requirement TB-185
+#[test]
+fn resolve_aloo_dir_prefers_aloo_home_over_the_derived_dot_aloo() {
+    let aloo_home = OsStr::new("/tmp/alice-aloo");
+    let home = OsStr::new("/home/dave");
+    assert_eq!(
+        resolve_aloo_dir(Some(aloo_home), Some(home), None),
+        PathBuf::from("/tmp/alice-aloo"),
+        "ALOO_HOME must win outright, not be joined with .aloo - the whole point is naming the exact directory"
+    );
+}
+
+/// @requirement TB-185
+#[test]
+fn resolve_aloo_dir_treats_an_empty_aloo_home_as_unset() {
+    let home = OsStr::new("/home/dave");
+    assert_eq!(
+        resolve_aloo_dir(Some(OsStr::new("")), Some(home), None),
+        PathBuf::from("/home/dave/.aloo")
+    );
+}
+
+/// @requirement TB-185
+#[test]
+fn resolve_aloo_dir_falls_back_to_home_dot_aloo_when_aloo_home_is_unset() {
+    let home = OsStr::new("/home/dave");
+    assert_eq!(
+        resolve_aloo_dir(None, Some(home), None),
+        PathBuf::from("/home/dave/.aloo")
+    );
 }
 
 /// @requirement TB-122

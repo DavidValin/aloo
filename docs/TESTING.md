@@ -131,6 +131,32 @@ libtest's flags — so `cargo test -- --nocapture`, `-- --ignored` and
 `-- --list` all fail with `error: unexpected argument`. Either name a
 target, or use `cargo slow` for the ignored tests.
 
+### Manual multi-client testing (tmux)
+
+None of the above replaces actually running the app — some behavior
+(real UDP hole punching, real audio devices, the full `/otp` mutual-consent
+flow) can only be checked by driving two live clients, and tmux (one pane
+per client, `cargo run` in each) is the ordinary way to do that on a single
+machine before ever involving a second one.
+
+**Give each client its own `ALOO_HOME`.** Every piece of this app's local
+state - `id_store`, the connect cache, `settings`, and the OTP layer's own
+`otp_store`/`otp/.keychain/` - lives under one directory (`~/.aloo` by
+default). Two clients on the same machine otherwise silently share that
+directory: harmless for most of those stores, but it corrupts the OTP
+layer specifically, since its keychain and per-contact ack-gate state are
+each only ever meant to represent one party's own view. This is exactly
+how a real, reported bug was first tracked down - a stuck OTP session that
+only reproduced with two same-machine clients sharing one `~/.aloo`.
+
+```sh
+ALOO_HOME=/tmp/aloo-alice cargo run   # pane 1
+ALOO_HOME=/tmp/aloo-bob   cargo run   # pane 2
+```
+
+`ALOO_HOME` is also mentioned in the app's own `Ctrl+H` help and in
+`README.md`'s local-state section.
+
 ### Where the reports are written
 
 Everything lands in **`target/traceability/`**, rewritten on every
@@ -366,6 +392,8 @@ Documented behaviour with no automated test, and why:
 | `session.rs`'s `UserJoined` handler actually calling `ensure_link` the moment a peer is learned about (TB-149) | `docs/PROTOCOL.md` §7.1 "Trigger" | lives in `session::handle_server_message`, which - like the rest of `session.rs` - has no test file of its own (needs a live socket, see the top of this document); the mechanism it relies on (a pre-warmed link failing silently when nothing is pending) is covered directly at the `PeerLinkManager` level by `punch_timeout_with_nothing_pending_fails_silently`, but the wiring that actually calls `ensure_link` from `UserJoined` in production is only exercised indirectly, by the app actually working when manually tested with two clients |
 | `session.rs`'s `PeerCandidates` handler actually consulting `shares_a_joined_channel` before calling into `PeerLinkManager` (TB-155) | `docs/PROTOCOL.md` §7.1.2 | same gap as the `UserJoined` row above and for the same reason (`session.rs` needs a live socket); the decision predicate itself is fully covered directly against `UiState` (`shares_a_joined_channel_is_true_for_a_member_of_a_joined_channel`, `_is_false_for_a_stranger`, `_is_false_once_the_channel_is_left`, and the `p2p_trust_boundary.feature` scenarios), but the call site that actually gates on it in production is only exercised indirectly |
 | `session.rs`'s `handle_leave`/`UserLeft` call sites actually invoking `PeerLinkManager::forget` once `has_reason_to_keep_link` fails (TB-158) | `docs/PROTOCOL.md` §7.1.3 | same gap as the two rows above and for the same reason; the decision predicate itself is fully covered directly against `UiState` (`has_reason_to_keep_link_is_true_for_a_shared_channel`, `_is_true_for_dm_history`, `_is_false_with_neither`), but the call sites that actually act on it in production are only exercised indirectly |
+| File/voice content actually flowing end-to-end under an active OTP session - offer, accept/auto-accept, chunked transport, whole-content decrypt, and the resulting ack (AC-146) | `docs/PROTOCOL.md` §16.2 | `client::otp::send_file_offer`/`prepare_outgoing_file_content`/`finish_incoming_file`/`send_voice_offer`/`on_voice_offer` and their `session.rs` call sites (`accept_file_offer`, `handle_file_event`, `handle_p2p_event`) all take a live `SessionState`/`ControlSink`/spawned worker threads and need a real socket to exercise meaningfully, the same reason the three rows above do; the mechanism each genuinely new piece relies on *is* covered directly - whole-file `otp --encrypt`/`--decrypt` round-tripping without buffering (`encrypt_file_and_decrypt_file_round_trip_without_buffering_in_memory`), failing closed on a second encrypt without proof of delivery (`decrypt_file_without_assume_delivered_twice_fails_closed_on_the_second_call`), and the ack-gate releasing on a rejected/failed offer that never touched the pad (`clear_pending_releases_the_gate_regardless_of_sequence`, `clear_pending_on_an_unknown_contact_is_a_no_op`) - so what's untested is specifically the wiring that calls these at the right moments; verified manually with two clients (large file over an OTP session arrives with the shield prefix and is byte-identical to the source once downloaded; holding Space to an OTP-active peer records silently with no live playback on the peer's end, and the clip appears as one finished, playable entry on both sides after release) |
+| A recovery-resend actually firing on `LinkStatusChanged`'s `Active` transition and reaching the right peer (AC-147) | `docs/PROTOCOL.md` §16.4 | `client::otp::recover_and_resend` and its `session.rs` call site (`handle_p2p_event`'s `LinkStatusChanged` arm) need a live link transition to exercise - same live-socket reason as the row above; the mechanism it relies on *is* covered directly - `otp --recover-last` replaying the exact last-sent ciphertext without spending key, both in-memory and file-to-file (`recover_last_sent_replays_without_consuming_key`, `recover_last_file_replays_the_last_sent_ciphertext_without_consuming_key`), the pending-send descriptor round-tripping through the store file (`pending_content_round_trips_through_save_and_load`), and - the property that makes any of this safe to attempt at all - a resend of an already-accepted sequence being rejected before `otp --decrypt` ever runs on it again (`is_next_expected_rejects_a_resend_of_an_already_accepted_sequence`); verify manually by restarting one client mid-conversation, right after a send, before its ack could arrive, and confirming the message resends automatically on reconnect using the recovered ciphertext rather than a fresh encode |
 
 These are candidate requirements, not requirements — adding one means
 writing the test first, otherwise the model would claim coverage that

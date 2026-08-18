@@ -212,19 +212,39 @@ async fn help_content(w: &mut AlooWorld) {
 /// The encryption tags and identity pinning are both far enough down the
 /// (now longer) help text that a typical terminal does not show them
 /// without scrolling - see `docs/SPEC.md` Functionality #7's scrollable
-/// overlay.
+/// overlay. Each is scrolled to independently (PageDown, incrementally)
+/// rather than assuming a single End-scroll screenful contains both -
+/// exactly how far apart they land shifts whenever `HELP_BODY` changes.
 #[then("scrolling to the bottom reveals identity pinning")]
 async fn help_content_scrolled(w: &mut AlooWorld) {
-    press_key(w, KeyCode::End, KeyModifiers::NONE);
-    let rows = ui_rows(w.ui_ref());
+    let rows = scroll_help_until(w, "PQH");
     assert!(
         rows.iter().any(|r| r.contains("PQH")),
         "expected the encryption tags explained: {rows:?}"
     );
+    let rows = scroll_help_until(w, "Identity pinning");
     assert!(
         rows.iter().any(|r| r.contains("Identity pinning")),
         "expected identity pinning: {rows:?}"
     );
+}
+
+/// Presses PageDown until `text` appears on screen or the scroll position
+/// stops advancing (hit bottom) - see `help_content_scrolled`'s doc.
+fn scroll_help_until(w: &mut AlooWorld, text: &str) -> Vec<String> {
+    let mut rows = ui_rows(w.ui_ref());
+    for _ in 0..40 {
+        if rows.iter().any(|r| r.contains(text)) {
+            break;
+        }
+        let before = w.ui_ref().help_scroll();
+        press_key(w, KeyCode::PageDown, KeyModifiers::NONE);
+        if w.ui_ref().help_scroll() == before {
+            break;
+        }
+        rows = ui_rows(w.ui_ref());
+    }
+    rows
 }
 
 #[then("the help hint sits at the top right")]
@@ -273,12 +293,25 @@ async fn room_untouched(w: &mut AlooWorld) {
 /// screen (the help text has grown since this was written) - scrolls to it
 /// first, same precedent as `help_content_scrolled`. Rendered wide (via
 /// `ui_rows_wide`) so the line's width comfortably clears the popup's own
-/// 90%-of-terminal cap.
+/// 90%-of-terminal cap. Scrolls incrementally (PageDown) rather than
+/// jumping straight to End: exactly how far down this line sits shifts
+/// whenever `HELP_BODY` grows elsewhere, so a fixed "scroll all the way,
+/// then check" no longer reliably lands on a screenful containing it.
 #[then("the help popup shows its longest line unclipped")]
 async fn help_unclipped(w: &mut AlooWorld) {
-    press_key(w, KeyCode::End, KeyModifiers::NONE);
-    let rows = ui_rows_wide(w.ui_ref());
     let tail = "static: ML-DSA-87+RSA4096/ML-KEM-1024+RSA4096/AES-256-GCM, loaded from a file";
+    let mut rows = ui_rows_wide(w.ui_ref());
+    for _ in 0..40 {
+        if rows.iter().any(|r| r.contains(tail)) {
+            break;
+        }
+        let before = w.ui_ref().help_scroll();
+        press_key(w, KeyCode::PageDown, KeyModifiers::NONE);
+        if w.ui_ref().help_scroll() == before {
+            break;
+        }
+        rows = ui_rows_wide(w.ui_ref());
+    }
     assert!(
         rows.iter().any(|r| r.contains(tail)),
         "expected the longest help line in full: {rows:?}"

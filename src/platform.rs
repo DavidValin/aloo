@@ -9,16 +9,50 @@
 use std::ffi::OsStr;
 use std::path::PathBuf;
 
-/// The directory both stores default to a file under: resolved home
-/// (`resolve_home_dir`) joined with `.aloo`. Falls back to `.aloo`
-/// relative to the current directory - still never a bare loose file - if
-/// neither environment variable is usable, a degenerate case this app has
+/// The directory both stores default to a file under: `ALOO_HOME` if set
+/// (the exact directory, not joined with `.aloo` - the point of setting it
+/// is to name the whole thing), else resolved home (`resolve_home_dir`)
+/// joined with `.aloo`. Falls back to `.aloo` relative to the current
+/// directory - still never a bare loose file - if neither the override nor
+/// either environment variable is usable, a degenerate case this app has
 /// no real answer for.
+///
+/// The override exists because *every* piece of this app's local state -
+/// `id_store`, the connect cache, `settings`, and the OTP layer's
+/// `otp_store`/`otp/.keychain/` - lives under this one directory: two
+/// `aloo` clients on the same machine (the ordinary way to test or demo
+/// two peers before deploying across real machines) otherwise silently
+/// share it, which is harmless for most of those stores but actively
+/// breaks the OTP layer - its keychain and per-contact ack-gate state are
+/// only ever meant to represent *one* party's own view, and a second
+/// process serving a different identity out of the same directory
+/// corrupts both parties' views of what should be independent state.
+/// Pointing each instance at its own `ALOO_HOME` gives each one a fully
+/// separate `~/.aloo`, exactly as if they were on separate machines.
 pub fn aloo_dir() -> PathBuf {
-    match resolve_home_dir(
+    resolve_aloo_dir(
+        std::env::var_os("ALOO_HOME").as_deref(),
         std::env::var_os("HOME").as_deref(),
         std::env::var_os("USERPROFILE").as_deref(),
-    ) {
+    )
+}
+
+/// Pure decision behind `aloo_dir`, split out the same way `resolve_home_dir`
+/// is - testable against synthetic values without mutating the real
+/// process environment (unsafe under parallel tests). An empty `ALOO_HOME`
+/// counts as unset, same treatment `resolve_home_dir` gives `HOME`/
+/// `USERPROFILE`.
+pub fn resolve_aloo_dir(
+    aloo_home: Option<&OsStr>,
+    home: Option<&OsStr>,
+    userprofile: Option<&OsStr>,
+) -> PathBuf {
+    if let Some(dir) = aloo_home
+        && !dir.is_empty()
+    {
+        return PathBuf::from(dir);
+    }
+    match resolve_home_dir(home, userprofile) {
         Some(home) => home.join(".aloo"),
         None => PathBuf::from(".aloo"),
     }

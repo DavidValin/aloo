@@ -62,11 +62,42 @@ pub(crate) async fn handle_leave(
 
 pub(crate) async fn handle_send_text(
     wr: &mut impl crate::control::ControlSink,
+    ui_state: &mut UiState,
     session: &mut SessionState,
     channel: String,
     plaintext: String,
     recipients: Vec<Recipient>,
 ) -> proto::Result<()> {
+    // OTP is pairwise, not a channel-wide concept: each recipient who has
+    // individually provisioned an OTP contact with us gets an OTP-wrapped
+    // copy via `client::otp::send_or_queue`, exactly like a DM to them
+    // would; everyone else gets the plain per-recipient path below,
+    // unchanged - the same way mixed `KeyMode`s already coexist in one
+    // channel send.
+    let mut plain_recipients = Vec::new();
+    for (id, key_mode, der) in recipients {
+        match crate::client::otp::contact_name_if_active(session, &der) {
+            Some(contact_name) => {
+                crate::client::otp::send_or_queue(
+                    wr,
+                    session,
+                    ui_state,
+                    id,
+                    &contact_name,
+                    key_mode,
+                    &der,
+                    plaintext.as_bytes(),
+                    Content::Text,
+                    Some(channel.clone()),
+                    None,
+                )
+                .await?;
+            }
+            None => plain_recipients.push((id, key_mode, der)),
+        }
+    }
+    let recipients = plain_recipients;
+
     // Split by whether each recipient's rotating key (pq_hybrid, if any)
     // is currently fresh - a static/untracked recipient is always ready.
     // Anyone not ready is queued rather than dropped, and sent
@@ -177,6 +208,7 @@ pub(crate) async fn handle_send_file(
                 to: id,
                 path: path.clone(),
                 key,
+                otp: None,
             },
         );
         session.peer_link.ensure_link(wr, id).await;

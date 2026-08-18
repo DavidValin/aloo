@@ -88,6 +88,11 @@ falling back to a server relay (§7.1).
   - [13.10 Rotating encryption keys (forward secrecy)](#1310-rotating-encryption-keys-forward-secrecy)
 - [14. The three encryption methods, side by side](#14-the-three-encryption-methods-side-by-side)
 - [15. Sequences](#15-sequences)
+- [16. One-time-pad layer over `pq_hybrid`](#16-one-time-pad-layer-over-pq_hybrid)
+  - [16.1 Turning it on, only once both sides explicitly agree](#161-turning-it-on-only-once-both-sides-explicitly-agree)
+  - [16.2 Sending under the pad](#162-sending-under-the-pad)
+  - [16.3 Session visibility in the DM log](#163-session-visibility-in-the-dm-log)
+  - [16.4 Recovering a send whose ciphertext already left](#164-recovering-a-send-whose-ciphertext-already-left)
 
 ## Overview: the connections, and what travels on each
 
@@ -184,6 +189,9 @@ the payload carried inside a reliable or unreliable one.
 | `StreamStart` / `StreamEnd` | reliably | Brackets one voice recording (§7.3) |
 | `StreamKeySetup` | reliably | A `pq_hybrid` stream's key setup, sent once (§13.3) |
 | *(voice chunks)* | unreliably | The audio, as `Unreliable` datagrams (§7.3) |
+| `OtpEnvelope` / `OtpFileOffer` | reliably | A `pq_hybrid` send additionally wrapped by the one-time-pad layer (§16) |
+| `OtpVoiceOffer` | reliably | Offers a fully-recorded voice message under the pad layer - auto-accepted, no popup (§16.2) |
+| `OtpDeliveryAck` | reliably | Confirms an `OtpEnvelope`/`OtpFileOffer`/`OtpVoiceOffer` decoded, unblocking the next one (§16) |
 
 **Server UDP socket** — stateless, no user data.
 
@@ -2522,3 +2530,305 @@ Details are in the sections referenced.
   bob sees a different key, finds a valid certificate from the identity he
   pinned, moves the pin across, and is not asked anything
 ```
+
+## 16. One-time-pad layer over `pq_hybrid`
+
+An additional, optional layer of secrecy for one specific `pq_hybrid`
+conversation at a time: the finished send this method already produces
+(§13.3's setup-plus-chunk, or a stream's setup) is, when this layer is
+active for that peer, further encrypted through a one-time pad before it
+goes on the wire, and the reverse on the way in - before the ordinary
+`pq_hybrid` open ever runs. Nothing about §13's key material, signatures or
+binding changes; this layer sits entirely outside it.
+
+This is pairwise and per-contact, never a property of an identity or a
+whole channel: two peers who both use `pq_hybrid` may or may not have this
+layer active between them, independent of what either uses with anyone
+else. A channel message to a mix of such peers and ordinary ones sends an
+extra-wrapped copy to the former and a plain `pq_hybrid` copy to the
+latter, exactly as today's mixed-`key_mode` channels already do.
+
+The pad itself is managed entirely by an external keychain tool, never by
+this protocol or its implementation: generating pad material, tracking how
+much of it remains, and physically destroying each byte the instant it is
+used are all outside this document's scope. What this section defines is
+only the two things the wire protocol itself is responsible for: how the
+two sides agree on a shared pad in the first place, and how a send that
+uses one is carried.
+
+### 16.1 Turning it on, only once both sides explicitly agree
+
+Either side may, at any time and only by its own user's explicit action,
+propose starting a one-time-pad session with the other. This is never
+automatic: not on connect, not on a schedule, not in response to anything
+the peer does. **Neither side ever considers the layer active on its own
+say-so** - starting it always ends in an explicit accept from the other
+party, confirmed back to the proposer, and both users see the outcome
+(started or cancelled) regardless of which of them asked.
+
+The proposer first checks whether a pad is already in place for this peer
+(from a previous session, or arranged by the two users themselves outside
+this protocol entirely). That check decides which of two proposals to
+send - it never skips asking the other side:
+
+```
+ alice (no pad yet)                                          bob
+   |--- OtpKeySetup { name, size, offset:0,    total_len, ... } ->|   ordinary pq_hybrid envelope
+   |--- OtpKeySetup { name, size, offset:16K,  total_len, ... } ->|   ordinary pq_hybrid envelope
+   |--- ... (one per 16KB slice of enc_key/dec_key) -------------->|
+   |<-- OtpKeySetupAck { name, accepted, reason } ----------------|   ordinary pq_hybrid envelope
+
+ alice (pad already in place)                                 bob
+   |--- OtpSessionRequest { name } -------------------------------->|   ordinary pq_hybrid envelope
+   |<-- OtpKeySetupAck { name, accepted, reason } ----------------|   ordinary pq_hybrid envelope
+```
+
+All message types here are carried as ordinary `Envelope`s, sealed under
+the ongoing `pq_hybrid` conversation exactly like a text message - the
+one-time-pad layer cannot protect the handshake that establishes it, and
+does not try to.
+
+Generating a fresh pad is itself gated on the initiating user's explicit
+confirmation - shown a plain choice ("generate and share one automatically
+over pq_hybrid, or arrange it yourself and place the keys where the local
+keychain expects them") before anything is generated or sent. Confirming
+then asks for a size (MB per key, 1 to 900,000 - re-prompting on anything
+outside that range rather than guessing), so a fresh pad is never
+generated at some fixed size the user didn't choose. That size travels
+with the setup message and is shown to the deciding side in its own
+invite popup before it ever has to accept or reject - a much larger pad
+takes longer to arrive and claims more local disk/keychain space than a
+small one, and that isn't something to discover only after agreeing. The
+pad material this produces (twice the chosen size, one key per direction)
+is far larger than one `pq_hybrid` send can carry: a `pq_hybrid` envelope
+still rides one
+UDP datagram with no fragmentation of its own below this layer, well under
+even one key's raw size, so it never travels as a single `OtpKeySetup`
+message. Instead each side of the pad is sliced into small (16KB)
+`OtpKeySetupChunk`s, each its own ordinary `pq_hybrid` send with its own
+`offset`/`total_len`, and the receiving side accumulates them
+(`OtpKeySetupReassembly`, keyed per sender) until the last one lands - only
+then is the reassembled pad staged as a visible invite. A chunk that
+doesn't pick up exactly where the last accepted one for that sender left
+off (wrong contact, wrong total length, wrong offset) is rejected rather
+than spliced in, so a stale or unrelated attempt can never produce a
+corrupted "complete" pad. The bytes carried this way, once reassembled,
+are opaque pad material for the *receiving* side's use, generated by the
+initiator alongside its own half - never derived, negotiated, or
+influenced by anything the wire has carried before, since a one-time pad's
+only security property comes from being independent, true randomness.
+
+The receiving side never acts on either proposal automatically: it is
+shown who is asking and must explicitly accept or reject before anything
+is written to its keychain or acknowledged. Accepting `OtpKeySetup` adopts
+the received pad; accepting `OtpSessionRequest` instead confirms the
+receiving side's *own* existing pad for this contact is actually still
+there (a proposal alone is not proof of that). Either way, only a
+genuine accept produces `OtpKeySetupAck { accepted: true }` - and only
+receiving that reply lets the initiator consider the session active on
+its own side too. A plain reject, or the initiating user declining the
+local confirmation in the first place, ends the same way: `accepted:
+false`, and neither side's keychain state changes as a result. Whichever
+side learns the outcome shows it plainly - "OTP session started at
+&lt;timestamp&gt;" or "OTP session cancelled" - so it is never only the
+proposer who knows whether the session actually began.
+
+One rejection reason is handled differently: `OtpSessionRequest` proposes
+resuming a pad the initiator's own side believes already exists, but that
+belief can be wrong - the initiator's keychain genuinely has an entry
+while the peer's does not (an earlier attempt the peer never completed
+being the ordinary way this happens). The peer's ack reports this exact
+case as `accepted: false` with the reason "no matching key found on my
+end", and *this* one the initiator does act on: its own stale keychain
+entry is removed (`otp --remove-contact`) and forgotten locally, and the
+same generate-and-share confirmation a first-ever `/otp` would have shown
+is offered again - without it, a bare retry would keep proposing the same
+already-broken contact forever, and a fresh key generation would be
+refused outright by the initiator's own leftover entry (`otp
+--add-contact` never overwrites an existing name). Every other rejection
+reason - including a genuinely offline/never-provisioned peer's plain
+reject - is left alone; this recovery is specifically for the one case
+that is otherwise a permanent dead end.
+
+### 16.2 Sending under the pad
+
+Once active, a send to that contact is wrapped once more after the
+ordinary `pq_hybrid` seal, and carries a `seq` naming its place in this
+layer's own independent counter for that contact (unrelated to `send_id`,
+which the underlying `pq_hybrid` send still has and still enforces on its
+own terms):
+
+```
+ alice                                              bob
+   |--- OtpEnvelope { channel, seq, envelope } -------->|
+   |<-- OtpDeliveryAck { seq } --------------------------|
+```
+
+The receiving side only sends `OtpDeliveryAck` once the message has been
+fully unwrapped *and* successfully delivered to the local application -
+never on receipt alone. The sending side treats that ack, and only that
+ack, as proof the message actually reached and was understood by the
+other end, and will not encrypt a second message to this contact under
+the pad until it has arrived. A message typed while one is still
+outstanding is held locally and sent the moment the ack for the previous
+one comes in; nothing about this queueing is itself visible on the wire.
+This is the same requirement the underlying pad-management tool enforces
+on its own local state (never spend pad material on a message before the
+previous one is confirmed delivered) - here answered with the only thing
+that can actually prove delivery across a network: a message from the
+peer that received it.
+
+**File content.** A file's *offer* (name, size) travels as an ordinary,
+unwrapped `pq_hybrid` `OtpFileOffer` - not itself pad-encrypted - carrying
+only this layer's `seq` as a marker of which ack-gate slot it reserves.
+Only the file's actual bytes are pad-protected, and only once the offer
+is accepted (the same consent gate a non-OTP file already has):
+
+```
+ alice                                              bob
+   |--- OtpFileOffer { stream_id, seq, envelope } ----->|   envelope: ordinary pq_hybrid
+   |<-- FileAccept { stream_id } ------------------------|
+   |    (encrypts the file whole through the pad,
+   |     into a local temp file)
+   |--- FileChunk { stream_id, seq, blocks } ----------->|   any number, as today (§7.6)
+   |--- FileEnd { stream_id } --------------------------->|
+   |    (bob decrypts the assembled temp file
+   |     whole through the pad, into the real
+   |     download, then deletes the temp copy)
+   |<-- OtpDeliveryAck { seq } ---------------------------|
+```
+
+Each `FileChunk` is still individually `pq_hybrid`/PQ-sealed exactly as an
+ordinary transfer's chunks are (§7.6) - the pad layer wraps the file's
+plaintext *once, whole*, before that chunking ever runs, rather than
+per-chunk (the same reasoning §16.1 gives for the key-setup pad itself:
+no per-chunk framing is cheap enough to spend pad material against). This
+is why the ack-gate slot is reserved locally the moment the offer is
+sent, but the pad is not actually touched until `FileAccept` arrives:
+running `otp --encrypt` before knowing whether the offer is even wanted
+would burn irreplaceable pad material for nothing. If the offer is
+rejected, or the whole-file encrypt itself fails, that reserved slot is
+released locally without ever having spent the pad, and any message
+queued behind it is sent immediately - no `OtpDeliveryAck` was ever going
+to arrive for a pad that was never touched.
+
+**Voice content.** Recording under this layer is never live: there is no
+per-chunk framing cheap enough to make streaming practical against a
+resource destroyed the instant it is used, so instead of the ordinary
+live `StreamStart`/chunks/`StreamEnd` sequence (§7.3), the whole message
+is captured locally first and only then sent, once, as a `FileOffer`
+would be - except a voice message has no consent prompt to wait for
+(voice never has one, on or off this layer), so it skips the
+accept/reject round trip that a file offer waits for: the pad is spent
+encrypting the complete recording immediately, and `OtpVoiceOffer` carries
+both the offer and the (already-encrypted) content's arrival in one
+uninterrupted exchange - the receiving side answers with `FileAccept`
+itself, automatically, the moment the offer decodes:
+
+```
+ alice                                              bob
+   |    (finishes recording; encrypts the
+   |     whole clip through the pad, into a
+   |     local temp file)
+   |--- OtpVoiceOffer { stream_id, seq, envelope } ----->|   envelope: ordinary pq_hybrid
+   |<-- FileAccept { stream_id } -------------------------|   sent automatically, no popup
+   |--- FileChunk { stream_id, seq, blocks } ----------->|   any number, as §7.6
+   |--- FileEnd { stream_id } --------------------------->|
+   |    (bob decrypts the assembled temp file
+   |     whole through the pad, decodes it back
+   |     to PCM, and deletes the temp copy)
+   |<-- OtpDeliveryAck { seq } ---------------------------|
+```
+
+Once decrypted, the recording becomes an ordinary, already-finished voice
+message in the peer's log - the same shape a completed live stream would
+have left behind - so replaying it (Enter, §7.3) works identically either
+way; the only difference this layer makes is that it arrives all at once
+once fully received, rather than becoming playable partway through.
+
+### 16.3 Session visibility in the DM log
+
+Every error/confirmation this layer shows (§16.1's "started"/"cancelled",
+§16.2's queued-message notice, any of the failure paths above) is shown
+two ways at once, not just as the small top-right status notice: the same
+text is also logged as a line in the relevant peer's own DM room, marking
+it unread exactly like any other arrival if that room isn't the one
+currently open. The notice itself clears; the room's own history of how
+its session got set up (or why it didn't) does not.
+
+While a mutual-consent session is genuinely active with a DM's peer
+(§16.1's "started" moment, on either side), every real message shown in
+that room - never the app's own lines about the session itself - carries
+a 🛡️ prefix, so which conversation is currently under the extra pad layer
+is never something the user has to remember or go check.
+
+A text message is logged the moment it's typed, before the send it
+describes has actually been attempted - the same optimistic-then-corrected
+approach a plain (non-OTP) send already uses. If that send then genuinely
+fails - the underlying `pq_hybrid` envelope couldn't be built, or `otp`
+itself failed to encrypt it (including a pad that's run out, §16.2) - the
+row it was logged under is found again and shown in red, so a message
+that never reached the peer is never left looking identical to one that
+did. This is scoped to direct messages: a channel send can be OTP-wrapped
+independently per recipient, so there is no single row a failure could
+unambiguously mark.
+
+### 16.4 Recovering a send whose ciphertext already left
+
+Once a message's ciphertext has genuinely gone out and this layer's own
+gate is holding (§16.2 - waiting for `OtpDeliveryAck`), the sender must
+never build a fresh one for that contact, no matter how long the ack
+takes or why it never arrives - not a lost packet beyond what the direct
+link's own reliable retransmission already covers, not this app
+restarting mid-conversation, not the peer's connection dropping and
+coming back. Encoding a second message before the first is genuinely
+acknowledged would desync the receiving side's decode position from that
+point on, permanently - the pad has no integrity check of its own to
+catch this, so a misaligned decrypt does not fail, it silently returns
+garbage.
+
+The pad-management tool this layer shells out to already keeps a small
+safety copy of the last ciphertext it produced for each contact,
+recoverable without spending any key: `otp --recover-last <contact>
+--sent` re-streams those exact bytes, byte for byte, repeatably. Recovery
+means replaying that copy, never re-encrypting the original message
+fresh.
+
+This is retried automatically every time a direct link to that contact
+transitions to genuinely reachable again (not on a timer, not polled) -
+covering a reconnect, a link flap, or this app's own restart once the
+link comes back up:
+
+```
+ alice restarts, reconnects to bob                            bob
+   |    (link becomes Active again)
+   |--- OtpEnvelope { seq: 4, envelope } ----------------------->|   the same seq as the
+   |                                                              |   original, un-acked send
+   |<-- OtpDeliveryAck { seq: 4 } ---------------------------------|
+```
+
+A file or voice content resend works the same way, just carrying a fresh
+offer (a new `stream_id`, a new outer transport key, since the original
+one existed only for the lifetime of the connection that made it) around
+the *same already-encrypted* recovered bytes - `otp --encrypt` never runs
+a second time for that content either.
+
+**Why a resend can never be treated as automatically safe on the
+receiving side.** The peer may have already decrypted the original
+message successfully - only the acknowledgement travelling back to the
+sender was lost, not the message itself. Resending must not then cause a
+second, genuine decrypt of content the pad has already been spent on:
+`otp --decrypt` has no way to recognize its own input as a duplicate, so
+handing it the same ciphertext twice consumes a second range of key and
+returns garbage the second time, exactly the corruption this whole layer
+exists to prevent. The receiving side's own per-contact sequence counter
+(§16.2) is therefore checked *before* `otp --decrypt` is ever invoked, not
+after - a resend of a sequence already accepted is rejected outright,
+never reaching the pad a second time. This makes a resend of an
+already-delivered message a harmless, silent no-op on the receiving end,
+not a failure.
+
+A recovery attempt that finds nothing to recover, or that fails for any
+reason, leaves the gate exactly as it was - it never falls back to
+building a fresh message, and the same check runs again on the next
+reconnect.

@@ -65,6 +65,7 @@ fn round_trips_through_save_and_load() {
         server_bind: "127.0.0.1".to_string(),
         server_port: 9999,
         server_auth: ServerAuth::None,
+        ..Settings::default()
     };
     saved.save(&path).expect("save should succeed");
 

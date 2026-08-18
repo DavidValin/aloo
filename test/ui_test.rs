@@ -872,17 +872,39 @@ fn render_help_popup_shows_expected_content_when_open() {
     // The encryption tags and identity pinning both sit far enough down the
     // (now longer) help text that a typical terminal does not show them
     // without scrolling - see docs/SPEC.md Functionality #7's scrollable
-    // overlay.
-    press(&mut state, KeyCode::End);
-    let rows = rendered_rows(&state);
+    // overlay. Scrolled to incrementally (rather than jumping straight to
+    // End) since each section's exact distance from the bottom shifts
+    // whenever HELP_BODY's content changes - the two sections are no
+    // longer guaranteed to land in the same screenful.
+    let rows = scroll_help_until(&mut state, "PQH");
     assert!(
         rows.iter().any(|r| r.contains("PQH")),
         "expected the encryption tags explained: {rows:?}"
     );
+    let rows = scroll_help_until(&mut state, "Identity pinning");
     assert!(
         rows.iter().any(|r| r.contains("Identity pinning")),
-        "expected id_store identity pinning explained after scrolling to the bottom: {rows:?}"
+        "expected id_store identity pinning explained after scrolling further down: {rows:?}"
     );
+}
+
+/// Presses PageDown until `text` appears on screen (or the help overlay's
+/// scroll position stops advancing, i.e. it hit bottom) - a content-length-
+/// independent way to reach a specific help section, since exactly how far
+/// down any given line sits shifts whenever `HELP_BODY` changes.
+fn scroll_help_until(state: &mut UiState, text: &str) -> Vec<String> {
+    for _ in 0..40 {
+        let rows = rendered_rows(state);
+        if rows.iter().any(|r| r.contains(text)) {
+            return rows;
+        }
+        let before = state.help_scroll();
+        press(state, KeyCode::PageDown);
+        if state.help_scroll() == before {
+            break;
+        }
+    }
+    rendered_rows(state)
 }
 
 /// @requirement TB-126
@@ -1231,19 +1253,35 @@ fn help_popup_widens_enough_to_show_its_longest_line_without_clipping_it() {
     // `render_help_popup_shows_expected_content_when_open`.
     let mut state = joined_general_with(vec![]);
     state.help_open = true;
-    press(&mut state, KeyCode::End);
-    let backend = ratatui::backend::TestBackend::new(130, 30);
-    let mut terminal = ratatui::Terminal::new(backend).unwrap();
-    terminal.draw(|f| render(f, &state)).unwrap();
-    let buffer = terminal.backend().buffer().clone();
-    let rows: Vec<String> = (0..buffer.area.height)
-        .map(|y| {
-            (0..buffer.area.width)
-                .map(|x| buffer[(x, y)].symbol())
-                .collect::<String>()
-        })
-        .collect();
     let tail = "static: ML-DSA-87+RSA4096/ML-KEM-1024+RSA4096/AES-256-GCM, loaded from a file";
+    let rows_130 = |state: &UiState| -> Vec<String> {
+        let backend = ratatui::backend::TestBackend::new(130, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, state)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    };
+    // Scrolled to incrementally rather than jumping to End - see
+    // `scroll_help_until`'s doc for why the exact distance to this line
+    // isn't assumed fixed.
+    let mut rows = rows_130(&state);
+    for _ in 0..40 {
+        if rows.iter().any(|r| r.contains(tail)) {
+            break;
+        }
+        let before = state.help_scroll();
+        press(&mut state, KeyCode::PageDown);
+        if state.help_scroll() == before {
+            break;
+        }
+        rows = rows_130(&state);
+    }
     assert!(
         rows.iter().any(|r| r.contains(tail)),
         "expected the longest help line in full, unclipped: {rows:?}"

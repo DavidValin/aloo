@@ -46,14 +46,35 @@ fn encrypt_for_recipient(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_send_text(
     wr: &mut impl crate::control::ControlSink,
+    ui_state: &mut UiState,
     session: &mut SessionState,
     to: UserId,
     plaintext: String,
     recipient_key_mode: KeyMode,
     recipient_pubkey_der: Vec<u8>,
+    log_index: Option<usize>,
 ) -> proto::Result<()> {
+    if let Some(contact_name) =
+        crate::client::otp::contact_name_if_active(session, &recipient_pubkey_der)
+    {
+        return crate::client::otp::send_or_queue(
+            wr,
+            session,
+            ui_state,
+            to,
+            &contact_name,
+            recipient_key_mode,
+            &recipient_pubkey_der,
+            plaintext.as_bytes(),
+            Content::Text,
+            None,
+            log_index,
+        )
+        .await;
+    }
     if session.remote_keys.try_use(to) {
         let send_id = session.next_stream_id;
         session.next_stream_id += 1;
@@ -104,6 +125,20 @@ pub(crate) async fn handle_send_file(
     {
         return Ok(());
     }
+    if let Some(contact_name) = crate::client::otp::contact_name_if_active(session, &recipient_pubkey_der) {
+        return crate::client::otp::send_file_offer(
+            wr,
+            session,
+            ui_state,
+            to,
+            &contact_name,
+            &recipient_pubkey_der,
+            path,
+            filename,
+            size,
+        )
+        .await;
+    }
     let payload = crate::client::file_transfer::FileOfferPayload {
         filename: filename.clone(),
         size,
@@ -136,7 +171,7 @@ pub(crate) async fn handle_send_file(
     ui_state.log_own_file_offer_dm(to, stream_id, filename.clone(), size);
     session.own_file_targets.insert(
         stream_id,
-        crate::client::file_transfer::OwnFileTarget { to, path, key },
+        crate::client::file_transfer::OwnFileTarget { to, path, key, otp: None },
     );
     session.peer_link.ensure_link(wr, to).await;
     session.peer_link.send_reliable_or_queue(
@@ -165,6 +200,31 @@ pub(crate) async fn handle_voice_record_start(
         || !session.remote_keys.try_use(to)
     {
         ui_state.recording_failed("recipient's key isn't ready yet".to_string());
+        return Ok(());
+    }
+    // Under an active OTP session, voice is recorded fully and sent once
+    // finished (`client::otp::send_voice_offer`'s doc) rather than
+    // live-streamed - no `StreamStart`/per-chunk network traffic at all
+    // until the recording stops.
+    if let Some(contact_name) = crate::client::otp::contact_name_if_active(session, &recipient_pubkey_der) {
+        ui_state.log_own_voice_stream_start_dm(to, stream_id);
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+        session.active_recording = Some(stop_tx);
+        session.own_stream_targets.insert(
+            stream_id,
+            voice_stream::OwnStreamTarget::DirectOtp {
+                to,
+                contact_name,
+                recipient_pubkey_der,
+            },
+        );
+        voice_stream::spawn_record_accumulate_worker(
+            recorder,
+            stream_id,
+            session.own_stream_done_tx.clone(),
+            stop_rx,
+            session.auto_stop_tx.clone(),
+        );
         return Ok(());
     }
     // Voice is never queued (PROTOCOL.md §11.2) - a link that isn't already
@@ -229,7 +289,7 @@ pub(crate) async fn handle_voice_record_start(
     Ok(())
 }
 
-pub(crate) fn on_message(
+pub(crate) async fn on_message(
     ui_state: &mut UiState,
     session: &mut SessionState,
     from: UserId,
@@ -239,6 +299,25 @@ pub(crate) fn on_message(
     let Some(sender) = ui_state.known_users.get(&from).cloned() else {
         return;
     };
+    // The OTP-layer provisioning handshake rides ordinary (non-OTP)
+    // `pq_hybrid` envelopes distinguished only by `Content` - see
+    // `client::otp`'s module doc. Every other content type falls through
+    // to the normal text-message path below unchanged.
+    match envelope.content {
+        Content::OtpKeySetup => {
+            crate::client::otp::on_key_setup(ui_state, session, from, from_name, &sender, envelope);
+            return;
+        }
+        Content::OtpSessionRequest => {
+            crate::client::otp::on_session_request(ui_state, session, from, from_name, &sender, envelope);
+            return;
+        }
+        Content::OtpKeySetupAck => {
+            crate::client::otp::on_key_setup_ack(ui_state, session, from, &sender, envelope).await;
+            return;
+        }
+        _ => {}
+    }
     if let Some(body) =
         crate::client::session::decrypt_envelope_for(envelope, from, &sender, None, session)
     {

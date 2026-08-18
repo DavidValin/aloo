@@ -103,6 +103,7 @@ async fn dm_send_requested(w: &mut AlooWorld, body: String, name: String) {
             plaintext,
             recipient_key_mode: _,
             recipient_pubkey_der,
+            log_index: _,
         } => {
             assert_eq!(*to, want);
             assert_eq!(plaintext, &body);

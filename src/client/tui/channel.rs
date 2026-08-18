@@ -441,6 +441,7 @@ impl UiState {
             to_name: None,
             body,
             outgoing: false,
+            failed: false,
         };
         // A Pending/Rejected sender's message decrypts fine (it's encrypted
         // with *our* key, not theirs) but is held back rather than shown -
@@ -470,6 +471,7 @@ impl UiState {
                     to_name: None,
                     body: MessageBody::Voice { duration_ms, pcm },
                     outgoing: true,
+                    failed: false,
                 },
             );
         }
@@ -494,6 +496,7 @@ impl UiState {
                     to_name: None,
                     body: MessageBody::VoiceStreaming { stream_id },
                     outgoing: true,
+                    failed: false,
                 },
             );
         }
@@ -519,6 +522,7 @@ impl UiState {
             to_name: None,
             body: MessageBody::VoiceStreaming { stream_id },
             outgoing: false,
+            failed: false,
         };
         if self.is_trust_gated(from) {
             self.hold_message(from, Some(channel.to_string()), entry);
@@ -574,6 +578,7 @@ impl UiState {
                     to_name: None,
                     body,
                     outgoing: true,
+                    failed: false,
                 },
             );
         }
@@ -614,6 +619,7 @@ impl UiState {
                         status: FileTransferStatus::Pending,
                     },
                     outgoing: true,
+                    failed: false,
                 },
             );
         }
@@ -648,6 +654,7 @@ impl UiState {
                         status: FileTransferStatus::InProgress { bytes: 0 },
                     },
                     outgoing: false,
+                    failed: false,
                 },
             );
         }

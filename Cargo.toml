@@ -61,8 +61,18 @@ serde = { version = "1.0.229", features = ["derive"] }
 sha2 = { version = "0.10", features = ["oid"] }
 sysinfo = "0.33"
 thiserror = "2.0.20"
+# Only for formatting the OTP session-established timestamp shown in the TUI
+# (`client::otp::format_now`) - already pulled in transitively by ratatui at
+# this exact version, so this promotes it to direct rather than growing the
+# dependency tree.
+time = { version = "0.3.55", features = ["local-offset", "formatting"] }
 tokio = { version = "1.53.1", features = ["full"] }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
+# Wipes raw one-time-pad key bytes (`crypto::otp`, `client::otp`) from memory
+# on drop - pad material is the literal one-time secret with no
+# computational-hardness fallback, unlike every other key type this app
+# handles, so it gets a stricter standard.
+zeroize = { version = "1", features = ["derive"] }
 
 # Test-only. None of these reach the shipped `aloo` binary or library.
 [dev-dependencies]
@@ -184,6 +194,18 @@ path = "test/p2p_test.rs"
 [[test]]
 name = "hybrid_crypto_test"
 path = "test/hybrid_crypto_test.rs"
+
+[[test]]
+name = "otp_provisioning_test"
+path = "test/otp_provisioning_test.rs"
+
+[[test]]
+name = "otp_store_test"
+path = "test/otp_store_test.rs"
+
+[[test]]
+name = "otp_cli_test"
+path = "test/otp_cli_test.rs"
 
 [[test]]
 name = "ui_connect_popup_test"

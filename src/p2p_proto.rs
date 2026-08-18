@@ -130,4 +130,44 @@ pub enum P2pPayload {
     FileEnd {
         stream_id: u64,
     },
+    /// An OTP-wrapped send: `envelope`'s single `blocks` element is a
+    /// `pq_hybrid` blob that has additionally been piped through `otp -c
+    /// <contact> --encrypt` (`client::otp::wrap_outgoing`) - the receiver
+    /// must run `otp -c <contact> --decrypt` first to recover the ordinary
+    /// `pq_hybrid` blob before it can be opened. `seq` is this contact's
+    /// wire-level OTP sequence number, named by the `OtpDeliveryAck` the
+    /// receiver sends back once decode succeeds. Only ever sent to a peer
+    /// whose OTP provisioning has completed - see
+    /// `client::otp::contact_name_if_active`.
+    OtpEnvelope {
+        channel: Option<String>,
+        seq: u64,
+        envelope: Envelope,
+    },
+    /// `OtpEnvelope`'s file-offer counterpart, mirroring `FileOffer`.
+    OtpFileOffer {
+        channel: Option<String>,
+        stream_id: u64,
+        seq: u64,
+        envelope: Envelope,
+    },
+    /// Sent back once an `OtpEnvelope`/`OtpFileOffer` has been unwrapped
+    /// *and* successfully delivered locally - the genuine network
+    /// acknowledgement that lets the sender honestly pass `-y` to `otp`'s
+    /// own delivery-confirmation gate for its next send to this contact.
+    OtpDeliveryAck {
+        seq: u64,
+    },
+    /// `OtpFileOffer`'s voice counterpart - carries a `Content::VoiceOffer`
+    /// envelope whose plaintext is a bincode-encoded
+    /// `client::otp::VoiceOfferPayload`. Auto-accepted on arrival (no
+    /// `FileAccept`/`FileReject` round trip): the actual PCM content
+    /// streams as ordinary `FileChunk`/`FileEnd` blocks immediately after,
+    /// exactly like an accepted file transfer, and OTP-decrypts the same
+    /// way (`client::otp::finish_incoming_file`-shaped handling).
+    OtpVoiceOffer {
+        stream_id: u64,
+        seq: u64,
+        envelope: Envelope,
+    },
 }

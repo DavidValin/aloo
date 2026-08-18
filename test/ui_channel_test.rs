@@ -1328,3 +1328,18 @@ fn on_joined_clears_the_left_flag() {
     assert!(!state.channels[0].left);
     assert!(state.channels[0].joined);
 }
+
+/// @requirement AC-140
+#[test]
+fn an_unrecognized_slash_command_is_never_sent_as_channel_text() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    type_str(&mut state, "/nonsense");
+    let action = press(&mut state, KeyCode::Enter);
+    assert_eq!(action, None, "an unrecognized command must never produce a send action");
+    assert!(state.input.is_empty());
+    assert_eq!(
+        state.status_notice,
+        Some(("unknown command: /nonsense".to_string(), false))
+    );
+    assert!(state.channels[0].log.is_empty());
+}

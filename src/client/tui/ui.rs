@@ -59,13 +59,14 @@ pub const HELP_SCROLL_PAGE: usize = 10;
 /// typical terminal window - module-level (not local to
 /// `render_help_popup`) so `UiState::handle_key`'s scroll clamping and the
 /// renderer share one source of truth for how many lines there are.
-const HELP_HEADINGS: [&str; 7] = [
+const HELP_HEADINGS: [&str; 8] = [
     "Channels",
     "Messaging",
     "Private messages",
     "Voice messages",
     "File transfer",
     "Encryption (tag shown after each username)",
+    "One-time-pad layer (optional, per contact)",
     "Identity pinning (id_store)",
 ];
 const HELP_BODY: &[&str] = &[
@@ -106,6 +107,27 @@ const HELP_BODY: &[&str] = &[
     "  name \u{1F6A8} PLAIN  static: one RSA keypair auto-generated when you connected",
     "  name \u{1F6E1}\u{FE0F} PQH    static: ML-DSA-87+RSA4096/ML-KEM-1024+RSA4096/AES-256-GCM, loaded from a file",
     "",
+    "One-time-pad layer (optional, per contact)",
+    "  /otp       inside an open DM room: proposes an extra one-time-pad",
+    "             layer on top of pq_hybrid for that contact only. Never",
+    "             starts on its own say-so - always ends in an explicit",
+    "             Accept/Reject on the other side, confirmed back to you.",
+    "  If no key exists yet, you're asked to confirm generating one and",
+    "  sharing it automatically over pq_hybrid (or you can run 'otp'",
+    "  yourself and place the keys under ~/.aloo/otp/.keychain/ instead).",
+    "  Confirming asks for a size next, 1-900000 MB per key. An incoming",
+    "  proposal shows an Accept/Reject popup naming the sender and, for a",
+    "  fresh key, the size offered.",
+    "  Requires both sides to use pq_hybrid, and the real 'otp' command",
+    "  (github.com/DavidValin/otp-toolkit) installed. Once started, a message to",
+    "  that contact waits for the previous one to be genuinely acknowledged",
+    "  before the next can send. \"OTP session started at <time>\" (green) or",
+    "  \"OTP session cancelled\" (red) is shown to both sides.",
+    "  Text, file and voice content sent to that contact are all protected",
+    "  under the pad while active - a file's name/size still travel unwrapped",
+    "  (only its bytes are, once accepted); voice is recorded fully and sent",
+    "  once instead of live, arriving playable once it fully lands.",
+    "",
     "Identity pinning (id_store)",
     "  Remembers each nickname's full public key across sessions (not",
     "  just a hash) - exact match for password/pq_hybrid. none is",
@@ -115,6 +137,11 @@ const HELP_BODY: &[&str] = &[
     "  theirs held while unresolved; Reject saves nothing and isn't",
     "  permanent - select them again to reconsider. Path set in the",
     "  connect popup's id_store field.",
+    "",
+    "  All local state (id_store, settings, the OTP keychain) lives under",
+    "  ~/.aloo by default. Set ALOO_HOME to use a different directory -",
+    "  needed if you run more than one client on this same machine, since",
+    "  they'd otherwise collide by sharing one ~/.aloo.",
     "",
     "  Ctrl+C  quit      Ctrl+H  toggle this help      Up/Down  scroll",
 ];
@@ -171,6 +198,15 @@ pub enum MessageBody {
         stream_id: u64,
         status: FileTransferStatus,
     },
+    /// An app-generated line about the conversation itself rather than
+    /// something either party said - currently only the OTP layer's own
+    /// errors/confirmations (`client::otp::notify`), mirrored here from the
+    /// same text shown in the top-right status notice so the history of a
+    /// session's setup isn't lost the moment that notice clears. Never
+    /// given the OTP shield prefix (`render_messages`) - it would be
+    /// redundant on a line that already names OTP explicitly, and the
+    /// prefix is meant to mark *content*, not the app's own narration.
+    System(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -185,6 +221,13 @@ pub struct LogEntry {
     pub to_name: Option<String>,
     pub body: MessageBody,
     pub outgoing: bool,
+    /// Set after the fact, once an async send this row was optimistically
+    /// logged for (`push_outgoing_dm`) turns out to have failed - currently
+    /// only OTP sends, the one case that can fail per-message after the
+    /// row is already showing (`client::otp::send_now`'s failure paths via
+    /// `UiState::mark_dm_message_failed`). Never true for anything but an
+    /// `outgoing` entry.
+    pub failed: bool,
 }
 
 /// Which anchor a peer's identity mismatch failed against - drives the
@@ -293,6 +336,15 @@ pub struct PendingFileOffer {
     /// `Some(channel)` if this offer arrived via a channel send, `None` for
     /// a DM - decides which log the accepted row goes into.
     pub channel: Option<String>,
+    /// `Some((contact_name, seq))` if this offer arrived via
+    /// `client::otp::on_file_offer` - accepting it then routes the
+    /// incoming content through the OTP-decrypt path
+    /// (`session::accept_file_offer`) instead of writing chunks straight
+    /// to the final destination, and `seq` is what the eventual
+    /// `OtpDeliveryAck` names once the whole file has arrived and been
+    /// decrypted. `None` for an ordinary (non-OTP) offer.
+    pub otp_contact_name: Option<String>,
+    pub otp_seq: Option<u64>,
 }
 
 /// Which button is focused in the file-offer popup - `Accept` by default
@@ -303,6 +355,56 @@ pub struct PendingFileOffer {
 pub enum FileOfferChoice {
     Accept,
     Reject,
+}
+
+/// Which button is focused in either OTP popup below - `Accept` by
+/// default, same reasoning as `FileOfferChoice`: you either just typed
+/// `/otp` yourself (wanting to proceed is the common case) or a peer is
+/// asking for something you'd typically grant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OtpChoice {
+    Accept,
+    Reject,
+}
+
+/// The local "generate and share a fresh pad?" decision after `/otp` finds
+/// no existing keychain entry (`client::otp::handle_otp_command`) - never
+/// acted on without this confirmation, see `docs/PROTOCOL.md` §16.1.
+#[derive(Debug, Clone)]
+pub struct PendingOtpGenerate {
+    pub peer: UserId,
+    pub peer_name: String,
+    pub key_mode: KeyMode,
+    pub pubkey_der: Vec<u8>,
+}
+
+/// One incoming OTP session proposal awaiting an Accept/Reject decision -
+/// the peer-initiated counterpart of `PendingOtpGenerate`, mirroring
+/// `PendingFileOffer`'s queued-popup idiom. `peer_encryption_key`/
+/// `peer_decryption_key` are `Some` only for a fresh-key invitation
+/// (`Content::OtpKeySetup`); both `None` means a session request against
+/// an already-existing keychain contact (`Content::OtpSessionRequest`).
+/// Holds raw one-time-pad key bytes while awaiting a decision, so - like
+/// `crypto::otp::OtpKeySetupPayload` - this is zeroized on drop.
+#[derive(zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
+pub struct PendingOtpInvite {
+    #[zeroize(skip)]
+    pub from: UserId,
+    #[zeroize(skip)]
+    pub from_name: String,
+    #[zeroize(skip)]
+    pub contact_name: String,
+    pub peer_encryption_key: Option<Vec<u8>>,
+    pub peer_decryption_key: Option<Vec<u8>>,
+    /// The pad size (MB per key) the sender chose - `Some` alongside the
+    /// key material for a fresh-key invitation, always `None` for a bare
+    /// session request (nothing was generated, so there's no size to
+    /// report). Shown in the invite popup so the deciding side isn't
+    /// asked to accept sight-unseen - a much larger pad takes longer to
+    /// receive (`OtpKeySetupChunk`'s doc) and ties up more disk/keychain
+    /// space than a small one.
+    #[zeroize(skip)]
+    pub pad_size_mb: Option<u32>,
 }
 
 /// A recipient's addressing info: their id, announced `KeyMode` (which
@@ -347,6 +449,13 @@ pub enum UiAction {
         plaintext: String,
         recipient_key_mode: KeyMode,
         recipient_pubkey_der: Vec<u8>,
+        /// Where this text landed in the DM's log when it was optimistically
+        /// shown (`push_outgoing_dm`) - lets a later async failure
+        /// (currently only an OTP send) find and mark that exact row
+        /// (`UiState::mark_dm_message_failed`) rather than leaving a
+        /// message that was never delivered looking identical to one that
+        /// was.
+        log_index: Option<usize>,
     },
     /// The target is captured at press-time (not release-time): live
     /// streaming needs to know who to address the wire `StreamXStart` to
@@ -400,6 +509,31 @@ pub enum UiAction {
         from: UserId,
         stream_id: u64,
     },
+    /// Sent by the `/otp` command (`submit_input`) for the currently open
+    /// DM room - the one and only trigger for starting an OTP session
+    /// (`client::otp::handle_otp_command`). Never sent automatically.
+    RequestOtpSession {
+        peer: UserId,
+        key_mode: KeyMode,
+        pubkey_der: Vec<u8>,
+    },
+    /// The user confirmed "generate and share a fresh OTP pad?"
+    /// (`otp_generate_confirm`) and then chose a size for it
+    /// (`otp_size_input`, MB per key, `crypto::otp::OTP_SIZE_MB_MIN..=OTP_SIZE_MB_MAX`)
+    /// - `client::otp::confirm_generate` does the actual generation and
+    /// send.
+    ConfirmOtpGenerate {
+        size_mb: u32,
+    },
+    /// The user declined generating a pad, at either step
+    /// (`otp_generate_confirm`'s Reject, or Escape out of `otp_size_input`)
+    /// - purely local, nothing was ever sent.
+    CancelOtpGenerate,
+    /// The user accepted an incoming OTP session proposal
+    /// (`otp_invite_open`) - `client::otp::accept_invite`.
+    AcceptOtpInvite,
+    /// The user rejected it - `client::otp::reject_invite`.
+    RejectOtpInvite,
 }
 
 /// Which trigger started the current recording - `handle_key`'s Space
@@ -490,6 +624,52 @@ pub struct UiState {
     /// (`push_file_offer`, popup + bell) only once that sender is
     /// `Accept`ed (`resolve_identity_accept`).
     pending_file_offers: HashMap<UserId, Vec<PendingFileOffer>>,
+    /// The local "generate and share a fresh OTP pad?" confirmation opened
+    /// by `/otp` when no keychain entry exists yet
+    /// (`client::otp::handle_otp_command`) - `None` when nothing is
+    /// pending. Only ever one at a time: `/otp` itself is unreachable while
+    /// any modal popup (including this one) is already absorbing input.
+    otp_generate_confirm: Option<PendingOtpGenerate>,
+    otp_generate_focus: OtpChoice,
+    /// The pad-size prompt shown right after accepting `otp_generate_confirm`
+    /// - carries the same peer info forward (nothing about who/what was
+    /// asked changes, only whether a size has been chosen yet). `None`
+    /// whenever `otp_generate_confirm` is, and vice versa - they're never
+    /// both open, see `handle_key`'s ordering.
+    otp_size_input: Option<PendingOtpGenerate>,
+    /// Digits typed so far for `otp_size_input` - a plain `String` rather
+    /// than a parsed number so an in-progress, momentarily-invalid edit
+    /// (a leading digit before more follow, or a backspace mid-edit) is
+    /// never rejected while still being typed; only Enter validates.
+    pub otp_size_text: String,
+    /// Set by an out-of-range or unparseable submission
+    /// (`crypto::otp::otp_size_mb_in_range`) - shown under the input,
+    /// cleared the next time the popup opens or a key changes the text.
+    pub otp_size_error: Option<String>,
+    /// Every incoming OTP session proposal currently awaiting a decision,
+    /// keyed by the sender - mirrors `file_offers`/`file_offer_queue`
+    /// exactly (queued-popup idiom, `Accept`-first default).
+    otp_invites: HashMap<UserId, PendingOtpInvite>,
+    otp_invite_queue: VecDeque<UserId>,
+    otp_invite_focus: OtpChoice,
+    /// The most recent OTP session outcome ("OTP session started at ..."
+    /// in green, or a cancellation/failure in red) - a small always-visible
+    /// notice, independent of `audio_error`'s suppressed-by-design banner
+    /// (see that field's callers) since this one must actually be seen:
+    /// "both parties should be aware if OTP session started/failed" is a
+    /// hard requirement, not a best-effort one. Also used for the "unknown
+    /// command" notice (`submit_input`).
+    pub status_notice: Option<(String, bool)>,
+    /// Peers a mutual-consent OTP session has genuinely started with in
+    /// this connection (set alongside the "OTP session started" notice,
+    /// `client::otp::accept_invite`/`on_key_setup_ack`) - drives the shield
+    /// prefix a DM room's messages get while it's active
+    /// (`render_messages`). Scoped to DMs: OTP's own UI surface (`/otp`,
+    /// both popups) only ever exists inside a private room, so that is
+    /// where "in OTP mode" has an unambiguous meaning - a channel send may
+    /// wrap per-recipient under a contact's pad too, but a channel log has
+    /// no single peer for a shield to describe.
+    otp_active_peers: HashSet<UserId>,
     /// Whether a previously-received voice message is currently being
     /// replayed (Enter on a `MessageBody::Voice` log entry) - while `true`,
     /// Escape stops that playback instead of its usual meaning (closing the
@@ -614,6 +794,16 @@ impl UiState {
             file_offer_queue: VecDeque::new(),
             file_offer_focus: FileOfferChoice::Accept,
             pending_file_offers: HashMap::new(),
+            otp_generate_confirm: None,
+            otp_generate_focus: OtpChoice::Accept,
+            otp_size_input: None,
+            otp_size_text: String::new(),
+            otp_size_error: None,
+            otp_invites: HashMap::new(),
+            otp_invite_queue: VecDeque::new(),
+            otp_invite_focus: OtpChoice::Accept,
+            status_notice: None,
+            otp_active_peers: HashSet::new(),
             replaying: false,
             recording: false,
             recording_source: None,
@@ -864,6 +1054,122 @@ impl UiState {
         self.file_offers.remove(&key)
     }
 
+    /// Opens the local "generate and share a fresh OTP pad?" confirmation
+    /// (`/otp` found no existing keychain entry) - see
+    /// `client::otp::handle_otp_command`.
+    pub fn open_otp_generate_confirm(
+        &mut self,
+        peer: UserId,
+        peer_name: String,
+        key_mode: KeyMode,
+        pubkey_der: Vec<u8>,
+    ) {
+        self.otp_generate_confirm = Some(PendingOtpGenerate {
+            peer,
+            peer_name,
+            key_mode,
+            pubkey_der,
+        });
+        self.otp_generate_focus = OtpChoice::Accept;
+    }
+
+    pub fn take_otp_generate_confirm(&mut self) -> Option<PendingOtpGenerate> {
+        self.otp_generate_focus = OtpChoice::Accept;
+        self.otp_generate_confirm.take()
+    }
+
+    /// Read-only counterpart of `take_otp_generate_confirm`, for a caller
+    /// that only wants to observe whether the prompt is showing (and who it
+    /// names) without answering it - mirrors `otp_invite_open`.
+    pub fn otp_generate_confirm_open(&self) -> Option<&PendingOtpGenerate> {
+        self.otp_generate_confirm.as_ref()
+    }
+
+    /// Opens the pad-size prompt (`handle_key`'s Accept branch for
+    /// `otp_generate_confirm`) - carries `pending`'s peer info forward
+    /// unchanged, since accepting only decided *that* a pad gets
+    /// generated, not how big.
+    pub fn open_otp_size_input(&mut self, pending: PendingOtpGenerate) {
+        self.otp_size_input = Some(pending);
+        self.otp_size_text.clear();
+        self.otp_size_error = None;
+    }
+
+    pub fn take_otp_size_input(&mut self) -> Option<PendingOtpGenerate> {
+        self.otp_size_text.clear();
+        self.otp_size_error = None;
+        self.otp_size_input.take()
+    }
+
+    /// Read-only counterpart of `take_otp_size_input`, mirroring
+    /// `otp_generate_confirm_open`.
+    pub fn otp_size_input_open(&self) -> Option<&PendingOtpGenerate> {
+        self.otp_size_input.as_ref()
+    }
+
+    /// Queues an incoming OTP session proposal - mirrors `push_file_offer`
+    /// exactly, one sender at a time (a second proposal from the same
+    /// sender while one is already queued simply replaces it, since only
+    /// the latest is still meaningful).
+    #[allow(clippy::too_many_arguments)]
+    pub fn push_otp_invite(
+        &mut self,
+        from: UserId,
+        from_name: String,
+        contact_name: String,
+        peer_encryption_key: Option<Vec<u8>>,
+        peer_decryption_key: Option<Vec<u8>>,
+        pad_size_mb: Option<u32>,
+    ) {
+        self.otp_invites.insert(
+            from,
+            PendingOtpInvite {
+                from,
+                from_name,
+                contact_name,
+                peer_encryption_key,
+                peer_decryption_key,
+                pad_size_mb,
+            },
+        );
+        if !self.otp_invite_queue.contains(&from) {
+            self.otp_invite_queue.push_back(from);
+        }
+        if self.otp_invite_queue.front() == Some(&from) {
+            self.otp_invite_focus = OtpChoice::Accept;
+        }
+    }
+
+    pub fn otp_invite_open(&self) -> Option<&PendingOtpInvite> {
+        let from = self.otp_invite_queue.front()?;
+        self.otp_invites.get(from)
+    }
+
+    pub fn take_otp_invite(&mut self) -> Option<PendingOtpInvite> {
+        let from = self.otp_invite_queue.pop_front()?;
+        self.otp_invite_focus = OtpChoice::Accept;
+        self.otp_invites.remove(&from)
+    }
+
+    /// Sets the always-visible OTP/command status line - see
+    /// `status_notice`'s field doc for why this is a separate, actually-
+    /// rendered surface rather than reusing `audio_error`/`push_notice`.
+    pub fn push_status_notice(&mut self, message: String, success: bool) {
+        self.status_notice = Some((message, success));
+    }
+
+    /// Records that a mutual-consent OTP session has genuinely started with
+    /// `peer` - see `otp_active_peers`'s doc.
+    pub fn mark_otp_active(&mut self, peer: UserId) {
+        self.otp_active_peers.insert(peer);
+    }
+
+    /// Whether `peer`'s messages should carry the OTP shield prefix right
+    /// now.
+    pub fn is_otp_active(&self, peer: UserId) -> bool {
+        self.otp_active_peers.contains(&peer)
+    }
+
     /// Finds the file-transfer log row matching `(from, stream_id)`
     /// (embedded in `MessageBody::File`, same `(from, stream_id)` matching
     /// `finalize_stream_entry` already uses for voice) wherever it lives -
@@ -1054,6 +1360,102 @@ impl UiState {
                     KeyCode::Enter => match self.identity_review_focus {
                         IdentityChoice::Accept => Some(UiAction::AcceptIdentity(peer)),
                         IdentityChoice::Reject => Some(UiAction::RejectIdentity(peer)),
+                    },
+                    _ => None,
+                },
+                _ => None,
+            };
+        }
+
+        // An outstanding OTP session proposal from a peer is next -
+        // "accepted by both parties" means this decision can't be
+        // deferred behind ordinary typing, same absorb-everything shape as
+        // identity review/file offer.
+        if self.otp_invite_queue.front().is_some() {
+            return match kind {
+                KeyEventKind::Press | KeyEventKind::Repeat => match code {
+                    KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
+                        self.otp_invite_focus = match self.otp_invite_focus {
+                            OtpChoice::Accept => OtpChoice::Reject,
+                            OtpChoice::Reject => OtpChoice::Accept,
+                        };
+                        None
+                    }
+                    KeyCode::Enter => match self.otp_invite_focus {
+                        OtpChoice::Accept => Some(UiAction::AcceptOtpInvite),
+                        OtpChoice::Reject => Some(UiAction::RejectOtpInvite),
+                    },
+                    _ => None,
+                },
+                _ => None,
+            };
+        }
+
+        // The pad-size prompt, shown right after Accept below - same
+        // priority tier, and mutually exclusive with `otp_generate_confirm`
+        // (checked first only because it's the one more likely to be open
+        // once both exist, not because order matters here).
+        if self.otp_size_input.is_some() {
+            return match kind {
+                KeyEventKind::Press | KeyEventKind::Repeat => match code {
+                    KeyCode::Esc => Some(UiAction::CancelOtpGenerate),
+                    KeyCode::Enter => match self.otp_size_text.parse::<u32>() {
+                        Ok(size_mb) if crate::crypto::otp::otp_size_mb_in_range(size_mb) => {
+                            Some(UiAction::ConfirmOtpGenerate { size_mb })
+                        }
+                        _ => {
+                            self.otp_size_error = Some(format!(
+                                "enter a whole number between {} and {}",
+                                crate::crypto::otp::OTP_SIZE_MB_MIN,
+                                crate::crypto::otp::OTP_SIZE_MB_MAX
+                            ));
+                            None
+                        }
+                    },
+                    KeyCode::Backspace => {
+                        self.otp_size_text.pop();
+                        self.otp_size_error = None;
+                        None
+                    }
+                    // 6 digits covers the max (900000) with no room for a
+                    // typo'd extra digit to even be entered.
+                    KeyCode::Char(c) if c.is_ascii_digit() && self.otp_size_text.len() < 6 => {
+                        self.otp_size_text.push(c);
+                        self.otp_size_error = None;
+                        None
+                    }
+                    _ => None,
+                },
+                _ => None,
+            };
+        }
+
+        // The local "generate and share a fresh pad?" confirmation - same
+        // priority tier as the invite popup above (they can never both be
+        // open at once: typing `/otp` is itself unreachable while any
+        // modal popup, including an invite, is absorbing every key).
+        if self.otp_generate_confirm.is_some() {
+            return match kind {
+                KeyEventKind::Press | KeyEventKind::Repeat => match code {
+                    KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
+                        self.otp_generate_focus = match self.otp_generate_focus {
+                            OtpChoice::Accept => OtpChoice::Reject,
+                            OtpChoice::Reject => OtpChoice::Accept,
+                        };
+                        None
+                    }
+                    KeyCode::Enter => match self.otp_generate_focus {
+                        OtpChoice::Accept => {
+                            // Confirming only decides "yes, generate one" -
+                            // the size prompt above is the next step, not
+                            // an immediate `ConfirmOtpGenerate`.
+                            let pending = self
+                                .take_otp_generate_confirm()
+                                .expect("otp_generate_confirm.is_some() was just checked");
+                            self.open_otp_size_input(pending);
+                            None
+                        }
+                        OtpChoice::Reject => Some(UiAction::CancelOtpGenerate),
                     },
                     _ => None,
                 },
@@ -1311,6 +1713,24 @@ impl UiState {
             // left wondering where their typed command went.
             return self.start_file_send();
         }
+        if self.input.trim() == "/otp" {
+            // Only meaningful inside an open DM room - OTP is provisioned
+            // pairwise, per contact, never for a whole channel at once
+            // (see `client::otp`'s module doc). A no-op if the peer is
+            // trust-gated (docs/PROTOCOL.md §12) - the same guard the
+            // compose bar itself already applies before any send.
+            let peer_id = self.active_private_room?;
+            if self.is_trust_gated(peer_id) {
+                return None;
+            }
+            let peer = self.known_users.get(&peer_id)?.clone();
+            self.input.clear();
+            return Some(UiAction::RequestOtpSession {
+                peer: peer_id,
+                key_mode: peer.key_mode,
+                pubkey_der: peer.public_key_der,
+            });
+        }
         if self.input.trim() == "/leave" {
             // Always the currently selected channel tab - `/leave` takes
             // no argument. A no-op if that tab isn't actually joined (an
@@ -1324,6 +1744,17 @@ impl UiState {
             self.input.clear();
             return Some(UiAction::LeaveChannel { name });
         }
+        // Anything else starting with `/` is an attempted command, not a
+        // message - even one this build doesn't recognize, or a typo of a
+        // real one. It must never leak into a channel or DM as literal
+        // text: silently falling through to the send paths below would
+        // send "/otpp" (or worse, "/leave" typed one keystroke wrong) as a
+        // plain chat message every recipient sees.
+        if self.input.trim().starts_with('/') {
+            let attempted = std::mem::take(&mut self.input);
+            self.push_status_notice(format!("unknown command: {}", attempted.trim()), false);
+            return None;
+        }
         if let Some(peer_id) = self.active_private_room {
             // Defensive: normal navigation can no longer reach a compose
             // bar for a Pending/Rejected peer's room (Enter on their
@@ -1335,13 +1766,14 @@ impl UiState {
             }
             let peer = self.known_users.get(&peer_id)?.clone();
             let text = std::mem::take(&mut self.input);
+            let log_index = self.push_outgoing_dm(peer_id, MessageBody::Text(text.clone()));
             let action = UiAction::SendDirectText {
                 to: peer_id,
-                plaintext: text.clone(),
+                plaintext: text,
                 recipient_key_mode: peer.key_mode,
                 recipient_pubkey_der: peer.public_key_der,
+                log_index,
             };
-            self.push_outgoing_dm(peer_id, MessageBody::Text(text));
             Some(action)
         } else {
             let channel = self.channels.get(self.selected_channel)?;
@@ -1709,11 +2141,28 @@ pub fn render(frame: &mut Frame, state: &UiState) {
     if let Some(offer) = state.file_offer_open() {
         render_file_offer_popup(frame, area, offer, state.file_offer_focus);
     }
+    // The OTP popups sit above the file offer, same tier `handle_key` gives
+    // them (below only an identity review).
+    if let Some(pending) = &state.otp_generate_confirm {
+        render_otp_generate_popup(frame, area, pending, state.otp_generate_focus);
+    }
+    if let Some(pending) = state.otp_size_input_open() {
+        render_otp_size_popup(frame, area, pending, state);
+    }
+    if let Some(invite) = state.otp_invite_open() {
+        render_otp_invite_popup(frame, area, invite, state.otp_invite_focus);
+    }
     // Drawn last of all - takes priority over even the help overlay, same
     // as it does in `handle_key`, so it's always interactable regardless
     // of what else happened to be open when the mismatch arrived.
     if let Some(review) = state.identity_review_open() {
         render_identity_review_popup(frame, area, review, state.identity_review_focus);
+    }
+    // The status notice is a small non-modal banner, not a popup - drawn
+    // absolutely last so a session outcome is always visible even over
+    // everything above, without ever blocking input the way those do.
+    if let Some((message, success)) = &state.status_notice {
+        render_status_notice(frame, area, message, *success);
     }
 }
 
@@ -1771,6 +2220,156 @@ fn render_file_offer_popup(
         16,
         "Reject",
         focus == FileOfferChoice::Reject,
+    );
+}
+
+fn render_otp_generate_popup(
+    frame: &mut Frame,
+    area: Rect,
+    pending: &PendingOtpGenerate,
+    focus: OtpChoice,
+) {
+    let popup = centered_rect(64, 11, area);
+    let block = Block::default()
+        .title("Start an OTP session")
+        .borders(Borders::ALL);
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(6), Constraint::Length(3)])
+        .split(inner);
+
+    let message = format!(
+        "No OTP key found for {}. Generate one now and share it automatically \
+         over the encrypted pq_hybrid channel? Alternatively, run the 'otp' \
+         command yourself and place the keys under ~/.aloo/otp/.keychain/, \
+         then try /otp again.",
+        pending.peer_name
+    );
+    frame.render_widget(
+        Paragraph::new(message).wrap(ratatui::widgets::Wrap { trim: true }),
+        rows[0],
+    );
+
+    let button_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(rows[1]);
+    render_popup_button(frame, button_cols[0], 16, "Accept", focus == OtpChoice::Accept);
+    render_popup_button(frame, button_cols[1], 16, "Reject", focus == OtpChoice::Reject);
+}
+
+fn render_otp_invite_popup(
+    frame: &mut Frame,
+    area: Rect,
+    invite: &PendingOtpInvite,
+    focus: OtpChoice,
+) {
+    let popup = centered_rect(64, 9, area);
+    let block = Block::default()
+        .title(format!("OTP session request from {}", invite.from_name))
+        .borders(Borders::ALL);
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(3)])
+        .split(inner);
+
+    // The size, when there is one (a fresh-key invitation, not a bare
+    // resume request), is exactly what the sender chose in their own size
+    // prompt - shown so this decision isn't made sight-unseen (see
+    // `PendingOtpInvite::pad_size_mb`'s doc).
+    let size_clause = match invite.pad_size_mb {
+        Some(mb) => format!(" using a fresh {mb}MB pad"),
+        None => String::new(),
+    };
+    let message = format!(
+        "{} wants to start an OTP session with you{size_clause}, layered on top of \
+         pq_hybrid for extra secrecy. Accept it?",
+        invite.from_name
+    );
+    frame.render_widget(
+        Paragraph::new(message).wrap(ratatui::widgets::Wrap { trim: true }),
+        rows[0],
+    );
+
+    let button_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(rows[1]);
+    render_popup_button(frame, button_cols[0], 16, "Accept", focus == OtpChoice::Accept);
+    render_popup_button(frame, button_cols[1], 16, "Reject", focus == OtpChoice::Reject);
+}
+
+/// Follows `render_otp_generate_popup`'s Accept - asks how large a pad to
+/// generate (MB per key, `crypto::otp::OTP_SIZE_MB_MIN..=OTP_SIZE_MB_MAX`),
+/// same shape as `channel::render_channel_password_popup`'s text-entry
+/// popup (a live input line, an error line only when there's an error to
+/// show).
+fn render_otp_size_popup(frame: &mut Frame, area: Rect, pending: &PendingOtpGenerate, state: &UiState) {
+    let has_error = state.otp_size_error.is_some();
+    let popup = centered_rect(64, if has_error { 8 } else { 7 }, area);
+    let block = Block::default()
+        .title(format!("Pad size for {} (MB per key)", pending.peer_name))
+        .borders(Borders::ALL);
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let mut constraints = vec![Constraint::Min(3), Constraint::Length(1)];
+    if has_error {
+        constraints.push(Constraint::Length(1));
+    }
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(inner);
+
+    let message = format!(
+        "Choose a size between {} and {} MB, then press Enter. \
+         Esc cancels the whole session.",
+        crate::crypto::otp::OTP_SIZE_MB_MIN,
+        crate::crypto::otp::OTP_SIZE_MB_MAX
+    );
+    frame.render_widget(
+        Paragraph::new(message).wrap(ratatui::widgets::Wrap { trim: true }),
+        rows[0],
+    );
+    frame.render_widget(Paragraph::new(format!("> {}", state.otp_size_text)), rows[1]);
+    if let Some(err) = &state.otp_size_error {
+        frame.render_widget(
+            Paragraph::new(err.as_str()).style(Style::default().fg(Color::Red)),
+            rows[2],
+        );
+    }
+}
+
+/// A small, non-modal one-line banner in the top-right corner reporting the
+/// most recent OTP session outcome (green on success, red otherwise) - see
+/// `UiState::status_notice`'s field doc for why this exists as its own
+/// always-rendered surface.
+fn render_status_notice(frame: &mut Frame, area: Rect, message: &str, success: bool) {
+    let width = (message.len() as u16 + 4).min(area.width);
+    let rect = Rect {
+        x: area.width.saturating_sub(width),
+        y: 1,
+        width,
+        height: 3,
+    };
+    let color = if success { Color::Green } else { Color::Red };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(color));
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    frame.render_widget(
+        Paragraph::new(message)
+            .style(Style::default().fg(color).add_modifier(Modifier::BOLD))
+            .wrap(ratatui::widgets::Wrap { trim: true }),
+        inner,
     );
 }
 
@@ -1946,10 +2545,15 @@ pub(crate) fn render_messages(
             .unwrap_or(&[])
     };
 
+    // OTP's own UI surface only exists inside a private room (see
+    // `otp_active_peers`'s doc) - a channel log never gets the shield
+    // prefix, regardless of any individual member's OTP status.
+    let shield_active = dm_peer.is_some_and(|peer| state.is_otp_active(peer));
+
     let items: Vec<ListItem> = log
         .iter()
         .map(|entry| {
-            let line = match &entry.body {
+            let mut line = match &entry.body {
                 MessageBody::Text(text) => Line::from(format!("{}: {}", entry.from_name, text)),
                 MessageBody::Voice { duration_ms, .. } => {
                     let label = format_duration_label(*duration_ms);
@@ -2020,7 +2624,25 @@ pub(crate) fn render_messages(
                     }
                     Line::from(spans)
                 }
+                MessageBody::System(text) => Line::from(Span::styled(
+                    text.clone(),
+                    Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                )),
             };
+            if shield_active && !matches!(entry.body, MessageBody::System(_)) {
+                line.spans.insert(0, Span::raw("\u{1F6E1}\u{FE0F} "));
+            }
+            // A row whose async send turned out to have failed
+            // (`UiState::mark_dm_message_failed`) is shown in red, same as
+            // every other "this needs your attention" red the app already
+            // uses - a failed send must never look identical to a
+            // delivered one. The line's own style is a fallback under each
+            // span's, but none of the spans built above (including the
+            // shield prefix) set their own color, so this reliably paints
+            // the whole row.
+            if entry.failed {
+                line.style = Style::default().fg(Color::Red);
+            }
             ListItem::new(line)
         })
         .collect();
