@@ -310,7 +310,6 @@ fn incoming_offer(
         stream_id,
         channel: None,
         otp_contact_name: None,
-        otp_seq: None,
     }
 }
 

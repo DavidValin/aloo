@@ -51,6 +51,13 @@ pub enum PendingOtpSend {
         plaintext: Vec<u8>,
         content: Content,
     },
+    /// An accepted file's content-phase encrypt, held back because the
+    /// contact's gate was busy at `FileAccepted` time - `to` is carried
+    /// only for symmetry with the other variants (unused by the drain,
+    /// which re-derives everything it needs from `session.own_file_targets`
+    /// via `stream_id`, since the entry - key included - is left in place
+    /// rather than removed while queued).
+    FileContent { stream_id: u64, to: UserId },
 }
 
 /// In-memory only, unlike `OtpStore` - losing a queued-but-unsent message
@@ -1252,23 +1259,32 @@ pub(crate) async fn send_or_queue(
 
 /// Sends a file offer under an active OTP session - `direct_message::
 /// handle_send_file`'s entry point once `contact_name_if_active` returns
-/// `Some`. Unlike text's `send_or_queue`, the *offer* itself is an
-/// ordinary `pq_hybrid` seal, never run through `otp --encrypt` - only the
-/// file's actual content gets OTP-protected, once accepted
-/// (`P2pEvent::FileAccepted`'s handling in `session.rs`, which OTP-encrypts
-/// `path` into a temp file before the existing chunked sender ever reads
-/// it). What this function does is reserve the send-path gate for that
-/// later encrypt up front: `record_sent` fires here, the moment the offer
-/// goes out, precisely so nothing else can call `otp --encrypt` for this
-/// contact before the content-encrypt genuinely happens - by the time
-/// `FileAccepted` arrives and actually runs it, it is honestly the first
-/// encrypt since the last ack, so `assume_delivered: true` there is
-/// correct by the same construction argument `wrap_outgoing`'s doc makes.
-/// If the offer is rejected or the later content-encrypt fails outright,
-/// nothing was ever actually spent - the caller releases the gate locally
-/// via `OtpStore::clear_pending` rather than waiting on an ack that can
-/// never come (see `session.rs`'s `FileRejected` handling and
-/// `apply_file_content_otp_wrap`'s failure path).
+/// `Some`. The *offer* (filename + size) is a genuine pad spend in its own
+/// right - wrapped through `otp --encrypt` exactly like a text message
+/// (`wrap_outgoing`) - see docs/PROTOCOL.md 16.2 for why paying a bit of
+/// pad on every offer, including ones later rejected, is an accepted
+/// tradeoff for keeping the filename off the wire in the clear.
+///
+/// This is the *offer* phase's pad spend only: `record_sent` fires right
+/// after `wrap_outgoing` succeeds, the same reserve-after-genuinely-spent
+/// ordering `send_now` uses for text, so there is never a window where the
+/// gate is reserved but nothing was actually encrypted - a rejected offer
+/// needs no local gate release, since the offer itself already earned its
+/// own ack (sent the moment the peer decrypts and queues it for the
+/// popup, `on_file_offer`) independent of whether the user has decided to
+/// accept yet. If that ack is lost - the peer never replies, or goes
+/// offline before it can - the only way forward is `recover_and_resend`:
+/// the pad was genuinely spent the instant this function's
+/// `wrap_outgoing` succeeded, so nothing may ever re-encrypt a fresh offer
+/// for this contact until either a real ack arrives or the exact same
+/// ciphertext is recovered and resent.
+///
+/// The file's actual *content* is a wholly separate, later pad spend, only
+/// reserved once the offer is genuinely accepted
+/// (`start_outgoing_file_content`, `P2pEvent::FileAccepted`'s handling in
+/// `session.rs`) - two independent slots, two independent acks, since the
+/// pad tool never allows a second `--encrypt` before the first is
+/// confirmed delivered.
 ///
 /// A busy gate is refused outright rather than queued the way `send_or_queue`
 /// queues text - replaying a whole file path/filename/size through the
@@ -1353,15 +1369,31 @@ pub(crate) async fn send_file_offer(
         );
         return Ok(());
     };
+    let Some(pq_blob) = envelope.blocks.first().cloned() else {
+        return Ok(());
+    };
+    let Some(wrapped) = wrap_outgoing(&session.otp_cli_cfg, pq_blob, contact_name).await else {
+        notify(
+            ui_state,
+            to,
+            &peer_name,
+            "OTP: the otp command failed to encrypt this file offer - not sent".to_string(),
+            false,
+        );
+        return Ok(());
+    };
     let seq = session
         .otp_store
         .get(contact_name)
         .map(|s| s.next_out_seq)
         .unwrap_or(0);
+    let mut otp_envelope = envelope;
+    otp_envelope.blocks = vec![wrapped];
     session.otp_store.record_sent(
         contact_name,
         seq,
         crate::client::otp_store::PendingOtpContent::File {
+            stream_id,
             filename: filename.clone(),
             size,
         },
@@ -1374,7 +1406,7 @@ pub(crate) async fn send_file_offer(
             to,
             path,
             key,
-            otp: Some((contact_name.to_string(), seq)),
+            otp: Some(contact_name.to_string()),
         },
     );
     session.peer_link.ensure_link(wr, to).await;
@@ -1384,7 +1416,7 @@ pub(crate) async fn send_file_offer(
             channel: None,
             stream_id,
             seq,
-            envelope,
+            envelope: otp_envelope,
         },
     );
     crate::client::session::request_rotation(session, to);
@@ -1397,9 +1429,10 @@ pub(crate) async fn send_file_offer(
 /// separate accept step to defer content-encryption to (voice auto-accepts,
 /// no popup - `Content::VoiceOffer`'s doc), so the one genuine `otp
 /// --encrypt` for this send happens right here, before anything is
-/// reserved or sent - simpler than the file path, and never needs
-/// `release_pending_and_drain` since nothing is ever reserved ahead of a
-/// failure. Once encrypted, streams out exactly like a file: registers an
+/// reserved or sent - simpler than the file path, and (like every other
+/// pad spend in this module) only ever reserved *after* it genuinely
+/// succeeds, so a failure here needs no gate release either. Once
+/// encrypted, streams out exactly like a file: registers an
 /// ordinary `OwnFileTarget` (with `otp: None` - the content is already
 /// ciphertext, nothing left for `FileAccepted` to do) and sends
 /// `OtpVoiceOffer`; the peer's `FileAccept` (auto-sent, no popup on their
@@ -1598,23 +1631,17 @@ pub(crate) async fn on_message(
 
 /// `on_message`'s file-offer counterpart, for `P2pEvent::OtpFileOffer` -
 /// mirrors `session::handle_incoming_file_offer`'s Pending/Rejected-hold
-/// and popup logic, but keeps control of the ack decision here (only once
-/// the offer has actually been decrypted and either queued for the popup
-/// or held).
+/// and popup logic, but with `on_message`'s own OTP-unwrap-then-ack shape:
+/// the envelope here is genuinely OTP-wrapped, exactly like a text message
+/// (`send_file_offer`'s doc), so it must be unwrapped through `otp
+/// --decrypt` before it can be opened, and once delivered - queued for the
+/// popup, or held pending trust - earns its own `OtpDeliveryAck`
+/// immediately, independent of whether the user has decided to accept yet.
+/// That ack only closes the *offer* phase's gate; the file's actual
+/// content, once accepted, reserves and acks a wholly separate slot
+/// (`start_outgoing_file_content`, `finish_incoming_file`).
 #[allow(clippy::too_many_arguments)]
-/// Applies an incoming `P2pEvent::OtpFileOffer` - unlike `on_message`, the
-/// envelope here is an ordinary `pq_hybrid` seal, never itself run through
-/// `otp --decrypt` (see `send_file_offer`'s doc: only the file's actual
-/// content is OTP-protected, not the offer). `seq` still gets the same
-/// replay-guard-shaped acceptance every incoming OTP-numbered message
-/// gets (`record_received`), and still ends up in `PendingFileOffer` so
-/// `session::accept_file_offer` knows to route the eventual content
-/// through the OTP-decrypt path - but no `OtpDeliveryAck` is sent here.
-/// That only happens once the whole file has actually arrived and been
-/// decrypted (`session.rs`'s `ReceiveDone` handling) - acking the mere
-/// offer would tell the sender its content-encrypt is safe to run before
-/// the user has even decided whether to accept.
-pub(crate) fn on_file_offer(
+pub(crate) async fn on_file_offer(
     session: &mut SessionState,
     ui_state: &mut UiState,
     channel: Option<String>,
@@ -1630,12 +1657,26 @@ pub(crate) fn on_file_offer(
     let Some(contact_name) = contact_name_for_peer(session, &sender.public_key_der) else {
         return;
     };
+    let Some(blob) = envelope.blocks.first() else {
+        return;
+    };
+    // Checked *before* `otp --decrypt` runs - see `on_message`'s identical
+    // guard for why a resend of an already-processed offer must never
+    // touch the pad a second time.
+    if !session.otp_store.is_next_expected(&contact_name, seq) {
+        return;
+    }
+    let Some(pq_blob) = unwrap_incoming(&session.otp_cli_cfg, blob, &contact_name).await else {
+        return;
+    };
     if !session.otp_store.record_received(&contact_name, seq) {
         return;
     }
     let _ = session.otp_store.save();
+    let mut inner = envelope;
+    inner.blocks = vec![pq_blob];
     let Some(payload) = crate::client::session::decrypt_file_offer(
-        &envelope,
+        &inner,
         from,
         &sender,
         channel.as_deref(),
@@ -1652,13 +1693,16 @@ pub(crate) fn on_file_offer(
         stream_id,
         channel,
         otp_contact_name: Some(contact_name),
-        otp_seq: Some(seq),
     };
     if ui_state.is_trust_gated(from) {
         ui_state.hold_file_offer(offer);
     } else if ui_state.push_file_offer(offer) {
         crate::client::voice_stream::play_bell_chime(session);
     }
+    crate::client::session::request_rotation(session, from);
+    session
+        .peer_link
+        .send_reliable_or_queue(from, P2pPayload::OtpDeliveryAck { seq });
 }
 
 /// `on_file_offer`'s voice counterpart, for `P2pEvent::OtpVoiceOffer`.
@@ -1668,9 +1712,11 @@ pub(crate) fn on_file_offer(
 /// receive-side bookkeeping exactly like `session::accept_file_offer`
 /// would, then sends `FileAccept` straight back so the sender's existing,
 /// unmodified `FileAccepted` handling starts streaming the pre-encrypted
-/// content right away. No `OtpDeliveryAck` here either, same reasoning as
-/// `on_file_offer` - only once the whole recording has arrived and been
-/// decrypted (`finish_incoming_file`) is one sent.
+/// content right away. There is only ever one pad spend for the whole
+/// message here (`send_voice_offer` already OTP-encrypted the recording
+/// before this envelope was even sent, see its doc) - so no
+/// `OtpDeliveryAck` here; only once the whole recording has arrived and
+/// been decrypted (`finish_incoming_file`) is one sent.
 pub(crate) async fn on_voice_offer(
     wr: &mut impl crate::control::ControlSink,
     session: &mut SessionState,
@@ -1699,7 +1745,7 @@ pub(crate) async fn on_voice_offer(
         (from, stream_id),
         crate::client::file_transfer::OtpIncomingFileReceive {
             contact_name,
-            seq,
+            seq: Some(seq),
             temp_path: temp_path.clone(),
             kind: crate::client::file_transfer::OtpIncomingKind::Voice {
                 duration_ms: payload.duration_ms,
@@ -1793,113 +1839,103 @@ pub(crate) async fn on_delivery_ack(
             )
             .await
         }
-        None => Ok(()),
-    }
-}
-
-/// Releases the ack-gate for `contact_name` without any genuine ack ever
-/// arriving, then drains one queued send exactly like `on_delivery_ack`
-/// does - for the file-transfer failure paths where the slot
-/// `send_file_offer` reserved via `record_sent` will never be honoured by
-/// a real `otp --encrypt` (the offer was rejected) or the encrypt itself
-/// failed, so no `OtpDeliveryAck` will ever arrive to release it the
-/// normal way. See `OtpStore::clear_pending`'s doc for exactly when this
-/// is safe to call - only when nothing genuine was ever encrypted under
-/// this slot.
-pub(crate) async fn release_pending_and_drain(
-    wr: &mut impl crate::control::ControlSink,
-    ui_state: &mut UiState,
-    session: &mut SessionState,
-    to: UserId,
-    contact_name: &str,
-) -> proto::Result<()> {
-    if !session.otp_store.clear_pending(contact_name) {
-        return Ok(());
-    }
-    let _ = session.otp_store.save();
-    let Some(sender) = ui_state.known_users.get(&to).cloned() else {
-        return Ok(());
-    };
-    match session.otp_out_queue.pop_front(contact_name) {
-        Some(PendingOtpSend::Direct {
-            to,
-            plaintext,
-            content,
-            log_index,
-        }) => {
-            send_now(
-                wr,
-                session,
-                ui_state,
-                to,
-                contact_name,
-                sender.key_mode,
-                &sender.public_key_der,
-                &plaintext,
-                content,
-                None,
-                log_index,
-            )
-            .await
-        }
-        Some(PendingOtpSend::Channel {
-            channel,
-            to,
-            plaintext,
-            content,
-        }) => {
-            send_now(
-                wr,
-                session,
-                ui_state,
-                to,
-                contact_name,
-                sender.key_mode,
-                &sender.public_key_der,
-                &plaintext,
-                content,
-                Some(channel),
-                None,
-            )
-            .await
+        Some(PendingOtpSend::FileContent { stream_id, .. }) => {
+            start_outgoing_file_content(session, ui_state, stream_id).await
         }
         None => Ok(()),
     }
 }
 
-/// `P2pEvent::FileAccepted`'s OTP step: if `target.otp` reserved a slot at
-/// offer time, encrypts the file whole into a fresh temp file via
-/// `otp_cli::encrypt_file_retrying` (bounded memory, piped through the
-/// subprocess - never buffered in aloo's own memory) and returns that temp
-/// path for the caller to stream instead of the original. `assume_delivered:
-/// true` is correct here for the same reason it is at offer time: this is
-/// honestly the first `otp --encrypt` run since the last genuine ack for
-/// this contact (the offer itself was never OTP-encrypted - see
-/// `send_file_offer`'s doc).
+/// `P2pEvent::FileAccepted`'s OTP step - a wholly independent pad spend
+/// from the offer's own (docs/PROTOCOL.md 16.2): checks whether this
+/// contact's gate is free, and either reserves it right now (encrypts the
+/// file whole into a fresh temp file via `otp_cli::encrypt_file_retrying`,
+/// bounded memory, piped through the subprocess - never buffered in
+/// aloo's own memory - then `record_sent`s only *after* that genuinely
+/// succeeds, the same reserve-after-spent ordering `send_now`/
+/// `send_file_offer` use) or, if something else currently holds the gate,
+/// queues this stream for `on_delivery_ack` to retry once it frees.
 ///
-/// On failure, this fully handles it - releases the gate (nothing genuine
-/// was ever encrypted under it), marks the row failed, notifies, and
-/// cleans up the temp file - and returns `None`; the caller must not spawn
-/// the send worker in that case. A non-OTP target is returned unchanged.
-pub(crate) async fn prepare_outgoing_file_content(
-    wr: &mut impl crate::control::ControlSink,
+/// Spawning the actual chunked send worker is this function's own
+/// responsibility in every case (immediate, queued-then-drained, and the
+/// plain non-OTP path alike) - the caller (`P2pEvent::FileAccepted`'s
+/// handling in `session.rs`) never removes `target` from
+/// `session.own_file_targets` itself, since a queued attempt needs the
+/// entry - key included - to still be there whenever it's finally
+/// retried.
+///
+/// On a genuine encrypt failure, nothing was ever reserved, so there is
+/// no gate to release: just notify, mark the row failed, and clean up the
+/// temp file. A non-OTP target spawns immediately, gate logic never
+/// entering into it at all.
+pub(crate) async fn start_outgoing_file_content(
     session: &mut SessionState,
     ui_state: &mut UiState,
     stream_id: u64,
-    to: UserId,
-    path: &std::path::Path,
-    otp: Option<(String, u64)>,
-) -> proto::Result<Option<std::path::PathBuf>> {
-    let Some((contact_name, _seq)) = otp else {
-        return Ok(Some(path.to_path_buf()));
+) -> proto::Result<()> {
+    let Some(target) = session.own_file_targets.get(&stream_id) else {
+        return Ok(());
     };
+    let Some(contact_name) = target.otp.clone() else {
+        let target = session
+            .own_file_targets
+            .remove(&stream_id)
+            .expect("just confirmed present above");
+        crate::client::file_transfer::spawn_send_file_worker(
+            target.path,
+            target.key,
+            target.to,
+            stream_id,
+            session.record_out_tx.clone(),
+            session.file_events_tx.clone(),
+        );
+        return Ok(());
+    };
+    let to = target.to;
+    let unacked = session
+        .otp_store
+        .get(&contact_name)
+        .and_then(|s| s.pending_unacked_out_seq)
+        .is_some();
+    if unacked {
+        session
+            .otp_out_queue
+            .enqueue(contact_name, PendingOtpSend::FileContent { stream_id, to });
+        return Ok(());
+    }
+    let target = session
+        .own_file_targets
+        .remove(&stream_id)
+        .expect("just confirmed present above");
     let temp_path = temp_content_path(&session.otp_cli_cfg, "otp-send");
-    let outcome = otp_cli::encrypt_file_retrying(&session.otp_cli_cfg, &contact_name, path, &temp_path, true).await;
+    let outcome =
+        otp_cli::encrypt_file_retrying(&session.otp_cli_cfg, &contact_name, &target.path, &temp_path, true).await;
     match outcome {
         Ok(otp_cli::FileCliOutcome::Ok) => {
             restrict_file_permissions(&temp_path);
             session.otp_send_temp_files.insert(stream_id, temp_path.clone());
-            Ok(Some(temp_path))
+            let seq = session
+                .otp_store
+                .get(&contact_name)
+                .map(|s| s.next_out_seq)
+                .unwrap_or(0);
+            session.otp_store.record_sent(
+                &contact_name,
+                seq,
+                crate::client::otp_store::PendingOtpContent::FileContent { stream_id },
+            );
+            let _ = session.otp_store.save();
+            session
+                .peer_link
+                .send_reliable_or_queue(to, P2pPayload::OtpFileContentSeq { stream_id, seq });
+            crate::client::file_transfer::spawn_send_file_worker(
+                temp_path,
+                target.key,
+                to,
+                stream_id,
+                session.record_out_tx.clone(),
+                session.file_events_tx.clone(),
+            );
         }
         _ => {
             secure_remove_file(&temp_path);
@@ -1913,10 +1949,9 @@ pub(crate) async fn prepare_outgoing_file_content(
                 "OTP: failed to encrypt this file's content - not sent".to_string(),
                 false,
             );
-            release_pending_and_drain(wr, ui_state, session, to, &contact_name).await?;
-            Ok(None)
         }
     }
+    Ok(())
 }
 
 /// `FileEvent::ReceiveDone`'s OTP step: the chunked transport just finished
@@ -1998,9 +2033,15 @@ pub(crate) async fn finish_incoming_file(
             crate::client::session::request_rotation(session, from);
         }
     }
-    session
-        .peer_link
-        .send_reliable_or_queue(from, P2pPayload::OtpDeliveryAck { seq: pending.seq });
+    // `seq` is `None` only if a file's content genuinely finished
+    // decrypting before its own `OtpFileContentSeq` ever arrived - not
+    // possible over an ordered reliable link (it's always sent first), but
+    // guarded rather than assumed; nothing to ack in that case.
+    if let Some(seq) = pending.seq {
+        session
+            .peer_link
+            .send_reliable_or_queue(from, P2pPayload::OtpDeliveryAck { seq });
+    }
 }
 
 /// Reverse of `contact_name_for_peer`: which (if any) currently-known peer's
@@ -2066,19 +2107,12 @@ pub(crate) async fn recover_and_resend(
             crate::client::otp_store::PendingOtpContent::Text { channel } => {
                 recover_and_resend_text(wr, session, &contact_name, seq, to, channel).await?;
             }
-            crate::client::otp_store::PendingOtpContent::File { filename, size } => {
-                recover_and_resend_file(
-                    wr,
-                    session,
-                    ui_state,
-                    &contact_name,
-                    seq,
-                    to,
-                    &recipient_pubkey_der,
-                    filename,
-                    size,
-                )
-                .await?;
+            crate::client::otp_store::PendingOtpContent::File { stream_id, .. } => {
+                recover_and_resend_file_offer(wr, session, &contact_name, seq, to, stream_id).await?;
+            }
+            crate::client::otp_store::PendingOtpContent::FileContent { stream_id } => {
+                recover_and_resend_file_content(session, &contact_name, seq, to, &recipient_pubkey_der, stream_id)
+                    .await?;
             }
             crate::client::otp_store::PendingOtpContent::Voice { duration_ms } => {
                 recover_and_resend_voice(
@@ -2130,17 +2164,62 @@ async fn recover_and_resend_text(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn recover_and_resend_file(
+/// Offer-phase recovery, mirroring `recover_and_resend_text` exactly: the
+/// offer is a genuine pad spend in its own right (`send_file_offer`'s
+/// doc), so recovering means recovering that same ciphertext, never
+/// re-encoding a fresh one - resent under the *same*
+/// `stream_id` the original offer used, so an eventual `FileAccepted` for
+/// it still finds the matching `OwnFileTarget` entry (only ever missing if
+/// this process itself restarted mid-transfer, since that map is
+/// in-memory only - a rarer, best-effort-only case this doesn't try to
+/// solve).
+async fn recover_and_resend_file_offer(
     wr: &mut impl crate::control::ControlSink,
     session: &mut SessionState,
-    ui_state: &mut UiState,
+    contact_name: &str,
+    seq: u64,
+    to: UserId,
+    stream_id: u64,
+) -> proto::Result<()> {
+    let Ok(Some(recovered)) =
+        otp_cli::recover_last(&session.otp_cli_cfg, contact_name, otp_cli::RecoverDirection::Sent).await
+    else {
+        return Ok(());
+    };
+    let envelope = Envelope {
+        content: Content::FileOffer,
+        blocks: vec![recovered],
+    };
+    session.peer_link.ensure_link(wr, to).await;
+    session.peer_link.send_reliable_or_queue(
+        to,
+        P2pPayload::OtpFileOffer {
+            channel: None,
+            stream_id,
+            seq,
+            envelope,
+        },
+    );
+    Ok(())
+}
+
+/// Content-phase recovery: the file was already accepted and its content
+/// already genuinely OTP-encrypted before the connection dropped -
+/// recovers that same ciphertext (`recover_last_file`, never a fresh
+/// encrypt) and restarts the chunked send from the beginning under the
+/// *same* `stream_id` the receiver already has `OtpIncomingFileReceive`
+/// state for, with a freshly resolved chunk key and a resent
+/// `StreamKeySetup`/`OtpFileContentSeq` ahead of the chunks - the receiving
+/// side's existing worker is expected to accept a restarted stream for a
+/// `stream_id` it already knows about.
+#[allow(clippy::too_many_arguments)]
+async fn recover_and_resend_file_content(
+    session: &mut SessionState,
     contact_name: &str,
     seq: u64,
     to: UserId,
     recipient_pubkey_der: &[u8],
-    filename: String,
-    size: u64,
+    stream_id: u64,
 ) -> proto::Result<()> {
     let temp_path = temp_content_path(&session.otp_cli_cfg, "otp-recover-send");
     let Ok(Some(())) = otp_cli::recover_last_file(
@@ -2155,29 +2234,6 @@ async fn recover_and_resend_file(
         return Ok(());
     };
     restrict_file_permissions(&temp_path);
-    let file_payload = crate::client::file_transfer::FileOfferPayload {
-        filename: filename.clone(),
-        size,
-    };
-    let Ok(plaintext) = proto::encode(&file_payload) else {
-        secure_remove_file(&temp_path);
-        return Ok(());
-    };
-    let stream_id = session.next_stream_id;
-    session.next_stream_id += 1;
-    let Some(envelope) = crate::client::envelope::encrypt_envelope_for(
-        session.own_pq_private.as_ref(),
-        session.pq_peer_keys.encap_for(to),
-        KeyMode::PqHybrid,
-        recipient_pubkey_der,
-        None,
-        stream_id,
-        &plaintext,
-        Content::FileOffer,
-    ) else {
-        secure_remove_file(&temp_path);
-        return Ok(());
-    };
     let Some(key) = crate::client::voice_stream::resolve_direct_key(
         session,
         stream_id,
@@ -2188,26 +2244,25 @@ async fn recover_and_resend_file(
         secure_remove_file(&temp_path);
         return Ok(());
     };
-    ui_state.log_own_file_offer_dm(to, stream_id, filename, size);
+    if let crate::client::voice_stream::DirectStreamKey::Pq(pq) = &key {
+        let setups = pq.setups();
+        for (id, setup) in setups {
+            session
+                .peer_link
+                .send_reliable_or_queue(id, P2pPayload::StreamKeySetup { stream_id, setup });
+        }
+    }
     session.otp_send_temp_files.insert(stream_id, temp_path.clone());
-    session.own_file_targets.insert(
-        stream_id,
-        crate::client::file_transfer::OwnFileTarget {
-            to,
-            path: temp_path,
-            key,
-            otp: None,
-        },
-    );
-    session.peer_link.ensure_link(wr, to).await;
-    session.peer_link.send_reliable_or_queue(
+    session
+        .peer_link
+        .send_reliable_or_queue(to, P2pPayload::OtpFileContentSeq { stream_id, seq });
+    crate::client::file_transfer::spawn_send_file_worker(
+        temp_path,
+        key,
         to,
-        P2pPayload::OtpFileOffer {
-            channel: None,
-            stream_id,
-            seq,
-            envelope,
-        },
+        stream_id,
+        session.record_out_tx.clone(),
+        session.file_events_tx.clone(),
     );
     Ok(())
 }

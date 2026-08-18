@@ -727,14 +727,18 @@ async fn accept_file_offer(
     // only the destination differs: a temp file, decrypted whole into
     // `final_path` once `handle_file_event`'s `ReceiveDone` runs
     // `client::otp::finish_incoming_file`.
-    let worker_dest = match (&offer.otp_contact_name, offer.otp_seq) {
-        (Some(contact_name), Some(seq)) => {
+    // `seq` starts `None` here - the content phase's own pad slot isn't
+    // reserved (or numbered) until the sender's `FileAccepted` handling
+    // actually runs `otp --encrypt`, named separately once
+    // `P2pEvent::OtpFileContentSeq` arrives (docs/PROTOCOL.md 16.2).
+    let worker_dest = match &offer.otp_contact_name {
+        Some(contact_name) => {
             let temp_path = crate::client::otp::temp_content_path(&session.otp_cli_cfg, "otp-recv");
             session.otp_incoming_file_receives.insert(
                 (from, stream_id),
                 file_transfer::OtpIncomingFileReceive {
                     contact_name: contact_name.clone(),
-                    seq,
+                    seq: None,
                     temp_path: temp_path.clone(),
                     kind: file_transfer::OtpIncomingKind::File {
                         final_path: final_path.clone(),
@@ -743,7 +747,7 @@ async fn accept_file_offer(
             );
             temp_path
         }
-        _ => final_path,
+        None => final_path,
     };
     let job_tx = file_transfer::spawn_receive_file_worker(
         key,
@@ -1011,40 +1015,34 @@ async fn handle_p2p_event(
             );
         }
         P2pEvent::FileAccepted { stream_id } => {
-            if let Some(target) = session.own_file_targets.remove(&stream_id) {
+            // `target` stays in `own_file_targets` here -
+            // `start_outgoing_file_content` may need to queue this stream
+            // behind another pending OTP send, in which case the entry
+            // (key included) must still be there whenever the queue
+            // finally drains it (`client::otp::start_outgoing_file_content`'s
+            // doc). It owns removal, and spawning the send worker, in
+            // every case (immediate, queued, and the plain non-OTP path
+            // alike).
+            if let Some(target) = session.own_file_targets.get(&stream_id) {
                 let me = ui_state.own_id.unwrap_or(UserId(0));
                 ui_state.set_file_progress(me, stream_id, 0);
                 // A pq_hybrid transfer's setup goes out before its first
                 // chunk, exactly as a voice stream's does after
                 // `StreamStart` - the chunks themselves are ciphertext only.
-                if let voice_stream::DirectStreamKey::Pq(pq) = &target.key {
-                    for (id, setup) in pq.setups() {
-                        session
-                            .peer_link
-                            .send_reliable_or_queue(id, P2pPayload::StreamKeySetup { stream_id, setup });
-                    }
+                let setups: Vec<(UserId, Vec<u8>)> = match &target.key {
+                    voice_stream::DirectStreamKey::Pq(pq) => pq.setups(),
+                    _ => Vec::new(),
+                };
+                for (id, setup) in setups {
+                    session
+                        .peer_link
+                        .send_reliable_or_queue(id, P2pPayload::StreamKeySetup { stream_id, setup });
                 }
-                let file_transfer::OwnFileTarget { to, path, key, otp: otp_slot } = target;
-                if let Some(send_path) =
-                    crate::client::otp::prepare_outgoing_file_content(wr, session, ui_state, stream_id, to, &path, otp_slot).await?
-                {
-                    file_transfer::spawn_send_file_worker(
-                        send_path,
-                        key,
-                        to,
-                        stream_id,
-                        session.record_out_tx.clone(),
-                        session.file_events_tx.clone(),
-                    );
-                }
+                crate::client::otp::start_outgoing_file_content(session, ui_state, stream_id).await?;
             }
         }
         P2pEvent::FileRejected { stream_id } => {
-            if let Some(target) = session.own_file_targets.remove(&stream_id) {
-                if let Some((contact_name, _seq)) = target.otp {
-                    crate::client::otp::release_pending_and_drain(wr, ui_state, session, target.to, &contact_name).await?;
-                }
-            }
+            session.own_file_targets.remove(&stream_id);
             let me = ui_state.own_id.unwrap_or(UserId(0));
             ui_state.set_file_rejected(me, stream_id);
         }
@@ -1121,10 +1119,16 @@ async fn handle_p2p_event(
             let from_name = name_of(ui_state, from);
             crate::client::otp::on_file_offer(
                 session, ui_state, channel, from, from_name, stream_id, seq, envelope,
-            );
+            )
+            .await;
         }
         P2pEvent::OtpDeliveryAck { from, seq } => {
             crate::client::otp::on_delivery_ack(wr, ui_state, session, from, seq).await?;
+        }
+        P2pEvent::OtpFileContentSeq { from, stream_id, seq } => {
+            if let Some(pending) = session.otp_incoming_file_receives.get_mut(&(from, stream_id)) {
+                pending.seq = Some(seq);
+            }
         }
         P2pEvent::OtpVoiceOffer {
             from,
@@ -1470,7 +1474,6 @@ fn handle_incoming_file_offer(
         stream_id,
         channel,
         otp_contact_name: None,
-        otp_seq: None,
     };
     if ui_state.is_trust_gated(from) {
         ui_state.hold_file_offer(offer);

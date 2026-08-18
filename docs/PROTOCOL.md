@@ -190,6 +190,7 @@ the payload carried inside a reliable or unreliable one.
 | `StreamKeySetup` | reliably | A `pq_hybrid` stream's key setup, sent once (§13.3) |
 | *(voice chunks)* | unreliably | The audio, as `Unreliable` datagrams (§7.3) |
 | `OtpEnvelope` / `OtpFileOffer` | reliably | A `pq_hybrid` send additionally wrapped by the one-time-pad layer (§16) |
+| `OtpFileContentSeq` | reliably | Names an accepted file's content-phase pad slot, independent of the offer's own (§16.2) |
 | `OtpVoiceOffer` | reliably | Offers a fully-recorded voice message under the pad layer - auto-accepted, no popup (§16.2) |
 | `OtpDeliveryAck` | reliably | Confirms an `OtpEnvelope`/`OtpFileOffer`/`OtpVoiceOffer` decoded, unblocking the next one (§16) |
 
@@ -2678,39 +2679,61 @@ previous one is confirmed delivered) - here answered with the only thing
 that can actually prove delivery across a network: a message from the
 peer that received it.
 
-**File content.** A file's *offer* (name, size) travels as an ordinary,
-unwrapped `pq_hybrid` `OtpFileOffer` - not itself pad-encrypted - carrying
-only this layer's `seq` as a marker of which ack-gate slot it reserves.
-Only the file's actual bytes are pad-protected, and only once the offer
-is accepted (the same consent gate a non-OTP file already has):
+**File content.** A file's *offer* is itself a genuine, independent pad
+spend - `OtpFileOffer`'s `envelope` is wrapped through the pad exactly like
+an ordinary `OtpEnvelope` (§16.2 above). This costs a bit of pad on every
+offer, including ones later rejected - an accepted tradeoff for keeping
+the filename and size off the wire in the clear, deliberately made in
+favour of privacy over pad economy. The file's actual *content*, once
+accepted, is a **second, wholly independent** pad spend, named by its own
+`seq` (carried by `OtpFileContentSeq`, not the offer's) and closed by its
+own `OtpDeliveryAck` - two pad-protected round trips per file:
 
 ```
- alice                                              bob
-   |--- OtpFileOffer { stream_id, seq, envelope } ----->|   envelope: ordinary pq_hybrid
-   |<-- FileAccept { stream_id } ------------------------|
-   |    (encrypts the file whole through the pad,
-   |     into a local temp file)
-   |--- FileChunk { stream_id, seq, blocks } ----------->|   any number, as today (§7.6)
-   |--- FileEnd { stream_id } --------------------------->|
+ alice                                                bob
+   |--- OtpFileOffer { stream_id, seq: A, envelope } ---->|   envelope: pad-wrapped pq_hybrid
+   |<-- OtpDeliveryAck { seq: A } -------------------------|   the instant bob decrypts + queues
+   |                                                       |   the popup - independent of accept
+   |<-- FileAccept { stream_id } ---------------------------|
+   |    (reserves a *second*, independent pad slot,
+   |     encrypts the file whole through it into a
+   |     local temp file)
+   |--- OtpFileContentSeq { stream_id, seq: B } ---------->|   names the content-phase slot
+   |--- FileChunk { stream_id, seq, blocks } -------------->|   any number, as today (§7.6)
+   |--- FileEnd { stream_id } ------------------------------>|
    |    (bob decrypts the assembled temp file
    |     whole through the pad, into the real
    |     download, then deletes the temp copy)
-   |<-- OtpDeliveryAck { seq } ---------------------------|
+   |<-- OtpDeliveryAck { seq: B } --------------------------|
 ```
 
 Each `FileChunk` is still individually `pq_hybrid`/PQ-sealed exactly as an
 ordinary transfer's chunks are (§7.6) - the pad layer wraps the file's
 plaintext *once, whole*, before that chunking ever runs, rather than
 per-chunk (the same reasoning §16.1 gives for the key-setup pad itself:
-no per-chunk framing is cheap enough to spend pad material against). This
-is why the ack-gate slot is reserved locally the moment the offer is
-sent, but the pad is not actually touched until `FileAccept` arrives:
-running `otp --encrypt` before knowing whether the offer is even wanted
-would burn irreplaceable pad material for nothing. If the offer is
-rejected, or the whole-file encrypt itself fails, that reserved slot is
-released locally without ever having spent the pad, and any message
-queued behind it is sent immediately - no `OtpDeliveryAck` was ever going
-to arrive for a pad that was never touched.
+no per-chunk framing is cheap enough to spend pad material against).
+
+Splitting the offer and the content into two independent slots is not
+optional bookkeeping - the pad tool itself refuses a second `--encrypt`
+for a contact before the first is confirmed delivered (§16.2 above), so
+one slot could never honestly cover both. The content-phase reservation
+is made only once the file-content encrypt genuinely succeeds (the same
+reserve-after-spent ordering the offer and every text send already use),
+so a genuine encrypt failure there needs no gate release either - nothing
+was ever reserved to begin with. If the *content*-phase gate happens to be
+busy when `FileAccept` arrives (something else is mid-flight for this
+contact), the content encrypt is queued and retried the moment that
+other send's ack clears the gate - the accepted offer itself is never
+re-sent or re-decided, only the pad-protected encrypt of its bytes waits.
+
+Because the offer is a genuine pad spend, its recovery follows exactly
+the same rule AC-147/§16.2 gives every other pad-protected send:
+once it has left the machine, nothing may encrypt a fresh offer to that
+contact again until either a real `OtpDeliveryAck` arrives or
+`recover_and_resend` replays the *exact* ciphertext already sent - never a
+freshly re-encoded one. A user who goes offline before the offer's ack
+arrives has no other path forward; the next reconnect's recovery pass is
+what resumes it.
 
 **Voice content.** Recording under this layer is never live: there is no
 per-chunk framing cheap enough to make streaming practical against a

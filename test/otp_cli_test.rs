@@ -129,7 +129,7 @@ async fn provisioning_then_has_contact_is_true_on_both_sides() {
     assert!(otp_cli::has_contact(&bob_cfg, "alice").await.unwrap());
 }
 
-/// @requirement AC-136
+/// @requirement AC-136, AC-148
 #[tokio::test]
 async fn a_message_encrypted_by_alice_decrypts_to_the_same_bytes_for_bob() {
     if !require_otp() {

@@ -336,15 +336,16 @@ pub struct PendingFileOffer {
     /// `Some(channel)` if this offer arrived via a channel send, `None` for
     /// a DM - decides which log the accepted row goes into.
     pub channel: Option<String>,
-    /// `Some((contact_name, seq))` if this offer arrived via
+    /// `Some(contact_name)` if this offer arrived via
     /// `client::otp::on_file_offer` - accepting it then routes the
     /// incoming content through the OTP-decrypt path
     /// (`session::accept_file_offer`) instead of writing chunks straight
-    /// to the final destination, and `seq` is what the eventual
-    /// `OtpDeliveryAck` names once the whole file has arrived and been
-    /// decrypted. `None` for an ordinary (non-OTP) offer.
+    /// to the final destination. The content phase's own OTP `seq` isn't
+    /// known yet at this point - it's a separate pad spend, reserved only
+    /// once the sender's `FileAccepted` handling runs, and arrives
+    /// separately as `P2pEvent::OtpFileContentSeq` (docs/PROTOCOL.md
+    /// 16.2). `None` here for an ordinary (non-OTP) offer.
     pub otp_contact_name: Option<String>,
-    pub otp_seq: Option<u64>,
 }
 
 /// Which button is focused in the file-offer popup - `Accept` by default

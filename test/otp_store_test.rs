@@ -71,25 +71,6 @@ fn record_acked_clears_the_gate_only_on_a_matching_sequence() {
     assert!(!store.record_acked("alice-bob", 5));
 }
 
-/// @requirement AC-145
-#[test]
-fn clear_pending_releases_the_gate_regardless_of_sequence() {
-    let mut store = OtpStore::new_empty(temp_store_path());
-    store.record_sent("alice-bob", 7, PendingOtpContent::Text { channel: None });
-    assert!(store.clear_pending("alice-bob"));
-    assert_eq!(store.get("alice-bob").unwrap().pending_unacked_out_seq, None);
-
-    // Nothing to release the second time.
-    assert!(!store.clear_pending("alice-bob"));
-}
-
-/// @requirement AC-145
-#[test]
-fn clear_pending_on_an_unknown_contact_is_a_no_op() {
-    let mut store = OtpStore::new_empty(temp_store_path());
-    assert!(!store.clear_pending("nobody"));
-}
-
 /// @requirement AC-137
 #[test]
 fn record_received_only_accepts_the_exact_next_sequence() {
@@ -170,9 +151,15 @@ fn pending_content_round_trips_through_save_and_load() {
         "file-contact",
         3,
         PendingOtpContent::File {
+            stream_id: 9,
             filename: "report.pdf".to_string(),
             size: 123456,
         },
+    );
+    store.record_sent(
+        "file-content-contact",
+        4,
+        PendingOtpContent::FileContent { stream_id: 9 },
     );
     store.record_sent("voice-contact", 1, PendingOtpContent::Voice { duration_ms: 4200 });
     store.save().unwrap();
@@ -191,9 +178,14 @@ fn pending_content_round_trips_through_save_and_load() {
     assert_eq!(
         loaded.get("file-contact").unwrap().pending_content,
         Some(PendingOtpContent::File {
+            stream_id: 9,
             filename: "report.pdf".to_string(),
             size: 123456
         })
+    );
+    assert_eq!(
+        loaded.get("file-content-contact").unwrap().pending_content,
+        Some(PendingOtpContent::FileContent { stream_id: 9 })
     );
     assert_eq!(
         loaded.get("voice-contact").unwrap().pending_content,
@@ -220,15 +212,11 @@ fn a_line_written_before_pending_content_existed_still_loads() {
 
 /// @requirement TB-188, AC-147
 #[test]
-fn record_acked_and_clear_pending_both_clear_pending_content() {
+fn record_acked_clears_pending_content() {
     let mut store = OtpStore::new_empty(temp_store_path());
     store.record_sent("acked", 0, PendingOtpContent::Text { channel: None });
     assert!(store.record_acked("acked", 0));
     assert_eq!(store.get("acked").unwrap().pending_content, None);
-
-    store.record_sent("released", 0, PendingOtpContent::Text { channel: None });
-    assert!(store.clear_pending("released"));
-    assert_eq!(store.get("released").unwrap().pending_content, None);
 }
 
 /// @requirement TB-188, AC-147

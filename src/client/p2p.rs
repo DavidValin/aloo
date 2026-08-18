@@ -208,6 +208,14 @@ pub enum P2pEvent {
         from: UserId,
         seq: u64,
     },
+    /// Mirrors `p2p_proto::P2pPayload::OtpFileContentSeq` - names an
+    /// accepted file transfer's content-phase pad slot, independent of the
+    /// offer's own `seq`.
+    OtpFileContentSeq {
+        from: UserId,
+        stream_id: u64,
+        seq: u64,
+    },
     /// OTP-wrapped counterpart of a voice offer - mirrors `OtpFileOffer`,
     /// DM-only (unlike `FileOffer`, never carries a `channel`).
     OtpVoiceOffer {
@@ -984,6 +992,9 @@ impl PeerLinkManager {
                 envelope,
             },
             P2pPayload::OtpDeliveryAck { seq } => P2pEvent::OtpDeliveryAck { from, seq },
+            P2pPayload::OtpFileContentSeq { stream_id, seq } => {
+                P2pEvent::OtpFileContentSeq { from, stream_id, seq }
+            }
             P2pPayload::OtpVoiceOffer {
                 stream_id,
                 seq,

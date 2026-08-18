@@ -120,13 +120,16 @@ pub(crate) struct OwnFileTarget {
     pub(crate) to: UserId,
     pub(crate) path: PathBuf,
     pub(crate) key: DirectStreamKey,
-    /// `Some((contact_name, seq))` if this transfer's *offer* already
-    /// reserved an OTP send-path slot (`client::otp::send_file_offer`) -
-    /// `FileAccepted` then OTP-encrypts `path` into a temp file and
-    /// streams that instead, exactly the content-protection
-    /// `client::otp`'s module doc describes. `None` for an ordinary
+    /// `Some(contact_name)` if this transfer is under OTP - the *offer*
+    /// already spent its own independent pad slot to reach the peer
+    /// (`client::otp::send_file_offer`); `FileAccepted` then reserves a
+    /// second, separate slot to OTP-encrypt `path` into a temp file and
+    /// streams that instead (`client::otp::start_outgoing_file_content`) -
+    /// two independent pad spends, two independent acks, since the pad
+    /// tool never allows a second `--encrypt` before the first is
+    /// confirmed delivered (docs/PROTOCOL.md 16.2). `None` for an ordinary
     /// (non-OTP) transfer, unchanged from before this field existed.
-    pub(crate) otp: Option<(String, u64)>,
+    pub(crate) otp: Option<String>,
 }
 
 /// Bookkeeping for one currently-arriving incoming file transfer - mirrors
@@ -158,9 +161,18 @@ pub(crate) enum OtpIncomingKind {
 /// `otp_cli::decrypt_file` from `temp_path` and finalizes per `kind`,
 /// removes the temp file, and only then acknowledges `seq` back to the
 /// sender.
+///
+/// `seq` is the *content* phase's own OTP sequence number, distinct from
+/// the offer's - a file offer's `seq` only ever names the offer's own pad
+/// slot (docs/PROTOCOL.md 16.2), so for a file this starts `None` at
+/// accept time and is filled in once `P2pEvent::OtpFileContentSeq` arrives
+/// (sent once, reliably, ahead of the first `FileChunk`). A voice message
+/// has no separate accept step - its one offer/content seq is one and the
+/// same, known immediately, so `on_voice_offer` sets this to `Some` right
+/// away.
 pub(crate) struct OtpIncomingFileReceive {
     pub(crate) contact_name: String,
-    pub(crate) seq: u64,
+    pub(crate) seq: Option<u64>,
     pub(crate) temp_path: PathBuf,
     pub(crate) kind: OtpIncomingKind,
 }

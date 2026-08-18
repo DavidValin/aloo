@@ -144,7 +144,13 @@ pub enum P2pPayload {
         seq: u64,
         envelope: Envelope,
     },
-    /// `OtpEnvelope`'s file-offer counterpart, mirroring `FileOffer`.
+    /// `OtpEnvelope`'s file-offer counterpart, mirroring `FileOffer` -
+    /// `envelope`'s single `blocks` element is, exactly like `OtpEnvelope`'s,
+    /// a `pq_hybrid` blob additionally piped through `otp -c <contact>
+    /// --encrypt`: the offer (filename + size) is a genuine pad spend in
+    /// its own right (docs/PROTOCOL.md 16.2). `seq` names *this* pad slot
+    /// alone; the file's actual content, once accepted, reserves and acks
+    /// an independent second slot named by `OtpFileContentSeq`.
     OtpFileOffer {
         channel: Option<String>,
         stream_id: u64,
@@ -156,6 +162,17 @@ pub enum P2pPayload {
     /// acknowledgement that lets the sender honestly pass `-y` to `otp`'s
     /// own delivery-confirmation gate for its next send to this contact.
     OtpDeliveryAck {
+        seq: u64,
+    },
+    /// Names an accepted file transfer's *content*-phase OTP pad slot,
+    /// sent once, reliably, right after the sender reserves it (once the
+    /// content is genuinely OTP-encrypted) and before the first
+    /// `FileChunk` - independent of `OtpFileOffer`'s own `seq`, which only
+    /// ever named the offer itself (docs/PROTOCOL.md 16.2). The receiver
+    /// names this `seq` in the `OtpDeliveryAck` it sends once the whole
+    /// file has arrived and been decrypted.
+    OtpFileContentSeq {
+        stream_id: u64,
         seq: u64,
     },
     /// `OtpFileOffer`'s voice counterpart - carries a `Content::VoiceOffer`
