@@ -179,7 +179,11 @@ async fn connect_and_handshake(
 > {
     let (identity, key_mode) = resolve_my_keypair(&request.my_key)?;
 
-    let stream = TcpStream::connect((request.host.as_str(), request.port)).await?;
+    // Prefer IPv4 when the hostname resolves to both families. Docker's IPv6
+    // UDP port publishing often poisons STUN (observed address becomes
+    // 172.17.0.1) while IPv4 returns the client's real public endpoint.
+    let server_addr = resolve_server_prefer_ipv4(&request.host, request.port).await?;
+    let stream = TcpStream::connect(server_addr).await?;
     // The server's UDP rendezvous socket binds the same numeric port on the
     // same address (`server::run`) - captured here, before the stream
     // splits, since `peer_addr` needs the whole `TcpStream` and this is the
@@ -247,6 +251,18 @@ async fn connect_and_handshake(
     let you = you.ok_or("server accepted identify but returned no user id")?;
 
     Ok((rd, wr, you, identity, key_mode, server_addr))
+}
+
+/// Resolves `host:port`, preferring IPv4 when both A and AAAA records exist.
+async fn resolve_server_prefer_ipv4(host: &str, port: u16) -> Result<std::net::SocketAddr, BoxError> {
+    let mut addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host, port))
+        .await?
+        .collect();
+    if addrs.is_empty() {
+        return Err(format!("no addresses for {host}:{port}").into());
+    }
+    addrs.sort_by_key(|a| a.is_ipv6());
+    Ok(addrs[0])
 }
 
 /// `PqHybrid` is never generated in-process here - always loaded from the

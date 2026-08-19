@@ -1110,6 +1110,7 @@ async fn handle_server_message(
                     .peer_link
                     .on_peer_candidates(wr, from, candidates, link_nonce)
                     .await;
+            } else {
             }
         }
         ServerMessage::Error { message } => eprintln!("aloo: server error: {message}"),

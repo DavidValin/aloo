@@ -7,7 +7,7 @@
 //! transport" section and `crate::client::p2p`.
 
 use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use crate::proto::Envelope;
 
@@ -32,6 +32,30 @@ pub const SAFE_DATAGRAM_BYTES: usize = 1200;
 pub enum RendezvousMessage {
     BindingRequest { token: u64 },
     BindingResponse { token: u64, observed: SocketAddr },
+}
+
+/// Whether `observed` from a STUN-style `BindingResponse` is safe to treat
+/// as this client's public, peer-punchable address. Docker's default UDP
+/// port publishing often makes the server see the docker-bridge address
+/// (e.g. `172.17.0.1`) instead of the client's real public endpoint -
+/// advertising that poisons hole punch across separate networks.
+pub fn is_usable_reflexive_observed(addr: SocketAddr) -> bool {
+    match addr.ip() {
+        IpAddr::V4(v4) => {
+            !(v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_unspecified()
+                || v4.octets()[0] == 0)
+        }
+        IpAddr::V6(v6) => {
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_unique_local()
+                || (v6.segments()[0] & 0xffc0) == 0xfe80)
+        }
+    }
 }
 
 /// Client <-> client, once each side knows the other's candidate addresses

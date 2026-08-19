@@ -813,7 +813,8 @@ impl PeerLinkManager {
     pub fn on_datagram_at(&mut self, addr: SocketAddr, dgram: PunchDatagram, now: Instant) {
         match dgram {
             PunchDatagram::Ping { link_nonce } => {
-                let Some(peer) = self.attribute(addr, link_nonce) else {
+                let peer = self.attribute(addr, link_nonce);
+                let Some(peer) = peer else {
                     // An unsolicited probe from a stranger, or a stale
                     // candidate from a link that has moved on: answering
                     // would confirm this socket is live to anyone who
@@ -834,7 +835,8 @@ impl PeerLinkManager {
                 self.send_pings(peer);
             }
             PunchDatagram::Pong { link_nonce } => {
-                let Some(peer) = self.attribute(addr, link_nonce) else {
+                let peer = self.attribute(addr, link_nonce);
+                let Some(peer) = peer else {
                     return;
                 };
                 self.on_pong(peer, addr, link_nonce, now);
@@ -910,6 +912,10 @@ impl PeerLinkManager {
             return;
         };
         if token != self.reflexive_token || self.reflexive == Some(observed) {
+            return;
+        }
+        if !crate::p2p_proto::is_usable_reflexive_observed(observed) {
+            warn_unusable_reflexive(observed);
             return;
         }
         self.reflexive = Some(observed);
@@ -1550,7 +1556,10 @@ async fn learn_reflexive_candidate(
                 continue;
             };
             if got_token == token {
-                return Some(observed);
+                if crate::p2p_proto::is_usable_reflexive_observed(observed) {
+                    return Some(observed);
+                }
+                warn_unusable_reflexive(observed);
             }
         }
     }
@@ -1559,6 +1568,24 @@ async fn learn_reflexive_candidate(
 
 fn encode_dgram_rendezvous(msg: &RendezvousMessage) -> Vec<u8> {
     proto::encode(msg).unwrap_or_default()
+}
+
+static WARNED_UNUSABLE_REFLEXIVE: std::sync::OnceLock<std::sync::Mutex<bool>> =
+    std::sync::OnceLock::new();
+
+fn warn_unusable_reflexive(observed: SocketAddr) {
+    let warned = WARNED_UNUSABLE_REFLEXIVE.get_or_init(|| std::sync::Mutex::new(false));
+    let mut warned = warned.lock().unwrap_or_else(|e| e.into_inner());
+    if *warned {
+        return;
+    }
+    *warned = true;
+    eprintln!(
+        "aloo: server STUN returned an unusable reflexive address ({observed}) - \
+         usually Docker UDP port publishing without host networking. \
+         Cross-network hole punch will not work until the server's UDP rendezvous \
+         sees clients' real public addresses (see docs/SERVER_ON_DOCKER.md)."
+    );
 }
 
 /// Spawned once per session (mirrors `session.rs`'s TCP-reader task):
@@ -1606,7 +1633,9 @@ pub fn spawn_receive_loop(
                     .ok()
                     .map(InboundDatagram::Punch)
             };
-            let Some(decoded) = decoded else { continue };
+            let Some(decoded) = decoded else {
+                continue;
+            };
             if raw_tx.send((addr, decoded)).is_err() {
                 // The receiving end (`session.rs`'s `p2p_raw_rx`) is gone,
                 // meaning the whole session has already ended - nothing

@@ -235,6 +235,15 @@ fn rendezvous_messages_roundtrip() {
     );
 }
 
+#[test]
+fn usable_reflexive_observed_rejects_docker_bridge() {
+    use aloo::p2p_proto::is_usable_reflexive_observed;
+    assert!(!is_usable_reflexive_observed("172.17.0.1:38082".parse().unwrap()));
+    assert!(!is_usable_reflexive_observed("10.0.0.5:1234".parse().unwrap()));
+    assert!(!is_usable_reflexive_observed("127.0.0.1:1".parse().unwrap()));
+    assert!(is_usable_reflexive_observed("203.0.113.5:4000".parse().unwrap()));
+}
+
 /// @requirement TB-143
 #[test]
 fn punch_datagrams_roundtrip() {
