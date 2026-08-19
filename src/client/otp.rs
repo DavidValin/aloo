@@ -569,6 +569,27 @@ async fn send_key_setup_chunked(
     payload: &crypto::otp::OtpKeySetupPayload,
 ) -> proto::Result<()> {
     let total_len = payload.peer_encryption_key.len() as u32;
+    // Every chunk of a pad has to arrive, in order, for the receiving side
+    // to reassemble anything at all - a pad with its front missing is not a
+    // smaller pad, it is a malformed setup message. The link's queue drops
+    // its oldest entries once `PENDING_MAX` is reached, so a pad that cannot
+    // fit in it whole is refused here rather than being sent, truncated, and
+    // rejected on the far side.
+    let chunks = (total_len as usize).div_ceil(OTP_SETUP_CHUNK_BYTES);
+    if chunks > crate::client::p2p::PENDING_MAX {
+        notify(
+            ui_state,
+            pending.peer,
+            &pending.peer_name,
+            format!(
+                "OTP session failed: a {}MB pad is too large to provision over a direct link                  (limit is {}MB per key) - try a smaller size",
+                payload.keypair_size_mb,
+                crate::client::p2p::PENDING_MAX * OTP_SETUP_CHUNK_BYTES / (1024 * 1024),
+            ),
+            false,
+        );
+        return Ok(());
+    }
     let mut offset: u32 = 0;
     loop {
         let end = (offset as usize + OTP_SETUP_CHUNK_BYTES).min(total_len as usize) as u32;
@@ -647,7 +668,7 @@ async fn send_key_setup_chunked(
 /// bincode/ARQ framing must still fit alongside two chunks this size
 /// inside one UDP datagram (~65KB hard ceiling, no fragmentation below
 /// this layer) - 16KB leaves generous headroom.
-const OTP_SETUP_CHUNK_BYTES: usize = 16 * 1024;
+pub const OTP_SETUP_CHUNK_BYTES: usize = 16 * 1024;
 
 /// Reports what happened to a just-queued OTP setup/session-request send:
 /// `Active` means it genuinely went out on the wire right now, `Pending`
@@ -750,11 +771,18 @@ pub(crate) fn on_key_setup(
         let mut fresh = crypto::otp::OtpKeySetupReassembly::new(&chunk);
         if !fresh.accept(&chunk) {
             session.otp_incoming_setup.remove(&from);
+            // A chunk that isn't the start of a pad, with nothing
+            // accumulated for it to continue: the chunks before it never
+            // arrived. Reassembly cannot recover from that - say so in the
+            // terms that let the sender act on it, rather than blaming the
+            // one message that did arrive.
             notify(
                 ui_state,
                 from,
                 &from_name,
-                format!("OTP: received a malformed setup message from {from_name}"),
+                format!(
+                    "OTP: the setup from {from_name} arrived incomplete (its first part is                      missing) - ask them to run /otp again"
+                ),
                 false,
             );
             return;

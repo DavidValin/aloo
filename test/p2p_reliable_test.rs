@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use aloo::client::p2p_reliable::{ArqReceiver, ArqSender, MAX_RETRIES};
+use aloo::client::p2p_reliable::{ArqReceiver, ArqSender, MAX_RETRIES, SEND_WINDOW};
 
 // ---------------------------------------------------------------------
 // ArqReceiver: in-order delivery under reordering/duplication
@@ -79,7 +79,7 @@ fn reorder_buffer_bound_fails_the_link_rather_than_growing_unbounded() {
 #[test]
 fn unacked_frame_is_not_retransmitted_before_its_backoff_elapses() {
     let mut tx = ArqSender::new();
-    tx.send(vec![1, 2, 3]);
+    tx.send(vec![1, 2, 3]).expect("first frame goes out immediately");
     let due = tx.due_for_retransmit(Instant::now()).unwrap();
     assert!(
         due.is_empty(),
@@ -91,7 +91,7 @@ fn unacked_frame_is_not_retransmitted_before_its_backoff_elapses() {
 #[test]
 fn acked_frame_is_never_retransmitted() {
     let mut tx = ArqSender::new();
-    let seq = tx.send(vec![9]);
+    let (seq, _) = tx.send(vec![9]).expect("first frame goes out immediately");
     tx.on_ack(seq);
     assert!(!tx.has_pending());
     let far_future = Instant::now() + Duration::from_secs(60);
@@ -102,7 +102,7 @@ fn acked_frame_is_never_retransmitted() {
 #[test]
 fn unacked_frame_is_retransmitted_after_its_backoff_elapses() {
     let mut tx = ArqSender::new();
-    let seq = tx.send(vec![7, 7]);
+    let (seq, _) = tx.send(vec![7, 7]).expect("first frame goes out immediately");
     // Simulate time passing by checking well past the initial backoff.
     let later = Instant::now() + Duration::from_millis(500);
     let due = tx.due_for_retransmit(later).unwrap();
@@ -113,7 +113,7 @@ fn unacked_frame_is_retransmitted_after_its_backoff_elapses() {
 #[test]
 fn frame_exceeding_max_retries_fails_the_sender() {
     let mut tx = ArqSender::new();
-    tx.send(vec![1]);
+    tx.send(vec![1]).expect("first frame goes out immediately");
     let mut now = Instant::now();
     for _ in 0..MAX_RETRIES {
         now += Duration::from_secs(10); // comfortably past any backoff
@@ -124,5 +124,127 @@ fn frame_exceeding_max_retries_fails_the_sender() {
     assert!(
         tx.due_for_retransmit(now).is_err(),
         "exceeding MAX_RETRIES must fail the whole send"
+    );
+}
+
+// ---------------------------------------------------------------------
+// ArqSender: the send window that keeps a bulk hand-off (an OTP pad) from
+// arriving as one unpaceable burst
+// ---------------------------------------------------------------------
+
+/// @requirement TB-202
+#[test]
+fn only_send_window_frames_go_out_at_once() {
+    let mut tx = ArqSender::new();
+    let sent: Vec<_> = (0..SEND_WINDOW + 20)
+        .map(|i| tx.send(vec![i as u8]))
+        .collect();
+    assert!(
+        sent[..SEND_WINDOW].iter().all(Option::is_some),
+        "the first SEND_WINDOW frames go straight onto the wire"
+    );
+    assert!(
+        sent[SEND_WINDOW..].iter().all(Option::is_none),
+        "everything past the window waits rather than being blasted out"
+    );
+}
+
+/// @requirement TB-202
+#[test]
+fn an_ack_releases_the_next_backlogged_frame_in_order() {
+    let mut tx = ArqSender::new();
+    let mut on_wire: Vec<(u32, Vec<u8>)> = (0..SEND_WINDOW + 3)
+        .filter_map(|i| tx.send(vec![i as u8]))
+        .collect();
+    // Ack the in-flight frames oldest-first; each retires one and releases
+    // exactly one backlogged frame.
+    for i in 0..3u32 {
+        let released = tx.on_ack(i);
+        assert_eq!(
+            released.len(),
+            1,
+            "each cumulative ack advancing the frontier by one frees exactly one slot"
+        );
+        on_wire.extend(released);
+    }
+    let order: Vec<u8> = on_wire.iter().map(|(_, p)| p[0]).collect();
+    let expected: Vec<u8> = (0..SEND_WINDOW as u8 + 3).collect();
+    assert_eq!(
+        order, expected,
+        "frames must reach the wire in the order they were handed over"
+    );
+    let seqs: Vec<u32> = on_wire.iter().map(|(seq, _)| *seq).collect();
+    let expected_seqs: Vec<u32> = (0..SEND_WINDOW as u32 + 3).collect();
+    assert_eq!(
+        seqs, expected_seqs,
+        "sequence numbers are assigned on the way out, so the peer sees one gapless run"
+    );
+}
+
+/// @requirement TB-202
+#[test]
+fn a_duplicate_ack_does_not_pull_the_backlog_forward() {
+    let mut tx = ArqSender::new();
+    for i in 0..SEND_WINDOW + 2 {
+        tx.send(vec![i as u8]);
+    }
+    assert_eq!(tx.on_ack(0).len(), 1, "the first ack releases a frame");
+    assert!(
+        tx.on_ack(0).is_empty(),
+        "a replayed ack for an already-retired frame releases nothing"
+    );
+}
+
+/// @requirement TB-202
+#[test]
+fn reset_hands_back_in_flight_and_backlogged_frames_in_order() {
+    let mut tx = ArqSender::new();
+    for i in 0..SEND_WINDOW + 5 {
+        tx.send(vec![i as u8]);
+    }
+    let requeued: Vec<u8> = tx.reset().into_iter().map(|p| p[0]).collect();
+    let expected: Vec<u8> = (0..SEND_WINDOW as u8 + 5).collect();
+    assert_eq!(
+        requeued, expected,
+        "a re-punched link must re-send everything undelivered, in the original order"
+    );
+    assert!(!tx.has_pending(), "reset leaves nothing behind");
+}
+
+/// @requirement TB-202
+#[test]
+fn a_backlogged_frame_still_counts_as_pending() {
+    let mut tx = ArqSender::new();
+    for i in 0..SEND_WINDOW + 1 {
+        tx.send(vec![i as u8]);
+    }
+    // Retire every in-flight frame; the one still backlogged is released by
+    // the first of those acks, so something is always outstanding.
+    for i in 0..SEND_WINDOW as u32 {
+        tx.on_ack(i);
+    }
+    assert!(
+        tx.has_pending(),
+        "the frame released into the window is still awaiting its own ack"
+    );
+}
+
+/// The window is what keeps a bulk sender from ever driving a well-behaved
+/// receiver into `REORDER_BUFFER_LIMIT` - the failure an OTP pad transfer
+/// used to hit head-on.
+/// @requirement TB-202
+#[test]
+fn a_full_window_lost_in_flight_stays_within_the_receivers_reorder_bound() {
+    let mut tx = ArqSender::new();
+    let frames: Vec<_> = (0..SEND_WINDOW).filter_map(|i| tx.send(vec![i as u8])).collect();
+    let mut rx = ArqReceiver::new();
+    // Worst case: the very first frame is lost and every other frame of the
+    // window arrives, so all of them have to be buffered.
+    for (seq, payload) in frames.iter().skip(1) {
+        rx.receive(*seq, payload.clone());
+    }
+    assert!(
+        !rx.failed(),
+        "a full window in flight must stay inside the receiver's reorder buffer"
     );
 }

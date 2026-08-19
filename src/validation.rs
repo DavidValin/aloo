@@ -64,3 +64,41 @@ pub fn channel_password_is_valid(password: &str) -> bool {
 pub fn is_storable(s: &str) -> bool {
     !s.contains('\t') && !s.contains('\n') && !s.contains('\r')
 }
+
+/// The address the server should listen on, from a `--bind` value (or the
+/// `server_bind` setting) and a port.
+///
+/// Parsing the host on its own, rather than pasting `"{bind}:{port}"`
+/// together and parsing that as a whole socket address, is what makes an
+/// IPv6 bind work at all: `"::"` and `"::1"` produce `":::7878"` and
+/// `"::1:7878"`, neither of which is a valid socket address, so every plain
+/// IPv6 form was rejected outright and only the bracketed `"[::]"` spelling
+/// - which nothing documents or suggests - could be used. A bracketed form
+/// is still accepted, since that is what the flag's own error message used
+/// to push people towards and what any surviving settings file may hold.
+///
+/// A host name is deliberately still not accepted: which of a name's
+/// addresses to bind is ambiguous, and the answer decides which address
+/// family clients (and therefore the direct-link UDP sockets they derive
+/// from it) end up using.
+pub fn parse_bind_addr(bind: &str, port: u16) -> Result<std::net::SocketAddr, String> {
+    let host = bind.trim();
+    // `[::]` / `[::1]`: the bracketed spelling, with the brackets serving
+    // only to separate host from port in a combined string that isn't used
+    // here.
+    let unbracketed = match (host.strip_prefix('['), host.strip_suffix(']')) {
+        (Some(_), Some(_)) => &host[1..host.len() - 1],
+        _ => host,
+    };
+    unbracketed
+        .parse::<std::net::IpAddr>()
+        .map(|ip| std::net::SocketAddr::new(ip, port))
+        .map_err(|_| {
+            format!(
+                "not a valid IP address to bind: {bind:?} - use an address such as \
+                 0.0.0.0 (every IPv4 interface), :: (every interface of both \
+                 families, where the OS allows it), or a specific interface's own \
+                 address"
+            )
+        })
+}

@@ -255,14 +255,38 @@ async fn connect_and_handshake(
 
 /// Resolves `host:port`, preferring IPv4 when both A and AAAA records exist.
 async fn resolve_server_prefer_ipv4(host: &str, port: u16) -> Result<std::net::SocketAddr, BoxError> {
-    let mut addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host, port))
+    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host, port))
         .await?
         .collect();
-    if addrs.is_empty() {
-        return Err(format!("no addresses for {host}:{port}").into());
-    }
-    addrs.sort_by_key(|a| a.is_ipv6());
-    Ok(addrs[0])
+    prefer_ipv4(&addrs).ok_or_else(|| format!("no addresses for {host}:{port}").into())
+}
+
+/// Picks which resolved address to connect to: the first IPv4 one, or the
+/// first of any family when the host has no A record at all. `None` only for
+/// an empty list, which is a resolution failure rather than a choice.
+///
+/// Preferring IPv4 is not a general-purpose policy - it is specifically
+/// about the UDP rendezvous that rides the same host and port. A server
+/// reached over IPv6 through Docker's default port publishing sees clients
+/// through the bridge, so its STUN answer reports the bridge's own address
+/// as the client's public one; the IPv4 path on the same server commonly
+/// reports the client's real endpoint. Since an unusable observation costs
+/// cross-network punching entirely (`p2p_proto::is_usable_reflexive_observed`
+/// can only refuse it, not repair it), the family that tends to yield a true
+/// observation is worth preferring at connect time.
+///
+/// Order within a family is left exactly as the resolver returned it, which
+/// is what lets DNS-level ordering (round-robin, sorted by RFC 6724 policy)
+/// still mean something.
+///
+/// `pub` purely so `test/connect_test.rs` can exercise the choice without a
+/// live resolver, the same way `resolve_my_keypair` is exposed below.
+pub fn prefer_ipv4(addrs: &[std::net::SocketAddr]) -> Option<std::net::SocketAddr> {
+    addrs
+        .iter()
+        .find(|a| a.is_ipv4())
+        .or_else(|| addrs.first())
+        .copied()
 }
 
 /// `PqHybrid` is never generated in-process here - always loaded from the

@@ -244,6 +244,55 @@ fn usable_reflexive_observed_rejects_docker_bridge() {
     assert!(is_usable_reflexive_observed("203.0.113.5:4000".parse().unwrap()));
 }
 
+/// A dual-stack server sees every IPv4 client through one socket bound to
+/// `::`, so an IPv4 client's own observation normally comes back in
+/// IPv4-mapped form - which means mapped form is the *common* case here,
+/// not an exotic one. Judged as an IPv6 address it would sail past every
+/// rule above (none of which have an IPv6 counterpart), so the exact
+/// docker-bridge address this check exists to reject would be accepted
+/// whenever the server happens to be dual-stack.
+#[test]
+fn usable_reflexive_observed_judges_an_ipv4_mapped_address_as_ipv4() {
+    use aloo::p2p_proto::is_usable_reflexive_observed;
+    assert!(
+        !is_usable_reflexive_observed("[::ffff:172.17.0.1]:38082".parse().unwrap()),
+        "a mapped docker-bridge address is the same bogus address in a different shape"
+    );
+    assert!(!is_usable_reflexive_observed("[::ffff:10.0.0.5]:1234".parse().unwrap()));
+    assert!(!is_usable_reflexive_observed("[::ffff:127.0.0.1]:1".parse().unwrap()));
+    assert!(
+        is_usable_reflexive_observed("[::ffff:203.0.113.5]:4000".parse().unwrap()),
+        "a mapped *public* address is still perfectly usable - this must not reject everything"
+    );
+}
+
+/// The remaining IPv4 rejections, which a real STUN answer can carry when
+/// the server's view of the client is broken in some way other than a Docker
+/// bridge: an unspecified or `0.x` address from a server that failed to read
+/// the source at all, a broadcast address, and the self-assigned range a
+/// machine falls back to when DHCP fails.
+#[test]
+fn usable_reflexive_observed_rejects_every_unroutable_ipv4_shape() {
+    use aloo::p2p_proto::is_usable_reflexive_observed;
+    assert!(!is_usable_reflexive_observed("0.0.0.0:7878".parse().unwrap()));
+    assert!(!is_usable_reflexive_observed("0.1.2.3:7878".parse().unwrap()));
+    assert!(!is_usable_reflexive_observed("255.255.255.255:7878".parse().unwrap()));
+    assert!(!is_usable_reflexive_observed("169.254.10.1:7878".parse().unwrap()));
+    assert!(!is_usable_reflexive_observed("192.168.1.5:7878".parse().unwrap()));
+    assert!(!is_usable_reflexive_observed("172.31.255.1:7878".parse().unwrap()));
+}
+
+/// Genuine IPv6 is unaffected by the mapped-address unwrapping above.
+#[test]
+fn usable_reflexive_observed_still_judges_real_ipv6_as_ipv6() {
+    use aloo::p2p_proto::is_usable_reflexive_observed;
+    assert!(is_usable_reflexive_observed("[2001:db8::1]:4000".parse().unwrap()));
+    assert!(!is_usable_reflexive_observed("[::1]:4000".parse().unwrap()));
+    assert!(!is_usable_reflexive_observed("[fd00::1]:4000".parse().unwrap()));
+    assert!(!is_usable_reflexive_observed("[fe80::1]:4000".parse().unwrap()));
+    assert!(!is_usable_reflexive_observed("[::]:4000".parse().unwrap()));
+}
+
 /// @requirement TB-143
 #[test]
 fn punch_datagrams_roundtrip() {

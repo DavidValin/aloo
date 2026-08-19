@@ -13,6 +13,7 @@ use aloo::client::tui::terminal;
 use aloo::crypto;
 use aloo::server::{self, AuthConfig};
 use aloo::settings;
+use aloo::validation;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -43,8 +44,13 @@ struct Cli {
     #[arg(long)]
     port: Option<u16>,
 
-    /// Server-only: address to bind to. Defaults to 0.0.0.0 - falls back to
-    /// whatever `~/.aloo/settings` last recorded if this flag is omitted.
+    /// Server-only: address to bind to, IPv4 or IPv6 (e.g. 0.0.0.0, ::, or
+    /// one interface's own address). Defaults to 0.0.0.0, which serves IPv4
+    /// only - use :: to serve both families where the OS allows it. Falls
+    /// back to whatever `~/.aloo/settings` last recorded if this flag is
+    /// omitted. Both the TCP control port and the UDP rendezvous port that
+    /// direct peer-to-peer punching needs are bound here, so a family left
+    /// out here is a family that cannot punch.
     #[arg(long)]
     bind: Option<String>,
 
@@ -318,7 +324,7 @@ async fn run_server(cli: Cli) -> Result<(), BoxError> {
         eprintln!("aloo: could not persist server settings to ~/.aloo/settings ({e})");
     }
 
-    let addr: SocketAddr = format!("{bind}:{port}").parse()?;
+    let addr: SocketAddr = validation::parse_bind_addr(&bind, port)?;
     println!("aloo: server listening on {addr}");
     server::run(addr, auth).await?;
     Ok(())

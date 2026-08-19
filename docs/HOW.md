@@ -5,6 +5,7 @@ Rules:
   * New functionality need to contain tests according to the conventions
   * All tests should pass after the change
   * Documentation files need to be concise and in sync with the current implementation
+  * Do not change git branch, commit or push
 
 Important files:
 

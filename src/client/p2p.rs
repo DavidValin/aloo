@@ -68,7 +68,19 @@ pub const REFLEXIVE_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
 pub const PENDING_MAX_AGE: Duration = Duration::from_secs(60);
 /// Ceiling on queued-but-undelivered payloads per link, so a long-dead
 /// peer can't grow this without bound.
-pub const PENDING_MAX: usize = 64;
+///
+/// The floor on this value is set by the largest single thing the app ever
+/// hands the link in one go: an OTP pad provisioning, which is 64 chunked
+/// envelopes *per megabyte per key* (`client::otp`'s `OTP_SETUP_CHUNK_BYTES`)
+/// queued by one `/otp` confirmation - usually against a link that is still
+/// being punched, which is exactly when everything queues. At 64 this cap
+/// was reached by the smallest pad the size prompt even allows, and since
+/// overflow drops the *oldest* entry, what got dropped was the front of the
+/// pad - leaving the receiver reassembling from a chunk that isn't the first
+/// one and reporting a malformed setup. `client::otp::send_key_setup_chunked`
+/// checks its chunk count against this before sending anything, so a pad too
+/// large to queue is refused up front rather than silently truncated here.
+pub const PENDING_MAX: usize = 1024;
 /// Ceiling on how many candidate addresses one link will probe. Relayed
 /// candidates are bounded by the peer's own interface count, but
 /// peer-reflexive ones (`adopt_candidate`) come straight off the wire, so
@@ -680,10 +692,34 @@ impl PeerLinkManager {
             if link.candidates.len() >= CANDIDATES_MAX {
                 break;
             }
+            // A peer still on a build that advertises its raw, IPv4-mapped
+            // observation (see `normalize_mapped`) would otherwise have its
+            // one useful candidate thrown away by the family check below.
+            // Only worth doing when this socket is IPv4: on a dual-stack
+            // IPv6 socket the mapped form is what can actually be sent to,
+            // and rewriting it to plain IPv4 would be what got it discarded.
+            let addr = if local_is_ipv6 {
+                addr
+            } else {
+                normalize_mapped(addr)
+            };
             // Nothing can ever be sent to an address of the family this
             // session's socket isn't bound to, so storing one would only
             // spend a `CANDIDATES_MAX` slot that a reachable address needs.
             if addr.is_ipv6() != local_is_ipv6 {
+                continue;
+            }
+            // Nor to a link-local address that arrived this way: the scope
+            // id naming its interface cannot survive the relay (neither the
+            // wire format nor `SocketAddr` carries one), so probing it can
+            // only ever fail at the syscall. Filtered on receipt as well as
+            // when advertising (`host_candidates`), so a peer on an older
+            // build cannot spend our slots on addresses we can't use. A
+            // peer-reflexive link-local learned from a datagram we actually
+            // received is a different matter and is kept (`adopt_candidate`):
+            // that address came from the socket, not the relay, so it still
+            // carries its scope id and can be answered.
+            if is_link_local(&addr.ip()) {
                 continue;
             }
             if !link.candidates.contains(&addr) {
@@ -764,16 +800,27 @@ impl PeerLinkManager {
     }
 
     fn transmit_reliable(socket: &UdpSocket, link: &mut PeerLink, payload: &P2pPayload) {
+        if !matches!(link.state, PeerLinkState::Active { .. }) {
+            return;
+        }
+        let bytes = proto::encode(payload).unwrap_or_default();
+        // `None` means the ARQ send window is full: the frame is held and
+        // goes out of `on_ack` once a slot frees up, so there is nothing to
+        // put on the wire here (see `p2p_reliable::SEND_WINDOW`).
+        let Some((seq, bytes)) = link.arq_tx.send(bytes) else {
+            return;
+        };
+        Self::transmit_frame(socket, link, seq, bytes);
+    }
+
+    /// Puts one already-sequenced reliable frame on the wire - the single
+    /// path shared by a first transmission, a windowed frame released by an
+    /// ack, and a retransmission.
+    fn transmit_frame(socket: &UdpSocket, link: &mut PeerLink, seq: u32, payload: Vec<u8>) {
         let PeerLinkState::Active { addr, last_sent, .. } = &mut link.state else {
             return;
         };
-        let bytes = proto::encode(payload).unwrap_or_default();
-        let seq = link.arq_tx.send(bytes.clone());
-        let dgram = encode_dgram(&PunchDatagram::Reliable {
-            seq,
-            payload: bytes,
-        });
-        send_dgram(socket, &dgram, *addr);
+        send_dgram(socket, &encode_dgram(&PunchDatagram::Reliable { seq, payload }), *addr);
         *last_sent = Instant::now();
     }
 
@@ -854,8 +901,14 @@ impl PeerLinkManager {
                     return;
                 };
                 self.note_received(peer, now);
+                let socket = self.socket.clone();
                 if let Some(link) = self.links.get_mut(&peer) {
-                    link.arq_tx.on_ack(seq);
+                    // Retiring this frame may release the next one waiting
+                    // on the send window - that release is the only thing
+                    // that keeps a windowed backlog moving.
+                    for (seq, payload) in link.arq_tx.on_ack(seq) {
+                        Self::transmit_frame(&socket, link, seq, payload);
+                    }
                 }
             }
             PunchDatagram::Reliable { seq, payload } => {
@@ -911,6 +964,7 @@ impl PeerLinkManager {
         let RendezvousMessage::BindingResponse { token, observed } = msg else {
             return;
         };
+        let observed = normalize_mapped(observed);
         if token != self.reflexive_token || self.reflexive == Some(observed) {
             return;
         }
@@ -1001,15 +1055,27 @@ impl PeerLinkManager {
     }
 
     fn on_reliable(&mut self, peer: UserId, addr: SocketAddr, seq: u32, payload: Vec<u8>) {
-        send_dgram(
-            &self.socket,
-            &encode_dgram(&PunchDatagram::Ack { seq }),
-            addr,
-        );
         let Some(link) = self.links.get_mut(&peer) else {
             return;
         };
-        for delivered in link.arq_rx.receive(seq, payload) {
+        let delivered = link.arq_rx.receive(seq, payload);
+        // Acked *after* the frame has been through the receiver, and naming
+        // the frontier it reports rather than this frame's own `seq`: the
+        // ack is cumulative, and says what has been delivered in order, not
+        // merely what arrived (`ArqSender::on_ack` has the full reasoning).
+        // A frame that only landed in the reorder buffer therefore repeats
+        // the old frontier, which is what stalls the sender's window on the
+        // gap instead of letting it slide forward over undelivered data.
+        // Still sent for a duplicate or a post-failure frame, so a peer
+        // whose ack was lost can recover.
+        if let Some(ack) = link.arq_rx.ack_seq() {
+            send_dgram(
+                &self.socket,
+                &encode_dgram(&PunchDatagram::Ack { seq: ack }),
+                addr,
+            );
+        }
+        for delivered in delivered {
             let Ok(p2p_payload) = proto::decode::<P2pPayload>(&delivered) else {
                 continue;
             };
@@ -1504,6 +1570,19 @@ fn random_token() -> u64 {
 /// `send_to` across families fails outright at the syscall - so an address
 /// of the other family is not a worse candidate, it is an impossible one,
 /// and advertising it only spends a slot of the peer's `CANDIDATES_MAX`.
+///
+/// Link-local addresses are dropped for the same reason, one step further:
+/// an IPv6 `fe80::/10` address is meaningless without the scope id naming
+/// which interface it belongs to, which neither the wire format nor
+/// `SocketAddr` carries, so a peer that tries one gets `EINVAL` from the
+/// syscall rather than a packet on the wire. They cannot be filtered as a
+/// nicety, either: *every* IPv6 interface has one, so on a session whose
+/// socket is IPv6 they are the majority of what `if_addrs` reports (a
+/// machine with a few Docker/VPN interfaces easily has five or more), and
+/// unfiltered they crowd the one globally routable address out of a
+/// receiver's `CANDIDATES_MAX` window - the same way unordered candidates
+/// used to crowd out the reflexive one. IPv4's equivalent (`169.254.0.0/16`,
+/// self-assigned when DHCP fails) is dropped on the same grounds.
 fn host_candidates(local_port: u16, want_ipv6: bool) -> Vec<SocketAddr> {
     if_addrs::get_if_addrs()
         .map(|ifaces| {
@@ -1511,10 +1590,50 @@ fn host_candidates(local_port: u16, want_ipv6: bool) -> Vec<SocketAddr> {
                 .into_iter()
                 .map(|iface| iface.ip())
                 .filter(|ip| ip.is_ipv6() == want_ipv6)
+                .filter(|ip| !is_link_local(ip))
                 .map(|ip| SocketAddr::new(ip, local_port))
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Whether this address is link-local, and so unusable as a candidate (see
+/// `host_candidates`). `Ipv6Addr::is_unicast_link_local` is still unstable,
+/// so the `fe80::/10` prefix is matched directly.
+fn is_link_local(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_link_local(),
+        std::net::IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) == 0xfe80,
+    }
+}
+
+/// Rewrites an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) to the plain IPv4
+/// address it names, leaving everything else alone.
+///
+/// This is what a dual-stack server reports back as an IPv4 client's own
+/// reflexive address: one socket bound to `::` receives an IPv4 client's
+/// datagram with an IPv4-mapped source, and echoing that observation
+/// verbatim is correct but unusable. Such an address is an
+/// `IpAddr::V6` as far as this program is concerned, so an IPv4 client would
+/// advertise it as its first and most important candidate, and every peer
+/// whose socket is IPv4 - which, being an IPv4 client's peers, is all of the
+/// ones that can reach it - would then discard it as being of the wrong
+/// family. The net effect is that reflexive discovery silently produces
+/// nothing usable for every IPv4 client of a dual-stack server, leaving only
+/// host candidates and so no way to punch across two NATs.
+///
+/// A client only ever holds an IPv6 socket when it reached the server over
+/// real IPv6 (`session.rs` takes the family from the server's address), in
+/// which case the observation is a genuine IPv6 address and this is a no-op -
+/// so normalizing our own reflexive address is always safe.
+fn normalize_mapped(addr: SocketAddr) -> SocketAddr {
+    match addr {
+        SocketAddr::V6(v6) => match v6.ip().to_ipv4_mapped() {
+            Some(v4) => SocketAddr::new(std::net::IpAddr::V4(v4), addr.port()),
+            None => addr,
+        },
+        SocketAddr::V4(_) => addr,
+    }
 }
 
 /// Best-effort STUN-Binding-style discovery of this client's own
@@ -1556,6 +1675,15 @@ async fn learn_reflexive_candidate(
                 continue;
             };
             if got_token == token {
+                // Normalized *before* the usability check, not after: a
+                // dual-stack server reports an IPv4 client's own address in
+                // IPv4-mapped form (`::ffff:a.b.c.d`), and that takes the
+                // IPv6 branch of `is_usable_reflexive_observed` - where none
+                // of the IPv4 private/loopback/link-local rules are applied,
+                // so a mapped `::ffff:192.168.x.x` would pass as publicly
+                // routable. Normalizing first is what puts it in front of
+                // the rules that actually describe it (see `normalize_mapped`).
+                let observed = normalize_mapped(observed);
                 if crate::p2p_proto::is_usable_reflexive_observed(observed) {
                     return Some(observed);
                 }

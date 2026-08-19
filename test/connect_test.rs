@@ -293,3 +293,69 @@ fn resolve_my_keypair_autogenerates_a_missing_pq_hybrid_bundle() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// ---------------------------------------------------------------------
+// Which resolved address the client connects to
+// ---------------------------------------------------------------------
+
+/// The reason this preference exists is the UDP rendezvous riding the same
+/// host and port, not the TCP connection: a dual-stack server behind
+/// Docker's default port publishing answers STUN over IPv6 with the bridge's
+/// own address, which is unusable as a reflexive candidate and costs
+/// cross-network punching entirely.
+///
+/// @requirement TB-205
+#[test]
+fn a_host_with_both_families_resolves_to_its_ipv4_address() {
+    use aloo::client::connect::prefer_ipv4;
+    let addrs = vec![
+        "[2001:db8::1]:7878".parse().unwrap(),
+        "203.0.113.5:7878".parse().unwrap(),
+    ];
+    assert_eq!(
+        prefer_ipv4(&addrs),
+        Some("203.0.113.5:7878".parse().unwrap()),
+        "IPv4 must win even when the resolver returned the AAAA record first"
+    );
+}
+
+/// @requirement TB-205
+#[test]
+fn an_ipv6_only_host_still_resolves() {
+    use aloo::client::connect::prefer_ipv4;
+    let addrs: Vec<std::net::SocketAddr> = vec!["[2001:db8::1]:7878".parse().unwrap()];
+    assert_eq!(
+        prefer_ipv4(&addrs),
+        Some("[2001:db8::1]:7878".parse().unwrap()),
+        "preferring IPv4 must never become requiring it - an AAAA-only host is reachable"
+    );
+}
+
+/// Order inside a family is the resolver's to decide (round-robin, RFC 6724
+/// sorting), so the preference must reorder families without disturbing it.
+///
+/// @requirement TB-205
+#[test]
+fn resolver_order_within_ipv4_is_preserved() {
+    use aloo::client::connect::prefer_ipv4;
+    let addrs = vec![
+        "[2001:db8::1]:7878".parse().unwrap(),
+        "203.0.113.5:7878".parse().unwrap(),
+        "198.51.100.9:7878".parse().unwrap(),
+    ];
+    assert_eq!(
+        prefer_ipv4(&addrs),
+        Some("203.0.113.5:7878".parse().unwrap()),
+        "the first IPv4 record the resolver returned is the one to use"
+    );
+}
+
+/// An empty list is a resolution failure, which the caller turns into a
+/// "no addresses for host:port" error rather than connecting to something.
+///
+/// @requirement TB-205
+#[test]
+fn a_host_that_resolves_to_nothing_yields_no_address() {
+    use aloo::client::connect::prefer_ipv4;
+    assert_eq!(prefer_ipv4(&[]), None);
+}

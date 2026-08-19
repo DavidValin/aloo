@@ -39,8 +39,27 @@ pub enum RendezvousMessage {
 /// port publishing often makes the server see the docker-bridge address
 /// (e.g. `172.17.0.1`) instead of the client's real public endpoint -
 /// advertising that poisons hole punch across separate networks.
+///
+/// An IPv4-mapped address (`::ffff:a.b.c.d`) is judged as the IPv4 address
+/// it actually names, not as an IPv6 one. That is not a nicety: a
+/// dual-stack server sees every IPv4 client through one socket bound to
+/// `::`, so mapped form is the *normal* shape of an IPv4 client's
+/// observation, and none of the rules below that would catch a bogus
+/// address - private, loopback, link-local - exist in the IPv6 branch. Left
+/// to that branch, `::ffff:172.17.0.1` (the exact docker-bridge case this
+/// function is here to reject) passes as publicly routable. Callers
+/// normalize on their own account too, since the address is also stored and
+/// family-filtered downstream; doing it here as well is what makes the
+/// answer independent of whether they did it first.
 pub fn is_usable_reflexive_observed(addr: SocketAddr) -> bool {
-    match addr.ip() {
+    let ip = match addr.ip() {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => IpAddr::V6(v6),
+        },
+        v4 => v4,
+    };
+    match ip {
         IpAddr::V4(v4) => {
             !(v4.is_loopback()
                 || v4.is_private()

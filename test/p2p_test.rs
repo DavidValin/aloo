@@ -1013,6 +1013,181 @@ async fn candidates_of_the_wrong_address_family_are_never_advertised_or_stored()
     );
 }
 
+/// A link-local address cannot be probed once it has been relayed: the scope
+/// id naming which interface it belongs to survives neither the wire format
+/// nor `SocketAddr`, so the syscall rejects it outright. They are not a rare
+/// case to tidy up, either - every IPv6 interface has one, so on an
+/// IPv6-bound session they are the bulk of what the machine reports, and
+/// unfiltered they crowd the one globally routable address out of the peer's
+/// `CANDIDATES_MAX` window, exactly the failure ordering the reflexive
+/// candidate first was meant to end.
+///
+/// @requirement TB-200
+#[tokio::test]
+async fn link_local_candidates_are_never_advertised_or_stored() {
+    let server_addr = spawn_test_server().await;
+    let (mut alice, _events, mut a, mut b, bob_id) = one_manager(server_addr).await;
+
+    assert!(
+        alice
+            .local_candidate_list()
+            .iter()
+            .all(|c| !is_link_local_addr(c)),
+        "a link-local address was advertised, though no peer could ever probe it: {:?}",
+        alice.local_candidate_list()
+    );
+
+    alice.ensure_link(&mut a, bob_id).await;
+    let nonce = relayed_nonce(&mut b).await;
+
+    // A peer (an older build, say) offers its link-locals alongside one
+    // genuinely reachable address.
+    alice
+        .on_peer_candidates(
+            &mut a,
+            bob_id,
+            vec![
+                "169.254.13.7:7000".parse().unwrap(),
+                "169.254.99.1:7001".parse().unwrap(),
+                "127.0.0.1:7002".parse().unwrap(),
+            ],
+            nonce,
+        )
+        .await;
+
+    assert_eq!(
+        alice.candidate_count(bob_id),
+        1,
+        "only the routable candidate should be kept - a relayed link-local can \
+         only ever fail at the syscall, and spends a slot that a reachable \
+         address needs"
+    );
+}
+
+/// The whole point of the reflexive filter: a server that sees clients
+/// through a Docker bridge reports the bridge's own address as everybody's
+/// "public" one. Advertising it doesn't just fail to help - it actively
+/// poisons the candidate list, since it is the first address peers try and
+/// it can never work across networks. It must be refused outright rather
+/// than stored, and must not re-signal links as a genuine address change
+/// does.
+///
+/// @requirement TB-204
+#[tokio::test]
+async fn a_bogus_reflexive_observation_is_refused_rather_than_advertised() {
+    let server_addr = spawn_test_server().await;
+    let (mut alice, mut events, mut a, _b, bob_id) = one_manager(server_addr).await;
+
+    alice.ensure_link(&mut a, bob_id).await;
+    let _ = next_signal_for(&mut events, bob_id);
+
+    let t0 = tokio::time::Instant::now().into_std();
+    alice.tick_at(t0 + REFLEXIVE_REFRESH_INTERVAL + Duration::from_millis(100));
+    let token = alice.reflexive_token();
+
+    // The server answers with its own docker-bridge address.
+    let bogus: SocketAddr = "172.17.0.1:38082".parse().unwrap();
+    alice.on_rendezvous(
+        server_addr,
+        RendezvousMessage::BindingResponse {
+            token,
+            observed: bogus,
+        },
+    );
+
+    assert!(
+        !alice.local_candidate_list().contains(&bogus),
+        "a docker-bridge address must never be advertised as our public one"
+    );
+    assert!(
+        next_signal_for(&mut events, bob_id).is_none(),
+        "refusing an unusable observation is not an address change - re-signalling \
+         peers over it would spend a round trip advertising an address that cannot work"
+    );
+}
+
+/// A dual-stack server sees an IPv4 client through a socket bound to `::`,
+/// so it reports that client's own address back in IPv4-mapped form. Stored
+/// verbatim it is an `IpAddr::V6` as far as this program is concerned, and
+/// every peer whose socket is IPv4 - which, for an IPv4 client, is all the
+/// ones that can reach it - discards it on the family filter. The net effect
+/// is that reflexive discovery silently yields nothing usable for every IPv4
+/// client of a dual-stack server.
+///
+/// @requirement TB-204
+#[tokio::test]
+async fn a_mapped_reflexive_observation_is_advertised_as_plain_ipv4() {
+    let server_addr = spawn_test_server().await;
+    let (mut alice, _events, _a, _b, _bob_id) = one_manager(server_addr).await;
+
+    let t0 = tokio::time::Instant::now().into_std();
+    alice.tick_at(t0 + REFLEXIVE_REFRESH_INTERVAL + Duration::from_millis(100));
+    let token = alice.reflexive_token();
+
+    // What a dual-stack server reports for an IPv4 client.
+    let mapped: SocketAddr = "[::ffff:203.0.113.9]:33333".parse().unwrap();
+    alice.on_rendezvous(
+        server_addr,
+        RendezvousMessage::BindingResponse {
+            token,
+            observed: mapped,
+        },
+    );
+
+    let advertised = alice.local_candidate_list();
+    let plain: SocketAddr = "203.0.113.9:33333".parse().unwrap();
+    assert!(
+        advertised.contains(&plain),
+        "the mapped observation must be advertised as the IPv4 address it names, \
+         or an IPv4 peer's family filter discards it: {advertised:?}"
+    );
+    assert!(
+        !advertised.contains(&mapped),
+        "the mapped form must not also be advertised - it spends a CANDIDATES_MAX \
+         slot on an address no IPv4 peer will keep"
+    );
+}
+
+/// A mapped address that names a *private* IPv4 address is the docker-bridge
+/// case wearing a different hat, and is the reason the usability check has to
+/// see the normalized address: judged as IPv6 it passes every rule, since
+/// none of the IPv4 private/loopback rules have an IPv6 counterpart.
+///
+/// @requirement TB-204
+#[tokio::test]
+async fn a_mapped_bogus_reflexive_observation_is_refused_too() {
+    let server_addr = spawn_test_server().await;
+    let (mut alice, _events, _a, _b, _bob_id) = one_manager(server_addr).await;
+
+    let t0 = tokio::time::Instant::now().into_std();
+    alice.tick_at(t0 + REFLEXIVE_REFRESH_INTERVAL + Duration::from_millis(100));
+    let token = alice.reflexive_token();
+
+    let mapped_bogus: SocketAddr = "[::ffff:172.17.0.1]:38082".parse().unwrap();
+    alice.on_rendezvous(
+        server_addr,
+        RendezvousMessage::BindingResponse {
+            token,
+            observed: mapped_bogus,
+        },
+    );
+
+    let advertised = alice.local_candidate_list();
+    let plain: SocketAddr = "172.17.0.1:38082".parse().unwrap();
+    assert!(
+        !advertised.contains(&mapped_bogus) && !advertised.contains(&plain),
+        "a mapped docker-bridge address is the same unusable address in a \
+         different shape and must be refused in either form: {advertised:?}"
+    );
+}
+
+fn is_link_local_addr(addr: &SocketAddr) -> bool {
+    match addr.ip() {
+        std::net::IpAddr::V4(v4) => v4.is_link_local(),
+        std::net::IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) == 0xfe80,
+    }
+}
+
 /// `UserOffline` forgets a peer's link outright - stopping its keepalives,
 /// its retries and its backoff. Everything that brings the link back
 /// therefore hangs off the `ensure_link` on their next `UserJoined`, which
@@ -1312,6 +1487,19 @@ async fn next_candidates(
     }
 }
 
+/// One payload the size of a real OTP setup chunk: a label block to assert
+/// order and completeness on, plus 32KB of filler standing in for the two
+/// 16KB key chunks such an envelope actually carries.
+fn otp_sized_payload(i: usize) -> P2pPayload {
+    P2pPayload::Envelope {
+        channel: None,
+        envelope: Envelope {
+            content: Content::Text,
+            blocks: vec![format!("chunk-{i}").into_bytes(), vec![b'x'; 32 * 1024]],
+        },
+    }
+}
+
 fn text_payload(body: &str) -> P2pPayload {
     P2pPayload::Envelope {
         channel: None,
@@ -1320,6 +1508,86 @@ fn text_payload(body: &str) -> P2pPayload {
             blocks: vec![body.as_bytes().to_vec()],
         },
     }
+}
+
+/// Regression, and the one that reproduces the OTP failure end to end: a
+/// pad provisioning hands the link hundreds of chunked envelopes in a single
+/// pass, far more than the ARQ send window. Every one of them must arrive,
+/// in the order it was handed over.
+///
+/// Before the window existed they all went onto the socket in the same
+/// instant; the tail was dropped, and since a receiver has to buffer every
+/// frame after a lost one, it hit `REORDER_BUFFER_LIMIT` and failed the
+/// whole link. The receiving side then reassembled a pad whose front was
+/// missing and reported a malformed setup message.
+///
+/// @requirement TB-202
+#[tokio::test]
+async fn a_burst_larger_than_the_send_window_arrives_complete_and_in_order() {
+    let server_addr = spawn_test_server().await;
+    let mut pair = Pair::connect(server_addr).await;
+    pair.alice.ensure_link(&mut pair.a_ctl, pair.bob_id).await;
+    pair.punch().await;
+
+    // Comfortably more than one window, so the backlog has to drain through
+    // several rounds of acks rather than emptying on the first.
+    // Sized like a real pad, not just "more than one window": the smallest
+    // pad the `/otp` size prompt allows is 64 chunks, which is also exactly
+    // the receiver's `REORDER_BUFFER_LIMIT`. A burst below that limit cannot
+    // reproduce the failure at all - the receiver absorbs the reordering and
+    // the ARQ retransmits whatever was dropped - so the count has to clear
+    // it the way a genuine pad does.
+    let burst = 100;
+    // Sized like the real thing: an OTP setup chunk carries 16KB of each key
+    // (`client::otp::OTP_SETUP_CHUNK_BYTES`), so the datagrams are ~32KB
+    // rather than a few bytes. That is what actually loads the socket
+    // buffer - a burst of tiny text frames fits on loopback whether it is
+    // paced or not, and would pass against the very bug this pins.
+    for i in 0..burst {
+        pair.alice
+            .send_reliable_or_queue(pair.bob_id, otp_sized_payload(i));
+    }
+
+    let bob_id = pair.bob_id;
+    let _ = bob_id;
+    let delivered = {
+        let mut got: Vec<String> = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            pair.pump(Duration::from_millis(50), |_, _| false).await;
+            let mut rest = Vec::new();
+            for event in pair.b_seen.drain(..) {
+                match event {
+                    P2pEvent::Message { envelope, .. } => {
+                        let block = envelope.blocks.first().cloned().unwrap_or_default();
+                        got.push(String::from_utf8_lossy(&block).into_owned());
+                    }
+                    other => rest.push(other),
+                }
+            }
+            pair.b_seen = rest;
+            if got.len() >= burst || tokio::time::Instant::now() >= deadline {
+                break got;
+            }
+        }
+    };
+
+    let expected: Vec<String> = (0..burst).map(|i| format!("chunk-{i}")).collect();
+    assert_eq!(
+        delivered.len(),
+        burst,
+        "every frame of the burst must arrive - {} of {burst} did. A pad with any \
+         chunk missing is not a smaller pad, it is a malformed setup message",
+        delivered.len()
+    );
+    assert_eq!(
+        delivered, expected,
+        "the burst must be delivered in the order it was handed over"
+    );
+    assert!(
+        pair.alice.is_active(pair.bob_id) && pair.bob.is_active(pair.alice_id),
+        "the link must survive the burst rather than failing on a blown reorder buffer"
+    );
 }
 
 /// Regression. A changed reflexive address re-signals every link that is not

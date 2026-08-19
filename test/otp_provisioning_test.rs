@@ -1,4 +1,8 @@
-use aloo::client::otp::{apply_incoming_setup, detect_or_adopt_existing, format_now, initiate_provisioning};
+use aloo::client::otp::{
+    apply_incoming_setup, detect_or_adopt_existing, format_now, initiate_provisioning,
+    OTP_SETUP_CHUNK_BYTES,
+};
+use aloo::client::p2p::PENDING_MAX;
 use aloo::client::otp_cli::{self, OtpCliConfig};
 use aloo::client::otp_store::OtpStore;
 use aloo::crypto::otp::{
@@ -420,4 +424,40 @@ fn otp_size_mb_in_range_matches_the_documented_bounds() {
     assert!(otp_size_mb_in_range(500_000));
     assert!(otp_size_mb_in_range(OTP_SIZE_MB_MAX));
     assert!(!otp_size_mb_in_range(OTP_SIZE_MB_MAX + 1));
+}
+
+/// The pad is handed to the direct link as one burst of chunked envelopes,
+/// usually while that link is still being punched - so all of them queue.
+/// Overflowing the link's queue drops its *oldest* entries, which is the
+/// front of the pad: the receiving side then reassembles from a chunk that
+/// isn't the first one and reports a malformed setup. The smallest pad the
+/// size prompt allows must therefore still fit the queue whole, with room
+/// left over for the ordinary traffic already sitting in it.
+///
+/// @requirement TB-203
+#[test]
+fn the_smallest_pad_fits_a_links_pending_queue_whole() {
+    let bytes_per_key = OTP_SIZE_MB_MIN as usize * 1024 * 1024;
+    let chunks = bytes_per_key.div_ceil(OTP_SETUP_CHUNK_BYTES);
+    assert!(
+        chunks < PENDING_MAX,
+        "a {OTP_SIZE_MB_MIN}MB pad is {chunks} chunks but a link only queues {PENDING_MAX} - \
+         its front would be dropped and the setup would arrive malformed"
+    );
+}
+
+/// A pad whose first chunk never arrived cannot be reassembled from what
+/// did: a fresh accumulation only ever starts at offset zero.
+///
+/// @requirement TB-203
+#[test]
+fn reassembly_cannot_start_from_anything_but_the_first_chunk() {
+    let enc = vec![1u8; 4096];
+    let dec = vec![2u8; 4096];
+    let chunks = split_into_chunks("c", &enc, &dec, 1024);
+    let mut acc = OtpKeySetupReassembly::new(&chunks[1]);
+    assert!(
+        !acc.accept(&chunks[1]),
+        "a mid-pad chunk with nothing before it must be refused, not treated as a pad start"
+    );
 }
