@@ -11,7 +11,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use aloo::client::p2p::{
-    LINK_IDLE_TIMEOUT, LinkStatus, P2pEvent, PENDING_MAX_AGE, PeerLinkManager,
+    InboundDatagram, LINK_IDLE_TIMEOUT, LinkStatus, P2pEvent, PENDING_MAX_AGE, PeerLinkManager,
     RETRY_BASE, RETRY_MAX, REFLEXIVE_REFRESH_INTERVAL, SIGNAL_TIMEOUT,
 };
 use aloo::crypto;
@@ -1052,5 +1052,597 @@ async fn a_peer_who_reconnects_is_punched_again() {
     assert_ne!(
         first, second,
         "the re-punch is a fresh attempt, not a resumption of the forgotten one"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Two real managers: the flow's unhappy paths
+// ---------------------------------------------------------------------
+
+/// Both ends of a real link plus everything needed to drive them: the two
+/// control connections signalling actually travels over (relayed by a real
+/// server), the raw-datagram feed each side's `spawn_receive_loop` publishes,
+/// and each side's `P2pEvent` channel.
+///
+/// The single-manager tests above inject datagrams by hand, which is exact
+/// but cannot exercise anything where *both* sides' state machines have to
+/// agree: a re-punch, an ARQ sequence space restarting on both sides at once,
+/// a peer that disappears mid-conversation and comes back. Those need two
+/// managers actually talking, which is what this drives.
+struct Pair {
+    alice: PeerLinkManager,
+    bob: PeerLinkManager,
+    a_ctl: ControlEndpoint<TcpStream>,
+    b_ctl: ControlEndpoint<TcpStream>,
+    a_events: tokio::sync::mpsc::UnboundedReceiver<P2pEvent>,
+    b_events: tokio::sync::mpsc::UnboundedReceiver<P2pEvent>,
+    a_raw: tokio::sync::mpsc::UnboundedReceiver<(SocketAddr, InboundDatagram)>,
+    b_raw: tokio::sync::mpsc::UnboundedReceiver<(SocketAddr, InboundDatagram)>,
+    /// Everything drained off each event channel so far. Buffered rather
+    /// than consumed on the spot so a helper looking for one kind of event
+    /// (a `Signal` to relay) never throws away another kind a test still
+    /// wants to assert on (a delivered `Message`).
+    a_seen: Vec<P2pEvent>,
+    b_seen: Vec<P2pEvent>,
+    alice_id: UserId,
+    bob_id: UserId,
+}
+
+impl Pair {
+    async fn connect(server_addr: SocketAddr) -> Self {
+        let mut a_ctl = ControlEndpoint::new(TcpStream::connect(server_addr).await.unwrap());
+        let alice_id = handshake(&mut a_ctl, "alice").await;
+        let mut b_ctl = ControlEndpoint::new(TcpStream::connect(server_addr).await.unwrap());
+        let bob_id = handshake(&mut b_ctl, "bob").await;
+
+        let (a_events_tx, a_events) = tokio::sync::mpsc::unbounded_channel();
+        let (b_events_tx, b_events) = tokio::sync::mpsc::unbounded_channel();
+        let (alice, a_socket) =
+            PeerLinkManager::bind("127.0.0.1:0".parse().unwrap(), server_addr, a_events_tx)
+                .await
+                .unwrap();
+        let (bob, b_socket) =
+            PeerLinkManager::bind("127.0.0.1:0".parse().unwrap(), server_addr, b_events_tx)
+                .await
+                .unwrap();
+
+        let (a_raw_tx, a_raw) = tokio::sync::mpsc::unbounded_channel();
+        let (b_raw_tx, b_raw) = tokio::sync::mpsc::unbounded_channel();
+        aloo::client::p2p::spawn_receive_loop(a_socket, server_addr, a_raw_tx);
+        aloo::client::p2p::spawn_receive_loop(b_socket, server_addr, b_raw_tx);
+
+        Self {
+            alice,
+            bob,
+            a_ctl,
+            b_ctl,
+            a_events,
+            b_events,
+            a_raw,
+            b_raw,
+            a_seen: Vec::new(),
+            b_seen: Vec::new(),
+            alice_id,
+            bob_id,
+        }
+    }
+
+    fn drain_events(&mut self) {
+        while let Ok(e) = self.a_events.try_recv() {
+            self.a_seen.push(e);
+        }
+        while let Ok(e) = self.b_events.try_recv() {
+            self.b_seen.push(e);
+        }
+    }
+
+    /// Removes and returns every buffered `Signal`, leaving other events in
+    /// place.
+    fn take_signals(seen: &mut Vec<P2pEvent>) -> Vec<(UserId, Vec<SocketAddr>, u64)> {
+        let mut signals = Vec::new();
+        let mut rest = Vec::new();
+        for event in seen.drain(..) {
+            match event {
+                P2pEvent::Signal {
+                    peer,
+                    candidates,
+                    link_nonce,
+                } => signals.push((peer, candidates, link_nonce)),
+                other => rest.push(other),
+            }
+        }
+        *seen = rest;
+        signals
+    }
+
+    /// The signalling half of `session.rs`: forwards every `Signal` either
+    /// manager emitted out over that side's own control connection as a
+    /// `RequestPeerLink`, and feeds back in every `PeerCandidates` the server
+    /// relays as a result - including the replies those themselves provoke.
+    async fn relay_signalling(&mut self) {
+        for _ in 0..6 {
+            self.drain_events();
+            let mut moved = false;
+            for (peer, candidates, link_nonce) in Self::take_signals(&mut self.a_seen) {
+                self.a_ctl
+                    .send(&ClientMessage::RequestPeerLink {
+                        peer,
+                        candidates,
+                        link_nonce,
+                    })
+                    .await
+                    .unwrap();
+                moved = true;
+            }
+            for (peer, candidates, link_nonce) in Self::take_signals(&mut self.b_seen) {
+                self.b_ctl
+                    .send(&ClientMessage::RequestPeerLink {
+                        peer,
+                        candidates,
+                        link_nonce,
+                    })
+                    .await
+                    .unwrap();
+                moved = true;
+            }
+            if self.feed_relayed_candidates().await {
+                moved = true;
+            }
+            if !moved {
+                break;
+            }
+        }
+    }
+
+    /// Hands each side any `PeerCandidates` the server has relayed to it.
+    async fn feed_relayed_candidates(&mut self) -> bool {
+        let mut any = false;
+        for _ in 0..4 {
+            let mut moved = false;
+            if let Some((from, candidates, link_nonce)) = next_candidates(&mut self.b_ctl).await {
+                self.bob
+                    .on_peer_candidates(&mut self.b_ctl, from, candidates, link_nonce)
+                    .await;
+                moved = true;
+            }
+            if let Some((from, candidates, link_nonce)) = next_candidates(&mut self.a_ctl).await {
+                self.alice
+                    .on_peer_candidates(&mut self.a_ctl, from, candidates, link_nonce)
+                    .await;
+                moved = true;
+            }
+            if !moved {
+                break;
+            }
+            any = true;
+        }
+        any
+    }
+
+    /// Feeds inbound datagrams into both managers, ticking both on roughly
+    /// the session loop's cadence, until `done` holds or `limit` elapses.
+    async fn pump(
+        &mut self,
+        limit: Duration,
+        done: impl Fn(&PeerLinkManager, &PeerLinkManager) -> bool,
+    ) -> bool {
+        let deadline = tokio::time::Instant::now() + limit;
+        loop {
+            let mut fed = false;
+            while let Ok((addr, dgram)) = self.a_raw.try_recv() {
+                self.alice.on_inbound(addr, dgram);
+                fed = true;
+            }
+            while let Ok((addr, dgram)) = self.b_raw.try_recv() {
+                self.bob.on_inbound(addr, dgram);
+                fed = true;
+            }
+            self.drain_events();
+            if done(&self.alice, &self.bob) {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            if fed {
+                tokio::task::yield_now().await;
+            } else {
+                self.alice.tick();
+                self.bob.tick();
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    }
+
+    /// One full candidate exchange followed by punching, asserting both
+    /// sides end up with a confirmed link.
+    async fn punch(&mut self) {
+        self.relay_signalling().await;
+        let (alice_id, bob_id) = (self.alice_id, self.bob_id);
+        assert!(
+            self.pump(Duration::from_secs(10), move |a, b| {
+                a.is_active(bob_id) && b.is_active(alice_id)
+            })
+            .await,
+            "the loopback punch should complete in both directions"
+        );
+    }
+
+    /// Drives the pair until a text message surfaces on bob's event channel,
+    /// returning its single plaintext block.
+    async fn bob_next_text(&mut self, limit: Duration) -> Option<Vec<u8>> {
+        let deadline = tokio::time::Instant::now() + limit;
+        loop {
+            if let Some(idx) = self
+                .b_seen
+                .iter()
+                .position(|e| matches!(e, P2pEvent::Message { .. }))
+            {
+                return match self.b_seen.remove(idx) {
+                    P2pEvent::Message { envelope, .. } => envelope.blocks.into_iter().next(),
+                    _ => None,
+                };
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+            self.pump(Duration::from_millis(50), |_, _| false).await;
+        }
+    }
+}
+
+/// The next `PeerCandidates` waiting on this connection, or `None` if none
+/// arrives promptly. Timeout-guarded rather than a plain `recv`: whether a
+/// side answers a proposal at all depends on its own link state, so the
+/// correct answer is often "nothing", which a blocking read would hang on.
+async fn next_candidates(
+    ctl: &mut ControlEndpoint<TcpStream>,
+) -> Option<(UserId, Vec<SocketAddr>, u64)> {
+    let msg: ServerMessage = tokio::time::timeout(Duration::from_millis(300), ctl.recv())
+        .await
+        .ok()?
+        .ok()??;
+    match msg {
+        ServerMessage::PeerCandidates {
+            from,
+            candidates,
+            link_nonce,
+        } => Some((from, candidates, link_nonce)),
+        _ => None,
+    }
+}
+
+fn text_payload(body: &str) -> P2pPayload {
+    P2pPayload::Envelope {
+        channel: None,
+        envelope: Envelope {
+            content: Content::Text,
+            blocks: vec![body.as_bytes().to_vec()],
+        },
+    }
+}
+
+/// Regression. A changed reflexive address re-signals every link that is not
+/// `Active` (TB-181) - and such a link may be `Lost` rather than merely
+/// `Requested`, still holding the ARQ state of the traffic it carried before
+/// it died (marking a link lost deliberately does not reset that; the reset
+/// belongs to the next attempt). Re-signalling it without going through that
+/// reset left this side numbering its next frame from where the dead link
+/// stopped, while the peer - following the new nonce onto a fresh attempt -
+/// restarted its receive sequence at zero. Every later frame then sat in the
+/// peer's reorder buffer forever: acked, so never retransmitted, and never
+/// delivered, with nothing reported to either user.
+///
+/// @requirement TB-180, TB-181
+#[tokio::test]
+async fn a_reflexive_change_restarts_the_sequence_space_of_a_link_that_carried_traffic() {
+    let server_addr = spawn_test_server().await;
+    let mut pair = Pair::connect(server_addr).await;
+    pair.alice.ensure_link(&mut pair.a_ctl, pair.bob_id).await;
+    pair.punch().await;
+
+    // Real traffic first, so both sides' sequence spaces have actually
+    // advanced past zero before anything restarts.
+    let bob_id = pair.bob_id;
+    pair.alice
+        .send_reliable_or_queue(bob_id, text_payload("before the restart"));
+    assert_eq!(
+        pair.bob_next_text(Duration::from_secs(10))
+            .await
+            .as_deref()
+            .map(String::from_utf8_lossy),
+        Some("before the restart".into()),
+        "precondition: the original link delivers, advancing both sequence spaces"
+    );
+
+    // Alice's side of the link dies quietly (a NAT rebinding, a route
+    // change) and is marked lost, while bob still believes it is up.
+    let future = tokio::time::Instant::now().into_std() + LINK_IDLE_TIMEOUT + Duration::from_secs(1);
+    pair.alice.tick_at(future);
+    assert_eq!(
+        pair.alice.status(bob_id),
+        Some(LinkStatus::Lost),
+        "precondition: alice's link is lost, and still holds the dead link's ARQ state"
+    );
+
+    // Her public address turns out to have moved too, which re-signals the
+    // lost link - the path this regression is about.
+    let observed: SocketAddr = "203.0.113.77:33333".parse().unwrap();
+    let token = pair.alice.reflexive_token();
+    pair.alice.on_rendezvous(
+        server_addr,
+        RendezvousMessage::BindingResponse { token, observed },
+    );
+    assert_eq!(
+        pair.alice.status(bob_id),
+        Some(LinkStatus::Connecting),
+        "a moved address must put the lost link back into establishment"
+    );
+
+    // Bob sees a nonce he does not recognise on a link he thought was up,
+    // concludes alice restarted, and follows her - resetting his own receive
+    // sequence to zero as he does.
+    pair.punch().await;
+
+    pair.alice
+        .send_reliable_or_queue(bob_id, text_payload("after the restart"));
+    assert_eq!(
+        pair.bob_next_text(Duration::from_secs(10))
+            .await
+            .as_deref()
+            .map(String::from_utf8_lossy),
+        Some("after the restart".into()),
+        "content sent on the re-punched link must actually be delivered: both \
+         sides restart the sequence space together, or every frame is acked \
+         into the peer's reorder buffer and silently never delivered"
+    );
+}
+
+/// A peer that goes quiet mid-conversation and comes back. Everything typed
+/// while the link was down has to arrive once it reopens, under a sequence
+/// space both sides restarted together - the two-sided counterpart of
+/// `content_queued_while_the_link_is_down_is_flushed_when_it_recovers`,
+/// which proves the queue survives but cannot prove the peer accepts what
+/// comes out of it.
+///
+/// @requirement TB-179, TB-180
+#[tokio::test]
+async fn content_queued_while_a_peer_is_away_is_delivered_once_the_link_returns() {
+    let server_addr = spawn_test_server().await;
+    let mut pair = Pair::connect(server_addr).await;
+    pair.alice.ensure_link(&mut pair.a_ctl, pair.bob_id).await;
+    pair.punch().await;
+
+    let (alice_id, bob_id) = (pair.alice_id, pair.bob_id);
+    pair.alice
+        .send_reliable_or_queue(bob_id, text_payload("while up"));
+    assert!(
+        pair.bob_next_text(Duration::from_secs(10)).await.is_some(),
+        "precondition: the link works and both sequence spaces have advanced"
+    );
+
+    // The path between them dies. Both sides notice independently, which is
+    // what really happens: neither is told, each just stops hearing beats.
+    let future = tokio::time::Instant::now().into_std() + LINK_IDLE_TIMEOUT + Duration::from_secs(1);
+    pair.alice.tick_at(future);
+    pair.bob.tick_at(future);
+    assert_eq!(pair.alice.status(bob_id), Some(LinkStatus::Lost));
+    assert_eq!(pair.bob.status(alice_id), Some(LinkStatus::Lost));
+
+    // The user types anyway - it queues against the down link rather than
+    // being dropped or reported.
+    pair.alice
+        .send_reliable_or_queue(bob_id, text_payload("typed while away"));
+    assert_eq!(
+        pair.alice.pending_count(bob_id),
+        1,
+        "content for a down link must be held, not dropped"
+    );
+
+    // A send is also what skips the retry backoff and re-signals.
+    pair.alice.ensure_link(&mut pair.a_ctl, bob_id).await;
+    pair.punch().await;
+
+    assert_eq!(
+        pair.bob_next_text(Duration::from_secs(10))
+            .await
+            .as_deref()
+            .map(String::from_utf8_lossy),
+        Some("typed while away".into()),
+        "what was queued while the peer was away must arrive once it returns"
+    );
+    assert_eq!(
+        pair.alice.pending_count(bob_id),
+        0,
+        "and must not be left sitting in the queue afterwards"
+    );
+}
+
+/// The whole reconnect cycle, end to end: a peer disconnects (their link is
+/// forgotten, as `UserOffline` does), comes back as the brand-new `UserId` a
+/// reconnect always is - ids are never reused - and gets punched from
+/// scratch. Nothing from the previous session may linger: not the link, not
+/// its retries, and not its addresses in the demultiplexing index, which
+/// would otherwise attribute a stale datagram to the wrong peer.
+///
+/// @requirement TB-149, TB-178
+#[tokio::test]
+async fn a_peer_that_reconnects_under_a_new_id_is_punched_from_scratch() {
+    let server_addr = spawn_test_server().await;
+    let mut pair = Pair::connect(server_addr).await;
+    pair.alice.ensure_link(&mut pair.a_ctl, pair.bob_id).await;
+    pair.punch().await;
+
+    let old_bob_id = pair.bob_id;
+    let old_bob_addr = pair
+        .alice
+        .active_addr(old_bob_id)
+        .expect("the established link has an address");
+
+    // Bob's connection goes away for real, so the server unregisters him -
+    // the same thing that makes it send everyone else `UserOffline`.
+    let placeholder = ControlEndpoint::new(TcpStream::connect(server_addr).await.unwrap());
+    drop(std::mem::replace(&mut pair.b_ctl, placeholder));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Which is what forgets his link here.
+    pair.alice.forget(old_bob_id);
+    assert_eq!(
+        pair.alice.status(old_bob_id),
+        None,
+        "a disconnected peer's link, and its retries, are gone"
+    );
+
+    // Bob comes back: a new connection, a new UDP socket, and a new UserId.
+    let mut b_ctl = ControlEndpoint::new(TcpStream::connect(server_addr).await.unwrap());
+    let new_bob_id = handshake(&mut b_ctl, "bob").await;
+    assert_ne!(
+        new_bob_id, old_bob_id,
+        "a reconnect is always a brand-new identity"
+    );
+    let (b_events_tx, b_events) = tokio::sync::mpsc::unbounded_channel();
+    let (bob, b_socket) =
+        PeerLinkManager::bind("127.0.0.1:0".parse().unwrap(), server_addr, b_events_tx)
+            .await
+            .unwrap();
+    let (b_raw_tx, b_raw) = tokio::sync::mpsc::unbounded_channel();
+    aloo::client::p2p::spawn_receive_loop(b_socket, server_addr, b_raw_tx);
+    pair.bob = bob;
+    pair.b_ctl = b_ctl;
+    pair.b_events = b_events;
+    pair.b_raw = b_raw;
+    pair.b_seen.clear();
+    pair.bob_id = new_bob_id;
+
+    // A stale datagram from the dead session must not be attributed to
+    // anything, even though its address was live moments ago.
+    pair.alice
+        .on_datagram(old_bob_addr, PunchDatagram::Keepalive { link_nonce: 1 });
+    assert_eq!(
+        pair.alice.status(old_bob_id),
+        None,
+        "a forgotten peer's address must no longer resolve to any link"
+    );
+
+    // The new identity punches from scratch and carries content.
+    pair.alice.ensure_link(&mut pair.a_ctl, new_bob_id).await;
+    pair.punch().await;
+    pair.alice
+        .send_reliable_or_queue(new_bob_id, text_payload("hello again"));
+    assert_eq!(
+        pair.bob_next_text(Duration::from_secs(10))
+            .await
+            .as_deref()
+            .map(String::from_utf8_lossy),
+        Some("hello again".into()),
+        "the reconnected peer must get a working link of its own"
+    );
+    assert_eq!(
+        pair.alice.status(old_bob_id),
+        None,
+        "and the previous session's link must still be gone"
+    );
+}
+
+/// Forgetting a peer has to be complete, not just a status change: nothing
+/// may keep probing them, and no address they used may still resolve to
+/// them. A stale `Ping` carrying the forgotten link's own nonce is the
+/// sharpest version of this - if `forget` left either the link or its
+/// addresses behind, that datagram would revive or misattribute it.
+///
+/// @requirement TB-178
+#[tokio::test]
+async fn forgetting_a_peer_stops_its_retries_and_drops_its_addresses() {
+    let server_addr = spawn_test_server().await;
+    let (mut alice, mut events, mut a, mut b, bob_id) = one_manager(server_addr).await;
+
+    alice.ensure_link(&mut a, bob_id).await;
+    let link_nonce = relayed_nonce(&mut b).await;
+    let peer_addr: SocketAddr = "203.0.113.50:40404".parse().unwrap();
+    alice.on_datagram(peer_addr, PunchDatagram::Pong { link_nonce });
+    assert!(alice.is_active(bob_id), "precondition: an established link");
+
+    alice.forget(bob_id);
+
+    // Its own nonce, from its own address, must revive nothing.
+    alice.on_datagram(peer_addr, PunchDatagram::Ping { link_nonce });
+    alice.on_datagram(peer_addr, PunchDatagram::Pong { link_nonce });
+    assert_eq!(
+        alice.status(bob_id),
+        None,
+        "a forgotten link must not come back from stale datagrams"
+    );
+    assert_eq!(alice.candidate_count(bob_id), 0);
+
+    // And no retry may be scheduled for it, however far time moves.
+    let _ = next_signal_for(&mut events, bob_id);
+    let long_after = tokio::time::Instant::now().into_std() + RETRY_MAX * 4;
+    alice.tick_at(long_after);
+    assert_eq!(
+        next_signal_for(&mut events, bob_id),
+        None,
+        "a forgotten peer must never be re-signalled"
+    );
+}
+
+/// The rendezvous socket is the one part of punching that is served by the
+/// server, and it faces the open internet with no authentication at all: it
+/// answers whatever arrives. A single failed receive must therefore never
+/// end its loop - it serves every client on the server, so ending it would
+/// silently leave every later client with host candidates only, able to
+/// punch on a LAN and nowhere else, for the rest of the server's uptime.
+///
+/// The error that motivates this is platform-specific (on Windows a client
+/// that vanishes surfaces as `WSAECONNRESET` on a *later* receive, and an
+/// oversized datagram as `WSAEMSGSIZE`), so what is portable to assert is
+/// the property itself: after junk, an oversized datagram, a wrong-direction
+/// message and a client that goes away mid-exchange, a legitimate request
+/// is still answered.
+///
+/// @requirement TB-201
+#[tokio::test]
+async fn the_rendezvous_socket_keeps_serving_after_junk_and_a_vanished_client() {
+    let server_addr = spawn_test_server().await;
+
+    // Junk that decodes to nothing.
+    let noise = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    noise.send_to(b"not a rendezvous message", server_addr).await.unwrap();
+    // Larger than the server's receive buffer.
+    noise.send_to(&vec![0xAB; 2048], server_addr).await.unwrap();
+    // A well-formed message travelling the wrong way.
+    let wrong_way = aloo::proto::encode(&RendezvousMessage::BindingResponse {
+        token: 7,
+        observed: "203.0.113.9:1".parse().unwrap(),
+    })
+    .unwrap();
+    noise.send_to(&wrong_way, server_addr).await.unwrap();
+
+    // A client that asks and then vanishes before the reply lands, so the
+    // server's own `send_to` has nowhere to go.
+    let vanishing = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let request = aloo::proto::encode(&RendezvousMessage::BindingRequest { token: 11 }).unwrap();
+    vanishing.send_to(&request, server_addr).await.unwrap();
+    drop(vanishing);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // A legitimate client must still be served.
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let expected = client.local_addr().unwrap();
+    let request = aloo::proto::encode(&RendezvousMessage::BindingRequest { token: 42 }).unwrap();
+    client.send_to(&request, server_addr).await.unwrap();
+
+    let mut buf = [0u8; 512];
+    let (n, from) = tokio::time::timeout(Duration::from_secs(5), client.recv_from(&mut buf))
+        .await
+        .expect("the rendezvous socket must still answer after all of the above")
+        .unwrap();
+    assert_eq!(from, server_addr);
+    assert_eq!(
+        aloo::proto::decode::<RendezvousMessage>(&buf[..n]).unwrap(),
+        RendezvousMessage::BindingResponse {
+            token: 42,
+            observed: expected,
+        },
+        "the reply must echo the token and the address the request came from"
     );
 }

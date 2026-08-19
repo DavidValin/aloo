@@ -1093,10 +1093,19 @@ async fn handle_server_message(
             // Trust boundary (docs/PROTOCOL.md §7.1.2): the server's relay
             // performs no relationship checking of its own - any registered
             // client can name any other UserId as `peer`. Only respond to a
-            // request from someone we currently share a joined channel
-            // with; a stranger's request is dropped before any PeerLink
-            // state is touched at all.
-            if ui_state.shares_a_joined_channel(from) {
+            // request from someone we still have a reason to reach - a
+            // shared joined channel, or DM history with them; a stranger's
+            // request is dropped before any PeerLink state is touched at all.
+            //
+            // Deliberately the same bar §7.1.3 uses to decide whether to
+            // *keep* a link, rather than the narrower shared-channel check:
+            // the two must agree, or a DM that outlives every shared channel
+            // ends up in a state both sides keep retrying forever while each
+            // silently drops the other's candidate exchange. That survives
+            // only on cached addresses - the moment either side's address
+            // actually changes, which is exactly when signalling is what
+            // recovers a link, the DM can never be re-punched again.
+            if ui_state.has_reason_to_keep_link(from) {
                 session
                     .peer_link
                     .on_peer_candidates(wr, from, candidates, link_nonce)

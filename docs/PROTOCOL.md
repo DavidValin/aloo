@@ -1078,6 +1078,31 @@ symmetric NAT the server-facing mapping is independent of the peer-facing
 ones, so a change here says nothing about whether a working peer path
 still works, and the liveness check above catches it if it does not.
 
+That re-signal is a fresh attempt in the full sense of step 4, including
+the reliable layer's restart (§7.1.1). A link that is not up may be *lost*
+rather than merely waiting on a first reply, and a lost link still holds
+the reliable-delivery state of whatever it was carrying when it died -
+losing a link deliberately does not discard that, since the content was
+never delivered and the restart belongs to the next attempt. The peer
+that receives the new identifier concludes this side restarted and resets
+its own sequence space to match, so a side that re-signalled *without*
+restarting its own would keep numbering frames from where the dead link
+stopped: every one of them then lands outside the peer's expected
+sequence, is buffered as though it were merely early, and is
+acknowledged - so it is never retransmitted either - and the content is
+silently lost in both directions with nothing reported to either user.
+
+**6. The rendezvous socket keeps serving.** The server side of step 1 is
+unauthenticated and answers whatever arrives, and one socket serves every
+client at once, so a single failed receive on it must never end it: doing
+so would leave every client that connects afterwards with host candidates
+alone - able to punch on a LAN and nowhere else - for the rest of that
+server's uptime, with nothing to say why. Because it replies to whoever
+asked, an ordinary client disappearing can itself surface as an error on
+a *later* receive, which is exactly the case that has to be survivable.
+Failures are therefore reported and skipped, with a brief pause first so
+a permanently broken socket cannot spin.
+
 
 #### 7.1.1 Reliable delivery over the punched link
 
@@ -1165,10 +1190,19 @@ person's client to respond to punch traffic at all.
 The receiving client closes this gap itself, since the server has no
 membership list left to validate against (§7.2's note above): on an
 incoming `PeerCandidates`, before doing anything else - not even creating
-`PeerLink` state - it checks whether the sender is a member of any channel
-it has actually joined right now (a shared-channel check).
-A request from someone who isn't is dropped silently, leaving nothing
-behind for a follow-up message to probe.
+`PeerLink` state - it checks whether it still has any reason to reach the
+sender at all, which is the same relevance check §7.1.3 uses to decide
+whether to *keep* a link: a currently-joined channel in common, or DM
+history with them. A request from someone who clears neither is dropped
+silently, leaving nothing behind for a follow-up message to probe.
+
+The two checks are deliberately the same one. Answering only within a
+shared channel while retention also keeps a link for DM history leaves a
+DM that has outlived every shared channel in a state neither side will
+ever re-signal - each keeps retrying and each silently drops the other's
+proposal. That is invisible for as long as the addresses learned earlier
+still work, and becomes permanent the moment either peer's address moves,
+which is precisely the situation signalling exists to recover from.
 
 This check is **not** applied symmetrically to the *initiating* side
 (the initiating side) - every call site that proactively opens a
@@ -1176,9 +1210,11 @@ link is already reachable only after legitimate prior contact: the eager
 trigger above fires directly off a `UserJoined` for a shared channel; the
 file-offer accept/reject and key-rotation-install paths only run for a
 peer that already reached this client through an existing link or a
-verified rotation. Gating those too would be pure redundancy, and would
-actively break the supported case of still messaging someone in an open DM
-after they've left every channel you shared (SPEC.md's "Offline users").
+verified rotation. Gating those too would be pure redundancy. It is also
+why the answering check has to admit DM history rather than a shared
+channel alone: the supported case of still messaging someone in an open DM
+after they have left every channel you shared (SPEC.md's "Offline users")
+needs *both* directions to work, not just the one that initiates.
 
 #### 7.1.3 Tearing down a link once it no longer serves a purpose
 

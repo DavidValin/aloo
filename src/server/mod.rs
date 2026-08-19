@@ -656,11 +656,30 @@ async fn serve_tcp(
 /// authentication, no `Registry` access, no state between datagrams: same
 /// threat model as a public STUN server. See
 /// `crate::client::p2p::learn_reflexive_candidate`.
+///
+/// A failed `recv_from` is logged and ignored rather than ending the loop,
+/// the same "degrade, never take the socket down" handling the client's own
+/// receive loop uses (`client::p2p::spawn_receive_loop`). This socket sends
+/// to whoever asked, so an ordinary client disappearing can surface an error
+/// on a *later* recv (on Windows, `WSAECONNRESET` after the ICMP
+/// port-unreachable for a previous reply; `WSAEMSGSIZE` for a datagram
+/// larger than `buf`), and breaking on those killed reflexive-address
+/// discovery for the whole remaining uptime of the server - leaving every
+/// client from then on with host candidates only, able to punch on a LAN
+/// and nowhere else.
 async fn udp_rendezvous_loop(socket: UdpSocket) {
     let mut buf = [0u8; 512];
     loop {
-        let Ok((n, from)) = socket.recv_from(&mut buf).await else {
-            break;
+        let (n, from) = match socket.recv_from(&mut buf).await {
+            Ok(ok) => ok,
+            Err(e) => {
+                eprintln!("aloo: UDP rendezvous receive error (ignoring, still listening): {e}");
+                // Safety net against a permanently-broken socket erroring
+                // instantly forever, which would busy-spin this task at
+                // 100% of a core; transient errors don't notice 50ms.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
         };
         let Ok(RendezvousMessage::BindingRequest { token }) = proto::decode(&buf[..n]) else {
             continue;

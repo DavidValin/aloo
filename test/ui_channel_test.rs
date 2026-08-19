@@ -1200,6 +1200,38 @@ fn shares_a_joined_channel_is_false_once_the_channel_is_left() {
     assert!(!state.shares_a_joined_channel(UserId(2)));
 }
 
+/// The bar for *answering* a link request is the same one used for *keeping*
+/// a link (TB-158), not the narrower shared-channel test: an open DM with
+/// history is a supported reason to reach someone who has left every channel
+/// you shared (SPEC.md's "Offline users"), and §7.1.2 already exempts the
+/// initiating side for exactly that reason.
+///
+/// The two bars have to agree. Gating the answer on a shared channel while
+/// retention kept the link on DM history left both sides holding a link
+/// neither would ever re-signal: it survives only while the addresses learned
+/// earlier still work, so the first time either peer's address moves - the
+/// one situation signalling exists to recover from - the DM can never be
+/// punched again.
+///
+/// @requirement TB-155
+#[test]
+fn a_link_request_is_answered_for_a_dm_peer_with_no_shared_channel() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.on_direct_message(UserId(2), "bob".into(), MessageBody::Text("hey".into()));
+    // Bob leaves the only channel they had in common; the DM remains.
+    state.on_user_left("general", UserId(2));
+
+    assert!(
+        !state.shares_a_joined_channel(UserId(2)),
+        "precondition: no shared channel is left"
+    );
+    assert!(
+        state.has_reason_to_keep_link(UserId(2)),
+        "the DM is still a reason to reach them - so their link request must \
+         be answered, or the link can never be re-established"
+    );
+}
+
 // ---------------------------------------------------------------------
 // Leaving a channel (US-026)
 // ---------------------------------------------------------------------

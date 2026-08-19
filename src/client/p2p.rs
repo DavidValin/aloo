@@ -891,6 +891,17 @@ impl PeerLinkManager {
     /// mapping is independent of the peer-facing ones, so a change here
     /// says nothing about whether a working peer path still works, and
     /// `LINK_IDLE_TIMEOUT` catches it if it doesn't.
+    ///
+    /// The re-signal goes through `restart_attempt`, exactly like the two
+    /// other paths that begin a fresh attempt (`ensure_link`, `retry_due`):
+    /// a link that isn't `Active` may still be `Lost` while holding live
+    /// ARQ state (`mark_lost` deliberately doesn't reset it - the reset
+    /// belongs to the next attempt), and the peer answering our new nonce
+    /// resets *their* sequence space. Assigning the new nonce by hand here
+    /// skipped our own reset and left the reopened link with one side at
+    /// sequence zero and the other mid-stream, silently losing traffic in
+    /// both directions (every `Reliable` frame is acked unconditionally, so
+    /// nothing retransmits) against §7.1.1's "both sides restart from zero".
     pub fn on_rendezvous(&mut self, addr: SocketAddr, msg: RendezvousMessage) {
         if addr != self.server_udp_addr {
             return;
@@ -902,7 +913,7 @@ impl PeerLinkManager {
             return;
         }
         self.reflexive = Some(observed);
-        let candidates = self.local_candidates();
+        let now = Instant::now();
         let stale: Vec<UserId> = self
             .links
             .iter()
@@ -910,16 +921,10 @@ impl PeerLinkManager {
             .map(|(&id, _)| id)
             .collect();
         for peer in stale {
-            let link_nonce = random_token();
-            if let Some(link) = self.links.get_mut(&peer) {
-                link.link_nonce = link_nonce;
-                link.state = PeerLinkState::Requested {
-                    started: Instant::now(),
-                };
-            }
+            let (candidates, link_nonce) = self.restart_attempt(peer, now);
             let _ = self.events_tx.send(P2pEvent::Signal {
                 peer,
-                candidates: candidates.clone(),
+                candidates,
                 link_nonce,
             });
         }
