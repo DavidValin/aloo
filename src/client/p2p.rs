@@ -234,6 +234,27 @@ pub enum P2pEvent {
         from: UserId,
         envelope: crate::proto::Envelope,
     },
+
+    /// Mirrors `p2p_proto::P2pPayload::CallInvite` - see
+    /// `crate::client::voice_call` for how a call's roster/audio are handled
+    /// from here.
+    CallInvite {
+        channel: Option<String>,
+        from: UserId,
+        call_id: u64,
+    },
+    CallAccept {
+        from: UserId,
+        call_id: u64,
+    },
+    CallReject {
+        from: UserId,
+        call_id: u64,
+    },
+    CallEnd {
+        from: UserId,
+        call_id: u64,
+    },
 }
 
 /// Outgoing traffic originating on a background thread (the voice
@@ -247,6 +268,19 @@ pub enum P2pEvent {
 pub enum P2pOutbound {
     ChannelVoiceChunk {
         stream_id: u64,
+        seq: u32,
+        per_recipient: Vec<(UserId, Vec<Vec<u8>>)>,
+    },
+    /// A live call's outgoing audio chunk, fanned out to every current
+    /// participant - mechanically identical to `ChannelVoiceChunk`
+    /// (`stream_id` is the call's own `call_id`), kept as its own variant
+    /// because it comes from `voice_call::spawn_call_audio_worker`'s
+    /// unbounded, dynamically-addressed capture rather than a bounded
+    /// push-to-talk recording, and dispatching it must never touch
+    /// anything push-to-talk-specific (`SessionState::own_stream_targets`,
+    /// the `MAX_RECORDING_SAMPLES` cap, ...).
+    CallVoiceChunk {
+        call_id: u64,
         seq: u32,
         per_recipient: Vec<(UserId, Vec<Vec<u8>>)>,
     },
@@ -1018,6 +1052,14 @@ impl PeerLinkManager {
             P2pPayload::DeviceIdAnnounce { envelope } => {
                 P2pEvent::DeviceIdAnnounce { from, envelope }
             }
+            P2pPayload::CallInvite { call_id, channel } => P2pEvent::CallInvite {
+                channel,
+                from,
+                call_id,
+            },
+            P2pPayload::CallAccept { call_id } => P2pEvent::CallAccept { from, call_id },
+            P2pPayload::CallReject { call_id } => P2pEvent::CallReject { from, call_id },
+            P2pPayload::CallEnd { call_id } => P2pEvent::CallEnd { from, call_id },
         };
         let _ = self.events_tx.send(event);
     }
@@ -1234,6 +1276,15 @@ impl PeerLinkManager {
             } => {
                 for (id, blocks) in per_recipient {
                     self.send_unreliable_voice(id, stream_id, seq, blocks);
+                }
+            }
+            P2pOutbound::CallVoiceChunk {
+                call_id,
+                seq,
+                per_recipient,
+            } => {
+                for (id, blocks) in per_recipient {
+                    self.send_unreliable_voice(id, call_id, seq, blocks);
                 }
             }
             P2pOutbound::DirectVoiceChunk {

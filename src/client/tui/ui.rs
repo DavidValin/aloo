@@ -64,12 +64,13 @@ pub const STATUS_NOTICE_TIMEOUT: std::time::Duration = std::time::Duration::from
 /// typical terminal window - module-level (not local to
 /// `render_help_popup`) so `UiState::handle_key`'s scroll clamping and the
 /// renderer share one source of truth for how many lines there are.
-const HELP_HEADINGS: [&str; 9] = [
+const HELP_HEADINGS: [&str; 10] = [
     "Channels",
     "Messaging",
     "Private messages",
     "Voice messages",
     "File transfer",
+    "Live voice calls",
     "Encryption (tag shown after each username)",
     "One-time-pad layer (optional, per contact)",
     "OTP mail (async, stored encrypted on the server)",
@@ -107,6 +108,17 @@ const HELP_BODY: &[&str] = &[
     "  Accepting streams the file straight to ~/.aloo/downloads with a",
     "  live progress bar - nothing is held whole in memory on either side,",
     "  and there is no size cap. Declining shows as rejected in your log.",
+    "",
+    "Live voice calls",
+    "  /call      start a continuous, multi-user call in the selected channel",
+    "             or open private room - distinct from a voice message: not",
+    "             push-to-talk, no time cap, and every current member/the",
+    "             peer gets an Accept/Reject popup (with a chime) naming you.",
+    "  /mute      toggle your own microphone while on a call",
+    "  /endcall   leave the call - a permanent red banner (top right) marks",
+    "             the whole time you're on one",
+    "  Not available over an OTP session (that layer has no live-streaming",
+    "  concept at all - see the OTP section below).",
     "",
     "Encryption (tag shown after each username)",
     "  name \u{1F6A8} PWD    static: one RSA keypair derived from a password",
@@ -415,6 +427,60 @@ pub enum OtpChoice {
     Reject,
 }
 
+/// One incoming live-call invite awaiting an Accept/Reject decision
+/// (`docs/PROTOCOL.md` "Live voice calls") - mirrors `PendingFileOffer`'s
+/// queued-popup idiom exactly, down to `Accept` being the default focus.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingCallInvite {
+    pub call_id: u64,
+    pub from: UserId,
+    pub from_name: String,
+    /// `Some(channel)` for a channel call, `None` for a DM.
+    pub channel: Option<String>,
+}
+
+/// Which button is focused in the call-invite popup - `Accept` by default,
+/// same reasoning as `FileOfferChoice`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallInviteChoice {
+    Accept,
+    Reject,
+}
+
+/// Where `/call` should be addressed, resolved at command-submit time (same
+/// "known now, not deferred" reasoning as `VoiceTarget`) - `session::
+/// handle_ui_action` dispatches into `crate::client::channel`/
+/// `crate::client::direct_message`'s `handle_start_call`, which resolve the
+/// actual recipient list (channel membership is looked up fresh there,
+/// rather than snapshotted here, since a call invite tolerates the extra
+/// few milliseconds a bounded live recording can't - see
+/// `voice_call::addressable_channel_members`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum CallTarget {
+    Channel {
+        channel: String,
+    },
+    Direct {
+        to: UserId,
+        recipient_key_mode: KeyMode,
+        recipient_pubkey_der: Vec<u8>,
+    },
+}
+
+/// The permanent, always-visible (not auto-clearing, unlike
+/// `UiState::status_notice`) top-right indicator for an active call -
+/// `docs/SPEC.md` "Live voice calls" requires this stay on screen for the
+/// call's whole duration, in red.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CallUiState {
+    pub call_id: u64,
+    pub channel: Option<String>,
+    pub muted: bool,
+    /// Other participants currently on the call with us, in join order -
+    /// never includes ourselves.
+    pub participants: Vec<(UserId, String)>,
+}
+
 /// The local "generate and share a fresh pad?" decision after `/otp` finds
 /// no existing keychain entry (`client::otp::handle_otp_command`) - never
 /// acted on without this confirmation, see `docs/PROTOCOL.md` §16.1.
@@ -622,6 +688,28 @@ pub enum UiAction {
     SaveOtpMailAttachment {
         index: usize,
     },
+    /// The `/call` command (`submit_input`) - starts a live voice call
+    /// addressed to `target`. Never sent while already on a call or mid
+    /// push-to-talk recording (`submit_input` refuses those itself, with a
+    /// status notice); OTP-gating (a DM contact we currently have an OTP
+    /// session with) is checked session-side, where `SessionState` is
+    /// available (`crate::client::direct_message::handle_start_call`).
+    StartCall(CallTarget),
+    /// The user accepted an incoming call invite (`docs/PROTOCOL.md` "Live
+    /// voice calls") - `crate::client::voice_call::accept_invite`.
+    AcceptCallInvite {
+        call_id: u64,
+    },
+    /// The user rejected it - `crate::client::voice_call::reject_invite`.
+    RejectCallInvite {
+        call_id: u64,
+    },
+    /// The `/mute` command, typed while on a call - toggles our own
+    /// microphone, purely local (`crate::client::voice_call::toggle_mute`).
+    ToggleCallMute,
+    /// The `/endcall` command - leaves the call we're currently on
+    /// (`crate::client::voice_call::end_own_call`).
+    EndCall,
 }
 
 /// Which trigger started the current recording - `handle_key`'s Space
@@ -712,6 +800,24 @@ pub struct UiState {
     /// (`push_file_offer`, popup + bell) only once that sender is
     /// `Accept`ed (`resolve_identity_accept`).
     pending_file_offers: HashMap<UserId, Vec<PendingFileOffer>>,
+    /// Every incoming call invite currently awaiting a decision, keyed by
+    /// `call_id` - mirrors `file_offers`/`file_offer_queue` exactly
+    /// (queued-popup idiom, `Accept`-first default).
+    pub call_invites: HashMap<u64, PendingCallInvite>,
+    call_invite_queue: VecDeque<u64>,
+    call_invite_focus: CallInviteChoice,
+    /// Call invites received from a `Pending`/`Rejected` identity-review
+    /// sender, held back the same way `pending_file_offers` holds a file
+    /// offer - queued for real (`push_call_invite`, popup + bell) only once
+    /// that sender is `Accept`ed (`resolve_identity_accept`).
+    pending_call_invites: HashMap<UserId, Vec<PendingCallInvite>>,
+    /// The live voice call we're currently on, if any - the permanent
+    /// top-right indicator (`docs/SPEC.md` "Live voice calls") renders from
+    /// this; the actual network/audio plumbing lives on `SessionState`
+    /// (`crate::client::voice_call::ActiveCall`), which this mirrors
+    /// read-only for presentation, same split every other feature here
+    /// uses.
+    pub call: Option<CallUiState>,
     /// The local "generate and share a fresh OTP pad?" confirmation opened
     /// by `/otp` when no keychain entry exists yet
     /// (`client::otp::handle_otp_command`) - `None` when nothing is
@@ -908,6 +1014,11 @@ impl UiState {
             file_offer_queue: VecDeque::new(),
             file_offer_focus: FileOfferChoice::Accept,
             pending_file_offers: HashMap::new(),
+            call_invites: HashMap::new(),
+            call_invite_queue: VecDeque::new(),
+            call_invite_focus: CallInviteChoice::Accept,
+            pending_call_invites: HashMap::new(),
+            call: None,
             otp_generate_confirm: None,
             otp_generate_focus: OtpChoice::Accept,
             otp_size_input: None,
@@ -1070,6 +1181,16 @@ impl UiState {
             .push(offer);
     }
 
+    /// Held-invite counterpart for an incoming call invite from a
+    /// `Pending`/`Rejected` identity-review sender - see
+    /// `pending_call_invites`'s doc.
+    pub fn hold_call_invite(&mut self, invite: PendingCallInvite) {
+        self.pending_call_invites
+            .entry(invite.from)
+            .or_default()
+            .push(invite);
+    }
+
     /// Removes `peer` from the review queue wherever it is - not
     /// necessarily the front - resetting focus if the popup on screen
     /// changed. Removing by identity rather than a plain `pop_front` keeps
@@ -1150,6 +1271,13 @@ impl UiState {
                 }
             }
         }
+        if let Some(invites) = self.pending_call_invites.remove(&peer) {
+            for invite in invites {
+                if self.push_call_invite(invite) {
+                    play_bell = true;
+                }
+            }
+        }
         play_bell
     }
 
@@ -1218,6 +1346,82 @@ impl UiState {
         self.file_offer_queue.retain(|k| *k != key);
         self.file_offer_focus = FileOfferChoice::Accept;
         self.file_offers.remove(&key)
+    }
+
+    // -------------------------------------------------------------
+    // Live voice calls (`docs/PROTOCOL.md` "Live voice calls"): the invite
+    // Accept/Reject popup is the same modal-queue idiom as file transfer's
+    // above; `call` (below) is the separate, always-visible "on a call
+    // right now" indicator, unrelated to the popup queue.
+    // -------------------------------------------------------------
+
+    /// Queues `invite` and, if nothing else is currently showing, makes it
+    /// the one shown right away - mirrors `push_file_offer` exactly.
+    pub fn push_call_invite(&mut self, invite: PendingCallInvite) -> bool {
+        let key = invite.call_id;
+        self.call_invites.insert(key, invite);
+        self.call_invite_queue.push_back(key);
+        let is_front = self.call_invite_queue.front() == Some(&key);
+        if is_front {
+            self.call_invite_focus = CallInviteChoice::Accept;
+        }
+        is_front
+    }
+
+    /// The invite currently shown in the popup, if any.
+    pub fn call_invite_open(&self) -> Option<&PendingCallInvite> {
+        let key = self.call_invite_queue.front()?;
+        self.call_invites.get(key)
+    }
+
+    /// Removes and returns the invite for `call_id` - a decision here is
+    /// always final, same as a file offer's.
+    pub fn take_call_invite(&mut self, call_id: u64) -> Option<PendingCallInvite> {
+        self.call_invite_queue.retain(|k| *k != call_id);
+        self.call_invite_focus = CallInviteChoice::Accept;
+        self.call_invites.remove(&call_id)
+    }
+
+    /// Starts showing the permanent top-right "on a call" indicator -
+    /// called once we become an active participant, whether as the
+    /// initiator or an accepter (`crate::client::voice_call::begin_own_call`).
+    pub fn begin_call(&mut self, call_id: u64, channel: Option<String>) {
+        self.call = Some(CallUiState {
+            call_id,
+            channel,
+            muted: false,
+            participants: Vec::new(),
+        });
+    }
+
+    /// Clears the permanent indicator - called once we've left the call
+    /// (`crate::client::voice_call::end_own_call`).
+    pub fn end_call(&mut self) {
+        self.call = None;
+    }
+
+    pub fn set_call_muted(&mut self, muted: bool) {
+        if let Some(call) = self.call.as_mut() {
+            call.muted = muted;
+        }
+    }
+
+    /// Records a newly-connected participant on the indicator - a no-op if
+    /// we're not actually shown as on a call (defensive; shouldn't happen,
+    /// since `crate::client::voice_call` only ever adds a participant to an
+    /// `ActiveCall` that already exists).
+    pub fn on_call_participant_joined(&mut self, peer: UserId, name: String) {
+        if let Some(call) = self.call.as_mut()
+            && !call.participants.iter().any(|(id, _)| *id == peer)
+        {
+            call.participants.push((peer, name));
+        }
+    }
+
+    pub fn on_call_participant_left(&mut self, peer: UserId) {
+        if let Some(call) = self.call.as_mut() {
+            call.participants.retain(|(id, _)| *id != peer);
+        }
     }
 
     /// Opens the local "generate and share a fresh OTP pad?" confirmation
@@ -1693,6 +1897,29 @@ impl UiState {
             };
         }
 
+        // An incoming call invite is the same priority tier as a file
+        // offer - both are "someone needs a consent decision before
+        // anything else happens" popups, absorbing every key the same way.
+        if let Some(&call_id) = self.call_invite_queue.front() {
+            return match kind {
+                KeyEventKind::Press | KeyEventKind::Repeat => match code {
+                    KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
+                        self.call_invite_focus = match self.call_invite_focus {
+                            CallInviteChoice::Accept => CallInviteChoice::Reject,
+                            CallInviteChoice::Reject => CallInviteChoice::Accept,
+                        };
+                        None
+                    }
+                    KeyCode::Enter => match self.call_invite_focus {
+                        CallInviteChoice::Accept => Some(UiAction::AcceptCallInvite { call_id }),
+                        CallInviteChoice::Reject => Some(UiAction::RejectCallInvite { call_id }),
+                    },
+                    _ => None,
+                },
+                _ => None,
+            };
+        }
+
         // Ctrl+H toggles the help overlay from any view/mode/focus, taking
         // priority over everything below. Gated on `Press`: on a Kitty
         // terminal the matching `Release` also reaches here, and toggling
@@ -1978,6 +2205,54 @@ impl UiState {
             self.input.clear();
             return Some(UiAction::LeaveChannel { name });
         }
+        if self.input.trim() == "/call" {
+            // Distinct from push-to-talk: a continuous, multi-user call
+            // (`docs/PROTOCOL.md` "Live voice calls"), never available under
+            // OTP - that gate needs `SessionState`, so it's checked
+            // session-side (`crate::client::direct_message::handle_start_call`)
+            // once this actually reaches it.
+            if self.call.is_some() {
+                self.push_status_notice("already on a call".to_string(), false);
+                self.input.clear();
+                return None;
+            }
+            if self.recording {
+                self.push_status_notice(
+                    "can't start a call while recording a voice message".to_string(),
+                    false,
+                );
+                self.input.clear();
+                return None;
+            }
+            let Some(target) = self.current_call_target() else {
+                self.push_status_notice("nobody to call here".to_string(), false);
+                self.input.clear();
+                return None;
+            };
+            self.input.clear();
+            return Some(UiAction::StartCall(target));
+        }
+        if self.input.trim() == "/mute" {
+            // Toggles either way - see `CallUiState::muted`'s doc; the
+            // actual flip happens session-side (`crate::client::voice_call::
+            // toggle_mute`), which then writes the result back here.
+            if self.call.is_none() {
+                self.push_status_notice("not on a call".to_string(), false);
+                self.input.clear();
+                return None;
+            }
+            self.input.clear();
+            return Some(UiAction::ToggleCallMute);
+        }
+        if self.input.trim() == "/endcall" {
+            if self.call.is_none() {
+                self.push_status_notice("not on a call".to_string(), false);
+                self.input.clear();
+                return None;
+            }
+            self.input.clear();
+            return Some(UiAction::EndCall);
+        }
         // Anything else starting with `/` is an attempted command, not a
         // message - even one this build doesn't recognize, or a typo of a
         // real one. It must never leak into a channel or DM as literal
@@ -2130,6 +2405,14 @@ impl UiState {
     }
 
     fn current_voice_target(&self) -> Option<VoiceTarget> {
+        // The microphone is already spoken for by the live call - push-to-
+        // talk and a call both ultimately open the same `voice::Recorder`,
+        // and layering a bounded recording's own send path on top of a
+        // continuous call's would be confusing at best. `/mute` is how you
+        // temporarily stop talking on a call, not Space.
+        if self.call.is_some() {
+            return None;
+        }
         if let Some(peer_id) = self.active_private_room {
             // An offline peer can't receive a live stream either - ignore
             // Space entirely rather than starting a recording with nowhere
@@ -2155,6 +2438,34 @@ impl UiState {
                 recipients: self.recipients_for_channel(channel),
             })
         }
+    }
+
+    /// Resolves what `/call` should address, mirroring
+    /// `current_voice_target`'s DM branch (same offline/trust-gate checks)
+    /// but, unlike it, not resolving a channel's recipient list here -
+    /// `crate::client::channel::handle_start_call` recomputes that fresh
+    /// (`crate::client::voice_call::addressable_channel_members`), since an
+    /// invite (unlike an already-flowing recording) tolerates the extra
+    /// few milliseconds that costs.
+    fn current_call_target(&self) -> Option<CallTarget> {
+        if let Some(peer_id) = self.active_private_room {
+            if self.offline.contains(&peer_id) || self.is_trust_gated(peer_id) {
+                return None;
+            }
+            let peer = self.known_users.get(&peer_id)?;
+            return Some(CallTarget::Direct {
+                to: peer_id,
+                recipient_key_mode: peer.key_mode,
+                recipient_pubkey_der: peer.public_key_der.clone(),
+            });
+        }
+        let channel = self.channels.get(self.selected_channel)?;
+        if !channel.joined {
+            return None;
+        }
+        Some(CallTarget::Channel {
+            channel: channel.name.clone(),
+        })
     }
 
     /// Starts a recording from the global Ctrl+Alt+P shortcut. Deliberately
@@ -2449,6 +2760,11 @@ pub fn render(frame: &mut Frame, state: &UiState) {
     if let Some(offer) = state.file_offer_open() {
         render_file_offer_popup(frame, area, offer, state.file_offer_focus);
     }
+    // A call invite is the same tier as a file offer, same reasoning
+    // `handle_key` applies.
+    if let Some(invite) = state.call_invite_open() {
+        render_call_invite_popup(frame, area, invite, state.call_invite_focus);
+    }
     // The OTP popups sit above the file offer, same tier `handle_key` gives
     // them (below only an identity review).
     if let Some(pending) = &state.otp_generate_confirm {
@@ -2466,11 +2782,20 @@ pub fn render(frame: &mut Frame, state: &UiState) {
     if let Some(review) = state.identity_review_open() {
         render_identity_review_popup(frame, area, review, state.identity_review_focus);
     }
+    // The permanent "on a call" indicator (`docs/SPEC.md` "Live voice
+    // calls") is drawn in the same top-right corner the status notice
+    // uses, just above it - unlike that notice it never auto-clears, so it
+    // claims the corner first and pushes the notice down rather than the
+    // other way around.
+    let mut status_notice_y = 1;
+    if let Some(call) = &state.call {
+        status_notice_y = render_call_banner(frame, area, call);
+    }
     // The status notice is a small non-modal banner, not a popup - drawn
     // absolutely last so a session outcome is always visible even over
     // everything above, without ever blocking input the way those do.
     if let Some((message, success)) = &state.status_notice {
-        render_status_notice(frame, area, message, *success);
+        render_status_notice(frame, area, status_notice_y, message, *success);
     }
 }
 
@@ -2528,6 +2853,59 @@ fn render_file_offer_popup(
         16,
         "Reject",
         focus == FileOfferChoice::Reject,
+    );
+}
+
+/// The Accept/Reject popup for one incoming call invite
+/// (`docs/PROTOCOL.md` "Live voice calls") - visual shape mirrors
+/// `render_file_offer_popup` exactly, same `Accept`-first default.
+fn render_call_invite_popup(
+    frame: &mut Frame,
+    area: Rect,
+    invite: &PendingCallInvite,
+    focus: CallInviteChoice,
+) {
+    let title = format!("Voice call incoming from {}", invite.from_name);
+    let popup = centered_rect(64, 9, area);
+    let block = Block::default().title(title).borders(Borders::ALL);
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(3)])
+        .split(inner);
+
+    let location = match &invite.channel {
+        Some(name) => format!("#{name}"),
+        None => "a private message".to_string(),
+    };
+    let message = format!(
+        "{} is calling via {location}. Do you accept?",
+        invite.from_name
+    );
+    frame.render_widget(
+        Paragraph::new(message).wrap(ratatui::widgets::Wrap { trim: true }),
+        rows[0],
+    );
+
+    let button_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(rows[1]);
+    render_popup_button(
+        frame,
+        button_cols[0],
+        16,
+        "Accept",
+        focus == CallInviteChoice::Accept,
+    );
+    render_popup_button(
+        frame,
+        button_cols[1],
+        16,
+        "Reject",
+        focus == CallInviteChoice::Reject,
     );
 }
 
@@ -2658,12 +3036,14 @@ fn render_otp_size_popup(frame: &mut Frame, area: Rect, pending: &PendingOtpGene
 /// A small, non-modal one-line banner in the top-right corner reporting the
 /// most recent OTP session outcome (green on success, red otherwise) - see
 /// `UiState::status_notice`'s field doc for why this exists as its own
-/// always-rendered surface.
-fn render_status_notice(frame: &mut Frame, area: Rect, message: &str, success: bool) {
+/// always-rendered surface. `y` is where the permanent call banner (drawn
+/// just above this one, when there is a call) leaves off -
+/// `render_call_banner`'s return value, or `1` when there is none.
+fn render_status_notice(frame: &mut Frame, area: Rect, y: u16, message: &str, success: bool) {
     let width = (message.len() as u16 + 4).min(area.width);
     let rect = Rect {
         x: area.width.saturating_sub(width),
-        y: 1,
+        y,
         width,
         height: 3,
     };
@@ -2679,6 +3059,44 @@ fn render_status_notice(frame: &mut Frame, area: Rect, message: &str, success: b
             .wrap(ratatui::widgets::Wrap { trim: true }),
         inner,
     );
+}
+
+/// The permanent, always-visible top-right "on a call" indicator
+/// (`docs/SPEC.md` "Live voice calls") - unlike `render_status_notice`,
+/// never auto-clears while `state.call` is `Some`. Always red regardless of
+/// mute state: the red means "a call is live", not "something went wrong"
+/// the way `render_status_notice`'s red does. Returns the height it
+/// occupied (including its top margin) so `render` can draw the status
+/// notice just below it instead of overlapping.
+fn render_call_banner(frame: &mut Frame, area: Rect, call: &CallUiState) -> u16 {
+    let where_clause = match &call.channel {
+        Some(name) => format!(" in #{name}"),
+        None => String::new(),
+    };
+    let mute_clause = if call.muted { " \u{1F507} muted" } else { "" };
+    let message = format!(
+        "\u{1F534} On a call{where_clause} ({} connected){mute_clause}",
+        call.participants.len()
+    );
+    let width = (message.chars().count() as u16 + 4).min(area.width);
+    let rect = Rect {
+        x: area.width.saturating_sub(width),
+        y: 1,
+        width,
+        height: 3,
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Red));
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    frame.render_widget(
+        Paragraph::new(message)
+            .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+            .wrap(ratatui::widgets::Wrap { trim: true }),
+        inner,
+    );
+    rect.y + rect.height
 }
 
 /// Renders the label the UI shows on a finalized voice message block, e.g.

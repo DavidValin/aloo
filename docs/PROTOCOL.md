@@ -59,6 +59,7 @@ falling back to a server relay (§7.1).
   - [7.4 `Error { message: String }`](#74-error-message-string)
   - [7.5 `RotateKey` / `KeyRotated` - per-peer key rotation relay](#75-rotatekey-keyrotated---per-peer-key-rotation-relay)
   - [7.6 File transfer](#76-file-transfer)
+  - [7.7 Live voice calls](#77-live-voice-calls)
 - [8. Encryption model](#8-encryption-model)
   - [8.1 RSA-OAEP chunking](#81-rsa-oaep-chunking)
   - [8.2 Cost implication for voice](#82-cost-implication-for-voice)
@@ -213,6 +214,10 @@ the payload carried inside a reliable or unreliable one.
 | `OtpVoiceOffer` | reliably | Offers a fully-recorded voice message under the pad layer - auto-accepted, no popup (§16.2) |
 | `OtpDeliveryAck` | reliably | Confirms an `OtpEnvelope`/`OtpFileOffer`/`OtpVoiceOffer` decoded, unblocking the next one (§16) |
 | `DeviceIdAnnounce` | reliably | This side's device id, sealed like any other content - sent automatically once `Active` (§12.7) |
+| `CallInvite` | reliably | Proposes a live voice call (§7.7) |
+| `CallAccept` | reliably | Joins a call, or replies to a newly-discovered participant - the mesh's only signal (§7.7) |
+| `CallReject` | reliably | Declines an invite, sent only to whoever sent it (§7.7) |
+| `CallEnd` | reliably | Leaves a call still in progress (§7.7) |
 
 **Server UDP socket** — stateless, no user data.
 
@@ -1471,6 +1476,140 @@ arrive - `safe_filename` (unchanged: reduces a peer-supplied name to just
 its final path component) still guards the on-disk path against a
 maliciously-crafted filename, applied after the length crop above. There is
 no separate save-location prompt; accepting *is* saving.
+
+### 7.7 Live voice calls
+
+A **call** is a continuous, multi-user voice conversation - distinct from a
+voice message (§7.3) in every way that matters: it is not push-to-talk (the
+microphone stays open once joined, not just while a key is held), it has no
+`MAX_RECORDING_SECS` cap, and joining it takes an explicit Accept rather
+than arriving unsolicited. Like everything else in §7, there is **no
+server involvement at all** - signaling and audio both travel exclusively
+over punched links (§7.1), and there is no server-side call state of any
+kind.
+
+`CallInvite`/`CallAccept`/`CallReject`/`CallEnd` are four more
+`P2pPayload` variants (§7.1.1), all sent reliably:
+
+```
+CallInvite { call_id: u64, channel: optional<string> }
+CallAccept { call_id: u64 }
+CallReject { call_id: u64 }
+CallEnd    { call_id: u64 }
+```
+
+`call_id` is a fresh random token (unguessable off-path, like a link's
+`link_nonce`, §7.1) chosen by whoever runs `/call`, naming the call for its
+whole lifetime. `channel: some(name)` on `CallInvite` addresses a channel
+call, `none` a call to one DM peer - carried in the clear (unlike a file
+offer's filename, §7.6, there's nothing about a call's existence worth
+hiding from a peer it's already addressed to).
+
+**Starting a call.** The initiator becomes a participant immediately, then
+sends `CallInvite` to every member of `channel` (or the one DM peer) whose
+link is reachable and who isn't currently under an OTP session with them
+(see this section's OTP note below) - the same recipient-computation an
+ordinary channel send already does, not a list carried on the wire. Each
+recipient shows an Accept/Reject popup naming the caller. Rejecting sends
+`CallReject` back to whoever the invite came from and nothing else -
+purely informational, since the rejecter was never added as a participant
+anywhere.
+
+**No coordinator: how a full mesh converges.** Once more than two people
+are on a call, something has to tell a third participant who the other two
+already are - there is no server, and no single participant (not even the
+initiator) is treated as a directory the others depend on staying
+reachable. Two rules, both riding the same `CallAccept` message, are
+sufficient:
+
+1. On accepting, a client broadcasts `CallAccept { call_id }` to every
+   other member of the call's channel/DM it can currently address - not
+   just the inviter.
+2. On receiving a `CallAccept` for a call it is itself active on, from
+   someone not yet in its own roster, a client adds that peer as a
+   participant *and* replies with its own `CallAccept { call_id }` sent
+   directly back to them alone.
+
+A `CallAccept` for a call the receiver isn't active on (not yet decided,
+already declined, or a stale message from a call already left) is simply
+ignored - rule 1's broadcast reaches people who aren't ready for it as a
+matter of course, and that's fine, since rule 2 is what actually
+guarantees convergence. Worked example, alice having invited bob and
+carol to a channel call:
+
+```
+bob accepts  -> CallAccept(bob)   broadcast to {alice, carol}
+   alice (active): adds bob, replies CallAccept(alice) -> bob
+   carol (not active yet): ignores it
+carol accepts later -> CallAccept(carol) broadcast to {alice, bob}
+   alice (active): adds carol, replies CallAccept(alice) -> carol (already
+     has alice - a harmless no-op on carol's end)
+   bob (active): adds carol, replies CallAccept(bob) -> carol
+carol receives bob's reply: adds bob (already reached alice above)
+```
+
+Every pairwise link ends up established regardless of join order or which
+messages happen to race - a participant who is discovered late is always
+covered by rule 2 firing on whichever side heard about them second.
+
+**Audio reuses the voice-streaming wire format (§7.3), addressed
+differently.** Once two participants have exchanged `CallAccept`s, each
+sends the other a continuous run of `PunchDatagram::Unreliable { stream_id,
+seq, blocks }` chunks (and, for a `pq_hybrid` recipient, one
+`P2pPayload::StreamKeySetup`, §13.7) exactly as a voice message would -
+with the call's own `call_id` standing in for `stream_id`. Two differences
+from an ordinary voice message:
+
+- **No `StreamStart`/`StreamEnd` is ever sent for call audio.** A
+  `CallAccept` (either direction) is what starts a participant's audio
+  toward its recipient; a `CallEnd` (below) is what stops it. This also
+  keeps a call's audio out of the receiving client's voice-message log -
+  it was never announced as one.
+- **No `MAX_RECORDING_SECS` cap applies.** A call chunk stream runs for as
+  long as both sides remain participants, which is expected to be far
+  longer than any one voice message.
+
+Since a chunk/setup's only identity on the wire is `(from, stream_id)`
+(§7.3's stream-identity rule, unchanged here), an implementation must
+distinguish a call's `call_id` from an ordinary voice message's
+`stream_id` some other way if it needs to route them differently (the
+reference client tracks which `(from, id)` pairs belong to its current
+call's roster) - the two numbers are drawn from disjoint generators (a
+call's is fully random; a voice message's is a small per-connection
+counter) and so cannot collide in practice, but nothing on the wire tags a
+chunk with which kind of stream it belongs to.
+
+**Muting is purely local - there is no wire message for it.** A muted
+participant simply stops sending chunks to everyone for as long as it's
+muted; every recipient's mixer hears silence from that source in the
+meantime because nothing is pushed to it, the same as a moment of natural
+silence during an ordinary recording. No participant is ever told another
+one is muted.
+
+**Leaving.** `CallEnd { call_id }` is sent to every other participant a
+leaving client currently knows about, and each one, on receiving it, tears
+down that one pairwise audio stream and drops the leaver from its roster.
+The call itself has no separate "end" beyond that - it is, at any moment,
+simply whichever participants haven't yet sent (or received) a `CallEnd`
+for it. A client that never receives `CallEnd` from a peer who is
+genuinely gone (their connection died outright) is not automatically
+corrected by this section - see §7.1.3/§7.1.4 for how a lost link is
+detected and surfaced independently of call state.
+
+**Busy handling.** A client already active on one call answers *any*
+`CallInvite` it receives - for a different call - with an immediate
+`CallReject`, without ever showing a popup: the reference client supports
+only one active call at a time, the same simplification an ordinary phone
+line makes.
+
+**Not available under OTP.** The one-time-pad layer (§16) has no
+live-streaming concept at all - even voice under OTP is recorded whole and
+sent once, never continuously (§16.2) - so a call can never reach a peer
+it applies to. A DM call to a peer under an active OTP session is refused
+outright, with nothing sent; a channel call simply excludes any member
+under one from the invite (and, symmetrically, from the `CallAccept`
+broadcast above), the same partial-delivery treatment an ordinary channel
+send already gives a rotating-key recipient without a fresh key (§11.2).
 
 ## 8. Encryption model
 

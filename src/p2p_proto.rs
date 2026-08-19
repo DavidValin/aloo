@@ -196,4 +196,44 @@ pub enum P2pPayload {
     DeviceIdAnnounce {
         envelope: Envelope,
     },
+
+    /// Proposes a live, continuous, multi-user voice call (`docs/PROTOCOL.md`
+    /// "Live voice calls") - distinct from a push-to-talk voice message.
+    /// `call_id` is a fresh random token (like `link_nonce`) naming the call
+    /// for the rest of its life, and doubles as the `stream_id` every
+    /// participant's audio to every other participant is keyed under (safe
+    /// to share across peers: audio chunks and `StreamKeySetup` are already
+    /// scoped by `(from, stream_id)`, never `stream_id` alone). Sent by the
+    /// caller to every current member of `channel`, or to the one DM peer
+    /// when `channel: None`. Cleartext (no `Envelope`) - unlike a file
+    /// offer's filename, a call's existence has nothing worth hiding from
+    /// the peer it's already addressed to, and a channel name is already
+    /// visible wire metadata elsewhere (`Envelope::channel`).
+    CallInvite {
+        call_id: u64,
+        channel: Option<String>,
+    },
+    /// Joins call `call_id`: sent both by a freshly-accepting client (to
+    /// every other member of the call's channel/DM) and, symmetrically, by
+    /// an already-joined participant echoing straight back to whoever it
+    /// just learned about this way (the "welcome" reply) - what converges
+    /// every participant's roster without any of them acting as a
+    /// coordinator the others depend on. Receiving this for a call/`from`
+    /// pair already in the local roster is a harmless no-op.
+    CallAccept {
+        call_id: u64,
+    },
+    /// Declines an invite - sent only back to whoever it came from (never
+    /// broadcast), mirrors `FileReject`. Purely informational: the sender
+    /// was never added as a participant, so there is nothing to tear down.
+    CallReject {
+        call_id: u64,
+    },
+    /// Leaves call `call_id` - sent to every other participant the leaver
+    /// currently knows about, so each tears down that one pairwise audio
+    /// stream. The call itself has no other "end" - it simply has however
+    /// many participants remain once everyone who has sent this is gone.
+    CallEnd {
+        call_id: u64,
+    },
 }

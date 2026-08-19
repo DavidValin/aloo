@@ -36,6 +36,7 @@ src/client/direct_message.rs  <-- DM-addressed send/receive handling for the ses
 src/client/envelope.rs         <-- builds outgoing proto::Envelopes (session-state-free crypto+proto glue)
 src/client/keymode_policy.rs    <-- client-side KeyMode policy predicates (addressability, identity pinning)
 src/client/voice_stream.rs       <-- live voice streaming plumbing shared by channels and DMs
+src/client/voice_call.rs          <-- live, continuous, multi-user voice calls: roster convergence, the capture/decrypt workers, Functionality #14
 src/client/file_transfer.rs       <-- consent-gated, streamed file transfer: FileOfferPayload shape, chunking/filename constants, download dir, send/receive workers, Functionality #9
 src/client/file_browser.rs   <-- fs-backed directory-listing model with back/forward history (rendering lives in tui/)
 src/client/voice.rs           <-- handles capture / live playback (mixer)
@@ -126,6 +127,8 @@ The UI is composed of:
   - **Conn:`<-|BAD|NORMAL|GOOD>`** — a rough read on how lively the connection feels, resampled once a second from the average gap between the last 1-3 protocol messages actually seen moving over the socket in either direction (there is no ping/pong in the wire protocol, so this is message cadence, not a true round-trip time). `-` (white) before any message has been exchanged yet this session; otherwise `BAD` (red), `NORMAL` (yellow) or `GOOD` (green) by how short that average gap is.
 - **Left area / sidebar** (20% wide) — list of users in the selected channel, each shown with an encryption tag next to their name (position depends on `my_key` type — see below; a narrow terminal clips this like any other overlong sidebar entry). Each connected user is coloured by whether messages can actually reach them — that is, by the state of the direct peer-to-peer link to them (`docs/PROTOCOL.md` §7.1.4), not merely by their being connected to the server: **green** once that link is up, **red** once it is lost (it keeps being retried in the background), and **yellow** while it is still being established, which is also how someone is shown before any link to them exists yet. Being present in the channel is not the same as being reachable, and this is where the difference shows. Two states override that colour: a user who has gone offline but is kept listed (Functionality #7) is rendered in soft gray, and a user whose identity hasn't been verified yet, or was explicitly rejected (Functionality #8), is rendered in red regardless of anything else — the most urgent of the three.
 - **Identity review popup** — a centered, bordered popup that opens automatically (announced with the same bell chime an incoming file offer plays — every popup that lands asking for a decision chimes: identity review, OTP session invites and generate-confirms, file offers, incoming OTP mail), on top of whatever else is on screen (even the help overlay). Messaging with the mismatched peer is blocked the instant their identity fails to check out (Functionality #8), but the popup itself is briefly withheld — until this specific connection's own address/device id are known, usually a second or two later — so it can show both sides of the comparison instead of just two fingerprints. Names the peer, explains the specific mismatch plus the last-known and new address/device id, and offers two buttons, **Accept** and **Reject** (`Reject` focused by default); `Left`/`Right`/`Tab` move focus between them, `Enter` confirms - no other key does anything while it's open, and there's no Esc-to-dismiss, since the whole point is an explicit decision rather than a wait-and-see banner. If more than one peer's identity is unresolved at once, only the oldest unshown one is displayed; resolving it (either button) reveals the next.
+- **Call invite popup** — same shape as the file-offer popup below (centered, chimed, **Accept** focused by default), titled `Voice call incoming from <nickname>` — see Functionality #14.
+- **Permanent call indicator** — while on a call, a red bordered box in the top-right corner (just above where the status notice would show) reads `🔴 On a call [in #<channel>] (<n> connected)`, with ` 🔇 muted` appended while muted. Unlike the status notice, it never times out on its own — it's cleared only by leaving the call (Functionality #14).
 - **Main area** (80% wide) — messages in the selected channel.
 - **Bottom bar** (full width) — text input where the user composes and sends a message; the cursor blinks at the end of the typed text whenever this bar is focused (the default focus on connecting). While viewing a private room whose peer is offline, this bar instead shows `(user offline)` in red and refuses all typing (Functionality #7).
 
@@ -243,6 +246,15 @@ When a tab is selected, the user joins that channel. The join is broadcast to al
     - **`/mailbox` opens the mailbox popup**, laid over the mail view it opens as its backdrop (Esc out of the popup closes an untouched backdrop with it): every sent mail with its delivery status (`awaiting server` / `on server` / `delivered ✓` / `failed` — status only, never content) and every received mail. **Enter on a received mail reads it**: the payload is decrypted in memory only and shown full-screen — Subtext, Content, voice parts playable through the normal mixer (Enter), attachments savable to `~/.aloo/downloads` (Enter). `d` removes a mail (confirm popup): removing a received mail overwrites and deletes its stored ciphertext **and** pad, destroying the content for good; removing a sent mail drops only the local status reference.
     - **Receiving**: a client with the `otp` binary asks the server for its mail right after connecting; each delivered mail is decrypted through the keychain exactly once, its identity signature checked against the pinned sender, then immediately re-encrypted under a fresh local one-time pad and stored as that (ciphertext, pad) file pair — plaintext is never at rest. A notice (with the file-offer chime) announces new mail; the sender is told when their mail was genuinely delivered, on their next connect if offline at the time.
 
+14. **Live voice calls: a continuous, multi-user conversation, distinct from a voice message (Functionality #4).** Full model in `docs/PROTOCOL.md` §7.7; from the user's point of view:
+    - **`/call`** in the compose bar starts one, addressed to whatever's currently in view — the selected channel, or an open private room — same "nowhere to send it" no-op as Space (Functionality #4) if neither applies. Refused, with a status notice, while already on a call, while a push-to-talk recording is in progress, and — DM only — while an OTP session (`docs/PROTOCOL.md` §16) is active with that peer, since that layer has no live-streaming concept at all; a channel call simply leaves out any member under one, the same silent exclusion an unreachable member already gets elsewhere (Functionality #7/#8).
+    - **Every reachable member/the peer sees a popup** — chimed, like a file offer — reading `Voice call incoming from <nickname>`, with **Accept**/**Reject** buttons, **Accept focused by default** (same reasoning as the file-offer popup, Functionality #9). A caller already on a different call is answered automatically with a decline, no popup shown - the reference client supports one active call at a time. Several invites queue and show one at a time, same as file offers; one from a not-yet-trusted identity (Functionality #8) is held, not shown, until that identity is `Accept`ed.
+    - **Accepting joins.** Once joined, the microphone stays open continuously - not push-to-talk, no 4-minute cap - and stays that way for as long as the call runs. Every participant who accepts hears every other one; there is no server and no single participant's connection the others depend on staying up (`docs/PROTOCOL.md` §7.7's roster-convergence rule).
+    - **A permanent red indicator** (see "Connected UI" above) marks the whole time a call is active, naming how many other participants are currently connected and whether the microphone is muted.
+    - **`/mute`** silences the microphone without ending the call or telling anyone else - captured audio is simply never sent while muted, so every other participant just hears silence, same as an ordinary pause in talking. `/mute` again resumes. Refused, with a notice, while not on a call.
+    - **`/endcall`** leaves the call: every other participant is told and stops hearing from us. Refused, with a notice, while not on a call. The call itself has no separate "end" beyond that - it is, at any moment, simply whichever participants haven't yet left.
+    - **Mutually exclusive with push-to-talk.** Space and the global shortcut (Functionality #4) do nothing while on a call - the microphone is already spoken for - and `/call` cannot be run mid-recording either.
+
 ## Protocol terms, and what implements them
 
 `docs/PROTOCOL.md` describes the protocol without naming a single Rust
@@ -262,7 +274,7 @@ here that implements it. If a name changes on one side, it changes on both.
 | Channels (§6), password bans (§6.6) | `server/mod.rs` `Registry::{join_channel, leave_channel, unregister, channel_list, channel_password_attempts}`; `validation.rs` |
 | Direct link, candidates, punching (§7.1) | `client/p2p.rs` `PeerLinkManager`; `p2p_proto.rs` `PunchDatagram`, `RendezvousMessage`, `SAFE_DATAGRAM_BYTES` |
 | Reliable layer (§7.1.1) | `client/p2p_reliable.rs` `ArqSender`, `ArqReceiver` |
-| `P2pPayload` variants (§7.2/§7.3/§7.6) | `p2p_proto.rs` `P2pPayload` |
+| `P2pPayload` variants (§7.2/§7.3/§7.6/§7.7) | `p2p_proto.rs` `P2pPayload` |
 | Per-recipient OAEP, chunking (§8/§8.1) | `crypto/mod.rs` `encrypt_chunked`, `decrypt_chunked`, `max_chunk_len` |
 | Password-derived keys (§8.3) | `crypto/mod.rs` `KeyPair::from_password` |
 | RSA-PSS signing (§8.4) | `crypto/mod.rs` `sign`, `verify` |
@@ -410,6 +422,30 @@ duplicating them.
 | Receive worker — decrypts/writes one chunk at a time | `file_transfer.rs` `spawn_receive_file_worker` |
 | Forward an incoming chunk/end to its worker | `file_transfer.rs` `forward_chunk`/`end_incoming_transfer`, called from `session.rs` |
 | Progress/completion/failure → log row | `session.rs` `handle_file_event` → `UiState::set_file_progress`/`set_file_completed`/`set_file_rejected`/`set_file_failed` |
+
+### Live voice calls
+
+Continuous and multi-user (Functionality #14, `docs/PROTOCOL.md` §7.7) -
+distinct from a voice message (above) in transport shape too: no
+`StreamStart`/`StreamEnd`, no `MAX_RECORDING_SECS` cap, and a dynamic,
+live-changing recipient set instead of one resolved once at record-start.
+Reuses `voice_stream.rs`'s per-chunk RSA/PQ dispatch (`resolve_direct_key`,
+`resolve_incoming_key`, `encrypt_direct_chunk`, `ChunkDecryptor`) directly
+rather than duplicating it - a call chunk's plaintext is exactly as
+payload-agnostic to those functions as a voice message's or a file
+chunk's already is.
+
+| Stage | Where |
+| --- | --- |
+| Start our own call (initiator or accepter) | `voice_call.rs` `begin_own_call` |
+| Invite fan-out - channel / DM | `channel.rs` `handle_start_call` / `direct_message.rs` `handle_start_call` |
+| Roster convergence (broadcast on join, reply to a newcomer) | `voice_call.rs` `accept_invite`, `on_call_accept`, `add_participant` |
+| Continuous capture + dynamic per-recipient fan-out (own thread) | `voice_call.rs` `spawn_call_audio_worker`, `CallRecorderCmd` |
+| Decrypt loop (one thread per participant's incoming audio) | `voice_call.rs` `spawn_call_decrypt_worker` |
+| Telling a call chunk/setup apart from a voice message's, sharing the same wire events | `voice_call.rs` `is_call_stream`; `session.rs` `handle_p2p_event`'s `StreamChunk`/`StreamKeySetup` arms |
+| Muting (purely local, no wire message) | `voice_call.rs` `toggle_mute`, `CallRecorderCmd::SetMuted` |
+| Leaving, tearing down every participant | `voice_call.rs` `end_own_call`, `remove_participant` |
+| Invite/accept/reject popup + permanent indicator | `client/tui/ui.rs` `PendingCallInvite`, `CallUiState`, `push_call_invite`/`call_invite_open`/`take_call_invite`, `begin_call`/`end_call`/`set_call_muted`, `UiAction::StartCall`/`AcceptCallInvite`/`RejectCallInvite`/`ToggleCallMute`/`EndCall` |
 
 ### What `pq_hybrid` adds
 

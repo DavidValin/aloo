@@ -23,6 +23,7 @@ pub mod session;
 pub mod sysstats;
 pub mod tui;
 pub mod voice;
+pub mod voice_call;
 #[cfg(target_env = "musl")]
 mod voice_pulse;
 pub mod voice_stream;

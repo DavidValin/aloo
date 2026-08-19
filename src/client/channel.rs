@@ -18,6 +18,7 @@ use crate::client::rekey;
 use crate::client::session::SessionState;
 use crate::client::tui::ui::{Recipient, UiState};
 use crate::client::voice;
+use crate::client::voice_call;
 use crate::client::voice_stream;
 
 pub(crate) async fn handle_join(
@@ -294,6 +295,37 @@ pub(crate) async fn handle_voice_record_start(
         stop_rx,
         session.auto_stop_tx.clone(),
     );
+    Ok(())
+}
+
+/// Starts a live voice call addressed to every member of `channel` we can
+/// currently reach (`voice_call::addressable_channel_members` - excludes
+/// self/offline/trust-gated the same way an ordinary send does, and anyone
+/// we currently have an OTP session with, which a call can never reach at
+/// all - `docs/PROTOCOL.md` "Live voice calls"). We become a participant
+/// immediately (`voice_call::begin_own_call`), same as everyone who later
+/// accepts; each invitee gets an Accept/Reject popup naming us.
+pub(crate) async fn handle_start_call(
+    wr: &mut impl crate::control::ControlSink,
+    ui_state: &mut UiState,
+    session: &mut SessionState,
+    channel: String,
+) -> proto::Result<()> {
+    let recipients = voice_call::addressable_channel_members(session, ui_state, &channel);
+    let call_id = voice_call::new_call_id();
+    if !voice_call::begin_own_call(session, ui_state, call_id, Some(channel.clone())) {
+        return Ok(());
+    }
+    for (id, ..) in recipients {
+        session.peer_link.ensure_link(wr, id).await;
+        session.peer_link.send_reliable_or_queue(
+            id,
+            P2pPayload::CallInvite {
+                call_id,
+                channel: Some(channel.clone()),
+            },
+        );
+    }
     Ok(())
 }
 

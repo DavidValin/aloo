@@ -532,6 +532,48 @@ fn file_transfer_message_family_roundtrips() {
     assert_eq!(decode::<P2pPayload>(&encode(&end).unwrap()).unwrap(), end);
 }
 
+/// The live-call signaling family (`docs/PROTOCOL.md` "Live voice calls")
+/// round-trips the same way every other `P2pPayload` variant does -
+/// `CallInvite`/`CallAccept`/`CallReject`/`CallEnd` are always addressed
+/// point-to-point, same shape as the file-transfer family above.
+///
+/// @requirement TB-199
+#[test]
+fn live_call_message_family_roundtrips() {
+    let invite = P2pPayload::CallInvite {
+        call_id: 42,
+        channel: Some("general".into()),
+    };
+    assert_eq!(
+        decode::<P2pPayload>(&encode(&invite).unwrap()).unwrap(),
+        invite
+    );
+
+    let invite_dm = P2pPayload::CallInvite {
+        call_id: 42,
+        channel: None,
+    };
+    assert_eq!(
+        decode::<P2pPayload>(&encode(&invite_dm).unwrap()).unwrap(),
+        invite_dm
+    );
+
+    let accept = P2pPayload::CallAccept { call_id: 42 };
+    assert_eq!(
+        decode::<P2pPayload>(&encode(&accept).unwrap()).unwrap(),
+        accept
+    );
+
+    let reject = P2pPayload::CallReject { call_id: 42 };
+    assert_eq!(
+        decode::<P2pPayload>(&encode(&reject).unwrap()).unwrap(),
+        reject
+    );
+
+    let end = P2pPayload::CallEnd { call_id: 42 };
+    assert_eq!(decode::<P2pPayload>(&encode(&end).unwrap()).unwrap(), end);
+}
+
 /// @requirement TB-060, AC-159
 #[test]
 fn otp_mail_messages_roundtrip() {

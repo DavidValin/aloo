@@ -2043,3 +2043,40 @@ evidence = "docs/PROTOCOL.md 17.2; src/crypto/otp.rs new_mail_id, mail_id_is_val
 id = "TB-197"
 description = "Server mail routing is idempotent and claimant-checked: a retried id overwrites byte-identically and re-acknowledges (or answers OtpMailDelivered if the mail was already delivered and deleted), an OtpMailAck is honored only from the stored recipient nickname, and a delivery receipt is forgotten only by the stored sender nickname."
 evidence = "docs/PROTOCOL.md 17.2, 17.3; src/server/mail.rs on_mail_send, mark_delivered, forget_receipt; tests store_is_idempotent_for_a_retried_id, on_mail_send_answers_a_retry_after_delivery_with_delivered, mark_delivered_refuses_a_claimant_other_than_the_recipient, forget_receipt_only_for_the_original_sender"
+
+[[user_story]]
+id = "US-036"
+title = "Live voice calls"
+as_a = "connected user"
+i_want = "to start a continuous, multi-user voice call in a channel or private room, distinct from a push-to-talk voice message"
+so_that = "a group of people can talk together in real time without anyone holding a key down"
+
+[[user_story.acceptance_criteria]]
+id = "AC-167"
+description = "/call in a channel or private room offers every member/the peer we can currently reach an Accept/Reject popup titled 'Voice call incoming from <nickname>', Accept focused by default; an invite from a Pending/Rejected identity is held, not shown, until that identity is Accepted."
+evidence = "docs/SPEC.md 'Live voice calls'; src/client/tui/ui.rs push_call_invite, call_invite_open, hold_call_invite, resolve_identity_accept, render_call_invite_popup, submit_input's /call branch, current_call_target; tests incoming_call_invite_shows_a_popup_naming_the_caller_with_accept_focused, a_call_invite_from_a_trust_gated_sender_is_held_until_accepted, slash_call_addresses_the_viewed_channel_or_an_open_private_room; scenario features/voice/live_call.feature 'An incoming call invite names the caller, Accept focused by default'"
+
+[[user_story.acceptance_criteria]]
+id = "AC-168"
+description = "Accepting or rejecting a call invite removes it from the queue for good (no reconsiderable state, like a file offer); a second invite queued behind the first becomes the one shown once the first is resolved."
+evidence = "docs/SPEC.md 'Live voice calls'; src/client/tui/ui.rs take_call_invite; test rejecting_a_call_invite_clears_it_and_shows_the_next_queued_one; scenario features/voice/live_call.feature 'Rejecting a call invite clears it and shows the next one queued'"
+
+[[user_story.acceptance_criteria]]
+id = "AC-169"
+description = "A permanent red indicator is shown in the top-right corner for as long as we're on a call - unlike the auto-clearing status notice, it never times out on its own - naming how many other participants are currently connected and whether our own microphone is muted; it and a status notice remain independently visible at once rather than one overwriting the other."
+evidence = "docs/SPEC.md 'Live voice calls'; src/client/tui/ui.rs begin_call, end_call, on_call_participant_joined, on_call_participant_left, set_call_muted, render_call_banner, render_status_notice's y parameter; tests the_permanent_call_indicator_tracks_participants_and_mute_state, the_call_indicator_and_a_status_notice_are_both_visible_at_once; scenario features/voice/live_call.feature 'A permanent call indicator tracks participants and mute state'"
+
+[[user_story.acceptance_criteria]]
+id = "AC-170"
+description = "/mute toggles our own microphone while on a call, without ending it or telling other participants; /mute is refused, with a notice, while not on a call."
+evidence = "docs/SPEC.md 'Live voice calls'; src/client/tui/ui.rs submit_input's /mute branch, UiAction::ToggleCallMute; src/client/voice_call.rs toggle_mute; test slash_mute_is_refused_off_a_call_and_toggles_on_one; scenario features/voice/live_call.feature '/mute only works while on a call'"
+
+[[user_story.acceptance_criteria]]
+id = "AC-171"
+description = "/endcall leaves the call we're on, and is refused (with a notice) while not on one; /call is refused (with a notice) while already on a call or mid push-to-talk recording, and push-to-talk (Space or the global shortcut) is unavailable while on a call - the microphone is already spoken for."
+evidence = "docs/SPEC.md 'Live voice calls'; src/client/tui/ui.rs submit_input's /endcall and /call branches, current_voice_target's call guard; tests slash_endcall_is_refused_off_a_call_and_works_on_one, slash_call_is_refused_while_already_on_a_call_or_mid_recording, slash_call_with_nowhere_to_call_shows_a_notice, push_to_talk_is_unavailable_while_on_a_call; scenario features/voice/live_call.feature '/call refuses a second call, and /endcall only works on one'"
+
+[[user_story.technical_behavior]]
+id = "TB-199"
+description = "CallInvite, CallAccept, CallReject and CallEnd (the live-call signaling family) round-trip through bincode encode/decode intact, addressed point-to-point like the file-transfer message family."
+evidence = "docs/PROTOCOL.md 'Live voice calls'; src/p2p_proto.rs P2pPayload::CallInvite/CallAccept/CallReject/CallEnd; test live_call_message_family_roundtrips"

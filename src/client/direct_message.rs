@@ -13,6 +13,7 @@ use crate::client::rekey;
 use crate::client::session::SessionState;
 use crate::client::tui::ui::UiState;
 use crate::client::voice;
+use crate::client::voice_call;
 use crate::client::voice_stream;
 
 /// Encrypts `plaintext` for one recipient, dispatching by their `KeyMode` -
@@ -285,6 +286,48 @@ pub(crate) async fn handle_voice_record_start(
         session.own_stream_done_tx.clone(),
         stop_rx,
         session.auto_stop_tx.clone(),
+    );
+    Ok(())
+}
+
+/// Starts a live voice call to `to` - refused outright (with a status
+/// notice, no invite ever sent) if we currently have an OTP session with
+/// them: that layer has no live-streaming concept at all (voice under OTP
+/// is recorded whole and sent once, never continuous -
+/// `docs/PROTOCOL.md` "Live voice calls"), so a DM call has nobody left to
+/// reach once its one possible recipient is excluded. We become a
+/// participant immediately (`voice_call::begin_own_call`), same as `to` if
+/// they accept.
+pub(crate) async fn handle_start_call(
+    wr: &mut impl crate::control::ControlSink,
+    ui_state: &mut UiState,
+    session: &mut SessionState,
+    to: UserId,
+    recipient_key_mode: KeyMode,
+    recipient_pubkey_der: Vec<u8>,
+) -> proto::Result<()> {
+    if crate::client::otp::contact_name_if_active(session, &recipient_pubkey_der).is_some() {
+        ui_state.push_status_notice(
+            "voice calls aren't supported over an OTP session".to_string(),
+            false,
+        );
+        return Ok(());
+    }
+    if !crate::client::keymode_policy::can_address(recipient_key_mode, session.own_key_mode) {
+        ui_state.push_status_notice("can't call this recipient right now".to_string(), false);
+        return Ok(());
+    }
+    let call_id = voice_call::new_call_id();
+    if !voice_call::begin_own_call(session, ui_state, call_id, None) {
+        return Ok(());
+    }
+    session.peer_link.ensure_link(wr, to).await;
+    session.peer_link.send_reliable_or_queue(
+        to,
+        P2pPayload::CallInvite {
+            call_id,
+            channel: None,
+        },
     );
     Ok(())
 }

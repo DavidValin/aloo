@@ -32,6 +32,7 @@ use crate::client::rekey;
 use crate::client::sysstats;
 use crate::client::tui::ui::{self, IdentityCase, PendingFileOffer, UiAction, UiState, VoiceTarget};
 use crate::client::voice;
+use crate::client::voice_call;
 use crate::client::voice_stream;
 
 /// How long an incoming stream can go without a chunk/end before it's
@@ -181,6 +182,10 @@ pub(crate) struct SessionState {
     /// cleared - a peer's device id doesn't change mid-session just
     /// because their link flaps and re-punches.
     pub(crate) peer_device_ids: HashMap<UserId, String>,
+    /// The live voice call (`crate::client::voice_call`) we're currently in,
+    /// if any - distinct from push-to-talk's `active_recording`, and never
+    /// set for more than one call at a time (`voice_call::is_busy`).
+    pub(crate) active_call: Option<voice_call::ActiveCall>,
 }
 
 // `key_mode` pushed this past clippy's default 7-argument threshold;
@@ -345,6 +350,7 @@ pub(crate) async fn run_connected_session(
         }),
         own_device_id,
         peer_device_ids: HashMap::new(),
+        active_call: None,
     };
 
     let mut ui_state = UiState::new(display_name);
@@ -831,6 +837,38 @@ async fn handle_ui_action(
         UiAction::SaveOtpMailAttachment { index } => {
             crate::client::otp_mail::handle_save_attachment(ui_state, index);
         }
+        UiAction::StartCall(target) => match target {
+            ui::CallTarget::Channel { channel } => {
+                crate::client::channel::handle_start_call(wr, ui_state, session, channel).await?;
+            }
+            ui::CallTarget::Direct {
+                to,
+                recipient_key_mode,
+                recipient_pubkey_der,
+            } => {
+                crate::client::direct_message::handle_start_call(
+                    wr,
+                    ui_state,
+                    session,
+                    to,
+                    recipient_key_mode,
+                    recipient_pubkey_der,
+                )
+                .await?;
+            }
+        },
+        UiAction::AcceptCallInvite { call_id } => {
+            voice_call::accept_invite(wr, session, ui_state, call_id).await?;
+        }
+        UiAction::RejectCallInvite { call_id } => {
+            voice_call::reject_invite(wr, session, ui_state, call_id).await?;
+        }
+        UiAction::ToggleCallMute => {
+            voice_call::toggle_mute(session, ui_state);
+        }
+        UiAction::EndCall => {
+            voice_call::end_own_call(wr, session, ui_state).await?;
+        }
     }
     Ok(())
 }
@@ -1150,7 +1188,14 @@ async fn handle_p2p_event(
             stream_id,
             setup,
         } => {
-            voice_stream::forward_key_setup(session, from, stream_id, setup);
+            // A call's audio setup and a push-to-talk stream's share this
+            // same generic event - `is_call_stream` tells them apart by
+            // `(from, stream_id)` (see its doc for why that's unambiguous).
+            if voice_call::is_call_stream(session, from, stream_id) {
+                voice_call::forward_key_setup(session, from, stream_id, setup);
+            } else {
+                voice_stream::forward_key_setup(session, from, stream_id, setup);
+            }
         }
         P2pEvent::StreamChunk {
             from,
@@ -1158,7 +1203,11 @@ async fn handle_p2p_event(
             seq,
             blocks,
         } => {
-            voice_stream::forward_chunk(session, from, stream_id, seq, blocks);
+            if voice_call::is_call_stream(session, from, stream_id) {
+                voice_call::forward_chunk(session, from, stream_id, seq, blocks);
+            } else {
+                voice_stream::forward_chunk(session, from, stream_id, seq, blocks);
+            }
         }
         P2pEvent::StreamEnd { from, stream_id } => {
             voice_stream::end_incoming_stream(session, from, stream_id);
@@ -1325,6 +1374,26 @@ async fn handle_p2p_event(
             envelope,
         } => {
             crate::client::otp::on_voice_offer(wr, session, ui_state, from, stream_id, seq, envelope).await;
+        }
+        P2pEvent::CallInvite {
+            channel,
+            from,
+            call_id,
+        } => {
+            let from_name = name_of(ui_state, from);
+            if voice_call::on_call_invite(wr, session, ui_state, from, from_name, call_id, channel).await
+            {
+                voice_stream::play_bell_chime(session);
+            }
+        }
+        P2pEvent::CallAccept { from, call_id } => {
+            voice_call::on_call_accept(wr, session, ui_state, from, call_id).await?;
+        }
+        P2pEvent::CallReject { from, call_id } => {
+            voice_call::on_call_reject(session, ui_state, from, call_id);
+        }
+        P2pEvent::CallEnd { from, call_id } => {
+            voice_call::on_call_end(session, ui_state, from, call_id);
         }
     }
     Ok(())

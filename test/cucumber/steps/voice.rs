@@ -4,7 +4,7 @@ use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 use cucumber::{given, then, when};
 
 use aloo::proto::{KeyMode, UserId};
-use aloo::client::tui::ui::{MessageBody, UiAction, VoiceTarget};
+use aloo::client::tui::ui::{MessageBody, PendingCallInvite, UiAction, VoiceTarget};
 use aloo::client::tui::ui::format_duration_label;
 
 use crate::steps::ui_common::id_for;
@@ -342,4 +342,142 @@ async fn recording_continues(w: &mut AlooWorld) {
         w.ui_ref().recording,
         "a playback failure is unrelated to an in-progress recording"
     );
+}
+
+// ---------------------------------------------------------------------
+// Live voice calls (US-036) - distinct from push-to-talk above. Only the
+// `UiState`-level half is exercised here (invite popup, permanent
+// indicator, slash commands); the network/audio orchestration
+// (`crate::client::voice_call`) needs a live session, see
+// docs/TESTING.md's "Known coverage gaps".
+// ---------------------------------------------------------------------
+
+#[given(expr = "{word} is calling me in the channel")]
+async fn call_invite_arrives(w: &mut AlooWorld, name: String) {
+    let id = UserId(id_for(&name));
+    w.ui_mut().push_call_invite(PendingCallInvite {
+        call_id: id_for(&name),
+        from: id,
+        from_name: name,
+        channel: Some("general".into()),
+    });
+}
+
+#[then(expr = "a call invite popup names {word}")]
+async fn call_invite_names(w: &mut AlooWorld, name: String) {
+    let invite = w.ui_ref().call_invite_open().expect("no call invite popup is open");
+    assert_eq!(invite.from_name, name);
+}
+
+#[then(expr = "accepting {word}'s call is requested")]
+async fn accepting_call_requested(w: &mut AlooWorld, name: String) {
+    assert_eq!(
+        w.last_action,
+        Some(UiAction::AcceptCallInvite {
+            call_id: id_for(&name)
+        })
+    );
+}
+
+#[then(expr = "rejecting {word}'s call is requested")]
+async fn rejecting_call_requested(w: &mut AlooWorld, name: String) {
+    assert_eq!(
+        w.last_action,
+        Some(UiAction::RejectCallInvite {
+            call_id: id_for(&name)
+        })
+    );
+}
+
+/// Applies whichever Accept/Reject decision `handle_key` just produced -
+/// `session::handle_ui_action` does this over the network in production
+/// (`voice_call::accept_invite`/`reject_invite`); here it's just the local
+/// `take_call_invite` half, enough to prove the queue advances.
+#[when("that decision is applied")]
+async fn call_decision_applied(w: &mut AlooWorld) {
+    let call_id = match w.last_action {
+        Some(UiAction::AcceptCallInvite { call_id } | UiAction::RejectCallInvite { call_id }) => {
+            call_id
+        }
+        ref other => panic!("expected a call invite decision, got {other:?}"),
+    };
+    w.ui_mut().take_call_invite(call_id);
+}
+
+#[when("I join a call in the channel")]
+async fn i_join_a_call(w: &mut AlooWorld) {
+    w.ui_mut().begin_call(1, Some("general".into()));
+}
+
+#[when(expr = "{word} joins the call with me")]
+async fn peer_joins_call(w: &mut AlooWorld, name: String) {
+    let id = UserId(id_for(&name));
+    w.ui_mut().on_call_participant_joined(id, name);
+}
+
+#[when("I mute myself")]
+async fn i_mute_myself(w: &mut AlooWorld) {
+    w.ui_mut().set_call_muted(true);
+}
+
+#[when("I leave the call")]
+async fn i_leave_the_call(w: &mut AlooWorld) {
+    w.ui_mut().end_call();
+}
+
+#[then("a call indicator is shown")]
+async fn call_indicator_shown(w: &mut AlooWorld) {
+    let rows = ui_rows(w.ui_ref());
+    assert!(
+        rows.iter().any(|r| r.contains("On a call")),
+        "expected the permanent call indicator: {rows:?}"
+    );
+}
+
+#[then("no call indicator is shown")]
+async fn no_call_indicator(w: &mut AlooWorld) {
+    let rows = ui_rows(w.ui_ref());
+    assert!(
+        !rows.iter().any(|r| r.contains("On a call")),
+        "no call indicator should be showing: {rows:?}"
+    );
+}
+
+#[then(expr = "the call indicator shows {int} connected")]
+async fn call_indicator_connected_count(w: &mut AlooWorld, count: usize) {
+    let rows = ui_rows(w.ui_ref());
+    let wanted = format!("{count} connected");
+    assert!(
+        rows.iter().any(|r| r.contains(&wanted)),
+        "expected {wanted:?}: {rows:?}"
+    );
+}
+
+#[then("the call indicator shows muted")]
+async fn call_indicator_muted(w: &mut AlooWorld) {
+    let rows = ui_rows(w.ui_ref());
+    assert!(
+        rows.iter().any(|r| r.contains("muted")),
+        "expected the muted marker: {rows:?}"
+    );
+}
+
+#[then(expr = "a call status notice says {string}")]
+async fn call_status_notice_says(w: &mut AlooWorld, expected: String) {
+    let (text, _) = w
+        .ui_ref()
+        .status_notice
+        .as_ref()
+        .expect("no status notice is shown");
+    assert!(text.contains(&expected), "expected {expected:?} within {text:?}");
+}
+
+#[then("muting is requested")]
+async fn muting_requested(w: &mut AlooWorld) {
+    assert_eq!(w.last_action, Some(UiAction::ToggleCallMute));
+}
+
+#[then("ending the call is requested")]
+async fn ending_call_requested(w: &mut AlooWorld) {
+    assert_eq!(w.last_action, Some(UiAction::EndCall));
 }

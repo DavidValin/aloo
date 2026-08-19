@@ -4,8 +4,8 @@ use ui_common::*;
 
 use aloo::proto::UserId;
 use aloo::client::tui::ui::{
-    Focus, IdentityCase, MessageBody, Mode, RECORD_HOLD_TIMEOUT, UiAction, UiState,
-    render,
+    CallTarget, Focus, IdentityCase, MessageBody, Mode, PendingCallInvite, RECORD_HOLD_TIMEOUT,
+    UiAction, UiState, render,
 };
 use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::Terminal;
@@ -1597,4 +1597,276 @@ fn render_empty_state_does_not_panic() {
     let backend = ratatui::backend::TestBackend::new(80, 24);
     let mut terminal = ratatui::Terminal::new(backend).unwrap();
     terminal.draw(|f| render(f, &state)).unwrap();
+}
+
+// ---------------------------------------------------------------------
+// Live voice calls (US-036) - distinct from push-to-talk
+// (`test/cucumber/steps/voice.rs` has the Gherkin-level coverage for the
+// same behavior; these pin the exact `UiState` mechanics). The network/
+// audio orchestration (`crate::client::voice_call`) needs a live session
+// and a real microphone, so it isn't covered here - see docs/TESTING.md's
+// "Known coverage gaps".
+// ---------------------------------------------------------------------
+
+/// @requirement AC-167
+#[test]
+fn incoming_call_invite_shows_a_popup_naming_the_caller_with_accept_focused() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    assert!(state.call_invite_open().is_none());
+
+    let shown = state.push_call_invite(PendingCallInvite {
+        call_id: 42,
+        from: UserId(2),
+        from_name: "bob".into(),
+        channel: Some("general".into()),
+    });
+    assert!(shown, "the first invite becomes the one shown");
+    assert_eq!(
+        state.call_invite_open().map(|i| i.from_name.as_str()),
+        Some("bob")
+    );
+
+    let rows = rendered_rows(&state);
+    assert!(
+        rows.iter()
+            .any(|r| r.contains("Voice call incoming from bob")),
+        "{rows:?}"
+    );
+    assert!(rows.iter().any(|r| r.contains("Accept")), "{rows:?}");
+    assert!(rows.iter().any(|r| r.contains("Reject")), "{rows:?}");
+
+    // Accept is focused by default - a bare Enter accepts.
+    let action = press(&mut state, KeyCode::Enter);
+    assert_eq!(action, Some(UiAction::AcceptCallInvite { call_id: 42 }));
+}
+
+/// @requirement AC-167
+#[test]
+fn a_call_invite_from_a_trust_gated_sender_is_held_until_accepted() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.push_identity_review(UserId(2), "bob".into(), "mismatch".into(), static_mismatch());
+    assert!(state.is_trust_gated(UserId(2)));
+
+    state.hold_call_invite(PendingCallInvite {
+        call_id: 7,
+        from: UserId(2),
+        from_name: "bob".into(),
+        channel: Some("general".into()),
+    });
+    assert!(
+        state.call_invite_open().is_none(),
+        "held, not shown, while trust-gated"
+    );
+
+    let played_bell = state.resolve_identity_accept(UserId(2));
+    assert!(
+        played_bell,
+        "the revealed invite becomes the one shown, so the caller should chime"
+    );
+    assert_eq!(state.call_invite_open().map(|i| i.call_id), Some(7));
+}
+
+/// @requirement AC-168
+#[test]
+fn rejecting_a_call_invite_clears_it_and_shows_the_next_queued_one() {
+    let mut state = joined_general_with(vec![user(2, "bob"), user(3, "carol")]);
+    state.push_call_invite(PendingCallInvite {
+        call_id: 1,
+        from: UserId(2),
+        from_name: "bob".into(),
+        channel: None,
+    });
+    state.push_call_invite(PendingCallInvite {
+        call_id: 2,
+        from: UserId(3),
+        from_name: "carol".into(),
+        channel: None,
+    });
+
+    press(&mut state, KeyCode::Left); // move focus onto Reject
+    let action = press(&mut state, KeyCode::Enter);
+    assert_eq!(action, Some(UiAction::RejectCallInvite { call_id: 1 }));
+
+    // `session::handle_ui_action` applies the decision over the network;
+    // its local half is just this.
+    state.take_call_invite(1);
+
+    assert_eq!(
+        state.call_invite_open().map(|i| i.call_id),
+        Some(2),
+        "carol's invite is shown next"
+    );
+}
+
+/// @requirement AC-169
+#[test]
+fn the_permanent_call_indicator_tracks_participants_and_mute_state() {
+    let mut state = joined_general_with(vec![]);
+    assert!(state.call.is_none());
+    assert!(!rendered_rows(&state).iter().any(|r| r.contains("On a call")));
+
+    state.begin_call(99, Some("general".into()));
+    assert!(state.call.is_some());
+    let rows = rendered_rows(&state);
+    assert!(rows.iter().any(|r| r.contains("On a call")), "{rows:?}");
+    assert!(rows.iter().any(|r| r.contains("0 connected")), "{rows:?}");
+
+    state.on_call_participant_joined(UserId(2), "bob".into());
+    assert!(
+        rendered_rows(&state)
+            .iter()
+            .any(|r| r.contains("1 connected"))
+    );
+
+    state.set_call_muted(true);
+    assert!(rendered_rows(&state).iter().any(|r| r.contains("muted")));
+
+    state.on_call_participant_left(UserId(2));
+    assert!(
+        rendered_rows(&state)
+            .iter()
+            .any(|r| r.contains("0 connected"))
+    );
+
+    state.end_call();
+    assert!(state.call.is_none());
+    assert!(!rendered_rows(&state).iter().any(|r| r.contains("On a call")));
+}
+
+/// The permanent call indicator and the transient status notice
+/// (`STATUS_NOTICE_TIMEOUT`) occupy the same top-right corner but must
+/// never clobber each other - see `render_status_notice`'s `y` parameter.
+///
+/// @requirement AC-169
+#[test]
+fn the_call_indicator_and_a_status_notice_are_both_visible_at_once() {
+    let mut state = joined_general_with(vec![]);
+    state.begin_call(1, None);
+    state.push_status_notice("bob left the call".into(), true);
+
+    let rows = rendered_rows(&state);
+    assert!(rows.iter().any(|r| r.contains("On a call")), "{rows:?}");
+    assert!(
+        rows.iter().any(|r| r.contains("bob left the call")),
+        "{rows:?}"
+    );
+}
+
+/// @requirement AC-170
+#[test]
+fn slash_mute_is_refused_off_a_call_and_toggles_on_one() {
+    let mut state = joined_general_with(vec![]);
+    state.focus = Focus::Input;
+
+    type_str(&mut state, "/mute");
+    let action = press(&mut state, KeyCode::Enter);
+    assert_eq!(action, None);
+    assert_eq!(
+        state.status_notice.as_ref().map(|(m, ok)| (m.as_str(), *ok)),
+        Some(("not on a call", false))
+    );
+
+    state.begin_call(1, None);
+    type_str(&mut state, "/mute");
+    let action = press(&mut state, KeyCode::Enter);
+    assert_eq!(action, Some(UiAction::ToggleCallMute));
+    assert!(
+        state.input.is_empty(),
+        "the command is cleared from the compose bar"
+    );
+}
+
+/// @requirement AC-171
+#[test]
+fn slash_endcall_is_refused_off_a_call_and_works_on_one() {
+    let mut state = joined_general_with(vec![]);
+    state.focus = Focus::Input;
+
+    type_str(&mut state, "/endcall");
+    assert_eq!(press(&mut state, KeyCode::Enter), None);
+    assert_eq!(
+        state.status_notice.as_ref().map(|(m, _)| m.as_str()),
+        Some("not on a call")
+    );
+
+    state.begin_call(1, None);
+    type_str(&mut state, "/endcall");
+    assert_eq!(press(&mut state, KeyCode::Enter), Some(UiAction::EndCall));
+}
+
+/// @requirement AC-171
+#[test]
+fn slash_call_is_refused_while_already_on_a_call_or_mid_recording() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.focus = Focus::Input;
+
+    state.begin_call(1, None);
+    type_str(&mut state, "/call");
+    assert_eq!(press(&mut state, KeyCode::Enter), None);
+    assert_eq!(
+        state.status_notice.as_ref().map(|(m, _)| m.as_str()),
+        Some("already on a call")
+    );
+    state.end_call();
+
+    state.recording = true;
+    type_str(&mut state, "/call");
+    assert_eq!(press(&mut state, KeyCode::Enter), None);
+    assert_eq!(
+        state.status_notice.as_ref().map(|(m, _)| m.as_str()),
+        Some("can't start a call while recording a voice message")
+    );
+}
+
+/// @requirement AC-171
+#[test]
+fn slash_call_with_nowhere_to_call_shows_a_notice() {
+    let mut state = UiState::new("me".into());
+    state.focus = Focus::Input;
+    type_str(&mut state, "/call");
+    assert_eq!(press(&mut state, KeyCode::Enter), None);
+    assert_eq!(
+        state.status_notice.as_ref().map(|(m, _)| m.as_str()),
+        Some("nobody to call here")
+    );
+}
+
+/// @requirement AC-167
+#[test]
+fn slash_call_addresses_the_viewed_channel_or_an_open_private_room() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.focus = Focus::Input;
+
+    type_str(&mut state, "/call");
+    assert_eq!(
+        press(&mut state, KeyCode::Enter),
+        Some(UiAction::StartCall(CallTarget::Channel {
+            channel: "general".into()
+        }))
+    );
+
+    // `known_users`/`channel.members` are already seeded with bob
+    // (`joined_general_with`) - opening a private room with him is just
+    // pointing `active_private_room` at his id, same as
+    // `direct_message::open_private_room` does before this ever runs.
+    state.active_private_room = Some(UserId(2));
+    type_str(&mut state, "/call");
+    match press(&mut state, KeyCode::Enter) {
+        Some(UiAction::StartCall(CallTarget::Direct { to, .. })) => {
+            assert_eq!(to, UserId(2))
+        }
+        other => panic!("expected a direct call target, got {other:?}"),
+    }
+}
+
+/// @requirement AC-171
+#[test]
+fn push_to_talk_is_unavailable_while_on_a_call() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.focus = Focus::Messages;
+    state.begin_call(1, None);
+
+    let action = state.handle_key(KeyCode::Char(' '), KeyModifiers::NONE, KeyEventKind::Press);
+    assert_eq!(action, None);
+    assert!(!state.recording, "the mic is already spoken for by the call");
 }
