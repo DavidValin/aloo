@@ -43,6 +43,11 @@ pub(crate) enum OwnStreamTarget {
         contact_name: String,
         recipient_pubkey_der: Vec<u8>,
     },
+    /// A recording destined for the OTP mail being composed
+    /// (docs/PROTOCOL.md §17.1) - accumulate-only like `DirectOtp`, but
+    /// nothing network-related at all: the finished PCM lands in the
+    /// compose form's attachment list (`UiState::otp_mail_add_voice`).
+    MailAttachment,
 }
 
 /// The once-per-stream `PqHybrid` setup: each PQ recipient's own sealed

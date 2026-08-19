@@ -68,13 +68,13 @@ Feature: Getting help without leaving the app
     Then my typing does not reach the compose bar
 
   @TB-106
-  Scenario: Escape does not close help, nor the room underneath it
+  Scenario: Escape closes help without touching the room underneath it
     Given I am connected and viewing a channel
     And bob is in the channel with me
     And I have opened a private room with bob
     And the help overlay is open
     When I press Escape
-    Then the help overlay is open
+    Then the help overlay is closed
     And the private room underneath is untouched
 
   @TB-126

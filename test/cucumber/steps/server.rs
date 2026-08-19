@@ -248,8 +248,11 @@ async fn registry_fresh(w: &mut AlooWorld) {
 }
 
 /// The handle used in the scenario doubles as the nickname, so `alice` in a
-/// step is the same person the server knows as "alice".
+/// step is the same person the server knows as "alice". Also usable as a
+/// `When`: the OTP mail scenarios connect the recipient mid-scenario,
+/// after mail for them is already waiting.
 #[given(expr = "{word} has connected")]
+#[when(expr = "{word} has connected")]
 async fn client_connects(w: &mut AlooWorld, who: String) {
     let addr = w.addr.expect("no server running");
     let mut stream = ControlEndpoint::new(TcpStream::connect(addr).await.unwrap());

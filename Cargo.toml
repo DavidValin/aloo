@@ -208,6 +208,22 @@ name = "otp_cli_test"
 path = "test/otp_cli_test.rs"
 
 [[test]]
+name = "otp_mail_test"
+path = "test/otp_mail_test.rs"
+
+[[test]]
+name = "otp_mail_store_test"
+path = "test/otp_mail_store_test.rs"
+
+[[test]]
+name = "server_mail_test"
+path = "test/server_mail_test.rs"
+
+[[test]]
+name = "ui_otp_mail_test"
+path = "test/ui_otp_mail_test.rs"
+
+[[test]]
 name = "ui_connect_popup_test"
 path = "test/ui_connect_popup_test.rs"
 

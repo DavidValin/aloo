@@ -431,7 +431,7 @@ impl UiState {
     }
 
     /// `seed_member` plus a yellow "`<time>` `<name>` joined" log entry
-    /// (`MessageBody::Presence`, `docs/SPEC.md` Functionality #7) - but only
+    /// (`MessageBody::Presence`, `docs/SPEC.md` Functionality #12) - but only
     /// when `channel` was already joined *before* this call, i.e. this is a
     /// genuine live join rather than the existing-member snapshot a fresh
     /// join receives (see `seed_member`'s doc): that snapshot's `UserJoined`

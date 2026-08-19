@@ -359,6 +359,54 @@ pub enum ClientMessage {
     /// (like receiving anything else) simply resets the server's
     /// `HEARTBEAT_TIMEOUT` clock for this connection.
     Heartbeat,
+
+    /// Uploads one OTP mail for the server to hold until its recipient
+    /// connects (docs/PROTOCOL.md §17) - the one deliberate exception to
+    /// "content never touches the server", and even here only as an opaque
+    /// blob: `ciphertext` is the whole mail sealed through the sender's
+    /// one-time pad, which the server has no key material for. The sender's
+    /// own registered nickname is what the server records as "from" - never
+    /// anything client-claimed. Answered with `OtpMailResult`; a sender
+    /// that never receives one retries with the *same* `mail_id` and the
+    /// exact ciphertext recovered from `otp --recover-last --sent`, so the
+    /// id doubles as the dedup key.
+    OtpMailSend {
+        /// Sender-generated, `crypto::otp::mail_id_is_valid`-shaped.
+        mail_id: String,
+        /// Recipient nickname, exactly as pinned by the sender.
+        to: String,
+        /// The pairwise `otp` keychain contact this was sealed under
+        /// (`crypto::otp::contact_name_for`) - carried so the receiver can
+        /// refuse outright (touching no pad) if it doesn't match the
+        /// contact the receiver derives from its *own* pinned key for the
+        /// claimed sender.
+        contact_name: String,
+        /// This mail's position in the contact's OTP send counter - the
+        /// same counter `P2pPayload::OtpEnvelope::seq` uses, because a mail
+        /// spends the same sequential pad (§17.2).
+        seq: u64,
+        /// Unix seconds, UTC, at the moment the user confirmed the send.
+        sent_at_utc: u64,
+        ciphertext: Vec<u8>,
+    },
+    /// Asks the server for everything §17.3 owes this client: every stored
+    /// mail addressed to its nickname (delivered as `OtpMailDeliver`s), and
+    /// every delivered-but-unnotified receipt for mail it previously sent
+    /// (delivered as `OtpMailDelivered`s). Sent once after identify by any
+    /// client with a local OTP keychain; harmless for one without.
+    OtpMailFetch,
+    /// Receiver -> server: this mail was decrypted and persisted locally -
+    /// the server deletes its stored ciphertext and records a delivery
+    /// receipt for the sender (§17.3).
+    OtpMailAck {
+        mail_id: String,
+    },
+    /// Sender -> server: the `OtpMailDelivered` receipt was seen and local
+    /// state updated - the server may forget the receipt instead of
+    /// re-notifying on every future connect.
+    OtpMailDeliveredAck {
+        mail_id: String,
+    },
 }
 
 /// Messages the server sends to a client.
@@ -451,5 +499,41 @@ pub enum ServerMessage {
 
     Error {
         message: String,
+    },
+
+    /// Answers one `OtpMailSend` (docs/PROTOCOL.md §17.2): `ok: true` means
+    /// the ciphertext is durably stored (or was already - a retried id is
+    /// acknowledged again, never stored twice) and the sender may treat the
+    /// mail's pad spend as delivered-to-server. `ok: false` is exceptional
+    /// (malformed id, oversized ciphertext, a disk failure): the pad bytes
+    /// this mail consumed are gone either way, so the sender reports it as
+    /// a hard failure rather than retrying.
+    OtpMailResult {
+        mail_id: String,
+        ok: bool,
+        reason: Option<String>,
+    },
+    /// One stored mail, handed to the nickname it's addressed to - in
+    /// response to that client's `OtpMailFetch`, or pushed immediately if
+    /// the recipient happens to be connected when `OtpMailSend` arrives.
+    /// Every field is the stored mirror of the original `OtpMailSend`,
+    /// except `from`, which is the nickname the server itself registered
+    /// for the sender's connection. Mails from one sender are always
+    /// delivered in ascending `seq` order (§17.3) - the pad is sequential,
+    /// so the receiver cannot decrypt them in any other order.
+    OtpMailDeliver {
+        mail_id: String,
+        from: String,
+        contact_name: String,
+        seq: u64,
+        sent_at_utc: u64,
+        ciphertext: Vec<u8>,
+    },
+    /// Tells the original sender their mail was genuinely received and
+    /// decrypted by its recipient (who acknowledged it via `OtpMailAck`).
+    /// Re-sent on every `OtpMailFetch` until the sender answers with
+    /// `OtpMailDeliveredAck` (§17.3).
+    OtpMailDelivered {
+        mail_id: String,
     },
 }

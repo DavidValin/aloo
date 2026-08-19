@@ -24,10 +24,12 @@ Just you, your terminal, and the people you're talking to.
 - 📢 **Public channels** — join the channels the server advertises, shown as tabs across the top; a channel created after you connect shows up live, no reconnect needed.
 - 🔒 **Private channels** — create or join a channel that isn't advertised to anyone; you just need to know its name, and optionally a password its creator set.
 - ✉️  **Private messages (DMs)** — open a one-on-one conversation with anyone in the sidebar.
-- 🌐 **Server-coordinated, never server-carried** — the server tracks who's connected to which channel and helps two clients punch a direct connection to each other; once that's up, your messages, voice, and files travel peer-to-peer, never through the server at all.
+- 🔐 **Live One Time Pad sessions** — type `/otp` in a DM to wrap that conversation in real one-time-pad encryption, the only cipher with proven perfect secrecy, layered on top of the quantum-resistant encryption you already have. The pad is generated (or brought your own) per contact, the session starts only once both of you explicitly accept, and every message, voice clip and file in that room then travels pad-wrapped — still peer-to-peer, never through the server — with a live header showing both directions' remaining key. Requires [otp-toolkit](https://github.com/DavidValin/otp-toolkit) installed.
+- 📨 **OTP mail (asynchronous) (** — write someone a whole mail (subject, text, voice recordings, file attachments) that waits for them even while they're offline: it's sealed under your shared one-time pad and parked on the server — which can't read a byte of it — until they next connect. Type `/mail` for the full-screen compose view and `/mailbox` for your mailbox, with each sent mail's delivery status and your received mail, readable in place. Needs a pinned recipient you share an `otp` pad with (see `/otp` below), with more pad left than the mail is long — the remaining key is shown live, top-right, as you write and attach.
+- 🌐 **Server-coordinated, never server-carried** — the server tracks who's connected to which channel and helps two clients punch a direct connection to each other; once that's up, your messages, voice, and files travel peer-to-peer, never through the server at all. (OTP mail is the one deliberate exception: an already-pad-sealed blob the server stores, unreadably, until its recipient collects it.)
 
 - 🛡️  **Everything above is end-to-end encrypted**. See the "Encryption" section below for how. You can go a step further with `/otp` in a DM: an optional, one-time-pad-encrypted session layered on top, active only once both of you explicitly accept it (requires [otp-toolkit](https://github.com/DavidValin/otp-toolkit) installed).
-- 💾 **Chat history isn't saved to disk.** Text and voice messages only ever live in memory for as long as the app is running — close it or disconnect, and they're gone. A file you've accepted is the one exception: that's the point of a file transfer, so it's written to `~/.aloo/downloads`.
+- 💾 **Chat history isn't saved to disk.** Text and voice messages only ever live in memory for as long as the app is running — close it or disconnect, and they're gone. A file you've accepted is the one exception: that's the point of a file transfer, so it's written to `~/.aloo/downloads`. OTP mail is the other, deliberate one: a received mail stays on disk — as ciphertext plus the pad to read it by, never plaintext — until you remove it from the mailbox, which destroys both.
 
 ## Getting started
 
@@ -75,6 +77,7 @@ Nicknames are case-sensitive and must be free — if someone else is already con
 - Press **Space** and hold it to record and send a voice message live — let go to stop.
 - Press **Ctrl+Alt+P** to do the same thing from anywhere — even if aloo isn't the focused window. Enabled by default; edit `~/.aloo/settings` (`global_ptt_shortcut`, `global_ptt_enabled`) to change the combo or turn it off. Needs X11 on Linux — not available under Wayland.
 - Type `/file` and press **Enter** to send a file.
+- Type `/mail` to write an OTP mail, `/mailbox` to check your mail's delivery status and read what arrived (needs a shared `otp` pad — see `/otp` under "Encryption").
 - Type `/leave` and press **Enter** to leave the selected channel — a private one's tab disappears, a public one stays (rejoin it with Enter) but you're no longer a member.
 - Pick someone in the sidebar and press **Enter** to open a DM with them.
 - Press `]` / `[` to switch between channel tabs, `Ctrl+J` to join or create a channel — public or private, optionally password-protected.
@@ -128,6 +131,17 @@ openssl rsa -pubout -in key -out key.pub
 ```
 
 `key` is the private key — pass it to `--enc rsa key` (server). `key.pub` is the matching public key — hand it out to clients.
+
+## One Time Pad mail
+
+A live `/otp` session needs both of you online at once — One Time Pad mail doesn't. Write someone a whole mail — subject, text, voice recordings, file attachments — and it waits for them:
+
+* `/mail` — compose a mail that is delivered asynchronously, once the recipient connects
+* `/mailbox` — read received mails, and follow each sent mail's delivery status (awaiting server / on server / delivered ✓)
+
+**The server's role here — and how it differs from a `/otp` session.** Live `/otp` messages travel **peer-to-peer**: the server carries none of them, it only helps your two apps find each other. Mail can't work that way — the whole point is that the recipient may be offline — so this is the one deliberate exception where the server acts as a mailbox: it **stores** the mail on disk and **delivers** it when the recipient next connects, deletes its copy the moment they confirm it arrived, and holds the delivery receipt for you until you've seen it. What it stores is sealed under your shared one-time pad *before it ever leaves your machine*: the server holds no key material and cannot read a byte of it. And because a bare pad hides content but can't detect tampering, every mail also carries a signature from your durable identity — so the server (or anyone else who touches the blob) can't alter a bit undetected.
+
+Both paths spend the **same** pad for that contact, in strict order, so a mail and your live `/otp` messages never decrypt out of sequence. Composing needs a pinned recipient you share an `otp` pad with (see `/otp` above) and more pad remaining than the whole mail is long — the compose view shows the remaining key live, top-right, as you write and attach. A received mail rests on your disk as ciphertext plus the pad to read it by (never plaintext) until you remove it from `/mailbox`, which destroys both.
 
 ## Knowing who you're really talking to
 

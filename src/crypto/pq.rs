@@ -606,6 +606,58 @@ pub fn sign_rotation(
     Ok((encoded, bincode_encode(&(mldsa_sig, rsa_sig))?))
 }
 
+/// Domain tag for an OTP mail's payload signature (docs/PROTOCOL.md
+/// §17.2), separate from every other signing context so a mail signature
+/// can never double as a rotation/continuity/card one or vice versa.
+const MAIL_DOMAIN: &[u8] = b"aloo/otp-mail/v1";
+
+fn mail_commitment(payload: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(MAIL_DOMAIN.len() + payload.len());
+    v.extend_from_slice(MAIL_DOMAIN);
+    v.extend_from_slice(payload);
+    v
+}
+
+/// Signs an OTP mail's encoded payload with the sender's durable identity
+/// (ML-DSA-87 plus RSA-4096, the same dual-signature every other identity
+/// statement here carries). A one-time pad is perfectly confidential but
+/// *malleable* - it authenticates nothing - so without this the server (or
+/// anyone rewriting the stored blob) could flip payload bits undetected;
+/// with it, the receiver verifies the decrypted payload against the
+/// sender's **pinned** bundle before believing a byte of it.
+pub fn sign_mail(signing: &PqPrivateBundle, payload: &[u8]) -> Result<Vec<u8>> {
+    let commitment = mail_commitment(payload);
+    let mldsa_sig = {
+        let sk = decode_mldsa_signing(signing)?;
+        sk.sign(&commitment).encode().as_slice().to_vec()
+    };
+    let rsa_sk = super::private_key_from_der(&signing.rsa_sign_private_der)?;
+    let rsa_sig = super::sign(&rsa_sk, &commitment)?;
+    bincode_encode(&(mldsa_sig, rsa_sig))
+}
+
+/// Verifies a mail payload signature against the sender's pinned identity.
+/// `false` - fail closed - on any malformed or non-matching input.
+pub fn verify_mail(sender_public: &PqPublicBundle, payload: &[u8], signature: &[u8]) -> bool {
+    let Ok((mldsa_sig, rsa_sig)) = bincode_decode::<(Vec<u8>, Vec<u8>)>(signature) else {
+        return false;
+    };
+    let commitment = mail_commitment(payload);
+    let Ok(vk) = decode_mldsa_verifying(sender_public) else {
+        return false;
+    };
+    let Ok(sig) = MlDsaSignature::<MlDsa87>::try_from(mldsa_sig.as_slice()) else {
+        return false;
+    };
+    if vk.verify(&commitment, &sig).is_err() {
+        return false;
+    }
+    let Ok(rsa_pk) = super::public_key_from_der(&sender_public.rsa_sign_public_der) else {
+        return false;
+    };
+    super::verify(&rsa_pk, &commitment, &rsa_sig)
+}
+
 /// Verifies a rotation against the sender's pinned identity and returns it.
 /// `None` - fail closed - on a bad signature, a rotation addressed to
 /// somebody else, or malformed bytes.

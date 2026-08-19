@@ -10,6 +10,8 @@ pub mod keymode_policy;
 pub mod netstats;
 pub mod otp;
 pub mod otp_cli;
+pub mod otp_mail;
+pub mod otp_mail_store;
 pub mod otp_store;
 pub mod p2p;
 pub mod p2p_reliable;

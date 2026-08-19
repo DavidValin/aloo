@@ -386,10 +386,10 @@ async fn help_width_capped(w: &mut AlooWorld) {
     // multi-byte but exactly one cell each.
     let border_row = rows
         .iter()
-        .find(|r| r.contains("Help (Ctrl+H to close, arrows to scroll)"))
+        .find(|r| r.contains("Help (Ctrl+H / Esc to close, arrows to scroll)"))
         .expect("expected the popup's title row");
     let row_chars: Vec<char> = border_row.chars().collect();
-    let title: Vec<char> = "Help (Ctrl+H to close, arrows to scroll)".chars().collect();
+    let title: Vec<char> = "Help (Ctrl+H / Esc to close, arrows to scroll)".chars().collect();
     let title_start = row_chars
         .windows(title.len())
         .position(|c| c == title.as_slice())

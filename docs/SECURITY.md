@@ -102,6 +102,26 @@ came from, and only from, the intended peer - the same limit §12
 describes for a first contact, applied a second time to this layer's own
 setup message.
 
+**OTP mail (§17) widens what the server sees and stores, not what it can
+read.** A mail is the one piece of content the server ever holds: an
+opaque pad-sealed blob on its disk, plus the routing metadata beside it -
+sender and recipient nickname, the pairwise contact name, a sequence
+number, a size, a client-claimed timestamp - which is strictly more
+sender/recipient linkage than the live path's "these two are setting up a
+link" (§10). Because a bare pad is malleable, the sealed payload carries
+its own ML-DSA-87 + RSA-4096 signature under the sender's durable
+identity, verified against the *receiver's pin* after decrypt - the
+mail-path counterpart of the `pq_hybrid` seal live sends keep underneath
+the pad. A received mail is deliberately kept readable at rest as a
+(ciphertext, locally-generated pad) file pair under `~/.aloo/otp_mail/`
+until the user removes it: anyone with filesystem access to that
+directory can XOR the two files together, exactly as they could already
+read `~/.aloo/downloads` or the OTP keychain itself - local disk access
+remains out of scope (see above). Mail storage is also unbounded on the
+server beyond a per-mail size cap: an *authenticated* client can grow the
+mail directory at will, the same server-operator-trust boundary the relay
+already has - `--password`/`--enc rsa` are the control.
+
 ## Assurance: how much of this is checked
 
 **Machine-checked.** Every requirement in `requirements/requirements.toml`

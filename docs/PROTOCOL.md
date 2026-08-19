@@ -95,6 +95,11 @@ falling back to a server relay (§7.1).
   - [16.3 Session visibility in the DM log](#163-session-visibility-in-the-dm-log)
   - [16.4 Recovering a send whose ciphertext already left](#164-recovering-a-send-whose-ciphertext-already-left)
   - [16.5 Live key-metadata header](#165-live-key-metadata-header)
+- [17. OTP mail: asynchronous, server-stored delivery](#17-otp-mail-asynchronous-server-stored-delivery)
+  - [17.1 Composing: what a mail is, and who can be written to](#171-composing-what-a-mail-is-and-who-can-be-written-to)
+  - [17.2 Uploading: the mail's pad spend, and the storage acknowledgement](#172-uploading-the-mails-pad-spend-and-the-storage-acknowledgement)
+  - [17.3 Delivery: fetch, decrypt, acknowledge, notify](#173-delivery-fetch-decrypt-acknowledge-notify)
+  - [17.4 One pad, two transports: ordering across mail and live sends](#174-one-pad-two-transports-ordering-across-mail-and-live-sends)
 
 ## Overview: the connections, and what travels on each
 
@@ -124,9 +129,12 @@ not the number of channels it has joined.
 **The server connection** is opened once and held for the life of the
 session. It sets things up and nothing more: authentication, nicknames,
 channel membership and presence, relaying key rotations, and relaying the
-address exchange that lets two clients find each other. **No message
+address exchange that lets two clients find each other. **No live message
 content of any kind crosses it** — not text, not voice, not files, not
-even as ciphertext (§7.1, §10).
+even as ciphertext (§7.1, §10). The single, deliberate exception is OTP
+mail (§17): a user may hand the server one *one-time-pad-sealed* blob to
+hold for an offline recipient — ciphertext the server has no key material
+for, stored only until the recipient collects it.
 
 **A peer connection** is one direct UDP link per *peer*, established by
 hole punching (§7.1) the first time that peer is learned about. It is not
@@ -155,6 +163,10 @@ the handshake (§1.3).
 | `RotateKey` | Offers a peer fresh key material (§7.5, §11, §13.10) |
 | `RequestPeerLink` | Asks the server to pass candidates to a peer (§7.1) |
 | `Heartbeat` | Proves the connection is still alive (§4.1) |
+| `OtpMailSend` | Uploads one pad-sealed mail for an offline recipient (§17.2) |
+| `OtpMailFetch` | Asks for pending mail and delivery receipts (§17.3) |
+| `OtpMailAck` | Recipient confirms a delivered mail was decrypted and stored (§17.3) |
+| `OtpMailDeliveredAck` | Sender confirms a delivery receipt was seen (§17.3) |
 
 | Server → client | Purpose |
 |---|---|
@@ -172,6 +184,9 @@ the handshake (§1.3).
 | `KeyRotated` | A peer's relayed key rotation (§7.5, §11, §13.10) |
 | `PeerCandidates` | A peer's relayed addresses, to punch against (§7.1) |
 | `Error` | A soft, recoverable failure; the connection stays open (§7.4) |
+| `OtpMailResult` | Whether an uploaded mail is durably stored (§17.2) |
+| `OtpMailDeliver` | One stored mail, handed to its recipient (§17.3) |
+| `OtpMailDelivered` | A sent mail was genuinely decrypted by its recipient (§17.3) |
 
 **Peer connection** — UDP, punched. Two layers: the datagram itself, and
 the payload carried inside a reliable or unreliable one.
@@ -1638,6 +1653,16 @@ conversation exists at all.
 It never sees: message plaintext (text or voice), voice audio content,
 file names or contents, or any private key.
 
+One addition since §17: a client using OTP mail hands the server a
+one-time-pad-sealed blob to hold until its recipient collects it. The
+server then additionally sees (and stores, on disk, until delivery) that
+blob's **size and routing metadata** - sender and recipient nickname, the
+pairwise pad contact name, a sequence number, a client-claimed timestamp -
+but never its content: the blob is sealed under a pad the server holds no
+byte of, and its integrity is anchored to the sender's pinned identity
+signature *inside* the sealed payload (§17.2), so the server can neither
+read nor undetectably alter a mail it stores.
+
 ## 11. Rotating a peer's key during a session
 
 Only `KeyMode::PqHybrid` (§3) rotates its encryption keys during a
@@ -2935,3 +2960,184 @@ anything that isn't this app's own send/receive (e.g. the same keychain
 used with `otp` directly, out of band) - never for a room that isn't
 currently on screen, so an idle session elsewhere in the app costs nothing
 beyond its own occasional safety-net fetch.
+
+## 17. OTP mail: asynchronous, server-stored delivery
+
+Everything before this section is *live*: both parties connected, content
+over a direct link, the server carrying none of it. OTP mail is the one
+asynchronous path - a whole mail (subject line, body text, voice
+recordings, file attachments), sealed under the same per-contact one-time
+pad §16 established, handed to the **server** to hold until the recipient
+next connects. It is the single deliberate exception to "content never
+touches the server", and the exception is as narrow as it can be made:
+what the server stores is one opaque pad-sealed blob plus the routing
+metadata to hand it over (§10), on disk, deleted the moment the recipient
+acknowledges decrypting it.
+
+Nothing about §7's live messaging, §13, or §16's live pad layer changes.
+A mail is not a fallback the live path degrades to - it is only ever
+composed deliberately, in its own full-screen view, and confirmed
+explicitly before anything is encrypted or sent.
+
+### 17.1 Composing: what a mail is, and who can be written to
+
+A mail's fields: `from` (the sender's nickname - on the wire the server
+substitutes its own registered record of it, never trusting the claim),
+`to` (a recipient nickname), `SendAtInUTC` (unix seconds at the moment the
+send was confirmed), `subtext` (a subject line), `content` (body text),
+zero or more voice recordings (complete PCM16 clips, the same shape a
+finished live voice message holds), and zero or more file attachments
+(name plus bytes, carried *inside* the sealed blob - unlike a live
+transfer there is no separate streamed phase).
+
+Two preconditions decide whether a recipient nickname is writable at all,
+checked live as the field is typed:
+
+1. **A pinned user with that nickname** (§12) whose pinned key is a
+   `pq_hybrid` bundle - the pin is what the mail's addressing and
+   verification anchor to, not the nickname string.
+2. **An `otp` keychain contact for the pair** (the same
+   fingerprint-derived contact name §16 uses), whose encryption key has
+   **more bytes remaining than the whole encoded mail**. The compose view
+   shows the remaining key (in MB) and re-derives it continuously as text
+   is typed and recordings/attachments are added or removed; an
+   attachment that would not fit the remaining key is refused at the
+   moment of attaching, and the send path re-measures the real encoded
+   size before any pad is spent.
+
+There is no key-material negotiation here: if no pad exists for the pair,
+the answer is §16.1's provisioning flow, not anything mail-specific.
+
+### 17.2 Uploading: the mail's pad spend, and the storage acknowledgement
+
+The payload is bincode-encoded, then signed with the sender's durable
+identity (ML-DSA-87 + RSA-4096 over a mail-specific domain tag) and the
+`(payload, signature)` pair sealed through `otp --encrypt` for the
+contact. The signature exists because a one-time pad is perfectly
+confidential but **malleable** - it authenticates nothing - and this blob,
+unlike a §16 send, does not have a signed `pq_hybrid` envelope inside it.
+Without the signature, whoever stores the blob could flip payload bits
+undetected; with it, the receiver verifies the decrypted payload against
+the sender's *pinned* bundle before believing a byte of it.
+
+The upload:
+
+```
+ sender                                                       server
+   |--- OtpMailSend { mail_id, to, contact_name, seq,             |
+   |                  sent_at_utc, ciphertext } ----------------->|  stores pending/<mail_id>
+   |<-- OtpMailResult { mail_id, ok, reason } --------------------|  on disk
+```
+
+- `mail_id` is sender-generated (16 random bytes, lowercase hex) so a
+  retry carries the same id and the server deduplicates instead of
+  storing twice. Both sides validate its exact shape before ever building
+  a filesystem path from it.
+- `seq` is the contact's **same** §16.2 send counter - a mail spends the
+  same sequential pad as a live send, see §17.4.
+- The mail spend passes through the same stop-and-wait gate as every
+  other spend for that contact. What acknowledges it is
+  `OtpMailResult { ok: true }` - durable storage on the server - rather
+  than a peer's `OtpDeliveryAck`. Until that arrives, nothing else may
+  encrypt for this contact.
+
+That gate is what makes the retry rule sound: if `OtpMailResult` never
+arrives (connection lost, client crashed), the `otp` CLI's `.last_sent`
+safety copy still holds **exactly this mail's ciphertext**, because
+nothing newer could have been encrypted. On its next connect the client
+re-uploads any mail still awaiting acknowledgement with `otp
+--recover-last <contact> --sent`'s replayed bytes - byte-identical, the
+same `mail_id`, never a fresh encode or a second pad spend. A retried id
+whose mail was meanwhile delivered and deleted is answered with
+`OtpMailDelivered` instead of a second store.
+
+`OtpMailResult { ok: false }` is exceptional (malformed id, ciphertext
+over the size cap, a server disk failure) and terminal: the pad bytes the
+mail consumed are destroyed either way, so the client reports it as a
+hard failure naming the consequence (the contact's two pad halves are now
+out of step - one range spent on the sending side that the receiving side
+will never consume - and need re-keying via §16.1) rather than retrying
+into the same wall. An honest client validates everything the server
+would reject *before* encrypting, so this answer is never part of normal
+operation.
+
+### 17.3 Delivery: fetch, decrypt, acknowledge, notify
+
+On every connect, a client with a local OTP keychain sends one
+`OtpMailFetch` right after identifying. The server answers with both
+halves of what that nickname is owed:
+
+```
+ recipient                                                    server
+   |--- OtpMailFetch --------------------------------------------->|
+   |<-- OtpMailDeliver { mail_id, from, contact_name, seq, ... } --|  one per pending mail,
+   |<-- OtpMailDeliver { ... } ------------------------------------|  per-sender seq order
+   |--- OtpMailAck { mail_id } ------------------------------------>|  deletes pending/<id>,
+   |                                                                |  records delivered/<id>
+
+ sender (later, or immediately if connected)
+   |<-- OtpMailDelivered { mail_id } -------------------------------|
+   |--- OtpMailDeliveredAck { mail_id } --------------------------->|  forgets delivered/<id>
+```
+
+If the recipient happens to be connected when `OtpMailSend` arrives, the
+server pushes the `OtpMailDeliver` immediately as well - the fetch is the
+guarantee, not the only path. Mails from one sender are always delivered
+in ascending `seq` order; the pad is sequential, so no other order can
+decrypt.
+
+The receiving side runs a strict, layered check **before** `otp
+--decrypt` ever touches the keychain - the pad-corruption rules of §16.4
+apply with full force here:
+
+1. **Dedupe**: an id already stored locally just re-acknowledges (its
+   earlier ack was lost).
+2. **Contact derivation from the pin**: the receiver derives the expected
+   contact name from its *own pinned key* for the claimed `from`
+   nickname. If that doesn't reproduce the mail's carried `contact_name`,
+   the mail was sealed under some other identity's pad and is left on the
+   server un-acknowledged and untouched - decrypting it against the local
+   contact would consume the wrong pad range and corrupt the contact.
+   The same holds when `from` isn't pinned at all: the mail waits until
+   the identity question is resolved, exactly as §12 holds live traffic.
+3. **The sequence guard**: only the exact next expected `seq` for the
+   contact may reach the pad. A lower one re-acknowledges (already
+   consumed); a higher one waits - an earlier spend is still in flight
+   (§17.4).
+
+Only then does the one genuine `otp --decrypt` run. The recovered
+`(payload, signature)` is verified against the pinned bundle, and the
+payload's own sealed `from`/`to` must match the server's claimed routing -
+a mismatch on any of these discards the mail (with an acknowledgement:
+the pad range is consumed and redelivery of the same ciphertext can never
+work again, so leaving it pending would only wedge the contact).
+
+**Storage on the receiving side.** The decrypted payload is immediately
+re-encrypted under a locally generated one-time pad of its own length and
+stored as that (ciphertext, pad) file pair - never as plaintext at rest.
+The keychain pad that carried it is physically destroyed by the decrypt
+(that is the `otp` tool's contract), so this local re-pad is what makes
+the mail re-readable at all: each read XORs the two files together in
+memory only. Removing a mail securely destroys both files, after which
+its content is unrecoverable anywhere. Only once that pair is durably
+written does `OtpMailAck` go back - the server deletes its stored copy
+and records a delivery receipt for the sender, re-notified on every
+future fetch until the sender's `OtpMailDeliveredAck` confirms it was
+seen.
+
+### 17.4 One pad, two transports: ordering across mail and live sends
+
+A mail and a live §16 send to the same contact spend the **same**
+sequential pad, and the receiving side may only ever consume them in
+spend order - but they travel different transports at different speeds,
+so one interleaving needs naming. The sender's gate clears on the
+*server's* storage acknowledgement, not the recipient's decrypt: a live
+send can therefore be encrypted (spend N+1) and reach the recipient over
+the direct link *before* the mail (spend N) has been fetched from the
+server. The recipient's §16.2 sequence guard rejects the early arrival
+without touching the pad, exactly as designed - and the moment the mail
+is fetched, decrypted, and acknowledged, the server's `OtpMailDelivered`
+tells the sender the recipient's counter has advanced, which triggers the
+sender's normal §16.4 recovery scan: the refused live send is replayed
+from its kept ciphertext and now lands in order. No fresh pad is spent
+anywhere in that resolution, and neither message is lost.

@@ -55,6 +55,13 @@ pub enum PendingOtpContent {
     /// `FileAccepted` arrives (`client::otp::start_outgoing_file_content`).
     FileContent { stream_id: u64 },
     Voice { duration_ms: u32 },
+    /// An OTP mail's pad spend (docs/PROTOCOL.md §17.2). Unlike every other
+    /// variant it's acknowledged by the *server*'s `OtpMailResult` (storage
+    /// is the delivery this spend waits on), and retried over the control
+    /// channel by `client::otp_mail::resend_pending` rather than by
+    /// `client::otp::recover_and_resend`'s P2P-link path - which therefore
+    /// skips it.
+    Mail { mail_id: String },
 }
 
 /// One contact's OTP state.
@@ -282,6 +289,9 @@ fn encode_pending_content(content: &PendingOtpContent) -> String {
         PendingOtpContent::Voice { duration_ms } => {
             format!("V{PENDING_CONTENT_SEP}{duration_ms}")
         }
+        PendingOtpContent::Mail { mail_id } => {
+            format!("M{PENDING_CONTENT_SEP}{mail_id}")
+        }
     }
 }
 
@@ -311,6 +321,10 @@ fn decode_pending_content(s: &str) -> Option<PendingOtpContent> {
         "V" => {
             let duration_ms = parts.next()?.parse().ok()?;
             Some(PendingOtpContent::Voice { duration_ms })
+        }
+        "M" => {
+            let mail_id = parts.next()?.to_string();
+            Some(PendingOtpContent::Mail { mail_id })
         }
         _ => None,
     }

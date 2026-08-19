@@ -926,8 +926,8 @@ so_that = "I do not have to leave the app to look something up"
 
 [[user_story.acceptance_criteria]]
 id = "AC-056"
-description = "Ctrl+H opens and closes a help overlay from any view or mode, in either letter case."
-evidence = "docs/SPEC.md Functionality #7; tests ctrl_h_opens_and_closes_the_help_overlay, ctrl_h_uppercase_also_toggles_help, ctrl_h_works_regardless_of_current_view_or_mode"
+description = "Ctrl+H opens and closes a help overlay from any view or mode, in either letter case; Escape closes it too (Press-gated, so the paired Release a kitty-protocol terminal delivers cannot leak into the DM-closing Esc handling underneath)."
+evidence = "docs/SPEC.md Functionality #7; tests ctrl_h_opens_and_closes_the_help_overlay, ctrl_h_uppercase_also_toggles_help, ctrl_h_works_regardless_of_current_view_or_mode, escape_also_closes_the_help_overlay"
 
 [[user_story.acceptance_criteria]]
 id = "AC-057"
@@ -941,7 +941,7 @@ evidence = "docs/SPEC.md Functionality #7; tests render_channel_view_shows_the_c
 
 [[user_story.technical_behavior]]
 id = "TB-106"
-description = "While help is open every key besides the scroll keys is absorbed - no typing reaches the compose bar, no focus moves - and Esc specifically does not close it or the private room underneath."
+description = "While help is open every key besides the scroll and close keys is absorbed - no typing reaches the compose bar, no focus moves. Esc closes the overlay itself and nothing else: it never falls through to the private room underneath, on neither the closing Press nor its paired Release."
 evidence = "docs/SPEC.md Functionality #7; tests help_absorbs_other_keys_while_open, esc_while_help_open_only_closes_help_not_the_private_room_underneath"
 
 [[user_story.technical_behavior]]
@@ -1541,8 +1541,8 @@ evidence = "src/client/tui/ui.rs submit_input (unknown-command guard); tests an_
 
 [[user_story.acceptance_criteria]]
 id = "AC-141"
-description = "Every OTP error/confirmation shown in the top-right status notice is also logged as a line in the relevant peer's own DM room, so the history of a session's setup (and any failure) isn't lost the moment that notice clears - marking the room unread exactly like any other DM arrival if it isn't the one currently open. While a mutual-consent OTP session is active with the DM's peer, every real message in that room (not the app's own system lines about the session itself) is shown with a shield prefix, so the user always knows which conversation is currently under the extra pad layer."
-evidence = "src/client/tui/ui.rs MessageBody::System, otp_active_peers, mark_otp_active, is_otp_active, render_messages (shield prefix); src/client/tui/direct_message.rs push_otp_system_message; src/client/otp.rs notify; tests an_otp_system_message_is_logged_into_the_named_peers_dm_room, an_otp_system_message_does_not_mark_unread_when_that_room_is_active, otp_active_peers_default_to_inactive_until_marked, messages_in_an_otp_active_dm_get_the_shield_prefix_but_system_lines_never_do, messages_in_a_dm_without_an_active_otp_session_get_no_shield"
+description = "The top-right status notice clears on its own 30 seconds after it was pushed (STATUS_NOTICE_TIMEOUT, driven by the session ticker), so a stale outcome never squats on the corner of the screen. Every OTP error/confirmation shown there is also logged as a line in the relevant peer's own DM room, so the history of a session's setup (and any failure) isn't lost the moment that notice clears - marking the room unread exactly like any other DM arrival if it isn't the one currently open. While a mutual-consent OTP session is active with the DM's peer, every real message in that room (not the app's own system lines about the session itself) is shown with a shield prefix, so the user always knows which conversation is currently under the extra pad layer."
+evidence = "src/client/tui/ui.rs MessageBody::System, otp_active_peers, mark_otp_active, is_otp_active, render_messages (shield prefix); src/client/tui/direct_message.rs push_otp_system_message; src/client/otp.rs notify; src/client/tui/ui.rs STATUS_NOTICE_TIMEOUT, tick_status_notice; tests the_status_notice_clears_after_thirty_seconds, an_otp_system_message_is_logged_into_the_named_peers_dm_room, an_otp_system_message_does_not_mark_unread_when_that_room_is_active, otp_active_peers_default_to_inactive_until_marked, messages_in_an_otp_active_dm_get_the_shield_prefix_but_system_lines_never_do, messages_in_a_dm_without_an_active_otp_session_get_no_shield"
 
 [[user_story.acceptance_criteria]]
 id = "AC-142"
@@ -1938,3 +1938,88 @@ evidence = "src/client/tui/ui.rs render_messages; test presence_notice_is_render
 id = "TB-190"
 description = "A duplicate UserJoined for someone already listed as a member logs no second notice, and the existing-member snapshot a fresh join receives logs none at all - both keyed off whether the channel was already ChannelTab::joined before the call, mirroring the ordering TB-159 already establishes."
 evidence = "src/client/tui/channel.rs UiState::on_user_joined, UiState::seed_member; tests a_live_join_logs_a_yellow_joined_presence_notice, on_user_joined_creates_the_tab_if_a_join_snapshot_arrives_before_joined; scenario features/presence/presence_notices.feature 'The initial membership snapshot is not announced as a join'"
+
+# ============================================================================
+# US-035 - OTP mail: asynchronous, server-stored delivery
+# ============================================================================
+[[user_story]]
+id = "US-035"
+title = "Send OTP mail that waits on the server"
+as_a = "user with an established one-time pad for a contact"
+i_want = "to write them a mail - subject, text, voice recordings and file attachments - that waits encrypted on the server while they are offline"
+so_that = "we can communicate with one-time-pad secrecy without both having to be online at the same moment"
+
+[[user_story.acceptance_criteria]]
+id = "AC-154"
+description = "The /mail command opens a full-screen compose view - a command rather than a key chord, since the natural chord (Ctrl+M) is indistinguishable from Enter on terminals without the kitty keyboard protocol - with From fixed to the user's own nickname, To/Subtext/Content and an attachments pane fillable independently in any order, Tab cycling focus, and Esc discarding it."
+evidence = "docs/PROTOCOL.md 17.1; docs/SPEC.md Functionality; src/client/tui/otp_mail.rs UiState::open_otp_mail, handle_mail_compose_key; src/client/tui/ui.rs handle_key's otp_mail routing, submit_input's /mail branch; tests slash_mail_opens_the_full_screen_compose_view, esc_discards_the_compose_view, fields_are_entered_independently_in_any_order; scenarios features/messaging/otp_mail.feature 'The /mail command opens a full-screen mail compose view', 'Escape discards the compose view'"
+
+[[user_story.acceptance_criteria]]
+id = "AC-155"
+description = "Recipient validation runs as the To field is filled, on every keystroke: valid for composing (a pinned user with that nickname, an otp keychain contact for the pair, and a key longer than the whole mail) renders the field green with a tick emoji; invalid renders it red with a cross emoji and the specific reason."
+evidence = "docs/PROTOCOL.md 17.1; src/client/otp_mail.rs check_recipient, RecipientCheck; src/client/tui/otp_mail.rs render_otp_mail_view's To field, check_failure_label; tests typing_in_to_emits_a_recipient_check_per_keystroke, a_failed_check_renders_the_to_field_red_with_a_cross, a_passing_check_renders_green_with_a_tick, a_stale_check_result_for_an_edited_nickname_is_ignored; scenarios features/messaging/otp_mail.feature 'An unpinned recipient renders invalid with a cross', 'A pinned recipient with enough key renders valid with a tick'"
+
+[[user_story.acceptance_criteria]]
+id = "AC-156"
+description = "Once the nickname is filled and its check has passed, the remaining key size in MB is displayed in the top right of the compose screen, updating in realtime as content is typed and voice recordings or files are attached or removed."
+evidence = "docs/PROTOCOL.md 17.1; src/client/tui/otp_mail.rs ComposeState::estimated_bytes, key_left_after_mail, render_otp_mail_view's header; tests the_remaining_key_appears_top_right_once_valid, the_remaining_key_shrinks_as_the_mail_grows; scenario features/messaging/otp_mail.feature 'The remaining key in MB tracks the mail as it grows'"
+
+[[user_story.acceptance_criteria]]
+id = "AC-157"
+description = "Voice recordings (hold Space, only while the attachments pane is focused, reusing the existing recording machinery) and files ('a' opens the existing file browser) can be attached while composing; attaching one longer than the remaining available key cancels the operation outright, with nothing attached. Enter on an attached voice recording replays it through the same mixer path a logged voice message uses, and Escape during that playback stops it and nothing else - a file attachment plays nothing."
+evidence = "docs/PROTOCOL.md 17.1; src/client/tui/otp_mail.rs handle_mail_browser_key, UiState::otp_mail_add_voice, ComposeState::fits_budget; src/client/session.rs OwnStreamTarget::MailAttachment arms; tests space_in_the_attachments_pane_drives_a_mail_recording, attaching_a_file_larger_than_the_remaining_key_is_cancelled, a_fitting_file_attaches, a_voice_recording_larger_than_the_remaining_key_is_cancelled, enter_plays_a_voice_attachment_and_esc_stops_it, enter_on_a_file_attachment_plays_nothing; scenario features/messaging/otp_mail.feature 'An attachment longer than the remaining key is cancelled'"
+
+[[user_story.acceptance_criteria]]
+id = "AC-158"
+description = "A selected voice recording or file attachment is removed with 'd', and only after a confirmation popup whose safe default is Cancel."
+evidence = "docs/SPEC.md Functionality; src/client/tui/otp_mail.rs handle_mail_compose_key's delete_confirm branch; test d_removes_the_selected_attachment_only_after_confirming; scenario features/messaging/otp_mail.feature 'Removing an attachment needs confirmation'"
+
+[[user_story.acceptance_criteria]]
+id = "AC-159"
+description = "Sending happens only through an explicit confirm popup (Ctrl+S opens it; Cancel is the default). On confirm the mail is one-time-pad encrypted through the otp CLI, uploaded as OtpMailSend, and a local reference is stored on disk; the server's OtpMailResult acknowledgement moves it to stored-on-server, and a mail whose acknowledgement never arrived is re-uploaded on the next connect with the exact ciphertext recovered from the keychain's .last_sent copy, under the same mail id - never a fresh encode."
+evidence = "docs/PROTOCOL.md 17.2; src/client/otp_mail.rs handle_send, resend_pending, on_mail_result; src/client/tui/otp_mail.rs handle_mail_compose_key's send_confirm branch; tests ctrl_s_opens_the_send_confirm_only_when_valid, send_emits_only_after_confirming, a_mails_last_sent_copy_replays_byte_identically_for_retry; scenarios features/messaging/otp_mail.feature 'Sending needs explicit confirmation', 'A retry re-uploads the recovered ciphertext, never a fresh encode'"
+
+[[user_story.acceptance_criteria]]
+id = "AC-160"
+description = "The server stores an undelivered mail's ciphertext on disk and acknowledges storage to the sender; when the recipient connects (OtpMailFetch, or immediately if already connected) every pending mail addressed to their nickname is delivered in per-sender sequence order, and the recipient's OtpMailAck deletes the stored ciphertext from the server's disk."
+evidence = "docs/PROTOCOL.md 17.2, 17.3; src/server/mail.rs MailStore, on_mail_send, on_mail_fetch, on_mail_ack; tests store_and_pending_for_round_trip_on_disk, pending_for_orders_one_senders_mails_by_seq, mark_delivered_deletes_the_pending_file_and_records_a_receipt, on_mail_send_stores_and_acknowledges, on_mail_send_pushes_immediately_to_a_connected_recipient, on_mail_fetch_delivers_pending_and_receipts; scenarios features/messaging/otp_mail.feature 'A mail for an offline recipient waits on the server disk', 'The recipient fetches, acknowledges, and the server copy is deleted'"
+
+[[user_story.acceptance_criteria]]
+id = "AC-161"
+description = "The server keeps a delivery receipt for every acknowledged mail and notifies the sender (immediately if connected, otherwise on their next OtpMailFetch); the sender updates the mail's local reference to delivered and answers OtpMailDeliveredAck, after which the server forgets the receipt."
+evidence = "docs/PROTOCOL.md 17.3; src/server/mail.rs mark_delivered, receipts_from, forget_receipt, on_mail_delivered_ack; src/client/otp_mail.rs on_mail_delivered; tests on_mail_ack_notifies_a_connected_sender, on_mail_send_answers_a_retry_after_delivery_with_delivered, forget_receipt_only_for_the_original_sender, on_mail_delivered_ack_forgets_the_receipt; scenario features/messaging/otp_mail.feature 'The sender learns of delivery on their next connect'"
+
+[[user_story.acceptance_criteria]]
+id = "AC-162"
+description = "The /mailbox command opens the mailbox popup (over the mail view it opens as the popup's backdrop; Esc out of the popup closes an untouched backdrop with it): every sent mail with its delivery status (awaiting server / on server / delivered / failed - never its content) and every received mail; Enter on a received mail decrypts it in memory and opens it for reading, voice parts playable and attachments savable."
+evidence = "docs/SPEC.md Functionality; src/client/tui/otp_mail.rs handle_mailbox_key, handle_mail_reader_key, render_mailbox, render_mail_reader; src/client/otp_mail.rs mailbox_rows, handle_read; tests slash_mailbox_opens_the_mailbox, esc_from_the_mailbox_keeps_a_draft_in_progress, the_mailbox_lists_sent_status_and_received_rows, enter_on_a_received_row_asks_to_read_it, the_reader_plays_voice_parts_and_saves_attachments; scenario features/messaging/otp_mail.feature 'The mailbox shows delivery status, and a received mail can be read'"
+
+[[user_story.acceptance_criteria]]
+id = "AC-163"
+description = "A received mail rests on disk only as a ciphertext file plus the pad used for its decryption (the payload re-encrypted under fresh local randomness the moment it arrived, since the keychain pad that carried it is destroyed by the decrypt); reading XORs the two in memory only, and removing the mail overwrites and deletes both files, making its content unrecoverable."
+evidence = "docs/PROTOCOL.md 17.3; src/client/otp_mail_store.rs store_received_payload, read_received_payload, remove_received; src/crypto/otp.rs repad, xor_pad; tests received_payload_stores_ciphertext_and_pad_and_reads_back_by_xor, stored_blob_files_are_never_the_plaintext, remove_received_destroys_both_files, d_on_a_mailbox_row_requires_confirm_before_delete, repad_round_trips_and_neither_half_alone_is_the_plaintext; scenario features/messaging/otp_mail.feature 'A received mail rests as ciphertext plus pad and dies with them'"
+
+[[user_story.technical_behavior]]
+id = "TB-193"
+description = "A mail spends the same per-contact sequential pad and passes the same stop-and-wait gate as live OTP sends - reserved only after otp --encrypt genuinely succeeds, cleared only by the server's OtpMailResult (or a late OtpMailDelivered), with one queued send drained per clearing. While a mail is unacknowledged nothing else can encrypt for that contact, which is exactly what keeps .last_sent naming the mail; a resend whose gate no longer names its seq is skipped rather than replaying bytes that may belong to a newer send."
+evidence = "docs/PROTOCOL.md 17.2; src/client/otp_mail.rs handle_send, resend_pending, on_mail_result; src/client/otp_store.rs PendingOtpContent::Mail; tests pending_mail_content_round_trips_through_save_and_load, a_mails_last_sent_copy_replays_byte_identically_for_retry"
+
+[[user_story.technical_behavior]]
+id = "TB-194"
+description = "The receiving side derives the pad contact from its own pinned key for the claimed sender and refuses - untouched and unacknowledged - a mail whose carried contact name does not reproduce it, and runs the per-contact sequence guard before otp --decrypt exactly as for live sends: a lower sequence re-acknowledges, a higher one waits for the earlier spend, and the sender's recovery scan re-fires on OtpMailDelivered so a live send refused while a mail was still ahead of it in pad order heals without fresh pad."
+evidence = "docs/PROTOCOL.md 17.3, 17.4; src/client/otp_mail.rs MailGate, mail_gate, on_mail_deliver, on_mail_delivered; tests mail_gate_refuses_a_contact_mismatch_before_the_pad, mail_gate_reacknowledges_an_already_consumed_sequence, mail_gate_waits_for_an_earlier_spend, mail_gate_admits_only_the_exact_next_sequence; scenario features/messaging/otp_mail.feature 'A mail sealed for a different identity never touches the pad'"
+
+[[user_story.technical_behavior]]
+id = "TB-195"
+description = "A one-time pad is malleable, so the sealed payload carries an ML-DSA-87+RSA-4096 identity signature over a mail-specific domain tag, verified against the receiver's pinned bundle for the claimed sender after decrypt; a payload that fails verification, or whose sealed from/to disagree with the server's claimed routing, is discarded (with acknowledgement - its pad range is spent either way) and never believed."
+evidence = "docs/PROTOCOL.md 17.2, 17.3; src/crypto/pq.rs sign_mail, verify_mail; src/client/otp_mail.rs on_mail_deliver; tests sign_mail_verifies_and_rejects_a_flipped_payload, mail_signature_domain_is_not_interchangeable_with_rotation; scenario features/messaging/otp_mail.feature 'A tampered mail fails its identity signature'"
+
+[[user_story.technical_behavior]]
+id = "TB-196"
+description = "Mail ids are 16 random bytes as exactly 32 lowercase hex characters, validated on both sides before any filesystem path is built from one; the server additionally caps stored ciphertext size, requires storable nicknames, and records the sender's registered nickname as from - never the client's claim."
+evidence = "docs/PROTOCOL.md 17.2; src/crypto/otp.rs new_mail_id, mail_id_is_valid; src/server/mail.rs MailStore::store, on_mail_send; tests mail_ids_are_lowercase_hex_and_validated_strictly, store_rejects_a_malformed_mail_id_before_touching_disk, store_rejects_oversized_ciphertext, on_mail_send_records_the_registered_sender_nickname; scenario features/messaging/otp_mail.feature 'Mail ids are validated before any path is built from them'"
+
+[[user_story.technical_behavior]]
+id = "TB-197"
+description = "Server mail routing is idempotent and claimant-checked: a retried id overwrites byte-identically and re-acknowledges (or answers OtpMailDelivered if the mail was already delivered and deleted), an OtpMailAck is honored only from the stored recipient nickname, and a delivery receipt is forgotten only by the stored sender nickname."
+evidence = "docs/PROTOCOL.md 17.2, 17.3; src/server/mail.rs on_mail_send, mark_delivered, forget_receipt; tests store_is_idempotent_for_a_retried_id, on_mail_send_answers_a_retry_after_delivery_with_delivered, mark_delivered_refuses_a_claimant_other_than_the_recipient, forget_receipt_only_for_the_original_sender"

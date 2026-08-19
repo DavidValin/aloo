@@ -225,6 +225,32 @@ pub struct AlooWorld {
     pub otp_pad_dec: Vec<u8>,
     pub otp_chunks: Vec<aloo::crypto::otp::OtpKeySetupChunk>,
     pub otp_reassembled: Option<(Vec<u8>, Vec<u8>)>,
+
+    // -- otp mail (US-035) ---------------------------------------------
+    /// The live mail server's storage root, when a scenario spawned one.
+    pub otp_mail_dir: Option<std::path::PathBuf>,
+    /// The id of the mail most recently uploaded/handled.
+    pub otp_mail_id: Option<String>,
+    /// The sealed (pre-`otp --encrypt`) bytes of that mail.
+    pub otp_mail_sealed: Vec<u8>,
+    /// Its ciphertext, exactly as uploaded.
+    pub otp_mail_ciphertext: Vec<u8>,
+    /// A client-side mail store rooted in a scenario temp dir.
+    pub otp_mail_client_store: Option<aloo::client::otp_mail_store::OtpMailStore>,
+    /// The payload bytes a store scenario re-padded.
+    pub otp_mail_payload: Vec<u8>,
+    /// The most recent pre-decrypt gate verdict.
+    pub otp_mail_gate: Option<aloo::client::otp_mail::MailGate>,
+    /// A mail payload signature under inspection.
+    pub otp_mail_signature: Vec<u8>,
+    /// Snapshot of the compose view's remaining-key display.
+    pub otp_mail_key_left: Option<u64>,
+    /// A server-side `MailStore` opened directly (no sockets).
+    pub otp_mail_server_store: Option<aloo::server::mail::MailStore>,
+    /// The pre-decrypt gate scenario's fixed local view: the contact this
+    /// side derives from its own pin, and the next sequence it expects.
+    pub otp_mail_expected_contact: Option<String>,
+    pub otp_mail_next_expected: u64,
 }
 
 impl std::fmt::Debug for AlooWorld {

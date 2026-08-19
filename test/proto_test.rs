@@ -509,3 +509,54 @@ fn file_transfer_message_family_roundtrips() {
     let end = P2pPayload::FileEnd { stream_id: 7 };
     assert_eq!(decode::<P2pPayload>(&encode(&end).unwrap()).unwrap(), end);
 }
+
+/// @requirement TB-060, AC-159
+#[test]
+fn otp_mail_messages_roundtrip() {
+    let send = ClientMessage::OtpMailSend {
+        mail_id: "ab".repeat(16),
+        to: "bob".into(),
+        contact_name: "aabb-ccdd".into(),
+        seq: 4,
+        sent_at_utc: 1_766_000_000,
+        ciphertext: vec![7, 8, 9],
+    };
+    assert_eq!(decode::<ClientMessage>(&encode(&send).unwrap()).unwrap(), send);
+
+    for msg in [
+        ClientMessage::OtpMailFetch,
+        ClientMessage::OtpMailAck {
+            mail_id: "cd".repeat(16),
+        },
+        ClientMessage::OtpMailDeliveredAck {
+            mail_id: "ef".repeat(16),
+        },
+    ] {
+        assert_eq!(decode::<ClientMessage>(&encode(&msg).unwrap()).unwrap(), msg);
+    }
+
+    let deliver = ServerMessage::OtpMailDeliver {
+        mail_id: "ab".repeat(16),
+        from: "alice".into(),
+        contact_name: "aabb-ccdd".into(),
+        seq: 4,
+        sent_at_utc: 1_766_000_000,
+        ciphertext: vec![7, 8, 9],
+    };
+    assert_eq!(
+        decode::<ServerMessage>(&encode(&deliver).unwrap()).unwrap(),
+        deliver
+    );
+    for msg in [
+        ServerMessage::OtpMailResult {
+            mail_id: "ab".repeat(16),
+            ok: false,
+            reason: Some("too large".into()),
+        },
+        ServerMessage::OtpMailDelivered {
+            mail_id: "ab".repeat(16),
+        },
+    ] {
+        assert_eq!(decode::<ServerMessage>(&encode(&msg).unwrap()).unwrap(), msg);
+    }
+}

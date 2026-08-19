@@ -13,8 +13,11 @@
 //! for hole punching - the one place this module touches UDP at all, and
 //! it never sees anything from the punched links themselves.
 
+pub mod mail;
+
 use std::collections::{BTreeSet, HashMap};
 use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -223,6 +226,18 @@ impl Registry {
             public_key_der: c.public_key_der.clone(),
             key_mode: c.key_mode,
         })
+    }
+
+    /// The connected client currently holding `name`, if any - what lets an
+    /// `OtpMailSend`/`OtpMailAck` reach a recipient/sender who happens to
+    /// be online right now instead of waiting for their next
+    /// `OtpMailFetch`. Nicknames are unique among connected clients
+    /// (`try_register`), so at most one match exists.
+    pub fn id_by_name(&self, name: &str) -> Option<UserId> {
+        self.clients
+            .iter()
+            .find(|(_, c)| c.name == name)
+            .map(|(id, _)| *id)
     }
 
     /// Public channels only: private channels are only reachable by
@@ -564,7 +579,7 @@ pub async fn run(addr: SocketAddr, auth: AuthConfig) -> std::io::Result<()> {
 /// out from `run` so tests can bind to an ephemeral port (`:0`) and
 /// discover the real address via `TcpListener::local_addr`.
 pub async fn serve(listener: TcpListener, auth: AuthConfig) -> std::io::Result<()> {
-    serve_tcp(listener, auth, proto::HEARTBEAT_TIMEOUT).await
+    serve_tcp(listener, auth, proto::HEARTBEAT_TIMEOUT, mail::default_mail_dir()).await
 }
 
 /// `serve`, plus a UDP rendezvous socket bound alongside it (see
@@ -576,7 +591,7 @@ pub async fn serve_with_rendezvous(
     auth: AuthConfig,
 ) -> std::io::Result<()> {
     tokio::spawn(udp_rendezvous_loop(udp));
-    serve_tcp(listener, auth, proto::HEARTBEAT_TIMEOUT).await
+    serve_tcp(listener, auth, proto::HEARTBEAT_TIMEOUT, mail::default_mail_dir()).await
 }
 
 /// `serve`, with the liveness timeout (§4.1) overridden instead of using
@@ -589,26 +604,45 @@ pub async fn serve_with_heartbeat_timeout(
     auth: AuthConfig,
     heartbeat_timeout: Duration,
 ) -> std::io::Result<()> {
-    serve_tcp(listener, auth, heartbeat_timeout).await
+    serve_tcp(listener, auth, heartbeat_timeout, mail::default_mail_dir()).await
+}
+
+/// `serve`, with the OTP mail directory (docs/PROTOCOL.md §17) overridden
+/// instead of `mail::default_mail_dir()` - what mail tests use so each
+/// scenario gets its own empty store under a temp dir rather than sharing
+/// (and polluting) the real `~/.aloo/server_otp_mail`.
+pub async fn serve_with_mail_dir(
+    listener: TcpListener,
+    auth: AuthConfig,
+    mail_dir: PathBuf,
+) -> std::io::Result<()> {
+    serve_tcp(listener, auth, proto::HEARTBEAT_TIMEOUT, mail_dir).await
 }
 
 async fn serve_tcp(
     listener: TcpListener,
     auth: AuthConfig,
     heartbeat_timeout: Duration,
+    mail_dir: PathBuf,
 ) -> std::io::Result<()> {
     let registry = Arc::new(Mutex::new(Registry::new()));
     let senders: Senders = Arc::new(Mutex::new(HashMap::new()));
     let auth = Arc::new(auth);
+    // Shared without a lock of its own: every method works on one file at a
+    // time and the racy interleavings (two connections storing/acking the
+    // same id) each resolve to a harmless no-op for the loser.
+    let mail_store = Arc::new(mail::MailStore::open(mail_dir)?);
 
     loop {
         let (socket, peer) = listener.accept().await?;
         let registry = registry.clone();
         let senders = senders.clone();
         let auth = auth.clone();
+        let mail_store = mail_store.clone();
         tokio::spawn(async move {
             if let Err(e) =
-                handle_connection(socket, peer, registry, senders, auth, heartbeat_timeout).await
+                handle_connection(socket, peer, registry, senders, auth, heartbeat_timeout, mail_store)
+                    .await
             {
                 eprintln!("aloo: connection {peer} ended: {e}");
             }
@@ -641,6 +675,7 @@ async fn udp_rendezvous_loop(socket: UdpSocket) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     socket: TcpStream,
     peer_addr: SocketAddr,
@@ -648,6 +683,7 @@ async fn handle_connection(
     senders: Senders,
     auth: Arc<AuthConfig>,
     heartbeat_timeout: Duration,
+    mail_store: Arc<mail::MailStore>,
 ) -> proto::Result<()> {
     let peer_ip = peer_addr.ip();
     let (rd, wr) = tokio::io::split(socket);
@@ -756,7 +792,16 @@ async fn handle_connection(
         }
     });
 
-    let result = client_loop(id, &mut rd, &registry, &senders, peer_ip, heartbeat_timeout).await;
+    let result = client_loop(
+        id,
+        &mut rd,
+        &registry,
+        &senders,
+        peer_ip,
+        heartbeat_timeout,
+        &mail_store,
+    )
+    .await;
 
     {
         let mut reg = registry.lock().await;
@@ -769,6 +814,7 @@ async fn handle_connection(
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn client_loop<R: AsyncRead + Unpin>(
     id: UserId,
     rd: &mut crate::control::ControlReader<R>,
@@ -776,6 +822,7 @@ async fn client_loop<R: AsyncRead + Unpin>(
     senders: &Senders,
     source_ip: IpAddr,
     heartbeat_timeout: Duration,
+    mail_store: &mail::MailStore,
 ) -> proto::Result<()> {
     loop {
         // Any message at all - `Heartbeat` or otherwise - proves the
@@ -841,6 +888,23 @@ async fn client_loop<R: AsyncRead + Unpin>(
                 // Purely a liveness signal - already did its job just by
                 // arriving and resetting the timeout above.
                 ClientMessage::Heartbeat => Vec::new(),
+                ClientMessage::OtpMailSend {
+                    mail_id,
+                    to,
+                    contact_name,
+                    seq,
+                    sent_at_utc,
+                    ciphertext,
+                } => mail::on_mail_send(
+                    &reg, mail_store, id, mail_id, to, contact_name, seq, sent_at_utc, ciphertext,
+                ),
+                ClientMessage::OtpMailFetch => mail::on_mail_fetch(&reg, mail_store, id),
+                ClientMessage::OtpMailAck { mail_id } => {
+                    mail::on_mail_ack(&reg, mail_store, id, mail_id)
+                }
+                ClientMessage::OtpMailDeliveredAck { mail_id } => {
+                    mail::on_mail_delivered_ack(&reg, mail_store, id, mail_id)
+                }
                 ClientMessage::SecureChannel(_)
                 | ClientMessage::Auth(_)
                 | ClientMessage::Identify { .. } => vec![Outgoing {

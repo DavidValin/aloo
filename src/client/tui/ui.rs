@@ -54,12 +54,17 @@ pub const MESSAGE_PAGE_JUMP: usize = 10;
 /// press - see `UiState::help_scroll`.
 pub const HELP_SCROLL_PAGE: usize = 10;
 
+/// How long the top-right status notice stays on screen before
+/// `UiState::tick_status_notice` clears it - long enough to be read after
+/// looking away, short enough that a stale outcome doesn't linger forever.
+pub const STATUS_NOTICE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// The help overlay's own text, `Up`/`Down`/`PageUp`/`PageDown`/`Home`/`End`-
 /// scrollable (`UiState::help_scroll`) since it easily runs longer than a
 /// typical terminal window - module-level (not local to
 /// `render_help_popup`) so `UiState::handle_key`'s scroll clamping and the
 /// renderer share one source of truth for how many lines there are.
-const HELP_HEADINGS: [&str; 8] = [
+const HELP_HEADINGS: [&str; 9] = [
     "Channels",
     "Messaging",
     "Private messages",
@@ -67,6 +72,7 @@ const HELP_HEADINGS: [&str; 8] = [
     "File transfer",
     "Encryption (tag shown after each username)",
     "One-time-pad layer (optional, per contact)",
+    "OTP mail (async, stored encrypted on the server)",
     "Identity pinning (id_store)",
 ];
 const HELP_BODY: &[&str] = &[
@@ -81,13 +87,13 @@ const HELP_BODY: &[&str] = &[
     "  Enter      send the typed message (compose bar focused)",
     "",
     "Private messages",
-    "  Up / Down  pick a user (sidebar focused)",
+    "  Up / Down    pick a user (sidebar focused)",
     "  Enter      open a private room with the selected user",
     "  Esc        close the private room",
     "",
     "Voice messages",
     "  Space      hold to record & send live (not while composing); release to stop",
-    "  Ctrl+Alt+P same, from anywhere - edit/disable in ~/.aloo/settings",
+    "  Ctrl+Alt+P   same, from anywhere - edit/disable in ~/.aloo/settings",
     "  Enter      replay a voice message (messages focused)",
     "  Esc        stop a replay while it is playing",
     "  Capped at 4 minutes - recording stops itself on reaching it, and a",
@@ -131,6 +137,22 @@ const HELP_BODY: &[&str] = &[
     "  directions' Seq/Offset/remaining-MB live, updated about once a",
     "  second - remaining turns red below 0.5MB per direction.",
     "",
+    "OTP mail (async, stored encrypted on the server)",
+    "  /mail      full-screen compose view: To / Subtext / Content, plus",
+    "             voice recordings (hold Space, only while the attachments",
+    "             pane is focused) and file attachments ('a' opens the",
+    "             browser; 'd' removes the selected one, after confirming).",
+    "  Needs a pinned recipient you hold an otp key for, longer than the",
+    "  whole mail - the To field shows \u{2705}/\u{274C} live and the remaining key",
+    "  (MB) shows top-right, updating as you type and attach. Ctrl+S sends,",
+    "  only after a confirm popup. The mail travels one-time-pad encrypted",
+    "  and waits on the server (which cannot read it) until the recipient",
+    "  connects.",
+    "  /mailbox   opens the mailbox: each sent mail's delivery status, and",
+    "             received mail - Enter reads one (decrypted in memory",
+    "             only), 'd' removes it, destroying its stored",
+    "             ciphertext+pad.",
+    "",
     "Identity pinning (id_store)",
     "  Remembers each nickname's full public key across sessions (not",
     "  just a hash) - exact match for password/pq_hybrid. none is",
@@ -146,7 +168,9 @@ const HELP_BODY: &[&str] = &[
     "  needed if you run more than one client on this same machine, since",
     "  they'd otherwise collide by sharing one ~/.aloo.",
     "",
-    "  Ctrl+C  quit      Ctrl+H  toggle this help      Up/Down  scroll",
+    "  Ctrl+C         quit",
+    "  Ctrl+H / Esc   close this help",
+    "  Up/Down        scroll",
 ];
 
 /// Where one file transfer's log row currently stands
@@ -216,7 +240,7 @@ pub enum MessageBody {
     /// app narration. Already-formatted text (`local_time_short` prefix
     /// plus the peer's name and the event) built by
     /// `channel::on_user_joined`/`on_user_left`/`ui::on_user_offline` -
-    /// see `docs/SPEC.md` Functionality #7. Excluded from the OTP shield
+    /// see `docs/SPEC.md` Functionality #12. Excluded from the OTP shield
     /// prefix for the same reason `System` is.
     Presence(String),
 }
@@ -438,6 +462,11 @@ pub enum VoiceTarget {
         recipient_key_mode: KeyMode,
         recipient_pubkey_der: Vec<u8>,
     },
+    /// A recording destined for the mail being composed (docs/PROTOCOL.md
+    /// §17.1) - nothing goes on the wire at all: the accumulate worker
+    /// reports the finished PCM and it lands in the compose form's
+    /// attachment list (`UiState::otp_mail_add_voice`).
+    MailAttachment,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -547,6 +576,41 @@ pub enum UiAction {
     AcceptOtpInvite,
     /// The user rejected it - `client::otp::reject_invite`.
     RejectOtpInvite,
+    /// Emitted on every keystroke in the mail compose view's To field
+    /// (docs/PROTOCOL.md §17.1) - `client::otp_mail::check_recipient` runs
+    /// the pinned-user + keychain + remaining-key checks (which need
+    /// `SessionState` and the `otp` CLI, neither of which `UiState` has)
+    /// and answers through `UiState::otp_mail_set_check`.
+    CheckOtpMailRecipient {
+        nickname: String,
+    },
+    /// The `/mailbox` command (`submit_input`) - the session snapshots
+    /// the mail store into mailbox rows
+    /// (`UiState::otp_mail_set_mailbox_rows`), shown over the mail view
+    /// the command just opened as their backdrop.
+    OpenOtpMailbox,
+    /// The user confirmed Send in the mail confirm popup - the *only*
+    /// path that ever encrypts and uploads a mail
+    /// (`client::otp_mail::handle_send`).
+    SendOtpMail,
+    /// Enter on a received mailbox row - the session XORs the stored
+    /// (ciphertext, pad) pair in memory and opens the reader
+    /// (`client::otp_mail::handle_read`).
+    ReadOtpMail {
+        mail_id: String,
+    },
+    /// The user confirmed removing a mail in the mailbox - for a received
+    /// mail this securely destroys its stored ciphertext *and* pad
+    /// (`client::otp_mail::handle_delete`).
+    DeleteOtpMail {
+        mail_id: String,
+    },
+    /// Enter on an attachment row in the mail reader - the session writes
+    /// its bytes (already in memory with the open payload) to the
+    /// downloads directory.
+    SaveOtpMailAttachment {
+        index: usize,
+    },
 }
 
 /// Which trigger started the current recording - `handle_key`'s Space
@@ -671,8 +735,13 @@ pub struct UiState {
     /// (see that field's callers) since this one must actually be seen:
     /// "both parties should be aware if OTP session started/failed" is a
     /// hard requirement, not a best-effort one. Also used for the "unknown
-    /// command" notice (`submit_input`).
+    /// command" notice (`submit_input`). Auto-clears
+    /// `STATUS_NOTICE_TIMEOUT` after it was pushed (`tick_status_notice`)
+    /// so a stale outcome never squats on the corner of the screen.
     pub status_notice: Option<(String, bool)>,
+    /// When `status_notice` was last pushed - what `tick_status_notice`
+    /// measures the timeout from. `None` whenever `status_notice` is.
+    status_notice_since: Option<Instant>,
     /// Peers a mutual-consent OTP session has genuinely started with in
     /// this connection (set alongside the "OTP session started" notice,
     /// `client::otp::accept_invite`/`on_key_setup_ack`) - drives the shield
@@ -712,8 +781,15 @@ pub struct UiState {
     pub(crate) recording_source: Option<RecordSource>,
     /// Timestamp of the most recent Space press/repeat while recording;
     /// `tick_recording_timeout` watches this to detect release on
-    /// terminals that never send `KeyEventKind::Release`.
-    recording_last_seen: Option<Instant>,
+    /// terminals that never send `KeyEventKind::Release`. `pub(crate)`
+    /// because the mail compose view's own Space branch
+    /// (`crate::client::tui::otp_mail`) drives the same machinery.
+    pub(crate) recording_last_seen: Option<Instant>,
+    /// The OTP mail surface (compose view + mailbox popup + reader),
+    /// `Some` while the `/mail`//`/mailbox` full-screen view is open - see
+    /// `crate::client::tui::otp_mail`. Every key routes there while open
+    /// (`handle_key`), and `render` swaps the whole screen for it.
+    pub otp_mail: Option<super::otp_mail::OtpMailState>,
     /// Whether this terminal actually delivers a real `KeyEventKind::Release`
     /// for Space (queried once at startup via `crossterm::terminal::
     /// supports_keyboard_enhancement`; see `set_keyboard_release_reporting`).
@@ -830,12 +906,14 @@ impl UiState {
             otp_invite_queue: VecDeque::new(),
             otp_invite_focus: OtpChoice::Accept,
             status_notice: None,
+            status_notice_since: None,
             otp_active_peers: HashSet::new(),
             otp_key_status: HashMap::new(),
             replaying: false,
             recording: false,
             recording_source: None,
             recording_last_seen: None,
+            otp_mail: None,
             keyboard_release_reporting: false,
             audio_error: None,
             blink_on: false,
@@ -1184,6 +1262,27 @@ impl UiState {
     /// rendered surface rather than reusing `audio_error`/`push_notice`.
     pub fn push_status_notice(&mut self, message: String, success: bool) {
         self.status_notice = Some((message, success));
+        self.status_notice_since = Some(Instant::now());
+    }
+
+    /// Clears a status notice that has been showing for
+    /// `STATUS_NOTICE_TIMEOUT` - called from the session's ticker, the
+    /// same cadence `tick_recording_timeout` rides. A notice whose
+    /// timestamp is missing (set by writing the pub field directly, as
+    /// tests do) is adopted from `now` rather than left immortal.
+    pub fn tick_status_notice(&mut self, now: Instant) {
+        if self.status_notice.is_none() {
+            self.status_notice_since = None;
+            return;
+        }
+        match self.status_notice_since {
+            Some(since) if now.duration_since(since) >= STATUS_NOTICE_TIMEOUT => {
+                self.status_notice = None;
+                self.status_notice_since = None;
+            }
+            None => self.status_notice_since = Some(now),
+            _ => {}
+        }
     }
 
     /// Records that a mutual-consent OTP session has genuinely started with
@@ -1552,14 +1651,19 @@ impl UiState {
             return None;
         }
         if self.help_open {
-            // Only scrolling is honored while the overlay is up; every
-            // other key is swallowed. Closing is Ctrl+H only (not Esc
-            // too): Esc already means "close the current private room" a
-            // few branches down, and since that branch isn't gated on
-            // `kind`, closing help via Esc could leak a second, unwanted
-            // "close the DM" side effect once its paired `Release` arrives
-            // and `help_open` has already flipped back to `false`. Keeping
-            // open/close on the same keystroke sidesteps that entirely.
+            // Only scrolling and closing are honored while the overlay is
+            // up; every other key is swallowed. Closing is Ctrl+H (the
+            // toggle above) or Esc - the Esc close is gated on `Press`,
+            // and its paired `Release` on a kitty-protocol terminal is
+            // still absorbed safely below even though `help_open` has
+            // already flipped: the DM-closing Esc branch further down is
+            // itself `Press`-gated, so no second side effect can leak.
+            if code == KeyCode::Esc {
+                if kind == KeyEventKind::Press {
+                    self.help_open = false;
+                }
+                return None;
+            }
             let max_scroll = HELP_BODY.len().saturating_sub(1);
             match code {
                 KeyCode::Up => self.help_scroll = self.help_scroll.saturating_sub(1),
@@ -1575,6 +1679,17 @@ impl UiState {
                 _ => {}
             }
             return None;
+        }
+
+        // The OTP mail view owns every key while open (below the modal
+        // popups and Ctrl+H above, which must stay reachable over it) -
+        // including its own Space handling, since Space types text in its
+        // fields but records in its attachments pane. Opened only by the
+        // `/mail` and `/mailbox` commands (`submit_input`) - deliberately
+        // no key chord: Ctrl+M is indistinguishable from Enter on
+        // terminals without the kitty keyboard protocol (both are 0x0D).
+        if self.otp_mail.is_some() {
+            return self.handle_otp_mail_key(code, modifiers, kind);
         }
 
         if code == KeyCode::Char(' ') && self.focus != Focus::Input {
@@ -1772,6 +1887,23 @@ impl UiState {
                 key_mode: peer.key_mode,
                 pubkey_der: peer.public_key_der,
             });
+        }
+        if self.input.trim() == "/mail" {
+            // The one way to compose an OTP mail (docs/PROTOCOL.md §17.1) -
+            // a command rather than a key chord, since the natural chord
+            // (Ctrl+M) is indistinguishable from Enter on terminals
+            // without the kitty keyboard protocol (both are 0x0D).
+            self.input.clear();
+            self.open_otp_mail();
+            return None;
+        }
+        if self.input.trim() == "/mailbox" {
+            // The one way to open the mailbox: opens the mail view with
+            // the mailbox popup on top - the session answers the action
+            // with the current rows (`client::otp_mail::handle_open_mailbox`).
+            self.input.clear();
+            self.open_otp_mail();
+            return Some(UiAction::OpenOtpMailbox);
         }
         if self.input.trim() == "/leave" {
             // Always the currently selected channel tab - `/leave` takes
@@ -2227,7 +2359,12 @@ pub(crate) fn finalize_held_stream(
 
 pub fn render(frame: &mut Frame, state: &UiState) {
     let area = frame.area();
-    if let Some(peer_id) = state.active_private_room {
+    if state.otp_mail.is_some() {
+        // The mail view replaces the whole screen (its popups included) -
+        // the global popups/notice below still overlay it, same priority
+        // order `handle_key` applies.
+        super::otp_mail::render_otp_mail_view(frame, area, state);
+    } else if let Some(peer_id) = state.active_private_room {
         super::direct_message::render_private_room(frame, area, state, peer_id);
     } else {
         super::channel::render_channel_view(frame, area, state);
@@ -2877,9 +3014,13 @@ fn render_help_popup(frame: &mut Frame, area: Rect, state: &UiState) {
     let max_allowed = (area.width as u32 * 9 / 10) as u16;
     let popup_width = (content_width + 4).min(max_allowed);
 
-    let popup = centered_rect(popup_width, 32, area);
+    // Tall enough for the whole text when the terminal allows it, capped
+    // at 90% of the available height so the view underneath stays visible
+    // as context - scrolling covers whatever doesn't fit.
+    let popup_height = (HELP_BODY.len() as u16 + 2).min((area.height as u32 * 9 / 10) as u16);
+    let popup = centered_rect(popup_width, popup_height, area);
     let block = Block::default()
-        .title("Help (Ctrl+H to close, arrows to scroll)")
+        .title("Help (Ctrl+H / Esc to close, arrows to scroll)")
         .borders(Borders::ALL);
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
@@ -2896,20 +3037,40 @@ fn render_help_popup(frame: &mut Frame, area: Rect, state: &UiState) {
     let max_scroll = HELP_BODY.len().saturating_sub(visible_rows);
     let scroll = state.help_scroll.min(max_scroll);
 
-    let lines: Vec<Line> = HELP_BODY
-        .iter()
-        .map(|&text| {
-            if HELP_HEADINGS.contains(&text) {
-                Line::from(Span::styled(
-                    text,
-                    Style::default().add_modifier(Modifier::BOLD),
-                ))
-            } else {
-                Line::from(text)
-            }
-        })
-        .collect();
+    let lines: Vec<Line> = HELP_BODY.iter().map(|&text| help_line(text)).collect();
     frame.render_widget(Paragraph::new(lines).scroll((scroll as u16, 0)), inner);
+}
+
+/// Styles one help line: section headings in yellow (bold), a
+/// shortcut/command item's keys in the default (bright) color with its
+/// description in gray - so the shortcut itself is what stands out - and
+/// plain prose/continuation lines entirely in gray. An item line is
+/// recognised by its shape: a two-space indent, then the keys, then a run
+/// of three-plus spaces before the description (every key column in
+/// `HELP_BODY` keeps at least that gap; anything narrower is prose).
+fn help_line(text: &'static str) -> Line<'static> {
+    if HELP_HEADINGS.contains(&text) {
+        return Line::from(Span::styled(
+            text,
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    if text.is_empty() {
+        return Line::from(text);
+    }
+    let is_item = text.starts_with("  ") && !text.starts_with("   ");
+    if is_item
+        && let Some(gap) = text[2..].find("   ").map(|i| i + 2)
+    {
+        let (keys, description) = text.split_at(gap);
+        return Line::from(vec![
+            Span::styled(keys, Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(description, Style::default().fg(Color::DarkGray)),
+        ]);
+    }
+    Line::from(Span::styled(text, Style::default().fg(Color::DarkGray)))
 }
 
 pub(crate) fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {

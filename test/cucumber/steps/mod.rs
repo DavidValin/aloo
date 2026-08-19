@@ -19,6 +19,7 @@ pub mod identity_continuity;
 pub mod malformed_input;
 pub mod messaging;
 pub mod otp;
+pub mod otp_mail;
 pub mod pq_hybrid;
 pub mod presence;
 pub mod server;

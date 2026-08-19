@@ -166,6 +166,11 @@ pub(crate) struct SessionState {
     /// handshake attempt has to restart anyway, same as any other
     /// in-flight state tied to a `UserId`.
     pub(crate) otp_incoming_setup: HashMap<UserId, crate::crypto::otp::OtpKeySetupReassembly>,
+    /// OTP mail references and received-mail blobs (docs/PROTOCOL.md §17),
+    /// loaded from `~/.aloo/otp_mail/` alongside the other stores and
+    /// saved synchronously after every mutation - see
+    /// `client::otp_mail_store`'s module doc.
+    pub(crate) otp_mail_store: crate::client::otp_mail_store::OtpMailStore,
 }
 
 // `key_mode` pushed this past clippy's default 7-argument threshold;
@@ -308,6 +313,14 @@ pub(crate) async fn run_connected_session(
         }),
         otp_out_queue: crate::client::otp::OtpOutQueue::new(),
         otp_incoming_setup: HashMap::new(),
+        otp_mail_store: crate::client::otp_mail_store::OtpMailStore::load(
+            crate::client::otp_mail_store::OtpMailStore::default_dir(),
+        )
+        .unwrap_or_else(|_| {
+            crate::client::otp_mail_store::OtpMailStore::new_empty(
+                crate::client::otp_mail_store::OtpMailStore::default_dir(),
+            )
+        }),
     };
 
     let mut ui_state = UiState::new(display_name);
@@ -328,6 +341,18 @@ pub(crate) async fn run_connected_session(
     let mut last_cpu_sample = Instant::now();
     let mut last_conn_sample = Instant::now();
     let mut last_otp_key_status_sample = Instant::now();
+
+    // OTP mail (docs/PROTOCOL.md §17.3): a client with a local OTP
+    // keychain immediately asks for everything the server holds for it -
+    // pending mail addressed to this nickname, and delivery receipts for
+    // mail it sent - then replays any upload whose storage acknowledgement
+    // a previous session never saw. Skipped without the `otp` binary:
+    // nothing could decrypt what a fetch would deliver.
+    if crate::client::otp_cli::binary_available(&session.otp_cli_cfg) {
+        wr.send_control(&ClientMessage::OtpMailFetch).await?;
+        session.conn_stats.record_event(Instant::now());
+        crate::client::otp_mail::resend_pending(&mut wr, &mut session).await?;
+    }
 
     terminal.draw(|f| ui::render(f, &ui_state))?;
 
@@ -388,6 +413,20 @@ pub(crate) async fn run_connected_session(
                             crate::client::otp::send_voice_offer(
                                 &mut wr, &mut session, &mut ui_state, to, &contact_name, &recipient_pubkey_der, pcm, duration_ms,
                             ).await?;
+                        }
+                        voice_stream::OwnStreamTarget::MailAttachment => {
+                            // Nothing was sent anywhere - the finished
+                            // recording either joins the mail being
+                            // composed or, if it outgrew the remaining key
+                            // meanwhile (or the compose view is gone), the
+                            // operation is cancelled outright.
+                            let compose_open = ui_state.otp_mail.is_some();
+                            if !ui_state.otp_mail_add_voice(duration_ms, pcm) && compose_open {
+                                ui_state.push_status_notice(
+                                    "OTP mail: recording is larger than the remaining key - cancelled".to_string(),
+                                    false,
+                                );
+                            }
                         }
                     }
                 }
@@ -502,6 +541,7 @@ pub(crate) async fn run_connected_session(
                 if let Some(action) = ui_state.tick_recording_timeout(Instant::now()) {
                     handle_ui_action(action, &mut wr, &mut ui_state, &mut session).await?;
                 }
+                ui_state.tick_status_notice(Instant::now());
                 let cutoff = Instant::now() - STREAM_IDLE_TIMEOUT;
                 for stream in session.active_streams.values().filter(|s| s.last_seen < cutoff) {
                     let _ = stream.job_tx.send(voice_stream::DecryptJob::End);
@@ -627,6 +667,25 @@ async fn handle_ui_action(
                             )
                             .await?;
                         }
+                        VoiceTarget::MailAttachment => {
+                            // Accumulate-only, addressed to nobody: the
+                            // same worker an OTP DM recording uses, with
+                            // the finished PCM routed to the compose form
+                            // instead of any wire send.
+                            let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+                            session.active_recording = Some(stop_tx);
+                            session.own_stream_targets.insert(
+                                stream_id,
+                                voice_stream::OwnStreamTarget::MailAttachment,
+                            );
+                            voice_stream::spawn_record_accumulate_worker(
+                                recorder,
+                                stream_id,
+                                session.own_stream_done_tx.clone(),
+                                stop_rx,
+                                session.auto_stop_tx.clone(),
+                            );
+                        }
                     }
                 }
                 Err(e) => {
@@ -714,6 +773,24 @@ async fn handle_ui_action(
         }
         UiAction::RejectOtpInvite => {
             crate::client::otp::reject_invite(wr, session, ui_state).await?;
+        }
+        UiAction::CheckOtpMailRecipient { nickname } => {
+            crate::client::otp_mail::handle_check_recipient(session, ui_state, nickname).await;
+        }
+        UiAction::OpenOtpMailbox => {
+            crate::client::otp_mail::handle_open_mailbox(session, ui_state);
+        }
+        UiAction::SendOtpMail => {
+            crate::client::otp_mail::handle_send(wr, session, ui_state).await?;
+        }
+        UiAction::ReadOtpMail { mail_id } => {
+            crate::client::otp_mail::handle_read(session, ui_state, mail_id);
+        }
+        UiAction::DeleteOtpMail { mail_id } => {
+            crate::client::otp_mail::handle_delete(session, ui_state, mail_id);
+        }
+        UiAction::SaveOtpMailAttachment { index } => {
+            crate::client::otp_mail::handle_save_attachment(ui_state, index);
         }
     }
     Ok(())
@@ -942,6 +1019,29 @@ async fn handle_server_message(
             }
         }
         ServerMessage::Error { message } => eprintln!("aloo: server error: {message}"),
+        ServerMessage::OtpMailResult { mail_id, ok, reason } => {
+            crate::client::otp_mail::on_mail_result(wr, session, ui_state, mail_id, ok, reason)
+                .await?;
+        }
+        ServerMessage::OtpMailDeliver {
+            mail_id,
+            from,
+            contact_name,
+            seq,
+            sent_at_utc: _,
+            ciphertext,
+        } => {
+            // The wire-level sent_at is unauthenticated routing metadata;
+            // the one the mail displays comes from inside the signed
+            // payload (`client::otp_mail::on_mail_deliver`).
+            crate::client::otp_mail::on_mail_deliver(
+                wr, session, ui_state, mail_id, from, contact_name, seq, ciphertext,
+            )
+            .await?;
+        }
+        ServerMessage::OtpMailDelivered { mail_id } => {
+            crate::client::otp_mail::on_mail_delivered(wr, session, ui_state, mail_id).await?;
+        }
     }
     Ok(None)
 }
@@ -1265,6 +1365,11 @@ fn check_identity(session: &mut SessionState, ui_state: &mut UiState, user: &Use
                             previous_public_key_der,
                         },
                     );
+                    // Every popup that lands asking for a decision chimes,
+                    // exactly as an incoming file offer already does - a
+                    // blocking question that arrived silently is easy to
+                    // sit unnoticed behind whatever the user was reading.
+                    voice_stream::play_bell_chime(session);
                 }
             }
         }

@@ -168,6 +168,42 @@ fn ctrl_h_uppercase_also_toggles_help() {
     assert!(state.help_open);
 }
 
+/// @requirement AC-056
+#[test]
+fn escape_also_closes_the_help_overlay() {
+    let mut state = UiState::new("me".into());
+    ctrl(&mut state, KeyCode::Char('h'));
+    assert!(state.help_open);
+    assert_eq!(press(&mut state, KeyCode::Esc), None);
+    assert!(!state.help_open);
+    // The paired Release a kitty-protocol terminal delivers afterwards is
+    // inert - the DM-closing Esc branch is Press-gated, so nothing leaks.
+    assert_eq!(
+        state.handle_key(KeyCode::Esc, KeyModifiers::NONE, KeyEventKind::Release),
+        None
+    );
+    assert!(!state.help_open);
+}
+
+/// @requirement AC-141
+#[test]
+fn the_status_notice_clears_after_thirty_seconds() {
+    use std::time::{Duration, Instant};
+    let mut state = UiState::new("me".into());
+    state.push_status_notice("OTP session started".into(), true);
+    let now = Instant::now();
+    state.tick_status_notice(now);
+    assert!(state.status_notice.is_some(), "still fresh");
+    state.tick_status_notice(now + Duration::from_secs(29));
+    assert!(state.status_notice.is_some(), "just under the timeout");
+    state.tick_status_notice(now + aloo::client::tui::ui::STATUS_NOTICE_TIMEOUT);
+    assert!(state.status_notice.is_none(), "cleared at the timeout");
+    // A fresh notice restarts the clock rather than inheriting the old one.
+    state.push_status_notice("another".into(), false);
+    state.tick_status_notice(Instant::now());
+    assert!(state.status_notice.is_some());
+}
+
 /// @requirement TB-107
 #[test]
 fn ctrl_h_release_event_does_not_re_toggle_help() {
@@ -230,11 +266,13 @@ fn esc_while_help_open_only_closes_help_not_the_private_room_underneath() {
     ctrl(&mut state, KeyCode::Char('h'));
     assert!(state.help_open);
 
-    // by design, only Ctrl+H closes help (see handle_key's doc comment) -
-    // Esc while help is open must be a no-op, not fall through to the
-    // normal "Esc closes the private room" handling underneath.
+    // Esc closes help - and only help: it must never fall through to the
+    // normal "Esc closes the private room" handling underneath, neither on
+    // the Press that closed it nor on the paired Release a kitty-protocol
+    // terminal delivers afterwards.
     press(&mut state, KeyCode::Esc);
-    assert!(state.help_open, "Esc must not close help");
+    assert!(!state.help_open, "Esc closes help");
+    state.handle_key(KeyCode::Esc, KeyModifiers::NONE, KeyEventKind::Release);
     assert_eq!(
         state.active_private_room,
         Some(UserId(2)),
@@ -924,6 +962,52 @@ fn render_help_popup_shows_expected_content_when_open() {
     );
 }
 
+/// @requirement AC-056
+#[test]
+fn help_headings_are_yellow_and_descriptions_gray() {
+    let mut state = joined_general_with(vec![]);
+    state.help_open = true;
+    let backend = TestBackend::new(100, 40);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| render(f, &state)).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+
+    // Walk the buffer rows as (text, per-cell styles) pairs.
+    let mut heading_fg = None;
+    let mut key_fg = None;
+    let mut desc_fg = None;
+    for y in 0..buffer.area.height {
+        let row: String = (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol())
+            .collect();
+        if let Some(x) = row.find("Channels")
+            && heading_fg.is_none()
+        {
+            heading_fg = Some(buffer[(x as u16, y)].fg);
+        }
+        if let Some(x) = row.find("Ctrl+J") {
+            key_fg = Some(buffer[(x as u16, y)].fg);
+            if let Some(dx) = row.find("join/create") {
+                desc_fg = Some(buffer[(dx as u16, y)].fg);
+            }
+        }
+    }
+    assert_eq!(
+        heading_fg,
+        Some(ratatui::style::Color::Yellow),
+        "section headings render yellow"
+    );
+    assert_eq!(
+        desc_fg,
+        Some(ratatui::style::Color::DarkGray),
+        "a shortcut's description renders gray"
+    );
+    assert_ne!(
+        key_fg, desc_fg,
+        "the shortcut itself keeps the brighter default color"
+    );
+}
+
 /// Presses PageDown until `text` appears on screen (or the help overlay's
 /// scroll position stops advancing, i.e. it hit bottom) - a content-length-
 /// independent way to reach a specific help section, since exactly how far
@@ -1352,10 +1436,10 @@ fn help_popup_never_exceeds_90_percent_of_the_terminal_width() {
     // multi-byte and each is still exactly one terminal cell.
     let border_row = rows
         .iter()
-        .find(|r| r.contains("Help (Ctrl+H to close, arrows to scroll)"))
+        .find(|r| r.contains("Help (Ctrl+H / Esc to close, arrows to scroll)"))
         .expect("expected the popup's title row");
     let row_chars: Vec<char> = border_row.chars().collect();
-    let title: Vec<char> = "Help (Ctrl+H to close, arrows to scroll)".chars().collect();
+    let title: Vec<char> = "Help (Ctrl+H / Esc to close, arrows to scroll)".chars().collect();
     let title_start = row_chars
         .windows(title.len())
         .position(|w| w == title.as_slice())

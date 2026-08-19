@@ -457,6 +457,9 @@ pub(crate) async fn handle_otp_command(
         notify(ui_state, peer, &peer_name, link_readiness_notice(readiness, &peer_name), true);
     } else {
         ui_state.open_otp_generate_confirm(peer, peer_name, key_mode, peer_pubkey_der);
+        // A decision popup just opened - chime, like every popup that
+        // asks the user for an action does (the file-offer precedent).
+        crate::client::voice_stream::play_bell_chime(session);
     }
     Ok(())
 }
@@ -780,6 +783,8 @@ pub(crate) fn on_key_setup(
         Some(dec),
         Some(chunk.keypair_size_mb),
     );
+    // Same chime every decision popup plays on arrival.
+    crate::client::voice_stream::play_bell_chime(session);
     notify(
         ui_state,
         from,
@@ -825,6 +830,8 @@ pub(crate) fn on_session_request(
         return;
     };
     ui_state.push_otp_invite(from, from_name.clone(), payload.contact_name, None, None, None);
+    // Same chime every decision popup plays on arrival.
+    crate::client::voice_stream::play_bell_chime(session);
     notify(
         ui_state,
         from,
@@ -1039,6 +1046,8 @@ pub(crate) async fn on_key_setup_ack(
             sender.key_mode,
             sender.public_key_der.clone(),
         );
+        // Same chime every decision popup plays on arrival.
+        crate::client::voice_stream::play_bell_chime(session);
         notify(
             ui_state,
             from,
@@ -1078,7 +1087,9 @@ pub(crate) async fn on_key_setup_ack(
 /// call just leaves whatever snapshot was already there rather than
 /// clearing it - a stale-but-real figure beats a blank one for a display
 /// that's cosmetic, not a security decision.
-async fn refresh_otp_key_status(
+/// `pub(crate)`: OTP mail's own pad spends (`client::otp_mail`) refresh
+/// through here too, when the mail's counterpart happens to be connected.
+pub(crate) async fn refresh_otp_key_status(
     cfg: &otp_cli::OtpCliConfig,
     ui_state: &mut UiState,
     peer: UserId,
@@ -1848,21 +1859,41 @@ pub(crate) async fn on_delivery_ack(
         return Ok(());
     }
     let _ = session.otp_store.save();
-    match session.otp_out_queue.pop_front(&contact_name) {
+    flush_one_queued(wr, ui_state, session, &contact_name).await
+}
+
+/// Releases exactly one queued send for `contact_name`, if any - the drain
+/// step every genuine gate-clearing shares: a peer's `OtpDeliveryAck`
+/// (`on_delivery_ack`) and the server's `OtpMailResult`/`OtpMailDelivered`
+/// for a mail spend (`client::otp_mail`) all authorise exactly one more
+/// send before the next acknowledgement is needed. The queued item's
+/// recipient is re-resolved fresh from `known_users` - the queue only ever
+/// holds a connection-lifetime `UserId`, so a recipient who disconnected
+/// meanwhile simply drops the item (their `UserId` will never come back).
+pub(crate) async fn flush_one_queued(
+    wr: &mut impl crate::control::ControlSink,
+    ui_state: &mut UiState,
+    session: &mut SessionState,
+    contact_name: &str,
+) -> proto::Result<()> {
+    match session.otp_out_queue.pop_front(contact_name) {
         Some(PendingOtpSend::Direct {
             to,
             plaintext,
             content,
             log_index,
         }) => {
+            let Some(recipient) = ui_state.known_users.get(&to).cloned() else {
+                return Ok(());
+            };
             send_now(
                 wr,
                 session,
                 ui_state,
                 to,
-                &contact_name,
-                sender.key_mode,
-                &sender.public_key_der,
+                contact_name,
+                recipient.key_mode,
+                &recipient.public_key_der,
                 &plaintext,
                 content,
                 None,
@@ -1876,14 +1907,17 @@ pub(crate) async fn on_delivery_ack(
             plaintext,
             content,
         }) => {
+            let Some(recipient) = ui_state.known_users.get(&to).cloned() else {
+                return Ok(());
+            };
             send_now(
                 wr,
                 session,
                 ui_state,
                 to,
-                &contact_name,
-                sender.key_mode,
-                &sender.public_key_der,
+                contact_name,
+                recipient.key_mode,
+                &recipient.public_key_der,
                 &plaintext,
                 content,
                 Some(channel),
@@ -2180,6 +2214,11 @@ pub(crate) async fn recover_and_resend(
                     duration_ms,
                 )
                 .await?;
+            }
+            crate::client::otp_store::PendingOtpContent::Mail { .. } => {
+                // A mail's retry rides the server control channel, not a
+                // P2P link - `client::otp_mail::resend_pending` handles it
+                // once per (re)connect; nothing to do on a link transition.
             }
         }
     }
