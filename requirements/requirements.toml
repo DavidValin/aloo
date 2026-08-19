@@ -1806,8 +1806,8 @@ evidence = "src/p2p_proto.rs SAFE_DATAGRAM_BYTES; src/client/file_transfer.rs FI
 
 [[user_story.technical_behavior]]
 id = "TB-149"
-description = "A direct link's punch handshake is triggered eagerly, the moment a peer is first learned about (ServerMessage::UserJoined), rather than lazily on first send - since voice (unlike text/file) excludes a recipient outright if its link isn't already Active at record-start, a lazy trigger meant the first voice message to any brand-new peer reliably missed them. A pre-warmed link that fails to punch with nothing ever queued against it fails silently (no visible LinkFailed banner) - only a link something was genuinely waiting on surfaces a visible failure."
-evidence = "src/client/session.rs handle_server_message's UserJoined arm (ensure_link call); src/client/p2p.rs PeerLinkManager::expire_pending (only content that was actually queued can age out into a P2pEvent::LinkFailed); test punch_timeout_with_nothing_pending_fails_silently"
+description = "A direct link's punch handshake is triggered eagerly, the moment a peer is learned about (ServerMessage::UserJoined), rather than lazily on first send - since voice (unlike text/file) excludes a recipient outright if its link isn't already Active at record-start, a lazy trigger meant the first voice message to any brand-new peer reliably missed them. The trigger fires on every UserJoined for that peer, not only the first: UserOffline forgets their link outright (TB-178), so gating it on 'a UserId we have never seen' would leave a peer who reconnected after any blip - including a heartbeat timeout on a slow link - with no link and nothing to re-arm it. A pre-warmed link that fails to punch with nothing ever queued against it fails silently (no visible LinkFailed banner) - only a link something was genuinely waiting on surfaces a visible failure."
+evidence = "src/client/session.rs handle_server_message's UserJoined arm (unconditional ensure_link call, distinct from the first-sighting-only identity pin beside it); src/client/p2p.rs PeerLinkManager::expire_pending (only content that was actually queued can age out into a P2pEvent::LinkFailed), forget; tests punch_timeout_with_nothing_pending_fails_silently, a_peer_who_reconnects_is_punched_again"
 
 [[user_story.technical_behavior]]
 id = "TB-155"
@@ -1848,6 +1848,11 @@ evidence = "docs/PROTOCOL.md 7.1.1; src/client/p2p.rs PeerLinkManager::send_reli
 id = "TB-181"
 description = "The client's own server-reflexive candidate is re-learned every REFLEXIVE_REFRESH_INTERVAL for the whole session rather than once at startup, which both keeps the NAT mapping it names from expiring while the client sits idle and keeps the address it advertises true. An observed address that has changed replaces it and re-signals every link that is not already up; links that are up are deliberately left alone, since on a symmetric NAT the server-facing mapping is independent of the peer-facing ones."
 evidence = "docs/PROTOCOL.md 7.1; src/client/p2p.rs PeerLinkManager::refresh_reflexive, on_rendezvous, learn_reflexive_candidate; test a_changed_reflexive_address_re_signals_links_that_are_not_up"
+
+[[user_story.technical_behavior]]
+id = "TB-200"
+description = "A candidate list is ordered and filtered so the CANDIDATES_MAX ceiling can never cost a link the one address that would have worked. The server-reflexive candidate - the only entry that can work between peers on different networks - is advertised ahead of the host ones, which are an unbounded list of whatever the machine's interfaces report (loopback, the LAN address, one gateway per Docker bridge, VPN or container network) and so can otherwise push it past a receiver's ceiling. Addresses of the family the session's socket is not bound to are advertised by neither side and stored by neither side: a send across families fails at the syscall, so such an address is not a worse candidate but an impossible one, and keeping it only spends a slot a reachable address needs."
+evidence = "docs/PROTOCOL.md 7.1; src/client/p2p.rs local_candidates, host_candidates, PeerLinkManager::on_peer_candidates, CANDIDATES_MAX; tests the_reflexive_candidate_is_advertised_ahead_of_the_host_ones, candidates_of_the_wrong_address_family_are_never_advertised_or_stored"
 
 # ============================================================================
 # US-025 - Protect a private channel with a password

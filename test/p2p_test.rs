@@ -931,3 +931,126 @@ async fn a_lost_link_still_answers_a_fresh_invite_from_the_peer() {
     // ...and be punching again rather than waiting out her own backoff.
     assert_eq!(alice.status(bob_id), Some(LinkStatus::Connecting));
 }
+
+/// The reflexive candidate is the only address in the list that can work
+/// between two peers on different networks. The host candidates around it
+/// are whatever `if_addrs` reports - loopback, the LAN address, and one
+/// gateway per Docker bridge, VPN or container network - and a receiver
+/// stops storing at `CANDIDATES_MAX`. Advertising the useful one last
+/// therefore let a machine with enough virtual interfaces push its own
+/// only routable address off the end of its peer's list, leaving nothing
+/// to punch to but private addresses. It goes first.
+///
+/// @requirement TB-200
+#[tokio::test]
+async fn the_reflexive_candidate_is_advertised_ahead_of_the_host_ones() {
+    let server_addr = spawn_test_server().await;
+    let (alice, _events, _a, _b, _bob_id) = one_manager(server_addr).await;
+
+    let candidates = alice.local_candidate_list();
+    assert!(
+        !candidates.is_empty(),
+        "a bound manager always has at least its own host addresses"
+    );
+    // On loopback the rendezvous socket always answers, so the reflexive
+    // address is known - and must be the entry a truncating peer keeps.
+    let reflexive = candidates[0];
+    assert_eq!(
+        reflexive.ip(),
+        std::net::Ipv4Addr::LOCALHOST,
+        "loopback's reflexive address is 127.0.0.1, observed by the server"
+    );
+    // No duplicates: the reflexive address is also a host address here, and
+    // spending two of a peer's sixteen slots on one address helps nobody.
+    let mut seen = std::collections::HashSet::new();
+    for addr in &candidates {
+        assert!(seen.insert(*addr), "{addr} advertised twice");
+    }
+}
+
+/// The session's one UDP socket is bound to a single address family for
+/// its whole life, and `send_to` across families fails at the syscall. An
+/// address of the other family is therefore not a worse candidate but an
+/// impossible one, and storing it only spends a `CANDIDATES_MAX` slot that
+/// a reachable address needs - so neither side ever advertises or keeps
+/// one.
+///
+/// @requirement TB-200
+#[tokio::test]
+async fn candidates_of_the_wrong_address_family_are_never_advertised_or_stored() {
+    let server_addr = spawn_test_server().await;
+    let (mut alice, _events, mut a, mut b, bob_id) = one_manager(server_addr).await;
+
+    // This manager is bound on IPv4 (loopback server), so nothing it
+    // advertises may be IPv6.
+    assert!(
+        alice.local_candidate_list().iter().all(|c| c.is_ipv4()),
+        "an IPv4-bound socket advertised an IPv6 candidate it could never send from"
+    );
+
+    alice.ensure_link(&mut a, bob_id).await;
+    let nonce = relayed_nonce(&mut b).await;
+
+    // bob replies with a mix: two IPv6 addresses that alice's socket can
+    // never reach, and one usable IPv4 one.
+    alice
+        .on_peer_candidates(
+            &mut a,
+            bob_id,
+            vec![
+                "[2001:db8::1]:7000".parse().unwrap(),
+                "[::1]:7001".parse().unwrap(),
+                "127.0.0.1:7002".parse().unwrap(),
+            ],
+            nonce,
+        )
+        .await;
+
+    assert_eq!(
+        alice.candidate_count(bob_id),
+        1,
+        "only the IPv4 candidate is reachable and so only it should be kept"
+    );
+}
+
+/// `UserOffline` forgets a peer's link outright - stopping its keepalives,
+/// its retries and its backoff. Everything that brings the link back
+/// therefore hangs off the `ensure_link` on their next `UserJoined`, which
+/// is why that call fires on *every* sighting rather than only the first
+/// one: a peer who blips offline and reconnects (a heartbeat timeout on a
+/// slow link is enough) would otherwise be left with no link at all, and
+/// nothing scheduled to build one, until the user happened to send them
+/// something.
+///
+/// @requirement TB-149
+#[tokio::test]
+async fn a_peer_who_reconnects_is_punched_again() {
+    let server_addr = spawn_test_server().await;
+    let (mut alice, _events, mut a, mut b, bob_id) = one_manager(server_addr).await;
+
+    alice.ensure_link(&mut a, bob_id).await;
+    let first = relayed_nonce(&mut b).await;
+    assert_eq!(alice.status(bob_id), Some(LinkStatus::Connecting));
+
+    // What `UserOffline` does: the link, its retries and its backoff go.
+    alice.forget(bob_id);
+    assert_eq!(
+        alice.status(bob_id),
+        None,
+        "a forgotten peer has no link left to retry"
+    );
+
+    // What their next `UserJoined` now does unconditionally.
+    alice.ensure_link(&mut a, bob_id).await;
+    let second = relayed_nonce(&mut b).await;
+
+    assert_eq!(
+        alice.status(bob_id),
+        Some(LinkStatus::Connecting),
+        "reconnecting must put the peer back into establishment"
+    );
+    assert_ne!(
+        first, second,
+        "the re-punch is a fresh attempt, not a resumption of the forgotten one"
+    );
+}

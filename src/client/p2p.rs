@@ -20,9 +20,10 @@
 //! and flushed the moment the link comes back - it only surfaces as a
 //! visible failure once it has been undeliverable for `PENDING_MAX_AGE`.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::ErrorKind;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use tokio::net::UdpSocket;
@@ -433,6 +434,13 @@ pub struct PeerLinkManager {
     server_udp_addr: SocketAddr,
     /// This machine's own interface addresses, fixed for the session.
     host_candidates: Vec<SocketAddr>,
+    /// Whether the one UDP socket is bound to an IPv6 address. The socket's
+    /// family is fixed for the session (`session.rs` picks it from the
+    /// server's own address), and a datagram can only ever be sent to an
+    /// address of that same family - so this is what keeps candidates of
+    /// the other family, ours and the peer's alike, out of a list that is
+    /// capped at `CANDIDATES_MAX`.
+    local_is_ipv6: bool,
     /// Our server-reflexive (public) address, re-learned every
     /// `REFLEXIVE_REFRESH_INTERVAL` so it can't go stale behind a NAT that
     /// dropped the mapping while we sat idle.
@@ -463,14 +471,16 @@ impl PeerLinkManager {
         events_tx: UnboundedSender<P2pEvent>,
     ) -> std::io::Result<(Self, Arc<UdpSocket>)> {
         let socket = Arc::new(UdpSocket::bind(bind_addr).await?);
-        let local_port = socket.local_addr()?.port();
+        let local_addr = socket.local_addr()?;
+        let local_is_ipv6 = local_addr.is_ipv6();
         let reflexive = learn_reflexive_candidate(&socket, server_udp_addr).await;
 
         Ok((
             Self {
                 socket: socket.clone(),
                 server_udp_addr,
-                host_candidates: host_candidates(local_port),
+                host_candidates: host_candidates(local_addr.port(), local_is_ipv6),
+                local_is_ipv6,
                 reflexive,
                 reflexive_token: 0,
                 last_reflexive_probe: Instant::now(),
@@ -484,12 +494,25 @@ impl PeerLinkManager {
 
     /// Every address this client can currently be reached at, in the order
     /// they're advertised to a peer.
+    ///
+    /// The server-reflexive address goes **first**, ahead of the host
+    /// candidates. It is the only entry that can work between two peers on
+    /// different networks, while the host ones are an unbounded list of
+    /// whatever `if_addrs` reports - loopback, the LAN address, and one
+    /// gateway per Docker bridge, VPN or container network. Since a
+    /// receiver stops storing at `CANDIDATES_MAX`, advertising the useful
+    /// one last meant a developer machine with enough virtual interfaces
+    /// could push the only routable address off the end of its own peer's
+    /// list, leaving nothing to punch to but private addresses.
     fn local_candidates(&self) -> Vec<SocketAddr> {
-        let mut out = self.host_candidates.clone();
-        if let Some(reflexive) = self.reflexive
-            && !out.contains(&reflexive)
-        {
+        let mut out = Vec::with_capacity(self.host_candidates.len() + 1);
+        if let Some(reflexive) = self.reflexive {
             out.push(reflexive);
+        }
+        for addr in &self.host_candidates {
+            if !out.contains(addr) {
+                out.push(*addr);
+            }
         }
         out
     }
@@ -646,6 +669,7 @@ impl PeerLinkManager {
                 })
                 .await;
         }
+        let local_is_ipv6 = self.local_is_ipv6;
         let link = self
             .links
             .entry(from)
@@ -655,6 +679,12 @@ impl PeerLinkManager {
         for addr in candidates {
             if link.candidates.len() >= CANDIDATES_MAX {
                 break;
+            }
+            // Nothing can ever be sent to an address of the family this
+            // session's socket isn't bound to, so storing one would only
+            // spend a `CANDIDATES_MAX` slot that a reachable address needs.
+            if addr.is_ipv6() != local_is_ipv6 {
+                continue;
             }
             if !link.candidates.contains(&addr) {
                 link.candidates.push(addr);
@@ -676,7 +706,7 @@ impl PeerLinkManager {
             link_nonce: link.link_nonce,
         });
         for addr in &link.candidates {
-            let _ = self.socket.try_send_to(&dgram, *addr);
+            send_dgram(&self.socket, &dgram, *addr);
         }
     }
 
@@ -729,7 +759,7 @@ impl PeerLinkManager {
             seq,
             blocks,
         });
-        let _ = self.socket.try_send_to(&dgram, *addr);
+        send_dgram(&self.socket, &dgram, *addr);
         *last_sent = Instant::now();
     }
 
@@ -743,7 +773,7 @@ impl PeerLinkManager {
             seq,
             payload: bytes,
         });
-        let _ = socket.try_send_to(&dgram, *addr);
+        send_dgram(socket, &dgram, *addr);
         *last_sent = Instant::now();
     }
 
@@ -792,9 +822,11 @@ impl PeerLinkManager {
                 };
                 self.adopt_candidate(peer, addr);
                 self.note_received(peer, now);
-                let _ = self
-                    .socket
-                    .try_send_to(&encode_dgram(&PunchDatagram::Pong { link_nonce }), addr);
+                send_dgram(
+                    &self.socket,
+                    &encode_dgram(&PunchDatagram::Pong { link_nonce }),
+                    addr,
+                );
                 // Probe straight back at the address they actually reached
                 // us from, rather than waiting for the next tick: this is
                 // the path most likely to work, and the peer needs our
@@ -958,9 +990,11 @@ impl PeerLinkManager {
     }
 
     fn on_reliable(&mut self, peer: UserId, addr: SocketAddr, seq: u32, payload: Vec<u8>) {
-        let _ = self
-            .socket
-            .try_send_to(&encode_dgram(&PunchDatagram::Ack { seq }), addr);
+        send_dgram(
+            &self.socket,
+            &encode_dgram(&PunchDatagram::Ack { seq }),
+            addr,
+        );
         let Some(link) = self.links.get_mut(&peer) else {
             return;
         };
@@ -1105,7 +1139,8 @@ impl PeerLinkManager {
                     match link.arq_tx.due_for_retransmit(now) {
                         Ok(due) => {
                             for (seq, payload) in due {
-                                let _ = self.socket.try_send_to(
+                                send_dgram(
+                                    &self.socket,
                                     &encode_dgram(&PunchDatagram::Reliable { seq, payload }),
                                     addr,
                                 );
@@ -1118,7 +1153,8 @@ impl PeerLinkManager {
                         lost.push((peer, "too many out-of-order messages".into()));
                     }
                     if now.duration_since(*last_sent) >= KEEPALIVE_INTERVAL {
-                        let _ = self.socket.try_send_to(
+                        send_dgram(
+                            &self.socket,
                             &encode_dgram(&PunchDatagram::Keepalive {
                                 link_nonce: link.link_nonce,
                             }),
@@ -1169,7 +1205,7 @@ impl PeerLinkManager {
         let request = encode_dgram_rendezvous(&RendezvousMessage::BindingRequest {
             token: self.reflexive_token,
         });
-        let _ = self.socket.try_send_to(&request, self.server_udp_addr);
+        send_dgram(&self.socket, &request, self.server_udp_addr);
     }
 
     /// Moves a link out of service and schedules its next attempt. Never
@@ -1399,6 +1435,42 @@ fn retry_delay(attempts: u32) -> Duration {
     shifted.min(RETRY_MAX)
 }
 
+/// One datagram out of the session's UDP socket, with the failures that
+/// actually mean something surfaced rather than dropped on the floor.
+///
+/// Every send here used to be a bare `let _ = try_send_to(..)`. That is
+/// right for the two failures punching produces by design - a momentarily
+/// full send buffer, and the ICMP port-unreachable that comes back from
+/// probing a candidate address nobody is listening on - but it also
+/// silently swallowed the ones that mean a datagram can *never* leave:
+/// a payload past the maximum datagram size, or an address of the family
+/// this socket isn't bound to. Neither is recoverable and neither showed
+/// up anywhere, in a subsystem whose whole failure mode is "nothing
+/// arrives and nothing says why".
+///
+/// Reported at most once per error kind per session (`WARNED`), so a
+/// permanently broken path can't scribble over the TUI on every tick.
+fn send_dgram(socket: &UdpSocket, bytes: &[u8], to: SocketAddr) {
+    let Err(e) = socket.try_send_to(bytes, to) else {
+        return;
+    };
+    if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::ConnectionRefused) {
+        return;
+    }
+    static WARNED: OnceLock<Mutex<HashSet<ErrorKind>>> = OnceLock::new();
+    let warned = WARNED.get_or_init(|| Mutex::new(HashSet::new()));
+    // A poisoned lock here would mean another thread panicked mid-warning;
+    // that is not a reason to lose this one, so recover and carry on.
+    let mut warned = warned.lock().unwrap_or_else(|e| e.into_inner());
+    if warned.insert(e.kind()) {
+        eprintln!(
+            "aloo: direct-link UDP send to {to} failed ({e}) - {} byte datagram, \
+             suppressing further reports of this kind",
+            bytes.len()
+        );
+    }
+}
+
 fn encode_dgram(dgram: &PunchDatagram) -> Vec<u8> {
     proto::encode(dgram).unwrap_or_default()
 }
@@ -1415,12 +1487,20 @@ fn random_token() -> u64 {
 /// candidates - works as-is for same-LAN peers, and loopback is
 /// deliberately not filtered out since it's exactly what makes two
 /// same-machine sessions (tests, or two local clients) punch trivially.
-fn host_candidates(local_port: u16) -> Vec<SocketAddr> {
+///
+/// Only addresses matching the socket's own family are kept (`want_ipv6`).
+/// The session's socket is bound to one family for its whole life, and a
+/// `send_to` across families fails outright at the syscall - so an address
+/// of the other family is not a worse candidate, it is an impossible one,
+/// and advertising it only spends a slot of the peer's `CANDIDATES_MAX`.
+fn host_candidates(local_port: u16, want_ipv6: bool) -> Vec<SocketAddr> {
     if_addrs::get_if_addrs()
         .map(|ifaces| {
             ifaces
                 .into_iter()
-                .map(|iface| SocketAddr::new(iface.ip(), local_port))
+                .map(|iface| iface.ip())
+                .filter(|ip| ip.is_ipv6() == want_ipv6)
+                .map(|ip| SocketAddr::new(ip, local_port))
                 .collect()
         })
         .unwrap_or_default()

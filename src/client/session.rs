@@ -1027,17 +1027,25 @@ async fn handle_server_message(
             // channel with them).
             if !ui_state.known_users.contains_key(&user.id) {
                 check_identity(session, ui_state, &user);
-                // Start punching a direct link the moment we learn this
-                // peer exists rather than at first send (§7.1): voice is
-                // never queued, so a link still `Punching` when someone
-                // starts recording excludes that recipient outright. The
-                // gap between learning about a channel-mate and pressing
-                // Space is normally far longer than the handshake needs.
-                // Harmless unconditionally: `ensure_link` is a no-op on an
-                // existing link, and failure stays silent until something
-                // is actually queued against this peer.
-                session.peer_link.ensure_link(wr, user.id).await;
             }
+            // Start punching a direct link the moment we learn this peer
+            // exists rather than at first send (§7.1): voice is never
+            // queued, so a link still `Punching` when someone starts
+            // recording excludes that recipient outright. The gap between
+            // learning about a channel-mate and pressing Space is normally
+            // far longer than the handshake needs.
+            //
+            // Deliberately *outside* the `known_users` check above, unlike
+            // the identity pin: `known_users` is never removed from, but
+            // `UserOffline` does `peer_link.forget` them. Gating this on
+            // "first time we've seen this UserId" therefore left a peer who
+            // reconnected after any blip - including a heartbeat timeout on
+            // a slow link (§4.1) - with no link and nothing to re-arm it,
+            // showing as a permanently `Connecting` (yellow) name while
+            // nothing was actually being punched. Harmless unconditionally:
+            // `ensure_link` is a no-op on an existing link, and failure
+            // stays silent until something is actually queued against them.
+            session.peer_link.ensure_link(wr, user.id).await;
             ui_state.on_user_joined(&channel, user);
         }
         ServerMessage::UserLeft { channel, user_id } => {
