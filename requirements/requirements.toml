@@ -1054,6 +1054,26 @@ id = "TB-117"
 description = "Resolving a peer's identity review programmatically, not through the popup, removes that specific peer from the review queue wherever it is, not only when it's the one currently shown - a second peer's review can resolve while a first peer's review is still on screen without disturbing it."
 evidence = "test a_silently_resolved_review_is_removed_even_when_it_is_not_the_one_shown"
 
+[[user_story.acceptance_criteria]]
+id = "AC-164"
+description = "Each machine generates a random 50-character device id the first time it's needed and reuses it for every later session (~/.aloo/d_id) - never regenerated once the file exists."
+evidence = "docs/PROTOCOL.md 12.7; src/client/device_id.rs load_or_create; tests creates_a_50_character_lowercase_hex_id_when_the_file_is_missing, reuses_the_existing_id_instead_of_regenerating"
+
+[[user_story.acceptance_criteria]]
+id = "AC-165"
+description = "A peer's device id is sent encrypted (Content::DeviceIdAnnounce, sealed per-recipient like any other content) once their direct link reaches Active, and, together with the address the link reaches them at, is recorded against their pinned key - refreshed on every later Active transition, not just the first."
+evidence = "docs/PROTOCOL.md 12.7; src/client/session.rs send_device_id_announce, on_device_id_announce, maybe_resolve_p2p_identity_data, src/client/idstore.rs IdStore::set_last_seen; tests device_id_announce_travels_encrypted_and_decrypts_on_arrival, set_last_seen_records_address_and_device_id_for_a_pinned_nickname, last_seen_survives_a_save_and_load_round_trip"
+
+[[user_story.acceptance_criteria]]
+id = "AC-166"
+description = "A key mismatch still gates messaging with that peer the instant it's detected, but the Accept/Reject popup itself is withheld until this connection's own address/device id are known (or punching gives up) - once shown, it states the last-known address/device id next to the new connection's, so the user has more to judge a key change by than two fingerprints alone."
+evidence = "docs/PROTOCOL.md 12.7; src/client/session.rs check_identity, reveal_pending_identity_review; src/client/tui/ui.rs begin_identity_review, reveal_identity_review; identity_pinning.feature 'A mismatch gates messaging immediately but withholds the review until the new connection is known'; tests a_begun_review_gates_messaging_but_shows_no_popup_yet, revealing_a_begun_review_shows_the_popup_and_chimes, revealing_a_review_that_was_never_begun_is_a_no_op, revealing_an_already_revealed_review_is_a_no_op_second_time, enter_on_a_still_awaiting_sidebar_member_does_not_open_anything"
+
+[[user_story.technical_behavior]]
+id = "TB-198"
+description = "IdStore's on-disk format gained two trailing, independently-optional columns (last-seen address, last-seen device id); a file written before they existed still loads correctly, with both read back as None."
+evidence = "test a_store_without_last_seen_columns_still_loads"
+
 # ============================================================================
 # US-018 - See system and connection health at a glance
 # ============================================================================

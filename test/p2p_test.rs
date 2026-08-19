@@ -14,6 +14,9 @@ use aloo::client::p2p::{
     LINK_IDLE_TIMEOUT, LinkStatus, P2pEvent, PENDING_MAX_AGE, PeerLinkManager,
     RETRY_BASE, RETRY_MAX, REFLEXIVE_REFRESH_INTERVAL, SIGNAL_TIMEOUT,
 };
+use aloo::crypto;
+use rand_core::OsRng;
+use rsa::RsaPrivateKey;
 use aloo::p2p_proto::{P2pPayload, PunchDatagram, RendezvousMessage};
 use aloo::proto::*;
 use aloo::server::{AuthConfig, serve_with_rendezvous};
@@ -227,6 +230,139 @@ async fn direct_link_handshake_and_reliable_message_end_to_end() {
     // Nothing should ever have reached the server-relay path for this
     // content - only the two PeerCandidates exchanges above went over TCP.
     let _ = a_events_rx.try_recv(); // no assertion needed; just avoid an unused warning
+}
+
+/// A device id (docs/PROTOCOL.md §12.7) travels exactly like any other
+/// content: `P2pPayload::DeviceIdAnnounce` carries a per-recipient
+/// RSA-OAEP-sealed `Envelope` (`Content::DeviceIdAnnounce`), delivered
+/// reliably over the punched link like a text message, never as plaintext
+/// on the wire. This is the wire/crypto layer alone - `session.rs`'s
+/// automatic send-on-Active and decrypt-on-arrival orchestration around it
+/// isn't reachable from here (it lives on `SessionState`, not
+/// `PeerLinkManager`).
+///
+/// @requirement AC-165
+#[tokio::test]
+async fn device_id_announce_travels_encrypted_and_decrypts_on_arrival() {
+    let server_addr = spawn_test_server().await;
+
+    let mut a = ControlEndpoint::new(TcpStream::connect(server_addr).await.unwrap());
+    let alice_id = handshake(&mut a, "alice").await;
+    let mut b = ControlEndpoint::new(TcpStream::connect(server_addr).await.unwrap());
+    let bob_id = handshake(&mut b, "bob").await;
+
+    let (a_events_tx, _a_events_rx) = tokio::sync::mpsc::unbounded_channel::<P2pEvent>();
+    let (b_events_tx, mut b_events_rx) = tokio::sync::mpsc::unbounded_channel::<P2pEvent>();
+    let (mut alice, a_socket) =
+        PeerLinkManager::bind("127.0.0.1:0".parse().unwrap(), server_addr, a_events_tx)
+            .await
+            .unwrap();
+    let (mut bob, b_socket) =
+        PeerLinkManager::bind("127.0.0.1:0".parse().unwrap(), server_addr, b_events_tx)
+            .await
+            .unwrap();
+
+    let (a_raw_tx, mut a_raw_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (b_raw_tx, mut b_raw_rx) = tokio::sync::mpsc::unbounded_channel();
+    aloo::client::p2p::spawn_receive_loop(a_socket, server_addr, a_raw_tx);
+    aloo::client::p2p::spawn_receive_loop(b_socket, server_addr, b_raw_tx);
+
+    alice.ensure_link(&mut a, bob_id).await;
+    let ServerMessage::PeerCandidates {
+        candidates, link_nonce, ..
+    } = b.recv().await.unwrap().unwrap()
+    else {
+        panic!("bob should receive alice's PeerCandidates");
+    };
+    bob.on_peer_candidates(&mut b, alice_id, candidates, link_nonce)
+        .await;
+    let ServerMessage::PeerCandidates {
+        candidates, link_nonce, ..
+    } = a.recv().await.unwrap().unwrap()
+    else {
+        panic!("alice should receive bob's PeerCandidates reply");
+    };
+    alice
+        .on_peer_candidates(&mut a, bob_id, candidates, link_nonce)
+        .await;
+
+    let both_active =
+        |a: &PeerLinkManager, b: &PeerLinkManager| a.is_active(bob_id) && b.is_active(alice_id);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while !both_active(&alice, &bob) {
+        if tokio::time::Instant::now() >= deadline {
+            panic!("loopback punch did not complete in time");
+        }
+        tokio::select! {
+            Some((addr, dgram)) = a_raw_rx.recv() => alice.on_inbound(addr, dgram),
+            Some((addr, dgram)) = b_raw_rx.recv() => bob.on_inbound(addr, dgram),
+            _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+    }
+
+    // Bob's keypair - small but big enough for a 50-byte device id under
+    // OAEP/SHA-256 (needs > 66 + 50 = 116 bytes of modulus; 1024 bits is
+    // 128 bytes), and much faster to generate than the production
+    // `RSA_KEY_BITS` (2048).
+    let bob_key = RsaPrivateKey::new(&mut OsRng, 1024).expect("keygen");
+    // Round-tripped through DER, exactly like the real send path: a
+    // sender only ever holds a peer's `public_key_der` bytes (from
+    // `UserInfo`), never a live key object.
+    let bob_public_der = crypto::public_key_to_der(&bob_key.to_public_key()).unwrap();
+    let bob_public = crypto::public_key_from_der(&bob_public_der).unwrap();
+    let alice_device_id = "a".repeat(50);
+
+    let blocks = crypto::encrypt_chunked(&bob_public, alice_device_id.as_bytes()).unwrap();
+    let envelope = Envelope {
+        content: Content::DeviceIdAnnounce,
+        blocks,
+    };
+    // Sanity check: the plaintext device id must not appear anywhere in
+    // the encoded wire bytes - proof this isn't accidentally sent as
+    // cleartext.
+    let wire_bytes = encode(&P2pPayload::DeviceIdAnnounce {
+        envelope: envelope.clone(),
+    })
+    .unwrap();
+    assert!(
+        !wire_bytes
+            .windows(alice_device_id.len())
+            .any(|w| w == alice_device_id.as_bytes()),
+        "the device id must never appear verbatim in the encoded frame"
+    );
+
+    alice.send_reliable_or_queue(bob_id, P2pPayload::DeviceIdAnnounce { envelope });
+
+    let received = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            tokio::select! {
+                Some((addr, dgram)) = a_raw_rx.recv() => alice.on_inbound(addr, dgram),
+                Some((addr, dgram)) = b_raw_rx.recv() => bob.on_inbound(addr, dgram),
+                Some(event) = b_events_rx.recv() => {
+                    if is_link_bookkeeping(&event) {
+                        continue;
+                    }
+                    return event;
+                }
+            }
+        }
+    })
+    .await
+    .expect("bob should receive alice's DeviceIdAnnounce within the timeout");
+
+    match received {
+        P2pEvent::DeviceIdAnnounce { from, envelope } => {
+            assert_eq!(from, alice_id);
+            assert_eq!(envelope.content, Content::DeviceIdAnnounce);
+            let plaintext = crypto::decrypt_chunked(&bob_key, &envelope.blocks).unwrap();
+            assert_eq!(
+                String::from_utf8(plaintext).unwrap(),
+                alice_device_id,
+                "bob must recover exactly alice's device id, unmodified"
+            );
+        }
+        _ => panic!("expected P2pEvent::DeviceIdAnnounce, got a different event"),
+    }
 }
 
 /// There is deliberately no relay fallback (`docs/PROTOCOL.md` §7.1): if a

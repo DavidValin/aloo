@@ -280,6 +280,17 @@ pub enum IdentityCase {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IdentityStatus {
+    /// Detected, but the popup itself is still withheld: this connection's
+    /// own address/device id (docs/PROTOCOL.md §12.7) haven't arrived yet
+    /// from the P2P handshake, and showing the review before they do would
+    /// give the user only half the picture. Never queued/shown
+    /// (`push_identity_review`/`reopen_identity_review` skip it), but
+    /// `is_trust_gated` is already true - messaging with this peer is
+    /// blocked from the moment the mismatch is detected, not from whenever
+    /// the popup happens to become visible. `reveal_identity_review`
+    /// (`session::reveal_pending_identity_review`) is what moves this to
+    /// `Pending` and actually opens the popup.
+    AwaitingPeerInfo,
     /// Detected, not yet decided - shown in the popup (now or once queued
     /// reviews ahead of it resolve) and blocks messaging like `Rejected`
     /// does in the meantime.
@@ -980,6 +991,51 @@ impl UiState {
         }
     }
 
+    /// Starts a mismatch review the instant it's detected, without
+    /// showing anything yet (`session::check_identity`'s mismatch arm) -
+    /// gates messaging with `peer` immediately (`is_trust_gated`), same as
+    /// `push_identity_review` does, but leaves the popup itself for
+    /// `reveal_identity_review` once this connection's address/device id
+    /// are known (docs/PROTOCOL.md §12.7). Never queued: `identity_review_open`
+    /// only ever shows the queue front, and this is deliberately kept out
+    /// of it until revealed.
+    pub fn begin_identity_review(&mut self, peer: UserId, nickname: String, case: IdentityCase) {
+        self.identity_reviews.insert(
+            peer,
+            IdentityReview {
+                nickname,
+                message: String::new(),
+                case,
+                status: IdentityStatus::AwaitingPeerInfo,
+            },
+        );
+    }
+
+    /// Finishes a review `begin_identity_review` started, once its caller
+    /// has a `message` worth showing (old vs. new address/device id
+    /// filled in) - moves it to `Pending`, queues it, and chimes exactly
+    /// as `push_identity_review` would have. Returns whether there was
+    /// actually an `AwaitingPeerInfo` review to reveal (`false` if `peer`
+    /// has no review, or it was already revealed/resolved) - a caller
+    /// only plays the chime on `true`, so this never re-alerts on a
+    /// second, later transition for the same peer.
+    pub fn reveal_identity_review(&mut self, peer: UserId, message: String) -> bool {
+        match self.identity_reviews.get_mut(&peer) {
+            Some(review) if review.status == IdentityStatus::AwaitingPeerInfo => {
+                review.message = message;
+                review.status = IdentityStatus::Pending;
+            }
+            _ => return false,
+        }
+        if !self.identity_review_queue.contains(&peer) {
+            self.identity_review_queue.push_back(peer);
+        }
+        if self.identity_review_queue.front() == Some(&peer) {
+            self.identity_review_focus = IdentityChoice::Reject;
+        }
+        true
+    }
+
     /// The review currently shown in the popup, if any.
     pub fn identity_review_open(&self) -> Option<&IdentityReview> {
         let peer = self.identity_review_queue.front()?;
@@ -1108,11 +1164,15 @@ impl UiState {
     }
 
     /// Re-opens the popup for an already-`Rejected` peer (Enter on their
-    /// red sidebar entry) - a no-op if they're not actually in review, or
-    /// already the one showing.
+    /// red sidebar entry) - a no-op if they're not actually in review,
+    /// already the one showing, or still `AwaitingPeerInfo` (there is
+    /// nothing to show yet; `is_trust_gated` already blocks messaging with
+    /// them in the meantime, and `reveal_identity_review` is what will
+    /// actually open this once it has something to display).
     pub(crate) fn reopen_identity_review(&mut self, peer: UserId) {
-        if !self.identity_reviews.contains_key(&peer) {
-            return;
+        match self.identity_reviews.get(&peer) {
+            Some(review) if review.status != IdentityStatus::AwaitingPeerInfo => {}
+            _ => return,
         }
         if self.identity_review_queue.front() == Some(&peer) {
             return;
@@ -2677,7 +2737,11 @@ fn render_identity_review_popup(
     focus: IdentityChoice,
 ) {
     let title = format!("Identity review: {}", review.nickname);
-    let popup = centered_rect(64, 9, area);
+    // Taller than the other single-button popups (64x9): the message now
+    // also carries the last-known vs. new address/device id
+    // (docs/PROTOCOL.md §12.7), several lines longer than the original
+    // one-line fingerprint warning.
+    let popup = centered_rect(70, 13, area);
     let block = Block::default().title(title).borders(Borders::ALL);
     let inner = block.inner(popup);
     frame.render_widget(block, popup);

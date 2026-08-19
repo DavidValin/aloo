@@ -25,6 +25,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use crate::crypto::{hex_decode, hex_encode};
@@ -92,10 +93,22 @@ impl Trust {
 struct Entry {
     key: Vec<u8>,
     trust: Trust,
+    /// Where this nickname's pinned key was last confirmed reachable over
+    /// the direct P2P link, and which device (`client::device_id`)
+    /// announced it - purely informational, shown alongside a fresh
+    /// connection's own address/device id in an impersonation review
+    /// popup (`session::check_identity`/`reveal_pending_identity_review`)
+    /// so a user judging a key change has more than two fingerprints to
+    /// go on. `None` until the first P2P link under this pin goes
+    /// `Active` - a pin just written from `Identify` (first sighting, or
+    /// an `Accept`) has no address yet.
+    last_addr: Option<SocketAddr>,
+    last_device_id: Option<String>,
 }
 
 /// A nickname -> full-public-key pinning store, backed by a small flat file
-/// (`nickname<TAB><hex-encoded DER><TAB><trust>` per line).
+/// (`nickname<TAB><hex-encoded DER><TAB><trust><TAB><last addr><TAB><last
+/// device id>` per line, the last two columns optionally empty).
 pub struct IdStore {
     path: PathBuf,
     entries: HashMap<String, Entry>,
@@ -124,21 +137,38 @@ impl IdStore {
         match fs::read_to_string(path) {
             Ok(contents) => {
                 for line in contents.lines() {
-                    // The trust column is optional on the way in: a store
-                    // written before it existed is read as trust-on-first-use
-                    // rather than discarded, since throwing away a user's
-                    // pins would lose real security, not just convenience.
-                    let Some((name, rest)) = line.split_once('\t') else {
+                    // The trust/addr/device-id columns are all optional on
+                    // the way in: a store written before one of them
+                    // existed is still read successfully (trust defaults
+                    // to trust-on-first-use, addr/device-id to "never seen
+                    // yet") rather than discarded, since throwing away a
+                    // user's pins would lose real security, not just
+                    // convenience.
+                    let mut fields = line.split('\t');
+                    let Some(name) = fields.next() else {
                         continue;
                     };
-                    let (hex, trust) = match rest.split_once('\t') {
-                        Some((hex, trust)) => (hex, Trust::parse(trust).unwrap_or_default()),
-                        None => (rest, Trust::default()),
+                    let Some(hex) = fields.next() else {
+                        continue;
                     };
+                    let trust = fields.next().and_then(Trust::parse).unwrap_or_default();
+                    let last_addr = fields
+                        .next()
+                        .filter(|s| !s.is_empty())
+                        .and_then(|s| s.parse().ok());
+                    let last_device_id = fields.next().filter(|s| !s.is_empty()).map(str::to_string);
                     if is_storable(name)
                         && let Some(der) = hex_decode(hex)
                     {
-                        entries.insert(name.to_string(), Entry { key: der, trust });
+                        entries.insert(
+                            name.to_string(),
+                            Entry {
+                                key: der,
+                                trust,
+                                last_addr,
+                                last_device_id,
+                            },
+                        );
                     }
                 }
             }
@@ -180,11 +210,22 @@ impl IdStore {
             (Some(prev), Trust::Tofu) => prev.trust,
             _ => trust,
         };
+        // A re-pin (Accept, or a proven-continuous rotation) keeps
+        // whatever address/device id was already recorded rather than
+        // wiping it back to `None` - that metadata describes the
+        // relationship, not any one key, and `set_last_seen` is what
+        // actually refreshes it once the new key's own link goes Active.
+        let (last_addr, last_device_id) = previous
+            .as_ref()
+            .map(|prev| (prev.last_addr, prev.last_device_id.clone()))
+            .unwrap_or_default();
         self.entries.insert(
             nickname.to_string(),
             Entry {
                 key: public_key_der.to_vec(),
                 trust,
+                last_addr,
+                last_device_id,
             },
         );
         match previous {
@@ -243,8 +284,50 @@ impl IdStore {
             out.push_str(&hex_encode(&entry.key));
             out.push('\t');
             out.push_str(entry.trust.as_str());
+            out.push('\t');
+            if let Some(addr) = entry.last_addr {
+                out.push_str(&addr.to_string());
+            }
+            out.push('\t');
+            if let Some(id) = &entry.last_device_id {
+                out.push_str(id);
+            }
             out.push('\n');
         }
         fs::write(&self.path, out)
+    }
+
+    /// The address `nickname`'s pinned key was last confirmed reachable at
+    /// over the direct P2P link - `None` if that has never happened yet
+    /// (or `nickname` isn't pinned at all). See `Entry::last_addr`'s doc.
+    pub fn last_addr(&self, nickname: &str) -> Option<SocketAddr> {
+        self.entries.get(nickname)?.last_addr
+    }
+
+    /// The device id `nickname`'s pinned key last announced alongside
+    /// `last_addr` - see that method's doc.
+    pub fn last_device_id(&self, nickname: &str) -> Option<&str> {
+        self.entries.get(nickname)?.last_device_id.as_deref()
+    }
+
+    /// Records where, and which device, `nickname`'s *currently pinned*
+    /// key was just confirmed reachable at - called once its P2P link
+    /// goes `Active` (`session.rs`'s `LinkStatusChanged` handling) or once
+    /// an impersonation review is `Accept`ed. A no-op if `nickname` isn't
+    /// pinned (nothing to attach this to yet - it becomes meaningful the
+    /// moment `check_and_pin`/`check_and_pin_with` first pins them).
+    /// `device_id` is peer-supplied over the wire, exactly like a
+    /// nickname is, so it's validated with the same `is_storable` guard
+    /// before being written to this flat file; an unstorable value is
+    /// silently dropped rather than failing the whole update, leaving
+    /// whatever address was passed in still recorded.
+    pub fn set_last_seen(&mut self, nickname: &str, addr: SocketAddr, device_id: &str) {
+        let Some(entry) = self.entries.get_mut(nickname) else {
+            return;
+        };
+        entry.last_addr = Some(addr);
+        if is_storable(device_id) {
+            entry.last_device_id = Some(device_id.to_string());
+        }
     }
 }

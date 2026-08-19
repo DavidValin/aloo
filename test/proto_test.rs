@@ -162,6 +162,28 @@ fn content_file_offer_envelope_roundtrips() {
     }
 }
 
+/// `Content::DeviceIdAnnounce`, carried by `P2pPayload::DeviceIdAnnounce` -
+/// a peer's device id, encrypted the same way any other content is
+/// (docs/PROTOCOL.md §12.7). Round-trips exactly like `Text`/`FileOffer`.
+///
+/// @requirement AC-165
+#[test]
+fn content_device_id_announce_envelope_roundtrips() {
+    let env = Envelope {
+        content: Content::DeviceIdAnnounce,
+        blocks: vec![vec![7, 7, 7]],
+    };
+    let msg = P2pPayload::DeviceIdAnnounce {
+        envelope: env.clone(),
+    };
+    let bytes = encode(&msg).unwrap();
+    let decoded: P2pPayload = decode(&bytes).unwrap();
+    match decoded {
+        P2pPayload::DeviceIdAnnounce { envelope } => assert_eq!(envelope, env),
+        _ => panic!("wrong variant"),
+    }
+}
+
 /// @requirement TB-143
 #[test]
 fn request_peer_link_and_peer_candidates_roundtrip() {

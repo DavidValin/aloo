@@ -171,6 +171,16 @@ pub(crate) struct SessionState {
     /// saved synchronously after every mutation - see
     /// `client::otp_mail_store`'s module doc.
     pub(crate) otp_mail_store: crate::client::otp_mail_store::OtpMailStore,
+    /// This machine's own `client::device_id` (`~/.aloo/d_id`) - sent,
+    /// encrypted, to every peer once their link reaches `Active`
+    /// (`send_device_id_announce`), purely so it can be shown in an
+    /// impersonation review (docs/PROTOCOL.md §12.7).
+    pub(crate) own_device_id: String,
+    /// The device id each peer has announced, decrypted from their
+    /// `Content::DeviceIdAnnounce` (`P2pEvent::DeviceIdAnnounce`). Never
+    /// cleared - a peer's device id doesn't change mid-session just
+    /// because their link flaps and re-punches.
+    pub(crate) peer_device_ids: HashMap<UserId, String>,
 }
 
 // `key_mode` pushed this past clippy's default 7-argument threshold;
@@ -242,6 +252,18 @@ pub(crate) async fn run_connected_session(
     } else {
         SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), 0)
     };
+    // `~/.aloo/d_id` - generated once, on whichever session first needs it,
+    // and reused for the machine's whole lifetime (`docs/PROTOCOL.md`
+    // §12.7). A failure to load/create it is not fatal - the direct link
+    // itself doesn't depend on it at all, it just leaves an impersonation
+    // review with less to compare against - so this falls back to an
+    // empty string (`display_device_id` renders that as "unknown") rather
+    // than refusing to connect.
+    let own_device_id = crate::client::device_id::load_or_create(&crate::client::device_id::default_path())
+        .unwrap_or_else(|e| {
+            eprintln!("aloo: failed to load/create device id: {e} (continuing without one)");
+            String::new()
+        });
     let (p2p_events_tx, mut p2p_events_rx) = tokio::sync::mpsc::unbounded_channel::<P2pEvent>();
     let (peer_link, p2p_socket) = PeerLinkManager::bind(bind_addr, server_addr, p2p_events_tx)
         .await
@@ -321,6 +343,8 @@ pub(crate) async fn run_connected_session(
                 crate::client::otp_mail_store::OtpMailStore::default_dir(),
             )
         }),
+        own_device_id,
+        peer_device_ids: HashMap::new(),
     };
 
     let mut ui_state = UiState::new(display_name);
@@ -730,6 +754,21 @@ async fn handle_ui_action(
                 session
                     .id_store
                     .check_and_pin(&review.nickname, &new_public_key_der);
+                // The address/device id this connection was actually
+                // reviewed under (docs/PROTOCOL.md §12.7) - known by now,
+                // since the review was only ever revealed once punching
+                // resolved (`reveal_pending_identity_review`). Recorded
+                // against the freshly re-pinned key so the *next* mismatch
+                // for this nickname has something other than "unknown" to
+                // compare against.
+                if let (Some(addr), Some(device_id)) = (
+                    session.peer_link.active_addr(peer),
+                    session.peer_device_ids.get(&peer).cloned(),
+                ) {
+                    session
+                        .id_store
+                        .set_last_seen(&review.nickname, addr, &device_id);
+                }
                 if let Err(e) = session.id_store.save() {
                     eprintln!("aloo: failed to save id_store: {e}");
                 }
@@ -1208,17 +1247,45 @@ async fn handle_p2p_event(
         }
         P2pEvent::LinkStatusChanged { peer, status } => {
             ui_state.set_link_status(peer, status);
-            if status == p2p::LinkStatus::Active {
-                // A send whose ciphertext already left the machine is
-                // recovered via `otp --recover-last`, never re-encoded -
-                // this is the one place that retry gets triggered, on every
-                // genuine reachability transition (reconnect, link flap,
-                // this app's own restart once the link comes back up).
-                // Scans every OTP contact with something outstanding, not
-                // just `peer` - cheap (a handful of contacts at most) and
-                // opportunistically recovers anyone else reachable too.
-                crate::client::otp::recover_and_resend(wr, session, ui_state).await?;
+            match status {
+                p2p::LinkStatus::Active => {
+                    // A send whose ciphertext already left the machine is
+                    // recovered via `otp --recover-last`, never re-encoded -
+                    // this is the one place that retry gets triggered, on every
+                    // genuine reachability transition (reconnect, link flap,
+                    // this app's own restart once the link comes back up).
+                    // Scans every OTP contact with something outstanding, not
+                    // just `peer` - cheap (a handful of contacts at most) and
+                    // opportunistically recovers anyone else reachable too.
+                    crate::client::otp::recover_and_resend(wr, session, ui_state).await?;
+
+                    // Tells `peer` our own device id, encrypted, every time
+                    // the link reaches Active (idempotent - harmless on a
+                    // reconnect/flap, and covers the case they somehow
+                    // never got it the first time). Purely informational
+                    // (docs/PROTOCOL.md §12.7); silently does nothing if we
+                    // can't currently address them.
+                    send_device_id_announce(session, ui_state, peer);
+                    maybe_resolve_p2p_identity_data(session, ui_state, peer);
+                }
+                p2p::LinkStatus::Lost => {
+                    // Bounded by `PUNCH_TIMEOUT`/`SIGNAL_TIMEOUT` (`p2p.rs`'s
+                    // `tick_at`), so a review withheld by
+                    // `begin_identity_review` is never stuck open forever
+                    // behind a link that never punches through - it's
+                    // revealed here with "unknown" standing in for
+                    // whatever never arrived.
+                    if reveal_pending_identity_review(&session.id_store, ui_state, peer, None, None)
+                    {
+                        voice_stream::play_bell_chime(session);
+                    }
+                }
+                p2p::LinkStatus::Connecting => {}
             }
+        }
+        P2pEvent::DeviceIdAnnounce { from, envelope } => {
+            on_device_id_announce(session, ui_state, from, envelope);
+            maybe_resolve_p2p_identity_data(session, ui_state, from);
         }
         P2pEvent::OtpMessage {
             channel,
@@ -1350,26 +1417,24 @@ fn check_identity(session: &mut SessionState, ui_state: &mut UiState, user: &Use
                 }
                 Some(previous) => {
                     let previous_public_key_der = previous.to_vec();
-                    let message = format!(
-                        "'{}' connected with a different key than last time (was {}, now {}) - possible impersonation. Accept their new key, or reject it.",
-                        user.name,
-                        short_fingerprint(&crypto::fingerprint_der(&previous_public_key_der)),
-                        short_fingerprint(&crypto::fingerprint_der(&user.public_key_der)),
-                    );
-                    ui_state.push_identity_review(
+                    // The popup itself is withheld until this specific
+                    // connection's address/device id are known - see
+                    // `maybe_resolve_p2p_identity_data`, called once the
+                    // link reaches `Active` (the address) and once the
+                    // peer's encrypted `DeviceIdAnnounce` decrypts (the
+                    // device id), whichever lands second - or `Lost`, if
+                    // punching gives up on either (docs/PROTOCOL.md §12.7).
+                    // `begin_identity_review` still gates messaging with
+                    // this peer immediately (`is_trust_gated`) - only the
+                    // popup waits.
+                    ui_state.begin_identity_review(
                         user.id,
                         user.name.clone(),
-                        message,
                         IdentityCase::StaticMismatch {
                             new_public_key_der: user.public_key_der.clone(),
                             previous_public_key_der,
                         },
                     );
-                    // Every popup that lands asking for a decision chimes,
-                    // exactly as an incoming file offer already does - a
-                    // blocking question that arrived silently is easy to
-                    // sit unnoticed behind whatever the user was reading.
-                    voice_stream::play_bell_chime(session);
                 }
             }
         }
@@ -1386,6 +1451,177 @@ fn check_identity(session: &mut SessionState, ui_state: &mut UiState, user: &Use
 /// glance, without wrapping a 64-character hex string across the screen.
 fn short_fingerprint(fp: &str) -> &str {
     fp.get(..16).unwrap_or(fp)
+}
+
+/// Finishes a mismatch review `check_identity` started with
+/// `begin_identity_review`, once this specific connection's P2P address
+/// and device id are known - or, on `Lost`, once punching has given up
+/// trying to learn them (docs/PROTOCOL.md §12.7). Called from
+/// `handle_p2p_event`'s `LinkStatusChanged` arm for both transitions, so
+/// the review is never stuck open forever behind a link that never
+/// punches through. A no-op (returns `false`) if `peer` has no pending
+/// `AwaitingPeerInfo` review - the common case, since most `UserJoined`
+/// sightings never mismatch at all.
+///
+/// The "last known" half is read from `id_store` rather than snapshotted
+/// at detection time: nothing overwrites it in the meantime, since
+/// `maybe_resolve_p2p_identity_data` - the only other place that would
+/// (`record_last_seen`) - reveals this same review instead of recording
+/// over it, for as long as it stays pending.
+fn reveal_pending_identity_review(
+    id_store: &idstore::IdStore,
+    ui_state: &mut UiState,
+    peer: UserId,
+    new_addr: Option<SocketAddr>,
+    new_device_id: Option<&str>,
+) -> bool {
+    let Some(review) = ui_state.identity_reviews.get(&peer) else {
+        return false;
+    };
+    if review.status != ui::IdentityStatus::AwaitingPeerInfo {
+        return false;
+    }
+    let IdentityCase::StaticMismatch {
+        new_public_key_der,
+        previous_public_key_der,
+    } = &review.case;
+    let nickname = review.nickname.clone();
+    let message = format!(
+        "'{nickname}' connected with a different key than last time (was {}, now {}) - possible impersonation.\nLast known from {} (device {}).\nNow connecting from {} (device {}).\nAccept their new key, or reject it.",
+        short_fingerprint(&crypto::fingerprint_der(previous_public_key_der)),
+        short_fingerprint(&crypto::fingerprint_der(new_public_key_der)),
+        display_addr(id_store.last_addr(&nickname)),
+        display_device_id(id_store.last_device_id(&nickname)),
+        display_addr(new_addr),
+        display_device_id(new_device_id),
+    );
+    ui_state.reveal_identity_review(peer, message)
+}
+
+fn display_addr(addr: Option<SocketAddr>) -> String {
+    addr.map(|a| a.to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn display_device_id(id: Option<&str>) -> String {
+    match id {
+        Some(id) if !id.is_empty() => id.to_string(),
+        _ => "unknown".to_string(),
+    }
+}
+
+/// Refreshes `nickname`'s last-seen address/device id in `id_store` and
+/// saves synchronously - called once both are known for a peer with no
+/// mismatch review pending (`maybe_resolve_p2p_identity_data`). By this
+/// point `check_identity` has always already pinned `nickname` (it runs
+/// before `ensure_link` ever starts punching), so this only stays a no-op
+/// in the edge case `IdStore::set_last_seen` itself documents: an
+/// unstorable nickname that was never actually written to the store.
+fn record_last_seen(session: &mut SessionState, nickname: &str, addr: SocketAddr, device_id: &str) {
+    session.id_store.set_last_seen(nickname, addr, device_id);
+    if let Err(e) = session.id_store.save() {
+        eprintln!("aloo: failed to save id_store: {e}");
+    }
+}
+
+/// Sends `peer` our own device id (`SessionState::own_device_id`),
+/// encrypted the same way any other per-recipient content is
+/// (`Content::DeviceIdAnnounce`) - called every time their link reaches
+/// `Active` (`handle_p2p_event`'s `LinkStatusChanged` arm). Silently does
+/// nothing if we can't currently address them
+/// (`keymode_policy::can_address`) or encryption fails for any other
+/// reason - purely informational, so there is nothing to recover or retry
+/// here beyond the automatic resend this function already gets on the
+/// next `Active` transition (a link flap, a later rotation).
+///
+/// Deliberately bypasses `SessionState::remote_keys`' fresh-key
+/// queueing (`rekey::RemoteKeys`, docs/PROTOCOL.md §11.1): that gate
+/// exists to pace a *user's* sends against a rotating peer, and consuming
+/// its one-shot bootstrap freshness with this automatic message would
+/// delay the user's own first real message until the next rotation. This
+/// sends immediately with whichever key (bootstrap or latest rotated) is
+/// currently on file for them, same as `otp::recover_and_resend` already
+/// does opportunistically on every `Active` transition.
+fn send_device_id_announce(session: &mut SessionState, ui_state: &UiState, peer: UserId) {
+    let Some(user) = ui_state.known_users.get(&peer) else {
+        return;
+    };
+    if !crate::client::keymode_policy::can_address(user.key_mode, session.own_key_mode) {
+        return;
+    }
+    let key_mode = user.key_mode;
+    let pubkey_der = user.public_key_der.clone();
+    let send_id = session.next_stream_id;
+    session.next_stream_id += 1;
+    let Some(envelope) = crate::client::envelope::encrypt_envelope_for(
+        session.own_pq_private.as_ref(),
+        session.pq_peer_keys.encap_for(peer),
+        key_mode,
+        &pubkey_der,
+        None,
+        send_id,
+        session.own_device_id.as_bytes(),
+        Content::DeviceIdAnnounce,
+    ) else {
+        return;
+    };
+    session
+        .peer_link
+        .send_reliable_or_queue(peer, P2pPayload::DeviceIdAnnounce { envelope });
+    request_rotation(session, peer);
+}
+
+/// Decrypts `from`'s `Content::DeviceIdAnnounce` (`P2pEvent::DeviceIdAnnounce`)
+/// and caches the result in `SessionState::peer_device_ids`. Processed
+/// unconditionally, regardless of any pending trust gate on `from` - this
+/// is exactly the data an impersonation review needs to resolve, not
+/// visible chat content subject to §12.4's hold-and-reveal. Silently does
+/// nothing on any failure (unknown sender, decrypt failure, non-UTF-8
+/// plaintext, or a mislabeled `envelope.content`) - there is no user-facing
+/// consequence beyond the review continuing to show "unknown" for this
+/// peer's device id.
+fn on_device_id_announce(session: &mut SessionState, ui_state: &UiState, from: UserId, envelope: Envelope) {
+    if envelope.content != Content::DeviceIdAnnounce {
+        return;
+    }
+    let Some(sender) = ui_state.known_users.get(&from).cloned() else {
+        return;
+    };
+    let Some(plaintext) = decrypt_own_envelope(&envelope, from, &sender, None, session) else {
+        return;
+    };
+    let Ok(device_id) = String::from_utf8(plaintext) else {
+        return;
+    };
+    session.peer_device_ids.insert(from, device_id);
+}
+
+/// Checks whether `peer`'s address (`PeerLinkManager::active_addr`) and
+/// device id (`SessionState::peer_device_ids`, from `on_device_id_announce`)
+/// are *both* now known, and if so either reveals a pending mismatch
+/// review (`reveal_pending_identity_review`) or, the ordinary case,
+/// refreshes their pinned key's last-seen values (`record_last_seen`). A
+/// no-op otherwise - called from both `LinkStatusChanged`'s `Active` arm
+/// and `DeviceIdAnnounce`'s arm, since those two pieces of information
+/// arrive independently and can race either way; whichever event
+/// completes the pair is the one that actually acts.
+fn maybe_resolve_p2p_identity_data(session: &mut SessionState, ui_state: &mut UiState, peer: UserId) {
+    let Some(addr) = session.peer_link.active_addr(peer) else {
+        return;
+    };
+    let Some(device_id) = session.peer_device_ids.get(&peer).cloned() else {
+        return;
+    };
+    if reveal_pending_identity_review(&session.id_store, ui_state, peer, Some(addr), Some(&device_id)) {
+        voice_stream::play_bell_chime(session);
+    } else {
+        let nickname = ui_state
+            .known_users
+            .get(&peer)
+            .map(|u| u.name.clone())
+            .unwrap_or_default();
+        record_last_seen(session, &nickname, addr, &device_id);
+    }
 }
 
 /// Installs a `pq_hybrid` peer's offer of fresh encryption keys (§13.10),

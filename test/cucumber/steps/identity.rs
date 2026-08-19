@@ -167,6 +167,37 @@ async fn identity_mismatches(w: &mut AlooWorld, name: String) {
     w.ui_mut().push_identity_review(id, name, message, case);
 }
 
+/// Simulates `session::check_identity`'s mismatch arm calling
+/// `begin_identity_review` instead of `push_identity_review` -
+/// (docs/PROTOCOL.md §12.7): the review exists and gates messaging, but
+/// nothing is shown yet, mirroring the real gap between detecting a
+/// mismatch and the P2P handshake delivering this connection's own
+/// address/device id.
+#[when(expr = "{word}'s identity mismatches but the new connection is not yet known")]
+async fn identity_mismatches_pending(w: &mut AlooWorld, name: String) {
+    let id = UserId(id_for(&name));
+    let case = IdentityCase::StaticMismatch {
+        new_public_key_der: b"new-key".to_vec(),
+        previous_public_key_der: b"old-key".to_vec(),
+    };
+    w.ui_mut().begin_identity_review(id, name, case);
+}
+
+/// Simulates `session::reveal_pending_identity_review` finishing what
+/// `identity_mismatches_pending` started, once this connection's
+/// address/device id are known.
+#[when(expr = "{word}'s new connection becomes known")]
+async fn identity_review_revealed(w: &mut AlooWorld, name: String) {
+    let id = UserId(id_for(&name));
+    let message = format!(
+        "'{name}' connected with a different key than last time (was aaaaaaaaaaaaaaaa, now bbbbbbbbbbbbbbbb) - possible impersonation.\nLast known from 203.0.113.1:4000 (device old-device).\nNow connecting from 203.0.113.2:4000 (device new-device).\nAccept their new key, or reject it."
+    );
+    assert!(
+        w.ui_mut().reveal_identity_review(id, message),
+        "expected a pending AwaitingPeerInfo review for {name} to reveal"
+    );
+}
+
 /// A channel message from a peer whose review is still unresolved - held
 /// rather than shown (docs/PROTOCOL.md §12 "hold and reveal").
 #[when(expr = "{word} sends the channel message {string} while unresolved")]

@@ -57,6 +57,17 @@ Safety phrases and identity cards (§12.6) exist to close this, but they
 require the user to do something out of band. No protocol can fix this
 without an anchor outside itself.
 
+**A mismatch review's address/device id are unauthenticated hints, not
+evidence.** The impersonation review popup shows the address and
+self-reported device id a new connection announces (§12.7), alongside
+what was recorded last time - but a device id is exactly as trustworthy
+as a nickname: whoever holds the connection chooses what to send, so a
+deliberate impersonator can announce any device id, and an address is
+whatever NAT/network they happen to be behind that moment. Neither is
+checked against anything; both exist purely to give a human more context
+for a decision the key-mismatch signal already forced, not to make that
+decision for them.
+
 **The control channel is unauthenticated without a server key.** Under
 `--password` or open auth, the control channel is encrypted but a man in
 the middle can substitute their own offer. Only RSA auth (§5.3) gives the

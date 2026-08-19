@@ -76,6 +76,7 @@ falling back to a server relay (§7.1).
   - [12.4 What happens on a mismatch](#124-what-happens-on-a-mismatch)
   - [12.5 Store format and location](#125-store-format-and-location)
   - [12.6 Making a pin worth more than "these bytes differ"](#126-making-a-pin-worth-more-than-these-bytes-differ)
+  - [12.7 Device id and last-seen address](#127-device-id-and-last-seen-address)
 - [13. Post-quantum hybrid encryption (`pq_hybrid`)](#13-post-quantum-hybrid-encryption-pq_hybrid)
   - [13.1 Why this method, and why it looks different](#131-why-this-method-and-why-it-looks-different)
   - [13.2 Key material: an identity that stays, keys that move](#132-key-material-an-identity-that-stays-keys-that-move)
@@ -211,6 +212,7 @@ the payload carried inside a reliable or unreliable one.
 | `OtpFileContentSeq` | reliably | Names an accepted file's content-phase pad slot, independent of the offer's own (§16.2) |
 | `OtpVoiceOffer` | reliably | Offers a fully-recorded voice message under the pad layer - auto-accepted, no popup (§16.2) |
 | `OtpDeliveryAck` | reliably | Confirms an `OtpEnvelope`/`OtpFileOffer`/`OtpVoiceOffer` decoded, unblocking the next one (§16) |
+| `DeviceIdAnnounce` | reliably | This side's device id, sealed like any other content - sent automatically once `Active` (§12.7) |
 
 **Server UDP socket** — stateless, no user data.
 
@@ -1007,7 +1009,8 @@ ufrag/pwd plays.
 
 Each side sends `Ping{link_nonce}` to every one of the other's
 candidates in parallel, repeating every tick (~150ms) while unconfirmed.
-A `Ping` or `Pong` is attributed to a link by its *source address* where
+A `Ping` or `Pong` is attributed to a link by its
+*source address* where
 that is already known, and otherwise by its `link_nonce` against a link
 currently being established - and in that second case the source address
 is adopted as a **peer-reflexive candidate**, probed from then on like
@@ -1828,19 +1831,31 @@ reads the pinned key with a read of the store (which never mutates) rather than
 calling the pin-and-compare path (which always would), compares it by hand,
 and on a byte difference:
 
-1. Opens (or queues, if another peer's review is already showing - see
+1. Starts a review (`session::check_identity` calling
+   `UiState::begin_identity_review`) that immediately gates messaging (point
+   2) but shows nothing yet - the popup itself is withheld until this
+   specific connection's P2P address and device id are known, since showing
+   it any earlier would give the user only two fingerprints to judge a key
+   change by instead of the fuller picture §12.7 adds. Once punching
+   resolves - `Active` (usually within a second or two) or `Lost` (after
+   `PUNCH_TIMEOUT`/`SIGNAL_TIMEOUT`, §7.1, if it never punches through at
+   all) - `session::reveal_pending_identity_review` finishes the review and
+   opens (or queues, if another peer's review is already showing - see
    below) an on-screen popup naming the peer, e.g. `Identity review: alice`,
-   with the message `'alice' connected with a different key than last time
-   (was <fp>, now <fp>) - possible impersonation. Accept their new key, or
-   reject it.`, where each `<fp>` is a 16-hex-character prefix of
-   the fingerprint computed on-the-fly from the old and new key
-   bytes purely for compact display - the fingerprint itself is never
-   what's stored or compared (§12.2). Two buttons, `Accept` and `Reject`,
-   are shown; `Reject` is focused by default (the review buttons) so
-   accepting always takes a deliberate move off the safer default rather
-   than an accidental confirm. This is purely a local UI cue - it has no
-   wire-protocol meaning and isn't sent to or expected from peers.
-2. Gates messaging with that peer until the popup is resolved (see below) -
+   with a message of the form `'alice' connected with a different key than
+   last time (was <fp>, now <fp>) - possible impersonation.` followed by
+   the last-known and new address/device id (§12.7's exact wording), where
+   each `<fp>` is a 16-hex-character prefix of the fingerprint computed
+   on-the-fly from the old and new key bytes purely for compact display -
+   the fingerprint itself is never what's stored or compared (§12.2). Two
+   buttons, `Accept` and `Reject`, are shown; `Reject` is focused by default
+   (the review buttons) so accepting always takes a deliberate move off the
+   safer default rather than an accidental confirm. This is purely a local
+   UI cue - it has no wire-protocol meaning and isn't sent to or expected
+   from peers.
+2. Gates messaging with that peer from the moment the mismatch is detected
+   (not from whenever the popup happens to become visible) until it is
+   resolved (see below) -
    a real behavior change from the passive banner this replaced, which left
    §6-§11 completely unaffected. Specifically, while a peer's review is
    `Pending` or `Rejected` (the review status):
@@ -1860,12 +1875,14 @@ and on a byte difference:
    - Their sidebar entry renders red, taking priority over the usual
      green/offline-gray coloring.
 3. On `Accept` (`session.rs::handle_ui_action`'s `AcceptIdentity` arm):
-   pins the new key and **saves the store to disk immediately,
-   synchronously** (saving the store, same as the old immediate-save
-   policy) - the on-disk file reflects the new pinning the instant the
-   decision is made, not batched or deferred. Every message held per
-   point 2 is then revealed into the real log, in arrival order, and the
-   peer is fully trusted again (sidebar color, sending, everything).
+   pins the new key, records the address/device id this connection was
+   actually reviewed under as its last-seen values (§12.7), and **saves
+   the store to disk immediately, synchronously** (saving the store, same
+   as the old immediate-save policy) - the on-disk file reflects the new
+   pinning the instant the decision is made, not batched or deferred.
+   Every message held per point 2 is then revealed into the real log, in
+   arrival order, and the peer is fully trusted again (sidebar color,
+   sending, everything).
 4. On `Reject`: no `id_store` write at all - the previous pin (if any)
    is left exactly as it was on disk and in memory. The peer's review
    stays recorded (not discarded) so selecting them again re-opens the
@@ -1892,13 +1909,16 @@ byte difference reaches the review flow above.
 The store is a small flat file, one line per pinned nickname:
 
 ```
-<nickname><TAB><hex-encoded public_key_der>\n
+<nickname><TAB><hex-encoded public_key_der><TAB><trust><TAB><last addr><TAB><last device id>\n
 ```
 
-e.g. `alice\t30820122300d06092a864886f70d01010105000382010f00...\n` - the
-full DER bytes, lowercase-hex-encoded (lowercase hex, the same
+e.g. `alice\t30820122300d06092a864886f70d01010105000382010f00...\ttofu\t203.0.113.7:51820\t3f9a...\n` -
+the full DER bytes, lowercase-hex-encoded (lowercase hex, the same
 encoding the fingerprint already uses, not base64 or raw bytes) so
-the file stays plain text no matter what the key bytes are. Entries are written in sorted-by-nickname order on save so the
+the file stays plain text no matter what the key bytes are; `trust` is
+`tofu` or `verified` (§12.6); `last addr`/`last device id` are §12.7's
+last-seen values, either or both left empty until they have something to
+record. Entries are written in sorted-by-nickname order on save so the
 file diffs cleanly under version control or manual inspection.
 
 A nickname containing a tab, `\n`, or `\r` is never pinned (silently
@@ -1906,12 +1926,17 @@ treated as if it were a first-ever sighting, with nothing written) - a
 `display_name` is attacker-controlled input (any connected peer chooses
 their own), and accepting one containing the file's own field delimiter
 would let a remote peer inject spurious records into a purely local trust
-file. The key half has no such restriction - hex digits can't collide with
-either delimiter no matter what the underlying bytes are, so any
-DER-encodable key is always storable. A line whose key half fails to
-hex-decode (odd length, non-hex character - e.g. hand-editing damage) is
-skipped on load, same as a line missing the `\t` separator entirely -
-loading the store never fails the whole store over one bad line.
+file. `device_id` is announced by a peer the same way a nickname is, so
+it gets the same treatment: an unstorable one is silently dropped rather
+than written (§12.7). The key half has no such restriction - hex digits
+can't collide with either delimiter no matter what the underlying bytes
+are, so any DER-encodable key is always storable. A line whose key half
+fails to hex-decode (odd length, non-hex character - e.g. hand-editing
+damage) is skipped on load, same as a line missing the name or key
+column entirely; the trust/address/device-id columns are all
+independently optional on the way in (a store written before one of them
+existed, or with an empty field, still loads correctly) - loading the
+store never fails the whole store over one bad line or an older format.
 
 The path is set per-connection in the connect popup's `id_store` field
 (`docs/SPEC.md`'s "Not connected UI"), prefilled with `idstore::
@@ -2018,6 +2043,92 @@ that what arrived is what was sent.
 **What remains open.** None of this authenticates a first contact that
 arrives with no card and no prior pin; that is still trust-on-first-use,
 and the protocol has no way around it without an anchor outside itself.
+
+### 12.7 Device id and last-seen address
+
+Two more client-local, informational-only signals, purely to give a human
+more to go on when a mismatch review (§12.4) actually asks them to decide -
+neither one is trusted or checked by anything; they're just displayed. An
+address is never something that can be kept confidential in transit (it's
+the packet's own source, inherent to any IP communication - see §12.1's
+"what remains open" reasoning extended to this), but a device id is real
+payload, and it always travels sealed exactly like ordinary content -
+never in the clear, and never inside the punch handshake itself.
+
+**Device id.** Each installation generates a random 50-character
+lowercase-hex id the first time one is needed and reuses it for that
+machine's whole lifetime: `crypto::random_bytes(25)` hex-encoded, written
+to `~/.aloo/d_id` (`client::device_id::load_or_create`) and read back
+as-is on every later run rather than regenerated. Like a nickname, it is
+entirely self-reported by whoever holds it - nothing stops a modified
+client from lying about theirs - so it carries no security weight on its
+own; it exists only to give a human something else to eyeball.
+
+**`DeviceIdAnnounce`: sent encrypted, once a link is `Active`.** A new
+`Content::DeviceIdAnnounce` tag and `P2pPayload::DeviceIdAnnounce {
+envelope: Envelope }` (§7.1's `PunchDatagram::Reliable`, exactly like a
+text message or file offer) carry it - `envelope`'s plaintext is just the
+device id's raw UTF-8 bytes, sealed per-recipient with whichever scheme
+the recipient's `KeyMode` uses (RSA-OAEP, or the `pq_hybrid` one-chunk
+send, §13), the same `envelope::encrypt_envelope_for` dispatch every
+other content type goes through. The punch handshake itself
+(`Ping`/`Pong`) carries no device id at all - deliberately kept out of
+that layer, which has no notion of recipient keys - so a device id is
+only ever sent once the link reaches `Active` and the peer's key is
+already known (from `Identify`/`UserJoined`, over the TCP control
+channel). Sent automatically, unprompted, every time a link reaches
+`Active` (`session::send_device_id_announce`) - idempotent, and cheap
+enough that a link flap simply resends it. Silently skipped if this
+client cannot currently address the recipient (`keymode_policy::can_address`
+- the same partial-delivery rule every other content type follows) or
+encryption fails for any other reason; there is nothing to retry beyond
+the automatic resend the next `Active` transition already gives it.
+
+On arrival, `session::on_device_id_announce` decrypts it (independent of
+any trust gate on the sender - this is exactly the data an impersonation
+review needs to resolve, not visible chat content subject to §12.4's
+hold-and-reveal) and caches the plaintext. Processed unconditionally on
+both sides regardless of who initiated the mismatch review, if any.
+
+**Last-seen address/device id.** Once *both* a peer's direct link is
+`Active` (the address) and their `DeviceIdAnnounce` has decrypted (the
+device id) - the two arrive independently and may race either way, so
+whichever happens second is what actually acts
+(`session::maybe_resolve_p2p_identity_data`) - they are recorded against
+their *currently pinned* key in `id_store`
+(§12.5's trailing two columns), refreshed on every later `Active`
+transition for that same pin, not just the first. This deliberately does
+**not** happen while a mismatch review for that peer is still outstanding
+(`AwaitingPeerInfo`/`Pending`): the review needs to compare against
+whatever was recorded *before* this connection, so nothing overwrites it
+until the user actually `Accept`s (at which point the newly-reviewed
+connection's address/device id become the new last-seen values, per
+§12.4 point 3).
+
+**How this shows up in a mismatch review.** §12.4's mismatch popup message
+gets two more lines, one for each side of the comparison:
+
+```
+Last known from <addr> (device <id>).
+Now connecting from <addr> (device <id>).
+```
+
+The "last known" half is read straight from `id_store` - whatever was
+recorded the last time this nickname's *previous* key went `Active`,
+`unknown` if that never happened (e.g. the pin was set by an
+`--export-identity-card` import, §12.6, rather than a live connection).
+The "new" half is this specific connection's own values, which is why the
+review itself is held open a moment before it's shown at all:
+`check_identity` detecting the mismatch only starts the review
+(`UiState::begin_identity_review`) and gates messaging with the peer
+immediately, exactly as before - the popup itself waits for
+`session::reveal_pending_identity_review`, called from
+`maybe_resolve_p2p_identity_data` once both pieces are known, or from the
+link going `Lost` (punching gave up before ever reaching `Active`, per
+`PUNCH_TIMEOUT`/`SIGNAL_TIMEOUT`, §7.1 - both new fields show `unknown`
+rather than leaving the review open forever). Every path reveals the
+review exactly once; a link that later flaps and re-punches does not
+re-reveal or re-chime.
 
 ## 13. Post-quantum hybrid encryption (`pq_hybrid`)
 

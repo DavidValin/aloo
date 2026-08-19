@@ -1,4 +1,5 @@
 use aloo::client::idstore::{IdCheck, IdStore, default_path};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 fn temp_store_path() -> PathBuf {
@@ -213,8 +214,110 @@ fn on_disk_format_is_hex_encoded_not_raw_or_base64() {
         store.save().unwrap();
     }
     let contents = std::fs::read_to_string(&path).unwrap();
-    // Third column is how much the pin is worth (docs/PROTOCOL.md 12.6);
+    // Third column is how much the pin is worth (docs/PROTOCOL.md 12.6) -
     // a fresh sighting is trusted-on-first-use until a human says more.
-    assert_eq!(contents, "alice\tdeadbeef\ttofu\n");
+    // The two trailing (empty) columns are last-seen address/device id
+    // (docs/PROTOCOL.md 12.7) - absent until this pin's key has gone
+    // `Active` over the direct link at least once.
+    assert_eq!(contents, "alice\tdeadbeef\ttofu\t\t\n");
     std::fs::remove_file(&path).ok();
+}
+
+// ---------------------------------------------------------------------
+// Last-seen address/device id (docs/PROTOCOL.md §12.7)
+// ---------------------------------------------------------------------
+
+/// @requirement AC-165
+#[test]
+fn last_addr_and_device_id_are_none_until_set() {
+    let path = temp_store_path();
+    let mut store = IdStore::load(&path).unwrap();
+    store.check_and_pin("alice", b"key-a");
+    assert_eq!(store.last_addr("alice"), None);
+    assert_eq!(store.last_device_id("alice"), None);
+}
+
+/// @requirement AC-165
+#[test]
+fn set_last_seen_is_a_no_op_for_an_unpinned_nickname() {
+    let path = temp_store_path();
+    let mut store = IdStore::load(&path).unwrap();
+    let addr: SocketAddr = "203.0.113.7:9999".parse().unwrap();
+    store.set_last_seen("nobody", addr, "some-device");
+    assert_eq!(store.last_addr("nobody"), None);
+    assert_eq!(store.last_device_id("nobody"), None);
+}
+
+/// @requirement AC-165
+#[test]
+fn set_last_seen_records_address_and_device_id_for_a_pinned_nickname() {
+    let path = temp_store_path();
+    let mut store = IdStore::load(&path).unwrap();
+    store.check_and_pin("alice", b"key-a");
+    let addr: SocketAddr = "203.0.113.7:9999".parse().unwrap();
+    store.set_last_seen("alice", addr, "alice-device");
+    assert_eq!(store.last_addr("alice"), Some(addr));
+    assert_eq!(store.last_device_id("alice"), Some("alice-device"));
+}
+
+/// @requirement AC-165
+#[test]
+fn set_last_seen_with_an_unstorable_device_id_leaves_it_unset() {
+    let path = temp_store_path();
+    let mut store = IdStore::load(&path).unwrap();
+    store.check_and_pin("alice", b"key-a");
+    let addr: SocketAddr = "203.0.113.7:9999".parse().unwrap();
+    // A tab is the on-disk field delimiter - a hostile peer's self-reported
+    // device id must not be able to inject a record into this local file.
+    store.set_last_seen("alice", addr, "evil\tid");
+    assert_eq!(store.last_addr("alice"), Some(addr), "address is still recorded");
+    assert_eq!(store.last_device_id("alice"), None);
+}
+
+/// @requirement AC-165
+#[test]
+fn last_seen_survives_a_save_and_load_round_trip() {
+    let path = temp_store_path();
+    let addr: SocketAddr = "[::1]:4242".parse().unwrap();
+    {
+        let mut store = IdStore::load(&path).unwrap();
+        store.check_and_pin("alice", b"key-a");
+        store.set_last_seen("alice", addr, "alice-device");
+        store.save().unwrap();
+    }
+    let store = IdStore::load(&path).unwrap();
+    assert_eq!(store.last_addr("alice"), Some(addr));
+    assert_eq!(store.last_device_id("alice"), Some("alice-device"));
+    std::fs::remove_file(&path).ok();
+}
+
+/// @requirement AC-165, TB-198
+#[test]
+fn a_store_without_last_seen_columns_still_loads() {
+    let path = temp_store_path();
+    // A file saved before this feature existed - only nickname/hex/trust.
+    std::fs::write(&path, "alice\t6b65792d61\ttofu\n").unwrap();
+    let store = IdStore::load(&path).expect("must still load");
+    assert_eq!(store.get("alice"), Some(b"key-a".as_slice()));
+    assert_eq!(store.last_addr("alice"), None);
+    assert_eq!(store.last_device_id("alice"), None);
+    std::fs::remove_file(&path).ok();
+}
+
+/// @requirement AC-165
+#[test]
+fn re_pinning_on_accept_keeps_the_previously_recorded_last_seen() {
+    let path = temp_store_path();
+    let mut store = IdStore::load(&path).unwrap();
+    store.check_and_pin("alice", b"key-a");
+    let addr: SocketAddr = "203.0.113.7:9999".parse().unwrap();
+    store.set_last_seen("alice", addr, "alice-device");
+    // A mismatch's Accept re-pins the new key via check_and_pin - the
+    // address/device id recorded under the old key isn't wiped by that
+    // alone; the caller (`session::handle_ui_action`'s `AcceptIdentity`
+    // arm) calls `set_last_seen` again right after with the connection
+    // it actually just reviewed.
+    store.check_and_pin("alice", b"key-b");
+    assert_eq!(store.last_addr("alice"), Some(addr));
+    assert_eq!(store.last_device_id("alice"), Some("alice-device"));
 }

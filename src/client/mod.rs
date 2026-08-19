@@ -1,5 +1,6 @@
 pub mod channel;
 pub mod connect;
+pub mod device_id;
 pub mod direct_message;
 pub mod envelope;
 pub mod file_browser;

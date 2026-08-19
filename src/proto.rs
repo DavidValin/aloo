@@ -295,6 +295,17 @@ pub enum Content {
     /// Always auto-accepted on arrival (`client::otp::on_voice_offer`) -
     /// unlike a file offer, there's no reject path.
     VoiceOffer,
+    /// Carries the sender's `client::device_id` as raw UTF-8 bytes -
+    /// purely informational (docs/PROTOCOL.md §12.7), shown in an
+    /// impersonation review popup next to the last one recorded for that
+    /// nickname. A distinct `Content` tag (rather than reusing `Text`)
+    /// keeps it out of the visible chat log dispatch path - like every
+    /// other `Content` variant, this tag itself is unauthenticated
+    /// metadata alongside the encrypted `blocks`, not part of any
+    /// signature (`session::on_device_id_announce` checks it defensively
+    /// before trusting the plaintext, same as any other receiver-side
+    /// sanity check).
+    DeviceIdAnnounce,
 }
 
 /// Messages the client sends to the server - pure signaling: auth,

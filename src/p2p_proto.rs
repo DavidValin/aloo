@@ -187,4 +187,13 @@ pub enum P2pPayload {
         seq: u64,
         envelope: Envelope,
     },
+    /// This side's `client::device_id`, encrypted the same way any other
+    /// per-recipient content is (`Content::DeviceIdAnnounce`'s plaintext is
+    /// just the id's raw UTF-8 bytes) - sent automatically the moment a
+    /// direct link reaches `Active`, purely so an impersonation review
+    /// (docs/PROTOCOL.md §12.7) has a device id to show. `channel: None`
+    /// always - this is never addressed to a channel.
+    DeviceIdAnnounce {
+        envelope: Envelope,
+    },
 }

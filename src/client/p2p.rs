@@ -224,6 +224,16 @@ pub enum P2pEvent {
         seq: u64,
         envelope: crate::proto::Envelope,
     },
+    /// A peer's `client::device_id`, still sealed - mirrors
+    /// `p2p_proto::P2pPayload::DeviceIdAnnounce`. `session.rs` decrypts it
+    /// with `decrypt_own_envelope` (its `Content::DeviceIdAnnounce` tag,
+    /// not `Text`, is what routes it here instead of the ordinary message
+    /// path) and feeds the plaintext into the impersonation-review flow
+    /// (docs/PROTOCOL.md §12.7) rather than any visible log.
+    DeviceIdAnnounce {
+        from: UserId,
+        envelope: crate::proto::Envelope,
+    },
 }
 
 /// Outgoing traffic originating on a background thread (the voice
@@ -1005,6 +1015,9 @@ impl PeerLinkManager {
                 seq,
                 envelope,
             },
+            P2pPayload::DeviceIdAnnounce { envelope } => {
+                P2pEvent::DeviceIdAnnounce { from, envelope }
+            }
         };
         let _ = self.events_tx.send(event);
     }

@@ -1357,6 +1357,92 @@ fn sending_a_channel_message_excludes_a_pending_or_rejected_member() {
     }
 }
 
+// ---------------------------------------------------------------------
+// Deferred identity review: begin/reveal (docs/PROTOCOL.md §12.7)
+// ---------------------------------------------------------------------
+
+/// @requirement AC-166
+#[test]
+fn a_begun_review_gates_messaging_but_shows_no_popup_yet() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.begin_identity_review(UserId(2), "bob".into(), static_mismatch());
+
+    assert!(
+        state.is_trust_gated(UserId(2)),
+        "messaging must be gated the instant a mismatch is detected"
+    );
+    assert!(
+        state.identity_review_open().is_none(),
+        "nothing should be shown until the review is revealed"
+    );
+    let rows = rendered_rows(&state);
+    assert!(
+        !rows.iter().any(|r| r.contains("Identity review")),
+        "no popup should render for an AwaitingPeerInfo review: {rows:?}"
+    );
+}
+
+/// @requirement AC-166
+#[test]
+fn revealing_a_begun_review_shows_the_popup_and_chimes() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.begin_identity_review(UserId(2), "bob".into(), static_mismatch());
+
+    let revealed = state.reveal_identity_review(UserId(2), "last known vs. new address".into());
+
+    assert!(revealed, "a pending AwaitingPeerInfo review must reveal");
+    assert_eq!(
+        state.identity_review_open().map(|r| r.nickname.as_str()),
+        Some("bob")
+    );
+    let rows = rendered_rows(&state);
+    assert!(
+        rows.iter().any(|r| r.contains("last known vs. new address")),
+        "expected the revealed message to render: {rows:?}"
+    );
+}
+
+/// @requirement AC-166
+#[test]
+fn revealing_a_review_that_was_never_begun_is_a_no_op() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    let revealed = state.reveal_identity_review(UserId(2), "message".into());
+    assert!(!revealed);
+    assert!(state.identity_review_open().is_none());
+}
+
+/// @requirement AC-166
+#[test]
+fn revealing_an_already_revealed_review_is_a_no_op_second_time() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.begin_identity_review(UserId(2), "bob".into(), static_mismatch());
+    assert!(state.reveal_identity_review(UserId(2), "first".into()));
+    // A second `LinkStatusChanged` for the same peer (e.g. the link later
+    // flaps and re-punches) must not re-reveal or re-chime.
+    assert!(!state.reveal_identity_review(UserId(2), "second".into()));
+    assert_eq!(
+        state.identity_review_open().map(|r| r.message.as_str()),
+        Some("first"),
+        "the message from the second call must not overwrite the first"
+    );
+}
+
+/// @requirement AC-166
+#[test]
+fn enter_on_a_still_awaiting_sidebar_member_does_not_open_anything() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.begin_identity_review(UserId(2), "bob".into(), static_mismatch());
+
+    state.focus = Focus::Sidebar;
+    state.sidebar_selected = 0;
+    press(&mut state, KeyCode::Enter);
+
+    assert!(
+        state.identity_review_open().is_none(),
+        "there is nothing to show yet, so Enter must not force it open"
+    );
+}
+
 /// @requirement TB-108
 #[test]
 fn help_popup_widens_enough_to_show_its_longest_line_without_clipping_it() {

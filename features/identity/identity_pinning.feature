@@ -105,3 +105,13 @@ Feature: Recognising a peer across reconnects
     And I press Enter
     Then the outgoing channel message excludes bob but includes carol
 
+  @AC-166
+  Scenario: A mismatch gates messaging immediately but withholds the review until the new connection is known
+    Given I am connected and viewing a channel
+    And bob is in the channel with me
+    When bob's identity mismatches but the new connection is not yet known
+    Then bob is still flagged as unverified
+    And no review popup is shown
+    When bob's new connection becomes known
+    Then a review popup names bob with Accept and Reject buttons
+

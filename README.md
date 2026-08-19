@@ -149,8 +149,9 @@ Nicknames aren't proof of identity — anyone could reconnect as "alice" the mom
 
 - The **first time** you see someone's nickname, aloo just trusts their key and quietly remembers it (pinned locally, never sent anywhere).
 - **Next time** they show up with the *same* key, nothing happens — it's silently confirmed as the same person.
-- If that nickname ever comes back with a **different, unrecognized key**, aloo stops and asks you: an identity review popup shows up with **Accept** or **Reject**. Until you decide, you can't send them anything, and any messages they send stay hidden instead of appearing in your log.
+- If that nickname ever comes back with a **different, unrecognized key**, aloo blocks messaging with them right away and, a moment later — as soon as it knows how to reach this new connection — asks you: an identity review popup shows up with **Accept** or **Reject**, naming not just both keys' fingerprints but also where each connection came from: `Last known from <address> (device <id>)` next to `Now connecting from <address> (device <id>)`, so you have more than two fingerprints to judge a key change by. Until you decide, you can't send them anything, and any messages they send stay hidden instead of appearing in your log.
 - **Accept** if you've confirmed it's really them (new device, lost their old key, etc.) — the new key is pinned from then on. **Reject** if you're not sure — nothing is trusted, and you can revisit the decision later by opening a chat with them again.
+- The "device" shown above is a random id aloo generates once per machine (`~/.aloo/d_id`) and reuses forever — purely informational, sent to peers only so it can show up in this popup.
 
 This only applies to identity types that actually stay the same across reconnects (`Password`, `PQ-Hybrid`) — the `None` type has no persistent identity to pin in the first place, so there's nothing to compare.
 

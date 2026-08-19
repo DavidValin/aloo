@@ -144,6 +144,10 @@ name = "idstore_test"
 path = "test/idstore_test.rs"
 
 [[test]]
+name = "device_id_test"
+path = "test/device_id_test.rs"
+
+[[test]]
 name = "settings_test"
 path = "test/settings_test.rs"
 
