@@ -451,9 +451,11 @@ pub struct ContactDetail {
 /// always `0` even for a contact that doesn't exist (also verified
 /// directly - the error lands on stderr with nothing on stdout), so a
 /// missing `Contact:` line, not the exit code, is what this treats as "no
-/// such contact".
+/// such contact". stdout is prefixed with a status line (`OK`) ahead of the
+/// `Contact:` block, so this looks for that line anywhere rather than
+/// requiring it first.
 fn parse_show_contact(text: &str) -> Option<ContactDetail> {
-    if !text.trim_start().starts_with("Contact:") {
+    if !text.lines().any(|line| line.trim_start().starts_with("Contact:")) {
         return None;
     }
     let mut d = ContactDetail::default();
