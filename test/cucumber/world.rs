@@ -274,7 +274,7 @@ pub struct AlooWorld {
     /// A live attach socket, and the session-input end of the daemon
     /// serving it, for the scenarios that drive a real attachment.
     pub daemon_socket: Option<std::path::PathBuf>,
-    pub daemon_client: Option<tokio::net::UnixStream>,
+    pub daemon_client: Option<aloo::client::daemon_ipc::ClientStream>,
     pub daemon_input_rx:
         Option<tokio::sync::mpsc::UnboundedReceiver<aloo::client::session::SessionInput>>,
     pub daemon_read_buf: Vec<u8>,

@@ -297,11 +297,11 @@ pub fn is_daemon_child() -> bool {
 /// than any single failed connection - so a bad connection is dropped and
 /// the loop continues.
 pub async fn serve_attachments(
-    listener: tokio::net::UnixListener,
+    mut listener: daemon_ipc::Listener,
     input_tx: tokio::sync::mpsc::UnboundedSender<SessionInput>,
 ) {
     loop {
-        let Ok((stream, _)) = listener.accept().await else {
+        let Ok(stream) = listener.accept().await else {
             continue;
         };
         // Sequential, not spawned: serving one connection to completion
@@ -322,7 +322,7 @@ pub async fn serve_attachments(
 
 /// Handles one attach connection from its first message to its last.
 async fn serve_one(
-    stream: tokio::net::UnixStream,
+    stream: daemon_ipc::Stream,
     input_tx: &tokio::sync::mpsc::UnboundedSender<SessionInput>,
 ) -> Result<(), BoxError> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1061,7 +1061,15 @@ impl DaemonPlan {
 /// and a `DaemonPlan`. Everything else - the handshake, the session loop,
 /// the UI state - is shared code, which is what keeps the two modes from
 /// drifting apart.
-pub async fn run(config: DaemonConfig) -> Result<(), BoxError> {
+///
+/// `hotkey_rx` is registered by the caller rather than here, because on
+/// macOS it can only be registered on the process's real main thread -
+/// see `main.rs`'s `with_global_ptt`. `None` means no global shortcut,
+/// which a daemon warns about below.
+pub async fn run(
+    config: DaemonConfig,
+    hotkey_rx: Option<tokio::sync::mpsc::UnboundedReceiver<crate::client::global_ptt::GlobalPttEvent>>,
+) -> Result<(), BoxError> {
     let instance =
         SingleInstance::acquire(daemon_ipc::socket_path(), daemon_ipc::pid_path()).await?;
     let listener = daemon_ipc::bind_listener(&daemon_ipc::socket_path())?;
@@ -1093,11 +1101,6 @@ pub async fn run(config: DaemonConfig) -> Result<(), BoxError> {
         .unwrap_or_else(|_| {
             crate::client::idstore::IdStore::new_empty(request.id_store_path.clone())
         });
-    let hotkey = crate::client::global_ptt::hotkey_to_register(&crate::settings::Settings::load_or_create(
-        &crate::settings::default_path(),
-    )
-    .unwrap_or_default());
-    let hotkey_rx = hotkey.and_then(crate::client::global_ptt::spawn);
     if hotkey_rx.is_none() {
         // Not fatal - the session is still worth running, and someone can
         // still attach and hold Space - but it is the one thing a daemon

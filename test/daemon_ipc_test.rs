@@ -374,7 +374,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Reads exactly one message from the daemon side of an attach socket.
 async fn read_one(
-    stream: &mut tokio::net::UnixStream,
+    stream: &mut daemon_ipc::ClientStream,
     buf: &mut Vec<u8>,
 ) -> DaemonMessage {
     let mut chunk = [0u8; 4096];

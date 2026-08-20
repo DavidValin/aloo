@@ -18,6 +18,11 @@ use aloo::validation;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
+/// Where `global_ptt` delivers presses of the global push-to-talk
+/// shortcut - `None` wherever the shortcut isn't running (turned off,
+/// Wayland, or registration lost the combo to someone else).
+type HotkeyReceiver = tokio::sync::mpsc::UnboundedReceiver<global_ptt::GlobalPttEvent>;
+
 /// Clap's own defaults, with flag/parameter names (`--port`, and the
 /// `<PORT>` placeholder that goes with it) in yellow rather than plain bold.
 const HELP_STYLES: Styles = Styles::styled()
@@ -167,9 +172,10 @@ struct Cli {
 /// shortcut (`crate::client::global_ptt`) needs the process's *real* OS main
 /// thread free to pump a `CFRunLoop` - something `#[tokio::main]` would
 /// immediately claim for its own `block_on`. Every other path
-/// (`--server`, `--keygen-pq-hybrid`, and the client on Windows/Linux)
+/// (`--server`, `--keygen-pq-hybrid`, and the client or daemon on
+/// Windows/Linux)
 /// builds its own runtime and behaves exactly as it did before; see
-/// `run_client_entry`/`run_client_macos` for the one case that differs.
+/// `with_global_ptt` for the one case that differs.
 fn main() -> Result<(), BoxError> {
     let cli = Cli::parse();
     if let Some(prefix) = &cli.keygen_pq_hybrid {
@@ -243,14 +249,16 @@ fn run_daemon_entry(cli: Cli) -> Result<(), BoxError> {
     // The hotkey has to be registered from the process's real main thread
     // on macOS, exactly as it does for a foreground client - so the daemon
     // reuses the same split rather than inventing a second one.
-    let runtime = build_runtime()?;
-    match runtime.block_on(daemon::run(config)) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            daemon::report_startup_failure(&e);
-            Err(e)
+    let hotkey = global_ptt::hotkey_to_register(&load_settings());
+    with_global_ptt(hotkey, move |hotkey_rx| {
+        match build_runtime()?.block_on(daemon::run(config, hotkey_rx)) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                daemon::report_startup_failure(&e);
+                Err(e)
+            }
         }
-    }
+    })
 }
 
 fn resolve_daemon_config(cli: &Cli) -> Result<aloo::client::daemon::DaemonConfig, String> {
@@ -297,9 +305,8 @@ fn load_settings() -> settings::Settings {
     }
 }
 
-/// Client entry point, platform-dispatching only where it has to
-/// (`run_client_macos` - see its doc comment). Everywhere else this is
-/// exactly what `#[tokio::main]` used to do: build a runtime, block on
+/// Client entry point. Off macOS `with_global_ptt` adds nothing, so this
+/// is exactly what `#[tokio::main]` used to do: build a runtime, block on
 /// `run_client`.
 fn run_client_entry(cli: Cli) -> Result<(), BoxError> {
     // A running daemon owns this machine's session. Taking it over is what
@@ -316,26 +323,43 @@ fn run_client_entry(cli: Cli) -> Result<(), BoxError> {
         }
     }
 
-    let settings = load_settings();
-    let hotkey = global_ptt::hotkey_to_register(&settings);
-
-    #[cfg(target_os = "macos")]
-    return run_client_macos(cli, hotkey);
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        let hotkey_rx = hotkey.and_then(global_ptt::spawn);
+    let hotkey = global_ptt::hotkey_to_register(&load_settings());
+    with_global_ptt(hotkey, move |hotkey_rx| {
         build_runtime()?.block_on(run_client(cli, hotkey_rx))
-    }
+    })
+}
+
+/// Registers the global push-to-talk shortcut, then runs `body` with the
+/// channel it delivers on - the one piece of the client and the daemon
+/// that has to know which OS it's on.
+///
+/// Everywhere but macOS there is nothing to arrange: `global_ptt::spawn`
+/// owns the hotkey on a thread of its own, so `body` simply runs here.
+#[cfg(not(target_os = "macos"))]
+fn with_global_ptt<F>(
+    hotkey: Option<global_hotkey::hotkey::HotKey>,
+    body: F,
+) -> Result<(), BoxError>
+where
+    F: FnOnce(Option<HotkeyReceiver>) -> Result<(), BoxError> + Send + 'static,
+{
+    body(hotkey.and_then(global_ptt::spawn))
 }
 
 /// macOS-only: Carbon's `RegisterEventHotKey` (what `global_ptt` uses)
 /// only delivers events via the real main thread's `CFRunLoop`, so on
-/// this OS alone the roles are swapped: `main()` stays free to register
-/// the hotkey and pump that run loop while the entire client runs on a
-/// spawned thread. `run_client` itself is identical either way.
+/// this OS alone the roles are swapped: `main()` stays behind to register
+/// the hotkey and pump that run loop while all of `body` - client or
+/// daemon, runtime included - runs on a spawned thread. What `body` does
+/// is identical either way.
 #[cfg(target_os = "macos")]
-fn run_client_macos(cli: Cli, hotkey: Option<global_hotkey::hotkey::HotKey>) -> Result<(), BoxError> {
+fn with_global_ptt<F>(
+    hotkey: Option<global_hotkey::hotkey::HotKey>,
+    body: F,
+) -> Result<(), BoxError>
+where
+    F: FnOnce(Option<HotkeyReceiver>) -> Result<(), BoxError> + Send + 'static,
+{
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -345,22 +369,19 @@ fn run_client_macos(cli: Cli, hotkey: Option<global_hotkey::hotkey::HotKey>) -> 
     };
 
     let shutdown = Arc::new(AtomicBool::new(false));
-    let shutdown_for_client = shutdown.clone();
+    let shutdown_for_body = shutdown.clone();
     let handle = std::thread::spawn(move || -> Result<(), BoxError> {
-        // The closure boundary guarantees `shutdown` is set on every exit
-        // path (including `build_runtime()` itself failing), so the main
-        // thread's pump loop below can never be left waiting forever.
-        let result = (|| -> Result<(), BoxError> {
-            let rt = build_runtime()?;
-            rt.block_on(run_client(cli, hotkey_rx))
-        })();
-        shutdown_for_client.store(true, Ordering::Relaxed);
+        // `shutdown` is set on every exit path of `body` (including the
+        // runtime it builds failing to start), so the main thread's pump
+        // loop below can never be left waiting forever.
+        let result = body(hotkey_rx);
+        shutdown_for_body.store(true, Ordering::Relaxed);
         result
     });
 
     // Harmless to keep pumping even if `manager` is `None` (disabled, or
     // registration failed above) - there's simply nothing registered for
-    // it to deliver, and this is still what waits for the client thread.
+    // it to deliver, and this is still what waits for the spawned thread.
     global_ptt::pump_main_thread(&shutdown);
 
     let result = match handle.join() {

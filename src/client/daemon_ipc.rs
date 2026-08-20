@@ -303,7 +303,7 @@ pub async fn is_daemon_running(path: &Path) -> bool {
 }
 
 #[cfg(unix)]
-pub async fn connect(path: &Path) -> io::Result<tokio::net::UnixStream> {
+pub async fn connect(path: &Path) -> io::Result<ClientStream> {
     // Refuse a socket this user does not own before speaking to it: it
     // would otherwise be a way for another local account to feed a chosen
     // session to whoever ran `aloo`.
@@ -332,7 +332,7 @@ pub async fn connect(path: &Path) -> io::Result<tokio::net::UnixStream> {
 /// and chmod; closing it entirely would mean binding inside a
 /// private-mode directory, and `~/.aloo` is already the user's own.
 #[cfg(unix)]
-pub fn bind_listener(path: &Path) -> io::Result<tokio::net::UnixListener> {
+pub fn bind_listener(path: &Path) -> io::Result<Listener> {
     check_socket_path_length(path)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -341,10 +341,10 @@ pub fn bind_listener(path: &Path) -> io::Result<tokio::net::UnixListener> {
     // `is_daemon_running` first, which is what distinguishes debris from a
     // second daemon.
     let _ = std::fs::remove_file(path);
-    let listener = tokio::net::UnixListener::bind(path)?;
+    let inner = tokio::net::UnixListener::bind(path)?;
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    Ok(listener)
+    Ok(Listener { inner })
 }
 
 /// Windows has no Unix domain sockets; a named pipe is the equivalent
@@ -358,13 +358,84 @@ pub fn pipe_name() -> String {
 }
 
 #[cfg(windows)]
-pub async fn connect(_path: &Path) -> io::Result<tokio::net::windows::named_pipe::NamedPipeClient> {
+pub async fn connect(_path: &Path) -> io::Result<ClientStream> {
     tokio::net::windows::named_pipe::ClientOptions::new().open(pipe_name())
 }
 
+/// The first pipe instance, which is what makes the name exist at all -
+/// `first_pipe_instance` is the flag that refuses a *second* process
+/// claiming the same name, so this is also Windows' half of the
+/// single-instance check the socket file performs on Unix. Every later
+/// instance is created by `Listener::accept`.
 #[cfg(windows)]
-pub fn bind_listener(_path: &Path) -> io::Result<tokio::net::windows::named_pipe::NamedPipeServer> {
-    tokio::net::windows::named_pipe::ServerOptions::new()
+pub fn bind_listener(_path: &Path) -> io::Result<Listener> {
+    let pending = tokio::net::windows::named_pipe::ServerOptions::new()
         .first_pipe_instance(true)
-        .create(pipe_name())
+        .create(pipe_name())?;
+    Ok(Listener { pending })
+}
+
+// ---------------------------------------------------------------------
+// One shape for two transports
+// ---------------------------------------------------------------------
+
+/// A live attach connection, as the daemon holds it: the accepted end of
+/// a Unix socket, or the connected pipe instance on Windows. Both are
+/// `AsyncRead + AsyncWrite`, which is all `serve_attachments` ever asks
+/// of them.
+#[cfg(unix)]
+pub type Stream = tokio::net::UnixStream;
+#[cfg(windows)]
+pub type Stream = tokio::net::windows::named_pipe::NamedPipeServer;
+
+/// The same connection as the *viewer* holds it. Identical to `Stream` on
+/// Unix, where one type is both ends of a socket; Windows names the two
+/// ends apart, so the attaching client gets its own alias.
+#[cfg(unix)]
+pub type ClientStream = tokio::net::UnixStream;
+#[cfg(windows)]
+pub type ClientStream = tokio::net::windows::named_pipe::NamedPipeClient;
+
+/// What the daemon accepts attaching viewers on.
+///
+/// A type of its own rather than the platform's listener directly,
+/// because the two do not have the same shape: a Unix listener accepts
+/// connections while staying itself, whereas a named pipe *is* one
+/// connection and the server has to keep a fresh idle instance ready
+/// behind it. `accept` hides that difference, so the daemon's serve loop
+/// is one piece of code on both.
+#[derive(Debug)]
+pub struct Listener {
+    #[cfg(unix)]
+    inner: tokio::net::UnixListener,
+    #[cfg(windows)]
+    pending: tokio::net::windows::named_pipe::NamedPipeServer,
+}
+
+impl Listener {
+    /// Waits for the next viewer and hands back its connection.
+    ///
+    /// The peer address a Unix `accept` also returns is dropped: an
+    /// attach socket has no meaningful peer name (it is unnamed, and the
+    /// permissions are what say who may connect), and there is nothing
+    /// equivalent to hand back on Windows.
+    #[cfg(unix)]
+    pub async fn accept(&mut self) -> io::Result<Stream> {
+        let (stream, _peer) = self.inner.accept().await?;
+        Ok(stream)
+    }
+
+    /// Windows: waiting *is* `connect` on the idle instance, and the
+    /// instance that just connected is the connection. A replacement is
+    /// created before this returns rather than at the top of the next
+    /// `accept`, so the name never goes momentarily unservable: a second
+    /// viewer arriving while the first is being served connects to the
+    /// replacement and waits there, which is what the socket's accept
+    /// backlog does on Unix.
+    #[cfg(windows)]
+    pub async fn accept(&mut self) -> io::Result<Stream> {
+        self.pending.connect().await?;
+        let next = tokio::net::windows::named_pipe::ServerOptions::new().create(pipe_name())?;
+        Ok(std::mem::replace(&mut self.pending, next))
+    }
 }
