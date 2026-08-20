@@ -1,14 +1,14 @@
 use aloo::client::otp::{
-    apply_incoming_setup, commit_pending_setup, detect_or_adopt_existing, discard_pending_setup,
-    format_now, initiate_provisioning, own_pad_wins_glare, pending_setup_dir, read_pending_setup,
-    OTP_SETUP_CHUNK_BYTES,
+    apply_incoming_setup, commit_pending_setup, decide_end_otp, detect_or_adopt_existing,
+    discard_pending_setup, format_now, initiate_provisioning, own_pad_wins_glare,
+    pending_setup_dir, read_pending_setup, EndOtpDecision, OTP_SETUP_CHUNK_BYTES,
 };
 use aloo::client::p2p::PENDING_MAX;
 use aloo::client::otp_cli::{self, OtpCliConfig};
-use aloo::client::otp_store::OtpStore;
+use aloo::client::otp_store::{OtpContactState, OtpStore, PendingOtpContent};
 use aloo::crypto::otp::{
-    contact_name_for, otp_size_mb_in_range, OtpKeySetupAckPayload, OtpKeySetupChunk,
-    OtpKeySetupPayload, OtpKeySetupReassembly, OTP_SIZE_MB_MAX, OTP_SIZE_MB_MIN,
+    contact_name_for, otp_size_mb_in_range, OtpEndSessionPayload, OtpKeySetupAckPayload,
+    OtpKeySetupChunk, OtpKeySetupPayload, OtpKeySetupReassembly, OTP_SIZE_MB_MAX, OTP_SIZE_MB_MIN,
 };
 use aloo::proto;
 use std::path::PathBuf;
@@ -632,4 +632,80 @@ async fn accepting_a_peers_pad_retires_this_sides_own_staged_one() {
         "a pad that can never be adopted must not survive to be re-offered"
     );
     assert!(otp_cli::has_contact(&alice_cfg, &contact_name).await.unwrap());
+}
+
+// ---------------------------------------------------------------------
+// /endotp's pure decision (docs/PROTOCOL.md 16.6)
+// ---------------------------------------------------------------------
+
+/// @requirement TB-212
+#[test]
+fn decide_end_otp_refuses_when_nothing_is_provisioned() {
+    assert_eq!(decide_end_otp(None), EndOtpDecision::NoActiveSession);
+    let unprovisioned = OtpContactState::default();
+    assert_eq!(
+        decide_end_otp(Some(&unprovisioned)),
+        EndOtpDecision::NoActiveSession
+    );
+}
+
+/// A mail send still awaiting this contact's pad gate must never be stranded
+/// by `/endotp` destroying the very keychain entry its retry
+/// (`otp --recover-last`) depends on - see `EndOtpDecision::MailInFlight`'s
+/// doc.
+///
+/// @requirement TB-212
+#[test]
+fn decide_end_otp_refuses_while_a_mail_is_in_flight() {
+    let state = OtpContactState {
+        provisioned: true,
+        pending_unacked_out_seq: Some(3),
+        pending_content: Some(PendingOtpContent::Mail {
+            mail_id: "m1".to_string(),
+        }),
+        ..Default::default()
+    };
+    assert_eq!(decide_end_otp(Some(&state)), EndOtpDecision::MailInFlight);
+}
+
+/// Unlike a mail spend, a live P2P text/file/voice send outstanding for a
+/// contact has no second store depending on the keychain surviving, so it
+/// must not block `/endotp` - the far side simply never gets that message's
+/// acknowledgement, the same outcome a permanently vanished peer already
+/// produces today.
+///
+/// @requirement TB-212
+#[test]
+fn decide_end_otp_allows_ending_with_a_plain_pending_send() {
+    let state = OtpContactState {
+        provisioned: true,
+        pending_unacked_out_seq: Some(3),
+        pending_content: Some(PendingOtpContent::Text { channel: None }),
+        ..Default::default()
+    };
+    assert_eq!(decide_end_otp(Some(&state)), EndOtpDecision::End);
+}
+
+/// @requirement TB-212
+#[test]
+fn decide_end_otp_allows_ending_a_quiescent_session() {
+    let state = OtpContactState {
+        provisioned: true,
+        ..Default::default()
+    };
+    assert_eq!(decide_end_otp(Some(&state)), EndOtpDecision::End);
+}
+
+/// One shape carries both `Content::OtpEndSession` and its
+/// `Content::OtpEndSessionAck` reply - see `OtpEndSessionPayload`'s doc.
+///
+/// @requirement AC-192
+#[test]
+fn end_session_payload_round_trips_through_the_wire_encoding() {
+    let payload = OtpEndSessionPayload {
+        contact_name: "abcd-1234".to_string(),
+    };
+    let encoded = proto::encode(&payload).unwrap();
+    let decoded: OtpEndSessionPayload = proto::decode(&encoded).unwrap();
+    assert_eq!(decoded.contact_name, "abcd-1234");
 }

@@ -368,6 +368,15 @@ pub(crate) async fn on_message(
             crate::client::otp::on_key_setup_ack(ui_state, session, from, &sender, envelope).await;
             return;
         }
+        Content::OtpEndSession => {
+            crate::client::otp::on_end_session(session, ui_state, from, from_name, &sender, envelope)
+                .await;
+            return;
+        }
+        Content::OtpEndSessionAck => {
+            crate::client::otp::on_end_session_ack(session, from, &sender, envelope);
+            return;
+        }
         _ => {}
     }
     if let Some(body) =

@@ -97,6 +97,7 @@ falling back to a server relay (§7.1).
   - [16.3 Session visibility in the DM log](#163-session-visibility-in-the-dm-log)
   - [16.4 Recovering a send whose ciphertext already left](#164-recovering-a-send-whose-ciphertext-already-left)
   - [16.5 Live key-metadata header](#165-live-key-metadata-header)
+  - [16.6 Ending a session: /endotp](#166-ending-a-session-endotp)
 - [17. OTP mail: asynchronous, server-stored delivery](#17-otp-mail-asynchronous-server-stored-delivery)
   - [17.1 Composing: what a mail is, and who can be written to](#171-composing-what-a-mail-is-and-who-can-be-written-to)
   - [17.2 Uploading: the mail's pad spend, and the storage acknowledgement](#172-uploading-the-mails-pad-spend-and-the-storage-acknowledgement)
@@ -3232,18 +3233,21 @@ once fully received, rather than becoming playable partway through.
 ### 16.3 Session visibility in the DM log
 
 Every error/confirmation this layer shows (§16.1's "started"/"cancelled",
-§16.2's queued-message notice, any of the failure paths above) is shown
-two ways at once, not just as the small top-right status notice: the same
-text is also logged as a line in the relevant peer's own DM room, marking
-it unread exactly like any other arrival if that room isn't the one
-currently open. The notice itself clears; the room's own history of how
-its session got set up (or why it didn't) does not.
+§16.2's queued-message notice, §16.6's "ended" notices, any of the failure
+paths above) is shown two ways at once, not just as the small top-right
+status notice: the same text is also logged as a line in the relevant
+peer's own DM room, marking it unread exactly like any other arrival if
+that room isn't the one currently open. The notice itself clears; the
+room's own history of how its session got set up (or ended, or why it
+didn't) does not.
 
 While a mutual-consent session is genuinely active with a DM's peer
-(§16.1's "started" moment, on either side), every real message shown in
-that room - never the app's own lines about the session itself - carries
-a 🛡️ prefix, so which conversation is currently under the extra pad layer
-is never something the user has to remember or go check.
+(§16.1's "started" moment, on either side, through to §16.6's "ended"
+moment, on whichever side ends it), every real message shown in that room -
+never the app's own lines about the session itself - carries a 🛡️ prefix,
+so which conversation is currently under the extra pad layer is never
+something the user has to remember or go check. Neither side disconnecting
+and reconnecting affects this window at all - only §16.6 closes it.
 
 A text message is logged the moment it's typed, before the send it
 describes has actually been attempted - the same optimistic-then-corrected
@@ -3356,6 +3360,114 @@ anything that isn't this app's own send/receive (e.g. the same keychain
 used with `otp` directly, out of band) - never for a room that isn't
 currently on screen, so an idle session elsewhere in the app costs nothing
 beyond its own occasional safety-net fetch.
+
+### 16.6 Ending a session: /endotp
+
+A mutual-consent session, once started (§16.1), stays active indefinitely -
+neither participant's connection dropping, nor either side's app
+restarting, ends it on its own. It ends only when one of the two
+participants deliberately runs `/endotp` against that contact's private
+room. Unlike starting a session, ending one needs no round trip to agree:
+either side may do it alone, and the far side is *told*, not asked.
+
+```
+ alice (has decided to end it)                                bob
+   |   destroys her own copy of the pad immediately -
+   |   otp --remove-contact, and every per-contact
+   |   sequence/gate/setup record for bob is reset
+   |--- OtpEndSession { contact_name } ----------------------------->|   ordinary pq_hybrid envelope
+   |                                                                  |   bob does the same local
+   |                                                                  |   teardown on his side
+   |<-- OtpEndSessionAck { contact_name } -----------------------------|
+```
+
+Both message types here are carried as ordinary `Envelope`s, sealed under
+the ongoing `pq_hybrid` conversation - exactly like every other OTP control
+message in this section (§16.1) - never wrapped through the pad itself,
+since by the time either message goes out the sending side's own copy of
+the pad may already be destroyed.
+
+**Local teardown happens first, unconditionally, before anything is sent.**
+The instant `/endotp` runs, `otp --remove-contact` deletes the keychain
+entry, and every local record for that contact - the provisioned flag, the
+outstanding-ack gate, any pad still owed to the peer from an unfinished
+`OtpKeySetup` (§16.1), and both sequence counters - resets to the same
+state a never-provisioned contact starts in. This guarantees this side can
+never again spend that pad, even if the notice below is never delivered at
+all, and it guarantees a fresh pad provisioned later for the same peer (the
+contact name is deterministic - a later `/otp` between the same two people
+always derives the identical name, §16.1) starts genuinely clean: sequence
+0 in both directions, no gate held over from the session just ended, no key
+material carried over from it either. A status notice and a line in that
+peer's own DM room both announce "OTP session ended" immediately (§16.3),
+the same way starting one is announced on both sides.
+
+`/endotp` is refused - locally, silently, nothing sent or torn down - in
+two cases: there is no active session with that peer at all, or an OTP
+mail (§17) to that exact contact is still waiting on the pad's
+stop-and-wait gate (the contact's pending send names a mail, not a live
+P2P one). The second case matters because a mail's only recovery path, if
+its own upload acknowledgement is ever lost, is replaying the exact
+ciphertext `otp --recover-last` still holds for that contact (§17.2) -
+destroying the keychain entry out from under an in-flight mail would make
+that recovery permanently impossible, stranding it in "awaiting
+acknowledgement" forever. Every other kind of outstanding send (a live P2P
+text, file offer, file content, or voice spend) has no second store
+depending on the keychain surviving, so it never blocks `/endotp` - the
+peer simply never receives that one message's own acknowledgement, the
+same outcome a peer who vanished permanently already produces today.
+
+**The receiving side never gets a say.** `OtpEndSession` is not a
+proposal; there is nothing to accept or reject, only to converge to. On
+receipt, the same full local teardown runs - keychain contact removed,
+every per-contact record reset - and a status notice/DM-room line announce
+"OTP session ended by &lt;name&gt;". `OtpEndSessionAck` is always sent
+back, even for a contact that was already reset: that is exactly what a
+*retried* `OtpEndSession` (below) whose first acknowledgement got lost
+looks like on the receiving end, and answering it again is what lets the
+sender's own retry stop.
+
+**The notice is retried until it is genuinely heard, however long that
+takes** - the same durability §16.1 already gives a pad invitation still
+owed to a peer. Whether `/endotp` is run while the peer is online or
+offline, this side records the notice as owed against the contact name
+(not the connection, which does not survive a reconnect), persisted to the
+same on-disk store every other per-contact OTP record lives in. Every time
+a direct link to that peer next becomes reachable - a reconnect, a link
+flap, this app's own restart once the link comes back up - the notice is
+re-sent, unchanged, exactly as an unanswered pad invitation already is.
+Only a genuine `OtpEndSessionAck` clears the debt; a link transition with
+nothing acknowledged yet simply retries again next time.
+
+```
+ alice ends the session while bob is offline                     bob
+   |   local teardown; OtpEndSession has
+   |   nowhere to go right now
+   |
+   |   ...bob reconnects, sometime later...
+   |--- OtpEndSession { contact_name } -------------------------------->|   the same notice, retried
+   |                                                                      |   bob tears his own side
+   |                                                                      |   down and acknowledges
+   |<-- OtpEndSessionAck { contact_name } -----------------------------------|
+```
+
+**A session's own liveness is independent of the connection carrying it.**
+Nothing about a peer's `UserId` changing on reconnect (§3) affects whether
+their contact is still provisioned - that fact lives entirely in the
+fingerprint-derived, contact-name-keyed store (§16.1), which a reconnect
+never touches. The one thing that is naturally connection-scoped is which
+UI surface currently shows the session as active (the shield prefix and the
+key-metadata header, §16.5); that is re-established the moment a peer who
+is already provisioned is seen again under a fresh `UserId`, so it never
+lags behind the underlying, persistent fact for long.
+
+Ending a session never ends the underlying `pq_hybrid` conversation itself:
+the DM room stays open and usable exactly as it was before OTP was ever
+turned on for that contact. While the session was active, every send to
+that contact rode the pad unconditionally - there was never a way to drop
+back to a plain, non-pad-wrapped send in the meantime (§16.2) - but from
+the moment it ends, a plain send to them works again immediately. Only the
+extra pad layer, and the shield marking it, are gone.
 
 ## 17. OTP mail: asynchronous, server-stored delivery
 

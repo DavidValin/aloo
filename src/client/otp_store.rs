@@ -101,17 +101,31 @@ pub struct OtpContactState {
     /// stale or duplicate at the aloo layer (`otp` itself has no notion of
     /// message ordering beyond pad-offset consumption).
     pub next_expected_in_seq: u64,
+    /// `true` while this side has locally ended the session with `/endotp`
+    /// and the peer still hasn't confirmed receiving that notice
+    /// (`OtpEndSessionAck`) - the durable counterpart of
+    /// `pending_setup_size_mb`, for the same reason: a peer who is offline
+    /// right now, or whose connection drops before the notice arrives, must
+    /// still learn about it, so this is retried on every reconnect
+    /// (`client::otp::resend_pending_end_notices`) rather than only
+    /// attempted once. Never `true` at the same time as `provisioned` -
+    /// `OtpStore::end_session` resets every other field the instant this is
+    /// set, since ending is a full local teardown, not a pause.
+    pub pending_end_notice: bool,
 }
 
 /// A `contact_name -> OtpContactState` store, backed by a small flat file:
-/// `contact_name<TAB>provisioned<TAB>pending_unacked_out_seq<TAB>next_out_seq<TAB>next_expected_in_seq<TAB>pending_content`
+/// `contact_name<TAB>provisioned<TAB>pending_unacked_out_seq<TAB>next_out_seq<TAB>next_expected_in_seq<TAB>pending_content<TAB>pending_setup_size_mb<TAB>pending_end_notice`
 /// per line, `pending_unacked_out_seq` empty when `None`. `pending_content`
 /// is empty when `None`, otherwise one of `T`/`T<US>channel`/
 /// `F<US>stream_id<US>filename<US>size`/`C<US>stream_id`/`V<US>duration_ms`
 /// (`<US>` = `\x1F`, chosen since a filename could in principle contain a
 /// tab) - a trailing field missing entirely (an older file written before
 /// this field existed) parses the same as present-but-empty, same
-/// tolerance `parse_line` already gives every other field.
+/// tolerance `parse_line` already gives every other field. `pending_end_notice`
+/// is `1` when `true`, empty (or absent, for a file written before this
+/// field existed) when `false` - same evolutionary tolerance
+/// `pending_setup_size_mb` already established.
 pub struct OtpStore {
     path: PathBuf,
     entries: HashMap<String, OtpContactState>,
@@ -214,6 +228,55 @@ impl OtpStore {
         self.entries.remove(contact_name).is_some()
     }
 
+    /// The local half of `/endotp` (`client::otp::handle_end_otp_command`):
+    /// resets `contact_name` all the way back to a never-provisioned-looking
+    /// state (mirroring what `otp_cli::remove_contact` just did to the real
+    /// keychain, so a later fresh `/otp` for the same pair - same derived
+    /// name - starts genuinely clean, never resuming a stale sequence
+    /// counter or gate from the session just ended) and records that the
+    /// peer still needs to be told, durably - see `pending_end_notice`'s
+    /// doc. Overwrites whatever was there rather than merging, the same way
+    /// `client::otp::stage_pending_setup` treats a previous attempt for the
+    /// same name as fully superseded.
+    pub fn end_session(&mut self, contact_name: &str) {
+        self.entries.insert(
+            contact_name.to_string(),
+            OtpContactState {
+                pending_end_notice: true,
+                ..Default::default()
+            },
+        );
+    }
+
+    /// The receiving side's counterpart to `end_session`
+    /// (`client::otp::on_end_session`): the same full local reset, but
+    /// without owing a notice of our own - we are the one being told, not
+    /// the one telling.
+    pub fn reset_after_peer_ended(&mut self, contact_name: &str) {
+        self.entries
+            .insert(contact_name.to_string(), OtpContactState::default());
+    }
+
+    /// The peer's `OtpEndSessionAck` arrived - stop retrying the notice.
+    /// Returns whether one was actually outstanding, so a stray/duplicate
+    /// ack can be told apart from a genuine one.
+    pub fn clear_end_notice(&mut self, contact_name: &str) -> bool {
+        match self.entries.get_mut(contact_name) {
+            Some(state) => std::mem::take(&mut state.pending_end_notice),
+            None => false,
+        }
+    }
+
+    /// Every contact whose `/endotp` notice is still owed to its peer, for
+    /// the retry pass that runs whenever a direct link becomes reachable
+    /// again (`client::otp::resend_pending_end_notices`) - the `/endotp`
+    /// counterpart of `pending_setups`.
+    pub fn pending_end_notices(&self) -> impl Iterator<Item = &str> {
+        self.entries
+            .iter()
+            .filter_map(|(name, state)| state.pending_end_notice.then_some(name.as_str()))
+    }
+
     pub fn record_sent(&mut self, contact_name: &str, seq: u64, content: PendingOtpContent) {
         let state = self.entries.entry(contact_name.to_string()).or_default();
         state.pending_unacked_out_seq = Some(seq);
@@ -300,6 +363,10 @@ impl OtpStore {
             out.push('\t');
             if let Some(size_mb) = state.pending_setup_size_mb {
                 out.push_str(&size_mb.to_string());
+            }
+            out.push('\t');
+            if state.pending_end_notice {
+                out.push('1');
             }
             out.push('\n');
         }
@@ -388,6 +455,10 @@ fn parse_line(line: &str) -> Option<(String, OtpContactState)> {
     // Absent entirely in a file written before this field existed, which
     // parses as "no setup owed" - the correct reading of an older store.
     let pending_setup_size_mb = parts.next().and_then(|s| s.parse().ok());
+    // Same tolerance, one field newer still: absent (or empty) reads as
+    // "no notice owed" - the correct reading of a store written before
+    // `/endotp` existed at all.
+    let pending_end_notice = parts.next() == Some("1");
     Some((
         name,
         OtpContactState {
@@ -397,6 +468,7 @@ fn parse_line(line: &str) -> Option<(String, OtpContactState)> {
             next_out_seq,
             next_expected_in_seq,
             pending_setup_size_mb,
+            pending_end_notice,
         },
     ))
 }

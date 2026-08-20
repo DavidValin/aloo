@@ -113,6 +113,17 @@ came from, and only from, the intended peer - the same limit §12
 describes for a first contact, applied a second time to this layer's own
 setup message.
 
+**Ending a session (§16.6) is unilateral by design, unlike starting one.**
+Either participant may run `/endotp` alone, with no consent from the other
+side - deliberately asymmetric with the mutual-accept required to turn the
+layer on, since requiring agreement to *stop* using something would let an
+unresponsive or hostile peer trap the other side into it indefinitely. The
+practical consequence: one participant can always unilaterally end the
+extra pad-layer secrecy for a conversation the other party may have wanted
+to keep, though never their ability to talk at all - the underlying
+`pq_hybrid` conversation is unaffected, and the peer is always told, even
+if only once they are next reachable.
+
 **OTP mail (§17) widens what the server sees and stores, not what it can
 read.** A mail is the one piece of content the server ever holds: an
 opaque pad-sealed blob on its disk, plus the routing metadata beside it -

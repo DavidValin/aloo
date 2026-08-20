@@ -81,6 +81,14 @@ impl OtpOutQueue {
     pub fn pop_front(&mut self, contact_name: &str) -> Option<PendingOtpSend> {
         self.queue.get_mut(contact_name)?.pop_front()
     }
+
+    /// Drops every send still queued for `contact_name` - once `/endotp`
+    /// (either side's) has run, the session they were waiting to go out
+    /// under no longer exists, so there is nothing left to flush them
+    /// into.
+    pub fn clear(&mut self, contact_name: &str) {
+        self.queue.remove(contact_name);
+    }
 }
 
 /// `Some(contact_name)` iff OTP is usable for this peer right now: their
@@ -1395,6 +1403,327 @@ pub(crate) async fn on_key_setup_ack(
             false,
         );
     }
+}
+
+// ---------------------------------------------------------------------
+// Ending a session: /endotp (docs/PROTOCOL.md §16.6)
+// ---------------------------------------------------------------------
+
+/// What `/endotp` should do for one contact, decided *before* anything
+/// destructive (`otp_cli::remove_contact`) runs - mirrors
+/// `client::otp_mail::MailGate`'s shape: a small, pure decision kept
+/// separate from `handle_end_otp_command` so it's directly testable without
+/// a live `SessionState`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndOtpDecision {
+    /// No provisioned contact for this peer at all - nothing to end.
+    NoActiveSession,
+    /// A mail send is still awaiting this contact's pad gate
+    /// (`PendingOtpContent::Mail`) - destroying the keychain contact now
+    /// would strand it in `AwaitingServerAck` forever, since its only
+    /// recovery path (`otp --recover-last`) needs the very keychain entry
+    /// this would delete (`client::otp_mail::resend_pending`'s doc).
+    MailInFlight,
+    /// Safe to tear down and notify.
+    End,
+}
+
+/// The decision behind `handle_end_otp_command`'s early guards - see
+/// `EndOtpDecision`'s doc for what each outcome protects.
+pub fn decide_end_otp(
+    state: Option<&crate::client::otp_store::OtpContactState>,
+) -> EndOtpDecision {
+    let Some(state) = state else {
+        return EndOtpDecision::NoActiveSession;
+    };
+    if !state.provisioned {
+        return EndOtpDecision::NoActiveSession;
+    }
+    if matches!(
+        state.pending_content,
+        Some(crate::client::otp_store::PendingOtpContent::Mail { .. })
+    ) {
+        return EndOtpDecision::MailInFlight;
+    }
+    EndOtpDecision::End
+}
+
+/// The `/endotp` command's handler (`UiAction::EndOtpSession`) - the one and
+/// only way an OTP session ends deliberately. Unlike starting one, ending is
+/// unilateral: either participant may do it alone, with no round trip to
+/// agree first - the local pad is destroyed immediately, so this side can
+/// never again spend it (the same "no double key pad spending" property
+/// `send_or_queue`'s gate protects while the session was live now holds
+/// because there is no pad left to spend), and the peer is *told*, not
+/// asked. Every send-path gate stops seeing this contact as active from
+/// this call onward, on this side; the peer converges to the same state the
+/// moment `on_end_session` processes the notice, whether that is seconds or
+/// days from now (`resend_pending_end_notices`).
+///
+/// Refuses outright (a local-only notice, nothing torn down or sent) if
+/// there is no active session with this peer, or if a mail send is still
+/// awaiting the pad's stop-and-wait gate for this exact contact
+/// (`PendingOtpContent::Mail`) - destroying the keychain contact out from
+/// under `client::otp_mail::resend_pending` would strand that mail in
+/// `AwaitingServerAck` forever, since its only recovery path (`otp
+/// --recover-last`) needs the very keychain entry this would delete. Every
+/// other pending send (a live P2P text/file/voice spend) has no second
+/// store depending on the keychain surviving, so it does not block ending.
+pub(crate) async fn handle_end_otp_command(
+    wr: &mut impl crate::control::ControlSink,
+    ui_state: &mut UiState,
+    session: &mut SessionState,
+    peer: UserId,
+    key_mode: KeyMode,
+    peer_pubkey_der: Vec<u8>,
+) -> proto::Result<()> {
+    let peer_name = ui_state
+        .known_users
+        .get(&peer)
+        .map(|u| u.name.clone())
+        .unwrap_or_default();
+    let Some(contact_name) = contact_name_for_peer(session, &peer_pubkey_der) else {
+        notify(
+            ui_state,
+            peer,
+            &peer_name,
+            "OTP: no active session with this user".to_string(),
+            false,
+        );
+        return Ok(());
+    };
+    match decide_end_otp(session.otp_store.get(&contact_name)) {
+        EndOtpDecision::NoActiveSession => {
+            notify(
+                ui_state,
+                peer,
+                &peer_name,
+                "OTP: no active session with this user".to_string(),
+                false,
+            );
+            return Ok(());
+        }
+        EndOtpDecision::MailInFlight => {
+            notify(
+                ui_state,
+                peer,
+                &peer_name,
+                "OTP: a mail to this contact is still being delivered - try /endotp again shortly"
+                    .to_string(),
+                false,
+            );
+            return Ok(());
+        }
+        EndOtpDecision::End => {}
+    }
+
+    // Local teardown first, unconditionally - this side must never be able
+    // to spend this pad again, even if the notice below never reaches the
+    // peer at all (and even if this process crashes right after: `otp
+    // --remove-contact` and `otp_store.save()` both already ran).
+    let _ = otp_cli::remove_contact(&session.otp_cli_cfg, &contact_name).await;
+    discard_pending_setup(&session.otp_cli_cfg, &contact_name);
+    session.otp_incoming_setup.remove(&peer);
+    session.otp_out_queue.clear(&contact_name);
+    session.otp_store.end_session(&contact_name);
+    let _ = session.otp_store.save();
+    ui_state.clear_otp_active(peer);
+    notify(ui_state, peer, &peer_name, "OTP session ended".to_string(), true);
+
+    send_end_session_payload(
+        wr,
+        session,
+        peer,
+        key_mode,
+        &peer_pubkey_der,
+        &contact_name,
+        Content::OtpEndSession,
+    )
+    .await;
+    Ok(())
+}
+
+/// Builds and sends `content` (`Content::OtpEndSession` or
+/// `Content::OtpEndSessionAck`) to `to` over the ordinary `pq_hybrid`
+/// channel - never pad-wrapped, since the pad may already be gone by the
+/// time this runs. Signals the link first (`ensure_link`) for the two
+/// callers that cannot assume one already exists: the initiator
+/// (`handle_end_otp_command`) and the retry pass
+/// (`resend_pending_end_notices`).
+async fn send_end_session_payload(
+    wr: &mut impl crate::control::ControlSink,
+    session: &mut SessionState,
+    to: UserId,
+    key_mode: KeyMode,
+    pubkey_der: &[u8],
+    contact_name: &str,
+    content: Content,
+) {
+    session.peer_link.ensure_link(wr, to).await;
+    queue_end_session_payload(session, to, key_mode, pubkey_der, contact_name, content);
+}
+
+/// `send_end_session_payload` without the `ensure_link` signalling round
+/// trip - for the one caller that cannot signal: an ack sent straight back
+/// at a peer whose `OtpEndSession` just arrived over the link, which is by
+/// definition already up (their message just came in on it) - mirrors
+/// `queue_key_setup_ack`'s identical reasoning.
+fn queue_end_session_payload(
+    session: &mut SessionState,
+    to: UserId,
+    key_mode: KeyMode,
+    pubkey_der: &[u8],
+    contact_name: &str,
+    content: Content,
+) {
+    let payload = crypto::otp::OtpEndSessionPayload {
+        contact_name: contact_name.to_string(),
+    };
+    let Ok(plaintext) = proto::encode(&payload) else {
+        return;
+    };
+    let send_id = session.next_stream_id;
+    session.next_stream_id += 1;
+    let Some(envelope) = crate::client::envelope::encrypt_envelope_for(
+        session.own_pq_private.as_ref(),
+        session.pq_peer_keys.encap_for(to),
+        key_mode,
+        pubkey_der,
+        None,
+        send_id,
+        &plaintext,
+        content,
+    ) else {
+        return;
+    };
+    session
+        .peer_link
+        .send_reliable_or_queue(to, P2pPayload::Envelope { channel: None, envelope });
+}
+
+/// Applies an incoming `Content::OtpEndSession` envelope
+/// (`direct_message::on_message`'s content-dispatch): the peer has
+/// unilaterally ended the session - there is nothing here to accept or
+/// reject, only to converge to. Tears this side down exactly like
+/// `handle_end_otp_command` tore the initiator's own side down (the same
+/// full local reset, the same reasoning: this side must never spend a pad
+/// the peer has already stopped tracking), then always replies with
+/// `OtpEndSessionAck` - even for a contact that was already reset, since
+/// that is exactly what a retried notice whose first ack got lost looks
+/// like on this end, and the initiator's own retry
+/// (`resend_pending_end_notices`) only stops once one genuinely arrives.
+pub(crate) async fn on_end_session(
+    session: &mut SessionState,
+    ui_state: &mut UiState,
+    from: UserId,
+    from_name: String,
+    sender: &UserInfo,
+    envelope: Envelope,
+) {
+    let Some(plaintext) =
+        crate::client::session::decrypt_own_envelope(&envelope, from, sender, None, session)
+    else {
+        return;
+    };
+    let Ok(payload) = proto::decode::<crypto::otp::OtpEndSessionPayload>(&plaintext) else {
+        return;
+    };
+    let had_session = session
+        .otp_store
+        .get(&payload.contact_name)
+        .is_some_and(|s| s.provisioned);
+
+    let _ = otp_cli::remove_contact(&session.otp_cli_cfg, &payload.contact_name).await;
+    discard_pending_setup(&session.otp_cli_cfg, &payload.contact_name);
+    session.otp_incoming_setup.remove(&from);
+    session.otp_out_queue.clear(&payload.contact_name);
+    session.otp_store.reset_after_peer_ended(&payload.contact_name);
+    let _ = session.otp_store.save();
+    ui_state.clear_otp_active(from);
+    if had_session {
+        notify(
+            ui_state,
+            from,
+            &from_name,
+            format!("OTP session ended by {from_name}"),
+            false,
+        );
+    }
+
+    queue_end_session_payload(
+        session,
+        from,
+        sender.key_mode,
+        &sender.public_key_der,
+        &payload.contact_name,
+        Content::OtpEndSessionAck,
+    );
+}
+
+/// Applies an incoming `Content::OtpEndSessionAck` - the initiator's side of
+/// the notice's confirmation: the peer has genuinely received the
+/// `OtpEndSession` this side sent, immediately or after a retried resend on
+/// some later reconnect, so the durable retry (`resend_pending_end_notices`)
+/// can finally stop. Silent either way - "OTP session ended" was already
+/// shown, locally and immediately, the moment `/endotp` itself ran; this is
+/// background bookkeeping only.
+pub(crate) fn on_end_session_ack(
+    session: &mut SessionState,
+    from: UserId,
+    sender: &UserInfo,
+    envelope: Envelope,
+) {
+    let Some(plaintext) =
+        crate::client::session::decrypt_own_envelope(&envelope, from, sender, None, session)
+    else {
+        return;
+    };
+    let Ok(payload) = proto::decode::<crypto::otp::OtpEndSessionPayload>(&plaintext) else {
+        return;
+    };
+    if session.otp_store.clear_end_notice(&payload.contact_name) {
+        let _ = session.otp_store.save();
+    }
+}
+
+/// Re-sends every `/endotp` notice still owed to a reachable peer - the
+/// `/endotp` counterpart of `resend_pending_setups`, driven by the same
+/// `LinkStatusChanged` -> `Active` trigger and for the same reason: a peer
+/// who was offline (or unreachable) when the session ended must still learn
+/// about it, however long that takes, the instant they are reachable again.
+pub(crate) async fn resend_pending_end_notices(
+    wr: &mut impl crate::control::ControlSink,
+    session: &mut SessionState,
+    ui_state: &mut UiState,
+) -> proto::Result<()> {
+    if session.own_pq_fp.is_none() {
+        return Ok(());
+    }
+    let owed: Vec<String> = session
+        .otp_store
+        .pending_end_notices()
+        .map(str::to_string)
+        .collect();
+    for contact_name in owed {
+        let Some((peer, pubkey_der)) = peer_for_contact_name(session, ui_state, &contact_name)
+        else {
+            continue; // not currently connected - a later transition retries
+        };
+        let Some(peer_info) = ui_state.known_users.get(&peer).cloned() else {
+            continue;
+        };
+        send_end_session_payload(
+            wr,
+            session,
+            peer,
+            peer_info.key_mode,
+            &pubkey_der,
+            &contact_name,
+            Content::OtpEndSession,
+        )
+        .await;
+    }
+    Ok(())
 }
 
 /// Fetches `contact_name`'s current `otp --show-contact` snapshot and

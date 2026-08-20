@@ -306,6 +306,22 @@ pub enum Content {
     /// before trusting the plaintext, same as any other receiver-side
     /// sanity check).
     DeviceIdAnnounce,
+    /// Carries a bincode-encoded `crypto::otp::OtpEndSessionPayload`: either
+    /// participant's `/endotp` unilaterally tearing the session down
+    /// (`client::otp::handle_end_otp_command`). Sent over an ordinary
+    /// `pq_hybrid` envelope, never pad-wrapped, the same reasoning
+    /// `OtpKeySetup`'s doc gives - the pad layer cannot protect a message
+    /// that ends its own session, and by the time this is sent the local
+    /// pad may already be destroyed. Trailing and matched only via `!=`
+    /// elsewhere, so this is non-breaking - an old peer that doesn't
+    /// recognise it simply never receives the notice.
+    OtpEndSession,
+    /// Carries a bincode-encoded `crypto::otp::OtpEndSessionPayload`, the
+    /// reply to `OtpEndSession` (`client::otp::on_end_session`) - purely an
+    /// acknowledgement (ending is unilateral, never refused), so the
+    /// initiator's own durably-retried notice (`OtpStore::pending_end_notices`)
+    /// stops resending once this arrives.
+    OtpEndSessionAck,
 }
 
 /// Messages the client sends to the server - pure signaling: auth,

@@ -325,3 +325,140 @@ fn a_line_written_before_pending_setup_existed_still_loads() {
     assert_eq!(state.pending_unacked_out_seq, Some(2));
     std::fs::remove_file(&path).ok();
 }
+
+// ---------------------------------------------------------------------
+// /endotp - ending a session (docs/PROTOCOL.md 16.6)
+// ---------------------------------------------------------------------
+
+/// @requirement TB-212
+#[test]
+fn end_session_resets_every_field_but_owes_a_notice() {
+    let path = temp_store_path();
+    let mut store = OtpStore::new_empty(path.clone());
+    store.mark_provisioned("alice-bob");
+    store.record_sent("alice-bob", 3, PendingOtpContent::Text { channel: None });
+    store.record_received("alice-bob", 0);
+    store.mark_setup_pending("alice-bob", 2);
+
+    store.end_session("alice-bob");
+
+    let state = store.get("alice-bob").unwrap();
+    assert!(!state.provisioned, "the ended contact must look never-provisioned");
+    assert_eq!(state.pending_unacked_out_seq, None);
+    assert_eq!(state.pending_content, None);
+    assert_eq!(state.pending_setup_size_mb, None);
+    assert_eq!(
+        state.next_out_seq, 0,
+        "a future fresh pad provisioned under this same (deterministically-derived) name must \
+         never inherit the ended session's sequence counters"
+    );
+    assert_eq!(state.next_expected_in_seq, 0);
+    assert!(state.pending_end_notice, "the peer still needs to be told");
+    std::fs::remove_file(&path).ok();
+}
+
+/// @requirement AC-194
+#[test]
+fn a_pending_end_notice_survives_save_and_load() {
+    let path = temp_store_path();
+    let mut store = OtpStore::new_empty(path.clone());
+    store.mark_provisioned("alice-bob");
+    store.end_session("alice-bob");
+    store.save().unwrap();
+
+    // Reloaded, because the whole point is surviving a restart - a peer who
+    // was offline when the session ended is still owed the notice tomorrow.
+    let loaded = OtpStore::load(&path).unwrap();
+    assert!(loaded.get("alice-bob").unwrap().pending_end_notice);
+    std::fs::remove_file(&path).ok();
+}
+
+/// @requirement TB-212
+#[test]
+fn reset_after_peer_ended_resets_fully_and_owes_no_notice_of_its_own() {
+    let path = temp_store_path();
+    let mut store = OtpStore::new_empty(path.clone());
+    store.mark_provisioned("alice-bob");
+    store.record_sent("alice-bob", 1, PendingOtpContent::Text { channel: None });
+
+    store.reset_after_peer_ended("alice-bob");
+
+    let state = store.get("alice-bob").unwrap();
+    assert!(!state.provisioned);
+    assert_eq!(state.pending_unacked_out_seq, None);
+    assert!(
+        !state.pending_end_notice,
+        "the receiving side was told, not the one telling - it owes no notice of its own"
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// @requirement AC-194
+#[test]
+fn clear_end_notice_reports_whether_anything_was_owed() {
+    let path = temp_store_path();
+    let mut store = OtpStore::new_empty(path.clone());
+    store.mark_provisioned("alice-bob");
+    store.end_session("alice-bob");
+    assert!(
+        store.clear_end_notice("alice-bob"),
+        "the first genuine ack clears it"
+    );
+    assert!(
+        !store.clear_end_notice("alice-bob"),
+        "a duplicate or stray ack must be distinguishable from a real one"
+    );
+    assert!(!store.clear_end_notice("someone-else"));
+    std::fs::remove_file(&path).ok();
+}
+
+/// @requirement AC-194
+#[test]
+fn pending_end_notices_yields_only_contacts_still_owed_one() {
+    let path = temp_store_path();
+    let mut store = OtpStore::new_empty(path.clone());
+    store.mark_provisioned("owed");
+    store.end_session("owed");
+    store.mark_provisioned("settled");
+    let owed: Vec<String> = store.pending_end_notices().map(str::to_string).collect();
+    assert_eq!(owed, vec!["owed".to_string()]);
+    std::fs::remove_file(&path).ok();
+}
+
+/// A store written before `/endotp` existed has no such field at all;
+/// loading one must mean "no notice owed", not a parse failure that would
+/// discard the rest of that line's state.
+///
+/// @requirement AC-194
+#[test]
+fn a_line_written_before_pending_end_notice_existed_still_loads_as_false() {
+    let path = temp_store_path();
+    std::fs::write(&path, "alice-bob\t1\t2\t3\t4\tT\t7\n").unwrap();
+    let loaded = OtpStore::load(&path).unwrap();
+    let state = loaded.get("alice-bob").unwrap();
+    assert!(!state.pending_end_notice);
+    assert_eq!(state.pending_setup_size_mb, Some(7));
+    std::fs::remove_file(&path).ok();
+}
+
+/// @requirement TB-212
+#[test]
+fn ending_one_contacts_session_does_not_touch_another_contacts_state() {
+    let path = temp_store_path();
+    let mut store = OtpStore::new_empty(path.clone());
+    store.mark_provisioned("alice-bob");
+    store.mark_provisioned("alice-carol");
+    store.record_sent("alice-carol", 5, PendingOtpContent::Text { channel: None });
+
+    store.end_session("alice-bob");
+
+    assert!(!store.get("alice-bob").unwrap().provisioned);
+    let carol = store.get("alice-carol").unwrap();
+    assert!(
+        carol.provisioned,
+        "a wholly independent contact - a different pinned nickname, a different otp key - must \
+         be untouched by ending this one"
+    );
+    assert_eq!(carol.pending_unacked_out_seq, Some(5));
+    std::fs::remove_file(&path).ok();
+}

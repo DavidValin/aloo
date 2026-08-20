@@ -838,6 +838,14 @@ async fn handle_ui_action(
         UiAction::RejectOtpInvite => {
             crate::client::otp::reject_invite(wr, session, ui_state).await?;
         }
+        UiAction::EndOtpSession {
+            peer,
+            key_mode,
+            pubkey_der,
+        } => {
+            crate::client::otp::handle_end_otp_command(wr, ui_state, session, peer, key_mode, pubkey_der)
+                .await?;
+        }
         UiAction::CheckOtpMailRecipient { nickname } => {
             crate::client::otp_mail::handle_check_recipient(session, ui_state, nickname).await;
         }
@@ -1052,6 +1060,29 @@ async fn handle_server_message(
             // channel with them).
             if !ui_state.known_users.contains_key(&user.id) {
                 check_identity(session, ui_state, &user);
+                // A peer who already has a provisioned OTP contact - an
+                // active session from before they disconnected, or from an
+                // earlier run of this app - reconnects under a fresh
+                // `UserId`. Re-derive the UI-facing "active" flag for it
+                // here, the same way `contact_name_if_active` already
+                // re-derives the real send-path gate fresh from
+                // `peer_pubkey_der` on every send. Without this, the
+                // shield/header/call-blocking would wrongly show "inactive"
+                // the moment a still-live session's peer reconnects, even
+                // though nothing about the session itself ended - only
+                // `/endotp` may do that (`docs/PROTOCOL.md` §16.6).
+                if let Some(contact_name) =
+                    crate::client::otp::contact_name_if_active(session, &user.public_key_der)
+                {
+                    ui_state.mark_otp_active(user.id);
+                    crate::client::otp::refresh_otp_key_status(
+                        &session.otp_cli_cfg,
+                        ui_state,
+                        user.id,
+                        &contact_name,
+                    )
+                    .await;
+                }
             }
             // Start punching a direct link the moment we learn this peer
             // exists rather than at first send (§7.1): voice is never
@@ -1364,6 +1395,11 @@ async fn handle_p2p_event(
                     // peer who went offline mid-provisioning resumes instead
                     // of stranding both sides.
                     crate::client::otp::resend_pending_setups(wr, session, ui_state).await?;
+                    // Same trigger again, for a `/endotp` notice this side
+                    // still owes a peer who was unreachable when it ran (or
+                    // whose acknowledgement never made it back) - see
+                    // `docs/PROTOCOL.md` §16.6.
+                    crate::client::otp::resend_pending_end_notices(wr, session, ui_state).await?;
 
                     // Tells `peer` our own device id, encrypted, every time
                     // the link reaches Active (idempotent - harmless on a

@@ -37,19 +37,20 @@ Feature: When someone's connection closes
     Then bob is dropped from the channel list
 
   @AC-053
-  Scenario: An offline peer's room refuses to take a message
+  Scenario: An offline peer's room refuses to send, though it can still be typed into
     Given I am connected and viewing a channel
     And bob is in the channel with me
     And bob has sent me the private message "hi"
     And bob has gone offline
     When I open a private room with bob
     Then focus moves to the compose bar
+    And the compose bar shows an offline notice in red
     When I type "are you there"
-    Then the compose bar refuses everything I type
+    Then the compose bar holds "are you there"
     When I press Enter
     Then nothing is sent
     And the private room holds only 2 messages
-    And the compose bar shows an offline notice in red
+    And the compose bar holds "are you there"
 
   @AC-053 @TB-105
   Scenario: Another person's room still works normally

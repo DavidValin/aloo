@@ -189,6 +189,13 @@ const HELP_BODY: &[&str] = &[
     "             layer on top of pq_hybrid for that contact only. Never",
     "             starts on its own say-so - always ends in an explicit",
     "             Accept/Reject on the other side, confirmed back to you.",
+    "  /endotp    ends an active session with that contact right away - no",
+    "             accept/reject needed, either side may do it alone. Your",
+    "             own copy of the pad is destroyed immediately; the other",
+    "             side is told now if reachable, or as soon as they",
+    "             reconnect otherwise. A disconnect alone never ends a",
+    "             session - only /endotp does - and the DM keeps working",
+    "             either way, just without that extra layer once it's off.",
     "  If no key exists yet, you're asked to confirm generating one and",
     "  sharing it automatically over pq_hybrid (or you can run 'otp'",
     "  yourself and place the keys under ~/.aloo/otp/.keychain/ instead).",
@@ -893,6 +900,16 @@ pub enum UiAction {
     AcceptOtpInvite,
     /// The user rejected it - `client::otp::reject_invite`.
     RejectOtpInvite,
+    /// Sent by the `/endotp` command (`submit_input`) for the currently
+    /// open DM room - unilaterally ends an active OTP session with that
+    /// peer (`client::otp::handle_end_otp_command`), no accept/reject round
+    /// trip the way starting one needs. The one DM action `submit_input`
+    /// still allows while that peer is offline - see its doc.
+    EndOtpSession {
+        peer: UserId,
+        key_mode: KeyMode,
+        pubkey_der: Vec<u8>,
+    },
     /// Emitted on every keystroke in the mail compose view's To field
     /// (docs/PROTOCOL.md §17.1) - `client::otp_mail::check_recipient` runs
     /// the pinned-user + keychain + remaining-key checks (which need
@@ -1163,6 +1180,19 @@ pub struct UiState {
     /// where "in OTP mode" has an unambiguous meaning - a channel send may
     /// wrap per-recipient under a contact's pad too, but a channel log has
     /// no single peer for a shield to describe.
+    ///
+    /// Keyed by connection-lifetime `UserId`, unlike the actual send-path
+    /// gate (`SessionState::otp_store`, keyed by the fingerprint-derived
+    /// contact name, which is what genuinely decides whether a send gets
+    /// OTP-wrapped and survives a reconnect on its own). This set alone
+    /// would therefore go stale - showing "inactive" - the instant a peer's
+    /// `UserId` changes, even though the underlying session is still very
+    /// much alive; `mark_otp_active` is re-called for the fresh `UserId` the
+    /// moment we learn a reconnected peer is provisioned again
+    /// (`session::handle_server_message`'s `UserJoined` arm), which is what
+    /// makes this set track the persistent session rather than the
+    /// connection. The only thing that ever removes an entry is `/endotp`
+    /// (`clear_otp_active`), on either side - never a disconnect.
     otp_active_peers: HashSet<UserId>,
     /// Live `otp --show-contact` snapshots for peers in `otp_active_peers`,
     /// driving the OTP session header's Seq/Offset/remaining figures
@@ -2125,9 +2155,24 @@ impl UiState {
     }
 
     /// Records that a mutual-consent OTP session has genuinely started with
-    /// `peer` - see `otp_active_peers`'s doc.
+    /// `peer` - see `otp_active_peers`'s doc. Also (re-)called, idempotently,
+    /// the moment a peer we already have a provisioned OTP contact for
+    /// reconnects under a fresh `UserId` (`session::handle_server_message`'s
+    /// `UserJoined` arm) - this per-connection flag would otherwise forget
+    /// an otherwise still-active session across every reconnect, which is
+    /// exactly what `/endotp` (and nothing else) is supposed to end.
     pub fn mark_otp_active(&mut self, peer: UserId) {
         self.otp_active_peers.insert(peer);
+    }
+
+    /// The reverse of `mark_otp_active` - `/endotp` ending the session, on
+    /// either side (`client::otp::handle_end_otp_command`/`on_end_session`).
+    /// Also drops any stale key-metadata snapshot (`otp_key_status`) for
+    /// this peer, so a session started fresh with them afterward shows only
+    /// its own figures, never a leftover reading from the one just ended.
+    pub fn clear_otp_active(&mut self, peer: UserId) {
+        self.otp_active_peers.remove(&peer);
+        self.otp_key_status.remove(&peer);
     }
 
     /// Whether `peer`'s messages should carry the OTP shield prefix right
@@ -3073,13 +3118,18 @@ impl UiState {
         ) {
             return self.handle_messages_key(code);
         }
-        // An offline DM peer can't receive anything: no typing, no send.
-        // The compose bar renders "(user offline)" instead in this state
-        // (`render_input_bar`), so there's nothing meaningful to edit. Same
-        // for a Pending/Rejected identity (docs/PROTOCOL.md §12) - normal
-        // navigation can no longer even open this room, but a room already
-        // open before the mismatch arrived must stop accepting input too.
-        if self.active_dm_peer_offline() || self.active_dm_peer_trust_gated() {
+        // A Pending/Rejected identity (docs/PROTOCOL.md §12) blocks typing
+        // outright - normal navigation can no longer even open this room,
+        // but a room already open before the mismatch arrived must stop
+        // accepting input too. An offline DM peer, by contrast, no longer
+        // blocks typing here: `/endotp` must still be composable and
+        // submitted for a peer who isn't currently reachable (ending a
+        // session must not require them to be reachable - see
+        // `client::otp`'s module doc), so `submit_input` itself is what
+        // refuses every *other* command/plain send to an offline peer, with
+        // `/endotp` the one deliberate exception. `render_input_bar` shows
+        // whatever's actually typed once it's non-empty, offline or not.
+        if self.active_dm_peer_trust_gated() {
             return None;
         }
         match code {
@@ -3101,6 +3151,33 @@ impl UiState {
     /// typed text would silently vanish instead of just staying put.
     fn submit_input(&mut self) -> Option<UiAction> {
         if self.input.trim().is_empty() {
+            return None;
+        }
+        if self.input.trim() == "/endotp" {
+            // The one DM action allowed to reach a peer who is currently
+            // offline (`handle_input_key` no longer blocks typing for that
+            // alone) - ending a session must not require them to be
+            // reachable right now, only that the far side eventually learns
+            // about it (`client::otp::resend_pending_end_notices`). Still a
+            // no-op for a trust-gated peer (docs/PROTOCOL.md §12), same as
+            // every other DM action.
+            let peer_id = self.active_private_room?;
+            if self.is_trust_gated(peer_id) {
+                return None;
+            }
+            let peer = self.known_users.get(&peer_id)?.clone();
+            self.input.clear();
+            return Some(UiAction::EndOtpSession {
+                peer: peer_id,
+                key_mode: peer.key_mode,
+                pubkey_der: peer.public_key_der,
+            });
+        }
+        // Everything below requires the open DM's peer (if any) to actually
+        // be reachable - `/endotp` above is the one deliberate exception.
+        // `active_dm_peer_offline` is `false` whenever no DM room is open at
+        // all, so this never touches a channel send.
+        if self.active_dm_peer_offline() || self.active_dm_peer_trust_gated() {
             return None;
         }
         if self.input.trim() == "/file" {
@@ -4781,19 +4858,23 @@ pub(crate) fn render_input_bar(frame: &mut Frame, area: Rect, state: &UiState) {
         .border_style(border_style);
     let inner = block.inner(area);
 
-    // An offline DM peer can't receive anything typed here (`handle_input_key`
-    // already refuses it) - replace whatever's in `input` with a clear,
-    // red notice instead of showing a compose bar that looks usable but
-    // silently does nothing. Same treatment for a Pending/Rejected identity
-    // (docs/PROTOCOL.md §12).
-    let mut spans = if dm_peer_offline {
-        vec![Span::styled(
-            "(user offline)",
-            Style::default().fg(Color::Red),
-        )]
-    } else if dm_peer_trust_gated {
+    // A Pending/Rejected identity (docs/PROTOCOL.md §12) always replaces
+    // whatever's in `input` with a clear, red notice - nothing typed there
+    // can ever be submitted (`handle_input_key` refuses it outright). An
+    // offline DM peer gets the same red placeholder only while `input` is
+    // actually empty: typing is no longer blocked for that case alone
+    // (`/endotp` must still be composable and submitted while a peer is
+    // unreachable - `handle_input_key`'s doc), so the moment there's
+    // something typed, show it rather than hiding it behind a fixed notice
+    // the user would otherwise be typing blind past.
+    let mut spans = if dm_peer_trust_gated {
         vec![Span::styled(
             "(identity not verified)",
+            Style::default().fg(Color::Red),
+        )]
+    } else if dm_peer_offline && state.input.is_empty() {
+        vec![Span::styled(
+            "(user offline)",
             Style::default().fg(Color::Red),
         )]
     } else {
@@ -4809,11 +4890,11 @@ pub(crate) fn render_input_bar(frame: &mut Frame, area: Rect, state: &UiState) {
 
     // Only show a blinking cursor here when this bar is actually focused,
     // nothing else (e.g. the join-channel popup) is drawn on top of it, and
-    // there's actually text to edit (not the offline notice above).
+    // there's actually text to edit (not one of the placeholders above).
     if state.focus == Focus::Input
         && state.mode == Mode::Normal
-        && !dm_peer_offline
         && !dm_peer_trust_gated
+        && (!dm_peer_offline || !state.input.is_empty())
     {
         let cursor_x =
             inner.x + (state.input.chars().count() as u16).min(inner.width.saturating_sub(1));

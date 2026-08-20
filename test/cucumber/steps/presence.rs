@@ -136,15 +136,6 @@ async fn gray_vs_green(w: &mut AlooWorld, offline: String, online: String) {
     );
 }
 
-#[then("the compose bar refuses everything I type")]
-async fn compose_refuses(w: &mut AlooWorld) {
-    assert_eq!(
-        w.ui_ref().input,
-        "",
-        "typing must be a no-op while the peer is offline"
-    );
-}
-
 #[then(expr = "the private room holds only {int} message(s)")]
 async fn room_message_count(w: &mut AlooWorld, n: usize) {
     let state = w.ui_ref();

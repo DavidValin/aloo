@@ -490,3 +490,29 @@ async fn loser_keeps_nothing(w: &mut AlooWorld) {
         "and must not have adopted one either"
     );
 }
+
+// ---------------------------------------------------------------------
+// /endotp - ending a session, and surviving a reconnect (AC-192, AC-193)
+// ---------------------------------------------------------------------
+
+#[given(expr = "the otp session with {word} is active")]
+async fn otp_session_active(w: &mut AlooWorld, who: String) {
+    w.ui_mut().mark_otp_active(UserId(id_for(&who)));
+}
+
+#[then(expr = "the otp session with {word} is still active")]
+async fn otp_session_still_active(w: &mut AlooWorld, who: String) {
+    assert!(
+        w.ui_ref().is_otp_active(UserId(id_for(&who))),
+        "a disconnect alone must never end an active session - only /endotp may"
+    );
+}
+
+#[then("the otp session was ended")]
+async fn otp_session_was_ended(w: &mut AlooWorld) {
+    assert!(
+        matches!(w.last_action, Some(UiAction::EndOtpSession { .. })),
+        "expected /endotp to produce EndOtpSession, got {:?}",
+        w.last_action
+    );
+}

@@ -100,7 +100,7 @@ fn reopening_dm_clears_unread_flag() {
 
 /// @requirement AC-053
 #[test]
-fn compose_bar_ignores_typing_and_enter_while_the_open_dm_peer_is_offline() {
+fn compose_bar_refuses_to_send_a_plain_message_to_an_offline_dm_peer() {
     let mut state = joined_general_with(vec![user(2, "bob")]);
     state.on_direct_message(UserId(2), "bob".into(), MessageBody::Text("hi".into())); // gives bob DM history
     state.on_user_offline(UserId(2));
@@ -111,20 +111,53 @@ fn compose_bar_ignores_typing_and_enter_while_the_open_dm_peer_is_offline() {
 
     type_str(&mut state, "are you there");
     assert_eq!(
-        state.input, "",
-        "typing must be a no-op while the DM peer is offline"
+        state.input, "are you there",
+        "typing itself is no longer blocked while a DM peer is offline - only sending is \
+         (`/endotp` needs to still be composable and submittable in this state)"
     );
 
     let action = press(&mut state, KeyCode::Enter);
     assert_eq!(
         action, None,
-        "Enter must not send while the DM peer is offline"
+        "Enter must not send a plain message while the DM peer is offline"
+    );
+    assert_eq!(
+        state.input, "are you there",
+        "a refused send leaves the typed text in place, same as any other refusal"
     );
     assert_eq!(
         state.private_rooms[&UserId(2)].log.len(),
         2,
         "bob's earlier message plus his own disconnect notice - nothing sent by us"
     );
+}
+
+/// @requirement AC-053
+#[test]
+fn endotp_can_still_be_typed_and_submitted_while_the_open_dm_peer_is_offline() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.focus = Focus::Sidebar;
+    press(&mut state, KeyCode::Enter); // opens DM with bob while he's still online
+    assert_eq!(state.active_private_room, Some(UserId(2)));
+    // Disconnects *after* the room is open - with no prior DM history, bob
+    // going offline before this would drop him from the sidebar entirely
+    // (`on_user_offline`'s "nothing to keep them around for" branch), which
+    // isn't the case this test is about: an *already-open* room's peer
+    // disconnecting mid-session, the scenario `/endotp` needs to survive.
+    state.on_user_offline(UserId(2));
+
+    type_str(&mut state, "/endotp");
+    assert_eq!(
+        state.input, "/endotp",
+        "unlike every other command, /endotp must be typeable while the peer is offline"
+    );
+
+    let action = press(&mut state, KeyCode::Enter);
+    match action {
+        Some(UiAction::EndOtpSession { peer, .. }) => assert_eq!(peer, UserId(2)),
+        other => panic!("expected EndOtpSession even while the peer is offline, got {other:?}"),
+    }
+    assert_eq!(state.input, "", "a recognized command always clears input");
 }
 
 /// @requirement TB-105
@@ -605,6 +638,91 @@ fn otp_active_peers_default_to_inactive_until_marked() {
     assert!(!state.is_otp_active(UserId(2)));
     state.mark_otp_active(UserId(2));
     assert!(state.is_otp_active(UserId(2)));
+}
+
+// ---------------------------------------------------------------------
+// /endotp - ending a session, and surviving a reconnect (docs/PROTOCOL.md 16.6)
+// ---------------------------------------------------------------------
+
+/// @requirement AC-192
+#[test]
+fn clear_otp_active_reverses_mark_otp_active_and_drops_the_key_status_snapshot() {
+    let mut state = joined_general_with(vec![pq_hybrid_user(2, "bob")]);
+    state.mark_otp_active(UserId(2));
+    state.set_otp_key_status(UserId(2), Default::default());
+    assert!(state.is_otp_active(UserId(2)));
+    assert!(state.otp_key_status_for(UserId(2)).is_some());
+
+    state.clear_otp_active(UserId(2));
+
+    assert!(!state.is_otp_active(UserId(2)));
+    assert!(
+        state.otp_key_status_for(UserId(2)).is_none(),
+        "a session started fresh with this peer later must not show a stale reading from the \
+         one just ended"
+    );
+}
+
+/// The per-connection `otp_active_peers` flag must never be cleared by a
+/// mere disconnect - only `/endotp`, on either side, may end a session
+/// (`docs/PROTOCOL.md` 16.6). `on_user_offline` is the one call site every
+/// disconnect goes through (`session::handle_server_message`'s
+/// `UserOffline` arm), so this pins the actual regression the reconnect
+/// requirement is about.
+///
+/// @requirement AC-193
+#[test]
+fn a_disconnect_alone_does_not_end_an_active_otp_session() {
+    let mut state = joined_general_with(vec![pq_hybrid_user(2, "bob")]);
+    state.mark_otp_active(UserId(2));
+
+    state.on_user_offline(UserId(2));
+
+    assert!(
+        state.is_otp_active(UserId(2)),
+        "bob disconnecting must not by itself end the session - only /endotp may"
+    );
+}
+
+/// `submit_input`'s counterpart to `/otp`'s own
+/// `accepting_an_invite_produces_accept_otp_invite_action`-style tests:
+/// `/endotp` for the currently open DM room produces `EndOtpSession`
+/// addressed to that exact peer, with their current key material attached
+/// (`send_end_session_payload` needs it to build the outer `pq_hybrid`
+/// envelope).
+///
+/// @requirement AC-192
+#[test]
+fn endotp_in_an_open_dm_room_produces_end_otp_session_for_that_peer() {
+    let mut state = joined_general_with(vec![pq_hybrid_user(2, "bob")]);
+    state.focus = Focus::Sidebar;
+    press(&mut state, KeyCode::Enter); // opens DM with bob
+    assert_eq!(state.active_private_room, Some(UserId(2)));
+
+    type_str(&mut state, "/endotp");
+    let action = press(&mut state, KeyCode::Enter);
+    match action {
+        Some(UiAction::EndOtpSession {
+            peer,
+            key_mode,
+            pubkey_der,
+        }) => {
+            assert_eq!(peer, UserId(2));
+            assert_eq!(key_mode, KeyMode::PqHybrid);
+            assert_eq!(pubkey_der, pq_hybrid_user(2, "bob").public_key_der);
+        }
+        other => panic!("expected EndOtpSession, got {other:?}"),
+    }
+    assert_eq!(state.input, "");
+}
+
+/// @requirement AC-192
+#[test]
+fn endotp_outside_any_open_dm_room_is_a_no_op() {
+    let mut state = joined_general_with(vec![pq_hybrid_user(2, "bob")]);
+    assert_eq!(state.active_private_room, None);
+    type_str(&mut state, "/endotp");
+    assert_eq!(press(&mut state, KeyCode::Enter), None);
 }
 
 /// @requirement AC-141

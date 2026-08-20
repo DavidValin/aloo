@@ -181,6 +181,16 @@ pub struct OtpSessionRequestPayload {
     pub contact_name: String,
 }
 
+/// Carried by both `Content::OtpEndSession` (either participant's `/endotp`
+/// unilaterally ending the session) and `Content::OtpEndSessionAck` (its
+/// reply) - one shape for both, since the ack has nothing to report beyond
+/// "received" (ending is never refused the way a proposal can be). Carries
+/// no key material, so it isn't zeroized.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OtpEndSessionPayload {
+    pub contact_name: String,
+}
+
 // ---------------------------------------------------------------------
 // OTP mail (docs/PROTOCOL.md section 17)
 // ---------------------------------------------------------------------
