@@ -5,12 +5,11 @@ use ui_common::*;
 use aloo::client::netstats::ConnQuality;
 use aloo::client::p2p::LinkStatus;
 use aloo::proto::{ChannelInfo, ChannelKind, KeyMode, UserId};
-use aloo::client::tui::channel::DWELL_DURATION;
 use aloo::client::tui::ui::{Focus, IdentityCase, MessageBody, UiAction, UiState, VoiceTarget, render};
 use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
-use std::time::{Duration, Instant};
+
 
 fn sidebar_rows(state: &UiState) -> Vec<String> {
     let backend = TestBackend::new(160, 30);
@@ -39,7 +38,7 @@ fn row_containing(rows: &[String], needle: &str) -> String {
 
 /// @requirement AC-018, TB-024
 #[test]
-fn channel_list_adds_unjoined_channels_without_duplicating() {
+fn channel_list_records_the_public_directory_without_duplicating() {
     let mut state = UiState::new("me".into());
     state.on_channel_list(vec![ChannelInfo {
         name: "general".into(),
@@ -49,18 +48,18 @@ fn channel_list_adds_unjoined_channels_without_duplicating() {
         name: "general".into(),
         kind: ChannelKind::Public,
     }]);
-    assert_eq!(state.channels.len(), 1);
-    assert!(!state.channels[0].joined);
+    assert_eq!(state.known_public_channels().len(), 1);
+    assert!(
+        state.channels.is_empty(),
+        "the directory is not the tab row - only joining creates a tab"
+    );
 }
 
 /// @requirement TB-024
 #[test]
 fn on_joined_marks_existing_channel_joined_or_creates_it() {
     let mut state = UiState::new("me".into());
-    state.on_channel_list(vec![ChannelInfo {
-        name: "general".into(),
-        kind: ChannelKind::Public,
-    }]);
+    state.seed_member("general", user(2, "bob"));
     state.on_joined(ChannelInfo {
         name: "general".into(),
         kind: ChannelKind::Public,
@@ -400,58 +399,66 @@ fn force_stop_recording_stops_regardless_of_trigger_and_is_a_noop_when_idle() {
 }
 
 // ---------------------------------------------------------------------
-// [ / ] dwell-to-join
+// [ / ] tab switching
 // ---------------------------------------------------------------------
+
+/// The first occurrence of `text` at or below row `min_y` - the same
+/// cell-by-cell scan as `ui_common::find_text_start`, bounded so a popup
+/// row can be told apart from an identical string elsewhere on screen.
+fn find_text_start_below(
+    buffer: &ratatui::buffer::Buffer,
+    text: &str,
+    min_y: u16,
+) -> (u16, u16) {
+    let want: Vec<String> = text.chars().map(|c| c.to_string()).collect();
+    for y in min_y..buffer.area.height {
+        for x in 0..buffer.area.width {
+            let matches = want.iter().enumerate().all(|(i, ch)| {
+                let xi = x + i as u16;
+                xi < buffer.area.width && buffer[(xi, y)].symbol() == ch
+            });
+            if matches {
+                return (x, y);
+            }
+        }
+    }
+    panic!("text {text:?} not found at or below row {min_y}");
+}
+
+/// Joins `names` as public channels, in order - every tab is a joined
+/// channel now, so this is what a multi-tab state looks like.
+fn joined_public(names: &[&str]) -> UiState {
+    let mut state = UiState::new("me".into());
+    for name in names {
+        state.on_joined(ChannelInfo {
+            name: (*name).into(),
+            kind: ChannelKind::Public,
+        });
+    }
+    state
+}
 
 /// @requirement AC-020
 #[test]
-fn bracket_key_selects_next_channel_immediately_but_does_not_join_yet() {
-    let mut state = UiState::new("me".into());
-    state.on_channel_list(vec![
-        ChannelInfo {
-            name: "general".into(),
-            kind: ChannelKind::Public,
-        },
-        ChannelInfo {
-            name: "random".into(),
-            kind: ChannelKind::Public,
-        },
-    ]);
-    state.on_joined(ChannelInfo {
-        name: "general".into(),
-        kind: ChannelKind::Public,
-    });
+fn bracket_key_switches_to_the_next_joined_channel_without_joining_anything() {
+    let mut state = joined_public(&["general", "random"]);
     assert_eq!(state.selected_channel, 0);
 
-    press(&mut state, KeyCode::Char(']'));
+    let action = press(&mut state, KeyCode::Char(']'));
     assert_eq!(
         state.selected_channel, 1,
         "] switches selection immediately"
     );
-    assert!(!state.channels[1].joined, "but hasn't joined yet");
-
-    let too_soon = state.tick_dwell(Instant::now());
-    assert_eq!(too_soon, None);
+    assert_eq!(
+        action, None,
+        "every tab is already joined - switching never requests a join"
+    );
 }
 
 /// @requirement AC-020
 #[test]
 fn opening_bracket_selects_the_previous_channel() {
-    let mut state = UiState::new("me".into());
-    state.on_channel_list(vec![
-        ChannelInfo {
-            name: "general".into(),
-            kind: ChannelKind::Public,
-        },
-        ChannelInfo {
-            name: "random".into(),
-            kind: ChannelKind::Public,
-        },
-    ]);
-    state.on_joined(ChannelInfo {
-        name: "general".into(),
-        kind: ChannelKind::Public,
-    });
+    let mut state = joined_public(&["general", "random"]);
     assert_eq!(state.selected_channel, 0);
 
     press(&mut state, KeyCode::Char('['));
@@ -461,66 +468,14 @@ fn opening_bracket_selects_the_previous_channel() {
     );
 }
 
-/// @requirement AC-020
-#[test]
-fn dwell_fires_join_after_three_seconds() {
-    let mut state = UiState::new("me".into());
-    state.on_channel_list(vec![
-        ChannelInfo {
-            name: "general".into(),
-            kind: ChannelKind::Public,
-        },
-        ChannelInfo {
-            name: "random".into(),
-            kind: ChannelKind::Public,
-        },
-    ]);
-    press(&mut state, KeyCode::Char(']'));
-    let started = Instant::now();
-    let later = started + DWELL_DURATION + Duration::from_millis(1);
-
-    let action = state.tick_dwell(later);
-    assert_eq!(
-        action,
-        Some(UiAction::JoinChannel {
-            name: "random".into(),
-            kind: ChannelKind::Public,
-            password: None
-        })
-    );
-}
-
-/// @requirement TB-025
-#[test]
-fn dwell_does_not_refire_for_an_already_joined_channel() {
-    let mut state = UiState::new("me".into());
-    state.on_channel_list(vec![
-        ChannelInfo {
-            name: "general".into(),
-            kind: ChannelKind::Public,
-        },
-        ChannelInfo {
-            name: "random".into(),
-            kind: ChannelKind::Public,
-        },
-    ]);
-    press(&mut state, KeyCode::Char(']'));
-    state.on_joined(ChannelInfo {
-        name: "random".into(),
-        kind: ChannelKind::Public,
-    });
-    let later = Instant::now() + DWELL_DURATION + Duration::from_millis(1);
-    assert_eq!(state.tick_dwell(later), None);
-}
-
 /// @requirement TB-026
 #[test]
 fn switching_tabs_closes_any_open_private_room() {
     let mut state = joined_general_with(vec![user(2, "bob")]);
-    state.on_channel_list(vec![ChannelInfo {
+    state.on_joined(ChannelInfo {
         name: "random".into(),
         kind: ChannelKind::Public,
-    }]);
+    });
     state.focus = Focus::Sidebar;
     press(&mut state, KeyCode::Enter);
     assert!(state.active_private_room.is_some());
@@ -1138,16 +1093,14 @@ fn render_join_popup_overlay_does_not_panic() {
 #[test]
 fn channel_tabs_are_prefixed_by_kind() {
     let mut state = UiState::new("me".into());
-    state.on_channel_list(vec![
-        ChannelInfo {
-            name: "the-hall".into(),
-            kind: ChannelKind::Public,
-        },
-        ChannelInfo {
-            name: "secret-room".into(),
-            kind: ChannelKind::Private,
-        },
-    ]);
+    state.on_joined(ChannelInfo {
+        name: "the-hall".into(),
+        kind: ChannelKind::Public,
+    });
+    state.on_joined(ChannelInfo {
+        name: "secret-room".into(),
+        kind: ChannelKind::Private,
+    });
     let rows = sidebar_rows(&state);
     let tab_row = row_containing(&rows, "the-hall");
     assert!(
@@ -1182,6 +1135,22 @@ fn channel_tabs_are_prefixed_by_kind() {
 #[test]
 fn shares_a_joined_channel_is_true_for_a_member_of_a_joined_channel() {
     let state = joined_general_with(vec![user(2, "bob")]);
+    assert!(state.shares_a_joined_channel(UserId(2)));
+}
+
+/// @requirement TB-155, TB-149
+#[test]
+fn shares_a_joined_channel_is_true_for_a_member_of_an_unselected_joined_channel() {
+    // Being joined is what counts, not being looked at: the link to
+    // everyone in every joined channel is armed regardless of which tab
+    // is on screen.
+    let mut state = joined_general_with(vec![]);
+    state.on_joined(ChannelInfo {
+        name: "random".into(),
+        kind: ChannelKind::Public,
+    });
+    state.seed_member("random", user(2, "bob"));
+    assert_eq!(state.selected_channel, 0, "still looking at general");
     assert!(state.shares_a_joined_channel(UserId(2)));
 }
 
@@ -1236,6 +1205,7 @@ fn a_link_request_is_answered_for_a_dm_peer_with_no_shared_channel() {
 // Leaving a channel (US-026)
 // ---------------------------------------------------------------------
 
+/// @requirement AC-109
 #[test]
 fn slash_leave_on_a_private_channel_removes_its_tab() {
     let mut state = joined_general_with(vec![]);
@@ -1264,8 +1234,9 @@ fn slash_leave_on_a_private_channel_removes_its_tab() {
     assert!(!state.channels.iter().any(|c| c.name == "secret-room"));
 }
 
+/// @requirement AC-109
 #[test]
-fn slash_leave_on_a_public_channel_keeps_the_tab_but_marks_it_left() {
+fn slash_leave_on_a_public_channel_removes_its_tab_too() {
     let mut state = joined_general_with(vec![user(2, "bob")]);
     state.selected_channel = state
         .channels
@@ -1284,24 +1255,19 @@ fn slash_leave_on_a_public_channel_keeps_the_tab_but_marks_it_left() {
 
     let former_members = state.leave_channel_locally("general");
     assert_eq!(former_members, vec![UserId(2)]);
-    let tab = state
-        .channels
-        .iter()
-        .find(|c| c.name == "general")
-        .expect("tab kept");
-    assert!(!tab.joined);
-    assert!(tab.left);
-    assert!(tab.members.is_empty());
+    assert!(
+        !state.channels.iter().any(|c| c.name == "general"),
+        "a tab is a channel you are in - leaving removes it, public or not"
+    );
 }
 
 /// @requirement AC-109
 #[test]
 fn slash_leave_is_a_noop_when_the_selected_channel_is_not_joined() {
     let mut state = joined_general_with(vec![]);
-    state.on_channel_list(vec![ChannelInfo {
-        name: "random".into(),
-        kind: ChannelKind::Public,
-    }]);
+    // A tab whose `Joined` confirmation hasn't arrived yet - the
+    // membership snapshot (§6.1) created it (`seed_member`).
+    state.seed_member("random", user(3, "carol"));
     state.selected_channel = state
         .channels
         .iter()
@@ -1316,82 +1282,6 @@ fn slash_leave_is_a_noop_when_the_selected_channel_is_not_joined() {
         state.input, "/leave",
         "left untouched on failure, same as /file - the user isn't left wondering where it went"
     );
-}
-
-/// @requirement AC-110
-#[test]
-fn left_channel_screen_enter_requests_rejoin() {
-    let mut state = joined_general_with(vec![]);
-    state.selected_channel = state
-        .channels
-        .iter()
-        .position(|c| c.name == "general")
-        .unwrap();
-    state.leave_channel_locally("general");
-
-    let action = press(&mut state, KeyCode::Enter);
-    assert_eq!(
-        action,
-        Some(UiAction::JoinChannel {
-            name: "general".into(),
-            kind: ChannelKind::Public,
-            password: None,
-        })
-    );
-}
-
-/// @requirement AC-110
-#[test]
-fn left_channel_screen_ignores_keys_other_than_enter() {
-    let mut state = joined_general_with(vec![]);
-    state.selected_channel = state
-        .channels
-        .iter()
-        .position(|c| c.name == "general")
-        .unwrap();
-    state.leave_channel_locally("general");
-
-    assert_eq!(press(&mut state, KeyCode::Char('x')), None);
-    assert_eq!(press(&mut state, KeyCode::Tab), None);
-}
-
-/// @requirement AC-110
-#[test]
-fn render_left_channel_screen_does_not_panic() {
-    let mut state = joined_general_with(vec![]);
-    state.selected_channel = state
-        .channels
-        .iter()
-        .position(|c| c.name == "general")
-        .unwrap();
-    state.leave_channel_locally("general");
-    let rows = sidebar_rows(&state);
-    let all = rows.join("");
-    assert!(all.contains("You left this public channel"));
-}
-
-/// @requirement TB-157
-#[test]
-fn dwell_does_not_refire_for_a_left_channel() {
-    let mut state = UiState::new("me".into());
-    state.on_channel_list(vec![
-        ChannelInfo {
-            name: "general".into(),
-            kind: ChannelKind::Public,
-        },
-        ChannelInfo {
-            name: "random".into(),
-            kind: ChannelKind::Public,
-        },
-    ]);
-    state.on_joined(ChannelInfo {
-        name: "general".into(),
-        kind: ChannelKind::Public,
-    });
-    state.leave_channel_locally("random");
-    press(&mut state, KeyCode::Char(']')); // select "random"
-    let later = Instant::now() + DWELL_DURATION + Duration::from_millis(1);
-    assert_eq!(state.tick_dwell(later), None);
 }
 
 /// @requirement TB-158
@@ -1416,18 +1306,326 @@ fn has_reason_to_keep_link_is_false_with_neither() {
     assert!(!state.has_reason_to_keep_link(UserId(2)));
 }
 
-/// @requirement AC-109
+
+// ---------------------------------------------------------------------
+// The /channels public directory (US-004)
+// ---------------------------------------------------------------------
+
+/// @requirement AC-174
 #[test]
-fn on_joined_clears_the_left_flag() {
+fn only_the_hall_is_joined_automatically_however_many_channels_are_offered() {
+    let mut state = UiState::new("me".into());
+    state.on_channel_list(vec![
+        ChannelInfo {
+            name: "random".into(),
+            kind: ChannelKind::Public,
+        },
+        ChannelInfo {
+            name: "the-hall".into(),
+            kind: ChannelKind::Public,
+        },
+    ]);
+    assert_eq!(
+        state.auto_join_channel(),
+        Some(UiAction::JoinChannel {
+            name: "the-hall".into(),
+            kind: ChannelKind::Public,
+            password: None,
+        }),
+        "the default channel is joined even when it isn't the first offered"
+    );
+    assert!(
+        state.channels.is_empty(),
+        "nothing is a tab until its Joined confirmation arrives"
+    );
+}
+
+/// @requirement AC-174
+#[test]
+fn nothing_is_auto_joined_once_a_channel_has_been_joined() {
     let mut state = joined_general_with(vec![]);
-    state.leave_channel_locally("general");
-    assert!(state.channels[0].left);
+    state.on_channel_list(vec![ChannelInfo {
+        name: "the-hall".into(),
+        kind: ChannelKind::Public,
+    }]);
+    assert_eq!(state.auto_join_channel(), None);
+}
+
+/// @requirement TB-206
+#[test]
+fn an_announced_public_channel_is_listed_without_becoming_a_tab() {
+    let mut state = joined_general_with(vec![]);
+    state.on_channel_list(vec![ChannelInfo {
+        name: "random".into(),
+        kind: ChannelKind::Public,
+    }]);
+    assert!(
+        state
+            .known_public_channels()
+            .iter()
+            .any(|c| c.name == "random")
+    );
+    assert!(!state.channels.iter().any(|c| c.name == "random"));
+    assert!(state.is_joined("general"));
+    assert!(!state.is_joined("random"));
+}
+
+/// @requirement TB-206
+#[test]
+fn rendering_before_any_channel_is_joined_does_not_panic() {
+    // Reachable for real now: between the `ChannelList` snapshot and the
+    // `Joined` confirmation for the-hall there are no tabs at all.
+    let mut state = UiState::new("me".into());
+    state.set_own_id(UserId(1));
+    state.on_channel_list(vec![ChannelInfo {
+        name: "the-hall".into(),
+        kind: ChannelKind::Public,
+    }]);
+    assert!(state.channels.is_empty());
+    let rows = rendered_rows(&state);
+    assert!(rows.iter().any(|r| r.contains("Ctrl+H: Help")));
+}
+
+/// @requirement TB-206
+#[test]
+fn a_public_channel_i_created_myself_appears_in_my_own_directory() {
+    // The server's ChannelCreated announcement goes to every client
+    // *except* the creator, so joining is the only signal we get about a
+    // channel we opened with Ctrl+J.
+    let mut state = joined_general_with(vec![]);
     state.on_joined(ChannelInfo {
-        name: "general".into(),
+        name: "watercooler".into(),
         kind: ChannelKind::Public,
     });
-    assert!(!state.channels[0].left);
-    assert!(state.channels[0].joined);
+    assert!(
+        state
+            .known_public_channels()
+            .iter()
+            .any(|c| c.name == "watercooler"),
+        "a public channel I created must be listed in my own /channels"
+    );
+    assert!(state.is_joined("watercooler"));
+}
+
+/// @requirement AC-022
+#[test]
+fn a_private_channel_i_created_is_never_listed_in_the_directory() {
+    let mut state = joined_general_with(vec![]);
+    state.on_joined(ChannelInfo {
+        name: "secret-room".into(),
+        kind: ChannelKind::Private,
+    });
+    assert!(
+        !state
+            .known_public_channels()
+            .iter()
+            .any(|c| c.name == "secret-room"),
+        "a private channel is never advertised, not even to its own author"
+    );
+    assert!(
+        state.channels.iter().any(|c| c.name == "secret-room"),
+        "it is still a tab - being in it is exactly what a tab means"
+    );
+}
+
+/// @requirement TB-206
+#[test]
+fn the_directory_does_not_duplicate_a_channel_already_announced() {
+    let mut state = joined_general_with(vec![]);
+    state.on_channel_list(vec![ChannelInfo {
+        name: "watercooler".into(),
+        kind: ChannelKind::Public,
+    }]);
+    state.on_joined(ChannelInfo {
+        name: "watercooler".into(),
+        kind: ChannelKind::Public,
+    });
+    assert_eq!(
+        state
+            .known_public_channels()
+            .iter()
+            .filter(|c| c.name == "watercooler")
+            .count(),
+        1
+    );
+}
+
+/// @requirement AC-172
+#[test]
+fn slash_channels_opens_the_directory_modal() {
+    let mut state = joined_general_with(vec![]);
+    type_str(&mut state, "/channels");
+    let action = press(&mut state, KeyCode::Enter);
+    assert_eq!(action, None, "opening the directory joins nothing by itself");
+    assert_eq!(state.mode, aloo::client::tui::ui::Mode::ChannelsPopup);
+    assert!(state.input.is_empty(), "the command is consumed");
+}
+
+/// @requirement AC-172
+#[test]
+fn escape_closes_the_directory_without_joining_anything() {
+    let mut state = joined_general_with(vec![]);
+    state.on_channel_list(vec![ChannelInfo {
+        name: "random".into(),
+        kind: ChannelKind::Public,
+    }]);
+    type_str(&mut state, "/channels");
+    press(&mut state, KeyCode::Enter);
+    let action = press(&mut state, KeyCode::Esc);
+    assert_eq!(action, None);
+    assert_eq!(state.mode, aloo::client::tui::ui::Mode::Normal);
+}
+
+/// @requirement AC-172
+#[test]
+fn the_directory_renders_a_joined_channel_in_yellow_and_the_rest_plain() {
+    let mut state = joined_general_with(vec![]);
+    state.on_channel_list(vec![
+        ChannelInfo {
+            name: "general".into(),
+            kind: ChannelKind::Public,
+        },
+        ChannelInfo {
+            name: "random".into(),
+            kind: ChannelKind::Public,
+        },
+    ]);
+    type_str(&mut state, "/channels");
+    press(&mut state, KeyCode::Enter);
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| render(f, &state)).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    // Below the modal's own title row, so the tab row's copy of "general"
+    // (a joined channel is always a tab too) can't be what's measured.
+    let (_, title_y) = find_text_start(&buffer, "Public channels");
+    let (x, y) = find_text_start_below(&buffer, "general", title_y);
+    assert_eq!(
+        buffer[(x, y)].style().fg,
+        Some(ratatui::style::Color::Yellow),
+        "a channel I'm in is yellow in the directory"
+    );
+    let (x, y) = find_text_start_below(&buffer, "random", title_y);
+    assert_ne!(
+        buffer[(x, y)].style().fg,
+        Some(ratatui::style::Color::Yellow),
+        "a channel I'm not in is not"
+    );
+}
+
+/// @requirement AC-173
+#[test]
+fn enter_in_the_directory_joins_the_selected_channel() {
+    let mut state = joined_general_with(vec![]);
+    state.on_channel_list(vec![
+        ChannelInfo {
+            name: "general".into(),
+            kind: ChannelKind::Public,
+        },
+        ChannelInfo {
+            name: "random".into(),
+            kind: ChannelKind::Public,
+        },
+    ]);
+    type_str(&mut state, "/channels");
+    press(&mut state, KeyCode::Enter);
+    press(&mut state, KeyCode::Down);
+    let action = press(&mut state, KeyCode::Enter);
+    assert_eq!(
+        action,
+        Some(UiAction::JoinChannel {
+            name: "random".into(),
+            kind: ChannelKind::Public,
+            password: None,
+        })
+    );
+    assert_eq!(state.mode, aloo::client::tui::ui::Mode::Normal);
+}
+
+/// @requirement AC-173
+#[test]
+fn the_directory_selection_wraps_in_both_directions() {
+    let mut state = joined_general_with(vec![]);
+    state.on_channel_list(vec![
+        ChannelInfo {
+            name: "general".into(),
+            kind: ChannelKind::Public,
+        },
+        ChannelInfo {
+            name: "random".into(),
+            kind: ChannelKind::Public,
+        },
+    ]);
+    type_str(&mut state, "/channels");
+    press(&mut state, KeyCode::Enter);
+    press(&mut state, KeyCode::Up);
+    assert_eq!(state.channels_popup_selected, 1, "Up wraps to the last row");
+    press(&mut state, KeyCode::Down);
+    assert_eq!(state.channels_popup_selected, 0);
+}
+
+/// @requirement TB-206
+#[test]
+fn enter_on_a_channel_i_am_already_in_selects_its_tab_instead_of_rejoining() {
+    let mut state = joined_general_with(vec![]);
+    state.on_joined(ChannelInfo {
+        name: "random".into(),
+        kind: ChannelKind::Public,
+    });
+    state.on_channel_list(vec![
+        ChannelInfo {
+            name: "general".into(),
+            kind: ChannelKind::Public,
+        },
+        ChannelInfo {
+            name: "random".into(),
+            kind: ChannelKind::Public,
+        },
+    ]);
+    state.selected_channel = 1;
+    type_str(&mut state, "/channels");
+    press(&mut state, KeyCode::Enter);
+    let action = press(&mut state, KeyCode::Enter);
+    assert_eq!(action, None, "already a member - no join is sent");
+    assert_eq!(state.selected_channel, 0, "its tab is brought to the front");
+}
+
+/// @requirement AC-109
+#[test]
+fn a_left_public_channel_stays_in_the_directory_to_rejoin_from() {
+    let mut state = joined_general_with(vec![]);
+    state.on_channel_list(vec![ChannelInfo {
+        name: "general".into(),
+        kind: ChannelKind::Public,
+    }]);
+    state.leave_channel_locally("general");
+    assert!(state.channels.is_empty());
+    assert!(
+        state
+            .known_public_channels()
+            .iter()
+            .any(|c| c.name == "general")
+    );
+    assert!(!state.is_joined("general"));
+}
+
+/// @requirement AC-172
+#[test]
+fn rendering_the_directory_with_nothing_announced_does_not_panic() {
+    // In a channel, but no *public* one: a private channel is never
+    // advertised, so nothing has reached the directory yet.
+    let mut state = UiState::new("me".into());
+    state.set_own_id(UserId(1));
+    state.on_joined(ChannelInfo {
+        name: "secret-room".into(),
+        kind: ChannelKind::Private,
+    });
+    assert!(state.known_public_channels().is_empty());
+    type_str(&mut state, "/channels");
+    press(&mut state, KeyCode::Enter);
+    let rows = rendered_rows(&state);
+    assert!(rows.join("").contains("no public channels announced yet"));
 }
 
 /// @requirement AC-140

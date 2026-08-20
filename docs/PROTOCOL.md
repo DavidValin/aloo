@@ -707,7 +707,9 @@ emptied (§6.2).
 
 A channel tab is shown prefixed with an emoji naming its kind at a glance,
 followed by a space before the name: 🌍 for public, 🔒 for private
-(the channel view).
+(the channel view). There is one tab per channel the client is a member
+of, and only those - the wider set of public channels the server has
+announced (§6.3) is a directory the user picks from, not a row of tabs.
 
 ### 6.1 `JoinChannel { name, kind, password }`
 
@@ -775,13 +777,12 @@ empty forever (until server restart); any other channel's next
 Since there's no server acknowledgment to the leaver, the client applies
 `/leave` optimistically: the moment it's submitted (`UiState::
 leave_channel_locally`), before the `LeaveChannel` write even reaches the
-server. A **private** channel's tab is removed from the client entirely -
-it's never re-advertised, so a ghost tab has nothing to reconnect it to. A
-**public** channel's tab instead stays, marked `left`: selecting it shows
-a rejoin prompt instead of the normal view (SPEC.md Functionality), and
-the dwell timer (§6's `[`/`]`) won't silently re-join it - only an
-explicit rejoin does. See §7.1.3 for what leaving does to any P2P links
-that were only justified by that channel's membership.
+server. The channel's tab is removed either way, public or private - a tab
+means "I am in this room". A public channel remains in the announced
+directory (§6.3), so the `/channels` modal is where it's rejoined from; a
+private one is never advertised there, and rejoining it means naming it
+again (Ctrl+J). See §7.1.3 for what leaving does to any P2P links that
+were only justified by that channel's membership.
 
 ### 6.3 `ChannelList(list<ChannelInfo>)` / `ChannelCreated { channel }`
 
@@ -794,7 +795,21 @@ after the initial snapshot doesn't stay invisible to everyone who didn't
 create or join it. A **private** channel creation never triggers this -
 it stays unadvertised exactly as `ChannelList` already keeps it. Joining
 an *already-existing* channel (public or private) never re-triggers it
-either - only genuine creation does. Like every other channel-membership
+either - only genuine creation does.
+
+A client's own joins feed the same directory: `ChannelCreated` is sent to
+every client *except* the creator, so joining a public channel is the only
+signal the creator gets that it now exists, and the client records it (a
+private channel is deliberately never recorded - it is advertised to
+nobody, its author included).
+
+Everything a client learns this way goes into its public channel
+directory - the rows of the `/channels` modal, with the ones it has
+already joined marked - and nothing in it is joined implicitly. Exactly
+one automatic join happens per connection: `DEFAULT_CHANNEL_NAME`
+("the-hall"), if the snapshot offers it and the client is not already in
+a channel. Every other join is a deliberate one (`/channels`' Enter, or
+Ctrl+J by name). Like every other channel-membership
 message, a client learns about a private channel only out-of-band (the
 protocol has no "invite" message).
 

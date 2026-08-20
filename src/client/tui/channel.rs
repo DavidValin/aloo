@@ -5,8 +5,6 @@
 //! `crate::client::tui::ui`; DM-room state/rendering is the mirror image in
 //! `crate::client::tui::direct_message`.
 
-use std::time::{Duration, Instant};
-
 use crossterm::event::KeyCode;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -26,32 +24,17 @@ use super::ui::{
     push_log_entry, render_input_bar, render_messages,
 };
 
-/// How long a tab has to stay selected (`[`/`]`) before it's actually
-/// joined on the network.
-pub const DWELL_DURATION: Duration = Duration::from_secs(3);
-
 #[derive(Debug, Clone)]
 pub struct ChannelTab {
     pub name: String,
     pub kind: ChannelKind,
-    /// Whether we've actually joined (vs. just knowing it exists from the
-    /// channel list / dwell not having fired yet).
+    /// Whether the server's `Joined` confirmation has arrived yet. A tab
+    /// only exists for a channel being joined, but the membership snapshot
+    /// (§6.1) can create it a moment before that confirmation
+    /// (`seed_member`), and until then there's nothing to send to.
     pub joined: bool,
-    /// Set when the user explicitly `/leave`t a *public* channel whose tab
-    /// is still showing (`UiState::leave_channel_locally`) - distinguishes
-    /// "left on purpose" from "never joined yet" so dwelling here doesn't
-    /// silently re-fire a join (`tick_dwell`) and the channel view instead
-    /// shows a rejoin prompt (`render_left_channel_screen`). Always `false`
-    /// for a private channel, which has no tab left to mark - leaving one
-    /// removes it outright. Cleared by `on_joined` once the user rejoins.
-    pub left: bool,
     pub members: Vec<UserInfo>,
     pub log: Vec<LogEntry>,
-}
-
-pub(crate) struct DwellState {
-    pub(crate) target_index: usize,
-    pub(crate) started_at: Instant,
 }
 
 impl UiState {
@@ -268,10 +251,11 @@ impl UiState {
 
     /// Local, optimistic half of leaving `name` - there is no server
     /// acknowledgment to wait for, `LeaveChannel` only notifies whoever
-    /// *remains* (docs/PROTOCOL.md §6.2). A private channel's tab is
-    /// removed outright (it's never re-advertised, so there's no reason to
-    /// keep a ghost tab around); a public channel's tab stays but is
-    /// marked `left` (`render_left_channel_screen` takes over its view).
+    /// *remains* (docs/PROTOCOL.md §6.2). The tab is removed outright,
+    /// public or private alike: tabs are exactly the channels the user is
+    /// currently joined to (`on_joined` is the only thing that creates
+    /// one), and a public channel the user left is still listed in the
+    /// `/channels` directory (`known_channels`) to rejoin from.
     /// Returns the peer ids who were in this channel with us, for the
     /// caller to run the P2P link-relevance sweep against
     /// (`has_reason_to_keep_link`).
@@ -280,37 +264,35 @@ impl UiState {
             return Vec::new();
         };
         let former_members: Vec<UserId> = self.channels[idx].members.iter().map(|m| m.id).collect();
-        if self.channels[idx].kind == ChannelKind::Private {
-            self.channels.remove(idx);
-            self.selected_channel = if self.channels.is_empty() {
-                0
-            } else {
-                self.selected_channel.min(self.channels.len() - 1)
-            };
-            self.sidebar_selected = 0;
+        self.channels.remove(idx);
+        self.selected_channel = if self.channels.is_empty() {
+            0
         } else {
-            let tab = &mut self.channels[idx];
-            tab.joined = false;
-            tab.left = true;
-            tab.members.clear();
-        }
+            self.selected_channel.min(self.channels.len() - 1)
+        };
+        self.sidebar_selected = 0;
+        self.message_selected = self
+            .channels
+            .get(self.selected_channel)
+            .map(|c| c.log.len().saturating_sub(1))
+            .unwrap_or(0);
         former_members
     }
 
     // -------------------------------------------------------------
-    // [ / ] dwell-to-join
+    // [ / ] tab switching
     // -------------------------------------------------------------
 
-    /// `forward` selects `]` (next channel) vs `[` (previous channel).
-    pub(crate) fn start_or_advance_dwell(&mut self, forward: bool) {
+    /// `forward` selects `]` (next channel tab) vs `[` (the previous one).
+    /// Every tab is a channel the user has already joined (`on_joined` is
+    /// the only thing that creates one), so switching is immediate and
+    /// never joins anything - joining is `/channels` or Ctrl+J.
+    pub(crate) fn select_adjacent_channel(&mut self, forward: bool) {
         if self.channels.is_empty() {
             return;
         }
         let len = self.channels.len();
-        let base = match &self.dwell {
-            Some(d) => d.target_index,
-            None => self.selected_channel,
-        };
+        let base = self.selected_channel.min(len - 1);
         let next = if forward {
             (base + 1) % len
         } else {
@@ -321,72 +303,139 @@ impl UiState {
         self.sidebar_selected = 0;
         // Start scrolled to the newest message in the newly-selected tab.
         self.message_selected = self.channels[next].log.len().saturating_sub(1);
-        self.dwell = Some(DwellState {
-            target_index: next,
-            started_at: Instant::now(),
-        });
     }
 
-    /// Call periodically from the UI loop; fires the actual `JoinChannel`
-    /// once the dwell timer has elapsed.
-    pub fn tick_dwell(&mut self, now: Instant) -> Option<UiAction> {
-        let d = self.dwell.as_ref()?;
-        if now.duration_since(d.started_at) < DWELL_DURATION {
+    // -------------------------------------------------------------
+    // The /channels directory popup
+    // -------------------------------------------------------------
+
+    /// Every public channel the server has announced (`ChannelList` at
+    /// connect, `ChannelCreated` afterwards), in announcement order - the
+    /// rows of the `/channels` modal. Kept separate from `channels` (the
+    /// tab row), which only ever holds channels the user is actually
+    /// joined to.
+    pub fn known_public_channels(&self) -> &[ChannelInfo] {
+        &self.known_channels
+    }
+
+    /// Whether `name` is one of the user's own joined channels - what
+    /// colours its `/channels` row yellow (`render_channels_popup`).
+    pub fn is_joined(&self, name: &str) -> bool {
+        self.channels.iter().any(|c| c.name == name && c.joined)
+    }
+
+    /// The one channel joined automatically on connecting: the server's
+    /// default public channel, `DEFAULT_CHANNEL_NAME` ("the-hall"),
+    /// and only while no channel has been joined yet. Every other public
+    /// channel the server offers is left for the user to pick out of
+    /// `/channels` - a tab means "I am in this room", so joining all of
+    /// them on the user's behalf would be wrong (docs/PROTOCOL.md §6.3).
+    pub fn auto_join_channel(&self) -> Option<UiAction> {
+        if !self.channels.is_empty() {
             return None;
         }
-        let idx = d.target_index;
-        self.dwell = None;
-        let channel = self.channels.get(idx)?;
-        // A channel explicitly `/leave`t (`left`) never dwell-auto-rejoins -
-        // only the explicit Enter-on-the-rejoin-prompt path does
-        // (`handle_key`, `render_left_channel_screen`). A never-joined one
-        // (`left == false`) still dwells exactly as before.
-        if channel.joined || channel.left {
-            return None;
-        }
+        let hall = self
+            .known_channels
+            .iter()
+            .find(|c| c.name == crate::server::DEFAULT_CHANNEL_NAME)?;
         Some(UiAction::JoinChannel {
-            name: channel.name.clone(),
-            kind: channel.kind,
+            name: hall.name.clone(),
+            kind: hall.kind,
             password: None,
         })
     }
 
-    /// The tab currently being dwelled on (Ctrl+Tab held past it), if any -
-    /// useful for rendering a "joining..." indicator.
-    pub fn dwell_target(&self) -> Option<usize> {
-        self.dwell.as_ref().map(|d| d.target_index)
+    /// Opens the `/channels` modal, selecting the first row.
+    pub(crate) fn open_channels_popup(&mut self) {
+        self.mode = Mode::ChannelsPopup;
+        self.channels_popup_selected = 0;
+    }
+
+    /// Handles the `/channels` modal: Up/Down move the selection, Enter
+    /// joins the selected channel (a no-op for one already joined - it's
+    /// shown yellow precisely so the user can tell), Esc closes it.
+    pub(crate) fn handle_channels_popup_key(&mut self, code: KeyCode) -> Option<UiAction> {
+        let len = self.known_channels.len();
+        match code {
+            KeyCode::Esc => {
+                self.mode = Mode::Normal;
+                None
+            }
+            KeyCode::Up => {
+                if len > 0 {
+                    self.channels_popup_selected = (self.channels_popup_selected + len - 1) % len;
+                }
+                None
+            }
+            KeyCode::Down => {
+                if len > 0 {
+                    self.channels_popup_selected = (self.channels_popup_selected + 1) % len;
+                }
+                None
+            }
+            KeyCode::Enter => {
+                let info = self.known_channels.get(self.channels_popup_selected)?.clone();
+                self.mode = Mode::Normal;
+                if self.is_joined(&info.name) {
+                    // Already a member: selecting it just brings its tab
+                    // to the front rather than re-sending a join the
+                    // server would treat as a no-op anyway (§6.1).
+                    if let Some(idx) = self.channels.iter().position(|c| c.name == info.name) {
+                        self.selected_channel = idx;
+                        self.active_private_room = None;
+                        self.sidebar_selected = 0;
+                        self.message_selected = self.channels[idx].log.len().saturating_sub(1);
+                    }
+                    return None;
+                }
+                Some(UiAction::JoinChannel {
+                    name: info.name,
+                    kind: info.kind,
+                    password: None,
+                })
+            }
+            _ => None,
+        }
     }
 
     // -------------------------------------------------------------
     // Applying incoming server events (already decrypted by the caller)
     // -------------------------------------------------------------
 
+    /// Records the server's public channel directory (`ChannelList` at
+    /// connect, one-element `ChannelCreated` announcements afterwards),
+    /// de-duplicating by name. This never creates a tab: tabs are exactly
+    /// the joined channels (`on_joined`), and the directory is what the
+    /// `/channels` modal lists.
     pub fn on_channel_list(&mut self, list: Vec<ChannelInfo>) {
         for info in list {
-            if !self.channels.iter().any(|c| c.name == info.name) {
-                self.channels.push(ChannelTab {
-                    name: info.name,
-                    kind: info.kind,
-                    joined: false,
-                    left: false,
-                    members: Vec::new(),
-                    log: Vec::new(),
-                });
+            if !self.known_channels.iter().any(|c| c.name == info.name) {
+                self.known_channels.push(info);
             }
         }
     }
 
     pub fn on_joined(&mut self, channel: ChannelInfo) {
+        // A public channel we're in belongs in the `/channels` directory
+        // too, and this is the only place that learns about one we
+        // created ourselves: the server's `ChannelCreated` announcement
+        // goes to every client *except* the creator (§6.3), so a channel
+        // opened with Ctrl+J would otherwise never appear in its own
+        // author's directory. A private channel is deliberately left out -
+        // it is never advertised to anyone (§6.3/AC-022).
+        if channel.kind == ChannelKind::Public
+            && !self.known_channels.iter().any(|c| c.name == channel.name)
+        {
+            self.known_channels.push(channel.clone());
+        }
         if let Some(tab) = self.channels.iter_mut().find(|c| c.name == channel.name) {
             tab.joined = true;
-            tab.left = false;
             tab.kind = channel.kind;
         } else {
             self.channels.push(ChannelTab {
                 name: channel.name,
                 kind: channel.kind,
                 joined: true,
-                left: false,
                 members: Vec::new(),
                 log: Vec::new(),
             });
@@ -416,7 +465,6 @@ impl UiState {
                     name: channel.to_string(),
                     kind: ChannelKind::Public,
                     joined: false,
-                    left: false,
                     members: Vec::new(),
                     log: Vec::new(),
                 });
@@ -809,30 +857,6 @@ pub(crate) fn render_channel_view(frame: &mut Frame, area: Rect, state: &UiState
         header_cols[1],
     );
 
-    // A public channel the user has explicitly `/leave`t shows a rejoin
-    // prompt instead of the normal sidebar+messages+compose view - the tab
-    // row above stays, so `[`/`]` navigation is still visible, but nothing
-    // below it is usable until they rejoin (`handle_key`'s `left` branch).
-    if state
-        .channels
-        .get(state.selected_channel)
-        .map(|c| c.left)
-        .unwrap_or(false)
-    {
-        let content_area = Rect {
-            x: rows[messages_row].x,
-            y: rows[messages_row].y,
-            width: rows[messages_row].width,
-            height: rows[messages_row].height + rows[input_row].height,
-        };
-        render_left_channel_screen(
-            frame,
-            content_area,
-            &state.channels[state.selected_channel].name,
-        );
-        return;
-    }
-
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(20), Constraint::Percentage(80)])
@@ -841,46 +865,6 @@ pub(crate) fn render_channel_view(frame: &mut Frame, area: Rect, state: &UiState
     render_sidebar(frame, cols[0], state);
     render_messages(frame, cols[1], state, None);
     render_input_bar(frame, rows[input_row], state);
-}
-
-/// Shown in place of the sidebar+messages+compose view while the selected
-/// channel tab is `left` (`ChannelTab::left`) - a public channel the user
-/// explicitly `/leave`t. `Enter` (handled in `UiState::handle_key`, not
-/// here) re-requests joining it.
-fn render_left_channel_screen(frame: &mut Frame, area: Rect, channel_name: &str) {
-    let popup = super::ui::centered_rect(56, 5, area);
-    let block = Block::default().borders(Borders::ALL);
-    let inner = block.inner(popup);
-    frame.render_widget(block, popup);
-
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-        ])
-        .split(inner);
-
-    frame.render_widget(
-        Paragraph::new(format!("You left this public channel: {channel_name}"))
-            .alignment(ratatui::layout::Alignment::Center),
-        rows[0],
-    );
-    frame.render_widget(
-        Paragraph::new("Do you want to join?").alignment(ratatui::layout::Alignment::Center),
-        rows[1],
-    );
-    frame.render_widget(
-        Paragraph::new("[ Enter to join ]")
-            .alignment(ratatui::layout::Alignment::Center)
-            .style(
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        rows[2],
-    );
 }
 
 /// `state.cpu_usage_pct` rounded to the nearest whole percent for display -
@@ -1053,6 +1037,51 @@ pub(crate) fn render_join_popup(frame: &mut Frame, area: Rect, state: &UiState) 
         );
         frame.render_widget(Paragraph::new(password_line), rows[2]);
     }
+}
+
+/// `/channels`' modal directory of every public channel the server has
+/// announced (`UiState::known_channels`). A channel the user is already
+/// joined to is drawn yellow, so "where am I" and "where could I go" read
+/// off the same list; the selected row is reversed. Up/Down move, Enter
+/// joins, Esc closes (`handle_channels_popup_key`).
+pub(crate) fn render_channels_popup(frame: &mut Frame, area: Rect, state: &UiState) {
+    let rows: Vec<ListItem> = state
+        .known_channels
+        .iter()
+        .enumerate()
+        .map(|(i, info)| {
+            let mut style = if state.is_joined(&info.name) {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default()
+            };
+            if i == state.channels_popup_selected {
+                style = style.add_modifier(Modifier::REVERSED);
+            }
+            ListItem::new(Line::from(Span::styled(
+                format!("\u{1F30D} {}", info.name),
+                style,
+            )))
+        })
+        .collect();
+    let height = (rows.len().max(1) as u16).saturating_add(2);
+    let popup = super::ui::centered_rect(44, height, area);
+    let block = Block::default()
+        .title("Public channels (Enter to join, Esc to close)")
+        .borders(Borders::ALL);
+    let inner = block.inner(popup);
+    frame.render_widget(ratatui::widgets::Clear, popup);
+    frame.render_widget(block, popup);
+    if rows.is_empty() {
+        frame.render_widget(Paragraph::new("no public channels announced yet"), inner);
+        return;
+    }
+    // `ListState` (same reason `render_file_browser` uses one) so a
+    // selection past the bottom of a long directory scrolls into view
+    // instead of being clipped.
+    let mut list_state = ratatui::widgets::ListState::default();
+    list_state.select(Some(state.channels_popup_selected.min(rows.len() - 1)));
+    frame.render_stateful_widget(List::new(rows), inner, &mut list_state);
 }
 
 /// The password-entry popup shown after a `ChannelJoinRejected` -

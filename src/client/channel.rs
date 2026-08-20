@@ -381,22 +381,15 @@ fn encrypt_for_each(
         .collect()
 }
 
+/// The connect-time `ChannelList` snapshot (docs/PROTOCOL.md §6.3):
+/// recorded as the public-channel directory `/channels` lists, plus the
+/// single automatic join it implies (`UiState::auto_join_channel`).
 pub(crate) fn on_list(
     ui_state: &mut UiState,
     list: Vec<ChannelInfo>,
 ) -> Option<crate::client::tui::ui::UiAction> {
-    let was_empty = ui_state.channels.is_empty();
     ui_state.on_channel_list(list);
-    if was_empty {
-        if let Some(first) = ui_state.channels.first() {
-            return Some(crate::client::tui::ui::UiAction::JoinChannel {
-                name: first.name.clone(),
-                kind: first.kind,
-                password: None,
-            });
-        }
-    }
-    None
+    ui_state.auto_join_channel()
 }
 
 pub(crate) fn on_joined(ui_state: &mut UiState, channel: ChannelInfo) {

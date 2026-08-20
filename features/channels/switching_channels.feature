@@ -2,43 +2,33 @@
 Feature: Moving between channels
 
   As a connected user
-  I want to tab through the channels on offer and open private ones by name
-  So that I can land on the conversation I care about without joining every
-  tab I pass through
+  I want to tab through the channels I have joined and open private ones by name
+  So that I can land on the conversation I care about
 
-  Selecting a tab and joining it are deliberately separate: the selection
-  moves at once so you can flick past several, and the join only happens once
-  you settle. See docs/SPEC.md Functionality #2.
+  The tab row is exactly the channels I am a member of, so switching tabs
+  never joins anything - joining is `/channels` (the public directory) or
+  Ctrl+J (by name). See docs/SPEC.md Functionality #2.
 
   @AC-020
-  Scenario: Tabbing to a channel selects it without joining it
-    Given I am connected and the server has offered a second channel
-    And the channel already has joined "general"
+  Scenario: Tabbing moves between the channels I have joined
+    Given I am connected and viewing a channel
+    And the channel already has joined "random"
     When I press the ] key
     Then the selected channel is "random"
-    And "random" has not been joined yet
-    When I check the dwell timer straight away
-    Then no join is requested yet
-
-  @AC-020
-  Scenario: Settling on a channel joins it
-    Given I am connected and the server has offered a second channel
-    When I press the ] key
-    And I wait on that tab for longer than the join delay
-    Then joining "random" is requested
+    And no join is requested
 
   @AC-020
   Scenario: Tabbing backwards wraps around to the last channel
-    Given I am connected and the server has offered a second channel
-    And the channel already has joined "general"
+    Given I am connected and viewing a channel
+    And the channel already has joined "random"
     When I press the [ key
     Then the selected channel is "random"
 
   @AC-020 @TB-026
   Scenario: Moving to another channel closes an open private room
-    Given I am connected and the server has offered a second channel
-    And the channel already has joined "general"
+    Given I am connected and viewing a channel
     And bob is in the channel with me
+    And the channel already has joined "random"
     And I have opened a private room with bob
     When I press the ] key
     Then no private room is open

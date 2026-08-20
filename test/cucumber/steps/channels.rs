@@ -2,13 +2,11 @@
 //! private channels (US-025) and the P2P trust boundary (TB-155).
 
 use std::net::{IpAddr, Ipv4Addr};
-use std::time::{Duration, Instant};
 
 use cucumber::{given, then, when};
 
 use aloo::proto::{ChannelJoinRejection, ChannelKind, UserId};
 use aloo::server::CHANNEL_MAX_PASSWORD_ATTEMPTS;
-use aloo::client::tui::channel::DWELL_DURATION;
 use aloo::client::tui::ui::{Mode, UiAction};
 
 use crate::steps::ui_common::id_for;
@@ -16,17 +14,12 @@ use crate::world::AlooWorld;
 
 const TEST_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
 
-#[when("I wait on that tab for longer than the join delay")]
-async fn wait_out_dwell(w: &mut AlooWorld) {
-    let later = Instant::now() + DWELL_DURATION + Duration::from_millis(1);
-    let action = w.ui_mut().tick_dwell(later);
-    w.action_was_none = action.is_none();
-    w.last_action = action;
-}
-
-#[when("I check the dwell timer straight away")]
-async fn check_dwell_now(w: &mut AlooWorld) {
-    let action = w.ui_mut().tick_dwell(Instant::now());
+/// The connect-time `ChannelList` snapshot's one automatic join
+/// (`UiState::auto_join_channel`) - `client::channel::on_list`'s decision,
+/// reachable here without a live session.
+#[when("the client applies the connect-time channel list")]
+async fn apply_channel_list(w: &mut AlooWorld) {
+    let action = w.ui_ref().auto_join_channel();
     w.action_was_none = action.is_none();
     w.last_action = action;
 }
@@ -41,25 +34,85 @@ async fn selected_channel_is(w: &mut AlooWorld, name: String) {
     );
 }
 
-#[then(expr = "{string} has not been joined yet")]
-async fn not_joined_yet(w: &mut AlooWorld, name: String) {
-    let state = w.ui_ref();
-    let ch = state
-        .channels
-        .iter()
-        .find(|c| c.name == name)
-        .expect("no such channel");
+#[then("no join is requested")]
+async fn no_join_requested(w: &mut AlooWorld) {
     assert!(
-        !ch.joined,
-        "selecting a tab must not join it - the dwell delay has not elapsed"
+        w.action_was_none,
+        "nothing here should have requested a join"
     );
 }
 
-#[then("no join is requested yet")]
-async fn no_join_yet(w: &mut AlooWorld) {
+// ---------------------------------------------------------------------
+// The /channels directory (AC-172, AC-173, AC-174, TB-206)
+// ---------------------------------------------------------------------
+
+#[given(expr = "the server has announced the public channel {string}")]
+async fn server_announced_channel(w: &mut AlooWorld, name: String) {
+    w.ui_mut().on_channel_list(vec![aloo::proto::ChannelInfo {
+        name,
+        kind: ChannelKind::Public,
+    }]);
+}
+
+#[given(expr = "a server offering {string} and {string}")]
+async fn server_offering_two(w: &mut AlooWorld, first: String, second: String) {
+    let mut state = aloo::client::tui::ui::UiState::new("me".into());
+    state.set_own_id(UserId(1));
+    state.on_channel_list(vec![
+        aloo::proto::ChannelInfo {
+            name: first,
+            kind: ChannelKind::Public,
+        },
+        aloo::proto::ChannelInfo {
+            name: second,
+            kind: ChannelKind::Public,
+        },
+    ]);
+    w.ui = Some(state);
+}
+
+#[then("the channels modal is open")]
+async fn channels_modal_open(w: &mut AlooWorld) {
+    assert_eq!(w.ui_ref().mode, Mode::ChannelsPopup);
+}
+
+#[then("the channels modal is closed")]
+async fn channels_modal_closed(w: &mut AlooWorld) {
+    assert_eq!(w.ui_ref().mode, Mode::Normal);
+}
+
+#[then(expr = "the channels modal lists {string}")]
+async fn channels_modal_lists(w: &mut AlooWorld, name: String) {
     assert!(
-        w.action_was_none,
-        "the dwell timer should not fire before the delay has passed"
+        w.ui_ref()
+            .known_public_channels()
+            .iter()
+            .any(|c| c.name == name),
+        "expected {name:?} in the public channel directory"
+    );
+}
+
+#[then(expr = "the channels modal shows {string} as one of mine")]
+async fn channels_modal_shows_mine(w: &mut AlooWorld, name: String) {
+    assert!(
+        w.ui_ref().is_joined(&name),
+        "expected {name:?} to render as joined (yellow)"
+    );
+}
+
+#[then(expr = "the channels modal shows {string} as one I have not joined")]
+async fn channels_modal_shows_not_mine(w: &mut AlooWorld, name: String) {
+    assert!(
+        !w.ui_ref().is_joined(&name),
+        "expected {name:?} to render as not joined"
+    );
+}
+
+#[then(expr = "the channel {string} has no tab")]
+async fn channel_has_no_tab(w: &mut AlooWorld, name: String) {
+    assert!(
+        !w.ui_ref().channels.iter().any(|c| c.name == name),
+        "a tab is a channel you have joined - {name:?} should have none"
     );
 }
 
@@ -171,24 +224,23 @@ async fn channel_no_longer_shown(w: &mut AlooWorld, channel: String) {
     );
 }
 
-#[then(expr = "the channel {string} is still shown")]
-async fn channel_still_shown(w: &mut AlooWorld, channel: String) {
+#[then(expr = "the channel {string} is still listed in the directory")]
+async fn channel_still_in_directory(w: &mut AlooWorld, channel: String) {
     assert!(
-        w.ui_ref().channels.iter().any(|c| c.name == channel),
-        "expected {channel:?}'s tab to still be there"
+        w.ui_ref()
+            .known_public_channels()
+            .iter()
+            .any(|c| c.name == channel),
+        "a left public channel stays in the /channels directory to rejoin from"
     );
 }
 
-#[then(expr = "the channel {string} is not joined")]
-async fn channel_not_joined(w: &mut AlooWorld, channel: String) {
-    let tab = w
-        .ui_ref()
-        .channels
-        .iter()
-        .find(|c| c.name == channel)
-        .unwrap_or_else(|| panic!("no such channel {channel:?}"));
-    assert!(!tab.joined);
-    assert!(tab.left);
+#[then(expr = "there is no reason to keep the link to {word}")]
+async fn no_reason_to_keep_link(w: &mut AlooWorld, who: String) {
+    assert!(
+        !w.ui_ref().has_reason_to_keep_link(UserId(id_for(&who))),
+        "the P2P link to {who} should be dropped once nothing justifies it"
+    );
 }
 
 // ---------------------------------------------------------------------

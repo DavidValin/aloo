@@ -565,9 +565,6 @@ pub(crate) async fn run_connected_session(
                     }
                     last_otp_key_status_sample = now;
                 }
-                if let Some(action) = ui_state.tick_dwell(Instant::now()) {
-                    handle_ui_action(action, &mut wr, &mut ui_state, &mut session).await?;
-                }
                 if let Some(action) = ui_state.tick_recording_timeout(Instant::now()) {
                     handle_ui_action(action, &mut wr, &mut ui_state, &mut session).await?;
                 }

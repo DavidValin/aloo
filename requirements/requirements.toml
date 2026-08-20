@@ -276,8 +276,8 @@ so_that = "I can take part in the conversation I care about"
 
 [[user_story.acceptance_criteria]]
 id = "AC-018"
-description = "The server's public channels are offered as tabs, and a freshly started server always offers 'the-hall'."
-evidence = "docs/SPEC.md 'Server startup', docs/PROTOCOL.md 6; tests fresh_registry_has_default_public_the_hall_channel, channel_list_adds_unjoined_channels_without_duplicating"
+description = "The server's public channels are announced to every client as a directory (the rows of /channels), and a freshly started server always offers 'the-hall'."
+evidence = "docs/SPEC.md 'Server startup', docs/PROTOCOL.md 6, 6.3; tests fresh_registry_has_default_public_the_hall_channel, channel_list_records_the_public_directory_without_duplicating"
 
 [[user_story.acceptance_criteria]]
 id = "AC-019"
@@ -286,8 +286,8 @@ evidence = "docs/SPEC.md 'Channels', docs/PROTOCOL.md 6.1; tests second_joiner_g
 
 [[user_story.acceptance_criteria]]
 id = "AC-020"
-description = "']' and '[' move between channel tabs immediately, and the join itself happens after dwelling on a tab for three seconds."
-evidence = "docs/SPEC.md Functionality #2; tests bracket_key_selects_next_channel_immediately_but_does_not_join_yet, opening_bracket_selects_the_previous_channel, dwell_fires_join_after_three_seconds"
+description = "']' and '[' move between the channel tabs immediately, wrapping in both directions. Every tab is a channel the user has joined, so switching never joins anything."
+evidence = "docs/SPEC.md Functionality #2; tests bracket_key_switches_to_the_next_joined_channel_without_joining_anything, opening_bracket_selects_the_previous_channel"
 
 [[user_story.acceptance_criteria]]
 id = "AC-021"
@@ -296,8 +296,8 @@ evidence = "docs/SPEC.md Functionality #2; tests ctrl_j_then_typing_and_enter_re
 
 [[user_story.acceptance_criteria]]
 id = "AC-022"
-description = "A private channel is never advertised to other clients; its name must already be known to join it."
-evidence = "docs/PROTOCOL.md 6.3; test private_channel_is_created_on_join_but_not_listed"
+description = "A private channel is never advertised to other clients, nor listed in its own author's /channels directory; its name must already be known to join it."
+evidence = "docs/PROTOCOL.md 6.3; tests private_channel_is_created_on_join_but_not_listed, a_private_channel_i_created_is_never_listed_in_the_directory"
 
 [[user_story.acceptance_criteria]]
 id = "AC-023"
@@ -321,13 +321,28 @@ evidence = "docs/PROTOCOL.md 6.2; test empty_channel_is_deleted_unless_it_is_the
 
 [[user_story.technical_behavior]]
 id = "TB-024"
-description = "The client's channel list de-duplicates repeated announcements and only marks a channel joined once it actually is."
-evidence = "tests channel_list_adds_unjoined_channels_without_duplicating, on_joined_marks_existing_channel_joined_or_creates_it"
+description = "The client's public channel directory de-duplicates repeated announcements, and a channel is only marked joined once it actually is."
+evidence = "tests channel_list_records_the_public_directory_without_duplicating, on_joined_marks_existing_channel_joined_or_creates_it"
+
+[[user_story.acceptance_criteria]]
+id = "AC-172"
+description = "Typing /channels opens a modal listing every public channel the server has announced, with the ones the user is already in shown in yellow; Esc closes it without joining anything."
+evidence = "docs/SPEC.md Functionality; src/client/tui/ui.rs submit_input's /channels branch; src/client/tui/channel.rs render_channels_popup, handle_channels_popup_key; tests slash_channels_opens_the_directory_modal, the_directory_renders_a_joined_channel_in_yellow_and_the_rest_plain, escape_closes_the_directory_without_joining_anything, rendering_the_directory_with_nothing_announced_does_not_panic"
+
+[[user_story.acceptance_criteria]]
+id = "AC-173"
+description = "Up/Down move the /channels modal's selection (wrapping at both ends) and Enter joins the selected channel, closing the modal."
+evidence = "docs/SPEC.md Functionality; src/client/tui/channel.rs handle_channels_popup_key; tests enter_in_the_directory_joins_the_selected_channel, the_directory_selection_wraps_in_both_directions"
+
+[[user_story.acceptance_criteria]]
+id = "AC-174"
+description = "On connecting, exactly one channel is joined automatically - DEFAULT_CHANNEL_NAME (the-hall) - however many other public channels the server's ChannelList offers; the rest are joined deliberately from /channels or Ctrl+J."
+evidence = "docs/PROTOCOL.md 6.3; src/client/tui/channel.rs UiState::auto_join_channel; src/client/channel.rs on_list; tests only_the_hall_is_joined_automatically_however_many_channels_are_offered, nothing_is_auto_joined_once_a_channel_has_been_joined"
 
 [[user_story.technical_behavior]]
-id = "TB-025"
-description = "The dwell timer does not re-fire a join for a channel that has already been joined."
-evidence = "test dwell_does_not_refire_for_an_already_joined_channel"
+id = "TB-206"
+description = "A channel tab exists exactly for a channel the user is a member of: the announced public directory (UiState::known_channels) never creates one, only a join does, and Enter in /channels on an already-joined channel selects its tab rather than re-sending a join. The relationship also runs the other way for public channels - joining one records it in the directory, de-duplicated, since ChannelCreated is sent to every client except the creator and a self-created channel would otherwise be missing from its own author's /channels."
+evidence = "docs/PROTOCOL.md 6.3; src/client/tui/channel.rs UiState::on_channel_list, on_joined, handle_channels_popup_key; tests an_announced_public_channel_is_listed_without_becoming_a_tab, enter_on_a_channel_i_am_already_in_selects_its_tab_instead_of_rejoining, rendering_before_any_channel_is_joined_does_not_panic, a_public_channel_i_created_myself_appears_in_my_own_directory, the_directory_does_not_duplicate_a_channel_already_announced"
 
 [[user_story.technical_behavior]]
 id = "TB-026"
@@ -1826,8 +1841,8 @@ evidence = "src/p2p_proto.rs SAFE_DATAGRAM_BYTES; src/client/file_transfer.rs FI
 
 [[user_story.technical_behavior]]
 id = "TB-149"
-description = "A direct link's punch handshake is triggered eagerly, the moment a peer is learned about (ServerMessage::UserJoined), rather than lazily on first send - since voice (unlike text/file) excludes a recipient outright if its link isn't already Active at record-start, a lazy trigger meant the first voice message to any brand-new peer reliably missed them. The trigger fires on every UserJoined for that peer, not only the first: UserOffline forgets their link outright (TB-178), so gating it on 'a UserId we have never seen' would leave a peer who reconnected after any blip - including a heartbeat timeout on a slow link - with no link and nothing to re-arm it. A pre-warmed link that fails to punch with nothing ever queued against it fails silently (no visible LinkFailed banner) - only a link something was genuinely waiting on surfaces a visible failure."
-evidence = "src/client/session.rs handle_server_message's UserJoined arm (unconditional ensure_link call, distinct from the first-sighting-only identity pin beside it); src/client/p2p.rs PeerLinkManager::expire_pending (only content that was actually queued can age out into a P2pEvent::LinkFailed), forget; tests punch_timeout_with_nothing_pending_fails_silently, a_peer_who_reconnects_is_punched_again"
+description = "A direct link's punch handshake is triggered eagerly, the moment a peer is learned about (ServerMessage::UserJoined), rather than lazily on first send - since voice (unlike text/file) excludes a recipient outright if its link isn't already Active at record-start, a lazy trigger meant the first voice message to any brand-new peer reliably missed them. The trigger fires on every UserJoined for that peer, not only the first: UserOffline forgets their link outright (TB-178), so gating it on 'a UserId we have never seen' would leave a peer who reconnected after any blip - including a heartbeat timeout on a slow link - with no link and nothing to re-arm it. A pre-warmed link that fails to punch with nothing ever queued against it fails silently (no visible LinkFailed banner) - only a link something was genuinely waiting on surfaces a visible failure. The trigger is equally independent of which channel tab is on screen: every member of every joined channel gets a link, not just the ones in the selected tab."
+evidence = "src/client/session.rs handle_server_message's UserJoined arm (unconditional ensure_link call, distinct from the first-sighting-only identity pin beside it); src/client/p2p.rs PeerLinkManager::expire_pending (only content that was actually queued can age out into a P2pEvent::LinkFailed), forget; tests punch_timeout_with_nothing_pending_fails_silently, a_peer_who_reconnects_is_punched_again, shares_a_joined_channel_is_true_for_a_member_of_an_unselected_joined_channel"
 
 [[user_story.technical_behavior]]
 id = "TB-155"
@@ -1936,18 +1951,8 @@ so_that = "I can step away from a conversation I'm done with while staying conne
 
 [[user_story.acceptance_criteria]]
 id = "AC-109"
-description = "Typing /leave and pressing Enter leaves the currently selected channel tab, public or private. Leaving a private channel removes its tab entirely; leaving a public channel keeps its tab but the client is no longer a member of it."
-evidence = "docs/SPEC.md Functionality; src/client/tui/ui.rs submit_input's /leave branch; src/client/tui/channel.rs UiState::leave_channel_locally; tests slash_leave_on_a_private_channel_removes_its_tab, slash_leave_on_a_public_channel_keeps_the_tab_but_marks_it_left"
-
-[[user_story.acceptance_criteria]]
-id = "AC-110"
-description = "Selecting a public channel tab you've left shows a single centered screen - 'You left this public channel. Do you want to join?' - instead of the normal sidebar/messages/compose view, and pressing Enter there requests rejoining it."
-evidence = "docs/SPEC.md Functionality; src/client/tui/channel.rs render_left_channel_screen; src/client/tui/ui.rs handle_key's left-channel branch; test left_channel_screen_enter_requests_rejoin"
-
-[[user_story.technical_behavior]]
-id = "TB-157"
-description = "The dwell timer never re-fires a join for a channel the user explicitly left (ChannelTab::left) - only a channel that was simply never joined yet still dwell-auto-joins; a left channel only rejoins via the explicit Enter-to-rejoin action."
-evidence = "src/client/tui/channel.rs UiState::tick_dwell; test dwell_does_not_refire_for_a_left_channel"
+description = "Typing /leave and pressing Enter leaves the currently selected channel tab, public or private, and removes that tab - a tab is a channel the user is in. A public channel stays listed in the /channels directory to rejoin from."
+evidence = "docs/SPEC.md Functionality; src/client/tui/ui.rs submit_input's /leave branch; src/client/tui/channel.rs UiState::leave_channel_locally; tests slash_leave_on_a_private_channel_removes_its_tab, slash_leave_on_a_public_channel_removes_its_tab_too, a_left_public_channel_stays_in_the_directory_to_rejoin_from"
 
 [[user_story.technical_behavior]]
 id = "TB-158"

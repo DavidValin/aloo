@@ -53,7 +53,7 @@ aloo --server --password MYPASSWORD    # people need this password to connect
 aloo --server --enc rsa server_key     # people need a matching RSA key to connect
 ```
 
-The server always starts with one public channel called `the-hall`.
+The server always starts with one public channel called `the-hall` — the one channel a client joins automatically on connecting. Any other public channel is joined deliberately, from `/channels`.
 
 The server and everyone connecting to it must run the **same version** of aloo. There is no version negotiation on the wire (see `docs/PROTOCOL.md` §9), so a server left behind on an older release isn't slower or reduced — clients simply can't connect to it, failing on connect with a decode error. `aloo --help`'s first line reports the version on each side.
 
@@ -79,9 +79,10 @@ Nicknames are case-sensitive and must be free — if someone else is already con
 - Press **Ctrl+Alt+P** to do the same thing from anywhere — even if aloo isn't the focused window. Enabled by default; edit `~/.aloo/settings` (`global_ptt_shortcut`, `global_ptt_enabled`) to change the combo or turn it off. Needs X11 on Linux — not available under Wayland.
 - Type `/file` and press **Enter** to send a file.
 - Type `/mail` to write an OTP mail, `/mailbox` to check your mail's delivery status and read what arrived (needs a shared `otp` pad — see `/otp` under "Encryption").
-- Type `/leave` and press **Enter** to leave the selected channel — a private one's tab disappears, a public one stays (rejoin it with Enter) but you're no longer a member.
+- Type `/leave` and press **Enter** to leave the selected channel — its tab disappears, public or private; a public one stays in `/channels` to rejoin from.
 - Pick someone in the sidebar and press **Enter** to open a DM with them.
-- Press `]` / `[` to switch between channel tabs, `Ctrl+J` to join or create a channel — public or private, optionally password-protected.
+- Type `/channels` and press **Enter** to see every public channel on the server — the ones you're in are yellow, Enter joins the selected one, Escape closes.
+- Press `]` / `[` to switch between your channel tabs (you're in every channel that has one), `Ctrl+J` to join or create a channel by name — public or private, optionally password-protected.
 - Press `Ctrl+H` anytime for an in-app help screen with all of this.
 
 ## Encryption

@@ -7,7 +7,9 @@ Feature: Leaving a channel
   connected to the rest
 
   /leave takes no argument - it always targets the currently selected
-  channel tab. See docs/PROTOCOL.md section 6.2/7.0.3.
+  channel tab, and the tab goes away with the membership. A public channel
+  is still listed in `/channels` to rejoin from.
+  See docs/PROTOCOL.md section 6.2/7.0.3.
 
   @AC-109
   Scenario: Leaving a private channel removes its tab
@@ -20,26 +22,21 @@ Feature: Leaving a channel
     Then the channel "secret-room" is no longer shown
 
   @AC-109
-  Scenario: Leaving a public channel keeps its tab but marks it not joined
+  Scenario: Leaving a public channel removes its tab but keeps it in the directory
+    Given I am connected and viewing a channel
+    And the server has announced the public channel "general"
+    And bob is in the channel with me
+    When I type "/leave"
+    And I press Enter
+    And the leave completes
+    Then the channel "general" is no longer shown
+    And the channel "general" is still listed in the directory
+
+  @TB-158
+  Scenario: Leaving drops the direct link to a channel-mate I share nothing else with
     Given I am connected and viewing a channel
     And bob is in the channel with me
     When I type "/leave"
     And I press Enter
     And the leave completes
-    Then the channel "general" is still shown
-    And the channel "general" is not joined
-
-  @AC-110
-  Scenario: Revisiting a left public channel offers to rejoin
-    Given I am connected and viewing a channel
-    And I have left the channel "general"
-    When I press Enter
-    Then joining "general" is requested
-
-  @TB-157
-  Scenario: Dwelling on a left channel does not silently rejoin it
-    Given I am connected and the server has offered a second channel
-    And I have left the channel "random"
-    When I press the ] key
-    And I wait on that tab for longer than the join delay
-    Then no join is requested yet
+    Then there is no reason to keep the link to bob

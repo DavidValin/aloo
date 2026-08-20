@@ -29,9 +29,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 
 use crate::client::p2p::LinkStatus;
-use crate::proto::{ChannelKind, KeyMode, UserId, UserInfo};
+use crate::proto::{ChannelInfo, ChannelKind, KeyMode, UserId, UserInfo};
 
-use super::channel::{ChannelTab, DwellState};
+use super::channel::ChannelTab;
 use super::direct_message::PrivateRoom;
 
 /// How long after the most recent Space press/repeat to conclude the key
@@ -78,10 +78,10 @@ const HELP_HEADINGS: [&str; 10] = [
 ];
 const HELP_BODY: &[&str] = &[
     "Channels",
-    "  \u{1F30D} public / \u{1F512} private   tab prefix shows a channel's kind at a glance",
-    "  ]  /  [    switch tabs (joins after staying on one for 3s)",
+    "  ]  /  [    switch between the channels you joined (\u{1F30D} public / \u{1F512} private)",
+    "  /channels  list every public channel (yours in yellow); Enter joins, Esc closes",
     "  Ctrl+J     join/create a channel: name, Public/Private (Left/Right), optional password",
-    "  /leave     leave the selected channel tab (a public one stays, offering to rejoin)",
+    "  /leave     leave the selected channel tab (its tab disappears)",
     "",
     "Messaging",
     "  Tab        cycle focus: sidebar -> messages -> compose bar",
@@ -365,6 +365,12 @@ pub enum Mode {
     /// lets the user type a password and resubmit the same `JoinChannel`.
     /// See `crate::client::tui::channel::handle_channel_password_popup_key`.
     ChannelPasswordPopup,
+    /// `/channels`' modal directory of the server's public channels -
+    /// joined ones shown yellow, Enter joins, Esc closes. Data lives in
+    /// `UiState::known_channels`/`channels_popup_selected`, the same split
+    /// `JoinPrivatePopup`/`join_popup_input` use. See
+    /// `crate::client::tui::channel::handle_channels_popup_key`.
+    ChannelsPopup,
     /// The `/file` send flow (browse -> confirm) is open - see
     /// `crate::client::tui::file_send`. Data lives in `UiState::file_send`, not
     /// here, same split `JoinPrivatePopup`/`join_popup_input` already use.
@@ -730,9 +736,17 @@ pub(crate) enum RecordSource {
 pub struct UiState {
     pub own_id: Option<UserId>,
     pub own_name: String,
+    /// The tab row: exactly the channels the user is currently joined to
+    /// (`on_joined` creates a tab, `leave_channel_locally` removes it).
+    /// The server's wider public directory lives in `known_channels`.
     pub channels: Vec<ChannelTab>,
     pub selected_channel: usize,
-    pub(crate) dwell: Option<DwellState>,
+    /// Every public channel the server has announced (`ChannelList` at
+    /// connect, `ChannelCreated` live) - the rows of the `/channels`
+    /// modal, whether or not the user has joined them.
+    pub known_channels: Vec<ChannelInfo>,
+    /// Selected row of the `/channels` modal, into `known_channels`.
+    pub channels_popup_selected: usize,
     pub known_users: HashMap<UserId, UserInfo>,
     /// Users whose connection has closed entirely (`on_user_offline`), as
     /// opposed to merely leaving one channel while staying connected
@@ -991,7 +1005,8 @@ impl UiState {
             own_name,
             channels: Vec::new(),
             selected_channel: 0,
-            dwell: None,
+            known_channels: Vec::new(),
+            channels_popup_selected: 0,
             known_users: HashMap::new(),
             offline: HashSet::new(),
             link_status: HashMap::new(),
@@ -2030,17 +2045,20 @@ impl UiState {
         if self.mode == Mode::ChannelPasswordPopup {
             return self.handle_channel_password_popup_key(code);
         }
+        if self.mode == Mode::ChannelsPopup {
+            return self.handle_channels_popup_key(code);
+        }
         if self.mode == Mode::FileSend {
             return self.handle_file_send_key(code);
         }
 
         match code {
             KeyCode::Char('[') => {
-                self.start_or_advance_dwell(false);
+                self.select_adjacent_channel(false);
                 return None;
             }
             KeyCode::Char(']') => {
-                self.start_or_advance_dwell(true);
+                self.select_adjacent_channel(true);
                 return None;
             }
             _ => {}
@@ -2058,26 +2076,6 @@ impl UiState {
                 }
                 _ => {}
             }
-        }
-
-        // A public channel tab we've explicitly `/leave`t shows a rejoin
-        // prompt instead of the normal sidebar+messages+compose view
-        // (`render_left_channel_screen`) - the only thing Enter here does
-        // is re-request joining it; every other key (besides `[`/`]`/
-        // Ctrl+H/Ctrl+J, already handled above) is inert, since none of
-        // the panes those would otherwise operate on are shown.
-        if self.active_private_room.is_none()
-            && let Some(channel) = self.channels.get(self.selected_channel)
-            && channel.left
-        {
-            return match code {
-                KeyCode::Enter => Some(UiAction::JoinChannel {
-                    name: channel.name.clone(),
-                    kind: ChannelKind::Public,
-                    password: None,
-                }),
-                _ => None,
-            };
         }
 
         if code == KeyCode::Esc {
@@ -2192,10 +2190,19 @@ impl UiState {
             self.open_otp_mail();
             return Some(UiAction::OpenOtpMailbox);
         }
+        if self.input.trim() == "/channels" {
+            // The one way to see the server's public channel directory:
+            // the tab row only ever shows the channels already joined
+            // (docs/PROTOCOL.md §6.3), so this modal is where the rest
+            // are, and where joining one from the list happens.
+            self.input.clear();
+            self.open_channels_popup();
+            return None;
+        }
         if self.input.trim() == "/leave" {
             // Always the currently selected channel tab - `/leave` takes
-            // no argument. A no-op if that tab isn't actually joined (an
-            // unjoined public tab, or one already `left`) - nothing to
+            // no argument. A no-op if that tab isn't actually joined yet
+            // (its `Joined` confirmation still in flight) - nothing to
             // leave.
             let channel = self.channels.get(self.selected_channel)?;
             if !channel.joined {
@@ -2745,6 +2752,9 @@ pub fn render(frame: &mut Frame, state: &UiState) {
     }
     if state.mode == Mode::ChannelPasswordPopup {
         super::channel::render_channel_password_popup(frame, area, state);
+    }
+    if state.mode == Mode::ChannelsPopup {
+        super::channel::render_channels_popup(frame, area, state);
     }
     if state.mode == Mode::FileSend {
         super::file_send::render_file_send_popup(frame, area, state);
