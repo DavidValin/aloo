@@ -463,8 +463,9 @@ pub(crate) fn on_stream_start(
     stream_id: u64,
 ) {
     // Snapshotted once, same as the decrypt key set itself (PROTOCOL.md
-    // §11.2/§12): a Pending/Rejected sender's stream is never played live.
-    let suppress_playback = ui_state.is_trust_gated(from);
+    // §11.2/§12): a Pending/Rejected sender's stream is never played live,
+    // and neither is a `/mute-voice`d one (docs/SPEC.md Functionality #15).
+    let suppress_playback = ui_state.suppress_playback_from(from);
     let sender_public_key_der = ui_state
         .known_users
         .get(&from)

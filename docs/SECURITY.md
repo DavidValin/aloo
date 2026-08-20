@@ -144,6 +144,29 @@ server beyond a per-mail size cap: an *authenticated* client can grow the
 mail directory at will, the same server-operator-trust boundary the relay
 already has - `--password`/`--enc rsa` are the control.
 
+**A running daemon's attach socket is a live handle on the whole session.**
+Background mode (`aloo --daemon`, `docs/SPEC.md` "Running in background
+mode") leaves a Unix domain socket at `~/.aloo/daemon.sock` for a terminal
+to attach through. Anyone who can write to it does not merely read stored
+secrets the way `~/.aloo/settings` leaks them — they get the *live*
+session: every message in it, and the ability to send text, files and
+voice as you, to anyone you can reach. Local disk access is already out of
+scope above, but this is worth stating separately because it is a strictly
+larger capability than reading files, and because it exists only while a
+daemon is running.
+
+What holds that line is file permissions, and nothing else: the socket is
+created `0600`, and aloo refuses to speak to one that is not owned by the
+user running it. There is no authentication on the socket itself and no
+encryption over it. That is a deliberate choice rather than an omission —
+a credential would have to be stored somewhere the same local attacker
+could read, so it would add ceremony without moving the boundary — but it
+does mean the usual caveats apply with more force than usual: another
+process running as your user, a permissive `umask` on a filesystem that
+ignores the `chmod`, or an `ALOO_HOME` pointed somewhere world-writable
+all defeat it. If you do not want that exposure, do not run a daemon; a
+foreground client opens no socket at all.
+
 ## Assurance: how much of this is checked
 
 **Machine-checked.** Every requirement in `requirements/requirements.toml`

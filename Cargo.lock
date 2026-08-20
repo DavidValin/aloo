@@ -66,6 +66,7 @@ dependencies = [
  "hkdf",
  "hmac",
  "if-addrs",
+ "libc",
  "libpulse-binding",
  "libpulse-simple-binding",
  "ml-dsa",

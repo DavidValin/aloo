@@ -37,6 +37,13 @@ windows-sys = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging", "W
 libpulse-binding = "2.30"
 libpulse-simple-binding = "2.29"
 
+# The daemon's own socket ownership check and the `setsid` that detaches it
+# from the launching terminal (`src/client/daemon_ipc.rs`,
+# `src/client/daemon.rs`) - std exposes neither. Already in the tree
+# transitively (cpal), so this only promotes it to a direct dependency.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dependencies]
 aes-gcm = "0.11"
 bincode = { version = "2", features = ["serde"] }
@@ -150,6 +157,18 @@ path = "test/idstore_test.rs"
 [[test]]
 name = "device_id_test"
 path = "test/device_id_test.rs"
+
+[[test]]
+name = "daemon_ipc_test"
+path = "test/daemon_ipc_test.rs"
+
+[[test]]
+name = "daemon_test"
+path = "test/daemon_test.rs"
+
+[[test]]
+name = "surface_test"
+path = "test/surface_test.rs"
 
 [[test]]
 name = "settings_test"

@@ -6,13 +6,10 @@
 //! `crate::client::voice_stream`.
 
 use std::collections::HashMap;
-use std::io::Stdout;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, KeyCode, KeyModifiers};
-use ratatui::Terminal;
-use ratatui::backend::CrosstermBackend;
 use rsa::RsaPrivateKey;
 use tokio::net::TcpStream;
 
@@ -38,6 +35,34 @@ use crate::client::voice_stream;
 /// How long an incoming stream can go without a chunk/end before it's
 /// treated as abandoned - see `voice_stream::STREAM_IDLE_TIMEOUT`.
 use voice_stream::STREAM_IDLE_TIMEOUT;
+
+/// Everything that can arrive from "the person using this session",
+/// whichever surface they are using it through
+/// (`crate::client::tui::surface`).
+///
+/// Before daemon mode this was just `crossterm::event::Event`, read by a
+/// thread `run_connected_session` spawned itself. A daemon's session has
+/// no terminal of its own, and gains one only when someone attaches - so
+/// the loop takes a receiver of *these* instead, and the same loop serves
+/// both worlds: a terminal-attached run feeds it from the local stdin
+/// thread, a daemon from its IPC listener.
+#[derive(Debug)]
+pub enum SessionInput {
+    /// A key (or other terminal event) from whoever is driving right now.
+    Key(Event),
+    /// Someone attached a viewer of this size - start drawing to it.
+    Attached {
+        writer: crate::client::tui::surface::AttachWriter,
+        size: crate::client::tui::surface::TerminalSize,
+    },
+    /// The attached viewer's terminal changed size.
+    Resized(crate::client::tui::surface::TerminalSize),
+    /// Stop drawing and keep running - `/daemon`, or the viewer's socket
+    /// dropping. Never ends the session.
+    Detach,
+    /// End the session and return, as a clean quit does.
+    Shutdown,
+}
 
 /// Every piece of state and every channel handle the voice-streaming
 /// machinery needs, threaded through both `handle_ui_action` (outgoing)
@@ -193,14 +218,83 @@ pub(crate) struct SessionState {
     /// `run_connected_session`'s select loop into
     /// `UiState::set_call_level`.
     pub(crate) call_level_tx: tokio::sync::mpsc::UnboundedSender<(UserId, u8)>,
+    /// What this session must do once connected, when it is running as a
+    /// daemon (`crate::client::daemon::DaemonPlan`, docs/SPEC.md "Daemon
+    /// mode"). `None` for every ordinary foreground client - and every
+    /// hook that reads it is a no-op in that case, which is what keeps
+    /// daemon mode from changing the behaviour of anything else.
+    pub(crate) daemon_plan: Option<crate::client::daemon::DaemonPlan>,
+    /// Whether a terminal is watching this session right now
+    /// (`SessionInput::Attached` until `Detach`). Only meaningful in
+    /// daemon mode; a foreground session is always being watched.
+    ///
+    /// What it gates is the join sound: it exists for when nobody is
+    /// looking, so it must not fire at someone who is.
+    pub(crate) viewer_attached: bool,
+    /// Peers already announced as online, so "alice is here" is one sound
+    /// however many shared channels her arrival arrives through
+    /// (`UserJoined` is per channel). Cleared on `UserOffline`, so the
+    /// next time she comes online is announced again.
+    pub(crate) announced_online: std::collections::HashSet<UserId>,
+    /// The peer a `--otp` daemon has proposed a session to and not yet
+    /// heard the outcome for (docs/SPEC.md "Running in background mode").
+    ///
+    /// Only set when the *daemon* asked, never when a person typed
+    /// `/otp` - someone at the keyboard already sees the outcome on
+    /// screen, and does not need to be alerted to it.
+    pub(crate) daemon_awaiting_otp: Option<UserId>,
+}
+
+/// `run_connected_session` for a daemon: no terminal, a plan, and the
+/// keyboard-release question answered by whoever attaches rather than by
+/// this process.
+///
+/// `keyboard_release_reporting: false` is the deliberate choice, not a
+/// placeholder. It is the safe default (`UiState`'s own doc): with it
+/// unset, a held Space that never reports a release is still auto-stopped
+/// on silence rather than recording forever. A daemon cannot ask - it has
+/// no terminal - and the shortcut it actually exists for
+/// (`global_ptt`) is exempt from that guess anyway, since a held OS hotkey
+/// always delivers a real release.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_daemon_session(
+    surface: &mut crate::client::tui::surface::Surface,
+    rd: crate::control::ControlReader<tokio::io::ReadHalf<TcpStream>>,
+    wr: crate::control::ControlWriter<tokio::io::WriteHalf<TcpStream>>,
+    display_name: String,
+    you: UserId,
+    my_identity: ResolvedIdentity,
+    key_mode: KeyMode,
+    id_store: idstore::IdStore,
+    hotkey_rx: Option<tokio::sync::mpsc::UnboundedReceiver<crate::client::global_ptt::GlobalPttEvent>>,
+    server_addr: SocketAddr,
+    input_rx: tokio::sync::mpsc::UnboundedReceiver<SessionInput>,
+    plan: crate::client::daemon::DaemonPlan,
+) -> Result<(), BoxError> {
+    run_connected_session(
+        surface,
+        rd,
+        wr,
+        display_name,
+        you,
+        my_identity,
+        key_mode,
+        false,
+        id_store,
+        hotkey_rx,
+        server_addr,
+        input_rx,
+        Some(plan),
+    )
+    .await
 }
 
 // `key_mode` pushed this past clippy's default 7-argument threshold;
 // grouping the handshake outputs into a struct would be a larger,
 // unrelated refactor of an already-established call site.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn run_connected_session(
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+pub async fn run_connected_session(
+    surface: &mut crate::client::tui::surface::Surface,
     mut rd: crate::control::ControlReader<tokio::io::ReadHalf<TcpStream>>,
     mut wr: crate::control::ControlWriter<tokio::io::WriteHalf<TcpStream>>,
     display_name: String,
@@ -211,8 +305,9 @@ pub(crate) async fn run_connected_session(
     id_store: idstore::IdStore,
     mut hotkey_rx: Option<tokio::sync::mpsc::UnboundedReceiver<crate::client::global_ptt::GlobalPttEvent>>,
     server_addr: SocketAddr,
+    mut input_rx: tokio::sync::mpsc::UnboundedReceiver<SessionInput>,
+    daemon_plan: Option<crate::client::daemon::DaemonPlan>,
 ) -> Result<(), BoxError> {
-    let mut input_rx = crate::client::tui::terminal::spawn_input_thread();
 
     let (net_tx, mut net_rx) = tokio::sync::mpsc::unbounded_channel::<ServerMessage>();
     tokio::spawn(async move {
@@ -308,6 +403,7 @@ pub(crate) async fn run_connected_session(
     let (rotate_out_tx, mut rotate_out_rx) =
         tokio::sync::mpsc::unbounded_channel::<ClientMessage>();
 
+    let is_daemon = daemon_plan.is_some();
     let mut session = SessionState {
         active_recording: None,
         next_stream_id: 1,
@@ -361,11 +457,30 @@ pub(crate) async fn run_connected_session(
         own_device_id,
         peer_device_ids: HashMap::new(),
         active_call: None,
+        daemon_plan,
+        // A foreground session is always watched; a daemon starts with
+        // nobody attached and learns otherwise from its IPC listener.
+        viewer_attached: !is_daemon,
+        announced_online: std::collections::HashSet::new(),
+        daemon_awaiting_otp: None,
     };
 
     let mut ui_state = UiState::new(display_name);
     ui_state.set_own_id(you);
+    // What makes `/daemon` mean something: only a session with a
+    // background to go back to can be handed back to it.
+    ui_state.daemon_mode = is_daemon;
     ui_state.set_keyboard_release_reporting(keyboard_release_reporting);
+    // `/mute-voice`'s persisted set (docs/SPEC.md Functionality #15).
+    // Read once here rather than threaded down from `main.rs`'s own load:
+    // the file may have been edited by hand, or by another session, since
+    // this process started. A read failure just means nothing is muted -
+    // never a reason to refuse the session.
+    ui_state.set_muted_voice(
+        crate::settings::Settings::load_or_create(&crate::settings::default_path())
+            .map(|s| s.muted_voice)
+            .unwrap_or_default(),
+    );
     // Ticks fast enough that `tick_recording_timeout` can detect a
     // released Space key within one `RECORD_HOLD_TIMEOUT` window without
     // adding much latency; also drives the idle-stream sweep below.
@@ -394,19 +509,47 @@ pub(crate) async fn run_connected_session(
         crate::client::otp_mail::resend_pending(&mut wr, &mut session).await?;
     }
 
-    terminal.draw(|f| ui::render(f, &ui_state))?;
+    surface.draw(|f| ui::render(f, &ui_state))?;
 
     loop {
         tokio::select! {
-            ev = input_rx.recv() => {
-                let Some(ev) = ev else { break };
-                if let Event::Key(key) = ev {
-                    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-                        break;
+            input = input_rx.recv() => {
+                let Some(input) = input else { break };
+                match input {
+                    SessionInput::Key(Event::Key(key)) => {
+                        // Only ever reached from a terminal this process
+                        // owns: the attach client answers Ctrl+C itself
+                        // by detaching, so a viewer can never kill the
+                        // daemon's session by quitting its own window.
+                        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                            break;
+                        }
+                        if let Some(action) = ui_state.handle_key(key.code, key.modifiers, key.kind) {
+                            // `Detach` acts on the surface, which this
+                            // loop owns and `handle_ui_action` does not -
+                            // so it is answered here rather than threaded
+                            // down into a function about network sends.
+                            if matches!(action, UiAction::Detach) {
+                                session.viewer_attached = false;
+                                surface.detach();
+                            } else {
+                                handle_ui_action(action, &mut wr, &mut ui_state, &mut session).await?;
+                            }
+                        }
                     }
-                    if let Some(action) = ui_state.handle_key(key.code, key.modifiers, key.kind) {
-                        handle_ui_action(action, &mut wr, &mut ui_state, &mut session).await?;
+                    SessionInput::Key(_) => {}
+                    SessionInput::Attached { writer, size } => {
+                        session.viewer_attached = true;
+                        surface.attach(writer, size)?;
                     }
+                    SessionInput::Resized(size) => {
+                        surface.resize(size)?;
+                    }
+                    SessionInput::Detach => {
+                        session.viewer_attached = false;
+                        surface.detach();
+                    }
+                    SessionInput::Shutdown => break,
                 }
             }
             msg = net_rx.recv() => {
@@ -474,14 +617,15 @@ pub(crate) async fn run_connected_session(
             finished = stream_finished_rx.recv() => {
                 let Some((from, stream_id, duration_ms, pcm)) = finished else { break };
                 if let Some(active) = session.active_streams.remove(&(from, stream_id)) {
-                    // Best-effort re-check of the trust state
-                    // `on_stream_start` snapshotted - skips the "message
-                    // ended" chime for a sender who was never heard. Not
-                    // threaded through `ActiveStream`, so a mismatch newly
-                    // detected mid-stream (rare) could still chime for
-                    // suppressed audio - a harmless UX quirk, not a
-                    // correctness issue.
-                    let was_heard = !ui_state.is_trust_gated(from);
+                    // Best-effort re-check of what `on_stream_start`
+                    // snapshotted - skips the "message ended" chime for a
+                    // sender who was never heard, whether that was the
+                    // trust gate or a `/mute-voice` (a chime announcing
+                    // audio that never played is just noise). Not threaded
+                    // through `ActiveStream`, so a state newly changed
+                    // mid-stream (rare) could still chime for suppressed
+                    // audio - a harmless UX quirk, not a correctness issue.
+                    let was_heard = !ui_state.suppress_playback_from(from);
                     match active.channel {
                         Some(channel) => crate::client::channel::on_stream_finished(&mut ui_state, &channel, from, stream_id, duration_ms, pcm),
                         None => crate::client::direct_message::on_stream_finished(&mut ui_state, from, stream_id, duration_ms, pcm),
@@ -598,7 +742,7 @@ pub(crate) async fn run_connected_session(
                 session.peer_link.tick();
             }
         }
-        terminal.draw(|f| ui::render(f, &ui_state))?;
+        surface.draw(|f| ui::render(f, &ui_state))?;
     }
 
     Ok(())
@@ -823,8 +967,28 @@ async fn handle_ui_action(
             key_mode,
             pubkey_der,
         } => {
+            // Snapshotted so a refusal raised by *this* call can be told
+            // apart from a notice that was already on screen.
+            let notice_before = ui_state.status_notice.clone();
             crate::client::otp::handle_otp_command(wr, ui_state, session, peer, key_mode, pubkey_der)
                 .await?;
+            // `handle_otp_command` refuses some proposals outright -
+            // neither side `pq_hybrid`, no `otp` binary, an unreadable
+            // peer identity - and those never reach the peer at all, so
+            // no acknowledgement will ever arrive to resolve them. A new
+            // failure notice is exactly that case; anything else is a
+            // proposal genuinely in flight, resolved by
+            // `on_key_setup_ack` when the peer answers.
+            let refused = ui_state.status_notice != notice_before
+                && matches!(&ui_state.status_notice, Some((_, false)));
+            if refused && !ui_state.is_otp_active(peer) {
+                let reason = ui_state
+                    .status_notice
+                    .as_ref()
+                    .map(|(text, _)| text.clone())
+                    .unwrap_or_default();
+                daemon_otp_outcome(ui_state, session, peer, false, &reason);
+            }
         }
         UiAction::ConfirmOtpGenerate { size_mb } => {
             crate::client::otp::confirm_generate(wr, session, ui_state, size_mb).await?;
@@ -902,8 +1066,52 @@ async fn handle_ui_action(
         UiAction::HostMuteCallMember { peer, muted } => {
             voice_call::host_set_muted(wr, session, ui_state, peer, muted).await?;
         }
+        UiAction::SetVoiceMuted { nickname, muted } => {
+            set_voice_muted(ui_state, &nickname, muted);
+        }
+        UiAction::Detach => {
+            // Intercepted by `run_connected_session`'s input arm, which
+            // owns the `Surface` this acts on. A no-op rather than an
+            // `unreachable!` so a future call path that routes one through
+            // here degrades to "nothing happened" instead of aborting a
+            // live session over a UI command.
+        }
     }
     Ok(())
+}
+
+/// Persists a `/mute-voice` / `/unmute-voice` decision to
+/// `~/.aloo/settings` and mirrors back whatever actually landed there
+/// (docs/SPEC.md Functionality #15).
+///
+/// Goes through `Settings::update_muted_voice`, never a plain `save` - see
+/// that function's doc: this file is now written *during* a session, and
+/// serializing this process's whole in-memory `Settings` would let a mute
+/// silently revert server settings a concurrently started `aloo --server`
+/// had just recorded.
+///
+/// A write failure leaves the in-memory set as `UiState` already applied
+/// it (so the mute works for this session) and says so, rather than
+/// refusing the mute over a preferences-file problem - the same policy
+/// `load_id_store` applies to its own store.
+fn set_voice_muted(ui_state: &mut UiState, nickname: &str, muted: bool) {
+    let result = crate::settings::Settings::update_muted_voice(
+        &crate::settings::default_path(),
+        |set| {
+            if muted {
+                set.insert(nickname.to_string());
+            } else {
+                set.remove(nickname);
+            }
+        },
+    );
+    match result {
+        Ok(stored) => ui_state.set_muted_voice(stored),
+        Err(e) => ui_state.push_status_notice(
+            format!("muted for this session only - could not write ~/.aloo/settings ({e})"),
+            false,
+        ),
+    }
 }
 
 /// Carries out an `AcceptFileOffer` decision: resolves which key to decrypt
@@ -1023,11 +1231,24 @@ async fn handle_server_message(
             // only expected during the handshake in connect::connect_and_handshake
         }
         ServerMessage::ChannelList(list) => {
-            if let Some(action) = crate::client::channel::on_list(ui_state, list) {
+            // A daemon joins exactly what it was configured to join, and
+            // never `the-hall` unless that was one of them - the whole
+            // point of the mode is to be where the user actually wants
+            // their voice to land. `on_list`'s auto-join is skipped
+            // entirely rather than joined-then-left, which would show up
+            // to everyone in the hall as a connect/disconnect flicker.
+            if session.daemon_plan.is_some() {
+                ui_state.on_channel_list(list);
+                request_daemon_joins(wr, session).await?;
+            } else if let Some(action) = crate::client::channel::on_list(ui_state, list) {
                 return Ok(Some(action));
             }
         }
-        ServerMessage::Joined { channel } => crate::client::channel::on_joined(ui_state, channel),
+        ServerMessage::Joined { channel } => {
+            let name = channel.name.clone();
+            crate::client::channel::on_joined(ui_state, channel);
+            apply_daemon_channel_focus(ui_state, session, &name);
+        }
         // Reuses the plain, dedup-safe appender directly - unlike
         // `crate::client::channel::on_list` (only for the connect-time snapshot
         // above), this must never auto-join anything.
@@ -1102,9 +1323,17 @@ async fn handle_server_message(
             // `ensure_link` is a no-op on an existing link, and failure
             // stays silent until something is actually queued against them.
             session.peer_link.ensure_link(wr, user.id).await;
+            let joined_id = user.id;
+            let joined_name = user.name.clone();
             ui_state.on_user_joined(&channel, user);
+            if let Some(action) =
+                on_daemon_peer_appeared(ui_state, session, joined_id, &joined_name, &channel)
+            {
+                return Ok(Some(action));
+            }
         }
         ServerMessage::UserLeft { channel, user_id } => {
+            notify_daemon_presence(ui_state, session, user_id, Some(&channel), "left");
             ui_state.on_user_left(&channel, user_id);
             // Unlike `UserOffline` below, a `UserLeft` peer may still share
             // another channel with us or have an open DM - only forget the
@@ -1115,6 +1344,11 @@ async fn handle_server_message(
             }
         }
         ServerMessage::UserOffline { user_id } => {
+            // Read before `on_user_offline`, which is what would make the
+            // nickname unresolvable if it ever stopped keeping them.
+            notify_daemon_presence(ui_state, session, user_id, None, "disconnected");
+            // Their next arrival is a fresh "they are online" event.
+            session.announced_online.remove(&user_id);
             ui_state.on_user_offline(user_id);
             // A full disconnect is always the end of any relationship with
             // them - unlike `UserLeft` (one channel, possibly still shared
@@ -1203,6 +1437,250 @@ async fn handle_server_message(
         }
     }
     Ok(None)
+}
+
+// ---------------------------------------------------------------------
+// Daemon plan hooks (docs/SPEC.md "Running in background mode")
+//
+// Every one of these is a no-op without a plan, which is what keeps
+// daemon mode from changing what an ordinary client does.
+// ---------------------------------------------------------------------
+
+/// Sends one `JoinChannel` per configured channel, once, on the first
+/// channel directory the server sends.
+///
+/// Once, not on every `ChannelList`: a client also receives one when a
+/// channel is created later in the session, and re-requesting the joins
+/// then would fight whatever the user has since done from an attached
+/// terminal.
+async fn request_daemon_joins(
+    wr: &mut impl crate::control::ControlSink,
+    session: &mut SessionState,
+) -> proto::Result<()> {
+    let Some(plan) = session.daemon_plan.as_mut() else {
+        return Ok(());
+    };
+    if plan.joins_requested {
+        return Ok(());
+    }
+    plan.joins_requested = true;
+    let channels = plan.channels.clone();
+    for channel in channels {
+        // `Public` is the kind to *create* it with if it doesn't exist -
+        // an existing channel keeps whatever kind it already has
+        // (docs/PROTOCOL.md §6.1), so this never converts one. A private
+        // channel joined by name with its password works identically.
+        crate::client::channel::handle_join(
+            wr,
+            session,
+            channel.name.clone(),
+            proto::ChannelKind::Public,
+            channel.password.clone(),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Selects the focused channel's tab once its join is confirmed.
+///
+/// Only the first time. After that the focus belongs to whoever is
+/// driving: someone who attached and moved to another tab must not have
+/// it yanked back by a peer rejoining.
+fn apply_daemon_channel_focus(ui_state: &mut UiState, session: &mut SessionState, joined: &str) {
+    let Some(plan) = session.daemon_plan.as_mut() else {
+        return;
+    };
+    if !plan.should_place_focus() || plan.focused_channel() != Some(joined) {
+        return;
+    }
+    if let Some(index) = ui_state.channels.iter().position(|c| c.name == joined) {
+        ui_state.selected_channel = index;
+        // A daemon's focus is a channel, not a DM - so any private room
+        // left open from a previous attach must not keep intercepting the
+        // push-to-talk target (`current_voice_target` checks it first).
+        ui_state.active_private_room = None;
+        plan.focus_applied = true;
+    }
+}
+
+/// Handles a peer appearing while a daemon plan is in effect: the focus
+/// sound, the desktop notification, and - for a DM focus - opening the
+/// room and, if asked, proposing an OTP session.
+///
+/// Returns the OTP request as an action rather than performing it, so the
+/// caller drives it through the same `handle_ui_action` path `/otp` uses;
+/// there is exactly one implementation of "propose an OTP session".
+fn on_daemon_peer_appeared(
+    ui_state: &mut UiState,
+    session: &mut SessionState,
+    peer: UserId,
+    nickname: &str,
+    channel: &str,
+) -> Option<UiAction> {
+    // Daemon mode at all, or there is nothing here to do.
+    session.daemon_plan.as_ref()?;
+
+    // The sound is decided against the *live* focus, so it is evaluated
+    // before anything that gates on the plan's `--focus` - the two differ
+    // exactly when someone has attached and moved, which is the case this
+    // rule exists for. See `DaemonPlan::should_play_joined_chime`.
+    let announce = crate::client::daemon::DaemonPlan::should_play_joined_chime(
+        true,
+        session.viewer_attached,
+        &ui_state.current_focus(),
+        peer,
+        channel,
+        session.announced_online.contains(&peer),
+    );
+    // Recorded whether or not it was announced: what makes "alice is
+    // online" one event is her being online, not our having made a noise
+    // about it (we may have been attached at the time, or pointed
+    // elsewhere).
+    session.announced_online.insert(peer);
+    if announce {
+        crate::client::voice_stream::play_joined_chime(session);
+    }
+
+    // Everything from here is about the focus the daemon was *started*
+    // with: placing it the first time, and the OTP session that goes with
+    // it. A peer who is not what this daemon was told to watch for is of
+    // no further interest - the sound above has already had its say.
+    let plan = session.daemon_plan.as_ref()?;
+    if !plan.is_focus_event(nickname, Some(channel)) {
+        return None;
+    }
+    let is_dm_focus = plan.focused_nickname() == Some(nickname);
+    // Both decided before anything below mutates the plan - see
+    // `DaemonPlan::should_place_focus` and `should_invite_otp`.
+    let place_focus = is_dm_focus && plan.should_place_focus();
+    let invite_otp = plan.should_invite_otp(nickname, ui_state.is_otp_active(peer));
+
+    // Silent, so it keeps the broader rule on purpose: it costs nothing
+    // to have seen later, and its siblings also cover leaving and
+    // disconnecting, which the sound deliberately does not.
+    crate::client::global_notification::notify(crate::client::global_notification::Notification::new(
+        format!("{nickname} is here"),
+        if is_dm_focus {
+            "Hold the push-to-talk shortcut to talk to them.".to_string()
+        } else {
+            format!("Joined {channel}.")
+        },
+    ));
+
+    if place_focus {
+        // Open their room, so the global shortcut addresses them rather
+        // than the channel they happened to be discovered in. Once only -
+        // see `should_place_focus`: after this, where the focus sits
+        // belongs to whoever is driving the session, not to the flag it
+        // was started with.
+        let Some(info) = ui_state.known_users.get(&peer).cloned() else {
+            return None;
+        };
+        ui_state.open_private_room(info);
+        if let Some(plan) = session.daemon_plan.as_mut() {
+            plan.focus_applied = true;
+        }
+    }
+
+    // The `UserJoined` arm above has already resumed any still-live
+    // session (`mark_otp_active`), which is exactly what makes the
+    // already-active case reachable here.
+    if invite_otp {
+        if let Some(plan) = session.daemon_plan.as_mut() {
+            plan.otp_requested = true;
+        }
+        let info = ui_state.known_users.get(&peer)?.clone();
+        // Marks this as the *daemon's* proposal, so its outcome is
+        // announced out loud (`daemon_otp_outcome`). A `/otp` someone
+        // typed is not marked, and stays silent - they can see it.
+        session.daemon_awaiting_otp = Some(peer);
+        return Some(UiAction::RequestOtpSession {
+            peer,
+            key_mode: info.key_mode,
+            pubkey_der: info.public_key_der,
+        });
+    }
+    None
+}
+
+/// Reports the outcome of an OTP session the *daemon* proposed
+/// (docs/SPEC.md "Running in background mode").
+///
+/// A failure here is the one thing a `--otp` daemon cannot recover from
+/// on its own: the peer is online, the focus is on them, and the shortcut
+/// is ready - but what it would send is no longer pad-protected, which is
+/// precisely what `--otp` was asked for. So it makes a noise. `bell.wav`,
+/// the app's existing "something needs you" sound, rather than a new one:
+/// this is the same class of event as an incoming file offer.
+///
+/// Success is silent. The daemon carrying on exactly as instructed is not
+/// news.
+pub(crate) fn daemon_otp_outcome(
+    ui_state: &mut UiState,
+    session: &mut SessionState,
+    peer: UserId,
+    started: bool,
+    reason: &str,
+) {
+    if session.daemon_awaiting_otp != Some(peer) {
+        return;
+    }
+    session.daemon_awaiting_otp = None;
+    if started {
+        return;
+    }
+    crate::client::voice_stream::play_bell_chime(session);
+    let name = ui_state
+        .known_users
+        .get(&peer)
+        .map(|u| u.name.clone())
+        .unwrap_or_default();
+    crate::client::global_notification::notify(
+        crate::client::global_notification::Notification::new(
+            format!("No OTP session with {name}"),
+            format!("{reason} Your voice would not be pad-protected."),
+        ),
+    );
+}
+
+/// Notifies that a focused peer has gone - left the focused channel, or
+/// disconnected entirely.
+///
+/// Notification only, no sound: the spec asks for a sound when someone
+/// *arrives* (that is the actionable event - you can talk to them now) and
+/// for a notification either way.
+fn notify_daemon_presence(
+    ui_state: &UiState,
+    session: &SessionState,
+    peer: UserId,
+    channel: Option<&str>,
+    what: &str,
+) {
+    let Some(plan) = session.daemon_plan.as_ref() else {
+        return;
+    };
+    let Some(info) = ui_state.known_users.get(&peer) else {
+        return;
+    };
+    // `UserOffline` names no channel (docs/PROTOCOL.md §6.4) - it means
+    // "this identity is gone", so for a channel focus it counts wherever
+    // they were.
+    let relevant = match channel {
+        Some(channel) => plan.is_focus_event(&info.name, Some(channel)),
+        None => plan.focused_nickname() == Some(info.name.as_str())
+            || plan.focused_channel().is_some(),
+    };
+    if !relevant {
+        return;
+    }
+    crate::client::global_notification::notify(crate::client::global_notification::Notification::new(
+        format!("{} {what}", info.name),
+        match channel {
+            Some(channel) => format!("No longer in {channel}."),
+            None => "They are offline.".to_string(),
+        },
+    ));
 }
 
 /// Applies one incoming direct-link event (`crate::client::p2p::P2pEvent`) - the

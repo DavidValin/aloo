@@ -691,3 +691,80 @@ async fn muting_requested(w: &mut AlooWorld) {
 async fn ending_call_requested(w: &mut AlooWorld) {
     assert_eq!(w.last_action, Some(UiAction::EndCall));
 }
+
+// ---------------------------------------------------------------------
+// Muting a person's voice messages (US-037, docs/SPEC.md Functionality #15)
+// ---------------------------------------------------------------------
+
+#[given(expr = "{word}'s voice messages are muted")]
+async fn given_voice_muted(w: &mut AlooWorld, name: String) {
+    let mut muted = w.ui_ref().muted_voice.clone();
+    muted.insert(name);
+    w.ui_mut().set_muted_voice(muted);
+}
+
+#[then(expr = "{word}'s voice messages are muted")]
+async fn then_voice_muted(w: &mut AlooWorld, name: String) {
+    assert!(
+        w.ui_ref().muted_voice.contains(&name),
+        "{name} should be muted, muted set is {:?}",
+        w.ui_ref().muted_voice
+    );
+}
+
+#[then(expr = "{word}'s voice messages are not muted")]
+async fn then_voice_not_muted(w: &mut AlooWorld, name: String) {
+    assert!(
+        !w.ui_ref().muted_voice.contains(&name),
+        "{name} should not be muted, muted set is {:?}",
+        w.ui_ref().muted_voice
+    );
+}
+
+/// The predicate every incoming-audio decision funnels through
+/// (`UiState::suppress_playback_from`) - what actually keeps a muted
+/// sender's stream off the mixer, and what a trust-gated sender's stream
+/// has always been kept off it by.
+#[then(expr = "playback from {word} is suppressed")]
+async fn then_playback_suppressed(w: &mut AlooWorld, name: String) {
+    let id = UserId(id_for(&name));
+    assert!(
+        w.ui_ref().suppress_playback_from(id),
+        "audio from {name} should never reach the mixer"
+    );
+}
+
+#[then(expr = "playback from {word} is not suppressed")]
+async fn then_playback_not_suppressed(w: &mut AlooWorld, name: String) {
+    let id = UserId(id_for(&name));
+    assert!(
+        !w.ui_ref().suppress_playback_from(id),
+        "audio from {name} should play as usual"
+    );
+}
+
+#[then(expr = "a status notice says {string}")]
+async fn then_status_notice_says(w: &mut AlooWorld, expected: String) {
+    let (text, _) = w
+        .ui_ref()
+        .status_notice
+        .as_ref()
+        .expect("no status notice is shown");
+    assert!(
+        text.contains(&expected),
+        "status notice {text:?} should contain {expected:?}"
+    );
+}
+
+#[then(expr = "a status notice names {word}")]
+async fn then_status_notice_names(w: &mut AlooWorld, name: String) {
+    let (text, _) = w
+        .ui_ref()
+        .status_notice
+        .as_ref()
+        .expect("no status notice is shown");
+    assert!(
+        text.contains(&name),
+        "status notice {text:?} should name {name:?}"
+    );
+}

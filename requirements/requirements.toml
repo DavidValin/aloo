@@ -2245,3 +2245,118 @@ evidence = "src/client/voice.rs level_from_pcm, LEVEL_FULL_SCALE_RMS; test level
 id = "TB-209"
 description = "A call participant's pq_hybrid StreamKeySetup arriving before that participant is in our roster is held (ActiveCall::pending_setups) and replayed into their decrypt worker the moment they are added, rather than dropped - the ordinary ordering, since a peer sends its setup the instant it adds us, before its own CallAccept has reached us."
 evidence = "docs/PROTOCOL.md 7.7; src/client/voice_call.rs forward_key_setup, add_participant, is_call_stream; test a_call_key_setup_arriving_before_the_participant_is_replayed_once_they_join"
+
+# ============================================================================
+# US-037 - Mute a person's voice messages
+# ============================================================================
+[[user_story]]
+id = "US-037"
+title = "Mute a person's voice messages"
+as_a = "connected user"
+i_want = "to stop one person's voice messages playing themselves the moment they arrive, and to have that stick across sessions"
+so_that = "a talkative contact does not interrupt whatever I am doing, while I can still read the log and replay them when I choose"
+
+[[user_story.acceptance_criteria]]
+id = "AC-195"
+description = "/mute-voice <nickname> stops that nickname's incoming voice messages from autoplaying; /unmute-voice <nickname> resumes them. Both confirm with a status notice, and either command with no nickname lists who is currently muted instead of erroring."
+evidence = "docs/SPEC.md Functionality #15; src/client/tui/ui.rs try_voice_mute_command, UiAction::SetVoiceMuted; tests mute_voice_command_produces_a_mute_action, unmute_voice_command_produces_an_unmute_action, a_bare_mute_voice_command_lists_who_is_muted; scenario features/voice/muting_voice.feature 'Muting and unmuting a person's voice messages'"
+
+[[user_story.acceptance_criteria]]
+id = "AC-196"
+description = "A muted sender's voice message still arrives, still decrypts and still appears in the log - only live playback is suppressed - so Enter still replays it; and the end-of-message chime is suppressed too, since it would otherwise announce audio that never played."
+evidence = "docs/SPEC.md Functionality #15; src/client/tui/ui.rs suppress_playback_from; src/client/channel.rs on_stream_start; src/client/direct_message.rs on_stream_start; src/client/session.rs was_heard; src/client/voice_stream.rs spawn_stream_decrypt_worker's suppress_playback; tests a_muted_peer_suppresses_playback_but_not_logging, suppress_playback_from_covers_both_the_trust_gate_and_a_mute; scenario features/voice/muting_voice.feature 'A muted message still arrives and can still be replayed'"
+
+[[user_story.acceptance_criteria]]
+id = "AC-197"
+description = "A muted user is marked in the channel sidebar, so a channel that has gone quiet is distinguishable from one where nobody is talking."
+evidence = "docs/SPEC.md Functionality #15; src/client/tui/channel.rs render_sidebar's muted marker; test a_muted_member_is_marked_in_the_sidebar; scenario features/voice/muting_voice.feature 'A muted user is marked in the sidebar'"
+
+[[user_story.acceptance_criteria]]
+id = "AC-198"
+description = "Muting is by nickname rather than by connection, so someone can be muted while offline or before they have ever connected, and the mute still applies when they next appear; it never affects a live voice call, where who you can hear is separate state that lasts only as long as the call."
+evidence = "docs/SPEC.md Functionality #15; src/settings.rs Settings::muted_voice; src/client/tui/ui.rs is_voice_muted; tests muting_an_offline_or_unknown_nickname_is_accepted, a_mute_does_not_suppress_call_audio; scenario features/voice/muting_voice.feature 'Someone can be muted before they ever connect'"
+
+[[user_story.technical_behavior]]
+id = "TB-213"
+description = "The muted-voice set persists in ~/.aloo/settings as one muted_voice=<nickname> line per entry, written in sorted order, rather than one comma-separated value - a nickname rejects only whitespace, so a comma is legal inside one and a joined list would be ambiguous. Unparseable or unstorable entries are skipped on load, like every other key in the file."
+evidence = "src/settings.rs Settings::muted_voice, parse, save; tests muted_voice_round_trips_as_one_line_per_nickname, a_nickname_containing_a_comma_survives_a_round_trip, muted_voice_entries_are_written_in_sorted_order"
+
+[[user_story.technical_behavior]]
+id = "TB-214"
+description = "A mute is persisted with a reload-merge-save of only the muted_voice key (Settings::update_muted_voice), never by serializing the whole in-memory Settings - so a mute written mid-session cannot silently revert server_bind/server_port/auth that a concurrently started aloo --server had recorded, and vice versa."
+evidence = "src/settings.rs Settings::update_muted_voice; src/client/session.rs set_voice_muted; tests update_muted_voice_preserves_keys_written_by_another_process, update_muted_voice_creates_the_file_when_missing"
+
+# ============================================================================
+# US-038 - Run aloo as a resumable background daemon
+# ============================================================================
+[[user_story]]
+id = "US-038"
+title = "Run aloo as a resumable background daemon"
+as_a = "user who wants to talk without keeping a terminal open"
+i_want = "aloo to connect at boot, join the channels I care about and focus where my voice should go, then let me take the session over from any terminal and hand it back"
+so_that = "the global push-to-talk shortcut is always live without me having to start and stay in the app"
+
+[[user_story.acceptance_criteria]]
+id = "AC-199"
+description = "--otp with a nickname --focus makes sure an OTP session is running with that person: one that is already active is continued silently, with no invitation sent and no Accept/Reject popup on their side, since a session outlives disconnects and restarts and only /endotp ends one; only a peer with no live session is invited, and at most once per daemon run so a flapping connection cannot become a queue of popups."
+evidence = "docs/SPEC.md 'Running in background mode' 'Focusing a person, with OTP'; docs/PROTOCOL.md 16.6; src/client/daemon.rs DaemonPlan::should_invite_otp; src/client/session.rs on_daemon_peer_appeared; tests an_already_active_otp_session_is_continued_not_re_invited, a_peer_with_no_otp_session_is_invited, without_otp_nobody_is_ever_invited, only_one_invitation_is_sent_per_daemon_run, someone_other_than_the_focused_peer_is_never_invited, a_channel_focus_never_invites_an_otp_session"
+
+[[user_story.acceptance_criteria]]
+id = "AC-200"
+description = "--focus is a starting position, not a standing instruction: it is placed once, at the first opportunity (which for a person may be long after startup, since they have to appear first), and never re-applied. Someone who attaches, moves to another channel or DM and detaches again keeps that position - a focused peer reconnecting, or a focused channel being rejoined, does not drag the focus back. The join sound and notification still fire for those events; only the focus move is suppressed."
+evidence = "docs/SPEC.md 'Running in background mode' 'Where your voice goes'; src/client/daemon.rs DaemonPlan::should_place_focus; src/client/session.rs apply_daemon_channel_focus, on_daemon_peer_appeared; tests the_focus_is_placed_once_and_then_left_alone, a_focused_peer_reappearing_does_not_re_steal_the_focus, a_focused_channel_being_rejoined_does_not_re_steal_the_focus, a_focus_still_waiting_for_its_peer_has_not_been_used_up"
+
+[[user_story.technical_behavior]]
+id = "TB-217"
+description = "--channels takes a comma-separated list of name[:password] items. The colon is what makes it unambiguous - it is legal in neither a channel name nor a channel password, whereas a comma is legal in a password - and the name/password split is on the first colon, so a password may contain commas when it comes from a single daemon_channel= settings line. Empty list items are skipped so a stray comma costs nothing, an unusable channel name is refused with a reason, an empty password means none rather than the empty one, and a channel round-trips through its settings line unchanged."
+evidence = "docs/SPEC.md 'Running in background mode' Channels; src/client/daemon.rs DaemonChannel::parse, parse_list, to_setting; src/validation.rs channel_name_is_valid, CHANNEL_PASSWORD_SYMBOLS; tests a_channel_without_a_password_parses_to_just_a_name, a_channel_password_may_itself_contain_commas, a_channels_list_splits_on_commas_and_passwords_on_colons, empty_items_in_a_channels_list_are_skipped_but_bad_names_are_not, a_single_channel_is_a_list_of_one, an_empty_password_means_no_password_rather_than_the_empty_one, an_unusable_channel_name_is_refused_with_a_reason, a_channel_round_trips_through_its_settings_line"
+
+[[user_story.technical_behavior]]
+id = "TB-218"
+description = "--focus reads a channel: prefix as a channel and anything else as a nickname (dm: being the explicit spelling of the latter), refuses an empty value, and refuses --otp against a channel since OTP is provisioned pairwise and has no channel-wide form. A DM focus then follows the person wherever they appear, while a channel focus follows arrivals in that channel."
+evidence = "src/client/daemon.rs DaemonFocus::parse, DaemonPlan::is_focus_event; tests focus_reads_a_channel_prefix_and_otherwise_a_nickname, otp_with_a_channel_focus_is_refused, an_empty_focus_is_refused, a_dm_focus_follows_the_person_not_the_channel, a_channel_focus_follows_the_channel_not_the_person, a_plan_with_no_focus_cares_about_nothing"
+
+[[user_story.acceptance_criteria]]
+id = "AC-201"
+description = "A daemon resolves what to run as flag-first, then daemon_* keys in ~/.aloo/settings, then the last connection made from the connect screen (~/.aloo/.cache, host/port and the keybundle it used), then built-in defaults - and writes the merged result back, so a later bare aloo --daemon reproduces it. With no server named anywhere it refuses to start rather than guessing; --server-pwd and --server-key are mutually exclusive; and a malformed channel or focus is reported rather than ignored."
+evidence = "docs/SPEC.md 'Running in background mode' Settings; src/client/daemon.rs DaemonConfig::resolve, persist, resolve_my_key; tests a_flag_beats_the_settings_file_and_the_cache, settings_fill_in_whatever_the_flags_left_out, the_connect_cache_is_the_last_resort_before_defaults, with_no_host_anywhere_the_daemon_refuses_to_start, the_two_server_credentials_are_mutually_exclusive, a_server_password_from_settings_is_used_when_no_flag_gives_one, a_bad_channel_or_focus_is_reported_rather_than_ignored, a_resolved_configuration_round_trips_through_the_settings_file"
+
+[[user_story.acceptance_criteria]]
+id = "AC-202"
+description = "A daemon joins exactly the channels it was given and never the-hall unless named, a focused channel is joined even when it was left off the list, and a nickname focus with no channels at all is given the-hall as a discovery channel - since presence is only ever announced within a shared channel, so a DM focus with nothing joined could never see its peer. A password containing a comma is settable from a settings line, where nothing splits on commas."
+evidence = "docs/SPEC.md 'Running in background mode' Channels; src/client/daemon.rs DaemonConfig::resolve; src/client/session.rs request_daemon_joins; tests a_daemon_joins_exactly_the_channels_it_was_given, a_focused_channel_is_joined_even_if_it_was_not_listed, a_dm_focus_with_no_channels_gets_a_discovery_channel, a_dm_focus_with_channels_does_not_get_the_hall, a_password_containing_a_comma_survives_the_settings_file"
+
+[[user_story.acceptance_criteria]]
+id = "AC-203"
+description = "One terminal attaches at a time: an Attach is answered with Attached and the session starts drawing at the reported size, keys and resizes reach it, and Detach stops the drawing while leaving the session running - as does a viewer vanishing without notice. Asking for status tells the session nothing, and only Shutdown ends it, so quitting a viewer can never take the session with it."
+evidence = "docs/SPEC.md 'Running in background mode' 'Taking the session over'; src/client/daemon.rs serve_attachments, serve_one, run_attach_client; src/client/session.rs SessionInput; tests attaching_forwards_keys_and_resizes_and_detaches_cleanly, a_viewer_vanishing_without_notice_still_detaches_the_session, status_answers_without_attaching, shutdown_ends_the_session_where_detach_does_not"
+
+[[user_story.technical_behavior]]
+id = "TB-219"
+description = "Attach-protocol messages and key events round-trip through the same length-prefixed bincode framing the network protocol uses. Every named key code, modifier set and event kind survives intact; an unnamed key code arrives as Other rather than vanishing, and an unknown modifier bit is dropped rather than failing the keystroke. A partial frame decodes to 'not yet' rather than an error, and several frames in one read are consumed one at a time."
+evidence = "src/client/daemon_ipc.rs KeyWire, KeyCodeWire, AttachMessage, DaemonMessage, encode_frame, decode_frame; tests every_named_key_code_round_trips, modifiers_and_event_kinds_round_trip, an_unnamed_key_code_becomes_other_rather_than_being_dropped, an_unknown_modifier_bit_is_dropped_not_fatal, attach_messages_round_trip_through_a_frame, daemon_messages_round_trip_through_a_frame, a_partial_frame_decodes_to_nothing_yet_rather_than_an_error, several_frames_in_one_buffer_are_consumed_one_at_a_time"
+
+[[user_story.technical_behavior]]
+id = "TB-220"
+description = "The attach socket is created private to its owner (0600) since its permissions are the access control, and lives beside the pid and log files under the same ~/.aloo directory so ALOO_HOME separates two daemons. Whether a daemon is running is decided by connecting rather than by the socket file existing, so a second daemon refuses while one is listening - naming the pid that holds it - while the debris a SIGKILLed daemon leaves behind is replaced rather than treated as a live instance. Both files are removed when the daemon exits."
+evidence = "docs/SPEC.md 'Running in background mode' 'Files it owns'; docs/SECURITY.md; src/client/daemon_ipc.rs bind_listener, connect, is_daemon_running, socket_path, pid_path, log_path; src/client/daemon.rs SingleInstance; tests the_socket_is_created_private_to_this_user, the_daemon_files_sit_together_under_the_aloo_directory, a_stale_socket_file_is_replaced_rather_than_refused, a_running_daemon_is_detected_by_connecting_not_by_the_file, acquiring_records_the_pid_and_releasing_cleans_up, a_second_daemon_refuses_while_one_is_listening, a_daemon_starts_over_the_debris_of_a_killed_one"
+
+[[user_story.acceptance_criteria]]
+id = "AC-204"
+description = "The join sound (assets/joined.wav) plays only in daemon mode, only while no terminal is attached, and only for the *current* focus rather than the --focus the daemon started with. On a channel focus every arrival in that channel is announced; on a DM focus the focused person coming online is announced once however many shared channels the arrival reaches us through, and again the next time they come online after going offline. A foreground client, an attached one, an unfocused channel, anyone but the focused person, and having nothing focused at all are all silent."
+evidence = "docs/SPEC.md 'Running in background mode'; src/client/daemon.rs DaemonPlan::should_play_joined_chime; src/client/tui/ui.rs UiState::current_focus, CurrentFocus; src/client/session.rs on_daemon_peer_appeared, SessionState::viewer_attached/announced_online; scenarios features/daemon/the_join_sound.feature"
+
+[[user_story.acceptance_criteria]]
+id = "AC-205"
+description = "When a --otp daemon proposes an OTP session to the peer it is focused on and that session does not start - they decline, this side cannot store its half of the pad, or the proposal is refused before it is even sent (no otp binary, either side not pq_hybrid, an unreadable identity) - it plays the alert sound and raises a notification, since the shortcut is now ready to send voice that is not pad-protected. A session that starts is silent, a session somebody typed /otp for themselves is never announced, and the outcome is reported once rather than once per message mentioning it."
+evidence = "docs/SPEC.md 'Running in background mode'; src/client/session.rs daemon_otp_outcome, SessionState::daemon_awaiting_otp, handle_ui_action's RequestOtpSession arm; src/client/otp.rs on_key_setup_ack; scenarios features/daemon/the_otp_alert.feature"
+
+[[user_story.technical_behavior]]
+id = "TB-215"
+description = "A detached surface draws nothing at all rather than rendering to a sink - the state a daemon spends nearly all its life in has to be free, not merely quiet. An attached one emits exactly one message per frame (not one per internal write), and a frame written after its viewer has gone is dropped rather than raised as an error, so a viewer vanishing mid-frame cannot fail the session."
+evidence = "src/client/tui/surface.rs Surface::draw, AttachWriter::flush, Surface::detach; tests a_detached_surface_draws_nothing_at_all, an_attached_surface_emits_one_message_per_frame, detaching_closes_the_frame_channel_and_stops_drawing, a_frame_written_after_the_viewer_is_gone_is_dropped_not_an_error, detaching_a_surface_that_was_never_attached_is_a_no_op"
+
+[[user_story.technical_behavior]]
+id = "TB-216"
+description = "The attach backend answers from what its viewer reported the three questions CrosstermBackend answers by querying its own stdout - which in a daemon is /dev/null: terminal size, window size, and cursor position (whose real implementation would block reading a Device Status Report reply from a stdin nobody is writing to). A zero dimension reported mid-resize is clamped to 1 rather than trusted."
+evidence = "src/client/tui/surface.rs AttachBackend::size/window_size/get_cursor_position, TerminalSize::new, Surface::resize; tests the_attach_backend_reports_the_size_its_viewer_declared, the_attach_backend_tracks_the_cursor_instead_of_asking_for_it, a_zero_dimension_is_clamped_rather_than_trusted, resizing_an_attached_surface_redraws_at_the_new_size, resizing_a_detached_surface_is_a_no_op"

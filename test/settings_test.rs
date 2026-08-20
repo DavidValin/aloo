@@ -175,3 +175,163 @@ fn an_empty_shortcut_value_is_ignored_in_favor_of_the_default() {
 
     std::fs::remove_file(&path).ok();
 }
+
+// ---------------------------------------------------------------------
+// muted_voice (`/mute-voice`, docs/SPEC.md Functionality #15)
+// ---------------------------------------------------------------------
+
+/// @requirement TB-213
+#[test]
+fn muted_voice_round_trips_as_one_line_per_nickname() {
+    let path = temp_settings_path();
+    let mut settings = Settings::default();
+    settings.muted_voice.insert("alice".to_string());
+    settings.muted_voice.insert("bob".to_string());
+    settings.save(&path).unwrap();
+
+    let raw = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        raw.contains("muted_voice=alice\n") && raw.contains("muted_voice=bob\n"),
+        "each nickname gets its own line, never one joined value: {raw}"
+    );
+
+    let reloaded = Settings::load_or_create(&path).unwrap();
+    assert_eq!(reloaded.muted_voice, settings.muted_voice);
+
+    std::fs::remove_file(&path).ok();
+}
+
+/// A nickname rejects only whitespace, so a comma is legal inside one -
+/// which is exactly why this is not a comma-separated value.
+/// @requirement TB-213
+#[test]
+fn a_nickname_containing_a_comma_survives_a_round_trip() {
+    let path = temp_settings_path();
+    let mut settings = Settings::default();
+    settings.muted_voice.insert("a,b".to_string());
+    settings.save(&path).unwrap();
+
+    let reloaded = Settings::load_or_create(&path).unwrap();
+    assert!(
+        reloaded.muted_voice.contains("a,b"),
+        "a comma inside a nickname must not split it: {:?}",
+        reloaded.muted_voice
+    );
+    assert_eq!(reloaded.muted_voice.len(), 1);
+
+    std::fs::remove_file(&path).ok();
+}
+
+/// @requirement TB-213
+#[test]
+fn muted_voice_entries_are_written_in_sorted_order() {
+    let path = temp_settings_path();
+    let mut settings = Settings::default();
+    for name in ["zoe", "alice", "bob"] {
+        settings.muted_voice.insert(name.to_string());
+    }
+    settings.save(&path).unwrap();
+
+    let raw = std::fs::read_to_string(&path).unwrap();
+    let lines: Vec<&str> = raw
+        .lines()
+        .filter(|l| l.starts_with("muted_voice="))
+        .collect();
+    assert_eq!(
+        lines,
+        vec!["muted_voice=alice", "muted_voice=bob", "muted_voice=zoe"],
+        "a stable order is what keeps the file from churning between saves"
+    );
+
+    std::fs::remove_file(&path).ok();
+}
+
+/// @requirement TB-213
+#[test]
+fn an_empty_or_unstorable_muted_voice_line_is_skipped() {
+    let path = temp_settings_path();
+    std::fs::write(&path, "muted_voice=\nmuted_voice=alice\n").unwrap();
+
+    let settings = Settings::load_or_create(&path).unwrap();
+    assert_eq!(settings.muted_voice.len(), 1);
+    assert!(settings.muted_voice.contains("alice"));
+
+    std::fs::remove_file(&path).ok();
+}
+
+/// The whole reason `update_muted_voice` exists: `~/.aloo/settings` is now
+/// written *during* a session, so a mute must never carry this process's
+/// stale view of every other key back to disk.
+/// @requirement TB-214
+#[test]
+fn update_muted_voice_preserves_keys_written_by_another_process() {
+    let path = temp_settings_path();
+
+    // This process's view of the file, loaded early.
+    let mut mine = Settings::default();
+    mine.server_port = 7878;
+    mine.save(&path).unwrap();
+
+    // Another process (an `aloo --server` start) rewrites it meanwhile.
+    let mut theirs = Settings::load_or_create(&path).unwrap();
+    theirs.server_port = 9999;
+    theirs.server_auth = ServerAuth::Password("hunter2".to_string());
+    theirs.save(&path).unwrap();
+
+    // Our mute must not revert any of that.
+    Settings::update_muted_voice(&path, |set| {
+        set.insert("alice".to_string());
+    })
+    .unwrap();
+
+    let after = Settings::load_or_create(&path).unwrap();
+    assert_eq!(
+        after.server_port, 9999,
+        "a mute must not roll back another writer's port"
+    );
+    assert_eq!(after.server_auth, ServerAuth::Password("hunter2".to_string()));
+    assert!(after.muted_voice.contains("alice"));
+
+    std::fs::remove_file(&path).ok();
+}
+
+/// @requirement TB-214
+#[test]
+fn update_muted_voice_creates_the_file_when_missing() {
+    let path = temp_settings_path();
+    assert!(!path.exists());
+
+    let stored = Settings::update_muted_voice(&path, |set| {
+        set.insert("alice".to_string());
+    })
+    .expect("a first mute on a fresh machine must work, not error");
+
+    assert!(stored.contains("alice"));
+    assert!(
+        Settings::load_or_create(&path).unwrap().muted_voice.contains("alice"),
+        "the returned set must be what actually landed on disk"
+    );
+
+    std::fs::remove_file(&path).ok();
+}
+
+/// @requirement TB-214
+#[test]
+fn update_muted_voice_removes_an_entry_too() {
+    let path = temp_settings_path();
+    Settings::update_muted_voice(&path, |set| {
+        set.insert("alice".to_string());
+        set.insert("bob".to_string());
+    })
+    .unwrap();
+
+    let stored = Settings::update_muted_voice(&path, |set| {
+        set.remove("alice");
+    })
+    .unwrap();
+
+    assert!(!stored.contains("alice"));
+    assert!(stored.contains("bob"));
+
+    std::fs::remove_file(&path).ok();
+}

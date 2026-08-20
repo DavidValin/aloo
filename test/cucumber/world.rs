@@ -253,6 +253,44 @@ pub struct AlooWorld {
     /// side derives from its own pin, and the next sequence it expects.
     pub otp_mail_expected_contact: Option<String>,
     pub otp_mail_next_expected: u64,
+    // -- background mode (US-038) --------------------------------------
+    /// Flags a scenario is building up before resolving them.
+    pub daemon_flags: Option<aloo::client::daemon::DaemonFlags>,
+    /// The settings file those flags are resolved against.
+    pub daemon_settings: Option<aloo::settings::Settings>,
+    /// What `DaemonConfig::resolve` made of the two, or why it refused.
+    pub daemon_config: Option<aloo::client::daemon::DaemonConfig>,
+    pub daemon_error: Option<String>,
+    /// The plan a running daemon is following.
+    pub daemon_plan: Option<aloo::client::daemon::DaemonPlan>,
+    /// Whether an OTP session is already live with the focused peer -
+    /// what decides between inviting and continuing.
+    pub daemon_otp_active: bool,
+    /// Whether the connect cache a scenario set up is still in play.
+    pub connect_cache: Option<aloo::client::connect::ConnectCache>,
+    /// What the peer-appeared decision came to, for the `Then` steps.
+    pub daemon_place_focus: bool,
+    pub daemon_invite_otp: bool,
+    /// A live attach socket, and the session-input end of the daemon
+    /// serving it, for the scenarios that drive a real attachment.
+    pub daemon_socket: Option<std::path::PathBuf>,
+    pub daemon_client: Option<tokio::net::UnixStream>,
+    pub daemon_input_rx:
+        Option<tokio::sync::mpsc::UnboundedReceiver<aloo::client::session::SessionInput>>,
+    pub daemon_read_buf: Vec<u8>,
+    pub daemon_status: Option<String>,
+    /// The situation a join-sound scenario is describing, and what came
+    /// of it.
+    pub chime_daemon_mode: bool,
+    pub chime_viewer_attached: bool,
+    pub chime_focus: Option<aloo::client::tui::ui::CurrentFocus>,
+    pub chime_announced: std::collections::HashSet<UserId>,
+    pub chime_played: bool,
+    pub chime_count: usize,
+    /// Whether the daemon is waiting on an OTP session it proposed, and
+    /// whether its failure was announced.
+    pub otp_awaited: bool,
+    pub otp_alarm: bool,
 }
 
 impl std::fmt::Debug for AlooWorld {

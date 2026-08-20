@@ -1226,7 +1226,20 @@ fn render_sidebar(frame: &mut Frame, area: Rect, state: &UiState) {
                 Some(_) => format!("{UNREAD_ENVELOPE} "),
                 None => String::new(),
             };
-            let label = format!("{envelope}{}", m.key_mode.format_with_name(&m.name));
+            // A muted voice (`/mute-voice`, docs/SPEC.md Functionality
+            // #16) is otherwise completely invisible: their messages still
+            // arrive and still log, they just never play. Without a marker
+            // here, a channel that has gone quiet is indistinguishable
+            // from one where nobody is talking.
+            let muted = if state.is_voice_muted(m.id) {
+                "\u{1F507} "
+            } else {
+                ""
+            };
+            let label = format!(
+                "{muted}{envelope}{}",
+                m.key_mode.format_with_name(&m.name)
+            );
             // A Pending/Rejected identity (docs/PROTOCOL.md §12) takes
             // priority over everything below - it's the most urgent,
             // actionable state (open the review popup via Enter), whether

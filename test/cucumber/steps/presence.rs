@@ -256,9 +256,9 @@ async fn help_content(w: &mut AlooWorld) {
             "expected {what}: {rows:?}"
         );
     }
-    // Past the first screenful now that the two selectors and the log's
-    // scroll keys have their own lines above them - reached the same way
-    // the sections below are.
+    // Past the first screenful now that the two selectors, the log's
+    // scroll keys and `/mute-voice` all have their own lines above them -
+    // reached the same way the sections below are.
     let rows = scroll_help_until(w, "Space");
     assert!(
         rows.iter().any(|r| r.contains("Space")),

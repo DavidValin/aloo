@@ -257,6 +257,58 @@ pub fn bell_chime_samples() -> Vec<i16> {
         .clone()
 }
 
+/// Bundled the same way as the other two chimes - a plain WAV, no
+/// MP3-decoding crate needed.
+const JOINED_CHIME_WAV: &[u8] = include_bytes!("../../assets/joined.wav");
+
+static JOINED_CHIME_SAMPLES: OnceLock<Vec<i16>> = OnceLock::new();
+
+/// Mono PCM16 samples for the sound a daemon plays when someone it is
+/// focused on appears (`docs/SPEC.md` "Running in background mode") - the audible half of
+/// "your contact is here", the other half being the desktop notification
+/// (`client::global_notification`). Only ever played in daemon mode: a
+/// foreground client shows the join in its own log, where a sound would be
+/// noise. Empty if the bundled asset is ever missing/malformed, same
+/// fallback as the other two.
+pub fn joined_chime_samples() -> Vec<i16> {
+    JOINED_CHIME_SAMPLES
+        .get_or_init(|| decode_wav_to_mono(JOINED_CHIME_WAV).unwrap_or_default())
+        .clone()
+}
+
+/// Plays `samples` and waits for them to finish, on a mixer of its own.
+///
+/// The chime helpers in `voice_stream` all push into the session's
+/// long-lived mixer, which is exactly what a startup failure does not
+/// have: it happens before there is a session, and the process is about to
+/// exit. Without waiting, the exit would cut the sound off before it was
+/// audible - which for the "your daemon did not start" tone would defeat
+/// its whole purpose.
+///
+/// Capped at `MAX_STANDALONE_PLAYBACK` so a broken audio device can never
+/// turn a failed start into a process that hangs instead of exiting.
+pub fn play_samples_blocking(samples: Vec<i16>) {
+    if samples.is_empty() {
+        return;
+    }
+    let (finished_tx, finished_rx) = std::sync::mpsc::channel::<u64>();
+    let mixer = spawn_mixer(
+        |_| {},
+        move |id| {
+            let _ = finished_tx.send(id);
+        },
+    );
+    let id = 1;
+    let _ = mixer.send(MixerCmd::Push { id, samples });
+    let _ = mixer.send(MixerCmd::Finish { id });
+    let _ = finished_rx.recv_timeout(MAX_STANDALONE_PLAYBACK);
+}
+
+/// How long `play_samples_blocking` waits for a sound to finish before
+/// giving up. Long enough for any bundled asset (the longest,
+/// `joined.wav`, is under ten seconds) plus room for a slow device open.
+pub const MAX_STANDALONE_PLAYBACK: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// Decodes a canonical PCM WAV file's audio into mono samples at
 /// `SAMPLE_RATE_HZ`. Walks chunks generically rather than assuming fixed
 /// offsets, so extra metadata chunks before `data` (e.g. ffmpeg's

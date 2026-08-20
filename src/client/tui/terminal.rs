@@ -39,11 +39,34 @@ pub fn setup() -> Result<(Terminal<CrosstermBackend<Stdout>>, bool), BoxError> {
     Ok((Terminal::new(backend)?, keyboard_release_reporting))
 }
 
+/// `setup`, wrapped as the `Surface` the rest of the client now takes
+/// (`crate::client::tui::surface`). The ordinary, terminal-attached start
+/// of the app - a daemon builds `Surface::Detached` instead and never
+/// touches the real terminal at all.
+pub fn setup_surface() -> Result<(super::surface::Surface, bool), BoxError> {
+    let (terminal, keyboard_release_reporting) = setup()?;
+    Ok((
+        super::surface::Surface::Local(terminal),
+        keyboard_release_reporting,
+    ))
+}
+
 pub fn restore(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<(), BoxError> {
     let _ = crossterm::execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
     crossterm::execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     disable_raw_mode()?;
     terminal.show_cursor()?;
+    Ok(())
+}
+
+/// Undoes `setup_surface`. Only a `Local` surface has a real terminal to
+/// give back - a `Detached`/`Attached` daemon never took one, and the
+/// terminal an attached *viewer* is using belongs to that other process,
+/// which restores its own on the way out.
+pub fn restore_surface(surface: &mut super::surface::Surface) -> Result<(), BoxError> {
+    if let super::surface::Surface::Local(terminal) = surface {
+        restore(terminal)?;
+    }
     Ok(())
 }
 
@@ -68,4 +91,25 @@ pub fn spawn_input_thread() -> tokio::sync::mpsc::UnboundedReceiver<Event> {
         }
     });
     input_rx
+}
+
+/// `spawn_input_thread`, wrapped as the `SessionInput` stream
+/// `session::run_connected_session` now consumes - the terminal-attached
+/// half of that enum. A daemon builds the same channel from its IPC
+/// listener instead, and never reads this process's stdin at all.
+pub fn spawn_session_input()
+-> tokio::sync::mpsc::UnboundedReceiver<crate::client::session::SessionInput> {
+    let mut events = spawn_input_thread();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(event) = events.recv().await {
+            if tx
+                .send(crate::client::session::SessionInput::Key(event))
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    rx
 }

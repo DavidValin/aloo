@@ -1346,6 +1346,13 @@ pub(crate) async fn on_key_setup_ack(
                     .to_string(),
                 false,
             );
+            crate::client::session::daemon_otp_outcome(
+                ui_state,
+                session,
+                from,
+                false,
+                "This side could not store its half of the pad.",
+            );
             return;
         }
         session.otp_store.clear_pending_setup(&ack.contact_name);
@@ -1360,6 +1367,7 @@ pub(crate) async fn on_key_setup_ack(
             format!("OTP session started at {}", format_now()),
             true,
         );
+        crate::client::session::daemon_otp_outcome(ui_state, session, from, true, "");
     } else if ack.reason.as_deref() == Some(NO_MATCHING_KEY_REASON) {
         let _ = otp_cli::remove_contact(&session.otp_cli_cfg, &ack.contact_name).await;
         discard_pending_setup(&session.otp_cli_cfg, &ack.contact_name);
@@ -1401,6 +1409,13 @@ pub(crate) async fn on_key_setup_ack(
             &sender.name,
             format!("OTP session cancelled{reason}"),
             false,
+        );
+        crate::client::session::daemon_otp_outcome(
+            ui_state,
+            session,
+            from,
+            false,
+            "They declined the session.",
         );
     }
 }

@@ -4,11 +4,8 @@
 
 use std::fs;
 use std::io;
-use std::io::Stdout;
 use std::path::{Path, PathBuf};
 
-use ratatui::Terminal;
-use ratatui::backend::CrosstermBackend;
 use tokio::net::TcpStream;
 
 use crate::BoxError;
@@ -88,7 +85,7 @@ impl std::fmt::Display for NicknameTakenError {
 impl std::error::Error for NicknameTakenError {}
 
 pub async fn run_client_inner(
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    surface: &mut crate::client::tui::surface::Surface,
     port: u16,
     keyboard_release_reporting: bool,
     hotkey_rx: Option<tokio::sync::mpsc::UnboundedReceiver<crate::client::global_ptt::GlobalPttEvent>>,
@@ -101,7 +98,7 @@ pub async fn run_client_inner(
     prefill_connect_defaults(&mut popup, &cache, &crate::platform::aloo_dir());
 
     loop {
-        let Some(request) = ui_connect_popup::run(terminal, &mut popup)? else {
+        let Some(request) = ui_connect_popup::run(surface, &mut popup)? else {
             return Ok(()); // user cancelled
         };
 
@@ -129,8 +126,13 @@ pub async fn run_client_inner(
         match connect_and_handshake(&request).await {
             Ok((rd, wr, you, identity, key_mode, server_addr)) => {
                 let id_store = load_id_store(&request.id_store_path);
+                // The stdin reader is started only now, once the popup is
+                // done with the terminal - the popup drives its own
+                // blocking `event::read()`, and two readers on one tty
+                // would race for every keystroke.
+                let input_rx = crate::client::tui::terminal::spawn_session_input();
                 return session::run_connected_session(
-                    terminal,
+                    surface,
                     rd,
                     wr,
                     request.nickname,
@@ -141,6 +143,11 @@ pub async fn run_client_inner(
                     id_store,
                     hotkey_rx,
                     server_addr,
+                    input_rx,
+                    // A foreground client has no plan: it opens the
+                    // popup, joins the-hall, and goes where the user
+                    // takes it.
+                    None,
                 )
                 .await;
             }
@@ -164,7 +171,7 @@ pub async fn run_client_inner(
 /// this session runs under. A taken nickname comes back as
 /// `NicknameTakenError` so the caller can retry instead of treating it as
 /// fatal.
-async fn connect_and_handshake(
+pub(crate) async fn connect_and_handshake(
     request: &ConnectRequest,
 ) -> Result<
     (

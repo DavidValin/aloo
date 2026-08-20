@@ -610,6 +610,20 @@ pub(crate) fn play_bell_chime(session: &mut SessionState) {
     let _ = session.mixer_tx.send(voice::MixerCmd::Finish { id });
 }
 
+/// Plays the daemon's "someone you are focused on is here" sound, same
+/// `Push`/`Finish` pattern as the other two chimes (`docs/SPEC.md`
+/// "Daemon mode"). Only ever called with a daemon plan in effect.
+pub(crate) fn play_joined_chime(session: &mut SessionState) {
+    let samples = voice::joined_chime_samples();
+    if samples.is_empty() {
+        return;
+    }
+    let id = session.next_mixer_id;
+    session.next_mixer_id += 1;
+    let _ = session.mixer_tx.send(voice::MixerCmd::Push { id, samples });
+    let _ = session.mixer_tx.send(voice::MixerCmd::Finish { id });
+}
+
 /// Resolves one recipient's outgoing key material for a point-to-point
 /// stream - shared by `channel`/`direct_message`'s `handle_send_file`.
 /// A resolution failure is just `None` and the caller silently excludes

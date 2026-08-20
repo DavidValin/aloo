@@ -1,10 +1,13 @@
 pub mod channel;
 pub mod connect;
+pub mod daemon;
+pub mod daemon_ipc;
 pub mod device_id;
 pub mod direct_message;
 pub mod envelope;
 pub mod file_browser;
 pub mod file_transfer;
+pub mod global_notification;
 pub mod global_ptt;
 pub mod idstore;
 pub mod keymode_policy;

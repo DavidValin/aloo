@@ -8,13 +8,10 @@
 //! terminal.
 
 use std::io;
-use std::io::Stdout;
 use std::path::PathBuf;
 
 use crossterm::event::{Event, KeyCode, KeyEventKind};
 use ratatui::Frame;
-use ratatui::Terminal;
-use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -516,11 +513,11 @@ fn place_text_cursor(frame: &mut Frame, inner: Rect, offset: u16, value: &str) {
 /// dispatch to `ConnectPopupState::handle_key`, repeat - until the user
 /// either submits a complete `ConnectRequest` or cancels.
 pub fn run(
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    surface: &mut super::surface::Surface,
     popup: &mut ConnectPopupState,
 ) -> Result<Option<ConnectRequest>, crate::BoxError> {
     loop {
-        terminal.draw(|f| render(f, popup))?;
+        surface.draw(|f| render(f, popup))?;
         let Event::Key(key) = crossterm::event::read()? else {
             continue;
         };

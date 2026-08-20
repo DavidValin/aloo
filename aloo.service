@@ -1,0 +1,51 @@
+# aloo in the background, started at login.
+#
+# A **user** service, not a system one: a system unit has no $HOME, no
+# display and no audio, so it could not do the global push-to-talk
+# shortcut, the sounds, or the desktop notifications - which is most of
+# the point of running aloo this way.
+#
+#   install:  cp aloo.service ~/.config/systemd/user/
+#             systemctl --user daemon-reload
+#             systemctl --user enable --now aloo
+#   watch:    systemctl --user status aloo
+#             journalctl --user -u aloo -f
+#
+# This unit deliberately carries no configuration of its own. Set the
+# daemon up once by hand with the flags you want -
+#
+#   aloo --daemon --host=chat.example.com --channels=team,ops --focus=alice
+#
+# - and it writes that back to ~/.aloo/settings, so the bare `aloo --daemon`
+# below reproduces it on every boot. Keeping the host, channels, focus and
+# credentials in one place means they cannot drift apart, and it keeps a
+# server password out of a file that is easy to share by accident.
+#
+# On X11 the shortcut needs DISPLAY and XAUTHORITY in the user manager's
+# environment. Most desktop sessions do this already; if yours does not:
+#
+#   systemctl --user import-environment DISPLAY XAUTHORITY
+#
+# Under Wayland the daemon connects, focuses and can be attached to
+# normally, but the global shortcut cannot fire - no application-level
+# workaround exists. It says so at startup rather than failing silently.
+#
+# See docs/SPEC.md, "Running in background mode".
+
+[Unit]
+Description=aloo daemon
+Documentation=https://github.com/DavidValin/aloo
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+# --foreground because systemd supervises the process itself: without it
+# the daemon would re-launch detached and exit, and systemd would see the
+# start as having failed.
+Type=simple
+ExecStart=%h/.local/bin/aloo --daemon --foreground
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

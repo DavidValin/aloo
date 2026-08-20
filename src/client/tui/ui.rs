@@ -148,6 +148,12 @@ const HELP_BODY: &[&str] = &[
     "  Esc        stop a replay while it is playing",
     "  Capped at 4 minutes - recording stops itself on reaching it, and a",
     "  received stream longer than that is never accepted past 4 minutes.",
+    "  /mute-voice <nickname>    stop their voice messages playing themselves",
+    "             on arrival - they still arrive and still show in the log,",
+    "             so Enter replays them; muted users are marked \u{1F507} in the",
+    "             sidebar. Kept in ~/.aloo/settings. Never affects a call.",
+    "  /unmute-voice <nickname>  undo it; either, with no nickname, lists",
+    "             who is currently muted.",
     "",
     "File transfer",
     "  /file      type this and press Enter to browse for a file to send",
@@ -982,6 +988,33 @@ pub enum UiAction {
         peer: UserId,
         muted: bool,
     },
+    /// `/mute-voice <nickname>` / `/unmute-voice <nickname>`: stop (or
+    /// resume) that nickname's voice messages playing themselves on
+    /// arrival (docs/SPEC.md Functionality #15).
+    ///
+    /// An action rather than a change `UiState` applies itself, because it
+    /// has to reach `~/.aloo/settings` - and every other persisted
+    /// mutation in this app is likewise carried out session-side
+    /// (`id_store`, `otp_store`), leaving `UiState` free of file I/O so
+    /// tests can construct one without a filesystem. The session writes
+    /// through and hands the stored set back via `set_muted_voice`, so
+    /// what is in memory is always what is on disk.
+    ///
+    /// Deliberately carries a nickname, not a `UserId`: muting someone who
+    /// is offline (or has never connected) is meaningful and expected.
+    SetVoiceMuted {
+        nickname: String,
+        muted: bool,
+    },
+    /// `/daemon`: stop drawing and hand this session back to the
+    /// background, leaving every connection, link and key exactly as they
+    /// are (docs/SPEC.md "Running in background mode").
+    ///
+    /// Answered by `session::run_connected_session`'s own input arm rather
+    /// than by `handle_ui_action`: it acts on the `Surface`, which that
+    /// loop owns and the action handler - which is about network sends -
+    /// has no business holding.
+    Detach,
 }
 
 /// Which trigger started the current recording - `handle_key`'s Space
@@ -997,6 +1030,20 @@ pub enum UiAction {
 pub(crate) enum RecordSource {
     Space,
     Global,
+}
+
+/// Where a session is pointed right now (`UiState::current_focus`) - the
+/// live answer, as opposed to the `--focus` a daemon was started with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CurrentFocus {
+    /// A channel tab is selected and joined.
+    Channel(String),
+    /// A private room is open, which takes precedence over any tab
+    /// behind it - the same order `current_voice_target` resolves in.
+    Dm(UserId),
+    /// Nothing addressable: no tabs, or the selected one is still
+    /// waiting on its `Joined` confirmation.
+    Nowhere,
 }
 
 pub struct UiState {
@@ -1307,6 +1354,26 @@ pub struct UiState {
     /// indicator. Defaults to `Unknown` (rendered `-`) until the first
     /// message of the session is observed.
     pub conn_quality: crate::client::netstats::ConnQuality,
+    /// Nicknames whose incoming voice messages must not autoplay
+    /// (`/mute-voice`, docs/SPEC.md Functionality #15), mirroring
+    /// `settings::Settings::muted_voice` - loaded from `~/.aloo/settings`
+    /// at session start and written straight back through
+    /// `Settings::update_muted_voice` on every change.
+    ///
+    /// Lives here, beside `identity_reviews`, because this is the other
+    /// half of the same question `is_trust_gated` answers: whether audio
+    /// from a given peer is allowed to reach the mixer. Keyed by nickname
+    /// rather than `UserId` - see that field's own doc for why.
+    pub muted_voice: std::collections::BTreeSet<String>,
+    /// Whether this session is running inside a daemon (`aloo --daemon`),
+    /// which is what makes `/daemon` meaningful: only a session that has
+    /// somewhere to go back *to* can be sent to the background.
+    ///
+    /// A foreground session cannot background itself - doing so would mean
+    /// re-parenting a live process along with its open TCP control
+    /// connection and UDP peer links - so there `/daemon` explains itself
+    /// rather than half-working.
+    pub daemon_mode: bool,
 }
 
 impl UiState {
@@ -1314,6 +1381,8 @@ impl UiState {
         Self {
             own_id: None,
             own_name,
+            muted_voice: std::collections::BTreeSet::new(),
+            daemon_mode: false,
             channels: Vec::new(),
             selected_channel: 0,
             selector_focus: SelectorFocus::Channels,
@@ -1491,6 +1560,57 @@ impl UiState {
     /// §12). Absence (`None`/normal peer) is the common case.
     pub fn is_trust_gated(&self, peer: UserId) -> bool {
         self.identity_reviews.contains_key(&peer)
+    }
+
+    /// Where the session is pointed *right now* - the open private room if
+    /// there is one, otherwise the selected channel tab.
+    ///
+    /// Deliberately the live answer rather than whatever `--focus` asked
+    /// for at startup (`daemon::DaemonFocus`). The two agree until someone
+    /// attaches and moves, and after that this one is the truth: it is
+    /// what `current_voice_target` addresses, so it is also what the
+    /// daemon's join sound has to follow, or the sound would be announcing
+    /// arrivals somewhere the next held shortcut is not going to reach.
+    pub fn current_focus(&self) -> CurrentFocus {
+        if let Some(peer) = self.active_private_room {
+            return CurrentFocus::Dm(peer);
+        }
+        match self.channels.get(self.selected_channel) {
+            Some(channel) if channel.joined => CurrentFocus::Channel(channel.name.clone()),
+            // Not joined yet, or no tabs at all: there is nowhere a held
+            // shortcut would go, so there is nothing to announce either.
+            _ => CurrentFocus::Nowhere,
+        }
+    }
+
+    /// Whether `peer`'s voice messages are muted (`/mute-voice`,
+    /// docs/SPEC.md Functionality #15) - resolved through their *current*
+    /// nickname, since that is what the user muted and what persists.
+    /// A peer we hold no `UserInfo` for is never muted: there is no name
+    /// to have matched.
+    ///
+    /// Paired with `is_trust_gated` at every incoming-audio decision:
+    /// either being true means the stream is still decrypted and still
+    /// logged, but never reaches the mixer.
+    pub fn is_voice_muted(&self, peer: UserId) -> bool {
+        self.known_users
+            .get(&peer)
+            .is_some_and(|u| self.muted_voice.contains(&u.name))
+    }
+
+    /// Whether audio arriving from `peer` right now must be kept off the
+    /// mixer - the single predicate both reasons funnel through, so a
+    /// caller can never remember one and forget the other. Snapshotted
+    /// once per stream at `*Start` (docs/PROTOCOL.md §11.2), exactly as
+    /// the trust gate alone used to be.
+    pub fn suppress_playback_from(&self, peer: UserId) -> bool {
+        self.is_trust_gated(peer) || self.is_voice_muted(peer)
+    }
+
+    /// Replaces the muted-voice set - used once at session start to seed
+    /// it from `~/.aloo/settings`.
+    pub fn set_muted_voice(&mut self, muted: std::collections::BTreeSet<String>) {
+        self.muted_voice = muted;
     }
 
     /// Buffers a message/stream-placeholder from a trust-gated `from`
@@ -3299,6 +3419,17 @@ impl UiState {
             self.call_confirm_focus = CallConfirmChoice::Confirm;
             return None;
         }
+        if self.input.trim() == "/daemon" {
+            self.input.clear();
+            if !self.daemon_mode {
+                self.push_status_notice(
+                    "not running as a daemon - start one with: aloo --daemon".to_string(),
+                    false,
+                );
+                return None;
+            }
+            return Some(UiAction::Detach);
+        }
         if self.input.trim() == "/endcall" {
             if self.call.is_none() {
                 self.push_status_notice("not on a call".to_string(), false);
@@ -3307,6 +3438,14 @@ impl UiState {
             }
             self.input.clear();
             return Some(UiAction::EndCall);
+        }
+        // The first commands in this app that take an argument - every
+        // other one above matches on whole-string equality, and `/leave`
+        // makes a point of taking none. Both must be handled before the
+        // unknown-command catch-all below, or they'd be swallowed as
+        // typos of a real command.
+        if let Some(action) = self.try_voice_mute_command() {
+            return action;
         }
         // Anything else starting with `/` is an attempted command, not a
         // message - even one this build doesn't recognize, or a typo of a
@@ -3355,6 +3494,110 @@ impl UiState {
             self.push_outgoing_channel(&name, MessageBody::Text(text));
             Some(action)
         }
+    }
+
+    /// Handles `/mute-voice [nickname]` and `/unmute-voice [nickname]`
+    /// (docs/SPEC.md Functionality #15).
+    ///
+    /// The nested `Option` distinguishes two things `submit_input` must
+    /// tell apart: the outer one is "this input *was* one of these
+    /// commands, stop looking", the inner is the action (if any) it
+    /// produced. Without that, a recognized-but-actionless command - a
+    /// bare `/mute-voice`, which only prints the current list - would fall
+    /// through to the unknown-command notice and then to the send paths.
+    fn try_voice_mute_command(&mut self) -> Option<Option<UiAction>> {
+        // Owned up front: everything below both reads the parsed pieces
+        // and clears `self.input`, which cannot borrow from it at once.
+        let (verb, rest) = {
+            let input = self.input.trim();
+            match input.split_once(char::is_whitespace) {
+                Some((verb, rest)) => (verb.to_string(), rest.trim().to_string()),
+                None => (input.to_string(), String::new()),
+            }
+        };
+        let muted = match verb.as_str() {
+            "/mute-voice" => true,
+            "/unmute-voice" => false,
+            _ => return None,
+        };
+        let rest = rest.as_str();
+
+        // A bare command lists what is currently muted instead of erroring.
+        // Nothing else in the UI answers "who have I muted?", and an
+        // argument-less command is the natural place to ask it.
+        if rest.is_empty() {
+            let notice = if self.muted_voice.is_empty() {
+                "no voices muted".to_string()
+            } else {
+                format!(
+                    "voices muted: {} (/unmute-voice <nickname> to undo)",
+                    self.muted_voice
+                        .iter()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
+            self.input.clear();
+            self.push_status_notice(notice, true);
+            return Some(None);
+        }
+
+        // A nickname never contains whitespace, so anything past the first
+        // word is a typo rather than part of the name - refused outright
+        // instead of silently muting the first word of it.
+        if rest.split_whitespace().count() > 1 {
+            self.input.clear();
+            self.push_status_notice(
+                format!("{verb} takes one nickname, with no spaces in it"),
+                false,
+            );
+            return Some(None);
+        }
+        // Guards the flat-file store the set is written to, exactly as
+        // `IdStore::check_and_pin` guards its own.
+        if !crate::validation::is_storable(rest) {
+            self.input.clear();
+            self.push_status_notice(format!("{rest:?} is not a usable nickname"), false);
+            return Some(None);
+        }
+
+        let already = self.muted_voice.contains(rest);
+        self.input.clear();
+        if already == muted {
+            // Not an error - just say so, and produce no action, so
+            // nothing is rewritten to disk for a no-op.
+            self.push_status_notice(
+                if muted {
+                    format!("{rest} is already muted")
+                } else {
+                    format!("{rest} is not muted")
+                },
+                true,
+            );
+            return Some(None);
+        }
+
+        // Applied locally right away so the sidebar marker and any stream
+        // starting this instant see it; the session mirrors back whatever
+        // actually landed on disk (`SetVoiceMuted`'s doc).
+        if muted {
+            self.muted_voice.insert(rest.to_string());
+        } else {
+            self.muted_voice.remove(rest);
+        }
+        self.push_status_notice(
+            if muted {
+                format!("{rest}'s voice messages muted")
+            } else {
+                format!("{rest}'s voice messages unmuted")
+            },
+            true,
+        );
+        Some(Some(UiAction::SetVoiceMuted {
+            nickname: rest.to_string(),
+            muted,
+        }))
     }
 
     fn handle_sidebar_key(&mut self, code: KeyCode) -> Option<UiAction> {

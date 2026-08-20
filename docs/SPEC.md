@@ -17,6 +17,7 @@ server and the client compile against (the wire protocol, crypto,
 validation rules, settings).
 
 ```
+aloo.service            <-- systemd **user** unit for background mode, installed to ~/.config/systemd/user/
 src/
 src/lib.rs              <-- library root: the module list `main.rs` and the tests build against
 src/main.rs             <-- CLI entry point: arg parsing, client/server mode dispatch
@@ -51,10 +52,14 @@ src/client/otp_store.rs     <-- per-contact OTP ack-gate/sequence state on disk
 src/client/otp_mail.rs        <-- OTP mail orchestration: recipient checks, send/retry, deliver/read/delete (docs/PROTOCOL.md section 17), Functionality #13
 src/client/otp_mail_store.rs   <-- OTP mail state on disk: sent references + received (ciphertext, pad) blob pairs, Functionality #13
 src/client/global_ptt.rs       <-- OS-level global push-to-talk hotkey
+src/client/global_notification.rs <-- desktop notifications for background mode (one API, three OS backends)
+src/client/daemon.rs            <-- background mode: config resolution, backgrounding, single instance, the join/focus plan, serving attached terminals
+src/client/daemon_ipc.rs         <-- the local socket an attaching terminal speaks over: wire types and framing
 src/client/sysstats.rs          <-- CPU usage sampling for the header's CPU:<pct>% indicator
 src/client/netstats.rs           <-- connection-speed statistic for the header's Conn:<quality> indicator
 src/client/tui/mod.rs            <-- the `tui` module list (no logic of its own)
 src/client/tui/terminal.rs        <-- terminal I/O: raw mode + alternate screen setup/restore, blocking input-reader thread
+src/client/tui/surface.rs          <-- where a frame is drawn: a real terminal, nothing at all (detached), or an attached terminal over a socket
 src/client/tui/ui_connect_popup.rs  <-- the connect popup
 src/client/tui/ui.rs           <-- the UI once the user is connected: shared state, key handling, log/input rendering
 src/client/tui/channel.rs       <-- channel state, the top row (both selectors) and its rendering (adds `impl UiState` on top of `ui.rs`)
@@ -277,6 +282,453 @@ When a channel is joined, the join is broadcast to all users already in the chan
     - **The other side is always told, however long that takes.** If they're offline, or the notice's delivery is never confirmed, aloo keeps retrying it every time a direct link to them next becomes reachable - a reconnect, a link flap, this app's own restart - until a genuine acknowledgement arrives. The receiving side never gets a vote: there's nothing to accept or reject, only to converge to, and it too tears its own copy of the pad down the moment the notice lands.
     - **Neither side disconnecting ends a session by itself.** A peer going offline and coming back - even under a fresh identity handle internally - leaves an active session exactly as active as it was; only `/endotp`, run by one of the two participants, ever ends it.
     - **The DM itself is unaffected, only reachable a different way.** While a session is active, every DM with that person rides it - there's no way to send one a plain, non-pad-wrapped message in the meantime (§16.2). Ending a session never closes the private room or stops you talking to that person, though: it only turns off the extra pad layer (and the 🛡️ shield marking it), and the conversation goes right back to a plain send from that point on, same as before `/otp` was ever run.
+16. **Mute one person's voice messages with `/mute-voice <nickname>`.** A voice message plays itself the moment it arrives (Functionality #4) — which is the point of a walkie-talkie, and occasionally the problem with one. Muting turns that off for one person, without turning off anything else.
+    - **`/mute-voice <nickname>`** stops that nickname's incoming voice messages from playing on arrival; **`/unmute-voice <nickname>`** resumes them. Both confirm with a status notice. Either command **with no nickname** lists who is currently muted instead of erroring — nothing else in the UI answers that question. These are the only two commands that take an argument; a second word is refused rather than guessed at, since a nickname never contains whitespace.
+    - **A muted message is not a blocked one.** It still arrives, still decrypts, and still appears in the log as a replayable entry — only live playback is suppressed, so `Enter` on it plays it whenever you choose. This is the same mechanism a not-yet-trusted sender's audio already goes through (Functionality #8): decrypted and accumulated, never sent to the mixer. The end-of-message chime is suppressed along with it, since it would otherwise announce audio that never played.
+    - **Muted users are marked `🔇` in the sidebar**, so a channel that has gone quiet because someone is muted is distinguishable from one where nobody is talking.
+    - **Muting is by nickname, not by connection.** Someone can be muted while offline, or before they have ever connected, and the mute applies the moment they appear. It persists in `~/.aloo/settings` as one `muted_voice=<nickname>` line per entry — one line each rather than one comma-separated value, because a nickname rejects only whitespace, so a comma is legal inside one. Being keyed on a name rather than a key makes this a comfort setting, not a security control: nicknames are unique only among currently-connected clients and are never reserved (which is exactly why identity pinning exists, Functionality #8), so a mute can in principle land on a different person who later takes that name.
+    - **It never affects a live voice call** (Functionality #14). Who you can hear on a call is separate state that lasts only as long as the call; `/mute-voice` is about messages that arrive on their own.
+
+## Running in background mode
+
+Run aloo connected, in the background, so the global push-to-talk shortcut
+works from wherever you already are.
+
+### What this is for
+
+aloo's walkie-talkie shortcut (`Ctrl+Alt+P` by default) only works while
+aloo is running. That is a real gap: the moment you want is usually the
+moment you are inside something else — an editor, a browser, a game — and
+"open a terminal, run aloo, wait for the connect screen, pick the right
+channel, *then* hold the key" is not a walkie-talkie. It is a chat app you
+have to visit.
+
+Background mode closes that gap. One `aloo --daemon` at login, and from
+then on:
+
+- you are connected, all day, without a terminal open anywhere;
+- you are in the channels you actually talk in — **not** `the-hall`, which
+  a normal client joins on connect and a daemon never does unless you ask;
+- one channel or one person is **focused**, so a held shortcut goes
+  straight there without a decision;
+- and when you do want to read the log or type, you run `aloo` in any
+  terminal and the session you already have appears — the same connection,
+  the same links, the same open conversations. `/daemon` hands it back.
+
+Nothing is re-connected in that hand-off, which is the point. Your direct
+peer links stay punched, your OTP sessions stay live, your identity stays
+pinned.
+
+### Starting one
+
+```sh
+aloo --daemon --host=chat.example.com --channels=team --focus=channel:team
+```
+
+That prints a pid and returns immediately:
+
+```
+aloo: daemon started (pid 20481), logging to /home/you/.aloo/daemon.log
+aloo: type 'aloo' in any terminal to attach, /daemon to hand it back
+```
+
+The daemon is now in its own session with no controlling terminal, so
+**closing the terminal you started it from does not touch it**. It
+re-launches itself detached rather than forking, which is what keeps it
+clean: by the time aloo has started, it already has audio and hotkey
+threads, and forking a threaded process gives you a child holding locks no
+thread will ever release.
+
+Its stdout and stderr go to `~/.aloo/daemon.log` — a daemon has nowhere
+else to report, and the things worth reporting (server unreachable,
+nickname taken, no keybundle) all happen before anyone could attach to
+watch.
+
+#### Foreground
+
+```sh
+aloo --daemon --foreground
+```
+
+Identical, except it does not re-launch itself and does not return. This is
+what a service manager wants, since it does its own supervising — see
+[Running it at login](#running-it-at-login).
+
+#### Checking on it, and stopping it
+
+```sh
+aloo --daemon-status      # aloo: aloo daemon running (pid 20481)
+aloo --daemon-stop        # ends the session and exits
+```
+
+Only one daemon runs at a time. A second `aloo --daemon` refuses and tells
+you the pid of the one already there. "Already there" is decided by
+actually connecting to its socket, not by a file existing — a daemon killed
+with `SIGKILL` leaves its socket file behind, and that debris is cleaned up
+rather than mistaken for a live instance.
+
+### Taking the session over, and giving it back
+
+```sh
+aloo            # a daemon is running -> attach to it
+```
+
+With a daemon running, a bare `aloo` attaches instead of opening the
+connect screen. You get the full UI — sidebar, channels, message log,
+compose bar — driving the session that was already there.
+
+To hand it back, type `/daemon` in the compose bar. The session keeps
+running; your terminal is released.
+
+`Ctrl+C` does the same thing. It is answered by the attaching program
+itself and never reaches the daemon, so **quitting your viewer can never
+kill the session behind it**. Ending the daemon is `aloo --daemon-stop`,
+deliberately a different command.
+
+One terminal at a time. A second `aloo` while someone is attached is told
+so and exits rather than fighting over the cursor.
+
+If you want a separate, independent session while a daemon is running:
+
+```sh
+aloo --no-attach
+```
+
+Be aware the server will refuse it if it is using the same nickname —
+nicknames are unique among connected clients.
+
+### Where your voice goes: `--focus`
+
+This is the setting that makes the shortcut worth having. `--focus` decides
+what a held `Ctrl+Alt+P` addresses, with no window to look at and no
+decision to make.
+
+#### A channel
+
+```sh
+aloo --daemon --channels=team --focus=channel:team
+```
+
+Hold the shortcut, talk, release — it goes to `team`. Everyone in that
+channel hears it live, as they would from any client.
+
+#### A person
+
+```sh
+aloo --daemon --channels=team --focus=alice
+```
+
+The daemon watches for `alice`. The moment she appears it opens the DM with
+her and puts the focus there, so the shortcut talks to *her*, not to the
+channel. Until she appears, there is nothing to talk to and the shortcut
+does nothing.
+
+A bare value is a nickname. `dm:alice` is the explicit spelling of the same
+thing, and `channel:alice` is how you would name a channel called `alice`.
+
+> **A DM focus needs a channel to watch from.** Presence in aloo is
+> channel-scoped: the server only tells you a person exists if you share a
+> joined channel with them, and there is no "is alice online?" query in the
+> protocol. `--focus=alice` with no `--channels` therefore has nowhere to
+> see her from, so the daemon joins `the-hall` as a discovery channel and
+> says so in its log. Naming a channel you actually share with her is
+> better in every way — it is quieter, and it is where she will be.
+
+### Channels
+
+`--channels` takes them comma separated, and a daemon joins **exactly**
+what you name — never `the-hall` unless you name it. That is the difference from a normal
+client, which joins `the-hall` on connect.
+
+```sh
+aloo --daemon --channels=team,ops --focus=channel:ops
+```
+
+With a password:
+
+```sh
+aloo --daemon --channels=ops:hunter2
+```
+
+Channels are separated by commas, and a password follows its channel after
+a **colon**. The colon is what makes this unambiguous: it is legal in
+neither a channel name nor a channel password, whereas a comma is legal in
+a password. The name/password split is on the **first** colon.
+
+One consequence worth knowing: `--channels=ops:a,b` is *not* the channel
+`ops` with the password `a,b` — the comma split runs first, so it reads as
+`ops` with password `a`, plus a channel called `b`. A password containing a
+comma can only be set in `~/.aloo/settings`, where each channel has a line
+to itself and nothing splits on commas. An empty password
+(`--channels=ops:`) means "no password", not "the empty password".
+
+A focused channel is joined automatically even if you forgot to list it:
+`--focus=channel:ops` implies `--channels=ops`.
+
+### Nicknames and identity
+
+```sh
+aloo --daemon --nick=david
+```
+
+Defaults to `$USER`. The nickname must be free — the server rejects a
+duplicate, and for a daemon that is a startup failure (see
+[When it fails](#when-it-fails-to-start)).
+
+Your identity is always `pq_hybrid`, aloo's strongest. A daemon connects
+with nobody watching, and that is the only key type needing no typed secret
+and no prompt: if the keybundle does not exist yet, it is generated on
+first connect. Point at a specific one with:
+
+```sh
+aloo --daemon --my-key=/home/you/.aloo/mykeys      # mykeys.pub + mykeys.priv
+```
+
+Otherwise it reuses whatever you last connected with (`~/.aloo/.cache`).
+
+### Servers that need a password or a key
+
+```sh
+aloo --daemon --server-pwd=SECRET                  # server started with --password
+aloo --daemon --server-key=/path/to/server_key.pub # server started with --enc rsa
+```
+
+The two are mutually exclusive. Whichever you use is remembered, so the
+next bare `aloo --daemon` reconnects the same way.
+
+### Focusing a person, with OTP
+
+```sh
+aloo --daemon --channels=team --focus=alice --otp
+```
+
+`--otp` means *have* a one-time-pad session with alice — the strongest
+thing aloo offers, layered over `pq_hybrid`. It does one of two things,
+depending on what already exists:
+
+- **No session yet** → an invitation is sent the moment she appears. She
+  gets the usual Accept/Reject popup; the session starts only if she
+  accepts, exactly as `/otp` behaves.
+- **A session already active** → nothing is sent. It is simply continued.
+
+The second case matters more than it looks. An OTP session survives both
+sides disconnecting and even restarting the app — only `/endotp` ends one
+(`docs/PROTOCOL.md` §16.6) — and aloo resumes it automatically the moment
+the peer reappears. Inviting on top of that would put an Accept/Reject
+popup in front of someone already in the session and spend a fresh pad
+handshake to arrive back where they started.
+
+At most one invitation per daemon run, so a peer on a flapping connection
+does not become a queue of popups.
+
+`--otp` needs a person. `--focus=channel:... --otp` is refused: OTP is
+provisioned pairwise, per contact, and has no channel-wide form.
+
+### Sounds and notifications
+
+A daemon has no screen, so it says things out loud.
+
+| When | Sound | Notification |
+|---|---|---|
+| Someone arrives where the focus currently is, with nobody watching | `joined.wav` | "alice is here" |
+| They leave the focused channel, or disconnect | — | "alice left / disconnected" |
+| An OTP session fails to start | `bell.wav` | the reason |
+| The daemon fails to start | `bell.wav` | the reason |
+
+The join sound is deliberately the narrowest of these. It exists for one
+situation — nobody is looking at aloo, and something changed where a held
+shortcut would land — so it plays only when all of this is true:
+
+- **it is a daemon**, since a foreground client already shows the arrival
+  in its log;
+- **no terminal is attached**, since a viewer already has it on screen;
+- **the arrival is where the focus is *now*** — not where `--focus` put it
+  at startup. The two agree until someone attaches and moves; after that
+  only the live one is worth announcing, because that is where the next
+  held shortcut actually goes.
+
+On a **channel** focus, every arrival in that channel is its own event and
+gets its own sound. On a **person** focus, them coming online is announced
+once — however many shared channels the arrival reaches you through, since
+`UserJoined` is sent per channel and "alice is online" is one event — and
+again the next time they come online after having gone offline.
+
+The notification keeps the wider rule on purpose: it is silent, it costs
+nothing to see later, and it also covers leaving and disconnecting, which
+the sound deliberately does not.
+
+Notifications use whatever your desktop already provides — `notify-send`
+on Linux, Notification Center on macOS, a toast on Windows. Two honest
+caveats: **an app cannot choose where a notification appears** (that
+belongs to your notification daemon), and the 8-second duration is a
+*request* — GNOME, for one, ignores timeout hints. If there is no
+windowing system at all (a text console, or over ssh), notifications are
+skipped rather than failing once per event.
+
+Sounds can be turned off in `~/.aloo/settings`; see below.
+
+### When it fails to start
+
+A daemon that quietly failed at login is indistinguishable from one that
+worked — until you hold the shortcut and nothing happens. So a failed start
+plays a tone, raises a notification, writes the reason to
+`~/.aloo/daemon.log`, and exits non-zero. It is fatal when:
+
+- the server is unreachable, or the host does not resolve;
+- authentication is rejected (wrong `--server-pwd`);
+- the nickname is already taken;
+- the keybundle cannot be read;
+- **every** configured channel failed to join;
+- a daemon is already running.
+
+Some things are warnings instead — the session is still worth having:
+
+- one of several channels failed to join;
+- the global shortcut could not be registered (you can still attach and
+  hold `Space`);
+- the focused person is not online yet — that is the normal case;
+- notifications are unavailable.
+
+> **Linux: the global shortcut needs X11.** aloo's hotkey backend has no
+> Wayland support, and no application-level workaround exists — a Wayland
+> compositor deliberately does not let one app grab keys globally. Under
+> Wayland the daemon connects, focuses and can be attached to normally, but
+> the shortcut will not fire. It says so at startup rather than failing
+> silently.
+
+### Running it at login
+
+Use a **user** service, not a system one. A system service has no `$HOME`,
+no display and no audio — it could not do the hotkey, the sounds or the
+notifications.
+
+A ready-to-use unit ships at the repository root as `aloo.service`:
+
+```sh
+cp aloo.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now aloo
+```
+
+It reads:
+
+```ini
+[Unit]
+Description=aloo daemon
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/aloo --daemon --foreground
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target
+```
+
+```sh
+systemctl --user daemon-reload
+systemctl --user enable --now aloo
+systemctl --user status aloo
+journalctl --user -u aloo -f
+```
+
+Note `--foreground`: systemd supervises the process itself, so the daemon
+must not re-launch and exit under it.
+
+The unit deliberately carries no flags beyond that. A bare `aloo --daemon`
+reuses the last configuration you started one with (see
+[Settings](#settings)), so the host, channels, focus and credentials live
+in `~/.aloo/settings` rather than being duplicated in the unit file. Set it
+up once by hand with the flags you want, then let the unit start it.
+
+On X11 the shortcut needs `DISPLAY` and `XAUTHORITY` in the user manager's
+environment. Most desktop sessions do this for you; if yours does not:
+
+```sh
+systemctl --user import-environment DISPLAY XAUTHORITY
+```
+
+**macOS** has no systemd. Use a `launchd` agent in
+`~/Library/LaunchAgents/`, running `aloo --daemon --foreground` with
+`RunAtLoad`. **Windows**: a shortcut to `aloo --daemon` in the Startup
+folder, or a Scheduled Task at logon.
+
+### Settings
+
+Every flag has a `daemon_`-prefixed key in `~/.aloo/settings`, and a daemon
+writes its resolved configuration back on every start. That is what lets
+the service unit above be flag-free.
+
+```ini
+daemon_host=chat.example.com
+daemon_port=7878
+daemon_nickname=david
+daemon_server_auth_type=password
+daemon_server_password=hunter2
+daemon_my_key_pub=/home/david/.aloo/ab12.pub
+daemon_my_key_priv=/home/david/.aloo/ab12.priv
+daemon_channel=team
+daemon_channel=ops:hunter2
+daemon_focus=alice
+daemon_otp=true
+```
+
+`daemon_channel` is one line per channel rather than a single
+comma-separated value, using the same `name:password` form as
+`--channels`. That is deliberate: with a line to itself, nothing is
+splitting on commas, so this is the one place a password containing a
+comma can be set.
+
+Precedence, for any given setting: **a flag given this run wins; anything
+omitted falls back to `~/.aloo/settings`; anything still missing comes from
+the last connection you made (`~/.aloo/.cache`); and only then a built-in
+default.** The same rule `aloo --server` already uses for its own flags.
+
+### Files it owns
+
+| Path | |
+|---|---|
+| `~/.aloo/daemon.sock` | the socket a terminal attaches through |
+| `~/.aloo/daemon.pid` | the running daemon's process id |
+| `~/.aloo/daemon.log` | its stdout and stderr |
+
+All three are removed when it exits.
+
+> **The socket is the access control.** Anyone who can write to
+> `~/.aloo/daemon.sock` controls the session completely: they can read
+> every message in it and send voice, text and files as you. It is created
+> mode `0600`, and aloo refuses to speak to one that is not owned by the
+> user running it. This is a larger capability than reading
+> `~/.aloo/settings`, which only exposes stored secrets — see
+> `docs/SECURITY.md`.
+
+### Full example
+
+Connected at login, in two work channels, voice going to `ops`, with a
+one-time-pad session kept up with alice:
+
+```sh
+aloo --daemon \
+  --host=chat.example.com \
+  --server-pwd=SECRET \
+  --nick=david \
+  --channels=team,ops:hunter2 \
+  --focus=alice \
+  --otp
+```
+
+Then, from anywhere: hold `Ctrl+Alt+P`, talk, release — alice hears it,
+pad-encrypted, the moment you speak. Run `aloo` to read the log, `/daemon`
+to step back out.
+
+### See also
+
+- - [`PROTOCOL.md`](PROTOCOL.md) §16 — the one-time-pad layer, and §16.6 for
+  what starts and ends a session.
+- `docs/SECURITY.md` — what aloo protects and what it does not.
 
 ## Protocol terms, and what implements them
 

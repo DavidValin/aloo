@@ -1047,7 +1047,6 @@ fn render_help_popup_shows_expected_content_when_open() {
         rows.iter().any(|r| r.contains("/file")),
         "expected help on sending a file: {rows:?}"
     );
-
     // The encryption tags and identity pinning both sit far enough down the
     // (now longer) help text that a typical terminal does not show them
     // without scrolling - see docs/SPEC.md Functionality #7's scrollable
@@ -2570,4 +2569,253 @@ fn muting_ourselves_shows_on_the_roster_like_any_other_mute() {
         .find(|r| r.contains("bob") && r.contains("IN CALL"))
         .expect("bob's roster row");
     assert!(bob_row.contains("MUTED"), "{bob_row:?}");
+}
+
+// ---------------------------------------------------------------------
+// Muting a person's voice messages (SPEC.md Functionality #16)
+// ---------------------------------------------------------------------
+
+/// @requirement AC-195
+#[test]
+fn mute_voice_command_produces_a_mute_action() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    type_str(&mut state, "/mute-voice bob");
+    let action = press(&mut state, KeyCode::Enter);
+
+    assert_eq!(
+        action,
+        Some(UiAction::SetVoiceMuted {
+            nickname: "bob".into(),
+            muted: true
+        })
+    );
+    assert!(state.input.is_empty(), "a recognized command clears the bar");
+    assert!(
+        state.muted_voice.contains("bob"),
+        "applied locally right away, so a stream starting this instant sees it"
+    );
+    let (notice, ok) = state.status_notice.clone().expect("must confirm");
+    assert!(notice.contains("bob") && notice.contains("muted"), "{notice}");
+    assert!(ok);
+}
+
+/// @requirement AC-195
+#[test]
+fn unmute_voice_command_produces_an_unmute_action() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.set_muted_voice(["bob".to_string()].into_iter().collect());
+
+    type_str(&mut state, "/unmute-voice bob");
+    let action = press(&mut state, KeyCode::Enter);
+
+    assert_eq!(
+        action,
+        Some(UiAction::SetVoiceMuted {
+            nickname: "bob".into(),
+            muted: false
+        })
+    );
+    assert!(!state.muted_voice.contains("bob"));
+}
+
+/// @requirement AC-195
+#[test]
+fn a_bare_mute_voice_command_lists_who_is_muted() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.set_muted_voice(["bob".to_string(), "alice".to_string()].into_iter().collect());
+
+    type_str(&mut state, "/mute-voice");
+    let action = press(&mut state, KeyCode::Enter);
+
+    assert_eq!(action, None, "listing produces no action to persist");
+    let (notice, _) = state.status_notice.clone().expect("must list");
+    assert!(
+        notice.contains("alice") && notice.contains("bob"),
+        "the bare command is the only place that answers 'who have I muted?': {notice}"
+    );
+    assert!(state.input.is_empty());
+}
+
+/// @requirement AC-195
+#[test]
+fn a_bare_mute_voice_command_with_nothing_muted_says_so() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    type_str(&mut state, "/mute-voice");
+    assert_eq!(press(&mut state, KeyCode::Enter), None);
+    let (notice, _) = state.status_notice.clone().expect("must say something");
+    assert!(notice.contains("no voices muted"), "{notice}");
+}
+
+/// Muting someone already muted must not rewrite the settings file for a
+/// no-op - it produces a notice and no action at all.
+/// @requirement AC-195
+#[test]
+fn re_muting_an_already_muted_nickname_produces_no_action() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.set_muted_voice(["bob".to_string()].into_iter().collect());
+
+    type_str(&mut state, "/mute-voice bob");
+    assert_eq!(press(&mut state, KeyCode::Enter), None);
+    let (notice, _) = state.status_notice.clone().expect("must say so");
+    assert!(notice.contains("already muted"), "{notice}");
+
+    type_str(&mut state, "/unmute-voice alice");
+    assert_eq!(press(&mut state, KeyCode::Enter), None);
+    let (notice, _) = state.status_notice.clone().expect("must say so");
+    assert!(notice.contains("not muted"), "{notice}");
+}
+
+/// A nickname never contains whitespace, so a second word is a typo rather
+/// than part of the name - muting the first word of it silently would be
+/// worse than refusing.
+/// @requirement AC-195
+#[test]
+fn mute_voice_refuses_more_than_one_word() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    type_str(&mut state, "/mute-voice bob carol");
+    assert_eq!(press(&mut state, KeyCode::Enter), None);
+
+    assert!(state.muted_voice.is_empty());
+    let (notice, ok) = state.status_notice.clone().expect("must refuse");
+    assert!(notice.contains("one nickname"), "{notice}");
+    assert!(!ok);
+}
+
+/// These are the first commands in this app that take an argument, so the
+/// thing most likely to break is the unknown-command catch-all swallowing
+/// them. Also guards the neighbouring commands from the new prefix match.
+/// @requirement AC-195
+#[test]
+fn the_mute_commands_are_not_swallowed_as_unknown_commands() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    type_str(&mut state, "/mute-voice bob");
+    press(&mut state, KeyCode::Enter);
+    let (notice, _) = state.status_notice.clone().unwrap();
+    assert!(
+        !notice.contains("unknown command"),
+        "must be handled before the catch-all: {notice}"
+    );
+
+    // A near-miss still has to reach the catch-all.
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    type_str(&mut state, "/mute-voic bob");
+    assert_eq!(press(&mut state, KeyCode::Enter), None);
+    let (notice, _) = state.status_notice.clone().unwrap();
+    assert!(notice.contains("unknown command"), "{notice}");
+
+    // `/mute-voice` must not capture a shorter command that merely
+    // shares its prefix. `/mute` itself no longer exists (muting your own
+    // microphone is `m` on the call roster), so it reaches the
+    // unknown-command notice - which is exactly the check that matters:
+    // the prefix match did not swallow it.
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    type_str(&mut state, "/mute");
+    assert_eq!(press(&mut state, KeyCode::Enter), None);
+    let (notice, _) = state.status_notice.clone().unwrap();
+    assert!(notice.contains("unknown command"), "{notice}");
+}
+
+/// @requirement AC-196
+#[test]
+fn suppress_playback_from_covers_both_the_trust_gate_and_a_mute() {
+    let mut state = joined_general_with(vec![user(2, "bob"), user(3, "carol")]);
+    assert!(!state.suppress_playback_from(UserId(2)));
+
+    state.set_muted_voice(["bob".to_string()].into_iter().collect());
+    assert!(state.suppress_playback_from(UserId(2)), "muted");
+    assert!(!state.suppress_playback_from(UserId(3)), "untouched");
+
+    // The trust gate still suppresses on its own, mute or no mute.
+    state.push_identity_review(
+        UserId(3),
+        "carol".into(),
+        "carol's key changed unexpectedly".into(),
+        static_mismatch(),
+    );
+    assert!(state.suppress_playback_from(UserId(3)));
+}
+
+/// @requirement AC-196
+#[test]
+fn a_muted_peer_suppresses_playback_but_not_logging() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.set_muted_voice(["bob".to_string()].into_iter().collect());
+
+    // The stream still opens a row and still finalizes into a replayable
+    // Voice entry - muting is only ever about live playback.
+    state.on_channel_stream_start("general", UserId(2), "bob".into(), 7);
+    state.on_channel_stream_finished("general", UserId(2), 7, 1200, vec![0u8; 64]);
+
+    let log = &state.channels[state.selected_channel].log;
+    let has_voice = log
+        .iter()
+        .any(|e| matches!(&e.body, MessageBody::Voice { duration_ms, .. } if *duration_ms == 1200));
+    assert!(
+        has_voice,
+        "a muted message must still be in the log to replay: {log:?}"
+    );
+}
+
+/// @requirement AC-198
+#[test]
+fn muting_an_offline_or_unknown_nickname_is_accepted() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    // "dave" is not in `known_users` at all.
+    type_str(&mut state, "/mute-voice dave");
+    let action = press(&mut state, KeyCode::Enter);
+
+    assert_eq!(
+        action,
+        Some(UiAction::SetVoiceMuted {
+            nickname: "dave".into(),
+            muted: true
+        }),
+        "a mute is by nickname, so it can be set before they ever connect"
+    );
+    assert!(state.muted_voice.contains("dave"));
+
+    // And it takes effect the moment someone by that name shows up.
+    state.on_user_joined("general", user(4, "dave"));
+    assert!(state.is_voice_muted(UserId(4)));
+}
+
+/// A peer we hold no UserInfo for has no name to have matched, so is never
+/// muted - the lookup must not panic or guess.
+/// @requirement AC-198
+#[test]
+fn an_unknown_user_id_is_never_reported_as_muted() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.set_muted_voice(["bob".to_string()].into_iter().collect());
+    assert!(!state.is_voice_muted(UserId(99)));
+}
+
+// ---------------------------------------------------------------------
+// /daemon (SPEC.md "Running in background mode")
+// ---------------------------------------------------------------------
+
+/// @requirement AC-203
+#[test]
+fn slash_daemon_hands_the_session_back_when_running_as_one() {
+    let mut state = joined_general_with(vec![]);
+    state.daemon_mode = true;
+
+    type_str(&mut state, "/daemon");
+    assert_eq!(press(&mut state, KeyCode::Enter), Some(UiAction::Detach));
+    assert!(state.input.is_empty());
+}
+
+/// A foreground session cannot background itself - that would mean
+/// re-parenting a live process along with its open TCP control connection
+/// and UDP peer links - so it explains itself rather than half-working.
+/// @requirement AC-203
+#[test]
+fn slash_daemon_explains_itself_outside_daemon_mode() {
+    let mut state = joined_general_with(vec![]);
+    assert!(!state.daemon_mode, "a plain client is not a daemon");
+
+    type_str(&mut state, "/daemon");
+    assert_eq!(press(&mut state, KeyCode::Enter), None);
+    let (notice, ok) = state.status_notice.clone().expect("must explain");
+    assert!(notice.contains("not running as a daemon"), "{notice}");
+    assert!(!ok);
 }

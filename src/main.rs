@@ -8,6 +8,7 @@ use clap::Parser;
 use clap::builder::styling::{AnsiColor, Styles};
 
 use aloo::client::connect;
+use aloo::client::daemon;
 use aloo::client::global_ptt;
 use aloo::client::tui::terminal;
 use aloo::crypto;
@@ -79,6 +80,81 @@ struct Cli {
     #[arg(long, value_names = ["OLD_PREFIX", "NEW_PREFIX"], num_args = 2)]
     rekey_pq_hybrid: Option<Vec<String>>,
 
+    /// Run in the background, connected, so the global push-to-talk
+    /// shortcut works without aloo being open. Joins only the channels
+    /// given with `--channels` (never `the-hall` unless you name it) and
+    /// puts the focus where `--focus` says, so a held shortcut goes
+    /// straight there. Type `aloo` in any terminal to take the session
+    /// over, `/daemon` to hand it back.
+    #[arg(long)]
+    daemon: bool,
+
+    /// Daemon-only: stay in the foreground instead of re-launching
+    /// detached. What a service manager wants (systemd `Type=simple`),
+    /// since it does its own supervising.
+    #[arg(long)]
+    foreground: bool,
+
+    /// Print whether a daemon is running, and exit.
+    #[arg(long)]
+    daemon_status: bool,
+
+    /// Ask a running daemon to shut down, and exit.
+    #[arg(long)]
+    daemon_stop: bool,
+
+    /// Start a fresh session even if a daemon is running, instead of
+    /// attaching to it.
+    #[arg(long)]
+    no_attach: bool,
+
+    /// Daemon/client: the server to connect to. Defaults to whatever was
+    /// last connected to (`~/.aloo/.cache`).
+    #[arg(long)]
+    host: Option<String>,
+
+    /// Daemon-only: the nickname to connect as. Defaults to $USER.
+    #[arg(long)]
+    nick: Option<String>,
+
+    /// Daemon-only: the server's shared password, for a server started
+    /// with `--password`.
+    #[arg(long)]
+    server_pwd: Option<String>,
+
+    /// Daemon-only: the server's public key file, for a server started
+    /// with `--enc rsa`.
+    #[arg(long, value_name = "FILE")]
+    server_key: Option<PathBuf>,
+
+    /// Daemon-only: the `pq_hybrid` keybundle prefix to connect with -
+    /// `<PREFIX>` and `<PREFIX>.pub`. Generated on first use if missing.
+    #[arg(long, value_name = "PREFIX")]
+    my_key: Option<String>,
+
+    /// Daemon-only: the channels to join, comma separated, each
+    /// optionally with its password after a colon -
+    /// `--channels=team,ops:hunter2`. A colon is legal in neither a
+    /// channel name nor a password, which is what keeps it unambiguous;
+    /// a password containing a comma can only be set in
+    /// `~/.aloo/settings`, where each channel has a line of its own.
+    #[arg(long, value_name = "NAME[:PASSWORD],...")]
+    channels: Vec<String>,
+
+    /// Daemon-only: where a held push-to-talk shortcut sends its voice.
+    /// `channel:<name>` for a channel, or a bare nickname for a DM, which
+    /// opens as soon as that person appears.
+    #[arg(long, value_name = "TARGET")]
+    focus: Option<String>,
+
+    /// Daemon-only: with a nickname `--focus`, make sure an OTP session is
+    /// running with them. One that is already active - they survive
+    /// disconnects and restarts, only `/endotp` ends one - is simply
+    /// continued, with no invitation sent and no popup on their side; only
+    /// a peer with no live session is invited, once.
+    #[arg(long)]
+    otp: bool,
+
     /// Write an identity card for a PQ-hybrid keybundle: a small signed
     /// file pairing your nickname with your identity, shareable by any
     /// means. Whoever imports it has you pinned and verified before you
@@ -108,7 +184,93 @@ fn main() -> Result<(), BoxError> {
     if cli.server {
         return build_runtime()?.block_on(run_server(cli));
     }
+    if cli.daemon_status || cli.daemon_stop {
+        return build_runtime()?.block_on(run_daemon_control(&cli));
+    }
+    if cli.daemon {
+        return run_daemon_entry(cli);
+    }
     run_client_entry(cli)
+}
+
+// ---------------------------------------------------------------------
+// Daemon mode
+// ---------------------------------------------------------------------
+
+/// `--daemon-status` / `--daemon-stop`: one message to a running daemon.
+async fn run_daemon_control(cli: &Cli) -> Result<(), BoxError> {
+    use aloo::client::daemon_ipc::AttachMessage;
+    let socket = aloo::client::daemon_ipc::socket_path();
+    let message = if cli.daemon_stop {
+        AttachMessage::Shutdown
+    } else {
+        AttachMessage::Status
+    };
+    match daemon::send_control(&socket, message).await {
+        Ok(()) => Ok(()),
+        Err(e) if cli.daemon_status => {
+            // "No daemon" is the answer to a status question, not a
+            // failure of it.
+            println!("aloo: {e}");
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// `--daemon`: background this process unless told to stay, then run.
+///
+/// The re-exec happens *before* any runtime, thread or audio device is
+/// touched, so the child starts clean - see `daemon::spawn_detached` for
+/// why that matters more than it might look.
+fn run_daemon_entry(cli: Cli) -> Result<(), BoxError> {
+    if !cli.foreground && !daemon::is_daemon_child() {
+        let log = aloo::client::daemon_ipc::log_path();
+        let pid = daemon::spawn_detached(&log)?;
+        println!("aloo: daemon started (pid {pid}), logging to {}", log.display());
+        println!("aloo: type 'aloo' in any terminal to attach, /daemon to hand it back");
+        return Ok(());
+    }
+
+    let config = match resolve_daemon_config(&cli) {
+        Ok(config) => config,
+        Err(e) => {
+            daemon::report_startup_failure(&e);
+            return Err(e.into());
+        }
+    };
+
+    // The hotkey has to be registered from the process's real main thread
+    // on macOS, exactly as it does for a foreground client - so the daemon
+    // reuses the same split rather than inventing a second one.
+    let runtime = build_runtime()?;
+    match runtime.block_on(daemon::run(config)) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            daemon::report_startup_failure(&e);
+            Err(e)
+        }
+    }
+}
+
+fn resolve_daemon_config(cli: &Cli) -> Result<aloo::client::daemon::DaemonConfig, String> {
+    let settings = load_settings();
+    let cache = aloo::client::connect::ConnectCache::load(&aloo::client::connect::cache_path())
+        .unwrap_or_else(|_| {
+            aloo::client::connect::ConnectCache::new_empty(aloo::client::connect::cache_path())
+        });
+    let flags = aloo::client::daemon::DaemonFlags {
+        host: cli.host.clone(),
+        port: cli.port,
+        nickname: cli.nick.clone(),
+        server_pwd: cli.server_pwd.clone(),
+        server_key_file: cli.server_key.clone(),
+        my_key_prefix: cli.my_key.clone(),
+        channels: cli.channels.clone(),
+        focus: cli.focus.clone(),
+        otp: cli.otp,
+    };
+    aloo::client::daemon::DaemonConfig::resolve(&flags, &settings, &cache)
 }
 
 /// A full multi-thread runtime with all drivers enabled - the same flavor
@@ -140,6 +302,20 @@ fn load_settings() -> settings::Settings {
 /// exactly what `#[tokio::main]` used to do: build a runtime, block on
 /// `run_client`.
 fn run_client_entry(cli: Cli) -> Result<(), BoxError> {
+    // A running daemon owns this machine's session. Taking it over is what
+    // a bare `aloo` means once one exists - connecting a *second* client
+    // under the same nickname would be refused by the server anyway
+    // (nicknames are unique among connected clients, §5.4), so the choice
+    // is between resuming and a confusing error. `--no-attach` is the way
+    // to genuinely want a second, separate session.
+    if !cli.no_attach {
+        let socket = aloo::client::daemon_ipc::socket_path();
+        let runtime = build_runtime()?;
+        if runtime.block_on(aloo::client::daemon_ipc::is_daemon_running(&socket)) {
+            return runtime.block_on(daemon::run_attach_client(&socket));
+        }
+    }
+
     let settings = load_settings();
     let hotkey = global_ptt::hotkey_to_register(&settings);
 
@@ -338,10 +514,10 @@ async fn run_client(
     cli: Cli,
     hotkey_rx: Option<tokio::sync::mpsc::UnboundedReceiver<global_ptt::GlobalPttEvent>>,
 ) -> Result<(), BoxError> {
-    let (mut term, keyboard_release_reporting) = terminal::setup()?;
+    let (mut surface, keyboard_release_reporting) = terminal::setup_surface()?;
     let port = cli.port.unwrap_or(settings::DEFAULT_PORT);
     let result =
-        connect::run_client_inner(&mut term, port, keyboard_release_reporting, hotkey_rx).await;
-    terminal::restore(&mut term)?;
+        connect::run_client_inner(&mut surface, port, keyboard_release_reporting, hotkey_rx).await;
+    terminal::restore_surface(&mut surface)?;
     result
 }

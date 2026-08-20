@@ -1972,3 +1972,40 @@ fn an_idle_dropdown_closes_itself_after_the_timeout() {
     state.tick_selector_dropdown(Instant::now() + Duration::from_secs(29));
     assert!(state.selector_dropdown_open, "the step restarted the clock");
 }
+
+// ---------------------------------------------------------------------
+// Muted voices in the sidebar (SPEC.md Functionality #16)
+// ---------------------------------------------------------------------
+
+/// Without a marker, a channel that has gone quiet because someone is
+/// muted looks exactly like one where nobody is talking.
+/// @requirement AC-197
+#[test]
+fn a_muted_member_is_marked_in_the_sidebar() {
+    let mut state = joined_general_with(vec![user(2, "bob"), user(3, "carol")]);
+    state.set_muted_voice(["bob".to_string()].into_iter().collect());
+
+    let rows = sidebar_rows(&state);
+    let bob = row_containing(&rows, "bob");
+    let carol = row_containing(&rows, "carol");
+
+    assert!(
+        bob.contains('\u{1F507}'),
+        "a muted member must be marked: {bob:?}"
+    );
+    assert!(
+        !carol.contains('\u{1F507}'),
+        "an unmuted member must not be: {carol:?}"
+    );
+}
+
+/// @requirement AC-197
+#[test]
+fn unmuting_clears_the_sidebar_marker() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.set_muted_voice(["bob".to_string()].into_iter().collect());
+    assert!(row_containing(&sidebar_rows(&state), "bob").contains('\u{1F507}'));
+
+    state.set_muted_voice(Default::default());
+    assert!(!row_containing(&sidebar_rows(&state), "bob").contains('\u{1F507}'));
+}
