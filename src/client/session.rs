@@ -1075,6 +1075,14 @@ async fn handle_server_message(
                 own.forget(user_id);
             }
             session.replay.forget(user_id);
+            // A half-received pad from this connection can never be
+            // continued: the rest of it would arrive under the fresh
+            // `UserId` they reconnect with, which starts its own
+            // accumulation. Dropped here rather than left to linger for the
+            // session, both because it is dead weight and because it is raw
+            // pad material (zeroized on drop, so dropping it is what wipes
+            // it).
+            session.otp_incoming_setup.remove(&user_id);
         }
         ServerMessage::KeyRotated {
             from,
@@ -1325,6 +1333,12 @@ async fn handle_p2p_event(
                     // just `peer` - cheap (a handful of contacts at most) and
                     // opportunistically recovers anyone else reachable too.
                     crate::client::otp::recover_and_resend(wr, session, ui_state).await?;
+                    // Same trigger, same reasoning, for a pad still owed to
+                    // this peer: an invitation whose delivery was never
+                    // confirmed is re-offered rather than regenerated, so a
+                    // peer who went offline mid-provisioning resumes instead
+                    // of stranding both sides.
+                    crate::client::otp::resend_pending_setups(wr, session, ui_state).await?;
 
                     // Tells `peer` our own device id, encrypted, every time
                     // the link reaches Active (idempotent - harmless on a

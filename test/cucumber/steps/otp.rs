@@ -13,7 +13,10 @@
 
 use cucumber::{given, then, when};
 
-use aloo::client::otp::{apply_incoming_setup, detect_or_adopt_existing, initiate_provisioning, unwrap_incoming, wrap_outgoing};
+use aloo::client::otp::{
+    apply_incoming_setup, commit_pending_setup, detect_or_adopt_existing, discard_pending_setup,
+    initiate_provisioning, own_pad_wins_glare, read_pending_setup, unwrap_incoming, wrap_outgoing,
+};
 use aloo::client::otp_cli::{self, OtpCliConfig};
 use aloo::client::otp_store::{OtpStore, PendingOtpContent};
 use aloo::client::tui::ui::UiAction;
@@ -51,6 +54,13 @@ async fn provisioned_contact(w: &mut AlooWorld, a: String, b: String) {
         .expect("provisioning generation should succeed");
     let ack = apply_incoming_setup(&cfg_b, &payload).await;
     assert!(ack.accepted, "the handshake should succeed: {:?}", ack.reason);
+    // The initiating side holds its own half staged, not in the keychain,
+    // until the peer's acceptance comes back - `ack.accepted` here *is* that
+    // acceptance, so this is the step that makes alice's side usable.
+    assert!(
+        commit_pending_setup(&cfg_a, &payload.contact_name).await,
+        "the initiating side should adopt its own half once the peer accepts"
+    );
 
     w.otp_contact_name = Some(payload.contact_name.clone());
     w.otp_cfgs.insert(a, cfg_a);
@@ -338,4 +348,145 @@ async fn reassembled_matches(w: &mut AlooWorld) {
     let (enc, dec) = w.otp_reassembled.clone().expect("nothing was reassembled");
     assert_eq!(enc, w.otp_pad_enc);
     assert_eq!(dec, w.otp_pad_dec);
+}
+
+// ---------------------------------------------------------------------
+// An invitation that is never accepted (AC-142)
+// ---------------------------------------------------------------------
+
+/// Shared by the "never accepted" and "refused" scenarios: the difference
+/// between a peer who never answered and one who said no is, on this side,
+/// only which message came back - in both cases the pad was never adopted,
+/// which is exactly what the scenarios below assert.
+async fn generate_unaccepted_pad(w: &mut AlooWorld, from: String, to: String) {
+    let (pub_a, _) = pq_bundle_for(&from);
+    let (pub_b, _) = pq_bundle_for(&to);
+    let fp_a = bundle_fingerprint(&pub_a).expect("fingerprint");
+    let fp_b = bundle_fingerprint(&pub_b).expect("fingerprint");
+    let cfg_a = cfg_at(w.temp_path(&format!("otp-unaccepted-{from}")));
+    let cfg_b = cfg_at(w.temp_path(&format!("otp-unaccepted-{to}")));
+
+    let payload = initiate_provisioning(&cfg_a, 1, &fp_a, &fp_b)
+        .await
+        .expect("provisioning generation should succeed");
+    w.otp_contact_name = Some(payload.contact_name.clone());
+    w.otp_pad_enc = payload.peer_encryption_key.clone();
+    w.otp_pad_dec = payload.peer_decryption_key.clone();
+    w.otp_cfgs.insert(from, cfg_a);
+    w.otp_cfgs.insert(to, cfg_b);
+}
+
+#[when(expr = "{word} generates a pad for {word} that {word} never accepts")]
+async fn generates_pad_never_accepted(w: &mut AlooWorld, from: String, to: String, _who: String) {
+    generate_unaccepted_pad(w, from, to).await;
+}
+
+#[when(expr = "{word} generates a pad for {word} that {word} refuses")]
+async fn generates_pad_refused(w: &mut AlooWorld, from: String, to: String, _who: String) {
+    generate_unaccepted_pad(w, from.clone(), to).await;
+    // A refusal ends the invitation: the staged pad is dropped, exactly what
+    // `on_key_setup_ack` does when the ack comes back not accepted.
+    let contact = w.otp_contact_name.clone().expect("no otp contact set up");
+    let cfg = w.otp_cfgs.get(&from).expect("no otp config").clone();
+    discard_pending_setup(&cfg, &contact);
+}
+
+#[then(expr = "{word} holds no otp contact for {word}")]
+async fn holds_no_contact(w: &mut AlooWorld, who: String, _peer: String) {
+    let contact = w.otp_contact_name.clone().expect("no otp contact set up");
+    let cfg = w.otp_cfgs.get(&who).expect("no otp config").clone();
+    assert!(
+        !otp_cli::has_contact(&cfg, &contact).await.unwrap_or(true),
+        "an invitation that was never accepted must leave no keychain entry behind"
+    );
+}
+
+#[then(expr = "a later invitation from {word} to {word} still succeeds")]
+async fn later_invitation_succeeds(w: &mut AlooWorld, from: String, to: String) {
+    let (pub_a, _) = pq_bundle_for(&from);
+    let (pub_b, _) = pq_bundle_for(&to);
+    let fp_a = bundle_fingerprint(&pub_a).expect("fingerprint");
+    let fp_b = bundle_fingerprint(&pub_b).expect("fingerprint");
+    let cfg_from = w.otp_cfgs.get(&from).expect("no otp config").clone();
+    let cfg_to = w.otp_cfgs.get(&to).expect("no otp config").clone();
+
+    // Whichever direction it runs in, the contact name is the same - which
+    // is precisely why a leftover half used to make this impossible.
+    let payload = initiate_provisioning(&cfg_from, 1, &fp_a, &fp_b)
+        .await
+        .expect("a later invitation must not be blocked by an abandoned one");
+    let ack = apply_incoming_setup(&cfg_to, &payload).await;
+    assert!(ack.accepted, "the peer should accept the fresh pad: {:?}", ack.reason);
+    assert!(
+        commit_pending_setup(&cfg_from, &payload.contact_name).await,
+        "the initiating side should adopt its half once accepted"
+    );
+}
+
+#[then("the pad alice would re-send is byte-identical to the one she generated")]
+async fn resend_is_identical(w: &mut AlooWorld) {
+    let contact = w.otp_contact_name.clone().expect("no otp contact set up");
+    let cfg = w.otp_cfgs.get("alice").expect("no otp config").clone();
+    let again = read_pending_setup(&cfg, &contact, 1).expect("a staged pad must be re-readable");
+    assert_eq!(again.peer_encryption_key, w.otp_pad_enc);
+    assert_eq!(again.peer_decryption_key, w.otp_pad_dec);
+}
+
+#[when("alice and bob both generate a pad for each other before either answers")]
+async fn both_generate_at_once(w: &mut AlooWorld) {
+    let (pub_a, _) = pq_bundle_for("alice");
+    let (pub_b, _) = pq_bundle_for("bob");
+    let fp_a = bundle_fingerprint(&pub_a).expect("fingerprint");
+    let fp_b = bundle_fingerprint(&pub_b).expect("fingerprint");
+    let cfg_a = cfg_at(w.temp_path("otp-glare-alice"));
+    let cfg_b = cfg_at(w.temp_path("otp-glare-bob"));
+
+    let pad_a = initiate_provisioning(&cfg_a, 1, &fp_a, &fp_b)
+        .await
+        .expect("alice's pad");
+    initiate_provisioning(&cfg_b, 1, &fp_b, &fp_a)
+        .await
+        .expect("bob's pad");
+
+    // The loser concedes, exactly as `on_key_setup` does when it sees a pad
+    // arrive while one of its own is still owed.
+    let (loser_cfg, loser) = if own_pad_wins_glare(&fp_a, &fp_b) {
+        (cfg_b.clone(), "bob")
+    } else {
+        (cfg_a.clone(), "alice")
+    };
+    discard_pending_setup(&loser_cfg, &pad_a.contact_name);
+
+    w.otp_contact_name = Some(pad_a.contact_name.clone());
+    w.otp_glare_loser = Some(loser.to_string());
+    w.otp_cfgs.insert("alice".to_string(), cfg_a);
+    w.otp_cfgs.insert("bob".to_string(), cfg_b);
+}
+
+#[then("both sides agree on which pad survives")]
+async fn both_agree_on_winner(_w: &mut AlooWorld) {
+    let (pub_a, _) = pq_bundle_for("alice");
+    let (pub_b, _) = pq_bundle_for("bob");
+    let fp_a = bundle_fingerprint(&pub_a).expect("fingerprint");
+    let fp_b = bundle_fingerprint(&pub_b).expect("fingerprint");
+    assert_ne!(
+        own_pad_wins_glare(&fp_a, &fp_b),
+        own_pad_wins_glare(&fp_b, &fp_a),
+        "exactly one side may believe its own pad won"
+    );
+}
+
+#[then("the conceding side keeps no pad of its own")]
+async fn loser_keeps_nothing(w: &mut AlooWorld) {
+    let contact = w.otp_contact_name.clone().expect("no otp contact set up");
+    let loser = w.otp_glare_loser.clone().expect("no glare loser recorded");
+    let cfg = w.otp_cfgs.get(&loser).expect("no otp config").clone();
+    assert!(
+        read_pending_setup(&cfg, &contact, 1).is_none(),
+        "the conceding side must not keep a pad it can never have adopted"
+    );
+    assert!(
+        !otp_cli::has_contact(&cfg, &contact).await.unwrap_or(true),
+        "and must not have adopted one either"
+    );
 }

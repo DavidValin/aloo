@@ -218,6 +218,8 @@ pub struct AlooWorld {
     pub otp_wrapped: Vec<u8>,
     /// Whether `detect_or_adopt_existing` adopted a contact.
     pub otp_adopted: bool,
+    /// Which side conceded in a simultaneous-invitation scenario.
+    pub otp_glare_loser: Option<String>,
     /// Synthetic pad bytes for a chunking/reassembly scenario - not real
     /// `otp` CLI output, since TB-186 is about the wire-transfer mechanics,
     /// not the pad's own cryptographic origin (already covered elsewhere).

@@ -117,3 +117,36 @@ Feature: Layering one-time-pad encryption over an established pq_hybrid conversa
     Given alice generates a fresh 2MB pad for bob
     When it is sent to bob in many small pieces
     Then bob's reassembled pad is byte-identical to the one alice generated
+
+  @AC-142
+  Scenario: An invitation that is never accepted leaves nothing behind
+    Given alice and bob each have a pq_hybrid identity
+    When alice generates a pad for bob that bob never accepts
+    Then alice holds no otp contact for bob
+    And a later invitation from alice to bob still succeeds
+
+  @AC-142
+  Scenario: A refused invitation does not block the next one
+    Given alice and bob each have a pq_hybrid identity
+    When alice generates a pad for bob that bob refuses
+    Then alice holds no otp contact for bob
+    And a later invitation from alice to bob still succeeds
+
+  @AC-142
+  Scenario: A refused invitation does not block one going the other way
+    Given alice and bob each have a pq_hybrid identity
+    When alice generates a pad for bob that bob refuses
+    Then a later invitation from bob to alice still succeeds
+
+  @AC-142
+  Scenario: A pad owed to a peer is re-offered unchanged rather than regenerated
+    Given alice and bob each have a pq_hybrid identity
+    When alice generates a pad for bob that bob never accepts
+    Then the pad alice would re-send is byte-identical to the one she generated
+
+  @AC-142
+  Scenario: Both users invite each other at once and only one pad survives
+    Given alice and bob each have a pq_hybrid identity
+    When alice and bob both generate a pad for each other before either answers
+    Then both sides agree on which pad survives
+    And the conceding side keeps no pad of its own

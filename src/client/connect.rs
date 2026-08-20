@@ -280,7 +280,12 @@ async fn resolve_server_prefer_ipv4(host: &str, port: u16) -> Result<std::net::S
 /// still mean something.
 ///
 /// `pub` purely so `test/connect_test.rs` can exercise the choice without a
-/// live resolver, the same way `resolve_my_keypair` is exposed below.
+/// live resolver, the same way `resolve_my_keypair` is exposed below - the
+/// selection was split out of `resolve_server_prefer_ipv4` for exactly that
+/// reason, since the DNS lookup around it cannot be made deterministic in a
+/// test. Behaviour is unchanged from the single sort-and-take-first it
+/// replaced (a stable sort by `is_ipv6` puts the first IPv4 record first,
+/// and leaves the first address of any family first when there is none).
 pub fn prefer_ipv4(addrs: &[std::net::SocketAddr]) -> Option<std::net::SocketAddr> {
     addrs
         .iter()

@@ -253,3 +253,75 @@ fn a_malformed_line_is_skipped_rather_than_failing_the_whole_load() {
 
     std::fs::remove_file(&path).ok();
 }
+
+// ---------------------------------------------------------------------
+// A pad owed to a peer, so an undelivered invitation is retried rather
+// than regenerated
+// ---------------------------------------------------------------------
+
+/// @requirement AC-142
+#[test]
+fn a_pending_setup_survives_save_and_load() {
+    let path = temp_store_path();
+    let mut store = OtpStore::new_empty(path.clone());
+    store.mark_setup_pending("alice-bob", 4);
+    store.save().unwrap();
+
+    // Reloaded, because the whole point is surviving a restart - a peer who
+    // never received their pad is owed it just as much tomorrow.
+    let loaded = OtpStore::load(&path).unwrap();
+    assert_eq!(
+        loaded.get("alice-bob").unwrap().pending_setup_size_mb,
+        Some(4)
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// @requirement AC-142
+#[test]
+fn clearing_a_pending_setup_reports_whether_anything_was_owed() {
+    let path = temp_store_path();
+    let mut store = OtpStore::new_empty(path.clone());
+    store.mark_setup_pending("alice-bob", 1);
+    assert!(
+        store.clear_pending_setup("alice-bob"),
+        "the first answer to an outstanding invitation clears it"
+    );
+    assert!(
+        !store.clear_pending_setup("alice-bob"),
+        "a duplicate or stray answer must be distinguishable from a real one"
+    );
+    assert!(!store.clear_pending_setup("someone-else"));
+    std::fs::remove_file(&path).ok();
+}
+
+/// @requirement AC-142
+#[test]
+fn pending_setups_yields_only_contacts_still_owed_a_pad() {
+    let path = temp_store_path();
+    let mut store = OtpStore::new_empty(path.clone());
+    store.mark_setup_pending("owed", 2);
+    store.mark_provisioned("settled");
+    let owed: Vec<(String, u32)> = store
+        .pending_setups()
+        .map(|(n, s)| (n.to_string(), s))
+        .collect();
+    assert_eq!(owed, vec![("owed".to_string(), 2)]);
+    std::fs::remove_file(&path).ok();
+}
+
+/// A store written before pads could be owed has no such field at all;
+/// loading one must mean "nothing owed", not a parse failure that would
+/// discard the delivery-gate state on the same line.
+///
+/// @requirement AC-142
+#[test]
+fn a_line_written_before_pending_setup_existed_still_loads() {
+    let path = temp_store_path();
+    std::fs::write(&path, "alice-bob\t1\t2\t3\t4\tT\n").unwrap();
+    let loaded = OtpStore::load(&path).unwrap();
+    let state = loaded.get("alice-bob").unwrap();
+    assert_eq!(state.pending_setup_size_mb, None);
+    assert_eq!(state.pending_unacked_out_seq, Some(2));
+    std::fs::remove_file(&path).ok();
+}

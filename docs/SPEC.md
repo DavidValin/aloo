@@ -294,7 +294,7 @@ here that implements it. If a name changes on one side, it changes on both.
 | One-time-pad layer (§16), `contact_name_for` | `crypto/otp.rs` `contact_name_for`, `OtpKeySetupPayload`, `OtpSessionRequestPayload`, `OtpKeySetupAckPayload` |
 | `otp` command subprocess wrapper (§16) | `client/otp_cli.rs` `OtpCliConfig`, `encrypt`, `decrypt`, `status`, `has_contact`, `new_key_pair`, `add_contact`, `binary_available` |
 | Per-contact OTP state, ack gate (§16.2) | `client/otp_store.rs` `OtpStore`, `OtpContactState`; `client/otp.rs` `OtpOutQueue`, `send_or_queue`, `on_delivery_ack` |
-| Turning the layer on, mutual consent (§16.1) | `client/otp.rs` `handle_otp_command`, `detect_or_adopt_existing`, `initiate_provisioning`, `confirm_generate`, `cancel_generate`, `apply_incoming_setup`, `accept_invite`, `reject_invite`, `on_key_setup_ack` |
+| Turning the layer on, mutual consent (§16.1) | `client/otp.rs` `handle_otp_command`, `detect_or_adopt_existing`, `initiate_provisioning`, `confirm_generate`, `cancel_generate`, `apply_incoming_setup`, `accept_invite`, `reject_invite`, `on_key_setup_ack`, `commit_pending_setup`, `discard_pending_setup`, `resend_pending_setups` |
 | Chunked key-setup transfer (§16.1) | `crypto/otp.rs` `OtpKeySetupChunk`, `OtpKeySetupReassembly`; `client/otp.rs` `send_key_setup_chunked`, `on_key_setup`, `OTP_SETUP_CHUNK_BYTES`; `client/session.rs` `SessionState.otp_incoming_setup` |
 | OTP session popups and status notice | `client/tui/ui.rs` `PendingOtpGenerate`, `PendingOtpInvite`, `UiAction::RequestOtpSession`/`ConfirmOtpGenerate`/`CancelOtpGenerate`/`AcceptOtpInvite`/`RejectOtpInvite` |
 | `OtpEnvelope`/`OtpFileOffer`/`OtpFileContentSeq`/`OtpVoiceOffer`/`OtpDeliveryAck` (§16) | `p2p_proto.rs` `P2pPayload` |

@@ -1498,8 +1498,24 @@ impl PeerLinkManager {
     /// the last shared channel/DM relationship with them. The one way a
     /// link stops being retried.
     pub fn forget(&mut self, peer: UserId) {
-        self.links.remove(&peer);
+        let dropped = self
+            .links
+            .remove(&peer)
+            .map(|link| link.pending.len())
+            .unwrap_or(0);
         self.addr_index.retain(|_, &mut p| p != peer);
+        // Content still queued against a forgotten link is gone: unlike
+        // `expire_pending`, which reports it after `PENDING_MAX_AGE`, there
+        // is no link left here to age anything out of. Silence made a peer
+        // going offline mid-send indistinguishable from a completed one -
+        // the sender simply waited forever on a confirmation that could
+        // never arrive.
+        if dropped > 0 {
+            let _ = self.events_tx.send(P2pEvent::LinkFailed {
+                peer,
+                reason: "they went offline before it could be delivered".to_string(),
+            });
+        }
     }
 }
 

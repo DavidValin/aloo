@@ -1,5 +1,6 @@
 use aloo::client::otp::{
-    apply_incoming_setup, detect_or_adopt_existing, format_now, initiate_provisioning,
+    apply_incoming_setup, commit_pending_setup, detect_or_adopt_existing, discard_pending_setup,
+    format_now, initiate_provisioning, own_pad_wins_glare, pending_setup_dir, read_pending_setup,
     OTP_SETUP_CHUNK_BYTES,
 };
 use aloo::client::p2p::PENDING_MAX;
@@ -132,13 +133,25 @@ async fn initiate_provisioning_and_apply_incoming_setup_leave_both_sides_usable(
     let expected_contact_name = contact_name_for(&own_fp, &peer_fp);
     assert_eq!(payload.contact_name, expected_contact_name);
 
-    // Alice's own half is already usable immediately after generation.
-    assert!(otp_cli::has_contact(&alice_cfg, &expected_contact_name).await.unwrap());
+    // Alice's own half is staged, deliberately *not* in her keychain yet -
+    // nothing is committed there until bob has actually accepted.
+    assert!(
+        !otp_cli::has_contact(&alice_cfg, &expected_contact_name).await.unwrap(),
+        "the initiating side must not hold a contact the peer has not accepted"
+    );
 
     let ack = apply_incoming_setup(&bob_cfg, &payload).await;
     assert!(ack.accepted, "bob's add-contact should succeed: {:?}", ack.reason);
     assert_eq!(ack.contact_name, expected_contact_name);
     assert!(otp_cli::has_contact(&bob_cfg, &expected_contact_name).await.unwrap());
+
+    // Bob's acceptance is what commits alice's half, leaving both usable.
+    assert!(commit_pending_setup(&alice_cfg, &expected_contact_name).await);
+    assert!(otp_cli::has_contact(&alice_cfg, &expected_contact_name).await.unwrap());
+    assert!(
+        !pending_setup_dir(&alice_cfg, &expected_contact_name).exists(),
+        "the staged pad must be removed once it has been adopted"
+    );
 }
 
 /// @requirement AC-138
@@ -182,41 +195,85 @@ async fn detect_or_adopt_existing_finds_a_contact_provisioned_out_of_band() {
 /// nothing. Without recovery, `client::otp::accept_invite`'s "already have
 /// a key" branch on bob's side - reproduced directly here via
 /// `otp_cli::has_contact` - fails, and a plain retry is a permanent wall:
-/// `add_contact` refuses to overwrite alice's still-present stale entry.
+/// An invitation that is never accepted - the peer went offline, refused,
+/// or simply never answered - must leave the initiating side exactly as it
+/// found it. Nothing is committed to the keychain until the peer accepts,
+/// so a later `/otp` between the same two people generates a fresh pad
+/// instead of meeting a stale half of an abandoned one.
+///
+/// This used to be a dead end: the initiating side adopted its own half
+/// immediately, and since the contact name is derived from both
+/// fingerprints (so every retry produces the identical name) and
+/// `add_contact` refuses to overwrite, every later attempt hit that stale
+/// entry instead of fixing anything.
 ///
 /// @requirement AC-142
 #[tokio::test]
-async fn asymmetric_provisioning_is_a_dead_end_without_recovery() {
+async fn an_invitation_that_is_never_accepted_leaves_no_stale_contact() {
     if !require_otp() {
         return;
     }
     let own_fp = fp(0x30);
     let peer_fp = fp(0x40);
-    let alice_cfg = config_at(temp_dir("asym-dead-end-alice"));
-    let bob_cfg = config_at(temp_dir("asym-dead-end-bob"));
+    let alice_cfg = config_at(temp_dir("never-accepted-alice"));
+    let bob_cfg = config_at(temp_dir("never-accepted-bob"));
     let contact_name = contact_name_for(&own_fp, &peer_fp);
 
-    let _alice_payload = initiate_provisioning(&alice_cfg, 1, &own_fp, &peer_fp)
+    let _abandoned = initiate_provisioning(&alice_cfg, 1, &own_fp, &peer_fp)
         .await
         .expect("alice's own provisioning should succeed");
-    assert!(otp_cli::has_contact(&alice_cfg, &contact_name).await.unwrap());
     assert!(
-        !otp_cli::has_contact(&bob_cfg, &contact_name).await.unwrap(),
-        "bob never received or applied a matching setup"
+        !otp_cli::has_contact(&alice_cfg, &contact_name).await.unwrap(),
+        "an unaccepted invitation must not put anything in the keychain"
     );
 
-    // bob's accept_invite, reproduced: no key material to apply (this would
-    // have arrived as a bare OtpSessionRequest), so it falls to checking
-    // his own keychain - which doesn't have it.
+    // Bob never received it, so neither side holds anything.
     assert!(!otp_cli::has_contact(&bob_cfg, &contact_name).await.unwrap());
 
-    // A same-name retry (either side generating fresh) hits alice's
-    // still-present stale entry rather than fixing anything.
-    let retry = initiate_provisioning(&alice_cfg, 1, &own_fp, &peer_fp).await;
-    assert!(
-        retry.is_none(),
-        "add_contact must refuse to overwrite alice's existing entry for this name"
+    // The invitation is abandoned, and a second attempt succeeds where it
+    // previously deadlocked - all the way to both sides being usable.
+    discard_pending_setup(&alice_cfg, &contact_name);
+    let retry = initiate_provisioning(&alice_cfg, 1, &own_fp, &peer_fp)
+        .await
+        .expect("a fresh attempt must succeed after an abandoned one");
+    let ack = apply_incoming_setup(&bob_cfg, &retry).await;
+    assert!(ack.accepted, "bob should accept the fresh pad: {:?}", ack.reason);
+    assert!(commit_pending_setup(&alice_cfg, &contact_name).await);
+    assert!(otp_cli::has_contact(&alice_cfg, &contact_name).await.unwrap());
+    assert!(otp_cli::has_contact(&bob_cfg, &contact_name).await.unwrap());
+}
+
+/// A pad still owed to a peer is re-sent from what was staged on disk, so a
+/// retry offers the *same* pad rather than a second one. Two different pads
+/// under one contact name have no integrity check to tell them apart, and
+/// would decode to silent garbage.
+///
+/// @requirement AC-142
+#[tokio::test]
+async fn a_pending_setup_is_re_readable_for_retries_and_identical_each_time() {
+    if !require_otp() {
+        return;
+    }
+    let own_fp = fp(0x31);
+    let peer_fp = fp(0x41);
+    let alice_cfg = config_at(temp_dir("retry-readback-alice"));
+    let contact_name = contact_name_for(&own_fp, &peer_fp);
+
+    let first = initiate_provisioning(&alice_cfg, 1, &own_fp, &peer_fp)
+        .await
+        .expect("provisioning should succeed");
+    let again = read_pending_setup(&alice_cfg, &contact_name, 1)
+        .expect("a staged pad must be readable back for a retry");
+    assert_eq!(
+        (&again.peer_encryption_key, &again.peer_decryption_key),
+        (&first.peer_encryption_key, &first.peer_decryption_key),
+        "a retry must offer byte-identical key material, never a fresh pad"
     );
+
+    // Once discarded there is nothing to retry, which is what stops a
+    // finished invitation from being re-offered forever.
+    discard_pending_setup(&alice_cfg, &contact_name);
+    assert!(read_pending_setup(&alice_cfg, &contact_name, 1).is_none());
 }
 
 /// The actual recovery `client::otp::on_key_setup_ack` performs on
@@ -236,9 +293,14 @@ async fn asymmetric_provisioning_recovers_once_the_stale_contact_is_removed() {
     let bob_cfg = config_at(temp_dir("asym-recover-bob"));
     let contact_name = contact_name_for(&own_fp, &peer_fp);
 
+    // A stale entry can still arise even though provisioning no longer
+    // commits early: this is a contact that genuinely completed once (or was
+    // provisioned out of band and adopted by `detect_or_adopt_existing`) and
+    // whose counterpart has since lost their half.
     let _stale_payload = initiate_provisioning(&alice_cfg, 1, &own_fp, &peer_fp)
         .await
         .expect("alice's own (stale) provisioning should succeed");
+    assert!(commit_pending_setup(&alice_cfg, &contact_name).await);
     assert!(otp_cli::has_contact(&alice_cfg, &contact_name).await.unwrap());
 
     let mut alice_store = OtpStore::new_empty(temp_dir("asym-recover-store").join("store"));
@@ -259,7 +321,9 @@ async fn asymmetric_provisioning_recovers_once_the_stale_contact_is_removed() {
         .expect("provisioning should succeed once the stale entry is gone");
     let ack = apply_incoming_setup(&bob_cfg, &fresh_payload).await;
     assert!(ack.accepted, "bob's add-contact should now succeed: {:?}", ack.reason);
+    assert!(commit_pending_setup(&alice_cfg, &contact_name).await);
     assert!(otp_cli::has_contact(&bob_cfg, &contact_name).await.unwrap());
+    assert!(otp_cli::has_contact(&alice_cfg, &contact_name).await.unwrap());
 }
 
 /// @requirement TB-184
@@ -460,4 +524,112 @@ fn reassembly_cannot_start_from_anything_but_the_first_chunk() {
         !acc.accept(&chunks[1]),
         "a mid-pad chunk with nothing before it must be refused, not treated as a pad start"
     );
+}
+
+/// Both users press `/otp` before either has answered the other. The contact
+/// name is derived from the pair, so the two generated pads compete for one
+/// name and only one may ever be adopted - a pair that adopted one each
+/// would hold halves of two different pads, which nothing can tell apart and
+/// which would encrypt to silent garbage.
+///
+/// The tie is broken the way simultaneous link opens already are: the
+/// smaller fingerprint's pad wins, computed identically on both sides from
+/// values they already have.
+///
+/// @requirement AC-142
+#[test]
+fn simultaneous_invitations_are_resolved_the_same_way_by_both_sides() {
+    let low = fp(0x70);
+    let high = fp(0x71);
+    assert!(
+        own_pad_wins_glare(&low, &high),
+        "the smaller fingerprint's pad wins"
+    );
+    assert!(
+        !own_pad_wins_glare(&high, &low),
+        "and the larger one's loses - so exactly one pad survives"
+    );
+    // The decisive property: the two sides never both believe they won, and
+    // never both believe they lost.
+    assert_ne!(
+        own_pad_wins_glare(&low, &high),
+        own_pad_wins_glare(&high, &low)
+    );
+}
+
+/// The losing side drops its own staged pad, so only the winner's is ever
+/// adopted and both keychains end up holding halves of the *same* pad.
+///
+/// @requirement AC-142
+#[tokio::test]
+async fn a_glare_leaves_both_sides_holding_halves_of_one_pad() {
+    if !require_otp() {
+        return;
+    }
+    let alice_fp = fp(0x70);
+    let bob_fp = fp(0x71);
+    let alice_cfg = config_at(temp_dir("glare-alice"));
+    let bob_cfg = config_at(temp_dir("glare-bob"));
+    let contact_name = contact_name_for(&alice_fp, &bob_fp);
+
+    // Both generate before either has answered.
+    let pad_a = initiate_provisioning(&alice_cfg, 1, &alice_fp, &bob_fp)
+        .await
+        .expect("alice's pad");
+    let _pad_b = initiate_provisioning(&bob_cfg, 1, &bob_fp, &alice_fp)
+        .await
+        .expect("bob's pad");
+
+    // alice's fingerprint is the smaller one, so her pad wins: bob concedes,
+    // dropping his own staged pad rather than offering it.
+    assert!(own_pad_wins_glare(&alice_fp, &bob_fp));
+    discard_pending_setup(&bob_cfg, &contact_name);
+    assert!(
+        read_pending_setup(&bob_cfg, &contact_name, 1).is_none(),
+        "the conceding side must not keep a pad it can never have adopted"
+    );
+
+    // bob accepts alice's pad, and alice commits her own half on his ack.
+    let ack = apply_incoming_setup(&bob_cfg, &pad_a).await;
+    assert!(ack.accepted, "bob should adopt the winning pad: {:?}", ack.reason);
+    assert!(commit_pending_setup(&alice_cfg, &contact_name).await);
+
+    assert!(otp_cli::has_contact(&alice_cfg, &contact_name).await.unwrap());
+    assert!(otp_cli::has_contact(&bob_cfg, &contact_name).await.unwrap());
+}
+
+/// Accepting a peer's invitation retires any pad of this side's own still
+/// staged for the same contact. Otherwise it would be re-offered later and
+/// its commit would collide with the pad just adopted - the sequential form
+/// of the same race.
+///
+/// @requirement AC-142
+#[tokio::test]
+async fn accepting_a_peers_pad_retires_this_sides_own_staged_one() {
+    if !require_otp() {
+        return;
+    }
+    let alice_fp = fp(0x72);
+    let bob_fp = fp(0x73);
+    let alice_cfg = config_at(temp_dir("retire-alice"));
+    let bob_cfg = config_at(temp_dir("retire-bob"));
+    let contact_name = contact_name_for(&alice_fp, &bob_fp);
+
+    let _mine = initiate_provisioning(&alice_cfg, 1, &alice_fp, &bob_fp)
+        .await
+        .expect("alice's own pad");
+    let theirs = initiate_provisioning(&bob_cfg, 1, &bob_fp, &alice_fp)
+        .await
+        .expect("bob's pad");
+
+    // alice adopts bob's pad; her own staged one is retired at that moment.
+    let ack = apply_incoming_setup(&alice_cfg, &theirs).await;
+    assert!(ack.accepted, "{:?}", ack.reason);
+    discard_pending_setup(&alice_cfg, &contact_name);
+
+    assert!(
+        read_pending_setup(&alice_cfg, &contact_name, 1).is_none(),
+        "a pad that can never be adopted must not survive to be re-offered"
+    );
+    assert!(otp_cli::has_contact(&alice_cfg, &contact_name).await.unwrap());
 }

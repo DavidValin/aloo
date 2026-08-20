@@ -76,6 +76,18 @@ pub struct OtpContactState {
     /// `None` means the next send may proceed (assuming `otp`'s own
     /// `enc_ack_outstanding` agrees - see the module doc).
     pub pending_unacked_out_seq: Option<u64>,
+    /// `Some(size_mb)` while a pad this side generated is still waiting for
+    /// the peer to accept it - the provisioning counterpart of
+    /// `pending_unacked_out_seq`, and for the same reason: an invitation
+    /// whose delivery was never confirmed must be retried rather than
+    /// regenerated, since two different pads under one contact name have no
+    /// integrity check to tell them apart and would decode to silent
+    /// garbage. The pad itself lives on disk (`client::otp`'s pending
+    /// staging directory), not here; this only records that it is owed. Kept
+    /// keyed by contact name like everything else in this file, so a peer who
+    /// reconnects under a fresh `UserId` - or an app restart - resumes rather
+    /// than stranding a half-provisioned pair.
+    pub pending_setup_size_mb: Option<u32>,
     /// What that outstanding send actually was, alongside
     /// `pending_unacked_out_seq` - `Some` exactly when that is, cleared the
     /// same way (`record_acked`). `client::otp::recover_and_resend` reads
@@ -163,6 +175,34 @@ impl OtpStore {
             .entry(contact_name.to_string())
             .or_default()
             .provisioned = true;
+    }
+
+    /// Records that a pad of `size_mb` per key has been generated for
+    /// `contact_name` and is now owed to the peer until they accept it.
+    pub fn mark_setup_pending(&mut self, contact_name: &str, size_mb: u32) {
+        self.entries
+            .entry(contact_name.to_string())
+            .or_default()
+            .pending_setup_size_mb = Some(size_mb);
+    }
+
+    /// Clears that debt - the peer accepted, refused, or the user gave up.
+    /// Returns whether anything was actually owed, so a caller can tell a
+    /// real answer to an outstanding invitation apart from a duplicate or
+    /// stray one it should ignore.
+    pub fn clear_pending_setup(&mut self, contact_name: &str) -> bool {
+        match self.entries.get_mut(contact_name) {
+            Some(state) => state.pending_setup_size_mb.take().is_some(),
+            None => false,
+        }
+    }
+
+    /// Every contact with a pad still owed to its peer, for the retry pass
+    /// that runs whenever a direct link becomes reachable again.
+    pub fn pending_setups(&self) -> impl Iterator<Item = (&str, u32)> {
+        self.entries
+            .iter()
+            .filter_map(|(name, state)| Some((name.as_str(), state.pending_setup_size_mb?)))
     }
 
     /// Drops all local bookkeeping for `contact_name` - used only alongside
@@ -257,6 +297,10 @@ impl OtpStore {
             if let Some(content) = &state.pending_content {
                 out.push_str(&encode_pending_content(content));
             }
+            out.push('\t');
+            if let Some(size_mb) = state.pending_setup_size_mb {
+                out.push_str(&size_mb.to_string());
+            }
             out.push('\n');
         }
         fs::write(&self.path, out)
@@ -341,6 +385,9 @@ fn parse_line(line: &str) -> Option<(String, OtpContactState)> {
     let next_out_seq = parts.next()?.parse().ok()?;
     let next_expected_in_seq = parts.next()?.parse().ok()?;
     let pending_content = parts.next().and_then(decode_pending_content);
+    // Absent entirely in a file written before this field existed, which
+    // parses as "no setup owed" - the correct reading of an older store.
+    let pending_setup_size_mb = parts.next().and_then(|s| s.parse().ok());
     Some((
         name,
         OtpContactState {
@@ -349,6 +396,7 @@ fn parse_line(line: &str) -> Option<(String, OtpContactState)> {
             pending_content,
             next_out_seq,
             next_expected_in_seq,
+            pending_setup_size_mb,
         },
     ))
 }

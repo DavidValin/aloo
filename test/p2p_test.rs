@@ -1510,6 +1510,123 @@ fn text_payload(body: &str) -> P2pPayload {
     }
 }
 
+/// A peer going offline discards their link outright (TB-178), and with it
+/// anything still queued against it. That silence made a peer who vanished
+/// mid-send indistinguishable from one who received everything: the sender
+/// sat on "waiting for their confirmation" forever, because the only thing
+/// that reports undelivered content - `expire_pending` - needs a link that
+/// still exists to age it out of.
+///
+/// @requirement AC-142
+#[tokio::test]
+async fn forgetting_a_link_reports_content_that_was_still_waiting_on_it() {
+    let server_addr = spawn_test_server().await;
+    let (mut alice, mut events, mut a, _b, bob_id) = one_manager(server_addr).await;
+
+    alice.ensure_link(&mut a, bob_id).await;
+    alice.send_reliable_or_queue(bob_id, text_payload("an invitation in flight"));
+    assert_eq!(
+        alice.pending_count(bob_id),
+        1,
+        "precondition: the send is queued against a link that never came up"
+    );
+
+    alice.forget(bob_id);
+
+    let failed = std::iter::from_fn(|| events.try_recv().ok()).any(|e| {
+        matches!(
+            e,
+            P2pEvent::LinkFailed { peer, .. } if peer == bob_id
+        )
+    });
+    assert!(
+        failed,
+        "content dropped with a forgotten link must be reported, not silently discarded"
+    );
+}
+
+/// The counterpart: forgetting a link with nothing waiting on it is routine
+/// housekeeping (every `UserOffline` does it) and must stay silent, or every
+/// disconnect would raise a failure for content that never existed.
+///
+/// @requirement AC-142
+#[tokio::test]
+async fn forgetting_an_empty_link_reports_nothing() {
+    let server_addr = spawn_test_server().await;
+    let (mut alice, mut events, mut a, _b, bob_id) = one_manager(server_addr).await;
+
+    alice.ensure_link(&mut a, bob_id).await;
+    while events.try_recv().is_ok() {}
+    alice.forget(bob_id);
+
+    let failed = std::iter::from_fn(|| events.try_recv().ok())
+        .any(|e| matches!(e, P2pEvent::LinkFailed { .. }));
+    assert!(!failed, "an empty link going away is not a delivery failure");
+}
+
+/// Provisioning must not take the link hostage. A pad is handed over as one
+/// large burst, and ordinary conversation - which is not OTP-encrypted and
+/// has nothing to do with the invitation - has to keep flowing while that
+/// burst is in progress, rather than being lost or blocked behind it
+/// indefinitely.
+///
+/// @requirement AC-142
+#[tokio::test]
+async fn ordinary_messages_still_arrive_while_a_pad_is_being_transferred() {
+    let server_addr = spawn_test_server().await;
+    let mut pair = Pair::connect(server_addr).await;
+    pair.alice.ensure_link(&mut pair.a_ctl, pair.bob_id).await;
+    pair.punch().await;
+
+    // A pad-sized burst goes out, and a plain chat message is sent into the
+    // middle of it - the ordering a user typing during provisioning creates.
+    for i in 0..40 {
+        pair.alice
+            .send_reliable_or_queue(pair.bob_id, otp_sized_payload(i));
+    }
+    pair.alice
+        .send_reliable_or_queue(pair.bob_id, text_payload("hello while provisioning"));
+    for i in 40..80 {
+        pair.alice
+            .send_reliable_or_queue(pair.bob_id, otp_sized_payload(i));
+    }
+
+    let mut texts: Vec<String> = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let mut delivered = 0usize;
+    loop {
+        pair.pump(Duration::from_millis(50), |_, _| false).await;
+        let mut rest = Vec::new();
+        for event in pair.b_seen.drain(..) {
+            match event {
+                P2pEvent::Message { envelope, .. } => {
+                    delivered += 1;
+                    let block = envelope.blocks.first().cloned().unwrap_or_default();
+                    let body = String::from_utf8_lossy(&block).into_owned();
+                    if !body.starts_with("chunk-") {
+                        texts.push(body);
+                    }
+                }
+                other => rest.push(other),
+            }
+        }
+        pair.b_seen = rest;
+        if delivered >= 81 || tokio::time::Instant::now() >= deadline {
+            break;
+        }
+    }
+
+    assert_eq!(
+        texts,
+        vec!["hello while provisioning".to_string()],
+        "a plain message sent during provisioning must still reach the peer"
+    );
+    assert_eq!(
+        delivered, 81,
+        "and it must not cost the pad any of its chunks either"
+    );
+}
+
 /// Regression, and the one that reproduces the OTP failure end to end: a
 /// pad provisioning hands the link hundreds of chunked envelopes in a single
 /// pass, far more than the ARQ send window. Every one of them must arrive,

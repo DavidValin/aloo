@@ -2945,7 +2945,11 @@ over pq_hybrid, or arrange it yourself and place the keys where the local
 keychain expects them") before anything is generated or sent. Confirming
 then asks for a size (MB per key, 1 to 900,000 - re-prompting on anything
 outside that range rather than guessing), so a fresh pad is never
-generated at some fixed size the user didn't choose. That size travels
+generated at some fixed size the user didn't choose. A size larger than a
+direct link can deliver in one burst is refused *before* generation rather
+than after: generation reads that many megabytes of true randomness per
+key synchronously, so discovering the limit afterwards would mean spending
+all of that time to produce a pad that is then rejected. That size travels
 with the setup message and is shown to the deciding side in its own
 invite popup before it ever has to accept or reject - a much larger pad
 takes longer to arrive and claims more local disk/keychain space than a
@@ -2969,6 +2973,42 @@ initiator alongside its own half - never derived, negotiated, or
 influenced by anything the wire has carried before, since a one-time pad's
 only security property comes from being independent, true randomness.
 
+The initiating side writes nothing to its own keychain when it generates a
+pad. Both halves - its own and the peer's - are staged on disk, and only
+the peer's genuine acceptance moves its half into the keychain. This is
+what stops a failed invitation from poisoning the next one: the contact
+name is derived from both fingerprints, so every attempt between the same
+two people produces the identical name, and `otp --add-contact` refuses to
+overwrite. An invitation that is refused, unanswered, or interrupted by
+the peer going offline therefore leaves nothing behind, and a later `/otp`
+from *either* side simply generates a fresh pad.
+
+Because the contact name is derived from the pair, two users who both press
+`/otp` before either has answered generate two pads competing for one name,
+and only one may ever be adopted - a pair that adopted one each would hold
+halves of two different pads, which nothing can tell apart and which would
+encrypt to silent garbage. The tie is broken exactly as a simultaneous link
+open is (§7.1): the numerically smaller fingerprint's pad wins. Both sides
+compare the same two values and reach the same answer with no round trip to
+negotiate over, since each has already sent its pad by the time it learns of
+the other's. The conceding side drops its own staged pad and answers the
+winner's invitation normally; the winning side refuses the pad it receives
+with the reason "we both proposed at once - keeping the other pad", which is
+what tells the loser to drop it. Accepting any peer's pad likewise retires
+whatever this side had staged for that contact, since only one pad can live
+under the name.
+
+A pad that has been generated but not yet accepted is *owed* to the peer,
+recorded against the contact name (not the connection, which does not
+survive a reconnect) so it outlives both a fresh `UserId` and an app
+restart. Whenever a direct link to that peer becomes reachable again, the
+staged bytes are re-offered unchanged - never regenerated, since two
+different pads under one contact name have no integrity check to tell them
+apart and would decode to silent garbage. If the peer did receive the pad
+and only their acknowledgement was lost, the re-delivery arrives at a side
+that already holds the contact, and is answered with a fresh
+acknowledgement rather than a second invite popup.
+
 The receiving side never acts on either proposal automatically: it is
 shown who is asking and must explicitly accept or reject before anything
 is written to its keychain or acknowledged. Accepting `OtpKeySetup` adopts
@@ -2990,7 +3030,10 @@ belief can be wrong - the initiator's keychain genuinely has an entry
 while the peer's does not (an earlier attempt the peer never completed
 being the ordinary way this happens). The peer's ack reports this exact
 case as `accepted: false` with the reason "no matching key found on my
-end", and *this* one the initiator does act on: its own stale keychain
+end" - given whether the user accepted or rejected, since which button was
+pressed says nothing about whether the key exists, and "no" is the natural
+answer to an invitation you have no key for. *This* reason the initiator
+does act on: its own stale keychain
 entry is removed (`otp --remove-contact`) and forgotten locally, and the
 same generate-and-share confirmation a first-ever `/otp` would have shown
 is offered again - without it, a bare retry would keep proposing the same
