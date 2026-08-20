@@ -48,11 +48,11 @@ async fn bind_peer_link(w: &mut AlooWorld, who: &str) {
     let server_addr = w.addr.expect("no server running");
     let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel::<P2pEvent>();
     let (peer_link, socket) =
-        PeerLinkManager::bind("127.0.0.1:0".parse().unwrap(), server_addr, events_tx)
+        PeerLinkManager::bind("127.0.0.1:0".parse().unwrap(), Some(server_addr), events_tx)
             .await
             .expect("failed to bind direct-link socket");
     let (raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel();
-    aloo::client::p2p::spawn_receive_loop(socket, server_addr, raw_tx);
+    aloo::client::p2p::spawn_receive_loop(socket, Some(server_addr), raw_tx);
     let client = w.client_mut(who);
     client.peer_link = Some(peer_link);
     client.p2p_raw_rx = Some(raw_rx);

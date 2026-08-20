@@ -108,6 +108,12 @@ struct Cli {
     #[arg(long)]
     daemon_stop: bool,
 
+    /// Run with no server at all: reachable only by the direct_punch_to
+    /// peers in ~/.aloo/settings. Anything needing a server is refused,
+    /// by name, when asked for.
+    #[arg(long)]
+    no_server: bool,
+
     /// Start a fresh session even if a daemon is running, instead of
     /// attaching to it.
     #[arg(long)]
@@ -276,6 +282,7 @@ fn resolve_daemon_config(cli: &Cli) -> Result<aloo::client::daemon::DaemonConfig
         my_key_prefix: cli.my_key.clone(),
         channels: cli.channels.clone(),
         focus: cli.focus.clone(),
+        no_server: cli.no_server,
         otp: cli.otp,
     };
     aloo::client::daemon::DaemonConfig::resolve(&flags, &settings, &cache)

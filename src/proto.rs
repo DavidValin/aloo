@@ -306,6 +306,15 @@ pub enum Content {
     /// before trusting the plaintext, same as any other receiver-side
     /// sanity check).
     DeviceIdAnnounce,
+    /// Carries the sender's currently-joined channel names, bincode
+    /// encoded - how a peer reached with no server involved
+    /// (`docs/PROTOCOL.md` §7.1.5) is placed in the channels both sides
+    /// share, since no server is tracking membership for either of them.
+    /// Sealed and signed like every other content type, which is what
+    /// makes it an identity claim rather than an assertion: a nickname on
+    /// an unauthenticated punch datagram names nobody, while an envelope
+    /// that opens under a pinned key proves who sent it.
+    ChannelPresence,
     /// Carries a bincode-encoded `crypto::otp::OtpEndSessionPayload`: either
     /// participant's `/endotp` unilaterally tearing the session down
     /// (`client::otp::handle_end_otp_command`). Sent over an ordinary

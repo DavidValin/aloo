@@ -25,6 +25,7 @@ use aloo::client::rekey::RemoteKeys;
 use aloo::server::{Outgoing, Registry};
 use aloo::client::tui::ui::{UiAction, UiState};
 use aloo::client::tui::ui_connect_popup::ConnectPopupState;
+use aloo::settings::Settings;
 
 /// Modulus size for the scenario key pool below.
 ///
@@ -172,6 +173,30 @@ pub struct AlooWorld {
     pub replacement_bundle: Option<aloo::crypto::pq::PqPublicBundle>,
     /// A card being exported, shared and imported.
     pub identity_card: Option<aloo::crypto::pq::IdentityCard>,
+
+    // -- serverless direct punch (US-037) ------------------------------
+    /// The settings file a scenario just loaded.
+    pub direct_settings: Option<Settings>,
+    /// The stand-in rendezvous socket every direct-punch client binds
+    /// against, spawned once per scenario that needs one.
+    pub direct_rendezvous: Option<SocketAddr>,
+    /// Which slot of the grid the scenario has advanced to.
+    pub direct_slot: u64,
+    /// The monotonic clock the scenario is driving the scheduler with,
+    /// so a 30-second window can elapse without waiting for it.
+    pub direct_now: Option<std::time::Instant>,
+    /// The address a link was established on, for a scenario asserting a
+    /// later slot did not move it.
+    pub direct_addr: Option<SocketAddr>,
+    /// What a send would have put on the control connection.
+    pub direct_sent_to_server: Vec<aloo::proto::ClientMessage>,
+    /// The channels this client has joined, for a membership-reconciliation
+    /// scenario.
+    pub direct_our_channels: Vec<String>,
+    /// Where the peer is currently listed.
+    pub direct_current_channels: Vec<String>,
+    /// The last reconciliation's (shared, joining, leaving).
+    pub direct_reconciled: Option<(Vec<String>, Vec<String>, Vec<String>)>,
 
     // -- control channel -----------------------------------------------
     pub control_offer: Option<aloo::control::ControlOffer>,

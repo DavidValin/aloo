@@ -124,18 +124,18 @@ async fn direct_link_handshake_and_reliable_message_end_to_end() {
     let (a_events_tx, mut a_events_rx) = tokio::sync::mpsc::unbounded_channel::<P2pEvent>();
     let (b_events_tx, mut b_events_rx) = tokio::sync::mpsc::unbounded_channel::<P2pEvent>();
     let (mut alice, a_socket) =
-        PeerLinkManager::bind("127.0.0.1:0".parse().unwrap(), server_addr, a_events_tx)
+        PeerLinkManager::bind("127.0.0.1:0".parse().unwrap(), Some(server_addr), a_events_tx)
             .await
             .unwrap();
     let (mut bob, b_socket) =
-        PeerLinkManager::bind("127.0.0.1:0".parse().unwrap(), server_addr, b_events_tx)
+        PeerLinkManager::bind("127.0.0.1:0".parse().unwrap(), Some(server_addr), b_events_tx)
             .await
             .unwrap();
 
     let (a_raw_tx, mut a_raw_rx) = tokio::sync::mpsc::unbounded_channel();
     let (b_raw_tx, mut b_raw_rx) = tokio::sync::mpsc::unbounded_channel();
-    aloo::client::p2p::spawn_receive_loop(a_socket, server_addr, a_raw_tx);
-    aloo::client::p2p::spawn_receive_loop(b_socket, server_addr, b_raw_tx);
+    aloo::client::p2p::spawn_receive_loop(a_socket, Some(server_addr), a_raw_tx);
+    aloo::client::p2p::spawn_receive_loop(b_socket, Some(server_addr), b_raw_tx);
 
     // alice proposes a link to bob - relayed by the server as PeerCandidates.
     alice.ensure_link(&mut a, bob_id).await;
@@ -254,18 +254,18 @@ async fn device_id_announce_travels_encrypted_and_decrypts_on_arrival() {
     let (a_events_tx, _a_events_rx) = tokio::sync::mpsc::unbounded_channel::<P2pEvent>();
     let (b_events_tx, mut b_events_rx) = tokio::sync::mpsc::unbounded_channel::<P2pEvent>();
     let (mut alice, a_socket) =
-        PeerLinkManager::bind("127.0.0.1:0".parse().unwrap(), server_addr, a_events_tx)
+        PeerLinkManager::bind("127.0.0.1:0".parse().unwrap(), Some(server_addr), a_events_tx)
             .await
             .unwrap();
     let (mut bob, b_socket) =
-        PeerLinkManager::bind("127.0.0.1:0".parse().unwrap(), server_addr, b_events_tx)
+        PeerLinkManager::bind("127.0.0.1:0".parse().unwrap(), Some(server_addr), b_events_tx)
             .await
             .unwrap();
 
     let (a_raw_tx, mut a_raw_rx) = tokio::sync::mpsc::unbounded_channel();
     let (b_raw_tx, mut b_raw_rx) = tokio::sync::mpsc::unbounded_channel();
-    aloo::client::p2p::spawn_receive_loop(a_socket, server_addr, a_raw_tx);
-    aloo::client::p2p::spawn_receive_loop(b_socket, server_addr, b_raw_tx);
+    aloo::client::p2p::spawn_receive_loop(a_socket, Some(server_addr), a_raw_tx);
+    aloo::client::p2p::spawn_receive_loop(b_socket, Some(server_addr), b_raw_tx);
 
     alice.ensure_link(&mut a, bob_id).await;
     let ServerMessage::PeerCandidates {
@@ -387,7 +387,7 @@ async fn undeliverable_queued_content_is_reported_once_it_ages_out() {
 
     let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel::<P2pEvent>();
     let (mut alice, _socket) =
-        PeerLinkManager::bind("127.0.0.1:0".parse().unwrap(), server_addr, events_tx)
+        PeerLinkManager::bind("127.0.0.1:0".parse().unwrap(), Some(server_addr), events_tx)
             .await
             .unwrap();
     alice.ensure_link(&mut a, bob_id).await;
@@ -445,7 +445,7 @@ async fn punch_timeout_with_nothing_pending_fails_silently() {
 
     let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel::<P2pEvent>();
     let (mut alice, _socket) =
-        PeerLinkManager::bind("127.0.0.1:0".parse().unwrap(), server_addr, events_tx)
+        PeerLinkManager::bind("127.0.0.1:0".parse().unwrap(), Some(server_addr), events_tx)
             .await
             .unwrap();
     // A bare pre-warm - nothing ever queued against this link.
@@ -488,7 +488,7 @@ async fn one_manager(
 
     let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel::<P2pEvent>();
     let (alice, _socket) =
-        PeerLinkManager::bind("127.0.0.1:0".parse().unwrap(), server_addr, events_tx)
+        PeerLinkManager::bind("127.0.0.1:0".parse().unwrap(), Some(server_addr), events_tx)
             .await
             .unwrap();
     (alice, events_rx, a, b, bob_id)
@@ -1273,18 +1273,18 @@ impl Pair {
         let (a_events_tx, a_events) = tokio::sync::mpsc::unbounded_channel();
         let (b_events_tx, b_events) = tokio::sync::mpsc::unbounded_channel();
         let (alice, a_socket) =
-            PeerLinkManager::bind("127.0.0.1:0".parse().unwrap(), server_addr, a_events_tx)
+            PeerLinkManager::bind("127.0.0.1:0".parse().unwrap(), Some(server_addr), a_events_tx)
                 .await
                 .unwrap();
         let (bob, b_socket) =
-            PeerLinkManager::bind("127.0.0.1:0".parse().unwrap(), server_addr, b_events_tx)
+            PeerLinkManager::bind("127.0.0.1:0".parse().unwrap(), Some(server_addr), b_events_tx)
                 .await
                 .unwrap();
 
         let (a_raw_tx, a_raw) = tokio::sync::mpsc::unbounded_channel();
         let (b_raw_tx, b_raw) = tokio::sync::mpsc::unbounded_channel();
-        aloo::client::p2p::spawn_receive_loop(a_socket, server_addr, a_raw_tx);
-        aloo::client::p2p::spawn_receive_loop(b_socket, server_addr, b_raw_tx);
+        aloo::client::p2p::spawn_receive_loop(a_socket, Some(server_addr), a_raw_tx);
+        aloo::client::p2p::spawn_receive_loop(b_socket, Some(server_addr), b_raw_tx);
 
         Self {
             alice,
@@ -1887,11 +1887,11 @@ async fn a_peer_that_reconnects_under_a_new_id_is_punched_from_scratch() {
     );
     let (b_events_tx, b_events) = tokio::sync::mpsc::unbounded_channel();
     let (bob, b_socket) =
-        PeerLinkManager::bind("127.0.0.1:0".parse().unwrap(), server_addr, b_events_tx)
+        PeerLinkManager::bind("127.0.0.1:0".parse().unwrap(), Some(server_addr), b_events_tx)
             .await
             .unwrap();
     let (b_raw_tx, b_raw) = tokio::sync::mpsc::unbounded_channel();
-    aloo::client::p2p::spawn_receive_loop(b_socket, server_addr, b_raw_tx);
+    aloo::client::p2p::spawn_receive_loop(b_socket, Some(server_addr), b_raw_tx);
     pair.bob = bob;
     pair.b_ctl = b_ctl;
     pair.b_events = b_events;

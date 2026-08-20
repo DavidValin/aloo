@@ -1,5 +1,6 @@
 use aloo::settings::{
-    DEFAULT_BIND, DEFAULT_GLOBAL_PTT_SHORTCUT, DEFAULT_PORT, ServerAuth, Settings, default_path,
+    DEFAULT_BIND, DEFAULT_DIRECT_PUNCH_PORT, DEFAULT_GLOBAL_PTT_SHORTCUT, DEFAULT_PORT,
+    DirectPunchTarget, PunchFrequency, ServerAuth, Settings, default_path,
 };
 use std::path::PathBuf;
 
@@ -334,4 +335,180 @@ fn update_muted_voice_removes_an_entry_too() {
     assert!(stored.contains("bob"));
 
     std::fs::remove_file(&path).ok();
+}
+
+// ---- Serverless direct punch (docs/PROTOCOL.md 7.1.5) -------------------
+
+/// @requirement AC-212
+#[test]
+fn direct_punch_is_off_and_targetless_unless_the_file_turns_it_on() {
+    let settings = Settings::load_or_create(&temp_settings_path()).unwrap();
+    assert!(!settings.direct_punch);
+    assert!(settings.direct_punch_to.is_empty());
+    assert_eq!(settings.direct_punch_port, DEFAULT_DIRECT_PUNCH_PORT);
+}
+
+/// @requirement AC-212
+#[test]
+fn direct_punch_on_reads_one_target_per_line() {
+    let path = temp_settings_path();
+    std::fs::write(
+        &path,
+        "direct_punch=on\n\
+         direct_punch_to=bob,bobpublic.com,1min\n\
+         direct_punch_to=marco,marcohost.com,1h\n",
+    )
+    .unwrap();
+    let settings = Settings::load_or_create(&path).unwrap();
+    assert!(settings.direct_punch);
+    assert!(settings.direct_punch_invalid.is_empty());
+    let names: Vec<&str> = settings
+        .direct_punch_to
+        .iter()
+        .map(|t| t.nickname.as_str())
+        .collect();
+    assert_eq!(names, vec!["bob", "marco"]);
+    assert_eq!(settings.direct_punch_to[0].host, "bobpublic.com");
+    assert_eq!(settings.direct_punch_to[0].frequency.minutes(), 1);
+    assert_eq!(settings.direct_punch_to[1].frequency.minutes(), 60);
+    // No port in the line means the well-known one both sides assume.
+    assert_eq!(settings.direct_punch_to[0].port, DEFAULT_DIRECT_PUNCH_PORT);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// @requirement AC-212
+#[test]
+fn a_target_host_may_be_ipv4_ipv6_or_a_name_and_may_carry_its_own_port() {
+    for (value, host, port) in [
+        ("bob,203.0.113.9,5m", "203.0.113.9", DEFAULT_DIRECT_PUNCH_PORT),
+        ("bob,203.0.113.9:9000,5m", "203.0.113.9", 9000),
+        ("bob,2001:db8::1,5m", "2001:db8::1", DEFAULT_DIRECT_PUNCH_PORT),
+        ("bob,[2001:db8::1]:9000,5m", "2001:db8::1", 9000),
+        ("bob,bob-public.example.com,5m", "bob-public.example.com", DEFAULT_DIRECT_PUNCH_PORT),
+        ("bob,bobpublic.com:9000,5m", "bobpublic.com", 9000),
+    ] {
+        let target = DirectPunchTarget::parse(value).unwrap_or_else(|e| panic!("{value:?}: {e}"));
+        assert_eq!(target.host, host, "{value:?}");
+        assert_eq!(target.port, port, "{value:?}");
+    }
+}
+
+/// @requirement AC-212
+#[test]
+fn every_documented_frequency_parses_and_nothing_else_does() {
+    for minutes in aloo::settings::PUNCH_FREQUENCIES {
+        let spelling = if minutes == 60 {
+            "1h".to_string()
+        } else {
+            format!("{minutes}m")
+        };
+        assert_eq!(
+            PunchFrequency::parse(&spelling).unwrap().minutes(),
+            minutes,
+            "{spelling}"
+        );
+    }
+    // `1min` is the same thing spelled the way the settings file's own
+    // example spells it.
+    assert_eq!(PunchFrequency::parse("1min").unwrap().minutes(), 1);
+    for bad in ["", "2m", "0m", "90m", "2h", "1s", "m", "1", "sometimes"] {
+        assert!(
+            PunchFrequency::parse(bad).is_err(),
+            "{bad:?} should not be an accepted frequency"
+        );
+    }
+}
+
+/// @requirement AC-213
+#[test]
+fn a_malformed_target_is_reported_rather_than_silently_dropped() {
+    let path = temp_settings_path();
+    std::fs::write(
+        &path,
+        "direct_punch=on\n\
+         direct_punch_to=bob,bobpublic.com,1m\n\
+         direct_punch_to=carol,carolhost.com,3m\n\
+         direct_punch_to=dave,not a host,1h\n\
+         direct_punch_to=justanickname\n\
+         direct_punch_to=,nohost.com,1h\n",
+    )
+    .unwrap();
+    let settings = Settings::load_or_create(&path).unwrap();
+    // The good line still loads - one bad line never costs the others.
+    assert_eq!(settings.direct_punch_to.len(), 1);
+    assert_eq!(settings.direct_punch_to[0].nickname, "bob");
+    let bad: Vec<&str> = settings
+        .direct_punch_invalid
+        .iter()
+        .map(|(line, _)| line.as_str())
+        .collect();
+    assert_eq!(
+        bad,
+        vec![
+            "carol,carolhost.com,3m",
+            "dave,not a host,1h",
+            "justanickname",
+            ",nohost.com,1h",
+        ]
+    );
+    // Each one says why, so a typo is fixable without guessing.
+    for (_, reason) in &settings.direct_punch_invalid {
+        assert!(!reason.is_empty());
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+/// @requirement AC-212
+#[test]
+fn direct_punch_settings_survive_a_save_and_load_round_trip() {
+    let path = temp_settings_path();
+    let settings = Settings {
+        direct_punch: true,
+        direct_punch_port: 9100,
+        direct_punch_to: vec![
+            DirectPunchTarget::parse("bob,bobpublic.com,1m").unwrap(),
+            DirectPunchTarget::parse("marco,[2001:db8::1]:9000,1h").unwrap(),
+        ],
+        ..Settings::default()
+    };
+    settings.save(&path).unwrap();
+
+    let reloaded = Settings::load_or_create(&path).unwrap();
+    assert!(reloaded.direct_punch);
+    assert_eq!(reloaded.direct_punch_port, 9100);
+    assert_eq!(reloaded.direct_punch_to, settings.direct_punch_to);
+    assert!(reloaded.direct_punch_invalid.is_empty());
+    let _ = std::fs::remove_file(&path);
+}
+
+/// @requirement AC-217
+#[test]
+fn direct_punch_channels_are_read_one_per_line_and_validated() {
+    let path = temp_settings_path();
+    std::fs::write(
+        &path,
+        "direct_punch=on\n\
+         direct_punch_channel=general\n\
+         direct_punch_channel=dev\n\
+         direct_punch_channel=general\n\
+         direct_punch_channel=not a valid name!\n\
+         direct_punch_channel=\n",
+    )
+    .unwrap();
+    let settings = Settings::load_or_create(&path).unwrap();
+    // Duplicates collapse and invalid names are skipped: with no server to
+    // reject a bad name, this file is the only thing that can.
+    assert_eq!(
+        settings.direct_punch_channels,
+        vec!["general".to_string(), "dev".to_string()]
+    );
+
+    // File order is preserved through a round trip - it is the order the
+    // channels are presented in, so it must not churn.
+    let reloaded = {
+        settings.save(&path).unwrap();
+        Settings::load_or_create(&path).unwrap()
+    };
+    assert_eq!(reloaded.direct_punch_channels, settings.direct_punch_channels);
+    let _ = std::fs::remove_file(&path);
 }

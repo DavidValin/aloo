@@ -52,12 +52,25 @@ pub(crate) async fn handle_leave(
     session: &mut SessionState,
     name: String,
 ) -> proto::Result<()> {
-    wr.send_control(&ClientMessage::LeaveChannel { name: name.clone() }).await?;
+    // Leaving is local work with a courtesy notice attached: without a
+    // server to tell, the local half is the whole of it.
+    crate::client::session::send_if_server(
+        session,
+        wr,
+        &ClientMessage::LeaveChannel { name: name.clone() },
+    )
+    .await?;
     for peer in ui_state.leave_channel_locally(&name) {
-        if !ui_state.has_reason_to_keep_link(peer) {
+        // A `direct_punch_to` peer is a reason of its own to hold a link:
+        // it was opened from settings and a schedule, not from this
+        // channel, so leaving the channel says nothing about it (§7.1.5).
+        if !ui_state.has_reason_to_keep_link(peer)
+            && session.peer_link.direct_nickname_of(peer).is_none()
+        {
             session.peer_link.forget(peer);
         }
     }
+    crate::client::session::broadcast_channel_presence(session, ui_state);
     Ok(())
 }
 

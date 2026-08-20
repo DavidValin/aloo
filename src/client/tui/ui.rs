@@ -1017,6 +1017,36 @@ pub enum UiAction {
     Detach,
 }
 
+impl UiAction {
+    /// What this action needs a server for, or `None` if it can happen
+    /// with nothing but a direct link (`docs/PROTOCOL.md` §7.1.5).
+    ///
+    /// Named rather than boolean because the answer is shown to the user:
+    /// "joining a channel needs a server" is actionable, "unavailable" is
+    /// not. Everything absent from this list works serverlessly, which is
+    /// most of the app - text, voice, files, calls and live OTP sessions
+    /// are all peer-to-peer and never involved a server in the first place.
+    pub fn needs_server(&self) -> Option<&'static str> {
+        match self {
+            // Membership is server state. With no server, a channel is a
+            // name both sides declare in their settings instead.
+            Self::JoinChannel { .. } => Some("joining a channel"),
+            // OTP *mail* is stored on the server for an offline recipient;
+            // a live OTP session is peer-to-peer and stays available.
+            Self::CheckOtpMailRecipient { .. }
+            | Self::OpenOtpMailbox
+            | Self::SendOtpMail
+            | Self::ReadOtpMail { .. }
+            | Self::DeleteOtpMail { .. }
+            | Self::SaveOtpMailAttachment { .. } => Some("OTP mail"),
+            // Everything else is peer-to-peer. Leaving is deliberately not
+            // here: with no server a channel is a local declaration, so
+            // leaving one is a local act that needs nobody's permission.
+            _ => None,
+        }
+    }
+}
+
 /// Which trigger started the current recording - `handle_key`'s Space
 /// branch and `global_record_start`/`global_record_stop` (the global
 /// Ctrl+Alt+P shortcut, see `crate::client::global_ptt`) both drive the same
@@ -1074,6 +1104,11 @@ pub struct UiState {
     /// connect, `ChannelCreated` live) - the rows of the `/channels`
     /// modal, whether or not the user has joined them.
     pub known_channels: Vec<ChannelInfo>,
+    /// Running with no server (`--no-server`, docs/PROTOCOL.md §7.1.5).
+    /// Changes what the channel affordances can honestly offer: there is
+    /// no directory to browse and nothing to create, so the only channels
+    /// that exist are the ones `direct_punch_channel` names.
+    pub serverless: bool,
     /// Selected row of the `/channels` modal, into `known_channels`.
     pub channels_popup_selected: usize,
     pub known_users: HashMap<UserId, UserInfo>,
@@ -1389,6 +1424,7 @@ impl UiState {
             selector_dropdown_open: false,
             selector_dropdown_since: None,
             known_channels: Vec::new(),
+            serverless: false,
             channels_popup_selected: 0,
             known_users: HashMap::new(),
             offline: HashSet::new(),
@@ -2874,6 +2910,17 @@ impl UiState {
                     return None;
                 }
                 KeyCode::Char('j') | KeyCode::Char('J') => {
+                    // With no server there is nothing to create and no
+                    // directory to search, so the free-text form would only
+                    // ever be a way to type a name that cannot work. The
+                    // configured channels are the only ones that exist, so
+                    // this shows exactly those - the same modal `/channels`
+                    // uses, over the same list.
+                    if self.serverless {
+                        self.mode = Mode::ChannelsPopup;
+                        self.channels_popup_selected = 0;
+                        return None;
+                    }
                     self.mode = Mode::JoinPrivatePopup;
                     self.join_popup_input.clear();
                     self.join_popup_kind = ChannelKind::Private;
@@ -4913,6 +4960,31 @@ pub(crate) fn render_messages(
             .map(|c| c.log.as_slice())
             .unwrap_or(&[])
     };
+
+    // An empty conversation with no server behind it is a conversation
+    // waiting on a punch, not an idle one: nothing is going to arrive from
+    // a roster or a presence notice to explain the silence, so it is said
+    // here (see `channel::WAITING_FOR_DIRECT_PEERS`). Only while the peer
+    // is genuinely not reachable yet - once a link is up, an empty log
+    // means exactly what it always did.
+    if log.is_empty() && state.serverless {
+        let reachable = match dm_peer {
+            Some(peer) => state.link_status_of(peer) == crate::client::p2p::LinkStatus::Active,
+            None => state
+                .channels
+                .get(state.selected_channel)
+                .is_some_and(|c| !c.members.is_empty()),
+        };
+        if !reachable {
+            frame.render_widget(
+                Paragraph::new(super::channel::WAITING_FOR_DIRECT_PEERS)
+                    .style(Style::default().fg(Color::DarkGray))
+                    .wrap(ratatui::widgets::Wrap { trim: true }),
+                inner,
+            );
+            return;
+        }
+    }
 
     // OTP's own UI surface only exists inside a private room (see
     // `otp_active_peers`'s doc) - a channel log never gets the shield

@@ -219,6 +219,14 @@ name = "p2p_test"
 path = "test/p2p_test.rs"
 
 [[test]]
+name = "direct_punch_test"
+path = "test/direct_punch_test.rs"
+
+[[test]]
+name = "daemon_session_test"
+path = "test/daemon_session_test.rs"
+
+[[test]]
 name = "hybrid_crypto_test"
 path = "test/hybrid_crypto_test.rs"
 

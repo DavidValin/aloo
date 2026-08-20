@@ -184,6 +184,82 @@ fn content_device_id_announce_envelope_roundtrips() {
     }
 }
 
+/// `Content::ChannelPresence`, carried by `P2pPayload::ChannelPresence` -
+/// a serverless peer's channel membership, sealed the same way any other
+/// content is (docs/PROTOCOL.md §7.1.5). The channel list itself travels
+/// as the envelope's encrypted plaintext, never as a cleartext tag, so
+/// nothing on the wire says which channels either side is in.
+///
+/// A signed key rotation carried on the link instead of relayed by a
+/// server (docs/PROTOCOL.md §13.10, §7.1.5) - byte-for-byte the same
+/// rotation and signature `RotateKey`/`KeyRotated` carry, since the
+/// recipient verifies it itself and the transport was never part of that.
+///
+/// @requirement TB-225
+#[test]
+fn key_rotation_over_the_link_carries_the_same_payload_as_the_relayed_form() {
+    let rotation = vec![1, 2, 3, 4];
+    let signature = vec![9, 8, 7];
+    let relayed = ClientMessage::RotateKey {
+        to: UserId(7),
+        new_public_key_der: rotation.clone(),
+        signature: signature.clone(),
+    };
+    let direct = P2pPayload::KeyRotation {
+        rotation: rotation.clone(),
+        signature: signature.clone(),
+    };
+
+    let decoded: P2pPayload = decode(&encode(&direct).unwrap()).unwrap();
+    match decoded {
+        P2pPayload::KeyRotation {
+            rotation: r,
+            signature: sig,
+        } => {
+            assert_eq!(r, rotation);
+            assert_eq!(sig, signature);
+            // The two forms must stay interchangeable: the peer id is the
+            // only thing the relayed one adds, and a link already knows it.
+            match relayed {
+                ClientMessage::RotateKey {
+                    new_public_key_der,
+                    signature,
+                    ..
+                } => {
+                    assert_eq!(new_public_key_der, r);
+                    assert_eq!(signature, sig);
+                }
+                _ => unreachable!(),
+            }
+        }
+        _ => panic!("wrong variant"),
+    }
+}
+
+/// @requirement AC-214
+#[test]
+fn content_channel_presence_envelope_roundtrips() {
+    let channels = vec!["general".to_string(), "dev".to_string()];
+    let env = Envelope {
+        content: Content::ChannelPresence,
+        // Stands in for the sealed blob: what matters here is that the
+        // list survives its own encoding, and the envelope its own.
+        blocks: vec![encode(&channels).unwrap()],
+    };
+    let msg = P2pPayload::ChannelPresence {
+        envelope: env.clone(),
+    };
+    let decoded: P2pPayload = decode(&encode(&msg).unwrap()).unwrap();
+    match decoded {
+        P2pPayload::ChannelPresence { envelope } => {
+            assert_eq!(envelope, env);
+            let back: Vec<String> = decode(&envelope.blocks[0]).unwrap();
+            assert_eq!(back, channels);
+        }
+        _ => panic!("wrong variant"),
+    }
+}
+
 /// @requirement TB-143
 #[test]
 fn request_peer_link_and_peer_candidates_roundtrip() {
@@ -293,7 +369,7 @@ fn usable_reflexive_observed_still_judges_real_ipv6_as_ipv6() {
     assert!(!is_usable_reflexive_observed("[::]:4000".parse().unwrap()));
 }
 
-/// @requirement TB-143
+/// @requirement TB-143, TB-222
 #[test]
 fn punch_datagrams_roundtrip() {
     let msgs = vec![
@@ -309,6 +385,14 @@ fn punch_datagrams_roundtrip() {
             stream_id: 42,
             seq: 0,
             blocks: vec![vec![1, 2, 3]],
+        },
+        PunchDatagram::DirectPing {
+            link_nonce: 1,
+            from: "alice".into(),
+        },
+        PunchDatagram::DirectPong {
+            link_nonce: 1,
+            from: "bob".into(),
         },
     ];
     for msg in msgs {

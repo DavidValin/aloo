@@ -2009,3 +2009,67 @@ fn unmuting_clears_the_sidebar_marker() {
     state.set_muted_voice(Default::default());
     assert!(!row_containing(&sidebar_rows(&state), "bob").contains('\u{1F507}'));
 }
+
+/// An empty channel with no server behind it is one waiting to be punched
+/// into, not an idle one - and nothing else is coming to say so (no roster
+/// arrives, no presence notice). See docs/PROTOCOL.md §7.1.5.
+///
+/// @requirement AC-220
+#[test]
+fn an_empty_channel_without_a_server_says_it_is_waiting_for_direct_peers() {
+    let mut state = UiState::new("alice".into());
+    state.on_joined(ChannelInfo {
+        name: "general".into(),
+        kind: ChannelKind::Public,
+    });
+    state.serverless = true;
+
+    let rows = sidebar_rows(&state);
+    let joined = rows.join("\n");
+    assert!(
+        joined.contains("Waiting for other users"),
+        "an empty serverless channel must explain itself: {joined}"
+    );
+}
+
+/// The same channel with a server behind it is simply empty: a roster is
+/// on its way, so inventing an explanation would be wrong.
+///
+/// @requirement AC-220
+#[test]
+fn an_empty_channel_with_a_server_says_nothing_extra() {
+    let mut state = UiState::new("alice".into());
+    state.on_joined(ChannelInfo {
+        name: "general".into(),
+        kind: ChannelKind::Public,
+    });
+    state.serverless = false;
+
+    let joined = sidebar_rows(&state).join("\n");
+    assert!(
+        !joined.contains("Waiting for other users"),
+        "a server-backed session must not claim to be waiting on direct peers: {joined}"
+    );
+}
+
+/// Once someone is actually there, the waiting line goes away rather than
+/// sitting above a populated conversation.
+///
+/// @requirement AC-220
+#[test]
+fn the_waiting_line_disappears_once_a_direct_peer_is_present() {
+    let mut state = UiState::new("alice".into());
+    state.on_joined(ChannelInfo {
+        name: "general".into(),
+        kind: ChannelKind::Public,
+    });
+    state.serverless = true;
+    state.seed_member("general", user(2, "bob"));
+
+    let joined = sidebar_rows(&state).join("\n");
+    assert!(
+        !joined.contains("Waiting for other users"),
+        "the waiting line must not outlive the wait: {joined}"
+    );
+    assert!(joined.contains("bob"));
+}

@@ -41,7 +41,7 @@ test/traceability/               cross-checks all three, generates the reports
 | Path | What it is |
 | --- | --- |
 | `requirements/requirements.toml` | The requirement definitions: 16 user stories, 63 acceptance criteria, 115 technical behaviours, each with an `evidence` line naming where it was reconstructed from. Does **not** list which tests cover what — that link lives with the code. |
-| `features/` | Gherkin acceptance scenarios, one directory per story area (`channels/`, `connecting/`, `encryption/`, `help/`, `identity/`, `messaging/`, `presence/`, `voice/`). |
+| `features/` | Gherkin acceptance scenarios, one directory per story area (`channels/`, `connecting/`, `daemon/`, `direct_punch/`, `encryption/`, `help/`, `identity/`, `messaging/`, `presence/`, `voice/`). |
 | `test/cucumber/` | The cucumber-rs runner (`main.rs`), the shared `World` (`world.rs`), rendering/keying helpers (`support.rs`), and the step definitions under `steps/` that implement the Given/When/Then lines. |
 | `test/traceability/` | The gate itself: reads the three sources above, cross-checks them, and generates `target/traceability/` (`model.rs` builds the in-memory model, `validate.rs` runs the checks, `report.rs` writes the reports, `main.rs` wires it up as `cargo test --test traceability`). |
 | `test/` | Ordinary Rust tests, one file per `src` module that has one (`crypto_test.rs` ↔ `src/crypto/`, `ui_test.rs` ↔ `src/client/tui/ui.rs`, etc. — test file names keep the flat module name, not the tier path — see [§10](#changing-a-feature-where-to-look-first)). |
@@ -85,15 +85,26 @@ connect_test -- --ignored`. `cargo slow` names its targets explicitly
 rather than using `cargo test -- --ignored` because the cucumber target
 supplies its own runner and rejects libtest flags (see below).
 
+**`cargo slow` does not work from a git worktree nested inside the repo**
+(e.g. `.task-worktrees/<branch>/`). Cargo merges every `.cargo/config.toml`
+from the current directory upwards, and merging two `alias` tables
+*concatenates* the arrays - so the alias expands with each `--test` twice
+over and libtest refuses it with `Option 'test' given more than once`. It
+is not a broken alias: run the expansion directly from such a worktree,
+`cargo test --test crypto_test --test hybrid_crypto_test --test
+connect_test --test daemon_session_test -- --ignored`, or run `cargo slow`
+from a checkout that is not nested under another one.
+
 Runtimes assume dependencies have been built once, and are only this quick
 because `[profile.dev.package."*"]` in `Cargo.toml` builds dependencies at
 `opt-level = 3` — RSA key generation is pure Rust, and unoptimised it makes
 the suite roughly sixty times slower.
 
-As of writing: 16 stories, 64 acceptance criteria, 116 technical behaviours,
-118 Gherkin scenarios (586 steps), and 341 Rust test functions (of which 12
-carry `#[ignore]` — real RSA-4096 key generation, run by `cargo slow`). These
-numbers drift as the suite grows; `cargo trace` regenerates the live count in
+As of writing: 39 stories, 207 acceptance criteria, 196 technical
+behaviours, 300 Gherkin scenarios, and 930 Rust test functions (of which a
+handful carry `#[ignore]` — real RSA-4096 key generation, run by
+`cargo slow`). These numbers drift as the suite grows; `cargo trace`
+regenerates the live count in
 `target/traceability/traceability-matrix.md`.
 
 ### Running part of the suite
@@ -277,8 +288,8 @@ requirement it's mentioned in.
 ## Adding or changing a Gherkin scenario
 
 Feature files live under `features/<area>/*.feature`, grouped by story area
-(`channels/`, `connecting/`, `encryption/`, `help/`, `identity/`,
-`messaging/`, `presence/`, `voice/`). A feature-level tag applies to every
+(`channels/`, `connecting/`, `daemon/`, `direct_punch/`, `encryption/`, `help/`,
+`identity/`, `messaging/`, `presence/`, `voice/`). A feature-level tag applies to every
 scenario in the file (cucumber's own inheritance rule):
 
 ```gherkin
@@ -302,8 +313,10 @@ Feature: Claiming a unique nickname
 To add a scenario: write it in the language of `docs/SPEC.md`/`docs/PROTOCOL.md`,
 tag it with the AC/TB id(s) it proves, and either reuse existing step
 definitions or add new ones under `test/cucumber/steps/` (one file roughly
-per story area: `channels.rs`, `connect.rs`, `encryption.rs`, `identity.rs`,
-`messaging.rs`, `presence.rs`, `server.rs`, `voice.rs`, plus `ui_common.rs`
+per story area: `channels.rs`, `connect.rs`, `daemon.rs`, `direct_punch.rs`,
+`encryption.rs`,
+`identity.rs`, `messaging.rs`, `presence.rs`, `server.rs`, `voice.rs`, plus
+`ui_common.rs`
 for shared rendering/keying helpers). Run `cargo bdd -- -n "<part of the
 scenario name>"` to run just it while iterating.
 
@@ -388,9 +401,11 @@ Documented behaviour with no automated test, and why:
 | `AcceptIdentity`/`RejectIdentity`'s network-facing side effects (`id_store` persist, queued-send flush) | `docs/PROTOCOL.md` §12.4 | lives in `session.rs::handle_ui_action`, which - like the rest of `session.rs` - has no test file of its own (needs a live socket); the pure `UiState` bookkeeping half (`resolve_identity_accept`/`resolve_identity_reject`) is covered directly |
 | AC-094 (server settings persisted to and reloaded from `~/.aloo/settings` across a flag-less restart) | `docs/SPEC.md` "Server startup" | inherently a CLI/process/filesystem behavior (real `--server` flags, a real `$HOME`, a real restart), exercised in `test/main_test.rs` by spawning the compiled binary directly - the cucumber layer's steps all drive in-process `UiState`/`ConnectPopupState`/`Registry` structs and none of them spawn the real binary, so there's no existing seam to reuse instead of adding a new one for a single AC |
 | Real cross-NAT UDP hole punching (two clients on genuinely different networks, symmetric NATs, restrictive firewalls) | `docs/PROTOCOL.md` §7.1 | `test/p2p_test.rs`/the cucumber direct-link steps only ever punch over loopback (`127.0.0.1`), which trivially succeeds with no real NAT involved - they prove the protocol mechanics (candidate exchange, `Ping`/`Pong`, reliable delivery, punch-timeout failure), not real-world traversal success rate; that needs manual verification on two actually-separate networks |
-| A single transient UDP receive error doesn't end the whole client session (`p2p::spawn_receive_loop` logs and keeps listening rather than exiting its loop) | `src/client/p2p.rs` `spawn_receive_loop` | the actual OS-level trigger (e.g. Windows' well-documented `WSAECONNRESET` delivered to an *unconnected* UDP socket after an ICMP port-unreachable from an earlier `send_to` a candidate nobody answered) doesn't reproduce portably - confirmed on this project's Linux dev environment that an unconnected socket's `recv_from` simply times out rather than erroring after sending to a dead port, so a real regression test would only exercise the platforms it's run on, not the one it's for; the fix (never let one bad datagram end the loop) is defensive regardless of which platform actually triggers it |
-| A `pq_hybrid` voice/file chunk staying under `p2p_proto::SAFE_DATAGRAM_BYTES` (TB-148 only covers the RSA-family case) | `docs/PROTOCOL.md` §13.3 | the hybrid scheme repeats a multi-kilobyte `HybridStreamKeySetup` (ML-KEM ciphertext + ML-DSA and RSA signatures) on *every* chunk regardless of plaintext size, so no `CHUNK_INTERVAL`/`FILE_CHUNK_BYTES` choice can bring a `pq_hybrid` chunk under the safe budget - this is a pre-existing property of the §13 wire format that predates the direct peer-to-peer transport, not a regression introduced by it; fixing it for real would mean either fragmenting oversized reliable frames or redesigning §13 to stop repeating the key-setup per chunk, both bigger changes than a chunk-size tweak |
-| `session.rs`'s `UserJoined` handler actually calling `ensure_link` the moment a peer is learned about (TB-149) | `docs/PROTOCOL.md` §7.1 "Trigger" | lives in `session::handle_server_message`, which - like the rest of `session.rs` - has no test file of its own (needs a live socket, see the top of this document); the mechanism it relies on (a pre-warmed link failing silently when nothing is pending) is covered directly at the `PeerLinkManager` level by `punch_timeout_with_nothing_pending_fails_silently`, but the wiring that actually calls `ensure_link` from `UserJoined` in production is only exercised indirectly, by the app actually working when manually tested with two clients |
+| Real cross-NAT *serverless* punching - two clients on genuinely different networks meeting on the slot grid alone, with the NAT-forwarded `direct_punch_port` actually reachable from outside | `docs/PROTOCOL.md` §7.1.5 | same reason as the row above, one step further: `test/direct_punch_test.rs` and the `direct_punch/` scenarios punch over loopback with both ports trivially reachable, which proves the schedule, the handshake, the attempt window, the reconnect budget and the one-link rule, but not that a real router forwards the fixed port or that two real NATs open to each other from a shared clock alone. It also cannot prove the property the whole design rests on - that two *separate machines*' clocks agree closely enough to land in the same 30-second window - since both sides of every test share one clock; that needs two hosts, real port forwarding, and a look at whether both are actually NTP-synced |
+
+
+| A serverless peer's bootstrap encryption keys actually being seeded from their pin (`session.rs`'s `seed_direct_peer_keys`), and a rotation actually being routed onto the link rather than the control channel (`rotate_out_rx`'s dispatch) | `docs/PROTOCOL.md` §7.1.5, §13.10 | both are branches inside `session.rs`, needing a live `SessionState` with real pq_hybrid key material and a punched link - the same reason as the row above. What they compose is covered directly: the rotation payload round-tripping and staying byte-identical to the relayed form (`key_rotation_over_the_link_carries_the_same_payload_as_the_relayed_form`), the rotation crypto itself (`test/pq_rekey_test.rs`, unchanged and reused), and the registration bar the seeding is gated behind (`only_a_pinned_pq_hybrid_identity_can_become_an_addressable_peer`). Verify manually by talking for long enough that a rotation is due between two `--no-server` peers and confirming messages keep decrypting afterwards || A `pq_hybrid` voice/file chunk staying under `p2p_proto::SAFE_DATAGRAM_BYTES` (TB-148 only covers the RSA-family case) | `docs/PROTOCOL.md` §13.3 | the hybrid scheme repeats a multi-kilobyte `HybridStreamKeySetup` (ML-KEM ciphertext + ML-DSA and RSA signatures) on *every* chunk regardless of plaintext size, so no `CHUNK_INTERVAL`/`FILE_CHUNK_BYTES` choice can bring a `pq_hybrid` chunk under the safe budget - this is a pre-existing property of the §13 wire format that predates the direct peer-to-peer transport, not a regression introduced by it; fixing it for real would mean either fragmenting oversized reliable frames or redesigning §13 to stop repeating the key-setup per chunk, both bigger changes than a chunk-size tweak |
+
 | `session.rs`'s `PeerCandidates` handler actually consulting `shares_a_joined_channel` before calling into `PeerLinkManager` (TB-155) | `docs/PROTOCOL.md` §7.1.2 | same gap as the `UserJoined` row above and for the same reason (`session.rs` needs a live socket); the decision predicate itself is fully covered directly against `UiState` (`shares_a_joined_channel_is_true_for_a_member_of_a_joined_channel`, `_is_false_for_a_stranger`, `_is_false_once_the_channel_is_left`, and the `p2p_trust_boundary.feature` scenarios), but the call site that actually gates on it in production is only exercised indirectly |
 | `session.rs`'s `handle_leave`/`UserLeft` call sites actually invoking `PeerLinkManager::forget` once `has_reason_to_keep_link` fails (TB-158) | `docs/PROTOCOL.md` §7.1.3 | same gap as the two rows above and for the same reason; the decision predicate itself is fully covered directly against `UiState` (`has_reason_to_keep_link_is_true_for_a_shared_channel`, `_is_true_for_dm_history`, `_is_false_with_neither`), but the call sites that actually act on it in production are only exercised indirectly |
 | File/voice content actually flowing end-to-end under an active OTP session - offer (its own pad spend, AC-148), accept/auto-accept, a second independent content-phase pad spend, chunked transport, whole-content decrypt, and each phase's own resulting ack (AC-146) | `docs/PROTOCOL.md` §16.2 | `client::otp::send_file_offer`/`on_file_offer`/`start_outgoing_file_content`/`finish_incoming_file`/`send_voice_offer`/`on_voice_offer` and their `session.rs` call sites (`accept_file_offer`, `handle_file_event`, `handle_p2p_event`'s `FileAccepted`/`FileRejected`/`OtpFileContentSeq` arms) all take a live `SessionState`/`ControlSink`/spawned worker threads and need a real socket to exercise meaningfully, the same reason the three rows above do; the mechanism each piece relies on *is* covered directly - small-blob `otp --encrypt`/`--decrypt` round-tripping (`a_message_encrypted_by_alice_decrypts_to_the_same_bytes_for_bob`, the same path the offer rides), whole-file `otp --encrypt`/`--decrypt` round-tripping without buffering (`encrypt_file_and_decrypt_file_round_trip_without_buffering_in_memory`), and failing closed on a second encrypt without proof of delivery (`decrypt_file_without_assume_delivered_twice_fails_closed_on_the_second_call`) - so what's untested is specifically the wiring that calls these at the right moments, and in the right order (offer's own ack must close its slot before the content phase may open a second one); verified manually with two clients (large file over an OTP session arrives with the shield prefix and is byte-identical to the source once downloaded; holding Space to an OTP-active peer records silently with no live playback on the peer's end, and the clip appears as one finished, playable entry on both sides after release) |

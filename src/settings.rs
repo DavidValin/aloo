@@ -7,6 +7,11 @@
 //! writes the defaults on first run so a user can find and edit the file
 //! before ever changing anything.
 //!
+//! Also holds the serverless direct-punch configuration (`direct_punch`,
+//! `direct_punch_port`, and one `direct_punch_to` line per peer) that
+//! `crate::client::p2p`'s scheduler runs off - see `docs/PROTOCOL.md`
+//! §7.1.5.
+//!
 //! Also holds the server's last-used `--bind`/`--port`/auth configuration,
 //! written every time `--server` starts, so a crashed server relaunched
 //! with no flags comes back on the same address with the same auth. A
@@ -57,6 +62,181 @@ pub const DEFAULT_OTP_LOW_KEY_WARN_PCT: u8 = 10;
 /// Poll `otp --status --porcelain` for the low-key warning once every this
 /// many OTP send/receive operations, rather than on every single one.
 pub const DEFAULT_OTP_STATUS_POLL_INTERVAL: u32 = 20;
+
+/// The UDP port the direct-punch listener binds when `direct_punch=on`.
+///
+/// Server-coordinated punching (`docs/PROTOCOL.md` §7.1) can use an
+/// ephemeral port because the server relays whatever port the socket
+/// happened to get. Serverless punching (§7.1.5) has nobody to relay it,
+/// so the only thing a peer can address is a port both sides agreed on
+/// beforehand - by convention this one, overridable per machine with
+/// `direct_punch_port` for anyone who has to NAT-forward a different one.
+pub const DEFAULT_DIRECT_PUNCH_PORT: u16 = 7879;
+
+/// How often a `direct_punch_to` target is attempted, in minutes past the
+/// hour. Only the values `docs/SPEC.md` "Direct punch settings" lists are
+/// representable - the slot grid restarts at every o'clock, and both peers
+/// must land on the same grid or their probes never overlap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PunchFrequency(u32);
+
+/// Every accepted `<frequency>`, in minutes.
+pub const PUNCH_FREQUENCIES: [u32; 13] = [1, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60];
+
+impl PunchFrequency {
+    /// Parses `1m`/`5m`/.../`55m`/`1h`. `min` is accepted wherever `m` is
+    /// (`1min` reads more naturally in a hand-edited file, and the two
+    /// cannot be confused - there is no unit here that starts with `m` and
+    /// isn't minutes).
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let s = s.trim().to_ascii_lowercase();
+        let minutes = if let Some(n) = s.strip_suffix("min").or_else(|| s.strip_suffix('m')) {
+            n.parse::<u32>().ok()
+        } else if let Some(n) = s.strip_suffix("hour").or_else(|| s.strip_suffix('h')) {
+            n.parse::<u32>().ok().and_then(|h| h.checked_mul(60))
+        } else {
+            None
+        };
+        match minutes {
+            Some(m) if PUNCH_FREQUENCIES.contains(&m) => Ok(Self(m)),
+            _ => Err(format!(
+                "not a valid frequency: {s:?} - use one of 1m, 5m, 10m, 15m, 20m, \
+                 25m, 30m, 35m, 40m, 45m, 50m, 55m, 1h"
+            )),
+        }
+    }
+
+    pub fn minutes(self) -> u32 {
+        self.0
+    }
+
+    /// How many seconds one slot grid step covers.
+    pub fn seconds(self) -> u64 {
+        self.0 as u64 * 60
+    }
+
+    /// Which slot of the current hour `second_of_hour` falls in. The grid
+    /// restarts at every o'clock, which is what makes an interval that does
+    /// not divide 60 (`55m`) well defined: its slots are :00 and :55, and
+    /// the next one after :55 is the *next* hour's :00, not :50 past it.
+    pub fn slot_of_hour(self, second_of_hour: u64) -> u64 {
+        second_of_hour / self.seconds()
+    }
+}
+
+impl std::fmt::Display for PunchFrequency {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.0 == 60 {
+            write!(f, "1h")
+        } else {
+            write!(f, "{}m", self.0)
+        }
+    }
+}
+
+/// One `direct_punch_to=<nickname>,<host>[:<port>],<frequency>` line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectPunchTarget {
+    /// The peer's nickname - the only name a serverless link has, since
+    /// there is no server to assign or relay a `UserId` for it.
+    pub nickname: String,
+    /// A literal IPv4/IPv6 address or a hostname, resolved fresh at every
+    /// slot rather than once at startup (a home connection's address moves).
+    pub host: String,
+    pub port: u16,
+    pub frequency: PunchFrequency,
+}
+
+impl DirectPunchTarget {
+    /// Parses one settings value. The host may carry an explicit port
+    /// (`bobpublic.com:9000`, `[2001:db8::1]:9000`); a bare IPv6 literal
+    /// needs no brackets precisely because it cannot then also carry one.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        let parts: Vec<&str> = value.split(',').map(str::trim).collect();
+        let [nickname, host, frequency] = parts.as_slice() else {
+            return Err(format!(
+                "expected <nickname>,<host>,<frequency>, got {value:?}"
+            ));
+        };
+        if nickname.is_empty() || !crate::validation::is_storable(nickname) {
+            return Err(format!("not a valid nickname: {nickname:?}"));
+        }
+        let (host, port) = split_host_port(host)?;
+        Ok(Self {
+            nickname: (*nickname).to_string(),
+            host,
+            port,
+            frequency: PunchFrequency::parse(frequency)?,
+        })
+    }
+
+    /// `<nickname>,<host>[:<port>],<frequency>` - the exact spelling
+    /// `parse` accepts, so a load/save round trip is lossless.
+    pub fn to_setting_value(&self) -> String {
+        let host = if self.host.parse::<std::net::Ipv6Addr>().is_ok() {
+            format!("[{}]", self.host)
+        } else {
+            self.host.clone()
+        };
+        format!("{},{host}:{},{}", self.nickname, self.port, self.frequency)
+    }
+}
+
+/// Splits `host`, `host:port`, `[v6]` or `[v6]:port` into its two pieces,
+/// defaulting the port to `DEFAULT_DIRECT_PUNCH_PORT`, and rejects a host
+/// that is neither an IP literal nor a syntactically valid hostname.
+fn split_host_port(value: &str) -> Result<(String, u16), String> {
+    let (host, port) = if let Some(rest) = value.strip_prefix('[') {
+        // Bracketed IPv6, the one form that can carry a port without the
+        // port's colon being ambiguous with the address's own.
+        let Some((inside, after)) = rest.split_once(']') else {
+            return Err(format!("unterminated '[' in host: {value:?}"));
+        };
+        let port = match after {
+            "" => DEFAULT_DIRECT_PUNCH_PORT,
+            p => parse_port(p.strip_prefix(':').unwrap_or(p))?,
+        };
+        (inside.to_string(), port)
+    } else if value.parse::<std::net::Ipv6Addr>().is_ok() {
+        (value.to_string(), DEFAULT_DIRECT_PUNCH_PORT)
+    } else if let Some((h, p)) = value.rsplit_once(':') {
+        (h.to_string(), parse_port(p)?)
+    } else {
+        (value.to_string(), DEFAULT_DIRECT_PUNCH_PORT)
+    };
+    if !host_is_valid(&host) {
+        return Err(format!(
+            "not a valid IPv4 address, IPv6 address or hostname: {host:?}"
+        ));
+    }
+    Ok((host, port))
+}
+
+fn parse_port(s: &str) -> Result<u16, String> {
+    match s.parse::<u16>() {
+        Ok(p) if p != 0 => Ok(p),
+        _ => Err(format!("not a valid port: {s:?}")),
+    }
+}
+
+/// Whether `host` is an IP literal or a hostname worth trying to resolve.
+/// Deliberately syntactic only - whether the name resolves is the
+/// resolver's answer at punch time, not a settings-file question.
+fn host_is_valid(host: &str) -> bool {
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return true;
+    }
+    if host.is_empty() || host.len() > 253 {
+        return false;
+    }
+    host.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    })
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
@@ -117,6 +297,42 @@ pub struct Settings {
     /// `client::daemon::DaemonFocus::parse`, which owns that grammar.
     pub daemon_focus: Option<String>,
     pub daemon_otp: bool,
+    /// The daemon last ran with no server at all (`--no-server`). Persisted
+    /// like every other daemon field so a bare `aloo --daemon` at the next
+    /// boot reproduces it - without this a serverless daemon comes back
+    /// looking for a host it never had, and refuses to start.
+    pub daemon_no_server: bool,
+    /// Whether the serverless direct-punch scheduler runs at all
+    /// (`docs/PROTOCOL.md` §7.1.5). Off unless the file says `on`, since it
+    /// binds a fixed, well-known UDP port and sends unsolicited probes to
+    /// hosts named here - neither of which anyone should get by default.
+    pub direct_punch: bool,
+    /// The local UDP port that scheduler listens on. Only meaningful with
+    /// `direct_punch` on; see `DEFAULT_DIRECT_PUNCH_PORT` for why it has to
+    /// be fixed at all.
+    pub direct_punch_port: u16,
+    /// Every `direct_punch_to` line, in file order. One accumulating key
+    /// per peer rather than a single comma-joined value - the same shape
+    /// `muted_voice` above uses, and here the value has its own commas in
+    /// it, so a joined list could not be split back apart at all. Order is
+    /// the file's, not sorted: unlike `muted_voice` these are read as a
+    /// list of jobs to start, and a file's own order is what a reader
+    /// expects them listed in.
+    pub direct_punch_to: Vec<DirectPunchTarget>,
+    /// Channels this client considers itself in when there is no server to
+    /// join one through (`--no-server`, docs/PROTOCOL.md §7.1.5). A channel
+    /// is only a name both sides declare - `ChannelPresence` reconciles the
+    /// two lists - so with no membership to track this is the whole of it.
+    /// One accumulating key per channel, like `muted_voice` and
+    /// `direct_punch_to` above.
+    pub direct_punch_channels: Vec<String>,
+    /// `direct_punch_to` lines that would not parse, kept verbatim with the
+    /// reason. A malformed line is skipped like any other unparseable
+    /// setting, but skipping it *silently* would leave a typo'd nickname or
+    /// frequency looking exactly like a peer who simply never answers - so
+    /// the caller that starts the scheduler reports these once. Never
+    /// written back by `save`.
+    pub direct_punch_invalid: Vec<(String, String)>,
 }
 
 impl Default for Settings {
@@ -143,6 +359,12 @@ impl Default for Settings {
             daemon_channels: Vec::new(),
             daemon_focus: None,
             daemon_otp: false,
+            daemon_no_server: false,
+            direct_punch: false,
+            direct_punch_port: DEFAULT_DIRECT_PUNCH_PORT,
+            direct_punch_to: Vec::new(),
+            direct_punch_channels: Vec::new(),
+            direct_punch_invalid: Vec::new(),
         }
     }
 }
@@ -270,6 +492,39 @@ impl Settings {
                         settings.daemon_otp = b;
                     }
                 }
+                // `on`/`off` rather than `true`/`false`, matching how the
+                // setting is spelled in every example and in the README -
+                // both are accepted so neither spelling is a silent no-op.
+                "daemon_no_server" => {
+                    settings.daemon_no_server =
+                        matches!(value.to_ascii_lowercase().as_str(), "on" | "true" | "yes" | "1");
+                }
+                "direct_punch" => {
+                    settings.direct_punch = matches!(
+                        value.to_ascii_lowercase().as_str(),
+                        "on" | "true" | "yes" | "1"
+                    );
+                }
+                "direct_punch_port" => {
+                    if let Ok(p) = value.parse::<u16>()
+                        && p != 0
+                    {
+                        settings.direct_punch_port = p;
+                    }
+                }
+                "direct_punch_channel"
+                    if !value.is_empty()
+                        && crate::validation::channel_name_is_valid(value)
+                        && !settings.direct_punch_channels.iter().any(|c| c == value) =>
+                {
+                    settings.direct_punch_channels.push(value.to_string());
+                }
+                "direct_punch_to" => match DirectPunchTarget::parse(value) {
+                    Ok(target) => settings.direct_punch_to.push(target),
+                    Err(reason) => settings
+                        .direct_punch_invalid
+                        .push((value.to_string(), reason)),
+                },
                 _ => {}
             }
         }
@@ -350,6 +605,20 @@ impl Settings {
         }
         if self.daemon_otp {
             contents.push_str("daemon_otp=true\n");
+        }
+        if self.daemon_no_server {
+            contents.push_str("daemon_no_server=true\n");
+        }
+        contents.push_str(&format!(
+            "direct_punch={}\ndirect_punch_port={}\n",
+            if self.direct_punch { "on" } else { "off" },
+            self.direct_punch_port
+        ));
+        for target in &self.direct_punch_to {
+            contents.push_str(&format!("direct_punch_to={}\n", target.to_setting_value()));
+        }
+        for channel in &self.direct_punch_channels {
+            contents.push_str(&format!("direct_punch_channel={channel}\n"));
         }
         fs::write(path, contents)
     }

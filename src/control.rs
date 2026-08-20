@@ -431,6 +431,32 @@ pub trait ControlSink {
     ) -> impl std::future::Future<Output = Result<()>>;
 }
 
+/// A `ControlSink` with no server behind it: every send is discarded.
+///
+/// Used only by a session started with no server at all
+/// (`docs/PROTOCOL.md` §7.1.5). Discarding is safe *because nothing
+/// user-visible reaches it*: an action that needs a server is refused at
+/// the point it is asked for, with a reason, rather than being allowed to
+/// proceed into a message that vanishes here - which would look to the
+/// user like the app silently ignoring them.
+///
+/// Everything that would otherwise arrive is stopped upstream instead of
+/// being dropped here: joining a channel and OTP mail are refused
+/// (`UiAction::needs_server`), the connect-time mail fetch and the
+/// heartbeat are skipped, a key rotation is rerouted onto the peer link,
+/// a candidate relay is never signalled for a peer no server named, and
+/// a channel departure goes through `session::send_if_server`. This type
+/// is therefore a backstop for a path nobody has thought of, not the
+/// mechanism - if something starts relying on it to swallow a message a
+/// user asked for, that is the bug, not the fix.
+pub struct NullSink;
+
+impl ControlSink for NullSink {
+    async fn send_control(&mut self, _msg: &proto::ClientMessage) -> Result<()> {
+        Ok(())
+    }
+}
+
 impl<W: AsyncWrite + Unpin> ControlSink for ControlWriter<W> {
     async fn send_control(&mut self, msg: &proto::ClientMessage) -> Result<()> {
         self.send(msg).await

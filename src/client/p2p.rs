@@ -19,6 +19,15 @@
 //! Content queued against a link that isn't up yet is held, not dropped,
 //! and flushed the moment the link comes back - it only surfaces as a
 //! visible failure once it has been undeliverable for `PENDING_MAX_AGE`.
+//!
+//! One link can also be opened with no server involved at all: the
+//! serverless direct punch (`docs/PROTOCOL.md` §7.1.5, `DirectPunch` below).
+//! Everything the server would have supplied - who the peer is, where they
+//! are, and when both sides will probe at once - comes instead from
+//! `~/.aloo/settings`' `direct_punch_to` lines and from the wall clock. Once
+//! such a link is open it is an ordinary `PeerLink` carrying ordinary
+//! traffic; the only thing that stays different is who re-establishes it
+//! when it drops.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::ErrorKind;
@@ -32,6 +41,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::p2p_proto::{P2pPayload, PunchDatagram, RendezvousMessage};
 use crate::client::p2p_reliable::{ArqReceiver, ArqSender};
 use crate::proto::{self, ClientMessage, UserId};
+use crate::settings::PunchFrequency;
 
 /// How long a link may sit waiting for the peer's relayed candidates
 /// before the attempt is abandoned and retried. Generous because it covers
@@ -91,6 +101,97 @@ const CANDIDATES_MAX: usize = 16;
 /// candidates only.
 const RENDEZVOUS_TIMEOUT: Duration = Duration::from_millis(600);
 const RENDEZVOUS_ATTEMPTS: u32 = 3;
+
+/// How long one serverless direct-punch attempt keeps probing before it is
+/// abandoned until the target's next scheduled slot (`docs/PROTOCOL.md`
+/// §7.1.5 step 3). Comfortably inside the shortest slot grid (`1m`), so an
+/// attempt is always finished - successfully or not - before the next one
+/// is due.
+pub const DIRECT_PUNCH_WINDOW: Duration = Duration::from_secs(30);
+/// How many times a direct link that *was* up and dropped is re-punched
+/// straight away, outside its schedule, when there is no server to
+/// re-establish it through (§7.1.5 step 5). Spent attempts are forgiven the
+/// moment the link comes back: the budget bounds one outage, not the
+/// session.
+pub const DIRECT_MAX_RECONNECTS: u32 = 5;
+
+/// Where a serverless direct-punch target is in its cycle. A target that is
+/// not `Idle` *owns* its peer's link: the server-coordinated paths
+/// (`ensure_link`'s re-signal, `retry_due`, an incoming `PeerCandidates`)
+/// all stand aside for it, which is what keeps exactly one link in play
+/// between two people no matter how many ways they could reach each other
+/// (§7.1.5 step 6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectState {
+    /// Nothing in flight; waiting for this target's next slot.
+    Idle,
+    /// Probing the target's address, abandoned at `started +
+    /// DIRECT_PUNCH_WINDOW`.
+    Punching { started: Instant },
+    /// The link is up. It is maintained from here on by exactly the same
+    /// keepalive/liveness machinery every other link uses - the only thing
+    /// this state adds is who re-establishes it if it drops.
+    Established,
+}
+
+/// One `direct_punch_to` peer.
+struct DirectTarget {
+    host: String,
+    port: u16,
+    frequency: PunchFrequency,
+    /// The `UserId` this peer's link is filed under locally. Synthetic
+    /// (`direct_peer_id`) until the server tells us their real one, at
+    /// which point `set_direct_peer_id` moves the target onto it so a peer
+    /// reachable both ways still has just one link.
+    peer: UserId,
+    /// Resolved at the start of every attempt rather than once at startup -
+    /// the whole point of naming a host instead of an address is that a
+    /// home connection's address moves.
+    addr: Option<SocketAddr>,
+    state: DirectState,
+    /// Which slot of the hour was last acted on, so one slot fires once.
+    /// Seeded with the slot in progress when the target is configured, so a
+    /// client started mid-slot waits for the next boundary rather than
+    /// probing at a moment its peer has no reason to be probing back.
+    last_slot: Option<u64>,
+    /// Reconnect attempts spent on the current outage (§7.1.5 step 5).
+    reconnects: u32,
+}
+
+/// The serverless direct-punch scheduler's whole state, present only when
+/// `direct_punch=on`.
+struct DirectPunch {
+    /// This client's own nickname, as it appears in the peer's
+    /// `direct_punch_to` - the only thing that identifies us to them.
+    own_nick: String,
+    targets: HashMap<String, DirectTarget>,
+}
+
+/// The local `UserId` a peer known only by nickname is filed under.
+///
+/// The top bit is set so it can never collide with a server-assigned id:
+/// the server hands those out from a counter starting at 1, so the whole
+/// upper half of the space is unreachable to it. Below that it is just a
+/// hash of the nickname, which makes it stable across restarts - a direct
+/// peer keeps the same identity in the sidebar and in `id_store` whether or
+/// not a server ever names them.
+pub fn direct_peer_id(nickname: &str) -> UserId {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in nickname.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    UserId(hash | 0x8000_0000_0000_0000)
+}
+
+/// Whether `peer` is one of `direct_peer_id`'s synthetic ids rather than a
+/// `UserId` a server assigned - which is exactly the question "could a
+/// server re-signal this link". Nothing about such a peer can be relayed:
+/// no server has ever heard of them, so a candidate exchange naming one is
+/// an `Error` on the wire rather than a retry.
+pub fn is_direct_peer_id(peer: UserId) -> bool {
+    peer.0 & 0x8000_0000_0000_0000 != 0
+}
 
 /// What the UI shows for one peer's direct link (`docs/SPEC.md`'s
 /// "Connected UI" - the sidebar colours a name by this). Deliberately
@@ -181,6 +282,17 @@ pub enum P2pEvent {
         candidates: Vec<SocketAddr>,
         link_nonce: u64,
     },
+    /// A serverless direct-punch target's host needs resolving before it
+    /// can be probed (§7.1.5). Emitted rather than resolved in place
+    /// because a DNS lookup can block for seconds and this manager is
+    /// driven from the session's single-threaded select loop; the caller
+    /// resolves it off-loop and hands the answer back to
+    /// `on_direct_resolved`. Same shape, and the same reason, as `Signal`.
+    DirectResolve {
+        nickname: String,
+        host: String,
+        port: u16,
+    },
     /// This peer's link changed state - drives the sidebar's colour. Only
     /// emitted on an actual transition, never repeated per tick.
     LinkStatusChanged {
@@ -235,6 +347,22 @@ pub enum P2pEvent {
         from: UserId,
         stream_id: u64,
         seq: u64,
+        envelope: crate::proto::Envelope,
+    },
+    /// A peer's signed encryption-key rotation - mirrors
+    /// `p2p_proto::P2pPayload::KeyRotation`, and is handled exactly like
+    /// the server-relayed `ServerMessage::KeyRotated` it stands in for.
+    KeyRotation {
+        from: UserId,
+        rotation: Vec<u8>,
+        signature: Vec<u8>,
+    },
+    /// A serverless peer's channel membership, still sealed - mirrors
+    /// `p2p_proto::P2pPayload::ChannelPresence`. `session.rs` opens it
+    /// with the key pinned for that nickname; an envelope that opens is
+    /// what registers them as a real, addressable peer (§7.1.5).
+    ChannelPresence {
+        from: UserId,
         envelope: crate::proto::Envelope,
     },
     /// A peer's `client::device_id`, still sealed - mirrors
@@ -457,8 +585,10 @@ pub struct PeerLinkManager {
     socket: Arc<UdpSocket>,
     /// The server's UDP rendezvous socket: the only address this manager
     /// ever talks to that isn't a peer, and the discriminator that tells
-    /// rendezvous replies from punch traffic.
-    server_udp_addr: SocketAddr,
+    /// rendezvous replies from punch traffic. `None` with no server at all
+    /// (§7.1.5): a punch aimed at an address from settings needs no
+    /// reflexive candidate, since nothing relays one anywhere.
+    server_udp_addr: Option<SocketAddr>,
     /// This machine's own interface addresses, fixed for the session.
     host_candidates: Vec<SocketAddr>,
     /// Whether the one UDP socket is bound to an IPv6 address. The socket's
@@ -479,6 +609,9 @@ pub struct PeerLinkManager {
     /// data frame (identified only by its source address) reaches the
     /// right link.
     addr_index: HashMap<SocketAddr, UserId>,
+    /// The serverless direct-punch scheduler, present only once
+    /// `configure_direct_punch` has been called (`direct_punch=on`).
+    direct: Option<DirectPunch>,
     events_tx: UnboundedSender<P2pEvent>,
 }
 
@@ -494,13 +627,16 @@ impl PeerLinkManager {
     /// the session in case it starts working.
     pub async fn bind(
         bind_addr: SocketAddr,
-        server_udp_addr: SocketAddr,
+        server_udp_addr: Option<SocketAddr>,
         events_tx: UnboundedSender<P2pEvent>,
     ) -> std::io::Result<(Self, Arc<UdpSocket>)> {
         let socket = Arc::new(UdpSocket::bind(bind_addr).await?);
         let local_addr = socket.local_addr()?;
         let local_is_ipv6 = local_addr.is_ipv6();
-        let reflexive = learn_reflexive_candidate(&socket, server_udp_addr).await;
+        let reflexive = match server_udp_addr {
+            Some(addr) => learn_reflexive_candidate(&socket, addr).await,
+            None => None,
+        };
 
         Ok((
             Self {
@@ -513,6 +649,7 @@ impl PeerLinkManager {
                 last_reflexive_probe: Instant::now(),
                 links: HashMap::new(),
                 addr_index: HashMap::new(),
+                direct: None,
                 events_tx,
             },
             socket,
@@ -559,6 +696,11 @@ impl PeerLinkManager {
             Some(PeerLinkState::Requested { .. } | PeerLinkState::Punching { .. }) => {
                 LinkReadiness::Pending
             }
+            // A serverless direct punch is mid-attempt on this peer: it
+            // owns the link, and signalling a second one through the server
+            // is exactly the two-links-between-two-people case §7.1.5 step
+            // 6 forbids. The attempt underway is what the send waits on.
+            _ if self.direct_owns(peer) || is_direct_peer_id(peer) => LinkReadiness::Pending,
             // No link yet, or one waiting out a retry backoff.
             _ => {
                 let (candidates, link_nonce) = self.restart_attempt(peer, Instant::now());
@@ -663,6 +805,13 @@ impl PeerLinkManager {
         candidates: Vec<SocketAddr>,
         link_nonce: u64,
     ) {
+        // A link a serverless direct punch owns is not restarted by a
+        // relayed proposal, however well-meant: the peer is reachable both
+        // ways, and following this would tear down a working direct link to
+        // build a second one to the same person (§7.1.5 step 6).
+        if self.direct_owns(from) {
+            return;
+        }
         let now = Instant::now();
         let (needs_reply, agreed, restarting) = match self.links.get(&from) {
             Some(link) if link.establishing() => (false, link.link_nonce.min(link_nonce), false),
@@ -949,6 +1098,18 @@ impl PeerLinkManager {
                     blocks,
                 });
             }
+            PunchDatagram::DirectPing { link_nonce, from } => {
+                if from.len() > crate::p2p_proto::MAX_DIRECT_PUNCH_NICK_LEN {
+                    return;
+                }
+                self.on_direct_ping(addr, link_nonce, &from, now);
+            }
+            PunchDatagram::DirectPong { link_nonce, from } => {
+                if from.len() > crate::p2p_proto::MAX_DIRECT_PUNCH_NICK_LEN {
+                    return;
+                }
+                self.on_direct_pong(addr, link_nonce, &from, now);
+            }
         }
         self.sync_statuses();
     }
@@ -973,7 +1134,7 @@ impl PeerLinkManager {
     /// both directions (every `Reliable` frame is acked unconditionally, so
     /// nothing retransmits) against §7.1.1's "both sides restart from zero".
     pub fn on_rendezvous(&mut self, addr: SocketAddr, msg: RendezvousMessage) {
-        if addr != self.server_udp_addr {
+        if self.server_udp_addr != Some(addr) {
             return;
         }
         let RendezvousMessage::BindingResponse { token, observed } = msg else {
@@ -1178,6 +1339,17 @@ impl PeerLinkManager {
             P2pPayload::DeviceIdAnnounce { envelope } => {
                 P2pEvent::DeviceIdAnnounce { from, envelope }
             }
+            P2pPayload::ChannelPresence { envelope } => {
+                P2pEvent::ChannelPresence { from, envelope }
+            }
+            P2pPayload::KeyRotation {
+                rotation,
+                signature,
+            } => P2pEvent::KeyRotation {
+                from,
+                rotation,
+                signature,
+            },
             P2pPayload::CallInvite { call_id, channel } => P2pEvent::CallInvite {
                 channel,
                 from,
@@ -1212,6 +1384,25 @@ impl PeerLinkManager {
     /// links whose retry backoff has elapsed.
     pub fn tick(&mut self) {
         self.tick_at(Instant::now());
+    }
+
+    /// `tick`, plus one turn of the serverless direct-punch scheduler
+    /// (§7.1.5). `second_of_hour` is UTC's, deliberately: the slot grid only
+    /// works because both peers compute the same one, and a shared wall
+    /// clock is the whole of the agreement between them - a local-time grid
+    /// would put two peers in `+05:45`-style offsets on different grids
+    /// from everyone else.
+    pub fn tick_with_clock(&mut self, second_of_hour: u64) {
+        let now = Instant::now();
+        self.direct_tick(now, second_of_hour);
+        self.tick_at(now);
+    }
+
+    /// `tick_with_clock`, taking the monotonic clock explicitly too - the
+    /// same test seam `tick_at` is.
+    pub fn tick_with_clock_at(&mut self, now: Instant, second_of_hour: u64) {
+        self.direct_tick(now, second_of_hour);
+        self.tick_at(now);
     }
 
     /// `tick`, taking the current time explicitly - a test seam so a punch
@@ -1304,6 +1495,10 @@ impl PeerLinkManager {
     /// also what keeps the NAT mapping behind that address from expiring
     /// while nothing else is going on.
     fn refresh_reflexive(&mut self, now: Instant) {
+        // Nothing to ask, and nowhere to advertise the answer.
+        let Some(server_udp_addr) = self.server_udp_addr else {
+            return;
+        };
         if now.duration_since(self.last_reflexive_probe) < REFLEXIVE_REFRESH_INTERVAL {
             return;
         }
@@ -1312,7 +1507,7 @@ impl PeerLinkManager {
         let request = encode_dgram_rendezvous(&RendezvousMessage::BindingRequest {
             token: self.reflexive_token,
         });
-        send_dgram(&self.socket, &request, self.server_udp_addr);
+        send_dgram(&self.socket, &request, server_udp_addr);
     }
 
     /// Moves a link out of service and schedules its next attempt. Never
@@ -1380,6 +1575,11 @@ impl PeerLinkManager {
                 _ => false,
             })
             .map(|(&id, _)| id)
+            // A link a direct punch owns is its scheduler's to retry, and a
+            // link to a peer no server has ever named has nothing to
+            // re-signal *through* - relaying either one asks the server
+            // about a peer it either must not disturb or does not know.
+            .filter(|&id| !self.direct_owns(id) && !is_direct_peer_id(id))
             .collect();
         for peer in due {
             let (candidates, link_nonce) = self.restart_attempt(peer, now);
@@ -1474,6 +1674,525 @@ impl PeerLinkManager {
         }
     }
 
+    // ---- Serverless direct punch (docs/PROTOCOL.md 7.1.5) ----------------
+
+    /// Arms the direct-punch scheduler with `~/.aloo/settings`' targets and
+    /// this client's own nickname. `second_of_hour` seeds every target's
+    /// slot grid so a client started mid-slot waits for the next boundary:
+    /// probing at any other moment is wasted, since with no server to
+    /// arrange a meeting the *only* thing that makes two peers punch at the
+    /// same instant is that both grids restart at every o'clock.
+    pub fn configure_direct_punch(
+        &mut self,
+        own_nick: String,
+        targets: Vec<crate::settings::DirectPunchTarget>,
+        second_of_hour: u64,
+    ) {
+        let targets = targets
+            .into_iter()
+            .map(|t| {
+                let target = DirectTarget {
+                    peer: direct_peer_id(&t.nickname),
+                    // An address literal needs no resolver at all, so it is
+                    // usable from the very first slot.
+                    addr: t
+                        .host
+                        .parse::<std::net::IpAddr>()
+                        .ok()
+                        .map(|ip| SocketAddr::new(ip, t.port)),
+                    host: t.host,
+                    port: t.port,
+                    last_slot: Some(t.frequency.slot_of_hour(second_of_hour)),
+                    frequency: t.frequency,
+                    state: DirectState::Idle,
+                    reconnects: 0,
+                };
+                (t.nickname, target)
+            })
+            .collect();
+        self.direct = Some(DirectPunch { own_nick, targets });
+    }
+
+    /// Files a direct target's link under the `UserId` the server actually
+    /// assigned this nickname, replacing the synthetic one - so a peer who
+    /// is reachable both directly and through a server still has exactly
+    /// one link between them and us (§7.1.5 step 6), rather than one per
+    /// route. `None` puts the synthetic id back, for a peer who has gone
+    /// offline on the server but is still directly punchable.
+    ///
+    /// A link that is already open moves with the target rather than being
+    /// left behind or torn down (`rekey_link`), and the previous id is
+    /// returned so the caller can drop its now-stale UI row.
+    pub fn set_direct_peer_id(&mut self, nickname: &str, peer: Option<UserId>) -> Option<UserId> {
+        let wanted = peer.unwrap_or_else(|| direct_peer_id(nickname));
+        let direct = self.direct.as_mut()?;
+        let target = direct.targets.get_mut(nickname)?;
+        let previous = target.peer;
+        if previous == wanted {
+            return None;
+        }
+        target.peer = wanted;
+        // An idle target has no link to carry over, so renaming it is the
+        // whole job. A live one has to take its link with it - see
+        // `rekey_link`.
+        if target.state == DirectState::Idle {
+            return None;
+        }
+        self.rekey_link(previous, wanted);
+        Some(previous)
+    }
+
+    /// Moves a live link from one `UserId` to another, keeping everything
+    /// it is carrying: its punched address, its candidates, its ARQ
+    /// sequence spaces and anything queued on it all live in the link
+    /// itself, so this is a re-key of two maps rather than a rebuild.
+    ///
+    /// This is what keeps §7.1.5 step 6 true across the one ordering that
+    /// breaks it otherwise, and which daemon mode makes the *normal* one:
+    /// a client punches a direct link to someone who is not on the server,
+    /// and they connect to it hours later. Left filed under the synthetic
+    /// id, that working link is invisible to every path that addresses
+    /// them by the id the server just handed out - so the peer would be
+    /// signalled, punched a second time, and end up with two links where
+    /// the whole design promises one.
+    ///
+    /// A link already filed under `to` is only displaced if it is not the
+    /// one actually carrying traffic; a live one stays and the move is
+    /// abandoned, since destroying a working link is never the lesser
+    /// evil. (Normally there is nothing there at all: a `UserId` never
+    /// survives a reconnect, so a freshly announced peer is a fresh id.)
+    fn rekey_link(&mut self, from: UserId, to: UserId) {
+        let Some(link) = self.links.remove(&from) else {
+            return;
+        };
+        if let Some(existing) = self.links.get(&to) {
+            if matches!(existing.state, PeerLinkState::Active { .. })
+                && !matches!(link.state, PeerLinkState::Active { .. })
+            {
+                self.links.insert(from, link);
+                return;
+            }
+            self.addr_index.retain(|_, p| *p != to);
+        }
+        for peer in self.addr_index.values_mut() {
+            if *peer == from {
+                *peer = to;
+            }
+        }
+        self.links.insert(to, link);
+        // The link's own `reported` moved with it, so the UI would never
+        // be told that `to` is reachable - it only ever heard that about
+        // `from`. Said plainly here rather than left to `sync_statuses`,
+        // which by design only speaks on a change.
+        if let Some(status) = self.links.get(&to).map(|l| l.status()) {
+            let _ = self
+                .events_tx
+                .send(P2pEvent::LinkStatusChanged { peer: to, status });
+        }
+    }
+
+    /// Puts a direct target back on its synthetic id once the server that
+    /// named the peer no longer does (`ServerMessage::UserOffline`), so the
+    /// next slot punches at them as the direct-only peer they now are. A
+    /// link that is up survives the move (`rekey_link`) - someone dropping
+    /// off the server says nothing about whether the direct path to them
+    /// still works, and it usually does.
+    pub fn release_direct_peer_id(&mut self, peer: UserId) {
+        let Some(direct) = self.direct.as_mut() else {
+            return;
+        };
+        let Some(nickname) = direct
+            .targets
+            .iter()
+            .find(|(_, t)| t.peer == peer)
+            .map(|(n, _)| n.clone())
+        else {
+            return;
+        };
+        self.set_direct_peer_id(&nickname, None);
+    }
+
+    /// Whether a serverless direct punch currently owns this peer's link -
+    /// an attempt is in flight, or one succeeded and the link is up. The
+    /// server-coordinated paths all stand aside while this is true, which
+    /// is what keeps one link in play between two people (§7.1.5 step 6).
+    fn direct_owns(&self, peer: UserId) -> bool {
+        self.direct.as_ref().is_some_and(|d| {
+            d.targets
+                .values()
+                .any(|t| t.peer == peer && t.state != DirectState::Idle)
+        })
+    }
+
+    /// Drives the direct-punch scheduler: fires any target whose slot has
+    /// come round, keeps in-flight attempts probing, abandons ones that
+    /// have used up `DIRECT_PUNCH_WINDOW`, and notices established links
+    /// that have dropped. Called from `tick_at` with the wall-clock second
+    /// of the hour, which is the only clock the slot grid is defined
+    /// against.
+    fn direct_tick(&mut self, now: Instant, second_of_hour: u64) {
+        let Some(direct) = self.direct.as_ref() else {
+            return;
+        };
+        // Collected first, then acted on: each of these needs `&mut self`
+        // for the link side of the work, which cannot be held across an
+        // iteration of `direct.targets`.
+        let mut due: Vec<String> = Vec::new();
+        let mut probing: Vec<String> = Vec::new();
+        let mut abandoned: Vec<String> = Vec::new();
+        let mut dropped: Vec<String> = Vec::new();
+        for (nick, target) in &direct.targets {
+            let slot = target.frequency.slot_of_hour(second_of_hour);
+            let slot_arrived = target.last_slot != Some(slot);
+            match target.state {
+                DirectState::Idle => {
+                    if slot_arrived {
+                        due.push(nick.clone());
+                    }
+                }
+                DirectState::Punching { started } => {
+                    if now.duration_since(started) >= DIRECT_PUNCH_WINDOW {
+                        abandoned.push(nick.clone());
+                    } else {
+                        probing.push(nick.clone());
+                    }
+                }
+                // Step 4: a slot arriving on a target that is already up
+                // is deliberately nothing at all - only a loss re-opens it.
+                DirectState::Established => {
+                    if !matches!(
+                        self.links.get(&target.peer).map(|l| &l.state),
+                        Some(PeerLinkState::Active { .. })
+                    ) {
+                        dropped.push(nick.clone());
+                    }
+                }
+            }
+        }
+        if let Some(direct) = self.direct.as_mut() {
+            for target in direct.targets.values_mut() {
+                target.last_slot = Some(target.frequency.slot_of_hour(second_of_hour));
+            }
+        }
+        for nick in due {
+            self.begin_direct_attempt(&nick, now);
+        }
+        for nick in probing {
+            // The link underneath has a punch timeout of its own, much
+            // shorter than this window: left alone it gives up first,
+            // stops being `establishing`, and probing quietly stops - so a
+            // 30-second window would be 30 seconds in name only, and only
+            // ever really be one link-level attempt. Re-arming it here is
+            // what makes the window mean what it says, and gives the
+            // attempt a fresh nonce every time it turns over, exactly as
+            // the server-coordinated path's own backoff retry does.
+            self.rearm_direct_link(&nick, now);
+            self.send_direct_ping(&nick);
+        }
+        for nick in abandoned {
+            self.give_up_direct_attempt(&nick, now);
+        }
+        for nick in dropped {
+            self.on_direct_link_dropped(&nick, now);
+        }
+    }
+
+    /// Starts one attempt at `nickname`: puts the peer's link into a fresh
+    /// punch (the same `restart_attempt` every other establishment path
+    /// uses, so the reliable layer restarts with it) and either probes
+    /// straight away or asks the caller to resolve the host first.
+    fn begin_direct_attempt(&mut self, nickname: &str, now: Instant) {
+        let Some(direct) = self.direct.as_ref() else {
+            return;
+        };
+        let Some(target) = direct.targets.get(nickname) else {
+            return;
+        };
+        let (peer, addr, host, port) = (target.peer, target.addr, target.host.clone(), target.port);
+        // Step 4/6: a link that is already up - however it got there - is
+        // never punched again.
+        if matches!(
+            self.links.get(&peer).map(|l| &l.state),
+            Some(PeerLinkState::Active { .. })
+        ) {
+            return;
+        }
+        if let Some(target) = self.direct.as_mut().and_then(|d| d.targets.get_mut(nickname)) {
+            target.state = DirectState::Punching { started: now };
+        }
+        self.restart_attempt(peer, now);
+        match addr {
+            Some(addr) => {
+                self.adopt_candidate(peer, addr);
+                self.send_direct_ping(nickname);
+            }
+            None => {
+                let _ = self.events_tx.send(P2pEvent::DirectResolve {
+                    nickname: nickname.to_string(),
+                    host,
+                    port,
+                });
+            }
+        }
+        self.sync_statuses();
+    }
+
+    /// Feeds back the address the caller resolved for a `DirectResolve`.
+    /// `None` (a name that does not resolve right now) leaves the attempt
+    /// running with nothing to probe; it simply times out at
+    /// `DIRECT_PUNCH_WINDOW` like any other attempt that finds nobody, and
+    /// the next slot resolves again.
+    pub fn on_direct_resolved(&mut self, nickname: &str, addr: Option<SocketAddr>) {
+        let Some(addr) = addr else {
+            return;
+        };
+        let Some(direct) = self.direct.as_mut() else {
+            return;
+        };
+        let Some(target) = direct.targets.get_mut(nickname) else {
+            return;
+        };
+        if !matches!(target.state, DirectState::Punching { .. }) {
+            return;
+        }
+        target.addr = Some(addr);
+        let peer = target.peer;
+        self.adopt_candidate(peer, addr);
+        self.send_direct_ping(nickname);
+    }
+
+    /// Puts a direct target's link back into an establishing state if its
+    /// own `PUNCH_TIMEOUT` has already retired it, so one direct attempt
+    /// spans as many link-level attempts as `DIRECT_PUNCH_WINDOW` has room
+    /// for. A no-op while the link is still being established or is up.
+    fn rearm_direct_link(&mut self, nickname: &str, now: Instant) {
+        let Some(target) = self.direct.as_ref().and_then(|d| d.targets.get(nickname)) else {
+            return;
+        };
+        let (peer, addr) = (target.peer, target.addr);
+        match self.links.get(&peer).map(|l| &l.state) {
+            Some(PeerLinkState::Requested { .. } | PeerLinkState::Punching { .. }) => return,
+            // Reached `Active` between this tick's start and now, or via a
+            // path of its own: there is nothing to re-arm and everything to
+            // leave alone.
+            Some(PeerLinkState::Active { .. }) => return,
+            _ => {}
+        }
+        self.restart_attempt(peer, now);
+        if let Some(addr) = addr {
+            self.adopt_candidate(peer, addr);
+        }
+    }
+
+    /// One `DirectPing` to a target's current address. Repeated every tick
+    /// while an attempt is in flight, exactly like `send_pings` - the peer
+    /// is punching back on the same schedule, and it is their probe
+    /// arriving here (or ours there) that opens the first NAT mapping.
+    fn send_direct_ping(&self, nickname: &str) {
+        let Some(direct) = self.direct.as_ref() else {
+            return;
+        };
+        let Some(target) = direct.targets.get(nickname) else {
+            return;
+        };
+        let Some(addr) = target.addr else {
+            return;
+        };
+        let Some(link) = self.links.get(&target.peer) else {
+            return;
+        };
+        if !link.establishing() {
+            return;
+        }
+        send_dgram(
+            &self.socket,
+            &encode_dgram(&PunchDatagram::DirectPing {
+                link_nonce: link.link_nonce,
+                from: direct.own_nick.clone(),
+            }),
+            addr,
+        );
+    }
+
+    /// An attempt that used up its whole `DIRECT_PUNCH_WINDOW` without the
+    /// peer answering (step 3). If this was a reconnect and the budget is
+    /// not spent, another one starts immediately; otherwise the target goes
+    /// back to waiting for its next slot, and its link - now owned by
+    /// nobody - falls back to the ordinary retry path if a server is there
+    /// to drive it.
+    fn give_up_direct_attempt(&mut self, nickname: &str, now: Instant) {
+        let Some(target) = self.direct.as_mut().and_then(|d| d.targets.get_mut(nickname)) else {
+            return;
+        };
+        let peer = target.peer;
+        let retry = target.reconnects > 0 && target.reconnects < DIRECT_MAX_RECONNECTS;
+        if retry {
+            target.reconnects += 1;
+        } else {
+            target.reconnects = 0;
+            target.state = DirectState::Idle;
+        }
+        self.mark_lost(peer, "no answer to the direct punch".to_string(), now);
+        if retry {
+            self.begin_direct_attempt(nickname, now);
+        }
+        self.sync_statuses();
+    }
+
+    /// A direct link that was up has gone (step 5). With a server around,
+    /// re-establishment is the ordinary path's job and this target simply
+    /// steps aside until its next slot; with no server, this is the only
+    /// thing that can bring it back, so it re-punches immediately for up to
+    /// `DIRECT_MAX_RECONNECTS` attempts.
+    fn on_direct_link_dropped(&mut self, nickname: &str, now: Instant) {
+        let Some(target) = self.direct.as_mut().and_then(|d| d.targets.get_mut(nickname)) else {
+            return;
+        };
+        // "Is there a server available" is asked per peer, not per session,
+        // because that is the question that actually decides who can bring
+        // this link back. A server can only re-signal a peer it has named -
+        // one it never has is still filed under the synthetic id
+        // `direct_peer_id` gave them, and for them a server being up
+        // somewhere is no help at all. Asked session-wide instead, a peer
+        // who is only ever reachable directly would be handed to a
+        // re-signalling path that can never reach them, and the reconnect
+        // budget this whole step exists to spend would never be spent.
+        let server_can_reestablish = target.peer != direct_peer_id(nickname);
+        if server_can_reestablish {
+            target.state = DirectState::Idle;
+            target.reconnects = 0;
+            return;
+        }
+        target.reconnects = 1;
+        target.state = DirectState::Idle;
+        self.begin_direct_attempt(nickname, now);
+    }
+
+    /// Handles a `DirectPing`: a peer punching at us on the same slot grid.
+    /// Answered only for a nickname this client itself lists in
+    /// `direct_punch_to` - anyone else gets nothing back, so the port is no
+    /// more discoverable by probing it than the session socket is (§7.1's
+    /// same rule for an unattributable `Ping`).
+    fn on_direct_ping(&mut self, addr: SocketAddr, link_nonce: u64, from: &str, now: Instant) {
+        let Some(direct) = self.direct.as_ref() else {
+            return;
+        };
+        let (own_nick, peer, idle) = match direct.targets.get(from) {
+            Some(target) => (
+                direct.own_nick.clone(),
+                target.peer,
+                target.state == DirectState::Idle,
+            ),
+            None => return,
+        };
+        // Their probe *is* the slot arriving, as far as this side is
+        // concerned: without answering in kind there is no second direction
+        // to punch open, and their clock is as good an alarm as ours.
+        if idle {
+            self.begin_direct_attempt(from, now);
+        }
+        self.adopt_candidate(peer, addr);
+        if let Some(target) = self.direct.as_mut().and_then(|d| d.targets.get_mut(from)) {
+            target.addr = Some(addr);
+        }
+        self.note_received(peer, now);
+        send_dgram(
+            &self.socket,
+            &encode_dgram(&PunchDatagram::DirectPong {
+                link_nonce,
+                from: own_nick,
+            }),
+            addr,
+        );
+        // Probe straight back at the address they actually reached us from
+        // rather than the one settings named, for the same reason the
+        // server-coordinated path does: it is the path most likely to work.
+        self.send_direct_ping(from);
+    }
+
+    /// Handles a `DirectPong`: our own attempt answered. Activation is the
+    /// ordinary `on_pong` - from here the link is indistinguishable from
+    /// one the server helped arrange.
+    fn on_direct_pong(&mut self, addr: SocketAddr, link_nonce: u64, from: &str, now: Instant) {
+        let Some(direct) = self.direct.as_ref() else {
+            return;
+        };
+        let Some(target) = direct.targets.get(from) else {
+            return;
+        };
+        if !matches!(target.state, DirectState::Punching { .. }) {
+            return;
+        }
+        let peer = target.peer;
+        self.adopt_candidate(peer, addr);
+        self.on_pong(peer, addr, link_nonce, now);
+        if !self.is_active(peer) {
+            return;
+        }
+        if let Some(target) = self.direct.as_mut().and_then(|d| d.targets.get_mut(from)) {
+            target.state = DirectState::Established;
+            target.addr = Some(addr);
+            // The budget bounds one outage, not the session: a link that
+            // came back has nothing left to answer for.
+            target.reconnects = 0;
+        }
+    }
+
+    /// The `direct_punch_to` nickname a peer's link is filed under, if
+    /// any: what turns a `UserId` back into the name their key is pinned
+    /// under (`client::idstore`).
+    pub fn direct_nickname_of(&self, peer: UserId) -> Option<String> {
+        self.direct
+            .as_ref()?
+            .targets
+            .iter()
+            .find(|(_, t)| t.peer == peer)
+            .map(|(nickname, _)| nickname.clone())
+    }
+
+    /// Whether any `direct_punch_to` target is configured at all - the
+    /// question "is this session worth keeping alive without a server".
+    pub fn has_direct_targets(&self) -> bool {
+        self.direct.as_ref().is_some_and(|d| !d.targets.is_empty())
+    }
+
+    /// Every serverless peer whose link is currently up - who to tell when
+    /// this client's own channel membership changes.
+    pub fn active_direct_peers(&self) -> Vec<UserId> {
+        let Some(direct) = self.direct.as_ref() else {
+            return Vec::new();
+        };
+        direct
+            .targets
+            .values()
+            .filter(|t| t.state == DirectState::Established)
+            .map(|t| t.peer)
+            .filter(|p| self.is_active(*p))
+            .collect()
+    }
+
+    /// This target's current state, for tests and diagnostics: `None` when
+    /// direct punching is off or the nickname is not configured.
+    pub fn direct_status(&self, nickname: &str) -> Option<LinkStatus> {
+        let target = self.direct.as_ref()?.targets.get(nickname)?;
+        Some(match target.state {
+            DirectState::Idle => LinkStatus::Lost,
+            DirectState::Punching { .. } => LinkStatus::Connecting,
+            DirectState::Established => LinkStatus::Active,
+        })
+    }
+
+    /// The `UserId` a configured direct target's link is filed under.
+    pub fn direct_peer(&self, nickname: &str) -> Option<UserId> {
+        Some(self.direct.as_ref()?.targets.get(nickname)?.peer)
+    }
+
+    /// How many reconnect attempts the current outage has spent
+    /// (`DIRECT_MAX_RECONNECTS` is the ceiling) - a test/diagnostic helper.
+    pub fn direct_reconnects(&self, nickname: &str) -> Option<u32> {
+        Some(self.direct.as_ref()?.targets.get(nickname)?.reconnects)
+    }
+
     /// Whether the link to `peer` is currently `Active` - a test/diagnostic
     /// helper (see `test/p2p_test.rs`'s loopback handshake test); ordinary
     /// send paths go through `ensure_link`'s `LinkReadiness` instead.
@@ -1547,6 +2266,19 @@ impl PeerLinkManager {
             });
         }
     }
+}
+
+/// The current second of the UTC hour (0..3600), the clock every
+/// `direct_punch_to` slot grid is defined against (`docs/PROTOCOL.md`
+/// §7.1.5). UTC rather than local time so two peers in different time zones,
+/// including the half- and quarter-hour offsets, still share one grid. A
+/// clock before the Unix epoch has no meaningful second-of-hour, so it reads
+/// as zero rather than panicking.
+pub fn utc_second_of_hour() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() % 3600)
+        .unwrap_or(0)
 }
 
 /// The delay before the `attempts`-th consecutive retry: doubling from
@@ -1771,7 +2503,7 @@ fn warn_unusable_reflexive(observed: SocketAddr) {
 /// source address (see `InboundDatagram`).
 pub fn spawn_receive_loop(
     socket: Arc<UdpSocket>,
-    server_udp_addr: SocketAddr,
+    server_udp_addr: Option<SocketAddr>,
     raw_tx: UnboundedSender<(SocketAddr, InboundDatagram)>,
 ) {
     tokio::spawn(async move {
@@ -1798,7 +2530,7 @@ pub fn spawn_receive_loop(
                     continue;
                 }
             };
-            let decoded = if addr == server_udp_addr {
+            let decoded = if server_udp_addr == Some(addr) {
                 proto::decode::<RendezvousMessage>(&buf[..n])
                     .ok()
                     .map(InboundDatagram::Rendezvous)

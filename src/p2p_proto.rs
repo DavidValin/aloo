@@ -115,7 +115,31 @@ pub enum PunchDatagram {
         seq: u32,
         blocks: Vec<Vec<u8>>,
     },
+    /// `Ping`, for a link nobody signalled: the serverless direct punch
+    /// (§7.1.5). It carries the sender's nickname because that is the only
+    /// thing that can identify them here - there was no candidate relay to
+    /// name a `UserId`, and the source address is exactly what the receiver
+    /// is trying to learn. A receiver answers only a nickname listed in its
+    /// own `direct_punch_to`, so this names a peer rather than
+    /// authenticating one; the link it opens is still subject to every
+    /// per-peer identity check §12 applies to a server-coordinated one.
+    DirectPing {
+        link_nonce: u64,
+        from: String,
+    },
+    /// Echoes a `DirectPing`'s nonce, and names the answerer the same way.
+    DirectPong {
+        link_nonce: u64,
+        from: String,
+    },
 }
+
+/// Ceiling on a `DirectPing`/`DirectPong` `from` field. These arrive
+/// unsolicited from anyone who knows the port, ahead of any link state, so
+/// the nickname is compared against `direct_punch_to` and then dropped -
+/// but it is still an allocation attributable to an unauthenticated
+/// datagram, and nothing else bounds it.
+pub const MAX_DIRECT_PUNCH_NICK_LEN: usize = 64;
 
 /// What a `Reliable` frame's `payload` decodes to - the direct-transport
 /// content messages. The sending peer's UDP source address already
@@ -238,6 +262,30 @@ pub enum P2pPayload {
     /// always - this is never addressed to a channel.
     DeviceIdAnnounce {
         envelope: Envelope,
+    },
+    /// The sender's current channel membership, sealed exactly like
+    /// `DeviceIdAnnounce` above (its plaintext is the encoded list of
+    /// channel names, under `Content::ChannelPresence`). Sent when a
+    /// serverless direct link (§7.1.5) opens, and again whenever the
+    /// sender's own membership changes, so both sides converge on the
+    /// channels they share with no server tracking membership for them.
+    ///
+    /// Being sealed is what makes it usable as an identity claim rather
+    /// than a mere assertion: a nickname on an unauthenticated punch
+    /// datagram names nobody, while an envelope that opens under the key
+    /// pinned for that nickname proves who sent it.
+    ChannelPresence {
+        envelope: Envelope,
+    },
+    /// A signed encryption-key rotation (§13.10), carrying exactly what
+    /// `RotateKey`/`KeyRotated` carries over a server - a bincode-encoded
+    /// rotation and its signature. The recipient verifies that signature
+    /// itself, and a server relaying it never validated or stored
+    /// anything, so moving it onto the link costs nothing and is what lets
+    /// forward secrecy keep working with no server in reach.
+    KeyRotation {
+        rotation: Vec<u8>,
+        signature: Vec<u8>,
     },
 
     /// Proposes a live, continuous, multi-user voice call (`docs/PROTOCOL.md`

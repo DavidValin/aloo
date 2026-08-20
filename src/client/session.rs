@@ -20,7 +20,6 @@ use crate::client::file_transfer;
 use crate::client::idstore;
 use crate::client::netstats;
 use crate::client::p2p::{self, P2pEvent, P2pOutbound, PeerLinkManager};
-use crate::control::ControlSink;
 use crate::p2p_proto::P2pPayload;
 use crate::proto::{
     self, ClientMessage, Content, Envelope, KeyMode, ServerMessage, UserId, UserInfo,
@@ -68,6 +67,51 @@ pub enum SessionInput {
 /// machinery needs, threaded through both `handle_ui_action` (outgoing)
 /// and `handle_server_message` (incoming) so neither function needs a
 /// long, error-prone parameter list.
+/// Whether this session has a server behind it, and if so whether it can
+/// be used right now.
+///
+/// The two "no" cases are deliberately distinct rather than one boolean:
+/// `Absent` is how the client was started and will not change, so an
+/// action needing a server should say so plainly and stop; `Unreachable`
+/// is a condition that may well pass, so the same action is worth
+/// describing as temporarily unavailable. Telling a user "this needs a
+/// server" when one is merely reconnecting would be wrong, and telling
+/// them "retrying" when there is no server at all would be a lie.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerState {
+    /// Connected and usable.
+    Connected,
+    /// Configured, but not reachable at the moment.
+    Unreachable,
+    /// Started with no server at all (`--no-server`).
+    Absent,
+}
+
+impl ServerState {
+    /// Whether anything needing a server can happen right now.
+    pub fn is_absent(self) -> bool {
+        !matches!(self, Self::Connected)
+    }
+
+    /// Whether there is no server even in principle, as opposed to one
+    /// that is merely away.
+    pub fn is_serverless(self) -> bool {
+        matches!(self, Self::Absent)
+    }
+
+    /// How to explain to a user that `what` cannot happen. Phrased for the
+    /// status line, and different per state on purpose (see the type doc).
+    pub fn refusal(self, what: &str) -> String {
+        match self {
+            Self::Connected => format!("{what} is not available"),
+            Self::Unreachable => {
+                format!("{what} needs the server, which is unreachable right now")
+            }
+            Self::Absent => format!("{what} needs a server - running without one"),
+        }
+    }
+}
+
 pub(crate) struct SessionState {
     /// Set while we're recording; sending on it tells the record-stream
     /// worker to flush and stop.
@@ -243,6 +287,12 @@ pub(crate) struct SessionState {
     /// `/otp` - someone at the keyboard already sees the outcome on
     /// screen, and does not need to be alerted to it.
     pub(crate) daemon_awaiting_otp: Option<UserId>,
+    /// Whether a server is behind this session, and usable.
+    pub(crate) server: ServerState,
+    /// Where a spawned `DirectResolve` lookup hands its answer back to the
+    /// select loop (`docs/PROTOCOL.md` §7.1.5).
+    pub(crate) direct_resolved_tx:
+        tokio::sync::mpsc::UnboundedSender<(String, Option<SocketAddr>)>,
 }
 
 /// `run_connected_session` for a daemon: no terminal, a plan, and the
@@ -257,17 +307,17 @@ pub(crate) struct SessionState {
 /// (`global_ptt`) is exempt from that guess anyway, since a held OS hotkey
 /// always delivers a real release.
 #[allow(clippy::too_many_arguments)]
-pub async fn run_daemon_session(
+pub async fn run_daemon_session<W: crate::control::ControlSink>(
     surface: &mut crate::client::tui::surface::Surface,
-    rd: crate::control::ControlReader<tokio::io::ReadHalf<TcpStream>>,
-    wr: crate::control::ControlWriter<tokio::io::WriteHalf<TcpStream>>,
+    rd: Option<crate::control::ControlReader<tokio::io::ReadHalf<TcpStream>>>,
+    wr: W,
     display_name: String,
     you: UserId,
     my_identity: ResolvedIdentity,
     key_mode: KeyMode,
     id_store: idstore::IdStore,
     hotkey_rx: Option<tokio::sync::mpsc::UnboundedReceiver<crate::client::global_ptt::GlobalPttEvent>>,
-    server_addr: SocketAddr,
+    server_addr: Option<SocketAddr>,
     input_rx: tokio::sync::mpsc::UnboundedReceiver<SessionInput>,
     plan: crate::client::daemon::DaemonPlan,
 ) -> Result<(), BoxError> {
@@ -293,10 +343,10 @@ pub async fn run_daemon_session(
 // grouping the handshake outputs into a struct would be a larger,
 // unrelated refactor of an already-established call site.
 #[allow(clippy::too_many_arguments)]
-pub async fn run_connected_session(
+pub async fn run_connected_session<W: crate::control::ControlSink>(
     surface: &mut crate::client::tui::surface::Surface,
-    mut rd: crate::control::ControlReader<tokio::io::ReadHalf<TcpStream>>,
-    mut wr: crate::control::ControlWriter<tokio::io::WriteHalf<TcpStream>>,
+    rd: Option<crate::control::ControlReader<tokio::io::ReadHalf<TcpStream>>>,
+    mut wr: W,
     display_name: String,
     you: UserId,
     my_identity: ResolvedIdentity,
@@ -304,12 +354,19 @@ pub async fn run_connected_session(
     keyboard_release_reporting: bool,
     id_store: idstore::IdStore,
     mut hotkey_rx: Option<tokio::sync::mpsc::UnboundedReceiver<crate::client::global_ptt::GlobalPttEvent>>,
-    server_addr: SocketAddr,
+    server_addr: Option<SocketAddr>,
     mut input_rx: tokio::sync::mpsc::UnboundedReceiver<SessionInput>,
     daemon_plan: Option<crate::client::daemon::DaemonPlan>,
 ) -> Result<(), BoxError> {
-
+    // With no server there is nothing to read from one: the channel is
+    // created all the same and simply never yields, so the select loop
+    // below needs no serverless special case of its own.
+    let server_state = match (&rd, server_addr) {
+        (Some(_), _) => ServerState::Connected,
+        (None, _) => ServerState::Absent,
+    };
     let (net_tx, mut net_rx) = tokio::sync::mpsc::unbounded_channel::<ServerMessage>();
+    if let Some(mut rd) = rd {
     tokio::spawn(async move {
         loop {
             match rd.recv::<ServerMessage>().await {
@@ -322,6 +379,7 @@ pub async fn run_connected_session(
             }
         }
     });
+    }
 
     let (audio_err_tx, mut audio_err_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let (call_level_tx, mut call_level_rx) =
@@ -352,15 +410,52 @@ pub async fn run_connected_session(
         tokio::sync::mpsc::unbounded_channel::<file_transfer::FileEvent>();
     let (auto_stop_tx, mut auto_stop_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
+    // `~/.aloo/settings`, for the serverless direct-punch configuration
+    // (`docs/PROTOCOL.md` §7.1.5) and `/mute-voice`'s persisted set
+    // (docs/SPEC.md Functionality #15) alike. Read here rather than
+    // threaded down from `main.rs`'s own load: the file may have been
+    // edited by hand, or by another session, since this process started.
+    // A read failure is not fatal for either consumer - nothing is muted
+    // and direct punch stays off, the same way every other optional
+    // subsystem in this loop degrades.
+    let settings = crate::settings::Settings::load_or_create(&crate::settings::default_path())
+        .unwrap_or_else(|e| {
+            eprintln!("aloo: could not read ~/.aloo/settings ({e}); direct punch stays off");
+            crate::settings::Settings::default()
+        });
+    for (line, reason) in &settings.direct_punch_invalid {
+        eprintln!("aloo: ignoring direct_punch_to={line}: {reason}");
+    }
+    let (direct_resolved_tx, mut direct_resolved_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(String, Option<SocketAddr>)>();
+
     // The session's one direct client<->client UDP transport (`crate::client::p2p`).
     // Bound on the same address family as the server so the reflexive-
     // address probe below can actually reach it; the port is ephemeral
     // (`:0`) since only the server needs a fixed, well-known port.
-    let bind_addr: SocketAddr = if server_addr.is_ipv6() {
-        SocketAddr::new(std::net::Ipv6Addr::UNSPECIFIED.into(), 0)
+    //
+    // With `direct_punch=on` it is not ephemeral: a peer punching at us
+    // with no server to relay a port has nothing to aim at but a port both
+    // sides agreed on in advance, so the same socket binds
+    // `direct_punch_port` (§7.1.5). A port already in use is not fatal -
+    // the session falls back to an ephemeral one and says so, leaving
+    // everything except direct punching working.
+    // With no server to match families with, the socket follows whatever
+    // the direct-punch targets need; IPv4 is the safe default there, since
+    // that is what a settings file names in practice.
+    let unspecified: std::net::IpAddr = if server_addr.is_some_and(|a| a.is_ipv6()) {
+        std::net::Ipv6Addr::UNSPECIFIED.into()
     } else {
-        SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), 0)
+        std::net::Ipv4Addr::UNSPECIFIED.into()
     };
+    let bind_addr = SocketAddr::new(
+        unspecified,
+        if settings.direct_punch {
+            settings.direct_punch_port
+        } else {
+            0
+        },
+    );
     // `~/.aloo/d_id` - generated once, on whichever session first needs it,
     // and reused for the machine's whole lifetime (`docs/PROTOCOL.md`
     // §12.7). A failure to load/create it is not fatal - the direct link
@@ -374,9 +469,31 @@ pub async fn run_connected_session(
             String::new()
         });
     let (p2p_events_tx, mut p2p_events_rx) = tokio::sync::mpsc::unbounded_channel::<P2pEvent>();
-    let (peer_link, p2p_socket) = PeerLinkManager::bind(bind_addr, server_addr, p2p_events_tx)
-        .await
-        .map_err(|e| format!("failed to open the direct-link UDP socket: {e}"))?;
+    let (mut peer_link, p2p_socket) =
+        match PeerLinkManager::bind(bind_addr, server_addr, p2p_events_tx.clone()).await {
+            Ok(ok) => ok,
+            Err(e) if bind_addr.port() != 0 => {
+                eprintln!(
+                    "aloo: could not bind the direct-punch port {} ({e});                      falling back to an ephemeral port - direct_punch_to peers                      will not be able to reach this client",
+                    bind_addr.port()
+                );
+                PeerLinkManager::bind(
+                    SocketAddr::new(unspecified, 0),
+                    server_addr,
+                    p2p_events_tx,
+                )
+                .await
+                .map_err(|e| format!("failed to open the direct-link UDP socket: {e}"))?
+            }
+            Err(e) => return Err(format!("failed to open the direct-link UDP socket: {e}").into()),
+        };
+    if settings.direct_punch {
+        peer_link.configure_direct_punch(
+            display_name.clone(),
+            settings.direct_punch_to.clone(),
+            crate::client::p2p::utc_second_of_hour(),
+        );
+    }
     let (p2p_raw_tx, mut p2p_raw_rx) =
         tokio::sync::mpsc::unbounded_channel::<(SocketAddr, p2p::InboundDatagram)>();
     p2p::spawn_receive_loop(p2p_socket, server_addr, p2p_raw_tx);
@@ -432,6 +549,8 @@ pub async fn run_connected_session(
         remote_keys: rekey::RemoteKeys::new(),
         id_store,
         conn_stats: netstats::ConnStats::new(),
+        server: server_state,
+        direct_resolved_tx,
         auto_stop_tx,
         active_replay_id: None,
         peer_link,
@@ -466,21 +585,40 @@ pub async fn run_connected_session(
     };
 
     let mut ui_state = UiState::new(display_name);
+    // With no server there is nothing to join a channel *through*, so the
+    // channels named in settings are simply the ones this client is in.
+    // Seeded before the session starts so a `--focus channel:x` daemon
+    // finds its channel already there, and so the first `ChannelPresence`
+    // we send a peer is already correct.
+    ui_state.serverless = server_state.is_serverless();
+    if server_state.is_serverless() {
+        // The directory `/channels` and Ctrl+J browse: with no server the
+        // configured channels are the only ones that exist, so they are
+        // the whole of it.
+        ui_state.known_channels = settings
+            .direct_punch_channels
+            .iter()
+            .map(|name| proto::ChannelInfo {
+                name: name.clone(),
+                kind: proto::ChannelKind::Public,
+            })
+            .collect();
+        for name in &settings.direct_punch_channels {
+            crate::client::channel::on_joined(
+                &mut ui_state,
+                proto::ChannelInfo {
+                    name: name.clone(),
+                    kind: proto::ChannelKind::Public,
+                },
+            );
+        }
+    }
     ui_state.set_own_id(you);
     // What makes `/daemon` mean something: only a session with a
     // background to go back to can be handed back to it.
     ui_state.daemon_mode = is_daemon;
     ui_state.set_keyboard_release_reporting(keyboard_release_reporting);
-    // `/mute-voice`'s persisted set (docs/SPEC.md Functionality #15).
-    // Read once here rather than threaded down from `main.rs`'s own load:
-    // the file may have been edited by hand, or by another session, since
-    // this process started. A read failure just means nothing is muted -
-    // never a reason to refuse the session.
-    ui_state.set_muted_voice(
-        crate::settings::Settings::load_or_create(&crate::settings::default_path())
-            .map(|s| s.muted_voice)
-            .unwrap_or_default(),
-    );
+    ui_state.set_muted_voice(settings.muted_voice.clone());
     // Ticks fast enough that `tick_recording_timeout` can detect a
     // released Space key within one `RECORD_HOLD_TIMEOUT` window without
     // adding much latency; also drives the idle-stream sweep below.
@@ -503,10 +641,25 @@ pub async fn run_connected_session(
     // mail it sent - then replays any upload whose storage acknowledgement
     // a previous session never saw. Skipped without the `otp` binary:
     // nothing could decrypt what a fetch would deliver.
-    if crate::client::otp_cli::binary_available(&session.otp_cli_cfg) {
+    //
+    // Also skipped with no server, since the server *is* the mailbox
+    // (§7.1.5): the fetch would go nowhere and the resend would mark mail
+    // as being uploaded to nothing, which is exactly the silent
+    // half-finished state refusing at the point of intent exists to avoid.
+    if !session.server.is_absent()
+        && crate::client::otp_cli::binary_available(&session.otp_cli_cfg)
+    {
         wr.send_control(&ClientMessage::OtpMailFetch).await?;
         session.conn_stats.record_event(Instant::now());
         crate::client::otp_mail::resend_pending(&mut wr, &mut session).await?;
+    }
+
+    // A serverless daemon never receives a `ChannelList` - nothing sends
+    // one - so the joins its plan asks for have to be driven from here
+    // instead, or `--channel` would be silently ignored on the one start
+    // where nobody is watching to notice.
+    if session.server.is_serverless() {
+        request_daemon_joins(&mut wr, &mut ui_state, &mut session).await?;
     }
 
     surface.draw(|f| ui::render(f, &ui_state))?;
@@ -553,7 +706,28 @@ pub async fn run_connected_session(
                 }
             }
             msg = net_rx.recv() => {
-                let Some(msg) = msg else { break };
+                let Some(msg) = msg else {
+                    // The server is gone. With direct links configured
+                    // that is a degradation, not an ending: those links
+                    // are punched peer-to-peer and neither know nor care
+                    // that it went away, and tearing the session down
+                    // would disconnect the very peers it did not affect.
+                    // Anything needing a server is refused from here on,
+                    // described as temporary (`ServerState::Unreachable`)
+                    // since it may well come back.
+                    if session.server == ServerState::Connected
+                        && session.peer_link.has_direct_targets()
+                    {
+                        session.server = ServerState::Unreachable;
+                        ui_state.push_status_notice(
+                            "the server connection was lost - direct links are unaffected"
+                                .to_string(),
+                            false,
+                        );
+                        continue;
+                    }
+                    break;
+                };
                 if let Some(action) = handle_server_message(msg, &mut ui_state, &mut wr, &mut session).await? {
                     handle_ui_action(action, &mut wr, &mut ui_state, &mut session).await?;
                 }
@@ -572,6 +746,28 @@ pub async fn run_connected_session(
             }
             msg = rotate_out_rx.recv() => {
                 let Some(msg) = msg else { break };
+                // A rotation for a peer the server has never named cannot
+                // be relayed by it, and with no server at all none can.
+                // The link is already authenticated and the rotation
+                // carries its own signature, so it rides the link instead
+                // - the alternative is forward secrecy silently stopping
+                // (§13.10) for precisely the peers §7.1.5 exists for.
+                if let ClientMessage::RotateKey {
+                    to,
+                    new_public_key_der,
+                    signature,
+                } = &msg
+                    && (session.server.is_absent() || p2p::is_direct_peer_id(*to))
+                {
+                    session.peer_link.send_reliable_or_queue(
+                        *to,
+                        P2pPayload::KeyRotation {
+                            rotation: new_public_key_der.clone(),
+                            signature: signature.clone(),
+                        },
+                    );
+                    continue;
+                }
                 wr.send_control(&msg).await?;
                 session.conn_stats.record_event(Instant::now());
             }
@@ -690,7 +886,11 @@ pub async fn run_connected_session(
                 }
             }
             _ = heartbeat_ticker.tick() => {
-                wr.send_control(&ClientMessage::Heartbeat).await?;
+                // Liveness is a claim made *to a server* (§4.1). With none
+                // there is nobody it could reassure.
+                if !session.server.is_absent() {
+                    wr.send_control(&ClientMessage::Heartbeat).await?;
+                }
             }
             _ = ticker.tick() => {
                 tick_count = tick_count.wrapping_add(1);
@@ -739,7 +939,10 @@ pub async fn run_connected_session(
                 for stream in session.active_streams.values().filter(|s| s.last_seen < cutoff) {
                     let _ = stream.job_tx.send(voice_stream::DecryptJob::End);
                 }
-                session.peer_link.tick();
+                session.peer_link.tick_with_clock(crate::client::p2p::utc_second_of_hour());
+            }
+            Some((nickname, addr)) = direct_resolved_rx.recv() => {
+                session.peer_link.on_direct_resolved(&nickname, addr);
             }
         }
         surface.draw(|f| ui::render(f, &ui_state))?;
@@ -748,12 +951,69 @@ pub async fn run_connected_session(
     Ok(())
 }
 
+/// Sends on the control channel only when there is a server able to
+/// receive it, and reports success either way.
+///
+/// A session that has lost its server but kept its direct links alive
+/// (`ServerState::Unreachable`) still reaches code that would write to it -
+/// a re-signal, a channel departure. Writing to a dead socket errors, and
+/// every one of those call sites propagates with `?`, so without this the
+/// first such attempt would end the very session this is keeping alive.
+pub(crate) async fn send_if_server(
+    session: &SessionState,
+    wr: &mut impl crate::control::ControlSink,
+    msg: &ClientMessage,
+) -> proto::Result<()> {
+    if session.server.is_absent() {
+        return Ok(());
+    }
+    wr.send_control(msg).await
+}
+
 async fn handle_ui_action(
     action: UiAction,
     wr: &mut impl crate::control::ControlSink,
     ui_state: &mut UiState,
     session: &mut SessionState,
 ) -> proto::Result<()> {
+    // Refused here, before anything acts on it, rather than left to vanish
+    // into a control channel with no server behind it. A dropped message
+    // is indistinguishable from the app ignoring you: the join popup would
+    // close and no channel would ever appear, and a mail would sit
+    // "sending" against a result that cannot arrive. One check, at the one
+    // place every action passes through, so no call site can forget it.
+    if let Some(what) = action.needs_server()
+        && session.server.is_absent()
+    {
+        // Joining is the one refusal with a local answer: with no server a
+        // channel is just a name both sides declare, so joining one that
+        // *is* declared needs nobody's permission. Only a name nothing
+        // configured is genuinely impossible.
+        if let UiAction::JoinChannel { name, .. } = &action
+            && session.server.is_serverless()
+        {
+            if ui_state.known_channels.iter().any(|c| c.name == *name) {
+                crate::client::channel::on_joined(
+                    ui_state,
+                    proto::ChannelInfo {
+                        name: name.clone(),
+                        kind: proto::ChannelKind::Public,
+                    },
+                );
+                broadcast_channel_presence(session, ui_state);
+                return Ok(());
+            }
+            ui_state.push_status_notice(
+                format!(
+                    "{name:?} is not a direct_punch_channel - without a server,                      only channels named in ~/.aloo/settings exist"
+                ),
+                false,
+            );
+            return Ok(());
+        }
+        ui_state.push_status_notice(session.server.refusal(what), false);
+        return Ok(());
+    }
     match action {
         UiAction::JoinChannel {
             name,
@@ -1239,7 +1499,7 @@ async fn handle_server_message(
             // to everyone in the hall as a connect/disconnect flicker.
             if session.daemon_plan.is_some() {
                 ui_state.on_channel_list(list);
-                request_daemon_joins(wr, session).await?;
+                request_daemon_joins(wr, ui_state, session).await?;
             } else if let Some(action) = crate::client::channel::on_list(ui_state, list) {
                 return Ok(Some(action));
             }
@@ -1248,6 +1508,7 @@ async fn handle_server_message(
             let name = channel.name.clone();
             crate::client::channel::on_joined(ui_state, channel);
             apply_daemon_channel_focus(ui_state, session, &name);
+            broadcast_channel_presence(session, ui_state);
         }
         // Reuses the plain, dedup-safe appender directly - unlike
         // `crate::client::channel::on_list` (only for the connect-time snapshot
@@ -1322,12 +1583,26 @@ async fn handle_server_message(
             // nothing was actually being punched. Harmless unconditionally:
             // `ensure_link` is a no-op on an existing link, and failure
             // stays silent until something is actually queued against them.
+            // A `direct_punch_to` peer who is also on this server is one
+            // person, and must end up with one link: filing their direct
+            // target under the id the server just named is what makes the
+            // two routes converge on a single `PeerLink` (§7.1.5 step 6)
+            // instead of one per route.
+            if let Some(stale) = session
+                .peer_link
+                .set_direct_peer_id(&user.name, Some(user.id))
+            {
+                // Their link was already up under the settings-file
+                // identity and has just moved onto the one the server
+                // named; the row it used to colour is nobody now.
+                ui_state.forget_link_status(stale);
+            }
             session.peer_link.ensure_link(wr, user.id).await;
             let joined_id = user.id;
             let joined_name = user.name.clone();
             ui_state.on_user_joined(&channel, user);
             if let Some(action) =
-                on_daemon_peer_appeared(ui_state, session, joined_id, &joined_name, &channel)
+                on_daemon_peer_appeared(ui_state, session, joined_id, &joined_name, Some(&channel))
             {
                 return Ok(Some(action));
             }
@@ -1354,6 +1629,12 @@ async fn handle_server_message(
             // them - unlike `UserLeft` (one channel, possibly still shared
             // elsewhere or via an open DM), so this is the one case safe to
             // forget the link unconditionally.
+            // Released *before* the forget, not after: releasing moves a
+            // live direct link back onto its settings-file identity, so
+            // the forget below then finds nothing under `user_id` and
+            // leaves it alone. The other order tore down a working direct
+            // link every time its peer merely left the server.
+            session.peer_link.release_direct_peer_id(user_id);
             session.peer_link.forget(user_id);
             ui_state.forget_link_status(user_id);
             // Their rotating encryption keys, and ours for them, end with
@@ -1455,6 +1736,7 @@ async fn handle_server_message(
 /// terminal.
 async fn request_daemon_joins(
     wr: &mut impl crate::control::ControlSink,
+    ui_state: &mut UiState,
     session: &mut SessionState,
 ) -> proto::Result<()> {
     let Some(plan) = session.daemon_plan.as_mut() else {
@@ -1470,12 +1752,21 @@ async fn request_daemon_joins(
         // an existing channel keeps whatever kind it already has
         // (docs/PROTOCOL.md §6.1), so this never converts one. A private
         // channel joined by name with its password works identically.
-        crate::client::channel::handle_join(
+        // Through the ordinary action path rather than straight into
+        // `handle_join`: that is where the "can this happen at all" check
+        // lives, and a daemon start is exactly when nobody is watching to
+        // notice a join that quietly went nowhere. With no server it turns
+        // into a local join for a configured channel, and a named refusal
+        // for anything else.
+        handle_ui_action(
+            UiAction::JoinChannel {
+                name: channel.name.clone(),
+                kind: proto::ChannelKind::Public,
+                password: channel.password.clone(),
+            },
             wr,
+            ui_state,
             session,
-            channel.name.clone(),
-            proto::ChannelKind::Public,
-            channel.password.clone(),
         )
         .await?;
     }
@@ -1516,7 +1807,10 @@ fn on_daemon_peer_appeared(
     session: &mut SessionState,
     peer: UserId,
     nickname: &str,
-    channel: &str,
+    // `None` for a peer reached with no server and sharing no channel
+    // (§7.1.5): there is no channel they can be said to have arrived in,
+    // but they have still arrived, and a DM focus is about the person.
+    channel: Option<&str>,
 ) -> Option<UiAction> {
     // Daemon mode at all, or there is nothing here to do.
     session.daemon_plan.as_ref()?;
@@ -1547,7 +1841,7 @@ fn on_daemon_peer_appeared(
     // it. A peer who is not what this daemon was told to watch for is of
     // no further interest - the sound above has already had its say.
     let plan = session.daemon_plan.as_ref()?;
-    if !plan.is_focus_event(nickname, Some(channel)) {
+    if !plan.is_focus_event(nickname, channel) {
         return None;
     }
     let is_dm_focus = plan.focused_nickname() == Some(nickname);
@@ -1564,7 +1858,10 @@ fn on_daemon_peer_appeared(
         if is_dm_focus {
             "Hold the push-to-talk shortcut to talk to them.".to_string()
         } else {
-            format!("Joined {channel}.")
+            match channel {
+                Some(channel) => format!("Joined {channel}."),
+                None => "Reachable directly.".to_string(),
+            }
         },
     ));
 
@@ -1846,13 +2143,36 @@ async fn handle_p2p_event(
             candidates,
             link_nonce,
         } => {
-            wr.send_control(&ClientMessage::RequestPeerLink {
-                peer,
-                candidates,
-                link_nonce,
-            })
+            send_if_server(
+                session,
+                wr,
+                &ClientMessage::RequestPeerLink {
+                    peer,
+                    candidates,
+                    link_nonce,
+                },
+            )
             .await?;
             session.conn_stats.record_event(Instant::now());
+        }
+        P2pEvent::DirectResolve {
+            nickname,
+            host,
+            port,
+        } => {
+            // Resolved off the select loop (a DNS lookup can block for
+            // seconds) and handed back on the next pass through this
+            // handler, exactly as `PeerLinkManager::direct_tick` expects.
+            // An attempt whose answer never arrives simply times out at
+            // `DIRECT_PUNCH_WINDOW` and resolves again at its next slot.
+            let tx = session.direct_resolved_tx.clone();
+            tokio::spawn(async move {
+                let addr = tokio::net::lookup_host((host.as_str(), port))
+                    .await
+                    .ok()
+                    .and_then(|mut addrs| addrs.next());
+                let _ = tx.send((nickname, addr));
+            });
         }
         P2pEvent::LinkStatusChanged { peer, status } => {
             ui_state.set_link_status(peer, status);
@@ -1886,6 +2206,11 @@ async fn handle_p2p_event(
                     // (docs/PROTOCOL.md §12.7); silently does nothing if we
                     // can't currently address them.
                     send_device_id_announce(session, ui_state, peer);
+                    // A serverless peer has no server to learn our
+                    // membership from, so a link opening is the moment to
+                    // say it - and this envelope is also the thing that
+                    // authenticates us to them (§7.1.5).
+                    send_channel_presence(session, ui_state, peer);
                     maybe_resolve_p2p_identity_data(session, ui_state, peer);
                 }
                 p2p::LinkStatus::Lost => {
@@ -1901,6 +2226,26 @@ async fn handle_p2p_event(
                     }
                 }
                 p2p::LinkStatus::Connecting => {}
+            }
+        }
+        P2pEvent::KeyRotation {
+            from,
+            rotation,
+            signature,
+        } => {
+            // The same handler `ServerMessage::KeyRotated` uses: the
+            // rotation verifies itself against the sender's pinned
+            // identity, so which transport carried it changes nothing
+            // about whether it is trusted (docs/PROTOCOL.md 13.10).
+            handle_pq_key_rotated(ui_state, session, from, rotation, signature);
+        }
+        P2pEvent::ChannelPresence { from, envelope } => {
+            // Registration can produce the daemon's own `--otp` proposal,
+            // the same one `UserJoined` produces; driven through the
+            // ordinary action path so there stays exactly one
+            // implementation of it.
+            if let Some(action) = on_channel_presence(session, ui_state, from, envelope) {
+                handle_ui_action(action, wr, ui_state, session).await?;
             }
         }
         P2pEvent::DeviceIdAnnounce { from, envelope } => {
@@ -2197,6 +2542,243 @@ fn record_last_seen(session: &mut SessionState, nickname: &str, addr: SocketAddr
 /// sends immediately with whichever key (bootstrap or latest rotated) is
 /// currently on file for them, same as `otp::recover_and_resend` already
 /// does opportunistically on every `Active` transition.
+/// The recipient details for a serverless peer, assembled from what is
+/// known locally rather than from anything a server said (§7.1.5).
+///
+/// The key comes from `id_store`: it pins a nickname's full public key,
+/// and `direct_punch_to` names peers by that same nickname, so anyone this
+/// client has ever met through a server can still be addressed without
+/// one. A peer with no pinned key cannot be - there is nothing to encrypt
+/// to them with, and inventing a key would defeat the entire point of
+/// pinning - so they stay a transport-only link.
+///
+/// `PqHybrid` is not a default here but a requirement. Registration turns
+/// an unauthenticated nickname into a roster entry, and only `pq_hybrid`
+/// signs its sends (`docs/PROTOCOL.md` §13.4), so only there can an
+/// arriving envelope actually prove who sent it. Under `Password`/`None`
+/// anyone able to reach the port could claim any nickname and be believed.
+/// What one arriving `ChannelPresence` means for a peer's membership.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Reconciled {
+    /// Channels both sides are in - the peer's whole visible membership
+    /// after this announcement.
+    pub shared: Vec<String>,
+    /// Shared channels the peer is not listed in yet.
+    pub join: Vec<String>,
+    /// Channels the peer is currently listed in but no longer claims, or
+    /// that this client has itself left.
+    pub leave: Vec<String>,
+}
+
+/// Works out what an announced membership list changes, given what this
+/// client has joined and where the peer is currently listed.
+///
+/// Only channels *we* have joined are ever considered, which is the same
+/// rule a server applies when deciding whose `UserJoined` we are told
+/// about: a peer listing channels we are not in tells us nothing we have
+/// anywhere to put. The list is authoritative rather than additive - a
+/// peer that has left a channel says so by omitting it - so this is a
+/// reconciliation, not a merge, and a peer can never accumulate channels
+/// it has since left.
+pub fn reconcile_direct_membership(
+    theirs: &[String],
+    ours: &[String],
+    current: &[String],
+) -> Reconciled {
+    let shared: Vec<String> = theirs
+        .iter()
+        .filter(|c| ours.contains(c))
+        .cloned()
+        .collect();
+    let join = shared
+        .iter()
+        .filter(|c| !current.contains(c))
+        .cloned()
+        .collect();
+    let leave = current
+        .iter()
+        .filter(|c| !shared.contains(c))
+        .cloned()
+        .collect();
+    Reconciled { shared, join, leave }
+}
+
+pub fn direct_peer_identity(
+    id_store: &crate::client::idstore::IdStore,
+    nickname: &str,
+) -> Option<UserInfo> {
+    let key = id_store.get(nickname)?.to_vec();
+    // A pinned key that is not a PQ bundle belongs to one of the unsigned
+    // modes, which cannot authenticate anything.
+    proto::decode::<crypto::pq::PqPublicBundle>(&key).ok()?;
+    Some(UserInfo {
+        id: crate::client::p2p::direct_peer_id(nickname),
+        name: nickname.to_string(),
+        public_key_der: key,
+        key_mode: KeyMode::PqHybrid,
+    })
+}
+
+/// Tells a serverless peer which channels we are in, so they can place us
+/// in the ones we share (`P2pPayload::ChannelPresence`). Sent when their
+/// link opens and again whenever our own membership moves; a peer we have
+/// no pinned key for is skipped, since nothing can be sealed to them.
+/// Records a serverless peer's bootstrap encryption keys from the bundle
+/// pinned for their nickname - the job `ServerMessage::UserJoined` does for
+/// a peer a server announced (§13.10's "what to encrypt to until the
+/// relationship rotates").
+///
+/// Without this there is nothing to encrypt *to* them with, and since
+/// `encrypt_envelope_for` simply yields nothing when the recipient's encap
+/// keys are missing, every send to them - including the `ChannelPresence`
+/// that would have registered us with them - fails silently. That deadlocks
+/// the exchange in exactly the case it exists for: neither side is on a
+/// server, so neither is ever announced to the other, so neither ever gets
+/// keys. Seeded from the pin instead, which is the same material a server
+/// would have relayed.
+///
+/// Idempotent: a peer whose keys are already known keeps them, so a later
+/// rotation is never undone by re-seeding the bootstrap it superseded.
+fn seed_direct_peer_keys(session: &mut SessionState, peer: UserId, info: &UserInfo) {
+    if session.pq_peer_keys.encap_for(peer).is_some() {
+        return;
+    }
+    let Ok(bundle) = proto::decode::<crypto::pq::PqPublicBundle>(&info.public_key_der) else {
+        return;
+    };
+    let Ok(fingerprint) = crypto::pq::bundle_fingerprint(&bundle) else {
+        return;
+    };
+    session
+        .pq_peer_keys
+        .bootstrap(peer, bundle.bootstrap_encap().clone(), fingerprint);
+}
+
+fn send_channel_presence(session: &mut SessionState, ui_state: &UiState, peer: UserId) {
+    let Some(nickname) = session.peer_link.direct_nickname_of(peer) else {
+        return;
+    };
+    let Some(info) = direct_peer_identity(&session.id_store, &nickname) else {
+        return;
+    };
+    seed_direct_peer_keys(session, peer, &info);
+    let channels: Vec<String> = ui_state
+        .channels
+        .iter()
+        .filter(|c| c.joined)
+        .map(|c| c.name.clone())
+        .collect();
+    let Ok(plaintext) = proto::encode(&channels) else {
+        return;
+    };
+    let send_id = session.next_stream_id;
+    session.next_stream_id += 1;
+    let Some(envelope) = crate::client::envelope::encrypt_envelope_for(
+        session.own_pq_private.as_ref(),
+        session.pq_peer_keys.encap_for(peer),
+        info.key_mode,
+        &info.public_key_der,
+        None,
+        send_id,
+        &plaintext,
+        Content::ChannelPresence,
+    ) else {
+        return;
+    };
+    session
+        .peer_link
+        .send_reliable_or_queue(peer, P2pPayload::ChannelPresence { envelope });
+}
+
+/// Sends our channel membership to every serverless peer whose link is up.
+/// Called whenever that membership changes, so a peer never goes on
+/// believing we share a channel we have left, or misses one we just joined.
+pub(crate) fn broadcast_channel_presence(session: &mut SessionState, ui_state: &UiState) {
+    for peer in session.peer_link.active_direct_peers() {
+        send_channel_presence(session, ui_state, peer);
+    }
+}
+
+/// Handles an arriving `ChannelPresence` - the moment a serverless peer
+/// stops being a bare transport link and becomes someone this client can
+/// actually see and address (§7.1.5).
+///
+/// Opening the envelope *is* the authentication: `decrypt_own_envelope`
+/// verifies the sender's signature against the key pinned for their
+/// nickname and checks the recipient binding, so an envelope that opens
+/// could only have come from whoever holds that key. Nothing registers a
+/// peer before that - a `DirectPing` carries an unauthenticated nickname
+/// and is believed by nobody.
+///
+/// Membership is reconciled, not merely added to: a peer who has left a
+/// channel says so by sending a list without it, and is dropped from that
+/// channel here. Only channels *we* have joined are considered, which is
+/// the same rule a server applies when it decides whose `UserJoined` we
+/// are told about.
+fn on_channel_presence(
+    session: &mut SessionState,
+    ui_state: &mut UiState,
+    from: UserId,
+    envelope: Envelope,
+) -> Option<UiAction> {
+    if envelope.content != Content::ChannelPresence {
+        return None;
+    }
+    let nickname = session.peer_link.direct_nickname_of(from)?;
+    let info = direct_peer_identity(&session.id_store, &nickname)?;
+    let plaintext = decrypt_own_envelope(&envelope, from, &info, None, session)?;
+    // Only once they have proved who they are: seeding keys for an
+    // unauthenticated claim would let anyone reaching the port decide what
+    // this client encrypts to under that nickname.
+    seed_direct_peer_keys(session, from, &info);
+    let theirs: Vec<String> = proto::decode(&plaintext).ok()?;
+
+    let ours: Vec<String> = ui_state
+        .channels
+        .iter()
+        .filter(|c| c.joined)
+        .map(|c| c.name.clone())
+        .collect();
+    let current = ui_state.channels_containing_member(from);
+    let Reconciled { shared, join, leave } = reconcile_direct_membership(&theirs, &ours, &current);
+
+    // Departures first, so a peer moving from one channel to another is
+    // never momentarily in neither.
+    for channel in leave {
+        ui_state.on_user_left(&channel, from);
+    }
+
+    let mut action = None;
+    for channel in &join {
+        // The same entry point `ServerMessage::UserJoined` uses: from here
+        // on nothing downstream - the sidebar, channel sends, voice, the
+        // call roster, `--focus` - can tell this peer apart from one a
+        // server introduced, which is the entire point.
+        ui_state.on_user_joined(channel, info.clone());
+        // And the same daemon hooks, so a punched peer arriving while
+        // nobody is watching still rings, notifies, and takes the focus it
+        // was started with.
+        if action.is_none() {
+            action = on_daemon_peer_appeared(ui_state, session, from, &nickname, Some(channel));
+        }
+    }
+    // A peer we share no channel with is still reachable as a DM - that is
+    // what `direct_punch_to` on its own buys, and what `--focus <nickname>`
+    // addresses - so they are registered either way, and the daemon hooks
+    // still run for them. Without this a DM-only pair got a working link
+    // and nothing else: no focus placed, no chime, and - the one that
+    // actually loses data - no `--otp` proposal, since that is what a
+    // focused peer *appearing* is supposed to trigger.
+    if shared.is_empty() {
+        let first_sighting = !ui_state.known_users.contains_key(&from);
+        ui_state.known_users.insert(from, info);
+        if first_sighting {
+            action = on_daemon_peer_appeared(ui_state, session, from, &nickname, None);
+        }
+    }
+    action
+}
+
 fn send_device_id_announce(session: &mut SessionState, ui_state: &UiState, peer: UserId) {
     let Some(user) = ui_state.known_users.get(&peer) else {
         return;

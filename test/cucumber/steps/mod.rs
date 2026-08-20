@@ -13,6 +13,7 @@ pub mod channels;
 pub mod connect;
 pub mod control_channel;
 pub mod daemon;
+pub mod direct_punch;
 pub mod encryption;
 pub mod file_transfer;
 pub mod identity;

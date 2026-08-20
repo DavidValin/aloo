@@ -658,6 +658,11 @@ pub struct DaemonConfig {
     /// places that matter rather than the default one.
     pub channels: Vec<DaemonChannel>,
     pub focus: Option<DaemonFocus>,
+    /// Run with no server at all (`--no-server`): reachable only by the
+    /// `direct_punch_to` peers in `~/.aloo/settings` (docs/PROTOCOL.md
+    /// §7.1.5). Everything that needs a server is refused, by name, at the
+    /// point it is asked for.
+    pub no_server: bool,
 }
 
 /// The flags a daemon start can carry, straight off the command line.
@@ -675,6 +680,7 @@ pub struct DaemonFlags {
     pub channels: Vec<String>,
     pub focus: Option<String>,
     pub otp: bool,
+    pub no_server: bool,
 }
 
 impl DaemonConfig {
@@ -706,9 +712,13 @@ impl DaemonConfig {
             .clone()
             .or_else(|| settings.daemon_host.clone())
             .or_else(|| cached.map(|(host, ..)| host.to_string()))
+            // `--no-server` is the one start that legitimately has nowhere
+            // to connect to, so it must not be held to this.
+            .or_else(|| (flags.no_server || settings.daemon_no_server).then(String::new))
             .ok_or_else(|| {
                 "no server to connect to - pass --host, set daemon_host in ~/.aloo/settings, \
-                 or connect once with plain `aloo` so the daemon can reuse it"
+                 connect once with plain `aloo` so the daemon can reuse it, or pass \
+                 --no-server to run with none at all"
                     .to_string()
             })?;
         let port = flags
@@ -763,7 +773,15 @@ impl DaemonConfig {
         }
         // See this function's doc: a DM focus needs somewhere to see the
         // person from.
-        if matches!(focus, Some(DaemonFocus::Dm { .. })) && channels.is_empty() {
+        // ...but only where presence exists to be watched. With no server
+        // a peer is found by punching at the address settings names, not by
+        // being announced in a channel, and the hall is not a channel a
+        // serverless client could join anyway - adding it would produce an
+        // empty tab that can never fill (§7.1.5).
+        if !(flags.no_server || settings.daemon_no_server)
+            && matches!(focus, Some(DaemonFocus::Dm { .. }))
+            && channels.is_empty()
+        {
             eprintln!(
                 "aloo: no --channel given, so joining {} to watch for the focused peer - \
                  presence is only ever announced within a shared channel",
@@ -784,6 +802,7 @@ impl DaemonConfig {
             id_store_path: crate::client::idstore::default_path(),
             channels,
             focus,
+            no_server: flags.no_server || settings.daemon_no_server,
         })
     }
 
@@ -813,7 +832,15 @@ impl DaemonConfig {
         });
         let otp = matches!(self.focus, Some(DaemonFocus::Dm { otp: true, .. }));
         crate::settings::Settings::update_daemon(path, |s| {
-            s.daemon_host = Some(self.host.clone());
+            s.daemon_no_server = self.no_server;
+            // A serverless daemon has no host, and writing the empty one it
+            // stands in for would leave the next bare `--daemon` start
+            // resolving a host that is not a host. Whatever was recorded
+            // before is left alone instead: it costs nothing, and it is
+            // what a later start *with* a server should find.
+            if !self.no_server {
+                s.daemon_host = Some(self.host.clone());
+            }
             s.daemon_port = Some(self.port);
             s.daemon_nickname = Some(self.nickname.clone());
             s.daemon_channels = channels;
@@ -969,7 +996,7 @@ impl DaemonPlan {
         viewer_attached: bool,
         focus: &crate::client::tui::ui::CurrentFocus,
         joining_peer: crate::proto::UserId,
-        joining_channel: &str,
+        joining_channel: Option<&str>,
         already_announced: bool,
     ) -> bool {
         use crate::client::tui::ui::CurrentFocus;
@@ -977,7 +1004,10 @@ impl DaemonPlan {
             return false;
         }
         match focus {
-            CurrentFocus::Channel(name) => name == joining_channel,
+            // A peer who arrived through no channel at all - punched
+            // directly, sharing none (§7.1.5) - cannot be the arrival the
+            // *channel* in focus was waiting for.
+            CurrentFocus::Channel(name) => joining_channel == Some(name.as_str()),
             CurrentFocus::Dm(peer) => *peer == joining_peer && !already_announced,
             CurrentFocus::Nowhere => false,
         }
@@ -1083,19 +1113,54 @@ pub async fn run(
     }
 
     let request = config.to_connect_request();
-    let (rd, wr, you, identity, key_mode, server_addr) =
-        crate::client::connect::connect_and_handshake(&request).await?;
+    // With `--no-server` there is nobody to hand us a `UserId`, no control
+    // channel to open and no rendezvous to ask - only local key material
+    // and the peers `direct_punch_to` names (docs/PROTOCOL.md §7.1.5). The
+    // identity resolution is the very same one a connecting client does;
+    // all that is skipped is the part that needed somewhere to connect to.
+    let serverless = config.no_server;
+    let (rd, wr, you, identity, key_mode, server_addr) = if serverless {
+        let (identity, key_mode) = crate::client::connect::resolve_my_keypair(&request.my_key)?;
+        (
+            None,
+            ServerlessSink::Null(crate::control::NullSink),
+            crate::client::p2p::direct_peer_id(&request.nickname),
+            identity,
+            key_mode,
+            None,
+        )
+    } else {
+        let (rd, wr, you, identity, key_mode, server_addr) =
+            crate::client::connect::connect_and_handshake(&request).await?;
+        (
+            Some(rd),
+            ServerlessSink::Server(wr),
+            you,
+            identity,
+            key_mode,
+            Some(server_addr),
+        )
+    };
 
     let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(serve_attachments(listener, input_tx));
 
-    println!(
-        "aloo: daemon connected to {}:{} as {} (pid {})",
-        config.host,
-        config.port,
-        config.nickname,
-        std::process::id()
-    );
+    if serverless {
+        println!(
+            "aloo: daemon started as {} with no server (pid {}) - reachable \
+             only by the direct_punch_to peers in ~/.aloo/settings",
+            config.nickname,
+            std::process::id()
+        );
+    } else {
+        println!(
+            "aloo: daemon connected to {}:{} as {} (pid {})",
+            config.host,
+            config.port,
+            config.nickname,
+            std::process::id()
+        );
+    }
 
     let id_store = crate::client::idstore::IdStore::load(&request.id_store_path)
         .unwrap_or_else(|_| {
@@ -1138,6 +1203,23 @@ pub async fn run(
 
     drop(instance);
     result
+}
+
+/// The control channel a daemon writes to: a real one, or nothing at all
+/// under `--no-server`. One type rather than a generic parameter on `run`,
+/// since the choice is made at runtime from configuration.
+enum ServerlessSink {
+    Server(crate::control::ControlWriter<tokio::io::WriteHalf<tokio::net::TcpStream>>),
+    Null(crate::control::NullSink),
+}
+
+impl crate::control::ControlSink for ServerlessSink {
+    async fn send_control(&mut self, msg: &crate::proto::ClientMessage) -> crate::proto::Result<()> {
+        match self {
+            Self::Server(w) => w.send_control(msg).await,
+            Self::Null(n) => n.send_control(msg).await,
+        }
+    }
 }
 
 /// Plays the "this did not start" tone and reports why.

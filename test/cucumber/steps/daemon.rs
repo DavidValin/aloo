@@ -630,7 +630,7 @@ async fn told_someone_joined(w: &mut AlooWorld, nickname: String, channel: Strin
         w.chime_viewer_attached,
         w.chime_focus.as_ref().unwrap_or(&CurrentFocus::Nowhere),
         peer,
-        &channel,
+        Some(&channel),
         w.chime_announced.contains(&peer),
     );
     // The session records them as online whether or not it made a noise.

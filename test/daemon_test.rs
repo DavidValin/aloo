@@ -617,3 +617,134 @@ fn a_password_containing_a_comma_survives_the_settings_file() {
     assert_eq!(config.channels[0].name, "ops");
     assert_eq!(config.channels[0].password.as_deref(), Some("a,b"));
 }
+
+// ---- Daemon with no server (docs/PROTOCOL.md 7.1.5) --------------------
+
+fn temp_settings_path() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "aloo-daemon-noserver-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ))
+}
+
+/// `--no-server` is the one start that legitimately has nowhere to
+/// connect, so the host requirement must not apply to it.
+///
+/// @requirement AC-221
+#[test]
+fn no_server_lifts_the_host_requirement() {
+    let flags = DaemonFlags {
+        no_server: true,
+        nickname: Some("omar".into()),
+        ..DaemonFlags::default()
+    };
+    let config = DaemonConfig::resolve(&flags, &Settings::default(), &empty_cache())
+        .expect("--no-server must start with no host anywhere");
+    assert!(config.no_server);
+}
+
+/// A bare `aloo --daemon` at the next boot has to reproduce the last
+/// configuration - which for a serverless daemon means coming back
+/// serverless, not failing to start for want of a host it never had.
+///
+/// @requirement AC-221
+#[test]
+fn a_serverless_daemon_comes_back_serverless_after_a_restart() {
+    let path = temp_settings_path();
+    let flags = DaemonFlags {
+        no_server: true,
+        nickname: Some("omar".into()),
+        ..DaemonFlags::default()
+    };
+    let config = DaemonConfig::resolve(&flags, &Settings::default(), &empty_cache()).unwrap();
+    config.persist(&path).unwrap();
+
+    // The next boot passes no flags at all.
+    let reloaded = Settings::load_or_create(&path).unwrap();
+    let restarted = DaemonConfig::resolve(&DaemonFlags::default(), &reloaded, &empty_cache())
+        .expect("a persisted serverless daemon must start again with no flags");
+    assert!(
+        restarted.no_server,
+        "the daemon came back expecting a server it was never given"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The hall exists so a DM focus has somewhere to *see* the person from -
+/// presence is announced within a shared channel. With no server there is
+/// no presence and no hall to join; a serverless peer is found by punching
+/// at them, so joining a channel nothing configured would only produce an
+/// empty tab that can never fill.
+///
+/// @requirement AC-221
+#[test]
+fn a_serverless_dm_focus_does_not_get_a_discovery_channel() {
+    let flags = DaemonFlags {
+        no_server: true,
+        nickname: Some("omar".into()),
+        focus: Some("peter".into()),
+        ..DaemonFlags::default()
+    };
+    let config = DaemonConfig::resolve(&flags, &Settings::default(), &empty_cache()).unwrap();
+    assert!(
+        config.channels.is_empty(),
+        "a serverless DM focus needs no channel to discover anyone through, \
+         but got {:?}",
+        config.channels
+    );
+}
+
+/// A peer punched directly who shares no channel has still *arrived* - and
+/// a DM focus is about the person, not about where they turned up. The
+/// chime's channel arm is the only part that needs one, and a peer with
+/// none can never be the arrival a focused *channel* was waiting for.
+///
+/// This is the shape of an OTP pair configured only for each other
+/// (docs/PROTOCOL.md §7.1.5, §16): no channel between them at all.
+///
+/// @requirement AC-221
+#[test]
+fn a_dm_focus_is_about_the_person_even_with_no_channel_between_them() {
+    use aloo::client::tui::ui::CurrentFocus;
+
+    let peer = aloo::proto::UserId(1);
+    let plan = DaemonPlan::new(
+        Vec::new(),
+        Some(DaemonFocus::Dm {
+            nickname: "alice".into(),
+            otp: true,
+        }),
+    );
+    // The focus fires for the person whether or not a channel is named.
+    assert!(plan.is_focus_event("alice", None));
+    assert!(plan.is_focus_event("alice", Some("team")));
+    assert!(!plan.is_focus_event("bob", None));
+
+    // ...and the OTP session a `--otp` daemon exists to propose is offered
+    // for them, which is what a DM-only pair would otherwise never get.
+    assert!(plan.should_invite_otp("alice", false));
+
+    // The chime still rings for a focused DM peer arriving from nowhere.
+    assert!(DaemonPlan::should_play_joined_chime(
+        true,
+        false,
+        &CurrentFocus::Dm(peer),
+        peer,
+        None,
+        false,
+    ));
+    // But a focused *channel* is never satisfied by a peer who arrived in
+    // no channel at all.
+    assert!(!DaemonPlan::should_play_joined_chime(
+        true,
+        false,
+        &CurrentFocus::Channel("team".into()),
+        peer,
+        None,
+        false,
+    ));
+}

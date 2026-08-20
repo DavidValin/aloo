@@ -54,6 +54,7 @@ falling back to a server relay (§7.1).
     - [7.1.2 Trust boundary: responding only within a shared channel](#712-trust-boundary-responding-only-within-a-shared-channel)
     - [7.1.3 Tearing down a link once it no longer serves a purpose](#713-tearing-down-a-link-once-it-no-longer-serves-a-purpose)
     - [7.1.4 Showing which peers are actually reachable](#714-showing-which-peers-are-actually-reachable)
+    - [7.1.5 Punching with no server at all](#715-punching-with-no-server-at-all)
   - [7.2 Sending a channel or direct text message](#72-sending-a-channel-or-direct-text-message)
   - [7.3 Voice streaming](#73-voice-streaming)
   - [7.4 `Error { message: String }`](#74-error-message-string)
@@ -197,6 +198,7 @@ the payload carried inside a reliable or unreliable one.
 | Punch datagram | Purpose |
 |---|---|
 | `Ping` / `Pong` | Opens and confirms the NAT mapping (§7.1) |
+| `DirectPing` / `DirectPong` | The same, for a link no server arranged - names the sender, since nothing relayed an identity (§7.1.5) |
 | `Keepalive` | Stops an idle mapping expiring (§7.1) |
 | `Reliable` / `Ack` | The retransmitting layer text and files ride on (§7.1.1) |
 | `Unreliable` | Voice chunks, which are not worth retransmitting (§7.3) |
@@ -215,6 +217,8 @@ the payload carried inside a reliable or unreliable one.
 | `OtpVoiceOffer` | reliably | Offers a fully-recorded voice message under the pad layer - auto-accepted, no popup (§16.2) |
 | `OtpDeliveryAck` | reliably | Confirms an `OtpEnvelope`/`OtpFileOffer`/`OtpVoiceOffer` decoded, unblocking the next one (§16) |
 | `DeviceIdAnnounce` | reliably | This side's device id, sealed like any other content - sent automatically once `Active` (§12.7) |
+| `ChannelPresence` | reliably | This side's joined channels, sealed - what turns a serverless punched path into a peer in shared channels (§7.1.5) |
+| `KeyRotation` | reliably | A signed encryption-key rotation, carried on the link instead of relayed - what keeps forward secrecy working with no server in reach (§13.10, §7.1.5) |
 | `CallInvite` | reliably | Proposes a live voice call (§7.7) |
 | `CallAccept` | reliably | Joins a call, or replies to a newly-discovered participant - the mesh's only signal (§7.7) |
 | `CallReject` | reliably | Declines an invite, sent only to whoever sent it (§7.7) |
@@ -1281,6 +1285,163 @@ which outranks how well the transport to them is doing.
 
 This is purely local: nothing about link state is ever sent over the wire,
 and each side reaches its own conclusion about its own half.
+
+#### 7.1.5 Punching with no server at all
+
+Everything above needs a server for exactly two things: to say who a peer
+is, and to carry one round of candidate addresses between the two clients.
+This section describes an alternative, entirely separate way to get a link
+open that needs neither - the local preferences file supplies the identity
+and the address, and the wall clock supplies the timing. It changes nothing
+about §7.1: a client with it turned off behaves exactly as before, and a
+client with it on still punches server-coordinated links for everyone else
+in the ordinary way.
+
+**Configuration.** Both peers must have configured each other. Each names
+the other's nickname, the host their client is reachable on, and how often
+to try:
+
+```
+direct_punch=on
+direct_punch_to=bob,bobpublic.com,1m
+direct_punch_to=marco,marcohost.com,1h
+```
+
+The host may be an IPv4 address, an IPv6 address or a hostname, and may
+carry its own port (`bobpublic.com:9000`, `[2001:db8::1]:9000`); with no
+port, both sides assume one well-known default. The frequency is one of
+`1m`, `5m`, `10m`, `15m`, `20m`, `25m`, `30m`, `35m`, `40m`, `45m`, `50m`,
+`55m`, `1h`.
+
+Unlike §7.1's UDP socket, whose port is ephemeral because the server
+relays whatever it happened to be given, this one is fixed: with nothing
+relaying it, a port both sides agreed on in advance is the only thing a
+peer can aim at.
+
+**1. The slot grid, in place of signaling.** Hole punching only works if
+both sides send at roughly the same moment - that is what the candidate
+relay was buying. Here the wall clock buys it instead. Each target's
+schedule is a grid of slots that **restarts at every o'clock** and steps by
+that target's frequency: `1m` fires at :00, :01, :02, ...; `1h` fires at
+:00 only. Both peers run the same frequency, so both grids land on the same
+instants with nothing passing between them.
+
+The grid is computed against UTC, not local time, so peers in time zones
+with fractional-hour offsets stay on the same grid as everyone else.
+Restarting it at each o'clock is also what makes `55m` well defined: its
+slots are :00 and :55, and the one after :55 is the *next* hour's :00 - not
+:50 past it. A client started mid-slot waits for the next boundary rather
+than probing immediately, since a probe at any moment the peer has no
+reason to be probing back is wasted.
+
+**2. Punching, in place of a candidate exchange.** At each slot, a target
+whose link is not already up is probed directly at its configured address:
+
+```
+PunchDatagram (continued from step 3 above) =
+    | DirectPing { link_nonce: u64, from: string }
+    | DirectPong { link_nonce: u64, from: string }
+```
+
+These carry the sender's own nickname because nothing else can identify
+them: no candidate exchange named a peer, and the source address is
+precisely what the receiver is trying to learn. A `DirectPing` is answered
+**only** for a nickname the receiver itself lists in its own
+`direct_punch_to`, and a nickname longer than a fixed small ceiling is
+dropped before it is even looked up - so the fixed port is no more
+discoverable by scanning it than an ephemeral one, exactly as §7.1's rule
+for an unattributable `Ping` intends. A configured peer's probe also opens
+the receiver's own attempt if it had not started one: their clock is as
+good an alarm as ours, and without answering in kind there is no second
+direction to punch open.
+
+`DirectPong` echoes the nonce of the `DirectPing` it answers, and the
+address it arrives from - frequently not the one configured, once NAT is
+involved - is locked in as the link's active address. From that moment the
+link is an **ordinary** one: it activates through the same path a
+server-arranged link does, carries the same reliable and unreliable frames
+(§7.1.1, §7.2, §7.3, §7.6), and is kept alive and watched for silence by
+the same `Keepalive` and liveness rules. Nothing downstream of activation
+knows or cares which way it was opened.
+
+**3. One attempt lasts 30 seconds.** An attempt that nobody answers is
+abandoned after a fixed window and the target waits for its next slot.
+The window is comfortably inside the shortest grid step, so an attempt is
+always finished - one way or the other - before the next one is due. The
+whole window is genuinely spent probing: a link's own punch timeout
+(step 4 of §7.1) is much shorter than this, so one attempt covers as many
+link-level attempts, each with a fresh nonce, as the window has room for
+rather than falling silent after the first one gives up.
+
+**4. A link that is up is left alone.** A slot arriving for a target whose
+link is already open does nothing at all: no re-punch, no new nonce, no
+interruption. Only losing the link reopens the question.
+
+**5. Losing a link that was up.** This is the one case that does not wait
+for the next slot. The link is re-punched straight away, up to five
+attempts, each getting its own full 30-second window - but only for a peer
+no server could re-establish instead. That distinction is per peer, not
+per session: a peer the server has named is handed back to §7.1's ordinary
+re-signalling, which will reach them; a peer no server has ever named -
+one who exists only in the preferences file - has nothing else that can
+bring the link back, so the budget is spent on them. Coming back forgives
+the budget entirely, so it bounds one outage rather than the session.
+
+**6. Never two links between two people.** Whichever way a link was
+opened, there is only ever one of it. While a direct punch owns a peer's
+link, nothing about that peer is signaled through a server - not a send
+waiting on it, not a retry backoff, and not a candidate proposal arriving
+from the peer themselves, which is ignored rather than followed. And a
+peer who is reachable *both* ways is one person with one link: a target
+for someone the server has also named is filed under the identity the
+server gave them, so the two routes converge on the same link instead of
+opening one each.
+
+**7. From a path to a person.** A punch opens a path; it does not say who
+is at the other end. The nickname on a `DirectPing` is unauthenticated -
+anyone able to reach the port could claim it - so nothing is registered on
+one. What registers a peer is the first payload that *authenticates* them:
+
+```
+Content::ChannelPresence   // plaintext: the sender's joined channel names
+P2pPayload =
+    | ChannelPresence { envelope }     // sealed exactly like DeviceIdAnnounce
+```
+
+Sent when the link opens, and again whenever the sender's own membership
+changes. Opening it is the authentication: the envelope is verified
+against the key already pinned for that nickname and its recipient binding
+is checked (§13.4), so one that opens could only have come from whoever
+holds that key. This requires a pinned identity - a peer never met through
+a server has nothing to seal to and stays a transport-only link - and a
+signing key mode, since only `pq_hybrid` signs its sends; under the
+unsigned modes an arriving envelope proves nothing and no peer is ever
+registered from a nickname alone.
+
+Once registered, the peer is placed in the channels *both* sides have
+joined (a channel only one side is in gives the other nowhere to put
+them). The announced list is authoritative rather than additive, so a
+channel dropped from it is how a peer says they left. A peer sharing no
+channel at all is still registered, reachable as a direct conversation.
+
+From that point nothing downstream distinguishes them from a peer a server
+introduced: they are listed among a channel's members, channel-addressed
+messages and voice reach them, a call's roster includes them, and a focus
+naming them or their channel resolves. That is what makes a background
+client's channel focus and its global push-to-talk work over a link no
+server ever arranged.
+
+Because such a link is not held by any channel, a channel departure does
+not tear it down: it was opened by configuration and a schedule, and only
+those end it.
+
+**What this does not change.** A peer met this way is still subject to
+every identity rule in §12. Registration leans on §12's pinning rather
+than working around it: the pinned key is exactly what an arriving
+envelope is checked against, so a peer whose key is unknown, or whose key
+has changed, is not quietly admitted. No key exchange happens here - two
+peers who have never established each other's key material through a
+server have a working transport and nothing to encrypt over it.
 
 ### 7.2 Sending a channel or direct text message
 

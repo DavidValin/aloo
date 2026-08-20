@@ -133,7 +133,7 @@ pub async fn run_client_inner(
                 let input_rx = crate::client::tui::terminal::spawn_session_input();
                 return session::run_connected_session(
                     surface,
-                    rd,
+                    Some(rd),
                     wr,
                     request.nickname,
                     you,
@@ -142,7 +142,7 @@ pub async fn run_client_inner(
                     keyboard_release_reporting,
                     id_store,
                     hotkey_rx,
-                    server_addr,
+                    Some(server_addr),
                     input_rx,
                     // A foreground client has no plan: it opens the
                     // popup, joins the-hall, and goes where the user

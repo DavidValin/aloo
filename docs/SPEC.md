@@ -289,6 +289,30 @@ When a channel is joined, the join is broadcast to all users already in the chan
     - **Muting is by nickname, not by connection.** Someone can be muted while offline, or before they have ever connected, and the mute applies the moment they appear. It persists in `~/.aloo/settings` as one `muted_voice=<nickname>` line per entry — one line each rather than one comma-separated value, because a nickname rejects only whitespace, so a comma is legal inside one. Being keyed on a name rather than a key makes this a comfort setting, not a security control: nicknames are unique only among currently-connected clients and are never reserved (which is exactly why identity pinning exists, Functionality #8), so a mute can in principle land on a different person who later takes that name.
     - **It never affects a live voice call** (Functionality #14). Who you can hear on a call is separate state that lasts only as long as the call; `/mute-voice` is about messages that arrive on their own.
 
+17. **Direct punching: keeping a link to someone with no server involved.** Full model in `docs/PROTOCOL.md` §7.1.5; from the user's point of view:
+    - **It is off unless `~/.aloo/settings` turns it on**, and it is entirely separate from the ordinary direct link (Functionality #2, §7.1) - turning it on changes nothing about how everyone else is reached.
+    - **You name who to punch at, where, and how often.** `direct_punch=on`, then one `direct_punch_to=<nickname>,<host>,<frequency>` line per person. The host may be an IPv4 address, an IPv6 address or a hostname, and may carry its own port (`bobpublic.com:9000`, `[2001:db8::1]:9000`); with none, both sides assume `direct_punch_port` (7879 by default). The frequency is one of `1m`, `5m`, `10m`, `15m`, `20m`, `25m`, `30m`, `35m`, `40m`, `45m`, `50m`, `55m`, `1h`.
+    - **Both people have to configure each other.** There is no server to arrange a meeting, so what makes two clients probe at the same moment is that both run the same frequency and both schedules restart at every o'clock: `1m` fires at :00, :01, :02, ...; `1h` at :00 only. A client started mid-slot waits for the next boundary rather than probing at a time its peer has no reason to answer.
+    - **A line with a typo says so** at startup, naming the line and the reason, and never costs the lines around it - a mistyped frequency must not look like a peer who simply never answers.
+    - **An attempt lasts 30 seconds**, and a slot arriving for someone already connected does nothing at all. If a connected link drops and there is no server that could re-establish it, it is re-punched straight away, up to 5 times, before going back to waiting for its next slot.
+    - **There is never more than one connection to the same person**, whether it was opened directly or through a server.
+    - **They show up as a real person, not just a connection.** Once a punched link opens, each side sends the other a sealed note saying which channels it is in. Opening that note is what proves who they are — it is checked against the key already pinned for that nickname — so a punch alone registers nobody, and someone able to reach your port cannot claim to be a friend. It needs a pinned `pq_hybrid` identity: someone you have never talked to through a server has no key you could encrypt to, so they stay a bare connection.
+    - **They appear in the channels you both are in**, and behave exactly like anyone else there: listed in the sidebar, reachable by a channel message, by voice, by push-to-talk, and by a call. That is what makes this work in background mode — with the app in the background and the focus on a channel you both joined, `Ctrl+Alt+P` reaches them, and their voice plays on your side, with no server involved at either end. Attach a terminal later and they are simply there in the sidebar. Focused on their nickname instead, the same applies to your DM.
+    - **What they tell you is the whole truth**, not an addition: a channel missing from their note means they have left it. Channels you have not joined yourself are ignored. Sharing no channel at all still leaves them reachable as a DM.
+    - **Leaving a channel does not disconnect them.** The link came from your settings and the schedule, not from the channel, so only those end it.
+    - **For the two-people case specifically** — a DM with no channel and no server, optionally under `/otp`, optionally headless — see "Talking to one person, with no server" below, which walks the whole thing through.
+
+18. **Running with no server at all (`--no-server`).** A server only ever introduces people and tracks channel membership; everything that carries content was already peer-to-peer. `aloo --daemon --no-server` (add `--foreground` to keep it in the terminal) runs with none.
+    - **Where everything comes from.** Peers come from `direct_punch_to`, channels from `direct_punch_channel` — one name per line, joined at startup, and the only channels that exist. `Ctrl+J` and `/channels` show exactly those, since there is no directory to browse and nothing to create. Your own identity is your local key; no nickname is claimed from anyone.
+    - **What still works:** text, voice, push-to-talk, files, live voice calls, and live `/otp` sessions — all peer-to-peer — plus identity pinning, `--focus`, and the whole daemon/attach flow.
+    - **What is refused, by name, when you ask for it:** joining a channel that is not configured, and OTP mail (the server *is* the mailbox — live `/otp` is unaffected). Refusals appear on the status line the moment you ask, never as an action that silently does nothing.
+    - **Two different "no".** A server you never had reads as permanent; one that is merely unreachable reads as temporary and worth waiting for. They are never described with the same sentence.
+    - **Losing a server mid-session does not end it** if you have `direct_punch_to` peers: those links are peer-to-peer and were never affected, so the session carries on with the server-backed actions refused, rather than disconnecting the people the outage did not touch.
+    - **Waiting looks like waiting.** A channel or conversation nobody has punched into yet says *"Waiting for other users to connect directly to you"* rather than sitting blank, so a correctly configured client that is simply early is not mistaken for a broken one.
+    - **Worked through end to end** in "Talking to one person, with no server" below, including the `/otp` layer and the daemon flags.
+    - **Limits worth knowing.** You can only reach people you have talked to through a server at least once — that is where their pinned key came from — so there is no way to meet anyone new. There is no STUN either, so at least one side needs a genuinely reachable address and port.
+
+
 ## Running in background mode
 
 Run aloo connected, in the background, so the global push-to-talk shortcut
@@ -524,6 +548,10 @@ does not become a queue of popups.
 `--otp` needs a person. `--focus=channel:... --otp` is refused: OTP is
 provisioned pairwise, per contact, and has no channel-wide form.
 
+None of this needs a server. The whole handshake rides the direct link,
+so the same flags work under `--no-server` against a `direct_punch_to`
+peer - see "Talking to one person, with no server" below.
+
 ### Sounds and notifications
 
 A daemon has no screen, so it says things out loud.
@@ -730,6 +758,115 @@ to step back out.
   what starts and ends a session.
 - `docs/SECURITY.md` — what aloo protects and what it does not.
 
+## Talking to one person, with no server
+
+The shortest useful shape of Functionality #17/#18: two people who want to
+reach each other and nothing else. No channel, no server, no directory -
+just a DM that opens itself, optionally under the one-time-pad layer, and
+optionally with nobody sitting at either terminal.
+
+### What has to be true first
+
+**You must have met through a server at least once.** That is where each
+of you got the other's `pq_hybrid` key, and a pinned key is the only thing
+that will make either client believe a nickname later (§7.1.5 step 7). It
+is a one-time cost: after it, the server is never needed again for the two
+of you.
+
+**Both of you must name the other.** A `direct_punch_to` line is half of a
+handshake, not a permission: a probe is answered only for a nickname the
+*receiver* also lists, so a one-sided entry reaches nobody in either
+direction. Both sides also need the same frequency, since what makes two
+clients probe at the same instant is that both schedules restart at every
+o'clock.
+
+**At least one of you must be reachable.** There is no STUN and no relay,
+so the address in the other's settings has to actually arrive - a
+forwarded UDP port, or a host with a public address. Both behind NAT with
+nothing forwarded will never open.
+
+### The DM itself
+
+Alice's `~/.aloo/settings`:
+
+```
+direct_punch=on
+direct_punch_to=bob,bobs-host.example,1m
+```
+
+Bob's:
+
+```
+direct_punch=on
+direct_punch_to=alice,alices-host.example,1m
+```
+
+That is the whole configuration. **No channel is involved** - `direct_punch_channel`
+is for channels and does nothing here. A peer who shares no channel with
+you is still registered as someone you can DM, which is exactly what this
+buys.
+
+At the next slot both punch, the link opens, each sends the other a sealed
+note naming its channels (an empty list here), and opening that note is
+what proves who sent it. From that moment the other person is an ordinary
+peer: pick them in the sidebar and press Enter, or `--focus` them, and the
+DM works exactly as it does through a server - text, voice, push-to-talk,
+files, calls.
+
+### Adding the one-time-pad layer
+
+`/otp` is unchanged by any of this, because it never involved the server in
+the first place: it is a layer *over* `pq_hybrid` (`docs/PROTOCOL.md` §16),
+and its whole handshake rides the same direct link everything else does.
+
+- **It does not replace the pinned key, it sits on top of it.** An active
+  OTP session still needs the `pq_hybrid` pin underneath, so the "met once
+  through a server" requirement is not waived by having pad material.
+- **Starting one always takes an explicit accept from the other side.**
+  One of you runs `/otp` in the open DM; the other gets the invite popup
+  and accepts. There is no auto-accept, deliberately - mutual consent is
+  the point of §16.1 - so a pair of unattended daemons will punch a link,
+  register each other, and then wait forever on an unanswered invite.
+- **Once accepted it persists.** Only `/endotp` ends a session: neither
+  disconnecting, nor restarting, nor the link dropping does. A peer who
+  comes back with a session already provisioned simply has it continued.
+- **`/mail` does not work here** - the server *is* the mailbox
+  (Functionality #13). Live `/otp` is unaffected.
+
+So the pad layer costs exactly one human accept, once, ever.
+
+### Doing it with no terminal (daemon)
+
+Both sides can then run headless:
+
+```sh
+aloo --daemon --no-server --focus bob --otp
+```
+
+- **`--focus bob`** points the global push-to-talk shortcut at that DM, so
+  holding `Ctrl+Alt+P` from any other app talks to them. It is a *starting*
+  position: once placed, wherever someone later moves the focus from an
+  attached terminal is respected.
+- **`--otp`** makes the daemon propose an OTP session the moment that peer
+  appears, so nobody has to type `/otp` - and continues an already-active
+  one silently instead. It behaves identically with and without a server;
+  "Focusing a person, with OTP" above has the full rule.
+- **The first accept still needs a person.** Attach once on the receiving
+  side (`aloo`), accept, detach (`/daemon`). Everything after that is
+  unattended, including across restarts of either side.
+- **Nothing waits on a channel.** A peer reached this way arrives in no
+  channel at all, and the focus, the join sound, the desktop notification
+  and the OTP proposal all fire for them regardless - a DM focus is about
+  the person, not about where they turned up.
+
+### What it looks like while nobody is there
+
+Until the other side punches in, the DM says *"Waiting for other users to
+connect directly to you"* rather than sitting blank. With an hourly
+frequency that wait can genuinely be an hour - the schedule only fires on
+the hour - so a client that looks idle shortly after starting is usually
+correct rather than broken.
+
 ## Protocol terms, and what implements them
 
 `docs/PROTOCOL.md` describes the protocol without naming a single Rust
@@ -748,6 +885,8 @@ here that implements it. If a name changes on one side, it changes on both.
 | Registration, nicknames (§5.4) | `server/mod.rs` `Registry::try_register` |
 | Channels (§6), password bans (§6.6) | `server/mod.rs` `Registry::{join_channel, leave_channel, unregister, channel_list, channel_password_attempts}`; `validation.rs` |
 | Direct link, candidates, punching (§7.1) | `client/p2p.rs` `PeerLinkManager`; `p2p_proto.rs` `PunchDatagram`, `RendezvousMessage`, `SAFE_DATAGRAM_BYTES` |
+| Serverless direct punch (§7.1.5) | `settings.rs` `DirectPunchTarget`, `PunchFrequency`, `DEFAULT_DIRECT_PUNCH_PORT`, `PUNCH_FREQUENCIES`; `client/p2p.rs` `configure_direct_punch`, `direct_tick`, `on_direct_ping`, `on_direct_pong`, `direct_peer_id`, `is_direct_peer_id`, `utc_second_of_hour`, `DIRECT_PUNCH_WINDOW`, `DIRECT_MAX_RECONNECTS`; `p2p_proto.rs` `MAX_DIRECT_PUNCH_NICK_LEN` |
+| `ChannelPresence`, becoming an addressable peer (§7.1.5) | `proto.rs` `Content::ChannelPresence`; `p2p_proto.rs` `P2pPayload::ChannelPresence`; `client/session.rs` `direct_peer_identity`, `reconcile_direct_membership`, `on_channel_presence`, `send_channel_presence`, `broadcast_channel_presence`; `client/tui/channel.rs` `channels_containing_member`, `is_member_of_channel` |
 | Reliable layer (§7.1.1) | `client/p2p_reliable.rs` `ArqSender`, `ArqReceiver` |
 | `P2pPayload` variants (§7.2/§7.3/§7.6/§7.7) | `p2p_proto.rs` `P2pPayload` |
 | Per-recipient OAEP, chunking (§8/§8.1) | `crypto/mod.rs` `encrypt_chunked`, `decrypt_chunked`, `max_chunk_len` |

@@ -10,7 +10,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 
 use crate::client::netstats::ConnQuality;
 use crate::client::p2p::LinkStatus;
@@ -469,6 +469,24 @@ impl UiState {
     /// created this way; `on_joined` corrects it moments later from the
     /// authoritative `ChannelInfo`. Returns whether `user` was actually new
     /// to the channel (`false` on a duplicate join, which is a no-op here).
+    /// Every joined channel `peer` is currently listed in - the local
+    /// half of reconciling a serverless peer's announced membership
+    /// (`docs/PROTOCOL.md` §7.1.5).
+    pub fn channels_containing_member(&self, peer: UserId) -> Vec<String> {
+        self.channels
+            .iter()
+            .filter(|c| c.joined && c.members.iter().any(|m| m.id == peer))
+            .map(|c| c.name.clone())
+            .collect()
+    }
+
+    /// Whether `peer` is already listed in `channel`.
+    pub fn is_member_of_channel(&self, channel: &str, peer: UserId) -> bool {
+        self.channels
+            .iter()
+            .any(|c| c.name == channel && c.members.iter().any(|m| m.id == peer))
+    }
+
     pub fn seed_member(&mut self, channel: &str, user: UserInfo) -> bool {
         self.known_users.insert(user.id, user.clone());
         let tab = match self.channels.iter().position(|c| c.name == channel) {
@@ -1195,6 +1213,14 @@ pub(crate) fn conn_color(quality: ConnQuality) -> Color {
     }
 }
 
+/// Shown in place of an empty member list, and of an empty conversation,
+/// while running with no server (`docs/PROTOCOL.md` §7.1.5). Without it a
+/// perfectly-configured client that simply has not been punched into yet
+/// is indistinguishable from a broken one - there is no roster arriving
+/// from anywhere to fill the gap, and no presence notice to explain it.
+pub(crate) const WAITING_FOR_DIRECT_PEERS: &str =
+    "Waiting for other users to connect directly to you";
+
 fn render_sidebar(frame: &mut Frame, area: Rect, state: &UiState) {
     let border_style = focus_border_style(state.focus == super::ui::Focus::Sidebar);
     let block = Block::default()
@@ -1274,6 +1300,19 @@ fn render_sidebar(frame: &mut Frame, area: Rect, state: &UiState) {
             ListItem::new(label).style(style)
         })
         .collect();
+    // Nobody here yet. With a server, an empty channel is simply empty and
+    // says so by being blank; with none, it is a channel waiting to be
+    // punched into - which is a state worth naming, since otherwise a
+    // correctly-configured client that is merely early looks broken.
+    if items.is_empty() && state.serverless {
+        frame.render_widget(
+            Paragraph::new(WAITING_FOR_DIRECT_PEERS)
+                .style(Style::default().fg(Color::DarkGray))
+                .wrap(Wrap { trim: true }),
+            inner,
+        );
+        return;
+    }
     frame.render_widget(List::new(items), inner);
 }
 

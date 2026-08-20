@@ -2360,3 +2360,113 @@ evidence = "src/client/tui/surface.rs Surface::draw, AttachWriter::flush, Surfac
 id = "TB-216"
 description = "The attach backend answers from what its viewer reported the three questions CrosstermBackend answers by querying its own stdout - which in a daemon is /dev/null: terminal size, window size, and cursor position (whose real implementation would block reading a Device Status Report reply from a stdin nobody is writing to). A zero dimension reported mid-resize is clamped to 1 rather than trusted."
 evidence = "src/client/tui/surface.rs AttachBackend::size/window_size/get_cursor_position, TerminalSize::new, Surface::resize; tests the_attach_backend_reports_the_size_its_viewer_declared, the_attach_backend_tracks_the_cursor_instead_of_asking_for_it, a_zero_dimension_is_clamped_rather_than_trusted, resizing_an_attached_surface_redraws_at_the_new_size, resizing_a_detached_surface_is_a_no_op"
+
+# ============================================================================
+# US-039 - Keep a direct link to a peer with no server involved
+# ============================================================================
+[[user_story]]
+id = "US-039"
+title = "Keep a direct link to a peer with no server involved"
+as_a = "user who already knows where a particular person's machine is on the internet"
+i_want = "my client to punch a direct UDP link to them on a schedule we both keep, without any server arranging it"
+so_that = "we can reach each other even when there is no server we both trust, or none running at all"
+
+[[user_story.acceptance_criteria]]
+id = "AC-206"
+description = "With direct_punch=on, each direct_punch_to peer gets its own background attempt on a slot grid that restarts at every o'clock and steps by that peer's frequency - so both ends, running the same setting, probe at the same wall-clock moments with nothing coordinating them but the clock. An attempt punches straight at the configured host and port using the same Ping/Pong handshake a server-arranged link uses, and no candidate exchange is relayed through any server at any point."
+evidence = "docs/PROTOCOL.md 7.1.5; docs/SPEC.md 'Direct punch settings'; src/settings.rs PunchFrequency::slot_of_hour, src/client/p2p.rs PeerLinkManager::configure_direct_punch/direct_tick/begin_direct_attempt/send_direct_ping, utc_second_of_hour; tests every_frequencys_slot_grid_restarts_at_the_top_of_the_hour, two_peers_punch_a_link_from_the_schedule_alone_and_carry_a_message; direct_punch.feature"
+
+[[user_story.acceptance_criteria]]
+id = "AC-207"
+description = "A link opened this way is an ordinary direct link: once it is up it carries the same reliably-delivered content (text, files, voice) over the same transport as one the server helped arrange, and is maintained by the same keepalive and liveness rules."
+evidence = "docs/PROTOCOL.md 7.1.5; src/client/p2p.rs PeerLinkManager::on_direct_pong (activation via the shared on_pong), send_reliable_or_queue; test two_peers_punch_a_link_from_the_schedule_alone_and_carry_a_message; direct_punch.feature"
+
+[[user_story.acceptance_criteria]]
+id = "AC-208"
+description = "A slot arriving for a peer whose link is already up does nothing at all - the link is never re-punched, re-nonced or interrupted on a schedule; only losing it re-opens the question."
+evidence = "docs/PROTOCOL.md 7.1.5; src/client/p2p.rs PeerLinkManager::direct_tick (the Established arm), begin_direct_attempt's already-Active guard; test a_slot_arriving_on_a_link_that_is_already_up_does_not_punch_again; direct_punch.feature"
+
+[[user_story.acceptance_criteria]]
+id = "AC-209"
+description = "One attempt probes for the whole of DIRECT_PUNCH_WINDOW and is then abandoned until that peer's next slot, rather than running until the next attempt would overlap it. The window really is spent probing: the link underneath has a much shorter punch timeout of its own, so an attempt spans as many link-level attempts (each with a fresh nonce) as the window has room for, instead of quietly falling silent after the first one."
+evidence = "docs/PROTOCOL.md 7.1.5; src/client/p2p.rs DIRECT_PUNCH_WINDOW, PeerLinkManager::direct_tick's Punching arm, rearm_direct_link, give_up_direct_attempt; tests an_attempt_probes_for_the_punch_window_and_is_then_abandoned_until_the_next_slot, probing_really_continues_for_the_whole_window_not_just_one_link_attempt; direct_punch.feature"
+
+[[user_story.acceptance_criteria]]
+id = "AC-210"
+description = "A direct link that was up and dropped accidentally is re-punched straight away, outside its schedule, for up to DIRECT_MAX_RECONNECTS attempts - but only for a peer no server could re-signal instead; the budget is forgiven the moment the link comes back, so it bounds one outage rather than the session."
+evidence = "docs/PROTOCOL.md 7.1.5; src/client/p2p.rs DIRECT_MAX_RECONNECTS, PeerLinkManager::on_direct_link_dropped, give_up_direct_attempt, on_direct_pong's reconnect reset; test a_direct_only_link_that_drops_is_reconnected_up_to_the_reconnect_budget; direct_punch.feature"
+
+[[user_story.acceptance_criteria]]
+id = "AC-211"
+description = "There is never more than one peer-to-peer link between two people, whichever way it was opened: while a direct punch owns a peer's link nothing is signalled through the server for them (not a send, not a retry backoff, not a relayed proposal from the peer), and a direct target for someone the server does name is filed under that same UserId so the two routes converge on one link rather than one each. An already-open link moves with that change rather than being left behind under the identity it was opened with - the ordering that makes this matter (a link punched to someone who is not on the server, who connects to it later) is the normal one in daemon mode, and leaving it behind is what would silently produce the second link this forbids. It moves back the same way when they leave the server again, since that says nothing about whether the direct path still works."
+evidence = "docs/PROTOCOL.md 7.1.5; src/client/p2p.rs PeerLinkManager::direct_owns, ensure_link, on_peer_candidates, retry_due, set_direct_peer_id, rekey_link, release_direct_peer_id, is_direct_peer_id; src/client/session.rs handle_server_message's UserJoined/UserOffline arms; tests a_peer_being_punched_directly_is_never_also_signalled_through_the_server, a_direct_target_moves_onto_the_user_id_the_server_gives_it, a_peer_who_joins_the_server_after_a_direct_link_is_up_gets_only_one_link; direct_punch.feature"
+
+[[user_story.acceptance_criteria]]
+id = "AC-212"
+description = "~/.aloo/settings accepts direct_punch=on plus one direct_punch_to=<nickname>,<host>,<frequency> line per peer, where the host is an IPv4 address, an IPv6 address or a hostname and may carry its own port (defaulting to DEFAULT_DIRECT_PUNCH_PORT), and the frequency is one of the documented values; all of it survives a save/load round trip."
+evidence = "docs/SPEC.md 'Direct punch settings'; README.md 'Direct punching'; src/settings.rs DirectPunchTarget::parse/to_setting_value, PunchFrequency::parse, PUNCH_FREQUENCIES, Settings::parse/save; tests direct_punch_on_reads_one_target_per_line, a_target_host_may_be_ipv4_ipv6_or_a_name_and_may_carry_its_own_port, every_documented_frequency_parses_and_nothing_else_does, direct_punch_settings_survive_a_save_and_load_round_trip, direct_punch_is_off_and_targetless_unless_the_file_turns_it_on; direct_punch.feature"
+
+[[user_story.acceptance_criteria]]
+id = "AC-213"
+description = "A direct_punch_to line that does not parse is reported with the reason rather than silently ignored, and never costs the lines around it - a typo'd nickname, host or frequency must not be indistinguishable from a peer who simply never answers."
+evidence = "docs/SPEC.md 'Direct punch settings'; src/settings.rs Settings::direct_punch_invalid; src/client/session.rs run_connected_session's settings load; test a_malformed_target_is_reported_rather_than_silently_dropped; direct_punch.feature"
+
+[[user_story.technical_behavior]]
+id = "TB-221"
+description = "The slot grid is computed from the UTC second of the hour, and restarts at every o'clock rather than running continuously - which is what makes an interval that does not divide 60 (55m) well defined, and what keeps two peers in time zones with fractional-hour offsets on the same grid. A client started mid-slot waits for the next boundary rather than probing immediately, since a probe at any moment its peer has no reason to be probing back is wasted."
+evidence = "docs/PROTOCOL.md 7.1.5; src/settings.rs PunchFrequency::slot_of_hour; src/client/p2p.rs utc_second_of_hour, PeerLinkManager::configure_direct_punch (last_slot seeding), direct_tick; tests every_frequencys_slot_grid_restarts_at_the_top_of_the_hour, an_interval_that_does_not_divide_the_hour_still_restarts_at_oclock, the_slot_clock_is_the_utc_second_of_the_hour"
+
+[[user_story.technical_behavior]]
+id = "TB-222"
+description = "The serverless handshake carries the sender's nickname (DirectPing/DirectPong) because nothing else can identify them: no candidate exchange named a UserId, and the source address is exactly what the receiver is trying to learn. A probe is answered only for a nickname the receiver itself lists in direct_punch_to - anyone else gets nothing back, so the fixed port is no more discoverable by scanning it than an ephemeral one, and a nickname longer than MAX_DIRECT_PUNCH_NICK_LEN is dropped before it is looked up at all. A configured peer's probe also opens this side's own attempt, since their clock is as good an alarm as ours and without answering in kind there is no second direction to punch open."
+evidence = "docs/PROTOCOL.md 7.1.5; src/p2p_proto.rs PunchDatagram::DirectPing/DirectPong, MAX_DIRECT_PUNCH_NICK_LEN; src/client/p2p.rs PeerLinkManager::on_direct_ping, on_direct_pong, on_datagram_at's direct arms; tests punch_datagrams_roundtrip, a_direct_ping_naming_a_nickname_that_is_not_configured_is_ignored, a_peers_probe_is_answered_and_opens_this_sides_attempt_too"
+
+[[user_story.technical_behavior]]
+id = "TB-223"
+description = "A peer known only from settings is filed under a synthetic UserId derived from their nickname, with its top bit set so it can never collide with a server-assigned id (the server hands those out from a counter starting at 1). That bit is also the test for 'could a server re-establish this link at all', which is what decides whether an accidental loss spends the direct reconnect budget or is left to the ordinary re-signalling path - asked session-wide instead, a peer only ever reachable directly would be handed to a path that can never reach them."
+evidence = "docs/PROTOCOL.md 7.1.5; src/client/p2p.rs direct_peer_id, is_direct_peer_id, on_direct_link_dropped, retry_due, ensure_link; tests a_nickname_derived_peer_id_is_stable_and_never_collides_with_a_servers, a_peer_being_punched_directly_is_never_also_signalled_through_the_server"
+
+[[user_story.acceptance_criteria]]
+id = "AC-214"
+description = "A peer reached with no server is placed in the channels both sides have joined, from a sealed ChannelPresence announcement they send when the link opens and again whenever their own membership changes. The list is authoritative rather than additive, so a channel dropped from it is how a peer says they left, and only channels this client has itself joined are ever considered. Once placed, nothing downstream can tell them apart from a peer a server introduced: the sidebar lists them, channel sends and voice address them, the call roster includes them, and --focus resolves to them - which is what makes a daemon's channel focus and its global push-to-talk work over a punched link. A peer sharing no channel is still registered as a DM peer."
+evidence = "docs/PROTOCOL.md 7.1.5; docs/SPEC.md 'Direct punching'; src/proto.rs Content::ChannelPresence; src/p2p_proto.rs P2pPayload::ChannelPresence; src/client/session.rs reconcile_direct_membership, on_channel_presence, send_channel_presence, broadcast_channel_presence; src/client/tui/channel.rs channels_containing_member, is_member_of_channel; tests announced_membership_is_reconciled_against_our_own_joined_channels, content_channel_presence_envelope_roundtrips, and end to end between two whole serverless sessions in test/daemon_session_test.rs (two_serverless_sessions_punch_to_each_other_and_each_registers_the_other); becoming_a_real_peer.feature"
+
+[[user_story.acceptance_criteria]]
+id = "AC-215"
+description = "A peer is registered only on the first payload that authenticates them - an envelope that opens under the key already pinned for their nickname - never on a DirectPing, whose nickname is unauthenticated and could be claimed by anyone able to reach the port. Registration therefore requires both a pinned identity for that nickname (there is otherwise nothing to encrypt to them with) and a pq_hybrid one, since only pq_hybrid signs its sends and so only there can an arriving envelope prove who sent it."
+evidence = "docs/PROTOCOL.md 7.1.5, 13.4; src/client/session.rs direct_peer_identity, on_channel_presence (opens via decrypt_own_envelope before registering anything); src/client/idstore.rs IdStore::get; tests only_a_pinned_pq_hybrid_identity_can_become_an_addressable_peer, a_direct_ping_naming_a_nickname_that_is_not_configured_is_ignored, and end to end in two_serverless_sessions_punch_to_each_other_and_each_registers_the_other (whose pin, removed, is what makes it fail); becoming_a_real_peer.feature"
+
+[[user_story.technical_behavior]]
+id = "TB-224"
+description = "A direct target's nickname is recoverable from the UserId its link is filed under (direct_nickname_of), which is what turns a link back into the name its key is pinned under, and the set of serverless peers whose links are up is enumerable (active_direct_peers) so a membership change can be announced to exactly them. Leaving a channel never forgets a link the direct scheduler owns: that link was opened from settings and a schedule, not from the channel, so a channel departure says nothing about whether to keep it."
+evidence = "docs/PROTOCOL.md 7.1.5; src/client/p2p.rs PeerLinkManager::direct_nickname_of, active_direct_peers; src/client/channel.rs handle_leave's direct-peer guard; tests a_direct_targets_nickname_and_live_peers_are_queryable; becoming_a_real_peer.feature"
+
+[[user_story.acceptance_criteria]]
+id = "AC-217"
+description = "With no server there is nothing to join a channel through, so ~/.aloo/settings' direct_punch_channel lines are the channels this client is in: read one per line, validated against the same channel-name rules a server would apply, de-duplicated, kept in file order, and surviving a save/load round trip. They are seeded as joined at startup and are also the whole of the directory /channels and Ctrl+J browse, since no other channel exists."
+evidence = "docs/SPEC.md 'Direct punching'; src/settings.rs Settings::parse/save (direct_punch_channels); src/client/session.rs run_connected_session's serverless seeding; src/client/tui/ui.rs UiState::serverless, the Ctrl+J branch; test direct_punch_channels_are_read_one_per_line_and_validated; no_server.feature"
+
+[[user_story.acceptance_criteria]]
+id = "AC-218"
+description = "A session distinguishes having no server at all from having one that is currently unreachable, and explains each differently: the first is permanent and says so, the second reads as temporary. Both refuse the same actions, but telling a user something needs a server while one is merely reconnecting, or that it is retrying when there is no server at all, would each be wrong. Losing the server mid-session is a degradation rather than an ending whenever direct targets are configured: those links are punched peer-to-peer and are unaffected by it, so the session carries on with server-backed actions refused, instead of disconnecting the very peers the loss did not touch."
+evidence = "docs/SPEC.md 'Running without a server'; src/client/session.rs ServerState::is_absent/is_serverless/refusal, the net_rx close arm (degrades to Unreachable rather than ending a session that has direct links), send_if_server; src/client/p2p.rs has_direct_targets; tests server_state_distinguishes_no_server_from_an_unreachable_one, a_session_with_direct_targets_is_worth_keeping_without_a_server; no_server.feature"
+
+[[user_story.acceptance_criteria]]
+id = "AC-219"
+description = "An action needing a server is refused at the moment it is asked for, naming what it was and why, rather than being allowed to proceed into a control channel with nothing behind it - where a join would leave the popup closed and no channel ever appearing, and a mail would sit sending against a result that cannot arrive. The check sits at the single point every action passes through. Only genuinely server-backed actions are refused: joining a channel, and OTP mail. Text, voice, files, calls, live OTP sessions and leaving a channel are peer-to-peer and stay available, and joining a channel that direct_punch_channel already names is done locally rather than refused."
+evidence = "docs/SPEC.md 'Running without a server'; src/client/tui/ui.rs UiAction::needs_server; src/client/session.rs handle_ui_action's refusal gate and its local-join branch; src/control.rs NullSink; test only_server_backed_actions_are_refused_without_one; no_server.feature"
+
+[[user_story.acceptance_criteria]]
+id = "AC-220"
+description = "A channel or conversation that has nobody in it yet, while running with no server, says 'Waiting for other users to connect directly to you' rather than showing blank. Nothing else is going to explain the silence - no roster arrives and no presence notice is coming - so a correctly configured client that is merely early would otherwise be indistinguishable from a broken one. Shown only while genuinely unreachable: once a peer's link is up, an empty log means what it always meant."
+evidence = "docs/SPEC.md 'Running without a server'; src/client/tui/channel.rs WAITING_FOR_DIRECT_PEERS, render_sidebar; src/client/tui/ui.rs render_messages; no_server.feature"
+
+[[user_story.technical_behavior]]
+id = "TB-225"
+description = "An encryption-key rotation (13.10) is carried over the direct link when no server can relay it - either because there is none, or because the peer is one no server has ever named. The payload is exactly what the relayed form carries and the recipient verifies its signature itself, so the transport changes nothing about trust; without this, forward secrecy would silently stop for precisely the peers 7.1.5 exists for, while messages continued to encrypt and decrypt fine against the un-rotated bootstrap keys."
+evidence = "docs/PROTOCOL.md 13.10, 7.1.5; src/p2p_proto.rs P2pPayload::KeyRotation; src/client/p2p.rs P2pEvent::KeyRotation; src/client/session.rs rotate_out_rx's dispatch and the KeyRotation arm (handle_pq_key_rotated, shared with ServerMessage::KeyRotated); test punch_datagrams_roundtrip and the existing rotation tests it reuses unchanged"
+
+[[user_story.acceptance_criteria]]
+id = "AC-221"
+description = "A daemon can be started with no server at all: --no-server lifts the host requirement that every other start is held to, and is persisted like every other daemon field so a bare `aloo --daemon` at the next boot comes back serverless rather than failing for want of a host it never had. A serverless DM focus is given no discovery channel - the hall exists so a focus has somewhere to watch for presence, and with no server there is no presence and no hall to join, so adding one would only produce a tab that can never fill. The channels such a daemon was asked to join are driven at startup rather than off a ChannelList that will never arrive, and go through the same refusal gate every other action does, so --channel is never silently ignored on the one start where nobody is watching."
+evidence = "docs/SPEC.md 'Running without a server'; README.md; src/client/daemon.rs DaemonConfig::resolve (host fallback, discovery-channel guard, no_server), DaemonConfig::persist, run's serverless branch; src/settings.rs daemon_no_server; src/client/session.rs request_daemon_joins and its serverless trigger; tests no_server_lifts_the_host_requirement, a_serverless_daemon_comes_back_serverless_after_a_restart, a_serverless_dm_focus_does_not_get_a_discovery_channel, and end to end against a real session in test/daemon_session_test.rs (a_serverless_daemon_shows_its_configured_channel_and_waits_for_peers, a_serverless_daemon_joins_the_channel_it_was_given, a_channel_that_is_not_configured_is_refused_with_a_reason)"
