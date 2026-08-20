@@ -169,3 +169,15 @@ Feature: Live voice calls
     And the host leaves the call
     Then no call indicator is shown
     And a call status notice says "Call has ended: the host left the call"
+
+  @AC-184
+  Scenario: A call to a peer under an OTP session is refused before it is confirmed
+    Given I am connected and viewing a channel
+    And bob is in the channel with me
+    And an OTP session is active with bob
+    And I have opened a private room with bob
+    When I type "/call"
+    And I press Enter
+    Then a call status notice says "voice calls aren't supported over an OTP session"
+    And no call confirmation is shown
+    And no call is started

@@ -71,6 +71,14 @@ pub const STATUS_NOTICE_TIMEOUT: std::time::Duration = std::time::Duration::from
 /// (`crate::client::channel::handle_start_call`).
 pub const NO_ONE_INVITED_NOTICE: &str = "Call has ended: no one was invited";
 
+/// What a `/call` aimed at a peer under an active OTP session says. The
+/// OTP layer has no live-streaming concept at all (`docs/PROTOCOL.md`
+/// 16.2), so this is a refusal, not a partial delivery - one string,
+/// because three places can reach the same conclusion: `/call` itself,
+/// `direct_message::handle_start_call`'s authoritative recheck, and
+/// `voice_call::invite_to_call`.
+pub const OTP_CALL_REFUSAL: &str = "voice calls aren't supported over an OTP session";
+
 /// What every participant is told when the host hangs up - the host
 /// leaving ends the call for everyone (`docs/PROTOCOL.md` 7.7), unlike
 /// any other participant leaving.
@@ -2754,6 +2762,19 @@ impl UiState {
                 return None;
             };
             self.input.clear();
+            // A DM call to a peer under an active OTP session can never
+            // happen, so it must not be confirmed either: asking "invite 1
+            // user?" and refusing the moment it is agreed to would be
+            // worse than the plain refusal this had before there was a
+            // confirmation at all. `direct_message::handle_start_call`
+            // still rechecks against `SessionState` - the authority - but
+            // by then this has already spared the user the popup.
+            if let CallTarget::Direct { to, .. } = &target
+                && self.is_otp_active(*to)
+            {
+                self.push_status_notice(OTP_CALL_REFUSAL.to_string(), false);
+                return None;
+            }
             // Nobody is rung before the user has seen how many people that
             // is (`docs/SPEC.md` "Live voice calls") - except when the
             // answer is nobody at all, which needs no decision, only the
@@ -3016,7 +3037,7 @@ impl UiState {
     /// since membership can shift while the popup is up.
     fn call_invitee_count(&self, target: &CallTarget) -> usize {
         match target {
-            CallTarget::Direct { .. } => 1,
+            CallTarget::Direct { to, .. } => usize::from(!self.is_otp_active(*to)),
             CallTarget::Channel { channel } => self
                 .channels
                 .iter()

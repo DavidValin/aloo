@@ -308,7 +308,7 @@ pub(crate) async fn handle_start_call(
 ) -> proto::Result<()> {
     if crate::client::otp::contact_name_if_active(session, &recipient_pubkey_der).is_some() {
         ui_state.push_status_notice(
-            "voice calls aren't supported over an OTP session".to_string(),
+            crate::client::tui::ui::OTP_CALL_REFUSAL.to_string(),
             false,
         );
         return Ok(());

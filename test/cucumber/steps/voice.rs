@@ -556,6 +556,19 @@ async fn muting_member_requested(w: &mut AlooWorld, name: String) {
     );
 }
 
+#[given(expr = "an OTP session is active with {word}")]
+async fn otp_session_active(w: &mut AlooWorld, name: String) {
+    w.ui_mut().mark_otp_active(UserId(id_for(&name)));
+}
+
+#[then("no call confirmation is shown")]
+async fn no_call_confirmation(w: &mut AlooWorld) {
+    assert!(
+        w.ui_ref().call_confirm.is_none(),
+        "an impossible call must not be confirmable"
+    );
+}
+
 #[then("nothing is requested")]
 async fn nothing_requested(w: &mut AlooWorld) {
     assert!(w.action_was_none, "the key should have been inert");

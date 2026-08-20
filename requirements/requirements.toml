@@ -2156,6 +2156,11 @@ id = "AC-183"
 description = "When the host leaves, the call ends for every participant rather than merely losing one voice, and each of them is told: 'Call has ended: the host left the call'."
 evidence = "docs/SPEC.md 'Live voice calls'; docs/PROTOCOL.md 7.7; src/client/tui/ui.rs HOST_LEFT_NOTICE, CallUiState::host, end_call; src/client/voice_call.rs on_call_end's host branch, teardown_own_call; test the_hosts_departure_notice_reads_as_the_call_ending; scenario features/voice/live_call.feature 'The host leaving ends the call for everyone'"
 
+[[user_story.acceptance_criteria]]
+id = "AC-184"
+description = "A DM /call to a peer under an active OTP session is refused before the confirmation popup is ever shown, with the notice 'voice calls aren't supported over an OTP session'; a channel /call instead leaves such a member out of both the confirmation's invitee count and the invite fan-out, and reports 'no one was invited' if that leaves nobody."
+evidence = "docs/SPEC.md 'Live voice calls'; docs/PROTOCOL.md 7.7 'Not available under OTP'; src/client/tui/ui.rs OTP_CALL_REFUSAL, submit_input's /call branch, call_invitee_count; src/client/direct_message.rs handle_start_call; src/client/voice_call.rs addressable_channel_members, invite_to_call; test a_call_to_an_otp_active_peer_is_refused_without_a_confirmation; scenario features/voice/live_call.feature 'A call to a peer under an OTP session is refused before it is confirmed'"
+
 [[user_story.technical_behavior]]
 id = "TB-199"
 description = "CallInvite, CallAccept, CallReject and CallEnd (the live-call signaling family) round-trip through bincode encode/decode intact, addressed point-to-point like the file-transfer message family."

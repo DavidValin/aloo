@@ -5,7 +5,8 @@ use ui_common::*;
 use aloo::proto::UserId;
 use aloo::client::tui::ui::{
     CallMemberState, CallTarget, Focus, HOST_LEFT_NOTICE, IdentityCase, MessageBody, Mode,
-    NO_ONE_INVITED_NOTICE, PendingCallInvite, RECORD_HOLD_TIMEOUT, UiAction, UiState, render,
+    NO_ONE_INVITED_NOTICE, OTP_CALL_REFUSAL, PendingCallInvite, RECORD_HOLD_TIMEOUT, UiAction,
+    UiState, render,
 };
 use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::Terminal;
@@ -2237,4 +2238,53 @@ fn the_hosts_departure_notice_reads_as_the_call_ending() {
     assert!(state.call.is_none());
     assert!(!state.call_tab_selected, "the call tab goes with it");
     assert!(rendered_rows(&state).join("\n").contains(HOST_LEFT_NOTICE));
+}
+
+/// The OTP layer has no live-streaming concept at all, so a DM call to a
+/// peer under an active session is refused outright - and refused *before*
+/// the confirmation, not after it: asking "invite 1 user?" only to refuse
+/// the moment it is agreed to would be worse than no confirmation at all.
+/// A channel call takes the other route the spec gives it, silently
+/// leaving such a member out of the count and the invite.
+///
+/// @requirement AC-184
+#[test]
+fn a_call_to_an_otp_active_peer_is_refused_without_a_confirmation() {
+    let mut state = joined_general_with(vec![user(2, "bob"), user(3, "carol")]);
+    state.focus = Focus::Input;
+    state.mark_otp_active(UserId(2));
+
+    state.active_private_room = Some(UserId(2));
+    type_str(&mut state, "/call");
+    assert_eq!(press(&mut state, KeyCode::Enter), None);
+    assert!(
+        state.call_confirm.is_none(),
+        "an impossible call must not be confirmable"
+    );
+    assert_eq!(
+        state.status_notice.as_ref().map(|(m, _)| m.as_str()),
+        Some(OTP_CALL_REFUSAL)
+    );
+    assert!(state.call.is_none());
+
+    // In a channel, the same peer is simply left out - carol is still
+    // reachable, so the call goes ahead naming one invitee, not two.
+    state.active_private_room = None;
+    type_str(&mut state, "/call");
+    press(&mut state, KeyCode::Enter);
+    let pending = state.call_confirm.as_ref().expect("confirmation opened");
+    assert_eq!(pending.invitee_count, 1, "bob is under OTP and excluded");
+    assert!(rendered_rows(&state).join("\n").contains("1 user"));
+
+    // And with nobody else left, a channel call has nobody to invite at
+    // all rather than an OTP-only roster.
+    let mut alone = joined_general_with(vec![user(2, "bob")]);
+    alone.focus = Focus::Input;
+    alone.mark_otp_active(UserId(2));
+    type_str(&mut alone, "/call");
+    assert_eq!(press(&mut alone, KeyCode::Enter), None);
+    assert_eq!(
+        alone.status_notice.as_ref().map(|(m, _)| m.as_str()),
+        Some(NO_ONE_INVITED_NOTICE)
+    );
 }
