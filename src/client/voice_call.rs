@@ -63,7 +63,7 @@ pub(crate) enum CallRecorderCmd {
     SetMuted(bool),
     /// The host's mute (`P2pPayload::CallMute`), tracked separately from
     /// `SetMuted` so lifting one never lifts the other - a participant the
-    /// host muted stays silent through their own `/mute` toggling.
+    /// host muted stays silent through their own mute toggling.
     SetHostMuted(bool),
     Stop,
 }
@@ -535,6 +535,7 @@ pub(crate) async fn on_call_invite(
         from,
         from_name,
         channel,
+        ended: false,
     };
     if ui_state.is_trust_gated(from) {
         ui_state.hold_call_invite(invite);
@@ -593,9 +594,23 @@ pub(crate) async fn on_call_accept(
                 .peer_link
                 .send_reliable_or_queue(from, P2pPayload::CallRoster { call_id, members });
         }
-        // A muted participant stays muted for whoever joins after the
-        // fact - otherwise a newcomer's roster would show them speaking
-        // freely while everyone else's shows them silenced.
+        // Our own mute is ours alone to report, so it goes to a newcomer
+        // whoever we are - otherwise their roster would show us speaking
+        // freely while everyone else's shows us silenced.
+        if session.active_call.as_ref().is_some_and(|c| c.muted)
+            && let Some(own_id) = ui_state.own_id
+        {
+            session.peer_link.send_reliable_or_queue(
+                from,
+                P2pPayload::CallMute {
+                    call_id,
+                    target: own_id,
+                    muted: true,
+                },
+            );
+        }
+        // A host-muted participant stays muted for whoever joins after
+        // the fact, for the same reason - and only the host may say so.
         if session.active_call.as_ref().is_some_and(|c| c.host == you(ui_state)) {
             for (peer, muted) in muted_members(ui_state) {
                 session.peer_link.send_reliable_or_queue(
@@ -622,6 +637,8 @@ fn you(ui_state: &UiState) -> UserId {
 /// Every participant the host currently has muted, for replaying to a
 /// participant who joined after the fact.
 fn muted_members(ui_state: &UiState) -> Vec<(UserId, bool)> {
+    // Host mutes only: a participant's own mute is theirs to report, and
+    // is relayed by nobody (`on_call_mute`'s `target == from` branch).
     ui_state
         .call
         .as_ref()
@@ -695,12 +712,27 @@ pub(crate) fn on_call_reject(session: &SessionState, ui_state: &mut UiState, fro
 /// so, unless this names some other call than the one we're actually on
 /// (a stale message from one we already left ourselves).
 pub(crate) fn on_call_end(session: &mut SessionState, ui_state: &mut UiState, from: UserId, call_id: u64) {
+    let on_this_call = session
+        .active_call
+        .as_ref()
+        .is_some_and(|call| call.call_id == call_id);
+    // Not a call we are on: it may still be one we were *invited* to and
+    // have not answered yet, in which case the invite stays on screen but
+    // can no longer join anything (`accept_invite`). Only the peer who
+    // invited us can end it that way - the host is the only one whose
+    // departure ends a call for everyone (`docs/PROTOCOL.md` 7.7).
+    if !on_this_call {
+        if ui_state
+            .call_invite_for(call_id)
+            .is_some_and(|invite| invite.from == from)
+        {
+            ui_state.mark_call_invite_ended(call_id);
+        }
+        return;
+    }
     let Some(call) = session.active_call.as_ref() else {
         return;
     };
-    if call.call_id != call_id {
-        return;
-    }
     // The host hanging up ends the call for everyone (`docs/PROTOCOL.md`
     // 7.7): they are the one participant whose departure isn't just one
     // fewer voice. Nothing is sent on - the host already told every
@@ -717,11 +749,15 @@ pub(crate) fn on_call_end(session: &mut SessionState, ui_state: &mut UiState, fr
     }
 }
 
-/// `P2pEvent::CallMute` - the host's mute decision. Honoured only from the
-/// actual host of the call we are on: any other participant claiming to
-/// mute someone is ignored outright, which is what makes "only the host
-/// can lift it" hold on the wire and not just in the UI. Applied to every
-/// roster, and - when it names us - to our own capture thread.
+/// `P2pEvent::CallMute` - someone's microphone went off or back on
+/// (`docs/PROTOCOL.md` 7.7). Two cases, told apart by who it names:
+/// `target == from` is a participant reporting their *own* mute, which
+/// anyone may do about themselves and which only ever moves a roster row;
+/// `target != from` is the host's decision about someone else, honoured
+/// only from the actual host of the call we are on - any other
+/// participant claiming it is ignored outright, which is what makes "only
+/// the host can lift it" hold on the wire and not just in the UI. The
+/// host's, when it names us, also reaches our own capture thread.
 pub(crate) fn on_call_mute(
     session: &mut SessionState,
     ui_state: &mut UiState,
@@ -733,7 +769,18 @@ pub(crate) fn on_call_mute(
     let Some(call) = session.active_call.as_mut() else {
         return;
     };
-    if call.call_id != call_id || call.host != from {
+    if call.call_id != call_id {
+        return;
+    }
+    // Someone reporting their *own* microphone: a statement of fact about
+    // what they are sending, which anyone may make about themselves and
+    // nobody may make about anyone else. It only ever moves a roster row -
+    // it can never gate our own capture, whoever it names.
+    if from == target {
+        ui_state.set_call_member_self_muted(target, muted);
+        return;
+    }
+    if call.host != from {
         return;
     }
     if Some(target) == ui_state.own_id {
@@ -853,6 +900,14 @@ pub(crate) async fn accept_invite(
     let Some(invite) = ui_state.take_call_invite(call_id) else {
         return Ok(());
     };
+    // The host hung up while this invite was still on screen
+    // (`on_call_end`): the answer is taken, but there is no longer a call
+    // to join, so nothing is started and nothing is sent - the inviter
+    // has already torn its own side down.
+    if invite.ended {
+        ui_state.push_status_notice(ui::CALL_ALREADY_ENDED_NOTICE.to_string(), false);
+        return Ok(());
+    }
     if is_busy(session) {
         session.peer_link.ensure_link(wr, invite.from).await;
         session
@@ -905,17 +960,47 @@ pub(crate) async fn reject_invite(
     Ok(())
 }
 
-/// The `ToggleCallMute` UI action (`/mute`): flips our own mute state and
-/// tells the capture thread - a purely local gate on whether captured audio
-/// is ever encrypted/sent at all (see `spawn_call_audio_worker`), so
-/// nothing is signalled to other participants.
-pub(crate) fn toggle_mute(session: &mut SessionState, ui_state: &mut UiState) {
+/// The `ToggleCallMute` UI action (`m` on our own row in the call modal):
+/// flips our own mute state and tells the capture thread - a local gate on
+/// whether captured audio is ever encrypted/sent at all (see
+/// `spawn_call_audio_worker`) - then announces it to everyone on the call,
+/// so a roster always says who can currently be heard
+/// (`docs/PROTOCOL.md` 7.7). It stays ours to lift, unlike the host's
+/// mute: the announcement is a statement of fact, not authority.
+pub(crate) async fn toggle_mute(
+    wr: &mut impl ControlSink,
+    session: &mut SessionState,
+    ui_state: &mut UiState,
+) -> proto::Result<()> {
     let Some(call) = session.active_call.as_mut() else {
-        return;
+        return Ok(());
     };
     call.muted = !call.muted;
-    let _ = call.cmd_tx.send(CallRecorderCmd::SetMuted(call.muted));
-    ui_state.set_call_muted(call.muted);
+    let muted = call.muted;
+    let call_id = call.call_id;
+    let _ = call.cmd_tx.send(CallRecorderCmd::SetMuted(muted));
+    ui_state.set_call_muted(muted);
+    let Some(own_id) = ui_state.own_id else {
+        return Ok(());
+    };
+    ui_state.set_call_member_self_muted(own_id, muted);
+    let audience: Vec<UserId> = session
+        .active_call
+        .as_ref()
+        .map(|c| c.participants.keys().copied().collect())
+        .unwrap_or_default();
+    for id in audience {
+        session.peer_link.ensure_link(wr, id).await;
+        session.peer_link.send_reliable_or_queue(
+            id,
+            P2pPayload::CallMute {
+                call_id,
+                target: own_id,
+                muted,
+            },
+        );
+    }
+    Ok(())
 }
 
 /// The `EndCall` UI action (`/endcall`, or the modal's END CALL button):
@@ -935,7 +1020,16 @@ pub(crate) async fn end_own_call(
     let Some(call) = session.active_call.take() else {
         return Ok(());
     };
-    for &peer in call.participants.keys() {
+    // Everyone we exchange audio with, plus anyone still holding an
+    // invitation we sent: without that second group an unanswered invite
+    // would keep offering a call that no longer exists (`on_call_end`).
+    let mut peers: Vec<UserId> = call.participants.keys().copied().collect();
+    for peer in ui_state.call_invitees_awaiting_answer() {
+        if !peers.contains(&peer) {
+            peers.push(peer);
+        }
+    }
+    for peer in peers {
         session.peer_link.ensure_link(wr, peer).await;
         session
             .peer_link

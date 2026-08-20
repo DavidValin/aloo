@@ -106,12 +106,18 @@ async fn member_present_mode(w: &mut AlooWorld, name: String, mode: String) {
     w.ui_mut().seed_member("general", info);
 }
 
+/// A membership arrived at earlier, not a join happening now: joining
+/// lands the user in the channel joined (`UiState::on_joined`), so the
+/// selector is put back on whatever it was naming before.
 #[given(expr = "the channel already has joined {string}")]
 async fn already_joined(w: &mut AlooWorld, channel: String) {
-    w.ui_mut().on_joined(ChannelInfo {
+    let state = w.ui_mut();
+    let was = state.selected_channel;
+    state.on_joined(ChannelInfo {
         name: channel,
         kind: ChannelKind::Public,
     });
+    state.select_channel_at(was);
 }
 
 #[given(expr = "I have joined the private channel {string}")]
@@ -243,6 +249,7 @@ async fn press_named(w: &mut AlooWorld, key: String) {
         "Ctrl+H" => (KeyCode::Char('h'), KeyModifiers::CONTROL),
         "Ctrl+Shift+H" => (KeyCode::Char('H'), KeyModifiers::CONTROL),
         "Ctrl+J" => (KeyCode::Char('j'), KeyModifiers::CONTROL),
+        "Ctrl+R" => (KeyCode::Char('r'), KeyModifiers::CONTROL),
         "Ctrl+S" => (KeyCode::Char('s'), KeyModifiers::CONTROL),
         other => panic!("unknown key {other:?}"),
     };

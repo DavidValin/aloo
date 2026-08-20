@@ -5,12 +5,15 @@ use crossterm::event::{KeyCode, KeyModifiers};
 use cucumber::{given, then, when};
 use ratatui::style::Color;
 
+use aloo::client::tui::channel::HEADER_ROW_HEIGHT;
 use aloo::client::p2p::LinkStatus;
 use aloo::proto::{KeyMode, UserId};
 use aloo::client::tui::ui::{Focus, LogEntry, MessageBody};
 
 use crate::steps::ui_common::{id_for, press_key};
-use crate::support::{appears_before, find_text_start, ui_buffer, ui_rows, ui_rows_wide};
+use crate::support::{
+    appears_before, find_text_start, find_text_start_below, ui_buffer, ui_rows, ui_rows_wide,
+};
 use crate::world::AlooWorld;
 
 // ---------------------------------------------------------------------
@@ -119,13 +122,13 @@ async fn name_colour(w: &mut AlooWorld, name: String, colour: String) {
 #[then(expr = "{word} is rendered in gray while {word} stays green")]
 async fn gray_vs_green(w: &mut AlooWorld, offline: String, online: String) {
     let buffer = ui_buffer(w.ui_ref(), 160, 30);
-    let (ox, oy) = find_text_start(&buffer, &offline);
+    let (ox, oy) = find_text_start_below(&buffer, &offline, HEADER_ROW_HEIGHT);
     assert_eq!(
         buffer[(ox, oy)].fg,
         Color::DarkGray,
         "an offline member should be rendered in soft gray"
     );
-    let (nx, ny) = find_text_start(&buffer, &online);
+    let (nx, ny) = find_text_start_below(&buffer, &online, HEADER_ROW_HEIGHT);
     assert_eq!(
         buffer[(nx, ny)].fg,
         Color::Green,
@@ -257,13 +260,19 @@ async fn help_content(w: &mut AlooWorld) {
         ("Help", "a help popup title"),
         ("Ctrl+J", "how to join a hidden channel"),
         ("Space", "how to send a voice message"),
-        ("/file", "how to send a file"),
     ] {
         assert!(
             rows.iter().any(|r| r.contains(needle)),
             "expected {what}: {rows:?}"
         );
     }
+    // Past the first screenful now that the two selectors have their own
+    // lines above it - reached the same way the sections below are.
+    let rows = scroll_help_until(w, "/file");
+    assert!(
+        rows.iter().any(|r| r.contains("/file")),
+        "expected how to send a file: {rows:?}"
+    );
 }
 
 /// The encryption tags and identity pinning are both far enough down the
@@ -394,11 +403,9 @@ async fn help_width_capped(w: &mut AlooWorld) {
         .windows(title.len())
         .position(|c| c == title.as_slice())
         .expect("title in row");
-    assert_eq!(
-        row_chars[title_start - 1],
-        '┌',
-        "expected the corner right before the title"
-    );
+    // The corner cell itself is not asserted on - see the same measurement
+    // in `ui_test.rs` (`help_popup_never_exceeds_90_percent_of_the_terminal_width`)
+    // for why a wide glyph underneath can swallow it.
     let popup_start = title_start - 1;
     let popup_end = row_chars[popup_start..]
         .iter()

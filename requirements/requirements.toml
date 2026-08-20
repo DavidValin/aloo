@@ -286,8 +286,28 @@ evidence = "docs/SPEC.md 'Channels', docs/PROTOCOL.md 6.1; tests second_joiner_g
 
 [[user_story.acceptance_criteria]]
 id = "AC-020"
-description = "']' and '[' move between the channel tabs immediately, wrapping in both directions. Every tab is a channel the user has joined, so switching never joins anything."
-evidence = "docs/SPEC.md Functionality #2; tests bracket_key_switches_to_the_next_joined_channel_without_joining_anything, opening_bracket_selects_the_previous_channel"
+description = "The top row holds two selectors - the channel one on the left, the DM one on the right. '[' and ']' move between them, and on the outermost one they open that selector's own dropdown rather than wrapping around to the other end of the row; Up/Down then pick another entry, switching the view straight away, and Enter, Escape, Tab or the opposite key close the dropdown keeping whatever was picked - Tab closes it instead of cycling focus underneath, and an open dropdown left undriven for SELECTOR_DROPDOWN_IDLE_TIMEOUT closes itself the same way. Every entry is already joined or already open, so switching never joins anything."
+evidence = "docs/SPEC.md 'Connected UI', Functionality #2; src/client/tui/ui.rs selector_left, selector_right, selector_step, close_selector_dropdown, tick_selector_dropdown, focus_channel_selector, focus_dm_selector; tests opening_bracket_opens_the_channel_dropdown_and_down_switches_channel, up_in_the_channel_dropdown_selects_the_previous_channel, tab_closes_an_open_dropdown_instead_of_cycling_focus, an_idle_dropdown_closes_itself_after_the_timeout, closing_bracket_moves_between_the_two_selectors_without_wrapping, closing_bracket_on_the_dm_selector_opens_its_dropdown_and_up_down_switch_rooms"
+
+[[user_story.acceptance_criteria]]
+id = "AC-185"
+description = "The channel selector names one joined channel at a time, prefixed by its kind, and counts the rest as a grey '+<n> more...' - drawn outside the focus highlight, so it never sits on a block of background; its dropdown lists every joined channel except the one named, and does not open at all when there is nothing else to switch to."
+evidence = "docs/SPEC.md 'Connected UI'; src/client/tui/channel.rs channel_selector_title, render_selector_dropdown; src/client/tui/ui.rs selector_dropdown_entries; tests the_channel_selector_counts_everything_it_is_not_naming, the_unread_envelope_is_left_out_of_the_focus_highlight, the_channel_dropdown_lists_every_joined_channel_except_the_selected_one, the_channel_dropdown_does_not_open_with_only_one_channel_joined"
+
+[[user_story.acceptance_criteria]]
+id = "AC-186"
+description = "The DM selector mirrors the channel one for the rooms the user has open - every room, including one opened and never written in - and is not rendered at all until the first room exists. Focusing it opens the room it names, in place of the channel view but under the same top row."
+evidence = "docs/SPEC.md 'Connected UI'; src/client/tui/channel.rs dm_selector_title; src/client/tui/direct_message.rs render_private_room, select_dm; tests the_dm_selector_is_absent_until_a_room_has_been_opened, an_empty_room_still_counts_on_the_dm_selector, the_private_room_view_draws_the_same_top_row"
+
+[[user_story.acceptance_criteria]]
+id = "AC-187"
+description = "A message arriving in a channel or DM that is not the one on screen raises a blinking envelope (U+2709, the plain text-style glyph) on that selector, which keeps blinking until that channel or room is opened; while a selector's dropdown is open the envelope is shown on the individual rows it belongs to instead. The focus highlight covers the selector's own name but stops before the envelope, so no background block is painted around the glyph. Presence notices never raise one."
+evidence = "docs/SPEC.md 'Connected UI'; src/client/tui/channel.rs ChannelTab::unread, SelectorTitle, selector_line, envelope_spans; src/client/tui/ui.rs UNREAD_ENVELOPE, unread_envelope; src/client/tui/direct_message.rs PrivateRoom::unread; tests a_message_in_an_unselected_channel_blinks_an_envelope_until_it_is_opened, a_presence_notice_does_not_mark_a_channel_unread, the_unread_envelope_is_left_out_of_the_focus_highlight, an_unread_dm_blinks_an_envelope_on_the_dm_selector_until_it_is_opened"
+
+[[user_story.acceptance_criteria]]
+id = "AC-189"
+description = "Joining a channel lands the user in it: the moment the server's Joined confirmation arrives, that channel is the one the channel selector names and the view below it, so the compose bar is already addressed to it - closing any open private room, which stays on the DM selector."
+evidence = "docs/SPEC.md Functionality #2; src/client/tui/channel.rs on_joined, select_channel_at; src/client/tui/ui.rs focus_channel_selector; tests joining_a_channel_lands_the_selector_on_it, joining_a_channel_from_a_dm_room_leaves_the_room; scenario features/channels/switching_channels.feature 'Joining a channel lands me in it, ready to type'"
 
 [[user_story.acceptance_criteria]]
 id = "AC-021"
@@ -341,13 +361,18 @@ evidence = "docs/PROTOCOL.md 6.3; src/client/tui/channel.rs UiState::auto_join_c
 
 [[user_story.technical_behavior]]
 id = "TB-206"
-description = "A channel tab exists exactly for a channel the user is a member of: the announced public directory (UiState::known_channels) never creates one, only a join does, and Enter in /channels on an already-joined channel selects its tab rather than re-sending a join. The relationship also runs the other way for public channels - joining one records it in the directory, de-duplicated, since ChannelCreated is sent to every client except the creator and a self-created channel would otherwise be missing from its own author's /channels."
+description = "The channel selector holds exactly the channels the user is a member of: the announced public directory (UiState::known_channels) never adds one, only a join does, and Enter in /channels on an already-joined channel selects it there rather than re-sending a join. The relationship also runs the other way for public channels - joining one records it in the directory, de-duplicated, since ChannelCreated is sent to every client except the creator and a self-created channel would otherwise be missing from its own author's /channels."
 evidence = "docs/PROTOCOL.md 6.3; src/client/tui/channel.rs UiState::on_channel_list, on_joined, handle_channels_popup_key; tests an_announced_public_channel_is_listed_without_becoming_a_tab, enter_on_a_channel_i_am_already_in_selects_its_tab_instead_of_rejoining, rendering_before_any_channel_is_joined_does_not_panic, a_public_channel_i_created_myself_appears_in_my_own_directory, the_directory_does_not_duplicate_a_channel_already_announced"
 
 [[user_story.technical_behavior]]
 id = "TB-026"
-description = "Switching channel tabs closes any open private room."
-evidence = "test switching_tabs_closes_any_open_private_room"
+description = "Focusing the channel selector - with '[' from the DM one, or with Escape from inside a room - closes any open private room; the room itself stays on the DM selector, one ']' away."
+evidence = "src/client/tui/ui.rs focus_channel_selector; tests focusing_the_channel_selector_closes_any_open_private_room, escape_leaves_the_room_but_keeps_it_on_the_dm_selector"
+
+[[user_story.technical_behavior]]
+id = "TB-210"
+description = "Every private room is created through ensure_private_room, which appends it to dm_order (the DM selector's stable order) and names it on that selector only if nothing was named there yet - an incoming message never moves the selector off the room being read."
+evidence = "src/client/tui/direct_message.rs ensure_private_room; tests an_incoming_dm_never_takes_the_selector_off_the_room_being_read, the_first_room_created_becomes_what_the_dm_selector_names"
 
 [[user_story.technical_behavior]]
 id = "TB-027"
@@ -366,8 +391,8 @@ evidence = "docs/PROTOCOL.md 6.1; src/validation.rs channel_name_is_valid; tests
 
 [[user_story.acceptance_criteria]]
 id = "AC-103"
-description = "A channel tab is prefixed with an emoji naming its kind at a glance, followed by a space before the name: the globe for public, the lock for private."
-evidence = "docs/SPEC.md 'Connected UI'; src/client/tui/channel.rs render_channel_view; test channel_tabs_are_prefixed_by_kind"
+description = "A channel is prefixed with an emoji naming its kind at a glance, followed by a space before the name - the globe for public, the lock for private - on the channel selector and on its dropdown rows alike."
+evidence = "docs/SPEC.md 'Connected UI'; src/client/tui/ui.rs channel_kind_icon; src/client/tui/channel.rs channel_selector_title, render_selector_dropdown; test channel_tabs_are_prefixed_by_kind"
 
 [[user_story.technical_behavior]]
 id = "TB-150"
@@ -951,7 +976,7 @@ evidence = "docs/SPEC.md Functionality #7; test render_help_popup_shows_expected
 
 [[user_story.acceptance_criteria]]
 id = "AC-058"
-description = "A 'Ctrl+H: Help' hint sits at the top right, past the end of the channel tabs, as a reminder it is always available."
+description = "A 'Ctrl+H: Help' hint sits at the top right, past the end of the two selectors, as a reminder it is always available."
 evidence = "docs/SPEC.md Functionality #7; tests render_channel_view_shows_the_ctrl_h_hint_after_the_channel_tabs, header_shows_no_spinner_when_no_key_is_being_regenerated"
 
 [[user_story.technical_behavior]]
@@ -1841,7 +1866,7 @@ evidence = "src/p2p_proto.rs SAFE_DATAGRAM_BYTES; src/client/file_transfer.rs FI
 
 [[user_story.technical_behavior]]
 id = "TB-149"
-description = "A direct link's punch handshake is triggered eagerly, the moment a peer is learned about (ServerMessage::UserJoined), rather than lazily on first send - since voice (unlike text/file) excludes a recipient outright if its link isn't already Active at record-start, a lazy trigger meant the first voice message to any brand-new peer reliably missed them. The trigger fires on every UserJoined for that peer, not only the first: UserOffline forgets their link outright (TB-178), so gating it on 'a UserId we have never seen' would leave a peer who reconnected after any blip - including a heartbeat timeout on a slow link - with no link and nothing to re-arm it. A pre-warmed link that fails to punch with nothing ever queued against it fails silently (no visible LinkFailed banner) - only a link something was genuinely waiting on surfaces a visible failure. The trigger is equally independent of which channel tab is on screen: every member of every joined channel gets a link, not just the ones in the selected tab."
+description = "A direct link's punch handshake is triggered eagerly, the moment a peer is learned about (ServerMessage::UserJoined), rather than lazily on first send - since voice (unlike text/file) excludes a recipient outright if its link isn't already Active at record-start, a lazy trigger meant the first voice message to any brand-new peer reliably missed them. The trigger fires on every UserJoined for that peer, not only the first: UserOffline forgets their link outright (TB-178), so gating it on 'a UserId we have never seen' would leave a peer who reconnected after any blip - including a heartbeat timeout on a slow link - with no link and nothing to re-arm it. A pre-warmed link that fails to punch with nothing ever queued against it fails silently (no visible LinkFailed banner) - only a link something was genuinely waiting on surfaces a visible failure. The trigger is equally independent of which channel is on screen: every member of every joined channel gets a link, not just the selected one's."
 evidence = "src/client/session.rs handle_server_message's UserJoined arm (unconditional ensure_link call, distinct from the first-sighting-only identity pin beside it); src/client/p2p.rs PeerLinkManager::expire_pending (only content that was actually queued can age out into a P2pEvent::LinkFailed), forget; tests punch_timeout_with_nothing_pending_fails_silently, a_peer_who_reconnects_is_punched_again, shares_a_joined_channel_is_true_for_a_member_of_an_unselected_joined_channel"
 
 [[user_story.technical_behavior]]
@@ -1951,7 +1976,7 @@ so_that = "I can step away from a conversation I'm done with while staying conne
 
 [[user_story.acceptance_criteria]]
 id = "AC-109"
-description = "Typing /leave and pressing Enter leaves the currently selected channel tab, public or private, and removes that tab - a tab is a channel the user is in. A public channel stays listed in the /channels directory to rejoin from."
+description = "Typing /leave and pressing Enter leaves whichever channel the channel selector names, public or private, and drops it from that selector - it holds exactly the channels the user is in. A public channel stays listed in the /channels directory to rejoin from."
 evidence = "docs/SPEC.md Functionality; src/client/tui/ui.rs submit_input's /leave branch; src/client/tui/channel.rs UiState::leave_channel_locally; tests slash_leave_on_a_private_channel_removes_its_tab, slash_leave_on_a_public_channel_removes_its_tab_too, a_left_public_channel_stays_in_the_directory_to_rejoin_from"
 
 [[user_story.technical_behavior]]
@@ -2103,8 +2128,8 @@ evidence = "docs/SPEC.md 'Live voice calls'; src/client/tui/ui.rs begin_call, en
 
 [[user_story.acceptance_criteria]]
 id = "AC-170"
-description = "/mute toggles our own microphone while on a call, without ending it or telling other participants; /mute is refused, with a notice, while not on a call."
-evidence = "docs/SPEC.md 'Live voice calls'; src/client/tui/ui.rs submit_input's /mute branch, UiAction::ToggleCallMute; src/client/voice_call.rs toggle_mute; test slash_mute_is_refused_off_a_call_and_toggles_on_one; scenario features/voice/live_call.feature '/mute only works while on a call'"
+description = "'m' on our own row in the call modal toggles our own microphone without ending the call, and stays ours alone to lift; every other participant is told (CallMute naming ourselves), so every roster shows MUTED for anyone who cannot currently be heard, whether they silenced themselves or the host did."
+evidence = "docs/SPEC.md 'Live voice calls'; docs/PROTOCOL.md 7.7; src/client/tui/ui.rs handle_call_modal_key's 'm' arm, UiAction::ToggleCallMute, CallMember::self_muted, set_call_member_self_muted, call_member_labels; src/client/voice_call.rs toggle_mute, on_call_mute's self-report branch; tests m_on_our_own_row_toggles_our_own_microphone, muting_ourselves_shows_on_the_roster_like_any_other_mute; scenario features/voice/live_call.feature 'm on my own row mutes my microphone'"
 
 [[user_story.acceptance_criteria]]
 id = "AC-171"
@@ -2113,8 +2138,8 @@ evidence = "docs/SPEC.md 'Live voice calls'; src/client/tui/ui.rs submit_input's
 
 [[user_story.acceptance_criteria]]
 id = "AC-175"
-description = "A call modal opens the moment a call becomes active and lists everyone on it - the host first, labelled HOST in blue, then everyone else labelled IN CALL (green), INVITED (yellow) or REJECTED (grey), with MUTED (red) added for anyone the host has silenced."
-evidence = "docs/SPEC.md 'Live voice calls'; src/client/tui/ui.rs CallMember, CallMemberState, begin_call, upsert_call_member, on_call_invite_sent, on_call_invite_rejected, set_call_member_host_muted, call_member_labels, render_call_modal; tests the_call_modal_lists_the_host_first_and_labels_every_participant, an_unanswered_invitee_is_listed_as_invited; scenario features/voice/live_call.feature 'The call modal lists the host first and labels everyone on it'"
+description = "A call modal opens the moment a call becomes active and lists everyone on it - the host first, named '<nickname> (host)' rather than carrying a label of its own (our own row reads '(you)', and both marks together on our own call), then where each of them stands: IN CALL (green), INVITED (yellow) or REJECTED (grey), with MUTED (red) added for anyone the host has silenced. The name and the label columns are fixed-width, so every voice bar starts in the same column whatever the labels read."
+evidence = "docs/SPEC.md 'Live voice calls'; src/client/tui/ui.rs CallMember, CallMemberState, begin_call, upsert_call_member, on_call_invite_sent, on_call_invite_rejected, set_call_member_host_muted, call_member_name, call_member_labels, CALL_NAME_COL, CALL_LABEL_COL, pad_to, render_call_modal; tests the_call_modal_lists_the_host_first_and_labels_every_participant, an_unanswered_invitee_is_listed_as_invited, every_roster_row_starts_its_voice_bar_in_the_same_column; scenario features/voice/live_call.feature 'The call modal lists the host first and labels everyone on it'"
 
 [[user_story.acceptance_criteria]]
 id = "AC-176"
@@ -2123,8 +2148,8 @@ evidence = "docs/SPEC.md 'Live voice calls'; src/client/tui/ui.rs CallUiState::d
 
 [[user_story.acceptance_criteria]]
 id = "AC-177"
-description = "Escape folds the call modal into its own tab, drawn to the left of the channel tabs; selecting that tab renders the modal alone in place of the sidebar/messages/compose layout, and the modal's participant list scrolls to keep the selected row visible."
-evidence = "docs/SPEC.md 'Live voice calls'; src/client/tui/ui.rs CallUiState::minimized, call_tab_selected, call_modal_showing, handle_call_modal_key; src/client/tui/channel.rs call_and_channel_tabs, render_call_tab_view, select_adjacent_channel; tests escape_minimizes_the_call_modal_into_its_own_tab, the_call_roster_scrolls_to_keep_the_selection_visible; scenario features/voice/live_call.feature 'Escape folds the call modal into its own tab, and it can be reopened'"
+description = "Escape folds the call modal away into the top row's Call indicator - a red-bordered box filling the header band's full height, sitting immediately left of the status figures for the whole call - which advertises the Ctrl+R that brings the modal back; the modal's participant list scrolls to keep the selected row visible."
+evidence = "docs/SPEC.md 'Live voice calls'; src/client/tui/ui.rs CallUiState::minimized, call_modal_showing, handle_call_modal_key; src/client/tui/channel.rs render_header_row, render_call_marker; tests escape_folds_the_call_modal_into_the_header_indicator, the_call_indicator_is_a_bordered_box_beside_the_status_figures, the_call_roster_scrolls_to_keep_the_selection_visible; scenario features/voice/live_call.feature 'Escape folds the call modal into the top row, and Ctrl+R reopens it'"
 
 [[user_story.acceptance_criteria]]
 id = "AC-178"
@@ -2133,7 +2158,7 @@ evidence = "docs/SPEC.md 'Live voice calls'; src/client/tui/ui.rs handle_call_mo
 
 [[user_story.acceptance_criteria]]
 id = "AC-179"
-description = "The host can mute any other participant with 'm' on the call modal's roster, and only the host can lift it: the mute travels as CallMute, is honoured only from the call's actual host, and silences the target's own capture until the host sends the matching unmute."
+description = "The host can mute any other participant with 'm' on that participant's row in the call modal's roster, and only the host can lift it: the mute travels as CallMute naming someone other than its sender, is honoured only from the call's actual host, and silences the target's own capture until the host sends the matching unmute. A CallMute naming someone else, from anyone but the host, is ignored - and one naming its own sender never gates the receiver's capture, whoever sent it."
 evidence = "docs/SPEC.md 'Live voice calls'; docs/PROTOCOL.md 7.7; src/client/tui/ui.rs handle_call_modal_key's 'm' arm, UiAction::HostMuteCallMember; src/client/voice_call.rs host_set_muted, on_call_mute, CallRecorderCmd::SetHostMuted; test only_the_host_can_mute_a_participant_from_the_roster; scenarios features/voice/live_call.feature 'Only the host can mute someone from the roster', 'A participant who is not the host cannot mute anyone'"
 
 [[user_story.acceptance_criteria]]
@@ -2161,6 +2186,11 @@ id = "AC-184"
 description = "A DM /call to a peer under an active OTP session is refused before the confirmation popup is ever shown, with the notice 'voice calls aren't supported over an OTP session'; a channel /call instead leaves such a member out of both the confirmation's invitee count and the invite fan-out, and reports 'no one was invited' if that leaves nobody."
 evidence = "docs/SPEC.md 'Live voice calls'; docs/PROTOCOL.md 7.7 'Not available under OTP'; src/client/tui/ui.rs OTP_CALL_REFUSAL, submit_input's /call branch, call_invitee_count; src/client/direct_message.rs handle_start_call; src/client/voice_call.rs addressable_channel_members, invite_to_call; test a_call_to_an_otp_active_peer_is_refused_without_a_confirmation; scenario features/voice/live_call.feature 'A call to a peer under an OTP session is refused before it is confirmed'"
 
+[[user_story.acceptance_criteria]]
+id = "AC-188"
+description = "A call that ends while an invitation to it is still unanswered takes that invitation with it: the host tells everyone still holding one, and accepting it afterwards starts no call and says 'that call has already ended' instead."
+evidence = "docs/SPEC.md 'Live voice calls'; src/client/tui/ui.rs CALL_ALREADY_ENDED_NOTICE, PendingCallInvite::ended, mark_call_invite_ended, call_invite_for, call_invitees_awaiting_answer; src/client/voice_call.rs on_call_end's invite branch, accept_invite's ended guard, end_own_call's invitee fan-out; tests accepting_an_invite_whose_call_has_ended_starts_nothing_and_says_so, a_call_end_marks_an_unanswered_invite_from_that_caller; scenario features/voice/live_call.feature 'Accepting an invite to a call that has already ended joins nothing'"
+
 [[user_story.technical_behavior]]
 id = "TB-199"
 description = "CallInvite, CallAccept, CallReject and CallEnd (the live-call signaling family) round-trip through bincode encode/decode intact, addressed point-to-point like the file-transfer message family."
@@ -2168,7 +2198,7 @@ evidence = "docs/PROTOCOL.md 'Live voice calls'; src/p2p_proto.rs P2pPayload::Ca
 
 [[user_story.technical_behavior]]
 id = "TB-207"
-description = "CallMute and CallRoster - the host-authority half of the live-call signaling family - round-trip through bincode encode/decode intact, including an empty roster."
+description = "CallMute and CallRoster - the roster-authority half of the live-call signaling family - round-trip through bincode encode/decode intact, including an empty roster."
 evidence = "docs/PROTOCOL.md 7.7; src/p2p_proto.rs P2pPayload::CallMute/CallRoster; test host_mute_and_roster_messages_roundtrip"
 
 [[user_story.technical_behavior]]

@@ -6,6 +6,7 @@
 #![allow(dead_code)]
 
 use aloo::proto::{ChannelInfo, ChannelKind, KeyMode, UserId, UserInfo};
+use aloo::client::tui::channel::HEADER_ROW_HEIGHT;
 use aloo::client::tui::ui::{MessageBody, UiAction, UiState};
 use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::Terminal;
@@ -132,6 +133,21 @@ pub fn on_call_minimized(state: &mut UiState, call_id: u64, channel: Option<Stri
         .as_mut()
         .expect("begin_call just set it")
         .minimized = true;
+}
+
+/// The rendered row the header's text sits on: the header block is
+/// `HEADER_ROW_HEIGHT` rows tall with one blank line above and below it
+/// (`docs/SPEC.md` "Connected UI"), so nothing there is on row 0.
+pub const HEADER_TEXT_ROW: usize = 1;
+
+/// The first rendered row below the whole header block - where the
+/// sidebar, the message log and every dropdown start.
+pub const FIRST_ROW_BELOW_HEADER: usize = HEADER_ROW_HEIGHT as usize;
+
+/// The header's text row, the one carrying both selectors and the status
+/// figures.
+pub fn header_row(state: &UiState) -> String {
+    rendered_rows(state)[HEADER_TEXT_ROW].clone()
 }
 
 pub fn rendered_rows(state: &UiState) -> Vec<String> {

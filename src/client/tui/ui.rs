@@ -1,5 +1,6 @@
-//! The "connected" screen: channel tabs, a user sidebar, the message log,
-//! and the compose bar - plus the full-screen private-message room.
+//! The "connected" screen: the top row's channel/DM selectors, a user
+//! sidebar, the message log, and the compose bar - plus the private-message
+//! room, which the DM selector opens in place of the channel view.
 //!
 //! `UiState` is pure interaction/presentation state: it never touches the
 //! network or does any crypto (its one filesystem touch is stat-ing the
@@ -59,6 +60,14 @@ pub const HELP_SCROLL_PAGE: usize = 10;
 /// looking away, short enough that a stale outcome doesn't linger forever.
 pub const STATUS_NOTICE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// How long a selector dropdown stays open with nothing driving it before
+/// it folds itself away (`UiState::tick_selector_dropdown`). It is an
+/// overlay over the conversation, not a modal: left open and forgotten it
+/// would sit on top of the messages arriving underneath, so an idle one
+/// gets out of the way on its own.
+pub const SELECTOR_DROPDOWN_IDLE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(30);
+
 /// The help overlay's own text, `Up`/`Down`/`PageUp`/`PageDown`/`Home`/`End`-
 /// scrollable (`UiState::help_scroll`) since it easily runs longer than a
 /// typical terminal window - module-level (not local to
@@ -84,6 +93,12 @@ pub const OTP_CALL_REFUSAL: &str = "voice calls aren't supported over an OTP ses
 /// any other participant leaving.
 pub const HOST_LEFT_NOTICE: &str = "Call has ended: the host left the call";
 
+/// What accepting an invite to a call that has already ended says
+/// (`crate::client::voice_call::accept_invite`): the answer is taken -
+/// the popup closes - but there is nothing left to join, so no call
+/// starts and this is shown instead.
+pub const CALL_ALREADY_ENDED_NOTICE: &str = "that call has already ended";
+
 const HELP_HEADINGS: [&str; 10] = [
     "Channels",
     "Messaging",
@@ -98,7 +113,12 @@ const HELP_HEADINGS: [&str; 10] = [
 ];
 const HELP_BODY: &[&str] = &[
     "Channels",
-    "  ]  /  [    switch between the channels you joined (\u{1F30D} public / \u{1F512} private)",
+    "  [  /  ]    move between the channel selector (left) and the DM one (right);",
+    "             at either end it opens that selector's dropdown instead - every",
+    "             other channel you joined (\u{1F30D} public / \u{1F512} private), or room you",
+    "             have open. Up/Down pick one (the view follows straight away),",
+    "             Enter, Esc, Tab or the opposite key close it again, and so",
+    "             does leaving it alone for 30 seconds",
     "  /channels  list every public channel (yours in yellow); Enter joins, Esc closes",
     "  Ctrl+J     join/create a channel: name, Public/Private (Left/Right), optional password",
     "  /leave     leave the selected channel tab (its tab disappears)",
@@ -110,7 +130,9 @@ const HELP_BODY: &[&str] = &[
     "Private messages",
     "  Up / Down    pick a user (sidebar focused)",
     "  Enter      open a private room with the selected user",
-    "  Esc        close the private room",
+    "  Esc        back to the channel selector (the room stays on the DM selector)",
+    "  \u{2709}          blinks on a selector while a channel/DM behind it has unseen",
+    "             messages, and on the dropdown row they landed in",
     "",
     "Voice messages",
     "  Space      hold to record & send live (not while composing); release to stop",
@@ -135,16 +157,17 @@ const HELP_BODY: &[&str] = &[
     "             push-to-talk, no time cap, and every current member/the",
     "             peer gets an Accept/Reject popup (with a chime) naming you.",
     "             You confirm first, told how many people it will ring.",
-    "  /mute      toggle your own microphone while on a call",
     "  /endcall   leave the call - a permanent red banner (top right) marks",
     "             the whole time you're on one",
     "  The call modal opens with the call: live duration on top, then",
     "  everyone on it - HOST first, each labelled IN CALL / INVITED /",
     "  REJECTED (+ MUTED), with a live voice bar. Up/Down walk the list,",
-    "  Enter or e is END CALL, Esc folds it into its own tab ([ / ] to",
-    "  navigate back to it).",
-    "  As the host: m mutes whoever the cursor is on (only you can lift",
-    "  it), i invites one more person you share a channel or DM with.",
+    "  Enter or e is END CALL, Esc folds it away into the \u{1F534} Call",
+    "  indicator at the top right (Ctrl+R brings the modal back).",
+    "  m on your own row mutes your microphone (yours to lift, nobody",
+    "  else is told). As the host, m on anyone else's row mutes them",
+    "  instead - only you can lift that - and i invites one more person",
+    "  you share a channel or DM with.",
     "  Leaving as the host ends the call for everyone. One call at a time.",
     "  Not available over an OTP session (that layer has no live-streaming",
     "  concept at all - see the OTP section below).",
@@ -385,6 +408,50 @@ pub enum Focus {
     Input,
 }
 
+/// Which of the top row's two selectors - the channel one on the left, the
+/// DM one on the right - is focused, i.e. whose own selection is the view
+/// on screen (`docs/SPEC.md` "Connected UI"). `[`/`]` move between them
+/// and open the focused one's dropdown at the outer end; neither key ever
+/// wraps around from one end of the row to the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectorFocus {
+    Channels,
+    Dms,
+}
+
+/// The icon each kind of entry carries in the top row and in a dropdown:
+/// the channel's own kind for a channel (as `docs/SPEC.md` "Connected UI"
+/// has always shown it), and one shared marker for every DM.
+pub(crate) fn channel_kind_icon(kind: ChannelKind) -> &'static str {
+    match kind {
+        ChannelKind::Public => "\u{1F30D}",
+        ChannelKind::Private => "\u{1F512}",
+    }
+}
+
+pub(crate) const DM_ICON: &str = "\u{1F4AC}";
+
+/// The one envelope glyph this UI ever draws for unseen messages - the
+/// plain text-style U+2709, never an emoji-presentation variant, so a
+/// terminal renders it as one flat character with no colour block of its
+/// own behind it.
+pub(crate) const UNREAD_ENVELOPE: &str = "\u{2709}";
+
+/// That envelope as the top row and the dropdowns draw it: a fixed
+/// two-cell slot - a leading space and the glyph, or two spaces on the
+/// blink-off frame - so nothing shifts sideways as it blinks.
+pub(crate) fn unread_envelope(blink_on: bool) -> &'static str {
+    if blink_on { " \u{2709}" } else { "  " }
+}
+
+/// One row of an open selector dropdown - `label` already carries its
+/// kind prefix (\u{1F30D}/\u{1F512} for a channel, \u{1F4AC} for a DM), `unread` drives the
+/// blinking envelope beside it (`render_selector_dropdown`).
+pub struct SelectorEntry {
+    pub label: String,
+    pub unread: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Normal,
@@ -472,6 +539,11 @@ pub struct PendingCallInvite {
     pub from_name: String,
     /// `Some(channel)` for a channel call, `None` for a DM.
     pub channel: Option<String>,
+    /// Set once the host's `CallEnd` for this call has arrived while the
+    /// invite was still unanswered (`mark_call_invite_ended`): accepting
+    /// it then starts nothing and says so (`CALL_ALREADY_ENDED_NOTICE`),
+    /// since there is no longer a call to join.
+    pub ended: bool,
 }
 
 /// Which button is focused in the call-invite popup - `Accept` by default,
@@ -551,9 +623,14 @@ pub struct CallMember {
     pub name: String,
     pub state: CallMemberState,
     /// Muted *by the host* (`p2p_proto::P2pPayload::CallMute`) - a
-    /// different thing from a participant's own `/mute`, which is purely
-    /// local and never shown to anyone else. Only the host can lift it.
+    /// different thing from this person muting themselves: only the host
+    /// can lift this one.
     pub host_muted: bool,
+    /// Muted *by themselves* - announced to everyone on the call the
+    /// moment they toggle it (`crate::client::voice_call::toggle_mute`),
+    /// so every roster says who can currently be heard. Theirs alone to
+    /// lift again.
+    pub self_muted: bool,
     /// Live 0-100 meter reading for this person's voice
     /// (`crate::client::voice::level_from_pcm`), refreshed every audio
     /// chunk by whichever worker produced it.
@@ -579,13 +656,15 @@ pub struct CallInvitePicker {
 pub struct CallUiState {
     pub call_id: u64,
     pub channel: Option<String>,
-    /// Our own `/mute` - local only, never signalled (`docs/PROTOCOL.md`
-    /// 7.7).
+    /// Whether we have muted ourselves (`m` on our own row). It gates our
+    /// own capture locally and is announced to the call so everyone's
+    /// roster shows it (`docs/PROTOCOL.md` 7.7); it stays ours alone to
+    /// lift, unlike `CallMember::host_muted`.
     pub muted: bool,
     /// Who started this call: the initiator for a call we started, the
-    /// sender of the `CallInvite` for one we accepted. Labelled `HOST` on
-    /// the roster, and the only person allowed to mute others or invite
-    /// more people.
+    /// sender of the `CallInvite` for one we accepted. Named
+    /// `<nickname> (host)` on the roster, and the only person allowed to
+    /// mute anyone else or invite more people.
     pub host: UserId,
     /// The roster, host first, then everyone else in the order we learned
     /// about them - includes our own row.
@@ -599,9 +678,9 @@ pub struct CallUiState {
     /// read from the clock at render time, so the rendered value is
     /// deterministic for a given tick.
     pub elapsed_secs: u64,
-    /// `true` once Escape has folded the modal away into its tab
-    /// (`UiState::call_tab_selected`), leaving the ordinary
-    /// sidebar/messages/compose layout usable again.
+    /// `true` once Escape has folded the modal away into the header row's
+    /// `\u{1F534} Call Ctrl+R` indicator, leaving the ordinary
+    /// sidebar/messages/compose layout usable again. Ctrl+R brings it back.
     pub minimized: bool,
     /// The host's invite picker, while it is open.
     pub invite_picker: Option<CallInvitePicker>,
@@ -858,8 +937,9 @@ pub enum UiAction {
     RejectCallInvite {
         call_id: u64,
     },
-    /// The `/mute` command, typed while on a call - toggles our own
-    /// microphone, purely local (`crate::client::voice_call::toggle_mute`).
+    /// `m` on our own row in the call modal - toggles our own microphone,
+    /// ours alone to lift, and announced to everyone on the call
+    /// (`crate::client::voice_call::toggle_mute`).
     ToggleCallMute,
     /// The `/endcall` command, or the call modal's END CALL button -
     /// leaves the call we're currently on
@@ -903,6 +983,22 @@ pub struct UiState {
     /// The server's wider public directory lives in `known_channels`.
     pub channels: Vec<ChannelTab>,
     pub selected_channel: usize,
+    /// Which of the top row's two selectors is focused - whichever it is,
+    /// its own selection (`selected_channel` or `selected_dm`) is what the
+    /// view below renders. Kept in step with `active_private_room`:
+    /// `Channels` always means no room is open, `Dms` always means
+    /// `selected_dm`'s room is.
+    pub selector_focus: SelectorFocus,
+    /// Whether the focused selector's dropdown - the list of every entry
+    /// it holds *except* the one it names - is open over the view. Opened
+    /// by the focused selector's own outward key (`[` on the left one, `]`
+    /// on the right one), closed by Escape, Enter, Tab, the opposite key,
+    /// or `SELECTOR_DROPDOWN_IDLE_TIMEOUT` of nothing driving it.
+    pub selector_dropdown_open: bool,
+    /// When the open dropdown was last driven - opened, or moved with
+    /// Up/Down - which `tick_selector_dropdown` measures its idle timeout
+    /// from. `None` whenever no dropdown is open.
+    selector_dropdown_since: Option<Instant>,
     /// Every public channel the server has announced (`ChannelList` at
     /// connect, `ChannelCreated` live) - the rows of the `/channels`
     /// modal, whether or not the user has joined them.
@@ -923,6 +1019,17 @@ pub struct UiState {
     /// content addressed to them is queued, not delivered.
     pub link_status: HashMap<UserId, LinkStatus>,
     pub private_rooms: HashMap<UserId, PrivateRoom>,
+    /// Every open DM in the order it was first opened - `private_rooms` is
+    /// a `HashMap`, and the DM selector needs one stable order to name a
+    /// "next" and a "previous" room by. Every insertion into
+    /// `private_rooms` goes through `ensure_private_room`, which is what
+    /// keeps the two in step.
+    pub dm_order: Vec<UserId>,
+    /// The DM the right-hand selector currently names, whether or not that
+    /// selector is the focused one. `None` only while no room has ever
+    /// been opened - which is also when that selector isn't rendered at
+    /// all.
+    pub selected_dm: Option<UserId>,
     pub active_private_room: Option<UserId>,
     pub focus: Focus,
     pub sidebar_selected: usize,
@@ -994,11 +1101,6 @@ pub struct UiState {
     /// read-only for presentation, same split every other feature here
     /// uses.
     pub call: Option<CallUiState>,
-    /// Whether the call's own tab - the one Escape folds the modal into,
-    /// drawn to the left of the channel tabs - is the selected tab. While
-    /// it is, the call modal *is* the whole view: no sidebar, no message
-    /// log, no compose bar (`docs/SPEC.md` "Live voice calls").
-    pub call_tab_selected: bool,
     /// The "/call will ring <n> users - go ahead?" confirmation, opened by
     /// `/call` before a single invite is sent. `None` when nothing is
     /// pending; only ever one at a time, same as every other popup here.
@@ -1177,12 +1279,17 @@ impl UiState {
             own_name,
             channels: Vec::new(),
             selected_channel: 0,
+            selector_focus: SelectorFocus::Channels,
+            selector_dropdown_open: false,
+            selector_dropdown_since: None,
             known_channels: Vec::new(),
             channels_popup_selected: 0,
             known_users: HashMap::new(),
             offline: HashSet::new(),
             link_status: HashMap::new(),
             private_rooms: HashMap::new(),
+            dm_order: Vec::new(),
+            selected_dm: None,
             active_private_room: None,
             focus: Focus::Input,
             sidebar_selected: 0,
@@ -1206,7 +1313,6 @@ impl UiState {
             call_invite_focus: CallInviteChoice::Accept,
             pending_call_invites: HashMap::new(),
             call: None,
-            call_tab_selected: false,
             call_confirm: None,
             call_confirm_focus: CallConfirmChoice::Confirm,
             otp_generate_confirm: None,
@@ -1418,6 +1524,9 @@ impl UiState {
                                 is_current,
                                 entry,
                             );
+                            if !is_current {
+                                tab.unread = true;
+                            }
                         }
                     }
                     None => {
@@ -1435,20 +1544,19 @@ impl UiState {
                                     public_key_der: Vec::new(),
                                     key_mode: crate::proto::KeyMode::None,
                                 });
-                        let room = self
-                            .private_rooms
-                            .entry(peer)
-                            .or_insert_with(|| PrivateRoom {
-                                peer: fallback_peer,
-                                log: Vec::new(),
-                                unread: false,
-                            });
+                        self.ensure_private_room(peer, fallback_peer);
+                        let Some(room) = self.private_rooms.get_mut(&peer) else {
+                            continue;
+                        };
                         push_log_entry(
                             &mut room.log,
                             &mut self.message_selected,
                             is_current,
                             entry,
                         );
+                        if !is_current {
+                            room.unread = true;
+                        }
                     }
                 }
             }
@@ -1564,6 +1672,61 @@ impl UiState {
         self.call_invites.get(key)
     }
 
+    /// Accept on the invite popup. An invite whose call has already ended
+    /// (`mark_call_invite_ended`) is taken off screen with
+    /// `CALL_ALREADY_ENDED_NOTICE` instead of starting anything - the
+    /// answer is still spent, there is simply nothing left to join. The
+    /// session repeats the check when it handles the action
+    /// (`crate::client::voice_call::accept_invite`), for the case where
+    /// the `CallEnd` lands in between.
+    fn accept_call_invite(&mut self, call_id: u64) -> Option<UiAction> {
+        if self.call_invites.get(&call_id).is_some_and(|i| i.ended) {
+            self.take_call_invite(call_id);
+            self.push_status_notice(CALL_ALREADY_ENDED_NOTICE.to_string(), false);
+            return None;
+        }
+        Some(UiAction::AcceptCallInvite { call_id })
+    }
+
+    /// The invite we hold for `call_id`, answered or not - lets the
+    /// session check who sent it before acting on a `CallEnd` naming it
+    /// (`crate::client::voice_call::on_call_end`).
+    pub fn call_invite_for(&self, call_id: u64) -> Option<&PendingCallInvite> {
+        self.call_invites.get(&call_id)
+    }
+
+    /// Everyone on our own call's roster who was invited and has not
+    /// answered yet - who `end_own_call` must also tell, on top of the
+    /// participants it is actually exchanging audio with.
+    pub fn call_invitees_awaiting_answer(&self) -> Vec<UserId> {
+        self.call
+            .as_ref()
+            .map(|call| {
+                call.members
+                    .iter()
+                    .filter(|m| m.state == CallMemberState::Invited)
+                    .map(|m| m.id)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Marks the still-unanswered invite for `call_id` as belonging to a
+    /// call that has since ended, if we hold one. Returns whether it did -
+    /// the caller (`crate::client::voice_call::on_call_end`) uses that to
+    /// tell "this named an invite of ours" from "this named nothing we
+    /// know about". The popup stays up: the user is still owed an answer,
+    /// it just can no longer join anything.
+    pub fn mark_call_invite_ended(&mut self, call_id: u64) -> bool {
+        match self.call_invites.get_mut(&call_id) {
+            Some(invite) => {
+                invite.ended = true;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Removes and returns the invite for `call_id` - a decision here is
     /// always final, same as a file offer's.
     pub fn take_call_invite(&mut self, call_id: u64) -> Option<PendingCallInvite> {
@@ -1588,6 +1751,7 @@ impl UiState {
                 name: self.own_display_name(),
                 state: CallMemberState::InCall,
                 host_muted: false,
+                self_muted: false,
                 level: 0,
             });
         }
@@ -1606,16 +1770,21 @@ impl UiState {
         self.sort_call_members();
     }
 
-    /// Clears the modal, its tab and the permanent indicator - called once
-    /// we've left the call (`crate::client::voice_call::end_own_call`).
+    /// Clears the modal, the header's `\u{1F534} Call Ctrl+R` indicator and the
+    /// permanent banner - called once we've left the call
+    /// (`crate::client::voice_call::end_own_call`).
     pub fn end_call(&mut self) {
         self.call = None;
-        self.call_tab_selected = false;
     }
 
     pub fn set_call_muted(&mut self, muted: bool) {
         if let Some(call) = self.call.as_mut() {
             call.muted = muted;
+        }
+        // Our own row says the same thing to us as it does to everyone
+        // else, without waiting for our own announcement to come back.
+        if let Some(own_id) = self.own_id {
+            self.set_call_member_self_muted(own_id, muted);
         }
     }
 
@@ -1676,6 +1845,7 @@ impl UiState {
                 name,
                 state,
                 host_muted: false,
+                self_muted: false,
                 level: 0,
             }),
         }
@@ -1719,6 +1889,21 @@ impl UiState {
         };
         call.members.retain(|m| m.id != peer);
         call.selected = call.selected.min(call.members.len().saturating_sub(1));
+    }
+
+    /// Applies `peer`'s own mute state to the roster - see
+    /// `CallMember::self_muted`. Never touches anyone's capture: this is
+    /// what that person says about their own microphone, which everyone
+    /// on the call is shown.
+    pub fn set_call_member_self_muted(&mut self, peer: UserId, muted: bool) {
+        if let Some(call) = self.call.as_mut()
+            && let Some(member) = call.members.iter_mut().find(|m| m.id == peer)
+        {
+            member.self_muted = muted;
+            if muted {
+                member.level = 0;
+            }
+        }
     }
 
     /// Applies the host's mute decision for `peer` to the roster - see
@@ -2294,7 +2479,7 @@ impl UiState {
                         None
                     }
                     KeyCode::Enter => match self.call_invite_focus {
-                        CallInviteChoice::Accept => Some(UiAction::AcceptCallInvite { call_id }),
+                        CallInviteChoice::Accept => self.accept_call_invite(call_id),
                         CallInviteChoice::Reject => Some(UiAction::RejectCallInvite { call_id }),
                     },
                     _ => None,
@@ -2460,20 +2645,62 @@ impl UiState {
             return self.handle_file_send_key(code);
         }
 
+        // The top row's two selectors (`docs/SPEC.md` "Connected UI"):
+        // `[` walks left, `]` walks right, and the outermost press on
+        // either side opens that selector's own dropdown instead of
+        // wrapping around to the other end of the row.
         match code {
             KeyCode::Char('[') => {
-                self.select_adjacent_channel(false);
+                self.selector_left();
                 return None;
             }
             KeyCode::Char(']') => {
-                self.select_adjacent_channel(true);
+                self.selector_right();
                 return None;
             }
             _ => {}
         }
 
+        // An open dropdown owns Up/Down (which move the selection, and
+        // with it the view behind the overlay, straight away) and
+        // Enter/Escape/Tab (which close it, keeping whatever Up/Down
+        // landed on). Tab is in that group because its usual job - moving
+        // focus between the sidebar, the log and the compose bar - is
+        // about the view *behind* the overlay: getting on with it means
+        // being done with the dropdown, so it closes rather than cycling
+        // underneath. Everything else still falls through - this is an
+        // overlay, not a modal.
+        if self.selector_dropdown_open {
+            match code {
+                KeyCode::Up => {
+                    self.selector_step(false);
+                    return None;
+                }
+                KeyCode::Down => {
+                    self.selector_step(true);
+                    return None;
+                }
+                KeyCode::Enter | KeyCode::Esc | KeyCode::Tab => {
+                    self.close_selector_dropdown();
+                    return None;
+                }
+                _ => {}
+            }
+        }
+
         if modifiers.contains(KeyModifiers::CONTROL) {
             match code {
+                // Brings a folded-away call modal back up - the header's
+                // `\u{1F534} Call Ctrl+R` indicator is what advertises it
+                // (`docs/SPEC.md` "Live voice calls"). A no-op with no
+                // call on; it can only be reached while the modal is
+                // down, since the modal absorbs keys before this.
+                KeyCode::Char('r') | KeyCode::Char('R') => {
+                    if let Some(call) = self.call.as_mut() {
+                        call.minimized = false;
+                    }
+                    return None;
+                }
                 KeyCode::Char('j') | KeyCode::Char('J') => {
                     self.mode = Mode::JoinPrivatePopup;
                     self.join_popup_input.clear();
@@ -2490,10 +2717,10 @@ impl UiState {
             // Gated on `Press` only (same reasoning as the Ctrl+H toggle
             // above): a terminal that also reports `Release` for this key
             // must not act on it a second time, which matters here because
-            // - unlike the plain `active_private_room = None` below,
-            // idempotent either way - stopping playback is a real state
-            // transition that a second, redundant firing must not follow
-            // through the fallback branch and additionally close the room.
+            // - unlike `focus_channel_selector` below, idempotent either
+            // way - stopping playback is a real state transition that a
+            // second, redundant firing must not follow through the
+            // fallback branch and additionally close the room.
             if kind != KeyEventKind::Press {
                 return None;
             }
@@ -2501,7 +2728,7 @@ impl UiState {
                 self.replaying = false;
                 return Some(UiAction::StopPlayback);
             }
-            self.active_private_room = None;
+            self.focus_channel_selector();
             return None;
         }
 
@@ -2518,13 +2745,10 @@ impl UiState {
     }
 
     /// Whether the call modal is the thing currently owning the screen -
-    /// either overlaid on the ordinary view (a call just started, or its
-    /// tab was re-entered) or drawn as the whole view because its tab is
-    /// selected.
+    /// i.e. a call is on and Escape has not folded its modal away into the
+    /// header's `\u{1F534} Call Ctrl+R` indicator (which is what brings it back).
     pub fn call_modal_showing(&self) -> bool {
-        self.call
-            .as_ref()
-            .is_some_and(|c| !c.minimized || self.call_tab_selected)
+        self.call.as_ref().is_some_and(|c| !c.minimized)
     }
 
     /// Every key the call modal handles (`docs/SPEC.md` "Live voice
@@ -2559,15 +2783,15 @@ impl UiState {
             }
             KeyCode::Char('m') | KeyCode::Char('M') => {
                 let call = self.call.as_ref()?;
-                if !call.we_are_host(own_id) {
-                    return None;
-                }
                 let member = call.members.get(call.selected)?;
-                // Muting ourselves through the roster would be a second,
-                // host-only way to do what `/mute` already does, and it
-                // could not be lifted by anyone else either - so the host
-                // row is simply not mutable this way.
+                // Our own row toggles our own microphone: ours alone to
+                // lift again, though everyone's roster is told. Anyone
+                // else's row is the host's mute instead - a different
+                // thing entirely, and only the host may use it.
                 if Some(member.id) == own_id {
+                    return Some(UiAction::ToggleCallMute);
+                }
+                if !call.we_are_host(own_id) {
                     return None;
                 }
                 Some(UiAction::HostMuteCallMember {
@@ -2576,17 +2800,19 @@ impl UiState {
                 })
             }
             KeyCode::Enter | KeyCode::Char('e') | KeyCode::Char('E') => Some(UiAction::EndCall),
-            // Tab switching keeps working through the modal - it is how
-            // the user leaves the call tab again, and (from the overlay)
-            // how they get on with reading a channel without ending
-            // anything. Leaving for a channel folds the overlay away, so
-            // it doesn't simply reappear on top of that channel.
+            // Selector navigation keeps working through the modal - it is
+            // how the user gets on with reading a channel or a DM without
+            // ending anything. It folds the modal away first, so it
+            // doesn't simply reappear on top of whatever was navigated to
+            // (Ctrl+R brings it back).
             KeyCode::Char('[') | KeyCode::Char(']') => {
-                self.select_adjacent_channel(code == KeyCode::Char(']'));
-                if !self.call_tab_selected
-                    && let Some(call) = self.call.as_mut()
-                {
+                if let Some(call) = self.call.as_mut() {
                     call.minimized = true;
+                }
+                if code == KeyCode::Char(']') {
+                    self.selector_right();
+                } else {
+                    self.selector_left();
                 }
                 None
             }
@@ -2594,7 +2820,6 @@ impl UiState {
                 if let Some(call) = self.call.as_mut() {
                     call.minimized = true;
                 }
-                self.call_tab_selected = false;
                 None
             }
             _ => None,
@@ -2632,6 +2857,191 @@ impl UiState {
             }
             _ => None,
         }
+    }
+
+    // -------------------------------------------------------------
+    // The top row's two selectors
+    // -------------------------------------------------------------
+
+    /// `[`. From the DM selector it steps left onto the channel one; on
+    /// the channel selector - already the leftmost thing in the row -
+    /// there is nothing further left to step onto, so it opens that
+    /// selector's own dropdown instead. With a dropdown already open it is
+    /// the *DM* dropdown's close key, mirroring the side each selector
+    /// sits on (`docs/SPEC.md` "Connected UI").
+    pub(crate) fn selector_left(&mut self) {
+        if self.selector_dropdown_open {
+            if self.selector_focus == SelectorFocus::Dms {
+                self.close_selector_dropdown();
+            }
+            return;
+        }
+        match self.selector_focus {
+            SelectorFocus::Channels => self.open_selector_dropdown(),
+            SelectorFocus::Dms => self.focus_channel_selector(),
+        }
+    }
+
+    /// `]` - `selector_left`'s mirror image: from the channel selector it
+    /// steps right onto the DM one (which isn't there at all until a room
+    /// has been opened, in which case nothing happens), and on the DM
+    /// selector it opens that selector's dropdown. With the *channel*
+    /// dropdown open it closes it.
+    pub(crate) fn selector_right(&mut self) {
+        if self.selector_dropdown_open {
+            if self.selector_focus == SelectorFocus::Channels {
+                self.close_selector_dropdown();
+            }
+            return;
+        }
+        match self.selector_focus {
+            SelectorFocus::Channels => self.focus_dm_selector(),
+            SelectorFocus::Dms => self.open_selector_dropdown(),
+        }
+    }
+
+    /// Opens the focused selector's dropdown - unless it would be empty,
+    /// which is exactly when there is nothing else to switch to (one
+    /// channel joined, one room open), and an empty overlay in the way
+    /// would be pure obstruction.
+    fn open_selector_dropdown(&mut self) {
+        if !self.selector_dropdown_entries().is_empty() {
+            self.selector_dropdown_open = true;
+            self.selector_dropdown_since = Some(Instant::now());
+        }
+    }
+
+    /// The one way a dropdown is ever put away - every closing key and the
+    /// idle timeout alike - so its timer never outlives it.
+    pub(crate) fn close_selector_dropdown(&mut self) {
+        self.selector_dropdown_open = false;
+        self.selector_dropdown_since = None;
+    }
+
+    /// Folds an open dropdown away once `SELECTOR_DROPDOWN_IDLE_TIMEOUT`
+    /// has passed with nothing driving it - called from the session's
+    /// ticker, the same cadence `tick_status_notice` rides. An open
+    /// dropdown whose timestamp is missing (set by writing the pub field
+    /// directly, as tests do) is adopted from `now` rather than left
+    /// immortal.
+    pub fn tick_selector_dropdown(&mut self, now: Instant) {
+        if !self.selector_dropdown_open {
+            self.selector_dropdown_since = None;
+            return;
+        }
+        match self.selector_dropdown_since {
+            Some(since) if now.duration_since(since) >= SELECTOR_DROPDOWN_IDLE_TIMEOUT => {
+                self.close_selector_dropdown();
+            }
+            None => self.selector_dropdown_since = Some(now),
+            _ => {}
+        }
+    }
+
+    /// Up/Down while a dropdown is open: moves the focused selector's own
+    /// selection one entry on, wrapping at both ends the way the sidebar
+    /// and the `/channels` modal already do. The view behind the overlay
+    /// follows immediately - the dropdown lists everything *except* the
+    /// selection, so the row that was picked leaves the list and the one
+    /// stepped off rejoins it.
+    pub(crate) fn selector_step(&mut self, forward: bool) {
+        // Driving the list is what "not idle" means (`tick_selector_dropdown`).
+        self.selector_dropdown_since = Some(Instant::now());
+        match self.selector_focus {
+            SelectorFocus::Channels => {
+                let len = self.channels.len();
+                if len == 0 {
+                    return;
+                }
+                let next = if forward {
+                    (self.selected_channel + 1) % len
+                } else {
+                    (self.selected_channel + len - 1) % len
+                };
+                self.select_channel_at(next);
+            }
+            SelectorFocus::Dms => {
+                let len = self.dm_order.len();
+                if len == 0 {
+                    return;
+                }
+                let current = self
+                    .selected_dm
+                    .and_then(|id| self.dm_order.iter().position(|d| *d == id))
+                    .unwrap_or(0);
+                let next = if forward {
+                    (current + 1) % len
+                } else {
+                    (current + len - 1) % len
+                };
+                self.select_dm(self.dm_order[next]);
+            }
+        }
+    }
+
+    /// Focuses the left-hand selector: its channel becomes the view, so
+    /// any open room is closed (it stays on the DM selector, one `]`
+    /// away). Also where Escape lands from inside a room.
+    pub(crate) fn focus_channel_selector(&mut self) {
+        self.selector_focus = SelectorFocus::Channels;
+        self.close_selector_dropdown();
+        self.active_private_room = None;
+        self.sidebar_selected = 0;
+        self.select_channel_at(self.selected_channel);
+    }
+
+    /// Focuses the right-hand selector, opening the room it names. A no-op
+    /// while no room has ever been opened - that selector isn't rendered
+    /// at all then, and `]` from the channel one has nowhere to go.
+    pub(crate) fn focus_dm_selector(&mut self) {
+        let Some(peer) = self.selected_dm else {
+            return;
+        };
+        self.selector_focus = SelectorFocus::Dms;
+        self.close_selector_dropdown();
+        self.select_dm(peer);
+    }
+
+    /// The focused selector's dropdown rows: every entry it holds *except*
+    /// the one it currently names, in that selector's own order
+    /// (`channels`, `dm_order`). Also what decides whether there is a
+    /// dropdown worth opening at all (`open_selector_dropdown`).
+    pub fn selector_dropdown_entries(&self) -> Vec<SelectorEntry> {
+        match self.selector_focus {
+            SelectorFocus::Channels => self
+                .channels
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != self.selected_channel)
+                .map(|(_, c)| SelectorEntry {
+                    label: format!("{} {}", channel_kind_icon(c.kind), c.name),
+                    unread: c.unread,
+                })
+                .collect(),
+            SelectorFocus::Dms => self
+                .dm_order
+                .iter()
+                .filter(|id| Some(**id) != self.selected_dm)
+                .filter_map(|id| self.private_rooms.get(id))
+                .map(|room| SelectorEntry {
+                    label: format!("{DM_ICON} {}", room.peer.name),
+                    unread: room.unread,
+                })
+                .collect(),
+        }
+    }
+
+    /// Whether any channel behind the left-hand selector holds messages
+    /// the user has not seen - what makes its envelope blink. The channel
+    /// on screen is never one of them: selecting it clears the flag, and
+    /// nothing sets it again while it is the log being looked at.
+    pub fn any_channel_unread(&self) -> bool {
+        self.channels.iter().any(|c| c.unread)
+    }
+
+    /// `any_channel_unread`'s DM counterpart, for the right-hand selector.
+    pub fn any_dm_unread(&self) -> bool {
+        self.private_rooms.values().any(|r| r.unread)
     }
 
     fn cycle_focus(&mut self) {
@@ -2791,18 +3201,6 @@ impl UiState {
             });
             self.call_confirm_focus = CallConfirmChoice::Confirm;
             return None;
-        }
-        if self.input.trim() == "/mute" {
-            // Toggles either way - see `CallUiState::muted`'s doc; the
-            // actual flip happens session-side (`crate::client::voice_call::
-            // toggle_mute`), which then writes the result back here.
-            if self.call.is_none() {
-                self.push_status_notice("not on a call".to_string(), false);
-                self.input.clear();
-                return None;
-            }
-            self.input.clear();
-            return Some(UiAction::ToggleCallMute);
         }
         if self.input.trim() == "/endcall" {
             if self.call.is_none() {
@@ -2968,8 +3366,9 @@ impl UiState {
         // The microphone is already spoken for by the live call - push-to-
         // talk and a call both ultimately open the same `voice::Recorder`,
         // and layering a bounded recording's own send path on top of a
-        // continuous call's would be confusing at best. `/mute` is how you
-        // temporarily stop talking on a call, not Space.
+        // continuous call's would be confusing at best. Muting yourself
+        // (`m` on your own row) is how you temporarily stop talking on a
+        // call, not Space.
         if self.call.is_some() {
             return None;
         }
@@ -3314,13 +3713,7 @@ pub(crate) fn finalize_held_stream(
 
 pub fn render(frame: &mut Frame, state: &UiState) {
     let area = frame.area();
-    if state.call_tab_selected && state.call.is_some() {
-        // The call's own tab replaces the whole sidebar/messages/compose
-        // layout with the modal (`docs/SPEC.md` "Live voice calls") - the
-        // tab row itself is still drawn, so the user can see where they
-        // are and `[`/`]` back out.
-        super::channel::render_call_tab_view(frame, area, state);
-    } else if state.otp_mail.is_some() {
+    if state.otp_mail.is_some() {
         // The mail view replaces the whole screen (its popups included) -
         // the global popups/notice below still overlay it, same priority
         // order `handle_key` applies.
@@ -3329,6 +3722,12 @@ pub fn render(frame: &mut Frame, state: &UiState) {
         super::direct_message::render_private_room(frame, area, state, peer_id);
     } else {
         super::channel::render_channel_view(frame, area, state);
+    }
+    // The focused selector's dropdown, when open: an overlay hanging off
+    // the top row over whichever view is behind it - which keeps updating
+    // live as Up/Down move the selection - and below every popup.
+    if state.selector_dropdown_open {
+        super::channel::render_selector_dropdown(frame, area, state);
     }
     if state.mode == Mode::JoinPrivatePopup {
         super::channel::render_join_popup(frame, area, state);
@@ -3362,8 +3761,7 @@ pub fn render(frame: &mut Frame, state: &UiState) {
     // i.e. a call that has not been minimized away yet. Drawn under the
     // consent popups (which must stay answerable over it) for the same
     // reason `handle_key` lets them absorb keys first.
-    if !state.call_tab_selected
-        && let Some(call) = &state.call
+    if let Some(call) = &state.call
         && !call.minimized
     {
         render_call_modal(frame, centered_rect(70, 20, area), state, call);
@@ -3393,7 +3791,9 @@ pub fn render(frame: &mut Frame, state: &UiState) {
     // uses, just above it - unlike that notice it never auto-clears, so it
     // claims the corner first and pushes the notice down rather than the
     // other way around.
-    let mut status_notice_y = 1;
+    // Both hang just below the header block rather than inside it - that
+    // band is the selectors' own (`docs/SPEC.md` "Connected UI").
+    let mut status_notice_y = super::channel::HEADER_ROW_HEIGHT;
     if let Some(call) = &state.call {
         status_notice_y = render_call_banner(frame, area, call, state.own_id);
     }
@@ -3691,33 +4091,69 @@ fn level_bar(level: u8) -> String {
     )
 }
 
+/// How wide a roster row's name column is: the longest nickname
+/// (`ui_connect_popup::NICKNAME_MAX_LEN`) plus both suffixes it can carry
+/// at once - ` (host)` and ` (you)` - and one space of separation. Every
+/// row pads to it so the labels, and with them the voice bars, all start
+/// in the same column.
+const CALL_NAME_COL: usize = super::ui_connect_popup::NICKNAME_MAX_LEN + 7 + 6 + 1;
+
+/// The same for the label column: `REJECTED MUTED` is the widest anything
+/// there can read, so a row carrying nothing but `IN CALL` still leaves
+/// the space a later `MUTED` would take rather than sliding its bar left.
+const CALL_LABEL_COL: usize = 14;
+
 /// The roster labels one member's row carries, already coloured
-/// (`docs/SPEC.md` "Live voice calls"): `HOST` blue for whoever started
-/// the call, then `IN CALL` green / `INVITED` yellow / `REJECTED` grey for
-/// where they stand, then `MUTED` red if the host has silenced them.
-fn call_member_labels(member: &CallMember, host: UserId) -> Vec<Span<'static>> {
+/// (`docs/SPEC.md` "Live voice calls"): `IN CALL` green / `INVITED`
+/// yellow / `REJECTED` grey for where they stand, then `MUTED` red if
+/// they cannot currently be heard - whether they muted themselves or the
+/// host did. The host is not labelled here - their row is named
+/// `<nickname> (host)` instead (`call_member_name`).
+fn call_member_labels(member: &CallMember) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
-    if member.id == host {
-        spans.push(Span::styled(
-            "HOST",
-            Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD),
-        ));
-        spans.push(Span::raw(" "));
-    }
     let (text, color) = match member.state {
         CallMemberState::InCall => ("IN CALL", Color::Green),
         CallMemberState::Invited => ("INVITED", Color::Yellow),
         CallMemberState::Rejected => ("REJECTED", Color::DarkGray),
     };
     spans.push(Span::styled(text, Style::default().fg(color)));
-    if member.host_muted {
+    // One label for either kind of silence - the roster answers "can this
+    // person be heard right now", and both answers are no. Which of the
+    // two it is only matters for who may lift it (`CallMember::host_muted`
+    // vs `self_muted`), not for reading the row.
+    if member.host_muted || member.self_muted {
         spans.push(Span::raw(" "));
         spans.push(Span::styled(
             "MUTED",
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ));
     }
+    pad_to(&mut spans, CALL_LABEL_COL);
     spans
+}
+
+/// How a roster row names one member: their nickname, marked `(you)` for
+/// ourselves and `(host)` for whoever started the call - the host carries
+/// no separate label of its own (`docs/SPEC.md` "Live voice calls").
+fn call_member_name(member: &CallMember, host: UserId, own_id: Option<UserId>) -> String {
+    let mut name = member.name.clone();
+    if Some(member.id) == own_id {
+        name.push_str(" (you)");
+    }
+    if member.id == host {
+        name.push_str(" (host)");
+    }
+    name
+}
+
+/// Pads `spans` out to `width` display columns with one trailing blank
+/// span, leaving it alone if it is already at least that wide - what keeps
+/// a column of variable-length labels from shifting whatever follows it.
+fn pad_to(spans: &mut Vec<Span<'static>>, width: usize) {
+    let used: usize = spans.iter().map(|s| display_width(&s.content) as usize).sum();
+    if used < width {
+        spans.push(Span::raw(" ".repeat(width - used)));
+    }
 }
 
 /// The call modal (`docs/SPEC.md` "Live voice calls"): live duration on
@@ -3781,23 +4217,20 @@ pub(crate) fn render_call_modal(frame: &mut Frame, area: Rect, state: &UiState, 
                 Style::default().fg(Color::Yellow),
             )];
             let is_us = Some(member.id) == state.own_id;
-            let name = if is_us {
-                format!("{} (you)", member.name)
-            } else {
-                member.name.clone()
-            };
+            let name = call_member_name(member, call.host, state.own_id);
             spans.push(Span::styled(
-                format!("{name:<18}"),
+                format!("{name:<CALL_NAME_COL$}"),
                 if idx == call.selected {
                     Style::default().add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
                 },
             ));
-            spans.extend(call_member_labels(member, call.host));
-            // Our own row meters what we are actually sending: `/mute`
-            // stops that at the source, so the bar must read empty rather
-            // than keep twitching along with a microphone nobody hears.
+            spans.extend(call_member_labels(member));
+            // Our own row meters what we are actually sending: muting
+            // ourselves (`m` on our own row) stops that at the source, so
+            // the bar must read empty rather than keep twitching along
+            // with a microphone nobody hears.
             let level = if is_us && call.muted { 0 } else { member.level };
             spans.push(Span::raw("  "));
             spans.push(Span::styled(
@@ -3947,7 +4380,7 @@ fn render_call_banner(
     let width = (message.chars().count() as u16 + 4).min(area.width);
     let rect = Rect {
         x: area.width.saturating_sub(width),
-        y: 1,
+        y: super::channel::HEADER_ROW_HEIGHT,
         width,
         height: 3,
     };

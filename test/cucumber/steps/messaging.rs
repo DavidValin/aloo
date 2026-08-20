@@ -6,7 +6,7 @@ use aloo::proto::UserId;
 use aloo::client::tui::ui::{Focus, UiAction};
 
 use crate::steps::ui_common::id_for;
-use crate::support::{row_containing, ui_rows_wide};
+use crate::support::{sidebar_row_containing, ui_rows_wide};
 use crate::world::AlooWorld;
 
 // ---------------------------------------------------------------------
@@ -176,7 +176,7 @@ async fn history_kept(w: &mut AlooWorld, name: String) {
 fn envelope_shown(w: &mut AlooWorld, blink_on: bool, name: &str) -> bool {
     w.ui_mut().blink_on = blink_on;
     let rows = ui_rows_wide(w.ui_ref());
-    row_containing(&rows, name).contains('\u{2709}')
+    sidebar_row_containing(&rows, name).contains('\u{2709}')
 }
 
 #[then(expr = "{word} shows no envelope in the sidebar")]

@@ -311,7 +311,7 @@ fn ctrl_h_works_regardless_of_current_view_or_mode() {
 /// on the header row (trimmed of the two separating spaces).
 fn after_help_hint(state: &UiState) -> String {
     let rows = rendered_rows(state);
-    let header = rows.first().expect("header row").clone();
+    let header = rows[HEADER_TEXT_ROW].clone();
     let idx = header
         .find("Ctrl+H: Help")
         .expect("expected the help hint on the header row");
@@ -323,7 +323,7 @@ fn after_help_hint(state: &UiState) -> String {
 fn header_shows_only_the_help_hint_after_conn_and_cpu() {
     let state = joined_general_with(vec![]);
     let rows = rendered_rows(&state);
-    let header = rows.first().expect("header row");
+    let header = &rows[HEADER_TEXT_ROW];
     assert!(
         header.contains("Ctrl+H: Help"),
         "expected the help hint: {header:?}"
@@ -939,6 +939,9 @@ fn render_help_popup_shows_expected_content_when_open() {
         rows.iter().any(|r| r.contains("Space")),
         "expected help on sending a voice message: {rows:?}"
     );
+    // Past the first screenful now that the two selectors have their own
+    // lines above it - reached the same way the sections below are.
+    let rows = scroll_help_until(&mut state, "/file");
     assert!(
         rows.iter().any(|r| r.contains("/file")),
         "expected help on sending a file: {rows:?}"
@@ -1531,11 +1534,11 @@ fn help_popup_never_exceeds_90_percent_of_the_terminal_width() {
         .windows(title.len())
         .position(|w| w == title.as_slice())
         .expect("title in row");
-    assert_eq!(
-        row_chars[title_start - 1],
-        '┌',
-        "expected the corner right before the title: {border_row:?}"
-    );
+    // The corner cell itself is not asserted on: the title row now lands on
+    // the header, whose kind emoji is a wide glyph, and a wide glyph drawn
+    // underneath swallows the cell to its right - the same artifact
+    // `find_text_start` exists for. The title's own start is the reliable
+    // anchor, one column past that corner.
     let popup_start = title_start - 1;
     let popup_end = row_chars[popup_start..]
         .iter()
@@ -1620,6 +1623,7 @@ fn incoming_call_invite_shows_a_popup_naming_the_caller_with_accept_focused() {
         from: UserId(2),
         from_name: "bob".into(),
         channel: Some("general".into()),
+        ended: false,
     });
     assert!(shown, "the first invite becomes the one shown");
     assert_eq!(
@@ -1653,6 +1657,7 @@ fn a_call_invite_from_a_trust_gated_sender_is_held_until_accepted() {
         from: UserId(2),
         from_name: "bob".into(),
         channel: Some("general".into()),
+        ended: false,
     });
     assert!(
         state.call_invite_open().is_none(),
@@ -1676,12 +1681,14 @@ fn rejecting_a_call_invite_clears_it_and_shows_the_next_queued_one() {
         from: UserId(2),
         from_name: "bob".into(),
         channel: None,
+        ended: false,
     });
     state.push_call_invite(PendingCallInvite {
         call_id: 2,
         from: UserId(3),
         from_name: "carol".into(),
         channel: None,
+        ended: false,
     });
 
     press(&mut state, KeyCode::Left); // move focus onto Reject
@@ -1753,27 +1760,41 @@ fn the_call_indicator_and_a_status_notice_are_both_visible_at_once() {
     );
 }
 
+/// Muting ourselves is the modal's own `m`, on our own row - the only way
+/// to do it, and available to every participant, not just the host.
+///
 /// @requirement AC-170
 #[test]
-fn slash_mute_is_refused_off_a_call_and_toggles_on_one() {
-    let mut state = joined_general_with(vec![]);
-    state.focus = Focus::Input;
+fn m_on_our_own_row_toggles_our_own_microphone() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.begin_call(1, Some("general".into()), UserId(1));
+    state.on_call_participant_joined(UserId(2), "bob".into());
 
-    type_str(&mut state, "/mute");
-    let action = press(&mut state, KeyCode::Enter);
-    assert_eq!(action, None);
+    // Row 0 is us - our own row, whether or not we happen to be the host.
     assert_eq!(
-        state.status_notice.as_ref().map(|(m, ok)| (m.as_str(), *ok)),
-        Some(("not on a call", false))
+        press(&mut state, KeyCode::Char('m')),
+        Some(UiAction::ToggleCallMute)
     );
 
-    on_call_minimized(&mut state, 1, None);
-    type_str(&mut state, "/mute");
-    let action = press(&mut state, KeyCode::Enter);
-    assert_eq!(action, Some(UiAction::ToggleCallMute));
-    assert!(
-        state.input.is_empty(),
-        "the command is cleared from the compose bar"
+    // And as a plain participant, on someone else's call, just the same.
+    let mut guest = joined_general_with(vec![user(2, "bob"), user(3, "carol")]);
+    guest.begin_call(1, Some("general".into()), UserId(3));
+    guest.on_call_participant_joined(UserId(3), "carol".into());
+    // The cursor follows whoever it was on as the roster sorts, so walk it
+    // onto our own row from wherever it actually is.
+    let call = guest.call.as_ref().unwrap();
+    let own_row = call
+        .members
+        .iter()
+        .position(|m| Some(m.id) == guest.own_id)
+        .expect("our own row");
+    let steps = (own_row + call.members.len() - call.selected) % call.members.len();
+    for _ in 0..steps {
+        press(&mut guest, KeyCode::Down);
+    }
+    assert_eq!(
+        press(&mut guest, KeyCode::Char('m')),
+        Some(UiAction::ToggleCallMute)
     );
 }
 
@@ -1878,9 +1899,10 @@ fn push_to_talk_is_unavailable_while_on_a_call() {
 
 
 /// The call modal (`docs/SPEC.md` "Live voice calls") opens the moment a
-/// call starts and shows every roster label the spec calls for: HOST on
-/// whoever started it, IN CALL / INVITED / REJECTED on where each person
-/// stands, MUTED on anyone the host has silenced.
+/// call starts and shows every roster label the spec calls for: the host
+/// named `<nickname> (host)` rather than labelled, then IN CALL / INVITED
+/// / REJECTED on where each person stands, MUTED on anyone the host has
+/// silenced.
 ///
 /// @requirement AC-175
 #[test]
@@ -1908,12 +1930,46 @@ fn the_call_modal_lists_the_host_first_and_labels_every_participant() {
 
     let rows = rendered_rows(&state);
     let joined = rows.join("\n");
-    for label in ["HOST", "IN CALL", "REJECTED", "MUTED", "END CALL"] {
+    for label in ["IN CALL", "REJECTED", "MUTED", "END CALL"] {
         assert!(joined.contains(label), "missing {label} in {rows:?}");
     }
     assert!(
-        joined.contains("dave") && joined.contains("bob") && joined.contains("carol"),
+        !joined.contains("HOST"),
+        "the host carries no label of its own: {rows:?}"
+    );
+    assert!(
+        joined.contains("dave (host)"),
+        "the host is named instead: {rows:?}"
+    );
+    assert!(
+        joined.contains("bob") && joined.contains("carol"),
         "{rows:?}"
+    );
+}
+
+/// Every row pads its name and its labels to a fixed width, so a `MUTED`
+/// appearing on one row never slides that row's voice bar out of line with
+/// the others (`docs/SPEC.md` "Live voice calls").
+///
+/// @requirement AC-175
+#[test]
+fn every_roster_row_starts_its_voice_bar_in_the_same_column() {
+    let mut state = joined_general_with(vec![user(2, "bob"), user(3, "carol")]);
+    state.begin_call(1, Some("general".into()), UserId(1));
+    state.on_call_participant_joined(UserId(2), "bob".into());
+    state.on_call_invite_sent(UserId(3), "carol".into());
+    state.set_call_member_host_muted(UserId(2), true);
+
+    let rows = rendered_rows(&state);
+    let bar_columns: Vec<usize> = rows
+        .iter()
+        .filter(|r| r.contains(['\u{2591}', '\u{2588}']))
+        .map(|r| r.find(['\u{2591}', '\u{2588}']).expect("a bar on this row"))
+        .collect();
+    assert_eq!(bar_columns.len(), 3, "one bar per roster row: {rows:?}");
+    assert!(
+        bar_columns.iter().all(|c| *c == bar_columns[0]),
+        "every bar starts in the same column: {bar_columns:?} in {rows:?}"
     );
 }
 
@@ -2007,13 +2063,13 @@ fn each_participant_has_a_live_voice_meter() {
     assert_eq!(bob.level, 0);
 }
 
-/// Escape folds the modal into its own tab (drawn to the left of the
-/// channels); `[`/`]` navigate to it, and selecting it replaces the
-/// sidebar/messages/compose layout with the modal alone.
+/// Escape folds the modal away into the top row's `Call Ctrl+R`
+/// indicator - which stays on screen for the whole call, next to the
+/// status figures - and Ctrl+R brings the modal back.
 ///
 /// @requirement AC-177
 #[test]
-fn escape_minimizes_the_call_modal_into_its_own_tab() {
+fn escape_folds_the_call_modal_into_the_header_indicator() {
     let mut state = joined_general_with(vec![user(2, "bob")]);
     state.begin_call(1, Some("general".into()), UserId(1));
     assert!(state.call_modal_showing());
@@ -2021,24 +2077,22 @@ fn escape_minimizes_the_call_modal_into_its_own_tab() {
     assert_eq!(press(&mut state, KeyCode::Esc), None);
     assert!(state.call.as_ref().unwrap().minimized);
     assert!(!state.call_modal_showing(), "folded away, not showing");
-    // The tab itself is still there to navigate back to.
-    assert!(rendered_rows(&state).join("\n").contains("Call"));
+    // The indicator advertising the way back is in the top row.
+    let rows = rendered_rows(&state);
+    assert!(rows[HEADER_TEXT_ROW].contains("Call"), "{rows:?}");
+    assert!(rows[HEADER_TEXT_ROW].contains("Ctrl+R"), "{rows:?}");
+    // The ordinary layout is usable again - the modal is not in the way.
+    assert!(rows.iter().any(|r| r.contains("Users")), "{rows:?}");
+    assert!(
+        rows.iter().any(|r| r.contains("Message")),
+        "the compose bar is back: {rows:?}"
+    );
 
-    // `[` from the first channel wraps left onto the call tab.
-    press(&mut state, KeyCode::Char('['));
-    assert!(state.call_tab_selected);
+    // Ctrl+R brings it back up, over that same layout.
+    ctrl(&mut state, KeyCode::Char('r'));
     assert!(state.call_modal_showing());
     let rows = rendered_rows(&state);
     assert!(rows.join("\n").contains("END CALL"), "{rows:?}");
-    assert!(
-        !rows.iter().any(|r| r.contains("Type a message")),
-        "the call tab replaces the compose bar entirely: {rows:?}"
-    );
-
-    // And back out to the channel, without the overlay following.
-    press(&mut state, KeyCode::Char(']'));
-    assert!(!state.call_tab_selected);
-    assert!(!state.call_modal_showing());
 }
 
 /// The roster scrolls rather than truncating: with more members than fit,
@@ -2090,8 +2144,11 @@ fn only_the_host_can_mute_a_participant_from_the_roster() {
     state.begin_call(1, Some("general".into()), UserId(1));
     state.on_call_participant_joined(UserId(2), "bob".into());
 
-    // Row 0 is us (the host); the host row itself is not mutable this way.
-    assert_eq!(press(&mut state, KeyCode::Char('m')), None);
+    // Row 0 is us: `m` there is our own mute, not a host mute of anyone.
+    assert_eq!(
+        press(&mut state, KeyCode::Char('m')),
+        Some(UiAction::ToggleCallMute)
+    );
     press(&mut state, KeyCode::Down);
     assert_eq!(
         press(&mut state, KeyCode::Char('m')),
@@ -2115,7 +2172,17 @@ fn only_the_host_can_mute_a_participant_from_the_roster() {
     guest.begin_call(1, Some("general".into()), UserId(3));
     guest.on_call_participant_joined(UserId(3), "carol".into());
     guest.on_call_participant_joined(UserId(2), "bob".into());
+    // Cursor onto bob (not us, not the host): nothing to do without the
+    // host's authority.
     press(&mut guest, KeyCode::Down);
+    let on_bob = guest
+        .call
+        .as_ref()
+        .unwrap()
+        .members
+        .get(guest.call.as_ref().unwrap().selected)
+        .map(|m| m.id);
+    assert_eq!(on_bob, Some(UserId(2)), "cursor is on bob");
     assert_eq!(press(&mut guest, KeyCode::Char('m')), None);
 }
 
@@ -2236,8 +2303,12 @@ fn the_hosts_departure_notice_reads_as_the_call_ending() {
     state.push_status_notice(HOST_LEFT_NOTICE.to_string(), false);
 
     assert!(state.call.is_none());
-    assert!(!state.call_tab_selected, "the call tab goes with it");
-    assert!(rendered_rows(&state).join("\n").contains(HOST_LEFT_NOTICE));
+    let rows = rendered_rows(&state);
+    assert!(
+        !rows[HEADER_TEXT_ROW].contains("Ctrl+R"),
+        "the header's call indicator goes with it: {rows:?}"
+    );
+    assert!(rows.join("\n").contains(HOST_LEFT_NOTICE));
 }
 
 /// The OTP layer has no live-streaming concept at all, so a DM call to a
@@ -2287,4 +2358,115 @@ fn a_call_to_an_otp_active_peer_is_refused_without_a_confirmation() {
         alone.status_notice.as_ref().map(|(m, _)| m.as_str()),
         Some(NO_ONE_INVITED_NOTICE)
     );
+}
+
+/// The folded-away call keeps a red-bordered box of its own in the top
+/// row - filling the header band's height, immediately left of the status
+/// figures (`docs/SPEC.md` "Live voice calls").
+///
+/// @requirement AC-177
+#[test]
+fn the_call_indicator_is_a_bordered_box_beside_the_status_figures() {
+    let mut state = joined_general_with(vec![]);
+    on_call_minimized(&mut state, 1, Some("general".into()));
+    let rows = rendered_rows(&state);
+
+    let marker_row = HEADER_TEXT_ROW;
+    let marker = rows[marker_row]
+        .find("Call")
+        .expect("the marker names the call");
+    let conn = rows[marker_row].find("Conn:").expect("the status figures");
+    assert!(marker < conn, "the box sits left of them: {rows:?}");
+    // Its own borders sit on the blank lines above and below the row.
+    for y in [marker_row - 1, marker_row + 1] {
+        assert!(
+            rows[y].contains('\u{2500}'),
+            "expected a horizontal border on row {y}: {rows:?}"
+        );
+    }
+    assert!(
+        rows[marker_row].contains('\u{2502}'),
+        "and vertical borders beside the text: {rows:?}"
+    );
+}
+
+/// A call that ends while its invitation is still on screen takes the
+/// invitation with it: accepting afterwards joins nothing and says so
+/// (`docs/SPEC.md` "Live voice calls").
+///
+/// @requirement AC-188
+#[test]
+fn a_call_end_marks_an_unanswered_invite_from_that_caller() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.push_call_invite(PendingCallInvite {
+        call_id: 42,
+        from: UserId(2),
+        from_name: "bob".into(),
+        channel: Some("general".into()),
+        ended: false,
+    });
+    assert!(!state.call_invite_open().expect("shown").ended);
+
+    assert!(
+        !state.mark_call_invite_ended(7),
+        "a call we hold no invite for is not ours to mark"
+    );
+    assert!(state.mark_call_invite_ended(42));
+    let invite = state.call_invite_open().expect("still on screen");
+    assert!(
+        invite.ended,
+        "the popup stays up - it just can no longer join anything"
+    );
+    assert_eq!(state.call_invite_for(42).map(|i| i.from), Some(UserId(2)));
+}
+
+/// @requirement AC-188
+#[test]
+fn a_hosts_invitees_are_told_when_the_call_ends() {
+    let mut state = joined_general_with(vec![user(2, "bob"), user(3, "carol")]);
+    state.begin_call(1, Some("general".into()), UserId(1));
+    state.on_call_participant_joined(UserId(2), "bob".into());
+    state.on_call_invite_sent(UserId(3), "carol".into());
+
+    assert_eq!(
+        state.call_invitees_awaiting_answer(),
+        vec![UserId(3)],
+        "only the one who has not answered yet"
+    );
+    state.on_call_invite_rejected(UserId(3));
+    assert!(
+        state.call_invitees_awaiting_answer().is_empty(),
+        "an answered invite needs no CallEnd of its own"
+    );
+}
+
+/// Our own mute reads on the roster exactly like anyone else's - the row
+/// answers "can this person be heard", whoever silenced them
+/// (`docs/SPEC.md` "Live voice calls").
+///
+/// @requirement AC-170
+#[test]
+fn muting_ourselves_shows_on_the_roster_like_any_other_mute() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.begin_call(1, Some("general".into()), UserId(1));
+    state.on_call_participant_joined(UserId(2), "bob".into());
+    assert!(!rendered_rows(&state).join("\n").contains("MUTED"));
+
+    // What the session writes back once our own toggle has been applied.
+    state.set_call_muted(true);
+    assert!(
+        rendered_rows(&state).join("\n").contains("MUTED"),
+        "our own row says so"
+    );
+
+    // And a peer announcing their own mute reads the same, without any
+    // host authority behind it.
+    state.set_call_muted(false);
+    state.set_call_member_self_muted(UserId(2), true);
+    // The modal's own row for bob, not the sidebar entry with the same name.
+    let bob_row = rendered_rows(&state)
+        .into_iter()
+        .find(|r| r.contains("bob") && r.contains("IN CALL"))
+        .expect("bob's roster row");
+    assert!(bob_row.contains("MUTED"), "{bob_row:?}");
 }

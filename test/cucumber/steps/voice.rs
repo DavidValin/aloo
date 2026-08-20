@@ -8,7 +8,7 @@ use aloo::client::tui::ui::{MessageBody, PendingCallInvite, UiAction, VoiceTarge
 use aloo::client::tui::ui::format_duration_label;
 
 use crate::steps::ui_common::id_for;
-use crate::support::ui_rows;
+use crate::support::{header_row, ui_rows};
 use crate::world::AlooWorld;
 
 // ---------------------------------------------------------------------
@@ -360,7 +360,51 @@ async fn call_invite_arrives(w: &mut AlooWorld, name: String) {
         from: id,
         from_name: name,
         channel: Some("general".into()),
+        ended: false,
     });
+}
+
+/// What the host's `CallEnd` does to an invite of ours that is still
+/// unanswered (`crate::client::voice_call::on_call_end`): the popup stays
+/// up, but there is no longer a call behind it.
+#[when("that call ends before I answer")]
+async fn that_call_ends(w: &mut AlooWorld) {
+    let call_id = w
+        .ui_ref()
+        .call_invite_open()
+        .expect("no call invite popup is open")
+        .call_id;
+    assert!(w.ui_mut().mark_call_invite_ended(call_id));
+}
+
+#[then("no call invite is accepted")]
+async fn no_call_invite_accepted(w: &mut AlooWorld) {
+    assert!(
+        !matches!(w.last_action, Some(UiAction::AcceptCallInvite { .. })),
+        "nothing should have been joined: {:?}",
+        w.last_action
+    );
+}
+
+#[then("no call invite popup is open")]
+async fn no_call_invite_popup(w: &mut AlooWorld) {
+    assert!(
+        w.ui_ref().call_invite_open().is_none(),
+        "the answer is spent either way - the popup should be gone"
+    );
+}
+
+#[then(expr = "the call modal names {word} as the host")]
+async fn call_modal_names_host(w: &mut AlooWorld, name: String) {
+    let rows = ui_rows(w.ui_ref());
+    assert!(
+        rows.iter().any(|r| r.contains(&format!("{name} (host)"))),
+        "expected {name:?} named as the host: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|r| r.contains("HOST")),
+        "the host carries no label of its own: {rows:?}"
+    );
 }
 
 #[then(expr = "a call invite popup names {word}")]
@@ -406,7 +450,7 @@ async fn call_decision_applied(w: &mut AlooWorld) {
 
 /// Joins a call we host, with the modal folded away into its tab - an
 /// open modal deliberately absorbs every key, so the scenarios that go on
-/// to type `/mute`/`/endcall` need it out of the way, exactly as a real
+/// to type `/endcall` need it out of the way, exactly as a real
 /// user pressing Escape would leave it.
 #[when("I join a call in the channel")]
 async fn i_join_a_call(w: &mut AlooWorld) {
@@ -498,12 +542,13 @@ async fn call_modal_not_shown(w: &mut AlooWorld) {
     );
 }
 
-#[then("a call tab is shown")]
-async fn call_tab_shown(w: &mut AlooWorld) {
+#[then("the call indicator is shown in the top row")]
+async fn header_call_indicator_shown(w: &mut AlooWorld) {
     let rows = ui_rows(w.ui_ref());
+    let top = header_row(&rows);
     assert!(
-        rows.first().is_some_and(|r| r.contains("Call")),
-        "expected the call tab in the tab row: {rows:?}"
+        top.contains("Call") && top.contains("Ctrl+R"),
+        "expected the call indicator, advertising Ctrl+R: {rows:?}"
     );
 }
 

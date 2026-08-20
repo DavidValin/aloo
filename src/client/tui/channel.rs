@@ -1,6 +1,6 @@
-//! Channel-tab state and rendering: the `ChannelTab` log/membership model,
-//! dwell-to-join tab switching, and the channel view / sidebar / Ctrl+J
-//! popup rendering. Shared/mixed UI plumbing (`UiState` itself, `Focus`,
+//! Channel state and rendering: the `ChannelTab` log/membership model, the
+//! top row (both selectors, the call indicator and the status figures), and
+//! the channel view / sidebar / Ctrl+J popup rendering. Shared/mixed UI plumbing (`UiState` itself, `Focus`,
 //! `Mode`, message-log rendering, the input bar, ...) stays in
 //! `crate::client::tui::ui`; DM-room state/rendering is the mirror image in
 //! `crate::client::tui::direct_message`.
@@ -10,7 +10,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Tabs};
+use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 
 use crate::client::netstats::ConnQuality;
 use crate::client::p2p::LinkStatus;
@@ -19,9 +19,10 @@ use crate::client::sysstats::CPU_HEALTHY_MAX_PCT;
 use crate::validation;
 
 use super::ui::{
-    FileTransferStatus, JoinPopupFocus, LogEntry, MessageBody, Mode, UiAction, UiState,
-    finalize_held_stream, finalize_stream_entry, focus_border_style, local_time_short,
-    push_log_entry, render_input_bar, render_messages,
+    DM_ICON, FileTransferStatus, JoinPopupFocus, LogEntry, MessageBody, Mode, SelectorFocus,
+    UNREAD_ENVELOPE, UiAction, UiState, channel_kind_icon, finalize_held_stream,
+    finalize_stream_entry, focus_border_style, local_time_short, push_log_entry, render_input_bar,
+    render_messages, unread_envelope,
 };
 
 #[derive(Debug, Clone)]
@@ -35,6 +36,12 @@ pub struct ChannelTab {
     pub joined: bool,
     pub members: Vec<UserInfo>,
     pub log: Vec<LogEntry>,
+    /// Whether a message has landed here since this channel was last on
+    /// screen - what makes the channel selector's envelope blink
+    /// (`docs/SPEC.md` "Connected UI"). Set only by real messages (text,
+    /// voice, a file arriving), never by presence notices, and cleared the
+    /// moment the channel is selected again (`select_channel_at`).
+    pub unread: bool,
 }
 
 impl UiState {
@@ -204,7 +211,7 @@ impl UiState {
     }
 
     /// Whether channel `name` is the log currently on screen (no private
-    /// room open, and it's the selected tab) - used to decide whether an
+    /// room open, and it's the one the channel selector names) - used to decide whether an
     /// incoming/outgoing message should auto-follow `message_selected` to
     /// the bottom (`push_log_entry`), since that only makes sense for
     /// whatever the user is actually looking at right now.
@@ -251,9 +258,9 @@ impl UiState {
 
     /// Local, optimistic half of leaving `name` - there is no server
     /// acknowledgment to wait for, `LeaveChannel` only notifies whoever
-    /// *remains* (docs/PROTOCOL.md §6.2). The tab is removed outright,
-    /// public or private alike: tabs are exactly the channels the user is
-    /// currently joined to (`on_joined` is the only thing that creates
+    /// *remains* (docs/PROTOCOL.md §6.2). It is dropped from `channels`
+    /// outright, public or private alike: that list is exactly the
+    /// channels the user is currently joined to (`on_joined` is the only thing that creates
     /// one), and a public channel the user left is still listed in the
     /// `/channels` directory (`known_channels`) to rejoin from.
     /// Returns the peer ids who were in this channel with us, for the
@@ -280,47 +287,24 @@ impl UiState {
     }
 
     // -------------------------------------------------------------
-    // [ / ] tab switching
+    // What the channel selector names
     // -------------------------------------------------------------
 
-    /// `forward` selects `]` (next tab) vs `[` (the previous one). Every
-    /// channel tab is a channel the user has already joined (`on_joined`
-    /// is the only thing that creates one), so switching is immediate and
-    /// never joins anything - joining is `/channels` or Ctrl+J.
-    ///
-    /// While a call is running there is one extra tab, sitting to the left
-    /// of every channel: the call itself (`docs/SPEC.md` "Live voice
-    /// calls"), which is where Escape folds the call modal away to and how
-    /// the user gets back to it. Selecting it replaces the whole
-    /// sidebar/messages/compose layout with the modal.
-    pub(crate) fn select_adjacent_channel(&mut self, forward: bool) {
-        let has_call_tab = self.call.is_some();
-        let len = self.channels.len() + usize::from(has_call_tab);
-        if len == 0 {
+    /// Makes the channel at `idx` the one the left-hand selector names -
+    /// every joined channel is already joined (`on_joined` is the only
+    /// thing that creates one), so this never joins anything; joining is
+    /// `/channels` or Ctrl+J. Clears that channel's unread envelope, since
+    /// it is now the log being looked at, and starts it scrolled to its
+    /// newest message rather than wherever the last visit left off. Out of
+    /// range (no channels joined at all) is a no-op.
+    pub fn select_channel_at(&mut self, idx: usize) {
+        let Some(tab) = self.channels.get_mut(idx) else {
             return;
-        }
-        // One flat index over [call tab?] ++ channel tabs.
-        let base = if self.call_tab_selected && has_call_tab {
-            0
-        } else {
-            usize::from(has_call_tab) + self.selected_channel.min(self.channels.len().saturating_sub(1))
         };
-        let next = if forward {
-            (base + 1) % len
-        } else {
-            (base + len - 1) % len
-        };
-        if has_call_tab && next == 0 {
-            self.call_tab_selected = true;
-            return;
-        }
-        self.call_tab_selected = false;
-        let next = next - usize::from(has_call_tab);
-        self.selected_channel = next;
-        self.active_private_room = None;
-        self.sidebar_selected = 0;
-        // Start scrolled to the newest message in the newly-selected tab.
-        self.message_selected = self.channels[next].log.len().saturating_sub(1);
+        tab.unread = false;
+        let log_len = tab.log.len();
+        self.selected_channel = idx;
+        self.message_selected = log_len.saturating_sub(1);
     }
 
     // -------------------------------------------------------------
@@ -329,9 +313,9 @@ impl UiState {
 
     /// Every public channel the server has announced (`ChannelList` at
     /// connect, `ChannelCreated` afterwards), in announcement order - the
-    /// rows of the `/channels` modal. Kept separate from `channels` (the
-    /// tab row), which only ever holds channels the user is actually
-    /// joined to.
+    /// rows of the `/channels` modal. Kept separate from `channels` (what
+    /// the channel selector offers), which only ever holds channels the
+    /// user is actually joined to.
     pub fn known_public_channels(&self) -> &[ChannelInfo] {
         &self.known_channels
     }
@@ -346,8 +330,9 @@ impl UiState {
     /// default public channel, `DEFAULT_CHANNEL_NAME` ("the-hall"),
     /// and only while no channel has been joined yet. Every other public
     /// channel the server offers is left for the user to pick out of
-    /// `/channels` - a tab means "I am in this room", so joining all of
-    /// them on the user's behalf would be wrong (docs/PROTOCOL.md §6.3).
+    /// `/channels` - being on the channel selector means "I am in this
+    /// room", so joining all of them on the user's behalf would be wrong
+    /// (docs/PROTOCOL.md §6.3).
     pub fn auto_join_channel(&self) -> Option<UiAction> {
         if !self.channels.is_empty() {
             return None;
@@ -395,14 +380,13 @@ impl UiState {
                 let info = self.known_channels.get(self.channels_popup_selected)?.clone();
                 self.mode = Mode::Normal;
                 if self.is_joined(&info.name) {
-                    // Already a member: selecting it just brings its tab
-                    // to the front rather than re-sending a join the
-                    // server would treat as a no-op anyway (§6.1).
+                    // Already a member: selecting it just brings that
+                    // channel to the front of the channel selector rather
+                    // than re-sending a join the server would treat as a
+                    // no-op anyway (§6.1).
                     if let Some(idx) = self.channels.iter().position(|c| c.name == info.name) {
                         self.selected_channel = idx;
-                        self.active_private_room = None;
-                        self.sidebar_selected = 0;
-                        self.message_selected = self.channels[idx].log.len().saturating_sub(1);
+                        self.focus_channel_selector();
                     }
                     return None;
                 }
@@ -422,9 +406,9 @@ impl UiState {
 
     /// Records the server's public channel directory (`ChannelList` at
     /// connect, one-element `ChannelCreated` announcements afterwards),
-    /// de-duplicating by name. This never creates a tab: tabs are exactly
-    /// the joined channels (`on_joined`), and the directory is what the
-    /// `/channels` modal lists.
+    /// de-duplicating by name. This never creates a `ChannelTab`: those
+    /// are exactly the joined channels (`on_joined`), and the directory is
+    /// what the `/channels` modal lists.
     pub fn on_channel_list(&mut self, list: Vec<ChannelInfo>) {
         for info in list {
             if !self.known_channels.iter().any(|c| c.name == info.name) {
@@ -446,6 +430,7 @@ impl UiState {
         {
             self.known_channels.push(channel.clone());
         }
+        let name = channel.name.clone();
         if let Some(tab) = self.channels.iter_mut().find(|c| c.name == channel.name) {
             tab.joined = true;
             tab.kind = channel.kind;
@@ -456,7 +441,17 @@ impl UiState {
                 joined: true,
                 members: Vec::new(),
                 log: Vec::new(),
+                unread: false,
             });
+        }
+        // Landing in the channel just joined is the whole point of joining
+        // it: it becomes the one the channel selector names, and the view,
+        // so the compose bar is already addressed to it. Any open DM room
+        // closes with that, the same as any other move to the channel
+        // selector.
+        if let Some(idx) = self.channels.iter().position(|c| c.name == name) {
+            self.selected_channel = idx;
+            self.focus_channel_selector();
         }
     }
 
@@ -485,6 +480,7 @@ impl UiState {
                     joined: false,
                     members: Vec::new(),
                     log: Vec::new(),
+                    unread: false,
                 });
                 self.channels.last_mut().expect("just pushed")
             }
@@ -600,6 +596,9 @@ impl UiState {
         let is_current = self.is_viewing_channel(channel);
         if let Some(tab) = self.channels.iter_mut().find(|c| c.name == channel) {
             push_log_entry(&mut tab.log, &mut self.message_selected, is_current, entry);
+            if !is_current {
+                tab.unread = true;
+            }
         }
     }
 
@@ -678,6 +677,9 @@ impl UiState {
         let is_current = self.is_viewing_channel(channel);
         if let Some(tab) = self.channels.iter_mut().find(|c| c.name == channel) {
             push_log_entry(&mut tab.log, &mut self.message_selected, is_current, entry);
+            if !is_current {
+                tab.unread = true;
+            }
         }
     }
 
@@ -804,6 +806,9 @@ impl UiState {
                     failed: false,
                 },
             );
+            if !is_current {
+                tab.unread = true;
+            }
         }
     }
 }
@@ -812,54 +817,330 @@ impl UiState {
 // Rendering
 // ---------------------------------------------------------------------
 
-/// The tab row's titles and which one is selected. While a call is
-/// running there is one extra tab at the far left - the call itself
-/// (`docs/SPEC.md` "Live voice calls"), where Escape folds the call modal
-/// away to; every other tab is a joined channel, as before.
-fn call_and_channel_tabs(state: &UiState) -> (Vec<Line<'static>>, usize) {
-    let mut titles: Vec<Line> = Vec::new();
-    if state.call.is_some() {
-        titles.push(Line::from(Span::styled(
-            "\u{1F534} Call",
-            Style::default().fg(Color::Red),
-        )));
+/// The top row's two selectors and which of them is focused: the channel
+/// one on the left, the DM one on the right - the latter absent entirely
+/// until a room has been opened. Each names its own current selection,
+/// adds a grey `+<n> more...` for everything else it holds, and blinks an
+/// envelope while any of that has unseen messages (`docs/SPEC.md`
+/// "Connected UI"). The envelope is left off the selector whose dropdown
+/// is open, since it is then shown on the individual rows instead.
+fn selector_titles(state: &UiState) -> (Vec<SelectorTitle>, usize) {
+    let mut titles = vec![channel_selector_title(state)];
+    if let Some(dm) = dm_selector_title(state) {
+        titles.push(dm);
     }
-    let call_offset = titles.len();
-    titles.extend(state.channels.iter().map(|c| {
-        let prefix = if c.kind == ChannelKind::Private {
-            "\u{1F512}"
-        } else {
-            "\u{1F30D}"
-        };
-        Line::from(format!("{prefix} {}", c.name))
-    }));
-    let selected = if state.call_tab_selected && state.call.is_some() {
-        0
-    } else {
-        call_offset + state.selected_channel
+    let selected = match state.selector_focus {
+        SelectorFocus::Channels => 0,
+        SelectorFocus::Dms => titles.len().saturating_sub(1),
     };
-    let selected = selected.min(titles.len().saturating_sub(1));
     (titles, selected)
 }
 
-/// The call's own tab, selected: the call modal *is* the view, with only
-/// the tab row above it - no sidebar, no message log, no compose bar
-/// (`docs/SPEC.md` "Live voice calls").
-pub(crate) fn render_call_tab_view(frame: &mut Frame, area: Rect, state: &UiState) {
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(3)])
-        .split(area);
-    let (titles, selected) = call_and_channel_tabs(state);
-    frame.render_widget(Tabs::new(titles).select(selected), rows[0]);
-    if let Some(call) = &state.call {
-        crate::client::tui::ui::render_call_modal(frame, rows[1], state, call);
+/// One selector's row content, split by whether the focus highlight may
+/// cover it. Only `name` - the entry the selector currently names - is
+/// ever highlighted. Everything in `trailing` (the grey `+<n> more...`
+/// count, then the blinking unread envelope) is deliberately left out of
+/// it: reversing them paints a block of background behind text that is
+/// meant to read as quiet, which comes out as a smear rather than a
+/// marker.
+struct SelectorTitle {
+    name: Vec<Span<'static>>,
+    trailing: Vec<Span<'static>>,
+}
+
+/// The whole selector row as one line, laid out exactly as the tab row has
+/// always been - `\u{2423}<selector>\u{2423}\u{2502}\u{2423}<selector>\u{2423}` - together with each
+/// selector's own start column, which is where its dropdown hangs from.
+/// Built by hand rather than with `Tabs` for the reason `SelectorTitle`
+/// gives: the focus highlight has to stop before the envelope.
+fn selector_line(state: &UiState) -> (Line<'static>, Vec<u16>) {
+    let (titles, selected) = selector_titles(state);
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut starts: Vec<u16> = Vec::new();
+    let mut x: u16 = 0;
+    let push = |spans: &mut Vec<Span<'static>>, x: &mut u16, span: Span<'static>| {
+        *x += span.width() as u16;
+        spans.push(span);
+    };
+    for (i, title) in titles.into_iter().enumerate() {
+        push(
+            &mut spans,
+            &mut x,
+            Span::raw(if i == 0 { " " } else { " \u{2502} " }),
+        );
+        starts.push(x);
+        for span in title.name {
+            let span = if i == selected {
+                span.patch_style(Style::default().add_modifier(Modifier::REVERSED))
+            } else {
+                span
+            };
+            push(&mut spans, &mut x, span);
+        }
+        for span in title.trailing {
+            push(&mut spans, &mut x, span);
+        }
     }
+    push(&mut spans, &mut x, Span::raw(" "));
+    (Line::from(spans), starts)
+}
+
+fn channel_selector_title(state: &UiState) -> SelectorTitle {
+    let name = match state.channels.get(state.selected_channel) {
+        Some(c) => vec![Span::raw(format!("{} {}", channel_kind_icon(c.kind), c.name))],
+        // Every joined channel left behind (`/leave`): the selector keeps
+        // the row's left slot, with nothing to name in it.
+        None => vec![Span::styled(
+            "no channel",
+            Style::default().fg(Color::DarkGray),
+        )],
+    };
+    let mut trailing = Vec::new();
+    push_more_span(&mut trailing, state.channels.len());
+    trailing.extend(envelope_spans(
+        state,
+        SelectorFocus::Channels,
+        state.any_channel_unread(),
+    ));
+    SelectorTitle { name, trailing }
+}
+
+/// `None` - i.e. no DM selector in the row at all - until a room has been
+/// opened; there is nothing for it to name before that, and `]` from the
+/// channel selector has nowhere to go.
+fn dm_selector_title(state: &UiState) -> Option<SelectorTitle> {
+    let peer = state.selected_dm?;
+    let nickname = state.private_rooms.get(&peer)?.peer.name.clone();
+    let mut trailing = Vec::new();
+    push_more_span(&mut trailing, state.dm_order.len());
+    trailing.extend(envelope_spans(
+        state,
+        SelectorFocus::Dms,
+        state.any_dm_unread(),
+    ));
+    Some(SelectorTitle {
+        name: vec![Span::raw(format!("{DM_ICON} {nickname}"))],
+        trailing,
+    })
+}
+
+/// The `+<n> more...` a selector carries for everything it holds besides
+/// the one entry it names - nothing at all when it names the only one
+/// there is. Always grey and never highlighted (see `SelectorTitle`): it
+/// is a count of what is *not* on screen, and should read that way.
+fn push_more_span(spans: &mut Vec<Span<'static>>, total: usize) {
+    let others = total.saturating_sub(1);
+    if others > 0 {
+        spans.push(Span::styled(
+            format!(" +{others} more..."),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+}
+
+fn envelope_spans(state: &UiState, which: SelectorFocus, unread: bool) -> Vec<Span<'static>> {
+    let own_dropdown_open = state.selector_dropdown_open && state.selector_focus == which;
+    if unread && !own_dropdown_open {
+        vec![Span::styled(
+            unread_envelope(state.blink_on),
+            Style::default().fg(Color::Yellow),
+        )]
+    } else {
+        Vec::new()
+    }
+}
+
+/// How many rows the header block occupies: one blank line, the selectors
+/// and status figures, one blank line - so the row reads as indented from
+/// everything around it rather than pinned to the top edge
+/// (`docs/SPEC.md` "Connected UI"). Its content is inset by
+/// `HEADER_SIDE_PAD` columns on each side for the same reason.
+pub const HEADER_ROW_HEIGHT: u16 = 3;
+
+/// Which of `HEADER_ROW_HEIGHT`'s rows carries the text.
+const HEADER_TEXT_ROW: u16 = 1;
+
+const HEADER_SIDE_PAD: u16 = 1;
+
+/// The folded-away call's own marker in the top row: `\u{1F534} Call` and the
+/// `Ctrl+R` that brings its modal back, in a red-bordered box of its own
+/// filling the header band's full height (`docs/SPEC.md` "Live voice
+/// calls"). Only drawn while a call is on.
+const CALL_MARKER: &str = "\u{1F534} Call";
+const CALL_MARKER_KEY: &str = "Ctrl+R";
+
+/// Its box's outer width: both labels, the space between them, one column
+/// of padding each side, and the two border columns.
+const CALL_MARKER_WIDTH: u16 = 18;
+
+/// The top row, shared by the channel view and an open DM room
+/// (`direct_message::render_private_room`): both selectors on the left,
+/// and flush right the red-bordered `\u{1F534} Call Ctrl+R` box while a call is
+/// on (Escape folds the modal away into it, Ctrl+R brings it back), then
+/// Conn quality, CPU usage and the help hint, in that order
+/// (`docs/SPEC.md` "Connected UI").
+pub(crate) fn render_header_row(frame: &mut Frame, area: Rect, state: &UiState) {
+    let Some(line) = header_text_row(area) else {
+        return;
+    };
+    let call_width = if state.call.is_some() {
+        CALL_MARKER_WIDTH
+    } else {
+        0
+    };
+    // The status figures claim exactly what they need, plus one column of
+    // gap, so the call box sits right against them however long
+    // "Conn:NORMAL  CPU:100%  Ctrl+H: Help" happens to be this frame.
+    let status = status_line(state);
+    let status_width = status.width() as u16 + 1;
+    let header_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Min(0),
+            Constraint::Length(call_width),
+            Constraint::Length(status_width),
+        ])
+        .split(line);
+
+    let (selectors, _) = selector_line(state);
+    frame.render_widget(Paragraph::new(selectors), header_cols[0]);
+
+    if state.call.is_some() {
+        // The box is the one thing here that uses the whole three-row
+        // band: its borders sit on the blank lines the selectors leave
+        // above and below themselves.
+        render_call_marker(
+            frame,
+            Rect {
+                x: header_cols[1].x,
+                y: area.y,
+                width: header_cols[1].width,
+                height: area.height.min(HEADER_ROW_HEIGHT),
+            },
+        );
+    }
+
+    frame.render_widget(
+        Paragraph::new(status).alignment(ratatui::layout::Alignment::Right),
+        header_cols[2],
+    );
+}
+
+/// Conn quality, CPU usage and the help hint, in that order
+/// (`docs/SPEC.md` "Connected UI") - built up front so the row can be laid
+/// out around its real width.
+fn status_line(state: &UiState) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!("Conn:{}", state.conn_quality.label()),
+            Style::default().fg(conn_color(state.conn_quality)),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            format!("CPU:{}%", cpu_pct_rounded(state.cpu_usage_pct)),
+            Style::default().fg(cpu_color(state.cpu_usage_pct)),
+        ),
+        Span::raw("  "),
+        Span::styled("Ctrl+H: Help", Style::default().fg(Color::DarkGray)),
+    ])
+}
+
+fn render_call_marker(frame: &mut Frame, area: Rect) {
+    if area.width < 4 || area.height < 3 {
+        return;
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Red));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(CALL_MARKER, Style::default().fg(Color::Red)),
+            Span::raw(" "),
+            Span::styled(CALL_MARKER_KEY, Style::default().fg(Color::DarkGray)),
+        ]))
+        .alignment(ratatui::layout::Alignment::Center),
+        inner,
+    );
+}
+
+/// The one row of `area` the header's text sits on, already inset by
+/// `HEADER_SIDE_PAD` on both sides. `None` on a terminal too small to hold
+/// the block or too narrow to inset - nothing is drawn rather than drawn
+/// crooked.
+fn header_text_row(area: Rect) -> Option<Rect> {
+    (area.height > HEADER_TEXT_ROW && area.width > 2 * HEADER_SIDE_PAD).then(|| Rect {
+        x: area.x + HEADER_SIDE_PAD,
+        y: area.y + HEADER_TEXT_ROW,
+        width: area.width - 2 * HEADER_SIDE_PAD,
+        height: 1,
+    })
+}
+
+/// The focused selector's dropdown, hanging directly under it in the top
+/// row: every entry that selector holds *except* the one it names, each
+/// with its own blinking envelope if it has unseen messages. Up/Down move
+/// the selection (and the view behind this overlay with it), Enter, Escape
+/// or the opposite bracket close it.
+pub(crate) fn render_selector_dropdown(frame: &mut Frame, area: Rect, state: &UiState) {
+    let entries = state.selector_dropdown_entries();
+    if entries.is_empty() || area.height <= HEADER_ROW_HEIGHT {
+        return;
+    }
+    let rows: Vec<Line<'static>> = entries
+        .iter()
+        .map(|e| {
+            let mut spans = vec![Span::raw(e.label.clone())];
+            if e.unread {
+                spans.push(Span::styled(
+                    unread_envelope(state.blink_on),
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
+            Line::from(spans)
+        })
+        .collect();
+
+    // Hangs from the focused selector's own start column, plus the
+    // header's side padding (`selector_line` measures the rest).
+    let (_, starts) = selector_line(state);
+    let (_, selected) = selector_titles(state);
+    let x = HEADER_SIDE_PAD + starts.get(selected).copied().unwrap_or(0);
+    let title = match state.selector_focus {
+        SelectorFocus::Channels => "Channels",
+        SelectorFocus::Dms => "DMs",
+    };
+    let content_width = rows
+        .iter()
+        .map(|r| r.width())
+        .chain(std::iter::once(title.chars().count()))
+        .max()
+        .unwrap_or(0) as u16;
+    let x = x.min(area.width.saturating_sub(1));
+    let width = (content_width + 3).min(area.width - x);
+    // Hangs off the bottom of the header block, so the blank line under
+    // the selectors stays blank.
+    let height = ((rows.len() as u16) + 2).min(area.height - HEADER_ROW_HEIGHT);
+    let popup = Rect {
+        x,
+        y: area.y + HEADER_ROW_HEIGHT,
+        width,
+        height,
+    };
+    let block = Block::default().title(title).borders(Borders::ALL);
+    let inner = block.inner(popup);
+    frame.render_widget(ratatui::widgets::Clear, popup);
+    frame.render_widget(block, popup);
+    frame.render_widget(
+        List::new(rows.into_iter().map(ListItem::new).collect::<Vec<_>>()),
+        inner,
+    );
 }
 
 pub(crate) fn render_channel_view(frame: &mut Frame, area: Rect, state: &UiState) {
     let constraints = [
-        Constraint::Length(1),
+        Constraint::Length(HEADER_ROW_HEIGHT),
         Constraint::Min(3),
         Constraint::Length(3),
     ];
@@ -871,43 +1152,7 @@ pub(crate) fn render_channel_view(frame: &mut Frame, area: Rect, state: &UiState
     let messages_row = 1;
     let input_row = 2;
 
-    // The tab row is split so the status area - Conn quality, CPU usage,
-    // and the help hint - sits flush right, past the end of the channel
-    // tabs, regardless of how many tabs there are. Widest realistic
-    // content: "Conn:NORMAL  CPU:100%  Ctrl+H: Help" (34 cols); a little
-    // slack is kept above that.
-    let header_cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(0), Constraint::Length(40)])
-        .split(rows[tabs_row]);
-
-    let (titles, selected) = call_and_channel_tabs(state);
-    let tabs = Tabs::new(titles).select(selected);
-    frame.render_widget(tabs, header_cols[0]);
-
-    // Conn comes first (right before CPU), CPU right before the help hint
-    // - docs/SPEC.md "Connected UI".
-    let mut status_spans = vec![
-        Span::styled(
-            format!("Conn:{}", state.conn_quality.label()),
-            Style::default().fg(conn_color(state.conn_quality)),
-        ),
-        Span::raw("  "),
-        Span::styled(
-            format!("CPU:{}%", cpu_pct_rounded(state.cpu_usage_pct)),
-            Style::default().fg(cpu_color(state.cpu_usage_pct)),
-        ),
-        Span::raw("  "),
-    ];
-    status_spans.push(Span::styled(
-        "Ctrl+H: Help",
-        Style::default().fg(Color::DarkGray),
-    ));
-    let help_hint_line = Line::from(status_spans);
-    frame.render_widget(
-        Paragraph::new(help_hint_line).alignment(ratatui::layout::Alignment::Right),
-        header_cols[1],
-    );
+    render_header_row(frame, rows[tabs_row], state);
 
     let cols = Layout::default()
         .direction(Direction::Horizontal)
@@ -974,16 +1219,12 @@ fn render_sidebar(frame: &mut Frame, area: Rect, state: &UiState) {
             // an empty DM and switching back would show an envelope for a
             // conversation that never happened.
             let room = state.private_rooms.get(&m.id).filter(|r| !r.log.is_empty());
+            // The same glyph the selectors use (`UNREAD_ENVELOPE`), in a
+            // fixed two-cell slot so a blink never shifts the name.
             let envelope = match room {
-                Some(r) if r.unread => {
-                    if state.blink_on {
-                        "\u{2709} "
-                    } else {
-                        "  "
-                    }
-                }
-                Some(_) => "\u{2709} ",
-                None => "",
+                Some(r) if r.unread && !state.blink_on => "  ".to_string(),
+                Some(_) => format!("{UNREAD_ENVELOPE} "),
+                None => String::new(),
             };
             let label = format!("{envelope}{}", m.key_mode.format_with_name(&m.name));
             // A Pending/Rejected identity (docs/PROTOCOL.md §12) takes

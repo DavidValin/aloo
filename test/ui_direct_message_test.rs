@@ -3,7 +3,9 @@ mod ui_common;
 use ui_common::*;
 
 use aloo::proto::{KeyMode, UserId};
-use aloo::client::tui::ui::{Focus, IdentityCase, MessageBody, PendingOtpInvite, UiAction, VoiceTarget, render};
+use aloo::client::tui::ui::{
+    Focus, IdentityCase, MessageBody, PendingOtpInvite, UiAction, UiState, VoiceTarget, render,
+};
 use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -889,4 +891,205 @@ fn a_recognized_slash_command_still_works_after_the_guard_was_added() {
         Some(UiAction::RequestOtpSession { peer, .. }) => assert_eq!(peer, UserId(2)),
         other => panic!("expected RequestOtpSession, got {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------
+// The top row's DM selector (AC-020, AC-186, AC-187, TB-026, TB-210)
+// ---------------------------------------------------------------------
+
+/// Opens a DM with `peer` the way a user does: cursor on them in the
+/// sidebar, Enter.
+fn open_dm_with(state: &mut UiState, row: usize) {
+    state.focus = Focus::Sidebar;
+    state.sidebar_selected = row;
+    press(state, KeyCode::Enter);
+}
+
+/// @requirement AC-186
+#[test]
+fn the_dm_selector_is_absent_until_a_room_has_been_opened() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    let top = rendered_rows(&state).remove(HEADER_TEXT_ROW);
+    assert!(!top.contains("bob"), "nothing to name yet: {top:?}");
+    assert_eq!(state.selected_dm, None);
+
+    // `]` has nowhere to go while it isn't there.
+    press(&mut state, KeyCode::Char(']'));
+    assert_eq!(state.active_private_room, None);
+
+    open_dm_with(&mut state, 0);
+    press(&mut state, KeyCode::Char('['));
+    let top = rendered_rows(&state).remove(HEADER_TEXT_ROW);
+    assert!(top.contains("bob"), "the room is named on it now: {top:?}");
+}
+
+/// `]` from the channel selector focuses the DM one - it does *not* open
+/// its dropdown, and it does not wrap back round to the channels.
+///
+/// @requirement AC-020
+#[test]
+fn closing_bracket_moves_between_the_two_selectors_without_wrapping() {
+    let mut state = joined_general_with(vec![user(2, "bob"), user(3, "carol")]);
+    open_dm_with(&mut state, 0);
+    press(&mut state, KeyCode::Char('[')); // back onto the channel selector
+    assert_eq!(state.active_private_room, None);
+
+    press(&mut state, KeyCode::Char(']'));
+    assert_eq!(
+        state.active_private_room,
+        Some(UserId(2)),
+        "] focuses the DM selector, which opens the room it names"
+    );
+    assert!(!state.selector_dropdown_open, "without opening its dropdown");
+
+    press(&mut state, KeyCode::Char('['));
+    assert_eq!(state.active_private_room, None, "and [ steps back");
+    assert!(!state.selector_dropdown_open);
+}
+
+/// @requirement AC-020, AC-186
+#[test]
+fn closing_bracket_on_the_dm_selector_opens_its_dropdown_and_up_down_switch_rooms() {
+    let mut state = joined_general_with(vec![user(2, "bob"), user(3, "carol")]);
+    open_dm_with(&mut state, 0); // bob
+    open_dm_with(&mut state, 1); // carol - now the selected DM
+    assert_eq!(state.selected_dm, Some(UserId(3)));
+
+    press(&mut state, KeyCode::Char(']'));
+    assert!(state.selector_dropdown_open);
+
+    let labels: Vec<String> = state
+        .selector_dropdown_entries()
+        .into_iter()
+        .map(|e| e.label)
+        .collect();
+    assert_eq!(labels.len(), 1, "{labels:?}");
+    assert!(labels[0].contains("bob"), "{labels:?}");
+    assert!(
+        !labels.iter().any(|l| l.contains("carol")),
+        "the room already on screen is not offered again: {labels:?}"
+    );
+
+    press(&mut state, KeyCode::Down);
+    assert_eq!(
+        state.active_private_room,
+        Some(UserId(2)),
+        "Down switches the room behind the overlay straight away"
+    );
+    press(&mut state, KeyCode::Char('['));
+    assert!(!state.selector_dropdown_open, "[ closes the DM dropdown");
+    assert_eq!(
+        state.active_private_room,
+        Some(UserId(2)),
+        "closing it keeps what Down landed on, and stays in the room"
+    );
+}
+
+/// A room that was opened and never written in still counts - "every DM
+/// you have open", not "every DM with something in it".
+///
+/// @requirement AC-186
+#[test]
+fn an_empty_room_still_counts_on_the_dm_selector() {
+    let mut state = joined_general_with(vec![user(2, "bob"), user(3, "carol")]);
+    open_dm_with(&mut state, 0);
+    open_dm_with(&mut state, 1);
+    assert!(state.private_rooms[&UserId(2)].log.is_empty());
+
+    let top = rendered_rows(&state).remove(HEADER_TEXT_ROW);
+    assert!(top.contains("carol"), "{top:?}");
+    assert!(top.contains("+1 more..."), "{top:?}");
+}
+
+/// @requirement AC-187
+#[test]
+fn an_unread_dm_blinks_an_envelope_on_the_dm_selector_until_it_is_opened() {
+    let mut state = joined_general_with(vec![user(2, "bob"), user(3, "carol")]);
+    open_dm_with(&mut state, 1); // reading carol's room
+    state.on_direct_message(UserId(2), "bob".into(), MessageBody::Text("psst".into()));
+    assert!(state.any_dm_unread());
+
+    state.blink_on = true;
+    let top = rendered_rows(&state).remove(HEADER_TEXT_ROW);
+    assert!(top.contains('\u{2709}'), "{top:?}");
+    state.blink_on = false;
+    let top = rendered_rows(&state).remove(HEADER_TEXT_ROW);
+    assert!(!top.contains('\u{2709}'), "{top:?}");
+
+    // Open dropdown: the envelope moves onto bob's own row.
+    press(&mut state, KeyCode::Char(']'));
+    state.blink_on = true;
+    let rows = rendered_rows(&state);
+    assert!(!rows[HEADER_TEXT_ROW].contains('\u{2709}'), "{rows:?}");
+    let row = rows
+        .iter()
+        .skip(FIRST_ROW_BELOW_HEADER)
+        .find(|r| r.contains("bob"))
+        .unwrap_or_else(|| panic!("no dropdown row for bob: {rows:?}"));
+    assert!(row.contains('\u{2709}'), "{row:?}");
+
+    press(&mut state, KeyCode::Down); // onto bob's room - reading it
+    assert!(!state.any_dm_unread());
+}
+
+/// A message from someone else never yanks the selector off the room being
+/// read - it raises that room's envelope instead.
+///
+/// @requirement TB-210
+#[test]
+fn an_incoming_dm_never_takes_the_selector_off_the_room_being_read() {
+    let mut state = joined_general_with(vec![user(2, "bob"), user(3, "carol")]);
+    open_dm_with(&mut state, 1); // carol
+    state.on_direct_message(UserId(2), "bob".into(), MessageBody::Text("psst".into()));
+
+    assert_eq!(state.selected_dm, Some(UserId(3)));
+    assert_eq!(state.active_private_room, Some(UserId(3)));
+    assert_eq!(
+        state.dm_order,
+        vec![UserId(3), UserId(2)],
+        "rooms keep the order they were first opened in"
+    );
+}
+
+/// The very first room to exist is what the selector names - it has to
+/// name something the moment it appears.
+///
+/// @requirement TB-210
+#[test]
+fn the_first_room_created_becomes_what_the_dm_selector_names() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.on_direct_message(UserId(2), "bob".into(), MessageBody::Text("psst".into()));
+    assert_eq!(state.selected_dm, Some(UserId(2)));
+    assert_eq!(
+        state.active_private_room, None,
+        "named, but not opened - it is still unread"
+    );
+    assert!(state.private_rooms[&UserId(2)].unread);
+}
+
+/// @requirement TB-026
+#[test]
+fn escape_leaves_the_room_but_keeps_it_on_the_dm_selector() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    open_dm_with(&mut state, 0);
+
+    press(&mut state, KeyCode::Esc);
+    assert_eq!(state.active_private_room, None);
+    assert_eq!(state.selected_dm, Some(UserId(2)));
+    let top = rendered_rows(&state).remove(HEADER_TEXT_ROW);
+    assert!(top.contains("bob"), "still on the DM selector: {top:?}");
+}
+
+/// A room is reached through the top row, so the row is part of its view -
+/// the user can see where they are and `[` takes them back.
+///
+/// @requirement AC-186
+#[test]
+fn the_private_room_view_draws_the_same_top_row() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    open_dm_with(&mut state, 0);
+    let rows = rendered_rows(&state);
+    assert!(rows[HEADER_TEXT_ROW].contains("general"), "{rows:?}");
+    assert!(rows[HEADER_TEXT_ROW].contains("bob"), "{rows:?}");
+    assert!(rows[HEADER_TEXT_ROW].contains("Ctrl+H: Help"), "{rows:?}");
 }

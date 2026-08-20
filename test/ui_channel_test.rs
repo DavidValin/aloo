@@ -5,7 +5,11 @@ use ui_common::*;
 use aloo::client::netstats::ConnQuality;
 use aloo::client::p2p::LinkStatus;
 use aloo::proto::{ChannelInfo, ChannelKind, KeyMode, UserId};
-use aloo::client::tui::ui::{Focus, IdentityCase, MessageBody, UiAction, UiState, VoiceTarget, render};
+use aloo::client::tui::channel::HEADER_ROW_HEIGHT;
+use aloo::client::tui::ui::{
+    Focus, IdentityCase, MessageBody, SELECTOR_DROPDOWN_IDLE_TIMEOUT, UiAction, UiState,
+    VoiceTarget, render,
+};
 use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -29,6 +33,18 @@ fn row_containing(rows: &[String], needle: &str) -> String {
     rows.iter()
         .find(|r| r.contains(needle))
         .unwrap_or_else(|| panic!("no row contains {needle:?}: {rows:?}"))
+        .clone()
+}
+
+/// `row_containing`, skipping the top row: that row names the selected DM
+/// too (a speech balloon and the peer's nickname), so a sidebar assertion
+/// about the same person would otherwise match the selector rather than
+/// the roster entry.
+fn sidebar_row_containing(rows: &[String], needle: &str) -> String {
+    rows.iter()
+        .skip(FIRST_ROW_BELOW_HEADER)
+        .find(|r| r.contains(needle))
+        .unwrap_or_else(|| panic!("no row below the header contains {needle:?}: {rows:?}"))
         .clone()
 }
 
@@ -425,8 +441,10 @@ fn find_text_start_below(
     panic!("text {text:?} not found at or below row {min_y}");
 }
 
-/// Joins `names` as public channels, in order - every tab is a joined
-/// channel now, so this is what a multi-tab state looks like.
+/// Joins `names` as public channels, in order, and leaves the selector on
+/// the first of them - joining lands the user in the channel joined
+/// (`on_joined`), so this describes a membership arrived at earlier
+/// rather than a join happening right now.
 fn joined_public(names: &[&str]) -> UiState {
     let mut state = UiState::new("me".into());
     for name in names {
@@ -435,53 +453,199 @@ fn joined_public(names: &[&str]) -> UiState {
             kind: ChannelKind::Public,
         });
     }
+    state.select_channel_at(0);
     state
 }
 
 /// @requirement AC-020
 #[test]
-fn bracket_key_switches_to_the_next_joined_channel_without_joining_anything() {
+fn opening_bracket_opens_the_channel_dropdown_and_down_switches_channel() {
     let mut state = joined_public(&["general", "random"]);
     assert_eq!(state.selected_channel, 0);
+    assert!(!state.selector_dropdown_open);
 
-    let action = press(&mut state, KeyCode::Char(']'));
+    // `[` on the leftmost selector has nowhere further left to go, so it
+    // opens that selector's own dropdown instead of wrapping around.
+    press(&mut state, KeyCode::Char('['));
+    assert!(state.selector_dropdown_open);
+    assert_eq!(
+        state.selected_channel, 0,
+        "opening the dropdown changes nothing by itself"
+    );
+
+    let action = press(&mut state, KeyCode::Down);
     assert_eq!(
         state.selected_channel, 1,
-        "] switches selection immediately"
+        "Down switches the selection straight away, with the overlay still up"
     );
+    assert!(state.selector_dropdown_open);
     assert_eq!(
         action, None,
-        "every tab is already joined - switching never requests a join"
+        "every entry is a channel already joined - switching never requests a join"
     );
+
+    assert_eq!(press(&mut state, KeyCode::Enter), None);
+    assert!(!state.selector_dropdown_open, "Enter just closes it");
+    assert_eq!(state.selected_channel, 1, "keeping what Down landed on");
 }
 
 /// @requirement AC-020
 #[test]
-fn opening_bracket_selects_the_previous_channel() {
+fn up_in_the_channel_dropdown_selects_the_previous_channel() {
     let mut state = joined_public(&["general", "random"]);
-    assert_eq!(state.selected_channel, 0);
-
     press(&mut state, KeyCode::Char('['));
+
+    press(&mut state, KeyCode::Up);
     assert_eq!(
         state.selected_channel, 1,
-        "[ wraps around to the previous (last) channel"
+        "Up wraps around within the selector's own list"
+    );
+
+    press(&mut state, KeyCode::Esc);
+    assert!(!state.selector_dropdown_open, "Escape closes it too");
+    assert_eq!(state.selected_channel, 1);
+}
+
+/// The dropdown lists what the selector is *not* naming - there is no
+/// point offering the entry already on screen.
+///
+/// @requirement AC-185
+#[test]
+fn the_channel_dropdown_lists_every_joined_channel_except_the_selected_one() {
+    let mut state = joined_public(&["general", "random", "lobby"]);
+    press(&mut state, KeyCode::Char('['));
+
+    let labels: Vec<String> = state
+        .selector_dropdown_entries()
+        .into_iter()
+        .map(|e| e.label)
+        .collect();
+    assert_eq!(labels.len(), 2, "{labels:?}");
+    assert!(labels.iter().any(|l| l.contains("random")), "{labels:?}");
+    assert!(labels.iter().any(|l| l.contains("lobby")), "{labels:?}");
+    assert!(
+        !labels.iter().any(|l| l.contains("general")),
+        "the selected channel is not offered again: {labels:?}"
+    );
+
+    let rows = sidebar_rows(&state);
+    assert!(
+        rows.iter().skip(FIRST_ROW_BELOW_HEADER).any(|r| r.contains("random")),
+        "the dropdown is drawn under the selector: {rows:?}"
     );
 }
 
-/// @requirement TB-026
+/// With nothing else to switch to there is no dropdown to open - an empty
+/// overlay would only be in the way.
+///
+/// @requirement AC-185
 #[test]
-fn switching_tabs_closes_any_open_private_room() {
-    let mut state = joined_general_with(vec![user(2, "bob")]);
+fn the_channel_dropdown_does_not_open_with_only_one_channel_joined() {
+    let mut state = joined_public(&["general"]);
+    press(&mut state, KeyCode::Char('['));
+    assert!(!state.selector_dropdown_open);
+}
+
+/// @requirement AC-185
+#[test]
+fn the_channel_selector_counts_everything_it_is_not_naming() {
+    let mut state = joined_public(&["general"]);
+    let top = sidebar_rows(&state).remove(HEADER_TEXT_ROW);
+    assert!(top.contains("general"), "{top:?}");
+    assert!(
+        !top.contains("more..."),
+        "one channel joined, nothing else to count: {top:?}"
+    );
+
     state.on_joined(ChannelInfo {
         name: "random".into(),
         kind: ChannelKind::Public,
     });
+    state.on_joined(ChannelInfo {
+        name: "lobby".into(),
+        kind: ChannelKind::Public,
+    });
+    // Back to general: joining lands on the channel joined, and what this
+    // is about is the count of everything the selector is *not* naming.
+    state.select_channel_at(0);
+    let top = sidebar_rows(&state).remove(HEADER_TEXT_ROW);
+    assert!(top.contains("general"), "still naming the selected one: {top:?}");
+    assert!(top.contains("+2 more..."), "{top:?}");
+    assert!(
+        !top.contains("random"),
+        "the others are only named in the dropdown: {top:?}"
+    );
+}
+
+/// @requirement AC-187
+#[test]
+fn a_message_in_an_unselected_channel_blinks_an_envelope_until_it_is_opened() {
+    let mut state = joined_public(&["general", "random"]);
+    state.seed_member("random", user(2, "bob"));
+    state.on_channel_message(
+        "random",
+        UserId(2),
+        "bob".into(),
+        MessageBody::Text("over here".into()),
+    );
+    assert!(state.any_channel_unread());
+
+    state.blink_on = true;
+    let top = sidebar_rows(&state).remove(HEADER_TEXT_ROW);
+    assert!(
+        top.contains('\u{2709}'),
+        "the envelope shows on the blink-on frame: {top:?}"
+    );
+    state.blink_on = false;
+    let top = sidebar_rows(&state).remove(HEADER_TEXT_ROW);
+    assert!(
+        !top.contains('\u{2709}'),
+        "and is hidden on the blink-off frame - that is the blink: {top:?}"
+    );
+
+    // While the dropdown is open it moves onto the row it belongs to.
+    press(&mut state, KeyCode::Char('['));
+    state.blink_on = true;
+    let rows = sidebar_rows(&state);
+    assert!(
+        !rows[HEADER_TEXT_ROW].contains('\u{2709}'),
+        "not on the selector while its own dropdown is open: {rows:?}"
+    );
+    let row = row_containing(&rows, "random");
+    assert!(row.contains('\u{2709}'), "on the unread row instead: {row:?}");
+
+    // Opening it is what clears it.
+    press(&mut state, KeyCode::Down);
+    assert!(!state.any_channel_unread());
+    let rows = sidebar_rows(&state);
+    assert!(!rows[HEADER_TEXT_ROW].contains('\u{2709}'), "{rows:?}");
+}
+
+/// A presence notice is not a message: joining and leaving must not raise
+/// an envelope on a channel nobody has written in.
+///
+/// @requirement AC-187
+#[test]
+fn a_presence_notice_does_not_mark_a_channel_unread() {
+    let mut state = joined_public(&["general", "random"]);
+    state.on_user_joined("random", user(2, "bob"));
+    state.on_user_left("random", UserId(2));
+    assert!(!state.any_channel_unread());
+}
+
+/// @requirement TB-026
+#[test]
+fn focusing_the_channel_selector_closes_any_open_private_room() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
     state.focus = Focus::Sidebar;
     press(&mut state, KeyCode::Enter);
     assert!(state.active_private_room.is_some());
 
-    press(&mut state, KeyCode::Char(']'));
+    // `[` from the DM selector steps back onto the channel one, which is
+    // the channel view - the room itself stays on the DM selector.
+    press(&mut state, KeyCode::Char('['));
     assert_eq!(state.active_private_room, None);
+    assert_eq!(state.selected_dm, Some(UserId(2)));
 }
 
 // ---------------------------------------------------------------------
@@ -669,7 +833,7 @@ fn sidebar_shows_no_envelope_for_a_dm_room_that_has_no_messages_yet() {
     );
     assert!(state.private_rooms[&UserId(2)].log.is_empty());
 
-    let row = row_containing(&sidebar_rows(&state), "bob");
+    let row = sidebar_row_containing(&sidebar_rows(&state), "bob");
     assert!(
         !row.contains('\u{2709}'),
         "no envelope should show for a DM with zero messages: {row:?}"
@@ -694,7 +858,7 @@ fn sidebar_shows_a_solid_envelope_once_an_outgoing_message_exists_even_after_lea
     // a read/solid envelope must show regardless of the blink phase.
     for blink in [false, true] {
         state.blink_on = blink;
-        let row = row_containing(&sidebar_rows(&state), "bob");
+        let row = sidebar_row_containing(&sidebar_rows(&state), "bob");
         assert!(
             row.contains('\u{2709}'),
             "expected a steady envelope with blink_on={blink}: {row:?}"
@@ -711,14 +875,14 @@ fn sidebar_blinks_the_envelope_only_while_a_dm_message_is_unread() {
     assert!(state.private_rooms[&UserId(2)].unread);
 
     state.blink_on = true;
-    let row = row_containing(&sidebar_rows(&state), "bob");
+    let row = sidebar_row_containing(&sidebar_rows(&state), "bob");
     assert!(
         row.contains('\u{2709}'),
         "expected the envelope visible on the blink-on frame: {row:?}"
     );
 
     state.blink_on = false;
-    let row = row_containing(&sidebar_rows(&state), "bob");
+    let row = sidebar_row_containing(&sidebar_rows(&state), "bob");
     assert!(
         !row.contains('\u{2709}'),
         "expected the envelope hidden on the blink-off frame while unread: {row:?}"
@@ -743,7 +907,7 @@ fn sidebar_envelope_stops_blinking_and_stays_solid_once_the_dm_is_reopened() {
 
     for blink in [true, false] {
         state.blink_on = blink;
-        let row = row_containing(&sidebar_rows(&state), "bob");
+        let row = sidebar_row_containing(&sidebar_rows(&state), "bob");
         assert!(
             row.contains('\u{2709}'),
             "expected a solid (non-blinking) envelope once read, blink_on={blink}: {row:?}"
@@ -766,14 +930,14 @@ fn sidebar_renders_an_offline_member_in_gray_instead_of_green() {
     terminal.draw(|f| render(f, &state)).unwrap();
     let buffer = terminal.backend().buffer().clone();
 
-    let (bx, by) = find_text_start(&buffer, "bob");
+    let (bx, by) = find_text_start_below(&buffer, "bob", HEADER_ROW_HEIGHT);
     assert_eq!(
         buffer[(bx, by)].fg,
         ratatui::style::Color::DarkGray,
         "offline member should render in soft gray"
     );
 
-    let (cx, cy) = find_text_start(&buffer, "carol");
+    let (cx, cy) = find_text_start_below(&buffer, "carol", HEADER_ROW_HEIGHT);
     assert_eq!(
         buffer[(cx, cy)].fg,
         ratatui::style::Color::Green,
@@ -893,7 +1057,7 @@ fn header_shows_cpu_usage_right_before_the_ctrl_h_hint() {
     let mut state = joined_general_with(vec![]);
     state.set_cpu_usage(24.0);
     let rows = rendered_rows(&state);
-    let header = rows.first().expect("header row");
+    let header = &rows[HEADER_TEXT_ROW];
     assert!(
         header.contains("CPU:24%  Ctrl+H: Help"),
         "expected CPU right before the help hint: {header:?}"
@@ -907,7 +1071,7 @@ fn header_shows_conn_quality_right_before_the_cpu_indicator() {
     state.set_conn_quality(ConnQuality::Good);
     state.set_cpu_usage(24.0);
     let rows = rendered_rows(&state);
-    let header = rows.first().expect("header row");
+    let header = &rows[HEADER_TEXT_ROW];
     assert!(
         header.contains("Conn:GOOD  CPU:24%"),
         "expected Conn right before CPU: {header:?}"
@@ -920,7 +1084,7 @@ fn header_defaults_conn_quality_to_a_white_dash_before_any_traffic() {
     let state = joined_general_with(vec![]);
     assert_eq!(state.conn_quality, ConnQuality::Unknown);
     let rows = rendered_rows(&state);
-    let header = rows.first().expect("header row");
+    let header = &rows[HEADER_TEXT_ROW];
     assert!(
         header.contains("Conn:-"),
         "expected the default 'Conn:-': {header:?}"
@@ -1043,13 +1207,13 @@ fn sidebar_renders_a_trust_gated_member_in_red_taking_priority_over_offline() {
     terminal.draw(|f| render(f, &state)).unwrap();
     let buffer = terminal.backend().buffer().clone();
 
-    let (bx, by) = find_text_start(&buffer, "bob");
+    let (bx, by) = find_text_start_below(&buffer, "bob", HEADER_ROW_HEIGHT);
     assert_eq!(
         buffer[(bx, by)].fg,
         ratatui::style::Color::Red,
         "a trust-gated member renders red even while also offline"
     );
-    let (cx, cy) = find_text_start(&buffer, "carol");
+    let (cx, cy) = find_text_start_below(&buffer, "carol", HEADER_ROW_HEIGHT);
     assert_eq!(
         buffer[(cx, cy)].fg,
         ratatui::style::Color::Green,
@@ -1101,6 +1265,10 @@ fn channel_tabs_are_prefixed_by_kind() {
         name: "secret-room".into(),
         kind: ChannelKind::Private,
     });
+    // Joining lands on the channel joined, so put the selector back on the
+    // public one - this is about how each kind is drawn, not about where a
+    // join leaves you.
+    state.select_channel_at(0);
     let rows = sidebar_rows(&state);
     let tab_row = row_containing(&rows, "the-hall");
     assert!(
@@ -1111,6 +1279,11 @@ fn channel_tabs_are_prefixed_by_kind() {
         tab_row.contains("the-hall"),
         "public channel tab should still show its name: {tab_row:?}"
     );
+    // The private one is behind the selector, so its lock shows on its
+    // dropdown row - the selector names one channel at a time.
+    press(&mut state, KeyCode::Char('['));
+    let rows = sidebar_rows(&state);
+    let tab_row = row_containing(&rows, "secret-room");
     assert!(
         tab_row.contains('\u{1F512}'),
         "private channel tab should show the lock emoji: {tab_row:?}"
@@ -1119,11 +1292,16 @@ fn channel_tabs_are_prefixed_by_kind() {
         tab_row.contains("secret-room"),
         "private channel tab should still show its name: {tab_row:?}"
     );
-    // the globe must precede its own channel's name, not merely appear
-    // somewhere on the same row as the private channel's lock.
+    // Each emoji must precede its own channel's name, not merely appear
+    // somewhere on the same row.
     assert!(
-        tab_row.find('\u{1F30D}').unwrap() < tab_row.find("the-hall").unwrap(),
-        "globe emoji should prefix the public channel's name: {tab_row:?}"
+        tab_row.find('\u{1F512}').unwrap() < tab_row.find("secret-room").unwrap(),
+        "lock emoji should prefix the private channel's name: {tab_row:?}"
+    );
+    let top = rows[HEADER_TEXT_ROW].clone();
+    assert!(
+        top.find('\u{1F30D}').unwrap() < top.find("the-hall").unwrap(),
+        "globe emoji should prefix the public channel's name: {top:?}"
     );
 }
 
@@ -1150,7 +1328,8 @@ fn shares_a_joined_channel_is_true_for_a_member_of_an_unselected_joined_channel(
         kind: ChannelKind::Public,
     });
     state.seed_member("random", user(2, "bob"));
-    assert_eq!(state.selected_channel, 0, "still looking at general");
+    state.select_channel_at(0);
+    assert_eq!(state.selected_channel, 0, "back to looking at general");
     assert!(state.shares_a_joined_channel(UserId(2)));
 }
 
@@ -1641,4 +1820,155 @@ fn an_unrecognized_slash_command_is_never_sent_as_channel_text() {
         Some(("unknown command: /nonsense".to_string(), false))
     );
     assert!(state.channels[0].log.is_empty());
+}
+
+/// Joining a channel is a request to go there: it becomes the one the
+/// channel selector names, and the view, so the compose bar is already
+/// addressed to it (`docs/SPEC.md` Functionality #2).
+///
+/// @requirement AC-189
+#[test]
+fn joining_a_channel_lands_the_selector_on_it() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    assert_eq!(state.selected_channel, 0);
+
+    state.on_joined(ChannelInfo {
+        name: "random".into(),
+        kind: ChannelKind::Public,
+    });
+    assert_eq!(
+        state.channels[state.selected_channel].name, "random",
+        "the channel just joined is the one on screen"
+    );
+    let top = sidebar_rows(&state).remove(HEADER_TEXT_ROW);
+    assert!(top.contains("random"), "{top:?}");
+}
+
+/// Joining from inside a DM room leaves that room for the new channel -
+/// the room stays on the DM selector, as any move to the channel selector
+/// leaves it.
+///
+/// @requirement AC-189
+#[test]
+fn joining_a_channel_from_a_dm_room_leaves_the_room() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.focus = Focus::Sidebar;
+    press(&mut state, KeyCode::Enter);
+    assert!(state.active_private_room.is_some());
+
+    state.on_joined(ChannelInfo {
+        name: "random".into(),
+        kind: ChannelKind::Public,
+    });
+    assert_eq!(state.active_private_room, None);
+    assert_eq!(state.selected_dm, Some(UserId(2)), "still on the DM selector");
+    assert_eq!(state.channels[state.selected_channel].name, "random");
+}
+
+/// The focus highlight covers the selector's own name, and stops before
+/// the unread envelope: reversing a glyph paints a block of background
+/// around it (`docs/SPEC.md` "Connected UI").
+///
+/// @requirement AC-187
+#[test]
+fn the_unread_envelope_is_left_out_of_the_focus_highlight() {
+    let mut state = joined_public(&["general", "random"]);
+    state.seed_member("random", user(2, "bob"));
+    state.on_channel_message(
+        "random",
+        UserId(2),
+        "bob".into(),
+        MessageBody::Text("over here".into()),
+    );
+    state.blink_on = true;
+
+    let backend = TestBackend::new(100, 12);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| render(f, &state)).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+
+    let (nx, ny) = find_text_start_below(&buffer, "general", 0);
+    assert!(
+        buffer[(nx, ny)]
+            .modifier
+            .contains(ratatui::style::Modifier::REVERSED),
+        "the focused selector's own name is highlighted"
+    );
+    let (ex, ey) = find_text_start_below(&buffer, "\u{2709}", 0);
+    assert!(
+        !buffer[(ex, ey)]
+            .modifier
+            .contains(ratatui::style::Modifier::REVERSED),
+        "but the envelope beside it is not"
+    );
+
+    // Nor is the count of what the selector is not naming - grey, and
+    // never behind a block of background.
+    let (mx, my) = find_text_start_below(&buffer, "+1 more...", 0);
+    assert!(
+        !buffer[(mx, my)]
+            .modifier
+            .contains(ratatui::style::Modifier::REVERSED),
+        "the +<n> more... count is left out of the highlight"
+    );
+    assert_eq!(
+        buffer[(mx, my)].fg,
+        ratatui::style::Color::DarkGray,
+        "and stays grey"
+    );
+}
+
+/// Tab is about the view *behind* the overlay (sidebar, log, compose bar),
+/// so reaching for it means being done with the dropdown: it closes,
+/// rather than cycling focus underneath (`docs/SPEC.md` "Connected UI").
+///
+/// @requirement AC-020
+#[test]
+fn tab_closes_an_open_dropdown_instead_of_cycling_focus() {
+    let mut state = joined_public(&["general", "random"]);
+    state.focus = Focus::Input;
+    press(&mut state, KeyCode::Char('['));
+    assert!(state.selector_dropdown_open);
+
+    press(&mut state, KeyCode::Tab);
+    assert!(!state.selector_dropdown_open, "Tab closes it");
+    assert_eq!(
+        state.focus,
+        Focus::Input,
+        "and leaves the focus underneath where it was"
+    );
+
+    // With nothing open it goes back to being the ordinary focus cycle.
+    press(&mut state, KeyCode::Tab);
+    assert_eq!(state.focus, Focus::Sidebar);
+}
+
+/// An overlay left open and forgotten would sit on top of the messages
+/// arriving underneath, so an idle one folds itself away
+/// (`SELECTOR_DROPDOWN_IDLE_TIMEOUT`).
+///
+/// @requirement AC-020
+#[test]
+fn an_idle_dropdown_closes_itself_after_the_timeout() {
+    use std::time::{Duration, Instant};
+    let mut state = joined_public(&["general", "random", "lobby"]);
+    press(&mut state, KeyCode::Char('['));
+    let now = Instant::now();
+
+    state.tick_selector_dropdown(now);
+    assert!(state.selector_dropdown_open, "still fresh");
+    state.tick_selector_dropdown(now + Duration::from_secs(29));
+    assert!(state.selector_dropdown_open, "just under the timeout");
+    state.tick_selector_dropdown(now + SELECTOR_DROPDOWN_IDLE_TIMEOUT);
+    assert!(!state.selector_dropdown_open, "closed at the timeout");
+    assert_eq!(
+        state.selected_channel, 0,
+        "timing out keeps whatever was selected, like every other close"
+    );
+
+    // Driving the list is what "not idle" means: each Up/Down restarts it.
+    press(&mut state, KeyCode::Char('['));
+    press(&mut state, KeyCode::Down);
+    state.tick_selector_dropdown(Instant::now() + Duration::from_secs(29));
+    assert!(state.selector_dropdown_open, "the step restarted the clock");
 }

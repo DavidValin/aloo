@@ -218,7 +218,7 @@ the payload carried inside a reliable or unreliable one.
 | `CallAccept` | reliably | Joins a call, or replies to a newly-discovered participant - the mesh's only signal (§7.7) |
 | `CallReject` | reliably | Declines an invite, sent only to whoever sent it (§7.7) |
 | `CallEnd` | reliably | Leaves a call still in progress (§7.7); from the host, ends it for everyone |
-| `CallMute` | reliably | The host silences (or restores) one participant (§7.7) |
+| `CallMute` | reliably | Someone's microphone went off or back on: the host silencing (or restoring) one participant, or a participant reporting its own mute (§7.7) |
 | `CallRoster` | reliably | Hands a late-joining participant the sender's own roster (§7.7) |
 
 **Server UDP socket** — stateless, no user data.
@@ -1644,21 +1644,27 @@ call's is fully random; a voice message's is a small per-connection
 counter) and so cannot collide in practice, but nothing on the wire tags a
 chunk with which kind of stream it belongs to.
 
-**Muting oneself is purely local - there is no wire message for it.** A
-muted participant simply stops sending chunks to everyone for as long as
-it's muted; every recipient's mixer hears silence from that source in the
+**Muting oneself stops the audio locally, and is announced.** A muted
+participant simply stops sending chunks to everyone for as long as it's
+muted; every recipient's mixer hears silence from that source in the
 meantime because nothing is pushed to it, the same as a moment of natural
-silence during an ordinary recording. No participant is ever told another
-one has muted itself.
+silence during an ordinary recording. On top of that it sends
+`CallMute { call_id, target: <itself>, muted }` to every participant it
+knows about, so every roster can say who can currently be heard. That
+message carries no authority: it is a statement about the sender's own
+microphone, which stays the sender's alone to lift.
 
-**A host mute is not local.** `CallMute { call_id, target, muted }` is the
-host's decision about someone else, and is sent to every participant the
-host currently knows about, `target` included. `target` stops sending
-audio until the host sends the matching `muted: false`; its own local mute
-toggle neither lifts nor deepens that. Every other participant applies it
-to its own view of the roster, so a muted participant reads the same to
-everyone. A `CallMute` from anyone other than the host of the call the
-receiver is on is ignored. A participant who joins after a mute was
+**A host mute is not local either.** `CallMute { call_id, target, muted }`
+with a `target` other than the sender is the host's decision about someone
+else, and is sent to every participant the host currently knows about,
+`target` included. `target` stops sending audio until the host sends the
+matching `muted: false`; its own mute toggle neither lifts nor deepens
+that. Every other participant applies it to its own view of the roster, so
+a muted participant reads the same to everyone. **Who may send which:**
+`target == from` is accepted from anyone, and only ever moves a roster row
+- it can never gate the receiver's own capture, whoever it names;
+`target != from` is accepted only from the host of the call the receiver
+is on, and ignored from anyone else. A participant who joins after a mute was
 issued is brought up to date by the host repeating the outstanding
 `CallMute`s to them alongside the `CallAccept` that admits them.
 

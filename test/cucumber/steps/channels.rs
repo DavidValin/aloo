@@ -5,11 +5,12 @@ use std::net::{IpAddr, Ipv4Addr};
 
 use cucumber::{given, then, when};
 
-use aloo::proto::{ChannelJoinRejection, ChannelKind, UserId};
+use aloo::proto::{ChannelInfo, ChannelJoinRejection, ChannelKind, UserId};
 use aloo::server::CHANNEL_MAX_PASSWORD_ATTEMPTS;
-use aloo::client::tui::ui::{Mode, UiAction};
+use aloo::client::tui::ui::{MessageBody, Mode, SelectorFocus, UiAction};
 
 use crate::steps::ui_common::id_for;
+use crate::support::{header_row, ui_rows_wide};
 use crate::world::AlooWorld;
 
 const TEST_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
@@ -108,11 +109,11 @@ async fn channels_modal_shows_not_mine(w: &mut AlooWorld, name: String) {
     );
 }
 
-#[then(expr = "the channel {string} has no tab")]
-async fn channel_has_no_tab(w: &mut AlooWorld, name: String) {
+#[then(expr = "the channel {string} is not on the channel selector")]
+async fn channel_not_on_selector(w: &mut AlooWorld, name: String) {
     assert!(
         !w.ui_ref().channels.iter().any(|c| c.name == name),
-        "a tab is a channel you have joined - {name:?} should have none"
+        "the channel selector holds exactly the channels you have joined - {name:?} is not one"
     );
 }
 
@@ -196,7 +197,115 @@ async fn no_private_room(w: &mut AlooWorld) {
     assert_eq!(
         w.ui_ref().active_private_room,
         None,
-        "switching tabs should close any private room"
+        "focusing the channel selector should close any private room"
+    );
+}
+
+#[when(expr = "the server confirms I joined {string}")]
+async fn server_confirms_join(w: &mut AlooWorld, channel: String) {
+    w.ui_mut().on_joined(ChannelInfo {
+        name: channel,
+        kind: ChannelKind::Public,
+    });
+}
+
+#[then(expr = "the private room with {word} is open")]
+async fn private_room_is_open(w: &mut AlooWorld, name: String) {
+    assert_eq!(
+        w.ui_ref().active_private_room,
+        Some(UserId(id_for(&name))),
+        "expected {name}'s room to be the view"
+    );
+}
+
+// ---------------------------------------------------------------------
+// The top row's two selectors (US-004)
+// ---------------------------------------------------------------------
+
+#[then("the channel dropdown is open")]
+async fn channel_dropdown_open(w: &mut AlooWorld) {
+    let state = w.ui_ref();
+    assert!(state.selector_dropdown_open, "no dropdown is open");
+    assert_eq!(
+        state.selector_focus,
+        SelectorFocus::Channels,
+        "the open dropdown should be the channel selector's"
+    );
+}
+
+#[then("the DM dropdown is open")]
+async fn dm_dropdown_open(w: &mut AlooWorld) {
+    let state = w.ui_ref();
+    assert!(state.selector_dropdown_open, "no dropdown is open");
+    assert_eq!(
+        state.selector_focus,
+        SelectorFocus::Dms,
+        "the open dropdown should be the DM selector's"
+    );
+}
+
+#[then("no dropdown is open")]
+async fn no_dropdown_open(w: &mut AlooWorld) {
+    assert!(
+        !w.ui_ref().selector_dropdown_open,
+        "a selector dropdown is still open over the view"
+    );
+}
+
+#[then(expr = "the top row shows {string}")]
+async fn top_row_shows(w: &mut AlooWorld, text: String) {
+    let rows = ui_rows_wide(w.ui_ref());
+    assert!(
+        header_row(&rows).contains(&text),
+        "expected {text:?} in the top row: {:?}",
+        header_row(&rows)
+    );
+}
+
+#[then(expr = "the top row does not show {string}")]
+async fn top_row_does_not_show(w: &mut AlooWorld, text: String) {
+    let rows = ui_rows_wide(w.ui_ref());
+    assert!(
+        !header_row(&rows).contains(&text),
+        "did not expect {text:?} in the top row: {:?}",
+        header_row(&rows)
+    );
+}
+
+/// Blinking is one frame on, one frame off - what makes it a blink rather
+/// than a steady marker (`docs/SPEC.md` "Connected UI").
+#[then("the top row's envelope blinks")]
+async fn top_row_envelope_blinks(w: &mut AlooWorld) {
+    w.ui_mut().blink_on = true;
+    assert!(
+        header_row(&ui_rows_wide(w.ui_ref())).contains('\u{2709}'),
+        "expected the envelope on the blink-on frame"
+    );
+    w.ui_mut().blink_on = false;
+    assert!(
+        !header_row(&ui_rows_wide(w.ui_ref())).contains('\u{2709}'),
+        "and gone again on the blink-off frame"
+    );
+}
+
+#[then("the top row shows no envelope")]
+async fn top_row_no_envelope(w: &mut AlooWorld) {
+    for blink in [true, false] {
+        w.ui_mut().blink_on = blink;
+        assert!(
+            !header_row(&ui_rows_wide(w.ui_ref())).contains('\u{2709}'),
+            "expected no envelope at all (blink_on={blink})"
+        );
+    }
+}
+
+#[when(expr = "a message arrives in the channel {string}")]
+async fn message_arrives_in(w: &mut AlooWorld, channel: String) {
+    w.ui_mut().on_channel_message(
+        &channel,
+        UserId(id_for("bob")),
+        "bob".into(),
+        MessageBody::Text("over here".into()),
     );
 }
 

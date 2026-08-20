@@ -1,5 +1,5 @@
-//! Private-room (DM) state and rendering: the `PrivateRoom` log model and
-//! the full-screen private-room view. Shared/mixed UI plumbing (`UiState`
+//! Private-room (DM) state and rendering: the `PrivateRoom` log model, the
+//! rooms the top row's DM selector names, and the private-room view. Shared/mixed UI plumbing (`UiState`
 //! itself, `Focus`, `Mode`, message-log rendering, the input bar, ...)
 //! stays in `crate::client::tui::ui`; channel-tab state/rendering is the mirror
 //! image in `crate::client::tui::channel`.
@@ -21,6 +21,10 @@ use super::ui::{
 pub struct PrivateRoom {
     pub peer: UserInfo,
     pub log: Vec<LogEntry>,
+    /// Whether something has landed here since this room was last on
+    /// screen - what makes the DM selector's envelope blink, and the
+    /// sidebar's next to the peer (`docs/SPEC.md` "Connected UI").
+    /// Cleared the moment the room is selected again (`select_dm`).
     pub unread: bool,
 }
 
@@ -45,22 +49,68 @@ impl UiState {
             .unwrap_or(false)
     }
 
+    /// The one way a `PrivateRoom` is ever created - every caller that
+    /// needs a room to write into goes through here, which is what keeps
+    /// `dm_order` (the DM selector's stable order) in step with
+    /// `private_rooms`. `fallback` is only used if the room is new; an
+    /// existing one keeps whatever `peer` it already had. Deliberately
+    /// returns nothing: callers pair it with their own
+    /// `private_rooms.get_mut(..)` so they can still borrow
+    /// `message_selected` alongside the room (disjoint fields).
+    pub(crate) fn ensure_private_room(&mut self, peer: UserId, fallback: UserInfo) {
+        if self.private_rooms.contains_key(&peer) {
+            return;
+        }
+        self.private_rooms.insert(
+            peer,
+            PrivateRoom {
+                peer: fallback,
+                log: Vec::new(),
+                unread: false,
+            },
+        );
+        self.dm_order.push(peer);
+        // The DM selector appears with the very first room and names it
+        // from then on. A later room only becomes the named one when the
+        // user actually goes to it - an incoming message never yanks the
+        // selector off whatever it was showing; it raises that room's
+        // envelope instead.
+        if self.selected_dm.is_none() {
+            self.selected_dm = Some(peer);
+        }
+    }
+
+    /// Makes `peer`'s room the one the DM selector names and the view on
+    /// screen, marking it read - the DM half of `select_channel_at`.
+    /// Starts scrolled to the newest message, like opening any chat app,
+    /// rather than wherever the last visit left off.
+    pub(crate) fn select_dm(&mut self, peer: UserId) {
+        self.selected_dm = Some(peer);
+        self.active_private_room = Some(peer);
+        self.focus = Focus::Input;
+        let log_len = match self.private_rooms.get_mut(&peer) {
+            Some(room) => {
+                room.unread = false;
+                room.log.len()
+            }
+            None => 0,
+        };
+        self.message_selected = log_len.saturating_sub(1);
+    }
+
+    /// Enter on a sidebar user: opens (creating if needed) their room and
+    /// moves the top row's focus onto the DM selector, which names it from
+    /// then on - `[` goes back to the channel selector, and the room stays
+    /// on the DM one either way.
     pub(crate) fn open_private_room(&mut self, peer: UserInfo) {
         let id = peer.id;
         self.known_users.insert(id, peer.clone());
-        let room = self.private_rooms.entry(id).or_insert_with(|| PrivateRoom {
-            peer: peer.clone(),
-            log: Vec::new(),
-            unread: false,
-        });
-        room.peer = peer;
-        room.unread = false;
-        let log_len = room.log.len();
-        self.active_private_room = Some(id);
-        // Start scrolled to the newest message, like opening any chat app -
-        // not stuck at the oldest one.
-        self.message_selected = log_len.saturating_sub(1);
-        self.focus = Focus::Input;
+        self.ensure_private_room(id, peer.clone());
+        if let Some(room) = self.private_rooms.get_mut(&id) {
+            room.peer = peer;
+        }
+        self.selected_dm = Some(id);
+        self.focus_dm_selector();
     }
 
     /// Whether the private room with `peer` is the one currently open.
@@ -98,14 +148,10 @@ impl UiState {
                 public_key_der: Vec::new(),
                 key_mode: KeyMode::None,
             });
-        let room = self
-            .private_rooms
-            .entry(from)
-            .or_insert_with(|| PrivateRoom {
-                peer: fallback_peer,
-                log: Vec::new(),
-                unread: false,
-            });
+        self.ensure_private_room(from, fallback_peer);
+        let Some(room) = self.private_rooms.get_mut(&from) else {
+            return;
+        };
         push_log_entry(&mut room.log, &mut self.message_selected, is_current, entry);
         if unread {
             room.unread = true;
@@ -185,14 +231,10 @@ impl UiState {
                 public_key_der: Vec::new(),
                 key_mode: KeyMode::None,
             });
-        let room = self
-            .private_rooms
-            .entry(peer_id)
-            .or_insert_with(|| PrivateRoom {
-                peer: fallback_peer,
-                log: Vec::new(),
-                unread: false,
-            });
+        self.ensure_private_room(peer_id, fallback_peer);
+        let Some(room) = self.private_rooms.get_mut(&peer_id) else {
+            return;
+        };
         push_log_entry(&mut room.log, &mut self.message_selected, is_current, entry);
         if unread {
             room.unread = true;
@@ -242,14 +284,10 @@ impl UiState {
                 public_key_der: Vec::new(),
                 key_mode: KeyMode::None,
             });
-        let room = self
-            .private_rooms
-            .entry(peer)
-            .or_insert_with(|| PrivateRoom {
-                peer: fallback_peer,
-                log: Vec::new(),
-                unread: false,
-            });
+        self.ensure_private_room(peer, fallback_peer);
+        let Some(room) = self.private_rooms.get_mut(&peer) else {
+            return;
+        };
         push_log_entry(
             &mut room.log,
             &mut self.message_selected,
@@ -368,14 +406,10 @@ impl UiState {
                 public_key_der: Vec::new(),
                 key_mode: KeyMode::None,
             });
-        let room = self
-            .private_rooms
-            .entry(from)
-            .or_insert_with(|| PrivateRoom {
-                peer: fallback_peer,
-                log: Vec::new(),
-                unread: false,
-            });
+        self.ensure_private_room(from, fallback_peer);
+        let Some(room) = self.private_rooms.get_mut(&from) else {
+            return;
+        };
         push_log_entry(
             &mut room.log,
             &mut self.message_selected,
@@ -404,9 +438,16 @@ impl UiState {
 // Rendering
 // ---------------------------------------------------------------------
 
+/// A room is reached through the top row's DM selector, so the row itself
+/// is drawn here exactly as the channel view draws it
+/// (`channel::render_header_row`) - the user can see where they are, and
+/// `[` takes them back to the channel selector. There is no sidebar: the
+/// conversation has exactly one other person in it.
 pub(crate) fn render_private_room(frame: &mut Frame, area: Rect, state: &UiState, peer_id: UserId) {
     let show_otp_header = state.is_otp_active(peer_id);
-    let mut constraints = Vec::with_capacity(3);
+    let mut constraints = vec![Constraint::Length(
+        crate::client::tui::channel::HEADER_ROW_HEIGHT,
+    )];
     if show_otp_header {
         constraints.push(Constraint::Length(1));
     }
@@ -417,7 +458,8 @@ pub(crate) fn render_private_room(frame: &mut Frame, area: Rect, state: &UiState
         .constraints(constraints)
         .split(area);
 
-    let mut idx = 0;
+    super::channel::render_header_row(frame, rows[0], state);
+    let mut idx = 1;
     if show_otp_header {
         render_otp_header(frame, rows[idx], state, peer_id);
         idx += 1;

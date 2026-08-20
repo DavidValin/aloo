@@ -48,15 +48,21 @@ Feature: Live voice calls
     Then no call indicator is shown
 
   @AC-170
-  Scenario: /mute only works while on a call
+  Scenario: m on my own row mutes my microphone
     Given I am connected and viewing a channel
-    When I type "/mute"
-    And I press Enter
-    Then a call status notice says "not on a call"
-    When I join a call in the channel
-    And I type "/mute"
-    And I press Enter
+    When I open a call in the channel
+    And I press the m key
     Then muting is requested
+
+  @AC-188
+  Scenario: Accepting an invite to a call that has already ended joins nothing
+    Given I am connected and viewing a channel
+    And bob is calling me in the channel
+    When that call ends before I answer
+    And I press Enter
+    Then no call invite is accepted
+    And a call status notice says "that call has already ended"
+    And no call invite popup is open
 
   @AC-171
   Scenario: /call refuses a second call, and /endcall only works on one
@@ -80,7 +86,7 @@ Feature: Live voice calls
     When bob hosts a call I am on
     And carol is invited to the call
     Then the call modal is shown
-    And the call modal lists bob as HOST
+    And the call modal names bob as the host
     And the call modal lists carol as INVITED
     When carol declines the call
     Then the call modal lists carol as REJECTED
@@ -96,14 +102,14 @@ Feature: Live voice calls
     Then the call modal shows the duration "01:05"
 
   @AC-177
-  Scenario: Escape folds the call modal into its own tab, and it can be reopened
+  Scenario: Escape folds the call modal into the top row, and Ctrl+R reopens it
     Given I am connected and viewing a channel
     When I open a call in the channel
     Then the call modal is shown
     When I press Escape
     Then the call modal is not shown
-    And a call tab is shown
-    When I press the [ key
+    And the call indicator is shown in the top row
+    When I press Ctrl+R
     Then the call modal is shown
 
   @AC-178

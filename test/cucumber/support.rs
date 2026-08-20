@@ -11,6 +11,7 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 
+use aloo::client::tui::channel::HEADER_ROW_HEIGHT;
 use aloo::client::tui::ui::UiState;
 use aloo::client::tui::ui_connect_popup::ConnectPopupState;
 
@@ -62,10 +63,47 @@ pub fn appears_before(rows: &[String], before: &str, after: &str) -> bool {
     })
 }
 
-pub fn row_containing<'a>(rows: &'a [String], needle: &str) -> &'a String {
+/// The rendered row the header's text sits on: the header block is
+/// `HEADER_ROW_HEIGHT` rows tall with one blank line above and below it
+/// (`docs/SPEC.md` "Connected UI"), so nothing there is on row 0.
+pub const HEADER_TEXT_ROW: usize = 1;
+
+/// The first rendered row below the whole header block - where the
+/// sidebar, the message log and every dropdown start.
+pub const FIRST_ROW_BELOW_HEADER: usize = HEADER_ROW_HEIGHT as usize;
+
+/// The header's text row, carrying both selectors and the status figures.
+pub fn header_row(rows: &[String]) -> &String {
+    &rows[HEADER_TEXT_ROW]
+}
+
+/// The first row *below the header block* containing `needle`: the header
+/// names the selected DM (a speech balloon and the peer's nickname) as
+/// well as the selected channel, so a sidebar assertion about the same
+/// person would otherwise match the selector rather than the roster entry.
+pub fn sidebar_row_containing<'a>(rows: &'a [String], needle: &str) -> &'a String {
     rows.iter()
+        .skip(FIRST_ROW_BELOW_HEADER)
         .find(|r| r.contains(needle))
-        .unwrap_or_else(|| panic!("no rendered row contains {needle:?}: {rows:?}"))
+        .unwrap_or_else(|| panic!("no row below the header contains {needle:?}: {rows:?}"))
+}
+
+/// `find_text_start`, from row `min_y` down - the same reason
+/// `sidebar_row_containing` exists, for the colour assertions.
+pub fn find_text_start_below(buffer: &Buffer, text: &str, min_y: u16) -> (u16, u16) {
+    let want: Vec<String> = text.chars().map(|c| c.to_string()).collect();
+    for y in min_y..buffer.area.height {
+        for x in 0..buffer.area.width {
+            let matches = want.iter().enumerate().all(|(i, ch)| {
+                let xi = x + i as u16;
+                xi < buffer.area.width && buffer[(xi, y)].symbol() == ch
+            });
+            if matches {
+                return (x, y);
+            }
+        }
+    }
+    panic!("text {text:?} not found at or below row {min_y}");
 }
 
 /// Top-left cell of the first occurrence of `text`, scanned cell-by-cell

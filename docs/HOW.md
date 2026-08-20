@@ -4,7 +4,7 @@ Rules:
   * Every change needs to consider existing tested functionality
   * New functionality need to contain tests according to the conventions
   * All tests should pass after the change
-  * Documentation files need to be concise and in sync with the current implementation
+  * Documentation files need to be concise and in sync with the current implementation (do not reference old implementations)
   * Do not change git branch, commit or push
 
 Important files:

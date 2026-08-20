@@ -14,14 +14,14 @@ Feature: The public channel directory
     Given a server offering "the-hall" and "random"
     When the client applies the connect-time channel list
     Then joining "the-hall" is requested
-    And the channel "random" has no tab
+    And the channel "random" is not on the channel selector
 
   @TB-206
-  Scenario: A public channel I have not joined is listed but has no tab
+  Scenario: A public channel I have not joined is listed but not on the selector
     Given I am connected and viewing a channel
     And the server has announced the public channel "random"
     Then the channels modal lists "random"
-    And the channel "random" has no tab
+    And the channel "random" is not on the channel selector
 
   @AC-172
   Scenario: /channels lists every public channel, mine marked as mine

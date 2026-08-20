@@ -590,6 +590,7 @@ pub(crate) async fn run_connected_session(
                     handle_ui_action(action, &mut wr, &mut ui_state, &mut session).await?;
                 }
                 ui_state.tick_status_notice(Instant::now());
+                ui_state.tick_selector_dropdown(Instant::now());
                 let cutoff = Instant::now() - STREAM_IDLE_TIMEOUT;
                 for stream in session.active_streams.values().filter(|s| s.last_seen < cutoff) {
                     let _ = stream.job_tx.send(voice_stream::DecryptJob::End);
@@ -882,7 +883,7 @@ async fn handle_ui_action(
             voice_call::reject_invite(wr, session, ui_state, call_id).await?;
         }
         UiAction::ToggleCallMute => {
-            voice_call::toggle_mute(session, ui_state);
+            voice_call::toggle_mute(wr, session, ui_state).await?;
         }
         UiAction::EndCall => {
             voice_call::end_own_call(wr, session, ui_state).await?;

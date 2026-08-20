@@ -279,12 +279,14 @@ pub enum P2pPayload {
     CallEnd {
         call_id: u64,
     },
-    /// The host's mute decision for one participant of call `call_id`,
-    /// broadcast to every participant the host currently knows about
-    /// (including `target` itself). Unlike a participant's own local mute
-    /// (which has no wire message at all - see 7.7), a host mute is
-    /// authoritative: `target` stops sending audio until the *host* lifts
-    /// it, and every other participant shows it on their roster.
+    /// One participant of call `call_id` can no longer be heard, or can
+    /// again - broadcast to every participant the sender knows about
+    /// (`target` included). Who may send which is what separates the two
+    /// kinds (docs/PROTOCOL.md 7.7): `target == from` is anyone reporting
+    /// their *own* microphone, carries no authority and only ever moves a
+    /// roster row; `target != from` is the host's decision about someone
+    /// else, honoured only from that call's actual host, and `target`
+    /// stops sending audio until the *host* lifts it.
     CallMute {
         call_id: u64,
         target: UserId,
