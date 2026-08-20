@@ -317,10 +317,18 @@ pub(crate) async fn handle_start_call(
         ui_state.push_status_notice("can't call this recipient right now".to_string(), false);
         return Ok(());
     }
+    let Some(host) = ui_state.own_id else {
+        return Ok(());
+    };
     let call_id = voice_call::new_call_id();
-    if !voice_call::begin_own_call(session, ui_state, call_id, None) {
+    if !voice_call::begin_own_call(session, ui_state, call_id, None, host) {
         return Ok(());
     }
+    let name = ui_state
+        .known_users
+        .get(&to)
+        .map(|u| u.name.clone())
+        .unwrap_or_default();
     session.peer_link.ensure_link(wr, to).await;
     session.peer_link.send_reliable_or_queue(
         to,
@@ -329,6 +337,7 @@ pub(crate) async fn handle_start_call(
             channel: None,
         },
     );
+    ui_state.on_call_invite_sent(to, name);
     Ok(())
 }
 

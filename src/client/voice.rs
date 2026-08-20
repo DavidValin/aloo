@@ -134,6 +134,28 @@ pub fn pcm_from_bytes(bytes: &[u8]) -> Vec<i16> {
         .collect()
 }
 
+/// The loudness of one captured/decoded chunk as a 0-100 meter reading -
+/// what the live call modal draws next to each participant
+/// (`crate::client::tui::ui::CallMember::level`). Root-mean-square rather
+/// than peak amplitude, so one stray sample can't paint a full bar, and
+/// scaled against `LEVEL_FULL_SCALE_RMS` rather than `i16::MAX`: ordinary
+/// speech sits an order of magnitude below full scale, and a meter that
+/// never left its first tenth would show nothing useful.
+pub fn level_from_pcm(samples: &[i16]) -> u8 {
+    if samples.is_empty() {
+        return 0;
+    }
+    let sum_sq: f64 = samples.iter().map(|s| (*s as f64) * (*s as f64)).sum();
+    let rms = (sum_sq / samples.len() as f64).sqrt();
+    ((rms / LEVEL_FULL_SCALE_RMS) * 100.0).round().clamp(0.0, 100.0) as u8
+}
+
+/// The RMS amplitude `level_from_pcm` treats as a full meter. Chosen from
+/// what this app's own 16kHz mono capture actually produces: normal speech
+/// lands around 2000-4000 RMS, so this puts a comfortable talking voice
+/// near two thirds of the bar and leaves headroom above it.
+const LEVEL_FULL_SCALE_RMS: f64 = 6000.0;
+
 /// Linearly resamples mono `samples` from `from_rate` to `to_rate`. Used
 /// both to normalize whatever rate the input device actually captures at
 /// to `SAMPLE_RATE_HZ` (see `Recorder::take_pending`) and so playback can

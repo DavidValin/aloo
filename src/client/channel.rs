@@ -312,11 +312,29 @@ pub(crate) async fn handle_start_call(
     channel: String,
 ) -> proto::Result<()> {
     let recipients = voice_call::addressable_channel_members(session, ui_state, &channel);
+    // Recounted here, not trusted from the `/call` confirmation popup:
+    // membership can shift while that popup is up, and a call with nobody
+    // to ring is never started at all (`docs/SPEC.md` "Live voice calls").
+    if recipients.is_empty() {
+        ui_state.push_status_notice(
+            crate::client::tui::ui::NO_ONE_INVITED_NOTICE.to_string(),
+            false,
+        );
+        return Ok(());
+    }
+    let Some(host) = ui_state.own_id else {
+        return Ok(());
+    };
     let call_id = voice_call::new_call_id();
-    if !voice_call::begin_own_call(session, ui_state, call_id, Some(channel.clone())) {
+    if !voice_call::begin_own_call(session, ui_state, call_id, Some(channel.clone()), host) {
         return Ok(());
     }
     for (id, ..) in recipients {
+        let name = ui_state
+            .known_users
+            .get(&id)
+            .map(|u| u.name.clone())
+            .unwrap_or_default();
         session.peer_link.ensure_link(wr, id).await;
         session.peer_link.send_reliable_or_queue(
             id,
@@ -325,6 +343,7 @@ pub(crate) async fn handle_start_call(
                 channel: Some(channel.clone()),
             },
         );
+        ui_state.on_call_invite_sent(id, name);
     }
     Ok(())
 }

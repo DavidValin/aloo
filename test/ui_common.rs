@@ -119,6 +119,21 @@ pub fn make_temp_file_tree() -> std::path::PathBuf {
     root
 }
 
+/// Puts `state` on a call we host, with the call modal already folded
+/// away into its tab (`Esc`) - what most call tests want, since an open
+/// modal deliberately absorbs every key (including anything typed into
+/// the compose bar). Tests that are *about* the modal call `begin_call`
+/// themselves instead.
+pub fn on_call_minimized(state: &mut UiState, call_id: u64, channel: Option<String>) {
+    let host = state.own_id.expect("own id must be set before a call starts");
+    state.begin_call(call_id, channel, host);
+    state
+        .call
+        .as_mut()
+        .expect("begin_call just set it")
+        .minimized = true;
+}
+
 pub fn rendered_rows(state: &UiState) -> Vec<String> {
     let backend = TestBackend::new(100, 30);
     let mut terminal = Terminal::new(backend).unwrap();

@@ -23,9 +23,22 @@
 //!    straight back to them alone (`on_call_accept`) - a "welcome" that
 //!    reaches whoever became active too late to see our own broadcast.
 //!
-//! The initiator needs no special-casing: they never explicitly send a
-//! `CallAccept` of their own, and are added to (and add) everyone else
-//! purely through rule 2, exactly like any other participant.
+//! 3. On adding someone, send them our own roster (`CallRoster`), which
+//!    they answer with a `CallAccept` each - the only way a participant
+//!    invited *mid-call* (`invite_to_call`, from the call modal) can
+//!    reach people it could never have derived from the call's channel
+//!    membership. A pure discovery aid: rules 1 and 2 still do the work.
+//!
+//! For audio and roster purposes the initiator needs no special-casing:
+//! they never explicitly send a `CallAccept` of their own, and are added
+//! to (and add) everyone else purely through rule 2, exactly like any
+//! other participant. They are, however, the call's **host**
+//! (`ActiveCall::host`), and three decisions are theirs alone: muting a
+//! participant (`host_set_muted`/`on_call_mute`), inviting one more
+//! person (`invite_to_call`), and ending the call for everyone by leaving
+//! it (`on_call_end`'s host branch). Each is honoured only from the host
+//! of the call we are actually on - that check is the whole of the host's
+//! authority, since there is no server to enforce anything.
 
 use std::collections::HashMap;
 use std::sync::mpsc::RecvTimeoutError;
@@ -48,7 +61,49 @@ pub(crate) enum CallRecorderCmd {
     AddRecipient(UserId, Box<DirectStreamKey>),
     RemoveRecipient(UserId),
     SetMuted(bool),
+    /// The host's mute (`P2pPayload::CallMute`), tracked separately from
+    /// `SetMuted` so lifting one never lifts the other - a participant the
+    /// host muted stays silent through their own `/mute` toggling.
+    SetHostMuted(bool),
     Stop,
+}
+
+/// Key setups that arrived for a call participant we had not yet added to
+/// our roster, held until we do (`forward_key_setup`/`add_participant`).
+///
+/// This is not an edge case but the *ordinary* order of events for a
+/// `pq_hybrid` peer: `add_participant` sends its one `StreamKeySetup` the
+/// instant it adds us, and the `CallAccept` that lets *us* add *them* is
+/// still in flight at that moment. Dropping the setup - which is what
+/// happened before this existed - left that peer permanently
+/// undecryptable while our own audio reached them fine, i.e. a call
+/// audible in one direction only.
+///
+/// At most one setup per peer: a stream has exactly one, and a second
+/// arrival can only be a fresher attempt, so it replaces rather than
+/// queues.
+#[derive(Debug, Default)]
+pub struct PendingCallSetups(HashMap<UserId, Vec<u8>>);
+
+impl PendingCallSetups {
+    /// Holds `from`'s setup until they join our roster.
+    pub fn hold(&mut self, from: UserId, setup: Vec<u8>) {
+        self.0.insert(from, setup);
+    }
+
+    /// Takes whatever was held for `from`, if anything - delivering it is
+    /// the caller's job, and it is never delivered twice.
+    pub fn take(&mut self, from: UserId) -> Option<Vec<u8>> {
+        self.0.remove(&from)
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
 /// One participant's incoming-audio bookkeeping.
@@ -65,10 +120,20 @@ pub(crate) struct ActiveCallPeer {
 /// (`is_busy`), the same one-line-at-a-time simplification a phone makes.
 pub(crate) struct ActiveCall {
     pub(crate) call_id: u64,
+    /// Who started this call - the only participant allowed to mute
+    /// others, invite more people, or end it for everyone. Ourselves for a
+    /// call we started, whoever sent the `CallInvite` for one we accepted.
+    pub(crate) host: UserId,
     /// Participants we are actively exchanging audio with - never includes
     /// ourselves.
     participants: HashMap<UserId, ActiveCallPeer>,
+    /// Setups from participants we have not added yet - see
+    /// `PendingCallSetups`.
+    pending_setups: PendingCallSetups,
     muted: bool,
+    /// Silenced by the host (`P2pPayload::CallMute`) - unlike `muted`,
+    /// only the host can lift it, and every participant is told.
+    host_muted: bool,
     /// Commands for the capture thread (`spawn_call_audio_worker`).
     cmd_tx: std::sync::mpsc::Sender<CallRecorderCmd>,
 }
@@ -127,6 +192,7 @@ pub(crate) fn begin_own_call(
     ui_state: &mut UiState,
     call_id: u64,
     channel: Option<String>,
+    host: UserId,
 ) -> bool {
     if is_busy(session) {
         return false;
@@ -143,14 +209,24 @@ pub(crate) fn begin_own_call(
         }
     };
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
-    spawn_call_audio_worker(recorder, call_id, cmd_rx, session.record_out_tx.clone());
+    spawn_call_audio_worker(
+        recorder,
+        call_id,
+        cmd_rx,
+        session.record_out_tx.clone(),
+        ui_state.own_id,
+        session.call_level_tx.clone(),
+    );
     session.active_call = Some(ActiveCall {
         call_id,
+        host,
         participants: HashMap::new(),
+        pending_setups: PendingCallSetups::default(),
         muted: false,
+        host_muted: false,
         cmd_tx,
     });
-    ui_state.begin_call(call_id, channel);
+    ui_state.begin_call(call_id, channel, host);
     true
 }
 
@@ -167,10 +243,17 @@ fn spawn_call_audio_worker(
     call_id: u64,
     cmd_rx: std::sync::mpsc::Receiver<CallRecorderCmd>,
     out_tx: tokio::sync::mpsc::UnboundedSender<P2pOutbound>,
+    // Ours, purely so our own captured level can be metered on the call
+    // modal's roster under the right row - `None` only in the moment
+    // before the server has told us who we are, which a call can't
+    // realistically reach.
+    own_id: Option<UserId>,
+    level_tx: tokio::sync::mpsc::UnboundedSender<(UserId, u8)>,
 ) {
     std::thread::spawn(move || {
         let mut recipients: HashMap<UserId, DirectStreamKey> = HashMap::new();
         let mut muted = false;
+        let mut host_muted = false;
         let mut seq: u32 = 0;
         'outer: loop {
             let mut pending_cmds = match cmd_rx.recv_timeout(voice::CHUNK_INTERVAL) {
@@ -190,12 +273,24 @@ fn spawn_call_audio_worker(
                         recipients.remove(&id);
                     }
                     CallRecorderCmd::SetMuted(m) => muted = m,
+                    CallRecorderCmd::SetHostMuted(m) => host_muted = m,
                     CallRecorderCmd::Stop => break 'outer,
                 }
             }
 
             let pending = recorder.take_pending();
-            if muted || pending.is_empty() || recipients.is_empty() {
+            // The meter reads what we are actually sending, so a muted
+            // microphone reads flat zero rather than freezing at whatever
+            // it happened to show when mute was pressed.
+            if let Some(own_id) = own_id {
+                let level = if muted || host_muted {
+                    0
+                } else {
+                    voice::level_from_pcm(&pending)
+                };
+                let _ = level_tx.send((own_id, level));
+            }
+            if muted || host_muted || pending.is_empty() || recipients.is_empty() {
                 continue;
             }
             let pcm = voice::pcm_to_bytes(&pending);
@@ -230,12 +325,19 @@ fn spawn_call_decrypt_worker(
     mixer_tx: tokio::sync::mpsc::UnboundedSender<voice::MixerCmd>,
     mixer_id: u64,
     call_id: u64,
+    // Whose audio this is, and where to report its level - the call
+    // modal's meter for this participant (`docs/SPEC.md` "Live voice
+    // calls") is read off the same plaintext that goes to the mixer,
+    // rather than estimated from ciphertext size.
+    peer: UserId,
+    level_tx: tokio::sync::mpsc::UnboundedSender<(UserId, u8)>,
 ) -> tokio::sync::mpsc::UnboundedSender<DecryptJob> {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DecryptJob>();
     std::thread::spawn(move || {
         let mut decryptor = ChunkDecryptor::new(key);
         let push = |pcm: Vec<u8>, mixer_tx: &tokio::sync::mpsc::UnboundedSender<voice::MixerCmd>| {
             let samples = voice::pcm_from_bytes(&pcm);
+            let _ = level_tx.send((peer, voice::level_from_pcm(&samples)));
             let _ = mixer_tx.send(voice::MixerCmd::Push {
                 id: mixer_id,
                 samples,
@@ -272,18 +374,39 @@ fn spawn_call_decrypt_worker(
 /// `SessionState::next_stream_id`'s small sequential counter - so the two
 /// can never collide in practice, and even if they did they're still keyed
 /// apart by `from`).
-pub(crate) fn is_call_stream(session: &SessionState, from: UserId, stream_id: u64) -> bool {
-    session.active_call.as_ref().is_some_and(|c| {
-        c.call_id == stream_id && c.participants.contains_key(&from)
-    })
+pub(crate) fn is_call_stream(session: &SessionState, _from: UserId, stream_id: u64) -> bool {
+    session
+        .active_call
+        .as_ref()
+        .is_some_and(|c| c.call_id == stream_id)
 }
 
-pub(crate) fn forward_key_setup(session: &SessionState, from: UserId, stream_id: u64, setup: Vec<u8>) {
-    if let Some(call) = session.active_call.as_ref()
-        && call.call_id == stream_id
-        && let Some(peer) = call.participants.get(&from)
-    {
-        let _ = peer.job_tx.send(DecryptJob::KeySetup(setup));
+/// A call participant's `pq_hybrid` key setup. Held for later
+/// (`ActiveCall::pending_setups`) rather than dropped when it arrives
+/// before we have added `from` to our roster - which is the *normal*
+/// order, not an edge case: the peer sends this the instant they add us,
+/// and their `CallAccept` (what lets us add them) is still in flight at
+/// that point. Dropping it left that peer permanently undecryptable while
+/// our own audio reached them fine - a call audible in one direction only.
+pub(crate) fn forward_key_setup(
+    session: &mut SessionState,
+    from: UserId,
+    stream_id: u64,
+    setup: Vec<u8>,
+) {
+    let Some(call) = session.active_call.as_mut() else {
+        return;
+    };
+    if call.call_id != stream_id {
+        return;
+    }
+    match call.participants.get(&from) {
+        Some(peer) => {
+            let _ = peer.job_tx.send(DecryptJob::KeySetup(setup));
+        }
+        None => {
+            call.pending_setups.hold(from, setup);
+        }
     }
 }
 
@@ -343,12 +466,25 @@ async fn add_participant(
     let mixer_id = session.next_mixer_id;
     session.next_mixer_id += 1;
     let incoming_key = voice_stream::resolve_incoming_key(session, peer, pubkey_der);
-    let job_tx = spawn_call_decrypt_worker(incoming_key, session.mixer_tx.clone(), mixer_id, call_id);
+    let job_tx = spawn_call_decrypt_worker(
+        incoming_key,
+        session.mixer_tx.clone(),
+        mixer_id,
+        call_id,
+        peer,
+        session.call_level_tx.clone(),
+    );
 
     let Some(call) = session.active_call.as_mut() else {
         return false;
     };
     let _ = call.cmd_tx.send(CallRecorderCmd::AddRecipient(peer, Box::new(key)));
+    // Anything this peer sent before we could add them - in practice their
+    // one `pq_hybrid` key setup - goes in first, ahead of any chunk the
+    // worker is about to be handed. See `forward_key_setup`.
+    if let Some(setup) = call.pending_setups.take(peer) {
+        let _ = job_tx.send(DecryptJob::KeySetup(setup));
+    }
     call.participants.insert(peer, ActiveCallPeer { job_tx, mixer_id });
     ui_state.on_call_participant_joined(peer, peer_name.to_string());
     true
@@ -442,6 +578,98 @@ pub(crate) async fn on_call_accept(
         session
             .peer_link
             .send_reliable_or_queue(from, P2pPayload::CallAccept { call_id });
+        // Rule 1's broadcast only reaches the call's channel/DM members -
+        // which is exactly who a mid-call invite (`invite_to_call`) is
+        // *not* guaranteed to be. Handing the newcomer our own roster
+        // closes that gap: they answer each name on it with an ordinary
+        // `CallAccept`, and the two rules above converge the rest.
+        let members: Vec<UserId> = session
+            .active_call
+            .as_ref()
+            .map(|c| c.participants.keys().copied().filter(|id| *id != from).collect())
+            .unwrap_or_default();
+        if !members.is_empty() {
+            session
+                .peer_link
+                .send_reliable_or_queue(from, P2pPayload::CallRoster { call_id, members });
+        }
+        // A muted participant stays muted for whoever joins after the
+        // fact - otherwise a newcomer's roster would show them speaking
+        // freely while everyone else's shows them silenced.
+        if session.active_call.as_ref().is_some_and(|c| c.host == you(ui_state)) {
+            for (peer, muted) in muted_members(ui_state) {
+                session.peer_link.send_reliable_or_queue(
+                    from,
+                    P2pPayload::CallMute {
+                        call_id,
+                        target: peer,
+                        muted,
+                    },
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Our own `UserId`, or a sentinel that matches nobody - `UiState::own_id`
+/// is `None` only before the server has identified us, which no call can
+/// reach.
+fn you(ui_state: &UiState) -> UserId {
+    ui_state.own_id.unwrap_or(UserId(u64::MAX))
+}
+
+/// Every participant the host currently has muted, for replaying to a
+/// participant who joined after the fact.
+fn muted_members(ui_state: &UiState) -> Vec<(UserId, bool)> {
+    ui_state
+        .call
+        .as_ref()
+        .map(|c| {
+            c.members
+                .iter()
+                .filter(|m| m.host_muted)
+                .map(|m| (m.id, true))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `P2pEvent::CallRoster` - someone who just added us handed over their
+/// own view of the roster. Answer each name with an ordinary `CallAccept`
+/// and let 7.7's convergence rules do the rest; anyone already in our own
+/// roster is skipped, since a redundant `CallAccept` would only cost a
+/// round trip to be no-opped on the far side.
+pub(crate) async fn on_call_roster(
+    wr: &mut impl ControlSink,
+    session: &mut SessionState,
+    ui_state: &UiState,
+    from: UserId,
+    call_id: u64,
+    members: Vec<UserId>,
+) -> proto::Result<()> {
+    let Some(call) = session.active_call.as_ref() else {
+        return Ok(());
+    };
+    if call.call_id != call_id {
+        return Ok(());
+    }
+    let unknown: Vec<UserId> = members
+        .into_iter()
+        .filter(|id| {
+            *id != from
+                && Some(*id) != ui_state.own_id
+                && !session
+                    .active_call
+                    .as_ref()
+                    .is_some_and(|c| c.participants.contains_key(id))
+        })
+        .collect();
+    for id in unknown {
+        session.peer_link.ensure_link(wr, id).await;
+        session
+            .peer_link
+            .send_reliable_or_queue(id, P2pPayload::CallAccept { call_id });
     }
     Ok(())
 }
@@ -457,6 +685,7 @@ pub(crate) fn on_call_reject(session: &SessionState, ui_state: &mut UiState, fro
     if !matches_ours {
         return;
     }
+    ui_state.on_call_invite_rejected(from);
     if let Some(name) = ui_state.known_users.get(&from).map(|u| u.name.clone()) {
         ui_state.push_status_notice(format!("{name} declined the call"), false);
     }
@@ -466,11 +695,19 @@ pub(crate) fn on_call_reject(session: &SessionState, ui_state: &mut UiState, fro
 /// so, unless this names some other call than the one we're actually on
 /// (a stale message from one we already left ourselves).
 pub(crate) fn on_call_end(session: &mut SessionState, ui_state: &mut UiState, from: UserId, call_id: u64) {
-    let matches_ours = session
-        .active_call
-        .as_ref()
-        .is_some_and(|c| c.call_id == call_id);
-    if !matches_ours {
+    let Some(call) = session.active_call.as_ref() else {
+        return;
+    };
+    if call.call_id != call_id {
+        return;
+    }
+    // The host hanging up ends the call for everyone (`docs/PROTOCOL.md`
+    // 7.7): they are the one participant whose departure isn't just one
+    // fewer voice. Nothing is sent on - the host already told every
+    // participant it knew of, and each of those tears itself down here.
+    if call.host == from {
+        teardown_own_call(session, ui_state);
+        ui_state.push_status_notice(ui::HOST_LEFT_NOTICE.to_string(), false);
         return;
     }
     let name = ui_state.known_users.get(&from).map(|u| u.name.clone());
@@ -478,6 +715,127 @@ pub(crate) fn on_call_end(session: &mut SessionState, ui_state: &mut UiState, fr
     if let Some(name) = name {
         ui_state.push_status_notice(format!("{name} left the call"), true);
     }
+}
+
+/// `P2pEvent::CallMute` - the host's mute decision. Honoured only from the
+/// actual host of the call we are on: any other participant claiming to
+/// mute someone is ignored outright, which is what makes "only the host
+/// can lift it" hold on the wire and not just in the UI. Applied to every
+/// roster, and - when it names us - to our own capture thread.
+pub(crate) fn on_call_mute(
+    session: &mut SessionState,
+    ui_state: &mut UiState,
+    from: UserId,
+    call_id: u64,
+    target: UserId,
+    muted: bool,
+) {
+    let Some(call) = session.active_call.as_mut() else {
+        return;
+    };
+    if call.call_id != call_id || call.host != from {
+        return;
+    }
+    if Some(target) == ui_state.own_id {
+        call.host_muted = muted;
+        let _ = call.cmd_tx.send(CallRecorderCmd::SetHostMuted(muted));
+        ui_state.push_status_notice(
+            if muted {
+                "the host muted you".to_string()
+            } else {
+                "the host unmuted you".to_string()
+            },
+            !muted,
+        );
+    }
+    ui_state.set_call_member_host_muted(target, muted);
+}
+
+/// The `HostMuteCallMember` UI action (`m` on the call modal's roster):
+/// refused unless we really are the host, then told to every participant
+/// we know of - including `peer` itself, whose capture thread is what
+/// actually goes silent (`on_call_mute`).
+pub(crate) async fn host_set_muted(
+    wr: &mut impl ControlSink,
+    session: &mut SessionState,
+    ui_state: &mut UiState,
+    peer: UserId,
+    muted: bool,
+) -> proto::Result<()> {
+    let Some(call) = session.active_call.as_ref() else {
+        return Ok(());
+    };
+    if Some(call.host) != ui_state.own_id {
+        return Ok(());
+    }
+    let call_id = call.call_id;
+    let audience: Vec<UserId> = call.participants.keys().copied().collect();
+    for id in audience {
+        session.peer_link.ensure_link(wr, id).await;
+        session.peer_link.send_reliable_or_queue(
+            id,
+            P2pPayload::CallMute {
+                call_id,
+                target: peer,
+                muted,
+            },
+        );
+    }
+    ui_state.set_call_member_host_muted(peer, muted);
+    Ok(())
+}
+
+/// The `InviteToCall` UI action (`i` on the call modal): rings one more
+/// person mid-call. Host-only, and refused for a peer already on the
+/// roster - the picker already excludes both, this is the same check on
+/// the side that actually sends. Their `CallInvite` carries the call's own
+/// channel, exactly as the initial fan-out's did, so accepting it puts
+/// them on the same call rather than a parallel one.
+pub(crate) async fn invite_to_call(
+    wr: &mut impl ControlSink,
+    session: &mut SessionState,
+    ui_state: &mut UiState,
+    to: UserId,
+) -> proto::Result<()> {
+    let Some(call) = session.active_call.as_ref() else {
+        return Ok(());
+    };
+    if Some(call.host) != ui_state.own_id || call.participants.contains_key(&to) {
+        return Ok(());
+    }
+    let call_id = call.call_id;
+    let channel = ui_state.call.as_ref().and_then(|c| c.channel.clone());
+    let Some(user) = ui_state.known_users.get(&to).cloned() else {
+        return Ok(());
+    };
+    if crate::client::otp::contact_name_if_active(session, &user.public_key_der).is_some() {
+        ui_state.push_status_notice(
+            "voice calls aren't supported over an OTP session".to_string(),
+            false,
+        );
+        return Ok(());
+    }
+    session.peer_link.ensure_link(wr, to).await;
+    session
+        .peer_link
+        .send_reliable_or_queue(to, P2pPayload::CallInvite { call_id, channel });
+    ui_state.on_call_invite_sent(to, user.name);
+    Ok(())
+}
+
+/// Tears down every part of our own participation without telling anyone -
+/// the half `end_own_call` does after it has sent its `CallEnd`s, and all
+/// that is left to do when the host's `CallEnd` already ended the call for
+/// everyone.
+fn teardown_own_call(session: &mut SessionState, ui_state: &mut UiState) {
+    let Some(call) = session.active_call.take() else {
+        return;
+    };
+    for peer in call.participants.into_values() {
+        let _ = session.mixer_tx.send(voice::MixerCmd::Stop { id: peer.mixer_id });
+    }
+    let _ = call.cmd_tx.send(CallRecorderCmd::Stop);
+    ui_state.end_call();
 }
 
 /// The `AcceptCallInvite` UI action: joins the call named by a still-queued
@@ -502,14 +860,21 @@ pub(crate) async fn accept_invite(
             .send_reliable_or_queue(invite.from, P2pPayload::CallReject { call_id });
         return Ok(());
     }
-    let others: Vec<UserId> = match &invite.channel {
+    // Rule 1's broadcast, plus the inviter unconditionally: for a
+    // mid-call invite (`invite_to_call`) we may not even be in the call's
+    // channel, and without the inviter in this list nobody would ever
+    // learn we joined.
+    let mut others: Vec<UserId> = match &invite.channel {
         Some(channel) => addressable_channel_members(session, ui_state, channel)
             .into_iter()
             .map(|(id, ..)| id)
             .collect(),
-        None => vec![invite.from],
+        None => Vec::new(),
     };
-    if !begin_own_call(session, ui_state, call_id, invite.channel.clone()) {
+    if !others.contains(&invite.from) {
+        others.push(invite.from);
+    }
+    if !begin_own_call(session, ui_state, call_id, invite.channel.clone(), invite.from) {
         return Ok(());
     }
     for id in others {
@@ -553,11 +918,15 @@ pub(crate) fn toggle_mute(session: &mut SessionState, ui_state: &mut UiState) {
     ui_state.set_call_muted(call.muted);
 }
 
-/// The `EndCall` UI action (`/endcall`): tells every current participant we
-/// left, tears down every incoming decrypt worker/mixer source, stops our
-/// own capture thread, and clears both `SessionState`/`UiState`'s call
-/// bookkeeping. The only path that ever removes our *own* `active_call` -
-/// mirrors `/leave` being the only path that removes a joined channel.
+/// The `EndCall` UI action (`/endcall`, or the modal's END CALL button):
+/// tells every current participant we left, tears down every incoming
+/// decrypt worker/mixer source, stops our own capture thread, and clears
+/// both `SessionState`/`UiState`'s call bookkeeping.
+///
+/// Identical whoever runs it - the *host* leaving ends the call for
+/// everyone, but that asymmetry lives entirely on the receiving side
+/// (`on_call_end`), which is what lets one `CallEnd` mean both things
+/// without the leaver having to decide which it is.
 pub(crate) async fn end_own_call(
     wr: &mut impl ControlSink,
     session: &mut SessionState,
@@ -572,10 +941,7 @@ pub(crate) async fn end_own_call(
             .peer_link
             .send_reliable_or_queue(peer, P2pPayload::CallEnd { call_id: call.call_id });
     }
-    for peer in call.participants.into_values() {
-        let _ = session.mixer_tx.send(voice::MixerCmd::Stop { id: peer.mixer_id });
-    }
-    let _ = call.cmd_tx.send(CallRecorderCmd::Stop);
-    ui_state.end_call();
+    session.active_call = Some(call);
+    teardown_own_call(session, ui_state);
     Ok(())
 }

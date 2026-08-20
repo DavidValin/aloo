@@ -1,7 +1,8 @@
 use aloo::client::tui::ui::format_duration_label;
 use aloo::client::voice::{
     CHUNK_INTERVAL, MAX_RECORDING_SAMPLES, MAX_RECORDING_SECS, SAMPLE_RATE_HZ, decode_wav_to_mono,
-    downmix_f32_to_mono_i16, downmix_i16_to_mono, end_chime_samples, pcm_from_bytes, pcm_to_bytes,
+    downmix_f32_to_mono_i16, downmix_i16_to_mono, end_chime_samples, level_from_pcm,
+    pcm_from_bytes, pcm_to_bytes,
     recording_at_max, resample,
 };
 use aloo::p2p_proto::SAFE_DATAGRAM_BYTES;
@@ -313,4 +314,32 @@ fn end_chime_samples_decodes_the_bundled_asset_and_is_non_empty() {
     );
     // calling again should return the same cached samples
     assert_eq!(end_chime_samples(), samples);
+}
+
+/// The call modal's voice meter (`docs/SPEC.md` "Live voice calls") reads
+/// RMS, not peak: silence is 0, a loud constant tone saturates, and one
+/// stray spike in an otherwise quiet chunk barely moves it.
+///
+/// @requirement TB-208
+#[test]
+fn level_from_pcm_reads_rms_loudness_clamped_to_a_hundred() {
+    assert_eq!(level_from_pcm(&[]), 0);
+    assert_eq!(level_from_pcm(&[0; 512]), 0);
+
+    let full = level_from_pcm(&[i16::MAX; 512]);
+    assert_eq!(full, 100, "a full-scale tone saturates the meter");
+
+    let quiet = level_from_pcm(&[300; 512]);
+    let loud = level_from_pcm(&[3000; 512]);
+    assert!(quiet < loud, "louder audio reads higher: {quiet} vs {loud}");
+    assert!(loud <= 100);
+
+    // One spike among 512 silent samples must not paint a full bar - the
+    // reason this is RMS rather than peak amplitude.
+    let mut spike = [0i16; 512];
+    spike[0] = i16::MAX;
+    assert!(
+        level_from_pcm(&spike) < full / 3,
+        "a single spike reads far below the same amplitude held throughout"
+    );
 }

@@ -217,7 +217,9 @@ the payload carried inside a reliable or unreliable one.
 | `CallInvite` | reliably | Proposes a live voice call (§7.7) |
 | `CallAccept` | reliably | Joins a call, or replies to a newly-discovered participant - the mesh's only signal (§7.7) |
 | `CallReject` | reliably | Declines an invite, sent only to whoever sent it (§7.7) |
-| `CallEnd` | reliably | Leaves a call still in progress (§7.7) |
+| `CallEnd` | reliably | Leaves a call still in progress (§7.7); from the host, ends it for everyone |
+| `CallMute` | reliably | The host silences (or restores) one participant (§7.7) |
+| `CallRoster` | reliably | Hands a late-joining participant the sender's own roster (§7.7) |
 
 **Server UDP socket** — stateless, no user data.
 
@@ -1547,6 +1549,8 @@ CallInvite { call_id: u64, channel: optional<string> }
 CallAccept { call_id: u64 }
 CallReject { call_id: u64 }
 CallEnd    { call_id: u64 }
+CallMute   { call_id: u64, target: user_id, muted: bool }
+CallRoster { call_id: u64, members: list<user_id> }
 ```
 
 `call_id` is a fresh random token (unguessable off-path, like a link's
@@ -1555,6 +1559,16 @@ whole lifetime. `channel: some(name)` on `CallInvite` addresses a channel
 call, `none` a call to one DM peer - carried in the clear (unlike a file
 offer's filename, §7.6, there's nothing about a call's existence worth
 hiding from a peer it's already addressed to).
+
+**The host.** Whoever ran `/call` is the call's **host**, named for the
+rest of the call's life by the simple fact that theirs is the `CallInvite`
+each participant accepted. The host is an ordinary participant for audio
+purposes and holds no state anyone else depends on, but three decisions
+are theirs alone: muting a participant (`CallMute`), inviting more people
+mid-call (a further `CallInvite`), and ending the call for everyone (their
+own `CallEnd`, below). An implementation must honour those three only from
+the host of the call it is actually on, and ignore them from anyone else -
+that check is the whole of the host's authority.
 
 **Starting a call.** The initiator becomes a participant immediately, then
 sends `CallInvite` to every member of `channel` (or the one DM peer) whose
@@ -1630,19 +1644,51 @@ call's is fully random; a voice message's is a small per-connection
 counter) and so cannot collide in practice, but nothing on the wire tags a
 chunk with which kind of stream it belongs to.
 
-**Muting is purely local - there is no wire message for it.** A muted
-participant simply stops sending chunks to everyone for as long as it's
-muted; every recipient's mixer hears silence from that source in the
+**Muting oneself is purely local - there is no wire message for it.** A
+muted participant simply stops sending chunks to everyone for as long as
+it's muted; every recipient's mixer hears silence from that source in the
 meantime because nothing is pushed to it, the same as a moment of natural
 silence during an ordinary recording. No participant is ever told another
-one is muted.
+one has muted itself.
+
+**A host mute is not local.** `CallMute { call_id, target, muted }` is the
+host's decision about someone else, and is sent to every participant the
+host currently knows about, `target` included. `target` stops sending
+audio until the host sends the matching `muted: false`; its own local mute
+toggle neither lifts nor deepens that. Every other participant applies it
+to its own view of the roster, so a muted participant reads the same to
+everyone. A `CallMute` from anyone other than the host of the call the
+receiver is on is ignored. A participant who joins after a mute was
+issued is brought up to date by the host repeating the outstanding
+`CallMute`s to them alongside the `CallAccept` that admits them.
+
+**Late invites, and `CallRoster`.** The host may invite someone mid-call
+who was never a member of the call's channel (or, for a DM call, is not
+the DM peer). Such a participant cannot derive the roster the way rule 1's
+broadcast assumes - the channel/DM membership it would broadcast to simply
+isn't the call. `CallRoster { call_id, members }` closes that: whenever a
+participant adds someone new, it sends that newcomer the list of every
+*other* participant it currently has, and the newcomer answers each of
+them with an ordinary `CallAccept`. Rules 1 and 2 then converge the rest
+exactly as before; `CallRoster` is an optimisation of discovery, never a
+source of truth - a `CallRoster` naming someone unreachable or unknown is
+simply skipped.
 
 **Leaving.** `CallEnd { call_id }` is sent to every other participant a
 leaving client currently knows about, and each one, on receiving it, tears
 down that one pairwise audio stream and drops the leaver from its roster.
-The call itself has no separate "end" beyond that - it is, at any moment,
-simply whichever participants haven't yet sent (or received) a `CallEnd`
-for it. A client that never receives `CallEnd` from a peer who is
+For every participant but the host, the call has no separate "end" beyond
+that - it is, at any moment, simply whichever participants haven't yet
+sent (or received) a `CallEnd` for it.
+
+**The host's `CallEnd` ends the call for everyone.** A participant
+receiving `CallEnd` from the host of the call it is on tears down its
+entire participation - every pairwise stream, not just the host's - and
+leaves the call, rather than carrying on with whoever remains. Nothing is
+relayed on: the host sent its own `CallEnd` to every participant it knew
+of, and each of those does the same teardown independently. A participant
+the host never knew about is covered by whoever *did* know about it
+leaving in turn. A client that never receives `CallEnd` from a peer who is
 genuinely gone (their connection died outright) is not automatically
 corrected by this section - see §7.1.3/§7.1.4 for how a lost link is
 detected and surfaced independently of call state.

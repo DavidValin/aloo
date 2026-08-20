@@ -4,8 +4,8 @@ use ui_common::*;
 
 use aloo::proto::UserId;
 use aloo::client::tui::ui::{
-    CallTarget, Focus, IdentityCase, MessageBody, Mode, PendingCallInvite, RECORD_HOLD_TIMEOUT,
-    UiAction, UiState, render,
+    CallMemberState, CallTarget, Focus, HOST_LEFT_NOTICE, IdentityCase, MessageBody, Mode,
+    NO_ONE_INVITED_NOTICE, PendingCallInvite, RECORD_HOLD_TIMEOUT, UiAction, UiState, render,
 };
 use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::Terminal;
@@ -1705,7 +1705,7 @@ fn the_permanent_call_indicator_tracks_participants_and_mute_state() {
     assert!(state.call.is_none());
     assert!(!rendered_rows(&state).iter().any(|r| r.contains("On a call")));
 
-    state.begin_call(99, Some("general".into()));
+    state.begin_call(99, Some("general".into()), UserId(1));
     assert!(state.call.is_some());
     let rows = rendered_rows(&state);
     assert!(rows.iter().any(|r| r.contains("On a call")), "{rows:?}");
@@ -1741,7 +1741,7 @@ fn the_permanent_call_indicator_tracks_participants_and_mute_state() {
 #[test]
 fn the_call_indicator_and_a_status_notice_are_both_visible_at_once() {
     let mut state = joined_general_with(vec![]);
-    state.begin_call(1, None);
+    state.begin_call(1, None, UserId(1));
     state.push_status_notice("bob left the call".into(), true);
 
     let rows = rendered_rows(&state);
@@ -1766,7 +1766,7 @@ fn slash_mute_is_refused_off_a_call_and_toggles_on_one() {
         Some(("not on a call", false))
     );
 
-    state.begin_call(1, None);
+    on_call_minimized(&mut state, 1, None);
     type_str(&mut state, "/mute");
     let action = press(&mut state, KeyCode::Enter);
     assert_eq!(action, Some(UiAction::ToggleCallMute));
@@ -1789,7 +1789,7 @@ fn slash_endcall_is_refused_off_a_call_and_works_on_one() {
         Some("not on a call")
     );
 
-    state.begin_call(1, None);
+    on_call_minimized(&mut state, 1, None);
     type_str(&mut state, "/endcall");
     assert_eq!(press(&mut state, KeyCode::Enter), Some(UiAction::EndCall));
 }
@@ -1800,7 +1800,7 @@ fn slash_call_is_refused_while_already_on_a_call_or_mid_recording() {
     let mut state = joined_general_with(vec![user(2, "bob")]);
     state.focus = Focus::Input;
 
-    state.begin_call(1, None);
+    on_call_minimized(&mut state, 1, None);
     type_str(&mut state, "/call");
     assert_eq!(press(&mut state, KeyCode::Enter), None);
     assert_eq!(
@@ -1837,7 +1837,10 @@ fn slash_call_addresses_the_viewed_channel_or_an_open_private_room() {
     let mut state = joined_general_with(vec![user(2, "bob")]);
     state.focus = Focus::Input;
 
+    // `/call` opens the confirmation first - a second Enter (Call is
+    // focused) is what actually starts it.
     type_str(&mut state, "/call");
+    assert_eq!(press(&mut state, KeyCode::Enter), None);
     assert_eq!(
         press(&mut state, KeyCode::Enter),
         Some(UiAction::StartCall(CallTarget::Channel {
@@ -1851,6 +1854,7 @@ fn slash_call_addresses_the_viewed_channel_or_an_open_private_room() {
     // `direct_message::open_private_room` does before this ever runs.
     state.active_private_room = Some(UserId(2));
     type_str(&mut state, "/call");
+    press(&mut state, KeyCode::Enter);
     match press(&mut state, KeyCode::Enter) {
         Some(UiAction::StartCall(CallTarget::Direct { to, .. })) => {
             assert_eq!(to, UserId(2))
@@ -1864,9 +1868,373 @@ fn slash_call_addresses_the_viewed_channel_or_an_open_private_room() {
 fn push_to_talk_is_unavailable_while_on_a_call() {
     let mut state = joined_general_with(vec![user(2, "bob")]);
     state.focus = Focus::Messages;
-    state.begin_call(1, None);
+    on_call_minimized(&mut state, 1, None);
 
     let action = state.handle_key(KeyCode::Char(' '), KeyModifiers::NONE, KeyEventKind::Press);
     assert_eq!(action, None);
     assert!(!state.recording, "the mic is already spoken for by the call");
+}
+
+
+/// The call modal (`docs/SPEC.md` "Live voice calls") opens the moment a
+/// call starts and shows every roster label the spec calls for: HOST on
+/// whoever started it, IN CALL / INVITED / REJECTED on where each person
+/// stands, MUTED on anyone the host has silenced.
+///
+/// @requirement AC-175
+#[test]
+fn the_call_modal_lists_the_host_first_and_labels_every_participant() {
+    let mut state = joined_general_with(vec![user(2, "bob"), user(3, "carol"), user(4, "dave")]);
+    // dave hosts: the roster must put him first even though we join it
+    // holding only our own row.
+    state.begin_call(7, Some("general".into()), UserId(4));
+    state.on_call_participant_joined(UserId(4), "dave".into());
+    state.on_call_participant_joined(UserId(2), "bob".into());
+    state.on_call_invite_sent(UserId(3), "carol".into());
+    state.on_call_invite_rejected(UserId(3));
+    state.set_call_member_host_muted(UserId(2), true);
+
+    let call = state.call.as_ref().unwrap();
+    assert_eq!(
+        call.members.first().map(|m| m.id),
+        Some(UserId(4)),
+        "the host is always the first row"
+    );
+    assert_eq!(
+        call.members.iter().find(|m| m.id == UserId(3)).unwrap().state,
+        CallMemberState::Rejected
+    );
+
+    let rows = rendered_rows(&state);
+    let joined = rows.join("\n");
+    for label in ["HOST", "IN CALL", "REJECTED", "MUTED", "END CALL"] {
+        assert!(joined.contains(label), "missing {label} in {rows:?}");
+    }
+    assert!(
+        joined.contains("dave") && joined.contains("bob") && joined.contains("carol"),
+        "{rows:?}"
+    );
+}
+
+/// An invite that hasn't been answered yet reads INVITED - the only state
+/// the host ever sees that no other participant can.
+///
+/// @requirement AC-175
+#[test]
+fn an_unanswered_invitee_is_listed_as_invited() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.begin_call(1, Some("general".into()), UserId(1));
+    state.on_call_invite_sent(UserId(2), "bob".into());
+
+    assert_eq!(
+        state
+            .call
+            .as_ref()
+            .unwrap()
+            .members
+            .iter()
+            .find(|m| m.id == UserId(2))
+            .unwrap()
+            .state,
+        CallMemberState::Invited
+    );
+    assert!(
+        rendered_rows(&state).join("\n").contains("INVITED"),
+        "an unanswered invite is labelled INVITED"
+    );
+}
+
+/// The duration readout ticks in whole seconds and rolls over into hours,
+/// driven off the session's clock rather than read at render time.
+///
+/// @requirement AC-176
+#[test]
+fn the_call_modal_shows_a_live_duration() {
+    let mut state = joined_general_with(vec![]);
+    state.begin_call(1, None, UserId(1));
+    assert_eq!(state.call.as_ref().unwrap().duration_label(), "00:00");
+
+    let started = state.call.as_ref().unwrap().started_at;
+    state.tick_call_duration(started + Duration::from_secs(65));
+    assert_eq!(state.call.as_ref().unwrap().duration_label(), "01:05");
+    assert!(rendered_rows(&state).join("\n").contains("01:05"));
+
+    state.tick_call_duration(started + Duration::from_secs(3_725));
+    assert_eq!(state.call.as_ref().unwrap().duration_label(), "01:02:05");
+}
+
+/// Every participant carries a live voice meter, and our own reads flat
+/// zero while we're muted - the meter shows what is actually being sent.
+///
+/// @requirement AC-176
+#[test]
+fn each_participant_has_a_live_voice_meter() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.begin_call(1, None, UserId(1));
+    state.on_call_participant_joined(UserId(2), "bob".into());
+
+    state.set_call_level(UserId(2), 100);
+    assert_eq!(
+        state
+            .call
+            .as_ref()
+            .unwrap()
+            .members
+            .iter()
+            .find(|m| m.id == UserId(2))
+            .unwrap()
+            .level,
+        100
+    );
+    assert!(
+        rendered_rows(&state).join("\n").contains("\u{2588}"),
+        "a full meter draws filled blocks"
+    );
+
+    // Levels are clamped, and a host mute zeroes the meter it silences.
+    state.set_call_level(UserId(2), 250);
+    state.set_call_member_host_muted(UserId(2), true);
+    let bob = state
+        .call
+        .as_ref()
+        .unwrap()
+        .members
+        .iter()
+        .find(|m| m.id == UserId(2))
+        .unwrap()
+        .clone();
+    assert_eq!(bob.level, 0);
+}
+
+/// Escape folds the modal into its own tab (drawn to the left of the
+/// channels); `[`/`]` navigate to it, and selecting it replaces the
+/// sidebar/messages/compose layout with the modal alone.
+///
+/// @requirement AC-177
+#[test]
+fn escape_minimizes_the_call_modal_into_its_own_tab() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.begin_call(1, Some("general".into()), UserId(1));
+    assert!(state.call_modal_showing());
+
+    assert_eq!(press(&mut state, KeyCode::Esc), None);
+    assert!(state.call.as_ref().unwrap().minimized);
+    assert!(!state.call_modal_showing(), "folded away, not showing");
+    // The tab itself is still there to navigate back to.
+    assert!(rendered_rows(&state).join("\n").contains("Call"));
+
+    // `[` from the first channel wraps left onto the call tab.
+    press(&mut state, KeyCode::Char('['));
+    assert!(state.call_tab_selected);
+    assert!(state.call_modal_showing());
+    let rows = rendered_rows(&state);
+    assert!(rows.join("\n").contains("END CALL"), "{rows:?}");
+    assert!(
+        !rows.iter().any(|r| r.contains("Type a message")),
+        "the call tab replaces the compose bar entirely: {rows:?}"
+    );
+
+    // And back out to the channel, without the overlay following.
+    press(&mut state, KeyCode::Char(']'));
+    assert!(!state.call_tab_selected);
+    assert!(!state.call_modal_showing());
+}
+
+/// The roster scrolls rather than truncating: with more members than fit,
+/// moving the cursor down keeps it on screen.
+///
+/// @requirement AC-177
+#[test]
+fn the_call_roster_scrolls_to_keep_the_selection_visible() {
+    let members: Vec<_> = (2..40).map(|i| user(i, &format!("user{i}"))).collect();
+    let mut state = joined_general_with(members);
+    state.begin_call(1, Some("general".into()), UserId(1));
+    for i in 2..40u64 {
+        state.on_call_participant_joined(UserId(i), format!("user{i}"));
+    }
+
+    for _ in 0..38 {
+        press(&mut state, KeyCode::Down);
+    }
+    assert_eq!(state.call.as_ref().unwrap().selected, 38);
+    assert!(
+        rendered_rows(&state).join("\n").contains("user39"),
+        "the selected row scrolled into view"
+    );
+    // Up from the top wraps to the bottom, same as every other list here.
+    press(&mut state, KeyCode::Down);
+    assert_eq!(state.call.as_ref().unwrap().selected, 0);
+}
+
+/// END CALL is what the modal's Enter presses; `/endcall` still works from
+/// anywhere once the modal is out of the way.
+///
+/// @requirement AC-178
+#[test]
+fn the_modal_end_call_button_ends_the_call() {
+    let mut state = joined_general_with(vec![]);
+    state.begin_call(1, None, UserId(1));
+    assert!(rendered_rows(&state).join("\n").contains("END CALL"));
+    assert_eq!(press(&mut state, KeyCode::Enter), Some(UiAction::EndCall));
+}
+
+/// `m` on the roster is the host's mute toggle, and only the host's - a
+/// participant pressing it produces nothing, which is what "only the host
+/// can restore it" rests on.
+///
+/// @requirement AC-179
+#[test]
+fn only_the_host_can_mute_a_participant_from_the_roster() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.begin_call(1, Some("general".into()), UserId(1));
+    state.on_call_participant_joined(UserId(2), "bob".into());
+
+    // Row 0 is us (the host); the host row itself is not mutable this way.
+    assert_eq!(press(&mut state, KeyCode::Char('m')), None);
+    press(&mut state, KeyCode::Down);
+    assert_eq!(
+        press(&mut state, KeyCode::Char('m')),
+        Some(UiAction::HostMuteCallMember {
+            peer: UserId(2),
+            muted: true
+        })
+    );
+    // Once applied, the same key lifts it - still host-only.
+    state.set_call_member_host_muted(UserId(2), true);
+    assert_eq!(
+        press(&mut state, KeyCode::Char('m')),
+        Some(UiAction::HostMuteCallMember {
+            peer: UserId(2),
+            muted: false
+        })
+    );
+
+    // Same roster, but carol hosts: `m` does nothing at all for us now.
+    let mut guest = joined_general_with(vec![user(2, "bob"), user(3, "carol")]);
+    guest.begin_call(1, Some("general".into()), UserId(3));
+    guest.on_call_participant_joined(UserId(3), "carol".into());
+    guest.on_call_participant_joined(UserId(2), "bob".into());
+    press(&mut guest, KeyCode::Down);
+    assert_eq!(press(&mut guest, KeyCode::Char('m')), None);
+}
+
+/// `i` opens the host's invite picker, listing only people we share a
+/// channel or DM with and who aren't already invited or on the call - the
+/// "one active invitation at a time per user" rule.
+///
+/// @requirement AC-180
+#[test]
+fn the_host_can_invite_someone_who_shares_a_channel_and_only_once() {
+    let mut state = joined_general_with(vec![user(2, "bob"), user(3, "carol")]);
+    // A stranger we share nothing with is never a candidate.
+    state.known_users.insert(UserId(9), user(9, "stranger"));
+    state.begin_call(1, Some("general".into()), UserId(1));
+    state.on_call_participant_joined(UserId(2), "bob".into());
+
+    let candidates = state.call_invite_candidates();
+    let names: Vec<&str> = candidates.iter().map(|(_, n)| n.as_str()).collect();
+    assert_eq!(names, vec!["carol"], "bob is already on the call");
+
+    assert_eq!(press(&mut state, KeyCode::Char('i')), None);
+    assert!(state.call.as_ref().unwrap().invite_picker.is_some());
+    assert!(rendered_rows(&state).join("\n").contains("Invite to call"));
+    assert_eq!(
+        press(&mut state, KeyCode::Enter),
+        Some(UiAction::InviteToCall { to: UserId(3) })
+    );
+
+    // Once invited, carol is no longer offerable - one active invitation
+    // per user at a time.
+    state.on_call_invite_sent(UserId(3), "carol".into());
+    assert!(state.call_invite_candidates().is_empty());
+    assert_eq!(press(&mut state, KeyCode::Char('i')), None);
+    assert!(state.call.as_ref().unwrap().invite_picker.is_none());
+    assert_eq!(
+        state.status_notice.as_ref().map(|(m, _)| m.as_str()),
+        Some("nobody left to invite to this call")
+    );
+}
+
+/// A participant who isn't the host has no invite picker at all.
+///
+/// @requirement AC-180
+#[test]
+fn only_the_host_can_open_the_invite_picker() {
+    let mut state = joined_general_with(vec![user(2, "bob"), user(3, "carol")]);
+    state.begin_call(1, Some("general".into()), UserId(2));
+    state.on_call_participant_joined(UserId(2), "bob".into());
+
+    assert!(!state.open_call_invite_picker());
+    assert!(state.call.as_ref().unwrap().invite_picker.is_none());
+}
+
+/// `/call` confirms first, saying in so many words how many people it is
+/// about to ring - nothing is sent until that is answered.
+///
+/// @requirement AC-181
+#[test]
+fn slash_call_confirms_how_many_users_it_will_invite() {
+    let mut state = joined_general_with(vec![user(2, "bob"), user(3, "carol")]);
+    state.focus = Focus::Input;
+
+    type_str(&mut state, "/call");
+    assert_eq!(press(&mut state, KeyCode::Enter), None);
+    let pending = state.call_confirm.as_ref().expect("confirmation opened");
+    assert_eq!(pending.invitee_count, 2);
+    let rows = rendered_rows(&state);
+    assert!(rows.join("\n").contains("2 users"), "{rows:?}");
+
+    // Cancel leaves nothing behind and rings nobody.
+    press(&mut state, KeyCode::Left);
+    assert_eq!(press(&mut state, KeyCode::Enter), None);
+    assert!(state.call_confirm.is_none());
+    assert!(state.call.is_none());
+
+    // Confirming is what produces the actual StartCall.
+    type_str(&mut state, "/call");
+    press(&mut state, KeyCode::Enter);
+    assert_eq!(
+        press(&mut state, KeyCode::Enter),
+        Some(UiAction::StartCall(CallTarget::Channel {
+            channel: "general".into()
+        }))
+    );
+}
+
+/// A `/call` with nobody reachable never opens a confirmation at all -
+/// it says so and stops.
+///
+/// @requirement AC-182
+#[test]
+fn slash_call_with_no_reachable_members_says_no_one_was_invited() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.focus = Focus::Input;
+    state.on_user_offline(UserId(2));
+
+    type_str(&mut state, "/call");
+    assert_eq!(press(&mut state, KeyCode::Enter), None);
+    assert!(state.call_confirm.is_none(), "nothing to confirm");
+    assert_eq!(
+        state.status_notice.as_ref().map(|(m, _)| m.as_str()),
+        Some(NO_ONE_INVITED_NOTICE)
+    );
+}
+
+/// The host hanging up ends the call for everyone, with a notice saying
+/// so - unlike any other participant leaving, which just removes a row.
+///
+/// @requirement AC-183
+#[test]
+fn the_hosts_departure_notice_reads_as_the_call_ending() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.begin_call(1, Some("general".into()), UserId(2));
+    state.on_call_participant_joined(UserId(2), "bob".into());
+
+    // What `voice_call::on_call_end` does on the host's `CallEnd`.
+    state.end_call();
+    state.push_status_notice(HOST_LEFT_NOTICE.to_string(), false);
+
+    assert!(state.call.is_none());
+    assert!(!state.call_tab_selected, "the call tab goes with it");
+    assert!(rendered_rows(&state).join("\n").contains(HOST_LEFT_NOTICE));
 }

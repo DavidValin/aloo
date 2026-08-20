@@ -404,9 +404,161 @@ async fn call_decision_applied(w: &mut AlooWorld) {
     w.ui_mut().take_call_invite(call_id);
 }
 
+/// Joins a call we host, with the modal folded away into its tab - an
+/// open modal deliberately absorbs every key, so the scenarios that go on
+/// to type `/mute`/`/endcall` need it out of the way, exactly as a real
+/// user pressing Escape would leave it.
 #[when("I join a call in the channel")]
 async fn i_join_a_call(w: &mut AlooWorld) {
-    w.ui_mut().begin_call(1, Some("general".into()));
+    let ui = w.ui_mut();
+    ui.begin_call(1, Some("general".into()), UserId(id_for("me")));
+    ui.call.as_mut().expect("just begun").minimized = true;
+}
+
+#[when("I open a call in the channel")]
+async fn i_open_a_call(w: &mut AlooWorld) {
+    w.ui_mut()
+        .begin_call(1, Some("general".into()), UserId(id_for("me")));
+}
+
+#[when(expr = "{word} hosts a call I am on")]
+async fn peer_hosts_a_call(w: &mut AlooWorld, name: String) {
+    let id = UserId(id_for(&name));
+    w.ui_mut().begin_call(1, Some("general".into()), id);
+    w.ui_mut().on_call_participant_joined(id, name);
+}
+
+#[when(expr = "{word} is invited to the call")]
+async fn peer_is_invited(w: &mut AlooWorld, name: String) {
+    let id = UserId(id_for(&name));
+    w.ui_mut().on_call_invite_sent(id, name);
+}
+
+#[when(expr = "{word} declines the call")]
+async fn peer_declines(w: &mut AlooWorld, name: String) {
+    w.ui_mut().on_call_invite_rejected(UserId(id_for(&name)));
+}
+
+#[when(expr = "the host mutes {word}")]
+async fn host_mutes(w: &mut AlooWorld, name: String) {
+    w.ui_mut()
+        .set_call_member_host_muted(UserId(id_for(&name)), true);
+}
+
+#[when(expr = "the call has been running for {int} seconds")]
+async fn call_running_for(w: &mut AlooWorld, secs: u64) {
+    let started = w.ui_ref().call.as_ref().expect("not on a call").started_at;
+    w.ui_mut()
+        .tick_call_duration(started + std::time::Duration::from_secs(secs));
+}
+
+#[when("the host leaves the call")]
+async fn host_leaves(w: &mut AlooWorld) {
+    // The local half of `voice_call::on_call_end`'s host branch: the call
+    // is over for us too, and we are told why.
+    w.ui_mut().end_call();
+    w.ui_mut()
+        .push_status_notice(aloo::client::tui::ui::HOST_LEFT_NOTICE.to_string(), false);
+}
+
+#[then(expr = "the call modal lists {word} as {word}")]
+async fn call_modal_lists(w: &mut AlooWorld, name: String, label: String) {
+    let rows = ui_rows(w.ui_ref());
+    let wanted = label.replace('_', " ");
+    assert!(
+        rows.iter().any(|r| r.contains(&name) && r.contains(&wanted)),
+        "expected {name:?} labelled {wanted:?}: {rows:?}"
+    );
+}
+
+#[then(expr = "the call modal shows the duration {string}")]
+async fn call_modal_duration(w: &mut AlooWorld, expected: String) {
+    let rows = ui_rows(w.ui_ref());
+    assert!(
+        rows.iter().any(|r| r.contains(&expected)),
+        "expected the duration {expected:?}: {rows:?}"
+    );
+}
+
+#[then("the call modal is shown")]
+async fn call_modal_shown(w: &mut AlooWorld) {
+    let rows = ui_rows(w.ui_ref());
+    assert!(
+        rows.iter().any(|r| r.contains("END CALL")),
+        "expected the call modal: {rows:?}"
+    );
+}
+
+#[then("the call modal is not shown")]
+async fn call_modal_not_shown(w: &mut AlooWorld) {
+    let rows = ui_rows(w.ui_ref());
+    assert!(
+        !rows.iter().any(|r| r.contains("END CALL")),
+        "the call modal should be folded away: {rows:?}"
+    );
+}
+
+#[then("a call tab is shown")]
+async fn call_tab_shown(w: &mut AlooWorld) {
+    let rows = ui_rows(w.ui_ref());
+    assert!(
+        rows.first().is_some_and(|r| r.contains("Call")),
+        "expected the call tab in the tab row: {rows:?}"
+    );
+}
+
+#[then(expr = "the call confirmation says {string}")]
+async fn call_confirmation_says(w: &mut AlooWorld, expected: String) {
+    let rows = ui_rows(w.ui_ref());
+    assert!(
+        rows.iter().any(|r| r.contains(&expected)),
+        "expected {expected:?} in the confirmation: {rows:?}"
+    );
+}
+
+#[then("starting the call is requested")]
+async fn starting_call_requested(w: &mut AlooWorld) {
+    assert!(
+        matches!(w.last_action, Some(UiAction::StartCall(_))),
+        "expected a StartCall, got {:?}",
+        w.last_action
+    );
+}
+
+#[then("no call is started")]
+async fn no_call_started(w: &mut AlooWorld) {
+    assert!(
+        !matches!(w.last_action, Some(UiAction::StartCall(_))),
+        "nothing should have been started: {:?}",
+        w.last_action
+    );
+    assert!(w.ui_ref().call.is_none());
+}
+
+#[then(expr = "inviting {word} to the call is requested")]
+async fn inviting_requested(w: &mut AlooWorld, name: String) {
+    assert_eq!(
+        w.last_action,
+        Some(UiAction::InviteToCall {
+            to: UserId(id_for(&name))
+        })
+    );
+}
+
+#[then(expr = "muting {word} is requested")]
+async fn muting_member_requested(w: &mut AlooWorld, name: String) {
+    assert_eq!(
+        w.last_action,
+        Some(UiAction::HostMuteCallMember {
+            peer: UserId(id_for(&name)),
+            muted: true
+        })
+    );
+}
+
+#[then("nothing is requested")]
+async fn nothing_requested(w: &mut AlooWorld) {
+    assert!(w.action_was_none, "the key should have been inert");
 }
 
 #[when(expr = "{word} joins the call with me")]

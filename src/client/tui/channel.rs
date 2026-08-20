@@ -283,21 +283,39 @@ impl UiState {
     // [ / ] tab switching
     // -------------------------------------------------------------
 
-    /// `forward` selects `]` (next channel tab) vs `[` (the previous one).
-    /// Every tab is a channel the user has already joined (`on_joined` is
-    /// the only thing that creates one), so switching is immediate and
+    /// `forward` selects `]` (next tab) vs `[` (the previous one). Every
+    /// channel tab is a channel the user has already joined (`on_joined`
+    /// is the only thing that creates one), so switching is immediate and
     /// never joins anything - joining is `/channels` or Ctrl+J.
+    ///
+    /// While a call is running there is one extra tab, sitting to the left
+    /// of every channel: the call itself (`docs/SPEC.md` "Live voice
+    /// calls"), which is where Escape folds the call modal away to and how
+    /// the user gets back to it. Selecting it replaces the whole
+    /// sidebar/messages/compose layout with the modal.
     pub(crate) fn select_adjacent_channel(&mut self, forward: bool) {
-        if self.channels.is_empty() {
+        let has_call_tab = self.call.is_some();
+        let len = self.channels.len() + usize::from(has_call_tab);
+        if len == 0 {
             return;
         }
-        let len = self.channels.len();
-        let base = self.selected_channel.min(len - 1);
+        // One flat index over [call tab?] ++ channel tabs.
+        let base = if self.call_tab_selected && has_call_tab {
+            0
+        } else {
+            usize::from(has_call_tab) + self.selected_channel.min(self.channels.len().saturating_sub(1))
+        };
         let next = if forward {
             (base + 1) % len
         } else {
             (base + len - 1) % len
         };
+        if has_call_tab && next == 0 {
+            self.call_tab_selected = true;
+            return;
+        }
+        self.call_tab_selected = false;
+        let next = next - usize::from(has_call_tab);
         self.selected_channel = next;
         self.active_private_room = None;
         self.sidebar_selected = 0;
@@ -794,6 +812,51 @@ impl UiState {
 // Rendering
 // ---------------------------------------------------------------------
 
+/// The tab row's titles and which one is selected. While a call is
+/// running there is one extra tab at the far left - the call itself
+/// (`docs/SPEC.md` "Live voice calls"), where Escape folds the call modal
+/// away to; every other tab is a joined channel, as before.
+fn call_and_channel_tabs(state: &UiState) -> (Vec<Line<'static>>, usize) {
+    let mut titles: Vec<Line> = Vec::new();
+    if state.call.is_some() {
+        titles.push(Line::from(Span::styled(
+            "\u{1F534} Call",
+            Style::default().fg(Color::Red),
+        )));
+    }
+    let call_offset = titles.len();
+    titles.extend(state.channels.iter().map(|c| {
+        let prefix = if c.kind == ChannelKind::Private {
+            "\u{1F512}"
+        } else {
+            "\u{1F30D}"
+        };
+        Line::from(format!("{prefix} {}", c.name))
+    }));
+    let selected = if state.call_tab_selected && state.call.is_some() {
+        0
+    } else {
+        call_offset + state.selected_channel
+    };
+    let selected = selected.min(titles.len().saturating_sub(1));
+    (titles, selected)
+}
+
+/// The call's own tab, selected: the call modal *is* the view, with only
+/// the tab row above it - no sidebar, no message log, no compose bar
+/// (`docs/SPEC.md` "Live voice calls").
+pub(crate) fn render_call_tab_view(frame: &mut Frame, area: Rect, state: &UiState) {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(3)])
+        .split(area);
+    let (titles, selected) = call_and_channel_tabs(state);
+    frame.render_widget(Tabs::new(titles).select(selected), rows[0]);
+    if let Some(call) = &state.call {
+        crate::client::tui::ui::render_call_modal(frame, rows[1], state, call);
+    }
+}
+
 pub(crate) fn render_channel_view(frame: &mut Frame, area: Rect, state: &UiState) {
     let constraints = [
         Constraint::Length(1),
@@ -818,19 +881,8 @@ pub(crate) fn render_channel_view(frame: &mut Frame, area: Rect, state: &UiState
         .constraints([Constraint::Min(0), Constraint::Length(40)])
         .split(rows[tabs_row]);
 
-    let titles: Vec<Line> = state
-        .channels
-        .iter()
-        .map(|c| {
-            let prefix = if c.kind == ChannelKind::Private {
-                "\u{1F512}"
-            } else {
-                "\u{1F30D}"
-            };
-            Line::from(format!("{prefix} {}", c.name))
-        })
-        .collect();
-    let tabs = Tabs::new(titles).select(state.selected_channel);
+    let (titles, selected) = call_and_channel_tabs(state);
+    let tabs = Tabs::new(titles).select(selected);
     frame.render_widget(tabs, header_cols[0]);
 
     // Conn comes first (right before CPU), CPU right before the help hint

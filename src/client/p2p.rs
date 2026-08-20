@@ -268,6 +268,21 @@ pub enum P2pEvent {
         from: UserId,
         call_id: u64,
     },
+    /// Mirrors `p2p_proto::P2pPayload::CallMute` - the host's
+    /// authoritative mute decision for `target`.
+    CallMute {
+        from: UserId,
+        call_id: u64,
+        target: UserId,
+        muted: bool,
+    },
+    /// Mirrors `p2p_proto::P2pPayload::CallRoster` - who else is already on
+    /// the call, for a participant who joined too late to derive it.
+    CallRoster {
+        from: UserId,
+        call_id: u64,
+        members: Vec<UserId>,
+    },
 }
 
 /// Outgoing traffic originating on a background thread (the voice
@@ -1171,6 +1186,21 @@ impl PeerLinkManager {
             P2pPayload::CallAccept { call_id } => P2pEvent::CallAccept { from, call_id },
             P2pPayload::CallReject { call_id } => P2pEvent::CallReject { from, call_id },
             P2pPayload::CallEnd { call_id } => P2pEvent::CallEnd { from, call_id },
+            P2pPayload::CallMute {
+                call_id,
+                target,
+                muted,
+            } => P2pEvent::CallMute {
+                from,
+                call_id,
+                target,
+                muted,
+            },
+            P2pPayload::CallRoster { call_id, members } => P2pEvent::CallRoster {
+                from,
+                call_id,
+                members,
+            },
         };
         let _ = self.events_tx.send(event);
     }

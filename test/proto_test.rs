@@ -632,6 +632,52 @@ fn live_call_message_family_roundtrips() {
     assert_eq!(decode::<P2pPayload>(&encode(&end).unwrap()).unwrap(), end);
 }
 
+/// The host-authority half of the same family - the mute decision only the
+/// host may make, and the roster handed to someone who joined too late to
+/// derive it from the call's channel membership.
+///
+/// @requirement TB-207
+#[test]
+fn host_mute_and_roster_messages_roundtrip() {
+    let mute = P2pPayload::CallMute {
+        call_id: 42,
+        target: UserId(7),
+        muted: true,
+    };
+    assert_eq!(
+        decode::<P2pPayload>(&encode(&mute).unwrap()).unwrap(),
+        mute
+    );
+
+    let unmute = P2pPayload::CallMute {
+        call_id: 42,
+        target: UserId(7),
+        muted: false,
+    };
+    assert_eq!(
+        decode::<P2pPayload>(&encode(&unmute).unwrap()).unwrap(),
+        unmute
+    );
+
+    let roster = P2pPayload::CallRoster {
+        call_id: 42,
+        members: vec![UserId(2), UserId(3)],
+    };
+    assert_eq!(
+        decode::<P2pPayload>(&encode(&roster).unwrap()).unwrap(),
+        roster
+    );
+
+    let empty = P2pPayload::CallRoster {
+        call_id: 42,
+        members: Vec::new(),
+    };
+    assert_eq!(
+        decode::<P2pPayload>(&encode(&empty).unwrap()).unwrap(),
+        empty
+    );
+}
+
 /// @requirement TB-060, AC-159
 #[test]
 fn otp_mail_messages_roundtrip() {

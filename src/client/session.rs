@@ -186,6 +186,13 @@ pub(crate) struct SessionState {
     /// if any - distinct from push-to-talk's `active_recording`, and never
     /// set for more than one call at a time (`voice_call::is_busy`).
     pub(crate) active_call: Option<voice_call::ActiveCall>,
+    /// Where a live call's audio threads report voice levels
+    /// (`voice::level_from_pcm`) for the call modal's per-participant
+    /// meters - our own capture worker under our own `UserId`, and each
+    /// participant's decrypt worker under theirs. Drained by
+    /// `run_connected_session`'s select loop into
+    /// `UiState::set_call_level`.
+    pub(crate) call_level_tx: tokio::sync::mpsc::UnboundedSender<(UserId, u8)>,
 }
 
 // `key_mode` pushed this past clippy's default 7-argument threshold;
@@ -222,6 +229,8 @@ pub(crate) async fn run_connected_session(
     });
 
     let (audio_err_tx, mut audio_err_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let (call_level_tx, mut call_level_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(UserId, u8)>();
 
     // One persistent mixer thread for the whole session - per-message
     // stream opens against the same device are a common way to make
@@ -315,6 +324,7 @@ pub(crate) async fn run_connected_session(
         mixer_tx,
         stream_finished_tx,
         audio_err_tx,
+        call_level_tx,
         own_key_mode: key_mode,
         own_keys,
         own_pq_private,
@@ -503,6 +513,10 @@ pub(crate) async fn run_connected_session(
                 let Some(err) = err else { break };
                 ui_state.playback_failed(err);
             }
+            level = call_level_rx.recv() => {
+                let Some((peer, level)) = level else { break };
+                ui_state.set_call_level(peer, level);
+            }
             // `hotkey_rx` being `None` (feature disabled, unsupported, or
             // registration failed) parks this branch forever via
             // `pending()`. Unlike `input_rx`/`net_rx`, the sender dying is
@@ -554,6 +568,13 @@ pub(crate) async fn run_connected_session(
                     ui_state.set_conn_quality(session.conn_stats.quality());
                     last_conn_sample = now;
                 }
+                // The call modal's duration readout (`docs/SPEC.md` "Live
+                // voice calls") is refreshed on every tick rather than
+                // once a second: the readout itself only changes at
+                // one-second granularity, and refreshing at the redraw
+                // cadence is what keeps it from lagging a whole second
+                // behind the wall clock it is counting.
+                ui_state.tick_call_duration(now);
                 // The OTP session header's live Seq/Offset/remaining figures
                 // (docs/PROTOCOL.md 16.5) refresh once a second too, and only
                 // for whichever DM is actually open right now - see
@@ -865,6 +886,12 @@ async fn handle_ui_action(
         }
         UiAction::EndCall => {
             voice_call::end_own_call(wr, session, ui_state).await?;
+        }
+        UiAction::InviteToCall { to } => {
+            voice_call::invite_to_call(wr, session, ui_state, to).await?;
+        }
+        UiAction::HostMuteCallMember { peer, muted } => {
+            voice_call::host_set_muted(wr, session, ui_state, peer, muted).await?;
         }
     }
     Ok(())
@@ -1423,6 +1450,21 @@ async fn handle_p2p_event(
         }
         P2pEvent::CallEnd { from, call_id } => {
             voice_call::on_call_end(session, ui_state, from, call_id);
+        }
+        P2pEvent::CallMute {
+            from,
+            call_id,
+            target,
+            muted,
+        } => {
+            voice_call::on_call_mute(session, ui_state, from, call_id, target, muted);
+        }
+        P2pEvent::CallRoster {
+            from,
+            call_id,
+            members,
+        } => {
+            voice_call::on_call_roster(wr, session, ui_state, from, call_id, members).await?;
         }
     }
     Ok(())

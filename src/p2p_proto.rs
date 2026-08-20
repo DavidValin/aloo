@@ -9,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, SocketAddr};
 
-use crate::proto::Envelope;
+use crate::proto::{Envelope, UserId};
 
 /// Target ceiling for one whole UDP datagram on the direct link (a
 /// `PunchDatagram`, fully bincode-encoded), chosen to avoid IP
@@ -278,5 +278,28 @@ pub enum P2pPayload {
     /// many participants remain once everyone who has sent this is gone.
     CallEnd {
         call_id: u64,
+    },
+    /// The host's mute decision for one participant of call `call_id`,
+    /// broadcast to every participant the host currently knows about
+    /// (including `target` itself). Unlike a participant's own local mute
+    /// (which has no wire message at all - see 7.7), a host mute is
+    /// authoritative: `target` stops sending audio until the *host* lifts
+    /// it, and every other participant shows it on their roster.
+    CallMute {
+        call_id: u64,
+        target: UserId,
+        muted: bool,
+    },
+    /// Every participant of call `call_id` the sender currently has in its
+    /// own roster (never including the recipient), sent to a participant
+    /// the sender has just added. Lets someone who joined a call late -
+    /// invited mid-call from the call modal, rather than by the original
+    /// `CallInvite` fan-out - reach participants they could never have
+    /// derived from the call's channel/DM membership alone. The recipient
+    /// answers each listed member with an ordinary `CallAccept`, so 7.7's
+    /// convergence rules do the rest.
+    CallRoster {
+        call_id: u64,
+        members: Vec<UserId>,
     },
 }

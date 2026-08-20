@@ -2111,7 +2111,67 @@ id = "AC-171"
 description = "/endcall leaves the call we're on, and is refused (with a notice) while not on one; /call is refused (with a notice) while already on a call or mid push-to-talk recording, and push-to-talk (Space or the global shortcut) is unavailable while on a call - the microphone is already spoken for."
 evidence = "docs/SPEC.md 'Live voice calls'; src/client/tui/ui.rs submit_input's /endcall and /call branches, current_voice_target's call guard; tests slash_endcall_is_refused_off_a_call_and_works_on_one, slash_call_is_refused_while_already_on_a_call_or_mid_recording, slash_call_with_nowhere_to_call_shows_a_notice, push_to_talk_is_unavailable_while_on_a_call; scenario features/voice/live_call.feature '/call refuses a second call, and /endcall only works on one'"
 
+[[user_story.acceptance_criteria]]
+id = "AC-175"
+description = "A call modal opens the moment a call becomes active and lists everyone on it - the host first, labelled HOST in blue, then everyone else labelled IN CALL (green), INVITED (yellow) or REJECTED (grey), with MUTED (red) added for anyone the host has silenced."
+evidence = "docs/SPEC.md 'Live voice calls'; src/client/tui/ui.rs CallMember, CallMemberState, begin_call, upsert_call_member, on_call_invite_sent, on_call_invite_rejected, set_call_member_host_muted, call_member_labels, render_call_modal; tests the_call_modal_lists_the_host_first_and_labels_every_participant, an_unanswered_invitee_is_listed_as_invited; scenario features/voice/live_call.feature 'The call modal lists the host first and labels everyone on it'"
+
+[[user_story.acceptance_criteria]]
+id = "AC-176"
+description = "The call modal shows the call's duration in yellow, updating every second, and a live voice-level bar next to every participant; our own bar reads empty while our microphone is muted."
+evidence = "docs/SPEC.md 'Live voice calls'; src/client/tui/ui.rs CallUiState::duration_label, tick_call_duration, set_call_level, level_bar, render_call_modal; src/client/voice.rs level_from_pcm; src/client/voice_call.rs spawn_call_audio_worker, spawn_call_decrypt_worker; tests the_call_modal_shows_a_live_duration, each_participant_has_a_live_voice_meter, level_from_pcm_reads_rms_loudness_clamped_to_a_hundred; scenarios features/voice/live_call.feature 'The call modal counts the call's duration live'"
+
+[[user_story.acceptance_criteria]]
+id = "AC-177"
+description = "Escape folds the call modal into its own tab, drawn to the left of the channel tabs; selecting that tab renders the modal alone in place of the sidebar/messages/compose layout, and the modal's participant list scrolls to keep the selected row visible."
+evidence = "docs/SPEC.md 'Live voice calls'; src/client/tui/ui.rs CallUiState::minimized, call_tab_selected, call_modal_showing, handle_call_modal_key; src/client/tui/channel.rs call_and_channel_tabs, render_call_tab_view, select_adjacent_channel; tests escape_minimizes_the_call_modal_into_its_own_tab, the_call_roster_scrolls_to_keep_the_selection_visible; scenario features/voice/live_call.feature 'Escape folds the call modal into its own tab, and it can be reopened'"
+
+[[user_story.acceptance_criteria]]
+id = "AC-178"
+description = "The call modal's END CALL button leaves the call, the same action /endcall produces from anywhere."
+evidence = "docs/SPEC.md 'Live voice calls'; src/client/tui/ui.rs handle_call_modal_key's Enter arm, render_call_modal; test the_modal_end_call_button_ends_the_call; scenario features/voice/live_call.feature 'END CALL in the modal leaves the call'"
+
+[[user_story.acceptance_criteria]]
+id = "AC-179"
+description = "The host can mute any other participant with 'm' on the call modal's roster, and only the host can lift it: the mute travels as CallMute, is honoured only from the call's actual host, and silences the target's own capture until the host sends the matching unmute."
+evidence = "docs/SPEC.md 'Live voice calls'; docs/PROTOCOL.md 7.7; src/client/tui/ui.rs handle_call_modal_key's 'm' arm, UiAction::HostMuteCallMember; src/client/voice_call.rs host_set_muted, on_call_mute, CallRecorderCmd::SetHostMuted; test only_the_host_can_mute_a_participant_from_the_roster; scenarios features/voice/live_call.feature 'Only the host can mute someone from the roster', 'A participant who is not the host cannot mute anyone'"
+
+[[user_story.acceptance_criteria]]
+id = "AC-180"
+description = "The host, and only the host, can invite more people to a running call with 'i' on the call modal; the candidates are the users they share a joined channel or DM history with, excluding anyone already on the call or already invited - one active invitation per user at a time."
+evidence = "docs/SPEC.md 'Live voice calls'; src/client/tui/ui.rs call_invite_candidates, open_call_invite_picker, handle_call_invite_picker_key, render_call_invite_picker; src/client/voice_call.rs invite_to_call; tests the_host_can_invite_someone_who_shares_a_channel_and_only_once, only_the_host_can_open_the_invite_picker; scenario features/voice/live_call.feature 'The host invites one more person from the modal'"
+
+[[user_story.acceptance_criteria]]
+id = "AC-181"
+description = "/call confirms before anything is sent, naming in yellow how many users the invite will reach - every reachable member for a channel call, the one peer for a DM; cancelling rings nobody."
+evidence = "docs/SPEC.md 'Live voice calls'; src/client/tui/ui.rs PendingCallConfirm, call_invitee_count, submit_input's /call branch, render_call_confirm_popup; test slash_call_confirms_how_many_users_it_will_invite; scenario features/voice/live_call.feature '/call says how many users it will invite before inviting any'"
+
+[[user_story.acceptance_criteria]]
+id = "AC-182"
+description = "A /call that would reach nobody never starts a call at all, and says so: 'Call has ended: no one was invited'."
+evidence = "docs/SPEC.md 'Live voice calls'; src/client/tui/ui.rs NO_ONE_INVITED_NOTICE, submit_input's /call branch; src/client/channel.rs handle_start_call's empty-recipient guard; test slash_call_with_no_reachable_members_says_no_one_was_invited; scenario features/voice/live_call.feature '/call with nobody reachable ends before it starts'"
+
+[[user_story.acceptance_criteria]]
+id = "AC-183"
+description = "When the host leaves, the call ends for every participant rather than merely losing one voice, and each of them is told: 'Call has ended: the host left the call'."
+evidence = "docs/SPEC.md 'Live voice calls'; docs/PROTOCOL.md 7.7; src/client/tui/ui.rs HOST_LEFT_NOTICE, CallUiState::host, end_call; src/client/voice_call.rs on_call_end's host branch, teardown_own_call; test the_hosts_departure_notice_reads_as_the_call_ending; scenario features/voice/live_call.feature 'The host leaving ends the call for everyone'"
+
 [[user_story.technical_behavior]]
 id = "TB-199"
 description = "CallInvite, CallAccept, CallReject and CallEnd (the live-call signaling family) round-trip through bincode encode/decode intact, addressed point-to-point like the file-transfer message family."
 evidence = "docs/PROTOCOL.md 'Live voice calls'; src/p2p_proto.rs P2pPayload::CallInvite/CallAccept/CallReject/CallEnd; test live_call_message_family_roundtrips"
+
+[[user_story.technical_behavior]]
+id = "TB-207"
+description = "CallMute and CallRoster - the host-authority half of the live-call signaling family - round-trip through bincode encode/decode intact, including an empty roster."
+evidence = "docs/PROTOCOL.md 7.7; src/p2p_proto.rs P2pPayload::CallMute/CallRoster; test host_mute_and_roster_messages_roundtrip"
+
+[[user_story.technical_behavior]]
+id = "TB-208"
+description = "A voice level is the RMS of one chunk's samples scaled against LEVEL_FULL_SCALE_RMS and clamped to 0-100, so a single sample spike cannot paint a full meter the way a peak reading would."
+evidence = "src/client/voice.rs level_from_pcm, LEVEL_FULL_SCALE_RMS; test level_from_pcm_reads_rms_loudness_clamped_to_a_hundred"
+
+[[user_story.technical_behavior]]
+id = "TB-209"
+description = "A call participant's pq_hybrid StreamKeySetup arriving before that participant is in our roster is held (ActiveCall::pending_setups) and replayed into their decrypt worker the moment they are added, rather than dropped - the ordinary ordering, since a peer sends its setup the instant it adds us, before its own CallAccept has reached us."
+evidence = "docs/PROTOCOL.md 7.7; src/client/voice_call.rs forward_key_setup, add_participant, is_call_stream; test a_call_key_setup_arriving_before_the_participant_is_replayed_once_they_join"
