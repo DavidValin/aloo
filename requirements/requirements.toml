@@ -1024,10 +1024,25 @@ id = "AC-061"
 description = "Up/Down move one message, PageUp/PageDown jump by ten, Home/End go to the oldest/newest, all clamped at the ends rather than wrapping."
 evidence = "docs/SPEC.md 'Connected UI'; tests up_down_clamp_at_the_ends_instead_of_wrapping, page_up_page_down_home_and_end_jump_the_selection"
 
+[[user_story.acceptance_criteria]]
+id = "AC-190"
+description = "Up/Down/PageUp/PageDown scroll the message log straight from the compose bar, without moving focus and without typing into the message being composed."
+evidence = "docs/SPEC.md 'Connected UI', README keybindings; test scroll_keys_reach_the_log_from_the_compose_bar"
+
+[[user_story.acceptance_criteria]]
+id = "AC-191"
+description = "A message log longer than its pane shows a thin scrollbar down the right edge of the pane; one that fits shows none."
+evidence = "docs/SPEC.md 'Connected UI'; test an_overflowing_log_draws_a_scrollbar_and_a_short_one_does_not"
+
 [[user_story.technical_behavior]]
 id = "TB-109"
 description = "The rendered viewport follows the selection rather than always showing the top of the log."
 evidence = "test the_rendered_viewport_follows_the_selection_instead_of_always_showing_the_top"
+
+[[user_story.technical_behavior]]
+id = "TB-211"
+description = "The scrollbar thumb tracks the rendered viewport offset, so it sits at the bottom of its track on the newest message and at the top on the oldest."
+evidence = "test the_scrollbar_thumb_tracks_the_viewport"
 
 [[user_story.technical_behavior]]
 id = "TB-110"

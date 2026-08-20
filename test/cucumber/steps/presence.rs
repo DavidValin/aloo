@@ -259,15 +259,20 @@ async fn help_content(w: &mut AlooWorld) {
     for (needle, what) in [
         ("Help", "a help popup title"),
         ("Ctrl+J", "how to join a hidden channel"),
-        ("Space", "how to send a voice message"),
     ] {
         assert!(
             rows.iter().any(|r| r.contains(needle)),
             "expected {what}: {rows:?}"
         );
     }
-    // Past the first screenful now that the two selectors have their own
-    // lines above it - reached the same way the sections below are.
+    // Past the first screenful now that the two selectors and the log's
+    // scroll keys have their own lines above them - reached the same way
+    // the sections below are.
+    let rows = scroll_help_until(w, "Space");
+    assert!(
+        rows.iter().any(|r| r.contains("Space")),
+        "expected how to send a voice message: {rows:?}"
+    );
     let rows = scroll_help_until(w, "/file");
     assert!(
         rows.iter().any(|r| r.contains("/file")),

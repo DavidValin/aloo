@@ -271,6 +271,37 @@ async fn oldest_selected(w: &mut AlooWorld) {
     );
 }
 
+#[then("the message pane shows a scrollbar")]
+async fn scrollbar_shown(w: &mut AlooWorld) {
+    let buffer = crate::support::ui_buffer(w.ui_ref(), 100, 15);
+    let (thumb, track) = crate::support::message_scrollbar(&buffer)
+        .expect("an overflowing log should draw a scrollbar");
+    assert!(
+        thumb.len() < track.len(),
+        "a thumb filling its whole track would say the log fits: {thumb:?} of {track:?}"
+    );
+}
+
+#[then("the message pane shows no scrollbar")]
+async fn scrollbar_hidden(w: &mut AlooWorld) {
+    let buffer = crate::support::ui_buffer(w.ui_ref(), 100, 15);
+    assert!(
+        crate::support::message_scrollbar(&buffer).is_none(),
+        "a log that fits shouldn't give up a column to a scrollbar"
+    );
+}
+
+#[then(expr = "the scrollbar thumb sits at the {word} of its track")]
+async fn thumb_at_end(w: &mut AlooWorld, end: String) {
+    let buffer = crate::support::ui_buffer(w.ui_ref(), 100, 15);
+    let (thumb, track) = crate::support::message_scrollbar(&buffer).expect("a scrollbar");
+    match end.as_str() {
+        "top" => assert_eq!(thumb.first(), track.first(), "thumb at the top: {thumb:?}"),
+        "bottom" => assert_eq!(thumb.last(), track.last(), "thumb at the bottom: {thumb:?}"),
+        other => panic!("unknown track end {other:?}"),
+    }
+}
+
 #[then("the oldest message is visible and the newest has scrolled away")]
 async fn viewport_follows(w: &mut AlooWorld) {
     let state = w.ui_ref();

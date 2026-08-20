@@ -75,6 +75,55 @@ Feature: Reading back message history
     When I press PageUp
     Then the selection sits one page from the newest
 
+  @AC-190
+  Scenario: The scroll keys reach the log straight from the compose bar
+    Given I am connected and viewing a channel
+    And bob is in the channel with me
+    And the message log holds more than a page of messages
+    And focus is on the compose
+    When I press Up
+    Then the selection is 1 entries below the newest
+    And focus is still on the compose
+    When I press PageUp
+    Then the selection is 11 entries below the newest
+    When I press PageDown
+    Then the selection is 1 entries below the newest
+    When I press Down
+    Then the newest message is selected
+
+  @AC-190
+  Scenario: Scrolling from the compose bar does not type into the message
+    Given I am connected and viewing a channel
+    And bob is in the channel with me
+    And the message log holds more than a page of messages
+    And focus is on the compose
+    When I press Up
+    Then the compose bar is empty
+
+  @AC-191
+  Scenario: A log that overflows its pane shows a scrollbar
+    Given I am connected and viewing a channel
+    And bob is in the channel with me
+    And the message log holds 40 messages
+    Then the message pane shows a scrollbar
+
+  @AC-191
+  Scenario: A log that fits its pane shows no scrollbar
+    Given I am connected and viewing a channel
+    And bob is in the channel with me
+    And the message log holds 2 messages
+    Then the message pane shows no scrollbar
+
+  @TB-211
+  Scenario: The scrollbar thumb tracks the viewport
+    Given I am connected and viewing a channel
+    And bob is in the channel with me
+    And the message log holds 40 messages
+    Then the scrollbar thumb sits at the bottom of its track
+    When I move focus to the log
+    And I press Home
+    Then the scrollbar thumb sits at the top of its track
+
   @TB-109
   Scenario: The viewport follows the selection rather than pinning the top
     Given I am connected and viewing a channel

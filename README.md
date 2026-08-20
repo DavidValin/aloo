@@ -83,6 +83,7 @@ Nicknames are case-sensitive and must be free — if someone else is already con
 - Pick someone in the sidebar and press **Enter** to open a DM with them — it joins the DM selector at the top right, so `]` gets you back to it later and `[` returns to your channels.
 - Type `/channels` and press **Enter** to see every public channel on the server — the ones you're in are yellow, Enter joins the selected one, Escape closes.
 - Press `[` / `]` to move between the channel selector (left) and the DM selector (right); at either end the same key opens that selector's dropdown — every other channel you're in, or room you have open — where Up/Down pick one and Enter, Escape or the opposite key close it. A blinking ✉ marks a channel or DM with messages you haven't seen. `Ctrl+J` joins or creates a channel by name — public or private, optionally password-protected.
+- Press `Up` / `Down` to scroll back through the conversation, `PageUp` / `PageDown` to move ten at a time — straight from the compose bar, without interrupting what you're typing. A scrollbar down the right of the log shows where you are; `Tab` to the log and `Home` / `End` jump to the oldest / newest message.
 - Press `Ctrl+H` anytime for an in-app help screen with all of this.
 
 ## Encryption

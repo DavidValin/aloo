@@ -27,7 +27,10 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{
+    Block, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
+    ScrollbarState,
+};
 
 use crate::client::p2p::LinkStatus;
 use crate::proto::{ChannelInfo, ChannelKind, KeyMode, UserId, UserInfo};
@@ -126,6 +129,10 @@ const HELP_BODY: &[&str] = &[
     "Messaging",
     "  Tab        cycle focus: sidebar -> messages -> compose bar",
     "  Enter      send the typed message (compose bar focused)",
+    "  Up / Down  scroll the message log one message, from the compose bar too",
+    "  PgUp/PgDn  scroll it ten at a time; Home/End jump to the oldest/newest",
+    "             (log focused). A log taller than its pane shows a scrollbar",
+    "             down its right edge.",
     "",
     "Private messages",
     "  Up / Down    pick a user (sidebar focused)",
@@ -3053,6 +3060,19 @@ impl UiState {
     }
 
     fn handle_input_key(&mut self, code: KeyCode) -> Option<UiAction> {
+        // Reading back history is the one thing the compose bar hands
+        // straight to the log: focus starts here and stays here while
+        // typing, so requiring a Tab round-trip to scroll would leave the
+        // history effectively unreachable in normal use. None of these keys
+        // mean anything to a single-line, append-only compose buffer.
+        // Deliberately ahead of the guards below - a log stays readable
+        // even in a room that can no longer be typed in.
+        if matches!(
+            code,
+            KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown
+        ) {
+            return self.handle_messages_key(code);
+        }
         // An offline DM peer can't receive anything: no typing, no send.
         // The compose bar renders "(user offline)" instead in this state
         // (`render_input_bar`), so there's nothing meaningful to edit. Same
@@ -4692,12 +4712,54 @@ pub(crate) fn render_messages(
     } else {
         Style::default()
     };
+    // The rightmost column is given up to the scrollbar, but only while the
+    // log actually overflows - an unscrollable pane shouldn't lose a column
+    // of text to a bar that would be full-height anyway.
+    let visible = inner.height as usize;
+    let overflows = log.len() > visible && inner.width > 1;
+    let list_area = if overflows {
+        Rect {
+            width: inner.width - 1,
+            ..inner
+        }
+    } else {
+        inner
+    };
+
     let list = List::new(items).highlight_style(highlight_style);
     let mut list_state = ListState::default();
     if !log.is_empty() {
         list_state.select(Some(state.message_selected.min(log.len() - 1)));
     }
-    frame.render_stateful_widget(list, inner, &mut list_state);
+    frame.render_stateful_widget(list, list_area, &mut list_state);
+
+    if overflows {
+        // Read after the list has rendered: the offset that keeps the
+        // selection on screen is ratatui's to compute, so the thumb tracks
+        // the viewport itself rather than a guess made from the selection.
+        // ratatui counts `content_length` in scroll *positions*, not items:
+        // the last one shows the final viewport-worth of entries, so with
+        // `log.len()` passed straight in the thumb would stop a step short
+        // of the bottom of its track on the newest message.
+        let mut scrollbar_state = ScrollbarState::new(log.len() - visible + 1)
+            .viewport_content_length(visible)
+            .position(list_state.offset());
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None)
+                .track_symbol(Some("\u{2591}"))
+                .thumb_symbol("\u{2588}")
+                .track_style(Style::default().fg(Color::DarkGray))
+                .thumb_style(Style::default().fg(Color::Gray)),
+            Rect {
+                x: inner.right() - 1,
+                width: 1,
+                ..inner
+            },
+            &mut scrollbar_state,
+        );
+    }
 }
 
 pub(crate) fn render_input_bar(frame: &mut Frame, area: Rect, state: &UiState) {

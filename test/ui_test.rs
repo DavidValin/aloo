@@ -793,6 +793,105 @@ fn the_rendered_viewport_follows_the_selection_instead_of_always_showing_the_top
     );
 }
 
+/// @requirement AC-190
+#[test]
+fn scroll_keys_reach_the_log_from_the_compose_bar() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    let total = 40;
+    push_n_channel_texts(&mut state, total);
+    assert_eq!(state.focus, Focus::Input, "focus starts at the compose bar");
+
+    press(&mut state, KeyCode::Up);
+    assert_eq!(state.message_selected, total - 2);
+    assert_eq!(state.focus, Focus::Input, "scrolling shouldn't steal focus");
+    assert!(
+        state.input.is_empty(),
+        "a scroll key must not type into the message being composed"
+    );
+
+    press(&mut state, KeyCode::PageUp);
+    assert_eq!(
+        state.message_selected,
+        total - 2 - aloo::client::tui::ui::MESSAGE_PAGE_JUMP
+    );
+    press(&mut state, KeyCode::PageDown);
+    assert_eq!(state.message_selected, total - 2);
+    press(&mut state, KeyCode::Down);
+    assert_eq!(state.message_selected, total - 1);
+}
+
+/// @requirement AC-190
+#[test]
+fn a_dm_room_that_cannot_be_typed_in_can_still_be_scrolled() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    for i in 0..5 {
+        state.on_direct_message(UserId(2), "bob".into(), MessageBody::Text(format!("m{i}")));
+    }
+    state.active_private_room = Some(UserId(2));
+    state.message_selected = 4;
+    // An offline peer's room takes no input at all - reading back what was
+    // said before they dropped still has to work.
+    state.on_user_offline(UserId(2));
+
+    // Their disconnect notice lands in the room too, and the view follows
+    // it - the point is only that Up still walks back from wherever the
+    // selection ended up.
+    let before = state.message_selected;
+    press(&mut state, KeyCode::Up);
+    assert_eq!(state.message_selected, before - 1);
+}
+
+/// @requirement AC-191
+#[test]
+fn an_overflowing_log_draws_a_scrollbar_and_a_short_one_does_not() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    push_n_channel_texts(&mut state, 40);
+    let backend = TestBackend::new(100, 15);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| render(f, &state)).unwrap();
+    let (thumb, track) = message_scrollbar(terminal.backend().buffer())
+        .expect("40 messages can't fit a 15-row terminal");
+    assert!(
+        thumb.len() < track.len(),
+        "a thumb filling its track would say the log fits: {thumb:?} of {track:?}"
+    );
+
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    push_n_channel_texts(&mut state, 2);
+    terminal.draw(|f| render(f, &state)).unwrap();
+    assert!(
+        message_scrollbar(terminal.backend().buffer()).is_none(),
+        "a log that fits shouldn't give up a column to a scrollbar"
+    );
+}
+
+/// @requirement TB-211
+#[test]
+fn the_scrollbar_thumb_tracks_the_viewport() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    push_n_channel_texts(&mut state, 40);
+    let backend = TestBackend::new(100, 15);
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    terminal.draw(|f| render(f, &state)).unwrap();
+    let (thumb, track) = message_scrollbar(terminal.backend().buffer()).expect("a scrollbar");
+    assert_eq!(
+        thumb.last(),
+        track.last(),
+        "on the newest message the thumb sits at the bottom: {thumb:?} of {track:?}"
+    );
+
+    state.focus = Focus::Messages;
+    press(&mut state, KeyCode::Home);
+    terminal.draw(|f| render(f, &state)).unwrap();
+    let (thumb, track) = message_scrollbar(terminal.backend().buffer()).expect("a scrollbar");
+    assert_eq!(
+        thumb.first(),
+        track.first(),
+        "on the oldest message it sits at the top: {thumb:?} of {track:?}"
+    );
+}
+
 // ---------------------------------------------------------------------
 // Replaying a voice message / message-log Enter behavior
 // ---------------------------------------------------------------------
@@ -935,12 +1034,14 @@ fn render_help_popup_shows_expected_content_when_open() {
         rows.iter().any(|r| r.contains("Ctrl+J")),
         "expected help on joining a hidden channel: {rows:?}"
     );
+    // Past the first screenful now that the two selectors and the log's
+    // scroll keys have their own lines above them - reached the same way
+    // the sections below are.
+    let rows = scroll_help_until(&mut state, "Space");
     assert!(
         rows.iter().any(|r| r.contains("Space")),
         "expected help on sending a voice message: {rows:?}"
     );
-    // Past the first screenful now that the two selectors have their own
-    // lines above it - reached the same way the sections below are.
     let rows = scroll_help_until(&mut state, "/file");
     assert!(
         rows.iter().any(|r| r.contains("/file")),

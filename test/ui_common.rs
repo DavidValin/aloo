@@ -164,6 +164,33 @@ pub fn rendered_rows(state: &UiState) -> Vec<String> {
         .collect()
 }
 
+/// The message pane's scrollbar as `(thumb_rows, track_rows)` y-ranges, or
+/// `None` when no scrollbar was drawn. Found by locating the thumb glyph
+/// (`█`, which nothing else in the connected UI draws) and walking the
+/// contiguous run of thumb/track glyphs around it in that same column, so
+/// callers don't have to hardcode the pane's geometry.
+pub fn message_scrollbar(buffer: &ratatui::buffer::Buffer) -> Option<(Vec<u16>, Vec<u16>)> {
+    let (x, y0) = (0..buffer.area.width)
+        .flat_map(|x| (0..buffer.area.height).map(move |y| (x, y)))
+        .find(|&(x, y)| buffer[(x, y)].symbol() == "\u{2588}")?;
+    let is_bar = |y: u16| matches!(buffer[(x, y)].symbol(), "\u{2588}" | "\u{2591}");
+    let mut top = y0;
+    while top > 0 && is_bar(top - 1) {
+        top -= 1;
+    }
+    let mut bottom = y0;
+    while bottom + 1 < buffer.area.height && is_bar(bottom + 1) {
+        bottom += 1;
+    }
+    let track: Vec<u16> = (top..=bottom).collect();
+    let thumb = track
+        .iter()
+        .copied()
+        .filter(|&y| buffer[(x, y)].symbol() == "\u{2588}")
+        .collect();
+    Some((thumb, track))
+}
+
 /// Whether `before` appears strictly earlier than `after` in the same row,
 /// used instead of matching one contiguous substring spanning an emoji.
 /// 🔒/🚨 are wide (2-cell) glyphs and ratatui's buffer reserves a padding
