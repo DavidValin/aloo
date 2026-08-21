@@ -149,6 +149,17 @@ pub struct SessionState {
     /// (`docs/PROTOCOL.md` §7.1) or waits for one.
     pub(crate) record_out_tx: tokio::sync::mpsc::UnboundedSender<P2pOutbound>,
     pub(crate) own_stream_done_tx: tokio::sync::mpsc::UnboundedSender<(u64, u32, Vec<u8>)>,
+    /// Progress and completion reports from a pad generation running off
+    /// the event loop (`client::otp::confirm_generate`) - drained by
+    /// `run_connected_session`'s select loop, which moves the spinner and,
+    /// on `Finished`, resumes the provisioning handshake. Generation is the
+    /// one OTP step long enough (minutes, at the sizes now allowed) that
+    /// running it inline would freeze every other thing this loop does.
+    pub(crate) otp_keygen_tx: tokio::sync::mpsc::UnboundedSender<crate::client::otp::OtpKeygenEvent>,
+    /// Completion reports from the pad send/receive workers
+    /// (`client::otp_pad`) - drained by `run_connected_session`'s select
+    /// loop, which is where the two-phase commit advances.
+    pub(crate) otp_pad_tx: tokio::sync::mpsc::UnboundedSender<crate::client::otp_pad::PadEvent>,
     pub(crate) mixer_tx: tokio::sync::mpsc::UnboundedSender<voice::MixerCmd>,
     pub(crate) stream_finished_tx: tokio::sync::mpsc::UnboundedSender<(UserId, u64, u32, Vec<u8>)>,
     pub(crate) audio_err_tx: tokio::sync::mpsc::UnboundedSender<String>,
@@ -242,6 +253,15 @@ pub struct SessionState {
     /// handshake attempt has to restart anyway, same as any other
     /// in-flight state tied to a `UserId`.
     pub(crate) otp_incoming_setup: HashMap<UserId, crate::crypto::otp::OtpKeySetupReassembly>,
+    /// Pads currently streaming *in*, keyed by sender - see
+    /// `client::otp_pad`. At most one per peer: a second `OtpPadStart` from
+    /// the same sender supersedes the first, since a fresh `/otp` on their
+    /// side is a fresh proposal and the old one can never be completed.
+    pub(crate) otp_incoming_pads: HashMap<UserId, crate::client::otp_pad::IncomingPad>,
+    /// Pads currently streaming *out*, keyed by recipient - the sending
+    /// counterpart, and what `on_pad_verify` looks up to decide whether a
+    /// verification it just received belongs to a live transfer.
+    pub(crate) otp_outgoing_pads: HashMap<UserId, crate::client::otp_pad::OutgoingPad>,
     /// OTP mail references and received-mail blobs (docs/PROTOCOL.md §17),
     /// loaded from `~/.aloo/otp_mail/` alongside the other stores and
     /// saved synchronously after every mutation - see
@@ -410,6 +430,10 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
     let (record_out_tx, mut record_out_rx) = tokio::sync::mpsc::unbounded_channel::<P2pOutbound>();
     let (own_stream_done_tx, mut own_stream_done_rx) =
         tokio::sync::mpsc::unbounded_channel::<(u64, u32, Vec<u8>)>();
+    let (otp_keygen_tx, mut otp_keygen_rx) =
+        tokio::sync::mpsc::unbounded_channel::<crate::client::otp::OtpKeygenEvent>();
+    let (otp_pad_tx, mut otp_pad_rx) =
+        tokio::sync::mpsc::unbounded_channel::<crate::client::otp_pad::PadEvent>();
     let (stream_finished_tx, mut stream_finished_rx) =
         tokio::sync::mpsc::unbounded_channel::<(UserId, u64, u32, Vec<u8>)>();
     let (file_events_tx, mut file_events_rx) =
@@ -540,6 +564,8 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
         file_events_tx,
         record_out_tx,
         own_stream_done_tx,
+        otp_keygen_tx,
+        otp_pad_tx,
         mixer_tx,
         stream_finished_tx,
         audio_err_tx,
@@ -575,6 +601,8 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
         otp_text_msg_ids: std::collections::HashMap::new(),
         pending_receipts: crate::client::delivery::PendingReceipts::new(),
         otp_incoming_setup: HashMap::new(),
+        otp_incoming_pads: HashMap::new(),
+        otp_outgoing_pads: HashMap::new(),
         otp_mail_store: crate::client::otp_mail_store::OtpMailStore::load(
             crate::client::otp_mail_store::OtpMailStore::default_dir(),
         )
@@ -593,6 +621,14 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
         announced_online: std::collections::HashSet::new(),
         daemon_awaiting_otp: None,
     };
+
+    // Anything still in `~/.aloo/otp/.tmp/` is key material some earlier
+    // run was still producing or still receiving when it stopped - a
+    // superseded invitation, a dropped link, a kill, a power cut. It never
+    // completed (completion is an atomic rename *out* of that directory),
+    // so it is garbage by definition and is cleared here rather than left
+    // to accumulate. See `client::otp_staging`'s module doc.
+    crate::client::otp_staging::sweep(&session.otp_cli_cfg);
 
     let mut ui_state = UiState::new(display_name);
     // With no server there is nothing to join a channel *through*, so the
@@ -814,6 +850,14 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
                     }
                 }
             }
+            event = otp_pad_rx.recv() => {
+                let Some(event) = event else { break };
+                crate::client::otp::on_pad_event(&mut wr, &mut session, &mut ui_state, event).await?;
+            }
+            event = otp_keygen_rx.recv() => {
+                let Some(event) = event else { break };
+                crate::client::otp::on_keygen_event(&mut wr, &mut session, &mut ui_state, event).await?;
+            }
             finished = stream_finished_rx.recv() => {
                 let Some((from, stream_id, duration_ms, pcm)) = finished else { break };
                 if let Some(active) = session.active_streams.remove(&(from, stream_id)) {
@@ -924,6 +968,21 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
                 tick_count = tick_count.wrapping_add(1);
                 if tick_count % 4 == 0 {
                     ui_state.toggle_blink();
+                }
+                // Independent of any progress report: a spinner that only
+                // moved when bytes landed would stall exactly when the user
+                // most needs to see the app is still alive (a slow disk, a
+                // subprocess still starting up).
+                ui_state.tick_otp_keygen_spinner();
+                // Republish each in-flight pad transfer's link depth for
+                // its worker thread to pace against - the worker cannot
+                // reach into `peer_link` itself (`otp_pad::OutgoingPad`'s
+                // `depth` doc).
+                for (peer, pad) in &session.otp_outgoing_pads {
+                    pad.depth.store(
+                        session.peer_link.outbound_depth(*peer),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                 }
                 let now = Instant::now();
                 // CPU:<pct>% refreshes roughly every 300ms (docs/SPEC.md
@@ -1305,7 +1364,7 @@ async fn handle_ui_action(
             }
         }
         UiAction::ConfirmOtpGenerate { size_mb } => {
-            crate::client::otp::confirm_generate(wr, session, ui_state, size_mb).await?;
+            crate::client::otp::confirm_generate(session, ui_state, size_mb).await?;
         }
         UiAction::CancelOtpGenerate => {
             crate::client::otp::cancel_generate(ui_state);
@@ -2278,6 +2337,13 @@ async fn handle_p2p_event(
             stream_id,
             setup,
         } => {
+            // A pad transfer's setup shares this same generic event too -
+            // claimed first, by the same `(from, stream_id)` test, since a
+            // pad's stream is not an audio one and must not be handed to
+            // the voice machinery.
+            if crate::client::otp::route_pad_key_setup(session, from, stream_id, &setup) {
+                return Ok(());
+            }
             // A call's audio setup and a push-to-talk stream's share this
             // same generic event - `is_call_stream` tells them apart by
             // `(from, stream_id)` (see its doc for why that's unambiguous).
@@ -2368,6 +2434,62 @@ async fn handle_p2p_event(
         }
         P2pEvent::FileEnd { from, stream_id } => {
             file_transfer::end_incoming_transfer(&mut session.active_file_transfers, from, stream_id);
+        }
+        P2pEvent::OtpPadStart {
+            from,
+            stream_id,
+            contact_name,
+            keypair_size_mb,
+            key_len,
+            enc_digest,
+            dec_digest,
+        } => {
+            crate::client::otp::on_pad_start(
+                session,
+                ui_state,
+                from,
+                stream_id,
+                contact_name,
+                keypair_size_mb,
+                key_len,
+                enc_digest,
+                dec_digest,
+            );
+        }
+        P2pEvent::OtpPadChunk {
+            from,
+            stream_id,
+            seq,
+            blocks,
+        } => {
+            crate::client::otp::on_pad_chunk(session, from, stream_id, seq, blocks);
+        }
+        P2pEvent::OtpPadEnd { from, stream_id } => {
+            crate::client::otp::on_pad_end(session, from, stream_id);
+        }
+        P2pEvent::OtpPadVerify {
+            from,
+            contact_name,
+            accepted,
+            enc_digest,
+            dec_digest,
+        } => {
+            crate::client::otp::on_pad_verify(
+                session,
+                ui_state,
+                from,
+                contact_name,
+                accepted,
+                enc_digest,
+                dec_digest,
+            )
+            .await;
+        }
+        P2pEvent::OtpPadCommit { from, contact_name } => {
+            crate::client::otp::on_pad_commit(session, ui_state, from, contact_name).await;
+        }
+        P2pEvent::OtpPadCommitAck { from, contact_name } => {
+            crate::client::otp::on_pad_commit_ack(session, from, contact_name);
         }
         P2pEvent::Delivered {
             peer,
@@ -3348,6 +3470,8 @@ impl SessionState {
         let (file_events_tx, _) = tokio::sync::mpsc::unbounded_channel();
         let (record_out_tx, _) = tokio::sync::mpsc::unbounded_channel();
         let (own_stream_done_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let (otp_keygen_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let (otp_pad_tx, _) = tokio::sync::mpsc::unbounded_channel();
         let (mixer_tx, _) = tokio::sync::mpsc::unbounded_channel();
         let (stream_finished_tx, _) = tokio::sync::mpsc::unbounded_channel();
         let (audio_err_tx, _) = tokio::sync::mpsc::unbounded_channel();
@@ -3393,6 +3517,8 @@ impl SessionState {
             file_events_tx,
             record_out_tx,
             own_stream_done_tx,
+            otp_keygen_tx,
+            otp_pad_tx,
             mixer_tx,
             stream_finished_tx,
             audio_err_tx,
@@ -3426,6 +3552,8 @@ impl SessionState {
             otp_text_msg_ids: std::collections::HashMap::new(),
             pending_receipts: crate::client::delivery::PendingReceipts::new(),
             otp_incoming_setup: HashMap::new(),
+            otp_incoming_pads: HashMap::new(),
+            otp_outgoing_pads: HashMap::new(),
             otp_mail_store: crate::client::otp_mail_store::OtpMailStore::new_empty(
                 spec.scratch.join("otp_mail"),
             ),

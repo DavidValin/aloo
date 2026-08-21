@@ -8,8 +8,9 @@ Feature: Ending a one-time-pad session with /endotp
   offline never quietly ends it for me
 
   See docs/PROTOCOL.md section 16.6. The full send/receive/acknowledge wiring
-  (destroying the local pad, notifying the peer, retrying that notice on
-  reconnect) needs a live session and is verified manually with two clients
+  (pausing the local pad - kept, not destroyed, so a later /otp with the same
+  contact resumes it - notifying the peer, retrying that notice on reconnect)
+  needs a live session and is verified manually with two clients
   (docs/TESTING.md "Known coverage gaps") - these scenarios cover what is
   observable at the compose bar and in local session state.
 

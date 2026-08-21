@@ -322,19 +322,22 @@ const HELP_BODY: &[HelpLine] = &[
     },
     HelpLine::Item {
         keys: "/endotp",
-        text: "ends an active session with that contact right away - no accept/reject \
-               needed, either side may do it alone. Your own copy of the pad is destroyed \
-               immediately; the other side is told now if reachable, or as soon as they \
-               reconnect otherwise. A disconnect alone never ends a session - only \
-               /endotp does - and the DM keeps working either way, just without that \
-               extra layer once it's off.",
+        text: "ends (pauses) an active session with that contact right away - no \
+               accept/reject needed, either side may do it alone. The pad itself is kept, \
+               not destroyed - a later /otp with the same contact resumes the exact same \
+               key rather than generating a new one; the other side is told now if \
+               reachable, or as soon as they reconnect otherwise. A disconnect alone never \
+               ends a session - only /endotp does - and the DM keeps working either way, \
+               just without that extra layer once it's off.",
     },
     HelpLine::Note(
         "If no key exists yet, you're asked to confirm generating one and sharing it \
          automatically over pq_hybrid (or you can run 'otp' yourself and place the keys \
          under ~/.aloo/otp/.keychain/ instead). Confirming asks for a size next, \
-         1-900000 MB per key. An incoming proposal shows an Accept/Reject popup naming \
-         the sender and, for a fresh key, the size offered.",
+         1-1048576 MB per key (1TB, the real 'otp' command's own streaming limit) - a \
+         spinner shows the generation's progress, since a large pad takes a while. An \
+         incoming proposal shows an Accept/Reject popup naming the sender and, for a \
+         fresh key, the size offered.",
     ),
     HelpLine::Note(
         "Requires both sides to use pq_hybrid, and the real 'otp' command \
@@ -1247,6 +1250,50 @@ pub struct PendingOtpGenerate {
     pub pubkey_der: Vec<u8>,
 }
 
+/// How far a pad generation has got, driving the spinner popup
+/// (`render_otp_keygen_popup`). Generation runs off the event loop in its
+/// own task (`client::otp::confirm_generate`), reporting through
+/// `SessionState::otp_keygen_tx`, so the UI keeps redrawing and stays
+/// responsive throughout - which is the whole point: at the sizes this now
+/// allows (up to 1TB per key), a blocked, silent event loop would be
+/// indistinguishable from a crash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OtpKeygenProgress {
+    pub peer: UserId,
+    pub peer_name: String,
+    /// MB per key, as chosen in the size prompt - shown so the popup names
+    /// what is being waited on, not just that something is.
+    pub size_mb: u32,
+    /// Randomness handed to `otp --new-key-pair` so far, and the total it
+    /// will be handed (`2 * size_mb` MB - a pad is two independent keys).
+    pub written_bytes: u64,
+    pub total_bytes: u64,
+    /// Advanced once per UI tick by `tick_otp_keygen_spinner`; indexes
+    /// `SPINNER_FRAMES`. A spinner rather than only a percentage because
+    /// the two answer different questions - "is it still going" and "how
+    /// far" - and the first one matters most while waiting.
+    pub frame: usize,
+}
+
+impl OtpKeygenProgress {
+    /// `0.0..=1.0`, or `0.0` before the total is known (never divides by
+    /// zero - `total_bytes` is `2 * size_mb` MB, so only a zero size could
+    /// produce one, which the size prompt already refuses).
+    pub fn fraction(&self) -> f64 {
+        if self.total_bytes == 0 {
+            return 0.0;
+        }
+        (self.written_bytes as f64 / self.total_bytes as f64).clamp(0.0, 1.0)
+    }
+
+    pub fn percent(&self) -> u16 {
+        (self.fraction() * 100.0).round() as u16
+    }
+}
+
+/// The spinner's animation frames, advanced one per UI tick.
+pub const SPINNER_FRAMES: [&str; 8] = ["\u{280B}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283C}", "\u{2834}", "\u{2826}", "\u{2827}"];
+
 /// One incoming OTP session proposal awaiting an Accept/Reject decision -
 /// the peer-initiated counterpart of `PendingOtpGenerate`, mirroring
 /// `PendingFileOffer`'s queued-popup idiom. `peer_encryption_key`/
@@ -1795,6 +1842,12 @@ pub struct UiState {
     /// (`crypto::otp::otp_size_mb_in_range`) - shown under the input,
     /// cleared the next time the popup opens or a key changes the text.
     pub otp_size_error: Option<String>,
+    /// `Some` while a pad is actually being generated
+    /// (`client::otp::confirm_generate` through to the background
+    /// generation task finishing) - drives the spinner popup, since a pad
+    /// large enough to be worth choosing can take minutes and silence
+    /// there is indistinguishable from a hang.
+    otp_keygen: Option<OtpKeygenProgress>,
     /// Every incoming OTP session proposal currently awaiting a decision,
     /// keyed by the sender - mirrors `file_offers`/`file_offer_queue`
     /// exactly (queued-popup idiom, `Accept`-first default).
@@ -2046,6 +2099,7 @@ impl UiState {
             otp_size_input: None,
             otp_size_text: String::new(),
             otp_size_error: None,
+            otp_keygen: None,
             otp_invites: HashMap::new(),
             otp_invite_queue: VecDeque::new(),
             otp_invite_focus: OtpChoice::Accept,
@@ -3005,6 +3059,49 @@ impl UiState {
         self.otp_size_input.as_ref()
     }
 
+    /// Opens the generation spinner for `peer`'s pad, at 0 of
+    /// `2 * size_mb` MB - called by `client::otp::confirm_generate` the
+    /// moment it hands generation to its background task.
+    pub fn open_otp_keygen(&mut self, peer: UserId, peer_name: String, size_mb: u32) {
+        self.otp_keygen = Some(OtpKeygenProgress {
+            peer,
+            peer_name,
+            size_mb,
+            written_bytes: 0,
+            total_bytes: size_mb as u64 * 1024 * 1024 * 2,
+            frame: 0,
+        });
+    }
+
+    /// Moves the spinner's bar - one `otp_keygen_tx` progress report. A
+    /// no-op once the popup is closed (a late report arriving after the
+    /// generation was already resolved).
+    pub fn set_otp_keygen_progress(&mut self, written_bytes: u64, total_bytes: u64) {
+        if let Some(progress) = self.otp_keygen.as_mut() {
+            progress.written_bytes = written_bytes;
+            progress.total_bytes = total_bytes;
+        }
+    }
+
+    /// Closes the spinner - generation finished, failed, or was abandoned.
+    pub fn close_otp_keygen(&mut self) {
+        self.otp_keygen = None;
+    }
+
+    pub fn otp_keygen_open(&self) -> Option<&OtpKeygenProgress> {
+        self.otp_keygen.as_ref()
+    }
+
+    /// Advances the spinner one frame - driven by the session ticker, the
+    /// same cadence `toggle_blink` rides, so the animation keeps moving
+    /// even while no progress report has arrived (which is exactly when a
+    /// user most needs to see it is still alive).
+    pub fn tick_otp_keygen_spinner(&mut self) {
+        if let Some(progress) = self.otp_keygen.as_mut() {
+            progress.frame = (progress.frame + 1) % SPINNER_FRAMES.len();
+        }
+    }
+
     /// Queues an incoming OTP session proposal - mirrors `push_file_offer`
     /// exactly, one sender at a time (a second proposal from the same
     /// sender while one is already queued simply replaces it, since only
@@ -3047,6 +3144,26 @@ impl UiState {
         let from = self.otp_invite_queue.pop_front()?;
         self.otp_invite_focus = OtpChoice::Accept;
         self.otp_invites.remove(&from)
+    }
+
+    /// Drops one specific peer's unanswered invitation, wherever it sits in
+    /// the queue - unlike `take_otp_invite`, which only ever takes the one
+    /// currently showing.
+    ///
+    /// Used when a fresh `/otp` to that same peer supersedes it
+    /// (`client::otp::handle_otp_command`): answering their proposal and
+    /// making our own at once would leave two live proposals for one
+    /// contact name. Returns whether there was anything to drop. The
+    /// returned invite is dropped here rather than handed back, so its key
+    /// material is zeroized immediately (`PendingOtpInvite` is
+    /// `ZeroizeOnDrop`).
+    pub fn take_otp_invite_from(&mut self, from: UserId) -> bool {
+        self.otp_invite_queue.retain(|queued| *queued != from);
+        if self.otp_invites.remove(&from).is_some() {
+            self.otp_invite_focus = OtpChoice::Accept;
+            return true;
+        }
+        false
     }
 
     /// Sets the always-visible OTP/command status line - see
@@ -3627,6 +3744,17 @@ impl UiState {
             };
         }
 
+        // Generation actually running - the step after the size prompt
+        // below. Absorbs every key without acting on any: there is nothing
+        // to decide here, and no cancel either, because the pad is already
+        // being written to disk by a real subprocess (abandoning it
+        // half-written is exactly the stale-half-pad state
+        // `stage_pending_setup` exists to avoid). It closes itself when the
+        // generation reports back.
+        if self.otp_keygen.is_some() {
+            return None;
+        }
+
         // The pad-size prompt, shown right after Accept below - same
         // priority tier, and mutually exclusive with `otp_generate_confirm`
         // (checked first only because it's the one more likely to be open
@@ -3653,9 +3781,9 @@ impl UiState {
                         self.otp_size_error = None;
                         None
                     }
-                    // 6 digits covers the max (900000) with no room for a
-                    // typo'd extra digit to even be entered.
-                    KeyCode::Char(c) if c.is_ascii_digit() && self.otp_size_text.len() < 6 => {
+                    // 7 digits covers the max (1048576 - 1TB per key) with no
+                    // room for a typo'd extra digit to even be entered.
+                    KeyCode::Char(c) if c.is_ascii_digit() && self.otp_size_text.len() < 7 => {
                         self.otp_size_text.push(c);
                         self.otp_size_error = None;
                         None
@@ -5428,6 +5556,9 @@ pub fn render(frame: &mut Frame, state: &UiState) {
     if let Some(pending) = state.otp_size_input_open() {
         render_otp_size_popup(frame, area, pending, state);
     }
+    if let Some(progress) = state.otp_keygen_open() {
+        render_otp_keygen_popup(frame, area, progress);
+    }
     if let Some(invite) = state.otp_invite_open() {
         render_otp_invite_popup(frame, area, invite, state.otp_invite_focus);
     }
@@ -5693,6 +5824,81 @@ fn render_otp_size_popup(frame: &mut Frame, area: Rect, pending: &PendingOtpGene
             rows[2],
         );
     }
+}
+
+/// How wide the keygen popup's progress bar is drawn, in cells.
+const KEYGEN_BAR_CELLS: usize = 40;
+
+/// Follows `render_otp_size_popup`'s Enter - the pad is now genuinely
+/// being generated (`client::otp::confirm_generate`'s background task), so
+/// this shows a live spinner and progress bar until it finishes.
+///
+/// Absorbs input without offering any action (see `handle_key`): there is
+/// nothing to decide and nothing safe to cancel mid-generation. Its whole
+/// job is to make a long wait legible - at the sizes now allowed, a pad can
+/// take minutes, and a silent frozen screen is the failure mode this
+/// replaces.
+fn render_otp_keygen_popup(frame: &mut Frame, area: Rect, progress: &OtpKeygenProgress) {
+    let popup = centered_rect(64, 8, area);
+    let block = Block::default()
+        .title(format!("Generating a pad for {}", progress.peer_name))
+        .borders(Borders::ALL);
+    let inner = block.inner(popup);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(block, popup);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2), // spinner + what is happening
+            Constraint::Length(1), // bar
+            Constraint::Min(1),    // reassurance
+        ])
+        .split(inner);
+
+    let spinner = SPINNER_FRAMES[progress.frame % SPINNER_FRAMES.len()];
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                format!("{spinner} "),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!(
+                "{}MB per key ({}MB of true randomness in total)",
+                progress.size_mb,
+                progress.size_mb as u64 * 2
+            )),
+        ]))
+        .wrap(ratatui::widgets::Wrap { trim: true }),
+        rows[0],
+    );
+
+    let filled = (progress.fraction() * KEYGEN_BAR_CELLS as f64).round() as usize;
+    let filled = filled.min(KEYGEN_BAR_CELLS);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                "\u{2588}".repeat(filled),
+                Style::default().fg(Color::Green),
+            ),
+            Span::styled(
+                "\u{2591}".repeat(KEYGEN_BAR_CELLS - filled),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::raw(format!("  {}%", progress.percent())),
+        ])),
+        rows[1],
+    );
+
+    frame.render_widget(
+        Paragraph::new(
+            "Generating and sharing happen once - the pad is then reused for every message \
+             with this contact until it runs out.",
+        )
+        .style(Style::default().fg(Color::DarkGray))
+        .wrap(ratatui::widgets::Wrap { trim: true }),
+        rows[2],
+    );
 }
 
 /// A small, non-modal one-line banner in the top-right corner reporting the

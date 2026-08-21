@@ -309,6 +309,77 @@ pub enum P2pPayload {
         msg_id: Option<u64>,
         envelope: Envelope,
     },
+    /// Announces an incoming one-time-pad transfer, before any of it is
+    /// sent. Replaces the old per-chunk `pq_hybrid` envelope scheme, which
+    /// could not work at scale for two reasons: each chunk carried ~7KB of
+    /// fixed signature/key-exchange overhead (at a terabyte, terabytes of
+    /// pure overhead), and the resulting ~40KB datagrams were IP-fragmented
+    /// into ~28 pieces each, so a single lost fragment cost the whole chunk
+    /// and much NAT/firewall gear dropped them outright.
+    ///
+    /// Instead a pad now rides the same machinery a file transfer does: one
+    /// `StreamKeySetup` establishes the key, then the bytes stream as small
+    /// `OtpPadChunk`s that fit one un-fragmented datagram.
+    ///
+    /// `key_len` is one key's length in bytes; a pad is two keys of that
+    /// size, sent back to back (encryption half first), so the transfer is
+    /// `2 * key_len` bytes long. The two digests are of those halves as the
+    /// *sender* holds them - what the receiver checks its own reassembled
+    /// copy against before either side installs anything (see
+    /// `OtpPadVerify`).
+    OtpPadStart {
+        stream_id: u64,
+        contact_name: String,
+        keypair_size_mb: u32,
+        key_len: u64,
+        enc_digest: [u8; 32],
+        dec_digest: [u8; 32],
+    },
+    /// One chunk of pad material, encrypted under the stream key
+    /// `StreamKeySetup` established - exactly like `FileChunk`, and sized
+    /// the same way so it never fragments.
+    OtpPadChunk {
+        stream_id: u64,
+        seq: u32,
+        blocks: Vec<Vec<u8>>,
+    },
+    /// Every chunk has been sent. The receiver checks length and digests
+    /// at this point; nothing is installed on either side yet.
+    OtpPadEnd {
+        stream_id: u64,
+    },
+    /// The receiver's half of the two-phase commit: what it actually
+    /// reassembled, and whether the user accepted it.
+    ///
+    /// A one-time pad carries no integrity check of its own, so two sides
+    /// holding *almost* the same key produce ciphertext that decodes to
+    /// silent garbage rather than to an error. Neither side may install
+    /// until both have proven they hold identical bytes - so the receiver
+    /// reports its own digests here rather than installing, and waits.
+    /// `accepted: false` (a rejection, a length or digest mismatch) ends
+    /// the attempt with nothing installed anywhere.
+    OtpPadVerify {
+        contact_name: String,
+        accepted: bool,
+        enc_digest: [u8; 32],
+        dec_digest: [u8; 32],
+    },
+    /// The sender's half of the two-phase commit: the receiver's digests
+    /// matched its own, so the sender has now installed its own half and
+    /// the receiver may install too. The only message that authorises a
+    /// receiver to add the contact to its keychain.
+    ///
+    /// Retried until acknowledged (`OtpPadCommitAck`), for the same reason
+    /// `/endotp`'s notice is: a commit lost in flight would otherwise leave
+    /// the sender holding a live pad the receiver never installed.
+    OtpPadCommit {
+        contact_name: String,
+    },
+    /// The receiver has installed its half. Ends the exchange and stops
+    /// the sender retrying its commit.
+    OtpPadCommitAck {
+        contact_name: String,
+    },
     /// This side's `client::device_id`, encrypted the same way any other
     /// per-recipient content is (`Content::DeviceIdAnnounce`'s plaintext is
     /// just the id's raw UTF-8 bytes) - sent automatically the moment a

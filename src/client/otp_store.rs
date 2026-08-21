@@ -101,16 +101,20 @@ pub struct OtpContactState {
     /// stale or duplicate at the aloo layer (`otp` itself has no notion of
     /// message ordering beyond pad-offset consumption).
     pub next_expected_in_seq: u64,
-    /// `true` while this side has locally ended the session with `/endotp`
-    /// and the peer still hasn't confirmed receiving that notice
+    /// `true` while this side has locally ended (paused) the session with
+    /// `/endotp` and the peer still hasn't confirmed receiving that notice
     /// (`OtpEndSessionAck`) - the durable counterpart of
     /// `pending_setup_size_mb`, for the same reason: a peer who is offline
     /// right now, or whose connection drops before the notice arrives, must
     /// still learn about it, so this is retried on every reconnect
     /// (`client::otp::resend_pending_end_notices`) rather than only
-    /// attempted once. Never `true` at the same time as `provisioned` -
-    /// `OtpStore::end_session` resets every other field the instant this is
-    /// set, since ending is a full local teardown, not a pause.
+    /// attempted once. Routinely `true` alongside `provisioned` - unlike
+    /// this field's old "the keychain entry was just destroyed" meaning,
+    /// `OtpStore::pause_session` deliberately leaves `provisioned` and the
+    /// sequence counters untouched, since `/endotp` no longer removes the
+    /// real keychain entry either: pausing is not a teardown, it's a
+    /// contact this side has stopped actively using for now, resumable with
+    /// its existing pad via `/otp`.
     pub pending_end_notice: bool,
 }
 
@@ -229,32 +233,35 @@ impl OtpStore {
     }
 
     /// The local half of `/endotp` (`client::otp::handle_end_otp_command`):
-    /// resets `contact_name` all the way back to a never-provisioned-looking
-    /// state (mirroring what `otp_cli::remove_contact` just did to the real
-    /// keychain, so a later fresh `/otp` for the same pair - same derived
-    /// name - starts genuinely clean, never resuming a stale sequence
-    /// counter or gate from the session just ended) and records that the
-    /// peer still needs to be told, durably - see `pending_end_notice`'s
-    /// doc. Overwrites whatever was there rather than merging, the same way
-    /// `client::otp::stage_pending_setup` treats a previous attempt for the
-    /// same name as fully superseded.
-    pub fn end_session(&mut self, contact_name: &str) {
-        self.entries.insert(
-            contact_name.to_string(),
-            OtpContactState {
-                pending_end_notice: true,
-                ..Default::default()
-            },
-        );
+    /// pauses `contact_name` rather than destroying it - clears whatever was
+    /// genuinely mid-flight (an unacked send, a pad still owed to the peer)
+    /// and records that the peer still needs to be told, durably - see
+    /// `pending_end_notice`'s doc. Deliberately leaves `provisioned`,
+    /// `next_out_seq` and `next_expected_in_seq` exactly as they are:
+    /// `/endotp` no longer removes the real keychain entry either
+    /// (`otp_cli::remove_contact` stopped being called alongside this), so
+    /// the pad itself, and this store's record of how far into it each
+    /// direction has gotten, both survive - a later `/otp` with the same
+    /// contact (same derived name) resumes the very same pad exactly where
+    /// it left off, rather than starting over from a fresh key. A no-op
+    /// beyond the pending-state clear if `contact_name` was never
+    /// provisioned at all.
+    pub fn pause_session(&mut self, contact_name: &str) {
+        let state = self.entries.entry(contact_name.to_string()).or_default();
+        state.pending_unacked_out_seq = None;
+        state.pending_content = None;
+        state.pending_setup_size_mb = None;
+        state.pending_end_notice = true;
     }
 
-    /// The receiving side's counterpart to `end_session`
-    /// (`client::otp::on_end_session`): the same full local reset, but
-    /// without owing a notice of our own - we are the one being told, not
-    /// the one telling.
-    pub fn reset_after_peer_ended(&mut self, contact_name: &str) {
-        self.entries
-            .insert(contact_name.to_string(), OtpContactState::default());
+    /// The receiving side's counterpart to `pause_session`
+    /// (`client::otp::on_end_session`): the same pause, but without owing a
+    /// notice of our own - we are the one being told, not the one telling.
+    pub fn pause_after_peer_ended(&mut self, contact_name: &str) {
+        let state = self.entries.entry(contact_name.to_string()).or_default();
+        state.pending_unacked_out_seq = None;
+        state.pending_content = None;
+        state.pending_setup_size_mb = None;
     }
 
     /// The peer's `OtpEndSessionAck` arrived - stop retrying the notice.

@@ -164,6 +164,16 @@ impl ArqSender {
         !self.unacked.is_empty() || !self.backlog.is_empty()
     }
 
+    /// How many frames this sender is still carrying - in flight plus
+    /// waiting behind the window. The backpressure signal a bulk producer
+    /// throttles against (`p2p::PeerLinkManager::outbound_depth`): without
+    /// it, something that can generate frames faster than the link retires
+    /// them - a one-time pad being streamed to a peer, which may be
+    /// terabytes - simply grows `backlog` until memory runs out.
+    pub fn depth(&self) -> usize {
+        self.unacked.len() + self.backlog.len()
+    }
+
     /// Clears all state and hands back every still-unacked payload, oldest
     /// first, for the caller to re-queue. Called when a link is re-punched:
     /// the sequence space belongs to one punched link, so a new one has to

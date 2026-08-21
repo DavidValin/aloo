@@ -108,9 +108,10 @@ async fn wrapped_not_directly_openable(w: &mut AlooWorld) {
 async fn unwraps_and_reads(w: &mut AlooWorld, who: String) {
     let contact = w.otp_contact_name.clone().expect("no otp contact provisioned yet");
     let cfg = w.otp_cfgs.get(&who).expect("no otp config for this side").clone();
-    let blob = unwrap_incoming(&cfg, &w.otp_wrapped, &contact)
-        .await
-        .expect("unwrapping should succeed");
+    let blob = match unwrap_incoming(&cfg, &w.otp_wrapped, &contact).await {
+        aloo::client::otp::UnwrapOutcome::Ok(bytes) => bytes,
+        other => panic!("expected unwrapping to succeed, got {other:?}"),
+    };
 
     let (their_public, their_private) = pq_bundle_for(&who);
     let (alice_public, _) = pq_bundle_for("alice");

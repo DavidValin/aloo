@@ -219,6 +219,10 @@ the payload carried inside a reliable or unreliable one.
 | `OtpFileContentSeq` | reliably | Names an accepted file's content-phase pad slot, independent of the offer's own (§16.2) |
 | `OtpVoiceOffer` | reliably | Offers a fully-recorded voice message under the pad layer - auto-accepted, no popup (§16.2) |
 | `OtpDeliveryAck` | reliably | Confirms an `OtpEnvelope`/`OtpFileOffer`/`OtpVoiceOffer` decoded, unblocking the next one (§16) |
+| `OtpPadStart` | reliably | Announces an incoming one-time pad: its length and the digests both sides will be held to (§16.1) |
+| `OtpPadChunk` / `OtpPadEnd` | reliably | The pad's bytes, streamed small enough never to fragment, then the end of it (§16.1) |
+| `OtpPadVerify` | reliably | What the receiver actually reassembled, and whether it was accepted - installs nothing (§16.1) |
+| `OtpPadCommit` / `OtpPadCommitAck` | reliably | Both sides' digests matched: the sender has installed, the receiver may too, and confirms it has (§16.1) |
 | `DeviceIdAnnounce` | reliably | This side's device id, sealed like any other content - sent automatically once `Active` (§12.7) |
 | `ChannelPresence` | reliably | This side's joined channels, sealed - what turns a serverless punched path into a peer in shared channels (§7.1.5) |
 | `KeyRotation` | reliably | A signed encryption-key rotation, carried on the link instead of relayed - what keeps forward secrecy working with no server in reach (§13.10, §7.1.5) |
@@ -3272,32 +3276,84 @@ send - it never skips asking the other side:
 
 ```
  alice (no pad yet)                                          bob
-   |--- OtpKeySetup { name, size, offset:0,    total_len, ... } ->|   ordinary pq_hybrid envelope
-   |--- OtpKeySetup { name, size, offset:16K,  total_len, ... } ->|   ordinary pq_hybrid envelope
-   |--- ... (one per 16KB slice of enc_key/dec_key) -------------->|
-   |<-- OtpKeySetupAck { name, accepted, reason } ----------------|   ordinary pq_hybrid envelope
+   |--- OtpPadStart { name, size, key_len, enc_digest, dec_digest } ->|
+   |--- StreamKeySetup ---------------------------------------------->|
+   |--- OtpPadChunk * n ---------------------------------------------->|
+   |--- OtpPadEnd ---------------------------------------------------->|
+   |<-- OtpPadVerify { name, accepted, enc_digest, dec_digest } ------|
+   |--- OtpPadCommit { name } ---------------------------------------->|
+   |<-- OtpPadCommitAck { name } -------------------------------------|
 
  alice (pad already in place)                                 bob
    |--- OtpSessionRequest { name } -------------------------------->|   ordinary pq_hybrid envelope
    |<-- OtpKeySetupAck { name, accepted, reason } ----------------|   ordinary pq_hybrid envelope
 ```
 
-All message types here are carried as ordinary `Envelope`s, sealed under
-the ongoing `pq_hybrid` conversation exactly like a text message - the
-one-time-pad layer cannot protect the handshake that establishes it, and
-does not try to.
+The proposals and acknowledgements are carried as ordinary `Envelope`s,
+sealed under the ongoing `pq_hybrid` conversation exactly like a text
+message - the one-time-pad layer cannot protect the handshake that
+establishes it, and does not try to.
+
+The pad's own bytes are the exception, and travel differently for two
+reasons. Wrapping each slice in its own envelope costs a signature and a
+key exchange per slice - a fixed overhead of several kilobytes that, at the
+sizes a pad may reach, comes to more than the pad itself. And the resulting
+datagrams were large enough to be fragmented by IP, so losing any one
+fragment lost the whole slice, and equipment that discards fragmented UDP
+outright discarded the setup entirely - which made provisioning across a
+real network path fail far more often than it succeeded, while working
+perfectly between two clients on one machine.
+
+So the pad streams the way any other bulk content does: one key exchange
+establishes a symmetric key for the transfer, and the bytes follow in
+chunks small enough that no datagram is ever fragmented. The two keys are
+sent back to back - the peer's encryption half first, then its decryption
+half - so the transfer is twice `key_len` and the receiver splits it at
+that boundary. Nothing marks the boundary on the wire; it is known in
+advance from `OtpPadStart`.
+
+The sender hands over more chunks only while what the link is already
+carrying stays under a fixed bound, so a transfer paces itself to whatever
+the path actually drains rather than queueing ahead of it. That is what
+allows a pad of any size: memory holds one chunk and a bounded queue,
+never the pad.
+
+**Neither side installs a pad until both have proven they hold identical
+bytes.** A one-time pad carries no integrity check of its own - that is
+inherent to the cipher - so two sides whose copies differ by a single byte
+produce ciphertext that decodes to plausible-looking garbage, with nothing
+anywhere reporting an error. The exchange therefore commits in two phases.
+`OtpPadStart` declares a digest of each half up front. The receiver
+reassembles to a staging area, checks that it received exactly `2 *
+key_len` bytes and that both halves hash to what was declared, and only
+then asks its user. Accepting produces `OtpPadVerify` carrying the digests
+the receiver actually computed - it installs nothing. The sender compares
+those against its own staged files, and only on a match installs its own
+half and sends `OtpPadCommit`; receiving that commit is the sole
+authorisation for the receiver to install. A mismatch at either point ends
+the attempt with nothing installed anywhere, rather than leaving a pair
+that would silently produce garbage.
+
+Because a commit means the sender has already installed, the receiver can
+never end up holding a pad the sender does not - and the receiver's
+`OtpPadCommitAck` is what lets the sender stop retrying a commit whose
+delivery it cannot otherwise confirm.
 
 Generating a fresh pad is itself gated on the initiating user's explicit
 confirmation - shown a plain choice ("generate and share one automatically
 over pq_hybrid, or arrange it yourself and place the keys where the local
 keychain expects them") before anything is generated or sent. Confirming
-then asks for a size (MB per key, 1 to 900,000 - re-prompting on anything
-outside that range rather than guessing), so a fresh pad is never
+then asks for a size (MB per key, 1 to 1,048,576 - that is 1TB per key,
+the one-time-pad tool's own documented streaming limit - re-prompting on
+anything outside that range rather than guessing), so a fresh pad is never
 generated at some fixed size the user didn't choose. A size larger than a
-direct link can deliver in one burst is refused *before* generation rather
-than after: generation reads that many megabytes of true randomness per
-key synchronously, so discovering the limit afterwards would mean spending
-all of that time to produce a pad that is then rejected. That size travels
+direct link can deliver is refused *before* generation rather than after:
+generation reads that many megabytes of true randomness per key, so
+discovering the limit afterwards would mean spending all of that time to
+produce a pad that is then rejected. Generation streams its randomness in
+fixed-size chunks rather than building the whole pad in memory first, and
+reports progress as it goes, so the initiating side can show how far along
+a large pad is instead of appearing to hang. That size travels
 with the setup message and is shown to the deciding side in its own
 invite popup before it ever has to accept or reject - a much larger pad
 takes longer to arrive and claims more local disk/keychain space than a
@@ -3653,33 +3709,38 @@ either side may do it alone, and the far side is *told*, not asked.
 
 ```
  alice (has decided to end it)                                bob
-   |   destroys her own copy of the pad immediately -
-   |   otp --remove-contact, and every per-contact
-   |   sequence/gate/setup record for bob is reset
+   |   pauses her own copy of the pad - the keychain
+   |   entry and its sequence counters are left exactly
+   |   as they are; only the outstanding-ack gate and any
+   |   pad still owed to bob from an unfinished setup are
+   |   cleared, and the contact stops being active
    |--- OtpEndSession { contact_name } ----------------------------->|   ordinary pq_hybrid envelope
    |                                                                  |   bob does the same local
-   |                                                                  |   teardown on his side
+   |                                                                  |   pause on his side
    |<-- OtpEndSessionAck { contact_name } -----------------------------|
 ```
 
 Both message types here are carried as ordinary `Envelope`s, sealed under
 the ongoing `pq_hybrid` conversation - exactly like every other OTP control
 message in this section (§16.1) - never wrapped through the pad itself,
-since by the time either message goes out the sending side's own copy of
-the pad may already be destroyed.
+since ending a session must not itself depend on the pad still being usable.
 
-**Local teardown happens first, unconditionally, before anything is sent.**
-The instant `/endotp` runs, `otp --remove-contact` deletes the keychain
-entry, and every local record for that contact - the provisioned flag, the
-outstanding-ack gate, any pad still owed to the peer from an unfinished
-`OtpKeySetup` (§16.1), and both sequence counters - resets to the same
-state a never-provisioned contact starts in. This guarantees this side can
-never again spend that pad, even if the notice below is never delivered at
-all, and it guarantees a fresh pad provisioned later for the same peer (the
-contact name is deterministic - a later `/otp` between the same two people
-always derives the identical name, §16.1) starts genuinely clean: sequence
-0 in both directions, no gate held over from the session just ended, no key
-material carried over from it either. A status notice and a line in that
+**Local pausing happens first, unconditionally, before anything is sent.**
+The instant `/endotp` runs, this side stops treating the contact as active
+and clears whatever was genuinely mid-flight - the outstanding-ack gate,
+any pad still owed to the peer from an unfinished `OtpKeySetup` (§16.1).
+Unlike an earlier revision of this behavior, the keychain entry itself and
+both sequence counters (`EncryptedSequence`/`DecryptedSequence`,
+`EncryptionKeyOffset`/`DecryptionKeyOffset` - §16.1) are deliberately left
+untouched: `/endotp` pauses a session, it does not destroy the pad. This
+still guarantees this side can never again spend that pad *while paused*,
+since every send-path gate stops treating the contact as active from this
+call onward - not because the key material is gone, but because nothing
+routes a send through it until the session is reopened. A later `/otp`
+against the same peer finds the existing keychain entry still there and
+proposes resuming it via `OtpSessionRequest` (§16.1), the identical pad
+picking up exactly where it left off rather than a new one being
+generated. A status notice and a line in that
 peer's own DM room both announce "OTP session ended" immediately (§16.3),
 the same way starting one is announced on both sides.
 
@@ -3687,24 +3748,24 @@ the same way starting one is announced on both sides.
 two cases: there is no active session with that peer at all, or an OTP
 mail (§17) to that exact contact is still waiting on the pad's
 stop-and-wait gate (the contact's pending send names a mail, not a live
-P2P one). The second case matters because a mail's only recovery path, if
-its own upload acknowledgement is ever lost, is replaying the exact
-ciphertext `otp --recover-last` still holds for that contact (§17.2) -
-destroying the keychain entry out from under an in-flight mail would make
-that recovery permanently impossible, stranding it in "awaiting
-acknowledgement" forever. Every other kind of outstanding send (a live P2P
-text, file offer, file content, or voice spend) has no second store
-depending on the keychain surviving, so it never blocks `/endotp` - the
-peer simply never receives that one message's own acknowledgement, the
-same outcome a peer who vanished permanently already produces today.
+P2P one). The second case matters because pausing clears that gate's own
+bookkeeping; if the mail's upload acknowledgement then arrived late, there
+would be nothing left to reconcile it against, leaving the contact's
+pad-gate state out of step with what the server still has in flight for
+it. Every other kind of outstanding send (a live P2P text, file offer, file
+content, or voice spend) has no second store depending on that gate
+surviving, so it never blocks `/endotp` - the peer simply never receives
+that one message's own acknowledgement, the same outcome a peer who
+vanished permanently already produces today.
 
 **The receiving side never gets a say.** `OtpEndSession` is not a
 proposal; there is nothing to accept or reject, only to converge to. On
-receipt, the same full local teardown runs - keychain contact removed,
-every per-contact record reset - and a status notice/DM-room line announce
-"OTP session ended by &lt;name&gt;". `OtpEndSessionAck` is always sent
-back, even for a contact that was already reset: that is exactly what a
-*retried* `OtpEndSession` (below) whose first acknowledgement got lost
+receipt, the same local pause runs - the contact stops being active, its
+outstanding-ack gate and any owed setup are cleared, the keychain entry and
+sequence counters are left alone - and a status notice/DM-room line
+announce "OTP session ended by &lt;name&gt;". `OtpEndSessionAck` is always
+sent back, even for a contact that was already paused: that is exactly what
+a *retried* `OtpEndSession` (below) whose first acknowledgement got lost
 looks like on the receiving end, and answering it again is what lets the
 sender's own retry stop.
 
@@ -3722,13 +3783,13 @@ nothing acknowledged yet simply retries again next time.
 
 ```
  alice ends the session while bob is offline                     bob
-   |   local teardown; OtpEndSession has
+   |   local pause; OtpEndSession has
    |   nowhere to go right now
    |
    |   ...bob reconnects, sometime later...
    |--- OtpEndSession { contact_name } -------------------------------->|   the same notice, retried
-   |                                                                      |   bob tears his own side
-   |                                                                      |   down and acknowledges
+   |                                                                      |   bob pauses his own side
+   |                                                                      |   and acknowledges
    |<-- OtpEndSessionAck { contact_name } -----------------------------------|
 ```
 

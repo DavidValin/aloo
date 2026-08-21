@@ -30,13 +30,17 @@ const CONTACT_NAME_FP_BYTES: usize = 12;
 /// pad is always two independent keys this size (`OtpKeySetupPayload`'s
 /// doc), so the actual randomness generated and eventually transferred is
 /// double whatever's chosen here. The floor keeps a pad large enough to be
-/// worth generating and provisioning at all; the ceiling is a sanity bound
-/// against a typo, not a cryptographic limit - `otp --new-key-pair` reads
-/// that many megabytes of true randomness synchronously before anything
-/// else can happen, and the chunked transfer (`OtpKeySetupChunk`) scales
-/// linearly with it.
+/// worth generating and provisioning at all; the ceiling matches the real
+/// `otp` binary's own documented streaming limit - "supports keys up to
+/// 1TB through streaming architecture" (README.md "Keychain Features") -
+/// rather than being an arbitrary, much smaller sanity bound: generation
+/// (`otp_cli::new_key_pair`) streams the randomness in fixed-size chunks
+/// instead of buffering it whole, and the chunked P2P transfer
+/// (`OtpKeySetupChunk`, paced by `client::p2p_reliable::SEND_WINDOW`
+/// rather than handed to the link all at once) scales to it the same way.
 pub const OTP_SIZE_MB_MIN: u32 = 1;
-pub const OTP_SIZE_MB_MAX: u32 = 900_000;
+/// 1 TiB, in MB per key - `1024 * 1024`.
+pub const OTP_SIZE_MB_MAX: u32 = 1_048_576;
 
 /// Whether `size_mb` falls within `OTP_SIZE_MB_MIN..=OTP_SIZE_MB_MAX` -
 /// shared by the size-input popup's own validation and
@@ -44,6 +48,36 @@ pub const OTP_SIZE_MB_MAX: u32 = 900_000;
 /// spends a real subprocess call on the value.
 pub fn otp_size_mb_in_range(size_mb: u32) -> bool {
     (OTP_SIZE_MB_MIN..=OTP_SIZE_MB_MAX).contains(&size_mb)
+}
+
+/// A SHA-256 digest of one key half, used to prove both sides ended up
+/// holding byte-identical pad material before either installs it.
+///
+/// A one-time pad has no integrity check of its own - that is the whole
+/// point of the cipher, and it is why a mismatched pair is so dangerous:
+/// two keys that differ by a single byte produce plausible-looking
+/// ciphertext that decodes to silent garbage, with no error anywhere to
+/// say so. Comparing digests before installing is what turns that into a
+/// refusal instead. It is not a secrecy measure (the digest reveals
+/// nothing usable about a pad this size) but an agreement one.
+pub type KeyDigest = [u8; 32];
+
+/// Digests a key file without ever holding it in memory - pads reach 1TB
+/// (`OTP_SIZE_MB_MAX`), so this streams a fixed-size buffer rather than
+/// reading the file.
+pub fn digest_key_file(path: &std::path::Path) -> std::io::Result<KeyDigest> {
+    use sha2::{Digest, Sha256};
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 1024 * 1024];
+    loop {
+        let read = std::io::Read::read(&mut file, &mut buf)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buf[..read]);
+    }
+    Ok(hasher.finalize().into())
 }
 
 /// Deterministic, order-independent `otp` keychain contact name for a pair

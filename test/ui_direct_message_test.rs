@@ -480,7 +480,7 @@ fn the_size_prompt_supports_backspace() {
 
 /// @requirement AC-144
 #[test]
-fn the_size_prompt_rejects_a_value_outside_1_to_900000() {
+fn the_size_prompt_rejects_a_value_outside_the_allowed_range() {
     let mut state = joined_general_with(vec![user(2, "bob")]);
     state.open_otp_generate_confirm(UserId(2), "bob".into(), KeyMode::PqHybrid, vec![9, 9]);
     press(&mut state, KeyCode::Enter);
@@ -493,17 +493,47 @@ fn the_size_prompt_rejects_a_value_outside_1_to_900000() {
     assert!(state.otp_size_input_open().is_some());
 }
 
+/// A 7-digit value inside the range is accepted; the digit cap only exists
+/// to stop an 8th digit - which could never be in range - being typed at
+/// all.
+///
 /// @requirement AC-144
 #[test]
-fn the_size_prompt_rejects_more_than_six_digits() {
+fn the_size_prompt_accepts_the_maximum_and_rejects_more_than_seven_digits() {
     let mut state = joined_general_with(vec![user(2, "bob")]);
     state.open_otp_generate_confirm(UserId(2), "bob".into(), KeyMode::PqHybrid, vec![9, 9]);
     press(&mut state, KeyCode::Enter);
 
-    // 900001 would be the smallest 6-digit value past the max; typing a
-    // 7th digit must simply not be accepted into the buffer at all.
-    type_str(&mut state, "1234567");
-    assert_eq!(state.otp_size_text, "123456");
+    // The max itself (1TB per key) is 7 digits and must be typeable; an 8th
+    // digit must simply not be accepted into the buffer at all.
+    type_str(&mut state, "10485768");
+    assert_eq!(state.otp_size_text, "1048576");
+
+    let action = press(&mut state, KeyCode::Enter);
+    assert_eq!(
+        action,
+        Some(UiAction::ConfirmOtpGenerate {
+            size_mb: aloo::crypto::otp::OTP_SIZE_MB_MAX
+        }),
+        "the documented maximum must be submittable"
+    );
+}
+
+/// A value past the maximum that still fits the digit cap is caught by the
+/// range check on submit, not by the cap.
+///
+/// @requirement AC-144
+#[test]
+fn the_size_prompt_rejects_a_seven_digit_value_past_the_maximum() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.open_otp_generate_confirm(UserId(2), "bob".into(), KeyMode::PqHybrid, vec![9, 9]);
+    press(&mut state, KeyCode::Enter);
+
+    type_str(&mut state, "9999999");
+    let action = press(&mut state, KeyCode::Enter);
+    assert_eq!(action, None, "past the maximum, even at 7 digits");
+    assert!(state.otp_size_error.is_some());
+    assert!(state.otp_size_input_open().is_some());
 }
 
 /// @requirement AC-144
@@ -519,6 +549,123 @@ fn escape_on_the_size_prompt_cancels_the_whole_session() {
     // Still open at this level - `client::otp::cancel_generate` is the one
     // that actually takes it, once this action reaches it.
     assert!(state.otp_size_input_open().is_some());
+}
+
+// ---------------------------------------------------------------------
+// The generation spinner (a pad large enough to be worth choosing takes
+// long enough that silence would read as a hang)
+// ---------------------------------------------------------------------
+
+#[test]
+fn the_keygen_spinner_opens_with_the_chosen_size_and_no_progress_yet() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.open_otp_keygen(UserId(2), "bob".into(), 4);
+
+    let progress = state.otp_keygen_open().expect("the spinner should be open");
+    assert_eq!(progress.peer, UserId(2));
+    assert_eq!(progress.size_mb, 4);
+    assert_eq!(progress.written_bytes, 0);
+    assert_eq!(
+        progress.total_bytes,
+        4 * 1024 * 1024 * 2,
+        "a pad is two independent keys, so the randomness is double the per-key size"
+    );
+    assert_eq!(progress.percent(), 0);
+}
+
+#[test]
+fn keygen_progress_moves_the_bar_and_clamps_at_a_hundred_percent() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.open_otp_keygen(UserId(2), "bob".into(), 1);
+
+    state.set_otp_keygen_progress(1024 * 1024, 1024 * 1024 * 2);
+    assert_eq!(state.otp_keygen_open().unwrap().percent(), 50);
+
+    // A report past the total (never expected, but the bar must not draw
+    // wider than itself if one ever arrives) reads as complete, not more.
+    state.set_otp_keygen_progress(9_999_999, 1024 * 1024 * 2);
+    assert_eq!(state.otp_keygen_open().unwrap().percent(), 100);
+    assert_eq!(state.otp_keygen_open().unwrap().fraction(), 1.0);
+}
+
+#[test]
+fn the_keygen_spinner_animates_on_the_ticker_even_without_progress() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.open_otp_keygen(UserId(2), "bob".into(), 1);
+    let first = state.otp_keygen_open().unwrap().frame;
+
+    state.tick_otp_keygen_spinner();
+    assert_ne!(
+        state.otp_keygen_open().unwrap().frame,
+        first,
+        "the spinner must keep moving while waiting, not only when bytes land"
+    );
+
+    // Wraps rather than growing without bound.
+    for _ in 0..aloo::client::tui::ui::SPINNER_FRAMES.len() {
+        state.tick_otp_keygen_spinner();
+    }
+    assert!(
+        state.otp_keygen_open().unwrap().frame < aloo::client::tui::ui::SPINNER_FRAMES.len()
+    );
+}
+
+#[test]
+fn ticking_the_spinner_with_no_generation_running_is_a_no_op() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.tick_otp_keygen_spinner();
+    state.set_otp_keygen_progress(1, 2);
+    assert!(state.otp_keygen_open().is_none());
+}
+
+/// Nothing is decidable mid-generation and nothing is safe to cancel (the
+/// pad is already being written to disk), so the popup absorbs every key
+/// without producing an action.
+#[test]
+fn the_keygen_spinner_absorbs_every_key_without_acting() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.open_otp_keygen(UserId(2), "bob".into(), 1);
+
+    for code in [
+        KeyCode::Enter,
+        KeyCode::Esc,
+        KeyCode::Char('y'),
+        KeyCode::Left,
+        KeyCode::Tab,
+    ] {
+        assert_eq!(press(&mut state, code), None, "{code:?} must do nothing");
+        assert!(
+            state.otp_keygen_open().is_some(),
+            "{code:?} must not close the spinner"
+        );
+    }
+}
+
+#[test]
+fn the_keygen_spinner_renders_the_peer_the_size_and_the_percentage() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.open_otp_keygen(UserId(2), "bob".into(), 3);
+    state.set_otp_keygen_progress(1024 * 1024 * 3, 1024 * 1024 * 6);
+
+    // The peer is named in the popup's title, the figures in its body.
+    let rows = rendered_rows_at(&state, 100, 30).join("\n");
+    assert!(
+        rows.contains("Generating a pad for bob"),
+        "names who the pad is for: {rows:?}"
+    );
+
+    let body = popup_body(&buffer_at(&state, 100, 30), "Generating a pad").join("\n");
+    assert!(body.contains("3MB per key"), "names the chosen size: {body:?}");
+    assert!(body.contains("6MB"), "names the total randomness: {body:?}");
+    assert!(body.contains("50%"), "shows how far along it is: {body:?}");
+}
+
+#[test]
+fn closing_the_keygen_spinner_takes_it_away() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.open_otp_keygen(UserId(2), "bob".into(), 1);
+    state.close_otp_keygen();
+    assert!(state.otp_keygen_open().is_none());
 }
 
 /// @requirement AC-139

@@ -255,6 +255,14 @@ name = "otp_provisioning_test"
 path = "test/otp_provisioning_test.rs"
 
 [[test]]
+name = "otp_pad_test"
+path = "test/otp_pad_test.rs"
+
+[[test]]
+name = "otp_staging_test"
+path = "test/otp_staging_test.rs"
+
+[[test]]
 name = "otp_store_test"
 path = "test/otp_store_test.rs"
 

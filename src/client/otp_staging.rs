@@ -1,0 +1,186 @@
+//! Crash-safe staging for one-time-pad key material that is still being
+//! produced or still arriving.
+//!
+//! # The invariant
+//!
+//! `~/.aloo/otp/.tmp/` holds **only work in progress**. Key material
+//! becomes real by being *renamed out* of it - one atomic `rename`, only
+//! once every byte is present and checked. Nothing ever installs a pad
+//! into `otp`'s keychain while it is still inside `.tmp/`.
+//!
+//! Two properties fall straight out of that:
+//!
+//! * **A half-transmitted key can never be used.** The only path from
+//!   `.tmp/` to a usable contact runs through `promote`, and `promote` is
+//!   only reached once the transfer reports itself complete. There is no
+//!   other reader.
+//! * **Anything found in `.tmp/` is garbage, unconditionally.** It does not
+//!   matter *what* interrupted it - a superseded invitation, a dropped
+//!   link, `kill -9`, a power cut mid-generation. If it is still in
+//!   `.tmp/`, it never completed, so `sweep` deletes it at startup with no
+//!   manifest to consult and no truth table to get wrong.
+//!
+//! That second property is what makes the cleanup survive a crash without
+//! any bookkeeping of its own: the *location* is the record. Contrast the
+//! `otp` binary's own crash recovery (README.md "Recovering from a crash"),
+//! which has to reconcile a pending artifact against key file and metadata
+//! precisely because its artifacts live alongside live state; here they
+//! never do.
+//!
+//! # Erasing
+//!
+//! Pad bytes are the literal one-time secret, so staging files are
+//! overwritten before being unlinked rather than just removed. The
+//! overwrite streams a fixed-size zero buffer (`ERASE_CHUNK_BYTES`) rather
+//! than building one the size of the file: a pad may be up to 1TB
+//! (`crypto::otp::OTP_SIZE_MB_MAX`), and allocating that to erase it would
+//! abort the process outright.
+
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+use crate::client::otp_cli::OtpCliConfig;
+
+/// How much is written per pass when overwriting a staging file - bounded
+/// so erasing scales to a 1TB pad without scaling memory with it.
+const ERASE_CHUNK_BYTES: usize = 1024 * 1024;
+
+/// `~/.aloo/otp/.tmp/` - the one directory in-progress key material lives
+/// in. A sibling of `otp`'s own `.keychain/` (both under
+/// `OtpCliConfig::working_dir`), never inside it: `otp` treats every file
+/// in `.keychain/` as its own to reconcile, and half-written pad bytes are
+/// not something it should ever be asked to reason about.
+pub fn tmp_root(cfg: &OtpCliConfig) -> PathBuf {
+    cfg.working_dir.join(".tmp")
+}
+
+/// Removes every leftover in `.tmp/` - called once at session start
+/// (`client::session`) and safe to call at any other time.
+///
+/// Unconditional by design: see the module doc. Anything here is
+/// incomplete, whatever left it behind, so there is nothing to classify.
+/// Best-effort throughout - a staging file that cannot be removed (a
+/// permissions problem, a filesystem hiccup) is skipped rather than
+/// failing the session start, since the invariant that protects the
+/// *keychain* does not depend on the cleanup having succeeded: an
+/// unswept leftover is still never read by anything.
+pub fn sweep(cfg: &OtpCliConfig) {
+    let root = tmp_root(cfg);
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            secure_remove_dir(&path);
+        } else {
+            secure_remove_file(&path);
+        }
+    }
+}
+
+/// A fresh, collision-free directory under `.tmp/` for one in-progress
+/// piece of work. `label` only makes the directory recognisable while
+/// debugging; uniqueness comes from the pid and a nanosecond timestamp, so
+/// two attempts for the same contact - a superseded invitation and the one
+/// superseding it - never share a directory and cannot corrupt each other.
+pub fn new_dir(cfg: &OtpCliConfig, label: &str) -> std::io::Result<PathBuf> {
+    let root = tmp_root(cfg);
+    std::fs::create_dir_all(&root)?;
+    restrict_dir_permissions(&root);
+    let unique = format!(
+        "{label}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let dir = root.join(unique);
+    std::fs::create_dir_all(&dir)?;
+    restrict_dir_permissions(&dir);
+    Ok(dir)
+}
+
+/// Moves completed key material out of `.tmp/` and into its real place -
+/// the one and only way anything leaves staging.
+///
+/// A plain `rename`, so the destination either does not exist yet or
+/// appears complete in one step; there is no window where a reader could
+/// observe half of it. Both paths are under `OtpCliConfig::working_dir`
+/// and therefore on one filesystem, which is what lets `rename` be atomic
+/// at all. Any pre-existing destination is securely removed first rather
+/// than renamed over, so its pad bytes are erased rather than merely
+/// unlinked.
+pub fn promote(from: &Path, to: &Path) -> std::io::Result<()> {
+    if let Some(parent) = to.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if to.exists() {
+        if to.is_dir() {
+            secure_remove_dir(to);
+        } else {
+            secure_remove_file(to);
+        }
+    }
+    std::fs::rename(from, to)
+}
+
+/// Overwrite-then-unlink for one file of pad material. Best-effort: the
+/// unlink is attempted even if the overwrite failed, so a file that could
+/// not be scrubbed is still not left lying around.
+pub fn secure_remove_file(path: &Path) {
+    let _ = overwrite_with_zeros(path);
+    let _ = std::fs::remove_file(path);
+}
+
+/// `secure_remove_file` for every file in `dir`, then the directory
+/// itself. Recurses, so a staging directory that grew subdirectories (the
+/// `otp` CLI writes its generated pair into `<name>_keys/` subdirectories)
+/// is cleaned out entirely rather than leaving the pad bytes inside them.
+pub fn secure_remove_dir(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            secure_remove_dir(&path);
+        } else {
+            secure_remove_file(&path);
+        }
+    }
+    let _ = std::fs::remove_dir(dir);
+}
+
+/// Streams zeros over `path`'s existing length, in `ERASE_CHUNK_BYTES`
+/// passes. Memory use is one buffer regardless of the file's size - see
+/// the module doc for why that matters here specifically.
+fn overwrite_with_zeros(path: &Path) -> std::io::Result<()> {
+    let len = std::fs::metadata(path)?.len();
+    if len == 0 {
+        return Ok(());
+    }
+    let mut file = std::fs::OpenOptions::new().write(true).open(path)?;
+    let zeros = vec![0u8; ERASE_CHUNK_BYTES.min(len as usize)];
+    let mut written = 0u64;
+    while written < len {
+        let this_pass = (len - written).min(zeros.len() as u64) as usize;
+        file.write_all(&zeros[..this_pass])?;
+        written += this_pass as u64;
+    }
+    file.flush()?;
+    // Best-effort durability: an overwrite the OS still holds in cache
+    // when the machine loses power has not actually replaced anything on
+    // the platter.
+    let _ = file.sync_all();
+    Ok(())
+}
+
+#[cfg(unix)]
+fn restrict_dir_permissions(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
+}
+#[cfg(not(unix))]
+fn restrict_dir_permissions(_path: &Path) {}

@@ -327,12 +327,12 @@ fn a_line_written_before_pending_setup_existed_still_loads() {
 }
 
 // ---------------------------------------------------------------------
-// /endotp - ending a session (docs/PROTOCOL.md 16.6)
+// /endotp - pausing a session (docs/PROTOCOL.md 16.6)
 // ---------------------------------------------------------------------
 
 /// @requirement TB-212
 #[test]
-fn end_session_resets_every_field_but_owes_a_notice() {
+fn pause_session_clears_pending_state_but_keeps_the_pad_and_owes_a_notice() {
     let path = temp_store_path();
     let mut store = OtpStore::new_empty(path.clone());
     store.mark_provisioned("alice-bob");
@@ -340,19 +340,22 @@ fn end_session_resets_every_field_but_owes_a_notice() {
     store.record_received("alice-bob", 0);
     store.mark_setup_pending("alice-bob", 2);
 
-    store.end_session("alice-bob");
+    store.pause_session("alice-bob");
 
     let state = store.get("alice-bob").unwrap();
-    assert!(!state.provisioned, "the ended contact must look never-provisioned");
+    assert!(
+        state.provisioned,
+        "the pad itself is kept - /endotp no longer destroys the keychain entry"
+    );
     assert_eq!(state.pending_unacked_out_seq, None);
     assert_eq!(state.pending_content, None);
     assert_eq!(state.pending_setup_size_mb, None);
     assert_eq!(
-        state.next_out_seq, 0,
-        "a future fresh pad provisioned under this same (deterministically-derived) name must \
-         never inherit the ended session's sequence counters"
+        state.next_out_seq, 4,
+        "a later /otp with the same contact resumes the identical pad - the sequence \
+         counters must survive a pause, not reset to 0"
     );
-    assert_eq!(state.next_expected_in_seq, 0);
+    assert_eq!(state.next_expected_in_seq, 1);
     assert!(state.pending_end_notice, "the peer still needs to be told");
     std::fs::remove_file(&path).ok();
 }
@@ -363,7 +366,7 @@ fn a_pending_end_notice_survives_save_and_load() {
     let path = temp_store_path();
     let mut store = OtpStore::new_empty(path.clone());
     store.mark_provisioned("alice-bob");
-    store.end_session("alice-bob");
+    store.pause_session("alice-bob");
     store.save().unwrap();
 
     // Reloaded, because the whole point is surviving a restart - a peer who
@@ -375,17 +378,21 @@ fn a_pending_end_notice_survives_save_and_load() {
 
 /// @requirement TB-212
 #[test]
-fn reset_after_peer_ended_resets_fully_and_owes_no_notice_of_its_own() {
+fn pause_after_peer_ended_clears_pending_state_but_owes_no_notice_of_its_own() {
     let path = temp_store_path();
     let mut store = OtpStore::new_empty(path.clone());
     store.mark_provisioned("alice-bob");
     store.record_sent("alice-bob", 1, PendingOtpContent::Text { channel: None });
 
-    store.reset_after_peer_ended("alice-bob");
+    store.pause_after_peer_ended("alice-bob");
 
     let state = store.get("alice-bob").unwrap();
-    assert!(!state.provisioned);
+    assert!(state.provisioned, "the pad itself is kept on the receiving side too");
     assert_eq!(state.pending_unacked_out_seq, None);
+    assert_eq!(
+        state.next_out_seq, 2,
+        "the sequence counters survive a pause on this side too"
+    );
     assert!(
         !state.pending_end_notice,
         "the receiving side was told, not the one telling - it owes no notice of its own"
@@ -399,7 +406,7 @@ fn clear_end_notice_reports_whether_anything_was_owed() {
     let path = temp_store_path();
     let mut store = OtpStore::new_empty(path.clone());
     store.mark_provisioned("alice-bob");
-    store.end_session("alice-bob");
+    store.pause_session("alice-bob");
     assert!(
         store.clear_end_notice("alice-bob"),
         "the first genuine ack clears it"
@@ -418,7 +425,7 @@ fn pending_end_notices_yields_only_contacts_still_owed_one() {
     let path = temp_store_path();
     let mut store = OtpStore::new_empty(path.clone());
     store.mark_provisioned("owed");
-    store.end_session("owed");
+    store.pause_session("owed");
     store.mark_provisioned("settled");
     let owed: Vec<String> = store.pending_end_notices().map(str::to_string).collect();
     assert_eq!(owed, vec!["owed".to_string()]);
@@ -443,22 +450,98 @@ fn a_line_written_before_pending_end_notice_existed_still_loads_as_false() {
 
 /// @requirement TB-212
 #[test]
-fn ending_one_contacts_session_does_not_touch_another_contacts_state() {
+fn pausing_one_contacts_session_does_not_touch_another_contacts_state() {
     let path = temp_store_path();
     let mut store = OtpStore::new_empty(path.clone());
     store.mark_provisioned("alice-bob");
     store.mark_provisioned("alice-carol");
     store.record_sent("alice-carol", 5, PendingOtpContent::Text { channel: None });
 
-    store.end_session("alice-bob");
+    store.pause_session("alice-bob");
 
-    assert!(!store.get("alice-bob").unwrap().provisioned);
+    assert!(
+        store.get("alice-bob").unwrap().provisioned,
+        "the paused contact's own pad is kept"
+    );
     let carol = store.get("alice-carol").unwrap();
     assert!(
         carol.provisioned,
         "a wholly independent contact - a different pinned nickname, a different otp key - must \
-         be untouched by ending this one"
+         be untouched by pausing this one"
     );
     assert_eq!(carol.pending_unacked_out_seq, Some(5));
+    std::fs::remove_file(&path).ok();
+}
+
+/// @requirement TB-212
+#[test]
+fn pause_session_on_a_never_provisioned_contact_does_not_fabricate_one() {
+    let path = temp_store_path();
+    let mut store = OtpStore::new_empty(path.clone());
+    store.pause_session("stranger");
+    let state = store.get("stranger").unwrap();
+    assert!(
+        !state.provisioned,
+        "pausing must never make an unprovisioned contact look provisioned"
+    );
+    assert!(state.pending_end_notice);
+    std::fs::remove_file(&path).ok();
+}
+
+/// `/endotp` pauses rather than destroys, so a paused contact and an
+/// unacknowledged "ended" notice can coexist - which means reopening has
+/// to be able to cancel that notice, or it would be re-sent on the next
+/// link transition and tear down the session just reopened
+/// (`client::otp::handle_otp_command` clears it before proposing).
+#[test]
+fn a_paused_contact_can_have_its_end_notice_cancelled_and_stay_provisioned() {
+    let path = temp_store_path();
+    let mut store = OtpStore::new_empty(path.clone());
+    store.mark_provisioned("alice-bob");
+    store.record_sent("alice-bob", 3, PendingOtpContent::Text { channel: None });
+    store.pause_session("alice-bob");
+    assert!(store.get("alice-bob").unwrap().pending_end_notice);
+
+    // Reopening cancels the debt without touching the pad.
+    assert!(store.clear_end_notice("alice-bob"));
+
+    let state = store.get("alice-bob").unwrap();
+    assert!(!state.pending_end_notice, "the contradictory notice is gone");
+    assert!(state.provisioned, "the pad is still there to resume");
+    assert_eq!(
+        state.next_out_seq, 4,
+        "and it resumes where it left off, not from zero"
+    );
+    assert!(
+        store.pending_end_notices().next().is_none(),
+        "nothing is owed, so the retry pass has nothing to re-send"
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// The whole point of pausing: after `/endotp`, the contact is still
+/// provisioned, so `/otp` finds an existing key and proposes resuming it
+/// rather than generating a fresh pad.
+#[test]
+fn a_paused_contact_is_still_provisioned_so_otp_resumes_instead_of_regenerating() {
+    let path = temp_store_path();
+    let mut store = OtpStore::new_empty(path.clone());
+    store.mark_provisioned("alice-bob");
+    store.record_received("alice-bob", 0);
+    store.record_sent("alice-bob", 0, PendingOtpContent::Text { channel: None });
+    store.record_acked("alice-bob", 0);
+
+    store.pause_session("alice-bob");
+    store.save().unwrap();
+
+    // Reloaded, because resuming usually happens in a later session.
+    let reloaded = OtpStore::load(&path).unwrap();
+    let state = reloaded.get("alice-bob").unwrap();
+    assert!(
+        state.provisioned,
+        "`detect_or_adopt_existing` keys off this - false would mean generating a new pad"
+    );
+    assert_eq!(state.next_out_seq, 1);
+    assert_eq!(state.next_expected_in_seq, 1);
     std::fs::remove_file(&path).ok();
 }

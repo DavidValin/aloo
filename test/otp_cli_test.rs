@@ -459,3 +459,78 @@ async fn recover_last_file_replays_the_last_sent_ciphertext_without_consuming_ke
         "recovering must not spend any key"
     );
 }
+
+// ---------------------------------------------------------------------
+// Streaming key generation and its progress reporting
+// ---------------------------------------------------------------------
+
+/// The randomness is streamed to the subprocess in chunks rather than
+/// built as one buffer, so progress can be reported as it goes - and so a
+/// pad far larger than RAM stays generatable at all. Uses the smallest
+/// real size (1MB per key); the multi-gigabyte end of the range is
+/// verified by hand, not in the suite.
+#[tokio::test]
+async fn new_key_pair_with_progress_reports_monotonic_progress_to_the_exact_total() {
+    if !require_otp() {
+        return;
+    }
+    let cfg = config_at(temp_dir("keygen-progress"));
+
+    let reports = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(u64, u64)>::new()));
+    let sink = reports.clone();
+    otp_cli::new_key_pair_with_progress(&cfg, 1, "alice", "bob", move |written, total| {
+        sink.lock().unwrap().push((written, total));
+    })
+    .await
+    .expect("generating a 1MB-per-key pair should succeed");
+
+    let reports = reports.lock().unwrap().clone();
+    assert!(!reports.is_empty(), "generation must report progress at all");
+
+    // A pad is two independent keys, so the randomness is double the
+    // per-key size.
+    let expected_total: u64 = 1024 * 1024 * 2;
+    assert!(
+        reports.iter().all(|(_, total)| *total == expected_total),
+        "every report must name the same, correct total: {reports:?}"
+    );
+    assert!(
+        reports.windows(2).all(|w| w[0].0 <= w[1].0),
+        "progress must never go backwards: {reports:?}"
+    );
+    assert_eq!(
+        reports.last().unwrap().0,
+        expected_total,
+        "the final report must account for every byte: {reports:?}"
+    );
+
+    // And the keys it actually wrote are usable, not just reported on.
+    let a = cfg.working_dir.join("alice_keys");
+    assert!(a.join("encryption_for_bob.key").is_file());
+    assert!(a.join("decryption_from_bob.key").is_file());
+}
+
+/// The plain wrapper is the same call with the reporting dropped - it must
+/// still produce a real, usable pair.
+#[tokio::test]
+async fn new_key_pair_without_progress_still_generates_a_usable_pair() {
+    if !require_otp() {
+        return;
+    }
+    let cfg = config_at(temp_dir("keygen-plain"));
+    otp_cli::new_key_pair(&cfg, 1, "alice", "bob")
+        .await
+        .expect("generating a 1MB-per-key pair should succeed");
+
+    let enc = cfg.working_dir.join("alice_keys").join("encryption_for_bob.key");
+    let dec = cfg.working_dir.join("alice_keys").join("decryption_from_bob.key");
+    assert_eq!(
+        std::fs::metadata(&enc).unwrap().len(),
+        1024 * 1024,
+        "each key is the requested per-key size"
+    );
+    otp_cli::add_contact(&cfg, "bob", &enc, &dec)
+        .await
+        .expect("the generated keys must be installable");
+    assert!(otp_cli::has_contact(&cfg, "bob").await.unwrap());
+}

@@ -478,11 +478,14 @@ fn setup_ack_payload_round_trips_through_the_wire_encoding() {
     assert_eq!(decoded.reason.as_deref(), Some("boom"));
 }
 
+/// The ceiling is the real `otp` binary's own documented streaming limit -
+/// 1TB per key (README.md "Keychain Features") - expressed in MB.
+///
 /// @requirement AC-144
 #[test]
 fn otp_size_mb_in_range_matches_the_documented_bounds() {
     assert_eq!(OTP_SIZE_MB_MIN, 1);
-    assert_eq!(OTP_SIZE_MB_MAX, 900_000);
+    assert_eq!(OTP_SIZE_MB_MAX, 1_048_576, "1 TiB, in MB per key");
     assert!(!otp_size_mb_in_range(0));
     assert!(otp_size_mb_in_range(OTP_SIZE_MB_MIN));
     assert!(otp_size_mb_in_range(500_000));
@@ -650,9 +653,8 @@ fn decide_end_otp_refuses_when_nothing_is_provisioned() {
 }
 
 /// A mail send still awaiting this contact's pad gate must never be stranded
-/// by `/endotp` destroying the very keychain entry its retry
-/// (`otp --recover-last`) depends on - see `EndOtpDecision::MailInFlight`'s
-/// doc.
+/// by `/endotp` clearing that gate's own bookkeeping out from under it - see
+/// `EndOtpDecision::MailInFlight`'s doc.
 ///
 /// @requirement TB-212
 #[test]
@@ -669,10 +671,10 @@ fn decide_end_otp_refuses_while_a_mail_is_in_flight() {
 }
 
 /// Unlike a mail spend, a live P2P text/file/voice send outstanding for a
-/// contact has no second store depending on the keychain surviving, so it
-/// must not block `/endotp` - the far side simply never gets that message's
-/// acknowledgement, the same outcome a permanently vanished peer already
-/// produces today.
+/// contact has no second store depending on that gate's bookkeeping
+/// surviving, so it must not block `/endotp` - the far side simply never
+/// gets that message's acknowledgement, the same outcome a permanently
+/// vanished peer already produces today.
 ///
 /// @requirement TB-212
 #[test]
@@ -708,4 +710,20 @@ fn end_session_payload_round_trips_through_the_wire_encoding() {
     let encoded = proto::encode(&payload).unwrap();
     let decoded: OtpEndSessionPayload = proto::decode(&encoded).unwrap();
     assert_eq!(decoded.contact_name, "abcd-1234");
+}
+
+#[test]
+fn zz_scratch_measure_chunk_dgram() {
+    let chunk = OtpKeySetupChunk {
+        contact_name: "aabbccddeeff001122334455-66778899aabbccddeeff0011".to_string(),
+        keypair_size_mb: 1,
+        total_len: 1024 * 1024,
+        offset: 0,
+        enc_chunk: vec![7u8; OTP_SETUP_CHUNK_BYTES],
+        dec_chunk: vec![9u8; OTP_SETUP_CHUNK_BYTES],
+    };
+    let encoded = proto::encode(&chunk).unwrap();
+    eprintln!("OTP_SETUP_CHUNK_BYTES = {}", OTP_SETUP_CHUNK_BYTES);
+    eprintln!("bincode-encoded chunk plaintext = {} bytes", encoded.len());
+    eprintln!("chunks for a 1MB/key pad = {}", (1024*1024usize).div_ceil(OTP_SETUP_CHUNK_BYTES));
 }

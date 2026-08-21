@@ -9,14 +9,23 @@
 //! `working_dir` (`~/.aloo/otp/`) holding every contact's keychain
 //! together - never the app's own current directory.
 //!
-//! Verified directly against the installed binary (`otp v1.4.0`, newer than
-//! the `otp --help` text originally read from source - it added `--status
-//! --porcelain` and `--recover-last` beyond what the plan for this module
-//! was first drafted against): `--status <contact> --porcelain` prints
-//! stable `key=value` lines even on some non-zero exit codes (`4`
+//! Verified directly against the installed binary (`otp v1.5.1`, newer than
+//! both the `otp --help` text originally read from source and the `v1.4.0`
+//! this module was last checked against): `--status <contact> --porcelain`
+//! prints stable `key=value` lines even on some non-zero exit codes (`4`
 //! redelivery pending, `5` delivery confirmation outstanding, `6` key
 //! material rolled back), so `status` below treats any exit code other than
 //! `1` (error / contact not found) as "parse the porcelain output".
+//!
+//! `v1.5.1` added **origin and order verification**: every `--decrypt` now
+//! validates an encrypted per-message metadata block (a 16-byte `source_id`
+//! chunk of the mirrored key itself, plus the message's sequence number and
+//! key offset) before spending a single key byte, and rejects a replayed,
+//! reordered, foreign or corrupted message with a distinct exit code naming
+//! which field(s) failed - see `OtpCliOutcome::Rejected`. It also moved
+//! `KEYCHAIN_REDELIVERED` from exit `3` to exit `8`, freeing `1`-`7` for
+//! the validation-failure combinations (`README.md` "Origin and order
+//! verification" / "Exit codes for `-c`").
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -75,8 +84,10 @@ pub fn binary_available(cfg: &OtpCliConfig) -> bool {
 }
 
 /// The outcome of one `--encrypt`/`--decrypt` call, mapped from the exit
-/// code (README/`--help`: `0` success, `3` `KEYCHAIN_REDELIVERED`, anything
-/// else an error).
+/// code (README.md "Exit codes for `-c`": `0` success, `8`
+/// `KEYCHAIN_REDELIVERED`, `1`-`7` on `--decrypt` a metadata validation
+/// failure, anything else an error) - see `Rejected`'s doc for why this
+/// module treats only `2`-`7` of that range as one.
 #[derive(Debug)]
 pub enum OtpCliOutcome {
     Ok(Vec<u8>),
@@ -84,6 +95,23 @@ pub enum OtpCliOutcome {
     /// an earlier run, not this call's input. Caller must re-invoke - see
     /// `encrypt_retrying`/`decrypt_retrying`.
     Redelivered,
+    /// `--decrypt` only (exit `2`-`7`): the message's encrypted metadata
+    /// block - a 16-byte `source_id` chunk of the mirrored key, its
+    /// sequence number, and its key offset - failed validation against this
+    /// contact's own key state, before a single key byte was spent. `reason`
+    /// is `otp`'s own `stderr` explanation of which field(s) didn't match
+    /// (README.md "Origin and order verification"): a replayed, reordered,
+    /// duplicated, foreign or corrupted message all land here, distinctly
+    /// from a genuine error. Exit `1` (`source_id` alone invalid) is
+    /// deliberately *not* included here even though the table names it too:
+    /// the real binary documents that code as shared with generic errors -
+    /// "Note that exit `1` is shared with generic errors" - and verified
+    /// directly, the delivery-confirmation gate's own refusal (no terminal
+    /// to ask "did the previous message arrive?" on) also exits `1`. Since
+    /// that refusal is not a metadata rejection at all, exit `1` is always
+    /// `Error` here; only `2`-`7` are unambiguous enough to classify as a
+    /// genuine rejection.
+    Rejected(String),
     Error(String),
 }
 
@@ -124,7 +152,17 @@ async fn encrypt_decrypt(
     let (code, stdout, stderr) = run(cfg, &args, data).await?;
     Ok(match code {
         0 => OtpCliOutcome::Ok(stdout),
-        3 => OtpCliOutcome::Redelivered,
+        8 => OtpCliOutcome::Redelivered,
+        // Metadata-validation failures only exist on the decrypt side - see
+        // `OtpCliOutcome::Rejected`'s doc. Exit `1` is deliberately excluded:
+        // the real binary documents it as shared with generic errors (e.g.
+        // the delivery-confirmation gate refusing with no terminal to ask
+        // on), so it stays `Error` rather than being misreported as a
+        // validation rejection - verified directly against a real refusal
+        // of that kind.
+        2..=7 if mode == "--decrypt" => {
+            OtpCliOutcome::Rejected(String::from_utf8_lossy(&stderr).into_owned())
+        }
         _ => OtpCliOutcome::Error(String::from_utf8_lossy(&stderr).into_owned()),
     })
 }
@@ -208,6 +246,10 @@ pub enum FileCliOutcome {
     /// `encrypt_file_retrying`/`decrypt_file_retrying`), which re-creates
     /// (truncates) `dst` before trying again.
     Redelivered,
+    /// Same meaning as `OtpCliOutcome::Rejected` - `dst` was created
+    /// (truncated) but never written to, since the metadata check runs
+    /// before any output is staged.
+    Rejected(String),
     Error(String),
 }
 
@@ -245,7 +287,12 @@ async fn encrypt_decrypt_file(
     let (code, stderr) = run_file_to_file(cfg, &args, src, dst).await?;
     Ok(match code {
         0 => FileCliOutcome::Ok,
-        3 => FileCliOutcome::Redelivered,
+        8 => FileCliOutcome::Redelivered,
+        // See `encrypt_decrypt`'s identical match for why exit `1` is
+        // excluded here too.
+        2..=7 if mode == "--decrypt" => {
+            FileCliOutcome::Rejected(String::from_utf8_lossy(&stderr).into_owned())
+        }
         _ => FileCliOutcome::Error(String::from_utf8_lossy(&stderr).into_owned()),
     })
 }
@@ -309,6 +356,14 @@ pub async fn decrypt_file_retrying(
     ))
 }
 
+/// How much randomness is generated and written to the subprocess's stdin
+/// per step, for `new_key_pair`/`new_key_pair_with_progress` - matches the
+/// real binary's own internal chunk size (README.md "Keychain Features":
+/// "read in 4MB chunks - supports keys up to 1TB without loading into
+/// RAM"), so this side's own memory use tracks the same bound the binary
+/// already holds itself to, however large `size_mb` is.
+const KEYGEN_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+
 /// `otp --new-key-pair <size_mb> <name_a> <name_b>`: reads `2 * size_mb`
 /// megabytes of true randomness from stdin (README: two independent
 /// chunks - one per generated party's role), writes both `<name_a>_keys/`
@@ -319,15 +374,69 @@ pub async fn new_key_pair(
     name_a: &str,
     name_b: &str,
 ) -> io::Result<()> {
-    let total_bytes = (size_mb as usize) * 1024 * 1024 * 2;
-    let randomness = crate::crypto::random_bytes(total_bytes);
+    new_key_pair_with_progress(cfg, size_mb, name_a, name_b, |_written, _total| {}).await
+}
+
+/// `new_key_pair`, calling `on_progress(bytes_written, total_bytes)` after
+/// every chunk streamed to the subprocess's stdin - what
+/// `client::otp::initiate_provisioning` drives a generation spinner from.
+///
+/// Generates and writes the `2 * size_mb` MB of randomness in
+/// `KEYGEN_CHUNK_BYTES` steps rather than one `size_mb`-sized buffer built
+/// up front: at `OTP_SIZE_MB_MAX` (1TB per key, 2TB total) a single
+/// allocation that size would exhaust memory on any real machine well
+/// before it ever reached the subprocess - this keeps this side's own
+/// memory use bounded to one chunk regardless of how large a pad is
+/// chosen, the same streaming property the real binary already documents
+/// for its own side (README.md "Keychain Features").
+pub async fn new_key_pair_with_progress(
+    cfg: &OtpCliConfig,
+    size_mb: u32,
+    name_a: &str,
+    name_b: &str,
+    mut on_progress: impl FnMut(u64, u64),
+) -> io::Result<()> {
+    let total_bytes = size_mb as u64 * 1024 * 1024 * 2;
     let size_str = size_mb.to_string();
     let args = ["--new-key-pair", &size_str, name_a, name_b];
-    let (code, _stdout, stderr) = run(cfg, &args, &randomness).await?;
-    if code == 0 {
+    let mut child = Command::new(&cfg.binary_path)
+        .args(args)
+        .current_dir(&cfg.working_dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut stdin = child.stdin.take().expect("stdin was piped");
+    // Written concurrently with `wait_with_output` below (`tokio::join!`,
+    // the same shape `run` already uses), not sequentially before it: the
+    // subprocess's own stdout/stderr must be drained as it runs, or a chunky
+    // write here and a chunky write from the binary's own progress output
+    // could deadlock each other against the OS pipe buffers once either
+    // side outruns the other's small fixed capacity.
+    let write = async {
+        let mut written = 0u64;
+        // Errors writing to stdin are deliberately swallowed here, exactly
+        // like `run`'s own `write_all` - the subprocess's own exit code and
+        // stderr, read below once it exits, are the authority on what
+        // actually happened (a binary that reads less than offered, e.g.
+        // because it refused up front, closes its end of the pipe first).
+        while written < total_bytes {
+            let this_chunk = KEYGEN_CHUNK_BYTES.min((total_bytes - written) as usize);
+            let chunk = crate::crypto::random_bytes(this_chunk);
+            if stdin.write_all(&chunk).await.is_err() {
+                break;
+            }
+            written += this_chunk as u64;
+            on_progress(written, total_bytes);
+        }
+        drop(stdin);
+    };
+    let (_, output) = tokio::join!(write, child.wait_with_output());
+    let output = output?;
+    if output.status.code() == Some(0) {
         Ok(())
     } else {
-        Err(io::Error::other(String::from_utf8_lossy(&stderr).into_owned()))
+        Err(io::Error::other(String::from_utf8_lossy(&output.stderr).into_owned()))
     }
 }
 

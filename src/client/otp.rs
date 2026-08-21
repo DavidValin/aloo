@@ -160,15 +160,63 @@ pub async fn wrap_outgoing(cfg: &OtpCliConfig, pq_blob: Vec<u8>, contact_name: &
     }
 }
 
+/// `unwrap_incoming`'s result, split so a caller can tell a message the
+/// real `otp` binary actively refused - a replayed, reordered, foreign or
+/// corrupted ciphertext, caught by its origin/order metadata check before
+/// any key was spent (`otp_cli::OtpCliOutcome::Rejected`'s doc) - apart
+/// from an ordinary failure, and say so.
+#[derive(Debug)]
+pub enum UnwrapOutcome {
+    Ok(Vec<u8>),
+    /// `otp`'s own metadata validation refused this message; `reason` is
+    /// its `stderr` explanation of which field(s) didn't match.
+    Rejected(String),
+    Failed,
+}
+
 /// Unwraps wire bytes back to the `pq_hybrid` blob: `otp -c <contact_name>
 /// --decrypt -y`. Always passes `assume_delivered: true` - local delivery
 /// is immediate and self-vouching (the plaintext either reaches the local
 /// application right now or this call already failed), the asymmetric
 /// counterpart of the encrypt side's genuine-remote-ack requirement.
-pub async fn unwrap_incoming(cfg: &OtpCliConfig, wire_bytes: &[u8], contact_name: &str) -> Option<Vec<u8>> {
+pub async fn unwrap_incoming(cfg: &OtpCliConfig, wire_bytes: &[u8], contact_name: &str) -> UnwrapOutcome {
     match otp_cli::decrypt_retrying(cfg, contact_name, wire_bytes, true).await {
-        Ok(OtpCliOutcome::Ok(bytes)) => Some(bytes),
-        _ => None,
+        Ok(OtpCliOutcome::Ok(bytes)) => UnwrapOutcome::Ok(bytes),
+        Ok(OtpCliOutcome::Rejected(reason)) => UnwrapOutcome::Rejected(reason),
+        _ => UnwrapOutcome::Failed,
+    }
+}
+
+/// `unwrap_incoming` plus the notice a rejection deserves - shared by
+/// `on_message`/`on_file_offer`, the two receive paths where an incoming
+/// envelope is genuinely OTP-wrapped. A rejection is worth saying out loud
+/// (unlike an ordinary decode failure): it means this exact ciphertext was
+/// not produced by the mirrored key at the position expected - a replay, a
+/// reordered or duplicated message, or one from a source this pad doesn't
+/// recognize - security-relevant on its own, distinct from a transient
+/// failure.
+async fn unwrap_or_notify(
+    cfg: &OtpCliConfig,
+    wire_bytes: &[u8],
+    contact_name: &str,
+    ui_state: &mut UiState,
+    from: UserId,
+    from_name: &str,
+) -> Option<Vec<u8>> {
+    match unwrap_incoming(cfg, wire_bytes, contact_name).await {
+        UnwrapOutcome::Ok(bytes) => Some(bytes),
+        UnwrapOutcome::Rejected(reason) => {
+            let reason = reason.trim().replace('\n', "; ");
+            notify(
+                ui_state,
+                from,
+                from_name,
+                format!("OTP: a message from {from_name} was rejected ({reason}) - keys untouched"),
+                false,
+            );
+            None
+        }
+        UnwrapOutcome::Failed => None,
     }
 }
 
@@ -177,20 +225,12 @@ pub async fn unwrap_incoming(cfg: &OtpCliConfig, wire_bytes: &[u8], contact_name
 /// keychain (or are about to be discarded because they never got that
 /// far) - this material is the actual one-time secret, so it doesn't just
 /// get `remove_dir_all`'d.
+///
+/// Delegates to `otp_staging`, whose overwrite streams a bounded buffer
+/// rather than allocating one the size of the file - the difference
+/// between erasing a 1TB pad and aborting the process trying to.
 fn secure_remove_dir(dir: &Path) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_file() {
-            if let Ok(len) = std::fs::metadata(&path).map(|m| m.len()) {
-                let _ = std::fs::write(&path, vec![0u8; len as usize]);
-            }
-            let _ = std::fs::remove_file(&path);
-        }
-    }
-    let _ = std::fs::remove_dir(dir);
+    crate::client::otp_staging::secure_remove_dir(dir);
 }
 
 /// Best-effort overwrite-then-remove of one temp content file created via
@@ -199,10 +239,7 @@ fn secure_remove_dir(dir: &Path) {
 /// through `otp --encrypt`/`--decrypt` on disk (never buffered whole in
 /// memory - see `otp_cli::encrypt_file`/`decrypt_file`).
 pub(crate) fn secure_remove_file(path: &Path) {
-    if let Ok(len) = std::fs::metadata(path).map(|m| m.len()) {
-        let _ = std::fs::write(path, vec![0u8; len as usize]);
-    }
-    let _ = std::fs::remove_file(path);
+    crate::client::otp_staging::secure_remove_file(path);
 }
 
 /// A fresh, collision-free path under the OTP working directory for a
@@ -288,63 +325,104 @@ pub async fn initiate_provisioning(
     own_fp: &[u8; 32],
     peer_fp: &[u8; 32],
 ) -> Option<crypto::otp::OtpKeySetupPayload> {
+    initiate_provisioning_with_progress(cfg, size_mb, own_fp, peer_fp, |_, _| {}).await
+}
+
+/// `initiate_provisioning`, reporting generation progress as it goes -
+/// what `confirm_generate`'s background task drives the spinner popup
+/// from. Only the `otp --new-key-pair` step reports: it is the one that
+/// scales with `size_mb`, and so the only one worth watching.
+pub async fn initiate_provisioning_with_progress(
+    cfg: &OtpCliConfig,
+    size_mb: u32,
+    own_fp: &[u8; 32],
+    peer_fp: &[u8; 32],
+    on_progress: impl FnMut(u64, u64),
+) -> Option<crypto::otp::OtpKeySetupPayload> {
     let contact_name = crypto::otp::contact_name_for(own_fp, peer_fp);
     let name_a = format!("{contact_name}_a");
     let name_b = format!("{contact_name}_b");
 
-    otp_cli::new_key_pair(cfg, size_mb, &name_a, &name_b)
-        .await
-        .ok()?;
+    // Everything below happens inside `.tmp/`, and only a completed pad is
+    // renamed out of it - so a crash, a kill or a power cut anywhere in
+    // here leaves nothing that any later run could mistake for a usable
+    // pad (`client::otp_staging`'s module doc). Generation itself is
+    // pointed at the staging directory by giving `otp` a working dir of
+    // its own: `--new-key-pair` writes `<name>_keys/` relative to wherever
+    // it runs, and those raw halves must not land next to the real
+    // keychain.
+    let staging = crate::client::otp_staging::new_dir(cfg, "gen").ok()?;
+    let gen_cfg = OtpCliConfig {
+        binary_path: cfg.binary_path.clone(),
+        working_dir: staging.clone(),
+    };
+    let generated =
+        otp_cli::new_key_pair_with_progress(&gen_cfg, size_mb, &name_a, &name_b, on_progress).await;
+    if generated.is_err() {
+        crate::client::otp_staging::secure_remove_dir(&staging);
+        return None;
+    }
 
-    let dir_a = cfg.working_dir.join(format!("{name_a}_keys"));
-    let dir_b = cfg.working_dir.join(format!("{name_b}_keys"));
-
+    let dir_a = staging.join(format!("{name_a}_keys"));
+    let dir_b = staging.join(format!("{name_b}_keys"));
     let staged = stage_pending_setup(
         cfg,
+        &staging,
         &contact_name,
         &dir_a.join(format!("encryption_for_{name_b}.key")),
         &dir_a.join(format!("decryption_from_{name_b}.key")),
         &dir_b.join(format!("encryption_for_{name_a}.key")),
         &dir_b.join(format!("decryption_from_{name_a}.key")),
     );
-    secure_remove_dir(&dir_a);
-    secure_remove_dir(&dir_b);
+    crate::client::otp_staging::secure_remove_dir(&staging);
     staged?;
 
     read_pending_setup(cfg, &contact_name, size_mb)
 }
 
-/// Copies a freshly generated pad's four key files into the pending
-/// directory under canonical names, so nothing downstream has to know the
-/// `otp` CLI's role-suffixed naming. `None` if any part of it fails, in
-/// which case the caller removes the staging directory and reports failure
-/// rather than sending half a pad.
+/// Gathers a freshly generated pad's four key files under canonical names
+/// and publishes them as this contact's pending setup in one atomic step,
+/// so nothing downstream has to know the `otp` CLI's role-suffixed naming,
+/// and - more importantly - so `<contact>_pending/` is only ever observed
+/// absent or complete, never half-populated. A reader that caught it
+/// mid-assembly would send a truncated pad, which is precisely the
+/// half-a-key hazard staging exists to rule out.
+///
+/// The four files are *renamed* into place rather than copied: they are
+/// already inside `staging`, on the same filesystem as their destination,
+/// so this neither duplicates the bytes on disk nor spends time
+/// proportional to a pad that may be a terabyte.
+///
+/// `None` if any part of it fails, in which case the caller removes the
+/// staging directory and reports failure rather than sending half a pad.
 fn stage_pending_setup(
     cfg: &OtpCliConfig,
+    staging: &Path,
     contact_name: &str,
     own_enc: &Path,
     own_dec: &Path,
     peer_enc: &Path,
     peer_dec: &Path,
 ) -> Option<()> {
-    let dir = pending_setup_dir(cfg, contact_name);
-    // A pad already staged for this contact is a previous attempt that was
-    // never accepted; it is replaced wholesale rather than merged, so the
-    // four files always describe one single generation.
-    secure_remove_dir(&dir);
-    std::fs::create_dir_all(&dir).ok()?;
-    restrict_dir_permissions(&dir);
-    let (own_enc_to, own_dec_to, peer_enc_to, peer_dec_to) = pending_paths(&dir);
+    // Assembled under `staging` (still inside `.tmp/`, still garbage if
+    // interrupted), then promoted as a whole directory.
+    let assembled = staging.join("ready");
+    std::fs::create_dir_all(&assembled).ok()?;
+    restrict_dir_permissions(&assembled);
+    let (own_enc_to, own_dec_to, peer_enc_to, peer_dec_to) = pending_paths(&assembled);
     for (from, to) in [
         (own_enc, &own_enc_to),
         (own_dec, &own_dec_to),
         (peer_enc, &peer_enc_to),
         (peer_dec, &peer_dec_to),
     ] {
-        std::fs::copy(from, to).ok()?;
+        std::fs::rename(from, to).ok()?;
         restrict_file_permissions(to);
     }
-    Some(())
+    // A pad already staged for this contact is a previous attempt that was
+    // never accepted; `promote` securely removes it before renaming, so
+    // the four files always describe one single generation.
+    crate::client::otp_staging::promote(&assembled, &pending_setup_dir(cfg, contact_name)).ok()
 }
 
 /// Reads the peer's half back out of the pending directory as a sendable
@@ -395,25 +473,29 @@ pub fn discard_pending_setup(cfg: &OtpCliConfig, contact_name: &str) {
 }
 
 /// Runs the receiving side of the handshake (plan step 5-6): stages the
-/// received key bytes to temp files under `cfg.working_dir` just long
-/// enough for `otp --add-contact` to consume them, then securely removes
-/// the staging directory regardless of outcome.
+/// received key bytes under `.tmp/` just long enough for `otp
+/// --add-contact` to consume them, then securely removes the staging
+/// directory regardless of outcome.
+///
+/// Staged inside `.tmp/` rather than beside the keychain so that an
+/// interruption anywhere here - between writing the two halves, or during
+/// `--add-contact` itself - leaves nothing a later run could pick up and
+/// install (`client::otp_staging`'s module doc). The contact only becomes
+/// real through `--add-contact`, which is reached exactly once both halves
+/// are fully written.
 pub async fn apply_incoming_setup(
     cfg: &OtpCliConfig,
     payload: &crypto::otp::OtpKeySetupPayload,
 ) -> crypto::otp::OtpKeySetupAckPayload {
-    let staging_dir = cfg
-        .working_dir
-        .join(format!("{}_incoming", payload.contact_name));
     let ack = |accepted: bool, reason: Option<String>| crypto::otp::OtpKeySetupAckPayload {
         contact_name: payload.contact_name.clone(),
         accepted,
         reason,
     };
-    if let Err(e) = std::fs::create_dir_all(&staging_dir) {
-        return ack(false, Some(format!("staging directory: {e}")));
-    }
-    restrict_dir_permissions(&staging_dir);
+    let staging_dir = match crate::client::otp_staging::new_dir(cfg, "incoming") {
+        Ok(dir) => dir,
+        Err(e) => return ack(false, Some(format!("staging directory: {e}"))),
+    };
 
     let enc_path = staging_dir.join("encryption_for_peer.key");
     let dec_path = staging_dir.join("decryption_from_peer.key");
@@ -531,6 +613,20 @@ pub(crate) async fn handle_otp_command(
         return Ok(());
     }
 
+    // A `/endotp` notice still owed to this peer is a statement about the
+    // session the user is now reopening - and the two contradict each
+    // other. Left in place it would be re-sent on the next link
+    // transition (`resend_pending_end_notices`) and tear down the very
+    // session being started here, on both sides. Asking again is the newer
+    // intent, so the older debt is dropped.
+    //
+    // Only reachable at all because `/endotp` now *pauses* rather than
+    // destroying: the pad survives it, so a reopen and an unacknowledged
+    // end notice can genuinely coexist for the same contact.
+    if session.otp_store.clear_end_notice(&contact_name) {
+        let _ = session.otp_store.save();
+    }
+
     let already_have_key =
         detect_or_adopt_existing(&session.otp_cli_cfg, &mut session.otp_store, &contact_name).await;
 
@@ -585,6 +681,33 @@ pub(crate) async fn handle_otp_command(
         // itself (or its lack) is now always visible.
         notify(ui_state, peer, &peer_name, link_readiness_notice(readiness, &peer_name), true);
     } else {
+        // An invitation already owed to this contact is a *previous*
+        // attempt: one whose pad never arrived, was never answered, or was
+        // superseded by the peer's own. It must never stand in the way of
+        // asking again - a user who types `/otp` after nothing happened is
+        // asking to start over, and leaving the old debt in place would
+        // both keep re-offering a pad the peer may never have seen and
+        // make the fresh one collide with it under the same (derived,
+        // therefore identical) contact name. Dropped here, before anything
+        // new is generated, so a retry is always a clean start. Nothing in
+        // the keychain is touched: this only ever clears a pad that was
+        // staged and never adopted.
+        if session
+            .otp_store
+            .get(&contact_name)
+            .is_some_and(|c| c.pending_setup_size_mb.is_some())
+        {
+            discard_pending_setup(&session.otp_cli_cfg, &contact_name);
+            session.otp_store.clear_pending_setup(&contact_name);
+            let _ = session.otp_store.save();
+        }
+        // Likewise an invitation from *them* still sitting unanswered on
+        // this side: answering it and proposing our own at the same time
+        // would leave two live proposals for one contact name. The fresh
+        // `/otp` the user just asked for is the one that stands.
+        session.otp_incoming_setup.remove(&peer);
+        ui_state.take_otp_invite_from(peer);
+
         ui_state.open_otp_generate_confirm(peer, peer_name, key_mode, peer_pubkey_der);
         // A decision popup just opened - chime, like every popup that
         // asks the user for an action does (the file-offer precedent).
@@ -596,15 +719,21 @@ pub(crate) async fn handle_otp_command(
 /// `UiAction::ConfirmOtpGenerate`'s handler: the user said yes to "generate
 /// a pad and share it over pq_hybrid" (`ui_state.otp_generate_confirm`) and
 /// then chose `size_mb` (MB per key) in the prompt that followed
-/// (`ui_state.otp_size_input`). Generates the keypair at that size, keeps
-/// this side's own working half (`initiate_provisioning`), and sends the
-/// peer's half - along with the size, so the deciding side can see what
-/// it's agreeing to before it answers (`PendingOtpInvite::pad_size_mb`) -
-/// as `Content::OtpKeySetup`. Still does not become active on this side
-/// either, until the peer answers with `OtpKeySetupAck{accepted: true}`
-/// (`on_key_setup_ack`).
+/// (`ui_state.otp_size_input`).
+///
+/// Validates the size, then hands the generation itself to a background
+/// task and returns immediately - nothing is sent from here. The task
+/// reports through `SessionState::otp_keygen_tx`, and `on_keygen_event`
+/// resumes the handshake once the pad exists: keeping this side's own
+/// working half and sending the peer's - along with the size, so the
+/// deciding side can see what it's agreeing to before it answers
+/// (`PendingOtpInvite::pad_size_mb`) - as `Content::OtpKeySetup`. Still
+/// does not become active on this side either, until the peer answers with
+/// `OtpKeySetupAck{accepted: true}` (`on_key_setup_ack`).
+///
+/// Takes no `ControlSink`, unlike its sibling handlers: by the time
+/// anything needs sending, this call has long returned.
 pub(crate) async fn confirm_generate(
-    wr: &mut impl crate::control::ControlSink,
     session: &mut SessionState,
     ui_state: &mut UiState,
     size_mb: u32,
@@ -658,166 +787,127 @@ pub(crate) async fn confirm_generate(
             &pending.peer_name,
             format!(
                 "OTP session failed: {size_mb}MB per key is more than a direct link can \
-                 deliver in one go - the limit is {OTP_MAX_PROVISIONABLE_MB}MB per key"
+                 deliver in one go - the limit for sharing over the network is \
+                 {OTP_MAX_PROVISIONABLE_MB}MB per key. For a larger pad, generate it with \
+                 'otp --new-key-pair' and install it from /contacts (o) on both sides"
             ),
             false,
         );
         return Ok(());
     }
 
-    // Immediate feedback the moment a valid size is submitted - generating
-    // the keypair and staging it into the keychain is a real subprocess
-    // call that can take a moment (longer, the larger the size chosen),
-    // and this whole event loop is blocked on it meanwhile (nothing else
-    // redraws or processes until it returns), so silence here previously
-    // looked identical to a hang.
-    notify(
-        ui_state,
-        pending.peer,
-        &pending.peer_name,
-        format!(
-            "OTP: generating a fresh {size_mb}MB keypair for {}...",
-            pending.peer_name
-        ),
-        true,
-    );
-    let Some(payload) =
-        initiate_provisioning(&session.otp_cli_cfg, size_mb, &own_fp, &peer_fp).await
-    else {
-        notify(
-            ui_state,
-            pending.peer,
-            &pending.peer_name,
-            "OTP session failed: could not generate a keypair".to_string(),
-            false,
-        );
-        return Ok(());
-    };
-    // Recorded before the first chunk goes out, not after: if delivery
-    // fails, the debt is what makes the retry pass pick it up again, and a
-    // debt recorded only on success would be exactly the case that never
-    // gets retried.
-    session
-        .otp_store
-        .mark_setup_pending(&payload.contact_name, size_mb);
-    let _ = session.otp_store.save();
-    send_key_setup_chunked(wr, session, ui_state, &pending, &payload).await
+    // Generation runs off the event loop, reporting progress back through
+    // `otp_keygen_tx` - `on_keygen_event` picks it up and resumes the
+    // handshake once it finishes. Inline, this call blocks every other
+    // thing the session does (no redraw, no incoming message, no keypress)
+    // for as long as it takes to read `2 * size_mb` MB of true randomness -
+    // which at the sizes now allowed is minutes, indistinguishable from a
+    // hang. The spinner popup opened here is what the user watches
+    // meanwhile.
+    ui_state.open_otp_keygen(pending.peer, pending.peer_name.clone(), size_mb);
+    let cfg = session.otp_cli_cfg.clone();
+    let tx = session.otp_keygen_tx.clone();
+    tokio::spawn(async move {
+        let progress_tx = tx.clone();
+        let payload = initiate_provisioning_with_progress(
+            &cfg,
+            size_mb,
+            &own_fp,
+            &peer_fp,
+            move |written, total| {
+                let _ = progress_tx.send(OtpKeygenEvent::Progress {
+                    written_bytes: written,
+                    total_bytes: total,
+                });
+            },
+        )
+        .await;
+        let _ = tx.send(OtpKeygenEvent::Finished {
+            pending: Box::new(pending),
+            size_mb,
+            payload: payload.map(Box::new),
+        });
+    });
+    Ok(())
 }
 
-/// A whole pad (1MB per key by default, 2MB total) cannot go out as one
-/// `pq_hybrid` envelope - it rides a single UDP datagram with no
-/// fragmentation of its own beneath this layer, and the OS refuses a send
-/// anywhere near that size outright. `OtpKeySetupChunk`'s doc has the full
-/// reasoning; this splits both keys into `OTP_SETUP_CHUNK_BYTES`-sized
-/// pieces and sends each as its own ordinary `pq_hybrid` send, exactly the
-/// way a voice/file stream already sends many small chunks instead of one
-/// huge one.
-async fn send_key_setup_chunked(
+/// What a background pad generation reports back to the session loop -
+/// see `SessionState::otp_keygen_tx`.
+pub enum OtpKeygenEvent {
+    /// One chunk of randomness handed to `otp --new-key-pair`; moves the
+    /// spinner popup's bar.
+    Progress { written_bytes: u64, total_bytes: u64 },
+    /// Generation is over. `payload` is `None` if it failed - `otp` refused,
+    /// the disk filled, the binary vanished mid-run. Boxed because the
+    /// payload carries a whole pad's worth of key bytes and this enum is
+    /// otherwise tiny (clippy's `large_enum_variant`), and because keeping
+    /// it behind one pointer means moving the event around never copies it.
+    Finished {
+        pending: Box<PendingOtpGenerate>,
+        size_mb: u32,
+        payload: Option<Box<crypto::otp::OtpKeySetupPayload>>,
+    },
+}
+
+/// Applies one `OtpKeygenEvent` - the session loop's `otp_keygen_rx` arm.
+/// On `Finished`, this is where the provisioning handshake `confirm_generate`
+/// started actually resumes: the pad exists on disk now, so the debt is
+/// recorded and the peer's half goes out.
+pub(crate) async fn on_keygen_event(
     wr: &mut impl crate::control::ControlSink,
     session: &mut SessionState,
     ui_state: &mut UiState,
-    pending: &PendingOtpGenerate,
-    payload: &crypto::otp::OtpKeySetupPayload,
+    event: OtpKeygenEvent,
 ) -> proto::Result<()> {
-    let total_len = payload.peer_encryption_key.len() as u32;
-    // Every chunk of a pad has to arrive, in order, for the receiving side
-    // to reassemble anything at all - a pad with its front missing is not a
-    // smaller pad, it is a malformed setup message. The link's queue drops
-    // its oldest entries once `PENDING_MAX` is reached, so a pad that cannot
-    // fit in it whole is refused here rather than being sent, truncated, and
-    // rejected on the far side.
-    let chunks = (total_len as usize).div_ceil(OTP_SETUP_CHUNK_BYTES);
-    if chunks > crate::client::p2p::PENDING_MAX {
-        discard_pending_setup(&session.otp_cli_cfg, &payload.contact_name);
-        session.otp_store.clear_pending_setup(&payload.contact_name);
-        let _ = session.otp_store.save();
-        notify(
-            ui_state,
-            pending.peer,
-            &pending.peer_name,
-            format!(
-                "OTP session failed: a {}MB pad is too large to provision over a direct \
-                 link (limit is {OTP_MAX_PROVISIONABLE_MB}MB per key) - try a smaller size",
-                payload.keypair_size_mb,
-            ),
-            false,
-        );
-        return Ok(());
-    }
-    let mut offset: u32 = 0;
-    loop {
-        let end = (offset as usize + OTP_SETUP_CHUNK_BYTES).min(total_len as usize) as u32;
-        let chunk = crypto::otp::OtpKeySetupChunk {
-            contact_name: payload.contact_name.clone(),
-            keypair_size_mb: payload.keypair_size_mb,
-            total_len,
-            offset,
-            enc_chunk: payload.peer_encryption_key[offset as usize..end as usize].to_vec(),
-            dec_chunk: payload.peer_decryption_key[offset as usize..end as usize].to_vec(),
-        };
-        let is_last = end >= total_len;
-
-        let Ok(plaintext) = proto::encode(&chunk) else {
-            notify(
-                ui_state,
-                pending.peer,
-                &pending.peer_name,
-                "OTP session failed: could not encode the setup message".to_string(),
-                false,
-            );
-            return Ok(());
-        };
-        // `chunk` (above) is zeroized on drop, but its encoded bytes - the
-        // actual pad material, bincode-serialized - are an ordinary `Vec<u8>`
-        // the moment `proto::encode` returns one; wrapped immediately so
-        // this copy doesn't just get freed unzeroized once it's been sealed
-        // below.
-        let plaintext = zeroize::Zeroizing::new(plaintext);
-        let send_id = session.next_stream_id;
-        session.next_stream_id += 1;
-        let Some(envelope) = crate::client::envelope::encrypt_envelope_for(
-            session.own_pq_private.as_ref(),
-            session.pq_peer_keys.encap_for(pending.peer),
-            pending.key_mode,
-            &pending.pubkey_der,
-            None,
-            send_id,
-            &plaintext,
-            Content::OtpKeySetup,
-        ) else {
-            notify(
-                ui_state,
-                pending.peer,
-                &pending.peer_name,
-                "OTP session failed: could not encrypt the setup message".to_string(),
-                false,
-            );
-            return Ok(());
-        };
-        let readiness = session.peer_link.ensure_link(wr, pending.peer).await;
-        session.peer_link.send_reliable_or_queue(
-            pending.peer,
-            P2pPayload::Envelope {
-                channel: None,
-                // Provisioning traffic, not a message anybody sees - there
-                // is no row for a receipt to land on (7.2.1).
-                msg_id: None,
-                envelope,
-            },
-        );
-        if is_last {
-            notify(
-                ui_state,
-                pending.peer,
-                &pending.peer_name,
-                link_readiness_notice(readiness, &pending.peer_name),
-                true,
-            );
-            return Ok(());
+    match event {
+        OtpKeygenEvent::Progress {
+            written_bytes,
+            total_bytes,
+        } => {
+            ui_state.set_otp_keygen_progress(written_bytes, total_bytes);
+            Ok(())
         }
-        offset = end;
+        OtpKeygenEvent::Finished {
+            pending,
+            size_mb,
+            payload,
+        } => {
+            ui_state.close_otp_keygen();
+            let Some(payload) = payload else {
+                notify(
+                    ui_state,
+                    pending.peer,
+                    &pending.peer_name,
+                    "OTP session failed: could not generate a keypair".to_string(),
+                    false,
+                );
+                return Ok(());
+            };
+            // Recorded before the first chunk goes out, not after: if
+            // delivery fails, the debt is what makes the retry pass pick it
+            // up again, and a debt recorded only on success would be
+            // exactly the case that never gets retried.
+            session
+                .otp_store
+                .mark_setup_pending(&payload.contact_name, size_mb);
+            let _ = session.otp_store.save();
+            start_pad_send(
+                wr,
+                session,
+                ui_state,
+                pending.peer,
+                &pending.peer_name,
+                pending.key_mode,
+                &pending.pubkey_der,
+                &payload.contact_name,
+                size_mb,
+            )
+            .await;
+            Ok(())
+        }
     }
 }
+
 
 /// One key's raw bytes sent per `OtpKeySetupChunk`. `pq_hybrid`'s own
 /// per-send overhead (an ML-KEM ciphertext, an RSA ciphertext and two
@@ -827,15 +917,26 @@ async fn send_key_setup_chunked(
 /// this layer) - 16KB leaves generous headroom.
 pub const OTP_SETUP_CHUNK_BYTES: usize = 16 * 1024;
 
-/// The largest pad (MB per key) a direct link can actually deliver, derived
-/// from how many chunks its queue holds (`p2p::PENDING_MAX`) rather than
-/// picked: a pad is handed over as one burst, and one that cannot fit whole
-/// would have its front dropped and arrive unreassemblable.
+/// The largest pad (MB per key) the *automatic* `/otp` handshake can
+/// deliver over a direct link, derived from how many chunks that link's
+/// queue holds (`p2p::PENDING_MAX`) rather than picked: a pad is handed
+/// over as one burst, and one that cannot fit whole would have its front
+/// dropped and arrive unreassemblable.
+///
+/// This is deliberately far below `crypto::otp::OTP_SIZE_MB_MAX` (1TB per
+/// key, what the real `otp` binary itself supports and what a pad may
+/// actually *be*). The two limits answer different questions: how large a
+/// pad this app can support at all, versus how large a one it can push
+/// through a hole-punched UDP link in a single burst. A pad beyond this
+/// ceiling is provisioned out of band instead - generate it with `otp
+/// --new-key-pair` and install it from the contacts list (`/contacts`, `o`)
+/// or by placing the files under the keychain directly - which has no size
+/// ceiling of its own, since nothing crosses the network.
 ///
 /// Checked before `otp --new-key-pair` runs, not after: generation reads
-/// this many megabytes of true randomness *per key* synchronously, with the
-/// whole event loop blocked on it, so discovering the limit afterwards would
-/// mean spending all of that time to produce a pad that is then refused.
+/// this many megabytes of true randomness *per key*, so discovering the
+/// limit afterwards would mean spending all of that time to produce a pad
+/// that is then refused.
 pub const OTP_MAX_PROVISIONABLE_MB: u32 =
     (crate::client::p2p::PENDING_MAX * OTP_SETUP_CHUNK_BYTES / (1024 * 1024)) as u32;
 
@@ -1198,6 +1299,24 @@ pub(crate) async fn accept_invite(
     let Some(invite) = ui_state.take_otp_invite() else {
         return Ok(());
     };
+    // A streamed pad (`client::otp_pad`) is already reassembled and
+    // verified on disk by the time this popup appears - accepting it does
+    // *not* install it. It reports back what was received, and only the
+    // sender's matching commit authorises the install: neither side may
+    // hold a pad the other does not (see `otp_pad`'s two-phase commit).
+    if let Some(pad) = session.otp_incoming_pads.get(&invite.from)
+        && pad.contact_name == invite.contact_name
+    {
+        let (enc_digest, dec_digest) = (pad.enc_digest, pad.dec_digest);
+        let contact_name = pad.contact_name.clone();
+        // Our own staged pad, if any, is retired here: only one pad can
+        // ever live under this name, and we have just agreed to theirs.
+        discard_pending_setup(&session.otp_cli_cfg, &contact_name);
+        session.otp_store.clear_pending_setup(&contact_name);
+        let _ = session.otp_store.save();
+        send_pad_verify(session, invite.from, &contact_name, true, enc_digest, dec_digest);
+        return Ok(());
+    }
     let result: Result<(), String> = match (&invite.peer_encryption_key, &invite.peer_decryption_key) {
         (Some(enc), Some(dec)) => {
             let payload = crypto::otp::OtpKeySetupPayload {
@@ -1233,6 +1352,13 @@ pub(crate) async fn accept_invite(
         discard_pending_setup(&session.otp_cli_cfg, &invite.contact_name);
         session.otp_store.clear_pending_setup(&invite.contact_name);
         session.otp_store.mark_provisioned(&invite.contact_name);
+        // Agreeing to a session settles any `/endotp` notice this side was
+        // still owed to send for the same contact - the mirror of
+        // `handle_otp_command`'s own cancellation, for the case where *we*
+        // ended it and the peer is the one reopening. Without this, the
+        // stale notice goes out on the next link transition and tears down
+        // the session just agreed to.
+        session.otp_store.clear_end_notice(&invite.contact_name);
         let _ = session.otp_store.save();
     }
     send_key_setup_ack(
@@ -1279,6 +1405,24 @@ pub(crate) async fn reject_invite(
     let Some(invite) = ui_state.take_otp_invite() else {
         return Ok(());
     };
+    // A streamed pad's refusal is reported the same way its acceptance is,
+    // and the staging directory goes with it - nothing was installed on
+    // either side, and the sender drops its own half on hearing this.
+    if let Some(pad) = session.otp_incoming_pads.remove(&invite.from)
+        && pad.contact_name == invite.contact_name
+    {
+        let (enc_digest, dec_digest) = (pad.enc_digest, pad.dec_digest);
+        crate::client::otp_staging::secure_remove_dir(&pad.dir);
+        send_pad_verify(
+            session,
+            invite.from,
+            &invite.contact_name,
+            false,
+            enc_digest,
+            dec_digest,
+        );
+        return Ok(());
+    }
     // A keyless invitation is the sender saying "you already have this pad".
     // If this side doesn't, the sender's belief is simply wrong, and it must
     // hear *that* rather than a plain refusal - otherwise it keeps its stale
@@ -1441,8 +1585,8 @@ pub(crate) async fn on_key_setup_ack(
 // Ending a session: /endotp (docs/PROTOCOL.md §16.6)
 // ---------------------------------------------------------------------
 
-/// What `/endotp` should do for one contact, decided *before* anything
-/// destructive (`otp_cli::remove_contact`) runs - mirrors
+/// What `/endotp` should do for one contact, decided *before*
+/// `OtpStore::pause_session` clears anything - mirrors
 /// `client::otp_mail::MailGate`'s shape: a small, pure decision kept
 /// separate from `handle_end_otp_command` so it's directly testable without
 /// a live `SessionState`.
@@ -1451,12 +1595,14 @@ pub enum EndOtpDecision {
     /// No provisioned contact for this peer at all - nothing to end.
     NoActiveSession,
     /// A mail send is still awaiting this contact's pad gate
-    /// (`PendingOtpContent::Mail`) - destroying the keychain contact now
-    /// would strand it in `AwaitingServerAck` forever, since its only
-    /// recovery path (`otp --recover-last`) needs the very keychain entry
-    /// this would delete (`client::otp_mail::resend_pending`'s doc).
+    /// (`PendingOtpContent::Mail`) - pausing now would clear that gate's
+    /// bookkeeping (`OtpStore::pause_session`), so a late `OtpMailResult`
+    /// arriving afterward would have nothing to reconcile against
+    /// (`client::otp_mail::on_mail_result`'s `record_acked` call would
+    /// simply find nothing pending), leaving the contact's pad-gate state
+    /// out of step with what's actually still in flight to the server.
     MailInFlight,
-    /// Safe to tear down and notify.
+    /// Safe to pause and notify.
     End,
 }
 
@@ -1481,26 +1627,28 @@ pub fn decide_end_otp(
 }
 
 /// The `/endotp` command's handler (`UiAction::EndOtpSession`) - the one and
-/// only way an OTP session ends deliberately. Unlike starting one, ending is
-/// unilateral: either participant may do it alone, with no round trip to
-/// agree first - the local pad is destroyed immediately, so this side can
-/// never again spend it (the same "no double key pad spending" property
-/// `send_or_queue`'s gate protects while the session was live now holds
-/// because there is no pad left to spend), and the peer is *told*, not
-/// asked. Every send-path gate stops seeing this contact as active from
-/// this call onward, on this side; the peer converges to the same state the
-/// moment `on_end_session` processes the notice, whether that is seconds or
-/// days from now (`resend_pending_end_notices`).
+/// only way an OTP session ends (pauses) deliberately. Unlike starting one,
+/// ending is unilateral: either participant may do it alone, with no round
+/// trip to agree first. The pad itself, and the real keychain entry behind
+/// it, are deliberately left alone - `/endotp` no longer calls
+/// `otp_cli::remove_contact` - so what actually stops this side from
+/// spending it again is every send-path gate no longer seeing this contact
+/// as active (`ui_state.clear_otp_active`), the same "no double key pad
+/// spending" property `send_or_queue`'s gate protects while the session is
+/// live, now enforced by "OTP isn't attempted for this contact at all"
+/// rather than "there is no pad left". The peer is *told*, not asked;
+/// converges to the same paused state the moment `on_end_session` processes
+/// the notice, whether that is seconds or days from now
+/// (`resend_pending_end_notices`). A later `/otp` for the same contact
+/// resumes the identical pad - see `OtpStore::pause_session`'s doc.
 ///
 /// Refuses outright (a local-only notice, nothing torn down or sent) if
 /// there is no active session with this peer, or if a mail send is still
 /// awaiting the pad's stop-and-wait gate for this exact contact
-/// (`PendingOtpContent::Mail`) - destroying the keychain contact out from
-/// under `client::otp_mail::resend_pending` would strand that mail in
-/// `AwaitingServerAck` forever, since its only recovery path (`otp
-/// --recover-last`) needs the very keychain entry this would delete. Every
-/// other pending send (a live P2P text/file/voice spend) has no second
-/// store depending on the keychain surviving, so it does not block ending.
+/// (`PendingOtpContent::Mail`) - see `EndOtpDecision::MailInFlight`'s doc
+/// for why pausing mid-mail is refused rather than allowed. Every other
+/// pending send (a live P2P text/file/voice spend) has no second store
+/// depending on that gate surviving, so it does not block ending.
 pub(crate) async fn handle_end_otp_command(
     wr: &mut impl crate::control::ControlSink,
     ui_state: &mut UiState,
@@ -1549,18 +1697,26 @@ pub(crate) async fn handle_end_otp_command(
         EndOtpDecision::End => {}
     }
 
-    // Local teardown first, unconditionally - this side must never be able
-    // to spend this pad again, even if the notice below never reaches the
-    // peer at all (and even if this process crashes right after: `otp
-    // --remove-contact` and `otp_store.save()` both already ran).
-    let _ = otp_cli::remove_contact(&session.otp_cli_cfg, &contact_name).await;
+    // Local teardown first, unconditionally - this side must never show
+    // this session as active again, even if the notice below never reaches
+    // the peer at all. The keychain entry itself is deliberately left
+    // alone: `/endotp` pauses a session, it doesn't destroy the pad, so
+    // `/otp` with the same contact later resumes the very same key exactly
+    // where it left off (`OtpStore::pause_session`'s doc) instead of
+    // generating a fresh one.
     discard_pending_setup(&session.otp_cli_cfg, &contact_name);
     session.otp_incoming_setup.remove(&peer);
     session.otp_out_queue.clear(&contact_name);
-    session.otp_store.end_session(&contact_name);
+    session.otp_store.pause_session(&contact_name);
     let _ = session.otp_store.save();
     ui_state.clear_otp_active(peer);
-    notify(ui_state, peer, &peer_name, "OTP session ended".to_string(), true);
+    notify(
+        ui_state,
+        peer,
+        &peer_name,
+        "OTP session ended (the pad is kept - /otp with them resumes it)".to_string(),
+        true,
+    );
 
     send_end_session_payload(
         wr,
@@ -1643,13 +1799,13 @@ fn queue_end_session_payload(
 /// Applies an incoming `Content::OtpEndSession` envelope
 /// (`direct_message::on_message`'s content-dispatch): the peer has
 /// unilaterally ended the session - there is nothing here to accept or
-/// reject, only to converge to. Tears this side down exactly like
-/// `handle_end_otp_command` tore the initiator's own side down (the same
-/// full local reset, the same reasoning: this side must never spend a pad
-/// the peer has already stopped tracking), then always replies with
-/// `OtpEndSessionAck` - even for a contact that was already reset, since
-/// that is exactly what a retried notice whose first ack got lost looks
-/// like on this end, and the initiator's own retry
+/// reject, only to converge to. Pauses this side exactly like
+/// `handle_end_otp_command` paused the initiator's own side (the pad
+/// itself, and this store's record of it, both survive - only the
+/// "active" marker and anything genuinely mid-flight are cleared), then
+/// always replies with `OtpEndSessionAck` - even for a contact that was
+/// already paused, since that is exactly what a retried notice whose first
+/// ack got lost looks like on this end, and the initiator's own retry
 /// (`resend_pending_end_notices`) only stops once one genuinely arrives.
 pub(crate) async fn on_end_session(
     session: &mut SessionState,
@@ -1672,11 +1828,10 @@ pub(crate) async fn on_end_session(
         .get(&payload.contact_name)
         .is_some_and(|s| s.provisioned);
 
-    let _ = otp_cli::remove_contact(&session.otp_cli_cfg, &payload.contact_name).await;
     discard_pending_setup(&session.otp_cli_cfg, &payload.contact_name);
     session.otp_incoming_setup.remove(&from);
     session.otp_out_queue.clear(&payload.contact_name);
-    session.otp_store.reset_after_peer_ended(&payload.contact_name);
+    session.otp_store.pause_after_peer_ended(&payload.contact_name);
     let _ = session.otp_store.save();
     ui_state.clear_otp_active(from);
     if had_session {
@@ -1684,7 +1839,7 @@ pub(crate) async fn on_end_session(
             ui_state,
             from,
             &from_name,
-            format!("OTP session ended by {from_name}"),
+            format!("OTP session ended by {from_name} (the pad is kept - /otp resumes it)"),
             false,
         );
     }
@@ -2378,7 +2533,9 @@ pub(crate) async fn on_message(
     // got to (`UiState::message_crypto`). The post-spend refresh that
     // keeps the room's own header live still happens, further down.
     refresh_otp_key_status(&session.otp_cli_cfg, ui_state, from, &contact_name).await;
-    let Some(pq_blob) = unwrap_incoming(&session.otp_cli_cfg, blob, &contact_name).await else {
+    let Some(pq_blob) =
+        unwrap_or_notify(&session.otp_cli_cfg, blob, &contact_name, ui_state, from, &from_name).await
+    else {
         return;
     };
     if !session.otp_store.record_received(&contact_name, seq) {
@@ -2452,7 +2609,9 @@ pub(crate) async fn on_file_offer(
     if !session.otp_store.is_next_expected(&contact_name, seq) {
         return;
     }
-    let Some(pq_blob) = unwrap_incoming(&session.otp_cli_cfg, blob, &contact_name).await else {
+    let Some(pq_blob) =
+        unwrap_or_notify(&session.otp_cli_cfg, blob, &contact_name, ui_state, from, &from_name).await
+    else {
         return;
     };
     if !session.otp_store.record_received(&contact_name, seq) {
@@ -2825,13 +2984,19 @@ pub(crate) async fn finish_incoming_file(
             OtpIncomingKind::File { .. } => "file",
             OtpIncomingKind::Voice { .. } => "voice message",
         };
-        notify(
-            ui_state,
-            from,
-            &from_name,
-            format!("OTP: failed to decrypt an incoming {what} - it did not arrive"),
-            false,
-        );
+        // A rejection - the metadata check refused this exact transfer's
+        // content, not merely a transient I/O failure - is worth naming
+        // specifically; see `otp_cli::OtpCliOutcome::Rejected`'s doc.
+        let message = match outcome {
+            Ok(otp_cli::FileCliOutcome::Rejected(reason)) => {
+                format!(
+                    "OTP: an incoming {what} from {from_name} was rejected ({}) - keys untouched",
+                    reason.trim().replace('\n', "; ")
+                )
+            }
+            _ => format!("OTP: failed to decrypt an incoming {what} - it did not arrive"),
+        };
+        notify(ui_state, from, &from_name, message, false);
         return;
     }
     refresh_otp_key_status(&session.otp_cli_cfg, ui_state, from, &pending.contact_name).await;
@@ -2915,21 +3080,37 @@ pub(crate) async fn resend_pending_setups(
         let Some(peer_info) = ui_state.known_users.get(&peer).cloned() else {
             continue;
         };
-        let Some(payload) = read_pending_setup(&session.otp_cli_cfg, &contact_name, size_mb) else {
-            // The staged pad is gone from disk, so there is nothing left to
-            // resend and nothing was ever committed to the keychain - drop
-            // the debt rather than retrying something that cannot succeed.
+        // The staged pad is the source for every retry, so a resend is
+        // byte-identical to the original rather than a fresh generation.
+        // Gone from disk means there is nothing left to resend and nothing
+        // was ever committed to the keychain - drop the debt rather than
+        // retrying something that cannot succeed.
+        let dir = pending_setup_dir(&session.otp_cli_cfg, &contact_name);
+        let (_, _, peer_enc, _) = pending_paths(&dir);
+        if !peer_enc.is_file() {
             session.otp_store.clear_pending_setup(&contact_name);
             let _ = session.otp_store.save();
             continue;
-        };
-        let pending = PendingOtpGenerate {
+        }
+        // A transfer already streaming to this peer is not restarted: the
+        // link transition that triggered this pass may well be the very one
+        // it is already using.
+        if session.otp_outgoing_pads.contains_key(&peer) {
+            continue;
+        }
+        let _ = pubkey_der;
+        start_pad_send(
+            wr,
+            session,
+            ui_state,
             peer,
-            peer_name: peer_info.name.clone(),
-            key_mode: peer_info.key_mode,
-            pubkey_der,
-        };
-        send_key_setup_chunked(wr, session, ui_state, &pending, &payload).await?;
+            &peer_info.name.clone(),
+            peer_info.key_mode,
+            &peer_info.public_key_der.clone(),
+            &contact_name,
+            size_mb,
+        )
+        .await;
     }
     Ok(())
 }
@@ -3229,4 +3410,536 @@ async fn recover_and_resend_voice(
         },
     );
     Ok(())
+}
+
+// ---------------------------------------------------------------------
+// Streamed pad delivery and its two-phase commit (`client::otp_pad`)
+// ---------------------------------------------------------------------
+
+use crate::client::otp_pad::{self, IncomingPad, OutgoingPad, PadEvent};
+use crate::client::voice_stream::DecryptJob;
+
+/// Begins streaming an already-generated pad to `to`.
+///
+/// Called once the pad exists on disk (`initiate_provisioning` has staged
+/// it under `<contact>_pending/`), and again on every retry - the staged
+/// files are the source both times, so a resend is byte-identical to the
+/// original rather than a fresh generation.
+///
+/// Sends the announcement and the one-time key setup here, then hands the
+/// bytes to a worker thread that paces itself against the link
+/// (`otp_pad::spawn_send_pad_worker`).
+pub(crate) async fn start_pad_send(
+    wr: &mut impl crate::control::ControlSink,
+    session: &mut SessionState,
+    ui_state: &mut UiState,
+    to: UserId,
+    peer_name: &str,
+    key_mode: KeyMode,
+    peer_pubkey_der: &[u8],
+    contact_name: &str,
+    size_mb: u32,
+) {
+    if key_mode != KeyMode::PqHybrid {
+        notify(
+            ui_state,
+            to,
+            peer_name,
+            "OTP session failed: sharing a pad needs pq_hybrid on both sides".to_string(),
+            false,
+        );
+        return;
+    }
+    let dir = pending_setup_dir(&session.otp_cli_cfg, contact_name);
+    let (_, _, peer_enc, peer_dec) = pending_paths(&dir);
+    // Digested before anything is sent, and from the very files the worker
+    // will read: this is what the receiver checks its own copy against, so
+    // it has to describe exactly what goes on the wire.
+    let (Ok(enc_digest), Ok(dec_digest), Ok(key_len)) = (
+        crypto::otp::digest_key_file(&peer_enc),
+        crypto::otp::digest_key_file(&peer_dec),
+        std::fs::metadata(&peer_enc).map(|m| m.len()),
+    ) else {
+        notify(
+            ui_state,
+            to,
+            peer_name,
+            "OTP session failed: the generated pad could not be read".to_string(),
+            false,
+        );
+        return;
+    };
+
+    let stream_id = session.next_stream_id;
+    session.next_stream_id += 1;
+
+    let Some(pq) = crate::client::voice_stream::build_pq_stream_out(
+        session,
+        None,
+        stream_id,
+        &[(to, peer_pubkey_der.to_vec())],
+    ) else {
+        notify(
+            ui_state,
+            to,
+            peer_name,
+            "OTP session failed: could not prepare the pad's stream key".to_string(),
+            false,
+        );
+        return;
+    };
+
+    let readiness = session.peer_link.ensure_link(wr, to).await;
+    session.peer_link.send_reliable_or_queue(
+        to,
+        P2pPayload::OtpPadStart {
+            stream_id,
+            contact_name: contact_name.to_string(),
+            keypair_size_mb: size_mb,
+            key_len,
+            enc_digest,
+            dec_digest,
+        },
+    );
+    for (id, setup) in pq.setups() {
+        session
+            .peer_link
+            .send_reliable_or_queue(id, P2pPayload::StreamKeySetup { stream_id, setup });
+    }
+
+    // The worker polls this to decide when to read more off disk. It
+    // borrows nothing from the session - just a snapshot channel into the
+    // link's current depth - so the thread can outlive any one borrow.
+    // Republished each tick by the session loop; the worker polls it for
+    // backpressure (`OutgoingPad::depth`).
+    let depth = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    otp_pad::spawn_send_pad_worker(
+        peer_enc,
+        peer_dec,
+        crate::client::voice_stream::DirectStreamKey::Pq(pq),
+        to,
+        stream_id,
+        session.record_out_tx.clone(),
+        session.otp_pad_tx.clone(),
+        depth.clone(),
+    );
+    session.otp_outgoing_pads.insert(
+        to,
+        OutgoingPad {
+            stream_id,
+            sent: false,
+            depth,
+        },
+    );
+    notify(
+        ui_state,
+        to,
+        peer_name,
+        link_readiness_notice(readiness, peer_name),
+        true,
+    );
+}
+
+/// A peer is about to stream us a pad. Opens a staging directory and a
+/// worker to write it into; nothing is decided or installed here.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn on_pad_start(
+    session: &mut SessionState,
+    ui_state: &mut UiState,
+    from: UserId,
+    stream_id: u64,
+    contact_name: String,
+    keypair_size_mb: u32,
+    key_len: u64,
+    enc_digest: crypto::otp::KeyDigest,
+    dec_digest: crypto::otp::KeyDigest,
+) {
+    // A pad already arriving from this peer is a superseded proposal -
+    // they ran `/otp` again. Its staging directory goes now rather than
+    // being left to the startup sweep, so two transfers never write to two
+    // live directories for one contact.
+    if let Some(previous) = session.otp_incoming_pads.remove(&from) {
+        crate::client::otp_staging::secure_remove_dir(&previous.dir);
+    }
+    let Ok(dir) = crate::client::otp_staging::new_dir(&session.otp_cli_cfg, "pad-in") else {
+        return;
+    };
+    let Some(sender) = ui_state.known_users.get(&from).cloned() else {
+        crate::client::otp_staging::secure_remove_dir(&dir);
+        return;
+    };
+    let key = crate::client::voice_stream::resolve_incoming_key(
+        session,
+        from,
+        &sender.public_key_der,
+    );
+    let job_tx = otp_pad::spawn_receive_pad_worker(
+        key,
+        dir.clone(),
+        from,
+        stream_id,
+        key_len,
+        enc_digest,
+        dec_digest,
+        session.otp_pad_tx.clone(),
+    );
+    session.otp_incoming_pads.insert(
+        from,
+        IncomingPad {
+            stream_id,
+            contact_name,
+            keypair_size_mb,
+            enc_digest,
+            dec_digest,
+            dir,
+            job_tx,
+        },
+    );
+}
+
+/// One arriving pad chunk, handed straight to that transfer's worker.
+pub(crate) fn on_pad_chunk(
+    session: &mut SessionState,
+    from: UserId,
+    stream_id: u64,
+    seq: u32,
+    blocks: Vec<Vec<u8>>,
+) {
+    if let Some(pad) = session.otp_incoming_pads.get(&from)
+        && pad.stream_id == stream_id
+    {
+        let _ = pad.job_tx.send(DecryptJob::Chunk(seq, blocks));
+    }
+}
+
+/// The sender says that was the last chunk - the worker now checks length
+/// and digests and reports back through `on_pad_event`.
+pub(crate) fn on_pad_end(session: &mut SessionState, from: UserId, stream_id: u64) {
+    if let Some(pad) = session.otp_incoming_pads.get(&from)
+        && pad.stream_id == stream_id
+    {
+        let _ = pad.job_tx.send(DecryptJob::End);
+    }
+}
+
+/// Routes a `StreamKeySetup` to a pad transfer if one is expecting it -
+/// returns whether it was consumed, so the ordinary stream handling only
+/// sees setups that are not a pad's.
+pub(crate) fn route_pad_key_setup(
+    session: &mut SessionState,
+    from: UserId,
+    stream_id: u64,
+    setup: &[u8],
+) -> bool {
+    if let Some(pad) = session.otp_incoming_pads.get(&from)
+        && pad.stream_id == stream_id
+    {
+        let _ = pad.job_tx.send(DecryptJob::KeySetup(setup.to_vec()));
+        return true;
+    }
+    false
+}
+
+/// Applies one `PadEvent` - the session loop's `otp_pad_rx` arm, and where
+/// the two-phase commit's *first* phase completes on each side.
+pub(crate) async fn on_pad_event(
+    wr: &mut impl crate::control::ControlSink,
+    session: &mut SessionState,
+    ui_state: &mut UiState,
+    event: PadEvent,
+) -> proto::Result<()> {
+    match event {
+        PadEvent::Sent { to, stream_id } => {
+            // Nothing to announce: the receiver decides next, and only its
+            // verification moves this forward.
+            if let Some(pad) = session.otp_outgoing_pads.get_mut(&to)
+                && pad.stream_id == stream_id
+            {
+                pad.sent = true;
+            }
+        }
+        PadEvent::SendFailed {
+            to,
+            stream_id,
+            reason,
+        } => {
+            if session
+                .otp_outgoing_pads
+                .get(&to)
+                .is_some_and(|p| p.stream_id == stream_id)
+            {
+                session.otp_outgoing_pads.remove(&to);
+            }
+            let peer_name = peer_name_for(ui_state, to);
+            notify(
+                ui_state,
+                to,
+                &peer_name,
+                format!("OTP session failed: could not send the pad ({reason})"),
+                false,
+            );
+        }
+        PadEvent::Failed {
+            from,
+            stream_id,
+            reason,
+        } => {
+            if session
+                .otp_incoming_pads
+                .get(&from)
+                .is_some_and(|p| p.stream_id == stream_id)
+            {
+                session.otp_incoming_pads.remove(&from);
+            }
+            let from_name = peer_name_for(ui_state, from);
+            notify(
+                ui_state,
+                from,
+                &from_name,
+                format!("OTP session failed: {reason}"),
+                false,
+            );
+        }
+        PadEvent::Received {
+            from,
+            stream_id,
+            enc_digest,
+            dec_digest,
+        } => {
+            // Every byte arrived and both halves match what the sender
+            // declared. Still nothing installed - the user is asked first,
+            // and even a yes only produces `OtpPadVerify`.
+            let Some(pad) = session.otp_incoming_pads.get(&from) else {
+                return Ok(());
+            };
+            if pad.stream_id != stream_id {
+                return Ok(());
+            }
+            let contact_name = pad.contact_name.clone();
+            let size_mb = pad.keypair_size_mb;
+            let _ = (enc_digest, dec_digest);
+            let from_name = peer_name_for(ui_state, from);
+
+            // Already provisioned: this is a re-delivery whose commit was
+            // lost, not a new proposal. Re-verified straight away so the
+            // sender can finish rather than retrying forever.
+            if session
+                .otp_store
+                .get(&contact_name)
+                .is_some_and(|c| c.provisioned)
+            {
+                send_pad_verify(session, from, &contact_name, true, enc_digest, dec_digest);
+                return Ok(());
+            }
+            ui_state.push_otp_invite(
+                from,
+                from_name,
+                contact_name,
+                None,
+                None,
+                Some(size_mb),
+            );
+            crate::client::voice_stream::play_bell_chime(session);
+        }
+    }
+    let _ = wr;
+    Ok(())
+}
+
+/// Sends this side's verification of a received pad - the receiver's half
+/// of the two-phase commit. Never installs anything itself.
+pub(crate) fn send_pad_verify(
+    session: &mut SessionState,
+    to: UserId,
+    contact_name: &str,
+    accepted: bool,
+    enc_digest: crypto::otp::KeyDigest,
+    dec_digest: crypto::otp::KeyDigest,
+) {
+    session.peer_link.send_reliable_or_queue(
+        to,
+        P2pPayload::OtpPadVerify {
+            contact_name: contact_name.to_string(),
+            accepted,
+            enc_digest,
+            dec_digest,
+        },
+    );
+}
+
+/// The receiver reported what it reassembled. This is where the *sender*
+/// decides: only if the digests match its own does it install its own half
+/// and authorise the receiver to install theirs.
+pub(crate) async fn on_pad_verify(
+    session: &mut SessionState,
+    ui_state: &mut UiState,
+    from: UserId,
+    contact_name: String,
+    accepted: bool,
+    enc_digest: crypto::otp::KeyDigest,
+    dec_digest: crypto::otp::KeyDigest,
+) {
+    let peer_name = peer_name_for(ui_state, from);
+    session.otp_outgoing_pads.remove(&from);
+
+    if !accepted {
+        // Refused, or it did not survive the trip. Nothing was installed
+        // on either side; the staged pad goes.
+        discard_pending_setup(&session.otp_cli_cfg, &contact_name);
+        session.otp_store.clear_pending_setup(&contact_name);
+        let _ = session.otp_store.save();
+        notify(
+            ui_state,
+            from,
+            &peer_name,
+            "OTP session cancelled".to_string(),
+            false,
+        );
+        return;
+    }
+
+    // What *we* hold, recomputed from the staged files rather than
+    // remembered: the comparison has to be against the bytes that would
+    // actually be installed.
+    let dir = pending_setup_dir(&session.otp_cli_cfg, &contact_name);
+    let (_, _, peer_enc, peer_dec) = pending_paths(&dir);
+    let (Ok(own_enc), Ok(own_dec)) = (
+        crypto::otp::digest_key_file(&peer_enc),
+        crypto::otp::digest_key_file(&peer_dec),
+    ) else {
+        notify(
+            ui_state,
+            from,
+            &peer_name,
+            "OTP session failed: the staged pad could not be verified".to_string(),
+            false,
+        );
+        return;
+    };
+    if own_enc != enc_digest || own_dec != dec_digest {
+        // The two sides do not hold the same pad. Refused on both sides
+        // rather than installed - a mismatched pair produces silent
+        // garbage, not an error, so this is the last point it can be
+        // caught.
+        discard_pending_setup(&session.otp_cli_cfg, &contact_name);
+        session.otp_store.clear_pending_setup(&contact_name);
+        let _ = session.otp_store.save();
+        session.peer_link.send_reliable_or_queue(
+            from,
+            P2pPayload::OtpPadVerify {
+                contact_name: contact_name.clone(),
+                accepted: false,
+                enc_digest: own_enc,
+                dec_digest: own_dec,
+            },
+        );
+        notify(
+            ui_state,
+            from,
+            &peer_name,
+            "OTP session failed: the pad did not match on both sides - nothing was installed"
+                .to_string(),
+            false,
+        );
+        return;
+    }
+
+    // Agreed. This side installs first, then authorises the other: a
+    // commit that arrives is proof the sender already holds its half, so
+    // the receiver can never end up the only one with a pad.
+    if !commit_pending_setup(&session.otp_cli_cfg, &contact_name).await {
+        notify(
+            ui_state,
+            from,
+            &peer_name,
+            "OTP session failed: could not install this side's half of the pad".to_string(),
+            false,
+        );
+        return;
+    }
+    session.otp_store.mark_provisioned(&contact_name);
+    session.otp_store.clear_pending_setup(&contact_name);
+    let _ = session.otp_store.save();
+    session
+        .peer_link
+        .send_reliable_or_queue(from, P2pPayload::OtpPadCommit { contact_name });
+    ui_state.mark_otp_active(from);
+    notify(
+        ui_state,
+        from,
+        &peer_name,
+        format!("OTP session started at {}", format_now()),
+        true,
+    );
+}
+
+/// The sender's digests matched and it has installed - so this side may
+/// install too. The only path by which a received pad reaches the
+/// keychain.
+pub(crate) async fn on_pad_commit(
+    session: &mut SessionState,
+    ui_state: &mut UiState,
+    from: UserId,
+    contact_name: String,
+) {
+    let peer_name = peer_name_for(ui_state, from);
+    // Always acknowledged, even if already installed: that is exactly what
+    // a retried commit whose first ack was lost looks like from here, and
+    // answering again is what lets the sender stop.
+    let already = session
+        .otp_store
+        .get(&contact_name)
+        .is_some_and(|c| c.provisioned);
+    if already {
+        session
+            .peer_link
+            .send_reliable_or_queue(from, P2pPayload::OtpPadCommitAck { contact_name });
+        return;
+    }
+    let Some(pad) = session.otp_incoming_pads.remove(&from) else {
+        // Nothing staged for this peer - a commit for a transfer we no
+        // longer have. Acknowledged so the sender stops retrying, but
+        // nothing is installed from thin air.
+        session
+            .peer_link
+            .send_reliable_or_queue(from, P2pPayload::OtpPadCommitAck { contact_name });
+        return;
+    };
+    let (enc_path, dec_path) = otp_pad::incoming_paths(&pad.dir);
+    let installed = otp_cli::add_contact(&session.otp_cli_cfg, &contact_name, &enc_path, &dec_path)
+        .await
+        .is_ok();
+    crate::client::otp_staging::secure_remove_dir(&pad.dir);
+    if !installed {
+        notify(
+            ui_state,
+            from,
+            &peer_name,
+            "OTP session failed: could not install the received pad".to_string(),
+            false,
+        );
+        return;
+    }
+    session.otp_store.mark_provisioned(&contact_name);
+    let _ = session.otp_store.save();
+    session
+        .peer_link
+        .send_reliable_or_queue(from, P2pPayload::OtpPadCommitAck { contact_name });
+    ui_state.mark_otp_active(from);
+    if let Some(peer) = ui_state.known_users.get(&from).cloned() {
+        ui_state.open_private_room(peer);
+    }
+    notify(
+        ui_state,
+        from,
+        &peer_name,
+        format!("OTP session started at {}", format_now()),
+        true,
+    );
+}
+
+/// The receiver has installed - the exchange is over.
+pub(crate) fn on_pad_commit_ack(session: &mut SessionState, from: UserId, contact_name: String) {
+    let _ = (from, &contact_name);
+    session.otp_outgoing_pads.remove(&from);
 }

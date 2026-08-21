@@ -280,6 +280,46 @@ pub enum P2pEvent {
         from: UserId,
         stream_id: u64,
     },
+    /// A peer is about to stream us a one-time pad - see
+    /// `P2pPayload::OtpPadStart`.
+    OtpPadStart {
+        from: UserId,
+        stream_id: u64,
+        contact_name: String,
+        keypair_size_mb: u32,
+        key_len: u64,
+        enc_digest: [u8; 32],
+        dec_digest: [u8; 32],
+    },
+    OtpPadChunk {
+        from: UserId,
+        stream_id: u64,
+        seq: u32,
+        blocks: Vec<Vec<u8>>,
+    },
+    OtpPadEnd {
+        from: UserId,
+        stream_id: u64,
+    },
+    /// The receiver reported what it reassembled - the first half of the
+    /// two-phase commit (`P2pPayload::OtpPadVerify`).
+    OtpPadVerify {
+        from: UserId,
+        contact_name: String,
+        accepted: bool,
+        enc_digest: [u8; 32],
+        dec_digest: [u8; 32],
+    },
+    /// Both sides' digests matched and the sender has installed - the
+    /// receiver may now install too (`P2pPayload::OtpPadCommit`).
+    OtpPadCommit {
+        from: UserId,
+        contact_name: String,
+    },
+    OtpPadCommitAck {
+        from: UserId,
+        contact_name: String,
+    },
     /// The manager wants these candidates relayed to `peer` - the caller
     /// turns this into a `ClientMessage::RequestPeerLink` over the TCP
     /// control connection. Emitted by `tick_at` (a scheduled retry, or a
@@ -483,6 +523,20 @@ pub enum P2pOutbound {
         blocks: Vec<Vec<u8>>,
     },
     FileEnd {
+        to: UserId,
+        stream_id: u64,
+    },
+    /// One chunk of a one-time pad being streamed to a peer
+    /// (`client::otp_pad`'s send worker) - the pad counterpart of
+    /// `FileChunk`, kept a separate variant so the session loop can pace
+    /// pad traffic specifically without throttling ordinary sends.
+    OtpPadChunk {
+        to: UserId,
+        stream_id: u64,
+        seq: u32,
+        blocks: Vec<Vec<u8>>,
+    },
+    OtpPadEnd {
         to: UserId,
         stream_id: u64,
     },
@@ -1342,6 +1396,51 @@ impl PeerLinkManager {
                 blocks,
             },
             P2pPayload::FileEnd { stream_id } => P2pEvent::FileEnd { from, stream_id },
+            P2pPayload::OtpPadStart {
+                stream_id,
+                contact_name,
+                keypair_size_mb,
+                key_len,
+                enc_digest,
+                dec_digest,
+            } => P2pEvent::OtpPadStart {
+                from,
+                stream_id,
+                contact_name,
+                keypair_size_mb,
+                key_len,
+                enc_digest,
+                dec_digest,
+            },
+            P2pPayload::OtpPadChunk {
+                stream_id,
+                seq,
+                blocks,
+            } => P2pEvent::OtpPadChunk {
+                from,
+                stream_id,
+                seq,
+                blocks,
+            },
+            P2pPayload::OtpPadEnd { stream_id } => P2pEvent::OtpPadEnd { from, stream_id },
+            P2pPayload::OtpPadVerify {
+                contact_name,
+                accepted,
+                enc_digest,
+                dec_digest,
+            } => P2pEvent::OtpPadVerify {
+                from,
+                contact_name,
+                accepted,
+                enc_digest,
+                dec_digest,
+            },
+            P2pPayload::OtpPadCommit { contact_name } => {
+                P2pEvent::OtpPadCommit { from, contact_name }
+            }
+            P2pPayload::OtpPadCommitAck { contact_name } => {
+                P2pEvent::OtpPadCommitAck { from, contact_name }
+            }
             P2pPayload::OtpEnvelope {
                 channel,
                 seq,
@@ -1715,6 +1814,24 @@ impl PeerLinkManager {
                         blocks,
                     },
                 );
+            }
+            P2pOutbound::OtpPadChunk {
+                to,
+                stream_id,
+                seq,
+                blocks,
+            } => {
+                self.send_reliable_or_queue(
+                    to,
+                    P2pPayload::OtpPadChunk {
+                        stream_id,
+                        seq,
+                        blocks,
+                    },
+                );
+            }
+            P2pOutbound::OtpPadEnd { to, stream_id } => {
+                self.send_reliable_or_queue(to, P2pPayload::OtpPadEnd { stream_id });
             }
             P2pOutbound::FileEnd { to, stream_id } => {
                 self.send_reliable_or_queue(to, P2pPayload::FileEnd { stream_id });
@@ -2273,6 +2390,20 @@ impl PeerLinkManager {
 
     pub fn pending_count(&self, peer: UserId) -> usize {
         self.links.get(&peer).map_or(0, |l| l.pending.len())
+    }
+
+    /// Everything currently owed to `peer`: frames the reliable layer is
+    /// still carrying, plus anything queued waiting for the link to open.
+    ///
+    /// The backpressure signal for bulk producers. A one-time pad may be a
+    /// terabyte, which is far more than can ever be held in memory as
+    /// frames - so the pad sender only hands over more once this drops
+    /// below its watermark, and the transfer paces itself to whatever the
+    /// link is actually draining (`client::otp_pad`).
+    pub fn outbound_depth(&self, peer: UserId) -> usize {
+        self.links
+            .get(&peer)
+            .map_or(0, |l| l.arq_tx.depth() + l.pending.len())
     }
 
     /// The token the most recent `BindingRequest` went out with - what a

@@ -616,6 +616,19 @@ pub(crate) async fn on_mail_deliver(
         otp_cli::decrypt_retrying(&session.otp_cli_cfg, &expected_contact, &ciphertext, true).await;
     let sealed_bytes = match outcome {
         Ok(otp_cli::OtpCliOutcome::Ok(bytes)) => Zeroizing::new(bytes),
+        // A rejection - the metadata check refused this exact mail, not a
+        // transient failure - is worth naming specifically; see
+        // `otp_cli::OtpCliOutcome::Rejected`'s doc.
+        Ok(otp_cli::OtpCliOutcome::Rejected(reason)) => {
+            ui_state.push_status_notice(
+                format!(
+                    "OTP mail from {from} was rejected ({}) - left on the server, keys untouched",
+                    reason.trim().replace('\n', "; ")
+                ),
+                false,
+            );
+            return Ok(());
+        }
         _ => {
             ui_state.push_status_notice(
                 format!("OTP mail from {from} could not be decrypted - left on the server"),
