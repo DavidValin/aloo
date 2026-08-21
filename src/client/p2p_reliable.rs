@@ -3,8 +3,13 @@
 //! chunks (`docs/PROTOCOL.md`'s "Direct peer-to-peer transport" section) -
 //! the same "arrives complete, in order" guarantee TCP gives, built at the
 //! application layer since the underlying link is raw UDP. Deliberately
-//! minimal, with no selective-repeat and no cumulative acks, since this
+//! minimal, with no selective-repeat and no congestion control, since this
 //! operates at chat-message/file-chunk granularity, not bulk throughput.
+//! The acks are cumulative and name what has been *delivered in order*
+//! (`ArqSender::on_ack`), which is what ties the send window to delivery -
+//! but they say nothing about whether the recipient could read what
+//! arrived, so they are not what the UI's delivery indicator is built on
+//! (`docs/PROTOCOL.md` 7.2.1).
 //! The one concession to bulk is `SEND_WINDOW` (see its doc): an OTP pad
 //! provisioning arrives here as hundreds of frames handed over in one go,
 //! and blasting all of them at the socket at once is not something the

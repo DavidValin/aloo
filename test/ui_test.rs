@@ -2,11 +2,14 @@
 mod ui_common;
 use ui_common::*;
 
+use aloo::p2p_proto::ReceiptStage;
 use aloo::proto::UserId;
 use aloo::client::tui::ui::{
-    CallMemberState, CallTarget, Focus, HOST_LEFT_NOTICE, IdentityCase, MessageBody, Mode,
-    NO_ONE_INVITED_NOTICE, OTP_CALL_REFUSAL, PendingCallInvite, RECORD_HOLD_TIMEOUT, UiAction,
-    UiState, render,
+    CallMemberState, CallTarget, DELIVERED_LABEL, DELIVERY_ARROW, DeliveryStatus, Focus,
+    LISTENED_LABEL, SAVED_LABEL,
+    HOST_LEFT_NOTICE, IdentityCase, MessageBody, Mode, NO_DELIVERY_INFO, NO_ONE_INVITED_NOTICE,
+    OTP_CALL_REFUSAL, PendingCallInvite, RECEIVED_AT_LABEL, RECORD_HOLD_TIMEOUT, SENT_AT_LABEL,
+    UNDELIVERED_LABEL, UiAction, UiState, render,
 };
 use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::Terminal;
@@ -915,7 +918,10 @@ fn enter_on_voice_message_in_messages_focus_requests_replay() {
         action,
         UiAction::ReplayVoice {
             duration_ms: 4200,
-            pcm: vec![1, 2, 3, 4]
+            pcm: vec![1, 2, 3, 4],
+            from: UserId(2),
+            // Nothing is owed: this clip played on arrival.
+            owed_receipt: None,
         }
     );
     assert!(
@@ -2818,4 +2824,453 @@ fn slash_daemon_explains_itself_outside_daemon_mode() {
     let (notice, ok) = state.status_notice.clone().expect("must explain");
     assert!(notice.contains("not running as a daemon"), "{notice}");
     assert!(!ok);
+}
+
+// ---------------------------------------------------------------------
+// Delivery acknowledgments: the details popup and the routing behind it
+// (US-041)
+// ---------------------------------------------------------------------
+
+/// Sends one text into `general` and leaves focus on the message log, on
+/// that row - what `i` acts on.
+fn sent_and_selected(members: Vec<aloo::proto::UserInfo>, text: &str) -> (UiState, u64) {
+    let mut state = joined_general_with(members);
+    type_str(&mut state, text);
+    let msg_id = match press(&mut state, KeyCode::Enter).expect("a send was produced") {
+        UiAction::SendChannelText { msg_id, .. } => msg_id,
+        other => panic!("expected SendChannelText, got {other:?}"),
+    };
+    state.focus = Focus::Messages;
+    state.message_selected = state.channels[0].log.len() - 1;
+    (state, msg_id)
+}
+
+/// @requirement AC-232
+#[test]
+fn i_opens_the_details_of_the_selected_message() {
+    let (mut state, _) = sent_and_selected(vec![user(2, "bob")], "status check");
+    assert!(
+        !rendered_rows(&state).iter().any(|r| r.contains("Message details")),
+        "nothing is open before the key is pressed"
+    );
+
+    assert_eq!(press(&mut state, KeyCode::Char('i')), None);
+    let rows = rendered_rows(&state);
+    assert!(
+        rows.iter().any(|r| r.contains("Message details")),
+        "i opens the popup: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|r| r.contains(SENT_AT_LABEL)),
+        "it opens with when the message was sent: {rows:?}"
+    );
+}
+
+/// One line per recipient, each carrying that recipient's own state -
+/// which is the point of the popup over the row's single aggregate arrow.
+/// @requirement AC-232
+#[test]
+fn the_details_popup_names_every_recipient_with_its_own_state() {
+    let (mut state, msg_id) =
+        sent_and_selected(vec![user(2, "bob"), user(3, "carol")], "status check");
+    state.mark_delivered(UserId(2), msg_id, ReceiptStage::Decrypted);
+    press(&mut state, KeyCode::Char('i'));
+
+    let rows = rendered_rows(&state);
+    let names = |name: &str, label: &str| {
+        rows.iter()
+            .any(|r| r.contains(name) && r.contains(label))
+    };
+    assert!(
+        names("bob", DELIVERED_LABEL),
+        "the one who acknowledged it reads DELIVERED: {rows:?}"
+    );
+    assert!(
+        names("carol", UNDELIVERED_LABEL),
+        "the one who has not reads UNDELIVERED: {rows:?}"
+    );
+    // The same arrow, in the same colours, as the row it was opened from.
+    assert!(
+        rows.iter()
+            .any(|r| r.contains(&format!("{DELIVERY_ARROW} {DELIVERED_LABEL}"))),
+        "each status is written with the arrow: {rows:?}"
+    );
+}
+
+/// @requirement AC-232
+#[test]
+fn the_details_popup_absorbs_other_keys_and_closes_on_escape() {
+    let (mut state, _) = sent_and_selected(vec![user(2, "bob")], "one");
+    push_n_channel_texts(&mut state, 3);
+    state.message_selected = 0;
+    press(&mut state, KeyCode::Char('i'));
+
+    assert_eq!(press(&mut state, KeyCode::Down), None);
+    assert_eq!(
+        state.message_selected, 0,
+        "a key the popup does not handle is absorbed, not acted on underneath it"
+    );
+    assert!(
+        rendered_rows(&state).iter().any(|r| r.contains("Message details")),
+        "and does not close it either"
+    );
+
+    press(&mut state, KeyCode::Esc);
+    assert!(
+        !rendered_rows(&state).iter().any(|r| r.contains("Message details")),
+        "Escape closes it"
+    );
+
+    // `i` is a toggle, same as the key that opened it.
+    press(&mut state, KeyCode::Char('i'));
+    press(&mut state, KeyCode::Char('i'));
+    assert!(
+        !rendered_rows(&state).iter().any(|r| r.contains("Message details")),
+        "i closes it again"
+    );
+}
+
+/// A row with nothing to report says so, rather than opening an empty list
+/// that reads like a message nobody received.
+/// @requirement AC-232
+#[test]
+fn an_incoming_message_has_no_delivery_information_to_show() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.on_channel_message(
+        "general",
+        UserId(2),
+        "bob".into(),
+        MessageBody::Text("hello".into()),
+    );
+    state.focus = Focus::Messages;
+    state.message_selected = 0;
+    press(&mut state, KeyCode::Char('i'));
+
+    let rows = rendered_rows(&state);
+    assert!(
+        rows.iter().any(|r| r.contains(NO_DELIVERY_INFO)),
+        "it says there is nothing to report: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|r| r.contains(RECEIVED_AT_LABEL)),
+        "and calls the time what it actually is: {rows:?}"
+    );
+}
+
+/// @requirement AC-230
+#[test]
+fn only_messages_this_client_sent_carry_an_indicator() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    // One of every other row kind that can share a log with a sent text.
+    state.on_channel_message(
+        "general",
+        UserId(2),
+        "bob".into(),
+        MessageBody::Text("hello".into()),
+    );
+    state.on_user_joined("general", user(3, "carol"));
+    state.log_own_file_offer_channel("general", "bob", 7, "notes.txt".into(), 10, None);
+    type_str(&mut state, "mine");
+    press(&mut state, KeyCode::Enter);
+
+    let log = &state.channels[0].log;
+    let tracked: Vec<bool> = log.iter().map(|e| e.delivery_status().is_some()).collect();
+    assert_eq!(
+        tracked,
+        vec![false, false, false, true],
+        "only the text this client sent tracks a delivery: {:?}",
+        log.iter().map(|e| &e.body).collect::<Vec<_>>()
+    );
+
+    let rows = rendered_rows(&state);
+    assert!(
+        rows.iter().any(|r| r.contains("bob: hello")),
+        "an incoming message keeps the plain separator: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|r| r.contains(&format!("me {DELIVERY_ARROW} mine"))),
+        "and a sent one reads with the arrow: {rows:?}"
+    );
+}
+
+/// An acknowledgement names a peer and an id, never a conversation, so the
+/// id has to be enough to find the row wherever it lives.
+/// @requirement TB-231
+#[test]
+fn an_acknowledgement_finds_its_row_in_any_conversation() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    type_str(&mut state, "to the channel");
+    let channel_id = match press(&mut state, KeyCode::Enter).expect("a send") {
+        UiAction::SendChannelText { msg_id, .. } => msg_id,
+        other => panic!("expected SendChannelText, got {other:?}"),
+    };
+    state.focus = Focus::Sidebar;
+    press(&mut state, KeyCode::Enter); // opens bob's room
+    state.focus = Focus::Input;
+    type_str(&mut state, "and to bob");
+    let dm_id = match press(&mut state, KeyCode::Enter).expect("a send") {
+        UiAction::SendDirectText { msg_id, .. } => msg_id,
+        other => panic!("expected SendDirectText, got {other:?}"),
+    };
+    assert_ne!(
+        channel_id, dm_id,
+        "ids are handed out across the whole session, not per conversation"
+    );
+
+    state.mark_delivered(UserId(2), dm_id, ReceiptStage::Decrypted);
+    assert_eq!(
+        state.private_rooms[&UserId(2)].log[0].delivery_status(),
+        Some(DeliveryStatus::All)
+    );
+    assert_eq!(
+        state.channels[0].log[0].delivery_status(),
+        Some(DeliveryStatus::None),
+        "the channel row is a different message and is untouched"
+    );
+
+    state.mark_delivered(UserId(2), channel_id, ReceiptStage::Decrypted);
+    assert_eq!(
+        state.channels[0].log[0].delivery_status(),
+        Some(DeliveryStatus::All)
+    );
+}
+
+/// Acknowledgements arrive off a retrying transport and after reconnects,
+/// so a repeat and a stale id both have to be ordinary no-ops.
+/// @requirement TB-231
+#[test]
+fn marking_delivered_is_idempotent_and_ignores_unknown_ids() {
+    let mut state = joined_general_with(vec![user(2, "bob"), user(3, "carol")]);
+    type_str(&mut state, "hello all");
+    let msg_id = match press(&mut state, KeyCode::Enter).expect("a send") {
+        UiAction::SendChannelText { msg_id, .. } => msg_id,
+        other => panic!("expected SendChannelText, got {other:?}"),
+    };
+
+    state.mark_delivered(UserId(2), msg_id, ReceiptStage::Decrypted);
+    state.mark_delivered(UserId(2), msg_id, ReceiptStage::Decrypted);
+    assert_eq!(
+        state.channels[0].log[0].delivery_status(),
+        Some(DeliveryStatus::Some),
+        "a repeated acknowledgement from one recipient does not count twice"
+    );
+
+    // An id from before a reconnect, and a peer who was never a recipient.
+    state.mark_delivered(UserId(2), msg_id + 999, ReceiptStage::Decrypted);
+    state.mark_delivered(UserId(9), msg_id, ReceiptStage::Decrypted);
+    assert_eq!(
+        state.channels[0].log[0].delivery_status(),
+        Some(DeliveryStatus::Some)
+    );
+}
+
+/// A voice message and a file transfer are messages too - their rows carry
+/// the same arrow, in the same place, as a text row.
+/// @requirement AC-230
+#[test]
+fn a_voice_row_and_a_file_row_carry_the_arrow_too() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    let (voice_id, voice_delivery) = state.start_delivery(&[UserId(2)]);
+    state.log_own_voice_stream_start_channel("general", 7, Some(voice_delivery));
+    let (file_id, file_delivery) = state.start_delivery(&[UserId(2)]);
+    state.log_own_file_offer_channel("general", "bob", 8, "notes.txt".into(), 10, Some(file_delivery));
+
+    let statuses: Vec<Option<DeliveryStatus>> = state.channels[0]
+        .log
+        .iter()
+        .map(|e| e.delivery_status())
+        .collect();
+    assert_eq!(
+        statuses,
+        vec![Some(DeliveryStatus::None), Some(DeliveryStatus::None)],
+        "both start undelivered, like any other message"
+    );
+
+    // The rows read `me -> <body>` rather than `me: <body>`.
+    let rows = rendered_rows(&state);
+    assert_eq!(
+        rows.iter()
+            .filter(|r| r.contains(&format!("me {DELIVERY_ARROW} ")))
+            .count(),
+        2,
+        "both rows carry the arrow: {rows:?}"
+    );
+
+    state.mark_delivered(UserId(2), voice_id, ReceiptStage::Decrypted);
+    assert_eq!(
+        state.channels[0].log[0].delivery_status(),
+        Some(DeliveryStatus::All),
+        "the voice row turns green when its recipient decoded it"
+    );
+    assert_eq!(
+        state.channels[0].log[1].delivery_status(),
+        Some(DeliveryStatus::None),
+        "and the file row is a different message, untouched"
+    );
+
+    state.mark_delivered(UserId(2), file_id, ReceiptStage::Decrypted);
+    assert_eq!(
+        state.channels[0].log[1].delivery_status(),
+        Some(DeliveryStatus::All)
+    );
+}
+
+/// A live voice row becomes a finished one in place - the same row, so it
+/// keeps the delivery it was already tracking.
+/// @requirement AC-230
+#[test]
+fn a_voice_row_keeps_its_delivery_when_the_stream_finishes() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    let (msg_id, delivery) = state.start_delivery(&[UserId(2)]);
+    state.log_own_voice_stream_start_channel("general", 7, Some(delivery));
+    let me = state.own_id.expect("own id");
+
+    state.on_channel_stream_finished("general", me, 7, 1200, vec![0; 8]);
+    assert!(
+        matches!(state.channels[0].log[0].body, MessageBody::Voice { .. }),
+        "the placeholder was finalized in place"
+    );
+    state.mark_delivered(UserId(2), msg_id, ReceiptStage::Decrypted);
+    assert_eq!(
+        state.channels[0].log[0].delivery_status(),
+        Some(DeliveryStatus::All),
+        "finalizing must not lose which message this row is"
+    );
+}
+
+/// The details popup is the one place the extra state shows: a voice
+/// message the recipient has actually heard, and a file they have on disk,
+/// read differently from one merely decrypted (docs/PROTOCOL.md 7.2.1).
+/// @requirement AC-236
+#[test]
+fn the_details_popup_distinguishes_heard_from_merely_decrypted() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    let (msg_id, delivery) = state.start_delivery(&[UserId(2)]);
+    state.log_own_voice_stream_start_channel("general", 7, Some(delivery));
+    state.focus = Focus::Messages;
+    state.message_selected = 0;
+
+    state.mark_delivered(UserId(2), msg_id, ReceiptStage::Decrypted);
+    press(&mut state, KeyCode::Char('i'));
+    let rows = rendered_rows(&state);
+    assert!(
+        rows.iter().any(|r| r.contains(DELIVERED_LABEL)),
+        "decoded, but not heard: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|r| r.contains(LISTENED_LABEL)),
+        "and it must not claim they heard it"
+    );
+
+    state.mark_delivered(UserId(2), msg_id, ReceiptStage::Consumed);
+    let rows = rendered_rows(&state);
+    assert!(
+        rows.iter().any(|r| r.contains(LISTENED_LABEL)),
+        "once they play it, the popup says so: {rows:?}"
+    );
+}
+
+/// @requirement AC-236
+#[test]
+fn the_details_popup_says_saved_for_a_file_the_recipient_has_on_disk() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    let (msg_id, delivery) = state.start_delivery(&[UserId(2)]);
+    state.log_own_file_offer_channel("general", "bob", 8, "notes.txt".into(), 10, Some(delivery));
+    state.focus = Focus::Messages;
+    state.message_selected = 0;
+
+    state.mark_delivered(UserId(2), msg_id, ReceiptStage::Decrypted);
+    press(&mut state, KeyCode::Char('i'));
+    assert!(
+        rendered_rows(&state).iter().any(|r| r.contains(DELIVERED_LABEL)),
+        "they could read the offer"
+    );
+
+    state.mark_delivered(UserId(2), msg_id, ReceiptStage::Consumed);
+    let rows = rendered_rows(&state);
+    assert!(
+        rows.iter().any(|r| r.contains(SAVED_LABEL)),
+        "and once the whole file is on their disk it says that instead: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|r| r.contains(LISTENED_LABEL)),
+        "a file is saved, not listened to"
+    );
+}
+
+/// A text message has no further state to reach, so it never grows one -
+/// and the log's own arrow stays a three-state summary either way.
+/// @requirement AC-236
+#[test]
+fn a_text_message_has_no_extra_state_and_the_arrow_is_unchanged_by_one() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    type_str(&mut state, "hello");
+    let msg_id = match press(&mut state, KeyCode::Enter).expect("a send") {
+        UiAction::SendChannelText { msg_id, .. } => msg_id,
+        other => panic!("expected SendChannelText, got {other:?}"),
+    };
+    state.mark_delivered(UserId(2), msg_id, ReceiptStage::Consumed);
+
+    assert_eq!(
+        state.channels[0].log[0].delivery_status(),
+        Some(DeliveryStatus::All),
+        "the arrow is about who has the message, not what they did with it"
+    );
+    state.focus = Focus::Messages;
+    state.message_selected = 0;
+    press(&mut state, KeyCode::Char('i'));
+    let rows = rendered_rows(&state);
+    assert!(rows.iter().any(|r| r.contains(DELIVERED_LABEL)));
+    assert!(
+        !rows.iter().any(|r| r.contains(LISTENED_LABEL) || r.contains(SAVED_LABEL)),
+        "there is no such thing as listening to, or saving, a text message: {rows:?}"
+    );
+}
+
+/// A muted sender's clip decodes but is not played, so the debt to tell
+/// them moves onto the row - and replaying it later is what pays it.
+/// @requirement AC-236
+#[test]
+fn replaying_a_clip_that_was_never_heard_pays_its_sender() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.on_channel_stream_start("general", UserId(2), "bob".into(), 7);
+    state.owe_replay_receipt(UserId(2), 7, Some(99));
+    state.on_channel_stream_finished("general", UserId(2), 7, 1200, vec![0; 8]);
+    state.focus = Focus::Messages;
+    state.message_selected = 0;
+
+    match press(&mut state, KeyCode::Enter).expect("Enter replays a voice row") {
+        UiAction::ReplayVoice {
+            from,
+            owed_receipt,
+            ..
+        } => {
+            assert_eq!(from, UserId(2), "the debt is owed to whoever sent it");
+            assert_eq!(owed_receipt, Some(99));
+        }
+        other => panic!("expected ReplayVoice, got {other:?}"),
+    }
+
+    // Replaying again owes nothing: hearing it twice is still hearing it.
+    match press(&mut state, KeyCode::Enter).expect("still replayable") {
+        UiAction::ReplayVoice { owed_receipt, .. } => assert_eq!(owed_receipt, None),
+        other => panic!("expected ReplayVoice, got {other:?}"),
+    }
+}
+
+/// The ordinary case: a clip that played on arrival owes nothing, so
+/// replaying it says nothing to anybody.
+/// @requirement AC-236
+#[test]
+fn replaying_a_clip_that_was_already_heard_owes_nothing() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.on_channel_stream_start("general", UserId(2), "bob".into(), 7);
+    state.on_channel_stream_finished("general", UserId(2), 7, 1200, vec![0; 8]);
+    state.focus = Focus::Messages;
+    state.message_selected = 0;
+
+    match press(&mut state, KeyCode::Enter).expect("Enter replays a voice row") {
+        UiAction::ReplayVoice { owed_receipt, .. } => assert_eq!(owed_receipt, None),
+        other => panic!("expected ReplayVoice, got {other:?}"),
+    }
 }

@@ -233,6 +233,7 @@ async fn roundtrip_every_message(w: &mut AlooWorld) {
     // wire types above - `P2pPayload::Envelope` is where an `Envelope`
     // actually gets sent, so that's what needs the round-trip check.
     let payload = P2pPayload::Envelope {
+        msg_id: None,
         channel: None,
         envelope: envelope.clone(),
     };
@@ -240,6 +241,7 @@ async fn roundtrip_every_message(w: &mut AlooWorld) {
     match decoded {
         P2pPayload::Envelope {
             channel,
+            msg_id: _,
             envelope: got,
         } => {
             assert_eq!(channel, None);
@@ -259,12 +261,14 @@ async fn every_field_intact(w: &mut AlooWorld) {
     let envelope = w.envelope.as_ref().expect("no envelope round-tripped");
     let msg = P2pPayload::Envelope {
         channel: Some("general".into()),
+        msg_id: None,
         envelope: envelope.clone(),
     };
     let decoded: P2pPayload = decode(&encode(&msg).unwrap()).unwrap();
     match decoded {
         P2pPayload::Envelope {
             channel,
+            msg_id: _,
             envelope: got,
         } => {
             assert_eq!(

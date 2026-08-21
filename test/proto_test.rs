@@ -116,13 +116,14 @@ fn envelope_roundtrips() {
         blocks: vec![vec![9, 9, 9], vec![8, 8]],
     };
     let msg = P2pPayload::Envelope {
+        msg_id: None,
         channel: None,
         envelope: env.clone(),
     };
     let bytes = encode(&msg).unwrap();
     let decoded: P2pPayload = decode(&bytes).unwrap();
     match decoded {
-        P2pPayload::Envelope { channel, envelope } => {
+        P2pPayload::Envelope { channel, envelope, .. } => {
             assert_eq!(channel, None);
             assert_eq!(envelope, env);
         }
@@ -142,6 +143,7 @@ fn content_file_offer_envelope_roundtrips() {
         blocks: vec![vec![1, 2, 3]],
     };
     let msg = P2pPayload::FileOffer {
+        msg_id: None,
         channel: Some("general".into()),
         stream_id: 7,
         envelope: env.clone(),
@@ -153,6 +155,7 @@ fn content_file_offer_envelope_roundtrips() {
             channel,
             stream_id,
             envelope,
+            ..
         } => {
             assert_eq!(stream_id, 7);
             assert_eq!(channel.as_deref(), Some("general"));
@@ -409,6 +412,7 @@ fn punch_datagrams_roundtrip() {
 #[test]
 fn stream_start_and_end_roundtrip() {
     let start = P2pPayload::StreamStart {
+        msg_id: None,
         channel: Some("general".into()),
         stream_id: 42,
     };
@@ -424,6 +428,7 @@ fn stream_start_and_end_roundtrip() {
     assert_eq!(decode::<P2pPayload>(&encode(&end).unwrap()).unwrap(), end);
 
     let direct_start = P2pPayload::StreamStart {
+        msg_id: None,
         channel: None,
         stream_id: 7,
     };

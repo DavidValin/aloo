@@ -33,6 +33,7 @@ use ratatui::widgets::{
 };
 
 use crate::client::p2p::LinkStatus;
+use crate::p2p_proto::ReceiptStage;
 use crate::proto::{ChannelInfo, ChannelKind, KeyMode, UserId, UserInfo};
 
 use super::channel::ChannelTab;
@@ -133,6 +134,17 @@ const HELP_BODY: &[&str] = &[
     "  PgUp/PgDn  scroll it ten at a time; Home/End jump to the oldest/newest",
     "             (log focused). A log taller than its pane shows a scrollbar",
     "             down its right edge.",
+    "  i          message details: when it was sent, and every user it went",
+    "             to with their own DELIVERED / UNDELIVERED state (log",
+    "             focused). i or Esc closes it again.",
+    "  ->         each message you send reads `you -> message`, the arrow",
+    "             coloured by how far it has got: gray until anyone has",
+    "             decrypted it, green once everyone has, and in a channel",
+    "             orange while only some have. Voice messages and file",
+    "             transfers carry it too - a file turns green once the",
+    "             whole of it has arrived decrypted on their side. A",
+    "             message that reached nobody is struck through. Messages",
+    "             from other people keep a plain `name: message`.",
     "",
     "Private messages",
     "  Up / Down    pick a user (sidebar focused)",
@@ -329,6 +341,103 @@ pub enum MessageBody {
     Presence(String),
 }
 
+/// One recipient of an outgoing message, and whether that recipient has
+/// acknowledged it yet (`docs/PROTOCOL.md` 7.2.1). A DM has exactly one of
+/// these; a channel send has one per member it was addressed to, which is
+/// what lets the row distinguish "nobody yet" from "some of them" from
+/// "everyone" (`DeliveryStatus`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeliveryRecipient {
+    pub id: UserId,
+    /// The nickname as it was at send time. Snapshotted rather than looked
+    /// up when the info popup renders, so a recipient who has since left
+    /// is still named rather than disappearing from the list of who a
+    /// message went to.
+    pub name: String,
+    /// They could read it (`p2p_proto::ReceiptStage::Decrypted`).
+    pub delivered: bool,
+    /// They have since done the thing the message was for - played the
+    /// audio, saved the file (`p2p_proto::ReceiptStage::Consumed`). Only
+    /// ever true for a voice or file row, and shown only in the details
+    /// popup: the log's own arrow stays a three-state summary of who has
+    /// the message, not of what they did with it.
+    pub consumed: bool,
+}
+
+/// What one message row's indicator says, aggregated over its recipients
+/// (`docs/SPEC.md` "Delivery acknowledgments"). `Some` never applies to a
+/// DM - one recipient is either delivered or not - so a DM row's arrow is
+/// only ever gray or green.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryStatus {
+    /// Not one recipient has acknowledged it yet.
+    None,
+    /// At least one has, but not all of them.
+    Some,
+    /// Every recipient has.
+    All,
+}
+
+/// What separates a nickname from the message body on a row whose
+/// delivery this client tracks: an arrow, coloured by how far the message
+/// has got (`DeliveryStatus::color`). A glyph every terminal draws
+/// identically in one cell each, unlike an emoji, and one the colour can
+/// actually be trusted to reach - which is the whole job here.
+pub const DELIVERY_ARROW: &str = "->";
+/// What separates them on every other row - an incoming message, a system
+/// or presence line, an outgoing voice or file row. There is no delivery
+/// to report on those, so the plain separator says nothing about one.
+pub const PLAIN_SEPARATOR: &str = ":";
+
+/// What the info popup writes beside each recipient, after that
+/// recipient's own arrow (`render_message_info_popup`).
+pub const DELIVERED_LABEL: &str = "DELIVERED";
+pub const UNDELIVERED_LABEL: &str = "UNDELIVERED";
+/// What a voice message reads once the recipient has actually heard it -
+/// on arrival, or later if it was muted at the time and they replayed it.
+pub const LISTENED_LABEL: &str = "DELIVERED+LISTENED";
+/// What a file transfer reads once the recipient has the whole of it on
+/// disk, rather than merely having been able to read the offer.
+pub const SAVED_LABEL: &str = "DELIVERED+SAVED";
+
+/// What one recipient's line of the details popup says, and the colour to
+/// say it in. `body` decides the wording of the consumed state: the extra
+/// state a voice message can reach is not the one a file reaches, and a
+/// text message has no further state at all.
+pub fn recipient_label(recipient: &DeliveryRecipient, body: &MessageBody) -> (&'static str, Color) {
+    if !recipient.delivered {
+        return (UNDELIVERED_LABEL, DeliveryStatus::None.color());
+    }
+    let green = DeliveryStatus::All.color();
+    if !recipient.consumed {
+        return (DELIVERED_LABEL, green);
+    }
+    match body {
+        MessageBody::Voice { .. } | MessageBody::VoiceStreaming { .. } => (LISTENED_LABEL, green),
+        MessageBody::File { .. } => (SAVED_LABEL, green),
+        // Nothing else ever reports being consumed; if one somehow did,
+        // saying only what is certain beats inventing a word for it.
+        _ => (DELIVERED_LABEL, green),
+    }
+}
+
+impl DeliveryStatus {
+    /// The colour this status paints `DELIVERY_ARROW` in: gray for
+    /// nothing acknowledged yet, orange while only some of a channel's
+    /// recipients have, green once all of them have.
+    pub fn color(self) -> Color {
+        match self {
+            DeliveryStatus::None => Color::DarkGray,
+            // Ratatui's `Yellow` is the terminal's colour 3, which every
+            // palette renders as an orange/amber - this app's existing
+            // "partway there" colour (a reconnect in progress, a peer
+            // still being punched at).
+            DeliveryStatus::Some => Color::Yellow,
+            DeliveryStatus::All => Color::Green,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct LogEntry {
     pub from: UserId,
@@ -348,6 +457,92 @@ pub struct LogEntry {
     /// `UiState::mark_dm_message_failed`). Never true for anything but an
     /// `outgoing` entry.
     pub failed: bool,
+    /// When this row was created, in local time - what the info popup
+    /// shows (`docs/SPEC.md` "Delivery acknowledgments"). Formatted at
+    /// creation (`local_time_stamp`) rather than stored as an instant, the
+    /// same way presence notices already carry their own formatted time.
+    pub sent_at: String,
+    /// Set only on an outgoing message whose delivery this client tracks
+    /// (`docs/PROTOCOL.md` 7.2.1). `None` everywhere else, including
+    /// everything incoming (which was delivered to us by the fact of being
+    /// here), so those rows show no indicator rather than a misleading
+    /// gray one.
+    pub delivery: Option<MessageDelivery>,
+    /// The mirror image, on an *incoming* voice row: what this side still
+    /// owes its sender a `Consumed` receipt for, because the audio decoded
+    /// but was not played at the time - the sender had been muted, or was
+    /// still under identity review. Taken and sent if the user ever
+    /// replays the row (`handle_messages_key`'s Enter); `None` on every
+    /// row that owes nothing, which is almost all of them.
+    pub owed_receipt: Option<u64>,
+}
+
+/// One outgoing message's delivery state: who it was addressed to, and
+/// which of them have acknowledged it (`docs/PROTOCOL.md` 7.2.1).
+#[derive(Debug, Clone, PartialEq)]
+pub struct MessageDelivery {
+    /// This message's own identifier within this client, handed out by
+    /// `UiState::alloc_msg_id`. It goes on the wire as the reliable
+    /// frame's delivery tag, so a recipient's acknowledgement can be routed
+    /// straight back to this row (`UiState::mark_delivered`) - which a log
+    /// index could not do, since a row lives in one of many logs.
+    pub msg_id: u64,
+    pub recipients: Vec<DeliveryRecipient>,
+}
+
+impl MessageDelivery {
+    /// This message's aggregate status, over every recipient it was
+    /// addressed to. A send that reached nobody - every member filtered
+    /// out by the key-mode policy, or an empty channel - is `None` rather
+    /// than a vacuous `All`: nothing was acknowledged because nothing went
+    /// anywhere, and the row must not claim otherwise.
+    pub fn status(&self) -> DeliveryStatus {
+        let delivered = self.recipients.iter().filter(|r| r.delivered).count();
+        if delivered == 0 || self.recipients.is_empty() {
+            DeliveryStatus::None
+        } else if delivered == self.recipients.len() {
+            DeliveryStatus::All
+        } else {
+            DeliveryStatus::Some
+        }
+    }
+}
+
+impl LogEntry {
+    /// This row's delivery status, or `None` for a row that tracks no
+    /// delivery at all - such a row shows no indicator.
+    pub fn delivery_status(&self) -> Option<DeliveryStatus> {
+        self.delivery.as_ref().map(MessageDelivery::status)
+    }
+
+    /// Whether this row was sent and reached nobody at all - an empty
+    /// channel, or every member excluded by the key-mode policy. Distinct
+    /// from merely undelivered: there is no acknowledgement still to come,
+    /// so the row is struck through rather than left looking like it is
+    /// waiting (`render_messages`).
+    pub fn reached_nobody(&self) -> bool {
+        self.delivery
+            .as_ref()
+            .is_some_and(|d| d.recipients.is_empty())
+    }
+}
+
+/// The combining long stroke overlay - one per character is what draws a
+/// line through text in a terminal, which has no styling for it (ratatui's
+/// `Modifier::CROSSED_OUT` is an ANSI attribute plenty of terminals ignore).
+pub const STRIKE_OVERLAY: char = '\u{0336}';
+
+/// `s` with `STRIKE_OVERLAY` after every character, so it renders struck
+/// through. A combining mark attaches to the character *before* it, so the
+/// order matters and an empty string stays empty rather than growing a
+/// stroke attached to nothing.
+pub fn strike_through(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 2);
+    for c in s.chars() {
+        out.push(c);
+        out.push(STRIKE_OVERLAY);
+    }
+    out
 }
 
 /// Which anchor a peer's identity mismatch failed against - drives the
@@ -819,6 +1014,11 @@ pub enum UiAction {
         channel: String,
         plaintext: String,
         recipients: Vec<Recipient>,
+        /// This send's delivery tag, shared by every per-recipient frame
+        /// it turns into and matching the log row's own
+        /// `MessageDelivery::msg_id` - what routes each recipient's
+        /// acknowledgement back to that one row (`docs/PROTOCOL.md` 7.2.1).
+        msg_id: u64,
     },
     SendDirectText {
         to: UserId,
@@ -832,6 +1032,8 @@ pub enum UiAction {
         /// message that was never delivered looking identical to one that
         /// was.
         log_index: Option<usize>,
+        /// This send's delivery tag - see `SendChannelText::msg_id`.
+        msg_id: u64,
     },
     /// The target is captured at press-time (not release-time): live
     /// streaming needs to know who to address the wire `StreamXStart` to
@@ -841,6 +1043,15 @@ pub enum UiAction {
     ReplayVoice {
         duration_ms: u32,
         pcm: Vec<u8>,
+        /// Who sent the clip being replayed - who `owed_receipt` is owed
+        /// to.
+        from: UserId,
+        /// Set when this replay is the first time the clip has actually
+        /// been heard, because playback was suppressed when it arrived
+        /// (`docs/PROTOCOL.md` 7.2.1). The session sends that peer a
+        /// `Consumed` receipt for it; `None` means nothing is owed -
+        /// either it played on arrival, or it has been replayed before.
+        owed_receipt: Option<u64>,
     },
     /// Escape while a replayed (previously-received) voice message is
     /// playing - `session::handle_ui_action` stops it on the mixer, since
@@ -1385,6 +1596,19 @@ pub struct UiState {
     /// back from the visible channel/DM log until they're `Accepted`
     /// (`docs/PROTOCOL.md` §12 "hold and reveal") - see `HeldMessage`.
     pub pending_messages: HashMap<UserId, Vec<HeldMessage>>,
+    /// Source of `MessageDelivery::msg_id`. Session-scoped and
+    /// monotonic, which is all a delivery tag has to be: it is only ever
+    /// compared against ids this same client handed out, and never
+    /// survives a restart (a message whose acknowledgement has not arrived
+    /// by then never gets one - see `docs/PROTOCOL.md` 7.2.1).
+    next_msg_id: u64,
+    /// Which row of the current log the message info popup is open on, as
+    /// an index into `current_log` (`docs/SPEC.md` "Delivery
+    /// acknowledgments"). An index rather than a snapshot, so the
+    /// delivery states it shows keep updating while it is open; safe
+    /// because logs are append-only and the popup absorbs every key that
+    /// could change which conversation is on screen.
+    pub(crate) message_info: Option<usize>,
     /// System-wide CPU usage percentage, refreshed roughly every
     /// `sysstats::CPU_HEALTHY_MAX_PCT`-adjacent cadence by
     /// `session::run_connected_session` (`sysstats::CpuMonitor`) and shown
@@ -1501,6 +1725,8 @@ impl UiState {
             identity_review_queue: VecDeque::new(),
             identity_review_focus: IdentityChoice::Reject,
             pending_messages: HashMap::new(),
+            next_msg_id: 0,
+            message_info: None,
             cpu_usage_pct: 0.0,
             conn_quality: crate::client::netstats::ConnQuality::Unknown,
             server_link: crate::client::reconnect::ServerLinkState::Connected,
@@ -1698,6 +1924,153 @@ impl UiState {
     /// it from `~/.aloo/settings`.
     pub fn set_muted_voice(&mut self, muted: std::collections::BTreeSet<String>) {
         self.muted_voice = muted;
+    }
+
+    /// Hands out the next `MessageDelivery::msg_id`. Called once per
+    /// outgoing text message, just before the row is logged, so the id can
+    /// go on the wire as that send's delivery tag
+    /// (`p2p::PeerLinkManager::send_reliable_tagged`).
+    pub(crate) fn alloc_msg_id(&mut self) -> u64 {
+        let id = self.next_msg_id;
+        self.next_msg_id += 1;
+        id
+    }
+
+    /// Opens a delivery record for a message about to be sent to
+    /// `recipients`, returning the id the wire must carry alongside the
+    /// record the log row must hold - the two are the same number, which
+    /// is what lets a receipt find its row again (`mark_delivered`).
+    pub fn start_delivery(&mut self, recipients: &[UserId]) -> (u64, MessageDelivery) {
+        let msg_id = self.alloc_msg_id();
+        let recipients = recipients
+            .iter()
+            .map(|id| DeliveryRecipient {
+                id: *id,
+                name: self.peer_display_name(*id),
+                delivered: false,
+                consumed: false,
+            })
+            .collect();
+        (msg_id, MessageDelivery { msg_id, recipients })
+    }
+
+    /// A peer's nickname as it is right now, for snapshotting into a
+    /// `DeliveryRecipient`. Falls back to an open room's own record of
+    /// them, then to empty - a message is still addressed to someone the
+    /// roster has since forgotten.
+    fn peer_display_name(&self, id: UserId) -> String {
+        self.known_users
+            .get(&id)
+            .map(|u| u.name.clone())
+            .or_else(|| self.private_rooms.get(&id).map(|r| r.peer.name.clone()))
+            .unwrap_or_default()
+    }
+
+    /// The delivery id of this client's own row for `stream_id` - a voice
+    /// message or a file transfer, whose row is created when the stream
+    /// starts but whose wire payload may be built much later (an OTP voice
+    /// message is only sent once recording stops). Lets that later send
+    /// name the row that is already on screen rather than threading the id
+    /// through every intermediate structure.
+    pub fn own_stream_msg_id(&self, stream_id: u64) -> Option<u64> {
+        let logs = self
+            .channels
+            .iter()
+            .map(|c| &c.log)
+            .chain(self.private_rooms.values().map(|r| &r.log));
+        for log in logs {
+            for entry in log.iter() {
+                if !entry.outgoing {
+                    continue;
+                }
+                let matches = match &entry.body {
+                    MessageBody::VoiceStreaming { stream_id: sid }
+                    | MessageBody::File {
+                        stream_id: sid, ..
+                    } => *sid == stream_id,
+                    _ => false,
+                };
+                if matches {
+                    return entry.delivery.as_ref().map(|d| d.msg_id);
+                }
+            }
+        }
+        None
+    }
+
+    /// Marks the still-streaming incoming row `(from, stream_id)` as
+    /// owing its sender a `Consumed` receipt for `msg_id`, because its
+    /// audio decoded but was not played - the sender is muted, or is still
+    /// under identity review (`docs/PROTOCOL.md` 7.2.1). Replaying that
+    /// row later is what pays it (`handle_messages_key`'s Enter).
+    ///
+    /// Called while the row is still a `VoiceStreaming` placeholder, which
+    /// is the only form that carries `stream_id`; a held row (§12) is
+    /// covered too, since it becomes visible unchanged when its sender is
+    /// accepted. A no-op when the sender asked for no receipt.
+    pub fn owe_replay_receipt(&mut self, from: UserId, stream_id: u64, msg_id: Option<u64>) {
+        let Some(msg_id) = msg_id else {
+            return;
+        };
+        let is_this_stream = |e: &LogEntry| {
+            e.from == from
+                && matches!(e.body, MessageBody::VoiceStreaming { stream_id: sid } if sid == stream_id)
+        };
+        let visible = self
+            .channels
+            .iter_mut()
+            .map(|c| &mut c.log)
+            .chain(self.private_rooms.values_mut().map(|r| &mut r.log));
+        for log in visible {
+            if let Some(entry) = log.iter_mut().find(|e| is_this_stream(e)) {
+                entry.owed_receipt = Some(msg_id);
+                return;
+            }
+        }
+        for held in self.pending_messages.values_mut() {
+            if let Some(h) = held.iter_mut().find(|h| is_this_stream(&h.entry)) {
+                h.entry.owed_receipt = Some(msg_id);
+                return;
+            }
+        }
+    }
+
+    /// Records how far `peer` has got with the message `msg_id` names
+    /// (`docs/PROTOCOL.md` 7.2.1) - the sole thing that turns a row's
+    /// indicator from gray towards green, and the sole thing that fills in
+    /// the extra state its details popup can show. Searches every channel log and
+    /// private room because a `msg_id` is unique across all of them and
+    /// the acknowledgement says nothing about which conversation it came
+    /// from. Idempotent: a duplicate acknowledgement changes nothing, and
+    /// an id from before a reconnect simply matches nothing.
+    pub fn mark_delivered(&mut self, peer: UserId, msg_id: u64, stage: ReceiptStage) {
+        let logs = self
+            .channels
+            .iter_mut()
+            .map(|c| &mut c.log)
+            .chain(self.private_rooms.values_mut().map(|r| &mut r.log));
+        for log in logs {
+            for entry in log.iter_mut() {
+                let Some(delivery) = entry.delivery.as_mut() else {
+                    continue;
+                };
+                if delivery.msg_id != msg_id {
+                    continue;
+                }
+                for recipient in delivery.recipients.iter_mut() {
+                    if recipient.id != peer {
+                        continue;
+                    }
+                    // Consuming implies decrypting, and the two receipts
+                    // can arrive in either order after a re-punch, so
+                    // `Consumed` sets both rather than assuming the first
+                    // one landed.
+                    recipient.delivered = true;
+                    recipient.consumed |= stage == ReceiptStage::Consumed;
+                }
+                return;
+            }
+        }
     }
 
     /// Buffers a message/stream-placeholder from a trust-gated `from`
@@ -2814,6 +3187,21 @@ impl UiState {
             return self.handle_call_modal_key(code);
         }
 
+        // The message info popup owns every key while it is open
+        // (`docs/SPEC.md` "Delivery acknowledgments"): Esc and `i` close
+        // it, everything else is absorbed. Above Ctrl+H so it is a real
+        // popup rather than something the help overlay can be stacked on
+        // top of, and below the consent popups above, which must always
+        // stay answerable.
+        if self.message_info.is_some() {
+            if kind == KeyEventKind::Press
+                && matches!(code, KeyCode::Esc | KeyCode::Char('i') | KeyCode::Char('I'))
+            {
+                self.message_info = None;
+            }
+            return None;
+        }
+
         // Ctrl+H toggles the help overlay from any view/mode/focus, taking
         // priority over everything below. Gated on `Press`: on a Kitty
         // terminal the matching `Release` also reaches here, and toggling
@@ -3596,13 +3984,19 @@ impl UiState {
             }
             let peer = self.known_users.get(&peer_id)?.clone();
             let text = std::mem::take(&mut self.input);
-            let log_index = self.push_outgoing_dm(peer_id, MessageBody::Text(text.clone()));
+            // Allocated here, before the row exists, because the row and
+            // the send have to agree on it: it is both this row's identity
+            // and the tag the wire frame carries (`docs/PROTOCOL.md` 7.2.1).
+            let (msg_id, delivery) = self.start_delivery(&[peer_id]);
+            let log_index =
+                self.push_outgoing_dm(peer_id, MessageBody::Text(text.clone()), Some(delivery));
             let action = UiAction::SendDirectText {
                 to: peer_id,
                 plaintext: text,
                 recipient_key_mode: peer.key_mode,
                 recipient_pubkey_der: peer.public_key_der,
                 log_index,
+                msg_id,
             };
             Some(action)
         } else {
@@ -3613,12 +4007,15 @@ impl UiState {
             let name = channel.name.clone();
             let recipients = self.recipients_for_channel(channel);
             let text = std::mem::take(&mut self.input);
+            let recipient_ids: Vec<UserId> = recipients.iter().map(|(id, ..)| *id).collect();
+            let (msg_id, delivery) = self.start_delivery(&recipient_ids);
             let action = UiAction::SendChannelText {
                 channel: name.clone(),
                 plaintext: text.clone(),
                 recipients,
+                msg_id,
             };
-            self.push_outgoing_channel(&name, MessageBody::Text(text));
+            self.push_outgoing_channel(&name, MessageBody::Text(text), Some(delivery));
             Some(action)
         }
     }
@@ -3801,28 +4198,59 @@ impl UiState {
                 }
                 None
             }
+            // Opens this row's details - who it was sent to, and which of
+            // them have acknowledged it (`docs/SPEC.md` "Delivery
+            // acknowledgments"). Available on every row, not just the
+            // tracked ones: a row that carries no delivery information
+            // says so, which is itself the answer to the question being
+            // asked.
+            KeyCode::Char('i') | KeyCode::Char('I') => {
+                if len > 0 {
+                    self.message_info = Some(self.message_selected.min(len - 1));
+                }
+                None
+            }
             // A file entry has nothing left to do on Enter - it's already
             // either mid-transfer or saved under `~/.aloo/downloads` (or
             // rejected/failed); unlike the old whole-file-in-memory
             // approach, there's no separate save step to trigger here.
             KeyCode::Enter => {
-                let replay = match self.current_log().get(self.message_selected) {
+                let selected = self.message_selected;
+                let replay = match self.current_log().get(selected) {
                     Some(LogEntry {
                         body: MessageBody::Voice { duration_ms, pcm },
+                        from,
                         ..
-                    }) => Some((*duration_ms, pcm.clone())),
+                    }) => Some((*duration_ms, pcm.clone(), *from)),
                     _ => None,
                 };
-                replay.map(|(duration_ms, pcm)| {
-                    // An empty clip (0 playable samples) never actually
-                    // starts anything on the mixer (see `handle_ui_action`'s
-                    // `ReplayVoice` arm) - `replaying` must not be set in
-                    // that case, or Escape would be stuck stealing its
-                    // "stop playback" meaning with nothing to stop.
-                    if !pcm.is_empty() {
-                        self.replaying = true;
-                    }
-                    UiAction::ReplayVoice { duration_ms, pcm }
+                let (duration_ms, pcm, from) = replay?;
+                // An empty clip (0 playable samples) never actually starts
+                // anything on the mixer (see `handle_ui_action`'s
+                // `ReplayVoice` arm) - `replaying` must not be set in that
+                // case, or Escape would be stuck stealing its "stop
+                // playback" meaning with nothing to stop. Nor is a clip
+                // that never played worth telling the sender about.
+                if pcm.is_empty() {
+                    return Some(UiAction::ReplayVoice {
+                        duration_ms,
+                        pcm,
+                        from,
+                        owed_receipt: None,
+                    });
+                }
+                self.replaying = true;
+                // Taken, not read: hearing it twice is still hearing it
+                // once, and the sender has already been told.
+                let owed_receipt = self
+                    .current_log_mut()
+                    .and_then(|log| log.get_mut(selected))
+                    .and_then(|entry| entry.owed_receipt.take());
+                Some(UiAction::ReplayVoice {
+                    duration_ms,
+                    pcm,
+                    from,
+                    owed_receipt,
                 })
             }
             _ => None,
@@ -3974,6 +4402,19 @@ impl UiState {
         Some(UiAction::VoiceRecordStop)
     }
 
+    /// `current_log`'s mutable twin, for the one thing that writes back
+    /// into the row under the cursor: paying off an incoming voice
+    /// message's `owed_receipt` when it is replayed.
+    fn current_log_mut(&mut self) -> Option<&mut Vec<LogEntry>> {
+        match self.active_private_room {
+            Some(peer) => self.private_rooms.get_mut(&peer).map(|r| &mut r.log),
+            None => self
+                .channels
+                .get_mut(self.selected_channel)
+                .map(|c| &mut c.log),
+        }
+    }
+
     fn current_log(&self) -> &[LogEntry] {
         if let Some(peer_id) = self.active_private_room {
             self.private_rooms
@@ -4061,6 +4502,9 @@ impl UiState {
                             body: MessageBody::Presence(text.clone()),
                             outgoing: false,
                             failed: false,
+                            sent_at: local_time_stamp(),
+                            owed_receipt: None,
+                            delivery: None,
                         },
                     );
                 }
@@ -4079,6 +4523,9 @@ impl UiState {
                             body: MessageBody::Presence(text),
                             outgoing: false,
                             failed: false,
+                            sent_at: local_time_stamp(),
+                            owed_receipt: None,
+                            delivery: None,
                         },
                     );
                 }
@@ -4106,6 +4553,37 @@ pub(crate) fn local_time_short() -> String {
         Err(_) => {
             let dt = time::OffsetDateTime::now_utc();
             format!("{:02}:{:02}:{:02} UTC", dt.hour(), dt.minute(), dt.second())
+        }
+    }
+}
+
+/// This machine's local wall-clock date and time, for a log row's
+/// `sent_at` - the full stamp rather than `local_time_short`'s time alone,
+/// since the message info popup is read long after the fact, when which
+/// day it was is exactly what is being asked. Same UTC fallback, and the
+/// same reason for it, as `local_time_short`.
+pub(crate) fn local_time_stamp() -> String {
+    match time::OffsetDateTime::now_local() {
+        Ok(dt) => format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+            dt.year(),
+            u8::from(dt.month()),
+            dt.day(),
+            dt.hour(),
+            dt.minute(),
+            dt.second()
+        ),
+        Err(_) => {
+            let dt = time::OffsetDateTime::now_utc();
+            format!(
+                "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
+                dt.year(),
+                u8::from(dt.month()),
+                dt.day(),
+                dt.hour(),
+                dt.minute(),
+                dt.second()
+            )
         }
     }
 }
@@ -4207,6 +4685,12 @@ pub fn render(frame: &mut Frame, state: &UiState) {
     }
     if state.mode == Mode::FileSend {
         super::file_send::render_file_send_popup(frame, area, state);
+    }
+    // One message's delivery details, drawn under the help overlay and
+    // every consent popup for the same reason `handle_key` lets those
+    // absorb keys first.
+    if state.message_info.is_some() {
+        render_message_info_popup(frame, area, state);
     }
     // Drawn last, and independent of `mode`/the private-vs-channel view
     // above, so it overlays whatever's currently showing rather than
@@ -5004,6 +5488,28 @@ pub(crate) fn render_popup_button(
     );
 }
 
+/// The `<nickname><separator> ` a user-content row opens with. On a row
+/// whose delivery is tracked the separator is `DELIVERY_ARROW`, coloured
+/// by how far the message has got (`docs/SPEC.md` "Delivery
+/// acknowledgments"); on every other row it is the plain `:` this app has
+/// always used. Shared by text, voice and file rows so one message kind
+/// can never disagree with another about where the indicator lives.
+fn sender_prefix(entry: &LogEntry) -> Vec<Span<'static>> {
+    match entry.delivery_status() {
+        Some(status) => vec![
+            Span::raw(format!("{} ", entry.from_name)),
+            Span::styled(
+                DELIVERY_ARROW,
+                Style::default()
+                    .fg(status.color())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+        ],
+        None => vec![Span::raw(format!("{}{PLAIN_SEPARATOR} ", entry.from_name))],
+    }
+}
+
 pub(crate) fn render_messages(
     frame: &mut Frame,
     area: Rect,
@@ -5075,16 +5581,19 @@ pub(crate) fn render_messages(
         .iter()
         .map(|entry| {
             let mut line = match &entry.body {
-                MessageBody::Text(text) => Line::from(format!("{}: {}", entry.from_name, text)),
+                MessageBody::Text(text) => {
+                    let mut spans = sender_prefix(entry);
+                    spans.push(Span::raw(text.clone()));
+                    Line::from(spans)
+                }
                 MessageBody::Voice { duration_ms, .. } => {
                     let label = format_duration_label(*duration_ms);
-                    Line::from(vec![
-                        Span::raw(format!("{}: ", entry.from_name)),
-                        Span::styled(
-                            format!("\u{1F534} {label}"),
-                            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                        ),
-                    ])
+                    let mut spans = sender_prefix(entry);
+                    spans.push(Span::styled(
+                        format!("\u{1F534} {label}"),
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    ));
+                    Line::from(spans)
                 }
                 MessageBody::VoiceStreaming { .. } => {
                     let dot = if state.blink_on {
@@ -5092,13 +5601,12 @@ pub(crate) fn render_messages(
                     } else {
                         "\u{26AA}"
                     };
-                    Line::from(vec![
-                        Span::raw(format!("{}: ", entry.from_name)),
-                        Span::styled(
-                            format!("{dot} voice (streaming...)"),
-                            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                        ),
-                    ])
+                    let mut spans = sender_prefix(entry);
+                    spans.push(Span::styled(
+                        format!("{dot} voice (streaming...)"),
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    ));
+                    Line::from(spans)
                 }
                 MessageBody::File {
                     filename,
@@ -5106,7 +5614,7 @@ pub(crate) fn render_messages(
                     status,
                     ..
                 } => {
-                    let mut spans = vec![Span::raw(format!("{}: ", entry.from_name))];
+                    let mut spans = sender_prefix(entry);
                     if let Some(to_name) = &entry.to_name {
                         spans.push(Span::raw(format!("\u{2192} {to_name} ")));
                     }
@@ -5153,6 +5661,16 @@ pub(crate) fn render_messages(
                     Line::from(Span::styled(text.clone(), Style::default().fg(Color::Yellow)))
                 }
             };
+            // A message that reached nobody is struck through: it is not
+            // waiting on anybody's acknowledgement, because it was never
+            // addressed to anybody (`docs/SPEC.md` "Delivery
+            // acknowledgments"). Applied before the shield prefix below,
+            // so a combining overlay never lands on that emoji.
+            if entry.reached_nobody() {
+                for span in line.spans.iter_mut() {
+                    span.content = strike_through(&span.content).into();
+                }
+            }
             if shield_active
                 && !matches!(entry.body, MessageBody::System(_) | MessageBody::Presence(_))
             {
@@ -5319,6 +5837,117 @@ fn display_width(s: &str) -> u16 {
         .count();
     (s.chars().count() + wide) as u16
 }
+
+/// What the info popup calls the time a row carries, per direction: a row
+/// this client sent was sent then, a row that arrived was received then,
+/// and claiming otherwise would put words in the sender's mouth.
+pub const SENT_AT_LABEL: &str = "sent_at";
+pub const RECEIVED_AT_LABEL: &str = "received_at";
+
+/// What the info popup says on a row that tracks no delivery at all - an
+/// incoming message, a presence notice, or an outgoing row that is not a
+/// text message.
+pub const NO_DELIVERY_INFO: &str = "no delivery information for this message";
+
+/// One message's details: when it happened, and - for a message this
+/// client sent - every user it was sent to with that user's own delivery
+/// state (`docs/SPEC.md` "Delivery acknowledgments"). Opened with `i` on
+/// the message log and closed with `i` or Esc. Reads the row live rather
+/// than from a snapshot, so a recipient acknowledging while it is open
+/// turns their line green under the cursor.
+fn render_message_info_popup(frame: &mut Frame, area: Rect, state: &UiState) {
+    let Some(index) = state.message_info else {
+        return;
+    };
+    let Some(entry) = state.current_log().get(index) else {
+        return;
+    };
+
+    let time_label = if entry.outgoing {
+        SENT_AT_LABEL
+    } else {
+        RECEIVED_AT_LABEL
+    };
+    let time_line = format!("{time_label}: {}", entry.sent_at);
+    let recipients: &[DeliveryRecipient] = entry
+        .delivery
+        .as_ref()
+        .map(|d| d.recipients.as_slice())
+        .unwrap_or_default();
+
+    // Every status column is the same width, so the words line up under
+    // each other however uneven the nicknames are; the names column is
+    // sized by the longest name so nothing is truncated that fits.
+    let status_width = [
+        UNDELIVERED_LABEL,
+        DELIVERED_LABEL,
+        LISTENED_LABEL,
+        SAVED_LABEL,
+    ]
+    .iter()
+    .map(|l| l.len())
+    .max()
+    .unwrap_or(0)
+        + DELIVERY_ARROW.len()
+        + 1;
+    let name_width = recipients
+        .iter()
+        .map(|r| r.name.chars().count())
+        .max()
+        .unwrap_or(0);
+    let content_width = (name_width + GAP_COLUMNS + status_width)
+        .max(time_line.chars().count())
+        .max(NO_DELIVERY_INFO.len());
+    let max_allowed = (area.width as u32 * 9 / 10) as u16;
+    let popup_width = ((content_width + 4) as u16).min(max_allowed);
+    // The time line, a blank, then one line per recipient - or the single
+    // "nothing to report" line, which is why this floors at one rather
+    // than sizing straight off `recipients.len()`.
+    let body_lines = 2 + recipients.len().max(1);
+    let popup_height = ((body_lines + 2) as u16).min((area.height as u32 * 9 / 10) as u16);
+    let popup = centered_rect(popup_width, popup_height, area);
+
+    let block = Block::default()
+        .title("Message details (i / Esc to close)")
+        .borders(Borders::ALL);
+    let inner = block.inner(popup);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(block, popup);
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            time_line,
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+    if recipients.is_empty() {
+        lines.push(Line::from(Span::styled(
+            NO_DELIVERY_INFO,
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    for recipient in recipients {
+        let (label, color) = recipient_label(recipient, &entry.body);
+        // The status is right-aligned against the popup's own inner width,
+        // so it stays flush with the right edge rather than with whatever
+        // the longest nickname happened to be. Same arrow, same colour, as
+        // the log row this popup was opened from.
+        let status = format!("{DELIVERY_ARROW} {label}");
+        let used = recipient.name.chars().count() + status.len();
+        let pad = (inner.width as usize).saturating_sub(used).max(1);
+        lines.push(Line::from(vec![
+            Span::raw(recipient.name.clone()),
+            Span::raw(" ".repeat(pad)),
+            Span::styled(status, Style::default().fg(color).add_modifier(Modifier::BOLD)),
+        ]));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Minimum space kept between a nickname and its status column when the
+/// popup is sized, so the two never touch.
+const GAP_COLUMNS: usize = 2;
 
 fn render_help_popup(frame: &mut Frame, area: Rect, state: &UiState) {
     // Wide enough for the longest line plus the block's borders and a

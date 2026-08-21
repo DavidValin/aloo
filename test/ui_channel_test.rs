@@ -4,12 +4,13 @@ use ui_common::*;
 
 use aloo::client::netstats::ConnQuality;
 use aloo::client::p2p::LinkStatus;
+use aloo::p2p_proto::ReceiptStage;
 use aloo::proto::{ChannelInfo, ChannelKind, KeyMode, UserId};
 use aloo::client::reconnect::ServerLinkState;
 use aloo::client::tui::channel::{HEADER_ROW_HEIGHT, messages_start_col};
 use aloo::client::tui::ui::{
-    Focus, IdentityCase, MessageBody, SELECTOR_DROPDOWN_IDLE_TIMEOUT, UiAction, UiState,
-    VoiceTarget, render,
+    DeliveryStatus, Focus, IdentityCase, MessageBody, SELECTOR_DROPDOWN_IDLE_TIMEOUT, UiAction,
+    UiState, VoiceTarget, render, strike_through,
 };
 use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::Terminal;
@@ -253,6 +254,7 @@ fn typing_and_enter_sends_channel_text_excluding_self() {
             channel,
             plaintext,
             recipients,
+            msg_id: _,
         } => {
             assert_eq!(channel, "general");
             assert_eq!(plaintext, "hello all");
@@ -683,7 +685,7 @@ fn on_channel_stream_start_and_finished_swap_the_placeholder_body_in_place() {
 #[test]
 fn log_own_voice_stream_start_channel_appears_immediately_and_finalizes() {
     let mut state = joined_general_with(vec![]);
-    state.log_own_voice_stream_start_channel("general", 7);
+    state.log_own_voice_stream_start_channel("general", 7, None);
     assert_eq!(
         state.channels[0].log[0].body,
         MessageBody::VoiceStreaming { stream_id: 7 }
@@ -2250,4 +2252,88 @@ fn the_waiting_line_disappears_once_a_direct_peer_is_present() {
         "the waiting line must not outlive the wait: {joined}"
     );
     assert!(joined.contains("bob"));
+}
+
+// ---------------------------------------------------------------------
+// Delivery acknowledgments in a channel (US-041)
+// ---------------------------------------------------------------------
+
+/// Sends one text into `general` through the real compose path, handing
+/// back the delivery tag both the row and the wire send carry.
+fn send_to_general(state: &mut UiState, text: &str) -> u64 {
+    type_str(state, text);
+    match press(state, KeyCode::Enter).expect("a send was produced") {
+        UiAction::SendChannelText { msg_id, .. } => msg_id,
+        other => panic!("expected SendChannelText, got {other:?}"),
+    }
+}
+
+/// A channel row is one row over many recipients, which is why it has a
+/// third state a DM row can never reach.
+/// @requirement AC-231
+#[test]
+fn a_channel_message_reads_orange_once_only_some_recipients_have_it() {
+    let mut state = joined_general_with(vec![user(2, "bob"), user(3, "carol")]);
+    let msg_id = send_to_general(&mut state, "morning both");
+    let status = |s: &UiState| s.channels[0].log[0].delivery_status();
+
+    assert_eq!(status(&state), Some(DeliveryStatus::None));
+    state.mark_delivered(UserId(2), msg_id, ReceiptStage::Decrypted);
+    assert_eq!(
+        status(&state),
+        Some(DeliveryStatus::Some),
+        "one of two recipients is partway, not delivered"
+    );
+    state.mark_delivered(UserId(3), msg_id, ReceiptStage::Decrypted);
+    assert_eq!(status(&state), Some(DeliveryStatus::All));
+}
+
+/// @requirement AC-231
+#[test]
+fn a_channel_message_addressed_to_nobody_is_not_delivered() {
+    let mut state = joined_general_with(vec![]);
+    send_to_general(&mut state, "anyone there");
+    let entry = &state.channels[0].log[0];
+
+    assert_eq!(
+        entry.delivery_status(),
+        Some(DeliveryStatus::None),
+        "nothing was acknowledged because nothing went anywhere"
+    );
+    assert!(entry.reached_nobody());
+}
+
+/// The strike is drawn rather than styled: ratatui's `CROSSED_OUT` is an
+/// ANSI attribute plenty of terminals ignore, so the row carries a
+/// combining overlay per character instead.
+/// @requirement AC-231
+#[test]
+fn a_message_that_reached_nobody_is_struck_through() {
+    let mut state = joined_general_with(vec![]);
+    send_to_general(&mut state, "anyone there");
+
+    let rows = rendered_rows(&state);
+    assert!(
+        rows.iter()
+            .any(|r| r.contains(&strike_through("anyone there"))),
+        "the row must be drawn struck through: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|r| r.contains("anyone there")),
+        "and not additionally drawn plainly anywhere"
+    );
+}
+
+/// @requirement AC-231
+#[test]
+fn a_message_that_reached_somebody_is_not_struck_through() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    send_to_general(&mut state, "morning");
+    assert!(!state.channels[0].log[0].reached_nobody());
+
+    let rows = rendered_rows(&state);
+    assert!(
+        rows.iter().any(|r| r.contains("morning")),
+        "a message that did reach somebody is drawn plainly: {rows:?}"
+    );
 }

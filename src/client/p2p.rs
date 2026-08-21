@@ -219,12 +219,18 @@ pub enum P2pEvent {
     Message {
         channel: Option<String>,
         from: UserId,
+        /// What the sender asked to be told about once this is decrypted
+        /// (`docs/PROTOCOL.md` 7.2.1) - echoed straight back in a
+        /// `DeliveryReceipt`, never interpreted.
+        msg_id: Option<u64>,
         envelope: crate::proto::Envelope,
     },
     StreamStart {
         channel: Option<String>,
         from: UserId,
         stream_id: u64,
+        /// See `Message::msg_id`.
+        msg_id: Option<u64>,
     },
     /// A `pq_hybrid` stream's key setup, arriving reliably once, ahead of
     /// (or racing) its chunks - see `p2p_proto::P2pPayload::StreamKeySetup`.
@@ -251,6 +257,8 @@ pub enum P2pEvent {
         channel: Option<String>,
         from: UserId,
         stream_id: u64,
+        /// See `Message::msg_id`.
+        msg_id: Option<u64>,
         envelope: crate::proto::Envelope,
     },
     /// The accepter/rejecter is always exactly whoever we offered the file
@@ -299,6 +307,17 @@ pub enum P2pEvent {
         peer: UserId,
         status: LinkStatus,
     },
+    /// `peer` reports how far it has got with the message `msg_id` names -
+    /// mirrors `p2p_proto::P2pPayload::DeliveryReceipt`. This, and nothing
+    /// weaker, is what the sender's delivery indicator is driven by
+    /// (`client::tui::ui::UiState::mark_delivered`): the transport's own
+    /// ack (§7.1.1) says a datagram arrived, which is not the same claim
+    /// (`docs/PROTOCOL.md` 7.2.1).
+    Delivered {
+        peer: UserId,
+        msg_id: u64,
+        stage: crate::p2p_proto::ReceiptStage,
+    },
     /// Content queued against `peer` has been undeliverable for
     /// `PENDING_MAX_AGE` and has now been dropped. Retrying continues in
     /// the background regardless - this reports the lost content, not the
@@ -315,6 +334,8 @@ pub enum P2pEvent {
         channel: Option<String>,
         from: UserId,
         seq: u64,
+        /// See `Message::msg_id`.
+        msg_id: Option<u64>,
         envelope: crate::proto::Envelope,
     },
     /// OTP-wrapped counterpart of `FileOffer`.
@@ -323,6 +344,8 @@ pub enum P2pEvent {
         from: UserId,
         stream_id: u64,
         seq: u64,
+        /// See `Message::msg_id`.
+        msg_id: Option<u64>,
         envelope: crate::proto::Envelope,
     },
     /// A peer has confirmed successful local decode of the OTP message we
@@ -347,6 +370,8 @@ pub enum P2pEvent {
         from: UserId,
         stream_id: u64,
         seq: u64,
+        /// See `Message::msg_id`.
+        msg_id: Option<u64>,
         envelope: crate::proto::Envelope,
     },
     /// A peer's signed encryption-key rotation - mirrors
@@ -1261,25 +1286,42 @@ impl PeerLinkManager {
 
     fn emit_payload(&self, from: UserId, payload: P2pPayload) {
         let event = match payload {
-            P2pPayload::Envelope { channel, envelope } => P2pEvent::Message {
+            P2pPayload::Envelope {
+                channel,
+                msg_id,
+                envelope,
+            } => P2pEvent::Message {
                 channel,
                 from,
+                msg_id,
                 envelope,
+            },
+            P2pPayload::DeliveryReceipt { msg_id, stage } => P2pEvent::Delivered {
+                peer: from,
+                msg_id,
+                stage,
             },
             P2pPayload::FileOffer {
                 channel,
                 stream_id,
+                msg_id,
                 envelope,
             } => P2pEvent::FileOffer {
                 channel,
                 from,
                 stream_id,
+                msg_id,
                 envelope,
             },
-            P2pPayload::StreamStart { channel, stream_id } => P2pEvent::StreamStart {
+            P2pPayload::StreamStart {
+                channel,
+                stream_id,
+                msg_id,
+            } => P2pEvent::StreamStart {
                 channel,
                 from,
                 stream_id,
+                msg_id,
             },
             P2pPayload::StreamKeySetup { stream_id, setup } => P2pEvent::StreamKeySetup {
                 from,
@@ -1303,23 +1345,27 @@ impl PeerLinkManager {
             P2pPayload::OtpEnvelope {
                 channel,
                 seq,
+                msg_id,
                 envelope,
             } => P2pEvent::OtpMessage {
                 channel,
                 from,
                 seq,
+                msg_id,
                 envelope,
             },
             P2pPayload::OtpFileOffer {
                 channel,
                 stream_id,
                 seq,
+                msg_id,
                 envelope,
             } => P2pEvent::OtpFileOffer {
                 channel,
                 from,
                 stream_id,
                 seq,
+                msg_id,
                 envelope,
             },
             P2pPayload::OtpDeliveryAck { seq } => P2pEvent::OtpDeliveryAck { from, seq },
@@ -1329,11 +1375,13 @@ impl PeerLinkManager {
             P2pPayload::OtpVoiceOffer {
                 stream_id,
                 seq,
+                msg_id,
                 envelope,
             } => P2pEvent::OtpVoiceOffer {
                 from,
                 stream_id,
                 seq,
+                msg_id,
                 envelope,
             },
             P2pPayload::DeviceIdAnnounce { envelope } => {
@@ -2210,6 +2258,19 @@ impl PeerLinkManager {
     }
 
     /// How much content is queued waiting for this link to open.
+    /// Every reliable payload currently queued against `peer`'s link -
+    /// what `send_reliable_or_queue` parked because the link is not
+    /// `Active` yet. An inspection point for tests, which can then assert
+    /// on what a code path actually decided to send without needing two
+    /// live sockets and a completed punch; nothing in the client branches
+    /// on it.
+    pub fn pending_payloads(&self, peer: UserId) -> Vec<P2pPayload> {
+        self.links
+            .get(&peer)
+            .map(|l| l.pending.iter().map(|(_, p)| p.clone()).collect())
+            .unwrap_or_default()
+    }
+
     pub fn pending_count(&self, peer: UserId) -> usize {
         self.links.get(&peer).map_or(0, |l| l.pending.len())
     }

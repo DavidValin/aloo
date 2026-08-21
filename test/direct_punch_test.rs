@@ -195,6 +195,7 @@ async fn two_peers_punch_a_link_from_the_schedule_alone_and_carry_a_message() {
         bob_as_alice_sees_him,
         P2pPayload::Envelope {
             channel: None,
+            msg_id: None,
             envelope: Envelope {
                 content: Content::Text,
                 blocks: vec![b"no server involved".to_vec()],
@@ -792,6 +793,7 @@ fn only_server_backed_actions_are_refused_without_one() {
             channel: "general".into(),
             plaintext: "hi".to_string(),
             recipients: Vec::new(),
+            msg_id: 0,
         }
         .needs_server(),
         None

@@ -367,6 +367,7 @@ async fn send_channel_text(
         .send_reliable_or_queue(
             to_id,
             P2pPayload::Envelope {
+                msg_id: None,
                 channel: Some(channel),
                 envelope,
             },
@@ -389,6 +390,7 @@ async fn send_direct_text(w: &mut AlooWorld, from: String, body: String, to: Str
         .send_reliable_or_queue(
             to_id,
             P2pPayload::Envelope {
+                msg_id: None,
                 channel: None,
                 envelope,
             },
@@ -403,6 +405,7 @@ async fn stream_voice(w: &mut AlooWorld, from: String, channel: String, to: Stri
     peer_link.send_reliable_or_queue(
         to_id,
         P2pPayload::StreamStart {
+            msg_id: None,
             channel: Some(channel),
             stream_id: 42,
         },
@@ -520,6 +523,7 @@ async fn receives_channel_message(
             channel: got_channel,
             from,
             envelope,
+            ..
         } => {
             assert_eq!(
                 got_channel.as_deref(),
@@ -548,6 +552,7 @@ async fn receives_direct_message(w: &mut AlooWorld, who: String, body: String, f
             channel,
             from,
             envelope,
+            ..
         } => {
             assert_eq!(channel, None, "a DM must not carry a channel");
             assert_eq!(from, from_id);

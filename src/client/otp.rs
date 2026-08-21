@@ -44,12 +44,21 @@ pub enum PendingOtpSend {
         /// `Channel` - see `send_or_queue`'s doc for why channel sends are
         /// out of scope for this.
         log_index: Option<usize>,
+        /// The delivery tag the eventual send must carry, so the row this
+        /// message is already showing on turns green when the recipient
+        /// acknowledges it (docs/PROTOCOL.md 7.2.1). `None` for anything
+        /// that is not a text message - only those are tracked.
+        msg_id: Option<u64>,
     },
     Channel {
         channel: String,
         to: UserId,
         plaintext: Vec<u8>,
         content: Content,
+        /// See `Direct::msg_id`. A channel row is one row over many
+        /// recipients, so every queued recipient of the same message
+        /// carries the same tag.
+        msg_id: Option<u64>,
     },
     /// An accepted file's content-phase encrypt, held back because the
     /// contact's gate was busy at `FileAccepted` time - `to` is carried
@@ -565,6 +574,9 @@ pub(crate) async fn handle_otp_command(
             peer,
             P2pPayload::Envelope {
                 channel: None,
+                // Provisioning traffic, not a message anybody sees - there
+                // is no row for a receipt to land on (7.2.1).
+                msg_id: None,
                 envelope,
             },
         );
@@ -787,6 +799,9 @@ async fn send_key_setup_chunked(
             pending.peer,
             P2pPayload::Envelope {
                 channel: None,
+                // Provisioning traffic, not a message anybody sees - there
+                // is no row for a receipt to land on (7.2.1).
+                msg_id: None,
                 envelope,
             },
         );
@@ -1132,6 +1147,7 @@ fn queue_key_setup_ack(
         to,
         P2pPayload::Envelope {
             channel: None,
+            msg_id: None,
             envelope: ack_envelope,
         },
     );
@@ -1613,7 +1629,14 @@ fn queue_end_session_payload(
     };
     session
         .peer_link
-        .send_reliable_or_queue(to, P2pPayload::Envelope { channel: None, envelope });
+        .send_reliable_or_queue(
+            to,
+            P2pPayload::Envelope {
+                channel: None,
+                msg_id: None,
+                envelope,
+            },
+        );
 }
 
 /// Applies an incoming `Content::OtpEndSession` envelope
@@ -1829,6 +1852,7 @@ async fn send_now(
     content: Content,
     channel: Option<String>,
     log_index: Option<usize>,
+    msg_id: Option<u64>,
 ) -> proto::Result<()> {
     if !crate::client::keymode_policy::can_address(recipient_key_mode, session.own_key_mode) {
         return Ok(());
@@ -1899,6 +1923,7 @@ async fn send_now(
         P2pPayload::OtpEnvelope {
             channel,
             seq,
+            msg_id,
             envelope: otp_envelope,
         },
     );
@@ -1929,6 +1954,7 @@ pub(crate) async fn send_or_queue(
     content: Content,
     channel: Option<String>,
     log_index: Option<usize>,
+    msg_id: Option<u64>,
 ) -> proto::Result<()> {
     let unacked = session
         .otp_store
@@ -1942,12 +1968,14 @@ pub(crate) async fn send_or_queue(
                 to,
                 plaintext: plaintext.to_vec(),
                 content,
+                msg_id,
             },
             None => PendingOtpSend::Direct {
                 to,
                 plaintext: plaintext.to_vec(),
                 content,
                 log_index,
+                msg_id,
             },
         };
         session.otp_out_queue.enqueue(contact_name.to_string(), item);
@@ -1979,6 +2007,7 @@ pub(crate) async fn send_or_queue(
             content,
             channel,
             log_index,
+            msg_id,
         )
         .await
     }
@@ -2127,7 +2156,8 @@ pub(crate) async fn send_file_offer(
     );
     let _ = session.otp_store.save();
     refresh_otp_key_status(&session.otp_cli_cfg, ui_state, to, contact_name).await;
-    ui_state.log_own_file_offer_dm(to, stream_id, filename.clone(), size);
+    let (msg_id, delivery) = ui_state.start_delivery(&[to]);
+    ui_state.log_own_file_offer_dm(to, stream_id, filename.clone(), size, Some(delivery));
     session.own_file_targets.insert(
         stream_id,
         crate::client::file_transfer::OwnFileTarget {
@@ -2144,6 +2174,7 @@ pub(crate) async fn send_file_offer(
             channel: None,
             stream_id,
             seq,
+            msg_id: Some(msg_id),
             envelope: otp_envelope,
         },
     );
@@ -2293,9 +2324,16 @@ pub(crate) async fn send_voice_offer(
         },
     );
     session.peer_link.ensure_link(wr, to).await;
-    session
-        .peer_link
-        .send_reliable_or_queue(to, P2pPayload::OtpVoiceOffer { stream_id, seq, envelope });
+    let msg_id = ui_state.own_stream_msg_id(stream_id);
+    session.peer_link.send_reliable_or_queue(
+        to,
+        P2pPayload::OtpVoiceOffer {
+            stream_id,
+            seq,
+            msg_id,
+            envelope,
+        },
+    );
     crate::client::session::request_rotation(session, to);
     Ok(())
 }
@@ -2306,6 +2344,7 @@ pub(crate) async fn send_voice_offer(
 /// use. Only sends `OtpDeliveryAck` back once local delivery has actually
 /// succeeded - see the module doc for why that's always safe to do
 /// immediately and unconditionally, unlike the encrypt side's ack-gating.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn on_message(
     session: &mut SessionState,
     ui_state: &mut UiState,
@@ -2313,6 +2352,7 @@ pub(crate) async fn on_message(
     from: UserId,
     from_name: String,
     seq: u64,
+    msg_id: Option<u64>,
     envelope: Envelope,
 ) {
     let Some(sender) = ui_state.known_users.get(&from).cloned() else {
@@ -2352,6 +2392,15 @@ pub(crate) async fn on_message(
             Some(ch) => ui_state.on_channel_message(ch, from, from_name, body),
             None => ui_state.on_direct_message(from, from_name, body),
         }
+        // Two acknowledgements, answering two different questions: the
+        // receipt says this message was readable (7.2.1), the ack releases
+        // this contact's pad gate for the next send (16.2).
+        crate::client::session::send_delivery_receipt(
+            session,
+            from,
+            msg_id,
+            crate::p2p_proto::ReceiptStage::Decrypted,
+        );
         crate::client::session::request_rotation(session, from);
         session
             .peer_link
@@ -2550,6 +2599,7 @@ pub(crate) async fn flush_one_queued(
             plaintext,
             content,
             log_index,
+            msg_id,
         }) => {
             let Some(recipient) = ui_state.known_users.get(&to).cloned() else {
                 return Ok(());
@@ -2566,6 +2616,7 @@ pub(crate) async fn flush_one_queued(
                 content,
                 None,
                 log_index,
+                msg_id,
             )
             .await
         }
@@ -2574,6 +2625,7 @@ pub(crate) async fn flush_one_queued(
             to,
             plaintext,
             content,
+            msg_id,
         }) => {
             let Some(recipient) = ui_state.known_users.get(&to).cloned() else {
                 return Ok(());
@@ -2590,6 +2642,7 @@ pub(crate) async fn flush_one_queued(
                 content,
                 Some(channel),
                 None,
+                msg_id,
             )
             .await
         }
@@ -2917,7 +2970,8 @@ pub(crate) async fn recover_and_resend(
                 recover_and_resend_text(wr, session, &contact_name, seq, to, channel).await?;
             }
             crate::client::otp_store::PendingOtpContent::File { stream_id, .. } => {
-                recover_and_resend_file_offer(wr, session, &contact_name, seq, to, stream_id).await?;
+                recover_and_resend_file_offer(wr, session, ui_state, &contact_name, seq, to, stream_id)
+                    .await?;
             }
             crate::client::otp_store::PendingOtpContent::FileContent { stream_id } => {
                 recover_and_resend_file_content(session, &contact_name, seq, to, &recipient_pubkey_der, stream_id)
@@ -2966,12 +3020,20 @@ async fn recover_and_resend_text(
         content: Content::Text,
         blocks: vec![recovered],
     };
+    // The same row the original send named, so a recovery that finally
+    // gets through turns that row green rather than leaving it
+    // undelivered forever (docs/PROTOCOL.md 7.2.1).
+    let msg_id = session
+        .otp_text_msg_ids
+        .get(&(contact_name.to_string(), seq))
+        .copied();
     session.peer_link.ensure_link(wr, to).await;
     session.peer_link.send_reliable_or_queue(
         to,
         P2pPayload::OtpEnvelope {
             channel,
             seq,
+            msg_id,
             envelope,
         },
     );
@@ -2990,6 +3052,7 @@ async fn recover_and_resend_text(
 async fn recover_and_resend_file_offer(
     wr: &mut impl crate::control::ControlSink,
     session: &mut SessionState,
+    ui_state: &UiState,
     contact_name: &str,
     seq: u64,
     to: UserId,
@@ -3004,6 +3067,7 @@ async fn recover_and_resend_file_offer(
         content: Content::FileOffer,
         blocks: vec![recovered],
     };
+    let msg_id = ui_state.own_stream_msg_id(stream_id);
     session.peer_link.ensure_link(wr, to).await;
     session.peer_link.send_reliable_or_queue(
         to,
@@ -3011,6 +3075,7 @@ async fn recover_and_resend_file_offer(
             channel: None,
             stream_id,
             seq,
+            msg_id,
             envelope,
         },
     );
@@ -3092,7 +3157,6 @@ async fn recover_and_resend_voice(
     recipient_pubkey_der: &[u8],
     duration_ms: u32,
 ) -> proto::Result<()> {
-    let _ = ui_state;
     let temp_path = temp_content_path(&session.otp_cli_cfg, "otp-recover-voice");
     let Ok(Some(())) = otp_cli::recover_last_file(
         &session.otp_cli_cfg,
@@ -3146,12 +3210,14 @@ async fn recover_and_resend_voice(
             otp: None,
         },
     );
+    let msg_id = ui_state.own_stream_msg_id(stream_id);
     session.peer_link.ensure_link(wr, to).await;
     session.peer_link.send_reliable_or_queue(
         to,
         P2pPayload::OtpVoiceOffer {
             stream_id,
             seq,
+            msg_id,
             envelope,
         },
     );

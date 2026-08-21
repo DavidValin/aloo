@@ -48,6 +48,10 @@ fn encrypt_for_recipient(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// `msg_id` is the delivery tag this send's frame carries, and the id of
+/// the log row already showing it (docs/PROTOCOL.md 7.2.1) - the peer's
+/// acknowledgement of that frame is what turns the row's indicator green.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_send_text(
     wr: &mut impl crate::control::ControlSink,
     ui_state: &mut UiState,
@@ -57,6 +61,7 @@ pub(crate) async fn handle_send_text(
     recipient_key_mode: KeyMode,
     recipient_pubkey_der: Vec<u8>,
     log_index: Option<usize>,
+    msg_id: u64,
 ) -> proto::Result<()> {
     if let Some(contact_name) =
         crate::client::otp::contact_name_if_active(session, &recipient_pubkey_der)
@@ -73,6 +78,7 @@ pub(crate) async fn handle_send_text(
             Content::Text,
             None,
             log_index,
+            Some(msg_id),
         )
         .await;
     }
@@ -93,6 +99,7 @@ pub(crate) async fn handle_send_text(
                 to,
                 P2pPayload::Envelope {
                     channel: None,
+                    msg_id: Some(msg_id),
                     envelope,
                 },
             );
@@ -101,7 +108,15 @@ pub(crate) async fn handle_send_text(
     } else {
         session
             .remote_keys
-            .enqueue(to, rekey::QueuedOutbound::Direct { plaintext });
+            .enqueue(
+                to,
+                rekey::QueuedOutbound::Direct {
+                    plaintext,
+                    msg_id,
+                    log_index,
+                    attempts: 0,
+                },
+            );
     }
     Ok(())
 }
@@ -169,7 +184,8 @@ pub(crate) async fn handle_send_file(
         return Ok(());
     };
     session.next_stream_id += 1;
-    ui_state.log_own_file_offer_dm(to, stream_id, filename.clone(), size);
+    let (msg_id, delivery) = ui_state.start_delivery(&[to]);
+    ui_state.log_own_file_offer_dm(to, stream_id, filename.clone(), size, Some(delivery));
     session.own_file_targets.insert(
         stream_id,
         crate::client::file_transfer::OwnFileTarget { to, path, key, otp: None },
@@ -180,6 +196,7 @@ pub(crate) async fn handle_send_file(
         P2pPayload::FileOffer {
             channel: None,
             stream_id,
+            msg_id: Some(msg_id),
             envelope,
         },
     );
@@ -208,7 +225,11 @@ pub(crate) async fn handle_voice_record_start(
     // live-streamed - no `StreamStart`/per-chunk network traffic at all
     // until the recording stops.
     if let Some(contact_name) = crate::client::otp::contact_name_if_active(session, &recipient_pubkey_der) {
-        ui_state.log_own_voice_stream_start_dm(to, stream_id);
+        // The row exists from the moment recording starts, but nothing goes
+        // on the wire until it stops - `send_voice_offer` reads this id
+        // back off the row then (`UiState::own_stream_msg_id`).
+        let (_, delivery) = ui_state.start_delivery(&[to]);
+        ui_state.log_own_voice_stream_start_dm(to, stream_id, Some(delivery));
         let (stop_tx, stop_rx) = std::sync::mpsc::channel();
         session.active_recording = Some(stop_tx);
         session.own_stream_targets.insert(
@@ -256,12 +277,14 @@ pub(crate) async fn handle_voice_record_start(
             }
         },
     };
-    ui_state.log_own_voice_stream_start_dm(to, stream_id);
+    let (msg_id, delivery) = ui_state.start_delivery(&[to]);
+    ui_state.log_own_voice_stream_start_dm(to, stream_id, Some(delivery));
     session.peer_link.send_reliable_or_queue(
         to,
         P2pPayload::StreamStart {
             channel: None,
             stream_id,
+            msg_id: Some(msg_id),
         },
     );
     // A pq_hybrid recipient's setup follows `StreamStart`, once and
@@ -341,11 +364,14 @@ pub(crate) async fn handle_start_call(
     Ok(())
 }
 
-pub(crate) async fn on_message(
+/// See `channel::on_message` for why `msg_id` is receipted only from the
+/// decrypted branch below.
+pub async fn on_message(
     ui_state: &mut UiState,
     session: &mut SessionState,
     from: UserId,
     from_name: String,
+    msg_id: Option<u64>,
     envelope: Envelope,
 ) {
     let Some(sender) = ui_state.known_users.get(&from).cloned() else {
@@ -383,6 +409,12 @@ pub(crate) async fn on_message(
         crate::client::session::decrypt_envelope_for(envelope, from, &sender, None, session)
     {
         ui_state.on_direct_message(from, from_name, body);
+        crate::client::session::send_delivery_receipt(
+            session,
+            from,
+            msg_id,
+            crate::p2p_proto::ReceiptStage::Decrypted,
+        );
         crate::client::session::request_rotation(session, from);
     }
 }

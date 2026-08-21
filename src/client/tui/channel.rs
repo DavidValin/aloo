@@ -20,10 +20,10 @@ use crate::client::sysstats::CPU_HEALTHY_MAX_PCT;
 use crate::validation;
 
 use super::ui::{
-    DM_ICON, FileTransferStatus, JoinPopupFocus, LogEntry, MessageBody, Mode, SelectorFocus,
-    UNREAD_ENVELOPE, UiAction, UiState, channel_kind_icon, finalize_held_stream,
-    finalize_stream_entry, focus_border_style, local_time_short, push_log_entry, render_input_bar,
-    render_messages, unread_envelope,
+    DM_ICON, FileTransferStatus, JoinPopupFocus, LogEntry, MessageBody,
+    MessageDelivery, Mode, SelectorFocus, UNREAD_ENVELOPE, UiAction, UiState, channel_kind_icon,
+    finalize_held_stream, finalize_stream_entry, focus_border_style, local_time_short,
+    local_time_stamp, push_log_entry, render_input_bar, render_messages, unread_envelope,
 };
 
 #[derive(Debug, Clone)]
@@ -546,6 +546,9 @@ impl UiState {
                         body: MessageBody::Presence(text),
                         outgoing: false,
                         failed: false,
+                        sent_at: local_time_stamp(),
+                        owed_receipt: None,
+                        delivery: None,
                     },
                 );
             }
@@ -584,6 +587,9 @@ impl UiState {
                         body: MessageBody::Presence(text),
                         outgoing: false,
                         failed: false,
+                        sent_at: local_time_stamp(),
+                        owed_receipt: None,
+                        delivery: None,
                     },
                 );
             }
@@ -604,6 +610,9 @@ impl UiState {
             body,
             outgoing: false,
             failed: false,
+            sent_at: local_time_stamp(),
+            owed_receipt: None,
+            delivery: None,
         };
         // A Pending/Rejected sender's message decrypts fine (it's encrypted
         // with *our* key, not theirs) but is held back rather than shown -
@@ -637,6 +646,9 @@ impl UiState {
                     body: MessageBody::Voice { duration_ms, pcm },
                     outgoing: true,
                     failed: false,
+                    sent_at: local_time_stamp(),
+                    owed_receipt: None,
+                    delivery: None,
                 },
             );
         }
@@ -646,7 +658,12 @@ impl UiState {
     /// eventual duration/content), so the sender sees their own message
     /// appear live rather than only after they release Space - mirroring
     /// what the receiving side sees via `on_channel_stream_start`.
-    pub fn log_own_voice_stream_start_channel(&mut self, channel: &str, stream_id: u64) {
+    pub fn log_own_voice_stream_start_channel(
+        &mut self,
+        channel: &str,
+        stream_id: u64,
+        delivery: Option<MessageDelivery>,
+    ) {
         let from = self.own_id.unwrap_or(UserId(0));
         let from_name = self.own_name.clone();
         let is_current = self.is_viewing_channel(channel);
@@ -662,6 +679,9 @@ impl UiState {
                     body: MessageBody::VoiceStreaming { stream_id },
                     outgoing: true,
                     failed: false,
+                    sent_at: local_time_stamp(),
+                    owed_receipt: None,
+                    delivery,
                 },
             );
         }
@@ -688,6 +708,9 @@ impl UiState {
             body: MessageBody::VoiceStreaming { stream_id },
             outgoing: false,
             failed: false,
+            sent_at: local_time_stamp(),
+            owed_receipt: None,
+            delivery: None,
         };
         if self.is_trust_gated(from) {
             self.hold_message(from, Some(channel.to_string()), entry);
@@ -731,7 +754,20 @@ impl UiState {
     /// `crate::client::tui::file_send`) as our own, straight away rather than
     /// waiting for a server round-trip - the same optimistic-echo pattern
     /// `log_own_voice_channel` already uses for voice.
-    pub(crate) fn push_outgoing_channel(&mut self, channel: &str, body: MessageBody) {
+    /// `delivery` gives the row its indicator over the members this send
+    /// was actually addressed to (`docs/PROTOCOL.md` 7.2.1) - build it with
+    /// `UiState::start_delivery`. One row covers all of them, which is why
+    /// a channel row has three states rather than two: nobody has
+    /// acknowledged it, some have, or all have (`DeliveryStatus`). Every
+    /// one of those sends carries the same id, so each recipient's receipt
+    /// finds this same row (`UiState::mark_delivered`). `None` leaves the
+    /// row untracked.
+    pub(crate) fn push_outgoing_channel(
+        &mut self,
+        channel: &str,
+        body: MessageBody,
+        delivery: Option<MessageDelivery>,
+    ) {
         let from = self.own_id.unwrap_or(UserId(0));
         let from_name = self.own_name.clone();
         let is_current = self.is_viewing_channel(channel);
@@ -747,6 +783,9 @@ impl UiState {
                     body,
                     outgoing: true,
                     failed: false,
+                    sent_at: local_time_stamp(),
+                    owed_receipt: None,
+                    delivery,
                 },
             );
         }
@@ -767,6 +806,7 @@ impl UiState {
         stream_id: u64,
         filename: String,
         total: u64,
+        delivery: Option<MessageDelivery>,
     ) {
         let from = self.own_id.unwrap_or(UserId(0));
         let from_name = self.own_name.clone();
@@ -788,6 +828,9 @@ impl UiState {
                     },
                     outgoing: true,
                     failed: false,
+                    sent_at: local_time_stamp(),
+                    owed_receipt: None,
+                    delivery,
                 },
             );
         }
@@ -823,6 +866,9 @@ impl UiState {
                     },
                     outgoing: false,
                     failed: false,
+                    sent_at: local_time_stamp(),
+                    owed_receipt: None,
+                    delivery: None,
                 },
             );
             if !is_current {

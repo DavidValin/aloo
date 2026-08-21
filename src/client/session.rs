@@ -19,7 +19,7 @@ use crate::client::file_transfer;
 use crate::client::idstore;
 use crate::client::netstats;
 use crate::client::p2p::{self, P2pEvent, P2pOutbound, PeerLinkManager};
-use crate::p2p_proto::P2pPayload;
+use crate::p2p_proto::{P2pPayload, ReceiptStage};
 use crate::proto::{
     self, ClientMessage, Content, Envelope, KeyMode, ServerMessage, UserId, UserInfo,
 };
@@ -112,7 +112,7 @@ impl ServerState {
     }
 }
 
-pub(crate) struct SessionState {
+pub struct SessionState {
     /// Set while we're recording; sending on it tells the record-stream
     /// worker to flush and stop.
     pub(crate) active_recording: Option<std::sync::mpsc::Sender<()>>,
@@ -229,6 +229,16 @@ pub(crate) struct SessionState {
     /// message is still awaiting a network ack - in-memory only, unlike
     /// `otp_store` (`client::otp::OtpOutQueue`'s doc).
     pub(crate) otp_out_queue: crate::client::otp::OtpOutQueue,
+    /// Which log row each outstanding OTP text send belongs to, keyed by
+    /// `(contact_name, seq)` - what lets `client::otp::recover_and_resend_text`
+    /// name the same message again (docs/PROTOCOL.md 7.2.1) when a stuck
+    /// send is recovered rather than re-encoded. In-memory and
+    /// session-scoped, like every other delivery id: a row from a previous
+    /// run no longer exists to turn green.
+    pub(crate) otp_text_msg_ids: std::collections::HashMap<(String, u64), u64>,
+    /// Voice messages and file transfers that still owe their sender a
+    /// delivery receipt (`client::delivery`, docs/PROTOCOL.md 7.2.1).
+    pub(crate) pending_receipts: crate::client::delivery::PendingReceipts,
     /// One entry per sender currently mid-way through sending us a fresh
     /// OTP pad, accumulated chunk by chunk
     /// (`crypto::otp::OtpKeySetupReassembly`'s doc). In-memory only, per
@@ -566,6 +576,8 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
             )
         }),
         otp_out_queue: crate::client::otp::OtpOutQueue::new(),
+        otp_text_msg_ids: std::collections::HashMap::new(),
+        pending_receipts: crate::client::delivery::PendingReceipts::new(),
         otp_incoming_setup: HashMap::new(),
         otp_mail_store: crate::client::otp_mail_store::OtpMailStore::load(
             crate::client::otp_mail_store::OtpMailStore::default_dir(),
@@ -809,9 +821,33 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
                     // mid-stream (rare) could still chime for suppressed
                     // audio - a harmless UX quirk, not a correctness issue.
                     let was_heard = !ui_state.suppress_playback_from(from);
+                    // Decrypted audio, not merely a stream that ended: a
+                    // stream whose every chunk failed to open accumulates
+                    // nothing, and must not be receipted (7.2.1).
+                    let decrypted = !pcm.is_empty();
+                    let msg_id = session.pending_receipts.msg_id_of(from, stream_id);
+                    // Recorded against the placeholder row while it can
+                    // still be found by `stream_id` - finalizing below
+                    // replaces that body with one that no longer carries
+                    // it.
+                    if decrypted && !was_heard {
+                        ui_state.owe_replay_receipt(from, stream_id, msg_id);
+                    }
                     match active.channel {
                         Some(channel) => crate::client::channel::on_stream_finished(&mut ui_state, &channel, from, stream_id, duration_ms, pcm),
                         None => crate::client::direct_message::on_stream_finished(&mut ui_state, from, stream_id, duration_ms, pcm),
+                    }
+                    if decrypted {
+                        send_delivery_receipt(&mut session, from, msg_id, ReceiptStage::Decrypted);
+                    }
+                    // Heard on arrival is the common case and settles it
+                    // here. A stream that decoded nothing is forgotten;
+                    // one that decoded but was suppressed (muted, or a
+                    // sender still under identity review) keeps its debt,
+                    // to be paid if and when the user replays the row
+                    // (`UiAction::ReplayVoice`).
+                    if !decrypted || was_heard {
+                        settle_delivery_id(&mut session, from, stream_id, decrypted && was_heard);
                     }
                     if was_heard {
                         voice_stream::play_end_chime(&mut session);
@@ -1026,8 +1062,12 @@ async fn handle_ui_action(
             channel,
             plaintext,
             recipients,
+            msg_id,
         } => {
-            crate::client::channel::handle_send_text(wr, ui_state, session, channel, plaintext, recipients).await?;
+            crate::client::channel::handle_send_text(
+                wr, ui_state, session, channel, plaintext, recipients, msg_id,
+            )
+            .await?;
         }
         UiAction::SendDirectText {
             to,
@@ -1035,6 +1075,7 @@ async fn handle_ui_action(
             recipient_key_mode,
             recipient_pubkey_der,
             log_index,
+            msg_id,
         } => {
             crate::client::direct_message::handle_send_text(
                 wr,
@@ -1045,6 +1086,7 @@ async fn handle_ui_action(
                 recipient_key_mode,
                 recipient_pubkey_der,
                 log_index,
+                msg_id,
             )
             .await?;
         }
@@ -1152,7 +1194,12 @@ async fn handle_ui_action(
                 voice_stream::play_end_chime(session);
             }
         }
-        UiAction::ReplayVoice { pcm, .. } => {
+        UiAction::ReplayVoice {
+            pcm,
+            from,
+            owed_receipt,
+            ..
+        } => {
             let samples = voice::pcm_from_bytes(&pcm);
             if !samples.is_empty() {
                 let id = session.next_mixer_id;
@@ -1160,6 +1207,11 @@ async fn handle_ui_action(
                 session.active_replay_id = Some(id);
                 let _ = session.mixer_tx.send(voice::MixerCmd::Push { id, samples });
                 let _ = session.mixer_tx.send(voice::MixerCmd::Finish { id });
+                // A clip that was muted when it arrived is heard for the
+                // first time now, and its sender is owed that news
+                // (docs/PROTOCOL.md 7.2.1). `None` whenever nothing is
+                // owed, which is the ordinary case.
+                send_delivery_receipt(session, from, owed_receipt, ReceiptStage::Consumed);
             }
         }
         UiAction::StopPlayback => {
@@ -1752,7 +1804,9 @@ async fn handle_server_message(
         } => {
             // Only `pq_hybrid` peers ever rotate, so this is always their
             // encryption-key offer (§13.10).
-            handle_pq_key_rotated(ui_state, session, from, new_public_key_der, signature);
+            let (to_send, given_up) =
+                handle_pq_key_rotated(ui_state, session, from, new_public_key_der, signature);
+            flush_queued_outbound(wr, ui_state, session, from, to_send, given_up).await?;
         }
         ServerMessage::PeerCandidates {
             from,
@@ -2158,34 +2212,44 @@ async fn handle_p2p_event(
         P2pEvent::Message {
             channel: Some(channel),
             from,
+            msg_id,
             envelope,
         } => {
             let from_name = name_of(ui_state, from);
-            crate::client::channel::on_message(ui_state, session, channel, from, from_name, envelope);
+            crate::client::channel::on_message(
+                ui_state, session, channel, from, from_name, msg_id, envelope,
+            );
         }
         P2pEvent::Message {
             channel: None,
             from,
+            msg_id,
             envelope,
         } => {
             let from_name = name_of(ui_state, from);
-            crate::client::direct_message::on_message(ui_state, session, from, from_name, envelope)
-                .await;
+            crate::client::direct_message::on_message(
+                ui_state, session, from, from_name, msg_id, envelope,
+            )
+            .await;
         }
         P2pEvent::StreamStart {
             channel: Some(channel),
             from,
             stream_id,
+            msg_id,
         } => {
             let from_name = name_of(ui_state, from);
+            remember_delivery_id(session, from, stream_id, msg_id);
             crate::client::channel::on_stream_start(ui_state, session, channel, from, from_name, stream_id);
         }
         P2pEvent::StreamStart {
             channel: None,
             from,
             stream_id,
+            msg_id,
         } => {
             let from_name = name_of(ui_state, from);
+            remember_delivery_id(session, from, stream_id, msg_id);
             crate::client::direct_message::on_stream_start(ui_state, session, from, from_name, stream_id);
         }
         P2pEvent::StreamKeySetup {
@@ -2221,12 +2285,19 @@ async fn handle_p2p_event(
             channel,
             from,
             stream_id,
+            msg_id,
             envelope,
         } => {
             let from_name = name_of(ui_state, from);
-            handle_incoming_file_offer(
+            remember_delivery_id(session, from, stream_id, msg_id);
+            if handle_incoming_file_offer(
                 ui_state, session, from, from_name, stream_id, channel, envelope,
-            );
+            ) {
+                // The offer itself opened - that is this message decrypted
+                // (7.2.1). Whether the file is ever accepted and saved is
+                // a separate answer, sent from `ReceiveDone` below.
+                send_delivery_receipt(session, from, msg_id, ReceiptStage::Decrypted);
+            }
         }
         P2pEvent::FileAccepted { stream_id } => {
             // `target` stays in `own_file_targets` here -
@@ -2276,6 +2347,16 @@ async fn handle_p2p_event(
         }
         P2pEvent::FileEnd { from, stream_id } => {
             file_transfer::end_incoming_transfer(&mut session.active_file_transfers, from, stream_id);
+        }
+        P2pEvent::Delivered {
+            peer,
+            msg_id,
+            stage,
+        } => {
+            // The peer reports what it managed to do with this message
+            // (docs/PROTOCOL.md 7.2.1) - the only thing that moves a row's
+            // indicator off gray.
+            ui_state.mark_delivered(peer, msg_id, stage);
         }
         P2pEvent::LinkFailed { peer, reason } => {
             let name = name_of(ui_state, peer);
@@ -2385,7 +2466,9 @@ async fn handle_p2p_event(
             // rotation verifies itself against the sender's pinned
             // identity, so which transport carried it changes nothing
             // about whether it is trusted (docs/PROTOCOL.md 13.10).
-            handle_pq_key_rotated(ui_state, session, from, rotation, signature);
+            let (to_send, given_up) =
+                handle_pq_key_rotated(ui_state, session, from, rotation, signature);
+            flush_queued_outbound(wr, ui_state, session, from, to_send, given_up).await?;
         }
         P2pEvent::ChannelPresence { from, envelope } => {
             // Registration can produce the daemon's own `--otp` proposal,
@@ -2404,20 +2487,25 @@ async fn handle_p2p_event(
             channel,
             from,
             seq,
+            msg_id,
             envelope,
         } => {
             let from_name = name_of(ui_state, from);
-            crate::client::otp::on_message(session, ui_state, channel, from, from_name, seq, envelope)
-                .await;
+            crate::client::otp::on_message(
+                session, ui_state, channel, from, from_name, seq, msg_id, envelope,
+            )
+            .await;
         }
         P2pEvent::OtpFileOffer {
             channel,
             from,
             stream_id,
             seq,
+            msg_id,
             envelope,
         } => {
             let from_name = name_of(ui_state, from);
+            remember_delivery_id(session, from, stream_id, msg_id);
             crate::client::otp::on_file_offer(
                 session, ui_state, channel, from, from_name, stream_id, seq, envelope,
             )
@@ -2435,8 +2523,10 @@ async fn handle_p2p_event(
             from,
             stream_id,
             seq,
+            msg_id,
             envelope,
         } => {
+            remember_delivery_id(session, from, stream_id, msg_id);
             crate::client::otp::on_voice_offer(wr, session, ui_state, from, stream_id, seq, envelope).await;
         }
         P2pEvent::CallInvite {
@@ -3019,21 +3109,29 @@ fn maybe_resolve_p2p_identity_data(session: &mut SessionState, ui_state: &mut Ui
 ///
 /// A successful install makes the peer *fresh* again, which releases
 /// anything queued for them while they had no usable key.
+/// Returns `(to_send, given_up)` from `rekey::RemoteKeys::on_rotated` for
+/// the caller to put through `flush_queued_outbound` - split that way
+/// because installing a rotation is pure state work while sending needs
+/// the control sink.
 fn handle_pq_key_rotated(
     ui_state: &mut UiState,
     session: &mut SessionState,
     peer: UserId,
     rotation_bytes: Vec<u8>,
     signature: Vec<u8>,
-) {
-    let Some(you) = ui_state.own_id else { return };
-    let Some(my_fp) = session.own_pq_fp else { return };
+) -> (Vec<rekey::QueuedOutbound>, Vec<rekey::QueuedOutbound>) {
+    let Some(you) = ui_state.own_id else {
+        return (Vec::new(), Vec::new());
+    };
+    let Some(my_fp) = session.own_pq_fp else {
+        return (Vec::new(), Vec::new());
+    };
     let Some(sender_public) = ui_state
         .known_users
         .get(&peer)
         .and_then(|u| proto::decode::<crate::crypto::pq::PqPublicBundle>(&u.public_key_der).ok())
     else {
-        return;
+        return (Vec::new(), Vec::new());
     };
     let Some(rotation) = crate::crypto::pq::verify_rotation(
         &sender_public,
@@ -3042,11 +3140,106 @@ fn handle_pq_key_rotated(
         &rotation_bytes,
         &signature,
     ) else {
-        return;
+        return (Vec::new(), Vec::new());
     };
     if session.pq_peer_keys.install(peer, rotation) {
-        session.remote_keys.on_rotated(peer);
+        return session.remote_keys.on_rotated(peer);
     }
+    (Vec::new(), Vec::new())
+}
+
+/// Sends everything that was waiting on `peer`'s key (§13.10) and reports
+/// everything that has now waited too long. A queued message is a message
+/// the user already sees in their log: leaving it in the queue forever -
+/// which is what dropping `on_rotated`'s result used to do - meant a
+/// message that was never sent and never said so.
+///
+/// An item that still cannot go out goes back on the queue with its
+/// attempt already spent, so the retry is bounded by
+/// `rekey::MAX_QUEUED_SEND_ATTEMPTS` rather than by nothing at all. One
+/// that has run out is marked failed on its own row - red, exactly like
+/// any other send that turned out not to have happened.
+async fn flush_queued_outbound(
+    wr: &mut impl crate::control::ControlSink,
+    ui_state: &mut UiState,
+    session: &mut SessionState,
+    peer: UserId,
+    to_send: Vec<rekey::QueuedOutbound>,
+    given_up: Vec<rekey::QueuedOutbound>,
+) -> proto::Result<()> {
+    for item in given_up {
+        if let rekey::QueuedOutbound::Direct {
+            log_index: Some(index),
+            ..
+        } = &item
+        {
+            ui_state.mark_dm_message_failed(peer, *index);
+        }
+        let name = ui_state
+            .known_users
+            .get(&peer)
+            .map(|u| u.name.clone())
+            .unwrap_or_else(|| format!("{peer:?}"));
+        ui_state.push_status_notice(
+            format!("could not send to {name}: their key never became usable"),
+            false,
+        );
+    }
+    if to_send.is_empty() {
+        return Ok(());
+    }
+    let Some(recipient) = ui_state.known_users.get(&peer).cloned() else {
+        // The peer is gone entirely; there is nothing left to send to and
+        // nothing to retry against either.
+        return Ok(());
+    };
+    let mut sent_any = false;
+    for item in to_send {
+        let (channel, plaintext, msg_id) = match &item {
+            rekey::QueuedOutbound::Channel {
+                channel,
+                plaintext,
+                msg_id,
+                ..
+            } => (Some(channel.clone()), plaintext.clone(), *msg_id),
+            rekey::QueuedOutbound::Direct {
+                plaintext, msg_id, ..
+            } => (None, plaintext.clone(), *msg_id),
+        };
+        let send_id = session.next_stream_id;
+        session.next_stream_id += 1;
+        let envelope = crate::client::envelope::encrypt_envelope_for(
+            session.own_pq_private.as_ref(),
+            session.pq_peer_keys.encap_for(peer),
+            recipient.key_mode,
+            &recipient.public_key_der,
+            channel.clone(),
+            send_id,
+            plaintext.as_bytes(),
+            Content::Text,
+        );
+        let Some(envelope) = envelope else {
+            session.remote_keys.requeue(peer, item);
+            continue;
+        };
+        session.peer_link.ensure_link(wr, peer).await;
+        session.peer_link.send_reliable_or_queue(
+            peer,
+            crate::p2p_proto::P2pPayload::Envelope {
+                channel,
+                msg_id: Some(msg_id),
+                envelope,
+            },
+        );
+        sent_any = true;
+    }
+    // The whole batch went out under the one key this rotation supplied,
+    // so it is spent exactly once (`RemoteKeys::on_rotated`'s contract).
+    if sent_any {
+        session.remote_keys.mark_used(peer);
+        request_rotation(session, peer);
+    }
+    Ok(())
 }
 
 /// Rotates our `pq_hybrid` encryption keys for `peer` and offers them the
@@ -3082,6 +3275,198 @@ pub(crate) fn request_rotation_if_pq_hybrid(session: &mut SessionState, peer: Us
         new_public_key_der: encoded,
         signature,
     });
+}
+
+/// What a test needs to state about the session it wants
+/// (`SessionState::for_test`) - this client's own identity, and a
+/// directory to keep the on-disk stores in.
+pub struct TestSessionSpec {
+    pub key_mode: KeyMode,
+    /// This client's own key material, in exactly the form the real
+    /// connect path hands to `run_connected_session`.
+    pub identity: ResolvedIdentity,
+    /// Where every store that would otherwise live under the user's real
+    /// `~/.aloo` is put instead. Nothing in it is read back; it exists so
+    /// a test can never touch, or be perturbed by, real local state.
+    pub scratch: std::path::PathBuf,
+}
+
+impl SessionState {
+    /// The session's direct transport (`crate::client::p2p`) - exposed for
+    /// tests, which need it to open a link a receive path can then answer
+    /// over, and to read back what that path decided to send
+    /// (`PeerLinkManager::pending_payloads`).
+    pub fn peer_link_mut(&mut self) -> &mut PeerLinkManager {
+        &mut self.peer_link
+    }
+
+    /// Builds a session for tests, without a terminal, an audio device, a
+    /// server or a peer.
+    ///
+    /// The receive paths worth testing - `channel::on_message`,
+    /// `direct_message::on_message`, `handle_p2p_event` - are ordinary
+    /// functions over this struct, but the real thing is only ever built
+    /// half way through `run_connected_session`, wired to a live socket
+    /// and a running mixer. This is the same trade `serve_with_heartbeat_timeout`
+    /// makes on the server side: one constructor whose only job is to make
+    /// the logic reachable.
+    ///
+    /// Every worker channel is created and its receiver dropped. That is
+    /// safe rather than sloppy: each of them is written to as
+    /// `let _ = tx.send(..)`, so a dropped receiver changes nothing any
+    /// path under test decides - it only means nobody plays the audio or
+    /// writes the file, which is the point.
+    ///
+    /// The UDP transport is real, bound to an ephemeral loopback port with
+    /// no rendezvous server. A test can therefore call `ensure_link` and
+    /// then read back what a code path decided to send with
+    /// `PeerLinkManager::pending_payloads`, since nothing is `Active`.
+    pub async fn for_test(spec: TestSessionSpec) -> Self {
+        let (file_events_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let (record_out_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let (own_stream_done_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let (mixer_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let (stream_finished_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let (audio_err_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let (call_level_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let (rotate_out_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let (direct_resolved_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let (auto_stop_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let (p2p_events_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let (peer_link, _socket) =
+            PeerLinkManager::bind("127.0.0.1:0".parse().expect("loopback"), None, p2p_events_tx)
+                .await
+                .expect("binding an ephemeral loopback port");
+
+        // The same split the real path makes - see there for why
+        // `PqHybrid` has no `own_keys` and vice versa.
+        let (own_keys, own_pq_private, own_pq_fp, own_pq_keys) = match spec.identity {
+            ResolvedIdentity::Rsa(kp) => (Some(kp.private), None, None, None),
+            ResolvedIdentity::Pq {
+                private,
+                public_der,
+            } => {
+                let rotating =
+                    crate::client::pq_rekey::PqOwnKeys::new(private.bootstrap_decap().clone());
+                (
+                    None,
+                    Some(private),
+                    crate::crypto::pq::fingerprint_of_encoded(&public_der),
+                    Some(rotating),
+                )
+            }
+        };
+
+        Self {
+            active_recording: None,
+            next_stream_id: 1,
+            next_mixer_id: 1,
+            own_stream_targets: HashMap::new(),
+            active_streams: HashMap::new(),
+            own_file_targets: HashMap::new(),
+            active_file_transfers: HashMap::new(),
+            otp_incoming_file_receives: HashMap::new(),
+            otp_send_temp_files: HashMap::new(),
+            file_events_tx,
+            record_out_tx,
+            own_stream_done_tx,
+            mixer_tx,
+            stream_finished_tx,
+            audio_err_tx,
+            call_level_tx,
+            own_key_mode: spec.key_mode,
+            own_keys,
+            own_pq_private,
+            own_pq_fp,
+            own_pq_keys,
+            pq_peer_keys: crate::client::pq_rekey::PqPeerKeys::new(),
+            rotate_out_tx,
+            replay: crate::client::replay::ReplayGuard::new(),
+            remote_keys: rekey::RemoteKeys::new(),
+            id_store: idstore::IdStore::new_empty(spec.scratch.join("id_store")),
+            conn_stats: netstats::ConnStats::new(),
+            server: ServerState::Absent,
+            server_retry: None,
+            channel_passwords: HashMap::new(),
+            direct_resolved_tx,
+            auto_stop_tx,
+            active_replay_id: None,
+            peer_link,
+            otp_cli_cfg: crate::client::otp_cli::OtpCliConfig {
+                binary_path: spec.scratch.join("no-such-otp-binary"),
+                working_dir: spec.scratch.join("otp"),
+            },
+            otp_store: crate::client::otp_store::OtpStore::new_empty(
+                spec.scratch.join("otp_store"),
+            ),
+            otp_out_queue: crate::client::otp::OtpOutQueue::new(),
+            otp_text_msg_ids: std::collections::HashMap::new(),
+            pending_receipts: crate::client::delivery::PendingReceipts::new(),
+            otp_incoming_setup: HashMap::new(),
+            otp_mail_store: crate::client::otp_mail_store::OtpMailStore::new_empty(
+                spec.scratch.join("otp_mail"),
+            ),
+            own_device_id: "test-device".to_string(),
+            peer_device_ids: HashMap::new(),
+            active_call: None,
+            daemon_plan: None,
+            viewer_attached: true,
+            announced_online: std::collections::HashSet::new(),
+            daemon_awaiting_otp: None,
+        }
+    }
+}
+
+/// Tells `peer` that the message they named `msg_id` has been decrypted
+/// here (docs/PROTOCOL.md 7.2.1) - the single place a receipt is ever
+/// sent, called only from a branch that has already opened the envelope.
+/// A no-op when the sender asked for no receipt.
+///
+/// Sent reliably like any other content, so a receipt is not lost to one
+/// dropped datagram; queued rather than dropped if the link happens to be
+/// down, which is what lets a row turn green late rather than never.
+pub(crate) fn send_delivery_receipt(
+    session: &mut SessionState,
+    peer: UserId,
+    msg_id: Option<u64>,
+    stage: ReceiptStage,
+) {
+    let Some(msg_id) = msg_id else {
+        return;
+    };
+    session.peer_link.send_reliable_or_queue(
+        peer,
+        crate::p2p_proto::P2pPayload::DeliveryReceipt { msg_id, stage },
+    );
+}
+
+/// Notes that the voice message or file transfer `(from, stream_id)` will
+/// owe `from` a receipt once it completes (docs/PROTOCOL.md 7.2.1). Unlike
+/// a text message, neither can be receipted on arrival: at that point
+/// nothing has been decrypted yet.
+pub(crate) fn remember_delivery_id(
+    session: &mut SessionState,
+    from: UserId,
+    stream_id: u64,
+    msg_id: Option<u64>,
+) {
+    session.pending_receipts.remember(from, stream_id, msg_id);
+}
+
+/// Pays off what `remember_delivery_id` noted, if the transfer got as far
+/// as being *used* - the file written to disk, the audio played. Taken
+/// rather than read, so one transfer earns one `Consumed` receipt;
+/// `consumed: false` simply forgets it, which is what a failed, rejected
+/// or never-played one deserves - the sender's row stays at `DELIVERED`
+/// because that is all that happened.
+pub(crate) fn settle_delivery_id(
+    session: &mut SessionState,
+    from: UserId,
+    stream_id: u64,
+    consumed: bool,
+) {
+    let msg_id = session.pending_receipts.settle(from, stream_id, consumed);
+    send_delivery_receipt(session, from, msg_id, ReceiptStage::Consumed);
 }
 
 /// Rotates our own key material for `peer` - the single trigger every send
@@ -3196,6 +3581,11 @@ pub(crate) fn decrypt_own_envelope(
 /// Accepted" precedent as a message/stream) or queues it for the
 /// Accept/Reject popup, playing the bell if it's the one that ends up
 /// shown right away.
+///
+/// Returns whether the offer actually opened - which is what the sender's
+/// `Decrypted` receipt answers (7.2.1). A held offer counts: it was read,
+/// and the trust gate is about whether to show it, not whether it made
+/// sense.
 fn handle_incoming_file_offer(
     ui_state: &mut UiState,
     session: &mut SessionState,
@@ -3204,13 +3594,13 @@ fn handle_incoming_file_offer(
     stream_id: u64,
     channel: Option<String>,
     envelope: Envelope,
-) {
+) -> bool {
     let Some(sender) = ui_state.known_users.get(&from).cloned() else {
-        return;
+        return false;
     };
     let Some(payload) = decrypt_file_offer(&envelope, from, &sender, channel.as_deref(), session)
     else {
-        return;
+        return false;
     };
     let filename = crate::client::file_transfer::truncate_filename(&payload.filename);
     let offer = PendingFileOffer {
@@ -3224,11 +3614,12 @@ fn handle_incoming_file_offer(
     };
     if ui_state.is_trust_gated(from) {
         ui_state.hold_file_offer(offer);
-        return;
+        return true;
     }
     if ui_state.push_file_offer(offer) {
         voice_stream::play_bell_chime(session);
     }
+    true
 }
 
 /// Dispatches one file-transfer progress/completion/failure event
@@ -3272,6 +3663,10 @@ async fn handle_file_event(
                 }
                 None => ui_state.set_file_completed(from, stream_id),
             }
+            // The whole file arrived and was written to disk - which for a
+            // file is what "used" means (7.2.1), and is what the sender's
+            // details popup shows as DELIVERED+SAVED.
+            settle_delivery_id(session, from, stream_id, true);
         }
         file_transfer::FileEvent::ReceiveFailed { from, stream_id } => {
             session.active_file_transfers.remove(&(from, stream_id));
@@ -3279,6 +3674,7 @@ async fn handle_file_event(
                 crate::client::otp::secure_remove_file(&pending.temp_path);
             }
             ui_state.set_file_failed(from, stream_id);
+            settle_delivery_id(session, from, stream_id, false);
         }
     }
 }

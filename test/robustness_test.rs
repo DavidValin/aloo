@@ -89,6 +89,7 @@ fn truncating_a_valid_message_never_panics() {
         proto::encode(&P2pPayload::StreamStart {
             channel: Some("the-hall".into()),
             stream_id: 7,
+            msg_id: None,
         })
         .unwrap(),
         proto::encode(&PunchDatagram::Ping { link_nonce: 42 }).unwrap(),

@@ -56,8 +56,20 @@ test/traceability/               cross-checks all three, generates the reports
   tests that run the real async server over a loopback TCP socket. The
   client-side modules that need a live socket and an audio device to do
   anything (`connect.rs`, `session.rs`, `channel.rs`, `direct_message.rs`,
-  `voice_stream.rs`) have no test file of their own; `test/ui_common.rs` is
-  shared scaffolding rather than a test target itself.
+  `voice_stream.rs`) have no test file *named after them*; `test/ui_common.rs`
+  is shared scaffolding rather than a test target itself.
+
+  Where a decision inside one of those modules is worth pinning directly,
+  **`SessionState::for_test`** makes one reachable: a session with no
+  terminal, audio device, server or peer. Every worker channel is created
+  with its receiver dropped (each is written to as a discarded send, so
+  nothing under test behaves differently — it only means nobody plays the
+  audio or writes the file), every on-disk store is pointed at a scratch
+  directory so real local state is never touched, and the UDP transport is
+  real but unpunched, so `PeerLinkManager::pending_payloads` can read back
+  whatever a path decided to send. `test/session_receipt_test.rs` is the
+  worked example: it drives the actual `channel::on_message` /
+  `direct_message::on_message` to pin when a delivery receipt is sent.
 
 Both layers link to `requirements/requirements.toml` — scenarios through
 `@AC-024`-style tags, Rust tests through a `/// @requirement AC-024` marker.

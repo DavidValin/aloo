@@ -86,6 +86,11 @@ pub(crate) async fn handle_leave(
     Ok(())
 }
 
+/// `msg_id` is the delivery tag every per-recipient frame this send turns
+/// into carries, and the id of the single log row already showing it
+/// (docs/PROTOCOL.md 7.2.1) - so each recipient's acknowledgement lands
+/// back on that row and moves its indicator gray -> orange -> green.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_send_text(
     wr: &mut impl crate::control::ControlSink,
     ui_state: &mut UiState,
@@ -93,6 +98,7 @@ pub(crate) async fn handle_send_text(
     channel: String,
     plaintext: String,
     recipients: Vec<Recipient>,
+    msg_id: u64,
 ) -> proto::Result<()> {
     // OTP is pairwise, not a channel-wide concept: each recipient who has
     // individually provisioned an OTP contact with us gets an OTP-wrapped
@@ -116,6 +122,7 @@ pub(crate) async fn handle_send_text(
                     Content::Text,
                     Some(channel.clone()),
                     None,
+                    Some(msg_id),
                 )
                 .await?;
             }
@@ -142,6 +149,8 @@ pub(crate) async fn handle_send_text(
                 rekey::QueuedOutbound::Channel {
                     channel: channel.clone(),
                     plaintext: plaintext.clone(),
+                    msg_id,
+                    attempts: 0,
                 },
             );
         }
@@ -163,6 +172,7 @@ pub(crate) async fn handle_send_text(
                 id,
                 P2pPayload::Envelope {
                     channel: Some(channel.clone()),
+                    msg_id: Some(msg_id),
                     envelope,
                 },
             );
@@ -227,7 +237,17 @@ pub(crate) async fn handle_send_file(
             .get(&id)
             .map(|u| u.name.clone())
             .unwrap_or_default();
-        ui_state.log_own_file_offer_channel(&channel, &to_name, stream_id, filename.clone(), size);
+        // One row per recipient, so one delivery record per row, each
+        // addressed to exactly that recipient (docs/PROTOCOL.md 7.2.1).
+        let (msg_id, delivery) = ui_state.start_delivery(&[id]);
+        ui_state.log_own_file_offer_channel(
+            &channel,
+            &to_name,
+            stream_id,
+            filename.clone(),
+            size,
+            Some(delivery),
+        );
         session.own_file_targets.insert(
             stream_id,
             crate::client::file_transfer::OwnFileTarget {
@@ -243,6 +263,7 @@ pub(crate) async fn handle_send_file(
             P2pPayload::FileOffer {
                 channel: Some(channel.clone()),
                 stream_id,
+                msg_id: Some(msg_id),
                 envelope,
             },
         );
@@ -283,13 +304,18 @@ pub(crate) async fn handle_voice_record_start(
         stream_id,
         &parse_pq_recipients(&ready),
     );
-    ui_state.log_own_voice_stream_start_channel(&channel, stream_id);
+    // One row for the whole stream, addressed to everyone it actually went
+    // out to - so a channel voice message reads orange while only some of
+    // them have decoded it, exactly like a channel text message.
+    let (msg_id, delivery) = ui_state.start_delivery(&ready_ids);
+    ui_state.log_own_voice_stream_start_channel(&channel, stream_id, Some(delivery));
     for &id in &ready_ids {
         session.peer_link.send_reliable_or_queue(
             id,
             P2pPayload::StreamStart {
                 channel: Some(channel.clone()),
                 stream_id,
+                msg_id: Some(msg_id),
             },
         );
     }
@@ -456,12 +482,19 @@ pub(crate) fn on_join_rejected(
     ui_state.on_channel_join_rejected(name, kind);
 }
 
-pub(crate) fn on_message(
+/// `msg_id`, if the sender asked for one, is receipted here and nowhere
+/// else: only this branch is reached, and it is reached only once the
+/// envelope has actually been decrypted (docs/PROTOCOL.md 7.2.1). A
+/// message that arrives but cannot be opened is deliberately left
+/// unacknowledged - the sender's row stays undelivered, which is the
+/// truth.
+pub fn on_message(
     ui_state: &mut UiState,
     session: &mut SessionState,
     channel: String,
     from: UserId,
     from_name: String,
+    msg_id: Option<u64>,
     envelope: Envelope,
 ) {
     let Some(sender) = ui_state.known_users.get(&from).cloned() else {
@@ -475,6 +508,12 @@ pub(crate) fn on_message(
         session,
     ) {
         ui_state.on_channel_message(&channel, from, from_name, body);
+        crate::client::session::send_delivery_receipt(
+            session,
+            from,
+            msg_id,
+            crate::p2p_proto::ReceiptStage::Decrypted,
+        );
         crate::client::session::request_rotation(session, from);
     }
 }

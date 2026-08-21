@@ -227,6 +227,22 @@ pub struct AlooWorld {
     // -- key rotation --------------------------------------------------
     pub remote_keys: Option<RemoteKeys>,
     pub flushed: Vec<aloo::client::rekey::QueuedOutbound>,
+    /// What `RemoteKeys::on_rotated` gave up on rather than handing back
+    /// for sending - see `rekey::MAX_QUEUED_SEND_ATTEMPTS`.
+    pub given_up: Vec<aloo::client::rekey::QueuedOutbound>,
+
+    // -- delivery acknowledgment (US-041) ------------------------------
+    /// Voice/file transfers still owing their sender a receipt.
+    pub pending_receipts: Option<aloo::client::delivery::PendingReceipts>,
+    /// The message id the last settled transfer earned a receipt for, if
+    /// any - `None` means nothing was acknowledged.
+    pub receipted: Option<u64>,
+    /// A real session (`SessionState::for_test`) for the scenarios that
+    /// drive an actual receive path rather than the UI alone.
+    pub receipt_session: Option<aloo::client::session::SessionState>,
+    /// That session's own key, so a step can seal a message it will be
+    /// able to open - or deliberately not.
+    pub receipt_own_key: Option<aloo::crypto::KeyPair>,
 
     // -- identity pinning ----------------------------------------------
     pub id_store: Option<IdStore>,

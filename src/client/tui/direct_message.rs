@@ -13,8 +13,9 @@ use ratatui::widgets::Paragraph;
 use crate::proto::{KeyMode, UserId, UserInfo};
 
 use super::ui::{
-    FileTransferStatus, Focus, LogEntry, MessageBody, UiState, finalize_held_stream,
-    finalize_stream_entry, push_log_entry, render_input_bar, render_messages,
+    FileTransferStatus, Focus, LogEntry, MessageBody, MessageDelivery, UiState,
+    finalize_held_stream, finalize_stream_entry, local_time_stamp, push_log_entry,
+    render_input_bar, render_messages,
 };
 
 #[derive(Debug, Clone)]
@@ -126,6 +127,9 @@ impl UiState {
             body,
             outgoing: false,
             failed: false,
+            sent_at: local_time_stamp(),
+            owed_receipt: None,
+            delivery: None,
         };
         // Same hold-and-reveal treatment as a channel message
         // (docs/PROTOCOL.md §12) - decrypts fine (our own key), but not
@@ -174,12 +178,20 @@ impl UiState {
                     body: MessageBody::Voice { duration_ms, pcm },
                     outgoing: true,
                     failed: false,
+                    sent_at: local_time_stamp(),
+                    owed_receipt: None,
+                    delivery: None,
                 },
             );
         }
     }
 
-    pub fn log_own_voice_stream_start_dm(&mut self, to: UserId, stream_id: u64) {
+    pub fn log_own_voice_stream_start_dm(
+        &mut self,
+        to: UserId,
+        stream_id: u64,
+        delivery: Option<MessageDelivery>,
+    ) {
         let from = self.own_id.unwrap_or(UserId(0));
         let from_name = self.own_name.clone();
         let is_current = self.is_viewing_dm(to);
@@ -195,6 +207,9 @@ impl UiState {
                     body: MessageBody::VoiceStreaming { stream_id },
                     outgoing: true,
                     failed: false,
+                    sent_at: local_time_stamp(),
+                    owed_receipt: None,
+                    delivery,
                 },
             );
         }
@@ -214,6 +229,9 @@ impl UiState {
             body: MessageBody::VoiceStreaming { stream_id },
             outgoing: false,
             failed: false,
+            sent_at: local_time_stamp(),
+            owed_receipt: None,
+            delivery: None,
         };
         if self.is_trust_gated(peer_id) {
             self.hold_message(peer_id, None, entry);
@@ -299,6 +317,9 @@ impl UiState {
                 body: MessageBody::System(text),
                 outgoing: false,
                 failed: false,
+                sent_at: local_time_stamp(),
+                owed_receipt: None,
+                delivery: None,
             },
         );
         if unread {
@@ -315,7 +336,17 @@ impl UiState {
     /// (`mark_dm_message_failed`) once an async send outcome comes back.
     /// `None` only if the room doesn't exist yet, which shouldn't happen
     /// for a room the compose bar was just used in.
-    pub fn push_outgoing_dm(&mut self, to: UserId, body: MessageBody) -> Option<usize> {
+    /// `delivery` gives the row its indicator (`docs/PROTOCOL.md` 7.2.1) -
+    /// build it with `UiState::start_delivery`, whose id the send itself
+    /// must carry so the recipient's receipt finds this exact row again
+    /// (`UiState::mark_delivered`). `None` leaves the row untracked, which
+    /// is what an outgoing row with nothing to report wants.
+    pub fn push_outgoing_dm(
+        &mut self,
+        to: UserId,
+        body: MessageBody,
+        delivery: Option<MessageDelivery>,
+    ) -> Option<usize> {
         let from = self.own_id.unwrap_or(UserId(0));
         let from_name = self.own_name.clone();
         let is_current = self.is_viewing_dm(to);
@@ -332,6 +363,9 @@ impl UiState {
                 body,
                 outgoing: true,
                 failed: false,
+                sent_at: local_time_stamp(),
+                owed_receipt: None,
+                delivery,
             },
         );
         Some(index)
@@ -359,6 +393,7 @@ impl UiState {
         stream_id: u64,
         filename: String,
         total: u64,
+        delivery: Option<MessageDelivery>,
     ) {
         let from = self.own_id.unwrap_or(UserId(0));
         let from_name = self.own_name.clone();
@@ -380,6 +415,9 @@ impl UiState {
                     },
                     outgoing: true,
                     failed: false,
+                    sent_at: local_time_stamp(),
+                    owed_receipt: None,
+                    delivery,
                 },
             );
         }
@@ -426,6 +464,9 @@ impl UiState {
                 },
                 outgoing: false,
                 failed: false,
+                sent_at: local_time_stamp(),
+                owed_receipt: None,
+                delivery: None,
             },
         );
         if unread {

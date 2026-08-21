@@ -190,6 +190,7 @@ async fn direct_link_handshake_and_reliable_message_end_to_end() {
     alice.send_reliable_or_queue(
         bob_id,
         P2pPayload::Envelope {
+            msg_id: None,
             channel: Some("general".into()),
             envelope: envelope.clone(),
         },
@@ -219,6 +220,7 @@ async fn direct_link_handshake_and_reliable_message_end_to_end() {
             channel,
             from,
             envelope: got,
+            ..
         } => {
             assert_eq!(channel.as_deref(), Some("general"));
             assert_eq!(from, alice_id);
@@ -395,6 +397,7 @@ async fn undeliverable_queued_content_is_reported_once_it_ages_out() {
     alice.send_reliable_or_queue(
         bob_id,
         P2pPayload::Envelope {
+            msg_id: None,
             channel: None,
             envelope: Envelope {
                 content: Content::Text,
@@ -828,6 +831,7 @@ async fn content_queued_while_the_link_is_down_is_flushed_when_it_recovers() {
     alice.send_reliable_or_queue(
         bob_id,
         P2pPayload::Envelope {
+            msg_id: None,
             channel: None,
             envelope: Envelope {
                 content: Content::Text,
@@ -1492,6 +1496,7 @@ async fn next_candidates(
 /// 16KB key chunks such an envelope actually carries.
 fn otp_sized_payload(i: usize) -> P2pPayload {
     P2pPayload::Envelope {
+        msg_id: None,
         channel: None,
         envelope: Envelope {
             content: Content::Text,
@@ -1502,6 +1507,7 @@ fn otp_sized_payload(i: usize) -> P2pPayload {
 
 fn text_payload(body: &str) -> P2pPayload {
     P2pPayload::Envelope {
+        msg_id: None,
         channel: None,
         envelope: Envelope {
             content: Content::Text,
@@ -2030,4 +2036,147 @@ async fn the_rendezvous_socket_keeps_serving_after_junk_and_a_vanished_client() 
         },
         "the reply must echo the token and the address the request came from"
     );
+}
+
+// ---------------------------------------------------------------------
+// Delivery acknowledgment on the wire (docs/PROTOCOL.md 7.2.1)
+// ---------------------------------------------------------------------
+
+/// The id the sender puts on its message has to reach the receiving side,
+/// because answering it is the receiver's job - a receiver that never saw
+/// it could not acknowledge anything. `session.rs` is what decides to
+/// answer (only once the envelope has actually opened); this is the wire
+/// half alone.
+/// @requirement AC-233
+#[tokio::test]
+async fn a_message_carries_the_id_its_recipient_must_receipt() {
+    let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel::<P2pEvent>();
+    let (_manager, _socket) =
+        PeerLinkManager::bind("127.0.0.1:0".parse().unwrap(), None, events_tx.clone())
+            .await
+            .unwrap();
+
+    let named = P2pPayload::Envelope {
+        channel: None,
+        msg_id: Some(4242),
+        envelope: Envelope {
+            content: Content::Text,
+            blocks: vec![b"did you get this".to_vec()],
+        },
+    };
+    let decoded: P2pPayload = aloo::proto::decode(&aloo::proto::encode(&named).unwrap()).unwrap();
+    match decoded {
+        P2pPayload::Envelope { msg_id, .. } => assert_eq!(msg_id, Some(4242)),
+        other => panic!("expected an Envelope, got {other:?}"),
+    }
+    drop(events_rx.try_recv());
+}
+
+/// A receipt is ordinary reliable content in both directions: the sender
+/// learns of it as `P2pEvent::Delivered`, attributed to whichever link it
+/// arrived on, exactly like any other payload.
+/// @requirement AC-233
+#[tokio::test]
+async fn a_delivery_receipt_becomes_a_delivered_event_naming_its_sender() {
+    let server_addr = spawn_test_server().await;
+
+    let mut a = ControlEndpoint::new(TcpStream::connect(server_addr).await.unwrap());
+    let alice_id = handshake(&mut a, "alice").await;
+    let mut b = ControlEndpoint::new(TcpStream::connect(server_addr).await.unwrap());
+    let bob_id = handshake(&mut b, "bob").await;
+
+    let (a_events_tx, mut a_events_rx) = tokio::sync::mpsc::unbounded_channel::<P2pEvent>();
+    let (b_events_tx, mut b_events_rx) = tokio::sync::mpsc::unbounded_channel::<P2pEvent>();
+    let (mut alice, a_socket) =
+        PeerLinkManager::bind("127.0.0.1:0".parse().unwrap(), Some(server_addr), a_events_tx)
+            .await
+            .unwrap();
+    let (mut bob, b_socket) =
+        PeerLinkManager::bind("127.0.0.1:0".parse().unwrap(), Some(server_addr), b_events_tx)
+            .await
+            .unwrap();
+
+    let (a_raw_tx, mut a_raw_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (b_raw_tx, mut b_raw_rx) = tokio::sync::mpsc::unbounded_channel();
+    aloo::client::p2p::spawn_receive_loop(a_socket, Some(server_addr), a_raw_tx);
+    aloo::client::p2p::spawn_receive_loop(b_socket, Some(server_addr), b_raw_tx);
+
+    alice.ensure_link(&mut a, bob_id).await;
+    let ServerMessage::PeerCandidates {
+        candidates,
+        link_nonce,
+        ..
+    } = b.recv().await.unwrap().unwrap()
+    else {
+        panic!("bob should receive alice's PeerCandidates");
+    };
+    bob.on_peer_candidates(&mut b, alice_id, candidates, link_nonce)
+        .await;
+    let ServerMessage::PeerCandidates {
+        candidates,
+        link_nonce,
+        ..
+    } = a.recv().await.unwrap().unwrap()
+    else {
+        panic!("alice should receive bob's reply");
+    };
+    alice
+        .on_peer_candidates(&mut a, bob_id, candidates, link_nonce)
+        .await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while !(alice.is_active(bob_id) && bob.is_active(alice_id)) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "loopback punch did not complete in time"
+        );
+        tokio::select! {
+            Some((addr, dgram)) = a_raw_rx.recv() => alice.on_inbound(addr, dgram),
+            Some((addr, dgram)) = b_raw_rx.recv() => bob.on_inbound(addr, dgram),
+            _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+    }
+
+    // Bob answers a message he could read. `session.rs` sends this from the
+    // one branch that has actually decrypted an envelope; here it is sent
+    // directly, since the crypto is not what this test is about.
+    bob.send_reliable_or_queue(alice_id, P2pPayload::DeliveryReceipt {
+            msg_id: 4242,
+            stage: aloo::p2p_proto::ReceiptStage::Decrypted,
+        });
+
+    let got = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            tokio::select! {
+                Some((addr, dgram)) = a_raw_rx.recv() => alice.on_inbound(addr, dgram),
+                Some((addr, dgram)) = b_raw_rx.recv() => bob.on_inbound(addr, dgram),
+                Some(event) = a_events_rx.recv() => {
+                    if is_link_bookkeeping(&event) {
+                        continue;
+                    }
+                    return event;
+                }
+            }
+        }
+    })
+    .await
+    .expect("alice should be told her message was read");
+
+    match got {
+        P2pEvent::Delivered {
+            peer,
+            msg_id,
+            stage,
+        } => {
+            assert_eq!(peer, bob_id, "attributed to the link it arrived on");
+            assert_eq!(msg_id, 4242, "and naming the sender's own message");
+            assert_eq!(
+                stage,
+                aloo::p2p_proto::ReceiptStage::Decrypted,
+                "and saying how far he got with it"
+            );
+        }
+        _ => panic!("expected P2pEvent::Delivered, got a different event"),
+    }
+    let _ = b_events_rx.try_recv();
 }

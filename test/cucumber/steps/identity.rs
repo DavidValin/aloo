@@ -32,12 +32,22 @@ async fn bob_key_used(w: &mut AlooWorld) {
 #[when(expr = "I type {string} and then {string} to him")]
 async fn queue_two(w: &mut AlooWorld, first: String, second: String) {
     let remote = w.remote_keys.as_mut().expect("no rotation state");
-    remote.enqueue(UserId(2), QueuedOutbound::Direct { plaintext: first });
+    remote.enqueue(
+        UserId(2),
+        QueuedOutbound::Direct {
+            plaintext: first,
+            msg_id: 1,
+            log_index: Some(0),
+            attempts: 0,
+        },
+    );
     remote.enqueue(
         UserId(2),
         QueuedOutbound::Channel {
             channel: "general".into(),
             plaintext: second,
+            msg_id: 2,
+            attempts: 0,
         },
     );
 }
@@ -55,7 +65,9 @@ async fn both_held(w: &mut AlooWorld) {
 #[when("bob's next key arrives")]
 async fn bob_key_arrives(w: &mut AlooWorld) {
     let remote = w.remote_keys.as_mut().expect("no rotation state");
-    w.flushed = remote.on_rotated(UserId(2));
+    let (flushed, given_up) = remote.on_rotated(UserId(2));
+    w.flushed = flushed;
+    w.given_up = given_up;
     remote.mark_used(UserId(2));
 }
 
@@ -64,10 +76,19 @@ async fn flushed_in_order(w: &mut AlooWorld, first: String, second: String) {
     assert_eq!(
         w.flushed,
         vec![
-            QueuedOutbound::Direct { plaintext: first },
+            QueuedOutbound::Direct {
+                plaintext: first,
+                msg_id: 1,
+                log_index: Some(0),
+                // Handing an item out for sending is what spends an
+                // attempt (`RemoteKeys::on_rotated`).
+                attempts: 1,
+            },
             QueuedOutbound::Channel {
                 channel: "general".into(),
-                plaintext: second
+                plaintext: second,
+                msg_id: 2,
+                attempts: 1,
             },
         ],
         "the whole queue flushes at once, in the order it was typed"
@@ -326,3 +347,47 @@ async fn send_excludes(w: &mut AlooWorld, excluded: String, included: String) {
     }
 }
 
+
+// ---------------------------------------------------------------------
+// A queue is a wait, not a life sentence (AC-234)
+// ---------------------------------------------------------------------
+
+#[when("every rotation hands them back but none of them can be sent")]
+async fn rotations_never_help(w: &mut AlooWorld) {
+    let remote = w.remote_keys.as_mut().expect("no rotation state");
+    for _ in 0..aloo::client::rekey::MAX_QUEUED_SEND_ATTEMPTS {
+        let (flushed, given_up) = remote.on_rotated(UserId(2));
+        assert!(given_up.is_empty(), "still within their budget");
+        for item in flushed {
+            remote.requeue(UserId(2), item);
+        }
+    }
+    let (flushed, given_up) = remote.on_rotated(UserId(2));
+    w.flushed = flushed;
+    w.given_up = given_up;
+}
+
+#[then("both are given up on rather than held forever")]
+async fn both_given_up(w: &mut AlooWorld) {
+    assert_eq!(w.given_up.len(), 2, "both ran out of attempts");
+    assert!(
+        w.flushed.is_empty(),
+        "neither is handed out to be tried again"
+    );
+    let remote = w.remote_keys.as_ref().expect("no rotation state");
+    assert_eq!(
+        remote.queue_len(UserId(2)),
+        0,
+        "and neither is left waiting on a key that never came"
+    );
+}
+
+#[then("each names the row it was shown on, so it can be marked failed")]
+async fn each_names_its_row(w: &mut AlooWorld) {
+    let ids: Vec<u64> = w.given_up.iter().map(|i| i.msg_id()).collect();
+    assert_eq!(
+        ids,
+        vec![1, 2],
+        "the rows are named in the order they were typed"
+    );
+}

@@ -91,7 +91,7 @@ async fn peer_dm_stream_finishes(w: &mut AlooWorld, name: String, duration: u32)
 
 #[when("my own voice message starts streaming into the channel")]
 async fn own_stream_starts(w: &mut AlooWorld) {
-    w.ui_mut().log_own_voice_stream_start_channel("general", 7);
+    w.ui_mut().log_own_voice_stream_start_channel("general", 7, None);
 }
 
 #[when(expr = "my own voice message finishes after {int} milliseconds")]
@@ -261,7 +261,11 @@ async fn dm_becomes_replayable(w: &mut AlooWorld, duration: u32) {
 #[then("replaying that voice message is requested")]
 async fn replay_requested(w: &mut AlooWorld) {
     match w.last_action.as_ref().expect("no action was produced") {
-        UiAction::ReplayVoice { duration_ms, pcm } => {
+        UiAction::ReplayVoice {
+            duration_ms,
+            pcm,
+            ..
+        } => {
             assert_eq!(*duration_ms, 4200);
             assert_eq!(
                 pcm,

@@ -431,7 +431,16 @@ impl UiState {
                     if !pcm.is_empty() {
                         self.replaying = true;
                     }
-                    Some(UiAction::ReplayVoice { duration_ms, pcm })
+                    Some(UiAction::ReplayVoice {
+                        duration_ms,
+                        pcm,
+                        // A mail attachment is not a peer's live voice
+                        // message and owes nobody a receipt (7.2.1) - a
+                        // mail's own delivery is reported over the server
+                        // instead (17.3).
+                        from: crate::proto::UserId(0),
+                        owed_receipt: None,
+                    })
                 } else {
                     Some(UiAction::SaveOtpMailAttachment {
                         index: reader.selected_part - voices,
@@ -742,7 +751,12 @@ impl UiState {
                         if !pcm.is_empty() {
                             self.replaying = true;
                         }
-                        UiAction::ReplayVoice { duration_ms, pcm }
+                        UiAction::ReplayVoice {
+                            duration_ms,
+                            pcm,
+                            from: crate::proto::UserId(0),
+                            owed_receipt: None,
+                        }
                     })
                 }
                 KeyCode::Char('d') => {

@@ -781,8 +781,13 @@ so_that = "nothing is lost while a peer's key is mid-rotation"
 
 [[user_story.acceptance_criteria]]
 id = "AC-045"
-description = "A message typed for a rotating-key peer whose next key has not arrived is held, then sent automatically in the order typed once it does."
-evidence = "docs/PROTOCOL.md 11.1; tests queued_messages_flush_in_fifo_order_on_rotation, full_lifecycle_track_use_queue_rotate_flush"
+description = "A message typed for a rotating-key peer whose next key has not arrived is held, then sent automatically in the order typed once it does - genuinely put on the wire under that key, not merely drained from the queue, and named with the same message id its log row already carries so it can still be reported delivered."
+evidence = "docs/PROTOCOL.md 11.1, 7.2.1; src/client/rekey.rs RemoteKeys::on_rotated; src/client/session.rs flush_queued_outbound, handle_pq_key_rotated; tests queued_messages_flush_in_fifo_order_on_rotation, full_lifecycle_track_use_queue_rotate_flush; key_rotation.feature"
+
+[[user_story.acceptance_criteria]]
+id = "AC-234"
+description = "Holding a message is not the same as holding it forever: each time a rotation hands one back for sending it spends an attempt, and after MAX_QUEUED_SEND_ATTEMPTS it is given up on rather than waiting on a key that may never come - the row it was optimistically shown on is marked failed and the user is told, so a message that was never sent never goes on looking like it is still on its way."
+evidence = "docs/PROTOCOL.md 11.1; src/client/rekey.rs MAX_QUEUED_SEND_ATTEMPTS, QueuedOutbound.attempts, RemoteKeys::on_rotated, requeue; src/client/session.rs flush_queued_outbound; tests a_queued_message_is_given_up_on_after_its_attempts_run_out, an_item_that_cannot_be_sent_keeps_its_spent_attempt; key_rotation.feature"
 
 [[user_story.technical_behavior]]
 id = "TB-079"
@@ -798,6 +803,11 @@ evidence = "docs/PROTOCOL.md 11.1; tests tracked_peer_is_fresh_once_then_stale, 
 id = "TB-081"
 description = "Queueing for, or receiving a rotation from, a peer that was never tracked starts tracking them - stale when queued, fresh when rotated."
 evidence = "src/client/rekey.rs RemoteKeys; tests on_rotated_on_a_never_tracked_peer_starts_tracking_it, enqueue_on_untracked_peer_starts_tracking_it_as_stale"
+
+[[user_story.technical_behavior]]
+id = "TB-232"
+description = "An attempt is spent on the way out of the queue, not on the way in, so a message that goes out on its first pass has cost exactly one - and an item the caller could not send after all is re-queued with that attempt already spent, which is what makes the bound real rather than a counter that never advances."
+evidence = "src/client/rekey.rs RemoteKeys::on_rotated, requeue, QueuedOutbound::attempts; tests an_attempt_is_spent_when_an_item_is_handed_out, an_item_that_cannot_be_sent_keeps_its_spent_attempt"
 
 [[user_story.technical_behavior]]
 id = "TB-082"
@@ -2538,3 +2548,55 @@ evidence = "docs/PROTOCOL.md 4.2; src/client/reconnect.rs ServerSink, install, c
 id = "TB-228"
 description = "A control-channel write that fails drops the writer and wakes the supervisor instead of returning an error to the caller: with nothing arriving from the server there is nothing for the read half to fail on, so the heartbeat (4.1) is what finds a half-dead socket first - and every call site propagates with ?, which would end the very session reconnecting exists to keep."
 evidence = "docs/PROTOCOL.md 4.2, 4.1; src/client/reconnect.rs ServerSink::send_control, spawn_supervisor's lost-channel select; test a_write_that_fails_drops_the_connection_and_reports_the_loss"
+
+[[user_story]]
+id = "US-041"
+title = "Know whether the message you sent got there"
+as_a = "someone who has just sent a message"
+i_want = "to see whether it reached the people it was addressed to"
+so_that = "I know whether silence means nobody answered or nobody got it"
+
+[[user_story.acceptance_criteria]]
+id = "AC-230"
+description = "A message this client sent reads '<nickname> -> <body>', and that arrow is the indicator: it is coloured by how far the message has got. Text, voice messages and file transfers all carry one. Nothing else in the log does - a message from someone else, and the app's own system and presence lines, keep the plain ':' separator, because none of them has a delivery to report. In a private room the arrow has two states, gray while the one recipient has not confirmed decrypting it and green once they have. The OTP shield prefix stays where it always was, at the very start of the row."
+evidence = "docs/SPEC.md 'Connected UI', Functionality #20; docs/PROTOCOL.md 7.2.1; src/client/tui/ui.rs LogEntry::delivery_status, DeliveryStatus::color, DELIVERY_ARROW, PLAIN_SEPARATOR, sender_prefix, render_messages; src/client/tui/direct_message.rs push_outgoing_dm; tests a_sent_direct_message_starts_undelivered_and_turns_delivered, the_arrow_is_coloured_by_how_far_the_message_has_got, only_messages_this_client_sent_carry_an_indicator, a_voice_row_and_a_file_row_carry_the_arrow_too, the_shield_prefix_stays_at_the_start_of_the_row; delivery_acknowledgment.feature"
+
+[[user_story.acceptance_criteria]]
+id = "AC-231"
+description = "A channel message's arrow has three states rather than two, because one channel send is really one independently-addressed message per member: gray while no recipient has acknowledged it, orange once some but not all have, green once all have. A send that reached nobody at all reads gray rather than a vacuous green, and is additionally struck through with STRIKE_OVERLAY - it is not waiting on anybody's acknowledgement, so it must not look like it is."
+evidence = "docs/SPEC.md 'Connected UI', Functionality #20; docs/PROTOCOL.md 7.2, 7.2.1; src/client/tui/ui.rs MessageDelivery::status, DeliveryStatus::color, LogEntry::reached_nobody, STRIKE_OVERLAY, strike_through, render_messages; src/client/tui/channel.rs push_outgoing_channel; tests a_channel_message_reads_orange_once_only_some_recipients_have_it, a_channel_message_addressed_to_nobody_is_not_delivered, a_message_that_reached_nobody_is_struck_through, a_message_that_reached_somebody_is_not_struck_through; delivery_acknowledgment.feature"
+
+[[user_story.acceptance_criteria]]
+id = "AC-232"
+description = "Pressing i with the message log focused opens that message's details: sent_at, then one line per user it was sent to, each naming that user and, aligned to the right, that user's own coloured arrow followed by DELIVERED or UNDELIVERED. The popup absorbs every other key while open and closes on i or Escape. On a row that tracks no delivery it reads received_at and says so in place of the list, rather than showing an empty one."
+evidence = "docs/SPEC.md 'Connected UI', Functionality #20; src/client/tui/ui.rs UiState::message_info, handle_messages_key, render_message_info_popup, SENT_AT_LABEL, RECEIVED_AT_LABEL, NO_DELIVERY_INFO, DELIVERED_LABEL, UNDELIVERED_LABEL; tests i_opens_the_details_of_the_selected_message, the_details_popup_names_every_recipient_with_its_own_state, the_details_popup_absorbs_other_keys_and_closes_on_escape, an_incoming_message_has_no_delivery_information_to_show; delivery_acknowledgment.feature"
+
+[[user_story.acceptance_criteria]]
+id = "AC-233"
+description = "Delivery is a claim only the recipient can make, and it makes it explicitly: the sender names its message with a msg_id on what it sends, and the recipient answers DeliveryReceipt for that id once it has decrypted the content - never before, and never at all for content it could not open. A message held behind an identity review still counts as read: the gate decides whether to show it, not whether it made sense. The transport's own ack (7.1.1) is deliberately not used for this: it says a datagram arrived, which is a weaker claim than being able to read what was in it. A receipt is not a read receipt either, and does not survive a restart on either side."
+evidence = "docs/PROTOCOL.md 7.1.1, 7.2.1; src/p2p_proto.rs P2pPayload::DeliveryReceipt, Envelope.msg_id; src/client/p2p.rs P2pEvent::Delivered; src/client/session.rs send_delivery_receipt; src/client/channel.rs on_message; src/client/direct_message.rs on_message; tests a_channel_message_is_receipted_once_it_has_been_decrypted, a_direct_message_is_receipted_once_it_has_been_decrypted, an_undecryptable_message_is_never_receipted, a_message_held_pending_a_trust_decision_is_still_receipted, a_message_carries_the_id_its_recipient_must_receipt, a_delivery_receipt_becomes_a_delivered_event_naming_its_sender; delivery_acknowledgment.feature"
+
+[[user_story.technical_behavior]]
+id = "TB-230"
+description = "A msg_id is opaque to everything between the two ends: it is put on the wire by the sender, echoed back untouched by the recipient, and interpreted only by the sender that issued it. A payload carrying none asks for no receipt, which is what keeps the OTP layer's own provisioning traffic - envelopes nobody sees a row for - from generating receipts for rows that do not exist."
+evidence = "docs/PROTOCOL.md 7.2.1; src/p2p_proto.rs P2pPayload::Envelope.msg_id, DeliveryReceipt; src/client/session.rs send_delivery_receipt; src/client/otp.rs (provisioning envelopes send msg_id None); tests a_message_that_names_nothing_is_never_receipted, a_payload_naming_no_message_earns_no_receipt, marking_delivered_is_idempotent_and_ignores_unknown_ids"
+
+[[user_story.acceptance_criteria]]
+id = "AC-235"
+description = "A voice message and a file transfer are answered twice rather than once, because for them the interesting moment comes after decryption. The first answer is Decrypted: a file offer that opened, or a stream that ended having produced audio the receiver could decode. The second is Consumed, and comes later or never: the whole file written to disk, or the audio actually played. A transfer that fails part way, an offer that is rejected, a stream that decoded nothing, and a clip that is never played all earn no second answer - which is the truth about each of them. Both are different statements from the sending row's own completion, which is only about this side finishing sending."
+evidence = "docs/SPEC.md 'Connected UI', Functionality #20; docs/PROTOCOL.md 7.2.1; src/p2p_proto.rs P2pPayload::FileOffer.msg_id, StreamStart.msg_id; src/client/session.rs remember_delivery_id, settle_delivery_id, handle_file_event; src/client/delivery.rs PendingReceipts, remember, settle; tests nothing_is_receipted_merely_for_arriving, a_file_is_receipted_only_once_it_has_all_arrived_decrypted, a_failed_transfer_is_never_receipted, a_voice_stream_that_decoded_nothing_is_never_receipted, one_transfer_earns_at_most_one_receipt; delivery_acknowledgment.feature"
+
+[[user_story.acceptance_criteria]]
+id = "AC-236"
+description = "The details popup, and only the popup, shows what a recipient did with a message beyond being able to read it: DELIVERED+LISTENED in green for a voice message they have actually heard - on arrival, or later if it was muted at the time and they replayed it - and DELIVERED+SAVED in green for a file they have the whole of on disk. A text message never grows either, having nothing further to do, and the log's own arrow is unmoved by any of it: it stays a three-state summary of who has the message, not of what they did with it."
+evidence = "docs/SPEC.md 'Connected UI', Functionality #20; docs/PROTOCOL.md 7.2.1; src/p2p_proto.rs ReceiptStage; src/client/tui/ui.rs LISTENED_LABEL, SAVED_LABEL, recipient_label, DeliveryRecipient.consumed, mark_delivered, owe_replay_receipt, LogEntry.owed_receipt, UiAction::ReplayVoice; src/client/session.rs handle_ui_action's ReplayVoice arm, the stream-finished arm; tests the_details_popup_distinguishes_heard_from_merely_decrypted, the_details_popup_says_saved_for_a_file_the_recipient_has_on_disk, a_text_message_has_no_extra_state_and_the_arrow_is_unchanged_by_one, replaying_a_clip_that_was_never_heard_pays_its_sender, replaying_a_clip_that_was_already_heard_owes_nothing; delivery_acknowledgment.feature"
+
+[[user_story.technical_behavior]]
+id = "TB-233"
+description = "A session is constructible without a terminal, an audio device, a server or a peer (SessionState::for_test), so the receive paths that decide whether to acknowledge a message are tested through the real functions rather than around them. Every worker channel is created with its receiver dropped - safe because each is written to as a discarded send - and every on-disk store is pointed at a scratch directory, so a test can never touch real local state."
+evidence = "docs/TESTING.md; src/client/session.rs SessionState::for_test, TestSessionSpec, peer_link_mut; src/client/p2p.rs PeerLinkManager::pending_payloads; tests a_channel_message_is_receipted_once_it_has_been_decrypted, a_message_held_pending_a_trust_decision_is_still_receipted"
+
+[[user_story.technical_behavior]]
+id = "TB-231"
+description = "A message id is allocated by the UI and is unique across every channel log and private room in the session, which is what lets an acknowledgement - which names a peer and an id, never a conversation - be routed back to the one row that owns it. It is session-scoped and monotonic: nothing compares ids across restarts, so a message still unacknowledged when the client stops simply stays that way."
+evidence = "docs/PROTOCOL.md 7.2.1; src/client/tui/ui.rs UiState::alloc_msg_id, mark_delivered, MessageDelivery.msg_id; tests an_acknowledgement_finds_its_row_in_any_conversation, marking_delivered_is_idempotent_and_ignores_unknown_ids, two_senders_using_the_same_stream_id_are_kept_apart"

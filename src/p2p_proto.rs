@@ -134,6 +134,25 @@ pub enum PunchDatagram {
     },
 }
 
+/// How far a receiver has got with one message (docs/PROTOCOL.md 7.2.1).
+/// Two stages rather than one because for a voice message or a file the
+/// interesting moment comes after decryption: being able to read a file
+/// offer is not the same as having the file, and decoding audio is not the
+/// same as having heard it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReceiptStage {
+    /// The content was decrypted. For a text message this is the whole
+    /// story; for a file it means the *offer* opened, and for a voice
+    /// message that the audio decoded.
+    Decrypted,
+    /// The receiver has since done the thing the message was for: written
+    /// the file to disk, or played the audio. Only voice messages and file
+    /// transfers ever reach this - a text message has nothing further to
+    /// do. Implies `Decrypted`, and may arrive much later than it, or
+    /// never.
+    Consumed,
+}
+
 /// Ceiling on a `DirectPing`/`DirectPong` `from` field. These arrive
 /// unsolicited from anyone who knows the port, ahead of any link state, so
 /// the nickname is compared against `direct_punch_to` and then dropped -
@@ -152,16 +171,40 @@ pub const MAX_DIRECT_PUNCH_NICK_LEN: usize = 64;
 pub enum P2pPayload {
     Envelope {
         channel: Option<String>,
+        /// The sender's own name for this message, echoed back in a
+        /// `DeliveryReceipt` once the receiver has actually opened it
+        /// (docs/PROTOCOL.md 7.2.1). Meaningful only to the sender, who is
+        /// the only party that ever compares it against anything.
+        /// `None` asks for no receipt.
+        msg_id: Option<u64>,
         envelope: Envelope,
+    },
+    /// What the receiver has managed to do with the message `msg_id`
+    /// names (docs/PROTOCOL.md 7.2.1) - a stronger claim than the
+    /// transport's own ack (§7.1.1), and the only thing that marks a
+    /// message delivered. Never sent for a message that arrived but could
+    /// not be opened.
+    DeliveryReceipt {
+        msg_id: u64,
+        stage: ReceiptStage,
     },
     FileOffer {
         channel: Option<String>,
         stream_id: u64,
+        /// See `Envelope::msg_id`. A file's receipt is earned only once the
+        /// whole transfer has been decrypted and written out, not when the
+        /// offer arrives - the offer merely names which message it will
+        /// belong to (docs/PROTOCOL.md 7.2.1).
+        msg_id: Option<u64>,
         envelope: Envelope,
     },
     StreamStart {
         channel: Option<String>,
         stream_id: u64,
+        /// See `Envelope::msg_id`. A voice message's receipt is earned when
+        /// the stream ends having actually decrypted audio, not when it
+        /// starts (docs/PROTOCOL.md 7.2.1).
+        msg_id: Option<u64>,
     },
     /// The `pq_hybrid` key setup for one stream, sent reliably once per
     /// recipient right after `StreamStart` - a bincode-encoded
@@ -209,6 +252,12 @@ pub enum P2pPayload {
     OtpEnvelope {
         channel: Option<String>,
         seq: u64,
+        /// See `Envelope::msg_id` - an OTP-wrapped text message earns a
+        /// `DeliveryReceipt` the same way an ordinary one does, once the
+        /// pad has been unwrapped and the envelope inside it opened. That
+        /// is a different statement from `OtpDeliveryAck` below, which is
+        /// about the pad's own gate rather than about this message.
+        msg_id: Option<u64>,
         envelope: Envelope,
     },
     /// `OtpEnvelope`'s file-offer counterpart, mirroring `FileOffer` -
@@ -222,6 +271,8 @@ pub enum P2pPayload {
         channel: Option<String>,
         stream_id: u64,
         seq: u64,
+        /// See `FileOffer::msg_id`.
+        msg_id: Option<u64>,
         envelope: Envelope,
     },
     /// Sent back once an `OtpEnvelope`/`OtpFileOffer` has been unwrapped
@@ -252,6 +303,10 @@ pub enum P2pPayload {
     OtpVoiceOffer {
         stream_id: u64,
         seq: u64,
+        /// See `StreamStart::msg_id` - an OTP voice message is recorded
+        /// whole and sent once, so its receipt is earned the same way a
+        /// file's is, on the content arriving decrypted.
+        msg_id: Option<u64>,
         envelope: Envelope,
     },
     /// This side's `client::device_id`, encrypted the same way any other

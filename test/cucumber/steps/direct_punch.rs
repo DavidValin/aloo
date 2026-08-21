@@ -301,6 +301,7 @@ async fn message_arrives(w: &mut AlooWorld) {
         bob_id,
         P2pPayload::Envelope {
             channel: None,
+            msg_id: None,
             envelope: Envelope {
                 content: Content::Text,
                 blocks: vec![b"no server involved".to_vec()],
@@ -332,6 +333,127 @@ async fn message_arrives(w: &mut AlooWorld) {
     w.clients.insert("bob".into(), bob);
     assert_eq!(got.0, alice_id, "the message is attributed to alice");
     assert_eq!(got.1.blocks[0], b"no server involved".to_vec());
+}
+
+/// The delivery acknowledgment (docs/PROTOCOL.md 7.2.1) end to end, over a
+/// real punched link: alice names her message, bob's side answers with a
+/// `DeliveryReceipt` for it - which is exactly what
+/// `session::send_delivery_receipt` does once an envelope has actually
+/// been decrypted - and alice's own side turns that into the `Delivered`
+/// event her indicator is driven by. Bob is a bare transport here with no
+/// session behind it, so the step stands in for the decrypt step itself;
+/// what it proves is that the id survives the round trip and comes back
+/// attributed to the right peer.
+#[then(expr = "a message alice sends over that link is acknowledged back to her")]
+async fn message_is_acknowledged(w: &mut AlooWorld) {
+    const MSG_ID: u64 = 77;
+    let bob_id = direct_peer_id("bob");
+    let alice_id = direct_peer_id("alice");
+    link_of(w, "alice").send_reliable_or_queue(
+        bob_id,
+        P2pPayload::Envelope {
+            channel: None,
+            msg_id: Some(MSG_ID),
+            envelope: Envelope {
+                content: Content::Text,
+                blocks: vec![b"did you get this".to_vec()],
+            },
+        },
+    );
+    let mut alice = w.clients.remove("alice").unwrap();
+    let mut bob = w.clients.remove("bob").unwrap();
+    let got = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            tokio::select! {
+                Some((addr, dgram)) = alice.p2p_raw_rx.as_mut().unwrap().recv() => {
+                    alice.peer_link.as_mut().unwrap().on_inbound(addr, dgram);
+                }
+                Some((addr, dgram)) = bob.p2p_raw_rx.as_mut().unwrap().recv() => {
+                    bob.peer_link.as_mut().unwrap().on_inbound(addr, dgram);
+                }
+                Some(event) = bob.p2p_events_rx.as_mut().unwrap().recv() => {
+                    // Bob only answers a message that actually named one -
+                    // an unnamed message earns no receipt at all.
+                    if let P2pEvent::Message { from, msg_id: Some(msg_id), .. } = event {
+                        bob.peer_link.as_mut().unwrap().send_reliable_or_queue(
+                            from,
+                            P2pPayload::DeliveryReceipt {
+                                msg_id,
+                                stage: aloo::p2p_proto::ReceiptStage::Decrypted,
+                            },
+                        );
+                    }
+                }
+                Some(event) = alice.p2p_events_rx.as_mut().unwrap().recv() => {
+                    if let P2pEvent::Delivered { peer, msg_id, .. } = event {
+                        return (peer, msg_id);
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .expect("alice should be told her message was read by bob");
+    w.clients.insert("alice".into(), alice);
+    w.clients.insert("bob".into(), bob);
+    assert_eq!(got.0, bob_id, "the receipt names who sent it");
+    assert_eq!(got.1, MSG_ID, "and which message of hers it answers");
+    assert_ne!(bob_id, alice_id, "the two are distinct peers");
+}
+
+/// The other half of the contract: a payload that names no message asks
+/// for no receipt, which is what keeps the OTP layer's own provisioning
+/// traffic from generating receipts for rows that do not exist (7.2.1).
+#[then(expr = "a message alice sends without naming it is never acknowledged")]
+async fn message_is_not_acknowledged(w: &mut AlooWorld) {
+    let bob_id = direct_peer_id("bob");
+    link_of(w, "alice").send_reliable_or_queue(
+        bob_id,
+        P2pPayload::Envelope {
+            channel: None,
+            msg_id: None,
+            envelope: Envelope {
+                content: Content::Text,
+                blocks: vec![b"no answer wanted".to_vec()],
+            },
+        },
+    );
+    let mut alice = w.clients.remove("alice").unwrap();
+    let mut bob = w.clients.remove("bob").unwrap();
+    let mut arrived = false;
+    // Bob's client only ever answers a message that named one, so pumping
+    // the link to quiescence must produce no `Delivered` for alice.
+    let _ = tokio::time::timeout(Duration::from_millis(600), async {
+        loop {
+            tokio::select! {
+                Some((addr, dgram)) = alice.p2p_raw_rx.as_mut().unwrap().recv() => {
+                    alice.peer_link.as_mut().unwrap().on_inbound(addr, dgram);
+                }
+                Some((addr, dgram)) = bob.p2p_raw_rx.as_mut().unwrap().recv() => {
+                    bob.peer_link.as_mut().unwrap().on_inbound(addr, dgram);
+                }
+                Some(event) = bob.p2p_events_rx.as_mut().unwrap().recv() => {
+                    if let P2pEvent::Message { from, msg_id, .. } = event {
+                        arrived = true;
+                        assert_eq!(msg_id, None, "nothing named it");
+                        // Faithfully doing what a real client does with an
+                        // unnamed message: nothing.
+                        let _ = from;
+                    }
+                }
+                Some(event) = alice.p2p_events_rx.as_mut().unwrap().recv() => {
+                    assert!(
+                        !matches!(event, P2pEvent::Delivered { .. }),
+                        "an unnamed message must never come back acknowledged"
+                    );
+                }
+            }
+        }
+    })
+    .await;
+    w.clients.insert("alice".into(), alice);
+    w.clients.insert("bob".into(), bob);
+    assert!(arrived, "the message itself should still have got there");
 }
 
 #[when(expr = "four more slots come and go")]
@@ -695,6 +817,7 @@ async fn send_needs_no_server(_w: &mut AlooWorld) {
             channel: "general".into(),
             plaintext: "hi".to_string(),
             recipients: Vec::new(),
+            msg_id: 0,
         }
         .needs_server(),
         None

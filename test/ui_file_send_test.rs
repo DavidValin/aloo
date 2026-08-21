@@ -267,8 +267,8 @@ fn there_is_no_size_cap_on_a_file_send() {
 #[test]
 fn a_channel_file_send_logs_one_row_per_recipient_naming_them() {
     let mut state = joined_general_with(vec![user(2, "bob"), user(3, "carol")]);
-    state.log_own_file_offer_channel("general", "bob", 1, "report.pdf".into(), 1000);
-    state.log_own_file_offer_channel("general", "carol", 2, "report.pdf".into(), 1000);
+    state.log_own_file_offer_channel("general", "bob", 1, "report.pdf".into(), 1000, None);
+    state.log_own_file_offer_channel("general", "carol", 2, "report.pdf".into(), 1000, None);
 
     assert_eq!(state.channels[0].log.len(), 2);
     assert_eq!(state.channels[0].log[0].to_name.as_deref(), Some("bob"));
@@ -464,8 +464,8 @@ fn a_progress_update_advances_the_bar_and_completion_finalizes_it() {
 #[test]
 fn rejection_and_failure_are_reflected_on_the_matching_row() {
     let mut state = joined_general_with(vec![user(2, "bob"), user(3, "carol")]);
-    state.log_own_file_offer_channel("general", "bob", 1, "a.txt".into(), 10);
-    state.log_own_file_offer_channel("general", "carol", 2, "a.txt".into(), 10);
+    state.log_own_file_offer_channel("general", "bob", 1, "a.txt".into(), 10, None);
+    state.log_own_file_offer_channel("general", "carol", 2, "a.txt".into(), 10, None);
 
     state.set_file_rejected(state.own_id.unwrap(), 1);
     state.set_file_failed(state.own_id.unwrap(), 2);

@@ -3,9 +3,11 @@ mod ui_common;
 use ui_common::*;
 
 use aloo::client::p2p::LinkStatus;
+use aloo::p2p_proto::ReceiptStage;
 use aloo::proto::{KeyMode, UserId};
 use aloo::client::tui::ui::{
-    Focus, IdentityCase, MessageBody, PendingOtpInvite, UiAction, UiState, VoiceTarget, render,
+    DELIVERY_ARROW, DeliveryStatus, Focus, IdentityCase, MessageBody, PendingOtpInvite, UiAction,
+    UiState, VoiceTarget, render,
 };
 use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::Terminal;
@@ -54,6 +56,7 @@ fn opening_dm_from_sidebar_and_sending_a_message() {
             recipient_key_mode,
             recipient_pubkey_der,
             log_index,
+            msg_id: _,
         } => {
             assert_eq!(to, UserId(2));
             assert_eq!(plaintext, "just us");
@@ -862,11 +865,11 @@ fn push_outgoing_dm_returns_the_index_the_entry_landed_at() {
     state.focus = Focus::Sidebar;
     press(&mut state, KeyCode::Enter); // opens (and so creates) bob's room
     assert_eq!(
-        state.push_outgoing_dm(UserId(2), MessageBody::Text("one".into())),
+        state.push_outgoing_dm(UserId(2), MessageBody::Text("one".into()), None),
         Some(0)
     );
     assert_eq!(
-        state.push_outgoing_dm(UserId(2), MessageBody::Text("two".into())),
+        state.push_outgoing_dm(UserId(2), MessageBody::Text("two".into()), None),
         Some(1)
     );
     assert_eq!(state.private_rooms[&UserId(2)].log.len(), 2);
@@ -874,7 +877,7 @@ fn push_outgoing_dm_returns_the_index_the_entry_landed_at() {
     // No room exists yet for a peer nothing has been sent to or received
     // from - nothing to return an index into.
     assert_eq!(
-        state.push_outgoing_dm(UserId(3), MessageBody::Text("nobody".into())),
+        state.push_outgoing_dm(UserId(3), MessageBody::Text("nobody".into()), None),
         None
     );
 }
@@ -886,10 +889,10 @@ fn mark_dm_message_failed_flags_only_the_targeted_row() {
     state.focus = Focus::Sidebar;
     press(&mut state, KeyCode::Enter); // opens (and so creates) bob's room
     let first = state
-        .push_outgoing_dm(UserId(2), MessageBody::Text("ok".into()))
+        .push_outgoing_dm(UserId(2), MessageBody::Text("ok".into()), None)
         .unwrap();
     let second = state
-        .push_outgoing_dm(UserId(2), MessageBody::Text("will fail".into()))
+        .push_outgoing_dm(UserId(2), MessageBody::Text("will fail".into()), None)
         .unwrap();
 
     state.mark_dm_message_failed(UserId(2), second);
@@ -918,7 +921,7 @@ fn a_failed_message_is_rendered_in_red() {
     press(&mut state, KeyCode::Enter); // opens (and so creates) bob's room
     state.mark_otp_active(UserId(2));
     let index = state
-        .push_outgoing_dm(UserId(2), MessageBody::Text("never arrived".into()))
+        .push_outgoing_dm(UserId(2), MessageBody::Text("never arrived".into()), None)
         .unwrap();
     state.mark_dm_message_failed(UserId(2), index);
 
@@ -941,7 +944,7 @@ fn a_successful_message_is_not_rendered_in_red() {
     state.focus = Focus::Sidebar;
     press(&mut state, KeyCode::Enter); // opens (and so creates) bob's room
     state
-        .push_outgoing_dm(UserId(2), MessageBody::Text("arrived fine".into()))
+        .push_outgoing_dm(UserId(2), MessageBody::Text("arrived fine".into()), None)
         .unwrap();
 
     let backend = TestBackend::new(100, 15);
@@ -1294,4 +1297,90 @@ fn the_private_room_view_draws_the_same_top_row() {
     assert!(rows[HEADER_TEXT_ROW].contains("general"), "{rows:?}");
     assert!(rows[HEADER_TEXT_ROW].contains("bob"), "{rows:?}");
     assert!(rows[HEADER_TEXT_ROW].contains("Ctrl+H: Help"), "{rows:?}");
+}
+
+// ---------------------------------------------------------------------
+// Delivery acknowledgments (US-041)
+// ---------------------------------------------------------------------
+
+/// Opens bob's room and sends one text through the real compose path, so
+/// the row and the action agree on the same `msg_id` - which is the whole
+/// mechanism (docs/PROTOCOL.md 7.2.1).
+fn send_dm_to_bob(text: &str) -> (UiState, u64) {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.focus = Focus::Sidebar;
+    press(&mut state, KeyCode::Enter); // opens bob's room
+    state.focus = Focus::Input;
+    type_str(&mut state, text);
+    let action = press(&mut state, KeyCode::Enter).expect("a send was produced");
+    let msg_id = match action {
+        UiAction::SendDirectText { msg_id, .. } => msg_id,
+        other => panic!("expected SendDirectText, got {other:?}"),
+    };
+    (state, msg_id)
+}
+
+/// @requirement AC-230
+#[test]
+fn a_sent_direct_message_starts_undelivered_and_turns_delivered() {
+    let (mut state, msg_id) = send_dm_to_bob("did you get this");
+    let status = |s: &UiState| s.private_rooms[&UserId(2)].log[0].delivery_status();
+
+    assert_eq!(
+        status(&state),
+        Some(DeliveryStatus::None),
+        "a message nobody has acknowledged yet is undelivered"
+    );
+    state.mark_delivered(UserId(2), msg_id, ReceiptStage::Decrypted);
+    assert_eq!(
+        status(&state),
+        Some(DeliveryStatus::All),
+        "a DM has one recipient, so their acknowledgement is the whole of it"
+    );
+}
+
+/// @requirement AC-230
+#[test]
+fn the_arrow_is_coloured_by_how_far_the_message_has_got() {
+    let (mut state, msg_id) = send_dm_to_bob("did you get this");
+
+    let arrow_fg = |s: &UiState| {
+        let backend = TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, s)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let (x, y) = find_text_start(&buffer, DELIVERY_ARROW);
+        buffer[(x, y)].fg
+    };
+
+    assert_eq!(
+        arrow_fg(&state),
+        DeliveryStatus::None.color(),
+        "the arrow starts in the not-yet colour"
+    );
+    state.mark_delivered(UserId(2), msg_id, ReceiptStage::Decrypted);
+    assert_eq!(
+        arrow_fg(&state),
+        DeliveryStatus::All.color(),
+        "and turns to the delivered colour once the recipient acknowledges it"
+    );
+}
+
+/// The shield marks the *content* as OTP-wrapped, so it stays at the very
+/// start of the row - the arrow is about delivery and belongs where the
+/// separator always was.
+/// @requirement AC-230
+#[test]
+fn the_shield_prefix_stays_at_the_start_of_the_row() {
+    let (mut state, _) = send_dm_to_bob("under the pad");
+    state.mark_otp_active(UserId(2));
+
+    // Ordering rather than exact columns: the shield is a wide glyph with
+    // a variation selector, so per-cell reconstruction is only reliable
+    // for relative position (see `appears_before`'s doc).
+    let rows = rendered_rows(&state);
+    assert!(
+        appears_before(&rows, "\u{1F6E1}", DELIVERY_ARROW),
+        "the shield opens the row; the arrow separates the nickname from the text: {rows:?}"
+    );
 }

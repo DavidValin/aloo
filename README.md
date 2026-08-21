@@ -22,6 +22,7 @@ Just you, your terminal, and the people you're talking to.
 - 🔇 **Mute one person's voice** — stop one person's clips playing themselves, without blocking them or losing anything.
 - 📞 **Live voice calls** — continuous, multi-user calls with a roster, per-person voice meters and host mute — distinct from a walkie-talkie clip.
 - 💬 **Text chat** — type and hit Enter, just like any chat app.
+- ✅ **Delivery acknowledgments** — the arrow in `you -> message` says how far it got: grey, orange, green. `i` shows who has it, and who has heard or saved it.
 - 📎 **File transfer, with consent** — a built-in file browser, and nothing moves until the recipient accepts. No size cap.
 - 📢 **Public channels** — join what the server advertises; new ones appear live, no reconnect.
 - 🔒 **Private channels** — unadvertised, joined by name, optionally password-protected.
@@ -101,6 +102,22 @@ dropdown left alone folds itself away after 30 seconds.
 | Key | What it does |
 |---|---|
 | type + `Enter` | Send to the current channel or DM (compose bar focused) |
+| `i` | Details of the selected message: when it was sent, and who has it (message log focused) |
+
+**Did it get there?** A message you sent reads `you -> message`, and the
+arrow says how far it has got: **grey** while nobody has it, **green** once
+everyone it was addressed to has, and **orange** in a channel while only
+some do. Voice messages and file transfers carry it too. A message that
+reached nobody is struck through. Messages from other people read
+`them: message` — they arrived here by definition.
+
+Green means their app decrypted it, not that a person read it. Grey is not
+a failure: something still being punched through is re-sent by itself and
+turns green when it lands.
+
+Press `i` for the details — when it was sent, then each recipient with
+`-> UNDELIVERED`, `-> DELIVERED`, or, once they have actually heard a voice
+message or saved a file, `-> DELIVERED+LISTENED` / `-> DELIVERED+SAVED`.
 
 ### Voice messages
 

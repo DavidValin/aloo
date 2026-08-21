@@ -20,6 +20,7 @@ async fn send_requested(w: &mut AlooWorld, body: String, a: String, b: String) {
             channel,
             plaintext,
             recipients,
+            msg_id: _,
         } => {
             assert_eq!(channel, "general");
             assert_eq!(plaintext, &body);
@@ -104,6 +105,7 @@ async fn dm_send_requested(w: &mut AlooWorld, body: String, name: String) {
             recipient_key_mode: _,
             recipient_pubkey_der,
             log_index: _,
+            msg_id: _,
         } => {
             assert_eq!(*to, want);
             assert_eq!(plaintext, &body);

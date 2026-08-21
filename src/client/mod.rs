@@ -2,6 +2,7 @@ pub mod channel;
 pub mod connect;
 pub mod daemon;
 pub mod daemon_ipc;
+pub mod delivery;
 pub mod device_id;
 pub mod direct_message;
 pub mod envelope;

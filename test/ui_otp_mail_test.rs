@@ -679,7 +679,7 @@ fn the_reader_plays_voice_parts_and_saves_attachments() {
     // mixer action, and Escape while it plays stops the playback rather
     // than closing anything.
     match press(&mut state, KeyCode::Enter) {
-        Some(UiAction::ReplayVoice { duration_ms: 700, pcm }) => assert_eq!(pcm, vec![3u8; 64]),
+        Some(UiAction::ReplayVoice { duration_ms: 700, pcm, .. }) => assert_eq!(pcm, vec![3u8; 64]),
         other => panic!("expected ReplayVoice, got {other:?}"),
     }
     assert!(state.replaying);
@@ -714,7 +714,7 @@ fn enter_plays_a_voice_attachment_and_esc_stops_it() {
     press(&mut state, KeyCode::Tab); // Attachments
 
     match press(&mut state, KeyCode::Enter) {
-        Some(UiAction::ReplayVoice { duration_ms: 700, pcm }) => assert_eq!(pcm, vec![3u8; 64]),
+        Some(UiAction::ReplayVoice { duration_ms: 700, pcm, .. }) => assert_eq!(pcm, vec![3u8; 64]),
         other => panic!("expected ReplayVoice, got {other:?}"),
     }
     assert!(state.replaying);

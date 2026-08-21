@@ -57,6 +57,7 @@ falling back to a server relay (§7.1).
     - [7.1.4 Showing which peers are actually reachable](#714-showing-which-peers-are-actually-reachable)
     - [7.1.5 Punching with no server at all](#715-punching-with-no-server-at-all)
   - [7.2 Sending a channel or direct text message](#72-sending-a-channel-or-direct-text-message)
+    - [7.2.1 Delivery acknowledgment](#721-delivery-acknowledgment)
   - [7.3 Voice streaming](#73-voice-streaming)
   - [7.4 `Error { message: String }`](#74-error-message-string)
   - [7.5 `RotateKey` / `KeyRotated` - per-peer key rotation relay](#75-rotatekey-keyrotated---per-peer-key-rotation-relay)
@@ -207,6 +208,7 @@ the payload carried inside a reliable or unreliable one.
 | Peer payload | Carried | Purpose |
 |---|---|---|
 | `Envelope` | reliably | One text message, channel or direct (§7.2) |
+| `DeliveryReceipt` | reliably | Says a named message was decrypted here, and later that it was saved or played (§7.2.1) |
 | `FileOffer` | reliably | Offers a file; nothing is sent until accepted (§7.6) |
 | `FileAccept` / `FileReject` | reliably | The recipient's decision (§7.6) |
 | `FileChunk` / `FileEnd` | reliably | The file itself, once accepted (§7.6) |
@@ -1190,9 +1192,17 @@ from zero when a link is re-punched, which they can do safely because
 neither can transmit on the new link until both have entered the new
 attempt.
 
-This is deliberately minimal - no congestion control, no selective-repeat,
-no cumulative acks - since it operates at chat-message/file-chunk
-granularity, not bulk throughput.
+This is deliberately minimal - no congestion control and no
+selective-repeat - since it operates at chat-message/file-chunk
+granularity, not bulk throughput. The one thing it is not minimal about is
+what an ack means: an ack names the frontier the receiver has *delivered
+in order*, not the highest `seq` that happened to arrive, so a frame still
+sitting behind a gap in the reorder buffer repeats the old frontier and
+retires nothing. That is what keeps the in-flight window tied to delivery
+rather than to arrival. Note what it still does not say: an ack means a
+datagram reached the peer's client, never that the peer could read what
+was inside it - which is why delivery is reported separately, by the
+recipient itself (§7.2.1).
 
 **Datagram size.** A `Reliable`/`Unreliable` frame is one raw UDP datagram
 - there's no length-prefixed framing to split an oversized payload across
@@ -1496,6 +1506,75 @@ progress - contrast with voice, §7.3). `channel: Some(name)` is a channel
 message; `None` is a DM. A sender is expected to address every other
 current member of the channel itself - there is no server-side membership
 list to expand or validate against anymore.
+
+#### 7.2.1 Delivery acknowledgment
+
+A sender may want to know that a message it sent actually got through to
+the people it was addressed to. The reliable layer's own ack (§7.1.1) is
+*not* that answer: it says a datagram arrived and was handed to the peer's
+client, which says nothing about whether the peer could make sense of it.
+Delivery is therefore a claim only the recipient can make, and it makes it
+explicitly.
+
+A sender names its message by putting a `msg_id` on what it sends -
+`Envelope`, `OtpEnvelope`, `FileOffer`, `OtpFileOffer`, `StreamStart` or
+`OtpVoiceOffer`. The id is the sender's own; nobody else interprets it,
+and it is echoed back untouched. Omitting it asks for no receipt.
+
+The recipient answers with `DeliveryReceipt { msg_id, stage }` **once it
+has decrypted the content**, and never before. A message that arrives but
+cannot be decrypted is deliberately left unacknowledged; its sender goes on
+showing it as undelivered, which is the truth.
+
+There are two stages, because for a voice message or a file the
+interesting moment comes after decryption - being able to read a file
+offer is not the same as having the file, and decoding audio is not the
+same as having heard it:
+
+| Content | `Decrypted` | `Consumed` |
+|---|---|---|
+| text | the envelope opened | *(never - there is nothing further to do)* |
+| file transfer | the **offer** opened, so the recipient knows what is being sent | the whole file has arrived and been written to disk |
+| voice message | the stream ended having produced decrypted audio | that audio was actually played |
+
+`Consumed` may come long after `Decrypted`, or never: a file offer may be
+rejected or its transfer fail part way, and audio decoded while its sender
+was muted sits unheard until the recipient replays it - which is exactly
+when the receipt is sent. Either way, `Consumed` implies `Decrypted`; a
+sender receiving them out of order (a re-punch can reorder anything) must
+treat the stronger one as covering the weaker.
+
+A message decrypted but withheld from the user pending a trust decision
+(§12) still counts as `Decrypted`: the gate decides whether to show it, not
+whether it made sense.
+
+The properties that follow:
+
+- **It is per recipient.** A channel send is one independently-addressed
+  message per member (§7.2), each with its own link and its own receipt,
+  so a channel message is delivered to *some* of its recipients long
+  before it is delivered to all of them. A sender is expected to
+  distinguish the three cases - none, some, all - and a direct message,
+  having exactly one recipient, only ever has two of them.
+- **It survives the link.** A receipt is sent reliably like any other
+  content, and the message it answers is itself queued and re-sent across
+  a re-punch (§7.1.1). A message therefore turns delivered late rather
+  than never, however many attempts either direction took.
+- **It is not a read receipt.** `Decrypted` says the recipient's client
+  could read the message, not that a human has. `Consumed` says what their
+  client did with it - wrote the file, played the audio - which for a voice
+  message is as close to "they heard it" as a protocol can honestly get,
+  and still says nothing about whether anyone was listening.
+- **It does not survive a restart.** A `msg_id` names something in the
+  sender's own running state; a sender that stops has nothing left to
+  attribute an incoming receipt to, and a message left undelivered at that
+  point stays that way.
+
+This is a different acknowledgment from `OtpDeliveryAck` (§16.2), which
+answers a different question: that one is about the one-time pad's gate -
+whether the sender may spend the next pad slot - and is keyed by the pad
+sequence rather than by a message. Both are sent for an OTP-wrapped text
+message, and neither substitutes for the other.
 
 ### 7.3 Voice streaming
 
