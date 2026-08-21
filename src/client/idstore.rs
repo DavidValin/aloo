@@ -27,8 +27,10 @@ use std::fs;
 use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::crypto::{hex_decode, hex_encode};
+use crate::proto::KeyMode;
 use crate::validation::is_storable;
 
 /// `~/.aloo/ids_store` (`crate::platform::aloo_dir`) - only ever a
@@ -104,11 +106,53 @@ struct Entry {
     /// an `Accept`) has no address yet.
     last_addr: Option<SocketAddr>,
     last_device_id: Option<String>,
+    /// Wall-clock time this pin was last confirmed reachable, stamped
+    /// alongside `last_addr`/`last_device_id` by `set_last_seen` - a
+    /// contacts list (`client::tui::contacts`) has no other source for
+    /// "last seen" that survives a restart, since `presence::Presence` is
+    /// derived live from the current session's link state and answers
+    /// nothing about a contact who isn't connected right now.
+    last_seen_unix: Option<u64>,
+    /// Which `KeyMode` this nickname was last pinned under - recorded
+    /// alongside every `check_and_pin`/`check_and_pin_with` call
+    /// (`session::check_identity`/`AcceptIdentity`) purely for display
+    /// (the contacts list's encryption column); pinning itself never reads
+    /// it back. `None` for an entry pinned before this field existed, or
+    /// one hand-edited without it.
+    key_mode: Option<KeyMode>,
+}
+
+/// Current wall-clock time as Unix seconds - `0` on a clock that reports
+/// before the epoch, which never happens on a real system and isn't worth
+/// failing a save over.
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn key_mode_as_str(mode: KeyMode) -> &'static str {
+    match mode {
+        KeyMode::Password => "password",
+        KeyMode::None => "none",
+        KeyMode::PqHybrid => "pqhybrid",
+    }
+}
+
+fn parse_key_mode(s: &str) -> Option<KeyMode> {
+    match s {
+        "password" => Some(KeyMode::Password),
+        "none" => Some(KeyMode::None),
+        "pqhybrid" => Some(KeyMode::PqHybrid),
+        _ => None,
+    }
 }
 
 /// A nickname -> full-public-key pinning store, backed by a small flat file
 /// (`nickname<TAB><hex-encoded DER><TAB><trust><TAB><last addr><TAB><last
-/// device id>` per line, the last two columns optionally empty).
+/// device id><TAB><last seen unix><TAB><key mode>` per line, every column
+/// from `last addr` on optionally empty).
 pub struct IdStore {
     path: PathBuf,
     entries: HashMap<String, Entry>,
@@ -157,6 +201,11 @@ impl IdStore {
                         .filter(|s| !s.is_empty())
                         .and_then(|s| s.parse().ok());
                     let last_device_id = fields.next().filter(|s| !s.is_empty()).map(str::to_string);
+                    let last_seen_unix = fields
+                        .next()
+                        .filter(|s| !s.is_empty())
+                        .and_then(|s| s.parse().ok());
+                    let key_mode = fields.next().and_then(parse_key_mode);
                     if is_storable(name)
                         && let Some(der) = hex_decode(hex)
                     {
@@ -167,6 +216,8 @@ impl IdStore {
                                 trust,
                                 last_addr,
                                 last_device_id,
+                                last_seen_unix,
+                                key_mode,
                             },
                         );
                     }
@@ -215,9 +266,16 @@ impl IdStore {
         // wiping it back to `None` - that metadata describes the
         // relationship, not any one key, and `set_last_seen` is what
         // actually refreshes it once the new key's own link goes Active.
-        let (last_addr, last_device_id) = previous
+        let (last_addr, last_device_id, last_seen_unix, key_mode) = previous
             .as_ref()
-            .map(|prev| (prev.last_addr, prev.last_device_id.clone()))
+            .map(|prev| {
+                (
+                    prev.last_addr,
+                    prev.last_device_id.clone(),
+                    prev.last_seen_unix,
+                    prev.key_mode,
+                )
+            })
             .unwrap_or_default();
         self.entries.insert(
             nickname.to_string(),
@@ -226,6 +284,8 @@ impl IdStore {
                 trust,
                 last_addr,
                 last_device_id,
+                last_seen_unix,
+                key_mode,
             },
         );
         match previous {
@@ -262,6 +322,48 @@ impl IdStore {
         self.entries.get(nickname).map(|e| e.key.as_slice())
     }
 
+    /// Records which `KeyMode` `nickname` was last pinned under - see
+    /// `Entry::key_mode`'s doc. A no-op if `nickname` isn't pinned at all
+    /// (nothing to attach this to yet), same guard `set_last_seen` uses.
+    pub fn set_key_mode(&mut self, nickname: &str, key_mode: KeyMode) {
+        if let Some(entry) = self.entries.get_mut(nickname) {
+            entry.key_mode = Some(key_mode);
+        }
+    }
+
+    /// Which `KeyMode` `nickname` was last pinned under, if known - `None`
+    /// for an unpinned nickname or an entry written before this field
+    /// existed.
+    pub fn key_mode(&self, nickname: &str) -> Option<KeyMode> {
+        self.entries.get(nickname)?.key_mode
+    }
+
+    /// Wall-clock time `nickname`'s pin was last confirmed reachable, as
+    /// Unix seconds - see `Entry::last_seen_unix`'s doc. `None` if that has
+    /// never happened (or `nickname` isn't pinned).
+    pub fn last_seen_unix(&self, nickname: &str) -> Option<u64> {
+        self.entries.get(nickname)?.last_seen_unix
+    }
+
+    /// Every pinned nickname, sorted - the contacts list's row order
+    /// (`client::tui::contacts`), and the same order `save` already writes
+    /// the file in.
+    pub fn nicknames(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.entries.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
+    /// Forgets `nickname` entirely - "delete contact" in the contacts
+    /// list. Returns whether there was anything to forget. Never touches
+    /// anything outside this store: a contact's OTP keychain entry (if
+    /// any) is a separate deletion the caller drives itself
+    /// (`otp_cli::remove_contact`/`otp_store::forget`), since this store
+    /// has no idea whether one exists.
+    pub fn remove(&mut self, nickname: &str) -> bool {
+        self.entries.remove(nickname).is_some()
+    }
+
     /// Persists the current entries to `path`, creating parent directories
     /// if needed (e.g. `~/.aloo/` on first run). Entries are written in
     /// sorted order so the file diffs cleanly if the user inspects it, each
@@ -291,6 +393,14 @@ impl IdStore {
             out.push('\t');
             if let Some(id) = &entry.last_device_id {
                 out.push_str(id);
+            }
+            out.push('\t');
+            if let Some(seen) = entry.last_seen_unix {
+                out.push_str(&seen.to_string());
+            }
+            out.push('\t');
+            if let Some(mode) = entry.key_mode {
+                out.push_str(key_mode_as_str(mode));
             }
             out.push('\n');
         }
@@ -329,5 +439,6 @@ impl IdStore {
         if is_storable(device_id) {
             entry.last_device_id = Some(device_id.to_string());
         }
+        entry.last_seen_unix = Some(now_unix());
     }
 }

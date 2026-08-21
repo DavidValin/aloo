@@ -1,5 +1,6 @@
 pub mod channel;
 pub mod connect;
+pub mod contacts;
 pub mod daemon;
 pub mod daemon_ipc;
 pub mod delivery;

@@ -146,7 +146,10 @@ fn sidebar_up_down_wraps_selection() {
     let mut state = joined_general_with(vec![user(2, "bob"), user(3, "carol")]);
     state.focus = Focus::Sidebar;
     press(&mut state, KeyCode::Up);
-    assert_eq!(state.sidebar_selected, 1); // wraps to last
+    // Wraps to the last row, which is always our own synthetic "(me)" row
+    // appended after every real member (`channel::render_sidebar`) - here,
+    // index 2 (bob=0, carol=1, own row=2).
+    assert_eq!(state.sidebar_selected, 2);
     press(&mut state, KeyCode::Down);
     assert_eq!(state.sidebar_selected, 0);
 }

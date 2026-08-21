@@ -216,10 +216,11 @@ fn on_disk_format_is_hex_encoded_not_raw_or_base64() {
     let contents = std::fs::read_to_string(&path).unwrap();
     // Third column is how much the pin is worth (docs/PROTOCOL.md 12.6) -
     // a fresh sighting is trusted-on-first-use until a human says more.
-    // The two trailing (empty) columns are last-seen address/device id
-    // (docs/PROTOCOL.md 12.7) - absent until this pin's key has gone
-    // `Active` over the direct link at least once.
-    assert_eq!(contents, "alice\tdeadbeef\ttofu\t\t\n");
+    // The four trailing (empty) columns are last-seen address/device id
+    // (docs/PROTOCOL.md 12.7) and last-seen-unix/key-mode (the contacts
+    // list) - all absent until this pin's key has gone `Active` over the
+    // direct link at least once, or been recorded via `set_key_mode`.
+    assert_eq!(contents, "alice\tdeadbeef\ttofu\t\t\t\t\n");
     std::fs::remove_file(&path).ok();
 }
 
@@ -320,4 +321,146 @@ fn re_pinning_on_accept_keeps_the_previously_recorded_last_seen() {
     store.check_and_pin("alice", b"key-b");
     assert_eq!(store.last_addr("alice"), Some(addr));
     assert_eq!(store.last_device_id("alice"), Some("alice-device"));
+}
+
+// ---------------------------------------------------------------------
+// Last-seen wall-clock time / key mode (the contacts list)
+// ---------------------------------------------------------------------
+
+#[test]
+fn key_mode_is_none_until_set() {
+    let path = temp_store_path();
+    let mut store = IdStore::load(&path).unwrap();
+    store.check_and_pin("alice", b"key-a");
+    assert_eq!(store.key_mode("alice"), None);
+}
+
+#[test]
+fn set_key_mode_records_it_for_a_pinned_nickname() {
+    let path = temp_store_path();
+    let mut store = IdStore::load(&path).unwrap();
+    store.check_and_pin("alice", b"key-a");
+    store.set_key_mode("alice", aloo::proto::KeyMode::PqHybrid);
+    assert_eq!(store.key_mode("alice"), Some(aloo::proto::KeyMode::PqHybrid));
+}
+
+#[test]
+fn set_key_mode_is_a_no_op_for_an_unpinned_nickname() {
+    let path = temp_store_path();
+    let mut store = IdStore::load(&path).unwrap();
+    store.set_key_mode("nobody", aloo::proto::KeyMode::PqHybrid);
+    assert_eq!(store.key_mode("nobody"), None);
+}
+
+#[test]
+fn set_last_seen_stamps_a_wall_clock_time() {
+    let path = temp_store_path();
+    let mut store = IdStore::load(&path).unwrap();
+    store.check_and_pin("alice", b"key-a");
+    assert_eq!(store.last_seen_unix("alice"), None);
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let addr: SocketAddr = "203.0.113.7:9999".parse().unwrap();
+    store.set_last_seen("alice", addr, "alice-device");
+    let after = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let seen = store.last_seen_unix("alice").expect("stamped by set_last_seen");
+    assert!(seen >= before && seen <= after, "{seen} not in [{before}, {after}]");
+}
+
+#[test]
+fn key_mode_and_last_seen_survive_a_save_and_load_round_trip() {
+    let path = temp_store_path();
+    let addr: SocketAddr = "[::1]:4242".parse().unwrap();
+    {
+        let mut store = IdStore::load(&path).unwrap();
+        store.check_and_pin("alice", b"key-a");
+        store.set_key_mode("alice", aloo::proto::KeyMode::Password);
+        store.set_last_seen("alice", addr, "alice-device");
+        store.save().unwrap();
+    }
+    let store = IdStore::load(&path).unwrap();
+    assert_eq!(store.key_mode("alice"), Some(aloo::proto::KeyMode::Password));
+    assert!(store.last_seen_unix("alice").is_some());
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn a_store_without_last_seen_unix_or_key_mode_columns_still_loads() {
+    let path = temp_store_path();
+    // A file saved before these two fields existed - only through
+    // last_device_id.
+    std::fs::write(&path, "alice\t6b65792d61\ttofu\t\t\n").unwrap();
+    let store = IdStore::load(&path).expect("must still load");
+    assert_eq!(store.get("alice"), Some(b"key-a".as_slice()));
+    assert_eq!(store.last_seen_unix("alice"), None);
+    assert_eq!(store.key_mode("alice"), None);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn re_pinning_keeps_the_previously_recorded_key_mode_and_last_seen() {
+    let path = temp_store_path();
+    let mut store = IdStore::load(&path).unwrap();
+    store.check_and_pin("alice", b"key-a");
+    store.set_key_mode("alice", aloo::proto::KeyMode::PqHybrid);
+    let addr: SocketAddr = "203.0.113.7:9999".parse().unwrap();
+    store.set_last_seen("alice", addr, "alice-device");
+    store.check_and_pin("alice", b"key-b");
+    assert_eq!(store.key_mode("alice"), Some(aloo::proto::KeyMode::PqHybrid));
+    assert!(store.last_seen_unix("alice").is_some());
+}
+
+#[test]
+fn nicknames_lists_every_pinned_contact_sorted() {
+    let path = temp_store_path();
+    let mut store = IdStore::load(&path).unwrap();
+    store.check_and_pin("carol", b"key-c");
+    store.check_and_pin("alice", b"key-a");
+    store.check_and_pin("bob", b"key-b");
+    assert_eq!(store.nicknames(), vec!["alice", "bob", "carol"]);
+}
+
+#[test]
+fn nicknames_is_empty_for_a_fresh_store() {
+    let path = temp_store_path();
+    let store = IdStore::load(&path).unwrap();
+    assert!(store.nicknames().is_empty());
+}
+
+#[test]
+fn remove_forgets_a_pinned_contact_and_reports_it_removed_something() {
+    let path = temp_store_path();
+    let mut store = IdStore::load(&path).unwrap();
+    store.check_and_pin("alice", b"key-a");
+    assert!(store.remove("alice"));
+    assert_eq!(store.get("alice"), None);
+    assert_eq!(store.check_and_pin("alice", b"key-a"), IdCheck::New);
+}
+
+#[test]
+fn remove_on_an_unknown_nickname_reports_nothing_removed() {
+    let path = temp_store_path();
+    let mut store = IdStore::load(&path).unwrap();
+    assert!(!store.remove("nobody"));
+}
+
+#[test]
+fn remove_persists_across_a_save_and_load_round_trip() {
+    let path = temp_store_path();
+    {
+        let mut store = IdStore::load(&path).unwrap();
+        store.check_and_pin("alice", b"key-a");
+        store.check_and_pin("bob", b"key-b");
+        store.remove("alice");
+        store.save().unwrap();
+    }
+    let store = IdStore::load(&path).unwrap();
+    assert_eq!(store.get("alice"), None);
+    assert_eq!(store.get("bob"), Some(b"key-b".as_slice()));
+    std::fs::remove_file(&path).ok();
 }

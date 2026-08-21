@@ -948,6 +948,66 @@ fn sidebar_renders_an_offline_member_in_gray_instead_of_green() {
     );
 }
 
+// ---------------------------------------------------------------------
+// The own user's row (always last, never a real DM target)
+// ---------------------------------------------------------------------
+
+/// Our own row is appended after every real member, named plainly and
+/// suffixed `(me)` in gray - the suffix's colour never following whatever
+/// colour the name itself renders in.
+#[test]
+fn sidebar_lists_the_own_user_last_with_a_gray_me_suffix() {
+    let state = joined_general_with(vec![user(2, "bob"), user(3, "carol")]);
+    let backend = TestBackend::new(160, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| render(f, &state)).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+
+    let (nx, ny) = find_text_start_below(&buffer, "me (me)", HEADER_ROW_HEIGHT);
+    // "me (me)": own name at [0..2), the gray " (me)" suffix from [2..7).
+    assert_eq!(
+        buffer[(nx, ny)].fg,
+        ratatui::style::Color::Green,
+        "own name renders reachable-green (you are always reachable to yourself)"
+    );
+    assert_eq!(
+        buffer[(nx + 3, ny)].fg,
+        ratatui::style::Color::DarkGray,
+        "the (me) suffix is always gray regardless of the name's own colour"
+    );
+
+    // It comes after both real members, not before or between them.
+    let rows = popup_body(&buffer, "Users");
+    let bob_row = rows.iter().position(|r| r.contains("bob")).unwrap();
+    let carol_row = rows.iter().position(|r| r.contains("carol")).unwrap();
+    let me_row = rows.iter().position(|r| r.contains("(me)")).unwrap();
+    assert!(me_row > bob_row && me_row > carol_row);
+}
+
+/// Enter on the own row must never open a "DM with yourself" - it is the
+/// last sidebar index (`channel.members.len()`), one past every real
+/// member.
+#[test]
+fn enter_on_the_own_row_does_not_open_a_dm() {
+    let mut state = joined_general_with(vec![user(2, "bob"), user(3, "carol")]);
+    state.focus = Focus::Sidebar;
+    state.sidebar_selected = 2; // one past bob (0) and carol (1)
+    let action = press(&mut state, KeyCode::Enter);
+    assert!(action.is_none());
+    assert_eq!(state.active_private_room, None);
+}
+
+/// A channel with nobody else in it still shows our own row - it is never
+/// swallowed by the "waiting for direct peers" placeholder, which is about
+/// there being no real member yet, not about the sidebar being visually
+/// empty.
+#[test]
+fn the_own_row_still_shows_with_no_other_members() {
+    let state = joined_general_with(vec![]);
+    let rows = rendered_rows(&state);
+    assert!(rows.iter().any(|r| r.contains("(me)")));
+}
+
 /// The sidebar's colour is the state of the *direct link* to each person,
 /// not merely their presence on the server (AC-135): someone can be
 /// perfectly online and completely unreachable, which is exactly the case

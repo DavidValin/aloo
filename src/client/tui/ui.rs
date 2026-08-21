@@ -386,6 +386,14 @@ const HELP_BODY: &[HelpLine] = &[
          while unresolved; Reject saves nothing and isn't permanent - select them again \
          to reconsider. Path set in the connect popup's id_store field.",
     ),
+    HelpLine::Item {
+        keys: "/contacts",
+        text: "every pinned nickname, its last-seen time, its encryption method, and - if \
+               it has one - its OTP pad's live Seq/Offset/remaining-MB in each direction. \
+               'd' deletes a contact (its OTP key too, if any); 'o' installs an OTP key \
+               manually, from files you already generated with the real 'otp' command, \
+               without going through /otp's handshake; 'r' refreshes.",
+    },
     HelpLine::Blank,
     HelpLine::Note(
         "All local state (id_store, settings, the OTP keychain) lives under ~/.aloo by \
@@ -974,6 +982,10 @@ pub enum Mode {
     /// `crate::client::tui::file_send`. Data lives in `UiState::file_send`, not
     /// here, same split `JoinPrivatePopup`/`join_popup_input` already use.
     FileSend,
+    /// The `/contacts` modal is open - see `crate::client::tui::contacts`.
+    /// Data lives in `UiState::contacts`, same split as `FileSend`/
+    /// `file_send`.
+    Contacts,
 }
 
 /// Which field is focused inside the Ctrl+J popup - Tab/BackTab cycles.
@@ -1512,6 +1524,30 @@ pub enum UiAction {
         nickname: String,
         muted: bool,
     },
+    /// The `/contacts` command - gathers every pinned identity
+    /// (`idstore.rs`) merged with its live OTP keychain state, if any
+    /// (`client::contacts::gather_contact_rows`), and hands the rows to
+    /// the modal `open_contacts` already opened empty.
+    OpenContacts,
+    /// `r` on the contacts modal - re-runs the same gather, e.g. after the
+    /// remaining OTP key has moved since it was last opened.
+    RefreshContacts,
+    /// The user confirmed "delete contact" on the contacts modal - forgets
+    /// `nickname`'s identity pin outright, and its OTP keychain entry too
+    /// if it has one (`client::contacts::handle_delete`).
+    DeleteContact {
+        nickname: String,
+    },
+    /// The user confirmed "Install OTP key" on the contacts modal, having
+    /// picked both key files with its own file browser - runs
+    /// `otp --add-contact` against them directly
+    /// (`client::contacts::handle_install_otp_key`), the manual
+    /// counterpart to `/otp`'s handshake-driven provisioning.
+    InstallOtpKey {
+        nickname: String,
+        enc_path: std::path::PathBuf,
+        dec_path: std::path::PathBuf,
+    },
     /// `/daemon`: stop drawing and hand this session back to the
     /// background, leaving every connection, link and key exactly as they
     /// are (docs/SPEC.md "Running in background mode").
@@ -1683,6 +1719,12 @@ pub struct UiState {
     /// directory after `start_file_send` opens one at the process's real
     /// current directory (see that struct's tests).
     pub file_send: Option<super::file_send::FileSendState>,
+    /// The `/contacts` modal's state, while `mode == Mode::Contacts` - see
+    /// `crate::client::tui::contacts`. `pub`, not `pub(crate)`, same
+    /// reasoning as `file_send`: a test opening the "Install OTP key"
+    /// sub-popup needs to overwrite its file browser with a deterministic
+    /// temp directory.
+    pub contacts: Option<super::contacts::ContactsState>,
     /// Every incoming file offer currently awaiting a decision, keyed by
     /// `(from, stream_id)` - the popup always shows whichever's at the
     /// front of `file_offer_queue`. Analogous to `identity_reviews`/
@@ -1985,6 +2027,7 @@ impl UiState {
             channel_password_input: String::new(),
             channel_password_error: None,
             file_send: None,
+            contacts: None,
             file_row_of_stream: HashMap::new(),
             file_rows: HashMap::new(),
             file_offers: HashMap::new(),
@@ -3882,6 +3925,9 @@ impl UiState {
         if self.mode == Mode::FileSend {
             return self.handle_file_send_key(code);
         }
+        if self.mode == Mode::Contacts {
+            return self.handle_contacts_key(code);
+        }
 
         // The top row's two selectors (`docs/SPEC.md` "Connected UI"):
         // `[` walks left, `]` walks right, and the outermost press on
@@ -4496,6 +4542,16 @@ impl UiState {
             self.open_channels_popup();
             return None;
         }
+        if self.input.trim() == "/contacts" {
+            // The one way to see every pinned identity (`idstore.rs`) -
+            // unlike `/otp`/`/file`/`/endotp` above, this is never scoped
+            // to an open DM room: a contacts list is precisely the roster
+            // of people the app knows about *without* requiring one to be
+            // reachable, or even a room to be open, right now.
+            self.input.clear();
+            self.open_contacts();
+            return Some(UiAction::OpenContacts);
+        }
         if self.input.trim() == "/leave" {
             // Always the currently selected channel tab - `/leave` takes
             // no argument. A no-op if that tab isn't actually joined yet
@@ -4754,24 +4810,33 @@ impl UiState {
         }))
     }
 
+    /// The last index (`channel.members.len()`) is always our own row
+    /// (`channel::render_sidebar`'s synthetic "you" entry, appended after
+    /// every real member rather than folded into `channel.members`
+    /// itself), so every index below it is a real member at exactly the
+    /// same index it already had.
     fn handle_sidebar_key(&mut self, code: KeyCode) -> Option<UiAction> {
         let channel = self.channels.get(self.selected_channel)?;
-        let len = channel.members.len();
+        // +1 for our own row, always present and always last.
+        let len = channel.members.len() + 1;
         match code {
             KeyCode::Up => {
-                if len > 0 {
-                    self.sidebar_selected = (self.sidebar_selected + len - 1) % len;
-                }
+                self.sidebar_selected = (self.sidebar_selected + len - 1) % len;
                 None
             }
             KeyCode::Down => {
-                if len > 0 {
-                    self.sidebar_selected = (self.sidebar_selected + 1) % len;
-                }
+                self.sidebar_selected = (self.sidebar_selected + 1) % len;
                 None
             }
             KeyCode::Enter => {
-                let member = channel.members.get(self.sidebar_selected)?.clone();
+                let Some(member) = channel.members.get(self.sidebar_selected) else {
+                    // Our own row - nothing to open a DM with.
+                    return None;
+                };
+                let member = member.clone();
+                // Belt and braces: real members are never supposed to
+                // include our own id, but Enter must still never open a
+                // "DM" with ourselves if one somehow did.
                 if Some(member.id) == self.own_id {
                     return None;
                 }
@@ -5317,6 +5382,9 @@ pub fn render(frame: &mut Frame, state: &UiState) {
     }
     if state.mode == Mode::FileSend {
         super::file_send::render_file_send_popup(frame, area, state);
+    }
+    if state.mode == Mode::Contacts {
+        super::contacts::render_contacts_popup(frame, area, state);
     }
     // One message's delivery details, drawn under the help overlay and
     // every consent popup for the same reason `handle_key` lets those

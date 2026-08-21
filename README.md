@@ -362,6 +362,26 @@ Nicknames aren't proof of identity — anyone could reconnect as "alice" the mom
 
 This only applies to identity types that actually stay the same across reconnects (`Password`, `PQ-Hybrid`) — the `None` type has no persistent identity to pin in the first place, so there's nothing to compare.
 
+### Managing contacts: `/contacts`
+
+`/contacts` opens the full list of everyone you've ever pinned — nickname, when they were last seen, how they're encrypted, and, for anyone you also share a one-time pad with, that pad's live `seq offset remaining-MB` figures in each direction, the same figures the `/otp` session header shows.
+
+| Key | What it does |
+|---|---|
+| `Up` / `Down` | Move the selection |
+| `d` | Delete the selected contact — forgets their pin, and their OTP key too if they have one (confirms first) |
+| `o` | Install an OTP key for the selected contact, from files you generated yourself |
+| `r` | Refresh the list (e.g. after the remaining key has moved) |
+| `Esc` | Close |
+
+**Installing a key manually** is the alternative to `/otp`'s own handshake: generate a pair yourself with the real `otp` command —
+
+```sh
+otp --new-key-pair <size_in_MB> <part_a_name> <part_b_name>
+```
+
+— send one party's keys to the other person out of band, keep the other party's for yourself, then press `o` on their contact row and point **encryption key** at your own sending half and **decryption key** at your own receiving half. Both sides need their matching keys installed before messaging — a mismatch decrypts to garbage, not an error, so double-check which half went where.
+
 ## Advanced use
 
 Two things most people will never need, and a few will need badly: reaching someone with no server involved, and running with no server at all.

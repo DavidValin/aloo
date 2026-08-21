@@ -1234,6 +1234,9 @@ async fn handle_ui_action(
                 session
                     .id_store
                     .check_and_pin(&review.nickname, &new_public_key_der);
+                if let Some(key_mode) = ui_state.known_users.get(&peer).map(|u| u.key_mode) {
+                    session.id_store.set_key_mode(&review.nickname, key_mode);
+                }
                 // The address/device id this connection was actually
                 // reviewed under (docs/PROTOCOL.md §12.7) - known by now,
                 // since the review was only ever revealed once punching
@@ -1379,6 +1382,22 @@ async fn handle_ui_action(
         }
         UiAction::SetVoiceMuted { nickname, muted } => {
             set_voice_muted(ui_state, &nickname, muted);
+        }
+        UiAction::OpenContacts | UiAction::RefreshContacts => {
+            crate::client::contacts::handle_open(session, ui_state).await;
+        }
+        UiAction::DeleteContact { nickname } => {
+            crate::client::contacts::handle_delete(session, ui_state, nickname).await;
+        }
+        UiAction::InstallOtpKey {
+            nickname,
+            enc_path,
+            dec_path,
+        } => {
+            crate::client::contacts::handle_install_otp_key(
+                session, ui_state, nickname, enc_path, dec_path,
+            )
+            .await;
         }
         UiAction::Detach => {
             // Intercepted by `run_connected_session`'s input arm, which
@@ -2630,6 +2649,7 @@ fn check_identity(session: &mut SessionState, ui_state: &mut UiState, user: &Use
                     session
                         .id_store
                         .check_and_pin(&user.name, &user.public_key_der);
+                    session.id_store.set_key_mode(&user.name, user.key_mode);
                     if let Err(e) = session.id_store.save() {
                         crate::log_warn!("failed to save id_store: {e}");
                     }
@@ -2648,6 +2668,7 @@ fn check_identity(session: &mut SessionState, ui_state: &mut UiState, user: &Use
                     session
                         .id_store
                         .check_and_pin(&name, &user.public_key_der);
+                    session.id_store.set_key_mode(&name, user.key_mode);
                     if let Err(e) = session.id_store.save() {
                         crate::log_warn!("failed to save id_store: {e}");
                     }

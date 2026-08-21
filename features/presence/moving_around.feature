@@ -23,7 +23,7 @@ Feature: Moving around the connected screen
     And carol is in the channel with me
     And focus is on the sidebar
     When I press Up
-    Then the selected user is at position 1
+    Then the selected user is at position 2
     When I press Down
     Then the selected user is at position 0
 

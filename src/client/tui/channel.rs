@@ -1578,7 +1578,7 @@ fn render_sidebar(frame: &mut Frame, area: Rect, state: &UiState) {
     let Some(channel) = state.channels.get(state.selected_channel) else {
         return;
     };
-    let items: Vec<ListItem> = channel
+    let mut items: Vec<ListItem> = channel
         .members
         .iter()
         .enumerate()
@@ -1660,6 +1660,9 @@ fn render_sidebar(frame: &mut Frame, area: Rect, state: &UiState) {
     // says so by being blank; with none, it is a channel waiting to be
     // punched into - which is a state worth naming, since otherwise a
     // correctly-configured client that is merely early looks broken.
+    //
+    // Checked against the real roster, before our own row (always added
+    // below) would otherwise make this look non-empty.
     if items.is_empty() && state.serverless {
         frame.render_widget(
             Paragraph::new(WAITING_FOR_DIRECT_PEERS)
@@ -1669,6 +1672,28 @@ fn render_sidebar(frame: &mut Frame, area: Rect, state: &UiState) {
         );
         return;
     }
+    // Our own row, always last - so every real member keeps the same index
+    // it already had (what `handle_sidebar_key`, and every test that seeks
+    // a member by index, already assume). Not a real `UserInfo` (we have no
+    // direct link, encryption tag or presence to report about ourselves),
+    // so it is built here rather than folded into `channel.members` -
+    // `handle_sidebar_key`'s Enter arm treats this last index the same way,
+    // as a no-op rather than opening a DM with ourselves. The name is
+    // always green (`Presence::Reachable`'s colour) - you are always
+    // reachable to yourself - with `(me)` trailing in gray regardless, so
+    // it never reads as part of whatever colour the name itself happens to
+    // be.
+    let own_index = channel.members.len();
+    let mut own_style =
+        Style::default().fg(presence_color(crate::client::presence::Presence::Reachable));
+    if state.focus == super::ui::Focus::Sidebar && state.sidebar_selected == own_index {
+        own_style = own_style.add_modifier(Modifier::REVERSED);
+    }
+    let own_label = Line::from(vec![
+        Span::raw(state.own_name.clone()),
+        Span::styled(" (me)", Style::default().fg(Color::DarkGray)),
+    ]);
+    items.push(ListItem::new(own_label).style(own_style));
     frame.render_widget(List::new(items), inner);
 }
 

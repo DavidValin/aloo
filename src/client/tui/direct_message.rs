@@ -527,13 +527,16 @@ pub(crate) fn render_private_room(frame: &mut Frame, area: Rect, state: &UiState
 /// Below this many remaining bytes (0.5MB) a direction's key figure is
 /// rendered in red instead of green - the same "running low" line the pad
 /// itself has no concept of (it just refuses once truly empty), surfaced
-/// here so the user sees it coming.
-const OTP_KEY_LOW_THRESHOLD_BYTES: u64 = 512 * 1024;
+/// here so the user sees it coming. Also what the contacts list's own OTP
+/// columns use (`client::tui::contacts`), so a contact's remaining-key
+/// figure reads exactly the same everywhere it appears.
+pub(crate) const OTP_KEY_LOW_THRESHOLD_BYTES: u64 = 512 * 1024;
 
 /// `<seq> <offset> <remaining>MB` - `remaining` on its own since only that
 /// figure gets the red/green threshold color; `seq`/`offset` are always
-/// grey.
-fn push_otp_key_spans(spans: &mut Vec<Span<'static>>, seq: u64, offset: u64, remaining_bytes: u64) {
+/// grey. `pub(crate)` so the contacts list (`client::tui::contacts`) can
+/// render the exact same figures the same way.
+pub(crate) fn push_otp_key_spans(spans: &mut Vec<Span<'static>>, seq: u64, offset: u64, remaining_bytes: u64) {
     spans.push(Span::styled(
         format!("{seq} {offset} "),
         Style::default().fg(Color::Gray),

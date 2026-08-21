@@ -1,4 +1,5 @@
 pub mod channel;
+pub mod contacts;
 pub mod direct_message;
 pub mod file_send;
 pub mod otp_mail;
