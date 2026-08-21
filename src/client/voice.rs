@@ -378,10 +378,13 @@ impl Recorder {
     /// `on_stream_error` reports errors raised asynchronously by the audio
     /// callback (e.g. a buffer under/overrun, or the device disappearing
     /// mid-recording) once capture is already under way. These can't be
-    /// returned from `start` itself, and must not be `eprintln!`'d: cpal
-    /// invokes the callback from its own thread at any time, including
-    /// while ratatui has the terminal in raw/alternate-screen mode, so
-    /// writing straight to stderr corrupts the UI instead of being shown.
+    /// returned from `start` itself, and must not be written straight to
+    /// the terminal: cpal invokes the callback from its own thread at any
+    /// time, including while ratatui has the terminal in raw/alternate-screen
+    /// mode. This callback reports into the UI instead; anything in this
+    /// crate that has only a terminal to report to goes through
+    /// `crate::log_warn!`, which is silenced for exactly as long as the TUI
+    /// owns the screen.
     pub fn start(on_stream_error: impl Fn(String) + Send + 'static) -> Result<Self> {
         let host = cpal::default_host();
         let device = preferred_input_device(&host).ok_or(VoiceError::NoDevice)?;

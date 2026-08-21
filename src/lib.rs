@@ -1,6 +1,7 @@
 pub mod client;
 pub mod control;
 pub mod crypto;
+pub mod log;
 pub mod p2p_proto;
 pub mod platform;
 pub mod proto;

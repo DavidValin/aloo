@@ -326,6 +326,26 @@ pub struct Settings {
     /// One accumulating key per channel, like `muted_voice` and
     /// `direct_punch_to` above.
     pub direct_punch_channels: Vec<String>,
+    // -----------------------------------------------------------------
+    // The last connection made from the connect popup
+    // (`client::connect::run_client_inner`, docs/SPEC.md "Not connected UI")
+    //
+    // Written every time the popup is submitted, whether or not the
+    // connection then succeeds - these are "the values last used", not
+    // "the last connection that worked", the same rule the `.cache` file
+    // already follows for the keybundle paths beside them.
+    //
+    // The nickname has nowhere else to live: `.cache` is keyed by
+    // `(host, port)` and holds key files only, so it has no slot for the
+    // one field that is about the person rather than the server. Host and
+    // port sit here beside it rather than being read back out of `.cache`
+    // so that one file answers "what did this machine last connect as",
+    // which is also what a bare `aloo --daemon` needs
+    // (`client::daemon::DaemonConfig::resolve`).
+    // -----------------------------------------------------------------
+    pub connect_host: Option<String>,
+    pub connect_port: Option<u16>,
+    pub connect_nickname: Option<String>,
     /// `direct_punch_to` lines that would not parse, kept verbatim with the
     /// reason. A malformed line is skipped like any other unparseable
     /// setting, but skipping it *silently* would leave a typo'd nickname or
@@ -364,6 +384,9 @@ impl Default for Settings {
             direct_punch_port: DEFAULT_DIRECT_PUNCH_PORT,
             direct_punch_to: Vec::new(),
             direct_punch_channels: Vec::new(),
+            connect_host: None,
+            connect_port: None,
+            connect_nickname: None,
             direct_punch_invalid: Vec::new(),
         }
     }
@@ -519,6 +542,17 @@ impl Settings {
                 {
                     settings.direct_punch_channels.push(value.to_string());
                 }
+                "connect_host" if !value.is_empty() => {
+                    settings.connect_host = Some(value.to_string())
+                }
+                "connect_port" => {
+                    if let Ok(p) = value.parse::<u16>() {
+                        settings.connect_port = Some(p);
+                    }
+                }
+                "connect_nickname" if !value.is_empty() => {
+                    settings.connect_nickname = Some(value.to_string())
+                }
                 "direct_punch_to" => match DirectPunchTarget::parse(value) {
                     Ok(target) => settings.direct_punch_to.push(target),
                     Err(reason) => settings
@@ -620,6 +654,22 @@ impl Settings {
         for channel in &self.direct_punch_channels {
             contents.push_str(&format!("direct_punch_channel={channel}\n"));
         }
+        // Written by hand rather than through `optional` above: that
+        // closure holds a mutable borrow of `contents` for as long as it
+        // is alive, and everything between it and here writes directly.
+        for (key, value) in [
+            ("connect_host", &self.connect_host),
+            ("connect_nickname", &self.connect_nickname),
+        ] {
+            if let Some(value) = value
+                && crate::validation::is_storable(value)
+            {
+                contents.push_str(&format!("{key}={value}\n"));
+            }
+        }
+        if let Some(port) = self.connect_port {
+            contents.push_str(&format!("connect_port={port}\n"));
+        }
         fs::write(path, contents)
     }
 
@@ -686,17 +736,47 @@ impl Settings {
         }
     }
 
-    /// The daemon-key counterpart of `update_muted_voice`: applies `edit`
-    /// to what is on disk right now and writes it back.
+    /// The general form of `update_muted_voice`: applies `edit` to what is
+    /// on disk right now and writes that back, rather than serializing
+    /// whatever this process happens to hold.
     ///
     /// Same reasoning, and the same importance. A daemon persists its
-    /// resolved configuration at every start, and `/mute-voice` writes
-    /// this file mid-session - two writers on one file, where a
-    /// whole-struct save from either would silently revert the other.
-    pub fn update_daemon(path: &Path, edit: impl FnOnce(&mut Self)) -> io::Result<()> {
+    /// resolved configuration at every start, `/mute-voice` writes this
+    /// file mid-session, and a connect writes it again - several writers
+    /// on one file, where a whole-struct save from any of them would
+    /// silently revert the others.
+    pub fn update(path: &Path, edit: impl FnOnce(&mut Self)) -> io::Result<()> {
         let mut settings = Self::load_or_create(path)?;
         edit(&mut settings);
         settings.save(path)
+    }
+
+    /// Records what the connect popup was just submitted with, so the
+    /// next start proposes it again and a bare `aloo --daemon` can reuse
+    /// it (`client::daemon::DaemonConfig::resolve`).
+    ///
+    /// A merging write (`update`), and for the same reason: a daemon may
+    /// be running and writing its own keys to this file while a second
+    /// `aloo` is being connected in a terminal.
+    pub fn remember_connection(
+        path: &Path,
+        host: &str,
+        port: u16,
+        nickname: &str,
+    ) -> io::Result<()> {
+        Self::update(path, |s| {
+            // An empty host is what a `--no-server` start stands in for
+            // (`client::daemon::DaemonConfig::resolve`), not an address -
+            // recording it would leave the next start resolving a host
+            // that is not one.
+            if !host.is_empty() {
+                s.connect_host = Some(host.to_string());
+            }
+            s.connect_port = Some(port);
+            if !nickname.is_empty() {
+                s.connect_nickname = Some(nickname.to_string());
+            }
+        })
     }
 
     /// Applies `edit` to the *on-disk* muted-voice set and writes the file
@@ -704,14 +784,13 @@ impl Settings {
     /// `Settings`.
     ///
     /// This distinction is the whole point. `save` writes every field it
-    /// holds, which was safe while `~/.aloo/settings` was a cold file -
-    /// written from exactly one place (`main.rs`'s `--server` startup),
-    /// once, at launch. `/mute-voice` makes it a file mutated *during* a
-    /// session, and daemon mode means an `aloo` process is running
-    /// continuously, so a bare `save` here would let a mute silently
-    /// revert whatever `server_bind`/`server_port`/auth a concurrently
-    /// started `aloo --server` had just recorded - and vice versa. Reading
-    /// immediately before writing keeps each writer to its own keys.
+    /// holds, and this file has several writers going at once: a daemon
+    /// records its configuration at every start, a connect records what it
+    /// was submitted with, `/mute-voice` writes mid-session, and
+    /// `aloo --server` records its own bind/port/auth. A bare `save` from
+    /// any of them would silently revert whatever the others had just
+    /// recorded. Reading immediately before writing keeps each writer to
+    /// its own keys.
     ///
     /// Not atomic against a genuinely simultaneous writer (no lock file -
     /// that would be a heavier mechanism than a preferences file

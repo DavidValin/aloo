@@ -11,6 +11,7 @@ use aloo::client::connect::{
 };
 use aloo::client::connect::MyKeySelection;
 use aloo::client::tui::ui_connect_popup::{ConnectPopupState, MyKeyType};
+use aloo::settings::Settings;
 
 fn temp_path(label: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
@@ -226,7 +227,7 @@ fn prefill_connect_defaults_assigns_a_fresh_location_when_the_cache_is_empty() {
     let mut popup = ConnectPopupState::new();
     let original_host = popup.host.clone();
 
-    prefill_connect_defaults(&mut popup, &cache, &dir);
+    prefill_connect_defaults(&mut popup, &Settings::default(), &cache, &dir);
 
     assert_eq!(
         popup.host, original_host,
@@ -251,7 +252,7 @@ fn prefill_connect_defaults_restores_the_most_recent_cache_entry() {
     );
     let mut popup = ConnectPopupState::new();
 
-    prefill_connect_defaults(&mut popup, &cache, &dir);
+    prefill_connect_defaults(&mut popup, &Settings::default(), &cache, &dir);
 
     assert_eq!(popup.host, "chat.example.com");
     assert_eq!(popup.port, "6667");
@@ -358,4 +359,70 @@ fn resolver_order_within_ipv4_is_preserved() {
 fn a_host_that_resolves_to_nothing_yields_no_address() {
     use aloo::client::connect::prefer_ipv4;
     assert_eq!(prefer_ipv4(&[]), None);
+}
+
+/// The nickname has nowhere else to live: `.cache` is keyed by
+/// `(host, port)` and holds key files only, so it has no slot for the one
+/// field that is about the person rather than the server. Without
+/// `connect_nickname` every fresh start would propose `$USER` however
+/// often someone connected as somebody else.
+/// @requirement AC-240
+#[test]
+fn prefill_connect_defaults_restores_the_last_nickname_from_settings() {
+    let dir = temp_path("prefill-nick-dir");
+    let cache = ConnectCache::new_empty(temp_path("prefill-nick-cache"));
+    let settings = Settings {
+        connect_host: Some("chat.example.com".to_string()),
+        connect_port: Some(6667),
+        connect_nickname: Some("dave".to_string()),
+        ..Settings::default()
+    };
+    let mut popup = ConnectPopupState::new();
+
+    prefill_connect_defaults(&mut popup, &settings, &cache, &dir);
+
+    assert_eq!(popup.nickname, "dave");
+    assert_eq!(popup.host, "chat.example.com");
+    assert_eq!(popup.port, "6667");
+}
+
+/// Two stores answer the same question about the host and port, and the
+/// hand-editable one wins: `connect_host` is a deliberate answer, the
+/// cache is the older and less specific record. The keybundle paths still
+/// come from the cache, which is the only store that has them.
+/// @requirement AC-240
+#[test]
+fn settings_beat_the_cache_for_host_and_port_but_not_for_the_keybundle() {
+    let dir = temp_path("prefill-precedence-dir");
+    let mut cache = ConnectCache::new_empty(temp_path("prefill-precedence-cache"));
+    cache.record("cached.example.com", 1111, "/keys/ab12.pub", "/keys/ab12.priv");
+    let settings = Settings {
+        connect_host: Some("settings.example.com".to_string()),
+        connect_port: Some(2222),
+        ..Settings::default()
+    };
+    let mut popup = ConnectPopupState::new();
+
+    prefill_connect_defaults(&mut popup, &settings, &cache, &dir);
+
+    assert_eq!(popup.host, "settings.example.com");
+    assert_eq!(popup.port, "2222");
+    assert_eq!(popup.my_key.key_type, MyKeyType::PqHybrid);
+    assert_eq!(popup.my_key.file_pub, "/keys/ab12.pub");
+    assert_eq!(popup.my_key.file_priv, "/keys/ab12.priv");
+}
+
+/// Nothing recorded yet, so whatever the caller already put in the popup
+/// (`$USER`) stands.
+/// @requirement AC-240
+#[test]
+fn an_empty_settings_file_leaves_the_proposed_nickname_alone() {
+    let dir = temp_path("prefill-nonick-dir");
+    let cache = ConnectCache::new_empty(temp_path("prefill-nonick-cache"));
+    let mut popup = ConnectPopupState::new();
+    popup.nickname = "whoami".to_string();
+
+    prefill_connect_defaults(&mut popup, &Settings::default(), &cache, &dir);
+
+    assert_eq!(popup.nickname, "whoami");
 }

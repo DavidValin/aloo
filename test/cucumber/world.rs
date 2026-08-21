@@ -113,6 +113,11 @@ pub struct ClientState {
 #[derive(World, Default)]
 #[world(init = Self::default)]
 pub struct AlooWorld {
+    // -- diagnostics (US-042) ------------------------------------------
+    /// What the silenced sink had collected when a scenario last looked
+    /// (`log::take_collected`).
+    pub log_collected: Vec<String>,
+
     // -- connect popup -------------------------------------------------
     pub popup: Option<ConnectPopupState>,
     pub popup_error: Option<String>,

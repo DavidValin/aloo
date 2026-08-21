@@ -6,7 +6,9 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::style::Color;
 
-use aloo::client::connect::{MyKeySelection, ServerKeySelection};
+use aloo::client::connect::{
+    ConnectCache, MyKeySelection, ServerKeySelection, prefill_connect_defaults,
+};
 use aloo::client::file_browser::FileBrowserState;
 use aloo::client::tui::ui_connect_popup::{
     Action, ConnectPopupState, Field, FileBrowserTarget, KeyType, MyKeyType, NICKNAME_MAX_LEN,
@@ -460,4 +462,46 @@ async fn request_carries_none(w: &mut AlooWorld) {
     assert_eq!(req.host, "chat.example.com");
     assert_eq!(req.port, 6667);
     assert_eq!(req.nickname, "dave");
+}
+
+// ---------------------------------------------------------------------
+// The form comes back as whoever connected last (AC-240)
+// ---------------------------------------------------------------------
+
+/// The `connect_*` keys `Settings::remember_connection` wrote the last
+/// time this machine connected. Held on the world rather than written to
+/// a real file: `prefill_connect_defaults` takes the settings it prefills
+/// from, so a scenario has no reason to involve the filesystem.
+#[given(expr = "a settings file recording a connection as {string} to {string} port {int}")]
+async fn settings_record_connection(
+    w: &mut AlooWorld,
+    nickname: String,
+    host: String,
+    port: u16,
+) {
+    w.direct_settings = Some(aloo::settings::Settings {
+        connect_nickname: Some(nickname),
+        connect_host: Some(host),
+        connect_port: Some(port),
+        ..aloo::settings::Settings::default()
+    });
+}
+
+#[given("a settings file with no connection recorded")]
+async fn settings_record_nothing(w: &mut AlooWorld) {
+    w.direct_settings = Some(aloo::settings::Settings::default());
+}
+
+/// The client's own start (`connect::run_client_inner`): a fresh form
+/// proposing the local user, then prefilled from what this machine
+/// remembers.
+#[when("the connect form opens on that machine")]
+async fn form_opens_on_that_machine(w: &mut AlooWorld) {
+    let settings = w.direct_settings.clone().unwrap_or_default();
+    let mut popup = ConnectPopupState::new();
+    popup.nickname = "whoami".to_string();
+    let cache = ConnectCache::new_empty(w.temp_path("connect-prefill-cache"));
+    let dir = w.temp_path("connect-prefill-dir");
+    prefill_connect_defaults(&mut popup, &settings, &cache, &dir);
+    w.popup = Some(popup);
 }

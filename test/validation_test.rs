@@ -1,6 +1,6 @@
 use aloo::validation::{
     CHANNEL_NAME_MAX_LEN, CHANNEL_PASSWORD_MAX_LEN, CHANNEL_PASSWORD_SYMBOLS,
-    channel_name_is_valid, channel_password_is_valid,
+    channel_name_is_valid, channel_password_is_valid, normalize_channel_name,
 };
 
 /// @requirement AC-102, TB-150
@@ -80,4 +80,36 @@ fn channel_password_is_valid_rejects_over_the_length_cap() {
 #[test]
 fn channel_password_is_valid_accepts_empty() {
     assert!(channel_password_is_valid(""));
+}
+
+// ---------------------------------------------------------------------
+// The decorative `#` a channel is shown with
+// ---------------------------------------------------------------------
+
+/// @requirement AC-247
+#[test]
+fn normalize_channel_name_drops_a_leading_display_prefix() {
+    assert_eq!(normalize_channel_name("#general"), "general");
+    assert_eq!(normalize_channel_name("general"), "general");
+    assert_eq!(normalize_channel_name("  #general  "), "general");
+}
+
+/// Only the first one, and only one: `#` is not in the allowed charset, so
+/// anywhere else it is a genuine mistake that must still be refused rather
+/// than quietly deleted.
+/// @requirement AC-247
+#[test]
+fn normalize_channel_name_leaves_every_other_hash_alone() {
+    assert_eq!(normalize_channel_name("##general"), "#general");
+    assert!(!channel_name_is_valid(normalize_channel_name("##general")));
+    assert_eq!(normalize_channel_name("gen#eral"), "gen#eral");
+    assert!(!channel_name_is_valid(normalize_channel_name("gen#eral")));
+}
+
+/// The prefix is never part of a name, so it never reaches the server.
+/// @requirement AC-247
+#[test]
+fn a_normalized_name_is_one_the_server_accepts() {
+    assert!(channel_name_is_valid(normalize_channel_name("#general")));
+    assert!(!channel_name_is_valid("#general"));
 }

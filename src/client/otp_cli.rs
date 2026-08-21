@@ -484,6 +484,56 @@ fn parse_bytes_in_parens(s: &str) -> Option<u64> {
     inside.trim_end().strip_suffix("bytes)")?.trim().parse().ok()
 }
 
+/// Where `otp` keeps its keychain: `.keychain/` directly inside the
+/// working directory it is run from (README: "The keychain location is
+/// relative to the current working directory"), which for aloo is always
+/// `OtpCliConfig::working_dir`.
+pub fn keychain_dir(cfg: &OtpCliConfig) -> PathBuf {
+    cfg.working_dir.join(".keychain")
+}
+
+/// The two pad files one contact's `--encrypt`/`--decrypt` actually
+/// consume, as `(encryption, decryption)`. Named `<contact>_enc.key` and
+/// `<contact>_dec.key` inside `keychain_dir` - the layout `--add-contact`
+/// writes and every later operation reads, so this is the answer to "which
+/// key material was this message's" rather than a guess at it.
+pub fn contact_key_paths(cfg: &OtpCliConfig, contact: &str) -> (PathBuf, PathBuf) {
+    let dir = keychain_dir(cfg);
+    (
+        dir.join(format!("{contact}_enc.key")),
+        dir.join(format!("{contact}_dec.key")),
+    )
+}
+
+/// One peer's OTP session as the UI reads it: the live pad figures
+/// (`ContactDetail`), the contact name they belong to, and the two key
+/// files those figures index into.
+///
+/// The paths travel with the figures rather than being recomputed at
+/// render time because the UI layer has no `OtpCliConfig` - and because a
+/// message's details popup is reporting the key material *that message*
+/// was encrypted with, which is a fact about the moment it was sent, not
+/// about wherever the keychain happens to be pointed later.
+#[derive(Debug, Clone, Default)]
+pub struct OtpKeyStatus {
+    pub detail: ContactDetail,
+    pub contact_name: String,
+    pub enc_key_path: PathBuf,
+    pub dec_key_path: PathBuf,
+}
+
+impl OtpKeyStatus {
+    pub fn new(cfg: &OtpCliConfig, contact_name: &str, detail: ContactDetail) -> Self {
+        let (enc_key_path, dec_key_path) = contact_key_paths(cfg, contact_name);
+        Self {
+            detail,
+            contact_name: contact_name.to_string(),
+            enc_key_path,
+            dec_key_path,
+        }
+    }
+}
+
 /// `None` when the contact doesn't exist - see `parse_show_contact`'s doc
 /// for why that's read from the output, not the exit code.
 pub async fn show_contact(cfg: &OtpCliConfig, contact: &str) -> io::Result<Option<ContactDetail>> {

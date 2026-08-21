@@ -33,6 +33,18 @@ fn a_channel_password_may_itself_contain_commas() {
     assert_eq!(channel.password.as_deref(), Some("a,b"));
 }
 
+/// `--channels=#team` is the channel written the way the UI shows it; the
+/// `#` is decoration and never part of the name.
+/// @requirement AC-247
+#[test]
+fn a_channel_may_be_given_with_the_hash_it_is_shown_with() {
+    let channel = DaemonChannel::parse("#ops").unwrap();
+    assert_eq!(channel.name, "ops");
+    let with_password = DaemonChannel::parse("#ops:hunter2").unwrap();
+    assert_eq!(with_password.name, "ops");
+    assert_eq!(with_password.password.as_deref(), Some("hunter2"));
+}
+
 /// A comma is legal in a password, so it could never have separated
 /// items; a colon is legal in neither a name nor a password, so it can.
 /// @requirement TB-217
@@ -430,6 +442,72 @@ fn the_connect_cache_is_the_last_resort_before_defaults() {
             file_priv: "/keys/x.priv".into(),
         }
     );
+}
+
+/// What the connect screen last recorded (`Settings::remember_connection`)
+/// is consulted after the `daemon_*` keys and before the cache - which is
+/// what makes a first `--daemon` on a machine that has only ever been used
+/// interactively need no flags at all, including no `--nick`.
+/// @requirement AC-241
+#[test]
+fn the_last_interactive_connection_fills_in_what_no_daemon_start_ever_recorded() {
+    let settings = Settings {
+        connect_host: Some("connect.example".into()),
+        connect_port: Some(4444),
+        connect_nickname: Some("dave".into()),
+        ..Settings::default()
+    };
+
+    let config =
+        DaemonConfig::resolve(&DaemonFlags::default(), &settings, &empty_cache()).unwrap();
+
+    assert_eq!(config.host, "connect.example");
+    assert_eq!(config.port, 4444);
+    assert_eq!(config.nickname, "dave");
+}
+
+/// A previous daemon start's own record is the more specific of the two,
+/// and stays ahead of it.
+/// @requirement AC-241
+#[test]
+fn a_previous_daemon_start_still_beats_the_last_interactive_connection() {
+    let settings = Settings {
+        daemon_host: Some("daemon.example".into()),
+        daemon_port: Some(1111),
+        daemon_nickname: Some("from-daemon".into()),
+        connect_host: Some("connect.example".into()),
+        connect_port: Some(4444),
+        connect_nickname: Some("dave".into()),
+        ..Settings::default()
+    };
+
+    let config =
+        DaemonConfig::resolve(&DaemonFlags::default(), &settings, &empty_cache()).unwrap();
+
+    assert_eq!(config.host, "daemon.example");
+    assert_eq!(config.port, 1111);
+    assert_eq!(config.nickname, "from-daemon");
+}
+
+/// And a flag given this run still beats both.
+/// @requirement AC-241
+#[test]
+fn a_flag_beats_the_last_interactive_connection_too() {
+    let settings = Settings {
+        connect_host: Some("connect.example".into()),
+        connect_nickname: Some("dave".into()),
+        ..Settings::default()
+    };
+
+    let flags = DaemonFlags {
+        host: Some("flag.example".into()),
+        nickname: Some("from-flag".into()),
+        ..Default::default()
+    };
+    let config = DaemonConfig::resolve(&flags, &settings, &empty_cache()).unwrap();
+
+    assert_eq!(config.host, "flag.example");
+    assert_eq!(config.nickname, "from-flag");
 }
 
 /// With nothing anywhere there is no sensible guess, and silently picking

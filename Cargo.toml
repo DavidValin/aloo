@@ -183,6 +183,10 @@ name = "settings_test"
 path = "test/settings_test.rs"
 
 [[test]]
+name = "log_test"
+path = "test/log_test.rs"
+
+[[test]]
 name = "global_ptt_test"
 path = "test/global_ptt_test.rs"
 

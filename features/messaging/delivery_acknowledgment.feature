@@ -189,3 +189,22 @@ Feature: Knowing whether the message you sent got there
     Given alice and bob each list the other for direct punching every minute
     And their scheduled link is up
     Then a message alice sends without naming it is never acknowledged
+
+  @AC-242
+  Scenario: The details popup says how the message was encrypted
+    Given I am connected and viewing a channel
+    And bob is in the channel with me
+    And I have opened a private room with bob
+    And focus is on the compose
+    When I type "hello"
+    And I press Enter
+    And I open the details of my last message
+    Then the details name the encryption scheme by its mechanism
+    And the details name the key it was sealed to
+
+  @AC-242
+  Scenario: A line this client wrote itself reports no encryption
+    Given I am connected and viewing a channel
+    When carol joins the channel with me
+    And I open the details of my last message
+    Then the details report no encryption at all

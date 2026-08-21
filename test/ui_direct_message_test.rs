@@ -6,8 +6,8 @@ use aloo::client::p2p::LinkStatus;
 use aloo::p2p_proto::ReceiptStage;
 use aloo::proto::{KeyMode, UserId};
 use aloo::client::tui::ui::{
-    DELIVERY_ARROW, DeliveryStatus, Focus, IdentityCase, MessageBody, PendingOtpInvite, UiAction,
-    UiState, VoiceTarget, render,
+    DELIVERY_ARROW, DeliveryStatus, Focus, IdentityCase, MessageBody, OTP_ICON, PendingOtpInvite,
+    UiAction, UiState, VoiceTarget, render,
 };
 use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::Terminal;
@@ -731,7 +731,7 @@ fn endotp_outside_any_open_dm_room_is_a_no_op() {
 
 /// @requirement AC-141
 #[test]
-fn messages_in_an_otp_active_dm_get_the_shield_prefix_but_system_lines_never_do() {
+fn messages_in_an_otp_active_dm_get_the_pad_prefix_but_system_lines_never_do() {
     let mut state = joined_general_with(vec![pq_hybrid_user(2, "bob")]);
     state.active_private_room = Some(UserId(2));
     state.mark_otp_active(UserId(2));
@@ -740,34 +740,38 @@ fn messages_in_an_otp_active_dm_get_the_shield_prefix_but_system_lines_never_do(
 
     let rows = rendered_rows(&state);
     assert!(
-        appears_before(&rows, "\u{1F6E1}", "bob: hello under the pad"),
-        "a real message in an OTP-active DM should carry the shield prefix: {rows:?}"
+        appears_before(&rows, OTP_ICON, "bob: hello under the pad"),
+        "a real message in an OTP-active DM should carry the pad prefix: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|r| r.contains("bob: hello under the pad") && r.contains('\u{1F6E1}')),
+        "and not the shield, which is pq_hybrid's own tag: {rows:?}"
     );
     assert!(
         !rows.iter().any(|r| {
             let Some(system_at) = r.find("OTP session started at now") else {
                 return false;
             };
-            r[..system_at].contains('\u{1F6E1}')
+            r[..system_at].contains(OTP_ICON)
         }),
-        "an app system line must never itself get the shield prefix: {rows:?}"
+        "an app system line must never itself get the pad prefix: {rows:?}"
     );
 }
 
 /// @requirement AC-141
 #[test]
-fn messages_in_a_dm_without_an_active_otp_session_get_no_shield() {
+fn messages_in_a_dm_without_an_active_otp_session_get_no_pad_marker() {
     let mut state = joined_general_with(vec![pq_hybrid_user(2, "bob")]);
     state.active_private_room = Some(UserId(2));
     state.on_direct_message(UserId(2), "bob".into(), MessageBody::Text("plain hello".into()));
 
     // Checked against the message row specifically, not the whole screen -
-    // the room title itself already carries a shield glyph as bob's
-    // pq_hybrid tag (`KeyMode::format_with_name`), unrelated to this one.
+    // the room title carries bob's own pq_hybrid tag
+    // (`KeyMode::format_with_name`), which is a different marker entirely.
     let rows = rendered_rows(&state);
     assert!(
-        !rows.iter().any(|r| r.contains("bob: plain hello") && r.contains('\u{1F6E1}')),
-        "no shield should appear without an active OTP session: {rows:?}"
+        !rows.iter().any(|r| r.contains("bob: plain hello") && r.contains(OTP_ICON)),
+        "no pad marker should appear without an active OTP session: {rows:?}"
     );
 }
 
@@ -795,14 +799,14 @@ fn the_otp_header_shows_the_highlighted_title_and_yellow_nickname() {
     state.mark_otp_active(UserId(2));
     state.set_otp_key_status(
         UserId(2),
-        ContactDetail {
+        otp_status(ContactDetail {
             enc_sequence: 3,
             enc_offset: 300,
             enc_key_remaining: 2_000_000,
             dec_sequence: 5,
             dec_offset: 500,
             dec_key_remaining: 2_000_000,
-        },
+        }),
     );
 
     let backend = TestBackend::new(100, 15);
@@ -837,14 +841,14 @@ fn the_otp_header_colors_remaining_key_red_below_the_threshold_and_green_at_or_a
     state.mark_otp_active(UserId(2));
     state.set_otp_key_status(
         UserId(2),
-        ContactDetail {
+        otp_status(ContactDetail {
             enc_sequence: 0,
             enc_offset: 0,
             enc_key_remaining: 100_000, // well under 0.5MB - red
             dec_sequence: 0,
             dec_offset: 0,
             dec_key_remaining: 5_000_000, // well over 0.5MB - green
-        },
+        }),
     );
 
     let backend = TestBackend::new(100, 15);
@@ -1036,8 +1040,8 @@ fn open_dm_with(state: &mut UiState, row: usize) {
 fn the_dm_selector_colours_its_peer_by_the_direct_link_to_them() {
     let cases = [
         (LinkStatus::Active, ratatui::style::Color::Green),
-        (LinkStatus::Connecting, ratatui::style::Color::Yellow),
-        (LinkStatus::Lost, ratatui::style::Color::Red),
+        (LinkStatus::Connecting, ratatui::style::Color::DarkGray),
+        (LinkStatus::Lost, ratatui::style::Color::DarkGray),
     ];
     for (link, expected) in cases {
         let mut state = joined_general_with(vec![user(2, "bob")]);
@@ -1375,12 +1379,217 @@ fn the_shield_prefix_stays_at_the_start_of_the_row() {
     let (mut state, _) = send_dm_to_bob("under the pad");
     state.mark_otp_active(UserId(2));
 
-    // Ordering rather than exact columns: the shield is a wide glyph with
-    // a variation selector, so per-cell reconstruction is only reliable
-    // for relative position (see `appears_before`'s doc).
+    // Ordering rather than exact columns: the pad marker is a wide glyph,
+    // so per-cell reconstruction is only reliable for relative position
+    // (see `appears_before`'s doc).
     let rows = rendered_rows(&state);
     assert!(
-        appears_before(&rows, "\u{1F6E1}", DELIVERY_ARROW),
-        "the shield opens the row; the arrow separates the nickname from the text: {rows:?}"
+        appears_before(&rows, OTP_ICON, DELIVERY_ARROW),
+        "the pad marker opens the row; the arrow separates the nickname from the text: {rows:?}"
     );
+}
+
+/// The envelope blinks right beside the nickname it belongs to, so it
+/// carries that nickname's own colour rather than the generic unread
+/// yellow: two colours on one name read as two separate facts about it
+/// instead of one person with unread messages
+/// (`docs/SPEC.md` "Connected UI").
+/// @requirement AC-239
+#[test]
+fn the_dm_selectors_unread_envelope_takes_the_peers_own_colour() {
+    let cases = [
+        (LinkStatus::Active, ratatui::style::Color::Green),
+        (LinkStatus::Connecting, ratatui::style::Color::DarkGray),
+        (LinkStatus::Lost, ratatui::style::Color::DarkGray),
+    ];
+    for (link, expected) in cases {
+        let mut state = joined_general_with(vec![user(2, "bob"), user(3, "carol")]);
+        open_dm_with(&mut state, 1); // reading carol's room
+        press(&mut state, KeyCode::Char('['));
+        state.set_link_status(UserId(3), link);
+        state.on_direct_message(UserId(2), "bob".into(), MessageBody::Text("psst".into()));
+        state.blink_on = true;
+
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, &state)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+
+        let (name_x, name_y) = find_text_start(&buffer, "carol");
+        let (envelope_x, envelope_y) = find_text_start(&buffer, "\u{2709}");
+        assert_eq!(
+            envelope_y as usize, HEADER_TEXT_ROW,
+            "the envelope under test is the one on the DM selector"
+        );
+        assert_eq!(
+            buffer[(envelope_x, envelope_y)].fg,
+            buffer[(name_x, name_y)].fg,
+            "the envelope must match the nickname it sits beside"
+        );
+        assert_eq!(
+            buffer[(envelope_x, envelope_y)].fg,
+            expected,
+            "a {link:?} link colours both {expected:?}"
+        );
+    }
+}
+
+/// The channel selector's envelope is plain white: a channel is a room,
+/// not a person, and has no reachability to say anything about.
+/// @requirement AC-239
+#[test]
+fn the_channel_selectors_envelope_is_plain_white() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.on_joined(aloo::proto::ChannelInfo {
+        name: "random".into(),
+        kind: aloo::proto::ChannelKind::Public,
+    });
+    // Back on `general`, so the message below lands in a channel that is
+    // not the one being read - which is what raises an envelope at all.
+    state.select_channel_at(0);
+    state.on_channel_message(
+        "random",
+        UserId(2),
+        "bob".into(),
+        MessageBody::Text("over here".into()),
+    );
+    assert!(state.any_channel_unread());
+    state.blink_on = true;
+
+    let backend = TestBackend::new(120, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| render(f, &state)).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+
+    let (x, y) = find_text_start(&buffer, "\u{2709}");
+    assert_eq!(y as usize, HEADER_TEXT_ROW);
+    assert_eq!(buffer[(x, y)].fg, ratatui::style::Color::White);
+}
+
+// ---------------------------------------------------------------------
+// One marker for a pad session, everywhere it applies (docs/SPEC.md
+// "Connected UI")
+// ---------------------------------------------------------------------
+
+/// A room under the pad is marked as such wherever it is named: on every
+/// message, on the DM selector, on its dropdown row, in the room's own
+/// title, and in the compose bar the next message is typed into.
+/// @requirement AC-246
+#[test]
+fn a_pad_session_marks_every_surface_of_the_room_it_is_with() {
+    let mut state = joined_general_with(vec![pq_hybrid_user(2, "bob"), pq_hybrid_user(3, "carol")]);
+    for row in [0, 1] {
+        state.focus = Focus::Sidebar;
+        state.sidebar_selected = row;
+        press(&mut state, KeyCode::Enter);
+    }
+    state.mark_otp_active(UserId(2));
+    state.mark_otp_active(UserId(3));
+    state.on_direct_message(UserId(2), "bob".into(), MessageBody::Text("under the pad".into()));
+    open_dm_with(&mut state, 0);
+    state.focus = Focus::Input;
+    type_str(&mut state, "typing");
+
+    let rows = rendered_rows(&state);
+    let row_with = |needle: &str| -> String {
+        rows.iter()
+            .find(|r| r.contains(needle))
+            .unwrap_or_else(|| panic!("no row contains {needle:?}: {rows:?}"))
+            .clone()
+    };
+
+    // The message itself, and the room's own title.
+    assert!(
+        appears_before(&rows, OTP_ICON, "bob: under the pad"),
+        "the pad marks the message: {rows:?}"
+    );
+    let title = row_with("Private: bob");
+    assert!(
+        title.contains("OTP") && !title.contains('\u{1F6E1}'),
+        "the title carries the pad tag, not the layer under it: {title:?}"
+    );
+    // The compose bar, before what is being typed.
+    let compose = row_with("typing");
+    assert!(
+        appears_before(std::slice::from_ref(&compose), OTP_ICON, "typing"),
+        "the bar says what will happen to the next message too: {compose:?}"
+    );
+    // The DM selector names bob; the dropdown row names carol.
+    assert!(
+        appears_before(&[rows[HEADER_TEXT_ROW].clone()], "bob", "OTP"),
+        "the DM selector: {:?}",
+        rows[HEADER_TEXT_ROW]
+    );
+    press(&mut state, KeyCode::Char(']'));
+    press(&mut state, KeyCode::Char(']'));
+    // Read inside the dropdown's own border: it overlays the room title,
+    // whose tag would otherwise be mistaken for the row's.
+    let dropdown = popup_body(&buffer_at(&state, 100, 30), "DMs");
+    let carol = dropdown
+        .iter()
+        .find(|r| r.contains("carol"))
+        .unwrap_or_else(|| panic!("no dropdown row for carol: {dropdown:?}"));
+    assert!(
+        appears_before(std::slice::from_ref(carol), "carol", "OTP"),
+        "and every other room under a pad carries it too: {carol:?}"
+    );
+}
+
+/// The compose bar is unmarked in a room with no session, so the marker
+/// means something when it is there.
+/// @requirement AC-246
+#[test]
+fn the_compose_bar_is_unmarked_without_a_pad_session() {
+    let mut state = joined_general_with(vec![pq_hybrid_user(2, "bob")]);
+    open_dm_with(&mut state, 0);
+    state.focus = Focus::Input;
+    type_str(&mut state, "typing");
+
+    let rows = rendered_rows(&state);
+    let compose = rows
+        .iter()
+        .find(|r| r.contains("typing"))
+        .expect("the compose bar");
+    assert!(!compose.contains(OTP_ICON), "{compose:?}");
+}
+
+/// Agreeing a session opens the room it is with: both sides just decided
+/// deliberately, and the conversation it was for is what they want next.
+/// @requirement AC-249
+#[test]
+fn agreeing_a_pad_session_opens_the_room_it_is_with() {
+    let mut state = joined_general_with(vec![pq_hybrid_user(2, "bob"), pq_hybrid_user(3, "carol")]);
+    // Reading carol's room when bob's session is agreed.
+    open_dm_with(&mut state, 1);
+    assert_eq!(state.active_private_room, Some(UserId(3)));
+
+    state.open_otp_session(UserId(2));
+
+    assert_eq!(
+        state.active_private_room,
+        Some(UserId(2)),
+        "the room the session is with is what is on screen"
+    );
+    assert_eq!(state.selected_dm, Some(UserId(2)), "and what the selector names");
+    assert!(state.is_otp_active(UserId(2)));
+    assert_eq!(state.focus, Focus::Input, "ready to type into it");
+}
+
+/// A session resumed because its peer reconnected is not a moment anyone
+/// asked for, so it must never take the view off whatever is being read.
+/// @requirement AC-249
+#[test]
+fn a_session_resumed_on_reconnect_does_not_steal_the_view() {
+    let mut state = joined_general_with(vec![pq_hybrid_user(2, "bob"), pq_hybrid_user(3, "carol")]);
+    open_dm_with(&mut state, 1);
+    assert_eq!(state.active_private_room, Some(UserId(3)));
+
+    state.mark_otp_active(UserId(2));
+
+    assert_eq!(
+        state.active_private_room,
+        Some(UserId(3)),
+        "resuming a session leaves the reader where they were"
+    );
+    assert!(state.is_otp_active(UserId(2)));
 }

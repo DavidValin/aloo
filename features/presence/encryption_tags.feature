@@ -30,3 +30,11 @@ Feature: Showing how each person's identity is protected
     And bob is in the channel with me using pq_hybrid
     When I open a private room with bob
     Then the private room title reads "Private: bob" with the pq_hybrid tag after the name
+
+  @AC-245
+  Scenario: The tags line up down the right edge of the user list
+    Given I am connected and viewing a channel
+    And dan is in the channel with me using password
+    And frank is in the channel with me using pq_hybrid
+    Then every tag in the user list ends on the sidebar's right edge
+    And every nickname still starts on its left

@@ -2348,11 +2348,11 @@ fn retry_delay(attempts: u32) -> Duration {
 /// One datagram out of the session's UDP socket, with the failures that
 /// actually mean something surfaced rather than dropped on the floor.
 ///
-/// Every send here used to be a bare `let _ = try_send_to(..)`. That is
-/// right for the two failures punching produces by design - a momentarily
-/// full send buffer, and the ICMP port-unreachable that comes back from
-/// probing a candidate address nobody is listening on - but it also
-/// silently swallowed the ones that mean a datagram can *never* leave:
+/// Discarding every error would be right for the two failures punching
+/// produces by design - a momentarily full send buffer, and the ICMP
+/// port-unreachable that comes back from probing a candidate address
+/// nobody is listening on - but it would also swallow the ones that mean
+/// a datagram can *never* leave:
 /// a payload past the maximum datagram size, or an address of the family
 /// this socket isn't bound to. Neither is recoverable and neither showed
 /// up anywhere, in a subsystem whose whole failure mode is "nothing
@@ -2373,8 +2373,8 @@ fn send_dgram(socket: &UdpSocket, bytes: &[u8], to: SocketAddr) {
     // that is not a reason to lose this one, so recover and carry on.
     let mut warned = warned.lock().unwrap_or_else(|e| e.into_inner());
     if warned.insert(e.kind()) {
-        eprintln!(
-            "aloo: direct-link UDP send to {to} failed ({e}) - {} byte datagram, \
+        crate::log_warn!(
+            "direct-link UDP send to {to} failed ({e}) - {} byte datagram, \
              suppressing further reports of this kind",
             bytes.len()
         );
@@ -2541,8 +2541,8 @@ fn warn_unusable_reflexive(observed: SocketAddr) {
         return;
     }
     *warned = true;
-    eprintln!(
-        "aloo: server STUN returned an unusable reflexive address ({observed}) - \
+    crate::log_warn!(
+        "server STUN returned an unusable reflexive address ({observed}) - \
          usually Docker UDP port publishing without host networking. \
          Cross-network hole punch will not work until the server's UDP rendezvous \
          sees clients' real public addresses (see docs/SERVER_ON_DOCKER.md)."
@@ -2574,8 +2574,8 @@ pub fn spawn_receive_loop(
                 // so log and keep listening - same "degrade, never take
                 // the session down" principle as every optional subsystem.
                 Err(e) => {
-                    eprintln!(
-                        "aloo: direct-link UDP receive error (ignoring, still listening): {e}"
+                    crate::log_warn!(
+                        "direct-link UDP receive error (ignoring, still listening): {e}"
                     );
                     // Safety net against a permanently-broken socket
                     // erroring instantly forever, which would busy-spin

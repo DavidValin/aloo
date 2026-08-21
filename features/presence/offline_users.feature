@@ -81,3 +81,16 @@ Feature: When someone's connection closes
     And bob is in the channel with me
     When bob goes offline
     Then bob stays offline even if a join for them arrives again
+
+  # A UserId is per-connection and never reused, so someone reconnecting
+  # arrives as a stranger by id. The nickname is what carries them across.
+  @AC-248
+  Scenario: Someone who comes back continues where they left off
+    Given I am connected and viewing a channel
+    And bob is in the channel with me
+    And bob has sent me the private message "before"
+    And bob has gone offline
+    When bob reconnects under a new id
+    Then bob is listed once in the channel
+    And the private room with bob still holds "before"
+    And bob is no longer offline

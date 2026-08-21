@@ -53,3 +53,21 @@ Feature: Starting aloo in the background
     Given no daemon settings and nothing in the connect cache
     When the daemon is started with --channels=not-a-name-because-it-is-far-too-long
     Then it refuses to start, saying "not a usable channel name"
+
+  # A first `aloo --daemon` on a machine that has only ever been used
+  # interactively needs no flags at all - not even --nick.
+  @AC-241
+  Scenario: A first daemon reuses the last connection made by hand
+    Given the connect screen last connected as "dave" to "chat.example.com" port 6667
+    When the daemon is started with no flags at all
+    Then it connects to "chat.example.com" on port 6667
+    And it connects as "dave"
+
+  @AC-241
+  Scenario: A previous daemon start still comes first
+    Given the connect screen last connected as "dave" to "chat.example.com" port 6667
+    And the settings file records the server "settings.example" on port 1111
+    And the settings file records the nickname "david"
+    When the daemon is started with no flags at all
+    Then it connects to "settings.example" on port 1111
+    And it connects as "david"

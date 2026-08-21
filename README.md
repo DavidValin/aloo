@@ -72,6 +72,8 @@ This opens a connect screen. Fill in the host/port, pick a nickname, and press C
 
 Your identity type is already set to `pq_hybrid` (PQ-Hybrid, see "Encryption" below) — no need to generate any keys yourself beforehand, aloo creates them automatically the first time you connect.
 
+aloo remembers the host, port and nickname you connected with and proposes them again next time, so connecting a second time is usually just pressing Connect. They live in `~/.aloo/settings` (`connect_host`, `connect_port`, `connect_nickname`) if you ever want to change them by hand — and they're also what a flag-free `aloo --daemon` falls back to (see "Running in the background").
+
 Nicknames are case-sensitive and must be free — if someone else is already connected with it, you'll be bumped back to this screen with an error, so just pick another one and try again. A nickname frees up the moment its holder disconnects — even an unclean disconnect (a crash, a lost network) is caught within 30 seconds, so a name is never stuck "in use" for good.
 
 **If the connection drops, aloo gets itself back.** Nothing about a lost server ends the session: your direct links to other people are peer-to-peer and carry on regardless. But the server is what everyone else's *user list* comes from, so aloo reconnects on its own — right away, then 5s, 10s, 20s and every 30s, for as long as it takes — and re-joins the channels you were in, so you reappear for everyone, including anyone who connected while you were away. The top-left of the header says where it is up to: 🟢 `Connected to server!`, 🔴 `Reconnecting...`, 🔴 `Reconnecting in 5s...`, or 🔴 `Server down (reconnecting in 20 sec...)`. Running with `--no-server` it reads ⚪ `No server mode` instead — there is nothing to reconnect to.
@@ -158,6 +160,9 @@ who has never connected. Never affects a live call.
 | `Ctrl+J` | Join or create by name: Public/Private with `Left`/`Right`, optional password |
 | `/leave` | Leave the selected channel — its tab disappears |
 
+Channels are shown as `#name`. The `#` is just how they're written — typing
+it back in (`#general`, `--channels=#team`) is fine, it's ignored.
+
 A public channel you've left stays in `/channels` to rejoin from. A private
 one needs its name (and password, if the creator set one).
 
@@ -240,7 +245,7 @@ aloo --daemon                 # connect and go to the background
 aloo --daemon --foreground    # same, but stay in this terminal
 ```
 
-It reuses whatever you last connected with, so once you've connected normally at least once, a bare `aloo --daemon` is usually all you need. Flags (`--host`, `--nickname`, `--channels`, …) override, and whatever it starts with is remembered for next time.
+It reuses whatever you last connected with — host, port and nickname included — so once you've connected normally at least once, a bare `aloo --daemon` is all you need: none of those are mandatory on the command line if aloo already knows them. Flags (`--host`, `--nick`, `--channels`, …) override, and whatever it starts with is remembered for next time.
 
 ```sh
 aloo --daemon-status          # is one running?
@@ -312,12 +317,13 @@ These are the exact tags aloo shows next to a person's name, so you always know 
 | 🚨 PLAIN | None | None | ❌ No |
 | 🚨 PWD | Password | Basic | ❌ No |
 | 🛡️ PQH | PQ-Hybrid | Ultra secure | ✅ Yes (as of today) |
+| 🔑 OTP | One-time pad over PQ-Hybrid | Perfect secrecy, while it lasts | ✅ Yes |
 
 Whichever identity type you and everyone else picks shows up as a little tag next to your name in the app, so it's always clear how a person's messages are being protected.
 
 > **Heads up about PQH:** since it's the default, most people you meet will be using it — but it only talks to its own kind. A `PQH` user can message anyone, but can only *be messaged by* another `PQH` user. If a friend on `PLAIN`/`PWD` can't seem to reach you, that's why — one of you needs to switch to `pq_hybrid` too.
 
-> **Going further with `/otp`:** on top of any `PQH` conversation, you can layer real one-time-pad encryption — perfect secrecy, the only cipher proven mathematically unbreakable when used correctly — for one DM at a time. It's not another identity type: nothing changes about your tag. Type `/otp` in a private message; if no shared pad exists for that contact yet, you're asked to either generate one and share it automatically over the already-encrypted `PQH` channel, or exchange it with them offline (run `otp` yourself and place the keys under `~/.aloo/otp/.keychain/`, then try `/otp` again) if you'd rather not send it over the network at all. Either way, the session only starts once your peer explicitly accepts too — from then on, every message in that room is additionally wrapped under the pad and shown with a 🛡️ prefix for as long as it stays active, and a 1-line header above the messages shows both directions' key position (sequence, offset, remaining MB) live, turning red per direction once it drops below 0.5MB. Each contact you do this with keeps its own independent pad — starting one with someone else never touches another's. Requires [otp-toolkit](https://github.com/DavidValin/otp-toolkit) installed — see the in-app help (`Ctrl+H`) for the full flow.
+> **Going further with `/otp`:** on top of any `PQH` conversation, you can layer real one-time-pad encryption — perfect secrecy, the only cipher proven mathematically unbreakable when used correctly — for one DM at a time. It's not another identity type — but while a session is on, that person's tag reads `🔑 OTP` instead of `🛡️ PQH`, in the user list, on the DM selector, on their dropdown row and in the room's own title, because the pad is what's actually protecting what you say to them. Type `/otp` in a private message; if no shared pad exists for that contact yet, you're asked to either generate one and share it automatically over the already-encrypted `PQH` channel, or exchange it with them offline (run `otp` yourself and place the keys under `~/.aloo/otp/.keychain/`, then try `/otp` again) if you'd rather not send it over the network at all. Either way, the session only starts once your peer explicitly accepts too — accepting opens that room for both of you; from then on, every message in it is additionally wrapped under the pad and shown with a 🔑 prefix — which also sits at the front of the compose bar, so you can see what's about to happen to what you're typing — and a 1-line header above the messages shows both directions' key position (sequence, offset, remaining MB) live, turning red per direction once it drops below 0.5MB. Each contact you do this with keeps its own independent pad — starting one with someone else never touches another's. Requires [otp-toolkit](https://github.com/DavidValin/otp-toolkit) installed — see the in-app help (`Ctrl+H`) for the full flow.
 >
 > **Ending it with `/endotp`:** either of you can end an active session unilaterally, no round trip needed — type `/endotp` in that room and your own copy of the pad is destroyed immediately, so it can never be spent again. The other side is told; if they're offline right now, aloo keeps trying every time you reconnect until they've genuinely heard, so ending a session with someone who's stepped away always still reaches them. Disconnecting and reconnecting, by either of you, never ends a session on its own — only `/endotp` does. While a session is active every DM with that person rides it — there's no way to drop back to a plain send in the meantime — but ending it never closes the conversation itself: the moment `/endotp` runs, DMs with that person go back to plain `PQH` immediately, same as before `/otp` was ever run.
 

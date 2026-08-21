@@ -277,11 +277,11 @@ fn pending_paths(dir: &Path) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
 /// "Enable OTP" action, never automatically.
 ///
 /// This side's own half is deliberately *not* added to the keychain here.
-/// It used to be, which meant an invitation that never arrived left this
-/// side holding one half of a pad the peer knew nothing about - and since
-/// `add_contact` refuses to overwrite, every later attempt under the same
-/// (fingerprint-derived, therefore identical) contact name hit that stale
-/// entry instead of fixing anything. See `commit_pending_setup`.
+/// Adding it would leave an invitation that never arrived holding one half
+/// of a pad the peer knows nothing about - and since `add_contact` refuses
+/// to overwrite, every later attempt under the same (fingerprint-derived,
+/// therefore identical) contact name would hit that stale entry instead of
+/// fixing anything. See `commit_pending_setup`.
 pub async fn initiate_provisioning(
     cfg: &OtpCliConfig,
     size_mb: u32,
@@ -899,10 +899,11 @@ pub(crate) fn on_key_setup(
     let Some(plaintext) =
         crate::client::session::decrypt_own_envelope(&envelope, from, sender, None, session)
     else {
-        // Previously silent - a genuinely lost/corrupted setup message and
-        // one that never arrived at all looked identical (nothing). Now
-        // at least the difference between "nothing arrived" and "something
-        // arrived but couldn't be opened" is visible.
+        // Said out loud rather than dropped: silently, a genuinely
+        // lost or corrupted setup message and one that never arrived at
+        // all look identical, and the difference between "nothing
+        // arrived" and "something arrived but could not be opened" is
+        // the whole of what a user can act on here.
         notify(
             ui_state,
             from,
@@ -1246,7 +1247,7 @@ pub(crate) async fn accept_invite(
     .await;
 
     if accepted {
-        ui_state.mark_otp_active(invite.from);
+        ui_state.open_otp_session(invite.from);
         refresh_otp_key_status(&session.otp_cli_cfg, ui_state, invite.from, &invite.contact_name).await;
         notify(
             ui_state,
@@ -1374,7 +1375,7 @@ pub(crate) async fn on_key_setup_ack(
         session.otp_store.clear_pending_setup(&ack.contact_name);
         session.otp_store.mark_provisioned(&ack.contact_name);
         let _ = session.otp_store.save();
-        ui_state.mark_otp_active(from);
+        ui_state.open_otp_session(from);
         refresh_otp_key_status(&session.otp_cli_cfg, ui_state, from, &ack.contact_name).await;
         notify(
             ui_state,
@@ -1787,7 +1788,7 @@ pub(crate) async fn refresh_otp_key_status(
     contact_name: &str,
 ) {
     if let Ok(Some(detail)) = otp_cli::show_contact(cfg, contact_name).await {
-        ui_state.set_otp_key_status(peer, detail);
+        ui_state.set_otp_key_status(peer, otp_cli::OtpKeyStatus::new(cfg, contact_name, detail));
     }
 }
 
@@ -1979,12 +1980,12 @@ pub(crate) async fn send_or_queue(
             },
         };
         session.otp_out_queue.enqueue(contact_name.to_string(), item);
-        // Previously silent: a message held back here looked identical to
-        // one that was simply never sent, with no way to tell them apart -
-        // this is exactly what made a genuinely stuck gate (e.g. stale
+        // Always surfaced, even though the common case (a fast, healthy
+        // round trip) clears almost immediately: held back silently, a
+        // message looks identical to one that was never sent, which is
+        // what would make a genuinely stuck gate (e.g. stale
         // pending_unacked_out_seq state) indistinguishable from things
-        // working. Always surfaced now, even though the common case (a
-        // fast, healthy round trip) clears almost immediately.
+        // working.
         let peer_name = peer_name_for(ui_state, to);
         notify(
             ui_state,
@@ -2371,6 +2372,12 @@ pub(crate) async fn on_message(
     if !session.otp_store.is_next_expected(&contact_name, seq) {
         return;
     }
+    // Taken *before* the decrypt spends this message's key bytes: the row
+    // logged below records which part of the pad was this message's, and
+    // `otp --show-contact` only ever reports where the pad has already
+    // got to (`UiState::message_crypto`). The post-spend refresh that
+    // keeps the room's own header live still happens, further down.
+    refresh_otp_key_status(&session.otp_cli_cfg, ui_state, from, &contact_name).await;
     let Some(pq_blob) = unwrap_incoming(&session.otp_cli_cfg, blob, &contact_name).await else {
         return;
     };
@@ -2378,7 +2385,6 @@ pub(crate) async fn on_message(
         return;
     }
     let _ = session.otp_store.save();
-    refresh_otp_key_status(&session.otp_cli_cfg, ui_state, from, &contact_name).await;
     let mut inner = envelope;
     inner.blocks = vec![pq_blob];
     if let Some(body) = crate::client::session::decrypt_envelope_for(
@@ -2392,6 +2398,7 @@ pub(crate) async fn on_message(
             Some(ch) => ui_state.on_channel_message(ch, from, from_name, body),
             None => ui_state.on_direct_message(from, from_name, body),
         }
+        refresh_otp_key_status(&session.otp_cli_cfg, ui_state, from, &contact_name).await;
         // Two acknowledgements, answering two different questions: the
         // receipt says this message was readable (7.2.1), the ack releases
         // this contact's pad gate for the next send (16.2).

@@ -113,10 +113,22 @@ Feature: Live voice calls
     Then the call modal is shown
 
   @AC-178
-  Scenario: END CALL in the modal leaves the call
+  Scenario: END CALL in the modal asks before it leaves the call
     Given I am connected and viewing a channel
     When I open a call in the channel
     And I press Enter
+    Then the end-call confirmation is open
+    And the call is still running
+    When I press Enter
+    Then the end-call confirmation is closed
+    And the call is still running
+
+  @AC-178
+  Scenario: Confirming the question is what leaves the call
+    Given I am connected and viewing a channel
+    When I open a call in the channel
+    And I press Enter
+    And I move onto END CALL and confirm
     Then ending the call is requested
 
   @AC-179

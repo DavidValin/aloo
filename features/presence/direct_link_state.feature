@@ -8,33 +8,35 @@ Feature: Seeing who I can actually reach
   Being connected to the server and being reachable are not the same thing:
   a peer can be perfectly present in the channel and still have no direct
   path to me, in which case nothing I send them arrives. The sidebar colours
-  each name by the state of the direct link, not by presence. See
-  docs/PROTOCOL.md 7.1 and docs/SPEC.md "Connected UI".
+  each name by the state of the direct link, not by presence - and by the
+  only part of it anyone typing needs: green once what is typed reaches
+  them, gray until it does. See docs/PROTOCOL.md 7.1 and docs/SPEC.md
+  "Connected UI".
 
   @AC-135
-  Scenario: A reachable peer is green and an unreachable one is red
+  Scenario: A reachable peer is green and an unreachable one is gray
     Given I am connected and viewing a channel
     And bob is in the channel with me
     And carol is in the channel with me
     And I have a direct connection to carol
     And the direct connection to bob has been lost
     Then carol's name is shown in green
-    And bob's name is shown in red
+    And bob's name is shown in gray
 
   @AC-135
-  Scenario: A peer whose link is still being punched is shown as neither
+  Scenario: A peer whose link is still being punched reads the same as one with none
     Given I am connected and viewing a channel
     And bob is in the channel with me
-    Then bob's name is shown in yellow
+    Then bob's name is shown in gray
 
   @AC-135
-  Scenario: Losing the link to someone still in the channel turns them red
+  Scenario: Losing the link to someone still in the channel turns them gray
     Given I am connected and viewing a channel
     And bob is in the channel with me
     And I have a direct connection to bob
     Then bob's name is shown in green
     When the direct connection to bob is lost
-    Then bob's name is shown in red
+    Then bob's name is shown in gray
 
   @AC-228
   Scenario: A closed connection outranks whatever the link was last doing
@@ -54,7 +56,7 @@ Feature: Seeing who I can actually reach
     And I have a direct connection to bob
     Then the DM selector shows bob in green
     When the direct connection to bob is lost
-    Then the DM selector shows bob in red
+    Then the DM selector shows bob in gray
 
   @AC-229
   Scenario: Every room the DM dropdown lists carries its peer's reachability

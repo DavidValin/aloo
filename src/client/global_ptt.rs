@@ -62,8 +62,8 @@ pub fn resolve_hotkey(configured: &str) -> HotKey {
     match configured.parse::<HotKey>() {
         Ok(hotkey) => hotkey,
         Err(e) => {
-            eprintln!(
-                "aloo: global push-to-talk shortcut {configured:?} in ~/.aloo/settings is invalid ({e}); using the default {} instead",
+            crate::log_warn!(
+                "global push-to-talk shortcut {configured:?} in ~/.aloo/settings is invalid ({e}); using the default {} instead",
                 crate::settings::DEFAULT_GLOBAL_PTT_SHORTCUT
             );
             crate::settings::DEFAULT_GLOBAL_PTT_SHORTCUT
@@ -83,8 +83,8 @@ pub fn hotkey_to_register(settings: &crate::settings::Settings) -> Option<HotKey
         return None;
     }
     if is_wayland() {
-        eprintln!(
-            "aloo: global push-to-talk ({}) needs X11 and isn't available under Wayland - Space still works while aloo is focused",
+        crate::log_warn!(
+            "global push-to-talk ({}) needs X11 and isn't available under Wayland - Space still works while aloo is focused",
             settings.global_ptt_shortcut
         );
         return None;
@@ -122,14 +122,14 @@ pub fn spawn(hotkey: HotKey) -> Option<UnboundedReceiver<GlobalPttEvent>> {
         let manager = match GlobalHotKeyManager::new() {
             Ok(m) => m,
             Err(e) => {
-                eprintln!("aloo: could not initialize the global push-to-talk shortcut: {e}");
+                crate::log_warn!("could not initialize the global push-to-talk shortcut: {e}");
                 let _ = ready_tx.send(false);
                 return;
             }
         };
         forward_events(tx);
         if let Err(e) = manager.register(hotkey) {
-            eprintln!("aloo: could not register the global push-to-talk shortcut ({hotkey}): {e}");
+            crate::log_warn!("could not register the global push-to-talk shortcut ({hotkey}): {e}");
             let _ = ready_tx.send(false);
             return;
         }
@@ -167,13 +167,13 @@ pub fn register_on_current_thread(
     let manager = match GlobalHotKeyManager::new() {
         Ok(m) => m,
         Err(e) => {
-            eprintln!("aloo: could not initialize the global push-to-talk shortcut: {e}");
+            crate::log_warn!("could not initialize the global push-to-talk shortcut: {e}");
             return None;
         }
     };
     forward_events(tx);
     if let Err(e) = manager.register(hotkey) {
-        eprintln!("aloo: could not register the global push-to-talk shortcut ({hotkey}): {e}");
+        crate::log_warn!("could not register the global push-to-talk shortcut ({hotkey}): {e}");
         return None;
     }
     Some((manager, rx))

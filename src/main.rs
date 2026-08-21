@@ -179,8 +179,7 @@ struct Cli {
 /// thread free to pump a `CFRunLoop` - something `#[tokio::main]` would
 /// immediately claim for its own `block_on`. Every other path
 /// (`--server`, `--keygen-pq-hybrid`, and the client or daemon on
-/// Windows/Linux)
-/// builds its own runtime and behaves exactly as it did before; see
+/// Windows/Linux) simply builds its own runtime here; see
 /// `with_global_ptt` for the one case that differs.
 fn main() -> Result<(), BoxError> {
     let cli = Cli::parse();
@@ -306,7 +305,7 @@ fn load_settings() -> settings::Settings {
     match settings::Settings::load_or_create(&settings::default_path()) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("aloo: could not read/create ~/.aloo/settings ({e}); using defaults");
+            aloo::log_warn!("could not read/create ~/.aloo/settings ({e}); using defaults");
             settings::Settings::default()
         }
     }
@@ -525,7 +524,7 @@ async fn run_server(cli: Cli) -> Result<(), BoxError> {
     settings.server_bind = bind.clone();
     settings.server_port = port;
     if let Err(e) = settings.save(&settings::default_path()) {
-        eprintln!("aloo: could not persist server settings to ~/.aloo/settings ({e})");
+        aloo::log_warn!("could not persist server settings to ~/.aloo/settings ({e})");
     }
 
     let addr: SocketAddr = validation::parse_bind_addr(&bind, port)?;

@@ -185,11 +185,20 @@ pub(crate) async fn handle_send_text(
 }
 
 /// Sends one `FileOffer` per ready recipient - a channel file send is N
-/// independent point-to-point transfers, each with its own `stream_id` and
-/// log row (accept/reject/progress is inherently per-recipient), never a
-/// broadcast like voice's channel streams. Readiness is snapshot-and-
-/// exclude: an unready rotating-key recipient is simply left out. Nothing
-/// is read from `path` until a recipient individually accepts.
+/// independent point-to-point transfers, each with its own `stream_id`,
+/// since accept/reject/progress is inherently per-recipient and there is
+/// no broadcast the way voice's channel streams have one.
+///
+/// The sender sees **one row** for all of them, exactly as a channel voice
+/// message does: one delivery record over every recipient it went out to,
+/// so the details popup lists them individually
+/// (`docs/PROTOCOL.md` 7.2.1) while the log stays one line per thing sent.
+/// The row's status is aggregated from all N transfers
+/// (`UiState::register_file_row_stream`, `FileRowProgress`).
+///
+/// Readiness is snapshot-and-exclude: an unready rotating-key recipient is
+/// simply left out. Nothing is read from `path` until a recipient
+/// individually accepts.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_send_file(
     wr: &mut impl crate::control::ControlSink,
@@ -214,6 +223,11 @@ pub(crate) async fn handle_send_file(
     let Ok(plaintext) = proto::encode(&payload) else {
         return Ok(());
     };
+    // Everything that can actually be addressed, prepared before anything
+    // is logged: the row names exactly who the offer went out to, which is
+    // only known once every recipient has been through the two ways a send
+    // to them can still fall through below.
+    let mut prepared = Vec::new();
     for (id, key_mode, der) in ready {
         let stream_id = session.next_stream_id;
         let envelope = crate::client::envelope::encrypt_envelope_for(
@@ -232,22 +246,18 @@ pub(crate) async fn handle_send_file(
             continue;
         };
         session.next_stream_id += 1;
-        let to_name = ui_state
-            .known_users
-            .get(&id)
-            .map(|u| u.name.clone())
-            .unwrap_or_default();
-        // One row per recipient, so one delivery record per row, each
-        // addressed to exactly that recipient (docs/PROTOCOL.md 7.2.1).
-        let (msg_id, delivery) = ui_state.start_delivery(&[id]);
-        ui_state.log_own_file_offer_channel(
-            &channel,
-            &to_name,
-            stream_id,
-            filename.clone(),
-            size,
-            Some(delivery),
-        );
+        prepared.push((id, stream_id, envelope, key));
+    }
+    // The row is named by the first transfer's id and every other one is
+    // registered against it, so all N report into one line.
+    let Some(&(_, row, ..)) = prepared.first() else {
+        return Ok(());
+    };
+    let recipient_ids: Vec<UserId> = prepared.iter().map(|(id, ..)| *id).collect();
+    let (msg_id, delivery) = ui_state.start_delivery(&recipient_ids);
+    ui_state.log_own_file_offer_channel(&channel, row, filename.clone(), size, Some(delivery));
+    for (id, stream_id, envelope, key) in prepared {
+        ui_state.register_file_row_stream(row, stream_id);
         session.own_file_targets.insert(
             stream_id,
             crate::client::file_transfer::OwnFileTarget {
@@ -467,7 +477,7 @@ pub(crate) fn on_joined(ui_state: &mut UiState, channel: ChannelInfo) {
 }
 
 pub(crate) fn on_join_failed(name: String, reason: String) {
-    eprintln!("aloo: failed to join {name}: {reason}");
+    crate::log_warn!("failed to join {name}: {reason}");
 }
 
 /// Handles `ServerMessage::ChannelJoinRejected` - the password-flow-specific

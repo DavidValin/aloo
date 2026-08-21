@@ -224,7 +224,7 @@ pub(crate) fn spawn_send_file_worker(
         let file = match File::open(&path) {
             Ok(f) => f,
             Err(e) => {
-                eprintln!("aloo: failed to open {} for sending: {e}", path.display());
+                crate::log_warn!("failed to open {} for sending: {e}", path.display());
                 let _ = events_tx.send(FileEvent::SendFailed { stream_id });
                 return;
             }
@@ -238,7 +238,7 @@ pub(crate) fn spawn_send_file_worker(
                 Ok(0) => break,
                 Ok(n) => n,
                 Err(e) => {
-                    eprintln!("aloo: read error sending {}: {e}", path.display());
+                    crate::log_warn!("read error sending {}: {e}", path.display());
                     let _ = events_tx.send(FileEvent::SendFailed { stream_id });
                     return;
                 }
@@ -289,8 +289,8 @@ pub(crate) fn spawn_receive_file_worker(
             && !parent.as_os_str().is_empty()
             && let Err(e) = std::fs::create_dir_all(parent)
         {
-            eprintln!(
-                "aloo: failed to create download directory {}: {e}",
+            crate::log_warn!(
+                "failed to create download directory {}: {e}",
                 parent.display()
             );
             let _ = events_tx.send(FileEvent::ReceiveFailed { from, stream_id });
@@ -299,7 +299,7 @@ pub(crate) fn spawn_receive_file_worker(
         let mut file = match File::create(&dest_path) {
             Ok(f) => f,
             Err(e) => {
-                eprintln!("aloo: failed to create {}: {e}", dest_path.display());
+                crate::log_warn!("failed to create {}: {e}", dest_path.display());
                 let _ = events_tx.send(FileEvent::ReceiveFailed { from, stream_id });
                 return;
             }
@@ -317,7 +317,7 @@ pub(crate) fn spawn_receive_file_worker(
                               written: &mut u64,
                               failed: &mut bool| {
             if let Err(e) = file.write_all(&data) {
-                eprintln!("aloo: write error saving {}: {e}", dest_path.display());
+                crate::log_warn!("write error saving {}: {e}", dest_path.display());
                 *failed = true;
                 let _ = events_tx.send(FileEvent::ReceiveFailed { from, stream_id });
                 return;

@@ -48,6 +48,27 @@ pub fn plain_user(id: u64, name: &str) -> UserInfo {
     }
 }
 
+/// The OTP contact name every OTP test in this suite uses, and the two key
+/// files a real session would have recorded beside it
+/// (`otp_cli::contact_key_paths`).
+pub const TEST_OTP_CONTACT: &str = "abcd1234";
+
+/// An `OtpKeyStatus` around `detail`, carrying the key paths for
+/// `TEST_OTP_CONTACT` - what `client::otp::refresh_otp_key_status` builds
+/// from a real `otp --show-contact` reply.
+pub fn otp_status(detail: aloo::client::otp_cli::ContactDetail) -> aloo::client::otp_cli::OtpKeyStatus {
+    aloo::client::otp_cli::OtpKeyStatus {
+        detail,
+        contact_name: TEST_OTP_CONTACT.to_string(),
+        enc_key_path: std::path::PathBuf::from(format!(
+            "/tmp/aloo-test/otp/.keychain/{TEST_OTP_CONTACT}_enc.key"
+        )),
+        dec_key_path: std::path::PathBuf::from(format!(
+            "/tmp/aloo-test/otp/.keychain/{TEST_OTP_CONTACT}_dec.key"
+        )),
+    }
+}
+
 pub fn press(state: &mut UiState, code: KeyCode) -> Option<UiAction> {
     state.handle_key(code, KeyModifiers::NONE, KeyEventKind::Press)
 }
@@ -151,17 +172,7 @@ pub fn header_row(state: &UiState) -> String {
 }
 
 pub fn rendered_rows(state: &UiState) -> Vec<String> {
-    let backend = TestBackend::new(100, 30);
-    let mut terminal = Terminal::new(backend).unwrap();
-    terminal.draw(|f| aloo::client::tui::ui::render(f, state)).unwrap();
-    let buffer = terminal.backend().buffer().clone();
-    (0..buffer.area.height)
-        .map(|y| {
-            (0..buffer.area.width)
-                .map(|x| buffer[(x, y)].symbol())
-                .collect::<String>()
-        })
-        .collect()
+    rendered_rows_at(state, 100, 30)
 }
 
 /// The message pane's scrollbar as `(thumb_rows, track_rows)` y-ranges, or
@@ -206,6 +217,94 @@ pub fn appears_before(rows: &[String], before: &str, after: &str) -> bool {
         (Some(b), Some(a)) => b < a,
         _ => false,
     })
+}
+
+/// The whole frame rendered at an explicit size, for the tests whose
+/// subject *is* the geometry - `rendered_rows`' fixed 100x30 is the right
+/// default everywhere else.
+pub fn rendered_rows_at(state: &UiState, width: u16, height: u16) -> Vec<String> {
+    rows_of(&buffer_at(state, width, height))
+}
+
+pub fn buffer_at(state: &UiState, width: u16, height: u16) -> ratatui::buffer::Buffer {
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|f| aloo::client::tui::ui::render(f, state))
+        .unwrap();
+    terminal.backend().buffer().clone()
+}
+
+pub fn rows_of(buffer: &ratatui::buffer::Buffer) -> Vec<String> {
+    (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect()
+}
+
+/// One popup's own rectangle, found from its title rather than from
+/// whatever the renderer decided its size should be: `(x, y, width,
+/// height)`, borders included.
+///
+/// A popup's title sits one column past its top-left corner, and its box
+/// is the only run of border glyphs that starts there - the view drawn
+/// underneath has borders of its own on the same rows, which is exactly
+/// why this walks the box rather than trimming whitespace. Panics if
+/// `title` is not on screen, so a test that meant to open a popup cannot
+/// silently pass without one.
+///
+/// `title` need only be the *start* of the title, which is what a caller
+/// wants for the several popups whose titles carry their own key hints
+/// and are clipped on a narrow frame.
+pub fn popup_rect(buffer: &ratatui::buffer::Buffer, title: &str) -> (u16, u16, u16, u16) {
+    let (title_x, y) = find_text_start(buffer, title);
+    let x = title_x.saturating_sub(1);
+    let width = (x..buffer.area.width)
+        .position(|xi| buffer[(xi, y)].symbol() == "\u{2510}")
+        .map(|w| w as u16 + 1)
+        .unwrap_or(buffer.area.width - x);
+    let height = (y..buffer.area.height)
+        .position(|yi| buffer[(x, yi)].symbol() == "\u{2514}")
+        .map(|h| h as u16 + 1)
+        .unwrap_or(buffer.area.height - y);
+    (x, y, width, height)
+}
+
+/// The rows *inside* the popup titled `title` - its own content, with
+/// neither its borders nor anything the view behind it drew outside them.
+pub fn popup_body(buffer: &ratatui::buffer::Buffer, title: &str) -> Vec<String> {
+    let (x, y, width, height) = popup_rect(buffer, title);
+    ((y + 1)..(y + height).saturating_sub(1))
+        .map(|yi| {
+            ((x + 1)..(x + width).saturating_sub(1))
+                .map(|xi| buffer[(xi, yi)].symbol())
+                .collect::<String>()
+        })
+        .collect()
+}
+
+/// A marker string nothing in the UI's own chrome contains, pushed into a
+/// message log so a popup drawn over it can be checked for leaking it
+/// through (`docs/SPEC.md` "Connected UI": a popup replaces what is behind
+/// it rather than compositing over it).
+pub const BEHIND_MARKER: &str = "ZZQQ-behind-marker-ZZQQ";
+
+/// A channel view whose log is nothing but `BEHIND_MARKER`, so any row a
+/// popup fails to clear shows it.
+pub fn state_with_marker_behind() -> UiState {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    for _ in 0..40 {
+        state.on_channel_message(
+            "general",
+            UserId(2),
+            "bob".into(),
+            MessageBody::Text(BEHIND_MARKER.repeat(6)),
+        );
+    }
+    state
 }
 
 /// Locates the top-left buffer cell of the first occurrence of `text`,

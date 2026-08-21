@@ -7,7 +7,10 @@ use aloo::proto::UserId;
 use aloo::client::tui::ui::{
     CallMemberState, CallTarget, DELIVERED_LABEL, DELIVERY_ARROW, DeliveryStatus, Focus,
     LISTENED_LABEL, SAVED_LABEL,
-    HOST_LEFT_NOTICE, IdentityCase, MessageBody, Mode, NO_DELIVERY_INFO, NO_ONE_INVITED_NOTICE,
+    END_CALL_CONFIRM_TITLE, ENCRYPTION_LABEL, HELP_POPUP_TITLE, HOST_LEFT_NOTICE, IdentityCase,
+    KEY_FILE_LABEL,
+    KEY_LABEL, KEY_OFFSET_LABEL, KEY_PER_RECIPIENT, KEY_SEQ_LABEL, MessageBody, Mode,
+    NO_CRYPTO_INFO, NO_DELIVERY_INFO, NO_ONE_INVITED_NOTICE, PendingFileOffer,
     OTP_CALL_REFUSAL, PendingCallInvite, RECEIVED_AT_LABEL, RECORD_HOLD_TIMEOUT, SENT_AT_LABEL,
     UNDELIVERED_LABEL, UiAction, UiState, render,
 };
@@ -1606,56 +1609,48 @@ fn help_popup_widens_enough_to_show_its_longest_line_without_clipping_it() {
 
 /// @requirement TB-108
 #[test]
-fn help_popup_never_exceeds_90_percent_of_the_terminal_width() {
-    // Deliberately narrower than the popup's natural content width, so the
-    // 90% cap is the thing actually constraining it here.
-    let width = 60u16;
+fn the_help_popup_fills_the_whole_frame() {
+    // Narrower and shorter than the help text needs, so nothing but the
+    // frame itself can be deciding the popup's size here.
+    let (width, height) = (60u16, 20u16);
     let mut state = joined_general_with(vec![]);
     state.help_open = true;
-    let backend = ratatui::backend::TestBackend::new(width, 30);
-    let mut terminal = ratatui::Terminal::new(backend).unwrap();
-    terminal.draw(|f| render(f, &state)).unwrap();
-    let buffer = terminal.backend().buffer().clone();
-    let rows: Vec<String> = (0..buffer.area.height)
-        .map(|y| {
-            (0..buffer.area.width)
-                .map(|x| buffer[(x, y)].symbol())
-                .collect::<String>()
-        })
-        .collect();
-    // The popup's own top-left corner sits directly against its title (no
-    // gap, e.g. "┌Help (Ctrl+H to close)---┐") - locate the corner-title
-    // pair rather than just trimming whitespace, since the sidebar and
-    // messages borders drawn underneath the (narrower-than-screen) popup
-    // are visible in the same row and would otherwise be counted too.
-    // Indexed by char, not byte, since the box-drawing glyphs are
-    // multi-byte and each is still exactly one terminal cell.
-    let border_row = rows
-        .iter()
-        .find(|r| r.contains("Help (Ctrl+H / Esc to close, arrows to scroll)"))
-        .expect("expected the popup's title row");
-    let row_chars: Vec<char> = border_row.chars().collect();
-    let title: Vec<char> = "Help (Ctrl+H / Esc to close, arrows to scroll)".chars().collect();
-    let title_start = row_chars
-        .windows(title.len())
-        .position(|w| w == title.as_slice())
-        .expect("title in row");
-    // The corner cell itself is not asserted on: the title row now lands on
-    // the header, whose kind emoji is a wide glyph, and a wide glyph drawn
-    // underneath swallows the cell to its right - the same artifact
-    // `find_text_start` exists for. The title's own start is the reliable
-    // anchor, one column past that corner.
-    let popup_start = title_start - 1;
-    let popup_end = row_chars[popup_start..]
-        .iter()
-        .position(|&c| c == '┐')
-        .expect("closing corner")
-        + popup_start;
-    let popup_width = popup_end - popup_start + 1;
-    let max_allowed = (width as u32 * 9 / 10) as usize;
+    let buffer = buffer_at(&state, width, height);
+
+    let (x, y, popup_width, popup_height) = popup_rect(&buffer, HELP_POPUP_TITLE);
+    assert_eq!(
+        (x, y),
+        (0, 0),
+        "help starts at the very top left, above the header: {:?}",
+        rows_of(&buffer)
+    );
+    assert_eq!(
+        (popup_width, popup_height),
+        (width, height),
+        "help covers the whole frame, compose bar included: {:?}",
+        rows_of(&buffer)
+    );
+}
+
+/// The compose bar is the one part of the view furthest from where the
+/// overlay starts, so it gets its own check rather than being folded into
+/// the geometry assertion above.
+/// @requirement TB-108
+#[test]
+fn the_help_popup_covers_the_compose_bar() {
+    let mut state = joined_general_with(vec![]);
+    type_str(&mut state, "half-typed message");
+    let before = rendered_rows(&state);
     assert!(
-        popup_width <= max_allowed,
-        "popup width {popup_width} exceeds 90% of the {width}-wide terminal ({max_allowed}): {border_row:?}"
+        before.iter().any(|r| r.contains("half-typed message")),
+        "the compose bar should be showing before help opens: {before:?}"
+    );
+
+    state.help_open = true;
+    let after = rendered_rows(&state);
+    assert!(
+        !after.iter().any(|r| r.contains("half-typed message")),
+        "the compose bar must be covered while help is open: {after:?}"
     );
 }
 
@@ -2227,16 +2222,76 @@ fn the_call_roster_scrolls_to_keep_the_selection_visible() {
     assert_eq!(state.call.as_ref().unwrap().selected, 0);
 }
 
-/// END CALL is what the modal's Enter presses; `/endcall` still works from
-/// anywhere once the modal is out of the way.
+/// END CALL is what the modal's Enter presses, and it asks before it
+/// leaves; `/endcall` still works from anywhere once the modal is out of
+/// the way.
 ///
 /// @requirement AC-178
 #[test]
-fn the_modal_end_call_button_ends_the_call() {
+fn the_modal_end_call_button_asks_before_it_ends_the_call() {
     let mut state = joined_general_with(vec![]);
     state.begin_call(1, None, UserId(1));
     assert!(rendered_rows(&state).join("\n").contains("END CALL"));
+
+    // The button itself only opens the question.
+    assert_eq!(press(&mut state, KeyCode::Enter), None);
+    let rows = rendered_rows(&state);
+    assert!(
+        rows.iter().any(|r| r.contains(END_CALL_CONFIRM_TITLE)),
+        "pressing END CALL asks first: {rows:?}"
+    );
+    assert!(
+        state.call.is_some(),
+        "and nothing about the call has changed yet"
+    );
+
+    // Cancel is the default answer, so Enter straight away backs out.
+    assert_eq!(press(&mut state, KeyCode::Enter), None);
+    assert!(
+        !rendered_rows(&state)
+            .iter()
+            .any(|r| r.contains(END_CALL_CONFIRM_TITLE)),
+        "answering closes the question"
+    );
+    assert!(state.call.is_some(), "cancelling leaves the call running");
+
+    // Moving onto END CALL and confirming is what actually leaves.
+    press(&mut state, KeyCode::Enter);
+    press(&mut state, KeyCode::Left);
     assert_eq!(press(&mut state, KeyCode::Enter), Some(UiAction::EndCall));
+}
+
+/// The question absorbs every key while it is open, so no roster key can
+/// be mistaken for an answer to it - and Escape backs out of it rather
+/// than folding the modal away underneath it.
+///
+/// @requirement AC-178
+#[test]
+fn the_end_call_question_absorbs_every_other_key() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.begin_call(1, Some("general".into()), UserId(1));
+    state.on_call_participant_joined(UserId(2), "bob".into());
+    press(&mut state, KeyCode::Enter);
+
+    assert_eq!(press(&mut state, KeyCode::Down), None);
+    assert_eq!(
+        state.call.as_ref().unwrap().selected,
+        0,
+        "the roster must not move under an unanswered question"
+    );
+    assert_eq!(press(&mut state, KeyCode::Char('m')), None, "nor mute anyone");
+
+    press(&mut state, KeyCode::Esc);
+    assert!(
+        !rendered_rows(&state)
+            .iter()
+            .any(|r| r.contains(END_CALL_CONFIRM_TITLE)),
+        "Escape answers the question"
+    );
+    assert!(
+        !state.call.as_ref().unwrap().minimized,
+        "and stops there rather than folding the modal away too"
+    );
 }
 
 /// `m` on the roster is the host's mute toggle, and only the host's - a
@@ -2969,7 +3024,7 @@ fn only_messages_this_client_sent_carry_an_indicator() {
         MessageBody::Text("hello".into()),
     );
     state.on_user_joined("general", user(3, "carol"));
-    state.log_own_file_offer_channel("general", "bob", 7, "notes.txt".into(), 10, None);
+    state.log_own_file_offer_channel("general", 7, "notes.txt".into(), 10, None);
     type_str(&mut state, "mine");
     press(&mut state, KeyCode::Enter);
 
@@ -3073,7 +3128,7 @@ fn a_voice_row_and_a_file_row_carry_the_arrow_too() {
     let (voice_id, voice_delivery) = state.start_delivery(&[UserId(2)]);
     state.log_own_voice_stream_start_channel("general", 7, Some(voice_delivery));
     let (file_id, file_delivery) = state.start_delivery(&[UserId(2)]);
-    state.log_own_file_offer_channel("general", "bob", 8, "notes.txt".into(), 10, Some(file_delivery));
+    state.log_own_file_offer_channel("general", 8, "notes.txt".into(), 10, Some(file_delivery));
 
     let statuses: Vec<Option<DeliveryStatus>> = state.channels[0]
         .log
@@ -3175,7 +3230,7 @@ fn the_details_popup_distinguishes_heard_from_merely_decrypted() {
 fn the_details_popup_says_saved_for_a_file_the_recipient_has_on_disk() {
     let mut state = joined_general_with(vec![user(2, "bob")]);
     let (msg_id, delivery) = state.start_delivery(&[UserId(2)]);
-    state.log_own_file_offer_channel("general", "bob", 8, "notes.txt".into(), 10, Some(delivery));
+    state.log_own_file_offer_channel("general", 8, "notes.txt".into(), 10, Some(delivery));
     state.focus = Focus::Messages;
     state.message_selected = 0;
 
@@ -3273,4 +3328,542 @@ fn replaying_a_clip_that_was_already_heard_owes_nothing() {
         UiAction::ReplayVoice { owed_receipt, .. } => assert_eq!(owed_receipt, None),
         other => panic!("expected ReplayVoice, got {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------
+// The call modal's three columns (docs/SPEC.md "Live voice calls")
+// ---------------------------------------------------------------------
+
+/// The title a channel call's modal carries, and how these tests find its
+/// box on screen.
+fn call_modal_title(channel: &str) -> String {
+    format!("Call \u{2014} #{channel}")
+}
+
+/// A call in `general` hosted by us, with one row per name given.
+fn hosting_a_call_with(names: &[&str]) -> UiState {
+    let members: Vec<_> = names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| user(i as u64 + 2, name))
+        .collect();
+    let mut state = joined_general_with(members);
+    state.begin_call(1, Some("general".into()), UserId(1));
+    for (i, name) in names.iter().enumerate() {
+        state.on_call_participant_joined(UserId(i as u64 + 2), (*name).to_string());
+    }
+    state
+}
+
+/// The modal is as narrow as the call in it allows: sizing for the widest
+/// roster a call could ever hold would leave a block of blank columns
+/// down the middle of every row of an ordinary two-person one.
+///
+/// @requirement AC-175
+#[test]
+fn the_call_modal_narrows_to_the_names_actually_in_the_call() {
+    // Longer than our own `me (you) (host)` row, which is otherwise the
+    // widest name in either call and would make the two come out equal.
+    let short = hosting_a_call_with(&["bo"]);
+    let long = hosting_a_call_with(&["bartholomew-the-longer"]);
+
+    let short_width = popup_rect(&buffer_at(&short, 100, 30), &call_modal_title("general")).2;
+    let long_width = popup_rect(&buffer_at(&long, 100, 30), &call_modal_title("general")).2;
+
+    assert!(
+        short_width < long_width,
+        "a call between short names needs a narrower modal than one with a long name \
+         ({short_width} vs {long_width})"
+    );
+    assert!(
+        long_width < 100,
+        "and neither takes the whole screen ({long_width})"
+    );
+}
+
+/// All three columns line up down the list, and the meters are the one
+/// that lines up against the modal's own right edge rather than against
+/// whatever the labels before it came to.
+///
+/// @requirement AC-175
+#[test]
+fn the_roster_columns_line_up_and_the_meters_sit_flush_right() {
+    let mut state = hosting_a_call_with(&["bo", "bartholomew"]);
+    // One row carries a second label and one does not - the case a
+    // per-row label width would slide out of line.
+    state.set_call_member_host_muted(UserId(2), true);
+
+    let buffer = buffer_at(&state, 100, 30);
+    let (x, _, width, _) = popup_rect(&buffer, &call_modal_title("general"));
+    let body = popup_body(&buffer, &call_modal_title("general"));
+    let roster: Vec<&String> = body
+        .iter()
+        .filter(|r| r.contains(['\u{2591}', '\u{2588}']))
+        .collect();
+    assert_eq!(roster.len(), 3, "one row per participant: {body:?}");
+
+    // Every meter ends on the last column inside the border. Counted in
+    // characters, not bytes: the meter glyphs are multi-byte and exactly
+    // one cell each.
+    for row in &roster {
+        let chars: Vec<char> = row.chars().collect();
+        let last_bar = chars
+            .iter()
+            .rposition(|c| matches!(c, '\u{2591}' | '\u{2588}'))
+            .expect("a meter on this row");
+        assert_eq!(
+            last_bar + 1,
+            chars.len(),
+            "the meter runs to the modal's inner right edge: {row:?}"
+        );
+    }
+
+    // And the labels all start in one column, whatever each name's length.
+    let label_columns: Vec<usize> = roster
+        .iter()
+        .map(|r| {
+            let byte = r
+                .find("IN CALL")
+                .unwrap_or_else(|| panic!("every row is IN CALL here: {r:?}"));
+            r[..byte].chars().count()
+        })
+        .collect();
+    assert!(
+        label_columns.iter().all(|c| *c == label_columns[0]),
+        "the label column is the same on every row: {label_columns:?} in {roster:?}"
+    );
+
+    // Sanity: the box really is narrower than the frame it was given, so
+    // the flush-right assertion above is about the modal and not about
+    // the screen.
+    assert!(x > 0 && width < 100, "the modal is centered, not full width");
+}
+
+// ---------------------------------------------------------------------
+// What the details popup says about a message's encryption
+// (docs/SPEC.md "Delivery acknowledgments")
+// ---------------------------------------------------------------------
+
+/// The one thing a DM to one person can always name: the scheme its
+/// envelope was built with, and the key it was sealed to.
+/// @requirement AC-242
+#[test]
+fn the_details_popup_names_the_scheme_and_the_key_a_dm_was_sealed_to() {
+    let mut state = joined_general_with(vec![pq_hybrid_user(2, "bob")]);
+    // Opened the way a user does: cursor on bob in the sidebar, Enter.
+    state.focus = Focus::Sidebar;
+    state.sidebar_selected = 0;
+    press(&mut state, KeyCode::Enter);
+    type_str(&mut state, "hello");
+    press(&mut state, KeyCode::Enter);
+    state.focus = Focus::Messages;
+    state.message_selected = state.private_rooms[&UserId(2)].log.len() - 1;
+    press(&mut state, KeyCode::Char('i'));
+
+    let key_id = aloo::crypto::short_fingerprint_der(&state.known_users[&UserId(2)].public_key_der);
+    let rows = rendered_rows_at(&state, 140, 30);
+    assert!(
+        rows.iter()
+            .any(|r| r.contains(ENCRYPTION_LABEL) && r.contains("ML-KEM-1024")),
+        "the scheme is named by its mechanism, not by the my_key tag: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|r| r.contains(KEY_LABEL) && r.contains(&key_id)),
+        "and the key it was sealed to, short enough to read ({key_id}): {rows:?}"
+    );
+    assert_eq!(
+        key_id.len(),
+        aloo::crypto::SHORT_FINGERPRINT_HEX,
+        "a short representation, not a full SHA-256"
+    );
+}
+
+/// A channel send is sealed once per member with that member's own key,
+/// so there is no single key to name and the popup says as much rather
+/// than picking one.
+/// @requirement AC-242
+#[test]
+fn a_channel_send_to_several_people_names_no_single_key() {
+    let (mut state, _) = sent_and_selected(
+        vec![pq_hybrid_user(2, "bob"), pq_hybrid_user(3, "carol")],
+        "everyone",
+    );
+    press(&mut state, KeyCode::Char('i'));
+
+    let rows = rendered_rows_at(&state, 140, 30);
+    assert!(
+        rows.iter()
+            .any(|r| r.contains(KEY_LABEL) && r.contains(KEY_PER_RECIPIENT)),
+        "one key id would be a lie about the other recipients: {rows:?}"
+    );
+}
+
+/// A line this client wrote itself never travelled, so there is nothing
+/// to report about how it was protected.
+/// @requirement AC-242
+#[test]
+fn a_presence_notice_reports_no_encryption_at_all() {
+    let mut state = joined_general_with(vec![]);
+    state.on_user_joined("general", user(2, "bob"));
+    state.focus = Focus::Messages;
+    state.message_selected = state.channels[0].log.len() - 1;
+    press(&mut state, KeyCode::Char('i'));
+
+    let rows = rendered_rows_at(&state, 140, 30);
+    assert!(
+        rows.iter().any(|r| r.contains(NO_CRYPTO_INFO)),
+        "a presence line is not an encrypted message: {rows:?}"
+    );
+}
+
+/// Under an OTP session the pad is what actually protects the content, so
+/// the popup reports the pad position this message spent and the key file
+/// it came out of (`docs/PROTOCOL.md` §16) - not the envelope underneath.
+/// @requirement AC-243
+#[test]
+fn an_otp_message_reports_the_pad_position_and_key_file_it_used() {
+    use aloo::client::otp_cli::ContactDetail;
+
+    let mut state = joined_general_with(vec![pq_hybrid_user(2, "bob")]);
+    state.focus = Focus::Sidebar;
+    state.sidebar_selected = 0;
+    press(&mut state, KeyCode::Enter);
+    state.mark_otp_active(UserId(2));
+    // The pre-spend snapshot: four messages already sent, 480 bytes of pad
+    // already consumed. The message about to be logged is therefore
+    // sequence 5, starting at offset 480.
+    state.set_otp_key_status(
+        UserId(2),
+        otp_status(ContactDetail {
+            enc_sequence: 4,
+            enc_offset: 480,
+            enc_key_remaining: 2_000_000,
+            dec_sequence: 9,
+            dec_offset: 900,
+            dec_key_remaining: 2_000_000,
+        }),
+    );
+
+    type_str(&mut state, "under the pad");
+    press(&mut state, KeyCode::Enter);
+    state.focus = Focus::Messages;
+    state.message_selected = state.private_rooms[&UserId(2)].log.len() - 1;
+    press(&mut state, KeyCode::Char('i'));
+
+    let rows = rendered_rows_at(&state, 160, 30);
+    let says = |label: &str, value: &str| {
+        rows.iter()
+            .any(|r| r.contains(label) && r.contains(value))
+    };
+    assert!(
+        rows.iter()
+            .any(|r| r.contains(ENCRYPTION_LABEL) && r.contains("one-time pad")),
+        "the pad is what protected it: {rows:?}"
+    );
+    assert!(says(KEY_SEQ_LABEL, "5"), "this message's sequence: {rows:?}");
+    assert!(
+        says(KEY_OFFSET_LABEL, "480"),
+        "where its key bytes start: {rows:?}"
+    );
+    assert!(
+        says(KEY_FILE_LABEL, &format!("{TEST_OTP_CONTACT}_enc.key")),
+        "and which key file they came out of: {rows:?}"
+    );
+}
+
+/// The receiving side reads its own direction's figures and its own key
+/// file - the two pads are independent, and reporting the sending one on
+/// an incoming row would name key material that message never touched.
+/// @requirement AC-243
+#[test]
+fn an_incoming_otp_message_reports_the_decryption_pad() {
+    use aloo::client::otp_cli::ContactDetail;
+
+    let mut state = joined_general_with(vec![pq_hybrid_user(2, "bob")]);
+    state.focus = Focus::Sidebar;
+    state.sidebar_selected = 0;
+    press(&mut state, KeyCode::Enter);
+    state.mark_otp_active(UserId(2));
+    state.set_otp_key_status(
+        UserId(2),
+        otp_status(ContactDetail {
+            enc_sequence: 4,
+            enc_offset: 480,
+            enc_key_remaining: 2_000_000,
+            dec_sequence: 9,
+            dec_offset: 900,
+            dec_key_remaining: 2_000_000,
+        }),
+    );
+    state.on_direct_message(UserId(2), "bob".into(), MessageBody::Text("hi".into()));
+    state.focus = Focus::Messages;
+    state.message_selected = state.private_rooms[&UserId(2)].log.len() - 1;
+    press(&mut state, KeyCode::Char('i'));
+
+    let rows = rendered_rows_at(&state, 160, 30);
+    assert!(
+        rows.iter().any(|r| r.contains(KEY_SEQ_LABEL) && r.contains("10")),
+        "the next sequence on the receiving pad: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|r| r.contains(KEY_OFFSET_LABEL) && r.contains("900")),
+        "and that pad's own offset: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|r| r.contains(KEY_FILE_LABEL) && r.contains(&format!("{TEST_OTP_CONTACT}_dec.key"))),
+        "read from the decryption key, not the encryption one: {rows:?}"
+    );
+}
+
+// ---------------------------------------------------------------------
+// A popup replaces what is behind it (docs/SPEC.md "Connected UI")
+// ---------------------------------------------------------------------
+
+/// Every popup owns the cells it covers: whatever the view behind it drew
+/// there is gone, not showing through around the popup's own words.
+/// Checked by filling the message log with a marker no chrome contains and
+/// looking for it inside each popup's own border.
+///
+/// One test over every popup rather than one each: the property is the
+/// same for all of them, and a popup added without a `Clear` is exactly
+/// the regression worth catching here.
+/// @requirement AC-237
+#[test]
+fn no_popup_shows_the_view_behind_it() {
+    let mismatch = || IdentityCase::StaticMismatch {
+        new_public_key_der: vec![9, 9, 9],
+        previous_public_key_der: vec![1, 1, 1],
+    };
+    let offer = || PendingFileOffer {
+        from: UserId(2),
+        from_name: "bob".into(),
+        filename: "photo.png".into(),
+        size: 2048,
+        stream_id: 7,
+        channel: None,
+        otp_contact_name: None,
+    };
+
+    /// One popup under test: the title its border carries, and what opens
+    /// it. The lifetime is what lets an opener borrow the two builders
+    /// above rather than each repeating their literals.
+    type PopupCase<'a> = (&'a str, Box<dyn Fn(&mut UiState) + 'a>);
+
+    let cases: Vec<PopupCase> = vec![
+        (
+            HELP_POPUP_TITLE,
+            Box::new(|s: &mut UiState| s.help_open = true),
+        ),
+        (
+            "Identity review: bob",
+            Box::new(|s: &mut UiState| {
+                s.begin_identity_review(UserId(2), "bob".into(), mismatch());
+                s.reveal_identity_review(UserId(2), "bob's key changed".into());
+            }),
+        ),
+        (
+            "Incoming file from bob",
+            Box::new(move |s: &mut UiState| {
+                s.push_file_offer(offer());
+            }),
+        ),
+        (
+            "Join or create a channel",
+            Box::new(|s: &mut UiState| {
+                ctrl(s, KeyCode::Char('j'));
+            }),
+        ),
+        (
+            "Public channels",
+            Box::new(|s: &mut UiState| {
+                type_str(s, "/channels");
+                press(s, KeyCode::Enter);
+            }),
+        ),
+        (
+            "Message details",
+            Box::new(|s: &mut UiState| {
+                s.focus = Focus::Messages;
+                press(s, KeyCode::Char('i'));
+            }),
+        ),
+    ];
+
+    for (title, open) in cases {
+        let mut state = state_with_marker_behind();
+        assert!(
+            rendered_rows(&state)
+                .iter()
+                .any(|r| r.contains(BEHIND_MARKER)),
+            "the marker must be on screen before {title:?} opens"
+        );
+
+        open(&mut state);
+        let buffer = buffer_at(&state, 100, 30);
+        let body = popup_body(&buffer, title);
+        assert!(
+            !body.is_empty(),
+            "{title:?} should have opened, and have a body"
+        );
+        assert!(
+            !body.iter().any(|r| r.contains(BEHIND_MARKER)),
+            "{title:?} let the view behind it show through: {body:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------
+// The help overlay's two columns (docs/SPEC.md Functionality #7)
+// ---------------------------------------------------------------------
+
+/// Every description in the whole page starts in the same column, and a
+/// description too long for the width it has wraps back into that column
+/// rather than under the keys.
+/// @requirement TB-108
+#[test]
+fn help_descriptions_all_start_in_one_column_and_wrap_back_into_it() {
+    let mut state = joined_general_with(vec![]);
+    state.help_open = true;
+    // Narrow enough that the longest descriptions have to wrap, wide
+    // enough that the column itself is not being squeezed. Read inside
+    // the overlay's own border, so a column figure is a column of the
+    // page rather than of the screen.
+    let rows = popup_body(&buffer_at(&state, 90, 40), HELP_POPUP_TITLE);
+
+    // The column is wherever the widest command leaves it - read off the
+    // rendered page rather than assumed, so the assertion is about
+    // alignment and not about one particular figure.
+    let column = |needle: &str| -> usize {
+        let row = rows
+            .iter()
+            .find(|r| r.contains(needle))
+            .unwrap_or_else(|| panic!("no row contains {needle:?}: {rows:?}"));
+        let byte = row.find(needle).expect("just found it");
+        row[..byte].chars().count()
+    };
+
+    let ctrl_j = column("join/create");
+    for description in ["list every public channel", "leave the selected channel tab"] {
+        assert_eq!(
+            column(description),
+            ctrl_j,
+            "{description:?} must start in the same column as every other description"
+        );
+    }
+
+    // The `[  /  ]` entry is far too long for one line here, so the row
+    // straight after it is a continuation of its description - and that is
+    // what proves a wrap lands in the column rather than under the keys.
+    let first = rows
+        .iter()
+        .position(|r| r.contains("move between the channel selector"))
+        .expect("the first entry is on the first screenful");
+    let continuation = &rows[first + 1];
+    assert!(
+        !continuation.trim().is_empty(),
+        "the entry should have wrapped onto the next row: {continuation:?}"
+    );
+    assert_eq!(
+        continuation.chars().take_while(|c| *c == ' ').count(),
+        ctrl_j,
+        "a wrapped line falls in the description column, not under the keys"
+    );
+}
+
+/// The first column is reserved for commands and sized by the longest one,
+/// so no command is ever pushed into the description column.
+/// @requirement TB-108
+#[test]
+fn the_help_keys_column_is_as_wide_as_the_longest_command() {
+    let mut state = joined_general_with(vec![]);
+    state.help_open = true;
+    let rows = popup_body(&buffer_at(&state, 120, 60), HELP_POPUP_TITLE);
+    let joined = rows.join("\n");
+
+    // The longest command in the page, and a short one: both keep their
+    // whole text in the first column, and both descriptions line up.
+    assert!(
+        joined.contains("/unmute-voice <nickname>"),
+        "the longest command is not clipped: {rows:?}"
+    );
+    let column = |needle: &str| -> usize {
+        let row = rows
+            .iter()
+            .find(|r| r.contains(needle))
+            .unwrap_or_else(|| panic!("no row contains {needle:?}: {rows:?}"));
+        row[..row.find(needle).unwrap()].chars().count()
+    };
+    assert_eq!(
+        column("undo it; either"),
+        column("join/create"),
+        "the longest command and a short one leave their descriptions in the same column"
+    );
+}
+
+/// A terminal narrow enough to squeeze the description column still
+/// scrolls to the end of the page: `End` lands somewhere definite and a
+/// further page does not move past it.
+/// @requirement TB-126
+#[test]
+fn help_scrolls_to_the_end_of_the_wrapped_page() {
+    let mut state = joined_general_with(vec![]);
+    ctrl(&mut state, KeyCode::Char('h'));
+    press(&mut state, KeyCode::End);
+    let bottom = state.help_scroll();
+    assert!(
+        bottom + 1 >= aloo::client::tui::ui::help_total_lines(),
+        "End reaches the last line of the laid-out page ({bottom} of {})",
+        aloo::client::tui::ui::help_total_lines()
+    );
+
+    // And the last section is genuinely on screen there, at a width that
+    // wraps a good deal of the page.
+    let rows = rendered_rows_at(&state, 80, 30);
+    assert!(
+        rows.iter().any(|r| r.contains("scroll")),
+        "the very last entry is reachable: {rows:?}"
+    );
+}
+
+/// The name and the label columns are separated by a real gap, so a
+/// nickname that fills its own column does not run straight into the
+/// label after it.
+/// @requirement AC-175
+#[test]
+fn the_call_roster_keeps_a_gap_between_the_name_and_the_labels() {
+    // Two names of different lengths: the short one shows the padding, the
+    // long one shows the gap that survives it.
+    let state = hosting_a_call_with(&["bo", "bartholomew-the-longer"]);
+    let body = popup_body(&buffer_at(&state, 100, 30), &call_modal_title("general"));
+    let longest = body
+        .iter()
+        .find(|r| r.contains("bartholomew-the-longer"))
+        .unwrap_or_else(|| panic!("no row for the longest name: {body:?}"));
+    let after_name = longest
+        .find("bartholomew-the-longer")
+        .expect("just found it")
+        + "bartholomew-the-longer".len();
+    let label = longest.find("IN CALL").expect("its label");
+    assert_eq!(
+        label - after_name,
+        4,
+        "four columns between the widest name and its label: {longest:?}"
+    );
+}
+
+/// The glyph on a person's row and the glyph on their messages are one
+/// marker, so they can never drift apart into two different things
+/// meaning the same thing.
+/// @requirement AC-246
+#[test]
+fn otp_tag_and_icon_are_the_same_marker() {
+    assert!(
+        aloo::client::tui::ui::OTP_TAG.starts_with(aloo::client::tui::ui::OTP_ICON),
+        "the tag is the icon plus the layer's name"
+    );
+    // And deliberately not pq_hybrid's own shield, which the pad always
+    // runs over.
+    assert!(!aloo::client::tui::ui::OTP_ICON.contains('\u{1F6E1}'));
 }

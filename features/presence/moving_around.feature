@@ -26,3 +26,11 @@ Feature: Moving around the connected screen
     Then the selected user is at position 1
     When I press Down
     Then the selected user is at position 0
+
+  @AC-237
+  Scenario: A popup replaces the view behind it
+    Given I am connected and viewing a channel
+    And the channel log is full of messages
+    When I press Ctrl+J
+    Then the join-channel popup is open
+    And nothing of the view behind the popup shows through it

@@ -151,3 +151,40 @@ pub fn find_text_start(buffer: &Buffer, text: &str) -> (u16, u16) {
     }
     panic!("text {text:?} not found in the rendered buffer");
 }
+
+/// One popup's own rectangle, found from its title rather than from
+/// whatever the renderer decided its size should be: `(x, y, width,
+/// height)`, borders included.
+///
+/// A popup's title sits one column past its top-left corner, and its box
+/// is the only run of border glyphs that starts there - the view drawn
+/// underneath has borders of its own on the same rows, which is exactly
+/// why this walks the box rather than trimming whitespace. `title` need
+/// only be the *start* of the title, for the popups whose titles carry
+/// their own key hints and are clipped on a narrow frame.
+pub fn popup_rect(buffer: &Buffer, title: &str) -> (u16, u16, u16, u16) {
+    let (title_x, y) = find_text_start(buffer, title);
+    let x = title_x.saturating_sub(1);
+    let width = (x..buffer.area.width)
+        .position(|xi| buffer[(xi, y)].symbol() == "\u{2510}")
+        .map(|w| w as u16 + 1)
+        .unwrap_or(buffer.area.width - x);
+    let height = (y..buffer.area.height)
+        .position(|yi| buffer[(x, yi)].symbol() == "\u{2514}")
+        .map(|h| h as u16 + 1)
+        .unwrap_or(buffer.area.height - y);
+    (x, y, width, height)
+}
+
+/// The rows *inside* the popup titled `title` - its own content, with
+/// neither its borders nor anything the view behind it drew outside them.
+pub fn popup_body(buffer: &Buffer, title: &str) -> Vec<String> {
+    let (x, y, width, height) = popup_rect(buffer, title);
+    ((y + 1)..(y + height).saturating_sub(1))
+        .map(|yi| {
+            ((x + 1)..(x + width).saturating_sub(1))
+                .map(|xi| buffer[(xi, yi)].symbol())
+                .collect::<String>()
+        })
+        .collect()
+}

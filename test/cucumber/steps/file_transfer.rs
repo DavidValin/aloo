@@ -349,7 +349,7 @@ async fn bob_rejects(w: &mut AlooWorld) {
         );
     };
     w.ui_mut()
-        .log_own_file_offer_channel(&channel, "bob", STREAM_ID, filename, size, None);
+        .log_own_file_offer_channel(&channel, STREAM_ID, filename, size, None);
     let me = w.ui_ref().own_id.unwrap();
     w.ui_mut().set_file_rejected(me, STREAM_ID);
 }

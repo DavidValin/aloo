@@ -31,20 +31,16 @@ use crate::client::voice;
 use crate::client::voice_call;
 use crate::client::voice_stream;
 
-/// How long an incoming stream can go without a chunk/end before it's
-/// treated as abandoned - see `voice_stream::STREAM_IDLE_TIMEOUT`.
-use voice_stream::STREAM_IDLE_TIMEOUT;
+use voice_stream::IdleStreamAction;
 
 /// Everything that can arrive from "the person using this session",
 /// whichever surface they are using it through
 /// (`crate::client::tui::surface`).
 ///
-/// Before daemon mode this was just `crossterm::event::Event`, read by a
-/// thread `run_connected_session` spawned itself. A daemon's session has
-/// no terminal of its own, and gains one only when someone attaches - so
-/// the loop takes a receiver of *these* instead, and the same loop serves
-/// both worlds: a terminal-attached run feeds it from the local stdin
-/// thread, a daemon from its IPC listener.
+/// A daemon's session has no terminal of its own, and gains one only when
+/// someone attaches, so this covers more than a terminal event: one loop
+/// serves both worlds, fed by the local stdin thread on a
+/// terminal-attached run and by the IPC listener in a daemon.
 #[derive(Debug)]
 pub enum SessionInput {
     /// A key (or other terminal event) from whoever is driving right now.
@@ -148,9 +144,9 @@ pub struct SessionState {
     pub(crate) file_events_tx: tokio::sync::mpsc::UnboundedSender<file_transfer::FileEvent>,
     /// Outgoing voice/file-chunk traffic from a background thread (the
     /// recorder, the file sender) - drained by `run_connected_session`'s
-    /// select loop into `peer_link.dispatch_outbound`. Direct-transport
-    /// counterpart of what used to be a raw `ClientMessage` written
-    /// straight to the TCP socket.
+    /// select loop into `peer_link.dispatch_outbound`. This content never
+    /// touches the control connection: it rides the direct link
+    /// (`docs/PROTOCOL.md` §7.1) or waits for one.
     pub(crate) record_out_tx: tokio::sync::mpsc::UnboundedSender<P2pOutbound>,
     pub(crate) own_stream_done_tx: tokio::sync::mpsc::UnboundedSender<(u64, u32, Vec<u8>)>,
     pub(crate) mixer_tx: tokio::sync::mpsc::UnboundedSender<voice::MixerCmd>,
@@ -307,8 +303,8 @@ pub struct SessionState {
     /// The password each private channel was joined with, so a reconnect
     /// can walk back into the same channels this session was in
     /// (`docs/PROTOCOL.md` §4.2). In memory for the life of the session
-    /// only - it is never written anywhere, and a new session asks the
-    /// user again exactly as it did before.
+    /// only - it is never written anywhere, so a new session asks the user
+    /// for it again.
     pub(crate) channel_passwords: HashMap<String, String>,
     /// Where a spawned `DirectResolve` lookup hands its answer back to the
     /// select loop (`docs/PROTOCOL.md` §7.1.5).
@@ -430,11 +426,11 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
     // subsystem in this loop degrades.
     let settings = crate::settings::Settings::load_or_create(&crate::settings::default_path())
         .unwrap_or_else(|e| {
-            eprintln!("aloo: could not read ~/.aloo/settings ({e}); direct punch stays off");
+            crate::log_warn!("could not read ~/.aloo/settings ({e}); direct punch stays off");
             crate::settings::Settings::default()
         });
     for (line, reason) in &settings.direct_punch_invalid {
-        eprintln!("aloo: ignoring direct_punch_to={line}: {reason}");
+        crate::log_warn!("ignoring direct_punch_to={line}: {reason}");
     }
     let (direct_resolved_tx, mut direct_resolved_rx) =
         tokio::sync::mpsc::unbounded_channel::<(String, Option<SocketAddr>)>();
@@ -475,7 +471,7 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
     // than refusing to connect.
     let own_device_id = crate::client::device_id::load_or_create(&crate::client::device_id::default_path())
         .unwrap_or_else(|e| {
-            eprintln!("aloo: failed to load/create device id: {e} (continuing without one)");
+            crate::log_warn!("failed to load/create device id: {e} (continuing without one)");
             String::new()
         });
     let (p2p_events_tx, mut p2p_events_rx) = tokio::sync::mpsc::unbounded_channel::<P2pEvent>();
@@ -483,8 +479,8 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
         match PeerLinkManager::bind(bind_addr, server_addr, p2p_events_tx.clone()).await {
             Ok(ok) => ok,
             Err(e) if bind_addr.port() != 0 => {
-                eprintln!(
-                    "aloo: could not bind the direct-punch port {} ({e});                      falling back to an ephemeral port - direct_punch_to peers                      will not be able to reach this client",
+                crate::log_warn!(
+                    "could not bind the direct-punch port {} ({e});                      falling back to an ephemeral port - direct_punch_to peers                      will not be able to reach this client",
                     bind_addr.port()
                 );
                 PeerLinkManager::bind(
@@ -707,6 +703,15 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
                                 handle_ui_action(action, &mut wr, &mut ui_state, &mut session).await?;
                             }
                         }
+                    }
+                    // The terminal this process owns changed size. Its
+                    // attached counterpart is `SessionInput::Resized`
+                    // below, and both land in the same place: the frame
+                    // drawn at the bottom of this iteration repaints
+                    // every cell for the new dimensions
+                    // (`Surface::resize`).
+                    SessionInput::Key(Event::Resize(cols, rows)) => {
+                        surface.resize(crate::client::tui::surface::TerminalSize::new(cols, rows))?;
                     }
                     SessionInput::Key(_) => {}
                     SessionInput::Attached { writer, size } => {
@@ -968,10 +973,7 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
                 }
                 ui_state.tick_status_notice(Instant::now());
                 ui_state.tick_selector_dropdown(Instant::now());
-                let cutoff = Instant::now() - STREAM_IDLE_TIMEOUT;
-                for stream in session.active_streams.values().filter(|s| s.last_seen < cutoff) {
-                    let _ = stream.job_tx.send(voice_stream::DecryptJob::End);
-                }
+                sweep_idle_streams(&mut ui_state, &mut session, Instant::now());
                 session.peer_link.tick_with_clock(crate::client::p2p::utc_second_of_hour());
             }
             Some((nickname, addr)) = direct_resolved_rx.recv() => {
@@ -1248,7 +1250,7 @@ async fn handle_ui_action(
                         .set_last_seen(&review.nickname, addr, &device_id);
                 }
                 if let Err(e) = session.id_store.save() {
-                    eprintln!("aloo: failed to save id_store: {e}");
+                    crate::log_warn!("failed to save id_store: {e}");
                 }
             }
             if ui_state.resolve_identity_accept(peer) {
@@ -1725,7 +1727,7 @@ async fn handle_server_message(
                 // here, the same way `contact_name_if_active` already
                 // re-derives the real send-path gate fresh from
                 // `peer_pubkey_der` on every send. Without this, the
-                // shield/header/call-blocking would wrongly show "inactive"
+                // pad marker/header/call-blocking would wrongly show "inactive"
                 // the moment a still-live session's peer reconnects, even
                 // though nothing about the session itself ended - only
                 // `/endotp` may do that (`docs/PROTOCOL.md` §16.6).
@@ -1836,7 +1838,7 @@ async fn handle_server_message(
             } else {
             }
         }
-        ServerMessage::Error { message } => eprintln!("aloo: server error: {message}"),
+        ServerMessage::Error { message } => crate::log_warn!("server error: {message}"),
         ServerMessage::OtpMailResult { mail_id, ok, reason } => {
             crate::client::otp_mail::on_mail_result(wr, session, ui_state, mail_id, ok, reason)
                 .await?;
@@ -2629,7 +2631,7 @@ fn check_identity(session: &mut SessionState, ui_state: &mut UiState, user: &Use
                         .id_store
                         .check_and_pin(&user.name, &user.public_key_der);
                     if let Err(e) = session.id_store.save() {
-                        eprintln!("aloo: failed to save id_store: {e}");
+                        crate::log_warn!("failed to save id_store: {e}");
                     }
                 }
                 Some(previous) if previous == user.public_key_der.as_slice() => {}
@@ -2647,7 +2649,7 @@ fn check_identity(session: &mut SessionState, ui_state: &mut UiState, user: &Use
                         .id_store
                         .check_and_pin(&name, &user.public_key_der);
                     if let Err(e) = session.id_store.save() {
-                        eprintln!("aloo: failed to save id_store: {e}");
+                        crate::log_warn!("failed to save id_store: {e}");
                     }
                     ui_state.push_notice(format!(
                         "{name} moved to a new identity and proved it - pin updated"
@@ -2758,7 +2760,7 @@ fn display_device_id(id: Option<&str>) -> String {
 fn record_last_seen(session: &mut SessionState, nickname: &str, addr: SocketAddr, device_id: &str) {
     session.id_store.set_last_seen(nickname, addr, device_id);
     if let Err(e) = session.id_store.save() {
-        eprintln!("aloo: failed to save id_store: {e}");
+        crate::log_warn!("failed to save id_store: {e}");
     }
 }
 
@@ -3626,6 +3628,65 @@ fn handle_incoming_file_offer(
 /// (`file_transfer::FileEvent`) into the matching log row - see
 /// `UiState::update_file_entry` for how a row is found from just
 /// `(from, stream_id)`.
+/// One pass over every incoming stream that has gone quiet
+/// (`voice_stream::idle_stream_action`): a sender that stopped without a
+/// `StreamEnd` ever arriving (`docs/PROTOCOL.md` §7.3) is asked once to
+/// end, and a stream whose worker never answered that ask is closed out
+/// here so its row cannot claim to still be streaming for the rest of the
+/// session.
+fn sweep_idle_streams(ui_state: &mut UiState, session: &mut SessionState, now: Instant) {
+    let idle: Vec<(UserId, u64)> = session
+        .active_streams
+        .iter()
+        .filter(|(_, stream)| {
+            voice_stream::idle_stream_action(
+                now,
+                stream.last_seen,
+                stream.end_requested,
+                !stream.job_tx.is_closed(),
+            ) != IdleStreamAction::Wait
+        })
+        .map(|(key, _)| *key)
+        .collect();
+    for key in idle {
+        let Some(stream) = session.active_streams.get_mut(&key) else {
+            continue;
+        };
+        let action = voice_stream::idle_stream_action(
+            now,
+            stream.last_seen,
+            stream.end_requested,
+            !stream.job_tx.is_closed(),
+        );
+        match action {
+            IdleStreamAction::Wait => {}
+            IdleStreamAction::Nudge => {
+                stream.end_requested = true;
+                // The worker finalizes the row from whatever it managed to
+                // decrypt, and its report is what removes this entry
+                // (`stream_finished_rx`).
+                let _ = stream.job_tx.send(voice_stream::DecryptJob::End);
+            }
+            IdleStreamAction::GiveUp => {
+                let (from, stream_id) = key;
+                let Some(stream) = session.active_streams.remove(&key) else {
+                    continue;
+                };
+                // Nothing arrived that anyone could play, so the row is
+                // closed as an empty clip rather than left mid-stream.
+                match stream.channel {
+                    Some(channel) => {
+                        ui_state.on_channel_stream_finished(&channel, from, stream_id, 0, Vec::new())
+                    }
+                    None => {
+                        ui_state.on_direct_stream_finished(from, from, stream_id, 0, Vec::new())
+                    }
+                }
+            }
+        }
+    }
+}
+
 async fn handle_file_event(
     ui_state: &mut UiState,
     session: &mut SessionState,

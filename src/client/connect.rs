@@ -95,8 +95,18 @@ pub async fn run_client_inner(
     popup.port = port.to_string();
     popup.nickname = local_display_name();
 
+    let settings_path = crate::settings::default_path();
+    let settings = crate::settings::Settings::load_or_create(&settings_path).unwrap_or_else(|e| {
+        crate::log_warn!("could not read/create ~/.aloo/settings ({e}); using defaults");
+        crate::settings::Settings::default()
+    });
     let mut cache = load_connect_cache();
-    prefill_connect_defaults(&mut popup, &cache, &crate::platform::aloo_dir());
+    prefill_connect_defaults(
+        &mut popup,
+        &settings,
+        &cache,
+        &crate::platform::aloo_dir(),
+    );
 
     loop {
         let Some(request) = ui_connect_popup::run(surface, &mut popup)? else {
@@ -107,7 +117,15 @@ pub async fn run_client_inner(
         // actually succeeds ("the last values used in the popup", not "the
         // last successful connection") - a wrong password or an
         // unreachable host doesn't mean the pq_hybrid identity chosen was
-        // wrong.
+        // wrong, or that the nickname typed was.
+        if let Err(e) = crate::settings::Settings::remember_connection(
+            &settings_path,
+            &request.host,
+            request.port,
+            &request.nickname,
+        ) {
+            crate::log_warn!("could not remember this connection in ~/.aloo/settings ({e})");
+        }
         if let MyKeySelection::PqHybrid {
             file_pub,
             file_priv,
@@ -120,7 +138,7 @@ pub async fn run_client_inner(
                 &file_priv.display().to_string(),
             );
             if let Err(e) = cache.save() {
-                eprintln!("aloo: failed to save connect cache: {e}");
+                crate::log_warn!("failed to save connect cache: {e}");
             }
         }
 
@@ -359,13 +377,11 @@ async fn resolve_server_prefer_ipv4(host: &str, port: u16) -> Result<std::net::S
 /// is what lets DNS-level ordering (round-robin, sorted by RFC 6724 policy)
 /// still mean something.
 ///
-/// `pub` purely so `test/connect_test.rs` can exercise the choice without a
-/// live resolver, the same way `resolve_my_keypair` is exposed below - the
-/// selection was split out of `resolve_server_prefer_ipv4` for exactly that
-/// reason, since the DNS lookup around it cannot be made deterministic in a
-/// test. Behaviour is unchanged from the single sort-and-take-first it
-/// replaced (a stable sort by `is_ipv6` puts the first IPv4 record first,
-/// and leaves the first address of any family first when there is none).
+/// A function of its own, and `pub`, purely so `test/connect_test.rs` can
+/// exercise the choice without a live resolver - the same way
+/// `resolve_my_keypair` is exposed below, and for the same reason: the DNS
+/// lookup `resolve_server_prefer_ipv4` wraps around it cannot be made
+/// deterministic in a test.
 pub fn prefer_ipv4(addrs: &[std::net::SocketAddr]) -> Option<std::net::SocketAddr> {
     addrs
         .iter()
@@ -449,8 +465,8 @@ fn load_id_store(path: &std::path::Path) -> idstore::IdStore {
     match idstore::IdStore::load(path) {
         Ok(store) => store,
         Err(e) => {
-            eprintln!(
-                "aloo: failed to load id_store at {}: {e} (continuing this session without identity pinning)",
+            crate::log_warn!(
+                "failed to load id_store at {}: {e} (continuing this session without identity pinning)",
                 path.display()
             );
             idstore::IdStore::new_empty(path.to_path_buf())
@@ -601,8 +617,8 @@ fn load_connect_cache() -> ConnectCache {
     match ConnectCache::load(&path) {
         Ok(cache) => cache,
         Err(e) => {
-            eprintln!(
-                "aloo: failed to load connect cache at {}: {e} (continuing without it)",
+            crate::log_warn!(
+                "failed to load connect cache at {}: {e} (continuing without it)",
                 path.display()
             );
             ConnectCache::new_empty(path)
@@ -644,16 +660,48 @@ pub fn fresh_pq_hybrid_paths_in(dir: &Path) -> (PathBuf, PathBuf) {
     )
 }
 
-/// Prefills `popup`'s host/port/`pq_hybrid` file fields once, before it's
-/// shown (never reactively afterward). With a cached most-recent entry,
-/// restores its host/port/keybundle paths and sets the key type to
-/// `PqHybrid` (restored file paths only make sense with it); on first run,
-/// assigns a fresh not-yet-generated `pq_hybrid` location under `dir` so
-/// the default `my_key` type is immediately connectable.
-pub fn prefill_connect_defaults(popup: &mut ConnectPopupState, cache: &ConnectCache, dir: &Path) {
-    if let Some((host, port, file_pub, file_priv)) = cache.most_recent() {
-        popup.host = host.to_string();
+/// Prefills `popup`'s host/port/nickname/`pq_hybrid` file fields once,
+/// before it's shown (never reactively afterward).
+///
+/// Two stores feed it, each answering what it alone knows:
+///
+/// - **`~/.aloo/settings`** - the host, port and **nickname** last
+///   submitted (`Settings::remember_connection`). The nickname only lives
+///   here: `.cache` is keyed by `(host, port)`, so it has no slot for the
+///   one field that is about the person rather than the server. Absent on
+///   a machine that has never connected, which is when `$USER` (already
+///   in `popup.nickname`) stands in.
+/// - **`~/.aloo/.cache`** - the `pq_hybrid` keybundle paths last used for
+///   *that* server, which is why it is per-`(host, port)` rather than
+///   global. Restoring them also sets the key type to `PqHybrid`, since
+///   restored file paths only make sense with it. On first run a fresh,
+///   not-yet-generated location under `dir` is assigned instead, so the
+///   default `my_key` type is immediately connectable.
+pub fn prefill_connect_defaults(
+    popup: &mut ConnectPopupState,
+    settings: &crate::settings::Settings,
+    cache: &ConnectCache,
+    dir: &Path,
+) {
+    if let Some(host) = &settings.connect_host {
+        popup.host = host.clone();
+    }
+    if let Some(port) = settings.connect_port {
         popup.port = port.to_string();
+    }
+    if let Some(nickname) = &settings.connect_nickname {
+        popup.nickname = nickname.clone();
+    }
+    if let Some((host, port, file_pub, file_priv)) = cache.most_recent() {
+        // Only where settings had nothing to say - a hand-edited
+        // `connect_host` is a deliberate answer to the same question, and
+        // the cache is the older, less specific of the two records.
+        if settings.connect_host.is_none() {
+            popup.host = host.to_string();
+        }
+        if settings.connect_port.is_none() {
+            popup.port = port.to_string();
+        }
         popup.my_key.key_type = ui_connect_popup::MyKeyType::PqHybrid;
         popup.my_key.file_pub = file_pub.to_string();
         popup.my_key.file_priv = file_priv.to_string();

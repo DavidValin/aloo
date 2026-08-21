@@ -130,6 +130,7 @@ impl UiState {
             sent_at: local_time_stamp(),
             owed_receipt: None,
             delivery: None,
+            crypto: self.message_crypto(from, false),
         };
         // Same hold-and-reveal treatment as a channel message
         // (docs/PROTOCOL.md §12) - decrypts fine (our own key), but not
@@ -166,6 +167,7 @@ impl UiState {
         let from = self.own_id.unwrap_or(UserId(0));
         let from_name = self.own_name.clone();
         let is_current = self.is_viewing_dm(to);
+        let crypto = self.message_crypto(to, true);
         if let Some(room) = self.private_rooms.get_mut(&to) {
             push_log_entry(
                 &mut room.log,
@@ -181,6 +183,7 @@ impl UiState {
                     sent_at: local_time_stamp(),
                     owed_receipt: None,
                     delivery: None,
+                    crypto,
                 },
             );
         }
@@ -195,6 +198,7 @@ impl UiState {
         let from = self.own_id.unwrap_or(UserId(0));
         let from_name = self.own_name.clone();
         let is_current = self.is_viewing_dm(to);
+        let crypto = self.message_crypto(to, true);
         if let Some(room) = self.private_rooms.get_mut(&to) {
             push_log_entry(
                 &mut room.log,
@@ -210,6 +214,7 @@ impl UiState {
                     sent_at: local_time_stamp(),
                     owed_receipt: None,
                     delivery,
+                    crypto,
                 },
             );
         }
@@ -232,6 +237,7 @@ impl UiState {
             sent_at: local_time_stamp(),
             owed_receipt: None,
             delivery: None,
+            crypto: self.message_crypto(from, false),
         };
         if self.is_trust_gated(peer_id) {
             self.hold_message(peer_id, None, entry);
@@ -320,6 +326,9 @@ impl UiState {
                 sent_at: local_time_stamp(),
                 owed_receipt: None,
                 delivery: None,
+                // The app narrating its own OTP setup, not a message that
+                // travelled - there is no encryption to report on it.
+                crypto: None,
             },
         );
         if unread {
@@ -350,6 +359,7 @@ impl UiState {
         let from = self.own_id.unwrap_or(UserId(0));
         let from_name = self.own_name.clone();
         let is_current = self.is_viewing_dm(to);
+        let crypto = self.message_crypto(to, true);
         let room = self.private_rooms.get_mut(&to)?;
         let index = room.log.len();
         push_log_entry(
@@ -366,6 +376,7 @@ impl UiState {
                 sent_at: local_time_stamp(),
                 owed_receipt: None,
                 delivery,
+                crypto,
             },
         );
         Some(index)
@@ -398,6 +409,7 @@ impl UiState {
         let from = self.own_id.unwrap_or(UserId(0));
         let from_name = self.own_name.clone();
         let is_current = self.is_viewing_dm(to);
+        let crypto = self.message_crypto(to, true);
         if let Some(room) = self.private_rooms.get_mut(&to) {
             push_log_entry(
                 &mut room.log,
@@ -418,6 +430,7 @@ impl UiState {
                     sent_at: local_time_stamp(),
                     owed_receipt: None,
                     delivery,
+                    crypto,
                 },
             );
         }
@@ -434,6 +447,7 @@ impl UiState {
     ) {
         let unread = self.active_private_room != Some(from);
         let is_current = self.is_viewing_dm(from);
+        let crypto = self.message_crypto(from, false);
         let fallback_peer = self
             .known_users
             .get(&from)
@@ -467,6 +481,7 @@ impl UiState {
                 sent_at: local_time_stamp(),
                 owed_receipt: None,
                 delivery: None,
+                crypto,
             },
         );
         if unread {
@@ -545,7 +560,7 @@ fn render_otp_header(frame: &mut Frame, area: Rect, state: &UiState, peer_id: Us
         .unwrap_or_default();
     let detail = state
         .otp_key_status_for(peer_id)
-        .cloned()
+        .map(|s| s.detail.clone())
         .unwrap_or_default();
 
     let mut spans = vec![

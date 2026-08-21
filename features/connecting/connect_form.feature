@@ -131,3 +131,17 @@ Feature: Filling in the connect form
     And the connect form is filled in with valid details
     When I focus the "Connect" field
     Then the focused Connect button is highlighted but its border is not
+
+  @AC-240
+  Scenario: The form comes back as whoever connected last
+    Given a settings file recording a connection as "dave" to "chat.example.com" port 6667
+    When the connect form opens on that machine
+    Then the "nickname" field contains "dave"
+    And the "host" field contains "chat.example.com"
+    And the "port" field contains "6667"
+
+  @AC-240
+  Scenario: A machine that has never connected proposes the local user
+    Given a settings file with no connection recorded
+    When the connect form opens on that machine
+    Then the "nickname" field contains "whoami"

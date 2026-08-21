@@ -24,6 +24,11 @@ use crate::BoxError;
 /// answer to know whether it's ever allowed to auto-stop a recording on
 /// its own instead of waiting for a genuine release.
 pub fn setup() -> Result<(Terminal<CrosstermBackend<Stdout>>, bool), BoxError> {
+    // From here until `restore`, this process owns the screen: anything
+    // written straight to it would land in the middle of a frame. Every
+    // diagnostic is collected instead and replayed on the way out - see
+    // `crate::log`.
+    crate::log::silence();
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     crossterm::execute!(stdout, EnterAlternateScreen)?;
@@ -56,6 +61,11 @@ pub fn restore(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<(), 
     crossterm::execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     disable_raw_mode()?;
     terminal.show_cursor()?;
+    // The screen is the shell's again, so whatever had to stay quiet
+    // while it was not can finally be read. Both calls come after the
+    // terminal is genuinely handed back, never before.
+    crate::log::unsilence();
+    crate::log::drain();
     Ok(())
 }
 

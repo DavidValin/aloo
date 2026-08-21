@@ -9,6 +9,7 @@ use cucumber::{given, then, when};
 use aloo::proto::{ChannelInfo, ChannelKind, KeyMode, UserId, UserInfo};
 use aloo::client::tui::ui::{Focus, MessageBody, UiState};
 
+use crate::support::{popup_body, ui_buffer};
 use crate::world::AlooWorld;
 
 pub fn user_with_mode(id: u64, name: &str, key_mode: KeyMode) -> UserInfo {
@@ -173,6 +174,7 @@ async fn log_holds_a_page_and_a_half(w: &mut AlooWorld) {
 }
 
 #[given(expr = "{word} has sent me the private message {string}")]
+#[when(expr = "{word} has sent me the private message {string}")]
 async fn peer_sent_dm(w: &mut AlooWorld, name: String, body: String) {
     let id = UserId(id_for(&name));
     w.ui_mut()
@@ -306,4 +308,38 @@ async fn compose_holds(w: &mut AlooWorld, expected: String) {
 #[then("the compose bar is empty")]
 async fn compose_empty(w: &mut AlooWorld) {
     assert_eq!(w.ui_ref().input, "", "compose bar should be empty");
+}
+
+// ---------------------------------------------------------------------
+// A popup owns the cells it covers (AC-237)
+// ---------------------------------------------------------------------
+
+/// A marker nothing in the UI's own chrome contains, so any cell a popup
+/// fails to clear shows it.
+pub const BEHIND_MARKER: &str = "ZZQQ-behind-marker-ZZQQ";
+
+#[given("the channel log is full of messages")]
+async fn log_full_of_marker(w: &mut AlooWorld) {
+    let id = UserId(id_for("bob"));
+    let channel = w.ui_ref().channels[w.ui_ref().selected_channel].name.clone();
+    let state = w.ui_mut();
+    for _ in 0..40 {
+        state.on_channel_message(
+            &channel,
+            id,
+            "bob".into(),
+            MessageBody::Text(BEHIND_MARKER.repeat(6)),
+        );
+    }
+}
+
+#[then("nothing of the view behind the popup shows through it")]
+async fn nothing_shows_through(w: &mut AlooWorld) {
+    let buffer = ui_buffer(w.ui_ref(), 100, 30);
+    let body = popup_body(&buffer, "Join or create a channel");
+    assert!(!body.is_empty(), "the popup should have a body");
+    assert!(
+        !body.iter().any(|r| r.contains(BEHIND_MARKER)),
+        "the view behind the popup showed through it: {body:?}"
+    );
 }

@@ -166,6 +166,52 @@ fn resizing_an_attached_surface_redraws_at_the_new_size() {
     assert!(!frame.is_empty());
 }
 
+/// A resize must not be diffed against the buffer laid out for the old
+/// size: whatever the old layout put outside the new one would then never
+/// be painted over, showing as a half-erased header and torn selectors
+/// alongside the frame that is.
+///
+/// Checked at the level both `Surface` arms share (`Surface::resize` ->
+/// `Terminal::resize`), by looking for the erase-display escape that a
+/// full repaint has to emit and a diff never does. `Local` cannot be
+/// constructed here for the reason this file's own doc comment gives, but
+/// it reaches this same call.
+/// @requirement TB-234
+#[test]
+fn a_resize_repaints_every_cell_rather_than_diffing_against_the_old_size() {
+    /// `CSI 2 J` - erase the whole display. What `Terminal::resize` emits
+    /// through the backend, and nothing an ordinary diffed frame does.
+    const ERASE_DISPLAY: &[u8] = b"\x1b[2J";
+
+    let (writer, mut rx) = attach_channel();
+    let mut surface = Surface::Detached;
+    surface.attach(writer, TerminalSize::new(80, 24)).unwrap();
+    draw_something(&mut surface);
+    while rx.try_recv().is_ok() {}
+
+    surface.resize(TerminalSize::new(120, 40)).unwrap();
+    draw_something(&mut surface);
+
+    let frame = rx.try_recv().expect("a frame must follow a resize");
+    assert!(
+        frame
+            .windows(ERASE_DISPLAY.len())
+            .any(|w| w == ERASE_DISPLAY),
+        "the first frame after a resize must clear the screen under it"
+    );
+
+    // ...and only that one. A resize is a one-off, not a mode.
+    while rx.try_recv().is_ok() {}
+    draw_something(&mut surface);
+    let frame = rx.try_recv().expect("a second frame");
+    assert!(
+        !frame
+            .windows(ERASE_DISPLAY.len())
+            .any(|w| w == ERASE_DISPLAY),
+        "an ordinary frame after the resize goes back to diffing"
+    );
+}
+
 /// Resizing a detached surface has no meaning and must not error - a
 /// viewer's last resize can arrive just after it detaches.
 /// @requirement TB-216

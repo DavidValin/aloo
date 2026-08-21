@@ -1,18 +1,18 @@
 //! Where a frame gets drawn, decoupled from *whether* one gets drawn at
 //! all.
 //!
-//! Before daemon mode (`docs/SPEC.md` "Running in background mode") this was simply
-//! `Terminal<CrosstermBackend<Stdout>>`, threaded from `main.rs` through
-//! `connect` into `session`'s event loop, which redraws at the bottom of
-//! every `select!` iteration. A daemon has no terminal for most of its
-//! life, and a resumed one has a terminal belonging to a *different
-//! process* - neither of which that type can express.
+//! A plain `Terminal<CrosstermBackend<Stdout>>` cannot express two of the
+//! three places a session's frames go (`docs/SPEC.md` "Running in
+//! background mode"): a daemon has no terminal at all for most of its
+//! life, and a resumed one is drawing to a terminal that belongs to a
+//! *different process*.
 //!
-//! `Surface` covers all three cases behind one `draw` call, so the event
-//! loop itself is unchanged:
+//! `Surface` covers all three behind one `draw` call, so `session`'s event
+//! loop - which redraws at the bottom of every `select!` iteration - needs
+//! to know about none of it:
 //!
-//! - **`Local`** - this process owns the real stdout. Exactly what the app
-//!   did before, byte for byte.
+//! - **`Local`** - this process owns the real stdout, and draws to it
+//!   directly.
 //! - **`Detached`** - a running daemon with nobody watching. `draw` does
 //!   nothing at all: no rendering work, no allocation, no diff. This is
 //!   the state a daemon spends nearly all its time in, so it has to be
@@ -220,8 +220,8 @@ pub enum Surface {
 impl Surface {
     /// Renders one frame, or - when nothing is watching - does nothing.
     ///
-    /// Takes the same closure `Terminal::draw` does, so every existing
-    /// call site reads exactly as it did before.
+    /// Takes the same closure `Terminal::draw` does, so a call site reads
+    /// as an ordinary draw whichever of the three this is.
     pub fn draw<F>(&mut self, render: F) -> Result<(), BoxError>
     where
         F: FnOnce(&mut ratatui::Frame),
@@ -269,18 +269,34 @@ impl Surface {
         }
     }
 
-    /// Tells an attached surface its viewer's terminal changed size. A
-    /// no-op otherwise: a `Local` surface asks the OS on every draw, and a
-    /// `Detached` one has no size to speak of.
+    /// Tells this surface its terminal changed size, from either place a
+    /// resize is noticed: a `Local` surface's own `Event::Resize`, or the
+    /// `Resize` message an attached viewer sends for the terminal it owns.
+    /// A no-op only when `Detached` - nothing is being drawn there, and
+    /// there is no size to speak of.
     ///
-    /// `Terminal::resize` is what discards the stale buffer - without it
-    /// ratatui keeps diffing against a buffer of the old dimensions and
-    /// the viewer sees a frame laid out for a window that no longer
-    /// exists.
+    /// `Terminal::resize` is what discards the stale buffer and clears the
+    /// screen under it, so the very next `draw` repaints every cell for
+    /// the new dimensions. Without it ratatui keeps diffing against a
+    /// buffer laid out for a window that no longer exists: whatever the
+    /// old layout put outside the new one is never painted over, leaving
+    /// a half-erased header and torn selectors behind the frame that is.
+    ///
+    /// A `Local` terminal would eventually reach the same place on its own
+    /// (`Terminal::draw` autoresizes), but only once it next asks the OS,
+    /// and only for the size the OS happens to report then. Acting on the
+    /// event makes the repaint the resize's own, immediate consequence.
     pub fn resize(&mut self, size: TerminalSize) -> Result<(), BoxError> {
-        if let Self::Attached(terminal) = self {
-            terminal.backend_mut().set_size(size);
-            terminal.resize(ratatui::layout::Rect::new(0, 0, size.cols, size.rows))?;
+        let area = ratatui::layout::Rect::new(0, 0, size.cols, size.rows);
+        match self {
+            Self::Local(terminal) => {
+                terminal.resize(area)?;
+            }
+            Self::Detached => {}
+            Self::Attached(terminal) => {
+                terminal.backend_mut().set_size(size);
+                terminal.resize(area)?;
+            }
         }
         Ok(())
     }

@@ -14,8 +14,10 @@ use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 use aloo::client::connect::ResolvedIdentity;
 use aloo::client::session::{SessionState, TestSessionSpec};
 use aloo::client::tui::ui::{
-    DELIVERED_LABEL, DELIVERY_ARROW, DeliveryStatus, Focus, LISTENED_LABEL, LogEntry, MessageBody,
-    SAVED_LABEL, SENT_AT_LABEL, UNDELIVERED_LABEL, UiAction, UiState, strike_through,
+    DELIVERED_LABEL, DELIVERY_ARROW, DeliveryStatus, ENCRYPTION_LABEL, Focus, KEY_FILE_LABEL,
+    KEY_LABEL, KEY_OFFSET_LABEL, KEY_SEQ_LABEL, LISTENED_LABEL, LogEntry, MessageBody,
+    NO_CRYPTO_INFO, SAVED_LABEL, SENT_AT_LABEL, UNDELIVERED_LABEL, UiAction, UiState,
+    strike_through,
 };
 use aloo::crypto::KeyPair;
 use aloo::proto::{ChannelInfo, ChannelKind, KeyMode, UserInfo};
@@ -311,7 +313,7 @@ async fn offer_file(w: &mut AlooWorld) {
     let bob = UserId(id_for("bob"));
     let state = w.ui_mut();
     let (_, delivery) = state.start_delivery(&[bob]);
-    state.log_own_file_offer_channel("general", "bob", 8, "notes.txt".into(), 10, Some(delivery));
+    state.log_own_file_offer_channel("general", 8, "notes.txt".into(), 10, Some(delivery));
 }
 
 #[then("both of those rows carry a delivery arrow")]
@@ -586,4 +588,68 @@ async fn nothing_more_acknowledged(w: &mut AlooWorld) {
         vec![(1, ReceiptStage::Decrypted)],
         "the unreadable one added nothing - the sender's row stays undelivered"
     );
+}
+
+// ---------------------------------------------------------------------
+// How the message was encrypted (AC-242), and under a pad (AC-243)
+// ---------------------------------------------------------------------
+
+#[when("I open the details of my last message")]
+async fn open_details_of_last_message(w: &mut AlooWorld) {
+    let state = w.ui_mut();
+    let len = match state.active_private_room {
+        Some(peer) => state.private_rooms[&peer].log.len(),
+        None => state.channels[0].log.len(),
+    };
+    state.focus = Focus::Messages;
+    state.message_selected = len.saturating_sub(1);
+    state.handle_key(KeyCode::Char('i'), KeyModifiers::NONE, KeyEventKind::Press);
+}
+
+/// Read wide: the popup sizes itself to its own longest line, and the
+/// scheme's name is the longest thing in it.
+fn details_rows(w: &AlooWorld) -> Vec<String> {
+    crate::support::rows_of(&crate::support::ui_buffer(w.ui_ref(), 160, 30))
+}
+
+fn assert_details_line(w: &AlooWorld, label: &str, value: &str) {
+    let rows = details_rows(w);
+    assert!(
+        rows.iter().any(|r| r.contains(label) && r.contains(value)),
+        "no details line reads {label:?} {value:?}; rendered:\n{}",
+        rows.join("\n")
+    );
+}
+
+#[then("the details name the encryption scheme by its mechanism")]
+async fn details_name_the_scheme(w: &mut AlooWorld) {
+    // Not the `my_key` sourcing tag the sidebar shows - `PWD`/`PLAIN` say
+    // nothing about the cipher, both being RSA-OAEP.
+    assert_details_line(w, ENCRYPTION_LABEL, "OAEP");
+}
+
+#[then("the details name the key it was sealed to")]
+async fn details_name_the_key(w: &mut AlooWorld) {
+    let key_id = {
+        let state = w.ui_ref();
+        let peer = state.active_private_room.expect("a room is open");
+        aloo::crypto::short_fingerprint_der(&state.known_users[&peer].public_key_der)
+    };
+    assert_details_line(w, KEY_LABEL, &key_id);
+}
+
+#[then("the details report no encryption at all")]
+async fn details_report_no_encryption(w: &mut AlooWorld) {
+    assert_details_line(w, ENCRYPTION_LABEL, NO_CRYPTO_INFO);
+}
+
+#[then(expr = "the details name pad sequence {int} at offset {int}")]
+async fn details_name_pad_position(w: &mut AlooWorld, seq: u64, offset: u64) {
+    assert_details_line(w, KEY_SEQ_LABEL, &seq.to_string());
+    assert_details_line(w, KEY_OFFSET_LABEL, &offset.to_string());
+}
+
+#[then(expr = "the details name the key file ending {string}")]
+async fn details_name_key_file(w: &mut AlooWorld, tail: String) {
+    assert_details_line(w, KEY_FILE_LABEL, &tail);
 }

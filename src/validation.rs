@@ -18,6 +18,25 @@ pub fn channel_name_char_allowed(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '-'
 }
 
+/// The `#` a channel is *shown* with everywhere it is named
+/// (`docs/SPEC.md` "Connected UI"). Decoration, not part of the name: it
+/// is never sent on the wire and never stored.
+pub const CHANNEL_DISPLAY_PREFIX: char = '#';
+
+/// A channel name as someone may have typed or configured it, with that
+/// decorative `#` taken back off.
+///
+/// The name on screen carries one, so someone typing a channel in has
+/// every reason to type it the way they just read it. Only a leading one
+/// is dropped, and only one: `#` is not in the allowed charset, so
+/// anywhere else in the string it is a genuine mistake and stays there to
+/// be refused by `channel_name_is_valid` rather than being quietly
+/// deleted.
+pub fn normalize_channel_name(name: &str) -> &str {
+    let name = name.trim();
+    name.strip_prefix(CHANNEL_DISPLAY_PREFIX).unwrap_or(name)
+}
+
 /// True if `name` is non-empty, at most `CHANNEL_NAME_MAX_LEN` characters,
 /// and every character passes `channel_name_char_allowed`. Used
 /// identically by the client (reject at input time,

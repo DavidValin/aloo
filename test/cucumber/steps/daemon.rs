@@ -726,3 +726,19 @@ async fn second_outcome_noop(w: &mut AlooWorld) {
         "the outcome is reported once, not once per message that mentions it"
     );
 }
+
+/// The `connect_*` keys `settings::Settings::remember_connection` writes
+/// every time the connect screen is submitted (AC-240), which a daemon
+/// falls back to when nothing else names a server (AC-241).
+#[given(expr = "the connect screen last connected as {string} to {string} port {int}")]
+async fn connect_screen_last_connected(
+    w: &mut AlooWorld,
+    nickname: String,
+    host: String,
+    port: u16,
+) {
+    let s = settings(w);
+    s.connect_host = Some(host);
+    s.connect_port = Some(port);
+    s.connect_nickname = Some(nickname);
+}

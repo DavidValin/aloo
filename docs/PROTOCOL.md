@@ -3524,9 +3524,10 @@ didn't) does not.
 While a mutual-consent session is genuinely active with a DM's peer
 (§16.1's "started" moment, on either side, through to §16.6's "ended"
 moment, on whichever side ends it), every real message shown in that room -
-never the app's own lines about the session itself - carries a 🛡️ prefix,
-so which conversation is currently under the extra pad layer is never
-something the user has to remember or go check. Neither side disconnecting
+never the app's own lines about the session itself - carries a 🔑 prefix,
+as does the compose bar the next one is typed into, so which conversation
+is currently under the extra pad layer is never something the user has to
+remember or go check. Neither side disconnecting
 and reconnecting affects this window at all - only §16.6 closes it.
 
 A text message is logged the moment it's typed, before the send it
@@ -3736,10 +3737,13 @@ Nothing about a peer's `UserId` changing on reconnect (§3) affects whether
 their contact is still provisioned - that fact lives entirely in the
 fingerprint-derived, contact-name-keyed store (§16.1), which a reconnect
 never touches. The one thing that is naturally connection-scoped is which
-UI surface currently shows the session as active (the shield prefix and the
+UI surface currently shows the session as active (the 🔑 prefix and the
 key-metadata header, §16.5); that is re-established the moment a peer who
 is already provisioned is seen again under a fresh `UserId`, so it never
-lags behind the underlying, persistent fact for long.
+lags behind the underlying, persistent fact for long. Re-establishing it
+that way never moves the view - unlike agreeing a session in the first
+place, which opens the room it is with, since that is a thing both people
+just asked for.
 
 Ending a session never ends the underlying `pq_hybrid` conversation itself:
 the DM room stays open and usable exactly as it was before OTP was ever
@@ -3747,7 +3751,7 @@ turned on for that contact. While the session was active, every send to
 that contact rode the pad unconditionally - there was never a way to drop
 back to a plain, non-pad-wrapped send in the meantime (§16.2) - but from
 the moment it ends, a plain send to them works again immediately. Only the
-extra pad layer, and the shield marking it, are gone.
+extra pad layer, and the 🔑 marking it, are gone.
 
 ## 17. OTP mail: asynchronous, server-stored delivery
 

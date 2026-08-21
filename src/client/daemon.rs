@@ -108,6 +108,9 @@ impl DaemonChannel {
             Some((name, password)) => (name.trim(), Some(password.to_string())),
             None => (value, None),
         };
+        // `--channels=#team` is the channel written the way it is shown
+        // (`docs/SPEC.md` "Connected UI"); the `#` is decoration.
+        let name = crate::validation::normalize_channel_name(name);
         if !crate::validation::channel_name_is_valid(name) {
             return Err(format!(
                 "{name:?} is not a usable channel name (letters, digits and - only, \
@@ -582,8 +585,22 @@ async fn pump_attach(
                 let Some(event) = event else {
                     return Ok("input ended".to_string());
                 };
-                let crossterm::event::Event::Key(key) = event else {
-                    continue;
+                let key = match event {
+                    crossterm::event::Event::Key(key) => key,
+                    // The daemon renders for *this* terminal and has no
+                    // way to ask how big it is (its own stdout is
+                    // /dev/null), so a viewer that resizes has to say so -
+                    // otherwise every later frame stays laid out for the
+                    // window that was there on attach.
+                    crossterm::event::Event::Resize(cols, rows) => {
+                        wr.write_all(&daemon_ipc::encode_frame(&AttachMessage::Resize {
+                            cols,
+                            rows,
+                        })?)
+                        .await?;
+                        continue;
+                    }
+                    _ => continue,
                 };
                 // Answered locally, never forwarded - see this module's
                 // `run_attach_client` doc.
@@ -689,10 +706,17 @@ impl DaemonConfig {
     /// Precedence is the rule `main.rs`'s `run_server` already set for the
     /// server's own flags: **a flag given this run wins; anything omitted
     /// falls back to `~/.aloo/settings`; anything still missing comes from
-    /// the connect cache (the host, port and keybundle last connected
-    /// with); and only then a compiled default.** That is what lets a bare
-    /// `aloo --daemon` reproduce the last one exactly, which is what a
-    /// systemd unit runs.
+    /// the connect cache (the keybundle last connected with); and only
+    /// then a compiled default.** That is what lets a bare `aloo --daemon`
+    /// reproduce the last one exactly, which is what a systemd unit runs.
+    ///
+    /// Settings are consulted twice, in order: the `daemon_*` keys a
+    /// previous daemon start wrote, then the `connect_*` keys the connect
+    /// popup last recorded (`settings::Settings::remember_connection`).
+    /// The second is what makes a first `--daemon` on a machine that has
+    /// only ever been used interactively need no flags at all - it comes
+    /// back on the same server, as the same person, rather than as `$USER`
+    /// on a host it has to be told about again.
     ///
     /// A DM focus with no channels gets `the-hall` inserted, and says so.
     /// This is not a convenience: channel membership is the *only* way a
@@ -711,6 +735,7 @@ impl DaemonConfig {
             .host
             .clone()
             .or_else(|| settings.daemon_host.clone())
+            .or_else(|| settings.connect_host.clone())
             .or_else(|| cached.map(|(host, ..)| host.to_string()))
             // `--no-server` is the one start that legitimately has nowhere
             // to connect to, so it must not be held to this.
@@ -724,12 +749,14 @@ impl DaemonConfig {
         let port = flags
             .port
             .or(settings.daemon_port)
+            .or(settings.connect_port)
             .or_else(|| cached.map(|(_, port, ..)| port))
             .unwrap_or(crate::settings::DEFAULT_PORT);
         let nickname = flags
             .nickname
             .clone()
             .or_else(|| settings.daemon_nickname.clone())
+            .or_else(|| settings.connect_nickname.clone())
             .unwrap_or_else(local_display_name);
 
         let server_key = match (&flags.server_pwd, &flags.server_key_file) {
@@ -782,8 +809,8 @@ impl DaemonConfig {
             && matches!(focus, Some(DaemonFocus::Dm { .. }))
             && channels.is_empty()
         {
-            eprintln!(
-                "aloo: no --channel given, so joining {} to watch for the focused peer - \
+            crate::log_warn!(
+                "no --channel given, so joining {} to watch for the focused peer - \
                  presence is only ever announced within a shared channel",
                 crate::server::DEFAULT_CHANNEL_NAME
             );
@@ -823,7 +850,7 @@ impl DaemonConfig {
     /// Writes this configuration back to `~/.aloo/settings` so the next
     /// bare `aloo --daemon` - the one a systemd unit runs at boot -
     /// reproduces it. Uses the merging writer, never a whole-struct save,
-    /// for the reason `Settings::update_daemon` documents.
+    /// for the reason `Settings::update` documents.
     pub fn persist(&self, path: &Path) -> std::io::Result<()> {
         let channels: Vec<String> = self.channels.iter().map(|c| c.to_setting()).collect();
         let focus = self.focus.as_ref().map(|f| match f {
@@ -831,7 +858,7 @@ impl DaemonConfig {
             DaemonFocus::Dm { nickname, .. } => nickname.clone(),
         });
         let otp = matches!(self.focus, Some(DaemonFocus::Dm { otp: true, .. }));
-        crate::settings::Settings::update_daemon(path, |s| {
+        crate::settings::Settings::update(path, |s| {
             s.daemon_no_server = self.no_server;
             // A serverless daemon has no host, and writing the empty one it
             // stands in for would leave the next bare `--daemon` start
@@ -1109,7 +1136,7 @@ pub async fn run(
     // is the one that fails, since a failed start is exactly when the
     // user will re-run it.
     if let Err(e) = config.persist(&crate::settings::default_path()) {
-        eprintln!("aloo: could not persist daemon settings to ~/.aloo/settings ({e})");
+        crate::log_warn!("could not persist daemon settings to ~/.aloo/settings ({e})");
     }
 
     let request = config.to_connect_request();
@@ -1149,15 +1176,15 @@ pub async fn run(
     tokio::spawn(serve_attachments(listener, input_tx));
 
     if serverless {
-        println!(
-            "aloo: daemon started as {} with no server (pid {}) - reachable \
+        crate::log_warn!(
+            "daemon started as {} with no server (pid {}) - reachable \
              only by the direct_punch_to peers in ~/.aloo/settings",
             config.nickname,
             std::process::id()
         );
     } else {
-        println!(
-            "aloo: daemon connected to {}:{} as {} (pid {})",
+        crate::log_warn!(
+            "daemon connected to {}:{} as {} (pid {})",
             config.host,
             config.port,
             config.nickname,
@@ -1174,8 +1201,8 @@ pub async fn run(
         // still attach and hold Space - but it is the one thing a daemon
         // exists for, so it must not fail silently into a log nobody
         // reads.
-        eprintln!(
-            "aloo: the global push-to-talk shortcut is not available - \
+        crate::log_warn!(
+            "the global push-to-talk shortcut is not available - \
              this daemon can be attached to, but the shortcut will not fire"
         );
         crate::client::global_notification::notify(
@@ -1231,7 +1258,7 @@ impl crate::control::ControlSink for ServerlessSink {
 /// silently failed to come up is indistinguishable from one where it
 /// worked until the moment you press the shortcut and nothing happens.
 pub fn report_startup_failure(error: &dyn std::fmt::Display) {
-    eprintln!("aloo: daemon failed to start: {error}");
+    crate::log_warn!("daemon failed to start: {error}");
     crate::client::global_notification::notify(
         crate::client::global_notification::Notification::new(
             "aloo daemon failed to start",

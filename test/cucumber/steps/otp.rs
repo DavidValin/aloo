@@ -25,6 +25,7 @@ use aloo::crypto::pq::{bundle_fingerprint, open_send, seal_send};
 use aloo::proto::{KeyMode, UserId};
 
 use crate::steps::ui_common::id_for;
+use crate::support::{ui_buffer, ui_rows_wide};
 use crate::world::{pq_bundle_for, AlooWorld};
 
 fn cfg_at(dir: std::path::PathBuf) -> OtpCliConfig {
@@ -514,5 +515,79 @@ async fn otp_session_was_ended(w: &mut AlooWorld) {
         matches!(w.last_action, Some(UiAction::EndOtpSession { .. })),
         "expected /endotp to produce EndOtpSession, got {:?}",
         w.last_action
+    );
+}
+
+/// The pre-spend `otp --show-contact` snapshot a session holds for a peer
+/// (`UiState::set_otp_key_status`), which is what the message details
+/// popup reads a row's pad position out of (AC-243).
+#[given(
+    expr = "{word}'s pad has sent {int} messages over {int} bytes and received {int} over {int}"
+)]
+async fn pad_position(
+    w: &mut AlooWorld,
+    who: String,
+    enc_sequence: u64,
+    enc_offset: u64,
+    dec_sequence: u64,
+    dec_offset: u64,
+) {
+    let contact = "abcd1234";
+    let keychain = std::path::PathBuf::from("/tmp/aloo-test/otp/.keychain");
+    w.ui_mut().set_otp_key_status(
+        UserId(id_for(&who)),
+        otp_cli::OtpKeyStatus {
+            detail: otp_cli::ContactDetail {
+                enc_sequence,
+                enc_offset,
+                enc_key_remaining: 2_000_000,
+                dec_sequence,
+                dec_offset,
+                dec_key_remaining: 2_000_000,
+            },
+            contact_name: contact.to_string(),
+            enc_key_path: keychain.join(format!("{contact}_enc.key")),
+            dec_key_path: keychain.join(format!("{contact}_dec.key")),
+        },
+    );
+}
+
+// ---------------------------------------------------------------------
+// The tag a pad session gives that person (AC-246)
+// ---------------------------------------------------------------------
+
+#[then(expr = "{word} carries the OTP tag in the user list instead of their own")]
+async fn otp_tag_in_user_list(w: &mut AlooWorld, name: String) {
+    let rows = crate::support::popup_body(&ui_buffer(w.ui_ref(), 100, 14), "Users");
+    let row = rows
+        .iter()
+        .find(|r| r.contains(&name))
+        .unwrap_or_else(|| panic!("no user-list row for {name}: {rows:?}"));
+    assert!(row.contains("OTP"), "expected the pad tag: {row:?}");
+    assert!(
+        !row.contains("PQH"),
+        "the pad replaces the my_key tag rather than joining it: {row:?}"
+    );
+}
+
+#[then(expr = "{word} still carries their own tag")]
+async fn own_tag_kept(w: &mut AlooWorld, name: String) {
+    let rows = crate::support::popup_body(&ui_buffer(w.ui_ref(), 100, 14), "Users");
+    let row = rows
+        .iter()
+        .find(|r| r.contains(&name))
+        .unwrap_or_else(|| panic!("no user-list row for {name}: {rows:?}"));
+    assert!(
+        row.contains("PQH") && !row.contains("OTP"),
+        "only the peer the session is with is marked: {row:?}"
+    );
+}
+
+#[then(expr = "{word} carries the OTP tag on the DM selector")]
+async fn otp_tag_on_dm_selector(w: &mut AlooWorld, name: String) {
+    let rows = ui_rows_wide(w.ui_ref());
+    assert!(
+        crate::support::appears_before(&rows, &name, "OTP"),
+        "the DM selector carries the tag after the nickname: {rows:?}"
     );
 }

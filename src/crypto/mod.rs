@@ -186,6 +186,22 @@ pub fn fingerprint_der(der: &[u8]) -> String {
     hex_encode(&digest)
 }
 
+/// How many hex characters of a fingerprint are enough to tell two
+/// specific keys apart at a glance - 16, i.e. the first 8 bytes. Short
+/// enough not to wrap across a popup, still far beyond what anyone could
+/// collide against a key already pinned.
+pub const SHORT_FINGERPRINT_HEX: usize = 16;
+
+/// `fingerprint_der`, cut to `SHORT_FINGERPRINT_HEX`. The form every
+/// user-facing surface shows a key in (`session`'s identity-mismatch
+/// warning, the message details popup) - a full SHA-256 is for comparing
+/// bytes, not for reading.
+pub fn short_fingerprint_der(der: &[u8]) -> String {
+    let mut fp = fingerprint_der(der);
+    fp.truncate(SHORT_FINGERPRINT_HEX);
+    fp
+}
+
 /// The maximum plaintext length, in bytes, that fits in a single OAEP/SHA-256
 /// RSA block for the given key. Longer payloads must be split into several
 /// blocks, each encrypted independently.

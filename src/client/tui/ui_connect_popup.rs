@@ -518,8 +518,18 @@ pub fn run(
 ) -> Result<Option<ConnectRequest>, crate::BoxError> {
     loop {
         surface.draw(|f| render(f, popup))?;
-        let Event::Key(key) = crossterm::event::read()? else {
-            continue;
+        let key = match crossterm::event::read()? {
+            Event::Key(key) => key,
+            // Same handling the connected session gives its own resize
+            // (`session::run_connected_session`): discard the buffer laid
+            // out for the old size, so the redraw at the top of the next
+            // iteration repaints every cell rather than diffing against a
+            // window that no longer exists.
+            Event::Resize(cols, rows) => {
+                surface.resize(super::surface::TerminalSize::new(cols, rows))?;
+                continue;
+            }
+            _ => continue,
         };
         if key.kind == KeyEventKind::Release {
             continue;

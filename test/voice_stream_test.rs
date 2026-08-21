@@ -11,7 +11,10 @@
 //! key size, and two RSA-4096 keygens per identity would make this slow
 //! enough to skip. `hybrid_crypto_test.rs` covers the real sizes.
 
-use aloo::client::voice_stream::{ChunkDecryptor, IncomingStreamKey};
+use aloo::client::voice_stream::{
+    ChunkDecryptor, IdleStreamAction, IncomingStreamKey, idle_stream_action,
+};
+use std::time::{Duration, Instant};
 use aloo::crypto::pq::{
     PqPublicBundle, bundle_fingerprint, generate_bundle_with_bits, seal_chunk, seal_setup,
 };
@@ -134,5 +137,64 @@ fn an_rsa_stream_has_no_setup_to_install() {
         decryptor.decrypt(SEND_ID, 0, &[vec![1, 2, 3]]),
         None,
         "with no candidate keys nothing decrypts, but it must not panic"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Giving up on a stream nobody is going to finish (docs/PROTOCOL.md §7.3)
+// ---------------------------------------------------------------------
+
+/// A stream still receiving is left alone, however long it has been going.
+/// @requirement TB-236
+#[test]
+fn a_stream_that_is_still_arriving_is_never_swept() {
+    let now = Instant::now();
+    assert_eq!(
+        idle_stream_action(now, now, false, true),
+        IdleStreamAction::Wait
+    );
+}
+
+/// One that has gone quiet is asked to end - once. Asking again every
+/// tick would be noise, and a worker that took the first ask reports back,
+/// which is what actually finalizes the row.
+/// @requirement TB-236
+#[test]
+fn a_quiet_stream_is_asked_to_end_exactly_once() {
+    let now = Instant::now();
+    let quiet = now - Duration::from_secs(30);
+    assert_eq!(
+        idle_stream_action(now, quiet, false, true),
+        IdleStreamAction::Nudge
+    );
+    assert_eq!(
+        idle_stream_action(now, quiet, true, true),
+        IdleStreamAction::Wait,
+        "already asked, and its worker is still there to answer"
+    );
+}
+
+/// A worker that has gone without ever answering leaves nothing else to
+/// finalize the row - so the sweep gives up on it, rather than leaving the
+/// placeholder blinking "streaming..." for the rest of the session.
+/// @requirement TB-236
+#[test]
+fn a_stream_whose_worker_is_gone_is_given_up_on() {
+    let now = Instant::now();
+    let quiet = now - Duration::from_secs(30);
+    assert_eq!(
+        idle_stream_action(now, quiet, true, false),
+        IdleStreamAction::GiveUp
+    );
+    // But only once it has actually been asked, and only once it is quiet:
+    // a worker exiting the instant after its last chunk is the ordinary
+    // end of a stream, and its own report is what closes that row.
+    assert_eq!(
+        idle_stream_action(now, quiet, false, false),
+        IdleStreamAction::Nudge
+    );
+    assert_eq!(
+        idle_stream_action(now, now, true, false),
+        IdleStreamAction::Wait
     );
 }

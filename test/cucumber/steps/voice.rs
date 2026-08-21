@@ -4,11 +4,13 @@ use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 use cucumber::{given, then, when};
 
 use aloo::proto::{KeyMode, UserId};
-use aloo::client::tui::ui::{MessageBody, PendingCallInvite, UiAction, VoiceTarget};
+use aloo::client::tui::ui::{
+    END_CALL_CONFIRM_TITLE, MessageBody, PendingCallInvite, UiAction, VoiceTarget,
+};
 use aloo::client::tui::ui::format_duration_label;
 
-use crate::steps::ui_common::id_for;
-use crate::support::{header_row, ui_rows};
+use crate::steps::ui_common::{id_for, press_key};
+use crate::support::{header_row, ui_rows, ui_rows_wide};
 use crate::world::AlooWorld;
 
 // ---------------------------------------------------------------------
@@ -771,4 +773,46 @@ async fn then_status_notice_names(w: &mut AlooWorld, name: String) {
         text.contains(&name),
         "status notice {text:?} should name {name:?}"
     );
+}
+
+// ---------------------------------------------------------------------
+// END CALL asks before it leaves (AC-178)
+// ---------------------------------------------------------------------
+
+#[then("the end-call confirmation is open")]
+async fn end_call_confirmation_open(w: &mut AlooWorld) {
+    let rows = ui_rows_wide(w.ui_ref());
+    assert!(
+        rows.iter().any(|r| r.contains(END_CALL_CONFIRM_TITLE)),
+        "expected END CALL to ask first: {rows:?}"
+    );
+}
+
+#[then("the end-call confirmation is closed")]
+async fn end_call_confirmation_closed(w: &mut AlooWorld) {
+    let rows = ui_rows_wide(w.ui_ref());
+    assert!(
+        !rows.iter().any(|r| r.contains(END_CALL_CONFIRM_TITLE)),
+        "the question should have been answered: {rows:?}"
+    );
+}
+
+#[then("the call is still running")]
+async fn call_still_running(w: &mut AlooWorld) {
+    assert!(
+        w.ui_ref().call.is_some(),
+        "nothing about the call may change until the question is answered"
+    );
+    assert!(
+        !matches!(w.last_action, Some(UiAction::EndCall)),
+        "and no leave has been requested either"
+    );
+}
+
+/// Cancel is the focused answer, so leaving takes a deliberate move onto
+/// the other button first.
+#[when("I move onto END CALL and confirm")]
+async fn confirm_end_call(w: &mut AlooWorld) {
+    press_key(w, KeyCode::Left, KeyModifiers::NONE);
+    press_key(w, KeyCode::Enter, KeyModifiers::NONE);
 }

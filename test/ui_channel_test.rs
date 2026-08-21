@@ -952,7 +952,8 @@ fn sidebar_renders_an_offline_member_in_gray_instead_of_green() {
 /// not merely their presence on the server (AC-135): someone can be
 /// perfectly online and completely unreachable, which is exactly the case
 /// worth showing. Green once messages can actually reach them, red once
-/// they can't, yellow while the punch is still being worked out.
+/// they cannot - whether the punch is still in flight or the link is gone,
+/// since both answer the only question being asked the same way.
 ///
 /// @requirement AC-135
 #[test]
@@ -973,8 +974,8 @@ fn sidebar_colours_each_member_by_the_state_of_the_direct_link_to_them() {
 
     for (name, expected) in [
         ("bob", ratatui::style::Color::Green),
-        ("carol", ratatui::style::Color::Red),
-        ("dave", ratatui::style::Color::Yellow),
+        ("carol", ratatui::style::Color::DarkGray),
+        ("dave", ratatui::style::Color::DarkGray),
     ] {
         let (x, y) = find_text_start(&buffer, name);
         assert_eq!(
@@ -1003,7 +1004,7 @@ fn a_member_with_no_link_record_yet_is_not_shown_as_reachable() {
     let (x, y) = find_text_start(&buffer, "bob");
     assert_eq!(
         buffer[(x, y)].fg,
-        ratatui::style::Color::Yellow,
+        ratatui::style::Color::DarkGray,
         "an unknown link state must not claim the peer is reachable"
     );
 }
@@ -2335,5 +2336,453 @@ fn a_message_that_reached_somebody_is_not_struck_through() {
     assert!(
         rows.iter().any(|r| r.contains("morning")),
         "a message that did reach somebody is drawn plainly: {rows:?}"
+    );
+}
+
+// ---------------------------------------------------------------------
+// A dropdown longer than the screen (docs/SPEC.md "Connected UI")
+// ---------------------------------------------------------------------
+
+/// A client in more channels than the terminal has rows must still be able
+/// to walk the whole list: the dropdown stops at the bottom edge and
+/// scrolls inside it, rather than drawing off-screen rows that are simply
+/// lost.
+/// @requirement AC-238
+#[test]
+fn a_dropdown_taller_than_the_screen_stops_at_the_bottom_edge_and_scrolls() {
+    let names: Vec<String> = (0..30).map(|i| format!("channel-{i:02}")).collect();
+    let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+    let mut state = joined_public(&refs);
+    press(&mut state, KeyCode::Char('['));
+
+    let (height, width) = (14u16, 60u16);
+    let buffer = buffer_at(&state, width, height);
+    let (_, y, _, popup_height) = popup_rect(&buffer, "Channels");
+    assert_eq!(
+        y, HEADER_ROW_HEIGHT,
+        "the dropdown still hangs off the bottom of the header block"
+    );
+    assert!(
+        y + popup_height <= height,
+        "it must not run off the bottom of the screen ({y} + {popup_height} > {height})"
+    );
+
+    // What does not fit is reachable rather than lost: the list is
+    // scrolled to keep the row the selection sits at in view.
+    let rows = popup_body(&buffer, "Channels");
+    assert!(
+        rows.iter().any(|r| r.contains("channel-01")),
+        "the top of a list at its start is showing: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|r| r.contains(['\u{2591}', '\u{2588}'])),
+        "an overflowing dropdown carries a scrollbar: {rows:?}"
+    );
+
+    // Step to the far end of the list (Up wraps): the selection is then
+    // `channel-29`, which the dropdown no longer lists - but the rows
+    // around where it came out of the list are on screen, which they
+    // could not be without the list having scrolled to them.
+    press(&mut state, KeyCode::Up);
+    assert_eq!(state.channels[state.selected_channel].name, "channel-29");
+    let rows = popup_body(&buffer_at(&state, width, height), "Channels");
+    assert!(
+        rows.iter().any(|r| r.contains("channel-28")),
+        "the far end of the list is reachable: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|r| r.contains("channel-00")),
+        "and the list really moved rather than just growing: {rows:?}"
+    );
+}
+
+/// A list that fits gives up no column to a scrollbar that would be
+/// full-height anyway.
+/// @requirement AC-238
+#[test]
+fn a_dropdown_that_fits_carries_no_scrollbar() {
+    let mut state = joined_public(&["general", "random", "lobby"]);
+    press(&mut state, KeyCode::Char('['));
+
+    let rows = popup_body(&buffer_at(&state, 60, 30), "Channels");
+    assert!(
+        !rows.iter().any(|r| r.contains(['\u{2591}', '\u{2588}'])),
+        "nothing to scroll, so no scrollbar: {rows:?}"
+    );
+}
+
+/// A dropdown hangs under the selector it belongs to, not at the screen's
+/// left edge: the header row opens with the server-state element, so a
+/// dropdown positioned from the selector's own offset alone would land in
+/// the wrong place entirely.
+/// @requirement AC-238
+#[test]
+fn each_selector_dropdown_hangs_under_the_selector_it_belongs_to() {
+    let mut state = joined_general_with(vec![user(2, "bob"), user(3, "carol")]);
+    state.on_joined(aloo::proto::ChannelInfo {
+        name: "random".into(),
+        kind: aloo::proto::ChannelKind::Public,
+    });
+    state.select_channel_at(0);
+    // Two rooms open, so both selectors have something to drop down.
+    for row in [0, 1] {
+        state.focus = Focus::Sidebar;
+        state.sidebar_selected = row;
+        press(&mut state, KeyCode::Enter);
+    }
+
+    // The channel selector's own dropdown, under the channel selector.
+    press(&mut state, KeyCode::Char('['));
+    press(&mut state, KeyCode::Char('['));
+    assert!(state.selector_dropdown_open, "the channel dropdown should be open");
+    let buffer = buffer_at(&state, 120, 20);
+    let (channel_x, _) = find_text_start(&buffer, "\u{1F30D}");
+    let (dropdown_x, dropdown_y, ..) = popup_rect(&buffer, "Channels");
+    assert_eq!(
+        dropdown_y as usize, FIRST_ROW_BELOW_HEADER,
+        "it still hangs off the bottom of the header block"
+    );
+    assert_eq!(
+        dropdown_x, channel_x,
+        "the channel dropdown lines up with the channel selector, \
+         not with the left edge of the screen"
+    );
+    assert!(
+        dropdown_x > 0,
+        "and the header opens with the server state, so that column is not 0"
+    );
+
+    // The DM selector's, under the DM selector - a different column again.
+    press(&mut state, KeyCode::Esc);
+    press(&mut state, KeyCode::Char(']'));
+    press(&mut state, KeyCode::Char(']'));
+    assert!(state.selector_dropdown_open, "the DM dropdown should be open");
+    let buffer = buffer_at(&state, 120, 20);
+    let (dm_x, _) = find_text_start(&buffer, "\u{1F4AC}");
+    let (dropdown_x, ..) = popup_rect(&buffer, "DMs");
+    assert_eq!(
+        dropdown_x, dm_x,
+        "the DM dropdown lines up with the DM selector"
+    );
+    assert!(
+        dm_x > channel_x,
+        "which is further right than the channel one it sits beside"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Encryption tags in the user list, and the OTP one (docs/SPEC.md
+// "Connected UI")
+// ---------------------------------------------------------------------
+
+/// Every tag ends on the sidebar's own right edge, so they read as a
+/// column of their own rather than starting wherever each nickname
+/// happened to end - with the person still on the left.
+/// @requirement AC-245
+#[test]
+fn the_user_lists_encryption_tags_are_flush_right_with_the_names_on_the_left() {
+    let mut state = joined_general_with(vec![
+        pq_hybrid_user(2, "bo"),
+        password_user(3, "bartholomew"),
+    ]);
+    state.select_channel_at(0);
+
+    let buffer = buffer_at(&state, 100, 14);
+    let rows = popup_body(&buffer, "Users");
+    let tagged: Vec<&String> = rows.iter().filter(|r| r.contains("PWD") || r.contains("PQH")).collect();
+    assert_eq!(tagged.len(), 2, "one row per member: {rows:?}");
+
+    for row in &tagged {
+        let chars: Vec<char> = row.chars().collect();
+        let last = chars
+            .iter()
+            .rposition(|c| !c.is_whitespace())
+            .expect("a tag on this row");
+        assert_eq!(
+            last + 1,
+            chars.len(),
+            "the tag runs to the sidebar's right edge: {row:?}"
+        );
+    }
+    // The names of both lengths still start in column zero.
+    for (row, name) in tagged.iter().zip(["bo", "bartholomew"]) {
+        assert!(
+            row.starts_with(name),
+            "the person stays on the left: {row:?} should start with {name:?}"
+        );
+    }
+}
+
+/// A pad session replaces that person's own tag with the OTP one, in the
+/// user list and on both DM surfaces - the pad is what actually protects
+/// what is said to them, and it only ever runs over pq_hybrid, so the tag
+/// it displaces is always the same one.
+/// @requirement AC-246
+#[test]
+fn an_otp_session_replaces_that_peers_tag_everywhere_they_are_named() {
+    let mut state = joined_general_with(vec![pq_hybrid_user(2, "bob"), pq_hybrid_user(3, "carol")]);
+    state.select_channel_at(0);
+    for row in [0, 1] {
+        state.focus = Focus::Sidebar;
+        state.sidebar_selected = row;
+        press(&mut state, KeyCode::Enter);
+    }
+    state.mark_otp_active(UserId(2));
+
+    // Back on the channel view - opening those rooms left the last one
+    // showing, and the user list belongs to a channel.
+    press(&mut state, KeyCode::Char('['));
+    // The user list: bob's row carries OTP instead of PQH, carol's is
+    // untouched.
+    state.focus = Focus::Sidebar;
+    let buffer = buffer_at(&state, 100, 14);
+    let rows = popup_body(&buffer, "Users");
+    let row_of = |name: &str| -> String {
+        rows.iter()
+            .find(|r| r.contains(name))
+            .unwrap_or_else(|| panic!("no row for {name}: {rows:?}"))
+            .clone()
+    };
+    assert!(
+        row_of("bob").contains("OTP") && !row_of("bob").contains("PQH"),
+        "the pad replaces the my_key tag rather than joining it: {rows:?}"
+    );
+    assert!(
+        row_of("carol").contains("PQH") && !row_of("carol").contains("OTP"),
+        "and only for the peer the session is with: {rows:?}"
+    );
+
+    // The DM selector, while it names bob.
+    press(&mut state, KeyCode::Char(']'));
+    press(&mut state, KeyCode::Char(']'));
+    press(&mut state, KeyCode::Down);
+    press(&mut state, KeyCode::Char(']'));
+    let header = rendered_rows_at(&state, 120, 14).remove(HEADER_TEXT_ROW);
+    assert!(header.contains("bob"), "the selector should name bob: {header:?}");
+    assert!(
+        appears_before(std::slice::from_ref(&header), "bob", "OTP"),
+        "the DM selector carries the tag after the nickname: {header:?}"
+    );
+
+    // And the dropdown row for the peer it is not naming.
+    press(&mut state, KeyCode::Char(']'));
+    press(&mut state, KeyCode::Down);
+    press(&mut state, KeyCode::Char(']'));
+    let buffer = buffer_at(&state, 120, 14);
+    let rows = popup_body(&buffer, "DMs");
+    let bob = rows
+        .iter()
+        .find(|r| r.contains("bob"))
+        .unwrap_or_else(|| panic!("no dropdown row for bob: {rows:?}"));
+    assert!(
+        appears_before(std::slice::from_ref(bob), "bob", "OTP"),
+        "the dropdown row carries it too: {bob:?}"
+    );
+}
+
+/// The tag is drawn in the same cyan the room's own OTP session header
+/// uses, so the two read as one fact rather than two.
+/// @requirement AC-246
+#[test]
+fn the_otp_tag_is_drawn_in_the_session_headers_own_colour() {
+    let mut state = joined_general_with(vec![pq_hybrid_user(2, "bob")]);
+    state.select_channel_at(0);
+    state.mark_otp_active(UserId(2));
+
+    let buffer = buffer_at(&state, 100, 14);
+    let (x, y) = find_text_start(&buffer, "OTP");
+    assert_eq!(buffer[(x, y)].fg, ratatui::style::Color::Cyan);
+}
+
+/// A channel is named `#name` wherever it can be picked, and a `#` typed
+/// into the join form is that same decoration rather than part of the
+/// name - so someone can type a channel exactly the way they just read it.
+/// @requirement AC-247
+#[test]
+fn a_channel_is_shown_with_a_hash_and_a_typed_one_is_ignored() {
+    let mut state = joined_public(&["general", "random"]);
+
+    let header = rendered_rows_at(&state, 120, 14).remove(HEADER_TEXT_ROW);
+    assert!(
+        header.contains("#general"),
+        "the channel selector names it with the hash: {header:?}"
+    );
+    press(&mut state, KeyCode::Char('['));
+    let rows = popup_body(&buffer_at(&state, 120, 14), "Channels");
+    assert!(
+        rows.iter().any(|r| r.contains("#random")),
+        "and so does its dropdown: {rows:?}"
+    );
+    press(&mut state, KeyCode::Esc);
+
+    // Typed into the join form, the hash is accepted and then ignored:
+    // what is asked for is the bare name the server knows.
+    ctrl(&mut state, KeyCode::Char('j'));
+    type_str(&mut state, "#secret-room");
+    assert_eq!(
+        state.join_popup_input, "#secret-room",
+        "it is shown while typing, the way the channel itself is shown"
+    );
+    match press(&mut state, KeyCode::Enter) {
+        Some(UiAction::JoinChannel { name, .. }) => assert_eq!(name, "secret-room"),
+        other => panic!("expected a join for the bare name, got {other:?}"),
+    }
+}
+
+/// Only in the first position: anywhere else a `#` is a genuine mistake,
+/// and refusing the keystroke says so straight away.
+/// @requirement AC-247
+#[test]
+fn a_hash_typed_anywhere_but_the_front_is_refused() {
+    let mut state = joined_public(&["general"]);
+    ctrl(&mut state, KeyCode::Char('j'));
+    type_str(&mut state, "sec#ret");
+    assert_eq!(
+        state.join_popup_input, "secret",
+        "the stray hash never reaches the field"
+    );
+}
+
+#[test]
+#[ignore]
+fn zz_scratch_voice() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.select_channel_at(0);
+    let (_msg_id, delivery) = state.start_delivery(&[UserId(2)]);
+    state.log_own_voice_stream_start_channel("general", 7, Some(delivery));
+    println!("after start: {:?}", state.channels[0].log.last().map(|e| (&e.body, e.from)));
+    println!("own_id: {:?}", state.own_id);
+    state.on_channel_stream_finished("general", UserId(1), 7, 1000, vec![0u8; 4]);
+    println!("after finish: {:?}", state.channels[0].log.last().map(|e| &e.body));
+}
+
+// ---------------------------------------------------------------------
+// A peer who reconnects (docs/SPEC.md Functionality #7)
+// ---------------------------------------------------------------------
+
+/// A `UserId` is per-connection and never reused, so someone who
+/// reconnects arrives as a stranger by id. They must still take their own
+/// row back rather than appearing beside the gray one they left behind.
+/// @requirement AC-248
+#[test]
+fn a_peer_who_reconnects_takes_their_own_row_back() {
+    let mut state = joined_general_with(vec![user(2, "bob"), user(3, "carol")]);
+    state.select_channel_at(0);
+    // Something in bob's room, so he is kept listed while offline.
+    state.on_direct_message(UserId(2), "bob".into(), MessageBody::Text("hi".into()));
+    state.on_user_offline(UserId(2));
+    assert!(state.offline.contains(&UserId(2)));
+    assert_eq!(state.channels[0].members.len(), 2, "still listed while offline");
+    let position = state.channels[0]
+        .members
+        .iter()
+        .position(|m| m.name == "bob")
+        .expect("bob is listed");
+
+    // Back, under a fresh id the server just handed out.
+    state.on_user_joined("general", user(9, "bob"));
+
+    let names: Vec<&str> = state.channels[0].members.iter().map(|m| m.name.as_str()).collect();
+    assert_eq!(
+        names.iter().filter(|n| **n == "bob").count(),
+        1,
+        "one bob, not two: {names:?}"
+    );
+    assert_eq!(
+        state.channels[0].members[position].id,
+        UserId(9),
+        "the row he had is the row he takes back, in place"
+    );
+    assert!(
+        !state.offline.contains(&UserId(2)) && !state.offline.contains(&UserId(9)),
+        "and he is no longer offline under either id"
+    );
+    assert!(
+        !state.known_users.contains_key(&UserId(2)),
+        "the id he is no longer known by is dropped"
+    );
+}
+
+/// The conversation continues in the same window: one room, its whole
+/// history, still where it was on the DM selector.
+/// @requirement AC-248
+#[test]
+fn a_reconnecting_peers_dm_room_continues_rather_than_starting_again() {
+    let mut state = joined_general_with(vec![user(2, "bob"), user(3, "carol")]);
+    state.select_channel_at(0);
+    for row in [0, 1] {
+        state.focus = Focus::Sidebar;
+        state.sidebar_selected = row;
+        press(&mut state, KeyCode::Enter);
+    }
+    state.on_direct_message(UserId(2), "bob".into(), MessageBody::Text("before".into()));
+    let order_before = state.dm_order.clone();
+
+    state.on_user_offline(UserId(2));
+    state.on_user_joined("general", user(9, "bob"));
+
+    assert_eq!(state.dm_order.len(), order_before.len(), "no second room opened");
+    assert_eq!(
+        state.dm_order,
+        order_before
+            .iter()
+            .map(|id| if *id == UserId(2) { UserId(9) } else { *id })
+            .collect::<Vec<_>>(),
+        "the room keeps its place on the selector"
+    );
+    let room = state
+        .private_rooms
+        .get(&UserId(9))
+        .expect("the room moved onto the id he has now");
+    assert_eq!(room.peer.id, UserId(9), "and it names him by that id");
+    assert!(
+        room.log.iter().any(|e| matches!(&e.body, MessageBody::Text(t) if t == "before")),
+        "with everything said before he left still in it"
+    );
+    assert!(!state.private_rooms.contains_key(&UserId(2)));
+}
+
+/// A pad session survives a reconnect - only `/endotp` ever ends one
+/// (`docs/PROTOCOL.md` §16.6) - so it moves across with the room.
+/// @requirement AC-248
+#[test]
+fn a_pad_session_follows_a_peer_across_a_reconnect() {
+    let mut state = joined_general_with(vec![pq_hybrid_user(2, "bob")]);
+    state.select_channel_at(0);
+    state.on_direct_message(UserId(2), "bob".into(), MessageBody::Text("hi".into()));
+    state.mark_otp_active(UserId(2));
+
+    state.on_user_offline(UserId(2));
+    state.on_user_joined("general", pq_hybrid_user(9, "bob"));
+
+    assert!(state.is_otp_active(UserId(9)), "the session is still on");
+    assert!(!state.is_otp_active(UserId(2)));
+}
+
+/// Two people who were never the same person stay separate - adoption is
+/// by nickname, and only for a nickname this session actually saw go
+/// offline.
+/// @requirement AC-248
+#[test]
+fn a_different_nickname_is_never_adopted_and_neither_is_a_peer_still_online() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.select_channel_at(0);
+    state.on_direct_message(UserId(2), "bob".into(), MessageBody::Text("hi".into()));
+    state.on_user_offline(UserId(2));
+
+    // A different person joining takes nobody's row.
+    state.on_user_joined("general", user(9, "carol"));
+    assert!(state.private_rooms.contains_key(&UserId(2)), "bob's room is untouched");
+    assert!(state.offline.contains(&UserId(2)));
+
+    // And a second connection under a nickname nobody saw leave is not an
+    // adoption either.
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.select_channel_at(0);
+    state.on_user_joined("general", user(9, "bob"));
+    assert_eq!(
+        state.channels[0].members.len(),
+        2,
+        "nothing was offline, so nothing was taken over"
     );
 }

@@ -14,6 +14,7 @@ pub mod connect;
 pub mod control_channel;
 pub mod daemon;
 pub mod delivery;
+pub mod diagnostics;
 pub mod direct_punch;
 pub mod encryption;
 pub mod file_transfer;

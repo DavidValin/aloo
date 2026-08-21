@@ -10,7 +10,10 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, Borders, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
+    ScrollbarState, Wrap,
+};
 
 use crate::client::netstats::ConnQuality;
 use crate::client::presence::Presence;
@@ -21,9 +24,10 @@ use crate::validation;
 
 use super::ui::{
     DM_ICON, FileTransferStatus, JoinPopupFocus, LogEntry, MessageBody,
-    MessageDelivery, Mode, SelectorFocus, UNREAD_ENVELOPE, UiAction, UiState, channel_kind_icon,
-    finalize_held_stream, finalize_stream_entry, focus_border_style, local_time_short,
-    local_time_stamp, push_log_entry, render_input_bar, render_messages, unread_envelope,
+    MessageDelivery, Mode, OTP_TAG, OTP_TAG_COLOR, SelectorFocus, UNREAD_ENVELOPE, UiAction,
+    UiState, channel_label, display_width, finalize_held_stream, finalize_stream_entry,
+    focus_border_style, local_time_short, local_time_stamp, push_log_entry, render_input_bar,
+    render_messages, unread_envelope,
 };
 
 #[derive(Debug, Clone)]
@@ -82,7 +86,8 @@ impl UiState {
                 None
             }
             KeyCode::Enter => {
-                let name = self.join_popup_input.trim().to_string();
+                let name =
+                    validation::normalize_channel_name(&self.join_popup_input).to_string();
                 let kind = self.join_popup_kind;
                 let password = (kind == ChannelKind::Private
                     && !self.join_popup_password.is_empty())
@@ -110,6 +115,19 @@ impl UiState {
             }
             KeyCode::Char(c) => {
                 match self.join_popup_focus {
+                    // A leading `#` is accepted and then ignored on
+                    // submit (`validation::normalize_channel_name`): the
+                    // selector names channels with one, so someone typing
+                    // a channel in has every reason to type it the way
+                    // they just read it. Only in the first position -
+                    // anywhere else it is a genuine mistake, and refusing
+                    // the keystroke says so straight away.
+                    JoinPopupFocus::Name
+                        if c == validation::CHANNEL_DISPLAY_PREFIX
+                            && self.join_popup_input.is_empty() =>
+                    {
+                        self.join_popup_input.push(c);
+                    }
                     JoinPopupFocus::Name
                         if validation::channel_name_char_allowed(c)
                             && self.join_popup_input.chars().count()
@@ -489,7 +507,36 @@ impl UiState {
     }
 
     pub fn seed_member(&mut self, channel: &str, user: UserInfo) -> bool {
+        // Someone who went offline and is now back takes their own place
+        // again rather than appearing beside it
+        // (`UiState::adopt_returning_peer`). Done before anything is keyed
+        // by the new id, so the room and the selector move across in one
+        // step.
+        if let Some(previous) = self.returning_peer_id(&user) {
+            self.adopt_returning_peer(previous, &user);
+        }
         self.known_users.insert(user.id, user.clone());
+        // Their own row from before the reconnect: this nickname under an
+        // id this session no longer knows anyone by, which is exactly what
+        // `adopt_returning_peer` leaves behind. Read here rather than
+        // carried out of that call because a reconnect produces one
+        // `UserJoined` per channel and the adoption only runs on the
+        // first - every other channel finds its own stale row this way.
+        // The `known_users` check is what keeps it to genuinely departed
+        // connections: a nickname is unique among connected clients
+        // (`docs/PROTOCOL.md` §5.4), so one still known is somebody else's
+        // live row and not ours to take.
+        let stale_row = self
+            .channels
+            .iter()
+            .find(|c| c.name == channel)
+            .and_then(|c| {
+                c.members
+                    .iter()
+                    .find(|m| m.name == user.name && m.id != user.id)
+            })
+            .map(|m| m.id)
+            .filter(|id| !self.known_users.contains_key(id));
         let tab = match self.channels.iter().position(|c| c.name == channel) {
             Some(idx) => &mut self.channels[idx],
             None => {
@@ -504,6 +551,15 @@ impl UiState {
                 self.channels.last_mut().expect("just pushed")
             }
         };
+        // Replaced in place, so they keep their position in the list
+        // rather than moving to the end - and reported as an arrival,
+        // because that is what it is: they really did just rejoin.
+        if let Some(previous) = stale_row
+            && let Some(slot) = tab.members.iter_mut().find(|m| m.id == previous)
+        {
+            *slot = user;
+            return true;
+        }
         let is_new = !tab.members.iter().any(|m| m.id == user.id);
         if is_new {
             tab.members.push(user);
@@ -549,6 +605,9 @@ impl UiState {
                         sent_at: local_time_stamp(),
                         owed_receipt: None,
                         delivery: None,
+                        // This client wrote the line itself out of a
+                        // `UserJoined`; nothing about it was encrypted.
+                        crypto: None,
                     },
                 );
             }
@@ -590,6 +649,7 @@ impl UiState {
                         sent_at: local_time_stamp(),
                         owed_receipt: None,
                         delivery: None,
+                        crypto: None,
                     },
                 );
             }
@@ -613,6 +673,7 @@ impl UiState {
             sent_at: local_time_stamp(),
             owed_receipt: None,
             delivery: None,
+            crypto: self.message_crypto(from, false),
         };
         // A Pending/Rejected sender's message decrypts fine (it's encrypted
         // with *our* key, not theirs) but is held back rather than shown -
@@ -634,6 +695,7 @@ impl UiState {
         let from = self.own_id.unwrap_or(UserId(0));
         let from_name = self.own_name.clone();
         let is_current = self.is_viewing_channel(channel);
+        let crypto = self.channel_send_crypto(channel);
         if let Some(tab) = self.channels.iter_mut().find(|c| c.name == channel) {
             push_log_entry(
                 &mut tab.log,
@@ -649,6 +711,7 @@ impl UiState {
                     sent_at: local_time_stamp(),
                     owed_receipt: None,
                     delivery: None,
+                    crypto,
                 },
             );
         }
@@ -667,6 +730,7 @@ impl UiState {
         let from = self.own_id.unwrap_or(UserId(0));
         let from_name = self.own_name.clone();
         let is_current = self.is_viewing_channel(channel);
+        let crypto = self.channel_send_crypto(channel);
         if let Some(tab) = self.channels.iter_mut().find(|c| c.name == channel) {
             push_log_entry(
                 &mut tab.log,
@@ -682,6 +746,7 @@ impl UiState {
                     sent_at: local_time_stamp(),
                     owed_receipt: None,
                     delivery,
+                    crypto,
                 },
             );
         }
@@ -711,6 +776,7 @@ impl UiState {
             sent_at: local_time_stamp(),
             owed_receipt: None,
             delivery: None,
+            crypto: self.message_crypto(from, false),
         };
         if self.is_trust_gated(from) {
             self.hold_message(from, Some(channel.to_string()), entry);
@@ -771,6 +837,7 @@ impl UiState {
         let from = self.own_id.unwrap_or(UserId(0));
         let from_name = self.own_name.clone();
         let is_current = self.is_viewing_channel(channel);
+        let crypto = self.channel_send_crypto(channel);
         if let Some(tab) = self.channels.iter_mut().find(|c| c.name == channel) {
             push_log_entry(
                 &mut tab.log,
@@ -786,23 +853,24 @@ impl UiState {
                     sent_at: local_time_stamp(),
                     owed_receipt: None,
                     delivery,
+                    crypto,
                 },
             );
         }
     }
 
-    /// Creates one recipient's pending outgoing file-transfer row in the
-    /// channel log, straight away (before that recipient's Accept/Reject
-    /// response arrives) - mirrors `log_own_voice_stream_start_channel`'s
-    /// "show it live" precedent. A channel file send creates one of these
-    /// per recipient (`docs/PROTOCOL.md`'s file transfer section), `to_name`
-    /// naming which one this row is addressed to; later
-    /// progress/completion events find it again by `(from, stream_id)`
-    /// (`update_file_entry`).
+    /// Creates the pending outgoing file-transfer row in the channel log,
+    /// straight away (before any recipient's Accept/Reject response
+    /// arrives) - mirrors `log_own_voice_stream_start_channel`'s "show it
+    /// live" precedent, and its shape: **one** row for the whole send,
+    /// with `delivery` naming every recipient it went out to, so the
+    /// details popup lists them individually while the log stays one line.
+    /// `stream_id` is the row's own identity, which every transfer behind
+    /// it is registered against (`UiState::register_file_row_stream`);
+    /// later progress/completion events find it again through that.
     pub fn log_own_file_offer_channel(
         &mut self,
         channel: &str,
-        to_name: &str,
         stream_id: u64,
         filename: String,
         total: u64,
@@ -811,6 +879,7 @@ impl UiState {
         let from = self.own_id.unwrap_or(UserId(0));
         let from_name = self.own_name.clone();
         let is_current = self.is_viewing_channel(channel);
+        let crypto = self.channel_send_crypto(channel);
         if let Some(tab) = self.channels.iter_mut().find(|c| c.name == channel) {
             push_log_entry(
                 &mut tab.log,
@@ -819,7 +888,9 @@ impl UiState {
                 LogEntry {
                     from,
                     from_name,
-                    to_name: Some(to_name.to_string()),
+                    // Addressed to the channel, not to one person - the
+                    // details popup is where the recipients are named.
+                    to_name: None,
                     body: MessageBody::File {
                         filename,
                         total,
@@ -831,6 +902,7 @@ impl UiState {
                     sent_at: local_time_stamp(),
                     owed_receipt: None,
                     delivery,
+                    crypto,
                 },
             );
         }
@@ -849,6 +921,7 @@ impl UiState {
         total: u64,
     ) {
         let is_current = self.is_viewing_channel(channel);
+        let crypto = self.message_crypto(from, false);
         if let Some(tab) = self.channels.iter_mut().find(|c| c.name == channel) {
             push_log_entry(
                 &mut tab.log,
@@ -869,6 +942,7 @@ impl UiState {
                     sent_at: local_time_stamp(),
                     owed_receipt: None,
                     delivery: None,
+                    crypto,
                 },
             );
             if !is_current {
@@ -952,7 +1026,7 @@ fn selector_line(state: &UiState) -> (Line<'static>, Vec<u16>) {
 
 fn channel_selector_title(state: &UiState) -> SelectorTitle {
     let name = match state.channels.get(state.selected_channel) {
-        Some(c) => vec![Span::raw(format!("{} {}", channel_kind_icon(c.kind), c.name))],
+        Some(c) => vec![Span::raw(channel_label(c.kind, &c.name))],
         // Every joined channel left behind (`/leave`): the selector keeps
         // the row's left slot, with nothing to name in it.
         None => vec![Span::styled(
@@ -966,6 +1040,10 @@ fn channel_selector_title(state: &UiState) -> SelectorTitle {
         state,
         SelectorFocus::Channels,
         state.any_channel_unread(),
+        // A channel is a room, not a person: there is no reachability to
+        // colour its envelope by, so it says nothing about one - plain
+        // white, where a DM's says who it is from.
+        CHANNEL_UNREAD_COLOR,
     ));
     SelectorTitle { name, trailing }
 }
@@ -976,22 +1054,40 @@ fn channel_selector_title(state: &UiState) -> SelectorTitle {
 fn dm_selector_title(state: &UiState) -> Option<SelectorTitle> {
     let peer = state.selected_dm?;
     let nickname = state.private_rooms.get(&peer)?.peer.name.clone();
-    let mut trailing = Vec::new();
-    push_more_span(&mut trailing, state.dm_order.len());
-    trailing.extend(envelope_spans(
-        state,
-        SelectorFocus::Dms,
-        state.any_dm_unread(),
-    ));
     // The named peer carries the same presence colour their name has in
     // the channel sidebar (`presence_color`): an open DM is the one view
     // with no user list of its own, so without this the whole time a room
     // is open there is nothing on screen saying whether what is being
     // typed into it can actually get there.
+    let presence = presence_color(state.presence_of(peer));
+    // The pad tag sits directly after the nickname, before the quiet
+    // count and the envelope: it is a fact about that person, not about
+    // what else the selector is holding. Outside the focus highlight for
+    // the reason `SelectorTitle` gives - reversing an emoji paints a block
+    // behind it.
+    let mut trailing = Vec::new();
+    if state.is_otp_active(peer) {
+        trailing.push(Span::raw(" "));
+        trailing.push(Span::styled(
+            OTP_TAG,
+            Style::default().fg(OTP_TAG_COLOR),
+        ));
+    }
+    push_more_span(&mut trailing, state.dm_order.len());
+    // The envelope beside a person is that same colour, not the generic
+    // unread yellow (`docs/SPEC.md` "Connected UI"): it blinks right next
+    // to the nickname it belongs to, and two colours on one name read as
+    // two separate facts rather than one person with unread messages.
+    trailing.extend(envelope_spans(
+        state,
+        SelectorFocus::Dms,
+        state.any_dm_unread(),
+        presence,
+    ));
     Some(SelectorTitle {
         name: vec![Span::styled(
             format!("{DM_ICON} {nickname}"),
-            Style::default().fg(presence_color(state.presence_of(peer))),
+            Style::default().fg(presence),
         )],
         trailing,
     })
@@ -1011,12 +1107,25 @@ fn push_more_span(spans: &mut Vec<Span<'static>>, total: usize) {
     }
 }
 
-fn envelope_spans(state: &UiState, which: SelectorFocus, unread: bool) -> Vec<Span<'static>> {
+/// One selector's blinking unread envelope, in `color` - the colour the
+/// thing it stands for is already named in (`dm_selector_title` for why a
+/// person's is their presence colour).
+/// The colour a channel's unread envelope blinks in - plain white, for
+/// the reason `channel_selector_title` gives. A DM's takes the peer's own
+/// colour instead (`dm_selector_title`).
+pub(crate) const CHANNEL_UNREAD_COLOR: Color = Color::White;
+
+fn envelope_spans(
+    state: &UiState,
+    which: SelectorFocus,
+    unread: bool,
+    color: Color,
+) -> Vec<Span<'static>> {
     let own_dropdown_open = state.selector_dropdown_open && state.selector_focus == which;
     if unread && !own_dropdown_open {
         vec![Span::styled(
             unread_envelope(state.blink_on),
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(color),
         )]
     } else {
         Vec::new()
@@ -1211,6 +1320,22 @@ fn render_call_marker(frame: &mut Frame, area: Rect) {
     );
 }
 
+/// The absolute column the header's two selectors begin at: past the
+/// server-state element on their left, and inset by `HEADER_SIDE_PAD` like
+/// the rest of the row.
+///
+/// The same figure `render_header_row`'s layout puts them at, and the one
+/// each selector's own dropdown hangs from - measured through the very
+/// same `server_state_width` so the row and the dropdown under it cannot
+/// round apart by a column. `None` on a terminal too small to draw the
+/// header at all, where there is no selector to hang anything from
+/// either.
+fn selectors_start_col(area: Rect, state: &UiState) -> Option<u16> {
+    let line = header_text_row(area)?;
+    let label_width = server_state_line(state).width() as u16;
+    Some(line.x + server_state_width(area.width, label_width))
+}
+
 /// The one row of `area` the header's text sits on, already inset by
 /// `HEADER_SIDE_PAD` on both sides. `None` on a terminal too small to hold
 /// the block or too narrow to inset - nothing is drawn rather than drawn
@@ -1240,28 +1365,41 @@ pub(crate) fn render_selector_dropdown(frame: &mut Frame, area: Rect, state: &Ui
             // A DM row names a person, and is coloured by whether they can
             // be reached, exactly as the selector above it and the channel
             // sidebar are. A channel row has nobody to say that about.
-            let mut spans = vec![match e.presence {
-                Some(presence) => Span::styled(
-                    e.label.clone(),
-                    Style::default().fg(presence_color(presence)),
-                ),
+            // Its envelope follows the row's own colour, exactly as the
+            // selector above it does (`envelope_spans`).
+            let color = e.presence.map(presence_color);
+            let mut spans = vec![match color {
+                Some(color) => Span::styled(e.label.clone(), Style::default().fg(color)),
                 None => Span::raw(e.label.clone()),
             }];
+            // The same pad tag the DM selector above carries, on the row
+            // it belongs to (`UiState::encryption_tag`).
+            if e.otp {
+                spans.push(Span::raw(" "));
+                spans.push(Span::styled(OTP_TAG, Style::default().fg(OTP_TAG_COLOR)));
+            }
             if e.unread {
                 spans.push(Span::styled(
                     unread_envelope(state.blink_on),
-                    Style::default().fg(Color::Yellow),
+                    Style::default().fg(color.unwrap_or(CHANNEL_UNREAD_COLOR)),
                 ));
             }
             Line::from(spans)
         })
         .collect();
 
-    // Hangs from the focused selector's own start column, plus the
-    // header's side padding (`selector_line` measures the rest).
+    // Hangs from the focused selector's own start column: where the
+    // selectors begin on the row (`selectors_start_col`), plus that
+    // selector's own offset within them (`selector_line` measures it).
+    // Both parts matter - the row opens with the server-state element, so
+    // a dropdown positioned from the offset alone lands at the screen's
+    // left edge instead of under the selector it belongs to.
+    let Some(selectors_x) = selectors_start_col(area, state) else {
+        return;
+    };
     let (_, starts) = selector_line(state);
     let (_, selected) = selector_titles(state);
-    let x = HEADER_SIDE_PAD + starts.get(selected).copied().unwrap_or(0);
+    let x = selectors_x + starts.get(selected).copied().unwrap_or(0);
     let title = match state.selector_focus {
         SelectorFocus::Channels => "Channels",
         SelectorFocus::Dms => "DMs",
@@ -1275,7 +1413,9 @@ pub(crate) fn render_selector_dropdown(frame: &mut Frame, area: Rect, state: &Ui
     let x = x.min(area.width.saturating_sub(1));
     let width = (content_width + 3).min(area.width - x);
     // Hangs off the bottom of the header block, so the blank line under
-    // the selectors stays blank.
+    // the selectors stays blank - and never past the bottom of the
+    // screen, however many entries the selector holds. What does not fit
+    // is scrolled to rather than cut off (see below).
     let height = ((rows.len() as u16) + 2).min(area.height - HEADER_ROW_HEIGHT);
     let popup = Rect {
         x,
@@ -1287,10 +1427,58 @@ pub(crate) fn render_selector_dropdown(frame: &mut Frame, area: Rect, state: &Ui
     let inner = block.inner(popup);
     frame.render_widget(ratatui::widgets::Clear, popup);
     frame.render_widget(block, popup);
-    frame.render_widget(
+
+    // Scrolls exactly the way the message log does (`render_messages`):
+    // a `ListState` whose selection ratatui keeps on screen, computing
+    // the offset itself, and the rightmost column given up to a scrollbar
+    // only while there is genuinely more list than viewport. A list that
+    // merely stopped at the bottom edge would put every entry past it out
+    // of reach - including, once Up/Down walked that far, the part of the
+    // list the selection is moving through.
+    //
+    // Nothing is *highlighted*: the row kept in view marks where the
+    // current selection was taken out of the list, not a row of it (see
+    // `UiState::selector_dropdown_focus_row`), so the default (empty)
+    // highlight style is what this list wants.
+    let visible = inner.height as usize;
+    let overflows = rows.len() > visible && inner.width > 1;
+    let list_area = if overflows {
+        Rect {
+            width: inner.width - 1,
+            ..inner
+        }
+    } else {
+        inner
+    };
+    let total = rows.len();
+    let mut list_state = ListState::default();
+    list_state.select(Some(state.selector_dropdown_focus_row()));
+    frame.render_stateful_widget(
         List::new(rows.into_iter().map(ListItem::new).collect::<Vec<_>>()),
-        inner,
+        list_area,
+        &mut list_state,
     );
+
+    if overflows {
+        let mut scrollbar_state = ScrollbarState::new(total - visible + 1)
+            .viewport_content_length(visible)
+            .position(list_state.offset());
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None)
+                .track_symbol(Some("\u{2591}"))
+                .thumb_symbol("\u{2588}")
+                .track_style(Style::default().fg(Color::DarkGray))
+                .thumb_style(Style::default().fg(Color::Gray)),
+            Rect {
+                x: inner.right() - 1,
+                width: 1,
+                ..inner
+            },
+            &mut scrollbar_state,
+        );
+    }
 }
 
 pub(crate) fn render_channel_view(frame: &mut Frame, area: Rect, state: &UiState) {
@@ -1344,13 +1532,18 @@ pub(crate) fn cpu_color(pct: f32) -> Color {
 /// top row's DM selector.
 pub(crate) fn presence_color(presence: Presence) -> Color {
     match presence {
-        // The most urgent of the three, and the only one with something to
-        // do about it (Enter opens the review).
+        // Not a reachability state at all: an unresolved or rejected
+        // identity is the one thing here with something to *do* about it
+        // (Enter opens the review), so it keeps a colour of its own.
         Presence::Unverified => Color::Red,
-        Presence::Offline => Color::DarkGray,
+        // Reachability is a yes-or-no question, and the answer is all
+        // anyone about to type needs: green once what is typed reaches
+        // them, grey until it does. A punch in flight and a link that is
+        // gone are the same answer - no - and giving each its own colour
+        // only invites reading transport detail into a name
+        // (`docs/SPEC.md` "Connected UI").
         Presence::Reachable => Color::Green,
-        Presence::Connecting => Color::Yellow,
-        Presence::Unreachable => Color::Red,
+        Presence::Offline | Presence::Connecting | Presence::Unreachable => Color::DarkGray,
     }
 }
 
@@ -1414,10 +1607,31 @@ fn render_sidebar(frame: &mut Frame, area: Rect, state: &UiState) {
             } else {
                 ""
             };
-            let label = format!(
-                "{muted}{envelope}{}",
-                m.key_mode.format_with_name(&m.name)
-            );
+            // The person on the left, their encryption tag flush against
+            // the sidebar's right edge (`docs/SPEC.md` "Connected UI") -
+            // so the tags line up down one column and can be read as a
+            // column, rather than starting wherever each nickname
+            // happened to end. On a sidebar too narrow to hold both the
+            // gap floors at one space and the row clips at its right
+            // edge, exactly as an overlong entry always has.
+            let name = format!("{muted}{envelope}{}", m.name);
+            let tag = state.encryption_tag(m.id, m.key_mode);
+            let gap = (inner.width as usize)
+                .saturating_sub((display_width(&name) + display_width(tag)) as usize)
+                .max(1);
+            // The tag is the row's own colour - the direct-link state
+            // below - except while a pad session is open, which is loud
+            // enough to say in its own colour wherever it appears.
+            let tag_style = if tag == OTP_TAG {
+                Style::default().fg(OTP_TAG_COLOR)
+            } else {
+                Style::default()
+            };
+            let label = Line::from(vec![
+                Span::raw(name),
+                Span::raw(" ".repeat(gap)),
+                Span::styled(tag, tag_style),
+            ]);
             // A Pending/Rejected identity (docs/PROTOCOL.md §12) takes
             // priority over everything below - it's the most urgent,
             // actionable state (open the review popup via Enter), whether
@@ -1472,6 +1686,7 @@ pub(crate) fn render_join_popup(frame: &mut Frame, area: Rect, state: &UiState) 
         .title("Join or create a channel (Tab to move, Enter to confirm, Esc to cancel)")
         .borders(Borders::ALL);
     let inner = block.inner(popup);
+    frame.render_widget(ratatui::widgets::Clear, popup);
     frame.render_widget(block, popup);
 
     let mut constraints = vec![Constraint::Length(1), Constraint::Length(1)];
@@ -1585,6 +1800,7 @@ pub(crate) fn render_channel_password_popup(frame: &mut Frame, area: Rect, state
         ))
         .borders(Borders::ALL);
     let inner = block.inner(popup);
+    frame.render_widget(ratatui::widgets::Clear, popup);
     frame.render_widget(block, popup);
 
     let mut constraints = vec![Constraint::Length(1)];

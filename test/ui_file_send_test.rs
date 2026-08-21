@@ -263,25 +263,37 @@ fn there_is_no_size_cap_on_a_file_send() {
 // stream_id - AC-075/AC-096)
 // ---------------------------------------------------------------------
 
+/// One row for the whole send, addressed to everyone it went out to - the
+/// same shape a channel voice message has, with the recipients named
+/// individually in the details popup rather than one log line each.
 /// @requirement AC-096
 #[test]
-fn a_channel_file_send_logs_one_row_per_recipient_naming_them() {
+fn a_channel_file_send_logs_one_row_addressed_to_every_recipient() {
     let mut state = joined_general_with(vec![user(2, "bob"), user(3, "carol")]);
-    state.log_own_file_offer_channel("general", "bob", 1, "report.pdf".into(), 1000, None);
-    state.log_own_file_offer_channel("general", "carol", 2, "report.pdf".into(), 1000, None);
+    let (_msg_id, delivery) = state.start_delivery(&[UserId(2), UserId(3)]);
+    state.log_own_file_offer_channel("general", 1, "report.pdf".into(), 1000, Some(delivery));
+    state.register_file_row_stream(1, 1);
+    state.register_file_row_stream(1, 2);
 
-    assert_eq!(state.channels[0].log.len(), 2);
-    assert_eq!(state.channels[0].log[0].to_name.as_deref(), Some("bob"));
-    assert_eq!(state.channels[0].log[1].to_name.as_deref(), Some("carol"));
-    for entry in &state.channels[0].log {
-        assert!(entry.outgoing);
-        match &entry.body {
-            MessageBody::File { status, total, .. } => {
-                assert_eq!(*status, FileTransferStatus::Pending);
-                assert_eq!(*total, 1000);
-            }
-            other => panic!("expected a file entry, got {other:?}"),
+    assert_eq!(state.channels[0].log.len(), 1, "one line, not one per person");
+    let entry = &state.channels[0].log[0];
+    assert!(entry.outgoing);
+    assert_eq!(
+        entry.to_name, None,
+        "it is addressed to the channel; the popup names the people"
+    );
+    let recipients = &entry.delivery.as_ref().expect("a delivery record").recipients;
+    assert_eq!(
+        recipients.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+        vec!["bob", "carol"],
+        "every recipient is on the one row's delivery record"
+    );
+    match &entry.body {
+        MessageBody::File { status, total, .. } => {
+            assert_eq!(*status, FileTransferStatus::Pending);
+            assert_eq!(*total, 1000);
         }
+        other => panic!("expected a file entry, got {other:?}"),
     }
 
     let rows = rendered_rows(&state);
@@ -289,6 +301,72 @@ fn a_channel_file_send_logs_one_row_per_recipient_naming_them() {
         rows.iter().any(|r| r.contains('\u{1F4CE}')),
         "expected the paperclip icon to render: {rows:?}"
     );
+}
+
+/// The one row aggregates what all its transfers report: it is not sent
+/// until it is sent to everyone, and what happens to it in the end is what
+/// happened across all of them.
+/// @requirement AC-096
+#[test]
+fn one_file_row_reports_the_least_advanced_of_its_transfers() {
+    let mut state = joined_general_with(vec![user(2, "bob"), user(3, "carol")]);
+    let me = UserId(1);
+    let (_msg_id, delivery) = state.start_delivery(&[UserId(2), UserId(3)]);
+    state.log_own_file_offer_channel("general", 1, "report.pdf".into(), 1000, Some(delivery));
+    state.register_file_row_stream(1, 1);
+    state.register_file_row_stream(1, 2);
+
+    let status = |state: &aloo::client::tui::ui::UiState| match &state.channels[0].log[0].body {
+        MessageBody::File { status, .. } => status.clone(),
+        other => panic!("expected a file entry, got {other:?}"),
+    };
+
+    state.set_file_progress(me, 1, 800);
+    assert_eq!(
+        status(&state),
+        FileTransferStatus::InProgress { bytes: 0 },
+        "one recipient racing ahead does not make the send nearly done"
+    );
+    state.set_file_progress(me, 2, 300);
+    assert_eq!(status(&state), FileTransferStatus::InProgress { bytes: 300 });
+
+    // One finished, one still going: the row follows the one still going.
+    state.set_file_completed(me, 1);
+    assert_eq!(status(&state), FileTransferStatus::InProgress { bytes: 300 });
+    state.set_file_completed(me, 2);
+    assert_eq!(status(&state), FileTransferStatus::Completed);
+}
+
+/// A send everybody declined reads as declined; one that broke reads as
+/// broken; and one person taking it is enough for the row to have landed.
+/// @requirement AC-096
+#[test]
+fn one_file_row_ends_as_whatever_happened_across_its_transfers() {
+    let row = |rejected: &[u64], failed: &[u64], done: &[u64]| {
+        let mut state = joined_general_with(vec![user(2, "bob"), user(3, "carol")]);
+        let (_msg_id, delivery) = state.start_delivery(&[UserId(2), UserId(3)]);
+        state.log_own_file_offer_channel("general", 1, "report.pdf".into(), 1000, Some(delivery));
+        state.register_file_row_stream(1, 1);
+        state.register_file_row_stream(1, 2);
+        for id in rejected {
+            state.set_file_rejected(UserId(1), *id);
+        }
+        for id in failed {
+            state.set_file_failed(UserId(1), *id);
+        }
+        for id in done {
+            state.set_file_completed(UserId(1), *id);
+        }
+        match &state.channels[0].log[0].body {
+            MessageBody::File { status, .. } => status.clone(),
+            other => panic!("expected a file entry, got {other:?}"),
+        }
+    };
+
+    assert_eq!(row(&[1, 2], &[], &[]), FileTransferStatus::Rejected);
+    assert_eq!(row(&[], &[1, 2], &[]), FileTransferStatus::Failed);
+    assert_eq!(row(&[1], &[2], &[]), FileTransferStatus::Failed);
+    assert_eq!(row(&[1], &[], &[2]), FileTransferStatus::Completed);
 }
 
 // ---------------------------------------------------------------------
@@ -464,8 +542,8 @@ fn a_progress_update_advances_the_bar_and_completion_finalizes_it() {
 #[test]
 fn rejection_and_failure_are_reflected_on_the_matching_row() {
     let mut state = joined_general_with(vec![user(2, "bob"), user(3, "carol")]);
-    state.log_own_file_offer_channel("general", "bob", 1, "a.txt".into(), 10, None);
-    state.log_own_file_offer_channel("general", "carol", 2, "a.txt".into(), 10, None);
+    state.log_own_file_offer_channel("general", 1, "a.txt".into(), 10, None);
+    state.log_own_file_offer_channel("general", 2, "a.txt".into(), 10, None);
 
     state.set_file_rejected(state.own_id.unwrap(), 1);
     state.set_file_failed(state.own_id.unwrap(), 2);

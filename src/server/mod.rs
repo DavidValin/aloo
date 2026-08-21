@@ -644,7 +644,7 @@ async fn serve_tcp(
                 handle_connection(socket, peer, registry, senders, auth, heartbeat_timeout, mail_store)
                     .await
             {
-                eprintln!("aloo: connection {peer} ended: {e}");
+                crate::log_warn!("connection {peer} ended: {e}");
             }
         });
     }
@@ -673,7 +673,7 @@ async fn udp_rendezvous_loop(socket: UdpSocket) {
         let (n, from) = match socket.recv_from(&mut buf).await {
             Ok(ok) => ok,
             Err(e) => {
-                eprintln!("aloo: UDP rendezvous receive error (ignoring, still listening): {e}");
+                crate::log_warn!("UDP rendezvous receive error (ignoring, still listening): {e}");
                 // Safety net against a permanently-broken socket erroring
                 // instantly forever, which would busy-spin this task at
                 // 100% of a core; transient errors don't notice 50ms.

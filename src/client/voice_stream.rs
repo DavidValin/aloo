@@ -181,6 +181,51 @@ pub(crate) struct ActiveStream {
     /// `Some(channel)` for a channel stream, `None` for a DM.
     pub(crate) channel: Option<String>,
     pub(crate) last_seen: Instant,
+    /// Whether the idle sweep has already asked this stream's worker to
+    /// end (`IdleStreamAction`). One ask is all there is to make: a worker
+    /// that took it reports back and the entry goes with it, so a stream
+    /// still here afterwards is one whose worker is not answering.
+    pub(crate) end_requested: bool,
+}
+
+/// What the idle sweep should do about one incoming stream that has gone
+/// quiet (`session::run_connected_session`'s ticker).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdleStreamAction {
+    /// Still within its idle window, or already asked and its worker is
+    /// still there to answer.
+    Wait,
+    /// Quiet past `STREAM_IDLE_TIMEOUT` and not yet asked: tell the worker
+    /// to end, so it finalizes the row with whatever partial audio
+    /// arrived.
+    Nudge,
+    /// Asked, and the worker is gone without ever answering. Nothing else
+    /// will ever finalize this row, so the sweep closes it out itself -
+    /// otherwise the placeholder blinks "streaming..." for the rest of the
+    /// session and the entry leaks.
+    GiveUp,
+}
+
+/// The decision above, as a function of the three things it depends on -
+/// so the sweep's rule can be exercised without a socket, a worker thread
+/// or an audio device.
+pub fn idle_stream_action(
+    now: Instant,
+    last_seen: Instant,
+    end_requested: bool,
+    worker_alive: bool,
+) -> IdleStreamAction {
+    if now.saturating_duration_since(last_seen) < STREAM_IDLE_TIMEOUT {
+        return IdleStreamAction::Wait;
+    }
+    if !end_requested {
+        return IdleStreamAction::Nudge;
+    }
+    if worker_alive {
+        IdleStreamAction::Wait
+    } else {
+        IdleStreamAction::GiveUp
+    }
 }
 
 /// Encrypts one chunk of `pcm` for every recipient of `target`, dispatching
@@ -240,8 +285,9 @@ pub(crate) fn encrypt_direct_chunk(
 /// Every `UserId` a stream's `target` addresses - RSA and PQ recipients
 /// combined for a channel stream, the single recipient for a DM. Used at
 /// `*End` time to fan `P2pOutbound::VoiceEnd` out to the same recipient set
-/// `*Start` reached, since (unlike the old server-relayed broadcast) there's
-/// no membership list to derive it from on the receiving end anymore.
+/// `*Start` reached: the stream travels peer to peer (`docs/PROTOCOL.md`
+/// §7.1), so there is no membership list on the receiving end to derive it
+/// from.
 fn stream_recipient_ids(target: &StreamRecipients) -> Vec<UserId> {
     match target {
         StreamRecipients::Channel { rsa, pq, .. } => rsa
@@ -723,6 +769,7 @@ pub(crate) fn start_incoming_stream(
             job_tx,
             channel,
             last_seen: Instant::now(),
+            end_requested: false,
         },
     );
 }

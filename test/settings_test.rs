@@ -512,3 +512,82 @@ fn direct_punch_channels_are_read_one_per_line_and_validated() {
     assert_eq!(reloaded.direct_punch_channels, settings.direct_punch_channels);
     let _ = std::fs::remove_file(&path);
 }
+
+// ---------------------------------------------------------------------
+// The last connection made from the connect popup (`connect_*`)
+// ---------------------------------------------------------------------
+
+/// @requirement AC-240
+#[test]
+fn the_last_connection_is_remembered_and_read_back() {
+    let path = temp_settings_path();
+    Settings::remember_connection(&path, "chat.example.com", 6667, "dave")
+        .expect("recording a connection must not fail");
+
+    let settings = Settings::load_or_create(&path).unwrap();
+    assert_eq!(settings.connect_host.as_deref(), Some("chat.example.com"));
+    assert_eq!(settings.connect_port, Some(6667));
+    assert_eq!(settings.connect_nickname.as_deref(), Some("dave"));
+
+    let contents = std::fs::read_to_string(&path).unwrap();
+    assert!(contents.contains("connect_nickname=dave"), "{contents}");
+    assert!(contents.contains("connect_host=chat.example.com"), "{contents}");
+    assert!(contents.contains("connect_port=6667"), "{contents}");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A later connection replaces the earlier one - this is "the last values
+/// used", not a history.
+/// @requirement AC-240
+#[test]
+fn a_second_connection_replaces_what_the_first_recorded() {
+    let path = temp_settings_path();
+    Settings::remember_connection(&path, "first.example.com", 1111, "dave").unwrap();
+    Settings::remember_connection(&path, "second.example.com", 2222, "erin").unwrap();
+
+    let settings = Settings::load_or_create(&path).unwrap();
+    assert_eq!(settings.connect_host.as_deref(), Some("second.example.com"));
+    assert_eq!(settings.connect_port, Some(2222));
+    assert_eq!(settings.connect_nickname.as_deref(), Some("erin"));
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The merging write matters here for the same reason it does for the
+/// daemon keys: a daemon may be running and writing this same file while
+/// a second `aloo` is being connected in a terminal.
+/// @requirement AC-240
+#[test]
+fn remembering_a_connection_leaves_every_other_key_alone() {
+    let path = temp_settings_path();
+    let mut settings = Settings {
+        server_port: 9999,
+        daemon_nickname: Some("daemonname".to_string()),
+        ..Settings::default()
+    };
+    settings.muted_voice.insert("noisy".to_string());
+    settings.save(&path).unwrap();
+
+    Settings::remember_connection(&path, "chat.example.com", 6667, "dave").unwrap();
+
+    let reloaded = Settings::load_or_create(&path).unwrap();
+    assert_eq!(reloaded.server_port, 9999);
+    assert_eq!(reloaded.daemon_nickname.as_deref(), Some("daemonname"));
+    assert!(reloaded.muted_voice.contains("noisy"));
+    assert_eq!(reloaded.connect_nickname.as_deref(), Some("dave"));
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A `--no-server` start has no host to record, and the empty string it
+/// stands in for is not one - recording it would leave the next start
+/// resolving a host that is not a host.
+/// @requirement AC-240
+#[test]
+fn a_connection_with_no_host_leaves_the_recorded_host_alone() {
+    let path = temp_settings_path();
+    Settings::remember_connection(&path, "chat.example.com", 6667, "dave").unwrap();
+    Settings::remember_connection(&path, "", 6667, "dave").unwrap();
+
+    let settings = Settings::load_or_create(&path).unwrap();
+    assert_eq!(settings.connect_host.as_deref(), Some("chat.example.com"));
+    let _ = std::fs::remove_file(&path);
+}

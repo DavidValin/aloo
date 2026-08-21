@@ -125,3 +125,32 @@ Feature: Moving between channels
     When I press Ctrl+J
     And I press Enter
     Then nothing happens
+
+  @AC-238
+  Scenario: A dropdown longer than the screen scrolls instead of running off it
+    Given I am connected and viewing a channel
+    And the channel already has joined 30 more channels
+    When I press the [ key
+    Then the channel dropdown is open
+    And the dropdown stops at the bottom of the screen and carries a scrollbar
+    When I press Up
+    Then the dropdown has scrolled to the far end of the list
+
+  @AC-239
+  Scenario: An unread DM blinks in the colour of the person it is from
+    Given I am connected and viewing a channel
+    And bob is in the channel with me
+    And carol is in the channel with me
+    And I have opened a private room with carol
+    And bob has sent me the private message "psst"
+    When I press the [ key
+    Then the DM selector's envelope is the same colour as the nickname beside it
+
+  @AC-247
+  Scenario: A channel can be typed the way it is shown
+    Given I am connected and viewing a channel
+    Then the channel selector names it with a leading hash
+    When I press Ctrl+J
+    And I type "#secret-room"
+    And I press Enter
+    Then joining the private channel "secret-room" is requested

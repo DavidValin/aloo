@@ -288,6 +288,7 @@ fn render_confirm(
     let popup = centered_rect(64, 9, area);
     let block = Block::default().title("Send file").borders(Borders::ALL);
     let inner = block.inner(popup);
+    frame.render_widget(ratatui::widgets::Clear, popup);
     frame.render_widget(block, popup);
 
     let rows = Layout::default()

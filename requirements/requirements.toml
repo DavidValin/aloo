@@ -159,6 +159,12 @@ id = "TB-012"
 description = "A focused free-text field appends typed characters and Backspace removes the last one."
 evidence = "src/client/tui/ui_connect_popup.rs handle_key; tests typing_fills_host_field, id_store_path_field_is_freely_editable"
 
+[[user_story.acceptance_criteria]]
+id = "AC-240"
+description = "The host, port and nickname a connection was last made with are recorded in ~/.aloo/settings (connect_host / connect_port / connect_nickname) whether or not that connection then succeeded, and prefill the connect popup next time. The nickname lives only here - the connect cache is keyed by (host, port) and holds keybundle paths, with no slot for the one field that is about the person rather than the server - so without it every fresh start would propose $USER. Recording merges into the file rather than rewriting it, and a start with no host to record (--no-server) leaves the recorded host alone."
+evidence = "docs/SPEC.md 'Not connected UI'; src/settings.rs Settings::remember_connection; src/client/connect.rs run_client_inner, prefill_connect_defaults; tests the_last_connection_is_remembered_and_read_back, a_second_connection_replaces_what_the_first_recorded, remembering_a_connection_leaves_every_other_key_alone, a_connection_with_no_host_leaves_the_recorded_host_alone, prefill_connect_defaults_restores_the_last_nickname_from_settings, settings_beat_the_cache_for_host_and_port_but_not_for_the_keybundle, an_empty_settings_file_leaves_the_proposed_nickname_alone; scenario features/connecting/connect_form.feature 'The form comes back as whoever connected last'"
+
+
 # ============================================================================
 # US-002 - Authenticate to the server
 # ============================================================================
@@ -419,6 +425,22 @@ id = "TB-159"
 description = "A UserJoined for a channel the client has no local tab for yet creates one on the spot, rather than silently dropping the membership - the server sends an already-populated channel's existing-member snapshot before the final Joined confirmation, and the joiner has no local tab yet the first time that happens for a private channel (never pre-known via ChannelList) or a public one joined by name rather than dwelled into."
 evidence = "docs/PROTOCOL.md 6.1; src/client/tui/channel.rs UiState::on_user_joined; tests on_user_joined_creates_the_tab_if_a_join_snapshot_arrives_before_joined, on_user_joined_does_not_duplicate_an_existing_tab"
 
+[[user_story.acceptance_criteria]]
+id = "AC-238"
+description = "A selector dropdown hangs directly beneath the selector it belongs to, lined up with that selector's own first column rather than with the screen's left edge (which the server-state element occupies). One holding more entries than the screen has rows stops at the bottom edge and scrolls inside it - the entries around the current selection stay in view as Up/Down walk the list, and a scrollbar shows while (and only while) there is more list than viewport."
+evidence = "docs/SPEC.md 'Connected UI'; src/client/tui/channel.rs selectors_start_col, render_selector_dropdown; src/client/tui/ui.rs UiState::selector_dropdown_focus_row; tests each_selector_dropdown_hangs_under_the_selector_it_belongs_to, a_dropdown_taller_than_the_screen_stops_at_the_bottom_edge_and_scrolls, a_dropdown_that_fits_carries_no_scrollbar; scenario features/channels/switching_channels.feature 'A dropdown longer than the screen scrolls instead of running off it'"
+
+[[user_story.acceptance_criteria]]
+id = "AC-239"
+description = "The DM selector's blinking unread envelope carries the same colour as the nickname beside it (presence_color), not a colour of its own - so one person with unread messages reads as one fact. The channel selector's is plain white (CHANNEL_UNREAD_COLOR): a channel is a room, not a person, and has no reachability to report."
+evidence = "docs/SPEC.md 'Connected UI'; src/client/tui/channel.rs dm_selector_title, channel_selector_title, envelope_spans, CHANNEL_UNREAD_COLOR, render_selector_dropdown; tests the_dm_selectors_unread_envelope_takes_the_peers_own_colour, the_channel_selectors_envelope_is_plain_white; scenario features/channels/switching_channels.feature 'An unread DM blinks in the colour of the person it is from'"
+
+[[user_story.acceptance_criteria]]
+id = "AC-247"
+description = "A channel is named #<name> wherever it can be picked - the channel selector and its dropdown - and that # is decoration: it is never stored and never sent on the wire. A # typed at the front of the join form's name field, or written in a --channels flag or a daemon_channel line, is accepted and then ignored (validation::normalize_channel_name), so a channel can be typed exactly the way it is shown. Only a leading one: anywhere else it is refused, since it is not in a channel name's charset."
+evidence = "docs/SPEC.md 'Connected UI', 'Channels'; src/validation.rs CHANNEL_DISPLAY_PREFIX, normalize_channel_name; src/client/tui/ui.rs channel_label; src/client/tui/channel.rs handle_join_popup_key, channel_selector_title; src/client/daemon.rs DaemonChannel::parse; tests normalize_channel_name_drops_a_leading_display_prefix, normalize_channel_name_leaves_every_other_hash_alone, a_normalized_name_is_one_the_server_accepts, a_channel_is_shown_with_a_hash_and_a_typed_one_is_ignored, a_hash_typed_anywhere_but_the_front_is_refused, a_channel_may_be_given_with_the_hash_it_is_shown_with; scenario features/channels/switching_channels.feature 'A channel can be typed the way it is shown'"
+
+
 # ============================================================================
 # US-005 - Send a text message to a channel
 # ============================================================================
@@ -633,6 +655,12 @@ evidence = "docs/SPEC.md Functionality #4; docs/PROTOCOL.md 7.3; tests max_recor
 id = "TB-142"
 description = "An incoming voice stream is independently force-finalized with whatever arrived so far the moment it accumulates MAX_RECORDING_SAMPLES of audio, regardless of what the sender's own cap did - the receiving side never accepts more than 4 minutes of one stream even from a modified/hostile peer."
 evidence = "docs/PROTOCOL.md 7.3; src/client/voice_stream.rs spawn_stream_decrypt_worker; test recording_at_max_triggers_exactly_at_the_boundary_not_before"
+
+[[user_story.technical_behavior]]
+id = "TB-236"
+description = "An incoming voice stream that has gone quiet past STREAM_IDLE_TIMEOUT is asked to end exactly once (its worker then finalizes the row from whatever partial audio arrived and its report removes the entry). A stream still there after that ask, whose worker has gone without answering, is given up on: the sweep closes the row itself, so a placeholder can never blink 'streaming...' for the rest of the session and the entry cannot leak. A stream still receiving, or one already asked whose worker is still there, is left alone."
+evidence = "docs/PROTOCOL.md 7.3; src/client/voice_stream.rs IdleStreamAction, idle_stream_action, ActiveStream::end_requested; src/client/session.rs sweep_idle_streams; tests a_stream_that_is_still_arriving_is_never_swept, a_quiet_stream_is_asked_to_end_exactly_once, a_stream_whose_worker_is_gone_is_given_up_on"
+
 
 # ============================================================================
 # US-008 - Keep message content readable only by its recipient
@@ -914,6 +942,17 @@ id = "TB-101"
 description = "The connected view renders without panicking - empty, with members and messages, with a voice entry, with the identity banner, and with the join popup over it."
 evidence = "tests render_channel_view_does_not_panic, render_with_identity_banner_does_not_panic, render_join_popup_overlay_does_not_panic, render_empty_state_does_not_panic"
 
+[[user_story.acceptance_criteria]]
+id = "AC-245"
+description = "In the channel's user list the person stays on the left and their encryption tag is flush against the sidebar's right edge, so the tags read as a column of their own rather than starting wherever each nickname happens to end. A sidebar too narrow for both keeps one space between them and clips at its right edge, as any overlong entry does."
+evidence = "docs/SPEC.md 'Connected UI'; src/client/tui/channel.rs render_sidebar; src/client/tui/ui.rs display_width; test the_user_lists_encryption_tags_are_flush_right_with_the_names_on_the_left; scenario features/presence/encryption_tags.feature 'The tags line up down the right edge of the user list'"
+
+[[user_story.acceptance_criteria]]
+id = "AC-246"
+description = "One glyph (OTP_ICON) marks a one-time-pad session everywhere it applies, and it is deliberately not the shield pq_hybrid already carries - the pad always runs over pq_hybrid, so sharing a glyph would make the marker for the extra layer and for the layer under it the same character. As OTP_TAG (the glyph plus the name) it replaces that person's my_key tag in the channel user list, on the DM selector, on their row of the DM dropdown, and in their room's own title; on its own it prefixes every message the pad protects and sits at the front of the compose bar those messages are typed into. It replaces rather than joins the my_key tag because the pad is what actually protects everything said to that person (docs/PROTOCOL.md 16.2), and it only ever runs over pq_hybrid, so the tag it displaces is always the same one. Drawn in the same cyan the room's own OTP session header uses. The app's own narration lines and presence notices never carry it - it marks content, not the app talking about the session."
+evidence = "docs/SPEC.md 'Connected UI'; docs/PROTOCOL.md 16; src/client/tui/ui.rs OTP_ICON, OTP_TAG, OTP_TAG_COLOR, UiState::encryption_tag, SelectorEntry::otp, render_messages, render_input_bar; src/client/tui/channel.rs render_sidebar, dm_selector_title, render_selector_dropdown; tests an_otp_session_replaces_that_peers_tag_everywhere_they_are_named, the_otp_tag_is_drawn_in_the_session_headers_own_colour, otp_tag_and_icon_are_the_same_marker, a_pad_session_marks_every_surface_of_the_room_it_is_with, the_compose_bar_is_unmarked_without_a_pad_session, messages_in_a_dm_without_an_active_otp_session_get_no_pad_marker; scenario features/encryption/otp_layer.feature 'A pad session marks that person wherever they are named'"
+
+
 # ============================================================================
 # US-013 - Keep history reachable when a peer goes offline
 # ============================================================================
@@ -964,6 +1003,12 @@ id = "TB-105"
 description = "Offline blocking is scoped to the offline peer only, leaving other peers' rooms fully usable."
 evidence = "docs/SPEC.md Functionality #8; test compose_bar_works_normally_again_after_leaving_and_reopening_an_online_peers_dm"
 
+[[user_story.acceptance_criteria]]
+id = "AC-248"
+description = "A peer who goes offline and reconnects takes their own place back rather than appearing beside it: their sidebar row is replaced where it stands (and counts as an arrival, so the join notice still fires, in every channel they were in), and their private room, its whole history, its place on the DM selector and any active one-time-pad session all move onto the id they have now. A UserId is per-connection and never reused, so the match is on the nickname - the same anchor id_store pins by - and only for a nickname this session actually saw go offline; a nickname still known to be connected is somebody else's live row and is never taken over. What belonged to the connection that closed - an unanswered identity review, held messages, an offer in flight - is deliberately left behind, so the returning connection gets its own identity check."
+evidence = "docs/SPEC.md Functionality #7; docs/PROTOCOL.md 3, 12; src/client/tui/ui.rs UiState::returning_peer_id, adopt_returning_peer; src/client/tui/channel.rs seed_member; tests a_peer_who_reconnects_takes_their_own_row_back, a_reconnecting_peers_dm_room_continues_rather_than_starting_again, a_pad_session_follows_a_peer_across_a_reconnect, a_different_nickname_is_never_adopted_and_neither_is_a_peer_still_online; scenario features/presence/offline_users.feature 'Someone who comes back continues where they left off'"
+
+
 # ============================================================================
 # US-014 - Get help without leaving the app
 # ============================================================================
@@ -1001,8 +1046,8 @@ evidence = "test ctrl_h_release_event_does_not_re_toggle_help"
 
 [[user_story.technical_behavior]]
 id = "TB-108"
-description = "The help popup widens enough to show its longest line unclipped but never exceeds 90% of the terminal width."
-evidence = "tests help_popup_widens_enough_to_show_its_longest_line_without_clipping_it, help_popup_never_exceeds_90_percent_of_the_terminal_width"
+description = "The help overlay takes the whole frame: full width, from the row above the header down through the compose bar, so its longest line is only ever clipped by a terminal genuinely too narrow for it and nothing of the view behind it is left showing alongside. It is laid out in two columns - the first reserved for keys and commands and as wide as the longest one in the page, the second holding the descriptions, wrapped to the width the terminal leaves. A description too long for one line continues in the description column rather than under the keys, so the page stays two aligned columns at any width."
+evidence = "docs/SPEC.md Functionality #7; src/client/tui/ui.rs HelpLine, help_keys_col, help_desc_col, wrap_to_width, help_lines_for_column, render_help_popup; tests help_popup_widens_enough_to_show_its_longest_line_without_clipping_it, the_help_popup_fills_the_whole_frame, the_help_popup_covers_the_compose_bar, help_descriptions_all_start_in_one_column_and_wrap_back_into_it, the_help_keys_column_is_as_wide_as_the_longest_command; scenario features/help/in_app_help.feature 'The overlay covers the things people forget'"
 
 [[user_story.technical_behavior]]
 id = "TB-126"
@@ -1078,6 +1123,17 @@ evidence = "docs/SPEC.md 'Connected UI', README keybindings; test tab_cycles_foc
 id = "AC-063"
 description = "Up and Down move the selected user in the sidebar, wrapping around at both ends."
 evidence = "README keybindings; test sidebar_up_down_wraps_selection"
+
+[[user_story.acceptance_criteria]]
+id = "AC-237"
+description = "Every popup replaces what is behind it: the cells inside its border carry the popup's own content and nothing of the view underneath, however busy that view is."
+evidence = "docs/SPEC.md 'Connected UI'; src/client/tui/ui.rs render (the Clear before every popup's block); test no_popup_shows_the_view_behind_it; scenario features/presence/moving_around.feature 'A popup replaces the view behind it'"
+
+[[user_story.technical_behavior]]
+id = "TB-234"
+description = "A terminal that changes size is answered by discarding the buffer laid out for the old size and repainting every cell (Surface::resize), rather than diffing the next frame against a window that no longer exists - a diff would leave whatever the old layout drew outside the new one never painted over. Both the local terminal's own Event::Resize and an attached viewer's Resize message go through it."
+evidence = "docs/SPEC.md 'Connected UI'; src/client/tui/surface.rs Surface::resize; src/client/session.rs run_connected_session's SessionInput::Key(Event::Resize) and SessionInput::Resized arms; src/client/tui/ui_connect_popup.rs run's Event::Resize arm; src/client/daemon.rs pump_attach's Event::Resize arm; test a_resize_repaints_every_cell_rather_than_diffing_against_the_old_size, attaching_forwards_keys_and_resizes_and_detaches_cleanly"
+
 
 # ============================================================================
 # US-017 - Decide whether to trust a peer whose identity looks wrong
@@ -1231,8 +1287,8 @@ evidence = "docs/SPEC.md Functionality #10; tests an_incoming_offer_opens_a_popu
 
 [[user_story.acceptance_criteria]]
 id = "AC-096"
-description = "Rejecting an offer shows as rejected in the sender's log row rather than the transfer silently vanishing; a channel send's rows are independent per recipient, each naming who it's addressed to, so one recipient rejecting doesn't affect another's row."
-evidence = "docs/SPEC.md Functionality #10; tests toggling_focus_then_enter_rejects, rejection_and_failure_are_reflected_on_the_matching_row, a_channel_file_send_logs_one_row_per_recipient_naming_them; the accept/reject notice itself now travels the direct peer-to-peer link (US-024, TB-141) rather than a server relay"
+description = "Rejecting an offer shows as rejected in the sender's log row rather than the transfer silently vanishing. A channel send is one row for the sender - the same shape a channel voice message has - addressed to every recipient it went out to, so the details popup names them individually rather than the log carrying one line each. The transfer underneath stays per recipient, and the row aggregates them (FileRowProgress): while any are still going it reports the least advanced of them, and once none are left it reads Completed if any recipient took it, Rejected if they all declined, and Failed otherwise."
+evidence = "docs/SPEC.md Functionality #10, 'Delivery acknowledgments'; docs/PROTOCOL.md 7.2.1; src/client/tui/ui.rs FileRowProgress, register_file_row_stream, update_file_row; src/client/channel.rs handle_send_file; src/client/tui/channel.rs log_own_file_offer_channel; tests toggling_focus_then_enter_rejects, rejection_and_failure_are_reflected_on_the_matching_row, a_channel_file_send_logs_one_row_addressed_to_every_recipient, one_file_row_reports_the_least_advanced_of_its_transfers, one_file_row_ends_as_whatever_happened_across_its_transfers; the accept/reject notice itself travels the direct peer-to-peer link (US-024, TB-141) rather than a server relay"
 
 [[user_story.acceptance_criteria]]
 id = "AC-097"
@@ -1729,6 +1785,17 @@ id = "TB-187"
 description = "otp --remove-contact <name> deletes a keychain entry outright (pad material and all) and is only ever invoked in response to something already authenticated over the pq_hybrid channel - the peer's own signed report that they have no matching key. A failure to remove is treated as best-effort (logged, not fatal): the worst case is the next --add-contact failing the exact same way it already was, not corruption. Removing a name that never existed is itself still an error the caller must check, unlike --has-contact's plain boolean."
 evidence = "src/client/otp_cli.rs remove_contact; tests remove_contact_deletes_an_existing_contact, remove_contact_on_an_unknown_contact_fails, a_removed_contacts_name_can_be_reprovisioned_from_scratch"
 
+[[user_story.acceptance_criteria]]
+id = "AC-243"
+description = "Under an active OTP session the message details popup reports the pad rather than the envelope under it: which sequence that message is, the pad offset its key bytes start at, and the key file they came out of (<contact>_enc.key for a message sent, <contact>_dec.key for one received). The figures are the pad's position before that message spent its own key, recorded on the row when it is logged - the live figures describe some later message by the time anyone opens the popup."
+evidence = "docs/PROTOCOL.md 16; src/client/tui/ui.rs MessageCrypto::Otp, UiState::message_crypto; src/client/otp_cli.rs OtpKeyStatus, contact_key_paths; src/client/otp.rs refresh_otp_key_status, on_message; tests an_otp_message_reports_the_pad_position_and_key_file_it_used, an_incoming_otp_message_reports_the_decryption_pad; scenario features/encryption/otp_layer.feature 'A message details popup names the pad position it spent'"
+
+[[user_story.acceptance_criteria]]
+id = "AC-249"
+description = "Agreeing a pad session opens the room it is with, on both sides, the moment the handshake completes (UiState::open_otp_session): the two people just deliberately agreed to it, and the conversation it was for is what either of them wants next. Resuming a still-live session because its peer reconnected is not that moment and never moves the view - nobody asked for it, and taking the screen off whatever is being read would be wrong."
+evidence = "docs/SPEC.md Functionality #15; docs/PROTOCOL.md 16.3, 16.6; src/client/tui/ui.rs UiState::open_otp_session, mark_otp_active; src/client/otp.rs on_session_request's accept, on_key_setup_ack; src/client/session.rs handle_server_message's UserJoined arm; tests agreeing_a_pad_session_opens_the_room_it_is_with, a_session_resumed_on_reconnect_does_not_steal_the_view"
+
+
 # ============================================================================
 # US-021 - Connect with pq_hybrid without any manual key preparation
 # ============================================================================
@@ -1921,7 +1988,7 @@ evidence = "docs/PROTOCOL.md 7.1.2; src/client/session.rs handle_server_message'
 
 [[user_story.acceptance_criteria]]
 id = "AC-135"
-description = "Each person in the sidebar is coloured by the state of the direct link to them rather than by their presence on the server: green once that link is established and content can actually reach them, red once it is lost, and neither while it is still being established. A trust-gated or offline peer keeps its own existing colour, which takes priority."
+description = "Each person in the sidebar is coloured by the state of the direct link to them rather than by their presence on the server, and by the only part of it anyone about to type needs: green once that link is established and content can actually reach them, gray until it is - a punch still in flight, a link that has gone, and a connection that has closed are one answer and one colour. A trust-gated peer keeps its own red, which takes priority: an unresolved identity is not a reachability state but the one thing here with something to do about it."
 evidence = "docs/SPEC.md 'Connected UI'; docs/PROTOCOL.md 7.1; src/client/p2p.rs LinkStatus, src/client/tui/ui.rs UiState::set_link_status/link_status_of, src/client/tui/channel.rs render_sidebar; tests sidebar_colours_each_member_by_the_state_of_the_direct_link_to_them, a_member_with_no_link_record_yet_is_not_shown_as_reachable; direct_link_state.feature"
 
 [[user_story.acceptance_criteria]]
@@ -2198,8 +2265,8 @@ evidence = "docs/SPEC.md 'Live voice calls'; src/client/tui/ui.rs submit_input's
 
 [[user_story.acceptance_criteria]]
 id = "AC-175"
-description = "A call modal opens the moment a call becomes active and lists everyone on it - the host first, named '<nickname> (host)' rather than carrying a label of its own (our own row reads '(you)', and both marks together on our own call), then where each of them stands: IN CALL (green), INVITED (yellow) or REJECTED (grey), with MUTED (red) added for anyone the host has silenced. The name and the label columns are fixed-width, so every voice bar starts in the same column whatever the labels read."
-evidence = "docs/SPEC.md 'Live voice calls'; src/client/tui/ui.rs CallMember, CallMemberState, begin_call, upsert_call_member, on_call_invite_sent, on_call_invite_rejected, set_call_member_host_muted, call_member_name, call_member_labels, CALL_NAME_COL, CALL_LABEL_COL, pad_to, render_call_modal; tests the_call_modal_lists_the_host_first_and_labels_every_participant, an_unanswered_invitee_is_listed_as_invited, every_roster_row_starts_its_voice_bar_in_the_same_column; scenario features/voice/live_call.feature 'The call modal lists the host first and labels everyone on it'"
+description = "A call modal opens the moment a call becomes active and lists everyone on it - the host first, named '<nickname> (host)' rather than carrying a label of its own (our own row reads '(you)', and both marks together on our own call), then where each of them stands: IN CALL (green), INVITED (yellow) or REJECTED (grey), with MUTED (red) added for anyone the host has silenced. Each row is <nickname> <labels> <voice meter>, and all three columns line up down the list: the name and label columns are each as wide as the widest one in that call (CallColumns::measure), the name column is followed by four columns of gap so a name that fills it never runs into its label, and the meters sit flush against the modal's right edge. The modal itself is only as wide and as tall as those columns and the roster need, never a fixed size."
+evidence = "docs/SPEC.md 'Live voice calls'; src/client/tui/ui.rs CallMember, CallMemberState, begin_call, upsert_call_member, on_call_invite_sent, on_call_invite_rejected, set_call_member_host_muted, call_member_name, call_member_labels, CallColumns, call_modal_rect, pad_to, render_call_modal; tests the_call_modal_lists_the_host_first_and_labels_every_participant, an_unanswered_invitee_is_listed_as_invited, every_roster_row_starts_its_voice_bar_in_the_same_column, the_call_modal_narrows_to_the_names_actually_in_the_call, the_roster_columns_line_up_and_the_meters_sit_flush_right; scenario features/voice/live_call.feature 'The call modal lists the host first and labels everyone on it'"
 
 [[user_story.acceptance_criteria]]
 id = "AC-176"
@@ -2213,8 +2280,8 @@ evidence = "docs/SPEC.md 'Live voice calls'; src/client/tui/ui.rs CallUiState::m
 
 [[user_story.acceptance_criteria]]
 id = "AC-178"
-description = "The call modal's END CALL button leaves the call, the same action /endcall produces from anywhere."
-evidence = "docs/SPEC.md 'Live voice calls'; src/client/tui/ui.rs handle_call_modal_key's Enter arm, render_call_modal; test the_modal_end_call_button_ends_the_call; scenario features/voice/live_call.feature 'END CALL in the modal leaves the call'"
+description = "The call modal's END CALL button asks before it leaves: a confirmation over the modal with END CALL and Cancel, Cancel focused, so a stray Enter on the modal's own default button costs nothing. It absorbs every key while it is up and Escape answers it as Cancel; confirming produces the same action /endcall produces from anywhere. Typing /endcall is not gated - a typed command is already deliberate."
+evidence = "docs/SPEC.md 'Live voice calls'; src/client/tui/ui.rs CallUiState::end_confirm, handle_call_modal_key's Enter arm, handle_end_call_confirm_key, render_end_call_confirm_popup; tests the_modal_end_call_button_asks_before_it_ends_the_call, the_end_call_question_absorbs_every_other_key; scenarios features/voice/live_call.feature 'END CALL in the modal asks before it leaves the call', 'Confirming the question is what leaves the call'"
 
 [[user_story.acceptance_criteria]]
 id = "AC-179"
@@ -2385,6 +2452,12 @@ evidence = "src/client/tui/surface.rs Surface::draw, AttachWriter::flush, Surfac
 id = "TB-216"
 description = "The attach backend answers from what its viewer reported the three questions CrosstermBackend answers by querying its own stdout - which in a daemon is /dev/null: terminal size, window size, and cursor position (whose real implementation would block reading a Device Status Report reply from a stdin nobody is writing to). A zero dimension reported mid-resize is clamped to 1 rather than trusted."
 evidence = "src/client/tui/surface.rs AttachBackend::size/window_size/get_cursor_position, TerminalSize::new, Surface::resize; tests the_attach_backend_reports_the_size_its_viewer_declared, the_attach_backend_tracks_the_cursor_instead_of_asking_for_it, a_zero_dimension_is_clamped_rather_than_trusted, resizing_an_attached_surface_redraws_at_the_new_size, resizing_a_detached_surface_is_a_no_op"
+
+[[user_story.acceptance_criteria]]
+id = "AC-241"
+description = "A daemon start with no flags and no daemon_* keys of its own falls back to the connection the connect popup last recorded (connect_host / connect_port / connect_nickname) before reaching the connect cache - so a first `aloo --daemon` on a machine that has only ever been used interactively comes back on the same server as the same person, with nothing to supply on the command line. A flag given this run still wins, and a previous daemon start's own daemon_* keys still come first."
+evidence = "docs/SPEC.md 'Running in background mode'; src/client/daemon.rs DaemonConfig::resolve; tests the_last_interactive_connection_fills_in_what_no_daemon_start_ever_recorded, a_previous_daemon_start_still_beats_the_last_interactive_connection, a_flag_beats_the_last_interactive_connection_too; scenario features/daemon/starting_a_daemon.feature 'A first daemon reuses the last connection made by hand'"
+
 
 # ============================================================================
 # US-039 - Keep a direct link to a peer with no server involved
@@ -2600,3 +2673,29 @@ evidence = "docs/TESTING.md; src/client/session.rs SessionState::for_test, TestS
 id = "TB-231"
 description = "A message id is allocated by the UI and is unique across every channel log and private room in the session, which is what lets an acknowledgement - which names a peer and an id, never a conversation - be routed back to the one row that owns it. It is session-scoped and monotonic: nothing compares ids across restarts, so a message still unacknowledged when the client stops simply stays that way."
 evidence = "docs/PROTOCOL.md 7.2.1; src/client/tui/ui.rs UiState::alloc_msg_id, mark_delivered, MessageDelivery.msg_id; tests an_acknowledgement_finds_its_row_in_any_conversation, marking_delivered_is_idempotent_and_ignores_unknown_ids, two_senders_using_the_same_stream_id_are_kept_apart"
+
+[[user_story.acceptance_criteria]]
+id = "AC-242"
+description = "The message details popup names how that message's content was protected: the scheme by its mechanism (RSA-4096 OAEP/SHA-256, or ML-KEM-1024 + RSA-4096 -> AES-256-GCM with ML-DSA-87 signing) and a short fingerprint of the key it was sealed to (crypto::SHORT_FINGERPRINT_HEX characters). A channel send is sealed once per member with that member's own key, so it names no single key; a line this client wrote itself (a presence notice, the app's own OTP narration) reports no encryption at all."
+evidence = "docs/SPEC.md 'Delivery acknowledgments'; src/client/tui/ui.rs MessageCrypto, LogEntry::crypto, UiState::message_crypto, crypto_lines, render_message_info_popup; src/crypto/mod.rs short_fingerprint_der; tests the_details_popup_names_the_scheme_and_the_key_a_dm_was_sealed_to, a_channel_send_to_several_people_names_no_single_key, a_presence_notice_reports_no_encryption_at_all; scenario features/messaging/delivery_acknowledgment.feature 'The details popup says how the message was encrypted'"
+
+
+# ============================================================================
+# US-042 - Read a warning without it wrecking the screen
+# ============================================================================
+[[user_story]]
+id = "US-042"
+title = "Read a warning without it wrecking the screen"
+as_a = "user running aloo in a terminal"
+i_want = "the app's own warnings to go somewhere I can read them rather than into the middle of the interface"
+so_that = "the screen stays legible and the warning still reaches me"
+
+[[user_story.acceptance_criteria]]
+id = "AC-244"
+description = "Nothing this app has to say about itself is ever written to the screen while the TUI owns it. Every diagnostic goes through log_warn!, whose sink is silenced for exactly as long as ratatui holds the terminal (client::tui::terminal::setup / restore) and writes one 'aloo:'-prefixed line to stderr everywhere else - a --server, --daemon or --foreground start, and every one-shot CLI subcommand. Lines emitted while silenced are replayed to stderr once the terminal has been handed back, so a warning worth emitting is still readable rather than dropped."
+evidence = "docs/SPEC.md 'Where diagnostics go'; src/log.rs; src/client/tui/terminal.rs setup, restore; test a_silenced_sink_collects_every_line_and_replays_them_on_the_way_out; scenario features/diagnostics/where_warnings_go.feature 'A warning raised while the interface is up waits for the terminal'"
+
+[[user_story.technical_behavior]]
+id = "TB-235"
+description = "The silenced sink keeps at most log::RING_CAPACITY lines and drops the oldest, so a session warning about the same thing for hours cannot grow it without bound; draining empties it, so a replay never happens twice."
+evidence = "src/log.rs RING_CAPACITY, warn, take_collected, drain; test a_silenced_sink_collects_every_line_and_replays_them_on_the_way_out"

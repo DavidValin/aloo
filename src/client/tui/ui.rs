@@ -103,170 +103,309 @@ pub const HOST_LEFT_NOTICE: &str = "Call has ended: the host left the call";
 /// starts and this is shown instead.
 pub const CALL_ALREADY_ENDED_NOTICE: &str = "that call has already ended";
 
-const HELP_HEADINGS: [&str; 10] = [
-    "Channels",
-    "Messaging",
-    "Private messages",
-    "Voice messages",
-    "File transfer",
-    "Live voice calls",
-    "Encryption (tag shown after each username)",
-    "One-time-pad layer (optional, per contact)",
-    "OTP mail (async, stored encrypted on the server)",
-    "Identity pinning (id_store)",
-];
-const HELP_BODY: &[&str] = &[
-    "Channels",
-    "  [  /  ]    move between the channel selector (left) and the DM one (right);",
-    "             at either end it opens that selector's dropdown instead - every",
-    "             other channel you joined (\u{1F30D} public / \u{1F512} private), or room you",
-    "             have open. Up/Down pick one (the view follows straight away),",
-    "             Enter, Esc, Tab or the opposite key close it again, and so",
-    "             does leaving it alone for 30 seconds",
-    "  /channels  list every public channel (yours in yellow); Enter joins, Esc closes",
-    "  Ctrl+J     join/create a channel: name, Public/Private (Left/Right), optional password",
-    "  /leave     leave the selected channel tab (its tab disappears)",
-    "",
-    "Messaging",
-    "  Tab        cycle focus: sidebar -> messages -> compose bar",
-    "  Enter      send the typed message (compose bar focused)",
-    "  Up / Down  scroll the message log one message, from the compose bar too",
-    "  PgUp/PgDn  scroll it ten at a time; Home/End jump to the oldest/newest",
-    "             (log focused). A log taller than its pane shows a scrollbar",
-    "             down its right edge.",
-    "  i          message details: when it was sent, and every user it went",
-    "             to with their own DELIVERED / UNDELIVERED state (log",
-    "             focused). i or Esc closes it again.",
-    "  ->         each message you send reads `you -> message`, the arrow",
-    "             coloured by how far it has got: gray until anyone has",
-    "             decrypted it, green once everyone has, and in a channel",
-    "             orange while only some have. Voice messages and file",
-    "             transfers carry it too - a file turns green once the",
-    "             whole of it has arrived decrypted on their side. A",
-    "             message that reached nobody is struck through. Messages",
-    "             from other people keep a plain `name: message`.",
-    "",
-    "Private messages",
-    "  Up / Down    pick a user (sidebar focused)",
-    "  Enter      open a private room with the selected user",
-    "  Esc        back to the channel selector (the room stays on the DM selector)",
-    "  \u{2709}          blinks on a selector while a channel/DM behind it has unseen",
-    "             messages, and on the dropdown row they landed in",
-    "",
-    "Voice messages",
-    "  Space      hold to record & send live (not while composing); release to stop",
-    "  Ctrl+Alt+P   same, from anywhere - edit/disable in ~/.aloo/settings",
-    "  Enter      replay a voice message (messages focused)",
-    "  Esc        stop a replay while it is playing",
-    "  Capped at 4 minutes - recording stops itself on reaching it, and a",
-    "  received stream longer than that is never accepted past 4 minutes.",
-    "  /mute-voice <nickname>    stop their voice messages playing themselves",
-    "             on arrival - they still arrive and still show in the log,",
-    "             so Enter replays them; muted users are marked \u{1F507} in the",
-    "             sidebar. Kept in ~/.aloo/settings. Never affects a call.",
-    "  /unmute-voice <nickname>  undo it; either, with no nickname, lists",
-    "             who is currently muted.",
-    "",
-    "File transfer",
-    "  /file      type this and press Enter to browse for a file to send",
-    "  Left/Right/Tab   choose Send file / Discard on the confirmation box (Discard by default)",
-    "  The recipient sees a popup (with a chime) naming you and the file,",
-    "  Accept focused by default; Left/Right/Tab/Enter same as above.",
-    "  Accepting streams the file straight to ~/.aloo/downloads with a",
-    "  live progress bar - nothing is held whole in memory on either side,",
-    "  and there is no size cap. Declining shows as rejected in your log.",
-    "",
-    "Live voice calls",
-    "  /call      start a continuous, multi-user call in the selected channel",
-    "             or open private room - distinct from a voice message: not",
-    "             push-to-talk, no time cap, and every current member/the",
-    "             peer gets an Accept/Reject popup (with a chime) naming you.",
-    "             You confirm first, told how many people it will ring.",
-    "  /endcall   leave the call - a permanent red banner (top right) marks",
-    "             the whole time you're on one",
-    "  The call modal opens with the call: live duration on top, then",
-    "  everyone on it - HOST first, each labelled IN CALL / INVITED /",
-    "  REJECTED (+ MUTED), with a live voice bar. Up/Down walk the list,",
-    "  Enter or e is END CALL, Esc folds it away into the \u{1F534} Call",
-    "  indicator at the top right (Ctrl+R brings the modal back).",
-    "  m on your own row mutes your microphone (yours to lift, nobody",
-    "  else is told). As the host, m on anyone else's row mutes them",
-    "  instead - only you can lift that - and i invites one more person",
-    "  you share a channel or DM with.",
-    "  Leaving as the host ends the call for everyone. One call at a time.",
-    "  Not available over an OTP session (that layer has no live-streaming",
-    "  concept at all - see the OTP section below).",
-    "",
-    "Encryption (tag shown after each username)",
-    "  name \u{1F6A8} PWD    static: one RSA keypair derived from a password",
-    "  name \u{1F6A8} PLAIN  static: one RSA keypair auto-generated when you connected",
-    "  name \u{1F6E1}\u{FE0F} PQH    static: ML-DSA-87+RSA4096/ML-KEM-1024+RSA4096/AES-256-GCM, loaded from a file",
-    "",
-    "One-time-pad layer (optional, per contact)",
-    "  /otp       inside an open DM room: proposes an extra one-time-pad",
-    "             layer on top of pq_hybrid for that contact only. Never",
-    "             starts on its own say-so - always ends in an explicit",
-    "             Accept/Reject on the other side, confirmed back to you.",
-    "  /endotp    ends an active session with that contact right away - no",
-    "             accept/reject needed, either side may do it alone. Your",
-    "             own copy of the pad is destroyed immediately; the other",
-    "             side is told now if reachable, or as soon as they",
-    "             reconnect otherwise. A disconnect alone never ends a",
-    "             session - only /endotp does - and the DM keeps working",
-    "             either way, just without that extra layer once it's off.",
-    "  If no key exists yet, you're asked to confirm generating one and",
-    "  sharing it automatically over pq_hybrid (or you can run 'otp'",
-    "  yourself and place the keys under ~/.aloo/otp/.keychain/ instead).",
-    "  Confirming asks for a size next, 1-900000 MB per key. An incoming",
-    "  proposal shows an Accept/Reject popup naming the sender and, for a",
-    "  fresh key, the size offered.",
-    "  Requires both sides to use pq_hybrid, and the real 'otp' command",
-    "  (github.com/DavidValin/otp-toolkit) installed. Once started, a message to",
-    "  that contact waits for the previous one to be genuinely acknowledged",
-    "  before the next can send. \"OTP session started at <time>\" (green) or",
-    "  \"OTP session cancelled\" (red) is shown to both sides.",
-    "  Text, file and voice content sent to that contact are all protected",
-    "  under the pad while active - a file's name/size still travel unwrapped",
-    "  (only its bytes are, once accepted); voice is recorded fully and sent",
-    "  once instead of live, arriving playable once it fully lands.",
-    "  While active, a 1-line header above the messages shows both",
-    "  directions' Seq/Offset/remaining-MB live, updated about once a",
-    "  second - remaining turns red below 0.5MB per direction.",
-    "",
-    "OTP mail (async, stored encrypted on the server)",
-    "  /mail      full-screen compose view: To / Subtext / Content, plus",
-    "             voice recordings (hold Space, only while the attachments",
-    "             pane is focused) and file attachments ('a' opens the",
-    "             browser; 'd' removes the selected one, after confirming).",
-    "  Needs a pinned recipient you hold an otp key for, longer than the",
-    "  whole mail - the To field shows \u{2705}/\u{274C} live and the remaining key",
-    "  (MB) shows top-right, updating as you type and attach. Ctrl+S sends,",
-    "  only after a confirm popup. The mail travels one-time-pad encrypted",
-    "  and waits on the server (which cannot read it) until the recipient",
-    "  connects.",
-    "  /mailbox   opens the mailbox: each sent mail's delivery status, and",
-    "             received mail - Enter reads one (decrypted in memory",
-    "             only), 'd' removes it, destroying its stored",
-    "             ciphertext+pad.",
-    "",
-    "Identity pinning (id_store)",
-    "  Remembers each nickname's full public key across sessions (not",
-    "  just a hash) - exact match for password/pq_hybrid. none is",
-    "  untracked. A mismatch opens a popup naming the peer with",
-    "  Accept/Reject buttons; messaging with them is blocked until you",
-    "  decide. Accept saves to disk right away and reveals anything of",
-    "  theirs held while unresolved; Reject saves nothing and isn't",
-    "  permanent - select them again to reconsider. Path set in the",
-    "  connect popup's id_store field.",
-    "",
-    "  All local state (id_store, settings, the OTP keychain) lives under",
-    "  ~/.aloo by default. Set ALOO_HOME to use a different directory -",
-    "  needed if you run more than one client on this same machine, since",
-    "  they'd otherwise collide by sharing one ~/.aloo.",
-    "",
-    "  Ctrl+C         quit",
-    "  Ctrl+H / Esc   close this help",
-    "  Up/Down        scroll",
+/// One line of the help overlay's source text, before it is laid out.
+///
+/// Written unwrapped: an `Item`'s `text` is one sentence-flow string, and
+/// where it breaks is decided at render time against the terminal actually
+/// in front of the user (`help_rendered_lines`), not by hand here. That is
+/// what keeps every description inside one column - a hand-wrapped line
+/// can only be right for one width.
+pub enum HelpLine {
+    /// A section title, on a line of its own and flush left.
+    Heading(&'static str),
+    Blank,
+    /// A key, a key combination or a slash command, and what it does.
+    /// `keys` fills the first column, `text` wraps inside the second.
+    Item {
+        keys: &'static str,
+        text: &'static str,
+    },
+    /// Prose belonging to the section rather than to any one key. Sits in
+    /// the description column with the first one empty, so a section reads
+    /// as one block down the page.
+    Note(&'static str),
+}
+
+const HELP_BODY: &[HelpLine] = &[
+    HelpLine::Heading("Channels"),
+    HelpLine::Item {
+        keys: "[  /  ]",
+        text: "move between the channel selector (left) and the DM one (right); at either \
+               end it opens that selector's dropdown instead - every other channel you \
+               joined (\u{1F30D} public / \u{1F512} private), or room you have open. Up/Down pick one \
+               (the view follows straight away), Enter, Esc, Tab or the opposite key close \
+               it again, and so does leaving it alone for 30 seconds",
+    },
+    HelpLine::Item {
+        keys: "/channels",
+        text: "list every public channel (yours in yellow); Enter joins, Esc closes",
+    },
+    HelpLine::Item {
+        keys: "Ctrl+J",
+        text: "join/create a channel: name, Public/Private (Left/Right), optional password.                Channels are shown as #name - typing the # is fine, it is ignored.",
+    },
+    HelpLine::Item {
+        keys: "/leave",
+        text: "leave the selected channel tab (its tab disappears)",
+    },
+    HelpLine::Blank,
+    HelpLine::Heading("Messaging"),
+    HelpLine::Item {
+        keys: "Tab",
+        text: "cycle focus: sidebar -> messages -> compose bar",
+    },
+    HelpLine::Item {
+        keys: "Enter",
+        text: "send the typed message (compose bar focused)",
+    },
+    HelpLine::Item {
+        keys: "Up / Down",
+        text: "scroll the message log one message, from the compose bar too",
+    },
+    HelpLine::Item {
+        keys: "PgUp/PgDn",
+        text: "scroll it ten at a time; Home/End jump to the oldest/newest (log focused). \
+               A log taller than its pane shows a scrollbar down its right edge.",
+    },
+    HelpLine::Item {
+        keys: "i",
+        text: "message details: when it was sent, how it was encrypted (the scheme, and a \
+               short id of the key it was sealed to - or, under /otp, that message's own \
+               pad sequence, offset and key file), and every user it went to with their \
+               own DELIVERED / UNDELIVERED state (log focused). i or Esc closes it again.",
+    },
+    HelpLine::Item {
+        keys: "->",
+        text: "each message you send reads `you -> message`, the arrow coloured by how far \
+               it has got: gray until anyone has decrypted it, green once everyone has, \
+               and in a channel orange while only some have. Voice messages and file \
+               transfers carry it too - a file turns green once the whole of it has \
+               arrived decrypted on their side. A message that reached nobody is struck \
+               through. Messages from other people keep a plain `name: message`.",
+    },
+    HelpLine::Blank,
+    HelpLine::Heading("Private messages"),
+    HelpLine::Item {
+        keys: "Up / Down",
+        text: "pick a user (sidebar focused)",
+    },
+    HelpLine::Item {
+        keys: "Enter",
+        text: "open a private room with the selected user",
+    },
+    HelpLine::Item {
+        keys: "Esc",
+        text: "back to the channel selector (the room stays on the DM selector)",
+    },
+    HelpLine::Item {
+        keys: "\u{2709}",
+        text: "blinks on a selector while a channel/DM behind it has unseen messages, and \
+               on the dropdown row they landed in. Beside a person it takes their own \
+               colour, so it reads as part of the name rather than as a separate mark; a \
+               channel's is plain white, having no reachability to report.",
+    },
+    HelpLine::Blank,
+    HelpLine::Heading("Voice messages"),
+    HelpLine::Item {
+        keys: "Space",
+        text: "hold to record & send live (not while composing); release to stop",
+    },
+    HelpLine::Item {
+        keys: "Ctrl+Alt+P",
+        text: "same, from anywhere - edit/disable in ~/.aloo/settings",
+    },
+    HelpLine::Item {
+        keys: "Enter",
+        text: "replay a voice message (messages focused)",
+    },
+    HelpLine::Item {
+        keys: "Esc",
+        text: "stop a replay while it is playing",
+    },
+    HelpLine::Note(
+        "Capped at 4 minutes - recording stops itself on reaching it, and a received \
+         stream longer than that is never accepted past 4 minutes.",
+    ),
+    HelpLine::Item {
+        keys: "/mute-voice <nickname>",
+        text: "stop their voice messages playing themselves on arrival - they still arrive \
+               and still show in the log, so Enter replays them; muted users are marked \
+               \u{1F507} in the sidebar. Kept in ~/.aloo/settings. Never affects a call.",
+    },
+    HelpLine::Item {
+        keys: "/unmute-voice <nickname>",
+        text: "undo it; either, with no nickname, lists who is currently muted.",
+    },
+    HelpLine::Blank,
+    HelpLine::Heading("File transfer"),
+    HelpLine::Item {
+        keys: "/file",
+        text: "type this and press Enter to browse for a file to send. In a channel it goes \
+               to everyone at once and reads as one line in your log; press i on it to see \
+               each person's own progress.",
+    },
+    HelpLine::Item {
+        keys: "Left/Right/Tab",
+        text: "choose Send file / Discard on the confirmation box (Discard by default)",
+    },
+    HelpLine::Note(
+        "The recipient sees a popup (with a chime) naming you and the file, Accept \
+         focused by default; Left/Right/Tab/Enter same as above.",
+    ),
+    HelpLine::Note(
+        "Accepting streams the file straight to ~/.aloo/downloads with a live progress \
+         bar - nothing is held whole in memory on either side, and there is no size cap. \
+         Declining shows as rejected in your log.",
+    ),
+    HelpLine::Blank,
+    HelpLine::Heading("Live voice calls"),
+    HelpLine::Item {
+        keys: "/call",
+        text: "start a continuous, multi-user call in the selected channel or open private \
+               room - distinct from a voice message: not push-to-talk, no time cap, and \
+               every current member/the peer gets an Accept/Reject popup (with a chime) \
+               naming you. You confirm first, told how many people it will ring.",
+    },
+    HelpLine::Item {
+        keys: "/endcall",
+        text: "leave the call - a permanent red banner (top right) marks the whole time \
+               you're on one",
+    },
+    HelpLine::Note(
+        "The call modal opens with the call: live duration on top, then everyone on it - \
+         host first, each labelled IN CALL / INVITED / REJECTED (+ MUTED), with a live \
+         voice bar. Up/Down walk the list, Enter or e is END CALL (which asks before it \
+         leaves), Esc folds it away into the \u{1F534} Call indicator at the top right \
+         (Ctrl+R brings the modal back).",
+    ),
+    HelpLine::Note(
+        "m on your own row mutes your microphone (yours to lift, nobody else is told). As \
+         the host, m on anyone else's row mutes them instead - only you can lift that - \
+         and i invites one more person you share a channel or DM with.",
+    ),
+    HelpLine::Note(
+        "Leaving as the host ends the call for everyone. One call at a time. Not \
+         available over an OTP session (that layer has no live-streaming concept at all - \
+         see the OTP section below).",
+    ),
+    HelpLine::Blank,
+    HelpLine::Heading("Encryption (tag shown after each username)"),
+    HelpLine::Item {
+        keys: "name \u{1F6A8} PWD",
+        text: "static: one RSA keypair derived from a password",
+    },
+    HelpLine::Item {
+        keys: "name \u{1F6A8} PLAIN",
+        text: "static: one RSA keypair auto-generated when you connected",
+    },
+    HelpLine::Item {
+        keys: "name \u{1F6E1}\u{FE0F} PQH",
+        text: "static: ML-DSA-87+RSA4096/ML-KEM-1024+RSA4096/AES-256-GCM, loaded from a file",
+    },
+    HelpLine::Item {
+        keys: "name \u{1F511} OTP",
+        text: "a one-time-pad session is open with this person (/otp below), so that pad -                not the tag above - is what protects everything said to them. Shown in                place of their own tag in the user list, on the DM selector and on their                dropdown row.",
+    },
+    HelpLine::Note(
+        "The tags sit flush against the user list's right edge, so they read as a column of \
+         their own rather than starting wherever each nickname happens to end. A name is \
+         green while what you type reaches that person and gray until it does; red means \
+         their identity is unresolved, which is the one thing here to act on.",
+    ),
+    HelpLine::Blank,
+    HelpLine::Heading("One-time-pad layer (optional, per contact)"),
+    HelpLine::Item {
+        keys: "/otp",
+        text: "inside an open DM room: proposes an extra one-time-pad layer on top of \
+               pq_hybrid for that contact only. Never starts on its own say-so - always \
+               ends in an explicit Accept/Reject on the other side, confirmed back to you.",
+    },
+    HelpLine::Item {
+        keys: "/endotp",
+        text: "ends an active session with that contact right away - no accept/reject \
+               needed, either side may do it alone. Your own copy of the pad is destroyed \
+               immediately; the other side is told now if reachable, or as soon as they \
+               reconnect otherwise. A disconnect alone never ends a session - only \
+               /endotp does - and the DM keeps working either way, just without that \
+               extra layer once it's off.",
+    },
+    HelpLine::Note(
+        "If no key exists yet, you're asked to confirm generating one and sharing it \
+         automatically over pq_hybrid (or you can run 'otp' yourself and place the keys \
+         under ~/.aloo/otp/.keychain/ instead). Confirming asks for a size next, \
+         1-900000 MB per key. An incoming proposal shows an Accept/Reject popup naming \
+         the sender and, for a fresh key, the size offered.",
+    ),
+    HelpLine::Note(
+        "Requires both sides to use pq_hybrid, and the real 'otp' command \
+         (github.com/DavidValin/otp-toolkit) installed. Once started, a message to that \
+         contact waits for the previous one to be genuinely acknowledged before the next \
+         can send. \"OTP session started at <time>\" (green) or \"OTP session cancelled\" \
+         (red) is shown to both sides.",
+    ),
+    HelpLine::Note(
+        "Text, file and voice content sent to that contact are all protected under the \
+         pad while active - a file's name/size still travel unwrapped (only its bytes \
+         are, once accepted); voice is recorded fully and sent once instead of live, \
+         arriving playable once it fully lands.",
+    ),
+    HelpLine::Note(
+        "While active, a 1-line header above the messages shows both directions' \
+         Seq/Offset/remaining-MB live, updated about once a second - remaining turns red \
+         below 0.5MB per direction.",
+    ),
+    HelpLine::Blank,
+    HelpLine::Heading("OTP mail (async, stored encrypted on the server)"),
+    HelpLine::Item {
+        keys: "/mail",
+        text: "full-screen compose view: To / Subtext / Content, plus voice recordings \
+               (hold Space, only while the attachments pane is focused) and file \
+               attachments ('a' opens the browser; 'd' removes the selected one, after \
+               confirming).",
+    },
+    HelpLine::Note(
+        "Needs a pinned recipient you hold an otp key for, longer than the whole mail - \
+         the To field shows \u{2705}/\u{274C} live and the remaining key (MB) shows top-right, \
+         updating as you type and attach. Ctrl+S sends, only after a confirm popup. The \
+         mail travels one-time-pad encrypted and waits on the server (which cannot read \
+         it) until the recipient connects.",
+    ),
+    HelpLine::Item {
+        keys: "/mailbox",
+        text: "opens the mailbox: each sent mail's delivery status, and received mail - \
+               Enter reads one (decrypted in memory only), 'd' removes it, destroying its \
+               stored ciphertext+pad.",
+    },
+    HelpLine::Blank,
+    HelpLine::Heading("Identity pinning (id_store)"),
+    HelpLine::Note(
+        "Remembers each nickname's full public key across sessions (not just a hash) - \
+         exact match for password/pq_hybrid. none is untracked. A mismatch opens a popup \
+         naming the peer with Accept/Reject buttons; messaging with them is blocked until \
+         you decide. Accept saves to disk right away and reveals anything of theirs held \
+         while unresolved; Reject saves nothing and isn't permanent - select them again \
+         to reconsider. Path set in the connect popup's id_store field.",
+    ),
+    HelpLine::Blank,
+    HelpLine::Note(
+        "All local state (id_store, settings, the OTP keychain) lives under ~/.aloo by \
+         default. Set ALOO_HOME to use a different directory - needed if you run more \
+         than one client on this same machine, since they'd otherwise collide by sharing \
+         one ~/.aloo.",
+    ),
+    HelpLine::Blank,
+    HelpLine::Item {
+        keys: "Ctrl+C",
+        text: "quit",
+    },
+    HelpLine::Item {
+        keys: "Ctrl+H / Esc",
+        text: "close this help",
+    },
+    HelpLine::Item {
+        keys: "Up/Down",
+        text: "scroll",
+    },
 ];
 
 /// Where one file transfer's log row currently stands
@@ -326,7 +465,7 @@ pub enum MessageBody {
     /// errors/confirmations (`client::otp::notify`), mirrored here from the
     /// same text shown in the top-right status notice so the history of a
     /// session's setup isn't lost the moment that notice clears. Never
-    /// given the OTP shield prefix (`render_messages`) - it would be
+    /// given the OTP prefix (`render_messages`) - it would be
     /// redundant on a line that already names OTP explicitly, and the
     /// prefix is meant to mark *content*, not the app's own narration.
     System(String),
@@ -336,9 +475,61 @@ pub enum MessageBody {
     /// app narration. Already-formatted text (`local_time_short` prefix
     /// plus the peer's name and the event) built by
     /// `channel::on_user_joined`/`on_user_left`/`ui::on_user_offline` -
-    /// see `docs/SPEC.md` Functionality #12. Excluded from the OTP shield
+    /// see `docs/SPEC.md` Functionality #12. Excluded from the OTP
     /// prefix for the same reason `System` is.
     Presence(String),
+}
+
+/// What the transfers behind one outgoing file row have reported.
+///
+/// A channel file send is one row - the same shape a channel voice message
+/// has, and what the details popup lists every recipient of - but the
+/// transfer underneath it is per recipient: each has its own `stream_id`,
+/// its own worker, and its own accept/reject/progress/completion. This is
+/// how those separate answers become the single status that row shows.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FileRowProgress {
+    /// Every transfer this row covers, and how many bytes each has sent.
+    /// A transfer that has not started yet is present with `0`.
+    sent: HashMap<u64, u64>,
+    done: HashSet<u64>,
+    failed: HashSet<u64>,
+    rejected: HashSet<u64>,
+}
+
+impl FileRowProgress {
+    /// The one status the row shows, from what every transfer behind it
+    /// has said so far.
+    ///
+    /// While any are still going, the row reports the *least* advanced of
+    /// them: the row means "this file, to these people", and it is not
+    /// sent until it is sent to all of them. Once none are left, the row
+    /// is Completed if any recipient took it, Rejected if they all
+    /// declined, and Failed otherwise - a send nobody took because
+    /// something broke is not the same as one everybody turned down.
+    fn status(&self) -> FileTransferStatus {
+        let outstanding: Vec<u64> = self
+            .sent
+            .keys()
+            .copied()
+            .filter(|s| !self.done.contains(s) && !self.failed.contains(s) && !self.rejected.contains(s))
+            .collect();
+        if outstanding.is_empty() {
+            if !self.done.is_empty() {
+                return FileTransferStatus::Completed;
+            }
+            if self.failed.is_empty() && !self.rejected.is_empty() {
+                return FileTransferStatus::Rejected;
+            }
+            return FileTransferStatus::Failed;
+        }
+        let bytes = outstanding
+            .iter()
+            .map(|s| self.sent.get(s).copied().unwrap_or(0))
+            .min()
+            .unwrap_or(0);
+        FileTransferStatus::InProgress { bytes }
+    }
 }
 
 /// One recipient of an outgoing message, and whether that recipient has
@@ -438,6 +629,51 @@ impl DeliveryStatus {
     }
 }
 
+/// How one logged message's content was actually protected, as the
+/// details popup reports it (`docs/SPEC.md` "Delivery acknowledgments").
+///
+/// Recorded on the row when it is logged rather than derived when the
+/// popup opens: an OTP session's pad walks forward with every message, so
+/// by the time anyone presses `i` the live figures describe some later
+/// message, not this one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MessageCrypto {
+    /// The ordinary per-recipient envelope (`client::envelope`), named by
+    /// the `KeyMode` whose scheme built it. `key_id` is a short
+    /// fingerprint of the one public key involved
+    /// (`crypto::short_fingerprint_der`), or `None` for a channel send
+    /// addressed to several keys at once.
+    Envelope {
+        key_mode: KeyMode,
+        key_id: Option<String>,
+    },
+    /// The one-time-pad layer over that envelope (`docs/PROTOCOL.md` §16):
+    /// which sequence this message is, the pad offset its key bytes start
+    /// at, and the key file they were taken from.
+    Otp {
+        seq: u64,
+        offset: u64,
+        key_path: String,
+    },
+}
+
+/// What the details popup calls each scheme - the mechanism, not the
+/// `my_key` sourcing tag `KeyMode::label` shows in the sidebar. Someone
+/// asking how one specific message was encrypted is asking about the
+/// cipher, and `PWD` / `PLAIN` say nothing about it (both are RSA-OAEP -
+/// they differ in where the keypair came from, §8.3).
+impl MessageCrypto {
+    pub fn method_label(&self) -> &'static str {
+        match self {
+            MessageCrypto::Envelope { key_mode, .. } => match key_mode {
+                KeyMode::Password | KeyMode::None => "RSA-4096 OAEP/SHA-256",
+                KeyMode::PqHybrid => "ML-KEM-1024 + RSA-4096 -> AES-256-GCM, ML-DSA-87 signed",
+            },
+            MessageCrypto::Otp { .. } => "one-time pad (XOR) over the pq_hybrid envelope",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct LogEntry {
     pub from: UserId,
@@ -475,6 +711,11 @@ pub struct LogEntry {
     /// replays the row (`handle_messages_key`'s Enter); `None` on every
     /// row that owes nothing, which is almost all of them.
     pub owed_receipt: Option<u64>,
+    /// How this row's content was protected, for the details popup
+    /// (`MessageCrypto`). `None` on a row there is nothing to say it
+    /// about: a system or presence line this client wrote itself, or a
+    /// channel send whose members do not share one scheme.
+    pub crypto: Option<MessageCrypto>,
 }
 
 /// One outgoing message's delivery state: who it was addressed to, and
@@ -644,7 +885,45 @@ pub(crate) fn channel_kind_icon(kind: ChannelKind) -> &'static str {
     }
 }
 
+/// How a channel is named wherever it can be picked: its kind icon, then
+/// the `#` that says "this is a channel" and the name itself
+/// (`docs/SPEC.md` "Connected UI"). The `#` is decoration - what is stored
+/// and sent is the bare name (`validation::normalize_channel_name`).
+pub(crate) fn channel_label(kind: ChannelKind, name: &str) -> String {
+    format!(
+        "{} {}{name}",
+        channel_kind_icon(kind),
+        crate::validation::CHANNEL_DISPLAY_PREFIX
+    )
+}
+
 pub(crate) const DM_ICON: &str = "\u{1F4AC}";
+
+/// The one glyph a one-time-pad session is marked with, wherever it is
+/// marked (`docs/PROTOCOL.md` §16): on the row of every message the pad
+/// protects, and in the `OTP_TAG` those same people carry in the user
+/// list, on the DM selector and on their dropdown row.
+///
+/// A key rather than a shield, and deliberately not the \u{1F6E1}\u{FE0F}
+/// one `pq_hybrid` already carries (`proto::KeyMode::label`): the pad
+/// always runs *over* pq_hybrid, so sharing a glyph would mean the marker
+/// for the extra layer and the marker for the layer under it were the same
+/// character - and the whole job of both is telling them apart. A one-time
+/// pad is key material spent once and destroyed, which is what the key
+/// says and what nothing else in this UI claims.
+pub const OTP_ICON: &str = "\u{1F511}";
+
+/// The tag a peer carries while a pad session is open with them, in place
+/// of the `my_key` tag they would otherwise show. `OTP_ICON` plus the name
+/// of the layer, so the glyph on their row and the glyph on their messages
+/// are recognisably one thing (`otp_tag_and_icon_are_the_same_marker`
+/// keeps the two from drifting apart).
+pub const OTP_TAG: &str = "\u{1F511} OTP";
+
+/// The colour that tag is drawn in, wherever it appears - the same cyan
+/// the room's own OTP session header uses for `OTP SESSION`
+/// (`direct_message::render_otp_header`), so the two read as one fact.
+pub const OTP_TAG_COLOR: Color = Color::Cyan;
 
 /// The one envelope glyph this UI ever draws for unseen messages - the
 /// plain text-style U+2709, never an emoji-presentation variant, so a
@@ -665,6 +944,11 @@ pub(crate) fn unread_envelope(blink_on: bool) -> &'static str {
 pub struct SelectorEntry {
     pub label: String,
     pub unread: bool,
+    /// Whether a one-time-pad session is open with this row's peer, which
+    /// makes it carry `OTP_TAG` (`UiState::encryption_tag`). Always
+    /// `false` for a channel row: a pad is provisioned per contact, and a
+    /// channel is not one.
+    pub otp: bool,
     /// `Some` only for a DM row: how reachable that peer is, coloured the
     /// same way their name is everywhere else. A channel is not a person
     /// and has nobody's reachability to report.
@@ -903,6 +1187,13 @@ pub struct CallUiState {
     pub minimized: bool,
     /// The host's invite picker, while it is open.
     pub invite_picker: Option<CallInvitePicker>,
+    /// `true` while END CALL is waiting on its own confirmation
+    /// (`docs/SPEC.md` "Live voice calls"). The button is focused from the
+    /// moment the modal opens and Enter is the modal's most reachable key,
+    /// so without this a stray Enter leaves a call with no way back into
+    /// it. `CallConfirmChoice::Cancel` is the default answer, same as the
+    /// identity review's `Reject`: the safe one.
+    pub end_confirm: Option<CallConfirmChoice>,
 }
 
 impl CallUiState {
@@ -1398,6 +1689,12 @@ pub struct UiState {
     /// `identity_review_queue`, but simpler: a decision here is final
     /// (`Accept`/`Reject` both remove the entry outright), there is no
     /// `Rejected`-but-reconsiderable state the way an identity review has.
+    /// Which outgoing file row each transfer belongs to, and what those
+    /// transfers have reported so far - see `FileRowProgress`. Empty for
+    /// every send that is one transfer (a DM, and anything incoming),
+    /// where a stream id is already its own row.
+    file_row_of_stream: HashMap<u64, u64>,
+    file_rows: HashMap<u64, FileRowProgress>,
     pub file_offers: HashMap<(UserId, u64), PendingFileOffer>,
     file_offer_queue: VecDeque<(UserId, u64)>,
     /// Reset to `Accept` every time a different offer becomes the one
@@ -1477,13 +1774,13 @@ pub struct UiState {
     status_notice_since: Option<Instant>,
     /// Peers a mutual-consent OTP session has genuinely started with in
     /// this connection (set alongside the "OTP session started" notice,
-    /// `client::otp::accept_invite`/`on_key_setup_ack`) - drives the shield
+    /// `client::otp::accept_invite`/`on_key_setup_ack`) - drives the pad
     /// prefix a DM room's messages get while it's active
     /// (`render_messages`). Scoped to DMs: OTP's own UI surface (`/otp`,
     /// both popups) only ever exists inside a private room, so that is
     /// where "in OTP mode" has an unambiguous meaning - a channel send may
     /// wrap per-recipient under a contact's pad too, but a channel log has
-    /// no single peer for a shield to describe.
+    /// no single peer for a pad marker to describe.
     ///
     /// Keyed by connection-lifetime `UserId`, unlike the actual send-path
     /// gate (`SessionState::otp_store`, keyed by the fingerprint-derived
@@ -1511,7 +1808,7 @@ pub struct UiState {
     /// app's own send/receive. Never cleared once set: a stale-but-correct
     /// figure for a peer navigated away from and back to is a better first
     /// frame than a blank one while the next update is in flight.
-    otp_key_status: HashMap<UserId, crate::client::otp_cli::ContactDetail>,
+    otp_key_status: HashMap<UserId, crate::client::otp_cli::OtpKeyStatus>,
     /// Whether a previously-received voice message is currently being
     /// replayed (Enter on a `MessageBody::Voice` log entry) - while `true`,
     /// Escape stops that playback instead of its usual meaning (closing the
@@ -1562,7 +1859,7 @@ pub struct UiState {
     /// to exactly whatever they were underneath, rather than replacing
     /// them.
     pub help_open: bool,
-    /// First visible line index into `HELP_BODY` while the help overlay is
+    /// First visible line index into the overlay's laid-out lines while it is
     /// open - `Up`/`Down`/`PageUp`/`PageDown`/`Home`/`End` adjust it
     /// (`handle_key`), reset to `0` every time the overlay is freshly
     /// opened (`tick`-independent, done right in the Ctrl+H toggle) so it
@@ -1688,6 +1985,8 @@ impl UiState {
             channel_password_input: String::new(),
             channel_password_error: None,
             file_send: None,
+            file_row_of_stream: HashMap::new(),
+            file_rows: HashMap::new(),
             file_offers: HashMap::new(),
             file_offer_queue: VecDeque::new(),
             file_offer_focus: FileOfferChoice::Accept,
@@ -1914,8 +2213,8 @@ impl UiState {
     /// Whether audio arriving from `peer` right now must be kept off the
     /// mixer - the single predicate both reasons funnel through, so a
     /// caller can never remember one and forget the other. Snapshotted
-    /// once per stream at `*Start` (docs/PROTOCOL.md §11.2), exactly as
-    /// the trust gate alone used to be.
+    /// once per stream at `*Start` (docs/PROTOCOL.md §11.2), so a decision
+    /// made when a stream opens holds for the whole of it.
     pub fn suppress_playback_from(&self, peer: UserId) -> bool {
         self.is_trust_gated(peer) || self.is_voice_muted(peer)
     }
@@ -2383,6 +2682,7 @@ impl UiState {
             elapsed_secs: 0,
             minimized: false,
             invite_picker: None,
+            end_confirm: None,
         });
         self.sort_call_members();
     }
@@ -2755,24 +3055,240 @@ impl UiState {
         self.otp_key_status.remove(&peer);
     }
 
-    /// Whether `peer`'s messages should carry the OTP shield prefix right
+    /// Whether `peer`'s messages should carry the `OTP_ICON` prefix right
     /// now.
     pub fn is_otp_active(&self, peer: UserId) -> bool {
         self.otp_active_peers.contains(&peer)
     }
 
+    /// The id this session last knew `user` by, if they are someone who
+    /// went offline and has now come back.
+    ///
+    /// Matched on the *nickname*, because that is the only thing about a
+    /// person that survives a reconnect at all: a `UserId` is handed out
+    /// per connection and never reused (`docs/PROTOCOL.md` §3), so a
+    /// returning peer arrives as a complete stranger by id. The nickname
+    /// is already this app's continuity anchor everywhere it matters -
+    /// `id_store` pins by it (§12), `/mute-voice` remembers by it - and
+    /// pinning is what makes trusting it safe here: someone taking a
+    /// departed user's nickname is caught by the identity check that runs
+    /// on this very `UserJoined`, which gates messaging until it is
+    /// answered. Adopting the row is a *display* decision; whether that
+    /// person may be talked to is decided separately, and independently.
+    ///
+    /// A pure lookup: the caller decides what to do with the answer, and
+    /// `adopt_returning_peer` is what acts on it.
+    pub(crate) fn returning_peer_id(&self, user: &UserInfo) -> Option<UserId> {
+        self.known_users
+            .values()
+            .find(|known| {
+                known.id != user.id && known.name == user.name && self.offline.contains(&known.id)
+            })
+            .map(|known| known.id)
+    }
+
+    /// Moves everything this session holds about `previous` onto the id
+    /// `user` has now, so a peer who reconnects continues in the very same
+    /// DM room rather than opening a second one beside it
+    /// (`docs/SPEC.md` "Connected UI").
+    ///
+    /// Only what is genuinely *about the person* moves: their room and its
+    /// history, where it sits on the DM selector, and any one-time-pad
+    /// session, which by design outlives a disconnect and only `/endotp`
+    /// ever ends (`docs/PROTOCOL.md` §16.6). Everything that belongs to the
+    /// connection that just closed - an unanswered identity review, held
+    /// messages, a file offer or call invite in flight - is deliberately
+    /// left behind: those are transactions with a session that is over,
+    /// and the new connection gets its own, including its own identity
+    /// check.
+    pub(crate) fn adopt_returning_peer(&mut self, previous: UserId, user: &UserInfo) {
+        let id = user.id;
+        self.offline.remove(&previous);
+        self.link_status.remove(&previous);
+        self.known_users.remove(&previous);
+        if let Some(mut room) = self.private_rooms.remove(&previous) {
+            // The room keeps its whole log; only who it is *with* is
+            // restated, since their key material and id are both new.
+            room.peer = user.clone();
+            self.private_rooms.insert(id, room);
+        }
+        for entry in &mut self.dm_order {
+            if *entry == previous {
+                *entry = id;
+            }
+        }
+        if self.selected_dm == Some(previous) {
+            self.selected_dm = Some(id);
+        }
+        if self.active_private_room == Some(previous) {
+            self.active_private_room = Some(id);
+        }
+        if self.otp_active_peers.remove(&previous) {
+            self.otp_active_peers.insert(id);
+        }
+        if let Some(status) = self.otp_key_status.remove(&previous) {
+            self.otp_key_status.insert(id, status);
+        }
+    }
+
+    /// A pad session has just been agreed with `peer` - what both sides
+    /// call the moment their handshake completes
+    /// (`client::otp::on_session_request`'s accept, `on_key_setup_ack`).
+    ///
+    /// Marks it active and opens that room, because a session is something
+    /// two people just deliberately agreed to and the conversation it was
+    /// for is the next thing either of them wants to be looking at.
+    ///
+    /// Deliberately not folded into `mark_otp_active`: that is also how a
+    /// still-live session is resumed when its peer reconnects
+    /// (`session::handle_server_message`'s `UserJoined` arm), which nobody
+    /// asked for at that moment - taking the view off whatever they were
+    /// reading would be wrong there.
+    pub fn open_otp_session(&mut self, peer: UserId) {
+        self.mark_otp_active(peer);
+        if let Some(info) = self.known_users.get(&peer).cloned() {
+            self.open_private_room(info);
+        }
+    }
+
+    /// The encryption tag `peer` carries right now: `OTP_TAG` while a pad
+    /// session is open with them, otherwise the tag for the `my_key` they
+    /// connected with (`docs/SPEC.md` "Connected UI").
+    ///
+    /// The pad replaces the tag rather than being added beside it. It is
+    /// the layer that actually protects what is being said to that person
+    /// (`docs/PROTOCOL.md` §16.2 - there is no way to send them a plain
+    /// message while one is active), and it only ever runs over
+    /// `pq_hybrid`, so the tag it displaces is always the same one.
+    pub fn encryption_tag(&self, peer: UserId, key_mode: KeyMode) -> &'static str {
+        if self.is_otp_active(peer) {
+            OTP_TAG
+        } else {
+            key_mode.label()
+        }
+    }
+
     /// Records `peer`'s latest `otp --show-contact` snapshot - see
     /// `otp_key_status`'s doc for who calls this and how often.
-    pub fn set_otp_key_status(&mut self, peer: UserId, detail: crate::client::otp_cli::ContactDetail) {
-        self.otp_key_status.insert(peer, detail);
+    pub fn set_otp_key_status(
+        &mut self,
+        peer: UserId,
+        status: crate::client::otp_cli::OtpKeyStatus,
+    ) {
+        self.otp_key_status.insert(peer, status);
     }
 
     /// `peer`'s most recently fetched key-metadata snapshot, if any -
-    /// `render_otp_header` falls back to `ContactDetail::default()` (all
+    /// `render_otp_header` falls back to `OtpKeyStatus::default()` (all
     /// zeros) when `None`, e.g. the brief window before a session's own
     /// first fetch completes.
-    pub fn otp_key_status_for(&self, peer: UserId) -> Option<&crate::client::otp_cli::ContactDetail> {
+    pub fn otp_key_status_for(
+        &self,
+        peer: UserId,
+    ) -> Option<&crate::client::otp_cli::OtpKeyStatus> {
         self.otp_key_status.get(&peer)
+    }
+
+    /// How a message logged for `peer` right now is protected, as the
+    /// details popup reports it (`render_message_info_popup`).
+    ///
+    /// Both figures an OTP row carries are read from the snapshot *before*
+    /// this message spends its own key, which is what makes them describe
+    /// this message rather than the state after it: `otp --show-contact`
+    /// reports the sequence already written and the offset already
+    /// consumed, so the message about to be (or just being) logged is the
+    /// next sequence, starting at exactly that offset. Every OTP path
+    /// takes its pre-spend snapshot before the row is pushed and refreshes
+    /// again afterwards (`client::otp::send_now`, `client::otp::on_message`),
+    /// so this holds for both directions.
+    pub fn message_crypto(&self, peer: UserId, outgoing: bool) -> Option<MessageCrypto> {
+        // A snapshot always exists for an active session - every
+        // `mark_otp_active` is followed immediately by a refresh - except
+        // where `otp --show-contact` itself would not answer. There is
+        // then nothing true to say about the pad, so the row falls through
+        // to the envelope underneath it, which is at least a fact.
+        let otp_status = self.otp_key_status_for(peer).filter(|_| self.is_otp_active(peer));
+        if let Some(status) = otp_status {
+            let (sequence, offset, key_path) = if outgoing {
+                (
+                    status.detail.enc_sequence,
+                    status.detail.enc_offset,
+                    &status.enc_key_path,
+                )
+            } else {
+                (
+                    status.detail.dec_sequence,
+                    status.detail.dec_offset,
+                    &status.dec_key_path,
+                )
+            };
+            return Some(MessageCrypto::Otp {
+                seq: sequence + 1,
+                offset,
+                key_path: key_path.display().to_string(),
+            });
+        }
+        let user = self.known_users.get(&peer)?;
+        Some(MessageCrypto::Envelope {
+            key_mode: user.key_mode,
+            key_id: Some(crate::crypto::short_fingerprint_der(&user.public_key_der)),
+        })
+    }
+
+    /// `message_crypto` for a message this client is about to send to
+    /// `channel`: it is sealed once for every member of that channel
+    /// except ourselves, which is exactly the tab's own roster.
+    pub fn channel_send_crypto(&self, channel: &str) -> Option<MessageCrypto> {
+        let recipients: Vec<UserId> = self
+            .channels
+            .iter()
+            .find(|c| c.name == channel)
+            .map(|c| {
+                c.members
+                    .iter()
+                    .map(|m| m.id)
+                    .filter(|id| Some(*id) != self.own_id)
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.channel_message_crypto(&recipients)
+    }
+
+    /// `message_crypto` for the one member of a channel a per-recipient row
+    /// is addressed to - a channel file send makes one row per recipient
+    /// (`channel::log_own_file_offer_channel`), and a name is all that row
+    /// carries. `None` for a name nobody currently connected holds.
+    pub fn message_crypto_for_name(&self, name: &str, outgoing: bool) -> Option<MessageCrypto> {
+        let id = self
+            .known_users
+            .values()
+            .find(|u| u.name == name)
+            .map(|u| u.id)?;
+        self.message_crypto(id, outgoing)
+    }
+
+    /// `message_crypto` for a message going out to a whole channel, which
+    /// is sealed once per member with *that member's* own key
+    /// (`client::envelope::encrypt_envelope_for`).
+    ///
+    /// One key id is only meaningful where there is one key, so a send to
+    /// several members names the scheme without one; a channel whose
+    /// members do not even share a scheme names nothing at all, and the
+    /// popup's per-recipient list is what carries the detail there.
+    pub fn channel_message_crypto(&self, recipients: &[UserId]) -> Option<MessageCrypto> {
+        match recipients {
+            [] => None,
+            [one] => self.message_crypto(*one, true),
+            many => {
+                let first = self.known_users.get(many.first()?)?.key_mode;
+                many.iter()
+                    .all(|id| self.known_users.get(id).is_some_and(|u| u.key_mode == first))
+                    .then_some(MessageCrypto::Envelope {
+                        key_mode: first,
+                        key_id: None,
+                    })
+            }
+        }
     }
 
     /// Finds the file-transfer log row matching `(from, stream_id)`
@@ -2807,35 +3323,80 @@ impl UiState {
         }
     }
 
-    pub fn set_file_progress(&mut self, from: UserId, stream_id: u64, bytes: u64) {
-        self.update_file_entry(from, stream_id, |body| {
-            if let MessageBody::File { status, .. } = body {
-                *status = FileTransferStatus::InProgress { bytes };
+    /// Records that the transfer `stream_id` is one of those behind the
+    /// file row `row` - called once per recipient of a channel file send,
+    /// including for the transfer whose own id names the row
+    /// (`channel::handle_send_file`).
+    pub fn register_file_row_stream(&mut self, row: u64, stream_id: u64) {
+        self.file_row_of_stream.insert(stream_id, row);
+        self.file_rows
+            .entry(row)
+            .or_default()
+            .sent
+            .entry(stream_id)
+            .or_insert(0);
+    }
+
+    /// The row a transfer belongs to - itself, for every transfer that is
+    /// its own row (a DM send, and anything incoming).
+    fn file_row_of(&self, stream_id: u64) -> u64 {
+        self.file_row_of_stream
+            .get(&stream_id)
+            .copied()
+            .unwrap_or(stream_id)
+    }
+
+    /// Applies `record` to the row's aggregate and writes back whatever
+    /// status that leaves it in. A transfer with no aggregate is its own
+    /// row, and `fallback` is the status it takes directly.
+    fn update_file_row(
+        &mut self,
+        from: UserId,
+        stream_id: u64,
+        fallback: FileTransferStatus,
+        record: impl FnOnce(&mut FileRowProgress),
+    ) {
+        let row = self.file_row_of(stream_id);
+        let status = match self.file_rows.get_mut(&row) {
+            Some(progress) => {
+                record(progress);
+                progress.status()
+            }
+            None => fallback,
+        };
+        self.update_file_entry(from, row, |body| {
+            if let MessageBody::File { status: slot, .. } = body {
+                *slot = status;
             }
         });
     }
 
+    pub fn set_file_progress(&mut self, from: UserId, stream_id: u64, bytes: u64) {
+        self.update_file_row(
+            from,
+            stream_id,
+            FileTransferStatus::InProgress { bytes },
+            |progress| {
+                progress.sent.insert(stream_id, bytes);
+            },
+        );
+    }
+
     pub fn set_file_completed(&mut self, from: UserId, stream_id: u64) {
-        self.update_file_entry(from, stream_id, |body| {
-            if let MessageBody::File { status, .. } = body {
-                *status = FileTransferStatus::Completed;
-            }
+        self.update_file_row(from, stream_id, FileTransferStatus::Completed, |progress| {
+            progress.done.insert(stream_id);
         });
     }
 
     pub fn set_file_rejected(&mut self, from: UserId, stream_id: u64) {
-        self.update_file_entry(from, stream_id, |body| {
-            if let MessageBody::File { status, .. } = body {
-                *status = FileTransferStatus::Rejected;
-            }
+        self.update_file_row(from, stream_id, FileTransferStatus::Rejected, |progress| {
+            progress.rejected.insert(stream_id);
         });
     }
 
     pub fn set_file_failed(&mut self, from: UserId, stream_id: u64) {
-        self.update_file_entry(from, stream_id, |body| {
-            if let MessageBody::File { status, .. } = body {
-                *status = FileTransferStatus::Failed;
-            }
+        self.update_file_row(from, stream_id, FileTransferStatus::Failed, |progress| {
+            progress.failed.insert(stream_id);
         });
     }
 
@@ -2950,7 +3511,7 @@ impl UiState {
     }
 
     /// The help overlay's current scroll offset (first visible line index
-    /// into `HELP_BODY`) - loosely clamped here, precisely at render time
+    /// into the overlay's laid-out lines) - loosely clamped here, precisely at render time
     /// against the popup's actual visible height (`render_help_popup`).
     pub fn help_scroll(&self) -> usize {
         self.help_scroll
@@ -3233,7 +3794,10 @@ impl UiState {
                 }
                 return None;
             }
-            let max_scroll = HELP_BODY.len().saturating_sub(1);
+            // The bound the overlay can ever reach at any width - the
+            // exact one for this frame is applied when it renders (see
+            // `help_total_lines`).
+            let max_scroll = help_total_lines().saturating_sub(1);
             match code {
                 KeyCode::Up => self.help_scroll = self.help_scroll.saturating_sub(1),
                 KeyCode::Down => self.help_scroll = (self.help_scroll + 1).min(max_scroll),
@@ -3443,6 +4007,12 @@ impl UiState {
     /// tab. Every other key is absorbed - it is a modal.
     fn handle_call_modal_key(&mut self, code: KeyCode) -> Option<UiAction> {
         let own_id = self.own_id;
+        // Answered before anything else the modal does, the same tier its
+        // invite picker sits at: nothing about the call changes while
+        // either is open.
+        if self.call.as_ref()?.end_confirm.is_some() {
+            return self.handle_end_call_confirm_key(code);
+        }
         if self.call.as_ref()?.invite_picker.is_some() {
             return self.handle_call_invite_picker_key(code);
         }
@@ -3484,7 +4054,12 @@ impl UiState {
                     muted: !member.host_muted,
                 })
             }
-            KeyCode::Enter | KeyCode::Char('e') | KeyCode::Char('E') => Some(UiAction::EndCall),
+            // END CALL asks first (see `CallUiState::end_confirm`); the
+            // answer is what actually leaves.
+            KeyCode::Enter | KeyCode::Char('e') | KeyCode::Char('E') => {
+                self.call.as_mut()?.end_confirm = Some(CallConfirmChoice::Cancel);
+                None
+            }
             // Selector navigation keeps working through the modal - it is
             // how the user gets on with reading a channel or a DM without
             // ending anything. It folds the modal away first, so it
@@ -3506,6 +4081,36 @@ impl UiState {
                     call.minimized = true;
                 }
                 None
+            }
+            _ => None,
+        }
+    }
+
+    /// END CALL's confirmation, while it is open over the modal:
+    /// Left/Right/Tab move between the two buttons, Enter answers, Escape
+    /// is the same as answering Cancel. Nothing else reaches the modal
+    /// underneath, so no roster key can be mistaken for an answer.
+    fn handle_end_call_confirm_key(&mut self, code: KeyCode) -> Option<UiAction> {
+        let call = self.call.as_mut()?;
+        let focus = call.end_confirm?;
+        match code {
+            KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
+                call.end_confirm = Some(match focus {
+                    CallConfirmChoice::Confirm => CallConfirmChoice::Cancel,
+                    CallConfirmChoice::Cancel => CallConfirmChoice::Confirm,
+                });
+                None
+            }
+            KeyCode::Esc => {
+                call.end_confirm = None;
+                None
+            }
+            KeyCode::Enter => {
+                call.end_confirm = None;
+                match focus {
+                    CallConfirmChoice::Confirm => Some(UiAction::EndCall),
+                    CallConfirmChoice::Cancel => None,
+                }
             }
             _ => None,
         }
@@ -3699,8 +4304,9 @@ impl UiState {
                 .enumerate()
                 .filter(|(i, _)| *i != self.selected_channel)
                 .map(|(_, c)| SelectorEntry {
-                    label: format!("{} {}", channel_kind_icon(c.kind), c.name),
+                    label: channel_label(c.kind, &c.name),
                     unread: c.unread,
+                    otp: false,
                     presence: None,
                 })
                 .collect(),
@@ -3712,10 +4318,34 @@ impl UiState {
                 .map(|room| SelectorEntry {
                     label: format!("{DM_ICON} {}", room.peer.name),
                     unread: room.unread,
+                    otp: self.is_otp_active(room.peer.id),
                     presence: Some(self.presence_of(room.peer.id)),
                 })
                 .collect(),
         }
+    }
+
+    /// Which dropdown row the list has to keep on screen when it holds
+    /// more entries than fit (`render_selector_dropdown`).
+    ///
+    /// The dropdown lists everything *except* the current selection, so
+    /// there is no selected row in it to follow. What there is instead is
+    /// the *gap* the selection left: the number of entries ahead of it in
+    /// the selector's own order. Keeping that position in view is what
+    /// makes Up/Down walk a long list continuously - the row stepped onto
+    /// leaves the list and the one stepped off rejoins it right there, so
+    /// the neighbourhood of the gap is exactly where the movement is
+    /// visible.
+    pub fn selector_dropdown_focus_row(&self) -> usize {
+        let entries = self.selector_dropdown_entries().len();
+        let gap = match self.selector_focus {
+            SelectorFocus::Channels => self.selected_channel,
+            SelectorFocus::Dms => self
+                .selected_dm
+                .and_then(|id| self.dm_order.iter().position(|d| *d == id))
+                .unwrap_or(0),
+        };
+        gap.min(entries.saturating_sub(1))
     }
 
     /// Whether any channel behind the left-hand selector holds messages
@@ -4505,6 +5135,7 @@ impl UiState {
                             sent_at: local_time_stamp(),
                             owed_receipt: None,
                             delivery: None,
+                            crypto: None,
                         },
                     );
                 }
@@ -4526,6 +5157,7 @@ impl UiState {
                             sent_at: local_time_stamp(),
                             owed_receipt: None,
                             delivery: None,
+                            crypto: None,
                         },
                     );
                 }
@@ -4715,7 +5347,7 @@ pub fn render(frame: &mut Frame, state: &UiState) {
     if let Some(call) = &state.call
         && !call.minimized
     {
-        render_call_modal(frame, centered_rect(70, 20, area), state, call);
+        render_call_modal(frame, area, state, call);
     }
     if let Some(pending) = &state.call_confirm {
         render_call_confirm_popup(frame, area, pending, state.call_confirm_focus);
@@ -4771,6 +5403,7 @@ fn render_file_offer_popup(
     let popup = centered_rect(64, 9, area);
     let block = Block::default().title(title).borders(Borders::ALL);
     let inner = block.inner(popup);
+    frame.render_widget(Clear, popup);
     frame.render_widget(block, popup);
 
     let rows = Layout::default()
@@ -4826,6 +5459,7 @@ fn render_call_invite_popup(
     let popup = centered_rect(64, 9, area);
     let block = Block::default().title(title).borders(Borders::ALL);
     let inner = block.inner(popup);
+    frame.render_widget(Clear, popup);
     frame.render_widget(block, popup);
 
     let rows = Layout::default()
@@ -4877,6 +5511,7 @@ fn render_otp_generate_popup(
         .title("Start an OTP session")
         .borders(Borders::ALL);
     let inner = block.inner(popup);
+    frame.render_widget(Clear, popup);
     frame.render_widget(block, popup);
 
     let rows = Layout::default()
@@ -4915,6 +5550,7 @@ fn render_otp_invite_popup(
         .title(format!("OTP session request from {}", invite.from_name))
         .borders(Borders::ALL);
     let inner = block.inner(popup);
+    frame.render_widget(Clear, popup);
     frame.render_widget(block, popup);
 
     let rows = Layout::default()
@@ -4960,6 +5596,7 @@ fn render_otp_size_popup(frame: &mut Frame, area: Rect, pending: &PendingOtpGene
         .title(format!("Pad size for {} (MB per key)", pending.peer_name))
         .borders(Borders::ALL);
     let inner = block.inner(popup);
+    frame.render_widget(Clear, popup);
     frame.render_widget(block, popup);
 
     let mut constraints = vec![Constraint::Min(3), Constraint::Length(1)];
@@ -5042,17 +5679,75 @@ fn level_bar(level: u8) -> String {
     )
 }
 
-/// How wide a roster row's name column is: the longest nickname
-/// (`ui_connect_popup::NICKNAME_MAX_LEN`) plus both suffixes it can carry
-/// at once - ` (host)` and ` (you)` - and one space of separation. Every
-/// row pads to it so the labels, and with them the voice bars, all start
-/// in the same column.
-const CALL_NAME_COL: usize = super::ui_connect_popup::NICKNAME_MAX_LEN + 7 + 6 + 1;
+/// The `> ` / `  ` selection marker every roster row opens with.
+const CALL_MARKER_COL: usize = 2;
 
-/// The same for the label column: `REJECTED MUTED` is the widest anything
-/// there can read, so a row carrying nothing but `IN CALL` still leaves
-/// the space a later `MUTED` would take rather than sliding its bar left.
-const CALL_LABEL_COL: usize = 14;
+/// The gap between the name column and the label column. Four columns
+/// rather than one: on the row whose name fills the whole column the two
+/// would otherwise touch, and a long nickname running straight into
+/// `IN CALL` reads as one string rather than as two columns.
+const CALL_COL_GAP: usize = 4;
+
+/// The narrowest gap ever left between the labels and the voice meter that
+/// ends the row. Wider than `CALL_COL_GAP` because the meter is right
+/// aligned and the labels are not: on the widest row in the list these two
+/// columns are all that separates them, and one space there reads as one
+/// run of text rather than two columns.
+const CALL_LEVEL_GAP: usize = 2;
+
+/// A call roster's two measured column widths - the third column, the
+/// voice meter, is `LEVEL_BAR_CELLS` wide and always sits flush against
+/// the modal's right edge.
+///
+/// Both are measured from the roster actually on screen rather than fixed
+/// at the widest they could ever be (a 10-character nickname carrying both
+/// ` (you)` and ` (host)`, a `REJECTED MUTED` label pair). A call is
+/// usually two or three people with short names and one label each, so
+/// the worst case is mostly blank columns down the middle of every row.
+/// Measuring makes the modal as narrow as the call in it allows, and -
+/// because both figures are taken across the *whole* list, not per row -
+/// keeps all three columns lined up down it (`docs/SPEC.md` "Live voice
+/// calls").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CallColumns {
+    pub name: usize,
+    pub label: usize,
+}
+
+impl CallColumns {
+    /// Measures both columns across `call`'s whole roster.
+    pub fn measure(call: &CallUiState, own_id: Option<UserId>) -> Self {
+        let name = call
+            .members
+            .iter()
+            .map(|m| display_width(&call_member_name(m, call.host, own_id)) as usize)
+            .max()
+            .unwrap_or(0);
+        let label = call
+            .members
+            .iter()
+            .map(|m| {
+                call_member_labels(m)
+                    .iter()
+                    .map(|s| display_width(&s.content) as usize)
+                    .sum()
+            })
+            .max()
+            .unwrap_or(0);
+        Self { name, label }
+    }
+
+    /// How many columns one roster row needs end to end: marker, name,
+    /// gap, labels, the gap before the meter, and the meter itself.
+    pub fn row_width(self) -> usize {
+        CALL_MARKER_COL
+            + self.name
+            + CALL_COL_GAP
+            + self.label
+            + CALL_LEVEL_GAP
+            + LEVEL_BAR_CELLS
+    }
+}
 
 /// The roster labels one member's row carries, already coloured
 /// (`docs/SPEC.md` "Live voice calls"): `IN CALL` green / `INVITED`
@@ -5079,7 +5774,6 @@ fn call_member_labels(member: &CallMember) -> Vec<Span<'static>> {
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ));
     }
-    pad_to(&mut spans, CALL_LABEL_COL);
     spans
 }
 
@@ -5110,14 +5804,20 @@ fn pad_to(spans: &mut Vec<Span<'static>>, width: usize) {
 /// The call modal (`docs/SPEC.md` "Live voice calls"): live duration on
 /// top in yellow, the scrollable roster below it - host first, everyone
 /// else after - each row labelled and metered, and the END CALL button at
-/// the bottom. Drawn both as an overlay over the ordinary view and, when
-/// the call's tab is selected, as the whole view; `area` is whichever of
-/// those the caller decided on.
+/// the bottom.
+///
+/// `area` is the space the modal may use, not the modal: it sizes itself
+/// to the call in it (`call_modal_rect`) and centers in what it was given,
+/// so a three-person call on a wide terminal is a small box rather than a
+/// fixed slab of mostly-blank columns.
 pub(crate) fn render_call_modal(frame: &mut Frame, area: Rect, state: &UiState, call: &CallUiState) {
     let title = match &call.channel {
         Some(name) => format!("Call \u{2014} #{name}"),
         None => "Call".to_string(),
     };
+    let columns = CallColumns::measure(call, state.own_id);
+    let hint = call_modal_hint(call, state.own_id);
+    let area = call_modal_rect(call, &title, &hint, columns, area);
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
@@ -5169,21 +5869,33 @@ pub(crate) fn render_call_modal(frame: &mut Frame, area: Rect, state: &UiState, 
             )];
             let is_us = Some(member.id) == state.own_id;
             let name = call_member_name(member, call.host, state.own_id);
+            let name_col = columns.name;
             spans.push(Span::styled(
-                format!("{name:<CALL_NAME_COL$}"),
+                format!("{name:<name_col$}"),
                 if idx == call.selected {
                     Style::default().add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
                 },
             ));
-            spans.extend(call_member_labels(member));
+            spans.push(Span::raw(" ".repeat(CALL_COL_GAP)));
+            let mut labels = call_member_labels(member);
+            pad_to(&mut labels, columns.label);
+            spans.extend(labels);
             // Our own row meters what we are actually sending: muting
             // ourselves (`m` on our own row) stops that at the source, so
             // the bar must read empty rather than keep twitching along
             // with a microphone nobody hears.
             let level = if is_us && call.muted { 0 } else { member.level };
-            spans.push(Span::raw("  "));
+            // Flush right against the modal's inner edge, whatever the
+            // two measured columns before it came to - so the meters read
+            // as one column of their own rather than tracking the ragged
+            // right edge of the labels.
+            let used = CALL_MARKER_COL + name_col + CALL_COL_GAP + columns.label;
+            let gap = (inner.width as usize)
+                .saturating_sub(used + LEVEL_BAR_CELLS)
+                .max(CALL_LEVEL_GAP);
+            spans.push(Span::raw(" ".repeat(gap)));
             spans.push(Span::styled(
                 level_bar(level),
                 Style::default().fg(Color::Green),
@@ -5193,23 +5905,116 @@ pub(crate) fn render_call_modal(frame: &mut Frame, area: Rect, state: &UiState, 
         .collect();
     frame.render_widget(Paragraph::new(lines), rows[1]);
 
-    let host_hint = if call.we_are_host(state.own_id) {
-        "  m: mute  i: invite"
-    } else {
-        ""
-    };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            format!("Esc: minimize{host_hint}"),
+            hint,
             Style::default().fg(Color::DarkGray),
         ))),
         rows[2],
     );
-    render_popup_button(frame, rows[3], 14, "END CALL", true);
+    render_popup_button(frame, rows[3], CALL_END_BUTTON_WIDTH, "END CALL", true);
 
     if let Some(picker) = &call.invite_picker {
         render_call_invite_picker(frame, area, picker);
     }
+    if let Some(focus) = call.end_confirm {
+        render_end_call_confirm_popup(frame, area, focus);
+    }
+}
+
+/// What END CALL asks before it leaves a call
+/// (`CallUiState::end_confirm`). Drawn over the modal it was pressed on,
+/// like the invite picker, so the roster it is about stays in view.
+fn render_end_call_confirm_popup(frame: &mut Frame, area: Rect, focus: CallConfirmChoice) {
+    let popup = centered_rect(48, 6, area);
+    let block = Block::default()
+        .title(END_CALL_CONFIRM_TITLE)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Red));
+    let inner = block.inner(popup);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(block, popup);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(3)])
+        .split(inner);
+    frame.render_widget(
+        Paragraph::new(END_CALL_CONFIRM_QUESTION)
+            .wrap(ratatui::widgets::Wrap { trim: true })
+            .alignment(ratatui::layout::Alignment::Center),
+        rows[0],
+    );
+
+    let button_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(rows[1]);
+    render_popup_button(
+        frame,
+        button_cols[0],
+        16,
+        "END CALL",
+        focus == CallConfirmChoice::Confirm,
+    );
+    render_popup_button(
+        frame,
+        button_cols[1],
+        16,
+        "Cancel",
+        focus == CallConfirmChoice::Cancel,
+    );
+}
+
+/// The confirmation's title and question, named so a test reads the same
+/// strings the popup draws.
+pub const END_CALL_CONFIRM_TITLE: &str = "Leave this call?";
+pub const END_CALL_CONFIRM_QUESTION: &str = "Leaving is immediate and cannot be undone.";
+
+/// The width of the modal's own END CALL button, which is also a floor on
+/// how narrow the modal may get - a button clipped in half reads as a
+/// rendering fault rather than as a small window.
+const CALL_END_BUTTON_WIDTH: u16 = 14;
+
+/// The key line under the roster. The host's two extra keys are only shown
+/// to the host, since only they do anything for anyone else.
+fn call_modal_hint(call: &CallUiState, own_id: Option<UserId>) -> String {
+    let host_hint = if call.we_are_host(own_id) {
+        "  m: mute  i: invite"
+    } else {
+        ""
+    };
+    format!("Esc: minimize{host_hint}")
+}
+
+/// The rectangle the call modal actually occupies inside `area`: as narrow
+/// and as short as its own contents allow, centered, and never larger than
+/// what it was given.
+///
+/// Width is the widest thing that has to fit on one line - a roster row
+/// (`CallColumns::row_width`), the key hint, the title in its border, or
+/// the END CALL button. Height is one row per participant plus the fixed
+/// furniture around them (duration, hint, button, borders), so a two-person
+/// call is a small box and a twelve-person one grows until it runs out of
+/// screen, at which point the roster scrolls inside it as it already did.
+pub(crate) fn call_modal_rect(
+    call: &CallUiState,
+    title: &str,
+    hint: &str,
+    columns: CallColumns,
+    area: Rect,
+) -> Rect {
+    let content = columns
+        .row_width()
+        .max(display_width(hint) as usize)
+        .max(display_width(title) as usize)
+        .max(CALL_END_BUTTON_WIDTH as usize);
+    let width = (content as u16).saturating_add(2);
+    // 1 duration + roster + 1 hint + 3 button + 2 borders. The roster
+    // floors at one row: a modal with no room for even one participant
+    // would be a border around nothing.
+    let height = (call.members.len().max(1) as u16).saturating_add(7);
+    centered_rect(width, height, area)
 }
 
 /// The host-only invite picker, drawn over the modal it was opened from.
@@ -5412,6 +6217,7 @@ fn render_identity_review_popup(
     let popup = centered_rect(70, 13, area);
     let block = Block::default().title(title).borders(Borders::ALL);
     let inner = block.inner(popup);
+    frame.render_widget(Clear, popup);
     frame.render_widget(block, popup);
 
     let rows = Layout::default()
@@ -5520,7 +6326,10 @@ pub(crate) fn render_messages(
         state
             .known_users
             .get(&id)
-            .map(|u| format!("Private: {}", u.key_mode.format_with_name(&u.name)))
+            // The same tag they carry in the user list and on the DM
+            // selector (`UiState::encryption_tag`), so one person is not
+            // labelled two different ways on one screen.
+            .map(|u| format!("Private: {} {}", u.name, state.encryption_tag(id, u.key_mode)))
             .unwrap_or_else(|| "Private".to_string())
     } else {
         "Messages".to_string()
@@ -5573,9 +6382,9 @@ pub(crate) fn render_messages(
     }
 
     // OTP's own UI surface only exists inside a private room (see
-    // `otp_active_peers`'s doc) - a channel log never gets the shield
+    // `otp_active_peers`'s doc) - a channel log never gets the pad
     // prefix, regardless of any individual member's OTP status.
-    let shield_active = dm_peer.is_some_and(|peer| state.is_otp_active(peer));
+    let pad_active = dm_peer.is_some_and(|peer| state.is_otp_active(peer));
 
     let items: Vec<ListItem> = log
         .iter()
@@ -5664,17 +6473,17 @@ pub(crate) fn render_messages(
             // A message that reached nobody is struck through: it is not
             // waiting on anybody's acknowledgement, because it was never
             // addressed to anybody (`docs/SPEC.md` "Delivery
-            // acknowledgments"). Applied before the shield prefix below,
+            // acknowledgments"). Applied before the pad prefix below,
             // so a combining overlay never lands on that emoji.
             if entry.reached_nobody() {
                 for span in line.spans.iter_mut() {
                     span.content = strike_through(&span.content).into();
                 }
             }
-            if shield_active
+            if pad_active
                 && !matches!(entry.body, MessageBody::System(_) | MessageBody::Presence(_))
             {
-                line.spans.insert(0, Span::raw("\u{1F6E1}\u{FE0F} "));
+                line.spans.insert(0, Span::raw(format!("{OTP_ICON} ")));
             }
             // A row whose async send turned out to have failed
             // (`UiState::mark_dm_message_failed`) is shown in red, same as
@@ -5682,7 +6491,7 @@ pub(crate) fn render_messages(
             // uses - a failed send must never look identical to a
             // delivered one. The line's own style is a fallback under each
             // span's, but none of the spans built above (including the
-            // shield prefix) set their own color, so this reliably paints
+            // pad prefix) set their own color, so this reliably paints
             // the whole row.
             if entry.failed {
                 line.style = Style::default().fg(Color::Red);
@@ -5780,6 +6589,18 @@ pub(crate) fn render_input_bar(frame: &mut Frame, area: Rect, state: &UiState) {
     // unreachable - `handle_input_key`'s doc), so the moment there's
     // something typed, show it rather than hiding it behind a fixed notice
     // the user would otherwise be typing blind past.
+    // The pad marks the bar it is typed into, not just the rows it has
+    // already protected: while a session is open, everything sent from
+    // here goes under it (`docs/PROTOCOL.md` §16.2 - there is no way to
+    // send that person a plain message meanwhile), and this says so at the
+    // moment it matters rather than only afterwards. Shown even over the
+    // placeholders below, since it is a fact about the room rather than
+    // about what is currently typed.
+    let pad_prefix = state
+        .active_private_room
+        .is_some_and(|peer| state.is_otp_active(peer))
+        .then(|| format!("{OTP_ICON} "));
+
     let mut spans = if dm_peer_trust_gated {
         vec![Span::styled(
             "(identity not verified)",
@@ -5793,6 +6614,12 @@ pub(crate) fn render_input_bar(frame: &mut Frame, area: Rect, state: &UiState) {
     } else {
         vec![Span::raw(state.input.as_str())]
     };
+    if let Some(prefix) = &pad_prefix {
+        spans.insert(
+            0,
+            Span::styled(prefix.clone(), Style::default().fg(OTP_TAG_COLOR)),
+        );
+    }
     if state.recording {
         spans.push(Span::styled(
             " \u{1F3A4} recording...",
@@ -5809,8 +6636,11 @@ pub(crate) fn render_input_bar(frame: &mut Frame, area: Rect, state: &UiState) {
         && !dm_peer_trust_gated
         && (!dm_peer_offline || !state.input.is_empty())
     {
-        let cursor_x =
-            inner.x + (state.input.chars().count() as u16).min(inner.width.saturating_sub(1));
+        // Past the pad marker, when there is one - the cursor belongs
+        // where the next character will actually land.
+        let offset = pad_prefix.as_deref().map(display_width).unwrap_or(0)
+            + state.input.chars().count() as u16;
+        let cursor_x = inner.x + offset.min(inner.width.saturating_sub(1));
         frame.set_cursor_position((cursor_x, inner.y));
     }
 }
@@ -5828,14 +6658,14 @@ pub(crate) fn focus_border_style(focused: bool) -> Style {
 
 /// Terminal cell width of `s`, correcting `.chars().count()` for the
 /// 2-cell-wide emoji this help text uses (\u{1F512}/\u{1F6A8}) - every other
-/// character in here is a normal 1-cell one. Used only to size the help
-/// popup to fit its own longest line; see `render_help_popup`.
-fn display_width(s: &str) -> u16 {
-    let wide = s
-        .chars()
-        .filter(|c| matches!(*c, '\u{1F512}' | '\u{1F6A8}'))
-        .count();
-    (s.chars().count() + wide) as u16
+/// How many terminal cells `s` takes up, measured exactly the way ratatui
+/// measures it when laying the same text out. Anything sized from this and
+/// the text drawn into it therefore agree by construction, however many
+/// double-width emoji are in the string - which a `chars().count()` would
+/// not, and which every column this app aligns depends on (the call
+/// roster, the help overlay's two columns, the details popup).
+pub(crate) fn display_width(s: &str) -> u16 {
+    Span::raw(s).width() as u16
 }
 
 /// What the info popup calls the time a row carries, per direction: a row
@@ -5848,6 +6678,57 @@ pub const RECEIVED_AT_LABEL: &str = "received_at";
 /// incoming message, a presence notice, or an outgoing row that is not a
 /// text message.
 pub const NO_DELIVERY_INFO: &str = "no delivery information for this message";
+
+/// The labels down the info popup's encryption block, in the order they
+/// appear. The three `Key *` ones are the OTP layer's alone
+/// (`MessageCrypto::Otp`) - which sequence of the pad this message was,
+/// where in the pad its key bytes started, and which key file they came
+/// out of (`docs/PROTOCOL.md` §16).
+pub const ENCRYPTION_LABEL: &str = "encryption";
+pub const KEY_LABEL: &str = "key";
+pub const KEY_SEQ_LABEL: &str = "key_seq";
+pub const KEY_OFFSET_LABEL: &str = "key_offset";
+pub const KEY_FILE_LABEL: &str = "key_file";
+
+/// What stands in for a key id on a channel send, which is sealed once per
+/// member with that member's own key - there is no single key to name.
+pub const KEY_PER_RECIPIENT: &str = "one per recipient";
+
+/// What the popup says on a row this client wrote itself - a presence
+/// notice, or the app's own narration of an OTP handshake. Nothing about
+/// those lines travelled, so there is no encryption to report.
+pub const NO_CRYPTO_INFO: &str = "not an encrypted message";
+
+/// The encryption block for one row, as `(label, value)` pairs in display
+/// order. Split out from the rendering so the popup can size itself off
+/// the same lines it is about to draw, and so a test can read what a row
+/// reports without going through a frame.
+pub fn crypto_lines(crypto: Option<&MessageCrypto>) -> Vec<(&'static str, String)> {
+    let Some(crypto) = crypto else {
+        return vec![(ENCRYPTION_LABEL, NO_CRYPTO_INFO.to_string())];
+    };
+    let mut lines = vec![(ENCRYPTION_LABEL, crypto.method_label().to_string())];
+    match crypto {
+        MessageCrypto::Envelope { key_id, .. } => {
+            lines.push((
+                KEY_LABEL,
+                key_id
+                    .clone()
+                    .unwrap_or_else(|| KEY_PER_RECIPIENT.to_string()),
+            ));
+        }
+        MessageCrypto::Otp {
+            seq,
+            offset,
+            key_path,
+        } => {
+            lines.push((KEY_SEQ_LABEL, seq.to_string()));
+            lines.push((KEY_OFFSET_LABEL, offset.to_string()));
+            lines.push((KEY_FILE_LABEL, key_path.clone()));
+        }
+    }
+    lines
+}
 
 /// One message's details: when it happened, and - for a message this
 /// client sent - every user it was sent to with that user's own delivery
@@ -5875,6 +6756,16 @@ fn render_message_info_popup(frame: &mut Frame, area: Rect, state: &UiState) {
         .map(|d| d.recipients.as_slice())
         .unwrap_or_default();
 
+    // How this row's content was protected (`MessageCrypto`), as a block
+    // of `label: value` lines with the values in one column - the same
+    // shape the OTP session header uses for the same figures.
+    let crypto = crypto_lines(entry.crypto.as_ref());
+    let crypto_label_width = crypto.iter().map(|(l, _)| l.len()).max().unwrap_or(0);
+    let crypto_rendered: Vec<String> = crypto
+        .iter()
+        .map(|(label, value)| format!("{label:<crypto_label_width$}  {value}"))
+        .collect();
+
     // Every status column is the same width, so the words line up under
     // each other however uneven the nicknames are; the names column is
     // sized by the longest name so nothing is truncated that fits.
@@ -5897,13 +6788,21 @@ fn render_message_info_popup(frame: &mut Frame, area: Rect, state: &UiState) {
         .unwrap_or(0);
     let content_width = (name_width + GAP_COLUMNS + status_width)
         .max(time_line.chars().count())
-        .max(NO_DELIVERY_INFO.len());
+        .max(NO_DELIVERY_INFO.len())
+        .max(
+            crypto_rendered
+                .iter()
+                .map(|l| l.chars().count())
+                .max()
+                .unwrap_or(0),
+        );
     let max_allowed = (area.width as u32 * 9 / 10) as u16;
     let popup_width = ((content_width + 4) as u16).min(max_allowed);
-    // The time line, a blank, then one line per recipient - or the single
-    // "nothing to report" line, which is why this floors at one rather
-    // than sizing straight off `recipients.len()`.
-    let body_lines = 2 + recipients.len().max(1);
+    // The time line, a blank, the encryption block, a blank, then one line
+    // per recipient - or the single "nothing to report" line, which is why
+    // that part floors at one rather than sizing straight off
+    // `recipients.len()`.
+    let body_lines = 3 + crypto_rendered.len() + recipients.len().max(1);
     let popup_height = ((body_lines + 2) as u16).min((area.height as u32 * 9 / 10) as u16);
     let popup = centered_rect(popup_width, popup_height, area);
 
@@ -5921,6 +6820,13 @@ fn render_message_info_popup(frame: &mut Frame, area: Rect, state: &UiState) {
         )),
         Line::from(""),
     ];
+    for line in &crypto_rendered {
+        lines.push(Line::from(Span::styled(
+            line.clone(),
+            Style::default().fg(Color::Cyan),
+        )));
+    }
+    lines.push(Line::from(""));
     if recipients.is_empty() {
         lines.push(Line::from(Span::styled(
             NO_DELIVERY_INFO,
@@ -5949,76 +6855,180 @@ fn render_message_info_popup(frame: &mut Frame, area: Rect, state: &UiState) {
 /// popup is sized, so the two never touch.
 const GAP_COLUMNS: usize = 2;
 
-fn render_help_popup(frame: &mut Frame, area: Rect, state: &UiState) {
-    // Wide enough for the longest line plus the block's borders and a
-    // 1-column breathing margin on each side, but capped at 90% of the
-    // available width even if that clips the longest lines - a popup that
-    // fills the whole screen is worse than one that clips a little text.
-    let content_width = HELP_BODY
+/// The help overlay's own title, which is also how a test finds the box.
+pub const HELP_POPUP_TITLE: &str = "Help (Ctrl+H / Esc to close, arrows to scroll)";
+
+/// The two-space indent every entry under a heading carries, and the gap
+/// between the keys column and the description column.
+const HELP_INDENT: usize = 2;
+const HELP_COL_GAP: usize = 2;
+
+/// The narrowest the description column is ever squeezed to. Below this
+/// the overlay lets its lines run past the border and be clipped rather
+/// than wrapping every other word onto a line of its own - and, because
+/// the wrapped line count therefore stops growing here, it is also what
+/// makes `help_total_lines` a genuine bound at every width.
+const HELP_MIN_DESC_COL: usize = 24;
+
+/// How wide the overlay's first column is: the widest keys or command in
+/// it, so every description in the whole page starts in the same column
+/// (`docs/SPEC.md` Functionality #7).
+fn help_keys_col() -> usize {
+    HELP_BODY
         .iter()
-        .map(|l| display_width(l))
+        .filter_map(|line| match line {
+            HelpLine::Item { keys, .. } => Some(display_width(keys) as usize),
+            _ => None,
+        })
         .max()
-        .unwrap_or(0);
-    let max_allowed = (area.width as u32 * 9 / 10) as u16;
-    let popup_width = (content_width + 4).min(max_allowed);
-
-    // Tall enough for the whole text when the terminal allows it, capped
-    // at 90% of the available height so the view underneath stays visible
-    // as context - scrolling covers whatever doesn't fit.
-    let popup_height = (HELP_BODY.len() as u16 + 2).min((area.height as u32 * 9 / 10) as u16);
-    let popup = centered_rect(popup_width, popup_height, area);
-    let block = Block::default()
-        .title("Help (Ctrl+H / Esc to close, arrows to scroll)")
-        .borders(Borders::ALL);
-    let inner = block.inner(popup);
-    frame.render_widget(block, popup);
-
-    // The popup's actual on-screen height (and hence how many lines fit)
-    // depends on the terminal size at render time, which `UiState` has no
-    // reason to know - so the scroll offset stored in state is clamped
-    // precisely here, against `inner.height`, rather than in `handle_key`
-    // (which only loosely clamps against the total line count). This is
-    // what actually makes the content scrollable rather than just
-    // truncated: without it, a terminal shorter than the full help text
-    // would permanently hide everything past the bottom of the popup.
-    let visible_rows = inner.height as usize;
-    let max_scroll = HELP_BODY.len().saturating_sub(visible_rows);
-    let scroll = state.help_scroll.min(max_scroll);
-
-    let lines: Vec<Line> = HELP_BODY.iter().map(|&text| help_line(text)).collect();
-    frame.render_widget(Paragraph::new(lines).scroll((scroll as u16, 0)), inner);
+        .unwrap_or(0)
 }
 
-/// Styles one help line: section headings in yellow (bold), a
-/// shortcut/command item's keys in the default (bright) color with its
-/// description in gray - so the shortcut itself is what stands out - and
-/// plain prose/continuation lines entirely in gray. An item line is
-/// recognised by its shape: a two-space indent, then the keys, then a run
-/// of three-plus spaces before the description (every key column in
-/// `HELP_BODY` keeps at least that gap; anything narrower is prose).
-fn help_line(text: &'static str) -> Line<'static> {
-    if HELP_HEADINGS.contains(&text) {
-        return Line::from(Span::styled(
-            text,
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ));
+/// What is left for the description column inside an overlay `inner_width`
+/// columns wide, floored at `HELP_MIN_DESC_COL`.
+fn help_desc_col(inner_width: u16) -> usize {
+    (inner_width as usize)
+        .saturating_sub(HELP_INDENT + help_keys_col() + HELP_COL_GAP)
+        .max(HELP_MIN_DESC_COL)
+}
+
+/// `text` broken at spaces into pieces of at most `width` display columns.
+///
+/// A single word wider than the column - a path, a URL - is left over-long
+/// on a line of its own rather than cut mid-word: half a path is worse to
+/// read than one that runs to the edge, and it is the only case where a
+/// line can exceed the column at all.
+fn wrap_to_width(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0usize;
+    for word in text.split_whitespace() {
+        let word_width = display_width(word) as usize;
+        let needed = if current.is_empty() {
+            word_width
+        } else {
+            current_width + 1 + word_width
+        };
+        if !current.is_empty() && needed > width {
+            lines.push(std::mem::take(&mut current));
+            current_width = 0;
+        }
+        if !current.is_empty() {
+            current.push(' ');
+            current_width += 1;
+        }
+        current.push_str(word);
+        current_width += word_width;
     }
-    if text.is_empty() {
-        return Line::from(text);
+    if !current.is_empty() || lines.is_empty() {
+        lines.push(current);
     }
-    let is_item = text.starts_with("  ") && !text.starts_with("   ");
-    if is_item
-        && let Some(gap) = text[2..].find("   ").map(|i| i + 2)
-    {
-        let (keys, description) = text.split_at(gap);
-        return Line::from(vec![
-            Span::styled(keys, Style::default().add_modifier(Modifier::BOLD)),
-            Span::styled(description, Style::default().fg(Color::DarkGray)),
-        ]);
+    lines
+}
+
+/// The whole overlay laid out for a description column `desc_col` wide:
+/// headings flush left, everything else with its keys in the first column
+/// and its description - wrapped, every continuation line included -
+/// in the second.
+fn help_lines_for_column(desc_col: usize) -> Vec<Line<'static>> {
+    let keys_col = help_keys_col();
+    let indent = " ".repeat(HELP_INDENT);
+    let hanging = " ".repeat(HELP_INDENT + keys_col + HELP_COL_GAP);
+    let heading_style = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let description_style = Style::default().fg(Color::DarkGray);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for entry in HELP_BODY {
+        match entry {
+            HelpLine::Heading(title) => {
+                lines.push(Line::from(Span::styled(*title, heading_style)));
+            }
+            HelpLine::Blank => lines.push(Line::from("")),
+            // The keys are what the eye is looking for, so they keep the
+            // brighter default colour and the description behind them is
+            // gray.
+            HelpLine::Item { keys, text } => {
+                let pad = " ".repeat(keys_col.saturating_sub(display_width(keys) as usize));
+                for (i, chunk) in wrap_to_width(text, desc_col).into_iter().enumerate() {
+                    if i == 0 {
+                        lines.push(Line::from(vec![
+                            Span::raw(indent.clone()),
+                            Span::styled(*keys, Style::default().add_modifier(Modifier::BOLD)),
+                            Span::raw(format!("{pad}{}", " ".repeat(HELP_COL_GAP))),
+                            Span::styled(chunk, description_style),
+                        ]));
+                    } else {
+                        lines.push(Line::from(vec![
+                            Span::raw(hanging.clone()),
+                            Span::styled(chunk, description_style),
+                        ]));
+                    }
+                }
+            }
+            HelpLine::Note(text) => {
+                for chunk in wrap_to_width(text, desc_col) {
+                    lines.push(Line::from(vec![
+                        Span::raw(hanging.clone()),
+                        Span::styled(chunk, description_style),
+                    ]));
+                }
+            }
+        }
     }
-    Line::from(Span::styled(text, Style::default().fg(Color::DarkGray)))
+    lines
+}
+
+/// The overlay laid out for the terminal actually in front of the user.
+fn help_rendered_lines(inner_width: u16) -> Vec<Line<'static>> {
+    help_lines_for_column(help_desc_col(inner_width))
+}
+
+/// The most lines the overlay can ever come to, which is its length at the
+/// narrowest description column it will use (`HELP_MIN_DESC_COL`) -
+/// wrapping only ever produces fewer lines as the column widens.
+///
+/// `UiState::handle_key` needs a bound that does not depend on a terminal
+/// it cannot see, so that `End` lands somewhere definite and a further
+/// `PageDown` moves nothing; the exact figure for this frame is clamped
+/// again at render time.
+pub fn help_total_lines() -> usize {
+    static TOTAL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *TOTAL.get_or_init(|| help_lines_for_column(HELP_MIN_DESC_COL).len())
+}
+
+fn render_help_popup(frame: &mut Frame, area: Rect, state: &UiState) {
+    // The whole screen, from the row above the header down through the
+    // compose bar (`docs/SPEC.md` Functionality #7). Help is the one
+    // overlay nothing behind it can usefully be read alongside: it is a
+    // page to read, several screens long on a small terminal, and every
+    // column it does not take is a column its key table has to wrap in.
+    // Taking the frame outright also means the widest line is clipped
+    // only by a terminal genuinely too narrow for it.
+    let popup = area;
+    let block = Block::default()
+        .title(HELP_POPUP_TITLE)
+        .borders(Borders::ALL);
+    let inner = block.inner(popup);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(block, popup);
+
+    // Both the number of lines the text comes to and how many of them fit
+    // depend on the terminal size at render time, which `UiState` has no
+    // reason to know - so the scroll offset stored in state is clamped
+    // precisely here rather than in `handle_key` (which only loosely
+    // clamps against `help_total_lines`). This is what actually makes the
+    // content scrollable rather than just truncated: without it, a
+    // terminal shorter than the full help text would permanently hide
+    // everything past the bottom of the popup.
+    let lines = help_rendered_lines(inner.width);
+    let visible_rows = inner.height as usize;
+    let max_scroll = lines.len().saturating_sub(visible_rows);
+    let scroll = state.help_scroll.min(max_scroll);
+
+    frame.render_widget(Paragraph::new(lines).scroll((scroll as u16, 0)), inner);
 }
 
 pub(crate) fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
@@ -6055,6 +7065,7 @@ pub(crate) fn render_file_browser(
     let title = format!("{title_prefix} - {}", browser.current_dir.display());
     let block = Block::default().title(title).borders(Borders::ALL);
     let inner = block.inner(popup);
+    frame.render_widget(Clear, popup);
     frame.render_widget(block, popup);
 
     let items: Vec<ListItem> = browser

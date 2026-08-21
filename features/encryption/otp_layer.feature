@@ -150,3 +150,41 @@ Feature: Layering one-time-pad encryption over an established pq_hybrid conversa
     When alice and bob both generate a pad for each other before either answers
     Then both sides agree on which pad survives
     And the conceding side keeps no pad of its own
+
+  @AC-243
+  Scenario: A message details popup names the pad position it spent
+    Given I am connected and viewing a channel
+    And bob is in the channel with me
+    And I have opened a private room with bob
+    And the otp session with bob is active
+    And bob's pad has sent 4 messages over 480 bytes and received 9 over 900
+    And focus is on the compose
+    When I type "under the pad"
+    And I press Enter
+    And I open the details of my last message
+    Then the details name pad sequence 5 at offset 480
+    And the details name the key file ending "_enc.key"
+
+  @AC-243
+  Scenario: An arriving message names the receiving pad instead
+    Given I am connected and viewing a channel
+    And bob is in the channel with me
+    And I have opened a private room with bob
+    And the otp session with bob is active
+    And bob's pad has sent 4 messages over 480 bytes and received 9 over 900
+    When bob has sent me the private message "psst"
+    And I open the details of my last message
+    Then the details name pad sequence 10 at offset 900
+    And the details name the key file ending "_dec.key"
+
+  @AC-246
+  Scenario: A pad session marks that person wherever they are named
+    Given I am connected and viewing a channel
+    And bob is in the channel with me using pq_hybrid
+    And carol is in the channel with me using pq_hybrid
+    And I have opened a private room with bob
+    And the otp session with bob is active
+    Then bob carries the OTP tag on the DM selector
+    When I press the [ key
+    Then bob carries the OTP tag in the user list instead of their own
+    And carol still carries their own tag

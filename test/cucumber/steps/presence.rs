@@ -8,7 +8,7 @@ use ratatui::style::Color;
 use aloo::client::tui::channel::HEADER_ROW_HEIGHT;
 use aloo::client::p2p::LinkStatus;
 use aloo::proto::{KeyMode, UserId};
-use aloo::client::tui::ui::{Focus, LogEntry, MessageBody};
+use aloo::client::tui::ui::{Focus, HELP_POPUP_TITLE, LogEntry, MessageBody};
 
 use crate::steps::ui_common::{id_for, press_key};
 use crate::support::{
@@ -106,9 +106,9 @@ async fn direct_connection_lost(w: &mut AlooWorld, name: String) {
 async fn name_colour(w: &mut AlooWorld, name: String, colour: String) {
     let expected = match colour.as_str() {
         "green" => Color::Green,
+        "gray" => Color::DarkGray,
         "red" => Color::Red,
-        "yellow" => Color::Yellow,
-        other => panic!("unknown colour {other:?} - expected green/red/yellow"),
+        other => panic!("unknown colour {other:?} - expected green/gray/red"),
     };
     let buffer = ui_buffer(w.ui_ref(), 160, 30);
     let (x, y) = find_text_start(&buffer, &name);
@@ -433,39 +433,32 @@ async fn help_unclipped(w: &mut AlooWorld) {
     );
 }
 
-#[then("the help popup stays within 90 percent of a narrow terminal")]
-async fn help_width_capped(w: &mut AlooWorld) {
-    let width = 60u16;
-    let buffer = ui_buffer(w.ui_ref(), width, 30);
+#[then("the help popup covers the whole screen, the compose bar included")]
+async fn help_covers_the_whole_screen(w: &mut AlooWorld) {
+    // Smaller than the help text needs, so nothing but the frame itself
+    // can be deciding the overlay's size here.
+    let (width, height) = (60u16, 20u16);
+    let buffer = ui_buffer(w.ui_ref(), width, height);
     let rows = crate::support::rows_of(&buffer);
-    // Locate the popup's own corner-and-title pair: the sidebar and message
-    // borders drawn underneath it appear on the same row and would otherwise
-    // be counted as part of it. Indexed by char, since box-drawing glyphs are
-    // multi-byte but exactly one cell each.
-    let border_row = rows
-        .iter()
-        .find(|r| r.contains("Help (Ctrl+H / Esc to close, arrows to scroll)"))
-        .expect("expected the popup's title row");
-    let row_chars: Vec<char> = border_row.chars().collect();
-    let title: Vec<char> = "Help (Ctrl+H / Esc to close, arrows to scroll)".chars().collect();
-    let title_start = row_chars
-        .windows(title.len())
-        .position(|c| c == title.as_slice())
-        .expect("title in row");
-    // The corner cell itself is not asserted on - see the same measurement
-    // in `ui_test.rs` (`help_popup_never_exceeds_90_percent_of_the_terminal_width`)
-    // for why a wide glyph underneath can swallow it.
-    let popup_start = title_start - 1;
-    let popup_end = row_chars[popup_start..]
-        .iter()
-        .position(|&c| c == '┐')
-        .expect("closing corner")
-        + popup_start;
-    let popup_width = popup_end - popup_start + 1;
-    let max_allowed = (width as u32 * 9 / 10) as usize;
+    let row_chars: Vec<Vec<char>> = rows.iter().map(|r| r.chars().collect()).collect();
+
+    assert_eq!(
+        row_chars[0][0], '\u{250C}',
+        "the overlay's top-left corner sits at the very top left, above the header: {rows:?}"
+    );
     assert!(
-        popup_width <= max_allowed,
-        "popup width {popup_width} exceeds 90% of a {width}-wide terminal ({max_allowed})"
+        rows[0].contains(HELP_POPUP_TITLE),
+        "the overlay's own title row is the frame's first row: {rows:?}"
+    );
+    assert_eq!(
+        row_chars[0][width as usize - 1],
+        '\u{2510}',
+        "the overlay runs to the last column: {rows:?}"
+    );
+    assert_eq!(
+        row_chars[height as usize - 1][0],
+        '\u{2514}',
+        "the overlay runs down to the last row, so the compose bar is covered: {rows:?}"
     );
 }
 
@@ -510,4 +503,107 @@ async fn focus_moves_to(w: &mut AlooWorld, area: String) {
 #[then(expr = "the selected user is at position {int}")]
 async fn sidebar_position(w: &mut AlooWorld, index: usize) {
     assert_eq!(w.ui_ref().sidebar_selected, index, "sidebar selection");
+}
+
+// ---------------------------------------------------------------------
+// Where the tags sit in the user list (AC-245)
+// ---------------------------------------------------------------------
+
+/// The user list's own rows, inside its border - so a column figure is a
+/// column of the sidebar rather than of the screen.
+fn user_list_rows(w: &AlooWorld) -> Vec<String> {
+    crate::support::popup_body(&ui_buffer(w.ui_ref(), 100, 14), "Users")
+}
+
+#[then("every tag in the user list ends on the sidebar's right edge")]
+async fn tags_flush_right(w: &mut AlooWorld) {
+    let rows = user_list_rows(w);
+    let tagged: Vec<&String> = rows
+        .iter()
+        .filter(|r| r.contains("PWD") || r.contains("PQH") || r.contains("PLAIN"))
+        .collect();
+    assert!(!tagged.is_empty(), "expected tagged rows: {rows:?}");
+    for row in tagged {
+        let chars: Vec<char> = row.chars().collect();
+        let last = chars
+            .iter()
+            .rposition(|c| !c.is_whitespace())
+            .expect("a tag on this row");
+        assert_eq!(
+            last + 1,
+            chars.len(),
+            "the tag runs to the sidebar's right edge: {row:?}"
+        );
+    }
+}
+
+#[then("every nickname still starts on its left")]
+async fn names_flush_left(w: &mut AlooWorld) {
+    let rows = user_list_rows(w);
+    for name in ["dan", "frank"] {
+        let row = rows
+            .iter()
+            .find(|r| r.contains(name))
+            .unwrap_or_else(|| panic!("no row for {name}: {rows:?}"));
+        assert!(
+            row.starts_with(name),
+            "the person stays on the left: {row:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------
+// A peer who reconnects (AC-248)
+// ---------------------------------------------------------------------
+
+/// The fresh `UserId` a reconnecting peer arrives under - deliberately not
+/// `id_for(name)`, since the whole point is that the server never hands
+/// the same one out twice.
+const RECONNECTED_ID: u64 = 9_001;
+
+#[when(expr = "{word} reconnects under a new id")]
+async fn reconnects(w: &mut AlooWorld, name: String) {
+    let info = crate::steps::ui_common::user_with_mode(
+        RECONNECTED_ID,
+        &name,
+        aloo::proto::KeyMode::Password,
+    );
+    w.ui_mut().on_user_joined("general", info);
+}
+
+#[then(expr = "{word} is listed once in the channel")]
+async fn listed_once(w: &mut AlooWorld, name: String) {
+    let state = w.ui_ref();
+    let listed = state.channels[state.selected_channel]
+        .members
+        .iter()
+        .filter(|m| m.name == name)
+        .count();
+    assert_eq!(listed, 1, "expected one {name}, not one per connection");
+}
+
+#[then(expr = "the private room with {word} still holds {string}")]
+async fn room_still_holds(w: &mut AlooWorld, name: String, text: String) {
+    let state = w.ui_ref();
+    let room = state
+        .private_rooms
+        .get(&UserId(RECONNECTED_ID))
+        .unwrap_or_else(|| panic!("no room under {name}'s new id: {:?}", state.dm_order));
+    assert!(
+        room.log
+            .iter()
+            .any(|e| matches!(&e.body, MessageBody::Text(t) if *t == text)),
+        "the conversation continues in the same room: {:?}",
+        room.log.len()
+    );
+}
+
+#[then(expr = "{word} is no longer offline")]
+async fn no_longer_offline(w: &mut AlooWorld, name: String) {
+    let state = w.ui_ref();
+    assert!(!state.offline.contains(&UserId(RECONNECTED_ID)));
+    assert!(
+        !state.offline.contains(&UserId(id_for(&name))),
+        "the id they are no longer known by is cleared too"
+    );
 }

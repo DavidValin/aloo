@@ -10,7 +10,7 @@ use aloo::server::CHANNEL_MAX_PASSWORD_ATTEMPTS;
 use aloo::client::tui::ui::{MessageBody, Mode, SelectorFocus, UiAction};
 
 use crate::steps::ui_common::id_for;
-use crate::support::{header_row, ui_rows_wide};
+use crate::support::{find_text_start, header_row, popup_body, popup_rect, ui_buffer, ui_rows_wide};
 use crate::world::AlooWorld;
 
 const TEST_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
@@ -501,4 +501,82 @@ async fn would_accept_link_from(w: &mut AlooWorld, who: String) {
 async fn would_not_accept_link_from_stranger(w: &mut AlooWorld) {
     // An id no channel member in these scenarios ever uses.
     assert!(!w.ui_ref().shares_a_joined_channel(UserId(999_999)));
+}
+
+// ---------------------------------------------------------------------
+// A dropdown longer than the screen (AC-238) and the colour its envelope
+// takes (AC-239)
+// ---------------------------------------------------------------------
+
+/// The frame these two steps measure on: short enough that a 30-entry
+/// dropdown cannot possibly fit, wide enough that nothing is clipped
+/// sideways while it is being read.
+const SHORT_FRAME: (u16, u16) = (60, 14);
+
+#[given(expr = "the channel already has joined {int} more channels")]
+async fn already_joined_many(w: &mut AlooWorld, n: usize) {
+    let state = w.ui_mut();
+    let was = state.selected_channel;
+    for i in 0..n {
+        state.on_joined(ChannelInfo {
+            name: format!("channel-{i:02}"),
+            kind: ChannelKind::Public,
+        });
+    }
+    state.select_channel_at(was);
+}
+
+#[then("the dropdown stops at the bottom of the screen and carries a scrollbar")]
+async fn dropdown_stops_at_the_bottom(w: &mut AlooWorld) {
+    let (width, height) = SHORT_FRAME;
+    let buffer = ui_buffer(w.ui_ref(), width, height);
+    let (_, y, _, popup_height) = popup_rect(&buffer, "Channels");
+    assert!(
+        y + popup_height <= height,
+        "the dropdown ran off the bottom of the screen ({y} + {popup_height} > {height})"
+    );
+    let rows = popup_body(&buffer, "Channels");
+    assert!(
+        rows.iter().any(|r| r.contains(['\u{2591}', '\u{2588}'])),
+        "an overflowing dropdown carries a scrollbar: {rows:?}"
+    );
+}
+
+#[then("the dropdown has scrolled to the far end of the list")]
+async fn dropdown_scrolled_to_the_end(w: &mut AlooWorld) {
+    let (width, height) = SHORT_FRAME;
+    let rows = popup_body(&ui_buffer(w.ui_ref(), width, height), "Channels");
+    // The selection itself leaves the list (the selector names it), so
+    // what proves the scroll is the entry next to it being on screen while
+    // the start of the list no longer is.
+    assert!(
+        rows.iter().any(|r| r.contains("channel-28")),
+        "the far end of the list is not reachable: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|r| r.contains("channel-00")),
+        "the list grew instead of scrolling: {rows:?}"
+    );
+}
+
+#[then("the DM selector's envelope is the same colour as the nickname beside it")]
+async fn dm_envelope_matches_the_nickname(w: &mut AlooWorld) {
+    w.ui_mut().blink_on = true;
+    let buffer = ui_buffer(w.ui_ref(), 120, 30);
+    let (name_x, name_y) = find_text_start(&buffer, "carol");
+    let (envelope_x, envelope_y) = find_text_start(&buffer, "\u{2709}");
+    assert_eq!(
+        buffer[(envelope_x, envelope_y)].fg,
+        buffer[(name_x, name_y)].fg,
+        "the envelope must carry the colour of the nickname it sits beside"
+    );
+}
+
+#[then("the channel selector names it with a leading hash")]
+async fn channel_named_with_hash(w: &mut AlooWorld) {
+    let rows = ui_rows_wide(w.ui_ref());
+    assert!(
+        header_row(&rows).contains("#general"),
+        "a channel is named the way it can be typed back in: {rows:?}"
+    );
 }

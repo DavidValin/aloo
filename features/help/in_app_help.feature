@@ -46,7 +46,7 @@ Feature: Getting help without leaving the app
     And the help overlay is open
     Then the help overlay explains private channels, voice, files and the tags
     And the help popup shows its longest line unclipped
-    And the help popup stays within 90 percent of a narrow terminal
+    And the help popup covers the whole screen, the compose bar included
     Then scrolling to the bottom reveals identity pinning
 
   @AC-058

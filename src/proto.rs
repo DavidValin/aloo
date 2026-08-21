@@ -491,7 +491,7 @@ pub enum ServerMessage {
     },
     /// Sent to every other currently-connected client the instant a new
     /// *public* channel is created - never for a private one, which stays
-    /// unadvertised (§6.3) exactly as before. `ChannelList` (above) is only
+    /// unadvertised (§6.3). `ChannelList` (above) is only
     /// ever sent once, right after `IdentifyResult`, so without this a
     /// channel created after that snapshot would stay permanently invisible
     /// to anyone who didn't create or join it themselves.
