@@ -132,6 +132,17 @@ pub struct AlooWorld {
 
     // -- live server over loopback TCP ---------------------------------
     pub addr: Option<SocketAddr>,
+    /// How long the running server tolerates silence before treating a
+    /// client as gone (`server::serve_with_heartbeat_timeout`) - set only
+    /// by scenarios about reconnecting (US-040), which have to wait it out.
+    pub reap_after: Option<std::time::Duration>,
+    /// A real `run_daemon_session` driven by a reconnect scenario, and the
+    /// handle that shuts it down again.
+    pub session: Option<tokio::task::JoinHandle<()>>,
+    pub session_input:
+        Option<tokio::sync::mpsc::UnboundedSender<aloo::client::session::SessionInput>>,
+    /// Why the last deliberate reconnect attempt was refused.
+    pub reconnect_failure: Option<String>,
     pub clients: HashMap<String, ClientState>,
 
     // -- encryption ----------------------------------------------------

@@ -28,6 +28,18 @@ pub(crate) async fn handle_join(
     kind: ChannelKind,
     password: Option<String>,
 ) -> proto::Result<()> {
+    // Remembered for the life of the session so a reconnect can walk back
+    // into this channel unaided (`session::on_server_reconnected`) - a
+    // private channel the user typed a password for once should not
+    // silently stop being one of theirs because the network blinked.
+    match &password {
+        Some(pw) => {
+            session.channel_passwords.insert(name.clone(), pw.clone());
+        }
+        None => {
+            session.channel_passwords.remove(&name);
+        }
+    }
     wr.send_control(&ClientMessage::JoinChannel {
             name,
             kind,

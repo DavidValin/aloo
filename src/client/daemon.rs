@@ -1119,7 +1119,7 @@ pub async fn run(
     // identity resolution is the very same one a connecting client does;
     // all that is skipped is the part that needed somewhere to connect to.
     let serverless = config.no_server;
-    let (rd, wr, you, identity, key_mode, server_addr) = if serverless {
+    let (server_events, wr, you, identity, key_mode, server_addr) = if serverless {
         let (identity, key_mode) = crate::client::connect::resolve_my_keypair(&request.my_key)?;
         (
             None,
@@ -1130,11 +1130,14 @@ pub async fn run(
             None,
         )
     } else {
-        let (rd, wr, you, identity, key_mode, server_addr) =
-            crate::client::connect::connect_and_handshake(&request).await?;
+        // A daemon is the start that most needs reconnecting: nobody is
+        // watching it, and the session it would otherwise sit out is one
+        // whose peers can still hear it (`docs/PROTOCOL.md` §4.2).
+        let (events, sink, you, identity, key_mode, server_addr) =
+            crate::client::connect::connect_with_reconnect(&request).await?;
         (
-            Some(rd),
-            ServerlessSink::Server(wr),
+            Some(events),
+            ServerlessSink::Server(sink),
             you,
             identity,
             key_mode,
@@ -1187,7 +1190,7 @@ pub async fn run(
     let plan = DaemonPlan::new(config.channels.clone(), config.focus.clone());
     let result = crate::client::session::run_daemon_session(
         &mut surface,
-        rd,
+        server_events,
         wr,
         request.nickname.clone(),
         you,
@@ -1209,7 +1212,7 @@ pub async fn run(
 /// under `--no-server`. One type rather than a generic parameter on `run`,
 /// since the choice is made at runtime from configuration.
 enum ServerlessSink {
-    Server(crate::control::ControlWriter<tokio::io::WriteHalf<tokio::net::TcpStream>>),
+    Server(crate::client::reconnect::ServerSink),
     Null(crate::control::NullSink),
 }
 

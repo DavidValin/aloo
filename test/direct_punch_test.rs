@@ -807,23 +807,6 @@ fn only_server_backed_actions_are_refused_without_one() {
     );
 }
 
-/// @requirement AC-218
-#[tokio::test]
-async fn a_session_with_direct_targets_is_worth_keeping_without_a_server() {
-    let rendezvous = spawn_fake_rendezvous().await;
-    let mut alice = spawn_client(rendezvous).await;
-    // Nothing configured: losing the server leaves nothing behind, so the
-    // session has no reason to carry on.
-    assert!(!alice.link.has_direct_targets());
-
-    alice
-        .link
-        .configure_direct_punch("alice".into(), vec![target("bob", 65000, "1h")], 30);
-    // Now it does: those links are punched peer-to-peer and are entirely
-    // unaffected by the server going away.
-    assert!(alice.link.has_direct_targets());
-}
-
 /// Punching is mutual by construction: a probe is answered only for a
 /// nickname the *receiver* lists (TB-214), so listing someone who has not
 /// listed you buys nothing in either direction. Worth pinning down because

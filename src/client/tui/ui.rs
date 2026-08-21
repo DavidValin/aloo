@@ -470,6 +470,10 @@ pub(crate) fn unread_envelope(blink_on: bool) -> &'static str {
 pub struct SelectorEntry {
     pub label: String,
     pub unread: bool,
+    /// `Some` only for a DM row: how reachable that peer is, coloured the
+    /// same way their name is everywhere else. A channel is not a person
+    /// and has nobody's reachability to report.
+    pub presence: Option<crate::client::presence::Presence>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1116,7 +1120,14 @@ pub struct UiState {
     /// opposed to merely leaving one channel while staying connected
     /// (`on_user_left`). A `UserId` is never reused (PROTOCOL.md §3), so
     /// once inserted here an entry is never removed for the rest of the
-    /// session - there's no way for the same identity to come back online.
+    /// connection - there's no way for the same identity to come back
+    /// online.
+    ///
+    /// A *reconnect* is the one thing that empties it wholesale
+    /// (`forget_server_presence`), and does not contradict that: the ids in
+    /// it belonged to the connection that ended, and the server behind the
+    /// new one may not even be the same process. Nothing moves an id from
+    /// offline back to online; the whole id space is dropped at once.
     pub offline: HashSet<UserId>,
     /// The state of the direct peer-to-peer link to each peer, as reported
     /// by `p2p::PeerLinkManager` through `P2pEvent::LinkStatusChanged` -
@@ -1389,6 +1400,13 @@ pub struct UiState {
     /// indicator. Defaults to `Unknown` (rendered `-`) until the first
     /// message of the session is observed.
     pub conn_quality: crate::client::netstats::ConnQuality,
+    /// What the control connection is doing, shown as the header's very
+    /// first element (`docs/SPEC.md` "Connected UI"). Driven by
+    /// `session::run_connected_session` from the reconnect supervisor's
+    /// events (`crate::client::reconnect`), and fixed at `NoServer` for
+    /// the whole of a `--no-server` session, which has no supervisor and
+    /// nothing to reconnect to.
+    pub server_link: crate::client::reconnect::ServerLinkState,
     /// Nicknames whose incoming voice messages must not autoplay
     /// (`/mute-voice`, docs/SPEC.md Functionality #15), mirroring
     /// `settings::Settings::muted_voice` - loaded from `~/.aloo/settings`
@@ -1485,7 +1503,40 @@ impl UiState {
             pending_messages: HashMap::new(),
             cpu_usage_pct: 0.0,
             conn_quality: crate::client::netstats::ConnQuality::Unknown,
+            server_link: crate::client::reconnect::ServerLinkState::Connected,
         }
+    }
+
+    /// Called by `session::run_connected_session` as the reconnect
+    /// supervisor reports, and once at session start for `--no-server`.
+    pub fn set_server_link(&mut self, state: crate::client::reconnect::ServerLinkState) {
+        self.server_link = state;
+    }
+
+    /// How reachable `peer` is right now - the one answer every place
+    /// that names a person renders from (the channel sidebar, the top
+    /// row's DM selector), so none of them can disagree about who can be
+    /// reached. See `crate::client::presence`.
+    pub fn presence_of(&self, peer: UserId) -> crate::client::presence::Presence {
+        crate::client::presence::Presence::of(
+            self.is_trust_gated(peer),
+            self.offline.contains(&peer),
+            self.link_status_of(peer),
+        )
+    }
+
+    /// The header's first element, exactly as rendered.
+    ///
+    /// Whether a direct link is being punched right now is read off
+    /// `link_status` rather than tracked separately - `LinkStatus::
+    /// Connecting` *is* "being established (or re-established)", which is
+    /// what a punch in flight is.
+    pub fn server_link_label(&self) -> String {
+        let punching = self
+            .link_status
+            .values()
+            .any(|s| *s == crate::client::p2p::LinkStatus::Connecting);
+        self.server_link.label(punching)
     }
 
     /// Called periodically by `session::run_connected_session` with a
@@ -2456,6 +2507,33 @@ impl UiState {
         self.link_status.remove(&peer);
     }
 
+    /// Drops everything the connection that just ended said about other
+    /// people (`docs/PROTOCOL.md` §4.2): channel memberships, who they
+    /// were, and who among them had gone offline.
+    ///
+    /// Wholesale rather than per-peer, and *not* by marking anyone offline:
+    /// every `UserId` here belonged to that connection, the server behind
+    /// the next one may not even be the same process, and this client
+    /// simply does not know who is present any more. Whoever is still there
+    /// arrives again in the membership snapshot the re-joins bring back
+    /// (§6.1). Peers named by their own identity rather than by anything a
+    /// server handed out - direct-punch peers (§7.1.5) - are untouched:
+    /// no server coming or going has any bearing on them.
+    ///
+    /// Private rooms are left alone. Their logs are the conversation, and
+    /// a room whose peer does not come back stays readable exactly as one
+    /// whose peer went offline does.
+    pub fn forget_server_presence(&mut self) {
+        for tab in &mut self.channels {
+            tab.members
+                .retain(|m| crate::client::p2p::is_direct_peer_id(m.id));
+        }
+        self.known_users
+            .retain(|id, _| crate::client::p2p::is_direct_peer_id(*id));
+        self.offline
+            .retain(|id| crate::client::p2p::is_direct_peer_id(*id));
+    }
+
     /// How `peer`'s direct link should be shown right now. A peer we have
     /// no link record for at all is `Connecting`: one is pre-warmed the
     /// moment they're learned about (§7.1), so "no record" means the
@@ -3235,6 +3313,7 @@ impl UiState {
                 .map(|(_, c)| SelectorEntry {
                     label: format!("{} {}", channel_kind_icon(c.kind), c.name),
                     unread: c.unread,
+                    presence: None,
                 })
                 .collect(),
             SelectorFocus::Dms => self
@@ -3245,6 +3324,7 @@ impl UiState {
                 .map(|room| SelectorEntry {
                     label: format!("{DM_ICON} {}", room.peer.name),
                     unread: room.unread,
+                    presence: Some(self.presence_of(room.peer.id)),
                 })
                 .collect(),
         }

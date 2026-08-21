@@ -2150,12 +2150,6 @@ impl PeerLinkManager {
             .map(|(nickname, _)| nickname.clone())
     }
 
-    /// Whether any `direct_punch_to` target is configured at all - the
-    /// question "is this session worth keeping alive without a server".
-    pub fn has_direct_targets(&self) -> bool {
-        self.direct.as_ref().is_some_and(|d| !d.targets.is_empty())
-    }
-
     /// Every serverless peer whose link is currently up - who to tell when
     /// this client's own channel membership changes.
     pub fn active_direct_peers(&self) -> Vec<UserId> {

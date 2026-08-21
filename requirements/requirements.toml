@@ -1914,6 +1914,21 @@ id = "AC-135"
 description = "Each person in the sidebar is coloured by the state of the direct link to them rather than by their presence on the server: green once that link is established and content can actually reach them, red once it is lost, and neither while it is still being established. A trust-gated or offline peer keeps its own existing colour, which takes priority."
 evidence = "docs/SPEC.md 'Connected UI'; docs/PROTOCOL.md 7.1; src/client/p2p.rs LinkStatus, src/client/tui/ui.rs UiState::set_link_status/link_status_of, src/client/tui/channel.rs render_sidebar; tests sidebar_colours_each_member_by_the_state_of_the_direct_link_to_them, a_member_with_no_link_record_yet_is_not_shown_as_reachable; direct_link_state.feature"
 
+[[user_story.acceptance_criteria]]
+id = "AC-228"
+description = "How reachable a person is comes from the direct peer-to-peer link to them, not from their being connected: a live link reads as reachable, one being punched as connecting, and no link as unreachable. Two things override it, in order - an identity that is unresolved or rejected, which needs answering rather than waiting out, and a connection that has closed entirely, which leaves them listed only for the history worth reaching."
+evidence = "docs/SPEC.md 'Connected UI'; docs/PROTOCOL.md 7.1.4, 12; src/client/presence.rs Presence::of; src/client/tui/ui.rs UiState::presence_of; tests presence_follows_the_direct_link_not_mere_membership, an_unresolved_identity_outranks_everything_else, a_closed_connection_outranks_whatever_its_link_was_last_doing; presence_colours.feature"
+
+[[user_story.acceptance_criteria]]
+id = "AC-229"
+description = "The top row's DM selector colours the peer it names by that same presence, as do the rows of its dropdown - the same colours the channel sidebar gives the same person. An open DM is the one view with no user list of its own, so without this nothing on screen says whether what is being typed into it can actually get there."
+evidence = "docs/SPEC.md 'Connected UI'; src/client/tui/channel.rs dm_selector_title, render_selector_dropdown, presence_color; src/client/tui/ui.rs SelectorEntry::presence, selector_dropdown_entries; tests the_dm_selector_colours_its_peer_by_the_direct_link_to_them, an_offline_or_unverified_peer_overrides_the_link_colour_on_the_dm_selector, the_dm_dropdown_colours_every_room_it_lists_the_same_way; presence_colours.feature"
+
+[[user_story.technical_behavior]]
+id = "TB-229"
+description = "Presence is derived in one place and consumed by every widget that names a person, so the sidebar and the DM selector cannot disagree about the same peer; whether a message typed right now would actually arrive is a question of that one value (is_reachable), not of the three inputs re-read per widget."
+evidence = "src/client/presence.rs Presence, is_reachable; src/client/tui/ui.rs UiState::presence_of; src/client/tui/channel.rs render_sidebar, dm_selector_title; test only_a_live_link_counts_as_reachable"
+
 [[user_story.technical_behavior]]
 id = "TB-176"
 description = "A Ping or Pong arriving from an address nobody advertised is attributed by its link_nonce to a link currently being established, that source is adopted as a peer-reflexive candidate, and it becomes usable for data frames - which is what makes a peer behind a NAT that maps a different external port per destination (symmetric/carrier-grade NAT) reachable at all. Attribution by nonce is limited to links being established, never an already-Active one, so an unauthenticated datagram can't move a live link's address; and a probe whose nonce matches no such link is ignored rather than answered, so this never becomes a reflector for anyone scanning the socket."
@@ -2448,8 +2463,8 @@ evidence = "docs/SPEC.md 'Direct punching'; src/settings.rs Settings::parse/save
 
 [[user_story.acceptance_criteria]]
 id = "AC-218"
-description = "A session distinguishes having no server at all from having one that is currently unreachable, and explains each differently: the first is permanent and says so, the second reads as temporary. Both refuse the same actions, but telling a user something needs a server while one is merely reconnecting, or that it is retrying when there is no server at all, would each be wrong. Losing the server mid-session is a degradation rather than an ending whenever direct targets are configured: those links are punched peer-to-peer and are unaffected by it, so the session carries on with server-backed actions refused, instead of disconnecting the very peers the loss did not touch."
-evidence = "docs/SPEC.md 'Running without a server'; src/client/session.rs ServerState::is_absent/is_serverless/refusal, the net_rx close arm (degrades to Unreachable rather than ending a session that has direct links), send_if_server; src/client/p2p.rs has_direct_targets; tests server_state_distinguishes_no_server_from_an_unreachable_one, a_session_with_direct_targets_is_worth_keeping_without_a_server; no_server.feature"
+description = "A session distinguishes having no server at all from having one that is currently unreachable, and explains each differently: the first is permanent and says so, the second reads as temporary - which it genuinely is, because a lost server is always being retried (4.2). Both refuse the same actions, but telling a user something needs a server while one is merely reconnecting, or that it is retrying when there is no server at all, would each be wrong. Losing the server mid-session is a degradation rather than an ending: direct links are punched peer-to-peer and are unaffected by it, so the session carries on with server-backed actions refused, instead of disconnecting the very peers the loss did not touch."
+evidence = "docs/SPEC.md 'Running without a server', Functionality #19; docs/PROTOCOL.md 4.2; src/client/session.rs ServerState::is_absent/is_serverless/refusal, handle_server_event's Lost arm (degrades to Unreachable rather than ending the session), send_if_server; test server_state_distinguishes_no_server_from_an_unreachable_one; no_server.feature"
 
 [[user_story.acceptance_criteria]]
 id = "AC-219"
@@ -2470,3 +2485,56 @@ evidence = "docs/PROTOCOL.md 13.10, 7.1.5; src/p2p_proto.rs P2pPayload::KeyRotat
 id = "AC-221"
 description = "A daemon can be started with no server at all: --no-server lifts the host requirement that every other start is held to, and is persisted like every other daemon field so a bare `aloo --daemon` at the next boot comes back serverless rather than failing for want of a host it never had. A serverless DM focus is given no discovery channel - the hall exists so a focus has somewhere to watch for presence, and with no server there is no presence and no hall to join, so adding one would only produce a tab that can never fill. The channels such a daemon was asked to join are driven at startup rather than off a ChannelList that will never arrive, and go through the same refusal gate every other action does, so --channel is never silently ignored on the one start where nobody is watching."
 evidence = "docs/SPEC.md 'Running without a server'; README.md; src/client/daemon.rs DaemonConfig::resolve (host fallback, discovery-channel guard, no_server), DaemonConfig::persist, run's serverless branch; src/settings.rs daemon_no_server; src/client/session.rs request_daemon_joins and its serverless trigger; tests no_server_lifts_the_host_requirement, a_serverless_daemon_comes_back_serverless_after_a_restart, a_serverless_dm_focus_does_not_get_a_discovery_channel, and end to end against a real session in test/daemon_session_test.rs (a_serverless_daemon_shows_its_configured_channel_and_waits_for_peers, a_serverless_daemon_joins_the_channel_it_was_given, a_channel_that_is_not_configured_is_refused_with_a_reason)"
+
+
+[[user_story]]
+id = "US-040"
+title = "Stay on the server, and say what is going on"
+as_a = "someone whose network drops while aloo is running"
+i_want = "aloo to get itself back on the server and show me where it is up to"
+so_that = "I stay visible to everyone, including people who connect while I am away"
+
+[[user_story.acceptance_criteria]]
+id = "AC-222"
+description = "A lost control connection is retried immediately, and every failure widens the wait: doubling from RECONNECT_FIRST_DELAY up to a ceiling of RECONNECT_MAX_DELAY, with no attempt limit and no giving up. From the client's side a server that is down, restarting, unreachable, or on the far end of a network that is off are indistinguishable, and every one of them ends with the server answering again. The schedule is saturating rather than shifting, so a session retrying for days cannot wrap back around into a tight loop."
+evidence = "docs/PROTOCOL.md 4.2; docs/SPEC.md Functionality #19; src/client/reconnect.rs Backoff::delay_after, delay_after, RECONNECT_FIRST_DELAY, RECONNECT_MAX_DELAY, reconnect_loop; tests the_first_attempt_is_immediate_and_every_failure_widens_the_wait, the_wait_never_grows_past_the_ceiling; reconnecting.feature"
+
+[[user_story.acceptance_criteria]]
+id = "AC-223"
+description = "The header's first element says what the control connection is doing, in green or red, and the selectors beside it start at the column the message list below them starts at. With a server it reads 'Connected to server!', 'Reconnecting...' while an attempt is in flight, 'Reconnecting in <n>s...' while waiting for the next one with the number counting down live, and 'Server down (reconnecting in <n> sec...)' once SERVER_DOWN_AFTER_ATTEMPTS attempts have failed - a reconnect reads as a hiccup until then, because most of them are. A label too long for the sidebar's width pushes the selectors right rather than being cut off: a countdown missing its number says nothing."
+evidence = "docs/SPEC.md 'Connected UI', Functionality #19; docs/PROTOCOL.md 4.2; src/client/reconnect.rs ServerLinkState, waiting, label, seconds_left, SERVER_DOWN_AFTER_ATTEMPTS; src/client/tui/channel.rs server_state_line, server_link_color, server_state_width, messages_start_col; tests every_state_says_exactly_what_is_happening, a_reconnect_reads_as_a_hiccup_until_enough_attempts_have_failed, the_server_state_is_the_first_thing_on_the_header_row, the_selectors_start_where_the_message_list_below_them_does, a_state_too_long_for_the_sidebar_width_pushes_the_selectors_rather_than_truncating, every_server_state_renders_in_its_own_colour; reconnecting.feature"
+
+[[user_story.acceptance_criteria]]
+id = "AC-224"
+description = "A session started with --no-server shows 'No server mode' in white instead of any reconnect state, and 'No server mode (punching)' while a direct UDP punch is in flight. There is nothing to reconnect to, so counting down at something that does not exist would be a lie; and with no server, punching is the only thing this client does to reach anybody, which is worth naming. With a server the same punch is the ordinary case and is not named there - the sidebar already colours the peer it belongs to."
+evidence = "docs/SPEC.md 'Connected UI', Functionality #18/#19; docs/PROTOCOL.md 7.1.5; src/client/reconnect.rs ServerLinkState::NoServer, label; src/client/tui/ui.rs UiState::server_link_label; src/client/session.rs run_connected_session's serverless branch; tests a_punch_in_flight_is_only_worth_naming_when_there_is_no_server, no_server_mode_says_so_while_a_punch_is_in_flight; reconnecting.feature"
+
+[[user_story.acceptance_criteria]]
+id = "AC-225"
+description = "A session whose server disappears is not ended: the loss is reported once, server-backed actions are refused as temporarily unavailable, direct links are untouched, and the connection is re-established on its own when the server comes back - the client then holding a fresh UserId, since a reconnect is an ordinary new connection as far as the server is concerned."
+evidence = "docs/PROTOCOL.md 4.2, 4; src/client/reconnect.rs spawn_supervisor, ServerEvent; src/client/session.rs handle_server_event's Lost/Reconnected arms; test a_session_whose_server_disappears_gets_itself_back_on; reconnecting.feature"
+
+[[user_story.acceptance_criteria]]
+id = "AC-226"
+description = "A nickname the server still holds is retried like any other failure rather than treated as fatal: the connection holding it is usually this client's own dead one, which the server frees within HEARTBEAT_TIMEOUT of it going quiet (5.4, 4.1). Giving up there would turn a network blink into being locked out of your own nickname."
+evidence = "docs/PROTOCOL.md 4.2, 5.4, 4.1; src/client/reconnect.rs reconnect_loop (every Err is retried); test a_taken_nickname_is_an_ordinary_retryable_failure; reconnecting.feature"
+
+[[user_story.acceptance_criteria]]
+id = "AC-227"
+description = "Reconnecting re-joins every channel the session was in, passwords included (remembered in memory for the session only, never written anywhere), so the client is put back into the member lists other clients are shown - including clients that connected while it was away. Everything the previous connection said about other people is dropped first - memberships, identities, and who among them had gone offline - since those UserIds were that connection's to hand out and the server behind the next one may not even be the same process. Nobody is marked offline by it: they did not go anywhere, this client stopped knowing. Whoever is still there comes back in the membership snapshot the re-joins bring."
+evidence = "docs/PROTOCOL.md 4.2, 6.1; docs/SPEC.md Functionality #19; src/client/session.rs on_server_reconnected, forget_peer, channel_passwords; src/client/channel.rs handle_join; src/client/tui/ui.rs UiState::forget_server_presence; test a_session_reaped_by_the_server_reappears_in_a_later_arrival_s_member_list, a_reconnect_drops_what_the_old_connection_said_without_marking_anyone_offline; reconnecting.feature"
+
+[[user_story.technical_behavior]]
+id = "TB-226"
+description = "The retry schedule is a value (Backoff) rather than two constants read directly, so a whole sequence of failures can be driven in milliseconds by a test instead of minutes - the same reason serve_with_heartbeat_timeout exists beside serve. Production always uses Backoff::default(), whose figures are the documented ones."
+evidence = "docs/TESTING.md; src/client/reconnect.rs Backoff, ReconnectPlan::backoff; src/client/connect.rs connect_with_reconnect; test a_backoff_can_be_driven_faster_than_the_default_without_changing_its_shape"
+
+[[user_story.technical_behavior]]
+id = "TB-227"
+description = "The session writes to a sink whose socket the supervisor replaces underneath it, so no call site knows a reconnect happened. A send with no connection installed is discarded rather than failed, exactly as NullSink discards one with no server at all and for the same reason: while the server is away ServerState is Unreachable, every action needing one is refused where it is asked for, and anything still arriving at the sink is a backstop rather than the mechanism."
+evidence = "docs/PROTOCOL.md 4.2; src/client/reconnect.rs ServerSink, install, clear, is_connected; src/control.rs NullSink; tests a_sink_with_no_connection_installed_discards_instead_of_failing, installing_a_connection_makes_the_sink_usable_again"
+
+[[user_story.technical_behavior]]
+id = "TB-228"
+description = "A control-channel write that fails drops the writer and wakes the supervisor instead of returning an error to the caller: with nothing arriving from the server there is nothing for the read half to fail on, so the heartbeat (4.1) is what finds a half-dead socket first - and every call site propagates with ?, which would end the very session reconnecting exists to keep."
+evidence = "docs/PROTOCOL.md 4.2, 4.1; src/client/reconnect.rs ServerSink::send_control, spawn_supervisor's lost-channel select; test a_write_that_fails_drops_the_connection_and_reports_the_loss"

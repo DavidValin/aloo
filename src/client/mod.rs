@@ -20,6 +20,8 @@ pub mod otp_store;
 pub mod p2p;
 pub mod p2p_reliable;
 pub mod pq_rekey;
+pub mod presence;
+pub mod reconnect;
 pub mod rekey;
 pub mod replay;
 pub mod session;

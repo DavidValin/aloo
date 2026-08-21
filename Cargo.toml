@@ -207,6 +207,14 @@ name = "server_test"
 path = "test/server_test.rs"
 
 [[test]]
+name = "reconnect_test"
+path = "test/reconnect_test.rs"
+
+[[test]]
+name = "presence_test"
+path = "test/presence_test.rs"
+
+[[test]]
 name = "rekey_test"
 path = "test/rekey_test.rs"
 

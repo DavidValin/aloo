@@ -36,6 +36,7 @@ falling back to a server relay (§7.1).
 - [3. Domain types](#3-domain-types)
 - [4. Connection lifecycle](#4-connection-lifecycle)
   - [4.1 Liveness: `Heartbeat`](#41-liveness-heartbeat)
+  - [4.2 Coming back: reconnecting](#42-coming-back-reconnecting)
 - [5. Authentication](#5-authentication)
   - [5.1 `AuthKind::None`](#51-authkindnone)
   - [5.2 `AuthKind::Password`](#52-authkindpassword)
@@ -618,6 +619,45 @@ Heartbeat
 - This is a server-side timeout only. The client neither expects nor waits
   for an acknowledgement, and a `Heartbeat` arriving from a client the
   server has no other reason to distrust is never itself an error.
+
+### 4.2 Coming back: reconnecting
+
+§4.1 is the server's side of a connection that dies without closing. This
+is the client's.
+
+Content is peer-to-peer (§7.1, §10), so a client whose control connection
+drops keeps talking to every peer it already has a direct link to - those
+links carry their own keepalives and re-punch themselves (§7.1.4), and
+never notice the server is gone. Presence is the opposite: the nickname is
+freed, peers are told `UserOffline` (§6.4), and anyone connecting
+afterwards is never told this client exists. Left there, a client is
+reachable but invisible - its messages arrive, and it is in nobody's member
+list.
+
+A client therefore reconnects, and keeps reconnecting:
+
+- The first attempt is made as soon as the loss is noticed. Each failure
+  doubles the wait before the next attempt, from 5s up to a ceiling of 30s.
+  There is no attempt limit and no giving up: from the client's side a
+  server that is down, restarting, unreachable, or simply on the other end
+  of a network that is off are indistinguishable, and every one of them
+  ends with the server answering again.
+- A rejected nickname (§5.4) is retried like any other failure rather than
+  treated as fatal. The connection that still holds the name is usually
+  this client's own previous one, which the server frees within
+  `HEARTBEAT_TIMEOUT` of it going quiet.
+- The reconnected client is a **new** client in every way the server cares
+  about: a fresh connection, a fresh `UserId` (§3), and no channel
+  membership. It re-sends `JoinChannel` for each channel it was in, which
+  is what puts it back in the member lists other clients - including
+  clients that connected during the gap - are shown.
+- Because the `UserId` it was known by is gone, everything the previous
+  connection said about *other* clients is dropped on reconnect too: those
+  ids were that connection's to hand out. Whoever is still there is
+  re-announced in the membership snapshot the re-joins bring back (§6.1).
+- Nothing about this is negotiated, and the server implements no part of
+  it. A reconnect is an ordinary connection (§4), indistinguishable from a
+  first one.
 
 
 ## 5. Authentication

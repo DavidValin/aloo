@@ -119,6 +119,59 @@ async fn name_colour(w: &mut AlooWorld, name: String, colour: String) {
     );
 }
 
+#[then(expr = "{word}'s name is shown in gray, whatever their/his/her link was last doing")]
+async fn name_gray_despite_link(w: &mut AlooWorld, name: String) {
+    let buffer = ui_buffer(w.ui_ref(), 160, 30);
+    let (x, y) = find_text_start_below(&buffer, &name, HEADER_ROW_HEIGHT);
+    assert_eq!(
+        buffer[(x, y)].fg,
+        Color::DarkGray,
+        "a closed connection outranks whatever {name}'s link was last doing"
+    );
+}
+
+/// The top row's DM selector names one person, and an open room is the one
+/// view with no user list of its own - so it carries the same colour their
+/// name has in the sidebar (AC-229).
+#[then(expr = "the DM selector shows {word} in {word}")]
+async fn dm_selector_colour(w: &mut AlooWorld, name: String, colour: String) {
+    let expected = match colour.as_str() {
+        "green" => Color::Green,
+        "red" => Color::Red,
+        "yellow" => Color::Yellow,
+        "gray" => Color::DarkGray,
+        other => panic!("unknown colour {other:?}"),
+    };
+    let buffer = ui_buffer(w.ui_ref(), 160, 30);
+    // The header row's own copy of the name, not the sidebar's.
+    let (x, y) = find_text_start(&buffer, &name);
+    assert!(
+        (y as usize) < HEADER_ROW_HEIGHT as usize,
+        "the first {name} on screen should be the one on the DM selector"
+    );
+    assert_eq!(
+        buffer[(x, y)].fg,
+        expected,
+        "the DM selector should show {name} in {colour}"
+    );
+}
+
+#[then("every room listed in the DM dropdown carries its peer's reachability")]
+async fn dm_dropdown_carries_presence(w: &mut AlooWorld) {
+    let entries = w.ui_ref().selector_dropdown_entries();
+    assert!(
+        !entries.is_empty(),
+        "the dropdown lists every open room except the one named - there should be one"
+    );
+    for entry in entries {
+        assert!(
+            entry.presence.is_some(),
+            "a DM row names a person and must carry their presence: {:?}",
+            entry.label
+        );
+    }
+}
+
 #[then(expr = "{word} is rendered in gray while {word} stays green")]
 async fn gray_vs_green(w: &mut AlooWorld, offline: String, online: String) {
     let buffer = ui_buffer(w.ui_ref(), 160, 30);

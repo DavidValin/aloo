@@ -13,6 +13,7 @@ use crate::crypto;
 use crate::client::idstore;
 use crate::validation::is_storable;
 use crate::proto::{self, AuthKind, AuthResponse, ClientMessage, KeyMode, ServerMessage};
+use crate::client::reconnect;
 use crate::client::session;
 use crate::client::tui::ui_connect_popup::{self, ConnectPopupState};
 
@@ -123,8 +124,8 @@ pub async fn run_client_inner(
             }
         }
 
-        match connect_and_handshake(&request).await {
-            Ok((rd, wr, you, identity, key_mode, server_addr)) => {
+        match connect_with_reconnect(&request).await {
+            Ok((server_events, sink, you, identity, key_mode, server_addr)) => {
                 let id_store = load_id_store(&request.id_store_path);
                 // The stdin reader is started only now, once the popup is
                 // done with the terminal - the popup drives its own
@@ -133,8 +134,8 @@ pub async fn run_client_inner(
                 let input_rx = crate::client::tui::terminal::spawn_session_input();
                 return session::run_connected_session(
                     surface,
-                    Some(rd),
-                    wr,
+                    Some(server_events),
+                    sink,
                     request.nickname,
                     you,
                     identity,
@@ -165,6 +166,52 @@ pub async fn run_client_inner(
     }
 }
 
+/// Connects, then hands the connection straight to the reconnect
+/// supervisor (`crate::client::reconnect`) - what every session that has a
+/// server starts from.
+///
+/// The session never sees the socket itself: it gets the supervisor's
+/// event stream in place of the read half, and a sink whose write half the
+/// supervisor replaces on every reconnect (`docs/PROTOCOL.md` §4.2). The
+/// first connection is still made here, and still fails here - a server
+/// that cannot be reached *at all* is a wrong host or a wrong password far
+/// more often than a server that is briefly down, and saying so beats
+/// retrying forever against a typo.
+pub async fn connect_with_reconnect(
+    request: &ConnectRequest,
+) -> Result<
+    (
+        tokio::sync::mpsc::UnboundedReceiver<reconnect::ServerEvent>,
+        reconnect::ServerSink,
+        proto::UserId,
+        ResolvedIdentity,
+        KeyMode,
+        std::net::SocketAddr,
+    ),
+    BoxError,
+> {
+    let (rd, wr, you, identity, key_mode, server_addr) = connect_and_handshake(request).await?;
+    let public_key_der = match &identity {
+        ResolvedIdentity::Rsa(kp) => crypto::public_key_to_der(&kp.public)?,
+        ResolvedIdentity::Pq { public_der, .. } => public_der.clone(),
+    };
+    let (sink, lost_rx) = reconnect::ServerSink::new(wr);
+    let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
+    reconnect::spawn_supervisor(
+        rd,
+        reconnect::ReconnectPlan {
+            request: request.clone(),
+            public_key_der,
+            key_mode,
+            backoff: reconnect::Backoff::default(),
+        },
+        sink.clone(),
+        lost_rx,
+        events_tx,
+    );
+    Ok((events_rx, sink, you, identity, key_mode, server_addr))
+}
+
 /// Connects, then runs the auth + identify handshake. On success returns
 /// the split stream halves, the `UserId` the server assigned us, our
 /// private key (needed to decrypt incoming messages), and the `KeyMode`
@@ -185,7 +232,37 @@ pub(crate) async fn connect_and_handshake(
     BoxError,
 > {
     let (identity, key_mode) = resolve_my_keypair(&request.my_key)?;
+    let public_key_der = match &identity {
+        ResolvedIdentity::Rsa(kp) => crypto::public_key_to_der(&kp.public)?,
+        ResolvedIdentity::Pq { public_der, .. } => public_der.clone(),
+    };
+    let (rd, wr, you, server_addr) = handshake_as(request, public_key_der, key_mode).await?;
+    Ok((rd, wr, you, identity, key_mode, server_addr))
+}
 
+/// The handshake itself, for an identity that has already been resolved.
+///
+/// Split out from `connect_and_handshake` for reconnects
+/// (`crate::client::reconnect`), which must come back as the *same*
+/// identity: `resolve_my_keypair` generates a fresh keypair for
+/// `MyKeySelection::None`, so re-resolving would silently change who this
+/// client is halfway through a session. Everything a reconnect can safely
+/// redo - the TCP connect, the sealed control channel, the server's proof
+/// of itself, auth, and identify - is here; everything it must not redo is
+/// in the caller.
+pub(crate) async fn handshake_as(
+    request: &ConnectRequest,
+    public_key_der: Vec<u8>,
+    key_mode: KeyMode,
+) -> Result<
+    (
+        crate::control::ControlReader<tokio::io::ReadHalf<TcpStream>>,
+        crate::control::ControlWriter<tokio::io::WriteHalf<TcpStream>>,
+        proto::UserId,
+        std::net::SocketAddr,
+    ),
+    BoxError,
+> {
     // Prefer IPv4 when the hostname resolves to both families. Docker's IPv6
     // UDP port publishing often poisons STUN (observed address becomes
     // 172.17.0.1) while IPv4 returns the client's real public endpoint.
@@ -236,10 +313,6 @@ pub(crate) async fn connect_and_handshake(
         return Err(format!("authentication failed: {}", reason.unwrap_or_default()).into());
     }
 
-    let public_key_der = match &identity {
-        ResolvedIdentity::Rsa(kp) => crypto::public_key_to_der(&kp.public)?,
-        ResolvedIdentity::Pq { public_der, .. } => public_der.clone(),
-    };
     wr.send(&ClientMessage::Identify {
         display_name: request.nickname.clone(),
         public_key_der,
@@ -257,7 +330,7 @@ pub(crate) async fn connect_and_handshake(
     }
     let you = you.ok_or("server accepted identify but returned no user id")?;
 
-    Ok((rd, wr, you, identity, key_mode, server_addr))
+    Ok((rd, wr, you, server_addr))
 }
 
 /// Resolves `host:port`, preferring IPv4 when both A and AAAA records exist.

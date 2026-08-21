@@ -2,6 +2,7 @@
 mod ui_common;
 use ui_common::*;
 
+use aloo::client::p2p::LinkStatus;
 use aloo::proto::{KeyMode, UserId};
 use aloo::client::tui::ui::{
     Focus, IdentityCase, MessageBody, PendingOtpInvite, UiAction, UiState, VoiceTarget, render,
@@ -1021,6 +1022,89 @@ fn open_dm_with(state: &mut UiState, row: usize) {
     state.focus = Focus::Sidebar;
     state.sidebar_selected = row;
     press(state, KeyCode::Enter);
+}
+
+/// The DM selector names one person, and an open room is the one view
+/// with no user list of its own - so the same colour their name carries in
+/// the channel sidebar has to be on it, or nothing on screen says whether
+/// what is being typed can reach them.
+/// @requirement AC-229
+#[test]
+fn the_dm_selector_colours_its_peer_by_the_direct_link_to_them() {
+    let cases = [
+        (LinkStatus::Active, ratatui::style::Color::Green),
+        (LinkStatus::Connecting, ratatui::style::Color::Yellow),
+        (LinkStatus::Lost, ratatui::style::Color::Red),
+    ];
+    for (link, expected) in cases {
+        let mut state = joined_general_with(vec![user(2, "bob")]);
+        open_dm_with(&mut state, 0);
+        // Back onto the channel selector, so the DM name is not also
+        // carrying the focus highlight while its colour is read.
+        press(&mut state, KeyCode::Char('['));
+        state.set_link_status(UserId(2), link);
+
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, &state)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let (x, y) = find_text_start(&buffer, "bob");
+        assert_eq!(
+            y as usize, HEADER_TEXT_ROW,
+            "the first `bob` on screen is the one on the DM selector"
+        );
+        assert_eq!(
+            buffer[(x, y)].fg,
+            expected,
+            "a {link:?} link must colour the DM selector {expected:?}"
+        );
+    }
+}
+
+/// The same two overrides the sidebar applies, in the same order.
+/// @requirement AC-229
+#[test]
+fn an_offline_or_unverified_peer_overrides_the_link_colour_on_the_dm_selector() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    open_dm_with(&mut state, 0);
+    press(&mut state, KeyCode::Char('['));
+    state.set_link_status(UserId(2), LinkStatus::Active);
+    // Something in the room, so an offline peer is kept listed rather than
+    // dropped outright.
+    state.on_direct_message(UserId(2), "bob".into(), MessageBody::Text("hi".into()));
+    state.on_user_offline(UserId(2));
+
+    let backend = TestBackend::new(120, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| render(f, &state)).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    let (x, y) = find_text_start(&buffer, "bob");
+    assert_eq!(y as usize, HEADER_TEXT_ROW);
+    assert_eq!(
+        buffer[(x, y)].fg,
+        ratatui::style::Color::DarkGray,
+        "a peer whose connection closed reads as gone, whatever their link last did"
+    );
+}
+
+/// @requirement AC-229
+#[test]
+fn the_dm_dropdown_colours_every_room_it_lists_the_same_way() {
+    let mut state = joined_general_with(vec![user(2, "bob"), user(3, "carol")]);
+    open_dm_with(&mut state, 0);
+    open_dm_with(&mut state, 1);
+    state.set_link_status(UserId(2), LinkStatus::Active);
+
+    let entries = state.selector_dropdown_entries();
+    // The dropdown lists every room *except* the one the selector names.
+    assert!(!entries.is_empty(), "the other open room must be listed");
+    for entry in entries {
+        assert!(
+            entry.presence.is_some(),
+            "a DM row names a person and must carry their presence: {:?}",
+            entry.label
+        );
+    }
 }
 
 /// @requirement AC-186

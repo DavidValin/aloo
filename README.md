@@ -73,6 +73,8 @@ Your identity type is already set to `pq_hybrid` (PQ-Hybrid, see "Encryption" be
 
 Nicknames are case-sensitive and must be free — if someone else is already connected with it, you'll be bumped back to this screen with an error, so just pick another one and try again. A nickname frees up the moment its holder disconnects — even an unclean disconnect (a crash, a lost network) is caught within 30 seconds, so a name is never stuck "in use" for good.
 
+**If the connection drops, aloo gets itself back.** Nothing about a lost server ends the session: your direct links to other people are peer-to-peer and carry on regardless. But the server is what everyone else's *user list* comes from, so aloo reconnects on its own — right away, then 5s, 10s, 20s and every 30s, for as long as it takes — and re-joins the channels you were in, so you reappear for everyone, including anyone who connected while you were away. The top-left of the header says where it is up to: 🟢 `Connected to server!`, 🔴 `Reconnecting...`, 🔴 `Reconnecting in 5s...`, or 🔴 `Server down (reconnecting in 20 sec...)`. Running with `--no-server` it reads ⚪ `No server mode` instead — there is nothing to reconnect to.
+
 ## How to use it
 
 Everything below works from the connected screen. `Ctrl+H` shows the same

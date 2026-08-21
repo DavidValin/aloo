@@ -11,7 +11,6 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, KeyCode, KeyModifiers};
 use rsa::RsaPrivateKey;
-use tokio::net::TcpStream;
 
 use crate::BoxError;
 use crate::client::connect::ResolvedIdentity;
@@ -24,6 +23,7 @@ use crate::p2p_proto::P2pPayload;
 use crate::proto::{
     self, ClientMessage, Content, Envelope, KeyMode, ServerMessage, UserId, UserInfo,
 };
+use crate::client::reconnect::{ServerEvent, ServerLinkState};
 use crate::client::rekey;
 use crate::client::sysstats;
 use crate::client::tui::ui::{self, IdentityCase, PendingFileOffer, UiAction, UiState, VoiceTarget};
@@ -289,6 +289,17 @@ pub(crate) struct SessionState {
     pub(crate) daemon_awaiting_otp: Option<UserId>,
     /// Whether a server is behind this session, and usable.
     pub(crate) server: ServerState,
+    /// While the reconnect supervisor is waiting out its backoff
+    /// (`crate::client::reconnect`): when the next attempt is due, and how
+    /// many have already failed. The header's countdown is recomputed from
+    /// this on every redraw rather than pushed a message per second.
+    pub(crate) server_retry: Option<(Instant, u32)>,
+    /// The password each private channel was joined with, so a reconnect
+    /// can walk back into the same channels this session was in
+    /// (`docs/PROTOCOL.md` §4.2). In memory for the life of the session
+    /// only - it is never written anywhere, and a new session asks the
+    /// user again exactly as it did before.
+    pub(crate) channel_passwords: HashMap<String, String>,
     /// Where a spawned `DirectResolve` lookup hands its answer back to the
     /// select loop (`docs/PROTOCOL.md` §7.1.5).
     pub(crate) direct_resolved_tx:
@@ -309,7 +320,7 @@ pub(crate) struct SessionState {
 #[allow(clippy::too_many_arguments)]
 pub async fn run_daemon_session<W: crate::control::ControlSink>(
     surface: &mut crate::client::tui::surface::Surface,
-    rd: Option<crate::control::ControlReader<tokio::io::ReadHalf<TcpStream>>>,
+    server_events: Option<tokio::sync::mpsc::UnboundedReceiver<ServerEvent>>,
     wr: W,
     display_name: String,
     you: UserId,
@@ -323,7 +334,7 @@ pub async fn run_daemon_session<W: crate::control::ControlSink>(
 ) -> Result<(), BoxError> {
     run_connected_session(
         surface,
-        rd,
+        server_events,
         wr,
         display_name,
         you,
@@ -345,7 +356,7 @@ pub async fn run_daemon_session<W: crate::control::ControlSink>(
 #[allow(clippy::too_many_arguments)]
 pub async fn run_connected_session<W: crate::control::ControlSink>(
     surface: &mut crate::client::tui::surface::Surface,
-    rd: Option<crate::control::ControlReader<tokio::io::ReadHalf<TcpStream>>>,
+    server_events: Option<tokio::sync::mpsc::UnboundedReceiver<ServerEvent>>,
     mut wr: W,
     display_name: String,
     you: UserId,
@@ -358,28 +369,17 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
     mut input_rx: tokio::sync::mpsc::UnboundedReceiver<SessionInput>,
     daemon_plan: Option<crate::client::daemon::DaemonPlan>,
 ) -> Result<(), BoxError> {
-    // With no server there is nothing to read from one: the channel is
-    // created all the same and simply never yields, so the select loop
-    // below needs no serverless special case of its own.
-    let server_state = match (&rd, server_addr) {
+    // With no server there is nothing to hear from one: a channel is
+    // created all the same, its sender parked here for the life of the
+    // session so the branch simply never fires, and the select loop below
+    // needs no serverless special case of its own.
+    let server_state = match (&server_events, server_addr) {
         (Some(_), _) => ServerState::Connected,
         (None, _) => ServerState::Absent,
     };
-    let (net_tx, mut net_rx) = tokio::sync::mpsc::unbounded_channel::<ServerMessage>();
-    if let Some(mut rd) = rd {
-    tokio::spawn(async move {
-        loop {
-            match rd.recv::<ServerMessage>().await {
-                Ok(Some(msg)) => {
-                    if net_tx.send(msg).is_err() {
-                        break;
-                    }
-                }
-                _ => break,
-            }
-        }
-    });
-    }
+    let (never_tx, never_rx) = tokio::sync::mpsc::unbounded_channel::<ServerEvent>();
+    let mut server_events = server_events.unwrap_or(never_rx);
+    let _server_events_kept_open = never_tx;
 
     let (audio_err_tx, mut audio_err_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let (call_level_tx, mut call_level_rx) =
@@ -550,6 +550,8 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
         id_store,
         conn_stats: netstats::ConnStats::new(),
         server: server_state,
+        server_retry: None,
+        channel_passwords: HashMap::new(),
         direct_resolved_tx,
         auto_stop_tx,
         active_replay_id: None,
@@ -591,7 +593,11 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
     // finds its channel already there, and so the first `ChannelPresence`
     // we send a peer is already correct.
     ui_state.serverless = server_state.is_serverless();
+    // Fixed for the whole session: a `--no-server` start has no supervisor
+    // and nothing it could ever reconnect to, so this is the one header
+    // state that is never driven by an event.
     if server_state.is_serverless() {
+        ui_state.set_server_link(ServerLinkState::NoServer);
         // The directory `/channels` and Ctrl+J browse: with no server the
         // configured channels are the only ones that exist, so they are
         // the whole of it.
@@ -705,32 +711,13 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
                     SessionInput::Shutdown => break,
                 }
             }
-            msg = net_rx.recv() => {
-                let Some(msg) = msg else {
-                    // The server is gone. With direct links configured
-                    // that is a degradation, not an ending: those links
-                    // are punched peer-to-peer and neither know nor care
-                    // that it went away, and tearing the session down
-                    // would disconnect the very peers it did not affect.
-                    // Anything needing a server is refused from here on,
-                    // described as temporary (`ServerState::Unreachable`)
-                    // since it may well come back.
-                    if session.server == ServerState::Connected
-                        && session.peer_link.has_direct_targets()
-                    {
-                        session.server = ServerState::Unreachable;
-                        ui_state.push_status_notice(
-                            "the server connection was lost - direct links are unaffected"
-                                .to_string(),
-                            false,
-                        );
-                        continue;
-                    }
-                    break;
-                };
-                if let Some(action) = handle_server_message(msg, &mut ui_state, &mut wr, &mut session).await? {
-                    handle_ui_action(action, &mut wr, &mut ui_state, &mut session).await?;
-                }
+            event = server_events.recv() => {
+                // `None` means the supervisor task itself is gone, which
+                // it only ever is once this session has dropped its own
+                // sender - and a `--no-server` session holds that sender
+                // open forever, so this branch never fires for one.
+                let Some(event) = event else { break };
+                handle_server_event(event, &mut ui_state, &mut wr, &mut session).await?;
             }
             msg = record_out_rx.recv() => {
                 let Some(msg) = msg else { break };
@@ -911,6 +898,16 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
                 if now.duration_since(last_conn_sample) >= Duration::from_secs(1) {
                     ui_state.set_conn_quality(session.conn_stats.quality());
                     last_conn_sample = now;
+                }
+                // The header's reconnect countdown, recomputed from the
+                // supervisor's deadline on every redraw rather than pushed
+                // up the event channel once a second - the number on screen
+                // is then never a stale copy of one.
+                if let Some((until, failed_attempts)) = session.server_retry {
+                    ui_state.set_server_link(ServerLinkState::waiting(
+                        failed_attempts,
+                        crate::client::reconnect::seconds_left(now, until),
+                    ));
                 }
                 // The call modal's duration readout (`docs/SPEC.md` "Live
                 // voice calls") is refreshed on every tick rather than
@@ -1474,6 +1471,133 @@ async fn accept_file_offer(
 /// dwell timer (`UiState::tick_dwell`). Async (and given `wr`) because
 /// punching a direct link to a newly-learned peer writes to the network
 /// right here.
+/// One event from the reconnect supervisor (`crate::client::reconnect`):
+/// either a message the server sent, or a change in whether there is a
+/// server to send one.
+async fn handle_server_event(
+    event: ServerEvent,
+    ui_state: &mut UiState,
+    wr: &mut impl crate::control::ControlSink,
+    session: &mut SessionState,
+) -> proto::Result<()> {
+    match event {
+        ServerEvent::Message(msg) => {
+            if let Some(action) = handle_server_message(*msg, ui_state, wr, session).await? {
+                handle_ui_action(action, wr, ui_state, session).await?;
+            }
+        }
+        // The server is gone, but the session is not: direct links are
+        // punched peer-to-peer and neither know nor care that it went away,
+        // so tearing the session down would disconnect the very peers it
+        // did not affect. Anything needing a server is refused from here
+        // on, described as temporary (`ServerState::Unreachable`) - which
+        // it now genuinely is, because something is already retrying.
+        ServerEvent::Lost => {
+            session.server = ServerState::Unreachable;
+            session.server_retry = None;
+            ui_state.set_server_link(ServerLinkState::Reconnecting);
+            ui_state.push_status_notice(
+                "the server connection was lost - direct links are unaffected".to_string(),
+                false,
+            );
+        }
+        ServerEvent::Attempting => {
+            session.server_retry = None;
+            ui_state.set_server_link(ServerLinkState::Reconnecting);
+        }
+        ServerEvent::Waiting {
+            until,
+            failed_attempts,
+            reason,
+        } => {
+            session.server_retry = Some((until, failed_attempts));
+            ui_state.set_server_link(ServerLinkState::waiting(
+                failed_attempts,
+                crate::client::reconnect::seconds_left(Instant::now(), until),
+            ));
+            // Once, on the first failure. The header carries the state
+            // from here on, and a notice per attempt would bury everything
+            // else the log has to say for as long as the server is away.
+            if failed_attempts == 1 {
+                ui_state.push_status_notice(
+                    format!("the server is not answering ({reason}) - still trying"),
+                    false,
+                );
+            }
+        }
+        ServerEvent::Reconnected { you } => {
+            on_server_reconnected(you, ui_state, wr, session).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Back on the server, as a brand-new `UserId` (TB-020).
+///
+/// Everything the old connection said about other people is dropped before
+/// anything the new one says is applied: those `UserId`s were that
+/// connection's to hand out, and a peer who reconnected in the meantime is
+/// now a different one - as is anyone at all, if the server itself
+/// restarted and began handing ids out from the start again. Nobody is
+/// marked *offline* by this: they did not go anywhere, and this client
+/// simply no longer knows who is there. Whoever is still around comes
+/// straight back in the membership snapshot the re-joins below ask for, so
+/// the cost of being thorough here is at most one re-punch of a link that
+/// was already fine, and the cost of not being is a sidebar full of people
+/// who are not there.
+async fn on_server_reconnected(
+    you: UserId,
+    ui_state: &mut UiState,
+    wr: &mut impl crate::control::ControlSink,
+    session: &mut SessionState,
+) -> proto::Result<()> {
+    session.server = ServerState::Connected;
+    session.server_retry = None;
+    ui_state.set_server_link(ServerLinkState::Connected);
+
+    let stale: Vec<UserId> = ui_state
+        .known_users
+        .keys()
+        .copied()
+        // A direct peer is named by its own identity rather than by
+        // anything the server handed out (§7.1.5), so no server coming or
+        // going has any bearing on it.
+        .filter(|id| !p2p::is_direct_peer_id(*id))
+        .collect();
+    for id in stale {
+        drop_peer_state(ui_state, session, id);
+    }
+    ui_state.forget_server_presence();
+    ui_state.set_own_id(you);
+
+    // Walk back into the same channels. Without this a reconnect would be
+    // silent in exactly the way that started all this: messages still
+    // arriving over the direct links, and this client in nobody's member
+    // list - including the member lists of people who connect later.
+    let rejoin: Vec<(String, proto::ChannelKind)> = ui_state
+        .channels
+        .iter()
+        .filter(|c| c.joined)
+        .map(|c| (c.name.clone(), c.kind))
+        .collect();
+    for (name, kind) in rejoin {
+        let password = session.channel_passwords.get(&name).cloned();
+        crate::client::channel::handle_join(wr, session, name, kind, password).await?;
+    }
+
+    // The same mailbox catch-up a fresh connection does (§17.3) - a
+    // reconnect is a fresh connection in every way that matters to the
+    // server, including having missed whatever arrived while it was away.
+    if crate::client::otp_cli::binary_available(&session.otp_cli_cfg) {
+        wr.send_control(&ClientMessage::OtpMailFetch).await?;
+        session.conn_stats.record_event(Instant::now());
+        crate::client::otp_mail::resend_pending(wr, session).await?;
+    }
+
+    ui_state.push_status_notice("reconnected to the server".to_string(), true);
+    Ok(())
+}
+
 async fn handle_server_message(
     msg: ServerMessage,
     ui_state: &mut UiState,
@@ -1619,41 +1743,7 @@ async fn handle_server_message(
             }
         }
         ServerMessage::UserOffline { user_id } => {
-            // Read before `on_user_offline`, which is what would make the
-            // nickname unresolvable if it ever stopped keeping them.
-            notify_daemon_presence(ui_state, session, user_id, None, "disconnected");
-            // Their next arrival is a fresh "they are online" event.
-            session.announced_online.remove(&user_id);
-            ui_state.on_user_offline(user_id);
-            // A full disconnect is always the end of any relationship with
-            // them - unlike `UserLeft` (one channel, possibly still shared
-            // elsewhere or via an open DM), so this is the one case safe to
-            // forget the link unconditionally.
-            // Released *before* the forget, not after: releasing moves a
-            // live direct link back onto its settings-file identity, so
-            // the forget below then finds nothing under `user_id` and
-            // leaves it alone. The other order tore down a working direct
-            // link every time its peer merely left the server.
-            session.peer_link.release_direct_peer_id(user_id);
-            session.peer_link.forget(user_id);
-            ui_state.forget_link_status(user_id);
-            // Their rotating encryption keys, and ours for them, end with
-            // the connection: a later one is a different `UserId` starting
-            // its rotation counter over (§13.10), and the keys we held are
-            // of no further use to anyone - including us.
-            session.pq_peer_keys.forget(user_id);
-            if let Some(own) = session.own_pq_keys.as_mut() {
-                own.forget(user_id);
-            }
-            session.replay.forget(user_id);
-            // A half-received pad from this connection can never be
-            // continued: the rest of it would arrive under the fresh
-            // `UserId` they reconnect with, which starts its own
-            // accumulation. Dropped here rather than left to linger for the
-            // session, both because it is dead weight and because it is raw
-            // pad material (zeroized on drop, so dropping it is what wipes
-            // it).
-            session.otp_incoming_setup.remove(&user_id);
+            forget_peer(ui_state, session, user_id);
         }
         ServerMessage::KeyRotated {
             from,
@@ -1978,6 +2068,64 @@ fn notify_daemon_presence(
             None => "They are offline.".to_string(),
         },
     ));
+}
+
+/// Everything that ends when one peer's connection does, in one place:
+/// their presence, their direct link, their rotating keys, and any
+/// half-arrived pad from them.
+///
+/// Called from `ServerMessage::UserOffline` for one peer, and from
+/// `on_server_reconnected` for all of them at once - a reconnect makes
+/// every `UserId` the previous connection handed out meaningless in
+/// exactly the way one `UserOffline` makes a single one meaningless
+/// (`docs/PROTOCOL.md` §4.2).
+fn forget_peer(ui_state: &mut UiState, session: &mut SessionState, user_id: UserId) {
+    // Read before `on_user_offline`, which is what would make the
+    // nickname unresolvable if it ever stopped keeping them.
+    notify_daemon_presence(ui_state, session, user_id, None, "disconnected");
+    ui_state.on_user_offline(user_id);
+    drop_peer_state(ui_state, session, user_id);
+}
+
+/// The half of `forget_peer` that is not about presence: the direct link,
+/// the keys, and anything half-arrived from them.
+///
+/// Split out for a reconnect, which ends every relationship the previous
+/// connection's `UserId`s named without any of them having *gone offline* -
+/// nobody disconnected, this client did. Saying otherwise would log a
+/// departure notice for each of them and, on a daemon, notify about it.
+fn drop_peer_state(ui_state: &mut UiState, session: &mut SessionState, user_id: UserId) {
+    // Their next arrival is a fresh "they are online" event.
+    session.announced_online.remove(&user_id);
+    // A full disconnect is always the end of any relationship with
+    // them - unlike `UserLeft` (one channel, possibly still shared
+    // elsewhere or via an open DM), so this is the one case safe to
+    // forget the link unconditionally.
+    // Released *before* the forget, not after: releasing moves a
+    // live direct link back onto its settings-file identity, so
+    // the forget below then finds nothing under `user_id` and
+    // leaves it alone. The other order tore down a working direct
+    // link every time its peer merely left the server.
+    session.peer_link.release_direct_peer_id(user_id);
+    session.peer_link.forget(user_id);
+    ui_state.forget_link_status(user_id);
+    // Their rotating encryption keys, and ours for them, end with
+    // the connection: a later one is a different `UserId` starting
+    // its rotation counter over (§13.10), and the keys we held are
+    // of no further use to anyone - including us.
+    session.pq_peer_keys.forget(user_id);
+    if let Some(own) = session.own_pq_keys.as_mut() {
+        own.forget(user_id);
+    }
+    session.replay.forget(user_id);
+    // A half-received pad from this connection can never be
+    // continued: the rest of it would arrive under the fresh
+    // `UserId` they reconnect with, which starts its own
+    // accumulation. Dropped here rather than left to linger for the
+    // session, both because it is dead weight and because it is raw
+    // pad material (zeroized on drop, so dropping it is what wipes
+    // it).
+    session.otp_incoming_setup.remove(&user_id);
 }
 
 /// Applies one incoming direct-link event (`crate::client::p2p::P2pEvent`) - the

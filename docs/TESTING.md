@@ -100,8 +100,8 @@ because `[profile.dev.package."*"]` in `Cargo.toml` builds dependencies at
 `opt-level = 3` — RSA key generation is pure Rust, and unoptimised it makes
 the suite roughly sixty times slower.
 
-As of writing: 39 stories, 207 acceptance criteria, 196 technical
-behaviours, 300 Gherkin scenarios, and 930 Rust test functions (of which a
+As of writing: 40 stories, 222 acceptance criteria, 202 technical
+behaviours, 320 Gherkin scenarios, and 981 Rust test functions (of which a
 handful carry `#[ignore]` — real RSA-4096 key generation, run by
 `cargo slow`). These numbers drift as the suite grows; `cargo trace`
 regenerates the live count in

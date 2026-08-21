@@ -35,3 +35,33 @@ Feature: Seeing who I can actually reach
     Then bob's name is shown in green
     When the direct connection to bob is lost
     Then bob's name is shown in red
+
+  @AC-228
+  Scenario: A closed connection outranks whatever the link was last doing
+    Given I am connected and viewing a channel
+    And bob is in the channel with me
+    And bob has sent me the private message "hi"
+    And I have a direct connection to bob
+    Then bob's name is shown in green
+    When bob goes offline
+    Then bob's name is shown in gray, whatever his link was last doing
+
+  @AC-229
+  Scenario: An open DM is coloured on the top row the same way the sidebar colours it
+    Given I am connected and viewing a channel
+    And bob is in the channel with me
+    And I have opened a private room with bob
+    And I have a direct connection to bob
+    Then the DM selector shows bob in green
+    When the direct connection to bob is lost
+    Then the DM selector shows bob in red
+
+  @AC-229
+  Scenario: Every room the DM dropdown lists carries its peer's reachability
+    Given I am connected and viewing a channel
+    And bob is in the channel with me
+    And carol is in the channel with me
+    And I have opened a private room with bob
+    And I have opened a private room with carol
+    Then every room listed in the DM dropdown carries its peer's reachability
+

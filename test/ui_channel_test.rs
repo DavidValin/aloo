@@ -5,7 +5,8 @@ use ui_common::*;
 use aloo::client::netstats::ConnQuality;
 use aloo::client::p2p::LinkStatus;
 use aloo::proto::{ChannelInfo, ChannelKind, KeyMode, UserId};
-use aloo::client::tui::channel::HEADER_ROW_HEIGHT;
+use aloo::client::reconnect::ServerLinkState;
+use aloo::client::tui::channel::{HEADER_ROW_HEIGHT, messages_start_col};
 use aloo::client::tui::ui::{
     Focus, IdentityCase, MessageBody, SELECTOR_DROPDOWN_IDLE_TIMEOUT, UiAction, UiState,
     VoiceTarget, render,
@@ -1099,6 +1100,183 @@ fn header_defaults_conn_quality_to_a_white_dash_before_any_traffic() {
         buffer[(x, y)].fg,
         ratatui::style::Color::White,
         "Conn:- should render in white"
+    );
+}
+
+// ---------------------------------------------------------------------
+// The header's server-state element (docs/PROTOCOL.md 4.2)
+// ---------------------------------------------------------------------
+
+/// A reconnect ends every relationship the old connection's ids named -
+/// but nobody went anywhere, so nothing may claim they did. The ids are
+/// dropped wholesale instead, including the offline set: it belonged to
+/// that connection, whose server may not even be the same process next
+/// time.
+/// @requirement AC-227
+#[test]
+fn a_reconnect_drops_what_the_old_connection_said_without_marking_anyone_offline() {
+    let mut state = joined_general_with(vec![user(2, "bob"), user(3, "carol")]);
+    state.on_user_offline(UserId(3));
+    assert!(state.offline.contains(&UserId(3)));
+
+    state.forget_server_presence();
+
+    assert!(
+        state.channels[0].members.is_empty(),
+        "memberships came from the connection that ended"
+    );
+    assert!(state.known_users.is_empty(), "so did the identities");
+    assert!(
+        state.offline.is_empty(),
+        "and so did the record of who had gone - those ids mean nothing now"
+    );
+}
+
+/// A direct-punch peer is named by its own identity rather than by
+/// anything a server handed out, so no server coming or going touches it.
+/// @requirement AC-227
+#[test]
+fn a_reconnect_leaves_direct_punch_peers_exactly_where_they_are() {
+    let direct = aloo::client::p2p::direct_peer_id("bob");
+    let mut state = joined_general_with(vec![user(2, "carol")]);
+    state.seed_member("general", user(direct.0, "bob"));
+
+    state.forget_server_presence();
+
+    assert_eq!(
+        state.channels[0].members.len(),
+        1,
+        "the direct peer stays, the server-named one goes"
+    );
+    assert_eq!(state.channels[0].members[0].id, direct);
+    assert!(state.known_users.contains_key(&direct));
+}
+
+/// @requirement AC-223
+#[test]
+fn the_server_state_is_the_first_thing_on_the_header_row() {
+    let state = joined_general_with(vec![]);
+    let header = header_row(&state);
+    let connected = header
+        .find("Connected to server!")
+        .expect("the header must say what the server connection is doing");
+    let selector = header.find("general").expect("the channel selector");
+    assert!(
+        connected < selector,
+        "the server state comes before the selectors: {header:?}"
+    );
+}
+
+/// @requirement AC-223
+#[test]
+fn the_selectors_start_where_the_message_list_below_them_does() {
+    // Wide enough for the server state to fit in the sidebar's share of
+    // it; a terminal too narrow for that is the next test.
+    const WIDTH: u16 = 140;
+    let state = joined_general_with(vec![]);
+    let backend = TestBackend::new(WIDTH, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| render(f, &state)).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+
+    // The selector's own first cell: its channel-kind icon, which is where
+    // its text starts (a wide glyph occupies one cell plus a blank, so the
+    // icon alone is what can be located exactly). One column past the
+    // message pane's own left edge, which is where the messages *inside*
+    // that pane's border begin - so the two columns of text line up.
+    let (x, y) = find_text_start(&buffer, "\u{1F30D}");
+    assert_eq!(y as usize, HEADER_TEXT_ROW, "the selector is on the header row");
+    assert_eq!(
+        x,
+        messages_start_col(WIDTH) + 1,
+        "the channel selector must line up with the message list under it"
+    );
+}
+
+/// A countdown that has lost its number tells the user nothing, so an
+/// over-long state pushes the selectors right rather than being cut off.
+/// @requirement AC-223
+#[test]
+fn a_state_too_long_for_the_sidebar_width_pushes_the_selectors_rather_than_truncating() {
+    let mut state = joined_general_with(vec![]);
+    state.set_server_link(ServerLinkState::Down { seconds_left: 30 });
+    let header = header_row(&state);
+    assert!(
+        header.contains("Server down (reconnecting in 30 sec...)"),
+        "the whole state must survive: {header:?}"
+    );
+    let state_end = header.find("sec...)").expect("the countdown") + "sec...)".len();
+    let selector = header.find("general").expect("the channel selector");
+    assert!(
+        selector > state_end,
+        "the selectors move aside instead of being written over: {header:?}"
+    );
+}
+
+/// @requirement AC-223
+#[test]
+fn every_server_state_renders_in_its_own_colour() {
+    let cases = [
+        (
+            ServerLinkState::Connected,
+            "Connected to server!",
+            ratatui::style::Color::Green,
+        ),
+        (
+            ServerLinkState::Reconnecting,
+            "Reconnecting...",
+            ratatui::style::Color::Red,
+        ),
+        (
+            ServerLinkState::RetryingIn { seconds_left: 5 },
+            "Reconnecting in 5s...",
+            ratatui::style::Color::Red,
+        ),
+        (
+            ServerLinkState::Down { seconds_left: 12 },
+            "Server down",
+            ratatui::style::Color::Red,
+        ),
+        (
+            ServerLinkState::NoServer,
+            "No server mode",
+            ratatui::style::Color::White,
+        ),
+    ];
+    for (link, text, expected) in cases {
+        let mut state = joined_general_with(vec![]);
+        state.set_server_link(link);
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, &state)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let (x, y) = find_text_start(&buffer, text);
+        assert_eq!(buffer[(x, y)].fg, expected, "{text} should render {expected:?}");
+    }
+}
+
+/// @requirement AC-224
+#[test]
+fn no_server_mode_says_so_while_a_punch_is_in_flight() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.set_server_link(ServerLinkState::NoServer);
+    assert!(header_row(&state).contains("No server mode"));
+    assert!(
+        !header_row(&state).contains("(punching)"),
+        "nothing is being punched yet"
+    );
+
+    state.set_link_status(UserId(2), LinkStatus::Connecting);
+    assert!(
+        header_row(&state).contains("No server mode (punching)"),
+        "a link being established is a punch in flight: {:?}",
+        header_row(&state)
+    );
+
+    state.set_link_status(UserId(2), LinkStatus::Active);
+    assert!(
+        !header_row(&state).contains("(punching)"),
+        "a link that is up is not a punch in flight"
     );
 }
 

@@ -24,6 +24,7 @@ pub mod otp;
 pub mod otp_mail;
 pub mod pq_hybrid;
 pub mod presence;
+pub mod reconnect;
 pub mod server;
 pub mod status;
 pub mod ui_common;

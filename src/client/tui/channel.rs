@@ -13,7 +13,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 
 use crate::client::netstats::ConnQuality;
-use crate::client::p2p::LinkStatus;
+use crate::client::presence::Presence;
+use crate::client::reconnect::ServerLinkState;
 use crate::proto::{ChannelInfo, ChannelJoinRejection, ChannelKind, UserId, UserInfo};
 use crate::client::sysstats::CPU_HEALTHY_MAX_PCT;
 use crate::validation;
@@ -936,8 +937,16 @@ fn dm_selector_title(state: &UiState) -> Option<SelectorTitle> {
         SelectorFocus::Dms,
         state.any_dm_unread(),
     ));
+    // The named peer carries the same presence colour their name has in
+    // the channel sidebar (`presence_color`): an open DM is the one view
+    // with no user list of its own, so without this the whole time a room
+    // is open there is nothing on screen saying whether what is being
+    // typed into it can actually get there.
     Some(SelectorTitle {
-        name: vec![Span::raw(format!("{DM_ICON} {nickname}"))],
+        name: vec![Span::styled(
+            format!("{DM_ICON} {nickname}"),
+            Style::default().fg(presence_color(state.presence_of(peer))),
+        )],
         trailing,
     })
 }
@@ -991,11 +1000,57 @@ const CALL_MARKER_KEY: &str = "Ctrl+R";
 /// of padding each side, and the two border columns.
 const CALL_MARKER_WIDTH: u16 = 18;
 
+/// How much of the channel view's width the sidebar takes, and therefore
+/// the column its message list starts at - the one the header's selectors
+/// line up with (`server_state_width`).
+pub const SIDEBAR_PERCENT: u16 = 20;
+
+/// The column the message list starts at in a view `width` columns wide,
+/// computed through the very same `Layout` the view itself is split with
+/// so the two can never round apart by a column.
+pub fn messages_start_col(width: u16) -> u16 {
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints(view_columns())
+        .split(Rect {
+            x: 0,
+            y: 0,
+            width,
+            height: 1,
+        })[1]
+        .x
+}
+
+/// The channel view's own sidebar/messages split, named once so
+/// `messages_start_col` measures exactly what `render_channel_view` draws.
+fn view_columns() -> [Constraint; 2] {
+    [
+        Constraint::Percentage(SIDEBAR_PERCENT),
+        Constraint::Percentage(100 - SIDEBAR_PERCENT),
+    ]
+}
+
+/// How wide the header's server-state element is, given the header row's
+/// own (already inset) width and the label that has to fit in it.
+///
+/// Normally the message list's start column, so the selectors beside it
+/// begin exactly where the messages below them do. A label too long for
+/// that - "Server down (reconnecting in 30 sec...)" on a narrow terminal -
+/// pushes the selectors right instead of being cut off: a countdown that
+/// has lost its number tells the user nothing, and the selectors moving is
+/// the cheaper of the two costs.
+fn server_state_width(area_width: u16, label_width: u16) -> u16 {
+    messages_start_col(area_width)
+        .saturating_sub(HEADER_SIDE_PAD)
+        .max(label_width + 1)
+}
+
 /// The top row, shared by the channel view and an open DM room
-/// (`direct_message::render_private_room`): both selectors on the left,
-/// and flush right the red-bordered `\u{1F534} Call Ctrl+R` box while a call is
-/// on (Escape folds the modal away into it, Ctrl+R brings it back), then
-/// Conn quality, CPU usage and the help hint, in that order
+/// (`direct_message::render_private_room`): the server-state element
+/// first, then both selectors - starting where the message list below them
+/// does - and flush right the red-bordered `\u{1F534} Call Ctrl+R` box while a
+/// call is on (Escape folds the modal away into it, Ctrl+R brings it back),
+/// then Conn quality, CPU usage and the help hint, in that order
 /// (`docs/SPEC.md` "Connected UI").
 pub(crate) fn render_header_row(frame: &mut Frame, area: Rect, state: &UiState) {
     let Some(line) = header_text_row(area) else {
@@ -1011,17 +1066,21 @@ pub(crate) fn render_header_row(frame: &mut Frame, area: Rect, state: &UiState) 
     // "Conn:NORMAL  CPU:100%  Ctrl+H: Help" happens to be this frame.
     let status = status_line(state);
     let status_width = status.width() as u16 + 1;
+    let server_state = server_state_line(state);
+    let server_state_width = server_state_width(area.width, server_state.width() as u16);
     let header_cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
+            Constraint::Length(server_state_width),
             Constraint::Min(0),
             Constraint::Length(call_width),
             Constraint::Length(status_width),
         ])
         .split(line);
 
+    frame.render_widget(Paragraph::new(server_state), header_cols[0]);
     let (selectors, _) = selector_line(state);
-    frame.render_widget(Paragraph::new(selectors), header_cols[0]);
+    frame.render_widget(Paragraph::new(selectors), header_cols[1]);
 
     if state.call.is_some() {
         // The box is the one thing here that uses the whole three-row
@@ -1030,9 +1089,9 @@ pub(crate) fn render_header_row(frame: &mut Frame, area: Rect, state: &UiState) 
         render_call_marker(
             frame,
             Rect {
-                x: header_cols[1].x,
+                x: header_cols[2].x,
                 y: area.y,
-                width: header_cols[1].width,
+                width: header_cols[2].width,
                 height: area.height.min(HEADER_ROW_HEIGHT),
             },
         );
@@ -1040,8 +1099,31 @@ pub(crate) fn render_header_row(frame: &mut Frame, area: Rect, state: &UiState) 
 
     frame.render_widget(
         Paragraph::new(status).alignment(ratatui::layout::Alignment::Right),
-        header_cols[2],
+        header_cols[3],
     );
+}
+
+/// The header's first element: what the control connection is doing
+/// (`crate::client::reconnect::ServerLinkState`), in the one colour that
+/// state carries.
+fn server_state_line(state: &UiState) -> Line<'static> {
+    Line::from(Span::styled(
+        state.server_link_label(),
+        Style::default().fg(server_link_color(state.server_link)),
+    ))
+}
+
+/// Colour for the header's server-state element: green connected, red
+/// while anything is wrong with a server that is meant to be there, white
+/// when there is deliberately none (`docs/SPEC.md` "Connected UI").
+pub(crate) fn server_link_color(state: ServerLinkState) -> Color {
+    match state {
+        ServerLinkState::Connected => Color::Green,
+        ServerLinkState::Reconnecting
+        | ServerLinkState::RetryingIn { .. }
+        | ServerLinkState::Down { .. } => Color::Red,
+        ServerLinkState::NoServer => Color::White,
+    }
 }
 
 /// Conn quality, CPU usage and the help hint, in that order
@@ -1109,7 +1191,16 @@ pub(crate) fn render_selector_dropdown(frame: &mut Frame, area: Rect, state: &Ui
     let rows: Vec<Line<'static>> = entries
         .iter()
         .map(|e| {
-            let mut spans = vec![Span::raw(e.label.clone())];
+            // A DM row names a person, and is coloured by whether they can
+            // be reached, exactly as the selector above it and the channel
+            // sidebar are. A channel row has nobody to say that about.
+            let mut spans = vec![match e.presence {
+                Some(presence) => Span::styled(
+                    e.label.clone(),
+                    Style::default().fg(presence_color(presence)),
+                ),
+                None => Span::raw(e.label.clone()),
+            }];
             if e.unread {
                 spans.push(Span::styled(
                     unread_envelope(state.blink_on),
@@ -1174,7 +1265,7 @@ pub(crate) fn render_channel_view(frame: &mut Frame, area: Rect, state: &UiState
 
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(20), Constraint::Percentage(80)])
+        .constraints(view_columns())
         .split(rows[messages_row]);
 
     render_sidebar(frame, cols[0], state);
@@ -1199,6 +1290,21 @@ pub(crate) fn cpu_color(pct: f32) -> Color {
         Color::Green
     } else {
         Color::Red
+    }
+}
+
+/// One colour per `presence::Presence` (`docs/SPEC.md` "Connected UI"),
+/// shared by every place a person is named: the channel sidebar and the
+/// top row's DM selector.
+pub(crate) fn presence_color(presence: Presence) -> Color {
+    match presence {
+        // The most urgent of the three, and the only one with something to
+        // do about it (Enter opens the review).
+        Presence::Unverified => Color::Red,
+        Presence::Offline => Color::DarkGray,
+        Presence::Reachable => Color::Green,
+        Presence::Connecting => Color::Yellow,
+        Presence::Unreachable => Color::Red,
     }
 }
 
@@ -1283,17 +1389,7 @@ fn render_sidebar(frame: &mut Frame, area: Rect, state: &UiState) {
             // show here - a peer can be perfectly online and completely
             // unreachable, which is exactly the case this is here to make
             // visible.
-            let mut style = if state.is_trust_gated(m.id) {
-                Style::default().fg(Color::Red)
-            } else if state.offline.contains(&m.id) {
-                Style::default().fg(Color::DarkGray)
-            } else {
-                match state.link_status_of(m.id) {
-                    LinkStatus::Active => Style::default().fg(Color::Green),
-                    LinkStatus::Lost => Style::default().fg(Color::Red),
-                    LinkStatus::Connecting => Style::default().fg(Color::Yellow),
-                }
-            };
+            let mut style = Style::default().fg(presence_color(state.presence_of(m.id)));
             if state.focus == super::ui::Focus::Sidebar && i == state.sidebar_selected {
                 style = style.add_modifier(Modifier::REVERSED);
             }
