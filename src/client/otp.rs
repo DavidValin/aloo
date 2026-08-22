@@ -2049,11 +2049,7 @@ fn contact_name_for_peer(session: &SessionState, peer_pubkey_der: &[u8]) -> Opti
 /// name that changed every session would file each reconnect under a
 /// different pad.
 fn own_pinned_public_der(session: &SessionState) -> Option<Vec<u8>> {
-    if !crate::client::keymode_policy::uses_byte_comparison_pinning(session.own_key_mode) {
-        return None;
-    }
-    let own = session.own_keys.as_ref()?;
-    crypto::public_key_to_der(&own.to_public_key()).ok()
+    session.otp_own_pinned_der.clone()
 }
 
 /// Whether `peer_pubkey_der` parses as a `pq_hybrid` bundle - the only
@@ -2093,6 +2089,52 @@ fn direct_file_offer(
         return None;
     }
     proto::decode(envelope.blocks.first()?).ok()
+}
+
+/// A voice offer's payload under `Direct` framing - `direct_file_offer`'s
+/// counterpart, and for the same reason: without `pq_hybrid` there is no
+/// sealed envelope to open, so the single block *is* the encoded payload.
+fn direct_voice_offer(
+    envelope: &Envelope,
+) -> Option<crate::client::file_transfer::VoiceOfferPayload> {
+    if envelope.content != Content::VoiceOffer {
+        return None;
+    }
+    proto::decode(envelope.blocks.first()?).ok()
+}
+
+/// The envelope a stream-shaped OTP send (a file offer, a voice offer)
+/// puts inside the pad, framed the way this pair's `OtpFraming` says.
+///
+/// Text has the same choice inline in `send_now`; this exists because the
+/// two stream paths need it identically, and because getting it wrong is
+/// silent: hardcoding `PqHybrid` here made every file and voice send fail
+/// closed for a pure-OTP pair, with the text path beside it working.
+fn offer_envelope(
+    session: &SessionState,
+    to: UserId,
+    peer_key_mode: KeyMode,
+    recipient_pubkey_der: &[u8],
+    stream_id: u64,
+    plaintext: &[u8],
+    content: Content,
+) -> Option<Envelope> {
+    match framing_for(session.own_key_mode, peer_key_mode) {
+        OtpFraming::Direct => Some(Envelope {
+            content,
+            blocks: vec![plaintext.to_vec()],
+        }),
+        OtpFraming::PqWrapped => crate::client::envelope::encrypt_envelope_for(
+            session.own_pq_private.as_ref(),
+            session.pq_peer_keys.encap_for(to),
+            KeyMode::PqHybrid,
+            recipient_pubkey_der,
+            None,
+            stream_id,
+            plaintext,
+            content,
+        ),
+    }
 }
 
 /// How one contact's OTP traffic is framed inside the pad.
@@ -2165,9 +2207,6 @@ async fn send_now(
     log_index: Option<usize>,
     msg_id: Option<u64>,
 ) -> proto::Result<()> {
-    if !crate::client::keymode_policy::can_address(recipient_key_mode, session.own_key_mode) {
-        return Ok(());
-    }
     let send_id = session.next_stream_id;
     session.next_stream_id += 1;
     // With `pq_hybrid` on both sides the pad wraps an ordinary envelope;
@@ -2185,6 +2224,18 @@ async fn send_now(
             blocks: vec![plaintext.to_vec()],
         },
         OtpFraming::PqWrapped => {
+            // Only meaningful for the framing that actually seals something
+            // to their key: `can_address` refuses a `pq_hybrid` recipient
+            // from a sender with no `pq_hybrid` signing identity of its own.
+            // Under `Direct` there is no envelope and no signature - the pad
+            // is the whole protection, and the two identities are only ever
+            // used to *name* the contact - so applying it there silently
+            // dropped every send from a password-pinned side to a
+            // `pq_hybrid` one, in a session both ends showed as active.
+            if !crate::client::keymode_policy::can_address(recipient_key_mode, session.own_key_mode)
+            {
+                return Ok(());
+            }
             let Some(envelope) = crate::client::envelope::encrypt_envelope_for(
                 session.own_pq_private.as_ref(),
                 session.pq_peer_keys.encap_for(to),
@@ -2394,7 +2445,7 @@ pub async fn send_or_queue(
 /// in-memory `PendingOtpSend` queue across a possible reconnect is a lot
 /// of extra state for a case the user can simply retry a moment later.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn send_file_offer(
+pub async fn send_file_offer(
     wr: &mut impl crate::control::ControlSink,
     session: &mut SessionState,
     ui_state: &mut UiState,
@@ -2437,12 +2488,12 @@ pub(crate) async fn send_file_offer(
     };
     let stream_id = session.next_stream_id;
     session.next_stream_id += 1;
-    let Some(envelope) = crate::client::envelope::encrypt_envelope_for(
-        session.own_pq_private.as_ref(),
-        session.pq_peer_keys.encap_for(to),
-        KeyMode::PqHybrid,
+    let peer_key_mode = peer_key_mode_of(recipient_pubkey_der, session);
+    let Some(envelope) = offer_envelope(
+        session,
+        to,
+        peer_key_mode,
         recipient_pubkey_der,
-        None,
         stream_id,
         &plaintext,
         Content::FileOffer,
@@ -2460,7 +2511,7 @@ pub(crate) async fn send_file_offer(
         session,
         stream_id,
         to,
-        KeyMode::PqHybrid,
+        peer_key_mode,
         recipient_pubkey_der,
     ) else {
         notify(
@@ -2547,7 +2598,7 @@ pub(crate) async fn send_file_offer(
 /// ciphertext, nothing left for `FileAccepted` to do) and sends
 /// `OtpVoiceOffer`; the peer's `FileAccept` (auto-sent, no popup on their
 /// end either) triggers the existing chunked send worker unchanged.
-pub(crate) async fn send_voice_offer(
+pub async fn send_voice_offer(
     wr: &mut impl crate::control::ControlSink,
     session: &mut SessionState,
     ui_state: &mut UiState,
@@ -2619,12 +2670,12 @@ pub(crate) async fn send_voice_offer(
     };
     let stream_id = session.next_stream_id;
     session.next_stream_id += 1;
-    let Some(envelope) = crate::client::envelope::encrypt_envelope_for(
-        session.own_pq_private.as_ref(),
-        session.pq_peer_keys.encap_for(to),
-        KeyMode::PqHybrid,
+    let peer_key_mode = peer_key_mode_of(recipient_pubkey_der, session);
+    let Some(envelope) = offer_envelope(
+        session,
+        to,
+        peer_key_mode,
         recipient_pubkey_der,
-        None,
         stream_id,
         &plaintext,
         Content::VoiceOffer,
@@ -2643,7 +2694,7 @@ pub(crate) async fn send_voice_offer(
         session,
         stream_id,
         to,
-        KeyMode::PqHybrid,
+        peer_key_mode,
         recipient_pubkey_der,
     ) else {
         secure_remove_file(&cipher_path);
@@ -2796,7 +2847,7 @@ pub async fn on_message(
 /// content, once accepted, reserves and acks a wholly separate slot
 /// (`start_outgoing_file_content`, `finish_incoming_file`).
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn on_file_offer(
+pub async fn on_file_offer(
     session: &mut SessionState,
     ui_state: &mut UiState,
     channel: Option<String>,
@@ -2881,7 +2932,7 @@ pub(crate) async fn on_file_offer(
 /// before this envelope was even sent, see its doc) - so no
 /// `OtpDeliveryAck` here; only once the whole recording has arrived and
 /// been decrypted (`finish_incoming_file`) is one sent.
-pub(crate) async fn on_voice_offer(
+pub async fn on_voice_offer(
     wr: &mut impl crate::control::ControlSink,
     session: &mut SessionState,
     ui_state: &mut UiState,
@@ -2900,7 +2951,18 @@ pub(crate) async fn on_voice_offer(
         return;
     }
     let _ = session.otp_store.save();
-    let Some(payload) = crate::client::session::decrypt_voice_offer(&envelope, from, &sender, session) else {
+    // Same split as `on_message`/`on_file_offer`: a sealed envelope under
+    // `pq_hybrid`, the encoded payload itself without one.
+    let payload = match framing_for(
+        session.own_key_mode,
+        peer_key_mode_of(&sender.public_key_der, session),
+    ) {
+        OtpFraming::Direct => direct_voice_offer(&envelope),
+        OtpFraming::PqWrapped => {
+            crate::client::session::decrypt_voice_offer(&envelope, from, &sender, session)
+        }
+    };
+    let Some(payload) = payload else {
         return;
     };
     let key = crate::client::voice_stream::resolve_incoming_key(session, from, &sender.public_key_der);
@@ -3074,7 +3136,7 @@ pub(crate) async fn flush_one_queued(
 /// no gate to release: just notify, mark the row failed, and clean up the
 /// temp file. A non-OTP target spawns immediately, gate logic never
 /// entering into it at all.
-pub(crate) async fn start_outgoing_file_content(
+pub async fn start_outgoing_file_content(
     session: &mut SessionState,
     ui_state: &mut UiState,
     stream_id: u64,
@@ -3183,7 +3245,7 @@ pub(crate) async fn start_outgoing_file_content(
 /// this contact something else - so a decrypt failure here must not send
 /// one; it marks the row failed instead, same as any other genuinely lost
 /// delivery.
-pub(crate) async fn finish_incoming_file(
+pub async fn finish_incoming_file(
     session: &mut SessionState,
     ui_state: &mut UiState,
     from: UserId,

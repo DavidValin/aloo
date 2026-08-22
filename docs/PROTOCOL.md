@@ -3506,7 +3506,15 @@ For the two spends that carry the user's bytes verbatim - a file's content
 phase and a voice message - there is nowhere to bury a nonce without
 corrupting what lands on the receiver's disk, so the plaintext's own
 `sha256` stands in. It proves the same thing: only a party that decrypted
-the content can name it. A message typed while one is still
+the content can name it.
+
+None of this varies with framing. The nonce lives at the pad layer, above
+whatever the pad happens to be carrying, so a pair with `pq_hybrid` on both
+sides (an envelope inside the pad) and a pair with none (the plaintext
+inside the pad) acknowledge each other identically. What *does* vary is the
+cost: a `pq_hybrid` envelope is ~7KB of ML-DSA/ML-KEM/RSA regardless of the
+message, which for a short chat line is nearly all of the pad it spends -
+one of the two reasons `Direct` framing exists (§16.1). A message typed while one is still
 outstanding is held locally and sent the moment the ack for the previous
 one comes in; nothing about this queueing is itself visible on the wire.
 This is the same requirement the underlying pad-management tool enforces

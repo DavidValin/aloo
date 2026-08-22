@@ -539,8 +539,11 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
     // `PqHybrid` has no single RSA key here and never rotates it (it's a
     // static identity, like `Password`/`None`, but with its own separate
     // key material) - see `SessionState::own_keys`/`own_pq_private`.
-    let (own_keys, own_pq_private, own_pq_fp, own_pq_keys) = match my_identity {
-        ResolvedIdentity::Rsa(kp) => (Some(kp.private), None, None, None),
+    let (own_keys, own_pq_private, own_pq_fp, own_pq_keys, own_pinned_der) = match my_identity {
+        ResolvedIdentity::Rsa(kp) => {
+            let der = crate::crypto::public_key_to_der(&kp.private.to_public_key()).ok();
+            (Some(kp.private), None, None, None, der)
+        }
         ResolvedIdentity::Pq {
             private,
             public_der,
@@ -552,6 +555,11 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
                 Some(private),
                 crate::crypto::pq::fingerprint_of_encoded(&public_der),
                 Some(rotating),
+                // A `pq_hybrid` identity's pinned key is the encoded bundle
+                // itself - there is no RSA keypair here to derive one from,
+                // and without this a pad shared with a non-`pq` peer would
+                // have no name on this side (`otp::contact_name_for_peer`).
+                Some(public_der),
             )
         }
     };
@@ -580,10 +588,9 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
         call_level_tx,
         own_key_mode: key_mode,
         own_keys: own_keys.clone(),
-        otp_own_pinned_der: own_keys
-            .as_ref()
-            .filter(|_| crate::client::keymode_policy::uses_byte_comparison_pinning(key_mode))
-            .and_then(|k| crate::crypto::public_key_to_der(&k.to_public_key()).ok()),
+        otp_own_pinned_der: own_pinned_der
+            .clone()
+            .filter(|_| crate::client::keymode_policy::uses_byte_comparison_pinning(key_mode)),
         own_pq_private,
         own_pq_fp,
         own_pq_keys,
@@ -3477,6 +3484,24 @@ impl SessionState {
         &mut self.otp_store
     }
 
+    /// The OTP ciphertext this side staged for `stream_id`'s content
+    /// phase. Exposed for tests, which stand in for the chunked transport
+    /// by handing that file to the other session directly.
+    pub fn otp_send_temp_file(&self, stream_id: u64) -> Option<&std::path::PathBuf> {
+        self.otp_send_temp_files.get(&stream_id)
+    }
+
+    /// The bookkeeping a receive path registered for an arriving OTP
+    /// transfer - exposed for tests, which drive `otp::finish_incoming_file`
+    /// by hand rather than through a spawned worker.
+    pub fn take_otp_incoming_receive(
+        &mut self,
+        from: UserId,
+        stream_id: u64,
+    ) -> Option<crate::client::file_transfer::OtpIncomingFileReceive> {
+        self.otp_incoming_file_receives.remove(&(from, stream_id))
+    }
+
     /// Builds a session for tests, without a terminal, an audio device, a
     /// server or a peer.
     ///
@@ -3519,8 +3544,11 @@ impl SessionState {
 
         // The same split the real path makes - see there for why
         // `PqHybrid` has no `own_keys` and vice versa.
-        let (own_keys, own_pq_private, own_pq_fp, own_pq_keys) = match spec.identity {
-            ResolvedIdentity::Rsa(kp) => (Some(kp.private), None, None, None),
+        let (own_keys, own_pq_private, own_pq_fp, own_pq_keys, own_pinned_der) = match spec.identity {
+            ResolvedIdentity::Rsa(kp) => {
+                let der = crate::crypto::public_key_to_der(&kp.private.to_public_key()).ok();
+                (Some(kp.private), None, None, None, der)
+            }
             ResolvedIdentity::Pq {
                 private,
                 public_der,
@@ -3532,6 +3560,7 @@ impl SessionState {
                     Some(private),
                     crate::crypto::pq::fingerprint_of_encoded(&public_der),
                     Some(rotating),
+                    Some(public_der),
                 )
             }
         };
@@ -3557,7 +3586,9 @@ impl SessionState {
             call_level_tx,
             own_key_mode: spec.key_mode,
             own_keys,
-            otp_own_pinned_der: None,
+            otp_own_pinned_der: own_pinned_der.filter(|_| {
+                crate::client::keymode_policy::uses_byte_comparison_pinning(spec.key_mode)
+            }),
             own_pq_private,
             own_pq_fp,
             own_pq_keys,

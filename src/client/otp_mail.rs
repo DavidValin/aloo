@@ -117,7 +117,7 @@ pub fn mail_gate(
 }
 
 /// Runs the recipient checks for `nickname` - see `RecipientCheck`.
-pub(crate) async fn check_recipient(session: &SessionState, nickname: &str) -> RecipientCheck {
+pub async fn check_recipient(session: &SessionState, nickname: &str) -> RecipientCheck {
     let Some(own_fp) = session.own_pq_fp else {
         return RecipientCheck::NotPqIdentity;
     };

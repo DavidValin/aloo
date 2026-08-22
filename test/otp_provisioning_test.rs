@@ -18,12 +18,21 @@ fn fp(byte: u8) -> [u8; 32] {
     [byte; 32]
 }
 
+/// Every scratch directory this file makes lives under one root, wiped once
+/// per process - these tests generate real pad material, and a test that
+/// panics never reaches any cleanup of its own.
+fn temp_root() -> &'static std::path::Path {
+    static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    ROOT.get_or_init(|| {
+        let root = std::env::temp_dir().join("aloo-otp-provisioning-test");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("scratch root");
+        root
+    })
+}
+
 fn temp_dir(label: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "aloo-otp-provisioning-test-{label}-{}-{}",
-        std::process::id(),
-        fastrand_seed()
-    ));
+    let dir = temp_root().join(format!("{label}-{}-{}", std::process::id(), fastrand_seed()));
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }

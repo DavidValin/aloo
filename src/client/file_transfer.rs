@@ -148,7 +148,7 @@ pub(crate) struct ActiveFileTransfer {
 /// transfer; a voice message has no destination file at all, and instead
 /// becomes an ordinary `MessageBody::Voice` log entry once its bytes are
 /// decoded (`client::otp::finish_incoming_file`).
-pub(crate) enum OtpIncomingKind {
+pub enum OtpIncomingKind {
     File { final_path: PathBuf },
     Voice { duration_ms: u32 },
 }
@@ -170,11 +170,11 @@ pub(crate) enum OtpIncomingKind {
 /// has no separate accept step - its one offer/content seq is one and the
 /// same, known immediately, so `on_voice_offer` sets this to `Some` right
 /// away.
-pub(crate) struct OtpIncomingFileReceive {
-    pub(crate) contact_name: String,
-    pub(crate) seq: Option<u64>,
-    pub(crate) temp_path: PathBuf,
-    pub(crate) kind: OtpIncomingKind,
+pub struct OtpIncomingFileReceive {
+    pub contact_name: String,
+    pub seq: Option<u64>,
+    pub temp_path: PathBuf,
+    pub kind: OtpIncomingKind,
 }
 
 /// Progress/completion events for both directions of file transfer,

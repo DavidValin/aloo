@@ -959,6 +959,20 @@ This holds in both directions of use:
   sufficient, because holding the mirror pad is a stronger statement about
   who is speaking than holding an identity key is.
 
+It only takes *one* side to be missing `pq_hybrid` for the second case to
+apply, since an envelope needs both a sender who can sign it and a
+recipient who can open it. So a pair where only one has a `pq_hybrid`
+identity talks over the pad directly, exactly as a pair where neither does.
+Both sides work this out independently, from the keys themselves, and
+always reach the same answer.
+
+Two things this does not change: the pad's contact is still named from
+*keys* rather than nicknames, and every message is still acknowledged the
+same way (below). Offline mail is the one exception - it is stored and
+acknowledged by a server that holds no pad, so its sender binding is a
+signature and it needs `pq_hybrid`; a pure-pad pair is told so rather than
+falling back to something weaker.
+
 ### Proving an acknowledgement, without spending pad to do it
 
 The verdict says a message came from the right correspondent. It does not
