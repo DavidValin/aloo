@@ -54,38 +54,76 @@ pub struct ContactRow {
     /// `idstore::IdStore::key_mode` - `None` for a pin recorded before
     /// that field existed.
     pub key_mode: Option<KeyMode>,
-    /// `Some(name)` iff this contact is even *eligible* for OTP (pinned
-    /// under `KeyMode::PqHybrid`, with a fingerprint derivable from its
-    /// pinned key - `client::otp`'s own requirement, PROTOCOL.md's OTP
-    /// section) - the contact name `otp --add-contact`/`--show-contact`
-    /// would use for it. Independent of whether OTP is actually
-    /// provisioned yet (`otp: Some(_)` below) - "Install OTP key" is
-    /// offered whenever this is `Some` and `otp` is `None`.
+    /// The contact name `otp --add-contact`/`--show-contact` uses for this
+    /// nickname - fingerprint-derived under `pq_hybrid`, nickname-derived
+    /// otherwise (`otp_contact_name_for`). Independent of whether OTP is
+    /// actually provisioned yet (`otp: Some(_)` below); "Install OTP key"
+    /// is offered whenever `otp` is `None`.
     pub otp_contact_name: Option<String>,
     /// `Some` iff `otp_contact_name` names a keychain entry that already
     /// exists.
     pub otp: Option<ContactOtpDetail>,
 }
 
-/// The OTP contact name `nickname`'s pinned identity would use, if any -
-/// `None` when OTP isn't even eligible: it needs both sides on
-/// `pq_hybrid` (`client::otp`'s module doc), so a contact pinned under
-/// `Password`/`None`, or one recorded before `key_mode` was tracked at
-/// all, has nothing here to compute a name from. Never touches the
-/// keychain itself - just derives the name `otp_cli::has_contact`/
-/// `show_contact`/`add_contact`/`remove_contact` would all use for it.
+/// The `otp` keychain contact name to file `nickname`'s pad under.
+///
+/// Two derivations, and which one applies is what decides how that
+/// contact's traffic is framed (`client::otp::OtpFraming`): a `pq_hybrid`
+/// pin on both sides gives a fingerprint-derived name both machines
+/// compute identically, and anything else falls back to the nickname.
+/// Never `None` - every contact can hold a pad, since a pad installed by
+/// hand needs no identity to authenticate under. Never touches the
+/// keychain itself; just derives the name `otp_cli::has_contact`/
+/// `show_contact`/`add_contact`/`remove_contact` would all use.
 pub fn otp_contact_name_for(
     id_store: &IdStore,
     nickname: &str,
-    own_pq_fp: Option<[u8; 32]>,
+    own_identity: OwnIdentity<'_>,
 ) -> Option<String> {
-    if id_store.key_mode(nickname) != Some(KeyMode::PqHybrid) {
+    // Both sides on `pq_hybrid`: the name is derived from the two
+    // fingerprints, so both machines compute the identical one with nothing
+    // negotiated.
+    if id_store.key_mode(nickname) == Some(KeyMode::PqHybrid)
+        && let Some(own_fp) = own_identity.pq_fingerprint
+        && let Some(der) = id_store.get(nickname)
+        && let Some(peer_fp) = crate::crypto::pq::fingerprint_of_encoded(der)
+    {
+        return Some(crate::crypto::otp::contact_name_for(&own_fp, &peer_fp));
+    }
+    // No fingerprint to derive from, so the two pinned public keys are used
+    // instead - never the nickname, which proves nothing and would let an
+    // impersonator taking a familiar name spend the real contact's pad
+    // (`crypto::otp::contact_name_for_keys`).
+    //
+    // `None` when either side lacks a key stable across reconnects: a
+    // `KeyMode::None` peer is not pinned at all, so there is nothing to
+    // bind a pad to and no safe way to offer one.
+    if !crate::client::keymode_policy::uses_byte_comparison_pinning(id_store.key_mode(nickname)?) {
         return None;
     }
-    let own_fp = own_pq_fp?;
-    let der = id_store.get(nickname)?;
-    let peer_fp = crate::crypto::pq::fingerprint_of_encoded(der)?;
-    Some(crate::crypto::otp::contact_name_for(&own_fp, &peer_fp))
+    let peer_der = id_store.get(nickname)?;
+    let own_der = own_identity.pinned_public_der?;
+    Some(crate::crypto::otp::contact_name_for_keys(own_der, peer_der))
+}
+
+/// This side's own identity, as the contact-naming rules need to see it -
+/// the `pq_hybrid` fingerprint when there is one, and the pinned public key
+/// otherwise. Both are `Option` because either can be absent (no pq
+/// identity; or a `KeyMode::None` session with no stable key at all), and
+/// which one is used decides how a contact's pad is named.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OwnIdentity<'a> {
+    pub pq_fingerprint: Option<[u8; 32]>,
+    pub pinned_public_der: Option<&'a [u8]>,
+}
+
+/// This side's own identity as `SessionState` holds it - the one place
+/// the two representations are read out of a live session.
+pub fn own_identity_of(session: &SessionState) -> OwnIdentity<'_> {
+    OwnIdentity {
+        pq_fingerprint: session.own_pq_fp,
+        pinned_public_der: session.otp_own_pinned_der.as_deref(),
+    }
 }
 
 async fn otp_detail_for(cfg: &OtpCliConfig, contact_name: &str) -> Option<ContactOtpDetail> {
@@ -111,13 +149,13 @@ async fn otp_detail_for(cfg: &OtpCliConfig, contact_name: &str) -> Option<Contac
 pub async fn gather_contact_rows(
     id_store: &IdStore,
     otp_cli_cfg: &OtpCliConfig,
-    own_pq_fp: Option<[u8; 32]>,
+    own_identity: OwnIdentity<'_>,
 ) -> Vec<ContactRow> {
     let mut rows = Vec::new();
     for nickname in id_store.nicknames() {
         let last_seen_unix = id_store.last_seen_unix(&nickname);
         let key_mode = id_store.key_mode(&nickname);
-        let otp_contact_name = otp_contact_name_for(id_store, &nickname, own_pq_fp);
+        let otp_contact_name = otp_contact_name_for(id_store, &nickname, own_identity);
         let otp = match &otp_contact_name {
             Some(name) => otp_detail_for(otp_cli_cfg, name).await,
             None => None,
@@ -136,7 +174,7 @@ pub async fn gather_contact_rows(
 /// `UiAction::OpenContacts`/`RefreshContacts`'s shared handler: re-gathers
 /// every row and hands it to the modal.
 pub async fn handle_open(session: &SessionState, ui_state: &mut UiState) {
-    let rows = gather_contact_rows(&session.id_store, &session.otp_cli_cfg, session.own_pq_fp).await;
+    let rows = gather_contact_rows(&session.id_store, &session.otp_cli_cfg, own_identity_of(session)).await;
     ui_state.set_contacts_rows(rows);
 }
 
@@ -152,10 +190,10 @@ pub async fn delete_contact(
     id_store: &mut IdStore,
     otp_store: &mut OtpStore,
     otp_cli_cfg: &OtpCliConfig,
-    own_pq_fp: Option<[u8; 32]>,
+    own_identity: OwnIdentity<'_>,
     nickname: &str,
 ) -> bool {
-    if let Some(contact_name) = otp_contact_name_for(id_store, nickname, own_pq_fp) {
+    if let Some(contact_name) = otp_contact_name_for(id_store, nickname, own_identity) {
         if let Err(e) = otp_cli::remove_contact(otp_cli_cfg, &contact_name).await {
             crate::log_warn!("failed to remove otp keychain entry for {nickname}: {e}");
         }
@@ -172,11 +210,16 @@ pub async fn delete_contact(
 
 /// `UiAction::DeleteContact`'s handler.
 pub async fn handle_delete(session: &mut SessionState, ui_state: &mut UiState, nickname: String) {
+    let own_identity_owned = session.otp_own_pinned_der.clone();
+    let own_identity = OwnIdentity {
+        pq_fingerprint: session.own_pq_fp,
+        pinned_public_der: own_identity_owned.as_deref(),
+    };
     let removed = delete_contact(
         &mut session.id_store,
         &mut session.otp_store,
         &session.otp_cli_cfg,
-        session.own_pq_fp,
+        own_identity,
         &nickname,
     )
     .await;
@@ -190,9 +233,11 @@ pub async fn handle_delete(session: &mut SessionState, ui_state: &mut UiState, n
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InstallOtpKeyOutcome {
     Ok,
-    /// `nickname` isn't pinned under `pq_hybrid` - OTP needs both sides on
-    /// it (`client::otp`'s module doc), so there is no consistent contact
-    /// name to even attempt this under.
+    /// No keychain contact name could be derived for `nickname` at all.
+    /// Unreachable in practice now that every contact has one
+    /// (`otp_contact_name_for` always answers), but kept so a future
+    /// derivation that *can* fail has somewhere honest to report it rather
+    /// than being forced into `Error`.
     NotEligible,
     /// A file didn't validate, or `otp --add-contact` itself refused.
     Error(String),
@@ -211,20 +256,23 @@ fn validate_key_file(path: &Path) -> Result<(), String> {
 /// runs `otp --add-contact` directly against two key files the user
 /// already generated (with real `otp --new-key-pair`) and placed
 /// themselves, exactly the alternative the help overlay's OTP section
-/// already documents. Refuses up front (no subprocess spawned at all)
-/// when `nickname` isn't even OTP-eligible, rather than letting `otp` fail
-/// on a name that could never be derived consistently on the peer's side
-/// either.
+/// already documents.
+///
+/// Works for any contact, with or without a `pq_hybrid` identity: a pad
+/// installed here authenticates by itself, so no identity is needed to
+/// hold one (`client::otp::OtpFraming::Direct`). Both key files are stat'd
+/// before any subprocess runs, so a typo'd path fails here rather than
+/// somewhere inside `otp`.
 pub async fn install_otp_key(
     id_store: &IdStore,
     otp_store: &mut OtpStore,
     otp_cli_cfg: &OtpCliConfig,
-    own_pq_fp: Option<[u8; 32]>,
+    own_identity: OwnIdentity<'_>,
     nickname: &str,
     enc_path: &Path,
     dec_path: &Path,
 ) -> InstallOtpKeyOutcome {
-    let Some(contact_name) = otp_contact_name_for(id_store, nickname, own_pq_fp) else {
+    let Some(contact_name) = otp_contact_name_for(id_store, nickname, own_identity) else {
         return InstallOtpKeyOutcome::NotEligible;
     };
     if let Err(e) = validate_key_file(enc_path) {
@@ -251,11 +299,16 @@ pub async fn handle_install_otp_key(
     enc_path: PathBuf,
     dec_path: PathBuf,
 ) {
+    let own_identity_owned = session.otp_own_pinned_der.clone();
+    let own_identity = OwnIdentity {
+        pq_fingerprint: session.own_pq_fp,
+        pinned_public_der: own_identity_owned.as_deref(),
+    };
     let outcome = install_otp_key(
         &session.id_store,
         &mut session.otp_store,
         &session.otp_cli_cfg,
-        session.own_pq_fp,
+        own_identity,
         &nickname,
         &enc_path,
         &dec_path,
@@ -269,7 +322,7 @@ pub async fn handle_install_otp_key(
         }
         InstallOtpKeyOutcome::NotEligible => {
             ui_state.set_contacts_install_error(
-                "OTP needs this contact pinned under pq_hybrid on both sides".to_string(),
+                "no keychain name could be derived for this contact".to_string(),
             );
         }
         InstallOtpKeyOutcome::Error(e) => {

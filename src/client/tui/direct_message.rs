@@ -103,7 +103,7 @@ impl UiState {
     /// moves the top row's focus onto the DM selector, which names it from
     /// then on - `[` goes back to the channel selector, and the room stays
     /// on the DM one either way.
-    pub(crate) fn open_private_room(&mut self, peer: UserInfo) {
+    pub fn open_private_room(&mut self, peer: UserInfo) {
         let id = peer.id;
         self.known_users.insert(id, peer.clone());
         self.ensure_private_room(id, peer.clone());

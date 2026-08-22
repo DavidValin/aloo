@@ -207,7 +207,7 @@ impl UiState {
                 let row = self.contacts.as_ref()?.rows.get(self.contacts.as_ref()?.selected)?.clone();
                 if row.otp_contact_name.is_none() {
                     self.push_status_notice(
-                        "OTP needs this contact pinned under pq_hybrid on both sides".to_string(),
+                        "no keychain name could be derived for this contact".to_string(),
                         false,
                     );
                     return None;

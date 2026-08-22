@@ -52,7 +52,7 @@ fn encrypt_for_recipient(
 /// the log row already showing it (docs/PROTOCOL.md 7.2.1) - the peer's
 /// acknowledgement of that frame is what turns the row's indicator green.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn handle_send_text(
+pub async fn handle_send_text(
     wr: &mut impl crate::control::ControlSink,
     ui_state: &mut UiState,
     session: &mut SessionState,

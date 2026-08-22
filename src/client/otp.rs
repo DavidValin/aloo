@@ -103,14 +103,18 @@ impl OtpOutQueue {
 /// `Some(contact_name)` iff OTP is usable for this peer right now: their
 /// keychain contact has been marked provisioned in `session.otp_store`,
 /// either by a completed handshake (`apply_incoming_setup`/the ack path) or
-/// by `detect_or_adopt_existing` finding it already there. Implicitly
-/// requires `own_key_mode == PqHybrid`, since `own_pq_fp` is only ever
-/// `Some` in that case - OTP always rides on top of an established
-/// `pq_hybrid` identity, never a `Password`/`None` one.
-pub(crate) fn contact_name_if_active(session: &SessionState, peer_pubkey_der: &[u8]) -> Option<String> {
-    let own_fp = session.own_pq_fp?;
-    let peer_fp = crypto::pq::fingerprint_of_encoded(peer_pubkey_der)?;
-    let contact_name = crypto::otp::contact_name_for(&own_fp, &peer_fp);
+/// by `detect_or_adopt_existing` finding it already there.
+///
+/// Named exactly the way every other path names this pair
+/// (`contact_name_for_peer`), which is what makes a pure-OTP session
+/// usable: `/otp` will start one between two peers with no `pq_hybrid`
+/// between them so long as both identities survive a reconnect
+/// (`handle_otp_command`), and this is the lookup an ordinary send uses to
+/// find it. Deriving the name here from `pq` fingerprints alone would have
+/// left such a session reading as active while every message quietly went
+/// out without the pad.
+pub fn contact_name_if_active(session: &SessionState, peer_pubkey_der: &[u8]) -> Option<String> {
+    let contact_name = contact_name_for_peer(session, peer_pubkey_der)?;
     session
         .otp_store
         .get(&contact_name)
@@ -153,9 +157,22 @@ pub async fn detect_or_adopt_existing(
 /// unacked message for this contact (either genuinely the first message
 /// ever, or a real `OtpDeliveryAck` just cleared the gate) - see
 /// `direct_message`/`channel`'s send-path integration.
-pub async fn wrap_outgoing(cfg: &OtpCliConfig, pq_blob: Vec<u8>, contact_name: &str) -> Option<Vec<u8>> {
-    match otp_cli::encrypt_retrying(cfg, contact_name, &pq_blob, true).await {
-        Ok(OtpCliOutcome::Ok(bytes)) => Some(bytes),
+pub async fn wrap_outgoing(
+    cfg: &OtpCliConfig,
+    pq_blob: Vec<u8>,
+    contact_name: &str,
+) -> Option<(Vec<u8>, crypto::otp::AckProof)> {
+    // A fresh nonce rides inside every message, under the pad, so that its
+    // acknowledgement can be bound to *this* message rather than to a
+    // sequence number anyone could quote back. The sender keeps only the
+    // proof (`ack_proof_for`), which is all it needs to check the ack
+    // against - see `crypto::otp::AckProof`.
+    let nonce = crate::crypto::random_bytes(crypto::otp::ACK_NONCE_BYTES);
+    let proof = crypto::otp::ack_proof_for(&nonce);
+    let mut framed = nonce;
+    framed.extend_from_slice(&pq_blob);
+    match otp_cli::encrypt_retrying(cfg, contact_name, &framed, true).await {
+        Ok(OtpCliOutcome::Ok(bytes)) => Some((bytes, proof)),
         _ => None,
     }
 }
@@ -167,7 +184,10 @@ pub async fn wrap_outgoing(cfg: &OtpCliConfig, pq_blob: Vec<u8>, contact_name: &
 /// from an ordinary failure, and say so.
 #[derive(Debug)]
 pub enum UnwrapOutcome {
-    Ok(Vec<u8>),
+    /// The recovered payload, and the proof to acknowledge it with - the
+    /// hash of the nonce the sender buried inside it, which only a
+    /// successful decrypt could reveal.
+    Ok(Vec<u8>, crypto::otp::AckProof),
     /// `otp`'s own metadata validation refused this message; `reason` is
     /// its `stderr` explanation of which field(s) didn't match.
     Rejected(String),
@@ -181,7 +201,15 @@ pub enum UnwrapOutcome {
 /// counterpart of the encrypt side's genuine-remote-ack requirement.
 pub async fn unwrap_incoming(cfg: &OtpCliConfig, wire_bytes: &[u8], contact_name: &str) -> UnwrapOutcome {
     match otp_cli::decrypt_retrying(cfg, contact_name, wire_bytes, true).await {
-        Ok(OtpCliOutcome::Ok(bytes)) => UnwrapOutcome::Ok(bytes),
+        Ok(OtpCliOutcome::Ok(bytes)) => {
+            // Every message begins with the sender's ack nonce; anything
+            // shorter than one cannot be a message this build produced.
+            if bytes.len() < crypto::otp::ACK_NONCE_BYTES {
+                return UnwrapOutcome::Failed;
+            }
+            let (nonce, payload) = bytes.split_at(crypto::otp::ACK_NONCE_BYTES);
+            UnwrapOutcome::Ok(payload.to_vec(), crypto::otp::ack_proof_for(nonce))
+        }
         Ok(OtpCliOutcome::Rejected(reason)) => UnwrapOutcome::Rejected(reason),
         _ => UnwrapOutcome::Failed,
     }
@@ -202,9 +230,9 @@ async fn unwrap_or_notify(
     ui_state: &mut UiState,
     from: UserId,
     from_name: &str,
-) -> Option<Vec<u8>> {
+) -> Option<(Vec<u8>, crypto::otp::AckProof)> {
     match unwrap_incoming(cfg, wire_bytes, contact_name).await {
-        UnwrapOutcome::Ok(bytes) => Some(bytes),
+        UnwrapOutcome::Ok(bytes, proof) => Some((bytes, proof)),
         UnwrapOutcome::Rejected(reason) => {
             let reason = reason.trim().replace('\n', "; ");
             notify(
@@ -569,27 +597,31 @@ pub(crate) async fn handle_otp_command(
         .get(&peer)
         .map(|u| u.name.clone())
         .unwrap_or_default();
-    if key_mode != KeyMode::PqHybrid || session.own_key_mode != KeyMode::PqHybrid {
+    let framing = framing_for(session.own_key_mode, key_mode);
+    // Without `pq_hybrid` the pad is bound to the two pinned public keys,
+    // so both sides must actually *have* one that survives a reconnect. A
+    // `KeyMode::None` peer has no persistent identity by design
+    // (docs/PROTOCOL.md §12.2), which means nothing distinguishes them from
+    // anyone else who takes the same nickname - and spending pad on the
+    // wrong person destroys it for the right one, since the bytes are gone
+    // whether or not they could read them. Refused rather than risked.
+    if framing == OtpFraming::Direct
+        && !(crate::client::keymode_policy::uses_byte_comparison_pinning(key_mode)
+            && crate::client::keymode_policy::uses_byte_comparison_pinning(session.own_key_mode))
+    {
         notify(
             ui_state,
             peer,
             &peer_name,
-            "OTP session failed: both sides must use pq_hybrid".to_string(),
+            "OTP session failed: without pq_hybrid, both sides need an identity that persists \
+             across reconnects (password or pq_hybrid) - a 'none' identity cannot be told apart \
+             from someone reusing the nickname"
+                .to_string(),
             false,
         );
         return Ok(());
     }
-    let Some(own_fp) = session.own_pq_fp else {
-        notify(
-            ui_state,
-            peer,
-            &peer_name,
-            "OTP session failed: this session has no pq_hybrid identity".to_string(),
-            false,
-        );
-        return Ok(());
-    };
-    let Some(peer_fp) = crypto::pq::fingerprint_of_encoded(&peer_pubkey_der) else {
+    let Some(contact_name) = contact_name_for_peer(session, &peer_pubkey_der) else {
         notify(
             ui_state,
             peer,
@@ -599,7 +631,6 @@ pub(crate) async fn handle_otp_command(
         );
         return Ok(());
     };
-    let contact_name = crypto::otp::contact_name_for(&own_fp, &peer_fp);
 
     if !otp_cli::binary_available(&session.otp_cli_cfg) {
         notify(
@@ -629,6 +660,24 @@ pub(crate) async fn handle_otp_command(
 
     let already_have_key =
         detect_or_adopt_existing(&session.otp_cli_cfg, &mut session.otp_store, &contact_name).await;
+
+    // Without `pq_hybrid` on both sides there is no channel to share a
+    // freshly generated pad over - the handshake that carries one is itself
+    // an ordinary `pq_hybrid` send. A pad that is *already* installed on
+    // both sides needs no such channel, though, so this refuses only the
+    // generate-and-share path, never the resume path.
+    if framing == OtpFraming::Direct && !already_have_key {
+        notify(
+            ui_state,
+            peer,
+            &peer_name,
+            "OTP session failed: without pq_hybrid a pad cannot be shared over the network - \
+             generate one with 'otp --new-key-pair' and install it on both sides from /contacts (o)"
+                .to_string(),
+            false,
+        );
+        return Ok(());
+    }
 
     if already_have_key {
         let payload = crypto::otp::OtpSessionRequestPayload {
@@ -1972,9 +2021,115 @@ pub(crate) async fn poll_key_status(session: &SessionState, ui_state: &mut UiSta
 /// fingerprint isn't available (we're not `pq_hybrid`, or the peer's bytes
 /// don't decode as a `PqPublicBundle`).
 fn contact_name_for_peer(session: &SessionState, peer_pubkey_der: &[u8]) -> Option<String> {
-    let own_fp = session.own_pq_fp?;
-    let peer_fp = crypto::pq::fingerprint_of_encoded(peer_pubkey_der)?;
-    Some(crypto::otp::contact_name_for(&own_fp, &peer_fp))
+    match framing_for(session.own_key_mode, peer_key_mode_of(peer_pubkey_der, session)) {
+        OtpFraming::PqWrapped => {
+            let own_fp = session.own_pq_fp?;
+            let peer_fp = crypto::pq::fingerprint_of_encoded(peer_pubkey_der)?;
+            Some(crypto::otp::contact_name_for(&own_fp, &peer_fp))
+        }
+        // No pq identity on one side or the other, so there is no
+        // fingerprint - the name comes from the two pinned public keys
+        // instead. Never from the nickname: see
+        // `crypto::otp::contact_name_for_keys` for what that would have
+        // cost. `None` when this side has no stable key of its own to
+        // derive from, which is exactly the `KeyMode::None` case
+        // `handle_otp_command` refuses outright.
+        OtpFraming::Direct => {
+            let own_der = own_pinned_public_der(session)?;
+            Some(crypto::otp::contact_name_for_keys(&own_der, peer_pubkey_der))
+        }
+    }
+}
+
+/// This side's own pinned public key, in the same encoding a peer would
+/// announce it in - the local half of `contact_name_for_keys`.
+///
+/// `None` for `KeyMode::None`, whose keypair is generated fresh on every
+/// connect: there is nothing stable to derive a contact name from, and a
+/// name that changed every session would file each reconnect under a
+/// different pad.
+fn own_pinned_public_der(session: &SessionState) -> Option<Vec<u8>> {
+    if !crate::client::keymode_policy::uses_byte_comparison_pinning(session.own_key_mode) {
+        return None;
+    }
+    let own = session.own_keys.as_ref()?;
+    crypto::public_key_to_der(&own.to_public_key()).ok()
+}
+
+/// Whether `peer_pubkey_der` parses as a `pq_hybrid` bundle - the only
+/// thing that distinguishes a peer able to carry an inner envelope from one
+/// that is not. Read from the key itself rather than a stored `KeyMode` so
+/// the two can never disagree.
+fn peer_key_mode_of(peer_pubkey_der: &[u8], _session: &SessionState) -> KeyMode {
+    if crypto::pq::fingerprint_of_encoded(peer_pubkey_der).is_some() {
+        KeyMode::PqHybrid
+    } else {
+        KeyMode::None
+    }
+}
+
+/// The message body carried directly in a `Direct`-framed envelope - its
+/// single block is the plaintext, not a sealed blob.
+///
+/// Mirrors `session::decrypt_envelope_for`'s contract exactly (only
+/// `Content::Text` produces a body; anything else is routed elsewhere), so
+/// the two framings behave identically from the caller's point of view.
+fn direct_body(envelope: &Envelope) -> Option<crate::client::tui::ui::MessageBody> {
+    if envelope.content != Content::Text {
+        return None;
+    }
+    let plaintext = envelope.blocks.first()?;
+    Some(crate::client::tui::ui::MessageBody::Text(
+        String::from_utf8_lossy(plaintext).into_owned(),
+    ))
+}
+
+/// `direct_body`'s file-offer counterpart - mirrors
+/// `session::decrypt_file_offer`'s contract for `Direct` framing.
+fn direct_file_offer(
+    envelope: &Envelope,
+) -> Option<crate::client::file_transfer::FileOfferPayload> {
+    if envelope.content != Content::FileOffer {
+        return None;
+    }
+    proto::decode(envelope.blocks.first()?).ok()
+}
+
+/// How one contact's OTP traffic is framed inside the pad.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OtpFraming {
+    /// The ordinary case: an ordinary `pq_hybrid` envelope is built first
+    /// and *that* is what goes through `otp --encrypt`. The envelope's own
+    /// signature and the pad's decrypt verdict both apply.
+    PqWrapped,
+    /// One side or the other has no `pq_hybrid` identity, so there is no
+    /// envelope to build: the message's plaintext goes straight into the
+    /// pad.
+    ///
+    /// Authentication is then entirely the decrypt verdict - a message is
+    /// accepted only if `otp` confirms it was produced by the holder of the
+    /// mirror key at the expected offset and is next in sequence
+    /// (`docs/SPEC.md`, "How a pad-wrapped message authenticates itself").
+    /// That is a *stronger* statement about who is speaking than an
+    /// identity signature would be, since it is tied to the specific key
+    /// position rather than merely to a keypair - so nothing is given up by
+    /// dropping the envelope here.
+    ///
+    /// It also stops a pad being spent on ~7KB of ML-DSA/ML-KEM/RSA
+    /// overhead per message, which for a short chat line was the
+    /// overwhelming majority of what each message cost.
+    Direct,
+}
+
+/// Which framing applies between these two. `PqWrapped` needs `pq_hybrid`
+/// on *both* sides - an envelope can only be built if this side can sign
+/// one and the other can open it - so anything else is `Direct`.
+pub fn framing_for(own_key_mode: KeyMode, peer_key_mode: KeyMode) -> OtpFraming {
+    if own_key_mode == KeyMode::PqHybrid && peer_key_mode == KeyMode::PqHybrid {
+        OtpFraming::PqWrapped
+    } else {
+        OtpFraming::Direct
+    }
 }
 
 /// `id`'s display name, for a call site (`send_now`/`send_or_queue`) that
@@ -2015,28 +2170,47 @@ async fn send_now(
     }
     let send_id = session.next_stream_id;
     session.next_stream_id += 1;
-    let Some(envelope) = crate::client::envelope::encrypt_envelope_for(
-        session.own_pq_private.as_ref(),
-        session.pq_peer_keys.encap_for(to),
-        recipient_key_mode,
-        recipient_pubkey_der,
-        channel.clone(),
-        send_id,
-        plaintext,
-        content,
-    ) else {
-        let peer_name = peer_name_for(ui_state, to);
-        notify(
-            ui_state,
-            to,
-            &peer_name,
-            "OTP: failed to build the underlying pq_hybrid envelope - message not sent".to_string(),
-            false,
-        );
-        if let Some(idx) = log_index {
-            ui_state.mark_dm_message_failed(to, idx);
+    // With `pq_hybrid` on both sides the pad wraps an ordinary envelope;
+    // without it there is no envelope to build and the plaintext goes
+    // straight into the pad, authenticated by the decrypt verdict alone -
+    // see `OtpFraming`.
+    let envelope = match framing_for(session.own_key_mode, recipient_key_mode) {
+        OtpFraming::Direct => Envelope {
+            content,
+            // Not a sealed blob: this is the plaintext itself, and it is
+            // safe here precisely because everything below is about to be
+            // one-time-pad encrypted. `Envelope` is reused rather than a
+            // parallel shape so `content` still routes the message the same
+            // way at the far end.
+            blocks: vec![plaintext.to_vec()],
+        },
+        OtpFraming::PqWrapped => {
+            let Some(envelope) = crate::client::envelope::encrypt_envelope_for(
+                session.own_pq_private.as_ref(),
+                session.pq_peer_keys.encap_for(to),
+                recipient_key_mode,
+                recipient_pubkey_der,
+                channel.clone(),
+                send_id,
+                plaintext,
+                content,
+            ) else {
+                let peer_name = peer_name_for(ui_state, to);
+                notify(
+                    ui_state,
+                    to,
+                    &peer_name,
+                    "OTP: failed to build the underlying pq_hybrid envelope - message not sent"
+                        .to_string(),
+                    false,
+                );
+                if let Some(idx) = log_index {
+                    ui_state.mark_dm_message_failed(to, idx);
+                }
+                return Ok(());
+            };
+            envelope
         }
-        return Ok(());
     };
     let Some(pq_blob) = envelope.blocks.first().cloned() else {
         return Ok(());
@@ -2062,6 +2236,7 @@ async fn send_now(
         .get(contact_name)
         .map(|s| s.next_out_seq)
         .unwrap_or(0);
+    let (wrapped, ack_proof) = wrapped;
     let mut otp_envelope = envelope;
     otp_envelope.blocks = vec![wrapped];
     session.otp_store.record_sent(
@@ -2070,6 +2245,7 @@ async fn send_now(
         crate::client::otp_store::PendingOtpContent::Text {
             channel: channel.clone(),
         },
+        Some(ack_proof),
     );
     let _ = session.otp_store.save();
     refresh_otp_key_status(&session.otp_cli_cfg, ui_state, to, contact_name).await;
@@ -2083,6 +2259,10 @@ async fn send_now(
             envelope: otp_envelope,
         },
     );
+    if let Some(msg_id) = msg_id {
+        ui_state.mark_awaiting_pad_ack(to, msg_id);
+        session.otp_ack_rows.insert((contact_name.to_string(), seq), msg_id);
+    }
     crate::client::session::request_rotation(session, to);
     Ok(())
 }
@@ -2098,7 +2278,7 @@ async fn send_now(
 /// independently per recipient and there is no single row a "this one
 /// failed" mark could unambiguously apply to.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn send_or_queue(
+pub async fn send_or_queue(
     wr: &mut impl crate::control::ControlSink,
     session: &mut SessionState,
     ui_state: &mut UiState,
@@ -2117,6 +2297,17 @@ pub(crate) async fn send_or_queue(
         .get(contact_name)
         .and_then(|s| s.pending_unacked_out_seq)
         .is_some();
+    // The pad as a second factor, folded into the same gate. Holding the
+    // identity key that selects a contact is not the same as holding that
+    // contact's pad, and the only way to clear `pending_unacked_out_seq` is
+    // an acknowledgement carrying the proof buried under that pad. So one
+    // message goes out on the strength of the identity alone, and
+    // everything after it waits until the peer has demonstrated possession.
+    //
+    // The bound is what matters: a peer with a stolen identity key but no
+    // pad extracts exactly one message, and even that is not lost - nothing
+    // overwrites its `.last_sent` copy while this gate holds, so it is
+    // still deliverable to the genuine contact afterwards.
     if unacked {
         let item = match channel {
             Some(ch) => PendingOtpSend::Channel {
@@ -2299,6 +2490,7 @@ pub(crate) async fn send_file_offer(
         .get(contact_name)
         .map(|s| s.next_out_seq)
         .unwrap_or(0);
+    let (wrapped, ack_proof) = wrapped;
     let mut otp_envelope = envelope;
     otp_envelope.blocks = vec![wrapped];
     session.otp_store.record_sent(
@@ -2309,6 +2501,7 @@ pub(crate) async fn send_file_offer(
             filename: filename.clone(),
             size,
         },
+        Some(ack_proof),
     );
     let _ = session.otp_store.save();
     refresh_otp_key_status(&session.otp_cli_cfg, ui_state, to, contact_name).await;
@@ -2334,6 +2527,8 @@ pub(crate) async fn send_file_offer(
             envelope: otp_envelope,
         },
     );
+    ui_state.mark_awaiting_pad_ack(to, msg_id);
+    session.otp_ack_rows.insert((contact_name.to_string(), seq), msg_id);
     crate::client::session::request_rotation(session, to);
     Ok(())
 }
@@ -2393,6 +2588,10 @@ pub(crate) async fn send_voice_offer(
     let cipher_path = temp_content_path(&session.otp_cli_cfg, "otp-voice-cipher");
     let outcome =
         otp_cli::encrypt_file_retrying(&session.otp_cli_cfg, contact_name, &plain_path, &cipher_path, true).await;
+    // Taken before the plaintext is wiped: the PCM *is* this spend's
+    // payload, so its digest is what the receiver will be able to prove
+    // (`crypto::otp::ack_proof_for_file`).
+    let ack_proof = crate::crypto::otp::ack_proof_for_file(&plain_path).ok();
     secure_remove_file(&plain_path);
     if !matches!(outcome, Ok(otp_cli::FileCliOutcome::Ok)) {
         secure_remove_file(&cipher_path);
@@ -2466,6 +2665,7 @@ pub(crate) async fn send_voice_offer(
         contact_name,
         seq,
         crate::client::otp_store::PendingOtpContent::Voice { duration_ms },
+        ack_proof,
     );
     let _ = session.otp_store.save();
     refresh_otp_key_status(&session.otp_cli_cfg, ui_state, to, contact_name).await;
@@ -2490,6 +2690,10 @@ pub(crate) async fn send_voice_offer(
             envelope,
         },
     );
+    if let Some(msg_id) = msg_id {
+        ui_state.mark_awaiting_pad_ack(to, msg_id);
+        session.otp_ack_rows.insert((contact_name.to_string(), seq), msg_id);
+    }
     crate::client::session::request_rotation(session, to);
     Ok(())
 }
@@ -2501,31 +2705,36 @@ pub(crate) async fn send_voice_offer(
 /// succeeded - see the module doc for why that's always safe to do
 /// immediately and unconditionally, unlike the encrypt side's ack-gating.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn on_message(
+pub async fn on_message(
     session: &mut SessionState,
     ui_state: &mut UiState,
     channel: Option<String>,
     from: UserId,
     from_name: String,
     seq: u64,
-    msg_id: Option<u64>,
+    // Carried for symmetry with an ordinary send, and read by the *sender*
+    // to find this message's own row - never consumed here, because a
+    // pad-protected leg reports its delivery through `OtpDeliveryAck`
+    // rather than through the `DeliveryReceipt` this id would name
+    // (`client::tui::ui::DeliveryProof`).
+    _msg_id: Option<u64>,
     envelope: Envelope,
-) {
+) -> proto::Result<()> {
     let Some(sender) = ui_state.known_users.get(&from).cloned() else {
-        return;
+        return Ok(());
     };
     let Some(contact_name) = contact_name_for_peer(session, &sender.public_key_der) else {
-        return;
+        return Ok(());
     };
     let Some(blob) = envelope.blocks.first() else {
-        return;
+        return Ok(());
     };
     // Checked *before* `otp --decrypt` runs, not after - a resend of a
     // message this contact's counter already moved past (the peer decrypted
     // it fine; only the ack got lost) must never reach the pad a second
     // time. See `OtpStore::is_next_expected`'s doc.
     if !session.otp_store.is_next_expected(&contact_name, seq) {
-        return;
+        return Ok(());
     }
     // Taken *before* the decrypt spends this message's key bytes: the row
     // logged below records which part of the pad was this message's, and
@@ -2536,40 +2745,43 @@ pub(crate) async fn on_message(
     let Some(pq_blob) =
         unwrap_or_notify(&session.otp_cli_cfg, blob, &contact_name, ui_state, from, &from_name).await
     else {
-        return;
+        return Ok(());
     };
+    let (pq_blob, ack_proof) = pq_blob;
     if !session.otp_store.record_received(&contact_name, seq) {
-        return;
+        return Ok(());
     }
-    let _ = session.otp_store.save();
     let mut inner = envelope;
     inner.blocks = vec![pq_blob];
-    if let Some(body) = crate::client::session::decrypt_envelope_for(
-        inner,
-        from,
-        &sender,
-        channel.as_deref(),
-        session,
-    ) {
+    // With `pq_hybrid` there is a sealed envelope inside the pad to open;
+    // without it the pad's plaintext *is* the message, already authenticated
+    // by the decrypt verdict that got us here (`OtpFraming`).
+    let body = match framing_for(session.own_key_mode, peer_key_mode_of(&sender.public_key_der, session)) {
+        OtpFraming::Direct => direct_body(&inner),
+        OtpFraming::PqWrapped => crate::client::session::decrypt_envelope_for(
+            inner,
+            from,
+            &sender,
+            channel.as_deref(),
+            session,
+        ),
+    };
+    if let Some(body) = body {
         match &channel {
             Some(ch) => ui_state.on_channel_message(ch, from, from_name, body),
             None => ui_state.on_direct_message(from, from_name, body),
         }
         refresh_otp_key_status(&session.otp_cli_cfg, ui_state, from, &contact_name).await;
-        // Two acknowledgements, answering two different questions: the
-        // receipt says this message was readable (7.2.1), the ack releases
-        // this contact's pad gate for the next send (16.2).
-        crate::client::session::send_delivery_receipt(
-            session,
-            from,
-            msg_id,
-            crate::p2p_proto::ReceiptStage::Decrypted,
-        );
+        // No ordinary `DeliveryReceipt` here. It would say exactly what
+        // the ack below already says, except unprovenly - and the sender's
+        // row would ignore it anyway, since a pad-protected leg accepts
+        // only the pad's own acknowledgement (`DeliveryProof`).
         crate::client::session::request_rotation(session, from);
         session
             .peer_link
-            .send_reliable_or_queue(from, P2pPayload::OtpDeliveryAck { seq });
+            .send_reliable_or_queue(from, P2pPayload::OtpDeliveryAck { seq, proof: ack_proof });
     }
+    Ok(())
 }
 
 /// `on_message`'s file-offer counterpart, for `P2pEvent::OtpFileOffer` -
@@ -2614,20 +2826,26 @@ pub(crate) async fn on_file_offer(
     else {
         return;
     };
+    let (pq_blob, ack_proof) = pq_blob;
     if !session.otp_store.record_received(&contact_name, seq) {
         return;
     }
-    let _ = session.otp_store.save();
     refresh_otp_key_status(&session.otp_cli_cfg, ui_state, from, &contact_name).await;
     let mut inner = envelope;
     inner.blocks = vec![pq_blob];
-    let Some(payload) = crate::client::session::decrypt_file_offer(
-        &inner,
-        from,
-        &sender,
-        channel.as_deref(),
-        session,
-    ) else {
+    // Same split as `on_message`: sealed envelope under `pq_hybrid`, bare
+    // plaintext without it.
+    let payload = match framing_for(session.own_key_mode, peer_key_mode_of(&sender.public_key_der, session)) {
+        OtpFraming::Direct => direct_file_offer(&inner),
+        OtpFraming::PqWrapped => crate::client::session::decrypt_file_offer(
+            &inner,
+            from,
+            &sender,
+            channel.as_deref(),
+            session,
+        ),
+    };
+    let Some(payload) = payload else {
         return;
     };
     let filename = crate::client::file_transfer::truncate_filename(&payload.filename);
@@ -2648,7 +2866,7 @@ pub(crate) async fn on_file_offer(
     crate::client::session::request_rotation(session, from);
     session
         .peer_link
-        .send_reliable_or_queue(from, P2pPayload::OtpDeliveryAck { seq });
+        .send_reliable_or_queue(from, P2pPayload::OtpDeliveryAck { seq, proof: ack_proof });
 }
 
 /// `on_file_offer`'s voice counterpart, for `P2pEvent::OtpVoiceOffer`.
@@ -2725,12 +2943,13 @@ pub(crate) async fn on_voice_offer(
 /// except here only one item is ever released per ack rather than the
 /// whole queue at once, since a fresh ack only ever authorises one more
 /// send before the next ack is needed.
-pub(crate) async fn on_delivery_ack(
+pub async fn on_delivery_ack(
     wr: &mut impl crate::control::ControlSink,
     ui_state: &mut UiState,
     session: &mut SessionState,
     from: UserId,
     seq: u64,
+    proof: crate::crypto::otp::AckProof,
 ) -> proto::Result<()> {
     let Some(sender) = ui_state.known_users.get(&from).cloned() else {
         return Ok(());
@@ -2738,8 +2957,22 @@ pub(crate) async fn on_delivery_ack(
     let Some(contact_name) = contact_name_for_peer(session, &sender.public_key_der) else {
         return Ok(());
     };
-    if !session.otp_store.record_acked(&contact_name, seq) {
+    // `record_acked` refuses a `proof` that doesn't match what was buried
+    // under the pad of the message `seq` names, which is what keeps the
+    // gate closed against anyone who saw the packet but could not open it.
+    if !session.otp_store.record_acked(&contact_name, seq, Some(proof)) {
         return Ok(());
+    }
+    // The proof held, so this is also the strongest statement available
+    // that the peer read the message - and on a pad-protected leg it is
+    // the *only* one the row will accept (`DeliveryProof`).
+    if let Some(msg_id) = session.otp_ack_rows.remove(&(contact_name.clone(), seq)) {
+        ui_state.mark_delivered(
+            from,
+            msg_id,
+            crate::p2p_proto::ReceiptStage::Decrypted,
+            crate::client::tui::ui::DeliveryProof::PadAck,
+        );
     }
     let _ = session.otp_store.save();
     flush_one_queued(wr, ui_state, session, &contact_name).await
@@ -2883,6 +3116,9 @@ pub(crate) async fn start_outgoing_file_content(
     let temp_path = temp_content_path(&session.otp_cli_cfg, "otp-send");
     let outcome =
         otp_cli::encrypt_file_retrying(&session.otp_cli_cfg, &contact_name, &target.path, &temp_path, true).await;
+    // Same substitute as a voice message's, for the same reason: the file's
+    // own bytes are the pad plaintext, so there is no room to bury a nonce.
+    let ack_proof = crate::crypto::otp::ack_proof_for_file(&target.path).ok();
     match outcome {
         Ok(otp_cli::FileCliOutcome::Ok) => {
             restrict_file_permissions(&temp_path);
@@ -2896,12 +3132,21 @@ pub(crate) async fn start_outgoing_file_content(
                 &contact_name,
                 seq,
                 crate::client::otp_store::PendingOtpContent::FileContent { stream_id },
+                ack_proof,
             );
             let _ = session.otp_store.save();
             refresh_otp_key_status(&session.otp_cli_cfg, ui_state, to, &contact_name).await;
             session
                 .peer_link
                 .send_reliable_or_queue(to, P2pPayload::OtpFileContentSeq { stream_id, seq });
+            // The content phase reports onto the offer's own row - there is
+            // only ever one row per transfer, and it is not finished until
+            // the bytes have actually landed.
+            let row = ui_state.own_stream_msg_id(stream_id);
+            if let Some(msg_id) = row {
+                ui_state.mark_awaiting_pad_ack(to, msg_id);
+                session.otp_ack_rows.insert((contact_name.to_string(), seq), msg_id);
+            }
             crate::client::file_transfer::spawn_send_file_worker(
                 temp_path,
                 target.key,
@@ -2999,6 +3244,11 @@ pub(crate) async fn finish_incoming_file(
         notify(ui_state, from, &from_name, message, false);
         return;
     }
+    // Read off the plaintext before the Voice arm below wipes it - this is
+    // the whole-file spend's stand-in for a nonce, and only a party that
+    // genuinely decrypted the content can produce it
+    // (`crypto::otp::ack_proof_for_file`).
+    let ack_proof = crate::crypto::otp::ack_proof_for_file(&decrypt_dest).ok();
     refresh_otp_key_status(&session.otp_cli_cfg, ui_state, from, &pending.contact_name).await;
     match pending.kind {
         OtpIncomingKind::File { .. } => ui_state.set_file_completed(from, stream_id),
@@ -3018,10 +3268,10 @@ pub(crate) async fn finish_incoming_file(
     // decrypting before its own `OtpFileContentSeq` ever arrived - not
     // possible over an ordered reliable link (it's always sent first), but
     // guarded rather than assumed; nothing to ack in that case.
-    if let Some(seq) = pending.seq {
+    if let (Some(seq), Some(proof)) = (pending.seq, ack_proof) {
         session
             .peer_link
-            .send_reliable_or_queue(from, P2pPayload::OtpDeliveryAck { seq });
+            .send_reliable_or_queue(from, P2pPayload::OtpDeliveryAck { seq, proof });
     }
 }
 
@@ -3212,7 +3462,7 @@ async fn recover_and_resend_text(
     // gets through turns that row green rather than leaving it
     // undelivered forever (docs/PROTOCOL.md 7.2.1).
     let msg_id = session
-        .otp_text_msg_ids
+        .otp_ack_rows
         .get(&(contact_name.to_string(), seq))
         .copied();
     session.peer_link.ensure_link(wr, to).await;

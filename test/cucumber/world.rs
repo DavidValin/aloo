@@ -273,6 +273,11 @@ pub struct AlooWorld {
     /// The most recently wrapped wire bytes, for a scenario that inspects
     /// them directly.
     pub otp_wrapped: Vec<u8>,
+    /// The acknowledgement proof the *sender* derived when wrapping, and
+    /// the one the *receiver* derived when unwrapping - kept apart so a
+    /// scenario can assert the two sides reached it independently.
+    pub otp_ack_proof: Option<[u8; 32]>,
+    pub otp_unwrapped_ack_proof: Option<[u8; 32]>,
     /// Whether `detect_or_adopt_existing` adopted a contact.
     pub otp_adopted: bool,
     /// Which side conceded in a simultaneous-invitation scenario.

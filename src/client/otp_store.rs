@@ -116,6 +116,16 @@ pub struct OtpContactState {
     /// contact this side has stopped actively using for now, resumable with
     /// its existing pad via `/otp`.
     pub pending_end_notice: bool,
+    /// What the peer's acknowledgement of `pending_unacked_out_seq` must
+    /// carry to be believed: `sha256` of the nonce buried inside that
+    /// message (`crypto::otp::AckProof`).
+    ///
+    /// Persisted rather than kept in memory because the gate it guards is
+    /// persisted: a message still awaiting acknowledgement across a restart
+    /// must still be checkable when the ack finally arrives, or the only
+    /// options would be trusting an unverified ack or wedging the contact
+    /// forever.
+    pub pending_ack_proof: Option<[u8; 32]>,
 }
 
 /// A `contact_name -> OtpContactState` store, backed by a small flat file:
@@ -250,6 +260,7 @@ impl OtpStore {
         let state = self.entries.entry(contact_name.to_string()).or_default();
         state.pending_unacked_out_seq = None;
         state.pending_content = None;
+        state.pending_ack_proof = None;
         state.pending_setup_size_mb = None;
         state.pending_end_notice = true;
     }
@@ -261,6 +272,7 @@ impl OtpStore {
         let state = self.entries.entry(contact_name.to_string()).or_default();
         state.pending_unacked_out_seq = None;
         state.pending_content = None;
+        state.pending_ack_proof = None;
         state.pending_setup_size_mb = None;
     }
 
@@ -284,21 +296,48 @@ impl OtpStore {
             .filter_map(|(name, state)| state.pending_end_notice.then_some(name.as_str()))
     }
 
-    pub fn record_sent(&mut self, contact_name: &str, seq: u64, content: PendingOtpContent) {
+    pub fn record_sent(
+        &mut self,
+        contact_name: &str,
+        seq: u64,
+        content: PendingOtpContent,
+        ack_proof: Option<[u8; 32]>,
+    ) {
         let state = self.entries.entry(contact_name.to_string()).or_default();
         state.pending_unacked_out_seq = Some(seq);
         state.pending_content = Some(content);
+        state.pending_ack_proof = ack_proof;
         state.next_out_seq = state.next_out_seq.max(seq + 1);
     }
 
     /// Clears `pending_unacked_out_seq` iff it currently equals `seq` -
     /// refusing a stale or mismatched ack rather than trusting it blindly.
     /// Returns whether it actually cleared anything.
-    pub fn record_acked(&mut self, contact_name: &str, seq: u64) -> bool {
+    pub fn record_acked(
+        &mut self,
+        contact_name: &str,
+        seq: u64,
+        proof: Option<[u8; 32]>,
+    ) -> bool {
         match self.entries.get_mut(contact_name) {
             Some(state) if state.pending_unacked_out_seq == Some(seq) => {
+                // The acknowledgement has to prove it came from someone who
+                // actually decrypted the message it names. A `seq` alone is
+                // quotable by anyone who saw the packet; the proof is not,
+                // since it needs the nonce that only the pad reveals.
+                //
+                // An expectation of `None` means the message predates this
+                // check (sent by an older build, or recovered from a store
+                // written before the field existed) - accepted, since
+                // refusing would wedge the contact permanently.
+                if let Some(expected) = state.pending_ack_proof
+                    && proof != Some(expected)
+                {
+                    return false;
+                }
                 state.pending_unacked_out_seq = None;
                 state.pending_content = None;
+                state.pending_ack_proof = None;
                 true
             }
             _ => false,
@@ -374,6 +413,10 @@ impl OtpStore {
             out.push('\t');
             if state.pending_end_notice {
                 out.push('1');
+            }
+            out.push('\t');
+            if let Some(proof) = state.pending_ack_proof {
+                out.push_str(&crate::crypto::hex_encode(&proof));
             }
             out.push('\n');
         }
@@ -466,6 +509,14 @@ fn parse_line(line: &str) -> Option<(String, OtpContactState)> {
     // "no notice owed" - the correct reading of a store written before
     // `/endotp` existed at all.
     let pending_end_notice = parts.next() == Some("1");
+    // Same evolutionary tolerance every trailing field here gets: absent or
+    // empty reads as "no proof recorded", which `record_acked` treats as a
+    // message predating the check rather than one to refuse.
+    let pending_ack_proof = parts
+        .next()
+        .filter(|s| !s.is_empty())
+        .and_then(crate::crypto::hex_decode)
+        .and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok());
     Some((
         name,
         OtpContactState {
@@ -476,6 +527,7 @@ fn parse_line(line: &str) -> Option<(String, OtpContactState)> {
             next_expected_in_seq,
             pending_setup_size_mb,
             pending_end_notice,
+            pending_ack_proof,
         },
     ))
 }

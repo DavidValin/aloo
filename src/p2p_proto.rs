@@ -279,8 +279,15 @@ pub enum P2pPayload {
     /// *and* successfully delivered locally - the genuine network
     /// acknowledgement that lets the sender honestly pass `-y` to `otp`'s
     /// own delivery-confirmation gate for its next send to this contact.
+    /// `proof` binds the acknowledgement to the message it names, so that
+    /// only a party that genuinely decrypted it can clear the gate: it is
+    /// `sha256` of the nonce buried under that message's pad, or of the
+    /// plaintext file for a content-phase spend
+    /// (`crypto::otp::ack_proof_for`/`ack_proof_for_file`). A bare `seq`
+    /// would have been quotable by anyone who saw the packet go past.
     OtpDeliveryAck {
         seq: u64,
+        proof: [u8; 32],
     },
     /// Names an accepted file transfer's *content*-phase OTP pad slot,
     /// sent once, reliably, right after the sender reserves it (once the

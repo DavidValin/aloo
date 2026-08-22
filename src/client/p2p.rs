@@ -395,6 +395,7 @@ pub enum P2pEvent {
     OtpDeliveryAck {
         from: UserId,
         seq: u64,
+        proof: [u8; 32],
     },
     /// Mirrors `p2p_proto::P2pPayload::OtpFileContentSeq` - names an
     /// accepted file transfer's content-phase pad slot, independent of the
@@ -1467,7 +1468,9 @@ impl PeerLinkManager {
                 msg_id,
                 envelope,
             },
-            P2pPayload::OtpDeliveryAck { seq } => P2pEvent::OtpDeliveryAck { from, seq },
+            P2pPayload::OtpDeliveryAck { seq, proof } => {
+                P2pEvent::OtpDeliveryAck { from, seq, proof }
+            }
             P2pPayload::OtpFileContentSeq { stream_id, seq } => {
                 P2pEvent::OtpFileContentSeq { from, stream_id, seq }
             }

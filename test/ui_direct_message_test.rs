@@ -6,6 +6,7 @@ use aloo::client::p2p::LinkStatus;
 use aloo::p2p_proto::ReceiptStage;
 use aloo::proto::{KeyMode, UserId};
 use aloo::client::tui::ui::{
+    DeliveryProof,
     DELIVERY_ARROW, DeliveryStatus, Focus, IdentityCase, MessageBody, OTP_ICON, PendingOtpInvite,
     UiAction, UiState, VoiceTarget, render,
 };
@@ -1482,7 +1483,7 @@ fn a_sent_direct_message_starts_undelivered_and_turns_delivered() {
         Some(DeliveryStatus::None),
         "a message nobody has acknowledged yet is undelivered"
     );
-    state.mark_delivered(UserId(2), msg_id, ReceiptStage::Decrypted);
+    state.mark_delivered(UserId(2), msg_id, ReceiptStage::Decrypted, DeliveryProof::Receipt);
     assert_eq!(
         status(&state),
         Some(DeliveryStatus::All),
@@ -1509,7 +1510,7 @@ fn the_arrow_is_coloured_by_how_far_the_message_has_got() {
         DeliveryStatus::None.color(),
         "the arrow starts in the not-yet colour"
     );
-    state.mark_delivered(UserId(2), msg_id, ReceiptStage::Decrypted);
+    state.mark_delivered(UserId(2), msg_id, ReceiptStage::Decrypted, DeliveryProof::Receipt);
     assert_eq!(
         arrow_fg(&state),
         DeliveryStatus::All.color(),

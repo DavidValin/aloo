@@ -558,12 +558,41 @@ pub struct DeliveryRecipient {
     pub name: String,
     /// They could read it (`p2p_proto::ReceiptStage::Decrypted`).
     pub delivered: bool,
+    /// Whether this leg went out under the one-time-pad layer, and so
+    /// answers to the pad's own acknowledgement rather than to an ordinary
+    /// delivery receipt (`DeliveryProof`).
+    ///
+    /// Per recipient rather than per row, because a channel send can be
+    /// mixed: some members reachable under a pad, others not, all sharing
+    /// one `msg_id`.
+    pub awaits_pad_ack: bool,
     /// They have since done the thing the message was for - played the
     /// audio, saved the file (`p2p_proto::ReceiptStage::Consumed`). Only
     /// ever true for a voice or file row, and shown only in the details
     /// popup: the log's own arrow stays a three-state summary of who has
     /// the message, not of what they did with it.
     pub consumed: bool,
+}
+
+/// Which acknowledgement is claiming a recipient read a message - the two
+/// are not equally believable, and a row that can insist on the stronger
+/// one does.
+///
+/// An ordinary `DeliveryReceipt` is an unsigned payload naming a `msg_id`,
+/// with nothing tying it to the message's content: anyone on the link can
+/// say it. An `OtpDeliveryAck` carries `sha256` of the nonce buried under
+/// that message's pad, which only a party that actually decrypted it can
+/// name (`docs/SPEC.md` "Proving an acknowledgement", AC-250). So on a
+/// pad-protected leg the receipt is not accepted as proof of reading; the
+/// pad's own ack is what turns the arrow green.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryProof {
+    /// The peer's `DeliveryReceipt` - their unproven word.
+    Receipt,
+    /// A verified `OtpDeliveryAck` (`client::otp::on_delivery_ack` has
+    /// already checked the proof against what was recorded for the
+    /// outstanding sequence; a mismatch never reaches here).
+    PadAck,
 }
 
 /// What one message row's indicator says, aggregated over its recipients
@@ -2344,6 +2373,7 @@ impl UiState {
                 id: *id,
                 name: self.peer_display_name(*id),
                 delivered: false,
+                awaits_pad_ack: false,
                 consumed: false,
             })
             .collect();
@@ -2439,7 +2469,13 @@ impl UiState {
     /// the acknowledgement says nothing about which conversation it came
     /// from. Idempotent: a duplicate acknowledgement changes nothing, and
     /// an id from before a reconnect simply matches nothing.
-    pub fn mark_delivered(&mut self, peer: UserId, msg_id: u64, stage: ReceiptStage) {
+    pub fn mark_delivered(
+        &mut self,
+        peer: UserId,
+        msg_id: u64,
+        stage: ReceiptStage,
+        proof: DeliveryProof,
+    ) {
         let logs = self
             .channels
             .iter_mut()
@@ -2457,12 +2493,54 @@ impl UiState {
                     if recipient.id != peer {
                         continue;
                     }
+                    if recipient.awaits_pad_ack && proof == DeliveryProof::Receipt {
+                        // A pad-protected leg answers only to the pad's own
+                        // proof-carrying ack. A plain receipt may still
+                        // record that they played or saved it - but only
+                        // once that ack has genuinely landed, so a receipt
+                        // can never be what turns this leg green.
+                        recipient.consumed |=
+                            recipient.delivered && stage == ReceiptStage::Consumed;
+                        continue;
+                    }
                     // Consuming implies decrypting, and the two receipts
                     // can arrive in either order after a re-punch, so
                     // `Consumed` sets both rather than assuming the first
                     // one landed.
                     recipient.delivered = true;
                     recipient.consumed |= stage == ReceiptStage::Consumed;
+                }
+                return;
+            }
+        }
+    }
+
+    /// Marks this client's own send to `peer` on row `msg_id` as one that
+    /// went out under the pad - so from here on only a verified
+    /// `OtpDeliveryAck` can report it read (`mark_delivered`).
+    ///
+    /// Called by `client::otp` at the moment the pad-wrapped payload
+    /// genuinely reaches the wire, never earlier: a send that failed to
+    /// encrypt never left, and must not leave its row waiting on an
+    /// acknowledgement that can no longer be coming.
+    pub fn mark_awaiting_pad_ack(&mut self, peer: UserId, msg_id: u64) {
+        let logs = self
+            .channels
+            .iter_mut()
+            .map(|c| &mut c.log)
+            .chain(self.private_rooms.values_mut().map(|r| &mut r.log));
+        for log in logs {
+            for entry in log.iter_mut() {
+                let Some(delivery) = entry.delivery.as_mut() else {
+                    continue;
+                };
+                if delivery.msg_id != msg_id {
+                    continue;
+                }
+                for recipient in delivery.recipients.iter_mut() {
+                    if recipient.id == peer {
+                        recipient.awaits_pad_ack = true;
+                    }
                 }
                 return;
             }

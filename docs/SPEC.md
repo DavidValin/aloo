@@ -171,6 +171,8 @@ Every tag is unbracketed and trails the name, reading as an annotation on it - o
 
 Green is a statement about the recipient's own client, not about the network: it means that client decrypted the message and said so. For a file that is the *offer* opening — they know what is being sent — and for a voice message the stream ending with audio their end could decode. Either is a different statement from the sending row's own `📎 <filename>` completion, which is only about this side finishing sending.
 
+Under an OTP session the arrow means something stronger. An ordinary acknowledgement is the recipient's unproven word — a small message naming which of yours it is about, which anyone on the link could send. A pad-protected one has to prove it: it carries a value that can only be derived by actually decrypting the message it names (see "Proving an acknowledgement" below). So on those rows the arrow ignores the ordinary acknowledgement entirely and stays gray until the proof arrives — green there means *this pad's holder* read it, not merely that someone said so.
+
 **Message details popup.** `i`, with the message log focused, opens a centered, bordered popup on the selected message titled `Message details (i / Esc to close)`: `sent_at: <YYYY-MM-DD HH:MM:SS>` in bold, a blank line, the encryption block below, a blank line, then one line per user the message was sent to — the nickname on the left, and right-aligned against the popup's edge that user's own status, the same arrow in the same colours as the row it was opened from. Names are as they were at send time, so a recipient who has since left is still listed. On a row that tracks no delivery it reads `received_at:` instead, and says `no delivery information for this message` in place of the list. It absorbs every key while open; `i` or Escape closes it.
 
 The popup, and only the popup, shows what a recipient did with the message beyond being able to read it (`docs/PROTOCOL.md` §7.2.1's two receipt stages):
@@ -377,6 +379,7 @@ When a channel is joined, the join is broadcast to all users already in the chan
     - **In a channel it has three**, because one message you send is really one message per member (`docs/PROTOCOL.md` §7.2): gray while nobody has it, orange once some of them do, green once all of them do. A file send in a channel is one row too, over every recipient it went out to, so it has the same three.
     - **A message that reached nobody at all is struck through** — an empty channel, or one where every member was excluded — with the arrow left gray. It is not waiting on anyone, so it must not sit there looking like it is.
     - **Green means their app could actually read it** — their client decrypted the message and said so. It does not mean a human has looked at it. For a file that is the offer opening; for a voice message, the audio decoding.
+    - **Under `/otp`, green additionally means it was provably them.** An ordinary acknowledgement is taken on trust; a pad one has to prove it decrypted the message before the arrow moves, so it stays gray until that proof lands rather than turning green on somebody's word.
     - **Gray is not a failure.** A message to somebody whose link is still being punched, or who is briefly unreachable, is held and re-sent by itself; the arrow turns green whenever it finally lands. A send that genuinely failed is already shown in red (`UiState::mark_dm_message_failed`), which is a different thing.
     - **Pressing `i` on a message opens its details** (message log focused): `sent_at`, then every user it was sent to, each with that user's own coloured arrow and status aligned to the right — `UNDELIVERED`, `DELIVERED`, and for a voice message they have heard or a file they have on disk, `DELIVERED+LISTENED` or `DELIVERED+SAVED`. That extra state shows only here; the log's arrow never changes for it. `i` or Escape closes it, and it absorbs every other key while open. On a message that tracks no delivery — anything incoming, a presence notice — it says so instead, next to when that message arrived.
     - **It does not survive a restart.** Acknowledgements are matched against messages this run sent; anything still gray when the client stops simply stays that way.
@@ -913,6 +916,96 @@ and its whole handshake rides the same direct link everything else does.
   (Functionality #13). Live `/otp` is unaffected.
 
 So the pad layer costs exactly one human accept, once, ever.
+
+### How a pad-wrapped message authenticates itself
+
+Every message that arrives under the pad layer is checked before a single
+key byte is spent, and the statement it has to satisfy is this: the message
+must have been **produced by the holder of the mirror key at the expected
+offset, and next in sequence**. Anything that fails is refused outright and
+never reaches the conversation.
+
+That statement is not something aloo computes. It is what the `otp` command
+itself decides, from an encrypted metadata block it puts at the front of
+every message (`otp-toolkit`'s "Origin and order verification"). The block
+carries three things, and each answers one part of the sentence:
+
+| Field | What it is | What it proves |
+|---|---|---|
+| `source_id` | 16 bytes taken from the key itself, at this message's offset | **the holder of the mirror key** - only the correspondent whose key is the mirror of this one holds those exact bytes at that exact position |
+| `offset` | the absolute key position this message starts at | **at the expected offset** - it must equal where this contact's own key has actually reached |
+| `seq` | this message's sequence number in its direction | **next in sequence** - it must be exactly the next one expected, so a replayed, reordered or duplicated message is refused |
+
+Because the source_id is drawn from the pad, it cannot be forged by anyone
+who does not already hold the pad - and it is destroyed along with the rest
+of that message's key range once spent, so it cannot be replayed either.
+
+The check runs *before* anything is staged, delivered or truncated, so a
+message that fails leaves the key untouched. `otp` reports the outcome
+through its exit code, and that verdict is the whole of what aloo needs: a
+successful decrypt **is** the proof of origin and ordering, so there is no
+separate signature to verify and no identity to look up. A failing verdict
+means the message came from the wrong source or was encrypted against the
+wrong pad; aloo shows that plainly and processes nothing
+(`client::otp::unwrap_or_notify`).
+
+This holds in both directions of use:
+
+- **Under `pq_hybrid`** (the ordinary case) the verdict is checked in
+  addition to the envelope's own signature - a message that decrypts but
+  fails verification is discarded rather than opened.
+- **Without `pq_hybrid`**, where there is no inner envelope to sign
+  anything, the verdict is the *only* authentication - and it is
+  sufficient, because holding the mirror pad is a stronger statement about
+  who is speaking than holding an identity key is.
+
+### Proving an acknowledgement, without spending pad to do it
+
+The verdict says a message came from the right correspondent. It does not
+say the message *arrived* - the two directions are independent, and nothing
+about receiving something proves the peer received what you sent. Since a
+pad range is destroyed the moment it is used, aloo sends exactly one
+message at a time to a contact and waits for that message to be
+acknowledged before spending any more key.
+
+So the acknowledgement itself has to be trustworthy, and naming a sequence
+number is not enough - anyone who watched the packet go past can quote one.
+Instead every message carries a fresh 16-byte nonce buried under the pad,
+and the acknowledgement returns `sha256` of it:
+
+| | |
+|---|---|
+| What goes out | the message, with a random nonce in front of it, all under the pad |
+| What comes back | `sha256(nonce)` - no pad spent, no key consumed |
+| Why it can't be faked | the nonce is only readable by decrypting, which needs the mirror pad |
+| Why the nonce isn't echoed raw | that would expose 16 bytes of known plaintext against known ciphertext, which is 16 bytes of recovered key |
+
+A fresh nonce per message is what makes this repeatable: the proof is bound
+to *that* message, so an old acknowledgement is worthless against the next
+one. And a hash costs the receiver nothing, which matters more than it
+sounds - an acknowledgement that spent pad would itself be a message
+needing acknowledgement, and the recursion would never bottom out.
+
+Two cases carry the user's bytes verbatim - a file's content, and a voice
+message - so there is no room to insert a nonce without corrupting what
+lands on disk. Those use the plaintext's own `sha256` instead, which proves
+the same thing: only someone who decrypted the content can name it.
+
+The practical effect is a hard bound on impersonation. A pad is filed
+against the correspondent's *keys*, never their nickname, so someone who
+takes a familiar name gets nowhere. Someone who takes an identity key gets
+one message - and then the gate closes, because they cannot produce the
+proof. Even that one message is not lost: nothing overwrites its retained
+copy while the gate is held, so it is still deliverable to the real
+contact when they return.
+
+One consequence is worth stating: because verification is a property of
+decryption, authenticating costs pad. A message sent purely to prove
+identity would spend key like any other, which is why nothing here adds an
+authentication handshake - the first real message's own verdict does the
+job. And once a ciphertext has left the machine its key range is spent for
+good, so a lost message is re-transmitted byte-identically
+(`otp --recover-last --sent`) and never re-encrypted.
 
 ### Doing it with no terminal (daemon)
 

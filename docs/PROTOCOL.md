@@ -218,7 +218,7 @@ the payload carried inside a reliable or unreliable one.
 | `OtpEnvelope` / `OtpFileOffer` | reliably | A `pq_hybrid` send additionally wrapped by the one-time-pad layer (§16) |
 | `OtpFileContentSeq` | reliably | Names an accepted file's content-phase pad slot, independent of the offer's own (§16.2) |
 | `OtpVoiceOffer` | reliably | Offers a fully-recorded voice message under the pad layer - auto-accepted, no popup (§16.2) |
-| `OtpDeliveryAck` | reliably | Confirms an `OtpEnvelope`/`OtpFileOffer`/`OtpVoiceOffer` decoded, unblocking the next one (§16) |
+| `OtpDeliveryAck` | reliably | Confirms an `OtpEnvelope`/`OtpFileOffer`/`OtpVoiceOffer` decoded, carrying proof of the nonce under its pad, unblocking the next one (§16) |
 | `OtpPadStart` | reliably | Announces an incoming one-time pad: its length and the digests both sides will be held to (§16.1) |
 | `OtpPadChunk` / `OtpPadEnd` | reliably | The pad's bytes, streamed small enough never to fragment, then the end of it (§16.1) |
 | `OtpPadVerify` | reliably | What the receiver actually reassembled, and whether it was accepted - installs nothing (§16.1) |
@@ -3458,8 +3458,8 @@ own terms):
 
 ```
  alice                                              bob
-   |--- OtpEnvelope { channel, seq, envelope } -------->|
-   |<-- OtpDeliveryAck { seq } --------------------------|
+   |--- OtpEnvelope { channel, seq, envelope } -------->|   a fresh nonce rides under the pad
+   |<-- OtpDeliveryAck { seq, proof } -------------------|   proof = sha256(that nonce)
 ```
 
 The receiving side only sends `OtpDeliveryAck` once the message has been
@@ -3467,7 +3467,46 @@ fully unwrapped *and* successfully delivered to the local application -
 never on receipt alone. The sending side treats that ack, and only that
 ack, as proof the message actually reached and was understood by the
 other end, and will not encrypt a second message to this contact under
-the pad until it has arrived. A message typed while one is still
+the pad until it has arrived.
+
+**The sender's delivery indicator.** An ordinary message's `->` arrow and
+its details popup are driven by the peer's `DeliveryReceipt` (§7.2.1). A
+pad-protected one is not: the receipt is unsigned and names only a `msg_id`,
+so on this layer the arrow answers to `OtpDeliveryAck` instead, and stays
+gray until a *verified* one arrives. The two acknowledgements otherwise
+remain distinct statements - the ack additionally releases the pad gate,
+which no receipt ever did - so a pad-wrapped text message sends no
+`Decrypted` receipt at all; it would only repeat, unprovenly, what the ack
+already establishes. A `Consumed` receipt (they played the audio, saved the
+file) still travels normally, but on this layer it records only what the
+ack has already established rather than implying delivery on its own.
+
+**What makes the ack believable.** A bare `seq` is quotable by anyone who
+watched the packet go past, so every pad spend buries a fresh 16-byte
+nonce in front of its plaintext, and the acknowledgement carries
+`sha256(nonce)` back. Reaching that value requires having actually opened
+the message, which requires the mirror pad - so the ack is bound to *this*
+message rather than to a number, and an acknowledgement that does not
+match the expectation leaves the gate closed (§16.2's queueing simply
+continues to hold). The nonce itself is never echoed: that would hand an
+observer 16 bytes of known plaintext against known ciphertext, which is 16
+bytes of recovered pad. The hash costs the receiver no pad at all, which
+is the point - an acknowledgement that spent pad would itself be a message
+needing acknowledgement, with no bottom to the recursion.
+
+This is also what bounds an impersonator. Contact selection is bound to
+keys rather than nicknames (§16.1), but a peer holding a stolen identity
+key still has no pad, and therefore can never produce a matching proof: it
+extracts exactly one message before the gate closes for good, and even
+that one is not lost - nothing overwrites its `--recover-last --sent` copy
+while the gate holds, so it is still deliverable to the genuine contact
+afterwards.
+
+For the two spends that carry the user's bytes verbatim - a file's content
+phase and a voice message - there is nowhere to bury a nonce without
+corrupting what lands on the receiver's disk, so the plaintext's own
+`sha256` stands in. It proves the same thing: only a party that decrypted
+the content can name it. A message typed while one is still
 outstanding is held locally and sent the moment the ack for the previous
 one comes in; nothing about this queueing is itself visible on the wire.
 This is the same requirement the underlying pad-management tool enforces

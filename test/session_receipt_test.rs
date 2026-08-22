@@ -53,6 +53,7 @@ async fn session_and_ui(name: &str) -> (SessionState, UiState, KeyPair) {
             public: me.public.clone(),
         }),
         scratch: scratch_dir(name),
+        otp: None,
     })
     .await;
 

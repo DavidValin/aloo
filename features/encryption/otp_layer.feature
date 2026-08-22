@@ -27,6 +27,14 @@ Feature: Layering one-time-pad encryption over an established pq_hybrid conversa
     Then the wrapped bytes do not open as a pq_hybrid send directly
     And bob unwraps it and reads back exactly what was sent
 
+  @AC-250
+  Scenario: The two sides derive the same acknowledgement proof independently
+    Given alice and bob each have a pq_hybrid identity
+    And alice and bob have provisioned an otp contact for each other
+    When alice seals "meet me at six" for bob and wraps it under the pad
+    Then bob unwraps it and reads back exactly what was sent
+    And the acknowledgement proof the receiver computed matches the sender's
+
   @AC-137
   Scenario: A second message under the pad waits for a genuine delivery acknowledgement
     Given alice and bob each have a pq_hybrid identity

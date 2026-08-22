@@ -5,6 +5,7 @@ use ui_common::*;
 use aloo::p2p_proto::ReceiptStage;
 use aloo::proto::UserId;
 use aloo::client::tui::ui::{
+    DeliveryProof,
     CallMemberState, CallTarget, DELIVERED_LABEL, DELIVERY_ARROW, DeliveryStatus, Focus,
     LISTENED_LABEL, SAVED_LABEL,
     END_CALL_CONFIRM_TITLE, ENCRYPTION_LABEL, HELP_POPUP_TITLE, HOST_LEFT_NOTICE, IdentityCase,
@@ -2931,7 +2932,7 @@ fn i_opens_the_details_of_the_selected_message() {
 fn the_details_popup_names_every_recipient_with_its_own_state() {
     let (mut state, msg_id) =
         sent_and_selected(vec![user(2, "bob"), user(3, "carol")], "status check");
-    state.mark_delivered(UserId(2), msg_id, ReceiptStage::Decrypted);
+    state.mark_delivered(UserId(2), msg_id, ReceiptStage::Decrypted, DeliveryProof::Receipt);
     press(&mut state, KeyCode::Char('i'));
 
     let rows = rendered_rows(&state);
@@ -3075,7 +3076,7 @@ fn an_acknowledgement_finds_its_row_in_any_conversation() {
         "ids are handed out across the whole session, not per conversation"
     );
 
-    state.mark_delivered(UserId(2), dm_id, ReceiptStage::Decrypted);
+    state.mark_delivered(UserId(2), dm_id, ReceiptStage::Decrypted, DeliveryProof::Receipt);
     assert_eq!(
         state.private_rooms[&UserId(2)].log[0].delivery_status(),
         Some(DeliveryStatus::All)
@@ -3086,7 +3087,7 @@ fn an_acknowledgement_finds_its_row_in_any_conversation() {
         "the channel row is a different message and is untouched"
     );
 
-    state.mark_delivered(UserId(2), channel_id, ReceiptStage::Decrypted);
+    state.mark_delivered(UserId(2), channel_id, ReceiptStage::Decrypted, DeliveryProof::Receipt);
     assert_eq!(
         state.channels[0].log[0].delivery_status(),
         Some(DeliveryStatus::All)
@@ -3105,8 +3106,8 @@ fn marking_delivered_is_idempotent_and_ignores_unknown_ids() {
         other => panic!("expected SendChannelText, got {other:?}"),
     };
 
-    state.mark_delivered(UserId(2), msg_id, ReceiptStage::Decrypted);
-    state.mark_delivered(UserId(2), msg_id, ReceiptStage::Decrypted);
+    state.mark_delivered(UserId(2), msg_id, ReceiptStage::Decrypted, DeliveryProof::Receipt);
+    state.mark_delivered(UserId(2), msg_id, ReceiptStage::Decrypted, DeliveryProof::Receipt);
     assert_eq!(
         state.channels[0].log[0].delivery_status(),
         Some(DeliveryStatus::Some),
@@ -3114,8 +3115,8 @@ fn marking_delivered_is_idempotent_and_ignores_unknown_ids() {
     );
 
     // An id from before a reconnect, and a peer who was never a recipient.
-    state.mark_delivered(UserId(2), msg_id + 999, ReceiptStage::Decrypted);
-    state.mark_delivered(UserId(9), msg_id, ReceiptStage::Decrypted);
+    state.mark_delivered(UserId(2), msg_id + 999, ReceiptStage::Decrypted, DeliveryProof::Receipt);
+    state.mark_delivered(UserId(9), msg_id, ReceiptStage::Decrypted, DeliveryProof::Receipt);
     assert_eq!(
         state.channels[0].log[0].delivery_status(),
         Some(DeliveryStatus::Some)
@@ -3154,7 +3155,7 @@ fn a_voice_row_and_a_file_row_carry_the_arrow_too() {
         "both rows carry the arrow: {rows:?}"
     );
 
-    state.mark_delivered(UserId(2), voice_id, ReceiptStage::Decrypted);
+    state.mark_delivered(UserId(2), voice_id, ReceiptStage::Decrypted, DeliveryProof::Receipt);
     assert_eq!(
         state.channels[0].log[0].delivery_status(),
         Some(DeliveryStatus::All),
@@ -3166,7 +3167,7 @@ fn a_voice_row_and_a_file_row_carry_the_arrow_too() {
         "and the file row is a different message, untouched"
     );
 
-    state.mark_delivered(UserId(2), file_id, ReceiptStage::Decrypted);
+    state.mark_delivered(UserId(2), file_id, ReceiptStage::Decrypted, DeliveryProof::Receipt);
     assert_eq!(
         state.channels[0].log[1].delivery_status(),
         Some(DeliveryStatus::All)
@@ -3188,11 +3189,109 @@ fn a_voice_row_keeps_its_delivery_when_the_stream_finishes() {
         matches!(state.channels[0].log[0].body, MessageBody::Voice { .. }),
         "the placeholder was finalized in place"
     );
-    state.mark_delivered(UserId(2), msg_id, ReceiptStage::Decrypted);
+    state.mark_delivered(UserId(2), msg_id, ReceiptStage::Decrypted, DeliveryProof::Receipt);
     assert_eq!(
         state.channels[0].log[0].delivery_status(),
         Some(DeliveryStatus::All),
         "finalizing must not lose which message this row is"
+    );
+}
+
+/// A row that went out under the pad reports its delivery through the
+/// pad's own proof-carrying acknowledgement, and nothing weaker - a plain
+/// `DeliveryReceipt` is an unsigned payload naming a `msg_id`, which anyone
+/// on the link can say.
+///
+/// @requirement AC-251
+#[test]
+fn a_pad_protected_row_ignores_a_plain_receipt_and_waits_for_the_pad_ack() {
+    let (mut state, msg_id) = sent_and_selected(vec![user(2, "bob")], "under the pad");
+    state.mark_awaiting_pad_ack(UserId(2), msg_id);
+
+    let arrow_status = |s: &UiState| {
+        s.channels[0]
+            .log
+            .iter()
+            .find_map(|e| e.delivery.as_ref().map(|d| d.status()))
+            .expect("the row tracks its own delivery")
+    };
+
+    state.mark_delivered(UserId(2), msg_id, ReceiptStage::Decrypted, DeliveryProof::Receipt);
+    press(&mut state, KeyCode::Char('i'));
+    assert!(
+        rendered_rows(&state)
+            .iter()
+            .any(|r| r.contains(UNDELIVERED_LABEL)),
+        "an unproven receipt must not be able to claim they read a pad-protected message"
+    );
+    assert_eq!(
+        arrow_status(&state),
+        DeliveryStatus::None,
+        "so the arrow stays gray"
+    );
+
+    state.mark_delivered(UserId(2), msg_id, ReceiptStage::Decrypted, DeliveryProof::PadAck);
+    assert!(
+        rendered_rows(&state)
+            .iter()
+            .any(|r| r.contains(DELIVERED_LABEL)),
+        "the pad's own ack is what turns it green"
+    );
+    assert_eq!(arrow_status(&state), DeliveryStatus::All);
+}
+
+/// An ordinary row is unaffected - there is no pad behind it to insist on,
+/// so its receipt is the only acknowledgement there ever was.
+///
+/// @requirement AC-251
+#[test]
+fn a_row_that_never_went_under_the_pad_still_answers_to_its_receipt() {
+    let (mut state, msg_id) = sent_and_selected(vec![user(2, "bob")], "in the clear");
+
+    state.mark_delivered(UserId(2), msg_id, ReceiptStage::Decrypted, DeliveryProof::Receipt);
+    press(&mut state, KeyCode::Char('i'));
+    assert!(
+        rendered_rows(&state)
+            .iter()
+            .any(|r| r.contains(DELIVERED_LABEL))
+    );
+}
+
+/// Consuming ordinarily implies decrypting, so a `Consumed` receipt sets
+/// both. On a pad-protected leg that shortcut would hand the untrusted
+/// path a way in through the back door, so it only ever records what the
+/// pad ack has already established.
+///
+/// @requirement AC-251
+#[test]
+fn a_consumed_receipt_cannot_turn_a_pad_protected_row_green_on_its_own() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    let (msg_id, delivery) = state.start_delivery(&[UserId(2)]);
+    state.log_own_voice_stream_start_channel("general", 7, Some(delivery));
+    state.mark_awaiting_pad_ack(UserId(2), msg_id);
+    state.focus = Focus::Messages;
+    state.message_selected = 0;
+
+    state.mark_delivered(UserId(2), msg_id, ReceiptStage::Consumed, DeliveryProof::Receipt);
+    press(&mut state, KeyCode::Char('i'));
+    let rows = rendered_rows(&state);
+    assert!(
+        rows.iter().any(|r| r.contains(UNDELIVERED_LABEL)),
+        "a Consumed receipt must not imply delivery here: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|r| r.contains(LISTENED_LABEL)),
+        "and it must not claim they heard something they never proved receiving"
+    );
+
+    // Once the pad ack lands, a later replay receipt reads normally again.
+    state.mark_delivered(UserId(2), msg_id, ReceiptStage::Decrypted, DeliveryProof::PadAck);
+    state.mark_delivered(UserId(2), msg_id, ReceiptStage::Consumed, DeliveryProof::Receipt);
+    assert!(
+        rendered_rows(&state)
+            .iter()
+            .any(|r| r.contains(LISTENED_LABEL)),
+        "the pad ack proves receipt; what they then did with it is theirs to report"
     );
 }
 
@@ -3208,7 +3307,7 @@ fn the_details_popup_distinguishes_heard_from_merely_decrypted() {
     state.focus = Focus::Messages;
     state.message_selected = 0;
 
-    state.mark_delivered(UserId(2), msg_id, ReceiptStage::Decrypted);
+    state.mark_delivered(UserId(2), msg_id, ReceiptStage::Decrypted, DeliveryProof::Receipt);
     press(&mut state, KeyCode::Char('i'));
     let rows = rendered_rows(&state);
     assert!(
@@ -3220,7 +3319,7 @@ fn the_details_popup_distinguishes_heard_from_merely_decrypted() {
         "and it must not claim they heard it"
     );
 
-    state.mark_delivered(UserId(2), msg_id, ReceiptStage::Consumed);
+    state.mark_delivered(UserId(2), msg_id, ReceiptStage::Consumed, DeliveryProof::Receipt);
     let rows = rendered_rows(&state);
     assert!(
         rows.iter().any(|r| r.contains(LISTENED_LABEL)),
@@ -3237,14 +3336,14 @@ fn the_details_popup_says_saved_for_a_file_the_recipient_has_on_disk() {
     state.focus = Focus::Messages;
     state.message_selected = 0;
 
-    state.mark_delivered(UserId(2), msg_id, ReceiptStage::Decrypted);
+    state.mark_delivered(UserId(2), msg_id, ReceiptStage::Decrypted, DeliveryProof::Receipt);
     press(&mut state, KeyCode::Char('i'));
     assert!(
         rendered_rows(&state).iter().any(|r| r.contains(DELIVERED_LABEL)),
         "they could read the offer"
     );
 
-    state.mark_delivered(UserId(2), msg_id, ReceiptStage::Consumed);
+    state.mark_delivered(UserId(2), msg_id, ReceiptStage::Consumed, DeliveryProof::Receipt);
     let rows = rendered_rows(&state);
     assert!(
         rows.iter().any(|r| r.contains(SAVED_LABEL)),
@@ -3267,7 +3366,7 @@ fn a_text_message_has_no_extra_state_and_the_arrow_is_unchanged_by_one() {
         UiAction::SendChannelText { msg_id, .. } => msg_id,
         other => panic!("expected SendChannelText, got {other:?}"),
     };
-    state.mark_delivered(UserId(2), msg_id, ReceiptStage::Consumed);
+    state.mark_delivered(UserId(2), msg_id, ReceiptStage::Consumed, DeliveryProof::Receipt);
 
     assert_eq!(
         state.channels[0].log[0].delivery_status(),

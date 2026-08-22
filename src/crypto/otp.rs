@@ -50,6 +50,35 @@ pub fn otp_size_mb_in_range(size_mb: u32) -> bool {
     (OTP_SIZE_MB_MIN..=OTP_SIZE_MB_MAX).contains(&size_mb)
 }
 
+/// How many random bytes ride inside every OTP message purely so its
+/// acknowledgement can be bound to it. 16 bytes is far past any feasible
+/// guess, and the cost is fixed per message rather than proportional to it.
+pub const ACK_NONCE_BYTES: usize = 16;
+
+/// The proof a receiver returns to show it genuinely decrypted a specific
+/// message: `sha256` of that message's nonce.
+///
+/// Sent in the clear, and safe to be: an attacker holding only the
+/// ciphertext cannot learn the nonce without the pad, so cannot produce
+/// this. The *nonce itself* is never echoed - that would hand an observer
+/// 16 bytes of known plaintext against known ciphertext, which is 16 bytes
+/// of recovered pad.
+///
+/// Costing the receiver nothing is the point. An acknowledgement that
+/// spent pad would itself be a message needing acknowledgement, and the
+/// chain would never terminate; and a receiver who had to spend key to let
+/// the sender continue would force strict turn-taking on every
+/// conversation.
+pub type AckProof = [u8; 32];
+
+/// The proof for `nonce` - computed by the receiver from what it
+/// decrypted, and by the sender from what it generated, with no other way
+/// to arrive at it.
+pub fn ack_proof_for(nonce: &[u8]) -> AckProof {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(nonce).into()
+}
+
 /// A SHA-256 digest of one key half, used to prove both sides ended up
 /// holding byte-identical pad material before either installs it.
 ///
@@ -78,6 +107,52 @@ pub fn digest_key_file(path: &std::path::Path) -> std::io::Result<KeyDigest> {
         hasher.update(&buf[..read]);
     }
     Ok(hasher.finalize().into())
+}
+
+/// The proof for a pad spend whose plaintext is a whole file rather than
+/// a blob aloo composed - a file transfer's content phase, or a voice
+/// message's PCM.
+///
+/// Those two carry the user's bytes verbatim, so there is nowhere to bury
+/// a nonce without corrupting what lands on the receiver's disk. The
+/// plaintext's own digest stands in, and it proves exactly the same thing:
+/// only a party that actually decrypted this message can name it. The
+/// ciphertext alone yields nothing without the pad.
+///
+/// Unlike `ack_proof_for` it isn't fresh per send - the same file sent
+/// twice proves the same value. That costs nothing here, because a proof
+/// is only ever checked against the *one* sequence number currently
+/// pending for the contact (`OtpStore::record_acked`), so a replayed proof
+/// has no second gate left to open.
+pub fn ack_proof_for_file(path: &std::path::Path) -> std::io::Result<AckProof> {
+    digest_key_file(path)
+}
+
+/// The `otp` keychain contact name for a pair with no `pq_hybrid`
+/// identities, derived from the two **pinned public keys** rather than
+/// from nicknames.
+///
+/// Deriving it from the keys is what makes the pad safe to spend. A
+/// nickname proves nothing - it is trust-on-first-use and freed the moment
+/// its holder disconnects (`docs/PROTOCOL.md` §5.4/§11.2), so anyone may
+/// take a familiar one. Had the name been the nickname, an impersonator
+/// could have caused this side to encrypt to *the real contact's pad*:
+/// unreadable to them, but irreversibly spent, leaving the genuine
+/// correspondent's offsets desynchronised and the pad useless. Keyed off
+/// the pinned key instead, an impersonator simply derives a different
+/// contact name, finds no pad under it, and gets nothing spent on them.
+///
+/// Same sorted, order-independent construction `contact_name_for` uses, so
+/// both sides compute the identical name from their own and their peer's
+/// key with nothing negotiated. Only meaningful for `KeyMode`s whose key is
+/// actually stable across reconnects
+/// (`client::keymode_policy::uses_byte_comparison_pinning`) - a freshly
+/// generated key every connect would name a different contact every time.
+pub fn contact_name_for_keys(own_public_der: &[u8], peer_public_der: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let own: [u8; 32] = Sha256::digest(own_public_der).into();
+    let peer: [u8; 32] = Sha256::digest(peer_public_der).into();
+    contact_name_for(&own, &peer)
 }
 
 /// Deterministic, order-independent `otp` keychain contact name for a pair

@@ -307,6 +307,15 @@ pub(crate) async fn handle_send(
         crate::client::otp_store::PendingOtpContent::Mail {
             mail_id: mail_id.clone(),
         },
+        // No ack proof to expect. Every other spend is acknowledged by the
+        // peer, who proves possession of the mirror pad by naming what was
+        // buried under it; a mail's is acknowledged by the *server*, which
+        // holds no pad and only ever claims to have stored the ciphertext.
+        // Nothing weaker is on offer here, and nothing stronger is needed:
+        // "stored" is exactly the property this spend waits on, and the
+        // recipient's own binding still comes from the key-derived contact
+        // name rather than from anything the server asserts.
+        None,
     );
     let _ = session.otp_store.save();
     let sent_at_utc = payload.sent_at_utc;
@@ -470,7 +479,7 @@ pub(crate) async fn on_mail_result(
     // destination; on failure no acknowledgement will ever come and the
     // contact must not stay wedged forever. The failure notice is loud
     // about what a refused-after-spend mail means for the pad.
-    if session.otp_store.record_acked(&mail_ref.contact_name, mail_ref.seq) {
+    if session.otp_store.record_acked(&mail_ref.contact_name, mail_ref.seq, None) {
         let _ = session.otp_store.save();
         crate::client::otp::flush_one_queued(wr, ui_state, session, &mail_ref.contact_name).await?;
     }
@@ -510,7 +519,7 @@ pub(crate) async fn on_mail_delivered(
         // A delivery notice can arrive with the storage ack lost (crash
         // between the two) - the gate still clears, exactly as it would
         // have on the ack itself.
-        if session.otp_store.record_acked(&mail_ref.contact_name, mail_ref.seq) {
+        if session.otp_store.record_acked(&mail_ref.contact_name, mail_ref.seq, None) {
             let _ = session.otp_store.save();
             crate::client::otp::flush_one_queued(wr, ui_state, session, &mail_ref.contact_name)
                 .await?;

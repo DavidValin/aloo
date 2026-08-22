@@ -3,6 +3,7 @@
 //! cryptography or keychain formats itself, so these tests need the actual
 //! command installed and on `PATH` (or pointed at via `ALOO_OTP_BIN`).
 
+use aloo::client::otp::{unwrap_incoming, wrap_outgoing, UnwrapOutcome};
 use aloo::client::otp_cli::{self, ContactDetail, FileCliOutcome, OtpCliConfig, OtpCliOutcome, RecoverDirection};
 use std::path::PathBuf;
 
@@ -301,8 +302,20 @@ async fn show_contact_advances_offset_and_sequence_after_an_encrypt() {
 
     let detail = otp_cli::show_contact(&alice_cfg, "bob").await.unwrap().unwrap();
     assert_eq!(detail.enc_sequence, 1);
-    assert_eq!(detail.enc_offset, 5, "offset should advance by the plaintext's own length");
-    assert_eq!(detail.enc_key_remaining, 1024 * 1024 - 5);
+    // A message now consumes its own length *plus* the 16-byte source_id
+    // chunk and the metadata block's pad - so the offset advances by more
+    // than the plaintext, and the exact overhead is otp's business, not
+    // something to pin here.
+    assert!(
+        detail.enc_offset > 5,
+        "offset should advance by the plaintext plus this message's metadata, got {}",
+        detail.enc_offset
+    );
+    assert_eq!(
+        detail.enc_key_remaining,
+        1024 * 1024 - detail.enc_offset,
+        "remaining key and offset must always agree"
+    );
     // The decrypt direction is untouched by an encrypt on this side.
     assert_eq!(detail.dec_sequence, 0);
     assert_eq!(detail.dec_offset, 0);
@@ -359,7 +372,14 @@ async fn encrypt_file_and_decrypt_file_round_trip_without_buffering_in_memory() 
     }
     let ciphertext = std::fs::read(&ciphertext_path).unwrap();
     assert_ne!(ciphertext, big, "must not just be a copy of the plaintext");
-    assert_eq!(ciphertext.len(), big.len(), "otp does not expand its input");
+    // Since otp-toolkit added origin/order verification, every message
+    // carries an encrypted metadata block (source_id, seq, offset) ahead of
+    // the payload - so the ciphertext is a little longer than its input
+    // rather than the same length.
+    assert!(
+        ciphertext.len() > big.len(),
+        "the metadata block should make the ciphertext longer than the plaintext"
+    );
 
     let recovered_path = bob_cfg.working_dir.join("recovered.bin");
     match otp_cli::decrypt_file(&bob_cfg, "alice", &ciphertext_path, &recovered_path, false)
@@ -399,12 +419,17 @@ async fn decrypt_file_without_assume_delivered_twice_fails_closed_on_the_second_
     // A second decrypt of the very same (already-consumed) ciphertext,
     // still without assume_delivered, must fail closed rather than
     // silently consuming more key or succeeding twice.
+    // Refused either way, but which check catches it first depends on the
+    // binary: origin/order verification now rejects the replayed ciphertext
+    // (its seq and offset are already spent) before the delivery-confirmation
+    // gate is ever reached. What matters is that it fails closed and consumes
+    // no key - never that it succeeds twice.
     match otp_cli::decrypt_file(&bob_cfg, "alice", &ciphertext_path, &dst, false)
         .await
         .unwrap()
     {
-        FileCliOutcome::Error(_) => {}
-        other => panic!("expected Error (confirmation required), got {other:?}"),
+        FileCliOutcome::Rejected(_) | FileCliOutcome::Error(_) => {}
+        other => panic!("expected a refusal, got {other:?}"),
     }
 }
 
@@ -533,4 +558,317 @@ async fn new_key_pair_without_progress_still_generates_a_usable_pair() {
         .await
         .expect("the generated keys must be installable");
     assert!(otp_cli::has_contact(&cfg, "bob").await.unwrap());
+}
+
+// ---------------------------------------------------------------------
+// Origin and order verification - the verdict aloo authenticates on
+// ---------------------------------------------------------------------
+
+/// The property the whole verdict-based authentication rests on: a message
+/// is accepted only if it was produced by the holder of the mirror key at
+/// the expected offset and is next in sequence. A replay satisfies none of
+/// that, and must be refused *without consuming key* - so the pad stays
+/// usable and the two sides stay in step.
+#[tokio::test]
+async fn a_replayed_ciphertext_is_rejected_and_consumes_no_key() {
+    if !require_otp() {
+        return;
+    }
+    let (alice_cfg, bob_cfg) = provision_pair("replay").await;
+    let ciphertext = match otp_cli::encrypt(&alice_cfg, "bob", b"hello bob", true)
+        .await
+        .unwrap()
+    {
+        OtpCliOutcome::Ok(bytes) => bytes,
+        other => panic!("expected Ok, got {other:?}"),
+    };
+
+    match otp_cli::decrypt(&bob_cfg, "alice", &ciphertext, true).await.unwrap() {
+        OtpCliOutcome::Ok(plaintext) => assert_eq!(plaintext, b"hello bob"),
+        other => panic!("the genuine message must decrypt, got {other:?}"),
+    }
+    let after_first = otp_cli::status(&bob_cfg, "alice").await.unwrap().unwrap();
+
+    // The same bytes again: already spent, so neither seq nor offset can
+    // still match.
+    match otp_cli::decrypt(&bob_cfg, "alice", &ciphertext, true).await.unwrap() {
+        OtpCliOutcome::Rejected(_) => {}
+        other => panic!("a replay must be rejected, got {other:?}"),
+    }
+    let after_replay = otp_cli::status(&bob_cfg, "alice").await.unwrap().unwrap();
+    assert_eq!(
+        after_first.dec_key_remaining, after_replay.dec_key_remaining,
+        "a rejected message must not spend a single key byte"
+    );
+    assert_eq!(
+        after_first.dec_sequence, after_replay.dec_sequence,
+        "and must not advance the sequence either"
+    );
+}
+
+/// A message from someone who does not hold the mirror key cannot produce a
+/// valid source_id, so it is refused - this is what makes a successful
+/// decrypt a statement about *who sent it*, not merely that bytes decoded.
+#[tokio::test]
+async fn a_message_from_a_foreign_pad_is_rejected() {
+    if !require_otp() {
+        return;
+    }
+    let (_alice_cfg, bob_cfg) = provision_pair("foreign-victim").await;
+    // A wholly unrelated pair - a "sender" bob has never shared a pad with.
+    let (stranger_cfg, _) = provision_pair("foreign-stranger").await;
+
+    let forged = match otp_cli::encrypt(&stranger_cfg, "bob", b"trust me", true)
+        .await
+        .unwrap()
+    {
+        OtpCliOutcome::Ok(bytes) => bytes,
+        other => panic!("expected Ok, got {other:?}"),
+    };
+
+    match otp_cli::decrypt(&bob_cfg, "alice", &forged, true).await.unwrap() {
+        OtpCliOutcome::Rejected(_) => {}
+        other => panic!("a message from a foreign pad must be rejected, got {other:?}"),
+    }
+    // And it cost nothing: the pad is untouched, so the real correspondent's
+    // next message still lands.
+    let status = otp_cli::status(&bob_cfg, "alice").await.unwrap().unwrap();
+    assert_eq!(status.dec_sequence, 0);
+    assert_eq!(status.dec_key_remaining, 1024 * 1024);
+}
+
+/// Corrupting a delivered ciphertext breaks the metadata block, so it is
+/// refused rather than XORed into garbage and handed upward.
+#[tokio::test]
+async fn a_tampered_ciphertext_is_rejected_rather_than_decoded_to_garbage() {
+    if !require_otp() {
+        return;
+    }
+    let (alice_cfg, bob_cfg) = provision_pair("tamper").await;
+    let mut ciphertext = match otp_cli::encrypt(&alice_cfg, "bob", b"the real message", true)
+        .await
+        .unwrap()
+    {
+        OtpCliOutcome::Ok(bytes) => bytes,
+        other => panic!("expected Ok, got {other:?}"),
+    };
+    ciphertext[0] ^= 0xFF;
+
+    match otp_cli::decrypt(&bob_cfg, "alice", &ciphertext, true).await.unwrap() {
+        OtpCliOutcome::Rejected(_) => {}
+        other => panic!("a tampered message must be rejected, got {other:?}"),
+    }
+    let status = otp_cli::status(&bob_cfg, "alice").await.unwrap().unwrap();
+    assert_eq!(
+        status.dec_key_remaining,
+        1024 * 1024,
+        "a rejected message must leave the pad untouched"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Pure-OTP mode: the verdict carrying a bare plaintext
+// ---------------------------------------------------------------------
+
+/// Scenario 3 - verdict OK, direct framing. Without pq_hybrid there is no
+/// envelope inside the pad, so what comes back out of `--decrypt` is the
+/// message itself. The verdict is what makes that safe to act on.
+#[tokio::test]
+async fn direct_framing_round_trips_a_bare_plaintext_on_a_good_verdict() {
+    if !require_otp() {
+        return;
+    }
+    let (alice_cfg, bob_cfg) = provision_pair("direct-ok").await;
+    // Exactly what `send_now` puts in the pad under `OtpFraming::Direct`:
+    // the plaintext, with no envelope wrapped around it.
+    let plaintext = b"no pq_hybrid anywhere in sight";
+
+    let ciphertext = match otp_cli::encrypt(&alice_cfg, "bob", plaintext, true).await.unwrap() {
+        OtpCliOutcome::Ok(bytes) => bytes,
+        other => panic!("expected Ok, got {other:?}"),
+    };
+    match otp_cli::decrypt(&bob_cfg, "alice", &ciphertext, true).await.unwrap() {
+        OtpCliOutcome::Ok(out) => assert_eq!(
+            out, plaintext,
+            "a good verdict must hand back exactly what was sent"
+        ),
+        other => panic!("expected Ok, got {other:?}"),
+    }
+}
+
+/// Scenario 4 - verdict failed, direct framing. This is the case that
+/// matters most: with no envelope there is no signature to fall back on, so
+/// the verdict is the *only* thing standing between an injected message and
+/// the conversation. It must refuse, and must not spend key doing so.
+#[tokio::test]
+async fn direct_framing_refuses_a_bad_verdict_and_keeps_the_pad_intact() {
+    if !require_otp() {
+        return;
+    }
+    let (_alice_cfg, bob_cfg) = provision_pair("direct-bad").await;
+    let (stranger_cfg, _) = provision_pair("direct-bad-stranger").await;
+
+    // Someone who does not hold the mirror key, sending a well-formed
+    // message of their own - the exact thing dropping the envelope would
+    // expose if the verdict were not enforced.
+    let injected = match otp_cli::encrypt(&stranger_cfg, "bob", b"trust me", true).await.unwrap() {
+        OtpCliOutcome::Ok(bytes) => bytes,
+        other => panic!("expected Ok, got {other:?}"),
+    };
+
+    match otp_cli::decrypt(&bob_cfg, "alice", &injected, true).await.unwrap() {
+        OtpCliOutcome::Rejected(_) => {}
+        other => panic!("a bad verdict must be a rejection, got {other:?}"),
+    }
+    let status = otp_cli::status(&bob_cfg, "alice").await.unwrap().unwrap();
+    assert_eq!(
+        status.dec_key_remaining,
+        1024 * 1024,
+        "refusing must cost no key, so the real correspondent is unaffected"
+    );
+    assert_eq!(status.dec_sequence, 0, "and must not advance the sequence");
+
+    // The pad is genuinely still usable afterwards - the injected message
+    // did not desynchronise anything.
+    let (alice_cfg2, bob_cfg2) = provision_pair("direct-bad-after").await;
+    let genuine = match otp_cli::encrypt(&alice_cfg2, "bob", b"the real one", true).await.unwrap() {
+        OtpCliOutcome::Ok(bytes) => bytes,
+        other => panic!("expected Ok, got {other:?}"),
+    };
+    match otp_cli::decrypt(&bob_cfg2, "alice", &genuine, true).await.unwrap() {
+        OtpCliOutcome::Ok(out) => assert_eq!(out, b"the real one"),
+        other => panic!("expected Ok, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------
+// The nonce-bound acknowledgement (AC-250), against the real binary
+// ---------------------------------------------------------------------
+
+/// The nonce lives at the pad layer, so it is there in pure-OTP mode too -
+/// where there is no envelope inside the pad at all, and the bytes that
+/// come back out are the message itself.
+///
+/// @requirement AC-250
+#[tokio::test]
+async fn direct_framing_carries_the_nonce_and_yields_the_senders_proof() {
+    if !require_otp() {
+        return;
+    }
+    let (alice_cfg, bob_cfg) = provision_pair("direct-nonce").await;
+    let plaintext = b"no pq_hybrid anywhere in sight";
+
+    let (ciphertext, sent_proof) = wrap_outgoing(&alice_cfg, plaintext.to_vec(), "bob")
+        .await
+        .expect("wrapping should succeed");
+    assert!(
+        !ciphertext.windows(plaintext.len()).any(|w| w == plaintext),
+        "the plaintext must not be recoverable from the wire bytes"
+    );
+
+    match unwrap_incoming(&bob_cfg, &ciphertext, "alice").await {
+        UnwrapOutcome::Ok(out, proof) => {
+            assert_eq!(out, plaintext, "the nonce must be stripped, not delivered");
+            assert_eq!(
+                proof, sent_proof,
+                "both sides reach the same proof with nothing negotiated"
+            );
+        }
+        other => panic!("expected Ok, got {other:?}"),
+    }
+}
+
+/// The proof is per message, not per contact: an acknowledgement genuinely
+/// earned by one message says nothing about the next.
+///
+/// @requirement AC-250
+#[tokio::test]
+async fn two_messages_under_one_pad_have_different_proofs() {
+    if !require_otp() {
+        return;
+    }
+    let (alice_cfg, bob_cfg) = provision_pair("two-nonces").await;
+
+    let (first, first_proof) = wrap_outgoing(&alice_cfg, b"same text".to_vec(), "bob")
+        .await
+        .expect("wrapping should succeed");
+    let UnwrapOutcome::Ok(_, first_seen) = unwrap_incoming(&bob_cfg, &first, "alice").await else {
+        panic!("the first message should decrypt");
+    };
+    assert_eq!(first_seen, first_proof);
+
+    // Byte-identical plaintext, so only the nonce distinguishes them.
+    let (second, second_proof) = wrap_outgoing(&alice_cfg, b"same text".to_vec(), "bob")
+        .await
+        .expect("wrapping should succeed");
+    assert_ne!(
+        first_proof, second_proof,
+        "a fresh nonce per message is what keeps an old ack from clearing a new gate"
+    );
+    let UnwrapOutcome::Ok(_, second_seen) = unwrap_incoming(&bob_cfg, &second, "alice").await else {
+        panic!("the second message should decrypt");
+    };
+    assert_eq!(second_seen, second_proof);
+}
+
+/// A message that fails the verdict yields no proof at all - there is
+/// nothing to derive one from, so the sender's gate stays shut.
+///
+/// @requirement AC-250
+#[tokio::test]
+async fn a_refused_message_produces_no_proof_to_acknowledge_it_with() {
+    if !require_otp() {
+        return;
+    }
+    let (_alice_cfg, bob_cfg) = provision_pair("nonce-refused").await;
+    let (stranger_cfg, _) = provision_pair("nonce-refused-stranger").await;
+
+    let (injected, _) = wrap_outgoing(&stranger_cfg, b"trust me".to_vec(), "bob")
+        .await
+        .expect("the stranger can wrap against their own pad");
+
+    match unwrap_incoming(&bob_cfg, &injected, "alice").await {
+        UnwrapOutcome::Rejected(_) => {}
+        other => panic!("a foreign pad must be refused outright, got {other:?}"),
+    }
+}
+
+/// A resend replays the exact ciphertext rather than re-encoding, so the
+/// nonce inside it is the same one - which is the whole reason a retry is
+/// still acknowledgeable. Had recovery re-encrypted, the receiver would
+/// have derived a proof the sender was no longer expecting and the gate
+/// would have wedged shut.
+///
+/// @requirement AC-250, AC-147
+#[tokio::test]
+async fn a_recovered_resend_still_proves_itself_with_the_original_nonce() {
+    if !require_otp() {
+        return;
+    }
+    let (alice_cfg, bob_cfg) = provision_pair("nonce-retry").await;
+
+    let (sent, sent_proof) = wrap_outgoing(&alice_cfg, b"did this arrive?".to_vec(), "bob")
+        .await
+        .expect("wrapping should succeed");
+
+    // The ack never came back, so alice recovers what she already sent.
+    let recovered = otp_cli::recover_last(&alice_cfg, "bob", RecoverDirection::Sent)
+        .await
+        .unwrap()
+        .expect("the last sent ciphertext is still recoverable");
+    assert_eq!(
+        recovered, sent,
+        "recovery must replay the exact bytes, nonce included - never a fresh encode"
+    );
+
+    match unwrap_incoming(&bob_cfg, &recovered, "alice").await {
+        UnwrapOutcome::Ok(out, proof) => {
+            assert_eq!(out, b"did this arrive?");
+            assert_eq!(
+                proof, sent_proof,
+                "the retry earns the very proof the sender is still waiting on"
+            );
+        }
+        other => panic!("expected Ok, got {other:?}"),
+    }
 }

@@ -9,6 +9,7 @@ use aloo::proto::{ChannelInfo, ChannelKind, KeyMode, UserId};
 use aloo::client::reconnect::ServerLinkState;
 use aloo::client::tui::channel::{HEADER_ROW_HEIGHT, messages_start_col};
 use aloo::client::tui::ui::{
+    DeliveryProof,
     DeliveryStatus, Focus, IdentityCase, MessageBody, SELECTOR_DROPDOWN_IDLE_TIMEOUT, UiAction,
     UiState, VoiceTarget, render, strike_through,
 };
@@ -2339,13 +2340,13 @@ fn a_channel_message_reads_orange_once_only_some_recipients_have_it() {
     let status = |s: &UiState| s.channels[0].log[0].delivery_status();
 
     assert_eq!(status(&state), Some(DeliveryStatus::None));
-    state.mark_delivered(UserId(2), msg_id, ReceiptStage::Decrypted);
+    state.mark_delivered(UserId(2), msg_id, ReceiptStage::Decrypted, DeliveryProof::Receipt);
     assert_eq!(
         status(&state),
         Some(DeliveryStatus::Some),
         "one of two recipients is partway, not delivered"
     );
-    state.mark_delivered(UserId(3), msg_id, ReceiptStage::Decrypted);
+    state.mark_delivered(UserId(3), msg_id, ReceiptStage::Decrypted, DeliveryProof::Receipt);
     assert_eq!(status(&state), Some(DeliveryStatus::All));
 }
 

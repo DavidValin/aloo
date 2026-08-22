@@ -87,9 +87,11 @@ async fn seal_and_wrap(w: &mut AlooWorld, from: String, message: String, to: Str
 
     let contact = w.otp_contact_name.clone().expect("no otp contact provisioned yet");
     let cfg = w.otp_cfgs.get(&from).expect("no otp config for this side").clone();
-    w.otp_wrapped = wrap_outgoing(&cfg, blob, &contact)
+    let (wrapped, proof) = wrap_outgoing(&cfg, blob, &contact)
         .await
         .expect("wrapping should succeed");
+    w.otp_wrapped = wrapped;
+    w.otp_ack_proof = Some(proof);
     w.plaintext = message.into_bytes();
 }
 
@@ -109,7 +111,10 @@ async fn unwraps_and_reads(w: &mut AlooWorld, who: String) {
     let contact = w.otp_contact_name.clone().expect("no otp contact provisioned yet");
     let cfg = w.otp_cfgs.get(&who).expect("no otp config for this side").clone();
     let blob = match unwrap_incoming(&cfg, &w.otp_wrapped, &contact).await {
-        aloo::client::otp::UnwrapOutcome::Ok(bytes) => bytes,
+        aloo::client::otp::UnwrapOutcome::Ok(bytes, proof) => {
+            w.otp_unwrapped_ack_proof = Some(proof);
+            bytes
+        }
         other => panic!("expected unwrapping to succeed, got {other:?}"),
     };
 
@@ -141,7 +146,7 @@ async fn attempt_send_under_pad(w: &mut AlooWorld, from: &str, message: &str) {
         .await
         .expect("wrapping should succeed");
     w.otp_store_mut()
-        .record_sent(&contact, seq, PendingOtpContent::Text { channel: None });
+        .record_sent(&contact, seq, PendingOtpContent::Text { channel: None }, None);
     w.otp_outstanding = Some((message.to_string(), seq));
     w.otp_sent.push(message.to_string());
 }
@@ -168,7 +173,7 @@ async fn delivery_ack_arrives(w: &mut AlooWorld, _who: String, text: String) {
     let (pending_text, seq) = w.otp_outstanding.clone().expect("nothing is outstanding");
     assert_eq!(pending_text, text, "the ack must name the message actually outstanding");
     assert!(
-        w.otp_store_mut().record_acked(&contact, seq),
+        w.otp_store_mut().record_acked(&contact, seq, None),
         "a genuine, matching ack must clear the gate"
     );
     w.otp_outstanding = None;
@@ -590,5 +595,18 @@ async fn otp_tag_on_dm_selector(w: &mut AlooWorld, name: String) {
     assert!(
         crate::support::appears_before(&rows, &name, "OTP"),
         "the DM selector carries the tag after the nickname: {rows:?}"
+    );
+}
+
+#[then("the acknowledgement proof the receiver computed matches the sender's")]
+async fn ack_proof_matches(w: &mut AlooWorld) {
+    let sent = w.otp_ack_proof.expect("nothing was wrapped in this scenario");
+    let read_back = w
+        .otp_unwrapped_ack_proof
+        .expect("nothing was unwrapped in this scenario");
+    assert_eq!(
+        sent, read_back,
+        "only a party that actually opened the pad can name this message's nonce, \
+         so the two sides must arrive at the same proof independently"
     );
 }

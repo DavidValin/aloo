@@ -170,6 +170,12 @@ pub struct SessionState {
     /// - neither ever rotates), used to decrypt anything addressed to us.
     /// `None` for `PqHybrid` - see `own_pq_private`.
     pub(crate) own_keys: Option<RsaPrivateKey>,
+    /// This side's own pinned public key, encoded once at session build
+    /// rather than re-derived per use - the local half of a pure-OTP
+    /// contact's name (`crypto::otp::contact_name_for_keys`). `None` for
+    /// `KeyMode::None`, which has no key stable across reconnects to bind
+    /// a pad to at all.
+    pub(crate) otp_own_pinned_der: Option<Vec<u8>>,
     /// This client's own PQ-hybrid private keybundle (`crypto::pq`,
     /// `docs/PROTOCOL.md` §13) - `Some` only when `own_key_mode ==
     /// KeyMode::PqHybrid`, the mirror image of `own_keys` above. `PqHybrid`
@@ -235,14 +241,20 @@ pub struct SessionState {
     /// Outgoing OTP messages held back while their contact's previous
     /// message is still awaiting a network ack - in-memory only, unlike
     /// `otp_store` (`client::otp::OtpOutQueue`'s doc).
+    /// Which log row (`MessageDelivery::msg_id`) each outstanding pad send
+    /// belongs to, keyed by the `(contact, seq)` that names it on the wire.
+    ///
+    /// Two call sites need it: the ack that clears the gate, so it can also
+    /// turn that row's arrow green (`client::tui::ui::DeliveryProof::PadAck`),
+    /// and `recover_and_resend_text`, so a resend still names the row the
+    /// original send did rather than landing untracked.
+    ///
+    /// Deliberately in memory only, unlike the gate itself
+    /// (`otp_store`'s `pending_ack_proof`): the log it points into does not
+    /// survive a restart either, so persisting the id would only ever name
+    /// a row that no longer exists.
+    pub(crate) otp_ack_rows: std::collections::HashMap<(String, u64), u64>,
     pub(crate) otp_out_queue: crate::client::otp::OtpOutQueue,
-    /// Which log row each outstanding OTP text send belongs to, keyed by
-    /// `(contact_name, seq)` - what lets `client::otp::recover_and_resend_text`
-    /// name the same message again (docs/PROTOCOL.md 7.2.1) when a stuck
-    /// send is recovered rather than re-encoded. In-memory and
-    /// session-scoped, like every other delivery id: a row from a previous
-    /// run no longer exists to turn green.
-    pub(crate) otp_text_msg_ids: std::collections::HashMap<(String, u64), u64>,
     /// Voice messages and file transfers that still owe their sender a
     /// delivery receipt (`client::delivery`, docs/PROTOCOL.md 7.2.1).
     pub(crate) pending_receipts: crate::client::delivery::PendingReceipts,
@@ -253,10 +265,6 @@ pub struct SessionState {
     /// handshake attempt has to restart anyway, same as any other
     /// in-flight state tied to a `UserId`.
     pub(crate) otp_incoming_setup: HashMap<UserId, crate::crypto::otp::OtpKeySetupReassembly>,
-    /// Pads currently streaming *in*, keyed by sender - see
-    /// `client::otp_pad`. At most one per peer: a second `OtpPadStart` from
-    /// the same sender supersedes the first, since a fresh `/otp` on their
-    /// side is a fresh proposal and the old one can never be completed.
     pub(crate) otp_incoming_pads: HashMap<UserId, crate::client::otp_pad::IncomingPad>,
     /// Pads currently streaming *out*, keyed by recipient - the sending
     /// counterpart, and what `on_pad_verify` looks up to decide whether a
@@ -571,7 +579,11 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
         audio_err_tx,
         call_level_tx,
         own_key_mode: key_mode,
-        own_keys,
+        own_keys: own_keys.clone(),
+        otp_own_pinned_der: own_keys
+            .as_ref()
+            .filter(|_| crate::client::keymode_policy::uses_byte_comparison_pinning(key_mode))
+            .and_then(|k| crate::crypto::public_key_to_der(&k.to_public_key()).ok()),
         own_pq_private,
         own_pq_fp,
         own_pq_keys,
@@ -597,8 +609,8 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
                 crate::client::otp_store::OtpStore::default_path(),
             )
         }),
+        otp_ack_rows: std::collections::HashMap::new(),
         otp_out_queue: crate::client::otp::OtpOutQueue::new(),
-        otp_text_msg_ids: std::collections::HashMap::new(),
         pending_receipts: crate::client::delivery::PendingReceipts::new(),
         otp_incoming_setup: HashMap::new(),
         otp_incoming_pads: HashMap::new(),
@@ -2497,9 +2509,16 @@ async fn handle_p2p_event(
             stage,
         } => {
             // The peer reports what it managed to do with this message
-            // (docs/PROTOCOL.md 7.2.1) - the only thing that moves a row's
-            // indicator off gray.
-            ui_state.mark_delivered(peer, msg_id, stage);
+            // (docs/PROTOCOL.md 7.2.1) - what moves a row's indicator off
+            // gray, except on a leg that went out under the pad, where the
+            // pad's own proof-carrying ack is the only thing that does
+            // (`DeliveryProof`).
+            ui_state.mark_delivered(
+                peer,
+                msg_id,
+                stage,
+                crate::client::tui::ui::DeliveryProof::Receipt,
+            );
         }
         P2pEvent::LinkFailed { peer, reason } => {
             let name = name_of(ui_state, peer);
@@ -2637,7 +2656,7 @@ async fn handle_p2p_event(
             crate::client::otp::on_message(
                 session, ui_state, channel, from, from_name, seq, msg_id, envelope,
             )
-            .await;
+            .await?;
         }
         P2pEvent::OtpFileOffer {
             channel,
@@ -2654,8 +2673,8 @@ async fn handle_p2p_event(
             )
             .await;
         }
-        P2pEvent::OtpDeliveryAck { from, seq } => {
-            crate::client::otp::on_delivery_ack(wr, ui_state, session, from, seq).await?;
+        P2pEvent::OtpDeliveryAck { from, seq, proof } => {
+            crate::client::otp::on_delivery_ack(wr, ui_state, session, from, seq, proof).await?;
         }
         P2pEvent::OtpFileContentSeq { from, stream_id, seq } => {
             if let Some(pending) = session.otp_incoming_file_receives.get_mut(&(from, stream_id)) {
@@ -3022,7 +3041,7 @@ pub fn direct_peer_identity(
 ///
 /// Idempotent: a peer whose keys are already known keeps them, so a later
 /// rotation is never undone by re-seeding the bootstrap it superseded.
-fn seed_direct_peer_keys(session: &mut SessionState, peer: UserId, info: &UserInfo) {
+pub fn seed_direct_peer_keys(session: &mut SessionState, peer: UserId, info: &UserInfo) {
     if session.pq_peer_keys.encap_for(peer).is_some() {
         return;
     }
@@ -3434,6 +3453,11 @@ pub struct TestSessionSpec {
     /// `~/.aloo` is put instead. Nothing in it is read back; it exists so
     /// a test can never touch, or be perturbed by, real local state.
     pub scratch: std::path::PathBuf,
+    /// Which `otp` binary and keychain this session should use. `None`
+    /// points at a path that deliberately does not exist, so a test that
+    /// never meant to involve the pad layer fails closed rather than
+    /// reaching for a real one (`otp_cli::binary_available`).
+    pub otp: Option<crate::client::otp_cli::OtpCliConfig>,
 }
 
 impl SessionState {
@@ -3443,6 +3467,14 @@ impl SessionState {
     /// (`PeerLinkManager::pending_payloads`).
     pub fn peer_link_mut(&mut self) -> &mut PeerLinkManager {
         &mut self.peer_link
+    }
+
+    /// The OTP layer's per-contact state - exposed for tests, which need
+    /// to mark a contact provisioned (standing in for a handshake covered
+    /// elsewhere) and to read back whether a send is still awaiting its
+    /// acknowledgement.
+    pub fn otp_store_mut(&mut self) -> &mut crate::client::otp_store::OtpStore {
+        &mut self.otp_store
     }
 
     /// Builds a session for tests, without a terminal, an audio device, a
@@ -3525,6 +3557,7 @@ impl SessionState {
             call_level_tx,
             own_key_mode: spec.key_mode,
             own_keys,
+            otp_own_pinned_der: None,
             own_pq_private,
             own_pq_fp,
             own_pq_keys,
@@ -3541,16 +3574,16 @@ impl SessionState {
             auto_stop_tx,
             active_replay_id: None,
             peer_link,
-            otp_cli_cfg: crate::client::otp_cli::OtpCliConfig {
+            otp_cli_cfg: spec.otp.unwrap_or(crate::client::otp_cli::OtpCliConfig {
                 binary_path: spec.scratch.join("no-such-otp-binary"),
                 working_dir: spec.scratch.join("otp"),
-            },
+            }),
             otp_store: crate::client::otp_store::OtpStore::new_empty(
                 spec.scratch.join("otp_store"),
             ),
+            otp_ack_rows: std::collections::HashMap::new(),
             otp_out_queue: crate::client::otp::OtpOutQueue::new(),
-            otp_text_msg_ids: std::collections::HashMap::new(),
-            pending_receipts: crate::client::delivery::PendingReceipts::new(),
+                pending_receipts: crate::client::delivery::PendingReceipts::new(),
             otp_incoming_setup: HashMap::new(),
             otp_incoming_pads: HashMap::new(),
             otp_outgoing_pads: HashMap::new(),

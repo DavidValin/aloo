@@ -14,6 +14,7 @@ use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 use aloo::client::connect::ResolvedIdentity;
 use aloo::client::session::{SessionState, TestSessionSpec};
 use aloo::client::tui::ui::{
+    DeliveryProof,
     DELIVERED_LABEL, DELIVERY_ARROW, DeliveryStatus, ENCRYPTION_LABEL, Focus, KEY_FILE_LABEL,
     KEY_LABEL, KEY_OFFSET_LABEL, KEY_SEQ_LABEL, LISTENED_LABEL, LogEntry, MessageBody,
     NO_CRYPTO_INFO, SAVED_LABEL, SENT_AT_LABEL, UNDELIVERED_LABEL, UiAction, UiState,
@@ -73,7 +74,7 @@ fn assert_status(entry: &LogEntry, want: DeliveryStatus) {
 async fn peer_acknowledges(w: &mut AlooWorld, name: String) {
     let msg_id = last_msg_id(w);
     w.ui_mut()
-        .mark_delivered(UserId(id_for(&name)), msg_id, ReceiptStage::Decrypted);
+        .mark_delivered(UserId(id_for(&name)), msg_id, ReceiptStage::Decrypted, DeliveryProof::Receipt);
 }
 
 // ---------------------------------------------------------------------
@@ -433,7 +434,7 @@ fn last_msg_id_in_general(w: &AlooWorld) -> u64 {
 async fn bob_decrypted(w: &mut AlooWorld) {
     let msg_id = last_msg_id_in_general(w);
     w.ui_mut()
-        .mark_delivered(UserId(id_for("bob")), msg_id, ReceiptStage::Decrypted);
+        .mark_delivered(UserId(id_for("bob")), msg_id, ReceiptStage::Decrypted, DeliveryProof::Receipt);
     open_details_on_last_row(w);
 }
 
@@ -442,7 +443,7 @@ async fn bob_decrypted(w: &mut AlooWorld) {
 async fn bob_consumed(w: &mut AlooWorld) {
     let msg_id = last_msg_id_in_general(w);
     w.ui_mut()
-        .mark_delivered(UserId(id_for("bob")), msg_id, ReceiptStage::Consumed);
+        .mark_delivered(UserId(id_for("bob")), msg_id, ReceiptStage::Consumed, DeliveryProof::Receipt);
     open_details_on_last_row(w);
 }
 
@@ -493,6 +494,7 @@ async fn a_readable_session(w: &mut AlooWorld) {
             public: me.public.clone(),
         }),
         scratch,
+        otp: None,
     })
     .await;
 

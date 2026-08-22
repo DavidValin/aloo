@@ -44,7 +44,7 @@ fn mark_provisioned_round_trips_through_save_and_load() {
 fn record_sent_sets_the_pending_ack_gate() {
     let mut store = OtpStore::new_empty(temp_store_path());
     store.mark_provisioned("alice-bob");
-    store.record_sent("alice-bob", 0, PendingOtpContent::Text { channel: None });
+    store.record_sent("alice-bob", 0, PendingOtpContent::Text { channel: None }, None);
     let state = store.get("alice-bob").unwrap();
     assert_eq!(state.pending_unacked_out_seq, Some(0));
     assert_eq!(state.next_out_seq, 1);
@@ -54,21 +54,94 @@ fn record_sent_sets_the_pending_ack_gate() {
 #[test]
 fn record_acked_clears_the_gate_only_on_a_matching_sequence() {
     let mut store = OtpStore::new_empty(temp_store_path());
-    store.record_sent("alice-bob", 5, PendingOtpContent::Text { channel: None });
+    store.record_sent("alice-bob", 5, PendingOtpContent::Text { channel: None }, None);
 
     // A stale/mismatched ack must not clear a different outstanding message.
-    assert!(!store.record_acked("alice-bob", 4));
+    assert!(!store.record_acked("alice-bob", 4, None));
     assert_eq!(
         store.get("alice-bob").unwrap().pending_unacked_out_seq,
         Some(5)
     );
 
-    assert!(store.record_acked("alice-bob", 5));
+    assert!(store.record_acked("alice-bob", 5, None));
     assert_eq!(store.get("alice-bob").unwrap().pending_unacked_out_seq, None);
 
     // A second ack for the same (now cleared) sequence is a no-op, not an
     // error - there's nothing left to clear.
-    assert!(!store.record_acked("alice-bob", 5));
+    assert!(!store.record_acked("alice-bob", 5, None));
+}
+
+/// The gate is what stops aloo passing `-y` to the next `otp --encrypt`,
+/// so what opens it has to be unforgeable. A sequence number alone is
+/// visible to anyone who saw the packet; the proof is not, because reaching
+/// it requires the nonce that only the pad reveals.
+///
+/// @requirement AC-250
+#[test]
+fn record_acked_refuses_an_ack_that_cannot_name_the_message() {
+    let mut store = OtpStore::new_empty(temp_store_path());
+    let proof = aloo::crypto::otp::ack_proof_for(b"the nonce that rode under the pad");
+    store.record_sent(
+        "alice-bob",
+        7,
+        PendingOtpContent::Text { channel: None },
+        Some(proof),
+    );
+
+    // Right sequence, wrong proof - an observer quoting back what it saw.
+    assert!(!store.record_acked("alice-bob", 7, Some([0u8; 32])));
+    // Right sequence, no proof at all.
+    assert!(!store.record_acked("alice-bob", 7, None));
+    assert_eq!(
+        store.get("alice-bob").unwrap().pending_unacked_out_seq,
+        Some(7),
+        "a refused ack must leave the message outstanding, not silently drop it"
+    );
+
+    assert!(store.record_acked("alice-bob", 7, Some(proof)));
+    let state = store.get("alice-bob").unwrap();
+    assert_eq!(state.pending_unacked_out_seq, None);
+    assert_eq!(
+        state.pending_ack_proof, None,
+        "the expectation is spent along with the gate it guarded"
+    );
+}
+
+/// A message recorded without an expectation - written by a build predating
+/// this check, or a mail spend the server acknowledges - must still be
+/// clearable, or the contact would wedge permanently.
+///
+/// @requirement AC-250
+#[test]
+fn record_acked_still_clears_a_message_that_recorded_no_expectation() {
+    let mut store = OtpStore::new_empty(temp_store_path());
+    store.record_sent("alice-bob", 1, PendingOtpContent::Text { channel: None }, None);
+    assert!(store.record_acked("alice-bob", 1, Some([9u8; 32])));
+    assert_eq!(store.get("alice-bob").unwrap().pending_unacked_out_seq, None);
+}
+
+/// The gate outlives a restart, so the expectation guarding it has to as
+/// well - otherwise an ack arriving after a restart could only be trusted
+/// blindly or refused forever.
+///
+/// @requirement AC-250
+#[test]
+fn a_pending_ack_proof_survives_save_and_load() {
+    let path = temp_store_path();
+    let mut store = OtpStore::new_empty(path.clone());
+    let proof = aloo::crypto::otp::ack_proof_for(b"nonce");
+    store.record_sent(
+        "alice-bob",
+        2,
+        PendingOtpContent::Text { channel: None },
+        Some(proof),
+    );
+    store.save().unwrap();
+
+    let mut loaded = OtpStore::load(&path).unwrap();
+    assert_eq!(loaded.get("alice-bob").unwrap().pending_ack_proof, Some(proof));
+    assert!(!loaded.record_acked("alice-bob", 2, Some([0u8; 32])));
+    assert!(loaded.record_acked("alice-bob", 2, Some(proof)));
 }
 
 /// @requirement AC-137
@@ -139,13 +212,14 @@ fn is_next_expected_rejects_a_resend_of_an_already_accepted_sequence() {
 fn pending_content_round_trips_through_save_and_load() {
     let path = temp_store_path();
     let mut store = OtpStore::new_empty(path.clone());
-    store.record_sent("text-contact", 0, PendingOtpContent::Text { channel: None });
+    store.record_sent("text-contact", 0, PendingOtpContent::Text { channel: None }, None);
     store.record_sent(
         "text-channel-contact",
         0,
         PendingOtpContent::Text {
             channel: Some("general".to_string()),
         },
+        None,
     );
     store.record_sent(
         "file-contact",
@@ -155,13 +229,15 @@ fn pending_content_round_trips_through_save_and_load() {
             filename: "report.pdf".to_string(),
             size: 123456,
         },
+        None,
     );
     store.record_sent(
         "file-content-contact",
         4,
         PendingOtpContent::FileContent { stream_id: 9 },
+        None,
     );
-    store.record_sent("voice-contact", 1, PendingOtpContent::Voice { duration_ms: 4200 });
+    store.record_sent("voice-contact", 1, PendingOtpContent::Voice { duration_ms: 4200 }, None);
     store.save().unwrap();
 
     let loaded = OtpStore::load(&path).unwrap();
@@ -214,8 +290,8 @@ fn a_line_written_before_pending_content_existed_still_loads() {
 #[test]
 fn record_acked_clears_pending_content() {
     let mut store = OtpStore::new_empty(temp_store_path());
-    store.record_sent("acked", 0, PendingOtpContent::Text { channel: None });
-    assert!(store.record_acked("acked", 0));
+    store.record_sent("acked", 0, PendingOtpContent::Text { channel: None }, None);
+    assert!(store.record_acked("acked", 0, None));
     assert_eq!(store.get("acked").unwrap().pending_content, None);
 }
 
@@ -228,6 +304,7 @@ fn pending_sends_yields_only_contacts_with_something_outstanding() {
         "busy-contact",
         2,
         PendingOtpContent::Voice { duration_ms: 900 },
+        None,
     );
 
     let pending: Vec<_> = store.pending_sends().collect();
@@ -336,7 +413,7 @@ fn pause_session_clears_pending_state_but_keeps_the_pad_and_owes_a_notice() {
     let path = temp_store_path();
     let mut store = OtpStore::new_empty(path.clone());
     store.mark_provisioned("alice-bob");
-    store.record_sent("alice-bob", 3, PendingOtpContent::Text { channel: None });
+    store.record_sent("alice-bob", 3, PendingOtpContent::Text { channel: None }, None);
     store.record_received("alice-bob", 0);
     store.mark_setup_pending("alice-bob", 2);
 
@@ -382,7 +459,7 @@ fn pause_after_peer_ended_clears_pending_state_but_owes_no_notice_of_its_own() {
     let path = temp_store_path();
     let mut store = OtpStore::new_empty(path.clone());
     store.mark_provisioned("alice-bob");
-    store.record_sent("alice-bob", 1, PendingOtpContent::Text { channel: None });
+    store.record_sent("alice-bob", 1, PendingOtpContent::Text { channel: None }, None);
 
     store.pause_after_peer_ended("alice-bob");
 
@@ -455,7 +532,7 @@ fn pausing_one_contacts_session_does_not_touch_another_contacts_state() {
     let mut store = OtpStore::new_empty(path.clone());
     store.mark_provisioned("alice-bob");
     store.mark_provisioned("alice-carol");
-    store.record_sent("alice-carol", 5, PendingOtpContent::Text { channel: None });
+    store.record_sent("alice-carol", 5, PendingOtpContent::Text { channel: None }, None);
 
     store.pause_session("alice-bob");
 
@@ -498,7 +575,7 @@ fn a_paused_contact_can_have_its_end_notice_cancelled_and_stay_provisioned() {
     let path = temp_store_path();
     let mut store = OtpStore::new_empty(path.clone());
     store.mark_provisioned("alice-bob");
-    store.record_sent("alice-bob", 3, PendingOtpContent::Text { channel: None });
+    store.record_sent("alice-bob", 3, PendingOtpContent::Text { channel: None }, None);
     store.pause_session("alice-bob");
     assert!(store.get("alice-bob").unwrap().pending_end_notice);
 
@@ -528,8 +605,8 @@ fn a_paused_contact_is_still_provisioned_so_otp_resumes_instead_of_regenerating(
     let mut store = OtpStore::new_empty(path.clone());
     store.mark_provisioned("alice-bob");
     store.record_received("alice-bob", 0);
-    store.record_sent("alice-bob", 0, PendingOtpContent::Text { channel: None });
-    store.record_acked("alice-bob", 0);
+    store.record_sent("alice-bob", 0, PendingOtpContent::Text { channel: None }, None);
+    store.record_acked("alice-bob", 0, None);
 
     store.pause_session("alice-bob");
     store.save().unwrap();

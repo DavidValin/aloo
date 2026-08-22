@@ -7,6 +7,7 @@ use aloo::client::p2p::PENDING_MAX;
 use aloo::client::otp_cli::{self, OtpCliConfig};
 use aloo::client::otp_store::{OtpContactState, OtpStore, PendingOtpContent};
 use aloo::crypto::otp::{
+    contact_name_for_keys,
     contact_name_for, otp_size_mb_in_range, OtpEndSessionPayload, OtpKeySetupAckPayload,
     OtpKeySetupChunk, OtpKeySetupPayload, OtpKeySetupReassembly, OTP_SIZE_MB_MAX, OTP_SIZE_MB_MIN,
 };
@@ -726,4 +727,200 @@ fn zz_scratch_measure_chunk_dgram() {
     eprintln!("OTP_SETUP_CHUNK_BYTES = {}", OTP_SETUP_CHUNK_BYTES);
     eprintln!("bincode-encoded chunk plaintext = {} bytes", encoded.len());
     eprintln!("chunks for a 1MB/key pad = {}", (1024*1024usize).div_ceil(OTP_SETUP_CHUNK_BYTES));
+}
+
+// ---------------------------------------------------------------------
+// Pure-OTP mode: which framing applies, and what each one rests on
+// ---------------------------------------------------------------------
+
+use aloo::client::otp::{framing_for, OtpFraming};
+use aloo::proto::KeyMode;
+
+/// Scenario 1 - pq_hybrid available on both sides. The pad wraps an
+/// ordinary envelope, exactly as before; nothing about this path changes.
+#[test]
+fn pq_hybrid_on_both_sides_keeps_the_wrapped_framing() {
+    assert_eq!(
+        framing_for(KeyMode::PqHybrid, KeyMode::PqHybrid),
+        OtpFraming::PqWrapped
+    );
+}
+
+/// Scenario 2 - pq_hybrid missing on either side. An envelope can only be
+/// built when this side can sign one *and* the other can open it, so a
+/// single missing identity is enough to drop to direct framing.
+#[test]
+fn a_missing_pq_hybrid_identity_on_either_side_means_direct_framing() {
+    for (own, peer) in [
+        (KeyMode::Password, KeyMode::PqHybrid),
+        (KeyMode::None, KeyMode::PqHybrid),
+        (KeyMode::PqHybrid, KeyMode::Password),
+        (KeyMode::PqHybrid, KeyMode::None),
+        (KeyMode::Password, KeyMode::Password),
+        (KeyMode::None, KeyMode::None),
+    ] {
+        assert_eq!(
+            framing_for(own, peer),
+            OtpFraming::Direct,
+            "own={own:?} peer={peer:?} cannot carry an inner envelope"
+        );
+    }
+}
+
+/// The framing decision is symmetric in the sense that matters: both ends
+/// of one pair reach the same answer, so one never wraps while the other
+/// expects bare plaintext.
+#[test]
+fn both_ends_of_a_pair_agree_on_the_framing() {
+    for (a, b) in [
+        (KeyMode::PqHybrid, KeyMode::PqHybrid),
+        (KeyMode::PqHybrid, KeyMode::Password),
+        (KeyMode::Password, KeyMode::None),
+    ] {
+        assert_eq!(
+            framing_for(a, b),
+            framing_for(b, a),
+            "{a:?}/{b:?} must be framed identically from either side"
+        );
+    }
+}
+
+/// **The impersonation defence.** A pad is looked up by a name derived from
+/// the two pinned keys, so someone who takes a familiar *nickname* but holds
+/// a different key derives a different name - finds no pad under it, and
+/// gets none of ours spent on them.
+///
+/// This matters even though they could never read what we sent: encrypting
+/// consumes our key irreversibly, so a message sent to an impostor destroys
+/// pad the real contact still needs and leaves the two sides' offsets out of
+/// step. Confidentiality was never the exposure; the pad's survival was.
+#[test]
+fn an_impersonator_with_the_same_nickname_derives_a_different_contact_name() {
+    let own = b"my-own-pinned-key";
+    let real_bob = b"the-real-bobs-pinned-key";
+    let impostor = b"an-impostor-who-took-the-name-bob";
+
+    let real = contact_name_for_keys(own, real_bob);
+    let fake = contact_name_for_keys(own, impostor);
+    assert_ne!(
+        real, fake,
+        "an impersonator must never resolve to the pad we hold for the real contact"
+    );
+}
+
+/// Both sides derive the identical name from their own and their peer's
+/// key, with nothing negotiated - the same order-independence the
+/// fingerprint-derived name has.
+#[test]
+fn a_key_derived_contact_name_is_order_independent_and_stable() {
+    let a = b"alices-key";
+    let b = b"bobs-key";
+    assert_eq!(contact_name_for_keys(a, b), contact_name_for_keys(b, a));
+    assert_eq!(contact_name_for_keys(a, b), contact_name_for_keys(a, b));
+    assert_ne!(contact_name_for_keys(a, b), contact_name_for_keys(a, b"carols-key"));
+}
+
+/// A key-derived name has to satisfy the same CLI naming rules a
+/// fingerprint-derived one does, or `otp --add-contact` would refuse the
+/// pad it is meant to file.
+#[test]
+fn a_key_derived_contact_name_satisfies_the_otp_cli_naming_rules() {
+    let forbidden = ['/', '\\', ':', '*', '?', '"', '<', '>', '|', '='];
+    let name = contact_name_for_keys(b"own", b"peer");
+    assert_ne!(name, ".");
+    assert_ne!(name, "..");
+    assert!(!name.chars().any(|c| forbidden.contains(&c) || c.is_control()));
+    assert!(!name.is_empty());
+}
+
+// ---------------------------------------------------------------------
+// The pad as a second factor: bounding what an unproved peer can extract
+// ---------------------------------------------------------------------
+
+/// Holding the identity key that *selects* a contact is not the same as
+/// holding that contact's pad. Only the pad can produce a message `otp`
+/// will accept - and only a party that opened one can name the nonce
+/// buried inside it, which is exactly what the acknowledgement must carry.
+///
+/// So the bound falls out of the send gate itself: the first message goes
+/// out on the strength of the identity, and the second waits on an
+/// acknowledgement that a pad-less impersonator cannot produce.
+///
+/// @requirement AC-250
+#[test]
+fn a_peer_without_the_pad_cannot_unblock_a_second_message() {
+    let mut store = OtpStore::new_empty(temp_dir("impostor").join("otp-store"));
+    let nonce = b"the nonce alice buried under the pad";
+    let proof = aloo::crypto::otp::ack_proof_for(nonce);
+    let blocked = |s: &OtpStore| s.get("alice-bob").and_then(|c| c.pending_unacked_out_seq).is_some();
+
+    store.record_sent(
+        "alice-bob",
+        0,
+        PendingOtpContent::Text { channel: None },
+        Some(proof),
+    );
+    assert!(blocked(&store), "the first message closes the gate behind it");
+
+    // An impostor saw the packet, so it can quote the sequence number - but
+    // the nonce was under the pad, and it has no pad.
+    assert!(!store.record_acked("alice-bob", 0, Some([0xAB; 32])));
+    assert!(
+        blocked(&store),
+        "a peer that cannot name the message must not receive a second one"
+    );
+
+    // The genuine contact decrypted it, so it can.
+    assert!(store.record_acked("alice-bob", 0, Some(proof)));
+    assert!(!blocked(&store), "real proof releases what was held behind the gate");
+}
+
+/// The bound is per contact - one contact's proof says nothing about
+/// another's, because each has its own pad and its own nonce.
+///
+/// @requirement AC-250
+#[test]
+fn proving_one_contact_does_not_unblock_a_different_one() {
+    let mut store = OtpStore::new_empty(temp_dir("two-contacts").join("otp-store"));
+    let bob_proof = aloo::crypto::otp::ack_proof_for(b"bob nonce");
+    let carol_proof = aloo::crypto::otp::ack_proof_for(b"carol nonce");
+    store.record_sent("alice-bob", 0, PendingOtpContent::Text { channel: None }, Some(bob_proof));
+    store.record_sent("alice-carol", 0, PendingOtpContent::Text { channel: None }, Some(carol_proof));
+
+    assert!(store.record_acked("alice-bob", 0, Some(bob_proof)));
+    assert!(
+        !store.record_acked("alice-carol", 0, Some(bob_proof)),
+        "bob's proof must not open carol's gate"
+    );
+    assert!(store.record_acked("alice-carol", 0, Some(carol_proof)));
+}
+
+/// A file transfer's content phase and a voice message carry the user's
+/// bytes verbatim under the pad, so there is nowhere to bury a nonce. The
+/// plaintext's own digest stands in, and it proves the same thing: it can
+/// only be named by someone who decrypted the content.
+///
+/// @requirement AC-250
+#[test]
+fn a_whole_file_spend_proves_itself_with_the_plaintexts_digest() {
+    let dir = temp_dir("ack-file");
+    let a = dir.join("a.bin");
+    let b = dir.join("b.bin");
+    std::fs::write(&a, b"the recording that was actually sent").unwrap();
+    std::fs::write(&b, b"the recording that was actually sent").unwrap();
+
+    let sent = aloo::crypto::otp::ack_proof_for_file(&a).unwrap();
+    let received = aloo::crypto::otp::ack_proof_for_file(&b).unwrap();
+    assert_eq!(
+        sent, received,
+        "both sides must reach the same proof from the same plaintext, independently"
+    );
+
+    std::fs::write(&b, b"the recording that was actually sen_").unwrap();
+    assert_ne!(
+        sent,
+        aloo::crypto::otp::ack_proof_for_file(&b).unwrap(),
+        "a single differing byte must not be acknowledgeable as this message"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
