@@ -1,6 +1,8 @@
 use std::time::{Duration, Instant};
 
-use aloo::client::p2p_reliable::{ArqReceiver, ArqSender, MAX_RETRIES, SEND_WINDOW};
+use aloo::client::p2p_reliable::{
+    ArqReceiver, ArqSender, MAX_RETRIES, REORDER_BUFFER_LIMIT, SEND_WINDOW, SEND_WINDOW_BYTES,
+};
 
 // ---------------------------------------------------------------------
 // ArqReceiver: in-order delivery under reordering/duplication
@@ -56,7 +58,11 @@ fn duplicate_frames_are_dropped_without_redelivering() {
 fn reorder_buffer_bound_fails_the_link_rather_than_growing_unbounded() {
     let mut rx = ArqReceiver::new();
     // Never send seq 0, so every one of these sits in the reorder buffer.
-    for seq in 1..500 {
+    // Derived from the limit rather than hardcoded: the bound moves with
+    // `SEND_WINDOW` (a receiver must tolerate a full window of reordering),
+    // and a literal here would silently stop testing the bound the moment
+    // it did.
+    for seq in 1..(REORDER_BUFFER_LIMIT as u32 * 2) {
         rx.receive(seq, vec![]);
         if rx.failed() {
             break;
@@ -246,5 +252,88 @@ fn a_full_window_lost_in_flight_stays_within_the_receivers_reorder_bound() {
     assert!(
         !rx.failed(),
         "a full window in flight must stay inside the receiver's reorder buffer"
+    );
+}
+
+/// Frames are not one size, so counting them is the wrong unit for what
+/// the window is protecting. A pad chunk is ~1KB and an OTP setup chunk
+/// ~32KB; a window of `SEND_WINDOW` frames is 128KB of the first and 4MB
+/// of the second, and the socket buffer only cares about the second
+/// number. A burst that large loses roughly a third of itself.
+///
+/// @requirement TB-144
+#[test]
+fn the_window_bounds_bytes_in_flight_not_only_frames() {
+    let mut tx = ArqSender::new();
+    let big = 32 * 1024;
+    let mut on_wire = 0usize;
+    for _ in 0..SEND_WINDOW {
+        if tx.send(vec![0u8; big]).is_some() {
+            on_wire += big;
+        }
+    }
+    assert!(
+        on_wire <= SEND_WINDOW_BYTES,
+        "{on_wire} bytes went out at once, over the {SEND_WINDOW_BYTES}-byte budget - \
+         which is exactly the burst that loses a third of itself on a real socket"
+    );
+    assert!(
+        on_wire < SEND_WINDOW * big,
+        "large frames must be held back by the byte budget rather than the frame count"
+    );
+}
+
+/// The byte budget must not cost small frames their parallelism - that
+/// parallelism is the whole throughput of a pad transfer.
+///
+/// @requirement TB-144
+#[test]
+fn small_frames_still_get_the_full_frame_window() {
+    let mut tx = ArqSender::new();
+    let pad_chunk = 1024 + 16; // `otp_pad::PAD_CHUNK_BYTES` plus its GCM tag
+    let sent = (0..SEND_WINDOW * 2)
+        .filter(|_| tx.send(vec![0u8; pad_chunk]).is_some())
+        .count();
+    assert_eq!(
+        sent, SEND_WINDOW,
+        "a pad chunk is small enough that the frame count, not the byte budget, \
+         should be what bounds it"
+    );
+}
+
+/// A single frame bigger than the whole byte budget must still go out.
+/// Holding it back would stall the link permanently: the budget only ever
+/// frees up when something in flight is acked, and nothing is.
+///
+/// @requirement TB-144
+#[test]
+fn a_frame_larger_than_the_whole_budget_is_still_sent() {
+    let mut tx = ArqSender::new();
+    assert!(
+        tx.send(vec![0u8; SEND_WINDOW_BYTES * 2]).is_some(),
+        "an oversized frame on an empty window must be admitted, not stalled forever"
+    );
+}
+
+/// Retiring frames must give their bytes back, or the budget leaks and the
+/// link wedges after one window's worth of traffic.
+///
+/// @requirement TB-144
+#[test]
+fn acking_returns_bytes_to_the_budget() {
+    let mut tx = ArqSender::new();
+    let big = 32 * 1024;
+    let mut admitted = 0;
+    while tx.send(vec![0u8; big]).is_some() {
+        admitted += 1;
+        if admitted > SEND_WINDOW {
+            panic!("the byte budget should have closed the window well before this");
+        }
+    }
+    // Everything in flight is acked, so the backlog must flow again.
+    let released = tx.on_ack(admitted as u32 - 1);
+    assert!(
+        !released.is_empty(),
+        "acking the whole window must free its bytes and release the backlog"
     );
 }

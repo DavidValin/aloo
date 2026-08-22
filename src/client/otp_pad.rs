@@ -76,18 +76,46 @@ use crate::client::voice_stream::{self, ChunkDecryptor, DecryptJob, DirectStream
 use crate::crypto::otp::KeyDigest;
 use crate::proto::UserId;
 
-/// Payload bytes per pad chunk. Deliberately the same as
-/// `file_transfer::FILE_CHUNK_BYTES`: that size is already proven in
-/// production to cross real internet paths without IP fragmentation, which
-/// is the entire failure this module exists to fix.
-pub const PAD_CHUNK_BYTES: usize = crate::client::file_transfer::FILE_CHUNK_BYTES;
+/// Plaintext pad bytes per `OtpPadChunk` frame.
+///
+/// Bounded by one un-fragmented datagram: `p2p_proto::SAFE_DATAGRAM_BYTES`
+/// is 1200, and this frame's own encoding costs a measured 44 bytes on top
+/// of the sealed chunk (`test/otp_pad_test.rs`), leaving 1156. 1024 takes
+/// that with headroom to spare rather than shaving the last 12%.
+///
+/// It is deliberately *not* `file_transfer::FILE_CHUNK_BYTES` any more.
+/// That constant is 512 because a file chunk may be RSA-OAEP sealed, which
+/// expands 512 bytes to ~768; a pad chunk is always AES-256-GCM
+/// (`start_pad_send` builds a `DirectStreamKey::Pq`, and
+/// `crypto::pq::seal_chunk` adds only a 16-byte tag), so it inherited a
+/// constraint that never applied to it. Since the reliable layer moves at
+/// most `SEND_WINDOW` frames per round trip, that inherited 512 was
+/// halving provisioning throughput for nothing.
+pub const PAD_CHUNK_BYTES: usize = 1024;
 
-/// How many frames the sender lets build up for a peer before it stops
-/// reading more pad off disk. At `PAD_CHUNK_BYTES` each this is roughly
-/// 16MB in flight - large enough that the link is never starved waiting for
-/// the producer, small enough that memory use stays flat no matter how
-/// large the pad is.
-pub const PAD_INFLIGHT_FRAMES: usize = (16 * 1024 * 1024) / PAD_CHUNK_BYTES;
+/// How many frames the sender may have outstanding before it stops reading
+/// more pad off disk.
+///
+/// **Must stay below `p2p::PENDING_MAX`**, and is derived from it so it
+/// cannot drift. `outbound_depth` - the signal this throttles against - is
+/// `arq_tx.depth() + pending.len()`, and on a link that is not yet `Active`
+/// the first term is zero while the second *saturates* at `PENDING_MAX`.
+/// A bound above that can therefore never be reached, so the worker sees
+/// no backpressure at all and reads the entire pad at disk speed into a
+/// queue that discards its oldest entry on overflow - shredding the front
+/// of the transfer, continuously, while the progress bar races to 100%.
+/// That is not a slow transfer; it is a destroyed one.
+///
+/// Half of `PENDING_MAX` leaves the queue as much room again for
+/// everything else the link carries, and is still four times
+/// `p2p_reliable::SEND_WINDOW`, so the link is never left waiting on the
+/// disk.
+pub const PAD_INFLIGHT_FRAMES: usize = crate::client::p2p::PENDING_MAX / 2;
+
+/// How much pad must be handed over before the sender reports progress
+/// again. Fine enough that the bar moves visibly on a small pad, coarse
+/// enough that a large one does not drown the session loop in events.
+pub const PAD_PROGRESS_BYTES: u64 = 256 * 1024;
 
 /// One end of a pad transfer in progress on the *sending* side.
 pub(crate) struct OutgoingPad {
@@ -101,6 +129,13 @@ pub(crate) struct OutgoingPad {
     /// closure into the link manager, which lives in `SessionState` and
     /// cannot be borrowed by another thread.
     pub depth: Arc<AtomicUsize>,
+    /// Plaintext pad bytes the worker has read off disk and handed to the
+    /// link. This is *not* what the progress bar shows: it runs ahead of
+    /// delivery by whatever the link is still carrying, which is the whole
+    /// point of `PAD_INFLIGHT_FRAMES`. Subtracting that backlog is what
+    /// turns it into something honest to display
+    /// (`client::otp::refresh_pad_send_progress`).
+    pub read_bytes: u64,
 }
 
 /// A pad arriving from a peer, reassembled straight to disk.
@@ -115,6 +150,9 @@ pub(crate) struct IncomingPad {
     /// Where the two halves are being written, inside `.tmp/`.
     pub dir: PathBuf,
     pub job_tx: tokio::sync::mpsc::UnboundedSender<DecryptJob>,
+    /// Ciphertext bytes handed to the worker so far - drives the transfer
+    /// popup's bar and nothing else.
+    pub received_bytes: u64,
 }
 
 /// What the receiving worker reports back when a pad transfer finishes.
@@ -135,6 +173,15 @@ pub(crate) enum PadEvent {
         from: UserId,
         stream_id: u64,
         reason: String,
+    },
+    /// The sending worker has handed over another slice of the pad.
+    /// Emitted every `PAD_PROGRESS_BYTES` rather than per chunk: at
+    /// `PAD_CHUNK_BYTES` each, a per-chunk event would be thousands of
+    /// wakeups per megabyte for a bar that moves in whole percent.
+    SendProgress {
+        to: UserId,
+        stream_id: u64,
+        sent_bytes: u64,
     },
     /// The sending worker has streamed the whole pad.
     Sent { to: UserId, stream_id: u64 },
@@ -170,9 +217,12 @@ pub(crate) fn spawn_send_pad_worker(
     out_tx: tokio::sync::mpsc::UnboundedSender<P2pOutbound>,
     events_tx: tokio::sync::mpsc::UnboundedSender<PadEvent>,
     depth: Arc<AtomicUsize>,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
 ) {
     std::thread::spawn(move || {
         let mut seq: u32 = 0;
+        let mut sent: u64 = 0;
+        let mut reported: u64 = 0;
         for path in [enc_path, dec_path] {
             let file = match std::fs::File::open(&path) {
                 Ok(f) => f,
@@ -188,6 +238,14 @@ pub(crate) fn spawn_send_pad_worker(
             let mut reader = std::io::BufReader::with_capacity(PAD_CHUNK_BYTES * 16, file);
             let mut buf = vec![0u8; PAD_CHUNK_BYTES];
             loop {
+                // Checked per chunk rather than per file: a pad half can be
+                // a terabyte, and a cancel the user has to wait out is not
+                // a cancel. Returning here rather than breaking leaves no
+                // `Sent` event behind, so nothing downstream believes the
+                // transfer completed.
+                if cancelled.load(Ordering::Relaxed) {
+                    return;
+                }
                 let read = match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => n,
@@ -203,8 +261,17 @@ pub(crate) fn spawn_send_pad_worker(
                 // Backpressure: wait for the link to drain rather than
                 // queueing unboundedly ahead of it. A pad is far larger
                 // than anything that could be held as frames.
+                //
+                // The session loop republishes the link's true depth here,
+                // but only once per tick - and this loop can queue tens of
+                // thousands of chunks in that time, so waiting on that
+                // figure alone let the worker overshoot the bound many
+                // times over before it ever saw a new value. Counting our
+                // own sends between republishes closes that window: the
+                // value is then never an *under*estimate, which is the only
+                // direction that matters for a bound.
                 while depth.load(Ordering::Relaxed) >= PAD_INFLIGHT_FRAMES {
-                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    std::thread::sleep(std::time::Duration::from_millis(2));
                 }
                 let Some(blocks) =
                     voice_stream::encrypt_direct_chunk(&key, stream_id, seq, &buf[..read])
@@ -227,7 +294,17 @@ pub(crate) fn spawn_send_pad_worker(
                 {
                     return;
                 }
+                depth.fetch_add(1, Ordering::Relaxed);
                 seq = seq.wrapping_add(1);
+                sent += read as u64;
+                if sent - reported >= PAD_PROGRESS_BYTES {
+                    reported = sent;
+                    let _ = events_tx.send(PadEvent::SendProgress {
+                        to,
+                        stream_id,
+                        sent_bytes: sent,
+                    });
+                }
             }
         }
         let _ = out_tx.send(P2pOutbound::OtpPadEnd { to, stream_id });

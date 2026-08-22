@@ -2180,3 +2180,67 @@ async fn a_delivery_receipt_becomes_a_delivered_event_naming_its_sender() {
     }
     let _ = b_events_rx.try_recv();
 }
+
+/// A whole megabyte of pad, at the real chunk size, over a genuinely
+/// punched link - every frame of it must arrive.
+///
+/// This deliberately asserts arrival and *not* a rate. Throughput cannot be
+/// measured here: `Pair::pump` hand-feeds datagrams between the two
+/// managers with sleeps between rounds, so a run is bounded by the
+/// harness's own cadence rather than by the transport - measured at roughly
+/// 2ms per frame regardless of how many frames there are, which is a
+/// per-frame harness cost, not a window-over-round-trip one. A number
+/// printed from here would describe this test, not the app.
+///
+/// What it does pin is the property that actually broke provisioning: a
+/// pad-sized burst far larger than one window arrives complete. A pad
+/// missing a chunk is not a smaller pad - it decodes to garbage with
+/// nothing anywhere reporting it.
+///
+/// @requirement AC-254
+#[tokio::test]
+async fn a_megabyte_of_pad_chunks_arrives_complete() {
+    let server_addr = spawn_test_server().await;
+    let mut pair = Pair::connect(server_addr).await;
+    pair.alice.ensure_link(&mut pair.a_ctl, pair.bob_id).await;
+    pair.punch().await;
+
+    let chunk = aloo::client::otp_pad::PAD_CHUNK_BYTES;
+    let frames = (1024 * 1024) / chunk;
+    assert!(
+        frames > aloo::client::p2p_reliable::SEND_WINDOW,
+        "the burst has to exceed one window or it proves nothing about draining"
+    );
+    for i in 0..frames {
+        pair.alice.send_reliable_or_queue(
+            pair.bob_id,
+            P2pPayload::OtpPadChunk {
+                stream_id: 1,
+                seq: i as u32,
+                blocks: vec![vec![b'k'; chunk + 16]],
+            },
+        );
+    }
+
+    let mut arrived = 0usize;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        pair.pump(Duration::from_millis(20), |_, _| false).await;
+        let mut rest = Vec::new();
+        for event in pair.b_seen.drain(..) {
+            match event {
+                P2pEvent::OtpPadChunk { .. } => arrived += 1,
+                other => rest.push(other),
+            }
+        }
+        pair.b_seen = rest;
+        if arrived >= frames || tokio::time::Instant::now() >= deadline {
+            break;
+        }
+    }
+
+    assert_eq!(
+        arrived, frames,
+        "every pad chunk must arrive - {arrived} of {frames} did"
+    );
+}

@@ -374,7 +374,15 @@ pub async fn new_key_pair(
     name_a: &str,
     name_b: &str,
 ) -> io::Result<()> {
-    new_key_pair_with_progress(cfg, size_mb, name_a, name_b, |_written, _total| {}).await
+    new_key_pair_with_progress(
+        cfg,
+        size_mb,
+        name_a,
+        name_b,
+        |_written, _total| {},
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .await
 }
 
 /// `new_key_pair`, calling `on_progress(bytes_written, total_bytes)` after
@@ -389,12 +397,49 @@ pub async fn new_key_pair(
 /// memory use bounded to one chunk regardless of how large a pad is
 /// chosen, the same streaming property the real binary already documents
 /// for its own side (README.md "Keychain Features").
+/// Bytes of free space on the filesystem holding `path`, or `None` where
+/// that cannot be determined (a non-Unix build, or a path that does not
+/// resolve).
+///
+/// Used only to refuse work that cannot possibly succeed - never to
+/// second-guess a write that might. `None` therefore means "proceed", not
+/// "refuse".
+#[cfg(unix)]
+pub fn free_space_bytes(path: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `c_path` is a valid NUL-terminated C string that outlives the
+    // call, and `stat` is only read after a zero return.
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) } != 0 {
+        return None;
+    }
+    Some(stat.f_bavail as u64 * stat.f_frsize as u64)
+}
+
+#[cfg(not(unix))]
+pub fn free_space_bytes(_path: &Path) -> Option<u64> {
+    None
+}
+
+/// How much disk `otp --new-key-pair <size_mb>` actually needs.
+///
+/// Four times the per-key size, not twice: the tool writes both halves
+/// into *both* correspondents' directories (`a_keys/` and `b_keys/` each
+/// get an encryption and a decryption key), so a 2000MB pad is 8GB on
+/// disk. Measured against the real binary rather than assumed - it is not
+/// a number any of its documentation states.
+pub fn keygen_disk_bytes(size_mb: u32) -> u64 {
+    u64::from(size_mb) * 1024 * 1024 * 4
+}
+
 pub async fn new_key_pair_with_progress(
     cfg: &OtpCliConfig,
     size_mb: u32,
     name_a: &str,
     name_b: &str,
     mut on_progress: impl FnMut(u64, u64),
+    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> io::Result<()> {
     let total_bytes = size_mb as u64 * 1024 * 1024 * 2;
     let size_str = size_mb.to_string();
@@ -421,6 +466,13 @@ pub async fn new_key_pair_with_progress(
         // actually happened (a binary that reads less than offered, e.g.
         // because it refused up front, closes its end of the pipe first).
         while written < total_bytes {
+            // Closing our end of the pipe is what stops the tool: it is
+            // waiting on this entropy and can do nothing without it. It
+            // then exits non-zero, so the caller sees a failed generation
+            // rather than a truncated pad presented as a real one.
+            if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
             let this_chunk = KEYGEN_CHUNK_BYTES.min((total_bytes - written) as usize);
             let chunk = crate::crypto::random_bytes(this_chunk);
             if stdin.write_all(&chunk).await.is_err() {

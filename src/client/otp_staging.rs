@@ -79,6 +79,61 @@ pub fn sweep(cfg: &OtpCliConfig) {
     }
 }
 
+/// Removes every `<contact>_pending` directory whose contact is not still
+/// owed a pad, at startup.
+///
+/// `sweep` above clears `.tmp/`, which only ever holds work in progress. A
+/// `_pending` directory is different: it holds a pad this side generated
+/// and must keep until the peer accepts it, so it deliberately survives
+/// `sweep`. What nothing did until now was remove one whose handshake was
+/// abandoned - and each is *four times* the per-key size, so a few
+/// declined or interrupted `/otp` attempts silently consume tens of
+/// gigabytes and never give it back. Found the hard way, on a disk with
+/// 292KB left and 7.9GB of it stranded in one such directory.
+///
+/// `still_owed` answers "is this contact still mid-handshake" - in
+/// practice `OtpStore::pending_setups`, the same record the retry pass
+/// uses. Anything it does not name has no path back to being installed,
+/// so keeping it only costs space.
+pub fn sweep_abandoned_setups(cfg: &OtpCliConfig, still_owed: &[String]) -> u64 {
+    let Ok(entries) = std::fs::read_dir(&cfg.working_dir) else {
+        return 0;
+    };
+    let mut reclaimed = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Some(contact) = name.strip_suffix("_pending") else {
+            continue;
+        };
+        if still_owed.iter().any(|c| c == contact) {
+            continue;
+        }
+        reclaimed += dir_bytes(&path);
+        secure_remove_dir(&path);
+    }
+    reclaimed
+}
+
+/// Total size of the files directly inside `dir` - for reporting how much
+/// an abandoned setup gave back, nothing more.
+fn dir_bytes(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter_map(|e| e.metadata().ok())
+        .filter(|m| m.is_file())
+        .map(|m| m.len())
+        .sum()
+}
+
 /// A fresh, collision-free directory under `.tmp/` for one in-progress
 /// piece of work. `label` only makes the directory recognisable while
 /// debugging; uniqueness comes from the pid and a nanosecond timestamp, so

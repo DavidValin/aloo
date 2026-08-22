@@ -253,6 +253,22 @@ pub struct SessionState {
     /// (`otp_store`'s `pending_ack_proof`): the log it points into does not
     /// survive a restart either, so persisting the id would only ever name
     /// a row that no longer exists.
+    /// Set when the user abandons an in-progress pad for this peer. Both
+    /// background workers poll it, so each stops at a chunk boundary and
+    /// unwinds having released its files - rather than being torn down
+    /// mid-write, which would leave exactly the partial state a cancel is
+    /// meant to remove.
+    /// A fresh pad this side has offered and is waiting for the peer to
+    /// agree to, by contact name. Nothing is generated until the answer
+    /// arrives - the peer pays for the transfer in time and disk, so they
+    /// decide first (`otp::confirm_generate`).
+    pub(crate) otp_awaiting_consent:
+        std::collections::HashMap<String, (crate::client::tui::ui::PendingOtpGenerate, u32)>,
+    /// Contacts whose peer has already agreed to a fresh pad, so its
+    /// arrival needs no second decision from them.
+    pub(crate) otp_consented: std::collections::HashSet<String>,
+    pub(crate) otp_cancelled:
+        std::collections::HashMap<UserId, std::sync::Arc<std::sync::atomic::AtomicBool>>,
     pub(crate) otp_ack_rows: std::collections::HashMap<(String, u64), u64>,
     pub(crate) otp_out_queue: crate::client::otp::OtpOutQueue,
     /// Voice messages and file transfers that still owe their sender a
@@ -616,6 +632,9 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
                 crate::client::otp_store::OtpStore::default_path(),
             )
         }),
+        otp_awaiting_consent: std::collections::HashMap::new(),
+        otp_consented: std::collections::HashSet::new(),
+        otp_cancelled: std::collections::HashMap::new(),
         otp_ack_rows: std::collections::HashMap::new(),
         otp_out_queue: crate::client::otp::OtpOutQueue::new(),
         pending_receipts: crate::client::delivery::PendingReceipts::new(),
@@ -648,6 +667,24 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
     // so it is garbage by definition and is cleared here rather than left
     // to accumulate. See `client::otp_staging`'s module doc.
     crate::client::otp_staging::sweep(&session.otp_cli_cfg);
+    // `.tmp/` above is only ever work in progress. A `_pending` directory
+    // outlives it by design - it holds a pad this side generated and must
+    // keep until the peer accepts - so an abandoned handshake leaves four
+    // times the per-key size behind with nothing to reclaim it. Anything
+    // the store no longer records as owed has no path back to being
+    // installed.
+    let still_owed: Vec<String> = session
+        .otp_store
+        .pending_setups()
+        .map(|(name, _)| name.to_string())
+        .collect();
+    let reclaimed =
+        crate::client::otp_staging::sweep_abandoned_setups(&session.otp_cli_cfg, &still_owed);
+    if reclaimed > 0 {
+        crate::log_warn!(
+            "reclaimed {reclaimed} bytes from abandoned OTP setup directories at startup"
+        );
+    }
 
     let mut ui_state = UiState::new(display_name);
     // With no server there is nothing to join a channel *through*, so the
@@ -997,10 +1034,20 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
                 // its worker thread to pace against - the worker cannot
                 // reach into `peer_link` itself (`otp_pad::OutgoingPad`'s
                 // `depth` doc).
-                for (peer, pad) in &session.otp_outgoing_pads {
-                    pad.depth.store(
-                        session.peer_link.outbound_depth(*peer),
-                        std::sync::atomic::Ordering::Relaxed,
+                let pad_peers: Vec<UserId> = session.otp_outgoing_pads.keys().copied().collect();
+                for peer in pad_peers {
+                    let depth = session.peer_link.outbound_depth(peer);
+                    if let Some(pad) = session.otp_outgoing_pads.get(&peer) {
+                        pad.depth.store(depth, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    // Same tick, same figure: the bar tracks what the link
+                    // has actually drained, so it keeps moving after the
+                    // worker has finished reading and goes on moving until
+                    // the last frame is genuinely away.
+                    crate::client::otp::refresh_pad_send_progress(
+                        &mut session,
+                        &mut ui_state,
+                        peer,
                     );
                 }
                 let now = Instant::now();
@@ -1383,10 +1430,13 @@ async fn handle_ui_action(
             }
         }
         UiAction::ConfirmOtpGenerate { size_mb } => {
-            crate::client::otp::confirm_generate(session, ui_state, size_mb).await?;
+            crate::client::otp::confirm_generate(wr, session, ui_state, size_mb).await?;
         }
         UiAction::CancelOtpGenerate => {
             crate::client::otp::cancel_generate(ui_state);
+        }
+        UiAction::CancelOtpPad { peer } => {
+            crate::client::otp::cancel_pad(session, ui_state, peer);
         }
         UiAction::AcceptOtpInvite => {
             crate::client::otp::accept_invite(wr, session, ui_state).await?;
@@ -2481,7 +2531,11 @@ async fn handle_p2p_event(
             seq,
             blocks,
         } => {
-            crate::client::otp::on_pad_chunk(session, from, stream_id, seq, blocks);
+            crate::client::otp::on_pad_chunk(session, ui_state, from, stream_id, seq, blocks);
+        }
+        P2pEvent::OtpPadCancel { from, stream_id } => {
+            let _ = stream_id;
+            crate::client::otp::on_pad_cancel(session, ui_state, from);
         }
         P2pEvent::OtpPadEnd { from, stream_id } => {
             crate::client::otp::on_pad_end(session, from, stream_id);
@@ -3612,6 +3666,9 @@ impl SessionState {
             otp_store: crate::client::otp_store::OtpStore::new_empty(
                 spec.scratch.join("otp_store"),
             ),
+            otp_awaiting_consent: std::collections::HashMap::new(),
+            otp_consented: std::collections::HashSet::new(),
+            otp_cancelled: std::collections::HashMap::new(),
             otp_ack_rows: std::collections::HashMap::new(),
             otp_out_queue: crate::client::otp::OtpOutQueue::new(),
                 pending_receipts: crate::client::delivery::PendingReceipts::new(),

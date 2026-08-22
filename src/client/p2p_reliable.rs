@@ -29,22 +29,57 @@ pub const MAX_RETRIES: u32 = 10;
 /// Bound on how many out-of-order frames a receiver buffers before giving
 /// up and failing the link, rather than growing unbounded on a hostile or
 /// badly reordering path. Comfortably above `SEND_WINDOW`, so a well-behaved
-/// sender can never drive a receiver into it on reordering alone.
-const REORDER_BUFFER_LIMIT: usize = 64;
+/// sender can never drive a receiver into it on reordering alone - the two
+/// are raised together for that reason.
+pub const REORDER_BUFFER_LIMIT: usize = 512;
 /// How many frames may be in flight (sent, not yet acked) at once. Anything
 /// beyond it waits in `ArqSender::backlog` and goes out as acks retire the
 /// frames ahead of it.
 ///
 /// Without this, a caller that hands over many frames in one pass - an OTP
-/// pad is 64 frames *per megabyte per key*, all queued by a single
+/// pad is 2048 frames *per megabyte per key*, all queued by a single
 /// `/otp` confirmation - had every one of them put on the wire in the same
 /// instant: megabytes into a UDP socket with nothing pacing it. The tail of
 /// that burst is dropped (by the socket's own send buffer, by the first
 /// router that sees it, or by the receiver's buffer), and because the
 /// receiver has to hold every frame after a lost one, it blows through
-/// `REORDER_BUFFER_LIMIT` and fails the whole link instead. Small enough to
-/// stay well under both that limit and any plausible socket buffer.
-pub const SEND_WINDOW: usize = 16;
+/// `REORDER_BUFFER_LIMIT` and fails the whole link instead.
+///
+/// It is also, directly, this link's throughput: acks are cumulative and
+/// arrive a round trip after the frames they cover, so a sender moves at
+/// most one window per RTT no matter how much it has to send. At 16
+/// frames of 512 bytes that was ~100KB/s to a peer 80ms away, which made
+/// even a modest pad a multi-minute wait and a large one impractical.
+///
+/// This is the *frame* half of the window, and it exists to keep the
+/// receiver's `REORDER_BUFFER_LIMIT` out of reach. The half that actually
+/// protects the socket is `SEND_WINDOW_BYTES` - see there for why counting
+/// frames alone was not enough.
+pub const SEND_WINDOW: usize = 128;
+
+/// How many *bytes* may be in flight at once - the other half of the
+/// window, and the one that decides whether a burst survives.
+///
+/// Counting frames alone is the wrong unit, because frames are not one
+/// size: a pad chunk is ~1KB and an OTP setup chunk ~32KB, so a window of
+/// 128 frames is 128KB of the first and 4MB of the second. The socket
+/// buffer, the first router, and the peer's receive buffer all care about
+/// the second number. A 4MB burst into a UDP socket loses roughly a third
+/// of itself, which `p2p_test`'s burst test pins directly - and because
+/// acks are cumulative, the receiver then has to hold every frame behind
+/// the first casualty.
+///
+/// So the sender is bounded by both, and a bulk transfer of small frames
+/// gets the parallelism it needs without a large-frame burst turning the
+/// same window into megabytes. 256KB is comfortably under a default UDP
+/// socket buffer (~212KB is the usual `wmem_default`, and the kernel
+/// doubles what it accounts) while leaving small frames the full
+/// `SEND_WINDOW`.
+///
+/// Beyond this is where the absence of congestion control starts to matter
+/// (see the module doc): nothing here measures the path, so the window is
+/// the only thing bounding how hard a transfer leans on it.
+pub const SEND_WINDOW_BYTES: usize = 256 * 1024;
 
 struct Unacked {
     payload: Vec<u8>,
@@ -58,6 +93,10 @@ struct Unacked {
 pub struct ArqSender {
     next_seq: u32,
     unacked: BTreeMap<u32, Unacked>,
+    /// Sum of `unacked`'s payload lengths, maintained alongside it so the
+    /// byte half of the window is a comparison rather than a walk of the
+    /// whole map on every send.
+    unacked_bytes: usize,
     /// Frames accepted from the caller but not yet on the wire, oldest
     /// first, because `SEND_WINDOW` frames were already in flight when they
     /// were handed over. Sequence numbers are assigned on the way *out* of
@@ -73,16 +112,29 @@ impl ArqSender {
 
     /// Offers one payload for reliable delivery. Returns the
     /// `(seq, payload)` the caller must transmit as a
-    /// `PunchDatagram::Reliable` right now, or `None` if `SEND_WINDOW`
-    /// frames are already in flight - in which case this one is held in the
-    /// backlog and comes back out of `on_ack` later. Nothing is ever
-    /// dropped here; `None` means "not yet", never "lost".
+    /// `PunchDatagram::Reliable` right now, or `None` if the window is
+    /// already full - in which case this one is held in the backlog and
+    /// comes back out of `on_ack` later. Nothing is ever dropped here;
+    /// `None` means "not yet", never "lost".
     pub fn send(&mut self, payload: Vec<u8>) -> Option<(u32, Vec<u8>)> {
-        if self.unacked.len() >= SEND_WINDOW {
+        if !self.window_admits(payload.len()) {
             self.backlog.push_back(payload);
             return None;
         }
         Some(self.admit(payload))
+    }
+
+    /// Whether a frame of `len` bytes fits the window right now - both
+    /// halves must agree (`SEND_WINDOW`, `SEND_WINDOW_BYTES`).
+    ///
+    /// An empty window always admits, whatever the size: a frame larger
+    /// than the whole byte budget would otherwise never be sent at all,
+    /// and stalling forever is worse than one oversized burst.
+    fn window_admits(&self, len: usize) -> bool {
+        if self.unacked.is_empty() {
+            return true;
+        }
+        self.unacked.len() < SEND_WINDOW && self.unacked_bytes + len <= SEND_WINDOW_BYTES
     }
 
     /// Assigns the next sequence number to `payload` and records it as
@@ -90,6 +142,7 @@ impl ArqSender {
     fn admit(&mut self, payload: Vec<u8>) -> (u32, Vec<u8>) {
         let seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1);
+        self.unacked_bytes += payload.len();
         self.unacked.insert(
             seq,
             Unacked {
@@ -128,13 +181,16 @@ impl ArqSender {
             .map(|(&s, _)| s)
             .collect();
         for s in &retired {
-            self.unacked.remove(s);
+            if let Some(frame) = self.unacked.remove(s) {
+                self.unacked_bytes = self.unacked_bytes.saturating_sub(frame.payload.len());
+            }
         }
         let mut released = Vec::new();
-        while self.unacked.len() < SEND_WINDOW {
-            let Some(next) = self.backlog.pop_front() else {
+        while let Some(next) = self.backlog.front() {
+            if !self.window_admits(next.len()) {
                 break;
-            };
+            }
+            let next = self.backlog.pop_front().expect("just checked the front");
             released.push(self.admit(next));
         }
         released
@@ -182,6 +238,7 @@ impl ArqSender {
     /// it (`p2p::PeerLinkManager::reset_transport`).
     pub fn reset(&mut self) -> Vec<Vec<u8>> {
         self.next_seq = 0;
+        self.unacked_bytes = 0;
         // In-flight frames first (`BTreeMap` iterates them in `seq` order),
         // then anything that never got a sequence number at all - which is
         // exactly the order they were handed over in, and the order a

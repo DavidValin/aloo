@@ -221,6 +221,7 @@ the payload carried inside a reliable or unreliable one.
 | `OtpDeliveryAck` | reliably | Confirms an `OtpEnvelope`/`OtpFileOffer`/`OtpVoiceOffer` decoded, carrying proof of the nonce under its pad, unblocking the next one (§16) |
 | `OtpPadStart` | reliably | Announces an incoming one-time pad: its length and the digests both sides will be held to (§16.1) |
 | `OtpPadChunk` / `OtpPadEnd` | reliably | The pad's bytes, streamed small enough never to fragment, then the end of it (§16.1) |
+| `OtpPadCancel` | reliably | Either side abandoned an in-progress pad transfer - the other stops waiting and erases what it staged (§16.1) |
 | `OtpPadVerify` | reliably | What the receiver actually reassembled, and whether it was accepted - installs nothing (§16.1) |
 | `OtpPadCommit` / `OtpPadCommitAck` | reliably | Both sides' digests matched: the sender has installed, the receiver may too, and confirms it has (§16.1) |
 | `DeviceIdAnnounce` | reliably | This side's device id, sealed like any other content - sent automatically once `Active` (§12.7) |
@@ -3346,14 +3347,24 @@ keychain expects them") before anything is generated or sent. Confirming
 then asks for a size (MB per key, 1 to 1,048,576 - that is 1TB per key,
 the one-time-pad tool's own documented streaming limit - re-prompting on
 anything outside that range rather than guessing), so a fresh pad is never
-generated at some fixed size the user didn't choose. A size larger than a
-direct link can deliver is refused *before* generation rather than after:
-generation reads that many megabytes of true randomness per key, so
-discovering the limit afterwards would mean spending all of that time to
-produce a pad that is then rejected. Generation streams its randomness in
-fixed-size chunks rather than building the whole pad in memory first, and
-reports progress as it goes, so the initiating side can show how far along
-a large pad is instead of appearing to hang. That size travels
+generated at some fixed size the user didn't choose. No size is refused for being too large to
+deliver: there used to be a ceiling here, derived from how many chunks the
+link's queue could hold, and the streamed self-pacing transport above
+removed the reason for it. What a large size costs is time, and the
+initiating side is told the estimate before it commits. Generation streams
+its randomness in fixed-size chunks rather than building the whole pad in
+memory first, and reports progress as it goes, so the initiating side can
+show how far along a large pad is instead of appearing to hang.
+
+**Both slow phases are shown, on both sides.** Generating and transferring
+are separately slow - one bounded by how fast this machine produces
+randomness, the other by the link's round-trip time - and the second is
+invisible without help: the deciding side is not asked to accept until the
+whole pad has arrived and both digests match, so on a large pad the gap
+between "generating" ending and the invite appearing is the entire
+transfer. The progress popup therefore switches from generation to transfer
+rather than closing, with its own bar over both halves, and the receiving
+side opens the same popup as the pad begins to arrive. That size travels
 with the setup message and is shown to the deciding side in its own
 invite popup before it ever has to accept or reject - a much larger pad
 takes longer to arrive and claims more local disk/keychain space than a

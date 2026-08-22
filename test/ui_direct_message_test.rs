@@ -6,7 +6,7 @@ use aloo::client::p2p::LinkStatus;
 use aloo::p2p_proto::ReceiptStage;
 use aloo::proto::{KeyMode, UserId};
 use aloo::client::tui::ui::{
-    DeliveryProof,
+    DeliveryProof, OtpPadPhase,
     DELIVERY_ARROW, DeliveryStatus, Focus, IdentityCase, MessageBody, OTP_ICON, PendingOtpInvite,
     UiAction, UiState, VoiceTarget, render,
 };
@@ -589,6 +589,123 @@ fn keygen_progress_moves_the_bar_and_clamps_at_a_hundred_percent() {
     assert_eq!(state.otp_keygen_open().unwrap().fraction(), 1.0);
 }
 
+/// Removing the old 16MB ceiling means a user can now ask for a pad that
+/// takes hours to send. Refusing was the wrong answer - the transport
+/// genuinely delivers it - but so is saying nothing, so the prompt costs
+/// the choice out before they commit to generating it.
+///
+/// @requirement AC-253
+#[test]
+fn the_size_prompt_says_how_long_that_size_takes_to_send() {
+    use aloo::client::otp::transfer_estimate_text;
+    // Coarse on purpose: the figure is a guess about someone else's
+    // network, so it must not read more precisely than it knows.
+    assert_eq!(transfer_estimate_text(1), "about 6s");
+    assert!(transfer_estimate_text(1024).ends_with('h'), "a 1GB pad is hours");
+    assert!(transfer_estimate_text(64).ends_with('m'), "a 64MB pad is minutes");
+    assert!(
+        transfer_estimate_text(1024 * 512).ends_with('h'),
+        "a 512GB pad is hours, and saying so is the point"
+    );
+    // Monotonic - a bigger pad never reads as quicker.
+    let mut previous = 0;
+    for mb in [1u32, 16, 256, 4096, 65536] {
+        let secs = aloo::client::otp::transfer_estimate(mb).as_secs();
+        assert!(secs > previous, "{mb}MB must not estimate under a smaller pad");
+        previous = secs;
+    }
+}
+
+/// The pad's second slow phase. Generation finishing used to close the
+/// popup outright, leaving the screen empty for however long the transfer
+/// took - and since the peer is only asked to accept once the whole pad
+/// has arrived and verified, that gap is the entire transfer.
+///
+/// @requirement AC-253
+#[test]
+fn the_popup_moves_from_generating_to_transferring_rather_than_closing() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.open_otp_keygen(UserId(2), "bob".into(), 4);
+    assert_eq!(
+        state.otp_keygen_open().unwrap().phase,
+        OtpPadPhase::Generating
+    );
+
+    state.set_otp_keygen_progress(8 * 1024 * 1024, 8 * 1024 * 1024);
+    state.begin_otp_pad_transfer(UserId(2), "bob".into(), 4, OtpPadPhase::Sending);
+
+    let progress = state.otp_keygen_open().expect("still open, now transferring");
+    assert_eq!(progress.phase, OtpPadPhase::Sending);
+    assert_eq!(progress.percent(), 0, "the transfer's own bar starts at zero");
+    assert_eq!(
+        progress.total_bytes,
+        4 * 1024 * 1024 * 2,
+        "both halves cross the link, so the transfer is twice the per-key size"
+    );
+}
+
+/// The receiving side gets the same popup, for the same reason: nothing
+/// else on their screen says a pad is on its way.
+///
+/// @requirement AC-253
+#[test]
+fn the_receiving_side_sees_its_own_transfer_progress() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.begin_otp_pad_transfer(UserId(2), "bob".into(), 1, OtpPadPhase::Receiving);
+    state.set_otp_pad_transfer_progress(UserId(2), 1024 * 1024);
+    assert_eq!(state.otp_keygen_open().unwrap().percent(), 50);
+    assert_eq!(
+        state.otp_keygen_open().unwrap().phase,
+        OtpPadPhase::Receiving
+    );
+}
+
+/// A transfer report for somebody else must not drive this popup's bar,
+/// and a stale one ending must not tear it down - two pads can be in
+/// flight with different peers.
+///
+/// @requirement AC-253
+#[test]
+fn a_transfer_popup_only_answers_to_the_peer_it_is_reporting_on() {
+    let mut state = joined_general_with(vec![user(2, "bob"), user(3, "carol")]);
+    state.begin_otp_pad_transfer(UserId(2), "bob".into(), 1, OtpPadPhase::Receiving);
+
+    state.set_otp_pad_transfer_progress(UserId(3), 2 * 1024 * 1024);
+    assert_eq!(
+        state.otp_keygen_open().unwrap().percent(),
+        0,
+        "carol's transfer must not move bob's bar"
+    );
+
+    state.close_otp_keygen_for(UserId(3));
+    assert!(
+        state.otp_keygen_open().is_some(),
+        "nor should carol's ending close bob's popup"
+    );
+
+    state.close_otp_keygen_for(UserId(2));
+    assert!(state.otp_keygen_open().is_none());
+}
+
+/// A late generation report must not rewind a bar that has already moved
+/// on to the transfer - the two phases share one popup but not one total.
+///
+/// @requirement AC-253
+#[test]
+fn a_late_generation_report_cannot_rewind_the_transfer_bar() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.begin_otp_pad_transfer(UserId(2), "bob".into(), 1, OtpPadPhase::Sending);
+    state.set_otp_pad_transfer_progress(UserId(2), 2 * 1024 * 1024);
+    assert_eq!(state.otp_keygen_open().unwrap().percent(), 100);
+
+    state.set_otp_keygen_progress(0, 2 * 1024 * 1024);
+    assert_eq!(
+        state.otp_keygen_open().unwrap().percent(),
+        100,
+        "the transfer had already finished; a stale keygen report says nothing about it"
+    );
+}
+
 #[test]
 fn the_keygen_spinner_animates_on_the_ticker_even_without_progress() {
     let mut state = joined_general_with(vec![user(2, "bob")]);
@@ -623,13 +740,15 @@ fn ticking_the_spinner_with_no_generation_running_is_a_no_op() {
 /// pad is already being written to disk), so the popup absorbs every key
 /// without producing an action.
 #[test]
-fn the_keygen_spinner_absorbs_every_key_without_acting() {
+fn the_keygen_spinner_absorbs_every_key_except_escape() {
     let mut state = joined_general_with(vec![user(2, "bob")]);
     state.open_otp_keygen(UserId(2), "bob".into(), 1);
 
+    // There is nothing to decide while a pad is being made or sent, so
+    // every ordinary key is swallowed rather than leaking into the message
+    // input behind the popup.
     for code in [
         KeyCode::Enter,
-        KeyCode::Esc,
         KeyCode::Char('y'),
         KeyCode::Left,
         KeyCode::Tab,
@@ -640,6 +759,37 @@ fn the_keygen_spinner_absorbs_every_key_without_acting() {
             "{code:?} must not close the spinner"
         );
     }
+}
+
+/// Escape is the exception, and has to be: generation and transfer run for
+/// minutes and consume gigabytes, so a user who realises they picked the
+/// wrong size must be able to stop rather than wait it out. Cancelling is
+/// what erases the staged material - see `otp::cancel_pad`.
+///
+/// @requirement AC-255
+#[test]
+fn escape_during_generation_or_transfer_cancels_the_pad() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.open_otp_keygen(UserId(2), "bob".into(), 1);
+    assert_eq!(
+        press(&mut state, KeyCode::Esc),
+        Some(UiAction::CancelOtpPad { peer: UserId(2) }),
+        "Escape must reach the generation phase"
+    );
+
+    state.begin_otp_pad_transfer(UserId(2), "bob".into(), 1, OtpPadPhase::Sending);
+    assert_eq!(
+        press(&mut state, KeyCode::Esc),
+        Some(UiAction::CancelOtpPad { peer: UserId(2) }),
+        "and the transfer phase, which is the longer of the two"
+    );
+
+    state.begin_otp_pad_transfer(UserId(2), "bob".into(), 1, OtpPadPhase::Receiving);
+    assert_eq!(
+        press(&mut state, KeyCode::Esc),
+        Some(UiAction::CancelOtpPad { peer: UserId(2) }),
+        "and it must work from the receiving side too - either side may give up"
+    );
 }
 
 #[test]
@@ -1740,4 +1890,58 @@ fn a_session_resumed_on_reconnect_does_not_steal_the_view() {
         "resuming a session leaves the reader where they were"
     );
     assert!(state.is_otp_active(UserId(2)));
+}
+
+/// A superseded proposal must not still be sitting in front of the user.
+///
+/// The sending side already retires its own stale state when `/otp` runs
+/// again; the receiver did not, so a second attempt left the first
+/// attempt's popup queued behind the new one - one `/otp`, two decision
+/// popups. Worse, accepting the stale one reports digests for a pad whose
+/// staging directory has already been erased.
+///
+/// @requirement AC-256
+#[test]
+fn a_second_proposal_from_one_peer_replaces_the_first_rather_than_queueing() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.push_otp_invite(UserId(2), "bob".into(), "contact-a".into(), None, None, None);
+    state.push_otp_invite(
+        UserId(2),
+        "bob".into(),
+        "contact-a".into(),
+        None,
+        None,
+        Some(500),
+    );
+
+    let open = state.otp_invite_open().expect("a proposal is open");
+    assert_eq!(
+        open.pad_size_mb,
+        Some(500),
+        "the newer proposal is the one that stands"
+    );
+    state.take_otp_invite();
+    assert!(
+        state.otp_invite_open().is_none(),
+        "answering it must leave nothing queued behind - one proposal, one decision"
+    );
+}
+
+/// And retiring one explicitly clears it, which is what a superseded pad
+/// transfer relies on (`otp::on_pad_start`).
+///
+/// @requirement AC-256
+#[test]
+fn retiring_a_peers_proposal_removes_it_from_the_queue() {
+    let mut state = joined_general_with(vec![user(2, "bob"), user(3, "carol")]);
+    state.push_otp_invite(UserId(2), "bob".into(), "c-b".into(), None, None, None);
+    state.push_otp_invite(UserId(3), "carol".into(), "c-c".into(), None, None, None);
+
+    assert!(state.take_otp_invite_from(UserId(2)));
+    let open = state.otp_invite_open().expect("carol's is untouched");
+    assert_eq!(open.from, UserId(3), "only the named peer's proposal goes");
+    assert!(
+        !state.take_otp_invite_from(UserId(2)),
+        "retiring one that is already gone reports nothing to retire"
+    );
 }

@@ -126,6 +126,21 @@ pub struct OtpContactState {
     /// options would be trusting an unverified ack or wedging the contact
     /// forever.
     pub pending_ack_proof: Option<[u8; 32]>,
+    /// Which pad is actually installed for this contact
+    /// (`crypto::otp::pad_pair_digest`), when it arrived over the network.
+    ///
+    /// `provisioned` alone cannot tell a re-delivery of the installed pad
+    /// from a *new* pad offered for the same contact, and the two must be
+    /// answered oppositely: the first is re-verified silently so the sender
+    /// can stop retrying, the second is a proposal the user has to decide.
+    /// Conflating them let the sender install a new pad while this side
+    /// kept the old one - two different pads under one name, decoding to
+    /// garbage with nothing reporting it.
+    ///
+    /// `None` for a contact adopted from an existing keychain entry rather
+    /// than received, where there is nothing to compare against; such a
+    /// contact simply always asks.
+    pub installed_pad_digest: Option<[u8; 32]>,
 }
 
 /// A `contact_name -> OtpContactState` store, backed by a small flat file:
@@ -196,6 +211,26 @@ impl OtpStore {
             let content = state.pending_content.as_ref()?;
             Some((name.as_str(), seq, content))
         })
+    }
+
+    /// Records which pad is installed for `contact_name`, alongside marking
+    /// it provisioned - see `installed_pad_digest`.
+    pub fn mark_provisioned_with_pad(&mut self, contact_name: &str, digest: [u8; 32]) {
+        self.mark_provisioned(contact_name);
+        if let Some(state) = self.entries.get_mut(contact_name) {
+            state.installed_pad_digest = Some(digest);
+        }
+    }
+
+    /// Whether `digest` names the pad already installed for this contact -
+    /// i.e. whether an arriving pad is a re-delivery rather than a new
+    /// proposal. False for a contact with no recorded pad, which therefore
+    /// always asks.
+    pub fn is_installed_pad(&self, contact_name: &str, digest: [u8; 32]) -> bool {
+        self.entries
+            .get(contact_name)
+            .and_then(|s| s.installed_pad_digest)
+            .is_some_and(|installed| installed == digest)
     }
 
     pub fn mark_provisioned(&mut self, contact_name: &str) {
@@ -418,6 +453,10 @@ impl OtpStore {
             if let Some(proof) = state.pending_ack_proof {
                 out.push_str(&crate::crypto::hex_encode(&proof));
             }
+            out.push('\t');
+            if let Some(digest) = state.installed_pad_digest {
+                out.push_str(&crate::crypto::hex_encode(&digest));
+            }
             out.push('\n');
         }
         fs::write(&self.path, out)
@@ -517,6 +556,11 @@ fn parse_line(line: &str) -> Option<(String, OtpContactState)> {
         .filter(|s| !s.is_empty())
         .and_then(crate::crypto::hex_decode)
         .and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok());
+    let installed_pad_digest = parts
+        .next()
+        .filter(|s| !s.is_empty())
+        .and_then(crate::crypto::hex_decode)
+        .and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok());
     Some((
         name,
         OtpContactState {
@@ -528,6 +572,7 @@ fn parse_line(line: &str) -> Option<(String, OtpContactState)> {
             pending_setup_size_mb,
             pending_end_notice,
             pending_ack_proof,
+            installed_pad_digest,
         },
     ))
 }

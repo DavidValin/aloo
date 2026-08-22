@@ -301,6 +301,10 @@ pub enum P2pEvent {
         from: UserId,
         stream_id: u64,
     },
+    OtpPadCancel {
+        from: UserId,
+        stream_id: u64,
+    },
     /// The receiver reported what it reassembled - the first half of the
     /// two-phase commit (`P2pPayload::OtpPadVerify`).
     OtpPadVerify {
@@ -538,6 +542,13 @@ pub enum P2pOutbound {
         blocks: Vec<Vec<u8>>,
     },
     OtpPadEnd {
+        to: UserId,
+        stream_id: u64,
+    },
+    /// The peer abandoned an in-progress pad transfer
+    /// (`P2pPayload::OtpPadCancel`) - whichever side gave up, this one
+    /// must stop waiting and erase whatever it staged.
+    OtpPadCancel {
         to: UserId,
         stream_id: u64,
     },
@@ -1424,6 +1435,7 @@ impl PeerLinkManager {
                 blocks,
             },
             P2pPayload::OtpPadEnd { stream_id } => P2pEvent::OtpPadEnd { from, stream_id },
+            P2pPayload::OtpPadCancel { stream_id } => P2pEvent::OtpPadCancel { from, stream_id },
             P2pPayload::OtpPadVerify {
                 contact_name,
                 accepted,
@@ -1835,6 +1847,9 @@ impl PeerLinkManager {
             }
             P2pOutbound::OtpPadEnd { to, stream_id } => {
                 self.send_reliable_or_queue(to, P2pPayload::OtpPadEnd { stream_id });
+            }
+            P2pOutbound::OtpPadCancel { to, stream_id } => {
+                self.send_reliable_or_queue(to, P2pPayload::OtpPadCancel { stream_id });
             }
             P2pOutbound::FileEnd { to, stream_id } => {
                 self.send_reliable_or_queue(to, P2pPayload::FileEnd { stream_id });

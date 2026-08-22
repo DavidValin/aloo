@@ -128,6 +128,23 @@ pub fn ack_proof_for_file(path: &std::path::Path) -> std::io::Result<AckProof> {
     digest_key_file(path)
 }
 
+/// One value naming the *pair* of halves a pad is - `sha256` of the two
+/// half digests, in order.
+///
+/// What it is for: telling a re-delivery of the pad already installed
+/// apart from a genuinely new one offered for the same contact. Those two
+/// look identical at the `provisioned` flag, and treating the second as
+/// the first is how the two sides end up holding *different* pads under
+/// one name - the silent-garbage case the whole two-phase commit exists to
+/// prevent.
+pub fn pad_pair_digest(enc: &KeyDigest, dec: &KeyDigest) -> KeyDigest {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(enc);
+    hasher.update(dec);
+    hasher.finalize().into()
+}
+
 /// The `otp` keychain contact name for a pair with no `pq_hybrid`
 /// identities, derived from the two **pinned public keys** rather than
 /// from nicknames.
@@ -288,6 +305,15 @@ impl OtpKeySetupReassembly {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OtpSessionRequestPayload {
     pub contact_name: String,
+    /// `Some(mb per key)` when this asks to generate and share a *fresh*
+    /// pad, `None` when it asks to resume one both sides already hold.
+    ///
+    /// The size is here rather than in the pad's own arrival because it is
+    /// the only thing the deciding side actually has to weigh, and by the
+    /// time a pad arrives the cost it represents - minutes of transfer and
+    /// several gigabytes of disk on both machines - has already been paid.
+    /// Asking then is asking too late to matter.
+    pub pad_size_mb: Option<u32>,
 }
 
 /// Carried by both `Content::OtpEndSession` (either participant's `/endotp`

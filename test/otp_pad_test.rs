@@ -9,6 +9,8 @@
 //! "neither side installs until both prove they hold the same bytes".
 
 use aloo::client::otp_pad::{PAD_CHUNK_BYTES, PAD_INFLIGHT_FRAMES};
+use aloo::p2p_proto::{P2pPayload, PunchDatagram, SAFE_DATAGRAM_BYTES};
+use aloo::proto;
 use aloo::crypto::otp::digest_key_file;
 use std::path::PathBuf;
 
@@ -31,14 +33,35 @@ fn temp_dir(label: &str) -> PathBuf {
 /// inside a single un-fragmented datagram.
 #[test]
 fn a_pad_chunk_fits_one_unfragmented_datagram() {
-    // The smallest MTU worth designing for is 1280 (IPv6's minimum);
-    // subtract generous room for IP/UDP headers and this app's own framing
-    // and the payload must still fit.
-    const SAFE_PAYLOAD_BYTES: usize = 1024;
+    // Measured, not estimated. The chunk size is the single biggest lever
+    // on how long provisioning takes, so guessing at the framing overhead
+    // would mean either leaving throughput on the table or shipping a size
+    // that fragments - and fragmentation is exactly what made provisioning
+    // fail across real network paths.
+    //
+    // A pad chunk is sealed with AES-256-GCM (`crypto::pq::seal_chunk`),
+    // whose only expansion is the 16-byte tag - unlike a file chunk, whose
+    // RSA-OAEP path expands by half again and is why
+    // `file_transfer::FILE_CHUNK_BYTES` is as small as it is.
+    const GCM_TAG_BYTES: usize = 16;
+    let sealed = vec![0u8; PAD_CHUNK_BYTES + GCM_TAG_BYTES];
+    let payload = proto::encode(&P2pPayload::OtpPadChunk {
+        stream_id: u64::MAX,
+        seq: u32::MAX,
+        blocks: vec![sealed],
+    })
+    .expect("encode");
+    let dgram = proto::encode(&PunchDatagram::Reliable {
+        seq: u32::MAX,
+        payload,
+    })
+    .expect("encode");
+
     assert!(
-        PAD_CHUNK_BYTES <= SAFE_PAYLOAD_BYTES,
-        "a pad chunk of {PAD_CHUNK_BYTES} bytes risks IP fragmentation, which is exactly \
-         what made provisioning fail across real network paths"
+        dgram.len() <= SAFE_DATAGRAM_BYTES,
+        "a {PAD_CHUNK_BYTES}-byte pad chunk becomes a {}-byte datagram, over the \
+         {SAFE_DATAGRAM_BYTES}-byte budget that keeps it un-fragmented",
+        dgram.len()
     );
 }
 
@@ -61,15 +84,32 @@ fn chunk_count_scales_with_the_pad_so_per_chunk_overhead_would_not_survive() {
 /// Memory must not scale with the pad - the sender stops reading once this
 /// many frames are outstanding, so a terabyte pad costs the same memory as
 /// a megabyte one.
+///
+/// Asserted as a property rather than against a figure. The bound used to
+/// be a flat 16MB, which read as generous and was in fact unreachable:
+/// `outbound_depth` saturates at `PENDING_MAX` on a link that is not yet
+/// `Active`, so a bound above it meant no backpressure at all (see
+/// `the_inflight_bound_stays_under_what_the_link_queue_can_hold`). It is
+/// now derived from that queue, so pinning a constant here would only
+/// pin the wrong half of the relationship again.
+// The assertions here compare compile-time constants, which is the point:
+// what is being checked is a relationship between them that a later edit
+// could silently break.
+#[allow(clippy::assertions_on_constants)]
 #[test]
 fn the_inflight_bound_is_a_fixed_amount_of_data_not_a_fraction_of_the_pad() {
     let inflight_bytes = PAD_INFLIGHT_FRAMES * PAD_CHUNK_BYTES;
-    assert_eq!(
-        inflight_bytes,
-        16 * 1024 * 1024,
-        "the sender should keep about 16MB in flight regardless of pad size"
-    );
     assert!(PAD_INFLIGHT_FRAMES > 0);
+    // Whatever it is, it is a constant - a pad a million times larger
+    // costs the sender exactly the same memory.
+    for pad_bytes in [1024u64 * 1024, 1024 * 1024 * 1024 * 1024] {
+        let _ = pad_bytes;
+        assert_eq!(PAD_INFLIGHT_FRAMES * PAD_CHUNK_BYTES, inflight_bytes);
+    }
+    assert!(
+        inflight_bytes <= 16 * 1024 * 1024,
+        "{inflight_bytes} bytes in flight is more memory than a bounded transfer needs"
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -155,4 +195,33 @@ fn digesting_an_empty_file_succeeds_rather_than_erroring() {
 fn digesting_a_missing_file_is_an_error_not_a_default_digest() {
     let dir = temp_dir("digest-missing");
     assert!(digest_key_file(&dir.join("nope.key")).is_err());
+}
+
+
+/// The bound the worker throttles against must stay under what the link's
+/// queue can actually hold, or it can never be reached at all.
+///
+/// `outbound_depth` is `arq_tx.depth() + pending.len()`, and while a link
+/// is not yet `Active` the first term is zero and the second saturates at
+/// `PENDING_MAX`. A bound above that leaves the worker permanently
+/// unthrottled: it reads the whole pad at disk speed into a queue that
+/// discards its *oldest* entry on overflow, so the front of the transfer
+/// is destroyed continuously while the progress bar races to completion.
+/// That is not a slow transfer, it is a broken one, and it is what this
+/// pins.
+///
+/// @requirement AC-254
+#[allow(clippy::assertions_on_constants)]
+#[test]
+fn the_inflight_bound_stays_under_what_the_link_queue_can_hold() {
+    assert!(
+        PAD_INFLIGHT_FRAMES < aloo::client::p2p::PENDING_MAX,
+        "an in-flight bound of {PAD_INFLIGHT_FRAMES} can never be reached through a queue \
+         that holds {}, so the worker would never throttle at all",
+        aloo::client::p2p::PENDING_MAX
+    );
+    assert!(
+        PAD_INFLIGHT_FRAMES > aloo::client::p2p_reliable::SEND_WINDOW,
+        "and it must stay well above one send window, or the link waits on the disk"
+    );
 }

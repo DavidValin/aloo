@@ -1286,10 +1286,27 @@ pub struct PendingOtpGenerate {
 /// responsive throughout - which is the whole point: at the sizes this now
 /// allows (up to 1TB per key), a blocked, silent event loop would be
 /// indistinguishable from a crash.
+/// Which of a pad's two slow phases the popup is reporting on.
+///
+/// They are separate because they fail, and wait, for entirely different
+/// reasons - generation is bounded by how fast this machine produces true
+/// randomness, transfer by the link's round-trip time - and because a user
+/// watching a bar that restarts at zero deserves to be told why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OtpPadPhase {
+    /// `otp --new-key-pair` is still reading randomness.
+    Generating,
+    /// The pad exists here and is streaming to the peer.
+    Sending,
+    /// The peer's pad is streaming to us.
+    Receiving,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OtpKeygenProgress {
     pub peer: UserId,
     pub peer_name: String,
+    pub phase: OtpPadPhase,
     /// MB per key, as chosen in the size prompt - shown so the popup names
     /// what is being waited on, not just that something is.
     pub size_mb: u32,
@@ -1495,6 +1512,11 @@ pub enum UiAction {
     /// (`otp_generate_confirm`'s Reject, or Escape out of `otp_size_input`)
     /// - purely local, nothing was ever sent.
     CancelOtpGenerate,
+    /// Escape during generation or transfer: abandon the pad on both sides
+    /// and erase whatever has been staged for it.
+    CancelOtpPad {
+        peer: UserId,
+    },
     /// The user accepted an incoming OTP session proposal
     /// (`otp_invite_open`) - `client::otp::accept_invite`.
     AcceptOtpInvite,
@@ -3142,6 +3164,7 @@ impl UiState {
     /// moment it hands generation to its background task.
     pub fn open_otp_keygen(&mut self, peer: UserId, peer_name: String, size_mb: u32) {
         self.otp_keygen = Some(OtpKeygenProgress {
+            phase: OtpPadPhase::Generating,
             peer,
             peer_name,
             size_mb,
@@ -3153,17 +3176,69 @@ impl UiState {
 
     /// Moves the spinner's bar - one `otp_keygen_tx` progress report. A
     /// no-op once the popup is closed (a late report arriving after the
-    /// generation was already resolved).
+    /// generation was already resolved), and equally once it has moved on
+    /// to the transfer: generation reports are counted against a different
+    /// total, so applying one there would rewind a bar that has genuinely
+    /// advanced.
     pub fn set_otp_keygen_progress(&mut self, written_bytes: u64, total_bytes: u64) {
-        if let Some(progress) = self.otp_keygen.as_mut() {
+        if let Some(progress) = self.otp_keygen.as_mut()
+            && progress.phase == OtpPadPhase::Generating
+        {
             progress.written_bytes = written_bytes;
             progress.total_bytes = total_bytes;
         }
     }
 
+    /// Switches the popup to the transfer phase, bar back to zero.
+    ///
+    /// Generating a pad and pushing it across a link are both slow, for
+    /// unrelated reasons, and this is the moment between them. Without it
+    /// the popup vanished the instant generation finished and the peer's
+    /// invitation appeared minutes later with nothing in between - which
+    /// read as the handshake having silently failed.
+    ///
+    /// `size_mb` is per key; the transfer is both halves, so the total is
+    /// twice it (`otp_pad::spawn_send_pad_worker` sends enc then dec).
+    pub fn begin_otp_pad_transfer(
+        &mut self,
+        peer: UserId,
+        peer_name: String,
+        size_mb: u32,
+        phase: OtpPadPhase,
+    ) {
+        self.otp_keygen = Some(OtpKeygenProgress {
+            phase,
+            peer,
+            peer_name,
+            size_mb,
+            written_bytes: 0,
+            total_bytes: size_mb as u64 * 1024 * 1024 * 2,
+            frame: 0,
+        });
+    }
+
     /// Closes the spinner - generation finished, failed, or was abandoned.
     pub fn close_otp_keygen(&mut self) {
         self.otp_keygen = None;
+    }
+
+    /// Closes it only if it is reporting on `peer` - so a stale transfer
+    /// ending cannot tear down a popup that has since moved on to another
+    /// contact.
+    pub fn close_otp_keygen_for(&mut self, peer: UserId) {
+        if self.otp_keygen.as_ref().is_some_and(|p| p.peer == peer) {
+            self.otp_keygen = None;
+        }
+    }
+
+    /// Moves the transfer bar, if the popup is still reporting on `peer`.
+    pub fn set_otp_pad_transfer_progress(&mut self, peer: UserId, sent_bytes: u64) {
+        if let Some(progress) = self.otp_keygen.as_mut()
+            && progress.peer == peer
+            && progress.phase != OtpPadPhase::Generating
+        {
+            progress.written_bytes = sent_bytes.min(progress.total_bytes);
+        }
     }
 
     pub fn otp_keygen_open(&self) -> Option<&OtpKeygenProgress> {
@@ -3829,8 +3904,17 @@ impl UiState {
         // half-written is exactly the stale-half-pad state
         // `stage_pending_setup` exists to avoid). It closes itself when the
         // generation reports back.
-        if self.otp_keygen.is_some() {
-            return None;
+        // Generation and transfer are both long enough to be regretted -
+        // minutes, and gigabytes of disk - so Escape has to reach them.
+        // Everything else is still absorbed: there is nothing else to
+        // decide while one is running.
+        if let Some(progress) = self.otp_keygen.as_ref() {
+            return match (kind, code) {
+                (KeyEventKind::Press | KeyEventKind::Repeat, KeyCode::Esc) => {
+                    Some(UiAction::CancelOtpPad { peer: progress.peer })
+                }
+                _ => None,
+            };
         }
 
         // The pad-size prompt, shown right after Accept below - same
@@ -5885,9 +5969,25 @@ fn render_otp_size_popup(frame: &mut Frame, area: Rect, pending: &PendingOtpGene
         .constraints(constraints)
         .split(inner);
 
+    // The estimate is the whole reason a ceiling is no longer imposed
+    // here: any size can be delivered, but a large one takes real time and
+    // that is the user's call to make knowingly rather than ours to refuse.
+    let estimate = state
+        .otp_size_text
+        .parse::<u32>()
+        .ok()
+        .filter(|mb| crate::crypto::otp::otp_size_mb_in_range(*mb))
+        .map(|mb| {
+            format!(
+                " {} MB per key is {} to send over the link once generated.",
+                mb,
+                crate::client::otp::transfer_estimate_text(mb)
+            )
+        })
+        .unwrap_or_default();
     let message = format!(
         "Choose a size between {} and {} MB, then press Enter. \
-         Esc cancels the whole session.",
+         Esc cancels the whole session.{estimate}",
         crate::crypto::otp::OTP_SIZE_MB_MIN,
         crate::crypto::otp::OTP_SIZE_MB_MAX
     );
@@ -5918,9 +6018,39 @@ const KEYGEN_BAR_CELLS: usize = 40;
 /// replaces.
 fn render_otp_keygen_popup(frame: &mut Frame, area: Rect, progress: &OtpKeygenProgress) {
     let popup = centered_rect(64, 8, area);
-    let block = Block::default()
-        .title(format!("Generating a pad for {}", progress.peer_name))
-        .borders(Borders::ALL);
+    let (title, what, reassurance) = match progress.phase {
+        OtpPadPhase::Generating => (
+            format!("Generating a pad for {}", progress.peer_name),
+            format!(
+                "{}MB per key ({}MB of true randomness in total)",
+                progress.size_mb,
+                progress.size_mb as u64 * 2
+            ),
+            "Generating and sharing happen once - the pad is then reused for every message \
+             with this contact until it runs out.",
+        ),
+        OtpPadPhase::Sending => (
+            format!("Sending the pad to {}", progress.peer_name),
+            format!(
+                "{}MB per key, both halves ({}MB over the link)",
+                progress.size_mb,
+                progress.size_mb as u64 * 2
+            ),
+            "They are asked to accept only once the whole pad has arrived and both sides \
+             agree it matches - so their prompt appears when this finishes, not before.",
+        ),
+        OtpPadPhase::Receiving => (
+            format!("Receiving a pad from {}", progress.peer_name),
+            format!(
+                "{}MB per key, both halves ({}MB over the link)",
+                progress.size_mb,
+                progress.size_mb as u64 * 2
+            ),
+            "Nothing is installed yet. Once it has all arrived and matches what they sent, \
+             you will be asked whether to accept it.",
+        ),
+    };
+    let block = Block::default().title(title).borders(Borders::ALL);
     let inner = block.inner(popup);
     frame.render_widget(Clear, popup);
     frame.render_widget(block, popup);
@@ -5941,11 +6071,7 @@ fn render_otp_keygen_popup(frame: &mut Frame, area: Rect, progress: &OtpKeygenPr
                 format!("{spinner} "),
                 Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
             ),
-            Span::raw(format!(
-                "{}MB per key ({}MB of true randomness in total)",
-                progress.size_mb,
-                progress.size_mb as u64 * 2
-            )),
+            Span::raw(what),
         ]))
         .wrap(ratatui::widgets::Wrap { trim: true }),
         rows[0],
@@ -5969,10 +6095,7 @@ fn render_otp_keygen_popup(frame: &mut Frame, area: Rect, progress: &OtpKeygenPr
     );
 
     frame.render_widget(
-        Paragraph::new(
-            "Generating and sharing happen once - the pad is then reused for every message \
-             with this contact until it runs out.",
-        )
+        Paragraph::new(reassurance)
         .style(Style::default().fg(Color::DarkGray))
         .wrap(ratatui::widgets::Wrap { trim: true }),
         rows[2],

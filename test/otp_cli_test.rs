@@ -512,9 +512,16 @@ async fn new_key_pair_with_progress_reports_monotonic_progress_to_the_exact_tota
 
     let reports = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(u64, u64)>::new()));
     let sink = reports.clone();
-    otp_cli::new_key_pair_with_progress(&cfg, 1, "alice", "bob", move |written, total| {
-        sink.lock().unwrap().push((written, total));
-    })
+    otp_cli::new_key_pair_with_progress(
+        &cfg,
+        1,
+        "alice",
+        "bob",
+        move |written, total| {
+            sink.lock().unwrap().push((written, total));
+        },
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
     .await
     .expect("generating a 1MB-per-key pair should succeed");
 

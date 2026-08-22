@@ -933,3 +933,114 @@ fn a_whole_file_spend_proves_itself_with_the_plaintexts_digest() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The pad tool writes *four* files of the chosen size, not two - both
+/// halves land in both correspondents' key directories - so a pad needs
+/// four times its per-key size on disk. Measured against the real binary
+/// rather than assumed; nothing in its documentation states it.
+///
+/// Getting this wrong is expensive in the worst way: generation appears to
+/// start, the disk fills partway through, and the failure surfaces from
+/// inside the tool long after the user committed to waiting.
+///
+/// @requirement AC-254
+#[test]
+fn a_pads_disk_cost_is_four_times_its_per_key_size() {
+    use aloo::client::otp_cli::keygen_disk_bytes;
+    assert_eq!(keygen_disk_bytes(1), 4 * 1024 * 1024);
+    assert_eq!(
+        keygen_disk_bytes(2000),
+        8_388_608_000,
+        "a 2000MB pad is 8GB on disk, which is the figure worth refusing on"
+    );
+}
+
+/// The check must fail *open*: a filesystem it cannot measure is not a
+/// reason to refuse work that would have succeeded.
+///
+/// @requirement AC-254
+#[test]
+fn free_space_is_reported_for_a_real_directory_and_absent_for_a_missing_one() {
+    use aloo::client::otp_cli::free_space_bytes;
+    let dir = temp_dir("free-space");
+    assert!(
+        free_space_bytes(&dir).is_some_and(|free| free > 0),
+        "a directory that exists must report something to compare against"
+    );
+    assert!(
+        free_space_bytes(&dir.join("no-such-subdirectory")).is_none(),
+        "an unmeasurable path must read as unknown, so the caller proceeds rather than refusing"
+    );
+}
+
+/// Which pad is installed, not merely that one is - the discriminator that
+/// keeps a re-delivery apart from a new proposal.
+///
+/// @requirement AC-256
+#[test]
+fn a_pads_identity_is_the_pair_of_its_half_digests() {
+    use aloo::crypto::otp::pad_pair_digest;
+    let a = [1u8; 32];
+    let b = [2u8; 32];
+    assert_eq!(pad_pair_digest(&a, &b), pad_pair_digest(&a, &b));
+    assert_ne!(
+        pad_pair_digest(&a, &b),
+        pad_pair_digest(&b, &a),
+        "the halves are not interchangeable - one encrypts, the other decrypts"
+    );
+    assert_ne!(
+        pad_pair_digest(&a, &b),
+        pad_pair_digest(&a, &[3u8; 32]),
+        "a pad differing in either half is a different pad"
+    );
+}
+
+/// A store records the pad it installed, and only that pad reads back as
+/// installed - which is what stops a *new* pad being silently accepted as
+/// a re-delivery and leaving the two sides holding different key material.
+///
+/// @requirement AC-256
+#[test]
+fn only_the_recorded_pad_reads_back_as_installed() {
+    let mut store = OtpStore::new_empty(temp_dir("installed-pad").join("otp-store"));
+    let installed = aloo::crypto::otp::pad_pair_digest(&[7u8; 32], &[8u8; 32]);
+    let other = aloo::crypto::otp::pad_pair_digest(&[7u8; 32], &[9u8; 32]);
+
+    store.mark_provisioned_with_pad("alice-bob", installed);
+    assert!(store.is_installed_pad("alice-bob", installed));
+    assert!(
+        !store.is_installed_pad("alice-bob", other),
+        "a different pad must never pass as the one already installed"
+    );
+
+    // A contact adopted from an existing keychain entry records no pad, so
+    // it can only ever ask.
+    store.mark_provisioned("alice-carol");
+    assert!(!store.is_installed_pad("alice-carol", installed));
+}
+
+/// The size rides with the request, so the deciding side weighs it before
+/// anything is generated rather than after it has all arrived.
+///
+/// @requirement AC-257
+#[test]
+fn a_session_request_carries_the_pad_size_it_is_proposing() {
+    use aloo::crypto::otp::OtpSessionRequestPayload;
+    let fresh = OtpSessionRequestPayload {
+        contact_name: "alice-bob".to_string(),
+        pad_size_mb: Some(500),
+    };
+    let decoded: OtpSessionRequestPayload =
+        proto::decode(&proto::encode(&fresh).unwrap()).unwrap();
+    assert_eq!(decoded.pad_size_mb, Some(500));
+    assert_eq!(decoded.contact_name, "alice-bob");
+
+    // A resume asks for no new pad, so there is no size to weigh.
+    let resume = OtpSessionRequestPayload {
+        contact_name: "alice-bob".to_string(),
+        pad_size_mb: None,
+    };
+    let decoded: OtpSessionRequestPayload =
+        proto::decode(&proto::encode(&resume).unwrap()).unwrap();
+    assert_eq!(decoded.pad_size_mb, None);
+}

@@ -350,6 +350,14 @@ pub enum P2pPayload {
         seq: u32,
         blocks: Vec<Vec<u8>>,
     },
+    /// Either side has abandoned an in-progress pad transfer - the user
+    /// pressed Escape. Symmetric on purpose: generation and transfer are
+    /// both long enough to be regretted, and whichever side gives up, the
+    /// other must stop waiting and erase what it staged rather than hold
+    /// gigabytes for a handshake that is never completing.
+    OtpPadCancel {
+        stream_id: u64,
+    },
     /// Every chunk has been sent. The receiver checks length and digests
     /// at this point; nothing is installed on either side yet.
     OtpPadEnd {
