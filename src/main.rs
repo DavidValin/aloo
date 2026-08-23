@@ -91,7 +91,7 @@ struct Cli {
     /// Run in the background, connected, so the global push-to-talk
     /// shortcut works without aloo being open. Joins only the channels
     /// given with `--channels` (never `the-hall` unless you name it) and
-    /// puts the focus where `--focus` says, so a held shortcut goes
+    /// puts the focus where `--initial-focus` says, so a held shortcut goes
     /// straight there. Type `aloo` in any terminal to take the session
     /// over, `/daemon` to hand it back.
     #[arg(long)]
@@ -156,15 +156,17 @@ struct Cli {
     #[arg(long, value_name = "NAME[:PASSWORD],...")]
     channels: Vec<String>,
 
-    /// Daemon-only: where a held push-to-talk shortcut sends its voice.
-    /// `channel:<name>` for a channel, or a bare nickname for a DM, which
-    /// opens as soon as that person appears.
+    /// Daemon-only: where a held push-to-talk shortcut sends its voice, the
+    /// first time it opens. `channel:<name>` for a channel, or a bare
+    /// nickname for a DM, which opens as soon as that person appears. Only
+    /// places it once, at startup - not a standing instruction that keeps
+    /// steering focus afterward.
     #[arg(long, value_name = "TARGET")]
-    focus: Option<String>,
+    initial_focus: Option<String>,
 
-    /// Daemon-only: with a nickname `--focus`, make sure an OTP session is
-    /// running with them. One that is already active - they survive
-    /// disconnects and restarts, only `/endotp` ends one - is simply
+    /// Daemon-only: with a nickname `--initial-focus`, make sure an OTP
+    /// session is running with them. One that is already active - they
+    /// survive disconnects and restarts, only `/endotp` ends one - is simply
     /// continued, with no invitation sent and no popup on their side; only
     /// a peer with no live session is invited, once.
     #[arg(long)]
@@ -290,7 +292,7 @@ fn resolve_daemon_config(cli: &Cli) -> Result<aloo::client::daemon::DaemonConfig
         ssl: cli.ssl,
         my_key_prefix: cli.my_key.clone(),
         channels: cli.channels.clone(),
-        focus: cli.focus.clone(),
+        initial_focus: cli.initial_focus.clone(),
         no_server: cli.no_server,
         otp: cli.otp,
     };

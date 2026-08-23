@@ -1585,6 +1585,85 @@ refusal) is treated as an error by the client itself; a body that is
 neither `good` nor `nochg` is logged rather than retried early, since the
 next scheduled fire is only minutes away regardless.
 
+**Reconciling an unpinned nickname against an already-pinned key.** A
+`direct_punch_to` nickname can punch successfully - the name matches, so the
+transport link comes up - and still have no key pinned for it at all: maybe
+the settings line was typed before the key was ever exchanged, maybe the
+person is already known under a different name. Left alone this is exactly
+the "transport-only link" §7.1.5 already describes above: nothing ever
+registers them, and nothing tells the user why.
+
+Instead, the moment such a peer sends whatever would normally prove their
+identity - a `ChannelPresence` envelope for a `pq_hybrid` peer, or a
+pad-wrapped message for a pad-only one - the user is asked: *"A connection
+was received directly to your public ip from an unknown nickname
+("&lt;name&gt;"). Do you want to check which of your local keys matches this
+request?"* Declining costs nothing: no check runs, and a later, distinct
+proof from the same nickname asks again from scratch.
+
+Agreeing runs a real cryptographic scan against every *other* nickname
+already pinned locally - never a guess, and only ever against a candidate
+whose pin decodes as a `pq_hybrid` keybundle:
+
+- a `ChannelPresence` proof is tried by attempting the ordinary
+  envelope-open (§13's signature check) as if that candidate's key were the
+  sender's;
+- an OTP-wrapped proof is tried by attempting only the *outer* `pq_hybrid`
+  seal a `PqWrapped` pad session carries (§16.2) - covering a peer who has
+  a real identity *and* an OTP session layered on top of it, without ever
+  touching the pad itself during the search.
+
+A candidate whose pin does *not* decode is never tried at all, for either
+proof kind - not because it couldn't in principle prove something, but
+because doing so would mean running every locally-held one-time pad's own
+decrypt against a ciphertext from an unverified source, one pad at a time,
+to find out who is speaking. A `pq_hybrid` signature check costs nothing
+to try repeatedly and fails cleanly on a wrong guess; a pad's decrypt is
+real, spent key material, and repeatedly reaching for *every* pad held
+just to attribute one unverified message is a materially different (and
+here, deliberately unwanted) cost. A pad-only peer's unpinned nickname is
+therefore never reconciled by this scan - the "impossible without a key"
+outcome below is what such a peer's first message gets instead.
+
+A wrong candidate has no side effect either way: both checks are ordinary
+`pq_hybrid` signature verifications that fail before anything is spent.
+Since a signature verifies under exactly one key, at most one candidate
+can ever succeed - this is a cryptographic near-certainty, not something
+the scan has to adjudicate. The pad itself, for the OTP-proof case, is
+touched only once real content-decrypt happens - after the outer seal has
+already named exactly one candidate as correct.
+
+Finding no match tells the user plainly: *"Impossible to establish
+communication with the user without a key. Requires a server for key
+exchange or manually exchanging the keys."* Finding exactly one asks a
+second question - *"I found that the request from &lt;name&gt; matches your
+local key for &lt;matched&gt;. Do you want to use &lt;matched&gt;'s key to talk to
+&lt;name&gt;?"* - and confirming it pins the same key bytes under the new
+nickname too (no `IdStore` schema change: nothing ever required a key to
+be pinned under only one name) and finishes registration from the
+plaintext the scan already recovered, never decrypting a second time. For
+an OTP-wrapped match this automatically shares the existing pad session,
+since a `PqWrapped` contact name is a pure function of both sides'
+fingerprints.
+
+This is reachable only for a nickname that is itself a `direct_punch_to`
+target - a stranger probing an unconfigured name is untouched, exactly as
+above - and never for a server-introduced peer, since the server-coordinated
+path's own datagrams (`Ping`/`Pong`) carry no nickname at all; only
+`DirectPing`/`DirectPong` do, and that variant only exists here.
+
+**A repeated, genuinely failed check is a strike against its source IP.**
+Three strikes - the user agreed to check, the scan ran, nothing matched -
+from one IP, spanning at least two different clock minutes, within a
+rolling 10-hour window, bans that IP outright: no further `DirectPing` from
+it is even shown a popup, checked first thing before any nickname is
+looked at. Unlike §6.6's channel-password ban, this one has no auto-expiry
+and does not live only in memory - it is written to
+`~/.aloo/banned_ips.log` (date, ip, reason, one per line, plus a running
+`<n> banned` header line recomputed on every write) and reloaded at
+startup, so it survives a restart and is lifted only by editing the file
+by hand.
+
 ### 7.2 Sending a channel or direct text message
 
 The sender addresses each intended recipient individually - a channel

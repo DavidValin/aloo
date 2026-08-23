@@ -257,8 +257,8 @@ When a channel is joined, the join is broadcast to all users already in the chan
    - If there are unread messages from that user, the envelope blinks instead of staying solid; reopening their room (marking it read) stops the blinking but does not remove the envelope, since there's still history.
    - Outgoing DM messages are encrypted with the receiver's public key; incoming DM messages are decrypted with the user's own private key.
 
-4. **Send a voice message** by holding Space (while focus is not on the compose bar - Space there just types a literal space) and releasing it to stop, up to `voice::MAX_RECORDING_SECS` (4 minutes) long. Voice is streamed live, not recorded-then-sent: while Space is held, captured audio is chunked (`voice::CHUNK_INTERVAL`, 15ms) and sent to the network as it's captured, and the receiving side plays each chunk as it arrives, rather than waiting for the whole message. While recording, a 🎤 "recording..." indicator appears inline at the end of the input bar and the bar's border turns red.
-   - **Live appearance and finalization.** Both directions show the in-progress message immediately (a pulsing "streaming..." block in the log) and it turns into a normal, replayable voice block only once the stream ends. The user can replay a finished voice message later by scrolling through the channel/DM history and pressing Enter on it, which renders in bold red, marked with a 🔴 and labeled with its actual recorded duration, e.g. `🔴 voice (12sec)` — the duration shown always reflects the real length of that specific message, not a fixed value. Any partial second rounds up (1ms shows as `1sec`, 1001ms as `2sec`), except a genuinely instantaneous 0ms recording, which shows `0sec` rather than rounding up to `1sec`. **While a replay is playing, pressing Escape stops it** immediately, instead of Escape's usual meaning of closing the current private room — Escape reverts to that usual meaning again the moment nothing is being replayed.
+4. **Send a voice message** by holding Space (while focus is not on the compose bar - Space there just types a literal space) and releasing it to stop, up to `voice::MAX_RECORDING_SECS` (4 minutes) long. Voice is streamed live, not recorded-then-sent: while Space is held, captured audio is chunked (`voice::CHUNK_INTERVAL`, 15ms) and sent to the network as it's captured, and the receiving side plays each chunk as it arrives, rather than waiting for the whole message. While recording, a blinking red ⏺ "recording..." indicator appears inline at the end of the input bar and the bar's border turns red.
+   - **Live appearance and finalization.** Both directions show the in-progress message immediately (a blinking red ⏺ "voice (streaming...)" block in the log) and it turns into a normal, replayable voice block only once the stream ends. The user can replay a finished voice message later by scrolling through the channel/DM history and pressing Enter on it, which renders in bold red, marked with a 🔴 and labeled with its actual recorded duration, e.g. `🔴 voice (12sec)` — the duration shown always reflects the real length of that specific message, not a fixed value. Any partial second rounds up (1ms shows as `1sec`, 1001ms as `2sec`), except a genuinely instantaneous 0ms recording, which shows `0sec` rather than rounding up to `1sec`. **While a replay is playing, pressing Escape stops it** immediately, instead of Escape's usual meaning of closing the current private room — Escape reverts to that usual meaning again the moment nothing is being replayed.
    - **Release detection** works on any terminal. At startup the client queries whether the terminal actually supports the Kitty keyboard protocol's release reporting (`crossterm::terminal::supports_keyboard_enhancement`, not just whether enabling it succeeded — a terminal can accept the escape sequence without honoring it). If it does, stopping relies solely on that genuine `Release` event: recording continues through any pause or silence for as long as Space is physically held, and only stops when it's actually released. If it doesn't, there is no way to observe a release directly, so the app falls back to watching for the OS's keyboard auto-repeat (a steady stream of `Press` events roughly every 30-50ms once repeating, after an initial OS repeat-delay commonly in the 500-650ms range) and treats ~900ms of silence since the last one as "released" — an approximation, used only when nothing better is available. Both stopping mechanisms are no-ops when nothing is actually being recorded: a `Release` event with no matching prior `Press` (e.g. one delivered right as a channel switch or DM close ends a recording some other way) does nothing, and so does the idle-timeout check firing with no recording in progress.
    - **Length cap.** A recording that reaches `voice::MAX_RECORDING_SECS` (4 minutes) stops itself automatically — the indicator clears and the end-of-message chime plays, exactly as if Space had just been released, whether or not it's still actually held. This is a client-side courtesy limit on the *sending* side; the receiving side independently enforces the identical cap regardless of what the sender did (`docs/PROTOCOL.md` §7.3) — an incoming stream is force-finalized with whatever arrived once it reaches 4 minutes of audio, so a modified or misbehaving peer can never make a receiver accept, or keep decrypting, a longer one.
    - **Failure handling.** If starting the recorder fails (e.g. no microphone), or if Space is pressed with nowhere to address the stream to (not joined to any channel, no active DM), the indicator clears immediately (or never starts) rather than continuing to claim a recording is happening. The failure reason is tracked internally but deliberately not rendered on screen - this kind of environment tends to surface plenty of transient, self-recovering audio errors (buffer under/overruns, PulseAudio status-query hiccups) that aren't worth interrupting the display for.
@@ -333,7 +333,7 @@ When a channel is joined, the join is broadcast to all users already in the chan
     - **Nobody is rung before you confirm.** `/call` opens a confirmation naming, in yellow, how many people the invite will reach — every reachable member for a channel call, the one peer for a DM. Cancel rings nobody. If the answer is nobody at all, there is nothing to confirm: the call never starts and a notice reads `Call has ended: no one was invited`. A DM call to a peer under an OTP session is likewise refused *before* the confirmation rather than after it — it could never succeed, so there is nothing to agree to.
     - **Every reachable member/the peer sees a popup** — chimed, like a file offer — reading `Voice call incoming from <nickname>`, with **Accept**/**Reject** buttons, **Accept focused by default** (same reasoning as the file-offer popup, Functionality #9). A caller already on a different call is answered automatically with a decline, no popup shown - the reference client supports one active call at a time. Several invites queue and show one at a time, same as file offers; one from a not-yet-trusted identity (Functionality #8) is held, not shown, until that identity is `Accept`ed.
     - **Accepting joins.** Once joined, the microphone stays open continuously - not push-to-talk, no 4-minute cap - and stays that way for as long as the call runs. Every participant who accepts hears every other one; there is no server and no single participant's connection the others depend on staying up (`docs/PROTOCOL.md` §7.7's roster-convergence rule).
-    - **A permanent red indicator** (see "Connected UI" above) marks the whole time a call is active, naming how many other participants are currently connected and whether the microphone is muted.
+    - **A permanent red indicator** (see "Connected UI" above) marks the whole time a call is active, naming how many other participants are currently connected and whether the microphone is muted. The compact header version blinks while unmuted — the same live-activity blink a recording or a streaming voice message uses — and shows 🔇 in place of the dot, steady rather than blinking, while you are muted.
     - **A call modal** opens the moment the call becomes active — for the caller and for everyone who accepts — and is the call's own screen:
         - **The live duration sits on top**, in yellow, ticking every second.
         - **Below it, everyone on the call**: the **host** (whoever ran `/call`) first, named `<nickname> (host)` rather than carrying a label of its own — your own row reads `<nickname> (you)`, and both marks together on your own call. Each row then carries where that person stands — `IN CALL` in green, `INVITED` in yellow for an invite nobody has answered yet, `REJECTED` in grey for one that was declined — plus `MUTED` in red if they cannot currently be heard — whether they silenced themselves or the host did, since the row answers "can I hear this person right now" — and a **live voice-level bar** that moves with what they are actually saying. Every row is `<nickname> <labels> <voice meter>` and all three columns line up down the list: the name column is as wide as the widest name in *this* call, followed by four columns of gap so a name that fills it never runs into its label; the label column is as wide as the widest label pair in the call, and the meters sit flush against the modal's right edge — so a `MUTED` appearing on one row never slides that row's bar out of line with the others. The modal itself is only as wide and as tall as the call in it needs: two people with short names get a small modal rather than a fixed box with blank columns down its middle. Your own bar reads empty while you are muted. Only the host ever sees `INVITED`/`REJECTED`: everyone else learns the roster purely from who is actually on the call.
@@ -369,6 +369,7 @@ When a channel is joined, the join is broadcast to all users already in the chan
     - **There is never more than one connection to the same person**, whether it was opened directly or through a server.
     - **They show up as a real person, not just a connection.** Once a punched link opens, each side sends the other a sealed note saying which channels it is in. Opening that note is what proves who they are — it is checked against the key already pinned for that nickname — so a punch alone registers nobody, and someone able to reach your port cannot claim to be a friend. That note needs a pinned `pq_hybrid` identity to be sealed to.
     - **Or a shared pad proves it instead.** Two people who hold a one-time pad for each other but have never exchanged `pq_hybrid` identities have no note to send — and are exactly who this is for. The pad stands in: a link opening to someone you hold a pad for registers them straight away, with the session already on (there is nothing to negotiate — you both already hold the key — so `/otp` opens no round trip and your first message rides the pad). Coming the other way, a pad-wrapped message from someone nobody introduced is opened first and registers them only if `otp` genuinely decrypts it, which it does only for the holder of the matching key at the expected position. Their nickname comes from your own settings and their key from your own pin — never from anything they claim — so this registers people, it never renames them.
+    - **An unpinned name from someone you already listed asks first.** If a `direct_punch_to` nickname punches successfully but you have no key pinned for it at all, you're asked whether to check your other local `pq_hybrid` keys for a match instead of it staying a silent, transport-only link forever — checked whether the proof itself is a plain `pq_hybrid` announcement or an OTP session running on top of one, but never against a pad-only pin, which would mean running every one-time pad you hold against an unverified message just to find out who it's from. Say yes and it runs a real cryptographic check — never a guess — and if exactly one matches, offers to use it for the new name too; confirming pins that key under the new nickname and finishes registering them immediately. Nothing matching says so plainly: "Impossible to establish communication with the user without a key. Requires a server for key exchange or manually exchanging the keys." Declining either question costs nothing — no check runs, and a later message asks again. Three genuinely failed checks from one address, spread over at least two minutes within 10 hours, permanently blocks any further request from it until you edit `~/.aloo/banned_ips.log` yourself. Never triggered for a nickname you never listed, or for anyone the server introduces. Full model in `docs/PROTOCOL.md` §7.1.5.
     - **They appear in the channels you both are in**, and behave exactly like anyone else there: listed in the sidebar, reachable by a channel message, by voice, by push-to-talk, and by a call. That is what makes this work in background mode — with the app in the background and the focus on a channel you both joined, `Ctrl+Alt+P` reaches them, and their voice plays on your side, with no server involved at either end. Attach a terminal later and they are simply there in the sidebar. Focused on their nickname instead, the same applies to your DM.
     - **What they tell you is the whole truth**, not an addition: a channel missing from their note means they have left it. Channels you have not joined yourself are ignored. Sharing no channel at all still leaves them reachable as a DM.
     - **Leaving a channel does not disconnect them.** The link came from your settings and the schedule, not from the channel, so only those end it.
@@ -377,7 +378,7 @@ When a channel is joined, the join is broadcast to all users already in the chan
 
 18. **Running with no server at all (`--no-server`).** A server only ever introduces people and tracks channel membership; everything that carries content was already peer-to-peer. `aloo --daemon --no-server` (add `--foreground` to keep it in the terminal) runs with none.
     - **Where everything comes from.** Peers come from `direct_punch_to`, channels from `direct_punch_channel` — one name per line, joined at startup, and the only channels that exist. `Ctrl+J` and `/channels` show exactly those, since there is no directory to browse and nothing to create. Your own identity is your local key; no nickname is claimed from anyone.
-    - **What still works:** text, voice, push-to-talk, files, live voice calls, and live `/otp` sessions — all peer-to-peer — plus identity pinning, `--focus`, and the whole daemon/attach flow.
+    - **What still works:** text, voice, push-to-talk, files, live voice calls, and live `/otp` sessions — all peer-to-peer — plus identity pinning, `--initial-focus`, and the whole daemon/attach flow.
     - **What is refused, by name, when you ask for it:** joining a channel that is not configured, and OTP mail (the server *is* the mailbox — live `/otp` is unaffected). Refusals appear on the status line the moment you ask, never as an action that silently does nothing.
     - **Two different "no".** A server you never had reads as permanent; one that is merely unreachable reads as temporary and worth waiting for. They are never described with the same sentence.
     - **Losing a server mid-session does not end it.** Direct links are peer-to-peer and were never affected, so the session carries on with the server-backed actions refused, rather than disconnecting the people the outage did not touch — and, with a server configured at all, it is being reconnected to the whole time (Functionality #19).
@@ -438,7 +439,7 @@ pinned.
 ### Starting one
 
 ```sh
-aloo --daemon --host=chat.example.com --channels=team --focus=channel:team
+aloo --daemon --host=chat.example.com --channels=team --initial-focus=channel:team
 ```
 
 That prints a pid and returns immediately:
@@ -513,16 +514,16 @@ aloo --no-attach
 Be aware the server will refuse it if it is using the same nickname —
 nicknames are unique among connected clients.
 
-### Where your voice goes: `--focus`
+### Where your voice goes: `--initial-focus`
 
-This is the setting that makes the shortcut worth having. `--focus` decides
+This is the setting that makes the shortcut worth having. `--initial-focus` decides
 what a held `Ctrl+Alt+P` addresses, with no window to look at and no
 decision to make.
 
 #### A channel
 
 ```sh
-aloo --daemon --channels=team --focus=channel:team
+aloo --daemon --channels=team --initial-focus=channel:team
 ```
 
 Hold the shortcut, talk, release — it goes to `team`. Everyone in that
@@ -531,7 +532,7 @@ channel hears it live, as they would from any client.
 #### A person
 
 ```sh
-aloo --daemon --channels=team --focus=alice
+aloo --daemon --channels=team --initial-focus=alice
 ```
 
 The daemon watches for `alice`. The moment she appears it opens the DM with
@@ -545,7 +546,7 @@ thing, and `channel:alice` is how you would name a channel called `alice`.
 > **A DM focus needs a channel to watch from.** Presence in aloo is
 > channel-scoped: the server only tells you a person exists if you share a
 > joined channel with them, and there is no "is alice online?" query in the
-> protocol. `--focus=alice` with no `--channels` therefore has nowhere to
+> protocol. `--initial-focus=alice` with no `--channels` therefore has nowhere to
 > see her from, so the daemon joins `the-hall` as a discovery channel and
 > says so in its log. Naming a channel you actually share with her is
 > better in every way — it is quieter, and it is where she will be.
@@ -557,7 +558,7 @@ what you name — never `the-hall` unless you name it. That is the difference fr
 client, which joins `the-hall` on connect.
 
 ```sh
-aloo --daemon --channels=team,ops --focus=channel:ops
+aloo --daemon --channels=team,ops --initial-focus=channel:ops
 ```
 
 With a password:
@@ -579,7 +580,7 @@ to itself and nothing splits on commas. An empty password
 (`--channels=ops:`) means "no password", not "the empty password".
 
 A focused channel is joined automatically even if you forgot to list it:
-`--focus=channel:ops` implies `--channels=ops`.
+`--initial-focus=channel:ops` implies `--channels=ops`.
 
 ### Nicknames and identity
 
@@ -619,7 +620,7 @@ it has nothing to log in to. Both are remembered, so the next bare
 ### Focusing a person, with OTP
 
 ```sh
-aloo --daemon --channels=team --focus=alice --otp
+aloo --daemon --channels=team --initial-focus=alice --otp
 ```
 
 `--otp` means *have* a one-time-pad session with alice — the strongest
@@ -641,7 +642,7 @@ handshake to arrive back where they started.
 At most one invitation per daemon run, so a peer on a flapping connection
 does not become a queue of popups.
 
-`--otp` needs a person. `--focus=channel:... --otp` is refused: OTP is
+`--otp` needs a person. `--initial-focus=channel:... --otp` is refused: OTP is
 provisioned pairwise, per contact, and has no channel-wide form.
 
 None of this needs a server. The whole handshake rides the direct link,
@@ -666,7 +667,7 @@ shortcut would land — so it plays only when all of this is true:
 - **it is a daemon**, since a foreground client already shows the arrival
   in its log;
 - **no terminal is attached**, since a viewer already has it on screen;
-- **the arrival is where the focus is *now*** — not where `--focus` put it
+- **the arrival is where the focus is *now*** — not where `--initial-focus` put it
   at startup. The two agree until someone attaches and moves; after that
   only the live one is worth announcing, because that is where the next
   held shortcut actually goes.
@@ -796,7 +797,7 @@ daemon_my_key_pub=/home/david/.aloo/ab12.pub
 daemon_my_key_priv=/home/david/.aloo/ab12.priv
 daemon_channel=team
 daemon_channel=ops:hunter2
-daemon_focus=alice
+daemon_initial_focus=alice
 daemon_otp=true
 ```
 
@@ -850,7 +851,7 @@ aloo --daemon \
   --server-pwd=SECRET \
   --nick=david \
   --channels=team,ops:hunter2 \
-  --focus=alice \
+  --initial-focus=alice \
   --otp
 ```
 
@@ -924,7 +925,7 @@ buys.
 At the next slot both punch, the link opens, each sends the other a sealed
 note naming its channels (an empty list here), and opening that note is
 what proves who sent it. From that moment the other person is an ordinary
-peer: pick them in the sidebar and press Enter, or `--focus` them, and the
+peer: pick them in the sidebar and press Enter, or `--initial-focus` them, and the
 DM works exactly as it does through a server - text, voice, push-to-talk,
 files, calls.
 
@@ -1059,10 +1060,10 @@ good, so a lost message is re-transmitted byte-identically
 Both sides can then run headless:
 
 ```sh
-aloo --daemon --no-server --focus bob --otp
+aloo --daemon --no-server --initial-focus bob --otp
 ```
 
-- **`--focus bob`** points the global push-to-talk shortcut at that DM, so
+- **`--initial-focus bob`** points the global push-to-talk shortcut at that DM, so
   holding `Ctrl+Alt+P` from any other app talks to them. It is a *starting*
   position: once placed, wherever someone later moves the focus from an
   attached terminal is respected.

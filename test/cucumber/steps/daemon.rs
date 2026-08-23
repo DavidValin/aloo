@@ -141,25 +141,25 @@ async fn started_with_channels(w: &mut AlooWorld, channels: String) {
     resolve(w).await;
 }
 
-#[when(expr = "the daemon is started with --focus={word}")]
+#[when(expr = "the daemon is started with --initial-focus={word}")]
 async fn started_with_focus(w: &mut AlooWorld, focus: String) {
     flags(w).host = Some("chat.example".to_string());
-    flags(w).focus = Some(focus);
+    flags(w).initial_focus = Some(focus);
     resolve(w).await;
 }
 
-#[when(expr = "the daemon is started with --channels={word} --focus={word}")]
+#[when(expr = "the daemon is started with --channels={word} --initial-focus={word}")]
 async fn started_with_channels_and_focus(w: &mut AlooWorld, channels: String, focus: String) {
     flags(w).host = Some("chat.example".to_string());
     flags(w).channels = vec![channels];
-    flags(w).focus = Some(focus);
+    flags(w).initial_focus = Some(focus);
     resolve(w).await;
 }
 
-#[when(expr = "the daemon is started with --focus={word} --otp")]
+#[when(expr = "the daemon is started with --initial-focus={word} --otp")]
 async fn started_with_focus_and_otp(w: &mut AlooWorld, focus: String) {
     flags(w).host = Some("chat.example".to_string());
-    flags(w).focus = Some(focus);
+    flags(w).initial_focus = Some(focus);
     flags(w).otp = true;
     resolve(w).await;
 }
@@ -225,10 +225,10 @@ async fn peer_appears(w: &mut AlooWorld, nickname: String) {
     }
 }
 
-#[when("the daemon is stopped and started again with the same --focus")]
+#[when("the daemon is stopped and started again with the same --initial-focus")]
 async fn restarted(w: &mut AlooWorld) {
     // A restart is a fresh plan: the latch lives in memory and is never
-    // persisted, which is the whole reason `--focus` applies again.
+    // persisted, which is the whole reason `--initial-focus` applies again.
     let previous = plan(w).clone();
     w.daemon_plan = Some(DaemonPlan::new(previous.channels, previous.focus));
 }
@@ -276,12 +276,12 @@ async fn does_not_join_the_hall(w: &mut AlooWorld) {
 
 #[then(expr = "the focus is the channel {string}")]
 async fn focus_is_channel(w: &mut AlooWorld, name: String) {
-    assert_eq!(config(w).focus, Some(DaemonFocus::Channel(name)));
+    assert_eq!(config(w).initial_focus, Some(DaemonFocus::Channel(name)));
 }
 
 #[then(expr = "the focus is a private conversation with {word}")]
 async fn focus_is_dm(w: &mut AlooWorld, nickname: String) {
-    match &config(w).focus {
+    match &config(w).initial_focus {
         Some(DaemonFocus::Dm { nickname: got, .. }) => assert_eq!(got, &nickname),
         other => panic!("expected a DM focus on {nickname}, got {other:?}"),
     }

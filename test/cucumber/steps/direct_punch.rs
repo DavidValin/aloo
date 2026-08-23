@@ -943,3 +943,204 @@ async fn peter_no_record(w: &mut AlooWorld) {
     assert_eq!(link_of(w, "peter").status(bob), None);
     assert_eq!(link_of(w, "peter").direct_status("bob"), None);
 }
+
+// ---------------------------------------------------------------------
+// Reconciling an unpinned nickname against an already-pinned key
+// (AC-275 - AC-279): the popup mechanics only, driven directly against
+// `UiState` the same way `identity.rs`'s review-popup scenarios are - the
+// real cryptographic scan that finds a match needs a live link and a live
+// pad/keybundle to mean anything, and is proven end to end with two real
+// punched sessions in test/daemon_session_test.rs instead.
+// ---------------------------------------------------------------------
+
+use crossterm::event::{KeyCode, KeyModifiers};
+
+use aloo::client::tui::ui::{RecoveredProof, UnverifiedDirectProof};
+
+use crate::steps::ui_common::press_key;
+use crate::support::ui_rows;
+
+/// `carol` is only ever a name in these scenarios - no `direct_punch_to`
+/// settings or real link are involved, since the popup itself doesn't care
+/// how the proof arrived.
+fn unknown_peer_id(name: &str) -> aloo::proto::UserId {
+    direct_peer_id(name)
+}
+
+#[given(expr = "{word} is a direct-punch target alice has no key pinned for")]
+async fn unpinned_target_named(w: &mut AlooWorld, name: String) {
+    // Nothing to set up: the absence of a pin is the whole point, and the
+    // steps below open the review directly rather than through a real
+    // `direct_peer_identity` lookup.
+    let _ = (w, name);
+}
+
+#[when(expr = "{word}'s punched link sends a pq_hybrid ChannelPresence proof")]
+#[given(expr = "{word}'s punched link sends a pq_hybrid ChannelPresence proof")]
+async fn sends_channel_presence_proof(w: &mut AlooWorld, name: String) {
+    let peer = unknown_peer_id(&name);
+    let envelope = Envelope {
+        content: Content::ChannelPresence,
+        blocks: vec![b"sealed-channel-list".to_vec()],
+    };
+    w.ui_mut().push_unknown_peer_review(
+        peer,
+        name,
+        UnverifiedDirectProof::ChannelPresence { envelope },
+        "203.0.113.9:4000".parse().unwrap(),
+    );
+}
+
+#[when(expr = "{word}'s punched link sends a pad-wrapped message proof")]
+async fn sends_otp_message_proof(w: &mut AlooWorld, name: String) {
+    let peer = unknown_peer_id(&name);
+    let envelope = Envelope {
+        content: Content::Text,
+        blocks: vec![b"pad-wrapped-ciphertext".to_vec()],
+    };
+    w.ui_mut().push_unknown_peer_review(
+        peer,
+        name,
+        UnverifiedDirectProof::OtpMessage {
+            channel: None,
+            seq: 1,
+            msg_id: None,
+            envelope,
+        },
+        "203.0.113.9:4000".parse().unwrap(),
+    );
+}
+
+#[then(expr = "alice is asked whether to check her local keys for {word}")]
+async fn asked_to_check(w: &mut AlooWorld, name: String) {
+    let peer = unknown_peer_id(&name);
+    let review = w
+        .ui_ref()
+        .unknown_peer_reviews
+        .get(&peer)
+        .unwrap_or_else(|| panic!("no unknown-peer review open for {name}"));
+    assert_eq!(review.requested_nickname, name);
+    assert!(
+        matches!(
+            review.stage,
+            aloo::client::tui::ui::UnknownPeerStage::Initial
+        ),
+        "expected the initial question, not something further along"
+    );
+    let rows = ui_rows(w.ui_ref());
+    let screen = rows.join("\n");
+    assert!(
+        screen.contains(&name) && screen.contains("Yes") && screen.contains("No"),
+        "expected the popup to name {name:?} with Yes/No buttons: {screen}"
+    );
+}
+
+#[given("alice agrees to check her local keys")]
+#[when("alice agrees to check her local keys")]
+async fn agrees_to_check(w: &mut AlooWorld) {
+    // Focus starts on "No" - move to "Yes" and confirm.
+    press_key(w, KeyCode::Tab, KeyModifiers::NONE);
+    press_key(w, KeyCode::Enter, KeyModifiers::NONE);
+    assert!(
+        matches!(w.last_action, Some(UiAction::CheckUnknownPeerIdentity(_))),
+        "expected CheckUnknownPeerIdentity, got {:?}",
+        w.last_action
+    );
+}
+
+#[when("alice declines to check her local keys")]
+async fn declines_to_check(w: &mut AlooWorld) {
+    // "No" is already focused - Enter alone confirms it.
+    press_key(w, KeyCode::Enter, KeyModifiers::NONE);
+    match w.last_action {
+        Some(UiAction::DeclineUnknownPeerIdentity(peer)) => {
+            w.ui_mut().resolve_unknown_peer_review(peer);
+        }
+        ref other => panic!("expected DeclineUnknownPeerIdentity, got {other:?}"),
+    }
+}
+
+#[given(expr = "the check finds that {word}'s key matches {word}'s request")]
+#[when(expr = "the check finds that {word}'s key matches {word}'s request")]
+async fn check_finds_a_match(w: &mut AlooWorld, matched_name: String, requested_name: String) {
+    let peer = unknown_peer_id(&requested_name);
+    w.ui_mut().advance_to_confirm_match(
+        peer,
+        matched_name,
+        b"the-matched-nicknames-key-bytes".to_vec(),
+        RecoveredProof::ChannelPresence {
+            plaintext: b"decoded-channel-list".to_vec(),
+        },
+    );
+}
+
+#[then(expr = "alice is asked whether to use {word}'s key for {word}")]
+async fn asked_to_use_match(w: &mut AlooWorld, matched_name: String, requested_name: String) {
+    let peer = unknown_peer_id(&requested_name);
+    let review = w
+        .ui_ref()
+        .unknown_peer_reviews
+        .get(&peer)
+        .expect("no unknown-peer review open");
+    assert!(
+        matches!(
+            &review.stage,
+            aloo::client::tui::ui::UnknownPeerStage::ConfirmMatch { matched_nickname, .. }
+                if matched_nickname == &matched_name
+        ),
+        "expected the confirm-match question naming {matched_name}, got {:?}",
+        review.stage
+    );
+    let rows = ui_rows(w.ui_ref());
+    let screen = rows.join("\n");
+    assert!(
+        screen.contains(&matched_name) && screen.contains(&requested_name),
+        "expected the popup to name both {matched_name:?} and {requested_name:?}: {screen}"
+    );
+}
+
+#[when("alice confirms using dave's key")]
+async fn confirms_match(w: &mut AlooWorld) {
+    press_key(w, KeyCode::Tab, KeyModifiers::NONE);
+    press_key(w, KeyCode::Enter, KeyModifiers::NONE);
+}
+
+#[when("alice declines the offered match")]
+async fn declines_match(w: &mut AlooWorld) {
+    // "No" is already focused on the confirm-match screen too.
+    press_key(w, KeyCode::Enter, KeyModifiers::NONE);
+    if let Some(UiAction::DeclineUnknownPeerKey(peer)) = w.last_action {
+        w.ui_mut().resolve_unknown_peer_review(peer);
+    }
+}
+
+#[then(expr = "confirming {word}'s match is what alice's answer asked for")]
+async fn confirming_was_the_action(w: &mut AlooWorld, name: String) {
+    let peer = unknown_peer_id(&name);
+    assert_eq!(
+        w.last_action,
+        Some(UiAction::ConfirmUnknownPeerKey(peer)),
+        "expected ConfirmUnknownPeerKey for {name}, got {:?}",
+        w.last_action
+    );
+}
+
+#[then(expr = "declining {word}'s match is what alice's answer asked for")]
+async fn declining_was_the_action(w: &mut AlooWorld, name: String) {
+    let peer = unknown_peer_id(&name);
+    assert_eq!(
+        w.last_action,
+        Some(UiAction::DeclineUnknownPeerKey(peer)),
+        "expected DeclineUnknownPeerKey for {name}, got {:?}",
+        w.last_action
+    );
+}
+
+#[then(expr = "no unknown-peer review is left open for {word}")]
+async fn no_review_left(w: &mut AlooWorld, name: String) {
+    let peer = unknown_peer_id(&name);
+    assert!(
+        !w.ui_ref().unknown_peer_reviews.contains_key(&peer),
+        "expected no outstanding review for {name}"
+    );
+}

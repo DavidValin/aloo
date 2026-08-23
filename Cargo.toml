@@ -271,6 +271,10 @@ name = "noip_test"
 path = "test/noip_test.rs"
 
 [[test]]
+name = "ip_ban_test"
+path = "test/ip_ban_test.rs"
+
+[[test]]
 name = "daemon_session_test"
 path = "test/daemon_session_test.rs"
 

@@ -34,7 +34,7 @@ use ratatui::widgets::{
 
 use crate::client::p2p::LinkStatus;
 use crate::p2p_proto::ReceiptStage;
-use crate::proto::{ChannelInfo, ChannelKind, KeyMode, UserId, UserInfo};
+use crate::proto::{ChannelInfo, ChannelKind, Envelope, KeyMode, UserId, UserInfo};
 
 use super::channel::ChannelTab;
 use super::direct_message::PrivateRoom;
@@ -888,6 +888,91 @@ pub enum IdentityChoice {
     Reject,
 }
 
+/// Whatever a `direct_punch_to` nickname with no pinned key sent that would
+/// normally have proved who they are - captured instead of being silently
+/// dropped, so a "Yes" to `render_unknown_peer_popup` has something real to
+/// scan (`session::scan_pinned_keys_for_match`) rather than nothing at all.
+/// Holds exactly what the ordinary registration path would otherwise have
+/// consumed, so a confirmed match can finish registration from it without a
+/// second decrypt (`docs/PROTOCOL.md` §7.1.5).
+#[derive(Debug, Clone, PartialEq)]
+pub enum UnverifiedDirectProof {
+    /// A `Content::ChannelPresence` envelope, exactly as
+    /// `session::on_channel_presence` receives it.
+    ChannelPresence { envelope: Envelope },
+    /// An OTP-wrapped `P2pEvent::OtpMessage`'s payload, exactly as
+    /// `client::otp::on_message` receives it. Only ever matched against a
+    /// candidate whose pin decodes as a `pq_hybrid` keybundle - a `pq_hybrid`
+    /// identity with an OTP session layered on top of it - never against a
+    /// pad-only pin, which would mean running every locally-held one-time
+    /// pad's own decrypt against an unverified ciphertext.
+    OtpMessage {
+        channel: Option<String>,
+        seq: u64,
+        msg_id: Option<u64>,
+        envelope: Envelope,
+    },
+}
+
+/// Which screen an unknown-direct-peer review is showing - two sequential
+/// questions about the same review, not a withheld-vs-shown distinction
+/// like `IdentityStatus`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum UnknownPeerStage {
+    /// "A connection was received directly ... unknown nickname ... check
+    /// which of your local keys matches?" - Yes runs the real scan.
+    Initial,
+    /// The scan found exactly one match; showing "I found that the request
+    /// from <requested_nickname> matches your local key for <nickname> ...
+    /// use it?" - Yes pins, No discards just this offer. Carries what the
+    /// scan already recovered so confirming never decrypts a second time -
+    /// for an OTP match the pad's own position has already moved past that
+    /// ciphertext by the time this stage exists.
+    ConfirmMatch {
+        matched_nickname: String,
+        matched_key_der: Vec<u8>,
+        recovered: RecoveredProof,
+    },
+}
+
+/// What a successful scan already recovered from `UnverifiedDirectProof` -
+/// held on `UnknownPeerStage::ConfirmMatch` so `session::handle_ui_action`'s
+/// `ConfirmUnknownPeerKey` arm can finish registration from it directly.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RecoveredProof {
+    ChannelPresence {
+        plaintext: Vec<u8>,
+    },
+    OtpMessage {
+        plaintext: Vec<u8>,
+        ack_proof: crate::crypto::otp::AckProof,
+        contact_name: String,
+    },
+}
+
+/// One outstanding unknown-direct-peer review, keyed by the `UserId` the
+/// punched link is filed under (same keying `identity_reviews` uses).
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnknownPeerReview {
+    /// The nickname the punch actually named - not yet pinned to anything.
+    pub requested_nickname: String,
+    pub stage: UnknownPeerStage,
+    /// Held so a "Yes" on `Initial` has something to scan without a second
+    /// round trip through `session.rs`'s event handling.
+    pub proof: UnverifiedDirectProof,
+    /// The link's address at the moment this review was first opened
+    /// (`PeerLinkManager::active_addr`) - what `record_direct_proof_failure`
+    /// bans against if the scan comes back with no match.
+    pub source_addr: std::net::SocketAddr,
+}
+
+/// Which button currently has focus in the unknown-peer review popup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnknownPeerChoice {
+    Yes,
+    No,
+}
+
 /// A message received from a peer whose identity is `Pending`/`Rejected` at
 /// the moment it arrived - held here instead of the visible channel/DM log
 /// (`docs/PROTOCOL.md` §12 "hold and reveal") until that peer is Accepted,
@@ -1459,6 +1544,20 @@ pub enum UiAction {
     /// has no access to either.
     AcceptIdentity(UserId),
     RejectIdentity(UserId),
+    /// "Yes" on the first unknown-direct-peer popup (`docs/PROTOCOL.md`
+    /// §7.1.5) - `session::handle_ui_action` runs the real cryptographic
+    /// scan, since `UiState` has no crypto/session access.
+    CheckUnknownPeerIdentity(UserId),
+    /// "No" on the first popup - no scan runs, no ban-counting; the
+    /// captured proof is simply discarded.
+    DeclineUnknownPeerIdentity(UserId),
+    /// "Yes" on the second ("use <nickname>'s key?") popup - pins the
+    /// matched key under the new nickname and completes registration from
+    /// the plaintext the scan already recovered.
+    ConfirmUnknownPeerKey(UserId),
+    /// "No" on the second popup - discards this specific match; a later,
+    /// distinct proof re-triggers the whole flow from the top.
+    DeclineUnknownPeerKey(UserId),
     /// A file send confirmed in the `/file` popup (`crate::client::tui::file_send`) -
     /// `crate::client::channel::handle_send_file` builds and sends one `FileOffer`
     /// per ready recipient (rotating-key readiness is snapshotted here,
@@ -1700,7 +1799,7 @@ pub(crate) enum RecordSource {
 }
 
 /// Where a session is pointed right now (`UiState::current_focus`) - the
-/// live answer, as opposed to the `--focus` a daemon was started with.
+/// live answer, as opposed to the `--initial-focus` a daemon was started with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CurrentFocus {
     /// A channel tab is selected and joined.
@@ -2032,6 +2131,24 @@ pub struct UiState {
     /// review becomes the one shown, so accepting always takes a deliberate
     /// move off the safe default rather than an accidental double-Enter.
     identity_review_focus: IdentityChoice,
+    /// One outstanding "an unknown direct-punch nickname sent proof" review
+    /// per peer (`docs/PROTOCOL.md` §7.1.5) - a different question from
+    /// `identity_reviews` (no identity at all, rather than one that
+    /// changed), so it is its own independent family rather than a case of
+    /// `IdentityCase`. Populated by `push_unknown_peer_review` (called from
+    /// `session::on_channel_presence`/`client::otp::on_message` when a
+    /// `direct_punch_to` nickname with no pinned key sends whatever would
+    /// normally prove it), resolved by `session::handle_ui_action`'s
+    /// `CheckUnknownPeerIdentity`/`DeclineUnknownPeerIdentity`/
+    /// `ConfirmUnknownPeerKey`/`DeclineUnknownPeerKey` arms.
+    pub unknown_peer_reviews: HashMap<UserId, UnknownPeerReview>,
+    /// Peers with a review not yet shown, front-first - same one-at-a-time
+    /// shape as `identity_review_queue`.
+    unknown_peer_review_queue: VecDeque<UserId>,
+    /// Which button is focused in the currently-open popup. Reset to `No`
+    /// every time a different peer's review becomes the one shown, for the
+    /// same reason `identity_review_focus` resets to `Reject`.
+    unknown_peer_review_focus: UnknownPeerChoice,
     /// Messages/streams received from a `Pending`/`Rejected` peer, held
     /// back from the visible channel/DM log until they're `Accepted`
     /// (`docs/PROTOCOL.md` §12 "hold and reveal") - see `HeldMessage`.
@@ -2168,6 +2285,9 @@ impl UiState {
             identity_reviews: HashMap::new(),
             identity_review_queue: VecDeque::new(),
             identity_review_focus: IdentityChoice::Reject,
+            unknown_peer_reviews: HashMap::new(),
+            unknown_peer_review_queue: VecDeque::new(),
+            unknown_peer_review_focus: UnknownPeerChoice::No,
             pending_messages: HashMap::new(),
             next_msg_id: 0,
             message_info: None,
@@ -2319,10 +2439,77 @@ impl UiState {
         self.identity_reviews.contains_key(&peer)
     }
 
+    /// Opens a review for a `direct_punch_to` nickname with no pinned key
+    /// that just sent proof of an identity (`docs/PROTOCOL.md` §7.1.5) -
+    /// called from `session::on_channel_presence`/`client::otp::on_message`
+    /// the moment that gap is detected. Refuses a second review for a
+    /// `peer` that already has one outstanding: a retried proof arriving
+    /// while the first popup is still up is simply dropped, the same
+    /// "silently drop" convention already used everywhere on this path.
+    /// Returns whether it was actually queued.
+    pub fn push_unknown_peer_review(
+        &mut self,
+        peer: UserId,
+        requested_nickname: String,
+        proof: UnverifiedDirectProof,
+        source_addr: std::net::SocketAddr,
+    ) -> bool {
+        if self.unknown_peer_reviews.contains_key(&peer) {
+            return false;
+        }
+        self.unknown_peer_reviews.insert(
+            peer,
+            UnknownPeerReview {
+                requested_nickname,
+                stage: UnknownPeerStage::Initial,
+                proof,
+                source_addr,
+            },
+        );
+        self.unknown_peer_review_queue.push_back(peer);
+        if self.unknown_peer_review_queue.front() == Some(&peer) {
+            self.unknown_peer_review_focus = UnknownPeerChoice::No;
+        }
+        true
+    }
+
+    /// The review currently shown in the popup, if any.
+    pub fn unknown_peer_review_open(&self) -> Option<&UnknownPeerReview> {
+        let peer = self.unknown_peer_review_queue.front()?;
+        self.unknown_peer_reviews.get(peer)
+    }
+
+    /// Moves a review from `Initial` to `ConfirmMatch` in place - same
+    /// queue position, so it stays exactly where it was rather than being
+    /// re-queued behind anything that arrived in the meantime.
+    pub fn advance_to_confirm_match(
+        &mut self,
+        peer: UserId,
+        matched_nickname: String,
+        matched_key_der: Vec<u8>,
+        recovered: RecoveredProof,
+    ) {
+        if let Some(review) = self.unknown_peer_reviews.get_mut(&peer) {
+            review.stage = UnknownPeerStage::ConfirmMatch {
+                matched_nickname,
+                matched_key_der,
+                recovered,
+            };
+            self.unknown_peer_review_focus = UnknownPeerChoice::No;
+        }
+    }
+
+    /// Removes a review on every terminal outcome: declining either popup,
+    /// confirming a match, or a completed scan finding nothing to offer.
+    pub fn resolve_unknown_peer_review(&mut self, peer: UserId) {
+        self.unknown_peer_reviews.remove(&peer);
+        self.unknown_peer_review_queue.retain(|&p| p != peer);
+    }
+
     /// Where the session is pointed *right now* - the open private room if
     /// there is one, otherwise the selected channel tab.
     ///
-    /// Deliberately the live answer rather than whatever `--focus` asked
+    /// Deliberately the live answer rather than whatever `--initial-focus` asked
     /// for at startup (`daemon::DaemonFocus`). The two agree until someone
     /// attaches and moves, and after that this one is the truth: it is
     /// what `current_voice_target` addresses, so it is also what the
@@ -3863,6 +4050,45 @@ impl UiState {
                         IdentityChoice::Accept => Some(UiAction::AcceptIdentity(peer)),
                         IdentityChoice::Reject => Some(UiAction::RejectIdentity(peer)),
                     },
+                    _ => None,
+                },
+                _ => None,
+            };
+        }
+
+        // An outstanding unknown-direct-peer review is next: still an
+        // absorb-everything decision (docs/PROTOCOL.md §7.1.5), but a
+        // genuine identity-mismatch warning above still wins if both are
+        // somehow open at once, since impersonation outranks a peer this
+        // side has simply never met yet.
+        if let Some(&peer) = self.unknown_peer_review_queue.front() {
+            return match kind {
+                KeyEventKind::Press | KeyEventKind::Repeat => match code {
+                    KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
+                        self.unknown_peer_review_focus = match self.unknown_peer_review_focus {
+                            UnknownPeerChoice::Yes => UnknownPeerChoice::No,
+                            UnknownPeerChoice::No => UnknownPeerChoice::Yes,
+                        };
+                        None
+                    }
+                    KeyCode::Enter => {
+                        let stage = self.unknown_peer_reviews.get(&peer).map(|r| &r.stage);
+                        match (stage, self.unknown_peer_review_focus) {
+                            (Some(UnknownPeerStage::Initial), UnknownPeerChoice::Yes) => {
+                                Some(UiAction::CheckUnknownPeerIdentity(peer))
+                            }
+                            (Some(UnknownPeerStage::Initial), UnknownPeerChoice::No) => {
+                                Some(UiAction::DeclineUnknownPeerIdentity(peer))
+                            }
+                            (Some(UnknownPeerStage::ConfirmMatch { .. }), UnknownPeerChoice::Yes) => {
+                                Some(UiAction::ConfirmUnknownPeerKey(peer))
+                            }
+                            (Some(UnknownPeerStage::ConfirmMatch { .. }), UnknownPeerChoice::No) => {
+                                Some(UiAction::DeclineUnknownPeerKey(peer))
+                            }
+                            (None, _) => None,
+                        }
+                    }
                     _ => None,
                 },
                 _ => None,
@@ -5714,6 +5940,12 @@ pub fn render(frame: &mut Frame, state: &UiState) {
     if let Some(invite) = state.otp_invite_open() {
         render_otp_invite_popup(frame, area, invite, state.otp_invite_focus);
     }
+    // Drawn just below the identity review, for the same reason it is
+    // checked just below it in `handle_key`: impersonation still wins the
+    // screen if both are somehow open for different peers at once.
+    if let Some(review) = state.unknown_peer_review_open() {
+        render_unknown_peer_popup(frame, area, review, state.unknown_peer_review_focus);
+    }
     // Drawn last of all - takes priority over even the help overlay, same
     // as it does in `handle_key`, so it's always interactable regardless
     // of what else happened to be open when the mismatch arrived.
@@ -6761,6 +6993,70 @@ fn render_identity_review_popup(
     );
 }
 
+/// The Yes/No popup for a `direct_punch_to` nickname with no pinned key
+/// that just sent proof of an identity (`docs/PROTOCOL.md` §7.1.5) -
+/// opened by `push_unknown_peer_review`. Same visual style as
+/// `render_identity_review_popup`; the wording switches on `review.stage`,
+/// since this is two sequential questions about the same review rather
+/// than a case-specific message the caller pre-formats.
+fn render_unknown_peer_popup(
+    frame: &mut Frame,
+    area: Rect,
+    review: &UnknownPeerReview,
+    focus: UnknownPeerChoice,
+) {
+    let title = format!("Unknown direct connection: {}", review.requested_nickname);
+    let popup = centered_rect(70, 11, area);
+    let block = Block::default().title(title).borders(Borders::ALL);
+    let inner = block.inner(popup);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(block, popup);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(3)])
+        .split(inner);
+
+    let message = match &review.stage {
+        UnknownPeerStage::Initial => format!(
+            "A connection was received directly to your public ip from an unknown \
+             nickname (\"{}\"). Do you want to check which of your local keys \
+             matches this request?",
+            review.requested_nickname
+        ),
+        UnknownPeerStage::ConfirmMatch {
+            matched_nickname, ..
+        } => format!(
+            "I found that the request from {} matches your local key for {}. \
+             Do you want to use {}'s key to talk to {}?",
+            review.requested_nickname, matched_nickname, matched_nickname, review.requested_nickname
+        ),
+    };
+    frame.render_widget(
+        Paragraph::new(message).wrap(ratatui::widgets::Wrap { trim: true }),
+        rows[0],
+    );
+
+    let button_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(rows[1]);
+    render_popup_button(
+        frame,
+        button_cols[0],
+        16,
+        "Yes",
+        focus == UnknownPeerChoice::Yes,
+    );
+    render_popup_button(
+        frame,
+        button_cols[1],
+        16,
+        "No",
+        focus == UnknownPeerChoice::No,
+    );
+}
+
 /// One popup button (identity review's and the file offer's Accept/Reject,
 /// file send's Send/Discard) - same border-vs-fill focus convention as
 /// `ui_connect_popup::render_connect_button`: the border (block) always
@@ -6914,11 +7210,7 @@ pub(crate) fn render_messages(
                     Line::from(spans)
                 }
                 MessageBody::VoiceStreaming { .. } => {
-                    let dot = if state.blink_on {
-                        "\u{1F534}"
-                    } else {
-                        "\u{26AA}"
-                    };
+                    let dot = if state.blink_on { "\u{23FA}" } else { " " };
                     let mut spans = sender_prefix(entry);
                     spans.push(Span::styled(
                         format!("{dot} voice (streaming...)"),
@@ -7136,8 +7428,9 @@ pub(crate) fn render_input_bar(frame: &mut Frame, area: Rect, state: &UiState) {
         );
     }
     if state.recording {
+        let dot = if state.blink_on { "\u{23FA}" } else { " " };
         spans.push(Span::styled(
-            " \u{1F3A4} recording...",
+            format!(" {dot} recording..."),
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ));
     }

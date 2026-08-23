@@ -2332,7 +2332,7 @@ pub(crate) async fn poll_key_status(session: &SessionState, ui_state: &mut UiSta
 /// familiar name spend the real contact's pad - spending pad on the wrong
 /// person destroys it for the right one, since the bytes are gone whether
 /// or not they could read them (`crypto::otp::contact_name_for_keys`).
-fn contact_name_for_peer(session: &SessionState, peer_pubkey_der: &[u8]) -> Option<String> {
+pub(crate) fn contact_name_for_peer(session: &SessionState, peer_pubkey_der: &[u8]) -> Option<String> {
     match framing_for(&session.otp_own_pinned_der, peer_pubkey_der) {
         OtpFraming::PqWrapped => {
             let peer_fp = crypto::pq::fingerprint_of_encoded(peer_pubkey_der)?;
@@ -2456,25 +2456,51 @@ fn frame_padded(
 /// `Direct` pair has no seal to check, and `otp --decrypt`'s own refusal
 /// stands in for it - which is why that refusal is reported out loud
 /// (`unwrap_or_notify`) rather than swallowed.
-async fn open_otp_envelope(
+/// The framing-dependent first half of opening an OTP envelope: recovers
+/// the still-padded bytes, either by unwrapping the outer `pq_hybrid` seal
+/// (`PqWrapped`) or reading the raw block directly (`Direct`).
+///
+/// Split out from `open_otp_envelope` so the unknown-nickname reconciliation
+/// scan (`session::scan_pinned_keys_for_match`, `docs/PROTOCOL.md` §7.1.5)
+/// can try this safe half against several *decodable* candidates without
+/// ever touching a pad: the `PqWrapped` branch is an ordinary signature
+/// check (`decrypt_own_blinded_envelope`), side-effect-free on a wrong
+/// candidate for the same reason `decrypt_own_envelope` is, and the scan
+/// never calls this for a candidate whose pin doesn't decode - which is
+/// exactly what would fall to the `Direct` branch below, the one half of
+/// this that reads real key material with no verification of its own.
+/// Real pad bytes are only ever touched by `finish_opening_otp_envelope`,
+/// and only once, for whichever single candidate this proved correct.
+pub(crate) fn recover_padded_otp_bytes(
+    session: &mut SessionState,
+    from: UserId,
+    sender: &UserInfo,
+    envelope: &Envelope,
+) -> Option<Vec<u8>> {
+    match framing_for(&session.otp_own_pinned_der, &sender.public_key_der) {
+        OtpFraming::PqWrapped => {
+            crate::client::session::decrypt_own_blinded_envelope(envelope, from, sender, session)
+        }
+        OtpFraming::Direct => envelope.blocks.first().cloned(),
+    }
+}
+
+/// The pad-decrypt half of opening an OTP envelope - the one place real key
+/// material is actually spent, only ever for a sender already identified
+/// (the ordinary caller has one from `otp_sender_of`; the unknown-nickname
+/// scan has one because `recover_padded_otp_bytes` already proved it).
+pub(crate) async fn finish_opening_otp_envelope(
     session: &mut SessionState,
     ui_state: &mut UiState,
     from: UserId,
-    sender: &UserInfo,
     from_name: &str,
     contact_name: &str,
     channel: Option<&str>,
-    envelope: &Envelope,
+    padded: &[u8],
 ) -> Option<(Vec<u8>, crypto::otp::AckProof)> {
-    let padded = match framing_for(&session.otp_own_pinned_der, &sender.public_key_der) {
-        OtpFraming::PqWrapped => {
-            crate::client::session::decrypt_own_blinded_envelope(envelope, from, sender, session)?
-        }
-        OtpFraming::Direct => envelope.blocks.first()?.clone(),
-    };
     let (inner, proof) = unwrap_or_notify(
         &session.otp_cli_cfg,
-        &padded,
+        padded,
         contact_name,
         ui_state,
         from,
@@ -2489,6 +2515,20 @@ async fn open_otp_envelope(
         return None;
     }
     Some((inner.payload, proof))
+}
+
+async fn open_otp_envelope(
+    session: &mut SessionState,
+    ui_state: &mut UiState,
+    from: UserId,
+    sender: &UserInfo,
+    from_name: &str,
+    contact_name: &str,
+    channel: Option<&str>,
+    envelope: &Envelope,
+) -> Option<(Vec<u8>, crypto::otp::AckProof)> {
+    let padded = recover_padded_otp_bytes(session, from, sender, envelope)?;
+    finish_opening_otp_envelope(session, ui_state, from, from_name, contact_name, channel, &padded).await
 }
 
 /// The chunk-transport key for an OTP content stream - a file's content
@@ -3155,10 +3195,34 @@ pub async fn on_message(
     // pad-protected leg reports its delivery through `OtpDeliveryAck`
     // rather than through the `DeliveryReceipt` this id would name
     // (`client::tui::ui::DeliveryProof`).
-    _msg_id: Option<u64>,
+    msg_id: Option<u64>,
     envelope: Envelope,
 ) -> proto::Result<()> {
     let Some(sender) = otp_sender_of(session, ui_state, from) else {
+        // `otp_sender_of` fails for exactly two reasons: `direct_nickname_of`
+        // fails (an unconfigured nickname, untouched by this feature), or it
+        // succeeds but `direct_peer_identity`/`id_store.get` fails - a
+        // `direct_punch_to` target with no key pinned at all. Offer to check
+        // whether this proof matches a *pq_hybrid* key already pinned under a
+        // different nickname (`docs/PROTOCOL.md` §7.1.5) - never against a
+        // pad-only pin, which would mean running real key material against
+        // an unverified ciphertext for every pad held, not just this one.
+        if let Some(nickname) = session.peer_link.direct_nickname_of(from)
+            && session.id_store.get(&nickname).is_none()
+            && let Some(addr) = session.peer_link.active_addr(from)
+        {
+            ui_state.push_unknown_peer_review(
+                from,
+                nickname,
+                crate::client::tui::ui::UnverifiedDirectProof::OtpMessage {
+                    channel,
+                    seq,
+                    msg_id,
+                    envelope,
+                },
+                addr,
+            );
+        }
         return Ok(());
     };
     let Some(contact_name) = contact_name_for_peer(session, &sender.public_key_der) else {
@@ -3210,10 +3274,47 @@ pub async fn on_message(
     if !session.otp_store.record_received(&contact_name, seq) {
         return Ok(());
     }
+    apply_otp_message(
+        session,
+        ui_state,
+        channel,
+        from,
+        from_name,
+        seq,
+        &sender,
+        &contact_name,
+        envelope.content,
+        plaintext,
+        ack_proof,
+    )
+    .await
+}
+
+/// The registration/dispatch half of `on_message`, factored out so a
+/// confirmed unknown-peer match (`session::handle_ui_action`'s
+/// `ConfirmUnknownPeerKey` arm, `docs/PROTOCOL.md` §7.1.5) can finish it
+/// from the plaintext the scan already recovered. Never re-decrypt for that
+/// case: the pad's own position has already moved past that ciphertext by
+/// the time a match is found, so a second attempt would be rejected as a
+/// replay rather than repeating the same result.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn apply_otp_message(
+    session: &mut SessionState,
+    ui_state: &mut UiState,
+    channel: Option<String>,
+    from: UserId,
+    from_name: String,
+    seq: u64,
+    sender: &UserInfo,
+    contact_name: &str,
+    content: Content,
+    plaintext: Vec<u8>,
+    ack_proof: crypto::otp::AckProof,
+) -> proto::Result<()> {
     // The pad opened it, so this really is who the link claims - see
     // `otp_sender_of`. Registering here is what lets the reply go back.
-    adopt_pad_verified_sender(ui_state, from, &sender);
-    match envelope.content {
+    adopt_pad_verified_sender(ui_state, from, sender);
+    match content {
         Content::Text => {
             let body = crate::client::tui::ui::MessageBody::Text(
                 String::from_utf8_lossy(&plaintext).into_owned(),
@@ -3222,7 +3323,7 @@ pub async fn on_message(
                 Some(ch) => ui_state.on_channel_message(ch, from, from_name, body),
                 None => ui_state.on_direct_message(from, from_name, body),
             }
-            refresh_otp_key_status(&session.otp_cli_cfg, ui_state, from, &contact_name).await;
+            refresh_otp_key_status(&session.otp_cli_cfg, ui_state, from, contact_name).await;
             // No ordinary `DeliveryReceipt` here. It would say exactly what
             // the ack below already says, except unprovenly - and the sender's
             // row would ignore it anyway, since a pad-protected leg accepts
@@ -3242,7 +3343,7 @@ pub async fn on_message(
             let Ok(payload) = proto::decode::<crypto::otp::OtpEndSessionPayload>(&plaintext) else {
                 return Ok(());
             };
-            apply_end_session(session, ui_state, from, from_name, &sender, payload).await;
+            apply_end_session(session, ui_state, from, from_name, sender, payload).await;
         }
         Content::OtpEndSessionAck => {
             let Ok(payload) = proto::decode::<crypto::otp::OtpEndSessionPayload>(&plaintext) else {

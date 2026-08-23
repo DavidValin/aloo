@@ -241,9 +241,16 @@ async fn attach_until(plan: DaemonPlan, needle: &str) -> String {
     screen
 }
 
-/// Everything but whitespace - see `Running::wait_for`.
+/// Everything but whitespace and box-drawing border characters - see
+/// `Running::wait_for`. A popup's wrapped paragraph text can straddle a
+/// border line right at the wrap point (the closing `│` of one rendered
+/// row, immediately followed by the opening `│` of the next), which would
+/// otherwise land a real border character in the middle of a needle that
+/// only cares about the words either side of it.
 fn squash(s: &str) -> String {
-    s.chars().filter(|c| !c.is_whitespace()).collect()
+    s.chars()
+        .filter(|c| !c.is_whitespace() && !"│─┌┐└┘├┤┬┴┼".contains(*c))
+        .collect()
 }
 
 /// Drops CSI/OSC escape sequences, leaving the characters a person would
@@ -283,7 +290,7 @@ fn strip_ansi(s: &str) -> String {
     out
 }
 
-/// `aloo --daemon --no-server --focus peter` with `direct_punch_channel=team`:
+/// `aloo --daemon --no-server --initial-focus peter` with `direct_punch_channel=team`:
 /// the channel from settings is there, the configured peer is nowhere yet,
 /// and the screen says so instead of sitting blank.
 ///
@@ -501,5 +508,203 @@ async fn two_serverless_sessions_punch_to_each_other_and_each_registers_the_othe
         delivered,
         "the whole point of the link: an ordinary channel message must reach \
          bob over it with no server involved: {bob_screen}"
+    );
+}
+
+/// A `direct_punch_to` nickname that punches successfully (the name matches,
+/// so the transport link comes up) but that alice has no key pinned for at
+/// all - only under a *different* name she already knows the same real
+/// identity by - asks before doing anything, finds the match, and once
+/// confirmed registers the peer under the new name using that same key
+/// (`docs/PROTOCOL.md` §7.1.5's unknown-nickname reconciliation).
+///
+/// Real wall-clock punch, same 75s window as its sibling above, plus the
+/// popup interaction itself (fast, in-process).
+///
+/// @requirement AC-275, AC-276, AC-277
+#[tokio::test]
+#[ignore = "waits for a real wall-clock slot boundary - run by `cargo slow`"]
+async fn an_unknown_but_matching_nickname_is_offered_and_then_pinned() {
+    let _guard = SERIAL.lock().await;
+    let home = shared_home();
+
+    let (alice_port, bob_port) = (free_udp_port(), free_udp_port());
+
+    // Alice already holds bob's real key - just under "dave", not "bob".
+    // Bob's own `direct_punch_to` still names her correctly as "alice", so
+    // the punch itself succeeds; it is only her *pin* that is missing under
+    // the name the punch actually arrives as.
+    let mut alice_store =
+        aloo::client::idstore::IdStore::new_empty(home.join("id_store_alice_unknown"));
+    alice_store.check_and_pin("dave", &public_der(home, "bob"));
+    let mut bob_store =
+        aloo::client::idstore::IdStore::new_empty(home.join("id_store_bob_unknown"));
+    bob_store.check_and_pin("alice", &public_der(home, "alice"));
+
+    let to_boundary = 60
+        - (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            % 60);
+    if to_boundary > 3 {
+        tokio::time::sleep(Duration::from_secs(to_boundary - 3)).await;
+    }
+
+    let settings_for = |port: u16, peer: &str, peer_port: u16| {
+        format!(
+            "direct_punch=on\n\
+             direct_punch_port={port}\n\
+             direct_punch_channel=team\n\
+             direct_punch_to={peer},127.0.0.1:{peer_port},every_1m\n"
+        )
+    };
+
+    write_settings(home, &settings_for(alice_port, "bob", bob_port));
+    let mut alice = start(
+        "alice",
+        "alice",
+        alice_store,
+        DaemonPlan::new(Vec::new(), None),
+    );
+    assert!(
+        alice.wait_for("team", Duration::from_secs(10)).await,
+        "alice should be in the channel she declared: {}",
+        alice.screen
+    );
+
+    write_settings(home, &settings_for(bob_port, "alice", alice_port));
+    let bob = start("bob", "bob", bob_store, DaemonPlan::new(Vec::new(), None));
+
+    // The punch succeeds (the name matches), but alice has no pin for
+    // "bob" - so instead of registering him, or staying silent forever,
+    // she is asked.
+    let asked = alice
+        .wait_for(
+            "unknown nickname (\"bob\")",
+            Duration::from_secs(75),
+        )
+        .await;
+    assert!(
+        asked,
+        "alice should have been asked about the unknown nickname \"bob\": {}",
+        alice.screen
+    );
+
+    // Focus starts on "No" - move to "Yes" and confirm running the check.
+    alice.key(KeyCode::Tab);
+    alice.key(KeyCode::Enter);
+
+    // A short, distinctive needle rather than the whole sentence: the
+    // terminal backend only sends cells that changed since the last frame
+    // (see `wait_for`'s own doc), and the confirm-match popup overlaps the
+    // initial one's screen position almost entirely, so a long phrase can
+    // lose an individual unchanged character here and there even though
+    // the real text is correct - "dave" alone is short enough not to.
+    let matched = alice.wait_for("dave", Duration::from_secs(10)).await;
+    assert!(
+        matched,
+        "the scan should have found dave's key matches bob's request: {}",
+        alice.screen
+    );
+
+    // Focus resets to "No" on the new screen too - move to "Yes" and confirm.
+    alice.key(KeyCode::Tab);
+    alice.key(KeyCode::Enter);
+
+    // "bob" is already on screen from the popup's own title, so waiting for
+    // it alone would pass vacuously without the confirm having done
+    // anything yet - wait for the sidebar tag that only appears once he is
+    // actually registered as an ordinary pq_hybrid member.
+    let registered = alice
+        .wait_for("bob 🛡️ PQH", Duration::from_secs(10))
+        .await;
+    let joined = alice.wait_for("bob joined", Duration::from_secs(5)).await;
+    let alice_screen = alice.screen.clone();
+    alice.end().await;
+    bob.end().await;
+    assert!(
+        registered,
+        "bob should now be registered, pinned to the same key as dave: {alice_screen}"
+    );
+    assert!(
+        joined,
+        "bob's arrival should be announced exactly like any other peer's: {alice_screen}"
+    );
+}
+
+/// When nothing else pinned locally could possibly be the source of an
+/// unknown nickname's request, checking says so plainly instead of leaving
+/// the popup dangling or silently doing nothing.
+///
+/// @requirement AC-278
+#[tokio::test]
+#[ignore = "waits for a real wall-clock slot boundary - run by `cargo slow`"]
+async fn an_unknown_nickname_with_no_matching_key_is_told_its_impossible() {
+    let _guard = SERIAL.lock().await;
+    let home = shared_home();
+
+    let (alice_port, bob_port) = (free_udp_port(), free_udp_port());
+
+    // Alice holds nothing else at all - there is nothing the scan could
+    // possibly find.
+    let alice_store =
+        aloo::client::idstore::IdStore::new_empty(home.join("id_store_alice_no_match"));
+    let mut bob_store =
+        aloo::client::idstore::IdStore::new_empty(home.join("id_store_bob_no_match"));
+    bob_store.check_and_pin("alice", &public_der(home, "alice"));
+
+    let to_boundary = 60
+        - (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            % 60);
+    if to_boundary > 3 {
+        tokio::time::sleep(Duration::from_secs(to_boundary - 3)).await;
+    }
+
+    let settings_for = |port: u16, peer: &str, peer_port: u16| {
+        format!(
+            "direct_punch=on\n\
+             direct_punch_port={port}\n\
+             direct_punch_channel=team\n\
+             direct_punch_to={peer},127.0.0.1:{peer_port},every_1m\n"
+        )
+    };
+
+    write_settings(home, &settings_for(alice_port, "bob", bob_port));
+    let mut alice = start(
+        "alice",
+        "alice",
+        alice_store,
+        DaemonPlan::new(Vec::new(), None),
+    );
+    assert!(alice.wait_for("team", Duration::from_secs(10)).await);
+
+    write_settings(home, &settings_for(bob_port, "alice", alice_port));
+    let bob = start("bob", "bob", bob_store, DaemonPlan::new(Vec::new(), None));
+
+    let asked = alice
+        .wait_for("unknown nickname (\"bob\")", Duration::from_secs(75))
+        .await;
+    assert!(asked, "alice should have been asked: {}", alice.screen);
+
+    alice.key(KeyCode::Tab);
+    alice.key(KeyCode::Enter);
+
+    let told = alice
+        .wait_for(
+            "Impossible to establish communication",
+            Duration::from_secs(10),
+        )
+        .await;
+    let alice_screen = alice.screen.clone();
+    alice.end().await;
+    bob.end().await;
+    assert!(
+        told,
+        "with nothing else pinned, alice should be told plainly rather than \
+         left with a popup that goes nowhere: {alice_screen}"
     );
 }

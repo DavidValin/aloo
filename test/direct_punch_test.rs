@@ -433,7 +433,7 @@ async fn a_direct_target_moves_onto_the_user_id_the_server_gives_it() {
     assert_eq!(alice.link.direct_peer("bob"), Some(direct_peer_id("bob")));
 }
 
-/// @requirement TB-222
+/// @requirement TB-222, TB-247
 #[tokio::test]
 async fn a_direct_ping_naming_a_nickname_that_is_not_configured_is_ignored() {
     let rendezvous = spawn_fake_rendezvous().await;
@@ -590,7 +590,7 @@ async fn probing_really_continues_for_the_whole_window_not_just_one_link_attempt
 
 /// Daemon mode makes this ordering the common one: the daemon runs for
 /// hours with a direct link already up, and the peer connects to the
-/// server later (`--focus <nickname>` only ever resolves off `UserJoined`).
+/// server later (`--initial-focus <nickname>` only ever resolves off `UserJoined`).
 /// @requirement AC-211
 #[tokio::test]
 async fn a_peer_who_joins_the_server_after_a_direct_link_is_up_gets_only_one_link() {

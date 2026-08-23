@@ -54,5 +54,5 @@ Feature: Keeping a one-time-pad session up in the background
   @AC-199
   Scenario: Asking for OTP on a channel focus is refused
     Given no daemon settings and nothing in the connect cache
-    When the daemon is started with --focus=channel:ops --otp
+    When the daemon is started with --initial-focus=channel:ops --otp
     Then it refuses to start, saying "needs a person"

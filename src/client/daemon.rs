@@ -48,18 +48,20 @@ pub enum DaemonFocus {
 }
 
 impl DaemonFocus {
-    /// Parses a `--focus` value. `channel:<name>` and `dm:<nickname>` are
-    /// the explicit spellings; a bare value is a nickname, since that is
-    /// the shorter and more common case and a channel already has a
-    /// natural prefix to reach for.
+    /// Parses a `--initial-focus` value. `channel:<name>` and
+    /// `dm:<nickname>` are the explicit spellings; a bare value is a
+    /// nickname, since that is the shorter and more common case and a
+    /// channel already has a natural prefix to reach for.
     pub fn parse(value: &str, otp: bool) -> Result<Self, String> {
         let value = value.trim();
         if value.is_empty() {
-            return Err("--focus needs a value".to_string());
+            return Err("--initial-focus needs a value".to_string());
         }
         if let Some(name) = value.strip_prefix("channel:") {
             if name.is_empty() {
-                return Err("--focus=channel: needs a channel name after the colon".to_string());
+                return Err(
+                    "--initial-focus=channel: needs a channel name after the colon".to_string(),
+                );
             }
             if otp {
                 // OTP is provisioned pairwise, per contact - there is no
@@ -72,7 +74,7 @@ impl DaemonFocus {
         }
         let nickname = value.strip_prefix("dm:").unwrap_or(value);
         if nickname.is_empty() {
-            return Err("--focus=dm: needs a nickname after the colon".to_string());
+            return Err("--initial-focus=dm: needs a nickname after the colon".to_string());
         }
         Ok(Self::Dm {
             nickname: nickname.to_string(),
@@ -679,7 +681,7 @@ pub struct DaemonConfig {
     /// it was asked for - the whole point of daemon mode is to be in the
     /// places that matter rather than the default one.
     pub channels: Vec<DaemonChannel>,
-    pub focus: Option<DaemonFocus>,
+    pub initial_focus: Option<DaemonFocus>,
     /// Run with no server at all (`--no-server`): reachable only by the
     /// `direct_punch_to` peers in `~/.aloo/settings` (docs/PROTOCOL.md
     /// §7.1.5). Everything that needs a server is refused, by name, at the
@@ -700,7 +702,7 @@ pub struct DaemonFlags {
     pub ssl: bool,
     pub my_key_prefix: Option<String>,
     pub channels: Vec<String>,
-    pub focus: Option<String>,
+    pub initial_focus: Option<String>,
     pub otp: bool,
     pub no_server: bool,
 }
@@ -790,18 +792,18 @@ impl DaemonConfig {
             }
         }
 
-        let focus_value = flags
-            .focus
+        let initial_focus_value = flags
+            .initial_focus
             .clone()
-            .or_else(|| settings.daemon_focus.clone());
+            .or_else(|| settings.daemon_initial_focus.clone());
         let otp = flags.otp || settings.daemon_otp;
-        let focus = match focus_value {
+        let initial_focus = match initial_focus_value {
             Some(value) => Some(DaemonFocus::parse(&value, otp)?),
             None => None,
         };
 
         // A focused channel is one the daemon must actually be in.
-        if let Some(DaemonFocus::Channel(name)) = &focus
+        if let Some(DaemonFocus::Channel(name)) = &initial_focus
             && !channels.iter().any(|c| &c.name == name)
         {
             channels.push(DaemonChannel::parse(name)?);
@@ -814,7 +816,7 @@ impl DaemonConfig {
         // serverless client could join anyway - adding it would produce an
         // empty tab that can never fill (§7.1.5).
         if !(flags.no_server || settings.daemon_no_server)
-            && matches!(focus, Some(DaemonFocus::Dm { .. }))
+            && matches!(initial_focus, Some(DaemonFocus::Dm { .. }))
             && channels.is_empty()
         {
             crate::log_warn!(
@@ -836,7 +838,7 @@ impl DaemonConfig {
             ssl,
             my_key,
             channels,
-            focus,
+            initial_focus,
             no_server,
         })
     }
@@ -875,11 +877,11 @@ impl DaemonConfig {
     /// for the reason `Settings::update` documents.
     pub fn persist(&self, path: &Path) -> std::io::Result<()> {
         let channels: Vec<String> = self.channels.iter().map(|c| c.to_setting()).collect();
-        let focus = self.focus.as_ref().map(|f| match f {
+        let initial_focus = self.initial_focus.as_ref().map(|f| match f {
             DaemonFocus::Channel(name) => format!("channel:{name}"),
             DaemonFocus::Dm { nickname, .. } => nickname.clone(),
         });
-        let otp = matches!(self.focus, Some(DaemonFocus::Dm { otp: true, .. }));
+        let otp = matches!(self.initial_focus, Some(DaemonFocus::Dm { otp: true, .. }));
         crate::settings::Settings::update(path, |s| {
             s.daemon_no_server = self.no_server;
             // A serverless daemon has no host, and writing the empty one it
@@ -893,7 +895,7 @@ impl DaemonConfig {
             s.daemon_port = Some(self.port);
             s.daemon_nickname = Some(self.nickname.clone());
             s.daemon_channels = channels;
-            s.daemon_focus = focus;
+            s.daemon_initial_focus = initial_focus;
             s.daemon_otp = otp;
             if !self.password.is_empty() {
                 s.daemon_server_password = Some(self.password.clone());
@@ -1026,8 +1028,8 @@ impl DaemonPlan {
     ///   own log, where a sound would only be noise.
     /// - **`viewer_attached`** - while a terminal is watching, the arrival
     ///   is on screen already. The sound is for when it is not.
-    /// - **`focus`** - the *current* focus, not the `--focus` the daemon
-    ///   started with. Those agree until someone attaches and moves, and
+    /// - **`focus`** - the *current* focus, not the `--initial-focus` the
+    ///   daemon started with. Those agree until someone attaches and moves, and
     ///   after that only the live one is worth announcing: it is where a
     ///   held shortcut actually goes.
     /// - **`already_announced`** (DM focus only) - a peer joining two
@@ -1068,7 +1070,7 @@ impl DaemonPlan {
     /// Whether the focus still needs placing - true until it has been
     /// placed once, false forever after.
     ///
-    /// `--focus` is a *starting* position, not a standing instruction. It
+    /// `--initial-focus` is a *starting* position, not a standing instruction. It
     /// answers "where should a held shortcut go when this daemon comes
     /// up", and once that question has been answered, where the focus sits
     /// belongs to whoever is driving the session: someone who attaches,
@@ -1248,7 +1250,7 @@ pub async fn run(
     }
 
     let mut surface = crate::client::tui::surface::Surface::Detached;
-    let plan = DaemonPlan::new(config.channels.clone(), config.focus.clone());
+    let plan = DaemonPlan::new(config.channels.clone(), config.initial_focus.clone());
     let result = crate::client::session::run_daemon_session(
         &mut surface,
         server_events,

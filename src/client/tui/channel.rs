@@ -1150,8 +1150,12 @@ const HEADER_SIDE_PAD: u16 = 1;
 /// calls"). Only drawn while a call is on. The plain record-circle glyph
 /// rather than a multicolour emoji, so its colour is always exactly the
 /// `Style` it's painted with (`Color::Red`, below), never one fixed inside
-/// the character itself.
-const CALL_MARKER: &str = "\u{23FA} Call";
+/// the character itself. Blinks (`render_call_marker`'s `blink_on`) the
+/// same way a live recording's own indicator does - a permanent, always-on
+/// dot would read as decoration rather than as "something is live right
+/// now".
+const CALL_MARKER_DOT: &str = "\u{23FA}";
+const CALL_MARKER_SUFFIX: &str = " Call";
 const CALL_MARKER_KEY: &str = "Ctrl+R";
 
 /// Its box's outer width: both labels, the space between them, one column
@@ -1240,7 +1244,7 @@ pub(crate) fn render_header_row(frame: &mut Frame, area: Rect, state: &UiState) 
     let (selectors, _) = selector_line(state);
     frame.render_widget(Paragraph::new(selectors), header_cols[1]);
 
-    if state.call.is_some() {
+    if let Some(call) = &state.call {
         // The box is the one thing here that uses the whole three-row
         // band: its borders sit on the blank lines the selectors leave
         // above and below themselves.
@@ -1252,6 +1256,8 @@ pub(crate) fn render_header_row(frame: &mut Frame, area: Rect, state: &UiState) 
                 width: header_cols[2].width,
                 height: area.height.min(HEADER_ROW_HEIGHT),
             },
+            state.blink_on,
+            call.muted,
         );
     }
 
@@ -1303,7 +1309,7 @@ fn status_line(state: &UiState) -> Line<'static> {
     ])
 }
 
-fn render_call_marker(frame: &mut Frame, area: Rect) {
+fn render_call_marker(frame: &mut Frame, area: Rect, blink_on: bool, self_muted: bool) {
     if area.width < 4 || area.height < 3 {
         return;
     }
@@ -1312,9 +1318,21 @@ fn render_call_marker(frame: &mut Frame, area: Rect) {
         .border_style(Style::default().fg(Color::Red));
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    // Muted is a standing state, not an in-progress activity, so it never
+    // blinks - it replaces the dot outright rather than alternating with it.
+    let dot = if self_muted {
+        "\u{1F507}"
+    } else if blink_on {
+        CALL_MARKER_DOT
+    } else {
+        " "
+    };
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled(CALL_MARKER, Style::default().fg(Color::Red)),
+            Span::styled(
+                format!("{dot}{CALL_MARKER_SUFFIX}"),
+                Style::default().fg(Color::Red),
+            ),
             Span::raw(" "),
             Span::styled(CALL_MARKER_KEY, Style::default().fg(Color::DarkGray)),
         ]))

@@ -62,3 +62,57 @@ Feature: A punched peer becomes someone I can actually see and talk to
     Then bob has no link to peter
     And peter has no link to bob
     And peter has no record of bob at all
+
+  # Reconciling an unpinned nickname against an already-pinned key
+  # (docs/PROTOCOL.md 7.1.5's continuation): a `direct_punch_to` name that
+  # punches successfully but has no key pinned at all asks before doing
+  # anything, rather than staying a silent transport-only link forever.
+  # The popup mechanics are proven here against `UiState` directly, the
+  # same way the identity review popup's own scenarios are; the real
+  # cryptographic scan that finds a match is proven end to end with two
+  # real punched sessions in test/daemon_session_test.rs, since it needs a
+  # live link and a live pad/keybundle to mean anything.
+
+  @AC-275 @pqhybrid
+  Scenario: A configured but unpinned nickname's pq_hybrid proof asks first
+    Given I am connected and viewing a channel
+    And carol is a direct-punch target alice has no key pinned for
+    When carol's punched link sends a pq_hybrid ChannelPresence proof
+    Then alice is asked whether to check her local keys for carol
+
+  @AC-275 @pqhybrid_otp
+  Scenario: A configured but unpinned nickname's pad-wrapped proof asks first
+    Given I am connected and viewing a channel
+    And carol is a direct-punch target alice has no key pinned for
+    When carol's punched link sends a pad-wrapped message proof
+    Then alice is asked whether to check her local keys for carol
+
+  @AC-276 @AC-277
+  Scenario: Confirming a found match asks to use it, then reports it chosen
+    Given I am connected and viewing a channel
+    And carol is a direct-punch target alice has no key pinned for
+    And carol's punched link sends a pq_hybrid ChannelPresence proof
+    And alice agrees to check her local keys
+    When the check finds that dave's key matches carol's request
+    Then alice is asked whether to use dave's key for carol
+    When alice confirms using dave's key
+    Then confirming carol's match is what alice's answer asked for
+
+  @AC-279
+  Scenario: Declining the first question leaves no review outstanding
+    Given I am connected and viewing a channel
+    And carol is a direct-punch target alice has no key pinned for
+    And carol's punched link sends a pq_hybrid ChannelPresence proof
+    When alice declines to check her local keys
+    Then no unknown-peer review is left open for carol
+
+  @AC-279
+  Scenario: Declining the offered match discards only that offer
+    Given I am connected and viewing a channel
+    And carol is a direct-punch target alice has no key pinned for
+    And carol's punched link sends a pq_hybrid ChannelPresence proof
+    And alice agrees to check her local keys
+    And the check finds that dave's key matches carol's request
+    When alice declines the offered match
+    Then declining carol's match is what alice's answer asked for
+    And no unknown-peer review is left open for carol

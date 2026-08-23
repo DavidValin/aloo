@@ -359,8 +359,10 @@ pub struct Settings {
     /// `name,password` syntax `--channel` takes.
     pub daemon_channels: Vec<String>,
     /// `channel:<name>` or a bare nickname - parsed by
-    /// `client::daemon::DaemonFocus::parse`, which owns that grammar.
-    pub daemon_focus: Option<String>,
+    /// `client::daemon::DaemonFocus::parse`, which owns that grammar. Only
+    /// ever *places* the daemon's starting tab once, at launch - not a
+    /// standing instruction (`client::daemon::DaemonPlan::should_place_focus`).
+    pub daemon_initial_focus: Option<String>,
     pub daemon_otp: bool,
     /// The daemon last ran with no server at all (`--no-server`). Persisted
     /// like every other daemon field so a bare `aloo --daemon` at the next
@@ -477,7 +479,7 @@ impl Default for Settings {
             daemon_my_key_pub: None,
             daemon_my_key_priv: None,
             daemon_channels: Vec::new(),
-            daemon_focus: None,
+            daemon_initial_focus: None,
             daemon_otp: false,
             daemon_no_server: false,
             direct_punch: false,
@@ -632,8 +634,8 @@ impl Settings {
                 "daemon_channel" if !value.is_empty() && crate::validation::is_storable(value) => {
                     settings.daemon_channels.push(value.to_string());
                 }
-                "daemon_focus" if !value.is_empty() => {
-                    settings.daemon_focus = Some(value.to_string())
+                "daemon_initial_focus" if !value.is_empty() => {
+                    settings.daemon_initial_focus = Some(value.to_string())
                 }
                 "daemon_otp" => {
                     if let Ok(b) = value.parse::<bool>() {
@@ -766,7 +768,7 @@ impl Settings {
         optional("daemon_server_password", &self.daemon_server_password);
         optional("daemon_my_key_pub", &self.daemon_my_key_pub);
         optional("daemon_my_key_priv", &self.daemon_my_key_priv);
-        optional("daemon_focus", &self.daemon_focus);
+        optional("daemon_initial_focus", &self.daemon_initial_focus);
         if let Some(port) = self.daemon_port {
             contents.push_str(&format!("daemon_port={port}\n"));
         }

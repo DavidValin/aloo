@@ -11,7 +11,7 @@ Feature: Hearing when someone arrives where your voice is pointed
   in its log, an attached terminal already has it on screen, and a channel
   you are not pointed at is not somewhere your next words are going.
 
-  It follows the *current* focus, not the --focus the daemon was started
+  It follows the *current* focus, not the --initial-focus the daemon was started
   with. The two agree until someone attaches and moves; after that only the
   live one is worth announcing, since that is where the shortcut goes.
 

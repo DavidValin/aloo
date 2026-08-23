@@ -2539,12 +2539,12 @@ so_that = "the global push-to-talk shortcut is always live without me having to 
 
 [[user_story.acceptance_criteria]]
 id = "AC-199"
-description = "--otp with a nickname --focus makes sure an OTP session is running with that person: one that is already active is continued silently, with no invitation sent and no Accept/Reject popup on their side, since a session outlives disconnects and restarts and only /endotp ends one; only a peer with no live session is invited, and at most once per daemon run so a flapping connection cannot become a queue of popups."
+description = "--otp with a nickname --initial-focus makes sure an OTP session is running with that person: one that is already active is continued silently, with no invitation sent and no Accept/Reject popup on their side, since a session outlives disconnects and restarts and only /endotp ends one; only a peer with no live session is invited, and at most once per daemon run so a flapping connection cannot become a queue of popups."
 evidence = "docs/SPEC.md 'Running in background mode' 'Focusing a person, with OTP'; docs/PROTOCOL.md 16.6; src/client/daemon.rs DaemonPlan::should_invite_otp; src/client/session.rs on_daemon_peer_appeared; tests an_already_active_otp_session_is_continued_not_re_invited, a_peer_with_no_otp_session_is_invited, without_otp_nobody_is_ever_invited, only_one_invitation_is_sent_per_daemon_run, someone_other_than_the_focused_peer_is_never_invited, a_channel_focus_never_invites_an_otp_session"
 
 [[user_story.acceptance_criteria]]
 id = "AC-200"
-description = "--focus is a starting position, not a standing instruction: it is placed once, at the first opportunity (which for a person may be long after startup, since they have to appear first), and never re-applied. Someone who attaches, moves to another channel or DM and detaches again keeps that position - a focused peer reconnecting, or a focused channel being rejoined, does not drag the focus back. The join sound and notification still fire for those events; only the focus move is suppressed."
+description = "--initial-focus is a starting position, not a standing instruction: it is placed once, at the first opportunity (which for a person may be long after startup, since they have to appear first), and never re-applied. Someone who attaches, moves to another channel or DM and detaches again keeps that position - a focused peer reconnecting, or a focused channel being rejoined, does not drag the focus back. The join sound and notification still fire for those events; only the focus move is suppressed."
 evidence = "docs/SPEC.md 'Running in background mode' 'Where your voice goes'; src/client/daemon.rs DaemonPlan::should_place_focus; src/client/session.rs apply_daemon_channel_focus, on_daemon_peer_appeared; tests the_focus_is_placed_once_and_then_left_alone, a_focused_peer_reappearing_does_not_re_steal_the_focus, a_focused_channel_being_rejoined_does_not_re_steal_the_focus, a_focus_still_waiting_for_its_peer_has_not_been_used_up"
 
 [[user_story.technical_behavior]]
@@ -2554,7 +2554,7 @@ evidence = "docs/SPEC.md 'Running in background mode' Channels; src/client/daemo
 
 [[user_story.technical_behavior]]
 id = "TB-218"
-description = "--focus reads a channel: prefix as a channel and anything else as a nickname (dm: being the explicit spelling of the latter), refuses an empty value, and refuses --otp against a channel since OTP is provisioned pairwise and has no channel-wide form. A DM focus then follows the person wherever they appear, while a channel focus follows arrivals in that channel."
+description = "--initial-focus reads a channel: prefix as a channel and anything else as a nickname (dm: being the explicit spelling of the latter), refuses an empty value, and refuses --otp against a channel since OTP is provisioned pairwise and has no channel-wide form. A DM focus then follows the person wherever they appear, while a channel focus follows arrivals in that channel."
 evidence = "src/client/daemon.rs DaemonFocus::parse, DaemonPlan::is_focus_event; tests focus_reads_a_channel_prefix_and_otherwise_a_nickname, otp_with_a_channel_focus_is_refused, an_empty_focus_is_refused, a_dm_focus_follows_the_person_not_the_channel, a_channel_focus_follows_the_channel_not_the_person, a_plan_with_no_focus_cares_about_nothing"
 
 [[user_story.acceptance_criteria]]
@@ -2584,7 +2584,7 @@ evidence = "docs/SPEC.md 'Running in background mode' 'Files it owns'; docs/SECU
 
 [[user_story.acceptance_criteria]]
 id = "AC-204"
-description = "The join sound (assets/joined.wav) plays only in daemon mode, only while no terminal is attached, and only for the *current* focus rather than the --focus the daemon started with. On a channel focus every arrival in that channel is announced; on a DM focus the focused person coming online is announced once however many shared channels the arrival reaches us through, and again the next time they come online after going offline. A foreground client, an attached one, an unfocused channel, anyone but the focused person, and having nothing focused at all are all silent."
+description = "The join sound (assets/joined.wav) plays only in daemon mode, only while no terminal is attached, and only for the *current* focus rather than the --initial-focus the daemon started with. On a channel focus every arrival in that channel is announced; on a DM focus the focused person coming online is announced once however many shared channels the arrival reaches us through, and again the next time they come online after going offline. A foreground client, an attached one, an unfocused channel, anyone but the focused person, and having nothing focused at all are all silent."
 evidence = "docs/SPEC.md 'Running in background mode'; src/client/daemon.rs DaemonPlan::should_play_joined_chime; src/client/tui/ui.rs UiState::current_focus, CurrentFocus; src/client/session.rs on_daemon_peer_appeared, SessionState::viewer_attached/announced_online; scenarios features/daemon/the_join_sound.feature"
 
 [[user_story.acceptance_criteria]]
@@ -2675,7 +2675,7 @@ evidence = "docs/PROTOCOL.md 7.1.5; src/client/p2p.rs direct_peer_id, is_direct_
 
 [[user_story.acceptance_criteria]]
 id = "AC-214"
-description = "A peer reached with no server is placed in the channels both sides have joined, from a sealed ChannelPresence announcement they send when the link opens and again whenever their own membership changes. The list is authoritative rather than additive, so a channel dropped from it is how a peer says they left, and only channels this client has itself joined are ever considered. Once placed, nothing downstream can tell them apart from a peer a server introduced: the sidebar lists them, channel sends and voice address them, the call roster includes them, and --focus resolves to them - which is what makes a daemon's channel focus and its global push-to-talk work over a punched link. A peer sharing no channel is still registered as a DM peer."
+description = "A peer reached with no server is placed in the channels both sides have joined, from a sealed ChannelPresence announcement they send when the link opens and again whenever their own membership changes. The list is authoritative rather than additive, so a channel dropped from it is how a peer says they left, and only channels this client has itself joined are ever considered. Once placed, nothing downstream can tell them apart from a peer a server introduced: the sidebar lists them, channel sends and voice address them, the call roster includes them, and --initial-focus resolves to them - which is what makes a daemon's channel focus and its global push-to-talk work over a punched link. A peer sharing no channel is still registered as a DM peer."
 evidence = "docs/PROTOCOL.md 7.1.5; docs/SPEC.md 'Direct punching'; src/proto.rs Content::ChannelPresence; src/p2p_proto.rs P2pPayload::ChannelPresence; src/client/session.rs reconcile_direct_membership, on_channel_presence, send_channel_presence, broadcast_channel_presence; src/client/tui/channel.rs channels_containing_member, is_member_of_channel; tests announced_membership_is_reconciled_against_our_own_joined_channels, content_channel_presence_envelope_roundtrips, and end to end between two whole serverless sessions in test/daemon_session_test.rs (two_serverless_sessions_punch_to_each_other_and_each_registers_the_other); becoming_a_real_peer.feature"
 
 [[user_story.acceptance_criteria]]
@@ -2737,6 +2737,63 @@ evidence = "docs/PROTOCOL.md 7.1.5 (No-IP updates); src/client/session.rs Sessio
 id = "TB-246"
 description = "The updater fires once as soon as it starts, then every 5 or 6 minutes alternately, forever - never a flat 5.5-minute period, since 330 seconds is not a multiple of 60 and so cannot land on the same wall-clock second every time on its own. Alternating a 5-minute gap with a 6-minute one is what keeps every single fire on second 50 of its minute while still averaging exactly 5.5 minutes over every pair of them - landing there specifically so the update completes before the direct-punch slot grid's own boundaries, which always fall on second 0 of some minute."
 evidence = "docs/PROTOCOL.md 7.1.5 (No-IP updates); src/client/noip.rs NOIP_SECOND_OF_MINUTE, NOIP_GAP_SHORT, NOIP_GAP_LONG, seconds_until_next_noip_mark, run; tests seconds_until_next_noip_mark_computes_the_gap_to_the_next_mark, the_two_gaps_average_five_and_a_half_minutes_and_stay_on_the_mark"
+
+[[user_story.acceptance_criteria]]
+id = "AC-275"
+description = "A direct_punch_to nickname whose punch succeeds but who has no key pinned at all - a gap that otherwise leaves the link a silent transport-only stub forever - is asked whether to check local keys for a match, the moment it sends whatever would normally prove its identity (a ChannelPresence envelope, or an OTP-wrapped message). Never triggered for a nickname that is not itself a direct_punch_to target, and never for a server-introduced peer, since neither can ever reach the code path this depends on (direct_nickname_of succeeding)."
+evidence = "docs/PROTOCOL.md 7.1.5 (unknown-nickname reconciliation); src/client/tui/ui.rs UnverifiedDirectProof, UnknownPeerReview, push_unknown_peer_review; src/client/session.rs on_channel_presence's unpinned branch; src/client/otp.rs on_message's unpinned branch; test an_unknown_but_matching_nickname_is_offered_and_then_pinned; scenarios features/direct_punch/becoming_a_real_peer.feature 'A configured but unpinned nickname's pq_hybrid proof asks first', 'A configured but unpinned nickname's pad-wrapped proof asks first'"
+
+[[user_story.acceptance_criteria]]
+id = "AC-276"
+description = "Agreeing to check runs a real cryptographic scan against every other nickname already pinned locally that decodes as a pq_hybrid keybundle, stopping at the first one that genuinely verifies the received proof - an ordinary envelope signature check for a ChannelPresence proof, or just the outer pq_hybrid seal for an OTP-wrapped one (covering a peer running an OTP session on top of a real identity). A candidate whose pin does not decode is never tried for either proof kind: that would mean running every locally-held one-time pad's own decrypt against an unverified ciphertext to find out who is speaking, a materially different cost than a signature check. A wrong candidate has no side effect either way, so trying several in a row costs nothing, and at most one can ever succeed; the pad itself is touched only once, for the one candidate the outer seal already proved correct."
+evidence = "docs/PROTOCOL.md 7.1.5; src/client/session.rs scan_pinned_keys_for_match, ScanMatch; src/client/tui/ui.rs UnknownPeerStage::ConfirmMatch, RecoveredProof; tests an_unknown_but_matching_nickname_is_offered_and_then_pinned; scenario features/direct_punch/becoming_a_real_peer.feature 'Confirming a found match asks to use it, then reports it chosen'"
+
+[[user_story.acceptance_criteria]]
+id = "AC-277"
+description = "Confirming a found match pins the matched key bytes under the new nickname too - legal without any IdStore schema change, since nothing ever required a key to be pinned under only one name - and finishes registration from the plaintext the scan already recovered, never decrypting a second time. For an OTP-wrapped match this automatically shares the existing pad session too, since a PqWrapped contact name is a pure function of both sides' fingerprints."
+evidence = "docs/PROTOCOL.md 7.1.5; src/client/idstore.rs IdStore::check_and_pin; src/client/session.rs handle_ui_action's ConfirmUnknownPeerKey arm, apply_channel_presence_plaintext; src/client/otp.rs apply_otp_message, recover_padded_otp_bytes, finish_opening_otp_envelope; test an_unknown_but_matching_nickname_is_offered_and_then_pinned; scenario features/direct_punch/becoming_a_real_peer.feature 'Confirming a found match asks to use it, then reports it chosen'"
+
+[[user_story.acceptance_criteria]]
+id = "AC-278"
+description = "When the scan finds no match among any locally pinned key or pad, the user is told plainly that communication is impossible without a key and what would fix it - a server, or manually exchanging keys - as a status notice, not a popup that goes nowhere."
+evidence = "docs/PROTOCOL.md 7.1.5; src/client/session.rs handle_ui_action's CheckUnknownPeerIdentity arm (the None branch); test an_unknown_nickname_with_no_matching_key_is_told_its_impossible"
+
+[[user_story.acceptance_criteria]]
+id = "AC-279"
+description = "Declining the first popup runs no check and costs nothing - no ban-counting, no lasting state - and a later, distinct proof from the same nickname asks again from scratch. Declining the offered match discards only that specific suggestion; the underlying verification already ran to produce it, but nothing is pinned."
+evidence = "docs/PROTOCOL.md 7.1.5; src/client/tui/ui.rs UiAction::DeclineUnknownPeerIdentity/DeclineUnknownPeerKey, resolve_unknown_peer_review; scenarios features/direct_punch/becoming_a_real_peer.feature 'Declining the first question leaves no review outstanding', 'Declining the offered match discards only that offer'"
+
+[[user_story.technical_behavior]]
+id = "TB-247"
+description = "This whole mechanism is reachable only for a nickname that is itself a direct_punch_to target - direct_nickname_of succeeding is exactly what proves it, and it only ever resolves for a UserId filed under this client's own settings. A server-introduced peer's real UserId is never such a key, so the code path is structurally unreachable for one; for the one overlap case (a nickname that is both server-known and a direct_punch_to target), check_identity always pins the key before set_direct_peer_id could ever let the new branches see them, since both run inside the same synchronous handling of one ServerMessage::UserJoined."
+evidence = "docs/PROTOCOL.md 7.1.5; src/client/p2p.rs PeerLinkManager::direct_nickname_of, set_direct_peer_id; src/client/session.rs handle_server_message's UserJoined arm (check_identity before set_direct_peer_id); tests a_direct_ping_naming_a_nickname_that_is_not_configured_is_ignored, a_peer_being_punched_directly_is_never_also_signalled_through_the_server"
+
+[[user_story]]
+id = "US-046"
+title = "Stop an unproven direct-punch requester from turning into free guessing"
+as_a = "someone running direct punching with no server involved"
+i_want = "a source that keeps failing to prove any identity to permanently stop reaching my socket at all"
+so_that = "an attacker cannot use my fixed punch port as a free oracle for guessing which of my pinned keys matches a name they invented"
+
+[[user_story.acceptance_criteria]]
+id = "AC-280"
+description = "Three genuine failed checks - the user agreed to check, the scan ran, nothing matched - from the same source IP, spanning at least two different clock minutes, within a rolling 10-hour window, bans that IP. Three crammed into the same minute do not ban, and failures older than the window are pruned and stop counting."
+evidence = "docs/PROTOCOL.md 7.1.5 (No-IP updates section's IP ban list); src/client/ip_ban.rs IpBanList::record_failed_check; tests three_failures_spanning_two_minutes_within_the_window_bans_the_ip, three_failures_inside_one_minute_do_not_ban, failures_older_than_the_rolling_window_are_pruned_and_do_not_count; scenarios features/direct_punch/ip_banning.feature 'Three failed checks spanning two clock minutes bans the source', 'Three failed checks crammed into the same minute do not ban', 'Failed checks older than the rolling window are forgotten'"
+
+[[user_story.acceptance_criteria]]
+id = "AC-281"
+description = "A banned IP's direct-punch requests are dropped outright, before any nickname is even looked at - no popup, no scan, no strike recorded - checked first thing in on_direct_ping. An already-banned IP asked for one more check stays banned without a fresh strike being counted."
+evidence = "src/client/p2p.rs PeerLinkManager::on_direct_ping (the ip_bans check), is_ip_banned; src/client/ip_ban.rs IpBanList::is_banned; tests an_already_banned_ip_stays_banned_and_is_not_recounted; scenario features/direct_punch/ip_banning.feature 'A banned source cannot be checked again to shake off the ban'"
+
+[[user_story.acceptance_criteria]]
+id = "AC-282"
+description = "A ban survives a restart: ~/.aloo/banned_ips.log persists every ban with its date, ip and reason, plus a running '<n> banned' header line, reloaded at startup. The ban itself has no auto-expiry and is lifted only by editing the file by hand."
+evidence = "src/client/ip_ban.rs IpBanList::load/save, default_path; tests a_banned_ip_stays_banned_across_a_reload, the_header_line_reports_the_running_count_and_is_recomputed_on_every_ban, loading_a_missing_file_starts_empty_rather_than_erroring; scenarios features/direct_punch/ip_banning.feature 'A ban outlives the process that recorded it', 'The file names how many sources are banned, recomputed each time'"
+
+[[user_story.technical_behavior]]
+id = "TB-248"
+description = "The file's entry lines are the one source of truth; the header count is a best-effort display value recomputed on every save and never trusted on load, so a hand-edited removal of a line takes effect immediately even though the header may briefly disagree until the next ban. A line that does not parse as date/ip/reason, or whose ip does not parse, is skipped rather than failing the whole load."
+evidence = "src/client/ip_ban.rs IpBanList::load, save; tests a_hand_edited_removal_of_an_entry_is_trusted_over_a_stale_header, an_unparseable_ban_line_is_skipped_rather_than_failing_the_whole_load; scenarios features/direct_punch/ip_banning.feature 'Removing a line by hand lifts that ban immediately', 'A corrupted line in the file is skipped, not fatal'"
 
 
 [[user_story]]

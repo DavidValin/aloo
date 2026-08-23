@@ -41,7 +41,7 @@ Feature: Which channels a daemon joins
   @AC-202
   Scenario: A focused channel is joined even when it was left off the list
     Given no daemon settings and nothing in the connect cache
-    When the daemon is started with --channels=team --focus=channel:ops
+    When the daemon is started with --channels=team --initial-focus=channel:ops
     Then it joins exactly "team, ops"
     And the focus is the channel "ops"
 
@@ -51,13 +51,13 @@ Feature: Which channels a daemon joins
   @AC-202
   Scenario: Focusing a person with no channels given picks a discovery channel
     Given no daemon settings and nothing in the connect cache
-    When the daemon is started with --focus=alice
+    When the daemon is started with --initial-focus=alice
     Then it joins exactly "the-hall"
     And the focus is a private conversation with alice
 
   @AC-202
   Scenario: Naming a channel means the-hall is not needed
     Given no daemon settings and nothing in the connect cache
-    When the daemon is started with --channels=team --focus=alice
+    When the daemon is started with --channels=team --initial-focus=alice
     Then it joins exactly "team"
     And it does not join the-hall

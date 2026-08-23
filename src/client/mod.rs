@@ -12,6 +12,7 @@ pub mod file_transfer;
 pub mod global_notification;
 pub mod global_ptt;
 pub mod idstore;
+pub mod ip_ban;
 pub mod netstats;
 pub mod noip;
 pub mod otp;

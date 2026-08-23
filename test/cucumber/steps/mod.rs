@@ -20,6 +20,7 @@ pub mod encryption;
 pub mod file_transfer;
 pub mod identity;
 pub mod identity_continuity;
+pub mod ip_ban;
 pub mod malformed_input;
 pub mod messaging;
 pub mod otp;

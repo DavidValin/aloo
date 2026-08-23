@@ -273,6 +273,10 @@ pub struct AlooWorld {
     pub id_check: Option<aloo::client::idstore::IdCheck>,
     pub temp_files: Vec<std::path::PathBuf>,
 
+    // -- IP ban list (US-046) --------------------------------------------
+    pub ip_bans: Option<aloo::client::ip_ban::IpBanList>,
+    pub ip_bans_path: Option<std::path::PathBuf>,
+
     // -- one-time-pad layer (US-033) -------------------------------------
     /// Each side's own `otp` CLI working directory, keyed by handle
     /// ("alice"/"bob"/...).

@@ -260,20 +260,20 @@ aloo --daemon-status          # is one running?
 aloo --daemon-stop            # stop it
 ```
 
-### Where your voice goes: `--focus`
+### Where your voice goes: `--initial-focus`
 
-This is the setting that makes the whole thing worth having. With no window to look at and no decision to make, `--focus` decides where a held shortcut sends your voice.
+This is the setting that makes the whole thing worth having. With no window to look at and no decision to make, `--initial-focus` decides where a held shortcut sends your voice.
 
 ```sh
-aloo --daemon --channels=team --focus=channel:team   # to a channel
-aloo --daemon --channels=team --focus=alice          # to one person
+aloo --daemon --channels=team --initial-focus=channel:team   # to a channel
+aloo --daemon --channels=team --initial-focus=alice          # to one person
 ```
 
 A bare value is a nickname; `dm:alice` spells the same thing out, and `channel:alice` is how you'd name a *channel* called alice. With a person, the daemon watches for them and opens that DM the moment they appear, so the shortcut talks to **them** rather than to the channel they turned up in. Until they appear there's nothing to talk to and the shortcut does nothing.
 
-`--focus` is a *starting* position, not a standing instruction. Once it's been placed, wherever you later move to from an attached terminal is respected — the daemon won't quietly drag your voice somewhere else behind your back.
+`--initial-focus` is a *starting* position, not a standing instruction. Once it's been placed, wherever you later move to from an attached terminal is respected — the daemon won't quietly drag your voice somewhere else behind your back.
 
-> **A person focus needs a channel to watch from.** Presence is channel-scoped: the server only tells you someone exists if you share a joined channel with them. `--focus=alice` with no `--channels` has nowhere to see her from, so the daemon joins `the-hall` to watch and says so in its log. Naming a channel you actually share with her is better — it's quieter, and it's where she'll be.
+> **A person focus needs a channel to watch from.** Presence is channel-scoped: the server only tells you someone exists if you share a joined channel with them. `--initial-focus=alice` with no `--channels` has nowhere to see her from, so the daemon joins `the-hall` to watch and says so in its log. Naming a channel you actually share with her is better — it's quieter, and it's where she'll be.
 
 ### Attaching a terminal, and giving it back
 
@@ -289,7 +289,7 @@ One terminal at a time: a second `aloo` while someone is attached says so and ex
 
 ### How voice is handled with nobody watching
 
-- **Sending:** hold `Ctrl+Alt+P` from any app, talk, release. It goes wherever `--focus` points — live, exactly as it would from a normal client.
+- **Sending:** hold `Ctrl+Alt+P` from any app, talk, release. It goes wherever `--initial-focus` points — live, exactly as it would from a normal client.
 - **Receiving:** voice messages play themselves the moment they arrive, which is the point of a walkie-talkie. That happens whether or not a terminal is attached, so you hear people without doing anything. `/mute-voice <nickname>` stops one person's from autoplaying; the message still arrives and can be replayed from the log later.
 - **The join sound.** A daemon has no screen, so it says one thing out loud: when someone arrives *where the focus currently is* and nobody is watching, it plays a short sound and posts a desktop notification ("alice is here"). It's deliberately the narrowest possible trigger — it exists for "nobody is looking, and something changed where a held shortcut would land". If a terminal is attached, you'd already see it, so it stays quiet.
 - **When something needs you**, like an OTP session failing to start or the daemon failing to come up, you get a bell and a notification with the reason — never a silent failure you discover later by pressing the shortcut and hearing nothing.
@@ -420,9 +420,11 @@ Every schedule restarts at the top of the hour — `every_1m` tries at :00, :01,
 
 Each attempt keeps trying for 30 seconds. Once you're connected, aloo leaves it alone and stops trying — until the connection drops, at which point it re-punches straight away (up to 5 times) if there's no server that could do it instead. You'll never end up with two connections to the same person; direct or server-arranged, there's only ever one.
 
-Once a link is up, the two of you swap a sealed note saying which channels you're in — so a punched peer isn't just a connection, they show up in the sidebar of any channel you both joined and work like anyone else there: messages, voice, push-to-talk, calls. That's what makes this useful with [background mode](#running-in-the-background): with aloo in the background and `--focus` on a shared channel (or on their nickname), `Ctrl+Alt+P` reaches them and their voice plays on your end, with no server in the middle. Attach a terminal whenever you like and they're already there.
+Once a link is up, the two of you swap a sealed note saying which channels you're in — so a punched peer isn't just a connection, they show up in the sidebar of any channel you both joined and work like anyone else there: messages, voice, push-to-talk, calls. That's what makes this useful with [background mode](#running-in-the-background): with aloo in the background and `--initial-focus` on a shared channel (or on their nickname), `Ctrl+Alt+P` reaches them and their voice plays on your end, with no server in the middle. Attach a terminal whenever you like and they're already there.
 
 Opening that note is also what proves who they are — it's checked against the key you already pinned for that nickname, so a punch on its own registers nobody and a stranger who finds your port can't pose as a friend. It does mean this only works with people you've talked to through a server at least once (that's where their key came from), on the default `pq_hybrid` identity.
+
+**If a punch succeeds but you have no key pinned for that name at all**, aloo asks before doing anything: "A connection was received directly to your public ip from an unknown nickname... Do you want to check which of your local keys matches this request?" Say yes and it runs a real check against every other `pq_hybrid` key you already hold — including one with an OTP session layered on top — never a guess, and if exactly one matches, offers to use it for the new name too. It never checks a pad-only pin this way, since that would mean running every one-time pad you hold against an unverified message. Nothing matching says so plainly, and declining either question costs nothing. Three genuinely failed checks from the same address, spread over at least two minutes within 10 hours, permanently blocks it — lift that yourself by editing `~/.aloo/banned_ips.log`. Never triggered for someone you never listed, or for anyone a server introduces.
 
 Two caveats. **Your client punches out from UDP port 7879 while this is on** — it's actively pinging the other side from that port, not just passively listening on it, and that's what gets through NAT with nothing to configure on your router: both of you punching at the same moment is what opens the path, not a forwarding rule. It can still fail against a stricter (symmetric) NAT or firewall, in which case forwarding that port — or picking a `direct_punch_port` you can forward — is the fallback. And **this opens a path, not a conversation**: aloo still needs to have learned that person's keys through a server at some point to encrypt anything to them.
 

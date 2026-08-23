@@ -9,9 +9,9 @@
 //! `working_dir` (`~/.aloo/otp/`) holding every contact's keychain
 //! together - never the app's own current directory.
 //!
-//! Verified directly against the installed binary (`otp v1.5.1`, newer than
-//! both the `otp --help` text originally read from source and the `v1.4.0`
-//! this module was last checked against): `--status <contact> --porcelain`
+//! Verified directly against the installed binary (`otp v1.7.0`, newer than
+//! both the `otp --help` text originally read from source and the `v1.5.1`
+//! this module was previously checked against): `--status <contact> --porcelain`
 //! prints stable `key=value` lines even on some non-zero exit codes (`4`
 //! redelivery pending, `5` delivery confirmation outstanding, `6` key
 //! material rolled back), so `status` below treats any exit code other than

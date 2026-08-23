@@ -31,7 +31,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::ErrorKind;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -165,6 +165,11 @@ struct DirectPunch {
     /// `direct_punch_to` - the only thing that identifies us to them.
     own_nick: String,
     targets: HashMap<String, DirectTarget>,
+    /// Permanent, on-disk IP bans for the unknown-nickname direct-punch flow
+    /// (`docs/PROTOCOL.md` §7.1.5) - loaded here rather than at `bind` time
+    /// so a session that never turns `direct_punch` on never touches
+    /// `~/.aloo/banned_ips.log` at all.
+    ip_bans: crate::client::ip_ban::IpBanList,
 }
 
 /// The local `UserId` a peer known only by nickname is filed under.
@@ -1893,7 +1898,19 @@ impl PeerLinkManager {
                 (t.nickname, target)
             })
             .collect();
-        self.direct = Some(DirectPunch { own_nick, targets });
+        let ip_ban_path = crate::client::ip_ban::default_path();
+        let ip_bans = crate::client::ip_ban::IpBanList::load(&ip_ban_path).unwrap_or_else(|e| {
+            crate::log_warn!(
+                "could not read {}: {e} (starting with no bans remembered)",
+                ip_ban_path.display()
+            );
+            crate::client::ip_ban::IpBanList::new_empty(ip_ban_path)
+        });
+        self.direct = Some(DirectPunch {
+            own_nick,
+            targets,
+            ip_bans,
+        });
     }
 
     /// Files a direct target's link under the `UserId` the server actually
@@ -2260,6 +2277,11 @@ impl PeerLinkManager {
         let Some(direct) = self.direct.as_ref() else {
             return;
         };
+        // Permanently banned - dropped before any nickname is even looked
+        // at, regardless of what it claims (`client::ip_ban`).
+        if direct.ip_bans.is_banned(addr.ip()) {
+            return;
+        }
         let (own_nick, peer, idle) = match direct.targets.get(from) {
             Some(target) => (
                 direct.own_nick.clone(),
@@ -2453,6 +2475,33 @@ impl PeerLinkManager {
         match self.links.get(&peer).map(|l| &l.state) {
             Some(PeerLinkState::Active { addr, .. }) => Some(*addr),
             _ => None,
+        }
+    }
+
+    /// Whether `ip` is on the permanent ban list (`client::ip_ban`) - the
+    /// same check `on_direct_ping` already runs, exposed for a caller (the
+    /// unknown-nickname direct-punch flow, `docs/PROTOCOL.md` §7.1.5) that
+    /// needs to know without sending anything. `false` with `direct_punch`
+    /// off - there is no ban list to consult when there is no direct-punch
+    /// subsystem for it to protect.
+    pub fn is_ip_banned(&self, ip: IpAddr) -> bool {
+        self.direct.as_ref().is_some_and(|d| d.ip_bans.is_banned(ip))
+    }
+
+    /// Records one genuine failed check (the user agreed to check local
+    /// keys, the scan found no match) against `ip`, banning it once enough
+    /// have landed - see `client::ip_ban::IpBanList::record_failed_check`
+    /// for the exact timing rule. A no-op returning `NotYet` with
+    /// `direct_punch` off - unreachable in practice, since the flow that
+    /// calls this only ever runs for a `direct_punch_to` nickname.
+    pub fn record_direct_proof_failure(
+        &mut self,
+        ip: IpAddr,
+        now_unix: u64,
+    ) -> crate::client::ip_ban::BanOutcome {
+        match self.direct.as_mut() {
+            Some(direct) => direct.ip_bans.record_failed_check(ip, now_unix),
+            None => crate::client::ip_ban::BanOutcome::NotYet,
         }
     }
 

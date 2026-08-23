@@ -15,13 +15,15 @@ use crate::BoxError;
 use crate::client::connect::ResolvedIdentity;
 use crate::client::file_transfer;
 use crate::client::idstore;
+use crate::client::ip_ban::BanOutcome;
 use crate::client::netstats;
 use crate::client::p2p::{self, P2pEvent, P2pOutbound, PeerLinkManager};
 use crate::client::reconnect::{ServerEvent, ServerLinkState};
 use crate::client::rekey;
 use crate::client::sysstats;
 use crate::client::tui::ui::{
-    self, IdentityCase, PendingFileOffer, UiAction, UiState, VoiceTarget,
+    self, IdentityCase, PendingFileOffer, RecoveredProof, UiAction, UiState,
+    UnknownPeerStage, UnverifiedDirectProof, VoiceTarget,
 };
 use crate::client::voice;
 use crate::client::voice_call;
@@ -698,7 +700,7 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
     let mut ui_state = UiState::new(display_name);
     // With no server there is nothing to join a channel *through*, so the
     // channels named in settings are simply the ones this client is in.
-    // Seeded before the session starts so a `--focus channel:x` daemon
+    // Seeded before the session starts so a `--initial-focus channel:x` daemon
     // finds its channel already there, and so the first `ChannelPresence`
     // we send a peer is already correct.
     ui_state.serverless = server_state.is_serverless();
@@ -1391,6 +1393,132 @@ async fn handle_ui_action(
             // any) is left exactly as it was, so this is never persisted
             // (docs/PROTOCOL.md §12).
             ui_state.resolve_identity_reject(peer);
+        }
+        UiAction::CheckUnknownPeerIdentity(peer) => {
+            let Some(review) = ui_state.unknown_peer_reviews.get(&peer).cloned() else {
+                return Ok(());
+            };
+            match scan_pinned_keys_for_match(
+                session,
+                ui_state,
+                peer,
+                &review.requested_nickname,
+                &review.proof,
+            )
+            .await
+            {
+                Some(scan_match) => {
+                    ui_state.advance_to_confirm_match(
+                        peer,
+                        scan_match.nickname,
+                        scan_match.key_der,
+                        scan_match.recovered,
+                    );
+                }
+                None => {
+                    ui_state.resolve_unknown_peer_review(peer);
+                    // Only a genuinely completed, failed check counts toward
+                    // a ban - declining the popup never reaches here at all.
+                    if let BanOutcome::Banned =
+                        session.peer_link.record_direct_proof_failure(review.source_addr.ip(), now_unix())
+                    {
+                        crate::log_warn!(
+                            "banned {} after repeated unproven direct-punch checks",
+                            review.source_addr.ip()
+                        );
+                    }
+                    // `push_status_notice`, not `push_notice`: `audio_error`
+                    // has no render call site anywhere in this codebase (see
+                    // `push_status_notice`'s own doc) - this is the one
+                    // surface that is actually shown.
+                    ui_state.push_status_notice(
+                        "Impossible to establish communication with the user without a key. \
+                         Requires a server for key exchange or manually exchanging the keys"
+                            .to_string(),
+                        false,
+                    );
+                }
+            }
+        }
+        UiAction::DeclineUnknownPeerIdentity(peer) => {
+            // No scan ever ran, so no ban-counting either - declining costs
+            // nothing, and a later, distinct proof asks again from scratch.
+            ui_state.resolve_unknown_peer_review(peer);
+        }
+        UiAction::ConfirmUnknownPeerKey(peer) => {
+            let Some(review) = ui_state.unknown_peer_reviews.get(&peer).cloned() else {
+                return Ok(());
+            };
+            let UnknownPeerStage::ConfirmMatch {
+                matched_nickname,
+                matched_key_der,
+                recovered,
+            } = review.stage
+            else {
+                return Ok(());
+            };
+            session
+                .id_store
+                .check_and_pin(&review.requested_nickname, &matched_key_der);
+            if let Err(e) = session.id_store.save() {
+                crate::log_warn!("failed to save id_store: {e}");
+            }
+            ui_state.resolve_unknown_peer_review(peer);
+            match recovered {
+                RecoveredProof::ChannelPresence { plaintext } => {
+                    let info = direct_peer_identity(&session.id_store, &review.requested_nickname)
+                        .expect("just pinned above");
+                    if let Some(action) = apply_channel_presence_plaintext(
+                        session,
+                        ui_state,
+                        peer,
+                        &review.requested_nickname,
+                        &info,
+                        &plaintext,
+                    ) {
+                        Box::pin(handle_ui_action(action, wr, ui_state, session)).await?;
+                    }
+                }
+                RecoveredProof::OtpMessage {
+                    plaintext,
+                    ack_proof,
+                    contact_name,
+                } => {
+                    let info = direct_peer_identity(&session.id_store, &review.requested_nickname)
+                        .expect("just pinned above");
+                    let UnverifiedDirectProof::OtpMessage {
+                        channel,
+                        seq,
+                        envelope,
+                        ..
+                    } = review.proof
+                    else {
+                        return Ok(());
+                    };
+                    crate::client::otp::apply_otp_message(
+                        session,
+                        ui_state,
+                        channel,
+                        peer,
+                        matched_nickname,
+                        seq,
+                        &info,
+                        &contact_name,
+                        envelope.content,
+                        plaintext,
+                        ack_proof,
+                    )
+                    .await?;
+                }
+            }
+        }
+        UiAction::DeclineUnknownPeerKey(peer) => {
+            // This specific match is discarded; a later, distinct proof
+            // re-triggers the whole flow from Initial and scans again
+            // cleanly (the one already spent - real key/replay state
+            // consumed by the scan itself - cannot be un-spent, but nothing
+            // further happens with it).
+            ui_state.resolve_unknown_peer_review(peer);
         }
         UiAction::AcceptFileOffer { from, stream_id } => {
             accept_file_offer(wr, ui_state, session, from, stream_id).await?;
@@ -2120,7 +2248,7 @@ fn on_daemon_peer_appeared(
     session.daemon_plan.as_ref()?;
 
     // The sound is decided against the *live* focus, so it is evaluated
-    // before anything that gates on the plan's `--focus` - the two differ
+    // before anything that gates on the plan's `--initial-focus` - the two differ
     // exactly when someone has attached and moved, which is the case this
     // rule exists for. See `DaemonPlan::should_play_joined_chime`.
     let announce = crate::client::daemon::DaemonPlan::should_play_joined_chime(
@@ -3257,13 +3385,44 @@ fn on_channel_presence(
         return None;
     }
     let nickname = session.peer_link.direct_nickname_of(from)?;
-    let info = direct_peer_identity(&session.id_store, &nickname)?;
+    let Some(info) = direct_peer_identity(&session.id_store, &nickname) else {
+        // A `direct_punch_to` target with no key pinned at all - offer to
+        // check whether this proof matches something already pinned under
+        // a different nickname, instead of silently staying a
+        // transport-only link forever (docs/PROTOCOL.md §7.1.5). Never
+        // reached for a server-introduced peer: `direct_nickname_of`
+        // already returned above for anyone not also a `direct_punch_to`
+        // target of ours.
+        let addr = session.peer_link.active_addr(from)?;
+        ui_state.push_unknown_peer_review(
+            from,
+            nickname,
+            crate::client::tui::ui::UnverifiedDirectProof::ChannelPresence { envelope },
+            addr,
+        );
+        return None;
+    };
     let plaintext = decrypt_own_envelope(&envelope, from, &info, None, session)?;
+    apply_channel_presence_plaintext(session, ui_state, from, &nickname, &info, &plaintext)
+}
+
+/// The registration/membership half of `on_channel_presence`, factored out
+/// so a confirmed unknown-peer match (`handle_ui_action`'s
+/// `ConfirmUnknownPeerKey` arm) can finish it from the plaintext the scan
+/// already recovered, without decrypting a second time.
+fn apply_channel_presence_plaintext(
+    session: &mut SessionState,
+    ui_state: &mut UiState,
+    from: UserId,
+    nickname: &str,
+    info: &UserInfo,
+    plaintext: &[u8],
+) -> Option<UiAction> {
     // Only once they have proved who they are: seeding keys for an
     // unauthenticated claim would let anyone reaching the port decide what
     // this client encrypts to under that nickname.
-    seed_direct_peer_keys(session, from, &info);
-    let theirs: Vec<String> = proto::decode(&plaintext).ok()?;
+    seed_direct_peer_keys(session, from, info);
+    let theirs: Vec<String> = proto::decode(plaintext).ok()?;
 
     let ours: Vec<String> = ui_state
         .channels
@@ -3288,18 +3447,18 @@ fn on_channel_presence(
     for channel in &join {
         // The same entry point `ServerMessage::UserJoined` uses: from here
         // on nothing downstream - the sidebar, channel sends, voice, the
-        // call roster, `--focus` - can tell this peer apart from one a
+        // call roster, `--initial-focus` - can tell this peer apart from one a
         // server introduced, which is the entire point.
         ui_state.on_user_joined(channel, info.clone());
         // And the same daemon hooks, so a punched peer arriving while
         // nobody is watching still rings, notifies, and takes the focus it
         // was started with.
         if action.is_none() {
-            action = on_daemon_peer_appeared(ui_state, session, from, &nickname, Some(channel));
+            action = on_daemon_peer_appeared(ui_state, session, from, nickname, Some(channel));
         }
     }
     // A peer we share no channel with is still reachable as a DM - that is
-    // what `direct_punch_to` on its own buys, and what `--focus <nickname>`
+    // what `direct_punch_to` on its own buys, and what `--initial-focus <nickname>`
     // addresses - so they are registered either way, and the daemon hooks
     // still run for them. Without this a DM-only pair got a working link
     // and nothing else: no focus placed, no chime, and - the one that
@@ -3307,12 +3466,146 @@ fn on_channel_presence(
     // focused peer *appearing* is supposed to trigger.
     if shared.is_empty() {
         let first_sighting = !ui_state.known_users.contains_key(&from);
-        ui_state.known_users.insert(from, info);
+        ui_state.known_users.insert(from, info.clone());
         if first_sighting {
-            action = on_daemon_peer_appeared(ui_state, session, from, &nickname, None);
+            action = on_daemon_peer_appeared(ui_state, session, from, nickname, None);
         }
     }
     action
+}
+
+/// What `scan_pinned_keys_for_match` found: which other pinned nickname's
+/// key genuinely opened the proof, its raw key bytes (to pin under the new
+/// nickname), and what was already recovered doing it - so the caller never
+/// decrypts a second time.
+struct ScanMatch {
+    nickname: String,
+    key_der: Vec<u8>,
+    recovered: crate::client::tui::ui::RecoveredProof,
+}
+
+/// Tries `proof` (received under `requested_nickname`, over the link filed
+/// as `from`) against every *other* pinned nickname's key, stopping at the
+/// first genuine cryptographic success (`docs/PROTOCOL.md` §7.1.5). Both
+/// proof kinds are only ever tried against a candidate whose pin decodes as
+/// a `pq_hybrid` keybundle:
+///
+/// - a `ChannelPresence` proof, via the ordinary envelope-open
+///   (`decrypt_own_envelope`) - nothing to seal an envelope to otherwise;
+/// - an `OtpMessage` proof, via only the *outer* `pq_hybrid` seal
+///   (`otp::recover_padded_otp_bytes`'s `PqWrapped` branch) - covering a
+///   peer who has a real identity *and* an OTP session layered on top of
+///   it. A pad-only (`Direct`-framing) sender is deliberately never
+///   scanned for: that would mean running every locally-held one-time pad's
+///   own decrypt against a ciphertext from an unverified source, one pad at
+///   a time, rather than a single cheap signature check - a materially
+///   different (and unwanted) cost merely to identify who is speaking.
+///
+/// A wrong candidate has no observable side effect either way: both checks
+/// are ordinary `pq_hybrid` signature verifications that fail before
+/// `session.replay.accept` is ever reached, so trying several candidates in
+/// a row is safe, and at most one can ever succeed. The pad itself is only
+/// ever touched once, by `otp::finish_opening_otp_envelope`, for the one
+/// candidate the outer seal already proved correct.
+async fn scan_pinned_keys_for_match(
+    session: &mut SessionState,
+    ui_state: &mut UiState,
+    from: UserId,
+    requested_nickname: &str,
+    proof: &crate::client::tui::ui::UnverifiedDirectProof,
+) -> Option<ScanMatch> {
+    use crate::client::tui::ui::UnverifiedDirectProof;
+
+    let candidates: Vec<(String, Vec<u8>)> = session
+        .id_store
+        .nicknames()
+        .into_iter()
+        .filter(|n| n != requested_nickname)
+        .filter_map(|n| session.id_store.get(&n).map(|k| (n.clone(), k.to_vec())))
+        .filter(|(_, key_der)| crypto::pq::fingerprint_of_encoded(key_der).is_some())
+        .collect();
+
+    for (nickname, key_der) in candidates {
+        let info = UserInfo {
+            id: from,
+            name: nickname.clone(),
+            public_key_der: key_der.clone(),
+            key_mode: KeyMode::PqHybrid,
+        };
+        match proof {
+            UnverifiedDirectProof::ChannelPresence { envelope } => {
+                if let Some(plaintext) = decrypt_own_envelope(envelope, from, &info, None, session) {
+                    return Some(ScanMatch {
+                        nickname,
+                        key_der,
+                        recovered: crate::client::tui::ui::RecoveredProof::ChannelPresence {
+                            plaintext,
+                        },
+                    });
+                }
+            }
+            UnverifiedDirectProof::OtpMessage {
+                envelope,
+                seq,
+                channel,
+                ..
+            } if matches!(
+                envelope.content,
+                Content::Text | Content::OtpEndSession | Content::OtpEndSessionAck
+            ) =>
+            {
+                let Some(padded) =
+                    crate::client::otp::recover_padded_otp_bytes(session, from, &info, envelope)
+                else {
+                    continue;
+                };
+                // Proven correct by the outer seal above - only now derive
+                // the contact name and spend real pad bytes, exactly once.
+                let Some(contact_name) =
+                    crate::client::otp::contact_name_for_peer(session, &key_der)
+                else {
+                    continue;
+                };
+                if !session.otp_store.is_next_expected(&contact_name, *seq) {
+                    continue;
+                }
+                let Some((plaintext, ack_proof)) = crate::client::otp::finish_opening_otp_envelope(
+                    session,
+                    ui_state,
+                    from,
+                    requested_nickname,
+                    &contact_name,
+                    channel.as_deref(),
+                    &padded,
+                )
+                .await
+                else {
+                    continue;
+                };
+                if !session.otp_store.record_received(&contact_name, *seq) {
+                    continue;
+                }
+                return Some(ScanMatch {
+                    nickname,
+                    key_der,
+                    recovered: crate::client::tui::ui::RecoveredProof::OtpMessage {
+                        plaintext,
+                        ack_proof,
+                        contact_name,
+                    },
+                });
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn send_device_id_announce(session: &mut SessionState, ui_state: &UiState, peer: UserId) {

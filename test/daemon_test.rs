@@ -111,7 +111,7 @@ fn a_channel_round_trips_through_its_settings_line() {
 }
 
 // ---------------------------------------------------------------------
-// --focus parsing
+// --initial-focus parsing
 // ---------------------------------------------------------------------
 
 /// @requirement TB-218
@@ -270,7 +270,7 @@ fn a_channel_focus_never_invites_an_otp_session() {
 }
 
 // ---------------------------------------------------------------------
-// --focus is a starting position, not a standing instruction
+// --initial-focus is a starting position, not a standing instruction
 // ---------------------------------------------------------------------
 
 /// @requirement AC-200
@@ -333,12 +333,12 @@ fn a_focus_still_waiting_for_its_peer_has_not_been_used_up() {
 }
 
 // ---------------------------------------------------------------------
-// Restarting: --focus applies again on a fresh run
+// Restarting: --initial-focus applies again on a fresh run
 // ---------------------------------------------------------------------
 
 /// The other half of `should_place_focus`. The latch lives in the plan,
 /// which is built fresh on every start and never persisted - so stopping
-/// the daemon and running it again with `--focus` puts the focus back
+/// the daemon and running it again with `--initial-focus` puts the focus back
 /// where the flag says, even though the previous run had moved on.
 /// @requirement AC-200
 #[test]
@@ -351,7 +351,7 @@ fn a_restart_places_the_focus_again() {
     let fresh_run = dm_plan("alice", false);
     assert!(
         fresh_run.should_place_focus(),
-        "a fresh start must honour --focus again"
+        "a fresh start must honour --initial-focus again"
     );
 }
 
@@ -614,7 +614,7 @@ fn a_daemon_joins_exactly_the_channels_it_was_given() {
 fn a_focused_channel_is_joined_even_if_it_was_not_listed() {
     let flags = DaemonFlags {
         channels: vec!["team".into()],
-        focus: Some("channel:ops".into()),
+        initial_focus: Some("channel:ops".into()),
         ..flags_with_host()
     };
     let config = DaemonConfig::resolve(&flags, &Settings::default(), &empty_cache()).unwrap();
@@ -630,7 +630,7 @@ fn a_focused_channel_is_joined_even_if_it_was_not_listed() {
 #[test]
 fn a_dm_focus_with_no_channels_gets_a_discovery_channel() {
     let flags = DaemonFlags {
-        focus: Some("alice".into()),
+        initial_focus: Some("alice".into()),
         ..flags_with_host()
     };
     let config = DaemonConfig::resolve(&flags, &Settings::default(), &empty_cache()).unwrap();
@@ -650,7 +650,7 @@ fn a_dm_focus_with_no_channels_gets_a_discovery_channel() {
 fn a_dm_focus_with_channels_does_not_get_the_hall() {
     let flags = DaemonFlags {
         channels: vec!["team".into()],
-        focus: Some("alice".into()),
+        initial_focus: Some("alice".into()),
         ..flags_with_host()
     };
     let config = DaemonConfig::resolve(&flags, &Settings::default(), &empty_cache()).unwrap();
@@ -669,13 +669,13 @@ fn a_bad_channel_or_focus_is_reported_rather_than_ignored() {
     assert!(DaemonConfig::resolve(&bad_channel, &Settings::default(), &empty_cache()).is_err());
 
     let bad_focus = DaemonFlags {
-        focus: Some("channel:".into()),
+        initial_focus: Some("channel:".into()),
         ..flags_with_host()
     };
     assert!(DaemonConfig::resolve(&bad_focus, &Settings::default(), &empty_cache()).is_err());
 
     let otp_on_channel = DaemonFlags {
-        focus: Some("channel:ops".into()),
+        initial_focus: Some("channel:ops".into()),
         otp: true,
         ..flags_with_host()
     };
@@ -703,7 +703,7 @@ fn a_resolved_configuration_round_trips_through_the_settings_file() {
         nickname: Some("david".into()),
         server_pwd: Some("hunter2".into()),
         channels: vec!["team,ops:s3cret".into()],
-        focus: Some("alice".into()),
+        initial_focus: Some("alice".into()),
         otp: true,
         ..Default::default()
     };
@@ -720,7 +720,7 @@ fn a_resolved_configuration_round_trips_through_the_settings_file() {
     assert_eq!(again.password, config.password);
     assert_eq!(again.ssl, config.ssl);
     assert_eq!(again.channels, config.channels);
-    assert_eq!(again.focus, config.focus);
+    assert_eq!(again.initial_focus, config.initial_focus);
 
     std::fs::remove_file(&path).ok();
 }
@@ -808,7 +808,7 @@ fn a_serverless_dm_focus_does_not_get_a_discovery_channel() {
     let flags = DaemonFlags {
         no_server: true,
         nickname: Some("omar".into()),
-        focus: Some("peter".into()),
+        initial_focus: Some("peter".into()),
         ..DaemonFlags::default()
     };
     let config = DaemonConfig::resolve(&flags, &Settings::default(), &empty_cache()).unwrap();
