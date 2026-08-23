@@ -11,7 +11,8 @@ use aloo::client::p2p::LinkStatus;
 use aloo::client::reconnect::{RECONNECT_MAX_DELAY, ServerLinkState, delay_after};
 use aloo::client::tui::channel::messages_start_col;
 use aloo::proto::{ChannelKind, ClientMessage, ServerMessage, UserId};
-use aloo::server::AuthConfig;
+use aloo::server::ServerOptions;
+use aloo::server::users_registry::UsersRegistry;
 
 use crate::steps::ui_common::id_for;
 use crate::support::{find_text_start, header_row, ui_buffer, ui_rows_wide};
@@ -126,10 +127,11 @@ async fn state_is_first(w: &mut AlooWorld) {
 #[then("the channel selector starts where the message list starts")]
 async fn selector_aligned(w: &mut AlooWorld) {
     let buffer = ui_buffer(w.ui_ref(), WIDE, 30);
-    // The selector's kind icon is its first cell; one column past the
-    // message pane's own edge is where the messages inside it begin, so
-    // the two columns of text line up.
-    let (x, _) = find_text_start(&buffer, "\u{1F30D}");
+    // The selector's own `#name` is its first cell (a public channel
+    // carries no kind icon); one column past the message pane's own edge
+    // is where the messages inside it begin, so the two columns of text
+    // line up.
+    let (x, _) = find_text_start(&buffer, "#general");
     assert_eq!(
         x,
         messages_start_col(WIDE) + 1,
@@ -191,6 +193,29 @@ fn scenario_keybundle(nickname: &str) -> aloo::client::connect::MyKeySelection {
     }
 }
 
+fn password_for(nickname: &str) -> String {
+    format!("pw-{nickname}")
+}
+
+/// Registers `nickname` in `w`'s server registry (creating a scratch one
+/// if this is the scenario's first) if it is not there yet.
+fn ensure_registered(w: &mut AlooWorld, nickname: &str) {
+    let users = w.server_users.get_or_insert_with(|| {
+        let dir = std::env::temp_dir().join(format!(
+            "aloo-cucumber-reconnect-users-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        UsersRegistry::open_with_iterations(dir, 100).unwrap()
+    });
+    if !users.is_registered(nickname) {
+        users.register_manual(nickname, &password_for(nickname)).unwrap();
+    }
+}
+
 fn request_for(
     addr: std::net::SocketAddr,
     nickname: &str,
@@ -198,19 +223,19 @@ fn request_for(
     aloo::client::connect::ConnectRequest {
         host: addr.ip().to_string(),
         port: addr.port(),
+        ssl: false,
+        ssl_ca: None,
         nickname: nickname.to_string(),
-        server_key: aloo::client::connect::ServerKeySelection::None,
+        password: password_for(nickname),
         my_key: scenario_keybundle(nickname),
-        id_store_path: std::env::temp_dir().join(format!(
-            "aloo-cucumber-reconnect-idstore-{}-{nickname}",
-            std::process::id()
-        )),
+        activation_code: None,
     }
 }
 
 #[then(expr = "reconnecting as {string} is refused while that connection holds the name")]
 async fn reconnect_refused(w: &mut AlooWorld, nickname: String) {
     let addr = w.addr.expect("no server running");
+    ensure_registered(w, &nickname);
     let outcome =
         aloo::client::connect::connect_with_reconnect(&request_for(addr, &nickname)).await;
     let err = match outcome {
@@ -240,21 +265,32 @@ async fn refusal_is_retryable(w: &mut AlooWorld) {
 async fn reaping_server(w: &mut AlooWorld, seconds: u64) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let users = UsersRegistry::open_with_iterations(
+        std::env::temp_dir().join(format!(
+            "aloo-cucumber-reconnect-users-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )),
+        100,
+    )
+    .unwrap();
+    let options =
+        ServerOptions::new(users.clone()).with_heartbeat_timeout(Duration::from_secs(seconds));
     tokio::spawn(async move {
-        let _ = aloo::server::serve_with_heartbeat_timeout(
-            listener,
-            AuthConfig::None,
-            Duration::from_secs(seconds),
-        )
-        .await;
+        let _ = aloo::server::serve(listener, options).await;
     });
     w.addr = Some(addr);
+    w.server_users = Some(users);
     w.reap_after = Some(Duration::from_secs(seconds));
 }
 
 #[given(expr = "{word} is running a session on it, joined to {string}")]
 async fn session_joined(w: &mut AlooWorld, nickname: String, channel: String) {
     let addr = w.addr.expect("no server running");
+    ensure_registered(w, &nickname);
     let request = request_for(addr, &nickname);
     let (events, sink, you, identity, server_addr) =
         aloo::client::connect::connect_with_reconnect(&request)
@@ -262,7 +298,8 @@ async fn session_joined(w: &mut AlooWorld, nickname: String, channel: String) {
             .expect("the first connection is an ordinary one");
 
     let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel();
-    let id_store = aloo::client::idstore::IdStore::new_empty(request.id_store_path.clone());
+    let id_store =
+        aloo::client::idstore::IdStore::new_empty(aloo::client::idstore::default_path());
     let plan = aloo::client::daemon::DaemonPlan::new(
         vec![aloo::client::daemon::DaemonChannel {
             name: channel,
@@ -304,7 +341,8 @@ async fn server_gives_up(w: &mut AlooWorld, _nickname: String) {
 async fn late_arrival_sees(w: &mut AlooWorld, newcomer: String, who: String, channel: String) {
     let addr = w.addr.expect("no server running");
     let mut stream = aloo::control::ControlEndpoint::new(TcpStream::connect(addr).await.unwrap());
-    handshake(&mut stream, &newcomer).await;
+    ensure_registered(w, &newcomer);
+    handshake(&mut stream, &newcomer, &password_for(&newcomer)).await;
     stream
         .send(&ClientMessage::JoinChannel {
             name: channel.clone(),
@@ -342,7 +380,11 @@ async fn late_arrival_sees(w: &mut AlooWorld, newcomer: String, who: String, cha
 }
 
 /// A plain client handshake, enough to watch what the server says.
-async fn handshake(stream: &mut aloo::control::ControlEndpoint<TcpStream>, nickname: &str) {
+async fn handshake(
+    stream: &mut aloo::control::ControlEndpoint<TcpStream>,
+    nickname: &str,
+    password: &str,
+) {
     let hello: ServerMessage = stream.recv().await.unwrap().unwrap();
     let ServerMessage::Hello { control, .. } = hello else {
         panic!("expected Hello");
@@ -354,13 +396,16 @@ async fn handshake(stream: &mut aloo::control::ControlEndpoint<TcpStream>, nickn
         .unwrap();
     stream.enable(keys);
     stream
-        .send(&ClientMessage::Auth(aloo::proto::AuthResponse::None))
+        .send(&ClientMessage::Auth {
+            nickname: nickname.to_string(),
+            password: password.to_string(),
+        })
         .await
         .unwrap();
-    let _auth: ServerMessage = stream.recv().await.unwrap().unwrap();
+    let auth: ServerMessage = stream.recv().await.unwrap().unwrap();
+    assert!(matches!(auth, ServerMessage::AuthResult { ok: true, .. }), "{auth:?}");
     stream
         .send(&ClientMessage::Identify {
-            display_name: nickname.to_string(),
             public_key_der: vec![1, 2, 3],
             key_mode: aloo::proto::KeyMode::PqHybrid,
         })

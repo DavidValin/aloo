@@ -655,6 +655,12 @@ pub async fn send_control(socket: &Path, message: AttachMessage) -> Result<(), B
 // Configuration
 // ---------------------------------------------------------------------
 
+/// What a daemon with a server but no password is refused with
+/// (`run`): the one credential a login needs, and nobody is there to
+/// type it.
+pub const NO_PASSWORD_ERROR: &str = "no password for the server - pass --server-pwd, or set \
+                                     daemon_server_password in ~/.aloo/settings";
+
 /// Everything a daemon needs to connect and place itself, once flags,
 /// `~/.aloo/settings` and the connect cache have been folded together.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -662,9 +668,13 @@ pub struct DaemonConfig {
     pub host: String,
     pub port: u16,
     pub nickname: String,
-    pub server_key: crate::client::connect::ServerKeySelection,
+    /// The nickname's password (docs/PROTOCOL.md §5.1) - the one
+    /// credential a login needs, and a daemon has nobody there to type
+    /// it, so it comes from `--server-pwd` or `daemon_server_password`.
+    pub password: String,
+    /// Dial over TLS (`--ssl` / `daemon_ssl`).
+    pub ssl: bool,
     pub my_key: crate::client::connect::MyKeySelection,
-    pub id_store_path: PathBuf,
     /// The channels to join, in order. Never includes `the-hall` unless
     /// it was asked for - the whole point of daemon mode is to be in the
     /// places that matter rather than the default one.
@@ -687,7 +697,7 @@ pub struct DaemonFlags {
     pub port: Option<u16>,
     pub nickname: Option<String>,
     pub server_pwd: Option<String>,
-    pub server_key_file: Option<PathBuf>,
+    pub ssl: bool,
     pub my_key_prefix: Option<String>,
     pub channels: Vec<String>,
     pub focus: Option<String>,
@@ -754,14 +764,17 @@ impl DaemonConfig {
             .or_else(|| settings.connect_nickname.clone())
             .unwrap_or_else(local_display_name);
 
-        let server_key = match (&flags.server_pwd, &flags.server_key_file) {
-            (Some(_), Some(_)) => {
-                return Err("--server-pwd and --server-key are mutually exclusive".to_string());
-            }
-            (Some(pw), None) => crate::client::connect::ServerKeySelection::Password(pw.clone()),
-            (None, Some(file)) => crate::client::connect::ServerKeySelection::Rsa(file.clone()),
-            (None, None) => settings.daemon_server_key(),
-        };
+        let no_server = flags.no_server || settings.daemon_no_server;
+        // Empty when nothing names one - a serverless daemon has nothing
+        // to log in to, and for one with a server `run` refuses to start
+        // before dialling rather than here, so a configuration can still
+        // be resolved and shown without a password.
+        let password = flags
+            .server_pwd
+            .clone()
+            .or_else(|| settings.daemon_server_password.clone())
+            .unwrap_or_default();
+        let ssl = flags.ssl || settings.daemon_ssl;
 
         let my_key = resolve_my_key(flags, settings, cached)?;
 
@@ -819,12 +832,12 @@ impl DaemonConfig {
             host,
             port,
             nickname,
-            server_key,
+            password,
+            ssl,
             my_key,
-            id_store_path: crate::client::idstore::default_path(),
             channels,
             focus,
-            no_server: flags.no_server || settings.daemon_no_server,
+            no_server,
         })
     }
 
@@ -836,10 +849,24 @@ impl DaemonConfig {
             host: self.host.clone(),
             port: self.port,
             nickname: self.nickname.clone(),
-            server_key: self.server_key.clone(),
+            password: self.password.clone(),
+            ssl: self.ssl,
+            ssl_ca: None,
             my_key: self.my_key.clone(),
-            id_store_path: self.id_store_path.clone(),
+            activation_code: None,
         }
+    }
+
+    /// Whatever `run` needs true before it touches a socket: a server
+    /// configuration with nothing to log in with is refused outright
+    /// rather than dialling in with an empty password. Pure and
+    /// side-effect-free so a test (or a scenario) can check it without
+    /// spinning up the daemon's socket and single-instance lock.
+    pub fn ensure_startable(&self) -> Result<(), String> {
+        if !self.no_server && self.password.is_empty() {
+            return Err(NO_PASSWORD_ERROR.to_string());
+        }
+        Ok(())
     }
 
     /// Writes this configuration back to `~/.aloo/settings` so the next
@@ -868,7 +895,10 @@ impl DaemonConfig {
             s.daemon_channels = channels;
             s.daemon_focus = focus;
             s.daemon_otp = otp;
-            s.set_daemon_server_key(&self.server_key);
+            if !self.password.is_empty() {
+                s.daemon_server_password = Some(self.password.clone());
+            }
+            s.daemon_ssl = self.ssl;
             s.set_daemon_my_key(&self.my_key);
         })
     }
@@ -1124,6 +1154,7 @@ pub async fn run(
         tokio::sync::mpsc::UnboundedReceiver<crate::client::global_ptt::GlobalPttEvent>,
     >,
 ) -> Result<(), BoxError> {
+    config.ensure_startable()?;
     let instance =
         SingleInstance::acquire(daemon_ipc::socket_path(), daemon_ipc::pid_path()).await?;
     let listener = daemon_ipc::bind_listener(&daemon_ipc::socket_path())?;
@@ -1136,7 +1167,15 @@ pub async fn run(
         crate::log_warn!("could not persist daemon settings to ~/.aloo/settings ({e})");
     }
 
-    let request = config.to_connect_request();
+    let mut request = config.to_connect_request();
+    // The extra trusted roots for `ssl` live only in settings
+    // (`connect_ssl_ca`), read here the same way the connect popup's path
+    // reads them - never persisted as part of the daemon's own keys.
+    request.ssl_ca = crate::settings::Settings::load_or_create(&crate::settings::default_path())
+        .ok()
+        .and_then(|s| s.connect_ssl_ca)
+        .as_deref()
+        .map(crate::platform::expand_tilde);
     // With `--no-server` there is nobody to hand us a `UserId`, no control
     // channel to open and no rendezvous to ask - only local key material
     // and the peers `direct_punch_to` names (docs/PROTOCOL.md §7.1.5). The
@@ -1188,8 +1227,8 @@ pub async fn run(
     }
 
     let id_store =
-        crate::client::idstore::IdStore::load(&request.id_store_path).unwrap_or_else(|_| {
-            crate::client::idstore::IdStore::new_empty(request.id_store_path.clone())
+        crate::client::idstore::IdStore::load(&crate::client::idstore::default_path()).unwrap_or_else(|_| {
+            crate::client::idstore::IdStore::new_empty(crate::client::idstore::default_path())
         });
     if hotkey_rx.is_none() {
         // Not fatal - the session is still worth running, and someone can

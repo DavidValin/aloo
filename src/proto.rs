@@ -222,25 +222,6 @@ pub enum ChannelJoinRejection {
     Banned,
 }
 
-/// What kind of `server_key` credential the server expects on connect.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum AuthKind {
-    None,
-    Password,
-    Rsa,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum AuthResponse {
-    None,
-    Password(String),
-    /// The auth challenge nonce, encrypted (in one or more OAEP blocks)
-    /// with the server's public key.
-    Rsa {
-        blocks: Vec<Vec<u8>>,
-    },
-}
-
 /// One message body (text, file, or voice), encrypted for a single
 /// recipient.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -343,12 +324,37 @@ pub enum ClientMessage {
     /// control channel on. Must be the client's first message; everything
     /// after it, in both directions, is sealed (`crate::control`).
     SecureChannel(crate::control::ControlAccept),
-    /// Answers the server's `Hello` challenge - the first message sent
-    /// *inside* the tunnel `SecureChannel` established.
-    Auth(AuthResponse),
-    /// Sent once auth succeeds: chosen display name and `my_key` public key.
+    /// The one way in (docs/PROTOCOL.md §5): the nickname this client
+    /// wants to be known as and that nickname's password, checked against
+    /// the server's users registry (`crate::server::users_registry`). The
+    /// first message sent *inside* the tunnel `SecureChannel` established,
+    /// so the password is never on the wire in the clear.
+    Auth {
+        nickname: String,
+        password: String,
+    },
+    /// Answers an `AuthResult { activation_pending: true }` (§5.2): the
+    /// activation code the server emailed at registration. Accepted only
+    /// at that exact point in the handshake, and only once per connection
+    /// - a wrong code closes the connection, so guessing costs a
+    /// reconnect per attempt.
+    Activate {
+        code: String,
+    },
+    /// Asks the server to create an account (§5.3). Sent instead of `Auth`,
+    /// right after `SecureChannel`, and answered with `RegisterResult`
+    /// after which the server closes the connection either way - a
+    /// registration is never also a login. Refused outright on a server
+    /// whose `Hello` said `registration_open: false`.
+    Register {
+        nickname: String,
+        password: String,
+        email: String,
+    },
+    /// Sent once auth succeeds: this client's `my_key` public key. The
+    /// nickname is the one `Auth` already authenticated - there is nothing
+    /// to choose here any more.
     Identify {
-        display_name: String,
         public_key_der: Vec<u8>,
         key_mode: KeyMode,
     },
@@ -448,16 +454,31 @@ pub enum ClientMessage {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ServerMessage {
     Hello {
-        auth: AuthKind,
-        /// Present only when `auth == AuthKind::Rsa`: a random nonce the
-        /// client must encrypt with the server's public key and echo back.
-        challenge: Option<Vec<u8>>,
+        /// Whether this server accepts `Register` at all
+        /// (`server_allow_registration`, §5.3) - told up front so a client
+        /// can say "this server does not take registrations" before the
+        /// user types an email address for nothing.
+        registration_open: bool,
         /// Ephemeral encryption keys for this connection's control channel
-        /// (`crate::control`), signed with the server's long-term key when
-        /// it has one. The last thing either side sends in the clear.
+        /// (`crate::control`). The last thing either side sends in the
+        /// clear. Nothing vouches for them at this layer: authenticating
+        /// the server is TLS's job (`crate::server::ssl`).
         control: crate::control::ControlOffer,
     },
+    /// Answers `Auth` and `Activate`. `ok: false` with
+    /// `activation_pending: false` closes the connection; `ok: false` with
+    /// `activation_pending: true` means the credentials were right but the
+    /// account has not been activated yet - the client may send exactly
+    /// one `Activate` (§5.2), answered with another `AuthResult`.
     AuthResult {
+        ok: bool,
+        activation_pending: bool,
+        reason: Option<String>,
+    },
+    /// Answers `Register` (§5.3). The connection closes right after either
+    /// way. `ok: true` means the account exists and an activation code is
+    /// on its way to the email given.
+    RegisterResult {
         ok: bool,
         reason: Option<String>,
     },

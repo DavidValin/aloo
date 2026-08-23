@@ -8,12 +8,20 @@
 //!
 //! `Registry` holds the pure membership/routing logic and is unit tested
 //! directly, with no sockets involved. `serve`/`run` wire that logic to
-//! real TCP connections, plus a stateless UDP rendezvous socket
-//! (`udp_rendezvous_loop`) that helps a client learn its own public address
-//! for hole punching - the one place this module touches UDP at all, and
-//! it never sees anything from the punched links themselves.
+//! real TCP connections (optionally under TLS, `ssl`), plus a stateless
+//! UDP rendezvous socket (`udp_rendezvous_loop`) that helps a client learn
+//! its own public address for hole punching - the one place this module
+//! touches UDP at all, and it never sees anything from the punched links
+//! themselves.
+//!
+//! Who may log in is the `users_registry`'s business (accounts on disk,
+//! each with a nickname and a password); `activation` is the small web
+//! endpoint that turns an emailed code into an activated account.
 
+pub mod activation;
 pub mod mail;
+pub mod ssl;
+pub mod users_registry;
 
 use std::collections::{BTreeSet, HashMap};
 use std::net::{IpAddr, SocketAddr};
@@ -21,74 +29,82 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use rsa::RsaPrivateKey;
 use tokio::io::AsyncRead;
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::{Mutex, mpsc};
+use tokio_rustls::TlsAcceptor;
 
 use crate::crypto;
 use crate::p2p_proto::RendezvousMessage;
 use crate::proto::{
-    self, AuthKind, AuthResponse, ChannelInfo, ChannelJoinRejection, ChannelKind, ClientMessage,
-    KeyMode, ServerMessage, UserId, UserInfo,
+    self, ChannelInfo, ChannelJoinRejection, ChannelKind, ClientMessage, KeyMode, ServerMessage,
+    UserId, UserInfo,
 };
 use crate::validation;
+use users_registry::{AuthCheck, SmtpConfig, UsersRegistry};
 
-/// How the server was started: `--enc rsa <keyfile>`, `--password <pass>`,
-/// or neither (open access).
-pub enum AuthConfig {
-    None,
-    Password(String),
-    Rsa(Box<RsaPrivateKey>),
+/// Everything `serve` needs besides a socket: who may log in, whether
+/// anyone may register, and how. Built from `~/.aloo/settings` by
+/// `main.rs::run_server`; tests build one around a scratch registry.
+#[derive(Clone)]
+pub struct ServerOptions {
+    /// The accounts every `Auth` is checked against (docs/PROTOCOL.md §5).
+    pub users: UsersRegistry,
+    /// `server_allow_registration` - whether `Register` is answered with
+    /// anything but a refusal.
+    pub allow_registration: bool,
+    /// Where activation emails go out through. Registration with no relay
+    /// is refused with a reason rather than creating an account whose
+    /// code nobody will ever receive.
+    pub smtp: Option<SmtpConfig>,
+    /// `server_activation_url`, for the link in the activation email.
+    pub activation_url: Option<String>,
+    /// The OTP mail store's directory (`mail::default_mail_dir` in
+    /// production; a scratch dir in tests).
+    pub mail_dir: PathBuf,
+    /// §4.1's liveness timeout - `proto::HEARTBEAT_TIMEOUT` in
+    /// production, milliseconds in the tests that prove it fires.
+    pub heartbeat_timeout: Duration,
+    /// `server_ssl=on`: every accepted socket is TLS-wrapped with this
+    /// before the protocol starts.
+    pub tls: Option<TlsAcceptor>,
 }
 
-impl AuthConfig {
-    pub fn kind(&self) -> AuthKind {
-        match self {
-            AuthConfig::None => AuthKind::None,
-            AuthConfig::Password(_) => AuthKind::Password,
-            AuthConfig::Rsa(_) => AuthKind::Rsa,
+impl ServerOptions {
+    /// Production defaults around `users`: no registration, the real mail
+    /// directory, the real heartbeat timeout, no TLS.
+    pub fn new(users: UsersRegistry) -> Self {
+        Self {
+            users,
+            allow_registration: false,
+            smtp: None,
+            activation_url: None,
+            mail_dir: mail::default_mail_dir(),
+            heartbeat_timeout: proto::HEARTBEAT_TIMEOUT,
+            tls: None,
         }
     }
 
-    /// A fresh nonce to send as part of `ServerMessage::Hello` when this
-    /// config requires RSA auth; `None` otherwise.
-    /// The long-term key this server can vouch for its per-connection
-    /// control-channel offer with (`control::make_offer`). Only RSA auth
-    /// has one - the other modes leave the channel encrypted but
-    /// unauthenticated, which is documented rather than hidden.
-    pub fn signing_key(&self) -> Option<&RsaPrivateKey> {
-        match self {
-            AuthConfig::Rsa(key) => Some(key),
-            _ => None,
-        }
+    pub fn with_mail_dir(mut self, dir: PathBuf) -> Self {
+        self.mail_dir = dir;
+        self
     }
 
-    pub fn make_challenge(&self) -> Option<Vec<u8>> {
-        match self {
-            AuthConfig::Rsa(_) => Some(crypto::random_bytes(32)),
-            _ => None,
-        }
+    pub fn with_heartbeat_timeout(mut self, timeout: Duration) -> Self {
+        self.heartbeat_timeout = timeout;
+        self
     }
 
-    /// Checks a client's `AuthResponse` against this config. For RSA, the
-    /// client is expected to have encrypted `challenge` with the server's
-    /// public key (which it holds as its `server_key` file); decrypting it
-    /// back to the original nonce proves that.
-    pub fn verify(&self, challenge: Option<&[u8]>, response: &AuthResponse) -> bool {
-        match (self, response) {
-            (AuthConfig::None, AuthResponse::None) => true,
-            (AuthConfig::Password(expected), AuthResponse::Password(given)) => {
-                crypto::constant_time_eq(expected.as_bytes(), given.as_bytes())
-            }
-            (AuthConfig::Rsa(key), AuthResponse::Rsa { blocks }) => {
-                match (challenge, crypto::decrypt_chunked(key, blocks)) {
-                    (Some(nonce), Ok(plain)) => crypto::constant_time_eq(nonce, &plain),
-                    _ => false,
-                }
-            }
-            _ => false,
-        }
+    pub fn with_tls(mut self, acceptor: TlsAcceptor) -> Self {
+        self.tls = Some(acceptor);
+        self
+    }
+
+    pub fn with_registration(mut self, smtp: Option<SmtpConfig>, url: Option<String>) -> Self {
+        self.allow_registration = true;
+        self.smtp = smtp;
+        self.activation_url = url;
+        self
     }
 }
 
@@ -563,10 +579,10 @@ type Senders = Arc<Mutex<HashMap<UserId, mpsc::UnboundedSender<ServerMessage>>>>
 /// Binds `addr` (both TCP and, for the UDP rendezvous socket, the same
 /// numeric port - independent port namespaces, so this needs no separate
 /// flag) and serves forever.
-pub async fn run(addr: SocketAddr, auth: AuthConfig) -> std::io::Result<()> {
+pub async fn run(addr: SocketAddr, options: ServerOptions) -> std::io::Result<()> {
     let listener = TcpListener::bind(addr).await?;
     let udp = UdpSocket::bind(addr).await?;
-    serve_with_rendezvous(listener, udp, auth).await
+    serve_with_rendezvous(listener, udp, options).await
 }
 
 /// Accepts connections on an already-bound listener and serves forever,
@@ -574,8 +590,8 @@ pub async fn run(addr: SocketAddr, auth: AuthConfig) -> std::io::Result<()> {
 /// direct-link candidate discovery and want one less socket to bind. Split
 /// out from `run` so tests can bind to an ephemeral port (`:0`) and
 /// discover the real address via `TcpListener::local_addr`.
-pub async fn serve(listener: TcpListener, auth: AuthConfig) -> std::io::Result<()> {
-    serve_tcp(listener, auth, proto::HEARTBEAT_TIMEOUT, mail::default_mail_dir()).await
+pub async fn serve(listener: TcpListener, options: ServerOptions) -> std::io::Result<()> {
+    serve_tcp(listener, options).await
 }
 
 /// `serve`, plus a UDP rendezvous socket bound alongside it (see
@@ -584,61 +600,40 @@ pub async fn serve(listener: TcpListener, auth: AuthConfig) -> std::io::Result<(
 pub async fn serve_with_rendezvous(
     listener: TcpListener,
     udp: UdpSocket,
-    auth: AuthConfig,
+    options: ServerOptions,
 ) -> std::io::Result<()> {
     tokio::spawn(udp_rendezvous_loop(udp));
-    serve_tcp(listener, auth, proto::HEARTBEAT_TIMEOUT, mail::default_mail_dir()).await
+    serve_tcp(listener, options).await
 }
 
-/// `serve`, with the liveness timeout (§4.1) overridden instead of using
-/// `proto::HEARTBEAT_TIMEOUT`. The real `HEARTBEAT_TIMEOUT` (30s) is far
-/// too slow to wait out in a test; this is what lets a test prove the
-/// timeout actually fires - and that ordinary traffic keeps resetting it -
-/// in milliseconds instead.
-pub async fn serve_with_heartbeat_timeout(
-    listener: TcpListener,
-    auth: AuthConfig,
-    heartbeat_timeout: Duration,
-) -> std::io::Result<()> {
-    serve_tcp(listener, auth, heartbeat_timeout, mail::default_mail_dir()).await
-}
-
-/// `serve`, with the OTP mail directory (docs/PROTOCOL.md §17) overridden
-/// instead of `mail::default_mail_dir()` - what mail tests use so each
-/// scenario gets its own empty store under a temp dir rather than sharing
-/// (and polluting) the real `~/.aloo/server_otp_mail`.
-pub async fn serve_with_mail_dir(
-    listener: TcpListener,
-    auth: AuthConfig,
-    mail_dir: PathBuf,
-) -> std::io::Result<()> {
-    serve_tcp(listener, auth, proto::HEARTBEAT_TIMEOUT, mail_dir).await
-}
-
-async fn serve_tcp(
-    listener: TcpListener,
-    auth: AuthConfig,
-    heartbeat_timeout: Duration,
-    mail_dir: PathBuf,
-) -> std::io::Result<()> {
+async fn serve_tcp(listener: TcpListener, options: ServerOptions) -> std::io::Result<()> {
     let registry = Arc::new(Mutex::new(Registry::new()));
     let senders: Senders = Arc::new(Mutex::new(HashMap::new()));
-    let auth = Arc::new(auth);
     // Shared without a lock of its own: every method works on one file at a
     // time and the racy interleavings (two connections storing/acking the
     // same id) each resolve to a harmless no-op for the loser.
-    let mail_store = Arc::new(mail::MailStore::open(mail_dir)?);
+    let mail_store = Arc::new(mail::MailStore::open(options.mail_dir.clone())?);
+    let options = Arc::new(options);
 
     loop {
         let (socket, peer) = listener.accept().await?;
         let registry = registry.clone();
         let senders = senders.clone();
-        let auth = auth.clone();
+        let options = options.clone();
         let mail_store = mail_store.clone();
         tokio::spawn(async move {
+            // The TLS handshake happens here, inside the connection's own
+            // task, so a client that stalls mid-handshake holds up nobody
+            // but itself.
+            let socket = match ssl::accept(options.tls.as_ref(), socket).await {
+                Ok(socket) => socket,
+                Err(e) => {
+                    crate::log_warn!("connection {peer} failed TLS: {e}");
+                    return;
+                }
+            };
             if let Err(e) =
-                handle_connection(socket, peer, registry, senders, auth, heartbeat_timeout, mail_store)
-                    .await
+                handle_connection(socket, peer, registry, senders, options, mail_store).await
             {
                 crate::log_warn!("connection {peer} ended: {e}");
             }
@@ -690,14 +685,12 @@ async fn udp_rendezvous_loop(socket: UdpSocket) {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn handle_connection(
-    socket: TcpStream,
+    socket: ssl::BoxedStream,
     peer_addr: SocketAddr,
     registry: Arc<Mutex<Registry>>,
     senders: Senders,
-    auth: Arc<AuthConfig>,
-    heartbeat_timeout: Duration,
+    options: Arc<ServerOptions>,
     mail_store: Arc<mail::MailStore>,
 ) -> proto::Result<()> {
     let peer_ip = peer_addr.ip();
@@ -706,14 +699,12 @@ async fn handle_connection(
     let mut wr = crate::control::ControlWriter::new(wr);
 
     // Ephemeral per connection, so recording a session and later stealing
-    // the server's long-term key still does not decrypt it.
+    // the server's TLS key still does not decrypt it.
     let (encap, decap) = crate::crypto::pq::generate_encryption_keys();
-    let control = crate::control::make_offer(encap, auth.signing_key())?;
+    let control = crate::control::make_offer(encap);
 
-    let challenge = auth.make_challenge();
     wr.send(&ServerMessage::Hello {
-        auth: auth.kind(),
-        challenge: challenge.clone(),
+        registration_open: options.allow_registration,
         control,
     })
     .await?;
@@ -730,59 +721,142 @@ async fn handle_connection(
     wr.enable(keys.send);
     rd.enable(keys.recv);
 
-    let Some(ClientMessage::Auth(response)) = rd.recv().await? else {
-        let _ = wr.send(
-            &ServerMessage::AuthResult {
-                ok: false,
-                reason: Some("expected auth message".into()),
-            },
-        )
-        .await;
-        return Ok(());
+    let (nickname, password) = match rd.recv().await? {
+        Some(ClientMessage::Auth { nickname, password }) => (nickname, password),
+        Some(ClientMessage::Register {
+            nickname,
+            password,
+            email,
+        }) => {
+            let (ok, reason) = match register_account(&options, &nickname, &password, &email).await
+            {
+                Ok(()) => (true, None),
+                Err(reason) => (false, Some(reason)),
+            };
+            let _ = wr.send(&ServerMessage::RegisterResult { ok, reason }).await;
+            return Ok(());
+        }
+        _ => {
+            let _ = wr
+                .send(&ServerMessage::AuthResult {
+                    ok: false,
+                    activation_pending: false,
+                    reason: Some("expected auth message".into()),
+                })
+                .await;
+            return Ok(());
+        }
     };
-    if !auth.verify(challenge.as_deref(), &response) {
-        let _ = wr.send(&ServerMessage::AuthResult {
+    // The derivation is deliberately slow (§5.1) and the check reads the
+    // registry's files - neither belongs on the async executor.
+    let check = {
+        let users = options.users.clone();
+        let (nickname, password) = (nickname.clone(), password.clone());
+        tokio::task::spawn_blocking(move || {
+            users.check_credentials(&nickname, &password, users_registry::now_utc())
+        })
+        .await
+        .unwrap_or(AuthCheck::Rejected)
+    };
+    match check {
+        AuthCheck::Ok => {}
+        AuthCheck::Rejected => {
+            let _ = wr
+                .send(&ServerMessage::AuthResult {
+                    ok: false,
+                    activation_pending: false,
+                    reason: Some("authentication failed".into()),
+                })
+                .await;
+            return Ok(());
+        }
+        AuthCheck::ActivationPending { expired: true } => {
+            let _ = wr
+                .send(&ServerMessage::AuthResult {
+                    ok: false,
+                    activation_pending: false,
+                    reason: Some(
+                        "this account's activation code has expired - register again".into(),
+                    ),
+                })
+                .await;
+            return Ok(());
+        }
+        AuthCheck::ActivationPending { expired: false } => {
+            wr.send(&ServerMessage::AuthResult {
                 ok: false,
-                reason: Some("authentication failed".into()),
-            },
-        )
-        .await;
-        return Ok(());
+                activation_pending: true,
+                reason: None,
+            })
+            .await?;
+            let Some(ClientMessage::Activate { code }) = rd.recv().await? else {
+                let _ = wr
+                    .send(&ServerMessage::AuthResult {
+                        ok: false,
+                        activation_pending: false,
+                        reason: Some("expected activation code".into()),
+                    })
+                    .await;
+                return Ok(());
+            };
+            let outcome = options
+                .users
+                .activate(&nickname, &code, users_registry::now_utc());
+            let reason = match outcome {
+                users_registry::ActivationOutcome::Activated => None,
+                users_registry::ActivationOutcome::WrongCode
+                | users_registry::ActivationOutcome::NothingPending => {
+                    Some("wrong activation code".to_string())
+                }
+                users_registry::ActivationOutcome::Expired => {
+                    Some("this account's activation code has expired - register again".to_string())
+                }
+            };
+            if let Some(reason) = reason {
+                let _ = wr
+                    .send(&ServerMessage::AuthResult {
+                        ok: false,
+                        activation_pending: false,
+                        reason: Some(reason),
+                    })
+                    .await;
+                return Ok(());
+            }
+        }
     }
     wr.send(&ServerMessage::AuthResult {
-            ok: true,
-            reason: None,
-        },
-    )
+        ok: true,
+        activation_pending: false,
+        reason: None,
+    })
     .await?;
 
     let Some(ClientMessage::Identify {
-        display_name,
         public_key_der,
         key_mode,
     }) = rd.recv().await?
     else {
-        let _ = wr.send(&ServerMessage::Error {
+        let _ = wr
+            .send(&ServerMessage::Error {
                 message: "expected identify message".into(),
-            },
-        )
-        .await;
+            })
+            .await;
         return Ok(());
     };
 
     let id = {
         let mut reg = registry.lock().await;
-        match reg.try_register(display_name, public_key_der, key_mode) {
+        match reg.try_register(nickname, public_key_der, key_mode) {
             Ok(id) => id,
             Err(reason) => {
                 drop(reg);
-                let _ = wr.send(&ServerMessage::IdentifyResult {
+                let _ = wr
+                    .send(&ServerMessage::IdentifyResult {
                         ok: false,
                         you: None,
                         reason: Some(reason),
-                    },
-                )
-                .await;
+                    })
+                    .await;
                 return Ok(());
             }
         }
@@ -813,7 +887,7 @@ async fn handle_connection(
         &registry,
         &senders,
         peer_ip,
-        heartbeat_timeout,
+        options.heartbeat_timeout,
         &mail_store,
     )
     .await;
@@ -921,7 +995,9 @@ async fn client_loop<R: AsyncRead + Unpin>(
                     mail::on_mail_delivered_ack(&reg, mail_store, id, mail_id)
                 }
                 ClientMessage::SecureChannel(_)
-                | ClientMessage::Auth(_)
+                | ClientMessage::Auth { .. }
+                | ClientMessage::Activate { .. }
+                | ClientMessage::Register { .. }
                 | ClientMessage::Identify { .. } => vec![Outgoing {
                     to: id,
                     message: ServerMessage::Error {
@@ -932,6 +1008,53 @@ async fn client_loop<R: AsyncRead + Unpin>(
         };
         dispatch(senders, outgoing).await;
     }
+}
+
+/// `Register` (§5.3) end to end: the policy checks, the registry write,
+/// and the activation email - with the registration rolled back if the
+/// email cannot be handed to the relay, so a name is never left taken by
+/// an account whose code nobody received. `Err` carries the reason the
+/// client is shown.
+async fn register_account(
+    options: &ServerOptions,
+    nickname: &str,
+    password: &str,
+    email: &str,
+) -> Result<(), String> {
+    if !options.allow_registration {
+        return Err("this server does not take registrations".into());
+    }
+    let Some(smtp) = &options.smtp else {
+        return Err("this server has no email delivery configured for registrations".into());
+    };
+    let registration = {
+        let users = options.users.clone();
+        let (nickname, password, email) = (
+            nickname.to_string(),
+            password.to_string(),
+            email.to_string(),
+        );
+        tokio::task::spawn_blocking(move || {
+            users.register(&nickname, &password, &email, users_registry::now_utc())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?
+    };
+    if let Err(e) = users_registry::send_activation_email(
+        smtp,
+        email,
+        nickname,
+        &registration.code,
+        options.activation_url.as_deref(),
+    )
+    .await
+    {
+        crate::log_warn!("activation email for {nickname} could not be sent: {e}");
+        let _ = options.users.remove(nickname);
+        return Err("the activation email could not be sent - try again later".into());
+    }
+    Ok(())
 }
 
 async fn dispatch(senders: &Senders, outgoing: Vec<Outgoing>) {

@@ -129,25 +129,126 @@ fn an_explicit_flag_overrides_and_persists_over_a_previous_value() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// The server's own settings keys are in the file from the first start,
+/// so an operator finds `server_ssl`, `server_allow_registration` and the
+/// SMTP keys already named - and a later flag-less start keeps them.
 /// @requirement AC-094
 #[test]
-fn server_with_no_flags_reuses_previously_persisted_password_auth() {
-    let home = temp_home("reuse-password");
+fn server_start_writes_the_ssl_and_registration_keys_and_keeps_them() {
+    let home = temp_home("server-keys");
 
-    let _ = spawn_server_and_read_startup_line(&home, &["--server", "--password", "MYPASSWORD"]);
+    let _ = spawn_server_and_read_startup_line(&home, &["--server", "--port", "17881"]);
 
     let settings_path = home.join(".aloo").join("settings");
     let contents = std::fs::read_to_string(&settings_path)
         .expect("server should have written ~/.aloo/settings");
-    assert!(contents.contains("server_auth_type=password"));
-    assert!(contents.contains("server_auth_password=MYPASSWORD"));
+    for key in [
+        "server_ssl=off",
+        "server_ssl_fullchain=~/.aloo/certs/fullchain.pem",
+        "server_ssl_privkey=~/.aloo/certs/privkey.pem",
+        "server_allow_registration=off",
+        "server_smtp_host=",
+        "server_smtp_port=",
+        "server_smtp_username=",
+        "server_smtp_password=",
+    ] {
+        assert!(contents.contains(key), "missing {key} in:\n{contents}");
+    }
 
-    // Starting again with no --password/--enc must not silently drop back
-    // to open access.
+    // An operator's hand edit survives the next flag-less start, which
+    // only rewrites bind/port.
+    let edited = contents.replace("server_smtp_host=", "server_smtp_host=smtp.example.com");
+    std::fs::write(&settings_path, edited).unwrap();
     let _ = spawn_server_and_read_startup_line(&home, &["--server"]);
     let contents_after = std::fs::read_to_string(&settings_path).unwrap();
-    assert!(contents_after.contains("server_auth_type=password"));
-    assert!(contents_after.contains("server_auth_password=MYPASSWORD"));
+    assert!(contents_after.contains("server_smtp_host=smtp.example.com"));
+    assert!(contents_after.contains("server_port=17881"));
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// `server_ssl=on` with no certificate refuses to start rather than
+/// serving plaintext behind the operator's back.
+/// @requirement AC-262
+#[test]
+fn server_ssl_on_without_a_certificate_refuses_to_start() {
+    let home = temp_home("ssl-missing");
+    let settings_dir = home.join(".aloo");
+    std::fs::create_dir_all(&settings_dir).unwrap();
+    std::fs::write(
+        settings_dir.join("settings"),
+        "server_ssl=on\nserver_ssl_fullchain=~/.aloo/certs/fullchain.pem\nserver_ssl_privkey=~/.aloo/certs/privkey.pem\n",
+    )
+    .unwrap();
+
+    let output = Command::new(bin())
+        .args(["--server", "--port", "17882"])
+        .env("HOME", &home)
+        .output()
+        .expect("run server");
+    assert!(!output.status.success(), "must refuse to start");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("server_ssl") && stderr.contains("fullchain.pem"),
+        "the refusal names the setting and the missing file: {stderr}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// `--register-user` and `--change-password` edit `~/.aloo/users` in
+/// place: an account appears active with no email and no activation
+/// file, a second registration of the name is refused, and the password
+/// change rewrites the stored key.
+/// @requirement AC-267
+#[test]
+fn register_user_and_change_password_edit_the_users_registry_directly() {
+    let home = temp_home("registry-cli");
+
+    let output = Command::new(bin())
+        .args(["--register-user", "alice", "first-pw"])
+        .env("HOME", &home)
+        .output()
+        .expect("run register");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let user_dir = home.join(".aloo").join("users").join("alice");
+    let key_before = std::fs::read_to_string(user_dir.join("key")).expect("key file written");
+    assert!(!user_dir.join("email.txt").exists(), "manual registration has no email");
+    assert!(
+        !std::fs::read_dir(&user_dir)
+            .unwrap()
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().ends_with("_activate.txt")),
+        "manual registration needs no activation"
+    );
+
+    let output = Command::new(bin())
+        .args(["--register-user", "alice", "again"])
+        .env("HOME", &home)
+        .output()
+        .expect("run register twice");
+    assert!(!output.status.success(), "an existing nickname is refused");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("already registered"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let output = Command::new(bin())
+        .args(["--change-password", "alice", "second-pw"])
+        .env("HOME", &home)
+        .output()
+        .expect("run change-password");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let key_after = std::fs::read_to_string(user_dir.join("key")).unwrap();
+    assert_ne!(key_before, key_after, "the stored key changes with the password");
+
+    let output = Command::new(bin())
+        .args(["--change-password", "nobody", "x"])
+        .env("HOME", &home)
+        .output()
+        .expect("run change-password on a stranger");
+    assert!(!output.status.success(), "a name nobody registered is refused");
 
     std::fs::remove_dir_all(&home).ok();
 }

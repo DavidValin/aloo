@@ -13,15 +13,18 @@ use cucumber::{given, then, when};
 use tokio::net::{TcpListener, TcpStream};
 
 use aloo::client::p2p::{P2pEvent, PeerLinkManager};
-use aloo::crypto;
 use aloo::p2p_proto::P2pPayload;
-use aloo::proto::{
-    AuthKind, AuthResponse, ChannelKind, ClientMessage, Content, Envelope, KeyMode, ServerMessage,
-    UserId,
-};
-use aloo::server::{AuthConfig, Registry, serve_with_rendezvous};
+use aloo::proto::{ChannelKind, ClientMessage, Content, Envelope, KeyMode, ServerMessage, UserId};
+use aloo::server::users_registry::UsersRegistry;
+use aloo::server::{Registry, ServerOptions, serve_with_rendezvous};
 
-use crate::world::{AlooWorld, ClientState, keypair_for};
+use crate::world::{AlooWorld, ClientState};
+
+/// The password every scenario's registered nicknames get, unless the
+/// scenario explicitly names its own.
+fn password_for(nickname: &str) -> String {
+    format!("pw-{nickname}")
+}
 
 const TEST_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
 
@@ -29,12 +32,29 @@ const TEST_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
 // Shared helpers
 // ---------------------------------------------------------------------
 
-async fn spawn_server(auth: AuthConfig) -> std::net::SocketAddr {
+fn scratch_users() -> UsersRegistry {
+    let dir = std::env::temp_dir().join(format!(
+        "aloo-cucumber-server-users-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    // A handful of logins per scenario at most - the real iteration count
+    // would be a needless tax on `cargo bdd`'s runtime (see
+    // `users_registry::USER_KEY_ITERATIONS`'s doc for why a `dev` build
+    // cannot optimise that hot loop away).
+    UsersRegistry::open_with_iterations(dir, 100).unwrap()
+}
+
+async fn spawn_server(users: UsersRegistry) -> std::net::SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let udp = tokio::net::UdpSocket::bind(addr).await.unwrap();
+    let options = ServerOptions::new(users);
     tokio::spawn(async move {
-        let _ = serve_with_rendezvous(listener, udp, auth).await;
+        let _ = serve_with_rendezvous(listener, udp, options).await;
     });
     addr
 }
@@ -180,30 +200,27 @@ async fn handshake(
     name: &str,
     key_mode: KeyMode,
 ) -> UserId {
-    let (auth, challenge) = stream
-        .client_handshake(None)
+    let _registration_open = stream
+        .client_handshake()
         .await
         .unwrap()
         .expect("server closed during handshake");
-    assert_eq!(
-        (auth, challenge),
-        (AuthKind::None, None),
-        "an open server should advertise no auth and no challenge"
-    );
 
     stream
-        .send(&ClientMessage::Auth(AuthResponse::None))
+        .send(&ClientMessage::Auth {
+            nickname: name.into(),
+            password: password_for(name),
+        })
         .await
         .unwrap();
     let result: ServerMessage = stream.recv().await.unwrap().unwrap();
     assert!(
         matches!(result, ServerMessage::AuthResult { ok: true, .. }),
-        "auth should succeed"
+        "auth should succeed for {name}, got {result:?}"
     );
 
     stream
         .send(&ClientMessage::Identify {
-            display_name: name.into(),
             public_key_der: vec![],
             key_mode,
         })
@@ -233,12 +250,21 @@ async fn handshake(
 
 #[given("a server that anyone may connect to")]
 async fn server_open(w: &mut AlooWorld) {
-    w.addr = Some(spawn_server(AuthConfig::None).await);
+    let users = scratch_users();
+    w.addr = Some(spawn_server(users.clone()).await);
+    w.server_users = Some(users);
 }
 
-#[given(expr = "a server that requires the password {string}")]
-async fn server_password(w: &mut AlooWorld, password: String) {
-    w.addr = Some(spawn_server(AuthConfig::Password(password)).await);
+/// `{word}` is registered up front so `{word} logs in with the password
+/// {string}` has an account to check against; a wrong-password scenario
+/// still finds the *right* one registered here, and offers the wrong one
+/// itself.
+#[given(expr = "a server with {word} registered under the password {string}")]
+async fn server_with_registered_user(w: &mut AlooWorld, nickname: String, password: String) {
+    let users = scratch_users();
+    users.register_manual(&nickname, &password).unwrap();
+    w.addr = Some(spawn_server(users.clone()).await);
+    w.server_users = Some(users);
 }
 
 #[given("a running server registry")]
@@ -254,6 +280,10 @@ async fn registry_fresh(w: &mut AlooWorld) {
 #[when(expr = "{word} has connected")]
 async fn client_connects(w: &mut AlooWorld, who: String) {
     let addr = w.addr.expect("no server running");
+    let users = w.server_users.clone().expect("no server running");
+    if !users.is_registered(&who) {
+        users.register_manual(&who, &password_for(&who)).unwrap();
+    }
     let mut stream = ControlEndpoint::new(TcpStream::connect(addr).await.unwrap());
     let id = handshake(&mut stream, &who, KeyMode::PqHybrid).await;
     w.ids.insert(who.clone(), id);
@@ -421,27 +451,32 @@ async fn stream_voice(w: &mut AlooWorld, from: String, channel: String, to: Stri
 #[when(expr = "someone else tries to connect as {string}")]
 async fn duplicate_nickname(w: &mut AlooWorld, name: String) {
     let addr = w.addr.expect("no server running");
+    let users = w.server_users.clone().expect("no server running");
+    if !users.is_registered(&name) {
+        users.register_manual(&name, &password_for(&name)).unwrap();
+    }
     let mut stream = ControlEndpoint::new(TcpStream::connect(addr).await.unwrap());
 
-    let (auth_kind, _) = stream
-        .client_handshake(None)
+    let _registration_open = stream
+        .client_handshake()
         .await
         .unwrap()
         .expect("server closed during handshake");
-    assert_eq!(auth_kind, AuthKind::None);
     stream
-        .send(&ClientMessage::Auth(AuthResponse::None))
+        .send(&ClientMessage::Auth {
+            nickname: name.clone(),
+            password: password_for(&name),
+        })
         .await
         .unwrap();
     let auth: ServerMessage = stream.recv().await.unwrap().unwrap();
     assert!(
         matches!(auth, ServerMessage::AuthResult { ok: true, .. }),
-        "auth itself should still pass"
+        "auth itself should still pass - the same nickname/password holds a real account"
     );
 
     stream
         .send(&ClientMessage::Identify {
-            display_name: name,
             public_key_der: vec![],
             key_mode: KeyMode::PqHybrid,
         })
@@ -466,22 +501,17 @@ async fn disconnects(w: &mut AlooWorld, who: String) {
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 }
 
-#[when(expr = "a client offers the password {string}")]
-async fn offer_password(w: &mut AlooWorld, password: String) {
+#[when(expr = "{word} logs in with the password {string}")]
+async fn logs_in_with_password(w: &mut AlooWorld, nickname: String, password: String) {
     let addr = w.addr.expect("no server running");
     let mut stream = ControlEndpoint::new(TcpStream::connect(addr).await.unwrap());
-    let (auth, challenge) = stream
-        .client_handshake(None)
+    let _registration_open = stream
+        .client_handshake()
         .await
         .unwrap()
         .expect("server closed during handshake");
-    assert_eq!(
-        (auth, challenge),
-        (AuthKind::Password, None),
-        "a password-protected server should advertise Password and issue no challenge"
-    );
     stream
-        .send(&ClientMessage::Auth(AuthResponse::Password(password)))
+        .send(&ClientMessage::Auth { nickname, password })
         .await
         .unwrap();
     let result: ServerMessage = stream.recv().await.unwrap().unwrap();
@@ -807,56 +837,5 @@ async fn still_connected(w: &mut AlooWorld, who: String) {
     assert!(
         w.registry_mut().user_info(id).is_some(),
         "leaving a channel is not a disconnect - the user stays registered"
-    );
-}
-
-#[then("an RSA-protected server accepts the real key holder and refuses an impostor")]
-async fn rsa_auth(_w: &mut AlooWorld) {
-    let server_kp = keypair_for("server");
-    let impostor_kp = keypair_for("mallory");
-    let cfg = AuthConfig::Rsa(Box::new(server_kp.private));
-    assert_eq!(cfg.kind(), AuthKind::Rsa);
-
-    let challenge = cfg
-        .make_challenge()
-        .expect("rsa auth must issue a challenge nonce");
-    assert_eq!(
-        challenge.len(),
-        32,
-        "the documented nonce is 32 random bytes"
-    );
-
-    let good = crypto::encrypt_chunked(&server_kp.public, &challenge).unwrap();
-    assert!(
-        cfg.verify(Some(&challenge), &AuthResponse::Rsa { blocks: good }),
-        "the real key holder gets in"
-    );
-
-    let bad = crypto::encrypt_chunked(&impostor_kp.public, &challenge).unwrap();
-    assert!(
-        !cfg.verify(Some(&challenge), &AuthResponse::Rsa { blocks: bad }),
-        "a nonce encrypted to somebody else's key must not authenticate"
-    );
-
-    // A response of the wrong shape is an authentication failure too.
-    assert!(!cfg.verify(Some(&challenge), &AuthResponse::None));
-    assert!(!cfg.verify(Some(&challenge), &AuthResponse::Password("whatever".into())));
-}
-
-#[then("an open server issues no challenge and accepts an empty credential")]
-async fn open_server_auth(_w: &mut AlooWorld) {
-    let cfg = AuthConfig::None;
-    assert_eq!(cfg.kind(), AuthKind::None);
-    assert!(
-        cfg.make_challenge().is_none(),
-        "no auth means no challenge to answer"
-    );
-    assert!(
-        cfg.verify(None, &AuthResponse::None),
-        "an empty credential is the right one here"
-    );
-    assert!(
-        !cfg.verify(None, &AuthResponse::Password("x".into())),
-        "a response of the wrong variant is still a failure"
     );
 }

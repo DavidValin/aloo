@@ -121,7 +121,6 @@ async fn roundtrip_every_message(w: &mut AlooWorld) {
 
     let client: Vec<ClientMessage> = vec![
         ClientMessage::Identify {
-            display_name: "dave".into(),
             public_key_der: vec![1, 2, 3, 4],
             key_mode: KeyMode::PqHybrid,
         },
@@ -269,7 +268,6 @@ async fn key_mode_survives(_w: &mut AlooWorld) {
         assert_eq!(decoded, user, "round trip failed for {key_mode:?}");
 
         let identify = ClientMessage::Identify {
-            display_name: "dave".into(),
             public_key_der: vec![1, 2, 3, 4],
             key_mode,
         };

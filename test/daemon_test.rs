@@ -359,7 +359,7 @@ fn a_restart_places_the_focus_again() {
 // Resolving what to run as
 // ---------------------------------------------------------------------
 
-use aloo::client::connect::{ConnectCache, MyKeySelection, ServerKeySelection};
+use aloo::client::connect::{ConnectCache, MyKeySelection};
 use aloo::client::daemon::{DaemonConfig, DaemonFlags};
 use aloo::settings::Settings;
 
@@ -522,28 +522,71 @@ fn with_no_host_anywhere_the_daemon_refuses_to_start() {
 
 /// @requirement AC-201
 #[test]
-fn the_two_server_credentials_are_mutually_exclusive() {
-    let flags = DaemonFlags {
-        server_pwd: Some("pw".into()),
-        server_key_file: Some("/k.pub".into()),
-        ..flags_with_host()
-    };
-    let err = DaemonConfig::resolve(&flags, &Settings::default(), &empty_cache()).unwrap_err();
-    assert!(err.contains("mutually exclusive"), "{err}");
-}
-
-/// @requirement AC-201
-#[test]
 fn a_server_password_from_settings_is_used_when_no_flag_gives_one() {
     let mut settings = Settings::default();
-    settings.daemon_server_auth_type = Some("password".into());
     settings.daemon_server_password = Some("hunter2".into());
 
     let config = DaemonConfig::resolve(&flags_with_host(), &settings, &empty_cache()).unwrap();
-    assert_eq!(
-        config.server_key,
-        ServerKeySelection::Password("hunter2".into())
-    );
+    assert_eq!(config.password, "hunter2");
+
+    let flags = DaemonFlags {
+        server_pwd: Some("from-flag".into()),
+        ..flags_with_host()
+    };
+    let config = DaemonConfig::resolve(&flags, &settings, &empty_cache()).unwrap();
+    assert_eq!(config.password, "from-flag", "a flag given this run wins");
+}
+
+/// `--ssl` (or `daemon_ssl`) is carried into the request the daemon
+/// connects with; it is the one TLS decision a headless start can make.
+/// @requirement AC-201, AC-261
+#[test]
+fn ssl_comes_from_the_flag_or_the_settings_file() {
+    let config =
+        DaemonConfig::resolve(&flags_with_host(), &Settings::default(), &empty_cache()).unwrap();
+    assert!(!config.ssl, "plain TCP unless asked");
+    assert!(!config.to_connect_request().ssl);
+
+    let flags = DaemonFlags {
+        ssl: true,
+        ..flags_with_host()
+    };
+    let config = DaemonConfig::resolve(&flags, &Settings::default(), &empty_cache()).unwrap();
+    assert!(config.ssl);
+    assert!(config.to_connect_request().ssl);
+
+    let mut settings = Settings::default();
+    settings.daemon_ssl = true;
+    let config = DaemonConfig::resolve(&flags_with_host(), &settings, &empty_cache()).unwrap();
+    assert!(config.ssl, "daemon_ssl=on is what a bare start reads back");
+}
+
+/// A daemon with a server but no password anywhere refuses to start
+/// before touching a socket - the same reasoning `with_no_host_anywhere`
+/// gives for a missing host, applied to the one credential login needs.
+/// @requirement AC-201
+#[tokio::test]
+async fn run_refuses_to_start_with_a_server_and_no_password() {
+    let config = DaemonConfig::resolve(&flags_with_host(), &Settings::default(), &empty_cache())
+        .unwrap();
+    assert!(config.password.is_empty());
+    let err = aloo::client::daemon::run(config, None).await.unwrap_err();
+    assert_eq!(err.to_string(), aloo::client::daemon::NO_PASSWORD_ERROR);
+}
+
+/// The request a daemon dials with is the connect popup's own type,
+/// carrying the nickname's password and no store path of its own.
+/// @requirement AC-201, AC-005
+#[test]
+fn the_daemon_connects_with_the_resolved_password() {
+    let flags = DaemonFlags {
+        server_pwd: Some("hunter2".into()),
+        ..flags_with_host()
+    };
+    let config = DaemonConfig::resolve(&flags, &Settings::default(), &empty_cache()).unwrap();
+    let request = config.to_connect_request();
+    assert_eq!(request.password, "hunter2");
+    assert_eq!(request.activation_code, None);
 }
 
 /// @requirement AC-202
@@ -674,7 +717,8 @@ fn a_resolved_configuration_round_trips_through_the_settings_file() {
     assert_eq!(again.host, config.host);
     assert_eq!(again.port, config.port);
     assert_eq!(again.nickname, config.nickname);
-    assert_eq!(again.server_key, config.server_key);
+    assert_eq!(again.password, config.password);
+    assert_eq!(again.ssl, config.ssl);
     assert_eq!(again.channels, config.channels);
     assert_eq!(again.focus, config.focus);
 

@@ -51,16 +51,24 @@ If someone already runs a server for you, skip to step 3 — you just need their
 To run your own:
 
 ```sh
-aloo --server                          # anyone can connect
-aloo --server --password MYPASSWORD    # people need this password to connect
-aloo --server --enc rsa server_key     # people need a matching RSA key to connect
+aloo --server                                       # bind 0.0.0.0:7878
+aloo --server --bind 0.0.0.0 --port 7878            # the same, spelled out
 ```
+
+Everyone who connects logs in with a nickname and a password, checked against the server's own users registry — there is no server-wide shared password or key any more. Create the first account or two directly on the server's machine:
+
+```sh
+aloo --register-user bob acoolpassword    # active immediately, no email needed
+aloo --change-password bob newpass        # takes effect on dave's next login
+```
+
+Want people to be able to sign themselves up? Turn on `server_allow_registration` and an SMTP relay in `~/.aloo/settings` (see "Talking to the server (authentication)" below) — then anyone can register from the connect screen and activate with the code emailed to them.
 
 The server always starts with one public channel called `the-hall` — the one channel a client joins automatically on connecting. Any other public channel is joined deliberately, from `/channels`.
 
 The server and everyone connecting to it must run the **same version** of aloo. There is no version negotiation on the wire (see `docs/PROTOCOL.md` §9), so a server left behind on an older release isn't slower or reduced — clients simply can't connect to it, failing on connect with a decode error. `aloo --help`'s first line reports the version on each side.
 
-Whatever `--bind`/`--port`/`--password`/`--enc` you run it with gets saved to `~/.aloo/settings`; a bare `aloo --server` afterwards (e.g. after a crash) reuses the last configuration you started it with, auth included, instead of resetting to open access on the default port.
+Whatever `--bind`/`--port` you run it with gets saved to `~/.aloo/settings`; a bare `aloo --server` afterwards (e.g. after a crash) reuses the last configuration you started it with instead of resetting to the default port. TLS, registration and SMTP are settings-only — there's no flag for any of them — and are written to that file from the very first start, so they're easy to find and edit by hand; see "Talking to the server (authentication)" below.
 
 ### 3. Connect
 
@@ -68,15 +76,15 @@ Whatever `--bind`/`--port`/`--password`/`--enc` you run it with gets saved to `~
 aloo
 ```
 
-This opens a connect screen. Fill in the host/port, pick a nickname, and press Connect. Everything else on that screen has sensible defaults — you don't need to touch it to get started (see `docs/SPEC.md` if you want to know what every field does).
+This opens a connect screen. Fill in the host/port, a nickname and its password, and press Connect. If the server takes registrations (`server_allow_registration=on`), an email field and a Register button appear too — no account yet? Fill in an email and press Register instead; check that address for a 12-digit activation code, then Connect with the same nickname and password (aloo asks for the code the first time it logs in on an unactivated account). Everything else on that screen has sensible defaults — you don't need to touch it to get started (see `docs/SPEC.md` if you want to know what every field does).
 
 Your identity type is already set to `pq_hybrid` (PQ-Hybrid, see "Encryption" below) — no need to generate any keys yourself beforehand, aloo creates them automatically the first time you connect.
 
 aloo remembers the host, port and nickname you connected with and proposes them again next time, so connecting a second time is usually just pressing Connect. They live in `~/.aloo/settings` (`connect_host`, `connect_port`, `connect_nickname`) if you ever want to change them by hand — and they're also what a flag-free `aloo --daemon` falls back to (see "Running in the background").
 
-Nicknames are case-sensitive and must be free — if someone else is already connected with it, you'll be bumped back to this screen with an error, so just pick another one and try again. A nickname frees up the moment its holder disconnects — even an unclean disconnect (a crash, a lost network) is caught within 30 seconds, so a name is never stuck "in use" for good.
+Nicknames are case-sensitive and must be free — if someone else is already connected with it, you'll be bumped back to this screen with an error, so just pick another one and try again. A nickname frees up the moment its holder disconnects — even an unclean disconnect (a crash, a lost network) is caught within 30 seconds, so a name is never stuck "in use" for good. It's still your account, though — the same nickname and password log you back in whenever you reconnect.
 
-**If the connection drops, aloo gets itself back.** Nothing about a lost server ends the session: your direct links to other people are peer-to-peer and carry on regardless. But the server is what everyone else's *user list* comes from, so aloo reconnects on its own — right away, then 5s, 10s, 20s and every 30s, for as long as it takes — and re-joins the channels you were in, so you reappear for everyone, including anyone who connected while you were away. The top-left of the header says where it is up to: 🟢 `Connected to server!`, 🔴 `Reconnecting...`, 🔴 `Reconnecting in 5s...`, or 🔴 `Server down (reconnecting in 20 sec...)`. Running with `--no-server` it reads ⚪ `No server mode` instead — there is nothing to reconnect to.
+**If the connection drops, aloo gets itself back.** Nothing about a lost server ends the session: your direct links to other people are peer-to-peer and carry on regardless. But the server is what everyone else's *user list* comes from, so aloo reconnects on its own — right away, then 5s, 10s, 20s and every 30s, for as long as it takes — and re-joins the channels you were in, so you reappear for everyone, including anyone who connected while you were away. The top-left of the header says where it is up to: ⏺ `Connected to server!` in green, ⏺ `Reconnecting...`, ⏺ `Reconnecting in 5s...`, or ⏺ `Server down (reconnecting in 20 sec...)` in red. Running with `--no-server` it reads ⏺ `No server mode` in white instead — there is nothing to reconnect to.
 
 ## How to use it
 
@@ -194,7 +202,7 @@ whole in memory on either side, and there's no size cap.
 | `/endcall` | Leave the call |
 | `Up` / `Down` | Walk the roster |
 | `Enter` or `e` | END CALL |
-| `Esc` | Fold the modal away into the 🔴 Call indicator |
+| `Esc` | Fold the modal away into the ⏺ Call indicator |
 | `Ctrl+R` | Bring the modal back |
 | `m` on your row | Mute your own microphone — yours alone to lift |
 | `m` on another row | *(host only)* mute them — only you can lift it |
@@ -296,11 +304,13 @@ There are two separate places encryption shows up: how *you* prove who you are, 
 
 ### Talking to the server (authentication)
 
-How you prove you're allowed to connect:
+How you prove you're allowed to connect: a nickname and its password, checked against the server's own users registry (`~/.aloo/users` on the server's machine) — the same login every time, not a mode chosen per connection.
 
-- 🔓 **None** — anyone can connect, no questions asked.
-- 🔑 **Password** — a shared password the server owner gives out.
-- 🗝️ **RSA key** — the server owner hands you their public key file; only people with a matching key can connect.
+- 🔑 **Nickname + password.** The server operator either registers you directly (`aloo --register-user <nickname> <password>`, active immediately) or turns on self-registration.
+- ✉️ **Self-registration.** With `server_allow_registration=on` and an SMTP relay configured in `~/.aloo/settings` (`server_smtp_host`, `server_smtp_port`, `server_smtp_username`, `server_smtp_password`), anyone can register from the connect screen's Register button and activate with the 12-digit code emailed to them — valid for one hour, and also usable from a browser link if `server_activation_url` is set.
+- 🔏 **Optional TLS.** `server_ssl=on` plus a certificate pair (`server_ssl_fullchain`/`server_ssl_privkey` — a Let's Encrypt pair works well) serves the control connection, and the activation link, over TLS. On the client side this is settings-only too, not a connect-screen field: set `connect_ssl=on` in `~/.aloo/settings` (or pass `--ssl`/set `daemon_ssl` for a headless start); a self-signed or privately issued certificate needs its root added via `connect_ssl_ca`.
+
+None of this is per-connection: it's how the server itself is configured, in `~/.aloo/settings` on the server's machine.
 
 ### Your identity & message encryption
 
@@ -327,18 +337,24 @@ Your own tag is `🛡️ PQH` too, and so is everyone else's — the only thing 
 >
 > **Ending it with `/endotp`:** either of you can end an active session unilaterally, no round trip needed — type `/endotp` in that room. This pauses the session rather than destroying the pad: your key stays exactly where it was, so running `/otp` with that same contact again later resumes the identical pad instead of generating a new one — nothing is wasted. What does stop immediately is *using* it: this side won't spend it again until the session is reopened. The other side is told — under the pad, like everything else you say to them, which is also the only way to tell a contact you share nothing but a pad with; if they're offline right now, aloo keeps trying every time you reconnect until they've genuinely heard, so ending a session with someone who's stepped away always still reaches them. Disconnecting and reconnecting, by either of you, never ends a session on its own — only `/endotp` does. While a session is active every DM with that person rides it — there's no way to drop back to a plain send in the meantime — but ending it never closes the conversation itself: the moment `/endotp` runs, DMs with that person go back to plain `PQH` immediately, same as before `/otp` was ever run.
 
-By default, everything aloo writes to disk on its own — your auto-generated PQ-Hybrid keys, identity-pinning files, downloaded files — lives under `~/.aloo`. It never writes anywhere else unless you deliberately point a field (like a server RSA key file) somewhere else yourself. Set the `ALOO_HOME` environment variable to use a different directory instead — handy for running more than one client on the same machine (e.g. testing in separate terminals), since two clients sharing one `~/.aloo` would otherwise collide.
+By default, everything aloo writes to disk on its own — your auto-generated PQ-Hybrid keys, identity-pinning files, downloaded files — lives under `~/.aloo`. It never writes anywhere else unless you deliberately point a field (like `connect_ssl_ca`, or the server's own certificate paths) somewhere else yourself. Set the `ALOO_HOME` environment variable to use a different directory instead — handy for running more than one client on the same machine (e.g. testing in separate terminals), since two clients sharing one `~/.aloo` would otherwise collide.
 
-### Generating an RSA key for server authentication
+### Generating a TLS certificate for a server
 
-Only needed if the server you're connecting to requires `--enc rsa` — this is the *server's* key, not yours. Your own PQ-Hybrid identity generates itself on first connect; skip this otherwise.
+Only needed if you're turning `server_ssl` on. A real certificate for a domain you control:
 
 ```sh
-openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:4096 -out key
-openssl rsa -pubout -in key -out key.pub
+certbot certonly --standalone -d chat.example.com
+# then point server_ssl_fullchain / server_ssl_privkey at
+# /etc/letsencrypt/live/chat.example.com/{fullchain,privkey}.pem
 ```
 
-`key` is the private key — pass it to `--enc rsa key` (server). `key.pub` is the matching public key — hand it out to clients.
+For local testing, a self-signed pair works too — clients then need its root added via `connect_ssl_ca`:
+
+```sh
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+  -keyout privkey.pem -out fullchain.pem -days 365 -nodes -subj "/CN=localhost"
+```
 
 ## One Time Pad mail
 

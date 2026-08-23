@@ -1,13 +1,14 @@
+#[path = "server_common.rs"]
+mod server_common;
+
 use std::net::{IpAddr, Ipv4Addr};
 
-use aloo::control::ControlEndpoint;
-use aloo::crypto;
 use aloo::proto::*;
 use aloo::server::{
-    AuthConfig, CHANNEL_MAX_PASSWORD_ATTEMPTS, CHANNEL_PASSWORD_BAN_DURATION, DEFAULT_CHANNEL_NAME,
-    Outgoing, Registry, serve, serve_with_heartbeat_timeout,
+    CHANNEL_MAX_PASSWORD_ATTEMPTS, CHANNEL_PASSWORD_BAN_DURATION, DEFAULT_CHANNEL_NAME, Outgoing,
+    Registry,
 };
-use tokio::net::{TcpListener, TcpStream};
+use server_common::{TestServer, login, password_for, test_options, test_users_registry};
 
 const TEST_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
 const OTHER_TEST_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
@@ -741,151 +742,264 @@ fn key_rotation_from_unknown_sender_is_rejected() {
 }
 
 // ---------------------------------------------------------------------
-// AuthConfig
+// Logging in (docs/PROTOCOL.md §5)
 // ---------------------------------------------------------------------
 
-/// @requirement AC-014, TB-013, TB-014
-#[test]
-fn none_auth_kind_and_no_challenge() {
-    let cfg = AuthConfig::None;
-    assert_eq!(cfg.kind(), AuthKind::None);
-    assert!(cfg.make_challenge().is_none());
-    assert!(cfg.verify(None, &AuthResponse::None));
-    assert!(!cfg.verify(None, &AuthResponse::Password("x".into())));
-}
-
 /// @requirement AC-013, TB-013
-#[test]
-fn password_auth_accepts_correct_and_rejects_wrong() {
-    let cfg = AuthConfig::Password("hunter2".into());
-    assert_eq!(cfg.kind(), AuthKind::Password);
-    assert!(cfg.make_challenge().is_none());
-    assert!(cfg.verify(None, &AuthResponse::Password("hunter2".into())));
-    assert!(!cfg.verify(None, &AuthResponse::Password("wrong".into())));
-}
-
-/// @requirement AC-013, TB-013
-#[test]
-fn rsa_auth_accepts_valid_challenge_response_and_rejects_wrong_key() {
-    let server_kp = crypto::KeyPair::generate().unwrap();
-    let impostor_kp = crypto::KeyPair::generate().unwrap();
-    let cfg = AuthConfig::Rsa(Box::new(server_kp.private));
-    assert_eq!(cfg.kind(), AuthKind::Rsa);
-
-    let challenge = cfg.make_challenge().expect("rsa requires a challenge");
-
-    // legitimate client: encrypts the nonce with the server's real public key
-    let good_blocks = crypto::encrypt_chunked(&server_kp.public, &challenge).unwrap();
-    assert!(cfg.verify(
-        Some(&challenge),
-        &AuthResponse::Rsa {
-            blocks: good_blocks
+#[tokio::test]
+async fn a_registered_nickname_with_its_password_is_let_in() {
+    let server = TestServer::spawn(test_options("login-ok")).await;
+    server.ensure_user("alice");
+    let mut stream = server.connect().await;
+    let result = login(&mut stream, "alice", &password_for("alice")).await;
+    assert_eq!(
+        result,
+        ServerMessage::AuthResult {
+            ok: true,
+            activation_pending: false,
+            reason: None
         }
+    );
+}
+
+/// A wrong password and a nickname nobody registered get the very same
+/// answer, so a login attempt cannot be used to list the accounts.
+/// @requirement AC-013
+#[tokio::test]
+async fn a_wrong_password_and_an_unknown_nickname_are_refused_alike() {
+    let server = TestServer::spawn(test_options("login-bad")).await;
+    server.ensure_user("alice");
+
+    let mut stream = server.connect().await;
+    let wrong = login(&mut stream, "alice", "not-her-password").await;
+    let ServerMessage::AuthResult {
+        ok: false,
+        activation_pending: false,
+        reason: Some(wrong_reason),
+    } = wrong
+    else {
+        panic!("expected a refusal, got {wrong:?}");
+    };
+    let closed: Option<ServerMessage> = stream.recv().await.unwrap();
+    assert!(closed.is_none(), "the server hangs up after a refusal");
+
+    let mut stream = server.connect().await;
+    let unknown = login(&mut stream, "nobody", "whatever").await;
+    let ServerMessage::AuthResult {
+        ok: false,
+        activation_pending: false,
+        reason: Some(unknown_reason),
+    } = unknown
+    else {
+        panic!("expected a refusal, got {unknown:?}");
+    };
+    assert_eq!(wrong_reason, unknown_reason, "one answer for both");
+}
+
+/// A nickname the registry could never hold is refused before any file is
+/// looked at - it can name nothing under the users directory.
+/// @requirement AC-013, TB-238
+#[tokio::test]
+async fn an_unregistrable_nickname_is_refused_without_touching_the_registry() {
+    let server = TestServer::spawn(test_options("login-traversal")).await;
+    let mut stream = server.connect().await;
+    let result = login(&mut stream, "../etc", "x").await;
+    assert!(matches!(result, ServerMessage::AuthResult { ok: false, .. }));
+    assert!(!server.options.users.dir().join("..").join("etc").join("key").exists());
+}
+
+/// The right password on an account still awaiting its code is told so,
+/// and may answer with the code once (§5.2).
+/// @requirement AC-265
+#[tokio::test]
+async fn a_pending_account_is_asked_for_its_code_and_activated_by_the_right_one() {
+    let options = test_options("login-activate");
+    let registration = options
+        .users
+        .register("carol", "pw-carol", "carol@example.com", aloo::server::users_registry::now_utc())
+        .unwrap();
+    let server = TestServer::spawn(options).await;
+
+    // Wrong code: refused, connection closed, account still pending.
+    let mut stream = server.connect().await;
+    let result = login(&mut stream, "carol", "pw-carol").await;
+    assert_eq!(
+        result,
+        ServerMessage::AuthResult {
+            ok: false,
+            activation_pending: true,
+            reason: None
+        }
+    );
+    stream
+        .send(&ClientMessage::Activate {
+            code: "000000000000".into(),
+        })
+        .await
+        .unwrap();
+    let refused: ServerMessage = stream.recv().await.unwrap().unwrap();
+    assert!(
+        matches!(refused, ServerMessage::AuthResult { ok: false, activation_pending: false, reason: Some(ref r) } if r.contains("wrong")),
+        "{refused:?}"
+    );
+    assert!(stream.recv::<ServerMessage>().await.unwrap().is_none());
+    assert!(server.options.users.pending_activation("carol").is_some());
+
+    // Right code: activated, and the handshake continues into Identify.
+    let mut stream = server.connect().await;
+    let result = login(&mut stream, "carol", "pw-carol").await;
+    assert!(matches!(result, ServerMessage::AuthResult { activation_pending: true, .. }));
+    stream
+        .send(&ClientMessage::Activate {
+            code: registration.code.clone(),
+        })
+        .await
+        .unwrap();
+    let ok: ServerMessage = stream.recv().await.unwrap().unwrap();
+    assert!(matches!(ok, ServerMessage::AuthResult { ok: true, .. }), "{ok:?}");
+    assert!(server.options.users.pending_activation("carol").is_none());
+    stream
+        .send(&ClientMessage::Identify {
+            public_key_der: vec![],
+            key_mode: KeyMode::PqHybrid,
+        })
+        .await
+        .unwrap();
+    let identify: ServerMessage = stream.recv().await.unwrap().unwrap();
+    assert!(matches!(identify, ServerMessage::IdentifyResult { ok: true, .. }));
+
+    // From now on the login is an ordinary one.
+    let mut again = server.connect().await;
+    let result = login(&mut again, "carol", "pw-carol").await;
+    assert!(matches!(result, ServerMessage::AuthResult { ok: true, activation_pending: false, .. }));
+}
+
+/// A code older than `ACTIVATION_VALIDITY_SECS` cannot activate anything;
+/// the user is told to register again.
+/// @requirement AC-265
+#[tokio::test]
+async fn an_expired_activation_is_refused_with_a_reason() {
+    let options = test_options("login-expired");
+    let long_ago = aloo::server::users_registry::now_utc()
+        - aloo::server::users_registry::ACTIVATION_VALIDITY_SECS
+        - 60;
+    options
+        .users
+        .register("dan", "pw-dan", "dan@example.com", long_ago)
+        .unwrap();
+    let server = TestServer::spawn(options).await;
+    let mut stream = server.connect().await;
+    let result = login(&mut stream, "dan", "pw-dan").await;
+    match result {
+        ServerMessage::AuthResult {
+            ok: false,
+            activation_pending: false,
+            reason: Some(reason),
+        } => assert!(reason.contains("expired"), "{reason}"),
+        other => panic!("expected an expiry refusal, got {other:?}"),
+    }
+}
+
+/// `Hello` says whether registrations are taken, and a `Register` on a
+/// server that does not take them is refused and hung up on.
+/// @requirement AC-264
+#[tokio::test]
+async fn registration_is_advertised_in_hello_and_refused_when_off() {
+    let server = TestServer::spawn(test_options("register-off")).await;
+    let mut stream = server.connect().await;
+    let open = stream.client_handshake().await.unwrap().unwrap();
+    assert!(!open, "registration is off by default");
+    stream
+        .send(&ClientMessage::Register {
+            nickname: "eve".into(),
+            password: "pw".into(),
+            email: "eve@example.com".into(),
+        })
+        .await
+        .unwrap();
+    let result: ServerMessage = stream.recv().await.unwrap().unwrap();
+    assert!(
+        matches!(result, ServerMessage::RegisterResult { ok: false, reason: Some(ref r) } if r.contains("registrations")),
+        "{result:?}"
+    );
+    assert!(stream.recv::<ServerMessage>().await.unwrap().is_none());
+    assert!(!server.options.users.is_registered("eve"));
+}
+
+/// Registration on, but no relay to send the code through: refused with
+/// a reason, and no half-account left behind.
+/// @requirement AC-264
+#[tokio::test]
+async fn registration_without_a_relay_is_refused_and_creates_nothing() {
+    let server = TestServer::spawn(test_options("register-no-smtp").with_registration(None, None)).await;
+    let mut stream = server.connect().await;
+    let open = stream.client_handshake().await.unwrap().unwrap();
+    assert!(open);
+    stream
+        .send(&ClientMessage::Register {
+            nickname: "eve".into(),
+            password: "pw".into(),
+            email: "eve@example.com".into(),
+        })
+        .await
+        .unwrap();
+    let result: ServerMessage = stream.recv().await.unwrap().unwrap();
+    assert!(
+        matches!(result, ServerMessage::RegisterResult { ok: false, reason: Some(ref r) } if r.contains("email")),
+        "{result:?}"
+    );
+    assert!(!server.options.users.is_registered("eve"));
+}
+
+/// The registry a server reads is the directory on disk, re-read per
+/// login: a `--register-user` / `--change-password` made while it runs
+/// is honoured by the very next connection.
+/// @requirement AC-267
+#[tokio::test]
+async fn registry_edits_take_effect_on_the_next_login_without_a_restart() {
+    let server = TestServer::spawn(test_options("live-edit")).await;
+    let editor = test_users_registry(server.options.users.dir());
+
+    let mut stream = server.connect().await;
+    assert!(matches!(
+        login(&mut stream, "fay", "first").await,
+        ServerMessage::AuthResult { ok: false, .. }
     ));
 
-    // impostor: encrypts with a different keypair's public half, so the
-    // server can't decrypt it back to the original nonce
-    let bad_blocks = crypto::encrypt_chunked(&impostor_kp.public, &challenge).unwrap();
-    assert!(!cfg.verify(Some(&challenge), &AuthResponse::Rsa { blocks: bad_blocks }));
-}
+    editor.register_manual("fay", "first").unwrap();
+    let mut stream = server.connect().await;
+    assert!(matches!(
+        login(&mut stream, "fay", "first").await,
+        ServerMessage::AuthResult { ok: true, .. }
+    ));
 
-/// @requirement TB-014
-#[test]
-fn rsa_auth_rejects_response_of_the_wrong_kind() {
-    let server_kp = crypto::KeyPair::generate().unwrap();
-    let cfg = AuthConfig::Rsa(Box::new(server_kp.private));
-    let challenge = cfg.make_challenge().unwrap();
-    assert!(!cfg.verify(Some(&challenge), &AuthResponse::None));
-    assert!(!cfg.verify(Some(&challenge), &AuthResponse::Password("whatever".into())));
+    editor.change_password("fay", "second").unwrap();
+    let mut stream = server.connect().await;
+    assert!(matches!(
+        login(&mut stream, "fay", "first").await,
+        ServerMessage::AuthResult { ok: false, .. }
+    ));
+    let mut stream = server.connect().await;
+    assert!(matches!(
+        login(&mut stream, "fay", "second").await,
+        ServerMessage::AuthResult { ok: true, .. }
+    ));
 }
 
 // ---------------------------------------------------------------------
 // End-to-end over real TCP
 // ---------------------------------------------------------------------
 
-async fn handshake_no_auth(stream: &mut ControlEndpoint<TcpStream>, name: &str) -> UserId {
-    handshake_no_auth_with_mode(stream, name, KeyMode::PqHybrid).await
-}
-
-async fn handshake_no_auth_with_mode(
-    stream: &mut ControlEndpoint<TcpStream>,
-    name: &str,
-    key_mode: KeyMode,
-) -> UserId {
-    let (auth, challenge) = stream
-        .client_handshake(None)
-        .await
-        .unwrap()
-        .expect("server closed during handshake");
-    assert_eq!(auth, AuthKind::None);
-    assert_eq!(challenge, None);
-
-    stream
-        .send(&ClientMessage::Auth(AuthResponse::None))
-        .await
-        .unwrap();
-    let result: ServerMessage = stream.recv().await.unwrap().unwrap();
-    assert!(matches!(result, ServerMessage::AuthResult { ok: true, .. }));
-
-    stream
-        .send(&ClientMessage::Identify {
-            display_name: name.into(),
-            public_key_der: vec![],
-            key_mode,
-        })
-        .await
-        .unwrap();
-
-    let identify_result: ServerMessage = stream.recv().await.unwrap().unwrap();
-    let ServerMessage::IdentifyResult {
-        ok: true,
-        you: Some(you),
-        ..
-    } = identify_result
-    else {
-        panic!("expected a successful IdentifyResult, got {identify_result:?}");
-    };
-
-    let channel_list: ServerMessage = stream.recv().await.unwrap().unwrap();
-    assert!(matches!(channel_list, ServerMessage::ChannelList(_)));
-
-    you
-}
-
-async fn spawn_test_server(auth: AuthConfig) -> std::net::SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        let _ = serve(listener, auth).await;
-    });
-    addr
-}
-
-/// Like `spawn_test_server`, but with a `heartbeat_timeout` (§4.1) short
-/// enough to actually wait out in a test - the real `HEARTBEAT_TIMEOUT`
-/// (30s) would make these tests unusably slow.
-async fn spawn_test_server_with_heartbeat_timeout(
-    auth: AuthConfig,
-    heartbeat_timeout: std::time::Duration,
-) -> std::net::SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        let _ = serve_with_heartbeat_timeout(listener, auth, heartbeat_timeout).await;
-    });
-    addr
-}
-
 /// @requirement AC-019, AC-024
 #[tokio::test]
 async fn end_to_end_two_clients_join_and_learn_about_each_other() {
-    let addr = spawn_test_server(AuthConfig::None).await;
+    let server = TestServer::spawn(test_options("e2e")).await;
 
-    let mut a = ControlEndpoint::new(TcpStream::connect(addr).await.unwrap());
-    let alice_id = handshake_no_auth(&mut a, "alice").await;
+    let mut a = server.connect().await;
+    let alice_id = server.handshake(&mut a, "alice").await;
 
-    let mut b = ControlEndpoint::new(TcpStream::connect(addr).await.unwrap());
-    let bob_id = handshake_no_auth(&mut b, "bob").await;
+    let mut b = server.connect().await;
+    let bob_id = server.handshake(&mut b, "bob").await;
 
     a.send(&ClientMessage::JoinChannel {
         name: "general".into(),
@@ -927,12 +1041,12 @@ async fn end_to_end_two_clients_join_and_learn_about_each_other() {
 /// @requirement AC-108
 #[tokio::test]
 async fn end_to_end_a_second_client_sees_a_newly_created_public_channel() {
-    let addr = spawn_test_server(AuthConfig::None).await;
+    let server = TestServer::spawn(test_options("e2e")).await;
 
-    let mut a = ControlEndpoint::new(TcpStream::connect(addr).await.unwrap());
-    handshake_no_auth(&mut a, "alice").await;
-    let mut b = ControlEndpoint::new(TcpStream::connect(addr).await.unwrap());
-    handshake_no_auth(&mut b, "bob").await;
+    let mut a = server.connect().await;
+    server.handshake(&mut a, "alice").await;
+    let mut b = server.connect().await;
+    server.handshake(&mut b, "bob").await;
 
     a.send(&ClientMessage::JoinChannel {
         name: "watercooler".into(),
@@ -958,12 +1072,12 @@ async fn end_to_end_a_second_client_sees_a_newly_created_public_channel() {
 /// @requirement AC-104, AC-105
 #[tokio::test]
 async fn end_to_end_password_protected_channel_join_flow() {
-    let addr = spawn_test_server(AuthConfig::None).await;
+    let server = TestServer::spawn(test_options("e2e")).await;
 
-    let mut a = ControlEndpoint::new(TcpStream::connect(addr).await.unwrap());
-    handshake_no_auth(&mut a, "alice").await;
-    let mut b = ControlEndpoint::new(TcpStream::connect(addr).await.unwrap());
-    handshake_no_auth(&mut b, "bob").await;
+    let mut a = server.connect().await;
+    server.handshake(&mut a, "alice").await;
+    let mut b = server.connect().await;
+    server.handshake(&mut b, "bob").await;
 
     a.send(&ClientMessage::JoinChannel {
         name: "vault".into(),
@@ -1009,12 +1123,12 @@ async fn end_to_end_password_protected_channel_join_flow() {
 /// @requirement TB-082
 #[tokio::test]
 async fn end_to_end_key_rotation_is_relayed_and_rejected_appropriately() {
-    let addr = spawn_test_server(AuthConfig::None).await;
+    let server = TestServer::spawn(test_options("e2e")).await;
 
-    let mut a = ControlEndpoint::new(TcpStream::connect(addr).await.unwrap());
-    let alice_id = handshake_no_auth_with_mode(&mut a, "alice", KeyMode::PqHybrid).await;
-    let mut b = ControlEndpoint::new(TcpStream::connect(addr).await.unwrap());
-    let bob_id = handshake_no_auth_with_mode(&mut b, "bob", KeyMode::PqHybrid).await;
+    let mut a = server.connect().await;
+    let alice_id = server.handshake_with_mode(&mut a, "alice", KeyMode::PqHybrid).await;
+    let mut b = server.connect().await;
+    let bob_id = server.handshake_with_mode(&mut b, "bob", KeyMode::PqHybrid).await;
 
     // alice rotates her key for bob - relayed verbatim as KeyRotated.
     a.send(&ClientMessage::RotateKey {
@@ -1054,41 +1168,20 @@ async fn end_to_end_key_rotation_is_relayed_and_rejected_appropriately() {
     );
 }
 
-/// @requirement AC-013
-#[tokio::test]
-async fn end_to_end_wrong_password_is_rejected() {
-    let addr = spawn_test_server(AuthConfig::Password("s3cret".into())).await;
-    let mut stream = ControlEndpoint::new(TcpStream::connect(addr).await.unwrap());
-
-    let (auth, _) = stream
-        .client_handshake(None)
-        .await
-        .unwrap()
-        .expect("server closed during handshake");
-    assert_eq!(auth, AuthKind::Password);
-
-    stream
-        .send(&ClientMessage::Auth(AuthResponse::Password("wrong".into())))
-        .await
-        .unwrap();
-    let result: ServerMessage = stream.recv().await.unwrap().unwrap();
-    assert!(matches!(
-        result,
-        ServerMessage::AuthResult { ok: false, .. }
-    ));
-}
-
 /// @requirement TB-112
 #[tokio::test]
 async fn end_to_end_stray_auth_and_identify_after_handshake_error_but_stay_connected() {
-    let addr = spawn_test_server(AuthConfig::None).await;
-    let mut a = ControlEndpoint::new(TcpStream::connect(addr).await.unwrap());
-    handshake_no_auth(&mut a, "dave").await;
+    let server = TestServer::spawn(test_options("e2e")).await;
+    let mut a = server.connect().await;
+    server.handshake(&mut a, "dave").await;
 
     // a stray Auth once already connected: an Error, not a close
-    a.send(&ClientMessage::Auth(AuthResponse::None))
-        .await
-        .unwrap();
+    a.send(&ClientMessage::Auth {
+        nickname: "dave".into(),
+        password: password_for("dave"),
+    })
+    .await
+    .unwrap();
     let after_auth: ServerMessage = a.recv().await.unwrap().unwrap();
     match after_auth {
         ServerMessage::Error { message } => {
@@ -1099,7 +1192,6 @@ async fn end_to_end_stray_auth_and_identify_after_handshake_error_but_stay_conne
 
     // a stray Identify right after: also an Error, connection still open
     a.send(&ClientMessage::Identify {
-        display_name: "dave2".into(),
         public_key_der: vec![],
         key_mode: KeyMode::PqHybrid,
     })
@@ -1111,6 +1203,25 @@ async fn end_to_end_stray_auth_and_identify_after_handshake_error_but_stay_conne
             assert!(message.contains("unexpected message after handshake"))
         }
         other => panic!("expected Error, got {other:?}"),
+    }
+
+    // and the same for a stray Activate or Register
+    for stray in [
+        ClientMessage::Activate {
+            code: "123456789012".into(),
+        },
+        ClientMessage::Register {
+            nickname: "dave".into(),
+            password: "x".into(),
+            email: "dave@example.com".into(),
+        },
+    ] {
+        a.send(&stray).await.unwrap();
+        let answer: ServerMessage = a.recv().await.unwrap().unwrap();
+        assert!(
+            matches!(answer, ServerMessage::Error { ref message } if message.contains("unexpected message after handshake")),
+            "{answer:?}"
+        );
     }
 
     // the connection is still fully usable afterward
@@ -1128,30 +1239,21 @@ async fn end_to_end_stray_auth_and_identify_after_handshake_error_but_stay_conne
 /// @requirement AC-015, AC-017
 #[tokio::test]
 async fn end_to_end_duplicate_nickname_is_rejected_and_connection_closes() {
-    let addr = spawn_test_server(AuthConfig::None).await;
+    let server = TestServer::spawn(test_options("e2e")).await;
 
-    let mut a = ControlEndpoint::new(TcpStream::connect(addr).await.unwrap());
-    let _alice_id = handshake_no_auth(&mut a, "dave").await;
+    let mut a = server.connect().await;
+    let _alice_id = server.handshake(&mut a, "dave").await;
 
-    // a second client tries to identify with the same nickname
-    let mut b = ControlEndpoint::new(TcpStream::connect(addr).await.unwrap());
-    let (auth, _) = b
-        .client_handshake(None)
-        .await
-        .unwrap()
-        .expect("server closed during handshake");
-    assert_eq!(auth, AuthKind::None);
-    b.send(&ClientMessage::Auth(AuthResponse::None))
-        .await
-        .unwrap();
-    let auth_result: ServerMessage = b.recv().await.unwrap().unwrap();
+    // a second client logs in as the same nickname - the password is
+    // right, so auth succeeds; it is Identify that is refused
+    let mut b = server.connect().await;
+    let auth_result = login(&mut b, "dave", &password_for("dave")).await;
     assert!(matches!(
         auth_result,
         ServerMessage::AuthResult { ok: true, .. }
     ));
 
     b.send(&ClientMessage::Identify {
-        display_name: "dave".into(),
         public_key_der: vec![],
         key_mode: KeyMode::PqHybrid,
     })
@@ -1192,11 +1294,11 @@ async fn end_to_end_duplicate_nickname_is_rejected_and_connection_closes() {
 /// @requirement AC-016
 #[tokio::test]
 async fn end_to_end_nickname_is_free_again_after_the_holder_disconnects() {
-    let addr = spawn_test_server(AuthConfig::None).await;
+    let server = TestServer::spawn(test_options("e2e")).await;
 
     {
-        let mut a = ControlEndpoint::new(TcpStream::connect(addr).await.unwrap());
-        handshake_no_auth(&mut a, "dave").await;
+        let mut a = server.connect().await;
+        server.handshake(&mut a, "dave").await;
         // `a` drops here, closing the connection
     }
 
@@ -1205,38 +1307,40 @@ async fn end_to_end_nickname_is_free_again_after_the_holder_disconnects() {
 
     // succeeds without the server rejecting it as a duplicate; a hang or a
     // rejection here would fail this test via handshake_no_auth's asserts
-    let mut b = ControlEndpoint::new(TcpStream::connect(addr).await.unwrap());
-    handshake_no_auth(&mut b, "dave").await;
+    let mut b = server.connect().await;
+    server.handshake(&mut b, "dave").await;
 }
 
 /// @requirement AC-152
 #[tokio::test]
 async fn heartbeat_timeout_frees_the_nickname_without_a_clean_disconnect() {
     let heartbeat_timeout = std::time::Duration::from_millis(80);
-    let addr = spawn_test_server_with_heartbeat_timeout(AuthConfig::None, heartbeat_timeout).await;
+    let server =
+        TestServer::spawn(test_options("heartbeat").with_heartbeat_timeout(heartbeat_timeout)).await;
 
     // `a`'s socket is deliberately never closed or dropped for the rest of
     // this test - the server has to notice the silence itself, not a FIN.
-    let mut a = ControlEndpoint::new(TcpStream::connect(addr).await.unwrap());
-    handshake_no_auth(&mut a, "dave").await;
+    let mut a = server.connect().await;
+    server.handshake(&mut a, "dave").await;
 
     tokio::time::sleep(heartbeat_timeout * 3).await;
 
     // succeeds even though `a` is still technically connected - proving the
     // server freed "dave" on its own via the heartbeat timeout, not via a
     // closed socket it never got.
-    let mut b = ControlEndpoint::new(TcpStream::connect(addr).await.unwrap());
-    handshake_no_auth(&mut b, "dave").await;
+    let mut b = server.connect().await;
+    server.handshake(&mut b, "dave").await;
 }
 
 /// @requirement TB-191
 #[tokio::test]
 async fn ordinary_traffic_resets_the_heartbeat_timeout_clock() {
     let heartbeat_timeout = std::time::Duration::from_millis(150);
-    let addr = spawn_test_server_with_heartbeat_timeout(AuthConfig::None, heartbeat_timeout).await;
+    let server =
+        TestServer::spawn(test_options("heartbeat-reset").with_heartbeat_timeout(heartbeat_timeout)).await;
 
-    let mut a = ControlEndpoint::new(TcpStream::connect(addr).await.unwrap());
-    handshake_no_auth(&mut a, "dave").await;
+    let mut a = server.connect().await;
+    server.handshake(&mut a, "dave").await;
 
     // Spread well past `heartbeat_timeout`'s total span, but never silent
     // for longer than it at a stretch - each Heartbeat should reset the
@@ -1247,16 +1351,9 @@ async fn ordinary_traffic_resets_the_heartbeat_timeout_clock() {
     }
 
     // still registered: a second "dave" is refused, not accepted.
-    let mut b = ControlEndpoint::new(TcpStream::connect(addr).await.unwrap());
-    let (auth, challenge) = b.client_handshake(None).await.unwrap().unwrap();
-    assert_eq!(auth, AuthKind::None);
-    assert_eq!(challenge, None);
-    b.send(&ClientMessage::Auth(AuthResponse::None))
-        .await
-        .unwrap();
-    let _: ServerMessage = b.recv().await.unwrap().unwrap();
+    let mut b = server.connect().await;
+    let _ = login(&mut b, "dave", &password_for("dave")).await;
     b.send(&ClientMessage::Identify {
-        display_name: "dave".into(),
         public_key_der: vec![],
         key_mode: KeyMode::PqHybrid,
     })

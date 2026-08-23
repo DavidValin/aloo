@@ -78,9 +78,10 @@ fn random_bytes_never_panic_any_decoder() {
 #[test]
 fn truncating_a_valid_message_never_panics() {
     let messages: Vec<Vec<u8>> = vec![
-        proto::encode(&ClientMessage::Auth(aloo::proto::AuthResponse::Password(
-            "hunter2".into(),
-        )))
+        proto::encode(&ClientMessage::Auth {
+            nickname: "dave".into(),
+            password: "hunter2".into(),
+        })
         .unwrap(),
         proto::encode(&ServerMessage::Error {
             message: "something went wrong".into(),

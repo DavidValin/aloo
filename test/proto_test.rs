@@ -1,6 +1,6 @@
 use aloo::p2p_proto::{P2pPayload, PunchDatagram, RendezvousMessage};
 use aloo::proto::{
-    AuthKind, AuthResponse, ChannelInfo, ChannelJoinRejection, ChannelKind, ClientMessage, Content,
+    ChannelInfo, ChannelJoinRejection, ChannelKind, ClientMessage, Content,
     Envelope, KeyMode, MAX_FRAME_LEN, ProtoError, ServerMessage, UserId, UserInfo, decode, encode,
     frame, parse_frame, read_message, write_message,
 };
@@ -9,13 +9,55 @@ use aloo::proto::{
 #[test]
 fn encode_decode_roundtrip_client_message() {
     let msg = ClientMessage::Identify {
-        display_name: "dave".into(),
         public_key_der: vec![1, 2, 3, 4],
         key_mode: KeyMode::PqHybrid,
     };
     let bytes = encode(&msg).expect("encode");
     let decoded: ClientMessage = decode(&bytes).expect("decode");
     assert_eq!(msg, decoded);
+}
+
+/// The login, activation and registration messages (docs/PROTOCOL.md §5)
+/// and their answers survive the wire intact.
+/// @requirement TB-060, AC-013
+#[test]
+fn auth_activate_and_register_messages_roundtrip() {
+    let messages = [
+        ClientMessage::Auth {
+            nickname: "dave".into(),
+            password: "hunter2".into(),
+        },
+        ClientMessage::Activate {
+            code: "123456789012".into(),
+        },
+        ClientMessage::Register {
+            nickname: "dave".into(),
+            password: "hunter2".into(),
+            email: "dave@example.com".into(),
+        },
+    ];
+    for msg in &messages {
+        assert_eq!(&decode::<ClientMessage>(&encode(msg).unwrap()).unwrap(), msg);
+    }
+    let answers = [
+        ServerMessage::AuthResult {
+            ok: false,
+            activation_pending: true,
+            reason: None,
+        },
+        ServerMessage::AuthResult {
+            ok: true,
+            activation_pending: false,
+            reason: None,
+        },
+        ServerMessage::RegisterResult {
+            ok: false,
+            reason: Some("this server does not take registrations".into()),
+        },
+    ];
+    for msg in &answers {
+        assert_eq!(&decode::<ServerMessage>(&encode(msg).unwrap()).unwrap(), msg);
+    }
 }
 
 /// @requirement TB-060
@@ -529,9 +571,8 @@ async fn async_write_then_read_message_roundtrip() {
 
     let (encap, _) = aloo::crypto::pq::generate_encryption_keys();
     let hello = ServerMessage::Hello {
-        auth: AuthKind::Rsa,
-        challenge: Some(vec![1, 2, 3]),
-        control: aloo::control::make_offer(encap, None).expect("offer"),
+        registration_open: true,
+        control: aloo::control::make_offer(encap),
     };
     write_message(&mut server, &hello).await.expect("write");
 
@@ -609,7 +650,10 @@ async fn async_stream_carries_multiple_messages_in_order() {
         ClientMessage::LeaveChannel {
             name: "general".into(),
         },
-        ClientMessage::Auth(AuthResponse::Password("hunter2".into())),
+        ClientMessage::Auth {
+            nickname: "dave".into(),
+            password: "hunter2".into(),
+        },
     ];
     for m in &msgs {
         write_message(&mut server, m).await.unwrap();
@@ -662,7 +706,6 @@ fn user_info_roundtrips_with_every_key_mode_variant() {
 #[test]
 fn identify_roundtrips_with_its_key_mode() {
     let msg = ClientMessage::Identify {
-        display_name: "alice".into(),
         public_key_der: vec![1, 2, 3],
         key_mode: KeyMode::PqHybrid,
     };

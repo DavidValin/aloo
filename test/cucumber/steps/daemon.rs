@@ -13,7 +13,7 @@
 
 use cucumber::{given, then, when};
 
-use aloo::client::connect::{ConnectCache, ServerKeySelection};
+use aloo::client::connect::ConnectCache;
 use aloo::client::daemon::{DaemonChannel, DaemonConfig, DaemonFlags, DaemonFocus, DaemonPlan};
 use aloo::settings::Settings;
 
@@ -169,13 +169,19 @@ async fn started_bare(w: &mut AlooWorld) {
     resolve(w).await;
 }
 
-#[when(expr = "the daemon is started with both --server-pwd and --server-key")]
-async fn started_with_both_credentials(w: &mut AlooWorld) {
-    let f = flags(w);
-    f.host = Some("chat.example".to_string());
-    f.server_pwd = Some("pw".to_string());
-    f.server_key_file = Some("/k.pub".into());
+#[when(expr = "the daemon is started with --host={word} but no password")]
+async fn started_with_host_but_no_password(w: &mut AlooWorld, host: String) {
+    flags(w).host = Some(host);
     resolve(w).await;
+    // `resolve` alone does not refuse an empty password (a serverless
+    // start is legitimately allowed one) - `run` is what does, through
+    // this same pure check, before it ever touches a socket.
+    if let Some(config) = &w.daemon_config
+        && let Err(e) = config.ensure_startable()
+    {
+        w.daemon_config = None;
+        w.daemon_error = Some(e);
+    }
 }
 
 /// Runs the resolution every `When` above ends in, recording either the
@@ -279,14 +285,6 @@ async fn focus_is_dm(w: &mut AlooWorld, nickname: String) {
         Some(DaemonFocus::Dm { nickname: got, .. }) => assert_eq!(got, &nickname),
         other => panic!("expected a DM focus on {nickname}, got {other:?}"),
     }
-}
-
-#[then(expr = "it uses the server password {string}")]
-async fn uses_server_password(w: &mut AlooWorld, password: String) {
-    assert_eq!(
-        config(w).server_key,
-        ServerKeySelection::Password(password)
-    );
 }
 
 #[then(expr = "it refuses to start, saying {string}")]

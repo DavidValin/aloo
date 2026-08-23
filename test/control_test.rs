@@ -3,20 +3,16 @@
 
 use aloo::control::{
     ControlEndpoint, ControlReader, ControlWriter, accept_offer, make_offer, open_accept,
-    verify_offer,
 };
 use aloo::crypto::pq::generate_encryption_keys;
-use aloo::crypto::KeyPair;
-use aloo::proto::{AuthKind, AuthResponse, ClientMessage, ServerMessage};
-
-const TEST_BITS: usize = 1024;
+use aloo::proto::{ClientMessage, ServerMessage};
 
 /// Both sides derive the same directional keys from one exchange.
 /// @requirement AC-126
 #[tokio::test]
 async fn both_sides_agree_on_the_same_keys() {
     let (encap, decap) = generate_encryption_keys();
-    let offer = make_offer(encap, None).expect("offer");
+    let offer = make_offer(encap);
 
     let (accept, client_keys) = accept_offer(&offer).expect("accept");
     let server_keys = open_accept(&decap, &accept).expect("server must recover the secret");
@@ -44,7 +40,7 @@ async fn both_sides_agree_on_the_same_keys() {
 async fn a_different_server_cannot_recover_the_secret() {
     let (encap, _decap) = generate_encryption_keys();
     let (_, other_decap) = generate_encryption_keys();
-    let offer = make_offer(encap, None).expect("offer");
+    let offer = make_offer(encap);
 
     let (accept, _) = accept_offer(&offer).expect("accept");
 
@@ -61,7 +57,7 @@ async fn a_different_server_cannot_recover_the_secret() {
 #[tokio::test]
 async fn frames_are_sealed_once_the_tunnel_is_on() {
     let (encap, decap) = generate_encryption_keys();
-    let offer = make_offer(encap, None).expect("offer");
+    let offer = make_offer(encap);
     let (accept, client_keys) = accept_offer(&offer).expect("accept");
     let server_keys = open_accept(&decap, &accept).expect("recover");
 
@@ -69,7 +65,10 @@ async fn frames_are_sealed_once_the_tunnel_is_on() {
     let mut wr = ControlWriter::new(client_side);
     let mut rd = ControlReader::new(server_side);
 
-    let secret = ClientMessage::Auth(AuthResponse::Password("hunter2".into()));
+    let secret = ClientMessage::Auth {
+        nickname: "dave".into(),
+        password: "hunter2".into(),
+    };
 
     // In the clear first, which is how the handshake itself travels.
     wr.send(&secret).await.expect("send");
@@ -91,15 +90,16 @@ async fn frames_are_sealed_once_the_tunnel_is_on() {
 #[tokio::test]
 async fn the_password_is_not_recoverable_from_the_sealed_bytes() {
     let (encap, decap) = generate_encryption_keys();
-    let offer = make_offer(encap, None).expect("offer");
+    let offer = make_offer(encap);
     let (accept, client_keys) = accept_offer(&offer).expect("accept");
     let _ = open_accept(&decap, &accept).expect("recover");
 
     let mut wr = ControlWriter::new(Vec::new());
     wr.enable(client_keys.send);
-    wr.send(&ClientMessage::Auth(AuthResponse::Password(
-        "hunter2-in-the-clear".into(),
-    )))
+    wr.send(&ClientMessage::Auth {
+        nickname: "dave".into(),
+        password: "hunter2-in-the-clear".into(),
+    })
     .await
     .expect("send");
     let buffer = wr.into_inner();
@@ -117,13 +117,13 @@ async fn the_password_is_not_recoverable_from_the_sealed_bytes() {
 #[tokio::test]
 async fn repeating_a_message_does_not_repeat_the_ciphertext() {
     let (encap, _) = generate_encryption_keys();
-    let offer = make_offer(encap, None).expect("offer");
+    let offer = make_offer(encap);
     let (_, keys) = accept_offer(&offer).expect("accept");
 
     let mut wr = ControlWriter::new(Vec::new());
     wr.enable(keys.send);
 
-    let msg = ClientMessage::Auth(AuthResponse::None);
+    let msg = ClientMessage::Heartbeat;
     wr.send(&msg).await.expect("send");
     wr.send(&msg).await.expect("send");
     let buffer = wr.into_inner();
@@ -143,13 +143,13 @@ async fn repeating_a_message_does_not_repeat_the_ciphertext() {
 #[tokio::test]
 async fn a_tampered_frame_fails_to_authenticate() {
     let (encap, decap) = generate_encryption_keys();
-    let offer = make_offer(encap, None).expect("offer");
+    let offer = make_offer(encap);
     let (accept, client_keys) = accept_offer(&offer).expect("accept");
     let server_keys = open_accept(&decap, &accept).expect("recover");
 
     let mut wr = ControlWriter::new(Vec::new());
     wr.enable(client_keys.send);
-    wr.send(&ClientMessage::Auth(AuthResponse::None))
+    wr.send(&ClientMessage::Heartbeat)
         .await
         .expect("send");
     let mut buffer = wr.into_inner();
@@ -166,73 +166,6 @@ async fn a_tampered_frame_fails_to_authenticate() {
     );
 }
 
-// ---------------------------------------------------------------------
-// Server authentication
-// ---------------------------------------------------------------------
-
-/// @requirement AC-128
-#[tokio::test]
-async fn a_client_holding_the_server_key_requires_a_valid_signature() {
-    let server = KeyPair::generate_with_bits(TEST_BITS).expect("keygen");
-    let (encap, _) = generate_encryption_keys();
-
-    let signed = make_offer(encap.clone(), Some(&server.private)).expect("offer");
-    assert!(
-        verify_offer(&signed, Some(&server.public)),
-        "the server's own signature must satisfy a client holding its key"
-    );
-
-    let unsigned = make_offer(encap, None).expect("offer");
-    assert!(
-        !verify_offer(&unsigned, Some(&server.public)),
-        "an unsigned offer is exactly what a man in the middle would send"
-    );
-}
-
-/// @requirement AC-128
-#[tokio::test]
-async fn an_offer_signed_by_another_key_is_refused() {
-    let server = KeyPair::generate_with_bits(TEST_BITS).expect("keygen");
-    let impostor = KeyPair::generate_with_bits(TEST_BITS).expect("keygen");
-    let (encap, _) = generate_encryption_keys();
-
-    let offer = make_offer(encap, Some(&impostor.private)).expect("offer");
-    assert!(!verify_offer(&offer, Some(&server.public)));
-}
-
-/// Substituting the keys inside a signed offer breaks the signature - the
-/// whole point of signing it.
-/// @requirement AC-128
-#[tokio::test]
-async fn swapping_the_keys_inside_a_signed_offer_is_refused() {
-    let server = KeyPair::generate_with_bits(TEST_BITS).expect("keygen");
-    let (encap, _) = generate_encryption_keys();
-    let (other_encap, _) = generate_encryption_keys();
-
-    let mut offer = make_offer(encap, Some(&server.private)).expect("offer");
-    offer.encap = other_encap;
-
-    assert!(
-        !verify_offer(&offer, Some(&server.public)),
-        "a man in the middle swapping in their own keys must be caught"
-    );
-}
-
-/// A client with no server key has nothing to check against, and says so
-/// by accepting the offer - encrypted, but not authenticated.
-/// @requirement AC-128
-#[tokio::test]
-async fn a_client_without_a_server_key_accepts_any_offer() {
-    let (encap, _) = generate_encryption_keys();
-    let offer = make_offer(encap, None).expect("offer");
-
-    assert!(
-        verify_offer(&offer, None),
-        "with nothing to check against, the offer is taken as given - encrypted, \
-         but not authenticated, which is the documented limit of this mode"
-    );
-}
-
 /// The endpoint's handshake helper drives the whole exchange.
 /// Exercises the same send path the live client uses, through the
 /// `ControlSink` seam that lets a split-stream writer and a sequential
@@ -242,14 +175,13 @@ async fn a_client_without_a_server_key_accepts_any_offer() {
 async fn the_endpoint_handshake_turns_the_channel_on() {
     let (client_side, server_side) = tokio::io::duplex(8192);
     let (encap, decap) = generate_encryption_keys();
-    let offer = make_offer(encap, None).expect("offer");
+    let offer = make_offer(encap);
 
     let server = tokio::spawn(async move {
         let mut server = ControlEndpoint::new(server_side);
         server
             .send(&ServerMessage::Hello {
-                auth: AuthKind::None,
-                challenge: None,
+                registration_open: true,
                 control: offer,
             })
             .await
@@ -260,21 +192,20 @@ async fn the_endpoint_handshake_turns_the_channel_on() {
         };
         server.enable(open_accept(&decap, &accept).expect("recover"));
         let sealed: ClientMessage = server.recv().await.expect("recv").expect("some");
-        assert_eq!(sealed, ClientMessage::Auth(AuthResponse::None));
+        assert_eq!(sealed, ClientMessage::Heartbeat);
     });
 
     let mut client = ControlEndpoint::new(client_side);
-    let (auth, challenge) = client
-        .client_handshake(None)
+    let registration_open = client
+        .client_handshake()
         .await
         .expect("handshake")
         .expect("some");
-    assert_eq!(auth, AuthKind::None);
-    assert_eq!(challenge, None);
+    assert!(registration_open, "what Hello said is handed back");
     // Through the trait, exactly as `channel`/`p2p`/`direct_message` send.
     use aloo::control::ControlSink;
     client
-        .send_control(&ClientMessage::Auth(AuthResponse::None))
+        .send_control(&ClientMessage::Heartbeat)
         .await
         .expect("send");
 

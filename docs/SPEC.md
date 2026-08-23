@@ -83,15 +83,31 @@ Two further `[[test]]` targets sit alongside the per-module ones and don't follo
 
 ## Server startup
 
-The server is started as:
+The server is started as `aloo --server [--bind <ADDR>] [--port <PORT>]`
+(defaults `0.0.0.0`/`7878`). There is no auth flag: every client logs in
+with a nickname and password checked against the server's own users
+registry (`~/.aloo/users`, docs/PROTOCOL.md §5.1) - accounts created
+either directly on the server's machine (`aloo --register-user <nickname>
+<password>`, active immediately; `aloo --change-password <nickname>
+<password>` to change one) or, if `server_allow_registration=on`, by
+anyone from the connect screen's Register button, activated with an
+emailed code (§5.2, §5.3). TLS (`server_ssl`, §1.4), registration, and the
+SMTP relay activation email goes out through are all settings-only - set
+them in `~/.aloo/settings`, not on the command line. The server always
+seeds one default public channel, `the-hall`, so a freshly started server
+has something for the first-connected client to join.
 
-- `aloo --server` — no auth, open to anyone.
-- `aloo --server --enc rsa <keyfile>` — server holds an RSA keypair loaded from `<keyfile>`; clients authenticate/encrypt against it.
-- `aloo --server --password <MYPASSWORD>` — server checks a single shared password against every connecting client.
-
-Other server flags: `--bind <ADDR>` (default `0.0.0.0`), `--port <PORT>` (default `7878`). The server always seeds one default public channel, `the-hall`, so a freshly started server has something for the first-connected client to join.
-
-Every server start persists its resolved `--bind`/`--port`/auth choice to `~/.aloo/settings` (`server_bind`, `server_port`, `server_auth_type` + its one associated value). Any of `--bind`, `--port`, `--enc`, `--password` given on the command line wins and gets persisted; whichever of these flags is *not* given falls back to what's already in `~/.aloo/settings`. So `aloo --server` alone reuses this machine's last server configuration in full - including auth - and a supervisor that restarts a crashed server with the exact same bare `aloo --server` command comes back up listening the same way, without needing to remember or re-pass the original flags.
+Every server start persists its resolved `--bind`/`--port` to
+`~/.aloo/settings` (`server_bind`, `server_port`). Either flag given on
+the command line wins and gets persisted; whichever is *not* given falls
+back to what's already in `~/.aloo/settings`. So `aloo --server` alone
+reuses this machine's last bind address and port, and a supervisor that
+restarts a crashed server with the exact same bare `aloo --server`
+command comes back up listening the same way, without needing to
+remember or re-pass the original flags. `server_ssl`/
+`server_allow_registration`/`server_smtp_*` are written (even to an empty
+value) on the very first start and never touched by a flag at all - an
+operator edits them in the settings file directly.
 
 ## UI
 
@@ -99,20 +115,27 @@ Every server start persists its resolved `--bind`/`--port`/auth choice to `~/.al
 
 A modal is shown, 64 columns wide - clamped to the terminal's own width if it's narrower than that, so this is a target rather than an absolute floor - centered vertically and horizontally, containing the details to connect. Either way it's noticeably wider than the original 50-column box it replaced. Focus defaults to the **host** field the moment the popup opens, with a blinking text cursor at the end of its (initially empty) value — same as every other text field once it's focused (see below).
 
-- **host / ip**, **port**, **nickname** — each its own titled, bordered box (not just a plain label/value line).
+- **host / ip**, **port**, **nickname**, **password** — each its own titled, bordered box (not just a plain label/value line).
   - **nickname** — the display name used in channels and DMs; must be unique among currently connected clients (see Functionality below), capped at 10 characters (typing beyond the limit is a no-op), no whitespace allowed.
-- **id_store** — its own titled, bordered box, same as host/port/nickname — the file path for the local identity-pinning store (see Functionality #8 below). Prefilled with `idstore::default_path()`'s result: always `~/.aloo/ids_store` — the app never reads or writes a loose file in the current working directory of its own accord. A plain editable text field — any path is accepted, and it doesn't need to exist yet, so a user who deliberately wants it somewhere else (including a local file) can still type one in.
-- **server_key** (2 fields wrapped in a border) — this key is used to authenticate to the server
-  - type: `rsa` / `password` / `none`
-  - if `rsa`: a file field, selected via the in-TUI file browser
-  - if `password`: a text input field for the password
-  - if `none`: no additional field
+  - **password** — the nickname's password on this server, checked against the users registry (docs/PROTOCOL.md §5.1). Rendered as asterisks; accepts any character; never remembered between runs, unlike every other field here.
+- **email** and the **Register** button — shown only while `registration_available` is true, captured once from the local `server_allow_registration` setting when the popup opens; a server that takes no registrations shows neither, and Tab never lands on either. **email** is its own titled, bordered box, read only by Register - Connect never looks at it. Refuses whitespace while typing; must look like an email address to register with.
+- there is no **ssl** field at all: like `server_ssl` on the server side, whether the control connection dials over TLS (docs/PROTOCOL.md §1.4) is settings-only (`connect_ssl` in `~/.aloo/settings`), captured silently once when the popup opens and carried into the connection, with no key anywhere in the popup able to change it.
 - **my_key** (2 fields wrapped in a border, titled `my_key (pq_hybrid)`) — this key is used to decrypt messages addressed to the user. There is no type to choose: `pq_hybrid` is the only peer-to-peer scheme this app has (quantum-resistant, hedged with classical RSA-4096), so the group's title names it and the two fields under it are the keybundle itself.
   - `file_pub` and `file_priv`, pointing at a keybundle. They never start blank: they're prefilled — from `~/.aloo/.cache`'s most-recently-used entry if one exists (`docs/PROTOCOL.md` §13.9's connect-popup cache), or otherwise a freshly-assigned, not-yet-generated location under `~/.aloo/` — and connecting auto-generates the actual keys there if they don't exist yet, so this never blocks on manual preparation. Overridable by hand, including pointing at one `aloo --keygen-pq-hybrid <prefix>` produced externally — there's no `openssl`-equivalent for ML-DSA-87/ML-KEM-1024, but running it yourself is not required. See Functionality #10 and `docs/PROTOCOL.md` §13, §13.9.
-- **ALOO_HOME** — a read-only line directly above the Connect button, reading `ALOO_HOME=<path>`, drawn in gray so it reads as a note rather than another field to fill in. It names the directory this client actually resolved (`platform::aloo_dir`), which every piece of local state lives under — `id_store`, the connect cache, `settings`, and the OTP layer's `otp_store`/`otp/.keychain/`. It is spelled as the environment variable that sets it, so the line doubles as the answer to "how do I run a second client on this machine": `ALOO_HOME=/tmp/aloo-bob aloo`. Captured once when the popup opens, so rendering stays a pure function of the popup's own state.
-- **Connect button** — a bordered button below the fields, highlighted when focused. The highlight (solid background) fills only the button's interior; its border keeps its own plain/focus style rather than being swallowed into the highlighted fill, consistent with every other bordered/focusable element in this app. Tab cycles through every field in order and wraps around to this button; pressing Enter while it's focused validates the form and, if valid, connects. Pressing Enter on it with an invalid/incomplete form shows a validation error below instead (e.g. "host is required", "nickname is required").
+- **ALOO_HOME** — a read-only line above the buttons, reading `ALOO_HOME=<path>`, drawn in gray and centered horizontally, with a blank line of its own directly above and below it, so it reads as a note set apart from the form rather than another field to fill in. It names the directory this client actually resolved (`platform::aloo_dir`), which every piece of local state lives under, including the identity-pinning store (`idstore::default_path()`, always `$ALOO_HOME/id_store` - there is no popup field for it; it is never user-editable), the connect cache, `settings`, and the OTP layer's `otp_store`/`otp/.keychain/`. It is spelled as the environment variable that sets it, so the line doubles as the answer to "how do I run a second client on this machine": `ALOO_HOME=/tmp/aloo-bob aloo`. Captured once when the popup opens, so rendering stays a pure function of the popup's own state.
+- **Connect** button, joined by a **Register** button beside it once `registration_available` — bordered, either one highlighted when focused. The highlight (solid background) fills only the button's interior; its border keeps its own plain/focus style rather than being swallowed into the highlighted fill, consistent with every other bordered/focusable element in this app. Tab cycles through every field in order and wraps around to the first; Connect is always last unless Register is showing, in which case Register is. Enter on **Connect** validates host/port/nickname/password/my_key and, if valid, connects; on an incomplete form it shows a validation error below instead (e.g. "host is required", "password is required"). Enter on **Register** validates the same plus a plausible email and a registrable nickname, and on success shows a green notice ("registered - check `<email>` for the activation code, then Connect") instead of connecting - registering is never also a login.
 
-Every focused text field (host/port/nickname/id_store, and a `password`-type `server_key` value) shows a blinking cursor at the end of its current value, not just a reversed-color highlight.
+A login whose credentials are right but whose account is still waiting on
+its emailed activation code opens a small popup asking for it
+(docs/PROTOCOL.md §5.2): a 12-digit numeric field, Enter to submit (a
+short code shows a validation error instead), Esc to give up. Submitting
+retries the connect with that code attached, as many times as it takes.
+
+Every focused text field (host/port/nickname/password/email) shows a
+blinking cursor at the end of its current value, not just a
+reversed-color highlight. The keyboard-shortcut hint at the very bottom of
+the popup - the last element in its layout - is centered horizontally too,
+the same as the ALOO_HOME line above it.
 
 `my_key` is the user's own key material, loaded from the keybundle pair the two fields name. It uses the hybrid scheme in Functionality #10, including its own ongoing key-rotation behavior for the rest of the session.
 
@@ -126,9 +149,9 @@ Every focused text field (host/port/nickname/id_store, and a `password`-type `se
 
 The UI is composed of:
 
-- **Top area** (full width, three rows tall) — one blank line, then the row itself, then another blank line, with its content inset one column from each side, so it reads as sitting in the middle of its own band rather than pinned to the screen's edges. Borderless, and drawn identically over an open DM room, which is reached through it. That row opens with the **server state** indicator; then, starting at the column the message list below starts at (the sidebar's width — so the two line up), two selectors laid out as tabs, one focused at a time: the **channel selector** on the left and the **DM selector** on the right; followed right-aligned by, in order: the **🔴 Call Ctrl+R** indicator (only while on a call — Functionality #14), two spaces, a **Conn:`<-|BAD|NORMAL|GOOD>`** indicator, two spaces, a **CPU:`<pct>`%** indicator, two spaces, the **Ctrl+H: Help** hint (Functionality #6).
-  - **Server state** — the first thing on the row, and the only thing left of the selectors. One of, with a server (`docs/PROTOCOL.md` §4.2): **🟢 Connected to server!** in green; **🔴 Reconnecting...** in red while an attempt is actually in flight; **🔴 Reconnecting in `<n>`s...** in red while waiting for the next one, the number counting down live; and, once three attempts have failed, **🔴 Server down (reconnecting in `<n>` sec...)** in red, which keeps counting down and keeps retrying for as long as the session lasts. With `--no-server` (Functionality #18) it instead reads **⚪ No server mode** in white, or **⚪ No server mode (punching)** while a direct UDP punch is in flight — there is nothing to reconnect to, and punching is the only thing this client does to reach anybody. A label too long for the sidebar's width pushes the selectors right rather than being cut off: a countdown missing its number says nothing.
-  - **Channel selector** — names the one joined channel currently on screen as `<icon> #<name>`: an emoji naming its kind at a glance (🌍 for public, 🔒 for private), then `#` and the name. That `#` is decoration — it is never stored and never sent on the wire — and typing it back in is fine (see "Channels" below). Then `+<n> more...` in grey for however many other channels the user is joined to. Only the named channel itself carries the focus highlight — the count, like the envelope below, is always drawn grey with nothing behind it. `[` opens its dropdown — hanging off the bottom of that three-row band, lined up under the selector it belongs to: every joined channel *except* the one named, public and private alike, each written the same `<icon> #<name>` way. Nothing to switch to means no dropdown opens. Either dropdown hangs directly beneath the selector it belongs to — lined up with that selector's own first column, not with the screen's left edge, which the server-state element occupies. A dropdown with more entries than the screen has rows below the header stops at the bottom edge and scrolls inside it rather than drawing rows nobody can see: the entries around the current selection are kept in view as Up/Down walk the list, and a one-column scrollbar is drawn down its right edge while — and only while — there is more list than viewport, exactly as the message log's own is.
+- **Top area** (full width, three rows tall) — one blank line, then the row itself, then another blank line, with its content inset one column from each side, so it reads as sitting in the middle of its own band rather than pinned to the screen's edges. Borderless, and drawn identically over an open DM room, which is reached through it. That row opens with the **server state** indicator; then, starting at the column the message list below starts at (the sidebar's width — so the two line up), two selectors laid out as tabs, one focused at a time: the **channel selector** on the left and the **DM selector** on the right; followed right-aligned by, in order: the **⏺ Call Ctrl+R** indicator (only while on a call — Functionality #14), two spaces, a **Conn:`<-|BAD|NORMAL|GOOD>`** indicator, two spaces, a **CPU:`<pct>`%** indicator, two spaces, the **Ctrl+H: Help** hint (Functionality #6).
+  - **Server state** — the first thing on the row, and the only thing left of the selectors. Every state renders the same plain record-circle glyph (⏺, `ServerLinkState::ICON`) - never a multicolour emoji - so the colour shown is always exactly the one the header applies, never one baked into the character itself. One of, with a server (`docs/PROTOCOL.md` §4.2): **⏺ Connected to server!** in green; **⏺ Reconnecting...** in red while an attempt is actually in flight; **⏺ Reconnecting in `<n>`s...** in red while waiting for the next one, the number counting down live; and, once three attempts have failed, **⏺ Server down (reconnecting in `<n>` sec...)** in red, which keeps counting down and keeps retrying for as long as the session lasts. With `--no-server` (Functionality #18) it instead reads **⏺ No server mode** in white, or **⏺ No server mode (punching)** while a direct UDP punch is in flight — there is nothing to reconnect to, and punching is the only thing this client does to reach anybody. A label too long for the sidebar's width pushes the selectors right rather than being cut off: a countdown missing its number says nothing.
+  - **Channel selector** — names the one joined channel currently on screen as `#<name>`, private ones prefixed `🔒 ` and public ones carrying no icon at all - a bare `#name` is itself the "this one is public" signal. That `#` is decoration — it is never stored and never sent on the wire — and typing it back in is fine (see "Channels" below). Then `+<n> more...` in grey for however many other channels the user is joined to. Only the named channel itself carries the focus highlight — the count, like the envelope below, is always drawn grey with nothing behind it. `[` opens its dropdown — hanging off the bottom of that three-row band, lined up under the selector it belongs to: every joined channel *except* the one named, public and private alike, each written the same way. Nothing to switch to means no dropdown opens. Either dropdown hangs directly beneath the selector it belongs to — lined up with that selector's own first column, not with the screen's left edge, which the server-state element occupies. A dropdown with more entries than the screen has rows below the header stops at the bottom edge and scrolls inside it rather than drawing rows nobody can see: the entries around the current selection are kept in view as Up/Down walk the list, and a one-column scrollbar is drawn down its right edge while — and only while — there is more list than viewport, exactly as the message log's own is.
   - **DM selector** — the same, for the private rooms the user has open: the nickname of the one it names (prefixed 💬), then the `🔑 OTP` tag if a one-time-pad session is open with that person (see the tag convention below), then `+<n> more...` in grey. Its dropdown rows carry that same tag, each on the row of the person it is about. Not rendered at all until a room has been opened; every open room counts, including one opened and never written in. `]` opens its dropdown: every open room except the one named. Focusing this selector opens the room it names in place of the channel view.
   - **Unread envelope** — ✉ (U+2709, the plain text-style glyph — never an emoji-presentation variant, so it draws as one flat character with no colour block behind it), blinking, on either selector while any channel or room behind it holds messages that have not been looked at yet. The focus highlight covers the selector's own name and stops before the envelope, so nothing paints a background around it; it keeps blinking until that channel or room is opened. While a selector's own dropdown is open the envelope moves onto the individual rows it belongs to, so it names *which* one is unread. Presence notices never raise one. On the DM selector — and on a DM row of an open dropdown — the envelope carries the same colour as the nickname beside it (the direct-link/presence colour the sidebar uses), not a colour of its own: it blinks directly against that name, and two colours on one name read as two separate facts rather than as one person with unread messages. The channel selector's is plain white: a channel is a room rather than a person, so its envelope has no reachability to report and says nothing about one.
   - **CPU:`<pct>`%** — this client's own system-wide CPU usage, resampled roughly every 300ms. Rendered green below 25%, red at 25% and above.
@@ -136,7 +159,7 @@ The UI is composed of:
 - **Left area / sidebar** (20% wide) — list of users in the selected channel. Each row keeps the person on the **left** and their encryption tag flush against the sidebar's **right** edge, so the tags read as a column of their own rather than starting wherever each nickname happens to end. A sidebar too narrow to hold both keeps one space between them and clips at its right edge, like any other overlong sidebar entry. Each connected user is coloured by whether messages can actually reach them — that is, by the state of the direct peer-to-peer link to them (`docs/PROTOCOL.md` §7.1.4), not merely by their being connected to the server. It is a two-state answer, because that is the whole of what someone about to type needs: **green** once that link is up and what is typed reaches them, **gray** until it does. A punch still in flight, a link that has been lost and is being retried, and a connection that has closed entirely (Functionality #7) are all the same answer — no — and giving each its own colour only invites reading transport detail into a name. Being present in the channel is not the same as being reachable, and this is where the difference shows. One state overrides the colour: a user whose identity hasn't been verified yet, or was explicitly rejected (Functionality #8), is rendered in **red** regardless of anything else. That is not a reachability state at all but the one thing here with something to *do* about it (Enter opens the review). **Your own row is always last**, named plainly in green (you are always reachable to yourself) and suffixed ` (me)` in gray — that suffix's colour never follows whatever colour the name itself takes. Enter on it does nothing: there is no DM to open with yourself.
 - **Identity review popup** — a centered, bordered popup that opens automatically (announced with the same bell chime an incoming file offer plays — every popup that lands asking for a decision chimes: identity review, OTP session invites and generate-confirms, file offers, incoming OTP mail), on top of whatever else is on screen (even the help overlay). Messaging with the mismatched peer is blocked the instant their identity fails to check out (Functionality #8), but the popup itself is briefly withheld — until this specific connection's own address/device id are known, usually a second or two later — so it can show both sides of the comparison instead of just two fingerprints. Names the peer, explains the specific mismatch plus the last-known and new address/device id, and offers two buttons, **Accept** and **Reject** (`Reject` focused by default); `Left`/`Right`/`Tab` move focus between them, `Enter` confirms - no other key does anything while it's open, and there's no Esc-to-dismiss, since the whole point is an explicit decision rather than a wait-and-see banner. If more than one peer's identity is unresolved at once, only the oldest unshown one is displayed; resolving it (either button) reveals the next.
 - **Call invite popup** — same shape as the file-offer popup below (centered, chimed, **Accept** focused by default), titled `Voice call incoming from <nickname>` — see Functionality #14.
-- **Permanent call indicator** — while on a call, a red bordered box in the top-right corner (just above where the status notice would show) reads `🔴 On a call [in #<channel>] (<n> connected)`, with ` 🔇 muted` appended while muted. Unlike the status notice, it never times out on its own — it's cleared only by leaving the call (Functionality #14). The top row's own `🔴 Call Ctrl+R` marker is the separate, one-line reminder of the key that brings the call modal back once Escape has folded it away.
+- **Permanent call indicator** — while on a call, a red bordered box in the top-right corner (just above where the status notice would show) reads `⏺ On a call [in #<channel>] (<n> connected)`, with ` 🔇 muted` appended while muted. Unlike the status notice, it never times out on its own — it's cleared only by leaving the call (Functionality #14). The top row's own `⏺ Call Ctrl+R` marker is the separate, one-line reminder of the key that brings the call modal back once Escape has folded it away.
 - **Main area** (80% wide) — messages in the selected channel.
 - **Bottom bar** (full width) — text input where the user composes and sends a message; the cursor blinks at the end of the typed text whenever this bar is focused (the default focus on connecting). While viewing a private room whose peer is offline, this bar instead shows `(user offline)` in red and refuses all typing (Functionality #7).
 
@@ -315,7 +338,7 @@ When a channel is joined, the join is broadcast to all users already in the chan
         - **The live duration sits on top**, in yellow, ticking every second.
         - **Below it, everyone on the call**: the **host** (whoever ran `/call`) first, named `<nickname> (host)` rather than carrying a label of its own — your own row reads `<nickname> (you)`, and both marks together on your own call. Each row then carries where that person stands — `IN CALL` in green, `INVITED` in yellow for an invite nobody has answered yet, `REJECTED` in grey for one that was declined — plus `MUTED` in red if they cannot currently be heard — whether they silenced themselves or the host did, since the row answers "can I hear this person right now" — and a **live voice-level bar** that moves with what they are actually saying. Every row is `<nickname> <labels> <voice meter>` and all three columns line up down the list: the name column is as wide as the widest name in *this* call, followed by four columns of gap so a name that fills it never runs into its label; the label column is as wide as the widest label pair in the call, and the meters sit flush against the modal's right edge — so a `MUTED` appearing on one row never slides that row's bar out of line with the others. The modal itself is only as wide and as tall as the call in it needs: two people with short names get a small modal rather than a fixed box with blank columns down its middle. Your own bar reads empty while you are muted. Only the host ever sees `INVITED`/`REJECTED`: everyone else learns the roster purely from who is actually on the call.
         - **The list scrolls**; Up/Down move the cursor and it stays in view.
-        - **`Esc` folds the modal away** into the top row's `🔴 Call Ctrl+R` indicator — a red-bordered box filling the header band's full height, sitting immediately left of the status figures — so the ordinary sidebar/messages/compose layout is usable again. **`Ctrl+R`** brings it back up over that layout. `[`/`]` work through the modal too — they fold it away first, so it doesn't reappear on top of whatever was navigated to.
+        - **`Esc` folds the modal away** into the top row's `⏺ Call Ctrl+R` indicator — a red-bordered box filling the header band's full height, sitting immediately left of the status figures — so the ordinary sidebar/messages/compose layout is usable again. **`Ctrl+R`** brings it back up over that layout. `[`/`]` work through the modal too — they fold it away first, so it doesn't reappear on top of whatever was navigated to.
         - **`END CALL`** (Enter, or `e`) **asks first**: a small red-bordered box over the modal, `Leave this call?`, with `END CALL` and `Cancel` — `Cancel` focused, so a stray Enter on the modal's default button costs nothing and leaving takes a deliberate move onto the other one. It absorbs every key while it is up (Escape answers it the same as Cancel), so no roster key can be mistaken for an answer. Confirming leaves the call — the same thing `/endcall` does from anywhere once the modal is out of the way, which is not gated: typing a command is already deliberate.
         - **`m` on your own row mutes your own microphone**, and again unmutes it: captured audio is simply never sent while muted, so every other participant hears silence, same as an ordinary pause in talking. It stays yours alone to lift, and nothing about the call ends — but everyone is told, so every roster shows you as `MUTED` while it lasts (`docs/PROTOCOL.md` §7.7).
         - **The host can mute anyone else** with `m` on their row. Unlike muting yourself, that is not theirs to undo: the muted participant stops sending until the *host* lifts it, and everyone's roster shows it. On anyone else's row `m` does nothing for anyone but the host.
@@ -578,15 +601,19 @@ aloo --daemon --my-key=/home/you/.aloo/mykeys      # mykeys.pub + mykeys.priv
 
 Otherwise it reuses whatever you last connected with (`~/.aloo/.cache`).
 
-### Servers that need a password or a key
+### Logging in
 
 ```sh
-aloo --daemon --server-pwd=SECRET                  # server started with --password
-aloo --daemon --server-key=/path/to/server_key.pub # server started with --enc rsa
+aloo --daemon --server-pwd=SECRET   # the nickname's password on this server
+aloo --daemon --ssl                 # dial over TLS (server_ssl=on)
 ```
 
-The two are mutually exclusive. Whichever you use is remembered, so the
-next bare `aloo --daemon` reconnects the same way.
+`--server-pwd` is the one credential a headless start needs; with a
+server named but no password anywhere (flag or `daemon_server_password`
+in settings), the daemon refuses to start rather than dialling in with an
+empty one - a serverless start (`--no-server`) is the one exception, since
+it has nothing to log in to. Both are remembered, so the next bare
+`aloo --daemon` reconnects the same way.
 
 ### Focusing a person, with OTP
 
@@ -671,7 +698,7 @@ plays a tone, raises a notification, writes the reason to
 `~/.aloo/daemon.log`, and exits non-zero. It is fatal when:
 
 - the server is unreachable, or the host does not resolve;
-- authentication is rejected (wrong `--server-pwd`);
+- authentication is rejected (wrong `--server-pwd`, or none given);
 - the nickname is already taken;
 - the keybundle cannot be read;
 - **every** configured channel failed to join;
@@ -1104,10 +1131,11 @@ here that implements it. If a name changes on one side, it changes on both.
 | Encoding rules (§2) | `proto.rs` `encode`, `decode`, `bincode_config` (capped at `MAX_FRAME_LEN` — see TB-172) |
 | `ClientMessage`, `ServerMessage`, `Envelope`, `UserInfo`, `KeyMode` | `proto.rs` |
 | Control channel (§1.3) | `control.rs` `ControlOffer`, `ControlAccept`, `accept_offer`, `open_accept`, `derive`, `ControlWriter`/`ControlReader`/`ControlEndpoint`, `ControlSink` |
-| Connection lifecycle (§4), auth (§5) | `server/mod.rs` `handle_connection`, `AuthConfig`; `client/connect.rs` `connect_and_handshake` |
+| Connection lifecycle (§4), auth (§5), TLS (§1.4) | `server/mod.rs` `handle_connection`, `ServerOptions`; `server/users_registry.rs` `UsersRegistry`; `server/ssl.rs`; `client/connect.rs` `connect_and_handshake`, `open_control_channel` |
 | Liveness, `Heartbeat` (§4.1) | `proto.rs` `HEARTBEAT_INTERVAL`, `HEARTBEAT_TIMEOUT`, `ClientMessage::Heartbeat`; `server/mod.rs` `client_loop`; `client/session.rs` `run_connected_session` |
 | Reconnecting (§4.2) | `client/reconnect.rs` `ServerSink`, `ServerEvent`, `ServerLinkState`, `ReconnectPlan`, `spawn_supervisor`, `delay_after`, `RECONNECT_FIRST_DELAY`, `RECONNECT_MAX_DELAY`, `SERVER_DOWN_AFTER_ATTEMPTS`; `client/connect.rs` `connect_with_reconnect`, `handshake_as`; `client/session.rs` `handle_server_event`, `on_server_reconnected`, `forget_peer` |
 | Registration, nicknames (§5.4) | `server/mod.rs` `Registry::try_register` |
+| Login, activation, self-registration (§5.1-§5.3) | `server/users_registry.rs` `UsersRegistry`, `derive_user_key`, `AuthCheck`, `ActivationOutcome`, `generate_activation_code`, `send_activation_email`; `server/activation.rs` `AttemptLimiter`, `handle`; `client/tui/ui_connect_popup.rs` `ActivationPopupState`; `main.rs` `run_register_user`, `run_change_password` |
 | Channels (§6), password bans (§6.6) | `server/mod.rs` `Registry::{join_channel, leave_channel, unregister, channel_list, channel_password_attempts}`; `validation.rs` |
 | Direct link, candidates, punching (§7.1) | `client/p2p.rs` `PeerLinkManager`; `p2p_proto.rs` `PunchDatagram`, `RendezvousMessage`, `SAFE_DATAGRAM_BYTES` |
 | Serverless direct punch (§7.1.5) | `settings.rs` `DirectPunchTarget`, `PunchFrequency`, `DEFAULT_DIRECT_PUNCH_PORT`, `PUNCH_FREQUENCIES`; `client/p2p.rs` `configure_direct_punch`, `direct_tick`, `on_direct_ping`, `on_direct_pong`, `direct_peer_id`, `is_direct_peer_id`, `utc_second_of_hour`, `DIRECT_PUNCH_WINDOW`, `DIRECT_MAX_RECONNECTS`; `p2p_proto.rs` `MAX_DIRECT_PUNCH_NICK_LEN` |
@@ -1324,7 +1352,7 @@ the DM recording is refused outright (`direct_message.rs`).
 | Offer/accept a rotation | `crypto/pq.rs` `PqRotation`, `sign_rotation`, `verify_rotation` (signed by the durable identity, not the key replaced); `session.rs` `request_rotation` (the one trigger every send/receive path calls), `handle_pq_key_rotated` |
 | Safety phrase (eight words from a fingerprint) | `crypto/safety.rs` `phrase`, `WORDS` |
 | Encrypted control channel | `control.rs` `ControlOffer`/`ControlAccept` (handshake), `accept_offer`/`open_accept` (key transport, reusing `crypto::pq`'s hybrid wrap), `ControlWriter`/`ControlReader` (split, for the live client and server), `ControlEndpoint` (sequential, with `client_handshake`), `ControlSink` (the seam send paths take) |
-| Server proving its identity | `control.rs` `make_offer`/`verify_offer`; `server/mod.rs` `AuthConfig::signing_key` — signed only when the deployment has an RSA server key |
+| Server proving its identity | `server/ssl.rs` `SslFiles`, `load_acceptor`, `client_connector`, `accept`, `connect` — TLS, not the control channel's own (unauthenticated) offer |
 | How much a pin is worth | `client/idstore.rs` `Trust` (`tofu`/`verified`), `check_and_pin_with`, `mark_verified`, `trust` — third column of the store file |
 | Retire an identity for a new one | `crypto/pq.rs` `ContinuitySig`, `sign_continuity`, `verify_continuity`, `PqPublicBundle::with_continuity`; `main.rs` `run_rekey_pq_hybrid` (`--rekey-pq-hybrid`); `session.rs` `continuity_proven` — a proven change re-pins with a status note instead of a review |
 | Identity card (pin before first contact) | `crypto/pq.rs` `IdentityCard`, `make_identity_card`, `open_identity_card`, `save_identity_card`, `load_identity_card`; `main.rs` `run_export_identity_card` (`--export-identity-card`) |
@@ -1344,18 +1372,24 @@ the DM recording is refused outright (`direct_message.rs`).
 | Auto-generate keys if missing | `crypto/pq.rs` `ensure_bundle_at`, called from `connect.rs` `resolve_my_keypair` (`docs/PROTOCOL.md` §13.9) |
 | Connect-popup cache (`~/.aloo/.cache`) | `connect.rs` `ConnectCache`, `cache_path`, `random_prefix`, `fresh_pq_hybrid_paths_in`, `prefill_connect_defaults` |
 
-### `server_key` — a separate axis
+### Logging in — a separate axis
 
-Authenticating *to the server* is unrelated to the message encryption above and
-has only three options (`connect.rs` `ServerKeySelection`,
-`proto.rs` `AuthKind`). Client side: `connect.rs` `build_auth_response`.
-Server side: `server/mod.rs` `AuthConfig::verify`.
+Authenticating *to the server* is unrelated to the message encryption above:
+one nickname, one password, checked against the users registry
+(`server/users_registry.rs` `UsersRegistry::check_credentials`). Client
+side: `connect.rs` `handshake_as` sends `ClientMessage::Auth`. Server side:
+`server/mod.rs` `handle_connection` matches on `AuthCheck`.
 
-| Option | Check |
+| Outcome | What happens |
 | --- | --- |
-| `none` | passes unconditionally |
-| `password` | sent as-is and compared byte-for-byte in constant time (`crypto/mod.rs` `constant_time_eq`) — it is **not** hashed |
-| `rsa` | server sends a random nonce (`crypto/mod.rs` `random_bytes`, `server/mod.rs` `make_challenge`); client encrypts it with the server's public key; server decrypts and compares |
+| `AuthCheck::Ok` | the derived key matches (`crypto/mod.rs` `constant_time_eq`) and the account is activated — `AuthResult { ok: true }`, then `Identify` |
+| `AuthCheck::ActivationPending { expired: false }` | credentials right, code still owed — `AuthResult { ok: false, activation_pending: true }`, one `ClientMessage::Activate` may follow |
+| `AuthCheck::ActivationPending { expired: true }` | the code is more than `ACTIVATION_VALIDITY_SECS` old — refused, register again |
+| `AuthCheck::Rejected` | wrong password, or no such nickname — the same answer either way, so a login attempt cannot enumerate accounts |
+
+The password is never persisted: `UsersRegistry` stores only the
+PBKDF2-HMAC-SHA256 key it derives from nickname+password
+(`derive_user_key`), hex-encoded in each account's `key` file.
 
 ## Server responsibilities
 

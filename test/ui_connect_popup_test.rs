@@ -1,7 +1,8 @@
-use aloo::client::connect::{ConnectRequest, MyKeySelection, ServerKeySelection};
+use aloo::client::connect::{ConnectRequest, MyKeySelection, RegisterRequest};
 use aloo::client::file_browser::FileBrowserState;
 use aloo::client::tui::ui_connect_popup::{
-    ALOO_HOME_LABEL, Action, ConnectPopupState, Field, KeyType, NICKNAME_MAX_LEN, render,
+    ACTIVATION_CODE_LEN, ALOO_HOME_LABEL, Action, ActivationAction, ActivationPopupState,
+    ConnectPopupState, Field, NICKNAME_MAX_LEN, render, render_activation,
 };
 use crossterm::event::KeyCode;
 use ratatui::Terminal;
@@ -16,31 +17,18 @@ fn type_str(state: &mut ConnectPopupState, s: &str) {
 }
 
 // ---------------------------------------------------------------------
-// KeyType
-// ---------------------------------------------------------------------
-
-/// @requirement TB-001
-#[test]
-fn key_type_cycles_rsa_password_none_and_back() {
-    assert_eq!(KeyType::Rsa.cycle_next(), KeyType::Password);
-    assert_eq!(KeyType::Password.cycle_next(), KeyType::None);
-    assert_eq!(KeyType::None.cycle_next(), KeyType::Rsa);
-}
-
-/// @requirement TB-001
-#[test]
-fn key_type_defaults_to_none() {
-    assert_eq!(KeyType::default(), KeyType::None);
-}
-
-// ---------------------------------------------------------------------
 // Focus order
 // ---------------------------------------------------------------------
 
-/// @requirement TB-002, TB-003
+/// One way to authenticate and one `my_key` scheme: nothing in the focus
+/// order is conditional any more, and there is no `server_key` or
+/// `id_store` field in it at all. `email`/`Register` only join the order
+/// once the server takes registrations at all.
+/// @requirement TB-002, TB-003, AC-270
 #[test]
-fn focus_order_with_a_none_server_key_has_no_server_value_field() {
-    let state = ConnectPopupState::new();
+fn focus_order_lists_every_field_once_with_register_last_when_registration_is_available() {
+    let mut state = ConnectPopupState::new();
+    state.registration_available = true;
     let order = state.focus_order();
     assert_eq!(
         order,
@@ -48,25 +36,32 @@ fn focus_order_with_a_none_server_key_has_no_server_value_field() {
             Field::Host,
             Field::Port,
             Field::Nickname,
-            Field::IdStorePath,
-            Field::ServerKeyType,
+            Field::Password,
+            Field::Email,
             Field::MyKeyValuePub,
             Field::MyKeyValuePriv,
-            Field::Connect
+            Field::Connect,
+            Field::Register,
         ],
         "my_key always contributes both keybundle paths - there is only one scheme"
     );
+    assert_eq!(order.last(), Some(&Field::Register), "Register sits at the end");
 }
 
-/// @requirement TB-003
+/// A server that takes no registrations has nothing for `email`/Register
+/// to do, so neither is reachable at all - not shown, not tabbed to.
+/// @requirement AC-270
 #[test]
-fn focus_order_includes_server_key_value_when_not_none() {
-    let mut state = ConnectPopupState::new();
-    state.server_key.key_type = KeyType::Password;
-    assert!(state.focus_order().contains(&Field::ServerKeyValue));
+fn focus_order_excludes_email_and_register_unless_registration_is_available() {
+    let state = ConnectPopupState::new();
+    assert!(!state.registration_available, "off unless settings say otherwise");
+    let order = state.focus_order();
+    assert!(!order.contains(&Field::Email));
+    assert!(!order.contains(&Field::Register));
+    assert_eq!(order.last(), Some(&Field::Connect), "Connect is the last field with no Register");
 }
 
-/// @requirement AC-084, TB-002, TB-003
+/// @requirement AC-084, TB-002
 #[test]
 fn focus_order_includes_both_my_key_files() {
     let state = ConnectPopupState::new();
@@ -84,7 +79,7 @@ fn focus_next_and_prev_wrap_around() {
     assert_eq!(
         state.focus,
         Field::Connect,
-        "prev from the first field wraps to the last"
+        "prev from the first field wraps to the last - Connect, with registration unavailable"
     );
     state.focus_next();
     assert_eq!(state.focus, Field::Host);
@@ -100,32 +95,9 @@ fn tab_key_advances_focus() {
     assert_eq!(state.focus, Field::Host);
 }
 
-/// Cycling the server_key type takes its value field in and out of the
-/// focus order; whatever it does, focus must land on a field that is
-/// actually there.
-/// @requirement TB-003
-#[test]
-fn cycling_the_server_key_type_always_leaves_focus_on_a_field_that_exists() {
-    let mut state = ConnectPopupState::new();
-    state.server_key.key_type = KeyType::Password;
-    state.focus = Field::ServerKeyType;
-    assert!(state.focus_order().contains(&Field::ServerKeyValue));
-
-    state.handle_key(KeyCode::Left).unwrap(); // Password -> None
-    assert_eq!(state.server_key.key_type, KeyType::None);
-    assert!(
-        !state.focus_order().contains(&Field::ServerKeyValue),
-        "a none server_key shows no value field"
-    );
-    assert!(
-        state.focus_order().contains(&state.focus),
-        "focus must never be left on a field that is no longer shown"
-    );
-}
-
 /// `my_key` has no type selector to cycle, so its two fields can never be
 /// orphaned - a Left/Right anywhere in the group is simply a no-op.
-/// @requirement TB-002, TB-003
+/// @requirement TB-002
 #[test]
 fn my_key_fields_are_never_orphaned_by_a_type_change() {
     let mut state = ConnectPopupState::new();
@@ -133,6 +105,35 @@ fn my_key_fields_are_never_orphaned_by_a_type_change() {
     state.handle_key(KeyCode::Left).unwrap();
     assert_eq!(state.focus, Field::MyKeyValuePriv);
     assert!(state.focus_order().contains(&Field::MyKeyValuePriv));
+}
+
+/// `ssl` is not a popup field at all - like `server_ssl` on the server
+/// side, it is settings-only (`connect_ssl`). The popup only ever carries
+/// whatever value was captured from settings when it opened, silently,
+/// into the request it builds; no key anywhere in the popup can change it.
+/// @requirement AC-269, TB-001
+#[test]
+fn ssl_is_settings_only_and_cannot_be_toggled_from_the_popup() {
+    let mut state = ConnectPopupState::new();
+    assert!(!state.ssl, "plain TCP unless connect_ssl said otherwise");
+    // Every key a user could press, on every field, leaves it alone.
+    for field in state.focus_order() {
+        state.focus = field;
+        for key in [KeyCode::Left, KeyCode::Right, KeyCode::Enter, KeyCode::Char('x')] {
+            let _ = state.handle_key(key);
+        }
+    }
+    assert!(!state.ssl, "nothing in the popup ever touches ssl");
+
+    // What settings captured is still carried into the built request.
+    state.ssl = true;
+    state.host = "chat.example.com".into();
+    state.port = "6667".into();
+    state.nickname = "dave".into();
+    state.password = "hunter2".into();
+    state.my_key.file_pub = "/keys/pq_hybrid.pub".into();
+    state.my_key.file_priv = "/keys/pq_hybrid".into();
+    assert!(state.build_request().unwrap().ssl);
 }
 
 // ---------------------------------------------------------------------
@@ -174,30 +175,87 @@ fn nickname_field_is_capped_at_ten_characters() {
     assert_eq!(state.nickname, "davethegre");
 }
 
+/// There is no `id_store` field: the store has exactly one home
+/// (`idstore::default_path`, under `ALOO_HOME`), and the popup neither
+/// shows nor lets anyone edit it.
 /// @requirement AC-005
 #[test]
-fn id_store_path_is_prefilled_from_the_default_path() {
+fn the_popup_has_no_id_store_field() {
     let state = ConnectPopupState::new();
+    let backend = TestBackend::new(80, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| render(f, &state)).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    let rows: Vec<String> = (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect();
     assert!(
-        !state.id_store_path.is_empty(),
-        "id_store should be prefilled, not left blank"
+        !rows.iter().any(|r| r.contains("id_store")),
+        "no id_store box on the form: {rows:?}"
     );
+    let req = {
+        let mut state = state;
+        state.host = "localhost".into();
+        state.port = "9000".into();
+        state.nickname = "dave".into();
+        state.password = "pw".into();
+        state.my_key.file_pub = "/keys/a.pub".into();
+        state.my_key.file_priv = "/keys/a.priv".into();
+        state.build_request().unwrap()
+    };
+    // Nothing in the request names a store path either.
     assert_eq!(
-        state.id_store_path,
-        aloo::client::idstore::default_path().display().to_string()
+        format!("{req:?}").contains("id_store"),
+        false,
+        "the request carries no id_store path: {req:?}"
     );
 }
 
-/// @requirement AC-005, TB-012
+/// @requirement AC-269, TB-012
 #[test]
-fn id_store_path_field_is_freely_editable() {
+fn password_field_takes_any_character_and_backspaces() {
     let mut state = ConnectPopupState::new();
-    state.focus = Field::IdStorePath;
-    state.id_store_path.clear();
-    type_str(&mut state, "/tmp/my_ids_store");
-    assert_eq!(state.id_store_path, "/tmp/my_ids_store");
+    state.focus = Field::Password;
+    type_str(&mut state, "s3cret pass!");
+    assert_eq!(state.password, "s3cret pass!", "a password may contain anything");
     state.handle_key(KeyCode::Backspace).unwrap();
-    assert_eq!(state.id_store_path, "/tmp/my_ids_stor");
+    assert_eq!(state.password, "s3cret pass");
+}
+
+/// @requirement AC-269
+#[test]
+fn the_password_is_rendered_masked() {
+    let mut state = ConnectPopupState::new();
+    state.password = "hunter2".into();
+    let backend = TestBackend::new(80, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| render(f, &state)).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    let rows: Vec<String> = (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect();
+    assert!(!rows.iter().any(|r| r.contains("hunter2")), "{rows:?}");
+    assert!(rows.iter().any(|r| r.contains("*******")), "{rows:?}");
+    assert!(rows.iter().any(|r| r.contains("password")), "{rows:?}");
+}
+
+/// @requirement AC-270, TB-012
+#[test]
+fn email_field_refuses_whitespace_and_backspaces() {
+    let mut state = ConnectPopupState::new();
+    state.focus = Field::Email;
+    type_str(&mut state, "dave @example.com");
+    assert_eq!(state.email, "dave@example.com");
+    state.handle_key(KeyCode::Backspace).unwrap();
+    assert_eq!(state.email, "dave@example.co");
 }
 
 /// @requirement AC-004
@@ -207,31 +265,6 @@ fn port_field_only_accepts_digits() {
     state.focus = Field::Port;
     type_str(&mut state, "8a0b0");
     assert_eq!(state.port, "800");
-}
-
-/// @requirement TB-003
-#[test]
-fn password_field_only_editable_when_key_type_is_password() {
-    let mut state = ConnectPopupState::new();
-    state.focus = Field::ServerKeyValue;
-    // key_type is still None, so ServerKeyValue isn't a real editable field yet
-    type_str(&mut state, "secret");
-    assert_eq!(state.server_key.password, "");
-
-    state.server_key.key_type = KeyType::Password;
-    type_str(&mut state, "secret");
-    assert_eq!(state.server_key.password, "secret");
-}
-
-/// @requirement TB-001
-#[test]
-fn enter_on_key_type_field_cycles_it() {
-    let mut state = ConnectPopupState::new();
-    state.focus = Field::ServerKeyType;
-    state.handle_key(KeyCode::Enter).unwrap();
-    assert_eq!(state.server_key.key_type, KeyType::Rsa);
-    state.handle_key(KeyCode::Right).unwrap();
-    assert_eq!(state.server_key.key_type, KeyType::Password);
 }
 
 // ---------------------------------------------------------------------
@@ -258,18 +291,6 @@ fn build_request_rejects_bad_port() {
 
 /// @requirement TB-005
 #[test]
-fn build_request_rejects_missing_rsa_files() {
-    let mut state = ConnectPopupState::new();
-    state.host = "localhost".into();
-    state.port = "9000".into();
-    state.nickname = "dave".into();
-    state.server_key.key_type = KeyType::Rsa; // file left blank
-    let err = state.build_request().unwrap_err();
-    assert!(err.contains("server_key file"));
-}
-
-/// @requirement TB-005
-#[test]
 fn build_request_rejects_missing_nickname() {
     let mut state = ConnectPopupState::new();
     state.host = "localhost".into();
@@ -278,39 +299,29 @@ fn build_request_rejects_missing_nickname() {
     assert!(err.contains("nickname"));
 }
 
-/// @requirement TB-005
+/// @requirement TB-005, AC-269
 #[test]
-fn build_request_rejects_empty_id_store_path() {
-    let mut state = ConnectPopupState::new();
-    state.host = "localhost".into();
-    state.port = "9000".into();
-    state.nickname = "dave".into();
-    state.id_store_path.clear();
-    let err = state.build_request().unwrap_err();
-    assert!(err.contains("id_store"));
-}
-
-/// @requirement TB-006
-#[test]
-fn build_request_carries_a_custom_id_store_path() {
+fn build_request_rejects_a_missing_password() {
     let mut state = ConnectPopupState::new();
     state.host = "localhost".into();
     state.port = "9000".into();
     state.nickname = "dave".into();
     state.my_key.file_pub = "/keys/pq_hybrid.pub".into();
     state.my_key.file_priv = "/keys/pq_hybrid.priv".into();
-    state.id_store_path = "/custom/ids_store".into();
-    let req = state.build_request().expect("should be valid");
-    assert_eq!(req.id_store_path, PathBuf::from("/custom/ids_store"));
+    let err = state.build_request().unwrap_err();
+    assert!(err.contains("password"), "{err}");
 }
 
 /// @requirement TB-006
 #[test]
-fn build_request_succeeds_with_a_none_server_key() {
+fn build_request_maps_the_form_onto_a_connect_request() {
     let mut state = ConnectPopupState::new();
     state.host = "localhost".into();
     state.port = "9000".into();
     state.nickname = "dave".into();
+    state.password = "hunter2".into();
+    state.email = "ignored@example.com".into();
+    state.ssl = true;
     state.my_key.file_pub = "/keys/pq_hybrid.pub".into();
     state.my_key.file_priv = "/keys/pq_hybrid.priv".into();
     let req = state.build_request().expect("should be valid");
@@ -319,41 +330,86 @@ fn build_request_succeeds_with_a_none_server_key() {
         ConnectRequest {
             host: "localhost".into(),
             port: 9000,
+            ssl: true,
+            ssl_ca: None,
             nickname: "dave".into(),
-            server_key: ServerKeySelection::None,
+            password: "hunter2".into(),
             my_key: MyKeySelection {
                 file_pub: PathBuf::from("/keys/pq_hybrid.pub"),
                 file_priv: PathBuf::from("/keys/pq_hybrid.priv"),
             },
-            id_store_path: PathBuf::from(&state.id_store_path),
+            activation_code: None,
         }
     );
 }
 
-/// @requirement TB-006
+/// Connect never needs an email; Register always does, and a plausible
+/// one.
+/// @requirement AC-270, TB-005
 #[test]
-fn build_request_succeeds_with_a_password_server_key() {
+fn register_needs_an_email_where_connect_does_not() {
     let mut state = ConnectPopupState::new();
-    state.host = "10.0.0.5".into();
-    state.port = "4444".into();
+    state.host = "localhost".into();
+    state.port = "9000".into();
     state.nickname = "dave".into();
-    state.server_key.key_type = KeyType::Password;
-    state.server_key.password = "hunter2".into();
+    state.password = "hunter2".into();
     state.my_key.file_pub = "/keys/pq_hybrid.pub".into();
     state.my_key.file_priv = "/keys/pq_hybrid.priv".into();
+    assert!(state.build_request().is_ok());
+    let err = state.build_register_request().unwrap_err();
+    assert!(err.contains("email"), "{err}");
 
-    let req = state.build_request().expect("should be valid");
+    state.email = "not-an-address".into();
+    let err = state.build_register_request().unwrap_err();
+    assert!(err.contains("email"), "{err}");
+
+    state.email = "dave@example.com".into();
     assert_eq!(
-        req.server_key,
-        ServerKeySelection::Password("hunter2".into())
-    );
-    assert_eq!(
-        req.my_key,
-        MyKeySelection {
-            file_pub: PathBuf::from("/keys/pq_hybrid.pub"),
-            file_priv: PathBuf::from("/keys/pq_hybrid.priv"),
+        state.build_register_request().unwrap(),
+        RegisterRequest {
+            host: "localhost".into(),
+            port: 9000,
+            ssl: false,
+            ssl_ca: None,
+            nickname: "dave".into(),
+            password: "hunter2".into(),
+            email: "dave@example.com".into(),
         }
     );
+}
+
+/// A registrable nickname is the registry's alphabet, checked on the
+/// form before a round trip to the server says the same thing.
+/// @requirement AC-270
+#[test]
+fn register_refuses_a_nickname_the_registry_could_not_hold() {
+    let mut state = ConnectPopupState::new();
+    state.host = "localhost".into();
+    state.port = "9000".into();
+    state.nickname = "da/ve".into();
+    state.password = "hunter2".into();
+    state.email = "dave@example.com".into();
+    let err = state.build_register_request().unwrap_err();
+    assert!(err.contains("nickname"), "{err}");
+}
+
+/// @requirement AC-270
+#[test]
+fn enter_on_register_returns_a_register_action_or_an_error() {
+    let mut state = ConnectPopupState::new();
+    state.focus = Field::Register;
+    assert_eq!(state.handle_key(KeyCode::Enter).unwrap(), Action::None);
+    assert!(state.error.is_some(), "an empty form is refused with a reason");
+
+    state.host = "chat.example.com".into();
+    state.port = "6667".into();
+    state.nickname = "dave".into();
+    state.password = "hunter2".into();
+    state.email = "dave@example.com".into();
+    match state.handle_key(KeyCode::Enter).unwrap() {
+        Action::Register(req) => assert_eq!(req.email, "dave@example.com"),
+        other => panic!("expected Register, got {other:?}"),
+    }
 }
 
 /// @requirement AC-084, TB-006
@@ -363,6 +419,7 @@ fn build_request_succeeds_with_pq_hybrid_files() {
     state.host = "10.0.0.5".into();
     state.port = "4444".into();
     state.nickname = "dave".into();
+    state.password = "hunter2".into();
     state.my_key.file_pub = "/keys/pq_hybrid.pub".into();
     state.my_key.file_priv = "/keys/pq_hybrid".into();
 
@@ -383,6 +440,7 @@ fn build_request_rejects_missing_pq_hybrid_files() {
     state.host = "localhost".into();
     state.port = "9000".into();
     state.nickname = "dave".into();
+    state.password = "hunter2".into();
     state.my_key.file_pub.clear(); // both files left blank
     state.my_key.file_priv.clear();
     let err = state.build_request().unwrap_err();
@@ -406,6 +464,7 @@ fn enter_on_connect_field_with_valid_form_returns_connect_action() {
     state.host = "chat.example.com".into();
     state.port = "6667".into();
     state.nickname = "dave".into();
+    state.password = "hunter2".into();
     state.my_key.file_pub = "/keys/pq_hybrid.pub".into();
     state.my_key.file_priv = "/keys/pq_hybrid.priv".into();
     state.focus = Field::Connect;
@@ -429,12 +488,70 @@ fn escape_cancels() {
 
 /// @requirement AC-010
 #[test]
-fn enter_on_rsa_server_key_value_opens_file_browser() {
+fn enter_on_a_my_key_file_field_opens_file_browser() {
     let mut state = ConnectPopupState::new();
-    state.server_key.key_type = KeyType::Rsa;
-    state.focus = Field::ServerKeyValue;
+    state.focus = Field::MyKeyValuePub;
     state.handle_key(KeyCode::Enter).unwrap();
     assert!(state.browser.is_some());
+}
+
+// ---------------------------------------------------------------------
+// Activation popup
+// ---------------------------------------------------------------------
+
+/// @requirement AC-271
+#[test]
+fn activation_popup_takes_exactly_twelve_digits() {
+    let mut popup = ActivationPopupState::new("dave");
+    for c in "12a3-4567 890123".chars() {
+        popup.handle_key(KeyCode::Char(c));
+    }
+    assert_eq!(popup.code, "123456789012", "digits only, capped at the code length");
+    assert_eq!(popup.code.len(), ACTIVATION_CODE_LEN);
+    popup.handle_key(KeyCode::Backspace);
+    assert_eq!(popup.code, "12345678901");
+}
+
+/// @requirement AC-271
+#[test]
+fn activation_popup_submits_a_complete_code_and_refuses_a_short_one() {
+    let mut popup = ActivationPopupState::new("dave");
+    for c in "1234".chars() {
+        popup.handle_key(KeyCode::Char(c));
+    }
+    assert_eq!(popup.handle_key(KeyCode::Enter), ActivationAction::None);
+    assert!(popup.error.is_some(), "a short code is refused with a reason");
+    for c in "56789012".chars() {
+        popup.handle_key(KeyCode::Char(c));
+    }
+    assert_eq!(
+        popup.handle_key(KeyCode::Enter),
+        ActivationAction::Submit("123456789012".into())
+    );
+    assert_eq!(popup.handle_key(KeyCode::Esc), ActivationAction::Cancel);
+}
+
+/// @requirement AC-271
+#[test]
+fn activation_popup_renders_the_nickname_the_code_and_the_error() {
+    let mut popup = ActivationPopupState::new("dave");
+    popup.code = "1234".into();
+    popup.error = Some("wrong activation code".into());
+    let backend = TestBackend::new(80, 24);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| render_activation(f, &popup)).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    let rows: Vec<String> = (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect();
+    assert!(rows.iter().any(|r| r.contains("dave")), "{rows:?}");
+    assert!(rows.iter().any(|r| r.contains("1234")), "{rows:?}");
+    assert!(rows.iter().any(|r| r.contains("wrong activation code")), "{rows:?}");
+    assert!(rows.iter().any(|r| r.contains("activation code")), "{rows:?}");
 }
 
 // ---------------------------------------------------------------------
@@ -554,13 +671,12 @@ fn file_browser_select_next_prev_wrap_around() {
 fn selecting_a_file_in_browser_applies_it_to_the_popup_field() {
     let root = make_tree();
     let mut state = ConnectPopupState::new();
-    state.server_key.key_type = KeyType::Rsa;
-    state.focus = Field::ServerKeyValue;
+    state.focus = Field::MyKeyValuePub;
     state.handle_key(KeyCode::Enter).unwrap(); // opens browser at process cwd
 
     // force the browser into our known temp tree so the test is deterministic
     state.browser = Some((
-        aloo::client::tui::ui_connect_popup::FileBrowserTarget::ServerKeyFile,
+        aloo::client::tui::ui_connect_popup::FileBrowserTarget::MyKeyFilePub,
         FileBrowserState::open(root.clone()).unwrap(),
     ));
     // move selection to "file.txt" (index 2: "..", "subdir", "file.txt")
@@ -573,7 +689,7 @@ fn selecting_a_file_in_browser_applies_it_to_the_popup_field() {
         "selecting a file should close the browser"
     );
     assert_eq!(
-        state.server_key.file,
+        state.my_key.file_pub,
         root.join("file.txt").display().to_string()
     );
 
@@ -587,12 +703,13 @@ fn selecting_a_file_in_browser_applies_it_to_the_popup_field() {
 
 /// @requirement TB-010
 #[test]
-fn render_does_not_panic_for_every_server_key_type() {
+fn render_does_not_panic_with_ssl_on_or_off_or_a_notice_showing() {
     let backend = TestBackend::new(80, 24);
     let mut terminal = Terminal::new(backend).unwrap();
-    for server_kind in [KeyType::None, KeyType::Password, KeyType::Rsa] {
+    for ssl in [false, true] {
         let mut state = ConnectPopupState::new();
-        state.server_key.key_type = server_kind;
+        state.ssl = ssl;
+        state.notice = Some("registered - check your email".into());
         terminal.draw(|f| render(f, &state)).unwrap();
     }
 }
@@ -628,6 +745,105 @@ fn render_shows_a_connect_button() {
     assert!(
         rows.iter().any(|row| row.contains("Connect")),
         "expected a visible Connect button"
+    );
+}
+
+fn rows_of(state: &ConnectPopupState) -> Vec<String> {
+    let backend = TestBackend::new(80, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| render(f, state)).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect()
+}
+
+/// The Register button (and the email field it needs) only appears once
+/// the server this popup was opened for takes registrations at all.
+/// @requirement AC-270
+#[test]
+fn register_button_and_email_field_only_show_when_registration_is_available() {
+    let state = ConnectPopupState::new();
+    let rows = rows_of(&state);
+    assert!(
+        !rows.iter().any(|row| row.contains("Register")),
+        "no Register button while registration is unavailable: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|row| row.contains("email")),
+        "no email field while registration is unavailable: {rows:?}"
+    );
+
+    let mut state = ConnectPopupState::new();
+    state.registration_available = true;
+    let rows = rows_of(&state);
+    assert!(rows.iter().any(|row| row.contains("Register")), "{rows:?}");
+    assert!(rows.iter().any(|row| row.contains("email")), "{rows:?}");
+}
+
+/// The hint line shows an error in red, else a notice in green, else the
+/// key hint - and an error wins over a notice.
+/// @requirement AC-270
+#[test]
+fn render_shows_a_registration_notice_in_green_unless_an_error_replaces_it() {
+    fn hint_cells(state: &ConnectPopupState, needle: &str) -> Option<Color> {
+        let backend = TestBackend::new(80, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, state)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        for y in 0..buffer.area.height {
+            let row: String = (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect();
+            if let Some(x) = row.find(needle) {
+                return buffer[(x as u16, y)].style().fg;
+            }
+        }
+        None
+    }
+    let mut state = ConnectPopupState::new();
+    state.notice = Some("registered - check your mail".into());
+    assert_eq!(hint_cells(&state, "registered"), Some(Color::Green));
+    state.error = Some("registration failed".into());
+    assert_eq!(hint_cells(&state, "registration failed"), Some(Color::Red));
+    assert_eq!(hint_cells(&state, "registered -"), None, "the error replaces the notice");
+}
+
+/// The keyboard-shortcut hint is the last thing in the popup's own layout
+/// (after the buttons, in the trailing `Min(1)` chunk) and centered
+/// horizontally, not flush left.
+/// @requirement TB-244
+#[test]
+fn the_shortcut_hint_is_centered() {
+    let backend = TestBackend::new(80, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let state = ConnectPopupState::new();
+    terminal.draw(|f| render(f, &state)).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+
+    let needle: Vec<char> = "Tab: next field  Enter: select/connect  Esc: quit"
+        .chars()
+        .collect();
+    let mut found = None;
+    for y in 0..buffer.area.height {
+        let row_chars: Vec<char> = (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol().chars().next().unwrap_or(' '))
+            .collect();
+        if let Some(start) = row_chars.windows(needle.len()).position(|w| w == needle.as_slice()) {
+            found = Some((start, y, row_chars.iter().collect::<String>()));
+        }
+    }
+    let (start, _, row) = found.expect("expected the shortcut hint in the popup");
+    let end = start + needle.len();
+    let text_mid = (start + end) as i32 / 2;
+    let screen_mid = buffer.area.width as i32 / 2;
+    assert!(
+        (text_mid - screen_mid).abs() <= 1,
+        "the shortcut hint should be centered, not flush left: {row:?}"
     );
 }
 
@@ -678,6 +894,54 @@ fn render_shows_the_resolved_aloo_home_in_gray() {
         })
         .expect("the Connect button should be below the ALOO_HOME line");
     assert!(button_y > y);
+}
+
+/// The line is set apart from the form around it: centered horizontally
+/// rather than flush left, with a blank row of its own directly above and
+/// directly below it.
+/// @requirement AC-258
+#[test]
+fn aloo_home_line_is_centered_with_a_blank_line_above_and_below() {
+    let backend = TestBackend::new(80, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut state = ConnectPopupState::new();
+    state.aloo_home = "/tmp/aloo-bob".to_string();
+    terminal.draw(|f| render(f, &state)).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+
+    let expected: Vec<char> = format!("{ALOO_HOME_LABEL}/tmp/aloo-bob").chars().collect();
+    let mut found = None;
+    for y in 0..buffer.area.height {
+        let row_chars: Vec<char> = (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol().chars().next().unwrap_or(' '))
+            .collect();
+        // Column indices, not byte offsets - `str::find` would be thrown
+        // off by the popup's own multi-byte box-drawing border characters
+        // sharing the row.
+        if let Some(start) = row_chars.windows(expected.len()).position(|w| w == expected.as_slice()) {
+            found = Some((start, y, row_chars.iter().collect::<String>()));
+        }
+    }
+    let (start, y, row) = found.expect("expected an ALOO_HOME line in the popup");
+    let end = start + expected.len();
+    let text_mid = (start + end) as i32 / 2;
+    let screen_mid = buffer.area.width as i32 / 2;
+    assert!(
+        (text_mid - screen_mid).abs() <= 1,
+        "the ALOO_HOME line should be centered, not flush left: {row:?}"
+    );
+
+    for neighbour_y in [y - 1, y + 1] {
+        let neighbour: String = (0..buffer.area.width)
+            .map(|x| buffer[(x, neighbour_y)].symbol())
+            .collect();
+        // The popup's own left/right border (│) still crosses every
+        // interior row - "blank" means no other visible content beside it.
+        assert!(
+            neighbour.chars().all(|c| c == ' ' || c == '│'),
+            "row {neighbour_y} beside the ALOO_HOME line should be blank: {neighbour:?}"
+        );
+    }
 }
 
 /// @requirement AC-258
@@ -731,7 +995,8 @@ fn popup_opens_with_the_cursor_focused_in_the_host_box() {
 /// @requirement AC-002
 #[test]
 fn host_port_and_nickname_are_each_individually_bordered() {
-    let state = ConnectPopupState::new();
+    let mut state = ConnectPopupState::new();
+    state.registration_available = true; // so the email box is on screen too
     let backend = TestBackend::new(80, 30);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal.draw(|f| render(f, &state)).unwrap();
@@ -744,7 +1009,7 @@ fn host_port_and_nickname_are_each_individually_bordered() {
         })
         .collect();
 
-    for title in ["host", "port", "nickname"] {
+    for title in ["host", "port", "nickname", "password", "email"] {
         assert!(
             rows.iter().any(|r| r.contains(title)),
             "expected a \"{title}\" box title: {rows:?}"
@@ -755,8 +1020,8 @@ fn host_port_and_nickname_are_each_individually_bordered() {
     // corner in the popup besides the outer one.
     let corner_rows = rows.iter().filter(|r| r.contains('┌')).count();
     assert!(
-        corner_rows >= 4,
-        "expected the outer popup plus host/port/nickname to each have their own top border: {rows:?}"
+        corner_rows >= 6,
+        "expected the outer popup plus host/port/nickname/password/email to each have their own top border: {rows:?}"
     );
 }
 
@@ -790,6 +1055,7 @@ fn connect_button_highlight_does_not_bleed_into_its_border() {
     state.host = "localhost".into();
     state.port = "9000".into();
     state.nickname = "dave".into();
+    state.password = "pw".into();
     state.focus = Field::Connect;
 
     let backend = TestBackend::new(80, 30);
@@ -830,9 +1096,8 @@ fn connect_button_highlight_does_not_bleed_into_its_border() {
 fn render_with_open_file_browser_does_not_panic() {
     let root = make_tree();
     let mut state = ConnectPopupState::new();
-    state.server_key.key_type = KeyType::Rsa;
     state.browser = Some((
-        aloo::client::tui::ui_connect_popup::FileBrowserTarget::ServerKeyFile,
+        aloo::client::tui::ui_connect_popup::FileBrowserTarget::MyKeyFilePriv,
         FileBrowserState::open(root.clone()).unwrap(),
     ));
     let backend = TestBackend::new(80, 24);
@@ -865,9 +1130,8 @@ fn file_browser_render_scrolls_to_keep_the_selection_visible() {
     assert_eq!(browser.selected_entry().unwrap().name, "file29.txt");
 
     let mut state = ConnectPopupState::new();
-    state.server_key.key_type = KeyType::Rsa;
     state.browser = Some((
-        aloo::client::tui::ui_connect_popup::FileBrowserTarget::ServerKeyFile,
+        aloo::client::tui::ui_connect_popup::FileBrowserTarget::MyKeyFilePub,
         browser,
     ));
 

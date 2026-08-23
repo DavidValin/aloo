@@ -131,7 +131,7 @@ const HELP_BODY: &[HelpLine] = &[
         keys: "[  /  ]",
         text: "move between the channel selector (left) and the DM one (right); at either \
                end it opens that selector's dropdown instead - every other channel you \
-               joined (\u{1F30D} public / \u{1F512} private), or room you have open. Up/Down pick one \
+               joined (private ones prefixed \u{1F512}), or room you have open. Up/Down pick one \
                (the view follows straight away), Enter, Esc, Tab or the opposite key close \
                it again, and so does leaving it alone for 30 seconds",
     },
@@ -274,7 +274,7 @@ const HELP_BODY: &[HelpLine] = &[
         "The call modal opens with the call: live duration on top, then everyone on it - \
          host first, each labelled IN CALL / INVITED / REJECTED (+ MUTED), with a live \
          voice bar. Up/Down walk the list, Enter or e is END CALL (which asks before it \
-         leaves), Esc folds it away into the \u{1F534} Call indicator at the top right \
+         leaves), Esc folds it away into the \u{23FA} Call indicator at the top right \
          (Ctrl+R brings the modal back).",
     ),
     HelpLine::Note(
@@ -917,23 +917,25 @@ pub enum SelectorFocus {
     Dms,
 }
 
-/// The icon each kind of entry carries in the top row and in a dropdown:
-/// the channel's own kind for a channel (as `docs/SPEC.md` "Connected UI"
-/// has always shown it), and one shared marker for every DM.
+/// The icon a private channel carries in the top row and in a dropdown,
+/// ahead of its `#name` - a public one carries none at all, so an
+/// unadorned `#name` is itself the "this is public" signal
+/// (`docs/SPEC.md` "Connected UI").
 pub(crate) fn channel_kind_icon(kind: ChannelKind) -> &'static str {
     match kind {
-        ChannelKind::Public => "\u{1F30D}",
-        ChannelKind::Private => "\u{1F512}",
+        ChannelKind::Public => "",
+        ChannelKind::Private => "\u{1F512} ",
     }
 }
 
-/// How a channel is named wherever it can be picked: its kind icon, then
-/// the `#` that says "this is a channel" and the name itself
-/// (`docs/SPEC.md` "Connected UI"). The `#` is decoration - what is stored
-/// and sent is the bare name (`validation::normalize_channel_name`).
+/// How a channel is named wherever it can be picked: its kind icon (empty
+/// for a public one), then the `#` that says "this is a channel" and the
+/// name itself (`docs/SPEC.md` "Connected UI"). The `#` is decoration -
+/// what is stored and sent is the bare name
+/// (`validation::normalize_channel_name`).
 pub(crate) fn channel_label(kind: ChannelKind, name: &str) -> String {
     format!(
-        "{} {}{name}",
+        "{}{}{name}",
         channel_kind_icon(kind),
         crate::validation::CHANNEL_DISPLAY_PREFIX
     )
@@ -981,7 +983,7 @@ pub(crate) fn unread_envelope(blink_on: bool) -> &'static str {
 }
 
 /// One row of an open selector dropdown - `label` already carries its
-/// kind prefix (\u{1F30D}/\u{1F512} for a channel, \u{1F4AC} for a DM), `unread` drives the
+/// kind prefix (\u{1F512} for a private channel, none for a public one, \u{1F4AC} for a DM), `unread` drives the
 /// blinking envelope beside it (`render_selector_dropdown`).
 pub struct SelectorEntry {
     pub label: String,
@@ -1227,7 +1229,7 @@ pub struct CallUiState {
     /// deterministic for a given tick.
     pub elapsed_secs: u64,
     /// `true` once Escape has folded the modal away into the header row's
-    /// `\u{1F534} Call Ctrl+R` indicator, leaving the ordinary
+    /// `\u{23FA} Call Ctrl+R` indicator, leaving the ordinary
     /// sidebar/messages/compose layout usable again. Ctrl+R brings it back.
     pub minimized: bool,
     /// The host's invite picker, while it is open.
@@ -2877,7 +2879,7 @@ impl UiState {
         self.sort_call_members();
     }
 
-    /// Clears the modal, the header's `\u{1F534} Call Ctrl+R` indicator and the
+    /// Clears the modal, the header's `\u{23FA} Call Ctrl+R` indicator and the
     /// permanent banner - called once we've left the call
     /// (`crate::client::voice_call::end_own_call`).
     pub fn end_call(&mut self) {
@@ -4259,7 +4261,7 @@ impl UiState {
         if modifiers.contains(KeyModifiers::CONTROL) {
             match code {
                 // Brings a folded-away call modal back up - the header's
-                // `\u{1F534} Call Ctrl+R` indicator is what advertises it
+                // `\u{23FA} Call Ctrl+R` indicator is what advertises it
                 // (`docs/SPEC.md` "Live voice calls"). A no-op with no
                 // call on; it can only be reached while the modal is
                 // down, since the modal absorbs keys before this.
@@ -4325,7 +4327,7 @@ impl UiState {
 
     /// Whether the call modal is the thing currently owning the screen -
     /// i.e. a call is on and Escape has not folded its modal away into the
-    /// header's `\u{1F534} Call Ctrl+R` indicator (which is what brings it back).
+    /// header's `\u{23FA} Call Ctrl+R` indicator (which is what brings it back).
     pub fn call_modal_showing(&self) -> bool {
         self.call.as_ref().is_some_and(|c| !c.minimized)
     }
@@ -6628,8 +6630,10 @@ fn render_call_banner(
         None => String::new(),
     };
     let mute_clause = if call.muted { " \u{1F507} muted" } else { "" };
+    // The plain record-circle glyph, not a multicolour emoji - its colour
+    // is entirely the `Style` painted below, never fixed in the character.
     let message = format!(
-        "\u{1F534} On a call{where_clause} ({} connected){mute_clause}",
+        "\u{23FA} On a call{where_clause} ({} connected){mute_clause}",
         call.connected_count(own_id)
     );
     let width = (message.chars().count() as u16 + 4).min(area.width);

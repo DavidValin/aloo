@@ -14,15 +14,9 @@ use crate::client::reconnect;
 use crate::client::session;
 use crate::client::tui::ui_connect_popup::{self, ConnectPopupState};
 use crate::crypto;
-use crate::proto::{self, AuthKind, AuthResponse, ClientMessage, KeyMode, ServerMessage};
+use crate::proto::{self, ClientMessage, KeyMode, ServerMessage};
+use crate::server::ssl::{self, BoxedStream};
 use crate::validation::is_storable;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ServerKeySelection {
-    None,
-    Password(String),
-    Rsa(PathBuf),
-}
 
 /// Where this client's own identity comes from. `pq_hybrid`
 /// (`docs/PROTOCOL.md` §13) is the only peer-to-peer scheme this app has,
@@ -37,20 +31,40 @@ pub struct MyKeySelection {
 
 /// What the user asked to connect with, as collected by the connect popup
 /// (`tui::ui_connect_popup`) and consumed by the handshake here.
+///
+/// The identity-pinning store (`aloo::idstore`, `docs/PROTOCOL.md` §12) is
+/// not a field: it always lives at `idstore::default_path()` under
+/// `ALOO_HOME`, like every other local store.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectRequest {
     pub host: String,
     pub port: u16,
+    /// Dial over TLS (`docs/PROTOCOL.md` §1.4); `host` is then also the
+    /// name the server's certificate is checked against.
+    pub ssl: bool,
+    /// Extra trusted roots for `ssl` (`connect_ssl_ca` in settings) - a
+    /// self-signed or privately issued server certificate lives here.
+    pub ssl_ca: Option<PathBuf>,
     pub nickname: String,
-    pub server_key: ServerKeySelection,
+    /// The nickname's password on this server (§5.1).
+    pub password: String,
     pub my_key: MyKeySelection,
-    /// Where the local identity-pinning store lives (see
-    /// `aloo::idstore`, `docs/PROTOCOL.md` §12) - the file that remembers
-    /// each nickname's full public key from the last time it was seen, so
-    /// a reconnecting peer whose key suddenly changed can be flagged
-    /// instead of silently trusted. Prefilled from
-    /// `idstore::default_path` but freely editable.
-    pub id_store_path: PathBuf,
+    /// An activation code to answer `AuthResult { activation_pending }`
+    /// with (§5.2) - set by the activation popup on the connect that
+    /// follows it, `None` on every other connect.
+    pub activation_code: Option<String>,
+}
+
+/// What the connect popup's Register button collects (§5.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisterRequest {
+    pub host: String,
+    pub port: u16,
+    pub ssl: bool,
+    pub ssl_ca: Option<PathBuf>,
+    pub nickname: String,
+    pub password: String,
+    pub email: String,
 }
 
 /// This client's own resolved key material, loaded from the keybundle
@@ -78,6 +92,21 @@ impl std::fmt::Display for NicknameTakenError {
 
 impl std::error::Error for NicknameTakenError {}
 
+/// The credentials were right but the account is not activated yet
+/// (`AuthResult { activation_pending: true }`, §5.2) - or the code this
+/// connect carried was refused. Either way the caller's next move is the
+/// activation popup, not an error screen; the string is what it shows.
+#[derive(Debug)]
+pub struct ActivationRequiredError(pub String);
+
+impl std::fmt::Display for ActivationRequiredError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for ActivationRequiredError {}
+
 pub async fn run_client_inner(
     surface: &mut crate::client::tui::surface::Surface,
     port: u16,
@@ -97,11 +126,31 @@ pub async fn run_client_inner(
     });
     let mut cache = load_connect_cache();
     prefill_connect_defaults(&mut popup, &settings, &cache, &crate::platform::aloo_dir());
+    let ssl_ca = settings
+        .connect_ssl_ca
+        .as_deref()
+        .map(crate::platform::expand_tilde);
 
     loop {
-        let Some(request) = ui_connect_popup::run(surface, &mut popup)? else {
-            return Ok(()); // user cancelled
+        let mut request = match ui_connect_popup::run(surface, &mut popup)? {
+            ui_connect_popup::Submission::Connect(request) => request,
+            ui_connect_popup::Submission::Register(mut register) => {
+                register.ssl_ca = ssl_ca.clone();
+                match register_account(&register).await {
+                    Ok(()) => {
+                        popup.notice = Some(format!(
+                            "registered - check {} for the activation code, then Connect",
+                            register.email
+                        ));
+                        popup.focus = ui_connect_popup::Field::Connect;
+                    }
+                    Err(e) => popup.error = Some(format!("registration failed: {e}")),
+                }
+                continue;
+            }
+            ui_connect_popup::Submission::Cancel => return Ok(()), // user cancelled
         };
+        request.ssl_ca = ssl_ca.clone();
 
         // Remembered regardless of whether the connection attempt below
         // actually succeeds ("the last values used in the popup", not "the
@@ -113,6 +162,7 @@ pub async fn run_client_inner(
             &request.host,
             request.port,
             &request.nickname,
+            request.ssl,
         ) {
             crate::log_warn!("could not remember this connection in ~/.aloo/settings ({e})");
         }
@@ -126,9 +176,32 @@ pub async fn run_client_inner(
             crate::log_warn!("failed to save connect cache: {e}");
         }
 
-        match connect_with_reconnect(&request).await {
+        // An account still waiting for its activation code (§5.2) is asked
+        // for it right here, and the connect retried with the answer -
+        // as many times as it takes, until the code is right or the user
+        // gives up on it with Esc.
+        let mut activation = ui_connect_popup::ActivationPopupState::new(&request.nickname);
+        let outcome = loop {
+            match connect_with_reconnect(&request).await {
+                Err(e) if e.is::<ActivationRequiredError>() => {
+                    activation.error = request.activation_code.as_ref().map(|_| e.to_string());
+                    let Some(code) = ui_connect_popup::run_activation(surface, &mut activation)?
+                    else {
+                        break None;
+                    };
+                    request.activation_code = Some(code);
+                }
+                other => break Some(other),
+            }
+        };
+        let Some(outcome) = outcome else {
+            popup.error = Some("activation cancelled - the account stays unactivated".into());
+            continue;
+        };
+
+        match outcome {
             Ok((server_events, sink, you, identity, server_addr)) => {
-                let id_store = load_id_store(&request.id_store_path);
+                let id_store = load_id_store(&idstore::default_path());
                 // The stdin reader is started only now, once the popup is
                 // done with the terminal - the popup drives its own
                 // blocking `event::read()`, and two readers on one tty
@@ -154,16 +227,47 @@ pub async fn run_client_inner(
                 .await;
             }
             Err(e) => {
-                let Some(taken) = e.downcast_ref::<NicknameTakenError>() else {
+                if let Some(taken) = e.downcast_ref::<NicknameTakenError>() {
+                    // Loop back to the popup instead of exiting: everything
+                    // the user already filled in (host, keys, ...) stays
+                    // put, only the nickname needs to change.
+                    popup.error = Some(taken.0.clone());
+                    popup.focus = ui_connect_popup::Field::Nickname;
+                } else if let Some(refused) = e.downcast_ref::<AuthRefusedError>() {
+                    // Same for a wrong password: the form, not an exit.
+                    popup.error = Some(refused.0.clone());
+                    popup.focus = ui_connect_popup::Field::Password;
+                } else {
                     return Err(e);
-                };
-                // Loop back to the popup instead of exiting: everything the
-                // user already filled in (host, keys, ...) stays put, only
-                // the nickname needs to change.
-                popup.error = Some(taken.0.clone());
-                popup.focus = ui_connect_popup::Field::Nickname;
+                }
             }
         }
+    }
+}
+
+/// `Register` over a fresh connection (§5.3): dial, seal the channel, ask,
+/// read the answer, hang up. The server closes the connection after its
+/// reply either way, so there is nothing to keep.
+pub async fn register_account(request: &RegisterRequest) -> Result<(), BoxError> {
+    let (mut rd, mut wr, registration_open, _) =
+        open_control_channel(&request.host, request.port, request.ssl, request.ssl_ca.as_deref())
+            .await?;
+    if !registration_open {
+        return Err("this server does not take registrations".into());
+    }
+    wr.send(&ClientMessage::Register {
+        nickname: request.nickname.clone(),
+        password: request.password.clone(),
+        email: request.email.clone(),
+    })
+    .await?;
+    let Some(ServerMessage::RegisterResult { ok, reason }) = rd.recv().await? else {
+        return Err("server closed the connection during registration".into());
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(reason.unwrap_or_else(|| "registration refused".into()).into())
     }
 }
 
@@ -208,6 +312,20 @@ pub async fn connect_with_reconnect(
     Ok((events_rx, sink, you, identity, server_addr))
 }
 
+/// The server refused the nickname/password pair (§5.1) - shown on the
+/// connect form rather than ending the client, since a typo in a password
+/// is the likeliest cause by far.
+#[derive(Debug)]
+pub struct AuthRefusedError(pub String);
+
+impl std::fmt::Display for AuthRefusedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for AuthRefusedError {}
+
 /// Connects, then runs the auth + identify handshake. On success returns
 /// the split stream halves, the `UserId` the server assigned us, and our
 /// own keybundle (needed to decrypt incoming messages). A taken nickname
@@ -217,8 +335,8 @@ pub(crate) async fn connect_and_handshake(
     request: &ConnectRequest,
 ) -> Result<
     (
-        crate::control::ControlReader<tokio::io::ReadHalf<TcpStream>>,
-        crate::control::ControlWriter<tokio::io::WriteHalf<TcpStream>>,
+        crate::control::ControlReader<tokio::io::ReadHalf<BoxedStream>>,
+        crate::control::ControlWriter<tokio::io::WriteHalf<BoxedStream>>,
         proto::UserId,
         ResolvedIdentity,
         std::net::SocketAddr,
@@ -237,74 +355,64 @@ pub(crate) async fn connect_and_handshake(
 /// (`crate::client::reconnect`), which must come back as the *same*
 /// identity: re-resolving would re-read (or, on a first run, re-generate)
 /// the keybundle files behind this client's back. Everything a reconnect
-/// can safely
-/// redo - the TCP connect, the sealed control channel, the server's proof
-/// of itself, auth, and identify - is here; everything it must not redo is
+/// can safely redo - the TCP (and TLS) connect, the sealed control
+/// channel, auth, and identify - is here; everything it must not redo is
 /// in the caller.
-pub(crate) async fn handshake_as(
+pub async fn handshake_as(
     request: &ConnectRequest,
     public_key_der: Vec<u8>,
 ) -> Result<
     (
-        crate::control::ControlReader<tokio::io::ReadHalf<TcpStream>>,
-        crate::control::ControlWriter<tokio::io::WriteHalf<TcpStream>>,
+        crate::control::ControlReader<tokio::io::ReadHalf<BoxedStream>>,
+        crate::control::ControlWriter<tokio::io::WriteHalf<BoxedStream>>,
         proto::UserId,
         std::net::SocketAddr,
     ),
     BoxError,
 > {
-    // Prefer IPv4 when the hostname resolves to both families. Docker's IPv6
-    // UDP port publishing often poisons STUN (observed address becomes
-    // 172.17.0.1) while IPv4 returns the client's real public endpoint.
-    let server_addr = resolve_server_prefer_ipv4(&request.host, request.port).await?;
-    let stream = TcpStream::connect(server_addr).await?;
-    // The server's UDP rendezvous socket binds the same numeric port on the
-    // same address (`server::run`) - captured here, before the stream
-    // splits, since `peer_addr` needs the whole `TcpStream` and this is the
-    // resolved address (DNS already settled), not just whatever hostname
-    // the user typed.
-    let server_addr = stream.peer_addr()?;
-    let (rd, wr) = tokio::io::split(stream);
-    let mut rd = crate::control::ControlReader::new(rd);
-    let mut wr = crate::control::ControlWriter::new(wr);
+    let (mut rd, mut wr, _registration_open, server_addr) =
+        open_control_channel(&request.host, request.port, request.ssl, request.ssl_ca.as_deref())
+            .await?;
 
-    let Some(ServerMessage::Hello {
-        auth,
-        challenge,
-        control,
+    wr.send(&ClientMessage::Auth {
+        nickname: request.nickname.clone(),
+        password: request.password.clone(),
+    })
+    .await?;
+    let Some(ServerMessage::AuthResult {
+        ok,
+        activation_pending,
+        reason,
     }) = rd.recv().await?
     else {
-        return Err("server closed the connection during handshake".into());
-    };
-
-    // A client that holds the server's public key requires the offer to be
-    // signed by it. An unsigned or wrongly-signed offer from a server we
-    // *can* authenticate is exactly what a man in the middle would send,
-    // so it is refused rather than silently accepted unauthenticated.
-    let server_public = match &request.server_key {
-        ServerKeySelection::Rsa(path) => Some(crypto::load_public_key(path)?),
-        _ => None,
-    };
-    if !crate::control::verify_offer(&control, server_public.as_ref()) {
-        return Err("the server could not prove it is the one this key belongs to".into());
-    }
-    let (accept, keys) = crate::control::accept_offer(&control)?;
-    wr.send(&ClientMessage::SecureChannel(accept)).await?;
-    wr.enable(keys.send);
-    rd.enable(keys.recv);
-
-    let response = build_auth_response(auth, challenge, &request.server_key)?;
-    wr.send(&ClientMessage::Auth(response)).await?;
-
-    let Some(ServerMessage::AuthResult { ok, reason }) = rd.recv().await? else {
         return Err("server closed the connection during authentication".into());
     };
-    if !ok {
-        return Err(format!("authentication failed: {}", reason.unwrap_or_default()).into());
+    if !ok && activation_pending {
+        // Right credentials, unactivated account (§5.2): answer with the
+        // code this connect carries, or tell the caller to go and get one.
+        let Some(code) = &request.activation_code else {
+            return Err(Box::new(ActivationRequiredError(
+                "this account is waiting for its activation code".into(),
+            )));
+        };
+        wr.send(&ClientMessage::Activate { code: code.clone() })
+            .await?;
+        let Some(ServerMessage::AuthResult { ok, reason, .. }) = rd.recv().await? else {
+            return Err("server closed the connection during activation".into());
+        };
+        if !ok {
+            return Err(Box::new(ActivationRequiredError(
+                reason.unwrap_or_else(|| "activation refused".into()),
+            )));
+        }
+    } else if !ok {
+        return Err(Box::new(AuthRefusedError(format!(
+            "authentication failed: {}",
+            reason.unwrap_or_default()
+        ))));
     }
 
     wr.send(&ClientMessage::Identify {
-        display_name: request.nickname.clone(),
         public_key_der,
         key_mode: KeyMode::PqHybrid,
     })
@@ -321,6 +429,60 @@ pub(crate) async fn handshake_as(
     let you = you.ok_or("server accepted identify but returned no user id")?;
 
     Ok((rd, wr, you, server_addr))
+}
+
+/// Dials the server and brings the sealed control channel up (§1.3): TCP,
+/// TLS when asked (§1.4), `Hello`, `SecureChannel`. Returns the two
+/// sealed halves, what `Hello` said about registrations, and the
+/// server's resolved address - shared by a login and a registration,
+/// which differ only in what they say next.
+async fn open_control_channel(
+    host: &str,
+    port: u16,
+    use_ssl: bool,
+    ssl_ca: Option<&Path>,
+) -> Result<
+    (
+        crate::control::ControlReader<tokio::io::ReadHalf<BoxedStream>>,
+        crate::control::ControlWriter<tokio::io::WriteHalf<BoxedStream>>,
+        bool,
+        std::net::SocketAddr,
+    ),
+    BoxError,
+> {
+    // Prefer IPv4 when the hostname resolves to both families. Docker's IPv6
+    // UDP port publishing often poisons STUN (observed address becomes
+    // 172.17.0.1) while IPv4 returns the client's real public endpoint.
+    let server_addr = resolve_server_prefer_ipv4(host, port).await?;
+    let stream = TcpStream::connect(server_addr).await?;
+    // The server's UDP rendezvous socket binds the same numeric port on the
+    // same address (`server::run`) - captured here, before the stream is
+    // wrapped and split, since `peer_addr` needs the whole `TcpStream` and
+    // this is the resolved address (DNS already settled), not just
+    // whatever hostname the user typed.
+    let server_addr = stream.peer_addr()?;
+    let connector = if use_ssl {
+        Some(ssl::client_connector(ssl_ca)?)
+    } else {
+        None
+    };
+    let stream = ssl::connect(connector.as_ref(), host, stream).await?;
+    let (rd, wr) = tokio::io::split(stream);
+    let mut rd = crate::control::ControlReader::new(rd);
+    let mut wr = crate::control::ControlWriter::new(wr);
+
+    let Some(ServerMessage::Hello {
+        registration_open,
+        control,
+    }) = rd.recv().await?
+    else {
+        return Err("server closed the connection during handshake".into());
+    };
+    let (accept, keys) = crate::control::accept_offer(&control)?;
+    wr.send(&ClientMessage::SecureChannel(accept)).await?;
+    wr.enable(keys.send);
+    rd.enable(keys.recv);
+    Ok((rd, wr, registration_open, server_addr))
 }
 
 /// Resolves `host:port`, preferring IPv4 when both A and AAAA records exist.
@@ -383,37 +545,14 @@ pub fn resolve_my_keypair(sel: &MyKeySelection) -> Result<ResolvedIdentity, BoxE
     })
 }
 
-fn build_auth_response(
-    auth_kind: AuthKind,
-    challenge: Option<Vec<u8>>,
-    server_key: &ServerKeySelection,
-) -> Result<AuthResponse, BoxError> {
-    match (auth_kind, server_key) {
-        (AuthKind::None, _) => Ok(AuthResponse::None),
-        (AuthKind::Password, ServerKeySelection::Password(pw)) => {
-            Ok(AuthResponse::Password(pw.clone()))
-        }
-        (AuthKind::Rsa, ServerKeySelection::Rsa(path)) => {
-            let server_pub = crypto::load_public_key(path)?;
-            let nonce = challenge.ok_or("server requires rsa auth but sent no challenge")?;
-            let blocks = crypto::encrypt_chunked(&server_pub, &nonce)?;
-            Ok(AuthResponse::Rsa { blocks })
-        }
-        (kind, _) => Err(format!(
-            "server requires {kind:?} auth but no matching server_key was provided"
-        )
-        .into()),
-    }
-}
-
 fn local_display_name() -> String {
     std::env::var("USER")
         .or_else(|_| std::env::var("USERNAME"))
         .unwrap_or_else(|_| "anon".to_string())
 }
 
-/// Loads the identity-pinning store from the connect popup's `id_store`
-/// field (§12). Any load failure other than "doesn't exist yet" falls back
+/// Loads the identity-pinning store (§12) from its one location under
+/// `ALOO_HOME`. Any load failure other than "doesn't exist yet" falls back
 /// to an empty in-memory store: refusing to connect over a local
 /// bookkeeping-file problem would be worse than running without pinning
 /// checks.
@@ -648,6 +787,8 @@ pub fn prefill_connect_defaults(
     if let Some(nickname) = &settings.connect_nickname {
         popup.nickname = nickname.clone();
     }
+    popup.ssl = settings.connect_ssl;
+    popup.registration_available = settings.server_allow_registration;
     if let Some((host, port, file_pub, file_priv)) = cache.most_recent() {
         // Only where settings had nothing to say - a hand-edited
         // `connect_host` is a deliberate answer to the same question, and

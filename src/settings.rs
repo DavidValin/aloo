@@ -12,12 +12,17 @@
 //! `crate::client::p2p`'s scheduler runs off - see `docs/PROTOCOL.md`
 //! §7.1.5.
 //!
-//! Also holds the server's last-used `--bind`/`--port`/auth configuration,
-//! written every time `--server` starts, so a crashed server relaunched
-//! with no flags comes back on the same address with the same auth. A
-//! `password` auth is persisted as plaintext like every other field -
-//! anyone who can read `~/.aloo/settings` already controls this user's
-//! account on this machine.
+//! Also holds the server's configuration: its last-used `--bind`/`--port`
+//! (written every time `--server` starts, so a crashed server relaunched
+//! with no flags comes back on the same address), the optional TLS
+//! certificate pair (`server_ssl*`, `crate::server::ssl`), whether
+//! registrations are taken and the SMTP account the activation emails go
+//! out through (`server_allow_registration`, `server_smtp_*`,
+//! `crate::server::users_registry`), and where the activation endpoint
+//! listens (`server_activation_*`, `crate::server::activation`). The SMTP
+//! password and a daemon's login password are persisted as plaintext like
+//! every other field - anyone who can read `~/.aloo/settings` already
+//! controls this user's account on this machine.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -40,17 +45,32 @@ pub fn default_path() -> PathBuf {
     crate::platform::aloo_dir().join("settings")
 }
 
-/// How the server that last ran on this machine was authenticating
-/// clients - mirrors `server::AuthConfig`'s three variants, but holds a
-/// `Rsa` keyfile *path* rather than a loaded `RsaPrivateKey`, since this is
-/// what actually round-trips through a text file (`main.rs::run_server`
-/// reloads the key from this path each time it falls back to it).
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub enum ServerAuth {
-    #[default]
-    None,
-    Password(String),
-    Rsa(PathBuf),
+/// Where the server's TLS certificate pair is looked for when `server_ssl`
+/// is on and the file names it (`docs/SPEC.md` "Server startup"). Written
+/// with a literal `~` so the file reads the same on every machine;
+/// `crate::platform::expand_tilde` resolves it at load time.
+pub const DEFAULT_SERVER_SSL_FULLCHAIN: &str = "~/.aloo/certs/fullchain.pem";
+pub const DEFAULT_SERVER_SSL_PRIVKEY: &str = "~/.aloo/certs/privkey.pem";
+
+/// The TCP port the account-activation web endpoint listens on when
+/// `server_allow_registration` is on (`crate::server::activation`) - on
+/// the same `server_bind` address as the server itself. Its own port
+/// because the server's port speaks the framed control protocol and
+/// answers with `Hello` before reading a byte, so a browser could never
+/// be told apart from a client there.
+pub const DEFAULT_SERVER_ACTIVATION_PORT: u16 = 7880;
+
+/// `on`/`true`/`yes`/`1` - the spelling every `on`/`off` setting in this
+/// file accepts, so no spelling is a silent no-op.
+fn parse_switch(value: &str) -> bool {
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "on" | "true" | "yes" | "1"
+    )
+}
+
+fn switch(on: bool) -> &'static str {
+    if on { "on" } else { "off" }
 }
 
 /// Default size (in megabytes) of a freshly generated OTP keypair
@@ -244,7 +264,37 @@ pub struct Settings {
     pub global_ptt_shortcut: String,
     pub server_bind: String,
     pub server_port: u16,
-    pub server_auth: ServerAuth,
+    /// Serve the control connection (and the activation endpoint) over
+    /// TLS using the certificate pair below (`crate::server::ssl`). Off
+    /// unless the file says `on`: turning it on with no certificate in
+    /// place refuses to start rather than silently serving plaintext.
+    pub server_ssl: bool,
+    /// PEM paths, `~`-relative as written (`DEFAULT_SERVER_SSL_FULLCHAIN`/
+    /// `DEFAULT_SERVER_SSL_PRIVKEY`); resolved when the server loads them.
+    pub server_ssl_fullchain: String,
+    pub server_ssl_privkey: String,
+    /// Whether `Register` is accepted at all (`docs/PROTOCOL.md` §5.3).
+    /// Off by default: with it off, the only way into the registry is
+    /// `aloo --register-user` on the server's own machine.
+    pub server_allow_registration: bool,
+    /// The SMTP account activation emails go out through
+    /// (`crate::server::users_registry::send_activation_email`). All four
+    /// are needed for a registration to be deliverable; a server with
+    /// registration on and no SMTP host refuses registrations with a
+    /// reason rather than creating accounts nobody can activate. Port 465
+    /// is spoken as implicit TLS, any other port as STARTTLS when the
+    /// server offers it.
+    pub server_smtp_host: Option<String>,
+    pub server_smtp_port: Option<u16>,
+    pub server_smtp_username: Option<String>,
+    pub server_smtp_password: Option<String>,
+    /// Where the activation web endpoint listens
+    /// (`DEFAULT_SERVER_ACTIVATION_PORT`), and the public base URL of it
+    /// that the activation email links to - e.g.
+    /// `https://chat.example.com:7880`. With no URL the email carries the
+    /// code alone, to be typed into the client's activation popup.
+    pub server_activation_port: u16,
+    pub server_activation_url: Option<String>,
     /// Overrides the `otp` binary aloo spawns for the OTP encryption layer
     /// (`client::otp_cli::OtpCliConfig::resolve`) - `None` resolves against
     /// `PATH` (or `ALOO_OTP_BIN`, which always wins over this). aloo never
@@ -283,9 +333,12 @@ pub struct Settings {
     pub daemon_host: Option<String>,
     pub daemon_port: Option<u16>,
     pub daemon_nickname: Option<String>,
-    pub daemon_server_auth_type: Option<String>,
+    /// The password `daemon_nickname` logs in with - the one credential a
+    /// daemon needs, and it connects with nobody there to type it.
     pub daemon_server_password: Option<String>,
-    pub daemon_server_rsa_keyfile: Option<String>,
+    /// Connect to the daemon's server over TLS (`connect_ssl`'s daemon
+    /// counterpart).
+    pub daemon_ssl: bool,
     pub daemon_my_key_pub: Option<String>,
     pub daemon_my_key_priv: Option<String>,
     /// One `daemon_channel=<name>[,<password>]` line per entry, in the
@@ -346,6 +399,16 @@ pub struct Settings {
     pub connect_host: Option<String>,
     pub connect_port: Option<u16>,
     pub connect_nickname: Option<String>,
+    /// Whether the last connection was made over TLS - the popup's `ssl`
+    /// toggle, remembered like the host beside it. The password typed
+    /// there is deliberately *not* remembered: it is the one field whose
+    /// loss costs nothing to retype and whose leak costs an account.
+    pub connect_ssl: bool,
+    /// A PEM file of extra root certificates the client trusts on top of
+    /// the public roots it ships with - for a server whose certificate
+    /// is self-signed or issued by a private CA. Hand-edited only; there
+    /// is no popup field for it.
+    pub connect_ssl_ca: Option<String>,
     /// `direct_punch_to` lines that would not parse, kept verbatim with the
     /// reason. A malformed line is skipped like any other unparseable
     /// setting, but skipping it *silently* would leave a typo'd nickname or
@@ -362,7 +425,16 @@ impl Default for Settings {
             global_ptt_shortcut: DEFAULT_GLOBAL_PTT_SHORTCUT.to_string(),
             server_bind: DEFAULT_BIND.to_string(),
             server_port: DEFAULT_PORT,
-            server_auth: ServerAuth::None,
+            server_ssl: false,
+            server_ssl_fullchain: DEFAULT_SERVER_SSL_FULLCHAIN.to_string(),
+            server_ssl_privkey: DEFAULT_SERVER_SSL_PRIVKEY.to_string(),
+            server_allow_registration: false,
+            server_smtp_host: None,
+            server_smtp_port: None,
+            server_smtp_username: None,
+            server_smtp_password: None,
+            server_activation_port: DEFAULT_SERVER_ACTIVATION_PORT,
+            server_activation_url: None,
             otp_binary_path: None,
             otp_keypair_size_mb: DEFAULT_OTP_KEYPAIR_SIZE_MB,
             otp_low_key_warn_pct: DEFAULT_OTP_LOW_KEY_WARN_PCT,
@@ -371,9 +443,8 @@ impl Default for Settings {
             daemon_host: None,
             daemon_port: None,
             daemon_nickname: None,
-            daemon_server_auth_type: None,
             daemon_server_password: None,
-            daemon_server_rsa_keyfile: None,
+            daemon_ssl: false,
             daemon_my_key_pub: None,
             daemon_my_key_priv: None,
             daemon_channels: Vec::new(),
@@ -387,6 +458,8 @@ impl Default for Settings {
             connect_host: None,
             connect_port: None,
             connect_nickname: None,
+            connect_ssl: false,
+            connect_ssl_ca: None,
             direct_punch_invalid: Vec::new(),
         }
     }
@@ -411,13 +484,6 @@ impl Settings {
 
     fn parse(contents: &str) -> Self {
         let mut settings = Self::default();
-        // `server_auth`'s three lines can appear in any order (or be
-        // partly missing on a hand-edited file), so its pieces are
-        // gathered here and only assembled into one `ServerAuth` once the
-        // whole file has been read.
-        let mut auth_type: Option<&str> = None;
-        let mut auth_password: Option<String> = None;
-        let mut auth_rsa_keyfile: Option<String> = None;
         for line in contents.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
@@ -444,10 +510,41 @@ impl Settings {
                         settings.server_port = p;
                     }
                 }
-                "server_auth_type" => auth_type = Some(value),
-                "server_auth_password" => auth_password = Some(value.to_string()),
-                "server_auth_rsa_keyfile" if !value.is_empty() => {
-                    auth_rsa_keyfile = Some(value.to_string())
+                "server_ssl" => settings.server_ssl = parse_switch(value),
+                "server_ssl_fullchain" if !value.is_empty() => {
+                    settings.server_ssl_fullchain = value.to_string();
+                }
+                "server_ssl_privkey" if !value.is_empty() => {
+                    settings.server_ssl_privkey = value.to_string();
+                }
+                "server_allow_registration" => {
+                    settings.server_allow_registration = parse_switch(value);
+                }
+                "server_smtp_host" if !value.is_empty() => {
+                    settings.server_smtp_host = Some(value.to_string());
+                }
+                "server_smtp_port" => {
+                    if let Ok(p) = value.parse::<u16>()
+                        && p != 0
+                    {
+                        settings.server_smtp_port = Some(p);
+                    }
+                }
+                "server_smtp_username" if !value.is_empty() => {
+                    settings.server_smtp_username = Some(value.to_string());
+                }
+                "server_smtp_password" if !value.is_empty() => {
+                    settings.server_smtp_password = Some(value.to_string());
+                }
+                "server_activation_port" => {
+                    if let Ok(p) = value.parse::<u16>()
+                        && p != 0
+                    {
+                        settings.server_activation_port = p;
+                    }
+                }
+                "server_activation_url" if !value.is_empty() => {
+                    settings.server_activation_url = Some(value.trim_end_matches('/').to_string());
                 }
                 "otp_binary_path" if !value.is_empty() => {
                     settings.otp_binary_path = Some(value.to_string());
@@ -485,15 +582,10 @@ impl Settings {
                 "daemon_nickname" if !value.is_empty() => {
                     settings.daemon_nickname = Some(value.to_string())
                 }
-                "daemon_server_auth_type" if !value.is_empty() => {
-                    settings.daemon_server_auth_type = Some(value.to_string())
-                }
-                "daemon_server_password" => {
+                "daemon_server_password" if !value.is_empty() => {
                     settings.daemon_server_password = Some(value.to_string())
                 }
-                "daemon_server_rsa_keyfile" if !value.is_empty() => {
-                    settings.daemon_server_rsa_keyfile = Some(value.to_string())
-                }
+                "daemon_ssl" => settings.daemon_ssl = parse_switch(value),
                 "daemon_my_key_pub" if !value.is_empty() => {
                     settings.daemon_my_key_pub = Some(value.to_string())
                 }
@@ -518,18 +610,8 @@ impl Settings {
                 // `on`/`off` rather than `true`/`false`, matching how the
                 // setting is spelled in every example and in the README -
                 // both are accepted so neither spelling is a silent no-op.
-                "daemon_no_server" => {
-                    settings.daemon_no_server = matches!(
-                        value.to_ascii_lowercase().as_str(),
-                        "on" | "true" | "yes" | "1"
-                    );
-                }
-                "direct_punch" => {
-                    settings.direct_punch = matches!(
-                        value.to_ascii_lowercase().as_str(),
-                        "on" | "true" | "yes" | "1"
-                    );
-                }
+                "daemon_no_server" => settings.daemon_no_server = parse_switch(value),
+                "direct_punch" => settings.direct_punch = parse_switch(value),
                 "direct_punch_port" => {
                     if let Ok(p) = value.parse::<u16>()
                         && p != 0
@@ -555,6 +637,10 @@ impl Settings {
                 "connect_nickname" if !value.is_empty() => {
                     settings.connect_nickname = Some(value.to_string())
                 }
+                "connect_ssl" => settings.connect_ssl = parse_switch(value),
+                "connect_ssl_ca" if !value.is_empty() => {
+                    settings.connect_ssl_ca = Some(value.to_string())
+                }
                 "direct_punch_to" => match DirectPunchTarget::parse(value) {
                     Ok(target) => settings.direct_punch_to.push(target),
                     Err(reason) => settings
@@ -564,13 +650,6 @@ impl Settings {
                 _ => {}
             }
         }
-        settings.server_auth = match auth_type {
-            Some("password") => auth_password.map(ServerAuth::Password).unwrap_or_default(),
-            Some("rsa") => auth_rsa_keyfile
-                .map(|f| ServerAuth::Rsa(PathBuf::from(f)))
-                .unwrap_or_default(),
-            _ => ServerAuth::None,
-        };
         settings
     }
 
@@ -586,17 +665,31 @@ impl Settings {
             "global_ptt_enabled={}\nglobal_ptt_shortcut={}\nserver_bind={}\nserver_port={}\n",
             self.global_ptt_enabled, self.global_ptt_shortcut, self.server_bind, self.server_port
         );
-        match &self.server_auth {
-            ServerAuth::None => contents.push_str("server_auth_type=none\n"),
-            ServerAuth::Password(pw) => {
-                contents.push_str("server_auth_type=password\n");
-                contents.push_str(&format!("server_auth_password={pw}\n"));
-            }
-            ServerAuth::Rsa(keyfile) => {
-                contents.push_str("server_auth_type=rsa\n");
-                contents.push_str(&format!("server_auth_rsa_keyfile={}\n", keyfile.display()));
-            }
-        }
+        // Every server key is written even when unset (`server_smtp_host=`),
+        // so an operator setting the server up finds each one already
+        // named in the file rather than having to know it exists.
+        contents.push_str(&format!(
+            "server_ssl={}\nserver_ssl_fullchain={}\nserver_ssl_privkey={}\n",
+            switch(self.server_ssl),
+            self.server_ssl_fullchain,
+            self.server_ssl_privkey
+        ));
+        contents.push_str(&format!(
+            "server_allow_registration={}\n",
+            switch(self.server_allow_registration)
+        ));
+        contents.push_str(&format!(
+            "server_smtp_host={}\nserver_smtp_port={}\nserver_smtp_username={}\nserver_smtp_password={}\n",
+            self.server_smtp_host.as_deref().unwrap_or(""),
+            self.server_smtp_port.map(|p| p.to_string()).unwrap_or_default(),
+            self.server_smtp_username.as_deref().unwrap_or(""),
+            self.server_smtp_password.as_deref().unwrap_or(""),
+        ));
+        contents.push_str(&format!(
+            "server_activation_port={}\nserver_activation_url={}\n",
+            self.server_activation_port,
+            self.server_activation_url.as_deref().unwrap_or("")
+        ));
         if let Some(bin) = &self.otp_binary_path {
             contents.push_str(&format!("otp_binary_path={bin}\n"));
         }
@@ -625,9 +718,7 @@ impl Settings {
         };
         optional("daemon_host", &self.daemon_host);
         optional("daemon_nickname", &self.daemon_nickname);
-        optional("daemon_server_auth_type", &self.daemon_server_auth_type);
         optional("daemon_server_password", &self.daemon_server_password);
-        optional("daemon_server_rsa_keyfile", &self.daemon_server_rsa_keyfile);
         optional("daemon_my_key_pub", &self.daemon_my_key_pub);
         optional("daemon_my_key_priv", &self.daemon_my_key_priv);
         optional("daemon_focus", &self.daemon_focus);
@@ -641,6 +732,9 @@ impl Settings {
         }
         if self.daemon_otp {
             contents.push_str("daemon_otp=true\n");
+        }
+        if self.daemon_ssl {
+            contents.push_str("daemon_ssl=on\n");
         }
         if self.daemon_no_server {
             contents.push_str("daemon_no_server=true\n");
@@ -672,52 +766,13 @@ impl Settings {
         if let Some(port) = self.connect_port {
             contents.push_str(&format!("connect_port={port}\n"));
         }
+        contents.push_str(&format!("connect_ssl={}\n", switch(self.connect_ssl)));
+        if let Some(ca) = &self.connect_ssl_ca
+            && crate::validation::is_storable(ca)
+        {
+            contents.push_str(&format!("connect_ssl_ca={ca}\n"));
+        }
         fs::write(path, contents)
-    }
-
-    /// The `server_key` a daemon should connect with, assembled from the
-    /// three `daemon_server_*` keys - which, like `server_auth`'s own
-    /// three, may appear in any order or be partly missing on a
-    /// hand-edited file.
-    pub fn daemon_server_key(&self) -> crate::client::connect::ServerKeySelection {
-        use crate::client::connect::ServerKeySelection;
-        match self.daemon_server_auth_type.as_deref() {
-            Some("password") => self
-                .daemon_server_password
-                .clone()
-                .map(ServerKeySelection::Password)
-                .unwrap_or(ServerKeySelection::None),
-            Some("rsa") => self
-                .daemon_server_rsa_keyfile
-                .clone()
-                .map(|f| ServerKeySelection::Rsa(PathBuf::from(f)))
-                .unwrap_or(ServerKeySelection::None),
-            _ => ServerKeySelection::None,
-        }
-    }
-
-    /// Records `selection` as the three `daemon_server_*` keys, clearing
-    /// whichever of them no longer applies - so switching a daemon from
-    /// password to rsa auth doesn't leave the old password behind in the
-    /// file for the next resolve to pick up.
-    pub fn set_daemon_server_key(
-        &mut self,
-        selection: &crate::client::connect::ServerKeySelection,
-    ) {
-        use crate::client::connect::ServerKeySelection;
-        self.daemon_server_password = None;
-        self.daemon_server_rsa_keyfile = None;
-        match selection {
-            ServerKeySelection::None => self.daemon_server_auth_type = Some("none".to_string()),
-            ServerKeySelection::Password(pw) => {
-                self.daemon_server_auth_type = Some("password".to_string());
-                self.daemon_server_password = Some(pw.clone());
-            }
-            ServerKeySelection::Rsa(file) => {
-                self.daemon_server_auth_type = Some("rsa".to_string());
-                self.daemon_server_rsa_keyfile = Some(file.display().to_string());
-            }
-        }
     }
 
     /// Records the keybundle a daemon connects with, so a later bare
@@ -755,8 +810,10 @@ impl Settings {
         host: &str,
         port: u16,
         nickname: &str,
+        ssl: bool,
     ) -> io::Result<()> {
         Self::update(path, |s| {
+            s.connect_ssl = ssl;
             // An empty host is what a `--no-server` start stands in for
             // (`client::daemon::DaemonConfig::resolve`), not an address -
             // recording it would leave the next start resolving a host

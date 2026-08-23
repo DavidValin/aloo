@@ -43,10 +43,10 @@ Feature: Starting aloo in the background
     Then it refuses to start, saying "no server to connect to"
 
   @AC-201
-  Scenario: The two server credentials cannot both be given
+  Scenario: A daemon with a server named but no password refuses to start
     Given no daemon settings and nothing in the connect cache
-    When the daemon is started with both --server-pwd and --server-key
-    Then it refuses to start, saying "mutually exclusive"
+    When the daemon is started with --host=chat.example but no password
+    Then it refuses to start, saying "no password for the server"
 
   @AC-201
   Scenario: A misspelled channel is reported rather than quietly dropped

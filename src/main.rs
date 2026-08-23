@@ -12,7 +12,7 @@ use aloo::client::daemon;
 use aloo::client::global_ptt;
 use aloo::client::tui::terminal;
 use aloo::crypto;
-use aloo::server::{self, AuthConfig};
+use aloo::server::{self, ServerOptions};
 use aloo::settings;
 use aloo::validation;
 
@@ -60,14 +60,17 @@ struct Cli {
     #[arg(long)]
     bind: Option<String>,
 
-    /// Server-only auth: `--enc rsa <keyfile>` requires clients to prove
-    /// they hold the matching public key.
-    #[arg(long, num_args = 2, value_names = ["TYPE", "FILE"])]
-    enc: Option<Vec<String>>,
+    /// Server-side registry: create an account that can log in right
+    /// away - no email, no activation. Edits ~/.aloo/users directly, so
+    /// run it on the server's machine; a running server sees it on the
+    /// next login.
+    #[arg(long, value_names = ["NICKNAME", "PASSWORD"], num_args = 2)]
+    register_user: Option<Vec<String>>,
 
-    /// Server-only auth: a single shared password every client must send.
-    #[arg(long)]
-    password: Option<String>,
+    /// Server-side registry: set a registered nickname's password. Takes
+    /// effect on that nickname's next login; sends no email.
+    #[arg(long, value_names = ["NICKNAME", "PASSWORD"], num_args = 2)]
+    change_password: Option<Vec<String>>,
 
     /// Generate a fresh PQ-hybrid (`my_key` type `pq_hybrid`) keybundle and
     /// exit - writes `<PREFIX>` (private) and `<PREFIX>.pub` (public),
@@ -128,15 +131,16 @@ struct Cli {
     #[arg(long)]
     nick: Option<String>,
 
-    /// Daemon-only: the server's shared password, for a server started
-    /// with `--password`.
+    /// Daemon-only: the password the nickname logs in with. Remembered in
+    /// ~/.aloo/settings (daemon_server_password) for the next bare
+    /// `aloo --daemon`.
     #[arg(long)]
     server_pwd: Option<String>,
 
-    /// Daemon-only: the server's public key file, for a server started
-    /// with `--enc rsa`.
-    #[arg(long, value_name = "FILE")]
-    server_key: Option<PathBuf>,
+    /// Daemon-only: connect over TLS, for a server running with
+    /// server_ssl=on. Remembered as daemon_ssl.
+    #[arg(long)]
+    ssl: bool,
 
     /// Daemon-only: the `pq_hybrid` keybundle prefix to connect with -
     /// `<PREFIX>` and `<PREFIX>.pub`. Generated on first use if missing.
@@ -191,6 +195,12 @@ fn main() -> Result<(), BoxError> {
     }
     if let Some(args) = &cli.export_identity_card {
         return run_export_identity_card(&args[0], &args[1]);
+    }
+    if let Some(args) = &cli.register_user {
+        return run_register_user(&args[0], &args[1]);
+    }
+    if let Some(args) = &cli.change_password {
+        return run_change_password(&args[0], &args[1]);
     }
     if cli.server {
         return build_runtime()?.block_on(run_server(cli));
@@ -277,7 +287,7 @@ fn resolve_daemon_config(cli: &Cli) -> Result<aloo::client::daemon::DaemonConfig
         port: cli.port,
         nickname: cli.nick.clone(),
         server_pwd: cli.server_pwd.clone(),
-        server_key_file: cli.server_key.clone(),
+        ssl: cli.ssl,
         my_key_prefix: cli.my_key.clone(),
         channels: cli.channels.clone(),
         focus: cli.focus.clone(),
@@ -486,11 +496,13 @@ fn run_export_identity_card(prefix: &str, nickname: &str) -> Result<(), BoxError
 // Server mode
 // ---------------------------------------------------------------------
 
-/// Resolves bind/port/auth CLI-flag-first, falling back to whatever
+/// Resolves bind/port CLI-flag-first, falling back to whatever
 /// `~/.aloo/settings` last recorded for any flag not given this run, then
 /// re-saves the merged result before starting - so a flag actually passed
 /// this run becomes what the next flag-less run (e.g. a supervisor
-/// restarting the server after a crash) inherits.
+/// restarting the server after a crash) inherits. Everything else the
+/// server runs with - TLS, registration, SMTP, the activation endpoint -
+/// is settings-only (docs/SPEC.md "Server startup").
 async fn run_server(cli: Cli) -> Result<(), BoxError> {
     let mut settings = load_settings();
     let bind = cli
@@ -499,37 +511,88 @@ async fn run_server(cli: Cli) -> Result<(), BoxError> {
         .unwrap_or_else(|| settings.server_bind.clone());
     let port = cli.port.unwrap_or(settings.server_port);
 
-    let auth = match (&cli.enc, &cli.password) {
-        (Some(v), None) if v[0] == "rsa" => {
-            let keyfile = PathBuf::from(&v[1]);
-            let key = crypto::load_private_key(&keyfile)?;
-            settings.server_auth = settings::ServerAuth::Rsa(keyfile);
-            AuthConfig::Rsa(Box::new(key))
-        }
-        (Some(v), None) => return Err(format!("unsupported --enc type: {}", v[0]).into()),
-        (None, Some(pw)) => {
-            settings.server_auth = settings::ServerAuth::Password(pw.clone());
-            AuthConfig::Password(pw.clone())
-        }
-        (None, None) => match settings.server_auth.clone() {
-            settings::ServerAuth::None => AuthConfig::None,
-            settings::ServerAuth::Password(pw) => AuthConfig::Password(pw),
-            settings::ServerAuth::Rsa(keyfile) => {
-                AuthConfig::Rsa(Box::new(crypto::load_private_key(&keyfile)?))
-            }
-        },
-        (Some(_), Some(_)) => return Err("--enc and --password are mutually exclusive".into()),
-    };
-
     settings.server_bind = bind.clone();
     settings.server_port = port;
     if let Err(e) = settings.save(&settings::default_path()) {
         aloo::log_warn!("could not persist server settings to ~/.aloo/settings ({e})");
     }
 
+    let users = server::users_registry::UsersRegistry::open(server::users_registry::default_dir())?;
+    let mut options = ServerOptions::new(users.clone());
+
+    // Refusing to start beats serving plaintext behind an operator's back:
+    // `server_ssl=on` with no certificate is a misconfiguration, not a
+    // preference.
+    if let Some(files) = server::ssl::SslFiles::from_settings(&settings) {
+        let acceptor = server::ssl::load_acceptor(&files)
+            .map_err(|e| format!("server_ssl is on but the certificate cannot be used: {e}"))?;
+        options = options.with_tls(acceptor);
+        println!("aloo: ssl on ({})", files.fullchain.display());
+    }
+
+    if settings.server_allow_registration {
+        let smtp = server::users_registry::SmtpConfig::from_settings(&settings);
+        if smtp.is_none() {
+            aloo::log_warn!(
+                "server_allow_registration is on but server_smtp_host/server_smtp_port are not set - registrations will be refused"
+            );
+        }
+        options = options.with_registration(smtp, settings.server_activation_url.clone());
+
+        let activation_addr =
+            validation::parse_bind_addr(&bind, settings.server_activation_port)?;
+        let listener = tokio::net::TcpListener::bind(activation_addr).await?;
+        let tls = options.tls.clone();
+        let registry = std::sync::Arc::new(users);
+        tokio::spawn(async move {
+            if let Err(e) = server::activation::run(listener, tls, registry).await {
+                aloo::log_warn!("activation endpoint stopped: {e}");
+            }
+        });
+        println!(
+            "aloo: registration open, activation endpoint on {}{activation_addr}",
+            if settings.server_ssl { "https://" } else { "http://" }
+        );
+        if !settings.server_ssl {
+            aloo::log_warn!(
+                "the activation endpoint is plain http - set server_ssl=on to serve it over https"
+            );
+        }
+    }
+
     let addr: SocketAddr = validation::parse_bind_addr(&bind, port)?;
     println!("aloo: server listening on {addr}");
-    server::run(addr, auth).await?;
+    server::run(addr, options).await?;
+    Ok(())
+}
+
+/// `--register-user <nickname> <password>`: straight into the registry
+/// the server reads from, active immediately.
+fn run_register_user(nickname: &str, password: &str) -> Result<(), BoxError> {
+    let users = server::users_registry::UsersRegistry::open(server::users_registry::default_dir())?;
+    // `main`'s default error printer shows a returned error's `Debug`, not
+    // its `Display` - for `RegisterError` that would print the bare enum
+    // variant name (`AlreadyRegistered`) instead of the readable message
+    // its own `Display` impl gives, so the message is carried through as
+    // a `String` instead, whose own `Debug` is just its quoted content.
+    users
+        .register_manual(nickname, password)
+        .map_err(|e| e.to_string())?;
+    println!(
+        "aloo: registered {nickname} in {} (active, no email)",
+        users.dir().display()
+    );
+    Ok(())
+}
+
+/// `--change-password <nickname> <password>`: rewrites the stored key.
+/// Effective on the next login, since every login re-reads it.
+fn run_change_password(nickname: &str, password: &str) -> Result<(), BoxError> {
+    let users = server::users_registry::UsersRegistry::open(server::users_registry::default_dir())?;
+    users
+        .change_password(nickname, password)
+        .map_err(|e| e.to_string())?;
+    println!("aloo: password changed for {nickname}");
     Ok(())
 }
 

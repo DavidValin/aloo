@@ -26,7 +26,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::io::{ReadHalf, WriteHalf};
-use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
@@ -137,24 +136,32 @@ impl ServerLinkState {
         }
     }
 
-    /// Exactly what the header renders, emoji included (`docs/SPEC.md`
+    /// The one glyph every state renders with - a plain record-circle
+    /// rather than a multicolour emoji, so the colour actually shown is
+    /// whichever one the header applies (`client::tui::channel::
+    /// server_link_color`) and not a fixed one baked into the character
+    /// itself.
+    pub const ICON: &'static str = "\u{23FA}";
+
+    /// Exactly what the header renders, icon included (`docs/SPEC.md`
     /// "Connected UI"). `punching` is only ever read in the `NoServer`
     /// state - with a server, a direct link being punched is the ordinary
     /// case and the sidebar already colours the peer it belongs to; with
     /// none it is the only thing this client is doing to reach anybody,
     /// and worth saying out loud.
     pub fn label(self, punching: bool) -> String {
+        let icon = Self::ICON;
         match self {
-            Self::Connected => "\u{1F7E2} Connected to server!".to_string(),
-            Self::Reconnecting => "\u{1F534} Reconnecting...".to_string(),
+            Self::Connected => format!("{icon} Connected to server!"),
+            Self::Reconnecting => format!("{icon} Reconnecting..."),
             Self::RetryingIn { seconds_left } => {
-                format!("\u{1F534} Reconnecting in {seconds_left}s...")
+                format!("{icon} Reconnecting in {seconds_left}s...")
             }
             Self::Down { seconds_left } => {
-                format!("\u{1F534} Server down (reconnecting in {seconds_left} sec...)")
+                format!("{icon} Server down (reconnecting in {seconds_left} sec...)")
             }
-            Self::NoServer if punching => "\u{26AA} No server mode (punching)".to_string(),
-            Self::NoServer => "\u{26AA} No server mode".to_string(),
+            Self::NoServer if punching => format!("{icon} No server mode (punching)"),
+            Self::NoServer => format!("{icon} No server mode"),
         }
     }
 }
@@ -212,14 +219,14 @@ pub enum ServerEvent {
 /// module exists to prevent.
 #[derive(Clone)]
 pub struct ServerSink {
-    inner: Arc<Mutex<Option<ControlWriter<WriteHalf<TcpStream>>>>>,
+    inner: Arc<Mutex<Option<ControlWriter<WriteHalf<crate::server::ssl::BoxedStream>>>>>,
     lost_tx: UnboundedSender<()>,
 }
 
 impl ServerSink {
     /// A sink over a live connection, plus the receiver the supervisor
     /// waits on to hear that a write failed.
-    pub fn new(writer: ControlWriter<WriteHalf<TcpStream>>) -> (Self, UnboundedReceiver<()>) {
+    pub fn new(writer: ControlWriter<WriteHalf<crate::server::ssl::BoxedStream>>) -> (Self, UnboundedReceiver<()>) {
         let (lost_tx, lost_rx) = tokio::sync::mpsc::unbounded_channel();
         (
             Self {
@@ -232,7 +239,7 @@ impl ServerSink {
 
     /// Puts a freshly established connection's writer in place of whatever
     /// was there.
-    pub async fn install(&self, writer: ControlWriter<WriteHalf<TcpStream>>) {
+    pub async fn install(&self, writer: ControlWriter<WriteHalf<crate::server::ssl::BoxedStream>>) {
         *self.inner.lock().await = Some(writer);
     }
 
@@ -290,7 +297,7 @@ pub struct ReconnectPlan {
 /// Runs until the session drops the event receiver, at which point every
 /// send fails and the task falls out on its own.
 pub fn spawn_supervisor(
-    reader: ControlReader<ReadHalf<TcpStream>>,
+    reader: ControlReader<ReadHalf<crate::server::ssl::BoxedStream>>,
     plan: ReconnectPlan,
     sink: ServerSink,
     mut lost_rx: UnboundedReceiver<()>,
@@ -345,7 +352,7 @@ async fn reconnect_loop(
     plan: &ReconnectPlan,
     sink: &ServerSink,
     events_tx: &UnboundedSender<ServerEvent>,
-) -> Option<ControlReader<ReadHalf<TcpStream>>> {
+) -> Option<ControlReader<ReadHalf<crate::server::ssl::BoxedStream>>> {
     let mut failed_attempts: u32 = 0;
     loop {
         // `delay_after(0)` is zero, so the first attempt happens the

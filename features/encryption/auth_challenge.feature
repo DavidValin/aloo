@@ -1,16 +1,20 @@
 @US-008
-Feature: Proving to a server that you hold its key
+Feature: RSA-OAEP is sound on its own
 
-  As a server operator who handed out an rsa key
-  I want a connecting client to prove it holds that key before it is let in
-  So that only clients I have authorised can join
+  As a user relying on pq_hybrid's RSA-4096 hedge against a flawed
+  post-quantum primitive
+  I want RSA-OAEP encryption itself to be sound - readable only by the
+  intended key
+  So that the classical half of the hedge is trustworthy independent of
+  the post-quantum half
 
-  This file is about RSA-OAEP, which serves exactly one purpose in this
-  app: the server's `rsa` auth challenge, where the client proves itself by
-  decrypting a nonce (docs/PROTOCOL.md section 5.3), chunked per section
-  8.1. It is *not* how messages are encrypted - nothing peer-to-peer uses
-  it. That is features/encryption/message_encryption.feature, which covers
-  all three layerings a message can travel under.
+  This file is about RSA-OAEP itself, chunked per docs/PROTOCOL.md section
+  8.1 - the primitive pq_hybrid's RSA-4096 hedge (section 13.5) is built
+  on. Server login is a nickname and its password (section 5.1), not any
+  RSA challenge. RSA-OAEP is not how peer-to-peer message content is
+  encrypted either - nothing there uses it directly. That is
+  features/encryption/message_encryption.feature, which covers all three
+  layerings a message can travel under.
 
   @AC-040
   Scenario: A payload can be read only by the holder of the key it was encrypted for

@@ -72,6 +72,19 @@ thiserror = "2.0.20"
 time = { version = "0.3.55", features = ["local-offset", "formatting"] }
 tokio = { version = "1.53.1", features = ["full"] }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
+# Server-side TLS for the control connection and the activation endpoint
+# (`src/server/ssl.rs`), and the client end of the same (`client::connect`).
+# The `ring` provider rather than rustls' default `aws-lc-rs`: pure Rust plus
+# a little portable C, which is what the fully static musl targets in
+# `Cross.toml` can build without a cmake toolchain.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls-pemfile = "2"
+webpki-roots = "1"
+# Password-to-key derivation for the server's users registry
+# (`server::users_registry::derive_user_key`) - a deliberately slow KDF,
+# since what it protects is a password.
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 # Wipes raw one-time-pad key bytes (`crypto::otp`, `client::otp`) from memory
 # on drop - pad material is the literal one-time secret with no
 # computational-hardness fallback, unlike every other key type this app
@@ -85,6 +98,8 @@ cucumber = "0.23"
 # Parses `requirements/requirements.toml`, the requirement model that the
 # traceability tool validates the suite against.
 toml = "0.9"
+# Self-signed certificates for the TLS tests (`test/ssl_test.rs`).
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 
 
 [lib]
@@ -214,6 +229,18 @@ path = "test/netstats_test.rs"
 [[test]]
 name = "server_test"
 path = "test/server_test.rs"
+
+[[test]]
+name = "server_users_registry_test"
+path = "test/server_users_registry_test.rs"
+
+[[test]]
+name = "server_ssl_test"
+path = "test/server_ssl_test.rs"
+
+[[test]]
+name = "server_activation_test"
+path = "test/server_activation_test.rs"
 
 [[test]]
 name = "reconnect_test"

@@ -1,6 +1,7 @@
 use aloo::settings::{
     DEFAULT_BIND, DEFAULT_DIRECT_PUNCH_PORT, DEFAULT_GLOBAL_PTT_SHORTCUT, DEFAULT_PORT,
-    DirectPunchTarget, PunchFrequency, ServerAuth, Settings, default_path,
+    DEFAULT_SERVER_ACTIVATION_PORT, DEFAULT_SERVER_SSL_FULLCHAIN, DEFAULT_SERVER_SSL_PRIVKEY,
+    DirectPunchTarget, PunchFrequency, Settings, default_path,
 };
 use std::path::PathBuf;
 
@@ -38,7 +39,8 @@ fn missing_file_is_created_with_documented_defaults() {
     assert_eq!(settings.global_ptt_shortcut, DEFAULT_GLOBAL_PTT_SHORTCUT);
     assert_eq!(settings.server_bind, DEFAULT_BIND);
     assert_eq!(settings.server_port, DEFAULT_PORT);
-    assert_eq!(settings.server_auth, ServerAuth::None);
+    assert!(!settings.server_ssl);
+    assert!(!settings.server_allow_registration);
     assert!(
         path.is_file(),
         "load_or_create must write the defaults to disk immediately, not just in memory"
@@ -51,7 +53,8 @@ fn missing_file_is_created_with_documented_defaults() {
     )));
     assert!(contents.contains(&format!("server_bind={DEFAULT_BIND}")));
     assert!(contents.contains(&format!("server_port={DEFAULT_PORT}")));
-    assert!(contents.contains("server_auth_type=none"));
+    assert!(contents.contains("server_ssl=off"));
+    assert!(contents.contains("server_allow_registration=off"));
 
     std::fs::remove_file(&path).ok();
 }
@@ -65,7 +68,6 @@ fn round_trips_through_save_and_load() {
         global_ptt_shortcut: "shift+alt+KeyV".to_string(),
         server_bind: "127.0.0.1".to_string(),
         server_port: 9999,
-        server_auth: ServerAuth::None,
         ..Settings::default()
     };
     saved.save(&path).expect("save should succeed");
@@ -77,64 +79,84 @@ fn round_trips_through_save_and_load() {
     std::fs::remove_file(&path).ok();
 }
 
-/// @requirement AC-094
+/// Every server key is in the file from the first run, unset ones with an
+/// empty value, so an operator finds them already named.
+/// @requirement TB-241
 #[test]
-fn round_trips_password_auth_through_save_and_load() {
+fn server_ssl_registration_and_smtp_keys_are_written_even_when_unset() {
     let path = temp_settings_path();
-    let saved = Settings {
-        server_auth: ServerAuth::Password("hunter2".to_string()),
-        ..Settings::default()
-    };
-    saved.save(&path).unwrap();
+    let settings = Settings::load_or_create(&path).unwrap();
+    assert_eq!(settings.server_ssl_fullchain, DEFAULT_SERVER_SSL_FULLCHAIN);
+    assert_eq!(settings.server_ssl_privkey, DEFAULT_SERVER_SSL_PRIVKEY);
+    assert_eq!(settings.server_activation_port, DEFAULT_SERVER_ACTIVATION_PORT);
+    assert_eq!(settings.server_smtp_host, None);
+    assert_eq!(settings.server_smtp_port, None);
 
-    let loaded = Settings::load_or_create(&path).unwrap();
-    assert_eq!(
-        loaded.server_auth,
-        ServerAuth::Password("hunter2".to_string())
-    );
-
+    let contents = std::fs::read_to_string(&path).unwrap();
+    for line in [
+        "server_ssl=off",
+        &format!("server_ssl_fullchain={DEFAULT_SERVER_SSL_FULLCHAIN}"),
+        &format!("server_ssl_privkey={DEFAULT_SERVER_SSL_PRIVKEY}"),
+        "server_allow_registration=off",
+        "server_smtp_host=",
+        "server_smtp_port=",
+        "server_smtp_username=",
+        "server_smtp_password=",
+        &format!("server_activation_port={DEFAULT_SERVER_ACTIVATION_PORT}"),
+        "server_activation_url=",
+    ] {
+        assert!(contents.contains(line), "missing {line:?} in:\n{contents}");
+    }
     std::fs::remove_file(&path).ok();
 }
 
-/// @requirement AC-094
+/// @requirement TB-241
 #[test]
-fn round_trips_rsa_auth_through_save_and_load() {
+fn server_ssl_registration_and_smtp_keys_round_trip() {
     let path = temp_settings_path();
     let saved = Settings {
-        server_auth: ServerAuth::Rsa(PathBuf::from("/tmp/server_key")),
+        server_ssl: true,
+        server_ssl_fullchain: "/etc/letsencrypt/live/chat/fullchain.pem".to_string(),
+        server_ssl_privkey: "/etc/letsencrypt/live/chat/privkey.pem".to_string(),
+        server_allow_registration: true,
+        server_smtp_host: Some("smtp.example.com".to_string()),
+        server_smtp_port: Some(587),
+        server_smtp_username: Some("aloo@example.com".to_string()),
+        server_smtp_password: Some("s3cret".to_string()),
+        server_activation_port: 8443,
+        server_activation_url: Some("https://chat.example.com:8443".to_string()),
         ..Settings::default()
     };
     saved.save(&path).unwrap();
-
     let loaded = Settings::load_or_create(&path).unwrap();
-    assert_eq!(
-        loaded.server_auth,
-        ServerAuth::Rsa(PathBuf::from("/tmp/server_key"))
-    );
-
+    assert_eq!(loaded, saved);
     std::fs::remove_file(&path).ok();
 }
 
-/// @requirement TB-138
+/// `on`/`true`/`yes`/`1` all switch a server flag on; a trailing slash on
+/// the activation URL is dropped so the link built from it is clean.
+/// @requirement TB-241
 #[test]
-fn a_malformed_server_auth_type_with_no_matching_value_falls_back_to_none() {
+fn server_switches_accept_every_documented_spelling() {
     let path = temp_settings_path();
-    std::fs::write(&path, "server_auth_type=password\n").unwrap();
+    for spelling in ["on", "true", "yes", "1"] {
+        std::fs::write(
+            &path,
+            format!("server_ssl={spelling}\nserver_allow_registration={spelling}\nserver_activation_url=https://x.example/\n"),
+        )
+        .unwrap();
+        let settings = Settings::load_or_create(&path).unwrap();
+        assert!(settings.server_ssl, "server_ssl={spelling}");
+        assert!(settings.server_allow_registration, "server_allow_registration={spelling}");
+        assert_eq!(
+            settings.server_activation_url.as_deref(),
+            Some("https://x.example")
+        );
+    }
+    std::fs::write(&path, "server_ssl=off\nserver_smtp_port=0\n").unwrap();
     let settings = Settings::load_or_create(&path).unwrap();
-    assert_eq!(
-        settings.server_auth,
-        ServerAuth::None,
-        "a password type with no password line must not panic or half-apply"
-    );
-
-    std::fs::write(&path, "server_auth_type=rsa\n").unwrap();
-    let settings = Settings::load_or_create(&path).unwrap();
-    assert_eq!(
-        settings.server_auth,
-        ServerAuth::None,
-        "an rsa type with no keyfile line must not panic or half-apply"
-    );
-
+    assert!(!settings.server_ssl);
+    assert_eq!(settings.server_smtp_port, None, "port 0 is not a port");
     std::fs::remove_file(&path).ok();
 }
 
@@ -276,7 +298,7 @@ fn update_muted_voice_preserves_keys_written_by_another_process() {
     // Another process (an `aloo --server` start) rewrites it meanwhile.
     let mut theirs = Settings::load_or_create(&path).unwrap();
     theirs.server_port = 9999;
-    theirs.server_auth = ServerAuth::Password("hunter2".to_string());
+    theirs.server_smtp_password = Some("hunter2".to_string());
     theirs.save(&path).unwrap();
 
     // Our mute must not revert any of that.
@@ -290,7 +312,7 @@ fn update_muted_voice_preserves_keys_written_by_another_process() {
         after.server_port, 9999,
         "a mute must not roll back another writer's port"
     );
-    assert_eq!(after.server_auth, ServerAuth::Password("hunter2".to_string()));
+    assert_eq!(after.server_smtp_password.as_deref(), Some("hunter2"));
     assert!(after.muted_voice.contains("alice"));
 
     std::fs::remove_file(&path).ok();
@@ -521,16 +543,22 @@ fn direct_punch_channels_are_read_one_per_line_and_validated() {
 #[test]
 fn the_last_connection_is_remembered_and_read_back() {
     let path = temp_settings_path();
-    Settings::remember_connection(&path, "chat.example.com", 6667, "dave")
+    Settings::remember_connection(&path, "chat.example.com", 6667, "dave", false)
         .expect("recording a connection must not fail");
 
     let settings = Settings::load_or_create(&path).unwrap();
     assert_eq!(settings.connect_host.as_deref(), Some("chat.example.com"));
     assert_eq!(settings.connect_port, Some(6667));
     assert_eq!(settings.connect_nickname.as_deref(), Some("dave"));
+    assert!(!settings.connect_ssl);
 
     let contents = std::fs::read_to_string(&path).unwrap();
     assert!(contents.contains("connect_nickname=dave"), "{contents}");
+    assert!(contents.contains("connect_ssl=off"), "{contents}");
+    assert!(
+        !contents.contains("connect_password"),
+        "there is no connect_password key at all: {contents}"
+    );
     assert!(contents.contains("connect_host=chat.example.com"), "{contents}");
     assert!(contents.contains("connect_port=6667"), "{contents}");
     let _ = std::fs::remove_file(&path);
@@ -542,13 +570,14 @@ fn the_last_connection_is_remembered_and_read_back() {
 #[test]
 fn a_second_connection_replaces_what_the_first_recorded() {
     let path = temp_settings_path();
-    Settings::remember_connection(&path, "first.example.com", 1111, "dave").unwrap();
-    Settings::remember_connection(&path, "second.example.com", 2222, "erin").unwrap();
+    Settings::remember_connection(&path, "first.example.com", 1111, "dave", true).unwrap();
+    Settings::remember_connection(&path, "second.example.com", 2222, "erin", false).unwrap();
 
     let settings = Settings::load_or_create(&path).unwrap();
     assert_eq!(settings.connect_host.as_deref(), Some("second.example.com"));
     assert_eq!(settings.connect_port, Some(2222));
     assert_eq!(settings.connect_nickname.as_deref(), Some("erin"));
+    assert!(!settings.connect_ssl, "the second connection was plain");
     let _ = std::fs::remove_file(&path);
 }
 
@@ -567,7 +596,7 @@ fn remembering_a_connection_leaves_every_other_key_alone() {
     settings.muted_voice.insert("noisy".to_string());
     settings.save(&path).unwrap();
 
-    Settings::remember_connection(&path, "chat.example.com", 6667, "dave").unwrap();
+    Settings::remember_connection(&path, "chat.example.com", 6667, "dave", false).unwrap();
 
     let reloaded = Settings::load_or_create(&path).unwrap();
     assert_eq!(reloaded.server_port, 9999);
@@ -584,8 +613,8 @@ fn remembering_a_connection_leaves_every_other_key_alone() {
 #[test]
 fn a_connection_with_no_host_leaves_the_recorded_host_alone() {
     let path = temp_settings_path();
-    Settings::remember_connection(&path, "chat.example.com", 6667, "dave").unwrap();
-    Settings::remember_connection(&path, "", 6667, "dave").unwrap();
+    Settings::remember_connection(&path, "chat.example.com", 6667, "dave", false).unwrap();
+    Settings::remember_connection(&path, "", 6667, "dave", false).unwrap();
 
     let settings = Settings::load_or_create(&path).unwrap();
     assert_eq!(settings.connect_host.as_deref(), Some("chat.example.com"));

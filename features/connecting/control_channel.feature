@@ -7,10 +7,16 @@ Feature: Keeping the setup conversation off the wire too
 
   Message content has never touched the server. But the control channel
   that gets a session going always travelled as plain TCP, and it carries
-  plenty worth having: the server password in the clear, nicknames, which
-  channels exist, who is in them, and when. Encrypting it changes nothing
-  about what the server itself learns - it still has to route by these -
-  only what anyone in between does. See docs/PROTOCOL.md.
+  plenty worth having: a login's nickname and password, which channels
+  exist, who is in them, and when. Encrypting it changes nothing about
+  what the server itself learns - it still has to route by these - only
+  what anyone in between does. See docs/PROTOCOL.md.
+
+  This layer's own offer is ephemeral and unauthenticated on its own -
+  vouching for the server is TLS's job (server_ssl, see
+  features/connecting - "Encrypting the connection to the server with
+  TLS" once that server is running one), a separate, optional layer this
+  file does not test.
 
   @AC-126
   Scenario: The setup conversation is encrypted before anything is said
@@ -25,14 +31,6 @@ Feature: Keeping the setup conversation off the wire too
     When a client accepts the offer
     And the client sends the password "hunter2" through the channel
     Then the password cannot be found anywhere in the bytes sent
-
-  @AC-128
-  Scenario: A server that can be identified must prove it
-    Given a server offering an encrypted control channel
-    And the client already holds that server's public key
-    Then a signed offer from that server is accepted
-    But an unsigned offer is refused
-    And an offer signed by somebody else is refused
 
   @TB-169
   Scenario: The same message twice does not look the same twice

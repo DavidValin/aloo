@@ -1144,11 +1144,14 @@ const HEADER_TEXT_ROW: u16 = 1;
 
 const HEADER_SIDE_PAD: u16 = 1;
 
-/// The folded-away call's own marker in the top row: `\u{1F534} Call` and the
+/// The folded-away call's own marker in the top row: `\u{23FA} Call` and the
 /// `Ctrl+R` that brings its modal back, in a red-bordered box of its own
 /// filling the header band's full height (`docs/SPEC.md` "Live voice
-/// calls"). Only drawn while a call is on.
-const CALL_MARKER: &str = "\u{1F534} Call";
+/// calls"). Only drawn while a call is on. The plain record-circle glyph
+/// rather than a multicolour emoji, so its colour is always exactly the
+/// `Style` it's painted with (`Color::Red`, below), never one fixed inside
+/// the character itself.
+const CALL_MARKER: &str = "\u{23FA} Call";
 const CALL_MARKER_KEY: &str = "Ctrl+R";
 
 /// Its box's outer width: both labels, the space between them, one column
@@ -1203,7 +1206,7 @@ fn server_state_width(area_width: u16, label_width: u16) -> u16 {
 /// The top row, shared by the channel view and an open DM room
 /// (`direct_message::render_private_room`): the server-state element
 /// first, then both selectors - starting where the message list below them
-/// does - and flush right the red-bordered `\u{1F534} Call Ctrl+R` box while a
+/// does - and flush right the red-bordered `\u{23FA} Call Ctrl+R` box while a
 /// call is on (Escape folds the modal away into it, Ctrl+R brings it back),
 /// then Conn quality, CPU usage and the help hint, in that order
 /// (`docs/SPEC.md` "Connected UI").
@@ -1785,10 +1788,7 @@ pub(crate) fn render_channels_popup(frame: &mut Frame, area: Rect, state: &UiSta
             if i == state.channels_popup_selected {
                 style = style.add_modifier(Modifier::REVERSED);
             }
-            ListItem::new(Line::from(Span::styled(
-                format!("\u{1F30D} {}", info.name),
-                style,
-            )))
+            ListItem::new(Line::from(Span::styled(info.name.clone(), style)))
         })
         .collect();
     let height = (rows.len().max(1) as u16).saturating_add(2);

@@ -1243,12 +1243,11 @@ fn the_selectors_start_where_the_message_list_below_them_does() {
     terminal.draw(|f| render(f, &state)).unwrap();
     let buffer = terminal.backend().buffer().clone();
 
-    // The selector's own first cell: its channel-kind icon, which is where
-    // its text starts (a wide glyph occupies one cell plus a blank, so the
-    // icon alone is what can be located exactly). One column past the
+    // The selector's own first cell: its `#name` (a public channel carries
+    // no kind icon, so this is where its text starts). One column past the
     // message pane's own left edge, which is where the messages *inside*
     // that pane's border begin - so the two columns of text line up.
-    let (x, y) = find_text_start(&buffer, "\u{1F30D}");
+    let (x, y) = find_text_start(&buffer, "#general");
     assert_eq!(y as usize, HEADER_TEXT_ROW, "the selector is on the header row");
     assert_eq!(
         x,
@@ -1514,12 +1513,12 @@ fn channel_tabs_are_prefixed_by_kind() {
     let rows = sidebar_rows(&state);
     let tab_row = row_containing(&rows, "the-hall");
     assert!(
-        tab_row.contains('\u{1F30D}'),
-        "public channel tab should show the globe emoji: {tab_row:?}"
+        !tab_row.contains('\u{1F512}'),
+        "a public channel tab should carry no lock emoji: {tab_row:?}"
     );
     assert!(
-        tab_row.contains("the-hall"),
-        "public channel tab should still show its name: {tab_row:?}"
+        tab_row.contains("#the-hall"),
+        "public channel tab should show its name, unadorned: {tab_row:?}"
     );
     // The private one is behind the selector, so its lock shows on its
     // dropdown row - the selector names one channel at a time.
@@ -1541,9 +1540,11 @@ fn channel_tabs_are_prefixed_by_kind() {
         "lock emoji should prefix the private channel's name: {tab_row:?}"
     );
     let top = rows[HEADER_TEXT_ROW].clone();
-    assert!(
-        top.find('\u{1F30D}').unwrap() < top.find("the-hall").unwrap(),
-        "globe emoji should prefix the public channel's name: {top:?}"
+    let hash = top.find("#the-hall").expect("the selector should show #the-hall");
+    assert_ne!(
+        top[..hash].chars().next_back(),
+        Some('\u{1F512}'),
+        "a public channel's own #name should carry no lock icon ahead of it: {top:?}"
     );
 }
 
@@ -2497,7 +2498,7 @@ fn each_selector_dropdown_hangs_under_the_selector_it_belongs_to() {
     press(&mut state, KeyCode::Char('['));
     assert!(state.selector_dropdown_open, "the channel dropdown should be open");
     let buffer = buffer_at(&state, 120, 20);
-    let (channel_x, _) = find_text_start(&buffer, "\u{1F30D}");
+    let (channel_x, _) = find_text_start(&buffer, "#general");
     let (dropdown_x, dropdown_y, ..) = popup_rect(&buffer, "Channels");
     assert_eq!(
         dropdown_y as usize, FIRST_ROW_BELOW_HEADER,

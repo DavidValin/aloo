@@ -1,30 +1,27 @@
 @US-002
-Feature: Gating who may connect to the server
+Feature: Logging in with a nickname and its password
 
   As a server operator
-  I want to gate who may connect, by shared password or RSA keypair
-  So that only clients I have authorised can join
+  I want every client to log in with a registered nickname and its password
+  So that only people who hold an account I recognise can join
 
-  The server is started in exactly one of three auth modes and advertises
-  which in its opening Hello; a client must answer with the matching kind.
-  See docs/PROTOCOL.md section 5.
+  There is one way in: a nickname and its password, checked against the
+  server's users registry. See docs/PROTOCOL.md section 5.
 
   @AC-013
-  Scenario: The right password gets in
-    Given a server that requires the password "s3cret"
-    When a client offers the password "s3cret"
+  Scenario: The right nickname and password get in
+    Given a server with alice registered under the password "s3cret"
+    When alice logs in with the password "s3cret"
     Then the connection is accepted
 
-  @AC-013
+  @AC-013 @AC-014
   Scenario: The wrong password does not
-    Given a server that requires the password "s3cret"
-    When a client offers the password "wrong"
+    Given a server with alice registered under the password "s3cret"
+    When alice logs in with the password "wrong"
     Then the connection is refused
 
-  @AC-013 @TB-013 @TB-014 @TB-016
-  Scenario: Only the holder of the server's key can answer its challenge
-    Then an RSA-protected server accepts the real key holder and refuses an impostor
-
-  @AC-014 @TB-013 @TB-014
-  Scenario: An open server lets anyone in without a credential
-    Then an open server issues no challenge and accepts an empty credential
+  @AC-014
+  Scenario: A nickname nobody registered is refused the same way as a wrong password
+    Given a server that anyone may connect to
+    When alice logs in with the password "whatever"
+    Then the connection is refused

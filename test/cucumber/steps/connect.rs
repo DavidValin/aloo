@@ -6,14 +6,10 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::style::Color;
 
-use aloo::client::connect::{
-    ConnectCache, MyKeySelection, ServerKeySelection, prefill_connect_defaults,
-};
+use aloo::client::connect::{ConnectCache, MyKeySelection, prefill_connect_defaults};
 use aloo::client::file_browser::FileBrowserState;
 use aloo::client::tui::ui_connect_popup::{
-    ALOO_HOME_LABEL, Action, ConnectPopupState, Field, FileBrowserTarget, KeyType,
-    NICKNAME_MAX_LEN,
-    render,
+    ALOO_HOME_LABEL, Action, ConnectPopupState, Field, FileBrowserTarget, NICKNAME_MAX_LEN, render,
 };
 
 use crate::support::popup_rows;
@@ -24,9 +20,10 @@ fn field_of(name: &str) -> Field {
         "host" => Field::Host,
         "port" => Field::Port,
         "nickname" => Field::Nickname,
-        "id_store" => Field::IdStorePath,
-        "server_key value" => Field::ServerKeyValue,
+        "password" => Field::Password,
+        "email" => Field::Email,
         "Connect" => Field::Connect,
+        "Register" => Field::Register,
         other => panic!("unknown field {other:?}"),
     }
 }
@@ -46,6 +43,7 @@ async fn form_valid(w: &mut AlooWorld) {
     p.host = "chat.example.com".into();
     p.port = "6667".into();
     p.nickname = "dave".into();
+    p.password = "hunter2".into();
 }
 
 #[given("my_key points at a keybundle pair")]
@@ -64,18 +62,6 @@ async fn my_key_is_pq_hybrid(w: &mut AlooWorld) {
     let order = w.popup_mut().focus_order();
     assert!(order.contains(&Field::MyKeyValuePub));
     assert!(order.contains(&Field::MyKeyValuePriv));
-}
-
-#[given(expr = "server_key is set to {word}")]
-#[when(expr = "server_key is set to {word}")]
-async fn server_key_is(w: &mut AlooWorld, kind: String) {
-    let p = w.popup_mut();
-    p.server_key.key_type = match kind.as_str() {
-        "rsa" => KeyType::Rsa,
-        "password" => KeyType::Password,
-        "none" => KeyType::None,
-        other => panic!("unknown server_key type {other:?}"),
-    };
 }
 
 #[given("a directory holding one sub-directory and one file")]
@@ -114,7 +100,8 @@ async fn clear_field(w: &mut AlooWorld, name: String) {
         Field::Host => p.host.clear(),
         Field::Port => p.port.clear(),
         Field::Nickname => p.nickname.clear(),
-        Field::IdStorePath => p.id_store_path.clear(),
+        Field::Password => p.password.clear(),
+        Field::Email => p.email.clear(),
         other => panic!("cannot clear {other:?}"),
     }
 }
@@ -143,17 +130,16 @@ async fn submit_form(w: &mut AlooWorld) {
 async fn browse_and_pick(w: &mut AlooWorld) {
     let root = w.browser_root.clone().expect("no directory tree");
     let p = w.popup_mut();
-    p.server_key.key_type = KeyType::Rsa;
-    p.focus = Field::ServerKeyValue;
+    p.focus = Field::MyKeyValuePub;
     p.handle_key(KeyCode::Enter).unwrap();
     assert!(
         p.browser.is_some(),
-        "Enter on an rsa file field must open the in-app browser"
+        "Enter on a my_key file field must open the in-app browser"
     );
 
     // Point it at the known tree so the scenario does not depend on the cwd.
     p.browser = Some((
-        FileBrowserTarget::ServerKeyFile,
+        FileBrowserTarget::MyKeyFilePub,
         FileBrowserState::open(root).unwrap(),
     ));
     // entries are "..", "subdir", "file.txt"
@@ -168,8 +154,7 @@ async fn browse_and_select_last(w: &mut AlooWorld) {
     let mut browser = FileBrowserState::open(root).unwrap();
     let last = browser.entries.len() - 1;
     browser.selected = last;
-    w.popup_mut().server_key.key_type = KeyType::Rsa;
-    w.popup_mut().browser = Some((FileBrowserTarget::ServerKeyFile, browser));
+    w.popup_mut().browser = Some((FileBrowserTarget::MyKeyFilePub, browser));
 }
 
 #[when("I walk into the sub-directory and back out again")]
@@ -187,7 +172,7 @@ async fn walk_in_and_out(w: &mut AlooWorld) {
         browser.entries.iter().any(|e| e.name == "nested.txt"),
         "walking in should list the sub-directory's contents"
     );
-    w.popup_mut().browser = Some((FileBrowserTarget::ServerKeyFile, browser));
+    w.popup_mut().browser = Some((FileBrowserTarget::MyKeyFilePub, browser));
 }
 
 // ---------------------------------------------------------------------
@@ -232,11 +217,85 @@ async fn field_contains(w: &mut AlooWorld, name: String, expected: String) {
         Field::Host => &p.host,
         Field::Port => &p.port,
         Field::Nickname => &p.nickname,
-        Field::IdStorePath => &p.id_store_path,
-        Field::ServerKeyValue => &p.server_key.password,
+        Field::Password => &p.password,
+        Field::Email => &p.email,
         other => panic!("cannot read {other:?}"),
     };
     assert_eq!(actual, &expected, "{name} field");
+}
+
+#[then("the form has no id_store field")]
+async fn no_id_store_field(w: &mut AlooWorld) {
+    let rows = popup_rows(w.popup.as_ref().expect("no form"), 80, 30);
+    assert!(
+        !rows.iter().any(|r| r.contains("id_store")),
+        "no id_store box on the form: {rows:?}"
+    );
+}
+
+/// `ssl` is not a popup field at all - like `server_ssl` on the server
+/// side, it is settings-only (`connect_ssl`).
+#[then("the form has no ssl field")]
+async fn no_ssl_field(w: &mut AlooWorld) {
+    let rows = popup_rows(w.popup.as_ref().expect("no form"), 80, 30);
+    assert!(
+        !rows.iter().any(|r| r.contains("ssl")),
+        "no ssl box or switch on the form: {rows:?}"
+    );
+}
+
+#[then("the form has no email field")]
+async fn no_email_field(w: &mut AlooWorld) {
+    let rows = popup_rows(w.popup.as_ref().expect("no form"), 80, 30);
+    assert!(
+        !rows.iter().any(|r| r.contains("email")),
+        "no email box while registration is unavailable: {rows:?}"
+    );
+}
+
+#[then("no Register button is offered")]
+async fn no_register_button(w: &mut AlooWorld) {
+    let rows = popup_rows(w.popup.as_ref().expect("no form"), 80, 30);
+    assert!(
+        !rows.iter().any(|r| r.contains("Register")),
+        "no Register button while registration is unavailable: {rows:?}"
+    );
+}
+
+#[then("an email field and a Register button are offered")]
+async fn email_field_and_register_button(w: &mut AlooWorld) {
+    let rows = popup_rows(w.popup.as_ref().expect("no form"), 80, 30);
+    assert!(rows.iter().any(|r| r.contains("email")), "{rows:?}");
+    assert!(rows.iter().any(|r| r.contains("Register")), "{rows:?}");
+}
+
+/// Simulates what `prefill_connect_defaults` does when
+/// `settings.server_allow_registration` is on - set directly on the
+/// popup rather than through a real settings file, the same way
+/// `my_key_points_at_files` sets fields directly.
+#[given("the server allows registration")]
+#[when("the server allows registration")]
+async fn server_allows_registration(w: &mut AlooWorld) {
+    w.popup_mut().registration_available = true;
+}
+
+#[then("the password field is shown masked")]
+async fn password_shown_masked(w: &mut AlooWorld) {
+    let state = w.popup.as_ref().expect("no form");
+    let rows = popup_rows(state, 80, 30);
+    assert!(
+        !rows.iter().any(|r| r.contains(&state.password) && !state.password.is_empty()),
+        "the raw password must never appear on screen: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|r| r.contains(&"*".repeat(state.password.chars().count()))),
+        "expected asterisks in place of the password: {rows:?}"
+    );
+}
+
+#[then("ssl is off")]
+async fn ssl_is_off(w: &mut AlooWorld) {
+    assert!(!w.popup.as_ref().expect("no form").ssl);
 }
 
 #[then(expr = "the nickname is capped at {int} characters")]
@@ -271,19 +330,6 @@ async fn each_boxed(w: &mut AlooWorld) {
     );
 }
 
-#[then(expr = "the id_store path is prefilled with the default {word} location")]
-async fn id_store_prefilled(w: &mut AlooWorld, _which: String) {
-    let p = w.popup.as_ref().expect("no form");
-    assert!(
-        !p.id_store_path.is_empty(),
-        "id_store should be prefilled, not left blank"
-    );
-    assert_eq!(
-        p.id_store_path,
-        aloo::client::idstore::default_path().display().to_string()
-    );
-}
-
 #[then("connecting begins with the details I entered")]
 async fn connecting_begins(w: &mut AlooWorld) {
     match w.popup_action.as_ref().expect("no action") {
@@ -294,6 +340,32 @@ async fn connecting_begins(w: &mut AlooWorld) {
         }
         other => panic!("expected Connect, got {other:?}"),
     }
+}
+
+#[then("registering begins with the email I entered")]
+async fn registering_begins(w: &mut AlooWorld) {
+    w.popup_mut().focus = Field::Register;
+    let action = w.popup_mut().handle_key(KeyCode::Enter).unwrap();
+    match action {
+        Action::Register(req) => assert_eq!(req.email, "dave@example.com"),
+        other => panic!("expected Register, got {other:?}"),
+    }
+}
+
+#[then(expr = "registering is refused with an error mentioning {string}")]
+async fn registering_refused_with(w: &mut AlooWorld, needle: String) {
+    w.popup_mut().focus = Field::Register;
+    let action = w.popup_mut().handle_key(KeyCode::Enter).unwrap();
+    assert_eq!(action, Action::None, "an invalid registration must not submit");
+    let err = w
+        .popup
+        .as_ref()
+        .and_then(|p| p.error.clone())
+        .expect("an invalid registration must show a validation error");
+    assert!(
+        err.contains(&needle),
+        "error {err:?} should mention {needle:?}"
+    );
 }
 
 #[then("a visible Connect button is offered")]
@@ -341,7 +413,7 @@ async fn form_cancelled(w: &mut AlooWorld) {
     );
 }
 
-#[then("the picked file fills the server_key field")]
+#[then("the picked file fills the my_key field")]
 async fn picked_file_fills(w: &mut AlooWorld) {
     let root = w.browser_root.clone().expect("no directory tree");
     let p = w.popup.as_ref().expect("no form");
@@ -350,7 +422,7 @@ async fn picked_file_fills(w: &mut AlooWorld) {
         "picking a file should close the browser"
     );
     assert_eq!(
-        p.server_key.file,
+        p.my_key.file_pub,
         root.join("file.txt").display().to_string(),
         "the chosen path must land in the field that opened the browser"
     );
@@ -442,15 +514,14 @@ async fn highlight_not_bleeding(w: &mut AlooWorld) {
     );
 }
 
-#[then("the request carries no server key material")]
-async fn request_carries_none(w: &mut AlooWorld) {
+#[then("the request carries the details as typed")]
+async fn request_carries_details(w: &mut AlooWorld) {
     let req = w
         .popup
         .as_ref()
         .unwrap()
         .build_request()
         .expect("form should be valid");
-    assert_eq!(req.server_key, ServerKeySelection::None);
     assert_eq!(
         req.my_key,
         MyKeySelection {
@@ -461,6 +532,8 @@ async fn request_carries_none(w: &mut AlooWorld) {
     assert_eq!(req.host, "chat.example.com");
     assert_eq!(req.port, 6667);
     assert_eq!(req.nickname, "dave");
+    assert_eq!(req.password, "hunter2");
+    assert!(!req.ssl);
 }
 
 /// The read-only line above the Connect button (`docs/SPEC.md` "Not

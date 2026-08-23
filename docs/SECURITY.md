@@ -142,7 +142,7 @@ read `~/.aloo/downloads` or the OTP keychain itself - local disk access
 remains out of scope (see above). Mail storage is also unbounded on the
 server beyond a per-mail size cap: an *authenticated* client can grow the
 mail directory at will, the same server-operator-trust boundary the relay
-already has - `--password`/`--enc rsa` are the control.
+already has - the users registry (§5.1) is the control.
 
 **A running daemon's attach socket is a live handle on the whole session.**
 Background mode (`aloo --daemon`, `docs/SPEC.md` "Running in background

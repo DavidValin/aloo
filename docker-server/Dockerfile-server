@@ -9,7 +9,7 @@
 #   docker run -d --name aloo-server --restart unless-stopped \
 #     -p 7878:7878/tcp -p 7878:7878/udp \
 #     -v aloo-data:/home/aloo/.aloo \
-#     -e ALOO_PASSWORD=mypassword \
+#     -e ALOO_REGISTER_USERS=alice:s3cret \
 #     aloo-server
 #
 # See the ENV block below for every parameter this image exposes.
@@ -83,9 +83,17 @@ VOLUME ["/home/aloo/.aloo"]
 # See docs/SERVER_ON_DOCKER.md "Parameters" for what each maps to.
 ENV ALOO_PORT=""
 ENV ALOO_BIND=""
-ENV ALOO_PASSWORD=""
-ENV ALOO_ENC_TYPE=""
-ENV ALOO_ENC_KEYFILE=""
+ENV ALOO_REGISTER_USERS=""
+ENV ALOO_SSL=""
+ENV ALOO_SSL_FULLCHAIN=""
+ENV ALOO_SSL_PRIVKEY=""
+ENV ALOO_ALLOW_REGISTRATION=""
+ENV ALOO_SMTP_HOST=""
+ENV ALOO_SMTP_PORT=""
+ENV ALOO_SMTP_USERNAME=""
+ENV ALOO_SMTP_PASSWORD=""
+ENV ALOO_ACTIVATION_PORT=""
+ENV ALOO_ACTIVATION_URL=""
 
 # TCP carries client connections; UDP is the rendezvous socket clients use
 # to discover their own public address for hole punching (docs/PROTOCOL.md

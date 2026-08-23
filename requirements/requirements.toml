@@ -56,8 +56,8 @@ evidence = "test port_field_only_accepts_digits"
 
 [[user_story.acceptance_criteria]]
 id = "AC-005"
-description = "The id_store path is prefilled with its default and stays freely editable."
-evidence = "docs/PROTOCOL.md 12.5; tests id_store_path_is_prefilled_from_the_default_path, id_store_path_field_is_freely_editable"
+description = "The connect popup has no id_store field at all: the identity-pinning store always resolves to idstore::default_path() under ALOO_HOME, the same as every other local store, and is never user-editable from the form or from a headless daemon start."
+evidence = "docs/PROTOCOL.md 12.5; src/client/idstore.rs default_path; src/client/connect.rs load_id_store; tests the_popup_has_no_id_store_field, the_daemon_connects_with_the_resolved_password"
 
 [[user_story.acceptance_criteria]]
 id = "AC-070"
@@ -81,8 +81,13 @@ evidence = "README.md 'Running the client'; test escape_cancels"
 
 [[user_story.acceptance_criteria]]
 id = "AC-010"
-description = "An rsa key field opens the in-app file browser, and the file picked there fills that field."
-evidence = "docs/SPEC.md 'File browser'; tests enter_on_rsa_server_key_value_opens_file_browser, selecting_a_file_in_browser_applies_it_to_the_popup_field"
+description = "A my_key file field opens the in-app file browser, and the file picked there fills that field."
+evidence = "docs/SPEC.md 'File browser'; tests enter_on_a_my_key_file_field_opens_file_browser, selecting_a_file_in_browser_applies_it_to_the_popup_field"
+
+[[user_story.acceptance_criteria]]
+id = "AC-269"
+description = "The connect popup carries a password field, masked as asterisks, accepting any character, never remembered between runs - login is always a nickname and its password. ssl is not a popup field at all - like server_ssl on the server side, it is settings-only (connect_ssl); the popup only ever captures whatever that setting said when it opened and carries it silently into the built request, with no key anywhere in the popup able to change it."
+evidence = "docs/SPEC.md 'Not connected UI'; src/client/tui/ui_connect_popup.rs Field::Password, ConnectPopupState::ssl; tests password_field_takes_any_character_and_backspaces, the_password_is_rendered_masked, ssl_is_settings_only_and_cannot_be_toggled_from_the_popup, build_request_rejects_a_missing_password"
 
 [[user_story.acceptance_criteria]]
 id = "AC-011"
@@ -101,18 +106,18 @@ evidence = "docs/SPEC.md 'File browser'; test file_browser_render_scrolls_to_kee
 
 [[user_story.technical_behavior]]
 id = "TB-001"
-description = "server_key's key type cycles rsa -> password -> none -> rsa and defaults to none."
-evidence = "src/client/tui/ui_connect_popup.rs KeyType; tests key_type_cycles_rsa_password_none_and_back, key_type_defaults_to_none"
+description = "There is no key-type selector anywhere in the connect popup: authentication is always a nickname and its password, checked against the server's users registry. There is no credential-type field for ssl either - it is a settings-only switch, not something the popup exposes."
+evidence = "src/client/tui/ui_connect_popup.rs Field, ConnectPopupState; tests ssl_is_settings_only_and_cannot_be_toggled_from_the_popup, build_request_maps_the_form_onto_a_connect_request"
 
 [[user_story.technical_behavior]]
 id = "TB-002"
 description = "The connect popup has no my_key type selector at all: MyKeyFields carries only file_pub/file_priv, and the my_key group's own title names the one scheme (pq_hybrid) rather than spending a focusable row on a choice that cannot vary."
-evidence = "docs/SPEC.md 'Not connected UI'; src/client/tui/ui_connect_popup.rs MyKeyFields, render; tests focus_order_with_a_none_server_key_has_no_server_value_field, focus_order_includes_both_my_key_files"
+evidence = "docs/SPEC.md 'Not connected UI'; src/client/tui/ui_connect_popup.rs MyKeyFields, render; tests my_key_fields_are_never_orphaned_by_a_type_change, focus_order_includes_both_my_key_files"
 
 [[user_story.technical_behavior]]
 id = "TB-003"
-description = "The focus order lists exactly the value fields the two selected key types require, and a field orphaned by a type change stops being editable."
-evidence = "src/client/tui/ui_connect_popup.rs focus_order; tests focus_order_*, cycling_the_server_key_type_always_leaves_focus_on_a_field_that_exists, my_key_fields_are_never_orphaned_by_a_type_change, password_field_only_editable_when_key_type_is_password"
+description = "The focus order lists host, port, nickname, password, the two my_key files and Connect unconditionally; email and Register join it, always last, only while registration_available is true - a server that takes no registrations shows and tabs through neither."
+evidence = "src/client/tui/ui_connect_popup.rs focus_order; tests focus_order_lists_every_field_once_with_register_last_when_registration_is_available, focus_order_excludes_email_and_register_unless_registration_is_available"
 
 [[user_story.technical_behavior]]
 id = "TB-004"
@@ -121,13 +126,13 @@ evidence = "docs/SPEC.md 'Not connected UI'; tests focus_next_and_prev_wrap_arou
 
 [[user_story.technical_behavior]]
 id = "TB-005"
-description = "build_request rejects an incomplete form field by field, naming the offending field: host, port, nickname, server_key file, id_store."
-evidence = "tests build_request_rejects_*"
+description = "build_request rejects an incomplete form field by field, naming the offending field: host, port, nickname, password, the my_key files. build_register_request additionally requires a plausible email and a registrable nickname."
+evidence = "tests build_request_rejects_empty_host, build_request_rejects_bad_port, build_request_rejects_missing_nickname, build_request_rejects_a_missing_password, build_request_rejects_missing_pq_hybrid_files, register_needs_an_email_where_connect_does_not, register_refuses_a_nickname_the_registry_could_not_hold"
 
 [[user_story.technical_behavior]]
 id = "TB-006"
-description = "build_request maps a valid form onto a ConnectRequest carrying the right selection for each key-type combination, including custom store paths."
-evidence = "tests build_request_succeeds_*, build_request_carries_a_custom_*"
+description = "build_request maps a valid form onto a ConnectRequest carrying host/port/ssl/nickname/password/my_key exactly as typed, with no activation code attached; build_register_request maps the same fields plus email onto a RegisterRequest."
+evidence = "tests build_request_maps_the_form_onto_a_connect_request, build_request_succeeds_with_pq_hybrid_files, register_needs_an_email_where_connect_does_not"
 
 [[user_story.technical_behavior]]
 id = "TB-007"
@@ -146,8 +151,8 @@ evidence = "test file_browser_new_navigation_clears_forward_history"
 
 [[user_story.technical_behavior]]
 id = "TB-010"
-description = "The connect popup renders without panicking for every key-type combination, and with the file browser open."
-evidence = "tests render_does_not_panic_for_every_key_type_combination, render_with_open_file_browser_does_not_panic, render_draws_something_when_popup_is_shown"
+description = "The connect popup renders without panicking with ssl on or off, with a notice showing, and with the file browser open."
+evidence = "tests render_does_not_panic_with_ssl_on_or_off_or_a_notice_showing, render_with_open_file_browser_does_not_panic, render_draws_something_when_popup_is_shown"
 
 [[user_story.technical_behavior]]
 id = "TB-011"
@@ -155,9 +160,14 @@ description = "The connect popup targets 64 columns wide, clamped to the termina
 evidence = "docs/SPEC.md 'Not connected UI'; test popup_is_wider_than_the_original_fifty_columns"
 
 [[user_story.technical_behavior]]
+id = "TB-244"
+description = "The ALOO_HOME line is centered horizontally, with a blank row of its own directly above and directly below it, setting it apart from the form as a note rather than another field; the keyboard-shortcut hint is the last element in the popup's layout and is also centered horizontally, rather than flush left."
+evidence = "src/client/tui/ui_connect_popup.rs render (aloo_home_idx, hint_idx, Alignment::Center); tests aloo_home_line_is_centered_with_a_blank_line_above_and_below, the_shortcut_hint_is_centered"
+
+[[user_story.technical_behavior]]
 id = "TB-012"
 description = "A focused free-text field appends typed characters and Backspace removes the last one."
-evidence = "src/client/tui/ui_connect_popup.rs handle_key; tests typing_fills_host_field, id_store_path_field_is_freely_editable"
+evidence = "src/client/tui/ui_connect_popup.rs handle_key; tests typing_fills_host_field, password_field_takes_any_character_and_backspaces, email_field_refuses_whitespace_and_backspaces"
 
 [[user_story.acceptance_criteria]]
 id = "AC-240"
@@ -166,7 +176,7 @@ evidence = "docs/SPEC.md 'Not connected UI'; src/settings.rs Settings::remember_
 
 [[user_story.acceptance_criteria]]
 id = "AC-258"
-description = "The connect popup names the ALOO_HOME this client actually resolved, on a read-only gray line directly above the Connect button, spelled as the environment variable that sets it (ALOO_HOME=<path>). Every piece of local state lives under that directory - id_store, the connect cache, settings, and the OTP layer's own stores - so running a second client on one machine means giving it its own, and the line is where that is visible at the moment it matters rather than only in Ctrl+H and the README. Gray so it reads as a note about this client rather than as another field to fill in, and captured once when the popup opens so rendering stays a pure function of the popup's state."
+description = "The connect popup names the ALOO_HOME this client actually resolved, on a read-only gray, centered line set apart from the form by a blank line above and a blank line below it, directly above the buttons, spelled as the environment variable that sets it (ALOO_HOME=<path>). Every piece of local state lives under that directory - id_store, the connect cache, settings, and the OTP layer's own stores - so running a second client on one machine means giving it its own, and the line is where that is visible at the moment it matters rather than only in Ctrl+H and the README. Gray and set apart so it reads as a note about this client rather than as another field to fill in, and captured once when the popup opens so rendering stays a pure function of the popup's state."
 evidence = "docs/SPEC.md 'Not connected UI'; src/platform.rs aloo_dir; src/client/tui/ui_connect_popup.rs ALOO_HOME_LABEL, ConnectPopupState::aloo_home, render; test render_shows_the_resolved_aloo_home_in_gray; scenario features/connecting/connect_form.feature 'The form names the ALOO_HOME this client is actually using'"
 
 # ============================================================================
@@ -176,38 +186,38 @@ evidence = "docs/SPEC.md 'Not connected UI'; src/platform.rs aloo_dir; src/clien
 id = "US-002"
 title = "Authenticate to the server"
 as_a = "server operator"
-i_want = "to gate who may connect, by shared password or RSA keypair"
-so_that = "only clients I have authorised can join"
+i_want = "every client to log in with a registered nickname and its password"
+so_that = "only people who hold an account I recognise can join"
 
 [[user_story.acceptance_criteria]]
 id = "AC-013"
-description = "A client presenting the correct credential is let in; one presenting a wrong credential is rejected."
-evidence = "docs/PROTOCOL.md 5; tests password_auth_accepts_correct_and_rejects_wrong, rsa_auth_accepts_valid_challenge_response_and_rejects_wrong_key, end_to_end_wrong_password_is_rejected"
+description = "A client presenting a registered nickname and its correct password is let in - AuthResult { ok: true }, followed by an ordinary Identify."
+evidence = "docs/PROTOCOL.md 5.1; src/server/mod.rs handle_connection; tests a_registered_nickname_with_its_password_is_let_in, register_manual_is_active_immediately_with_no_email_or_activation"
 
 [[user_story.acceptance_criteria]]
 id = "AC-014"
-description = "A server started with no auth accepts any client without a credential."
-evidence = "docs/PROTOCOL.md 5.1; test none_auth_kind_and_no_challenge"
+description = "A wrong password and a nickname nobody registered are refused with the identical AuthResult, so a login attempt cannot be used to discover which nicknames exist."
+evidence = "docs/PROTOCOL.md 5.1; tests a_wrong_password_and_an_unknown_nickname_are_refused_alike, unknown_nickname_and_wrong_password_are_indistinguishable"
 
 [[user_story.technical_behavior]]
 id = "TB-013"
-description = "The advertised AuthKind matches the configured mode, and a challenge nonce is issued for rsa only."
-evidence = "docs/PROTOCOL.md 5.1-5.3; tests none_auth_kind_and_no_challenge, password_auth_accepts_correct_and_rejects_wrong, rsa_auth_accepts_valid_challenge_response_and_rejects_wrong_key"
+description = "check_credentials returns exactly one of AuthCheck::Ok, ActivationPending { expired }, or Rejected, and handle_connection's match on it is exhaustive - a fourth outcome cannot silently fall through to acceptance or rejection."
+evidence = "src/server/users_registry.rs AuthCheck, UsersRegistry::check_credentials; src/server/mod.rs handle_connection; tests a_registered_nickname_with_its_password_is_let_in, a_pending_account_is_asked_for_its_code_and_activated_by_the_right_one, an_expired_activation_is_refused_with_a_reason"
 
 [[user_story.technical_behavior]]
 id = "TB-014"
-description = "An AuthResponse of the wrong variant for the advertised AuthKind is treated as an authentication failure."
-evidence = "docs/PROTOCOL.md 5; tests rsa_auth_rejects_response_of_the_wrong_kind, none_auth_kind_and_no_challenge"
+description = "check_credentials derives the candidate key from whatever was sent before ever looking at whether the nickname is registered, so an unknown nickname and a real, wrong password cost the same PBKDF2 work and give the same answer."
+evidence = "src/server/users_registry.rs UsersRegistry::check_credentials; test unknown_nickname_and_wrong_password_are_indistinguishable"
 
 [[user_story.technical_behavior]]
 id = "TB-015"
-description = "Credential comparison is constant-time, including for unequal lengths and empty inputs."
-evidence = "docs/PROTOCOL.md 5.2; src/crypto/mod.rs constant_time_eq; test constant_time_eq_matches_regular_equality"
+description = "Credential comparison - a login's derived key against the stored one, and an activation code against the pending one - is constant-time, including for unequal lengths and empty inputs."
+evidence = "docs/PROTOCOL.md 5.1; src/crypto/mod.rs constant_time_eq; src/server/users_registry.rs check_credentials, activate; test constant_time_eq_matches_regular_equality"
 
 [[user_story.technical_behavior]]
 id = "TB-016"
-description = "A challenge nonce is freshly drawn random bytes of the requested length, differing between draws."
-evidence = "docs/PROTOCOL.md 5.3 (32 random bytes per connection); test random_bytes_have_requested_length_and_are_not_trivially_constant"
+description = "Freshly drawn random bytes differ between draws - what an activation code's digits and every ephemeral key this app generates rely on."
+evidence = "docs/PROTOCOL.md 5.3; src/crypto/mod.rs random_bytes; src/server/users_registry.rs generate_activation_code; tests random_bytes_have_requested_length_and_are_not_trivially_constant, generated_activation_codes_are_the_documented_length_of_digits_and_differ_between_draws"
 
 [[user_story.technical_behavior]]
 id = "TB-112"
@@ -218,6 +228,101 @@ evidence = "docs/PROTOCOL.md 4; test end_to_end_stray_auth_and_identify_after_ha
 id = "TB-114"
 description = "The server's --bind and --port flags default to 0.0.0.0 and 7878 respectively, and are parsed into the address it listens on."
 evidence = "docs/SPEC.md 'Server startup'; tests help_advertises_the_documented_bind_and_port_defaults, server_bind_and_port_flags_are_parsed_into_the_listen_address"
+
+[[user_story.technical_behavior]]
+id = "TB-238"
+description = "A nickname must be 1-NICKNAME_MAX_LEN ASCII letters, digits, '-' or '_' to be registrable at all - checked before any path under the users registry's directory is built, so a name shaped like a traversal, an empty string, or one over the cap can never register, log in, or touch a file outside that directory."
+evidence = "src/validation.rs NICKNAME_MAX_LEN, nickname_is_registrable; src/server/users_registry.rs UsersRegistry::user_dir; tests an_unregistrable_nickname_touches_no_file_and_is_never_registered, an_unregistrable_nickname_is_refused_without_touching_the_registry"
+
+# ============================================================================
+# US-043 - Register a nickname by email
+# ============================================================================
+[[user_story]]
+id = "US-043"
+title = "Register a nickname by email"
+as_a = "user with no account on a server yet"
+i_want = "to register a nickname and password and activate it with a code emailed to me"
+so_that = "I can log in without the operator creating my account by hand"
+
+[[user_story.acceptance_criteria]]
+id = "AC-264"
+description = "Hello.registration_open tells a client up front whether this server takes registrations at all. Register is refused - RegisterResult { ok: false }, connection closed - when registration is off, or when it is on but the server has no SMTP relay configured to send the activation code through; either way no account is created."
+evidence = "docs/PROTOCOL.md 5.3; src/server/mod.rs register_account; tests registration_is_advertised_in_hello_and_refused_when_off, registration_without_a_relay_is_refused_and_creates_nothing"
+
+[[user_story.acceptance_criteria]]
+id = "AC-265"
+description = "A successful Register writes the account with a pending activation and emails a fresh code to it; logging in with the right nickname and password before that code is used answers AuthResult { activation_pending: true } instead of ok, and the client's next message may be exactly one Activate. The right code activates the account (AuthResult { ok: true } and the handshake continues into Identify); a wrong code refuses and closes the connection; a code more than ACTIVATION_VALIDITY_SECS old is refused as expired, and the account must be registered again to get a new one."
+evidence = "docs/PROTOCOL.md 5.2, 5.3; src/server/users_registry.rs UsersRegistry::register, activate, ACTIVATION_VALIDITY_SECS; src/server/mod.rs handle_connection; tests a_pending_account_is_asked_for_its_code_and_activated_by_the_right_one, an_expired_activation_is_refused_with_a_reason, register_writes_a_key_an_email_and_a_pending_activation, activate_accepts_the_right_code_once_and_refuses_a_wrong_or_expired_one"
+
+[[user_story.acceptance_criteria]]
+id = "AC-266"
+description = "The activation web endpoint (activation.rs), reachable only while server_allow_registration is on, answers a correct code with a success page and a wrong one with a refusal page; more than MAX_ATTEMPTS_PER_HOUR attempts from one source address within an hour bans that address from the endpoint for BAN_DURATION - a ban scoped to this endpoint alone, never to logging in as a client."
+evidence = "docs/PROTOCOL.md 5.3; src/server/activation.rs AttemptLimiter, MAX_ATTEMPTS_PER_HOUR, BAN_DURATION, handle; tests the_eleventh_attempt_within_an_hour_is_banned, a_ban_lasts_the_full_day_and_then_lifts, the_window_restarts_once_it_has_fully_elapsed, the_limiter_is_scoped_per_address, repeated_wrong_codes_from_one_address_trip_the_endpoints_own_ban"
+
+[[user_story.acceptance_criteria]]
+id = "AC-270"
+description = "The connect popup carries an email field and a Register button beside Connect, but only while registration_available is true (captured from the local server_allow_registration setting when the popup opens) - a server that takes no registrations shows neither. Submitting Register with a plausible email sends Register and, on success, shows a green notice telling the user to check that address for the activation code. Register needs a nickname the registry could hold and a plausible email address; Connect needs neither."
+evidence = "docs/SPEC.md 'Not connected UI'; src/client/tui/ui_connect_popup.rs Field::Email, Field::Register, ConnectPopupState::registration_available, build_register_request; src/client/connect.rs register_account, prefill_connect_defaults; tests register_button_and_email_field_only_show_when_registration_is_available, register_needs_an_email_where_connect_does_not, register_refuses_a_nickname_the_registry_could_not_hold, enter_on_register_returns_a_register_action_or_an_error, render_shows_a_registration_notice_in_green_unless_an_error_replaces_it"
+
+[[user_story.acceptance_criteria]]
+id = "AC-271"
+description = "A connect whose credentials are right but whose account is still pending opens a small activation popup asking for the emailed code; submitting it retries the connect with that code attached, as many times as it takes, until it succeeds or the user cancels with Esc. The code field accepts only digits, up to the documented length."
+evidence = "docs/PROTOCOL.md 5.2; src/client/tui/ui_connect_popup.rs ActivationPopupState, run_activation; src/client/connect.rs ActivationRequiredError, run_client_inner; tests activation_popup_takes_exactly_twelve_digits, activation_popup_submits_a_complete_code_and_refuses_a_short_one, activation_popup_renders_the_nickname_the_code_and_the_error"
+
+[[user_story.technical_behavior]]
+id = "TB-242"
+description = "The activation email names the nickname it is for and carries the raw code; when the server has a public activation_url configured, it also carries the equivalent link, and never does when there is none. Building the message never touches the network - only sending it does."
+evidence = "src/server/users_registry.rs activation_email, activation_link, send_activation_email; tests activation_email_carries_the_code_and_names_the_nickname_and_recipient, activation_email_includes_a_link_when_a_base_url_is_configured, activation_link_trims_a_trailing_slash_on_the_base_url"
+
+[[user_story.technical_behavior]]
+id = "TB-243"
+description = "The activation endpoint's hand-rolled HTTP layer parses a request line's method, path and percent-decoded query into a well-typed request, and renders a response as a status line plus a Content-Length matching its body - the two properties any client speaking ordinary HTTP/1.1 needs from it."
+evidence = "src/server/activation.rs parse_request, percent_decode, HttpResponse::to_bytes; tests parse_request_reads_the_method_path_and_decoded_query, parse_request_rejects_a_line_with_no_method_or_target, percent_decode_handles_plus_and_hex_escapes_and_keeps_invalid_ones_literal, to_bytes_carries_a_correct_content_length"
+
+# ============================================================================
+# US-044 - Encrypt the connection to the server with TLS
+# ============================================================================
+[[user_story]]
+id = "US-044"
+title = "Encrypt the connection to the server with TLS"
+as_a = "user or operator on a network I do not fully trust"
+i_want = "the option to run the control connection, and the activation endpoint, over TLS"
+so_that = "a certificate - not just the sealed control channel's own ephemeral offer - vouches for the server I am actually talking to"
+
+[[user_story.acceptance_criteria]]
+id = "AC-262"
+description = "server_ssl=on serves both the control connection and the activation endpoint under the certificate pair named by server_ssl_fullchain/server_ssl_privkey; a certificate and key that do not load or do not match each other refuse the server's startup outright, naming the problem, rather than falling back to plaintext. A client with ssl on and the certificate's own root trusted completes a real TLS handshake and exchanges bytes over it; one that does not trust the root refuses the handshake."
+evidence = "docs/PROTOCOL.md 1.4; src/server/ssl.rs SslFiles, load_acceptor, accept, connect; src/main.rs run_server; tests server_ssl_on_without_a_certificate_refuses_to_start, a_real_tls_handshake_carries_bytes_both_ways, a_client_with_the_wrong_trust_root_refuses_the_handshake, load_acceptor_reports_which_file_is_missing, ssl_files_from_settings_is_none_unless_server_ssl_is_on"
+
+[[user_story.acceptance_criteria]]
+id = "AC-263"
+description = "A client trusts the public roots it ships with plus, optionally, one PEM file of extra roots (connect_ssl_ca) for a self-signed or privately issued server certificate; the certificate is checked against the host the user typed. The daemon (--ssl / daemon_ssl) and the connect popup (its ssl switch, remembered as connect_ssl) each carry this choice through to the same connect path."
+evidence = "docs/PROTOCOL.md 1.4; src/server/ssl.rs client_connector, connector_from_roots, server_name; src/client/connect.rs open_control_channel; src/client/daemon.rs DaemonConfig; tests connector_from_roots_rejects_an_unparsable_extra_ca_file, server_name_accepts_a_hostname_and_an_ip_and_refuses_the_empty_string, ssl_switch_defaults_off_and_flips_with_left_right_or_enter"
+
+[[user_story.acceptance_criteria]]
+id = "AC-261"
+description = "A daemon connects over TLS when told to (--ssl, or daemon_ssl=on remembered from a previous run) and otherwise over plain TCP; either way the choice is carried into the same ConnectRequest a foreground client builds, so the handshake itself is shared rather than reimplemented for headless use."
+evidence = "src/client/daemon.rs DaemonConfig::resolve, to_connect_request; tests ssl_comes_from_the_flag_or_the_settings_file, the_daemon_connects_with_the_resolved_password"
+
+[[user_story.technical_behavior]]
+id = "TB-241"
+description = "server_ssl, server_ssl_fullchain, server_ssl_privkey, server_allow_registration and the four server_smtp_* keys all round-trip through ~/.aloo/settings, and are written - even to an empty value - on the very first save, so an operator setting a server up finds every one of them already named in the file."
+evidence = "src/settings.rs Settings::server_ssl and neighbours; tests server_ssl_registration_and_smtp_keys_are_written_even_when_unset, server_ssl_registration_and_smtp_keys_round_trip, server_switches_accept_every_documented_spelling, server_start_writes_the_ssl_and_registration_keys_and_keeps_them"
+
+# ============================================================================
+# US-045 - Administer the users registry from the server's own machine
+# ============================================================================
+[[user_story]]
+id = "US-045"
+title = "Administer the users registry from the server's own machine"
+as_a = "server operator"
+i_want = "to create or repair an account directly, without an email round trip"
+so_that = "I can hand someone a working login myself, or fix a forgotten password"
+
+[[user_story.acceptance_criteria]]
+id = "AC-267"
+description = "aloo --register-user <nickname> <password> creates an account that is active immediately - no email, no activation file. aloo --change-password <nickname> <password> rewrites a registered account's stored key, taking effect on its very next login, and sends no notification. Both edit the same on-disk registry a running server reads, so neither operation requires a restart to take effect - the very next connection sees it."
+evidence = "docs/SPEC.md 'Server startup'; src/main.rs run_register_user, run_change_password; src/server/users_registry.rs UsersRegistry::register_manual, change_password; tests register_user_and_change_password_edit_the_users_registry_directly, registry_edits_take_effect_on_the_next_login_without_a_restart, register_manual_is_active_immediately_with_no_email_or_activation, register_manual_refuses_an_existing_account_and_change_password_refuses_a_stranger, nicknames_lists_every_registered_account_sorted_and_ignores_stray_files, remove_deletes_an_account_entirely_and_is_a_no_op_on_a_stranger"
 
 # ============================================================================
 # US-003 - Claim a unique nickname
@@ -401,7 +506,7 @@ evidence = "docs/PROTOCOL.md 6.1; src/validation.rs channel_name_is_valid; tests
 
 [[user_story.acceptance_criteria]]
 id = "AC-103"
-description = "A channel is prefixed with an emoji naming its kind at a glance, followed by a space before the name - the globe for public, the lock for private - on the channel selector and on its dropdown rows alike."
+description = "A private channel is prefixed with a lock emoji and a space before the name; a public one carries no icon at all, so a bare #name is itself the 'this one is public' signal - true on the channel selector and on its dropdown rows alike."
 evidence = "docs/SPEC.md 'Connected UI'; src/client/tui/ui.rs channel_kind_icon; src/client/tui/channel.rs channel_selector_title, render_selector_dropdown; test channel_tabs_are_prefixed_by_kind"
 
 [[user_story.technical_behavior]]
@@ -671,15 +776,15 @@ evidence = "docs/PROTOCOL.md 7.3; src/client/voice_stream.rs IdleStreamAction, i
 # ============================================================================
 [[user_story]]
 id = "US-008"
-title = "Prove to a server that you hold its key"
-as_a = "server operator who handed out an rsa key"
-i_want = "a connecting client to prove it holds that key before it is let in"
-so_that = "only clients I have authorised can join"
+title = "Trust the RSA half of the pq_hybrid hedge on its own merits"
+as_a = "user relying on pq_hybrid's RSA-4096 hedge against a flawed post-quantum primitive"
+i_want = "RSA-OAEP encryption itself to be sound - readable only by the intended key"
+so_that = "the classical half of the hedge is trustworthy independent of the post-quantum half"
 
 [[user_story.acceptance_criteria]]
 id = "AC-040"
-description = "A payload encrypted for one key is readable by the holder of that key and by no one else - the RSA-OAEP primitive behind the server's rsa auth challenge (5.3). Peer-to-peer content makes the same promise through the sealed sends of 13."
-evidence = "docs/PROTOCOL.md 8, 5.3, docs/SPEC.md Functionality #1; auth_challenge.feature; tests encrypt_decrypt_roundtrip_short_message, wrong_key_cannot_decrypt"
+description = "A payload encrypted for one key is readable by the holder of that key and by no one else - the RSA-OAEP primitive pq_hybrid's RSA-4096 hedge is built on (13.5). Peer-to-peer content makes the same promise through the sealed sends of 13; nothing in the current protocol still routes a server login through this primitive (5.1)."
+evidence = "docs/PROTOCOL.md 8, 13.5, docs/SPEC.md Functionality #1; auth_challenge.feature; tests encrypt_decrypt_roundtrip_short_message, wrong_key_cannot_decrypt"
 
 [[user_story.acceptance_criteria]]
 id = "AC-041"
@@ -1551,13 +1656,13 @@ evidence = "docs/PROTOCOL.md 1.3; src/control.rs ControlOffer, accept_offer, ope
 
 [[user_story.acceptance_criteria]]
 id = "AC-127"
-description = "The credential a --password deployment sends, previously in the clear, no longer appears anywhere in the bytes on the wire; the same applies to nicknames, channel names, membership and key-rotation traffic, all of which now travel inside the tunnel. What the server itself learns is unchanged (it still routes by these) - only what an observer in between learns."
+description = "A login's nickname and password, previously sent in the clear, no longer appear anywhere in the bytes on the wire; the same applies to channel names, membership and key-rotation traffic, all of which now travel inside the tunnel. What the server itself learns is unchanged (it still routes by these) - only what an observer in between learns."
 evidence = "docs/PROTOCOL.md 1.3/10; src/control.rs (module doc), ControlWriter::send; control_channel.feature 'A password does not appear on the wire'; test the_password_is_not_recoverable_from_the_sealed_bytes"
 
 [[user_story.acceptance_criteria]]
 id = "AC-128"
-description = "A server started with an RSA server key signs its per-connection offer with it, and a client configured with that key requires a valid signature - an unsigned offer, one signed by another key, or one whose keys were swapped after signing are all refused, since each is what a man in the middle would produce. A client with no server key has nothing to check against and accepts the offer: encrypted, but not authenticated, which is documented as the limit of that mode rather than implied away."
-evidence = "docs/PROTOCOL.md 1.3; src/control.rs make_offer, verify_offer, offer_commitment; src/server/mod.rs AuthConfig::signing_key; control_channel.feature 'A server that can be identified must prove it'; tests a_client_holding_the_server_key_requires_a_valid_signature, an_offer_signed_by_another_key_is_refused, swapping_the_keys_inside_a_signed_offer_is_refused, a_client_without_a_server_key_accepts_any_offer"
+description = "This layer's own offer is ephemeral and carries no signature - nothing at the control-channel level vouches for the server, which is a real, documented limit rather than one implied away. A deployment that needs the server authenticated runs the connection over TLS instead (server_ssl, US-044), whose certificate is checked before a single control-channel frame is exchanged."
+evidence = "docs/PROTOCOL.md 1.3, 1.4; src/control.rs (module doc), ControlOffer; src/server/ssl.rs; tests a_real_tls_handshake_carries_bytes_both_ways, a_client_with_the_wrong_trust_root_refuses_the_handshake"
 
 [[user_story.technical_behavior]]
 id = "TB-169"
@@ -1566,7 +1671,7 @@ evidence = "docs/PROTOCOL.md 1.3; src/control.rs derive, nonce, seal, open; cont
 
 [[user_story.technical_behavior]]
 id = "TB-170"
-description = "The server's control-channel keys are ephemeral per connection and discarded with it, so recording a session and later stealing the server's long-term key does not decrypt it. The long-term key only ever signs the offer, never encrypts anything."
+description = "The control channel's encryption keys are ephemeral per connection and discarded with it, so recording a session and later gaining any long-term key this server holds - a TLS private key included - still does not decrypt it."
 evidence = "docs/PROTOCOL.md 1.3; src/server/mod.rs handle_connection (generate_encryption_keys per connection); src/control.rs (module doc); test a_different_server_cannot_recover_the_secret (TB-170)"
 
 [[user_story.technical_behavior]]
@@ -1942,22 +2047,17 @@ evidence = "src/client/global_ptt.rs is_wayland_session; tests is_wayland_sessio
 id = "US-023"
 title = "Recover server settings after a crash"
 as_a = "server operator"
-i_want = "the server to remember the --bind/--port/auth it was last started with"
-so_that = "restarting it after a crash doesn't require re-typing the original flags, and it doesn't silently fall back to open access on the default port"
+i_want = "the server to remember the --bind/--port it was last started with"
+so_that = "restarting it after a crash doesn't require re-typing the original flags, and it doesn't silently fall back to the default port on a different address"
 
 [[user_story.acceptance_criteria]]
 id = "AC-094"
-description = "Starting the server with any of --bind/--port/--enc/--password persists the resolved bind address, port, and auth method to ~/.aloo/settings; starting it again with none of those flags reuses exactly what was last persisted - including a persisted rsa auth's keyfile path or a persisted shared password - instead of resetting to the CLI defaults (open access on 0.0.0.0:7878)."
-evidence = "docs/SPEC.md 'Server startup'; tests server_with_no_flags_reuses_the_previously_persisted_bind_and_port, server_with_no_flags_reuses_previously_persisted_password_auth"
-
-[[user_story.technical_behavior]]
-id = "TB-138"
-description = "Settings::server_auth (none/password/rsa) round-trips through ~/.aloo/settings as server_auth_type plus its one associated value (server_auth_password or server_auth_rsa_keyfile); a server_auth_type naming password or rsa whose associated value line is missing falls back to None rather than panicking or half-applying."
-evidence = "src/settings.rs; tests round_trips_password_auth_through_save_and_load, round_trips_rsa_auth_through_save_and_load, a_malformed_server_auth_type_with_no_matching_value_falls_back_to_none"
+description = "Starting the server with --bind and/or --port persists the resolved bind address and port to ~/.aloo/settings; starting it again with neither flag reuses exactly what was last persisted instead of resetting to the CLI defaults (0.0.0.0:7878). The server_ssl/server_allow_registration/server_smtp_* keys beside them are settings-only - there is no flag for any of them - and are written even when unset, so an operator finds every one of them already named the first time the server ever starts."
+evidence = "docs/SPEC.md 'Server startup'; tests server_with_no_flags_reuses_the_previously_persisted_bind_and_port, server_start_writes_the_ssl_and_registration_keys_and_keeps_them"
 
 [[user_story.technical_behavior]]
 id = "TB-139"
-description = "run_server resolves each of bind/port/auth CLI-flag-first, falling back to whatever Settings::load_or_create returned for that field, then re-saves the merged result before binding - so a flag actually passed this run becomes what the next flag-less run inherits, and passing only one flag leaves the other persisted fields untouched."
+description = "run_server resolves bind/port CLI-flag-first, falling back to whatever Settings::load_or_create returned for that field, then re-saves the merged result before binding - so a flag actually passed this run becomes what the next flag-less run inherits, and passing only one flag leaves the other persisted field untouched."
 evidence = "src/main.rs run_server; tests an_explicit_flag_overrides_and_persists_over_a_previous_value, server_bind_and_port_flags_are_parsed_into_the_listen_address"
 
 # ============================================================================
@@ -2459,8 +2559,8 @@ evidence = "src/client/daemon.rs DaemonFocus::parse, DaemonPlan::is_focus_event;
 
 [[user_story.acceptance_criteria]]
 id = "AC-201"
-description = "A daemon resolves what to run as flag-first, then daemon_* keys in ~/.aloo/settings, then the last connection made from the connect screen (~/.aloo/.cache, host/port and the keybundle it used), then built-in defaults - and writes the merged result back, so a later bare aloo --daemon reproduces it. With no server named anywhere it refuses to start rather than guessing; --server-pwd and --server-key are mutually exclusive; and a malformed channel or focus is reported rather than ignored."
-evidence = "docs/SPEC.md 'Running in background mode' Settings; src/client/daemon.rs DaemonConfig::resolve, persist, resolve_my_key; tests a_flag_beats_the_settings_file_and_the_cache, settings_fill_in_whatever_the_flags_left_out, the_connect_cache_is_the_last_resort_before_defaults, with_no_host_anywhere_the_daemon_refuses_to_start, the_two_server_credentials_are_mutually_exclusive, a_server_password_from_settings_is_used_when_no_flag_gives_one, a_bad_channel_or_focus_is_reported_rather_than_ignored, a_resolved_configuration_round_trips_through_the_settings_file"
+description = "A daemon resolves what to run as flag-first, then daemon_* keys in ~/.aloo/settings, then the last connection made from the connect screen (~/.aloo/.cache, host/port and the keybundle it used), then built-in defaults - and writes the merged result back, so a later bare aloo --daemon reproduces it. With no server named anywhere it refuses to start rather than guessing; --server-pwd (or daemon_server_password) is the one login credential a headless start needs, and with a server but no password anywhere run refuses to start rather than dialling in with an empty one; a malformed channel or focus is reported rather than ignored."
+evidence = "docs/SPEC.md 'Running in background mode' Settings; src/client/daemon.rs DaemonConfig::resolve, persist, resolve_my_key, run, NO_PASSWORD_ERROR; tests a_flag_beats_the_settings_file_and_the_cache, settings_fill_in_whatever_the_flags_left_out, the_connect_cache_is_the_last_resort_before_defaults, with_no_host_anywhere_the_daemon_refuses_to_start, a_server_password_from_settings_is_used_when_no_flag_gives_one, a_bad_channel_or_focus_is_reported_rather_than_ignored, a_resolved_configuration_round_trips_through_the_settings_file"
 
 [[user_story.acceptance_criteria]]
 id = "AC-202"

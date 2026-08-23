@@ -32,15 +32,16 @@ falling back to a server relay (§7.1).
   - [1.1 Framing](#11-framing)
   - [1.2 Why length-prefixed framing](#12-why-length-prefixed-framing)
   - [1.3 The control channel is encrypted](#13-the-control-channel-is-encrypted)
+  - [1.4 Optional TLS](#14-optional-tls)
 - [2. Serialization](#2-serialization)
 - [3. Domain types](#3-domain-types)
 - [4. Connection lifecycle](#4-connection-lifecycle)
   - [4.1 Liveness: `Heartbeat`](#41-liveness-heartbeat)
   - [4.2 Coming back: reconnecting](#42-coming-back-reconnecting)
 - [5. Authentication](#5-authentication)
-  - [5.1 `AuthKind::None`](#51-authkindnone)
-  - [5.2 `AuthKind::Password`](#52-authkindpassword)
-  - [5.3 `AuthKind::Rsa`](#53-authkindrsa)
+  - [5.1 Logging in](#51-logging-in)
+  - [5.2 Activation](#52-activation)
+  - [5.3 Registration](#53-registration)
   - [5.4 Identify / nicknames](#54-identify-nicknames)
 - [6. Channels](#6-channels)
   - [6.1 `JoinChannel { name, kind, password }`](#61-joinchannel-name-kind-password)
@@ -160,8 +161,10 @@ the handshake (§1.3).
 | Client → server | Purpose |
 |---|---|
 | `SecureChannel` | Turns the control channel on; must be first (§1.3) |
-| `Auth` | Answers the server's challenge (§5) |
-| `Identify` | Claims a nickname, announces a public key and method (§5.4) |
+| `Auth` | Logs in with a nickname and its password (§5.1) |
+| `Activate` | Answers a pending account's emailed activation code (§5.2) |
+| `Register` | Creates an account, if this server takes registrations (§5.3) |
+| `Identify` | Claims the logged-in nickname, announcing a public key and method (§5.4) |
 | `JoinChannel` | Joins or implicitly creates a channel (§6.1) |
 | `LeaveChannel` | Leaves one channel (§6.2) |
 | `RotateKey` | Offers a peer fresh key material (§7.5, §11, §13.10) |
@@ -174,8 +177,9 @@ the handshake (§1.3).
 
 | Server → client | Purpose |
 |---|---|
-| `Hello` | Auth mode, challenge, control-channel offer (§1.3, §4) |
-| `AuthResult` | Whether authentication succeeded (§5) |
+| `Hello` | Whether this server takes registrations, and the control-channel offer (§1.3, §4) |
+| `AuthResult` | Whether login succeeded, or is waiting on activation (§5.1, §5.2) |
+| `RegisterResult` | Whether `Register` created an account (§5.3) |
 | `IdentifyResult` | Whether the nickname was granted, and this client's `UserId` (§5.4) |
 | `ChannelList` | The public channels, once, after identifying (§6.3) |
 | `Joined` | Confirms a join, last in the join snapshot (§6.1) |
@@ -296,7 +300,7 @@ the seal.
 
 ```
  client                                   server
-   |<-- Hello { auth, challenge,            |   (in the clear)
+   |<-- Hello { registration_open,          |   (in the clear)
    |            control: ControlOffer } ----|
    |                                        |
    |--- SecureChannel(ControlAccept) ------>|   (in the clear)
@@ -305,15 +309,15 @@ the seal.
 ```
 
 ```
-ControlOffer  { encap: PqEncapKeys, signature: optional<bytes> }
+ControlOffer  { encap: PqEncapKeys }
 ControlAccept { kem_ciphertext: bytes, wrapped_key: bytes[32],
                 eph_x25519_pub: bytes[32] }
 ```
 
 **Why.** Message content never touches the server at all (§7.1, §10), but
 the conversation that sets a session up always travelled as plain TCP - and
-it carries a `--password` credential in the clear (§5.2), nicknames,
-which channels exist, who is in them, and the timing of every key rotation.
+it carries a login's nickname and password in the clear (§5.1), which
+channels exist, who is in them, and the timing of every key rotation.
 Sealing it changes nothing about what the *server* learns, since it still
 has to route by these; it changes what anyone in between learns.
 
@@ -343,28 +347,38 @@ attack waiting to be used.
 
 **Authenticating the server.** An ephemeral offer needs something
 long-lived to vouch for it, or a man in the middle substitutes their own
-and reads everything. When the deployment uses RSA auth (§5.3) the client
-already holds the server's public key out of band, so the server signs its
-offer with the matching private key:
-
-```
-signature = RSA-PSS over "aloo/control/v1/offer" ++ encode(encap)
-```
-
-and a client holding that key **requires** a valid one. An unsigned offer,
-one signed by a different key, or one whose `encap` was swapped after
-signing are all refused - each is exactly what an interceptor would
-produce. This is the same shape as a TLS handshake signing an ephemeral key
-exchange with a long-term identity.
-
-Under `AuthKind::None` or `AuthKind::Password` there is no such key, and
-the channel is then **encrypted but not authenticated**: it defeats a
-passive observer, not an active man in the middle. That is a real limit of
-those modes and is stated as one rather than implied away.
+and reads everything. Nothing at this layer provides that: the offer
+carries no signature, and a client accepts it as-is regardless of who
+signed what. The channel is **encrypted but not authenticated** - it
+defeats a passive observer, not an active man in the middle - and that is
+a real limit, stated as one rather than implied away. A deployment that
+needs the server authenticated runs the whole connection over TLS instead
+(§1.4), whose certificate is checked before a single control-channel frame
+crosses the wire.
 
 Because the offer is per connection and thrown away with it, recording a
-session and later stealing the server's long-term key still does not
-decrypt it - that key only ever signs, never encrypts.
+session and later gaining any long-term key this server holds - a TLS
+private key included - still does not decrypt it.
+
+### 1.4 Optional TLS
+
+`server_ssl=on` in `~/.aloo/settings` serves the control connection (and
+the account-activation web endpoint, §5.3) under a certificate pair named
+by `server_ssl_fullchain`/`server_ssl_privkey` - a Let's Encrypt pair,
+typically. A client opts in with its own `ssl` switch (the connect popup's
+toggle, `--ssl`/`daemon_ssl` for a daemon), trusting the public roots it
+ships with plus, optionally, one PEM file of extra roots
+(`connect_ssl_ca`) for a self-signed or privately issued certificate. The
+certificate is checked against the host the user typed, standard TLS
+server-name verification.
+
+This is the identity §1.3's own offer cannot provide, layered underneath
+everything else unchanged: the control channel's own sealing (its
+post-quantum key transport) still runs on top of TLS exactly as it runs on
+top of plain TCP, so TLS here is what authenticates the server, not what
+keeps the conversation confidential. A certificate that does not load, or
+does not match its key, refuses the server's startup outright rather than
+falling back to plaintext.
 
 ## 2. Serialization
 
@@ -424,9 +438,10 @@ successful registration). The counter only ever increases - a `UserId`
 value is **never reused**, even after its holder disconnects, for as long
 as that server process keeps running (the counter is in-memory only and
 resets to 1 on a server restart). This is a different thing from the
-*nickname* (`display_name`), which **is** freed for reuse as soon as its
-holder disconnects (§5.4) - two different clients can be assigned the
-same nickname over time, but never the same live `UserId`.
+*nickname*, claimed by `Auth` and checked against the users registry
+(§5.1), which **is** freed for reuse as soon as its holder disconnects
+(§5.4) - two different clients can be assigned the same nickname over
+time, but never the same live `UserId`.
 
 ```
 UserInfo {
@@ -487,18 +502,10 @@ ChannelInfo { name: string, kind: ChannelKind }
 `Private` channels are never advertised - a client must already know the
 exact name to join one.
 
-```
-AuthKind = None | Password | Rsa
-```
-What the server requires to authenticate a new connection - see §5.
-
-```
-AuthResponse =
-    | None
-    | Password(string)
-    | Rsa { blocks: list<bytes> }   // the challenge nonce, RSA-OAEP
-                                    // encrypted with the server's key (§8)
-```
+There is one way to authenticate: a nickname and its password, checked
+against the server's users registry (§5.1). `AuthKind`/`AuthResponse` -
+three interchangeable credential modes negotiated per `Hello` - no longer
+exist; every server checks the same way.
 
 ```
 Envelope {
@@ -522,15 +529,15 @@ one-shot decision, unlike the stream of chunks that follows it).
    |                                         |
    |--- TCP connect ------------------------>|
    |                                         |
-   |<-- Hello { auth, challenge } -----------|
+   |<-- Hello { registration_open } ---------|
    |                                         |
-   |--- Auth(response) --------------------->|
+   |--- Auth { nickname, password } -------->|
    |                                         |
-   |<-- AuthResult { ok, reason } -----------|
-   |        (ok == false => connection closed by server, see §5)
+   |<-- AuthResult { ok, .. } ---------------|
+   |        (ok == false => connection closed by server, unless
+   |         activation_pending - see §5.1, §5.2)
    |                                         |
-   |--- Identify { display_name,             |
-   |               public_key_der,           |
+   |--- Identify { public_key_der,           |
    |               key_mode } -------------->|
    |                                         |
    |<-- IdentifyResult { ok, you, reason } --|
@@ -545,13 +552,15 @@ one-shot decision, unlike the stream of chunks that follows it).
 
 - The server always speaks first: it sends `Hello` immediately on
   accepting the TCP connection, before reading anything.
-- The client's next message **must** be `Auth`; any other message (or a
-  clean disconnect) at this point causes the server to send
-  `AuthResult { ok: false, reason: Some("expected auth message") }` and
-  close the connection.
-- On successful auth, the client's next message **must** be `Identify`;
-  otherwise the server sends
-  `Error { message: "expected identify message" }` and closes the
+- The client's next message **must** be `Auth` or `Register`; any other
+  message (or a clean disconnect) at this point causes the server to
+  send `AuthResult { ok: false, reason: Some("expected auth message") }`
+  and close the connection. `Register` is answered with
+  `RegisterResult` and the connection closes either way (§5.3) - it is
+  never followed by `Identify` on the same connection.
+- On successful auth (activation included, where it applies), the
+  client's next message **must** be `Identify`; otherwise the server
+  sends `Error { message: "expected identify message" }` and closes the
   connection. (Note this is `ServerMessage::Error`, not `AuthResult` -
   an asymmetry in the reference implementation, not a meaningfully
   different failure mode from a client's perspective: either way, the
@@ -655,83 +664,109 @@ A client therefore reconnects, and keeps reconnecting:
 
 ## 5. Authentication
 
-The server is started with exactly one of three auth modes
-(`aloo --server [--password <p> | --enc rsa <keyfile>]`); the client
-discovers which one is in effect from `Hello.auth` and must respond with
-the matching `AuthResponse` variant. Sending the wrong `AuthResponse`
-variant for the advertised `AuthKind` is treated as authentication
-failure (`AuthResult { ok: false }`), same as a genuinely wrong
-credential.
+There is one way in: `Auth { nickname, password }`, checked against the
+server's users registry (`crate::server::users_registry`) - accounts on
+disk under `~/.aloo/users/<nickname>/`, each a PBKDF2-derived key, an
+optional email, and, while unactivated, a pending code. A server that
+also takes registrations (§5.3) answers `Register` instead; either way
+the connection closes once its one exchange is settled.
 
-### 5.1 `AuthKind::None`
+### 5.1 Logging in
 
-`Hello.challenge` is `None`. The client must respond
-`Auth(AuthResponse::None)`. Always succeeds.
+```
+Auth { nickname: string, password: string }
+```
 
-### 5.2 `AuthKind::Password`
+The server derives a candidate key from `nickname` and `password`
+(`PBKDF2-HMAC-SHA256`, salted with the nickname) whether or not an
+account by that name exists, and compares it in constant time against the
+registered key - so a login attempt against an unregistered nickname
+costs the same work, and gets the same `AuthResult { ok: false,
+activation_pending: false }`, as one against a real, wrong password: a
+login cannot be used to discover which nicknames exist. A correct
+nickname and password on an activated account answers `AuthResult { ok:
+true, activation_pending: false, reason: None }`, and the client's next
+message must be `Identify` (§5.4). One still awaiting activation answers
+`ok: false, activation_pending: true` instead - see §5.2.
 
-`Hello.challenge` is `None`. The client must respond
-`Auth(AuthResponse::Password(plaintext_password))`. The password is
-plaintext *inside the frame*, but the frame itself is sealed (§1.3) - this
-message travels after `SecureChannel`, so it is not on the wire in the
-clear. Note the limit that goes with it: a `--password` server has no
-long-term key to sign its control offer with, so that channel is encrypted
-but unauthenticated (§1.3). The server compares it against its configured `--password` value
-using a constant-time comparison (a constant-time comparison) to avoid
-leaking a timing side-channel about where the strings first differ.
+### 5.2 Activation
 
-### 5.3 `AuthKind::Rsa`
+An account created by `Register` (§5.3) is not usable until its emailed
+code is given back, one way or another:
 
-`Hello.challenge` is `Some(nonce)`, a fresh 32 random bytes generated per
-connection (32 random bytes). The client must:
+- **In the client.** A login whose credentials are right but whose
+  account is `activation_pending` may send exactly one `Activate {
+  code }` in reply, answered with another `AuthResult`. The right code
+  continues the handshake into `Identify`; a wrong one, or one more than
+  `ACTIVATION_VALIDITY_SECS` (one hour) past the account's registration
+  time, refuses and the server closes the connection - the account must
+  be registered again once its code has expired.
+- **In a browser.** The activation email also names an HTTP(S) endpoint
+  (`server_activation_port`, over TLS when `server_ssl` is on) that takes
+  the same nickname and code and does the identical check. More than ten
+  attempts from one source address within an hour bans that address from
+  *this endpoint* for a day - a ban that has no effect on logging in as a
+  client, which costs a full reconnect per wrong code instead.
 
-1. Encrypt `nonce` with the server's public key (which the client must
-   already possess out-of-band, as its configured `server_key` file, see
-   README.md's "Generating RSA keys") using RSA-OAEP/SHA-256, splitting
-   into multiple blocks if needed (§8.1 - for a 32-byte nonce and any key
-   ≥ 226 bits this is always exactly one block in practice).
-2. Respond `Auth(AuthResponse::Rsa { blocks })`.
+Activating an account is nothing more than deleting the pending code file
+- there is no separate "activated" flag to fall out of sync with it.
 
-The server decrypts `blocks` with its own private key and compares the
-result to the original `nonce` byte-for-byte (constant-time). This proves
-the client holds the private key matching the `server_key` the server was
-started with, without the private key ever crossing the wire.
+### 5.3 Registration
+
+```
+Register { nickname: string, password: string, email: string }
+```
+
+Only answered when the server was started with `server_allow_registration
+=on`; otherwise (or with no SMTP relay configured to send the code
+through) it is refused - `RegisterResult { ok: false, reason: Some(...) }`
+- and no account is created. On success the server writes the account
+with a pending activation and emails a fresh code to `email`, answering
+`RegisterResult { ok: true, reason: None }`; the account cannot log in
+until that code comes back (§5.2). Registering a nickname whose previous
+registration is still within its activation window is refused outright;
+one whose window has expired may be registered again from scratch.
+
+This is a separate path from logging in - a client never sends `Auth`
+and `Register` on the same connection - and from the server's own
+`aloo --register-user`/`--change-password` (docs/SPEC.md "Server
+startup"), which create or repair an account directly on the server's
+own machine, with no email and no activation step at all.
 
 ### 5.4 Identify / nicknames
 
-After a successful `Auth`, the client sends exactly one `Identify`:
+After a successful `Auth` (activation included, where it applies), the
+client sends exactly one `Identify`:
 
 ```
-Identify { display_name: string, public_key_der: bytes, key_mode: KeyMode }
+Identify { public_key_der: bytes, key_mode: KeyMode }
 ```
 
-`public_key_der` is the client's own DER-encoded RSA public key (its
-`my_key` - see README.md; this is *independent* of whatever key material
-was used for the `server_key` challenge in §5.3, if any) - or, for
-`key_mode == PqHybrid`, a bincode-encoded `PqPublicBundle` instead (§13) -
-other clients
-use this to encrypt messages addressed to this user (§7.2, §8).
+There is no nickname field here any more - it was already claimed by
+`Auth`. `public_key_der` carries a bincode-encoded `PqPublicBundle` (§13)
+- other clients use this to encrypt messages addressed to this user
+(§7.2, §8).
 
-`key_mode` (§3) tells every peer, up front, whether `public_key_der` is
-good for the whole session (`Password`/`None`) or is a *bootstrap*
-encryption key that individual peer relationships will supersede via
-`KeyRotated` the first time a message is exchanged with them (`PqHybrid`;
-see §13.10). The server itself does not branch on `key_mode`
-beyond storing and relaying it as part of `UserInfo`, and using it to
-validate `RotateKey` (§7.5) - it never gates ordinary messaging on it.
+`key_mode` (§3) tells every peer, up front, which scheme `public_key_der`
+speaks; it is always `PqHybrid`, a *bootstrap* encryption key that
+individual peer relationships supersede via `KeyRotated` the first time a
+message is exchanged with them (see §13.10). The server itself does not
+branch on `key_mode` beyond storing and relaying it as part of `UserInfo`,
+and using it to validate `RotateKey` (§7.5) - it never gates ordinary
+messaging on it.
 
-The server enforces that `display_name` is not currently in use by any
-other connected client - matching is case-sensitive (`"dave"` and `"Dave"`
-are different nicknames and may be held by two different clients at once)
-- the check-and-register happens atomically under the server's single
-registry lock, so two simultaneous `Identify`s for the same name cannot
-both succeed. On success, the server assigns a fresh
-`UserId` and responds `IdentifyResult { ok: true, you: Some(id), reason: None }`.
-On a name collision, it responds
-`IdentifyResult { ok: false, you: None, reason: Some(String) }` (the
-reason names the taken nickname) and closes the connection immediately
-after - the client must reconnect (a new TCP connection, restarting from
-`Hello`) with a different `display_name` to retry. A nickname becomes
+The server enforces that the logged-in nickname is not currently held by
+any other connected client - matching is case-sensitive (`"dave"` and
+`"Dave"` are different nicknames and may be held by two different clients
+at once) - the check-and-register happens atomically under the server's
+single registry lock, so two simultaneous `Identify`s for the same name
+cannot both succeed. On success, the server assigns a fresh `UserId` and
+responds `IdentifyResult { ok: true, you: Some(id), reason: None }`. On a
+name collision, it responds `IdentifyResult { ok: false, you: None,
+reason: Some(String) }` (the reason names the taken nickname) and closes
+the connection immediately after - the client must reconnect (a new TCP
+connection, restarting from `Hello`) to retry, which succeeds the moment
+the other connection holding the name goes away. A nickname becomes
 available again as soon as its holder's connection closes - cleanly (§4)
 or because the server's heartbeat check decided it was dead (§4.1).
 
@@ -745,11 +780,12 @@ seeds one channel, `DEFAULT_CHANNEL_NAME` (`"the-hall"`, `ChannelKind::
 Public`), before any client connects - the one channel that survives being
 emptied (§6.2).
 
-A channel tab is shown prefixed with an emoji naming its kind at a glance,
-followed by a space before the name: 🌍 for public, 🔒 for private
-(the channel view). There is one tab per channel the client is a member
-of, and only those - the wider set of public channels the server has
-announced (§6.3) is a directory the user picks from, not a row of tabs.
+A private channel's tab is shown prefixed with 🔒 and a space before the
+name; a public one carries no icon at all, so a bare `#name` is itself
+the "this one is public" signal (the channel view). There is one tab per
+channel the client is a member of, and only those - the wider set of
+public channels the server has announced (§6.3) is a directory the user
+picks from, not a row of tabs.
 
 ### 6.1 `JoinChannel { name, kind, password }`
 
@@ -955,9 +991,9 @@ reconnecting. The IP is taken from the already-open TCP connection
 (the connection's source address), not anything the client asserts.
 
 Tracked in server memory only (the attempt counter), not
-persisted to disk - a server restart clears every ban, the same scope
-tradeoff `AuthConfig`'s in-memory-only session state already makes
-elsewhere in this document.
+persisted to disk - a server restart clears every ban. The users registry
+itself (§5.1) is the opposite: on disk, so a restart never forgets who is
+registered.
 
 
 ## 7. Messaging
@@ -2125,10 +2161,9 @@ is sealed on the wire, so a passive observer between the two sees strictly
 less than this list -
 
 - Connection metadata: source address, connection lifetime.
-- Auth material as sent (a `--password`-mode password reaches the server
-  as plaintext inside a sealed frame, though not persisted beyond the
-  comparison in §5.2; RSA-mode auth never exposes any private key, only a
-  ciphertext of a nonce it already generated itself).
+- Auth material as sent - a nickname and its plaintext password reach the
+  server inside a sealed frame (§5.1), compared against a PBKDF2-derived
+  key it stores; the password itself is never persisted.
 - Display names and DER-encoded public keys (both inherently
   non-secret - a public key is meant to be shared, and a nickname is
   chosen to be visible to other users).
@@ -2226,9 +2261,9 @@ that does.
 Nothing else in this protocol lets a client tell "the same person
 reconnecting" apart from "someone else who happens to have taken a
 familiar nickname." `UserId` (§3) is assigned fresh on every successful
-`Identify` and never reused, and a `display_name` is freed the instant its
+`Identify` and never reused, and a nickname is freed the instant its
 holder disconnects and immediately available to the next connection that
-asks for it (§5.4) - there is no requirement, or even a mechanism, for a
+claims it via `Auth` (§5.1, §5.4) - there is no requirement, or even a mechanism, for a
 name to keep being held by the same underlying identity across two
 separate connections. Every peer's `public_key_der` is trust-on-first-use
 on every single connection - nothing before this section gave any peer a
@@ -3112,13 +3147,13 @@ Details are in the sections referenced.
 ```
  client                                        server
    |--- TCP connect --------------------------->|
-   |<-- Hello { auth, challenge, control } -----|   in the clear
+   |<-- Hello { registration_open, control } ---|   in the clear
    |--- SecureChannel(accept) ----------------->|   in the clear
    |=========== everything below is sealed =====|
-   |--- Auth(response) ------------------------>|
-   |<-- AuthResult { ok } ----------------------|
-   |--- Identify { name, key, key_mode } ------>|
-   |<-- IdentifyResult { ok, you } -------------|
+   |--- Auth { nickname, password } ------------>|
+   |<-- AuthResult { ok, .. } ------------------- |
+   |--- Identify { key, key_mode } -------------->|
+   |<-- IdentifyResult { ok, you } ---------------|
    |<-- ChannelList(public channels) -----------|
 ```
 

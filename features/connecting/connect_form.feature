@@ -50,16 +50,24 @@ Feature: Filling in the connect form
     And I type "8a0b0" into the form
     Then the "port" field contains "800"
 
-  @AC-005 @TB-012
-  Scenario: The identity store path is prefilled but still mine to change
+  @AC-005
+  Scenario: There is no id_store field to fill in
     Given the connect form is open
-    Then the id_store path is prefilled with the default idstore location
-    When I focus the "id_store" field
-    And I clear the "id_store" field
-    And I type "/tmp/my_ids_store" into the form
-    Then the "id_store" field contains "/tmp/my_ids_store"
-    When I press Backspace
-    Then the "id_store" field contains "/tmp/my_ids_stor"
+    Then the form has no id_store field
+
+  @AC-269
+  Scenario: The password field is masked
+    Given the connect form is open
+    When I focus the "password" field
+    And I type "hunter2" into the form
+    Then the "password" field contains "hunter2"
+    But the password field is shown masked
+
+  @AC-269
+  Scenario: ssl is not a popup field - it defaults off, as connect_ssl settings say
+    Given the connect form is open
+    Then ssl is off
+    And the form has no ssl field
 
   @AC-070
   Scenario: my_key is pq_hybrid, the one peer-to-peer scheme this app has
@@ -77,7 +85,7 @@ Feature: Filling in the connect form
     And the connect form is filled in with valid details
     And my_key points at a keybundle pair
     Then a visible Connect button is offered
-    And the request carries no server key material
+    And the request carries the details as typed
     When I submit the form
     Then connecting begins with the details I entered
 
@@ -99,7 +107,27 @@ Feature: Filling in the connect form
       | field    | message  |
       | host     | host     |
       | nickname | nickname |
-      | id_store | id_store |
+      | password | password |
+
+  @AC-270
+  Scenario: The registration fields are hidden until the server allows registration
+    Given the connect form is open
+    Then the form has no email field
+    And no Register button is offered
+    When the server allows registration
+    Then an email field and a Register button are offered
+
+  @AC-270
+  Scenario: Register needs an email that Connect does not
+    Given the connect form is open
+    And the server allows registration
+    And the connect form is filled in with valid details
+    When I focus the "Register" field
+    Then registering is refused with an error mentioning "email"
+    When I focus the "email" field
+    And I type "dave@example.com" into the form
+    And I focus the "Register" field
+    Then registering begins with the email I entered
 
   @AC-009
   Scenario: Escape abandons the form
@@ -108,11 +136,11 @@ Feature: Filling in the connect form
     Then the form is cancelled
 
   @AC-010
-  Scenario: An rsa key field is filled from the in-app file browser
+  Scenario: A my_key field is filled from the in-app file browser
     Given the connect form is open
     And a directory holding one sub-directory and one file
     When I open the file browser on that directory and pick the file
-    Then the picked file fills the server_key field
+    Then the picked file fills the my_key field
 
   @AC-011
   Scenario: The file browser retraces its own steps

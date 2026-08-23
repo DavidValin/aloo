@@ -71,3 +71,31 @@ pub fn resolve_home_dir(home: Option<&OsStr>, userprofile: Option<&OsStr>) -> Op
         .find(|v| !v.is_empty())
         .map(PathBuf::from)
 }
+
+/// Resolves a leading `~` (or `~/...`) against the same home directory
+/// `aloo_dir` uses, leaving any other path untouched. Settings that name
+/// files outside `ALOO_HOME` - the TLS certificate pair, an extra CA - are
+/// written with a literal `~` so the file reads the same on every machine.
+pub fn expand_tilde(path: &str) -> PathBuf {
+    expand_tilde_with(
+        path,
+        resolve_home_dir(
+            std::env::var_os("HOME").as_deref(),
+            std::env::var_os("USERPROFILE").as_deref(),
+        ),
+    )
+}
+
+/// Pure half of `expand_tilde`, testable with a synthetic home. With no
+/// home to resolve against the path is returned as written - a literal
+/// `~` directory is the least surprising reading of an unanswerable
+/// question.
+pub fn expand_tilde_with(path: &str, home: Option<PathBuf>) -> PathBuf {
+    if path == "~" {
+        return home.unwrap_or_else(|| PathBuf::from(path));
+    }
+    match (path.strip_prefix("~/"), home) {
+        (Some(rest), Some(home)) => home.join(rest),
+        _ => PathBuf::from(path),
+    }
+}

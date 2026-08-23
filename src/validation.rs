@@ -84,6 +84,44 @@ pub fn is_storable(s: &str) -> bool {
     !s.contains('\t') && !s.contains('\n') && !s.contains('\r')
 }
 
+/// A registered nickname is at most this many characters - the same cap
+/// the connect popup enforces while typing
+/// (`client::tui::ui_connect_popup::NICKNAME_MAX_LEN`).
+pub const NICKNAME_MAX_LEN: usize = 10;
+
+/// Whether `nickname` can name an account in the server's users registry
+/// (`server::users_registry`): 1 to `NICKNAME_MAX_LEN` ASCII letters,
+/// digits, `-` or `_`. Stricter than the popup's own filter (which only
+/// refuses whitespace) because the registry keeps each account in a
+/// directory *named after the nickname*: `..`, a path separator, or a
+/// leading `.` would escape or hide it, and anything non-ASCII raises
+/// case-folding and normalisation questions a directory name cannot
+/// answer. The server applies this to `Auth` and `Register` alike, so an
+/// unregistrable name is refused before it ever reaches the filesystem.
+pub fn nickname_is_registrable(nickname: &str) -> bool {
+    !nickname.is_empty()
+        && nickname.len() <= NICKNAME_MAX_LEN
+        && nickname
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// A deliberately shallow check on a registration email address: one `@`
+/// with something on each side, no whitespace, and - the part that
+/// actually matters - no CR/LF, since the address ends up in an SMTP
+/// header line and a newline in it would let a client inject further
+/// headers. Whether the mailbox exists is what the activation code proves.
+pub fn email_is_plausible(email: &str) -> bool {
+    let Some((local, domain)) = email.split_once('@') else {
+        return false;
+    };
+    !local.is_empty()
+        && !domain.is_empty()
+        && domain.contains('.')
+        && email.len() <= 254
+        && !email.chars().any(|c| c.is_whitespace() || c == '<' || c == '>' || c == ',')
+}
+
 /// The address the server should listen on, from a `--bind` value (or the
 /// `server_bind` setting) and a port.
 ///

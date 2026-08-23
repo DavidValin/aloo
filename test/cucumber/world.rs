@@ -150,6 +150,10 @@ pub struct AlooWorld {
 
     // -- live server over loopback TCP ---------------------------------
     pub addr: Option<SocketAddr>,
+    /// The users registry the current scenario's server was started with -
+    /// what lets a step register a nickname before logging it in, or
+    /// register one lazily the first time a step needs it.
+    pub server_users: Option<aloo::server::users_registry::UsersRegistry>,
     /// How long the running server tolerates silence before treating a
     /// client as gone (`server::serve_with_heartbeat_timeout`) - set only
     /// by scenarios about reconnecting (US-040), which have to wait it out.
@@ -234,9 +238,6 @@ pub struct AlooWorld {
     pub server_control_keys: Option<aloo::control::ControlKeys>,
     /// What actually went on the wire, for scenarios that inspect it.
     pub control_bytes: Vec<u8>,
-    /// The server's long-term keypair, when a scenario needs one to sign
-    /// its offer with.
-    pub server_keypair: Option<KeyPair>,
 
     // -- malformed input -----------------------------------------------
     pub survived_malformed: bool,

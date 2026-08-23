@@ -19,16 +19,40 @@ use rand_core::OsRng;
 use rsa::RsaPrivateKey;
 use aloo::p2p_proto::{P2pPayload, PunchDatagram, RendezvousMessage};
 use aloo::proto::*;
-use aloo::server::{AuthConfig, serve_with_rendezvous};
+use aloo::server::ServerOptions;
+use aloo::server::users_registry::UsersRegistry;
+use aloo::server::serve_with_rendezvous;
 use aloo::control::ControlEndpoint;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
+
+#[path = "server_common.rs"]
+mod server_common;
+use server_common::{password_for, test_users_registry};
+
+/// One registry shared by every server this file spawns - simplest given
+/// how many helpers (`one_manager`, `Pair::connect`) take only a
+/// `server_addr` and hand off to `handshake` deeper inside. Registering
+/// "alice"/"bob" once and reusing them across servers is fine here: unlike
+/// the reconnect tests, nothing in this file cares about a fresh account.
+fn shared_users() -> UsersRegistry {
+    static USERS: std::sync::OnceLock<UsersRegistry> = std::sync::OnceLock::new();
+    USERS
+        .get_or_init(|| {
+            test_users_registry(std::env::temp_dir().join(format!(
+                "aloo-p2p-test-users-{}",
+                std::process::id()
+            )))
+        })
+        .clone()
+}
 
 async fn spawn_test_server() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let udp = UdpSocket::bind(addr).await.unwrap();
+    let options = ServerOptions::new(shared_users());
     tokio::spawn(async move {
-        let _ = serve_with_rendezvous(listener, udp, AuthConfig::None).await;
+        let _ = serve_with_rendezvous(listener, udp, options).await;
     });
     addr
 }
@@ -80,18 +104,25 @@ fn had_link_failure(
 }
 
 async fn handshake(stream: &mut ControlEndpoint<TcpStream>, name: &str) -> UserId {
-    let (auth, _) = stream
-        .client_handshake(None)
+    let users = shared_users();
+    if !users.is_registered(name) {
+        users.register_manual(name, &password_for(name)).unwrap();
+    }
+    let _registration_open = stream
+        .client_handshake()
         .await
         .unwrap()
         .expect("server closed during handshake");
-    assert_eq!(auth, AuthKind::None);
-    stream.send(&ClientMessage::Auth(AuthResponse::None))
+    stream
+        .send(&ClientMessage::Auth {
+            nickname: name.into(),
+            password: password_for(name),
+        })
         .await
         .unwrap();
-    let _: ServerMessage = stream.recv().await.unwrap().unwrap(); // AuthResult
+    let auth_result: ServerMessage = stream.recv().await.unwrap().unwrap();
+    assert!(matches!(auth_result, ServerMessage::AuthResult { ok: true, .. }), "{auth_result:?}");
     stream.send(&ClientMessage::Identify {
-            display_name: name.into(),
             public_key_der: vec![],
             key_mode: KeyMode::PqHybrid,
         },

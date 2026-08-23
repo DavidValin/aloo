@@ -1774,6 +1774,7 @@ async fn handle_server_message(
     match msg {
         ServerMessage::Hello { .. }
         | ServerMessage::AuthResult { .. }
+        | ServerMessage::RegisterResult { .. }
         | ServerMessage::IdentifyResult { .. } => {
             // only expected during the handshake in connect::connect_and_handshake
         }

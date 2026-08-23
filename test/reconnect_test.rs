@@ -9,14 +9,19 @@
 
 use std::time::{Duration, Instant};
 
-use aloo::client::connect::{ConnectRequest, MyKeySelection, ServerKeySelection};
+#[path = "server_common.rs"]
+mod server_common;
+
+use aloo::client::connect::{ConnectRequest, MyKeySelection};
 use aloo::client::reconnect::{
     Backoff, RECONNECT_FIRST_DELAY, RECONNECT_MAX_DELAY, SERVER_DOWN_AFTER_ATTEMPTS, ServerEvent,
     ServerLinkState, ServerSink, delay_after, seconds_left,
 };
 use aloo::control::ControlSink;
 use aloo::proto::{ChannelKind, ClientMessage, ServerMessage};
-use aloo::server::AuthConfig;
+use aloo::server::ServerOptions;
+use aloo::server::users_registry::UsersRegistry;
+use server_common::{password_for, test_users_registry};
 use tokio::net::{TcpListener, TcpStream};
 
 // ---------------------------------------------------------------------
@@ -115,23 +120,23 @@ fn a_reconnect_reads_as_a_hiccup_until_enough_attempts_have_failed() {
 fn every_state_says_exactly_what_is_happening() {
     assert_eq!(
         ServerLinkState::Connected.label(false),
-        "\u{1F7E2} Connected to server!"
+        "\u{23FA} Connected to server!"
     );
     assert_eq!(
         ServerLinkState::Reconnecting.label(false),
-        "\u{1F534} Reconnecting..."
+        "\u{23FA} Reconnecting..."
     );
     assert_eq!(
         ServerLinkState::RetryingIn { seconds_left: 5 }.label(false),
-        "\u{1F534} Reconnecting in 5s..."
+        "\u{23FA} Reconnecting in 5s..."
     );
     assert_eq!(
         ServerLinkState::Down { seconds_left: 12 }.label(false),
-        "\u{1F534} Server down (reconnecting in 12 sec...)"
+        "\u{23FA} Server down (reconnecting in 12 sec...)"
     );
     assert_eq!(
         ServerLinkState::NoServer.label(false),
-        "\u{26AA} No server mode"
+        "\u{23FA} No server mode"
     );
 }
 
@@ -140,7 +145,7 @@ fn every_state_says_exactly_what_is_happening() {
 fn a_punch_in_flight_is_only_worth_naming_when_there_is_no_server() {
     assert_eq!(
         ServerLinkState::NoServer.label(true),
-        "\u{26AA} No server mode (punching)"
+        "\u{23FA} No server mode (punching)"
     );
     // With a server, punching is the ordinary case and the sidebar already
     // colours the peer it belongs to - saying it here too would be noise
@@ -172,7 +177,7 @@ async fn live_sink() -> (
 ) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let client = TcpStream::connect(addr).await.unwrap();
+    let client: aloo::server::ssl::BoxedStream = Box::new(TcpStream::connect(addr).await.unwrap());
     let (server_side, _) = listener.accept().await.unwrap();
     let (_, wr) = tokio::io::split(client);
     let (sink, lost_rx) = ServerSink::new(aloo::control::ControlWriter::new(wr));
@@ -207,7 +212,7 @@ async fn installing_a_connection_makes_the_sink_usable_again() {
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let client = TcpStream::connect(addr).await.unwrap();
+    let client: aloo::server::ssl::BoxedStream = Box::new(TcpStream::connect(addr).await.unwrap());
     let (_kept_alive, _) = listener.accept().await.unwrap();
     let (_, wr) = tokio::io::split(client);
     sink.install(aloo::control::ControlWriter::new(wr)).await;
@@ -260,16 +265,22 @@ async fn a_write_that_fails_drops_the_connection_and_reports_the_loss() {
 /// cut, port closed.
 struct StoppableServer {
     addr: std::net::SocketAddr,
+    users: UsersRegistry,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl StoppableServer {
     /// `port == 0` picks a free one; passing a previous instance's port is
-    /// how "the same server came back" is staged.
-    fn start(port: u16) -> Self {
+    /// how "the same server came back" is staged. `users` is the same
+    /// registry across every restart of one logical server, so a
+    /// nickname registered before a restart is still valid after it -
+    /// only channel membership (`Registry`) resets, since that lives in
+    /// memory.
+    fn start(port: u16, users: UsersRegistry) -> Self {
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        let users_for_thread = users.clone();
         let thread = std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -278,8 +289,9 @@ impl StoppableServer {
             rt.block_on(async move {
                 let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
                 ready_tx.send(listener.local_addr().unwrap()).unwrap();
+                let options = ServerOptions::new(users_for_thread);
                 tokio::select! {
-                    _ = aloo::server::serve(listener, AuthConfig::None) => {}
+                    _ = aloo::server::serve(listener, options) => {}
                     _ = stop_rx => {}
                 }
             });
@@ -289,6 +301,7 @@ impl StoppableServer {
         let addr = ready_rx.recv().unwrap();
         Self {
             addr,
+            users,
             stop: Some(stop_tx),
             thread: Some(thread),
         }
@@ -340,18 +353,35 @@ fn request_for(addr: std::net::SocketAddr, nickname: &str) -> ConnectRequest {
     ConnectRequest {
         host: addr.ip().to_string(),
         port: addr.port(),
+        ssl: false,
+        ssl_ca: None,
         nickname: nickname.to_string(),
-        server_key: ServerKeySelection::None,
+        password: password_for(nickname),
         my_key: MyKeySelection {
             file_pub,
             file_priv,
         },
-        id_store_path: std::env::temp_dir().join(format!(
-            "aloo-reconnect-test-idstore-{}-{}",
-            std::process::id(),
-            nickname
-        )),
+        activation_code: None,
     }
+}
+
+/// A registry at a fresh scratch directory with `nicknames` already
+/// registered - what every reconnect test's `StoppableServer` shares
+/// across restarts.
+fn registry_with(nicknames: &[&str]) -> UsersRegistry {
+    let dir = std::env::temp_dir().join(format!(
+        "aloo-reconnect-test-users-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let users = test_users_registry(dir);
+    for name in nicknames {
+        users.register_manual(name, &password_for(name)).unwrap();
+    }
+    users
 }
 
 /// Waits for the next event, failing the test rather than hanging forever.
@@ -368,7 +398,7 @@ async fn next_event(rx: &mut tokio::sync::mpsc::UnboundedReceiver<ServerEvent>) 
 /// @requirement AC-225
 #[tokio::test]
 async fn a_session_whose_server_disappears_gets_itself_back_on() {
-    let mut server = StoppableServer::start(0);
+    let mut server = StoppableServer::start(0, registry_with(&["alice"]));
     let addr = server.addr;
     let request = request_for(addr, "alice");
 
@@ -404,7 +434,7 @@ async fn a_session_whose_server_disappears_gets_itself_back_on() {
                 waited += 1;
                 assert_eq!(failed_attempts, waited, "attempts must be counted in order");
                 if restarted.is_none() {
-                    restarted = Some(StoppableServer::start(addr.port()));
+                    restarted = Some(StoppableServer::start(addr.port(), server.users.clone()));
                 }
             }
             ServerEvent::Reconnected { you } => break you,
@@ -435,7 +465,7 @@ async fn a_session_whose_server_disappears_gets_itself_back_on() {
 /// @requirement AC-226
 #[tokio::test]
 async fn a_taken_nickname_is_an_ordinary_retryable_failure() {
-    let server = StoppableServer::start(0);
+    let server = StoppableServer::start(0, registry_with(&["alice"]));
     let request = request_for(server.addr, "alice");
 
     let (_events, _sink, _you, _identity, _addr) =
@@ -473,9 +503,10 @@ async fn a_session_reaped_by_the_server_reappears_in_a_later_arrival_s_member_li
     let reap_after = Duration::from_millis(1_500);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let options = ServerOptions::new(registry_with(&["alice", "bob"]))
+        .with_heartbeat_timeout(reap_after);
     tokio::spawn(async move {
-        let _ = aloo::server::serve_with_heartbeat_timeout(listener, AuthConfig::None, reap_after)
-            .await;
+        let _ = aloo::server::serve(listener, options).await;
     });
 
     let request = request_for(addr, "alice");
@@ -485,7 +516,8 @@ async fn a_session_reaped_by_the_server_reappears_in_a_later_arrival_s_member_li
             .expect("first connection");
 
     let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel();
-    let id_store = aloo::client::idstore::IdStore::new_empty(request.id_store_path.clone());
+    let id_store =
+        aloo::client::idstore::IdStore::new_empty(aloo::client::idstore::default_path());
     let plan = DaemonPlan::new(
         vec![DaemonChannel {
             name: "general".into(),
@@ -520,7 +552,7 @@ async fn a_session_reaped_by_the_server_reappears_in_a_later_arrival_s_member_li
     // the server's *current* membership, which knows nothing of alice's
     // first connection.
     let mut bob = ControlEndpoint::new(TcpStream::connect(addr).await.unwrap());
-    handshake(&mut bob, "bob").await;
+    handshake(&mut bob, "bob", &password_for("bob")).await;
     join(&mut bob, "general").await;
 
     let mut saw_alice = false;
@@ -550,6 +582,7 @@ async fn a_session_reaped_by_the_server_reappears_in_a_later_arrival_s_member_li
 async fn handshake(
     stream: &mut aloo::control::ControlEndpoint<TcpStream>,
     nickname: &str,
+    password: &str,
 ) -> aloo::proto::UserId {
     let hello: ServerMessage = stream.recv().await.unwrap().unwrap();
     let ServerMessage::Hello { control, .. } = hello else {
@@ -562,13 +595,16 @@ async fn handshake(
         .unwrap();
     stream.enable(keys);
     stream
-        .send(&ClientMessage::Auth(aloo::proto::AuthResponse::None))
+        .send(&ClientMessage::Auth {
+            nickname: nickname.to_string(),
+            password: password.to_string(),
+        })
         .await
         .unwrap();
-    let _auth: ServerMessage = stream.recv().await.unwrap().unwrap();
+    let result: ServerMessage = stream.recv().await.unwrap().unwrap();
+    assert!(matches!(result, ServerMessage::AuthResult { ok: true, .. }), "{result:?}");
     stream
         .send(&ClientMessage::Identify {
-            display_name: nickname.to_string(),
             public_key_der: vec![1, 2, 3],
             key_mode: aloo::proto::KeyMode::PqHybrid,
         })

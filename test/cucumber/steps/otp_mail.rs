@@ -20,11 +20,10 @@ use aloo::client::tui::ui::UiAction;
 use aloo::control::ControlEndpoint;
 use aloo::crypto::otp::{OtpMailSealed, mail_id_is_valid, new_mail_id, repad};
 use aloo::crypto::pq::{bundle_fingerprint, sign_mail, verify_mail};
-use aloo::proto::{
-    AuthKind, AuthResponse, ClientMessage, KeyMode, ServerMessage,
-};
-use aloo::server::AuthConfig;
+use aloo::proto::{ClientMessage, KeyMode, ServerMessage};
+use aloo::server::ServerOptions;
 use aloo::server::mail::{MailStore, StoredMail};
+use aloo::server::users_registry::UsersRegistry;
 
 use crate::world::{AlooWorld, pq_bundle_for};
 
@@ -300,11 +299,13 @@ async fn mail_server(w: &mut AlooWorld) {
     let mail_dir = w.temp_path("mail-server");
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let dir = mail_dir.clone();
+    let users = UsersRegistry::open_with_iterations(w.temp_path("mail-server-users"), 100).unwrap();
+    let options = ServerOptions::new(users.clone()).with_mail_dir(mail_dir.clone());
     tokio::spawn(async move {
-        let _ = aloo::server::serve_with_mail_dir(listener, AuthConfig::None, dir).await;
+        let _ = aloo::server::serve(listener, options).await;
     });
     w.addr = Some(addr);
+    w.server_users = Some(users);
     w.otp_mail_dir = Some(mail_dir);
 }
 
@@ -434,16 +435,28 @@ async fn reconnect_and_fetch(w: &mut AlooWorld, who: String) {
     let addr = w.addr.expect("server running");
     // The nickname frees asynchronously with the server noticing the
     // close - retry the whole handshake until it is granted again.
+    let password = w
+        .server_users
+        .as_ref()
+        .expect("server running")
+        .is_registered(&who)
+        .then(|| format!("pw-{who}"))
+        .expect("who should already be registered from connecting earlier");
     let mut granted = None;
     for _ in 0..100 {
         let mut stream = ControlEndpoint::new(TcpStream::connect(addr).await.unwrap());
-        let (auth, challenge) = stream
-            .client_handshake(None)
+        let _registration_open = stream
+            .client_handshake()
             .await
             .unwrap()
             .expect("server closed during handshake");
-        assert_eq!((auth, challenge), (AuthKind::None, None));
-        stream.send(&ClientMessage::Auth(AuthResponse::None)).await.unwrap();
+        stream
+            .send(&ClientMessage::Auth {
+                nickname: who.clone(),
+                password: password.clone(),
+            })
+            .await
+            .unwrap();
         let ServerMessage::AuthResult { ok: true, .. } =
             stream.recv().await.unwrap().unwrap()
         else {
@@ -451,7 +464,6 @@ async fn reconnect_and_fetch(w: &mut AlooWorld, who: String) {
         };
         stream
             .send(&ClientMessage::Identify {
-                display_name: who.clone(),
                 public_key_der: vec![],
                 key_mode: KeyMode::PqHybrid,
             })

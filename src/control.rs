@@ -18,26 +18,25 @@
 //!
 //! **Server authentication.** The server's offer is ephemeral, so it needs
 //! something long-lived to vouch for it or a man in the middle could simply
-//! substitute their own. When the deployment uses RSA auth (§5.3) the
-//! client already holds the server's public key out of band, so the server
-//! signs its offer and the client checks it - the same shape as a TLS
-//! handshake signing an ephemeral key exchange with a long-term identity.
-//! Without that key (`AuthKind::None`/`Password`) the channel is
-//! **encrypted but unauthenticated**: it defeats a passive observer, not an
-//! active man in the middle. That is a real limit and is stated as one
-//! rather than implied away.
+//! substitute their own. That vouching is not done at this layer: a
+//! deployment that wants it runs the control connection over TLS
+//! (`server_ssl=on`, `crate::server::ssl`), whose certificate is what the
+//! client checks before a single frame of this channel is exchanged. Over
+//! plain TCP the channel is **encrypted but unauthenticated**: it defeats
+//! a passive observer, not an active man in the middle. That is a real
+//! limit and is stated as one rather than implied away.
 //!
 //! Because the offer is per connection and thrown away with it, recording a
-//! session and later stealing the server's long-term key still does not
-//! decrypt it.
+//! session and later stealing the server's TLS key still does not decrypt
+//! it.
 
 use hkdf::Hkdf;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+use crate::crypto::CryptoError;
 use crate::crypto::pq::{PqEncapKeys, fresh_data_key, unwrap_key, wrap_key_for};
-use crate::crypto::{self, CryptoError};
 use crate::proto::{self, ProtoError, Result};
 
 /// HKDF labels for the two directions. Separate keys per direction so a
@@ -45,19 +44,12 @@ use crate::proto::{self, ProtoError, Result};
 const LABEL_C2S: &[u8] = b"aloo/control/v1/client-to-server";
 const LABEL_S2C: &[u8] = b"aloo/control/v1/server-to-client";
 
-/// What the server signs when it has a long-term key to sign with.
-const OFFER_DOMAIN: &[u8] = b"aloo/control/v1/offer";
-
-/// The server's ephemeral encryption keys for one connection, plus - when
-/// the deployment has a long-term server key - a signature over them.
+/// The server's ephemeral encryption keys for one connection. Nothing at
+/// this layer vouches for them (see the module doc): a deployment that
+/// needs the server authenticated runs the connection over TLS.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControlOffer {
     pub encap: PqEncapKeys,
-    /// RSA-PSS over `OFFER_DOMAIN ++ encoded(encap)`, made with the same
-    /// key clients already hold as their `server_key` (§5.3). `None` when
-    /// the server has no such key, in which case the channel is encrypted
-    /// but unauthenticated.
-    pub signature: Option<Vec<u8>>,
 }
 
 /// The client's reply: a secret transported to the server's offer.
@@ -68,49 +60,9 @@ pub struct ControlAccept {
     pub eph_x25519_pub: [u8; 32],
 }
 
-fn offer_commitment(encap: &PqEncapKeys) -> Result<Vec<u8>> {
-    let encoded = proto::encode(encap)?;
-    let mut v = Vec::with_capacity(OFFER_DOMAIN.len() + encoded.len());
-    v.extend_from_slice(OFFER_DOMAIN);
-    v.extend_from_slice(&encoded);
-    Ok(v)
-}
-
-/// Builds an offer, signing it if this server has a long-term key.
-pub fn make_offer(
-    encap: PqEncapKeys,
-    server_key: Option<&rsa::RsaPrivateKey>,
-) -> Result<ControlOffer> {
-    let signature = match server_key {
-        Some(key) => {
-            let commitment = offer_commitment(&encap)?;
-            Some(
-                crypto::sign(key, &commitment)
-                    .map_err(|e| ProtoError::Decode(e.to_string()))?,
-            )
-        }
-        None => None,
-    };
-    Ok(ControlOffer { encap, signature })
-}
-
-/// Checks an offer against the server key this client was configured with.
-///
-/// A client holding a server key **requires** a valid signature: an
-/// unsigned or badly-signed offer from a server it can authenticate is
-/// exactly what a man in the middle would produce. A client with no server
-/// key has nothing to check against and accepts the offer as-is.
-pub fn verify_offer(offer: &ControlOffer, server_key: Option<&rsa::RsaPublicKey>) -> bool {
-    let Some(key) = server_key else {
-        return true;
-    };
-    let Some(signature) = offer.signature.as_ref() else {
-        return false;
-    };
-    let Ok(commitment) = offer_commitment(&offer.encap) else {
-        return false;
-    };
-    crypto::verify(key, &commitment, signature)
+/// Builds the offer for one connection.
+pub fn make_offer(encap: PqEncapKeys) -> ControlOffer {
+    ControlOffer { encap }
 }
 
 /// Derives the two directional keys from the transported secret. Part of
@@ -380,32 +332,22 @@ impl<S: AsyncRead + AsyncWrite + Unpin> ControlEndpoint<S> {
     }
 
     /// Reads the server's `Hello`, turns the channel on, and hands back
-    /// what the caller still has to answer. After this returns, every
-    /// message in either direction is sealed.
-    ///
-    /// `server_key` is the client's out-of-band copy of the server's public
-    /// key, when it has one; the offer must then be signed by it.
-    pub async fn client_handshake(
-        &mut self,
-        server_key: Option<&rsa::RsaPublicKey>,
-    ) -> Result<Option<(proto::AuthKind, Option<Vec<u8>>)>> {
+    /// whether the server takes registrations - the one thing the caller
+    /// may still want to know before choosing between `Auth` and
+    /// `Register`. After this returns, every message in either direction
+    /// is sealed. `None` if the server closed before saying hello.
+    pub async fn client_handshake(&mut self) -> Result<Option<bool>> {
         let Some(proto::ServerMessage::Hello {
-            auth,
-            challenge,
+            registration_open,
             control,
         }) = self.recv().await?
         else {
             return Ok(None);
         };
-        if !verify_offer(&control, server_key) {
-            return Err(ProtoError::Decode(
-                "server could not prove it is the one this key belongs to".into(),
-            ));
-        }
         let (accept, keys) = accept_offer(&control)?;
         self.send(&proto::ClientMessage::SecureChannel(accept)).await?;
         self.enable(keys);
-        Ok(Some((auth, challenge)))
+        Ok(Some(registration_open))
     }
 
     pub fn into_inner(self) -> S {
