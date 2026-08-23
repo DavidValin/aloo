@@ -90,9 +90,9 @@ async fn spawn_client(rendezvous: SocketAddr) -> Client {
 fn every_frequencys_slot_grid_restarts_at_the_top_of_the_hour() {
     for minutes in aloo::settings::PUNCH_FREQUENCIES {
         let freq = PunchFrequency::parse(&if minutes == 60 {
-            "1h".to_string()
+            "every_1h".to_string()
         } else {
-            format!("{minutes}m")
+            format!("every_{minutes}m")
         })
         .unwrap();
         // O'clock is always slot 0, and the last second of the hour is
@@ -114,7 +114,7 @@ fn every_frequencys_slot_grid_restarts_at_the_top_of_the_hour() {
 /// @requirement TB-221
 #[test]
 fn an_interval_that_does_not_divide_the_hour_still_restarts_at_oclock() {
-    let freq = PunchFrequency::parse("55m").unwrap();
+    let freq = PunchFrequency::parse("every_55m").unwrap();
     // :00 and :55 are its only two slots; :55 lasts until the hour turns
     // over rather than a third slot opening at 1h50m.
     assert_eq!(freq.slot_of_hour(0), 0);
@@ -155,9 +155,9 @@ async fn two_peers_punch_a_link_from_the_schedule_alone_and_carry_a_message() {
     // ever handed the other's candidates.
     alice
         .link
-        .configure_direct_punch("alice".into(), vec![target("bob", bob.port, "1m")], 30);
+        .configure_direct_punch("alice".into(), vec![target("bob", bob.port, "every_1m")], 30);
     bob.link
-        .configure_direct_punch("bob".into(), vec![target("alice", alice.port, "1m")], 30);
+        .configure_direct_punch("bob".into(), vec![target("alice", alice.port, "every_1m")], 30);
 
     let bob_as_alice_sees_him = direct_peer_id("bob");
     let alice_as_bob_sees_her = direct_peer_id("alice");
@@ -179,7 +179,7 @@ async fn two_peers_punch_a_link_from_the_schedule_alone_and_carry_a_message() {
             Some((addr, dgram)) = alice.raw_rx.recv() => alice.link.on_inbound(addr, dgram),
             Some((addr, dgram)) = bob.raw_rx.recv() => bob.link.on_inbound(addr, dgram),
             _ = tokio::time::sleep(Duration::from_millis(20)) => {
-                // Second 60 is the next 1m slot after the 30 both were
+                // Second 60 is the next every_1m slot after the 30 both were
                 // configured at, so this is the boundary firing.
                 alice.link.tick_with_clock_at(Instant::now(), 60);
                 bob.link.tick_with_clock_at(Instant::now(), 60);
@@ -229,9 +229,9 @@ async fn a_slot_arriving_on_a_link_that_is_already_up_does_not_punch_again() {
     let mut bob = spawn_client(rendezvous).await;
     alice
         .link
-        .configure_direct_punch("alice".into(), vec![target("bob", bob.port, "1m")], 30);
+        .configure_direct_punch("alice".into(), vec![target("bob", bob.port, "every_1m")], 30);
     bob.link
-        .configure_direct_punch("bob".into(), vec![target("alice", alice.port, "1m")], 30);
+        .configure_direct_punch("bob".into(), vec![target("alice", alice.port, "every_1m")], 30);
     let bob_id = direct_peer_id("bob");
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -274,7 +274,7 @@ async fn an_attempt_probes_for_the_punch_window_and_is_then_abandoned_until_the_
     };
     alice
         .link
-        .configure_direct_punch("bob".into(), vec![target("bob", dead_port, "1m")], 30);
+        .configure_direct_punch("bob".into(), vec![target("bob", dead_port, "every_1m")], 30);
 
     let start = Instant::now();
     alice.link.tick_with_clock_at(start, 60);
@@ -312,9 +312,9 @@ async fn a_direct_only_link_that_drops_is_reconnected_up_to_the_reconnect_budget
     let mut bob = spawn_client(rendezvous).await;
     alice
         .link
-        .configure_direct_punch("alice".into(), vec![target("bob", bob.port, "1m")], 30);
+        .configure_direct_punch("alice".into(), vec![target("bob", bob.port, "every_1m")], 30);
     bob.link
-        .configure_direct_punch("bob".into(), vec![target("alice", alice.port, "1m")], 30);
+        .configure_direct_punch("bob".into(), vec![target("alice", alice.port, "every_1m")], 30);
     let bob_id = direct_peer_id("bob");
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -379,7 +379,7 @@ async fn a_peer_being_punched_directly_is_never_also_signalled_through_the_serve
     };
     alice
         .link
-        .configure_direct_punch("alice".into(), vec![target("bob", dead_port, "1m")], 30);
+        .configure_direct_punch("alice".into(), vec![target("bob", dead_port, "every_1m")], 30);
     let bob_id = direct_peer_id("bob");
     alice.link.tick_with_clock_at(Instant::now(), 60);
 
@@ -419,7 +419,7 @@ async fn a_direct_target_moves_onto_the_user_id_the_server_gives_it() {
     let mut alice = spawn_client(rendezvous).await;
     alice
         .link
-        .configure_direct_punch("alice".into(), vec![target("bob", 65000, "1h")], 30);
+        .configure_direct_punch("alice".into(), vec![target("bob", 65000, "every_1h")], 30);
     assert_eq!(alice.link.direct_peer("bob"), Some(direct_peer_id("bob")));
 
     // The same person, once a server names them, is one peer with one link
@@ -440,7 +440,7 @@ async fn a_direct_ping_naming_a_nickname_that_is_not_configured_is_ignored() {
     let mut alice = spawn_client(rendezvous).await;
     alice
         .link
-        .configure_direct_punch("alice".into(), vec![target("bob", 65000, "1m")], 30);
+        .configure_direct_punch("alice".into(), vec![target("bob", 65000, "every_1m")], 30);
 
     let stranger: SocketAddr = "127.0.0.1:65001".parse().unwrap();
     alice.link.on_datagram(
@@ -475,7 +475,7 @@ async fn a_peers_probe_is_answered_and_opens_this_sides_attempt_too() {
     let bob_addr = bob_socket.local_addr().unwrap();
     alice.link.configure_direct_punch(
         "alice".into(),
-        vec![target("bob", bob_addr.port(), "1h")],
+        vec![target("bob", bob_addr.port(), "every_1h")],
         30,
     );
     // No slot is due for an hourly target, so alice is idle - it is bob's
@@ -534,7 +534,7 @@ async fn probing_really_continues_for_the_whole_window_not_just_one_link_attempt
     let bob_addr = bob_socket.local_addr().unwrap();
     alice.link.configure_direct_punch(
         "alice".into(),
-        vec![target("bob", bob_addr.port(), "1m")],
+        vec![target("bob", bob_addr.port(), "every_1m")],
         30,
     );
 
@@ -599,9 +599,9 @@ async fn a_peer_who_joins_the_server_after_a_direct_link_is_up_gets_only_one_lin
     let mut bob = spawn_client(rendezvous).await;
     alice
         .link
-        .configure_direct_punch("alice".into(), vec![target("bob", bob.port, "1m")], 30);
+        .configure_direct_punch("alice".into(), vec![target("bob", bob.port, "every_1m")], 30);
     bob.link
-        .configure_direct_punch("bob".into(), vec![target("alice", alice.port, "1m")], 30);
+        .configure_direct_punch("bob".into(), vec![target("alice", alice.port, "every_1m")], 30);
 
     let synthetic = direct_peer_id("bob");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -732,7 +732,7 @@ async fn a_direct_targets_nickname_and_live_peers_are_queryable() {
     let mut alice = spawn_client(rendezvous).await;
     alice
         .link
-        .configure_direct_punch("alice".into(), vec![target("bob", 65000, "1h")], 30);
+        .configure_direct_punch("alice".into(), vec![target("bob", 65000, "every_1h")], 30);
 
     let bob = direct_peer_id("bob");
     assert_eq!(alice.link.direct_nickname_of(bob).as_deref(), Some("bob"));
@@ -743,7 +743,7 @@ async fn a_direct_targets_nickname_and_live_peers_are_queryable() {
 
 // ---- Running with no server at all (--no-server) ------------------------
 
-/// @requirement AC-218
+/// @requirement AC-218, TB-245
 #[test]
 fn server_state_distinguishes_no_server_from_an_unreachable_one() {
     use aloo::client::session::ServerState;
@@ -831,10 +831,10 @@ async fn listing_a_peer_who_has_not_listed_you_opens_no_link_either_way() {
 
     // bob lists peter. peter lists someone else entirely.
     bob.link
-        .configure_direct_punch("bob".into(), vec![target("peter", peter.port, "1m")], 30);
+        .configure_direct_punch("bob".into(), vec![target("peter", peter.port, "every_1m")], 30);
     peter
         .link
-        .configure_direct_punch("peter".into(), vec![target("omar", 65000, "1m")], 30);
+        .configure_direct_punch("peter".into(), vec![target("omar", 65000, "every_1m")], 30);
 
     let peter_as_bob_sees_him = direct_peer_id("peter");
     let bob_as_peter_sees_him = direct_peer_id("bob");

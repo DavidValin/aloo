@@ -377,8 +377,8 @@ fn direct_punch_on_reads_one_target_per_line() {
     std::fs::write(
         &path,
         "direct_punch=on\n\
-         direct_punch_to=bob,bobpublic.com,1min\n\
-         direct_punch_to=marco,marcohost.com,1h\n",
+         direct_punch_to=bob,bobpublic.com,every_1min\n\
+         direct_punch_to=marco,marcohost.com,every_1h\n",
     )
     .unwrap();
     let settings = Settings::load_or_create(&path).unwrap();
@@ -402,12 +402,12 @@ fn direct_punch_on_reads_one_target_per_line() {
 #[test]
 fn a_target_host_may_be_ipv4_ipv6_or_a_name_and_may_carry_its_own_port() {
     for (value, host, port) in [
-        ("bob,203.0.113.9,5m", "203.0.113.9", DEFAULT_DIRECT_PUNCH_PORT),
-        ("bob,203.0.113.9:9000,5m", "203.0.113.9", 9000),
-        ("bob,2001:db8::1,5m", "2001:db8::1", DEFAULT_DIRECT_PUNCH_PORT),
-        ("bob,[2001:db8::1]:9000,5m", "2001:db8::1", 9000),
-        ("bob,bob-public.example.com,5m", "bob-public.example.com", DEFAULT_DIRECT_PUNCH_PORT),
-        ("bob,bobpublic.com:9000,5m", "bobpublic.com", 9000),
+        ("bob,203.0.113.9,every_5m", "203.0.113.9", DEFAULT_DIRECT_PUNCH_PORT),
+        ("bob,203.0.113.9:9000,every_5m", "203.0.113.9", 9000),
+        ("bob,2001:db8::1,every_5m", "2001:db8::1", DEFAULT_DIRECT_PUNCH_PORT),
+        ("bob,[2001:db8::1]:9000,every_5m", "2001:db8::1", 9000),
+        ("bob,bob-public.example.com,every_5m", "bob-public.example.com", DEFAULT_DIRECT_PUNCH_PORT),
+        ("bob,bobpublic.com:9000,every_5m", "bobpublic.com", 9000),
     ] {
         let target = DirectPunchTarget::parse(value).unwrap_or_else(|e| panic!("{value:?}: {e}"));
         assert_eq!(target.host, host, "{value:?}");
@@ -420,9 +420,9 @@ fn a_target_host_may_be_ipv4_ipv6_or_a_name_and_may_carry_its_own_port() {
 fn every_documented_frequency_parses_and_nothing_else_does() {
     for minutes in aloo::settings::PUNCH_FREQUENCIES {
         let spelling = if minutes == 60 {
-            "1h".to_string()
+            "every_1h".to_string()
         } else {
-            format!("{minutes}m")
+            format!("every_{minutes}m")
         };
         assert_eq!(
             PunchFrequency::parse(&spelling).unwrap().minutes(),
@@ -430,10 +430,13 @@ fn every_documented_frequency_parses_and_nothing_else_does() {
             "{spelling}"
         );
     }
-    // `1min` is the same thing spelled the way the settings file's own
-    // example spells it.
-    assert_eq!(PunchFrequency::parse("1min").unwrap().minutes(), 1);
-    for bad in ["", "2m", "0m", "90m", "2h", "1s", "m", "1", "sometimes"] {
+    // `every_1min` is the same thing spelled the way the settings file's
+    // own example spells it.
+    assert_eq!(PunchFrequency::parse("every_1min").unwrap().minutes(), 1);
+    for bad in [
+        "", "every_2m", "every_0m", "every_90m", "every_2h", "every_1s", "every_m", "every_",
+        "1m", "1h", "m", "1", "sometimes",
+    ] {
         assert!(
             PunchFrequency::parse(bad).is_err(),
             "{bad:?} should not be an accepted frequency"
@@ -448,11 +451,11 @@ fn a_malformed_target_is_reported_rather_than_silently_dropped() {
     std::fs::write(
         &path,
         "direct_punch=on\n\
-         direct_punch_to=bob,bobpublic.com,1m\n\
-         direct_punch_to=carol,carolhost.com,3m\n\
-         direct_punch_to=dave,not a host,1h\n\
+         direct_punch_to=bob,bobpublic.com,every_1m\n\
+         direct_punch_to=carol,carolhost.com,every_3m\n\
+         direct_punch_to=dave,not a host,every_1h\n\
          direct_punch_to=justanickname\n\
-         direct_punch_to=,nohost.com,1h\n",
+         direct_punch_to=,nohost.com,every_1h\n",
     )
     .unwrap();
     let settings = Settings::load_or_create(&path).unwrap();
@@ -467,10 +470,10 @@ fn a_malformed_target_is_reported_rather_than_silently_dropped() {
     assert_eq!(
         bad,
         vec![
-            "carol,carolhost.com,3m",
-            "dave,not a host,1h",
+            "carol,carolhost.com,every_3m",
+            "dave,not a host,every_1h",
             "justanickname",
-            ",nohost.com,1h",
+            ",nohost.com,every_1h",
         ]
     );
     // Each one says why, so a typo is fixable without guessing.
@@ -488,8 +491,8 @@ fn direct_punch_settings_survive_a_save_and_load_round_trip() {
         direct_punch: true,
         direct_punch_port: 9100,
         direct_punch_to: vec![
-            DirectPunchTarget::parse("bob,bobpublic.com,1m").unwrap(),
-            DirectPunchTarget::parse("marco,[2001:db8::1]:9000,1h").unwrap(),
+            DirectPunchTarget::parse("bob,bobpublic.com,every_1m").unwrap(),
+            DirectPunchTarget::parse("marco,[2001:db8::1]:9000,every_1h").unwrap(),
         ],
         ..Settings::default()
     };

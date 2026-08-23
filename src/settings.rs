@@ -9,8 +9,10 @@
 //!
 //! Also holds the serverless direct-punch configuration (`direct_punch`,
 //! `direct_punch_port`, and one `direct_punch_to` line per peer) that
-//! `crate::client::p2p`'s scheduler runs off - see `docs/PROTOCOL.md`
-//! §7.1.5.
+//! `crate::client::p2p`'s scheduler runs off, and the optional No-IP
+//! dynamic DNS updater alongside it (`noip_when_no_server_and_direct_punch_is_active`,
+//! `noip_hostname`, `noip_username`, `noip_password`, `crate::client::noip`)
+//! - see `docs/PROTOCOL.md` §7.1.5.
 //!
 //! Also holds the server's configuration: its last-used `--bind`/`--port`
 //! (written every time `--server` starts, so a crashed server relaunched
@@ -104,25 +106,35 @@ pub struct PunchFrequency(u32);
 pub const PUNCH_FREQUENCIES: [u32; 13] = [1, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60];
 
 impl PunchFrequency {
-    /// Parses `1m`/`5m`/.../`55m`/`1h`. `min` is accepted wherever `m` is
-    /// (`1min` reads more naturally in a hand-edited file, and the two
-    /// cannot be confused - there is no unit here that starts with `m` and
-    /// isn't minutes).
+    /// Parses `every_1m`/`every_5m`/.../`every_55m`/`every_1h`. The
+    /// `every_` prefix makes a `direct_punch_to` line read unambiguously
+    /// at a glance - it is not just a bare number-and-letter that could be
+    /// mistaken for a port or something else. `min`/`hour` are accepted
+    /// wherever `m`/`h` are (`every_1min` reads more naturally in a
+    /// hand-edited file, and the two cannot be confused - there is no unit
+    /// here that starts with `m` and isn't minutes).
     pub fn parse(s: &str) -> Result<Self, String> {
         let s = s.trim().to_ascii_lowercase();
-        let minutes = if let Some(n) = s.strip_suffix("min").or_else(|| s.strip_suffix('m')) {
+        let err = || {
+            format!(
+                "not a valid frequency: {s:?} - use one of every_1m, every_5m, every_10m, \
+                 every_15m, every_20m, every_25m, every_30m, every_35m, every_40m, every_45m, \
+                 every_50m, every_55m, every_1h"
+            )
+        };
+        let Some(rest) = s.strip_prefix("every_") else {
+            return Err(err());
+        };
+        let minutes = if let Some(n) = rest.strip_suffix("min").or_else(|| rest.strip_suffix('m')) {
             n.parse::<u32>().ok()
-        } else if let Some(n) = s.strip_suffix("hour").or_else(|| s.strip_suffix('h')) {
+        } else if let Some(n) = rest.strip_suffix("hour").or_else(|| rest.strip_suffix('h')) {
             n.parse::<u32>().ok().and_then(|h| h.checked_mul(60))
         } else {
             None
         };
         match minutes {
             Some(m) if PUNCH_FREQUENCIES.contains(&m) => Ok(Self(m)),
-            _ => Err(format!(
-                "not a valid frequency: {s:?} - use one of 1m, 5m, 10m, 15m, 20m, \
-                 25m, 30m, 35m, 40m, 45m, 50m, 55m, 1h"
-            )),
+            _ => Err(err()),
         }
     }
 
@@ -137,7 +149,7 @@ impl PunchFrequency {
 
     /// Which slot of the current hour `second_of_hour` falls in. The grid
     /// restarts at every o'clock, which is what makes an interval that does
-    /// not divide 60 (`55m`) well defined: its slots are :00 and :55, and
+    /// not divide 60 (`every_55m`) well defined: its slots are :00 and :55, and
     /// the next one after :55 is the *next* hour's :00, not :50 past it.
     pub fn slot_of_hour(self, second_of_hour: u64) -> u64 {
         second_of_hour / self.seconds()
@@ -147,9 +159,9 @@ impl PunchFrequency {
 impl std::fmt::Display for PunchFrequency {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.0 == 60 {
-            write!(f, "1h")
+            write!(f, "every_1h")
         } else {
-            write!(f, "{}m", self.0)
+            write!(f, "every_{}m", self.0)
         }
     }
 }
@@ -379,6 +391,23 @@ pub struct Settings {
     /// One accumulating key per channel, like `muted_voice` and
     /// `direct_punch_to` above.
     pub direct_punch_channels: Vec<String>,
+    /// Runs `client::noip::run` in the background whenever there is no
+    /// server to hear from - `--no-server`, or the server connection has
+    /// been lost - and `direct_punch` names at least one target, so a
+    /// peer's `direct_punch_to` line naming this machine's No-IP hostname
+    /// keeps resolving to wherever it currently is. Off by default:
+    /// turning it on sends this machine's No-IP password out periodically.
+    pub noip_when_no_server_and_direct_punch_is_active: bool,
+    /// The No-IP hostname to keep updated
+    /// (`https://dynupdate.no-ip.com/nic/update?hostname=<noip_hostname>`),
+    /// and the account credentials that request authenticates with. Empty
+    /// by default like the two SSL paths above; unlike the SMTP settings
+    /// these are never all-or-nothing bundled into an `Option` because a
+    /// half-filled set is exactly as harmless as an unset one - the
+    /// updater simply never fires (`client::noip::NoipConfig::from_settings`).
+    pub noip_hostname: String,
+    pub noip_username: String,
+    pub noip_password: String,
     // -----------------------------------------------------------------
     // The last connection made from the connect popup
     // (`client::connect::run_client_inner`, docs/SPEC.md "Not connected UI")
@@ -455,6 +484,10 @@ impl Default for Settings {
             direct_punch_port: DEFAULT_DIRECT_PUNCH_PORT,
             direct_punch_to: Vec::new(),
             direct_punch_channels: Vec::new(),
+            noip_when_no_server_and_direct_punch_is_active: false,
+            noip_hostname: String::new(),
+            noip_username: String::new(),
+            noip_password: String::new(),
             connect_host: None,
             connect_port: None,
             connect_nickname: None,
@@ -647,6 +680,18 @@ impl Settings {
                         .direct_punch_invalid
                         .push((value.to_string(), reason)),
                 },
+                "noip_when_no_server_and_direct_punch_is_active" => {
+                    settings.noip_when_no_server_and_direct_punch_is_active = parse_switch(value)
+                }
+                "noip_hostname" if !value.is_empty() => {
+                    settings.noip_hostname = value.to_string()
+                }
+                "noip_username" if !value.is_empty() => {
+                    settings.noip_username = value.to_string()
+                }
+                "noip_password" if !value.is_empty() => {
+                    settings.noip_password = value.to_string()
+                }
                 _ => {}
             }
         }
@@ -750,6 +795,13 @@ impl Settings {
         for channel in &self.direct_punch_channels {
             contents.push_str(&format!("direct_punch_channel={channel}\n"));
         }
+        contents.push_str(&format!(
+            "noip_when_no_server_and_direct_punch_is_active={}\nnoip_hostname={}\nnoip_username={}\nnoip_password={}\n",
+            switch(self.noip_when_no_server_and_direct_punch_is_active),
+            self.noip_hostname,
+            self.noip_username,
+            self.noip_password,
+        ));
         // Written by hand rather than through `optional` above: that
         // closure holds a mutable borrow of `contents` for as long as it
         // is alive, and everything between it and here writes directly.

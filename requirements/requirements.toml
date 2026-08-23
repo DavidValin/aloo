@@ -2660,7 +2660,7 @@ evidence = "docs/SPEC.md 'Direct punch settings'; src/settings.rs Settings::dire
 
 [[user_story.technical_behavior]]
 id = "TB-221"
-description = "The slot grid is computed from the UTC second of the hour, and restarts at every o'clock rather than running continuously - which is what makes an interval that does not divide 60 (55m) well defined, and what keeps two peers in time zones with fractional-hour offsets on the same grid. A client started mid-slot waits for the next boundary rather than probing immediately, since a probe at any moment its peer has no reason to be probing back is wasted."
+description = "The slot grid is computed from the UTC second of the hour, and restarts at every o'clock rather than running continuously - which is what makes an interval that does not divide 60 (every_55m) well defined, and what keeps two peers in time zones with fractional-hour offsets on the same grid. A client started mid-slot waits for the next boundary rather than probing immediately, since a probe at any moment its peer has no reason to be probing back is wasted."
 evidence = "docs/PROTOCOL.md 7.1.5; src/settings.rs PunchFrequency::slot_of_hour; src/client/p2p.rs utc_second_of_hour, PeerLinkManager::configure_direct_punch (last_slot seeding), direct_tick; tests every_frequencys_slot_grid_restarts_at_the_top_of_the_hour, an_interval_that_does_not_divide_the_hour_still_restarts_at_oclock, the_slot_clock_is_the_utc_second_of_the_hour"
 
 [[user_story.technical_behavior]]
@@ -2717,6 +2717,26 @@ evidence = "docs/PROTOCOL.md 13.10, 7.1.5; src/p2p_proto.rs P2pPayload::KeyRotat
 id = "AC-221"
 description = "A daemon can be started with no server at all: --no-server lifts the host requirement that every other start is held to, and is persisted like every other daemon field so a bare `aloo --daemon` at the next boot comes back serverless rather than failing for want of a host it never had. A serverless DM focus is given no discovery channel - the hall exists so a focus has somewhere to watch for presence, and with no server there is no presence and no hall to join, so adding one would only produce a tab that can never fill. The channels such a daemon was asked to join are driven at startup rather than off a ChannelList that will never arrive, and go through the same refusal gate every other action does, so --channel is never silently ignored on the one start where nobody is watching."
 evidence = "docs/SPEC.md 'Running without a server'; README.md; src/client/daemon.rs DaemonConfig::resolve (host fallback, discovery-channel guard, no_server), DaemonConfig::persist, run's serverless branch; src/settings.rs daemon_no_server; src/client/session.rs request_daemon_joins and its serverless trigger; tests no_server_lifts_the_host_requirement, a_serverless_daemon_comes_back_serverless_after_a_restart, a_serverless_dm_focus_does_not_get_a_discovery_channel, and end to end against a real session in test/daemon_session_test.rs (a_serverless_daemon_shows_its_configured_channel_and_waits_for_peers, a_serverless_daemon_joins_the_channel_it_was_given, a_channel_that_is_not_configured_is_refused_with_a_reason)"
+
+[[user_story.acceptance_criteria]]
+id = "AC-272"
+description = "~/.aloo/settings accepts noip_when_no_server_and_direct_punch_is_active=on/off plus noip_hostname/noip_username/noip_password, all four off/empty by default and surviving a save/load round trip. A usable configuration needs all three of the latter filled in - a toggle left on with any of them empty, or with direct_punch naming no target, is reported once at session start and the updater never runs."
+evidence = "docs/SPEC.md 'Direct punch settings' (No-IP updates); README.md 'Direct punching'; src/settings.rs Settings::parse/save (noip_*); src/client/noip.rs NoipConfig::from_settings; src/client/session.rs run_connected_session's noip_config resolution (the two log_warn branches); tests noip_settings_default_off_and_empty, noip_settings_round_trip_through_save_and_load, noip_config_from_settings_requires_all_three_fields"
+
+[[user_story.acceptance_criteria]]
+id = "AC-274"
+description = "One No-IP update is an HTTP GET to https://dynupdate.no-ip.com/nic/update?hostname=<noip_hostname>, HTTP Basic-authenticated with noip_username/noip_password. No-IP reports its own outcome in the response body of an ordinary 200 - good/nochg on success, a documented failure code otherwise - so only a non-200 exchange (a transport or proxy failure, not a No-IP-level refusal) is treated as an error by the client itself; a body that is not good/nochg is logged rather than retried early, since the next scheduled fire is only minutes away regardless."
+evidence = "docs/PROTOCOL.md 7.1.5 (No-IP updates); src/client/noip.rs build_request, parse_response, update_once, run; tests build_request_carries_the_hostname_and_the_basic_auth_header, parse_response_returns_the_trimmed_body_on_200, parse_response_rejects_a_non_200_status, parse_response_rejects_an_empty_response"
+
+[[user_story.technical_behavior]]
+id = "TB-245"
+description = "The No-IP updater is started and stopped to track whether there is a server to hear from, not merely whether its own setting is on: it runs while --no-server or the server connection is lost and a usable configuration exists, and is torn down the moment the server is reachable again - so its credentials only ever leave the machine while a peer could actually need this side's address to reach it directly."
+evidence = "docs/PROTOCOL.md 7.1.5 (No-IP updates); src/client/session.rs SessionState::sync_noip_job, handle_server_event's Lost arm, on_server_reconnected, ServerState::is_absent; tests server_state_distinguishes_no_server_from_an_unreachable_one, noip_config_from_settings_requires_all_three_fields"
+
+[[user_story.technical_behavior]]
+id = "TB-246"
+description = "The updater fires once as soon as it starts, then every 5 or 6 minutes alternately, forever - never a flat 5.5-minute period, since 330 seconds is not a multiple of 60 and so cannot land on the same wall-clock second every time on its own. Alternating a 5-minute gap with a 6-minute one is what keeps every single fire on second 50 of its minute while still averaging exactly 5.5 minutes over every pair of them - landing there specifically so the update completes before the direct-punch slot grid's own boundaries, which always fall on second 0 of some minute."
+evidence = "docs/PROTOCOL.md 7.1.5 (No-IP updates); src/client/noip.rs NOIP_SECOND_OF_MINUTE, NOIP_GAP_SHORT, NOIP_GAP_LONG, seconds_until_next_noip_mark, run; tests seconds_until_next_noip_mark_computes_the_gap_to_the_next_mark, the_two_gaps_average_five_and_a_half_minutes_and_stay_on_the_mark"
 
 
 [[user_story]]

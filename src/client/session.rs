@@ -347,6 +347,15 @@ pub struct SessionState {
     /// Where a spawned `DirectResolve` lookup hands its answer back to the
     /// select loop (`docs/PROTOCOL.md` §7.1.5).
     pub(crate) direct_resolved_tx: tokio::sync::mpsc::UnboundedSender<(String, Option<SocketAddr>)>,
+    /// The No-IP job's configuration, resolved once at session start from
+    /// settings (`client::noip::NoipConfig::from_settings`) - `None` when
+    /// the feature is off or unusable, in which case `noip_task` never
+    /// runs regardless of `server`. See `sync_noip_job`.
+    pub(crate) noip_config: Option<crate::client::noip::NoipConfig>,
+    /// The running updater, present only while `server.is_absent()` and
+    /// `noip_config` is `Some` - started and stopped by `sync_noip_job` at
+    /// every server-state transition.
+    pub(crate) noip_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// `run_connected_session` for a daemon: no terminal, a plan, and the
@@ -473,6 +482,27 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
     for (line, reason) in &settings.direct_punch_invalid {
         crate::log_warn!("ignoring direct_punch_to={line}: {reason}");
     }
+    // The No-IP updater (`client::noip`, docs/PROTOCOL.md §7.1.5) only
+    // ever matters while direct punch has somewhere to send it - resolved
+    // once here from the same settings snapshot, so `sync_noip_job` below
+    // has nothing left to do but watch `session.server`.
+    let noip_config = if settings.noip_when_no_server_and_direct_punch_is_active {
+        if !settings.direct_punch || settings.direct_punch_to.is_empty() {
+            crate::log_warn!(
+                "noip_when_no_server_and_direct_punch_is_active is on but direct_punch names no target; the No-IP updater will not run"
+            );
+            None
+        } else {
+            crate::client::noip::NoipConfig::from_settings(&settings).or_else(|| {
+                crate::log_warn!(
+                    "noip_when_no_server_and_direct_punch_is_active is on but noip_hostname/noip_username/noip_password are not all set; the No-IP updater will not run"
+                );
+                None
+            })
+        }
+    } else {
+        None
+    };
     let (direct_resolved_tx, mut direct_resolved_rx) =
         tokio::sync::mpsc::unbounded_channel::<(String, Option<SocketAddr>)>();
 
@@ -634,7 +664,10 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
         viewer_attached: !is_daemon,
         announced_online: std::collections::HashSet::new(),
         daemon_awaiting_otp: None,
+        noip_config,
+        noip_task: None,
     };
+    session.sync_noip_job();
 
     // Anything still in `~/.aloo/otp/.tmp/` is key material some earlier
     // run was still producing or still receiving when it stopped - a
@@ -1658,6 +1691,7 @@ async fn handle_server_event(
         ServerEvent::Lost => {
             session.server = ServerState::Unreachable;
             session.server_retry = None;
+            session.sync_noip_job();
             ui_state.set_server_link(ServerLinkState::Reconnecting);
             ui_state.push_status_notice(
                 "the server connection was lost - direct links are unaffected".to_string(),
@@ -1716,6 +1750,7 @@ async fn on_server_reconnected(
 ) -> proto::Result<()> {
     session.server = ServerState::Connected;
     session.server_retry = None;
+    session.sync_noip_job();
     ui_state.set_server_link(ServerLinkState::Connected);
 
     let stale: Vec<UserId> = ui_state
@@ -3556,6 +3591,30 @@ pub struct TestSessionSpec {
 }
 
 impl SessionState {
+    /// Starts or stops the No-IP updater to match `server` and
+    /// `noip_config` - called once at session start and again on every
+    /// `ServerEvent::Lost`/`Reconnected` transition, the only two things
+    /// that can change whether it belongs running (`noip_config` itself is
+    /// fixed for the life of the session). A job already in the state it
+    /// should be in is left alone rather than restarted.
+    pub(crate) fn sync_noip_job(&mut self) {
+        let Some(config) = &self.noip_config else {
+            return;
+        };
+        let wanted = self.server.is_absent();
+        match (&self.noip_task, wanted) {
+            (None, true) => {
+                self.noip_task = Some(tokio::spawn(crate::client::noip::run(config.clone())));
+            }
+            (Some(_), false) => {
+                if let Some(handle) = self.noip_task.take() {
+                    handle.abort();
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// The session's direct transport (`crate::client::p2p`) - exposed for
     /// tests, which need it to open a link a receive path can then answer
     /// over, and to read back what that path decided to send
@@ -3730,6 +3789,8 @@ impl SessionState {
             viewer_attached: true,
             announced_online: std::collections::HashSet::new(),
             daemon_awaiting_otp: None,
+            noip_config: None,
+            noip_task: None,
         }
     }
 }

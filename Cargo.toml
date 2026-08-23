@@ -267,6 +267,10 @@ name = "direct_punch_test"
 path = "test/direct_punch_test.rs"
 
 [[test]]
+name = "noip_test"
+path = "test/noip_test.rs"
+
+[[test]]
 name = "daemon_session_test"
 path = "test/daemon_session_test.rs"
 

@@ -410,13 +410,13 @@ Add this to `~/.aloo/settings` (both of you — this only works if you've each l
 
 ```
 direct_punch=on
-direct_punch_to=bob,bobpublic.com,1m
-direct_punch_to=marco,marcohost.com,1h
+direct_punch_to=bob,bobpublic.com,every_1m
+direct_punch_to=marco,marcohost.com,every_1h
 ```
 
-One line per person: their nickname, where their client is (an IPv4 address, an IPv6 address, or a hostname — add `:9000` for a port other than the default 7879), and how often to try. The frequency can be `1m`, `5m`, `10m`, `15m`, `20m`, `25m`, `30m`, `35m`, `40m`, `45m`, `50m`, `55m` or `1h`.
+One line per person: their nickname, where their client is (an IPv4 address, an IPv6 address, or a hostname — add `:9000` for a port other than the default 7879), and how often to try. The frequency can be `every_1m`, `every_5m`, `every_10m`, `every_15m`, `every_20m`, `every_25m`, `every_30m`, `every_35m`, `every_40m`, `every_45m`, `every_50m`, `every_55m` or `every_1h`.
 
-Every schedule restarts at the top of the hour — `1m` tries at :00, :01, :02, and so on; `1h` at :00 only — which is exactly what makes it work: you're both trying at the same moments, so your two routers open up to each other at the same time. That's also why you both need the same frequency for a given person.
+Every schedule restarts at the top of the hour — `every_1m` tries at :00, :01, :02, and so on; `every_1h` at :00 only — which is exactly what makes it work: you're both trying at the same moments, so your two routers open up to each other at the same time. That's also why you both need the same frequency for a given person.
 
 Each attempt keeps trying for 30 seconds. Once you're connected, aloo leaves it alone and stops trying — until the connection drops, at which point it re-punches straight away (up to 5 times) if there's no server that could do it instead. You'll never end up with two connections to the same person; direct or server-arranged, there's only ever one.
 
@@ -424,7 +424,18 @@ Once a link is up, the two of you swap a sealed note saying which channels you'r
 
 Opening that note is also what proves who they are — it's checked against the key you already pinned for that nickname, so a punch on its own registers nobody and a stranger who finds your port can't pose as a friend. It does mean this only works with people you've talked to through a server at least once (that's where their key came from), on the default `pq_hybrid` identity.
 
-Two caveats. **Your client listens on UDP port 7879 while this is on**, so if you're behind NAT that port has to reach you — forward it, or set `direct_punch_port` to one you have. And **this opens a path, not a conversation**: aloo still needs to have learned that person's keys through a server at some point to encrypt anything to them.
+Two caveats. **Your client punches out from UDP port 7879 while this is on** — it's actively pinging the other side from that port, not just passively listening on it, and that's what gets through NAT with nothing to configure on your router: both of you punching at the same moment is what opens the path, not a forwarding rule. It can still fail against a stricter (symmetric) NAT or firewall, in which case forwarding that port — or picking a `direct_punch_port` you can forward — is the fallback. And **this opens a path, not a conversation**: aloo still needs to have learned that person's keys through a server at some point to encrypt anything to them.
+
+**If your own address moves** (an ordinary home connection) or you connect from different locations, give a No-IP hostname to the peers punching at you instead of a raw address, and let aloo keep it updated:
+
+```
+noip_when_no_server_and_direct_punch_is_active=on
+noip_hostname=myhouse.ddns.example
+noip_username=bob
+noip_password=haa
+```
+
+All four are off/empty by default, and all three of the latter need filling in for anything to run. Whenever there's no server to hear from — `--no-server`, or the server connection has dropped — and `direct_punch` names at least one target, this keeps `myhouse.ddns.example` pointed at wherever you currently are: an update fires as soon as it starts, then every 5 or 6 minutes alternately (5.5 minutes on average), always landing on second 50 of its minute so it lands before the punch schedule's own attempts, which fall on second 0. It stops the moment the server is reachable again — this only ever runs while direct punching is actually what's carrying you.
 
 ### Running with no server at all
 

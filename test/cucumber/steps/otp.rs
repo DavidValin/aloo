@@ -696,7 +696,7 @@ async fn pad_only_peer(
             nickname: peer_name.to_string(),
             host: "127.0.0.1".to_string(),
             port: 1,
-            frequency: aloo::settings::PunchFrequency::parse("1m").expect("valid frequency"),
+            frequency: aloo::settings::PunchFrequency::parse("every_1m").expect("valid frequency"),
         }],
         0,
     );

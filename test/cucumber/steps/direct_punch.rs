@@ -77,9 +77,9 @@ fn target(nickname: &str, port: u16, minutes: u32) -> DirectPunchTarget {
     DirectPunchTarget::parse(&format!(
         "{nickname},127.0.0.1:{port},{}",
         if minutes == 60 {
-            "1h".to_string()
+            "every_1h".to_string()
         } else {
-            format!("{minutes}m")
+            format!("every_{minutes}m")
         }
     ))
     .unwrap()

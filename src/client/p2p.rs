@@ -104,7 +104,7 @@ const RENDEZVOUS_ATTEMPTS: u32 = 3;
 
 /// How long one serverless direct-punch attempt keeps probing before it is
 /// abandoned until the target's next scheduled slot (`docs/PROTOCOL.md`
-/// §7.1.5 step 3). Comfortably inside the shortest slot grid (`1m`), so an
+/// §7.1.5 step 3). Comfortably inside the shortest slot grid (`every_1m`), so an
 /// attempt is always finished - successfully or not - before the next one
 /// is due.
 pub const DIRECT_PUNCH_WINDOW: Duration = Duration::from_secs(30);

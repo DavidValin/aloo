@@ -1380,15 +1380,16 @@ to try:
 
 ```
 direct_punch=on
-direct_punch_to=bob,bobpublic.com,1m
-direct_punch_to=marco,marcohost.com,1h
+direct_punch_to=bob,bobpublic.com,every_1m
+direct_punch_to=marco,marcohost.com,every_1h
 ```
 
 The host may be an IPv4 address, an IPv6 address or a hostname, and may
 carry its own port (`bobpublic.com:9000`, `[2001:db8::1]:9000`); with no
 port, both sides assume one well-known default. The frequency is one of
-`1m`, `5m`, `10m`, `15m`, `20m`, `25m`, `30m`, `35m`, `40m`, `45m`, `50m`,
-`55m`, `1h`.
+`every_1m`, `every_5m`, `every_10m`, `every_15m`, `every_20m`, `every_25m`,
+`every_30m`, `every_35m`, `every_40m`, `every_45m`, `every_50m`, `every_55m`,
+`every_1h`.
 
 Unlike §7.1's UDP socket, whose port is ephemeral because the server
 relays whatever it happened to be given, this one is fixed: with nothing
@@ -1399,13 +1400,13 @@ peer can aim at.
 both sides send at roughly the same moment - that is what the candidate
 relay was buying. Here the wall clock buys it instead. Each target's
 schedule is a grid of slots that **restarts at every o'clock** and steps by
-that target's frequency: `1m` fires at :00, :01, :02, ...; `1h` fires at
-:00 only. Both peers run the same frequency, so both grids land on the same
-instants with nothing passing between them.
+that target's frequency: `every_1m` fires at :00, :01, :02, ...; `every_1h`
+fires at :00 only. Both peers run the same frequency, so both grids land on
+the same instants with nothing passing between them.
 
 The grid is computed against UTC, not local time, so peers in time zones
 with fractional-hour offsets stay on the same grid as everyone else.
-Restarting it at each o'clock is also what makes `55m` well defined: its
+Restarting it at each o'clock is also what makes `every_55m` well defined: its
 slots are :00 and :55, and the one after :55 is the *next* hour's :00 - not
 :50 past it. A client started mid-slot waits for the next boundary rather
 than probing immediately, since a probe at any moment the peer has no
@@ -1540,6 +1541,49 @@ envelope is checked against, so a peer whose key is unknown, or whose key
 has changed, is not quietly admitted. No key exchange happens here - two
 peers who have never established each other's key material through a
 server have a working transport and nothing to encrypt over it.
+
+**No-IP updates.** Everything above assumes a peer's `direct_punch_to` host
+stays put. For one whose address changes - an ordinary home connection -
+that host is instead a No-IP dynamic DNS hostname, and this side is what
+keeps it pointed at wherever this machine currently is:
+
+```
+noip_when_no_server_and_direct_punch_is_active=on
+noip_hostname=myhouse.ddns.example
+noip_username=dave
+noip_password=hunter2
+```
+
+All four are off/empty by default, and all three of the latter must be
+filled in for anything to run - a toggle left on with one missing, or with
+`direct_punch` naming no target, is reported once at session start and the
+updater never starts (`client::noip::NoipConfig::from_settings`).
+
+The updater tracks whether there is a server to hear from, not merely
+whether its own setting is on: it runs only while `--no-server` or the
+server connection has been lost, and is torn down the moment the server is
+reachable again (`SessionState::sync_noip_job`) - so this machine's No-IP
+password only ever leaves it while a peer could actually need this side's
+address to reach it directly.
+
+Once running, it fires once immediately, then every 5 or 6 minutes
+alternately, forever. Never a flat 5.5-minute period: 330 seconds is not a
+multiple of 60, so no fixed period can land on the same wall-clock second
+every time on its own. Alternating a 5-minute gap with a 6-minute one is
+what keeps every single fire on second 50 of its minute - specifically so
+the update completes before the direct-punch slot grid's own boundaries,
+which always fall on second 0 of some minute - while still averaging
+exactly 5.5 minutes over every pair of them.
+
+One update is an HTTP GET to
+`https://dynupdate.no-ip.com/nic/update?hostname=<noip_hostname>`,
+HTTP Basic-authenticated with `noip_username`/`noip_password`. No-IP
+reports its own outcome in the response body of an ordinary `200` - `good`
+or `nochg` on success, a documented failure code otherwise - so only a
+non-`200` exchange (a transport or proxy failure, not a No-IP-level
+refusal) is treated as an error by the client itself; a body that is
+neither `good` nor `nochg` is logged rather than retried early, since the
+next scheduled fire is only minutes away regardless.
 
 ### 7.2 Sending a channel or direct text message
 

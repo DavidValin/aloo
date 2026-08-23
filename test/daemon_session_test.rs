@@ -297,7 +297,7 @@ async fn a_serverless_daemon_shows_its_configured_channel_and_waits_for_peers() 
         "direct_punch=on\n\
          direct_punch_port=0\n\
          direct_punch_channel=team\n\
-         direct_punch_to=peter,127.0.0.1:65001,1m\n",
+         direct_punch_to=peter,127.0.0.1:65001,every_1m\n",
     );
 
     let screen = attach_until(
@@ -443,7 +443,7 @@ async fn two_serverless_sessions_punch_to_each_other_and_each_registers_the_othe
             "direct_punch=on\n\
              direct_punch_port={port}\n\
              direct_punch_channel=team\n\
-             direct_punch_to={peer},127.0.0.1:{peer_port},1m\n"
+             direct_punch_to={peer},127.0.0.1:{peer_port},every_1m\n"
         )
     };
 

@@ -362,8 +362,8 @@ When a channel is joined, the join is broadcast to all users already in the chan
 
 17. **Direct punching: keeping a link to someone with no server involved.** Full model in `docs/PROTOCOL.md` §7.1.5; from the user's point of view:
     - **It is off unless `~/.aloo/settings` turns it on**, and it is entirely separate from the ordinary direct link (Functionality #2, §7.1) - turning it on changes nothing about how everyone else is reached.
-    - **You name who to punch at, where, and how often.** `direct_punch=on`, then one `direct_punch_to=<nickname>,<host>,<frequency>` line per person. The host may be an IPv4 address, an IPv6 address or a hostname, and may carry its own port (`bobpublic.com:9000`, `[2001:db8::1]:9000`); with none, both sides assume `direct_punch_port` (7879 by default). The frequency is one of `1m`, `5m`, `10m`, `15m`, `20m`, `25m`, `30m`, `35m`, `40m`, `45m`, `50m`, `55m`, `1h`.
-    - **Both people have to configure each other.** There is no server to arrange a meeting, so what makes two clients probe at the same moment is that both run the same frequency and both schedules restart at every o'clock: `1m` fires at :00, :01, :02, ...; `1h` at :00 only. A client started mid-slot waits for the next boundary rather than probing at a time its peer has no reason to answer.
+    - **You name who to punch at, where, and how often.** `direct_punch=on`, then one `direct_punch_to=<nickname>,<host>,<frequency>` line per person. The host may be an IPv4 address, an IPv6 address or a hostname, and may carry its own port (`bobpublic.com:9000`, `[2001:db8::1]:9000`); with none, both sides assume `direct_punch_port` (7879 by default). The frequency is one of `every_1m`, `every_5m`, `every_10m`, `every_15m`, `every_20m`, `every_25m`, `every_30m`, `every_35m`, `every_40m`, `every_45m`, `every_50m`, `every_55m`, `every_1h` — the `every_` prefix keeps a line unambiguous at a glance.
+    - **Both people have to configure each other.** There is no server to arrange a meeting, so what makes two clients probe at the same moment is that both run the same frequency and both schedules restart at every o'clock: `every_1m` fires at :00, :01, :02, ...; `every_1h` at :00 only. A client started mid-slot waits for the next boundary rather than probing at a time its peer has no reason to answer.
     - **A line with a typo says so** at startup, naming the line and the reason, and never costs the lines around it - a mistyped frequency must not look like a peer who simply never answers.
     - **An attempt lasts 30 seconds**, and a slot arriving for someone already connected does nothing at all. If a connected link drops and there is no server that could re-establish it, it is re-punched straight away, up to 5 times, before going back to waiting for its next slot.
     - **There is never more than one connection to the same person**, whether it was opened directly or through a server.
@@ -373,6 +373,7 @@ When a channel is joined, the join is broadcast to all users already in the chan
     - **What they tell you is the whole truth**, not an addition: a channel missing from their note means they have left it. Channels you have not joined yourself are ignored. Sharing no channel at all still leaves them reachable as a DM.
     - **Leaving a channel does not disconnect them.** The link came from your settings and the schedule, not from the channel, so only those end it.
     - **For the two-people case specifically** — a DM with no channel and no server, optionally under `/otp`, optionally headless — see "Talking to one person, with no server" below, which walks the whole thing through.
+    - **No-IP updates, for a home connection whose address moves.** `noip_when_no_server_and_direct_punch_is_active=on`, plus `noip_hostname`, `noip_username` and `noip_password` (all off/empty by default, and all three needed for anything to run). Whenever there is no server to hear from — `--no-server`, or the server connection has been lost — and `direct_punch` names at least one target, this runs a background job that keeps that No-IP hostname pointed at wherever this machine currently is: an update fires as soon as it starts, then every 5 or 6 minutes alternately (averaging 5.5 minutes), always landing on second 50 of its minute so it completes before the punch schedule's own boundaries, which always fall on second 0. It stops the moment the server is reachable again. Full model in `docs/PROTOCOL.md` §7.1.5 "No-IP updates".
 
 18. **Running with no server at all (`--no-server`).** A server only ever introduces people and tracks channel membership; everything that carries content was already peer-to-peer. `aloo --daemon --no-server` (add `--foreground` to keep it in the terminal) runs with none.
     - **Where everything comes from.** Peers come from `direct_punch_to`, channels from `direct_punch_channel` — one name per line, joined at startup, and the only channels that exist. `Ctrl+J` and `/channels` show exactly those, since there is no directory to browse and nothing to create. Your own identity is your local key; no nickname is claimed from anyone.
@@ -905,14 +906,14 @@ Alice's `~/.aloo/settings`:
 
 ```
 direct_punch=on
-direct_punch_to=bob,bobs-host.example,1m
+direct_punch_to=bob,bobs-host.example,every_1m
 ```
 
 Bob's:
 
 ```
 direct_punch=on
-direct_punch_to=alice,alices-host.example,1m
+direct_punch_to=alice,alices-host.example,every_1m
 ```
 
 That is the whole configuration. **No channel is involved** - `direct_punch_channel`

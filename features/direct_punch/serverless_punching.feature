@@ -17,8 +17,8 @@ Feature: Punching a direct link with no server involved
     Given a settings file that says
       """
       direct_punch=on
-      direct_punch_to=bob,bobpublic.com,1min
-      direct_punch_to=marco,marcohost.com,1h
+      direct_punch_to=bob,bobpublic.com,every_1min
+      direct_punch_to=marco,marcohost.com,every_1h
       """
     Then direct punching is on
     And bob is punched at "bobpublic.com" every 1 minutes
@@ -27,20 +27,20 @@ Feature: Punching a direct link with no server involved
 
   @AC-212
   Scenario: A peer may be named by address or by name, with a port of its own
-    Then "bob,203.0.113.9,5m" names host "203.0.113.9" on the well-known port
-    And "bob,203.0.113.9:9000,5m" names host "203.0.113.9" on port 9000
-    And "bob,2001:db8::1,5m" names host "2001:db8::1" on the well-known port
-    And "bob,[2001:db8::1]:9000,5m" names host "2001:db8::1" on port 9000
-    And "bob,bobpublic.com:9000,5m" names host "bobpublic.com" on port 9000
+    Then "bob,203.0.113.9,every_5m" names host "203.0.113.9" on the well-known port
+    And "bob,203.0.113.9:9000,every_5m" names host "203.0.113.9" on port 9000
+    And "bob,2001:db8::1,every_5m" names host "2001:db8::1" on the well-known port
+    And "bob,[2001:db8::1]:9000,every_5m" names host "2001:db8::1" on port 9000
+    And "bob,bobpublic.com:9000,every_5m" names host "bobpublic.com" on port 9000
 
   @AC-213
   Scenario: A line with a typo says so instead of quietly doing nothing
     Given a settings file that says
       """
       direct_punch=on
-      direct_punch_to=bob,bobpublic.com,1m
-      direct_punch_to=carol,carolhost.com,3m
-      direct_punch_to=dave,not a host,1h
+      direct_punch_to=bob,bobpublic.com,every_1m
+      direct_punch_to=carol,carolhost.com,every_3m
+      direct_punch_to=dave,not a host,every_1h
       """
     Then bob is punched at "bobpublic.com" every 1 minutes
     And 2 direct punch lines are reported as unusable, each with a reason

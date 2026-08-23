@@ -13,6 +13,7 @@ pub mod global_notification;
 pub mod global_ptt;
 pub mod idstore;
 pub mod netstats;
+pub mod noip;
 pub mod otp;
 pub mod otp_cli;
 pub mod otp_mail;
