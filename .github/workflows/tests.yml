@@ -33,7 +33,7 @@ jobs:
       # on the freshly built binary before aloo's tests rely on it.
       - name: Build and install otp-toolkit (required for OTP integration tests)
         run: |
-          git clone --depth 1 --branch v1.7.0 https://github.com/DavidValin/otp-toolkit.git /tmp/otp-toolkit
+          git clone --depth 1 --branch 1.7.0 https://github.com/DavidValin/otp-toolkit.git /tmp/otp-toolkit
           make -C /tmp/otp-toolkit build
           sudo make -C /tmp/otp-toolkit install
           otp -h >/dev/null
