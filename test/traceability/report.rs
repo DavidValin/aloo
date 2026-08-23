@@ -153,6 +153,40 @@ fn tests_in_bucket<'m>(
         .collect()
 }
 
+/// Distinct free-form tags on tests in this feature bucket, sorted, plus a
+/// trailing `None` if any of them carry no tag at all. `vec![None]` (the
+/// single implicit group) means this feature uses no such tags, so the tag
+/// level is skipped entirely when rendering.
+fn tag_groups_for_feature(model: &Model, bucket: &Option<String>) -> Vec<Option<String>> {
+    let mut tags = std::collections::BTreeSet::new();
+    let mut has_untagged = false;
+    for test in &model.tests {
+        if test.feature != *bucket {
+            continue;
+        }
+        if test.tags.is_empty() {
+            has_untagged = true;
+        } else {
+            tags.extend(test.tags.iter().cloned());
+        }
+    }
+    if tags.is_empty() {
+        return vec![None];
+    }
+    let mut out: Vec<Option<String>> = tags.into_iter().map(Some).collect();
+    if has_untagged {
+        out.push(None);
+    }
+    out
+}
+
+fn test_matches_tag(test: &TestLink, tag: &Option<String>) -> bool {
+    match tag {
+        Some(t) => test.tags.iter().any(|x| x == t),
+        None => test.tags.is_empty(),
+    }
+}
+
 /// Renders the pass/fail(/other) counts shown at every level of the tree.
 fn counts_html(pass: usize, fail: usize, other: usize) -> String {
     if pass + fail + other == 0 {
@@ -261,11 +295,9 @@ fn html(model: &Model, report: &Report) -> String {
 <title>aloo traceability</title>
 <style>
 :root{--bg:#fbfbfd;--fg:#1c1c22;--muted:#6b6b78;--card:#fff;--line:#e3e3ea;
---pass:#137a3f;--fail:#b3261e;--skip:#8a6100;--notest:#b3261e;--notrun:#5b5b6b;--notimpl:#8a6100;
---fail-dim-bg:#f7d9d6;--fail-dim-fg:#8a241d;}
+--pass:#137a3f;--fail:#b3261e;--skip:#8a6100;--notest:#b3261e;--notrun:#5b5b6b;--notimpl:#8a6100;}
 @media (prefers-color-scheme:dark){:root{--bg:#131318;--fg:#eceef2;--muted:#9a9aa8;--card:#1c1c23;--line:#2e2e38;
---pass:#5ed69a;--fail:#ff8a80;--skip:#ffcf6b;--notest:#ff8a80;--notrun:#a0a0b0;--notimpl:#ffcf6b;
---fail-dim-bg:#3a2323;--fail-dim-fg:#ff8a80;}}
+--pass:#5ed69a;--fail:#ff8a80;--skip:#ffcf6b;--notest:#ff8a80;--notrun:#a0a0b0;--notimpl:#ffcf6b;}}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--fg);
 font:15px/1.55 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;padding:32px 20px 80px}
@@ -286,6 +318,13 @@ input{flex:1;min-width:220px}
 .feature>summary::before{content:"\25B8";color:var(--muted);transition:transform .15s}
 .feature[open]>summary::before{transform:rotate(90deg)}
 .feature .story{margin:0 12px 12px}
+.feature .mode{margin:0 12px 12px}
+.mode{background:var(--card);border:1px solid var(--line);border-radius:9px;margin-bottom:14px;overflow:hidden}
+.mode>summary{cursor:pointer;padding:12px 14px;display:flex;gap:12px;align-items:center;font-weight:650;font-size:14.5px;list-style:none;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+.mode>summary::-webkit-details-marker{display:none}
+.mode>summary::before{content:"\25B8";color:var(--muted);transition:transform .15s}
+.mode[open]>summary::before{transform:rotate(90deg)}
+.mode .story{margin:0 10px 10px}
 .story{background:var(--card);border:1px solid var(--line);border-radius:10px;margin-bottom:14px;overflow:hidden}
 .story>summary{cursor:pointer;padding:13px 16px;display:flex;gap:12px;align-items:center;font-weight:600;list-style:none}
 .story>summary::-webkit-details-marker{display:none}
@@ -310,7 +349,7 @@ border:1px solid currentColor;white-space:nowrap}
 .tag{font-size:11px;font-weight:700;letter-spacing:.03em;padding:2px 8px;border-radius:20px;white-space:nowrap}
 .tag-pass{background:var(--pass);color:#fff}
 .tag-fail{background:var(--fail);color:#fff}
-.tag-fail-zero{background:var(--fail-dim-bg);color:var(--fail-dim-fg)}
+.tag-fail-zero{background:transparent;color:var(--fg)}
 .tag-other{background:var(--line);color:var(--muted)}
 .tag-none{color:var(--muted);font-weight:600;font-size:12px;white-space:nowrap}
 ul.tests{list-style:none;margin:8px 0 0;padding:0 0 0 14px;border-left:2px solid var(--line)}
@@ -405,37 +444,51 @@ footer{color:var(--muted);font-size:12px;margin-top:32px}
 "#,
     );
 
-    // the tree: Gherkin feature -> user story -> acceptance criteria -> scenario
+    // the tree: Gherkin feature -> encryption-mode tag (if any) -> user story -> acceptance criteria -> scenario
     for bucket in feature_buckets(model) {
-        let mut story_sections = Vec::new();
-        for story in &model.stories {
-            let mut matched = Vec::new();
-            for entry in model.requirements_of(&story.id) {
-                if entry.kind == ReqKind::Story {
-                    continue;
+        let tag_groups = tag_groups_for_feature(model, &bucket);
+        let show_tags = !(tag_groups.len() == 1 && tag_groups[0].is_none());
+
+        let mut tag_sections = Vec::new();
+        for tag in &tag_groups {
+            let mut story_sections = Vec::new();
+            for story in &model.stories {
+                let mut matched = Vec::new();
+                for entry in model.requirements_of(&story.id) {
+                    if entry.kind == ReqKind::Story {
+                        continue;
+                    }
+                    let mut tests = tests_in_bucket(model, &entry.id, &bucket);
+                    tests.retain(|t| test_matches_tag(t, tag));
+                    let include = if bucket.is_some() {
+                        !tests.is_empty()
+                    } else {
+                        !tests.is_empty() || model.tests_for(&entry.id).is_empty()
+                    };
+                    if include {
+                        matched.push((entry, tests));
+                    }
                 }
-                let tests = tests_in_bucket(model, &entry.id, &bucket);
-                let include = if bucket.is_some() {
-                    !tests.is_empty()
-                } else {
-                    !tests.is_empty() || model.tests_for(&entry.id).is_empty()
-                };
-                if include {
-                    matched.push((entry, tests));
+                if !matched.is_empty() {
+                    story_sections.push((story, matched));
                 }
             }
-            if !matched.is_empty() {
-                story_sections.push((story, matched));
+            if !story_sections.is_empty() {
+                tag_sections.push((tag.clone(), story_sections));
             }
         }
-        if story_sections.is_empty() {
+        if tag_sections.is_empty() {
             continue;
         }
 
-        let feature_tests: Vec<&TestLink> = story_sections
+        let feature_tests: Vec<&TestLink> = tag_sections
             .iter()
-            .flat_map(|(_, matched): &(_, Vec<_>)| {
-                matched.iter().flat_map(|(_, tests): &(_, Vec<&TestLink>)| tests.iter().copied())
+            .flat_map(|(_, story_sections): &(_, Vec<_>)| {
+                story_sections.iter().flat_map(|(_, matched): &(_, Vec<_>)| {
+                    matched
+                        .iter()
+                        .flat_map(|(_, tests): &(_, Vec<&TestLink>)| tests.iter().copied())
+                })
             })
             .collect();
         let (_, fpass, ffail, fother) = reduce(model, &feature_tests);
@@ -446,6 +499,29 @@ footer{color:var(--muted);font-size:12px;margin-top:32px}
             esc(&feature_name),
             counts_html(fpass, ffail, fother),
         );
+
+        for (tag, story_sections) in tag_sections {
+            if show_tags {
+                let tag_tests: Vec<&TestLink> = story_sections
+                    .iter()
+                    .flat_map(|(_, matched): &(_, Vec<_>)| {
+                        matched
+                            .iter()
+                            .flat_map(|(_, tests): &(_, Vec<&TestLink>)| tests.iter().copied())
+                    })
+                    .collect();
+                let (_, mpass, mfail, mother) = reduce(model, &tag_tests);
+                let tag_heading = match &tag {
+                    Some(t) => format!("@{t}"),
+                    None => "untagged".to_string(),
+                };
+                let _ = write!(
+                    h,
+                    "<details class=\"mode\"><summary><span style=\"flex:1\">{}</span>{}</summary>\n",
+                    esc(&tag_heading),
+                    counts_html(mpass, mfail, mother),
+                );
+            }
 
         for (story, matched) in story_sections {
             let story_tests: Vec<&TestLink> = matched
@@ -521,6 +597,10 @@ footer{color:var(--muted);font-size:12px;margin-top:32px}
             }
             h.push_str("</details>\n");
         }
+            if show_tags {
+                h.push_str("</details>\n");
+            }
+        }
         h.push_str("</details>\n");
     }
 
@@ -544,20 +624,32 @@ const q=document.getElementById('q'),st=document.getElementById('st'),kd=documen
 function apply(){
   const term=q.value.trim().toLowerCase(), s=st.value, k=kd.value;
   const filtering=term||s||k;
+  function applyStory(story){
+    let shown=0;
+    story.querySelectorAll('.req').forEach(r=>{
+      const ok=(!term||r.dataset.search.includes(term))
+            &&(!s||r.dataset.status===s)
+            &&(!k||r.dataset.kind===k);
+      r.classList.toggle('hidden',!ok); if(ok)shown++;
+      if(filtering)r.open=ok;
+    });
+    story.classList.toggle('hidden',shown===0);
+    if(filtering)story.open=shown>0;
+    return shown>0;
+  }
   document.querySelectorAll('details.feature').forEach(feature=>{
     let featureShown=0;
-    feature.querySelectorAll(':scope > details.story').forEach(story=>{
-      let shown=0;
-      story.querySelectorAll('.req').forEach(r=>{
-        const ok=(!term||r.dataset.search.includes(term))
-              &&(!s||r.dataset.status===s)
-              &&(!k||r.dataset.kind===k);
-        r.classList.toggle('hidden',!ok); if(ok)shown++;
-        if(filtering)r.open=ok;
+    feature.querySelectorAll(':scope > details.mode').forEach(mode=>{
+      let modeShown=0;
+      mode.querySelectorAll(':scope > details.story').forEach(story=>{
+        if(applyStory(story))modeShown++;
       });
-      story.classList.toggle('hidden',shown===0);
-      if(filtering)story.open=shown>0;
-      if(shown>0)featureShown++;
+      mode.classList.toggle('hidden',modeShown===0);
+      if(filtering)mode.open=modeShown>0;
+      if(modeShown>0)featureShown++;
+    });
+    feature.querySelectorAll(':scope > details.story').forEach(story=>{
+      if(applyStory(story))featureShown++;
     });
     feature.classList.toggle('hidden',featureShown===0);
     if(filtering)feature.open=featureShown>0;

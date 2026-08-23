@@ -91,6 +91,10 @@ pub struct TestLink {
     /// The owning `.feature` file's `Feature:` title. `None` for Rust tests,
     /// which don't belong to any Gherkin feature.
     pub feature: Option<String>,
+    /// Free-form `@word` tags on the scenario that aren't a requirement id
+    /// (e.g. `@direct_otp`) - a scenario's own way of naming which mode or
+    /// variant it exercises. Empty for Rust tests.
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -352,6 +356,7 @@ fn scan_rust_tests(dir: &Path, tests: &mut Vec<TestLink>, unlinked: &mut Vec<Unl
                             requirements: std::mem::take(&mut pending),
                             ignored,
                             feature: None,
+                            tags: Vec::new(),
                         });
                     }
                 }
@@ -421,24 +426,36 @@ fn scan_features(dir: &Path, tests: &mut Vec<TestLink>, unlinked: &mut Vec<Unlin
             .to_string();
 
         let mut feature_tags: Vec<String> = Vec::new();
+        let mut feature_topic_tags: Vec<String> = Vec::new();
         let mut feature_title: Option<String> = None;
         let mut pending: Vec<String> = Vec::new();
+        let mut pending_topics: Vec<String> = Vec::new();
         let mut seen_feature = false;
 
         for (idx, line) in text.lines().enumerate() {
             let trimmed = line.trim();
             if trimmed.starts_with('@') {
+                let words: Vec<&str> = trimmed
+                    .split_whitespace()
+                    .filter_map(|t| t.strip_prefix('@'))
+                    .collect();
                 pending.extend(
-                    trimmed
-                        .split_whitespace()
-                        .filter_map(|t| t.strip_prefix('@'))
+                    words
+                        .iter()
                         .filter(|t| is_requirement_id(t))
+                        .map(|t| t.to_string()),
+                );
+                pending_topics.extend(
+                    words
+                        .iter()
+                        .filter(|t| !is_requirement_id(t))
                         .map(|t| t.to_string()),
                 );
                 continue;
             }
             if let Some(title) = trimmed.strip_prefix("Feature:") {
                 feature_tags = std::mem::take(&mut pending);
+                feature_topic_tags = std::mem::take(&mut pending_topics);
                 feature_title = Some(title.trim().to_string());
                 seen_feature = true;
                 continue;
@@ -452,6 +469,10 @@ fn scan_features(dir: &Path, tests: &mut Vec<TestLink>, unlinked: &mut Vec<Unlin
                 ids.extend(std::mem::take(&mut pending));
                 ids.sort();
                 ids.dedup();
+                let mut topic_tags = feature_topic_tags.clone();
+                topic_tags.extend(std::mem::take(&mut pending_topics));
+                topic_tags.sort();
+                topic_tags.dedup();
 
                 if ids.is_empty() {
                     unlinked.push(UnlinkedTest {
@@ -469,6 +490,7 @@ fn scan_features(dir: &Path, tests: &mut Vec<TestLink>, unlinked: &mut Vec<Unlin
                         line: idx + 1,
                         kind: TestKind::Scenario,
                         requirements: ids,
+                        tags: topic_tags,
                         ignored: false,
                         feature: feature_title.clone(),
                     });
