@@ -60,32 +60,7 @@ impl Status {
 }
 
 pub fn status_of_requirement(model: &Model, id: &str) -> Status {
-    let tests = model.tests_for(id);
-    if tests.is_empty() {
-        return Status::NoTestLinked;
-    }
-    let outcomes: Vec<Option<TestOutcome>> = tests.iter().map(|t| model.outcome_of(t)).collect();
-    if outcomes.iter().any(|o| *o == Some(TestOutcome::Failed)) {
-        return Status::Fail;
-    }
-    // A scenario with no matching steps is worse than an untested requirement
-    // dressed up as a passing one, so it outranks any sibling that did pass.
-    if outcomes
-        .iter()
-        .any(|o| *o == Some(TestOutcome::NotImplemented))
-    {
-        return Status::NotImplemented;
-    }
-    if outcomes.iter().any(|o| *o == Some(TestOutcome::Passed)) {
-        return Status::Pass;
-    }
-    if tests.iter().all(|t| t.ignored) {
-        return Status::Skipped;
-    }
-    if outcomes.iter().all(|o| o.is_none()) {
-        return Status::NotRun;
-    }
-    Status::Skipped
+    reduce(model, &model.tests_for(id)).0
 }
 
 fn status_of_test(model: &Model, test: &TestLink) -> Status {
@@ -99,6 +74,46 @@ fn status_of_test(model: &Model, test: &TestLink) -> Status {
     }
 }
 
+/// Worst-wins status plus pass/fail/other tallies over an arbitrary slice of
+/// tests - shared by `status_of_requirement` (all tests for one id) and the
+/// feature/story/requirement tree (a bucket-scoped subset of those tests).
+fn reduce(model: &Model, tests: &[&TestLink]) -> (Status, usize, usize, usize) {
+    if tests.is_empty() {
+        return (Status::NoTestLinked, 0, 0, 0);
+    }
+    let outcomes: Vec<Option<TestOutcome>> = tests.iter().map(|t| model.outcome_of(t)).collect();
+    let mut pass = 0;
+    let mut fail = 0;
+    let mut other = 0;
+    for t in tests {
+        match status_of_test(model, t) {
+            Status::Pass => pass += 1,
+            Status::Fail => fail += 1,
+            _ => other += 1,
+        }
+    }
+    let status = if outcomes.iter().any(|o| *o == Some(TestOutcome::Failed)) {
+        Status::Fail
+    } else if outcomes
+        .iter()
+        .any(|o| *o == Some(TestOutcome::NotImplemented))
+    {
+        // A scenario with no matching steps is worse than an untested
+        // requirement dressed up as a passing one, so it outranks any
+        // sibling that did pass.
+        Status::NotImplemented
+    } else if outcomes.iter().any(|o| *o == Some(TestOutcome::Passed)) {
+        Status::Pass
+    } else if tests.iter().all(|t| t.ignored) {
+        Status::Skipped
+    } else if outcomes.iter().all(|o| o.is_none()) {
+        Status::NotRun
+    } else {
+        Status::Skipped
+    };
+    (status, pass, fail, other)
+}
+
 fn story_status(model: &Model, story: &str) -> Status {
     model
         .requirements_of(story)
@@ -107,6 +122,54 @@ fn story_status(model: &Model, story: &str) -> Status {
         .map(|r| status_of_requirement(model, &r.id))
         .min_by_key(|s| s.rank())
         .unwrap_or(Status::NoTestLinked)
+}
+
+/// Label for the synthetic top-level bucket holding requirements with no
+/// Gherkin scenario at all - Rust-only tests, or no test whatsoever.
+const NO_FEATURE_LABEL: &str = "No Gherkin feature (Rust tests / untested)";
+
+/// Every distinct Gherkin `Feature:` title in the model, alphabetical,
+/// followed by the synthetic `None` bucket (always last).
+fn feature_buckets(model: &Model) -> Vec<Option<String>> {
+    let names: std::collections::BTreeSet<String> =
+        model.tests.iter().filter_map(|t| t.feature.clone()).collect();
+    let mut out: Vec<Option<String>> = names.into_iter().map(Some).collect();
+    out.push(None);
+    out
+}
+
+/// The tests linked to `entry_id` that belong to `bucket` - `Some(name)` for
+/// a real Gherkin feature, or `None` for the synthetic bucket (which selects
+/// every test with no feature, i.e. Rust tests).
+fn tests_in_bucket<'m>(
+    model: &'m Model,
+    entry_id: &str,
+    bucket: &Option<String>,
+) -> Vec<&'m TestLink> {
+    model
+        .tests_for(entry_id)
+        .into_iter()
+        .filter(|t| t.feature == *bucket)
+        .collect()
+}
+
+/// Renders the pass/fail(/other) counts shown at every level of the tree.
+fn counts_html(pass: usize, fail: usize, other: usize) -> String {
+    if pass + fail + other == 0 {
+        return "<span class=\"tag-none\">NO TEST LINKED</span>".to_string();
+    }
+    let fail_class = if fail == 0 {
+        "tag tag-fail-zero"
+    } else {
+        "tag tag-fail"
+    };
+    let mut s = format!(
+        "<span class=\"tag tag-pass\">{pass} PASS</span><span class=\"{fail_class}\">{fail} FAIL</span>"
+    );
+    if other > 0 {
+        let _ = write!(s, "<span class=\"tag tag-other\">{other} OTHER</span>");
+    }
+    s
 }
 
 pub fn out_dir() -> PathBuf {
@@ -198,9 +261,11 @@ fn html(model: &Model, report: &Report) -> String {
 <title>aloo traceability</title>
 <style>
 :root{--bg:#fbfbfd;--fg:#1c1c22;--muted:#6b6b78;--card:#fff;--line:#e3e3ea;
---pass:#137a3f;--fail:#b3261e;--skip:#8a6100;--notest:#b3261e;--notrun:#5b5b6b;--notimpl:#8a6100;}
+--pass:#137a3f;--fail:#b3261e;--skip:#8a6100;--notest:#b3261e;--notrun:#5b5b6b;--notimpl:#8a6100;
+--fail-dim-bg:#f7d9d6;--fail-dim-fg:#8a241d;}
 @media (prefers-color-scheme:dark){:root{--bg:#131318;--fg:#eceef2;--muted:#9a9aa8;--card:#1c1c23;--line:#2e2e38;
---pass:#5ed69a;--fail:#ff8a80;--skip:#ffcf6b;--notest:#ff8a80;--notrun:#a0a0b0;--notimpl:#ffcf6b;}}
+--pass:#5ed69a;--fail:#ff8a80;--skip:#ffcf6b;--notest:#ff8a80;--notrun:#a0a0b0;--notimpl:#ffcf6b;
+--fail-dim-bg:#3a2323;--fail-dim-fg:#ff8a80;}}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--fg);
 font:15px/1.55 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;padding:32px 20px 80px}
@@ -215,6 +280,12 @@ h1{font-size:26px;margin:0 0 4px}
 input,select{background:var(--card);color:var(--fg);border:1px solid var(--line);
 border-radius:8px;padding:8px 10px;font:inherit;font-size:14px}
 input{flex:1;min-width:220px}
+.feature{background:var(--card);border:1px solid var(--line);border-radius:10px;margin-bottom:16px;overflow:hidden}
+.feature>summary{cursor:pointer;padding:14px 16px;display:flex;gap:12px;align-items:center;font-weight:700;font-size:16px;list-style:none}
+.feature>summary::-webkit-details-marker{display:none}
+.feature>summary::before{content:"\25B8";color:var(--muted);transition:transform .15s}
+.feature[open]>summary::before{transform:rotate(90deg)}
+.feature .story{margin:0 12px 12px}
 .story{background:var(--card);border:1px solid var(--line);border-radius:10px;margin-bottom:14px;overflow:hidden}
 .story>summary{cursor:pointer;padding:13px 16px;display:flex;gap:12px;align-items:center;font-weight:600;list-style:none}
 .story>summary::-webkit-details-marker{display:none}
@@ -222,7 +293,12 @@ input{flex:1;min-width:220px}
 .story[open]>summary::before{transform:rotate(90deg)}
 .id{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px;color:var(--muted)}
 .role{padding:0 16px 10px;margin:0;color:var(--muted);font-size:13px}
-.req{border-top:1px solid var(--line);padding:11px 16px}
+.req{border-top:1px solid var(--line)}
+.req>summary{cursor:pointer;padding:11px 16px;list-style:none;display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}
+.req>summary::-webkit-details-marker{display:none}
+.req>summary::before{content:"\25B8";color:var(--muted);transition:transform .15s}
+.req[open]>summary::before{transform:rotate(90deg)}
+.req-body{padding:0 16px 11px}
 .req-head{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}
 .desc{flex:1;min-width:240px}
 .kind{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);
@@ -231,6 +307,12 @@ border:1px solid var(--line);border-radius:5px;padding:1px 6px}
 border:1px solid currentColor;white-space:nowrap}
 .pass{color:var(--pass)}.fail{color:var(--fail)}.skip{color:var(--skip)}
 .notest{color:var(--notest)}.notrun{color:var(--notrun)}.notimpl{color:var(--notimpl)}
+.tag{font-size:11px;font-weight:700;letter-spacing:.03em;padding:2px 8px;border-radius:20px;white-space:nowrap}
+.tag-pass{background:var(--pass);color:#fff}
+.tag-fail{background:var(--fail);color:#fff}
+.tag-fail-zero{background:var(--fail-dim-bg);color:var(--fail-dim-fg)}
+.tag-other{background:var(--line);color:var(--muted)}
+.tag-none{color:var(--muted);font-weight:600;font-size:12px;white-space:nowrap}
 ul.tests{list-style:none;margin:8px 0 0;padding:0 0 0 14px;border-left:2px solid var(--line)}
 ul.tests li{padding:3px 0;font-size:13.5px;display:flex;gap:8px;align-items:baseline;flex-wrap:wrap}
 .tname{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
@@ -323,80 +405,121 @@ footer{color:var(--muted);font-size:12px;margin-top:32px}
 "#,
     );
 
-    // the tree
-    for story in &model.stories {
-        let st = story_status(model, &story.id);
+    // the tree: Gherkin feature -> user story -> acceptance criteria -> scenario
+    for bucket in feature_buckets(model) {
+        let mut story_sections = Vec::new();
+        for story in &model.stories {
+            let mut matched = Vec::new();
+            for entry in model.requirements_of(&story.id) {
+                if entry.kind == ReqKind::Story {
+                    continue;
+                }
+                let tests = tests_in_bucket(model, &entry.id, &bucket);
+                let include = if bucket.is_some() {
+                    !tests.is_empty()
+                } else {
+                    !tests.is_empty() || model.tests_for(&entry.id).is_empty()
+                };
+                if include {
+                    matched.push((entry, tests));
+                }
+            }
+            if !matched.is_empty() {
+                story_sections.push((story, matched));
+            }
+        }
+        if story_sections.is_empty() {
+            continue;
+        }
+
+        let feature_tests: Vec<&TestLink> = story_sections
+            .iter()
+            .flat_map(|(_, matched): &(_, Vec<_>)| {
+                matched.iter().flat_map(|(_, tests): &(_, Vec<&TestLink>)| tests.iter().copied())
+            })
+            .collect();
+        let (_, fpass, ffail, fother) = reduce(model, &feature_tests);
+        let feature_name = bucket.clone().unwrap_or_else(|| NO_FEATURE_LABEL.to_string());
         let _ = write!(
             h,
-            "<details class=\"story\" open><summary><span class=\"id\">{}</span><span style=\"flex:1\">{}</span><span class=\"badge {}\">{}</span></summary>\n<p class=\"role\">As {}, I want {} so that {}.</p>\n",
-            esc(&story.id),
-            esc(&story.title),
-            st.css(),
-            st.label(),
-            esc(&story.as_a),
-            esc(&story.i_want),
-            esc(&story.so_that),
+            "<details class=\"feature\"><summary><span style=\"flex:1\">{}</span>{}</summary>\n",
+            esc(&feature_name),
+            counts_html(fpass, ffail, fother),
         );
 
-        for entry in model.requirements_of(&story.id) {
-            if entry.kind == ReqKind::Story {
-                continue;
-            }
-            let status = status_of_requirement(model, &entry.id);
-            let tests = model.tests_for(&entry.id);
-            let haystack = format!(
-                "{} {} {}",
-                entry.id,
-                entry.description,
-                tests
-                    .iter()
-                    .map(|t| t.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            );
+        for (story, matched) in story_sections {
+            let story_tests: Vec<&TestLink> = matched
+                .iter()
+                .flat_map(|(_, tests): &(_, Vec<&TestLink>)| tests.iter().copied())
+                .collect();
+            let (_, spass, sfail, sother) = reduce(model, &story_tests);
             let _ = write!(
                 h,
-                "<div class=\"req\" data-status=\"{}\" data-kind=\"{}\" data-search=\"{}\">\n<div class=\"req-head\"><span class=\"id\">{}</span><span class=\"kind\">{}</span><span class=\"desc\">{}</span><span class=\"badge {}\">{}</span></div>\n",
-                status.label(),
-                entry.kind.label(),
-                esc(&haystack.to_lowercase()),
-                esc(&entry.id),
-                entry.kind.label(),
-                esc(&entry.description),
-                status.css(),
-                status.label(),
+                "<details class=\"story\"><summary><span class=\"id\">{}</span><span style=\"flex:1\">{}</span>{}</summary>\n<p class=\"role\">As {}, I want {} so that {}.</p>\n",
+                esc(&story.id),
+                esc(&story.title),
+                counts_html(spass, sfail, sother),
+                esc(&story.as_a),
+                esc(&story.i_want),
+                esc(&story.so_that),
             );
 
-            if tests.is_empty() {
-                h.push_str(
-                    "<p class=\"none\">No executable test is linked to this requirement.</p>",
+            for (entry, tests) in matched {
+                let (status, rpass, rfail, rother) = reduce(model, &tests);
+                let haystack = format!(
+                    "{} {} {}",
+                    entry.id,
+                    entry.description,
+                    tests
+                        .iter()
+                        .map(|t| t.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" ")
                 );
-            } else {
-                h.push_str("<ul class=\"tests\">");
-                for test in tests {
-                    let ts = status_of_test(model, test);
-                    let _ = write!(
-                        h,
-                        "<li><span class=\"badge {}\">{}</span><span class=\"tname\">{}</span><span class=\"tsrc\">{} &middot; {}:{}{}</span></li>",
-                        ts.css(),
-                        ts.label(),
-                        esc(&test.name),
-                        test.kind.label(),
-                        esc(&test.file.display().to_string()),
-                        test.line,
-                        if test.ignored {
-                            " &middot; #[ignore]"
-                        } else {
-                            ""
-                        },
+                let _ = write!(
+                    h,
+                    "<details class=\"req\" data-status=\"{}\" data-kind=\"{}\" data-search=\"{}\">\n<summary class=\"req-head\"><span class=\"id\">{}</span><span class=\"kind\">{}</span><span class=\"desc\">{}</span>{}</summary>\n<div class=\"req-body\">\n",
+                    status.label(),
+                    entry.kind.label(),
+                    esc(&haystack.to_lowercase()),
+                    esc(&entry.id),
+                    entry.kind.label(),
+                    esc(&entry.description),
+                    counts_html(rpass, rfail, rother),
+                );
+
+                if tests.is_empty() {
+                    h.push_str(
+                        "<p class=\"none\">No executable test is linked to this requirement.</p>",
                     );
+                } else {
+                    h.push_str("<ul class=\"tests\">");
+                    for test in tests {
+                        let ts = status_of_test(model, test);
+                        let _ = write!(
+                            h,
+                            "<li><span class=\"badge {}\">{}</span><span class=\"tname\">{}</span><span class=\"tsrc\">{} &middot; {}:{}{}</span></li>",
+                            ts.css(),
+                            ts.label(),
+                            esc(&test.name),
+                            test.kind.label(),
+                            esc(&test.file.display().to_string()),
+                            test.line,
+                            if test.ignored {
+                                " &middot; #[ignore]"
+                            } else {
+                                ""
+                            },
+                        );
+                    }
+                    h.push_str("</ul>");
                 }
-                h.push_str("</ul>");
+                if !entry.evidence.is_empty() {
+                    let _ = write!(h, "<p class=\"ev\">Evidence: {}</p>", esc(&entry.evidence));
+                }
+                h.push_str("</div>\n</details>\n");
             }
-            if !entry.evidence.is_empty() {
-                let _ = write!(h, "<p class=\"ev\">Evidence: {}</p>", esc(&entry.evidence));
-            }
-            h.push_str("</div>\n");
+            h.push_str("</details>\n");
         }
         h.push_str("</details>\n");
     }
@@ -420,16 +543,24 @@ footer{color:var(--muted);font-size:12px;margin-top:32px}
 const q=document.getElementById('q'),st=document.getElementById('st'),kd=document.getElementById('kd');
 function apply(){
   const term=q.value.trim().toLowerCase(), s=st.value, k=kd.value;
-  document.querySelectorAll('details.story').forEach(story=>{
-    let shown=0;
-    story.querySelectorAll('.req').forEach(r=>{
-      const ok=(!term||r.dataset.search.includes(term))
-            &&(!s||r.dataset.status===s)
-            &&(!k||r.dataset.kind===k);
-      r.classList.toggle('hidden',!ok); if(ok)shown++;
+  const filtering=term||s||k;
+  document.querySelectorAll('details.feature').forEach(feature=>{
+    let featureShown=0;
+    feature.querySelectorAll(':scope > details.story').forEach(story=>{
+      let shown=0;
+      story.querySelectorAll('.req').forEach(r=>{
+        const ok=(!term||r.dataset.search.includes(term))
+              &&(!s||r.dataset.status===s)
+              &&(!k||r.dataset.kind===k);
+        r.classList.toggle('hidden',!ok); if(ok)shown++;
+        if(filtering)r.open=ok;
+      });
+      story.classList.toggle('hidden',shown===0);
+      if(filtering)story.open=shown>0;
+      if(shown>0)featureShown++;
     });
-    story.classList.toggle('hidden',shown===0);
-    if(term||s||k)story.open=true;
+    feature.classList.toggle('hidden',featureShown===0);
+    if(filtering)feature.open=featureShown>0;
   });
 }
 [q,st,kd].forEach(el=>el.addEventListener('input',apply));

@@ -88,6 +88,9 @@ pub struct TestLink {
     /// `#[ignore]`d Rust tests - real coverage, but not exercised by a plain
     /// `cargo test`, so the report must not silently present them as proven.
     pub ignored: bool,
+    /// The owning `.feature` file's `Feature:` title. `None` for Rust tests,
+    /// which don't belong to any Gherkin feature.
+    pub feature: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -348,6 +351,7 @@ fn scan_rust_tests(dir: &Path, tests: &mut Vec<TestLink>, unlinked: &mut Vec<Unl
                             kind: TestKind::Rust,
                             requirements: std::mem::take(&mut pending),
                             ignored,
+                            feature: None,
                         });
                     }
                 }
@@ -417,6 +421,7 @@ fn scan_features(dir: &Path, tests: &mut Vec<TestLink>, unlinked: &mut Vec<Unlin
             .to_string();
 
         let mut feature_tags: Vec<String> = Vec::new();
+        let mut feature_title: Option<String> = None;
         let mut pending: Vec<String> = Vec::new();
         let mut seen_feature = false;
 
@@ -432,8 +437,9 @@ fn scan_features(dir: &Path, tests: &mut Vec<TestLink>, unlinked: &mut Vec<Unlin
                 );
                 continue;
             }
-            if trimmed.starts_with("Feature:") {
+            if let Some(title) = trimmed.strip_prefix("Feature:") {
                 feature_tags = std::mem::take(&mut pending);
+                feature_title = Some(title.trim().to_string());
                 seen_feature = true;
                 continue;
             }
@@ -464,6 +470,7 @@ fn scan_features(dir: &Path, tests: &mut Vec<TestLink>, unlinked: &mut Vec<Unlin
                         kind: TestKind::Scenario,
                         requirements: ids,
                         ignored: false,
+                        feature: feature_title.clone(),
                     });
                 }
                 continue;
