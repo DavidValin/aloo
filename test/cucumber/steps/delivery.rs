@@ -12,22 +12,21 @@ use cucumber::{given, then, when};
 use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 
 use aloo::client::connect::ResolvedIdentity;
+use aloo::client::delivery::PendingReceipts;
 use aloo::client::session::{SessionState, TestSessionSpec};
 use aloo::client::tui::ui::{
-    DeliveryProof,
-    DELIVERED_LABEL, DELIVERY_ARROW, DeliveryStatus, ENCRYPTION_LABEL, Focus, KEY_FILE_LABEL,
-    KEY_LABEL, KEY_OFFSET_LABEL, KEY_SEQ_LABEL, LISTENED_LABEL, LogEntry, MessageBody,
-    NO_CRYPTO_INFO, SAVED_LABEL, SENT_AT_LABEL, UNDELIVERED_LABEL, UiAction, UiState,
+    DELIVERED_LABEL, DELIVERY_ARROW, DeliveryProof, DeliveryStatus, ENCRYPTION_LABEL, Focus,
+    KEY_FILE_LABEL, KEY_LABEL, KEY_OFFSET_LABEL, KEY_SEQ_LABEL, LISTENED_LABEL, LogEntry,
+    MessageBody, NO_CRYPTO_INFO, SAVED_LABEL, SENT_AT_LABEL, UNDELIVERED_LABEL, UiAction, UiState,
     strike_through,
 };
-use aloo::crypto::KeyPair;
-use aloo::proto::{ChannelInfo, ChannelKind, KeyMode, UserInfo};
-use aloo::client::delivery::PendingReceipts;
+use aloo::crypto::pq::PqPublicBundle;
 use aloo::p2p_proto::ReceiptStage;
 use aloo::proto::UserId;
+use aloo::proto::{ChannelInfo, ChannelKind, KeyMode, UserInfo};
 
 use super::ui_common::id_for;
-use crate::world::AlooWorld;
+use crate::world::{AlooWorld, pq_bundle_for};
 
 /// The delivery tag of the send the scenario most recently made - the same
 /// id the row carries, which is the whole point of it (7.2.1).
@@ -73,8 +72,12 @@ fn assert_status(entry: &LogEntry, want: DeliveryStatus) {
 #[when(expr = "{word} acknowledges my last message")]
 async fn peer_acknowledges(w: &mut AlooWorld, name: String) {
     let msg_id = last_msg_id(w);
-    w.ui_mut()
-        .mark_delivered(UserId(id_for(&name)), msg_id, ReceiptStage::Decrypted, DeliveryProof::Receipt);
+    w.ui_mut().mark_delivered(
+        UserId(id_for(&name)),
+        msg_id,
+        ReceiptStage::Decrypted,
+        DeliveryProof::Receipt,
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -134,8 +137,7 @@ fn popup_rows(w: &AlooWorld) -> Vec<String> {
 fn assert_popup_row_pairs(w: &AlooWorld, name: &str, label: &str) {
     let rows = popup_rows(w);
     assert!(
-        rows.iter()
-            .any(|r| r.contains(name) && r.contains(label)),
+        rows.iter().any(|r| r.contains(name) && r.contains(label)),
         "no popup row names {name:?} as {label}; rendered:\n{}",
         rows.join("\n")
     );
@@ -433,8 +435,12 @@ fn last_msg_id_in_general(w: &AlooWorld) -> u64 {
 #[when(expr = "bob reports he decrypted it")]
 async fn bob_decrypted(w: &mut AlooWorld) {
     let msg_id = last_msg_id_in_general(w);
-    w.ui_mut()
-        .mark_delivered(UserId(id_for("bob")), msg_id, ReceiptStage::Decrypted, DeliveryProof::Receipt);
+    w.ui_mut().mark_delivered(
+        UserId(id_for("bob")),
+        msg_id,
+        ReceiptStage::Decrypted,
+        DeliveryProof::Receipt,
+    );
     open_details_on_last_row(w);
 }
 
@@ -442,8 +448,12 @@ async fn bob_decrypted(w: &mut AlooWorld) {
 #[when(expr = "bob reports he saved it")]
 async fn bob_consumed(w: &mut AlooWorld) {
     let msg_id = last_msg_id_in_general(w);
-    w.ui_mut()
-        .mark_delivered(UserId(id_for("bob")), msg_id, ReceiptStage::Consumed, DeliveryProof::Receipt);
+    w.ui_mut().mark_delivered(
+        UserId(id_for("bob")),
+        msg_id,
+        ReceiptStage::Consumed,
+        DeliveryProof::Receipt,
+    );
     open_details_on_last_row(w);
 }
 
@@ -477,7 +487,8 @@ const PEER: UserId = UserId(2);
 
 #[given("a session that can read messages sent to it")]
 async fn a_readable_session(w: &mut AlooWorld) {
-    let me = KeyPair::generate_with_bits(1024).expect("keygen");
+    let (my_public, my_private) = pq_bundle_for("receipt-me");
+    let my_der = aloo::proto::encode(&my_public).expect("encode bundle");
     let scratch = std::env::temp_dir().join(format!(
         "aloo-bdd-receipt-{}-{}",
         std::process::id(),
@@ -488,11 +499,10 @@ async fn a_readable_session(w: &mut AlooWorld) {
     ));
     std::fs::create_dir_all(&scratch).unwrap();
     let mut session = SessionState::for_test(TestSessionSpec {
-        key_mode: KeyMode::Password,
-        identity: ResolvedIdentity::Rsa(KeyPair {
-            private: me.private.clone(),
-            public: me.public.clone(),
-        }),
+        identity: ResolvedIdentity {
+            private: my_private,
+            public_der: my_der,
+        },
         scratch,
         otp: None,
     })
@@ -508,11 +518,12 @@ async fn a_readable_session(w: &mut AlooWorld) {
         name: "general".into(),
         kind: ChannelKind::Public,
     });
+    let (peer_public, _) = pq_bundle_for("receipt-bob");
     let peer = UserInfo {
         id: PEER,
         name: "bob".into(),
-        public_key_der: aloo::crypto::public_key_to_der(&me.public).expect("der"),
-        key_mode: KeyMode::Password,
+        public_key_der: aloo::proto::encode(&peer_public).expect("encode bundle"),
+        key_mode: KeyMode::PqHybrid,
     };
     ui.seed_member("general", peer.clone());
     ui.known_users.insert(PEER, peer);
@@ -525,13 +536,26 @@ async fn a_readable_session(w: &mut AlooWorld) {
 
     w.ui = Some(ui);
     w.receipt_session = Some(session);
-    w.receipt_own_key = Some(me);
+    w.receipt_own_bundle = Some(my_public);
 }
 
-async fn peer_sends(w: &mut AlooWorld, sealed_to: &aloo::crypto::KeyPair, msg_id: u64) {
+/// Bob really seals a message - to `sealed_to`'s keys, which a step
+/// chooses to be ours or a stranger's. `msg_id` doubles as the send id, so
+/// two messages in one scenario never collide in the `ReplayGuard`.
+async fn peer_sends(w: &mut AlooWorld, sealed_to: &PqPublicBundle, msg_id: u64) {
+    let (_, bob_private) = pq_bundle_for("receipt-bob");
+    let blob = aloo::crypto::pq::seal_send(
+        &bob_private,
+        sealed_to.bootstrap_encap(),
+        aloo::crypto::pq::bundle_fingerprint(sealed_to).expect("fingerprint"),
+        Some("general".to_string()),
+        msg_id,
+        b"a message",
+    )
+    .expect("sealing should succeed");
     let envelope = aloo::proto::Envelope {
         content: aloo::proto::Content::Text,
-        blocks: aloo::crypto::encrypt_chunked(&sealed_to.public, b"a message").expect("encrypt"),
+        blocks: vec![blob],
     };
     let mut session = w.receipt_session.take().expect("no session");
     let ui = w.ui.as_mut().expect("no ui");
@@ -563,14 +587,14 @@ fn receipts_sent(w: &mut AlooWorld) -> Vec<(u64, ReceiptStage)> {
 
 #[when("a peer sends me a message they sealed to my key")]
 async fn peer_sends_readable(w: &mut AlooWorld) {
-    let key = w.receipt_own_key.take().expect("no key");
-    peer_sends(w, &key, 1).await;
-    w.receipt_own_key = Some(key);
+    let bundle = w.receipt_own_bundle.take().expect("no bundle");
+    peer_sends(w, &bundle, 1).await;
+    w.receipt_own_bundle = Some(bundle);
 }
 
 #[when("a peer sends me a message sealed to somebody else's key")]
 async fn peer_sends_unreadable(w: &mut AlooWorld) {
-    let stranger = KeyPair::generate_with_bits(1024).expect("keygen");
+    let (stranger, _) = pq_bundle_for("receipt-stranger");
     peer_sends(w, &stranger, 2).await;
 }
 
@@ -625,9 +649,9 @@ fn assert_details_line(w: &AlooWorld, label: &str, value: &str) {
 
 #[then("the details name the encryption scheme by its mechanism")]
 async fn details_name_the_scheme(w: &mut AlooWorld) {
-    // Not the `my_key` sourcing tag the sidebar shows - `PWD`/`PLAIN` say
-    // nothing about the cipher, both being RSA-OAEP.
-    assert_details_line(w, ENCRYPTION_LABEL, "OAEP");
+    // The cipher, not the `my_key` tag the sidebar shows - that one is
+    // about identity, and says nothing about how a message was encrypted.
+    assert_details_line(w, ENCRYPTION_LABEL, "ML-KEM-1024");
 }
 
 #[then("the details name the key it was sealed to")]

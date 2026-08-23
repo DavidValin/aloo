@@ -1,7 +1,7 @@
 use aloo::client::connect::{ConnectRequest, MyKeySelection, ServerKeySelection};
 use aloo::client::file_browser::FileBrowserState;
 use aloo::client::tui::ui_connect_popup::{
-    Action, ConnectPopupState, Field, KeyType, MyKeyType, NICKNAME_MAX_LEN, render,
+    ALOO_HOME_LABEL, Action, ConnectPopupState, Field, KeyType, NICKNAME_MAX_LEN, render,
 };
 use crossterm::event::KeyCode;
 use ratatui::Terminal;
@@ -34,38 +34,13 @@ fn key_type_defaults_to_none() {
 }
 
 // ---------------------------------------------------------------------
-// MyKeyType (a separate, 3-variant cycle from server_key's KeyType)
-// ---------------------------------------------------------------------
-
-/// @requirement TB-002
-#[test]
-fn my_key_type_cycles_through_all_three_and_back() {
-    assert_eq!(MyKeyType::Password.cycle_next(), MyKeyType::None);
-    assert_eq!(MyKeyType::None.cycle_next(), MyKeyType::PqHybrid);
-    assert_eq!(MyKeyType::PqHybrid.cycle_next(), MyKeyType::Password);
-}
-
-/// @requirement TB-002
-#[test]
-fn my_key_type_defaults_to_pq_hybrid() {
-    assert_eq!(MyKeyType::default(), MyKeyType::PqHybrid);
-}
-
-/// @requirement AC-084
-#[test]
-fn my_key_type_label_includes_pq_hybrid() {
-    assert_eq!(MyKeyType::PqHybrid.label(), "pq_hybrid");
-}
-
-// ---------------------------------------------------------------------
 // Focus order
 // ---------------------------------------------------------------------
 
-/// @requirement TB-003
+/// @requirement TB-002, TB-003
 #[test]
-fn focus_order_with_both_keys_none_has_no_value_fields() {
-    let mut state = ConnectPopupState::new();
-    state.my_key.key_type = MyKeyType::None; // my_key defaults to pq_hybrid, not none
+fn focus_order_with_a_none_server_key_has_no_server_value_field() {
+    let state = ConnectPopupState::new();
     let order = state.focus_order();
     assert_eq!(
         order,
@@ -75,9 +50,11 @@ fn focus_order_with_both_keys_none_has_no_value_fields() {
             Field::Nickname,
             Field::IdStorePath,
             Field::ServerKeyType,
-            Field::MyKeyType,
+            Field::MyKeyValuePub,
+            Field::MyKeyValuePriv,
             Field::Connect
-        ]
+        ],
+        "my_key always contributes both keybundle paths - there is only one scheme"
     );
 }
 
@@ -89,24 +66,13 @@ fn focus_order_includes_server_key_value_when_not_none() {
     assert!(state.focus_order().contains(&Field::ServerKeyValue));
 }
 
-/// @requirement AC-084, TB-003
+/// @requirement AC-084, TB-002, TB-003
 #[test]
-fn focus_order_includes_both_my_key_files_when_pq_hybrid() {
-    let mut state = ConnectPopupState::new();
-    state.my_key.key_type = MyKeyType::PqHybrid;
+fn focus_order_includes_both_my_key_files() {
+    let state = ConnectPopupState::new();
     let order = state.focus_order();
     assert!(order.contains(&Field::MyKeyValuePub));
     assert!(order.contains(&Field::MyKeyValuePriv));
-}
-
-/// @requirement TB-003
-#[test]
-fn focus_order_includes_only_one_my_key_field_when_password() {
-    let mut state = ConnectPopupState::new();
-    state.my_key.key_type = MyKeyType::Password;
-    let order = state.focus_order();
-    assert!(order.contains(&Field::MyKeyValuePub));
-    assert!(!order.contains(&Field::MyKeyValuePriv));
 }
 
 /// @requirement TB-004
@@ -134,18 +100,39 @@ fn tab_key_advances_focus() {
     assert_eq!(state.focus, Field::Host);
 }
 
+/// Cycling the server_key type takes its value field in and out of the
+/// focus order; whatever it does, focus must land on a field that is
+/// actually there.
 /// @requirement TB-003
 #[test]
-fn changing_my_key_type_away_from_pq_hybrid_reassigns_focus_if_orphaned() {
+fn cycling_the_server_key_type_always_leaves_focus_on_a_field_that_exists() {
     let mut state = ConnectPopupState::new();
-    state.my_key.key_type = MyKeyType::PqHybrid;
-    state.focus = Field::MyKeyValuePriv;
-    state.handle_key(KeyCode::Left).unwrap(); // wrong field, no-op since focus != MyKeyType
-    assert_eq!(state.focus, Field::MyKeyValuePriv);
+    state.server_key.key_type = KeyType::Password;
+    state.focus = Field::ServerKeyType;
+    assert!(state.focus_order().contains(&Field::ServerKeyValue));
 
-    state.focus = Field::MyKeyType;
-    state.handle_key(KeyCode::Left).unwrap(); // PqHybrid -> Password, file_priv no longer shown
-    assert_eq!(state.my_key.key_type, MyKeyType::Password);
+    state.handle_key(KeyCode::Left).unwrap(); // Password -> None
+    assert_eq!(state.server_key.key_type, KeyType::None);
+    assert!(
+        !state.focus_order().contains(&Field::ServerKeyValue),
+        "a none server_key shows no value field"
+    );
+    assert!(
+        state.focus_order().contains(&state.focus),
+        "focus must never be left on a field that is no longer shown"
+    );
+}
+
+/// `my_key` has no type selector to cycle, so its two fields can never be
+/// orphaned - a Left/Right anywhere in the group is simply a no-op.
+/// @requirement TB-002, TB-003
+#[test]
+fn my_key_fields_are_never_orphaned_by_a_type_change() {
+    let mut state = ConnectPopupState::new();
+    state.focus = Field::MyKeyValuePriv;
+    state.handle_key(KeyCode::Left).unwrap();
+    assert_eq!(state.focus, Field::MyKeyValuePriv);
+    assert!(state.focus_order().contains(&Field::MyKeyValuePriv));
 }
 
 // ---------------------------------------------------------------------
@@ -310,7 +297,8 @@ fn build_request_carries_a_custom_id_store_path() {
     state.host = "localhost".into();
     state.port = "9000".into();
     state.nickname = "dave".into();
-    state.my_key.key_type = MyKeyType::None; // pq_hybrid (the default) needs file_pub/file_priv too
+    state.my_key.file_pub = "/keys/pq_hybrid.pub".into();
+    state.my_key.file_priv = "/keys/pq_hybrid.priv".into();
     state.id_store_path = "/custom/ids_store".into();
     let req = state.build_request().expect("should be valid");
     assert_eq!(req.id_store_path, PathBuf::from("/custom/ids_store"));
@@ -318,12 +306,13 @@ fn build_request_carries_a_custom_id_store_path() {
 
 /// @requirement TB-006
 #[test]
-fn build_request_succeeds_with_none_keys() {
+fn build_request_succeeds_with_a_none_server_key() {
     let mut state = ConnectPopupState::new();
     state.host = "localhost".into();
     state.port = "9000".into();
     state.nickname = "dave".into();
-    state.my_key.key_type = MyKeyType::None; // my_key defaults to pq_hybrid, not none
+    state.my_key.file_pub = "/keys/pq_hybrid.pub".into();
+    state.my_key.file_priv = "/keys/pq_hybrid.priv".into();
     let req = state.build_request().expect("should be valid");
     assert_eq!(
         req,
@@ -332,7 +321,10 @@ fn build_request_succeeds_with_none_keys() {
             port: 9000,
             nickname: "dave".into(),
             server_key: ServerKeySelection::None,
-            my_key: MyKeySelection::None,
+            my_key: MyKeySelection {
+                file_pub: PathBuf::from("/keys/pq_hybrid.pub"),
+                file_priv: PathBuf::from("/keys/pq_hybrid.priv"),
+            },
             id_store_path: PathBuf::from(&state.id_store_path),
         }
     );
@@ -340,14 +332,13 @@ fn build_request_succeeds_with_none_keys() {
 
 /// @requirement TB-006
 #[test]
-fn build_request_succeeds_with_password_and_pq_hybrid_mix() {
+fn build_request_succeeds_with_a_password_server_key() {
     let mut state = ConnectPopupState::new();
     state.host = "10.0.0.5".into();
     state.port = "4444".into();
     state.nickname = "dave".into();
     state.server_key.key_type = KeyType::Password;
     state.server_key.password = "hunter2".into();
-    state.my_key.key_type = MyKeyType::PqHybrid;
     state.my_key.file_pub = "/keys/pq_hybrid.pub".into();
     state.my_key.file_priv = "/keys/pq_hybrid.priv".into();
 
@@ -358,7 +349,7 @@ fn build_request_succeeds_with_password_and_pq_hybrid_mix() {
     );
     assert_eq!(
         req.my_key,
-        MyKeySelection::PqHybrid {
+        MyKeySelection {
             file_pub: PathBuf::from("/keys/pq_hybrid.pub"),
             file_priv: PathBuf::from("/keys/pq_hybrid.priv"),
         }
@@ -372,14 +363,13 @@ fn build_request_succeeds_with_pq_hybrid_files() {
     state.host = "10.0.0.5".into();
     state.port = "4444".into();
     state.nickname = "dave".into();
-    state.my_key.key_type = MyKeyType::PqHybrid;
     state.my_key.file_pub = "/keys/pq_hybrid.pub".into();
     state.my_key.file_priv = "/keys/pq_hybrid".into();
 
     let req = state.build_request().expect("should be valid");
     assert_eq!(
         req.my_key,
-        MyKeySelection::PqHybrid {
+        MyKeySelection {
             file_pub: PathBuf::from("/keys/pq_hybrid.pub"),
             file_priv: PathBuf::from("/keys/pq_hybrid"),
         }
@@ -393,7 +383,8 @@ fn build_request_rejects_missing_pq_hybrid_files() {
     state.host = "localhost".into();
     state.port = "9000".into();
     state.nickname = "dave".into();
-    state.my_key.key_type = MyKeyType::PqHybrid; // both files left blank
+    state.my_key.file_pub.clear(); // both files left blank
+    state.my_key.file_priv.clear();
     let err = state.build_request().unwrap_err();
     assert!(err.contains("file_pub") && err.contains("file_priv"));
 }
@@ -415,7 +406,8 @@ fn enter_on_connect_field_with_valid_form_returns_connect_action() {
     state.host = "chat.example.com".into();
     state.port = "6667".into();
     state.nickname = "dave".into();
-    state.my_key.key_type = MyKeyType::None; // pq_hybrid (the default) needs file_pub/file_priv too
+    state.my_key.file_pub = "/keys/pq_hybrid.pub".into();
+    state.my_key.file_priv = "/keys/pq_hybrid.priv".into();
     state.focus = Field::Connect;
     let action = state.handle_key(KeyCode::Enter).unwrap();
     match action {
@@ -595,16 +587,13 @@ fn selecting_a_file_in_browser_applies_it_to_the_popup_field() {
 
 /// @requirement TB-010
 #[test]
-fn render_does_not_panic_for_every_key_type_combination() {
+fn render_does_not_panic_for_every_server_key_type() {
     let backend = TestBackend::new(80, 24);
     let mut terminal = Terminal::new(backend).unwrap();
     for server_kind in [KeyType::None, KeyType::Password, KeyType::Rsa] {
-        for my_kind in [MyKeyType::None, MyKeyType::Password, MyKeyType::PqHybrid] {
-            let mut state = ConnectPopupState::new();
-            state.server_key.key_type = server_kind;
-            state.my_key.key_type = my_kind;
-            terminal.draw(|f| render(f, &state)).unwrap();
-        }
+        let mut state = ConnectPopupState::new();
+        state.server_key.key_type = server_kind;
+        terminal.draw(|f| render(f, &state)).unwrap();
     }
 }
 
@@ -639,6 +628,66 @@ fn render_shows_a_connect_button() {
     assert!(
         rows.iter().any(|row| row.contains("Connect")),
         "expected a visible Connect button"
+    );
+}
+
+/// The read-only line above the Connect button (`docs/SPEC.md` "Not
+/// connected UI"). Gray, so it reads as a note about where this client's
+/// local state lives rather than as another thing to fill in.
+/// @requirement AC-258
+#[test]
+fn render_shows_the_resolved_aloo_home_in_gray() {
+    let backend = TestBackend::new(80, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut state = ConnectPopupState::new();
+    // A value of our own rather than whatever this machine resolves, so
+    // the assertion is about the rendering rather than about $HOME.
+    state.aloo_home = "/tmp/aloo-bob".to_string();
+    terminal.draw(|f| render(f, &state)).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+
+    let expected = format!("{ALOO_HOME_LABEL}/tmp/aloo-bob");
+    let mut found = None;
+    for y in 0..buffer.area.height {
+        let mut row = String::new();
+        for x in 0..buffer.area.width {
+            row.push_str(buffer[(x, y)].symbol());
+        }
+        if let Some(x) = row.find(&expected) {
+            found = Some((x as u16, y));
+        }
+    }
+    let (x, y) = found.expect("expected an ALOO_HOME line in the popup");
+    assert_eq!(
+        buffer[(x, y)].fg,
+        Color::DarkGray,
+        "the ALOO_HOME line is gray, not another field to fill in"
+    );
+
+    // It sits above the Connect button, which is what makes it read as a
+    // note about the connection that is about to happen.
+    let button_y = (0..buffer.area.height)
+        .find(|&by| {
+            by > y
+                && (0..buffer.area.width.saturating_sub(6)).any(|bx| {
+                    (0..7)
+                        .map(|i| buffer[(bx + i, by)].symbol().to_string())
+                        .collect::<String>()
+                        == "Connect"
+                })
+        })
+        .expect("the Connect button should be below the ALOO_HOME line");
+    assert!(button_y > y);
+}
+
+/// @requirement AC-258
+#[test]
+fn a_fresh_popup_captures_the_aloo_home_it_resolved() {
+    let state = ConnectPopupState::new();
+    assert_eq!(
+        state.aloo_home,
+        aloo::platform::aloo_dir().display().to_string(),
+        "the popup names the directory this process actually uses"
     );
 }
 
@@ -845,3 +894,4 @@ fn file_browser_render_scrolls_to_keep_the_selection_visible() {
 
     std::fs::remove_dir_all(&root).ok();
 }
+

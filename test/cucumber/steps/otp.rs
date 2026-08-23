@@ -14,15 +14,18 @@
 use cucumber::{given, then, when};
 
 use aloo::client::otp::{
-    apply_incoming_setup, commit_pending_setup, detect_or_adopt_existing, discard_pending_setup,
-    initiate_provisioning, own_pad_wins_glare, read_pending_setup, unwrap_incoming, wrap_outgoing,
+    OtpFraming, apply_incoming_setup, commit_pending_setup, contact_name_if_active,
+    detect_or_adopt_existing, discard_pending_setup, framing_for, initiate_provisioning,
+    own_pad_wins_glare, read_pending_setup, send_or_queue, unwrap_incoming, wrap_outgoing,
 };
 use aloo::client::otp_cli::{self, OtpCliConfig};
 use aloo::client::otp_store::{OtpStore, PendingOtpContent};
-use aloo::client::tui::ui::UiAction;
+use aloo::client::tui::ui::{UiAction, UiState};
 use aloo::crypto::otp::{contact_name_for, OtpKeySetupChunk, OtpKeySetupReassembly};
-use aloo::crypto::pq::{bundle_fingerprint, open_send, seal_send};
-use aloo::proto::{KeyMode, UserId};
+use aloo::crypto::pq::{
+    HybridSend, bundle_fingerprint, open_send, open_send_blinded, seal_send_blinded,
+};
+use aloo::proto::UserId;
 
 use crate::steps::ui_common::id_for;
 use crate::support::{ui_buffer, ui_rows_wide};
@@ -77,52 +80,86 @@ async fn same_contact_name(_w: &mut AlooWorld, a: String, b: String) {
     assert_eq!(contact_name_for(&fp_a, &fp_b), contact_name_for(&fp_b, &fp_a));
 }
 
-#[when(expr = "{word} seals {string} for {word} and wraps it under the pad")]
-async fn seal_and_wrap(w: &mut AlooWorld, from: String, message: String, to: String) {
+/// The layer's one rule, in the order it actually happens: the pad goes on
+/// the message, and the seal goes around the pad.
+#[when(expr = "{word} pads {string} for {word} and seals the pad")]
+async fn pad_and_seal(w: &mut AlooWorld, from: String, message: String, to: String) {
+    let contact = w.otp_contact_name.clone().expect("no otp contact provisioned yet");
+    let cfg = w.otp_cfgs.get(&from).expect("no otp config for this side").clone();
+    let (padded, proof) = wrap_outgoing(&cfg, message.as_bytes().to_vec(), &contact)
+        .await
+        .expect("wrapping should succeed");
+    w.otp_pad_bytes = padded.len();
+
     let (_, from_private) = pq_bundle_for(&from);
     let (to_public, _) = pq_bundle_for(&to);
     let to_fp = bundle_fingerprint(&to_public).expect("fingerprint");
-    let blob = seal_send(&from_private, to_public.bootstrap_encap(), to_fp, None, 1, message.as_bytes())
-        .expect("sealing should succeed");
-
-    let contact = w.otp_contact_name.clone().expect("no otp contact provisioned yet");
-    let cfg = w.otp_cfgs.get(&from).expect("no otp config for this side").clone();
-    let (wrapped, proof) = wrap_outgoing(&cfg, blob, &contact)
-        .await
-        .expect("wrapping should succeed");
-    w.otp_wrapped = wrapped;
+    w.otp_wrapped =
+        seal_send_blinded(&from_private, to_public.bootstrap_encap(), to_fp, 1, &padded)
+            .expect("sealing should succeed");
     w.otp_ack_proof = Some(proof);
     w.plaintext = message.into_bytes();
 }
 
-#[then("the wrapped bytes do not open as a pq_hybrid send directly")]
-async fn wrapped_not_directly_openable(w: &mut AlooWorld) {
+#[then("the pad only ever covered the message, never the seal around it")]
+async fn pad_covered_only_the_message(w: &mut AlooWorld) {
+    assert!(
+        w.otp_pad_bytes < 200,
+        "the pad should cost about the length of the line, cost {}",
+        w.otp_pad_bytes
+    );
+    assert!(
+        w.otp_wrapped.len() > 5000,
+        "and the seal - the part the pad no longer pays for - should be the bulk of the wire \
+         block, which weighed {}",
+        w.otp_wrapped.len()
+    );
+}
+
+#[then("the sealed bytes name neither their recipient nor a room")]
+async fn sealed_bytes_name_nobody(w: &mut AlooWorld) {
+    let send: HybridSend =
+        aloo::proto::decode(&w.otp_wrapped).expect("the wire block is a pq_hybrid send");
+    assert_eq!(
+        send.setup.binding.recipient_fp, [0u8; 32],
+        "the recipient's fingerprint is signed but must not be transmitted"
+    );
+    assert!(
+        send.setup.binding.channel.is_none(),
+        "and the room travels under the pad, not in the binding"
+    );
     let (bob_public, bob_private) = pq_bundle_for("bob");
     let (alice_public, _) = pq_bundle_for("alice");
     let fp = bundle_fingerprint(&bob_public).expect("fingerprint");
     assert!(
-        open_send(&[bob_private.bootstrap_decap().clone()], &fp, &alice_public, &w.otp_wrapped).is_none(),
-        "otp-wrapped bytes must not parse as a pq_hybrid send until they are unwrapped"
+        open_send(&[bob_private.bootstrap_decap().clone()], &fp, &alice_public, &w.otp_wrapped)
+            .is_none(),
+        "a blinded send must not open by the ordinary path, which trusts the name on the wire"
     );
 }
 
-#[then(expr = "{word} unwraps it and reads back exactly what was sent")]
-async fn unwraps_and_reads(w: &mut AlooWorld, who: String) {
+#[then(expr = "{word} opens the seal, unwraps the pad, and reads back exactly what was sent")]
+async fn opens_and_unwraps(w: &mut AlooWorld, who: String) {
+    let (their_public, their_private) = pq_bundle_for(&who);
+    let (alice_public, _) = pq_bundle_for("alice");
+    let fp = bundle_fingerprint(&their_public).expect("fingerprint");
+    let (_, padded) = open_send_blinded(
+        &[their_private.bootstrap_decap().clone()],
+        &fp,
+        &alice_public,
+        &w.otp_wrapped,
+    )
+    .expect("the intended recipient must be able to open the seal");
+
     let contact = w.otp_contact_name.clone().expect("no otp contact provisioned yet");
     let cfg = w.otp_cfgs.get(&who).expect("no otp config for this side").clone();
-    let blob = match unwrap_incoming(&cfg, &w.otp_wrapped, &contact).await {
+    let plaintext = match unwrap_incoming(&cfg, &padded, &contact).await {
         aloo::client::otp::UnwrapOutcome::Ok(bytes, proof) => {
             w.otp_unwrapped_ack_proof = Some(proof);
             bytes
         }
         other => panic!("expected unwrapping to succeed, got {other:?}"),
     };
-
-    let (their_public, their_private) = pq_bundle_for(&who);
-    let (alice_public, _) = pq_bundle_for("alice");
-    let fp = bundle_fingerprint(&their_public).expect("fingerprint");
-    let (_, plaintext) = open_send(&[their_private.bootstrap_decap().clone()], &fp, &alice_public, &blob)
-        .expect("the intended recipient must be able to open the unwrapped pq_hybrid send");
     assert_eq!(plaintext, w.plaintext, "what came out must be exactly what went in");
 }
 
@@ -237,7 +274,7 @@ async fn adopted_without_generating(w: &mut AlooWorld) {
 #[when(expr = "I am asked to generate a fresh otp pad for {word}")]
 async fn asked_to_generate(w: &mut AlooWorld, who: String) {
     let id = UserId(id_for(&who));
-    w.ui_mut().open_otp_generate_confirm(id, who, KeyMode::PqHybrid, vec![9, 9]);
+    w.ui_mut().open_otp_generate_confirm(id, who, vec![9, 9]);
 }
 
 #[then(expr = "a prompt asks whether to generate and share a fresh pad with {word}")]
@@ -608,5 +645,404 @@ async fn ack_proof_matches(w: &mut AlooWorld) {
         sent, read_back,
         "only a party that actually opened the pad can name this message's nonce, \
          so the two sides must arrive at the same proof independently"
+    );
+}
+
+// ---------------------------------------------------------------------
+// A serverless, pad-only pair (AC-259)
+// ---------------------------------------------------------------------
+
+/// What a peer nobody ever introduced is pinned under: not a keybundle,
+/// because there was never a server to relay one. This is the `id_store`
+/// entry a hand-installed contact leaves (`/contacts`, `o`).
+fn pad_only_pin(who: &str) -> Vec<u8> {
+    format!("pad-only-pin-for-{who}").into_bytes()
+}
+
+async fn pad_only_peer(
+    w: &mut AlooWorld,
+    own_name: &str,
+    peer_name: &str,
+    cfg: OtpCliConfig,
+    contact: &str,
+) -> crate::world::PadOnlyPeer {
+    let (_, own_private) = pq_bundle_for(own_name);
+    let (own_public, _) = pq_bundle_for(own_name);
+    let mut session = aloo::client::session::SessionState::for_test(
+        aloo::client::session::TestSessionSpec {
+            identity: aloo::client::connect::ResolvedIdentity {
+                private: own_private,
+                public_der: aloo::proto::encode(&own_public).expect("encode bundle"),
+            },
+            scratch: w.temp_path(&format!("pad-only-{own_name}")),
+            otp: Some(cfg),
+        },
+    )
+    .await;
+    // Neither side's key reads as a keybundle *to the other*, which is
+    // exactly what makes this pair `Direct` from both ends.
+    session.set_own_pinned_der_for_test(pad_only_pin(own_name));
+    session
+        .id_store_mut()
+        .check_and_pin(peer_name, &pad_only_pin(peer_name));
+    session.otp_store_mut().mark_provisioned(contact);
+
+    // No server anywhere: a `direct_punch_to` entry is the only thing that
+    // makes this peer addressable, and the only place their nickname comes
+    // from (`p2p::direct_nickname_of`).
+    session.peer_link_mut().configure_direct_punch(
+        own_name.to_string(),
+        vec![aloo::settings::DirectPunchTarget {
+            nickname: peer_name.to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 1,
+            frequency: aloo::settings::PunchFrequency::parse("1m").expect("valid frequency"),
+        }],
+        0,
+    );
+    let peer = aloo::client::p2p::direct_peer_id(peer_name);
+    session.peer_link_mut().open_unpunched_link_for_test(peer);
+
+    let mut ui = UiState::new(own_name.into());
+    // A serverless client is its own `direct_peer_id` too - there is no
+    // server to assign one (`client::daemon::run`).
+    ui.set_own_id(aloo::client::p2p::direct_peer_id(own_name));
+    crate::world::PadOnlyPeer {
+        session,
+        ui,
+        peer,
+        peer_der: pad_only_pin(peer_name),
+    }
+}
+
+#[given(expr = "{word} and {word} reach each other directly and hold a pad for each other")]
+async fn pad_only_pair(w: &mut AlooWorld, a: String, b: String) {
+    let contact =
+        aloo::crypto::otp::contact_name_for_keys(&pad_only_pin(&a), &pad_only_pin(&b));
+    let cfg_a = cfg_at(w.temp_path(&format!("pad-only-otp-{a}")));
+    let cfg_b = cfg_at(w.temp_path(&format!("pad-only-otp-{b}")));
+    // One real pad, split so each side holds the mirror of the other's.
+    // One real pad, generated once and split: each side installs its own
+    // half plus the mirror of the other's, exactly as two people exchanging
+    // keys out of band would (`/contacts`, `o`).
+    otp_cli::new_key_pair(&cfg_a, 1, "a", "b")
+        .await
+        .expect("generating a real pad");
+    let a_keys = cfg_a.working_dir.join("a_keys");
+    let b_keys = cfg_a.working_dir.join("b_keys");
+    otp_cli::add_contact(
+        &cfg_a,
+        &contact,
+        &a_keys.join("encryption_for_b.key"),
+        &a_keys.join("decryption_from_b.key"),
+    )
+    .await
+    .expect("alice adds the contact");
+    otp_cli::add_contact(
+        &cfg_b,
+        &contact,
+        &b_keys.join("encryption_for_a.key"),
+        &b_keys.join("decryption_from_a.key"),
+    )
+    .await
+    .expect("bob adds the mirror");
+
+    let side_a = pad_only_peer(w, &a, &b, cfg_a, &contact).await;
+    let side_b = pad_only_peer(w, &b, &a, cfg_b, &contact).await;
+    w.otp_contact_name = Some(contact);
+    w.pad_only = Some((side_a, side_b));
+}
+
+#[given("neither of them has ever learned the other's keybundle")]
+async fn neither_has_a_keybundle(w: &mut AlooWorld) {
+    let (a, b) = w.pad_only.as_ref().expect("no pad-only pair");
+    for (side, who) in [(a, "alice"), (b, "bob")] {
+        assert!(
+            aloo::crypto::pq::fingerprint_of_encoded(&side.peer_der).is_none(),
+            "{who}'s pin of their peer must not be a readable keybundle"
+        );
+    }
+}
+
+#[then("their pair is framed direct, with no envelope around the pad")]
+async fn pair_is_direct(w: &mut AlooWorld) {
+    let (a, b) = w.pad_only.as_ref().expect("no pad-only pair");
+    for side in [a, b] {
+        assert_eq!(
+            framing_for(side.session.own_pinned_der_for_test(), &side.peer_der),
+            OtpFraming::Direct,
+        );
+    }
+}
+
+#[then("each of them files the pad under the very same contact name")]
+async fn same_pad_contact(w: &mut AlooWorld) {
+    let contact = w.otp_contact_name.clone().expect("no contact");
+    let (a, b) = w.pad_only.as_ref().expect("no pad-only pair");
+    for (side, who) in [(a, "alice"), (b, "bob")] {
+        assert_eq!(
+            contact_name_if_active(&side.session, &side.peer_der).as_deref(),
+            Some(contact.as_str()),
+            "{who} must find this pair's pad, with nothing negotiated"
+        );
+    }
+}
+
+#[when(expr = "{word}'s link to {word} comes up")]
+async fn link_comes_up(w: &mut AlooWorld, _a: String, _b: String) {
+    let (a, _) = w.pad_only.as_mut().expect("no pad-only pair");
+    assert!(
+        !a.ui.known_users.contains_key(&a.peer),
+        "nobody has introduced them yet"
+    );
+    aloo::client::session::register_pad_only_peer(&mut a.session, &mut a.ui, a.peer);
+}
+
+#[then(expr = "{word} is registered from the pad alone, with otp already active")]
+async fn registered_from_the_pad(w: &mut AlooWorld, _b: String) {
+    let (a, _) = w.pad_only.as_ref().expect("no pad-only pair");
+    assert!(
+        a.ui.known_users.contains_key(&a.peer),
+        "an installed pad stands in for the handshake a keybundle would have run"
+    );
+    assert!(
+        a.ui.is_otp_active(a.peer),
+        "there is nothing left to negotiate - the pad is already shared"
+    );
+}
+
+#[when(expr = "{word} sends {word} {string}")]
+async fn pad_only_send(w: &mut AlooWorld, _a: String, _b: String, message: String) {
+    let contact = w.otp_contact_name.clone().expect("no contact");
+    let (a, _) = w.pad_only.as_mut().expect("no pad-only pair");
+    let (msg_id, delivery) = a.ui.start_delivery(&[a.peer]);
+    a.ui.push_outgoing_dm(
+        a.peer,
+        aloo::client::tui::ui::MessageBody::Text(message.clone()),
+        Some(delivery),
+    );
+    let peer_der = a.peer_der.clone();
+    send_or_queue(
+        &mut aloo::control::NullSink,
+        &mut a.session,
+        &mut a.ui,
+        a.peer,
+        &contact,
+        &peer_der,
+        message.as_bytes(),
+        aloo::proto::Content::Text,
+        None,
+        None,
+        Some(msg_id),
+    )
+    .await
+    .expect("the pad-only send path should not fail");
+}
+
+#[then(expr = "{word} reads it, and registers {word} because the pad opened it")]
+async fn pad_only_receive(w: &mut AlooWorld, _b: String, _a: String) {
+    let (a, b) = w.pad_only.as_mut().expect("no pad-only pair");
+    let (seq, msg_id, envelope) = a
+        .session
+        .peer_link_mut()
+        .pending_payloads(a.peer)
+        .into_iter()
+        .find_map(|p| match p {
+            aloo::p2p_proto::P2pPayload::OtpEnvelope {
+                seq,
+                msg_id,
+                envelope,
+                ..
+            } => Some((seq, msg_id, envelope)),
+            _ => None,
+        })
+        .expect("a pad-wrapped message should have gone out");
+    assert_eq!(
+        envelope.blocks.len(),
+        1,
+        "direct framing puts the message straight in the pad"
+    );
+    assert!(
+        !b.ui.known_users.contains_key(&b.peer),
+        "the receiving side has no reason to know them yet"
+    );
+    aloo::client::otp::on_message(
+        &mut b.session,
+        &mut b.ui,
+        None,
+        b.peer,
+        "alice".into(),
+        seq,
+        msg_id,
+        envelope,
+    )
+    .await
+    .expect("the receive path should not fail");
+    assert!(
+        b.ui.known_users.contains_key(&b.peer),
+        "opening the message is what proves who sent it, and registers them"
+    );
+    assert!(
+        b.ui.private_rooms[&b.peer]
+            .log
+            .iter()
+            .any(|e| matches!(&e.body, aloo::client::tui::ui::MessageBody::Text(_))),
+        "and the message itself lands in their room"
+    );
+}
+
+/// Hands whatever pad-wrapped payload one side queued to the other - the
+/// control notices travel in both directions, unlike a text message.
+async fn deliver_pad_envelope(
+    from: &mut crate::world::PadOnlyPeer,
+    to: &mut crate::world::PadOnlyPeer,
+    from_name: &str,
+) {
+    let (seq, msg_id, envelope) = from
+        .session
+        .peer_link_mut()
+        .pending_payloads(from.peer)
+        .into_iter()
+        .find_map(|p| match p {
+            aloo::p2p_proto::P2pPayload::OtpEnvelope {
+                seq,
+                msg_id,
+                envelope,
+                ..
+            } => Some((seq, msg_id, envelope)),
+            _ => None,
+        })
+        .expect("a pad-wrapped payload should have gone out");
+    aloo::client::otp::on_message(
+        &mut to.session,
+        &mut to.ui,
+        None,
+        to.peer,
+        from_name.into(),
+        seq,
+        msg_id,
+        envelope,
+    )
+    .await
+    .expect("the receive path should not fail");
+}
+
+#[when(expr = "{word} runs \\/endotp with {word}")]
+async fn pad_only_endotp(w: &mut AlooWorld, _a: String, _b: String) {
+    let (a, _) = w.pad_only.as_mut().expect("no pad-only pair");
+    let peer_der = a.peer_der.clone();
+    let peer = a.peer;
+    aloo::client::otp::handle_end_otp_command(
+        &mut aloo::control::NullSink,
+        &mut a.ui,
+        &mut a.session,
+        peer,
+        peer_der,
+    )
+    .await
+    .expect("/endotp should not fail");
+}
+
+#[then("the notice reaches bob under the pad, and his ack comes back the same way")]
+async fn pad_only_end_notice(w: &mut AlooWorld) {
+    let contact = w.otp_contact_name.clone().expect("no contact");
+    let (a, b) = w.pad_only.as_mut().expect("no pad-only pair");
+    assert!(
+        a.session
+            .otp_store_mut()
+            .get(&contact)
+            .is_some_and(|s| s.pending_end_notice),
+        "the notice is owed until the peer confirms it"
+    );
+    deliver_pad_envelope(a, b, "alice").await;
+    assert!(
+        !b.ui.is_otp_active(b.peer),
+        "the peer converges to paused on reading it"
+    );
+    deliver_pad_envelope(b, a, "bob").await;
+    assert!(
+        a.session
+            .otp_store_mut()
+            .get(&contact)
+            .is_some_and(|s| !s.pending_end_notice),
+        "and his ack - itself under the pad - is what stops the retry"
+    );
+}
+
+#[then(expr = "{word}'s acknowledgement proves he decrypted it")]
+async fn pad_only_ack(w: &mut AlooWorld, _b: String) {
+    let contact = w.otp_contact_name.clone().expect("no contact");
+    let (a, b) = w.pad_only.as_mut().expect("no pad-only pair");
+    let (seq, proof) = b
+        .session
+        .peer_link_mut()
+        .pending_payloads(b.peer)
+        .into_iter()
+        .find_map(|p| match p {
+            aloo::p2p_proto::P2pPayload::OtpDeliveryAck { seq, proof } => Some((seq, proof)),
+            _ => None,
+        })
+        .expect("the receiving side acknowledges what it read");
+    assert!(
+        a.session
+            .otp_store_mut()
+            .get(&contact)
+            .and_then(|s| s.pending_unacked_out_seq)
+            .is_some(),
+        "the sender's gate is held until that ack lands"
+    );
+    aloo::client::otp::on_delivery_ack(
+        &mut aloo::control::NullSink,
+        &mut a.ui,
+        &mut a.session,
+        a.peer,
+        seq,
+        proof,
+    )
+    .await
+    .expect("the ack path should not fail");
+    assert!(
+        a.session
+            .otp_store_mut()
+            .get(&contact)
+            .and_then(|s| s.pending_unacked_out_seq)
+            .is_none(),
+        "a proof the sender can verify is what reopens the gate"
+    );
+}
+
+#[when(expr = "{word} runs \\/otp with {word}")]
+async fn pad_only_slash_otp(w: &mut AlooWorld, _a: String, _b: String) {
+    let (a, _) = w.pad_only.as_mut().expect("no pad-only pair");
+    let peer_der = a.peer_der.clone();
+    aloo::client::otp::handle_otp_command(
+        &mut aloo::control::NullSink,
+        &mut a.ui,
+        &mut a.session,
+        a.peer,
+        peer_der,
+    )
+    .await
+    .expect("/otp should not fail for a pad-only pair");
+}
+
+#[then(expr = "otp is active for {word} immediately, with nothing sent to negotiate it")]
+async fn otp_active_with_nothing_sent(w: &mut AlooWorld, _b: String) {
+    let (a, _) = w.pad_only.as_mut().expect("no pad-only pair");
+    assert!(
+        a.ui.is_otp_active(a.peer),
+        "both sides already hold the pad, so there is nothing to agree"
+    );
+    let peer = a.peer;
+    assert!(
+        a.session
+            .peer_link_mut()
+            .pending_payloads(peer)
+            .iter()
+            .all(|p| !matches!(
+                p,
+                aloo::p2p_proto::P2pPayload::Envelope { .. }
+            )),
+        "and no session request goes out - there is no envelope to carry one"
     );
 }

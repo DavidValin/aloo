@@ -93,7 +93,7 @@ async fn handshake(stream: &mut ControlEndpoint<TcpStream>, name: &str) -> UserI
     stream.send(&ClientMessage::Identify {
             display_name: name.into(),
             public_key_der: vec![],
-            key_mode: KeyMode::Password,
+            key_mode: KeyMode::PqHybrid,
         },
     )
     .await

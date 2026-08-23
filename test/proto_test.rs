@@ -11,7 +11,7 @@ fn encode_decode_roundtrip_client_message() {
     let msg = ClientMessage::Identify {
         display_name: "dave".into(),
         public_key_der: vec![1, 2, 3, 4],
-        key_mode: KeyMode::Password,
+        key_mode: KeyMode::PqHybrid,
     };
     let bytes = encode(&msg).expect("encode");
     let decoded: ClientMessage = decode(&bytes).expect("decode");
@@ -123,7 +123,9 @@ fn envelope_roundtrips() {
     let bytes = encode(&msg).unwrap();
     let decoded: P2pPayload = decode(&bytes).unwrap();
     match decoded {
-        P2pPayload::Envelope { channel, envelope, .. } => {
+        P2pPayload::Envelope {
+            channel, envelope, ..
+        } => {
             assert_eq!(channel, None);
             assert_eq!(envelope, env);
         }
@@ -317,10 +319,18 @@ fn rendezvous_messages_roundtrip() {
 #[test]
 fn usable_reflexive_observed_rejects_docker_bridge() {
     use aloo::p2p_proto::is_usable_reflexive_observed;
-    assert!(!is_usable_reflexive_observed("172.17.0.1:38082".parse().unwrap()));
-    assert!(!is_usable_reflexive_observed("10.0.0.5:1234".parse().unwrap()));
-    assert!(!is_usable_reflexive_observed("127.0.0.1:1".parse().unwrap()));
-    assert!(is_usable_reflexive_observed("203.0.113.5:4000".parse().unwrap()));
+    assert!(!is_usable_reflexive_observed(
+        "172.17.0.1:38082".parse().unwrap()
+    ));
+    assert!(!is_usable_reflexive_observed(
+        "10.0.0.5:1234".parse().unwrap()
+    ));
+    assert!(!is_usable_reflexive_observed(
+        "127.0.0.1:1".parse().unwrap()
+    ));
+    assert!(is_usable_reflexive_observed(
+        "203.0.113.5:4000".parse().unwrap()
+    ));
 }
 
 /// A dual-stack server sees every IPv4 client through one socket bound to
@@ -337,8 +347,12 @@ fn usable_reflexive_observed_judges_an_ipv4_mapped_address_as_ipv4() {
         !is_usable_reflexive_observed("[::ffff:172.17.0.1]:38082".parse().unwrap()),
         "a mapped docker-bridge address is the same bogus address in a different shape"
     );
-    assert!(!is_usable_reflexive_observed("[::ffff:10.0.0.5]:1234".parse().unwrap()));
-    assert!(!is_usable_reflexive_observed("[::ffff:127.0.0.1]:1".parse().unwrap()));
+    assert!(!is_usable_reflexive_observed(
+        "[::ffff:10.0.0.5]:1234".parse().unwrap()
+    ));
+    assert!(!is_usable_reflexive_observed(
+        "[::ffff:127.0.0.1]:1".parse().unwrap()
+    ));
     assert!(
         is_usable_reflexive_observed("[::ffff:203.0.113.5]:4000".parse().unwrap()),
         "a mapped *public* address is still perfectly usable - this must not reject everything"
@@ -353,22 +367,40 @@ fn usable_reflexive_observed_judges_an_ipv4_mapped_address_as_ipv4() {
 #[test]
 fn usable_reflexive_observed_rejects_every_unroutable_ipv4_shape() {
     use aloo::p2p_proto::is_usable_reflexive_observed;
-    assert!(!is_usable_reflexive_observed("0.0.0.0:7878".parse().unwrap()));
-    assert!(!is_usable_reflexive_observed("0.1.2.3:7878".parse().unwrap()));
-    assert!(!is_usable_reflexive_observed("255.255.255.255:7878".parse().unwrap()));
-    assert!(!is_usable_reflexive_observed("169.254.10.1:7878".parse().unwrap()));
-    assert!(!is_usable_reflexive_observed("192.168.1.5:7878".parse().unwrap()));
-    assert!(!is_usable_reflexive_observed("172.31.255.1:7878".parse().unwrap()));
+    assert!(!is_usable_reflexive_observed(
+        "0.0.0.0:7878".parse().unwrap()
+    ));
+    assert!(!is_usable_reflexive_observed(
+        "0.1.2.3:7878".parse().unwrap()
+    ));
+    assert!(!is_usable_reflexive_observed(
+        "255.255.255.255:7878".parse().unwrap()
+    ));
+    assert!(!is_usable_reflexive_observed(
+        "169.254.10.1:7878".parse().unwrap()
+    ));
+    assert!(!is_usable_reflexive_observed(
+        "192.168.1.5:7878".parse().unwrap()
+    ));
+    assert!(!is_usable_reflexive_observed(
+        "172.31.255.1:7878".parse().unwrap()
+    ));
 }
 
 /// Genuine IPv6 is unaffected by the mapped-address unwrapping above.
 #[test]
 fn usable_reflexive_observed_still_judges_real_ipv6_as_ipv6() {
     use aloo::p2p_proto::is_usable_reflexive_observed;
-    assert!(is_usable_reflexive_observed("[2001:db8::1]:4000".parse().unwrap()));
+    assert!(is_usable_reflexive_observed(
+        "[2001:db8::1]:4000".parse().unwrap()
+    ));
     assert!(!is_usable_reflexive_observed("[::1]:4000".parse().unwrap()));
-    assert!(!is_usable_reflexive_observed("[fd00::1]:4000".parse().unwrap()));
-    assert!(!is_usable_reflexive_observed("[fe80::1]:4000".parse().unwrap()));
+    assert!(!is_usable_reflexive_observed(
+        "[fd00::1]:4000".parse().unwrap()
+    ));
+    assert!(!is_usable_reflexive_observed(
+        "[fe80::1]:4000".parse().unwrap()
+    ));
     assert!(!is_usable_reflexive_observed("[::]:4000".parse().unwrap()));
 }
 
@@ -599,17 +631,20 @@ fn user_info_and_channel_info_roundtrip() {
         id: UserId(42),
         name: "alice".into(),
         public_key_der: vec![0xde, 0xad, 0xbe, 0xef],
-        key_mode: KeyMode::Password,
+        key_mode: KeyMode::PqHybrid,
     };
     let bytes = encode(&user).unwrap();
     let decoded: UserInfo = decode(&bytes).unwrap();
     assert_eq!(user, decoded);
 }
 
+/// `KeyMode` has one variant, but it stays on the wire so a peer
+/// implementation announces which scheme it speaks rather than leaving it
+/// implied - which only means anything if it survives the encoding.
 /// @requirement TB-061
 #[test]
 fn user_info_roundtrips_with_every_key_mode_variant() {
-    for key_mode in [KeyMode::Password, KeyMode::None, KeyMode::PqHybrid] {
+    for key_mode in [KeyMode::PqHybrid] {
         let user = UserInfo {
             id: UserId(1),
             name: "alice".into(),
@@ -622,11 +657,22 @@ fn user_info_roundtrips_with_every_key_mode_variant() {
     }
 }
 
+/// The same, through `Identify` - the message that actually announces it.
+/// @requirement TB-061
+#[test]
+fn identify_roundtrips_with_its_key_mode() {
+    let msg = ClientMessage::Identify {
+        display_name: "alice".into(),
+        public_key_der: vec![1, 2, 3],
+        key_mode: KeyMode::PqHybrid,
+    };
+    let decoded: ClientMessage = decode(&encode(&msg).unwrap()).unwrap();
+    assert_eq!(decoded, msg);
+}
+
 /// @requirement AC-051, TB-099
 #[test]
 fn key_mode_label_matches_the_documented_tag_convention() {
-    assert_eq!(KeyMode::Password.label(), "\u{1F6A8} PWD");
-    assert_eq!(KeyMode::None.label(), "\u{1F6A8} PLAIN");
     assert_eq!(KeyMode::PqHybrid.label(), "\u{1F6E1}\u{FE0F} PQH");
 }
 
@@ -634,13 +680,9 @@ fn key_mode_label_matches_the_documented_tag_convention() {
 #[test]
 fn format_with_name_puts_every_tag_after_the_name() {
     assert_eq!(
-        KeyMode::Password.format_with_name("dan"),
-        "dan \u{1F6A8} PWD"
-    );
-    assert_eq!(KeyMode::None.format_with_name("eve"), "eve \u{1F6A8} PLAIN");
-    assert_eq!(
         KeyMode::PqHybrid.format_with_name("frank"),
-        "frank \u{1F6E1}\u{FE0F} PQH"
+        "frank \u{1F6E1}\u{FE0F} PQH",
+        "the tag trails the name as an annotation on it"
     );
 }
 
@@ -733,10 +775,7 @@ fn host_mute_and_roster_messages_roundtrip() {
         target: UserId(7),
         muted: true,
     };
-    assert_eq!(
-        decode::<P2pPayload>(&encode(&mute).unwrap()).unwrap(),
-        mute
-    );
+    assert_eq!(decode::<P2pPayload>(&encode(&mute).unwrap()).unwrap(), mute);
 
     let unmute = P2pPayload::CallMute {
         call_id: 42,
@@ -778,7 +817,10 @@ fn otp_mail_messages_roundtrip() {
         sent_at_utc: 1_766_000_000,
         ciphertext: vec![7, 8, 9],
     };
-    assert_eq!(decode::<ClientMessage>(&encode(&send).unwrap()).unwrap(), send);
+    assert_eq!(
+        decode::<ClientMessage>(&encode(&send).unwrap()).unwrap(),
+        send
+    );
 
     for msg in [
         ClientMessage::OtpMailFetch,
@@ -789,7 +831,10 @@ fn otp_mail_messages_roundtrip() {
             mail_id: "ef".repeat(16),
         },
     ] {
-        assert_eq!(decode::<ClientMessage>(&encode(&msg).unwrap()).unwrap(), msg);
+        assert_eq!(
+            decode::<ClientMessage>(&encode(&msg).unwrap()).unwrap(),
+            msg
+        );
     }
 
     let deliver = ServerMessage::OtpMailDeliver {
@@ -814,6 +859,9 @@ fn otp_mail_messages_roundtrip() {
             mail_id: "ab".repeat(16),
         },
     ] {
-        assert_eq!(decode::<ServerMessage>(&encode(&msg).unwrap()).unwrap(), msg);
+        assert_eq!(
+            decode::<ServerMessage>(&encode(&msg).unwrap()).unwrap(),
+            msg
+        );
     }
 }

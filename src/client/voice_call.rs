@@ -50,7 +50,7 @@ use crate::client::voice;
 use crate::client::voice_stream::{self, ChunkDecryptor, DecryptJob, DirectStreamKey};
 use crate::control::ControlSink;
 use crate::p2p_proto::P2pPayload;
-use crate::proto::{self, KeyMode, UserId};
+use crate::proto::{self, UserId};
 
 /// One command to a running `spawn_call_audio_worker` thread - the call
 /// counterpart of push-to-talk's plain `stop_rx: Receiver<()>`, richer
@@ -174,7 +174,7 @@ pub(crate) fn addressable_channel_members(
     ui_state
         .recipients_for_channel(tab)
         .into_iter()
-        .filter(|(_, _, der)| crate::client::otp::contact_name_if_active(session, der).is_none())
+        .filter(|(_, der)| crate::client::otp::contact_name_if_active(session, der).is_none())
         .collect()
 }
 
@@ -335,14 +335,15 @@ fn spawn_call_decrypt_worker(
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DecryptJob>();
     std::thread::spawn(move || {
         let mut decryptor = ChunkDecryptor::new(key);
-        let push = |pcm: Vec<u8>, mixer_tx: &tokio::sync::mpsc::UnboundedSender<voice::MixerCmd>| {
-            let samples = voice::pcm_from_bytes(&pcm);
-            let _ = level_tx.send((peer, voice::level_from_pcm(&samples)));
-            let _ = mixer_tx.send(voice::MixerCmd::Push {
-                id: mixer_id,
-                samples,
-            });
-        };
+        let push =
+            |pcm: Vec<u8>, mixer_tx: &tokio::sync::mpsc::UnboundedSender<voice::MixerCmd>| {
+                let samples = voice::pcm_from_bytes(&pcm);
+                let _ = level_tx.send((peer, voice::level_from_pcm(&samples)));
+                let _ = mixer_tx.send(voice::MixerCmd::Push {
+                    id: mixer_id,
+                    samples,
+                });
+            };
         while let Some(job) = rx.blocking_recv() {
             match job {
                 DecryptJob::KeySetup(blob) => {
@@ -441,7 +442,6 @@ async fn add_participant(
     ui_state: &mut UiState,
     peer: UserId,
     peer_name: &str,
-    key_mode: KeyMode,
     pubkey_der: &[u8],
 ) -> bool {
     let Some(call) = session.active_call.as_ref() else {
@@ -451,17 +451,18 @@ async fn add_participant(
     if call.participants.contains_key(&peer) {
         return false;
     }
-    let Some(key) = voice_stream::resolve_direct_key(session, call_id, peer, key_mode, pubkey_der)
-    else {
+    let Some(key) = voice_stream::resolve_direct_key(session, call_id, peer, pubkey_der) else {
         return false;
     };
     session.peer_link.ensure_link(wr, peer).await;
-    if let DirectStreamKey::Pq(pq) = &key {
-        for (id, setup) in pq.setups() {
-            session
-                .peer_link
-                .send_reliable_or_queue(id, P2pPayload::StreamKeySetup { stream_id: call_id, setup });
-        }
+    for (id, setup) in key.setups() {
+        session.peer_link.send_reliable_or_queue(
+            id,
+            P2pPayload::StreamKeySetup {
+                stream_id: call_id,
+                setup,
+            },
+        );
     }
     let mixer_id = session.next_mixer_id;
     session.next_mixer_id += 1;
@@ -478,14 +479,17 @@ async fn add_participant(
     let Some(call) = session.active_call.as_mut() else {
         return false;
     };
-    let _ = call.cmd_tx.send(CallRecorderCmd::AddRecipient(peer, Box::new(key)));
+    let _ = call
+        .cmd_tx
+        .send(CallRecorderCmd::AddRecipient(peer, Box::new(key)));
     // Anything this peer sent before we could add them - in practice their
     // one `pq_hybrid` key setup - goes in first, ahead of any chunk the
     // worker is about to be handed. See `forward_key_setup`.
     if let Some(setup) = call.pending_setups.take(peer) {
         let _ = job_tx.send(DecryptJob::KeySetup(setup));
     }
-    call.participants.insert(peer, ActiveCallPeer { job_tx, mixer_id });
+    call.participants
+        .insert(peer, ActiveCallPeer { job_tx, mixer_id });
     ui_state.on_call_participant_joined(peer, peer_name.to_string());
     true
 }
@@ -503,7 +507,9 @@ fn remove_participant(session: &mut SessionState, ui_state: &mut UiState, peer: 
         return;
     };
     let _ = call.cmd_tx.send(CallRecorderCmd::RemoveRecipient(peer));
-    let _ = session.mixer_tx.send(voice::MixerCmd::Stop { id: removed.mixer_id });
+    let _ = session.mixer_tx.send(voice::MixerCmd::Stop {
+        id: removed.mixer_id,
+    });
     ui_state.on_call_participant_left(peer);
 }
 
@@ -570,7 +576,6 @@ pub(crate) async fn on_call_accept(
         ui_state,
         from,
         &user.name,
-        user.key_mode,
         &user.public_key_der,
     )
     .await;
@@ -587,7 +592,13 @@ pub(crate) async fn on_call_accept(
         let members: Vec<UserId> = session
             .active_call
             .as_ref()
-            .map(|c| c.participants.keys().copied().filter(|id| *id != from).collect())
+            .map(|c| {
+                c.participants
+                    .keys()
+                    .copied()
+                    .filter(|id| *id != from)
+                    .collect()
+            })
             .unwrap_or_default();
         if !members.is_empty() {
             session
@@ -611,7 +622,11 @@ pub(crate) async fn on_call_accept(
         }
         // A host-muted participant stays muted for whoever joins after
         // the fact, for the same reason - and only the host may say so.
-        if session.active_call.as_ref().is_some_and(|c| c.host == you(ui_state)) {
+        if session
+            .active_call
+            .as_ref()
+            .is_some_and(|c| c.host == you(ui_state))
+        {
             for (peer, muted) in muted_members(ui_state) {
                 session.peer_link.send_reliable_or_queue(
                     from,
@@ -694,7 +709,12 @@ pub(crate) async fn on_call_roster(
 /// `P2pEvent::CallReject` - purely informational: `from` was never added
 /// as a participant (a popup is only ever shown to someone who can choose
 /// Reject), so there is nothing structural to undo.
-pub(crate) fn on_call_reject(session: &SessionState, ui_state: &mut UiState, from: UserId, call_id: u64) {
+pub(crate) fn on_call_reject(
+    session: &SessionState,
+    ui_state: &mut UiState,
+    from: UserId,
+    call_id: u64,
+) {
     let matches_ours = session
         .active_call
         .as_ref()
@@ -711,7 +731,12 @@ pub(crate) fn on_call_reject(session: &SessionState, ui_state: &mut UiState, fro
 /// `P2pEvent::CallEnd` - a participant left; tear down their audio and say
 /// so, unless this names some other call than the one we're actually on
 /// (a stale message from one we already left ourselves).
-pub(crate) fn on_call_end(session: &mut SessionState, ui_state: &mut UiState, from: UserId, call_id: u64) {
+pub(crate) fn on_call_end(
+    session: &mut SessionState,
+    ui_state: &mut UiState,
+    from: UserId,
+    call_id: u64,
+) {
     let on_this_call = session
         .active_call
         .as_ref()
@@ -856,10 +881,7 @@ pub(crate) async fn invite_to_call(
         return Ok(());
     };
     if crate::client::otp::contact_name_if_active(session, &user.public_key_der).is_some() {
-        ui_state.push_status_notice(
-            crate::client::tui::ui::OTP_CALL_REFUSAL.to_string(),
-            false,
-        );
+        ui_state.push_status_notice(crate::client::tui::ui::OTP_CALL_REFUSAL.to_string(), false);
         return Ok(());
     }
     session.peer_link.ensure_link(wr, to).await;
@@ -879,7 +901,9 @@ fn teardown_own_call(session: &mut SessionState, ui_state: &mut UiState) {
         return;
     };
     for peer in call.participants.into_values() {
-        let _ = session.mixer_tx.send(voice::MixerCmd::Stop { id: peer.mixer_id });
+        let _ = session
+            .mixer_tx
+            .send(voice::MixerCmd::Stop { id: peer.mixer_id });
     }
     let _ = call.cmd_tx.send(CallRecorderCmd::Stop);
     ui_state.end_call();
@@ -929,7 +953,13 @@ pub(crate) async fn accept_invite(
     if !others.contains(&invite.from) {
         others.push(invite.from);
     }
-    if !begin_own_call(session, ui_state, call_id, invite.channel.clone(), invite.from) {
+    if !begin_own_call(
+        session,
+        ui_state,
+        call_id,
+        invite.channel.clone(),
+        invite.from,
+    ) {
         return Ok(());
     }
     for id in others {
@@ -1031,9 +1061,12 @@ pub(crate) async fn end_own_call(
     }
     for peer in peers {
         session.peer_link.ensure_link(wr, peer).await;
-        session
-            .peer_link
-            .send_reliable_or_queue(peer, P2pPayload::CallEnd { call_id: call.call_id });
+        session.peer_link.send_reliable_or_queue(
+            peer,
+            P2pPayload::CallEnd {
+                call_id: call.call_id,
+            },
+        );
     }
     session.active_call = Some(call);
     teardown_own_call(session, ui_state);

@@ -5,12 +5,12 @@
 
 use std::path::PathBuf;
 
+use aloo::client::connect::MyKeySelection;
 use aloo::client::connect::{
-    ConnectCache, ResolvedIdentity, cache_path, fresh_pq_hybrid_paths_in, prefill_connect_defaults,
+    ConnectCache, cache_path, fresh_pq_hybrid_paths_in, prefill_connect_defaults,
     random_prefix, resolve_my_keypair,
 };
-use aloo::client::connect::MyKeySelection;
-use aloo::client::tui::ui_connect_popup::{ConnectPopupState, MyKeyType};
+use aloo::client::tui::ui_connect_popup::ConnectPopupState;
 use aloo::settings::Settings;
 
 fn temp_path(label: &str) -> PathBuf {
@@ -256,7 +256,6 @@ fn prefill_connect_defaults_restores_the_most_recent_cache_entry() {
 
     assert_eq!(popup.host, "chat.example.com");
     assert_eq!(popup.port, "6667");
-    assert_eq!(popup.my_key.key_type, MyKeyType::PqHybrid);
     assert_eq!(popup.my_key.file_pub, "/keys/ab12.pub");
     assert_eq!(popup.my_key.file_priv, "/keys/ab12.priv");
 }
@@ -274,15 +273,16 @@ fn resolve_my_keypair_autogenerates_a_missing_pq_hybrid_bundle() {
     let file_priv = dir.join("gen.priv");
     assert!(!file_pub.exists() && !file_priv.exists());
 
-    let sel = MyKeySelection::PqHybrid {
+    let sel = MyKeySelection {
         file_pub: file_pub.clone(),
         file_priv: file_priv.clone(),
     };
-    let (identity, key_mode) =
-        resolve_my_keypair(&sel).expect("should autogenerate and load successfully");
+    let identity = resolve_my_keypair(&sel).expect("should autogenerate and load successfully");
 
-    assert_eq!(key_mode, aloo::proto::KeyMode::PqHybrid);
-    assert!(matches!(identity, ResolvedIdentity::Pq { .. }));
+    assert!(
+        aloo::crypto::pq::fingerprint_of_encoded(&identity.public_der).is_some(),
+        "the loaded identity's public half is a real keybundle"
+    );
     assert!(
         file_pub.is_file(),
         "the public bundle should now exist on disk"
@@ -395,7 +395,12 @@ fn prefill_connect_defaults_restores_the_last_nickname_from_settings() {
 fn settings_beat_the_cache_for_host_and_port_but_not_for_the_keybundle() {
     let dir = temp_path("prefill-precedence-dir");
     let mut cache = ConnectCache::new_empty(temp_path("prefill-precedence-cache"));
-    cache.record("cached.example.com", 1111, "/keys/ab12.pub", "/keys/ab12.priv");
+    cache.record(
+        "cached.example.com",
+        1111,
+        "/keys/ab12.pub",
+        "/keys/ab12.priv",
+    );
     let settings = Settings {
         connect_host: Some("settings.example.com".to_string()),
         connect_port: Some(2222),
@@ -407,7 +412,6 @@ fn settings_beat_the_cache_for_host_and_port_but_not_for_the_keybundle() {
 
     assert_eq!(popup.host, "settings.example.com");
     assert_eq!(popup.port, "2222");
-    assert_eq!(popup.my_key.key_type, MyKeyType::PqHybrid);
     assert_eq!(popup.my_key.file_pub, "/keys/ab12.pub");
     assert_eq!(popup.my_key.file_priv, "/keys/ab12.priv");
 }

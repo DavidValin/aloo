@@ -5,7 +5,7 @@ use ui_common::*;
 use aloo::client::netstats::ConnQuality;
 use aloo::client::p2p::LinkStatus;
 use aloo::p2p_proto::ReceiptStage;
-use aloo::proto::{ChannelInfo, ChannelKind, KeyMode, UserId};
+use aloo::proto::{ChannelInfo, ChannelKind, UserId};
 use aloo::client::reconnect::ServerLinkState;
 use aloo::client::tui::channel::{HEADER_ROW_HEIGHT, messages_start_col};
 use aloo::client::tui::ui::{
@@ -259,7 +259,7 @@ fn typing_and_enter_sends_channel_text_excluding_self() {
         } => {
             assert_eq!(channel, "general");
             assert_eq!(plaintext, "hello all");
-            let ids: Vec<UserId> = recipients.iter().map(|(id, _, _)| *id).collect();
+            let ids: Vec<UserId> = recipients.iter().map(|(id, _)| *id).collect();
             assert_eq!(ids, vec![UserId(2), UserId(3)]);
         }
         other => panic!("expected SendChannelText, got {other:?}"),
@@ -352,7 +352,7 @@ fn space_press_and_release_starts_and_stops_recording_for_channel() {
             assert_eq!(channel, "general");
             assert_eq!(
                 recipients,
-                vec![(UserId(2), KeyMode::Password, user(2, "bob").public_key_der)]
+                vec![(UserId(2), user(2, "bob").public_key_der)]
             );
         }
         other => panic!("expected VoiceRecordStart(Channel), got {other:?}"),
@@ -384,7 +384,7 @@ fn global_record_start_and_stop_streams_to_the_active_channel() {
             assert_eq!(channel, "general");
             assert_eq!(
                 recipients,
-                vec![(UserId(2), KeyMode::Password, user(2, "bob").public_key_der)]
+                vec![(UserId(2), user(2, "bob").public_key_der)]
             );
         }
         other => panic!("expected VoiceRecordStart(Channel), got {other:?}"),
@@ -788,8 +788,8 @@ fn a_message_arriving_in_a_different_channel_does_not_move_the_current_selection
 fn sidebar_shows_each_users_encryption_tag_after_their_name() {
     let state = joined_general_with(vec![
         pq_hybrid_user(2, "bob"),
-        password_user(4, "dan"),
-        plain_user(5, "eve"),
+        pq_hybrid_user(4, "dan"),
+        pq_hybrid_user(5, "eve"),
     ]);
     // the sidebar is a fixed 20% of the frame width (SPEC.md) - a narrow
     // terminal clips long labels just like it clips any other long text
@@ -811,11 +811,11 @@ fn sidebar_shows_each_users_encryption_tag_after_their_name() {
         "expected bob's tag rendered after his name: {rows:?}"
     );
     assert!(
-        appears_before(&rows, "dan", "PWD"),
+        appears_before(&rows, "dan", "PQH"),
         "expected dan's tag rendered after his name: {rows:?}"
     );
     assert!(
-        appears_before(&rows, "eve", "PLAIN"),
+        appears_before(&rows, "eve", "PQH"),
         "expected eve's tag rendered after her name: {rows:?}"
     );
 }
@@ -2544,13 +2544,13 @@ fn each_selector_dropdown_hangs_under_the_selector_it_belongs_to() {
 fn the_user_lists_encryption_tags_are_flush_right_with_the_names_on_the_left() {
     let mut state = joined_general_with(vec![
         pq_hybrid_user(2, "bo"),
-        password_user(3, "bartholomew"),
+        pq_hybrid_user(3, "bartholomew"),
     ]);
     state.select_channel_at(0);
 
     let buffer = buffer_at(&state, 100, 14);
     let rows = popup_body(&buffer, "Users");
-    let tagged: Vec<&String> = rows.iter().filter(|r| r.contains("PWD") || r.contains("PQH")).collect();
+    let tagged: Vec<&String> = rows.iter().filter(|r| r.contains("PQH")).collect();
     assert_eq!(tagged.len(), 2, "one row per member: {rows:?}");
 
     for row in &tagged {

@@ -47,43 +47,6 @@ impl KeyType {
     }
 }
 
-/// `my_key`'s type selector is a separate enum from `server_key`'s
-/// (`KeyType`): only `my_key` can be `pq_hybrid`, which has no meaning for
-/// the server auth challenge.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum MyKeyType {
-    Password,
-    None,
-    /// The default `my_key` selection: ML-DSA-87+RSA4096 signing,
-    /// ML-KEM-1024+RSA4096 key-wrap, AES-256-GCM bulk encryption (§13) - a
-    /// static, file-loaded keybundle. Generated with
-    /// `aloo --keygen-pq-hybrid` (no `openssl` exists for ML-DSA/ML-KEM),
-    /// though connecting auto-generates a missing bundle
-    /// (`crypto::pq::ensure_bundle_at`), so no manual step is required.
-    /// Chosen as the default because it's the strongest identity this app
-    /// offers.
-    #[default]
-    PqHybrid,
-}
-
-impl MyKeyType {
-    pub fn cycle_next(self) -> Self {
-        match self {
-            MyKeyType::Password => MyKeyType::None,
-            MyKeyType::None => MyKeyType::PqHybrid,
-            MyKeyType::PqHybrid => MyKeyType::Password,
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            MyKeyType::Password => "password",
-            MyKeyType::None => "none",
-            MyKeyType::PqHybrid => "pq_hybrid",
-        }
-    }
-}
-
 #[derive(Debug, Clone, Default)]
 pub struct ServerKeyFields {
     pub key_type: KeyType,
@@ -91,13 +54,24 @@ pub struct ServerKeyFields {
     pub file: String,
 }
 
+/// `my_key` has no type selector: `pq_hybrid` (ML-DSA-87+RSA4096 signing,
+/// ML-KEM-1024+RSA4096 key-wrap, AES-256-GCM bulk encryption - §13) is the
+/// only peer-to-peer scheme this app has, so the group is just the two
+/// keybundle files. Generated with `aloo --keygen-pq-hybrid` (no `openssl`
+/// exists for ML-DSA/ML-KEM), though connecting auto-generates a missing
+/// bundle (`crypto::pq::ensure_bundle_at`), so no manual step is required.
 #[derive(Debug, Clone, Default)]
 pub struct MyKeyFields {
-    pub key_type: MyKeyType,
-    pub password: String,
     pub file_pub: String,
     pub file_priv: String,
 }
+
+/// Prefix of the read-only line above the Connect button naming the
+/// directory every piece of this client's local state lives under
+/// (`crate::platform::aloo_dir`). Spelled as the environment variable
+/// that sets it, so the line doubles as the answer to "how do I run a
+/// second client on this machine": `ALOO_HOME=/tmp/aloo-bob aloo`.
+pub const ALOO_HOME_LABEL: &str = "ALOO_HOME=";
 
 /// Nicknames are capped at this many characters (sidebar/private-room
 /// labels also show each user's encryption method after the name, so a
@@ -112,7 +86,6 @@ pub enum Field {
     IdStorePath,
     ServerKeyType,
     ServerKeyValue,
-    MyKeyType,
     MyKeyValuePub,
     MyKeyValuePriv,
     Connect,
@@ -143,6 +116,14 @@ pub struct ConnectPopupState {
     pub id_store_path: String,
     pub server_key: ServerKeyFields,
     pub my_key: MyKeyFields,
+    /// The `ALOO_HOME` this process actually resolved
+    /// (`crate::platform::aloo_dir`) - every local store lives under it,
+    /// and running two clients on one machine means giving each its own.
+    /// Shown read-only above the Connect button so it is visible at the
+    /// moment it matters, rather than only in `Ctrl+H` and the README.
+    /// Captured once when the popup opens: a field, not a call at render
+    /// time, so the rendering stays a pure function of this state.
+    pub aloo_home: String,
     pub focus: Field,
     pub browser: Option<(FileBrowserTarget, FileBrowserState)>,
     pub error: Option<String>,
@@ -163,15 +144,17 @@ impl ConnectPopupState {
             id_store_path: crate::client::idstore::default_path().display().to_string(),
             server_key: ServerKeyFields::default(),
             my_key: MyKeyFields::default(),
+            aloo_home: crate::platform::aloo_dir().display().to_string(),
             focus: Field::Host,
             browser: None,
             error: None,
         }
     }
 
-    /// The focusable fields for the *current* key type selections: a
-    /// field only appears once it's actually shown (e.g. `MyKeyValuePriv`
-    /// only exists while `my_key.key_type == PqHybrid`).
+    /// The focusable fields for the *current* `server_key` selection: its
+    /// value field only appears once it's actually shown. `my_key` always
+    /// contributes both of its keybundle paths - there is only one scheme,
+    /// so nothing about that group is conditional.
     pub fn focus_order(&self) -> Vec<Field> {
         let mut v = vec![
             Field::Host,
@@ -183,15 +166,8 @@ impl ConnectPopupState {
         if self.server_key.key_type != KeyType::None {
             v.push(Field::ServerKeyValue);
         }
-        v.push(Field::MyKeyType);
-        match self.my_key.key_type {
-            MyKeyType::None => {}
-            MyKeyType::Password => v.push(Field::MyKeyValuePub),
-            MyKeyType::PqHybrid => {
-                v.push(Field::MyKeyValuePub);
-                v.push(Field::MyKeyValuePriv);
-            }
-        }
+        v.push(Field::MyKeyValuePub);
+        v.push(Field::MyKeyValuePriv);
         v.push(Field::Connect);
         v
     }
@@ -230,11 +206,6 @@ impl ConnectPopupState {
                 self.clamp_focus_after_type_change();
                 Ok(Action::None)
             }
-            KeyCode::Left | KeyCode::Right if self.focus == Field::MyKeyType => {
-                self.my_key.key_type = self.my_key.key_type.cycle_next();
-                self.clamp_focus_after_type_change();
-                Ok(Action::None)
-            }
             KeyCode::Backspace => {
                 self.backspace_focused();
                 Ok(Action::None)
@@ -247,9 +218,9 @@ impl ConnectPopupState {
         }
     }
 
-    /// If the field we were on just disappeared (e.g. `my_key` switched
-    /// away from `rsa` while focus was on `file_priv`), fall back to a
-    /// field that's always present instead of an orphaned one.
+    /// If the field we were on just disappeared (`server_key` switched to
+    /// `none` while focus was on its value), fall back to a field that's
+    /// always present instead of an orphaned one.
     fn clamp_focus_after_type_change(&mut self) {
         if !self.focus_order().contains(&self.focus) {
             self.focus = Field::Connect;
@@ -263,20 +234,11 @@ impl ConnectPopupState {
                 self.clamp_focus_after_type_change();
                 Ok(Action::None)
             }
-            Field::MyKeyType => {
-                self.my_key.key_type = self.my_key.key_type.cycle_next();
-                self.clamp_focus_after_type_change();
-                Ok(Action::None)
-            }
             Field::ServerKeyValue if self.server_key.key_type == KeyType::Rsa => {
                 self.open_browser(FileBrowserTarget::ServerKeyFile)
             }
-            Field::MyKeyValuePub if self.my_key.key_type == MyKeyType::PqHybrid => {
-                self.open_browser(FileBrowserTarget::MyKeyFilePub)
-            }
-            Field::MyKeyValuePriv if self.my_key.key_type == MyKeyType::PqHybrid => {
-                self.open_browser(FileBrowserTarget::MyKeyFilePriv)
-            }
+            Field::MyKeyValuePub => self.open_browser(FileBrowserTarget::MyKeyFilePub),
+            Field::MyKeyValuePriv => self.open_browser(FileBrowserTarget::MyKeyFilePriv),
             Field::Connect => match self.build_request() {
                 Ok(req) => Ok(Action::Connect(req)),
                 Err(e) => {
@@ -365,9 +327,6 @@ impl ConnectPopupState {
             Field::ServerKeyValue if self.server_key.key_type == KeyType::Password => {
                 self.server_key.password.pop();
             }
-            Field::MyKeyValuePub if self.my_key.key_type == MyKeyType::Password => {
-                self.my_key.password.pop();
-            }
             _ => {}
         }
     }
@@ -384,9 +343,6 @@ impl ConnectPopupState {
             Field::IdStorePath => self.id_store_path.push(c),
             Field::ServerKeyValue if self.server_key.key_type == KeyType::Password => {
                 self.server_key.password.push(c)
-            }
-            Field::MyKeyValuePub if self.my_key.key_type == MyKeyType::Password => {
-                self.my_key.password.push(c)
             }
             _ => {}
         }
@@ -426,23 +382,12 @@ impl ConnectPopupState {
             }
         };
 
-        let my_key = match self.my_key.key_type {
-            MyKeyType::None => MyKeySelection::None,
-            MyKeyType::Password => {
-                if self.my_key.password.is_empty() {
-                    return Err("my_key password is required".to_string());
-                }
-                MyKeySelection::Password(self.my_key.password.clone())
-            }
-            MyKeyType::PqHybrid => {
-                if self.my_key.file_pub.is_empty() || self.my_key.file_priv.is_empty() {
-                    return Err("my_key file_pub and file_priv are both required".to_string());
-                }
-                MyKeySelection::PqHybrid {
-                    file_pub: PathBuf::from(&self.my_key.file_pub),
-                    file_priv: PathBuf::from(&self.my_key.file_priv),
-                }
-            }
+        if self.my_key.file_pub.is_empty() || self.my_key.file_priv.is_empty() {
+            return Err("my_key file_pub and file_priv are both required".to_string());
+        }
+        let my_key = MyKeySelection {
+            file_pub: PathBuf::from(&self.my_key.file_pub),
+            file_priv: PathBuf::from(&self.my_key.file_priv),
         };
 
         Ok(ConnectRequest {
@@ -497,9 +442,9 @@ fn render_bordered_field(
 }
 
 /// Places the blinking terminal cursor at the end of the currently typed
-/// text in `inner`, `offset` columns in (non-zero for the `server_key`/
-/// `my_key` password fields, which share their line with a `"value: "`
-/// label rather than living in their own bordered box) - mirroring
+/// text in `inner`, `offset` columns in (non-zero for the `server_key`
+/// password field, which shares its line with a `"value: "` label rather
+/// than living in its own bordered box) - mirroring
 /// `ui::render_input_bar`'s cursor logic. Without this, a focused text
 /// field only *looks* focused (reversed value) but never actually shows
 /// where typing lands.
@@ -559,8 +504,9 @@ pub fn render(frame: &mut Frame, state: &ConnectPopupState) {
             Constraint::Length(1), // spacer
             Constraint::Length(4), // server_key group
             Constraint::Length(1), // spacer
-            Constraint::Length(5), // my_key group
+            Constraint::Length(4), // my_key group
             Constraint::Length(1), // spacer
+            Constraint::Length(1), // ALOO_HOME
             Constraint::Length(3), // connect button
             Constraint::Min(1),    // error / hint
         ])
@@ -632,67 +578,43 @@ pub fn render(frame: &mut Frame, state: &ConnectPopupState) {
         );
     }
 
-    let my_key_block = Block::default().title("my_key").borders(Borders::ALL);
+    // The group's title names the one scheme there is rather than
+    // spending a row on a selector that can only ever say `pq_hybrid`.
+    let my_key_block = Block::default()
+        .title("my_key (pq_hybrid)")
+        .borders(Borders::ALL);
     let my_key_inner = my_key_block.inner(chunks[7]);
     frame.render_widget(my_key_block, chunks[7]);
     let my_key_lines = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-        ])
+        .constraints([Constraint::Length(1), Constraint::Length(1)])
         .split(my_key_inner);
+    let pub_display = if state.my_key.file_pub.is_empty() {
+        "<press Enter to browse>".to_string()
+    } else {
+        state.my_key.file_pub.clone()
+    };
+    let priv_display = if state.my_key.file_priv.is_empty() {
+        "<press Enter to browse>".to_string()
+    } else {
+        state.my_key.file_priv.clone()
+    };
     frame.render_widget(
         Paragraph::new(key_field_line(
-            "type",
-            state.my_key.key_type.label(),
-            state.focus == Field::MyKeyType,
+            "file_pub",
+            &pub_display,
+            state.focus == Field::MyKeyValuePub,
         )),
         my_key_lines[0],
     );
-    match state.my_key.key_type {
-        MyKeyType::None => {}
-        MyKeyType::Password => {
-            let masked = "*".repeat(state.my_key.password.len());
-            frame.render_widget(
-                Paragraph::new(key_field_line(
-                    "value",
-                    &masked,
-                    state.focus == Field::MyKeyValuePub,
-                )),
-                my_key_lines[1],
-            );
-        }
-        MyKeyType::PqHybrid => {
-            let pub_display = if state.my_key.file_pub.is_empty() {
-                "<press Enter to browse>".to_string()
-            } else {
-                state.my_key.file_pub.clone()
-            };
-            let priv_display = if state.my_key.file_priv.is_empty() {
-                "<press Enter to browse>".to_string()
-            } else {
-                state.my_key.file_priv.clone()
-            };
-            frame.render_widget(
-                Paragraph::new(key_field_line(
-                    "file_pub",
-                    &pub_display,
-                    state.focus == Field::MyKeyValuePub,
-                )),
-                my_key_lines[1],
-            );
-            frame.render_widget(
-                Paragraph::new(key_field_line(
-                    "file_priv",
-                    &priv_display,
-                    state.focus == Field::MyKeyValuePriv,
-                )),
-                my_key_lines[2],
-            );
-        }
-    }
+    frame.render_widget(
+        Paragraph::new(key_field_line(
+            "file_priv",
+            &priv_display,
+            state.focus == Field::MyKeyValuePriv,
+        )),
+        my_key_lines[1],
+    );
 
     // The cursor always follows whichever text field currently has focus,
     // starting on `host` the moment the popup opens (its default focus).
@@ -710,14 +632,19 @@ pub fn render(frame: &mut Frame, state: &ConnectPopupState) {
                 &server_key_value,
             )
         }
-        Field::MyKeyValuePub if state.my_key.key_type == MyKeyType::Password => {
-            let masked = "*".repeat(state.my_key.password.len());
-            place_text_cursor(frame, my_key_lines[1], VALUE_LABEL_LEN, &masked)
-        }
         _ => {}
     }
 
-    render_connect_button(frame, chunks[9], state.focus == Field::Connect);
+    // Read-only, and gray so it reads as a note about where this client's
+    // local state lives rather than as another thing to fill in.
+    frame.render_widget(
+        Paragraph::new(format!("{ALOO_HOME_LABEL}{}", state.aloo_home))
+            .style(Style::default().fg(Color::DarkGray))
+            .alignment(Alignment::Left),
+        chunks[9],
+    );
+
+    render_connect_button(frame, chunks[10], state.focus == Field::Connect);
 
     let hint = state
         .error
@@ -732,7 +659,7 @@ pub fn render(frame: &mut Frame, state: &ConnectPopupState) {
         Paragraph::new(hint)
             .style(hint_style)
             .alignment(Alignment::Left),
-        chunks[10],
+        chunks[11],
     );
 
     if let Some((_, browser)) = &state.browser {

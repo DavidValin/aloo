@@ -659,10 +659,9 @@ async fn no_pinned_identity(w: &mut AlooWorld, _name: String) {
 
 #[given(expr = "alice has a pinned identity for {string} that is not a pq_hybrid one")]
 async fn pinned_but_unsigned(w: &mut AlooWorld, name: String) {
-    // The unsigned key modes (`Password`/`None`) pin a plain RSA key, which
-    // carries no signature - so nothing arriving under it could ever prove
-    // who sent it.
-    scratch_id_store(w).check_and_pin(&name, b"an-rsa-family-key-not-a-pq-bundle");
+    // What a hand-installed pad contact leaves behind: a pin that names
+    // someone but carries no keybundle to seal anything to.
+    scratch_id_store(w).check_and_pin(&name, b"a-pad-only-pin-not-a-pq-bundle");
 }
 
 #[then(expr = "{string} cannot become an addressable peer")]
@@ -671,7 +670,31 @@ async fn cannot_become_peer(w: &mut AlooWorld, name: String) {
     assert!(
         direct_peer_identity(store, &name).is_none(),
         "{name} must not be registerable: a nickname on an unauthenticated \
-         punch names nobody, and only a signed key mode can prove otherwise"
+         punch names nobody at all unless something is pinned for it"
+    );
+}
+
+#[then(expr = "{string} is named by that pin, but nothing is sealed to it")]
+async fn named_but_unsealable(w: &mut AlooWorld, name: String) {
+    let store = scratch_id_store(w);
+    let info = direct_peer_identity(store, &name)
+        .unwrap_or_else(|| panic!("{name} is pinned, so the pin names them"));
+    assert!(
+        aloo::crypto::pq::fingerprint_of_encoded(&info.public_key_der).is_none(),
+        "the pin is deliberately not a keybundle, so no envelope can be built for them"
+    );
+}
+
+#[then(expr = "only a pad can prove {string} is who the pin says")]
+async fn only_a_pad_proves(w: &mut AlooWorld, name: String) {
+    let store = scratch_id_store(w);
+    let info = direct_peer_identity(store, &name).expect("pinned");
+    // With no keybundle on their side the pair is framed direct, which is
+    // the framing whose authentication *is* the pad's decrypt verdict
+    // (docs/PROTOCOL.md 16.2).
+    assert_eq!(
+        aloo::client::otp::framing_for(b"our-own-pad-only-pin", &info.public_key_der),
+        aloo::client::otp::OtpFraming::Direct
     );
 }
 

@@ -62,17 +62,22 @@ Feature: Filling in the connect form
     Then the "id_store" field contains "/tmp/my_ids_stor"
 
   @AC-070
-  Scenario: my_key defaults to pq_hybrid, this app's strongest identity
+  Scenario: my_key is pq_hybrid, the one peer-to-peer scheme this app has
     Given the connect form is open
-    Then my_key defaults to pq_hybrid
+    Then my_key is pq_hybrid with no type to choose
+
+  @AC-258
+  Scenario: The form names the ALOO_HOME this client is actually using
+    Given the connect form is open
+    Then the form shows the ALOO_HOME it resolved, in gray
 
   @AC-007 @TB-006
   Scenario: A completed form connects
     Given the connect form is open
     And the connect form is filled in with valid details
-    And my_key is set to none
+    And my_key points at a keybundle pair
     Then a visible Connect button is offered
-    And the request carries no key material for either key
+    And the request carries no server key material
     When I submit the form
     Then connecting begins with the details I entered
 
@@ -86,15 +91,15 @@ Feature: Filling in the connect form
   Scenario Outline: Each missing piece of the form is reported by name
     Given the connect form is open
     And the connect form is filled in with valid details
-    And my_key is set to <my_key>
+    And my_key points at a keybundle pair
     When I clear the "<field>" field
     Then building the request fails mentioning "<message>"
 
     Examples:
-      | field    | my_key | message  |
-      | host     | none   | host     |
-      | nickname | none   | nickname |
-      | id_store | none   | id_store |
+      | field    | message  |
+      | host     | host     |
+      | nickname | nickname |
+      | id_store | id_store |
 
   @AC-009
   Scenario: Escape abandons the form

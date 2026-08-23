@@ -1,12 +1,12 @@
 use std::net::{IpAddr, Ipv4Addr};
 
+use aloo::control::ControlEndpoint;
 use aloo::crypto;
 use aloo::proto::*;
 use aloo::server::{
     AuthConfig, CHANNEL_MAX_PASSWORD_ATTEMPTS, CHANNEL_PASSWORD_BAN_DURATION, DEFAULT_CHANNEL_NAME,
     Outgoing, Registry, serve, serve_with_heartbeat_timeout,
 };
-use aloo::control::ControlEndpoint;
 use tokio::net::{TcpListener, TcpStream};
 
 const TEST_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
@@ -44,7 +44,7 @@ fn fresh_registry_has_default_public_the_hall_channel() {
 #[test]
 fn register_stores_user_info() {
     let mut reg = Registry::new();
-    let id = reg.register("dave".into(), vec![1, 2, 3], KeyMode::Password);
+    let id = reg.register("dave".into(), vec![1, 2, 3], KeyMode::PqHybrid);
     let info = reg.user_info(id).expect("registered user");
     assert_eq!(info.name, "dave");
     assert_eq!(info.public_key_der, vec![1, 2, 3]);
@@ -55,7 +55,7 @@ fn register_stores_user_info() {
 fn name_taken_reflects_currently_registered_clients() {
     let mut reg = Registry::new();
     assert!(!reg.name_taken("dave"));
-    reg.register("dave".into(), vec![], KeyMode::Password);
+    reg.register("dave".into(), vec![], KeyMode::PqHybrid);
     assert!(reg.name_taken("dave"));
     assert!(
         !reg.name_taken("Dave"),
@@ -68,10 +68,10 @@ fn name_taken_reflects_currently_registered_clients() {
 fn try_register_rejects_a_nickname_already_in_use() {
     let mut reg = Registry::new();
     let first = reg
-        .try_register("dave".into(), vec![1], KeyMode::Password)
+        .try_register("dave".into(), vec![1], KeyMode::PqHybrid)
         .expect("first registration succeeds");
     let err = reg
-        .try_register("dave".into(), vec![2], KeyMode::Password)
+        .try_register("dave".into(), vec![2], KeyMode::PqHybrid)
         .unwrap_err();
     assert!(err.contains("dave"));
     assert!(err.contains("taken"));
@@ -85,11 +85,11 @@ fn try_register_rejects_a_nickname_already_in_use() {
 fn try_register_allows_the_name_again_once_the_holder_is_gone() {
     let mut reg = Registry::new();
     let first = reg
-        .try_register("dave".into(), vec![1], KeyMode::Password)
+        .try_register("dave".into(), vec![1], KeyMode::PqHybrid)
         .unwrap();
     reg.unregister(first);
     let second = reg
-        .try_register("dave".into(), vec![2], KeyMode::Password)
+        .try_register("dave".into(), vec![2], KeyMode::PqHybrid)
         .expect("name freed up after unregister");
     assert_eq!(reg.user_info(second).unwrap().public_key_der, vec![2]);
 }
@@ -98,7 +98,7 @@ fn try_register_allows_the_name_again_once_the_holder_is_gone() {
 #[test]
 fn joining_new_channel_sends_confirmation_and_no_peer_events() {
     let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::Password);
+    let alice = reg.register("alice".into(), vec![], KeyMode::PqHybrid);
     let out = reg
         .join_channel(alice, "general", ChannelKind::Public, None, TEST_IP)
         .unwrap();
@@ -114,8 +114,8 @@ fn joining_new_channel_sends_confirmation_and_no_peer_events() {
 #[test]
 fn second_joiner_gets_snapshot_and_first_gets_notified() {
     let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![9], KeyMode::Password);
-    let bob = reg.register("bob".into(), vec![8], KeyMode::Password);
+    let alice = reg.register("alice".into(), vec![9], KeyMode::PqHybrid);
+    let bob = reg.register("bob".into(), vec![8], KeyMode::PqHybrid);
     reg.join_channel(alice, "general", ChannelKind::Public, None, TEST_IP)
         .unwrap();
     let out = reg
@@ -153,7 +153,7 @@ fn second_joiner_gets_snapshot_and_first_gets_notified() {
 #[test]
 fn rejoining_a_channel_is_a_noop() {
     let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::Password);
+    let alice = reg.register("alice".into(), vec![], KeyMode::PqHybrid);
     reg.join_channel(alice, "general", ChannelKind::Public, None, TEST_IP)
         .unwrap();
     let out = reg
@@ -166,7 +166,7 @@ fn rejoining_a_channel_is_a_noop() {
 #[test]
 fn private_channel_is_created_on_join_but_not_listed() {
     let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::Password);
+    let alice = reg.register("alice".into(), vec![], KeyMode::PqHybrid);
     reg.join_channel(alice, "secret-room", ChannelKind::Private, None, TEST_IP)
         .unwrap();
     let list = reg.channel_list();
@@ -177,8 +177,8 @@ fn private_channel_is_created_on_join_but_not_listed() {
 #[test]
 fn leaving_notifies_remaining_members() {
     let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::Password);
-    let bob = reg.register("bob".into(), vec![], KeyMode::Password);
+    let alice = reg.register("alice".into(), vec![], KeyMode::PqHybrid);
+    let bob = reg.register("bob".into(), vec![], KeyMode::PqHybrid);
     reg.join_channel(alice, "general", ChannelKind::Public, None, TEST_IP)
         .unwrap();
     reg.join_channel(bob, "general", ChannelKind::Public, None, TEST_IP)
@@ -197,7 +197,7 @@ fn leaving_notifies_remaining_members() {
 #[test]
 fn empty_channel_is_deleted_unless_it_is_the_default_channel() {
     let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::Password);
+    let alice = reg.register("alice".into(), vec![], KeyMode::PqHybrid);
     reg.join_channel(
         alice,
         DEFAULT_CHANNEL_NAME,
@@ -250,8 +250,8 @@ fn empty_channel_is_deleted_unless_it_is_the_default_channel() {
 #[test]
 fn a_newly_created_public_channel_is_broadcast_to_other_connected_clients() {
     let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::Password);
-    let bob = reg.register("bob".into(), vec![], KeyMode::Password);
+    let alice = reg.register("alice".into(), vec![], KeyMode::PqHybrid);
+    let bob = reg.register("bob".into(), vec![], KeyMode::PqHybrid);
 
     let out = reg
         .join_channel(alice, "brand-new-room", ChannelKind::Public, None, TEST_IP)
@@ -275,8 +275,8 @@ fn a_newly_created_public_channel_is_broadcast_to_other_connected_clients() {
 #[test]
 fn creating_a_private_channel_never_broadcasts_channelcreated() {
     let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::Password);
-    let _bob = reg.register("bob".into(), vec![], KeyMode::Password);
+    let alice = reg.register("alice".into(), vec![], KeyMode::PqHybrid);
+    let _bob = reg.register("bob".into(), vec![], KeyMode::PqHybrid);
 
     let out = reg
         .join_channel(alice, "secret-room", ChannelKind::Private, None, TEST_IP)
@@ -292,9 +292,9 @@ fn creating_a_private_channel_never_broadcasts_channelcreated() {
 #[test]
 fn joining_an_already_existing_public_channel_does_not_rebroadcast_it() {
     let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::Password);
-    let bob = reg.register("bob".into(), vec![], KeyMode::Password);
-    let carol = reg.register("carol".into(), vec![], KeyMode::Password);
+    let alice = reg.register("alice".into(), vec![], KeyMode::PqHybrid);
+    let bob = reg.register("bob".into(), vec![], KeyMode::PqHybrid);
+    let carol = reg.register("carol".into(), vec![], KeyMode::PqHybrid);
 
     reg.join_channel(alice, "already-there", ChannelKind::Public, None, TEST_IP)
         .unwrap();
@@ -312,8 +312,8 @@ fn joining_an_already_existing_public_channel_does_not_rebroadcast_it() {
 #[test]
 fn unregister_removes_user_from_every_channel_it_was_in() {
     let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::Password);
-    let bob = reg.register("bob".into(), vec![], KeyMode::Password);
+    let alice = reg.register("alice".into(), vec![], KeyMode::PqHybrid);
+    let bob = reg.register("bob".into(), vec![], KeyMode::PqHybrid);
     reg.join_channel(alice, "general", ChannelKind::Public, None, TEST_IP)
         .unwrap();
     reg.join_channel(bob, "general", ChannelKind::Public, None, TEST_IP)
@@ -332,8 +332,8 @@ fn unregister_removes_user_from_every_channel_it_was_in() {
 #[test]
 fn unregister_sends_exactly_one_useroffline_per_peer_even_if_shared_multiple_channels() {
     let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::Password);
-    let bob = reg.register("bob".into(), vec![], KeyMode::Password);
+    let alice = reg.register("alice".into(), vec![], KeyMode::PqHybrid);
+    let bob = reg.register("bob".into(), vec![], KeyMode::PqHybrid);
     reg.join_channel(alice, "general", ChannelKind::Public, None, TEST_IP)
         .unwrap();
     reg.join_channel(bob, "general", ChannelKind::Public, None, TEST_IP)
@@ -359,8 +359,8 @@ fn unregister_sends_exactly_one_useroffline_per_peer_even_if_shared_multiple_cha
 #[test]
 fn leave_channel_still_sends_userleft_while_the_user_stays_connected() {
     let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::Password);
-    let bob = reg.register("bob".into(), vec![], KeyMode::Password);
+    let alice = reg.register("alice".into(), vec![], KeyMode::PqHybrid);
+    let bob = reg.register("bob".into(), vec![], KeyMode::PqHybrid);
     reg.join_channel(alice, "general", ChannelKind::Public, None, TEST_IP)
         .unwrap();
     reg.join_channel(bob, "general", ChannelKind::Public, None, TEST_IP)
@@ -383,7 +383,7 @@ fn leave_channel_still_sends_userleft_while_the_user_stays_connected() {
 #[test]
 fn join_channel_rejects_a_name_over_the_length_cap() {
     let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::Password);
+    let alice = reg.register("alice".into(), vec![], KeyMode::PqHybrid);
     let too_long = "a".repeat(22);
     let err = reg
         .join_channel(alice, &too_long, ChannelKind::Public, None, TEST_IP)
@@ -398,7 +398,7 @@ fn join_channel_rejects_a_name_over_the_length_cap() {
 #[test]
 fn join_channel_rejects_a_name_with_disallowed_characters() {
     let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::Password);
+    let alice = reg.register("alice".into(), vec![], KeyMode::PqHybrid);
     let err = reg
         .join_channel(alice, "has space", ChannelKind::Public, None, TEST_IP)
         .unwrap_err();
@@ -416,8 +416,8 @@ fn join_channel_rejects_a_name_with_disallowed_characters() {
 #[test]
 fn private_channel_created_with_a_password_can_be_joined_by_a_second_client_with_the_right_one() {
     let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::Password);
-    let bob = reg.register("bob".into(), vec![], KeyMode::Password);
+    let alice = reg.register("alice".into(), vec![], KeyMode::PqHybrid);
+    let bob = reg.register("bob".into(), vec![], KeyMode::PqHybrid);
     reg.join_channel(
         alice,
         "vault",
@@ -437,8 +437,8 @@ fn private_channel_created_with_a_password_can_be_joined_by_a_second_client_with
 #[test]
 fn private_channel_created_with_a_password_rejects_a_join_with_no_password() {
     let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::Password);
-    let bob = reg.register("bob".into(), vec![], KeyMode::Password);
+    let alice = reg.register("alice".into(), vec![], KeyMode::PqHybrid);
+    let bob = reg.register("bob".into(), vec![], KeyMode::PqHybrid);
     reg.join_channel(
         alice,
         "vault",
@@ -462,8 +462,8 @@ fn private_channel_created_with_a_password_rejects_a_join_with_no_password() {
 #[test]
 fn private_channel_created_with_a_password_rejects_a_join_with_the_wrong_password() {
     let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::Password);
-    let bob = reg.register("bob".into(), vec![], KeyMode::Password);
+    let alice = reg.register("alice".into(), vec![], KeyMode::PqHybrid);
+    let bob = reg.register("bob".into(), vec![], KeyMode::PqHybrid);
     reg.join_channel(
         alice,
         "vault",
@@ -487,8 +487,8 @@ fn private_channel_created_with_a_password_rejects_a_join_with_the_wrong_passwor
 #[test]
 fn a_successful_password_join_resets_the_attempt_counter() {
     let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::Password);
-    let bob = reg.register("bob".into(), vec![], KeyMode::Password);
+    let alice = reg.register("alice".into(), vec![], KeyMode::PqHybrid);
+    let bob = reg.register("bob".into(), vec![], KeyMode::PqHybrid);
     reg.join_channel(
         alice,
         "vault",
@@ -525,8 +525,8 @@ fn a_successful_password_join_resets_the_attempt_counter() {
 #[test]
 fn more_than_seven_wrong_attempts_from_one_ip_bans_that_ip_for_that_channel() {
     let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::Password);
-    let bob = reg.register("bob".into(), vec![], KeyMode::Password);
+    let alice = reg.register("alice".into(), vec![], KeyMode::PqHybrid);
+    let bob = reg.register("bob".into(), vec![], KeyMode::PqHybrid);
     reg.join_channel(
         alice,
         "vault",
@@ -568,8 +568,8 @@ fn more_than_seven_wrong_attempts_from_one_ip_bans_that_ip_for_that_channel() {
 #[test]
 fn a_ban_is_scoped_to_ip_and_channel_not_userid() {
     let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::Password);
-    let bob = reg.register("bob".into(), vec![], KeyMode::Password);
+    let alice = reg.register("alice".into(), vec![], KeyMode::PqHybrid);
+    let bob = reg.register("bob".into(), vec![], KeyMode::PqHybrid);
     reg.join_channel(
         alice,
         "vault",
@@ -608,8 +608,8 @@ fn a_ban_is_scoped_to_ip_and_channel_not_userid() {
 #[test]
 fn channel_join_rejected_is_sent_to_the_requester_only() {
     let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::Password);
-    let bob = reg.register("bob".into(), vec![], KeyMode::Password);
+    let alice = reg.register("alice".into(), vec![], KeyMode::PqHybrid);
+    let bob = reg.register("bob".into(), vec![], KeyMode::PqHybrid);
     reg.join_channel(
         alice,
         "vault",
@@ -638,8 +638,8 @@ fn channel_join_rejected_is_sent_to_the_requester_only() {
 #[test]
 fn peer_link_request_relays_candidates_to_the_named_peer() {
     let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::Password);
-    let bob = reg.register("bob".into(), vec![], KeyMode::Password);
+    let alice = reg.register("alice".into(), vec![], KeyMode::PqHybrid);
+    let bob = reg.register("bob".into(), vec![], KeyMode::PqHybrid);
     let candidates = vec![
         "127.0.0.1:4000".parse().unwrap(),
         "203.0.113.5:51820".parse().unwrap(),
@@ -660,7 +660,7 @@ fn peer_link_request_relays_candidates_to_the_named_peer() {
 #[test]
 fn peer_link_request_to_an_unknown_recipient_is_rejected() {
     let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::Password);
+    let alice = reg.register("alice".into(), vec![], KeyMode::PqHybrid);
     let err = reg
         .route_peer_link_request(alice, UserId(9999), vec![], 1)
         .unwrap_err();
@@ -676,9 +676,9 @@ fn peer_link_request_to_an_unknown_recipient_is_rejected() {
 fn user_info_reflects_registered_key_mode() {
     let mut reg = Registry::new();
     let alice = reg.register("alice".into(), vec![1], KeyMode::PqHybrid);
-    let bob = reg.register("bob".into(), vec![2], KeyMode::Password);
+    let bob = reg.register("bob".into(), vec![2], KeyMode::PqHybrid);
     assert_eq!(reg.user_info(alice).unwrap().key_mode, KeyMode::PqHybrid);
-    assert_eq!(reg.user_info(bob).unwrap().key_mode, KeyMode::Password);
+    assert_eq!(reg.user_info(bob).unwrap().key_mode, KeyMode::PqHybrid);
 }
 
 /// @requirement TB-082
@@ -686,7 +686,7 @@ fn user_info_reflects_registered_key_mode() {
 fn key_rotation_is_delivered_to_recipient() {
     let mut reg = Registry::new();
     let alice = reg.register("alice".into(), vec![], KeyMode::PqHybrid);
-    let bob = reg.register("bob".into(), vec![], KeyMode::Password);
+    let bob = reg.register("bob".into(), vec![], KeyMode::PqHybrid);
     let out = reg
         .route_key_rotation(alice, bob, vec![9, 9, 9], vec![1, 1, 1])
         .expect("route ok");
@@ -697,40 +697,25 @@ fn key_rotation_is_delivered_to_recipient() {
     );
 }
 
-/// @requirement TB-082, TB-167
-#[test]
-fn key_rotation_from_a_static_mode_sender_is_rejected() {
-    for mode in [KeyMode::Password, KeyMode::None] {
-        let mut reg = Registry::new();
-        let alice = reg.register("alice".into(), vec![], mode);
-        let bob = reg.register("bob".into(), vec![], KeyMode::Password);
-        let err = reg
-            .route_key_rotation(alice, bob, vec![], vec![])
-            .unwrap_err();
-        assert!(
-            err.contains("does not rotate"),
-            "a {mode:?} sender has no keys to rotate, so the relay must refuse: {err}"
-        );
-    }
-}
-
-/// Only `pq_hybrid` rotates its encryption keys - the server still
-/// verifies nothing about the payload itself.
+/// The server has no notion of which senders rotate - every client runs
+/// the one mode that does - and inspects neither the key nor the
+/// signature it is relaying.
 /// @requirement TB-167
 #[test]
-fn rotate_key_is_rejected_from_a_non_rotating_sender() {
+fn the_server_relays_a_rotation_without_inspecting_it() {
     let mut reg = Registry::new();
     let alice = reg.register("alice".into(), vec![], KeyMode::PqHybrid);
     let bob = reg.register("bob".into(), vec![], KeyMode::PqHybrid);
-    assert!(
-        reg.route_key_rotation(alice, bob, vec![7], vec![8]).is_ok(),
-        "a PqHybrid sender rotates keys and must be relayed"
-    );
-
-    let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::None);
-    let bob = reg.register("bob".into(), vec![], KeyMode::PqHybrid);
-    assert!(reg.route_key_rotation(alice, bob, vec![7], vec![8]).is_err());
+    // Deliberately meaningless bytes: the server is not the thing that
+    // checks them, the recipient is (docs/PROTOCOL.md 13.10).
+    let out = reg
+        .route_key_rotation(alice, bob, vec![7], vec![8])
+        .expect("a registered sender's rotation is relayed");
+    assert_eq!(out.to, bob);
+    assert!(matches!(
+        &out.message,
+        ServerMessage::KeyRotated { from, .. } if *from == alice
+    ));
 }
 
 /// @requirement TB-082
@@ -748,7 +733,7 @@ fn key_rotation_to_unknown_recipient_is_rejected() {
 #[test]
 fn key_rotation_from_unknown_sender_is_rejected() {
     let mut reg = Registry::new();
-    let bob = reg.register("bob".into(), vec![], KeyMode::Password);
+    let bob = reg.register("bob".into(), vec![], KeyMode::PqHybrid);
     let err = reg
         .route_key_rotation(UserId(9999), bob, vec![], vec![])
         .unwrap_err();
@@ -819,7 +804,7 @@ fn rsa_auth_rejects_response_of_the_wrong_kind() {
 // ---------------------------------------------------------------------
 
 async fn handshake_no_auth(stream: &mut ControlEndpoint<TcpStream>, name: &str) -> UserId {
-    handshake_no_auth_with_mode(stream, name, KeyMode::Password).await
+    handshake_no_auth_with_mode(stream, name, KeyMode::PqHybrid).await
 }
 
 async fn handshake_no_auth_with_mode(
@@ -835,20 +820,21 @@ async fn handshake_no_auth_with_mode(
     assert_eq!(auth, AuthKind::None);
     assert_eq!(challenge, None);
 
-    stream.send(&ClientMessage::Auth(AuthResponse::None))
+    stream
+        .send(&ClientMessage::Auth(AuthResponse::None))
         .await
         .unwrap();
     let result: ServerMessage = stream.recv().await.unwrap().unwrap();
     assert!(matches!(result, ServerMessage::AuthResult { ok: true, .. }));
 
-    stream.send(&ClientMessage::Identify {
+    stream
+        .send(&ClientMessage::Identify {
             display_name: name.into(),
             public_key_der: vec![],
             key_mode,
-        },
-    )
-    .await
-    .unwrap();
+        })
+        .await
+        .unwrap();
 
     let identify_result: ServerMessage = stream.recv().await.unwrap().unwrap();
     let ServerMessage::IdentifyResult {
@@ -902,11 +888,10 @@ async fn end_to_end_two_clients_join_and_learn_about_each_other() {
     let bob_id = handshake_no_auth(&mut b, "bob").await;
 
     a.send(&ClientMessage::JoinChannel {
-            name: "general".into(),
-            kind: ChannelKind::Public,
-            password: None,
-        },
-    )
+        name: "general".into(),
+        kind: ChannelKind::Public,
+        password: None,
+    })
     .await
     .unwrap();
     let joined: ServerMessage = a.recv().await.unwrap().unwrap();
@@ -921,11 +906,10 @@ async fn end_to_end_two_clients_join_and_learn_about_each_other() {
     );
 
     b.send(&ClientMessage::JoinChannel {
-            name: "general".into(),
-            kind: ChannelKind::Public,
-            password: None,
-        },
-    )
+        name: "general".into(),
+        kind: ChannelKind::Public,
+        password: None,
+    })
     .await
     .unwrap();
 
@@ -951,11 +935,10 @@ async fn end_to_end_a_second_client_sees_a_newly_created_public_channel() {
     handshake_no_auth(&mut b, "bob").await;
 
     a.send(&ClientMessage::JoinChannel {
-            name: "watercooler".into(),
-            kind: ChannelKind::Public,
-            password: None,
-        },
-    )
+        name: "watercooler".into(),
+        kind: ChannelKind::Public,
+        password: None,
+    })
     .await
     .unwrap();
     let joined: ServerMessage = a.recv().await.unwrap().unwrap();
@@ -983,11 +966,10 @@ async fn end_to_end_password_protected_channel_join_flow() {
     handshake_no_auth(&mut b, "bob").await;
 
     a.send(&ClientMessage::JoinChannel {
-            name: "vault".into(),
-            kind: ChannelKind::Private,
-            password: Some("s3cret!".into()),
-        },
-    )
+        name: "vault".into(),
+        kind: ChannelKind::Private,
+        password: Some("s3cret!".into()),
+    })
     .await
     .unwrap();
     let joined: ServerMessage = a.recv().await.unwrap().unwrap();
@@ -995,11 +977,10 @@ async fn end_to_end_password_protected_channel_join_flow() {
 
     // bob tries with no password: told a password is required.
     b.send(&ClientMessage::JoinChannel {
-            name: "vault".into(),
-            kind: ChannelKind::Private,
-            password: None,
-        },
-    )
+        name: "vault".into(),
+        kind: ChannelKind::Private,
+        password: None,
+    })
     .await
     .unwrap();
     let rejected: ServerMessage = b.recv().await.unwrap().unwrap();
@@ -1013,11 +994,10 @@ async fn end_to_end_password_protected_channel_join_flow() {
 
     // bob retries with the right password.
     b.send(&ClientMessage::JoinChannel {
-            name: "vault".into(),
-            kind: ChannelKind::Private,
-            password: Some("s3cret!".into()),
-        },
-    )
+        name: "vault".into(),
+        kind: ChannelKind::Private,
+        password: Some("s3cret!".into()),
+    })
     .await
     .unwrap();
     let bob_snapshot: ServerMessage = b.recv().await.unwrap().unwrap();
@@ -1034,15 +1014,14 @@ async fn end_to_end_key_rotation_is_relayed_and_rejected_appropriately() {
     let mut a = ControlEndpoint::new(TcpStream::connect(addr).await.unwrap());
     let alice_id = handshake_no_auth_with_mode(&mut a, "alice", KeyMode::PqHybrid).await;
     let mut b = ControlEndpoint::new(TcpStream::connect(addr).await.unwrap());
-    let bob_id = handshake_no_auth_with_mode(&mut b, "bob", KeyMode::Password).await;
+    let bob_id = handshake_no_auth_with_mode(&mut b, "bob", KeyMode::PqHybrid).await;
 
-    // alice (pq_hybrid) rotates her key for bob - relayed as KeyRotated.
+    // alice rotates her key for bob - relayed verbatim as KeyRotated.
     a.send(&ClientMessage::RotateKey {
-            to: bob_id,
-            new_public_key_der: vec![4, 5, 6],
-            signature: vec![7, 8],
-        },
-    )
+        to: bob_id,
+        new_public_key_der: vec![4, 5, 6],
+        signature: vec![7, 8],
+    })
     .await
     .unwrap();
     let rotated: ServerMessage = b.recv().await.unwrap().unwrap();
@@ -1059,18 +1038,19 @@ async fn end_to_end_key_rotation_is_relayed_and_rejected_appropriately() {
         other => panic!("expected KeyRotated, got {other:?}"),
     }
 
-    // bob (Static) is not allowed to rotate: server sends him an Error back.
+    // A rotation naming a recipient the server has never heard of is
+    // refused - the one thing it does check.
     b.send(&ClientMessage::RotateKey {
-            to: alice_id,
-            new_public_key_der: vec![],
-            signature: vec![],
-        },
-    )
+        to: UserId(9999),
+        new_public_key_der: vec![],
+        signature: vec![],
+    })
     .await
     .unwrap();
     let err: ServerMessage = b.recv().await.unwrap().unwrap();
     assert!(
-        matches!(&err, ServerMessage::Error { message } if message.contains("does not rotate"))
+        matches!(&err, ServerMessage::Error { message } if message.contains("unknown recipient")),
+        "expected an unknown-recipient error, got {err:?}"
     );
 }
 
@@ -1087,10 +1067,10 @@ async fn end_to_end_wrong_password_is_rejected() {
         .expect("server closed during handshake");
     assert_eq!(auth, AuthKind::Password);
 
-    stream.send(&ClientMessage::Auth(AuthResponse::Password("wrong".into())),
-    )
-    .await
-    .unwrap();
+    stream
+        .send(&ClientMessage::Auth(AuthResponse::Password("wrong".into())))
+        .await
+        .unwrap();
     let result: ServerMessage = stream.recv().await.unwrap().unwrap();
     assert!(matches!(
         result,
@@ -1119,11 +1099,10 @@ async fn end_to_end_stray_auth_and_identify_after_handshake_error_but_stay_conne
 
     // a stray Identify right after: also an Error, connection still open
     a.send(&ClientMessage::Identify {
-            display_name: "dave2".into(),
-            public_key_der: vec![],
-            key_mode: KeyMode::Password,
-        },
-    )
+        display_name: "dave2".into(),
+        public_key_der: vec![],
+        key_mode: KeyMode::PqHybrid,
+    })
     .await
     .unwrap();
     let after_identify: ServerMessage = a.recv().await.unwrap().unwrap();
@@ -1136,11 +1115,10 @@ async fn end_to_end_stray_auth_and_identify_after_handshake_error_but_stay_conne
 
     // the connection is still fully usable afterward
     a.send(&ClientMessage::JoinChannel {
-            name: "general".into(),
-            kind: ChannelKind::Public,
-            password: None,
-        },
-    )
+        name: "general".into(),
+        kind: ChannelKind::Public,
+        password: None,
+    })
     .await
     .unwrap();
     let joined: ServerMessage = a.recv().await.unwrap().unwrap();
@@ -1173,11 +1151,10 @@ async fn end_to_end_duplicate_nickname_is_rejected_and_connection_closes() {
     ));
 
     b.send(&ClientMessage::Identify {
-            display_name: "dave".into(),
-            public_key_der: vec![],
-            key_mode: KeyMode::Password,
-        },
-    )
+        display_name: "dave".into(),
+        public_key_der: vec![],
+        key_mode: KeyMode::PqHybrid,
+    })
     .await
     .unwrap();
 
@@ -1202,11 +1179,10 @@ async fn end_to_end_duplicate_nickname_is_rejected_and_connection_closes() {
 
     // meanwhile the original "dave" is completely unaffected
     a.send(&ClientMessage::JoinChannel {
-            name: "general".into(),
-            kind: ChannelKind::Public,
-            password: None,
-        },
-    )
+        name: "general".into(),
+        kind: ChannelKind::Public,
+        password: None,
+    })
     .await
     .unwrap();
     let joined: ServerMessage = a.recv().await.unwrap().unwrap();
@@ -1282,13 +1258,16 @@ async fn ordinary_traffic_resets_the_heartbeat_timeout_clock() {
     b.send(&ClientMessage::Identify {
         display_name: "dave".into(),
         public_key_der: vec![],
-        key_mode: KeyMode::Password,
+        key_mode: KeyMode::PqHybrid,
     })
     .await
     .unwrap();
     let identify_result: ServerMessage = b.recv().await.unwrap().unwrap();
     assert!(
-        matches!(identify_result, ServerMessage::IdentifyResult { ok: false, .. }),
+        matches!(
+            identify_result,
+            ServerMessage::IdentifyResult { ok: false, .. }
+        ),
         "dave's original connection should still be alive, kept so by its heartbeats: {identify_result:?}"
     );
 }

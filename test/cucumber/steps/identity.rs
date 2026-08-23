@@ -5,9 +5,9 @@ use crossterm::event::{KeyCode, KeyModifiers};
 use cucumber::{given, then, when};
 
 use aloo::client::idstore::{IdCheck, IdStore};
-use aloo::proto::UserId;
 use aloo::client::rekey::{QueuedOutbound, RemoteKeys};
 use aloo::client::tui::ui::{IdentityCase, MessageBody, UiAction};
+use aloo::proto::UserId;
 
 use crate::steps::ui_common::{id_for, press_key};
 use crate::support::ui_rows;
@@ -333,7 +333,7 @@ async fn still_flagged(w: &mut AlooWorld, name: String) {
 async fn send_excludes(w: &mut AlooWorld, excluded: String, included: String) {
     match w.last_action.as_ref().expect("no action was produced") {
         UiAction::SendChannelText { recipients, .. } => {
-            let ids: Vec<UserId> = recipients.iter().map(|(id, _, _)| *id).collect();
+            let ids: Vec<UserId> = recipients.iter().map(|(id, _)| *id).collect();
             assert!(
                 !ids.contains(&UserId(id_for(&excluded))),
                 "{excluded} is unverified and must be excluded"
@@ -346,7 +346,6 @@ async fn send_excludes(w: &mut AlooWorld, excluded: String, included: String) {
         other => panic!("expected SendChannelText, got {other:?}"),
     }
 }
-
 
 // ---------------------------------------------------------------------
 // A queue is a wait, not a life sentence (AC-234)

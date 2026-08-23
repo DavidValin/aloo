@@ -161,10 +161,9 @@ pub fn pad_pair_digest(enc: &KeyDigest, dec: &KeyDigest) -> KeyDigest {
 ///
 /// Same sorted, order-independent construction `contact_name_for` uses, so
 /// both sides compute the identical name from their own and their peer's
-/// key with nothing negotiated. Only meaningful for `KeyMode`s whose key is
-/// actually stable across reconnects
-/// (`client::keymode_policy::uses_byte_comparison_pinning`) - a freshly
-/// generated key every connect would name a different contact every time.
+/// key with nothing negotiated. Used under `Direct` framing
+/// (`client::otp::OtpFraming`), where one side's announced key does not
+/// decode as a keybundle and so has no fingerprint to name a contact by.
 pub fn contact_name_for_keys(own_public_der: &[u8], peer_public_der: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let own: [u8; 32] = Sha256::digest(own_public_der).into();
@@ -365,7 +364,10 @@ pub fn new_mail_id() -> String {
 /// well-formed id cannot name a path separator, `.`/`..`, or anything else
 /// with filesystem meaning.
 pub fn mail_id_is_valid(id: &str) -> bool {
-    id.len() == OTP_MAIL_ID_LEN && id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    id.len() == OTP_MAIL_ID_LEN
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// One voice recording attached to an OTP mail: the complete, decoded

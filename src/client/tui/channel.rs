@@ -225,7 +225,7 @@ impl UiState {
                     && !self.offline.contains(&m.id)
                     && !self.is_trust_gated(m.id)
             })
-            .map(|m| (m.id, m.key_mode, m.public_key_der.clone()))
+            .map(|m| (m.id, m.public_key_der.clone()))
             .collect()
     }
 

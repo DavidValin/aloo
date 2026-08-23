@@ -2,14 +2,14 @@
 mod ui_common;
 use ui_common::*;
 
+use aloo::client::file_browser::FileBrowserState;
 use aloo::client::file_transfer::{self, MAX_FILENAME_CHARS};
-use aloo::proto::{KeyMode, UserId};
 use aloo::client::tui::file_send::{FileConfirmChoice, FileSendTarget};
 use aloo::client::tui::ui::{
     FileOfferChoice, FileTransferStatus, Focus, IdentityCase, MessageBody, Mode, PendingFileOffer,
     UiAction,
 };
-use aloo::client::file_browser::FileBrowserState;
+use aloo::proto::UserId;
 use crossterm::event::KeyCode;
 
 fn unique_dir(label: &str) -> std::path::PathBuf {
@@ -62,7 +62,10 @@ fn file_command_does_nothing_when_no_channel_is_joined_and_no_dm_is_open() {
 /// real current directory) with a deterministic temp tree - same technique
 /// `ui_connect_popup_test.rs::selecting_a_file_in_browser_applies_it_to_the_popup_field`
 /// already uses for the connect popup's own browser.
-fn open_file_send_with_temp_tree(state: &mut aloo::client::tui::ui::UiState, root: &std::path::Path) {
+fn open_file_send_with_temp_tree(
+    state: &mut aloo::client::tui::ui::UiState,
+    root: &std::path::Path,
+) {
     type_str(state, "/file");
     press(state, KeyCode::Enter);
     state.file_send.as_mut().unwrap().browser = FileBrowserState::open(root.to_path_buf()).unwrap();
@@ -144,7 +147,7 @@ fn sending_a_file_to_a_channel_produces_sendfilechannel_with_path_and_size() {
             assert_eq!(path, root.join("file.txt"));
             assert_eq!(filename, "file.txt");
             assert_eq!(size, b"hello file transfer".len() as u64);
-            let ids: Vec<UserId> = recipients.iter().map(|(id, _, _)| *id).collect();
+            let ids: Vec<UserId> = recipients.iter().map(|(id, _)| *id).collect();
             assert_eq!(
                 ids,
                 vec![UserId(2), UserId(3)],
@@ -185,15 +188,13 @@ fn sending_a_file_to_a_dm_peer_produces_sendfiledirect_with_path_and_size() {
             path,
             filename,
             size,
-            recipient_key_mode,
             recipient_pubkey_der,
         }) => {
             assert_eq!(to, UserId(2));
             assert_eq!(path, root.join("file.txt"));
             assert_eq!(filename, "file.txt");
             assert_eq!(size, b"hello file transfer".len() as u64);
-            assert_eq!(recipient_key_mode, KeyMode::Password);
-            assert_eq!(recipient_pubkey_der, vec![2u8; 4]);
+            assert_eq!(recipient_pubkey_der, pq_bundle_der(2));
         }
         other => panic!("expected SendFileDirect, got {other:?}"),
     }
@@ -275,16 +276,27 @@ fn a_channel_file_send_logs_one_row_addressed_to_every_recipient() {
     state.register_file_row_stream(1, 1);
     state.register_file_row_stream(1, 2);
 
-    assert_eq!(state.channels[0].log.len(), 1, "one line, not one per person");
+    assert_eq!(
+        state.channels[0].log.len(),
+        1,
+        "one line, not one per person"
+    );
     let entry = &state.channels[0].log[0];
     assert!(entry.outgoing);
     assert_eq!(
         entry.to_name, None,
         "it is addressed to the channel; the popup names the people"
     );
-    let recipients = &entry.delivery.as_ref().expect("a delivery record").recipients;
+    let recipients = &entry
+        .delivery
+        .as_ref()
+        .expect("a delivery record")
+        .recipients;
     assert_eq!(
-        recipients.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+        recipients
+            .iter()
+            .map(|r| r.name.as_str())
+            .collect::<Vec<_>>(),
         vec!["bob", "carol"],
         "every recipient is on the one row's delivery record"
     );
@@ -328,11 +340,17 @@ fn one_file_row_reports_the_least_advanced_of_its_transfers() {
         "one recipient racing ahead does not make the send nearly done"
     );
     state.set_file_progress(me, 2, 300);
-    assert_eq!(status(&state), FileTransferStatus::InProgress { bytes: 300 });
+    assert_eq!(
+        status(&state),
+        FileTransferStatus::InProgress { bytes: 300 }
+    );
 
     // One finished, one still going: the row follows the one still going.
     state.set_file_completed(me, 1);
-    assert_eq!(status(&state), FileTransferStatus::InProgress { bytes: 300 });
+    assert_eq!(
+        status(&state),
+        FileTransferStatus::InProgress { bytes: 300 }
+    );
     state.set_file_completed(me, 2);
     assert_eq!(status(&state), FileTransferStatus::Completed);
 }

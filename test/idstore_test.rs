@@ -271,7 +271,11 @@ fn set_last_seen_with_an_unstorable_device_id_leaves_it_unset() {
     // A tab is the on-disk field delimiter - a hostile peer's self-reported
     // device id must not be able to inject a record into this local file.
     store.set_last_seen("alice", addr, "evil\tid");
-    assert_eq!(store.last_addr("alice"), Some(addr), "address is still recorded");
+    assert_eq!(
+        store.last_addr("alice"),
+        Some(addr),
+        "address is still recorded"
+    );
     assert_eq!(store.last_device_id("alice"), None);
 }
 
@@ -341,7 +345,10 @@ fn set_key_mode_records_it_for_a_pinned_nickname() {
     let mut store = IdStore::load(&path).unwrap();
     store.check_and_pin("alice", b"key-a");
     store.set_key_mode("alice", aloo::proto::KeyMode::PqHybrid);
-    assert_eq!(store.key_mode("alice"), Some(aloo::proto::KeyMode::PqHybrid));
+    assert_eq!(
+        store.key_mode("alice"),
+        Some(aloo::proto::KeyMode::PqHybrid)
+    );
 }
 
 #[test]
@@ -368,8 +375,13 @@ fn set_last_seen_stamps_a_wall_clock_time() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    let seen = store.last_seen_unix("alice").expect("stamped by set_last_seen");
-    assert!(seen >= before && seen <= after, "{seen} not in [{before}, {after}]");
+    let seen = store
+        .last_seen_unix("alice")
+        .expect("stamped by set_last_seen");
+    assert!(
+        seen >= before && seen <= after,
+        "{seen} not in [{before}, {after}]"
+    );
 }
 
 #[test]
@@ -379,12 +391,15 @@ fn key_mode_and_last_seen_survive_a_save_and_load_round_trip() {
     {
         let mut store = IdStore::load(&path).unwrap();
         store.check_and_pin("alice", b"key-a");
-        store.set_key_mode("alice", aloo::proto::KeyMode::Password);
+        store.set_key_mode("alice", aloo::proto::KeyMode::PqHybrid);
         store.set_last_seen("alice", addr, "alice-device");
         store.save().unwrap();
     }
     let store = IdStore::load(&path).unwrap();
-    assert_eq!(store.key_mode("alice"), Some(aloo::proto::KeyMode::Password));
+    assert_eq!(
+        store.key_mode("alice"),
+        Some(aloo::proto::KeyMode::PqHybrid)
+    );
     assert!(store.last_seen_unix("alice").is_some());
     std::fs::remove_file(&path).ok();
 }
@@ -411,7 +426,10 @@ fn re_pinning_keeps_the_previously_recorded_key_mode_and_last_seen() {
     let addr: SocketAddr = "203.0.113.7:9999".parse().unwrap();
     store.set_last_seen("alice", addr, "alice-device");
     store.check_and_pin("alice", b"key-b");
-    assert_eq!(store.key_mode("alice"), Some(aloo::proto::KeyMode::PqHybrid));
+    assert_eq!(
+        store.key_mode("alice"),
+        Some(aloo::proto::KeyMode::PqHybrid)
+    );
     assert!(store.last_seen_unix("alice").is_some());
 }
 

@@ -3,7 +3,7 @@
 use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 use cucumber::{given, then, when};
 
-use aloo::proto::{KeyMode, UserId};
+use aloo::proto::UserId;
 use aloo::client::tui::ui::{
     END_CALL_CONFIRM_TITLE, MessageBody, PendingCallInvite, UiAction, VoiceTarget,
 };
@@ -126,11 +126,7 @@ async fn stream_to_channel(w: &mut AlooWorld, name: String) {
             assert_eq!(channel, "general");
             assert_eq!(
                 recipients,
-                &vec![(
-                    UserId(id_for(&name)),
-                    KeyMode::Password,
-                    vec![id_for(&name) as u8; 4]
-                )],
+                &vec![(UserId(id_for(&name)), vec![id_for(&name) as u8; 4])],
                 "the stream must be addressed to that member, carrying their key"
             );
         }

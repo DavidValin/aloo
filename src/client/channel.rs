@@ -6,20 +6,15 @@
 
 use std::time::Instant;
 
-use rsa::RsaPublicKey;
-
-use crate::crypto;
 use crate::client::p2p::LinkReadiness;
-use crate::p2p_proto::P2pPayload;
-use crate::proto::{
-    self, ChannelInfo, ChannelKind, ClientMessage, Content, Envelope, KeyMode, UserId,
-};
 use crate::client::rekey;
 use crate::client::session::SessionState;
 use crate::client::tui::ui::{Recipient, UiState};
 use crate::client::voice;
 use crate::client::voice_call;
 use crate::client::voice_stream;
+use crate::p2p_proto::P2pPayload;
+use crate::proto::{self, ChannelInfo, ChannelKind, ClientMessage, Content, Envelope, UserId};
 
 pub(crate) async fn handle_join(
     wr: &mut impl crate::control::ControlSink,
@@ -41,11 +36,10 @@ pub(crate) async fn handle_join(
         }
     }
     wr.send_control(&ClientMessage::JoinChannel {
-            name,
-            kind,
-            password,
-        },
-    )
+        name,
+        kind,
+        password,
+    })
     .await?;
     session.conn_stats.record_event(Instant::now());
     Ok(())
@@ -107,7 +101,7 @@ pub(crate) async fn handle_send_text(
     // unchanged - the same way mixed `KeyMode`s already coexist in one
     // channel send.
     let mut plain_recipients = Vec::new();
-    for (id, key_mode, der) in recipients {
+    for (id, der) in recipients {
         match crate::client::otp::contact_name_if_active(session, &der) {
             Some(contact_name) => {
                 crate::client::otp::send_or_queue(
@@ -116,7 +110,6 @@ pub(crate) async fn handle_send_text(
                     ui_state,
                     id,
                     &contact_name,
-                    key_mode,
                     &der,
                     plaintext.as_bytes(),
                     Content::Text,
@@ -126,23 +119,19 @@ pub(crate) async fn handle_send_text(
                 )
                 .await?;
             }
-            None => plain_recipients.push((id, key_mode, der)),
+            None => plain_recipients.push((id, der)),
         }
     }
     let recipients = plain_recipients;
 
-    // Split by whether each recipient's rotating key (pq_hybrid, if any)
-    // is currently fresh - a static/untracked recipient is always ready.
+    // Split by whether each recipient's rotating key is currently fresh.
     // Anyone not ready is queued rather than dropped, and sent
     // automatically once their next key arrives
     // (`session::handle_pq_key_rotated`).
     let mut ready = Vec::new();
-    for (id, key_mode, der) in recipients {
-        if !crate::client::keymode_policy::can_address(key_mode, session.own_key_mode) {
-            continue;
-        }
+    for (id, der) in recipients {
         if session.remote_keys.try_use(id) {
-            ready.push((id, key_mode, der));
+            ready.push((id, der));
         } else {
             session.remote_keys.enqueue(
                 id,
@@ -211,9 +200,9 @@ pub(crate) async fn handle_send_file(
     recipients: Vec<Recipient>,
 ) -> proto::Result<()> {
     let mut ready = Vec::new();
-    for (id, key_mode, der) in recipients {
-        if crate::client::keymode_policy::can_address(key_mode, session.own_key_mode) && session.remote_keys.try_use(id) {
-            ready.push((id, key_mode, der));
+    for (id, der) in recipients {
+        if session.remote_keys.try_use(id) {
+            ready.push((id, der));
         }
     }
     let payload = crate::client::file_transfer::FileOfferPayload {
@@ -228,12 +217,11 @@ pub(crate) async fn handle_send_file(
     // only known once every recipient has been through the two ways a send
     // to them can still fall through below.
     let mut prepared = Vec::new();
-    for (id, key_mode, der) in ready {
+    for (id, der) in ready {
         let stream_id = session.next_stream_id;
         let envelope = crate::client::envelope::encrypt_envelope_for(
-            session.own_pq_private.as_ref(),
+            &session.own_pq_private,
             session.pq_peer_keys.encap_for(id),
-            key_mode,
             &der,
             Some(channel.clone()),
             stream_id,
@@ -241,8 +229,7 @@ pub(crate) async fn handle_send_file(
             Content::FileOffer,
         );
         let Some(envelope) = envelope else { continue };
-        let Some(key) = voice_stream::resolve_direct_key(session, stream_id, id, key_mode, &der)
-        else {
+        let Some(key) = voice_stream::resolve_direct_key(session, stream_id, id, &der) else {
             continue;
         };
         session.next_stream_id += 1;
@@ -298,22 +285,20 @@ pub(crate) async fn handle_voice_record_start(
     // on), is simply left out of this particular stream, same as any other
     // partial-delivery case.
     let mut ready = Vec::new();
-    for (id, key_mode, der) in recipients {
-        if !crate::client::keymode_policy::can_address(key_mode, session.own_key_mode) || !session.remote_keys.try_use(id) {
+    for (id, der) in recipients {
+        if !session.remote_keys.try_use(id) {
             continue;
         }
         if session.peer_link.ensure_link(wr, id).await == LinkReadiness::Active {
-            ready.push((id, key_mode, der));
+            ready.push((id, der));
         }
     }
     let ready_ids: Vec<UserId> = ready.iter().map(|(id, ..)| *id).collect();
-    let rsa = parse_recipients(&ready);
-    let pq = voice_stream::build_pq_stream_out(
-        session,
-        Some(channel.clone()),
-        stream_id,
-        &parse_pq_recipients(&ready),
-    );
+    let Some(pq) =
+        voice_stream::build_pq_stream_out(session, Some(channel.clone()), stream_id, &ready)
+    else {
+        return Ok(());
+    };
     // One row for the whole stream, addressed to everyone it actually went
     // out to - so a channel voice message reads orange while only some of
     // them have decoded it, exactly like a channel text message.
@@ -329,14 +314,12 @@ pub(crate) async fn handle_voice_record_start(
             },
         );
     }
-    // Each pq_hybrid recipient's setup follows its `StreamStart`, once and
-    // reliably - the chunks after it carry ciphertext only.
-    if let Some(pq) = &pq {
-        for (id, setup) in pq.setups() {
-            session
-                .peer_link
-                .send_reliable_or_queue(id, P2pPayload::StreamKeySetup { stream_id, setup });
-        }
+    // Each recipient's setup follows its `StreamStart`, once and reliably
+    // - the chunks after it carry ciphertext only.
+    for (id, setup) in pq.setups() {
+        session
+            .peer_link
+            .send_reliable_or_queue(id, P2pPayload::StreamKeySetup { stream_id, setup });
     }
     let (stop_tx, stop_rx) = std::sync::mpsc::channel();
     session.active_recording = Some(stop_tx);
@@ -349,7 +332,7 @@ pub(crate) async fn handle_voice_record_start(
     );
     voice_stream::spawn_record_stream_worker(
         recorder,
-        voice_stream::StreamRecipients::Channel { rsa, pq },
+        voice_stream::StreamRecipients::Channel { pq },
         stream_id,
         session.record_out_tx.clone(),
         session.own_stream_done_tx.clone(),
@@ -409,28 +392,8 @@ pub(crate) async fn handle_start_call(
     Ok(())
 }
 
-fn parse_recipients(recipients: &[Recipient]) -> Vec<(UserId, RsaPublicKey)> {
-    recipients
-        .iter()
-        .filter(|(_, key_mode, _)| *key_mode != KeyMode::PqHybrid)
-        .filter_map(|(id, _, der)| crypto::public_key_from_der(der).ok().map(|k| (*id, k)))
-        .collect()
-}
-
-/// The `pq_hybrid` recipients, paired with the bundle bytes they announced
-/// - `build_pq_stream_out` needs those only for the identity fingerprint,
-/// and looks up what to actually encrypt to in `SessionState::pq_peer_keys`.
-fn parse_pq_recipients(recipients: &[Recipient]) -> Vec<(UserId, Vec<u8>)> {
-    recipients
-        .iter()
-        .filter(|(_, key_mode, _)| *key_mode == KeyMode::PqHybrid)
-        .map(|(id, _, der)| (*id, der.clone()))
-        .collect()
-}
-
 /// Encrypts `plaintext` once per recipient via
-/// `envelope::encrypt_envelope_for` - callers must have already excluded
-/// recipients this session can't address, see `can_address`.
+/// `envelope::encrypt_envelope_for`.
 ///
 /// Every recipient's copy is bound to the same `channel` and `send_id`, but
 /// each is sealed against that recipient's own identity, so one member's
@@ -445,11 +408,10 @@ fn encrypt_for_each(
 ) -> Vec<(UserId, Envelope)> {
     recipients
         .iter()
-        .filter_map(|(id, key_mode, pubkey_der)| {
+        .filter_map(|(id, pubkey_der)| {
             let envelope = crate::client::envelope::encrypt_envelope_for(
-                session.own_pq_private.as_ref(),
+                &session.own_pq_private,
                 session.pq_peer_keys.encap_for(*id),
-                *key_mode,
                 pubkey_der,
                 channel.clone(),
                 send_id,

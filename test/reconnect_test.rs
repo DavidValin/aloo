@@ -165,7 +165,11 @@ fn a_punch_in_flight_is_only_worth_naming_when_there_is_no_server() {
 
 /// A `ServerSink` over a real, live loopback connection, plus the listener
 /// side kept alive so nothing is torn down behind it.
-async fn live_sink() -> (ServerSink, tokio::sync::mpsc::UnboundedReceiver<()>, TcpStream) {
+async fn live_sink() -> (
+    ServerSink,
+    tokio::sync::mpsc::UnboundedReceiver<()>,
+    TcpStream,
+) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let client = TcpStream::connect(addr).await.unwrap();
@@ -306,17 +310,42 @@ impl Drop for StoppableServer {
     }
 }
 
+/// A keybundle written once per test process, at a small modulus - these
+/// tests are about the reconnect handshake, never about key strength, and
+/// a real RSA-4096 pair takes seconds (see `world.rs`'s `SCENARIO_KEY_BITS`
+/// for the same trade). Written up front rather than left to
+/// `ensure_bundle_at` so nothing here pays full keygen.
+fn scenario_keybundle(nickname: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!(
+        "aloo-reconnect-test-keys-{}-{nickname}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let file_pub = dir.join("id.pub");
+    let file_priv = dir.join("id.priv");
+    if !file_pub.exists() {
+        let (public, private) =
+            aloo::crypto::pq::generate_bundle_with_bits(1024).expect("scenario keygen");
+        aloo::crypto::pq::save_private_bundle(&private, &file_priv).expect("save private");
+        aloo::crypto::pq::save_public_bundle(&public, &file_pub).expect("save public");
+    }
+    (file_pub, file_priv)
+}
+
 fn request_for(addr: std::net::SocketAddr, nickname: &str) -> ConnectRequest {
+    // One fixed keybundle per nickname, on purpose: a reconnect must come
+    // back as the *same* person, and re-resolving from these same two
+    // paths is what proves the identity did not quietly change.
+    let (file_pub, file_priv) = scenario_keybundle(nickname);
     ConnectRequest {
         host: addr.ip().to_string(),
         port: addr.port(),
         nickname: nickname.to_string(),
         server_key: ServerKeySelection::None,
-        // `None` is deliberate: it is the one identity type that is
-        // *generated* rather than loaded, so a reconnect that re-resolved
-        // it would silently come back as a different person. Proving that
-        // does not happen needs exactly this selection.
-        my_key: MyKeySelection::None,
+        my_key: MyKeySelection {
+            file_pub,
+            file_priv,
+        },
         id_store_path: std::env::temp_dir().join(format!(
             "aloo-reconnect-test-idstore-{}-{}",
             std::process::id(),
@@ -326,9 +355,7 @@ fn request_for(addr: std::net::SocketAddr, nickname: &str) -> ConnectRequest {
 }
 
 /// Waits for the next event, failing the test rather than hanging forever.
-async fn next_event(
-    rx: &mut tokio::sync::mpsc::UnboundedReceiver<ServerEvent>,
-) -> ServerEvent {
+async fn next_event(rx: &mut tokio::sync::mpsc::UnboundedReceiver<ServerEvent>) -> ServerEvent {
     tokio::time::timeout(Duration::from_secs(10), rx.recv())
         .await
         .expect("timed out waiting for a server event")
@@ -340,13 +367,12 @@ async fn next_event(
 /// different `UserId`, because that is what a new connection is.
 /// @requirement AC-225
 #[tokio::test]
-async fn a_session_whose_server_disappears_gets_itself_back_on
-() {
+async fn a_session_whose_server_disappears_gets_itself_back_on() {
     let mut server = StoppableServer::start(0);
     let addr = server.addr;
     let request = request_for(addr, "alice");
 
-    let (mut events, _sink, first_id, _identity, _key_mode, _addr) =
+    let (mut events, _sink, first_id, _identity, _addr) =
         aloo::client::connect::connect_with_reconnect(&request)
             .await
             .expect("the first connection is an ordinary one");
@@ -412,7 +438,7 @@ async fn a_taken_nickname_is_an_ordinary_retryable_failure() {
     let server = StoppableServer::start(0);
     let request = request_for(server.addr, "alice");
 
-    let (_events, _sink, _you, _identity, _key_mode, _addr) =
+    let (_events, _sink, _you, _identity, _addr) =
         aloo::client::connect::connect_with_reconnect(&request)
             .await
             .expect("first connection");
@@ -453,7 +479,7 @@ async fn a_session_reaped_by_the_server_reappears_in_a_later_arrival_s_member_li
     });
 
     let request = request_for(addr, "alice");
-    let (events, sink, first_id, identity, key_mode, server_addr) =
+    let (events, sink, first_id, identity, server_addr) =
         aloo::client::connect::connect_with_reconnect(&request)
             .await
             .expect("first connection");
@@ -476,7 +502,6 @@ async fn a_session_reaped_by_the_server_reappears_in_a_later_arrival_s_member_li
             "alice".to_string(),
             first_id,
             identity,
-            key_mode,
             id_store,
             None,
             Some(server_addr),
@@ -516,7 +541,9 @@ async fn a_session_reaped_by_the_server_reappears_in_a_later_arrival_s_member_li
          and she is in nobody's user list"
     );
 
-    input_tx.send(aloo::client::session::SessionInput::Shutdown).ok();
+    input_tx
+        .send(aloo::client::session::SessionInput::Shutdown)
+        .ok();
     let _ = tokio::time::timeout(Duration::from_secs(5), session).await;
 }
 
@@ -543,7 +570,7 @@ async fn handshake(
         .send(&ClientMessage::Identify {
             display_name: nickname.to_string(),
             public_key_der: vec![1, 2, 3],
-            key_mode: aloo::proto::KeyMode::Password,
+            key_mode: aloo::proto::KeyMode::PqHybrid,
         })
         .await
         .unwrap();

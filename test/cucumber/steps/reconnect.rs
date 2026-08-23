@@ -8,9 +8,7 @@ use ratatui::style::Color;
 use tokio::net::{TcpListener, TcpStream};
 
 use aloo::client::p2p::LinkStatus;
-use aloo::client::reconnect::{
-    RECONNECT_MAX_DELAY, ServerLinkState, delay_after,
-};
+use aloo::client::reconnect::{RECONNECT_MAX_DELAY, ServerLinkState, delay_after};
 use aloo::client::tui::channel::messages_start_col;
 use aloo::proto::{ChannelKind, ClientMessage, ServerMessage, UserId};
 use aloo::server::AuthConfig;
@@ -166,13 +164,43 @@ async fn selectors_moved(w: &mut AlooWorld) {
 // Reconnecting for real (AC-225, AC-226, AC-227)
 // ---------------------------------------------------------------------
 
-fn request_for(addr: std::net::SocketAddr, nickname: &str) -> aloo::client::connect::ConnectRequest {
+
+/// A keybundle written once per nickname, at a small modulus - these
+/// scenarios are about reconnecting, never about key strength, and a real
+/// RSA-4096 pair takes seconds (`world.rs`'s `SCENARIO_KEY_BITS` makes the
+/// same trade). Fixed per nickname on purpose: a reconnect must come back
+/// as the *same* person, which is exactly what re-resolving these two
+/// paths proves.
+fn scenario_keybundle(nickname: &str) -> aloo::client::connect::MyKeySelection {
+    let dir = std::env::temp_dir().join(format!(
+        "aloo-cucumber-reconnect-keys-{}-{nickname}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let file_pub = dir.join("id.pub");
+    let file_priv = dir.join("id.priv");
+    if !file_pub.exists() {
+        let (public, private) =
+            aloo::crypto::pq::generate_bundle_with_bits(1024).expect("scenario keygen");
+        aloo::crypto::pq::save_private_bundle(&private, &file_priv).expect("save private");
+        aloo::crypto::pq::save_public_bundle(&public, &file_pub).expect("save public");
+    }
+    aloo::client::connect::MyKeySelection {
+        file_pub,
+        file_priv,
+    }
+}
+
+fn request_for(
+    addr: std::net::SocketAddr,
+    nickname: &str,
+) -> aloo::client::connect::ConnectRequest {
     aloo::client::connect::ConnectRequest {
         host: addr.ip().to_string(),
         port: addr.port(),
         nickname: nickname.to_string(),
         server_key: aloo::client::connect::ServerKeySelection::None,
-        my_key: aloo::client::connect::MyKeySelection::None,
+        my_key: scenario_keybundle(nickname),
         id_store_path: std::env::temp_dir().join(format!(
             "aloo-cucumber-reconnect-idstore-{}-{nickname}",
             std::process::id()
@@ -183,7 +211,8 @@ fn request_for(addr: std::net::SocketAddr, nickname: &str) -> aloo::client::conn
 #[then(expr = "reconnecting as {string} is refused while that connection holds the name")]
 async fn reconnect_refused(w: &mut AlooWorld, nickname: String) {
     let addr = w.addr.expect("no server running");
-    let outcome = aloo::client::connect::connect_with_reconnect(&request_for(addr, &nickname)).await;
+    let outcome =
+        aloo::client::connect::connect_with_reconnect(&request_for(addr, &nickname)).await;
     let err = match outcome {
         Ok(_) => panic!("a nickname already held must not be handed out twice"),
         Err(e) => e.to_string(),
@@ -227,7 +256,7 @@ async fn reaping_server(w: &mut AlooWorld, seconds: u64) {
 async fn session_joined(w: &mut AlooWorld, nickname: String, channel: String) {
     let addr = w.addr.expect("no server running");
     let request = request_for(addr, &nickname);
-    let (events, sink, you, identity, key_mode, server_addr) =
+    let (events, sink, you, identity, server_addr) =
         aloo::client::connect::connect_with_reconnect(&request)
             .await
             .expect("the first connection is an ordinary one");
@@ -250,7 +279,6 @@ async fn session_joined(w: &mut AlooWorld, nickname: String, channel: String) {
             nickname,
             you,
             identity,
-            key_mode,
             id_store,
             None,
             Some(server_addr),
@@ -288,7 +316,8 @@ async fn late_arrival_sees(w: &mut AlooWorld, newcomer: String, who: String, cha
 
     let mut seen = false;
     for _ in 0..8 {
-        let next = tokio::time::timeout(Duration::from_secs(2), stream.recv::<ServerMessage>()).await;
+        let next =
+            tokio::time::timeout(Duration::from_secs(2), stream.recv::<ServerMessage>()).await;
         let Ok(Ok(Some(msg))) = next else { break };
         if let ServerMessage::UserJoined { user, .. } = &msg
             && user.name == who
@@ -333,7 +362,7 @@ async fn handshake(stream: &mut aloo::control::ControlEndpoint<TcpStream>, nickn
         .send(&ClientMessage::Identify {
             display_name: nickname.to_string(),
             public_key_der: vec![1, 2, 3],
-            key_mode: aloo::proto::KeyMode::Password,
+            key_mode: aloo::proto::KeyMode::PqHybrid,
         })
         .await
         .unwrap();

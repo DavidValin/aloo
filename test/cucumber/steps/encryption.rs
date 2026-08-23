@@ -1,7 +1,7 @@
 //! Encryption and wire-protocol steps (US-008, US-009).
 
 use aloo::crypto::{
-    self, KeyPair, decrypt_chunked, encrypt_chunked, max_chunk_len, public_key_to_der,
+    self, decrypt_chunked, encrypt_chunked, max_chunk_len, public_key_to_der,
 };
 use aloo::p2p_proto::P2pPayload;
 use aloo::proto::{
@@ -32,12 +32,6 @@ async fn two_keypairs(w: &mut AlooWorld, a: String, b: String) {
 #[given(expr = "{word} has an RSA keypair")]
 async fn one_keypair(w: &mut AlooWorld, who: String) {
     w.derived.insert(who.clone(), keypair_for(&who));
-}
-
-#[given(expr = "{word} derives their identity from the password {string}")]
-async fn derive_from_password(w: &mut AlooWorld, who: String, password: String) {
-    let kp = KeyPair::from_password(&password).expect("password derivation should succeed");
-    w.derived.insert(who, kp);
 }
 
 // ---------------------------------------------------------------------
@@ -112,35 +106,6 @@ async fn exactly_blocks(w: &mut AlooWorld, n: usize) {
     );
 }
 
-#[then(expr = "{word} and {word} end up with the very same key")]
-async fn same_key(w: &mut AlooWorld, a: String, b: String) {
-    let ka = w.derived.get(&a).expect("no key");
-    let kb = w.derived.get(&b).expect("no key");
-    assert_eq!(
-        public_key_to_der(&ka.public).unwrap(),
-        public_key_to_der(&kb.public).unwrap(),
-        "the same password must rebuild the same keypair on any machine"
-    );
-    // Not just equal bytes: the two halves must genuinely interoperate.
-    let blocks = encrypt_chunked(&kb.public, b"round trip").unwrap();
-    let out = decrypt_chunked(&ka.private, &blocks).unwrap();
-    assert_eq!(
-        out, b"round trip",
-        "keys that compare equal must also work interchangeably"
-    );
-}
-
-#[then(expr = "{word} and {word} end up with different keys")]
-async fn different_key(w: &mut AlooWorld, a: String, b: String) {
-    let ka = w.derived.get(&a).expect("no key");
-    let kb = w.derived.get(&b).expect("no key");
-    assert_ne!(
-        public_key_to_der(&ka.public).unwrap(),
-        public_key_to_der(&kb.public).unwrap(),
-        "different passwords must not collide onto one keypair"
-    );
-}
-
 // ---------------------------------------------------------------------
 // Wire protocol (US-009)
 // ---------------------------------------------------------------------
@@ -158,7 +123,7 @@ async fn roundtrip_every_message(w: &mut AlooWorld) {
         ClientMessage::Identify {
             display_name: "dave".into(),
             public_key_der: vec![1, 2, 3, 4],
-            key_mode: KeyMode::Password,
+            key_mode: KeyMode::PqHybrid,
         },
         ClientMessage::JoinChannel {
             name: "general".into(),
@@ -224,7 +189,7 @@ async fn roundtrip_every_message(w: &mut AlooWorld) {
         id: UserId(42),
         name: "alice".into(),
         public_key_der: vec![0xde, 0xad, 0xbe, 0xef],
-        key_mode: KeyMode::Password,
+        key_mode: KeyMode::PqHybrid,
     };
     let decoded: UserInfo = decode(&encode(&user).expect("encode")).expect("decode");
     assert_eq!(decoded, user, "UserInfo did not survive the round trip");
@@ -293,7 +258,7 @@ async fn every_field_intact(w: &mut AlooWorld) {
 
 #[then("a user announced under any key mode arrives with that same key mode")]
 async fn key_mode_survives(_w: &mut AlooWorld) {
-    for key_mode in [KeyMode::Password, KeyMode::None, KeyMode::PqHybrid] {
+    for key_mode in [KeyMode::PqHybrid, KeyMode::PqHybrid, KeyMode::PqHybrid] {
         let user = UserInfo {
             id: UserId(1),
             name: "alice".into(),

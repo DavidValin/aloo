@@ -237,7 +237,10 @@ fn pending_content_round_trips_through_save_and_load() {
         PendingOtpContent::FileContent { stream_id: 9 },
         None,
     );
-    store.record_sent("voice-contact", 1, PendingOtpContent::Voice { duration_ms: 4200 }, None);
+    store.record_sent("voice-contact", 1, PendingOtpContent::Voice {
+            stream_id: 77,
+            duration_ms: 4200,
+        }, None);
     store.save().unwrap();
 
     let loaded = OtpStore::load(&path).unwrap();
@@ -265,7 +268,10 @@ fn pending_content_round_trips_through_save_and_load() {
     );
     assert_eq!(
         loaded.get("voice-contact").unwrap().pending_content,
-        Some(PendingOtpContent::Voice { duration_ms: 4200 })
+        Some(PendingOtpContent::Voice {
+            stream_id: 77,
+            duration_ms: 4200,
+        })
     );
 
     std::fs::remove_file(&path).ok();
@@ -303,7 +309,10 @@ fn pending_sends_yields_only_contacts_with_something_outstanding() {
     store.record_sent(
         "busy-contact",
         2,
-        PendingOtpContent::Voice { duration_ms: 900 },
+        PendingOtpContent::Voice {
+            stream_id: 77,
+            duration_ms: 900,
+        },
         None,
     );
 
@@ -312,7 +321,10 @@ fn pending_sends_yields_only_contacts_with_something_outstanding() {
     let (name, seq, content) = pending[0];
     assert_eq!(name, "busy-contact");
     assert_eq!(seq, 2);
-    assert_eq!(content, &PendingOtpContent::Voice { duration_ms: 900 });
+    assert_eq!(content, &PendingOtpContent::Voice {
+            stream_id: 77,
+            duration_ms: 900,
+        });
 }
 
 /// @requirement TB-182

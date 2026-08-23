@@ -4,7 +4,7 @@ use ui_common::*;
 
 use aloo::client::p2p::LinkStatus;
 use aloo::p2p_proto::ReceiptStage;
-use aloo::proto::{KeyMode, UserId};
+use aloo::proto::UserId;
 use aloo::client::tui::ui::{
     DeliveryProof, OtpPadPhase,
     DELIVERY_ARROW, DeliveryStatus, Focus, IdentityCase, MessageBody, OTP_ICON, PendingOtpInvite,
@@ -54,14 +54,12 @@ fn opening_dm_from_sidebar_and_sending_a_message() {
         UiAction::SendDirectText {
             to,
             plaintext,
-            recipient_key_mode,
             recipient_pubkey_der,
             log_index,
             msg_id: _,
         } => {
             assert_eq!(to, UserId(2));
             assert_eq!(plaintext, "just us");
-            assert_eq!(recipient_key_mode, KeyMode::Password);
             assert_eq!(recipient_pubkey_der, user(2, "bob").public_key_der);
             assert_eq!(log_index, Some(0), "the first message in a fresh room");
         }
@@ -201,11 +199,9 @@ fn space_release_targets_active_private_room_instead_of_channel() {
     match start {
         Some(UiAction::VoiceRecordStart(VoiceTarget::Direct {
             to,
-            recipient_key_mode,
             recipient_pubkey_der,
         })) => {
             assert_eq!(to, UserId(2));
-            assert_eq!(recipient_key_mode, KeyMode::Password);
             assert_eq!(recipient_pubkey_der, user(2, "bob").public_key_der);
         }
         other => panic!("expected VoiceRecordStart(Direct), got {other:?}"),
@@ -229,11 +225,9 @@ fn global_record_start_targets_the_active_private_room() {
     match start {
         Some(UiAction::VoiceRecordStart(VoiceTarget::Direct {
             to,
-            recipient_key_mode,
             recipient_pubkey_der,
         })) => {
             assert_eq!(to, UserId(2));
-            assert_eq!(recipient_key_mode, KeyMode::Password);
             assert_eq!(recipient_pubkey_der, user(2, "bob").public_key_der);
         }
         other => panic!("expected VoiceRecordStart(Direct), got {other:?}"),
@@ -419,7 +413,7 @@ fn render_private_room_full_screen_does_not_panic() {
 fn generate_confirm_popup_opens_when_no_key_exists() {
     let mut state = joined_general_with(vec![user(2, "bob")]);
     assert!(state.status_notice.is_none());
-    state.open_otp_generate_confirm(UserId(2), "bob".into(), KeyMode::PqHybrid, vec![9, 9]);
+    state.open_otp_generate_confirm(UserId(2), "bob".into(), vec![9, 9]);
 
     // It absorbs every other key while open - typing doesn't reach the
     // compose bar, same as the identity-review/file-offer popups.
@@ -441,7 +435,7 @@ fn generate_confirm_popup_opens_when_no_key_exists() {
 #[test]
 fn declining_the_generate_confirm_cancels_locally_without_sending_anything() {
     let mut state = joined_general_with(vec![user(2, "bob")]);
-    state.open_otp_generate_confirm(UserId(2), "bob".into(), KeyMode::PqHybrid, vec![9, 9]);
+    state.open_otp_generate_confirm(UserId(2), "bob".into(), vec![9, 9]);
     press(&mut state, KeyCode::Right); // Accept -> Reject
     let action = press(&mut state, KeyCode::Enter);
     assert_eq!(action, Some(UiAction::CancelOtpGenerate));
@@ -451,7 +445,7 @@ fn declining_the_generate_confirm_cancels_locally_without_sending_anything() {
 #[test]
 fn the_size_prompt_absorbs_input_and_submits_a_valid_size() {
     let mut state = joined_general_with(vec![user(2, "bob")]);
-    state.open_otp_generate_confirm(UserId(2), "bob".into(), KeyMode::PqHybrid, vec![9, 9]);
+    state.open_otp_generate_confirm(UserId(2), "bob".into(), vec![9, 9]);
     press(&mut state, KeyCode::Enter); // Accept -> opens the size prompt
 
     // Absorbs everything else too, same as every other OTP popup.
@@ -471,7 +465,7 @@ fn the_size_prompt_absorbs_input_and_submits_a_valid_size() {
 #[test]
 fn the_size_prompt_supports_backspace() {
     let mut state = joined_general_with(vec![user(2, "bob")]);
-    state.open_otp_generate_confirm(UserId(2), "bob".into(), KeyMode::PqHybrid, vec![9, 9]);
+    state.open_otp_generate_confirm(UserId(2), "bob".into(), vec![9, 9]);
     press(&mut state, KeyCode::Enter);
 
     type_str(&mut state, "123");
@@ -483,7 +477,7 @@ fn the_size_prompt_supports_backspace() {
 #[test]
 fn the_size_prompt_rejects_a_value_outside_the_allowed_range() {
     let mut state = joined_general_with(vec![user(2, "bob")]);
-    state.open_otp_generate_confirm(UserId(2), "bob".into(), KeyMode::PqHybrid, vec![9, 9]);
+    state.open_otp_generate_confirm(UserId(2), "bob".into(), vec![9, 9]);
     press(&mut state, KeyCode::Enter);
 
     type_str(&mut state, "0");
@@ -502,7 +496,7 @@ fn the_size_prompt_rejects_a_value_outside_the_allowed_range() {
 #[test]
 fn the_size_prompt_accepts_the_maximum_and_rejects_more_than_seven_digits() {
     let mut state = joined_general_with(vec![user(2, "bob")]);
-    state.open_otp_generate_confirm(UserId(2), "bob".into(), KeyMode::PqHybrid, vec![9, 9]);
+    state.open_otp_generate_confirm(UserId(2), "bob".into(), vec![9, 9]);
     press(&mut state, KeyCode::Enter);
 
     // The max itself (1TB per key) is 7 digits and must be typeable; an 8th
@@ -527,7 +521,7 @@ fn the_size_prompt_accepts_the_maximum_and_rejects_more_than_seven_digits() {
 #[test]
 fn the_size_prompt_rejects_a_seven_digit_value_past_the_maximum() {
     let mut state = joined_general_with(vec![user(2, "bob")]);
-    state.open_otp_generate_confirm(UserId(2), "bob".into(), KeyMode::PqHybrid, vec![9, 9]);
+    state.open_otp_generate_confirm(UserId(2), "bob".into(), vec![9, 9]);
     press(&mut state, KeyCode::Enter);
 
     type_str(&mut state, "9999999");
@@ -541,7 +535,7 @@ fn the_size_prompt_rejects_a_seven_digit_value_past_the_maximum() {
 #[test]
 fn escape_on_the_size_prompt_cancels_the_whole_session() {
     let mut state = joined_general_with(vec![user(2, "bob")]);
-    state.open_otp_generate_confirm(UserId(2), "bob".into(), KeyMode::PqHybrid, vec![9, 9]);
+    state.open_otp_generate_confirm(UserId(2), "bob".into(), vec![9, 9]);
     press(&mut state, KeyCode::Enter);
     type_str(&mut state, "50");
 
@@ -1006,11 +1000,9 @@ fn endotp_in_an_open_dm_room_produces_end_otp_session_for_that_peer() {
     match action {
         Some(UiAction::EndOtpSession {
             peer,
-            key_mode,
             pubkey_der,
         }) => {
             assert_eq!(peer, UserId(2));
-            assert_eq!(key_mode, KeyMode::PqHybrid);
             assert_eq!(pubkey_der, pq_hybrid_user(2, "bob").public_key_der);
         }
         other => panic!("expected EndOtpSession, got {other:?}"),

@@ -14,17 +14,17 @@ use cucumber::World;
 use rsa::{RsaPrivateKey, RsaPublicKey};
 use tokio::net::TcpStream;
 
-use aloo::crypto::KeyPair;
-use aloo::crypto::pq::{PqPrivateBundle, PqPublicBundle};
 use aloo::client::idstore::IdStore;
-use aloo::client::replay::ReplayGuard;
-use aloo::client::p2p::{P2pEvent, PeerLinkManager};
 use aloo::client::p2p::InboundDatagram;
-use aloo::proto::{Envelope, ServerMessage, UserId};
+use aloo::client::p2p::{P2pEvent, PeerLinkManager};
 use aloo::client::rekey::RemoteKeys;
-use aloo::server::{Outgoing, Registry};
+use aloo::client::replay::ReplayGuard;
 use aloo::client::tui::ui::{UiAction, UiState};
 use aloo::client::tui::ui_connect_popup::ConnectPopupState;
+use aloo::crypto::KeyPair;
+use aloo::crypto::pq::{PqPrivateBundle, PqPublicBundle};
+use aloo::proto::{Envelope, ServerMessage, UserId};
+use aloo::server::{Outgoing, Registry};
 use aloo::settings::Settings;
 
 /// Modulus size for the scenario key pool below.
@@ -89,10 +89,23 @@ pub fn pq_bundle_for(who: &str) -> (PqPublicBundle, PqPrivateBundle) {
     let pool = POOL.get_or_init(|| Mutex::new(HashMap::new()));
     let mut guard = pool.lock().expect("pq bundle pool lock");
     let entry = guard.entry(who.to_string()).or_insert_with(|| {
-        aloo::crypto::pq::generate_bundle_with_bits(SCENARIO_KEY_BITS)
-            .expect("scenario pq keygen")
+        aloo::crypto::pq::generate_bundle_with_bits(SCENARIO_KEY_BITS).expect("scenario pq keygen")
     });
     entry.clone()
+}
+
+/// One half of a serverless, pad-only pair: a peer reachable only by
+/// direct punch, pinned under a key that is not a keybundle, with a pad
+/// installed for the pair (`docs/PROTOCOL.md` §16.2's `Direct` framing).
+pub struct PadOnlyPeer {
+    pub session: aloo::client::session::SessionState,
+    pub ui: aloo::client::tui::ui::UiState,
+    /// The `UserId` their direct link is filed under
+    /// (`p2p::direct_peer_id`) - a serverless peer has no server-assigned
+    /// one.
+    pub peer: UserId,
+    /// What this side has pinned for them: deliberately not a keybundle.
+    pub peer_der: Vec<u8>,
 }
 
 /// State for a single simulated client in a multi-client scenario. The
@@ -245,9 +258,14 @@ pub struct AlooWorld {
     /// A real session (`SessionState::for_test`) for the scenarios that
     /// drive an actual receive path rather than the UI alone.
     pub receipt_session: Option<aloo::client::session::SessionState>,
-    /// That session's own key, so a step can seal a message it will be
-    /// able to open - or deliberately not.
-    pub receipt_own_key: Option<aloo::crypto::KeyPair>,
+    /// That session's own keybundle, so a step can seal a message it will
+    /// be able to open - or deliberately not.
+    pub receipt_own_bundle: Option<PqPublicBundle>,
+
+    /// The two sides of a serverless, pad-only pair (AC-259) - real
+    /// sessions, because what is under test is registration and the send
+    /// path, neither of which the UI alone reaches.
+    pub pad_only: Option<(PadOnlyPeer, PadOnlyPeer)>,
 
     // -- identity pinning ----------------------------------------------
     pub id_store: Option<IdStore>,
@@ -270,9 +288,13 @@ pub struct AlooWorld {
     pub otp_held: Vec<String>,
     /// The (text, seq) pair still awaiting a delivery ack, if any.
     pub otp_outstanding: Option<(String, u64)>,
-    /// The most recently wrapped wire bytes, for a scenario that inspects
+    /// The most recently built wire bytes, for a scenario that inspects
     /// them directly.
     pub otp_wrapped: Vec<u8>,
+    /// How many bytes the pad itself covered, as distinct from what the
+    /// seal around it weighs - the figure the pad-innermost layering
+    /// exists to keep small.
+    pub otp_pad_bytes: usize,
     /// The acknowledgement proof the *sender* derived when wrapping, and
     /// the one the *receiver* derived when unwrapping - kept apart so a
     /// scenario can assert the two sides reached it independently.

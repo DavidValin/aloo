@@ -81,7 +81,7 @@ fn write_settings(home: &Path, body: &str) {
 }
 
 fn my_key(home: &Path, who: &str) -> aloo::client::connect::MyKeySelection {
-    aloo::client::connect::MyKeySelection::PqHybrid {
+    aloo::client::connect::MyKeySelection {
         file_pub: home.join(format!("{who}.pub")),
         file_priv: home.join(format!("{who}.priv")),
     }
@@ -90,10 +90,9 @@ fn my_key(home: &Path, who: &str) -> aloo::client::connect::MyKeySelection {
 /// The DER a peer's identity is pinned under - exactly what a server would
 /// have relayed as `UserInfo::public_key_der`.
 fn public_der(home: &Path, who: &str) -> Vec<u8> {
-    match aloo::client::connect::resolve_my_keypair(&my_key(home, who)).unwrap().0 {
-        aloo::client::connect::ResolvedIdentity::Pq { public_der, .. } => public_der,
-        _ => panic!("expected a pq_hybrid identity"),
-    }
+    aloo::client::connect::resolve_my_keypair(&my_key(home, who))
+        .unwrap()
+        .public_der
 }
 
 /// A free UDP port, released immediately so the session under test can
@@ -179,7 +178,7 @@ fn start(
     plan: DaemonPlan,
 ) -> Running {
     let home = shared_home();
-    let (identity, key_mode) =
+    let identity =
         aloo::client::connect::resolve_my_keypair(&my_key(home, key_owner)).expect("identity");
 
     let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel::<SessionInput>();
@@ -197,7 +196,6 @@ fn start(
             name,
             you,
             identity,
-            key_mode,
             id_store,
             None,
             None,
@@ -430,11 +428,12 @@ async fn two_serverless_sessions_punch_to_each_other_and_each_registers_the_othe
     // Both grids restart at the same o'clock, so both fire at the next
     // minute boundary. Started just before one, rather than waiting a whole
     // step for the one after.
-    let to_boundary = 60 - (std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
-        % 60);
+    let to_boundary = 60
+        - (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            % 60);
     if to_boundary > 3 {
         tokio::time::sleep(Duration::from_secs(to_boundary - 3)).await;
     }
@@ -449,7 +448,12 @@ async fn two_serverless_sessions_punch_to_each_other_and_each_registers_the_othe
     };
 
     write_settings(home, &settings_for(alice_port, "bob", bob_port));
-    let mut alice = start("alice", "alice", alice_store, DaemonPlan::new(Vec::new(), None));
+    let mut alice = start(
+        "alice",
+        "alice",
+        alice_store,
+        DaemonPlan::new(Vec::new(), None),
+    );
     // Her first frame is proof the settings above have been read, so the
     // file is free to be rewritten for bob.
     assert!(
@@ -486,10 +490,7 @@ async fn two_serverless_sessions_punch_to_each_other_and_each_registers_the_othe
         "alice never registered bob - punched, authenticated and placed in \
          the channel they both declared: {alice_screen}"
     );
-    assert!(
-        saw_alice,
-        "bob never registered alice: {bob_screen}"
-    );
+    assert!(saw_alice, "bob never registered alice: {bob_screen}");
     // Registered as a real member, with the encryption tag every other
     // member carries - not merely a name that happened to be drawn.
     assert!(

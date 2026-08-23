@@ -4,39 +4,30 @@
 //! `handle_ui_action`/`handle_server_message`; the generic
 //! live-voice-streaming plumbing they use lives in `crate::client::voice_stream`.
 
-
-use crate::crypto;
 use crate::client::p2p::LinkReadiness;
-use crate::p2p_proto::P2pPayload;
-use crate::proto::{self, Content, Envelope, KeyMode, UserId};
 use crate::client::rekey;
 use crate::client::session::SessionState;
 use crate::client::tui::ui::UiState;
 use crate::client::voice;
 use crate::client::voice_call;
 use crate::client::voice_stream;
+use crate::p2p_proto::P2pPayload;
+use crate::proto::{self, Content, Envelope, UserId};
 
-/// Encrypts `plaintext` for one recipient, dispatching by their `KeyMode` -
-/// see `channel::encrypt_for_each`'s doc for the same split (this is its
-/// single-recipient DM counterpart). Returns `None` if the recipient is
-/// `PqHybrid` and we can't address them (`keymode_policy::can_address`), or if
-/// encryption itself fails.
+/// Encrypts `plaintext` for one recipient - the single-recipient DM
+/// counterpart of `channel::encrypt_for_each`. `None` if their rotating
+/// key isn't known yet, or if encryption itself fails.
 fn encrypt_for_recipient(
     session: &SessionState,
     to: UserId,
-    key_mode: KeyMode,
     pubkey_der: &[u8],
     send_id: u64,
     plaintext: &[u8],
     content: Content,
 ) -> Option<Envelope> {
-    if !crate::client::keymode_policy::can_address(key_mode, session.own_key_mode) {
-        return None;
-    }
     crate::client::envelope::encrypt_envelope_for(
-        session.own_pq_private.as_ref(),
+        &session.own_pq_private,
         session.pq_peer_keys.encap_for(to),
-        key_mode,
         pubkey_der,
         // A DM is bound to no channel - which is itself the binding, and
         // what stops this being replayed into one.
@@ -58,7 +49,6 @@ pub async fn handle_send_text(
     session: &mut SessionState,
     to: UserId,
     plaintext: String,
-    recipient_key_mode: KeyMode,
     recipient_pubkey_der: Vec<u8>,
     log_index: Option<usize>,
     msg_id: u64,
@@ -72,7 +62,6 @@ pub async fn handle_send_text(
             ui_state,
             to,
             &contact_name,
-            recipient_key_mode,
             &recipient_pubkey_der,
             plaintext.as_bytes(),
             Content::Text,
@@ -88,7 +77,6 @@ pub async fn handle_send_text(
         if let Some(envelope) = encrypt_for_recipient(
             session,
             to,
-            recipient_key_mode,
             &recipient_pubkey_der,
             send_id,
             plaintext.as_bytes(),
@@ -106,17 +94,15 @@ pub async fn handle_send_text(
             crate::client::session::request_rotation(session, to);
         }
     } else {
-        session
-            .remote_keys
-            .enqueue(
-                to,
-                rekey::QueuedOutbound::Direct {
-                    plaintext,
-                    msg_id,
-                    log_index,
-                    attempts: 0,
-                },
-            );
+        session.remote_keys.enqueue(
+            to,
+            rekey::QueuedOutbound::Direct {
+                plaintext,
+                msg_id,
+                log_index,
+                attempts: 0,
+            },
+        );
     }
     Ok(())
 }
@@ -133,15 +119,14 @@ pub(crate) async fn handle_send_file(
     path: std::path::PathBuf,
     filename: String,
     size: u64,
-    recipient_key_mode: KeyMode,
     recipient_pubkey_der: Vec<u8>,
 ) -> proto::Result<()> {
-    if !crate::client::keymode_policy::can_address(recipient_key_mode, session.own_key_mode)
-        || !session.remote_keys.try_use(to)
-    {
+    if !session.remote_keys.try_use(to) {
         return Ok(());
     }
-    if let Some(contact_name) = crate::client::otp::contact_name_if_active(session, &recipient_pubkey_der) {
+    if let Some(contact_name) =
+        crate::client::otp::contact_name_if_active(session, &recipient_pubkey_der)
+    {
         return crate::client::otp::send_file_offer(
             wr,
             session,
@@ -166,7 +151,6 @@ pub(crate) async fn handle_send_file(
     let Some(envelope) = encrypt_for_recipient(
         session,
         to,
-        recipient_key_mode,
         &recipient_pubkey_der,
         stream_id,
         &plaintext,
@@ -174,13 +158,8 @@ pub(crate) async fn handle_send_file(
     ) else {
         return Ok(());
     };
-    let Some(key) = voice_stream::resolve_direct_key(
-        session,
-        stream_id,
-        to,
-        recipient_key_mode,
-        &recipient_pubkey_der,
-    ) else {
+    let Some(key) = voice_stream::resolve_direct_key(session, stream_id, to, &recipient_pubkey_der)
+    else {
         return Ok(());
     };
     session.next_stream_id += 1;
@@ -188,7 +167,12 @@ pub(crate) async fn handle_send_file(
     ui_state.log_own_file_offer_dm(to, stream_id, filename.clone(), size, Some(delivery));
     session.own_file_targets.insert(
         stream_id,
-        crate::client::file_transfer::OwnFileTarget { to, path, key, otp: None },
+        crate::client::file_transfer::OwnFileTarget {
+            to,
+            path,
+            key,
+            otp: None,
+        },
     );
     session.peer_link.ensure_link(wr, to).await;
     session.peer_link.send_reliable_or_queue(
@@ -211,12 +195,9 @@ pub(crate) async fn handle_voice_record_start(
     recorder: voice::Recorder,
     stream_id: u64,
     to: UserId,
-    recipient_key_mode: KeyMode,
     recipient_pubkey_der: Vec<u8>,
 ) -> proto::Result<()> {
-    if !crate::client::keymode_policy::can_address(recipient_key_mode, session.own_key_mode)
-        || !session.remote_keys.try_use(to)
-    {
+    if !session.remote_keys.try_use(to) {
         ui_state.recording_failed("recipient's key isn't ready yet".to_string());
         return Ok(());
     }
@@ -224,7 +205,9 @@ pub(crate) async fn handle_voice_record_start(
     // finished (`client::otp::send_voice_offer`'s doc) rather than
     // live-streamed - no `StreamStart`/per-chunk network traffic at all
     // until the recording stops.
-    if let Some(contact_name) = crate::client::otp::contact_name_if_active(session, &recipient_pubkey_der) {
+    if let Some(contact_name) =
+        crate::client::otp::contact_name_if_active(session, &recipient_pubkey_der)
+    {
         // The row exists from the moment recording starts, but nothing goes
         // on the wire until it stops - `send_voice_offer` reads this id
         // back off the row then (`UiState::own_stream_msg_id`).
@@ -256,27 +239,16 @@ pub(crate) async fn handle_voice_record_start(
         ui_state.recording_failed("no direct connection to recipient yet".to_string());
         return Ok(());
     }
-    let key = match recipient_key_mode {
-        KeyMode::PqHybrid => {
-            let Some(pq) = voice_stream::build_pq_stream_out(
-                session,
-                None,
-                stream_id,
-                &[(to, recipient_pubkey_der.clone())],
-            ) else {
-                ui_state.recording_failed("failed to prepare pq_hybrid stream key".to_string());
-                return Ok(());
-            };
-            voice_stream::DirectStreamKey::Pq(pq)
-        }
-        _ => match crypto::public_key_from_der(&recipient_pubkey_der) {
-            Ok(k) => voice_stream::DirectStreamKey::Rsa(k),
-            Err(e) => {
-                ui_state.recording_failed(e.to_string());
-                return Ok(());
-            }
-        },
+    let Some(pq) = voice_stream::build_pq_stream_out(
+        session,
+        None,
+        stream_id,
+        &[(to, recipient_pubkey_der.clone())],
+    ) else {
+        ui_state.recording_failed("failed to prepare pq_hybrid stream key".to_string());
+        return Ok(());
     };
+    let key = voice_stream::DirectStreamKey::Pq(pq);
     let (msg_id, delivery) = ui_state.start_delivery(&[to]);
     ui_state.log_own_voice_stream_start_dm(to, stream_id, Some(delivery));
     session.peer_link.send_reliable_or_queue(
@@ -289,12 +261,10 @@ pub(crate) async fn handle_voice_record_start(
     );
     // A pq_hybrid recipient's setup follows `StreamStart`, once and
     // reliably - see the channel counterpart for why it isn't per chunk.
-    if let voice_stream::DirectStreamKey::Pq(pq) = &key {
-        for (id, setup) in pq.setups() {
-            session
-                .peer_link
-                .send_reliable_or_queue(id, P2pPayload::StreamKeySetup { stream_id, setup });
-        }
+    for (id, setup) in key.setups() {
+        session
+            .peer_link
+            .send_reliable_or_queue(id, P2pPayload::StreamKeySetup { stream_id, setup });
     }
     let (stop_tx, stop_rx) = std::sync::mpsc::channel();
     session.active_recording = Some(stop_tx);
@@ -326,18 +296,10 @@ pub(crate) async fn handle_start_call(
     ui_state: &mut UiState,
     session: &mut SessionState,
     to: UserId,
-    recipient_key_mode: KeyMode,
     recipient_pubkey_der: Vec<u8>,
 ) -> proto::Result<()> {
     if crate::client::otp::contact_name_if_active(session, &recipient_pubkey_der).is_some() {
-        ui_state.push_status_notice(
-            crate::client::tui::ui::OTP_CALL_REFUSAL.to_string(),
-            false,
-        );
-        return Ok(());
-    }
-    if !crate::client::keymode_policy::can_address(recipient_key_mode, session.own_key_mode) {
-        ui_state.push_status_notice("can't call this recipient right now".to_string(), false);
+        ui_state.push_status_notice(crate::client::tui::ui::OTP_CALL_REFUSAL.to_string(), false);
         return Ok(());
     }
     let Some(host) = ui_state.own_id else {
@@ -387,7 +349,9 @@ pub async fn on_message(
             return;
         }
         Content::OtpSessionRequest => {
-            crate::client::otp::on_session_request(ui_state, session, from, from_name, &sender, envelope);
+            crate::client::otp::on_session_request(
+                ui_state, session, from, from_name, &sender, envelope,
+            );
             return;
         }
         Content::OtpKeySetupAck => {
@@ -395,8 +359,10 @@ pub async fn on_message(
             return;
         }
         Content::OtpEndSession => {
-            crate::client::otp::on_end_session(session, ui_state, from, from_name, &sender, envelope)
-                .await;
+            crate::client::otp::on_end_session(
+                session, ui_state, from, from_name, &sender, envelope,
+            )
+            .await;
             return;
         }
         Content::OtpEndSessionAck => {

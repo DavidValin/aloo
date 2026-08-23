@@ -69,8 +69,7 @@ pub const STATUS_NOTICE_TIMEOUT: std::time::Duration = std::time::Duration::from
 /// overlay over the conversation, not a modal: left open and forgotten it
 /// would sit on top of the messages arriving underneath, so an idle one
 /// gets out of the way on its own.
-pub const SELECTOR_DROPDOWN_IDLE_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(30);
+pub const SELECTOR_DROPDOWN_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The help overlay's own text, `Up`/`Down`/`PageUp`/`PageDown`/`Home`/`End`-
 /// scrollable (`UiState::help_scroll`) since it easily runs longer than a
@@ -291,24 +290,18 @@ const HELP_BODY: &[HelpLine] = &[
     HelpLine::Blank,
     HelpLine::Heading("Encryption (tag shown after each username)"),
     HelpLine::Item {
-        keys: "name \u{1F6A8} PWD",
-        text: "static: one RSA keypair derived from a password",
-    },
-    HelpLine::Item {
-        keys: "name \u{1F6A8} PLAIN",
-        text: "static: one RSA keypair auto-generated when you connected",
-    },
-    HelpLine::Item {
         keys: "name \u{1F6E1}\u{FE0F} PQH",
-        text: "static: ML-DSA-87+RSA4096/ML-KEM-1024+RSA4096/AES-256-GCM, loaded from a file",
+        text: "the only scheme there is: ML-DSA-87+RSA4096/ML-KEM-1024+RSA4096/AES-256-GCM, loaded from a file",
     },
     HelpLine::Item {
         keys: "name \u{1F511} OTP",
         text: "a one-time-pad session is open with this person (/otp below), so that pad -                not the tag above - is what protects everything said to them. Shown in                place of their own tag in the user list, on the DM selector and on their                dropdown row.",
     },
     HelpLine::Note(
-        "The tags sit flush against the user list's right edge, so they read as a column of \
-         their own rather than starting wherever each nickname happens to end. A name is \
+        "Everyone carries the shield: it is the only scheme, and the keys that encrypt to a \
+         person rotate as you talk, so a stolen key file does not open what was already \
+         said. The tags sit flush against the user list's right edge, so they read as a \
+         column of their own rather than starting wherever each nickname happens to end. A name is \
          green while what you type reaches that person and gray until it does; red means \
          their identity is unresolved, which is the one thing here to act on.",
     ),
@@ -383,7 +376,8 @@ const HELP_BODY: &[HelpLine] = &[
     HelpLine::Heading("Identity pinning (id_store)"),
     HelpLine::Note(
         "Remembers each nickname's full public key across sessions (not just a hash) - \
-         exact match for password/pq_hybrid. none is untracked. A mismatch opens a popup \
+         exact match, since an identity is loaded from a file and never changes on its \
+         own. A mismatch opens a popup \
          naming the peer with Accept/Reject buttons; messaging with them is blocked until \
          you decide. Accept saves to disk right away and reveals anything of theirs held \
          while unresolved; Reject saves nothing and isn't permanent - select them again \
@@ -523,7 +517,9 @@ impl FileRowProgress {
             .sent
             .keys()
             .copied()
-            .filter(|s| !self.done.contains(s) && !self.failed.contains(s) && !self.rejected.contains(s))
+            .filter(|s| {
+                !self.done.contains(s) && !self.failed.contains(s) && !self.rejected.contains(s)
+            })
             .collect();
         if outstanding.is_empty() {
             if !self.done.is_empty() {
@@ -678,38 +674,44 @@ impl DeliveryStatus {
 /// message, not this one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MessageCrypto {
-    /// The ordinary per-recipient envelope (`client::envelope`), named by
-    /// the `KeyMode` whose scheme built it. `key_id` is a short
-    /// fingerprint of the one public key involved
-    /// (`crypto::short_fingerprint_der`), or `None` for a channel send
-    /// addressed to several keys at once.
-    Envelope {
-        key_mode: KeyMode,
-        key_id: Option<String>,
-    },
-    /// The one-time-pad layer over that envelope (`docs/PROTOCOL.md` §16):
-    /// which sequence this message is, the pad offset its key bytes start
-    /// at, and the key file they were taken from.
+    /// The ordinary per-recipient PQ-hybrid envelope
+    /// (`client::envelope`). `key_id` is a short fingerprint of the one
+    /// public key involved (`crypto::short_fingerprint_der`), or `None`
+    /// for a channel send addressed to several keys at once.
+    Envelope { key_id: Option<String> },
+    /// The one-time-pad layer (`docs/PROTOCOL.md` §16): which sequence
+    /// this message is, the pad offset its key bytes start at, and the key
+    /// file they were taken from.
     Otp {
         seq: u64,
         offset: u64,
         key_path: String,
+        /// Whether a sealed envelope was built around the pad
+        /// (`PqWrapped`) or the pad ciphertext travelled on its own
+        /// (`Direct`, §16.2) - the one thing about a pad-protected message
+        /// that is not the same on every pair, so the popup must not
+        /// assume it.
+        inside_envelope: bool,
     },
 }
 
-/// What the details popup calls each scheme - the mechanism, not the
-/// `my_key` sourcing tag `KeyMode::label` shows in the sidebar. Someone
-/// asking how one specific message was encrypted is asking about the
-/// cipher, and `PWD` / `PLAIN` say nothing about it (both are RSA-OAEP -
-/// they differ in where the keypair came from, §8.3).
+/// What the details popup calls each layer - the mechanism, not the
+/// `my_key` tag `KeyMode::label` shows in the sidebar. Someone asking how
+/// one specific message was encrypted is asking about the cipher.
 impl MessageCrypto {
     pub fn method_label(&self) -> &'static str {
         match self {
-            MessageCrypto::Envelope { key_mode, .. } => match key_mode {
-                KeyMode::Password | KeyMode::None => "RSA-4096 OAEP/SHA-256",
-                KeyMode::PqHybrid => "ML-KEM-1024 + RSA-4096 -> AES-256-GCM, ML-DSA-87 signed",
-            },
-            MessageCrypto::Otp { .. } => "one-time pad (XOR) over the pq_hybrid envelope",
+            MessageCrypto::Envelope { .. } => {
+                "ML-KEM-1024 + RSA-4096 -> AES-256-GCM, ML-DSA-87 signed"
+            }
+            MessageCrypto::Otp {
+                inside_envelope: true,
+                ..
+            } => "one-time pad (XOR) inside the pq_hybrid envelope",
+            MessageCrypto::Otp {
+                inside_envelope: false,
+                ..
+            } => "one-time pad (XOR), carrying the message directly",
         }
     }
 }
@@ -946,7 +948,7 @@ pub(crate) const DM_ICON: &str = "\u{1F4AC}";
 ///
 /// A key rather than a shield, and deliberately not the \u{1F6E1}\u{FE0F}
 /// one `pq_hybrid` already carries (`proto::KeyMode::label`): the pad
-/// always runs *over* pq_hybrid, so sharing a glyph would mean the marker
+/// normally runs *over* pq_hybrid, so sharing a glyph would mean the marker
 /// for the extra layer and the marker for the layer under it were the same
 /// character - and the whole job of both is telling them apart. A one-time
 /// pad is key material spent once and destroyed, which is what the key
@@ -1116,7 +1118,6 @@ pub enum CallTarget {
     },
     Direct {
         to: UserId,
-        recipient_key_mode: KeyMode,
         recipient_pubkey_der: Vec<u8>,
     },
 }
@@ -1275,7 +1276,6 @@ impl CallUiState {
 pub struct PendingOtpGenerate {
     pub peer: UserId,
     pub peer_name: String,
-    pub key_mode: KeyMode,
     pub pubkey_der: Vec<u8>,
 }
 
@@ -1338,7 +1338,9 @@ impl OtpKeygenProgress {
 }
 
 /// The spinner's animation frames, advanced one per UI tick.
-pub const SPINNER_FRAMES: [&str; 8] = ["\u{280B}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283C}", "\u{2834}", "\u{2826}", "\u{2827}"];
+pub const SPINNER_FRAMES: [&str; 8] = [
+    "\u{280B}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283C}", "\u{2834}", "\u{2826}", "\u{2827}",
+];
 
 /// One incoming OTP session proposal awaiting an Accept/Reject decision -
 /// the peer-initiated counterpart of `PendingOtpGenerate`, mirroring
@@ -1369,12 +1371,10 @@ pub struct PendingOtpInvite {
     pub pad_size_mb: Option<u32>,
 }
 
-/// A recipient's addressing info: their id, announced `KeyMode` (which
-/// scheme to encrypt under - see `envelope::encrypt_for_one` vs
-/// `envelope::encrypt_hybrid_envelope_for`), and their raw public key bytes
-/// (RSA DER, or a bincode-encoded `crypto::pq::PqPublicBundle` for
-/// `KeyMode::PqHybrid` - opaque either way until paired with `KeyMode`).
-pub type Recipient = (UserId, KeyMode, Vec<u8>);
+/// A recipient's addressing info: their id and their bootstrap keybundle
+/// as announced (a bincode-encoded `crypto::pq::PqPublicBundle` - opaque
+/// bytes until `envelope::encrypt_envelope_for` seals against it).
+pub type Recipient = (UserId, Vec<u8>);
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum VoiceTarget {
@@ -1384,7 +1384,6 @@ pub enum VoiceTarget {
     },
     Direct {
         to: UserId,
-        recipient_key_mode: KeyMode,
         recipient_pubkey_der: Vec<u8>,
     },
     /// A recording destined for the mail being composed (docs/PROTOCOL.md
@@ -1419,7 +1418,6 @@ pub enum UiAction {
     SendDirectText {
         to: UserId,
         plaintext: String,
-        recipient_key_mode: KeyMode,
         recipient_pubkey_der: Vec<u8>,
         /// Where this text landed in the DM's log when it was optimistically
         /// shown (`push_outgoing_dm`) - lets a later async failure
@@ -1477,7 +1475,6 @@ pub enum UiAction {
         path: std::path::PathBuf,
         filename: String,
         size: u64,
-        recipient_key_mode: KeyMode,
         recipient_pubkey_der: Vec<u8>,
     },
     /// The user confirmed Accept/Reject in the file-offer popup for
@@ -1497,7 +1494,6 @@ pub enum UiAction {
     /// (`client::otp::handle_otp_command`). Never sent automatically.
     RequestOtpSession {
         peer: UserId,
-        key_mode: KeyMode,
         pubkey_der: Vec<u8>,
     },
     /// The user confirmed "generate and share a fresh OTP pad?"
@@ -1529,7 +1525,6 @@ pub enum UiAction {
     /// still allows while that peer is offline - see its doc.
     EndOtpSession {
         peer: UserId,
-        key_mode: KeyMode,
         pubkey_der: Vec<u8>,
     },
     /// Emitted on every keystroke in the mail compose view's To field
@@ -2433,9 +2428,7 @@ impl UiState {
                 }
                 let matches = match &entry.body {
                     MessageBody::VoiceStreaming { stream_id: sid }
-                    | MessageBody::File {
-                        stream_id: sid, ..
-                    } => *sid == stream_id,
+                    | MessageBody::File { stream_id: sid, .. } => *sid == stream_id,
                     _ => false,
                 };
                 if matches {
@@ -2655,7 +2648,7 @@ impl UiState {
                                     id: peer,
                                     name: from_name,
                                     public_key_der: Vec::new(),
-                                    key_mode: crate::proto::KeyMode::None,
+                                    key_mode: crate::proto::KeyMode::PqHybrid,
                                 });
                         self.ensure_private_room(peer, fallback_peer);
                         let Some(room) = self.private_rooms.get_mut(&peer) else {
@@ -3068,10 +3061,7 @@ impl UiState {
                     && self.has_reason_to_keep_link(u.id)
                     && !call.members.iter().any(|m| {
                         m.id == u.id
-                            && matches!(
-                                m.state,
-                                CallMemberState::InCall | CallMemberState::Invited
-                            )
+                            && matches!(m.state, CallMemberState::InCall | CallMemberState::Invited)
                     })
             })
             .map(|u| (u.id, u.name.clone()))
@@ -3113,13 +3103,11 @@ impl UiState {
         &mut self,
         peer: UserId,
         peer_name: String,
-        key_mode: KeyMode,
         pubkey_der: Vec<u8>,
     ) {
         self.otp_generate_confirm = Some(PendingOtpGenerate {
             peer,
             peer_name,
-            key_mode,
             pubkey_der,
         });
         self.otp_generate_focus = OtpChoice::Accept;
@@ -3471,8 +3459,9 @@ impl UiState {
     /// The pad replaces the tag rather than being added beside it. It is
     /// the layer that actually protects what is being said to that person
     /// (`docs/PROTOCOL.md` §16.2 - there is no way to send them a plain
-    /// message while one is active), and it only ever runs over
-    /// `pq_hybrid`, so the tag it displaces is always the same one.
+    /// message while one is active). The tag it displaces is always the
+    /// same one, `pq_hybrid`'s, since that is the only `my_key` there is -
+    /// whether or not the pad actually has an envelope under it.
     pub fn encryption_tag(&self, peer: UserId, key_mode: KeyMode) -> &'static str {
         if self.is_otp_active(peer) {
             OTP_TAG
@@ -3520,7 +3509,9 @@ impl UiState {
         // where `otp --show-contact` itself would not answer. There is
         // then nothing true to say about the pad, so the row falls through
         // to the envelope underneath it, which is at least a fact.
-        let otp_status = self.otp_key_status_for(peer).filter(|_| self.is_otp_active(peer));
+        let otp_status = self
+            .otp_key_status_for(peer)
+            .filter(|_| self.is_otp_active(peer));
         if let Some(status) = otp_status {
             let (sequence, offset, key_path) = if outgoing {
                 (
@@ -3539,11 +3530,19 @@ impl UiState {
                 seq: sequence + 1,
                 offset,
                 key_path: key_path.display().to_string(),
+                // `otp::framing_for` reads both sides' keys; this client's
+                // own is always a real keybundle, so from here the answer
+                // turns entirely on whether the peer announced one.
+                inside_envelope: self
+                    .known_users
+                    .get(&peer)
+                    .is_some_and(|u| {
+                        crate::crypto::pq::fingerprint_of_encoded(&u.public_key_der).is_some()
+                    }),
             });
         }
         let user = self.known_users.get(&peer)?;
         Some(MessageCrypto::Envelope {
-            key_mode: user.key_mode,
             key_id: Some(crate::crypto::short_fingerprint_der(&user.public_key_der)),
         })
     }
@@ -3592,15 +3591,10 @@ impl UiState {
         match recipients {
             [] => None,
             [one] => self.message_crypto(*one, true),
-            many => {
-                let first = self.known_users.get(many.first()?)?.key_mode;
-                many.iter()
-                    .all(|id| self.known_users.get(id).is_some_and(|u| u.key_mode == first))
-                    .then_some(MessageCrypto::Envelope {
-                        key_mode: first,
-                        key_id: None,
-                    })
-            }
+            many => many
+                .iter()
+                .all(|id| self.known_users.contains_key(id))
+                .then_some(MessageCrypto::Envelope { key_id: None }),
         }
     }
 
@@ -3911,7 +3905,9 @@ impl UiState {
         if let Some(progress) = self.otp_keygen.as_ref() {
             return match (kind, code) {
                 (KeyEventKind::Press | KeyEventKind::Repeat, KeyCode::Esc) => {
-                    Some(UiAction::CancelOtpPad { peer: progress.peer })
+                    Some(UiAction::CancelOtpPad {
+                        peer: progress.peer,
+                    })
                 }
                 _ => None,
             };
@@ -4061,9 +4057,7 @@ impl UiState {
                     KeyCode::Enter => {
                         let pending = self.call_confirm.take()?;
                         match self.call_confirm_focus {
-                            CallConfirmChoice::Confirm => {
-                                Some(UiAction::StartCall(pending.target))
-                            }
+                            CallConfirmChoice::Confirm => Some(UiAction::StartCall(pending.target)),
                             CallConfirmChoice::Cancel => None,
                         }
                     }
@@ -4770,7 +4764,6 @@ impl UiState {
             self.input.clear();
             return Some(UiAction::EndOtpSession {
                 peer: peer_id,
-                key_mode: peer.key_mode,
                 pubkey_der: peer.public_key_der,
             });
         }
@@ -4802,7 +4795,6 @@ impl UiState {
             self.input.clear();
             return Some(UiAction::RequestOtpSession {
                 peer: peer_id,
-                key_mode: peer.key_mode,
                 pubkey_der: peer.public_key_der,
             });
         }
@@ -4969,7 +4961,6 @@ impl UiState {
             let action = UiAction::SendDirectText {
                 to: peer_id,
                 plaintext: text,
-                recipient_key_mode: peer.key_mode,
                 recipient_pubkey_der: peer.public_key_der,
                 log_index,
                 msg_id,
@@ -5264,7 +5255,6 @@ impl UiState {
             let peer = self.known_users.get(&peer_id)?;
             Some(VoiceTarget::Direct {
                 to: peer_id,
-                recipient_key_mode: peer.key_mode,
                 recipient_pubkey_der: peer.public_key_der.clone(),
             })
         } else {
@@ -5294,7 +5284,6 @@ impl UiState {
             let peer = self.known_users.get(&peer_id)?;
             return Some(CallTarget::Direct {
                 to: peer_id,
-                recipient_key_mode: peer.key_mode,
                 recipient_pubkey_der: peer.public_key_der.clone(),
             });
         }
@@ -5524,7 +5513,6 @@ impl UiState {
             }
         }
     }
-
 }
 
 /// This machine's local wall-clock time as `HH:MM:SS`, for the presence
@@ -5896,8 +5884,20 @@ fn render_otp_generate_popup(
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(rows[1]);
-    render_popup_button(frame, button_cols[0], 16, "Accept", focus == OtpChoice::Accept);
-    render_popup_button(frame, button_cols[1], 16, "Reject", focus == OtpChoice::Reject);
+    render_popup_button(
+        frame,
+        button_cols[0],
+        16,
+        "Accept",
+        focus == OtpChoice::Accept,
+    );
+    render_popup_button(
+        frame,
+        button_cols[1],
+        16,
+        "Reject",
+        focus == OtpChoice::Reject,
+    );
 }
 
 fn render_otp_invite_popup(
@@ -5941,8 +5941,20 @@ fn render_otp_invite_popup(
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(rows[1]);
-    render_popup_button(frame, button_cols[0], 16, "Accept", focus == OtpChoice::Accept);
-    render_popup_button(frame, button_cols[1], 16, "Reject", focus == OtpChoice::Reject);
+    render_popup_button(
+        frame,
+        button_cols[0],
+        16,
+        "Accept",
+        focus == OtpChoice::Accept,
+    );
+    render_popup_button(
+        frame,
+        button_cols[1],
+        16,
+        "Reject",
+        focus == OtpChoice::Reject,
+    );
 }
 
 /// Follows `render_otp_generate_popup`'s Accept - asks how large a pad to
@@ -5950,7 +5962,12 @@ fn render_otp_invite_popup(
 /// same shape as `channel::render_channel_password_popup`'s text-entry
 /// popup (a live input line, an error line only when there's an error to
 /// show).
-fn render_otp_size_popup(frame: &mut Frame, area: Rect, pending: &PendingOtpGenerate, state: &UiState) {
+fn render_otp_size_popup(
+    frame: &mut Frame,
+    area: Rect,
+    pending: &PendingOtpGenerate,
+    state: &UiState,
+) {
     let has_error = state.otp_size_error.is_some();
     let popup = centered_rect(64, if has_error { 8 } else { 7 }, area);
     let block = Block::default()
@@ -5995,7 +6012,10 @@ fn render_otp_size_popup(frame: &mut Frame, area: Rect, pending: &PendingOtpGene
         Paragraph::new(message).wrap(ratatui::widgets::Wrap { trim: true }),
         rows[0],
     );
-    frame.render_widget(Paragraph::new(format!("> {}", state.otp_size_text)), rows[1]);
+    frame.render_widget(
+        Paragraph::new(format!("> {}", state.otp_size_text)),
+        rows[1],
+    );
     if let Some(err) = &state.otp_size_error {
         frame.render_widget(
             Paragraph::new(err.as_str()).style(Style::default().fg(Color::Red)),
@@ -6069,7 +6089,9 @@ fn render_otp_keygen_popup(frame: &mut Frame, area: Rect, progress: &OtpKeygenPr
         Paragraph::new(Line::from(vec![
             Span::styled(
                 format!("{spinner} "),
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::raw(what),
         ]))
@@ -6081,10 +6103,7 @@ fn render_otp_keygen_popup(frame: &mut Frame, area: Rect, progress: &OtpKeygenPr
     let filled = filled.min(KEYGEN_BAR_CELLS);
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled(
-                "\u{2588}".repeat(filled),
-                Style::default().fg(Color::Green),
-            ),
+            Span::styled("\u{2588}".repeat(filled), Style::default().fg(Color::Green)),
             Span::styled(
                 "\u{2591}".repeat(KEYGEN_BAR_CELLS - filled),
                 Style::default().fg(Color::DarkGray),
@@ -6096,8 +6115,8 @@ fn render_otp_keygen_popup(frame: &mut Frame, area: Rect, progress: &OtpKeygenPr
 
     frame.render_widget(
         Paragraph::new(reassurance)
-        .style(Style::default().fg(Color::DarkGray))
-        .wrap(ratatui::widgets::Wrap { trim: true }),
+            .style(Style::default().fg(Color::DarkGray))
+            .wrap(ratatui::widgets::Wrap { trim: true }),
         rows[2],
     );
 }
@@ -6146,7 +6165,9 @@ const LEVEL_BAR_CELLS: usize = 10;
 /// block characters - the "audio bar with the voice levels from the user"
 /// `docs/SPEC.md` "Live voice calls" puts next to every roster row.
 fn level_bar(level: u8) -> String {
-    let filled = (level as usize * LEVEL_BAR_CELLS).div_ceil(100).min(LEVEL_BAR_CELLS);
+    let filled = (level as usize * LEVEL_BAR_CELLS)
+        .div_ceil(100)
+        .min(LEVEL_BAR_CELLS);
     format!(
         "{}{}",
         "\u{2588}".repeat(filled),
@@ -6215,12 +6236,7 @@ impl CallColumns {
     /// How many columns one roster row needs end to end: marker, name,
     /// gap, labels, the gap before the meter, and the meter itself.
     pub fn row_width(self) -> usize {
-        CALL_MARKER_COL
-            + self.name
-            + CALL_COL_GAP
-            + self.label
-            + CALL_LEVEL_GAP
-            + LEVEL_BAR_CELLS
+        CALL_MARKER_COL + self.name + CALL_COL_GAP + self.label + CALL_LEVEL_GAP + LEVEL_BAR_CELLS
     }
 }
 
@@ -6270,7 +6286,10 @@ fn call_member_name(member: &CallMember, host: UserId, own_id: Option<UserId>) -
 /// span, leaving it alone if it is already at least that wide - what keeps
 /// a column of variable-length labels from shifting whatever follows it.
 fn pad_to(spans: &mut Vec<Span<'static>>, width: usize) {
-    let used: usize = spans.iter().map(|s| display_width(&s.content) as usize).sum();
+    let used: usize = spans
+        .iter()
+        .map(|s| display_width(&s.content) as usize)
+        .sum();
     if used < width {
         spans.push(Span::raw(" ".repeat(width - used)));
     }
@@ -6285,7 +6304,12 @@ fn pad_to(spans: &mut Vec<Span<'static>>, width: usize) {
 /// to the call in it (`call_modal_rect`) and centers in what it was given,
 /// so a three-person call on a wide terminal is a small box rather than a
 /// fixed slab of mostly-blank columns.
-pub(crate) fn render_call_modal(frame: &mut Frame, area: Rect, state: &UiState, call: &CallUiState) {
+pub(crate) fn render_call_modal(
+    frame: &mut Frame,
+    area: Rect,
+    state: &UiState,
+    call: &CallUiState,
+) {
     let title = match &call.channel {
         Some(name) => format!("Call \u{2014} #{name}"),
         None => "Call".to_string(),
@@ -6804,7 +6828,13 @@ pub(crate) fn render_messages(
             // The same tag they carry in the user list and on the DM
             // selector (`UiState::encryption_tag`), so one person is not
             // labelled two different ways on one screen.
-            .map(|u| format!("Private: {} {}", u.name, state.encryption_tag(id, u.key_mode)))
+            .map(|u| {
+                format!(
+                    "Private: {} {}",
+                    u.name,
+                    state.encryption_tag(id, u.key_mode)
+                )
+            })
             .unwrap_or_else(|| "Private".to_string())
     } else {
         "Messages".to_string()
@@ -6939,11 +6969,14 @@ pub(crate) fn render_messages(
                 }
                 MessageBody::System(text) => Line::from(Span::styled(
                     text.clone(),
-                    Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::ITALIC),
                 )),
-                MessageBody::Presence(text) => {
-                    Line::from(Span::styled(text.clone(), Style::default().fg(Color::Yellow)))
-                }
+                MessageBody::Presence(text) => Line::from(Span::styled(
+                    text.clone(),
+                    Style::default().fg(Color::Yellow),
+                )),
             };
             // A message that reached nobody is struck through: it is not
             // waiting on anybody's acknowledgement, because it was never
@@ -6956,7 +6989,10 @@ pub(crate) fn render_messages(
                 }
             }
             if pad_active
-                && !matches!(entry.body, MessageBody::System(_) | MessageBody::Presence(_))
+                && !matches!(
+                    entry.body,
+                    MessageBody::System(_) | MessageBody::Presence(_)
+                )
             {
                 line.spans.insert(0, Span::raw(format!("{OTP_ICON} ")));
             }
@@ -7196,6 +7232,7 @@ pub fn crypto_lines(crypto: Option<&MessageCrypto>) -> Vec<(&'static str, String
             seq,
             offset,
             key_path,
+            ..
         } => {
             lines.push((KEY_SEQ_LABEL, seq.to_string()));
             lines.push((KEY_OFFSET_LABEL, offset.to_string()));
@@ -7320,7 +7357,10 @@ fn render_message_info_popup(frame: &mut Frame, area: Rect, state: &UiState) {
         lines.push(Line::from(vec![
             Span::raw(recipient.name.clone()),
             Span::raw(" ".repeat(pad)),
-            Span::styled(status, Style::default().fg(color).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                status,
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
         ]));
     }
     frame.render_widget(Paragraph::new(lines), inner);

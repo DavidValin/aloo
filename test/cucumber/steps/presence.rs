@@ -5,10 +5,10 @@ use crossterm::event::{KeyCode, KeyModifiers};
 use cucumber::{given, then, when};
 use ratatui::style::Color;
 
-use aloo::client::tui::channel::HEADER_ROW_HEIGHT;
 use aloo::client::p2p::LinkStatus;
-use aloo::proto::{KeyMode, UserId};
+use aloo::client::tui::channel::HEADER_ROW_HEIGHT;
 use aloo::client::tui::ui::{Focus, HELP_POPUP_TITLE, LogEntry, MessageBody};
+use aloo::proto::{KeyMode, UserId};
 
 use crate::steps::ui_common::{id_for, press_key};
 use crate::support::{
@@ -23,12 +23,9 @@ use crate::world::AlooWorld;
 #[then(expr = "{word}'s tag is shown after their name")]
 async fn tag_after(w: &mut AlooWorld, name: String) {
     let rows = ui_rows_wide(w.ui_ref());
-    let tag = match name.as_str() {
-        "dan" => "PWD",
-        "eve" => "PLAIN",
-        "frank" => "PQH",
-        other => panic!("no expected tag for {other}"),
-    };
+    // One scheme, so one tag - the assertion is about where it sits, not
+    // about which of several it is.
+    let tag = "PQH";
     assert!(
         appears_before(&rows, &name, tag),
         "every tag trails the name as an annotation on it - expected {name}'s {tag} tag after their name: {rows:?}"
@@ -217,7 +214,7 @@ async fn offline_is_permanent(w: &mut AlooWorld, name: String) {
     let info = crate::steps::ui_common::user_with_mode(
         id_for(&name),
         &name,
-        aloo::proto::KeyMode::Password,
+        aloo::proto::KeyMode::PqHybrid,
     );
     w.ui_mut().on_user_joined("general", info);
     assert!(
@@ -236,8 +233,7 @@ async fn offline_is_permanent(w: &mut AlooWorld, name: String) {
 /// `UiState::on_user_joined` and so does log a yellow "joined" line.
 #[when(expr = "{word} joins the channel with me")]
 async fn member_joins_live(w: &mut AlooWorld, name: String) {
-    let info =
-        crate::steps::ui_common::user_with_mode(id_for(&name), &name, KeyMode::Password);
+    let info = crate::steps::ui_common::user_with_mode(id_for(&name), &name, KeyMode::PqHybrid);
     w.ui_mut().on_user_joined("general", info);
 }
 
@@ -247,8 +243,8 @@ async fn member_leaves(w: &mut AlooWorld, name: String) {
 }
 
 fn assert_presence_suffix(entry: Option<&LogEntry>, suffix: &str) {
-    let entry =
-        entry.unwrap_or_else(|| panic!("expected a presence notice ending {suffix:?}, log is empty"));
+    let entry = entry
+        .unwrap_or_else(|| panic!("expected a presence notice ending {suffix:?}, log is empty"));
     match &entry.body {
         MessageBody::Presence(text) => assert!(
             text.ends_with(suffix),
@@ -275,11 +271,7 @@ async fn no_presence_notice(w: &mut AlooWorld) {
 #[then(expr = "{word}'s private room ends with the presence notice {string}")]
 async fn private_room_ends_with_presence(w: &mut AlooWorld, name: String, suffix: String) {
     let id = UserId(id_for(&name));
-    let entry = w
-        .ui_ref()
-        .private_rooms
-        .get(&id)
-        .and_then(|r| r.log.last());
+    let entry = w.ui_ref().private_rooms.get(&id).and_then(|r| r.log.last());
     assert_presence_suffix(entry, &suffix);
 }
 
@@ -414,7 +406,8 @@ async fn room_untouched(w: &mut AlooWorld) {
 /// then check" no longer reliably lands on a screenful containing it.
 #[then("the help popup shows its longest line unclipped")]
 async fn help_unclipped(w: &mut AlooWorld) {
-    let tail = "static: ML-DSA-87+RSA4096/ML-KEM-1024+RSA4096/AES-256-GCM, loaded from a file";
+    let tail =
+        "the only scheme there is: ML-DSA-87+RSA4096/ML-KEM-1024+RSA4096/AES-256-GCM, loaded from a file";
     let mut rows = ui_rows_wide(w.ui_ref());
     for _ in 0..40 {
         if rows.iter().any(|r| r.contains(tail)) {
@@ -566,7 +559,7 @@ async fn reconnects(w: &mut AlooWorld, name: String) {
     let info = crate::steps::ui_common::user_with_mode(
         RECONNECTED_ID,
         &name,
-        aloo::proto::KeyMode::Password,
+        aloo::proto::KeyMode::PqHybrid,
     );
     w.ui_mut().on_user_joined("general", info);
 }

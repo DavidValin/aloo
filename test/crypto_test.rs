@@ -54,34 +54,6 @@ fn wrong_key_cannot_decrypt() {
     assert!(result.is_err());
 }
 
-/// @requirement AC-042
-#[test]
-fn password_derived_keypair_is_deterministic() {
-    let kp1 = KeyPair::from_password("hunter2").expect("derive 1");
-    let kp2 = KeyPair::from_password("hunter2").expect("derive 2");
-    assert_eq!(
-        public_key_to_der(&kp1.public).unwrap(),
-        public_key_to_der(&kp2.public).unwrap()
-    );
-
-    // sanity: a key derived from kp1's password can decrypt what was
-    // encrypted for kp2's (identical) public key.
-    let blocks = encrypt_chunked(&kp2.public, b"round trip").unwrap();
-    let out = decrypt_chunked(&kp1.private, &blocks).unwrap();
-    assert_eq!(out, b"round trip");
-}
-
-/// @requirement AC-042
-#[test]
-fn different_passwords_derive_different_keypairs() {
-    let kp1 = KeyPair::from_password("hunter2").expect("derive 1");
-    let kp2 = KeyPair::from_password("correct horse battery staple").expect("derive 2");
-    assert_ne!(
-        public_key_to_der(&kp1.public).unwrap(),
-        public_key_to_der(&kp2.public).unwrap()
-    );
-}
-
 /// @requirement TB-115
 #[test]
 fn encrypt_chunked_rejects_a_key_too_small_for_oaep() {

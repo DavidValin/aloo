@@ -174,7 +174,7 @@ fn esc_on_the_delete_confirmation_returns_to_the_list() {
 fn o_on_an_ineligible_contact_refuses_and_shows_a_status_notice() {
     let mut state = joined_general_with(vec![]);
     state.open_contacts();
-    state.set_contacts_rows(vec![row("alice", Some(KeyMode::Password))]);
+    state.set_contacts_rows(vec![row("alice", Some(KeyMode::PqHybrid))]);
     let action = press(&mut state, KeyCode::Char('o'));
     assert!(action.is_none());
     assert!(state.contacts.as_ref().unwrap().install.is_none());

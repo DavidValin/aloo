@@ -61,8 +61,8 @@ evidence = "docs/PROTOCOL.md 12.5; tests id_store_path_is_prefilled_from_the_def
 
 [[user_story.acceptance_criteria]]
 id = "AC-070"
-description = "my_key defaults to pq_hybrid when the connect form opens, so a new user gets this app's strongest (quantum-resistant, RSA-4096-hedged) identity by default - at the cost of needing a keybundle prepared with aloo --keygen-pq-hybrid before the form can actually validate."
-evidence = "docs/SPEC.md 'Not connected UI'; tests my_key_type_defaults_to_pq_hybrid, connect_form.feature 'my_key defaults to pq_hybrid, this app's strongest identity'"
+description = "my_key is pq_hybrid with no type to choose - the only peer-to-peer scheme this app has (quantum-resistant, RSA-4096-hedged). The my_key group is titled with the scheme it uses and holds only its two keybundle paths, both of which are always in the focus order."
+evidence = "docs/SPEC.md 'Not connected UI'; tests focus_order_includes_both_my_key_files, my_key_fields_are_never_orphaned_by_a_type_change; connect_form.feature 'my_key is pq_hybrid, the one peer-to-peer scheme this app has'"
 
 [[user_story.acceptance_criteria]]
 id = "AC-007"
@@ -106,13 +106,13 @@ evidence = "src/client/tui/ui_connect_popup.rs KeyType; tests key_type_cycles_rs
 
 [[user_story.technical_behavior]]
 id = "TB-002"
-description = "my_key's key type cycles password -> none -> pq_hybrid -> password, defaults to pq_hybrid, and labels each stop correctly ('password', 'none', 'pq_hybrid')."
-evidence = "docs/SPEC.md 'Not connected UI'; tests my_key_type_cycles_through_all_three_and_back, my_key_type_defaults_to_pq_hybrid, my_key_type_label_includes_pq_hybrid"
+description = "The connect popup has no my_key type selector at all: MyKeyFields carries only file_pub/file_priv, and the my_key group's own title names the one scheme (pq_hybrid) rather than spending a focusable row on a choice that cannot vary."
+evidence = "docs/SPEC.md 'Not connected UI'; src/client/tui/ui_connect_popup.rs MyKeyFields, render; tests focus_order_with_a_none_server_key_has_no_server_value_field, focus_order_includes_both_my_key_files"
 
 [[user_story.technical_behavior]]
 id = "TB-003"
 description = "The focus order lists exactly the value fields the two selected key types require, and a field orphaned by a type change stops being editable."
-evidence = "src/client/tui/ui_connect_popup.rs focus_order; tests focus_order_*, changing_my_key_type_away_from_pq_hybrid_reassigns_focus_if_orphaned, password_field_only_editable_when_key_type_is_password"
+evidence = "src/client/tui/ui_connect_popup.rs focus_order; tests focus_order_*, cycling_the_server_key_type_always_leaves_focus_on_a_field_that_exists, my_key_fields_are_never_orphaned_by_a_type_change, password_field_only_editable_when_key_type_is_password"
 
 [[user_story.technical_behavior]]
 id = "TB-004"
@@ -164,6 +164,10 @@ id = "AC-240"
 description = "The host, port and nickname a connection was last made with are recorded in ~/.aloo/settings (connect_host / connect_port / connect_nickname) whether or not that connection then succeeded, and prefill the connect popup next time. The nickname lives only here - the connect cache is keyed by (host, port) and holds keybundle paths, with no slot for the one field that is about the person rather than the server - so without it every fresh start would propose $USER. Recording merges into the file rather than rewriting it, and a start with no host to record (--no-server) leaves the recorded host alone."
 evidence = "docs/SPEC.md 'Not connected UI'; src/settings.rs Settings::remember_connection; src/client/connect.rs run_client_inner, prefill_connect_defaults; tests the_last_connection_is_remembered_and_read_back, a_second_connection_replaces_what_the_first_recorded, remembering_a_connection_leaves_every_other_key_alone, a_connection_with_no_host_leaves_the_recorded_host_alone, prefill_connect_defaults_restores_the_last_nickname_from_settings, settings_beat_the_cache_for_host_and_port_but_not_for_the_keybundle, an_empty_settings_file_leaves_the_proposed_nickname_alone; scenario features/connecting/connect_form.feature 'The form comes back as whoever connected last'"
 
+[[user_story.acceptance_criteria]]
+id = "AC-258"
+description = "The connect popup names the ALOO_HOME this client actually resolved, on a read-only gray line directly above the Connect button, spelled as the environment variable that sets it (ALOO_HOME=<path>). Every piece of local state lives under that directory - id_store, the connect cache, settings, and the OTP layer's own stores - so running a second client on one machine means giving it its own, and the line is where that is visible at the moment it matters rather than only in Ctrl+H and the README. Gray so it reads as a note about this client rather than as another field to fill in, and captured once when the popup opens so rendering stays a pure function of the popup's state."
+evidence = "docs/SPEC.md 'Not connected UI'; src/platform.rs aloo_dir; src/client/tui/ui_connect_popup.rs ALOO_HOME_LABEL, ConnectPopupState::aloo_home, render; test render_shows_the_resolved_aloo_home_in_gray; scenario features/connecting/connect_form.feature 'The form names the ALOO_HOME this client is actually using'"
 
 # ============================================================================
 # US-002 - Authenticate to the server
@@ -667,25 +671,20 @@ evidence = "docs/PROTOCOL.md 7.3; src/client/voice_stream.rs IdleStreamAction, i
 # ============================================================================
 [[user_story]]
 id = "US-008"
-title = "Keep message content readable only by its recipient"
-as_a = "user of an end-to-end encrypted chat"
-i_want = "every message encrypted separately for each recipient"
-so_that = "neither the server nor anyone else can read what I said"
+title = "Prove to a server that you hold its key"
+as_a = "server operator who handed out an rsa key"
+i_want = "a connecting client to prove it holds that key before it is let in"
+so_that = "only clients I have authorised can join"
 
 [[user_story.acceptance_criteria]]
 id = "AC-040"
-description = "A message encrypted for one recipient is readable by that recipient and by no one else."
-evidence = "docs/PROTOCOL.md 8, docs/SPEC.md Functionality #1; tests encrypt_decrypt_roundtrip_short_message, wrong_key_cannot_decrypt"
+description = "A payload encrypted for one key is readable by the holder of that key and by no one else - the RSA-OAEP primitive behind the server's rsa auth challenge (5.3). Peer-to-peer content makes the same promise through the sealed sends of 13."
+evidence = "docs/PROTOCOL.md 8, 5.3, docs/SPEC.md Functionality #1; auth_challenge.feature; tests encrypt_decrypt_roundtrip_short_message, wrong_key_cannot_decrypt"
 
 [[user_story.acceptance_criteria]]
 id = "AC-041"
-description = "A message of any length, including an empty one and one far larger than a single RSA block, survives the encrypt/decrypt round trip byte for byte."
+description = "A payload of any length, including an empty one and one far larger than a single RSA block, survives the encrypt/decrypt round trip byte for byte."
 evidence = "docs/PROTOCOL.md 8.1; tests encrypt_decrypt_roundtrip_empty_message, long_message_is_split_into_multiple_blocks_and_reassembled"
-
-[[user_story.acceptance_criteria]]
-id = "AC-042"
-description = "The same password always reproduces the same keypair on any machine, and different passwords produce unrelated ones."
-evidence = "docs/PROTOCOL.md 8.3; tests password_derived_keypair_is_deterministic, different_passwords_derive_different_keypairs"
 
 [[user_story.technical_behavior]]
 id = "TB-051"
@@ -694,7 +693,7 @@ evidence = "docs/PROTOCOL.md 8.1; test long_message_is_split_into_multiple_block
 
 [[user_story.technical_behavior]]
 id = "TB-052"
-description = "An empty plaintext still produces exactly one block, so blocks is never empty for a valid envelope."
+description = "An empty plaintext still produces exactly one block, so blocks is never empty for a validly-encrypted payload."
 evidence = "docs/PROTOCOL.md 8.1; test encrypt_decrypt_roundtrip_empty_message"
 
 [[user_story.technical_behavior]]
@@ -730,7 +729,7 @@ evidence = "src/crypto/mod.rs fingerprint_der doc comment; test fingerprint_der_
 [[user_story.technical_behavior]]
 id = "TB-059"
 description = "Signing is RSA-PSS over SHA-256 with a random salt, and verification rejects tampered data, a foreign key, and garbage or empty signature bytes."
-evidence = "docs/PROTOCOL.md 8.4; tests sign_verify_roundtrip, verify_rejects_tampered_data, verify_rejects_signature_from_a_different_key, verify_rejects_garbage_signature_bytes"
+evidence = "docs/PROTOCOL.md 8.2; tests sign_verify_roundtrip, verify_rejects_tampered_data, verify_rejects_signature_from_a_different_key, verify_rejects_garbage_signature_bytes"
 
 [[user_story.technical_behavior]]
 id = "TB-115"
@@ -759,8 +758,8 @@ evidence = "docs/PROTOCOL.md 7; tests encode_decode_roundtrip_*, envelope_roundt
 
 [[user_story.technical_behavior]]
 id = "TB-061"
-description = "Every KeyMode variant round-trips, including PerMessage, in both Identify and UserInfo."
-evidence = "docs/PROTOCOL.md 3; tests identify_roundtrips_with_per_message_key_mode, user_info_roundtrips_with_per_message_key_mode, user_info_roundtrips_with_every_key_mode_variant"
+description = "KeyMode round-trips through the wire encoding in both Identify and UserInfo. The enum has one variant (PqHybrid) but stays on the wire, so a peer implementation announces which scheme it speaks rather than leaving it implied."
+evidence = "docs/PROTOCOL.md 3; tests identify_roundtrips_with_its_key_mode, user_info_roundtrips_with_every_key_mode_variant"
 
 [[user_story.technical_behavior]]
 id = "TB-062"
@@ -839,8 +838,8 @@ evidence = "src/client/rekey.rs RemoteKeys::on_rotated, requeue, QueuedOutbound:
 
 [[user_story.technical_behavior]]
 id = "TB-082"
-description = "The server relays RotateKey verbatim, but only from a sender registered as PqHybrid and only to a currently-connected recipient."
-evidence = "docs/PROTOCOL.md 7.5; tests key_rotation_is_delivered_to_recipient, key_rotation_from_a_static_mode_sender_is_rejected, key_rotation_to_unknown_recipient_is_rejected, key_rotation_from_unknown_sender_is_rejected, end_to_end_key_rotation_is_relayed_and_rejected_appropriately"
+description = "The server relays RotateKey verbatim, from any registered sender to a currently-connected recipient, refusing it only when either end is unknown to it."
+evidence = "docs/PROTOCOL.md 7.5; tests key_rotation_is_delivered_to_recipient, key_rotation_to_unknown_recipient_is_rejected, key_rotation_from_unknown_sender_is_rejected, end_to_end_key_rotation_is_relayed_and_rejected_appropriately"
 
 # ============================================================================
 # US-011 - Recognise a peer across reconnects (identity pinning)
@@ -924,17 +923,17 @@ so_that = "I can tell a file-backed identity from one regenerated every session"
 
 [[user_story.acceptance_criteria]]
 id = "AC-051"
-description = "Each user is shown with the encryption tag for their my_key type, trailing their name - one shared convention across all five my_key types - in the sidebar and in a private room's title."
+description = "Each user is shown with the encryption tag for their my_key type, trailing their name, in the sidebar and in a private room's title. There is one such tag, pq_hybrid's shield, plus the OTP key that replaces it while a pad session is open."
 evidence = "docs/SPEC.md 'Encryption tag convention', docs/PROTOCOL.md 3; tests key_mode_label_matches_the_documented_tag_convention, format_with_name_puts_every_tag_after_the_name, sidebar_shows_each_users_encryption_tag_after_their_name, private_room_title_shows_the_peers_pq_hybrid_tag_after_their_name, pq_hybrid_tag_is_the_shield"
 
 [[user_story.technical_behavior]]
 id = "TB-099"
-description = "KeyMode::label returns exactly the documented tag string for each of the five variants, with no brackets or surrounding whitespace of its own."
+description = "KeyMode::label returns exactly the documented tag string, with no brackets or surrounding whitespace of its own."
 evidence = "docs/PROTOCOL.md 3; tests key_mode_label_matches_the_documented_tag_convention, pq_hybrid_tag_is_the_shield"
 
 [[user_story.technical_behavior]]
 id = "TB-100"
-description = "format_with_name places every KeyMode's tag after the name, the same convention for all five variants."
+description = "format_with_name places the KeyMode tag after the name, as an annotation on it rather than a classification label in front of it."
 evidence = "docs/PROTOCOL.md 3; tests format_with_name_puts_every_tag_after_the_name, pq_hybrid_tag_is_the_shield"
 
 [[user_story.technical_behavior]]
@@ -949,8 +948,8 @@ evidence = "docs/SPEC.md 'Connected UI'; src/client/tui/channel.rs render_sideba
 
 [[user_story.acceptance_criteria]]
 id = "AC-246"
-description = "One glyph (OTP_ICON) marks a one-time-pad session everywhere it applies, and it is deliberately not the shield pq_hybrid already carries - the pad always runs over pq_hybrid, so sharing a glyph would make the marker for the extra layer and for the layer under it the same character. As OTP_TAG (the glyph plus the name) it replaces that person's my_key tag in the channel user list, on the DM selector, on their row of the DM dropdown, and in their room's own title; on its own it prefixes every message the pad protects and sits at the front of the compose bar those messages are typed into. It replaces rather than joins the my_key tag because the pad is what actually protects everything said to that person (docs/PROTOCOL.md 16.2), and it only ever runs over pq_hybrid, so the tag it displaces is always the same one. Drawn in the same cyan the room's own OTP session header uses. The app's own narration lines and presence notices never carry it - it marks content, not the app talking about the session."
-evidence = "docs/SPEC.md 'Connected UI'; docs/PROTOCOL.md 16; src/client/tui/ui.rs OTP_ICON, OTP_TAG, OTP_TAG_COLOR, UiState::encryption_tag, SelectorEntry::otp, render_messages, render_input_bar; src/client/tui/channel.rs render_sidebar, dm_selector_title, render_selector_dropdown; tests an_otp_session_replaces_that_peers_tag_everywhere_they_are_named, the_otp_tag_is_drawn_in_the_session_headers_own_colour, otp_tag_and_icon_are_the_same_marker, a_pad_session_marks_every_surface_of_the_room_it_is_with, the_compose_bar_is_unmarked_without_a_pad_session, messages_in_a_dm_without_an_active_otp_session_get_no_pad_marker; scenario features/encryption/otp_layer.feature 'A pad session marks that person wherever they are named'"
+description = "One glyph (OTP_ICON) marks a one-time-pad session everywhere it applies, and it is deliberately not the shield pq_hybrid already carries - the pad normally runs over pq_hybrid, so sharing a glyph would make the marker for the extra layer and for the layer under it the same character. As OTP_TAG (the glyph plus the name) it replaces that person's my_key tag in the channel user list, on the DM selector, on their row of the DM dropdown, and in their room's own title; on its own it prefixes every message the pad protects and sits at the front of the compose bar those messages are typed into. It replaces rather than joins the my_key tag because the pad is what actually protects everything said to that person (docs/PROTOCOL.md 16.2), and the tag it displaces is always the same one, pq_hybrid's, since that is the only my_key there is - whether or not the pad has an envelope under it (16.2's two framings). Drawn in the same cyan the room's own OTP session header uses. The app's own narration lines and presence notices never carry it - it marks content, not the app talking about the session."
+evidence = "docs/SPEC.md 'Connected UI'; docs/PROTOCOL.md 16; src/client/tui/ui.rs OTP_ICON, OTP_TAG, OTP_TAG_COLOR, UiState::encryption_tag, SelectorEntry::otp, render_messages, render_input_bar; src/client/tui/channel.rs render_sidebar, dm_selector_title, render_selector_dropdown; tests an_otp_session_replaces_that_peers_tag_everywhere_they_are_named, the_otp_tag_is_drawn_in_the_session_headers_own_colour, otp_tag_and_icon_are_the_same_marker, a_pad_session_marks_every_surface_of_the_room_it_is_with, the_compose_bar_is_unmarked_without_a_pad_session, messages_in_a_dm_without_an_active_otp_session_get_no_pad_marker; scenario features/encryption/message_encryption.feature 'A pad session marks that person wherever they are named'"
 
 
 # ============================================================================
@@ -971,7 +970,7 @@ evidence = "docs/SPEC.md Functionality #8; tests user_offline_with_dm_history_ke
 [[user_story.acceptance_criteria]]
 id = "AC-053"
 description = "An offline peer's private room replaces the compose bar with '(user offline)' in red while nothing is typed, and refuses to send anything typed there - with one deliberate exception: /endotp remains typeable and submittable regardless of the peer's online status, since ending an OTP session (docs/PROTOCOL.md 16.6) must not require them to be reachable. The moment something is typed, it's shown in place of the red notice rather than hidden behind it."
-evidence = "docs/SPEC.md Functionality #8; docs/PROTOCOL.md 16.6; tests compose_bar_refuses_to_send_a_plain_message_to_an_offline_dm_peer, endotp_can_still_be_typed_and_submitted_while_the_open_dm_peer_is_offline, private_room_input_bar_shows_a_red_offline_notice_instead_of_the_compose_bar; offline_users.feature, endotp.feature"
+evidence = "docs/SPEC.md Functionality #8; docs/PROTOCOL.md 16.6; tests compose_bar_refuses_to_send_a_plain_message_to_an_offline_dm_peer, endotp_can_still_be_typed_and_submitted_while_the_open_dm_peer_is_offline, private_room_input_bar_shows_a_red_offline_notice_instead_of_the_compose_bar; offline_users.feature, message_encryption.feature"
 
 [[user_story.acceptance_criteria]]
 id = "AC-054"
@@ -1327,7 +1326,7 @@ evidence = "src/p2p_proto.rs P2pPayload File* variants; test file_transfer_messa
 id = "US-020"
 title = "Communicate with post-quantum hybrid encryption"
 as_a = "user who wants a quantum-resistant identity"
-i_want = "a fifth my_key method combining ML-DSA-87+RSA4096 signing, ML-KEM-1024+RSA4096 key-wrap, and AES-256-GCM bulk encryption"
+i_want = "every peer-to-peer message to combine ML-DSA-87+RSA4096 signing, ML-KEM-1024+RSA4096 key-wrap, and AES-256-GCM bulk encryption"
 so_that = "my messages stay confidential and authentic even against a future quantum-capable attacker, with RSA-4096 as a hedge if either PQ primitive turns out to be flawed"
 
 [[user_story.acceptance_criteria]]
@@ -1342,13 +1341,13 @@ evidence = "docs/PROTOCOL.md 13; tests tampered_ciphertext_is_rejected, tampered
 
 [[user_story.acceptance_criteria]]
 id = "AC-081"
-description = "A pq_hybrid peer's identity is byte-comparison-pinned in id_store exactly like rsa/password (it is a static, file-loaded identity, not a rotating one), and renders the shield tag after their name."
-evidence = "docs/PROTOCOL.md 13; src/proto.rs KeyMode::label, src/client/session.rs check_identity; test key_mode_pq_hybrid_participates_in_byte_comparison_pinning_like_rsa"
+description = "A pq_hybrid peer's identity is byte-comparison-pinned in id_store - it is a static, file-loaded identity, not a rotating one - and renders the shield tag after their name. It is the only identity there is, so pinning applies to every peer, and a peer announcing bytes that do not decode as a keybundle has no identity to pin at all."
+evidence = "docs/PROTOCOL.md 12.2, 13; src/proto.rs KeyMode::label, src/client/session.rs check_identity; test pq_hybrid_tag_is_the_shield"
 
 [[user_story.acceptance_criteria]]
 id = "AC-082"
-description = "A recipient announcing KeyMode::PqHybrid can only be addressed by a sender whose own my_key is also pq_hybrid (the hybrid scheme's signing step needs the sender's own ML-DSA-87/RSA-sign identity, which no other my_key type has) - such a recipient is silently excluded from a non-pq_hybrid sender's channel/DM/file/voice send, the same partial-delivery pattern as any other unreachable recipient. A pq_hybrid sender can still address any non-pq_hybrid recipient normally (RSA-OAEP needs no sender identity)."
-evidence = "docs/PROTOCOL.md 13; src/client/keymode_policy.rs can_address; test a_non_pq_hybrid_sender_cannot_address_a_pq_hybrid_recipient"
+description = "Sealing a send needs a readable pq_hybrid keybundle on both sides, so the OTP layer's framing is decided by the two announced keys together and both ends reach the same answer: PqWrapped when both read, Direct otherwise. Direct is what still carries a conversation with a peer whose identity this client cannot read - a serverless direct-punch peer, known only by an id_store pin - authenticated by the pad's decrypt verdict alone. A peer with no readable key and no pad is silently excluded from an ordinary send, the same partial-delivery pattern as any other unreachable recipient."
+evidence = "docs/PROTOCOL.md 13.6, 16.2; src/client/otp.rs framing_for, OtpFraming; tests two_readable_keybundles_get_the_wrapped_framing, an_unreadable_key_on_either_side_means_direct_framing, both_ends_of_a_pair_agree_on_the_framing"
 
 [[user_story.acceptance_criteria]]
 id = "AC-083"
@@ -1357,8 +1356,8 @@ evidence = "docs/PROTOCOL.md 13; tests hybrid_voice_chunk_round_trips, wrap_key_
 
 [[user_story.acceptance_criteria]]
 id = "AC-084"
-description = "`aloo --keygen-pq-hybrid <prefix>` writes a loadable <prefix> (private) and <prefix>.pub (public) keybundle, mirroring openssl's my_key/my_key.pub convention for rsa; the connect popup's pq_hybrid my_key type reuses rsa's file_pub/file_priv shape to point at them."
-evidence = "docs/PROTOCOL.md 13; README.md 'Generating PQ-hybrid keys'; tests save_and_load_bundle_files_roundtrip, my_key_type_label_includes_pq_hybrid, focus_order_includes_both_my_key_files_when_pq_hybrid, build_request_succeeds_with_pq_hybrid_files, build_request_rejects_missing_pq_hybrid_files"
+description = "`aloo --keygen-pq-hybrid <prefix>` writes a loadable <prefix> (private) and <prefix>.pub (public) keybundle; the connect popup's my_key group points at them with a file_pub/file_priv pair."
+evidence = "docs/PROTOCOL.md 13; README.md 'Generating PQ-hybrid keys'; tests save_and_load_bundle_files_roundtrip, focus_order_includes_both_my_key_files, build_request_succeeds_with_pq_hybrid_files, build_request_rejects_missing_pq_hybrid_files"
 
 [[user_story.technical_behavior]]
 id = "TB-127"
@@ -1377,12 +1376,12 @@ evidence = "docs/PROTOCOL.md 13; src/crypto/pq.rs wrap_key_for_stream, unwrap_ke
 
 [[user_story.technical_behavior]]
 id = "TB-130"
-description = "A saved PQ-hybrid private keybundle file is restricted to owner-only permissions (0o600) on unix, since it is the one my_key file this app itself ever writes to disk (every other type's key file is produced externally)."
+description = "A saved PQ-hybrid private keybundle file is restricted to owner-only permissions (0o600) on unix, since it is the one key file this app itself ever writes to disk."
 evidence = "docs/PROTOCOL.md 13; src/crypto/pq.rs save_private_bundle; test save_private_bundle_sets_owner_only_permissions_on_unix"
 
 [[user_story.technical_behavior]]
 id = "TB-131"
-description = "PqPublicBundle/HybridEnvelope are carried opaquely inside the existing public_key_der/Envelope.blocks fields (bincode-encoded) - no wire schema change to UserInfo, Identify, or Envelope itself for this KeyMode."
+description = "PqPublicBundle/HybridEnvelope are carried opaquely inside the existing public_key_der/Envelope.blocks fields (bincode-encoded) - no wire schema change to UserInfo, Identify, or Envelope itself."
 evidence = "docs/PROTOCOL.md 13; src/proto.rs Envelope, UserInfo (unchanged shape); src/crypto/pq.rs PqPublicBundle, HybridEnvelope; test encrypt_hybrid_for_one_round_trips_via_wire_encoding"
 
 # ============================================================================
@@ -1398,37 +1397,37 @@ so_that = "nothing I am shown was ever meant for somebody else, and nothing I al
 [[user_story.acceptance_criteria]]
 id = "AC-111"
 description = "A pq_hybrid send - text, file offer, voice stream or file transfer - is sealed as one setup naming its recipient, its room and its send counter, plus the content in chunks under the key that setup authorises. A one-chunk send is the whole of a text message; a stream is the same construction with more chunks."
-evidence = "docs/PROTOCOL.md; src/crypto/pq.rs seal_send, seal_setup, seal_chunk; pq_hybrid_sends.feature 'A sealed message reaches the person it was sealed for'; tests encrypt_then_decrypt_hybrid_round_trips, a_stream_of_chunks_opens_under_its_setups_key"
+evidence = "docs/PROTOCOL.md; src/crypto/pq.rs seal_send, seal_setup, seal_chunk; message_encryption.feature 'A sealed message reaches the person it was sealed for'; tests encrypt_then_decrypt_hybrid_round_trips, a_stream_of_chunks_opens_under_its_setups_key"
 
 [[user_story.acceptance_criteria]]
 id = "AC-112"
 description = "A send names the identity it was sealed for, so a legitimate recipient cannot re-wrap it and pass it off as a message addressed to somebody else - the third party's own open fails closed rather than yielding a message they were never sent."
-evidence = "docs/PROTOCOL.md; src/crypto/pq.rs SendBinding.recipient_fp, open_setup; pq_hybrid_sends.feature 'A message sealed for someone else is refused'; tests a_send_sealed_for_one_recipient_does_not_open_for_another, open_setup_rejects_a_setup_sealed_for_someone_else"
+evidence = "docs/PROTOCOL.md; src/crypto/pq.rs SendBinding.recipient_fp, open_setup; message_encryption.feature 'A message sealed for someone else is refused'; tests a_send_sealed_for_one_recipient_does_not_open_for_another, open_setup_rejects_a_setup_sealed_for_someone_else"
 
 [[user_story.acceptance_criteria]]
 id = "AC-113"
 description = "A send is bound to the room it belongs to: a private message replayed into a channel (or a channel message into a private room) is refused, because the receiving side compares the binding's channel against the payload the send actually arrived on."
-evidence = "docs/PROTOCOL.md; src/crypto/pq.rs SendBinding.channel; src/client/session.rs decrypt_own_envelope; pq_hybrid_sends.feature 'A private message replayed into a channel is refused'; test a_private_send_does_not_open_as_a_channel_send"
+evidence = "docs/PROTOCOL.md; src/crypto/pq.rs SendBinding.channel; src/client/session.rs decrypt_own_envelope; message_encryption.feature 'A private message replayed into a channel is refused'; test a_private_send_does_not_open_as_a_channel_send"
 
 [[user_story.acceptance_criteria]]
 id = "AC-114"
 description = "A send that already arrived once is refused if it arrives again: a send_id must strictly exceed everything already accepted from that peer. Gaps are expected and accepted, since the counter is per connection rather than per recipient."
-evidence = "docs/PROTOCOL.md; src/client/replay.rs ReplayGuard; pq_hybrid_sends.feature 'A message that already arrived once is refused the second time'; tests a_repeated_send_id_is_refused, a_gap_in_send_ids_is_accepted"
+evidence = "docs/PROTOCOL.md; src/client/replay.rs ReplayGuard; message_encryption.feature 'A message that already arrived once is refused the second time'; tests a_repeated_send_id_is_refused, a_gap_in_send_ids_is_accepted"
 
 [[user_story.acceptance_criteria]]
 id = "AC-115"
 description = "A voice or file stream is sealed by the identical construction a text message uses: one setup, then chunks. The setup travels once (P2pPayload::StreamKeySetup, reliably) rather than being repeated in every chunk, so a chunk carries ciphertext only and stays under SAFE_DATAGRAM_BYTES instead of fragmenting."
-evidence = "docs/PROTOCOL.md; src/p2p_proto.rs P2pPayload::StreamKeySetup; src/client/voice_stream.rs PqStreamOut, ChunkDecryptor::install_setup; pq_hybrid_sends.feature 'Streamed content is sealed exactly like a text message'; test a_stream_of_chunks_opens_under_its_setups_key"
+evidence = "docs/PROTOCOL.md; src/p2p_proto.rs P2pPayload::StreamKeySetup; src/client/voice_stream.rs PqStreamOut, ChunkDecryptor::install_setup; message_encryption.feature 'Streamed content is sealed exactly like a text message'; test a_stream_of_chunks_opens_under_its_setups_key"
 
 [[user_story.technical_behavior]]
 id = "TB-160"
 description = "There is one seal/open pair for every pq_hybrid content type - text, file offers, voice and file chunks all go through seal_setup/open_setup plus seal_chunk/open_chunk, with seal_send/open_send as the one-chunk convenience. No content type has a layout of its own."
-evidence = "docs/PROTOCOL.md; src/crypto/pq.rs (SendSetup, HybridSend); src/client/envelope.rs encrypt_hybrid_envelope_for; src/client/voice_stream.rs build_chunk_recipients; pq_hybrid_sends.feature 'Streamed content is sealed exactly like a text message'"
+evidence = "docs/PROTOCOL.md; src/crypto/pq.rs (SendSetup, HybridSend); src/client/envelope.rs encrypt_hybrid_envelope_for; src/client/voice_stream.rs build_chunk_recipients; message_encryption.feature 'Streamed content is sealed exactly like a text message'"
 
 [[user_story.technical_behavior]]
 id = "TB-161"
 description = "Every chunk's AES-256-GCM nonce is the deterministic big-endian send_id ++ seq, unique for the life of one send's freshly-random k_data - so no chunk needs fresh OS randomness, and two chunks of one send never repeat a nonce."
-evidence = "docs/PROTOCOL.md; src/crypto/pq.rs chunk_nonce; pq_hybrid_sends.feature 'Two chunks of one send never repeat a nonce'; tests same_plaintext_produces_different_ciphertext_under_different_seq, decrypting_a_chunk_with_the_wrong_seq_fails"
+evidence = "docs/PROTOCOL.md; src/crypto/pq.rs chunk_nonce; message_encryption.feature 'Two chunks of one send never repeat a nonce'; tests same_plaintext_produces_different_ciphertext_under_different_seq, decrypting_a_chunk_with_the_wrong_seq_fails"
 
 [[user_story.technical_behavior]]
 id = "TB-162"
@@ -1453,27 +1452,27 @@ so_that = "someone who later steals my keybundle still cannot read what I alread
 [[user_story.acceptance_criteria]]
 id = "AC-116"
 description = "A pq_hybrid identity splits into a durable signing half (ML-DSA-87 + RSA-4096, in the keybundle file, pinned by contacts, never rotated) and an encryption half (ML-KEM-1024 + X25519) that is regenerated per peer relationship as messages are exchanged. Messages seal to the peer's current rotated key; a peer who has not rotated yet is still reachable on the bootstrap key from their bundle. Each relationship rotates independently."
-evidence = "docs/PROTOCOL.md 13.10; src/crypto/pq.rs PqEncapKeys, generate_encryption_keys; src/client/pq_rekey.rs PqOwnKeys, PqPeerKeys; pq_hybrid_forward_secrecy.feature 'A message still reaches its recipient after keys have rotated'; tests a_message_opens_under_the_key_the_peer_rotated_to, the_bootstrap_key_still_opens_a_message_from_a_peer_who_never_rotated, rotation_is_independent_per_peer"
+evidence = "docs/PROTOCOL.md 13.10; src/crypto/pq.rs PqEncapKeys, generate_encryption_keys; src/client/pq_rekey.rs PqOwnKeys, PqPeerKeys; message_encryption.feature 'A message still reaches its recipient after keys have rotated'; tests a_message_opens_under_the_key_the_peer_rotated_to, the_bootstrap_key_still_opens_a_message_from_a_peer_who_never_rotated, rotation_is_independent_per_peer"
 
 [[user_story.acceptance_criteria]]
 id = "AC-117"
 description = "A superseded encryption key is destroyed once it falls out of the retention window, so neither the keys still held nor the keybundle file on disk can open a message that was sealed to it. The exception, documented rather than hidden, is a first message exchanged before either side has rotated: that one is sealed to the bootstrap key the file does hold."
-evidence = "docs/PROTOCOL.md 13.10; src/client/pq_rekey.rs PqOwnKeys::rotate_for, candidates_for, PQ_KEY_RETENTION; pq_hybrid_forward_secrecy.feature 'A stolen keybundle does not open yesterday''s message'; tests a_key_pushed_out_of_the_retention_window_cannot_open_its_message, forgetting_a_peer_drops_their_keys"
+evidence = "docs/PROTOCOL.md 13.10; src/client/pq_rekey.rs PqOwnKeys::rotate_for, candidates_for, PQ_KEY_RETENTION; message_encryption.feature 'A stolen keybundle does not open yesterday''s message'; tests a_key_pushed_out_of_the_retention_window_cannot_open_its_message, forgetting_a_peer_drops_their_keys"
 
 [[user_story.acceptance_criteria]]
 id = "AC-118"
 description = "Every rotation is signed by the sender's durable identity (both ML-DSA-87 and RSA-PSS) rather than by the key it replaces, so each one is independently verifiable against the bundle a contact already pinned - no chain to break, and no resume mechanism needed across a reconnect. A rotation signed by anyone else, or one whose generation is not newer than the last accepted, is dropped and leaves the trusted key untouched."
-evidence = "docs/PROTOCOL.md 13.10; src/crypto/pq.rs sign_rotation, verify_rotation; src/client/pq_rekey.rs PqPeerKeys::install; src/client/session.rs handle_pq_key_rotated; pq_hybrid_forward_secrecy.feature 'A rotation is only trusted if the identity itself signed it'; tests a_rotation_is_trusted_only_if_the_identity_signed_it, an_older_rotation_generation_is_not_installed"
+evidence = "docs/PROTOCOL.md 13.10; src/crypto/pq.rs sign_rotation, verify_rotation; src/client/pq_rekey.rs PqPeerKeys::install; src/client/session.rs handle_pq_key_rotated; message_encryption.feature 'A rotation is only trusted if the identity itself signed it'; tests a_rotation_is_trusted_only_if_the_identity_signed_it, an_older_rotation_generation_is_not_installed"
 
 [[user_story.acceptance_criteria]]
 id = "AC-119"
 description = "A rotation commits to who it is for - both the recipient's live UserId and their durable identity fingerprint - so one peer cannot replay a rotation addressed to another as though it were meant for them."
-evidence = "docs/PROTOCOL.md 13.10; src/crypto/pq.rs rotation_commitment; pq_hybrid_forward_secrecy.feature 'A rotation names who it is for'; test a_rotation_meant_for_one_peer_is_refused_by_another"
+evidence = "docs/PROTOCOL.md 13.10; src/crypto/pq.rs rotation_commitment; message_encryption.feature 'A rotation names who it is for'; test a_rotation_meant_for_one_peer_is_refused_by_another"
 
 [[user_story.technical_behavior]]
 id = "TB-164"
 description = "Up to PQ_KEY_RETENTION superseded decryption keys are kept per peer so a burst of messages sent under one key, or a message already in flight when we rotate, still opens; anything older is discarded, and that bound is what the forward-secrecy guarantee rests on."
-evidence = "docs/PROTOCOL.md 13.10; src/client/pq_rekey.rs PQ_KEY_RETENTION, candidates_for; pq_hybrid_forward_secrecy.feature 'A few recent keys are kept so a burst of messages still opens'; test recent_keys_are_retained_so_a_burst_still_opens"
+evidence = "docs/PROTOCOL.md 13.10; src/client/pq_rekey.rs PQ_KEY_RETENTION, candidates_for; message_encryption.feature 'A few recent keys are kept so a burst of messages still opens'; test recent_keys_are_retained_so_a_burst_still_opens"
 
 [[user_story.technical_behavior]]
 id = "TB-165"
@@ -1487,8 +1486,8 @@ evidence = "docs/PROTOCOL.md 13.10; src/client/session.rs request_rotation, requ
 
 [[user_story.technical_behavior]]
 id = "TB-167"
-description = "The server relays RotateKey for the pq_hybrid mode and refuses it from the static ones, which have nothing to rotate; it still verifies nothing about the payload or signature, exactly as before."
-evidence = "docs/PROTOCOL.md 7.5/13.10; src/server/mod.rs route_key_rotation; test rotate_key_is_rejected_from_a_non_rotating_sender"
+description = "The server relays RotateKey without inspecting it: it verifies nothing about the payload or the signature, and has no notion of which senders rotate - every client runs the one mode that does (13.10)."
+evidence = "docs/PROTOCOL.md 7.5/13.10; src/server/mod.rs route_key_rotation; test the_server_relays_a_rotation_without_inspecting_it"
 
 # ============================================================================
 # US-029 - Proving an identity is still the same one
@@ -1691,14 +1690,24 @@ description = "Provisioning a pad has two slow phases, and the user watches both
 evidence = "src/client/tui/ui.rs OtpPadPhase, OtpKeygenProgress.phase, begin_otp_pad_transfer, set_otp_pad_transfer_progress, close_otp_keygen_for, set_otp_keygen_progress's phase guard, render_otp_keygen_popup; src/client/otp_pad.rs PadEvent::SendProgress, PAD_PROGRESS_BYTES, PAD_CHUNK_BYTES, IncomingPad.received_bytes; src/client/otp.rs start_pad_send, on_pad_start, on_pad_chunk, on_pad_event, on_pad_verify, transfer_estimate; src/client/p2p_reliable.rs SEND_WINDOW, REORDER_BUFFER_LIMIT; tests the_popup_moves_from_generating_to_transferring_rather_than_closing, the_receiving_side_sees_its_own_transfer_progress, a_transfer_popup_only_answers_to_the_peer_it_is_reporting_on, a_late_generation_report_cannot_rewind_the_transfer_bar, a_pad_chunk_fits_one_unfragmented_datagram, reorder_buffer_bound_fails_the_link_rather_than_growing_unbounded"
 
 [[user_story.acceptance_criteria]]
+id = "AC-259"
+description = "A pair who reach each other peer-to-peer and hold a one-time pad for each other can talk with no pq_hybrid identity of each other at all - the case with no server, a server that never introduced them, or one that has gone away. Neither side is gated on a keybundle: the pin is taken as it is, and whether it decodes only decides the framing (AC-082). Registration is what a keybundle would otherwise have bought, and the pad stands in for it on both sides. A link coming up to a peer whose pin does not decode registers them if a provisioned pad exists for the pair, and marks OTP active immediately - there is nothing left to negotiate, so /otp opens no round trip and the very first message rides the pad. An inbound pad-wrapped payload from a peer nobody introduced resolves the sender from the link's own nickname and this client's pin for it - never from anything the sender claims - and registers them only once otp --decrypt has actually opened something, which is what proves the claim. Registering is all either path does: it spends no pad, and the acknowledgement gate bounds an impostor taking the nickname to a single message (AC-250)."
+evidence = "docs/PROTOCOL.md 7.1.5, 16.2; src/client/session.rs direct_peer_identity, register_pad_only_peer; src/client/otp.rs otp_sender_of, adopt_pad_verified_sender, handle_otp_command's Direct arm; tests a_serverless_pad_only_pair_registers_and_talks_without_any_pq_hybrid_identity, an_unreadable_key_on_either_side_means_direct_framing; scenario features/encryption/message_encryption.feature 'Two peers with a pad and no keybundles talk anyway'"
+
+[[user_story.acceptance_criteria]]
+id = "AC-260"
+description = "Every OTP payload is layered the same way: the pad goes on the payload, and the pq_hybrid seal - where the pair has one - goes around the pad. seal(pad(payload)) under pqhybrid_otp, pad(payload) under direct_otp, for text, a file offer, a voice offer, and the /endotp notice and its ack alike; a file's and a voice message's content already worked this way, padded whole and sealed per chunk. Inverting the old pad-outside order matters twice over: a sealed envelope is ~6.4KB of ML-DSA/ML-KEM/RSA regardless of the message, so a short chat line used to spend about thirty-five times its own length of an irreplaceable pad, and a forgery now fails on the signature before a single pad byte is touched instead of after. What it costs is that the seal's binding becomes the outermost layer and would otherwise be readable, so nothing identifying is left in it: the room travels under the pad (an OtpInner header, checked after unwrapping, which is also the only place a Direct pair can carry it), and the recipient's fingerprint is signed but transmitted zeroed, with the recipient substituting their own back before verifying - the signatures, not the plaintext comparison, are what refuse a send bound to somebody else. send_id stays readable because it nonces the chunk. The /endotp notice and its ack take a sequence number without arming the stop-and-wait gate, since each is confirmed by the other rather than by an OtpDeliveryAck, and a repeated notice is answered from the recovered ciphertext of the ack already sent rather than by spending more pad. The two provisioning payloads - OtpSessionRequest and OtpKeySetupAck - are deliberately not padded: they are what decides whether a usable pad exists at all, and the side receiving a setup ack has not yet committed the key it would need to open one."
+evidence = "docs/PROTOCOL.md 16.2, 16.6; src/crypto/pq.rs seal_send_blinded, open_send_blinded; src/client/envelope.rs encrypt_blinded_envelope_for; src/client/session.rs decrypt_own_blinded_envelope; src/client/otp.rs OtpInner, build_otp_envelope, open_otp_envelope, frame_padded, queue_end_session_payload, apply_end_session, apply_end_session_ack, resend_last_end_session_ack, on_message's content dispatch; src/client/otp_store.rs reserve_out_seq; tests text_both_pq_hybrid_wraps_an_envelope_and_still_proves_its_ack, text_no_pq_hybrid_anywhere_uses_direct_and_still_proves_its_ack, end_session_both_pq_hybrid_travels_under_the_pad, end_session_no_pq_hybrid_anywhere_still_reaches_the_peer; scenarios features/encryption/message_encryption.feature 'The pad goes on the message and the seal goes around the pad', 'The outermost layer names neither its recipient nor its room', 'Ending a session travels under the pad it is ending'"
+
+[[user_story.acceptance_criteria]]
 id = "AC-252"
-description = "Pure-OTP mode is reachable by every kind of send, not merely startable. Once /otp has provisioned a pair with no pq_hybrid between them, an ordinary text, file or voice send must find that contact and use it: the contact is named the same way on every path (from pq fingerprints when both sides have one, from the two pinned public keys otherwise), a pq_hybrid session's pinned key is its encoded bundle rather than a nonexistent RSA keypair, a stream-shaped send frames its offer by the pair's actual OtpFraming rather than assuming an envelope can be built, and the pq-only addressability rule (which exists because the hybrid scheme's signing step needs our own pq identity) is applied only to the framing that actually seals something to their key. Anything less fails in the worst possible way: a session both ends display as active, with the shield prefix and the live key header, while messages either leave without the pad or are silently dropped. Mail is the deliberate exception - it is acknowledged by a server that holds no pad, so its sender binding is an ML-DSA signature and a pure-OTP pair is refused outright rather than falling back to something weaker."
-evidence = "src/client/otp.rs contact_name_if_active, contact_name_for_peer, own_pinned_public_der, offer_envelope, send_now's can_address placement, send_file_offer, send_voice_offer, on_voice_offer, direct_voice_offer; src/client/session.rs own_pinned_der in both session constructors; src/client/otp_mail.rs check_recipient; tests text_the_mixed_pairing_is_symmetric, text_one_pq_hybrid_side_falls_to_direct_and_still_proves_its_ack, text_no_pq_hybrid_anywhere_uses_direct_and_still_proves_its_ack, file_one_pq_hybrid_side_proves_both_of_its_spends, file_no_pq_hybrid_anywhere_proves_both_of_its_spends, voice_one_pq_hybrid_side_proves_its_spend, voice_no_pq_hybrid_anywhere_proves_its_spend, mail_refuses_a_pure_otp_pair_rather_than_falling_back"
+description = "Pure-OTP mode is reachable by every kind of send, not merely startable. Once /otp has provisioned a pair whose framing is Direct - one side announced no readable keybundle - a text, file or voice send must find that contact and use it: the contact is named the same way on both sides (from pq fingerprints under PqWrapped, from the two pinned public keys under Direct), a session's own pinned key is its encoded bundle, a stream-shaped send frames its offer by the pair's actual OtpFraming rather than assuming an envelope can be built, and its content chunks carry the pad ciphertext verbatim rather than being sealed to a keybundle the pair does not have - the content was already encrypted whole before the first chunk left, so the pad is the protection and the otp command's own decrypt verdict is the authentication. Anything less fails in the worst possible way: a session both ends display as active, with the shield prefix and the live key header, while messages either leave without the pad or are silently dropped. Mail is the one deliberate exception - it is acknowledged by a server that holds no pad, so its sender binding is an ML-DSA signature and a pure-OTP pair is refused outright rather than falling back to something weaker."
+evidence = "src/client/otp.rs OtpFraming, framing_for, contact_name_for_peer, offer_envelope, send_now, otp_stream_key, otp_incoming_stream_key, send_file_offer, send_voice_offer, on_voice_offer, direct_voice_offer; src/client/voice_stream.rs DirectStreamKey::Pad, IncomingStreamKey::Pad, encrypt_direct_chunk; src/client/session.rs otp_own_pinned_der in both session constructors, the OTP arm of handle_accept_file_offer; src/client/otp_mail.rs check_recipient; tests text_the_mixed_pairing_is_symmetric, text_one_pq_hybrid_side_falls_to_direct_and_still_proves_its_ack, text_no_pq_hybrid_anywhere_uses_direct_and_still_proves_its_ack, file_one_pq_hybrid_side_proves_both_of_its_spends, file_no_pq_hybrid_anywhere_proves_both_of_its_spends, voice_one_pq_hybrid_side_proves_its_spend, voice_no_pq_hybrid_anywhere_proves_its_spend, mail_refuses_a_pure_otp_pair_rather_than_falling_back"
 
 [[user_story.acceptance_criteria]]
 id = "AC-250"
 description = "Every acknowledgement that reopens the OTP send gate must prove the peer actually decrypted the message it names, not merely that it saw the packet. Each pad spend buries a fresh 16-byte nonce in front of its plaintext and the peer's OtpDeliveryAck carries sha256 of that nonce; an ack whose proof does not match what was recorded for the outstanding sequence leaves the gate closed and the message outstanding, exactly as if no ack had arrived. The nonce itself is never echoed - returning it in the clear would expose 16 bytes of known plaintext against known ciphertext, i.e. 16 bytes of recovered key - and the proof costs the receiver no pad at all, since an acknowledgement that spent pad would itself be a message needing one. The two spends that carry the user's bytes verbatim (a file's content phase and a voice message) have nowhere to bury a nonce and use the plaintext's own sha256 instead, which proves the same thing. The expectation is persisted alongside the gate it guards, so an ack arriving after a restart is still checkable; a record carrying no expectation (an OTP mail, acknowledged by the server rather than the peer, or a store written before this check existed) still clears normally rather than wedging the contact forever. The practical bound this creates: a peer holding a stolen identity key but not the pad extracts exactly one message before the gate closes for good, and even that one stays recoverable for the genuine contact (AC-147)."
-evidence = "src/crypto/otp.rs ACK_NONCE_BYTES, AckProof, ack_proof_for, ack_proof_for_file; src/client/otp.rs wrap_outgoing, unwrap_incoming, UnwrapOutcome, send_now, send_file_offer, send_voice_offer, start_outgoing_file_content, on_message, on_file_offer, finish_incoming_file, on_delivery_ack; src/client/otp_store.rs OtpContactState.pending_ack_proof, record_sent, record_acked; src/p2p_proto.rs OtpDeliveryAck; docs/PROTOCOL.md 16.2; docs/SPEC.md 'Proving an acknowledgement, without spending pad to do it'; tests record_acked_refuses_an_ack_that_cannot_name_the_message, record_acked_still_clears_a_message_that_recorded_no_expectation, a_pending_ack_proof_survives_save_and_load, a_peer_without_the_pad_cannot_unblock_a_second_message, proving_one_contact_does_not_unblock_a_different_one, a_whole_file_spend_proves_itself_with_the_plaintexts_digest, direct_framing_carries_the_nonce_and_yields_the_senders_proof, two_messages_under_one_pad_have_different_proofs, a_refused_message_produces_no_proof_to_acknowledge_it_with, a_recovered_resend_still_proves_itself_with_the_original_nonce, an_acknowledgement_that_proves_itself_opens_the_gate_and_the_arrow, an_acknowledgement_that_cannot_prove_itself_changes_nothing, an_acknowledgement_for_a_different_sequence_does_not_open_this_gate, a_queued_message_is_released_only_by_an_ack_that_proves_itself, each_direction_keeps_its_own_gate, text_both_pq_hybrid_wraps_an_envelope_and_still_proves_its_ack, text_one_pq_hybrid_side_falls_to_direct_and_still_proves_its_ack, text_no_pq_hybrid_anywhere_uses_direct_and_still_proves_its_ack, text_the_mixed_pairing_is_symmetric, file_both_pq_hybrid_proves_both_of_its_spends, file_one_pq_hybrid_side_proves_both_of_its_spends, file_no_pq_hybrid_anywhere_proves_both_of_its_spends, voice_both_pq_hybrid_proves_its_spend, voice_one_pq_hybrid_side_proves_its_spend, voice_no_pq_hybrid_anywhere_proves_its_spend; otp_layer.feature"
+evidence = "src/crypto/otp.rs ACK_NONCE_BYTES, AckProof, ack_proof_for, ack_proof_for_file; src/client/otp.rs wrap_outgoing, unwrap_incoming, UnwrapOutcome, send_now, send_file_offer, send_voice_offer, start_outgoing_file_content, on_message, on_file_offer, finish_incoming_file, on_delivery_ack; src/client/otp_store.rs OtpContactState.pending_ack_proof, record_sent, record_acked; src/p2p_proto.rs OtpDeliveryAck; docs/PROTOCOL.md 16.2; docs/SPEC.md 'Proving an acknowledgement, without spending pad to do it'; tests record_acked_refuses_an_ack_that_cannot_name_the_message, record_acked_still_clears_a_message_that_recorded_no_expectation, a_pending_ack_proof_survives_save_and_load, a_peer_without_the_pad_cannot_unblock_a_second_message, proving_one_contact_does_not_unblock_a_different_one, a_whole_file_spend_proves_itself_with_the_plaintexts_digest, direct_framing_carries_the_nonce_and_yields_the_senders_proof, two_messages_under_one_pad_have_different_proofs, a_refused_message_produces_no_proof_to_acknowledge_it_with, a_recovered_resend_still_proves_itself_with_the_original_nonce, an_acknowledgement_that_proves_itself_opens_the_gate_and_the_arrow, an_acknowledgement_that_cannot_prove_itself_changes_nothing, an_acknowledgement_for_a_different_sequence_does_not_open_this_gate, a_queued_message_is_released_only_by_an_ack_that_proves_itself, each_direction_keeps_its_own_gate, text_both_pq_hybrid_wraps_an_envelope_and_still_proves_its_ack, text_one_pq_hybrid_side_falls_to_direct_and_still_proves_its_ack, text_no_pq_hybrid_anywhere_uses_direct_and_still_proves_its_ack, text_the_mixed_pairing_is_symmetric, file_both_pq_hybrid_proves_both_of_its_spends, voice_both_pq_hybrid_proves_its_spend, file_one_pq_hybrid_side_proves_both_of_its_spends, file_no_pq_hybrid_anywhere_proves_both_of_its_spends, voice_one_pq_hybrid_side_proves_its_spend, voice_no_pq_hybrid_anywhere_proves_its_spend; message_encryption.feature"
 
 [[user_story.acceptance_criteria]]
 id = "AC-251"
@@ -1728,7 +1737,7 @@ evidence = "src/client/tui/ui.rs MessageBody::System, otp_active_peers, mark_otp
 [[user_story.acceptance_criteria]]
 id = "AC-142"
 description = "An invitation that is never accepted leaves the initiating side exactly as it found it, and one that is owed to a peer is retried rather than regenerated. Nothing is written to the keychain until the peer actually accepts: the generated pad waits, both halves staged on disk, so a peer who refuses, never answers, or goes offline mid-transfer leaves no stale entry - and since the contact name is derived from both fingerprints (every attempt produces the identical name) and add_contact refuses to overwrite, that is what makes a later /otp from either side succeed instead of deadlocking. A pad still owed is re-offered from the staged bytes whenever a direct link to that peer becomes reachable again, byte-identical to the original, because two different pads under one contact name have no integrity check to tell them apart and would decode to silent garbage; the debt is keyed by contact name, so it survives the fresh UserId a reconnect brings and an app restart. A re-delivery that arrives when the contact is already provisioned is re-acknowledged rather than raising a second popup, which is what closes the lost-acknowledgement case. When both users invite each other before either answers, the two pads compete for the one fingerprint-derived contact name and the tie is broken as simultaneous link opens are - the smaller fingerprint's pad wins, computed identically on both sides with no round trip - so the pair can never end up holding halves of two different pads; the conceding side drops its own staged pad, and accepting any peer's pad retires whatever this side had staged for that contact. Content dropped when a link is forgotten is reported, so a peer vanishing mid-invitation is visible rather than an indefinite silent wait. Where a stale entry can still arise - a contact adopted from outside the app, or one whose counterpart later lost their half - the peer's 'no matching key found on my end' answer still clears it, and that answer is now given on reject as well as accept, since which button was pressed says nothing about whether the key exists."
-evidence = "src/client/otp.rs own_pad_wins_glare, GLARE_REASON, pending_setup_dir, initiate_provisioning, commit_pending_setup, discard_pending_setup, read_pending_setup, resend_pending_setups, on_key_setup (re-delivery re-ack), reject_invite, on_key_setup_ack, NO_MATCHING_KEY_REASON; src/client/otp_store.rs pending_setup_size_mb, mark_setup_pending, clear_pending_setup, pending_setups; src/client/p2p.rs PeerLinkManager::forget; src/client/session.rs UserOffline (partial-reassembly cleanup), LinkStatusChanged; tests simultaneous_invitations_are_resolved_the_same_way_by_both_sides, a_glare_leaves_both_sides_holding_halves_of_one_pad, accepting_a_peers_pad_retires_this_sides_own_staged_one, an_invitation_that_is_never_accepted_leaves_no_stale_contact, a_pending_setup_is_re_readable_for_retries_and_identical_each_time, asymmetric_provisioning_recovers_once_the_stale_contact_is_removed, initiate_provisioning_and_apply_incoming_setup_leave_both_sides_usable, a_pending_setup_survives_save_and_load, clearing_a_pending_setup_reports_whether_anything_was_owed, pending_setups_yields_only_contacts_still_owed_a_pad, a_line_written_before_pending_setup_existed_still_loads, forgetting_a_link_reports_content_that_was_still_waiting_on_it, forgetting_an_empty_link_reports_nothing, ordinary_messages_still_arrive_while_a_pad_is_being_transferred, remove_contact_deletes_an_existing_contact, remove_contact_on_an_unknown_contact_fails, a_removed_contacts_name_can_be_reprovisioned_from_scratch, forget_removes_a_provisioned_entry, forget_returns_false_when_there_was_nothing_to_forget; otp_layer.feature"
+evidence = "src/client/otp.rs own_pad_wins_glare, GLARE_REASON, pending_setup_dir, initiate_provisioning, commit_pending_setup, discard_pending_setup, read_pending_setup, resend_pending_setups, on_key_setup (re-delivery re-ack), reject_invite, on_key_setup_ack, NO_MATCHING_KEY_REASON; src/client/otp_store.rs pending_setup_size_mb, mark_setup_pending, clear_pending_setup, pending_setups; src/client/p2p.rs PeerLinkManager::forget; src/client/session.rs UserOffline (partial-reassembly cleanup), LinkStatusChanged; tests simultaneous_invitations_are_resolved_the_same_way_by_both_sides, a_glare_leaves_both_sides_holding_halves_of_one_pad, accepting_a_peers_pad_retires_this_sides_own_staged_one, an_invitation_that_is_never_accepted_leaves_no_stale_contact, a_pending_setup_is_re_readable_for_retries_and_identical_each_time, asymmetric_provisioning_recovers_once_the_stale_contact_is_removed, initiate_provisioning_and_apply_incoming_setup_leave_both_sides_usable, a_pending_setup_survives_save_and_load, clearing_a_pending_setup_reports_whether_anything_was_owed, pending_setups_yields_only_contacts_still_owed_a_pad, a_line_written_before_pending_setup_existed_still_loads, forgetting_a_link_reports_content_that_was_still_waiting_on_it, forgetting_an_empty_link_reports_nothing, ordinary_messages_still_arrive_while_a_pad_is_being_transferred, remove_contact_deletes_an_existing_contact, remove_contact_on_an_unknown_contact_fails, a_removed_contacts_name_can_be_reprovisioned_from_scratch, forget_removes_a_provisioned_entry, forget_returns_false_when_there_was_nothing_to_forget; message_encryption.feature"
 
 [[user_story.acceptance_criteria]]
 id = "AC-143"
@@ -1747,7 +1756,7 @@ evidence = "src/client/otp_cli.rs encrypt_file, decrypt_file, encrypt_file_retry
 
 [[user_story.acceptance_criteria]]
 id = "AC-146"
-description = "While OTP is active for a DM peer, sending that peer a file protects both the offer naming it and the file's actual bytes under the pad - two independent pad spends, not one: the offer (filename + size) is wrapped through the pad exactly like a text message the moment it is sent (a deliberate choice, AC-148, to keep the filename off the wire even at the cost of pad on offers that are later rejected), and the file's content is a second, later pad spend, reserved only once the offer is accepted, encrypting the whole file into a temp file that the existing chunked transport streams unchanged; the receiving side decrypts the reassembled temp file whole once it fully arrives, then acknowledges that second slot. A voice message under OTP is never live-streamed - it is recorded fully first, encrypted whole the moment recording stops (no consent step to defer to, since voice auto-accepts either way, so there is only ever one slot for it), and sent the same way a file's content is; once decrypted on arrival it becomes an ordinary, already-finished voice message, playable on Enter exactly like any other. Both directions clean up their temporary plaintext/ciphertext staging files regardless of outcome, and this layer stays DM-only for both, matching text."
+description = "While OTP is active for a DM peer, sending that peer a file protects both the offer naming it and the file's actual bytes under the pad - two independent pad spends, not one: the offer (filename + size) is wrapped through the pad exactly like a text message the moment it is sent (a deliberate choice, AC-148, to keep the filename off the wire even at the cost of pad on offers that are later rejected), and the file's content is a second, later pad spend, reserved only once the offer is accepted, encrypting the whole file into a temp file that the existing chunked transport streams unchanged; the receiving side decrypts the reassembled temp file whole once it fully arrives, then acknowledges that second slot. A voice message under OTP is never live-streamed - it is recorded fully first and sent as the very same two spends a file uses: its offer (the duration) is wrapped through the pad the moment it is sent, and the recording is a second, later spend encrypted whole once that offer is acknowledged. The offer is padded rather than left to the envelope for the same reason a file's filename is - under Direct framing there is no envelope to hide the duration in, so nothing but the pad would protect it. The only difference from a file is that no popup asks: voice auto-accepts, so the receiving side stages and accepts in one step. Once decrypted on arrival it becomes an ordinary, already-finished voice message, playable on Enter exactly like any other. Both directions clean up their temporary plaintext/ciphertext staging files regardless of outcome, and this layer stays DM-only for both, matching text."
 evidence = "src/client/otp.rs send_file_offer, on_file_offer, start_outgoing_file_content, finish_incoming_file, send_voice_offer, on_voice_offer, temp_content_path, secure_remove_file; src/client/session.rs accept_file_offer, handle_file_event, handle_p2p_event's FileAccepted/FileRejected/OtpFileContentSeq/OtpVoiceOffer arms, decrypt_voice_offer; src/client/voice_stream.rs OwnStreamTarget::DirectOtp, spawn_record_accumulate_worker; src/client/direct_message.rs handle_send_file, handle_voice_record_start; src/proto.rs Content::VoiceOffer; src/p2p_proto.rs P2pPayload::OtpFileOffer/OtpFileContentSeq/OtpVoiceOffer; src/client/file_transfer.rs OwnFileTarget.otp, OtpIncomingFileReceive, OtpIncomingKind, VoiceOfferPayload; docs/PROTOCOL.md 16.2; verified manually with two clients (docs/TESTING.md 'Known coverage gaps' - session.rs needs a live socket, same as the other wiring-only gaps documented there)"
 
 [[user_story.acceptance_criteria]]
@@ -1763,12 +1772,12 @@ evidence = "src/client/otp_cli.rs recover_last, recover_last_file, RecoverDirect
 [[user_story.acceptance_criteria]]
 id = "AC-192"
 description = "Either participant may unilaterally end an active OTP session with /endotp - no accept/reject round trip the way starting one needs. The instant it runs, this side's own local pad is destroyed (the keychain contact removed) and every per-contact sequence/gate/setup record is reset, so this side can never spend that pad again; a status notice and a DM-room system line both show 'OTP session ended' immediately, the same way starting one is announced (AC-141). /endotp is refused, locally and silently, if there is no active session with that peer, or if a mail send to that exact contact is still awaiting the pad's stop-and-wait gate - destroying the keychain contact out from under it would strand that mail's server acknowledgement forever, since its only recovery path needs the very entry this would delete (AC-159's mail-retry mechanism). Ending one contact's session never touches any other contact's independent session or pad."
-evidence = "src/client/otp.rs handle_end_otp_command, decide_end_otp, EndOtpDecision, on_end_session, send_end_session_payload, queue_end_session_payload; src/client/otp_store.rs OtpStore::end_session, reset_after_peer_ended; src/client/tui/ui.rs UiAction::EndOtpSession, submit_input (/endotp), clear_otp_active; src/client/session.rs handle_ui_action's EndOtpSession arm; src/proto.rs Content::OtpEndSession/OtpEndSessionAck; src/crypto/otp.rs OtpEndSessionPayload; docs/PROTOCOL.md 16.6; tests decide_end_otp_refuses_when_nothing_is_provisioned, decide_end_otp_refuses_while_a_mail_is_in_flight, decide_end_otp_allows_ending_with_a_plain_pending_send, decide_end_otp_allows_ending_a_quiescent_session, end_session_payload_round_trips_through_the_wire_encoding, clear_otp_active_reverses_mark_otp_active_and_drops_the_key_status_snapshot, endotp_in_an_open_dm_room_produces_end_otp_session_for_that_peer, endotp_outside_any_open_dm_room_is_a_no_op; endotp.feature; verified manually with two clients for the full send/receive/ack wiring (docs/TESTING.md 'Known coverage gaps' - session.rs needs a live socket, same as AC-147's own wiring gap)"
+evidence = "src/client/otp.rs handle_end_otp_command, decide_end_otp, EndOtpDecision, on_end_session, send_end_session_payload, queue_end_session_payload; src/client/otp_store.rs OtpStore::end_session, reset_after_peer_ended; src/client/tui/ui.rs UiAction::EndOtpSession, submit_input (/endotp), clear_otp_active; src/client/session.rs handle_ui_action's EndOtpSession arm; src/proto.rs Content::OtpEndSession/OtpEndSessionAck; src/crypto/otp.rs OtpEndSessionPayload; docs/PROTOCOL.md 16.6; tests decide_end_otp_refuses_when_nothing_is_provisioned, decide_end_otp_refuses_while_a_mail_is_in_flight, decide_end_otp_allows_ending_with_a_plain_pending_send, decide_end_otp_allows_ending_a_quiescent_session, end_session_payload_round_trips_through_the_wire_encoding, clear_otp_active_reverses_mark_otp_active_and_drops_the_key_status_snapshot, endotp_in_an_open_dm_room_produces_end_otp_session_for_that_peer, endotp_outside_any_open_dm_room_is_a_no_op; message_encryption.feature; verified manually with two clients for the full send/receive/ack wiring (docs/TESTING.md 'Known coverage gaps' - session.rs needs a live socket, same as AC-147's own wiring gap)"
 
 [[user_story.acceptance_criteria]]
 id = "AC-193"
 description = "An active OTP session is never ended by either participant merely disconnecting and reconnecting - it stays active, with the shield prefix, the live key-metadata header, and the DM-only call restriction (AC-146) all still in force, until one side explicitly runs /endotp (AC-192). A peer's per-connection UserId changes on every reconnect, but the session's own state (whether the pad is still usable at all) is keyed by the pair's stable, fingerprint-derived contact name, so it survives independently of that; the moment a peer with an already-provisioned contact is seen again, the UI-facing 'active' flag is re-established for their new UserId."
-evidence = "src/client/otp.rs contact_name_if_active; src/client/otp_store.rs OtpContactState.provisioned (contact-name-keyed, never cleared by a disconnect); src/client/tui/ui.rs otp_active_peers, mark_otp_active, is_otp_active, clear_otp_active; src/client/session.rs handle_server_message's UserJoined arm (re-marks a reconnected, already-provisioned peer active); docs/PROTOCOL.md 16.6; tests a_disconnect_alone_does_not_end_an_active_otp_session, otp_active_peers_default_to_inactive_until_marked; endotp.feature; verified manually with two clients (docs/TESTING.md 'Known coverage gaps' - the UserJoined wiring needs a live socket, same as TB-149's own gap)"
+evidence = "src/client/otp.rs contact_name_if_active; src/client/otp_store.rs OtpContactState.provisioned (contact-name-keyed, never cleared by a disconnect); src/client/tui/ui.rs otp_active_peers, mark_otp_active, is_otp_active, clear_otp_active; src/client/session.rs handle_server_message's UserJoined arm (re-marks a reconnected, already-provisioned peer active); docs/PROTOCOL.md 16.6; tests a_disconnect_alone_does_not_end_an_active_otp_session, otp_active_peers_default_to_inactive_until_marked; message_encryption.feature; verified manually with two clients (docs/TESTING.md 'Known coverage gaps' - the UserJoined wiring needs a live socket, same as TB-149's own gap)"
 
 [[user_story.acceptance_criteria]]
 id = "AC-194"
@@ -1828,7 +1837,7 @@ evidence = "src/client/otp_cli.rs remove_contact; tests remove_contact_deletes_a
 [[user_story.acceptance_criteria]]
 id = "AC-243"
 description = "Under an active OTP session the message details popup reports the pad rather than the envelope under it: which sequence that message is, the pad offset its key bytes start at, and the key file they came out of (<contact>_enc.key for a message sent, <contact>_dec.key for one received). The figures are the pad's position before that message spent its own key, recorded on the row when it is logged - the live figures describe some later message by the time anyone opens the popup."
-evidence = "docs/PROTOCOL.md 16; src/client/tui/ui.rs MessageCrypto::Otp, UiState::message_crypto; src/client/otp_cli.rs OtpKeyStatus, contact_key_paths; src/client/otp.rs refresh_otp_key_status, on_message; tests an_otp_message_reports_the_pad_position_and_key_file_it_used, an_incoming_otp_message_reports_the_decryption_pad; scenario features/encryption/otp_layer.feature 'A message details popup names the pad position it spent'"
+evidence = "docs/PROTOCOL.md 16; src/client/tui/ui.rs MessageCrypto::Otp, UiState::message_crypto; src/client/otp_cli.rs OtpKeyStatus, contact_key_paths; src/client/otp.rs refresh_otp_key_status, on_message; tests an_otp_message_reports_the_pad_position_and_key_file_it_used, an_incoming_otp_message_reports_the_decryption_pad; scenario features/encryption/message_encryption.feature 'A message details popup names the pad position it spent'"
 
 [[user_story.acceptance_criteria]]
 id = "AC-249"
@@ -1848,7 +1857,7 @@ so_that = "I never have to run a separate command before I can connect, and reco
 
 [[user_story.acceptance_criteria]]
 id = "AC-085"
-description = "A freshly-opened connect popup with no ~/.aloo/.cache yet has pq_hybrid's file_pub/file_priv fields prefilled with a freshly-assigned, not-yet-generated location under ~/.aloo/, so pressing Connect immediately with the default my_key type doesn't fail validation."
+description = "A freshly-opened connect popup with no ~/.aloo/.cache yet has its file_pub/file_priv fields prefilled with a freshly-assigned, not-yet-generated location under ~/.aloo/, so pressing Connect immediately doesn't fail validation."
 evidence = "docs/PROTOCOL.md 13.9; tests prefill_connect_defaults_assigns_a_fresh_location_when_the_cache_is_empty, fresh_pq_hybrid_paths_in_produces_a_pub_and_priv_pair_under_the_given_directory, random_prefix_is_four_lowercase_alphanumeric_characters"
 
 [[user_story.acceptance_criteria]]
@@ -2571,8 +2580,8 @@ evidence = "docs/PROTOCOL.md 7.1.5; docs/SPEC.md 'Direct punching'; src/proto.rs
 
 [[user_story.acceptance_criteria]]
 id = "AC-215"
-description = "A peer is registered only on the first payload that authenticates them - an envelope that opens under the key already pinned for their nickname - never on a DirectPing, whose nickname is unauthenticated and could be claimed by anyone able to reach the port. Registration therefore requires both a pinned identity for that nickname (there is otherwise nothing to encrypt to them with) and a pq_hybrid one, since only pq_hybrid signs its sends and so only there can an arriving envelope prove who sent it."
-evidence = "docs/PROTOCOL.md 7.1.5, 13.4; src/client/session.rs direct_peer_identity, on_channel_presence (opens via decrypt_own_envelope before registering anything); src/client/idstore.rs IdStore::get; tests only_a_pinned_pq_hybrid_identity_can_become_an_addressable_peer, a_direct_ping_naming_a_nickname_that_is_not_configured_is_ignored, and end to end in two_serverless_sessions_punch_to_each_other_and_each_registers_the_other (whose pin, removed, is what makes it fail); becoming_a_real_peer.feature"
+description = "A peer is registered only on the first thing that authenticates them, never on a DirectPing, whose nickname is unauthenticated and could be claimed by anyone able to reach the port. Registration always requires a pinned identity for that nickname - a nickname alone names nobody - and then one of two proofs: an envelope that opens under that pin, or, for a pin that is not a keybundle, the pad opening a message sent under it (AC-259). Either way the proof is what registers them, and the pin is where their key comes from."
+evidence = "docs/PROTOCOL.md 7.1.5, 13.4; src/client/session.rs direct_peer_identity, on_channel_presence (opens via decrypt_own_envelope before registering anything); src/client/idstore.rs IdStore::get; tests a_nickname_names_someone_only_once_something_is_pinned_for_it, a_direct_ping_naming_a_nickname_that_is_not_configured_is_ignored, and end to end in two_serverless_sessions_punch_to_each_other_and_each_registers_the_other (whose pin, removed, is what makes it fail); becoming_a_real_peer.feature"
 
 [[user_story.technical_behavior]]
 id = "TB-224"

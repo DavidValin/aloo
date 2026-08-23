@@ -65,9 +65,7 @@ falling back to a server relay (§7.1).
   - [7.7 Live voice calls](#77-live-voice-calls)
 - [8. Encryption model](#8-encryption-model)
   - [8.1 RSA-OAEP chunking](#81-rsa-oaep-chunking)
-  - [8.2 Cost implication for voice](#82-cost-implication-for-voice)
-  - [8.3 Password-derived keys](#83-password-derived-keys)
-  - [8.4 RSA signatures](#84-rsa-signatures)
+  - [8.2 RSA signatures](#82-rsa-signatures)
 - [9. Versioning and compatibility](#9-versioning-and-compatibility)
 - [10. What the server never sees](#10-what-the-server-never-sees)
 - [11. Rotating a peer's key during a session](#11-rotating-a-peers-key-during-a-session)
@@ -92,7 +90,7 @@ falling back to a server relay (§7.1).
   - [13.8 Identity pinning](#138-identity-pinning)
   - [13.9 Client convenience: auto-generated keys and the connect-popup cache](#139-client-convenience-auto-generated-keys-and-the-connect-popup-cache)
   - [13.10 Rotating encryption keys (forward secrecy)](#1310-rotating-encryption-keys-forward-secrecy)
-- [14. The three encryption methods, side by side](#14-the-three-encryption-methods-side-by-side)
+- [14. The two encryption layers, side by side](#14-the-two-encryption-layers-side-by-side)
 - [15. Sequences](#15-sequences)
 - [16. One-time-pad layer over `pq_hybrid`](#16-one-time-pad-layer-over-pq_hybrid)
   - [16.1 Turning it on, only once both sides explicitly agree](#161-turning-it-on-only-once-both-sides-explicitly-agree)
@@ -439,58 +437,46 @@ UserInfo {
 }
 ```
 
-`public_key_der` is a DER-encoded RSA SubjectPublicKeyInfo for every
-`KeyMode` except `pq_hybrid`, whose identity is a keybundle rather than one
-key - it carries its encoded key bundle in this same field (§13) rather
-than growing the wire shape. Under `pq_hybrid`, the bundle carries only
-bootstrap encryption keys - the keys that supersede them as the
+`public_key_der` carries a client's bincode-encoded `pq_hybrid` key
+bundle (§13) - an identity is a bundle rather than one key, and it rides
+this field rather than growing the wire shape. The bundle carries only
+bootstrap encryption keys; the keys that supersede them as the
 relationship rotates are never reflected here, only relayed via
 `KeyRotated` (§7.5, §13.10).
 
 ```
-KeyMode = Password | None | PqHybrid
+KeyMode = PqHybrid
 ```
 
-The three values name how a client's own `my_key` was obtained, and whether
-it changes:
+`KeyMode` names how a client's own `my_key` was obtained. There is one
+value: `pq_hybrid`, a keybundle loaded from a file (§13). Peer-to-peer
+traffic is therefore always the hybrid scheme in §13, optionally wrapped
+in a one-time pad (§16). The field stays on the wire so a peer
+implementation still announces *which* scheme it speaks rather than
+leaving it implied.
 
 | value | `my_key` type | key material | changes? |
 |---|---|---|---|
-| `Password` | `password` | one keypair derived from a password (§8.3) | no |
-| `None` | `none` | one keypair generated at connect time | no |
 | `PqHybrid` | `pq_hybrid` | a keybundle loaded from a file (§13) | signing half no, encryption half every message (§13.10) |
 
-`PqHybrid` is what tells a peer to expect `KeyRotated`, for its encryption
-keys only (§13.10) - `public_key_der`/the identity itself stays good for
-the whole session regardless of `KeyMode`. §14 compares the three
-*methods* these values describe.
+The identity is "static" for protocol purposes - exactly one keybundle for
+the whole session, never rotated. Only its *encryption* keys rotate, which
+is what `KeyRotated` carries (§13.10); `public_key_der`/the identity
+itself stays good for the whole session.
 
-All three are "static" for protocol purposes - exactly one keybundle for
-the whole session, the identity itself never rotates - and behave
-identically everywhere in this document except two things: which of the
-three they are is broadcast (via `Identify` → `UserInfo`) precisely so
-every peer can render the right tag next to that user's name (sidebar,
-private-room title - SPEC.md Functionality #3); and `PqHybrid` alone
-changes what `public_key_der` actually contains and how `Envelope.blocks`
-is produced - see §13.
+`KeyMode` is broadcast (via `Identify` → `UserInfo`) so every peer can
+render the tag next to that user's name (sidebar, private-room title -
+SPEC.md Functionality #3):
 
 | `KeyMode`    | Tag           | Position (`KeyMode::format_with_name`) |
 |--------------|---------------|------------------------------------------|
-| `Password`   | `🚨 PWD`      | after the name: `name 🚨 PWD`            |
-| `None`       | `🚨 PLAIN`    | after the name: `name 🚨 PLAIN`          |
 | `PqHybrid`   | `🛡️ PQH`      | after the name: `name 🛡️ PQH`            |
 
 (`KeyMode::label()` returns just the tag, unbracketed; `format_with_name`
-composes it with a name, tag trailing, the same position for all three
-variants.) Every tag trails the name as an annotation on it, not a
-classification label sitting in front. The icon is about identity
-*durability*, not "unencrypted" - every `KeyMode` still encrypts every
-message with real per-recipient encryption (RSA, or for `PqHybrid` the
-hybrid scheme in §13); `🚨` just flags the two sourcings (`Password`,
-`None`) that don't persist an identity across separate connections the way
-`PqHybrid`'s saved keybundle file does. `🛡️` is `PqHybrid`'s own icon,
-read as the strongest tier (quantum-resistant signing *and* key exchange,
-each additionally hedged with RSA-4096).
+composes it with a name, tag trailing.) The tag trails the name as an
+annotation on it, not a classification label sitting in front. `🛡️` reads
+as the strongest tier: quantum-resistant signing *and* key exchange, each
+additionally hedged with RSA-4096.
 
 ```
 ChannelKind = Public | Private
@@ -517,9 +503,9 @@ AuthResponse =
 ```
 Envelope {
     content: Content        // Text | FileOffer
-    blocks:  list<bytes>    // what these bytes are depends on the
-                            // recipient's method: N RSA-OAEP blocks
-                            // (§8.1) or one sealed send (§13.3)
+    blocks:  list<bytes>    // exactly one element: a sealed send
+                            // (§13.3) - or, under the OTP layer's
+                            // Direct framing, the plaintext (§16.2)
 }
 ```
 `Envelope` is the unit of one complete, whole (non-streamed) encrypted
@@ -997,7 +983,7 @@ implicitly covers DMs too, since you can only open one with someone
 you've already learned about this way). Revised from an earlier
 lazy-on-first-send design once testing showed the gap it left: text and
 file sends tolerate a not-yet-`Active` link by queuing (§7.2/§7.6), but
-voice does not (§7.3) - a recipient of any `KeyMode`
+voice does not (§7.3) - a recipient
 whose link is still mid-punch at the exact moment someone starts a
 recording is excluded from it outright, so a purely lazy trigger meant
 the *first* voice message to any brand-new peer was reliably missing them
@@ -1467,11 +1453,32 @@ Sent when the link opens, and again whenever the sender's own membership
 changes. Opening it is the authentication: the envelope is verified
 against the key already pinned for that nickname and its recipient binding
 is checked (§13.4), so one that opens could only have come from whoever
-holds that key. This requires a pinned identity - a peer never met through
-a server has nothing to seal to and stays a transport-only link - and a
-signing key mode, since only `pq_hybrid` signs its sends; under the
-unsigned modes an arriving envelope proves nothing and no peer is ever
-registered from a nickname alone.
+holds that key. This requires a pinned identity - a peer with none stays a
+transport-only link - and one that reads as a keybundle, since that is
+what the envelope is sealed to.
+
+**A pad is the other thing that can register someone.** A pair who hold a
+one-time pad for each other but have never exchanged keybundles cannot
+send a `ChannelPresence` at all - there is nothing to seal one to - and
+under the rule above they would stay transport-only forever, which is
+exactly the pairing §16.2's `Direct` framing exists to serve. For them the
+pad stands in, on both sides:
+
+- **The side whose link comes up** registers the peer if a pad is
+  provisioned for the pair, and marks the session active immediately.
+  There is nothing left to negotiate - both ends already hold the key - so
+  `/otp` opens no round trip and the very first message rides the pad.
+- **The side a message arrives at** takes the sender's nickname from the
+  link and their key from its own pin for that nickname - never from
+  anything the sender claims - and registers them only once `otp
+  --decrypt` has actually opened something from them. That verdict is the
+  authentication, and a stronger one than a signature: it is tied to the
+  holder of the mirror key at the expected offset, not merely to a keypair
+  (§16.2).
+
+Registering is all either does. It spends no pad, and what an impostor
+taking the nickname can cost is bounded by the acknowledgement gate to a
+single message they cannot read (§16.2).
 
 Once registered, the peer is placed in the channels *both* sides have
 joined (a channel only one side is in gives the other nowhere to put
@@ -1764,8 +1771,8 @@ routing metadata for the receiving *client* (which log to eventually show
 the accepted transfer in).
 
 **`FileOffer`'s plaintext**: like text, `envelope.content` is
-`Content::FileOffer` and `envelope.blocks` decrypts (§8.1, identical
-RSA-OAEP chunking) to a bincode encoding of:
+`Content::FileOffer` and `envelope.blocks` opens (§13.3, the same one-chunk
+sealed send a text message uses) to a bincode encoding of:
 
 ```
 FileOfferPayload { filename: string, size: u64 }
@@ -1776,9 +1783,9 @@ cleartext fields on `P2pPayload::FileOffer`) keeps them as private as the
 rest of the message - the server never sees any of it at all anymore
 (§10), not even ciphertext size, since the offer travels the direct link
 (§7.1), not the server. Once accepted, the actual file bytes are **never**
-wrapped in a struct at all - each `FileChunk`'s `blocks` is the RSA-OAEP (or
-PQ-hybrid, §13) encryption of a raw slice of the file, exactly like voice's
-raw-PCM chunk convention (§7.3's "no content/rate/format field").
+wrapped in a struct at all - each `FileChunk`'s `blocks` is the PQ-hybrid
+(§13) encryption of a raw slice of the file, exactly like voice's raw-PCM
+chunk convention (§7.3's "no content/rate/format field").
 
 **No size bound.** Because a transfer is chunked exactly like voice rather
 than sent as one whole-file `Envelope`, the old reasoning for a size cap
@@ -1791,7 +1798,7 @@ roughly one chunk no matter how large the file is; the sender never reads
 any of the file into memory until the recipient's `FileAccept` arrives.
 512 bytes is deliberately small for a *different* reason than the old
 whole-file cap: each `FileChunk` is now one direct-link UDP datagram
-(§7.1), so it's sized to keep worst-case RSA-OAEP ciphertext under
+(§7.1), so it's sized to keep worst-case sealed-chunk ciphertext under
 `SAFE_DATAGRAM_BYTES` (§7.1.1) rather than to bound memory use
 alone - memory use would be just as bounded at a much larger chunk size.
 
@@ -2002,36 +2009,32 @@ send already gives a rotating-key recipient without a fresh key (§11.2).
 
 ## 8. Encryption model
 
-**There is no shared/session/hybrid key anywhere in this protocol for
-`Password`/`None`.** (§13 covers the one exception, `PqHybrid`, which
-*does* use a per-message shared key - deliberately, for reasons explained
-there; everything below this paragraph describes the other two modes.)
-Every plaintext payload - a text message, or one voice
-chunk - is
-encrypted **separately for every individual recipient**, using that
-recipient's own RSA public key. The server relays exactly as many
-independently-encrypted copies as there are recipients; it never sees,
-generates, or forwards a symmetric key, and could not decrypt a
-multi-recipient message even if it colluded with one recipient (each
-recipient's ciphertext is entirely independent).
+**There is no shared/session key anywhere in this protocol outside the
+sealed sends of §13.** Every plaintext payload - a text message, a file
+offer, one voice chunk - is encrypted **separately for every individual
+recipient**, sealed to that recipient alone under the hybrid scheme (§13).
+The server relays exactly as many independently-sealed copies as there are
+recipients; it never sees, generates, or forwards a key, and could not
+decrypt a multi-recipient message even if it colluded with one recipient
+(each recipient's ciphertext is entirely independent).
 
-This is a deliberate simplicity/auditability tradeoff over the usual
-hybrid scheme (symmetric-encrypt the payload once, RSA-encrypt only a
-short symmetric key per recipient) - it costs strictly more CPU and wire
-bytes per additional recipient (§8.2), which is the direct reason voice
-capture is kept to a low sample rate (§7.3) and streamed in small chunks
-rather than one large blob. `PqHybrid` (§13) is a narrow, deliberate
-exception to this whole design: its signing step needs *something* to
-sign, its key-wrap step needs *something* to wrap, and a KEM produces a
-shared secret by its very nature - a per-recipient-only scheme was never
-on the table for it the way it is for RSA-OAEP.
+Per-recipient sealing costs strictly more CPU and wire bytes per
+additional recipient, which is the direct reason voice capture is kept to
+a low sample rate (§7.3) and streamed in small chunks rather than one
+large blob. Within one send, §13's setup-plus-chunks shape does establish
+a per-send symmetric key (`k_data`) - a KEM produces a shared secret by
+its very nature - but that key never spans recipients: each gets its own,
+wrapped to its own keys.
 
-A recipient's public key here is ordinarily good for the whole session
-(`KeyMode::Password`/`None`/`PqHybrid` - the last one loaded from a
-file rather than autogenerated or password-derived, but equally static
-for the whole session, see §13). `PqHybrid` additionally rotates its
-*encryption* keys - not the identity itself - per peer relationship, on
-every message sent or received with that peer; see §13.10.
+A recipient's identity here is good for the whole session: a `pq_hybrid`
+keybundle is loaded from a file and never rotates (§13). Its *encryption*
+keys - not the identity - do rotate per peer relationship, on every
+message sent or received with that peer; see §13.10.
+
+**RSA-OAEP survives in exactly one place**: the server's `Rsa` auth
+challenge (§5.3), where the client proves it holds the server's key by
+decrypting a nonce. That is a client-to-server proof, not peer-to-peer
+content, and §8.1 describes the chunking it uses.
 
 ### 8.1 RSA-OAEP chunking
 
@@ -2059,41 +2062,7 @@ their decryptions in order:
   RSA private key, then concatenate the plaintexts in the same order.
 
 
-### 8.2 Cost implication for voice
-
-Total RSA work is proportional to bytes of plaintext, **independent of
-how finely that plaintext is chunked** for streaming (§7.3): encrypting
-one 480-byte chunk (`CHUNK_INTERVAL`'s 15ms at 16kHz mono 16-bit)
-in 3 blocks costs the same total RSA-encrypt work as encrypting the same
-480 bytes as one theoretical un-chunked blob would, modulo OAEP's fixed
-per-block overhead (at most one block worth of padding "waste" per chunk
-boundary - negligible in practice, since 190 bytes divides fairly evenly
-into typical chunk sizes). What chunking
-*does* affect is latency (finer chunks land sooner) and message-count
-overhead (more frames, more per-message framing/relay cost) - not total
-crypto cost. For a channel with `N` other members, a sender pays `N`× the
-per-recipient RSA-encrypt cost for every chunk (once per recipient, since
-each gets an independently-encrypted copy); each individual recipient
-only ever pays 1× the RSA-decrypt cost for their own copy.
-
-### 8.3 Password-derived keys
-
-A client's `my_key` (§5.4's `public_key_der`) can be sourced from an RSA
-keypair file, or deterministically derived from a password
-(the password derivation: PBKDF2-HMAC-SHA256, 100,000 rounds,
-fixed non-secret salt, seeding a ChaCha20 CSPRNG that generates the RSA
-keypair) so the same password reproduces the same keypair on any machine.
-This only affects how a client *obtains* the keypair whose public half it
-announces in `Identify`; the actual key material the wire protocol sees -
-the DER public key, RSA-encrypted ciphertext, everything in §7-§8 - is
-identical regardless of sourcing, and no peer can distinguish a
-password-derived key from a file-loaded one by its cryptographic
-properties alone. `key_mode` (§3) does still announce *which* sourcing
-was chosen (`Rsa` vs `Password` vs `None`), but purely as a display label
-for peers to show next to that user's name - it has no bearing on how any
-message is actually encrypted or decrypted.
-
-### 8.4 RSA signatures
+### 8.2 RSA signatures
 
 There is exactly one RSA signing primitive in this protocol, used as the
 classical half of every `pq_hybrid` signature: a send commitment (§13.3)
@@ -2293,28 +2262,20 @@ either direction - the human reviewing it decides, the app never guesses.
 ### 12.2 What gets pinned, and what doesn't
 
 **Scope: this section is about byte-comparison pinning only** - the
-the pin-and-compare path path the identity check drives, where the
-alarm condition is "these bytes differ from last time". It is the only
-pinning mechanism this app has: every `KeyMode` either participates in it
-or is left unprotected, covered below.
+pin-and-compare path the identity check drives, where the alarm condition
+is "these bytes differ from last time". It is the only pinning mechanism
+this app has.
 
-Under byte comparison, only `KeyMode`s whose key is actually the *same* key
-across two separate connections can be checked - not merely
-"persistent-looking" ones:
+Byte comparison only works where the key really is the *same* key across
+two separate connections, and `pq_hybrid` is: the identity keybundle is
+loaded from a file (§13.2), so the same file produces the same bundle on
+every connect, for as long as it exists. Rotation (§13.10) only ever
+changes the encryption half, never the identity pinned here.
 
-| `KeyMode` | Checked? | Why |
-|---|---|---|
-| `Password` | yes | `resolve_my_keypair` re-derives the keypair from the password via the password derivation (§8.3: PBKDF2 into a deterministic CSPRNG seed) - same password in, same keypair out, every time |
-| `PqHybrid` | yes | the identity keybundle is loaded from a file (§13.2) - the same file produces the same bundle on every connect, for as long as it exists. Rotation (§13.10) only ever changes the encryption half, never the identity that gets pinned here |
-| `None` | no | autogenerated fresh every connect by design (§3) - nothing persists it between sessions, so the very same legitimate user reconnecting announces a genuinely different key every time. Comparing it would flag a false "possible impersonation" on every single reconnect - worse than not checking at all, since a warning that fires constantly for no reason trains a user to dismiss it, including the one time it's real |
-
-In short: byte comparison only works for the two `my_key` types backed by a
-secret the user actually holds onto between sessions (a key file, or a
-password they remember). For a `my_key` type whose key material is, by
-design, thrown away and regenerated at every connect, there is no stable
-byte string to compare - which is a statement about *this* mechanism, not
-about `id_store` as a whole. `None` is the one `KeyMode` this document
-leaves genuinely unprotected - it has no stable key to compare.
+That is the whole of it, because `pq_hybrid` is the only `my_key` this
+protocol has. A peer announcing bytes that do not decode as a keybundle
+has no identity to pin at all, and is left untracked rather than
+compared.
 
 **The store pins the full `public_key_der` bytes, not a hash of them** -
 the pin-and-compare path compares raw DER byte-for-byte, and saving the store
@@ -2596,20 +2557,19 @@ own; it exists only to give a human something else to eyeball.
 `Content::DeviceIdAnnounce` tag and `P2pPayload::DeviceIdAnnounce {
 envelope: Envelope }` (§7.1's `PunchDatagram::Reliable`, exactly like a
 text message or file offer) carry it - `envelope`'s plaintext is just the
-device id's raw UTF-8 bytes, sealed per-recipient with whichever scheme
-the recipient's `KeyMode` uses (RSA-OAEP, or the `pq_hybrid` one-chunk
-send, §13), the same `envelope::encrypt_envelope_for` dispatch every
-other content type goes through. The punch handshake itself
+device id's raw UTF-8 bytes, sealed per-recipient as a `pq_hybrid`
+one-chunk send (§13), through the same `envelope::encrypt_envelope_for`
+every other content type goes through. The punch handshake itself
 (`Ping`/`Pong`) carries no device id at all - deliberately kept out of
 that layer, which has no notion of recipient keys - so a device id is
 only ever sent once the link reaches `Active` and the peer's key is
 already known (from `Identify`/`UserJoined`, over the TCP control
 channel). Sent automatically, unprompted, every time a link reaches
 `Active` (`session::send_device_id_announce`) - idempotent, and cheap
-enough that a link flap simply resends it. Silently skipped if this
-client cannot currently address the recipient (`keymode_policy::can_address`
-- the same partial-delivery rule every other content type follows) or
-encryption fails for any other reason; there is nothing to retry beyond
+enough that a link flap simply resends it. Silently skipped if the
+recipient announced no keybundle to seal to (the same partial-delivery
+rule every other content type follows) or encryption fails for any other
+reason; there is nothing to retry beyond
 the automatic resend the next `Active` transition already gives it.
 
 On arrival, `session::on_device_id_announce` decrypts it (independent of
@@ -2660,28 +2620,25 @@ re-reveal or re-chime.
 
 ## 13. Post-quantum hybrid encryption (`pq_hybrid`)
 
-`KeyMode::PqHybrid` is the third `my_key` method: ML-DSA-87+RSA-4096 signing,
-ML-KEM-1024+RSA-4096 key-wrap, AES-256-GCM bulk encryption. Unlike the
-other methods in this document, it is not built on RSA-OAEP-per-recipient at
-all (§8) - it needs a shared symmetric key by construction, so it is
-documented here as its own, self-contained model rather than a variation on
-§7-§8's. Like §11/§12, this section has real wire-visible pieces (a new
-`KeyMode` variant, and what `public_key_der`/`Envelope.blocks` actually
-contain for it) but otherwise reuses existing message types unchanged - no
-new `ClientMessage`/`ServerMessage` variant, no change to `Envelope`'s or
+`KeyMode::PqHybrid` is this protocol's one `my_key` method:
+ML-DSA-87+RSA-4096 signing, ML-KEM-1024+RSA-4096 key-wrap, AES-256-GCM
+bulk encryption. It needs a shared symmetric key per send by construction,
+so it is documented here as its own self-contained model rather than as a
+variation on §7-§8's per-recipient framing. Like §11/§12, this section
+says what `public_key_der`/`Envelope.blocks` actually contain, but
+otherwise reuses existing message types unchanged - no new
+`ClientMessage`/`ServerMessage` variant, no change to `Envelope`'s or
 `UserInfo`'s shape.
 
 ### 13.1 Why this method, and why it looks different
 
-The other two methods share one property: RSA-OAEP encryption needs
-nothing from the *sender* except the recipient's public key - no identity,
-no private key, no signature. That is what lets any client encrypt to any
-recipient regardless of the sender's own `my_key` choice, and it is exactly
-what makes real post-quantum *authentication* impossible to bolt on without
-a shared-key step: producing an ML-DSA-87 signature needs an ML-DSA-87
-signing key, which only a `pq_hybrid` sender has. This is why §13.6 below is
-a hard requirement, not an incidental detail: **a `PqHybrid` recipient can
-only be addressed by a `PqHybrid` sender.**
+A per-recipient-only scheme - encrypt to the recipient's public key and
+nothing else - needs nothing from the *sender*: no identity, no private
+key, no signature. That is convenient, and it is exactly what makes real
+post-quantum *authentication* impossible to bolt on without a shared-key
+step: producing an ML-DSA-87 signature needs an ML-DSA-87 signing key.
+This protocol requires one of every sender instead, which is what §13.6
+below rests on.
 
 The user-facing design brief this section implements:
 
@@ -2835,7 +2792,8 @@ them and a message to somebody else consumes a value this peer never sees.
 
 - **Text and file offers** put the whole `HybridSend` - setup and its
   single chunk - as the one element of `Envelope.blocks`. `Envelope`'s own
-  shape is unchanged; only the *meaning* of `blocks` differs by `KeyMode`.
+  shape is unchanged from when `blocks` held N RSA-OAEP blocks; it now
+  always holds exactly one sealed send.
 - **Voice streams and file transfers** send the `SendSetup` on its own,
   once, as `P2pPayload::StreamKeySetup` (§7.1.1, reliable), and every
   chunk after it carries ciphertext only.
@@ -2920,26 +2878,18 @@ the strongest tier available, not the fastest.
 
 ### 13.6 Who can send to whom
 
-Because step 1 needs the *sender's* ML-DSA-87/RSA-sign identity, and only a
-`pq_hybrid` client has one:
+Step 1 needs the *sender's* ML-DSA-87/RSA-sign identity, and every client
+has one - `pq_hybrid` is the only `my_key` this protocol has (§3), so
+every peer reached through a server can both produce and open a sealed
+send. There is no partial-reachability case left here at all.
 
-- **A `pq_hybrid` recipient can only be addressed by a `pq_hybrid`
-  sender.** A sender whose own `my_key` is `password`/`none` has no way to
-  produce a valid `SendSetup` signature - such a recipient is silently
-  excluded from that sender's channel/DM/file/voice send, the same
-  partial-delivery pattern as any other unreachable recipient in this app
-  (an offline member, a not-yet-fresh rotating-key recipient, §11.1/§11.2).
-  the addressing rule is the reference implementation of this check.
-- **A `pq_hybrid` sender can still address any non-`pq_hybrid` recipient
-  normally** - RSA-OAEP (§8) needs no sender identity at all, so a
-  `pq_hybrid` client falls straight through to the ordinary `encrypt_for_one`
-  path for a `password`/`none` recipient, exactly like any other sender
-  would.
-
-A mixed channel - some members `pq_hybrid`, some not - therefore behaves
-asymmetrically per sender: a `pq_hybrid` member's message reaches everyone;
-a non-`pq_hybrid` member's message reaches everyone *except* the `pq_hybrid`
-members.
+The one peer that cannot be sealed to is one who announced no keybundle:
+a `--no-server` direct-punch peer (§7.1.5) never went through `Identify`,
+so there is nothing to seal against. Such a peer is reachable only under
+an already-installed one-time pad, framed direct (§16.2), and is silently
+excluded from any ordinary channel/DM/file/voice send - the same
+partial-delivery pattern as any other unreachable recipient in this app
+(an offline member, a not-yet-fresh rotating-key recipient, §11.1/§11.2).
 
 ### 13.7 Voice streaming (and file transfer chunks)
 
@@ -2996,15 +2946,12 @@ predicate `check_identity` consults, covering exactly `Password`/
 Like §12, this is purely client-local behavior with no wire-protocol
 effect - a server, or a peer whose client doesn't implement this section at
 all, is fully interoperable with one that does. It exists because `13.2`'s
-file-loaded keybundle would otherwise be the one `my_key` type that can't
-be used the moment you open the app for the first time - `none` needs
-nothing prepared, and every other type fails
-with an actionable, immediate error naming exactly which field is empty. A
-blank `file_pub`/`file_priv` for `pq_hybrid` would technically fail the
-same validation, but with no in-app way to fix it short of quitting,
-running `aloo --keygen-pq-hybrid` externally, and reopening the form -
-real friction for what's this app's default `my_key` type. Two pieces close
-that gap:
+file-loaded keybundle would otherwise be something that cannot be used the
+moment you open the app for the first time: a blank
+`file_pub`/`file_priv` fails the form's validation with no in-app way to
+fix it short of quitting, running `aloo --keygen-pq-hybrid` externally,
+and reopening the form - real friction for the only `my_key` this app has.
+Two pieces close that gap:
 
 **Auto-generation at connect time** (the auto-generation step, called
 from `connect.rs::resolve_my_keypair`'s `PqHybrid` arm): if either
@@ -3124,40 +3071,36 @@ rotations and impersonate the identity indefinitely; recovering from that
 needs a new keybundle and re-pinning, not a ratchet. That gap is real and
 is the one place MLS-style group ratcheting remains stronger.
 
-## 14. The three encryption methods, side by side
+## 14. The two encryption layers, side by side
 
 Everything above describes mechanisms; this is the summary of what a user
-actually picks between. There are three methods, matching `KeyMode`'s
-(§3) three values one for one.
+actually gets. There is one peer-to-peer method - `pq_hybrid`, matching
+`KeyMode`'s (§3) one value - and one optional layer over it, the one-time
+pad (§16).
 
-| | **plain** (`none`) | **password** | **pq-hybrid** |
-|---|---|---|---|
-| Tag shown | `🚨 PLAIN` | `🚨 PWD` | `🛡️ PQH` |
-| Where the key comes from | generated at connect | derived from a password (§8.3) | loaded from a keybundle file |
-| Message encryption | RSA-OAEP per recipient (§8) | same | ML-KEM-1024 + X25519 wrap, AES-256-GCM content (§13.3) |
-| Signed by the sender? | no | no | yes - ML-DSA-87 **and** RSA-4096-PSS, both must verify |
-| Post-quantum? | no | no | yes, key exchange and signatures both |
-| Identity survives a reconnect? | no | yes | yes |
-| Byte-comparison pinning (§12)? | no | yes | yes |
-| Forward secrecy? | no | no | yes (§13.10) |
-| Recipient/room binding, replay protection? | no | no | yes (§13.3) |
-| Who can address it? | anyone | anyone | only another `pq_hybrid` sender (§13.6) |
+| | **pq-hybrid** | **pq-hybrid + OTP** |
+|---|---|---|
+| Tag shown | `🛡️ PQH` | `🔑 OTP` (replaces it) |
+| Where the key comes from | a keybundle file, auto-generated on first connect (§13.9) | the above, plus a pad both sides hold (§16.1) |
+| Message encryption | ML-KEM-1024 + X25519 wrap, AES-256-GCM content (§13.3) | a one-time pad on the message, sealed inside that envelope (§16.2) |
+| Signed by the sender? | yes - ML-DSA-87 **and** RSA-4096-PSS, both must verify | yes, plus the pad's own decrypt verdict |
+| Post-quantum? | yes, key exchange and signatures both | yes, and the pad layer is information-theoretically secure |
+| Identity survives a reconnect? | yes | yes |
+| Byte-comparison pinning (§12)? | yes | yes |
+| Forward secrecy? | yes (§13.10) | yes, and pad bytes are spent once and gone |
+| Recipient/room binding, replay protection? | yes (§13.3) | yes, plus strict pad sequencing (§16.2) |
+| Scope | channels and DMs | DMs only (§16.2) |
 
-Reading the table honestly:
+`pq_hybrid` is post-quantum, signed, bound to its recipient and room,
+replay-protected and forward secret all at once, and costs the user
+nothing to choose: the keybundle generates itself on first connect
+(§13.9).
 
-- **plain** exists for trying the app out. It encrypts every message for
-  real, but the identity behind it is thrown away at disconnect, so
-  nothing distinguishes a returning contact from a stranger.
-- **password** buys a reproducible identity with nothing to carry around,
-  at the cost that anyone who learns the password *is* you.
-- **pq-hybrid** is the default and the only one that is post-quantum,
-  signed, bound to its recipient and room, replay-protected, and forward
-  secret at once. Its cost is that it only talks to its own kind (§13.6).
-
-**plain** and **password** share §8's RSA-OAEP model entirely; only their
-key *sourcing* differs. `pq_hybrid` is a different construction
-throughout, which is why §13 is self-contained rather than a variation on
-§8.
+The one case with no envelope around the pad at all is a peer who
+announced no readable keybundle - a `--no-server` direct-punch peer
+(§7.1.5), which never went through `Identify`. A pad both sides already
+hold still carries that conversation, authenticated by the pad's decrypt
+verdict alone (§16.2).
 
 ## 15. Sequences
 
@@ -3293,7 +3236,12 @@ send - it never skips asking the other side:
 The proposals and acknowledgements are carried as ordinary `Envelope`s,
 sealed under the ongoing `pq_hybrid` conversation exactly like a text
 message - the one-time-pad layer cannot protect the handshake that
-establishes it, and does not try to.
+establishes it, and does not try to. This is what separates them from
+`/endotp`'s notice, which *is* padded (§16.6): `OtpSessionRequest` and
+`OtpKeySetupAck` are precisely what decides whether a usable pad exists,
+and the side receiving a setup ack has not yet committed the key it would
+need to open a padded one. A `Direct` pair never sends either, having
+nothing left to agree (§16.2).
 
 The pad's own bytes are the exception, and travel differently for two
 reasons. Wrapping each slice in its own envelope costs a signature and a
@@ -3461,17 +3409,94 @@ that is otherwise a permanent dead end.
 
 ### 16.2 Sending under the pad
 
-Once active, a send to that contact is wrapped once more after the
-ordinary `pq_hybrid` seal, and carries a `seq` naming its place in this
-layer's own independent counter for that contact (unrelated to `send_id`,
-which the underlying `pq_hybrid` send still has and still enforces on its
-own terms):
+Once active, a send to that contact goes through the pad, and carries a
+`seq` naming its place in this layer's own independent counter for that
+contact (unrelated to `send_id`, which the underlying `pq_hybrid` send
+still has and still enforces on its own terms):
 
 ```
  alice                                              bob
    |--- OtpEnvelope { channel, seq, envelope } -------->|   a fresh nonce rides under the pad
    |<-- OtpDeliveryAck { seq, proof } -------------------|   proof = sha256(that nonce)
 ```
+
+**One rule: the pad goes on the payload, and the seal goes around the
+pad.**
+
+```
+ pqhybrid_otp    seal(pad(payload))
+ direct_otp      pad(payload)
+```
+
+The same shape for every payload this layer carries - text, a file offer,
+a voice offer, and `/endotp`'s notice and its ack (§16.6). A file's and a
+voice message's *content* arrives at the same nesting a different way: it
+is padded whole in one streaming pass and its chunks are sealed
+individually (below).
+
+Sealing outermost is worth two things. A sealed envelope weighs ~6.4KB of
+ML-DSA/ML-KEM/RSA regardless of the message, so padding it rather than the
+message meant a short chat line spent roughly thirty-five times its own
+length of an irreplaceable pad. And the signature is now checked *before*
+the pad is touched, so a forgery costs nothing rather than a spend.
+
+What it costs is that the seal's binding (§13.3) becomes the outermost
+layer, and would otherwise be the one thing on the wire that names who is
+talking to whom. So an OTP send leaves nothing identifying in it:
+
+- **the room** travels under the pad, in a small header ahead of the
+  payload, and is checked against where the message arrived only after
+  unwrapping - against pad ciphertext no third party can produce. A
+  `Direct` pair has no binding at all, so this is where their routing has
+  to live regardless; sharing one shape means both framings decode by the
+  same path.
+- **the recipient's fingerprint** is signed but transmitted zeroed. The
+  recipient substitutes their own back before verifying, so a send bound
+  to somebody else still fails - on the two signatures rather than on a
+  plaintext comparison, which is the check that was doing the work all
+  along.
+- **`send_id`** stays readable. It nonces the chunk, so the recipient
+  needs it before anything can open, and it says no more than the `seq`
+  in the same frame already does.
+
+**Two framings.** Whether there is a seal at all depends on one observable
+fact: whether the peer announced a keybundle that decodes as a
+`PqPublicBundle` (§3).
+
+- **`PqWrapped`** - the ordinary case, and every peer reached through a
+  server. The pad ciphertext is sealed to the peer's keybundle. The
+  envelope's own signature and the pad's decrypt verdict both apply.
+- **`Direct`** - one side or the other has no readable keybundle. In
+  practice that is a pair who found each other peer to peer and never
+  exchanged identities: no server, a server that never introduced them, or
+  one that has since gone away (§7.1.5). There is nothing to seal against,
+  so `Envelope.blocks`' single element is the pad ciphertext itself.
+  `Envelope` is reused rather than a parallel shape so `content` still
+  routes the message identically at the far end.
+
+  Such a pair needs no session handshake either. The handshake exists to
+  agree on generating and sharing a pad, and a `Direct` pair by definition
+  already holds one - so `/otp` turns the layer on locally and the first
+  message goes straight under the pad. Their acknowledgement is the only
+  consent a pad-only pair can express, and the only one it needs.
+
+**Every kind of send works under either framing.** Text, a file offer and
+a voice offer are each one padded payload, framed as above. A file's
+content phase and a voice message's audio stream go as ordinary
+`FileChunk`s (§7.6) instead: the content is padded whole before the first
+chunk leaves, and the chunks are then sealed to the recipient's keybundle
+under `PqWrapped`, or carry the pad ciphertext verbatim under `Direct`.
+Either way it is the same nesting - pad innermost, seal outermost -
+arrived at by streaming rather than in one piece.
+
+Nothing is given up under `Direct`. Authentication is entirely the
+pad's decrypt verdict - a message is accepted only if the pad tool
+confirms it was produced by the holder of the mirror key at the expected
+offset and is next in sequence - which is a *stronger* statement about who
+is speaking than an identity signature would be, since it is tied to the
+specific key position rather than merely to a keypair. Both sides read the
+same announced key, so they always agree on the framing; one never wraps
+while the other expects bare plaintext.
 
 The receiving side only sends `OtpDeliveryAck` once the message has been
 fully unwrapped *and* successfully delivered to the local application -
@@ -3519,13 +3544,11 @@ corrupting what lands on the receiver's disk, so the plaintext's own
 `sha256` stands in. It proves the same thing: only a party that decrypted
 the content can name it.
 
-None of this varies with framing. The nonce lives at the pad layer, above
-whatever the pad happens to be carrying, so a pair with `pq_hybrid` on both
-sides (an envelope inside the pad) and a pair with none (the plaintext
-inside the pad) acknowledge each other identically. What *does* vary is the
-cost: a `pq_hybrid` envelope is ~7KB of ML-DSA/ML-KEM/RSA regardless of the
-message, which for a short chat line is nearly all of the pad it spends -
-one of the two reasons `Direct` framing exists (§16.1). A message typed while one is still
+None of this varies with framing. The nonce lives at the pad layer, under
+whatever is sealed around it, so a `PqWrapped` pair and a `Direct` pair
+acknowledge each other identically - and since the pad is innermost either
+way, they now spend the same amount of it too. A
+message typed while one is still
 outstanding is held locally and sent the moment the ack for the previous
 one comes in; nothing about this queueing is itself visible on the wire.
 This is the same requirement the underlying pad-management tool enforces
@@ -3594,28 +3617,37 @@ what resumes it.
 per-chunk framing cheap enough to make streaming practical against a
 resource destroyed the instant it is used, so instead of the ordinary
 live `StreamStart`/chunks/`StreamEnd` sequence (§7.3), the whole message
-is captured locally first and only then sent, once, as a `FileOffer`
-would be - except a voice message has no consent prompt to wait for
-(voice never has one, on or off this layer), so it skips the
-accept/reject round trip that a file offer waits for: the pad is spent
-encrypting the complete recording immediately, and `OtpVoiceOffer` carries
-both the offer and the (already-encrypted) content's arrival in one
-uninterrupted exchange - the receiving side answers with `FileAccept`
-itself, automatically, the moment the offer decodes:
+is captured locally first and only then sent, as **exactly the two spends
+a file uses** - the offer, then the content.
+
+The offer goes through the pad just as a file's does. That is what keeps
+the duration out of the clear: it lives in the payload rather than in the
+cleartext `OtpVoiceOffer` tag, and under `Direct` framing there is no
+envelope to hide it in, so the pad is the only thing that can. The
+recording itself is the second, later spend, encrypted whole only once the
+offer has been acknowledged.
+
+The one way it differs from a file is that nobody is asked: a voice
+message has no consent prompt, on or off this layer, so the receiving side
+stages and accepts in the same step it opens the offer in.
 
 ```
  alice                                              bob
-   |    (finishes recording; encrypts the
-   |     whole clip through the pad, into a
-   |     local temp file)
-   |--- OtpVoiceOffer { stream_id, seq, envelope } ----->|   envelope: ordinary pq_hybrid
-   |<-- FileAccept { stream_id } -------------------------|   sent automatically, no popup
+   |    (finishes recording; stages the PCM
+   |     locally, still plaintext)
+   |--- OtpVoiceOffer { stream_id, seq: A, envelope } -->|   envelope: pad-wrapped
+   |                                                     |   (bob opens it, reads the duration)
+   |<-- OtpDeliveryAck { seq: A, proof } ----------------|   the offer's own slot, closed
+   |<-- FileAccept { stream_id } ------------------------|   sent automatically, no popup
+   |    (encrypts the whole clip through the
+   |     pad, into a local temp file)
+   |--- OtpFileContentSeq { stream_id, seq: B } -------->|   names the recording's own slot
    |--- FileChunk { stream_id, seq, blocks } ----------->|   any number, as §7.6
-   |--- FileEnd { stream_id } --------------------------->|
+   |--- FileEnd { stream_id } -------------------------->|
    |    (bob decrypts the assembled temp file
    |     whole through the pad, decodes it back
    |     to PCM, and deletes the temp copy)
-   |<-- OtpDeliveryAck { seq } ---------------------------|
+   |<-- OtpDeliveryAck { seq: B, proof } ----------------|
 ```
 
 Once decrypted, the recording becomes an ordinary, already-finished voice
@@ -3772,16 +3804,36 @@ either side may do it alone, and the far side is *told*, not asked.
    |   as they are; only the outstanding-ack gate and any
    |   pad still owed to bob from an unfinished setup are
    |   cleared, and the contact stops being active
-   |--- OtpEndSession { contact_name } ----------------------------->|   ordinary pq_hybrid envelope
+   |--- OtpEndSession { contact_name } ----------------------------->|   under the pad, as OtpEnvelope
    |                                                                  |   bob does the same local
    |                                                                  |   pause on his side
-   |<-- OtpEndSessionAck { contact_name } -----------------------------|
+   |<-- OtpEndSessionAck { contact_name } -----------------------------|   likewise
 ```
 
-Both message types here are carried as ordinary `Envelope`s, sealed under
-the ongoing `pq_hybrid` conversation - exactly like every other OTP control
-message in this section (§16.1) - never wrapped through the pad itself,
-since ending a session must not itself depend on the pad still being usable.
+**Both travel under the pad**, framed by §16.2's single rule -
+`seal(pad(payload))` for a `PqWrapped` pair, `pad(payload)` for a `Direct`
+one - and carried by `OtpEnvelope` like any other padded send. Ending a
+session is something said to this contact, so it is said the same way
+everything else is; spending a little pad to say it is deliberate. For a
+`Direct` pair it is also the only shape that can carry it at all, there
+being no envelope to seal it into - before this, `/endotp` on a pad-only
+pair tore the session down locally and the peer was simply never told.
+
+Unlike the two provisioning payloads (§16.1), neither of these has a
+bootstrap problem to solve: a session that can be ended is by definition
+one whose pad both sides already hold. The one case that cannot be padded
+- a contact whose pad is gone or was never usable - falls back to an
+ordinary sealed `Envelope`, which needs a keybundle and so exists only for
+a `PqWrapped` pair.
+
+Each is confirmed by the other rather than by an `OtpDeliveryAck`, so
+neither arms the stop-and-wait gate behind it: arming it would leave it
+armed forever, and a later `/otp` resuming this same contact would find
+its first message queued behind a wait that can never end. They still take
+a `seq` from the same counter, because the pad is one ordered stream. A
+notice that arrives twice - its first ack having been lost - is answered
+from the recovered ciphertext of the ack already sent (`--recover-last
+--sent`), never by spending more pad.
 
 **Local pausing happens first, unconditionally, before anything is sent.**
 The instant `/endotp` runs, this side stops treating the contact as active

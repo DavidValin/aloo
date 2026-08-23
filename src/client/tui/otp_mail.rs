@@ -1067,7 +1067,6 @@ fn check_failure_label(compose: &ComposeState) -> Option<&'static str> {
                 Some("mail is larger than the remaining key")
             }
         }
-        RecipientCheck::NotPqIdentity => Some("needs your own pq_hybrid identity"),
         RecipientCheck::NotPinned => Some("no pinned user with this nickname"),
         RecipientCheck::NoKeychainEntry => Some("no otp key for this nickname"),
         RecipientCheck::CliUnavailable => Some("the 'otp' command isn't installed"),

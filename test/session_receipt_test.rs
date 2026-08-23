@@ -17,9 +17,11 @@ use aloo::client::connect::ResolvedIdentity;
 use aloo::client::session::{SessionState, TestSessionSpec};
 use aloo::client::tui::ui::UiState;
 use aloo::control::NullSink;
-use aloo::crypto::{self, KeyPair};
+use aloo::crypto::pq::{
+    PqPrivateBundle, PqPublicBundle, bundle_fingerprint, generate_bundle_with_bits, seal_send,
+};
 use aloo::p2p_proto::{P2pPayload, ReceiptStage};
-use aloo::proto::{ChannelInfo, ChannelKind, Content, Envelope, KeyMode, UserId, UserInfo};
+use aloo::proto::{self, ChannelInfo, ChannelKind, Content, Envelope, KeyMode, UserId, UserInfo};
 
 /// Small enough to keep the suite quick - key *size* is not what any of
 /// these assert (see `test/cucumber/world.rs`'s `SCENARIO_KEY_BITS` for
@@ -42,16 +44,34 @@ fn scratch_dir(name: &str) -> std::path::PathBuf {
     dir
 }
 
-/// A session that can read what `alice_sends` produces, with alice already
+/// Both halves of one identity, for the two roles a test plays: ours (the
+/// session's own keybundle) and alice's (the sender that seals to it).
+struct Identity {
+    public: PqPublicBundle,
+    private: PqPrivateBundle,
+    der: Vec<u8>,
+}
+
+fn identity() -> Identity {
+    let (public, private) = generate_bundle_with_bits(TEST_KEY_BITS).expect("keygen");
+    let der = proto::encode(&public).expect("encode bundle");
+    Identity {
+        public,
+        private,
+        der,
+    }
+}
+
+/// A session that can read what alice seals to it, with alice already
 /// known as a peer and a link opened to her (but never punched).
-async fn session_and_ui(name: &str) -> (SessionState, UiState, KeyPair) {
-    let me = KeyPair::generate_with_bits(TEST_KEY_BITS).expect("keygen");
+async fn session_and_ui(name: &str) -> (SessionState, UiState, Peers) {
+    let me = identity();
+    let alice_identity = identity();
     let mut session = SessionState::for_test(TestSessionSpec {
-        key_mode: KeyMode::Password,
-        identity: ResolvedIdentity::Rsa(KeyPair {
+        identity: ResolvedIdentity {
             private: me.private.clone(),
-            public: me.public.clone(),
-        }),
+            public_der: me.der.clone(),
+        },
         scratch: scratch_dir(name),
         otp: None,
     })
@@ -70,8 +90,8 @@ async fn session_and_ui(name: &str) -> (SessionState, UiState, KeyPair) {
     let alice = UserInfo {
         id: ALICE,
         name: "alice".into(),
-        public_key_der: crypto::public_key_to_der(&me.public).expect("der"),
-        key_mode: KeyMode::Password,
+        public_key_der: alice_identity.der.clone(),
+        key_mode: KeyMode::PqHybrid,
     };
     ui.seed_member("general", alice.clone());
     ui.known_users.insert(ALICE, alice);
@@ -82,14 +102,60 @@ async fn session_and_ui(name: &str) -> (SessionState, UiState, KeyPair) {
         .peer_link_mut()
         .ensure_link(&mut NullSink, ALICE)
         .await;
-    (session, ui, me)
+    (
+        session,
+        ui,
+        Peers {
+            me,
+            alice: alice_identity,
+        },
+    )
 }
 
-/// An envelope alice could have sent us, sealed to our own key.
-fn sealed_to(me: &KeyPair, text: &str) -> Envelope {
+/// The two identities a test needs back: ours (what an envelope must be
+/// sealed to) and alice's (what signs it).
+struct Peers {
+    me: Identity,
+    alice: Identity,
+}
+
+/// An envelope alice really did seal to us - the same construction
+/// `envelope::encrypt_envelope_for` builds, at the sender's side.
+///
+/// `send_id` is per-message because `ReplayGuard` refuses a second send
+/// from one peer under an id it has already accepted.
+fn sealed_to(peers: &Peers, channel: Option<&str>, send_id: u64, text: &str) -> Envelope {
+    let blob = seal_send(
+        &peers.alice.private,
+        peers.me.public.bootstrap_encap(),
+        bundle_fingerprint(&peers.me.public).expect("fingerprint"),
+        channel.map(str::to_string),
+        send_id,
+        text.as_bytes(),
+    )
+    .expect("sealing should succeed");
     Envelope {
         content: Content::Text,
-        blocks: crypto::encrypt_chunked(&me.public, text.as_bytes()).expect("encrypt"),
+        blocks: vec![blob],
+    }
+}
+
+/// An envelope alice sealed to *someone else*: it arrives, and nothing
+/// here can open it.
+fn sealed_to_someone_else(peers: &Peers, channel: Option<&str>, send_id: u64) -> Envelope {
+    let stranger = identity();
+    let blob = seal_send(
+        &peers.alice.private,
+        stranger.public.bootstrap_encap(),
+        bundle_fingerprint(&stranger.public).expect("fingerprint"),
+        channel.map(str::to_string),
+        send_id,
+        b"not for you",
+    )
+    .expect("sealing should succeed");
+    Envelope {
+        content: Content::Text,
+        blocks: vec![blob],
     }
 }
 
@@ -112,7 +178,7 @@ fn receipts(session: &mut SessionState) -> Vec<(u64, ReceiptStage)> {
 /// @requirement AC-233, TB-233
 #[tokio::test]
 async fn a_channel_message_is_receipted_once_it_has_been_decrypted() {
-    let (mut session, mut ui, me) = session_and_ui("channel-ok").await;
+    let (mut session, mut ui, peers) = session_and_ui("channel-ok").await;
 
     aloo::client::channel::on_message(
         &mut ui,
@@ -121,7 +187,7 @@ async fn a_channel_message_is_receipted_once_it_has_been_decrypted() {
         ALICE,
         "alice".into(),
         Some(MSG_ID),
-        sealed_to(&me, "hi there"),
+        sealed_to(&peers, Some("general"), 1, "hi there"),
     );
 
     assert_eq!(
@@ -141,8 +207,7 @@ async fn a_channel_message_is_receipted_once_it_has_been_decrypted() {
 /// @requirement AC-233
 #[tokio::test]
 async fn an_undecryptable_message_is_never_receipted() {
-    let (mut session, mut ui, _me) = session_and_ui("channel-bad").await;
-    let someone_else = KeyPair::generate_with_bits(TEST_KEY_BITS).expect("keygen");
+    let (mut session, mut ui, peers) = session_and_ui("channel-bad").await;
 
     aloo::client::channel::on_message(
         &mut ui,
@@ -152,7 +217,7 @@ async fn an_undecryptable_message_is_never_receipted() {
         "alice".into(),
         Some(MSG_ID),
         // Sealed to a key that is not ours: it arrives, and stays shut.
-        sealed_to(&someone_else, "not for you"),
+        sealed_to_someone_else(&peers, Some("general"), 1),
     );
 
     assert!(
@@ -168,7 +233,7 @@ async fn an_undecryptable_message_is_never_receipted() {
 /// @requirement AC-233
 #[tokio::test]
 async fn a_direct_message_is_receipted_once_it_has_been_decrypted() {
-    let (mut session, mut ui, me) = session_and_ui("dm-ok").await;
+    let (mut session, mut ui, peers) = session_and_ui("dm-ok").await;
 
     aloo::client::direct_message::on_message(
         &mut ui,
@@ -176,7 +241,7 @@ async fn a_direct_message_is_receipted_once_it_has_been_decrypted() {
         ALICE,
         "alice".into(),
         Some(MSG_ID),
-        sealed_to(&me, "just between us"),
+        sealed_to(&peers, None, 1, "just between us"),
     )
     .await;
 
@@ -194,7 +259,7 @@ async fn a_direct_message_is_receipted_once_it_has_been_decrypted() {
 /// @requirement TB-230
 #[tokio::test]
 async fn a_message_that_names_nothing_is_never_receipted() {
-    let (mut session, mut ui, me) = session_and_ui("unnamed").await;
+    let (mut session, mut ui, peers) = session_and_ui("unnamed").await;
 
     aloo::client::channel::on_message(
         &mut ui,
@@ -203,7 +268,7 @@ async fn a_message_that_names_nothing_is_never_receipted() {
         ALICE,
         "alice".into(),
         None,
-        sealed_to(&me, "no answer wanted"),
+        sealed_to(&peers, Some("general"), 1, "no answer wanted"),
     );
 
     assert_eq!(ui.channels[0].log.len(), 1, "it still arrives");
@@ -219,7 +284,7 @@ async fn a_message_that_names_nothing_is_never_receipted() {
 /// @requirement AC-233, TB-233
 #[tokio::test]
 async fn a_message_held_pending_a_trust_decision_is_still_receipted() {
-    let (mut session, mut ui, me) = session_and_ui("held").await;
+    let (mut session, mut ui, peers) = session_and_ui("held").await;
     ui.push_identity_review(
         ALICE,
         "alice".into(),
@@ -238,7 +303,7 @@ async fn a_message_held_pending_a_trust_decision_is_still_receipted() {
         ALICE,
         "alice".into(),
         Some(MSG_ID),
-        sealed_to(&me, "held for now"),
+        sealed_to(&peers, Some("general"), 1, "held for now"),
     );
 
     assert!(

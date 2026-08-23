@@ -870,6 +870,64 @@ pub fn seal_send(
     bincode_encode(&HybridSend { setup, ciphertext })
 }
 
+/// `seal_send` for a send whose recipient must not be *named* on the wire.
+///
+/// The binding is signed with the real `recipient_fp` and transmitted with
+/// it zeroed. Nothing is weakened: the recipient substitutes their own
+/// fingerprint back before verifying, so a send bound to somebody else
+/// still fails - not on the explicit comparison `open_setup` makes, but on
+/// the two signatures, which is the check that was doing the work all
+/// along. What changes is only that an observer can no longer read who a
+/// sealed blob is for.
+///
+/// Used by the OTP layer, where the seal is now the *outermost* layer
+/// (`client::otp`'s `build_otp_envelope`) and so has nothing above it left
+/// to hide its own header. `channel` is not a parameter because that layer
+/// carries its routing under the pad instead (`client::otp`'s `OtpInner`);
+/// the binding this signs always names no channel.
+///
+/// `send_id` stays in the clear - it nonces the chunk, so the recipient
+/// needs it before anything can be opened, and it says no more than the
+/// per-contact sequence number the same frame states outright.
+pub fn seal_send_blinded(
+    sender_signing: &PqPrivateBundle,
+    recipient_encap: &PqEncapKeys,
+    recipient_fp: [u8; 32],
+    send_id: u64,
+    data: &[u8],
+) -> Result<Vec<u8>> {
+    let (mut setup, k_data) =
+        seal_setup(sender_signing, recipient_encap, recipient_fp, None, send_id)?;
+    let ciphertext = seal_chunk(&k_data, send_id, 0, data);
+    setup.binding.recipient_fp = [0u8; 32];
+    bincode_encode(&HybridSend { setup, ciphertext })
+}
+
+/// `seal_send_blinded`'s counterpart. Refuses anything that is not in the
+/// blinded shape rather than guessing, so a send that *does* name a
+/// recipient cannot be replayed into this path to have the name filled in
+/// for it.
+///
+/// Returns the `send_id` alongside the plaintext - the one part of the
+/// binding the caller still has to judge for itself (that it is newer than
+/// anything already accepted from this sender).
+pub fn open_send_blinded(
+    my_decaps: &[PqDecapKeys],
+    my_fp: &[u8; 32],
+    sender_public: &PqPublicBundle,
+    blob: &[u8],
+) -> Option<(u64, Vec<u8>)> {
+    let mut send: HybridSend = bincode_decode(blob).ok()?;
+    if send.setup.binding.recipient_fp != [0u8; 32] || send.setup.binding.channel.is_some() {
+        return None;
+    }
+    // The guess the signatures are about to test.
+    send.setup.binding.recipient_fp = *my_fp;
+    let k_data = open_setup(my_decaps, my_fp, sender_public, &send.setup)?;
+    let plaintext = open_chunk(&k_data, send.setup.binding.send_id, 0, &send.ciphertext)?;
+    Some((send.setup.binding.send_id, plaintext))
+}
+
 /// Opens a whole one-chunk send, returning what it was bound to alongside
 /// the plaintext so the caller can check the parts only it knows (that
 /// `channel` matches where this arrived, and that `send_id` is newer than

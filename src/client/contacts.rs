@@ -55,8 +55,9 @@ pub struct ContactRow {
     /// that field existed.
     pub key_mode: Option<KeyMode>,
     /// The contact name `otp --add-contact`/`--show-contact` uses for this
-    /// nickname - fingerprint-derived under `pq_hybrid`, nickname-derived
-    /// otherwise (`otp_contact_name_for`). Independent of whether OTP is
+    /// nickname - fingerprint-derived for a `pq_hybrid` pin, pinned-key
+    /// derived otherwise (`otp_contact_name_for`). Independent of whether
+    /// OTP is
     /// actually provisioned yet (`otp: Some(_)` below); "Install OTP key"
     /// is offered whenever `otp` is `None`.
     pub otp_contact_name: Option<String>,
@@ -67,12 +68,16 @@ pub struct ContactRow {
 
 /// The `otp` keychain contact name to file `nickname`'s pad under.
 ///
-/// Two derivations, and which one applies is what decides how that
-/// contact's traffic is framed (`client::otp::OtpFraming`): a `pq_hybrid`
-/// pin on both sides gives a fingerprint-derived name both machines
-/// compute identically, and anything else falls back to the nickname.
-/// Never `None` - every contact can hold a pad, since a pad installed by
-/// hand needs no identity to authenticate under. Never touches the
+/// Two derivations, and which one applies is exactly this pair's
+/// `client::otp::OtpFraming`: a pin holding a readable `pq_hybrid` bundle
+/// gives a fingerprint-derived name both machines compute identically,
+/// and a pin without one (a `--no-server` direct-punch peer, which
+/// announces no keybundle at all) falls back to the two pinned public
+/// keys. Never the nickname, which proves nothing and would let an
+/// impersonator taking a familiar name spend the real contact's pad
+/// (`crypto::otp::contact_name_for_keys`).
+///
+/// `None` only when `nickname` is not pinned at all. Never touches the
 /// keychain itself; just derives the name `otp_cli::has_contact`/
 /// `show_contact`/`add_contact`/`remove_contact` would all use.
 pub fn otp_contact_name_for(
@@ -80,54 +85,45 @@ pub fn otp_contact_name_for(
     nickname: &str,
     own_identity: OwnIdentity<'_>,
 ) -> Option<String> {
-    // Both sides on `pq_hybrid`: the name is derived from the two
-    // fingerprints, so both machines compute the identical one with nothing
-    // negotiated.
-    if id_store.key_mode(nickname) == Some(KeyMode::PqHybrid)
-        && let Some(own_fp) = own_identity.pq_fingerprint
-        && let Some(der) = id_store.get(nickname)
-        && let Some(peer_fp) = crate::crypto::pq::fingerprint_of_encoded(der)
-    {
-        return Some(crate::crypto::otp::contact_name_for(&own_fp, &peer_fp));
-    }
-    // No fingerprint to derive from, so the two pinned public keys are used
-    // instead - never the nickname, which proves nothing and would let an
-    // impersonator taking a familiar name spend the real contact's pad
-    // (`crypto::otp::contact_name_for_keys`).
-    //
-    // `None` when either side lacks a key stable across reconnects: a
-    // `KeyMode::None` peer is not pinned at all, so there is nothing to
-    // bind a pad to and no safe way to offer one.
-    if !crate::client::keymode_policy::uses_byte_comparison_pinning(id_store.key_mode(nickname)?) {
-        return None;
-    }
     let peer_der = id_store.get(nickname)?;
-    let own_der = own_identity.pinned_public_der?;
-    Some(crate::crypto::otp::contact_name_for_keys(own_der, peer_der))
+    match crate::client::otp::framing_for(own_identity.pinned_public_der, peer_der) {
+        crate::client::otp::OtpFraming::PqWrapped => {
+            let peer_fp = crate::crypto::pq::fingerprint_of_encoded(peer_der)?;
+            Some(crate::crypto::otp::contact_name_for(
+                own_identity.pq_fingerprint,
+                &peer_fp,
+            ))
+        }
+        crate::client::otp::OtpFraming::Direct => Some(
+            crate::crypto::otp::contact_name_for_keys(own_identity.pinned_public_der, peer_der),
+        ),
+    }
 }
 
 /// This side's own identity, as the contact-naming rules need to see it -
-/// the `pq_hybrid` fingerprint when there is one, and the pinned public key
-/// otherwise. Both are `Option` because either can be absent (no pq
-/// identity; or a `KeyMode::None` session with no stable key at all), and
-/// which one is used decides how a contact's pad is named.
-#[derive(Debug, Clone, Copy, Default)]
+/// the `pq_hybrid` fingerprint and the pinned public key it was computed
+/// from. Both are always present (`pq_hybrid` is this app's only `my_key`);
+/// which one is used depends on what the *peer* announced.
+#[derive(Debug, Clone, Copy)]
 pub struct OwnIdentity<'a> {
-    pub pq_fingerprint: Option<[u8; 32]>,
-    pub pinned_public_der: Option<&'a [u8]>,
+    pub pq_fingerprint: &'a [u8; 32],
+    pub pinned_public_der: &'a [u8],
 }
 
-/// This side's own identity as `SessionState` holds it - the one place
-/// the two representations are read out of a live session.
+/// This side's own identity as `SessionState` holds it - the one place the
+/// two representations are read out of a live session.
 pub fn own_identity_of(session: &SessionState) -> OwnIdentity<'_> {
     OwnIdentity {
-        pq_fingerprint: session.own_pq_fp,
-        pinned_public_der: session.otp_own_pinned_der.as_deref(),
+        pq_fingerprint: &session.own_pq_fp,
+        pinned_public_der: &session.otp_own_pinned_der,
     }
 }
 
 async fn otp_detail_for(cfg: &OtpCliConfig, contact_name: &str) -> Option<ContactOtpDetail> {
-    let detail = otp_cli::show_contact(cfg, contact_name).await.ok().flatten()?;
+    let detail = otp_cli::show_contact(cfg, contact_name)
+        .await
+        .ok()
+        .flatten()?;
     let (enc_key_path, dec_key_path) = otp_cli::contact_key_paths(cfg, contact_name);
     Some(ContactOtpDetail {
         enc_sequence: detail.enc_sequence,
@@ -174,7 +170,12 @@ pub async fn gather_contact_rows(
 /// `UiAction::OpenContacts`/`RefreshContacts`'s shared handler: re-gathers
 /// every row and hands it to the modal.
 pub async fn handle_open(session: &SessionState, ui_state: &mut UiState) {
-    let rows = gather_contact_rows(&session.id_store, &session.otp_cli_cfg, own_identity_of(session)).await;
+    let rows = gather_contact_rows(
+        &session.id_store,
+        &session.otp_cli_cfg,
+        own_identity_of(session),
+    )
+    .await;
     ui_state.set_contacts_rows(rows);
 }
 
@@ -210,10 +211,11 @@ pub async fn delete_contact(
 
 /// `UiAction::DeleteContact`'s handler.
 pub async fn handle_delete(session: &mut SessionState, ui_state: &mut UiState, nickname: String) {
-    let own_identity_owned = session.otp_own_pinned_der.clone();
+    let own_fp = session.own_pq_fp;
+    let own_der = session.otp_own_pinned_der.clone();
     let own_identity = OwnIdentity {
-        pq_fingerprint: session.own_pq_fp,
-        pinned_public_der: own_identity_owned.as_deref(),
+        pq_fingerprint: &own_fp,
+        pinned_public_der: &own_der,
     };
     let removed = delete_contact(
         &mut session.id_store,
@@ -258,11 +260,11 @@ fn validate_key_file(path: &Path) -> Result<(), String> {
 /// themselves, exactly the alternative the help overlay's OTP section
 /// already documents.
 ///
-/// Works for any contact, with or without a `pq_hybrid` identity: a pad
-/// installed here authenticates by itself, so no identity is needed to
-/// hold one (`client::otp::OtpFraming::Direct`). Both key files are stat'd
-/// before any subprocess runs, so a typo'd path fails here rather than
-/// somewhere inside `otp`.
+/// Works for any pinned contact, with or without a readable `pq_hybrid`
+/// bundle: a pad installed here authenticates by itself, so no identity is
+/// needed to hold one (`client::otp::OtpFraming::Direct`). Both key files
+/// are stat'd before any subprocess runs, so a typo'd path fails here
+/// rather than somewhere inside `otp`.
 pub async fn install_otp_key(
     id_store: &IdStore,
     otp_store: &mut OtpStore,
@@ -299,10 +301,11 @@ pub async fn handle_install_otp_key(
     enc_path: PathBuf,
     dec_path: PathBuf,
 ) {
-    let own_identity_owned = session.otp_own_pinned_der.clone();
+    let own_fp = session.own_pq_fp;
+    let own_der = session.otp_own_pinned_der.clone();
     let own_identity = OwnIdentity {
-        pq_fingerprint: session.own_pq_fp,
-        pinned_public_der: own_identity_owned.as_deref(),
+        pq_fingerprint: &own_fp,
+        pinned_public_der: &own_der,
     };
     let outcome = install_otp_key(
         &session.id_store,

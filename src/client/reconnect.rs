@@ -31,7 +31,7 @@ use tokio::sync::Mutex;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use crate::control::{ControlReader, ControlSink, ControlWriter};
-use crate::proto::{self, ClientMessage, KeyMode, ServerMessage, UserId};
+use crate::proto::{self, ClientMessage, ServerMessage, UserId};
 
 /// How long to wait before the second attempt (the first is immediate -
 /// most losses are a socket dropping under a still-working network, and
@@ -271,16 +271,16 @@ impl ControlSink for ServerSink {
 
 /// Everything a reconnect needs to redo the handshake as the same person.
 ///
-/// The identity is carried as its already-encoded public DER rather than
-/// re-resolved from `request.my_key`: `MyKeySelection::None` *generates* a
-/// keypair, so resolving again would hand the server a public key whose
-/// private half this session does not hold, and every message anyone
-/// encrypted to it would arrive undecryptable.
+/// The identity is carried as its already-encoded public bundle rather
+/// than re-resolved from `request.my_key`: resolving again would re-read
+/// the keybundle files mid-session (and generate them if they had since
+/// gone missing), risking handing the server a public key whose private
+/// half this session does not hold - every message anyone encrypted to it
+/// would then arrive undecryptable.
 #[derive(Debug, Clone)]
 pub struct ReconnectPlan {
     pub request: crate::client::connect::ConnectRequest,
     pub public_key_der: Vec<u8>,
-    pub key_mode: KeyMode,
     /// `Backoff::default()` everywhere but in tests.
     pub backoff: Backoff,
 }
@@ -351,12 +351,7 @@ async fn reconnect_loop(
         // `delay_after(0)` is zero, so the first attempt happens the
         // moment the connection is noticed gone.
         events_tx.send(ServerEvent::Attempting).ok()?;
-        match crate::client::connect::handshake_as(
-            &plan.request,
-            plan.public_key_der.clone(),
-            plan.key_mode,
-        )
-        .await
+        match crate::client::connect::handshake_as(&plan.request, plan.public_key_der.clone()).await
         {
             Ok((reader, writer, you, _server_addr)) => {
                 sink.install(writer).await;

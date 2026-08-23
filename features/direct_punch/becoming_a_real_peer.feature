@@ -6,21 +6,24 @@ Feature: A punched peer becomes someone I can actually see and talk to
   So that my channels, my focus and my push-to-talk work the same either way
 
   A punch on its own only opens a path. What turns that path into a person
-  is an envelope that opens under the key already pinned for their
-  nickname: that proves who they are, and it carries the channels they are
-  in, so both sides can place each other in the channels they share. Until
-  that arrives nobody is registered - the nickname on a punch datagram is
-  unauthenticated and names nobody. See docs/PROTOCOL.md 7.1.5.
+  is something that authenticates them: an envelope that opens under the
+  key already pinned for their nickname - which also carries the channels
+  they are in, so both sides can place each other in the channels they
+  share - or, for a pair who hold a one-time pad and no keybundles, the pad
+  opening a message they sent. Until one of those arrives nobody is
+  registered: the nickname on a punch datagram is unauthenticated and names
+  nobody. See docs/PROTOCOL.md 7.1.5.
 
   @AC-215
   Scenario: An unauthenticated punch does not make anyone a peer
     Given alice has no pinned identity for "mallory"
     Then "mallory" cannot become an addressable peer
 
-  @AC-215
-  Scenario: A pinned identity that cannot sign is refused
+  @AC-215 @AC-259
+  Scenario: A pin that is not a keybundle still names someone, for the pad to prove
     Given alice has a pinned identity for "bob" that is not a pq_hybrid one
-    Then "bob" cannot become an addressable peer
+    Then "bob" is named by that pin, but nothing is sealed to it
+    And only a pad can prove "bob" is who the pin says
 
   @AC-214
   Scenario: A punched peer joins the channels we both are in

@@ -2,7 +2,7 @@
 
 - language: rust
 - ui framework: ratatui
-- other packages: crossterm, tokio, serde + bincode (v2 — the crates.io `bincode 3.0.0` is a squatted placeholder, not a real release), rsa, rand_core + rand_chacha (RSA key generation needs `rand_core` 0.6's `CryptoRngCore`; deterministic password-derived keys use `rand_chacha`), sha2 (pinned to 0.10 to match `rsa`'s `digest` version), pbkdf2 + hmac, cpal (raw PCM, no opus), clap (CLI parsing), thiserror (error types), sysinfo (cross-platform CPU usage for the header's `CPU:<pct>%` indicator)
+- other packages: crossterm, tokio, serde + bincode (v2 — the crates.io `bincode 3.0.0` is a squatted placeholder, not a real release), rsa, rand_core (RSA key generation needs `rand_core` 0.6's `CryptoRngCore`), sha2 (pinned to 0.10 to match `rsa`'s `digest` version), cpal (raw PCM, no opus), clap (CLI parsing), thiserror (error types), sysinfo (cross-platform CPU usage for the header's `CPU:<pct>%` indicator)
 
 This application is a terminal communication tool that supports text / voice channels.
 The `main.rs` file acts as the CLI entry point. When run without parameters, it runs the client (with terminal UI).
@@ -35,7 +35,6 @@ src/client/session.rs       <-- the live connected session: event loop, session 
 src/client/channel.rs        <-- channel-addressed send/receive handling for the session
 src/client/direct_message.rs  <-- DM-addressed send/receive handling for the session
 src/client/envelope.rs         <-- builds outgoing proto::Envelopes (session-state-free crypto+proto glue)
-src/client/keymode_policy.rs    <-- client-side KeyMode policy predicates (addressability, identity pinning)
 src/client/voice_stream.rs       <-- live voice streaming plumbing shared by channels and DMs
 src/client/voice_call.rs          <-- live, continuous, multi-user voice calls: roster convergence, the capture/decrypt workers, Functionality #14
 src/client/file_transfer.rs       <-- consent-gated, streamed file transfer: FileOfferPayload shape, chunking/filename constants, download dir, send/receive workers, Functionality #9
@@ -108,16 +107,14 @@ A modal is shown, 64 columns wide - clamped to the terminal's own width if it's 
   - if `rsa`: a file field, selected via the in-TUI file browser
   - if `password`: a text input field for the password
   - if `none`: no additional field
-- **my_key** (2 fields wrapped in a border) — this key is used to decrypt messages addressed to the user
-  - type: `password` / `none` / `pq_hybrid` (defaults to `pq_hybrid` — this app's strongest identity, quantum-resistant and hedged with classical RSA-4096. Its `file_pub`/`file_priv` fields never start blank: they're prefilled - from `~/.aloo/.cache`'s most-recently-used entry if one exists (`docs/PROTOCOL.md` §13.9's connect-popup cache), or otherwise a freshly-assigned, not-yet-generated location under `~/.aloo/` - and connecting auto-generates the actual keys there if they don't exist yet, so this default never blocks on manual preparation either — see Functionality #10)
-  - if `password`: a text input field for the password
-  - if `none`: no additional field
-  - if `pq_hybrid`: `file_pub` and `file_priv` fields, pointing at a keybundle (prefilled/auto-generated as above, or overridable by hand, including pointing at one `aloo --keygen-pq-hybrid <prefix>` produced externally - there's no `openssl`-equivalent for ML-DSA-87/ML-KEM-1024, but running it yourself is no longer required). See Functionality #10 and `docs/PROTOCOL.md` §13, §13.9.
+- **my_key** (2 fields wrapped in a border, titled `my_key (pq_hybrid)`) — this key is used to decrypt messages addressed to the user. There is no type to choose: `pq_hybrid` is the only peer-to-peer scheme this app has (quantum-resistant, hedged with classical RSA-4096), so the group's title names it and the two fields under it are the keybundle itself.
+  - `file_pub` and `file_priv`, pointing at a keybundle. They never start blank: they're prefilled — from `~/.aloo/.cache`'s most-recently-used entry if one exists (`docs/PROTOCOL.md` §13.9's connect-popup cache), or otherwise a freshly-assigned, not-yet-generated location under `~/.aloo/` — and connecting auto-generates the actual keys there if they don't exist yet, so this never blocks on manual preparation. Overridable by hand, including pointing at one `aloo --keygen-pq-hybrid <prefix>` produced externally — there's no `openssl`-equivalent for ML-DSA-87/ML-KEM-1024, but running it yourself is not required. See Functionality #10 and `docs/PROTOCOL.md` §13, §13.9.
+- **ALOO_HOME** — a read-only line directly above the Connect button, reading `ALOO_HOME=<path>`, drawn in gray so it reads as a note rather than another field to fill in. It names the directory this client actually resolved (`platform::aloo_dir`), which every piece of local state lives under — `id_store`, the connect cache, `settings`, and the OTP layer's `otp_store`/`otp/.keychain/`. It is spelled as the environment variable that sets it, so the line doubles as the answer to "how do I run a second client on this machine": `ALOO_HOME=/tmp/aloo-bob aloo`. Captured once when the popup opens, so rendering stays a pure function of the popup's own state.
 - **Connect button** — a bordered button below the fields, highlighted when focused. The highlight (solid background) fills only the button's interior; its border keeps its own plain/focus style rather than being swallowed into the highlighted fill, consistent with every other bordered/focusable element in this app. Tab cycles through every field in order and wraps around to this button; pressing Enter while it's focused validates the form and, if valid, connects. Pressing Enter on it with an invalid/incomplete form shows a validation error below instead (e.g. "host is required", "nickname is required").
 
-Every focused text field (host/port/nickname, and a `password`-type `server_key`/`my_key` value) shows a blinking cursor at the end of its current value, not just a reversed-color highlight.
+Every focused text field (host/port/nickname/id_store, and a `password`-type `server_key` value) shows a blinking cursor at the end of its current value, not just a reversed-color highlight.
 
-The `my_key` type controls how the user's own key material is sourced/protected locally. Every type but `pq_hybrid` uses an RSA keypair for actual channel/DM encryption — the public-key exchange that happens on joining a channel (see below) always applies; `pq_hybrid` instead uses the hybrid scheme in Functionality #10, including its own ongoing key-rotation behavior for the rest of the session.
+`my_key` is the user's own key material, loaded from the keybundle pair the two fields name. It uses the hybrid scheme in Functionality #10, including its own ongoing key-rotation behavior for the rest of the session.
 
 **File browser**: a custom in-TUI widget (not an OS dialog) that supports back/forward navigation through directories and file selection. Reused as-is for the `/file` send flow's own browser (`docs/SPEC.md` Functionality below). The visible list scrolls to keep the selected entry on screen, so a directory with more entries than fit in the popup's height can still be navigated all the way to its last entry with Up/Down, not just the ones that happen to fit on first open.
 
@@ -147,16 +144,14 @@ The private-message room (Functionality #3) titles itself the same way: `Private
 
 **OTP session header.** While a mutual-consent OTP session (`docs/PROTOCOL.md` §16) is active with a private room's peer, a 1-line header renders above that room's message log: `OTP SESSION with <nickname> - Receive Key (dec): <Seq> <Offset> <remaining>MB - Send Key (enc): <Seq> <Offset> <remaining>MB`. `OTP SESSION` is highlighted, `<nickname>` is yellow, each direction's `Seq`/`Offset` are grey, and `remaining` is green at or above 0.5MB, red below it. The figures come from the real `otp` command (`otp --show-contact`) and stay live: fetched once immediately when the session starts, again the instant this contact's pad is actually spent by a genuine send or receive in either direction, and roughly once a second besides as a safety net for as long as that room stays open (`docs/PROTOCOL.md` §16.5).
 
-**Encryption tag convention** (`aloo::proto::KeyMode::label`/`format_with_name`) — one of three, based on the `my_key` type that user connected with (see Functionality #10 for `pq_hybrid`'s wire implications):
+**Encryption tag convention** (`aloo::proto::KeyMode::label`/`format_with_name`) — one of two, since `pq_hybrid` is the only `my_key` this app has (see Functionality #10 for its wire implications):
 
 | `my_key` type | Tag | Position |
 | --- | --- | --- |
-| `password` | `🚨 PWD` | after the name: `name 🚨 PWD` |
-| `none` | `🚨 PLAIN` | after the name: `name 🚨 PLAIN` |
 | `pq_hybrid` | `🛡️ PQH` | after the name: `name 🛡️ PQH` |
-| *(any, while a one-time-pad session is open with that person)* | `🔑 OTP` | after the name: `name 🔑 OTP` |
+| *(while a one-time-pad session is open with that person)* | `🔑 OTP` | after the name: `name 🔑 OTP` |
 
-**`🔑 OTP` replaces, rather than joins, the tag above it.** While a pad session is open with someone (`/otp`, Functionality #15), the pad is what actually protects everything said to them — there is no way to send them a plain, non-pad-wrapped message in the meantime (`docs/PROTOCOL.md` §16.2) — so their row says so instead of naming the layer underneath. That layer is always `pq_hybrid`, since a pad only ever runs over one, so the tag being displaced is always the same one. It is drawn in the same cyan the room's own OTP session header uses.
+**`🔑 OTP` replaces, rather than joins, the tag above it.** While a pad session is open with someone (`/otp`, Functionality #15), the pad is what actually protects everything said to them — there is no way to send them a plain, non-pad-wrapped message in the meantime (`docs/PROTOCOL.md` §16.2) — so their row says so instead of naming the layer underneath. Whichever layer that is — a `pq_hybrid` envelope for the usual pairing, or nothing at all for a pad-only pair (`docs/PROTOCOL.md` §16.2) — the tag it displaces is `🛡️ PQH` either way, since that is the only `my_key` tag there is. It is drawn in the same cyan the room's own OTP session header uses.
 
 🔑 is the **one** glyph a pad session is ever marked with, and deliberately **not** the 🛡️ shield `pq_hybrid` already carries: the pad runs *over* pq_hybrid, so sharing a glyph would make the marker for the extra layer and the marker for the layer under it the same character, in the very places whose job is telling them apart. It appears:
 
@@ -165,7 +160,7 @@ The private-message room (Functionality #3) titles itself the same way: `Private
 
 The app's own narration lines and presence notices never carry it: it marks content, not the app talking about the session.
 
-Every tag is unbracketed and trails the name, reading as an annotation on it - one shared convention across all three `my_key` types. 🚨 flags the two less-durable sourcings (`password`-derived, `none`/auto-generated) that don't carry an identity across separate connections; 🛡️ is `pq_hybrid`'s own icon — a file-backed, durable *identity*, marked as the strongest tier: quantum-resistant signing hedged with RSA-4096, and quantum-resistant key exchange hedged with X25519 whose keys rotate per peer as messages are exchanged, so a stolen keybundle does not open past traffic (`docs/PROTOCOL.md` §13, §13.10). Every tag still means real per-recipient encryption (Functionality #1, #10); the icon is about identity durability, not "unencrypted".
+Both tags are unbracketed and trail the name, reading as an annotation on it. 🛡️ is `pq_hybrid`'s own icon — a file-backed, durable *identity*: quantum-resistant signing hedged with RSA-4096, and quantum-resistant key exchange hedged with X25519 whose keys rotate per peer as messages are exchanged, so a stolen keybundle does not open past traffic (`docs/PROTOCOL.md` §13, §13.10).
 
 **Delivery acknowledgments** (Functionality #20, `docs/PROTOCOL.md` §7.2.1). A message the user sent — text, voice or a file transfer alike — reads `<nickname> -> <body>` rather than the `<nickname>: <body>` everything else uses, and that arrow is the indicator: it is drawn bold, in gray while no recipient has confirmed decrypting the message, orange while some of a channel's recipients have, and green once all of them have. A private room has one recipient, so its arrow is only ever gray or green. A message that was addressed to nobody at all keeps its gray arrow and is additionally **struck through**, drawn by following every character of the row with U+0336 COMBINING LONG STROKE OVERLAY (a terminal has no styling for this that can be relied on). Nothing incoming carries an arrow, nor do the app's own system/presence lines — those keep the plain `:` separator, since an incoming message needed no acknowledging. Where the OTP 🔑 prefix also applies (`docs/PROTOCOL.md` §16) it stays where it always was, at the very start of the row and never struck through.
 
@@ -190,13 +185,13 @@ A text message never reaches a `+` state, having nothing further to do with it, 
 
 | Line | Value |
 | --- | --- |
-| `encryption` | the scheme by its mechanism — `RSA-4096 OAEP/SHA-256` for the `password`/`none` sourcings, `ML-KEM-1024 + RSA-4096 -> AES-256-GCM, ML-DSA-87 signed` for `pq_hybrid`, `one-time pad (XOR) over the pq_hybrid envelope` under an OTP session (`docs/PROTOCOL.md` §8.3, §13, §16) |
+| `encryption` | the scheme by its mechanism — `ML-KEM-1024 + RSA-4096 -> AES-256-GCM, ML-DSA-87 signed` for an ordinary send; under an OTP session, `one-time pad (XOR) inside the pq_hybrid envelope` when there is an envelope sealed around the pad, or `one-time pad (XOR), carrying the message directly` when there is not (§16.2's two framings — the popup names the one *this* message used, never assuming) (`docs/PROTOCOL.md` §13, §16) |
 | `key` | *(not under OTP)* a short fingerprint of the public key it was sealed to — the first 16 hex characters of its SHA-256, the same short form an identity-mismatch warning uses. A channel send is sealed once per member with that member's own key, so it reads `one per recipient` instead |
 | `key_seq` | *(OTP only)* which sequence of the pad this message is |
 | `key_offset` | *(OTP only)* the pad offset its key bytes start at |
 | `key_file` | *(OTP only)* the key file they came out of — `<contact>_enc.key` for a message sent, `<contact>_dec.key` for one received |
 
-The scheme is named by its cipher rather than by the `my_key` tag the sidebar shows: `🚨 PWD` and `🚨 PLAIN` say nothing about how a message was encrypted (both are RSA-OAEP — they differ in where the keypair came from). The OTP figures are the pad's position *before* this message spent its own key, recorded on the row when it is logged: the pad walks forward with every message, so the live figures in the session header describe some later message by the time anyone presses `i`. A line this client wrote itself — a presence notice, the app's own narration of an OTP handshake — never travelled, and reads `encryption  not an encrypted message`.
+The scheme is named by its cipher rather than by the `my_key` tag the sidebar shows, which is about identity rather than about how a message was encrypted. The OTP figures are the pad's position *before* this message spent its own key, recorded on the row when it is logged: the pad walks forward with every message, so the live figures in the session header describe some later message by the time anyone presses `i`. A line this client wrote itself — a presence notice, the app's own narration of an OTP handshake — never travelled, and reads `encryption  not an encrypted message`.
 
 **A popup replaces what is behind it.** Every popup in the connected UI — the identity review, a file offer, a call invite, the OTP prompts, the join/password/`/channels` modals, the file browser, the message details, the help overlay — owns the cells inside its own border: the view underneath is cleared there rather than composited through, so a busy message log never shows between a popup's words. Only the two non-modal banners are exempt, being banners rather than popups: the permanent call indicator and the status notice.
 
@@ -244,7 +239,7 @@ When a channel is joined, the join is broadcast to all users already in the chan
    - **Release detection** works on any terminal. At startup the client queries whether the terminal actually supports the Kitty keyboard protocol's release reporting (`crossterm::terminal::supports_keyboard_enhancement`, not just whether enabling it succeeded — a terminal can accept the escape sequence without honoring it). If it does, stopping relies solely on that genuine `Release` event: recording continues through any pause or silence for as long as Space is physically held, and only stops when it's actually released. If it doesn't, there is no way to observe a release directly, so the app falls back to watching for the OS's keyboard auto-repeat (a steady stream of `Press` events roughly every 30-50ms once repeating, after an initial OS repeat-delay commonly in the 500-650ms range) and treats ~900ms of silence since the last one as "released" — an approximation, used only when nothing better is available. Both stopping mechanisms are no-ops when nothing is actually being recorded: a `Release` event with no matching prior `Press` (e.g. one delivered right as a channel switch or DM close ends a recording some other way) does nothing, and so does the idle-timeout check firing with no recording in progress.
    - **Length cap.** A recording that reaches `voice::MAX_RECORDING_SECS` (4 minutes) stops itself automatically — the indicator clears and the end-of-message chime plays, exactly as if Space had just been released, whether or not it's still actually held. This is a client-side courtesy limit on the *sending* side; the receiving side independently enforces the identical cap regardless of what the sender did (`docs/PROTOCOL.md` §7.3) — an incoming stream is force-finalized with whatever arrived once it reaches 4 minutes of audio, so a modified or misbehaving peer can never make a receiver accept, or keep decrypting, a longer one.
    - **Failure handling.** If starting the recorder fails (e.g. no microphone), or if Space is pressed with nowhere to address the stream to (not joined to any channel, no active DM), the indicator clears immediately (or never starts) rather than continuing to claim a recording is happening. The failure reason is tracked internally but deliberately not rendered on screen - this kind of environment tends to surface plenty of transient, self-recovering audio errors (buffer under/overruns, PulseAudio status-query hiccups) that aren't worth interrupting the display for.
-   - **Encryption and cost.** Each chunk is encrypted the same way as text (per-recipient RSA, chunked into RSA-OAEP blocks) - live streaming multiplies the message rate, not the total RSA work per second of audio, which is purely a function of bytes-of-audio regardless of chunking.
+   - **Encryption and cost.** Each chunk is sealed under the stream's already-established key (AES-256-GCM, no asymmetric crypto per chunk) - live streaming multiplies the message rate, not the per-second crypto cost, which is purely a function of bytes-of-audio regardless of chunking.
    - **Jitter and mixing.** On the receiving end, a jitter buffer (a small per-source prebuffer before playback starts) absorbs ordinary arrival jitter between chunks so normal network/CPU timing variance doesn't produce audible gaps; multiple simultaneous incoming streams (two people talking near-simultaneously) are mixed together rather than queued one behind another.
    - **End-of-message chime.** A short "message ended" sound (`assets/end.wav`) plays through the same mixer both when the sender releases Space and when an incoming stream finishes, so both ends of a voice message get the same audible cue. Bundled as WAV rather than the project's original `assets/end.mp3` so it can be decoded (`voice::decode_wav_to_mono`) without an MP3 crate dependency - a WAV's PCM payload is read directly.
    - **Device handling.** Multi-channel input (an input device negotiating stereo-or-more, common even for a physically mono mic) is downmixed to a single mono sample per moment in time as it's captured, before anything else touches it. On Linux, capture/playback prefers a device routed through PulseAudio over whatever the raw ALSA host reports as default, when one is available - the plain ALSA host normally requires each process to have exclusive access to a device, which would otherwise make it impossible for two `aloo` clients on the same machine (the normal way to test a channel/DM locally) to both use the mic/speaker at once.
@@ -255,7 +250,7 @@ When a channel is joined, the join is broadcast to all users already in the chan
 6. **In-app help, toggled with Ctrl+H** (Escape closes it too). Works from any view or mode — the channel view, an open private room, mid-recording, even with the join-private-channel popup already open — and takes priority over everything else, since it's checked before any other key handling. A hint (`Ctrl+H: Help`) is shown at the top right of the screen, past the end of the two selectors, as a reminder that it's always available. The overlay takes the whole frame — full width, from the row above the header down through the compose bar: it is a page to read, several screens long on a small terminal, and every column it does not take is a column its key table has to wrap in. Arrows/PageUp/PageDown scroll it.
 
     It is laid out in two columns. The first is reserved for keys and commands and is as wide as the longest one in the whole page, so every description in it starts in the same place. The second holds the descriptions, wrapped to whatever width the terminal leaves — and a description too long for one line continues in that same column rather than under the keys, so the page reads as two aligned columns at any width. Prose that belongs to a section rather than to one key sits in the description column too. Section headings are yellow, keys keep the bright default colour, descriptions are gray.
-   - Pressing it opens a centered popup covering how to join a hidden (private) channel, how to send a voice message, how to send/receive a file (Functionality #9), what each of the three encryption tags means, and a general keybinding reference — everything in this document's Functionality section, condensed.
+   - Pressing it opens a centered popup covering how to join a hidden (private) channel, how to send a voice message, how to send/receive a file (Functionality #9), what each of the two encryption tags means, and a general keybinding reference — everything in this document's Functionality section, condensed.
    - The popup's content is taller than fits most terminal windows, so it scrolls: `Up`/`Down` move one line, `PageUp`/`PageDown` jump by `HELP_SCROLL_PAGE` lines, and `Home`/`End` jump straight to the top/bottom — clamped so it can't scroll past either end. It always reopens scrolled to the top, never wherever it was left last time.
    - While the popup is open, every other key is absorbed (no typing leaks into the compose bar, no navigation happens underneath) except Ctrl+H itself, which closes it again and returns to exactly whatever was showing before, and the scroll keys above. Esc does not close it — only Ctrl+H does, since Esc already means something else (close the current private room) when help isn't open, and the popup deliberately doesn't try to disambiguate the two.
 
@@ -270,7 +265,7 @@ When a channel is joined, the join is broadcast to all users already in the chan
 
 8. **Identity pinning (`id_store`): deciding whether to trust a nickname that reconnects under a different key.** Full model in `docs/PROTOCOL.md` §12; from the user's point of view:
    - The client keeps a small local file — set via the connect popup's `id_store` field — that remembers each nickname's **full public key** (hex-encoded, not just a hash of it) from the last time it was seen, for the `password` and `pq_hybrid` `my_key` types. Storing the whole key (not a fingerprint) means a pinned entry can be verified against an actual key file, not just trusted as "some hash matched" — a fingerprint is still computed on the fly for display in the review popup below.
-   - `password`/`pq_hybrid` are checked by simple comparison — that key is never supposed to change, so any difference at all is the signal. Only `none` is entirely untracked — that key is freshly autogenerated every session with no continuity mechanism at all, nothing to verify against.
+   - A pinned key is checked by simple comparison — a `pq_hybrid` identity is loaded from a file and never supposed to change, so any difference at all is the signal. A peer announcing bytes that do not decode as a keybundle has no identity to pin, and is left untracked.
    - The first time a nickname is ever seen, or when it's seen again with the same (or provably continuing) key as before, nothing happens — this is invisible in normal use. A first sighting is still saved to disk immediately, so it's pinned for the next reconnect too.
    - If a nickname with a pinned key reconnects with a **different** key — a byte change (`docs/PROTOCOL.md` §12.4) — messaging with them is gated immediately, and the **identity review popup** (see "Connected UI" above) opens as soon as this connection's own address/device id are known (below), naming the user and a short fingerprint of both the old and the new key. This can mean the person genuinely regenerated their key, or that someone else is now using that nickname — the app doesn't decide which; it puts the decision to the user via **Accept** or **Reject**, rather than guessing.
    - **Accept** trusts the new key from that point on: it's saved to disk immediately — synchronously, in real time, not batched or deferred — and any of that peer's channel/DM messages that arrived while the review was unresolved (held rather than shown, see below) are revealed into the log, in the order they arrived. **Reject** writes nothing to disk at all — the previous pin, if any, is left exactly as it was — and is never a permanent block: selecting that peer again (Enter on their sidebar entry) reopens the same popup for reconsideration, rather than staying silently stuck.
@@ -280,7 +275,7 @@ When a channel is joined, the join is broadcast to all users already in the chan
 
 9. **Send a file to a channel or a user, with the recipient's consent.** Type `/file` in the compose bar and press Enter (must be joined to a channel, or have a non-offline, verified DM room open — otherwise this does nothing and the typed `/file` stays put, same as Space with nowhere to record voice to). A popup file browser opens, centered on screen — the same in-TUI widget (`Up`/`Down` select, `Enter` open a directory or pick a file, `Left`/`Right` back/forward, `Esc` cancel) the connect popup's `rsa` server_key field already uses.
     - **Confirmation.** Selecting a file (Enter on it, not a directory) replaces the browser with a confirmation box: `Send "<filename>" to #<channel>?` or `Send "<filename>" to <username>?`, with two buttons, **Send file** and **Discard** — `Discard` focused by default, same reasoning as the identity review popup's `Reject`-first default (Functionality #8): sending should never be one accidental Enter away. `Left`/`Right`/`Tab` move focus, `Enter` confirms. Choosing **Discard** returns to the file browser at the same directory (not all the way back to the compose bar); pressing `Esc` on the confirmation box does the same. `Esc` on the browser itself cancels the whole `/file` flow. Filenames longer than 230 characters are cropped at the end before being offered (`docs/PROTOCOL.md`'s file transfer section) — the receiving client independently crops again on whatever it actually receives.
-    - **Offering.** Choosing **Send file** sends an *offer* — filename and size, encrypted exactly like a text message (RSA-OAEP per recipient, split into blocks the same way, `docs/PROTOCOL.md` §8.1) — to every ready recipient; nothing is read from disk yet. There is no size cap: since the file itself is streamed in small chunks only once accepted (below), the old whole-file-in-one-message limit no longer applies. A channel send is one independent offer per member — one recipient accepting doesn't wait on, or get affected by, another rejecting — but **one row** in your log for the whole send, the same shape a channel voice message has: the recipients are named individually in its details popup (`i`), not as a line each. That row aggregates all of them: while any transfer is still going it shows the least advanced of them (the file is not sent until it is sent to everyone), and once none are left it reads completed if any recipient took it, rejected if they all declined, and failed otherwise.
+    - **Offering.** Choosing **Send file** sends an *offer* — filename and size, encrypted exactly like a text message (sealed per recipient, `docs/PROTOCOL.md` §13.3) — to every ready recipient; nothing is read from disk yet. There is no size cap: since the file itself is streamed in small chunks only once accepted (below), the old whole-file-in-one-message limit no longer applies. A channel send is one independent offer per member — one recipient accepting doesn't wait on, or get affected by, another rejecting — but **one row** in your log for the whole send, the same shape a channel voice message has: the recipients are named individually in its details popup (`i`), not as a line each. That row aggregates all of them: while any transfer is still going it shows the least advanced of them (the file is not sent until it is sent to everyone), and once none are left it reads completed if any recipient took it, rejected if they all declined, and failed otherwise.
     - **The recipient's popup.** Before any file bytes arrive, the receiving side sees a centered popup — accompanied by a chime (`assets/bell.wav`) — reading `<nickname> is sending "<filename>" (<size>) via #<channel>` (or "via a private message" for a DM). Two buttons, **Accept** and **Reject** — **Accept focused by default**, the opposite of this app's usual safety-first default (Functionality #8's identity review, this flow's own Discard-first confirmation above): accepting an incoming file is the common case here, so it shouldn't cost an extra keystroke. `Left`/`Right`/`Tab` move focus, `Enter` confirms. Several offers arriving close together queue and show one at a time, same as identity reviews.
     - **Appearance and progress.** Both sides render the message as a paperclip and the filename, e.g. `📎 report.pdf`, in the channel/DM log — a channel send's per-recipient rows also name who each is addressed to. Before a decision, the sender's row reads "(waiting for accept...)"; once **Accept**ed, the file streams in small chunks straight to `~/.aloo/downloads` (never held whole in memory on either side) and both sides' rows show a live progress bar and percentage until every byte has moved, at which point the row settles back to the plain paperclip-and-filename look. Choosing **Reject** ends it there — the sender's row shows "(rejected)" instead, so declining a file is as visible to them as accepting one.
     - **Trust gating and offline peers** work exactly like text (Functionality #7/#8): an offer from a `Pending`/`Rejected` sender is decrypted but held — no popup, no chime — until they're `Accept`ed, at which point it's queued for real; a gated or offline channel member is simply not offered the file at all, same as text/voice; an offline or gated DM peer's room can't receive one at all (same gate that already blocks `/file` from starting in the first place).
@@ -288,9 +283,9 @@ When a channel is joined, the join is broadcast to all users already in the chan
 10. **`pq_hybrid`: a post-quantum hybrid encryption method** — ML-DSA-87+RSA4096 signing, ML-KEM-1024+RSA4096 key-wrap, AES-256-GCM bulk encryption. Full model in `docs/PROTOCOL.md` §13; from the user's point of view:
     - Selected as the `my_key` type in the connect popup - and selected by default. Unlike every other type, its keys aren't generated fresh in-process at connect time; they live in a keybundle file pair (`file_pub`/`file_priv`). You don't have to prepare that pair yourself: the popup prefills the fields (from `~/.aloo/.cache`'s most-recently-used entry for a server you've connected to before, or otherwise a freshly-assigned location under `~/.aloo/`), and connecting transparently generates the actual keys at that location the first time it's used, if they don't already exist (`docs/PROTOCOL.md` §13.9). `aloo --keygen-pq-hybrid <prefix>` (writes `<prefix>` and `<prefix>.pub`) is still there if you want to generate one yourself - e.g. to point both files at a specific, memorable location, or to produce one to move to another machine - but it's optional now, not required.
     - **The connect popup remembers your `pq_hybrid` identity per server.** After connecting (attempted or not - whichever files were used to try), `~/.aloo/.cache` records that `(host, port)`'s `file_pub`/`file_priv`. Reopening the app, or returning to the same server later in one session, prefills the exact same identity automatically - a different server you haven't used before still gets its own freshly-assigned location the first time.
-    - Text, file, and voice messages are all signed with **both** ML-DSA-87 and RSA-4096 before being encrypted — a receiver only accepts a message if **both** signatures check out, so a break in either primitive alone isn't enough to forge one. The bulk data is AES-256-GCM-encrypted once per send (not re-encrypted per recipient the way `password`/`none` are), and that one-time key is separately wrapped for each recipient by combining an ML-KEM-1024 exchange with a second, independent RSA-4096 encryption — recovering it needs breaking both, not just one.
+    - Text, file, and voice messages are all signed with **both** ML-DSA-87 and RSA-4096 before being encrypted — a receiver only accepts a message if **both** signatures check out, so a break in either primitive alone isn't enough to forge one. The bulk data is AES-256-GCM-encrypted once per send, and that one-time key is separately wrapped for each recipient by combining an ML-KEM-1024 exchange with a second, independent RSA-4096 encryption — recovering it needs breaking both, not just one.
     - Its own encryption keys rotate every message, per peer relationship - a fresh ML-KEM-1024+X25519 pair each time, cheap enough to run inline with no visible delay. A message typed for a peer before their next fresh key arrives isn't dropped - it's held and sent automatically the moment that key shows up, in the order it was typed. See `docs/PROTOCOL.md` §13.10.
-    - **Only another `pq_hybrid` user can send to a `pq_hybrid` user.** Producing a valid message to a `pq_hybrid` recipient needs the *sender's* own ML-DSA-87/RSA-sign identity, which no other `my_key` type has — a channel member using `password`/`none` simply can't reach a `pq_hybrid` peer, the same silent exclusion as any other unreachable recipient (an offline member). A `pq_hybrid` user can still message everyone else normally.
+    - **Sealing a send needs a readable keybundle on both sides.** Producing a valid message needs the *sender's* own ML-DSA-87/RSA-sign identity and the recipient's announced bundle. Every client has both, so every peer reached through a server is addressable. A peer who announced no readable bundle is reachable only under an already-installed one-time pad (`docs/PROTOCOL.md` §16.2's `Direct` framing) and is otherwise silently excluded, the same as any other unreachable recipient (an offline member).
     - Voice messages work the same way as text — the expensive signing/key-exchange work happens once per recording, not per 15ms chunk, so holding Space to talk feels identical to any other method.
     - Its identity is static (loaded from the keybundle file, not regenerated every session) and file-backed, so it's pinned in `id_store` exactly like `password` (Functionality #8) — a `pq_hybrid` nickname reconnecting under a different keybundle triggers the same identity review popup a changed `password` key would.
 
@@ -349,7 +344,8 @@ When a channel is joined, the join is broadcast to all users already in the chan
     - **A line with a typo says so** at startup, naming the line and the reason, and never costs the lines around it - a mistyped frequency must not look like a peer who simply never answers.
     - **An attempt lasts 30 seconds**, and a slot arriving for someone already connected does nothing at all. If a connected link drops and there is no server that could re-establish it, it is re-punched straight away, up to 5 times, before going back to waiting for its next slot.
     - **There is never more than one connection to the same person**, whether it was opened directly or through a server.
-    - **They show up as a real person, not just a connection.** Once a punched link opens, each side sends the other a sealed note saying which channels it is in. Opening that note is what proves who they are — it is checked against the key already pinned for that nickname — so a punch alone registers nobody, and someone able to reach your port cannot claim to be a friend. It needs a pinned `pq_hybrid` identity: someone you have never talked to through a server has no key you could encrypt to, so they stay a bare connection.
+    - **They show up as a real person, not just a connection.** Once a punched link opens, each side sends the other a sealed note saying which channels it is in. Opening that note is what proves who they are — it is checked against the key already pinned for that nickname — so a punch alone registers nobody, and someone able to reach your port cannot claim to be a friend. That note needs a pinned `pq_hybrid` identity to be sealed to.
+    - **Or a shared pad proves it instead.** Two people who hold a one-time pad for each other but have never exchanged `pq_hybrid` identities have no note to send — and are exactly who this is for. The pad stands in: a link opening to someone you hold a pad for registers them straight away, with the session already on (there is nothing to negotiate — you both already hold the key — so `/otp` opens no round trip and your first message rides the pad). Coming the other way, a pad-wrapped message from someone nobody introduced is opened first and registers them only if `otp` genuinely decrypts it, which it does only for the holder of the matching key at the expected position. Their nickname comes from your own settings and their key from your own pin — never from anything they claim — so this registers people, it never renames them.
     - **They appear in the channels you both are in**, and behave exactly like anyone else there: listed in the sidebar, reachable by a channel message, by voice, by push-to-talk, and by a call. That is what makes this work in background mode — with the app in the background and the focus on a channel you both joined, `Ctrl+Alt+P` reaches them, and their voice plays on your side, with no server involved at either end. Attach a terminal later and they are simply there in the sidebar. Focused on their nickname instead, the same applies to your DM.
     - **What they tell you is the whole truth**, not an addition: a channel missing from their note means they have left it. Channels you have not joined yourself are ignored. Sharing no channel at all still leaves them reachable as a DM.
     - **Leaving a channel does not disconnect them.** The link came from your settings and the schedule, not from the channel, so only those end it.
@@ -849,11 +845,20 @@ optionally with nobody sitting at either terminal.
 
 ### What has to be true first
 
-**You must have met through a server at least once.** That is where each
-of you got the other's `pq_hybrid` key, and a pinned key is the only thing
-that will make either client believe a nickname later (§7.1.5 step 7). It
-is a one-time cost: after it, the server is never needed again for the two
-of you.
+**Each of you must have something pinned for the other.** A pinned key is
+the only thing that will make either client believe a nickname later
+(§7.1.5 step 7). There are two ways to get one, and either is enough:
+
+- **You met through a server once.** That is where each of you got the
+  other's `pq_hybrid` key. A one-time cost: after it, the server is never
+  needed again for the two of you.
+- **Or you exchanged a one-time pad out of band and installed it
+  yourselves** (`/contacts`, `o`), with no server ever involved. Then the
+  pad is what proves who is who: a link opening to someone you hold a pad
+  for registers them, and a pad-wrapped message that `otp` genuinely
+  decrypts registers the sender. Every message between you rides the pad
+  from the first one - there is no `pq_hybrid` envelope underneath, and
+  none is needed.
 
 **Both of you must name the other.** A `direct_punch_to` line is half of a
 handshake, not a permission: a probe is answered only for a nickname the
@@ -1109,9 +1114,8 @@ here that implements it. If a name changes on one side, it changes on both.
 | `ChannelPresence`, becoming an addressable peer (§7.1.5) | `proto.rs` `Content::ChannelPresence`; `p2p_proto.rs` `P2pPayload::ChannelPresence`; `client/session.rs` `direct_peer_identity`, `reconcile_direct_membership`, `on_channel_presence`, `send_channel_presence`, `broadcast_channel_presence`; `client/tui/channel.rs` `channels_containing_member`, `is_member_of_channel` |
 | Reliable layer (§7.1.1) | `client/p2p_reliable.rs` `ArqSender`, `ArqReceiver` |
 | `P2pPayload` variants (§7.2/§7.3/§7.6/§7.7) | `p2p_proto.rs` `P2pPayload` |
-| Per-recipient OAEP, chunking (§8/§8.1) | `crypto/mod.rs` `encrypt_chunked`, `decrypt_chunked`, `max_chunk_len` |
-| Password-derived keys (§8.3) | `crypto/mod.rs` `KeyPair::from_password` |
-| RSA-PSS signing (§8.4) | `crypto/mod.rs` `sign`, `verify` |
+| RSA-OAEP chunking, for the server auth challenge only (§8.1) | `crypto/mod.rs` `encrypt_chunked`, `decrypt_chunked`, `max_chunk_len` |
+| RSA-PSS signing (§8.2) | `crypto/mod.rs` `sign`, `verify` |
 | Rotating-key freshness/queueing (§11) | `client/rekey.rs` `RemoteKeys`, `QueuedOutbound` |
 | Identity pinning (§12) | `client/idstore.rs` `IdStore`, `Trust`, `IdCheck`; `client/session.rs` `check_identity` |
 | Safety phrases (§12.6) | `crypto/safety.rs` `phrase`, `WORDS` |
@@ -1121,7 +1125,7 @@ here that implements it. If a name changes on one side, it changes on both.
 | `SendBinding`, `SendSetup`, sealed sends (§13.3) | `crypto/pq.rs` `SendBinding`, `SendSetup`, `HybridSend`, `seal_setup`, `seal_send`, `seal_chunk` |
 | Opening a send (§13.4) | `crypto/pq.rs` `open_setup`, `open_send`, `open_chunk`; `client/session.rs` `decrypt_own_envelope` |
 | Replay refusal (§13.4) | `client/replay.rs` `ReplayGuard` |
-| Addressing rule (§13.6) | `client/keymode_policy.rs` `can_address` |
+| OTP framing, and who can be sealed to (§13.6/§16.2) | `client/otp.rs` `OtpFraming`, `framing_for` |
 | Encryption-key rotation (§13.10) | `client/pq_rekey.rs` `PqOwnKeys`, `PqPeerKeys`, `PQ_KEY_RETENTION`; `crypto/pq.rs` `PqRotation`, `sign_rotation`, `verify_rotation` |
 | Fingerprints (§12.6/§13.3) | `crypto/pq.rs` `bundle_fingerprint`, `fingerprint_of_encoded` |
 | Wire-contract constants pinned by vectors | `crypto/pq.rs` `chunk_nonce`, `hkdf_combine`, `send_commitment`; `control.rs` `derive` — see `docs/SECURITY.md`, "Test vectors" |
@@ -1133,7 +1137,7 @@ here that implements it. If a name changes on one side, it changes on both.
 | OTP session popups and status notice | `client/tui/ui.rs` `PendingOtpGenerate`, `PendingOtpInvite`, `UiAction::RequestOtpSession`/`ConfirmOtpGenerate`/`CancelOtpGenerate`/`AcceptOtpInvite`/`RejectOtpInvite` |
 | `OtpEnvelope`/`OtpFileOffer`/`OtpFileContentSeq`/`OtpVoiceOffer`/`OtpDeliveryAck` (§16) | `p2p_proto.rs` `P2pPayload` |
 | File content under the pad, two independent pad spends per file - offer and content (§16.2) | `client/otp_cli.rs` `encrypt_file`, `decrypt_file`, `encrypt_file_retrying`, `decrypt_file_retrying`, `FileCliOutcome`; `client/otp.rs` `send_file_offer`, `on_file_offer`, `start_outgoing_file_content`, `finish_incoming_file`, `temp_content_path`, `secure_remove_file`; `client/file_transfer.rs` `OwnFileTarget.otp`, `OtpIncomingFileReceive`, `OtpIncomingKind`; `client/session.rs` `SessionState.otp_send_temp_files`/`otp_incoming_file_receives`, `accept_file_offer`, `handle_file_event`, `handle_p2p_event`'s `FileAccepted`/`FileRejected`/`OtpFileContentSeq` arms |
-| Voice content under the pad, recorded fully then sent once (§16.2) | `proto.rs` `Content::VoiceOffer`; `client/file_transfer.rs` `VoiceOfferPayload`; `client/otp.rs` `send_voice_offer`, `on_voice_offer`; `client/voice_stream.rs` `OwnStreamTarget::DirectOtp`, `spawn_record_accumulate_worker`; `client/direct_message.rs` `handle_voice_record_start`'s OTP branch; `client/session.rs` `decrypt_voice_offer`, `handle_p2p_event`'s `OtpVoiceOffer` arm |
+| Voice content under the pad, recorded fully then sent once (§16.2) | `proto.rs` `Content::VoiceOffer`; `client/file_transfer.rs` `VoiceOfferPayload`; `client/otp.rs` `send_voice_offer`, `on_voice_offer`; `client/voice_stream.rs` `OwnStreamTarget::DirectOtp`, `spawn_record_accumulate_worker`; `client/direct_message.rs` `handle_voice_record_start`'s OTP branch; `client/otp.rs` `open_otp_envelope`; `client/session.rs` `handle_p2p_event`'s `OtpVoiceOffer` arm |
 | Session visibility in the DM log (§16.3) | `client/tui/ui.rs` `MessageBody::System`, `otp_active_peers`, `mark_otp_active`, `is_otp_active`, `clear_otp_active`, `render_messages` (the 🔑 prefix), `render_input_bar`, `open_otp_session`; `client/tui/direct_message.rs` `push_otp_system_message`; `client/otp.rs` `notify` |
 | Asymmetric-provisioning recovery (§16.1) | `client/otp.rs` `NO_MATCHING_KEY_REASON`, `accept_invite`, `on_key_setup_ack`; `client/otp_cli.rs` `remove_contact`; `client/otp_store.rs` `OtpStore::forget` |
 | Failed DM send shown in red (§16.3) | `client/tui/ui.rs` `LogEntry.failed`, `UiAction::SendDirectText.log_index`, `render_messages` (red styling); `client/tui/direct_message.rs` `push_outgoing_dm`, `mark_dm_message_failed`; `client/otp.rs` `PendingOtpSend::Direct.log_index`, `send_now`, `send_or_queue` |
@@ -1158,69 +1162,57 @@ here that implements it. If a name changes on one side, it changes on both.
 | Sending what waited on a rotating key, and giving up bounded (§11.1) | `client/rekey.rs` `MAX_QUEUED_SEND_ATTEMPTS`, `QueuedOutbound`, `RemoteKeys::on_rotated`, `requeue`; `client/session.rs` `flush_queued_outbound`, `handle_pq_key_rotated` |
 | Mail delivery, pre-decrypt gate, re-pad storage (§17.3) | `client/otp_mail.rs` `on_mail_deliver`, `on_mail_delivered`, `MailGate`, `mail_gate`, `handle_read`, `handle_delete`; `client/otp_mail_store.rs` `OtpMailStore`, `SentMailRef`, `ReceivedMailRef`, `SentMailStatus`; `crypto/otp.rs` `repad`, `xor_pad` |
 
-## Encryption: how each method actually works
+## Encryption: how it actually works
 
-Implementation map for the three `my_key` methods and the two things they
-encrypt (text and voice), across both destinations (channel and DM). Wire-level
-rules live in `docs/PROTOCOL.md`; this section is the "where is it in the code"
-index. Entries reference file + function name (no line numbers - they rot
-on every refactor; the name is the stable handle).
+Implementation map for `pq_hybrid` - this app's one peer-to-peer scheme -
+and the two things it encrypts (text and voice), across both destinations
+(channel and DM). Wire-level rules live in `docs/PROTOCOL.md`; this
+section is the "where is it in the code" index. Entries reference file +
+function name (no line numbers - they rot on every refactor; the name is
+the stable handle).
 
-### One primitive, two key sourcings — plus `pq_hybrid`'s own
+### One scheme, one sourcing
 
-Two of the three methods share **one** encryption algorithm: RSA-OAEP with
-SHA-256, applied once per recipient. No AES, no hybrid scheme, no shared
-session key (Functionality #1). Because raw RSA only takes a fixed-size
-block, anything longer is split into several blocks and each is encrypted
-independently. `pq_hybrid` (Functionality #10) is the exception - its own
-primitives live in `crypto/pq.rs`, covered in its own subsection below.
+Every peer-to-peer payload is sealed under the PQ-hybrid scheme
+(Functionality #10), whose primitives live in `crypto/pq.rs`. It is the
+only such scheme: `my_key` has one type, so every peer both signs and
+opens sealed sends and there is no addressability rule to apply.
+
+RSA-OAEP survives in exactly one place: the server's `rsa` auth
+challenge (`connect.rs` `build_auth_response`, `server/mod.rs`'s verify),
+where the client proves it holds the server's key by decrypting a nonce.
 
 | Step | Where |
 | --- | --- |
-| Bytes-per-block for a key | `crypto/mod.rs` `max_chunk_len` |
-| Encrypt (splits into blocks) | `crypto/mod.rs` `encrypt_chunked` |
-| Decrypt (rejoins blocks) | `crypto/mod.rs` `decrypt_chunked` |
+| Bytes-per-block for a key (auth challenge only) | `crypto/mod.rs` `max_chunk_len` |
+| Encrypt/decrypt the auth nonce | `crypto/mod.rs` `encrypt_chunked`, `decrypt_chunked` |
 | Wire shape of one encrypted body | `proto.rs` `Envelope` |
 
-The two RSA-based `my_key` methods differ **only in where the RSA keypair
-comes from**. `none` is not plaintext despite its `[🚨 PLAIN]` tag — see the
-tag table above. The single branch point is `connect.rs` `resolve_my_keypair`
-(which also has `pq_hybrid`'s own arm, loading a keybundle instead of a
-plain RSA keypair - see below):
+`my_key` has one sourcing: a keybundle loaded from `file_pub`/`file_priv`,
+generated there on first connect if missing. `connect.rs`
+`resolve_my_keypair` is the whole of it, returning a `ResolvedIdentity`
+that `session.rs` (`run_connected_session`) unpacks into
+`SessionState::own_pq_private` / `own_pq_fp` / `own_pq_keys` - all
+non-optional, since every session has them.
 
-| Method | Keypair | Where |
-| --- | --- | --- |
-| `none` | fresh 2048-bit from OS randomness, kept for the session | `crypto/mod.rs` `KeyPair::generate` |
-| `password` | 2048-bit, deterministically derived: PBKDF2-HMAC-SHA256 (100k rounds, fixed salt) seeds a ChaCha20 RNG, so the same password always rebuilds the same key | `crypto/mod.rs` `KeyPair::from_password` |
-
-The choice is announced to peers as `proto.rs` `KeyMode` in `Identify`, which
-is what drives the encryption tag.
-
-After key sourcing, **the two static RSA methods are indistinguishable in
-code**: `session.rs` (`run_connected_session`) stores whichever private key
-was produced directly in `SessionState::own_keys` (a plain
-`Option<RsaPrivateKey>`) regardless of method, decrypted against directly via
-`crypto::decrypt_chunked`. `pq_hybrid` instead populates
-`SessionState::own_pq_private` and leaves `own_keys` as `None` (`session.rs`,
-around the `ResolvedIdentity` match in `run_connected_session`) - see
-`session::decrypt_envelope_for` for the resulting branch.
+The scheme is still announced to peers as `proto.rs` `KeyMode` in
+`Identify`, which is what drives the encryption tag; it now has one value.
 
 ### Text messages
 
 | | Channel | DM |
 | --- | --- | --- |
 | Send | `channel.rs` `handle_send_text` | `direct_message.rs` `handle_send_text` |
-| Encrypt (RSA methods) | `channel.rs` `encrypt_for_each` — loops recipients | `envelope.rs` `encrypt_for_one` — one recipient |
-| Encrypt (`pq_hybrid`) | same `encrypt_for_each`, dispatching via `envelope.rs` `encrypt_envelope_for` to `encrypt_hybrid_envelope_for` per `pq_hybrid` recipient | `direct_message.rs` `encrypt_for_recipient`, same dispatch |
+| Encrypt | `channel.rs` `encrypt_for_each` — loops recipients, each through `envelope.rs` `encrypt_envelope_for` → `encrypt_hybrid_envelope_for` | `direct_message.rs` `encrypt_for_recipient`, same call |
 | Wire message | `P2pPayload::Envelope { channel: Some(_), .. }`, one per member | `P2pPayload::Envelope { channel: None, .. }` |
 | Delivery | direct peer-to-peer link, one per recipient (`docs/PROTOCOL.md` §7.1/§7.2) — the server relays only the initial candidate exchange, never the message itself | same |
-| Receive + decrypt | `session.rs` `decrypt_envelope_for` → `crypto::decrypt_chunked` against `SessionState::own_keys` (RSA) or `crypto/pq.rs` `open_send` (`pq_hybrid`, dispatched by *our own* `own_key_mode`, then the binding's channel and `ReplayGuard` are checked) | same |
+| Receive + decrypt | `session.rs` `decrypt_envelope_for` → `crypto/pq.rs` `open_send` against our own rotating keys, then the binding's channel and `ReplayGuard` are checked | same |
 
 A channel message is therefore encrypted N times for N members and delivered
-over N independent direct links — the server never sees any of them.
-`pq_hybrid` recipients that a non-`pq_hybrid` sender can't address at all
-(`keymode_policy.rs` `can_address`) are excluded before encryption even starts -
-see "What `pq_hybrid` adds" below.
+over N independent direct links — the server never sees any of them. A
+member whose rotating key isn't fresh yet is queued rather than dropped
+(`rekey.rs`), and one whose announced keybundle doesn't decode at all is
+silently excluded, like any other unreachable recipient.
 
 ### Voice messages
 
@@ -1230,17 +1222,17 @@ dedicated thread — never on the async event loop.
 
 | Stage | Where |
 | --- | --- |
-| Recipients' public keys parsed **once** at record-start | `channel.rs` `parse_recipients` / `direct_message.rs` `handle_voice_record_start` |
+| Recipients' stream keys sealed **once** at record-start | `voice_stream.rs` `build_pq_stream_out`, from `channel.rs` `handle_voice_record_start` / `direct_message.rs` `handle_voice_record_start` |
 | Record + encrypt loop (own thread) | `voice_stream.rs` `spawn_record_stream_worker` |
 | Encrypt a chunk — channel (per recipient) | `voice_stream.rs` `build_chunk_recipients` → `p2p::P2pOutbound::ChannelVoiceChunk` |
 | Encrypt a chunk — DM | same, → `p2p::P2pOutbound::DirectVoiceChunk` |
 | Delivery | direct peer-to-peer link, unreliable/unordered per chunk (`docs/PROTOCOL.md` §7.1/§7.3) — never touches the server |
-| Receiving: pick the private key **once** for the whole stream | `voice_stream.rs` `resolve_incoming_key`, cloning `SessionState::own_keys` |
+| Receiving: snapshot our decryption keys **once** for the whole stream | `voice_stream.rs` `resolve_incoming_key`, from `SessionState::own_pq_keys` |
 | Decrypt loop (one thread per incoming stream) | `voice_stream.rs` `spawn_stream_decrypt_worker`, decrypt in `ChunkDecryptor::decrypt` |
 
-Each incoming stream gets its own decrypt thread because RSA private-key
-decrypt is much costlier than public-key encrypt — one shared thread would fall
-behind real time with two or three simultaneous speakers.
+Each incoming stream gets its own decrypt thread because unwrap+AEAD is
+meaningfully costlier than the sender's own encrypt — one shared thread
+would fall behind real time with two or three simultaneous speakers.
 
 ### File transfer
 
@@ -1250,8 +1242,9 @@ transfer's bytes move like voice's chunk stream, except always
 point-to-point (never a channel broadcast) since accept/reject/progress is
 inherently per-recipient. `file_transfer.rs`'s workers mirror
 `voice_stream.rs`'s plumbing but move bytes to/from disk instead of the
-audio mixer, reusing its RSA/PQ dispatch types directly rather than
-duplicating them.
+audio mixer, reusing its stream-key types (`DirectStreamKey`,
+`IncomingStreamKey`, `ChunkDecryptor`) directly rather than duplicating
+them.
 
 | Stage | Where |
 | --- | --- |
@@ -1311,12 +1304,12 @@ chunk's already is.
 
 ### What `pq_hybrid` adds
 
-`pq_hybrid` is a second *static* identity (like `password`/`none`), with
-different key material and a different, self-contained primitive set - but
-it's the only method whose *encryption* keys rotate during the session, so
-it reuses `rekey.rs`'s generic `RemoteKeys` for freshness/queueing (§11)
-even though its rotation signing/verification is entirely its own
-(`pq_rekey.rs`, `crypto/pq.rs`). Full model in `docs/PROTOCOL.md` §13.
+The identity itself is *static* - one keybundle loaded from a file for the
+whole session - but its *encryption* keys rotate per peer as messages are
+exchanged, so it reuses `rekey.rs`'s generic `RemoteKeys` for
+freshness/queueing (§11) even though its rotation signing/verification is
+entirely its own (`pq_rekey.rs`, `crypto/pq.rs`). Full model in
+`docs/PROTOCOL.md` §13.
 
 Voice is exempt from per-chunk rotation (§11.2): one key snapshot covers a
 whole stream (`voice_stream.rs`), and a recipient without a fresh key (or
@@ -1345,10 +1338,10 @@ the DM recording is refused outright (`direct_message.rs`).
 | Stream setup on the wire, once per recipient | `p2p_proto.rs` `P2pPayload::StreamKeySetup`; `voice_stream.rs` `PqStreamOut::setups`, `forward_key_setup` |
 | Hold chunks that outrun their setup, replay once it verifies | `voice_stream.rs` `ChunkDecryptor::install_setup`, `MAX_PENDING_CHUNKS` |
 | Refuse a send that already arrived | `client/replay.rs` `ReplayGuard`; `session.rs` `decrypt_own_envelope` (also checks the binding's channel) |
-| Own key material in the live session | `session.rs` `SessionState::own_pq_private` (mirrors `own_keys`, populated instead of it when `own_key_mode == PqHybrid`) |
-| Who can be addressed | `keymode_policy.rs` `can_address` - a `pq_hybrid` recipient needs a `pq_hybrid` sender (their own ML-DSA-87/RSA-sign identity); everyone else is reachable by any sender, as always |
-| `id_store` pinning | `keymode_policy.rs` `uses_byte_comparison_pinning` - `pq_hybrid` joins `password` on the plain-byte-comparison side |
-| Auto-generate keys if missing | `crypto/pq.rs` `ensure_bundle_at`, called from `connect.rs` `resolve_my_keypair`'s `PqHybrid` arm (`docs/PROTOCOL.md` §13.9) |
+| Own key material in the live session | `session.rs` `SessionState::own_pq_private`, `own_pq_fp`, `own_pq_keys` - all non-optional, since every session has them |
+| Who can be addressed | anyone who announced a keybundle that decodes; one who did not is reachable only under an already-installed pad (`otp.rs` `framing_for`) |
+| `id_store` pinning | `session.rs` `check_identity` - a file-loaded identity is the same bytes every connect, so a plain byte comparison against the pin is the whole check |
+| Auto-generate keys if missing | `crypto/pq.rs` `ensure_bundle_at`, called from `connect.rs` `resolve_my_keypair` (`docs/PROTOCOL.md` §13.9) |
 | Connect-popup cache (`~/.aloo/.cache`) | `connect.rs` `ConnectCache`, `cache_path`, `random_prefix`, `fresh_pq_hybrid_paths_in`, `prefill_connect_defaults` |
 
 ### `server_key` — a separate axis

@@ -510,15 +510,11 @@ impl Registry {
         new_public_key_der: Vec<u8>,
         signature: Vec<u8>,
     ) -> Result<Outgoing, String> {
-        let sender = self
-            .clients
-            .get(&from)
-            .ok_or_else(|| "unknown sender".to_string())?;
-        // Only pq_hybrid rotates its encryption keys (§13.10). The static
-        // modes have nothing to rotate and so have no business here. The
-        // server still verifies nothing about the payload itself.
-        if sender.key_mode != KeyMode::PqHybrid {
-            return Err("sender does not rotate keys".to_string());
+        // The server verifies nothing about the payload itself, and has no
+        // notion of which senders rotate: every client runs the one mode
+        // that does (§13.10).
+        if !self.clients.contains_key(&from) {
+            return Err("unknown sender".to_string());
         }
         if !self.clients.contains_key(&to) {
             return Err("unknown recipient".to_string());

@@ -241,7 +241,6 @@ impl UiState {
                     path,
                     filename,
                     size,
-                    recipient_key_mode: peer.key_mode,
                     recipient_pubkey_der: peer.public_key_der,
                 }
             }

@@ -45,9 +45,6 @@ pub const MAIL_OVERHEAD_ESTIMATE: u64 = 8 * 1024;
 /// content edit live without another subprocess call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecipientCheck {
-    /// This client isn't running a `pq_hybrid` identity of its own, so no
-    /// contact name can even be derived.
-    NotPqIdentity,
     /// No `id_store` pin for that nickname (or its pinned key isn't a
     /// pq_hybrid bundle).
     NotPinned,
@@ -118,9 +115,7 @@ pub fn mail_gate(
 
 /// Runs the recipient checks for `nickname` - see `RecipientCheck`.
 pub async fn check_recipient(session: &SessionState, nickname: &str) -> RecipientCheck {
-    let Some(own_fp) = session.own_pq_fp else {
-        return RecipientCheck::NotPqIdentity;
-    };
+    let own_fp = session.own_pq_fp;
     let Some(pinned_der) = session.id_store.get(nickname) else {
         return RecipientCheck::NotPinned;
     };
@@ -175,7 +170,10 @@ pub(crate) async fn handle_send(
     };
 
     if to.is_empty() || !crate::validation::is_storable(&to) {
-        fail(ui_state, "OTP mail: recipient nickname is not valid".to_string());
+        fail(
+            ui_state,
+            "OTP mail: recipient nickname is not valid".to_string(),
+        );
         return Ok(());
     }
     let check = check_recipient(session, &to).await;
@@ -220,7 +218,10 @@ pub(crate) async fn handle_send(
             MailAttachment::File { filename, path, .. } => match std::fs::read(&path) {
                 Ok(bytes) => files.push(OtpMailFile { filename, bytes }),
                 Err(e) => {
-                    fail(ui_state, format!("OTP mail: could not read '{filename}': {e}"));
+                    fail(
+                        ui_state,
+                        format!("OTP mail: could not read '{filename}': {e}"),
+                    );
                     return Ok(());
                 }
             },
@@ -241,11 +242,7 @@ pub(crate) async fn handle_send(
         return Ok(());
     };
     let payload_bytes = Zeroizing::new(payload_bytes);
-    let Some(signing) = session.own_pq_private.as_ref() else {
-        fail(ui_state, "OTP mail: this session has no pq_hybrid identity".to_string());
-        return Ok(());
-    };
-    let Ok(signature) = crypto::pq::sign_mail(signing, &payload_bytes) else {
+    let Ok(signature) = crypto::pq::sign_mail(&session.own_pq_private, &payload_bytes) else {
         fail(ui_state, "OTP mail: could not sign the mail".to_string());
         return Ok(());
     };
@@ -479,7 +476,10 @@ pub(crate) async fn on_mail_result(
     // destination; on failure no acknowledgement will ever come and the
     // contact must not stay wedged forever. The failure notice is loud
     // about what a refused-after-spend mail means for the pad.
-    if session.otp_store.record_acked(&mail_ref.contact_name, mail_ref.seq, None) {
+    if session
+        .otp_store
+        .record_acked(&mail_ref.contact_name, mail_ref.seq, None)
+    {
         let _ = session.otp_store.save();
         crate::client::otp::flush_one_queued(wr, ui_state, session, &mail_ref.contact_name).await?;
     }
@@ -519,7 +519,10 @@ pub(crate) async fn on_mail_delivered(
         // A delivery notice can arrive with the storage ack lost (crash
         // between the two) - the gate still clears, exactly as it would
         // have on the ack itself.
-        if session.otp_store.record_acked(&mail_ref.contact_name, mail_ref.seq, None) {
+        if session
+            .otp_store
+            .record_acked(&mail_ref.contact_name, mail_ref.seq, None)
+        {
             let _ = session.otp_store.save();
             crate::client::otp::flush_one_queued(wr, ui_state, session, &mail_ref.contact_name)
                 .await?;
@@ -579,20 +582,27 @@ pub(crate) async fn on_mail_deliver(
         return Ok(());
     }
     if session.otp_mail_store.has_received(&mail_id) {
-        wr.send_control(&ClientMessage::OtpMailAck { mail_id }).await?;
+        wr.send_control(&ClientMessage::OtpMailAck { mail_id })
+            .await?;
         return Ok(());
     }
     let pinned_der = session.id_store.get(&from).map(|d| d.to_vec());
-    let expected_contact = session.own_pq_fp.and_then(|own_fp| {
-        let peer_fp = crypto::pq::fingerprint_of_encoded(pinned_der.as_deref()?)?;
-        Some(crypto::otp::contact_name_for(&own_fp, &peer_fp))
-    });
+    let own_fp = session.own_pq_fp;
+    let expected_contact = pinned_der
+        .as_deref()
+        .and_then(crypto::pq::fingerprint_of_encoded)
+        .map(|peer_fp| crypto::otp::contact_name_for(&own_fp, &peer_fp));
     let next_expected = expected_contact
         .as_deref()
         .and_then(|c| session.otp_store.get(c))
         .map(|s| s.next_expected_in_seq)
         .unwrap_or(0);
-    match mail_gate(expected_contact.as_deref(), &contact_name, next_expected, seq) {
+    match mail_gate(
+        expected_contact.as_deref(),
+        &contact_name,
+        next_expected,
+        seq,
+    ) {
         MailGate::RefuseContact => {
             ui_state.push_status_notice(
                 format!(
@@ -606,7 +616,8 @@ pub(crate) async fn on_mail_deliver(
             // Already consumed once (the ack was lost, or the local index
             // was written and the ack crashed) - the pad range is gone
             // either way, so acknowledging is the only useful answer.
-            wr.send_control(&ClientMessage::OtpMailAck { mail_id }).await?;
+            wr.send_control(&ClientMessage::OtpMailAck { mail_id })
+                .await?;
             return Ok(());
         }
         MailGate::Wait => {
@@ -661,12 +672,14 @@ pub(crate) async fn on_mail_deliver(
     };
     let Ok(sealed) = proto::decode::<OtpMailSealed>(&sealed_bytes) else {
         discard(ui_state, "malformed");
-        wr.send_control(&ClientMessage::OtpMailAck { mail_id }).await?;
+        wr.send_control(&ClientMessage::OtpMailAck { mail_id })
+            .await?;
         return Ok(());
     };
     let Ok(pinned_bundle) = proto::decode::<crypto::pq::PqPublicBundle>(&pinned_der) else {
         discard(ui_state, "pinned key unreadable");
-        wr.send_control(&ClientMessage::OtpMailAck { mail_id }).await?;
+        wr.send_control(&ClientMessage::OtpMailAck { mail_id })
+            .await?;
         return Ok(());
     };
     // A one-time pad authenticates nothing - this signature check against
@@ -674,17 +687,20 @@ pub(crate) async fn on_mail_deliver(
     // from ever being believed.
     if !crypto::pq::verify_mail(&pinned_bundle, &sealed.payload, &sealed.signature) {
         discard(ui_state, "its identity signature doesn't verify");
-        wr.send_control(&ClientMessage::OtpMailAck { mail_id }).await?;
+        wr.send_control(&ClientMessage::OtpMailAck { mail_id })
+            .await?;
         return Ok(());
     }
     let Ok(payload) = proto::decode::<OtpMailPayload>(&sealed.payload) else {
         discard(ui_state, "malformed payload");
-        wr.send_control(&ClientMessage::OtpMailAck { mail_id }).await?;
+        wr.send_control(&ClientMessage::OtpMailAck { mail_id })
+            .await?;
         return Ok(());
     };
     if payload.from != from || payload.to != ui_state.own_name {
         discard(ui_state, "its sealed addressing doesn't match");
-        wr.send_control(&ClientMessage::OtpMailAck { mail_id }).await?;
+        wr.send_control(&ClientMessage::OtpMailAck { mail_id })
+            .await?;
         return Ok(());
     }
 
@@ -706,11 +722,13 @@ pub(crate) async fn on_mail_deliver(
         // Acknowledge anyway: the server redelivering the same ciphertext
         // can never decrypt again.
         discard(ui_state, &format!("could not be stored: {e}"));
-        wr.send_control(&ClientMessage::OtpMailAck { mail_id }).await?;
+        wr.send_control(&ClientMessage::OtpMailAck { mail_id })
+            .await?;
         return Ok(());
     }
     let _ = session.otp_mail_store.save();
-    wr.send_control(&ClientMessage::OtpMailAck { mail_id }).await?;
+    wr.send_control(&ClientMessage::OtpMailAck { mail_id })
+        .await?;
     ui_state.push_status_notice(
         format!("\u{1F4E8} OTP mail from {from} - type /mailbox to read it"),
         true,
@@ -727,12 +745,18 @@ pub(crate) async fn on_mail_deliver(
 /// mail.
 pub(crate) fn handle_read(session: &SessionState, ui_state: &mut UiState, mail_id: String) {
     let Some(bytes) = session.otp_mail_store.read_received_payload(&mail_id) else {
-        ui_state.push_status_notice("OTP mail: could not read this mail's stored files".to_string(), false);
+        ui_state.push_status_notice(
+            "OTP mail: could not read this mail's stored files".to_string(),
+            false,
+        );
         return;
     };
     let bytes = Zeroizing::new(bytes);
     let Ok(payload) = proto::decode::<OtpMailPayload>(&bytes) else {
-        ui_state.push_status_notice("OTP mail: this mail's stored files don't decode".to_string(), false);
+        ui_state.push_status_notice(
+            "OTP mail: this mail's stored files don't decode".to_string(),
+            false,
+        );
         return;
     };
     ui_state.otp_mail_open_reader(mail_id, payload);
@@ -770,12 +794,12 @@ pub(crate) fn handle_save_attachment(ui_state: &mut UiState, index: usize) {
     );
     let dir = crate::client::file_transfer::default_download_dir();
     let dest = dir.join(&dest_name);
-    let result = std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&dest, &attachment.bytes));
+    let result =
+        std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&dest, &attachment.bytes));
     match result {
-        Ok(()) => ui_state.push_status_notice(
-            format!("Saved {dest_name} to {}", dir.display()),
-            true,
-        ),
+        Ok(()) => {
+            ui_state.push_status_notice(format!("Saved {dest_name} to {}", dir.display()), true)
+        }
         Err(e) => ui_state.push_status_notice(format!("Could not save {dest_name}: {e}"), false),
     }
 }

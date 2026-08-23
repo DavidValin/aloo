@@ -8,14 +8,12 @@
 //! `cargo slow`. The chunk-level tests need no bundle at all (just a raw
 //! `[u8; 32]` key), so they stay fast and ungated.
 
-use aloo::client::keymode_policy::can_address;
 use aloo::crypto::pq::{
     PqPrivateBundle, PqPublicBundle, bundle_fingerprint, ensure_bundle_at, generate_bundle,
-    load_private_bundle, load_public_bundle, open_chunk, open_send, open_setup, save_private_bundle,
-    save_public_bundle, seal_chunk, seal_send, seal_setup,
+    load_private_bundle, load_public_bundle, open_chunk, open_send, open_setup,
+    save_private_bundle, save_public_bundle, seal_chunk, seal_send, seal_setup,
 };
 use aloo::proto::{self, KeyMode};
-use aloo::client::keymode_policy::uses_byte_comparison_pinning;
 
 /// Opens a sealed send the way a receiving client does: with the
 /// recipient's *own* identity fingerprint, which the binding inside must
@@ -86,8 +84,7 @@ fn same_plaintext_produces_different_ciphertext_under_different_seq() {
 fn hybrid_voice_chunk_round_trips() {
     let k_data = [9u8; 32];
     let ciphertext = seal_chunk(&k_data, 100, 5, b"raw pcm bytes");
-    let plaintext =
-        open_chunk(&k_data, 100, 5, &ciphertext).expect("decrypt should succeed");
+    let plaintext = open_chunk(&k_data, 100, 5, &ciphertext).expect("decrypt should succeed");
     assert_eq!(plaintext, b"raw pcm bytes");
 }
 
@@ -120,46 +117,8 @@ fn decrypting_a_chunk_with_the_wrong_key_fails() {
 }
 
 // ---------------------------------------------------------------------
-// can_address / uses_byte_comparison_pinning - fast, pure predicates
+// The one key mode's tag
 // ---------------------------------------------------------------------
-
-/// @requirement AC-082
-#[test]
-fn a_non_pq_hybrid_sender_cannot_address_a_pq_hybrid_recipient() {
-    assert!(
-        !can_address(KeyMode::PqHybrid, KeyMode::Password),
-        "a password sender has no ML-DSA-87/RSA-sign identity"
-    );
-    assert!(!can_address(KeyMode::PqHybrid, KeyMode::None));
-    assert!(
-        can_address(KeyMode::PqHybrid, KeyMode::PqHybrid),
-        "a pq_hybrid sender can address a pq_hybrid recipient"
-    );
-}
-
-/// @requirement AC-082
-#[test]
-fn every_sender_can_address_a_non_pq_hybrid_recipient() {
-    for recipient in [KeyMode::Password, KeyMode::None] {
-        for sender in [KeyMode::Password, KeyMode::None, KeyMode::PqHybrid] {
-            assert!(
-                can_address(recipient, sender),
-                "RSA-OAEP needs no sender identity at all"
-            );
-        }
-    }
-}
-
-/// @requirement AC-081
-#[test]
-fn key_mode_pq_hybrid_participates_in_byte_comparison_pinning_like_password() {
-    assert!(uses_byte_comparison_pinning(KeyMode::Password));
-    assert!(uses_byte_comparison_pinning(KeyMode::PqHybrid));
-    assert!(
-        !uses_byte_comparison_pinning(KeyMode::None),
-        "None has no continuity mechanism at all, by design"
-    );
-}
 
 /// @requirement AC-081
 #[test]
@@ -245,7 +204,13 @@ fn encrypt_hybrid_for_one_round_trips_via_wire_encoding() {
     let bob_public_decoded: aloo::crypto::pq::PqPublicBundle =
         proto::decode(&bob_public_der).expect("decode");
 
-    let block = seal_to(&alice_private, &bob_public_decoded, None, 1, b"hello via wire encoding");
+    let block = seal_to(
+        &alice_private,
+        &bob_public_decoded,
+        None,
+        1,
+        b"hello via wire encoding",
+    );
     assert_eq!(
         vec![block.clone()].len(),
         1,
@@ -292,7 +257,13 @@ fn tampered_signature_is_rejected() {
 
     // Mallory signs and sends her own envelope, but claims to be alice by
     // having bob verify against alice's public bundle instead of hers.
-    let blob = seal_to(&mallory_private, &bob_public, None, 1, b"pretend this is from alice");
+    let blob = seal_to(
+        &mallory_private,
+        &bob_public,
+        None,
+        1,
+        b"pretend this is from alice",
+    );
 
     assert!(
         open_for(&bob_private, &bob_public, &alice_public, &blob).is_none(),
@@ -361,19 +332,23 @@ fn seal_setup_and_open_setup_round_trip() {
     let (bob_public, bob_private) = generate_bundle().expect("bob bundle");
 
     let send_id = 4242u64;
-    let (setup, k_data) =
-        seal_setup(
-            &alice_private,
-            bob_public.bootstrap_encap(),
-            bundle_fingerprint(&bob_public).expect("fingerprint"),
-            None,
-            send_id,
-        )
-        .expect("seal setup");
+    let (setup, k_data) = seal_setup(
+        &alice_private,
+        bob_public.bootstrap_encap(),
+        bundle_fingerprint(&bob_public).expect("fingerprint"),
+        None,
+        send_id,
+    )
+    .expect("seal setup");
 
     let bob_fp = bundle_fingerprint(&bob_public).expect("fingerprint");
-    let recovered = open_setup(&[bob_private.bootstrap_decap().clone()], &bob_fp, &alice_public, &setup)
-        .expect("open+verify should succeed");
+    let recovered = open_setup(
+        &[bob_private.bootstrap_decap().clone()],
+        &bob_fp,
+        &alice_public,
+        &setup,
+    )
+    .expect("open+verify should succeed");
     assert_eq!(recovered, k_data);
 }
 
@@ -399,7 +374,13 @@ fn open_setup_rejects_a_setup_sealed_for_someone_else() {
 
     let carol_fp = bundle_fingerprint(&carol_public).expect("fingerprint");
     assert!(
-        open_setup(&[carol_private.bootstrap_decap().clone()], &carol_fp, &alice_public, &setup).is_none(),
+        open_setup(
+            &[carol_private.bootstrap_decap().clone()],
+            &carol_fp,
+            &alice_public,
+            &setup
+        )
+        .is_none(),
         "a stream setup names its recipient exactly like a text send does"
     );
 }
@@ -414,21 +395,26 @@ fn a_stream_of_chunks_opens_under_its_setups_key() {
     let (bob_public, bob_private) = generate_bundle().expect("bob bundle");
 
     let send_id = 7u64;
-    let (setup, k_data) =
-        seal_setup(
-            &alice_private,
-            bob_public.bootstrap_encap(),
-            bundle_fingerprint(&bob_public).expect("fingerprint"),
-            Some("the-hall".into()),
-            send_id,
-        )
-        .expect("seal setup");
+    let (setup, k_data) = seal_setup(
+        &alice_private,
+        bob_public.bootstrap_encap(),
+        bundle_fingerprint(&bob_public).expect("fingerprint"),
+        Some("the-hall".into()),
+        send_id,
+    )
+    .expect("seal setup");
     let chunks: Vec<Vec<u8>> = (0..3u32)
         .map(|seq| seal_chunk(&k_data, send_id, seq, format!("chunk {seq}").as_bytes()))
         .collect();
 
     let bob_fp = bundle_fingerprint(&bob_public).expect("fingerprint");
-    let recovered = open_setup(&[bob_private.bootstrap_decap().clone()], &bob_fp, &alice_public, &setup).expect("open setup");
+    let recovered = open_setup(
+        &[bob_private.bootstrap_decap().clone()],
+        &bob_fp,
+        &alice_public,
+        &setup,
+    )
+    .expect("open setup");
     for (seq, ciphertext) in chunks.iter().enumerate() {
         let seq = seq as u32;
         let plaintext =
@@ -458,7 +444,13 @@ fn save_and_load_bundle_files_roundtrip() {
     let loaded_private = load_private_bundle(&priv_path).expect("load private");
     let loaded_public = load_public_bundle(&pub_path).expect("load public");
 
-    let blob = seal_to(&loaded_private, &loaded_public, None, 1, b"round trip via files");
+    let blob = seal_to(
+        &loaded_private,
+        &loaded_public,
+        None,
+        1,
+        b"round trip via files",
+    );
     let out = open_for(&loaded_private, &loaded_public, &loaded_public, &blob).expect("open");
     assert_eq!(out, b"round trip via files");
 
@@ -554,9 +546,16 @@ fn ensure_bundle_at_regenerates_both_when_only_one_file_exists() {
     // The freshly (re)generated pair must actually work together.
     let public = load_public_bundle(&pub_path).expect("load public");
     let private = load_private_bundle(&priv_path).expect("load private");
-    let blob = seal_to(&private, &public, None, 1, b"still works after partial deletion");
+    let blob = seal_to(
+        &private,
+        &public,
+        None,
+        1,
+        b"still works after partial deletion",
+    );
     let out = open_for(&private, &public, &public, &blob).expect("open");
     assert_eq!(out, b"still works after partial deletion");
 
     std::fs::remove_dir_all(&dir).ok();
 }
+

@@ -690,9 +690,9 @@ fn announced_membership_is_reconciled_against_our_own_joined_channels() {
     assert_eq!(r.leave, vec!["general".to_string(), "dev".to_string()]);
 }
 
-/// @requirement AC-215
+/// @requirement AC-215, AC-259
 #[test]
-fn only_a_pinned_pq_hybrid_identity_can_become_an_addressable_peer() {
+fn a_nickname_names_someone_only_once_something_is_pinned_for_it() {
     use aloo::client::idstore::IdStore;
     use aloo::client::session::direct_peer_identity;
 
@@ -709,12 +709,19 @@ fn only_a_pinned_pq_hybrid_identity_can_become_an_addressable_peer() {
     // Nobody pinned: there is nothing to encrypt to, so no identity.
     assert!(direct_peer_identity(&store, "bob").is_none());
 
-    // Pinned, but not a pq_hybrid bundle - one of the unsigned modes,
-    // which cannot authenticate anything, so still refused.
+    // Pinned, but not a keybundle - what a hand-installed pad contact
+    // leaves. The pin names them, which is what lets a pad-only pair exist
+    // at all; nothing is sealed to it, and the pad is what proves the
+    // claim (`docs/PROTOCOL.md` §7.1.5 step 7, §16.2).
     store.check_and_pin("bob", b"not-a-pq-bundle");
+    let info = direct_peer_identity(&store, "bob").expect("a pin names someone");
     assert!(
-        direct_peer_identity(&store, "bob").is_none(),
-        "an unsigned key mode must never be registerable from a nickname alone"
+        aloo::crypto::pq::fingerprint_of_encoded(&info.public_key_der).is_none(),
+        "no envelope can be built for them - only a pad can carry this pair"
+    );
+    assert_eq!(
+        aloo::client::otp::framing_for(b"our-own-pad-only-pin", &info.public_key_der),
+        aloo::client::otp::OtpFraming::Direct,
     );
 }
 

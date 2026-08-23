@@ -5,12 +5,10 @@
 
 use std::time::{Duration, Instant};
 
-use rsa::{RsaPrivateKey, RsaPublicKey};
-
-use crate::crypto;
-use crate::proto::{self, KeyMode, UserId};
 use crate::client::session::SessionState;
 use crate::client::voice;
+use crate::crypto;
+use crate::proto::{self, UserId};
 
 /// How long an incoming stream can go without a chunk/end before it's
 /// treated as abandoned and force-finalized with whatever partial audio
@@ -58,14 +56,14 @@ pub(crate) enum OwnStreamTarget {
 /// Unlike a text send, each recipient here gets an independent `k_data`:
 /// a setup is bound to one recipient, so sharing a key across them would
 /// mean sharing a binding too.
-pub(crate) struct PqStreamOut {
+pub struct PqStreamOut {
     per_recipient: Vec<(UserId, [u8; 32], crypto::pq::SendSetup)>,
 }
 
 impl PqStreamOut {
     /// Every recipient's encoded setup, for sending as `StreamKeySetup`
     /// right after `StreamStart`.
-    pub(crate) fn setups(&self) -> Vec<(UserId, Vec<u8>)> {
+    pub fn setups(&self) -> Vec<(UserId, Vec<u8>)> {
         self.per_recipient
             .iter()
             .filter_map(|(id, _, setup)| crate::proto::encode(setup).ok().map(|b| (*id, b)))
@@ -73,12 +71,10 @@ impl PqStreamOut {
     }
 }
 
-/// Builds the once-per-stream `PqHybrid` setup for `recipients` (already
-/// filtered to `PqHybrid` peers), signed with our own PQ identity -
-/// `None` if we aren't ourselves `PqHybrid`, which `can_address` already
-/// rules out before this is called. A recipient whose wrap fails
-/// (malformed public bundle) is simply left out, same partial-delivery
-/// pattern as an RSA recipient with an unparseable key.
+/// Builds the once-per-stream setup for `recipients`, signed with our own
+/// PQ identity. A recipient whose wrap fails (malformed public bundle) is
+/// simply left out, the same partial-delivery pattern as any other
+/// unreachable recipient; `None` if that leaves nobody at all.
 ///
 /// `recipients` pairs each peer with the encoded bundle they announced -
 /// used only for their identity fingerprint. What the stream is actually
@@ -94,7 +90,7 @@ pub(crate) fn build_pq_stream_out(
     if recipients.is_empty() {
         return None;
     }
-    let signing = session.own_pq_private.as_ref()?;
+    let signing = &session.own_pq_private;
     let per_recipient: Vec<(UserId, [u8; 32], crypto::pq::SendSetup)> = recipients
         .iter()
         .filter_map(|(id, public_der)| {
@@ -111,35 +107,46 @@ pub(crate) fn build_pq_stream_out(
     Some(PqStreamOut { per_recipient })
 }
 
-/// A DM voice stream's single recipient is either RSA-family or `PqHybrid`
-/// - unlike a channel, never a mix (there's only one recipient).
-pub(crate) enum DirectStreamKey {
-    Rsa(RsaPublicKey),
+/// What a point-to-point stream's chunks are encrypted with - a DM voice
+/// stream, a file transfer, a pad transfer (`file_transfer`, `otp_pad`,
+/// `voice_call`).
+pub enum DirectStreamKey {
+    /// Sealed to the recipient's keybundle (§13.3): every ordinary
+    /// transfer, and an OTP one whose pair is `PqWrapped`. A
+    /// `PqStreamOut` of exactly one recipient.
     Pq(PqStreamOut),
+    /// The bytes handed to the transport are *already* one-time-pad
+    /// ciphertext, so they go on the wire verbatim
+    /// (`client::otp::OtpFraming::Direct`). Under `Direct` there is no
+    /// keybundle to seal to and none is needed: the pad is the whole
+    /// protection, and the `otp` command's own decrypt verdict is the
+    /// whole authentication - it refuses anything it cannot attribute to
+    /// the holder of the mirror key at the expected offset (§16.2).
+    Pad,
+}
+
+impl DirectStreamKey {
+    /// The `StreamKeySetup`s to send before the first chunk, if any.
+    /// Empty under `Pad`: there is no per-stream key to introduce.
+    pub fn setups(&self) -> Vec<(UserId, Vec<u8>)> {
+        match self {
+            DirectStreamKey::Pq(pq) => pq.setups(),
+            DirectStreamKey::Pad => Vec::new(),
+        }
+    }
 }
 
 /// Who a currently-recording stream is being encrypted for, with each
 /// recipient's key material already resolved once at record-start rather
-/// than on every chunk. A channel stream can address a mix of RSA-family
-/// and `PqHybrid` recipients at once - each gets whichever scheme their own
-/// `KeyMode` needs, independent of the others (`docs/PROTOCOL.md` §13).
+/// than on every chunk.
 pub(crate) enum StreamRecipients {
-    Channel {
-        rsa: Vec<(UserId, RsaPublicKey)>,
-        pq: Option<PqStreamOut>,
-    },
-    Direct {
-        to: UserId,
-        key: DirectStreamKey,
-    },
+    Channel { pq: PqStreamOut },
+    Direct { to: UserId, key: DirectStreamKey },
 }
 
 /// One chunk-decrypt job for an incoming stream's dedicated worker thread.
-/// `seq` is only needed by the `PqHybrid` path (reconstructing the
-/// deterministic per-chunk AES-GCM nonce, `crypto::pq::decrypt_hybrid_chunk`)
-/// - carried for every chunk regardless of scheme rather than only when
-/// relevant, since a worker doesn't know its own scheme until it inspects
-/// its `IncomingStreamKey`.
+/// `seq` reconstructs the deterministic per-chunk AES-GCM nonce
+/// (`crypto::pq::open_chunk`).
 pub(crate) enum DecryptJob {
     /// A `pq_hybrid` stream's encoded `crypto::pq::SendSetup`, arriving
     /// once - nothing in the stream decrypts until it does.
@@ -153,13 +160,11 @@ pub(crate) enum DecryptJob {
 }
 
 /// What an incoming stream's decrypt worker uses to recover each chunk's
-/// plaintext - resolved once at `start_incoming_stream`, based on *our own*
-/// `session.own_key_mode` (a stream addressed to us was necessarily
-/// encrypted against whichever public key material *we* announced,
-/// regardless of the sender's own `my_key` - same reasoning as
-/// `session::decrypt_envelope_for`).
+/// plaintext - resolved once at `start_incoming_stream`. A stream
+/// addressed to us was encrypted against the key material *we* announced,
+/// so this is derived from our own identity, not the sender's - same
+/// reasoning as `session::decrypt_envelope_for`.
 pub enum IncomingStreamKey {
-    Rsa(Vec<RsaPrivateKey>),
     /// `sender_public` verifies the stream's `StreamKeySetup` signature and
     /// `my_fp` proves the setup was sealed for *us* (`k_data` is then cached
     /// for the rest of the stream - see `spawn_stream_decrypt_worker`).
@@ -173,6 +178,17 @@ pub enum IncomingStreamKey {
         my_fp: [u8; 32],
         sender_public: crypto::pq::PqPublicBundle,
     },
+    /// This stream's chunks are one-time-pad ciphertext carried verbatim
+    /// (`client::otp::OtpFraming::Direct`) - the counterpart of
+    /// `DirectStreamKey::Pad`. Each chunk passes through untouched; the
+    /// reassembled whole is what `otp --decrypt` then opens, which is
+    /// also what authenticates it (§16.2).
+    Pad,
+    /// The sender announced a keybundle that does not decode, so nothing
+    /// in this stream can ever be opened. Kept as a state rather than
+    /// refusing the stream outright so the arriving rows behave exactly
+    /// like a stream whose chunks all fail their AEAD tag.
+    Undecryptable,
 }
 
 /// Bookkeeping for one currently-arriving incoming stream.
@@ -228,13 +244,10 @@ pub fn idle_stream_action(
     }
 }
 
-/// Encrypts one chunk of `pcm` for every recipient of `target`, dispatching
-/// per recipient by scheme - RSA-OAEP direct-encrypt (as ever) or, for a
-/// `PqStreamOut`'s recipients, cheap AES-256-GCM under the stream's already-
-/// established `k_data` (`crypto::pq::encrypt_hybrid_voice_chunk`, no
-/// asymmetric crypto per chunk). The wire shape (`Vec<(UserId, Vec<Vec<u8>>)>`)
-/// is scheme-agnostic already - a PQ recipient's "blocks" is just a single
-/// bincode-encoded blob instead of N OAEP blocks.
+/// Encrypts one chunk of `pcm` for every recipient of `target`: cheap
+/// AES-256-GCM under the stream's already-established `k_data`
+/// (`crypto::pq::seal_chunk`), with no asymmetric crypto per chunk. Each
+/// recipient's "blocks" is the single sealed blob.
 fn build_chunk_recipients(
     target: &StreamRecipients,
     stream_id: u64,
@@ -242,19 +255,16 @@ fn build_chunk_recipients(
     pcm: &[u8],
 ) -> Vec<(UserId, Vec<Vec<u8>>)> {
     match target {
-        StreamRecipients::Channel { rsa, pq, .. } => {
-            let mut out: Vec<(UserId, Vec<Vec<u8>>)> = rsa
-                .iter()
-                .filter_map(|(id, key)| crypto::encrypt_chunked(key, pcm).ok().map(|b| (*id, b)))
-                .collect();
-            if let Some(pq) = pq {
-                for (id, k_data, _) in &pq.per_recipient {
-                    let blob = crypto::pq::seal_chunk(k_data, stream_id, seq, pcm);
-                    out.push((*id, vec![blob]));
-                }
-            }
-            out
-        }
+        StreamRecipients::Channel { pq } => pq
+            .per_recipient
+            .iter()
+            .map(|(id, k_data, _)| {
+                (
+                    *id,
+                    vec![crypto::pq::seal_chunk(k_data, stream_id, seq, pcm)],
+                )
+            })
+            .collect(),
         StreamRecipients::Direct { to, key } => encrypt_direct_chunk(key, stream_id, seq, pcm)
             .map(|blocks| vec![(*to, blocks)])
             .unwrap_or_default(),
@@ -262,42 +272,36 @@ fn build_chunk_recipients(
 }
 
 /// One recipient's worth of `build_chunk_recipients`' `Direct` arm, pulled
-/// out so `file_transfer`'s sending worker can reuse the exact same RSA/PQ
-/// dispatch without duplicating it - a file transfer is always a single
-/// `DirectStreamKey` recipient (`docs/PROTOCOL.md`'s file transfer
-/// section), same shape as a DM voice stream.
-pub(crate) fn encrypt_direct_chunk(
+/// out so `file_transfer`'s sending worker can reuse it without
+/// duplicating it - a file transfer is always a single `DirectStreamKey`
+/// recipient (`docs/PROTOCOL.md`'s file transfer section), same shape as a
+/// DM voice stream.
+pub fn encrypt_direct_chunk(
     key: &DirectStreamKey,
     stream_id: u64,
     seq: u32,
     data: &[u8],
 ) -> Option<Vec<Vec<u8>>> {
     match key {
-        DirectStreamKey::Rsa(k) => crypto::encrypt_chunked(k, data).ok(),
         DirectStreamKey::Pq(pq) => {
             let (_, k_data, _) = pq.per_recipient.first()?;
-            let blob = crypto::pq::seal_chunk(k_data, stream_id, seq, data);
-            Some(vec![blob])
+            Some(vec![crypto::pq::seal_chunk(k_data, stream_id, seq, data)])
         }
+        // Already pad ciphertext - sealing it again would buy nothing and
+        // needs a keybundle this pair does not have.
+        DirectStreamKey::Pad => Some(vec![data.to_vec()]),
     }
 }
 
-/// Every `UserId` a stream's `target` addresses - RSA and PQ recipients
-/// combined for a channel stream, the single recipient for a DM. Used at
+/// Every `UserId` a stream's `target` addresses - every recipient of a
+/// channel stream, the single recipient for a DM. Used at
 /// `*End` time to fan `P2pOutbound::VoiceEnd` out to the same recipient set
 /// `*Start` reached: the stream travels peer to peer (`docs/PROTOCOL.md`
 /// §7.1), so there is no membership list on the receiving end to derive it
 /// from.
 fn stream_recipient_ids(target: &StreamRecipients) -> Vec<UserId> {
     match target {
-        StreamRecipients::Channel { rsa, pq, .. } => rsa
-            .iter()
-            .map(|(id, _)| *id)
-            .chain(
-                pq.iter()
-                    .flat_map(|pq| pq.per_recipient.iter().map(|(id, ..)| *id)),
-            )
-            .collect(),
+        StreamRecipients::Channel { pq } => pq.per_recipient.iter().map(|(id, ..)| *id).collect(),
         StreamRecipients::Direct { to, .. } => vec![*to],
     }
 }
@@ -475,11 +479,7 @@ impl ChunkDecryptor {
     /// order). `None` if the setup fails to verify - a stream whose setup
     /// isn't authentic decrypts nothing at all, the same fail-closed
     /// behaviour as a bad signature on a text message.
-    pub fn install_setup(
-        &mut self,
-        stream_id: u64,
-        blob: &[u8],
-    ) -> Option<Vec<(u32, Vec<u8>)>> {
+    pub fn install_setup(&mut self, stream_id: u64, blob: &[u8]) -> Option<Vec<(u32, Vec<u8>)>> {
         let IncomingStreamKey::Pq {
             my_decaps,
             my_fp,
@@ -510,18 +510,10 @@ impl ChunkDecryptor {
     /// key, corrupted chunk, bad AEAD tag, or - for `pq_hybrid` - a setup
     /// that hasn't arrived yet, in which case the chunk is held for
     /// `install_setup` to replay).
-    pub fn decrypt(
-        &mut self,
-        stream_id: u64,
-        seq: u32,
-        blocks: &[Vec<u8>],
-    ) -> Option<Vec<u8>> {
+    pub fn decrypt(&mut self, stream_id: u64, seq: u32, blocks: &[Vec<u8>]) -> Option<Vec<u8>> {
         match &self.key {
-            // `Password`/`None` never rotate, so this is always our one
-            // static private key, snapshotted at stream start.
-            IncomingStreamKey::Rsa(privates) => privates
-                .iter()
-                .find_map(|k| crypto::decrypt_chunked(k, blocks).ok()),
+            IncomingStreamKey::Pad => blocks.first().cloned(),
+            IncomingStreamKey::Undecryptable => None,
             IncomingStreamKey::Pq { .. } => {
                 let blob = blocks.first()?;
                 let Some(k_data) = self.pq_k_data else {
@@ -538,10 +530,10 @@ impl ChunkDecryptor {
 
 /// Runs on a dedicated thread for the lifetime of one incoming stream -
 /// each stream gets its own, rather than sharing one decrypt thread across
-/// every incoming stream, because private-key decrypt (RSA) or unwrap+AEAD
-/// (`PqHybrid`) is meaningfully costlier than the sender's own encrypt: a
-/// single shared thread would start lagging behind real time with just two
-/// or three simultaneous incoming streams.
+/// every incoming stream, because unwrap+AEAD is meaningfully costlier
+/// than the sender's own encrypt: a single shared thread would start
+/// lagging behind real time with just two or three simultaneous incoming
+/// streams.
 pub(crate) fn spawn_stream_decrypt_worker(
     key: IncomingStreamKey,
     mixer_tx: tokio::sync::mpsc::UnboundedSender<voice::MixerCmd>,
@@ -680,59 +672,38 @@ pub(crate) fn resolve_direct_key(
     session: &SessionState,
     stream_id: u64,
     to: UserId,
-    recipient_key_mode: KeyMode,
     recipient_pubkey_der: &[u8],
 ) -> Option<DirectStreamKey> {
-    match recipient_key_mode {
-        KeyMode::PqHybrid => {
-            // A direct stream belongs to no channel - the same binding a DM
-            // text message carries, and what keeps it out of one.
-            let pq = build_pq_stream_out(
-                session,
-                None,
-                stream_id,
-                &[(to, recipient_pubkey_der.to_vec())],
-            )?;
-            Some(DirectStreamKey::Pq(pq))
-        }
-        _ => crypto::public_key_from_der(recipient_pubkey_der)
-            .ok()
-            .map(DirectStreamKey::Rsa),
-    }
+    // A direct stream belongs to no channel - the same binding a DM text
+    // message carries, and what keeps it out of one.
+    build_pq_stream_out(
+        session,
+        None,
+        stream_id,
+        &[(to, recipient_pubkey_der.to_vec())],
+    )
+    .map(DirectStreamKey::Pq)
 }
 
-/// Resolves which key to try for an incoming stream/transfer from `from`,
-/// decided by *our own* `session.own_key_mode` - a stream addressed to us
-/// was encrypted against whatever *we* announced, regardless of the
-/// sender's `my_key`. Shared by voice and file transfer, both snapshotting
-/// once at start rather than per chunk. `sender_public_key_der` is only
-/// used when we are `PqHybrid`, to verify the once-per-stream signature.
+/// Resolves which key to try for an incoming stream/transfer from `from`.
+/// A stream addressed to us was encrypted against what *we* announced, so
+/// this is derived from our own rotating keys; `sender_public_key_der`
+/// verifies the once-per-stream signature. Shared by voice and file
+/// transfer, both snapshotting once at start rather than per chunk.
 pub(crate) fn resolve_incoming_key(
     session: &SessionState,
     from: UserId,
     sender_public_key_der: &[u8],
 ) -> IncomingStreamKey {
-    if session.own_key_mode == KeyMode::PqHybrid {
-        match (
-            session.own_pq_keys.as_ref(),
-            proto::decode(sender_public_key_der),
-        ) {
-            (Some(own), Ok(sender_public)) if session.own_pq_fp.is_some() => {
-                IncomingStreamKey::Pq {
-                    my_decaps: own.candidates_for(from),
-                    my_fp: session.own_pq_fp.expect("guarded by the match arm above"),
-                    sender_public,
-                }
-            }
-            // Malformed sender key, or (shouldn't happen) no own PQ
-            // identity despite `own_key_mode == PqHybrid` - nothing
-            // decryptable either way, so every chunk will just fail to
-            // decrypt below rather than crashing anything.
-            _ => IncomingStreamKey::Rsa(Vec::new()),
-        }
-    } else {
-        let candidates = session.own_keys.as_ref().cloned().into_iter().collect();
-        IncomingStreamKey::Rsa(candidates)
+    match proto::decode(sender_public_key_der) {
+        Ok(sender_public) => IncomingStreamKey::Pq {
+            my_decaps: session.own_pq_keys.candidates_for(from),
+            my_fp: session.own_pq_fp,
+            sender_public,
+        },
+        // A malformed sender key leaves nothing decryptable, so every
+        // chunk simply fails below rather than crashing anything.
+        Err(_) => IncomingStreamKey::Undecryptable,
     }
 }
 
@@ -742,11 +713,10 @@ pub(crate) fn start_incoming_stream(
     stream_id: u64,
     channel: Option<String>,
     suppress_playback: bool,
-    // The sender's `UserInfo.public_key_der` (whatever `key_mode` they
-    // announced) - only actually used when *our own* `own_key_mode` is
-    // `PqHybrid`, to verify the once-per-stream signature. Passed as raw
-    // bytes rather than requiring a full `UserInfo` here so callers already
-    // holding just the field don't need to reconstruct one.
+    // The sender's announced `UserInfo.public_key_der`, used to verify the
+    // once-per-stream signature. Passed as raw bytes rather than requiring
+    // a full `UserInfo` here so callers already holding just the field
+    // don't need to reconstruct one.
     sender_public_key_der: &[u8],
 ) {
     let mixer_id = session.next_mixer_id;

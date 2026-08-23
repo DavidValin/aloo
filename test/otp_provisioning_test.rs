@@ -742,54 +742,73 @@ fn zz_scratch_measure_chunk_dgram() {
 // Pure-OTP mode: which framing applies, and what each one rests on
 // ---------------------------------------------------------------------
 
-use aloo::client::otp::{framing_for, OtpFraming};
-use aloo::proto::KeyMode;
+use aloo::client::otp::{OtpFraming, framing_for};
 
-/// Scenario 1 - pq_hybrid available on both sides. The pad wraps an
-/// ordinary envelope, exactly as before; nothing about this path changes.
+/// The bytes a `pq_hybrid` peer announces in `UserInfo::public_key_der`.
+fn announced_bundle() -> Vec<u8> {
+    let (public, _) =
+        aloo::crypto::pq::generate_bundle_with_bits(1024).expect("bundle");
+    proto::encode(&public).expect("encode")
+}
+
+/// Scenario 1 - both sides announced a readable `pq_hybrid` keybundle,
+/// which is every pair reached through a server. The pad wraps an ordinary
+/// envelope, and the envelope's own signature applies on top of the pad's
+/// decrypt verdict.
+/// @requirement AC-082
 #[test]
-fn pq_hybrid_on_both_sides_keeps_the_wrapped_framing() {
+fn two_readable_keybundles_get_the_wrapped_framing() {
     assert_eq!(
-        framing_for(KeyMode::PqHybrid, KeyMode::PqHybrid),
+        framing_for(&announced_bundle(), &announced_bundle()),
         OtpFraming::PqWrapped
     );
 }
 
-/// Scenario 2 - pq_hybrid missing on either side. An envelope can only be
-/// built when this side can sign one *and* the other can open it, so a
-/// single missing identity is enough to drop to direct framing.
+/// Scenario 2 - one side or the other has no readable keybundle. An
+/// envelope can only be built if this side can sign one *and* the other
+/// can open it, so a single unreadable key is enough to drop to direct
+/// framing. This is exactly a serverless direct-punch peer
+/// (`docs/PROTOCOL.md` §7.1.5), known only by an `id_store` pin that is
+/// not a bundle: a pad both sides already hold still carries the
+/// conversation.
+/// @requirement AC-082
 #[test]
-fn a_missing_pq_hybrid_identity_on_either_side_means_direct_framing() {
+fn an_unreadable_key_on_either_side_means_direct_framing() {
+    let readable = announced_bundle();
     for (own, peer) in [
-        (KeyMode::Password, KeyMode::PqHybrid),
-        (KeyMode::None, KeyMode::PqHybrid),
-        (KeyMode::PqHybrid, KeyMode::Password),
-        (KeyMode::PqHybrid, KeyMode::None),
-        (KeyMode::Password, KeyMode::Password),
-        (KeyMode::None, KeyMode::None),
+        (readable.clone(), Vec::new()),
+        (Vec::new(), readable.clone()),
+        (Vec::new(), Vec::new()),
+        (readable.clone(), b"not a bundle at all".to_vec()),
+        (b"not a bundle at all".to_vec(), readable.clone()),
     ] {
         assert_eq!(
-            framing_for(own, peer),
+            framing_for(&own, &peer),
             OtpFraming::Direct,
-            "own={own:?} peer={peer:?} cannot carry an inner envelope"
+            "neither side can carry an inner envelope unless both keys read"
         );
     }
 }
 
-/// The framing decision is symmetric in the sense that matters: both ends
-/// of one pair reach the same answer, so one never wraps while the other
-/// expects bare plaintext.
+/// The framing decision reads only the two keys, and reads them the same
+/// way whichever order they arrive in - so both ends of one pair reach the
+/// same answer, and one never wraps while the other expects bare
+/// plaintext.
+/// @requirement AC-082
 #[test]
 fn both_ends_of_a_pair_agree_on_the_framing() {
+    let alice = announced_bundle();
+    let bob = announced_bundle();
+    let opaque = b"not a bundle at all".to_vec();
     for (a, b) in [
-        (KeyMode::PqHybrid, KeyMode::PqHybrid),
-        (KeyMode::PqHybrid, KeyMode::Password),
-        (KeyMode::Password, KeyMode::None),
+        (alice.clone(), bob.clone()),
+        (alice.clone(), opaque.clone()),
+        (opaque.clone(), opaque.clone()),
     ] {
         assert_eq!(
-            framing_for(a, b),
-            framing_for(b, a),
-            "{a:?}/{b:?} must be framed identically from either side"
+            framing_for(&a, &b),
+            framing_for(&b, &a),
+            "the pair must be framed identically from either side"
         );
     }
 }

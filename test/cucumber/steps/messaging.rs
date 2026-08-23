@@ -2,8 +2,8 @@
 
 use cucumber::then;
 
-use aloo::proto::UserId;
 use aloo::client::tui::ui::{Focus, UiAction};
+use aloo::proto::UserId;
 
 use crate::steps::ui_common::id_for;
 use crate::support::{sidebar_row_containing, ui_rows_wide};
@@ -24,14 +24,14 @@ async fn send_requested(w: &mut AlooWorld, body: String, a: String, b: String) {
         } => {
             assert_eq!(channel, "general");
             assert_eq!(plaintext, &body);
-            let ids: Vec<UserId> = recipients.iter().map(|(id, _, _)| *id).collect();
+            let ids: Vec<UserId> = recipients.iter().map(|(id, _)| *id).collect();
             assert_eq!(
                 ids,
                 vec![UserId(id_for(&a)), UserId(id_for(&b))],
                 "every other member is addressed individually, and I am not among them"
             );
             assert!(
-                recipients.iter().all(|(_, _, key)| !key.is_empty()),
+                recipients.iter().all(|(_, key)| !key.is_empty()),
                 "each recipient must come with the key needed to encrypt to them"
             );
         }
@@ -102,7 +102,6 @@ async fn dm_send_requested(w: &mut AlooWorld, body: String, name: String) {
         UiAction::SendDirectText {
             to,
             plaintext,
-            recipient_key_mode: _,
             recipient_pubkey_der,
             log_index: _,
             msg_id: _,

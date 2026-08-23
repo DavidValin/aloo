@@ -9,13 +9,13 @@ use std::path::{Path, PathBuf};
 use tokio::net::TcpStream;
 
 use crate::BoxError;
-use crate::crypto;
 use crate::client::idstore;
-use crate::validation::is_storable;
-use crate::proto::{self, AuthKind, AuthResponse, ClientMessage, KeyMode, ServerMessage};
 use crate::client::reconnect;
 use crate::client::session;
 use crate::client::tui::ui_connect_popup::{self, ConnectPopupState};
+use crate::crypto;
+use crate::proto::{self, AuthKind, AuthResponse, ClientMessage, KeyMode, ServerMessage};
+use crate::validation::is_storable;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServerKeySelection {
@@ -24,16 +24,15 @@ pub enum ServerKeySelection {
     Rsa(PathBuf),
 }
 
+/// Where this client's own identity comes from. `pq_hybrid`
+/// (`docs/PROTOCOL.md` §13) is the only peer-to-peer scheme this app has,
+/// so there is nothing to choose between: both files are keybundles
+/// produced by `aloo --keygen-pq-hybrid` (or auto-generated on first
+/// connect, §13.9), not PEM.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MyKeySelection {
-    None,
-    Password(String),
-    /// `pq_hybrid` (`docs/PROTOCOL.md` §13): both files are keybundles
-    /// produced by `aloo --keygen-pq-hybrid`, not PEM.
-    PqHybrid {
-        file_pub: PathBuf,
-        file_priv: PathBuf,
-    },
+pub struct MyKeySelection {
+    pub file_pub: PathBuf,
+    pub file_priv: PathBuf,
 }
 
 /// What the user asked to connect with, as collected by the connect popup
@@ -47,28 +46,22 @@ pub struct ConnectRequest {
     pub my_key: MyKeySelection,
     /// Where the local identity-pinning store lives (see
     /// `aloo::idstore`, `docs/PROTOCOL.md` §12) - the file that remembers
-    /// each nickname's full public key from the last time it was seen (for
-    /// `password`/`pq_hybrid`), so a reconnecting peer whose key suddenly
-    /// changed can be flagged instead of silently trusted. Prefilled from
+    /// each nickname's full public key from the last time it was seen, so
+    /// a reconnecting peer whose key suddenly changed can be flagged
+    /// instead of silently trusted. Prefilled from
     /// `idstore::default_path` but freely editable.
     pub id_store_path: PathBuf,
 }
 
-/// This client's own resolved key material, whichever `my_key` type
-/// produced it. Replaces a bare `RsaPrivateKey` return once `PqHybrid`
-/// needed to carry a whole `crypto::pq::PqPrivateBundle` instead - every
-/// other `my_key` type still resolves to a plain RSA keypair exactly as
-/// before. `pub` so `resolve_my_keypair`'s return type is externally
-/// nameable (see its own doc comment).
-pub enum ResolvedIdentity {
-    Rsa(crypto::KeyPair),
-    Pq {
-        private: crypto::pq::PqPrivateBundle,
-        /// Bincode-encoded `crypto::pq::PqPublicBundle`, precomputed here
-        /// (once, from `file_pub`) since `Identify`'s `public_key_der` needs
-        /// it and `PqPrivateBundle` alone can't derive it back out.
-        public_der: Vec<u8>,
-    },
+/// This client's own resolved key material, loaded from the keybundle
+/// pair `MyKeySelection` names. `pub` so `resolve_my_keypair`'s return
+/// type is externally nameable (see its own doc comment).
+pub struct ResolvedIdentity {
+    pub private: crypto::pq::PqPrivateBundle,
+    /// Bincode-encoded `crypto::pq::PqPublicBundle`, precomputed here
+    /// (once, from `file_pub`) since `Identify`'s `public_key_der` needs
+    /// it and `PqPrivateBundle` alone can't derive it back out.
+    pub public_der: Vec<u8>,
 }
 
 /// A distinct error type so `run_client_inner` can tell "the server
@@ -89,7 +82,9 @@ pub async fn run_client_inner(
     surface: &mut crate::client::tui::surface::Surface,
     port: u16,
     keyboard_release_reporting: bool,
-    hotkey_rx: Option<tokio::sync::mpsc::UnboundedReceiver<crate::client::global_ptt::GlobalPttEvent>>,
+    hotkey_rx: Option<
+        tokio::sync::mpsc::UnboundedReceiver<crate::client::global_ptt::GlobalPttEvent>,
+    >,
 ) -> Result<(), BoxError> {
     let mut popup = ConnectPopupState::new();
     popup.port = port.to_string();
@@ -101,12 +96,7 @@ pub async fn run_client_inner(
         crate::settings::Settings::default()
     });
     let mut cache = load_connect_cache();
-    prefill_connect_defaults(
-        &mut popup,
-        &settings,
-        &cache,
-        &crate::platform::aloo_dir(),
-    );
+    prefill_connect_defaults(&mut popup, &settings, &cache, &crate::platform::aloo_dir());
 
     loop {
         let Some(request) = ui_connect_popup::run(surface, &mut popup)? else {
@@ -126,24 +116,18 @@ pub async fn run_client_inner(
         ) {
             crate::log_warn!("could not remember this connection in ~/.aloo/settings ({e})");
         }
-        if let MyKeySelection::PqHybrid {
-            file_pub,
-            file_priv,
-        } = &request.my_key
-        {
-            cache.record(
-                &request.host,
-                request.port,
-                &file_pub.display().to_string(),
-                &file_priv.display().to_string(),
-            );
-            if let Err(e) = cache.save() {
-                crate::log_warn!("failed to save connect cache: {e}");
-            }
+        cache.record(
+            &request.host,
+            request.port,
+            &request.my_key.file_pub.display().to_string(),
+            &request.my_key.file_priv.display().to_string(),
+        );
+        if let Err(e) = cache.save() {
+            crate::log_warn!("failed to save connect cache: {e}");
         }
 
         match connect_with_reconnect(&request).await {
-            Ok((server_events, sink, you, identity, key_mode, server_addr)) => {
+            Ok((server_events, sink, you, identity, server_addr)) => {
                 let id_store = load_id_store(&request.id_store_path);
                 // The stdin reader is started only now, once the popup is
                 // done with the terminal - the popup drives its own
@@ -157,7 +141,6 @@ pub async fn run_client_inner(
                     request.nickname,
                     you,
                     identity,
-                    key_mode,
                     keyboard_release_reporting,
                     id_store,
                     hotkey_rx,
@@ -203,16 +186,12 @@ pub async fn connect_with_reconnect(
         reconnect::ServerSink,
         proto::UserId,
         ResolvedIdentity,
-        KeyMode,
         std::net::SocketAddr,
     ),
     BoxError,
 > {
-    let (rd, wr, you, identity, key_mode, server_addr) = connect_and_handshake(request).await?;
-    let public_key_der = match &identity {
-        ResolvedIdentity::Rsa(kp) => crypto::public_key_to_der(&kp.public)?,
-        ResolvedIdentity::Pq { public_der, .. } => public_der.clone(),
-    };
+    let (rd, wr, you, identity, server_addr) = connect_and_handshake(request).await?;
+    let public_key_der = identity.public_der.clone();
     let (sink, lost_rx) = reconnect::ServerSink::new(wr);
     let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
     reconnect::spawn_supervisor(
@@ -220,22 +199,20 @@ pub async fn connect_with_reconnect(
         reconnect::ReconnectPlan {
             request: request.clone(),
             public_key_der,
-            key_mode,
             backoff: reconnect::Backoff::default(),
         },
         sink.clone(),
         lost_rx,
         events_tx,
     );
-    Ok((events_rx, sink, you, identity, key_mode, server_addr))
+    Ok((events_rx, sink, you, identity, server_addr))
 }
 
 /// Connects, then runs the auth + identify handshake. On success returns
-/// the split stream halves, the `UserId` the server assigned us, our
-/// private key (needed to decrypt incoming messages), and the `KeyMode`
-/// this session runs under. A taken nickname comes back as
-/// `NicknameTakenError` so the caller can retry instead of treating it as
-/// fatal.
+/// the split stream halves, the `UserId` the server assigned us, and our
+/// own keybundle (needed to decrypt incoming messages). A taken nickname
+/// comes back as `NicknameTakenError` so the caller can retry instead of
+/// treating it as fatal.
 pub(crate) async fn connect_and_handshake(
     request: &ConnectRequest,
 ) -> Result<
@@ -244,34 +221,29 @@ pub(crate) async fn connect_and_handshake(
         crate::control::ControlWriter<tokio::io::WriteHalf<TcpStream>>,
         proto::UserId,
         ResolvedIdentity,
-        KeyMode,
         std::net::SocketAddr,
     ),
     BoxError,
 > {
-    let (identity, key_mode) = resolve_my_keypair(&request.my_key)?;
-    let public_key_der = match &identity {
-        ResolvedIdentity::Rsa(kp) => crypto::public_key_to_der(&kp.public)?,
-        ResolvedIdentity::Pq { public_der, .. } => public_der.clone(),
-    };
-    let (rd, wr, you, server_addr) = handshake_as(request, public_key_der, key_mode).await?;
-    Ok((rd, wr, you, identity, key_mode, server_addr))
+    let identity = resolve_my_keypair(&request.my_key)?;
+    let public_key_der = identity.public_der.clone();
+    let (rd, wr, you, server_addr) = handshake_as(request, public_key_der).await?;
+    Ok((rd, wr, you, identity, server_addr))
 }
 
 /// The handshake itself, for an identity that has already been resolved.
 ///
 /// Split out from `connect_and_handshake` for reconnects
 /// (`crate::client::reconnect`), which must come back as the *same*
-/// identity: `resolve_my_keypair` generates a fresh keypair for
-/// `MyKeySelection::None`, so re-resolving would silently change who this
-/// client is halfway through a session. Everything a reconnect can safely
+/// identity: re-resolving would re-read (or, on a first run, re-generate)
+/// the keybundle files behind this client's back. Everything a reconnect
+/// can safely
 /// redo - the TCP connect, the sealed control channel, the server's proof
 /// of itself, auth, and identify - is here; everything it must not redo is
 /// in the caller.
 pub(crate) async fn handshake_as(
     request: &ConnectRequest,
     public_key_der: Vec<u8>,
-    key_mode: KeyMode,
 ) -> Result<
     (
         crate::control::ControlReader<tokio::io::ReadHalf<TcpStream>>,
@@ -334,7 +306,7 @@ pub(crate) async fn handshake_as(
     wr.send(&ClientMessage::Identify {
         display_name: request.nickname.clone(),
         public_key_der,
-        key_mode,
+        key_mode: KeyMode::PqHybrid,
     })
     .await?;
 
@@ -352,10 +324,11 @@ pub(crate) async fn handshake_as(
 }
 
 /// Resolves `host:port`, preferring IPv4 when both A and AAAA records exist.
-async fn resolve_server_prefer_ipv4(host: &str, port: u16) -> Result<std::net::SocketAddr, BoxError> {
-    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host, port))
-        .await?
-        .collect();
+async fn resolve_server_prefer_ipv4(
+    host: &str,
+    port: u16,
+) -> Result<std::net::SocketAddr, BoxError> {
+    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host, port)).await?.collect();
     prefer_ipv4(&addrs).ok_or_else(|| format!("no addresses for {host}:{port}").into())
 }
 
@@ -390,41 +363,24 @@ pub fn prefer_ipv4(addrs: &[std::net::SocketAddr]) -> Option<std::net::SocketAdd
         .copied()
 }
 
-/// `PqHybrid` is never generated in-process here - always loaded from the
-/// keybundle files `aloo --keygen-pq-hybrid` produces (§13). `pub` purely
-/// so `test/connect_test.rs` can exercise the `PqHybrid` auto-generate arm
-/// directly without a live socket.
-pub fn resolve_my_keypair(sel: &MyKeySelection) -> Result<(ResolvedIdentity, KeyMode), BoxError> {
-    match sel {
-        MyKeySelection::None => Ok((
-            ResolvedIdentity::Rsa(crypto::KeyPair::generate()?),
-            KeyMode::None,
-        )),
-        MyKeySelection::Password(pw) => Ok((
-            ResolvedIdentity::Rsa(crypto::KeyPair::from_password(pw)?),
-            KeyMode::Password,
-        )),
-        MyKeySelection::PqHybrid {
-            file_pub,
-            file_priv,
-        } => {
-            // Transparently generates a fresh keybundle at these exact
-            // paths if either is missing - covers both a freshly-assigned,
-            // not-yet-generated location (`fresh_pq_hybrid_paths_in`) and a
-            // path the user typed by hand that simply doesn't exist yet.
-            crypto::pq::ensure_bundle_at(file_pub, file_priv)?;
-            let private = crypto::pq::load_private_bundle(file_priv)?;
-            let public = crypto::pq::load_public_bundle(file_pub)?;
-            let public_der = proto::encode(&public)?;
-            Ok((
-                ResolvedIdentity::Pq {
-                    private,
-                    public_der,
-                },
-                KeyMode::PqHybrid,
-            ))
-        }
-    }
+/// Keys are never derived in-process here - always loaded from the
+/// keybundle files `aloo --keygen-pq-hybrid` produces (§13), generating
+/// them first if they aren't there yet. `pub` purely so
+/// `test/connect_test.rs` can exercise the auto-generate arm directly
+/// without a live socket.
+pub fn resolve_my_keypair(sel: &MyKeySelection) -> Result<ResolvedIdentity, BoxError> {
+    // Transparently generates a fresh keybundle at these exact paths if
+    // either is missing - covers both a freshly-assigned,
+    // not-yet-generated location (`fresh_pq_hybrid_paths_in`) and a path
+    // the user typed by hand that simply doesn't exist yet.
+    crypto::pq::ensure_bundle_at(&sel.file_pub, &sel.file_priv)?;
+    let private = crypto::pq::load_private_bundle(&sel.file_priv)?;
+    let public = crypto::pq::load_public_bundle(&sel.file_pub)?;
+    let public_der = proto::encode(&public)?;
+    Ok(ResolvedIdentity {
+        private,
+        public_der,
+    })
 }
 
 fn build_auth_response(
@@ -702,7 +658,6 @@ pub fn prefill_connect_defaults(
         if settings.connect_port.is_none() {
             popup.port = port.to_string();
         }
-        popup.my_key.key_type = ui_connect_popup::MyKeyType::PqHybrid;
         popup.my_key.file_pub = file_pub.to_string();
         popup.my_key.file_priv = file_priv.to_string();
     } else {

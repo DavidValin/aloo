@@ -8,8 +8,10 @@
 
 use aloo::client::pq_rekey::{PQ_KEY_RETENTION, PqOwnKeys};
 use aloo::client::replay::ReplayGuard;
-use aloo::crypto::pq::{bundle_fingerprint, open_chunk, open_send, open_setup, seal_chunk,
-    seal_send, seal_setup, sign_rotation, verify_rotation};
+use aloo::crypto::pq::{
+    bundle_fingerprint, open_chunk, open_send, open_setup, seal_chunk, seal_send, seal_setup,
+    sign_rotation, verify_rotation,
+};
 use aloo::proto::UserId;
 use cucumber::{given, then, when};
 
@@ -18,13 +20,7 @@ use crate::world::{AlooWorld, pq_bundle_for};
 /// Seals to a peer's bootstrap keys - these scenarios are about what a send
 /// is bound to, not about rotation, which `pq_hybrid_forward_secrecy` and
 /// `pq_rekey_test.rs` cover.
-fn seal_to(
-    from: &str,
-    to: &str,
-    channel: Option<String>,
-    send_id: u64,
-    data: &[u8],
-) -> Vec<u8> {
+fn seal_to(from: &str, to: &str, channel: Option<String>, send_id: u64, data: &[u8]) -> Vec<u8> {
     let (_, from_private) = pq_bundle_for(from);
     let (to_public, _) = pq_bundle_for(to);
     seal_send(
@@ -40,7 +36,11 @@ fn seal_to(
 
 /// Opens as `who` would: their own bootstrap decryption key and their own
 /// fingerprint, which the binding has to name.
-fn open_as(who: &str, sender: &str, blob: &[u8]) -> Option<(aloo::crypto::pq::SendBinding, Vec<u8>)> {
+fn open_as(
+    who: &str,
+    sender: &str,
+    blob: &[u8],
+) -> Option<(aloo::crypto::pq::SendBinding, Vec<u8>)> {
     let (their_public, their_private) = pq_bundle_for(who);
     let (sender_public, _) = pq_bundle_for(sender);
     let fp = bundle_fingerprint(&their_public).expect("fingerprint");
@@ -167,8 +167,7 @@ async fn reads_back(w: &mut AlooWorld, who: String) {
             let (their_public, _) = pq_bundle_for(&who);
             let (alice_public, _) = pq_bundle_for("alice");
             let fp = bundle_fingerprint(&their_public).expect("fingerprint");
-            open_send(&own.candidates_for(SENDER), &fp, &alice_public, &w.sealed)
-                .map(|(_, pt)| pt)
+            open_send(&own.candidates_for(SENDER), &fp, &alice_public, &w.sealed).map(|(_, pt)| pt)
         }
         None => open_as(&who, "alice", &w.sealed).map(|(_, pt)| pt),
     }
@@ -194,8 +193,13 @@ async fn reads_back_stream(w: &mut AlooWorld, who: String) {
     let (alice_public, _) = pq_bundle_for("alice");
     let their_fp = bundle_fingerprint(&their_public).unwrap();
     let setup = w.sealed_setup.as_ref().expect("no stream in this scenario");
-    let k_data = open_setup(&[their_private.bootstrap_decap().clone()], &their_fp, &alice_public, setup)
-        .expect("the stream setup must verify for its recipient");
+    let k_data = open_setup(
+        &[their_private.bootstrap_decap().clone()],
+        &their_fp,
+        &alice_public,
+        setup,
+    )
+    .expect("the stream setup must verify for its recipient");
 
     for (seq, ciphertext) in w.sealed_chunks.iter().enumerate() {
         let seq = seq as u32;
@@ -215,7 +219,13 @@ async fn setup_proved_the_sender(w: &mut AlooWorld) {
     // Verified against the wrong sender, the setup yields no key at all -
     // so there is nothing to decrypt any chunk with.
     assert!(
-        open_setup(&[bob_private.bootstrap_decap().clone()], &bob_fp, &carol_public, setup).is_none(),
+        open_setup(
+            &[bob_private.bootstrap_decap().clone()],
+            &bob_fp,
+            &carol_public,
+            setup
+        )
+        .is_none(),
         "a stream setup must not verify against an identity that did not send it"
     );
 }
@@ -275,9 +285,7 @@ async fn seal_to_current_key(w: &mut AlooWorld, from: String, message: String, t
 
 #[when(expr = "{word} rotates past that key enough times for it to be forgotten")]
 async fn rotates_past(w: &mut AlooWorld, who: String) {
-    let own = w
-        .pq_own_keys
-        .get_or_insert_with(|| own_keys_for(&who));
+    let own = w.pq_own_keys.get_or_insert_with(|| own_keys_for(&who));
     for _ in 0..=PQ_KEY_RETENTION {
         own.rotate_for(SENDER);
     }
@@ -322,9 +330,7 @@ async fn seal_burst(w: &mut AlooWorld, from: String, count: u64, to: String) {
 
 #[when(expr = "{word} rotates once")]
 async fn rotates_once(w: &mut AlooWorld, who: String) {
-    let own = w
-        .pq_own_keys
-        .get_or_insert_with(|| own_keys_for(&who));
+    let own = w.pq_own_keys.get_or_insert_with(|| own_keys_for(&who));
     own.rotate_for(SENDER);
 }
 
@@ -334,7 +340,10 @@ async fn keybundle_cannot_open(w: &mut AlooWorld, who: String) {
     let (alice_public, _) = pq_bundle_for("alice");
     let fp = bundle_fingerprint(&their_public).expect("fingerprint");
 
-    let own = w.pq_own_keys.as_ref().expect("no rotation in this scenario");
+    let own = w
+        .pq_own_keys
+        .as_ref()
+        .expect("no rotation in this scenario");
     assert!(
         open_send(&own.candidates_for(SENDER), &fp, &alice_public, &w.sealed).is_none(),
         "a key rotated past the retention window must not open its message"
@@ -398,10 +407,17 @@ async fn can_still_open_all(w: &mut AlooWorld, who: String, count: usize) {
     let (their_public, _) = pq_bundle_for(&who);
     let (alice_public, _) = pq_bundle_for("alice");
     let fp = bundle_fingerprint(&their_public).expect("fingerprint");
-    let own = w.pq_own_keys.as_ref().expect("no rotation in this scenario");
+    let own = w
+        .pq_own_keys
+        .as_ref()
+        .expect("no rotation in this scenario");
     let candidates = own.candidates_for(SENDER);
 
-    assert_eq!(w.sealed_burst.len(), count, "wrong number of messages sealed");
+    assert_eq!(
+        w.sealed_burst.len(),
+        count,
+        "wrong number of messages sealed"
+    );
     for (i, blob) in w.sealed_burst.iter().enumerate() {
         let (_, plaintext) = open_send(&candidates, &fp, &alice_public, blob)
             .expect("a retained key must still open a message from the burst");

@@ -6,8 +6,8 @@
 use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 use cucumber::{given, then, when};
 
-use aloo::proto::{ChannelInfo, ChannelKind, KeyMode, UserId, UserInfo};
 use aloo::client::tui::ui::{Focus, MessageBody, UiState};
+use aloo::proto::{ChannelInfo, ChannelKind, KeyMode, UserId, UserInfo};
 
 use crate::support::{popup_body, ui_buffer};
 use crate::world::AlooWorld;
@@ -37,8 +37,6 @@ pub fn id_for(name: &str) -> u64 {
 
 fn key_mode_named(mode: &str) -> KeyMode {
     match mode {
-        "password" => KeyMode::Password,
-        "none" => KeyMode::None,
         "pq_hybrid" => KeyMode::PqHybrid,
         other => panic!("unknown key mode {other:?}"),
     }
@@ -97,7 +95,7 @@ async fn connected_two_channels(w: &mut AlooWorld) {
 
 #[given(expr = "{word} is in the channel with me")]
 async fn member_present(w: &mut AlooWorld, name: String) {
-    let info = user_with_mode(id_for(&name), &name, KeyMode::Password);
+    let info = user_with_mode(id_for(&name), &name, KeyMode::PqHybrid);
     w.ui_mut().seed_member("general", info);
 }
 
@@ -321,7 +319,9 @@ pub const BEHIND_MARKER: &str = "ZZQQ-behind-marker-ZZQQ";
 #[given("the channel log is full of messages")]
 async fn log_full_of_marker(w: &mut AlooWorld) {
     let id = UserId(id_for("bob"));
-    let channel = w.ui_ref().channels[w.ui_ref().selected_channel].name.clone();
+    let channel = w.ui_ref().channels[w.ui_ref().selected_channel]
+        .name
+        .clone();
     let state = w.ui_mut();
     for _ in 0..40 {
         state.on_channel_message(

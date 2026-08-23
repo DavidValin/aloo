@@ -2399,6 +2399,16 @@ impl PeerLinkManager {
     /// on what a code path actually decided to send without needing two
     /// live sockets and a completed punch; nothing in the client branches
     /// on it.
+    /// Opens an unpunched link record for `peer` - exposed for tests,
+    /// which need somewhere for a send to queue against a *serverless*
+    /// peer. `ensure_link` deliberately refuses to signal for one (the
+    /// direct punch owns that link, §7.1.5 step 6), so unlike an ordinary
+    /// peer there is otherwise no record for `pending_payloads` to read
+    /// back. The real path reaches the same state through `direct_tick`.
+    pub fn open_unpunched_link_for_test(&mut self, peer: UserId) {
+        self.start_attempt(peer, Instant::now());
+    }
+
     pub fn pending_payloads(&self, peer: UserId) -> Vec<P2pPayload> {
         self.links
             .get(&peer)

@@ -14,13 +14,11 @@
 //! only a few hundred bytes.
 //!
 //! Byte comparison (`check_and_pin` returning `Mismatch`, driven by
-//! `session::check_identity`) is only meaningful for `KeyMode`s whose key
-//! is stable across connections (`PqHybrid`: file-loaded; `Password`:
-//! deterministically re-derived - see
-//! `keymode_policy::uses_byte_comparison_pinning`). `None` keys are
-//! freshly generated on every connect, so comparing them would raise a
-//! false impersonation warning on every reconnect - training users to
-//! dismiss the warning that matters.
+//! `session::check_identity`) is meaningful because a `pq_hybrid` identity
+//! is file-loaded and so genuinely the same bytes on every connect. It is
+//! the only identity this app has; a peer announcing bytes that do not
+//! decode as a keybundle has nothing stable to compare and is left
+//! unpinned rather than compared.
 
 use std::collections::HashMap;
 use std::fs;
@@ -134,16 +132,14 @@ fn now_unix() -> u64 {
 
 fn key_mode_as_str(mode: KeyMode) -> &'static str {
     match mode {
-        KeyMode::Password => "password",
-        KeyMode::None => "none",
         KeyMode::PqHybrid => "pqhybrid",
     }
 }
 
+/// Anything but `pqhybrid` is `None` - including the `password`/`none`
+/// tags older stores could hold, whose schemes this app no longer has.
 fn parse_key_mode(s: &str) -> Option<KeyMode> {
     match s {
-        "password" => Some(KeyMode::Password),
-        "none" => Some(KeyMode::None),
         "pqhybrid" => Some(KeyMode::PqHybrid),
         _ => None,
     }
@@ -200,7 +196,8 @@ impl IdStore {
                         .next()
                         .filter(|s| !s.is_empty())
                         .and_then(|s| s.parse().ok());
-                    let last_device_id = fields.next().filter(|s| !s.is_empty()).map(str::to_string);
+                    let last_device_id =
+                        fields.next().filter(|s| !s.is_empty()).map(str::to_string);
                     let last_seen_unix = fields
                         .next()
                         .filter(|s| !s.is_empty())

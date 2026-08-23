@@ -437,7 +437,7 @@ fn the_connect_cache_is_the_last_resort_before_defaults() {
     // people have already pinned is the one the daemon comes back as.
     assert_eq!(
         config.my_key,
-        MyKeySelection::PqHybrid {
+        MyKeySelection {
             file_pub: "/keys/x.pub".into(),
             file_priv: "/keys/x.priv".into(),
         }

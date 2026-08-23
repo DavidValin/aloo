@@ -412,9 +412,7 @@ async fn serve_one(
         }
         buf.extend_from_slice(&chunk[..read]);
 
-        while let Some((message, consumed)) =
-            daemon_ipc::decode_frame::<AttachMessage>(&buf)?
-        {
+        while let Some((message, consumed)) = daemon_ipc::decode_frame::<AttachMessage>(&buf)? {
             buf.drain(..consumed);
             match message {
                 AttachMessage::Attach {
@@ -438,15 +436,12 @@ async fn serve_one(
                 }
                 AttachMessage::Key(key) => {
                     let (code, modifiers, kind) = key.to_crossterm();
-                    let _ = input_tx.send(SessionInput::Key(
-                        crossterm::event::Event::Key(crossterm::event::KeyEvent::new_with_kind(
-                            code, modifiers, kind,
-                        )),
-                    ));
+                    let _ = input_tx.send(SessionInput::Key(crossterm::event::Event::Key(
+                        crossterm::event::KeyEvent::new_with_kind(code, modifiers, kind),
+                    )));
                 }
                 AttachMessage::Resize { cols, rows } => {
-                    let _ = input_tx
-                        .send(SessionInput::Resized(TerminalSize::new(cols, rows)));
+                    let _ = input_tx.send(SessionInput::Resized(TerminalSize::new(cols, rows)));
                 }
                 AttachMessage::Detach => {
                     let _ = reply_tx.send(DaemonMessage::Detached {
@@ -894,7 +889,7 @@ fn resolve_my_key(
     cached: Option<(&str, u16, &str, &str)>,
 ) -> Result<crate::client::connect::MyKeySelection, String> {
     if let Some(prefix) = &flags.my_key_prefix {
-        return Ok(crate::client::connect::MyKeySelection::PqHybrid {
+        return Ok(crate::client::connect::MyKeySelection {
             file_pub: PathBuf::from(format!("{prefix}.pub")),
             file_priv: PathBuf::from(format!("{prefix}.priv")),
         });
@@ -902,20 +897,20 @@ fn resolve_my_key(
     if let (Some(file_pub), Some(file_priv)) =
         (&settings.daemon_my_key_pub, &settings.daemon_my_key_priv)
     {
-        return Ok(crate::client::connect::MyKeySelection::PqHybrid {
+        return Ok(crate::client::connect::MyKeySelection {
             file_pub: PathBuf::from(file_pub),
             file_priv: PathBuf::from(file_priv),
         });
     }
     if let Some((_, _, file_pub, file_priv)) = cached {
-        return Ok(crate::client::connect::MyKeySelection::PqHybrid {
+        return Ok(crate::client::connect::MyKeySelection {
             file_pub: PathBuf::from(file_pub),
             file_priv: PathBuf::from(file_priv),
         });
     }
     let (file_pub, file_priv) =
         crate::client::connect::fresh_pq_hybrid_paths_in(&crate::platform::aloo_dir());
-    Ok(crate::client::connect::MyKeySelection::PqHybrid {
+    Ok(crate::client::connect::MyKeySelection {
         file_pub,
         file_priv,
     })
@@ -1125,7 +1120,9 @@ impl DaemonPlan {
 /// which a daemon warns about below.
 pub async fn run(
     config: DaemonConfig,
-    hotkey_rx: Option<tokio::sync::mpsc::UnboundedReceiver<crate::client::global_ptt::GlobalPttEvent>>,
+    hotkey_rx: Option<
+        tokio::sync::mpsc::UnboundedReceiver<crate::client::global_ptt::GlobalPttEvent>,
+    >,
 ) -> Result<(), BoxError> {
     let instance =
         SingleInstance::acquire(daemon_ipc::socket_path(), daemon_ipc::pid_path()).await?;
@@ -1146,28 +1143,26 @@ pub async fn run(
     // identity resolution is the very same one a connecting client does;
     // all that is skipped is the part that needed somewhere to connect to.
     let serverless = config.no_server;
-    let (server_events, wr, you, identity, key_mode, server_addr) = if serverless {
-        let (identity, key_mode) = crate::client::connect::resolve_my_keypair(&request.my_key)?;
+    let (server_events, wr, you, identity, server_addr) = if serverless {
+        let identity = crate::client::connect::resolve_my_keypair(&request.my_key)?;
         (
             None,
             ServerlessSink::Null(crate::control::NullSink),
             crate::client::p2p::direct_peer_id(&request.nickname),
             identity,
-            key_mode,
             None,
         )
     } else {
         // A daemon is the start that most needs reconnecting: nobody is
         // watching it, and the session it would otherwise sit out is one
         // whose peers can still hear it (`docs/PROTOCOL.md` §4.2).
-        let (events, sink, you, identity, key_mode, server_addr) =
+        let (events, sink, you, identity, server_addr) =
             crate::client::connect::connect_with_reconnect(&request).await?;
         (
             Some(events),
             ServerlessSink::Server(sink),
             you,
             identity,
-            key_mode,
             Some(server_addr),
         )
     };
@@ -1192,8 +1187,8 @@ pub async fn run(
         );
     }
 
-    let id_store = crate::client::idstore::IdStore::load(&request.id_store_path)
-        .unwrap_or_else(|_| {
+    let id_store =
+        crate::client::idstore::IdStore::load(&request.id_store_path).unwrap_or_else(|_| {
             crate::client::idstore::IdStore::new_empty(request.id_store_path.clone())
         });
     if hotkey_rx.is_none() {
@@ -1222,7 +1217,6 @@ pub async fn run(
         request.nickname.clone(),
         you,
         identity,
-        key_mode,
         id_store,
         hotkey_rx,
         server_addr,
@@ -1244,7 +1238,10 @@ enum ServerlessSink {
 }
 
 impl crate::control::ControlSink for ServerlessSink {
-    async fn send_control(&mut self, msg: &crate::proto::ClientMessage) -> crate::proto::Result<()> {
+    async fn send_control(
+        &mut self,
+        msg: &crate::proto::ClientMessage,
+    ) -> crate::proto::Result<()> {
         match self {
             Self::Server(w) => w.send_control(msg).await,
             Self::Null(n) => n.send_control(msg).await,

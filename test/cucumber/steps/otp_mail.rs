@@ -453,7 +453,7 @@ async fn reconnect_and_fetch(w: &mut AlooWorld, who: String) {
             .send(&ClientMessage::Identify {
                 display_name: who.clone(),
                 public_key_der: vec![],
-                key_mode: KeyMode::Password,
+                key_mode: KeyMode::PqHybrid,
             })
             .await
             .unwrap();

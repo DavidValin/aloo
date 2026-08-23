@@ -49,10 +49,11 @@ pub struct FileOfferPayload {
 }
 
 /// `FileOfferPayload`'s voice counterpart, wrapped inside a
-/// `Content::VoiceOffer` envelope - only ever sent OTP-wrapped
-/// (`client::otp::send_voice_offer`), so `duration_ms` lives here rather
-/// than as a cleartext field, matching how `filename`/`size` stay out of
-/// the wire tag above.
+/// `Content::VoiceOffer` envelope and then, like a file offer, put through
+/// the pad (`client::otp::send_voice_offer`) - so `duration_ms` lives here
+/// rather than as a cleartext field, matching how `filename`/`size` stay
+/// out of the wire tag above. Padding it is what keeps that true under
+/// `Direct` framing, where there is no envelope to hide it in.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VoiceOfferPayload {
     pub duration_ms: u32,

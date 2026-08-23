@@ -3,11 +3,11 @@
 
 use cucumber::{given, then, when};
 
+use aloo::client::file_browser::FileBrowserState;
 use aloo::client::file_transfer::MAX_FILENAME_CHARS;
-use aloo::proto::UserId;
 use aloo::client::tui::file_send::{FileConfirmChoice, FileSendState, FileSendTarget};
 use aloo::client::tui::ui::{FileTransferStatus, MessageBody, Mode, PendingFileOffer, UiAction};
-use aloo::client::file_browser::FileBrowserState;
+use aloo::proto::UserId;
 use crossterm::event::{KeyCode, KeyModifiers};
 
 use crate::steps::ui_common::{id_for, press_key};
@@ -94,7 +94,7 @@ async fn file_send_requested_channel_addressed(
         } => {
             assert_eq!(channel, "general");
             assert_eq!(f, &filename);
-            let ids: Vec<UserId> = recipients.iter().map(|(id, _, _)| *id).collect();
+            let ids: Vec<UserId> = recipients.iter().map(|(id, _)| *id).collect();
             assert_eq!(ids, vec![UserId(id_for(&a)), UserId(id_for(&b))]);
         }
         other => panic!("expected SendFileChannel, got {other:?}"),

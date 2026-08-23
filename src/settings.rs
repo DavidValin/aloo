@@ -519,8 +519,10 @@ impl Settings {
                 // setting is spelled in every example and in the README -
                 // both are accepted so neither spelling is a silent no-op.
                 "daemon_no_server" => {
-                    settings.daemon_no_server =
-                        matches!(value.to_ascii_lowercase().as_str(), "on" | "true" | "yes" | "1");
+                    settings.daemon_no_server = matches!(
+                        value.to_ascii_lowercase().as_str(),
+                        "on" | "true" | "yes" | "1"
+                    );
                 }
                 "direct_punch" => {
                     settings.direct_punch = matches!(
@@ -698,7 +700,10 @@ impl Settings {
     /// whichever of them no longer applies - so switching a daemon from
     /// password to rsa auth doesn't leave the old password behind in the
     /// file for the next resolve to pick up.
-    pub fn set_daemon_server_key(&mut self, selection: &crate::client::connect::ServerKeySelection) {
+    pub fn set_daemon_server_key(
+        &mut self,
+        selection: &crate::client::connect::ServerKeySelection,
+    ) {
         use crate::client::connect::ServerKeySelection;
         self.daemon_server_password = None;
         self.daemon_server_rsa_keyfile = None;
@@ -715,25 +720,12 @@ impl Settings {
         }
     }
 
-    /// Records the keybundle a daemon connects with. Only `pq_hybrid` has
-    /// files to record - a daemon never uses any other `my_key` type (see
-    /// `client::daemon::resolve_my_key`), so the other variants clear the
-    /// keys rather than inventing a representation for them.
+    /// Records the keybundle a daemon connects with, so a later bare
+    /// `aloo --daemon` comes back as the same identity (see
+    /// `client::daemon::resolve_my_key`).
     pub fn set_daemon_my_key(&mut self, selection: &crate::client::connect::MyKeySelection) {
-        use crate::client::connect::MyKeySelection;
-        match selection {
-            MyKeySelection::PqHybrid {
-                file_pub,
-                file_priv,
-            } => {
-                self.daemon_my_key_pub = Some(file_pub.display().to_string());
-                self.daemon_my_key_priv = Some(file_priv.display().to_string());
-            }
-            _ => {
-                self.daemon_my_key_pub = None;
-                self.daemon_my_key_priv = None;
-            }
-        }
+        self.daemon_my_key_pub = Some(selection.file_pub.display().to_string());
+        self.daemon_my_key_priv = Some(selection.file_priv.display().to_string());
     }
 
     /// The general form of `update_muted_voice`: applies `edit` to what is

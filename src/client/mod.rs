@@ -12,7 +12,6 @@ pub mod file_transfer;
 pub mod global_notification;
 pub mod global_ptt;
 pub mod idstore;
-pub mod keymode_policy;
 pub mod netstats;
 pub mod otp;
 pub mod otp_cli;

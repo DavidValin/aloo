@@ -1,16 +1,17 @@
 use std::fs;
 use std::path::Path;
 
-/// ML-DSA-87+RSA4096 / ML-KEM-1024+RSA4096 / AES-256-GCM hybrid `my_key` method
-/// (`KeyMode::PqHybrid`). Kept as its own module since it shares no key
-/// material or primitives with the RSA-only code below - see its module doc
-/// for the full design, and `docs/PROTOCOL.md` §13.
+/// ML-DSA-87+RSA4096 / ML-KEM-1024+RSA4096 / AES-256-GCM hybrid `my_key`
+/// method (`KeyMode::PqHybrid`) - this app's one peer-to-peer scheme. Kept
+/// as its own module since it shares no key material with the RSA-only
+/// code below, which now serves only the server auth challenge and its own
+/// classical hedge - see its module doc for the full design, and
+/// `docs/PROTOCOL.md` §13.
 pub mod otp;
 pub mod pq;
 pub mod safety;
 
-use rand_chacha::ChaCha20Rng;
-use rand_core::{OsRng, RngCore, SeedableRng};
+use rand_core::{OsRng, RngCore};
 use rsa::pkcs8::{
     DecodePrivateKey, DecodePublicKey, EncodePrivateKey, EncodePublicKey, LineEnding,
 };
@@ -28,21 +29,6 @@ pub const RSA_KEY_BITS: usize = 2048;
 /// life of the keybundle.
 pub const RSA_PER_MSG_KEY_BITS: usize = 4096;
 
-/// Rounds used to stretch a `my_key` password into the seed for a
-/// deterministic keypair (`KeyPair::from_password`) - the only thing this
-/// app runs PBKDF2 over. A `server_key` password is *not* hashed: it is
-/// sent as-is in `proto::AuthResponse::Password` and compared byte-for-byte
-/// (in constant time) against the server's configured password by
-/// `server::AuthConfig::verify`.
-const PBKDF2_ROUNDS: u32 = 100_000;
-
-/// Fixed domain-separation salt for deterministic key derivation from a
-/// password. It is intentionally not random: the whole point of
-/// `KeyPair::from_password` is that the same password always reproduces
-/// the same keypair, so the user can "log in" from any machine without
-/// carrying a key file around.
-const PASSWORD_KEY_SALT: &[u8] = b"aloo-app/my-key-derivation/v1";
-
 #[derive(Debug, thiserror::Error)]
 pub enum CryptoError {
     #[error("io error: {0}")]
@@ -57,8 +43,10 @@ pub enum CryptoError {
 
 pub type Result<T> = std::result::Result<T, CryptoError>;
 
-/// An RSA keypair used both to prove identity to the server (`server_key`)
-/// and to receive/decrypt messages from other users (`my_key`).
+/// An RSA keypair. Used to prove identity to the server (`server_key`'s
+/// `rsa` type, §5.3) and as the classical hedge inside a `pq_hybrid`
+/// keybundle (`crypto::pq`); peer-to-peer content is never encrypted to
+/// one directly.
 pub struct KeyPair {
     pub private: RsaPrivateKey,
     pub public: RsaPublicKey,
@@ -76,24 +64,6 @@ impl KeyPair {
         let mut rng = OsRng;
         let private =
             RsaPrivateKey::new(&mut rng, bits).map_err(|e| CryptoError::Key(e.to_string()))?;
-        let public = private.to_public_key();
-        Ok(Self { private, public })
-    }
-
-    /// Deterministically derives a keypair from a password: the same
-    /// password always yields the same keypair, different passwords yield
-    /// different (for all practical purposes, unrelated) keypairs.
-    pub fn from_password(password: &str) -> Result<Self> {
-        let mut seed = [0u8; 32];
-        pbkdf2::pbkdf2_hmac::<Sha256>(
-            password.as_bytes(),
-            PASSWORD_KEY_SALT,
-            PBKDF2_ROUNDS,
-            &mut seed,
-        );
-        let mut rng = ChaCha20Rng::from_seed(seed);
-        let private = RsaPrivateKey::new(&mut rng, RSA_KEY_BITS)
-            .map_err(|e| CryptoError::Key(e.to_string()))?;
         let public = private.to_public_key();
         Ok(Self { private, public })
     }

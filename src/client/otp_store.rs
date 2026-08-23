@@ -54,7 +54,13 @@ pub enum PendingOtpContent {
     /// independent pad spend from `File`'s, reserved only once
     /// `FileAccepted` arrives (`client::otp::start_outgoing_file_content`).
     FileContent { stream_id: u64 },
-    Voice { duration_ms: u32 },
+    /// The *offer* phase of a voice message - padded exactly like
+    /// `File`'s, so the duration never travels in the clear, and carrying
+    /// `stream_id` for the same reason `File` does: recovery hands the
+    /// resent offer back to the same `OwnFileTarget` rather than
+    /// allocating a fresh one. The recording itself is a second,
+    /// independent spend, recorded as `FileContent`.
+    Voice { stream_id: u64, duration_ms: u32 },
     /// An OTP mail's pad spend (docs/PROTOCOL.md §17.2). Unlike every other
     /// variant it's acknowledged by the *server*'s `OtpMailResult` (storage
     /// is the delivery this spend waits on), and retried over the control
@@ -345,6 +351,24 @@ impl OtpStore {
         state.next_out_seq = state.next_out_seq.max(seq + 1);
     }
 
+    /// Takes the next outgoing sequence number without arming the
+    /// stop-and-wait gate - for a pad spend whose delivery is confirmed by
+    /// a reply of its own rather than by an `OtpDeliveryAck`.
+    ///
+    /// The session-control payloads are the case: `/endotp`'s notice is
+    /// confirmed by `OtpEndSessionAck`, and that ack is confirmed by the
+    /// notice simply not being retried. Arming the gate for either would
+    /// leave it armed forever, since nothing ever acks them the way a
+    /// message is acked - and a later `/otp` resuming this same contact
+    /// would find its first message queued behind a wait that can never
+    /// end.
+    pub fn reserve_out_seq(&mut self, contact_name: &str) -> u64 {
+        let state = self.entries.entry(contact_name.to_string()).or_default();
+        let seq = state.next_out_seq;
+        state.next_out_seq += 1;
+        seq
+    }
+
     /// Clears `pending_unacked_out_seq` iff it currently equals `seq` -
     /// refusing a stale or mismatched ack rather than trusting it blindly.
     /// Returns whether it actually cleared anything.
@@ -486,8 +510,11 @@ fn encode_pending_content(content: &PendingOtpContent) -> String {
         PendingOtpContent::FileContent { stream_id } => {
             format!("C{PENDING_CONTENT_SEP}{stream_id}")
         }
-        PendingOtpContent::Voice { duration_ms } => {
-            format!("V{PENDING_CONTENT_SEP}{duration_ms}")
+        PendingOtpContent::Voice {
+            stream_id,
+            duration_ms,
+        } => {
+            format!("V{PENDING_CONTENT_SEP}{stream_id}{PENDING_CONTENT_SEP}{duration_ms}")
         }
         PendingOtpContent::Mail { mail_id } => {
             format!("M{PENDING_CONTENT_SEP}{mail_id}")
@@ -519,8 +546,12 @@ fn decode_pending_content(s: &str) -> Option<PendingOtpContent> {
             Some(PendingOtpContent::FileContent { stream_id })
         }
         "V" => {
+            let stream_id = parts.next()?.parse().ok()?;
             let duration_ms = parts.next()?.parse().ok()?;
-            Some(PendingOtpContent::Voice { duration_ms })
+            Some(PendingOtpContent::Voice {
+                stream_id,
+                duration_ms,
+            })
         }
         "M" => {
             let mail_id = parts.next()?.to_string();

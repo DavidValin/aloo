@@ -12,13 +12,14 @@
 //! enough to skip. `hybrid_crypto_test.rs` covers the real sizes.
 
 use aloo::client::voice_stream::{
-    ChunkDecryptor, IdleStreamAction, IncomingStreamKey, idle_stream_action,
+    ChunkDecryptor, DirectStreamKey, IdleStreamAction, IncomingStreamKey, encrypt_direct_chunk,
+    idle_stream_action,
 };
-use std::time::{Duration, Instant};
 use aloo::crypto::pq::{
     PqPublicBundle, bundle_fingerprint, generate_bundle_with_bits, seal_chunk, seal_setup,
 };
 use aloo::proto;
+use std::time::{Duration, Instant};
 
 const TEST_BITS: usize = 1024;
 const SEND_ID: u64 = 9;
@@ -104,7 +105,9 @@ fn a_stream_whose_setup_never_verifies_decrypts_nothing() {
     assert_eq!(decryptor.decrypt(SEND_ID, 0, &[chunk]), None);
 
     assert!(
-        decryptor.install_setup(SEND_ID, b"not a setup at all").is_none(),
+        decryptor
+            .install_setup(SEND_ID, b"not a setup at all")
+            .is_none(),
         "a setup that doesn't even decode must not install"
     );
 }
@@ -122,12 +125,71 @@ fn a_setup_for_a_different_send_is_refused() {
     );
 }
 
-/// An RSA-family stream has no setup at all - its chunks decrypt (or fail)
-/// on arrival, and installing a setup is meaningless.
+/// A `Direct`-framed OTP stream carries its chunks verbatim: what the
+/// transport is handed is *already* one-time-pad ciphertext, encrypted
+/// whole before the first chunk left (`docs/PROTOCOL.md` §16.2), so
+/// sealing it again would buy nothing and needs a keybundle this pair does
+/// not have. This is the whole contract of `DirectStreamKey::Pad` /
+/// `IncomingStreamKey::Pad` - a file's content phase and a voice message's
+/// audio both ride it.
+/// @requirement AC-252, AC-082
+#[test]
+fn a_pad_framed_stream_carries_its_chunks_verbatim_and_reads_them_back() {
+    let pad_ciphertext: Vec<Vec<u8>> = vec![
+        b"already-pad-ciphertext-chunk-0".to_vec(),
+        b"chunk-1".to_vec(),
+        // An empty chunk still has to survive the round trip.
+        Vec::new(),
+    ];
+
+    let mut decryptor = ChunkDecryptor::new(IncomingStreamKey::Pad);
+    for (seq, plain) in pad_ciphertext.iter().enumerate() {
+        let seq = seq as u32;
+        let blocks = encrypt_direct_chunk(&DirectStreamKey::Pad, SEND_ID, seq, plain)
+            .expect("a Pad stream always produces a chunk");
+        assert_eq!(
+            blocks,
+            vec![plain.clone()],
+            "the bytes go on the wire untouched - nothing is sealed over them"
+        );
+        assert_eq!(
+            decryptor.decrypt(SEND_ID, seq, &blocks).as_ref(),
+            Some(plain),
+            "and come back out of the decryptor exactly as they went in"
+        );
+    }
+}
+
+/// There is no per-stream key to introduce under `Pad`, so nothing is sent
+/// ahead of the first chunk and nothing is waited for - unlike a sealed
+/// stream, whose chunks are held until their setup verifies.
+/// @requirement AC-252
+#[test]
+fn a_pad_framed_stream_has_no_setup_to_send_or_wait_for() {
+    assert!(
+        DirectStreamKey::Pad.setups().is_empty(),
+        "nothing is negotiated for a stream the pad already protects"
+    );
+
+    let mut decryptor = ChunkDecryptor::new(IncomingStreamKey::Pad);
+    // A chunk arriving first opens immediately rather than being buffered
+    // against a setup that is never coming.
+    assert_eq!(
+        decryptor.decrypt(SEND_ID, 0, &[b"first".to_vec()]),
+        Some(b"first".to_vec())
+    );
+    assert!(
+        decryptor.install_setup(SEND_ID, b"anything").is_none(),
+        "and a setup means nothing here if one somehow arrived"
+    );
+}
+
+/// A stream whose sender announced no readable keybundle has no setup at
+/// all - its chunks can never open, and installing a setup is meaningless.
 /// @requirement TB-160
 #[test]
 fn an_rsa_stream_has_no_setup_to_install() {
-    let mut decryptor = ChunkDecryptor::new(IncomingStreamKey::Rsa(Vec::new()));
+    let mut decryptor = ChunkDecryptor::new(IncomingStreamKey::Undecryptable);
 
     assert!(
         decryptor.install_setup(SEND_ID, b"anything").is_none(),

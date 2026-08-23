@@ -5,46 +5,61 @@
 //! binary.
 #![allow(dead_code)]
 
-use aloo::proto::{ChannelInfo, ChannelKind, KeyMode, UserId, UserInfo};
 use aloo::client::tui::channel::HEADER_ROW_HEIGHT;
 use aloo::client::tui::ui::{MessageBody, UiAction, UiState};
+use aloo::proto::{ChannelInfo, ChannelKind, KeyMode, UserId, UserInfo};
 use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
+
+/// A real, readable `pq_hybrid` keybundle per user id, generated once per
+/// test process and cached (the same trade `test/cucumber/world.rs`'s
+/// `pq_bundle_for` makes, and at the same small modulus - nothing here
+/// asserts on key *strength*).
+///
+/// Real rather than a stand-in because a peer's announced bytes are load
+/// bearing in the UI now: whether they decode as a keybundle is what
+/// decides which one-time-pad framing a message details popup reports
+/// (`UiState::message_crypto`). A fixture of filler bytes would silently
+/// make every UI peer look like a pad-only one.
+pub fn pq_bundle_der(id: u64) -> Vec<u8> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static POOL: OnceLock<Mutex<HashMap<u64, Vec<u8>>>> = OnceLock::new();
+    let pool = POOL.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = pool.lock().expect("bundle pool");
+    guard
+        .entry(id)
+        .or_insert_with(|| {
+            let (public, _) =
+                aloo::crypto::pq::generate_bundle_with_bits(1024).expect("scenario pq keygen");
+            aloo::proto::encode(&public).expect("encode bundle")
+        })
+        .clone()
+}
 
 pub fn user(id: u64, name: &str) -> UserInfo {
     UserInfo {
         id: UserId(id),
         name: name.to_string(),
-        public_key_der: vec![id as u8; 4],
-        key_mode: KeyMode::Password,
-    }
-}
-
-pub fn pq_hybrid_user(id: u64, name: &str) -> UserInfo {
-    UserInfo {
-        id: UserId(id),
-        name: name.to_string(),
-        public_key_der: vec![id as u8; 4],
+        public_key_der: pq_bundle_der(id),
         key_mode: KeyMode::PqHybrid,
     }
 }
 
-pub fn password_user(id: u64, name: &str) -> UserInfo {
-    UserInfo {
-        id: UserId(id),
-        name: name.to_string(),
-        public_key_der: vec![id as u8; 4],
-        key_mode: KeyMode::Password,
-    }
+pub fn pq_hybrid_user(id: u64, name: &str) -> UserInfo {
+    user(id, name)
 }
 
-pub fn plain_user(id: u64, name: &str) -> UserInfo {
+/// A peer whose announced bytes are *not* a readable keybundle - what a
+/// pad-only pair has of each other (`docs/PROTOCOL.md` §16.2's `Direct`
+/// framing), and the one case where the pad has no envelope under it.
+pub fn pad_only_user(id: u64, name: &str) -> UserInfo {
     UserInfo {
         id: UserId(id),
         name: name.to_string(),
-        public_key_der: vec![id as u8; 4],
-        key_mode: KeyMode::None,
+        public_key_der: format!("pad-only-pin-{id}").into_bytes(),
+        key_mode: KeyMode::PqHybrid,
     }
 }
 
@@ -56,7 +71,9 @@ pub const TEST_OTP_CONTACT: &str = "abcd1234";
 /// An `OtpKeyStatus` around `detail`, carrying the key paths for
 /// `TEST_OTP_CONTACT` - what `client::otp::refresh_otp_key_status` builds
 /// from a real `otp --show-contact` reply.
-pub fn otp_status(detail: aloo::client::otp_cli::ContactDetail) -> aloo::client::otp_cli::OtpKeyStatus {
+pub fn otp_status(
+    detail: aloo::client::otp_cli::ContactDetail,
+) -> aloo::client::otp_cli::OtpKeyStatus {
     aloo::client::otp_cli::OtpKeyStatus {
         detail,
         contact_name: TEST_OTP_CONTACT.to_string(),
@@ -147,7 +164,9 @@ pub fn make_temp_file_tree() -> std::path::PathBuf {
 /// the compose bar). Tests that are *about* the modal call `begin_call`
 /// themselves instead.
 pub fn on_call_minimized(state: &mut UiState, call_id: u64, channel: Option<String>) {
-    let host = state.own_id.expect("own id must be set before a call starts");
+    let host = state
+        .own_id
+        .expect("own id must be set before a call starts");
     state.begin_call(call_id, channel, host);
     state
         .call

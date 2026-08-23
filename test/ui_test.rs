@@ -1576,7 +1576,8 @@ fn help_popup_widens_enough_to_show_its_longest_line_without_clipping_it() {
     // `render_help_popup_shows_expected_content_when_open`.
     let mut state = joined_general_with(vec![]);
     state.help_open = true;
-    let tail = "static: ML-DSA-87+RSA4096/ML-KEM-1024+RSA4096/AES-256-GCM, loaded from a file";
+    let tail = "the only scheme there is: ML-DSA-87+RSA4096/ML-KEM-1024+RSA4096/AES-256-GCM, \
+                loaded from a file";
     let rows_130 = |state: &UiState| -> Vec<String> {
         let backend = ratatui::backend::TestBackend::new(130, 30);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
@@ -3670,6 +3671,67 @@ fn an_otp_message_reports_the_pad_position_and_key_file_it_used() {
     assert!(
         says(KEY_FILE_LABEL, &format!("{TEST_OTP_CONTACT}_enc.key")),
         "and which key file they came out of: {rows:?}"
+    );
+}
+
+/// The details popup's whole job is to say how *this* message was
+/// encrypted, so under the pad it must name which of §16.2's two framings
+/// carried it - never assume the usual one. The peer's announced key is
+/// what decides it: this client's own is always a real keybundle, so a
+/// peer who announced one is `PqWrapped` and a peer who did not is
+/// `Direct`.
+/// @requirement AC-242, AC-082
+#[test]
+fn the_details_popup_names_which_pad_framing_carried_the_message() {
+    use aloo::client::otp_cli::ContactDetail;
+    use aloo::proto::UserInfo;
+
+    let open_details = |peer: UserInfo| {
+        let id = peer.id;
+        let mut state = joined_general_with(vec![peer]);
+        state.focus = Focus::Sidebar;
+        state.sidebar_selected = 0;
+        press(&mut state, KeyCode::Enter);
+        state.mark_otp_active(id);
+        state.set_otp_key_status(
+            id,
+            otp_status(ContactDetail {
+                enc_sequence: 0,
+                enc_offset: 0,
+                enc_key_remaining: 2_000_000,
+                dec_sequence: 0,
+                dec_offset: 0,
+                dec_key_remaining: 2_000_000,
+            }),
+        );
+        type_str(&mut state, "under the pad");
+        press(&mut state, KeyCode::Enter);
+        state.focus = Focus::Messages;
+        state.message_selected = state.private_rooms[&id].log.len() - 1;
+        press(&mut state, KeyCode::Char('i'));
+        rendered_rows_at(&state, 160, 30)
+    };
+
+    let wrapped = open_details(pq_hybrid_user(2, "bob"));
+    assert!(
+        wrapped
+            .iter()
+            .any(|r| r.contains(ENCRYPTION_LABEL) && r.contains("inside the pq_hybrid envelope")),
+        "a peer who announced a keybundle is wrapped: {wrapped:?}"
+    );
+
+    let direct = open_details(pad_only_user(2, "bob"));
+    assert!(
+        direct
+            .iter()
+            .any(|r| r.contains(ENCRYPTION_LABEL) && r.contains("carrying the message directly")),
+        "a peer who announced none has no envelope under the pad: {direct:?}"
+    );
+    assert!(
+        !direct
+            .iter()
+            .any(|r| r.contains("inside the pq_hybrid envelope")),
+        "and must not claim one: {direct:?}"
     );
 }
 

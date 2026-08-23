@@ -10,26 +10,27 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, KeyCode, KeyModifiers};
-use rsa::RsaPrivateKey;
 
 use crate::BoxError;
 use crate::client::connect::ResolvedIdentity;
-use crate::crypto;
 use crate::client::file_transfer;
 use crate::client::idstore;
 use crate::client::netstats;
 use crate::client::p2p::{self, P2pEvent, P2pOutbound, PeerLinkManager};
+use crate::client::reconnect::{ServerEvent, ServerLinkState};
+use crate::client::rekey;
+use crate::client::sysstats;
+use crate::client::tui::ui::{
+    self, IdentityCase, PendingFileOffer, UiAction, UiState, VoiceTarget,
+};
+use crate::client::voice;
+use crate::client::voice_call;
+use crate::client::voice_stream;
+use crate::crypto;
 use crate::p2p_proto::{P2pPayload, ReceiptStage};
 use crate::proto::{
     self, ClientMessage, Content, Envelope, KeyMode, ServerMessage, UserId, UserInfo,
 };
-use crate::client::reconnect::{ServerEvent, ServerLinkState};
-use crate::client::rekey;
-use crate::client::sysstats;
-use crate::client::tui::ui::{self, IdentityCase, PendingFileOffer, UiAction, UiState, VoiceTarget};
-use crate::client::voice;
-use crate::client::voice_call;
-use crate::client::voice_stream;
 
 use voice_stream::IdleStreamAction;
 
@@ -131,7 +132,8 @@ pub struct SessionState {
     /// One entry per currently-arriving OTP-protected transfer - see
     /// `file_transfer::OtpIncomingFileReceive`'s doc. Removed once
     /// `ReceiveDone`/`ReceiveFailed` finishes handling it.
-    pub(crate) otp_incoming_file_receives: HashMap<(UserId, u64), file_transfer::OtpIncomingFileReceive>,
+    pub(crate) otp_incoming_file_receives:
+        HashMap<(UserId, u64), file_transfer::OtpIncomingFileReceive>,
     /// The temp ciphertext path a sending OTP transfer is actually
     /// streaming from (`P2pEvent::FileAccepted`'s OTP branch), kept only
     /// long enough to delete it once the send finishes or fails
@@ -155,7 +157,8 @@ pub struct SessionState {
     /// on `Finished`, resumes the provisioning handshake. Generation is the
     /// one OTP step long enough (minutes, at the sizes now allowed) that
     /// running it inline would freeze every other thing this loop does.
-    pub(crate) otp_keygen_tx: tokio::sync::mpsc::UnboundedSender<crate::client::otp::OtpKeygenEvent>,
+    pub(crate) otp_keygen_tx:
+        tokio::sync::mpsc::UnboundedSender<crate::client::otp::OtpKeygenEvent>,
     /// Completion reports from the pad send/receive workers
     /// (`client::otp_pad`) - drained by `run_connected_session`'s select
     /// loop, which is where the two-phase commit advances.
@@ -163,34 +166,25 @@ pub struct SessionState {
     pub(crate) mixer_tx: tokio::sync::mpsc::UnboundedSender<voice::MixerCmd>,
     pub(crate) stream_finished_tx: tokio::sync::mpsc::UnboundedSender<(UserId, u64, u32, Vec<u8>)>,
     pub(crate) audio_err_tx: tokio::sync::mpsc::UnboundedSender<String>,
-    /// Whether *this* client's own `my_key` is `pq_hybrid` - gates whether
-    /// `request_rotation` ever actually does anything.
-    pub(crate) own_key_mode: KeyMode,
-    /// This client's own static RSA-family private key (`Password`/`None`
-    /// - neither ever rotates), used to decrypt anything addressed to us.
-    /// `None` for `PqHybrid` - see `own_pq_private`.
-    pub(crate) own_keys: Option<RsaPrivateKey>,
-    /// This side's own pinned public key, encoded once at session build
-    /// rather than re-derived per use - the local half of a pure-OTP
-    /// contact's name (`crypto::otp::contact_name_for_keys`). `None` for
-    /// `KeyMode::None`, which has no key stable across reconnects to bind
-    /// a pad to at all.
-    pub(crate) otp_own_pinned_der: Option<Vec<u8>>,
+    /// This side's own pinned public key (the encoded `PqPublicBundle`),
+    /// held once at session build rather than re-derived per use - the
+    /// local half of a pure-OTP contact's name
+    /// (`crypto::otp::contact_name_for_keys`).
+    pub(crate) otp_own_pinned_der: Vec<u8>,
     /// This client's own PQ-hybrid private keybundle (`crypto::pq`,
-    /// `docs/PROTOCOL.md` §13) - `Some` only when `own_key_mode ==
-    /// KeyMode::PqHybrid`, the mirror image of `own_keys` above. `PqHybrid`
-    /// is a static identity (no rotation), so unlike `own_keys` this is
-    /// never wrapped for a background rotation worker to touch.
-    pub(crate) own_pq_private: Option<crate::crypto::pq::PqPrivateBundle>,
+    /// `docs/PROTOCOL.md` §13). A static identity (no rotation of the
+    /// bundle itself), so it is never wrapped for a background worker to
+    /// touch - only the per-peer encryption keys below rotate.
+    pub(crate) own_pq_private: crate::crypto::pq::PqPrivateBundle,
     /// Our own PQ-hybrid identity fingerprint - what an incoming send's
     /// binding must name as its recipient for us to accept it at all
-    /// (`crypto::pq::open_setup`). `Some` exactly when `own_pq_private` is.
-    pub(crate) own_pq_fp: Option<[u8; 32]>,
+    /// (`crypto::pq::open_setup`).
+    pub(crate) own_pq_fp: [u8; 32],
     /// Our rotating `pq_hybrid` decryption keys, one set per peer
-    /// (`docs/PROTOCOL.md` §13.10). `Some` exactly when `own_pq_private`
-    /// is. ML-KEM/X25519 keygen is fast enough to run inline on the
-    /// event-loop task, so this needs no background worker.
-    pub(crate) own_pq_keys: Option<crate::client::pq_rekey::PqOwnKeys>,
+    /// (`docs/PROTOCOL.md` §13.10). ML-KEM/X25519 keygen is fast enough to
+    /// run inline on the event-loop task, so this needs no background
+    /// worker.
+    pub(crate) own_pq_keys: crate::client::pq_rekey::PqOwnKeys,
     /// Which `pq_hybrid` encryption keys each peer currently wants us to
     /// use, and how far along their rotation counter we have seen.
     pub(crate) pq_peer_keys: crate::client::pq_rekey::PqPeerKeys,
@@ -352,8 +346,7 @@ pub struct SessionState {
     pub(crate) channel_passwords: HashMap<String, String>,
     /// Where a spawned `DirectResolve` lookup hands its answer back to the
     /// select loop (`docs/PROTOCOL.md` §7.1.5).
-    pub(crate) direct_resolved_tx:
-        tokio::sync::mpsc::UnboundedSender<(String, Option<SocketAddr>)>,
+    pub(crate) direct_resolved_tx: tokio::sync::mpsc::UnboundedSender<(String, Option<SocketAddr>)>,
 }
 
 /// `run_connected_session` for a daemon: no terminal, a plan, and the
@@ -375,9 +368,10 @@ pub async fn run_daemon_session<W: crate::control::ControlSink>(
     display_name: String,
     you: UserId,
     my_identity: ResolvedIdentity,
-    key_mode: KeyMode,
     id_store: idstore::IdStore,
-    hotkey_rx: Option<tokio::sync::mpsc::UnboundedReceiver<crate::client::global_ptt::GlobalPttEvent>>,
+    hotkey_rx: Option<
+        tokio::sync::mpsc::UnboundedReceiver<crate::client::global_ptt::GlobalPttEvent>,
+    >,
     server_addr: Option<SocketAddr>,
     input_rx: tokio::sync::mpsc::UnboundedReceiver<SessionInput>,
     plan: crate::client::daemon::DaemonPlan,
@@ -389,7 +383,6 @@ pub async fn run_daemon_session<W: crate::control::ControlSink>(
         display_name,
         you,
         my_identity,
-        key_mode,
         false,
         id_store,
         hotkey_rx,
@@ -400,9 +393,9 @@ pub async fn run_daemon_session<W: crate::control::ControlSink>(
     .await
 }
 
-// `key_mode` pushed this past clippy's default 7-argument threshold;
-// grouping the handshake outputs into a struct would be a larger,
-// unrelated refactor of an already-established call site.
+// Well past clippy's default 7-argument threshold; grouping the handshake
+// outputs into a struct would be a larger, unrelated refactor of an
+// already-established call site.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_connected_session<W: crate::control::ControlSink>(
     surface: &mut crate::client::tui::surface::Surface,
@@ -411,10 +404,11 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
     display_name: String,
     you: UserId,
     my_identity: ResolvedIdentity,
-    key_mode: KeyMode,
     keyboard_release_reporting: bool,
     id_store: idstore::IdStore,
-    mut hotkey_rx: Option<tokio::sync::mpsc::UnboundedReceiver<crate::client::global_ptt::GlobalPttEvent>>,
+    mut hotkey_rx: Option<
+        tokio::sync::mpsc::UnboundedReceiver<crate::client::global_ptt::GlobalPttEvent>,
+    >,
     server_addr: Option<SocketAddr>,
     mut input_rx: tokio::sync::mpsc::UnboundedReceiver<SessionInput>,
     daemon_plan: Option<crate::client::daemon::DaemonPlan>,
@@ -432,8 +426,7 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
     let _server_events_kept_open = never_tx;
 
     let (audio_err_tx, mut audio_err_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    let (call_level_tx, mut call_level_rx) =
-        tokio::sync::mpsc::unbounded_channel::<(UserId, u8)>();
+    let (call_level_tx, mut call_level_rx) = tokio::sync::mpsc::unbounded_channel::<(UserId, u8)>();
 
     // One persistent mixer thread for the whole session - per-message
     // stream opens against the same device are a common way to make
@@ -517,30 +510,32 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
     // review with less to compare against - so this falls back to an
     // empty string (`display_device_id` renders that as "unknown") rather
     // than refusing to connect.
-    let own_device_id = crate::client::device_id::load_or_create(&crate::client::device_id::default_path())
-        .unwrap_or_else(|e| {
-            crate::log_warn!("failed to load/create device id: {e} (continuing without one)");
-            String::new()
-        });
+    let own_device_id =
+        crate::client::device_id::load_or_create(&crate::client::device_id::default_path())
+            .unwrap_or_else(|e| {
+                crate::log_warn!("failed to load/create device id: {e} (continuing without one)");
+                String::new()
+            });
     let (p2p_events_tx, mut p2p_events_rx) = tokio::sync::mpsc::unbounded_channel::<P2pEvent>();
-    let (mut peer_link, p2p_socket) =
-        match PeerLinkManager::bind(bind_addr, server_addr, p2p_events_tx.clone()).await {
-            Ok(ok) => ok,
-            Err(e) if bind_addr.port() != 0 => {
-                crate::log_warn!(
-                    "could not bind the direct-punch port {} ({e});                      falling back to an ephemeral port - direct_punch_to peers                      will not be able to reach this client",
-                    bind_addr.port()
-                );
-                PeerLinkManager::bind(
-                    SocketAddr::new(unspecified, 0),
-                    server_addr,
-                    p2p_events_tx,
-                )
+    let (mut peer_link, p2p_socket) = match PeerLinkManager::bind(
+        bind_addr,
+        server_addr,
+        p2p_events_tx.clone(),
+    )
+    .await
+    {
+        Ok(ok) => ok,
+        Err(e) if bind_addr.port() != 0 => {
+            crate::log_warn!(
+                "could not bind the direct-punch port {} ({e});                      falling back to an ephemeral port - direct_punch_to peers                      will not be able to reach this client",
+                bind_addr.port()
+            );
+            PeerLinkManager::bind(SocketAddr::new(unspecified, 0), server_addr, p2p_events_tx)
                 .await
                 .map_err(|e| format!("failed to open the direct-link UDP socket: {e}"))?
-            }
-            Err(e) => return Err(format!("failed to open the direct-link UDP socket: {e}").into()),
-        };
+        }
+        Err(e) => return Err(format!("failed to open the direct-link UDP socket: {e}").into()),
+    };
     if settings.direct_punch {
         peer_link.configure_direct_punch(
             display_name.clone(),
@@ -552,33 +547,18 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
         tokio::sync::mpsc::unbounded_channel::<(SocketAddr, p2p::InboundDatagram)>();
     p2p::spawn_receive_loop(p2p_socket, server_addr, p2p_raw_tx);
 
-    // `PqHybrid` has no single RSA key here and never rotates it (it's a
-    // static identity, like `Password`/`None`, but with its own separate
-    // key material) - see `SessionState::own_keys`/`own_pq_private`.
-    let (own_keys, own_pq_private, own_pq_fp, own_pq_keys, own_pinned_der) = match my_identity {
-        ResolvedIdentity::Rsa(kp) => {
-            let der = crate::crypto::public_key_to_der(&kp.private.to_public_key()).ok();
-            (Some(kp.private), None, None, None, der)
-        }
-        ResolvedIdentity::Pq {
-            private,
-            public_der,
-        } => {
-            let rotating =
-                crate::client::pq_rekey::PqOwnKeys::new(private.bootstrap_decap().clone());
-            (
-                None,
-                Some(private),
-                crate::crypto::pq::fingerprint_of_encoded(&public_der),
-                Some(rotating),
-                // A `pq_hybrid` identity's pinned key is the encoded bundle
-                // itself - there is no RSA keypair here to derive one from,
-                // and without this a pad shared with a non-`pq` peer would
-                // have no name on this side (`otp::contact_name_for_peer`).
-                Some(public_der),
-            )
-        }
-    };
+    // The identity's own bundle never rotates; only the per-peer
+    // encryption keys derived from it do (`docs/PROTOCOL.md` §13.10). Its
+    // pinned key is the encoded bundle itself, which is also the local
+    // half of a pad contact's name (`otp::contact_name_for_peer`).
+    let ResolvedIdentity {
+        private: own_pq_private,
+        public_der: own_pinned_der,
+    } = my_identity;
+    let own_pq_fp = crate::crypto::pq::fingerprint_of_encoded(&own_pinned_der)
+        .ok_or("this client's own keybundle does not decode")?;
+    let own_pq_keys =
+        crate::client::pq_rekey::PqOwnKeys::new(own_pq_private.bootstrap_decap().clone());
     let (rotate_out_tx, mut rotate_out_rx) =
         tokio::sync::mpsc::unbounded_channel::<ClientMessage>();
 
@@ -602,11 +582,7 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
         stream_finished_tx,
         audio_err_tx,
         call_level_tx,
-        own_key_mode: key_mode,
-        own_keys: own_keys.clone(),
-        otp_own_pinned_der: own_pinned_der
-            .clone()
-            .filter(|_| crate::client::keymode_policy::uses_byte_comparison_pinning(key_mode)),
+        otp_own_pinned_der: own_pinned_der,
         own_pq_private,
         own_pq_fp,
         own_pq_keys,
@@ -752,8 +728,7 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
     // (§7.1.5): the fetch would go nowhere and the resend would mark mail
     // as being uploaded to nothing, which is exactly the silent
     // half-finished state refusing at the point of intent exists to avoid.
-    if !session.server.is_absent()
-        && crate::client::otp_cli::binary_available(&session.otp_cli_cfg)
+    if !session.server.is_absent() && crate::client::otp_cli::binary_available(&session.otp_cli_cfg)
     {
         wr.send_control(&ClientMessage::OtpMailFetch).await?;
         session.conn_stats.record_event(Instant::now());
@@ -1199,7 +1174,6 @@ async fn handle_ui_action(
         UiAction::SendDirectText {
             to,
             plaintext,
-            recipient_key_mode,
             recipient_pubkey_der,
             log_index,
             msg_id,
@@ -1210,7 +1184,6 @@ async fn handle_ui_action(
                 session,
                 to,
                 plaintext,
-                recipient_key_mode,
                 recipient_pubkey_der,
                 log_index,
                 msg_id,
@@ -1234,7 +1207,6 @@ async fn handle_ui_action(
             path,
             filename,
             size,
-            recipient_key_mode,
             recipient_pubkey_der,
         } => {
             crate::client::direct_message::handle_send_file(
@@ -1245,7 +1217,6 @@ async fn handle_ui_action(
                 path,
                 filename,
                 size,
-                recipient_key_mode,
                 recipient_pubkey_der,
             )
             .await?;
@@ -1271,7 +1242,6 @@ async fn handle_ui_action(
                         }
                         VoiceTarget::Direct {
                             to,
-                            recipient_key_mode,
                             recipient_pubkey_der,
                         } => {
                             crate::client::direct_message::handle_voice_record_start(
@@ -1281,7 +1251,6 @@ async fn handle_ui_action(
                                 recorder,
                                 stream_id,
                                 to,
-                                recipient_key_mode,
                                 recipient_pubkey_der,
                             )
                             .await?;
@@ -1293,10 +1262,9 @@ async fn handle_ui_action(
                             // instead of any wire send.
                             let (stop_tx, stop_rx) = std::sync::mpsc::channel();
                             session.active_recording = Some(stop_tx);
-                            session.own_stream_targets.insert(
-                                stream_id,
-                                voice_stream::OwnStreamTarget::MailAttachment,
-                            );
+                            session
+                                .own_stream_targets
+                                .insert(stream_id, voice_stream::OwnStreamTarget::MailAttachment);
                             voice_stream::spawn_record_accumulate_worker(
                                 recorder,
                                 stream_id,
@@ -1401,19 +1369,15 @@ async fn handle_ui_action(
                 .peer_link
                 .send_reliable_or_queue(from, P2pPayload::FileReject { stream_id });
         }
-        UiAction::RequestOtpSession {
-            peer,
-            key_mode,
-            pubkey_der,
-        } => {
+        UiAction::RequestOtpSession { peer, pubkey_der } => {
             // Snapshotted so a refusal raised by *this* call can be told
             // apart from a notice that was already on screen.
             let notice_before = ui_state.status_notice.clone();
-            crate::client::otp::handle_otp_command(wr, ui_state, session, peer, key_mode, pubkey_der)
-                .await?;
-            // `handle_otp_command` refuses some proposals outright -
-            // neither side `pq_hybrid`, no `otp` binary, an unreadable
-            // peer identity - and those never reach the peer at all, so
+            crate::client::otp::handle_otp_command(wr, ui_state, session, peer, pubkey_der).await?;
+            // `handle_otp_command` refuses some proposals outright - no
+            // `otp` binary, an unreadable peer identity, a peer with no
+            // announced keybundle to share a fresh pad over - and those
+            // never reach the peer at all, so
             // no acknowledgement will ever arrive to resolve them. A new
             // failure notice is exactly that case; anything else is a
             // proposal genuinely in flight, resolved by
@@ -1444,12 +1408,8 @@ async fn handle_ui_action(
         UiAction::RejectOtpInvite => {
             crate::client::otp::reject_invite(wr, session, ui_state).await?;
         }
-        UiAction::EndOtpSession {
-            peer,
-            key_mode,
-            pubkey_der,
-        } => {
-            crate::client::otp::handle_end_otp_command(wr, ui_state, session, peer, key_mode, pubkey_der)
+        UiAction::EndOtpSession { peer, pubkey_der } => {
+            crate::client::otp::handle_end_otp_command(wr, ui_state, session, peer, pubkey_der)
                 .await?;
         }
         UiAction::CheckOtpMailRecipient { nickname } => {
@@ -1476,7 +1436,6 @@ async fn handle_ui_action(
             }
             ui::CallTarget::Direct {
                 to,
-                recipient_key_mode,
                 recipient_pubkey_der,
             } => {
                 crate::client::direct_message::handle_start_call(
@@ -1484,7 +1443,6 @@ async fn handle_ui_action(
                     ui_state,
                     session,
                     to,
-                    recipient_key_mode,
                     recipient_pubkey_der,
                 )
                 .await?;
@@ -1553,16 +1511,14 @@ async fn handle_ui_action(
 /// refusing the mute over a preferences-file problem - the same policy
 /// `load_id_store` applies to its own store.
 fn set_voice_muted(ui_state: &mut UiState, nickname: &str, muted: bool) {
-    let result = crate::settings::Settings::update_muted_voice(
-        &crate::settings::default_path(),
-        |set| {
+    let result =
+        crate::settings::Settings::update_muted_voice(&crate::settings::default_path(), |set| {
             if muted {
                 set.insert(nickname.to_string());
             } else {
                 set.remove(nickname);
             }
-        },
-    );
+        });
     match result {
         Ok(stored) => ui_state.set_muted_voice(stored),
         Err(e) => ui_state.push_status_notice(
@@ -1591,16 +1547,22 @@ async fn accept_file_offer(
         .get(&from)
         .map(|u| u.public_key_der.clone())
         .unwrap_or_default();
-    let key = voice_stream::resolve_incoming_key(session, from, &sender_public_key_der);
-    let dest_name = crate::client::file_transfer::safe_filename(&crate::client::file_transfer::truncate_filename(
-        &offer.filename,
-    ));
+    // An OTP transfer's chunks are whatever its pair's framing puts on the
+    // wire: sealed under `PqWrapped`, raw pad ciphertext under `Direct`
+    // (`otp::otp_incoming_stream_key`). Everything else is always sealed.
+    let key = match &offer.otp_contact_name {
+        Some(_) => {
+            crate::client::otp::otp_incoming_stream_key(session, from, &sender_public_key_der)
+        }
+        None => voice_stream::resolve_incoming_key(session, from, &sender_public_key_der),
+    };
+    let dest_name = crate::client::file_transfer::safe_filename(
+        &crate::client::file_transfer::truncate_filename(&offer.filename),
+    );
     let final_path = crate::client::file_transfer::default_download_dir().join(dest_name);
-    // An OTP-active offer's chunks are ordinary pq_hybrid ciphertext, same
-    // as any other transfer (see `client::otp::send_file_offer`'s doc) -
-    // only the destination differs: a temp file, decrypted whole into
-    // `final_path` once `handle_file_event`'s `ReceiveDone` runs
-    // `client::otp::finish_incoming_file`.
+    // Only the destination differs for an OTP-active offer: a temp file,
+    // decrypted whole into `final_path` once `handle_file_event`'s
+    // `ReceiveDone` runs `client::otp::finish_incoming_file`.
     // `seq` starts `None` here - the content phase's own pad slot isn't
     // reserved (or numbered) until the sender's `FileAccepted` handling
     // actually runs `otp --encrypt`, named separately once
@@ -1855,9 +1817,11 @@ async fn handle_server_message(
                     proto::decode::<crate::crypto::pq::PqPublicBundle>(&user.public_key_der)
                 && let Ok(fingerprint) = crate::crypto::pq::bundle_fingerprint(&bundle)
             {
-                session
-                    .pq_peer_keys
-                    .bootstrap(user.id, bundle.bootstrap_encap().clone(), fingerprint);
+                session.pq_peer_keys.bootstrap(
+                    user.id,
+                    bundle.bootstrap_encap().clone(),
+                    fingerprint,
+                );
             }
             // Pin/check identity exactly once per connection - the first
             // time we ever see this UserId, before `on_user_joined` below
@@ -1986,7 +1950,11 @@ async fn handle_server_message(
             }
         }
         ServerMessage::Error { message } => crate::log_warn!("server error: {message}"),
-        ServerMessage::OtpMailResult { mail_id, ok, reason } => {
+        ServerMessage::OtpMailResult {
+            mail_id,
+            ok,
+            reason,
+        } => {
             crate::client::otp_mail::on_mail_result(wr, session, ui_state, mail_id, ok, reason)
                 .await?;
         }
@@ -2002,7 +1970,14 @@ async fn handle_server_message(
             // the one the mail displays comes from inside the signed
             // payload (`client::otp_mail::on_mail_deliver`).
             crate::client::otp_mail::on_mail_deliver(
-                wr, session, ui_state, mail_id, from, contact_name, seq, ciphertext,
+                wr,
+                session,
+                ui_state,
+                mail_id,
+                from,
+                contact_name,
+                seq,
+                ciphertext,
             )
             .await?;
         }
@@ -2146,17 +2121,19 @@ fn on_daemon_peer_appeared(
     // Silent, so it keeps the broader rule on purpose: it costs nothing
     // to have seen later, and its siblings also cover leaving and
     // disconnecting, which the sound deliberately does not.
-    crate::client::global_notification::notify(crate::client::global_notification::Notification::new(
-        format!("{nickname} is here"),
-        if is_dm_focus {
-            "Hold the push-to-talk shortcut to talk to them.".to_string()
-        } else {
-            match channel {
-                Some(channel) => format!("Joined {channel}."),
-                None => "Reachable directly.".to_string(),
-            }
-        },
-    ));
+    crate::client::global_notification::notify(
+        crate::client::global_notification::Notification::new(
+            format!("{nickname} is here"),
+            if is_dm_focus {
+                "Hold the push-to-talk shortcut to talk to them.".to_string()
+            } else {
+                match channel {
+                    Some(channel) => format!("Joined {channel}."),
+                    None => "Reachable directly.".to_string(),
+                }
+            },
+        ),
+    );
 
     if place_focus {
         // Open their room, so the global shortcut addresses them rather
@@ -2187,7 +2164,6 @@ fn on_daemon_peer_appeared(
         session.daemon_awaiting_otp = Some(peer);
         return Some(UiAction::RequestOtpSession {
             peer,
-            key_mode: info.key_mode,
             pubkey_der: info.public_key_der,
         });
     }
@@ -2258,19 +2234,22 @@ fn notify_daemon_presence(
     // they were.
     let relevant = match channel {
         Some(channel) => plan.is_focus_event(&info.name, Some(channel)),
-        None => plan.focused_nickname() == Some(info.name.as_str())
-            || plan.focused_channel().is_some(),
+        None => {
+            plan.focused_nickname() == Some(info.name.as_str()) || plan.focused_channel().is_some()
+        }
     };
     if !relevant {
         return;
     }
-    crate::client::global_notification::notify(crate::client::global_notification::Notification::new(
-        format!("{} {what}", info.name),
-        match channel {
-            Some(channel) => format!("No longer in {channel}."),
-            None => "They are offline.".to_string(),
-        },
-    ));
+    crate::client::global_notification::notify(
+        crate::client::global_notification::Notification::new(
+            format!("{} {what}", info.name),
+            match channel {
+                Some(channel) => format!("No longer in {channel}."),
+                None => "They are offline.".to_string(),
+            },
+        ),
+    );
 }
 
 /// Everything that ends when one peer's connection does, in one place:
@@ -2317,9 +2296,7 @@ fn drop_peer_state(ui_state: &mut UiState, session: &mut SessionState, user_id: 
     // its rotation counter over (§13.10), and the keys we held are
     // of no further use to anyone - including us.
     session.pq_peer_keys.forget(user_id);
-    if let Some(own) = session.own_pq_keys.as_mut() {
-        own.forget(user_id);
-    }
+    session.own_pq_keys.forget(user_id);
     session.replay.forget(user_id);
     // A half-received pad from this connection can never be
     // continued: the rest of it would arrive under the fresh
@@ -2389,7 +2366,9 @@ async fn handle_p2p_event(
         } => {
             let from_name = name_of(ui_state, from);
             remember_delivery_id(session, from, stream_id, msg_id);
-            crate::client::channel::on_stream_start(ui_state, session, channel, from, from_name, stream_id);
+            crate::client::channel::on_stream_start(
+                ui_state, session, channel, from, from_name, stream_id,
+            );
         }
         P2pEvent::StreamStart {
             channel: None,
@@ -2399,7 +2378,9 @@ async fn handle_p2p_event(
         } => {
             let from_name = name_of(ui_state, from);
             remember_delivery_id(session, from, stream_id, msg_id);
-            crate::client::direct_message::on_stream_start(ui_state, session, from, from_name, stream_id);
+            crate::client::direct_message::on_stream_start(
+                ui_state, session, from, from_name, stream_id,
+            );
         }
         P2pEvent::StreamKeySetup {
             from,
@@ -2467,19 +2448,17 @@ async fn handle_p2p_event(
             if let Some(target) = session.own_file_targets.get(&stream_id) {
                 let me = ui_state.own_id.unwrap_or(UserId(0));
                 ui_state.set_file_progress(me, stream_id, 0);
-                // A pq_hybrid transfer's setup goes out before its first
-                // chunk, exactly as a voice stream's does after
-                // `StreamStart` - the chunks themselves are ciphertext only.
-                let setups: Vec<(UserId, Vec<u8>)> = match &target.key {
-                    voice_stream::DirectStreamKey::Pq(pq) => pq.setups(),
-                    _ => Vec::new(),
-                };
-                for (id, setup) in setups {
-                    session
-                        .peer_link
-                        .send_reliable_or_queue(id, P2pPayload::StreamKeySetup { stream_id, setup });
+                // A transfer's setup goes out before its first chunk,
+                // exactly as a voice stream's does after `StreamStart` -
+                // the chunks themselves are ciphertext only.
+                for (id, setup) in target.key.setups() {
+                    session.peer_link.send_reliable_or_queue(
+                        id,
+                        P2pPayload::StreamKeySetup { stream_id, setup },
+                    );
                 }
-                crate::client::otp::start_outgoing_file_content(session, ui_state, stream_id).await?;
+                crate::client::otp::start_outgoing_file_content(session, ui_state, stream_id)
+                    .await?;
             }
         }
         P2pEvent::FileRejected { stream_id } => {
@@ -2502,7 +2481,11 @@ async fn handle_p2p_event(
             );
         }
         P2pEvent::FileEnd { from, stream_id } => {
-            file_transfer::end_incoming_transfer(&mut session.active_file_transfers, from, stream_id);
+            file_transfer::end_incoming_transfer(
+                &mut session.active_file_transfers,
+                from,
+                stream_id,
+            );
         }
         P2pEvent::OtpPadStart {
             from,
@@ -2663,6 +2646,12 @@ async fn handle_p2p_event(
                     // say it - and this envelope is also the thing that
                     // authenticates us to them (§7.1.5).
                     send_channel_presence(session, ui_state, peer);
+                    // A peer whose pin is not a readable keybundle gets no
+                    // `ChannelPresence` (nothing can be sealed to them);
+                    // an installed pad is what introduces them instead.
+                    if let Some(action) = register_pad_only_peer(session, ui_state, peer) {
+                        handle_ui_action(action, wr, ui_state, session).await?;
+                    }
                     maybe_resolve_p2p_identity_data(session, ui_state, peer);
                 }
                 p2p::LinkStatus::Lost => {
@@ -2737,8 +2726,15 @@ async fn handle_p2p_event(
         P2pEvent::OtpDeliveryAck { from, seq, proof } => {
             crate::client::otp::on_delivery_ack(wr, ui_state, session, from, seq, proof).await?;
         }
-        P2pEvent::OtpFileContentSeq { from, stream_id, seq } => {
-            if let Some(pending) = session.otp_incoming_file_receives.get_mut(&(from, stream_id)) {
+        P2pEvent::OtpFileContentSeq {
+            from,
+            stream_id,
+            seq,
+        } => {
+            if let Some(pending) = session
+                .otp_incoming_file_receives
+                .get_mut(&(from, stream_id))
+            {
                 pending.seq = Some(seq);
             }
         }
@@ -2750,7 +2746,10 @@ async fn handle_p2p_event(
             envelope,
         } => {
             remember_delivery_id(session, from, stream_id, msg_id);
-            crate::client::otp::on_voice_offer(wr, session, ui_state, from, stream_id, seq, envelope).await;
+            crate::client::otp::on_voice_offer(
+                wr, session, ui_state, from, stream_id, seq, envelope,
+            )
+            .await;
         }
         P2pEvent::CallInvite {
             channel,
@@ -2758,7 +2757,8 @@ async fn handle_p2p_event(
             call_id,
         } => {
             let from_name = name_of(ui_state, from);
-            if voice_call::on_call_invite(wr, session, ui_state, from, from_name, call_id, channel).await
+            if voice_call::on_call_invite(wr, session, ui_state, from, from_name, call_id, channel)
+                .await
             {
                 voice_stream::play_bell_chime(session);
             }
@@ -2794,10 +2794,9 @@ async fn handle_p2p_event(
 /// Checks a newly-learned peer's announced identity against the local
 /// pinning store (§12), opening a blocking Accept/Reject review if their
 /// nickname was previously pinned to a key this connection hasn't proven
-/// itself a continuation of. `KeyMode::None` is skipped - no continuity
-/// mechanism by design (§12.2). `Password`/`PqHybrid` keys are stable by
-/// construction, so a byte comparison against the pin is definitive
-/// (`StaticMismatch` arm).
+/// itself a continuation of. A `pq_hybrid` identity is file-loaded and so
+/// stable by construction, which is what makes a byte comparison against
+/// the pin definitive (`StaticMismatch` arm) - §12.2.
 ///
 /// Deliberately does **not** use `IdStore::check_and_pin` on a mismatch:
 /// that always re-pins as a side effect, which would trust the new key
@@ -2809,13 +2808,11 @@ async fn handle_p2p_event(
 /// whether this key change was deliberately made by whoever held the old
 /// keys, rather than being an unexplained substitution.
 ///
-/// Only `pq_hybrid` identities can prove this; the RSA modes have no
-/// signing identity separable from the key being replaced, so for them a
-/// changed key is always a question for the user.
+/// Proving it needs a signing identity separable from the key being
+/// replaced, which is exactly what a keybundle has: either half failing to
+/// decode as one leaves the change unexplained, and so a question for the
+/// user.
 fn continuity_proven(pinned_der: &[u8], user: &UserInfo) -> bool {
-    if user.key_mode != KeyMode::PqHybrid {
-        return false;
-    }
     let (Ok(pinned), Ok(announced)) = (
         proto::decode::<crypto::pq::PqPublicBundle>(pinned_der),
         proto::decode::<crypto::pq::PqPublicBundle>(&user.public_key_der),
@@ -2828,83 +2825,67 @@ fn continuity_proven(pinned_der: &[u8], user: &UserInfo) -> bool {
 /// A malformed `public_key_der` is silently skipped - this is a local
 /// safety net, not protocol validation.
 fn check_identity(session: &mut SessionState, ui_state: &mut UiState, user: &UserInfo) {
-    // `public_key_der` holds different bytes depending on scheme (an RSA
-    // SPKI DER blob for every mode except `PqHybrid`, a bincode-encoded
-    // `crypto::pq::PqPublicBundle` for it) - parseability is checked with
-    // the matching decoder rather than always assuming RSA, or a `PqHybrid`
-    // peer would always fail this check and never get pinned at all.
-    let parses = match user.key_mode {
-        KeyMode::PqHybrid => {
-            proto::decode::<crypto::pq::PqPublicBundle>(&user.public_key_der).is_ok()
-        }
-        _ => crypto::public_key_from_der(&user.public_key_der).is_ok(),
-    };
-    if !parses {
+    // `public_key_der` is a bincode-encoded `crypto::pq::PqPublicBundle`;
+    // a peer announcing anything else has no identity to pin.
+    if proto::decode::<crypto::pq::PqPublicBundle>(&user.public_key_der).is_err() {
         return;
     }
-    match user.key_mode {
-        key_mode if crate::client::keymode_policy::uses_byte_comparison_pinning(key_mode) => {
-            match session.id_store.get(&user.name) {
-                None => {
-                    // First-ever sighting: nothing to compare against, so this is
-                    // never suspicious - pin it immediately, same as before.
-                    session
-                        .id_store
-                        .check_and_pin(&user.name, &user.public_key_der);
-                    session.id_store.set_key_mode(&user.name, user.key_mode);
-                    if let Err(e) = session.id_store.save() {
-                        crate::log_warn!("failed to save id_store: {e}");
-                    }
-                }
-                Some(previous) if previous == user.public_key_der.as_slice() => {}
-                // A key change that proves itself is not an alarm. If this
-                // peer's new bundle carries a certificate signed by the
-                // identity we already pinned (§12.6), they deliberately
-                // retired the old keys - move the pin across and say so on
-                // the status line rather than opening a review. Reserving
-                // the review for genuinely unexplained changes is what
-                // keeps it meaningful; one that fires on every legitimate
-                // rekey teaches people to dismiss it.
-                Some(previous) if continuity_proven(previous, user) => {
-                    let name = user.name.clone();
-                    session
-                        .id_store
-                        .check_and_pin(&name, &user.public_key_der);
-                    session.id_store.set_key_mode(&name, user.key_mode);
-                    if let Err(e) = session.id_store.save() {
-                        crate::log_warn!("failed to save id_store: {e}");
-                    }
-                    ui_state.push_notice(format!(
-                        "{name} moved to a new identity and proved it - pin updated"
-                    ));
-                }
-                Some(previous) => {
-                    let previous_public_key_der = previous.to_vec();
-                    // The popup itself is withheld until this specific
-                    // connection's address/device id are known - see
-                    // `maybe_resolve_p2p_identity_data`, called once the
-                    // link reaches `Active` (the address) and once the
-                    // peer's encrypted `DeviceIdAnnounce` decrypts (the
-                    // device id), whichever lands second - or `Lost`, if
-                    // punching gives up on either (docs/PROTOCOL.md §12.7).
-                    // `begin_identity_review` still gates messaging with
-                    // this peer immediately (`is_trust_gated`) - only the
-                    // popup waits.
-                    ui_state.begin_identity_review(
-                        user.id,
-                        user.name.clone(),
-                        IdentityCase::StaticMismatch {
-                            new_public_key_der: user.public_key_der.clone(),
-                            previous_public_key_der,
-                        },
-                    );
-                }
+    // A `pq_hybrid` identity is file-loaded and so stable across
+    // reconnects, which is what makes a plain byte comparison against the
+    // pin meaningful in the first place.
+    match session.id_store.get(&user.name) {
+        None => {
+            // First-ever sighting: nothing to compare against, so this is
+            // never suspicious - pin it immediately, same as before.
+            session
+                .id_store
+                .check_and_pin(&user.name, &user.public_key_der);
+            session.id_store.set_key_mode(&user.name, user.key_mode);
+            if let Err(e) = session.id_store.save() {
+                crate::log_warn!("failed to save id_store: {e}");
             }
         }
-        // KeyMode::None, plus an unreachable fallback for the guard arm
-        // above (rustc can't statically know `uses_byte_comparison_pinning`
-        // covers exactly Password/PqHybrid).
-        _ => {}
+        Some(previous) if previous == user.public_key_der.as_slice() => {}
+        // A key change that proves itself is not an alarm. If this
+        // peer's new bundle carries a certificate signed by the
+        // identity we already pinned (§12.6), they deliberately
+        // retired the old keys - move the pin across and say so on
+        // the status line rather than opening a review. Reserving
+        // the review for genuinely unexplained changes is what
+        // keeps it meaningful; one that fires on every legitimate
+        // rekey teaches people to dismiss it.
+        Some(previous) if continuity_proven(previous, user) => {
+            let name = user.name.clone();
+            session.id_store.check_and_pin(&name, &user.public_key_der);
+            session.id_store.set_key_mode(&name, user.key_mode);
+            if let Err(e) = session.id_store.save() {
+                crate::log_warn!("failed to save id_store: {e}");
+            }
+            ui_state.push_notice(format!(
+                "{name} moved to a new identity and proved it - pin updated"
+            ));
+        }
+        Some(previous) => {
+            let previous_public_key_der = previous.to_vec();
+            // The popup itself is withheld until this specific
+            // connection's address/device id are known - see
+            // `maybe_resolve_p2p_identity_data`, called once the
+            // link reaches `Active` (the address) and once the
+            // peer's encrypted `DeviceIdAnnounce` decrypts (the
+            // device id), whichever lands second - or `Lost`, if
+            // punching gives up on either (docs/PROTOCOL.md §12.7).
+            // `begin_identity_review` still gates messaging with
+            // this peer immediately (`is_trust_gated`) - only the
+            // popup waits.
+            ui_state.begin_identity_review(
+                user.id,
+                user.name.clone(),
+                IdentityCase::StaticMismatch {
+                    new_public_key_der: user.public_key_der.clone(),
+                    previous_public_key_der,
+                },
+            );
+        }
     }
 }
 
@@ -2991,8 +2972,8 @@ fn record_last_seen(session: &mut SessionState, nickname: &str, addr: SocketAddr
 /// encrypted the same way any other per-recipient content is
 /// (`Content::DeviceIdAnnounce`) - called every time their link reaches
 /// `Active` (`handle_p2p_event`'s `LinkStatusChanged` arm). Silently does
-/// nothing if we can't currently address them
-/// (`keymode_policy::can_address`) or encryption fails for any other
+/// nothing if their announced keybundle can't be sealed to, or encryption
+/// fails for any other
 /// reason - purely informational, so there is nothing to recover or retry
 /// here beyond the automatic resend this function already gets on the
 /// next `Active` transition (a link flap, a later rotation).
@@ -3063,23 +3044,76 @@ pub fn reconcile_direct_membership(
         .filter(|c| !shared.contains(c))
         .cloned()
         .collect();
-    Reconciled { shared, join, leave }
+    Reconciled {
+        shared,
+        join,
+        leave,
+    }
 }
 
+/// What this client has pinned for a serverless peer's nickname, shaped as
+/// the `UserInfo` a server would otherwise have relayed (§7.1.5).
+///
+/// The pinned bytes are taken as they are, readable keybundle or not:
+/// which of the two it is decides how this pair talks, not whether they
+/// can (`otp::framing_for`). A pin that decodes gets ordinary sealed
+/// sends; one that does not is reachable under an already-installed
+/// one-time pad, framed direct (§16.2). `None` only when the nickname is
+/// not pinned at all - there is then nothing to identify them by.
 pub fn direct_peer_identity(
     id_store: &crate::client::idstore::IdStore,
     nickname: &str,
 ) -> Option<UserInfo> {
-    let key = id_store.get(nickname)?.to_vec();
-    // A pinned key that is not a PQ bundle belongs to one of the unsigned
-    // modes, which cannot authenticate anything.
-    proto::decode::<crypto::pq::PqPublicBundle>(&key).ok()?;
     Some(UserInfo {
         id: crate::client::p2p::direct_peer_id(nickname),
         name: nickname.to_string(),
-        public_key_der: key,
+        public_key_der: id_store.get(nickname)?.to_vec(),
         key_mode: KeyMode::PqHybrid,
     })
+}
+
+/// Registers a serverless peer this client can only reach under a pad:
+/// their pin is not a readable keybundle, so no `ChannelPresence` envelope
+/// can be sealed to them and the handshake that ordinarily introduces a
+/// punched peer (§7.1.5) never completes.
+///
+/// Holding a provisioned pad for the pair is what stands in for it. That
+/// is a deliberate substitution, not a gap: under `Direct` framing the pad
+/// *is* the authentication (§16.2), so requiring a signature this pair has
+/// no keys for would rule out exactly the case this exists to serve.
+/// Registering is also all this does - it opens no session and spends
+/// nothing; the first actual send is what touches the pad, and its own
+/// acknowledgement gate bounds what an impostor taking the nickname could
+/// cost (§16.2's one-message bound).
+///
+/// A peer whose pin *does* decode is left alone: `send_channel_presence`
+/// introduces them properly, and doing both would register them twice.
+pub fn register_pad_only_peer(
+    session: &mut SessionState,
+    ui_state: &mut UiState,
+    peer: UserId,
+) -> Option<UiAction> {
+    let nickname = session.peer_link.direct_nickname_of(peer)?;
+    let info = direct_peer_identity(&session.id_store, &nickname)?;
+    if crate::client::otp::framing_for(&session.otp_own_pinned_der, &info.public_key_der)
+        != crate::client::otp::OtpFraming::Direct
+    {
+        return None;
+    }
+    // No pad, nothing to say to them - registering would offer the user a
+    // conversation that could not carry a single message.
+    crate::client::otp::contact_name_if_active(session, &info.public_key_der)?;
+    if ui_state.known_users.contains_key(&peer) {
+        return None;
+    }
+    ui_state.known_users.insert(peer, info);
+    // The pad is already provisioned, so there is no handshake left to
+    // run: every send to them rides it from the first one
+    // (`otp::contact_name_if_active` gates on the pad being provisioned,
+    // not on a session having been negotiated). Saying so on their row is
+    // what makes that visible.
+    ui_state.mark_otp_active(peer);
+    on_daemon_peer_appeared(ui_state, session, peer, &nickname, None)
 }
 
 /// Tells a serverless peer which channels we are in, so they can place us
@@ -3137,9 +3171,8 @@ fn send_channel_presence(session: &mut SessionState, ui_state: &UiState, peer: U
     let send_id = session.next_stream_id;
     session.next_stream_id += 1;
     let Some(envelope) = crate::client::envelope::encrypt_envelope_for(
-        session.own_pq_private.as_ref(),
+        &session.own_pq_private,
         session.pq_peer_keys.encap_for(peer),
-        info.key_mode,
         &info.public_key_der,
         None,
         send_id,
@@ -3203,7 +3236,11 @@ fn on_channel_presence(
         .map(|c| c.name.clone())
         .collect();
     let current = ui_state.channels_containing_member(from);
-    let Reconciled { shared, join, leave } = reconcile_direct_membership(&theirs, &ours, &current);
+    let Reconciled {
+        shared,
+        join,
+        leave,
+    } = reconcile_direct_membership(&theirs, &ours, &current);
 
     // Departures first, so a peer moving from one channel to another is
     // never momentarily in neither.
@@ -3246,17 +3283,12 @@ fn send_device_id_announce(session: &mut SessionState, ui_state: &UiState, peer:
     let Some(user) = ui_state.known_users.get(&peer) else {
         return;
     };
-    if !crate::client::keymode_policy::can_address(user.key_mode, session.own_key_mode) {
-        return;
-    }
-    let key_mode = user.key_mode;
     let pubkey_der = user.public_key_der.clone();
     let send_id = session.next_stream_id;
     session.next_stream_id += 1;
     let Some(envelope) = crate::client::envelope::encrypt_envelope_for(
-        session.own_pq_private.as_ref(),
+        &session.own_pq_private,
         session.pq_peer_keys.encap_for(peer),
-        key_mode,
         &pubkey_der,
         None,
         send_id,
@@ -3280,7 +3312,12 @@ fn send_device_id_announce(session: &mut SessionState, ui_state: &UiState, peer:
 /// plaintext, or a mislabeled `envelope.content`) - there is no user-facing
 /// consequence beyond the review continuing to show "unknown" for this
 /// peer's device id.
-fn on_device_id_announce(session: &mut SessionState, ui_state: &UiState, from: UserId, envelope: Envelope) {
+fn on_device_id_announce(
+    session: &mut SessionState,
+    ui_state: &UiState,
+    from: UserId,
+    envelope: Envelope,
+) {
     if envelope.content != Content::DeviceIdAnnounce {
         return;
     }
@@ -3305,14 +3342,24 @@ fn on_device_id_announce(session: &mut SessionState, ui_state: &UiState, from: U
 /// and `DeviceIdAnnounce`'s arm, since those two pieces of information
 /// arrive independently and can race either way; whichever event
 /// completes the pair is the one that actually acts.
-fn maybe_resolve_p2p_identity_data(session: &mut SessionState, ui_state: &mut UiState, peer: UserId) {
+fn maybe_resolve_p2p_identity_data(
+    session: &mut SessionState,
+    ui_state: &mut UiState,
+    peer: UserId,
+) {
     let Some(addr) = session.peer_link.active_addr(peer) else {
         return;
     };
     let Some(device_id) = session.peer_device_ids.get(&peer).cloned() else {
         return;
     };
-    if reveal_pending_identity_review(&session.id_store, ui_state, peer, Some(addr), Some(&device_id)) {
+    if reveal_pending_identity_review(
+        &session.id_store,
+        ui_state,
+        peer,
+        Some(addr),
+        Some(&device_id),
+    ) {
         voice_stream::play_bell_chime(session);
     } else {
         let nickname = ui_state
@@ -3348,9 +3395,7 @@ fn handle_pq_key_rotated(
     let Some(you) = ui_state.own_id else {
         return (Vec::new(), Vec::new());
     };
-    let Some(my_fp) = session.own_pq_fp else {
-        return (Vec::new(), Vec::new());
-    };
+    let my_fp = session.own_pq_fp;
     let Some(sender_public) = ui_state
         .known_users
         .get(&peer)
@@ -3434,9 +3479,8 @@ async fn flush_queued_outbound(
         let send_id = session.next_stream_id;
         session.next_stream_id += 1;
         let envelope = crate::client::envelope::encrypt_envelope_for(
-            session.own_pq_private.as_ref(),
+            &session.own_pq_private,
             session.pq_peer_keys.encap_for(peer),
-            recipient.key_mode,
             &recipient.public_key_der,
             channel.clone(),
             send_id,
@@ -3468,29 +3512,19 @@ async fn flush_queued_outbound(
 }
 
 /// Rotates our `pq_hybrid` encryption keys for `peer` and offers them the
-/// new ones - a no-op unless this session is `PqHybrid`, so callers invoke
-/// it unconditionally after any send or receive, via `request_rotation`
-/// (§13.10). Rotates **inline**: ML-KEM-1024 and X25519 keygen are
-/// microseconds, so there is nothing here worth handing to a background
-/// worker. The key it supersedes is dropped the moment it falls out of the
-/// retention window, which is what forward secrecy actually consists of
-/// here.
+/// new ones - called unconditionally after any send or receive, via
+/// `request_rotation` (§13.10). Rotates **inline**: ML-KEM-1024 and
+/// X25519 keygen are microseconds, so there is nothing here worth handing
+/// to a background worker. The key it supersedes is dropped the moment it
+/// falls out of the retention window, which is what forward secrecy
+/// actually consists of here.
 pub(crate) fn request_rotation_if_pq_hybrid(session: &mut SessionState, peer: UserId) {
-    if session.own_key_mode != KeyMode::PqHybrid {
-        return;
-    }
-    let Some(signing) = session.own_pq_private.clone() else {
-        return;
-    };
     let Some(peer_fp) = session.pq_peer_keys.fingerprint_for(peer) else {
         return;
     };
-    let Some(own) = session.own_pq_keys.as_mut() else {
-        return;
-    };
-    let rotation = own.rotate_for(peer);
+    let rotation = session.own_pq_keys.rotate_for(peer);
     let Ok((encoded, signature)) =
-        crate::crypto::pq::sign_rotation(&signing, peer, &peer_fp, &rotation)
+        crate::crypto::pq::sign_rotation(&session.own_pq_private, peer, &peer_fp, &rotation)
     else {
         return;
     };
@@ -3506,7 +3540,6 @@ pub(crate) fn request_rotation_if_pq_hybrid(session: &mut SessionState, peer: Us
 /// (`SessionState::for_test`) - this client's own identity, and a
 /// directory to keep the on-disk stores in.
 pub struct TestSessionSpec {
-    pub key_mode: KeyMode,
     /// This client's own key material, in exactly the form the real
     /// connect path hands to `run_connected_session`.
     pub identity: ResolvedIdentity,
@@ -3528,6 +3561,31 @@ impl SessionState {
     /// (`PeerLinkManager::pending_payloads`).
     pub fn peer_link_mut(&mut self) -> &mut PeerLinkManager {
         &mut self.peer_link
+    }
+
+    /// Stands in for what a *peer* has pinned for this side, which is
+    /// ordinarily our own announced keybundle. Exposed for tests, which
+    /// need to model a pair whose view of each other comes from `id_store`
+    /// pins rather than from a server's `Identify` - a serverless
+    /// direct-punch pair (`docs/PROTOCOL.md` §7.1.5), where a pin that is
+    /// not a readable bundle is what drops the pad to `Direct` framing on
+    /// both sides (`otp::framing_for`).
+    pub fn set_own_pinned_der_for_test(&mut self, der: Vec<u8>) {
+        self.otp_own_pinned_der = der;
+    }
+
+    /// Reads back what `set_own_pinned_der_for_test` put there - what a
+    /// peer has pinned for this side, which is one half of the pair
+    /// `otp::framing_for` reads.
+    pub fn own_pinned_der_for_test(&self) -> &[u8] {
+        &self.otp_own_pinned_der
+    }
+
+    /// This session's identity-pinning store - exposed for tests, which
+    /// need to pin a serverless peer's key the way a previous connection
+    /// (or a hand-installed contact) would have.
+    pub fn id_store_mut(&mut self) -> &mut idstore::IdStore {
+        &mut self.id_store
     }
 
     /// The OTP layer's per-contact state - exposed for tests, which need
@@ -3591,33 +3649,23 @@ impl SessionState {
         let (direct_resolved_tx, _) = tokio::sync::mpsc::unbounded_channel();
         let (auto_stop_tx, _) = tokio::sync::mpsc::unbounded_channel();
         let (p2p_events_tx, _) = tokio::sync::mpsc::unbounded_channel();
-        let (peer_link, _socket) =
-            PeerLinkManager::bind("127.0.0.1:0".parse().expect("loopback"), None, p2p_events_tx)
-                .await
-                .expect("binding an ephemeral loopback port");
+        let (peer_link, _socket) = PeerLinkManager::bind(
+            "127.0.0.1:0".parse().expect("loopback"),
+            None,
+            p2p_events_tx,
+        )
+        .await
+        .expect("binding an ephemeral loopback port");
 
-        // The same split the real path makes - see there for why
-        // `PqHybrid` has no `own_keys` and vice versa.
-        let (own_keys, own_pq_private, own_pq_fp, own_pq_keys, own_pinned_der) = match spec.identity {
-            ResolvedIdentity::Rsa(kp) => {
-                let der = crate::crypto::public_key_to_der(&kp.private.to_public_key()).ok();
-                (Some(kp.private), None, None, None, der)
-            }
-            ResolvedIdentity::Pq {
-                private,
-                public_der,
-            } => {
-                let rotating =
-                    crate::client::pq_rekey::PqOwnKeys::new(private.bootstrap_decap().clone());
-                (
-                    None,
-                    Some(private),
-                    crate::crypto::pq::fingerprint_of_encoded(&public_der),
-                    Some(rotating),
-                    Some(public_der),
-                )
-            }
-        };
+        // The same unpacking the real path does.
+        let ResolvedIdentity {
+            private: own_pq_private,
+            public_der: own_pinned_der,
+        } = spec.identity;
+        let own_pq_fp = crate::crypto::pq::fingerprint_of_encoded(&own_pinned_der)
+            .expect("a test identity's own keybundle decodes");
+        let own_pq_keys =
+            crate::client::pq_rekey::PqOwnKeys::new(own_pq_private.bootstrap_decap().clone());
 
         Self {
             active_recording: None,
@@ -3638,11 +3686,7 @@ impl SessionState {
             stream_finished_tx,
             audio_err_tx,
             call_level_tx,
-            own_key_mode: spec.key_mode,
-            own_keys,
-            otp_own_pinned_der: own_pinned_der.filter(|_| {
-                crate::client::keymode_policy::uses_byte_comparison_pinning(spec.key_mode)
-            }),
+            otp_own_pinned_der: own_pinned_der,
             own_pq_private,
             own_pq_fp,
             own_pq_keys,
@@ -3671,7 +3715,7 @@ impl SessionState {
             otp_cancelled: std::collections::HashMap::new(),
             otp_ack_rows: std::collections::HashMap::new(),
             otp_out_queue: crate::client::otp::OtpOutQueue::new(),
-                pending_receipts: crate::client::delivery::PendingReceipts::new(),
+            pending_receipts: crate::client::delivery::PendingReceipts::new(),
             otp_incoming_setup: HashMap::new(),
             otp_incoming_pads: HashMap::new(),
             otp_outgoing_pads: HashMap::new(),
@@ -3742,24 +3786,16 @@ pub(crate) fn settle_delivery_id(
 }
 
 /// Rotates our own key material for `peer` - the single trigger every send
-/// and receive path calls, so `pq_hybrid` needs no sprinkling of call
-/// sites of its own. A no-op for the static modes, which have nothing to
-/// rotate.
+/// and receive path calls, so rotation needs no sprinkling of call sites
+/// of its own.
 pub(crate) fn request_rotation(session: &mut SessionState, peer: UserId) {
-    if session.own_key_mode == KeyMode::PqHybrid {
-        request_rotation_if_pq_hybrid(session, peer);
-    }
+    request_rotation_if_pq_hybrid(session, peer);
 }
 
-/// Decrypts `envelope`, addressed to *us*, from `from` (`sender`'s
-/// `UserInfo`, needed only for `PqHybrid`'s signature verification - see
-/// below). Which decryption scheme to use is decided by **our own**
-/// `session.own_key_mode`, not `sender`'s: a message addressed to us was
-/// necessarily encrypted against whichever public key material *we*
-/// announced, regardless of what `my_key` the sender themselves runs (see
-/// `docs/PROTOCOL.md` §13's "who can send to a `PqHybrid` peer" note) -
-/// `sender.key_mode` only matters here to know what shape their signing
-/// public key is in.
+/// Decrypts `envelope`, addressed to *us*, from `from`. It was sealed
+/// against the key material *we* announced, so the decryption keys are our
+/// own rotating ones; `sender`'s `UserInfo` is needed only to verify their
+/// signature over it (`docs/PROTOCOL.md` §13).
 pub(crate) fn decrypt_envelope_for(
     envelope: Envelope,
     from: UserId,
@@ -3778,7 +3814,7 @@ pub(crate) fn decrypt_envelope_for(
 
 /// Decrypts a `FileOffer` envelope addressed to us into its
 /// `FileOfferPayload` - the offer counterpart of `decrypt_envelope_for`,
-/// same RSA/PQ dispatch, different output shape (there's no `MessageBody`
+/// different output shape (there's no `MessageBody`
 /// for an unresolved offer, only for the row an `Accept` eventually
 /// creates - see `handle_incoming_file_offer`).
 pub(crate) fn decrypt_file_offer(
@@ -3792,22 +3828,6 @@ pub(crate) fn decrypt_file_offer(
         return None;
     }
     let plaintext = decrypt_own_envelope(envelope, from, sender, channel, session)?;
-    proto::decode(&plaintext).ok()
-}
-
-/// `decrypt_file_offer`'s voice counterpart, for `Content::VoiceOffer` -
-/// always a DM (voice-under-OTP has no channel path), so no `channel`
-/// parameter.
-pub(crate) fn decrypt_voice_offer(
-    envelope: &Envelope,
-    from: UserId,
-    sender: &UserInfo,
-    session: &mut SessionState,
-) -> Option<crate::client::file_transfer::VoiceOfferPayload> {
-    if envelope.content != Content::VoiceOffer {
-        return None;
-    }
-    let plaintext = decrypt_own_envelope(envelope, from, sender, None, session)?;
     proto::decode(&plaintext).ok()
 }
 
@@ -3827,26 +3847,42 @@ pub(crate) fn decrypt_own_envelope(
     channel: Option<&str>,
     session: &mut SessionState,
 ) -> Option<Vec<u8>> {
-    if session.own_key_mode == KeyMode::PqHybrid {
-        let my_fp = session.own_pq_fp?;
-        let candidates = session.own_pq_keys.as_ref()?.candidates_for(from);
-        let sender_public: crypto::pq::PqPublicBundle =
-            proto::decode(&sender.public_key_der).ok()?;
-        let blob = envelope.blocks.first()?;
-        let (binding, plaintext) =
-            crypto::pq::open_send(&candidates, &my_fp, &sender_public, blob)?;
-        if binding.channel.as_deref() != channel {
-            return None;
-        }
-        if !session.replay.accept(from, binding.send_id) {
-            return None;
-        }
-        Some(plaintext)
-    } else {
-        crypto::decrypt_chunked(session.own_keys.as_ref()?, &envelope.blocks).ok()
+    let candidates = session.own_pq_keys.candidates_for(from);
+    let sender_public: crypto::pq::PqPublicBundle = proto::decode(&sender.public_key_der).ok()?;
+    let blob = envelope.blocks.first()?;
+    let (binding, plaintext) =
+        crypto::pq::open_send(&candidates, &session.own_pq_fp, &sender_public, blob)?;
+    if binding.channel.as_deref() != channel {
+        return None;
     }
+    if !session.replay.accept(from, binding.send_id) {
+        return None;
+    }
+    Some(plaintext)
 }
 
+/// `decrypt_own_envelope` for an OTP-layer envelope, whose seal names no
+/// recipient and no channel (`crypto::pq::open_send_blinded`). Enforces
+/// the one part of the binding that is still the caller's to judge - that
+/// `send_id` is newer than anything already accepted from this sender -
+/// and leaves the channel check to the OTP layer, which makes it against
+/// what it recovers from under the pad (`client::otp`'s `OtpInner`).
+pub(crate) fn decrypt_own_blinded_envelope(
+    envelope: &Envelope,
+    from: UserId,
+    sender: &UserInfo,
+    session: &mut SessionState,
+) -> Option<Vec<u8>> {
+    let candidates = session.own_pq_keys.candidates_for(from);
+    let sender_public: crypto::pq::PqPublicBundle = proto::decode(&sender.public_key_der).ok()?;
+    let blob = envelope.blocks.first()?;
+    let (send_id, plaintext) =
+        crypto::pq::open_send_blinded(&candidates, &session.own_pq_fp, &sender_public, blob)?;
+    if !session.replay.accept(from, send_id) {
+        return None;
+    }
+    Some(plaintext)
+}
 
 /// Applies an incoming `FileOffer`: decrypts it, and either holds it
 /// (`Pending`/`Rejected` sender, `docs/PROTOCOL.md` §12 - same "held until
@@ -3945,9 +3981,13 @@ fn sweep_idle_streams(ui_state: &mut UiState, session: &mut SessionState, now: I
                 // Nothing arrived that anyone could play, so the row is
                 // closed as an empty clip rather than left mid-stream.
                 match stream.channel {
-                    Some(channel) => {
-                        ui_state.on_channel_stream_finished(&channel, from, stream_id, 0, Vec::new())
-                    }
+                    Some(channel) => ui_state.on_channel_stream_finished(
+                        &channel,
+                        from,
+                        stream_id,
+                        0,
+                        Vec::new(),
+                    ),
                     None => {
                         ui_state.on_direct_stream_finished(from, from, stream_id, 0, Vec::new())
                     }
@@ -3988,9 +4028,15 @@ async fn handle_file_event(
             from, stream_id, ..
         } => {
             session.active_file_transfers.remove(&(from, stream_id));
-            match session.otp_incoming_file_receives.remove(&(from, stream_id)) {
+            match session
+                .otp_incoming_file_receives
+                .remove(&(from, stream_id))
+            {
                 Some(pending) => {
-                    crate::client::otp::finish_incoming_file(session, ui_state, from, stream_id, pending).await;
+                    crate::client::otp::finish_incoming_file(
+                        session, ui_state, from, stream_id, pending,
+                    )
+                    .await;
                 }
                 None => ui_state.set_file_completed(from, stream_id),
             }
@@ -4001,7 +4047,10 @@ async fn handle_file_event(
         }
         file_transfer::FileEvent::ReceiveFailed { from, stream_id } => {
             session.active_file_transfers.remove(&(from, stream_id));
-            if let Some(pending) = session.otp_incoming_file_receives.remove(&(from, stream_id)) {
+            if let Some(pending) = session
+                .otp_incoming_file_receives
+                .remove(&(from, stream_id))
+            {
                 crate::client::otp::secure_remove_file(&pending.temp_path);
             }
             ui_state.set_file_failed(from, stream_id);

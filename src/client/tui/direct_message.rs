@@ -151,7 +151,7 @@ impl UiState {
                 id: from,
                 name: from_name.clone(),
                 public_key_der: Vec::new(),
-                key_mode: KeyMode::None,
+                key_mode: KeyMode::PqHybrid,
             });
         self.ensure_private_room(from, fallback_peer);
         let Some(room) = self.private_rooms.get_mut(&from) else {
@@ -253,7 +253,7 @@ impl UiState {
                 id: peer_id,
                 name: from_name.clone(),
                 public_key_der: Vec::new(),
-                key_mode: KeyMode::None,
+                key_mode: KeyMode::PqHybrid,
             });
         self.ensure_private_room(peer_id, fallback_peer);
         let Some(room) = self.private_rooms.get_mut(&peer_id) else {
@@ -306,7 +306,7 @@ impl UiState {
                 id: peer,
                 name: peer_name.to_string(),
                 public_key_der: Vec::new(),
-                key_mode: KeyMode::None,
+                key_mode: KeyMode::PqHybrid,
             });
         self.ensure_private_room(peer, fallback_peer);
         let Some(room) = self.private_rooms.get_mut(&peer) else {
@@ -456,7 +456,7 @@ impl UiState {
                 id: from,
                 name: from_name.clone(),
                 public_key_der: Vec::new(),
-                key_mode: KeyMode::None,
+                key_mode: KeyMode::PqHybrid,
             });
         self.ensure_private_room(from, fallback_peer);
         let Some(room) = self.private_rooms.get_mut(&from) else {
@@ -536,7 +536,12 @@ pub(crate) const OTP_KEY_LOW_THRESHOLD_BYTES: u64 = 512 * 1024;
 /// figure gets the red/green threshold color; `seq`/`offset` are always
 /// grey. `pub(crate)` so the contacts list (`client::tui::contacts`) can
 /// render the exact same figures the same way.
-pub(crate) fn push_otp_key_spans(spans: &mut Vec<Span<'static>>, seq: u64, offset: u64, remaining_bytes: u64) {
+pub(crate) fn push_otp_key_spans(
+    spans: &mut Vec<Span<'static>>,
+    seq: u64,
+    offset: u64,
+    remaining_bytes: u64,
+) {
     spans.push(Span::styled(
         format!("{seq} {offset} "),
         Style::default().fg(Color::Gray),
@@ -569,15 +574,27 @@ fn render_otp_header(frame: &mut Frame, area: Rect, state: &UiState, peer_id: Us
     let mut spans = vec![
         Span::styled(
             "OTP SESSION",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::raw(" with "),
         Span::styled(nickname, Style::default().fg(Color::Yellow)),
         Span::raw(" - Receive Key (dec): "),
     ];
-    push_otp_key_spans(&mut spans, detail.dec_sequence, detail.dec_offset, detail.dec_key_remaining);
+    push_otp_key_spans(
+        &mut spans,
+        detail.dec_sequence,
+        detail.dec_offset,
+        detail.dec_key_remaining,
+    );
     spans.push(Span::raw(" - Send Key (enc): "));
-    push_otp_key_spans(&mut spans, detail.enc_sequence, detail.enc_offset, detail.enc_key_remaining);
+    push_otp_key_spans(
+        &mut spans,
+        detail.enc_sequence,
+        detail.enc_offset,
+        detail.enc_key_remaining,
+    );
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }

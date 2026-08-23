@@ -11,7 +11,8 @@ use aloo::client::connect::{
 };
 use aloo::client::file_browser::FileBrowserState;
 use aloo::client::tui::ui_connect_popup::{
-    Action, ConnectPopupState, Field, FileBrowserTarget, KeyType, MyKeyType, NICKNAME_MAX_LEN,
+    ALOO_HOME_LABEL, Action, ConnectPopupState, Field, FileBrowserTarget, KeyType,
+    NICKNAME_MAX_LEN,
     render,
 };
 
@@ -47,30 +48,22 @@ async fn form_valid(w: &mut AlooWorld) {
     p.nickname = "dave".into();
 }
 
-fn my_key_type_named(kind: &str) -> MyKeyType {
-    match kind {
-        "password" => MyKeyType::Password,
-        "none" => MyKeyType::None,
-        "pq_hybrid" => MyKeyType::PqHybrid,
-        other => panic!("unknown my_key type {other:?}"),
-    }
+#[given("my_key points at a keybundle pair")]
+#[when("my_key points at a keybundle pair")]
+async fn my_key_points_at_files(w: &mut AlooWorld) {
+    let p = w.popup_mut();
+    p.my_key.file_pub = "/keys/pq_hybrid.pub".into();
+    p.my_key.file_priv = "/keys/pq_hybrid".into();
 }
 
-// Registered for both keywords: selecting a key type is sometimes the
-// scenario's setup and sometimes the action it is exercising.
-#[given(expr = "my_key is set to {word}")]
-#[when(expr = "my_key is set to {word}")]
-async fn my_key_is(w: &mut AlooWorld, kind: String) {
-    w.popup_mut().my_key.key_type = my_key_type_named(&kind);
-}
-
-#[then(expr = "my_key defaults to {word}")]
-async fn my_key_defaults_to(w: &mut AlooWorld, kind: String) {
-    assert_eq!(
-        w.popup_mut().my_key.key_type,
-        my_key_type_named(&kind),
-        "unexpected default my_key type"
-    );
+/// `my_key` has no type selector at all any more: `pq_hybrid` is the only
+/// peer-to-peer scheme, so the group is just its two keybundle paths and
+/// the focus order always offers both.
+#[then("my_key is pq_hybrid with no type to choose")]
+async fn my_key_is_pq_hybrid(w: &mut AlooWorld) {
+    let order = w.popup_mut().focus_order();
+    assert!(order.contains(&Field::MyKeyValuePub));
+    assert!(order.contains(&Field::MyKeyValuePriv));
 }
 
 #[given(expr = "server_key is set to {word}")]
@@ -449,7 +442,7 @@ async fn highlight_not_bleeding(w: &mut AlooWorld) {
     );
 }
 
-#[then("the request carries no key material for either key")]
+#[then("the request carries no server key material")]
 async fn request_carries_none(w: &mut AlooWorld) {
     let req = w
         .popup
@@ -458,10 +451,32 @@ async fn request_carries_none(w: &mut AlooWorld) {
         .build_request()
         .expect("form should be valid");
     assert_eq!(req.server_key, ServerKeySelection::None);
-    assert_eq!(req.my_key, MyKeySelection::None);
+    assert_eq!(
+        req.my_key,
+        MyKeySelection {
+            file_pub: std::path::PathBuf::from("/keys/pq_hybrid.pub"),
+            file_priv: std::path::PathBuf::from("/keys/pq_hybrid"),
+        }
+    );
     assert_eq!(req.host, "chat.example.com");
     assert_eq!(req.port, 6667);
     assert_eq!(req.nickname, "dave");
+}
+
+/// The read-only line above the Connect button (`docs/SPEC.md` "Not
+/// connected UI") - gray, so it reads as a note about where this client's
+/// local state lives rather than as another thing to fill in.
+#[then("the form shows the ALOO_HOME it resolved, in gray")]
+async fn form_shows_aloo_home(w: &mut AlooWorld) {
+    let state = w.popup.as_ref().expect("no form");
+    let expected = format!("{ALOO_HOME_LABEL}{}", state.aloo_home);
+    let buffer = crate::support::buffer_of(80, 30, |f| render(f, state));
+    let (x, y) = crate::support::find_text_start(&buffer, &expected);
+    assert_eq!(
+        buffer[(x, y)].fg,
+        ratatui::style::Color::DarkGray,
+        "the ALOO_HOME line is gray"
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -473,12 +488,7 @@ async fn request_carries_none(w: &mut AlooWorld) {
 /// a real file: `prefill_connect_defaults` takes the settings it prefills
 /// from, so a scenario has no reason to involve the filesystem.
 #[given(expr = "a settings file recording a connection as {string} to {string} port {int}")]
-async fn settings_record_connection(
-    w: &mut AlooWorld,
-    nickname: String,
-    host: String,
-    port: u16,
-) {
+async fn settings_record_connection(w: &mut AlooWorld, nickname: String, host: String, port: u16) {
     w.direct_settings = Some(aloo::settings::Settings {
         connect_nickname: Some(nickname),
         connect_host: Some(host),

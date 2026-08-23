@@ -362,7 +362,7 @@ fn ensure_registered(w: &mut AlooWorld, name: &str) -> UserId {
     }
     let id = w
         .registry_mut()
-        .register(name.to_string(), vec![1, 2, 3], aloo::proto::KeyMode::Password);
+        .register(name.to_string(), vec![1, 2, 3], aloo::proto::KeyMode::PqHybrid);
     w.ids.insert(name.to_string(), id);
     id
 }

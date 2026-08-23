@@ -154,7 +154,7 @@ fn the_protocol_documents_sections_are_stable() {
         "## 6. Channels",
         "## 7. Messaging",
         "## 8. Encryption model",
-        "### 8.4 RSA signatures",
+        "### 8.2 RSA signatures",
         "## 10. What the server never sees",
         "## 11. Rotating a peer's key during a session",
         "## 12. Client-side identity pinning",
@@ -162,7 +162,7 @@ fn the_protocol_documents_sections_are_stable() {
         "## 13. Post-quantum hybrid encryption",
         "### 13.3 One layout for everything",
         "### 13.10 Rotating encryption keys",
-        "## 14. The three encryption methods, side by side",
+        "## 14. The two encryption layers, side by side",
         "## 15. Sequences",
     ] {
         assert!(
@@ -172,21 +172,21 @@ fn the_protocol_documents_sections_are_stable() {
     }
 }
 
-/// The four methods have to be presented as four, whatever the wire enum
-/// happens to have five values for.
+/// What a user actually gets has to be laid out in one place: the one
+/// peer-to-peer scheme, and the one optional layer over it.
 /// @requirement AC-130
 #[test]
-fn the_three_encryption_methods_are_compared_in_one_place() {
+fn the_encryption_layers_are_compared_in_one_place() {
     let protocol = read("docs/PROTOCOL.md");
     let start = protocol
-        .find("## 14. The three encryption methods")
+        .find("## 14. The two encryption layers")
         .expect("section 14 must exist");
     let section = &protocol[start..];
 
-    for method in ["plain", "password", "pq-hybrid"] {
+    for layer in ["pq-hybrid", "OTP"] {
         assert!(
-            section[..4000].contains(method),
-            "section 14 must cover the {method} method"
+            section[..4000].contains(layer),
+            "section 14 must cover the {layer} layer"
         );
     }
 }
