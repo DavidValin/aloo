@@ -8,8 +8,9 @@ use aloo::client::otp_cli::{self, OtpCliConfig};
 use aloo::client::otp_store::{OtpContactState, OtpStore, PendingOtpContent};
 use aloo::crypto::otp::{
     contact_name_for_keys,
-    contact_name_for, otp_size_mb_in_range, OtpEndSessionPayload, OtpKeySetupAckPayload,
-    OtpKeySetupChunk, OtpKeySetupPayload, OtpKeySetupReassembly, OTP_SIZE_MB_MAX, OTP_SIZE_MB_MIN,
+    contact_name_for, contact_name_for_mail, otp_size_mb_in_range, OtpEndSessionPayload,
+    OtpKeySetupAckPayload, OtpKeySetupChunk, OtpKeySetupPayload, OtpKeySetupReassembly,
+    OtpPurpose, OTP_SIZE_MB_MAX, OTP_SIZE_MB_MIN,
 };
 use aloo::proto;
 use std::path::PathBuf;
@@ -137,7 +138,7 @@ async fn initiate_provisioning_and_apply_incoming_setup_leave_both_sides_usable(
     let alice_cfg = config_at(temp_dir("handshake-alice"));
     let bob_cfg = config_at(temp_dir("handshake-bob"));
 
-    let payload = initiate_provisioning(&alice_cfg, 1, &own_fp, &peer_fp)
+    let payload = initiate_provisioning(&alice_cfg, 1, &own_fp, &peer_fp, OtpPurpose::Live)
         .await
         .expect("provisioning generation should succeed");
     let expected_contact_name = contact_name_for(&own_fp, &peer_fp);
@@ -161,6 +162,53 @@ async fn initiate_provisioning_and_apply_incoming_setup_leave_both_sides_usable(
     assert!(
         !pending_setup_dir(&alice_cfg, &expected_contact_name).exists(),
         "the staged pad must be removed once it has been adopted"
+    );
+}
+
+/// The exact regression `/new-otp-mail-key` hit: `initiate_provisioning`
+/// used to compute the *live* contact name unconditionally, regardless of
+/// `purpose` - so a freshly generated mail key was staged, and would
+/// therefore have been installed, under the same name a live `/otp`
+/// session uses. Both sides ending up with a "mail" key that was in fact
+/// the live one is exactly what made every ordinary DM afterward wrongly
+/// ride that pad instead of `pq_hybrid`.
+///
+/// @requirement AC-294, AC-295
+#[tokio::test]
+async fn initiate_provisioning_for_mail_purpose_stages_under_the_mail_contact_name() {
+    if !require_otp() {
+        return;
+    }
+    let own_fp = fp(0x30);
+    let peer_fp = fp(0x40);
+    let alice_cfg = config_at(temp_dir("mail-handshake-alice"));
+    let bob_cfg = config_at(temp_dir("mail-handshake-bob"));
+
+    let payload = initiate_provisioning(&alice_cfg, 1, &own_fp, &peer_fp, OtpPurpose::Mail)
+        .await
+        .expect("provisioning generation should succeed");
+    let expected_mail_name = contact_name_for_mail(&own_fp, &peer_fp);
+    let live_name = contact_name_for(&own_fp, &peer_fp);
+    assert_eq!(payload.contact_name, expected_mail_name);
+    assert_ne!(
+        payload.contact_name, live_name,
+        "a mail-purpose handshake must never stage its pad under the live contact name"
+    );
+
+    let ack = apply_incoming_setup(&bob_cfg, &payload).await;
+    assert!(ack.accepted, "bob's add-contact should succeed: {:?}", ack.reason);
+    assert_eq!(ack.contact_name, expected_mail_name);
+    assert!(otp_cli::has_contact(&bob_cfg, &expected_mail_name).await.unwrap());
+    assert!(
+        !otp_cli::has_contact(&bob_cfg, &live_name).await.unwrap(),
+        "installing a mail key must never also create a live-purpose keychain entry"
+    );
+
+    assert!(commit_pending_setup(&alice_cfg, &expected_mail_name).await);
+    assert!(otp_cli::has_contact(&alice_cfg, &expected_mail_name).await.unwrap());
+    assert!(
+        !otp_cli::has_contact(&alice_cfg, &live_name).await.unwrap(),
+        "the initiating side must not end up with a live-purpose entry either"
     );
 }
 
@@ -229,7 +277,7 @@ async fn an_invitation_that_is_never_accepted_leaves_no_stale_contact() {
     let bob_cfg = config_at(temp_dir("never-accepted-bob"));
     let contact_name = contact_name_for(&own_fp, &peer_fp);
 
-    let _abandoned = initiate_provisioning(&alice_cfg, 1, &own_fp, &peer_fp)
+    let _abandoned = initiate_provisioning(&alice_cfg, 1, &own_fp, &peer_fp, OtpPurpose::Live)
         .await
         .expect("alice's own provisioning should succeed");
     assert!(
@@ -243,7 +291,7 @@ async fn an_invitation_that_is_never_accepted_leaves_no_stale_contact() {
     // The invitation is abandoned, and a second attempt succeeds where it
     // previously deadlocked - all the way to both sides being usable.
     discard_pending_setup(&alice_cfg, &contact_name);
-    let retry = initiate_provisioning(&alice_cfg, 1, &own_fp, &peer_fp)
+    let retry = initiate_provisioning(&alice_cfg, 1, &own_fp, &peer_fp, OtpPurpose::Live)
         .await
         .expect("a fresh attempt must succeed after an abandoned one");
     let ack = apply_incoming_setup(&bob_cfg, &retry).await;
@@ -269,7 +317,7 @@ async fn a_pending_setup_is_re_readable_for_retries_and_identical_each_time() {
     let alice_cfg = config_at(temp_dir("retry-readback-alice"));
     let contact_name = contact_name_for(&own_fp, &peer_fp);
 
-    let first = initiate_provisioning(&alice_cfg, 1, &own_fp, &peer_fp)
+    let first = initiate_provisioning(&alice_cfg, 1, &own_fp, &peer_fp, OtpPurpose::Live)
         .await
         .expect("provisioning should succeed");
     let again = read_pending_setup(&alice_cfg, &contact_name, 1)
@@ -307,7 +355,7 @@ async fn asymmetric_provisioning_recovers_once_the_stale_contact_is_removed() {
     // commits early: this is a contact that genuinely completed once (or was
     // provisioned out of band and adopted by `detect_or_adopt_existing`) and
     // whose counterpart has since lost their half.
-    let _stale_payload = initiate_provisioning(&alice_cfg, 1, &own_fp, &peer_fp)
+    let _stale_payload = initiate_provisioning(&alice_cfg, 1, &own_fp, &peer_fp, OtpPurpose::Live)
         .await
         .expect("alice's own (stale) provisioning should succeed");
     assert!(commit_pending_setup(&alice_cfg, &contact_name).await);
@@ -326,7 +374,7 @@ async fn asymmetric_provisioning_recovers_once_the_stale_contact_is_removed() {
     assert!(alice_store.get(&contact_name).is_none());
 
     // Now a fresh handshake for the very same contact name succeeds.
-    let fresh_payload = initiate_provisioning(&alice_cfg, 1, &own_fp, &peer_fp)
+    let fresh_payload = initiate_provisioning(&alice_cfg, 1, &own_fp, &peer_fp, OtpPurpose::Live)
         .await
         .expect("provisioning should succeed once the stale entry is gone");
     let ack = apply_incoming_setup(&bob_cfg, &fresh_payload).await;
@@ -586,10 +634,10 @@ async fn a_glare_leaves_both_sides_holding_halves_of_one_pad() {
     let contact_name = contact_name_for(&alice_fp, &bob_fp);
 
     // Both generate before either has answered.
-    let pad_a = initiate_provisioning(&alice_cfg, 1, &alice_fp, &bob_fp)
+    let pad_a = initiate_provisioning(&alice_cfg, 1, &alice_fp, &bob_fp, OtpPurpose::Live)
         .await
         .expect("alice's pad");
-    let _pad_b = initiate_provisioning(&bob_cfg, 1, &bob_fp, &alice_fp)
+    let _pad_b = initiate_provisioning(&bob_cfg, 1, &bob_fp, &alice_fp, OtpPurpose::Live)
         .await
         .expect("bob's pad");
 
@@ -628,10 +676,10 @@ async fn accepting_a_peers_pad_retires_this_sides_own_staged_one() {
     let bob_cfg = config_at(temp_dir("retire-bob"));
     let contact_name = contact_name_for(&alice_fp, &bob_fp);
 
-    let _mine = initiate_provisioning(&alice_cfg, 1, &alice_fp, &bob_fp)
+    let _mine = initiate_provisioning(&alice_cfg, 1, &alice_fp, &bob_fp, OtpPurpose::Live)
         .await
         .expect("alice's own pad");
-    let theirs = initiate_provisioning(&bob_cfg, 1, &bob_fp, &alice_fp)
+    let theirs = initiate_provisioning(&bob_cfg, 1, &bob_fp, &alice_fp, OtpPurpose::Live)
         .await
         .expect("bob's pad");
 

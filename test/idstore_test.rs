@@ -216,11 +216,13 @@ fn on_disk_format_is_hex_encoded_not_raw_or_base64() {
     let contents = std::fs::read_to_string(&path).unwrap();
     // Third column is how much the pin is worth (docs/PROTOCOL.md 12.6) -
     // a fresh sighting is trusted-on-first-use until a human says more.
-    // The four trailing (empty) columns are last-seen address/device id
-    // (docs/PROTOCOL.md 12.7) and last-seen-unix/key-mode (the contacts
-    // list) - all absent until this pin's key has gone `Active` over the
-    // direct link at least once, or been recorded via `set_key_mode`.
-    assert_eq!(contents, "alice\tdeadbeef\ttofu\t\t\t\t\n");
+    // The five trailing (empty) columns are last-seen address/device id
+    // (docs/PROTOCOL.md 12.7), last-seen-unix/key-mode (the contacts
+    // list), and pinned-from (an imported identity card's path) - all
+    // absent until this pin's key has gone `Active` over the direct link
+    // at least once, been recorded via `set_key_mode`, or been imported
+    // from a file.
+    assert_eq!(contents, "alice\tdeadbeef\ttofu\t\t\t\t\t\n");
     std::fs::remove_file(&path).ok();
 }
 
@@ -357,6 +359,56 @@ fn set_key_mode_is_a_no_op_for_an_unpinned_nickname() {
     let mut store = IdStore::load(&path).unwrap();
     store.set_key_mode("nobody", aloo::proto::KeyMode::PqHybrid);
     assert_eq!(store.key_mode("nobody"), None);
+}
+
+/// @requirement AC-301
+#[test]
+fn set_pinned_from_records_it_for_a_pinned_nickname() {
+    let path = temp_store_path();
+    let mut store = IdStore::load(&path).unwrap();
+    store.check_and_pin("alice", b"key-a");
+    assert_eq!(store.pinned_from("alice"), None);
+    store.set_pinned_from("alice", std::path::PathBuf::from("/tmp/alice.card"));
+    assert_eq!(store.pinned_from("alice"), Some(std::path::Path::new("/tmp/alice.card")));
+}
+
+/// @requirement AC-301
+#[test]
+fn set_pinned_from_is_a_no_op_for_an_unpinned_nickname() {
+    let path = temp_store_path();
+    let mut store = IdStore::load(&path).unwrap();
+    store.set_pinned_from("nobody", std::path::PathBuf::from("/tmp/nobody.card"));
+    assert_eq!(store.pinned_from("nobody"), None);
+}
+
+/// @requirement AC-301
+#[test]
+fn pinned_from_survives_a_save_and_load_round_trip() {
+    let path = temp_store_path();
+    {
+        let mut store = IdStore::load(&path).unwrap();
+        store.check_and_pin("alice", b"key-a");
+        store.set_pinned_from("alice", std::path::PathBuf::from("/tmp/alice.card"));
+        store.save().unwrap();
+    }
+    let store = IdStore::load(&path).unwrap();
+    assert_eq!(store.pinned_from("alice"), Some(std::path::Path::new("/tmp/alice.card")));
+    std::fs::remove_file(&path).ok();
+}
+
+/// A re-pin (`check_and_pin` again under the same nickname) must not wipe
+/// out a previously recorded card path - the same "metadata describes the
+/// relationship, not any one key" reasoning `re_pinning_keeps_the_previously_recorded_key_mode_and_last_seen`
+/// already establishes for `key_mode`/`last_seen`.
+/// @requirement AC-301
+#[test]
+fn re_pinning_keeps_the_previously_recorded_pinned_from() {
+    let path = temp_store_path();
+    let mut store = IdStore::load(&path).unwrap();
+    store.check_and_pin("alice", b"key-a");
+    store.set_pinned_from("alice", std::path::PathBuf::from("/tmp/alice.card"));
+    store.check_and_pin("alice", b"key-a-2");
+    assert_eq!(store.pinned_from("alice"), Some(std::path::Path::new("/tmp/alice.card")));
 }
 
 #[test]

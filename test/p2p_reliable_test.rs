@@ -98,7 +98,7 @@ fn unacked_frame_is_not_retransmitted_before_its_backoff_elapses() {
 fn acked_frame_is_never_retransmitted() {
     let mut tx = ArqSender::new();
     let (seq, _) = tx.send(vec![9]).expect("first frame goes out immediately");
-    tx.on_ack(seq);
+    tx.on_ack(seq, Instant::now());
     assert!(!tx.has_pending());
     let far_future = Instant::now() + Duration::from_secs(60);
     assert_eq!(tx.due_for_retransmit(far_future).unwrap(), Vec::new());
@@ -165,7 +165,7 @@ fn an_ack_releases_the_next_backlogged_frame_in_order() {
     // Ack the in-flight frames oldest-first; each retires one and releases
     // exactly one backlogged frame.
     for i in 0..3u32 {
-        let released = tx.on_ack(i);
+        let released = tx.on_ack(i, Instant::now());
         assert_eq!(
             released.len(),
             1,
@@ -194,9 +194,9 @@ fn a_duplicate_ack_does_not_pull_the_backlog_forward() {
     for i in 0..SEND_WINDOW + 2 {
         tx.send(vec![i as u8]);
     }
-    assert_eq!(tx.on_ack(0).len(), 1, "the first ack releases a frame");
+    assert_eq!(tx.on_ack(0, Instant::now()).len(), 1, "the first ack releases a frame");
     assert!(
-        tx.on_ack(0).is_empty(),
+        tx.on_ack(0, Instant::now()).is_empty(),
         "a replayed ack for an already-retired frame releases nothing"
     );
 }
@@ -227,7 +227,7 @@ fn a_backlogged_frame_still_counts_as_pending() {
     // Retire every in-flight frame; the one still backlogged is released by
     // the first of those acks, so something is always outstanding.
     for i in 0..SEND_WINDOW as u32 {
-        tx.on_ack(i);
+        tx.on_ack(i, Instant::now());
     }
     assert!(
         tx.has_pending(),
@@ -331,9 +331,82 @@ fn acking_returns_bytes_to_the_budget() {
         }
     }
     // Everything in flight is acked, so the backlog must flow again.
-    let released = tx.on_ack(admitted as u32 - 1);
+    let released = tx.on_ack(admitted as u32 - 1, Instant::now());
     assert!(
         !released.is_empty(),
         "acking the whole window must free its bytes and release the backlog"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Adaptive retransmit timeout (RFC 6298-style)
+// ---------------------------------------------------------------------
+
+/// @requirement TB-250
+#[test]
+fn initial_rto_is_the_fixed_guess_before_any_sample() {
+    let tx = ArqSender::new();
+    assert_eq!(
+        tx.current_rto(),
+        Duration::from_millis(400),
+        "nothing is known about the path yet, so the conservative fixed guess applies"
+    );
+}
+
+/// @requirement TB-250
+#[test]
+fn rto_adapts_below_the_initial_guess_once_samples_arrive() {
+    let mut tx = ArqSender::new();
+    let t0 = Instant::now();
+    for _ in 0..4 {
+        let (seq, _) = tx.send(vec![0u8]).expect("window has room");
+        tx.on_ack(seq, t0 + Duration::from_millis(30));
+    }
+    let rto = tx.current_rto();
+    assert!(
+        rto < Duration::from_millis(400),
+        "a handful of ~30ms samples must pull the timeout well below the unsampled guess: {rto:?}"
+    );
+    assert!(
+        rto >= Duration::from_millis(100),
+        "never below MIN_RTO, however fast the samples say the path is: {rto:?}"
+    );
+}
+
+/// @requirement TB-250
+#[test]
+fn a_retransmitted_frames_ack_is_never_used_as_a_sample() {
+    let mut tx = ArqSender::new();
+    let (seq, _) = tx.send(vec![0u8]).expect("first frame goes out immediately");
+    // Force a retransmit before it is ever acked.
+    let far_future = Instant::now() + Duration::from_secs(60);
+    tx.due_for_retransmit(far_future).unwrap();
+    // Acking it now, with an absurdly long elapsed time, must not corrupt
+    // the estimate - Karn's algorithm skips a retransmitted frame's ack
+    // entirely, since it cannot say which transmission it belongs to.
+    tx.on_ack(seq, far_future + Duration::from_secs(60));
+    assert_eq!(
+        tx.current_rto(),
+        Duration::from_millis(400),
+        "a retransmitted frame's ack must not be used as an RTT sample at all"
+    );
+}
+
+/// @requirement TB-250
+#[test]
+fn reset_clears_the_rtt_estimate() {
+    let mut tx = ArqSender::new();
+    let t0 = Instant::now();
+    let (seq, _) = tx.send(vec![0u8]).unwrap();
+    tx.on_ack(seq, t0 + Duration::from_millis(30));
+    assert!(
+        tx.current_rto() < Duration::from_millis(400),
+        "sanity: a sample landed before resetting"
+    );
+    tx.reset();
+    assert_eq!(
+        tx.current_rto(),
+        Duration::from_millis(400),
+        "a re-punched link starts with no RTT history - a new path may be nothing like the old one"
     );
 }

@@ -243,13 +243,18 @@ they're next online. Requires
 | hold `Space` | Record a voice attachment (attachments pane focused) |
 | `Ctrl+S` | Send |
 | `/mailbox` | Your mailbox: each sent mail's delivery status, and what arrived |
+| `/new-otp-mail-key` | Provision a mail-only key with an open DM's peer, both online right now |
 
 While anything you've received is still unread, the header shows a blinking
 ✉ and `<n> unread OTP Mails` — gone the moment you open it in the mailbox.
 
-Needs a pinned recipient you share a pad with, and more pad left than the
-mail is long — the remaining key shows top-right, updating as you type and
-attach. It waits on the server, sealed, until they next connect.
+Needs a pinned recipient with a **mail** key for that contact - its own,
+independent of any live `/otp` session with them - and more of it left than
+the mail is long; the remaining key shows top-right, updating as you type
+and attach. With no mail key at all, compose locks behind a red message
+until Escape closes it (and the whole view with it) - see "One Time Pad
+mail" and "Managing contacts" below for the two ways to get one. Once
+sent, it waits on the server, sealed, until they next connect.
 
 ## Running in the background
 
@@ -371,7 +376,7 @@ Driving it is in ["How to use it"](#otp-mail) above; what follows is what makes 
 
 **The server's role here — and how it differs from a `/otp` session.** Live `/otp` messages travel **peer-to-peer**: the server carries none of them, it only helps your two apps find each other. Mail can't work that way — the whole point is that the recipient may be offline — so this is the one deliberate exception where the server acts as a mailbox: it **stores** the mail on disk and **delivers** it when the recipient next connects, deletes its copy the moment they confirm it arrived, and holds the delivery receipt for you until you've seen it. What it stores is sealed under your shared one-time pad *before it ever leaves your machine*: the server holds no key material and cannot read a byte of it. And because a bare pad hides content but can't detect tampering, every mail also carries a signature from your durable identity — so the server (or anyone else who touches the blob) can't alter a bit undetected.
 
-Both paths spend the **same** pad for that contact, in strict order, so a mail and your live `/otp` messages never decrypt out of sequence. Composing needs a pinned recipient you share an `otp` pad with (see `/otp` above) and more pad remaining than the whole mail is long — the compose view shows the remaining key live, top-right, as you write and attach. A received mail rests on your disk as ciphertext plus the pad to read it by (never plaintext) until you remove it from `/mailbox`, which destroys both.
+**Mail has its own key, entirely separate from a live `/otp` session.** The two are never the same pad, even for a contact you have both with — spending one never touches the other. Composing needs a pinned recipient (§ above) plus a *mail* key for that contact specifically, with more pad remaining than the whole mail is long — the compose view shows the remaining key live, top-right, as you write and attach. `/new-otp-mail-key` is how you get one while you're both online: the exact same consent-and-transfer flow `/otp` uses, just filing the result as a mail key instead of a live-session one; `/contacts`' key details popup (below) is the other way, for installing one manually or when only one of you is online. Already have a mail key for that contact? Running it again does nothing over the network - you'll just see "otp mail key already exists. use /mail or delete existing in /contacts". **With no mail key at all, the compose view locks**: a centered red message names what's missing and how to fix it, and nothing but Escape does anything until you close it — which closes the whole compose view with it, not just the message. A received mail rests on your disk as ciphertext plus the pad to read it by (never plaintext) until you remove it from `/mailbox`, which destroys both.
 
 ## Knowing who you're really talking to
 
@@ -387,23 +392,32 @@ Your PQ-Hybrid identity is what gets pinned, and it stays the same across reconn
 
 ### Managing contacts: `/contacts`
 
-`/contacts` opens the full list of everyone you've ever pinned — nickname, when they were last seen, how they're encrypted, and, for anyone you also share a one-time pad with, that pad's live `seq offset remaining-MB` figures in each direction, the same figures the `/otp` session header shows.
+`/contacts` opens the full list of everyone you've ever pinned — nickname, when they were last seen, how they're encrypted, and, per contact, three keys shown as ✅/❌ badges: **PQH** (the pinned identity itself), **OTP** (a live session key), and **OTP MAIL** (mail's own, independent key).
 
 | Key | What it does |
 |---|---|
 | `Up` / `Down` | Move the selection |
-| `d` | Delete the selected contact — forgets their pin, and their OTP key too if they have one (confirms first) |
-| `o` | Install an OTP key for the selected contact, from files you generated yourself |
+| `Left` / `Right` | Cycle which of the three keys is highlighted — across the whole list at once, so paging up/down keeps comparing the same key |
+| `Enter` | Open the highlighted key's details popup |
+| `d` | Delete the selected contact outright — forgets their pin and both other keys (confirms first) |
+| `o` | Install an OTP key for the selected contact, from files you generated yourself (shortcut for the OTP key's own details-popup action) |
 | `r` | Refresh the list (e.g. after the remaining key has moved) |
 | `Esc` | Close |
 
-**Installing a key manually** is the alternative to `/otp`'s own handshake: generate a pair yourself with the real `otp` command —
+**A key's details popup** (`Enter`) explains what that key is for, then shows either its path on disk and live figures (seq/offset/remaining-MB, same as the `/otp` session header) with a **Delete key** action, or, if it doesn't exist yet, a **Create key** (PQH) / **Install manually** (OTP/OTP MAIL) action. Never both at once. `Left`/`Right` inside the popup switches which key it's showing.
 
-```sh
-otp --new-key-pair <size_in_MB> <part_a_name> <part_b_name>
-```
+- **PQH → Create key** imports a self-signed identity card (`aloo --export-identity-card`'s own output) via a file browser — refused unless the card's own attested nickname matches the row you opened it from.
+- **PQH → Delete key** forgets the whole contact: the pin and both other keys with it, since neither can be named without it.
+- **OTP / OTP MAIL → Install manually** is the alternative to `/otp`/`/new-otp-mail-key`'s own handshake: generate a pair yourself with the real `otp` command —
 
-— send one party's keys to the other person out of band, keep the other party's for yourself, then press `o` on their contact row and point **encryption key** at your own sending half and **decryption key** at your own receiving half. Both sides need their matching keys installed before messaging — a mismatch decrypts to garbage, not an error, so double-check which half went where.
+  ```sh
+  otp --new-key-pair <size_in_MB> <part_a_name> <part_b_name>
+  ```
+
+  — send one party's keys to the other person out of band, keep the other party's for yourself, then point **encryption key** at your own sending half and **decryption key** at your own receiving half. Both sides need their matching keys installed before messaging — a mismatch decrypts to garbage, not an error, so double-check which half went where.
+- **OTP / OTP MAIL → Delete key** removes just that one key, leaving the pin and the other key untouched.
+
+Every one of these actions takes effect immediately: the list refreshes, and if `/mail` is open composing to that same nickname, its recipient check re-runs without you retyping anything.
 
 ## Advanced use
 

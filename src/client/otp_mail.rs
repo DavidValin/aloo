@@ -48,8 +48,10 @@ pub enum RecipientCheck {
     /// No `id_store` pin for that nickname (or its pinned key isn't a
     /// pq_hybrid bundle).
     NotPinned,
-    /// Pinned, but the `otp` keychain has no contact for the pair.
-    NoKeychainEntry,
+    /// Pinned, but the `otp` keychain has no *mail-purpose* contact for the
+    /// pair yet (a live `/otp` session key, if any, does not count - mail
+    /// always spends its own key, `crypto::otp::contact_name_for_mail`).
+    NoMailKey,
     /// The `otp` binary couldn't be run at all.
     CliUnavailable,
     Ok {
@@ -122,13 +124,13 @@ pub async fn check_recipient(session: &SessionState, nickname: &str) -> Recipien
     let Some(peer_fp) = crypto::pq::fingerprint_of_encoded(pinned_der) else {
         return RecipientCheck::NotPinned;
     };
-    let contact_name = crypto::otp::contact_name_for(&own_fp, &peer_fp);
+    let contact_name = crypto::otp::contact_name_for_mail(&own_fp, &peer_fp);
     match otp_cli::status(&session.otp_cli_cfg, &contact_name).await {
         Ok(Some(status)) => RecipientCheck::Ok {
             contact_name,
             enc_key_remaining: status.enc_key_remaining,
         },
-        Ok(None) => RecipientCheck::NoKeychainEntry,
+        Ok(None) => RecipientCheck::NoMailKey,
         Err(_) => RecipientCheck::CliUnavailable,
     }
 }
@@ -598,7 +600,7 @@ pub(crate) async fn on_mail_deliver(
     let expected_contact = pinned_der
         .as_deref()
         .and_then(crypto::pq::fingerprint_of_encoded)
-        .map(|peer_fp| crypto::otp::contact_name_for(&own_fp, &peer_fp));
+        .map(|peer_fp| crypto::otp::contact_name_for_mail(&own_fp, &peer_fp));
     let next_expected = expected_contact
         .as_deref()
         .and_then(|c| session.otp_store.get(c))

@@ -102,7 +102,7 @@ pub(crate) async fn handle_send_text(
     // channel send.
     let mut plain_recipients = Vec::new();
     for (id, der) in recipients {
-        match crate::client::otp::contact_name_if_active(session, &der) {
+        match crate::client::otp::contact_name_for_sending(session, ui_state, id, &der) {
             Some(contact_name) => {
                 crate::client::otp::send_or_queue(
                     wr,

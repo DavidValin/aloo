@@ -54,7 +54,7 @@ pub async fn handle_send_text(
     msg_id: u64,
 ) -> proto::Result<()> {
     if let Some(contact_name) =
-        crate::client::otp::contact_name_if_active(session, &recipient_pubkey_der)
+        crate::client::otp::contact_name_for_sending(session, ui_state, to, &recipient_pubkey_der)
     {
         return crate::client::otp::send_or_queue(
             wr,
@@ -125,7 +125,7 @@ pub(crate) async fn handle_send_file(
         return Ok(());
     }
     if let Some(contact_name) =
-        crate::client::otp::contact_name_if_active(session, &recipient_pubkey_der)
+        crate::client::otp::contact_name_for_sending(session, ui_state, to, &recipient_pubkey_der)
     {
         return crate::client::otp::send_file_offer(
             wr,
@@ -206,7 +206,7 @@ pub(crate) async fn handle_voice_record_start(
     // live-streamed - no `StreamStart`/per-chunk network traffic at all
     // until the recording stops.
     if let Some(contact_name) =
-        crate::client::otp::contact_name_if_active(session, &recipient_pubkey_der)
+        crate::client::otp::contact_name_for_sending(session, ui_state, to, &recipient_pubkey_der)
     {
         // The row exists from the moment recording starts, but nothing goes
         // on the wire until it stops - `send_voice_offer` reads this id
@@ -298,7 +298,9 @@ pub(crate) async fn handle_start_call(
     to: UserId,
     recipient_pubkey_der: Vec<u8>,
 ) -> proto::Result<()> {
-    if crate::client::otp::contact_name_if_active(session, &recipient_pubkey_der).is_some() {
+    if crate::client::otp::contact_name_for_sending(session, ui_state, to, &recipient_pubkey_der)
+        .is_some()
+    {
         ui_state.push_status_notice(crate::client::tui::ui::OTP_CALL_REFUSAL.to_string(), false);
         return Ok(());
     }

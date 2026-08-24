@@ -174,7 +174,9 @@ pub(crate) fn addressable_channel_members(
     ui_state
         .recipients_for_channel(tab)
         .into_iter()
-        .filter(|(_, der)| crate::client::otp::contact_name_if_active(session, der).is_none())
+        .filter(|(id, der)| {
+            crate::client::otp::contact_name_for_sending(session, ui_state, *id, der).is_none()
+        })
         .collect()
 }
 
@@ -880,7 +882,9 @@ pub(crate) async fn invite_to_call(
     let Some(user) = ui_state.known_users.get(&to).cloned() else {
         return Ok(());
     };
-    if crate::client::otp::contact_name_if_active(session, &user.public_key_der).is_some() {
+    if crate::client::otp::contact_name_for_sending(session, ui_state, to, &user.public_key_der)
+        .is_some()
+    {
         ui_state.push_status_notice(crate::client::tui::ui::OTP_CALL_REFUSAL.to_string(), false);
         return Ok(());
     }

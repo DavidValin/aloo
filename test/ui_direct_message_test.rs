@@ -413,7 +413,7 @@ fn render_private_room_full_screen_does_not_panic() {
 fn generate_confirm_popup_opens_when_no_key_exists() {
     let mut state = joined_general_with(vec![user(2, "bob")]);
     assert!(state.status_notice.is_none());
-    state.open_otp_generate_confirm(UserId(2), "bob".into(), vec![9, 9]);
+    state.open_otp_generate_confirm(UserId(2), "bob".into(), vec![9, 9], aloo::crypto::otp::OtpPurpose::Live);
 
     // It absorbs every other key while open - typing doesn't reach the
     // compose bar, same as the identity-review/file-offer popups.
@@ -435,7 +435,7 @@ fn generate_confirm_popup_opens_when_no_key_exists() {
 #[test]
 fn declining_the_generate_confirm_cancels_locally_without_sending_anything() {
     let mut state = joined_general_with(vec![user(2, "bob")]);
-    state.open_otp_generate_confirm(UserId(2), "bob".into(), vec![9, 9]);
+    state.open_otp_generate_confirm(UserId(2), "bob".into(), vec![9, 9], aloo::crypto::otp::OtpPurpose::Live);
     press(&mut state, KeyCode::Right); // Accept -> Reject
     let action = press(&mut state, KeyCode::Enter);
     assert_eq!(action, Some(UiAction::CancelOtpGenerate));
@@ -445,7 +445,7 @@ fn declining_the_generate_confirm_cancels_locally_without_sending_anything() {
 #[test]
 fn the_size_prompt_absorbs_input_and_submits_a_valid_size() {
     let mut state = joined_general_with(vec![user(2, "bob")]);
-    state.open_otp_generate_confirm(UserId(2), "bob".into(), vec![9, 9]);
+    state.open_otp_generate_confirm(UserId(2), "bob".into(), vec![9, 9], aloo::crypto::otp::OtpPurpose::Live);
     press(&mut state, KeyCode::Enter); // Accept -> opens the size prompt
 
     // Absorbs everything else too, same as every other OTP popup.
@@ -465,7 +465,7 @@ fn the_size_prompt_absorbs_input_and_submits_a_valid_size() {
 #[test]
 fn the_size_prompt_supports_backspace() {
     let mut state = joined_general_with(vec![user(2, "bob")]);
-    state.open_otp_generate_confirm(UserId(2), "bob".into(), vec![9, 9]);
+    state.open_otp_generate_confirm(UserId(2), "bob".into(), vec![9, 9], aloo::crypto::otp::OtpPurpose::Live);
     press(&mut state, KeyCode::Enter);
 
     type_str(&mut state, "123");
@@ -477,7 +477,7 @@ fn the_size_prompt_supports_backspace() {
 #[test]
 fn the_size_prompt_rejects_a_value_outside_the_allowed_range() {
     let mut state = joined_general_with(vec![user(2, "bob")]);
-    state.open_otp_generate_confirm(UserId(2), "bob".into(), vec![9, 9]);
+    state.open_otp_generate_confirm(UserId(2), "bob".into(), vec![9, 9], aloo::crypto::otp::OtpPurpose::Live);
     press(&mut state, KeyCode::Enter);
 
     type_str(&mut state, "0");
@@ -496,7 +496,7 @@ fn the_size_prompt_rejects_a_value_outside_the_allowed_range() {
 #[test]
 fn the_size_prompt_accepts_the_maximum_and_rejects_more_than_seven_digits() {
     let mut state = joined_general_with(vec![user(2, "bob")]);
-    state.open_otp_generate_confirm(UserId(2), "bob".into(), vec![9, 9]);
+    state.open_otp_generate_confirm(UserId(2), "bob".into(), vec![9, 9], aloo::crypto::otp::OtpPurpose::Live);
     press(&mut state, KeyCode::Enter);
 
     // The max itself (1TB per key) is 7 digits and must be typeable; an 8th
@@ -521,7 +521,7 @@ fn the_size_prompt_accepts_the_maximum_and_rejects_more_than_seven_digits() {
 #[test]
 fn the_size_prompt_rejects_a_seven_digit_value_past_the_maximum() {
     let mut state = joined_general_with(vec![user(2, "bob")]);
-    state.open_otp_generate_confirm(UserId(2), "bob".into(), vec![9, 9]);
+    state.open_otp_generate_confirm(UserId(2), "bob".into(), vec![9, 9], aloo::crypto::otp::OtpPurpose::Live);
     press(&mut state, KeyCode::Enter);
 
     type_str(&mut state, "9999999");
@@ -535,7 +535,7 @@ fn the_size_prompt_rejects_a_seven_digit_value_past_the_maximum() {
 #[test]
 fn escape_on_the_size_prompt_cancels_the_whole_session() {
     let mut state = joined_general_with(vec![user(2, "bob")]);
-    state.open_otp_generate_confirm(UserId(2), "bob".into(), vec![9, 9]);
+    state.open_otp_generate_confirm(UserId(2), "bob".into(), vec![9, 9], aloo::crypto::otp::OtpPurpose::Live);
     press(&mut state, KeyCode::Enter);
     type_str(&mut state, "50");
 
@@ -554,7 +554,7 @@ fn escape_on_the_size_prompt_cancels_the_whole_session() {
 #[test]
 fn the_keygen_spinner_opens_with_the_chosen_size_and_no_progress_yet() {
     let mut state = joined_general_with(vec![user(2, "bob")]);
-    state.open_otp_keygen(UserId(2), "bob".into(), 4);
+    state.open_otp_keygen(UserId(2), "bob".into(), 4, aloo::crypto::otp::OtpPurpose::Live);
 
     let progress = state.otp_keygen_open().expect("the spinner should be open");
     assert_eq!(progress.peer, UserId(2));
@@ -571,7 +571,7 @@ fn the_keygen_spinner_opens_with_the_chosen_size_and_no_progress_yet() {
 #[test]
 fn keygen_progress_moves_the_bar_and_clamps_at_a_hundred_percent() {
     let mut state = joined_general_with(vec![user(2, "bob")]);
-    state.open_otp_keygen(UserId(2), "bob".into(), 1);
+    state.open_otp_keygen(UserId(2), "bob".into(), 1, aloo::crypto::otp::OtpPurpose::Live);
 
     state.set_otp_keygen_progress(1024 * 1024, 1024 * 1024 * 2);
     assert_eq!(state.otp_keygen_open().unwrap().percent(), 50);
@@ -619,14 +619,14 @@ fn the_size_prompt_says_how_long_that_size_takes_to_send() {
 #[test]
 fn the_popup_moves_from_generating_to_transferring_rather_than_closing() {
     let mut state = joined_general_with(vec![user(2, "bob")]);
-    state.open_otp_keygen(UserId(2), "bob".into(), 4);
+    state.open_otp_keygen(UserId(2), "bob".into(), 4, aloo::crypto::otp::OtpPurpose::Live);
     assert_eq!(
         state.otp_keygen_open().unwrap().phase,
         OtpPadPhase::Generating
     );
 
     state.set_otp_keygen_progress(8 * 1024 * 1024, 8 * 1024 * 1024);
-    state.begin_otp_pad_transfer(UserId(2), "bob".into(), 4, OtpPadPhase::Sending);
+    state.begin_otp_pad_transfer(UserId(2), "bob".into(), 4, OtpPadPhase::Sending, aloo::crypto::otp::OtpPurpose::Live);
 
     let progress = state.otp_keygen_open().expect("still open, now transferring");
     assert_eq!(progress.phase, OtpPadPhase::Sending);
@@ -645,7 +645,7 @@ fn the_popup_moves_from_generating_to_transferring_rather_than_closing() {
 #[test]
 fn the_receiving_side_sees_its_own_transfer_progress() {
     let mut state = joined_general_with(vec![user(2, "bob")]);
-    state.begin_otp_pad_transfer(UserId(2), "bob".into(), 1, OtpPadPhase::Receiving);
+    state.begin_otp_pad_transfer(UserId(2), "bob".into(), 1, OtpPadPhase::Receiving, aloo::crypto::otp::OtpPurpose::Live);
     state.set_otp_pad_transfer_progress(UserId(2), 1024 * 1024);
     assert_eq!(state.otp_keygen_open().unwrap().percent(), 50);
     assert_eq!(
@@ -662,7 +662,7 @@ fn the_receiving_side_sees_its_own_transfer_progress() {
 #[test]
 fn a_transfer_popup_only_answers_to_the_peer_it_is_reporting_on() {
     let mut state = joined_general_with(vec![user(2, "bob"), user(3, "carol")]);
-    state.begin_otp_pad_transfer(UserId(2), "bob".into(), 1, OtpPadPhase::Receiving);
+    state.begin_otp_pad_transfer(UserId(2), "bob".into(), 1, OtpPadPhase::Receiving, aloo::crypto::otp::OtpPurpose::Live);
 
     state.set_otp_pad_transfer_progress(UserId(3), 2 * 1024 * 1024);
     assert_eq!(
@@ -688,7 +688,7 @@ fn a_transfer_popup_only_answers_to_the_peer_it_is_reporting_on() {
 #[test]
 fn a_late_generation_report_cannot_rewind_the_transfer_bar() {
     let mut state = joined_general_with(vec![user(2, "bob")]);
-    state.begin_otp_pad_transfer(UserId(2), "bob".into(), 1, OtpPadPhase::Sending);
+    state.begin_otp_pad_transfer(UserId(2), "bob".into(), 1, OtpPadPhase::Sending, aloo::crypto::otp::OtpPurpose::Live);
     state.set_otp_pad_transfer_progress(UserId(2), 2 * 1024 * 1024);
     assert_eq!(state.otp_keygen_open().unwrap().percent(), 100);
 
@@ -703,7 +703,7 @@ fn a_late_generation_report_cannot_rewind_the_transfer_bar() {
 #[test]
 fn the_keygen_spinner_animates_on_the_ticker_even_without_progress() {
     let mut state = joined_general_with(vec![user(2, "bob")]);
-    state.open_otp_keygen(UserId(2), "bob".into(), 1);
+    state.open_otp_keygen(UserId(2), "bob".into(), 1, aloo::crypto::otp::OtpPurpose::Live);
     let first = state.otp_keygen_open().unwrap().frame;
 
     state.tick_otp_keygen_spinner();
@@ -736,7 +736,7 @@ fn ticking_the_spinner_with_no_generation_running_is_a_no_op() {
 #[test]
 fn the_keygen_spinner_absorbs_every_key_except_escape() {
     let mut state = joined_general_with(vec![user(2, "bob")]);
-    state.open_otp_keygen(UserId(2), "bob".into(), 1);
+    state.open_otp_keygen(UserId(2), "bob".into(), 1, aloo::crypto::otp::OtpPurpose::Live);
 
     // There is nothing to decide while a pad is being made or sent, so
     // every ordinary key is swallowed rather than leaking into the message
@@ -764,21 +764,21 @@ fn the_keygen_spinner_absorbs_every_key_except_escape() {
 #[test]
 fn escape_during_generation_or_transfer_cancels_the_pad() {
     let mut state = joined_general_with(vec![user(2, "bob")]);
-    state.open_otp_keygen(UserId(2), "bob".into(), 1);
+    state.open_otp_keygen(UserId(2), "bob".into(), 1, aloo::crypto::otp::OtpPurpose::Live);
     assert_eq!(
         press(&mut state, KeyCode::Esc),
         Some(UiAction::CancelOtpPad { peer: UserId(2) }),
         "Escape must reach the generation phase"
     );
 
-    state.begin_otp_pad_transfer(UserId(2), "bob".into(), 1, OtpPadPhase::Sending);
+    state.begin_otp_pad_transfer(UserId(2), "bob".into(), 1, OtpPadPhase::Sending, aloo::crypto::otp::OtpPurpose::Live);
     assert_eq!(
         press(&mut state, KeyCode::Esc),
         Some(UiAction::CancelOtpPad { peer: UserId(2) }),
         "and the transfer phase, which is the longer of the two"
     );
 
-    state.begin_otp_pad_transfer(UserId(2), "bob".into(), 1, OtpPadPhase::Receiving);
+    state.begin_otp_pad_transfer(UserId(2), "bob".into(), 1, OtpPadPhase::Receiving, aloo::crypto::otp::OtpPurpose::Live);
     assert_eq!(
         press(&mut state, KeyCode::Esc),
         Some(UiAction::CancelOtpPad { peer: UserId(2) }),
@@ -789,26 +789,38 @@ fn escape_during_generation_or_transfer_cancels_the_pad() {
 #[test]
 fn the_keygen_spinner_renders_the_peer_the_size_and_the_percentage() {
     let mut state = joined_general_with(vec![user(2, "bob")]);
-    state.open_otp_keygen(UserId(2), "bob".into(), 3);
+    state.open_otp_keygen(UserId(2), "bob".into(), 3, aloo::crypto::otp::OtpPurpose::Live);
     state.set_otp_keygen_progress(1024 * 1024 * 3, 1024 * 1024 * 6);
 
     // The peer is named in the popup's title, the figures in its body.
     let rows = rendered_rows_at(&state, 100, 30).join("\n");
     assert!(
-        rows.contains("Generating a pad for bob"),
+        rows.contains("Generating an OTP session pad for bob"),
         "names who the pad is for: {rows:?}"
     );
 
-    let body = popup_body(&buffer_at(&state, 100, 30), "Generating a pad").join("\n");
+    let body = popup_body(&buffer_at(&state, 100, 30), "Generating an OTP session pad").join("\n");
     assert!(body.contains("3MB per key"), "names the chosen size: {body:?}");
     assert!(body.contains("6MB"), "names the total randomness: {body:?}");
     assert!(body.contains("50%"), "shows how far along it is: {body:?}");
 }
 
+/// @requirement AC-295
+#[test]
+fn the_keygen_spinner_names_the_mail_key_when_that_is_the_purpose() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.open_otp_keygen(UserId(2), "bob".into(), 3, aloo::crypto::otp::OtpPurpose::Mail);
+    let rows = rendered_rows_at(&state, 100, 30).join("\n");
+    assert!(
+        rows.contains("Generating an OTP mail key pad for bob"),
+        "a mail-purpose keygen never reads as a live OTP session: {rows:?}"
+    );
+}
+
 #[test]
 fn closing_the_keygen_spinner_takes_it_away() {
     let mut state = joined_general_with(vec![user(2, "bob")]);
-    state.open_otp_keygen(UserId(2), "bob".into(), 1);
+    state.open_otp_keygen(UserId(2), "bob".into(), 1, aloo::crypto::otp::OtpPurpose::Live);
     state.close_otp_keygen();
     assert!(state.otp_keygen_open().is_none());
 }
@@ -849,6 +861,35 @@ fn the_invite_popup_shows_the_pad_size_the_sender_chose() {
     assert!(
         rows.iter().any(|r| r.contains("50MB")),
         "the offered pad size should be visible before deciding: {rows:?}"
+    );
+}
+
+/// A mail-purpose invite must never claim to be "layered on top of
+/// pq_hybrid" - a live session genuinely does that for every message
+/// afterward, but a mail key doesn't layer onto anything; it's `/mail`'s
+/// own, separate delivery mechanism.
+///
+/// @requirement AC-295
+#[test]
+fn a_mail_purpose_invite_never_describes_itself_as_layered_on_pq_hybrid() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.push_otp_invite(
+        UserId(2),
+        "bob".into(),
+        "mail-abc-def".into(),
+        None,
+        None,
+        Some(10),
+    );
+    let rows = rendered_rows(&state);
+    let joined = rows.join(" ");
+    assert!(
+        joined.contains("wants to exchange an OTP mail key with you"),
+        "names the mail purpose: {rows:?}"
+    );
+    assert!(
+        !joined.contains("layered on top of pq_hybrid"),
+        "a mail key never layers onto anything, unlike a live session: {rows:?}"
     );
 }
 
@@ -1307,6 +1348,21 @@ fn a_recognized_slash_command_still_works_after_the_guard_was_added() {
         Some(UiAction::RequestOtpSession { peer, .. }) => assert_eq!(peer, UserId(2)),
         other => panic!("expected RequestOtpSession, got {other:?}"),
     }
+}
+
+/// @requirement AC-295
+#[test]
+fn slash_new_otp_mail_key_requests_a_mail_only_key_exchange() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.focus = Focus::Sidebar;
+    press(&mut state, KeyCode::Enter); // opens DM with bob
+    type_str(&mut state, "/new-otp-mail-key");
+    let action = press(&mut state, KeyCode::Enter);
+    match action {
+        Some(UiAction::RequestOtpMailKey { peer, .. }) => assert_eq!(peer, UserId(2)),
+        other => panic!("expected RequestOtpMailKey, got {other:?}"),
+    }
+    assert!(state.input.is_empty());
 }
 
 /// @requirement AC-283

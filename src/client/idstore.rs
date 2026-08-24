@@ -118,6 +118,13 @@ struct Entry {
     /// it back. `None` for an entry pinned before this field existed, or
     /// one hand-edited without it.
     key_mode: Option<KeyMode>,
+    /// The identity-card file this pin was manually imported from
+    /// (`client::contacts::pin_identity_card_file`, the "Create key" action
+    /// on a contact's PQH key) - purely informational, for the key-details
+    /// popup's "path in disk" line. `None` for every pin that arrived the
+    /// ordinary way, over the wire (`session::check_identity`), which is
+    /// every pin recorded before this field existed too.
+    pinned_from: Option<PathBuf>,
 }
 
 /// Current wall-clock time as Unix seconds - `0` on a clock that reports
@@ -203,6 +210,7 @@ impl IdStore {
                         .filter(|s| !s.is_empty())
                         .and_then(|s| s.parse().ok());
                     let key_mode = fields.next().and_then(parse_key_mode);
+                    let pinned_from = fields.next().filter(|s| !s.is_empty()).map(PathBuf::from);
                     if is_storable(name)
                         && let Some(der) = hex_decode(hex)
                     {
@@ -215,6 +223,7 @@ impl IdStore {
                                 last_device_id,
                                 last_seen_unix,
                                 key_mode,
+                                pinned_from,
                             },
                         );
                     }
@@ -263,7 +272,7 @@ impl IdStore {
         // wiping it back to `None` - that metadata describes the
         // relationship, not any one key, and `set_last_seen` is what
         // actually refreshes it once the new key's own link goes Active.
-        let (last_addr, last_device_id, last_seen_unix, key_mode) = previous
+        let (last_addr, last_device_id, last_seen_unix, key_mode, pinned_from) = previous
             .as_ref()
             .map(|prev| {
                 (
@@ -271,6 +280,7 @@ impl IdStore {
                     prev.last_device_id.clone(),
                     prev.last_seen_unix,
                     prev.key_mode,
+                    prev.pinned_from.clone(),
                 )
             })
             .unwrap_or_default();
@@ -283,6 +293,7 @@ impl IdStore {
                 last_device_id,
                 last_seen_unix,
                 key_mode,
+                pinned_from,
             },
         );
         match previous {
@@ -333,6 +344,21 @@ impl IdStore {
     /// existed.
     pub fn key_mode(&self, nickname: &str) -> Option<KeyMode> {
         self.entries.get(nickname)?.key_mode
+    }
+
+    /// Records the identity-card file `nickname`'s pin was manually
+    /// imported from - see `Entry::pinned_from`'s doc. A no-op if
+    /// `nickname` isn't pinned (same guard `set_key_mode` uses).
+    pub fn set_pinned_from(&mut self, nickname: &str, path: PathBuf) {
+        if let Some(entry) = self.entries.get_mut(nickname) {
+            entry.pinned_from = Some(path);
+        }
+    }
+
+    /// The identity-card file `nickname`'s pin was manually imported from,
+    /// if any - `None` for a pin that arrived over the wire instead.
+    pub fn pinned_from(&self, nickname: &str) -> Option<&Path> {
+        self.entries.get(nickname)?.pinned_from.as_deref()
     }
 
     /// Wall-clock time `nickname`'s pin was last confirmed reachable, as
@@ -398,6 +424,10 @@ impl IdStore {
             out.push('\t');
             if let Some(mode) = entry.key_mode {
                 out.push_str(key_mode_as_str(mode));
+            }
+            out.push('\t');
+            if let Some(path) = &entry.pinned_from {
+                out.push_str(&path.display().to_string());
             }
             out.push('\n');
         }

@@ -171,6 +171,48 @@ pub fn contact_name_for_keys(own_public_der: &[u8], peer_public_der: &[u8]) -> S
     contact_name_for(&own, &peer)
 }
 
+/// `contact_name_for_keys`'s counterpart for OTP mail - see
+/// `contact_name_for_mail`'s doc for why the two must never share a name.
+pub fn contact_name_for_keys_mail(own_public_der: &[u8], peer_public_der: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let own: [u8; 32] = Sha256::digest(own_public_der).into();
+    let peer: [u8; 32] = Sha256::digest(peer_public_der).into();
+    contact_name_for_mail(&own, &peer)
+}
+
+/// Which independent OTP key a provisioning handshake or a piece of UI text
+/// is about - a live `/otp` session (used for messages while both people
+/// are online) or a mail-only key (`/new-otp-mail-key`, spent by OTP mail
+/// alone). The two are never the same pad; this only ever labels which one,
+/// it never changes any cryptography.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OtpPurpose {
+    Live,
+    Mail,
+}
+
+impl OtpPurpose {
+    /// What to call it in a popup title or status line.
+    pub fn label(self) -> &'static str {
+        match self {
+            OtpPurpose::Live => "OTP session",
+            OtpPurpose::Mail => "OTP mail key",
+        }
+    }
+
+    /// Recovers which purpose a contact name belongs to from the name
+    /// itself - every mail name is `contact_name_for_mail`'s `mail-`
+    /// prefixed form, every live name is not, so this never has to be
+    /// guessed or threaded through code that already carries the name.
+    pub fn of_contact_name(name: &str) -> Self {
+        if name.starts_with("mail-") {
+            OtpPurpose::Mail
+        } else {
+            OtpPurpose::Live
+        }
+    }
+}
+
 /// Deterministic, order-independent `otp` keychain contact name for a pair
 /// of `pq_hybrid` identities: a truncated prefix of their fingerprints,
 /// sorted, hex-joined with a separator the `otp` CLI's naming rules allow
@@ -190,6 +232,16 @@ pub fn contact_name_for(own_fp: &[u8; 32], peer_fp: &[u8; 32]) -> String {
         hex_encode(&a[..CONTACT_NAME_FP_BYTES]),
         hex_encode(&b[..CONTACT_NAME_FP_BYTES])
     )
+}
+
+/// OTP *mail*'s own keychain contact name for the same pair - deliberately
+/// distinct from `contact_name_for`'s (a live name is always lowercase hex
+/// plus `-`, so this `mail-` prefix can never collide with one) so a mail
+/// key is never the same pad a live `/otp` session would spend. Wraps
+/// `contact_name_for` rather than reimplementing the sort/truncate, so it
+/// inherits the same order-independence with no separate proof needed.
+pub fn contact_name_for_mail(own_fp: &[u8; 32], peer_fp: &[u8; 32]) -> String {
+    format!("mail-{}", contact_name_for(own_fp, peer_fp))
 }
 
 /// One peer's half of a freshly generated one-time-pad keypair, sent to the

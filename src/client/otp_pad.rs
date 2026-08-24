@@ -136,6 +136,13 @@ pub(crate) struct OutgoingPad {
     /// turns it into something honest to display
     /// (`client::otp::refresh_pad_send_progress`).
     pub read_bytes: u64,
+    /// Diagnostic-only baseline, captured when the transfer started -
+    /// what `client::otp::on_pad_verify` diffs against
+    /// `PeerLinkManager::link_diagnostics` to log a per-transfer
+    /// retransmit/window-utilization summary once it's over.
+    pub started_at: std::time::Instant,
+    pub retransmits_at_start: u64,
+    pub peak_unacked_at_start: usize,
 }
 
 /// A pad arriving from a peer, reassembled straight to disk.
@@ -153,6 +160,10 @@ pub(crate) struct IncomingPad {
     /// Ciphertext bytes handed to the worker so far - drives the transfer
     /// popup's bar and nothing else.
     pub received_bytes: u64,
+    /// Diagnostic-only baseline - see `OutgoingPad`'s own doc. The
+    /// receiving side has no window of its own to measure (it never
+    /// sends the bulk data), so this only ever logs elapsed time.
+    pub started_at: std::time::Instant,
 }
 
 /// What the receiving worker reports back when a pad transfer finishes.

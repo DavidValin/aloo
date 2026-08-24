@@ -1398,3 +1398,90 @@ async fn end_session_no_pq_hybrid_anywhere_still_reaches_the_peer() {
     }
     end_session_round_trip("end-pw-pw", Id::Opaque, Id::Opaque).await;
 }
+
+/// The exact bug `/endotp` used to have for a `PqWrapped` pair:
+/// `contact_name_if_active` alone (what every send-gating call site used
+/// to check) only ever asked "is a pad provisioned here", which
+/// `/endotp`'s own pause deliberately never clears - so text, voice, file
+/// sends, and `/call`'s own eligibility check all kept believing a paused
+/// session was still live, forever. `contact_name_for_sending` is what
+/// fixes that: it also consults `UiState::is_otp_active`, which
+/// `/endotp` *does* clear, so a pair with pq_hybrid to fall back to stops
+/// routing new sends through the pad the moment it pauses - while the pad
+/// itself stays provisioned underneath, exactly as documented (`/otp`
+/// with the same contact later resumes it).
+///
+/// @requirement AC-303
+#[tokio::test]
+async fn a_send_after_endotp_no_longer_rides_the_paused_pad() {
+    if !require_otp() {
+        return;
+    }
+    let (mut alice, _bob, contact) = pair("endotp-send-gate", Id::Pq, Id::Pq).await;
+    // `pair()`/`build_side()` provision the pad directly without going
+    // through the real handshake, so - unlike a session actually reached
+    // via `/otp` - the live toggle isn't set yet; set it here to model
+    // what a genuinely active session looks like before pausing it.
+    alice.ui.mark_otp_active(BOB);
+
+    assert_eq!(
+        aloo::client::otp::contact_name_for_sending(&alice.session, &alice.ui, BOB, &alice.peer_der),
+        Some(contact.clone()),
+        "while active, a new send still rides the pad"
+    );
+
+    let peer_der = alice.peer_der.clone();
+    aloo::client::otp::handle_end_otp_command(
+        &mut NullSink,
+        &mut alice.ui,
+        &mut alice.session,
+        BOB,
+        peer_der,
+    )
+    .await
+    .expect("/endotp should not fail");
+
+    assert_eq!(
+        aloo::client::otp::contact_name_for_sending(&alice.session, &alice.ui, BOB, &alice.peer_der),
+        None,
+        "a paused session must not route a new send through the pad any more"
+    );
+    assert_eq!(
+        aloo::client::otp::contact_name_if_active(&alice.session, &alice.peer_der),
+        Some(contact),
+        "the pad itself is kept, not destroyed - only new sends stop using it"
+    );
+}
+
+/// The mirror case: a `Direct`-framed (pad-only) pair has no `pq_hybrid`
+/// to fall back to at all, so for them the pad *is* the whole relationship
+/// - `contact_name_for_sending` must keep answering `Some` even once
+/// `/endotp` has cleared `is_otp_active`, unlike the `PqWrapped` case
+/// above.
+///
+/// @requirement AC-303
+#[tokio::test]
+async fn endotp_on_a_pad_only_pair_never_stops_contact_name_for_sending() {
+    if !require_otp() {
+        return;
+    }
+    let (mut alice, _bob, contact) = pair("endotp-send-gate-direct", Id::Opaque, Id::Opaque).await;
+
+    let peer_der = alice.peer_der.clone();
+    aloo::client::otp::handle_end_otp_command(
+        &mut NullSink,
+        &mut alice.ui,
+        &mut alice.session,
+        BOB,
+        peer_der,
+    )
+    .await
+    .expect("/endotp should not fail");
+    assert!(!alice.ui.is_otp_active(BOB), "the live toggle is still cleared as usual");
+
+    assert_eq!(
+        aloo::client::otp::contact_name_for_sending(&alice.session, &alice.ui, BOB, &alice.peer_der),
+        Some(contact),
+        "a pad-only pair has no plain channel to fall back to, so sending must still use the pad"
+    );
+}

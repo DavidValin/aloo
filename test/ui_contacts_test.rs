@@ -4,18 +4,28 @@ use ui_common::*;
 
 use aloo::client::contacts::ContactRow;
 use aloo::client::file_browser::FileBrowserState;
-use aloo::client::tui::contacts::{DeleteChoice, InstallField};
+use aloo::client::tui::contacts::{ContactKeyKind, DeleteChoice, InstallField};
 use aloo::client::tui::ui::{Mode, UiAction};
+use aloo::crypto::otp::OtpPurpose;
 use aloo::proto::KeyMode;
 use crossterm::event::KeyCode;
 
 fn row(nickname: &str, key_mode: Option<KeyMode>) -> ContactRow {
+    let pqh_fingerprint = if key_mode == Some(KeyMode::PqHybrid) {
+        Some(format!("fp-{nickname}"))
+    } else {
+        None
+    };
     ContactRow {
         nickname: nickname.to_string(),
         last_seen_unix: None,
         key_mode,
         otp_contact_name: None,
         otp: None,
+        otp_mail_contact_name: None,
+        otp_mail: None,
+        pqh_fingerprint,
+        pqh_pinned_from: None,
     }
 }
 
@@ -310,6 +320,7 @@ fn install_with_both_paths_set_produces_installotpkey() {
         action,
         Some(UiAction::InstallOtpKey {
             nickname: "alice".to_string(),
+            purpose: aloo::crypto::otp::OtpPurpose::Live,
             enc_path: root.join("file.txt"),
             dec_path: root.join("subdir").join("nested.txt"),
         })
@@ -366,85 +377,55 @@ fn rendering_shows_the_header_and_every_nicknames_row() {
     assert!(joined.contains("unknown"), "bob's encryption method is unrecorded");
 }
 
+/// @requirement AC-298
 #[test]
-fn an_eligible_but_uninstalled_contact_hints_at_o_to_install() {
+fn an_eligible_but_uninstalled_contact_shows_a_crossed_otp_badge() {
     let mut state = joined_general_with(vec![]);
     state.open_contacts();
     state.set_contacts_rows(vec![otp_eligible_row("alice")]);
 
     let body = popup_body(&buffer_at(&state, 160, 30), "Contacts").join("\n");
-    assert!(body.contains("o to install"));
+    assert!(body.contains("PQH"), "PQH is pinned: {body:?}");
+    assert!(body.contains("\u{274c}"), "OTP isn't installed yet, shown as a cross: {body:?}");
+    assert!(body.contains("OTP"), "the OTP badge itself renders: {body:?}");
 }
 
+/// @requirement AC-299
 #[test]
-fn an_installed_contacts_row_shows_its_otp_pad_figures_in_each_direction() {
+fn an_installed_otp_keys_details_popup_shows_its_pad_figures_in_each_direction() {
     let mut state = joined_general_with(vec![]);
     state.open_contacts();
     state.set_contacts_rows(vec![otp_installed_row("alice")]);
+    press(&mut state, KeyCode::Right); // Pqh -> Otp
+    press(&mut state, KeyCode::Enter); // open the OTP key's details
 
-    let body = popup_body(&buffer_at(&state, 200, 30), "Contacts").join("\n");
+    let body = popup_body(&buffer_at(&state, 200, 30), "alice").join("\n");
     assert!(body.contains("dec"));
     assert!(body.contains("enc"));
     // Same MB-figure formatting the /otp DM header uses.
     assert!(body.contains("MB"));
 }
 
-fn otp_installed_row_with(
-    nickname: &str,
-    dec_sequence: u64,
-    dec_offset: u64,
-    dec_key_remaining: u64,
-    enc_sequence: u64,
-    enc_offset: u64,
-    enc_key_remaining: u64,
-) -> ContactRow {
-    ContactRow {
-        otp: Some(aloo::client::contacts::ContactOtpDetail {
-            enc_sequence,
-            enc_offset,
-            enc_key_remaining,
-            dec_sequence,
-            dec_offset,
-            dec_key_remaining,
-            enc_key_path: std::path::PathBuf::from("/tmp/otp/.keychain/x_enc.key"),
-            dec_key_path: std::path::PathBuf::from("/tmp/otp/.keychain/x_dec.key"),
-        }),
-        ..otp_eligible_row(nickname)
-    }
-}
-
-/// Every column - including each OTP sub-figure (seq/offset/remaining, in
-/// both directions) - must line up down the list, however many digits a
-/// given row's numbers happen to have. A row with tiny figures and one
-/// with huge ones must still put "enc:" (and every column after it) at
-/// exactly the same screen column.
+/// Every column must still line up down the list even though the row no
+/// longer carries OTP's own seq/offset/remaining figures (moved to the key
+/// details popup) - just the three fixed-width key badges now, so two
+/// contacts with very different nickname lengths must still put the
+/// badges at the same screen column once padded.
+/// @requirement AC-298
 #[test]
-fn otp_sub_columns_stay_aligned_across_wildly_different_digit_counts() {
+fn key_badges_stay_aligned_regardless_of_nickname_length() {
     let mut state = joined_general_with(vec![]);
     state.open_contacts();
     state.set_contacts_rows(vec![
-        otp_installed_row_with("alice", 1, 2, 500, 3, 4, 900),
-        otp_installed_row_with("bob", 123_456, 987_654, 999_999_999, 7, 80_000, 1_000),
+        otp_installed_row("a"),
+        otp_installed_row("a-much-longer-nickname"),
     ]);
 
     let buffer = buffer_at(&state, 220, 30);
     let body = popup_body(&buffer, "Contacts");
-    let alice_row = body
-        .iter()
-        .find(|r| r.contains("alice"))
-        .expect("alice's row should render");
-    let bob_row = body
-        .iter()
-        .find(|r| r.contains("bob"))
-        .expect("bob's row should render");
-
-    let enc_x = |row: &str| row.find("enc:").expect("every installed row shows an enc: field");
-    assert_eq!(
-        enc_x(alice_row),
-        enc_x(bob_row),
-        "the enc: field must start at the same column regardless of how many digits \
-         the dec: figures before it have\nalice: {alice_row:?}\nbob:   {bob_row:?}"
-    );
+    let xs: Vec<usize> = body.iter().filter_map(|r| r.find("PQH")).collect();
+    assert_eq!(xs.len(), 2, "both rows should render a PQH badge: {body:?}");
+    assert!(xs.windows(2).all(|w| w[0] == w[1]), "badges must line up: {body:?}");
 }
 
 #[test]
@@ -470,8 +451,307 @@ fn the_delete_confirmation_names_the_selected_contact() {
 fn the_install_popup_names_the_selected_contact_and_explains_new_key_pair() {
     let mut state = joined_general_with(vec![]);
     open_install_popup(&mut state, "alice");
-    let body = popup_body(&buffer_at(&state, 160, 30), "Install OTP key").join("\n");
+    let body = popup_body(&buffer_at(&state, 160, 30), "Install OTP session").join("\n");
     assert!(body.contains("alice"));
     assert!(body.contains("--new-key-pair"));
     assert!(body.contains("otp-toolkit"));
+}
+
+// ---------------------------------------------------------------------
+// The key details popup: navigation
+// ---------------------------------------------------------------------
+
+/// @requirement AC-298
+#[test]
+fn left_and_right_on_the_list_cycle_the_selected_key_and_wrap() {
+    let mut state = joined_general_with(vec![]);
+    state.open_contacts();
+    state.set_contacts_rows(vec![row("alice", None)]);
+    assert_eq!(state.contacts.as_ref().unwrap().selected_key, ContactKeyKind::Pqh);
+    press(&mut state, KeyCode::Right);
+    assert_eq!(state.contacts.as_ref().unwrap().selected_key, ContactKeyKind::Otp);
+    press(&mut state, KeyCode::Right);
+    assert_eq!(state.contacts.as_ref().unwrap().selected_key, ContactKeyKind::OtpMail);
+    press(&mut state, KeyCode::Right);
+    assert_eq!(
+        state.contacts.as_ref().unwrap().selected_key,
+        ContactKeyKind::Pqh,
+        "wraps back to the first key"
+    );
+    press(&mut state, KeyCode::Left);
+    assert_eq!(
+        state.contacts.as_ref().unwrap().selected_key,
+        ContactKeyKind::OtpMail,
+        "Left from the first key wraps to the last"
+    );
+}
+
+/// @requirement AC-298
+#[test]
+fn enter_on_the_list_opens_the_details_popup_for_the_selected_row_and_key() {
+    let mut state = joined_general_with(vec![]);
+    state.open_contacts();
+    state.set_contacts_rows(vec![otp_eligible_row("alice")]);
+    press(&mut state, KeyCode::Right); // Pqh -> Otp
+    press(&mut state, KeyCode::Enter);
+
+    let detail = state.contacts.as_ref().unwrap().detail.as_ref().expect("opened");
+    assert_eq!(detail.nickname, "alice");
+    assert_eq!(detail.kind, ContactKeyKind::Otp);
+}
+
+/// @requirement AC-299
+#[test]
+fn esc_on_the_details_popup_closes_it_without_touching_the_list() {
+    let mut state = joined_general_with(vec![]);
+    state.open_contacts();
+    state.set_contacts_rows(vec![row("alice", None)]);
+    press(&mut state, KeyCode::Enter);
+    assert!(state.contacts.as_ref().unwrap().detail.is_some());
+    press(&mut state, KeyCode::Esc);
+    assert!(state.contacts.as_ref().unwrap().detail.is_none());
+    assert!(state.contacts.is_some(), "the list itself stays open");
+}
+
+/// @requirement AC-299
+#[test]
+fn left_and_right_inside_the_details_popup_switch_which_key_it_shows() {
+    let mut state = joined_general_with(vec![]);
+    state.open_contacts();
+    state.set_contacts_rows(vec![row("alice", None)]);
+    press(&mut state, KeyCode::Enter); // opens on Pqh
+    press(&mut state, KeyCode::Right);
+    assert_eq!(
+        state.contacts.as_ref().unwrap().detail.as_ref().unwrap().kind,
+        ContactKeyKind::Otp
+    );
+}
+
+/// @requirement AC-299
+#[test]
+fn the_details_popup_yellow_explanation_names_this_keys_purpose() {
+    let mut state = joined_general_with(vec![]);
+    state.open_contacts();
+    state.set_contacts_rows(vec![row("alice", None)]);
+    press(&mut state, KeyCode::Enter); // Pqh
+    let body = popup_body(&buffer_at(&state, 160, 30), "alice").join("\n");
+    assert!(body.contains("pin the identity"), "PQH's own explanation: {body:?}");
+
+    press(&mut state, KeyCode::Right); // Otp
+    let body = popup_body(&buffer_at(&state, 160, 30), "alice").join("\n");
+    assert!(body.contains("live One Time Pad sessions"), "OTP's own explanation: {body:?}");
+
+    press(&mut state, KeyCode::Right); // OtpMail
+    let body = popup_body(&buffer_at(&state, 160, 30), "alice").join("\n");
+    assert!(body.contains("deliver Mails"), "OTP mail's own explanation: {body:?}");
+}
+
+// ---------------------------------------------------------------------
+// The key details popup: deleting a present key
+// ---------------------------------------------------------------------
+
+/// @requirement AC-299
+#[test]
+fn deleting_a_present_pqh_key_asks_first_then_sends_deletecontact_and_closes_the_popup() {
+    let mut state = joined_general_with(vec![]);
+    state.open_contacts();
+    state.set_contacts_rows(vec![otp_installed_row("alice")]); // key_mode PqHybrid
+    press(&mut state, KeyCode::Enter); // details on Pqh, present
+    assert!(press(&mut state, KeyCode::Enter).is_none(), "first Enter only opens the confirm");
+    assert!(state.contacts.as_ref().unwrap().detail.as_ref().unwrap().confirm.is_some());
+
+    press(&mut state, KeyCode::Left); // toggle Cancel -> Delete
+    let action = press(&mut state, KeyCode::Enter);
+    assert_eq!(action, Some(UiAction::DeleteContact { nickname: "alice".to_string() }));
+    assert!(
+        state.contacts.as_ref().unwrap().detail.is_none(),
+        "nothing left to show once the identity pin itself is gone"
+    );
+}
+
+/// @requirement AC-299
+#[test]
+fn cancelling_a_delete_confirm_leaves_the_key_and_the_popup_alone() {
+    let mut state = joined_general_with(vec![]);
+    state.open_contacts();
+    state.set_contacts_rows(vec![otp_installed_row("alice")]);
+    press(&mut state, KeyCode::Enter);
+    press(&mut state, KeyCode::Enter); // open confirm (defaults to Cancel)
+    let action = press(&mut state, KeyCode::Enter);
+    assert_eq!(action, None);
+    assert!(state.contacts.as_ref().unwrap().detail.is_some(), "the popup stays open");
+    assert!(
+        state.contacts.as_ref().unwrap().detail.as_ref().unwrap().confirm.is_none(),
+        "back to the main view, not the confirm"
+    );
+}
+
+/// @requirement AC-299
+#[test]
+fn deleting_a_present_otp_key_sends_deletecontactkey_live_and_leaves_the_popup_open() {
+    let mut state = joined_general_with(vec![]);
+    state.open_contacts();
+    state.set_contacts_rows(vec![otp_installed_row("alice")]);
+    press(&mut state, KeyCode::Right); // Otp
+    press(&mut state, KeyCode::Enter); // details, present
+    press(&mut state, KeyCode::Enter); // open confirm
+    press(&mut state, KeyCode::Left); // toggle Cancel -> Delete
+
+    let action = press(&mut state, KeyCode::Enter);
+    assert_eq!(
+        action,
+        Some(UiAction::DeleteContactKey { nickname: "alice".to_string(), purpose: OtpPurpose::Live })
+    );
+    assert!(
+        state.contacts.as_ref().unwrap().detail.is_some(),
+        "the PQH pin and the other purpose are untouched - the popup stays put"
+    );
+}
+
+/// @requirement AC-299
+#[test]
+fn deleting_a_present_otp_mail_key_sends_deletecontactkey_mail() {
+    let mut state = joined_general_with(vec![]);
+    state.open_contacts();
+    let mail_row = ContactRow {
+        otp_mail_contact_name: Some("mail-name".to_string()),
+        otp_mail: Some(aloo::client::contacts::ContactOtpDetail {
+            enc_sequence: 0,
+            enc_offset: 0,
+            enc_key_remaining: 1,
+            dec_sequence: 0,
+            dec_offset: 0,
+            dec_key_remaining: 1,
+            enc_key_path: std::path::PathBuf::from("/tmp/enc"),
+            dec_key_path: std::path::PathBuf::from("/tmp/dec"),
+        }),
+        ..row("alice", Some(KeyMode::PqHybrid))
+    };
+    state.set_contacts_rows(vec![mail_row]);
+    press(&mut state, KeyCode::Right);
+    press(&mut state, KeyCode::Right); // OtpMail
+    press(&mut state, KeyCode::Enter);
+    press(&mut state, KeyCode::Enter); // open confirm
+    press(&mut state, KeyCode::Left); // toggle Cancel -> Delete
+
+    let action = press(&mut state, KeyCode::Enter);
+    assert_eq!(
+        action,
+        Some(UiAction::DeleteContactKey { nickname: "alice".to_string(), purpose: OtpPurpose::Mail })
+    );
+}
+
+// ---------------------------------------------------------------------
+// The key details popup: creating/installing a missing key
+// ---------------------------------------------------------------------
+
+/// @requirement AC-299
+#[test]
+fn enter_on_a_missing_otp_key_opens_the_install_popup_with_the_right_purpose() {
+    let mut state = joined_general_with(vec![]);
+    state.open_contacts();
+    state.set_contacts_rows(vec![otp_eligible_row("alice")]); // otp: None
+    press(&mut state, KeyCode::Right); // Otp
+    press(&mut state, KeyCode::Enter); // details, missing
+    press(&mut state, KeyCode::Enter); // Create/Install action
+
+    let install = state.contacts.as_ref().unwrap().install.as_ref().expect("opened");
+    assert_eq!(install.nickname, "alice");
+    assert_eq!(install.purpose, OtpPurpose::Live);
+}
+
+/// @requirement AC-299
+#[test]
+fn enter_on_a_missing_mail_key_opens_the_install_popup_with_mail_purpose() {
+    let mut state = joined_general_with(vec![]);
+    state.open_contacts();
+    state.set_contacts_rows(vec![otp_eligible_row("alice")]);
+    press(&mut state, KeyCode::Right);
+    press(&mut state, KeyCode::Right); // OtpMail
+    press(&mut state, KeyCode::Enter);
+    press(&mut state, KeyCode::Enter);
+
+    let install = state.contacts.as_ref().unwrap().install.as_ref().expect("opened");
+    assert_eq!(install.purpose, OtpPurpose::Mail);
+}
+
+/// @requirement AC-299
+#[test]
+fn escaping_the_install_popup_opened_from_details_returns_to_the_details_popup() {
+    let mut state = joined_general_with(vec![]);
+    state.open_contacts();
+    state.set_contacts_rows(vec![otp_eligible_row("alice")]);
+    press(&mut state, KeyCode::Right);
+    press(&mut state, KeyCode::Enter);
+    press(&mut state, KeyCode::Enter); // opens install
+    press(&mut state, KeyCode::Esc);
+    assert!(state.contacts.as_ref().unwrap().install.is_none());
+    assert!(
+        state.contacts.as_ref().unwrap().detail.is_some(),
+        "closing install falls back to the details popup that opened it, not the list"
+    );
+}
+
+/// @requirement AC-301
+#[test]
+fn enter_on_a_missing_pqh_key_opens_a_file_browser() {
+    let mut state = joined_general_with(vec![]);
+    state.open_contacts();
+    state.set_contacts_rows(vec![row("alice", None)]); // no pq_hybrid pin
+    press(&mut state, KeyCode::Enter); // details on Pqh, missing
+    press(&mut state, KeyCode::Enter); // Create key
+
+    assert!(
+        state.contacts.as_ref().unwrap().detail.as_ref().unwrap().pqh_browser.is_some(),
+        "opens the identity-card file browser"
+    );
+}
+
+/// @requirement AC-301
+#[test]
+fn selecting_a_card_file_sends_pinidentitycard_and_closes_the_browser() {
+    let root = make_temp_file_tree();
+    let mut state = joined_general_with(vec![]);
+    state.open_contacts();
+    state.set_contacts_rows(vec![row("alice", None)]);
+    press(&mut state, KeyCode::Enter);
+    press(&mut state, KeyCode::Enter); // opens browser
+
+    {
+        let detail = state.contacts.as_mut().unwrap().detail.as_mut().unwrap();
+        let browser = detail.pqh_browser.as_mut().unwrap();
+        *browser = FileBrowserState::open(root.clone()).unwrap();
+    }
+    press(&mut state, KeyCode::Down); // subdir
+    press(&mut state, KeyCode::Down); // file.txt
+    let action = press(&mut state, KeyCode::Enter);
+
+    assert_eq!(
+        action,
+        Some(UiAction::PinIdentityCard { nickname: "alice".to_string(), path: root.join("file.txt") })
+    );
+    assert!(state.contacts.as_ref().unwrap().detail.as_ref().unwrap().pqh_browser.is_none());
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// @requirement AC-301
+#[test]
+fn esc_on_the_pqh_browser_returns_to_the_details_popup() {
+    let root = make_temp_file_tree();
+    let mut state = joined_general_with(vec![]);
+    state.open_contacts();
+    state.set_contacts_rows(vec![row("alice", None)]);
+    press(&mut state, KeyCode::Enter);
+    press(&mut state, KeyCode::Enter);
+    {
+        let detail = state.contacts.as_mut().unwrap().detail.as_mut().unwrap();
+        let browser = detail.pqh_browser.as_mut().unwrap();
+        *browser = FileBrowserState::open(root.clone()).unwrap();
+    }
+    press(&mut state, KeyCode::Esc);
+    assert!(state.contacts.as_ref().unwrap().detail.as_ref().unwrap().pqh_browser.is_none());
+    assert!(state.contacts.as_ref().unwrap().detail.is_some());
+
+    std::fs::remove_dir_all(&root).ok();
 }

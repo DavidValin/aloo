@@ -271,6 +271,120 @@ fn a_stale_check_result_for_an_edited_nickname_is_ignored() {
 }
 
 // ---------------------------------------------------------------------
+// The hard mail-key gate: no way to write or send without one (AC-297)
+// ---------------------------------------------------------------------
+
+/// The exact wording required: `no otp mail key available for <nickname> -
+/// install one manually from /contacts or exchange one with the user if
+/// he is online using /new-otp-mail-key (requires pinned contact)`.
+/// @requirement AC-297
+#[test]
+fn no_mail_key_renders_a_centered_red_modal_with_the_exact_message() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    open_mail(&mut state);
+    type_str(&mut state, "bob");
+    state.otp_mail_set_check("bob", RecipientCheck::NoMailKey);
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| render(f, &state)).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    let rows: Vec<String> = (0..buffer.area.height)
+        .map(|y| (0..buffer.area.width).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+        .collect();
+    let joined = rows.join(" ");
+    assert!(
+        joined.contains("no otp mail key available for bob"),
+        "names the nickname: {rows:?}"
+    );
+    assert!(
+        joined.contains("install one manually from"),
+        "the /contacts instruction: {rows:?}"
+    );
+    assert!(joined.contains("/contacts"), "names /contacts: {rows:?}");
+    assert!(
+        joined.contains("/new-otp-mail-key"),
+        "names the command: {rows:?}"
+    );
+    assert!(
+        joined.contains("requires pinned contact"),
+        "names the precondition: {rows:?}"
+    );
+
+    let mut found_red = false;
+    for y in 0..buffer.area.height {
+        for x in 0..buffer.area.width {
+            let cell = &buffer[(x, y)];
+            if !cell.symbol().trim().is_empty() && cell.fg == ratatui::style::Color::Red {
+                found_red = true;
+            }
+        }
+    }
+    assert!(found_red, "the message renders in red");
+}
+
+/// @requirement AC-297
+#[test]
+fn the_gate_absorbs_typing_tab_and_ctrl_s_while_blocked() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    open_mail(&mut state);
+    type_str(&mut state, "bob");
+    state.otp_mail_set_check("bob", RecipientCheck::NoMailKey);
+
+    assert!(press(&mut state, KeyCode::Char('x')).is_none());
+    assert_eq!(
+        state.otp_mail.as_ref().unwrap().compose.content,
+        "",
+        "typing must not reach the content field while blocked"
+    );
+    assert!(press(&mut state, KeyCode::Tab).is_none());
+    assert_eq!(
+        state.otp_mail.as_ref().unwrap().compose.focus,
+        aloo::client::tui::otp_mail::MailFocus::To,
+        "Tab must not move focus while blocked"
+    );
+    assert!(ctrl(&mut state, KeyCode::Char('s')).is_none());
+    assert!(
+        !state.otp_mail.as_ref().unwrap().compose.send_confirm,
+        "Ctrl+S must not open the send confirm while blocked"
+    );
+}
+
+/// @requirement AC-297
+#[test]
+fn esc_on_the_gate_closes_both_the_modal_and_the_whole_compose_view() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    open_mail(&mut state);
+    type_str(&mut state, "bob");
+    state.otp_mail_set_check("bob", RecipientCheck::NoMailKey);
+
+    assert!(press(&mut state, KeyCode::Esc).is_none());
+    assert!(
+        state.otp_mail.is_none(),
+        "Esc must close the whole /mail view in one step, not just the modal"
+    );
+}
+
+/// @requirement AC-297
+#[test]
+fn a_recipient_with_a_mail_key_is_never_blocked() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    open_mail(&mut state);
+    type_str(&mut state, "bob");
+    state.otp_mail_set_check("bob", ok_check(5 * 1024 * 1024));
+
+    let rows = rows_of(&state);
+    assert!(
+        !rows.iter().any(|r| r.contains("no otp mail key available")),
+        "a valid recipient never shows the gate: {rows:?}"
+    );
+    press(&mut state, KeyCode::Tab); // To -> Subtext
+    press(&mut state, KeyCode::Tab); // Subtext -> Content
+    press(&mut state, KeyCode::Char('y'));
+    assert_eq!(state.otp_mail.as_ref().unwrap().compose.content, "y", "typing works normally");
+}
+
+// ---------------------------------------------------------------------
 // The realtime key budget (AC-156)
 // ---------------------------------------------------------------------
 

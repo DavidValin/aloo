@@ -1368,6 +1368,11 @@ pub struct PendingOtpGenerate {
     pub peer: UserId,
     pub peer_name: String,
     pub pubkey_der: Vec<u8>,
+    /// Which key this popup is generating - the contact name that decides
+    /// it (`crypto::otp::contact_name_for`/`_mail`) doesn't exist yet at
+    /// this point in the flow, so unlike `PendingOtpInvite` this can't be
+    /// recovered from one later and has to be carried explicitly.
+    pub purpose: crate::crypto::otp::OtpPurpose,
 }
 
 /// How far a pad generation has got, driving the spinner popup
@@ -1397,6 +1402,7 @@ pub enum OtpPadPhase {
 pub struct OtpKeygenProgress {
     pub peer: UserId,
     pub peer_name: String,
+    pub purpose: crate::crypto::otp::OtpPurpose,
     pub phase: OtpPadPhase,
     /// MB per key, as chosen in the size prompt - shown so the popup names
     /// what is being waited on, not just that something is.
@@ -1599,8 +1605,16 @@ pub enum UiAction {
     },
     /// Sent by the `/otp` command (`submit_input`) for the currently open
     /// DM room - the one and only trigger for starting an OTP session
-    /// (`client::otp::handle_otp_command`). Never sent automatically.
+    /// (`client::otp::handle_provisioning_command`). Never sent automatically.
     RequestOtpSession {
+        peer: UserId,
+        pubkey_der: Vec<u8>,
+    },
+    /// Sent by the `/new-otp-mail-key` command (`submit_input`) for the
+    /// currently open DM room - the one and only trigger for provisioning a
+    /// mail-only key (`client::otp::handle_provisioning_command`, same
+    /// mechanics as `RequestOtpSession`, different purpose).
+    RequestOtpMailKey {
         peer: UserId,
         pubkey_der: Vec<u8>,
     },
@@ -1755,8 +1769,33 @@ pub enum UiAction {
     /// counterpart to `/otp`'s handshake-driven provisioning.
     InstallOtpKey {
         nickname: String,
+        /// Which of the two independent keychain entries this installs -
+        /// `Live` for the plain `/otp` key, `Mail` for the OTP-mail-only
+        /// key (`crypto::otp::contact_name_for_mail`). The contacts
+        /// modal's top-level `o` shortcut always sends `Live`; the newer
+        /// per-key detail popup (`ContactKeyKind::Otp`/`OtpMail`) can send
+        /// either.
+        purpose: crate::crypto::otp::OtpPurpose,
         enc_path: std::path::PathBuf,
         dec_path: std::path::PathBuf,
+    },
+    /// The contacts modal's OTP or OTP-mail key detail popup, "Delete
+    /// key" - removes just that one purpose's keychain entry
+    /// (`client::contacts::handle_delete_otp_key`), leaving the identity
+    /// pin and the *other* purpose's key untouched. `DeleteContact` above
+    /// is what the PQH key's own "Delete key" sends instead, since
+    /// removing the identity pin necessarily takes both purposes with it.
+    DeleteContactKey {
+        nickname: String,
+        purpose: crate::crypto::otp::OtpPurpose,
+    },
+    /// The PQH key detail popup's "Create key": imports an identity card
+    /// file, pinning it as `Verified` if its self-signed nickname matches
+    /// the contact row this was opened from
+    /// (`client::contacts::handle_pin_identity_card`).
+    PinIdentityCard {
+        nickname: String,
+        path: std::path::PathBuf,
     },
     /// `/daemon`: stop drawing and hand this session back to the
     /// background, leaving every connection, link and key exactly as they
@@ -3352,11 +3391,13 @@ impl UiState {
         peer: UserId,
         peer_name: String,
         pubkey_der: Vec<u8>,
+        purpose: crate::crypto::otp::OtpPurpose,
     ) {
         self.otp_generate_confirm = Some(PendingOtpGenerate {
             peer,
             peer_name,
             pubkey_der,
+            purpose,
         });
         self.otp_generate_focus = OtpChoice::Accept;
     }
@@ -3398,11 +3439,18 @@ impl UiState {
     /// Opens the generation spinner for `peer`'s pad, at 0 of
     /// `2 * size_mb` MB - called by `client::otp::confirm_generate` the
     /// moment it hands generation to its background task.
-    pub fn open_otp_keygen(&mut self, peer: UserId, peer_name: String, size_mb: u32) {
+    pub fn open_otp_keygen(
+        &mut self,
+        peer: UserId,
+        peer_name: String,
+        size_mb: u32,
+        purpose: crate::crypto::otp::OtpPurpose,
+    ) {
         self.otp_keygen = Some(OtpKeygenProgress {
             phase: OtpPadPhase::Generating,
             peer,
             peer_name,
+            purpose,
             size_mb,
             written_bytes: 0,
             total_bytes: size_mb as u64 * 1024 * 1024 * 2,
@@ -3441,11 +3489,13 @@ impl UiState {
         peer_name: String,
         size_mb: u32,
         phase: OtpPadPhase,
+        purpose: crate::crypto::otp::OtpPurpose,
     ) {
         self.otp_keygen = Some(OtpKeygenProgress {
             phase,
             peer,
             peer_name,
+            purpose,
             size_mb,
             written_bytes: 0,
             total_bytes: size_mb as u64 * 1024 * 1024 * 2,
@@ -3553,6 +3603,14 @@ impl UiState {
             return true;
         }
         false
+    }
+
+    /// Whether `from` has an invite queued at all, at any position - not
+    /// just the one on top (`otp_invite_open`). Used to refuse starting a
+    /// second provisioning handshake (of either purpose) with a peer who
+    /// already has one outstanding.
+    pub fn has_otp_invite_from(&self, from: UserId) -> bool {
+        self.otp_invites.contains_key(&from)
     }
 
     /// Sets the always-visible OTP/command status line - see
@@ -5104,6 +5162,21 @@ impl UiState {
                 pubkey_der: peer.public_key_der,
             });
         }
+        if self.input.trim() == "/new-otp-mail-key" {
+            // The one way to provision OTP mail's own key, independent of
+            // any live `/otp` session with the same person - same
+            // provisioning mechanics as `/otp` just above, same guards.
+            let peer_id = self.active_private_room?;
+            if self.is_trust_gated(peer_id) {
+                return None;
+            }
+            let peer = self.known_users.get(&peer_id)?.clone();
+            self.input.clear();
+            return Some(UiAction::RequestOtpMailKey {
+                peer: peer_id,
+                pubkey_der: peer.public_key_der,
+            });
+        }
         if self.input.trim() == "/mail" {
             // The one way to compose an OTP mail (docs/PROTOCOL.md §17.1) -
             // a command rather than a key chord, since the natural chord
@@ -6224,9 +6297,10 @@ fn render_otp_generate_popup(
     pending: &PendingOtpGenerate,
     focus: OtpChoice,
 ) {
+    let label = pending.purpose.label();
     let popup = centered_rect(64, 11, area);
     let block = Block::default()
-        .title("Start an OTP session")
+        .title(format!("Start an {label}"))
         .borders(Borders::ALL);
     let inner = block.inner(popup);
     frame.render_widget(Clear, popup);
@@ -6237,11 +6311,15 @@ fn render_otp_generate_popup(
         .constraints([Constraint::Min(6), Constraint::Length(3)])
         .split(inner);
 
+    let retry_command = match pending.purpose {
+        crate::crypto::otp::OtpPurpose::Live => "/otp",
+        crate::crypto::otp::OtpPurpose::Mail => "/new-otp-mail-key",
+    };
     let message = format!(
-        "No OTP key found for {}. Generate one now and share it automatically \
+        "No {label} found for {}. Generate one now and share it automatically \
          over the encrypted pq_hybrid channel? Alternatively, run the 'otp' \
          command yourself and place the keys under ~/.aloo/otp/.keychain/, \
-         then try /otp again.",
+         then try {retry_command} again.",
         pending.peer_name
     );
     frame.render_widget(
@@ -6275,9 +6353,11 @@ fn render_otp_invite_popup(
     invite: &PendingOtpInvite,
     focus: OtpChoice,
 ) {
+    let purpose = crate::crypto::otp::OtpPurpose::of_contact_name(&invite.contact_name);
+    let label = purpose.label();
     let popup = centered_rect(64, 9, area);
     let block = Block::default()
-        .title(format!("OTP session request from {}", invite.from_name))
+        .title(format!("{label} request from {}", invite.from_name))
         .borders(Borders::ALL);
     let inner = block.inner(popup);
     frame.render_widget(Clear, popup);
@@ -6296,11 +6376,23 @@ fn render_otp_invite_popup(
         Some(mb) => format!(" using a fresh {mb}MB pad"),
         None => String::new(),
     };
-    let message = format!(
-        "{} wants to start an OTP session with you{size_clause}, layered on top of \
-         pq_hybrid for extra secrecy. Accept it?",
-        invite.from_name
-    );
+    // The trailing clause differs by purpose too, not just the verb: a
+    // live session genuinely layers the pad on top of pq_hybrid for every
+    // message afterward, but a mail key never layers onto anything - it's
+    // its own, separate delivery mechanism (`/mail`), so describing it as
+    // "layered on top of pq_hybrid" would misdescribe what accepting it
+    // actually does.
+    let message = match purpose {
+        crate::crypto::otp::OtpPurpose::Live => format!(
+            "{} wants to start an OTP session with you{size_clause}, layered on top of \
+             pq_hybrid for extra secrecy. Accept it?",
+            invite.from_name
+        ),
+        crate::crypto::otp::OtpPurpose::Mail => format!(
+            "{} wants to exchange an OTP mail key with you{size_clause}. Accept it?",
+            invite.from_name
+        ),
+    };
     frame.render_widget(
         Paragraph::new(message).wrap(ratatui::widgets::Wrap { trim: true }),
         rows[0],
@@ -6340,7 +6432,11 @@ fn render_otp_size_popup(
     let has_error = state.otp_size_error.is_some();
     let popup = centered_rect(64, if has_error { 8 } else { 7 }, area);
     let block = Block::default()
-        .title(format!("Pad size for {} (MB per key)", pending.peer_name))
+        .title(format!(
+            "{} pad size for {} (MB per key)",
+            pending.purpose.label(),
+            pending.peer_name
+        ))
         .borders(Borders::ALL);
     let inner = block.inner(popup);
     frame.render_widget(Clear, popup);
@@ -6407,9 +6503,10 @@ const KEYGEN_BAR_CELLS: usize = 40;
 /// replaces.
 fn render_otp_keygen_popup(frame: &mut Frame, area: Rect, progress: &OtpKeygenProgress) {
     let popup = centered_rect(64, 8, area);
+    let label = progress.purpose.label();
     let (title, what, reassurance) = match progress.phase {
         OtpPadPhase::Generating => (
-            format!("Generating a pad for {}", progress.peer_name),
+            format!("Generating an {label} pad for {}", progress.peer_name),
             format!(
                 "{}MB per key ({}MB of true randomness in total)",
                 progress.size_mb,
@@ -6419,7 +6516,7 @@ fn render_otp_keygen_popup(frame: &mut Frame, area: Rect, progress: &OtpKeygenPr
              with this contact until it runs out.",
         ),
         OtpPadPhase::Sending => (
-            format!("Sending the pad to {}", progress.peer_name),
+            format!("Sending the {label} pad to {}", progress.peer_name),
             format!(
                 "{}MB per key, both halves ({}MB over the link)",
                 progress.size_mb,
@@ -6429,7 +6526,7 @@ fn render_otp_keygen_popup(frame: &mut Frame, area: Rect, progress: &OtpKeygenPr
              agree it matches - so their prompt appears when this finishes, not before.",
         ),
         OtpPadPhase::Receiving => (
-            format!("Receiving a pad from {}", progress.peer_name),
+            format!("Receiving an {label} pad from {}", progress.peer_name),
             format!(
                 "{}MB per key, both halves ({}MB over the link)",
                 progress.size_mb,

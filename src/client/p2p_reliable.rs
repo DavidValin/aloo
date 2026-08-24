@@ -19,9 +19,18 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
 
-/// Initial retransmit backoff; doubles per retry up to `MAX_RETRANSMIT`.
+/// Retransmit timeout used until the first real RTT sample comes back -
+/// deliberately conservative, since nothing is known about the path yet.
+/// Every retry after the first one, and every later frame once a sample
+/// exists, uses `ArqSender::rto` instead (RFC 6298-style), not this.
 const INITIAL_RETRANSMIT: Duration = Duration::from_millis(400);
 const MAX_RETRANSMIT: Duration = Duration::from_secs(3);
+/// Floor under the *measured* RTO, so a clean, fast link (a LAN, or two
+/// peers a few milliseconds apart) doesn't compute a timeout so small that
+/// ordinary jitter starts firing spurious retransmits - a wasted duplicate
+/// send, not a correctness problem, but still waste. Well under any real
+/// hole-punched path's RTT, so it never masks a genuine loss on one.
+const MIN_RTO: Duration = Duration::from_millis(100);
 /// Giving up after this many retries treats the link as dead - there is no
 /// relay fallback, so a sender that stops getting acks must surface a
 /// failure rather than retry forever.
@@ -103,6 +112,29 @@ pub struct ArqSender {
     /// here, not on the way in, so what the peer sees is still one gapless
     /// ascending run.
     backlog: VecDeque<Vec<u8>>,
+    /// Diagnostic-only counters, read by `PeerLinkManager::link_diagnostics`
+    /// - never consulted by anything that decides what to send: how many
+    /// frames have ever been retransmitted on this link (a loss/stall
+    /// signal - this being large during a bulk transfer is exactly the
+    /// Go-Back-N throughput cliff the module doc describes, not merely a
+    /// slow path), and the highest `unacked.len()` this sender has ever
+    /// reached (whether the window itself, rather than something upstream,
+    /// is actually the throughput bound).
+    retransmit_count: u64,
+    peak_unacked: usize,
+    /// Smoothed RTT and RTT variance (RFC 6298 §2's `SRTT`/`RTTVAR`),
+    /// `None` until the first usable sample arrives. This is what turns a
+    /// fixed, worst-case-guessing `INITIAL_RETRANSMIT` into a timeout that
+    /// actually tracks the path: a nearby peer (a few ms away) starts
+    /// retransmitting a genuinely lost frame in well under 400ms once a
+    /// sample or two has landed, rather than waiting out a guess sized for
+    /// a much slower path. Only ever fed by an ack for a frame that was
+    /// *never* retransmitted (Karn's algorithm, applied in `on_ack`) - an
+    /// ack for a retransmitted frame cannot say which of its transmissions
+    /// it is acknowledging, so counting it would corrupt the estimate with
+    /// an unknown mix of the two.
+    srtt: Option<Duration>,
+    rttvar: Duration,
 }
 
 impl ArqSender {
@@ -148,11 +180,45 @@ impl ArqSender {
             Unacked {
                 payload: payload.clone(),
                 sent_at: Instant::now(),
-                backoff: INITIAL_RETRANSMIT,
+                backoff: self.rto(),
                 retries: 0,
             },
         );
+        self.peak_unacked = self.peak_unacked.max(self.unacked.len());
         (seq, payload)
+    }
+
+    /// The retransmit timeout a newly-admitted frame starts with -
+    /// `INITIAL_RETRANSMIT` until a real RTT sample exists, the RFC
+    /// 6298-style estimate from `srtt`/`rttvar` after that (§2's
+    /// `RTO = SRTT + max(G, 4*RTTVAR)`, `G` folded into `MIN_RTO` here
+    /// rather than tracked as a separate clock-granularity term), clamped
+    /// to `[MIN_RTO, MAX_RETRANSMIT]` so neither a very fast nor a very
+    /// slow path pushes it outside a sane range.
+    fn rto(&self) -> Duration {
+        match self.srtt {
+            None => INITIAL_RETRANSMIT,
+            Some(srtt) => (srtt + 4 * self.rttvar).clamp(MIN_RTO, MAX_RETRANSMIT),
+        }
+    }
+
+    /// Folds one RTT sample into `srtt`/`rttvar`, RFC 6298 §2's update
+    /// rule verbatim (`alpha = 1/8`, `beta = 1/4`). Only ever called with a
+    /// sample from a frame that was never retransmitted - see `srtt`'s
+    /// field doc for why a retransmitted frame's ack can't be trusted for
+    /// this.
+    fn record_rtt_sample(&mut self, sample: Duration) {
+        match self.srtt {
+            None => {
+                self.srtt = Some(sample);
+                self.rttvar = sample / 2;
+            }
+            Some(srtt) => {
+                let delta = srtt.checked_sub(sample).unwrap_or_else(|| sample - srtt);
+                self.rttvar = (self.rttvar * 3 + delta) / 4;
+                self.srtt = Some((srtt * 7 + sample) / 8);
+            }
+        }
     }
 
     /// Retires every frame up to and including `seq` - the ack is
@@ -174,12 +240,23 @@ impl ArqSender {
     ///
     /// A duplicate or stale ack retires nothing and releases nothing, so a
     /// replayed one cannot pull the backlog forward.
-    pub fn on_ack(&mut self, seq: u32) -> Vec<(u32, Vec<u8>)> {
+    ///
+    /// `now` feeds the RTT estimate (`record_rtt_sample`) - taken from the
+    /// most recent frame this ack actually retires, and only if that frame
+    /// was never retransmitted (Karn's algorithm: an ack for a
+    /// retransmitted frame can't say which transmission it belongs to).
+    pub fn on_ack(&mut self, seq: u32, now: Instant) -> Vec<(u32, Vec<u8>)> {
         let retired: Vec<u32> = self
             .unacked
             .range(..=seq)
             .map(|(&s, _)| s)
             .collect();
+        if let Some(&latest) = retired.last()
+            && let Some(frame) = self.unacked.get(&latest)
+            && frame.retries == 0
+        {
+            self.record_rtt_sample(now.saturating_duration_since(frame.sent_at));
+        }
         for s in &retired {
             if let Some(frame) = self.unacked.remove(s) {
                 self.unacked_bytes = self.unacked_bytes.saturating_sub(frame.payload.len());
@@ -213,7 +290,26 @@ impl ArqSender {
                 due.push((seq, unacked.payload.clone()));
             }
         }
+        self.retransmit_count += due.len() as u64;
         Ok(due)
+    }
+
+    /// Diagnostic-only: see `retransmit_count`'s field doc.
+    pub fn retransmit_count(&self) -> u64 {
+        self.retransmit_count
+    }
+
+    /// Diagnostic-only: see `peak_unacked`'s field doc.
+    pub fn peak_unacked(&self) -> usize {
+        self.peak_unacked
+    }
+
+    /// The retransmit timeout a frame admitted *right now* would start
+    /// with - `INITIAL_RETRANSMIT` until a real RTT sample exists, the
+    /// adaptive estimate after that. Exposed for tests; the sender itself
+    /// only ever consults this from `admit`.
+    pub fn current_rto(&self) -> Duration {
+        self.rto()
     }
 
     pub fn has_pending(&self) -> bool {
@@ -239,6 +335,11 @@ impl ArqSender {
     pub fn reset(&mut self) -> Vec<Vec<u8>> {
         self.next_seq = 0;
         self.unacked_bytes = 0;
+        // A re-punched link may be a genuinely different path (a new
+        // address, possibly a different route entirely) - carrying the old
+        // RTT estimate across would apply one path's timing to another's.
+        self.srtt = None;
+        self.rttvar = Duration::ZERO;
         // In-flight frames first (`BTreeMap` iterates them in `seq` order),
         // then anything that never got a sequence number at all - which is
         // exactly the order they were handed over in, and the order a

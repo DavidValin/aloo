@@ -1166,7 +1166,7 @@ impl PeerLinkManager {
                     // Retiring this frame may release the next one waiting
                     // on the send window - that release is the only thing
                     // that keeps a windowed backlog moving.
-                    for (seq, payload) in link.arq_tx.on_ack(seq) {
+                    for (seq, payload) in link.arq_tx.on_ack(seq, now) {
                         Self::transmit_frame(&socket, link, seq, payload);
                     }
                 }
@@ -2486,6 +2486,15 @@ impl PeerLinkManager {
         self.links
             .get(&peer)
             .map_or(0, |l| l.arq_tx.depth() + l.pending.len())
+    }
+
+    /// Diagnostic-only `(retransmit_count, peak_unacked)` for `peer`'s
+    /// outgoing ARQ sender - see `ArqSender`'s own doc on both. `None` if
+    /// there is no link recorded for this peer at all.
+    pub fn link_diagnostics(&self, peer: UserId) -> Option<(u64, usize)> {
+        self.links
+            .get(&peer)
+            .map(|l| (l.arq_tx.retransmit_count(), l.arq_tx.peak_unacked()))
     }
 
     /// The token the most recent `BindingRequest` went out with - what a

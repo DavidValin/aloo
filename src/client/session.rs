@@ -1547,9 +1547,17 @@ async fn handle_ui_action(
             // Snapshotted so a refusal raised by *this* call can be told
             // apart from a notice that was already on screen.
             let notice_before = ui_state.status_notice.clone();
-            crate::client::otp::handle_otp_command(wr, ui_state, session, peer, pubkey_der).await?;
-            // `handle_otp_command` refuses some proposals outright - no
-            // `otp` binary, an unreadable peer identity, a peer with no
+            crate::client::otp::handle_provisioning_command(
+                wr,
+                ui_state,
+                session,
+                peer,
+                pubkey_der,
+                crate::crypto::otp::OtpPurpose::Live,
+            )
+            .await?;
+            // `handle_provisioning_command` refuses some proposals outright
+            // - no `otp` binary, an unreadable peer identity, a peer with no
             // announced keybundle to share a fresh pad over - and those
             // never reach the peer at all, so
             // no acknowledgement will ever arrive to resolve them. A new
@@ -1566,6 +1574,17 @@ async fn handle_ui_action(
                     .unwrap_or_default();
                 daemon_otp_outcome(ui_state, session, peer, false, &reason);
             }
+        }
+        UiAction::RequestOtpMailKey { peer, pubkey_der } => {
+            crate::client::otp::handle_provisioning_command(
+                wr,
+                ui_state,
+                session,
+                peer,
+                pubkey_der,
+                crate::crypto::otp::OtpPurpose::Mail,
+            )
+            .await?;
         }
         UiAction::ConfirmOtpGenerate { size_mb } => {
             crate::client::otp::confirm_generate(wr, session, ui_state, size_mb).await?;
@@ -1681,13 +1700,22 @@ async fn handle_ui_action(
         }
         UiAction::InstallOtpKey {
             nickname,
+            purpose,
             enc_path,
             dec_path,
         } => {
             crate::client::contacts::handle_install_otp_key(
-                session, ui_state, nickname, enc_path, dec_path,
+                session, ui_state, nickname, purpose, enc_path, dec_path,
             )
             .await;
+        }
+        UiAction::DeleteContactKey { nickname, purpose } => {
+            crate::client::contacts::handle_delete_otp_key(session, ui_state, nickname, purpose)
+                .await;
+        }
+        UiAction::PinIdentityCard { nickname, path } => {
+            crate::client::contacts::handle_pin_identity_card(session, ui_state, nickname, path)
+                .await;
         }
         UiAction::Detach => {
             // Intercepted by `run_connected_session`'s input arm, which

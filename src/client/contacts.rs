@@ -26,6 +26,7 @@ use crate::client::otp_cli::{self, OtpCliConfig};
 use crate::client::otp_store::OtpStore;
 use crate::client::session::SessionState;
 use crate::client::tui::ui::UiState;
+use crate::crypto::otp::OtpPurpose;
 use crate::proto::KeyMode;
 
 /// One contact's live OTP pad figures, in each direction - the same
@@ -64,6 +65,25 @@ pub struct ContactRow {
     /// `Some` iff `otp_contact_name` names a keychain entry that already
     /// exists.
     pub otp: Option<ContactOtpDetail>,
+    /// `otp_contact_name`'s counterpart for OTP *mail* - the independent
+    /// key `/mail` always spends (`crypto::otp::contact_name_for_mail`),
+    /// never the live session key above.
+    pub otp_mail_contact_name: Option<String>,
+    /// `Some` iff `otp_mail_contact_name` names a keychain entry that
+    /// already exists.
+    pub otp_mail: Option<ContactOtpDetail>,
+    /// This contact's `pq_hybrid` fingerprint, short form
+    /// (`crypto::short_fingerprint_der` - the same form every other
+    /// key-display surface uses) - the PQH key detail popup's "id" line.
+    /// `Some` iff `key_mode` is `PqHybrid`; `None` for a pin that isn't
+    /// (nothing to show as a PQH "id" for a raw Direct-framed pin with no
+    /// pq_hybrid identity behind it at all).
+    pub pqh_fingerprint: Option<String>,
+    /// The identity-card file this pin was manually imported from
+    /// (`idstore::IdStore::pinned_from`) - the PQH key detail popup's
+    /// "path in disk". `None` for a pin that arrived over the wire
+    /// instead.
+    pub pqh_pinned_from: Option<PathBuf>,
 }
 
 /// The `otp` keychain contact name to file `nickname`'s pad under.
@@ -84,19 +104,32 @@ pub fn otp_contact_name_for(
     id_store: &IdStore,
     nickname: &str,
     own_identity: OwnIdentity<'_>,
+    purpose: OtpPurpose,
 ) -> Option<String> {
     let peer_der = id_store.get(nickname)?;
     match crate::client::otp::framing_for(own_identity.pinned_public_der, peer_der) {
         crate::client::otp::OtpFraming::PqWrapped => {
             let peer_fp = crate::crypto::pq::fingerprint_of_encoded(peer_der)?;
-            Some(crate::crypto::otp::contact_name_for(
-                own_identity.pq_fingerprint,
-                &peer_fp,
-            ))
+            Some(match purpose {
+                OtpPurpose::Live => crate::crypto::otp::contact_name_for(
+                    own_identity.pq_fingerprint,
+                    &peer_fp,
+                ),
+                OtpPurpose::Mail => crate::crypto::otp::contact_name_for_mail(
+                    own_identity.pq_fingerprint,
+                    &peer_fp,
+                ),
+            })
         }
-        crate::client::otp::OtpFraming::Direct => Some(
-            crate::crypto::otp::contact_name_for_keys(own_identity.pinned_public_der, peer_der),
-        ),
+        crate::client::otp::OtpFraming::Direct => Some(match purpose {
+            OtpPurpose::Live => {
+                crate::crypto::otp::contact_name_for_keys(own_identity.pinned_public_der, peer_der)
+            }
+            OtpPurpose::Mail => crate::crypto::otp::contact_name_for_keys_mail(
+                own_identity.pinned_public_der,
+                peer_der,
+            ),
+        }),
     }
 }
 
@@ -151,17 +184,33 @@ pub async fn gather_contact_rows(
     for nickname in id_store.nicknames() {
         let last_seen_unix = id_store.last_seen_unix(&nickname);
         let key_mode = id_store.key_mode(&nickname);
-        let otp_contact_name = otp_contact_name_for(id_store, &nickname, own_identity);
+        let otp_contact_name = otp_contact_name_for(id_store, &nickname, own_identity, OtpPurpose::Live);
         let otp = match &otp_contact_name {
             Some(name) => otp_detail_for(otp_cli_cfg, name).await,
             None => None,
         };
+        let otp_mail_contact_name =
+            otp_contact_name_for(id_store, &nickname, own_identity, OtpPurpose::Mail);
+        let otp_mail = match &otp_mail_contact_name {
+            Some(name) => otp_detail_for(otp_cli_cfg, name).await,
+            None => None,
+        };
+        let pqh_fingerprint = if key_mode == Some(KeyMode::PqHybrid) {
+            id_store.get(&nickname).map(crate::crypto::short_fingerprint_der)
+        } else {
+            None
+        };
+        let pqh_pinned_from = id_store.pinned_from(&nickname).map(|p| p.to_path_buf());
         rows.push(ContactRow {
             nickname,
             last_seen_unix,
             key_mode,
             otp_contact_name,
             otp,
+            otp_mail_contact_name,
+            otp_mail,
+            pqh_fingerprint,
+            pqh_pinned_from,
         });
     }
     rows
@@ -194,12 +243,19 @@ pub async fn delete_contact(
     own_identity: OwnIdentity<'_>,
     nickname: &str,
 ) -> bool {
-    if let Some(contact_name) = otp_contact_name_for(id_store, nickname, own_identity) {
-        if let Err(e) = otp_cli::remove_contact(otp_cli_cfg, &contact_name).await {
-            crate::log_warn!("failed to remove otp keychain entry for {nickname}: {e}");
-        }
-        if otp_store.forget(&contact_name) {
-            let _ = otp_store.save();
+    // Deleting the identity pin orphans both purposes' keychain names at
+    // once (neither can be recomputed once `id_store.get` stops answering
+    // for this nickname), so both are cleaned up here rather than leaving
+    // whichever one the caller didn't think of stranded on disk forever.
+    for purpose in [OtpPurpose::Live, OtpPurpose::Mail] {
+        if let Some(contact_name) = otp_contact_name_for(id_store, nickname, own_identity, purpose)
+        {
+            if let Err(e) = otp_cli::remove_contact(otp_cli_cfg, &contact_name).await {
+                crate::log_warn!("failed to remove {} keychain entry for {nickname}: {e}", purpose.label());
+            }
+            if otp_store.forget(&contact_name) {
+                let _ = otp_store.save();
+            }
         }
     }
     let removed = id_store.remove(nickname);
@@ -229,6 +285,31 @@ pub async fn handle_delete(session: &mut SessionState, ui_state: &mut UiState, n
         ui_state.push_status_notice(format!("removed contact {nickname}"), true);
     }
     handle_open(session, ui_state).await;
+    refresh_mail_recipient_check_if_open(session, ui_state, &nickname).await;
+}
+
+/// A key change from `/contacts` (installing, creating, or deleting any of
+/// a contact's three keys) must "take effect immediately" - if `/mail` is
+/// open composing *to this same nickname*, its recipient check is stale
+/// the instant any of that happens, so it's re-run here rather than
+/// leaving the compose view to show whatever it last computed until the
+/// user edits the field again. A no-op whenever `/mail` isn't open, or is
+/// open for someone else - `otp_mail::handle_check_recipient` itself
+/// already ignores a result for the wrong nickname, but there is no reason
+/// to shell out to `otp` at all for an unrelated compose.
+async fn refresh_mail_recipient_check_if_open(
+    session: &mut SessionState,
+    ui_state: &mut UiState,
+    nickname: &str,
+) {
+    let composing_to = ui_state
+        .otp_mail
+        .as_ref()
+        .map(|m| m.compose.to.clone())
+        .filter(|to| to == nickname);
+    if let Some(to) = composing_to {
+        crate::client::otp_mail::handle_check_recipient(session, ui_state, to).await;
+    }
 }
 
 /// What `install_otp_key` decided.
@@ -271,10 +352,11 @@ pub async fn install_otp_key(
     otp_cli_cfg: &OtpCliConfig,
     own_identity: OwnIdentity<'_>,
     nickname: &str,
+    purpose: OtpPurpose,
     enc_path: &Path,
     dec_path: &Path,
 ) -> InstallOtpKeyOutcome {
-    let Some(contact_name) = otp_contact_name_for(id_store, nickname, own_identity) else {
+    let Some(contact_name) = otp_contact_name_for(id_store, nickname, own_identity, purpose) else {
         return InstallOtpKeyOutcome::NotEligible;
     };
     if let Err(e) = validate_key_file(enc_path) {
@@ -298,6 +380,7 @@ pub async fn handle_install_otp_key(
     session: &mut SessionState,
     ui_state: &mut UiState,
     nickname: String,
+    purpose: OtpPurpose,
     enc_path: PathBuf,
     dec_path: PathBuf,
 ) {
@@ -313,15 +396,17 @@ pub async fn handle_install_otp_key(
         &session.otp_cli_cfg,
         own_identity,
         &nickname,
+        purpose,
         &enc_path,
         &dec_path,
     )
     .await;
     match outcome {
         InstallOtpKeyOutcome::Ok => {
-            ui_state.push_status_notice(format!("installed OTP key for {nickname}"), true);
+            ui_state.push_status_notice(format!("installed {} for {nickname}", purpose.label()), true);
             ui_state.close_contacts_install();
             handle_open(session, ui_state).await;
+            refresh_mail_recipient_check_if_open(session, ui_state, &nickname).await;
         }
         InstallOtpKeyOutcome::NotEligible => {
             ui_state.set_contacts_install_error(
@@ -330,6 +415,141 @@ pub async fn handle_install_otp_key(
         }
         InstallOtpKeyOutcome::Error(e) => {
             ui_state.set_contacts_install_error(e);
+        }
+    }
+}
+
+/// Deletes just one purpose's keychain entry for `nickname` - the OTP or
+/// OTP-mail key detail popup's own "Delete key", independent of the other
+/// purpose and of the identity pin itself (`delete_contact` is what
+/// removes all three together, reached instead from the PQH key's own
+/// "Delete key"). Returns whether there was anything to delete.
+pub async fn delete_otp_key(
+    id_store: &IdStore,
+    otp_store: &mut OtpStore,
+    otp_cli_cfg: &OtpCliConfig,
+    own_identity: OwnIdentity<'_>,
+    nickname: &str,
+    purpose: OtpPurpose,
+) -> bool {
+    let Some(contact_name) = otp_contact_name_for(id_store, nickname, own_identity, purpose) else {
+        return false;
+    };
+    let had_entry = otp_cli::has_contact(otp_cli_cfg, &contact_name)
+        .await
+        .unwrap_or(false);
+    if let Err(e) = otp_cli::remove_contact(otp_cli_cfg, &contact_name).await {
+        crate::log_warn!("failed to remove {} keychain entry for {nickname}: {e}", purpose.label());
+    }
+    if otp_store.forget(&contact_name) {
+        let _ = otp_store.save();
+    }
+    had_entry
+}
+
+/// `UiAction::DeleteContactKey`'s handler.
+pub async fn handle_delete_otp_key(
+    session: &mut SessionState,
+    ui_state: &mut UiState,
+    nickname: String,
+    purpose: OtpPurpose,
+) {
+    let own_fp = session.own_pq_fp;
+    let own_der = session.otp_own_pinned_der.clone();
+    let own_identity = OwnIdentity {
+        pq_fingerprint: &own_fp,
+        pinned_public_der: &own_der,
+    };
+    let removed = delete_otp_key(
+        &session.id_store,
+        &mut session.otp_store,
+        &session.otp_cli_cfg,
+        own_identity,
+        &nickname,
+        purpose,
+    )
+    .await;
+    if removed {
+        ui_state.push_status_notice(format!("removed {} for {nickname}", purpose.label()), true);
+    }
+    handle_open(session, ui_state).await;
+    refresh_mail_recipient_check_if_open(session, ui_state, &nickname).await;
+}
+
+/// What `pin_identity_card` decided.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PinIdentityCardOutcome {
+    Ok,
+    /// The file didn't load, or its self-signature didn't check out
+    /// (`crypto::pq::open_identity_card`) - never pinned either way.
+    Invalid(String),
+    /// The card is genuine, but vouches for a different nickname than the
+    /// contact row it was opened from - refused rather than silently
+    /// filing it under the wrong name, or under a second, new row.
+    NicknameMismatch { card_nickname: String },
+}
+
+/// PQH's "Create key": imports an identity card (`crypto::pq::IdentityCard`,
+/// `aloo --export-identity-card`'s output) and pins it as `Verified` -
+/// the one way to attach a real `pq_hybrid` identity to a nickname before
+/// ever connecting to them, instead of leaving it to trust-on-first-use.
+/// Requires the card's own self-attested nickname to match `nickname`
+/// exactly: a card is a binding of *one specific* nickname to a key, and
+/// this always upgrades the *existing* row it was opened from rather than
+/// ever creating a new one.
+pub fn pin_identity_card(
+    id_store: &mut IdStore,
+    nickname: &str,
+    path: &Path,
+) -> PinIdentityCardOutcome {
+    let card = match crate::crypto::pq::load_identity_card(path) {
+        Ok(card) => card,
+        Err(e) => return PinIdentityCardOutcome::Invalid(format!("{}: {e}", path.display())),
+    };
+    let Some((card_nickname, bundle)) = crate::crypto::pq::open_identity_card(&card) else {
+        return PinIdentityCardOutcome::Invalid(
+            "card signature does not match its own key - refusing to pin".to_string(),
+        );
+    };
+    if card_nickname != nickname {
+        return PinIdentityCardOutcome::NicknameMismatch {
+            card_nickname: card_nickname.to_string(),
+        };
+    }
+    let encoded = match crate::proto::encode(bundle) {
+        Ok(bytes) => bytes,
+        Err(e) => return PinIdentityCardOutcome::Invalid(format!("{e}")),
+    };
+    id_store.check_and_pin_with(nickname, &encoded, crate::client::idstore::Trust::Verified);
+    id_store.set_key_mode(nickname, KeyMode::PqHybrid);
+    id_store.set_pinned_from(nickname, path.to_path_buf());
+    if let Err(e) = id_store.save() {
+        crate::log_warn!("failed to save id_store: {e}");
+    }
+    PinIdentityCardOutcome::Ok
+}
+
+/// `UiAction::PinIdentityCard`'s handler.
+pub async fn handle_pin_identity_card(
+    session: &mut SessionState,
+    ui_state: &mut UiState,
+    nickname: String,
+    path: PathBuf,
+) {
+    match pin_identity_card(&mut session.id_store, &nickname, &path) {
+        PinIdentityCardOutcome::Ok => {
+            ui_state.push_status_notice(format!("pinned {nickname} from identity card"), true);
+            ui_state.close_contacts_pqh_create();
+            handle_open(session, ui_state).await;
+            refresh_mail_recipient_check_if_open(session, ui_state, &nickname).await;
+        }
+        PinIdentityCardOutcome::Invalid(e) => {
+            ui_state.set_contacts_pqh_create_error(e);
+        }
+        PinIdentityCardOutcome::NicknameMismatch { card_nickname } => {
+            ui_state.set_contacts_pqh_create_error(format!(
+                "this card vouches for '{card_nickname}', not '{nickname}' - refusing to pin it under the wrong name"
+            ));
         }
     }
 }

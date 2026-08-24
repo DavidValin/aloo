@@ -287,6 +287,18 @@ name = "otp_provisioning_test"
 path = "test/otp_provisioning_test.rs"
 
 [[test]]
+name = "otp_provisioning_concurrency_test"
+path = "test/otp_provisioning_concurrency_test.rs"
+
+[[test]]
+name = "otp_mail_recipient_check_test"
+path = "test/otp_mail_recipient_check_test.rs"
+
+[[test]]
+name = "contacts_mail_refresh_test"
+path = "test/contacts_mail_refresh_test.rs"
+
+[[test]]
 name = "otp_pad_test"
 path = "test/otp_pad_test.rs"
 

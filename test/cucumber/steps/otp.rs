@@ -21,7 +21,7 @@ use aloo::client::otp::{
 use aloo::client::otp_cli::{self, OtpCliConfig};
 use aloo::client::otp_store::{OtpStore, PendingOtpContent};
 use aloo::client::tui::ui::{UiAction, UiState};
-use aloo::crypto::otp::{contact_name_for, OtpKeySetupChunk, OtpKeySetupReassembly};
+use aloo::crypto::otp::{contact_name_for, OtpKeySetupChunk, OtpKeySetupReassembly, OtpPurpose};
 use aloo::crypto::pq::{
     HybridSend, bundle_fingerprint, open_send, open_send_blinded, seal_send_blinded,
 };
@@ -53,7 +53,7 @@ async fn provisioned_contact(w: &mut AlooWorld, a: String, b: String) {
     let cfg_a = cfg_at(w.temp_path(&format!("otp-{a}")));
     let cfg_b = cfg_at(w.temp_path(&format!("otp-{b}")));
 
-    let payload = initiate_provisioning(&cfg_a, 1, &fp_a, &fp_b)
+    let payload = initiate_provisioning(&cfg_a, 1, &fp_a, &fp_b, OtpPurpose::Live)
         .await
         .expect("provisioning generation should succeed");
     let ack = apply_incoming_setup(&cfg_b, &payload).await;
@@ -274,7 +274,8 @@ async fn adopted_without_generating(w: &mut AlooWorld) {
 #[when(expr = "I am asked to generate a fresh otp pad for {word}")]
 async fn asked_to_generate(w: &mut AlooWorld, who: String) {
     let id = UserId(id_for(&who));
-    w.ui_mut().open_otp_generate_confirm(id, who, vec![9, 9]);
+    w.ui_mut()
+        .open_otp_generate_confirm(id, who, vec![9, 9], aloo::crypto::otp::OtpPurpose::Live);
 }
 
 #[then(expr = "a prompt asks whether to generate and share a fresh pad with {word}")]
@@ -410,7 +411,7 @@ async fn generate_unaccepted_pad(w: &mut AlooWorld, from: String, to: String) {
     let cfg_a = cfg_at(w.temp_path(&format!("otp-unaccepted-{from}")));
     let cfg_b = cfg_at(w.temp_path(&format!("otp-unaccepted-{to}")));
 
-    let payload = initiate_provisioning(&cfg_a, 1, &fp_a, &fp_b)
+    let payload = initiate_provisioning(&cfg_a, 1, &fp_a, &fp_b, OtpPurpose::Live)
         .await
         .expect("provisioning generation should succeed");
     w.otp_contact_name = Some(payload.contact_name.clone());
@@ -456,7 +457,7 @@ async fn later_invitation_succeeds(w: &mut AlooWorld, from: String, to: String) 
 
     // Whichever direction it runs in, the contact name is the same - which
     // is precisely why a leftover half used to make this impossible.
-    let payload = initiate_provisioning(&cfg_from, 1, &fp_a, &fp_b)
+    let payload = initiate_provisioning(&cfg_from, 1, &fp_a, &fp_b, OtpPurpose::Live)
         .await
         .expect("a later invitation must not be blocked by an abandoned one");
     let ack = apply_incoming_setup(&cfg_to, &payload).await;
@@ -485,10 +486,10 @@ async fn both_generate_at_once(w: &mut AlooWorld) {
     let cfg_a = cfg_at(w.temp_path("otp-glare-alice"));
     let cfg_b = cfg_at(w.temp_path("otp-glare-bob"));
 
-    let pad_a = initiate_provisioning(&cfg_a, 1, &fp_a, &fp_b)
+    let pad_a = initiate_provisioning(&cfg_a, 1, &fp_a, &fp_b, OtpPurpose::Live)
         .await
         .expect("alice's pad");
-    initiate_provisioning(&cfg_b, 1, &fp_b, &fp_a)
+    initiate_provisioning(&cfg_b, 1, &fp_b, &fp_a, OtpPurpose::Live)
         .await
         .expect("bob's pad");
 
@@ -1015,12 +1016,13 @@ async fn pad_only_ack(w: &mut AlooWorld, _b: String) {
 async fn pad_only_slash_otp(w: &mut AlooWorld, _a: String, _b: String) {
     let (a, _) = w.pad_only.as_mut().expect("no pad-only pair");
     let peer_der = a.peer_der.clone();
-    aloo::client::otp::handle_otp_command(
+    aloo::client::otp::handle_provisioning_command(
         &mut aloo::control::NullSink,
         &mut a.ui,
         &mut a.session,
         a.peer,
         peer_der,
+        aloo::crypto::otp::OtpPurpose::Live,
     )
     .await
     .expect("/otp should not fail for a pad-only pair");

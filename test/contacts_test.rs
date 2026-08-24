@@ -6,12 +6,13 @@
 use std::path::PathBuf;
 
 use aloo::client::contacts::{
-    InstallOtpKeyOutcome, OwnIdentity, delete_contact, gather_contact_rows, install_otp_key,
-    otp_contact_name_for,
+    InstallOtpKeyOutcome, OwnIdentity, PinIdentityCardOutcome, delete_contact, delete_otp_key,
+    gather_contact_rows, install_otp_key, otp_contact_name_for, pin_identity_card,
 };
 use aloo::client::idstore::IdStore;
 use aloo::client::otp_cli::{self, OtpCliConfig};
 use aloo::client::otp_store::OtpStore;
+use aloo::crypto::otp::OtpPurpose;
 use aloo::proto::KeyMode;
 
 const TEST_BITS: usize = 1024;
@@ -110,7 +111,7 @@ fn a_contact_pinned_without_a_readable_bundle_gets_a_key_derived_name() {
     pin(&mut id_store, "alice", b"not-a-bundle", KeyMode::PqHybrid);
     let me = own_identity();
     assert_eq!(
-        otp_contact_name_for(&id_store, "alice", me.as_identity()),
+        otp_contact_name_for(&id_store, "alice", me.as_identity(), OtpPurpose::Live),
         Some(aloo::crypto::otp::contact_name_for_keys(
             &me.der,
             b"not-a-bundle"
@@ -126,7 +127,7 @@ fn a_pq_hybrid_pinned_contact_is_otp_eligible() {
     let der = pq_public_der();
     pin(&mut id_store, "alice", &der, KeyMode::PqHybrid);
     let me = own_identity();
-    let name = otp_contact_name_for(&id_store, "alice", me.as_identity());
+    let name = otp_contact_name_for(&id_store, "alice", me.as_identity(), OtpPurpose::Live);
     assert_eq!(
         name,
         Some(aloo::crypto::otp::contact_name_for(
@@ -143,7 +144,7 @@ fn a_pq_hybrid_pinned_contact_is_otp_eligible() {
 fn an_unpinned_nickname_resolves_to_no_name_at_all() {
     let id_store = IdStore::new_empty(scratch_dir("nickname-unpinned"));
     assert_eq!(
-        otp_contact_name_for(&id_store, "nobody", own_identity().as_identity()),
+        otp_contact_name_for(&id_store, "nobody", own_identity().as_identity(), OtpPurpose::Live),
         None
     );
 }
@@ -259,7 +260,7 @@ async fn deleting_a_provisioned_otp_contact_removes_the_keychain_entry_too() {
     pin(&mut id_store, "alice", &der, KeyMode::PqHybrid);
     let me = own_identity();
     let contact_name =
-        otp_contact_name_for(&id_store, "alice", me.as_identity()).unwrap();
+        otp_contact_name_for(&id_store, "alice", me.as_identity(), OtpPurpose::Live).unwrap();
 
     let (enc, dec) = make_key_pair(&cfg, &contact_name).await;
     otp_cli::add_contact(&cfg, &contact_name, &enc, &dec)
@@ -313,7 +314,7 @@ async fn installing_on_a_contact_with_an_unreadable_pin_is_allowed() {
     let mut otp_store = OtpStore::new_empty(scratch_dir("install-nonpq-otp"));
     let cfg = otp_cli_config("install-nonpq");
     let me = own_identity();
-    let contact_name = otp_contact_name_for(&id_store, "alice", me.as_identity()).unwrap();
+    let contact_name = otp_contact_name_for(&id_store, "alice", me.as_identity(), OtpPurpose::Live).unwrap();
 
     let (enc, dec) = make_key_pair(&cfg, &contact_name).await;
     let outcome = install_otp_key(
@@ -322,6 +323,7 @@ async fn installing_on_a_contact_with_an_unreadable_pin_is_allowed() {
         &cfg,
         me.as_identity(),
         "alice",
+        OtpPurpose::Live,
         &enc,
         &dec,
     )
@@ -355,6 +357,7 @@ async fn installing_with_a_missing_key_file_is_an_error_and_installs_nothing() {
         &cfg,
         me.as_identity(),
         "alice",
+        OtpPurpose::Live,
         &cfg.working_dir.join("no-such-enc.key"),
         &cfg.working_dir.join("no-such-dec.key"),
     )
@@ -364,7 +367,7 @@ async fn installing_with_a_missing_key_file_is_an_error_and_installs_nothing() {
         other => panic!("expected Error, got {other:?}"),
     }
     let contact_name =
-        otp_contact_name_for(&id_store, "alice", me.as_identity()).unwrap();
+        otp_contact_name_for(&id_store, "alice", me.as_identity(), OtpPurpose::Live).unwrap();
     assert!(!otp_cli::has_contact(&cfg, &contact_name).await.unwrap());
 }
 
@@ -380,7 +383,7 @@ async fn installing_with_real_key_files_succeeds_and_marks_the_contact_provision
     let cfg = otp_cli_config("install-ok");
     let me = own_identity();
     let contact_name =
-        otp_contact_name_for(&id_store, "alice", me.as_identity()).unwrap();
+        otp_contact_name_for(&id_store, "alice", me.as_identity(), OtpPurpose::Live).unwrap();
 
     let (enc, dec) = make_key_pair(&cfg, &contact_name).await;
     let outcome = install_otp_key(
@@ -389,6 +392,7 @@ async fn installing_with_real_key_files_succeeds_and_marks_the_contact_provision
         &cfg,
         me.as_identity(),
         "alice",
+        OtpPurpose::Live,
         &enc,
         &dec,
     )
@@ -413,4 +417,188 @@ async fn installing_with_real_key_files_succeeds_and_marks_the_contact_provision
     assert_eq!(otp.enc_sequence, 0);
     assert_eq!(otp.dec_sequence, 0);
     assert!(otp.enc_key_remaining > 0);
+}
+
+// ---------------------------------------------------------------------
+// install_otp_key: mail purpose is independent of the live key
+// ---------------------------------------------------------------------
+
+/// The same install path, run with `OtpPurpose::Mail`, must file the pad
+/// under the *mail* contact name - never colliding with a `Live` key
+/// installed for the same pair, and answering `otp_mail_contact_name`/
+/// `otp_mail` in `gather_contact_rows`, not `otp_contact_name`/`otp`.
+/// @requirement AC-295, TB-249
+#[tokio::test]
+async fn installing_a_mail_key_is_independent_of_the_live_key() {
+    if !require_otp() {
+        return;
+    }
+    let mut id_store = IdStore::new_empty(scratch_dir("install-mail"));
+    let der = pq_public_der();
+    pin(&mut id_store, "alice", &der, KeyMode::PqHybrid);
+    let mut otp_store = OtpStore::new_empty(scratch_dir("install-mail-otp"));
+    let cfg = otp_cli_config("install-mail");
+    let me = own_identity();
+
+    let live_name = otp_contact_name_for(&id_store, "alice", me.as_identity(), OtpPurpose::Live).unwrap();
+    let mail_name = otp_contact_name_for(&id_store, "alice", me.as_identity(), OtpPurpose::Mail).unwrap();
+    assert_ne!(live_name, mail_name, "the two purposes must never share a keychain name");
+
+    let (enc, dec) = make_key_pair(&cfg, &mail_name).await;
+    let outcome = install_otp_key(
+        &id_store,
+        &mut otp_store,
+        &cfg,
+        me.as_identity(),
+        "alice",
+        OtpPurpose::Mail,
+        &enc,
+        &dec,
+    )
+    .await;
+    assert_eq!(outcome, InstallOtpKeyOutcome::Ok);
+    assert!(otp_cli::has_contact(&cfg, &mail_name).await.unwrap());
+    assert!(
+        !otp_cli::has_contact(&cfg, &live_name).await.unwrap(),
+        "installing the mail key must not create a live-key entry too"
+    );
+
+    let rows = gather_contact_rows(&id_store, &cfg, me.as_identity()).await;
+    assert!(rows[0].otp.is_none(), "no live key was installed");
+    assert!(rows[0].otp_mail.is_some(), "the mail key shows up under its own field");
+}
+
+// ---------------------------------------------------------------------
+// delete_otp_key: one purpose only, identity pin untouched
+// ---------------------------------------------------------------------
+
+/// @requirement AC-300
+#[tokio::test]
+async fn delete_otp_key_removes_only_the_named_purpose() {
+    if !require_otp() {
+        return;
+    }
+    let mut id_store = IdStore::new_empty(scratch_dir("delete-one-purpose-ids"));
+    let der = pq_public_der();
+    pin(&mut id_store, "alice", &der, KeyMode::PqHybrid);
+    let mut otp_store = OtpStore::new_empty(scratch_dir("delete-one-purpose-otp"));
+    let cfg = otp_cli_config("delete-one-purpose");
+    let me = own_identity();
+
+    // Two *distinct* real key pairs - the real `otp` binary itself refuses
+    // installing the same key material under two different contacts (a
+    // pad reused across contacts is a broken one-time pad), so each
+    // purpose needs its own, generated in its own scratch dir.
+    for purpose in [OtpPurpose::Live, OtpPurpose::Mail] {
+        let gen_cfg = otp_cli_config(&format!("delete-one-purpose-gen-{}", purpose.label()));
+        let (enc, dec) = make_key_pair(&gen_cfg, purpose.label()).await;
+        let outcome =
+            install_otp_key(&id_store, &mut otp_store, &cfg, me.as_identity(), "alice", purpose, &enc, &dec)
+                .await;
+        assert_eq!(outcome, InstallOtpKeyOutcome::Ok);
+    }
+    let live_name = otp_contact_name_for(&id_store, "alice", me.as_identity(), OtpPurpose::Live).unwrap();
+    let mail_name = otp_contact_name_for(&id_store, "alice", me.as_identity(), OtpPurpose::Mail).unwrap();
+
+    let removed =
+        delete_otp_key(&id_store, &mut otp_store, &cfg, me.as_identity(), "alice", OtpPurpose::Mail).await;
+    assert!(removed);
+    assert!(!otp_cli::has_contact(&cfg, &mail_name).await.unwrap(), "the mail key is gone");
+    assert!(
+        otp_cli::has_contact(&cfg, &live_name).await.unwrap(),
+        "the live key is untouched by a mail-purpose delete"
+    );
+    assert!(id_store.get("alice").is_some(), "the identity pin itself is never touched");
+}
+
+/// @requirement AC-300
+#[tokio::test]
+async fn delete_otp_key_on_a_purpose_with_nothing_installed_reports_nothing_removed() {
+    let mut id_store = IdStore::new_empty(scratch_dir("delete-nothing-ids"));
+    let der = pq_public_der();
+    pin(&mut id_store, "alice", &der, KeyMode::PqHybrid);
+    let mut otp_store = OtpStore::new_empty(scratch_dir("delete-nothing-otp"));
+    let cfg = otp_cli_config("delete-nothing");
+    let me = own_identity();
+
+    let removed =
+        delete_otp_key(&id_store, &mut otp_store, &cfg, me.as_identity(), "alice", OtpPurpose::Mail).await;
+    assert!(!removed);
+}
+
+// ---------------------------------------------------------------------
+// pin_identity_card: PQH's manual "Create key"
+// ---------------------------------------------------------------------
+
+fn write_identity_card(dir: &std::path::Path, nickname: &str) -> (PathBuf, aloo::crypto::pq::PqPublicBundle) {
+    let (public, private) = aloo::crypto::pq::generate_bundle_with_bits(TEST_BITS)
+        .expect("generating a pq_hybrid bundle");
+    let card = aloo::crypto::pq::make_identity_card(&private, &public, nickname)
+        .expect("signing an identity card");
+    let path = dir.join(format!("{nickname}.card"));
+    aloo::crypto::pq::save_identity_card(&card, &path).expect("saving the card");
+    (path, public)
+}
+
+/// @requirement AC-301
+#[test]
+fn pinning_a_matching_identity_card_pins_it_as_verified_pq_hybrid() {
+    let dir = scratch_dir("pin-card-ok");
+    let (path, public) = write_identity_card(&dir, "alice");
+    let mut id_store = IdStore::new_empty(dir.join("ids_store"));
+
+    let outcome = pin_identity_card(&mut id_store, "alice", &path);
+    assert_eq!(outcome, PinIdentityCardOutcome::Ok);
+    assert_eq!(id_store.key_mode("alice"), Some(KeyMode::PqHybrid));
+    assert_eq!(id_store.trust("alice"), Some(aloo::client::idstore::Trust::Verified));
+    assert_eq!(id_store.pinned_from("alice"), Some(path.as_path()));
+    let expected_der = aloo::proto::encode(&public).unwrap();
+    assert_eq!(id_store.get("alice"), Some(expected_der.as_slice()));
+}
+
+/// @requirement AC-301
+#[test]
+fn pinning_a_card_for_a_different_nickname_is_refused() {
+    let dir = scratch_dir("pin-card-mismatch");
+    let (path, _public) = write_identity_card(&dir, "alice");
+    let mut id_store = IdStore::new_empty(dir.join("ids_store"));
+
+    let outcome = pin_identity_card(&mut id_store, "bob", &path);
+    match outcome {
+        PinIdentityCardOutcome::NicknameMismatch { card_nickname } => {
+            assert_eq!(card_nickname, "alice");
+        }
+        other => panic!("expected NicknameMismatch, got {other:?}"),
+    }
+    assert!(id_store.get("bob").is_none(), "a mismatched card is never pinned");
+}
+
+/// @requirement AC-301
+#[test]
+fn pinning_a_missing_file_is_invalid_not_a_panic() {
+    let dir = scratch_dir("pin-card-missing");
+    let mut id_store = IdStore::new_empty(dir.join("ids_store"));
+
+    let outcome = pin_identity_card(&mut id_store, "alice", &dir.join("no-such.card"));
+    match outcome {
+        PinIdentityCardOutcome::Invalid(_) => {}
+        other => panic!("expected Invalid, got {other:?}"),
+    }
+}
+
+/// @requirement AC-301
+#[test]
+fn pinning_a_card_upgrades_an_existing_direct_framed_pin() {
+    let dir = scratch_dir("pin-card-upgrade");
+    let (path, public) = write_identity_card(&dir, "alice");
+    let mut id_store = IdStore::new_empty(dir.join("ids_store"));
+    // Starts out pinned via a raw Direct-framed key, no pq_hybrid at all -
+    // the ❌PQH badge state this action exists to fix.
+    id_store.check_and_pin("alice", b"some-raw-pinned-key");
+    assert_eq!(id_store.key_mode("alice"), None);
+
+    let outcome = pin_identity_card(&mut id_store, "alice", &path);
+    assert_eq!(outcome, PinIdentityCardOutcome::Ok);
+    let expected_der = aloo::proto::encode(&public).unwrap();
+    assert_eq!(id_store.get("alice"), Some(expected_der.as_slice()));
 }

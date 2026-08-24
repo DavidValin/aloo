@@ -124,6 +124,38 @@ pub fn contact_name_if_active(session: &SessionState, peer_pubkey_der: &[u8]) ->
         .map(|_| contact_name)
 }
 
+/// What every *new* outgoing send (text, a voice recording, a file, a
+/// call's own eligibility) must check before riding the pad -
+/// `contact_name_if_active` alone answers "is a pad provisioned for this
+/// pair", not "should this specific send use it right now", and those two
+/// stopped being the same question the moment `/endotp` could pause a
+/// session without erasing its pad (`handle_end_otp_command`'s doc: kept
+/// on purpose, so `/otp` later resumes the identical key). Using
+/// `contact_name_if_active` alone here left every one of those four
+/// things believing a paused session was still live forever afterward -
+/// text/file/voice kept spending the paused pad, and `/call` stayed
+/// refused - since nothing about pausing touches `provisioned`.
+///
+/// A `Direct`-framed (pad-only) pair is the one case where that shortcut
+/// is still exactly right: with no `pq_hybrid` identity on either side
+/// there is no plain channel to fall back to at all, so for that pair
+/// provisioned and active are the same thing by construction - the pad
+/// *is* the relationship (`register_pad_only_peer`'s own doc). Only a
+/// `PqWrapped` pair - which has pq_hybrid to fall back to - needs the live
+/// toggle (`UiState::is_otp_active`) consulted at all.
+pub fn contact_name_for_sending(
+    session: &SessionState,
+    ui_state: &UiState,
+    peer: UserId,
+    peer_pubkey_der: &[u8],
+) -> Option<String> {
+    let contact_name = contact_name_if_active(session, peer_pubkey_der)?;
+    if framing_for(&session.otp_own_pinned_der, peer_pubkey_der) == OtpFraming::Direct {
+        return Some(contact_name);
+    }
+    ui_state.is_otp_active(peer).then_some(contact_name)
+}
+
 /// Checks `otp --has-contact <contact_name>` when `/otp` runs - if a
 /// keychain entry already exists (the user provisioned it themselves
 /// out-of-band, or a previous session's handshake already completed), it's
@@ -363,12 +395,14 @@ pub async fn initiate_provisioning(
     size_mb: u32,
     own_fp: &[u8; 32],
     peer_fp: &[u8; 32],
+    purpose: crypto::otp::OtpPurpose,
 ) -> Option<crypto::otp::OtpKeySetupPayload> {
     initiate_provisioning_with_progress(
         cfg,
         size_mb,
         own_fp,
         peer_fp,
+        purpose,
         |_, _| {},
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     )
@@ -384,10 +418,19 @@ pub async fn initiate_provisioning_with_progress(
     size_mb: u32,
     own_fp: &[u8; 32],
     peer_fp: &[u8; 32],
+    purpose: crypto::otp::OtpPurpose,
     on_progress: impl FnMut(u64, u64),
     cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Option<crypto::otp::OtpKeySetupPayload> {
-    let contact_name = crypto::otp::contact_name_for(own_fp, peer_fp);
+    // The one line this whole function exists to get right: a fresh mail
+    // key must never be staged (and therefore never later installed or
+    // streamed) under the *live* session's contact name, even though every
+    // other step here - generation, staging, digesting - has no idea
+    // purpose exists at all.
+    let contact_name = match purpose {
+        crypto::otp::OtpPurpose::Live => crypto::otp::contact_name_for(own_fp, peer_fp),
+        crypto::otp::OtpPurpose::Mail => crypto::otp::contact_name_for_mail(own_fp, peer_fp),
+    };
     let name_a = format!("{contact_name}_a");
     let name_b = format!("{contact_name}_b");
 
@@ -604,6 +647,12 @@ pub fn format_now() -> String {
 /// ends in an explicit accept/reject by **both** sides before anything is
 /// considered active - see the module doc.
 ///
+/// Shared with `/new-otp-mail-key` (`UiAction::RequestOtpMailKey`) via
+/// `purpose` - the two commands run the identical consent/generate/transfer
+/// machinery, differing only in which keychain contact name it ends up
+/// naming (`crypto::otp::contact_name_for_peer`/`_mail`) and how it labels
+/// itself to the user (`OtpPurpose::label`).
+///
 /// - No local keychain entry yet: opens `ui_state.otp_generate_confirm`, a
 ///   local Yes/No decision (`confirm_generate`/`cancel_generate` handle the
 ///   answer) - generating and sharing a fresh pad is never done without
@@ -613,24 +662,56 @@ pub fn format_now() -> String {
 ///   it (`on_session_request`/the invite popup) before either side shows
 ///   "started", so a stale or one-sided local entry can never be silently
 ///   assumed to still work.
-pub async fn handle_otp_command(
+///
+/// **Concurrency**: most of the state this drives is keyed by keychain
+/// contact name, which is already purpose-distinct, so a live and a mail
+/// handshake with two *different* peers never interfere. But a handful of
+/// in-flight-transfer bookkeeping (`otp_incoming_setup`/`otp_incoming_pads`/
+/// `otp_outgoing_pads`, and the invite queue) is keyed by peer alone, so a
+/// live and a mail handshake to the *same* peer at the same time would
+/// collide. Rather than threading purpose through all of that too, a second
+/// handshake (of either purpose) is simply refused while one is already
+/// outstanding with that peer.
+pub async fn handle_provisioning_command(
     wr: &mut impl crate::control::ControlSink,
     ui_state: &mut UiState,
     session: &mut SessionState,
     peer: UserId,
     peer_pubkey_der: Vec<u8>,
+    purpose: crypto::otp::OtpPurpose,
 ) -> proto::Result<()> {
     let peer_name = ui_state
         .known_users
         .get(&peer)
         .map(|u| u.name.clone())
         .unwrap_or_default();
-    let Some(contact_name) = contact_name_for_peer(session, &peer_pubkey_der) else {
+    let label = purpose.label();
+
+    if session.otp_incoming_setup.contains_key(&peer)
+        || session.otp_incoming_pads.contains_key(&peer)
+        || session.otp_outgoing_pads.contains_key(&peer)
+        || ui_state.has_otp_invite_from(peer)
+    {
         notify(
             ui_state,
             peer,
             &peer_name,
-            "OTP session failed: could not read this peer's identity".to_string(),
+            format!("a key exchange with {peer_name} is already in progress"),
+            false,
+        );
+        return Ok(());
+    }
+
+    let contact_name = match purpose {
+        crypto::otp::OtpPurpose::Live => contact_name_for_peer(session, &peer_pubkey_der),
+        crypto::otp::OtpPurpose::Mail => contact_name_for_peer_mail(session, &peer_pubkey_der),
+    };
+    let Some(contact_name) = contact_name else {
+        notify(
+            ui_state,
+            peer,
+            &peer_name,
+            format!("{label} failed: could not read this peer's identity"),
             false,
         );
         return Ok(());
@@ -641,8 +722,9 @@ pub async fn handle_otp_command(
             ui_state,
             peer,
             &peer_name,
-            "OTP session failed: the 'otp' command isn't installed - see github.com/DavidValin/otp-toolkit"
-                .to_string(),
+            format!(
+                "{label} failed: the 'otp' command isn't installed - see github.com/DavidValin/otp-toolkit"
+            ),
             false,
         );
         return Ok(());
@@ -665,6 +747,25 @@ pub async fn handle_otp_command(
     let already_have_key =
         detect_or_adopt_existing(&session.otp_cli_cfg, &mut session.otp_store, &contact_name).await;
 
+    // Mail has no "session" to resume or reconfirm - unlike `/otp`, which
+    // legitimately re-sends `OtpSessionRequest` even when a key already
+    // exists (that round trip is what turns the *session* on again after
+    // `/endotp`), a mail key is either usable or it isn't, and one call to
+    // `check_recipient` at compose time already answers that. So once one
+    // exists, `/new-otp-mail-key` has nothing left to do - refused locally,
+    // no network involved, before either the pad-only or resume branches
+    // below get a chance to send anything.
+    if purpose == crypto::otp::OtpPurpose::Mail && already_have_key {
+        notify(
+            ui_state,
+            peer,
+            &peer_name,
+            "otp mail key already exists. use /mail or delete existing in /contacts".to_string(),
+            false,
+        );
+        return Ok(());
+    }
+
     // Under `Direct` framing there is no channel to share a freshly
     // generated pad over - the handshake that carries one is itself an
     // ordinary `pq_hybrid` send, and this peer announced no bundle to seal
@@ -679,10 +780,11 @@ pub async fn handle_otp_command(
             ui_state,
             peer,
             &peer_name,
-            "OTP session failed: this peer announced no pq_hybrid identity, so a pad cannot be \
-             shared over the network - generate one with 'otp --new-key-pair' and install it on \
-             both sides from /contacts (o)"
-                .to_string(),
+            format!(
+                "{label} failed: this peer announced no pq_hybrid identity, so a pad cannot be \
+                 shared over the network - generate one with 'otp --new-key-pair' and install it \
+                 on both sides from /contacts (o)"
+            ),
             false,
         );
         return Ok(());
@@ -695,16 +797,22 @@ pub async fn handle_otp_command(
     // accepts it, and their acknowledgement (§16.2) is the only consent a
     // pad-only pair can express or needs to.
     if framing_for(&session.otp_own_pinned_der, &peer_pubkey_der) == OtpFraming::Direct {
-        ui_state.mark_otp_active(peer);
-        refresh_otp_key_status(&session.otp_cli_cfg, ui_state, peer, &contact_name).await;
-        notify(
-            ui_state,
-            peer,
-            &peer_name,
-            "OTP session started (pad-only pair - every message to them now rides the pad)"
-                .to_string(),
-            true,
-        );
+        let message = match purpose {
+            // `mark_otp_active`/the key-status header are live-session
+            // concepts (the shield prefix, the seq/offset header) - mail
+            // has no "active" toggle at all, it just checks the key exists
+            // (`check_recipient`) whenever a mail is composed.
+            crypto::otp::OtpPurpose::Live => {
+                ui_state.mark_otp_active(peer);
+                refresh_otp_key_status(&session.otp_cli_cfg, ui_state, peer, &contact_name).await;
+                "OTP session started (pad-only pair - every message to them now rides the pad)"
+                    .to_string()
+            }
+            crypto::otp::OtpPurpose::Mail => {
+                format!("{label} ready (pad-only pair) - mail to {peer_name} now uses it")
+            }
+        };
+        notify(ui_state, peer, &peer_name, message, true);
         return Ok(());
     }
 
@@ -719,7 +827,7 @@ pub async fn handle_otp_command(
                 ui_state,
                 peer,
                 &peer_name,
-                "OTP session failed: could not encode the session request".to_string(),
+                format!("{label} failed: could not encode the session request"),
                 false,
             );
             return Ok(());
@@ -739,7 +847,7 @@ pub async fn handle_otp_command(
                 ui_state,
                 peer,
                 &peer_name,
-                "OTP session failed: could not encrypt the session request".to_string(),
+                format!("{label} failed: could not encrypt the session request"),
                 false,
             );
             return Ok(());
@@ -762,7 +870,7 @@ pub async fn handle_otp_command(
             ui_state,
             peer,
             &peer_name,
-            link_readiness_notice(readiness, &peer_name),
+            link_readiness_notice(readiness, &peer_name, purpose),
             true,
         );
     } else {
@@ -793,7 +901,7 @@ pub async fn handle_otp_command(
         session.otp_incoming_setup.remove(&peer);
         ui_state.take_otp_invite_from(peer);
 
-        ui_state.open_otp_generate_confirm(peer, peer_name, peer_pubkey_der);
+        ui_state.open_otp_generate_confirm(peer, peer_name, peer_pubkey_der, purpose);
         // A decision popup just opened - chime, like every popup that
         // asks the user for an action does (the file-offer precedent).
         crate::client::voice_stream::play_bell_chime(session);
@@ -832,6 +940,8 @@ async fn send_session_request(
     contact_name: &str,
     pad_size_mb: Option<u32>,
 ) -> bool {
+    let purpose = crypto::otp::OtpPurpose::of_contact_name(contact_name);
+    let label = purpose.label();
     let payload = crypto::otp::OtpSessionRequestPayload {
         contact_name: contact_name.to_string(),
         pad_size_mb,
@@ -841,7 +951,7 @@ async fn send_session_request(
             ui_state,
             peer,
             peer_name,
-            "OTP session failed: could not encode the session request".to_string(),
+            format!("{label} failed: could not encode the session request"),
             false,
         );
         return false;
@@ -861,7 +971,7 @@ async fn send_session_request(
             ui_state,
             peer,
             peer_name,
-            "OTP session failed: could not encrypt the session request".to_string(),
+            format!("{label} failed: could not encrypt the session request"),
             false,
         );
         return false;
@@ -879,7 +989,7 @@ async fn send_session_request(
         ui_state,
         peer,
         peer_name,
-        link_readiness_notice(readiness, peer_name),
+        link_readiness_notice(readiness, peer_name, purpose),
         true,
     );
     true
@@ -999,7 +1109,7 @@ pub(crate) async fn begin_promised_generation(
     let Some(peer_fp) = crypto::pq::fingerprint_of_encoded(&pending.pubkey_der) else {
         return;
     };
-    ui_state.open_otp_keygen(pending.peer, pending.peer_name.clone(), size_mb);
+    ui_state.open_otp_keygen(pending.peer, pending.peer_name.clone(), size_mb, pending.purpose);
     let cfg = session.otp_cli_cfg.clone();
     let tx = session.otp_keygen_tx.clone();
     // One flag per peer, shared with the transfer worker that follows, so
@@ -1017,6 +1127,7 @@ pub(crate) async fn begin_promised_generation(
             size_mb,
             &own_fp,
             &peer_fp,
+            pending.purpose,
             move |written, total| {
                 let _ = progress_tx.send(OtpKeygenEvent::Progress {
                     written_bytes: written,
@@ -1185,13 +1296,18 @@ pub fn transfer_estimate_text(size_mb: u32) -> String {
 /// means it's held in the link's own queue until punching finishes - not
 /// lost, but not sent yet either, and previously indistinguishable from
 /// nothing having happened at all.
-fn link_readiness_notice(readiness: crate::client::p2p::LinkReadiness, peer_name: &str) -> String {
+fn link_readiness_notice(
+    readiness: crate::client::p2p::LinkReadiness,
+    peer_name: &str,
+    purpose: crypto::otp::OtpPurpose,
+) -> String {
+    let label = purpose.label();
     match readiness {
         crate::client::p2p::LinkReadiness::Active => {
-            format!("OTP: setup sent to {peer_name}, waiting for their confirmation...")
+            format!("{label}: setup sent to {peer_name}, waiting for their confirmation...")
         }
         crate::client::p2p::LinkReadiness::Pending => format!(
-            "OTP: still establishing a direct connection to {peer_name} - will send as soon as it's up"
+            "{label}: still establishing a direct connection to {peer_name} - will send as soon as it's up"
         ),
     }
 }
@@ -1545,6 +1661,51 @@ pub fn own_pad_wins_glare(own_fp: &[u8; 32], peer_fp: &[u8; 32]) -> bool {
     own_fp < peer_fp
 }
 
+/// What every point a provisioning handshake can converge from -
+/// `accept_invite`, `on_key_setup_ack`, `on_pad_verify`, `on_pad_commit` -
+/// does once the key is genuinely usable on this side: derives `purpose`
+/// from `contact_name` (never trusted from anywhere else, since these are
+/// the four functions that just finished writing the keychain entry that
+/// name points at) and only marks the *live* session active - `is_otp_active`,
+/// the DM's 🔑 tag, the key-status header - for `OtpPurpose::Live`. Mail has
+/// no "active" toggle at all: it just checks the key exists
+/// (`otp_mail::check_recipient`) whenever a mail is composed, so marking it
+/// active here would do nothing for `/mail` but would wrongly route every
+/// *ordinary* DM to this peer through the mail pad instead of `pq_hybrid` -
+/// exactly the bug this function exists to prevent.
+async fn finish_provisioning(
+    cfg: &OtpCliConfig,
+    ui_state: &mut UiState,
+    peer: UserId,
+    peer_name: &str,
+    contact_name: &str,
+) {
+    let purpose = crypto::otp::OtpPurpose::of_contact_name(contact_name);
+    let label = purpose.label();
+    match purpose {
+        crypto::otp::OtpPurpose::Live => {
+            ui_state.open_otp_session(peer);
+            refresh_otp_key_status(cfg, ui_state, peer, contact_name).await;
+            notify(
+                ui_state,
+                peer,
+                peer_name,
+                format!("{label} started at {}", format_now()),
+                true,
+            );
+        }
+        crypto::otp::OtpPurpose::Mail => {
+            notify(
+                ui_state,
+                peer,
+                peer_name,
+                format!("{label} ready - mail to {peer_name} now uses it"),
+                true,
+            );
+        }
+    }
+}
+
 pub(crate) async fn accept_invite(
     wr: &mut impl crate::control::ControlSink,
     session: &mut SessionState,
@@ -1666,21 +1827,14 @@ pub(crate) async fn accept_invite(
     .await;
 
     if accepted {
-        ui_state.open_otp_session(invite.from);
-        refresh_otp_key_status(
+        finish_provisioning(
             &session.otp_cli_cfg,
             ui_state,
             invite.from,
+            &invite.from_name,
             &invite.contact_name,
         )
         .await;
-        notify(
-            ui_state,
-            invite.from,
-            &invite.from_name,
-            format!("OTP session started at {}", format_now()),
-            true,
-        );
     } else {
         notify(
             ui_state,
@@ -1833,15 +1987,8 @@ pub(crate) async fn on_key_setup_ack(
         session.otp_store.clear_pending_setup(&ack.contact_name);
         session.otp_store.mark_provisioned(&ack.contact_name);
         let _ = session.otp_store.save();
-        ui_state.open_otp_session(from);
-        refresh_otp_key_status(&session.otp_cli_cfg, ui_state, from, &ack.contact_name).await;
-        notify(
-            ui_state,
-            from,
-            &sender.name,
-            format!("OTP session started at {}", format_now()),
-            true,
-        );
+        finish_provisioning(&session.otp_cli_cfg, ui_state, from, &sender.name, &ack.contact_name)
+            .await;
         crate::client::session::daemon_otp_outcome(ui_state, session, from, true, "");
     } else if ack.reason.as_deref() == Some(NO_MATCHING_KEY_REASON) {
         let _ = otp_cli::remove_contact(&session.otp_cli_cfg, &ack.contact_name).await;
@@ -1852,6 +1999,7 @@ pub(crate) async fn on_key_setup_ack(
             from,
             sender.name.clone(),
             sender.public_key_der.clone(),
+            crypto::otp::OtpPurpose::of_contact_name(&ack.contact_name),
         );
         // Same chime every decision popup plays on arrival.
         crate::client::voice_stream::play_bell_chime(session);
@@ -2339,6 +2487,26 @@ pub(crate) fn contact_name_for_peer(session: &SessionState, peer_pubkey_der: &[u
             Some(crypto::otp::contact_name_for(&session.own_pq_fp, &peer_fp))
         }
         OtpFraming::Direct => Some(crypto::otp::contact_name_for_keys(
+            &session.otp_own_pinned_der,
+            peer_pubkey_der,
+        )),
+    }
+}
+
+/// `contact_name_for_peer`'s OTP-mail counterpart - same framing decision,
+/// but naming the mail-specific keychain contact (`crypto::otp::
+/// contact_name_for_mail`/`contact_name_for_keys_mail`) so mail never
+/// spends the pad a live `/otp` session would.
+pub(crate) fn contact_name_for_peer_mail(
+    session: &SessionState,
+    peer_pubkey_der: &[u8],
+) -> Option<String> {
+    match framing_for(&session.otp_own_pinned_der, peer_pubkey_der) {
+        OtpFraming::PqWrapped => {
+            let peer_fp = crypto::pq::fingerprint_of_encoded(peer_pubkey_der)?;
+            Some(crypto::otp::contact_name_for_mail(&session.own_pq_fp, &peer_fp))
+        }
+        OtpFraming::Direct => Some(crypto::otp::contact_name_for_keys_mail(
             &session.otp_own_pinned_der,
             peer_pubkey_der,
         )),
@@ -4473,6 +4641,8 @@ pub(crate) async fn start_pad_send(
         depth.clone(),
         cancelled.clone(),
     );
+    let (retransmits_at_start, peak_unacked_at_start) =
+        session.peer_link.link_diagnostics(to).unwrap_or((0, 0));
     session.otp_outgoing_pads.insert(
         to,
         OutgoingPad {
@@ -4480,6 +4650,9 @@ pub(crate) async fn start_pad_send(
             sent: false,
             depth,
             read_bytes: 0,
+            started_at: std::time::Instant::now(),
+            retransmits_at_start,
+            peak_unacked_at_start,
         },
     );
     // Generation just closed its own popup; this reopens it on the second
@@ -4491,12 +4664,13 @@ pub(crate) async fn start_pad_send(
         peer_name.to_string(),
         size_mb,
         crate::client::tui::ui::OtpPadPhase::Sending,
+        crypto::otp::OtpPurpose::of_contact_name(contact_name),
     );
     notify(
         ui_state,
         to,
         peer_name,
-        link_readiness_notice(readiness, peer_name),
+        link_readiness_notice(readiness, peer_name, crypto::otp::OtpPurpose::of_contact_name(contact_name)),
         true,
     );
 }
@@ -4537,6 +4711,7 @@ pub(crate) fn on_pad_start(
         crate::client::otp_staging::secure_remove_dir(&dir);
         return;
     };
+    let purpose = crypto::otp::OtpPurpose::of_contact_name(&contact_name);
     let key =
         crate::client::voice_stream::resolve_incoming_key(session, from, &sender.public_key_der);
     let job_tx = otp_pad::spawn_receive_pad_worker(
@@ -4560,6 +4735,7 @@ pub(crate) fn on_pad_start(
             dir,
             job_tx,
             received_bytes: 0,
+            started_at: std::time::Instant::now(),
         },
     );
     // The invitation cannot appear until all of this has arrived and both
@@ -4570,6 +4746,7 @@ pub(crate) fn on_pad_start(
         sender.name.clone(),
         keypair_size_mb,
         crate::client::tui::ui::OtpPadPhase::Receiving,
+        purpose,
     );
 }
 
@@ -4862,6 +5039,14 @@ pub(crate) async fn on_pad_event(
             }
             let contact_name = pad.contact_name.clone();
             let size_mb = pad.keypair_size_mb;
+            // Temporary diagnostic - see `on_pad_verify`'s matching one on
+            // the sending side. The receiver has no send window of its own
+            // to measure, so this is elapsed time only.
+            crate::log_warn!(
+                "pad receive from {}: {size_mb}MB per key arrived in {:.1}s",
+                peer_name_for(ui_state, from),
+                pad.started_at.elapsed().as_secs_f64(),
+            );
             let _ = (enc_digest, dec_digest);
             let from_name = peer_name_for(ui_state, from);
             // The transfer popup has done its job - what happens next is a
@@ -4931,7 +5116,22 @@ pub(crate) async fn on_pad_verify(
     dec_digest: crypto::otp::KeyDigest,
 ) {
     let peer_name = peer_name_for(ui_state, from);
-    session.otp_outgoing_pads.remove(&from);
+    if let Some(pad) = session.otp_outgoing_pads.remove(&from) {
+        // Temporary diagnostic: elapsed time plus the retransmit/window
+        // deltas since the transfer began, so a slow send can be told
+        // apart from a genuinely loss-stalled one (`p2p_reliable::ArqSender`'s
+        // own doc - no selective-repeat, so one lost frame in a large
+        // window stalls the whole thing until a retransmit timeout fires).
+        let elapsed = pad.started_at.elapsed();
+        let (retransmits_now, peak_unacked_now) =
+            session.peer_link.link_diagnostics(from).unwrap_or((0, 0));
+        crate::log_warn!(
+            "pad send to {peer_name} finished in {:.1}s: {} retransmits, peak window {} frames",
+            elapsed.as_secs_f64(),
+            retransmits_now.saturating_sub(pad.retransmits_at_start),
+            peak_unacked_now.max(pad.peak_unacked_at_start),
+        );
+    }
     // Whichever way they answered, this side has stopped waiting on the
     // link - the transfer popup comes down and the outcome is a notice.
     ui_state.close_otp_keygen_for(from);
@@ -5014,17 +5214,10 @@ pub(crate) async fn on_pad_verify(
     session.otp_store.mark_provisioned(&contact_name);
     session.otp_store.clear_pending_setup(&contact_name);
     let _ = session.otp_store.save();
+    finish_provisioning(&session.otp_cli_cfg, ui_state, from, &peer_name, &contact_name).await;
     session
         .peer_link
         .send_reliable_or_queue(from, P2pPayload::OtpPadCommit { contact_name });
-    ui_state.mark_otp_active(from);
-    notify(
-        ui_state,
-        from,
-        &peer_name,
-        format!("OTP session started at {}", format_now()),
-        true,
-    );
 }
 
 /// The sender's digests matched and it has installed - so this side may
@@ -5089,20 +5282,13 @@ pub(crate) async fn on_pad_commit(
         crypto::otp::pad_pair_digest(&pad.enc_digest, &pad.dec_digest),
     );
     let _ = session.otp_store.save();
-    session
-        .peer_link
-        .send_reliable_or_queue(from, P2pPayload::OtpPadCommitAck { contact_name });
-    ui_state.mark_otp_active(from);
     if let Some(peer) = ui_state.known_users.get(&from).cloned() {
         ui_state.open_private_room(peer);
     }
-    notify(
-        ui_state,
-        from,
-        &peer_name,
-        format!("OTP session started at {}", format_now()),
-        true,
-    );
+    finish_provisioning(&session.otp_cli_cfg, ui_state, from, &peer_name, &contact_name).await;
+    session
+        .peer_link
+        .send_reliable_or_queue(from, P2pPayload::OtpPadCommitAck { contact_name });
 }
 
 /// The receiver has installed - the exchange is over.

@@ -95,6 +95,7 @@ falling back to a server relay (§7.1).
 - [15. Sequences](#15-sequences)
 - [16. One-time-pad layer over `pq_hybrid`](#16-one-time-pad-layer-over-pq_hybrid)
   - [16.1 Turning it on, only once both sides explicitly agree](#161-turning-it-on-only-once-both-sides-explicitly-agree)
+  - [16.1.1 A second, independent key for OTP mail: `/new-otp-mail-key`](#1611-a-second-independent-key-for-otp-mail-new-otp-mail-key)
   - [16.2 Sending under the pad](#162-sending-under-the-pad)
   - [16.3 Session visibility in the DM log](#163-session-visibility-in-the-dm-log)
   - [16.4 Recovering a send whose ciphertext already left](#164-recovering-a-send-whose-ciphertext-already-left)
@@ -1203,15 +1204,24 @@ small hand-rolled reliable layer on top, carried
 inside `PunchDatagram::Reliable { seq, payload }`:
 
 - **Sender** (the sender): assigns an increasing `seq` to each outgoing
-  payload, retransmits on a timeout with capped exponential backoff
-  (400ms initial, doubling up to 3s), and after 10 retries with no ack
-  treats the link as dead - which per §7.1 means re-punching it, not
-  giving up on the content: anything still unacknowledged goes back onto
-  the pending queue to be re-sent once the link reopens.
+  payload, retransmits on a timeout with capped exponential backoff, and
+  after 10 retries with no ack treats the link as dead - which per §7.1
+  means re-punching it, not giving up on the content: anything still
+  unacknowledged goes back onto the pending queue to be re-sent once the
+  link reopens. The timeout itself is measured, not fixed: 400ms until the
+  first round-trip sample comes back (nothing is known about the path
+  yet), an RFC 6298-style estimate from the observed RTT after that
+  (`SRTT + 4*RTTVAR`, floored at 100ms so a fast/local path doesn't fire on
+  ordinary jitter, capped at 3s) - a lost frame to a nearby peer is
+  retransmitted in well under 400ms rather than waiting out a guess sized
+  for a much slower path. Only ever sampled from a frame that was never
+  itself retransmitted (Karn's algorithm - an ack for a retransmitted
+  frame can't say which transmission it belongs to), and reset whenever a
+  link is re-punched, since a new path may have entirely different timing.
 - **Receiver** (the receiver): acks every `Reliable` frame it sees
   immediately, even a duplicate or an out-of-order one; delivers frames to
   the application in order, buffering ones that arrive ahead of the
-  expected sequence (bounded to 64 buffered frames - exceeding that fails
+  expected sequence (bounded to 512 buffered frames - exceeding that fails
   the link rather than growing unbounded) and dropping duplicates.
 
 The sequence space belongs to one punched link: both sides restart it
@@ -2556,17 +2566,23 @@ byte difference reaches the review flow above.
 The store is a small flat file, one line per pinned nickname:
 
 ```
-<nickname><TAB><hex-encoded public_key_der><TAB><trust><TAB><last addr><TAB><last device id>\n
+<nickname><TAB><hex-encoded public_key_der><TAB><trust><TAB><last addr><TAB><last device id><TAB><last seen unix><TAB><key mode><TAB><pinned from>\n
 ```
 
-e.g. `alice\t30820122300d06092a864886f70d01010105000382010f00...\ttofu\t203.0.113.7:51820\t3f9a...\n` -
+e.g. `alice\t30820122300d06092a864886f70d01010105000382010f00...\ttofu\t203.0.113.7:51820\t3f9a...\t1700000000\tpqhybrid\t\n` -
 the full DER bytes, lowercase-hex-encoded (lowercase hex, the same
 encoding the fingerprint already uses, not base64 or raw bytes) so
 the file stays plain text no matter what the key bytes are; `trust` is
 `tofu` or `verified` (§12.6); `last addr`/`last device id` are §12.7's
-last-seen values, either or both left empty until they have something to
-record. Entries are written in sorted-by-nickname order on save so the
-file diffs cleanly under version control or manual inspection.
+last-seen values; `last seen unix` is when that pair was last recorded
+(the contacts list's "last seen" column); `key mode` is the pin's
+`KeyMode`, `pqhybrid` or empty; `pinned from` is the identity-card file
+path an imported pin (§12.6's "Importing one") came from, empty for
+every pin that arrived over the wire instead. Every column from `last
+addr` on is independently optional on the way in, so a store written
+before any of them existed still loads correctly. Entries are written in
+sorted-by-nickname order on save so the file diffs cleanly under version
+control or manual inspection.
 
 A nickname containing a tab, `\n`, or `\r` is never pinned (silently
 treated as if it were a first-ever sighting, with nothing written) - a
@@ -2686,6 +2702,14 @@ A card is self-signed, which is precisely what it claims: whoever holds
 these keys asked to be known by this name. What makes it worth trusting is
 the channel it arrived over, not the signature - the signature only ensures
 that what arrived is what was sent.
+
+**Importing one.** The PQH key's "Create key" action on `/contacts`' key
+details popup (docs/SPEC.md "Contacts") opens a file browser for a card
+file; the card is refused, and nothing is pinned, unless its own attested
+nickname matches the contact row it was opened from exactly - a card
+always *upgrades* an existing row's identity rather than ever creating a
+new one. The file it came from is recorded (`id_store`'s `pinned_from`
+column, §12.5) purely for display in that same popup.
 
 **What remains open.** None of this authenticates a first contact that
 arrives with no card and no prior pin; that is still trust-on-first-use,
@@ -3565,6 +3589,55 @@ reason - including a genuinely offline/never-provisioned peer's plain
 reject - is left alone; this recovery is specifically for the one case
 that is otherwise a permanent dead end.
 
+### 16.1.1 A second, independent key for OTP mail: `/new-otp-mail-key`
+
+Everything above provisions the *live* session key - the one `/otp`
+proposes and a live send/receive spends. OTP mail (§17) never spends that
+key: it has its own, entirely independent one, provisioned the same way
+but under `/new-otp-mail-key` instead of `/otp`.
+
+`/new-otp-mail-key` runs through the identical state machine §16.1
+describes for the *generate-and-share* case - the same consent popups, the
+same streamed transfer and two-phase commit, the same glare resolution -
+parameterized only by *purpose* (`OtpPurpose::Live` for `/otp`,
+`OtpPurpose::Mail` for `/new-otp-mail-key`). What changes is the keychain
+contact name each files its result under: mail's own name is the live
+name with a `mail-` prefix (`crypto::otp::contact_name_for_mail`/
+`contact_name_for_keys_mail`), which can never collide with a live one,
+since a live name is always lowercase hex plus a `-`. Every
+keychain-name-keyed structure - `OtpStore`, the pending-setup directory,
+every `otp` CLI call - is isolated between the two purposes purely by
+that name, with nothing else to change.
+
+**"Already have a key" means something different for each purpose.** For
+`/otp`, a key already existing is not the end of it: a live session is a
+mutual on/off state that can be paused (`/endotp`) and resumed, so
+`/otp` still sends `OtpSessionRequest` to reconfirm/restart it even when
+the keychain entry is already there. Mail has no such state at all - a
+mail key is either usable or it isn't, and one `check_recipient` call at
+compose time (§17.1) already answers that - so `/new-otp-mail-key` on a
+contact that already has a mail key is refused *locally*, with no network
+round trip at all: "otp mail key already exists. use /mail or delete
+existing in /contacts".
+
+A pair may hold a live key, a mail key, both, or neither, in any
+combination; installing, generating, or losing one never touches the
+other. A pair's own popups (the generate/accept confirm, the size prompt,
+the keygen/transfer spinner) always name which of the two is under way -
+"OTP session" or "OTP mail key" - so the two are never visually
+confusable mid-handshake.
+
+**Concurrency scope.** Fully isolating every piece of shared provisioning
+state per purpose (so a live and a mail handshake with the *same* peer
+could run genuinely at once) would be a substantially larger change than
+the feature itself needs. Instead, a second provisioning handshake - of
+either purpose - with a peer who already has one in flight (a queued
+invite from them, or an in-flight incoming/outgoing transfer on this side)
+is refused outright, with a plain notice naming the peer. Two different
+peers may each provision independently at the same time; only a second
+attempt at the *same* peer is refused, and the existing exchange is left
+completely untouched by the refusal.
+
 ### 16.2 Sending under the pad
 
 Once active, a send to that contact goes through the pad, and carries a
@@ -4117,17 +4190,34 @@ checked live as the field is typed:
 1. **A pinned user with that nickname** (§12) whose pinned key is a
    `pq_hybrid` bundle - the pin is what the mail's addressing and
    verification anchor to, not the nickname string.
-2. **An `otp` keychain contact for the pair** (the same
-   fingerprint-derived contact name §16 uses), whose encryption key has
-   **more bytes remaining than the whole encoded mail**. The compose view
-   shows the remaining key (in MB) and re-derives it continuously as text
-   is typed and recordings/attachments are added or removed; an
-   attachment that would not fit the remaining key is refused at the
-   moment of attaching, and the send path re-measures the real encoded
-   size before any pad is spent.
+2. **An `otp` keychain contact under mail's own, independent contact name**
+   (§16.1.1 - never the live session's name, even when both exist for the
+   same pair), whose encryption key has **more bytes remaining than the
+   whole encoded mail**. The compose view shows the remaining key (in MB)
+   and re-derives it continuously as text is typed and
+   recordings/attachments are added or removed; an attachment that would
+   not fit the remaining key is refused at the moment of attaching, and
+   the send path re-measures the real encoded size before any pad is
+   spent.
 
-There is no key-material negotiation here: if no pad exists for the pair,
-the answer is §16.1's provisioning flow, not anything mail-specific.
+There is no key-material negotiation here: if no mail key exists for the
+pair, the answer is `/new-otp-mail-key` (§16.1.1), never `/otp` - a live
+session key is never substituted for a missing mail one, no matter how
+much of it remains unspent.
+
+**The hard gate.** A recipient with no mail key is not merely shown as
+invalid: the entire compose view is blocked outright. A centered, red
+modal reads "no otp mail key available for &lt;nickname&gt; - install one
+manually from /contacts or exchange one with the user if he is online
+using /new-otp-mail-key (requires pinned contact)", rendered over the
+compose view still visible underneath. Every key but Escape is absorbed -
+typing, attaching, Ctrl+S all do nothing while it is showing - and Escape
+closes the modal *and* the whole compose view together, in the one step;
+there is no way to edit the recipient in place and continue, since fixing
+this means installing or exchanging a key first (`/contacts` - see
+docs/SPEC.md "Contacts" - or `/new-otp-mail-key`) and opening a fresh
+`/mail` afterward. A recipient whose mail key is ready is never blocked
+by this at all.
 
 ### 17.2 Uploading: the mail's pad spend, and the storage acknowledgement
 

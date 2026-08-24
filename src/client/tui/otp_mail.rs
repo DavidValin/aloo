@@ -524,6 +524,24 @@ impl UiState {
         modifiers: KeyModifiers,
         kind: KeyEventKind,
     ) -> Option<UiAction> {
+        // A recipient with no OTP mail key blocks the entire compose form -
+        // typing, attaching, recording, everything - checked ahead of every
+        // other branch below. Esc is the only key that does anything, and
+        // it closes the whole view in one step (not just this gate): there
+        // is nothing to "go back" to here, since fixing this means
+        // installing a key from /contacts or /new-otp-mail-key and starting
+        // a fresh /mail, not editing the current recipient in place.
+        if self
+            .otp_mail
+            .as_ref()
+            .is_some_and(|m| matches!(m.compose.check, Some(RecipientCheck::NoMailKey)))
+        {
+            if kind == KeyEventKind::Press && code == KeyCode::Esc {
+                self.otp_mail = None;
+            }
+            return None;
+        }
+
         // Hold-Space voice recording, only while the attachments pane has
         // focus (a space in To/Subtext/Content is just a typed character).
         // Mirrors `handle_key`'s Space branch exactly - same flags, same
@@ -1051,6 +1069,48 @@ pub(crate) fn render_otp_mail_view(frame: &mut Frame, area: Rect, state: &UiStat
     if let Some(reader) = &mail.reader {
         render_mail_reader(frame, area, reader);
     }
+    // Highest layer: a recipient with no mail key blocks composing outright.
+    // Skipped while the mailbox/reader are open - those are about *other*
+    // mail and stay reachable; only writing/sending is gated.
+    if mail.reader.is_none()
+        && mail.mailbox.is_none()
+        && matches!(compose.check, Some(RecipientCheck::NoMailKey))
+    {
+        render_mail_key_blocked_modal(frame, area, &compose.to);
+    }
+}
+
+/// The hard stop for composing to a recipient with no OTP mail key -
+/// renders over the whole compose view (mirroring `render_help_popup`'s
+/// full-frame `Clear` convention) in red, per the exact wording asked for.
+/// Absorbed by `handle_mail_compose_key`'s matching gate; only Esc does
+/// anything, and it closes the whole `/mail` view, not just this popup.
+fn render_mail_key_blocked_modal(frame: &mut Frame, area: Rect, nickname: &str) {
+    let popup = centered_rect(64, 9, area);
+    let block = Block::default()
+        .title("OTP mail key required")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Red));
+    let inner = block.inner(popup);
+    frame.render_widget(ratatui::widgets::Clear, popup);
+    frame.render_widget(block, popup);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(1)])
+        .split(inner);
+    let message = format!(
+        "no otp mail key available for {nickname} - install one manually from /contacts or exchange one with the user if he is online using /new-otp-mail-key (requires pinned contact)"
+    );
+    frame.render_widget(
+        Paragraph::new(message)
+            .wrap(Wrap { trim: true })
+            .style(Style::default().fg(Color::Red)),
+        rows[0],
+    );
+    frame.render_widget(
+        Paragraph::new("Esc: close").style(Style::default().fg(Color::Red)),
+        rows[1],
+    );
 }
 
 /// The specific reason the To field is invalid, for the inline label -
@@ -1068,7 +1128,7 @@ fn check_failure_label(compose: &ComposeState) -> Option<&'static str> {
             }
         }
         RecipientCheck::NotPinned => Some("no pinned user with this nickname"),
-        RecipientCheck::NoKeychainEntry => Some("no otp key for this nickname"),
+        RecipientCheck::NoMailKey => Some("no otp mail key for this nickname"),
         RecipientCheck::CliUnavailable => Some("the 'otp' command isn't installed"),
     }
 }
