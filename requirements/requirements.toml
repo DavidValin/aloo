@@ -1208,6 +1208,16 @@ id = "TB-110"
 description = "Traffic arriving in a channel other than the selected one does not move the current selection."
 evidence = "test a_message_arriving_in_a_different_channel_does_not_move_the_current_selection"
 
+[[user_story.acceptance_criteria]]
+id = "AC-283"
+description = "/clear empties the message log of whichever screen (channel or private room) is currently open - not merely scrolled past, the backing history itself is gone - and never touches any other channel's or private room's log."
+evidence = "docs/SPEC.md 'Connected UI'; src/client/tui/ui.rs submit_input's /clear arm, current_log_mut; tests slash_clear_empties_the_current_channels_log, slash_clear_empties_the_current_private_rooms_log, slash_clear_does_not_touch_a_different_channels_log; reading_history.feature 'Clearing the current screen empties only that screen'"
+
+[[user_story.acceptance_criteria]]
+id = "AC-284"
+description = "/clear-all empties the message log of every channel tab and every private room at once, the same way /clear does for one screen."
+evidence = "docs/SPEC.md 'Connected UI'; src/client/tui/ui.rs submit_input's /clear-all arm; test slash_clear_all_empties_every_channel_and_private_room; reading_history.feature 'Clearing every screen empties all of them'"
+
 # ============================================================================
 # US-016 - Move around the connected UI
 # ============================================================================
@@ -2380,6 +2390,16 @@ id = "TB-197"
 description = "Server mail routing is idempotent and claimant-checked: a retried id overwrites byte-identically and re-acknowledges (or answers OtpMailDelivered if the mail was already delivered and deleted), an OtpMailAck is honored only from the stored recipient nickname, and a delivery receipt is forgotten only by the stored sender nickname."
 evidence = "docs/PROTOCOL.md 17.2, 17.3; src/server/mail.rs on_mail_send, mark_delivered, forget_receipt; tests store_is_idempotent_for_a_retried_id, on_mail_send_answers_a_retry_after_delivery_with_delivered, mark_delivered_refuses_a_claimant_other_than_the_recipient, forget_receipt_only_for_the_original_sender"
 
+[[user_story.acceptance_criteria]]
+id = "AC-292"
+description = "Every received mail is unread the moment it arrives, and stays that way until its reader is opened (`/mailbox`, Enter on its row); reading it, and only reading it, marks it read, persisted so the count survives a restart. A line written before this concept existed loads as already read - the safe, quiet default - so upgrading never surfaces a stampede of \"new\" mail that predates it."
+evidence = "docs/PROTOCOL.md 17; src/client/otp_mail_store.rs ReceivedMailRef::read, OtpMailStore::mark_read, unread_received_count; src/client/otp_mail.rs handle_read; tests a_freshly_stored_mail_is_unread, mark_read_flips_the_flag_and_is_idempotent, unread_received_count_counts_only_the_ones_still_unread, the_read_flag_round_trips_through_save_and_load, a_line_written_before_read_existed_loads_as_read"
+
+[[user_story.acceptance_criteria]]
+id = "AC-293"
+description = "The header shows \"<n> unread OTP Mails\" preceded by a blinking envelope whenever at least one received mail is still unread, positioned before the Conn/CPU indicators; nothing is shown at all once every received mail has been read."
+evidence = "docs/SPEC.md 'Connected UI'; src/client/tui/ui.rs UiState::unread_otp_mail_count, unread_envelope; src/client/tui/channel.rs status_line; src/client/otp_mail.rs refresh_unread_mail_count (session.rs wiring at arrival/read/delete/session-start - see docs/TESTING.md 'Known coverage gaps' for why that wiring itself isn't directly tested, the same reason every other handle_ui_action-adjacent row there gives); tests header_shows_nothing_about_otp_mail_when_there_is_none_unread, header_shows_the_unread_otp_mail_count_right_before_conn_quality, the_unread_otp_mail_indicator_blinks; scenario features/messaging/otp_mail.feature 'The header names how many OTP mails are unread'"
+
 [[user_story]]
 id = "US-036"
 title = "Live voice calls"
@@ -2768,6 +2788,22 @@ id = "TB-247"
 description = "This whole mechanism is reachable only for a nickname that is itself a direct_punch_to target - direct_nickname_of succeeding is exactly what proves it, and it only ever resolves for a UserId filed under this client's own settings. A server-introduced peer's real UserId is never such a key, so the code path is structurally unreachable for one; for the one overlap case (a nickname that is both server-known and a direct_punch_to target), check_identity always pins the key before set_direct_peer_id could ever let the new branches see them, since both run inside the same synchronous handling of one ServerMessage::UserJoined."
 evidence = "docs/PROTOCOL.md 7.1.5; src/client/p2p.rs PeerLinkManager::direct_nickname_of, set_direct_peer_id; src/client/session.rs handle_server_message's UserJoined arm (check_identity before set_direct_peer_id); tests a_direct_ping_naming_a_nickname_that_is_not_configured_is_ignored, a_peer_being_punched_directly_is_never_also_signalled_through_the_server"
 
+[[user_story.acceptance_criteria]]
+id = "AC-287"
+description = "Direct punching only ever counts as \"set up\" when both the master switch and at least one target are present together: `direct_punch=on` with no `direct_punch_to` line, or a `direct_punch_to` line with the switch left off, are each treated as nobody to reach."
+evidence = "docs/PROTOCOL.md 7.1.5; src/settings.rs Settings::has_direct_punch_configured; tests has_direct_punch_configured_is_false_by_default, has_direct_punch_configured_is_false_with_targets_but_the_switch_off, has_direct_punch_configured_is_false_with_the_switch_on_but_no_targets, has_direct_punch_configured_is_true_with_the_switch_on_and_a_target"
+
+[[user_story.acceptance_criteria]]
+id = "AC-290"
+description = "Direct punching, once configured, reports itself on the status line as \"<active>/<total> direct punches, next try in <time> (Control+s)\" - how many configured targets currently have an established link, how many are configured in total, and how long until the soonest one not already established comes due, in seconds/minutes/hours as appropriate. Nothing is shown at all when direct punching is not configured (AC-287)."
+evidence = "docs/SPEC.md 'Connected UI'; src/client/p2p.rs PeerLinkManager::direct_punch_summary; src/client/tui/channel.rs status_line; tests direct_punch_summary_is_none_when_nothing_is_configured, direct_punch_summary_reports_total_and_active_counts, direct_punch_summary_reports_time_until_the_next_attempt, direct_punch_summary_caps_the_next_attempt_at_the_top_of_the_hour"
+
+[[user_story.acceptance_criteria]]
+id = "AC-291"
+description = "Control+S opens a \"Direct Punches\" popup listing every configured direct_punch_to target; 'a' opens a blank add form, Enter/'e' opens the selected row prefilled for editing, 'd' deletes it, Esc backs out one level at a time (form, then popup). The form's nickname/host/port fields are free text, its frequency is a bounded Left/Right selector over the same 13 values the settings file accepts, and an invalid entry (e.g. an empty nickname) is refused with an inline error rather than silently accepted or crashing. Saving (an add, an edit or a delete) persists the whole updated list to ~/.aloo/settings and immediately reconfigures the direct-punch scheduler with it, so the change is live the same tick rather than waiting for a restart."
+evidence = "docs/SPEC.md 'Connected UI'; src/client/tui/direct_punch_popup.rs (popup itself, fully tested below); src/client/session.rs handle_ui_action's OpenDirectPunches/SaveDirectPunchTargets arms (persist + reconfigure - see docs/TESTING.md 'Known coverage gaps' for why this half needs a live session and isn't directly tested, the same reason every other handle_ui_action arm there gives); tests (test/ui_direct_punch_popup_test.rs) ctrl_s_opens_the_modal_empty_and_requests_a_load, up_and_down_wrap_around_the_row_list, esc_on_the_list_closes_the_whole_modal, a_opens_a_blank_add_form, enter_on_a_row_opens_it_prefilled_for_editing, esc_on_the_edit_form_returns_to_the_list_without_losing_other_rows, tab_cycles_focus_through_every_field_and_wraps, typing_fills_the_focused_text_field, the_port_field_only_accepts_digits, left_right_cycle_the_frequency_selector_and_wrap, enter_on_a_non_save_field_does_nothing, saving_a_valid_new_target_appends_it_and_requests_a_save, saving_edits_an_existing_target_in_place_rather_than_appending, an_invalid_nickname_shows_an_inline_error_and_does_not_save, d_deletes_the_selected_row_and_requests_a_save, d_on_an_empty_list_does_nothing"
+
+
 [[user_story]]
 id = "US-046"
 title = "Stop an unproven direct-punch requester from turning into free guessing"
@@ -2925,3 +2961,23 @@ evidence = "docs/SPEC.md 'Where diagnostics go'; src/log.rs; src/client/tui/term
 id = "TB-235"
 description = "The silenced sink keeps at most log::RING_CAPACITY lines and drops the oldest, so a session warning about the same thing for hours cannot grow it without bound; draining empties it, so a replay never happens twice."
 evidence = "src/log.rs RING_CAPACITY, warn, take_collected, drain; test a_silenced_sink_collects_every_line_and_replays_them_on_the_way_out"
+
+# ============================================================================
+# US-047 - Open a link straight from a message
+# ============================================================================
+[[user_story]]
+id = "US-047"
+title = "Open a link straight from a message"
+as_a = "user reading a message that contains a URL"
+i_want = "that link to stand out in the log and to open in my default browser without leaving the terminal"
+so_that = "following a link someone sent me does not mean retyping or copy-pasting it by hand"
+
+[[user_story.acceptance_criteria]]
+id = "AC-285"
+description = "A text message's http(s) links are rendered blue and underlined in the message log, distinguishing them from the surrounding plain text, while every other message kind (voice, file, presence, system) is unaffected."
+evidence = "docs/SPEC.md 'Text messages'; src/client/tui/ui.rs find_urls, push_text_with_links, render_messages; tests a_message_with_a_link_underlines_it_in_blue, a_message_with_no_link_renders_as_plain_text; scenario features/messaging/opening_links.feature 'A link in a message is shown in blue and underlined'"
+
+[[user_story.acceptance_criteria]]
+id = "AC-286"
+description = "Ctrl+O opens the first http(s) link in the focused message in the OS default browser (Linux: xdg-open, macOS: open, Windows: start); pressing it again on the same message cycles to that message's next link before wrapping back to the first, and it does nothing on a message with no link."
+evidence = "docs/SPEC.md 'Text messages'; src/client/tui/ui.rs UiState::next_url_in_focused_message, UiAction::OpenUrl; src/client/open_url.rs; src/client/session.rs handle_ui_action's OpenUrl arm; tests ctrl_o_opens_the_only_link_in_the_focused_message, ctrl_o_cycles_through_a_messages_several_links, ctrl_o_on_a_message_with_no_link_does_nothing, ctrl_o_on_a_different_message_starts_over_at_its_first_link; scenario features/messaging/opening_links.feature 'Ctrl+O opens the focused message's link'"

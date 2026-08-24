@@ -1309,6 +1309,28 @@ fn a_recognized_slash_command_still_works_after_the_guard_was_added() {
     }
 }
 
+/// @requirement AC-283
+#[test]
+fn slash_clear_empties_the_current_private_rooms_log() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    push_n_channel_texts(&mut state, 1);
+    state.on_direct_message(UserId(2), "bob".into(), MessageBody::Text("hi".into()));
+    state.focus = Focus::Sidebar;
+    press(&mut state, KeyCode::Enter); // opens DM with bob
+    assert!(!state.private_rooms.get(&UserId(2)).unwrap().log.is_empty());
+
+    type_str(&mut state, "/clear");
+    let action = press(&mut state, KeyCode::Enter);
+
+    assert_eq!(action, None);
+    assert!(state.private_rooms.get(&UserId(2)).unwrap().log.is_empty());
+    assert_eq!(state.message_selected, 0);
+    assert!(
+        !state.channels[0].log.is_empty(),
+        "clearing an open DM must not touch the channel's own log"
+    );
+}
+
 // ---------------------------------------------------------------------
 // The top row's DM selector (AC-020, AC-186, AC-187, TB-026, TB-210)
 // ---------------------------------------------------------------------

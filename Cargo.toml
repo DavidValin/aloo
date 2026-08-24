@@ -350,6 +350,10 @@ path = "test/contacts_test.rs"
 name = "ui_contacts_test"
 path = "test/ui_contacts_test.rs"
 
+[[test]]
+name = "ui_direct_punch_popup_test"
+path = "test/ui_direct_punch_popup_test.rs"
+
 # Behaviour-driven acceptance layer: Gherkin scenarios in `features/` executed
 # by cucumber-rs. `harness = false` because cucumber supplies its own runner
 # instead of libtest's.

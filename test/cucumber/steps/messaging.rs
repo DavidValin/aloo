@@ -6,7 +6,7 @@ use aloo::client::tui::ui::{Focus, UiAction};
 use aloo::proto::UserId;
 
 use crate::steps::ui_common::id_for;
-use crate::support::{sidebar_row_containing, ui_rows_wide};
+use crate::support::{find_text_start, sidebar_row_containing, ui_buffer, ui_rows_wide};
 use crate::world::AlooWorld;
 
 // ---------------------------------------------------------------------
@@ -219,6 +219,40 @@ async fn blinking_envelope(w: &mut AlooWorld, name: String) {
 #[then(expr = "message {int} is selected")]
 async fn message_selected(w: &mut AlooWorld, index: usize) {
     assert_eq!(w.ui_ref().message_selected, index, "selected message index");
+}
+
+#[then("the message log is empty")]
+async fn message_log_is_empty(w: &mut AlooWorld) {
+    let state = w.ui_ref();
+    let len = match state.active_private_room {
+        Some(id) => state.private_rooms[&id].log.len(),
+        None => state.channels[state.selected_channel].log.len(),
+    };
+    assert_eq!(len, 0, "the current screen's log should be empty");
+}
+
+#[then("every message log is empty")]
+async fn every_message_log_is_empty(w: &mut AlooWorld) {
+    let state = w.ui_ref();
+    for channel in &state.channels {
+        assert!(channel.log.is_empty(), "channel {} should be empty", channel.name);
+    }
+    for (peer, room) in &state.private_rooms {
+        assert!(room.log.is_empty(), "private room with {peer:?} should be empty");
+    }
+}
+
+#[then(expr = "the link {string} is shown in blue and underlined")]
+async fn link_is_blue_and_underlined(w: &mut AlooWorld, url: String) {
+    let buffer = ui_buffer(w.ui_ref(), 100, 15);
+    let (x, y) = find_text_start(&buffer, &url);
+    assert_eq!(buffer[(x, y)].fg, ratatui::style::Color::Blue);
+    assert!(buffer[(x, y)].modifier.contains(ratatui::style::Modifier::UNDERLINED));
+}
+
+#[then(expr = "the browser opens {string}")]
+async fn browser_opens(w: &mut AlooWorld, url: String) {
+    assert_eq!(w.last_action, Some(UiAction::OpenUrl(url)));
 }
 
 #[then("the newest message is selected")]

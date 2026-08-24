@@ -2370,6 +2370,38 @@ impl PeerLinkManager {
             .collect()
     }
 
+    /// A snapshot of the direct-punch scheduler for the status line:
+    /// `(active, total, next attempt in)` - how many configured targets
+    /// have an established link right now, how many are configured in
+    /// total, and how long until the soonest target not already
+    /// established comes due. `None` when direct punching is not
+    /// configured at all. Read-only: the same slot-grid math `direct_tick`
+    /// already drives, exposed here instead of acted on.
+    pub fn direct_punch_summary(&self, second_of_hour: u64) -> Option<(usize, usize, Option<Duration>)> {
+        let direct = self.direct.as_ref()?;
+        let total = direct.targets.len();
+        if total == 0 {
+            return None;
+        }
+        let active = self.active_direct_peers().len();
+        let next_in = direct
+            .targets
+            .values()
+            .filter(|t| t.state != DirectState::Established)
+            .map(|t| {
+                let seconds = t.frequency.seconds();
+                let slot = t.frequency.slot_of_hour(second_of_hour);
+                // The grid restarts at every o'clock (`PunchFrequency::slot_of_hour`'s
+                // own doc), so a frequency that does not evenly divide an
+                // hour (`every_55m`) has its next boundary capped at the
+                // top of the hour rather than run past it.
+                let next_boundary = ((slot + 1) * seconds).min(3600);
+                Duration::from_secs(next_boundary.saturating_sub(second_of_hour))
+            })
+            .min();
+        Some((active, total, next_in))
+    }
+
     /// This target's current state, for tests and diagnostics: `None` when
     /// direct punching is off or the nickname is not configured.
     pub fn direct_status(&self, nickname: &str) -> Option<LinkStatus> {

@@ -698,6 +698,7 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
     }
 
     let mut ui_state = UiState::new(display_name);
+    ui_state.set_unread_otp_mail_count(session.otp_mail_store.unread_received_count());
     // With no server there is nothing to join a channel *through*, so the
     // channels named in settings are simply the ones this client is in.
     // Seeded before the session starts so a `--initial-focus channel:x` daemon
@@ -1073,6 +1074,11 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
                 // Conn:<quality> refreshes once a second, same reasoning.
                 if now.duration_since(last_conn_sample) >= Duration::from_secs(1) {
                     ui_state.set_conn_quality(session.conn_stats.quality());
+                    ui_state.set_direct_punch_status(
+                        session
+                            .peer_link
+                            .direct_punch_summary(crate::client::p2p::utc_second_of_hour()),
+                    );
                     last_conn_sample = now;
                 }
                 // The header's reconnect countdown, recomputed from the
@@ -1185,6 +1191,13 @@ async fn handle_ui_action(
         return Ok(());
     }
     match action {
+        UiAction::OpenUrl(url) => {
+            if crate::client::open_url::open(url.clone()) {
+                ui_state.push_status_notice(format!("opening {url}"), true);
+            } else {
+                ui_state.push_status_notice(format!("could not open {url}"), false);
+            }
+        }
         UiAction::JoinChannel {
             name,
             kind,
@@ -1632,6 +1645,36 @@ async fn handle_ui_action(
         }
         UiAction::OpenContacts | UiAction::RefreshContacts => {
             crate::client::contacts::handle_open(session, ui_state).await;
+        }
+        UiAction::OpenDirectPunches => {
+            let settings = crate::settings::Settings::load_or_create(&crate::settings::default_path())
+                .unwrap_or_else(|e| {
+                    crate::log_warn!("could not read ~/.aloo/settings ({e}); using defaults");
+                    crate::settings::Settings::default()
+                });
+            ui_state.set_direct_punch_rows(settings.direct_punch_to);
+        }
+        UiAction::SaveDirectPunchTargets(targets) => {
+            let path = crate::settings::default_path();
+            // A merging write: a daemon or another client editing this
+            // same file concurrently keeps every key but this one, the
+            // same reasoning `Settings::update`'s own doc gives for
+            // `/mute-voice` and `remember_connection`.
+            if let Err(e) = crate::settings::Settings::update(&path, |s| {
+                s.direct_punch = true;
+                s.direct_punch_to = targets.clone();
+            }) {
+                crate::log_warn!("could not save ~/.aloo/settings ({e})");
+            }
+            // Takes effect this same tick, not on the next restart -
+            // `configure_direct_punch` rebuilds the scheduler from this
+            // exact list.
+            session.peer_link.configure_direct_punch(
+                ui_state.own_name.clone(),
+                targets.clone(),
+                crate::client::p2p::utc_second_of_hour(),
+            );
+            ui_state.set_direct_punch_rows(targets);
         }
         UiAction::DeleteContact { nickname } => {
             crate::client::contacts::handle_delete(session, ui_state, nickname).await;

@@ -949,3 +949,65 @@ fn a_rotation_carried_on_the_link_verifies_and_installs_like_a_relayed_one() {
     );
     let _ = bob_priv;
 }
+
+// ---------------------------------------------------------------------
+// The status line's direct-punch summary
+// ---------------------------------------------------------------------
+
+/// @requirement AC-290
+#[tokio::test]
+async fn direct_punch_summary_is_none_when_nothing_is_configured() {
+    let (events_tx, _events_rx) = tokio::sync::mpsc::unbounded_channel::<P2pEvent>();
+    let (manager, _socket) = PeerLinkManager::bind("127.0.0.1:0".parse().unwrap(), None, events_tx)
+        .await
+        .unwrap();
+    assert_eq!(manager.direct_punch_summary(0), None);
+}
+
+/// @requirement AC-290
+#[tokio::test]
+async fn direct_punch_summary_reports_total_and_active_counts() {
+    let (events_tx, _events_rx) = tokio::sync::mpsc::unbounded_channel::<P2pEvent>();
+    let (mut manager, _socket) = PeerLinkManager::bind("127.0.0.1:0".parse().unwrap(), None, events_tx)
+        .await
+        .unwrap();
+    manager.configure_direct_punch(
+        "me".into(),
+        vec![target("bob", 1, "every_1m"), target("carol", 2, "every_5m")],
+        0,
+    );
+
+    let (active, total, _next_in) = manager.direct_punch_summary(0).unwrap();
+    assert_eq!(total, 2);
+    assert_eq!(active, 0, "nothing has punched through yet");
+}
+
+/// @requirement AC-290
+#[tokio::test]
+async fn direct_punch_summary_reports_time_until_the_next_attempt() {
+    let (events_tx, _events_rx) = tokio::sync::mpsc::unbounded_channel::<P2pEvent>();
+    let (mut manager, _socket) = PeerLinkManager::bind("127.0.0.1:0".parse().unwrap(), None, events_tx)
+        .await
+        .unwrap();
+    manager.configure_direct_punch("me".into(), vec![target("bob", 1, "every_1m")], 30);
+
+    let (_, _, next_in) = manager.direct_punch_summary(30).unwrap();
+    assert_eq!(next_in, Some(Duration::from_secs(30)));
+}
+
+/// `every_55m`'s slots are :00 and :55 - at second 3500 (58:20) the next
+/// boundary is the *next* hour's :00, not :55 plus another 55 minutes past
+/// it, since the grid restarts at every o'clock.
+///
+/// @requirement AC-290
+#[tokio::test]
+async fn direct_punch_summary_caps_the_next_attempt_at_the_top_of_the_hour() {
+    let (events_tx, _events_rx) = tokio::sync::mpsc::unbounded_channel::<P2pEvent>();
+    let (mut manager, _socket) = PeerLinkManager::bind("127.0.0.1:0".parse().unwrap(), None, events_tx)
+        .await
+        .unwrap();
+    manager.configure_direct_punch("me".into(), vec![target("bob", 1, "every_55m")], 3500);
+
+    let (_, _, next_in) = manager.direct_punch_summary(3500).unwrap();
+    assert_eq!(next_in, Some(Duration::from_secs(100)));
+}

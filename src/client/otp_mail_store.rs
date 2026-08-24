@@ -91,6 +91,10 @@ pub struct ReceivedMailRef {
     /// Payload size in bytes (each blob file's length) - shown in the
     /// mailbox without opening the blobs.
     pub size: u64,
+    /// Whether `handle_read` has opened this mail yet - what the header's
+    /// "<n> unread OTP Mails" counts. `false` the moment it arrives;
+    /// `mark_read` is the only thing that ever flips it back.
+    pub read: bool,
 }
 
 /// The index + blob directory. Like `OtpStore`, saved synchronously after
@@ -181,6 +185,12 @@ impl OtpMailStore {
                 ) else {
                     return;
                 };
+                // A line written before `read` existed loads as already
+                // read - the safe, quiet default (same reasoning as
+                // `otp_store`'s own pre-existing fields loading as "nothing
+                // owed"), so upgrading never surfaces a stampede of
+                // "new" mail that was really just never marked either way.
+                let read = parts.next().and_then(|s| s.parse::<u8>().ok()).unwrap_or(1) != 0;
                 self.received.insert(
                     mail_id.to_string(),
                     ReceivedMailRef {
@@ -189,6 +199,7 @@ impl OtpMailStore {
                         sent_at_utc: sent,
                         received_at_utc: received,
                         size,
+                        read,
                     },
                 );
             }
@@ -227,8 +238,8 @@ impl OtpMailStore {
                 continue;
             }
             out.push_str(&format!(
-                "R\t{}\t{}\t{}\t{}\t{}\n",
-                r.mail_id, r.from, r.sent_at_utc, r.received_at_utc, r.size
+                "R\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                r.mail_id, r.from, r.sent_at_utc, r.received_at_utc, r.size, r.read as u8
             ));
         }
         fs::write(self.index_path(), out)
@@ -343,6 +354,25 @@ impl OtpMailStore {
         secure_remove(&self.ct_path(mail_id));
         secure_remove(&self.pad_path(mail_id));
         true
+    }
+
+    /// Marks a received mail read - `handle_read`'s side effect on opening
+    /// it. Returns whether it actually changed anything (an unknown id, or
+    /// one already read, is a no-op) so the caller only re-saves and
+    /// refreshes the header count when something genuinely did.
+    pub fn mark_read(&mut self, mail_id: &str) -> bool {
+        match self.received.get_mut(mail_id) {
+            Some(r) if !r.read => {
+                r.read = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// What the header's "<n> unread OTP Mails" counts.
+    pub fn unread_received_count(&self) -> usize {
+        self.received.values().filter(|r| !r.read).count()
     }
 
     /// Mailbox rows: every sent ref and received entry, newest first by

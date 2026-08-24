@@ -608,8 +608,14 @@ async fn run_client(
 ) -> Result<(), BoxError> {
     let (mut surface, keyboard_release_reporting) = terminal::setup_surface()?;
     let port = cli.port.unwrap_or(settings::DEFAULT_PORT);
-    let result =
-        connect::run_client_inner(&mut surface, port, keyboard_release_reporting, hotkey_rx).await;
+    let result = connect::run_client_inner(
+        &mut surface,
+        port,
+        keyboard_release_reporting,
+        hotkey_rx,
+        cli.no_server,
+    )
+    .await;
     terminal::restore_surface(&mut surface)?;
     result
 }

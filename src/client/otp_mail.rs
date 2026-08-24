@@ -417,6 +417,13 @@ fn refresh_mailbox_if_open(session: &SessionState, ui_state: &mut UiState) {
     }
 }
 
+/// The header's "<n> unread OTP Mails" count - refreshed whenever the
+/// received set can have changed (arrival, read, delete) and once at
+/// session start, rather than derived lazily on every render.
+pub(crate) fn refresh_unread_mail_count(session: &SessionState, ui_state: &mut UiState) {
+    ui_state.set_unread_otp_mail_count(session.otp_mail_store.unread_received_count());
+}
+
 /// A mail encrypt/decrypt is a genuine pad spend, so it refreshes the
 /// §16.5 live key-metadata header exactly like a live send/receive does -
 /// best-effort, only possible when the mail's counterpart happens to be
@@ -713,6 +720,7 @@ pub(crate) async fn on_mail_deliver(
         sent_at_utc: payload.sent_at_utc,
         received_at_utc: now_utc_secs(),
         size,
+        read: false,
     };
     if let Err(e) = session
         .otp_mail_store
@@ -736,6 +744,7 @@ pub(crate) async fn on_mail_deliver(
     crate::client::voice_stream::play_bell_chime(session);
     refresh_key_header_if_connected(session, ui_state, &from, &expected_contact).await;
     refresh_mailbox_if_open(session, ui_state);
+    refresh_unread_mail_count(session, ui_state);
     Ok(())
 }
 
@@ -743,7 +752,7 @@ pub(crate) async fn on_mail_deliver(
 /// in memory, decodes the payload, and opens the reader. The blob pair on
 /// disk is untouched - it outlives every read until the user removes the
 /// mail.
-pub(crate) fn handle_read(session: &SessionState, ui_state: &mut UiState, mail_id: String) {
+pub(crate) fn handle_read(session: &mut SessionState, ui_state: &mut UiState, mail_id: String) {
     let Some(bytes) = session.otp_mail_store.read_received_payload(&mail_id) else {
         ui_state.push_status_notice(
             "OTP mail: could not read this mail's stored files".to_string(),
@@ -759,6 +768,10 @@ pub(crate) fn handle_read(session: &SessionState, ui_state: &mut UiState, mail_i
         );
         return;
     };
+    if session.otp_mail_store.mark_read(&mail_id) {
+        let _ = session.otp_mail_store.save();
+        refresh_unread_mail_count(session, ui_state);
+    }
     ui_state.otp_mail_open_reader(mail_id, payload);
 }
 
@@ -775,6 +788,7 @@ pub(crate) fn handle_delete(session: &mut SessionState, ui_state: &mut UiState, 
         let _ = session.otp_mail_store.save();
     }
     refresh_mailbox_if_open(session, ui_state);
+    refresh_unread_mail_count(session, ui_state);
 }
 
 /// `UiAction::SaveOtpMailAttachment`'s handler: writes one attachment of

@@ -133,3 +133,28 @@ Feature: Reading back message history
     When I move focus to the log
     And I press Home
     Then the oldest message is visible and the newest has scrolled away
+
+  @AC-283
+  Scenario: Clearing the current screen empties only that screen
+    Given I am connected and viewing a channel
+    And bob is in the channel with me
+    And the message log holds 3 messages
+    And bob has sent me 3 private messages
+    When I type "/clear" into the compose bar
+    And I press Enter
+    Then the message log is empty
+    And the compose bar is empty
+    When I open a private room with bob
+    Then the newest message is selected
+
+  @AC-284
+  Scenario: Clearing every screen empties all of them
+    Given I am connected and viewing a channel
+    And bob is in the channel with me
+    And the message log holds 3 messages
+    And bob has sent me 3 private messages
+    When I open a private room with bob
+    And I type "/clear-all" into the compose bar
+    And I press Enter
+    Then every message log is empty
+    And the compose bar is empty

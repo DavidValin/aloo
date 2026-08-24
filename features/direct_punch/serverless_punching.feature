@@ -95,3 +95,9 @@ Feature: Punching a direct link with no server involved
     Then alice files bob under user 7
     When bob goes offline on the server
     Then alice files bob under a peer id no server could have handed out
+
+  @AC-290
+  Scenario: The status line reports how many direct punches are active
+    Given I am connected and viewing a channel
+    And direct punching has 1 of 2 peers active, next try in 37 seconds
+    Then the header shows "1/2 direct punches, next try in 37s (Control+s)" right before "Conn:"

@@ -1,6 +1,6 @@
 //! CPU / Conn header indicator steps (US-018).
 
-use cucumber::{then, when};
+use cucumber::{given, then, when};
 use ratatui::style::Color;
 
 use aloo::client::netstats::ConnQuality;
@@ -11,6 +11,15 @@ use crate::world::AlooWorld;
 #[when(expr = "CPU usage is sampled at {int} percent")]
 async fn cpu_sampled(w: &mut AlooWorld, pct: i64) {
     w.ui_mut().set_cpu_usage(pct as f32);
+}
+
+#[given(expr = "direct punching has {int} of {int} peers active, next try in {int} seconds")]
+async fn direct_punch_configured(w: &mut AlooWorld, active: usize, total: usize, next_in: u64) {
+    w.ui_mut().set_direct_punch_status(Some((
+        active,
+        total,
+        Some(std::time::Duration::from_secs(next_in)),
+    )));
 }
 
 #[when(expr = "the connection quality is classified as {word}")]

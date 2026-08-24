@@ -171,6 +171,12 @@ Feature: OTP mail that waits, encrypted, on the server
     When I select the received mail and press Enter
     Then a read of the received mail was requested
 
+  @AC-293
+  Scenario: The header names how many OTP mails are unread
+    Given I am connected and viewing a channel
+    And 2 OTP mails are unread
+    Then the header shows "2 unread OTP Mails" right before "Conn:"
+
   @AC-163
   Scenario: A received mail rests as ciphertext plus pad and dies with them
     Given a fresh client mail store

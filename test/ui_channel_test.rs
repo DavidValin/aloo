@@ -1143,6 +1143,108 @@ fn header_shows_conn_quality_right_before_the_cpu_indicator() {
     );
 }
 
+/// @requirement AC-293
+#[test]
+fn header_shows_nothing_about_otp_mail_when_there_is_none_unread() {
+    let state = joined_general_with(vec![]);
+    assert_eq!(state.unread_otp_mail_count, 0);
+    let rows = rendered_rows(&state);
+    let header = &rows[HEADER_TEXT_ROW];
+    assert!(
+        !header.contains("unread OTP Mail"),
+        "nothing should be shown with zero unread: {header:?}"
+    );
+}
+
+/// @requirement AC-293
+#[test]
+fn header_shows_the_unread_otp_mail_count_right_before_conn_quality() {
+    let mut state = joined_general_with(vec![]);
+    state.set_unread_otp_mail_count(3);
+    state.blink_on = true;
+    state.set_conn_quality(ConnQuality::Good);
+    let rows = rendered_rows(&state);
+    let header = &rows[HEADER_TEXT_ROW];
+    assert!(
+        header.contains("3 unread OTP Mails") && header.contains("Conn:GOOD"),
+        "expected the unread count somewhere before Conn: {header:?}"
+    );
+    assert!(
+        header.find("unread OTP Mails").unwrap() < header.find("Conn:").unwrap(),
+        "the unread count should sit before Conn: {header:?}"
+    );
+}
+
+/// @requirement AC-293
+#[test]
+fn the_unread_otp_mail_indicator_blinks() {
+    let mut state = joined_general_with(vec![]);
+    state.set_unread_otp_mail_count(1);
+
+    state.blink_on = true;
+    let rows_on = rendered_rows(&state);
+    assert!(rows_on[HEADER_TEXT_ROW].contains("\u{2709}"));
+
+    state.blink_on = false;
+    let rows_off = rendered_rows(&state);
+    assert!(!rows_off[HEADER_TEXT_ROW].contains("\u{2709}"));
+    assert!(
+        rows_off[HEADER_TEXT_ROW].contains("1 unread OTP Mails"),
+        "the count itself must not blink away, only the envelope: {:?}",
+        rows_off[HEADER_TEXT_ROW]
+    );
+}
+
+/// @requirement AC-290
+#[test]
+fn header_shows_nothing_about_direct_punching_when_it_is_not_configured() {
+    let state = joined_general_with(vec![]);
+    assert_eq!(state.direct_punch_status, None);
+    let rows = rendered_rows(&state);
+    let header = &rows[HEADER_TEXT_ROW];
+    assert!(
+        !header.contains("direct punches"),
+        "nothing should be shown when direct punching is not set up: {header:?}"
+    );
+}
+
+/// @requirement AC-290
+#[test]
+fn header_shows_the_direct_punch_summary_right_before_conn_quality() {
+    let mut state = joined_general_with(vec![]);
+    state.set_direct_punch_status(Some((1, 2, Some(std::time::Duration::from_secs(37)))));
+    state.set_conn_quality(ConnQuality::Good);
+    let rows = rendered_rows(&state);
+    let header = &rows[HEADER_TEXT_ROW];
+    assert!(
+        header.contains("1/2 direct punches, next try in 37s (Control+s)  Conn:GOOD"),
+        "expected the direct-punch summary right before Conn: {header:?}"
+    );
+}
+
+/// @requirement AC-290
+#[test]
+fn the_direct_punch_summary_is_green_when_everything_is_active_and_yellow_otherwise() {
+    let mut state = joined_general_with(vec![]);
+    state.set_direct_punch_status(Some((2, 2, None)));
+    let buffer = {
+        let backend = TestBackend::new(100, 15);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, &state)).unwrap();
+        terminal.backend().buffer().clone()
+    };
+    let (x, y) = find_text_start(&buffer, "2/2 direct punches");
+    assert_eq!(buffer[(x, y)].fg, ratatui::style::Color::Green);
+
+    state.set_direct_punch_status(Some((1, 2, Some(std::time::Duration::from_secs(5)))));
+    let backend = TestBackend::new(100, 15);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| render(f, &state)).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    let (x, y) = find_text_start(&buffer, "1/2 direct punches");
+    assert_eq!(buffer[(x, y)].fg, ratatui::style::Color::Yellow);
+}
+
 /// @requirement AC-072
 #[test]
 fn header_defaults_conn_quality_to_a_white_dash_before_any_traffic() {
@@ -2063,6 +2165,80 @@ fn an_unrecognized_slash_command_is_never_sent_as_channel_text() {
         Some(("unknown command: /nonsense".to_string(), false))
     );
     assert!(state.channels[0].log.is_empty());
+}
+
+/// @requirement AC-283
+#[test]
+fn slash_clear_empties_the_current_channels_log() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    push_n_channel_texts(&mut state, 3);
+    assert!(!state.channels[0].log.is_empty());
+
+    type_str(&mut state, "/clear");
+    let action = press(&mut state, KeyCode::Enter);
+
+    assert_eq!(action, None);
+    assert!(state.channels[0].log.is_empty());
+    assert_eq!(state.message_selected, 0);
+    assert!(state.input.is_empty());
+    assert_eq!(
+        state.status_notice,
+        Some(("cleared this screen's messages".to_string(), true))
+    );
+}
+
+/// `/clear` must only ever reach the screen that's actually open - a
+/// second, unrelated channel's history is exactly what it must leave
+/// alone.
+///
+/// @requirement AC-283
+#[test]
+fn slash_clear_does_not_touch_a_different_channels_log() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.on_joined(ChannelInfo {
+        name: "random".into(),
+        kind: ChannelKind::Public,
+    });
+    push_n_channel_texts(&mut state, 2);
+    state.selected_channel = state
+        .channels
+        .iter()
+        .position(|c| c.name == "random")
+        .unwrap();
+    type_str(&mut state, "/clear");
+    press(&mut state, KeyCode::Enter);
+
+    assert!(state.channels.iter().find(|c| c.name == "random").unwrap().log.is_empty());
+    assert!(
+        !state.channels.iter().find(|c| c.name == "general").unwrap().log.is_empty(),
+        "clearing one channel must not empty a different one"
+    );
+}
+
+/// @requirement AC-284
+#[test]
+fn slash_clear_all_empties_every_channel_and_private_room() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.on_joined(ChannelInfo {
+        name: "random".into(),
+        kind: ChannelKind::Public,
+    });
+    push_n_channel_texts(&mut state, 2);
+    state.on_direct_message(UserId(2), "bob".into(), MessageBody::Text("hi".into()));
+    assert!(!state.private_rooms.get(&UserId(2)).unwrap().log.is_empty());
+
+    type_str(&mut state, "/clear-all");
+    let action = press(&mut state, KeyCode::Enter);
+
+    assert_eq!(action, None);
+    assert!(state.channels.iter().all(|c| c.log.is_empty()));
+    assert!(state.private_rooms.values().all(|r| r.log.is_empty()));
+    assert_eq!(state.message_selected, 0);
+    assert!(state.input.is_empty());
+    assert_eq!(
+        state.status_notice,
+        Some(("cleared every screen's messages".to_string(), true))
+    );
 }
 
 /// Joining a channel is a request to go there: it becomes the one the

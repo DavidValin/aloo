@@ -501,6 +501,14 @@ impl Default for Settings {
 }
 
 impl Settings {
+    /// Whether this settings file actually names anyone to direct-punch -
+    /// the master switch on *and* at least one target, together
+    /// (`docs/PROTOCOL.md` §7.1.5). A `--no-server` client start uses this
+    /// to decide whether there is anyone to run for at all.
+    pub fn has_direct_punch_configured(&self) -> bool {
+        self.direct_punch && !self.direct_punch_to.is_empty()
+    }
+
     /// Loads `path`, writing (and returning) the defaults if it doesn't
     /// exist yet, so the file is always present and editable afterward.
     /// Unrecognized or unparseable lines are skipped rather than failing

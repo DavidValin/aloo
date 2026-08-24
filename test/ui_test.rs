@@ -702,6 +702,136 @@ fn scrolled_up_history_is_not_yanked_down_by_a_new_message() {
     );
 }
 
+// ---------------------------------------------------------------------
+// Opening a link in the focused message (AC-285, AC-286)
+// ---------------------------------------------------------------------
+
+/// @requirement AC-285
+#[test]
+fn a_message_with_a_link_underlines_it_in_blue() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.on_channel_message(
+        "general",
+        UserId(2),
+        "bob".into(),
+        MessageBody::Text("see https://example.com/x for details".into()),
+    );
+
+    let backend = TestBackend::new(100, 15);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| render(f, &state)).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+
+    let (lx, ly) = find_text_start(&buffer, "https://example.com/x");
+    assert_eq!(buffer[(lx, ly)].fg, ratatui::style::Color::Blue);
+    assert!(buffer[(lx, ly)].modifier.contains(ratatui::style::Modifier::UNDERLINED));
+
+    let (sx, sy) = find_text_start(&buffer, "see ");
+    assert_ne!(buffer[(sx, sy)].fg, ratatui::style::Color::Blue, "plain text stays unstyled");
+    assert!(!buffer[(sx, sy)].modifier.contains(ratatui::style::Modifier::UNDERLINED));
+}
+
+/// @requirement AC-285
+#[test]
+fn a_message_with_no_link_renders_as_plain_text() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.on_channel_message(
+        "general",
+        UserId(2),
+        "bob".into(),
+        MessageBody::Text("hello there".into()),
+    );
+
+    let backend = TestBackend::new(100, 15);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| render(f, &state)).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+
+    let (x, y) = find_text_start(&buffer, "hello there");
+    assert!(!buffer[(x, y)].modifier.contains(ratatui::style::Modifier::UNDERLINED));
+}
+
+/// @requirement AC-286
+#[test]
+fn ctrl_o_opens_the_only_link_in_the_focused_message() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.on_channel_message(
+        "general",
+        UserId(2),
+        "bob".into(),
+        MessageBody::Text("see https://example.com/x for details".into()),
+    );
+    assert_eq!(state.message_selected, 0);
+
+    let action = ctrl(&mut state, KeyCode::Char('o'));
+    assert_eq!(action, Some(UiAction::OpenUrl("https://example.com/x".to_string())));
+}
+
+/// @requirement AC-286
+#[test]
+fn ctrl_o_cycles_through_a_messages_several_links() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.on_channel_message(
+        "general",
+        UserId(2),
+        "bob".into(),
+        MessageBody::Text("first https://a.example second https://b.example".into()),
+    );
+
+    assert_eq!(
+        ctrl(&mut state, KeyCode::Char('o')),
+        Some(UiAction::OpenUrl("https://a.example".to_string()))
+    );
+    assert_eq!(
+        ctrl(&mut state, KeyCode::Char('o')),
+        Some(UiAction::OpenUrl("https://b.example".to_string()))
+    );
+    assert_eq!(
+        ctrl(&mut state, KeyCode::Char('o')),
+        Some(UiAction::OpenUrl("https://a.example".to_string())),
+        "a third press wraps back to the first link"
+    );
+}
+
+/// @requirement AC-286
+#[test]
+fn ctrl_o_on_a_message_with_no_link_does_nothing() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.on_channel_message("general", UserId(2), "bob".into(), MessageBody::Text("hi".into()));
+
+    assert_eq!(ctrl(&mut state, KeyCode::Char('o')), None);
+}
+
+/// @requirement AC-286
+#[test]
+fn ctrl_o_on_a_different_message_starts_over_at_its_first_link() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.on_channel_message(
+        "general",
+        UserId(2),
+        "bob".into(),
+        MessageBody::Text("https://first.example".into()),
+    );
+    state.on_channel_message(
+        "general",
+        UserId(2),
+        "bob".into(),
+        MessageBody::Text("https://second.example".into()),
+    );
+    state.message_selected = 0;
+    assert_eq!(
+        ctrl(&mut state, KeyCode::Char('o')),
+        Some(UiAction::OpenUrl("https://first.example".to_string()))
+    );
+
+    state.message_selected = 1;
+    assert_eq!(
+        ctrl(&mut state, KeyCode::Char('o')),
+        Some(UiAction::OpenUrl("https://second.example".to_string())),
+        "moving to a different message must not continue the previous message's cycle"
+    );
+}
+
 /// @requirement AC-061
 #[test]
 fn up_down_clamp_at_the_ends_instead_of_wrapping() {

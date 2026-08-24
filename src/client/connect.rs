@@ -114,6 +114,7 @@ pub async fn run_client_inner(
     hotkey_rx: Option<
         tokio::sync::mpsc::UnboundedReceiver<crate::client::global_ptt::GlobalPttEvent>,
     >,
+    no_server: bool,
 ) -> Result<(), BoxError> {
     let mut popup = ConnectPopupState::new();
     popup.port = port.to_string();
@@ -130,6 +131,50 @@ pub async fn run_client_inner(
         .connect_ssl_ca
         .as_deref()
         .map(crate::platform::expand_tilde);
+
+    if no_server {
+        // Nothing to show the connect popup for: with no server there is
+        // nobody to authenticate against, so the one thing left to decide
+        // is whether there is anybody to reach at all.
+        if !settings.has_direct_punch_configured() {
+            println!(
+                "aloo: --no-server with no direct_punch_to configured in ~/.aloo/settings - \
+                 nothing to reach, exiting."
+            );
+            return Ok(());
+        }
+        let my_key = MyKeySelection {
+            file_pub: PathBuf::from(&popup.my_key.file_pub),
+            file_priv: PathBuf::from(&popup.my_key.file_priv),
+        };
+        let identity = resolve_my_keypair(&my_key)?;
+        let you = crate::client::p2p::direct_peer_id(&popup.nickname);
+        let id_store = load_id_store(&idstore::default_path());
+        // Same reasoning as the connected path below: the popup is done
+        // with the terminal (there never was one here), so the stdin
+        // reader is safe to start now.
+        let input_rx = crate::client::tui::terminal::spawn_session_input();
+        crate::log_warn!(
+            "aloo started as {} with no server - reachable only by the direct_punch_to \
+             peers in ~/.aloo/settings",
+            popup.nickname
+        );
+        return session::run_connected_session(
+            surface,
+            None,
+            crate::control::NullSink,
+            popup.nickname,
+            you,
+            identity,
+            keyboard_release_reporting,
+            id_store,
+            hotkey_rx,
+            None,
+            input_rx,
+            None,
+        )
+        .await;
+    }
 
     loop {
         let mut request = match ui_connect_popup::run(surface, &mut popup)? {

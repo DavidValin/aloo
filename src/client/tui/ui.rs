@@ -1107,6 +1107,10 @@ pub enum Mode {
     /// Data lives in `UiState::contacts`, same split as `FileSend`/
     /// `file_send`.
     Contacts,
+    /// The Ctrl+S "Direct Punches" popup is open - see
+    /// `crate::client::tui::direct_punch_popup`. Data lives in
+    /// `UiState::direct_punches`, same split as `FileSend`/`file_send`.
+    DirectPunches,
 }
 
 /// Which field is focused inside the Ctrl+J popup - Tab/BackTab cycles.
@@ -1482,6 +1486,9 @@ pub enum VoiceTarget {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum UiAction {
+    /// Ctrl+O on the focused message: open this URL in the OS default
+    /// browser (`session::handle_ui_action`, `client::open_url`).
+    OpenUrl(String),
     JoinChannel {
         name: String,
         kind: ChannelKind,
@@ -1723,6 +1730,15 @@ pub enum UiAction {
     /// (`client::contacts::gather_contact_rows`), and hands the rows to
     /// the modal `open_contacts` already opened empty.
     OpenContacts,
+    /// Ctrl+S - reads `direct_punch_to` fresh from `~/.aloo/settings` and
+    /// hands the rows to the modal `open_direct_punches` already opened
+    /// empty, same split as `OpenContacts`.
+    OpenDirectPunches,
+    /// An add, edit or delete on the "Direct Punches" popup - persists the
+    /// whole replacement list to `~/.aloo/settings` (a merging write, so a
+    /// concurrent daemon's own keys are untouched) and immediately
+    /// reconfigures `PeerLinkManager`'s scheduler with it.
+    SaveDirectPunchTargets(Vec<crate::settings::DirectPunchTarget>),
     /// `r` on the contacts modal - re-runs the same gather, e.g. after the
     /// remaining OTP key has moved since it was last opened.
     RefreshContacts,
@@ -1883,6 +1899,13 @@ pub struct UiState {
     pub focus: Focus,
     pub sidebar_selected: usize,
     pub message_selected: usize,
+    /// `(message_selected, index into that message's links)` last opened
+    /// with Ctrl+O - lets a repeated press cycle through a message with
+    /// more than one link instead of reopening the first one every time.
+    /// Compared against the *current* `message_selected` rather than reset
+    /// on every cursor move, so no other navigation code needs to know
+    /// about it.
+    pub(crate) last_opened_url: Option<(usize, usize)>,
     pub input: String,
     pub mode: Mode,
     pub join_popup_input: String,
@@ -1919,6 +1942,10 @@ pub struct UiState {
     /// sub-popup needs to overwrite its file browser with a deterministic
     /// temp directory.
     pub contacts: Option<super::contacts::ContactsState>,
+    /// The Ctrl+S "Direct Punches" popup's state, while
+    /// `mode == Mode::DirectPunches` - see
+    /// `crate::client::tui::direct_punch_popup`.
+    pub direct_punches: Option<super::direct_punch_popup::DirectPunchPopupState>,
     /// Every incoming file offer currently awaiting a decision, keyed by
     /// `(from, stream_id)` - the popup always shows whichever's at the
     /// front of `file_offer_queue`. Analogous to `identity_reviews`/
@@ -2181,6 +2208,19 @@ pub struct UiState {
     /// indicator. Defaults to `Unknown` (rendered `-`) until the first
     /// message of the session is observed.
     pub conn_quality: crate::client::netstats::ConnQuality,
+    /// `(active, total, next attempt in)` from `PeerLinkManager::direct_punch_summary`,
+    /// refreshed once a second by `session::run_connected_session` the same
+    /// way `conn_quality` is, and shown at the left of the status line as
+    /// "<active>/<total> direct punches, next try in <time> (Control+s)".
+    /// `None` when direct punching is not configured at all - nothing is
+    /// shown, rather than a permanent "0/0".
+    pub direct_punch_status: Option<(usize, usize, Option<std::time::Duration>)>,
+    /// How many received OTP mails haven't been opened yet
+    /// (`otp_mail_store::OtpMailStore::unread_received_count`), refreshed
+    /// whenever the received set can have changed (arrival, read, delete)
+    /// and once at session start. Shown at the header's leftmost as
+    /// "<n> unread OTP Mails" behind a blinking envelope; `0` shows nothing.
+    pub unread_otp_mail_count: usize,
     /// What the control connection is doing, shown as the header's very
     /// first element (`docs/SPEC.md` "Connected UI"). Driven by
     /// `session::run_connected_session` from the reconnect supervisor's
@@ -2235,6 +2275,7 @@ impl UiState {
             focus: Focus::Input,
             sidebar_selected: 0,
             message_selected: 0,
+            last_opened_url: None,
             input: String::new(),
             mode: Mode::Normal,
             join_popup_input: String::new(),
@@ -2246,6 +2287,7 @@ impl UiState {
             channel_password_error: None,
             file_send: None,
             contacts: None,
+            direct_punches: None,
             file_row_of_stream: HashMap::new(),
             file_rows: HashMap::new(),
             file_offers: HashMap::new(),
@@ -2293,6 +2335,8 @@ impl UiState {
             message_info: None,
             cpu_usage_pct: 0.0,
             conn_quality: crate::client::netstats::ConnQuality::Unknown,
+            direct_punch_status: None,
+            unread_otp_mail_count: 0,
             server_link: crate::client::reconnect::ServerLinkState::Connected,
         }
     }
@@ -2343,6 +2387,21 @@ impl UiState {
     /// freshly-classified connection quality (`netstats::ConnStats::quality`).
     pub fn set_conn_quality(&mut self, quality: crate::client::netstats::ConnQuality) {
         self.conn_quality = quality;
+    }
+
+    /// Called once a second by `session::run_connected_session` with the
+    /// freshly-computed `PeerLinkManager::direct_punch_summary`.
+    pub fn set_direct_punch_status(
+        &mut self,
+        status: Option<(usize, usize, Option<std::time::Duration>)>,
+    ) {
+        self.direct_punch_status = status;
+    }
+
+    /// Called by `client::otp_mail::refresh_unread_mail_count` whenever the
+    /// received set can have changed.
+    pub fn set_unread_otp_mail_count(&mut self, count: usize) {
+        self.unread_otp_mail_count = count;
     }
 
     // -------------------------------------------------------------
@@ -4440,6 +4499,9 @@ impl UiState {
         if self.mode == Mode::Contacts {
             return self.handle_contacts_key(code);
         }
+        if self.mode == Mode::DirectPunches {
+            return self.handle_direct_punches_key(code);
+        }
 
         // The top row's two selectors (`docs/SPEC.md` "Connected UI"):
         // `[` walks left, `]` walks right, and the outermost press on
@@ -4515,6 +4577,22 @@ impl UiState {
                     self.join_popup_password.clear();
                     self.join_popup_focus = JoinPopupFocus::Name;
                     return None;
+                }
+                // Opens the first not-yet-opened http(s) link in the
+                // focused message (`message_selected`) in the OS default
+                // browser; pressing it again cycles to that same
+                // message's next link before starting over.
+                KeyCode::Char('o') | KeyCode::Char('O') => {
+                    return self.next_url_in_focused_message().map(UiAction::OpenUrl);
+                }
+                // Opens the "Direct Punches" popup - only worth reaching
+                // for once direct punching is at least worth looking at,
+                // but the popup itself (`open_direct_punches`) is where
+                // adding the very first one from scratch happens too, so
+                // it's never gated on any already being configured.
+                KeyCode::Char('s') | KeyCode::Char('S') => {
+                    self.open_direct_punches();
+                    return Some(UiAction::OpenDirectPunches);
                 }
                 _ => {}
             }
@@ -5050,6 +5128,35 @@ impl UiState {
             // are, and where joining one from the list happens.
             self.input.clear();
             self.open_channels_popup();
+            return None;
+        }
+        if self.input.trim() == "/clear" {
+            // Wipes the log of whichever screen is open right now - not
+            // just what's on screen, the `Vec<LogEntry>` backing it, so a
+            // scrollback of anything cleared this way is genuinely gone,
+            // not merely scrolled past.
+            self.input.clear();
+            if let Some(log) = self.current_log_mut() {
+                log.clear();
+            }
+            self.message_selected = 0;
+            self.message_info = None;
+            self.push_status_notice("cleared this screen's messages".to_string(), true);
+            return None;
+        }
+        if self.input.trim() == "/clear-all" {
+            // Same as `/clear`, but for every channel tab and every DM
+            // room at once - not just the one currently open.
+            self.input.clear();
+            for channel in self.channels.iter_mut() {
+                channel.log.clear();
+            }
+            for room in self.private_rooms.values_mut() {
+                room.log.clear();
+            }
+            self.message_selected = 0;
+            self.message_info = None;
+            self.push_status_notice("cleared every screen's messages".to_string(), true);
             return None;
         }
         if self.input.trim() == "/contacts" {
@@ -5631,6 +5738,31 @@ impl UiState {
         }
     }
 
+    /// The next not-yet-opened http(s) URL in the focused message
+    /// (`message_selected`), for Ctrl+O. A message with more than one link
+    /// cycles through them on repeated presses; moving the cursor to a
+    /// different message starts back at its first link, since
+    /// `last_opened_url`'s row no longer matches.
+    fn next_url_in_focused_message(&mut self) -> Option<String> {
+        let selected = self.message_selected;
+        let url = {
+            let MessageBody::Text(text) = &self.current_log().get(selected)?.body else {
+                return None;
+            };
+            let urls = find_urls(text);
+            if urls.is_empty() {
+                return None;
+            }
+            let next = match self.last_opened_url {
+                Some((row, url_idx)) if row == selected => (url_idx + 1) % urls.len(),
+                _ => 0,
+            };
+            (next, text[urls[next].clone()].to_string())
+        };
+        self.last_opened_url = Some((selected, url.0));
+        Some(url.1)
+    }
+
     /// Call periodically; auto-stops a recording once Space has been quiet
     /// for `RECORD_HOLD_TIMEOUT`, for terminals that never send `Release`
     /// (see `handle_key`). A no-op when `keyboard_release_reporting` is
@@ -5891,6 +6023,9 @@ pub fn render(frame: &mut Frame, state: &UiState) {
     }
     if state.mode == Mode::Contacts {
         super::contacts::render_contacts_popup(frame, area, state);
+    }
+    if state.mode == Mode::DirectPunches {
+        super::direct_punch_popup::render_direct_punches_popup(frame, area, state);
     }
     // One message's delivery details, drawn under the help overlay and
     // every consent popup for the same reason `handle_key` lets those
@@ -7115,6 +7250,48 @@ fn sender_prefix(entry: &LogEntry) -> Vec<Span<'static>> {
     }
 }
 
+/// Every `http://`/`https://` URL in `text`, as byte ranges - shared by
+/// message rendering (underlines each one) and Ctrl+O (opens one). A link
+/// is a whitespace-delimited token starting with one of those schemes, so
+/// no regex is needed: `split_whitespace`'s tokens are relocated by
+/// scanning forward from where the last one ended, since it doesn't hand
+/// back byte offsets itself.
+fn find_urls(text: &str) -> Vec<std::ops::Range<usize>> {
+    let mut out = Vec::new();
+    let mut from = 0;
+    for token in text.split_whitespace() {
+        let Some(rel) = text[from..].find(token) else {
+            continue;
+        };
+        let start = from + rel;
+        let end = start + token.len();
+        from = end;
+        if token.starts_with("http://") || token.starts_with("https://") {
+            out.push(start..end);
+        }
+    }
+    out
+}
+
+/// Appends `text` to `spans`, with every link `find_urls` finds in it
+/// rendered blue and underlined instead of the surrounding plain text.
+fn push_text_with_links(spans: &mut Vec<Span<'static>>, text: &str) {
+    let mut pos = 0;
+    for range in find_urls(text) {
+        if range.start > pos {
+            spans.push(Span::raw(text[pos..range.start].to_string()));
+        }
+        spans.push(Span::styled(
+            text[range.clone()].to_string(),
+            Style::default().fg(Color::Blue).add_modifier(Modifier::UNDERLINED),
+        ));
+        pos = range.end;
+    }
+    if pos < text.len() {
+        spans.push(Span::raw(text[pos..].to_string()));
+    }
+}
+
 pub(crate) fn render_messages(
     frame: &mut Frame,
     area: Rect,
@@ -7197,7 +7374,7 @@ pub(crate) fn render_messages(
             let mut line = match &entry.body {
                 MessageBody::Text(text) => {
                     let mut spans = sender_prefix(entry);
-                    spans.push(Span::raw(text.clone()));
+                    push_text_with_links(&mut spans, text);
                     Line::from(spans)
                 }
                 MessageBody::Voice { duration_ms, .. } => {

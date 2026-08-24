@@ -398,6 +398,49 @@ fn direct_punch_on_reads_one_target_per_line() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// @requirement AC-287
+#[test]
+fn has_direct_punch_configured_is_false_by_default() {
+    let settings = Settings::load_or_create(&temp_settings_path()).unwrap();
+    assert!(!settings.has_direct_punch_configured());
+}
+
+/// @requirement AC-287
+#[test]
+fn has_direct_punch_configured_is_false_with_targets_but_the_switch_off() {
+    let path = temp_settings_path();
+    std::fs::write(&path, "direct_punch_to=bob,bobpublic.com,every_1m\n").unwrap();
+    let settings = Settings::load_or_create(&path).unwrap();
+    assert!(!settings.direct_punch);
+    assert!(!settings.direct_punch_to.is_empty());
+    assert!(!settings.has_direct_punch_configured());
+    let _ = std::fs::remove_file(&path);
+}
+
+/// @requirement AC-287
+#[test]
+fn has_direct_punch_configured_is_false_with_the_switch_on_but_no_targets() {
+    let path = temp_settings_path();
+    std::fs::write(&path, "direct_punch=on\n").unwrap();
+    let settings = Settings::load_or_create(&path).unwrap();
+    assert!(!settings.has_direct_punch_configured());
+    let _ = std::fs::remove_file(&path);
+}
+
+/// @requirement AC-287
+#[test]
+fn has_direct_punch_configured_is_true_with_the_switch_on_and_a_target() {
+    let path = temp_settings_path();
+    std::fs::write(
+        &path,
+        "direct_punch=on\ndirect_punch_to=bob,bobpublic.com,every_1m\n",
+    )
+    .unwrap();
+    let settings = Settings::load_or_create(&path).unwrap();
+    assert!(settings.has_direct_punch_configured());
+    let _ = std::fs::remove_file(&path);
+}
+
 /// @requirement AC-212
 #[test]
 fn a_target_host_may_be_ipv4_ipv6_or_a_name_and_may_carry_its_own_port() {

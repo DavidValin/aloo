@@ -171,6 +171,13 @@ async fn log_holds_a_page_and_a_half(w: &mut AlooWorld) {
     }
 }
 
+#[given(expr = "{word} sends the channel message {string}")]
+#[when(expr = "{word} sends the channel message {string}")]
+async fn peer_sends_channel_message(w: &mut AlooWorld, name: String, body: String) {
+    let id = UserId(id_for(&name));
+    w.ui_mut().on_channel_message("general", id, name, MessageBody::Text(body));
+}
+
 #[given(expr = "{word} has sent me the private message {string}")]
 #[when(expr = "{word} has sent me the private message {string}")]
 async fn peer_sent_dm(w: &mut AlooWorld, name: String, body: String) {
@@ -249,6 +256,7 @@ async fn press_named(w: &mut AlooWorld, key: String) {
         "Ctrl+H" => (KeyCode::Char('h'), KeyModifiers::CONTROL),
         "Ctrl+Shift+H" => (KeyCode::Char('H'), KeyModifiers::CONTROL),
         "Ctrl+J" => (KeyCode::Char('j'), KeyModifiers::CONTROL),
+        "Ctrl+O" => (KeyCode::Char('o'), KeyModifiers::CONTROL),
         "Ctrl+R" => (KeyCode::Char('r'), KeyModifiers::CONTROL),
         "Ctrl+S" => (KeyCode::Char('s'), KeyModifiers::CONTROL),
         other => panic!("unknown key {other:?}"),

@@ -75,6 +75,7 @@ fn received_ref() -> ReceivedMailRef {
         sent_at_utc: 1_700_000_100,
         received_at_utc: 1_700_000_200,
         size: 42,
+        read: false,
     }
 }
 

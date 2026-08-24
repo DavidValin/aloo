@@ -1290,23 +1290,66 @@ pub(crate) fn server_link_color(state: ServerLinkState) -> Color {
     }
 }
 
-/// Conn quality, CPU usage and the help hint, in that order
-/// (`docs/SPEC.md` "Connected UI") - built up front so the row can be laid
-/// out around its real width.
+/// Direct punching, Conn quality, CPU usage and the help hint, in that
+/// order (`docs/SPEC.md` "Connected UI") - built up front so the row can be
+/// laid out around its real width. The direct-punch element is the one
+/// piece that's conditional: nothing is shown for it at all unless direct
+/// punching is actually configured.
 fn status_line(state: &UiState) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(
-            format!("Conn:{}", state.conn_quality.label()),
-            Style::default().fg(conn_color(state.conn_quality)),
-        ),
-        Span::raw("  "),
-        Span::styled(
-            format!("CPU:{}%", cpu_pct_rounded(state.cpu_usage_pct)),
-            Style::default().fg(cpu_color(state.cpu_usage_pct)),
-        ),
-        Span::raw("  "),
-        Span::styled("Ctrl+H: Help", Style::default().fg(Color::DarkGray)),
-    ])
+    let mut spans = Vec::new();
+    if state.unread_otp_mail_count > 0 {
+        spans.push(Span::styled(
+            format!(
+                "{} {} unread OTP Mails",
+                super::ui::unread_envelope(state.blink_on),
+                state.unread_otp_mail_count
+            ),
+            Style::default().fg(Color::Yellow),
+        ));
+        spans.push(Span::raw("  "));
+    }
+    if let Some((active, total, next_in)) = state.direct_punch_status {
+        let next = next_in
+            .map(human_duration)
+            .unwrap_or_else(|| "-".to_string());
+        spans.push(Span::styled(
+            format!("{active}/{total} direct punches, next try in {next} (Control+s)"),
+            Style::default().fg(if active == total {
+                Color::Green
+            } else {
+                Color::Yellow
+            }),
+        ));
+        spans.push(Span::raw("  "));
+    }
+    spans.push(Span::styled(
+        format!("Conn:{}", state.conn_quality.label()),
+        Style::default().fg(conn_color(state.conn_quality)),
+    ));
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled(
+        format!("CPU:{}%", cpu_pct_rounded(state.cpu_usage_pct)),
+        Style::default().fg(cpu_color(state.cpu_usage_pct)),
+    ));
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled("Ctrl+H: Help", Style::default().fg(Color::DarkGray)));
+    Line::from(spans)
+}
+
+/// Renders a duration the way the status line names "next try in": whole
+/// seconds under a minute, whole minutes under an hour, whole hours
+/// beyond - the same granularity `docs/PROTOCOL.md` §7.1.5's slot grid
+/// itself is expressed in, so it never claims more precision than the grid
+/// actually has.
+fn human_duration(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{}h", secs / 3600)
+    }
 }
 
 fn render_call_marker(frame: &mut Frame, area: Rect, blink_on: bool, self_muted: bool) {

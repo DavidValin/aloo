@@ -101,6 +101,8 @@ thing in-app at any time.
 | `Up` / `Down` | Scroll the log one message (works from the compose bar too), or pick an entry in a dropdown or the sidebar |
 | `PgUp` / `PgDn` | Scroll ten at a time |
 | `Home` / `End` | Jump to the oldest / newest message (log focused) |
+| `Ctrl+O` | Open the focused message's link in your default browser — presses again cycle through more than one |
+| `Ctrl+S` | Open the "Direct Punches" popup (shown only once you've configured one — see "Punching straight to someone") |
 | `Ctrl+H` | Help — `Esc` or `Ctrl+H` closes |
 | `Ctrl+C` | Quit |
 
@@ -113,6 +115,8 @@ dropdown left alone folds itself away after 30 seconds.
 |---|---|
 | type + `Enter` | Send to the current channel or DM (compose bar focused) |
 | `i` | Details of the selected message: when it was sent, and who has it (message log focused) |
+| `/clear` | Empty the log of whichever channel or DM is open right now |
+| `/clear-all` | Empty every channel and DM's log at once |
 
 **Did it get there?** A message you sent reads `you -> message`, and the
 arrow says how far it has got: **grey** while nobody has it, **green** once
@@ -239,6 +243,9 @@ they're next online. Requires
 | hold `Space` | Record a voice attachment (attachments pane focused) |
 | `Ctrl+S` | Send |
 | `/mailbox` | Your mailbox: each sent mail's delivery status, and what arrived |
+
+While anything you've received is still unread, the header shows a blinking
+✉ and `<n> unread OTP Mails` — gone the moment you open it in the mailbox.
 
 Needs a pinned recipient you share a pad with, and more pad left than the
 mail is long — the remaining key shows top-right, updating as you type and
@@ -416,6 +423,8 @@ direct_punch_to=marco,marcohost.com,every_1h
 
 One line per person: their nickname, where their client is (an IPv4 address, an IPv6 address, or a hostname — add `:9000` for a port other than the default 7879), and how often to try. The frequency can be `every_1m`, `every_5m`, `every_10m`, `every_15m`, `every_20m`, `every_25m`, `every_30m`, `every_35m`, `every_40m`, `every_45m`, `every_50m`, `every_55m` or `every_1h`.
 
+You don't have to hand-edit the file: **`Ctrl+S`** opens a "Direct Punches" popup listing every configured target — `a` adds one, `Enter`/`e` edits the selected one, `d` deletes it, `Esc` backs out. Saving writes straight back to `~/.aloo/settings` and reconfigures the schedule immediately, no restart needed. Once at least one is configured, the header shows `<active>/<total> direct punches, next try in <time> (Control+s)` to its left, in green once every configured peer is connected and yellow otherwise.
+
 Every schedule restarts at the top of the hour — `every_1m` tries at :00, :01, :02, and so on; `every_1h` at :00 only — which is exactly what makes it work: you're both trying at the same moments, so your two routers open up to each other at the same time. That's also why you both need the same frequency for a given person.
 
 Each attempt keeps trying for 30 seconds. Once you're connected, aloo leaves it alone and stops trying — until the connection drops, at which point it re-punches straight away (up to 5 times) if there's no server that could do it instead. You'll never end up with two connections to the same person; direct or server-arranged, there's only ever one.
@@ -446,7 +455,10 @@ If everyone you want to reach is already in `direct_punch_to`, you don't need a 
 ```sh
 aloo --daemon --no-server              # background
 aloo --daemon --foreground --no-server # stay in the terminal
+aloo --no-server                       # plain foreground client, no daemon
 ```
+
+A plain `aloo --no-server` skips the connect popup — there's no server to log in to — and goes straight to the connected screen if `direct_punch_to` names at least one peer. With none configured there's nothing to reach, so it prints a one-line explanation and exits immediately instead of opening to an empty screen.
 
 Channels come from your settings (`direct_punch_channel=general`, one per line) — those are the only ones that exist, and they're what `Ctrl+J` and `/channels` show. Everything that actually carries anything still works: messages, voice, push-to-talk, files, calls, and live `/otp` sessions are all peer-to-peer and never needed a server.
 

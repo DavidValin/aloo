@@ -56,6 +56,7 @@ fn received(id_byte: u8) -> ReceivedMailRef {
         sent_at_utc: 4_000,
         received_at_utc: 6_000 + id_byte as u64,
         size: 3,
+        read: false,
     }
 }
 
@@ -179,4 +180,87 @@ fn refs_list_newest_first() {
     store.record_sent(sent(0x09, SentMailStatus::Delivered)); // sent_at 5009
     let sent_ids: Vec<u64> = store.sent_refs().iter().map(|r| r.sent_at_utc).collect();
     assert_eq!(sent_ids, vec![5009, 5001]);
+}
+
+// ---------------------------------------------------------------------
+// Unread tracking (header's "<n> unread OTP Mails")
+// ---------------------------------------------------------------------
+
+/// @requirement AC-292
+#[test]
+fn a_freshly_stored_mail_is_unread() {
+    let t = TempStore::new("fresh-unread");
+    let mut store = t.store();
+    let (ct, pad) = repad(b"hi");
+    store.store_received_payload(received(0x01), &ct, &pad).unwrap();
+    assert_eq!(store.unread_received_count(), 1);
+}
+
+/// @requirement AC-292
+#[test]
+fn mark_read_flips_the_flag_and_is_idempotent() {
+    let t = TempStore::new("mark-read");
+    let mut store = t.store();
+    let (ct, pad) = repad(b"hi");
+    let r = received(0x02);
+    store.store_received_payload(r.clone(), &ct, &pad).unwrap();
+
+    assert!(store.mark_read(&r.mail_id), "the first read genuinely changes it");
+    assert_eq!(store.unread_received_count(), 0);
+    assert!(!store.mark_read(&r.mail_id), "reading an already-read mail changes nothing");
+    assert!(
+        !store.mark_read("no-such-id"),
+        "an unknown id is a no-op, not a panic"
+    );
+}
+
+/// @requirement AC-292
+#[test]
+fn unread_received_count_counts_only_the_ones_still_unread() {
+    let t = TempStore::new("mixed-unread");
+    let mut store = t.store();
+    let (ct, pad) = repad(b"hi");
+    let a = received(0x03);
+    let b = received(0x04);
+    store.store_received_payload(a.clone(), &ct, &pad).unwrap();
+    store.store_received_payload(b, &ct, &pad).unwrap();
+    assert_eq!(store.unread_received_count(), 2);
+
+    store.mark_read(&a.mail_id);
+    assert_eq!(store.unread_received_count(), 1);
+}
+
+/// @requirement AC-292
+#[test]
+fn the_read_flag_round_trips_through_save_and_load() {
+    let t = TempStore::new("read-roundtrip");
+    let mut store = t.store();
+    let (ct, pad) = repad(b"hi");
+    let r = received(0x05);
+    store.store_received_payload(r.clone(), &ct, &pad).unwrap();
+    store.mark_read(&r.mail_id);
+    store.save().unwrap();
+
+    let reloaded = OtpMailStore::load(t.dir.clone()).unwrap();
+    assert_eq!(reloaded.unread_received_count(), 0);
+    assert!(reloaded.received_ref(&r.mail_id).unwrap().read);
+}
+
+/// A line written before `read` existed loads as already read - the safe,
+/// quiet default, so upgrading never surfaces a stampede of "new" mail
+/// that predates the concept.
+///
+/// @requirement AC-292
+#[test]
+fn a_line_written_before_read_existed_loads_as_read() {
+    let t = TempStore::new("legacy-line");
+    std::fs::create_dir_all(&t.dir).unwrap();
+    std::fs::write(
+        t.dir.join("index"),
+        "R\tid0000\talice\t100\t200\t3\n", // five fields, no trailing `read`
+    )
+    .unwrap();
+    let store = OtpMailStore::load(t.dir.clone()).unwrap();
+    assert_eq!(store.unread_received_count(), 0);
+    assert!(store.received_ref("id0000").unwrap().read);
 }

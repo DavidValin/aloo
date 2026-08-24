@@ -533,6 +533,15 @@ async fn mailbox_requested(w: &mut AlooWorld) {
     );
 }
 
+// ---------------------------------------------------------------------
+// The header's unread count (AC-292, AC-293)
+// ---------------------------------------------------------------------
+
+#[given(expr = "{int} OTP mails are unread")]
+async fn unread_otp_mails(w: &mut AlooWorld, n: usize) {
+    w.ui_mut().set_unread_otp_mail_count(n);
+}
+
 #[when("the mailbox holds a delivered mail to bob and a received mail from alice")]
 async fn mailbox_rows(w: &mut AlooWorld) {
     w.ui_mut().otp_mail_set_mailbox_rows(vec![
@@ -550,6 +559,7 @@ async fn mailbox_rows(w: &mut AlooWorld) {
             sent_at_utc: 1_766_000_100,
             received_at_utc: 1_766_000_200,
             size: 42,
+            read: false,
         }),
     ]);
 }
@@ -626,6 +636,7 @@ async fn store_repadded(w: &mut AlooWorld) {
                 sent_at_utc: 1,
                 received_at_utc: 2,
                 size: w.otp_mail_payload.len() as u64,
+                read: false,
             },
             &ct,
             &pad,
