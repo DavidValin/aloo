@@ -13,10 +13,12 @@
 
 use cucumber::{given, then, when};
 
+use aloo::client::file_transfer::{OtpIncomingFileReceive, OtpIncomingKind};
 use aloo::client::otp::{
     OtpFraming, apply_incoming_setup, commit_pending_setup, contact_name_if_active,
-    detect_or_adopt_existing, discard_pending_setup, framing_for, initiate_provisioning,
-    own_pad_wins_glare, read_pending_setup, send_or_queue, unwrap_incoming, wrap_outgoing,
+    detect_or_adopt_existing, discard_pending_setup, finish_incoming_file, framing_for,
+    initiate_provisioning, own_pad_wins_glare, read_pending_setup, resume_pending_content_sends,
+    send_or_queue, send_voice_offer, unwrap_incoming, wrap_outgoing,
 };
 use aloo::client::otp_cli::{self, OtpCliConfig};
 use aloo::client::otp_store::{OtpStore, PendingOtpContent};
@@ -562,6 +564,25 @@ async fn otp_session_was_ended(w: &mut AlooWorld) {
     );
 }
 
+#[then("the end is refused because bob cannot confirm it")]
+async fn otp_end_refused_offline(w: &mut AlooWorld) {
+    assert!(
+        !matches!(w.last_action, Some(UiAction::EndOtpSession { .. })),
+        "an offline peer cannot confirm the end, so no EndOtpSession may be produced: {:?}",
+        w.last_action
+    );
+    let (message, success) = w
+        .ui_ref()
+        .status_notice
+        .clone()
+        .expect("the refusal explains itself instead of silently doing nothing");
+    assert!(
+        message.contains("offline") && message.contains("both sides online"),
+        "the notice names the reason: {message:?}"
+    );
+    assert!(!success);
+}
+
 /// The pre-spend `otp --show-contact` snapshot a session holds for a peer
 /// (`UiState::set_otp_key_status`), which is what the message details
 /// popup reads a row's pad position out of (AC-243).
@@ -708,6 +729,10 @@ async fn pad_only_peer(
     // A serverless client is its own `direct_peer_id` too - there is no
     // server to assign one (`client::daemon::run`).
     ui.set_own_id(aloo::client::p2p::direct_peer_id(own_name));
+    // A pair set up already holding a pad for each other is, by
+    // definition, currently linked - individual scenarios modeling a peer
+    // going unreachable override this explicitly.
+    ui.set_link_status(peer, aloo::client::p2p::LinkStatus::Active);
     crate::world::PadOnlyPeer {
         session,
         ui,
@@ -930,7 +955,12 @@ async fn deliver_pad_envelope(
 
 #[when(expr = "{word} runs \\/endotp with {word}")]
 async fn pad_only_endotp(w: &mut AlooWorld, _a: String, _b: String) {
-    let (a, _) = w.pad_only.as_mut().expect("no pad-only pair");
+    let (a, b) = w.pad_only.as_mut().expect("no pad-only pair");
+    // What a pad-only pair's link coming up establishes on both screens
+    // (`session::register_pad_only_peer` marks OTP active immediately) -
+    // `/endotp` now requires a genuinely active session to end.
+    a.ui.mark_otp_active(a.peer);
+    b.ui.mark_otp_active(b.peer);
     let peer_der = a.peer_der.clone();
     let peer = a.peer;
     aloo::client::otp::handle_end_otp_command(
@@ -944,7 +974,183 @@ async fn pad_only_endotp(w: &mut AlooWorld, _a: String, _b: String) {
     .expect("/endotp should not fail");
 }
 
-#[then("the notice reaches bob under the pad, and his ack comes back the same way")]
+#[given("bob has become unreachable for alice")]
+async fn pad_only_peer_unreachable(w: &mut AlooWorld) {
+    let (a, _) = w.pad_only.as_mut().expect("no pad-only pair");
+    let peer = a.peer;
+    a.ui.offline.insert(peer);
+    a.ui.set_link_status(peer, aloo::client::p2p::LinkStatus::Lost);
+}
+
+#[when("alice runs /endotp with bob expecting a refusal")]
+async fn pad_only_endotp_refused(w: &mut AlooWorld) {
+    let (a, b) = w.pad_only.as_mut().expect("no pad-only pair");
+    a.ui.mark_otp_active(a.peer);
+    b.ui.mark_otp_active(b.peer);
+    let peer_der = a.peer_der.clone();
+    let peer = a.peer;
+    aloo::client::otp::handle_end_otp_command(
+        &mut aloo::control::NullSink,
+        &mut a.ui,
+        &mut a.session,
+        peer,
+        peer_der,
+    )
+    .await
+    .expect("a refusal is not an error");
+}
+
+#[then("the end is refused with nothing spent and the session still active")]
+async fn pad_only_end_refused(w: &mut AlooWorld) {
+    let contact = w.otp_contact_name.clone().expect("no contact");
+    let (a, _) = w.pad_only.as_mut().expect("no pad-only pair");
+    let peer = a.peer;
+    let envelopes = a
+        .session
+        .peer_link_mut()
+        .pending_payloads(peer)
+        .into_iter()
+        .filter(|p| matches!(p, aloo::p2p_proto::P2pPayload::OtpEnvelope { .. }))
+        .count();
+    assert_eq!(envelopes, 0, "a refused end must put nothing on the wire");
+    assert!(
+        a.ui.is_otp_active(peer),
+        "the session stays exactly as it was"
+    );
+    let state = a.session.otp_store_mut().get(&contact).expect("the contact exists");
+    assert!(!state.pending_end_notice, "no end is owed - nothing entered the handshake");
+    assert_eq!(
+        state.next_out_seq, 0,
+        "and not a byte of pad was spent on the refusal"
+    );
+    let (message, success) = a
+        .ui
+        .status_notice
+        .clone()
+        .expect("the refusal explains itself");
+    assert!(
+        message.contains("offline") && message.contains("both sides online"),
+        "the notice says why and what to do: {message:?}"
+    );
+    assert!(!success);
+}
+
+#[when("bob drops before confirming, and later reconnects")]
+async fn pad_only_peer_drops_and_reconnects(w: &mut AlooWorld) {
+    // The queued notice is simply never handed to bob - his connection
+    // handle from that moment is dead. On his return, alice knows him
+    // again (what `register_pad_only_peer` does on the link coming up) and
+    // her link-Active passes run exactly as `session.rs` runs them.
+    let (a, _) = w.pad_only.as_mut().expect("no pad-only pair");
+    a.ui.known_users.insert(
+        a.peer,
+        aloo::proto::UserInfo {
+            id: a.peer,
+            name: "bob".into(),
+            public_key_der: a.peer_der.clone(),
+            key_mode: aloo::proto::KeyMode::PqHybrid,
+        },
+    );
+    aloo::client::otp::recover_and_resend(&mut aloo::control::NullSink, &mut a.session, &mut a.ui)
+        .await
+        .expect("the recovery pass should not fail");
+    aloo::client::otp::resend_pending_end_notices(
+        &mut aloo::control::NullSink,
+        &mut a.session,
+        &mut a.ui,
+    )
+    .await
+    .expect("the notice pass should not fail");
+}
+
+#[then("the very same notice is re-sent from recovery, and his confirmation ends it for both")]
+async fn pad_only_end_recovered(w: &mut AlooWorld) {
+    let contact = w.otp_contact_name.clone().expect("no contact");
+    let (a, b) = w.pad_only.as_mut().expect("no pad-only pair");
+    let peer = a.peer;
+    let envelopes: Vec<(u64, Option<u64>, aloo::proto::Envelope)> = a
+        .session
+        .peer_link_mut()
+        .pending_payloads(peer)
+        .into_iter()
+        .filter_map(|p| match p {
+            aloo::p2p_proto::P2pPayload::OtpEnvelope {
+                seq,
+                msg_id,
+                envelope,
+                ..
+            } => Some((seq, msg_id, envelope)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        envelopes.len(),
+        2,
+        "the original and exactly one recovered copy - the retry re-sends, never re-encodes"
+    );
+    assert_eq!(
+        envelopes[0].0, envelopes[1].0,
+        "both under the same slot: a re-encrypt would have taken a second one"
+    );
+    let state = a.session.otp_store_mut().get(&contact).expect("the contact exists");
+    assert_eq!(
+        state.next_out_seq, 1,
+        "one spend total - the pair's pads stay in lockstep"
+    );
+    assert!(
+        a.ui.is_otp_active(peer),
+        "two-phase: alice is still in the session until bob confirms"
+    );
+
+    // Bob finally receives the recovered copy...
+    let (seq, msg_id, envelope) = envelopes.into_iter().next_back().unwrap();
+    aloo::client::otp::on_message(
+        &mut b.session,
+        &mut b.ui,
+        None,
+        b.peer,
+        "alice".into(),
+        seq,
+        msg_id,
+        envelope,
+    )
+    .await
+    .expect("the receive path should not fail");
+    assert!(!b.ui.is_otp_active(b.peer), "bob's side ends the moment it lands");
+
+    // ...and his proof-carrying confirmation ends it on alice's side too.
+    let (ack_seq, proof) = b
+        .session
+        .peer_link_mut()
+        .pending_payloads(b.peer)
+        .into_iter()
+        .filter_map(|p| match p {
+            aloo::p2p_proto::P2pPayload::OtpDeliveryAck { seq, proof } => Some((seq, proof)),
+            _ => None,
+        })
+        .next_back()
+        .expect("the notice earns the same proof-carrying ack a message does");
+    aloo::client::otp::on_delivery_ack(
+        &mut aloo::control::NullSink,
+        &mut a.ui,
+        &mut a.session,
+        peer,
+        ack_seq,
+        proof,
+    )
+    .await
+    .expect("the ack path should not fail");
+    assert!(!a.ui.is_otp_active(peer), "confirmed - both sides out together");
+    assert!(
+        a.session
+            .otp_store_mut()
+            .get(&contact)
+            .is_some_and(|s| !s.pending_end_notice && s.pending_unacked_out_seq.is_none()),
+        "nothing owed, nothing outstanding"
+    );
+}
+
+#[then("the notice reaches bob under the pad, and his proof-carrying ack settles it")]
 async fn pad_only_end_notice(w: &mut AlooWorld) {
     let contact = w.otp_contact_name.clone().expect("no contact");
     let (a, b) = w.pad_only.as_mut().expect("no pad-only pair");
@@ -955,18 +1161,57 @@ async fn pad_only_end_notice(w: &mut AlooWorld) {
             .is_some_and(|s| s.pending_end_notice),
         "the notice is owed until the peer confirms it"
     );
+    assert!(
+        a.session
+            .otp_store_mut()
+            .get(&contact)
+            .and_then(|s| s.pending_unacked_out_seq)
+            .is_some(),
+        "an ordinary gated send now: the gate closes behind the notice"
+    );
     deliver_pad_envelope(a, b, "alice").await;
     assert!(
         !b.ui.is_otp_active(b.peer),
         "the peer converges to paused on reading it"
     );
-    deliver_pad_envelope(b, a, "bob").await;
+    // Bob answers with the ordinary proof-carrying OtpDeliveryAck - free of
+    // pad, like every message's ack - and that one ack settles both the
+    // gate and the durable retry.
+    let (seq, proof) = b
+        .session
+        .peer_link_mut()
+        .pending_payloads(b.peer)
+        .into_iter()
+        .filter_map(|p| match p {
+            aloo::p2p_proto::P2pPayload::OtpDeliveryAck { seq, proof } => Some((seq, proof)),
+            _ => None,
+        })
+        .next_back()
+        .expect("the notice earns the same proof-carrying ack a message does");
+    assert!(
+        a.ui.is_otp_active(a.peer),
+        "two-phase: alice's own side stays in the session until bob confirms"
+    );
+    aloo::client::otp::on_delivery_ack(
+        &mut aloo::control::NullSink,
+        &mut a.ui,
+        &mut a.session,
+        a.peer,
+        seq,
+        proof,
+    )
+    .await
+    .expect("the ack path should not fail");
     assert!(
         a.session
             .otp_store_mut()
             .get(&contact)
-            .is_some_and(|s| !s.pending_end_notice),
-        "and his ack - itself under the pad - is what stops the retry"
+            .is_some_and(|s| !s.pending_end_notice && s.pending_unacked_out_seq.is_none()),
+        "his proof-carrying ack is what stops the retry and reopens the gate"
+    );
+    assert!(
+        !a.ui.is_otp_active(a.peer),
+        "and only that confirmation pauses alice's own side - both ends in sync"
     );
 }
 
@@ -1047,4 +1292,174 @@ async fn otp_active_with_nothing_sent(w: &mut AlooWorld, _b: String) {
             )),
         "and no session request goes out - there is no envelope to carry one"
     );
+}
+
+// ---------------------------------------------------------------------
+// A voice send's content phase surviving the sender's own restart (AC-316)
+// ---------------------------------------------------------------------
+
+#[when("alice records and sends a voice message to bob")]
+async fn pad_only_send_voice(w: &mut AlooWorld) {
+    let contact = w.otp_contact_name.clone().expect("no contact");
+    let (a, b) = w.pad_only.as_mut().expect("no pad-only pair");
+    let pcm = b"the recording a restart must not lose".to_vec();
+    let peer = a.peer;
+    let peer_der = a.peer_der.clone();
+    send_voice_offer(
+        &mut aloo::control::NullSink,
+        &mut a.session,
+        &mut a.ui,
+        peer,
+        &contact,
+        &peer_der,
+        pcm.clone(),
+        1200,
+    )
+    .await
+    .expect("the voice offer should not fail");
+
+    let (stream_id, seq, envelope) = a
+        .session
+        .peer_link_mut()
+        .pending_payloads(peer)
+        .into_iter()
+        .find_map(|p| match p {
+            aloo::p2p_proto::P2pPayload::OtpVoiceOffer {
+                stream_id,
+                seq,
+                envelope,
+                ..
+            } => Some((stream_id, seq, envelope)),
+            _ => None,
+        })
+        .expect("the offer should have gone out");
+    w.otp_stream_id = Some(stream_id);
+    w.otp_voice_pcm = Some(pcm);
+
+    // Bob receives it and auto-accepts - both his reply and his ack for
+    // the offer sit queued, undelivered, exactly as they would if alice
+    // were unreachable right now.
+    aloo::client::otp::on_voice_offer(
+        &mut aloo::control::NullSink,
+        &mut b.session,
+        &mut b.ui,
+        b.peer,
+        stream_id,
+        seq,
+        envelope,
+    )
+    .await;
+}
+
+#[when("alice's whole process restarts before bob's acceptance is processed")]
+async fn pad_only_sender_restarts(w: &mut AlooWorld) {
+    let (a, _) = w.pad_only.as_mut().expect("no pad-only pair");
+    a.session.clear_own_file_targets_for_test();
+    let store_path = a.session.otp_store_mut().path().to_path_buf();
+    let reloaded =
+        OtpStore::load(&store_path).expect("the staging record's file must reload");
+    *a.session.otp_store_mut() = reloaded;
+}
+
+#[when("alice reconnects and bob's acceptance reaches her")]
+async fn pad_only_resume_and_ack(w: &mut AlooWorld) {
+    let (a, b) = w.pad_only.as_mut().expect("no pad-only pair");
+    // Alice's own restart also lost whatever she knew about bob being
+    // reachable - `register_pad_only_peer` is what re-populates this on a
+    // real reconnect's link-up; `resume_pending_content_sends` needs it to
+    // resolve who to address.
+    a.ui.known_users.insert(
+        a.peer,
+        aloo::proto::UserInfo {
+            id: a.peer,
+            name: "bob".into(),
+            public_key_der: a.peer_der.clone(),
+            key_mode: aloo::proto::KeyMode::PqHybrid,
+        },
+    );
+    resume_pending_content_sends(&mut a.session, &mut a.ui)
+        .await
+        .expect("the resume pass should not fail");
+
+    let (ack_seq, proof) = b
+        .session
+        .peer_link_mut()
+        .pending_payloads(b.peer)
+        .into_iter()
+        .filter_map(|p| match p {
+            aloo::p2p_proto::P2pPayload::OtpDeliveryAck { seq, proof } => Some((seq, proof)),
+            _ => None,
+        })
+        .next()
+        .expect("bob acknowledged the offer");
+    aloo::client::otp::on_delivery_ack(
+        &mut aloo::control::NullSink,
+        &mut a.ui,
+        &mut a.session,
+        a.peer,
+        ack_seq,
+        proof,
+    )
+    .await
+    .expect("the ack path should not fail");
+}
+
+#[then("the recording still reaches bob, byte-identical, with no pad spent twice")]
+async fn pad_only_recording_arrives_once(w: &mut AlooWorld) {
+    let contact = w.otp_contact_name.clone().expect("no contact");
+    let stream_id = w.otp_stream_id.expect("no stream_id recorded");
+    let pcm = w.otp_voice_pcm.clone().expect("no pcm recorded");
+    let arrived = w.temp_path("pad-only-content-restart-arrived");
+    let (a, b) = w.pad_only.as_mut().expect("no pad-only pair");
+
+    let peer = a.peer;
+    let content_announcements: Vec<u64> = a
+        .session
+        .peer_link_mut()
+        .pending_payloads(peer)
+        .into_iter()
+        .filter_map(|p| match p {
+            aloo::p2p_proto::P2pPayload::OtpFileContentSeq {
+                stream_id: s, seq, ..
+            } if s == stream_id => Some(seq),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        content_announcements.len(),
+        1,
+        "the content must be encrypted and announced exactly once, never twice"
+    );
+    let content_seq = content_announcements[0];
+
+    let staged = a
+        .session
+        .otp_send_temp_file(stream_id)
+        .expect("the content phase stages its ciphertext")
+        .clone();
+    std::fs::copy(&staged, &arrived).unwrap();
+
+    finish_incoming_file(
+        &mut b.session,
+        &mut b.ui,
+        b.peer,
+        stream_id,
+        OtpIncomingFileReceive {
+            contact_name: contact,
+            seq: Some(content_seq),
+            temp_path: arrived,
+            kind: OtpIncomingKind::Voice { duration_ms: 1200 },
+        },
+    )
+    .await;
+
+    let delivered = b
+        .ui
+        .private_rooms
+        .values()
+        .flat_map(|r| r.log.iter())
+        .any(|e| {
+            matches!(&e.body, aloo::client::tui::ui::MessageBody::Voice { pcm: p, .. } if *p == pcm)
+        });
+    assert!(delivered, "the recording arrives at bob, byte-identical");
 }

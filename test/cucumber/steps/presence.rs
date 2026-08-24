@@ -316,23 +316,24 @@ async fn help_content(w: &mut AlooWorld) {
     );
 }
 
-/// The encryption tags and identity pinning are both far enough down the
-/// (now longer) help text that a typical terminal does not show them
-/// without scrolling - see `docs/SPEC.md` Functionality #7's scrollable
-/// overlay. Each is scrolled to independently (PageDown, incrementally)
-/// rather than assuming a single End-scroll screenful contains both -
-/// exactly how far apart they land shifts whenever `HELP_BODY` changes.
-#[then("scrolling to the bottom reveals identity pinning")]
+/// The encryption tags and the "Contacts & Keys" section are both far
+/// enough down the (now longer) help text that a typical terminal does not
+/// show them without scrolling - see `docs/SPEC.md` Functionality #7's
+/// scrollable overlay. Each is scrolled to independently (PageDown,
+/// incrementally) rather than assuming a single End-scroll screenful
+/// contains both - exactly how far apart they land shifts whenever
+/// `HELP_BODY` changes.
+#[then("scrolling to the bottom reveals contacts and keys")]
 async fn help_content_scrolled(w: &mut AlooWorld) {
     let rows = scroll_help_until(w, "PQH");
     assert!(
         rows.iter().any(|r| r.contains("PQH")),
         "expected the encryption tags explained: {rows:?}"
     );
-    let rows = scroll_help_until(w, "Identity pinning");
+    let rows = scroll_help_until(w, "Contacts & Keys");
     assert!(
-        rows.iter().any(|r| r.contains("Identity pinning")),
-        "expected identity pinning: {rows:?}"
+        rows.iter().any(|r| r.contains("Contacts & Keys")),
+        "expected the contacts and keys section: {rows:?}"
     );
 }
 

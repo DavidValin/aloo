@@ -421,7 +421,7 @@ fn a_line_written_before_pending_setup_existed_still_loads() {
 
 /// @requirement TB-212
 #[test]
-fn pause_session_clears_pending_state_but_keeps_the_pad_and_owes_a_notice() {
+fn mark_end_requested_owes_the_notice_and_touches_nothing_else() {
     let path = temp_store_path();
     let mut store = OtpStore::new_empty(path.clone());
     store.mark_provisioned("alice-bob");
@@ -429,23 +429,32 @@ fn pause_session_clears_pending_state_but_keeps_the_pad_and_owes_a_notice() {
     store.record_received("alice-bob", 0);
     store.mark_setup_pending("alice-bob", 2);
 
-    store.pause_session("alice-bob");
+    store.mark_end_requested("alice-bob");
 
     let state = store.get("alice-bob").unwrap();
+    assert!(state.pending_end_notice, "the end is owed to the peer, durably");
     assert!(
         state.provisioned,
-        "the pad itself is kept - /endotp no longer destroys the keychain entry"
+        "nothing else moves at request time - /endotp is two-phase and pauses nothing \
+         until the peer confirms"
     );
-    assert_eq!(state.pending_unacked_out_seq, None);
-    assert_eq!(state.pending_content, None);
-    assert_eq!(state.pending_setup_size_mb, None);
     assert_eq!(
-        state.next_out_seq, 4,
-        "a later /otp with the same contact resumes the identical pad - the sequence \
-         counters must survive a pause, not reset to 0"
+        state.pending_unacked_out_seq,
+        Some(3),
+        "an in-flight send's pad was already spent - the peer's decoder is waiting on \
+         exactly that ciphertext, so requesting the end must keep it recoverable"
     );
+    assert_eq!(
+        state.pending_content,
+        Some(PendingOtpContent::Text { channel: None })
+    );
+    assert_eq!(
+        state.pending_setup_size_mb,
+        Some(2),
+        "even the owed setup survives the request - teardown happens only at confirmation"
+    );
+    assert_eq!(state.next_out_seq, 4);
     assert_eq!(state.next_expected_in_seq, 1);
-    assert!(state.pending_end_notice, "the peer still needs to be told");
     std::fs::remove_file(&path).ok();
 }
 
@@ -455,11 +464,11 @@ fn a_pending_end_notice_survives_save_and_load() {
     let path = temp_store_path();
     let mut store = OtpStore::new_empty(path.clone());
     store.mark_provisioned("alice-bob");
-    store.pause_session("alice-bob");
+    store.mark_end_requested("alice-bob");
     store.save().unwrap();
 
     // Reloaded, because the whole point is surviving a restart - a peer who
-    // was offline when the session ended is still owed the notice tomorrow.
+    // dropped mid-handshake is still owed the notice tomorrow.
     let loaded = OtpStore::load(&path).unwrap();
     assert!(loaded.get("alice-bob").unwrap().pending_end_notice);
     std::fs::remove_file(&path).ok();
@@ -467,7 +476,7 @@ fn a_pending_end_notice_survives_save_and_load() {
 
 /// @requirement TB-212
 #[test]
-fn pause_after_peer_ended_clears_pending_state_but_owes_no_notice_of_its_own() {
+fn pause_after_peer_ended_keeps_the_inflight_send_and_owes_no_notice_of_its_own() {
     let path = temp_store_path();
     let mut store = OtpStore::new_empty(path.clone());
     store.mark_provisioned("alice-bob");
@@ -477,7 +486,12 @@ fn pause_after_peer_ended_clears_pending_state_but_owes_no_notice_of_its_own() {
 
     let state = store.get("alice-bob").unwrap();
     assert!(state.provisioned, "the pad itself is kept on the receiving side too");
-    assert_eq!(state.pending_unacked_out_seq, None);
+    assert_eq!(
+        state.pending_unacked_out_seq,
+        Some(1),
+        "this side's own in-flight send survives being told the session ended - its pad \
+         was already spent, and the peer's decoder still expects exactly that ciphertext"
+    );
     assert_eq!(
         state.next_out_seq, 2,
         "the sequence counters survive a pause on this side too"
@@ -495,7 +509,7 @@ fn clear_end_notice_reports_whether_anything_was_owed() {
     let path = temp_store_path();
     let mut store = OtpStore::new_empty(path.clone());
     store.mark_provisioned("alice-bob");
-    store.pause_session("alice-bob");
+    store.mark_end_requested("alice-bob");
     assert!(
         store.clear_end_notice("alice-bob"),
         "the first genuine ack clears it"
@@ -514,7 +528,7 @@ fn pending_end_notices_yields_only_contacts_still_owed_one() {
     let path = temp_store_path();
     let mut store = OtpStore::new_empty(path.clone());
     store.mark_provisioned("owed");
-    store.pause_session("owed");
+    store.mark_end_requested("owed");
     store.mark_provisioned("settled");
     let owed: Vec<String> = store.pending_end_notices().map(str::to_string).collect();
     assert_eq!(owed, vec!["owed".to_string()]);
@@ -546,7 +560,7 @@ fn pausing_one_contacts_session_does_not_touch_another_contacts_state() {
     store.mark_provisioned("alice-carol");
     store.record_sent("alice-carol", 5, PendingOtpContent::Text { channel: None }, None);
 
-    store.pause_session("alice-bob");
+    store.pause_after_peer_ended("alice-bob");
 
     assert!(
         store.get("alice-bob").unwrap().provisioned,
@@ -564,31 +578,33 @@ fn pausing_one_contacts_session_does_not_touch_another_contacts_state() {
 
 /// @requirement TB-212
 #[test]
-fn pause_session_on_a_never_provisioned_contact_does_not_fabricate_one() {
+fn pausing_or_requesting_an_end_never_fabricates_a_provisioned_contact() {
     let path = temp_store_path();
     let mut store = OtpStore::new_empty(path.clone());
-    store.pause_session("stranger");
-    let state = store.get("stranger").unwrap();
+    store.pause_after_peer_ended("stranger");
     assert!(
-        !state.provisioned,
+        !store.get("stranger").unwrap().provisioned,
         "pausing must never make an unprovisioned contact look provisioned"
     );
+    store.mark_end_requested("other-stranger");
+    let state = store.get("other-stranger").unwrap();
+    assert!(!state.provisioned, "nor may requesting an end");
     assert!(state.pending_end_notice);
     std::fs::remove_file(&path).ok();
 }
 
-/// `/endotp` pauses rather than destroys, so a paused contact and an
-/// unacknowledged "ended" notice can coexist - which means reopening has
-/// to be able to cancel that notice, or it would be re-sent on the next
-/// link transition and tear down the session just reopened
-/// (`client::otp::handle_otp_command` clears it before proposing).
+/// `/endotp` is two-phase, so an active contact and an unconfirmed end
+/// request can coexist - which means `/otp` has to be able to cancel that
+/// request, or it would be re-driven on the next link transition and end
+/// the session just reopened (`client::otp::handle_provisioning_command`
+/// clears it before proposing).
 #[test]
-fn a_paused_contact_can_have_its_end_notice_cancelled_and_stay_provisioned() {
+fn a_pending_end_request_can_be_cancelled_and_the_contact_stays_provisioned() {
     let path = temp_store_path();
     let mut store = OtpStore::new_empty(path.clone());
     store.mark_provisioned("alice-bob");
     store.record_sent("alice-bob", 3, PendingOtpContent::Text { channel: None }, None);
-    store.pause_session("alice-bob");
+    store.mark_end_requested("alice-bob");
     assert!(store.get("alice-bob").unwrap().pending_end_notice);
 
     // Reopening cancels the debt without touching the pad.
@@ -620,7 +636,7 @@ fn a_paused_contact_is_still_provisioned_so_otp_resumes_instead_of_regenerating(
     store.record_sent("alice-bob", 0, PendingOtpContent::Text { channel: None }, None);
     store.record_acked("alice-bob", 0, None);
 
-    store.pause_session("alice-bob");
+    store.pause_after_peer_ended("alice-bob");
     store.save().unwrap();
 
     // Reloaded, because resuming usually happens in a later session.
@@ -632,5 +648,260 @@ fn a_paused_contact_is_still_provisioned_so_otp_resumes_instead_of_regenerating(
     );
     assert_eq!(state.next_out_seq, 1);
     assert_eq!(state.next_expected_in_seq, 1);
+    std::fs::remove_file(&path).ok();
+}
+
+/// @requirement AC-304
+#[test]
+fn ack_to_resend_answers_only_the_exact_last_acked_sequence() {
+    let path = temp_store_path();
+    let mut store = OtpStore::new_empty(path.clone());
+    store.mark_provisioned("alice-bob");
+    assert_eq!(
+        store.ack_to_resend("alice-bob", 0),
+        None,
+        "nothing has been acked yet"
+    );
+
+    store.record_last_received_ack("alice-bob", 3, [0x42; 32]);
+    assert_eq!(
+        store.ack_to_resend("alice-bob", 3),
+        Some([0x42; 32]),
+        "the exact sequence just recorded must be answered"
+    );
+    assert_eq!(
+        store.ack_to_resend("alice-bob", 2),
+        None,
+        "anything older than the last-acked sequence is a stale replay, not this one"
+    );
+    assert_eq!(store.ack_to_resend("someone-else", 3), None);
+    std::fs::remove_file(&path).ok();
+}
+
+/// @requirement AC-304
+#[test]
+fn record_last_received_ack_overwrites_rather_than_accumulates() {
+    let path = temp_store_path();
+    let mut store = OtpStore::new_empty(path.clone());
+    store.mark_provisioned("alice-bob");
+    store.record_last_received_ack("alice-bob", 3, [0x42; 32]);
+    store.record_last_received_ack("alice-bob", 4, [0x43; 32]);
+
+    assert_eq!(
+        store.ack_to_resend("alice-bob", 3),
+        None,
+        "only the single most recent message could ever legitimately reappear"
+    );
+    assert_eq!(store.ack_to_resend("alice-bob", 4), Some([0x43; 32]));
+    std::fs::remove_file(&path).ok();
+}
+
+/// @requirement AC-304
+#[test]
+fn last_received_ack_survives_save_and_load() {
+    let path = temp_store_path();
+    let mut store = OtpStore::new_empty(path.clone());
+    store.mark_provisioned("alice-bob");
+    store.record_last_received_ack("alice-bob", 7, [0x99; 32]);
+    store.save().unwrap();
+
+    let loaded = OtpStore::load(&path).unwrap();
+    assert_eq!(loaded.ack_to_resend("alice-bob", 7), Some([0x99; 32]));
+    std::fs::remove_file(&path).ok();
+}
+
+/// @requirement AC-313
+#[test]
+fn an_encrypt_intent_round_trips_and_record_sent_retires_it() {
+    let path = temp_store_path();
+    let mut store = OtpStore::new_empty(path.clone());
+    store.mark_provisioned("alice-bob");
+    store.set_encrypt_intent("alice-bob", PendingOtpContent::Text { channel: None });
+    assert!(store.encrypt_in_flight("alice-bob"));
+    store.save().unwrap();
+
+    // Reloaded, because the whole point is surviving the kill it records.
+    let mut loaded = OtpStore::load(&path).unwrap();
+    let intents: Vec<(String, PendingOtpContent)> = loaded
+        .encrypt_intents()
+        .map(|(n, c)| (n.to_string(), c.clone()))
+        .collect();
+    assert_eq!(
+        intents,
+        vec![("alice-bob".to_string(), PendingOtpContent::Text { channel: None })]
+    );
+
+    loaded.record_sent("alice-bob", 0, PendingOtpContent::Text { channel: None }, None);
+    assert!(
+        !loaded.encrypt_in_flight("alice-bob"),
+        "the finalising record_sent retires the write-ahead intent"
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// @requirement AC-311
+#[test]
+fn a_pending_commit_survives_save_and_load_and_clears_exactly_once() {
+    let path = temp_store_path();
+    let mut store = OtpStore::new_empty(path.clone());
+    store.mark_provisioned("alice-bob");
+    store.mark_commit_owed("alice-bob");
+    store.save().unwrap();
+
+    // Reloaded, because the whole point is surviving a restart: a peer who
+    // dropped before confirming their install is still owed the commit
+    // tomorrow.
+    let mut loaded = OtpStore::load(&path).unwrap();
+    let owed: Vec<String> = loaded.pending_commits().map(str::to_string).collect();
+    assert_eq!(owed, vec!["alice-bob".to_string()]);
+
+    assert!(loaded.clear_commit_owed("alice-bob"), "the first genuine ack clears it");
+    assert!(
+        !loaded.clear_commit_owed("alice-bob"),
+        "a duplicate or stray ack is distinguishable from a real one"
+    );
+    assert!(loaded.pending_commits().next().is_none());
+    std::fs::remove_file(&path).ok();
+}
+
+/// @requirement AC-308
+#[test]
+fn an_end_notice_pending_send_round_trips_through_save_and_load() {
+    let path = temp_store_path();
+    let mut store = OtpStore::new_empty(path.clone());
+    store.mark_provisioned("alice-bob");
+    store.record_sent("alice-bob", 5, PendingOtpContent::EndNotice, Some([0x21; 32]));
+    store.mark_end_requested("alice-bob");
+    store.save().unwrap();
+
+    let loaded = OtpStore::load(&path).unwrap();
+    let state = loaded.get("alice-bob").unwrap();
+    assert_eq!(state.pending_unacked_out_seq, Some(5));
+    assert_eq!(
+        state.pending_content,
+        Some(PendingOtpContent::EndNotice),
+        "the notice occupies the gate like any other spend, and survives a restart there"
+    );
+    assert!(state.pending_end_notice);
+    let recovered: Vec<(String, u64, PendingOtpContent)> = loaded
+        .pending_sends()
+        .map(|(n, s, c)| (n.to_string(), s, c.clone()))
+        .collect();
+    assert_eq!(
+        recovered,
+        vec![("alice-bob".to_string(), 5, PendingOtpContent::EndNotice)],
+        "recover_and_resend's own input yields it, so the reconnect retry finds it"
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// @requirement AC-309
+#[test]
+fn reset_for_new_pad_zeroes_every_counter_and_remnant_of_the_old_pad() {
+    let path = temp_store_path();
+    let mut store = OtpStore::new_empty(path.clone());
+    store.mark_provisioned("alice-bob");
+    store.record_sent("alice-bob", 7, PendingOtpContent::Text { channel: None }, Some([1; 32]));
+    store.record_received("alice-bob", 0);
+    store.record_last_received_ack("alice-bob", 0, [2; 32]);
+    store.mark_end_requested("alice-bob");
+
+    store.reset_for_new_pad("alice-bob", Some([9; 32]));
+
+    let state = store.get("alice-bob").unwrap();
+    assert!(state.provisioned);
+    assert_eq!(state.installed_pad_digest, Some([9; 32]));
+    assert_eq!(
+        state.next_out_seq, 0,
+        "the new pad is a new stream - stale counters would silently drop its every message"
+    );
+    assert_eq!(state.next_expected_in_seq, 0);
+    assert_eq!(state.pending_unacked_out_seq, None);
+    assert_eq!(state.pending_content, None);
+    assert_eq!(
+        state.last_received_ack, None,
+        "an old pad's recorded proof must never answer a new pad's sequence"
+    );
+    assert!(!state.pending_end_notice);
+    std::fs::remove_file(&path).ok();
+}
+
+/// A store written before this field existed has no such trailing columns
+/// at all; loading one must mean "nothing to re-ack", not a parse failure
+/// that would discard the rest of that line's state.
+///
+/// @requirement AC-304
+#[test]
+fn a_line_written_before_last_received_ack_existed_still_loads() {
+    let path = temp_store_path();
+    std::fs::write(&path, "alice-bob\t1\t2\t3\t4\tT\t7\n").unwrap();
+    let store = OtpStore::load(&path).unwrap();
+    let state = store.get("alice-bob").unwrap();
+    assert_eq!(state.last_received_ack, None);
+    assert_eq!(store.ack_to_resend("alice-bob", 3), None);
+    std::fs::remove_file(&path).ok();
+}
+
+// ---------------------------------------------------------------------
+// Content sends staged awaiting the peer's acceptance (AC-316)
+// ---------------------------------------------------------------------
+
+/// @requirement AC-316
+#[test]
+fn a_staged_content_send_survives_save_and_load_in_its_own_sibling_file() {
+    let path = temp_store_path();
+    let mut store = OtpStore::new_empty(path.clone());
+    store.stage_content_send(7, "alice-bob", PathBuf::from("/tmp/otp-voice-plain-123"));
+    store.save().unwrap();
+
+    // Reloaded, because the whole point is surviving a restart.
+    let loaded = OtpStore::load(&path).unwrap();
+    let staged: Vec<(u64, String, PathBuf)> = loaded
+        .content_sends()
+        .map(|(id, t)| (id, t.contact_name.clone(), t.path.clone()))
+        .collect();
+    assert_eq!(
+        staged,
+        vec![(7, "alice-bob".to_string(), PathBuf::from("/tmp/otp-voice-plain-123"))]
+    );
+
+    // It lives in its own sibling file, genuinely separate from the main
+    // store's per-contact lines.
+    let sibling = path.with_file_name(format!(
+        "{}.pending_content",
+        path.file_name().unwrap().to_string_lossy()
+    ));
+    assert!(sibling.is_file(), "staged content sends persist to their own file");
+    std::fs::remove_file(&path).ok();
+    std::fs::remove_file(&sibling).ok();
+}
+
+/// @requirement AC-316
+#[test]
+fn taking_a_staged_content_send_clears_it_and_reports_absence_afterward() {
+    let path = temp_store_path();
+    let mut store = OtpStore::new_empty(path.clone());
+    store.stage_content_send(3, "alice-bob", PathBuf::from("/tmp/x"));
+    store.stage_content_send(4, "alice-carol", PathBuf::from("/tmp/y"));
+
+    let taken = store.take_content_send(3).expect("it was staged");
+    assert_eq!(taken.contact_name, "alice-bob");
+    assert!(store.take_content_send(3).is_none(), "a second take finds nothing");
+
+    let remaining: Vec<u64> = store.content_sends().map(|(id, _)| id).collect();
+    assert_eq!(remaining, vec![4], "taking one must not disturb another contact's own");
+}
+
+/// A store with no sibling file at all (every store predating this
+/// feature) must load as "nothing staged", not a parse failure that would
+/// discard the rest of the store.
+///
+/// @requirement AC-316
+#[test]
+fn a_store_with_no_pending_content_sibling_file_loads_with_nothing_staged() {
+    let path = temp_store_path();
+    std::fs::write(&path, "alice-bob\t1\t2\t3\t4\tT\t7\n").unwrap();
+    let store = OtpStore::load(&path).unwrap();
+    assert_eq!(store.content_sends().count(), 0);
     std::fs::remove_file(&path).ok();
 }

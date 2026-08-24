@@ -135,9 +135,9 @@ fn compose_bar_refuses_to_send_a_plain_message_to_an_offline_dm_peer() {
     );
 }
 
-/// @requirement AC-053
+/// @requirement AC-310
 #[test]
-fn endotp_can_still_be_typed_and_submitted_while_the_open_dm_peer_is_offline() {
+fn endotp_while_the_open_dm_peer_is_offline_is_refused_with_a_notice() {
     let mut state = joined_general_with(vec![user(2, "bob")]);
     state.focus = Focus::Sidebar;
     press(&mut state, KeyCode::Enter); // opens DM with bob while he's still online
@@ -146,21 +146,33 @@ fn endotp_can_still_be_typed_and_submitted_while_the_open_dm_peer_is_offline() {
     // going offline before this would drop him from the sidebar entirely
     // (`on_user_offline`'s "nothing to keep them around for" branch), which
     // isn't the case this test is about: an *already-open* room's peer
-    // disconnecting mid-session, the scenario `/endotp` needs to survive.
+    // disconnecting mid-session.
     state.on_user_offline(UserId(2));
 
     type_str(&mut state, "/endotp");
     assert_eq!(
         state.input, "/endotp",
-        "unlike every other command, /endotp must be typeable while the peer is offline"
+        "typing is not blocked - the refusal happens on submit, out loud"
     );
 
     let action = press(&mut state, KeyCode::Enter);
-    match action {
-        Some(UiAction::EndOtpSession { peer, .. }) => assert_eq!(peer, UserId(2)),
-        other => panic!("expected EndOtpSession even while the peer is offline, got {other:?}"),
-    }
-    assert_eq!(state.input, "", "a recognized command always clears input");
+    assert_eq!(
+        action, None,
+        "/endotp is a synchronised, two-party end now - an offline peer cannot confirm it"
+    );
+    assert_eq!(
+        state.input, "",
+        "the refused command is consumed, not left half-typed"
+    );
+    let (message, success) = state
+        .status_notice
+        .clone()
+        .expect("the refusal explains itself instead of silently doing nothing");
+    assert!(
+        message.contains("bob is offline") && message.contains("both sides online"),
+        "the notice names the peer and the reason: {message:?}"
+    );
+    assert!(!success);
 }
 
 /// @requirement TB-105
@@ -1035,6 +1047,9 @@ fn endotp_in_an_open_dm_room_produces_end_otp_session_for_that_peer() {
     state.focus = Focus::Sidebar;
     press(&mut state, KeyCode::Enter); // opens DM with bob
     assert_eq!(state.active_private_room, Some(UserId(2)));
+    // /endotp needs the peer's direct link up, not merely their presence
+    // known - it is a synchronised, two-party handshake now (AC-310).
+    state.set_link_status(UserId(2), aloo::client::p2p::LinkStatus::Active);
 
     type_str(&mut state, "/endotp");
     let action = press(&mut state, KeyCode::Enter);

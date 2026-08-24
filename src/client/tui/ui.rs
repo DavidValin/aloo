@@ -311,17 +311,19 @@ const HELP_BODY: &[HelpLine] = &[
         keys: "/otp",
         text: "inside an open DM room: proposes an extra one-time-pad layer on top of \
                pq_hybrid for that contact only. Never starts on its own say-so - always \
-               ends in an explicit Accept/Reject on the other side, confirmed back to you.",
+               ends in an explicit Accept/Reject on the other side, confirmed back to you. \
+               Refused outright if a session with them is already active - /endotp first.",
     },
     HelpLine::Item {
         keys: "/endotp",
-        text: "ends (pauses) an active session with that contact right away - no \
-               accept/reject needed, either side may do it alone. The pad itself is kept, \
-               not destroyed - a later /otp with the same contact resumes the exact same \
-               key rather than generating a new one; the other side is told now if \
-               reachable, or as soon as they reconnect otherwise. A disconnect alone never \
-               ends a session - only /endotp does - and the DM keeps working either way, \
-               just without that extra layer once it's off.",
+        text: "ends (pauses) an active session with that contact, in sync on both sides: \
+               it needs them online, and takes effect only once they confirm receiving \
+               the end notice - until then the session stays on and new sends to them are \
+               refused (/otp cancels a pending end). No accept/reject - the peer is told, \
+               not asked. The pad itself is kept, not destroyed - a later /otp with the \
+               same contact resumes the exact same key rather than generating a new one. \
+               A disconnect alone never ends a session - only /endotp does - and the DM \
+               keeps working either way, just without that extra layer once it's off.",
     },
     HelpLine::Note(
         "If no key exists yet, you're asked to confirm generating one and sharing it \
@@ -360,11 +362,14 @@ const HELP_BODY: &[HelpLine] = &[
                confirming).",
     },
     HelpLine::Note(
-        "Needs a pinned recipient you hold an otp key for, longer than the whole mail - \
-         the To field shows \u{2705}/\u{274C} live and the remaining key (MB) shows top-right, \
-         updating as you type and attach. Ctrl+S sends, only after a confirm popup. The \
-         mail travels one-time-pad encrypted and waits on the server (which cannot read \
-         it) until the recipient connects.",
+        "Needs a pinned recipient you hold an OTP MAIL key for specifically - its own, \
+         entirely independent of any live /otp session with them - longer than the \
+         whole mail. With no mail key at all, a centered red message blocks the whole \
+         compose view until Esc closes it (and the view with it); /new-otp-mail-key or \
+         /contacts is how you get one. The To field otherwise shows \u{2705}/\u{274C} live and the \
+         remaining key (MB) shows top-right, updating as you type and attach. Ctrl+S \
+         sends, only after a confirm popup. The mail travels one-time-pad encrypted and \
+         waits on the server (which cannot read it) until the recipient connects.",
     ),
     HelpLine::Item {
         keys: "/mailbox",
@@ -373,23 +378,37 @@ const HELP_BODY: &[HelpLine] = &[
                stored ciphertext+pad.",
     },
     HelpLine::Blank,
-    HelpLine::Heading("Identity pinning (id_store)"),
+    HelpLine::Heading("Contacts & Keys"),
     HelpLine::Note(
-        "Remembers each nickname's full public key across sessions (not just a hash) - \
-         exact match, since an identity is loaded from a file and never changes on its \
-         own. A mismatch opens a popup \
-         naming the peer with Accept/Reject buttons; messaging with them is blocked until \
-         you decide. Accept saves to disk right away and reveals anything of theirs held \
-         while unresolved; Reject saves nothing and isn't permanent - select them again \
-         to reconsider. Path set in the connect popup's id_store field.",
+        "id_store remembers each pinned nickname's full public key across sessions (not \
+         just a hash) - exact match, since an identity is loaded from a file and never \
+         changes on its own. A mismatch opens a popup naming the peer with Accept/Reject \
+         buttons; messaging with them is blocked until you decide. Accept saves to disk \
+         right away and reveals anything of theirs held while unresolved; Reject saves \
+         nothing and isn't permanent - select them again to reconsider. Path set in the \
+         connect popup's id_store field.",
     ),
     HelpLine::Item {
         keys: "/contacts",
-        text: "every pinned nickname, its last-seen time, its encryption method, and - if \
-               it has one - its OTP pad's live Seq/Offset/remaining-MB in each direction. \
-               'd' deletes a contact (its OTP key too, if any); 'o' installs an OTP key \
-               manually, from files you already generated with the real 'otp' command, \
-               without going through /otp's handshake; 'r' refreshes.",
+        text: "every pinned nickname and its three keys - PQH (the pinned identity \
+               itself), OTP (a live /otp session), OTP MAIL (a /mail-only key, entirely \
+               separate from the live one) - each shown as a \u{2705}/\u{274C} badge. \
+               Left/Right cycles which of the three is highlighted across the whole \
+               list; Enter opens that key's own details: what it's for, its path and \
+               live figures if it exists, and a Create (PQH, from an identity card \
+               file) / Install manually (OTP or OTP MAIL, from files you generated \
+               yourself) / Delete action. 'o' still installs an OTP key directly, same \
+               as before; 'd' deletes the whole contact (every key with it); 'r' \
+               refreshes. Every action here takes effect immediately, including on an \
+               already-open /mail compose view.",
+    },
+    HelpLine::Item {
+        keys: "/new-otp-mail-key",
+        text: "inside an open DM room: the /otp-style handshake, but for the OTP MAIL \
+               key specifically - entirely independent of any live /otp session with \
+               the same person. Refused with no network round trip if a mail key \
+               already exists for that contact (delete it from /contacts first, or \
+               just use /mail).",
     },
     HelpLine::Blank,
     HelpLine::Note(
@@ -5113,18 +5132,39 @@ impl UiState {
             return None;
         }
         if self.input.trim() == "/endotp" {
-            // The one DM action allowed to reach a peer who is currently
-            // offline (`handle_input_key` no longer blocks typing for that
-            // alone) - ending a session must not require them to be
-            // reachable right now, only that the far side eventually learns
-            // about it (`client::otp::resend_pending_end_notices`). Still a
-            // no-op for a trust-gated peer (docs/PROTOCOL.md §12), same as
-            // every other DM action.
+            // Ending is a synchronised, two-party operation now
+            // (docs/PROTOCOL.md §16.6): it takes effect only when the
+            // peer's proof-carrying acknowledgement comes back, so both
+            // sides leave the session together. A peer who is offline
+            // cannot confirm anything, so this is refused out loud rather
+            // than silently swallowed like other DM actions - the user
+            // asked for something specific and deserves to know why it
+            // didn't happen. Still a no-op for a trust-gated peer
+            // (docs/PROTOCOL.md §12), same as every other DM action.
             let peer_id = self.active_private_room?;
             if self.is_trust_gated(peer_id) {
                 return None;
             }
             let peer = self.known_users.get(&peer_id)?.clone();
+            // Checked against the direct link too, not only
+            // `active_dm_peer_offline` (`ui_state.offline`, gated behind the
+            // server's `HEARTBEAT_TIMEOUT`) - the same race
+            // `handle_end_otp_command`'s authoritative guard closes further,
+            // narrowed here as well so the refusal is immediate rather than
+            // a round trip through session handling.
+            if self.active_dm_peer_offline() || self.link_status_of(peer_id) != LinkStatus::Active
+            {
+                self.input.clear();
+                self.push_status_notice(
+                    format!(
+                        "OTP: {} is offline - /endotp needs both sides online so the end \
+                         is confirmed on both; try again when they are back",
+                        peer.name
+                    ),
+                    false,
+                );
+                return None;
+            }
             self.input.clear();
             return Some(UiAction::EndOtpSession {
                 peer: peer_id,

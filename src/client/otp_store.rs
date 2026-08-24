@@ -1,7 +1,10 @@
 //! Persistent per-contact state for the OTP layer (`client::otp`),
 //! mirroring `idstore.rs`'s flat-file convention: one small text file under
 //! `~/.aloo/`, loaded at session-build time and written back synchronously
-//! after every mutation.
+//! after every mutation - plus one small sibling file next to it
+//! (`<path>.pending_content`) holding whatever `PendingContentSend` entries
+//! are currently staged; see that type's own doc for why this lives
+//! separately rather than as a new line shape mixed into the main format.
 //!
 //! Keyed by `crypto::otp::contact_name_for`'s stable, fingerprint-derived
 //! name rather than `proto::UserId`: `UserId` is only a connection-lifetime
@@ -68,6 +71,17 @@ pub enum PendingOtpContent {
     /// `client::otp::recover_and_resend`'s P2P-link path - which therefore
     /// skips it.
     Mail { mail_id: String },
+    /// The `/endotp` notice's pad spend (docs/PROTOCOL.md §16.6). An
+    /// ordinary stop-and-wait send in every mechanical respect - it arms
+    /// the gate, is acknowledged by the peer's proof-carrying
+    /// `OtpDeliveryAck`, and is recovered (never re-encrypted) by
+    /// `recover_and_resend` on every reconnect until that ack arrives -
+    /// because anything less reintroduced the desync it once caused: a
+    /// notice encrypted outside the gate could overwrite an in-flight
+    /// message's recover-last safety copy, leapfrog it on the pad, or be
+    /// spent again per retry. Its acknowledgement additionally clears
+    /// `pending_end_notice` (`client::otp::on_delivery_ack`).
+    EndNotice,
 }
 
 /// One contact's OTP state.
@@ -147,6 +161,45 @@ pub struct OtpContactState {
     /// than received, where there is nothing to compare against; such a
     /// contact simply always asks.
     pub installed_pad_digest: Option<[u8; 32]>,
+    /// The write-ahead half of every outgoing spend: what the *next*
+    /// `otp --encrypt` for this contact is about to be, recorded (and
+    /// saved) immediately before the encrypt runs and cleared by the
+    /// `record_sent` that finalises it. At rest this is `None`; it is
+    /// `Some` only inside the encrypt's own window - which is why a `Some`
+    /// found at startup means the process died inside that window, and the
+    /// tool's own encrypt counter then says on which side: still equal to
+    /// `next_out_seq` and the encrypt never ran (the intent is dropped,
+    /// nothing was spent); one ahead and the spend is real but unrecorded -
+    /// the orphan every later send would silently leapfrog, poisoning the
+    /// peer's decoder forever - so the intent is *promoted* to an ordinary
+    /// pending send (`reconcile_orphaned_sends`), and the standard
+    /// recovery machinery resends the tool's kept ciphertext under the
+    /// right framing. Also doubles as a same-process guard: a second send
+    /// entering while an encrypt is mid-flight queues behind it exactly as
+    /// it would behind an armed gate (`client::otp::send_or_queue`).
+    pub encrypt_intent: Option<PendingOtpContent>,
+    /// `true` from the moment this side - the pad's *generator* - installs
+    /// its half and sends `OtpPadCommit`, until the peer's
+    /// `OtpPadCommitAck` confirms they installed theirs. The commit is the
+    /// one provisioning payload whose loss splits the pair asymmetrically
+    /// (this side provisioned and active, the peer holding only staged
+    /// bytes), so like every other owed thing here it is recorded against
+    /// the contact name and re-sent on every reconnect
+    /// (`client::otp::resend_pending_commits`) until genuinely
+    /// acknowledged - the receiving side already answers a repeated commit
+    /// idempotently.
+    pub pending_commit: bool,
+    /// The `(seq, proof)` of the most recent incoming message this side
+    /// actually accepted and acknowledged - the durable record
+    /// `client::otp::on_message`/`on_file_offer`/`on_voice_offer` consult to
+    /// answer a re-arrival of that exact message (the sender's own
+    /// stop-and-wait gate never has more than one message outstanding, so
+    /// only the single most recent one could ever legitimately reappear)
+    /// by resending the very same ack, without re-decrypting anything or
+    /// spending any further pad. `None` for a contact that has never had a
+    /// message accepted, or whose peer has only ever sent session-control
+    /// payloads (which ack each other, not through this field).
+    pub last_received_ack: Option<(u64, [u8; 32])>,
 }
 
 /// A `contact_name -> OtpContactState` store, backed by a small flat file:
@@ -160,10 +213,44 @@ pub struct OtpContactState {
 /// tolerance `parse_line` already gives every other field. `pending_end_notice`
 /// is `1` when `true`, empty (or absent, for a file written before this
 /// field existed) when `false` - same evolutionary tolerance
-/// `pending_setup_size_mb` already established.
+/// `pending_setup_size_mb` already established. Two more trailing columns,
+/// `pending_ack_proof` and `installed_pad_digest` (both hex, empty when
+/// `None`), a pair, `last_received_ack_seq`/`last_received_ack_proof`
+/// (the latter hex too, both empty or absent together meaning `None`), and
+/// finally `pending_commit` (`1`/empty like `pending_end_notice`) and
+/// `encrypt_intent` (the same encoding `pending_content` uses, empty when
+/// `None`) follow the same tolerance again.
 pub struct OtpStore {
     path: PathBuf,
     entries: HashMap<String, OtpContactState>,
+    pending_content_sends: HashMap<u64, PendingContentSend>,
+}
+
+/// What `send_file_offer`/`send_voice_offer` stage the instant their offer
+/// is safely out (a genuine, durable, gated spend of its own - the offer
+/// phase's own retry already covers *that*) but before the peer's
+/// acceptance has arrived to trigger the *content* phase's separate spend:
+/// the plaintext this side is holding onto meanwhile, and which contact it
+/// belongs to. Never a `UserId`, for the same reason nothing else in this
+/// file keeps one - only a connection-lifetime handle, unsafe to trust
+/// across a reconnect; the peer is re-resolved fresh from `known_users`
+/// once a `FileAccepted` (or a reconnect that might carry one) actually
+/// needs it (`client::otp::begin_file_content`,
+/// `resume_pending_content_sends`).
+///
+/// Without this, a sender whose own process restarted in this exact
+/// window - offer sent, not yet accepted, or accepted by a peer whose
+/// `FileAccepted` reply the old process never lived to see - lost the
+/// recording or file silently: `own_file_targets` is in-memory only, so a
+/// `FileAccepted` arriving (or already queued) after the restart found
+/// nothing to act on. No pad was ever at risk either way - the content
+/// phase's own spend only ever happens *after* this record would have
+/// resolved it - but the message itself, and the plaintext staged for it,
+/// were both lost with no notice to either side.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingContentSend {
+    pub contact_name: String,
+    pub path: PathBuf,
 }
 
 impl OtpStore {
@@ -176,7 +263,58 @@ impl OtpStore {
         Self {
             path,
             entries: HashMap::new(),
+            pending_content_sends: HashMap::new(),
         }
+    }
+
+    /// The sibling file `pending_content_sends` persists to - a small,
+    /// separate flat file next to the main one rather than a new line
+    /// shape mixed into it, so `parse_line`'s existing per-contact format
+    /// (and every caller of `new_empty`/`load` with a single path) needs no
+    /// change at all.
+    fn content_sends_path(main_path: &Path) -> PathBuf {
+        let name = main_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        main_path.with_file_name(format!("{name}.pending_content"))
+    }
+
+    /// Records that `stream_id`'s content is staged at `path`, awaiting the
+    /// peer's acceptance - see `PendingContentSend`'s doc. The caller must
+    /// save before the offer that announces it actually leaves, or the
+    /// record protects nothing.
+    pub fn stage_content_send(&mut self, stream_id: u64, contact_name: &str, path: PathBuf) {
+        self.pending_content_sends.insert(
+            stream_id,
+            PendingContentSend {
+                contact_name: contact_name.to_string(),
+                path,
+            },
+        );
+    }
+
+    /// Takes (and clears) the staged record for `stream_id` - called the
+    /// moment something else (an immediate encrypt, or the ordinary
+    /// in-memory send queue) becomes the authoritative tracker of this
+    /// content's fate, so a stale record can never shadow it.
+    pub fn take_content_send(&mut self, stream_id: u64) -> Option<PendingContentSend> {
+        self.pending_content_sends.remove(&stream_id)
+    }
+
+    /// Every content send still staged - what a reconnect's autoheal pass
+    /// (`client::otp::resume_pending_content_sends`) resumes.
+    pub fn content_sends(&self) -> impl Iterator<Item = (u64, &PendingContentSend)> {
+        self.pending_content_sends
+            .iter()
+            .map(|(id, target)| (*id, target))
+    }
+
+    /// Where this store persists to - exposed for a test that needs to
+    /// simulate a genuine process restart (drop this value, `load` a fresh
+    /// one from the same file) rather than merely continuing in memory.
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     /// Loads `path` if it exists; a missing file just starts empty (first
@@ -195,9 +333,22 @@ impl OtpStore {
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
         }
+        let mut pending_content_sends = HashMap::new();
+        match fs::read_to_string(Self::content_sends_path(path)) {
+            Ok(contents) => {
+                for line in contents.lines() {
+                    if let Some((id, target)) = parse_content_send_line(line) {
+                        pending_content_sends.insert(id, target);
+                    }
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
         Ok(Self {
             path: path.to_path_buf(),
             entries,
+            pending_content_sends,
         })
     }
 
@@ -283,41 +434,105 @@ impl OtpStore {
         self.entries.remove(contact_name).is_some()
     }
 
-    /// The local half of `/endotp` (`client::otp::handle_end_otp_command`):
-    /// pauses `contact_name` rather than destroying it - clears whatever was
-    /// genuinely mid-flight (an unacked send, a pad still owed to the peer)
-    /// and records that the peer still needs to be told, durably - see
-    /// `pending_end_notice`'s doc. Deliberately leaves `provisioned`,
-    /// `next_out_seq` and `next_expected_in_seq` exactly as they are:
-    /// `/endotp` no longer removes the real keychain entry either
-    /// (`otp_cli::remove_contact` stopped being called alongside this), so
-    /// the pad itself, and this store's record of how far into it each
-    /// direction has gotten, both survive - a later `/otp` with the same
-    /// contact (same derived name) resumes the very same pad exactly where
-    /// it left off, rather than starting over from a fresh key. A no-op
-    /// beyond the pending-state clear if `contact_name` was never
-    /// provisioned at all.
-    pub fn pause_session(&mut self, contact_name: &str) {
-        let state = self.entries.entry(contact_name.to_string()).or_default();
-        state.pending_unacked_out_seq = None;
-        state.pending_content = None;
-        state.pending_ack_proof = None;
-        state.pending_setup_size_mb = None;
-        state.pending_end_notice = true;
-    }
-
-    /// The receiving side's counterpart to `pause_session`
-    /// (`client::otp::on_end_session`): the same pause, but without owing a
-    /// notice of our own - we are the one being told, not the one telling.
+    /// The pause a session converges to once its end is settled - run by
+    /// the side being told the moment the notice arrives
+    /// (`client::otp::apply_end_session`), and by the initiating side the
+    /// moment the peer's confirmation comes back
+    /// (`client::otp::on_delivery_ack` - `/endotp` is two-phase and takes
+    /// no local effect before that). Pauses rather than destroys: it
+    /// abandons only a pad still owed from an unfinished setup, and
+    /// deliberately leaves `provisioned`, both sequence counters, *and any
+    /// send still awaiting acknowledgement* exactly as they are. The pad
+    /// survives - a later `/otp` with the same contact (same derived name)
+    /// resumes it exactly where it left off - and an in-flight send's pad
+    /// was already spent, so the peer's decoder is expecting exactly that
+    /// ciphertext next: abandoning it would leave them permanently unable
+    /// to decrypt anything this side says afterwards. It stays recoverable
+    /// (`client::otp::recover_and_resend`) until genuinely acknowledged.
     pub fn pause_after_peer_ended(&mut self, contact_name: &str) {
         let state = self.entries.entry(contact_name.to_string()).or_default();
-        state.pending_unacked_out_seq = None;
-        state.pending_content = None;
-        state.pending_ack_proof = None;
         state.pending_setup_size_mb = None;
     }
 
-    /// The peer's `OtpEndSessionAck` arrived - stop retrying the notice.
+    /// Records what the next `otp --encrypt` for `contact_name` is about
+    /// to be - the write-ahead half of a spend; see `encrypt_intent`'s doc.
+    /// The caller must save before running the encrypt, or the record
+    /// protects nothing.
+    pub fn set_encrypt_intent(&mut self, contact_name: &str, content: PendingOtpContent) {
+        self.entries
+            .entry(contact_name.to_string())
+            .or_default()
+            .encrypt_intent = Some(content);
+    }
+
+    /// Drops a write-ahead intent whose encrypt never ran (it failed, or
+    /// reconciliation found the tool's counter unmoved). Returns what was
+    /// recorded, for a caller cleaning up whatever else the intent staged.
+    pub fn clear_encrypt_intent(&mut self, contact_name: &str) -> Option<PendingOtpContent> {
+        self.entries
+            .get_mut(contact_name)?
+            .encrypt_intent
+            .take()
+    }
+
+    /// Whether an encrypt is mid-flight for `contact_name` right now - the
+    /// same-process half of `encrypt_intent`'s guard.
+    pub fn encrypt_in_flight(&self, contact_name: &str) -> bool {
+        self.entries
+            .get(contact_name)
+            .is_some_and(|s| s.encrypt_intent.is_some())
+    }
+
+    /// Every contact holding a write-ahead intent - at startup, each one is
+    /// a send the previous process died inside
+    /// (`client::otp::reconcile_orphaned_sends`).
+    pub fn encrypt_intents(&self) -> impl Iterator<Item = (&str, &PendingOtpContent)> {
+        self.entries.iter().filter_map(|(name, state)| {
+            Some((name.as_str(), state.encrypt_intent.as_ref()?))
+        })
+    }
+
+    /// Records that this side has installed its half of a fresh pad and the
+    /// peer's `OtpPadCommitAck` is now owed - see `pending_commit`'s doc.
+    pub fn mark_commit_owed(&mut self, contact_name: &str) {
+        self.entries
+            .entry(contact_name.to_string())
+            .or_default()
+            .pending_commit = true;
+    }
+
+    /// The peer confirmed installing their half - stop re-sending the
+    /// commit. Returns whether one was actually owed.
+    pub fn clear_commit_owed(&mut self, contact_name: &str) -> bool {
+        match self.entries.get_mut(contact_name) {
+            Some(state) => std::mem::take(&mut state.pending_commit),
+            None => false,
+        }
+    }
+
+    /// Every contact whose `OtpPadCommit` is still unconfirmed, for the
+    /// reconnect retry pass (`client::otp::resend_pending_commits`).
+    pub fn pending_commits(&self) -> impl Iterator<Item = &str> {
+        self.entries
+            .iter()
+            .filter_map(|(name, state)| state.pending_commit.then_some(name.as_str()))
+    }
+
+    /// Records that `/endotp` has been requested for `contact_name` and the
+    /// peer's confirmation is now owed - the durable half of the two-phase
+    /// end (`client::otp::handle_end_otp_command`): nothing is paused yet,
+    /// nothing is torn down; the session stays fully active on this side
+    /// until the peer's proof-carrying acknowledgement of the end notice
+    /// arrives (`client::otp::on_delivery_ack`'s confirmation), however
+    /// many reconnects that takes.
+    pub fn mark_end_requested(&mut self, contact_name: &str) {
+        self.entries
+            .entry(contact_name.to_string())
+            .or_default()
+            .pending_end_notice = true;
+    }
+
+    /// The peer's acknowledgement of the notice arrived - stop retrying it.
     /// Returns whether one was actually outstanding, so a stray/duplicate
     /// ack can be told apart from a genuine one.
     pub fn clear_end_notice(&mut self, contact_name: &str) -> bool {
@@ -325,6 +540,26 @@ impl OtpStore {
             Some(state) => std::mem::take(&mut state.pending_end_notice),
             None => false,
         }
+    }
+
+    /// Replaces `contact_name`'s entry for a genuinely *new* pad just
+    /// installed over it (`otp_cli::add_contact` ran): the tool's own
+    /// per-contact state - sequence numbers, offsets, the recover-last
+    /// copy - all reset with the keychain entry, so every aloo-level
+    /// counter and remnant keyed to the old pad must reset with it.
+    /// Keeping any of it was what left a replaced pad born desynced: stale
+    /// `next_out_seq`/`next_expected_in_seq` silently dropped every message
+    /// of the new pad's stream, and a stale `last_received_ack` could
+    /// answer a new pad's sequence with the old pad's proof.
+    pub fn reset_for_new_pad(&mut self, contact_name: &str, digest: Option<[u8; 32]>) {
+        self.entries.insert(
+            contact_name.to_string(),
+            OtpContactState {
+                provisioned: true,
+                installed_pad_digest: digest,
+                ..OtpContactState::default()
+            },
+        );
     }
 
     /// Every contact whose `/endotp` notice is still owed to its peer, for
@@ -349,24 +584,9 @@ impl OtpStore {
         state.pending_content = Some(content);
         state.pending_ack_proof = ack_proof;
         state.next_out_seq = state.next_out_seq.max(seq + 1);
-    }
-
-    /// Takes the next outgoing sequence number without arming the
-    /// stop-and-wait gate - for a pad spend whose delivery is confirmed by
-    /// a reply of its own rather than by an `OtpDeliveryAck`.
-    ///
-    /// The session-control payloads are the case: `/endotp`'s notice is
-    /// confirmed by `OtpEndSessionAck`, and that ack is confirmed by the
-    /// notice simply not being retried. Arming the gate for either would
-    /// leave it armed forever, since nothing ever acks them the way a
-    /// message is acked - and a later `/otp` resuming this same contact
-    /// would find its first message queued behind a wait that can never
-    /// end.
-    pub fn reserve_out_seq(&mut self, contact_name: &str) -> u64 {
-        let state = self.entries.entry(contact_name.to_string()).or_default();
-        let seq = state.next_out_seq;
-        state.next_out_seq += 1;
-        seq
+        // The spend this intent announced is now fully recorded - the
+        // write-ahead record has done its job (`encrypt_intent`'s doc).
+        state.encrypt_intent = None;
     }
 
     /// Clears `pending_unacked_out_seq` iff it currently equals `seq` -
@@ -435,6 +655,26 @@ impl OtpStore {
         true
     }
 
+    /// Records the ack this side sent for the most recent incoming message
+    /// from `contact_name`, overwriting whatever was recorded before - with
+    /// only one message ever outstanding on the sender's own stop-and-wait
+    /// gate, only the latest could ever legitimately need re-acking again.
+    pub fn record_last_received_ack(&mut self, contact_name: &str, seq: u64, proof: [u8; 32]) {
+        let state = self.entries.entry(contact_name.to_string()).or_default();
+        state.last_received_ack = Some((seq, proof));
+    }
+
+    /// What to re-send if `seq` (already consumed - see `is_next_expected`)
+    /// arrives again: `Some(proof)` only when it matches the last message
+    /// this side actually processed and acked, since that is the only
+    /// re-arrival the peer's own single-outstanding-message gate could ever
+    /// produce. Anything older is a genuinely stale replay, answered with
+    /// silence exactly as before this existed.
+    pub fn ack_to_resend(&self, contact_name: &str, seq: u64) -> Option<[u8; 32]> {
+        let (last_seq, proof) = self.entries.get(contact_name)?.last_received_ack?;
+        (last_seq == seq).then_some(proof)
+    }
+
     /// Persists the current entries to `path`, creating parent directories
     /// if needed. Called synchronously after every mutation above - see
     /// the module doc for why this file's cadence is stricter than
@@ -481,10 +721,57 @@ impl OtpStore {
             if let Some(digest) = state.installed_pad_digest {
                 out.push_str(&crate::crypto::hex_encode(&digest));
             }
+            out.push('\t');
+            if let Some((seq, _)) = state.last_received_ack {
+                out.push_str(&seq.to_string());
+            }
+            out.push('\t');
+            if let Some((_, proof)) = state.last_received_ack {
+                out.push_str(&crate::crypto::hex_encode(&proof));
+            }
+            out.push('\t');
+            if state.pending_commit {
+                out.push('1');
+            }
+            out.push('\t');
+            if let Some(intent) = &state.encrypt_intent {
+                out.push_str(&encode_pending_content(intent));
+            }
             out.push('\n');
         }
-        fs::write(&self.path, out)
+        fs::write(&self.path, out)?;
+        self.save_content_sends()
     }
+
+    fn save_content_sends(&self) -> io::Result<()> {
+        let mut ids: Vec<&u64> = self.pending_content_sends.keys().collect();
+        ids.sort();
+        let mut out = String::new();
+        for id in ids {
+            let target = &self.pending_content_sends[id];
+            out.push_str(&id.to_string());
+            out.push('\t');
+            out.push_str(&target.contact_name);
+            out.push('\t');
+            out.push_str(&target.path.to_string_lossy());
+            out.push('\n');
+        }
+        fs::write(Self::content_sends_path(&self.path), out)
+    }
+}
+
+/// `stream_id<TAB>contact_name<TAB>path` per line - a genuinely separate
+/// tiny file (`PendingContentSend`'s doc) rather than a new shape mixed
+/// into the per-contact lines above. `path` takes the rest of the line
+/// (`splitn`, not `split`) since a real file's own path, unlike everything
+/// else this store ever writes, is user-chosen and could in principle
+/// contain a tab.
+fn parse_content_send_line(line: &str) -> Option<(u64, PendingContentSend)> {
+    let mut parts = line.splitn(3, '\t');
+    let id = parts.next()?.parse().ok()?;
+    let contact_name = parts.next()?.to_string();
+    let path = PathBuf::from(parts.next()?);
+    Some((id, PendingContentSend { contact_name, path }))
 }
 
 /// `\x1F` (ASCII unit separator) rather than a more typical `|`/`,` - a
@@ -519,6 +806,7 @@ fn encode_pending_content(content: &PendingOtpContent) -> String {
         PendingOtpContent::Mail { mail_id } => {
             format!("M{PENDING_CONTENT_SEP}{mail_id}")
         }
+        PendingOtpContent::EndNotice => "E".to_string(),
     }
 }
 
@@ -557,6 +845,7 @@ fn decode_pending_content(s: &str) -> Option<PendingOtpContent> {
             let mail_id = parts.next()?.to_string();
             Some(PendingOtpContent::Mail { mail_id })
         }
+        "E" => Some(PendingOtpContent::EndNotice),
         _ => None,
     }
 }
@@ -592,6 +881,25 @@ fn parse_line(line: &str) -> Option<(String, OtpContactState)> {
         .filter(|s| !s.is_empty())
         .and_then(crate::crypto::hex_decode)
         .and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok());
+    // Same evolutionary tolerance as every other trailing field: absent (an
+    // older store, or a contact that has never had a message accepted)
+    // reads as "nothing to re-ack", never as a store to reject.
+    let last_received_ack_seq: Option<u64> =
+        parts.next().filter(|s| !s.is_empty()).and_then(|s| s.parse().ok());
+    let last_received_ack_proof = parts
+        .next()
+        .filter(|s| !s.is_empty())
+        .and_then(crate::crypto::hex_decode)
+        .and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok());
+    let last_received_ack = match (last_received_ack_seq, last_received_ack_proof) {
+        (Some(seq), Some(proof)) => Some((seq, proof)),
+        _ => None,
+    };
+    // Same tolerance again: absent (an older store) reads as "no commit
+    // owed" - a pre-existing provisioned pair is by definition past its
+    // commit exchange.
+    let pending_commit = parts.next() == Some("1");
+    let encrypt_intent = parts.next().and_then(decode_pending_content);
     Some((
         name,
         OtpContactState {
@@ -604,6 +912,9 @@ fn parse_line(line: &str) -> Option<(String, OtpContactState)> {
             pending_end_notice,
             pending_ack_proof,
             installed_pad_digest,
+            last_received_ack,
+            pending_commit,
+            encrypt_intent,
         },
     ))
 }

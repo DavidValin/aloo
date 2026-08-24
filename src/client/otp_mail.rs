@@ -278,11 +278,25 @@ pub(crate) async fn handle_send(
         return Ok(());
     }
 
+    // Written ahead of the encrypt, so a kill inside its window leaves a
+    // reconcilable record instead of an orphaned spend
+    // (`OtpContactState::encrypt_intent`) - the mail id is fixed now so the
+    // promoted record still names the same mail.
+    let mail_id = new_mail_id();
+    session.otp_store.set_encrypt_intent(
+        &contact_name,
+        crate::client::otp_store::PendingOtpContent::Mail {
+            mail_id: mail_id.clone(),
+        },
+    );
+    let _ = session.otp_store.save();
     let outcome =
         otp_cli::encrypt_retrying(&session.otp_cli_cfg, &contact_name, &plaintext, true).await;
     let ciphertext = match outcome {
         Ok(otp_cli::OtpCliOutcome::Ok(bytes)) => bytes,
         _ => {
+            session.otp_store.clear_encrypt_intent(&contact_name);
+            let _ = session.otp_store.save();
             fail(
                 ui_state,
                 "OTP mail: the otp command failed to encrypt this mail - not sent".to_string(),
@@ -294,7 +308,6 @@ pub(crate) async fn handle_send(
     // Pad genuinely spent - reserve the gate and persist the reference
     // *before* the upload, so a crash between the two still resends
     // (`resend_pending`) instead of losing track of a spend.
-    let mail_id = new_mail_id();
     let seq = session
         .otp_store
         .get(&contact_name)
@@ -356,6 +369,51 @@ pub(crate) async fn handle_send(
 /// status update), and `.last_sent` may already be someone else's bytes -
 /// resending those as this mail would be worse than leaving the status
 /// stale for the fetch's `OtpMailDelivered` to eventually resolve.
+/// Rebuilds the `SentMailRef` for a mail spend promoted by startup
+/// reconciliation (`client::otp::reconcile_orphaned_sends`): the process
+/// died between the mail's `otp --encrypt` and its bookkeeping, so the
+/// spend is real but the reference `resend_pending` retries from was never
+/// written. The recipient nickname is re-derived the only honest way left -
+/// scanning the pinned identities for the one whose mail-purpose contact
+/// name matches - and the restored reference then retries exactly like any
+/// other mail awaiting the server's acknowledgement, re-uploading the
+/// tool's kept ciphertext. A contact name matching no pin (the pin was
+/// deleted since) restores nothing; the promoted gate then holds until the
+/// user replaces the mail key, which is already the manual recovery for a
+/// deleted pin.
+pub fn restore_orphaned_mail_ref(
+    mail_store: &mut crate::client::otp_mail_store::OtpMailStore,
+    id_store: &crate::client::idstore::IdStore,
+    own_fp: &[u8; 32],
+    contact_name: &str,
+    mail_id: String,
+    seq: u64,
+) {
+    let Some(to) = id_store.nicknames().into_iter().find(|nick| {
+        id_store
+            .get(nick)
+            .and_then(crate::crypto::pq::fingerprint_of_encoded)
+            .is_some_and(|peer_fp| {
+                crate::crypto::otp::contact_name_for_mail(own_fp, &peer_fp) == contact_name
+            })
+    }) else {
+        return;
+    };
+    let sent_at_utc = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    mail_store.record_sent(SentMailRef {
+        mail_id,
+        to,
+        contact_name: contact_name.to_string(),
+        seq,
+        sent_at_utc,
+        status: SentMailStatus::AwaitingServerAck,
+    });
+    let _ = mail_store.save();
+}
+
 pub(crate) async fn resend_pending(
     wr: &mut impl crate::control::ControlSink,
     session: &mut SessionState,

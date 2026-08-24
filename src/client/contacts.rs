@@ -367,7 +367,12 @@ pub async fn install_otp_key(
     }
     match otp_cli::add_contact(otp_cli_cfg, &contact_name, enc_path, dec_path).await {
         Ok(()) => {
-            otp_store.mark_provisioned(&contact_name);
+            // `add_contact` replaced the keychain entry wholesale (fresh
+            // tool sequence numbers and offsets), so every aloo-level
+            // counter keyed to whatever pad this name held before resets
+            // with it - or a manually reinstalled key would be born
+            // desynced at this layer (`OtpStore::reset_for_new_pad`).
+            otp_store.reset_for_new_pad(&contact_name, None);
             let _ = otp_store.save();
             InstallOtpKeyOutcome::Ok
         }

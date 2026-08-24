@@ -97,6 +97,7 @@ falling back to a server relay (§7.1).
   - [16.1 Turning it on, only once both sides explicitly agree](#161-turning-it-on-only-once-both-sides-explicitly-agree)
   - [16.1.1 A second, independent key for OTP mail: `/new-otp-mail-key`](#1611-a-second-independent-key-for-otp-mail-new-otp-mail-key)
   - [16.2 Sending under the pad](#162-sending-under-the-pad)
+    - [16.2.1 One conversation end to end: every spend, its acknowledgement, and its retries](#1621-one-conversation-end-to-end-every-spend-its-acknowledgement-and-its-retries)
   - [16.3 Session visibility in the DM log](#163-session-visibility-in-the-dm-log)
   - [16.4 Recovering a send whose ciphertext already left](#164-recovering-a-send-whose-ciphertext-already-left)
   - [16.5 Live key-metadata header](#165-live-key-metadata-header)
@@ -3468,7 +3469,18 @@ that would silently produce garbage.
 Because a commit means the sender has already installed, the receiver can
 never end up holding a pad the sender does not - and the receiver's
 `OtpPadCommitAck` is what lets the sender stop retrying a commit whose
-delivery it cannot otherwise confirm.
+delivery it cannot otherwise confirm. That retry is durable, exactly like
+every other owed thing in this layer: the commit is the one provisioning
+payload whose loss splits the pair asymmetrically (the sender provisioned
+and active, the receiver holding only staged bytes it was never
+authorised to install), so from the moment the sender installs, the
+commit is recorded as owed against the contact name and re-sent on every
+reconnect until the ack genuinely lands. The receiver answers a repeated
+commit idempotently - re-acknowledging one already installed - and finds
+its staged pad by the durable contact name the commit itself carries
+rather than by the sender's connection-lifetime `UserId`, so a retry
+arriving from a fresh connection still completes an install whose staging
+was left behind under the dead one.
 
 Generating a fresh pad is itself gated on the initiating user's explicit
 confirmation - shown a plain choice ("generate and share one automatically
@@ -3650,6 +3662,60 @@ still has and still enforces on its own terms):
    |--- OtpEnvelope { channel, seq, envelope } -------->|   a fresh nonce rides under the pad
    |<-- OtpDeliveryAck { seq, proof } -------------------|   proof = sha256(that nonce)
 ```
+
+Alice's next send stays gated until that proof arrives - one message
+outstanding at a time, per contact (`OtpStore::pending_unacked_out_seq`).
+If bob's own `OtpDeliveryAck` is what gets lost rather than alice's
+original send, alice's only recourse is to retry the same ciphertext - and
+bob must never answer that retry with silence, or the gate stays shut
+forever with nothing left to unstick it. So an arriving message whose `seq`
+has already been accepted is checked against the *one* ack bob has
+outstanding for this contact (`OtpContactState::last_received_ack` - only
+the single most recent accepted message can legitimately reappear this
+way, since the gate never allows more than one in flight): a match
+re-sends that exact recorded ack, at no further cost - no re-decrypt, no
+pad spent - while anything older is a genuinely stale replay and is still
+dropped in silence. This is the same shape as a repeated `/endotp` notice
+(§16.6), just one step earlier in the chain: there, the *ack* is what gets
+recovered and resent; here, it never had a ciphertext of its own to
+recover, only the raw `(seq, proof)` pair a plain `OtpDeliveryAck` is built
+from - which is exactly what `last_received_ack` durably records.
+
+The same discipline survives the process itself dying mid-step, on either
+side. Every encrypt writes ahead what it is about to be
+(`encrypt_intent`), so a kill between the tool's encrypt succeeding and
+the spend being recorded is reconciled at the next startup: the tool's
+own counter says whether anything was spent, and a real orphan is promoted
+to an ordinary recorded send that recovery then resends - never silently
+leapfrogged by the next message. A kill between a *decrypt* succeeding and
+its acceptance being recorded is healed at the moment the sender's retry
+is refused: the exact off-by-one between the tool's counter and the
+store's identifies the crash shape, and the orphaned plaintext - nonce
+included - is recovered whole from the tool's received-side safety copy
+and processed as if the decrypt had just happened. And a file's or voice
+message's *content* spend advances the receiver's expectation and records
+its `(seq, proof)` exactly like every other slot; a receiver who restarted
+after accepting re-registers the retried transfer from its announcement
+alone, landing the bytes generically rather than dropping the retries and
+wedging the pair.
+
+The *sender's* side of that same window survives a restart too, and for
+the same reason nothing here may ever depend on memory alone. A file or
+voice offer is a genuine, durable, gated spend the moment it goes out - but
+the *content* it announces is staged as plaintext, waiting on the peer's
+acceptance, before any of it is padded. That staging is written to disk the
+instant the offer leaves (contact name and plaintext path only - never a
+`UserId`, for the same reason nothing else here keeps one), not left to
+the in-memory bookkeeping that would otherwise be the only record of it.
+A restart in that window - before the peer's acceptance ever arrives, or
+after an old process already saw it and died before acting on it - is
+resolved the next time this side reconnects: the peer is re-resolved fresh
+and the exact same acceptance-handling path runs as if a live acceptance
+had just arrived, so a peer who already accepted before this side ever
+noticed needs to do nothing at all. No pad is ever at risk either way - the
+content's own spend only happens once this resolves, exactly as it would
+from a live acceptance - and a resumed attempt racing a genuinely
+re-delivered acceptance for the same transfer is never queued twice.
 
 **One rule: the pad goes on the payload, and the seal goes around the
 pad.**
@@ -3887,6 +3953,130 @@ have left behind - so replaying it (Enter, §7.3) works identically either
 way; the only difference this layer makes is that it arrives all at once
 once fully received, rather than becoming playable partway through.
 
+### 16.2.1 One conversation end to end: every spend, its acknowledgement, and its retries
+
+Everything above describes the shapes one at a time; this is the timeline
+they compose, with the stop-and-wait gate made explicit. One rule
+generates every line of it: **a spend closes the gate behind it, and only
+its own proof-carrying acknowledgement - which always costs zero pad -
+reopens it.** `seq` is one ordered space per direction, shared by text,
+both file phases, both voice phases, and the `/endotp` notice alike; the
+mirror direction (bob's sends to alice) is the same picture with its own
+independent counters and gate.
+
+```
+ alice                                                        bob
+   |--- OtpEnvelope { seq 0, Text } ------------------------->|  [pad] gate CLOSED behind it
+   |      (a second text typed now is QUEUED locally,          |  decrypts, shows, records
+   |       spending nothing)                                   |  (seq 0, proof) durably
+   |<-- OtpDeliveryAck { seq 0, proof=sha256(nonce) } ----------|  [no pad]
+   |      gate OPEN -> the queued text goes out as seq 1        |
+   |--- OtpEnvelope { seq 1, Text } ------------------------->|  ...and so on
+   |<-- OtpDeliveryAck { seq 1, proof } ------------------------|
+   |                                                           |
+   |--- OtpFileOffer { stream_id, seq 2 } -------------------->|  [pad: filename+size]
+   |<-- OtpDeliveryAck { seq 2, proof } ------------------------|  acked on decrypt, before
+   |<-- FileAccept { stream_id } -------------------------------|  the user even decides
+   |--- OtpFileContentSeq { stream_id, seq 3 } --------------->|  [no pad] names the next slot
+   |--- FileChunk ... FileChunk ------------------------------>|  [pad: the whole file, padded
+   |                                                           |   once, streamed as chunks]
+   |<-- OtpDeliveryAck { seq 3, proof=sha256(plaintext) } ------|  content has nowhere to bury
+   |                                                           |  a nonce; its digest is the
+   |                                                           |  proof, and consuming the
+   |                                                           |  slot advances bob's
+   |                                                           |  expectation like any other
+```
+
+A voice message is the same two-spend shape as a file - `OtpVoiceOffer`
+(auto-accepted, no popup) then `OtpFileContentSeq` + chunks - and `/endotp`
+is simply the next occupant of the same space, drawn in §16.6.
+
+**A duplicate is re-answered from the record, never reprocessed.** The
+peer retries a spend only because the acknowledgement this side already
+sent was lost; answering again costs nothing, and staying silent would
+hold their gate shut forever:
+
+```
+ alice                                                        bob
+   |--- OtpEnvelope { seq 4, Text } --------------X            |  bob's ack is what got lost
+   |          (ack lost in transit)  <------------------------ |  (he decrypted fine)
+   |--- OtpEnvelope { seq 4 } (recovered, resent) ------------>|  seq gate: already consumed -
+   |                                                           |  the pad is never touched
+   |<-- OtpDeliveryAck { seq 4, recorded proof } ---------------|  answered from the durable
+   |      gate OPEN                                             |  (seq, proof) record
+```
+
+**A reconnect retries by recovery, never by re-encryption.** Whatever
+single spend is unacknowledged when the link dies is resent byte-identical
+from the tool's own kept ciphertext (`--recover-last --sent`), under the
+same `seq`, on every reconnect until its acknowledgement genuinely lands -
+re-encrypting would consume a second pad range for a message the peer's
+decoder still expects at the first, desyncing the pair for good:
+
+```
+ alice                                              bob (offline)
+   |--- OtpEnvelope { seq 5 } ---------------X        (never arrives - his
+   |                                                   connection handle is dead)
+   |        ...bob reconnects, minutes or days later...
+   |--- OtpEnvelope { seq 5 } (recovered) ------------------->|  same ciphertext, same seq:
+   |<-- OtpDeliveryAck { seq 5, proof } -----------------------|  decodes exactly as the
+   |      gate OPEN                                            |  original would have
+```
+
+**Even the process dying inside a spend reconciles.** Both windows are
+covered (the details in §16.2's prose): a sender killed between the
+encrypt and its record finds the write-ahead intent at the next startup,
+promotes the orphan, and the recovery above resends it; a receiver killed
+between a decrypt and its record recognises the sender's retry by the
+exact off-by-one between the tool's counter and the store's, and recovers
+the orphaned plaintext - nonce and all - from the tool's received-side
+safety copy:
+
+```
+ alice (killed mid-send)                                      bob
+   |  [encrypt ran; process died before record/send]           |
+   |        ...restart: intent + tool one-ahead =>              |
+   |           promoted to an ordinary pending send...          |
+   |--- OtpEnvelope { seq 6 } (recovered) ------------------->|  indistinguishable from an
+   |<-- OtpDeliveryAck { seq 6, proof } -----------------------|  ordinary delayed delivery
+
+ alice                                     bob (killed mid-receive)
+   |--- OtpEnvelope { seq 7 } -------------->|  [decrypt ran; process died
+   |                                          |   before accept/ack]
+   |--- OtpEnvelope { seq 7 } (recovered) --->|  tool refuses (already past it);
+   |                                          |  counter off-by-one identifies the
+   |                                          |  crash; plaintext recovered from
+   |                                          |  --recover-last --received, then
+   |                                          |  accepted, shown, and acknowledged
+   |<-- OtpDeliveryAck { seq 7, true proof } -|  as if the kill never happened
+```
+
+**A file or voice send's *content* phase has one more window of its own,
+before either side has spent anything on it.** The offer is a durable
+spend the moment it goes out, but the content it names is only staged
+plaintext until the peer's acceptance arrives - and that staging, unlike
+every spend above, is not itself a pad spend to recover. A restart here is
+resolved by resuming the *acceptance*, not the pad:
+
+```
+ alice                                     bob (killed awaiting accept)
+   |--- OtpVoiceOffer { seq 8 } ------------->|  [pad spent for the offer;
+   |<-- OtpDeliveryAck { seq 8, proof } -------|   content staged, not yet
+   |--- FileAccept { stream 9 } ---------X    |   encrypted - process dies]
+   |            (never processed - the        |
+   |             in-memory target is gone)     |
+   |                                            |
+   |        ...bob reconnects...                |
+   |                                    resume_pending_content_sends:
+   |                                    the staged record survived on
+   |                                    disk; bob re-resolves alice and
+   |                                    re-enters accept-handling fresh -
+   |                                    alice never has to do anything
+   |--- OtpFileContentSeq { stream 9, seq 10 } ->|  content now genuinely
+   |--- FileChunk ... ------------------------->|  encrypted, exactly once
+   |<-- OtpDeliveryAck { seq 10, proof } --------|
+```
+
 ### 16.3 Session visibility in the DM log
 
 Every error/confirmation this layer shows (§16.1's "started"/"cancelled",
@@ -4031,107 +4221,151 @@ either side may do it alone, and the far side is *told*, not asked.
 ```
  alice (has decided to end it)                                bob
    |   pauses her own copy of the pad - the keychain
-   |   entry and its sequence counters are left exactly
-   |   as they are; only the outstanding-ack gate and any
-   |   pad still owed to bob from an unfinished setup are
-   |   cleared, and the contact stops being active
+   |   entry, its sequence counters, and any send still
+   |   awaiting acknowledgement are left exactly as they
+   |   are; only a pad still owed to bob from an
+   |   unfinished setup is abandoned, and the contact
+   |   stops being active
    |--- OtpEndSession { contact_name } ----------------------------->|   under the pad, as OtpEnvelope
    |                                                                  |   bob does the same local
    |                                                                  |   pause on his side
-   |<-- OtpEndSessionAck { contact_name } -----------------------------|   likewise
+   |<-- OtpDeliveryAck { seq, proof } ----------------------------------|   the ordinary proof-carrying ack
 ```
 
-**Both travel under the pad**, framed by §16.2's single rule -
-`seal(pad(payload))` for a `PqWrapped` pair, `pad(payload)` for a `Direct`
-one - and carried by `OtpEnvelope` like any other padded send. Ending a
-session is something said to this contact, so it is said the same way
+**The notice travels under the pad as an ordinary stop-and-wait send** -
+framed by §16.2's single rule (`seal(pad(payload))` for a `PqWrapped`
+pair, `pad(payload)` for a `Direct` one), carried by `OtpEnvelope`,
+closing the gate behind it, recoverable-never-re-encrypted while
+unacknowledged, and confirmed by the same proof-carrying `OtpDeliveryAck`
+(§16.2) every message earns. Ending a session is something said to this
+contact, so it is said - and, crucially, *sequenced* - the same way
 everything else is; spending a little pad to say it is deliberate. For a
 `Direct` pair it is also the only shape that can carry it at all, there
-being no envelope to seal it into - before this, `/endotp` on a pad-only
-pair tore the session down locally and the peer was simply never told.
+being no envelope to seal it into. An earlier design gave the notice its
+own parallel machinery - a dedicated padded `OtpEndSessionAck`, a sequence
+number taken *without* arming the gate, retries that re-encrypted - and
+every piece of that specialness was a desync in waiting: a re-encrypted
+retry spent a second pad range for a message the peer's decoder was still
+expecting at the first; the un-gated notice could overwrite an in-flight
+message's `--recover-last` safety copy (the tool keeps exactly one per
+contact) or leapfrog it on the pad; and the ack, itself an unconfirmable
+pad spend, could be overwritten or leapfrogged the same way on the other
+side. As an ordinary send, all of that is impossible by construction: at
+most one ciphertext per contact is ever outstanding, in either direction.
 
-Unlike the two provisioning payloads (§16.1), neither of these has a
-bootstrap problem to solve: a session that can be ended is by definition
-one whose pad both sides already hold. The one case that cannot be padded
-- a contact whose pad is gone or was never usable - falls back to an
-ordinary sealed `Envelope`, which needs a keybundle and so exists only for
-a `PqWrapped` pair.
+Unlike the two provisioning payloads (§16.1), the notice has no bootstrap
+problem to solve: a session that can be ended is by definition one whose
+pad both sides already hold. The one case that cannot be padded - a
+contact whose pad is gone or was never usable - falls back to an ordinary
+sealed `Envelope`, which needs a keybundle and so exists only for a
+`PqWrapped` pair; having spent no pad, it is confirmed by a sealed,
+unpadded `OtpEndSessionAck` (the one place that payload still exists)
+rather than a pad proof, and retried by fresh re-encoding, which for an
+unpadded envelope costs nothing.
 
-Each is confirmed by the other rather than by an `OtpDeliveryAck`, so
-neither arms the stop-and-wait gate behind it: arming it would leave it
-armed forever, and a later `/otp` resuming this same contact would find
-its first message queued behind a wait that can never end. They still take
-a `seq` from the same counter, because the pad is one ordered stream. A
-notice that arrives twice - its first ack having been lost - is answered
-from the recovered ciphertext of the ack already sent (`--recover-last
---sent`), never by spending more pad.
+A notice that arrives twice - its first ack having been lost - is answered
+exactly like any other repeated message (§16.2): from the durable
+`(seq, proof)` record its acceptance left behind, at no pad cost and with
+no re-decrypt. Nothing about a duplicate notice is special any more.
 
-**Local pausing happens first, unconditionally, before anything is sent.**
-The instant `/endotp` runs, this side stops treating the contact as active
-and clears whatever was genuinely mid-flight - the outstanding-ack gate,
-any pad still owed to the peer from an unfinished `OtpKeySetup` (§16.1).
-Unlike an earlier revision of this behavior, the keychain entry itself and
-both sequence counters (`EncryptedSequence`/`DecryptedSequence`,
-`EncryptionKeyOffset`/`DecryptionKeyOffset` - §16.1) are deliberately left
-untouched: `/endotp` pauses a session, it does not destroy the pad. This
-still guarantees this side can never again spend that pad *while paused*,
-since every send-path gate stops treating the contact as active from this
-call onward - not because the key material is gone, but because nothing
-routes a send through it until the session is reopened. A later `/otp`
-against the same peer finds the existing keychain entry still there and
-proposes resuming it via `OtpSessionRequest` (§16.1), the identical pad
-picking up exactly where it left off rather than a new one being
-generated. A status notice and a line in that
-peer's own DM room both announce "OTP session ended" immediately (§16.3),
-the same way starting one is announced on both sides.
+**Ending is two-phase: nothing takes effect anywhere until the peer's
+confirmation lands.** `/endotp` *requests* the end - recorded durably, so a
+crash or link drop mid-handshake still finishes it on the next reconnect -
+and the initiator's side stays fully in the session until the peer's
+proof-carrying acknowledgement of the notice arrives. That acknowledgement
+is the single point the end becomes effective: the receiving side pauses
+the moment the notice lands, the initiating side pauses the moment the
+confirmation lands, and so the two sides always leave the session
+together - never one paused while the other unknowingly keeps spending the
+pad at it. In the window between request and confirmation, a new send to
+that contact is refused out loud ("the session is ending - waiting for
+their confirmation"), never queued behind the very notice ending things
+and never silently rerouted; a repeat `/endotp` reports the end already in
+flight; and `/otp` cancels the pending end for a user who changes their
+mind. The confirmed pause abandons only a pad still owed to the peer from
+an unfinished `OtpKeySetup` (§16.1) - never installed anywhere, so
+dropping it costs nothing. The keychain entry itself, both sequence
+counters (`EncryptedSequence`/`DecryptedSequence`,
+`EncryptionKeyOffset`/`DecryptionKeyOffset` - §16.1), *and any send still
+awaiting its acknowledgement* are deliberately left untouched: `/endotp`
+pauses a session, it does not destroy the pad - and an in-flight message's
+pad was already spent, so the peer's decoder is waiting on exactly that
+ciphertext; abandoning it would leave them permanently unable to decrypt
+anything this side says afterwards, the notice included. When such a send
+is outstanding at `/endotp` time, the notice itself is *deferred*: the end
+is recorded as owed but spends nothing, the in-flight message keeps both
+its recovery copy and its place on the pad, and the moment its genuine ack
+arrives - immediately, or on a reconnect days later - the notice goes out
+as the gate's next occupant. A later `/otp` against the same peer finds
+the existing keychain entry still there and proposes resuming it via
+`OtpSessionRequest` (§16.1), the identical pad picking up exactly where it
+left off rather than a new one being generated. A status notice announces
+"ending session - waiting for them to confirm" the moment `/endotp` is
+accepted, and "OTP session ended - confirmed by them" the moment it
+completes (§16.3).
 
-`/endotp` is refused - locally, silently, nothing sent or torn down - in
-two cases: there is no active session with that peer at all, or an OTP
-mail (§17) to that exact contact is still waiting on the pad's
-stop-and-wait gate (the contact's pending send names a mail, not a live
-P2P one). The second case matters because pausing clears that gate's own
-bookkeeping; if the mail's upload acknowledgement then arrived late, there
-would be nothing left to reconcile it against, leaving the contact's
-pad-gate state out of step with what the server still has in flight for
-it. Every other kind of outstanding send (a live P2P text, file offer, file
-content, or voice spend) has no second store depending on that gate
-surviving, so it never blocks `/endotp` - the peer simply never receives
-that one message's own acknowledgement, the same outcome a peer who
-vanished permanently already produces today.
+`/endotp` is refused - out loud, nothing sent or torn down - in four
+cases: there is no *active* session with that peer (merely provisioned, or
+already paused, is nothing to end); the peer is currently offline, since
+an end they cannot confirm would leave the two sides out of step - the
+very thing the two-phase design exists to prevent - so the user is asked
+to try again when they are back; an end handshake is already in flight (a
+second `/endotp` has nothing to add, and re-running the send step would
+spend pad on a duplicate notice); or an OTP mail (§17) to that exact
+contact is still waiting on the pad's stop-and-wait gate (the contact's
+pending send names a mail, not a live P2P one). The mail case matters
+because a mail's upload acknowledgement arrives from the *server*, on its
+own schedule, and ending mid-flight would interleave two different
+confirmation authorities over one gate. A live in-flight send (a P2P text,
+file offer, file content, or voice spend) never blocks `/endotp` - it
+defers the notice behind itself instead, as above, and both are delivered
+in order.
 
 **The receiving side never gets a say.** `OtpEndSession` is not a
 proposal; there is nothing to accept or reject, only to converge to. On
-receipt, the same local pause runs - the contact stops being active, its
-outstanding-ack gate and any owed setup are cleared, the keychain entry and
-sequence counters are left alone - and a status notice/DM-room line
-announce "OTP session ended by &lt;name&gt;". `OtpEndSessionAck` is always
-sent back, even for a contact that was already paused: that is exactly what
-a *retried* `OtpEndSession` (below) whose first acknowledgement got lost
-looks like on the receiving end, and answering it again is what lets the
-sender's own retry stop.
+receipt, the same local pause runs - the contact stops being active, any
+owed setup is abandoned, and the keychain entry, sequence counters, and
+this side's *own* in-flight send (if any) are left alone - and a status
+notice/DM-room line announce "OTP session ended by &lt;name&gt;". The
+proof-carrying `OtpDeliveryAck` goes back the moment the notice decrypts,
+exactly as for a message - it costs the receiving side no pad, so nothing
+of its own that might still be in flight is disturbed by answering.
 
 **The notice is retried until it is genuinely heard, however long that
 takes** - the same durability §16.1 already gives a pad invitation still
-owed to a peer. Whether `/endotp` is run while the peer is online or
-offline, this side records the notice as owed against the contact name
-(not the connection, which does not survive a reconnect), persisted to the
-same on-disk store every other per-contact OTP record lives in. Every time
+owed to a peer. `/endotp` only *starts* with the peer online, but they can
+still vanish inside the handshake window - after the notice went out,
+before their confirmation landed - so the end request is recorded as owed
+against the contact name (not the connection, which does not survive a
+reconnect), persisted to the same on-disk store every other per-contact
+OTP record lives in. Every time
 a direct link to that peer next becomes reachable - a reconnect, a link
 flap, this app's own restart once the link comes back up - the notice is
-re-sent, unchanged, exactly as an unanswered pad invitation already is.
-Only a genuine `OtpEndSessionAck` clears the debt; a link transition with
-nothing acknowledged yet simply retries again next time.
+re-driven: already encrypted, it is recovered and resent by the same
+`--recover-last` pass every unacknowledged spend takes (§16.2's recovery
+rule - never a second encrypt, which would consume a second pad range for
+a message the peer's decoder was still expecting at the first, breaking
+their very first decrypt of the retry with the tool's "no valid metadata"
+refusal); still deferred behind an in-flight message, it simply waits -
+that message is what the recovery pass resends, and its ack is what sends
+the notice; deferred with nothing in flight any more (the gate cleared but
+the app restarted, or the link died in the same breath as the ack), it is
+encrypted fresh, which is safe exactly because no notice ciphertext exists
+yet and nothing is ahead of it. Only the notice's own proof-carrying
+acknowledgement clears the debt; a link transition with nothing
+acknowledged yet simply retries again next time.
 
 ```
- alice ends the session while bob is offline                     bob
-   |   local pause; OtpEndSession has
-   |   nowhere to go right now
+ alice runs /endotp; bob drops before confirming                 bob
+   |   end requested; alice's side stays in the
+   |   session until bob confirms - the notice (or
+   |   the message it is deferred behind) is orphaned
    |
    |   ...bob reconnects, sometime later...
-   |--- OtpEndSession { contact_name } -------------------------------->|   the same notice, retried
+   |--- OtpEnvelope { seq, OtpEndSession } ---------------------------->|   the same ciphertext, recovered
    |                                                                      |   bob pauses his own side
-   |                                                                      |   and acknowledges
-   |<-- OtpEndSessionAck { contact_name } -----------------------------------|
+   |                                                                      |   right away, and acknowledges
+   |<-- OtpDeliveryAck { seq, proof } --------------------------------------|
 ```
 
 **A session's own liveness is independent of the connection carrying it.**

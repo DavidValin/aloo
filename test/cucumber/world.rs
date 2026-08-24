@@ -300,6 +300,13 @@ pub struct AlooWorld {
     /// seal around it weighs - the figure the pad-innermost layering
     /// exists to keep small.
     pub otp_pad_bytes: usize,
+    /// The `stream_id` a file/voice offer most recently reserved, and the
+    /// raw PCM handed to it - carried across steps so a scenario spanning
+    /// "send", "the sender restarts", and "the recording still arrives"
+    /// can find the same transfer and compare the delivered bytes against
+    /// what was actually recorded.
+    pub otp_stream_id: Option<u64>,
+    pub otp_voice_pcm: Option<Vec<u8>>,
     /// The acknowledgement proof the *sender* derived when wrapping, and
     /// the one the *receiver* derived when unwrapping - kept apart so a
     /// scenario can assert the two sides reached it independently.

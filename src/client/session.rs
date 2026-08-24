@@ -242,7 +242,7 @@ pub struct SessionState {
     ///
     /// Two call sites need it: the ack that clears the gate, so it can also
     /// turn that row's arrow green (`client::tui::ui::DeliveryProof::PadAck`),
-    /// and `recover_and_resend_text`, so a resend still names the row the
+    /// and `recover_and_resend_envelope`, so a resend still names the row the
     /// original send did rather than landing untracked.
     ///
     /// Deliberately in memory only, unlike the gate itself
@@ -695,6 +695,29 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
         crate::log_warn!(
             "reclaimed {reclaimed} bytes from abandoned OTP setup directories at startup"
         );
+    }
+    // A write-ahead encrypt intent surviving into this run means the
+    // previous process died inside an encrypt's window - settle every such
+    // orphan before anything else can spend against the same pad
+    // (`client::otp::reconcile_orphaned_sends`'s doc). A promoted *mail*
+    // spend additionally needs its retry reference rebuilt, since that
+    // lives in the mail store the same crash skipped.
+    let promoted = crate::client::otp::reconcile_orphaned_sends(
+        &session.otp_cli_cfg,
+        &mut session.otp_store,
+    )
+    .await;
+    for (contact_name, seq, content) in promoted {
+        if let crate::client::otp_store::PendingOtpContent::Mail { mail_id } = content {
+            crate::client::otp_mail::restore_orphaned_mail_ref(
+                &mut session.otp_mail_store,
+                &session.id_store,
+                &session.own_pq_fp,
+                &contact_name,
+                mail_id,
+                seq,
+            );
+        }
     }
 
     let mut ui_state = UiState::new(display_name);
@@ -2680,20 +2703,15 @@ async fn handle_p2p_event(
             // doc). It owns removal, and spawning the send worker, in
             // every case (immediate, queued, and the plain non-OTP path
             // alike).
-            if let Some(target) = session.own_file_targets.get(&stream_id) {
+            if session.own_file_targets.contains_key(&stream_id) {
                 let me = ui_state.own_id.unwrap_or(UserId(0));
                 ui_state.set_file_progress(me, stream_id, 0);
-                // A transfer's setup goes out before its first chunk,
-                // exactly as a voice stream's does after `StreamStart` -
-                // the chunks themselves are ciphertext only.
-                for (id, setup) in target.key.setups() {
-                    session.peer_link.send_reliable_or_queue(
-                        id,
-                        P2pPayload::StreamKeySetup { stream_id, setup },
-                    );
-                }
-                crate::client::otp::start_outgoing_file_content(session, ui_state, stream_id)
-                    .await?;
+                // Setup, then the gate-check-then-encrypt-or-queue decision -
+                // shared with the reconnect autoheal pass
+                // (`client::otp::begin_file_content`) so a `FileAccepted`
+                // reconstructed after this side's own restart behaves
+                // identically to a live one.
+                crate::client::otp::begin_file_content(session, ui_state, stream_id).await?;
             }
         }
         P2pEvent::FileRejected { stream_id } => {
@@ -2863,11 +2881,22 @@ async fn handle_p2p_event(
                     // peer who went offline mid-provisioning resumes instead
                     // of stranding both sides.
                     crate::client::otp::resend_pending_setups(wr, session, ui_state).await?;
+                    // Same trigger again, for a fresh pair's `OtpPadCommit`
+                    // whose acknowledgement never made it back - the one
+                    // provisioning payload whose loss leaves the two sides
+                    // asymmetric (docs/PROTOCOL.md §16.1).
+                    crate::client::otp::resend_pending_commits(wr, session, ui_state).await?;
                     // Same trigger again, for a `/endotp` notice this side
                     // still owes a peer who was unreachable when it ran (or
                     // whose acknowledgement never made it back) - see
                     // `docs/PROTOCOL.md` §16.6.
                     crate::client::otp::resend_pending_end_notices(wr, session, ui_state).await?;
+                    // Same trigger again, for a file or voice send whose
+                    // offer already left but whose *content* is still
+                    // waiting on the peer's acceptance - covers this side's
+                    // own restart in that exact window, which the three
+                    // passes above do not (docs/PROTOCOL.md §16.2).
+                    crate::client::otp::resume_pending_content_sends(session, ui_state).await?;
 
                     // Tells `peer` our own device id, encrypted, every time
                     // the link reaches Active (idempotent - harmless on a
@@ -2966,12 +2995,7 @@ async fn handle_p2p_event(
             stream_id,
             seq,
         } => {
-            if let Some(pending) = session
-                .otp_incoming_file_receives
-                .get_mut(&(from, stream_id))
-            {
-                pending.seq = Some(seq);
-            }
+            crate::client::otp::on_content_seq(session, ui_state, from, stream_id, seq).await;
         }
         P2pEvent::OtpVoiceOffer {
             from,
@@ -3337,7 +3361,8 @@ pub fn register_pad_only_peer(
     }
     // No pad, nothing to say to them - registering would offer the user a
     // conversation that could not carry a single message.
-    crate::client::otp::contact_name_if_active(session, &info.public_key_der)?;
+    let contact_name =
+        crate::client::otp::contact_name_if_active(session, &info.public_key_der)?;
     if ui_state.known_users.contains_key(&peer) {
         return None;
     }
@@ -3346,8 +3371,17 @@ pub fn register_pad_only_peer(
     // run: every send to them rides it from the first one
     // (`otp::contact_name_if_active` gates on the pad being provisioned,
     // not on a session having been negotiated). Saying so on their row is
-    // what makes that visible.
-    ui_state.mark_otp_active(peer);
+    // what makes that visible - unless this side deliberately ended the
+    // session and still owes them the notice: re-marking it active would
+    // announce as running the very session the reconnect is about to
+    // deliver the end of (`otp::resend_pending_end_notices`).
+    if !session
+        .otp_store
+        .get(&contact_name)
+        .is_some_and(|s| s.pending_end_notice)
+    {
+        ui_state.mark_otp_active(peer);
+    }
     on_daemon_peer_appeared(ui_state, session, peer, &nickname, None)
 }
 
@@ -3996,6 +4030,14 @@ impl SessionState {
     /// both sides (`otp::framing_for`).
     pub fn set_own_pinned_der_for_test(&mut self, der: Vec<u8>) {
         self.otp_own_pinned_der = der;
+    }
+
+    /// Empties `own_file_targets` - simulates the one part of a real
+    /// process restart a test needs and cannot otherwise reach: this map
+    /// is in-memory only, so a genuine restart always starts it empty
+    /// (`OtpStore::PendingContentSend`'s doc covers what survives instead).
+    pub fn clear_own_file_targets_for_test(&mut self) {
+        self.own_file_targets.clear();
     }
 
     /// Reads back what `set_own_pinned_der_for_test` put there - what a

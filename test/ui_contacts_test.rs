@@ -377,6 +377,54 @@ fn rendering_shows_the_header_and_every_nicknames_row() {
     assert!(joined.contains("unknown"), "bob's encryption method is unrecorded");
 }
 
+/// A single (or empty) contact list must never shrink-wrap the popup down
+/// to a cramped sliver - the list itself sizes at `rows + 4`, floored at 7
+/// so there is always room to read comfortably.
+///
+/// @requirement AC-306
+#[test]
+fn the_popup_is_at_least_seven_lines_tall_with_only_one_contact() {
+    let mut state = joined_general_with(vec![]);
+    state.open_contacts();
+    state.set_contacts_rows(vec![row("alice", Some(KeyMode::PqHybrid))]);
+
+    let (_, _, _, height) = popup_rect(&buffer_at(&state, 140, 30), "Contacts");
+    assert!(height >= 7, "expected at least 7 lines, got {height}");
+}
+
+/// The empty-list case goes through the same height floor, not a smaller
+/// one of its own.
+///
+/// @requirement AC-306
+#[test]
+fn the_popup_is_at_least_seven_lines_tall_with_no_contacts_at_all() {
+    let mut state = joined_general_with(vec![]);
+    state.open_contacts();
+
+    let (_, _, _, height) = popup_rect(&buffer_at(&state, 140, 30), "Contacts");
+    assert!(height >= 7, "expected at least 7 lines, got {height}");
+}
+
+/// The shortcut hints in the title bar must stand out from the plain
+/// "Contacts" label rather than blending into the border's default color.
+///
+/// @requirement AC-306
+#[test]
+fn the_titles_shortcut_hints_are_colored_differently_from_the_label() {
+    let mut state = joined_general_with(vec![]);
+    state.open_contacts();
+    state.set_contacts_rows(vec![row("alice", Some(KeyMode::PqHybrid))]);
+
+    let buffer = buffer_at(&state, 140, 30);
+    let (label_x, label_y) = find_text_start(&buffer, "Contacts");
+    let (hint_x, hint_y) = find_text_start(&buffer, "switch key");
+    assert_ne!(
+        buffer[(label_x, label_y)].fg,
+        buffer[(hint_x, hint_y)].fg,
+        "the shortcut hints must not share the label's color"
+    );
+}
+
 /// @requirement AC-298
 #[test]
 fn an_eligible_but_uninstalled_contact_shows_a_crossed_otp_badge() {

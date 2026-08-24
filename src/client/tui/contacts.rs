@@ -1015,10 +1015,21 @@ pub(crate) fn render_contacts_popup(frame: &mut Frame, area: Rect, state: &UiSta
         + COL_GAP * 3
         + display_width(KEY_BADGES_SAMPLE) as usize;
     let width = (content_width as u16 + 4).clamp(60, area.width.saturating_sub(2));
-    let height = (contacts.rows.len().max(1) as u16 + 4).min(area.height.saturating_sub(2));
+    // At least 7 lines even with a single (or no) contact - short enough to
+    // still shrink-wrap a long list, tall enough that the popup never reads
+    // as a cramped sliver.
+    let height = (contacts.rows.len().max(1) as u16 + 4)
+        .max(7)
+        .min(area.height.saturating_sub(2));
     let popup = centered_rect(width, height, area);
     let block = Block::default()
-        .title("Contacts (\u{2190}/\u{2192}: switch key  Enter: key details  o: install OTP key  d: delete  r: refresh  Esc: close)")
+        .title(Line::from(vec![
+            Span::raw("Contacts "),
+            Span::styled(
+                "(\u{2190}/\u{2192}: switch key  Enter: key details  o: install OTP key  d: delete  r: refresh  Esc: close)",
+                Style::default().fg(Color::Cyan),
+            ),
+        ]))
         .borders(Borders::ALL);
     let inner = block.inner(popup);
     frame.render_widget(ratatui::widgets::Clear, popup);

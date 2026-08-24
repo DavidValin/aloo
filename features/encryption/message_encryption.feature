@@ -260,11 +260,33 @@ Feature: How a message is encrypted, at every layer
     When alice runs /otp with bob
     Then otp is active for bob immediately, with nothing sent to negotiate it
 
-  @US-033 @AC-260 @direct_otp
+  @US-033 @AC-260 @AC-310 @direct_otp
   Scenario: Ending a session travels under the pad it is ending
     Given alice and bob reach each other directly and hold a pad for each other
     When alice runs /endotp with bob
-    Then the notice reaches bob under the pad, and his ack comes back the same way
+    Then the notice reaches bob under the pad, and his proof-carrying ack settles it
+
+  @US-033 @AC-310 @direct_otp
+  Scenario: Ending needs the peer reachable, and a refusal spends nothing
+    Given alice and bob reach each other directly and hold a pad for each other
+    And bob has become unreachable for alice
+    When alice runs /endotp with bob expecting a refusal
+    Then the end is refused with nothing spent and the session still active
+
+  @US-033 @AC-307 @direct_otp
+  Scenario: An unconfirmed end notice is recovered on reconnect, never re-encrypted
+    Given alice and bob reach each other directly and hold a pad for each other
+    When alice runs /endotp with bob
+    And bob drops before confirming, and later reconnects
+    Then the very same notice is re-sent from recovery, and his confirmation ends it for both
+
+  @US-033 @AC-316 @direct_otp
+  Scenario: A voice recording survives the sender's own restart while awaiting acceptance
+    Given alice and bob reach each other directly and hold a pad for each other
+    When alice records and sends a voice message to bob
+    And alice's whole process restarts before bob's acceptance is processed
+    And alice reconnects and bob's acceptance reaches her
+    Then the recording still reaches bob, byte-identical, with no pad spent twice
 
   # -------------------------------------------------------------------
   # @otp_control - turning the pad layer on and off, and marking it
@@ -403,6 +425,7 @@ Feature: How a message is encrypted, at every layer
     Given I am connected and viewing a channel
     And bob is in the channel with me
     And I have opened a private room with bob
+    And I have a direct connection to bob
     When I type "/endotp" into the compose bar
     And I press Enter
     Then the otp session was ended
@@ -415,8 +438,8 @@ Feature: How a message is encrypted, at every layer
     And I press Enter
     Then nothing happens
 
-  @US-033 @AC-053 @otp_control
-  Scenario: /endotp still works once the peer has gone offline
+  @US-033 @AC-310 @otp_control
+  Scenario: /endotp is refused while the peer is offline
     Given I am connected and viewing a channel
     And bob is in the channel with me
     And I have opened a private room with bob
@@ -424,7 +447,7 @@ Feature: How a message is encrypted, at every layer
     When I type "/endotp" into the compose bar
     Then the compose bar holds "/endotp"
     When I press Enter
-    Then the otp session was ended
+    Then the end is refused because bob cannot confirm it
 
   @US-033 @AC-193 @otp_control
   Scenario: A disconnect alone does not end an active session

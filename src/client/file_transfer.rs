@@ -152,6 +152,14 @@ pub(crate) struct ActiveFileTransfer {
 pub enum OtpIncomingKind {
     File { final_path: PathBuf },
     Voice { duration_ms: u32 },
+    /// A transfer re-registered from its wire retry alone
+    /// (`client::otp::on_content_seq`): this side restarted after accepting
+    /// the offer, so what the content originally was - a file's name and
+    /// destination, a voice message's duration - died with the process.
+    /// The bytes still land (written under the OTP working directory and
+    /// named in a notice), the spend is still acknowledged, and the pads
+    /// stay in lockstep - only the presentation is degraded.
+    Recovered,
 }
 
 /// Bookkeeping for one currently-arriving OTP-protected transfer, kept

@@ -47,7 +47,7 @@ Feature: Getting help without leaving the app
     Then the help overlay explains private channels, voice, files and the tags
     And the help popup shows its longest line unclipped
     And the help popup covers the whole screen, the compose bar included
-    Then scrolling to the bottom reveals identity pinning
+    Then scrolling to the bottom reveals contacts and keys
 
   @AC-058
   Scenario: A reminder that help exists is always on screen

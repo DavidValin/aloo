@@ -93,6 +93,22 @@ impl OtpOutQueue {
         self.queue.get_mut(contact_name)?.pop_front()
     }
 
+    /// Whether `stream_id`'s content-phase encrypt is already queued for
+    /// `contact_name` - checked before enqueueing another copy
+    /// (`start_outgoing_file_content`'s doc): a resumed accept
+    /// (`resume_pending_content_sends`) and a genuinely re-delivered
+    /// `FileAccepted` for the very same stream can both reach the "gate is
+    /// busy, queue it" branch once each, and without this, both would
+    /// enqueue their own copy - the drain would then attempt this same
+    /// content a second time once some *later*, unrelated ack freed the
+    /// gate again.
+    pub fn has_queued_stream(&self, contact_name: &str, stream_id: u64) -> bool {
+        self.queue.get(contact_name).is_some_and(|q| {
+            q.iter()
+                .any(|item| matches!(item, PendingOtpSend::FileContent { stream_id: s, .. } if *s == stream_id))
+        })
+    }
+
     /// Drops every send still queued for `contact_name` - once `/endotp`
     /// (either side's) has run, the session they were waiting to go out
     /// under no longer exists, so there is nothing left to flush them
@@ -254,39 +270,6 @@ pub async fn unwrap_incoming(
         }
         Ok(OtpCliOutcome::Rejected(reason)) => UnwrapOutcome::Rejected(reason),
         _ => UnwrapOutcome::Failed,
-    }
-}
-
-/// `unwrap_incoming` plus the notice a rejection deserves - shared by
-/// `on_message`/`on_file_offer`, the two receive paths where an incoming
-/// envelope is genuinely OTP-wrapped. A rejection is worth saying out loud
-/// (unlike an ordinary decode failure): it means this exact ciphertext was
-/// not produced by the mirrored key at the position expected - a replay, a
-/// reordered or duplicated message, or one from a source this pad doesn't
-/// recognize - security-relevant on its own, distinct from a transient
-/// failure.
-async fn unwrap_or_notify(
-    cfg: &OtpCliConfig,
-    wire_bytes: &[u8],
-    contact_name: &str,
-    ui_state: &mut UiState,
-    from: UserId,
-    from_name: &str,
-) -> Option<(Vec<u8>, crypto::otp::AckProof)> {
-    match unwrap_incoming(cfg, wire_bytes, contact_name).await {
-        UnwrapOutcome::Ok(bytes, proof) => Some((bytes, proof)),
-        UnwrapOutcome::Rejected(reason) => {
-            let reason = reason.trim().replace('\n', "; ");
-            notify(
-                ui_state,
-                from,
-                from_name,
-                format!("OTP: a message from {from_name} was rejected ({reason}) - keys untouched"),
-                false,
-            );
-            None
-        }
-        UnwrapOutcome::Failed => None,
     }
 }
 
@@ -697,6 +680,27 @@ pub async fn handle_provisioning_command(
             peer,
             &peer_name,
             format!("a key exchange with {peer_name} is already in progress"),
+            false,
+        );
+        return Ok(());
+    }
+
+    // A live session already active with this peer has nothing left for a
+    // second `/otp` to negotiate - and re-running it anyway risks exactly
+    // the desync this once produced: re-provisioning or re-confirming a
+    // session that both sides already agree is running, right as the two
+    // sides' own bookkeeping is what could disagree about that (a
+    // reconnect mid-flight, a lost ack). `/endotp` is the only way to
+    // leave this state, same as it is the only way to enter a fresh
+    // negotiation afterward. Mail has no such state to conflict with - it
+    // is never "active" the way a session is, only ever usable or not
+    // (`otp_mail::check_recipient`) - so this never applies to it.
+    if purpose == crypto::otp::OtpPurpose::Live && ui_state.is_otp_active(peer) {
+        notify(
+            ui_state,
+            peer,
+            &peer_name,
+            format!("an OTP session with {peer_name} is already active - use /endotp first"),
             false,
         );
         return Ok(());
@@ -2152,68 +2156,132 @@ pub async fn handle_end_otp_command(
         EndOtpDecision::End => {}
     }
 
-    // Local teardown first, unconditionally - this side must never show
-    // this session as active again, even if the notice below never reaches
-    // the peer at all. The keychain entry itself is deliberately left
-    // alone: `/endotp` pauses a session, it doesn't destroy the pad, so
-    // `/otp` with the same contact later resumes the very same key exactly
-    // where it left off (`OtpStore::pause_session`'s doc) instead of
-    // generating a fresh one.
-    discard_pending_setup(&session.otp_cli_cfg, &contact_name);
-    session.otp_incoming_setup.remove(&peer);
-    session.otp_out_queue.clear(&contact_name);
-    session.otp_store.pause_session(&contact_name);
+    // An end handshake already in flight has nothing left for a second
+    // `/endotp` to do - re-running the send step would spend a second range
+    // of the pad on a duplicate notice, widening exactly the offset gap the
+    // retry machinery exists to prevent.
+    if session
+        .otp_store
+        .get(&contact_name)
+        .is_some_and(|s| s.pending_end_notice)
+    {
+        notify(
+            ui_state,
+            peer,
+            &peer_name,
+            format!("OTP: already ending - waiting for {peer_name} to confirm"),
+            false,
+        );
+        return Ok(());
+    }
+    // Ending is a synchronised, two-party operation over an *active*
+    // session - a contact that is merely provisioned (paused, or adopted
+    // and never started) has nothing running to end.
+    if !ui_state.is_otp_active(peer) {
+        notify(
+            ui_state,
+            peer,
+            &peer_name,
+            "OTP: no active session with this user".to_string(),
+            false,
+        );
+        return Ok(());
+    }
+    // Both sides must be reachable right now: the end takes effect only
+    // when the peer's proof-carrying acknowledgement of the notice
+    // arrives, so the two sides leave the session together, in sync -
+    // never one paused while the other unknowingly keeps spending the pad
+    // at it. Checked against the *direct link*, not only `ui_state.offline`
+    // (`ServerMessage::UserOffline`, gated behind `HEARTBEAT_TIMEOUT` - up
+    // to 30s of a peer looking reachable after they are actually gone):
+    // that lag is exactly wide enough for a human to run `/endotp` inside
+    // it, still spending the pad against someone who cannot currently
+    // receive or acknowledge it. Neither signal alone is fast enough on its
+    // own (the link's own idle detection lags further still,
+    // `p2p::LINK_IDLE_TIMEOUT`), so both are checked and either refuses.
+    // This narrows the race; it cannot close it outright - only the
+    // protocol-level durability (deferred/recovered notice, no local
+    // effect before the peer's ack) makes a spend that slips through this
+    // guard anyway still safe rather than merely less likely.
+    if ui_state.offline.contains(&peer)
+        || ui_state.link_status_of(peer) != crate::client::p2p::LinkStatus::Active
+    {
+        notify(
+            ui_state,
+            peer,
+            &peer_name,
+            format!(
+                "OTP: {peer_name} is offline - /endotp needs both sides online so the end \
+                 is confirmed on both; try again when they are back"
+            ),
+            false,
+        );
+        return Ok(());
+    }
+
+    // Two-phase from here (docs/PROTOCOL.md §16.6): nothing is paused or
+    // torn down yet. The end is *requested* - durably, so a crash or link
+    // drop mid-handshake still finishes it on reconnect - and this side
+    // stays fully in the session until the peer's acknowledgement lands
+    // (`on_delivery_ack`'s confirmation is the single point both sides'
+    // ends become effective). New sends meanwhile are refused
+    // (`send_or_queue`), never silently rerouted.
+    session.otp_store.mark_end_requested(&contact_name);
     let _ = session.otp_store.save();
-    ui_state.clear_otp_active(peer);
     notify(
         ui_state,
         peer,
         &peer_name,
-        "OTP session ended (the pad is kept - /otp with them resumes it)".to_string(),
+        format!("OTP: ending session - waiting for {peer_name} to confirm"),
         true,
     );
 
-    send_end_session_payload(
-        wr,
-        session,
-        peer,
-        &peer_pubkey_der,
-        &contact_name,
-        Content::OtpEndSession,
-    )
-    .await;
+    let gate_armed = session
+        .otp_store
+        .get(&contact_name)
+        .and_then(|s| s.pending_unacked_out_seq)
+        .is_some();
+    if !gate_armed {
+        send_end_notice_now(wr, session, peer, &peer_pubkey_der, &contact_name).await;
+    }
+    // else: deferred. An in-flight spend is still awaiting the peer's
+    // acknowledgement - encrypting the notice now would overwrite that
+    // message's only recover-last safety copy *and* leapfrog it on the pad;
+    // if the peer never received it, they could then never decrypt the
+    // notice (or anything else) again. The message stays recoverable
+    // (`recover_and_resend`), the end request was recorded durably above,
+    // and the moment the in-flight spend's genuine ack arrives - now or on
+    // any later reconnect - `on_delivery_ack` sends this notice as the
+    // gate's next occupant.
     Ok(())
 }
 
-/// Builds and sends `content` (`Content::OtpEndSession` or
-/// `Content::OtpEndSessionAck`) to `to`, padded like everything else this
-/// contact is told (`queue_end_session_payload`). Signals the link first
-/// (`ensure_link`) for the two callers that cannot assume one already
-/// exists: the initiator (`handle_end_otp_command`) and the retry pass
-/// (`resend_pending_end_notices`).
-async fn send_end_session_payload(
+/// Encrypts and sends the `/endotp` notice as the ordinary stop-and-wait
+/// send it now is (`PendingOtpContent::EndNotice`): the pad goes on it, the
+/// seal (where the pair has one) goes around the pad, `record_sent` arms
+/// the gate behind it, and the peer's proof-carrying `OtpDeliveryAck` is
+/// what clears it - at which point `on_delivery_ack` also clears
+/// `pending_end_notice`, ending the durable retry. Until that ack arrives,
+/// `recover_and_resend` retries the exact recorded ciphertext on every
+/// reconnect, like any other unacknowledged spend - never a second encrypt.
+///
+/// Callers must only reach this with the gate clear (the same
+/// reserve-after-genuinely-spent contract `send_now` has): the notice
+/// deferred behind an in-flight message is `handle_end_otp_command`'s and
+/// `on_delivery_ack`'s job to sequence, not this function's.
+///
+/// A contact whose pad cannot encrypt at all (gone, exhausted, or the
+/// binary missing) falls back to a sealed, unpadded `Envelope` - no gate
+/// armed, nothing recoverable - answered by the legacy sealed
+/// `OtpEndSessionAck` (`on_end_session_ack`) rather than a pad proof;
+/// `pending_end_notice` keeps the retry alive until either confirmation
+/// arrives.
+async fn send_end_notice_now(
     wr: &mut impl crate::control::ControlSink,
     session: &mut SessionState,
     to: UserId,
     pubkey_der: &[u8],
     contact_name: &str,
-    content: Content,
-) {
-    session.peer_link.ensure_link(wr, to).await;
-    queue_end_session_payload(session, to, pubkey_der, contact_name, content).await;
-}
-
-/// `send_end_session_payload` without the `ensure_link` signalling round
-/// trip - for the one caller that cannot signal: an ack sent straight back
-/// at a peer whose `OtpEndSession` just arrived over the link, which is by
-/// definition already up (their message just came in on it) - mirrors
-/// `queue_key_setup_ack`'s identical reasoning.
-async fn queue_end_session_payload(
-    session: &mut SessionState,
-    to: UserId,
-    pubkey_der: &[u8],
-    contact_name: &str,
-    content: Content,
 ) {
     let payload = crypto::otp::OtpEndSessionPayload {
         contact_name: contact_name.to_string(),
@@ -2221,16 +2289,18 @@ async fn queue_end_session_payload(
     let Ok(plaintext) = proto::encode(&payload) else {
         return;
     };
-    // Ending a session is itself something said to this contact, so it
-    // goes under their pad like everything else does - `seal(pad(x))` for
-    // a `PqWrapped` pair, `pad(x)` for a `Direct` one, which is also the
-    // only shape that can carry it at all for a pad-only pair. Spending a
-    // little pad to say "we're done" is deliberate (docs/PROTOCOL.md
-    // 16.6); the fallback below is for the one case that cannot be padded
-    // - a contact whose pad is gone or was never usable.
     let send_id = session.next_stream_id;
     session.next_stream_id += 1;
-    if let Some((envelope, _proof)) = build_otp_envelope(
+    session.peer_link.ensure_link(wr, to).await;
+    // Written ahead of the encrypt, so a kill inside its window leaves a
+    // reconcilable record instead of an orphaned spend
+    // (`OtpContactState::encrypt_intent`).
+    session.otp_store.set_encrypt_intent(
+        contact_name,
+        crate::client::otp_store::PendingOtpContent::EndNotice,
+    );
+    let _ = session.otp_store.save();
+    if let Some((envelope, proof)) = build_otp_envelope(
         session,
         to,
         pubkey_der,
@@ -2238,11 +2308,21 @@ async fn queue_end_session_payload(
         None,
         send_id,
         &plaintext,
-        content.clone(),
+        Content::OtpEndSession,
     )
     .await
     {
-        let seq = session.otp_store.reserve_out_seq(contact_name);
+        let seq = session
+            .otp_store
+            .get(contact_name)
+            .map(|s| s.next_out_seq)
+            .unwrap_or(0);
+        session.otp_store.record_sent(
+            contact_name,
+            seq,
+            crate::client::otp_store::PendingOtpContent::EndNotice,
+            Some(proof),
+        );
         let _ = session.otp_store.save();
         session.peer_link.send_reliable_or_queue(
             to,
@@ -2255,6 +2335,10 @@ async fn queue_end_session_payload(
         );
         return;
     }
+    // The padded build failed - nothing was spent, so the intent comes
+    // straight back off before the unpadded fallback goes out.
+    session.otp_store.clear_encrypt_intent(contact_name);
+    let _ = session.otp_store.save();
     let Some(envelope) = crate::client::envelope::encrypt_envelope_for(
         &session.own_pq_private,
         session.pq_peer_keys.encap_for(to),
@@ -2262,7 +2346,50 @@ async fn queue_end_session_payload(
         None,
         send_id,
         &plaintext,
-        content,
+        Content::OtpEndSession,
+    ) else {
+        return;
+    };
+    session.peer_link.send_reliable_or_queue(
+        to,
+        P2pPayload::Envelope {
+            channel: None,
+            msg_id: None,
+            envelope,
+        },
+    );
+}
+
+/// The legacy sealed reply to an *unpadded* `/endotp` notice
+/// (`on_end_session`'s fallback shape): no pad was involved on the way in,
+/// so there is no pad-derived proof to acknowledge with - a sealed,
+/// unpadded `OtpEndSessionAck` is the only honest answer, and deliberately
+/// spends no pad of this side's own either (the pair reached this shape
+/// precisely because a pad is no longer usable between them). A padded
+/// notice is acknowledged through the ordinary `OtpDeliveryAck` instead
+/// (`apply_otp_message`'s `OtpEndSession` arm).
+async fn send_sealed_end_session_ack(
+    session: &mut SessionState,
+    to: UserId,
+    pubkey_der: &[u8],
+    contact_name: &str,
+) {
+    let payload = crypto::otp::OtpEndSessionPayload {
+        contact_name: contact_name.to_string(),
+    };
+    let Ok(plaintext) = proto::encode(&payload) else {
+        return;
+    };
+    let send_id = session.next_stream_id;
+    session.next_stream_id += 1;
+    let Some(envelope) = crate::client::envelope::encrypt_envelope_for(
+        &session.own_pq_private,
+        session.pq_peer_keys.encap_for(to),
+        pubkey_der,
+        None,
+        send_id,
+        &plaintext,
+        Content::OtpEndSessionAck,
     ) else {
         return;
     };
@@ -2286,10 +2413,12 @@ async fn queue_end_session_payload(
 /// `handle_end_otp_command` paused the initiator's own side (the pad
 /// itself, and this store's record of it, both survive - only the
 /// "active" marker and anything genuinely mid-flight are cleared), then
-/// always replies with `OtpEndSessionAck` - even for a contact that was
-/// already paused, since that is exactly what a retried notice whose first
-/// ack got lost looks like on this end, and the initiator's own retry
-/// (`resend_pending_end_notices`) only stops once one genuinely arrives.
+/// always replies with the sealed legacy `OtpEndSessionAck` - even for a
+/// contact that was already paused, since that is exactly what a retried
+/// notice whose first ack got lost looks like on this end, and the
+/// initiator's own retry only stops once one genuinely arrives. (A *padded*
+/// notice is acknowledged with the ordinary proof-carrying `OtpDeliveryAck`
+/// instead - `apply_otp_message`'s `OtpEndSession` arm.)
 pub(crate) async fn on_end_session(
     session: &mut SessionState,
     ui_state: &mut UiState,
@@ -2306,7 +2435,10 @@ pub(crate) async fn on_end_session(
     let Ok(payload) = proto::decode::<crypto::otp::OtpEndSessionPayload>(&plaintext) else {
         return;
     };
-    apply_end_session(session, ui_state, from, from_name, sender, payload).await;
+    let contact_name = payload.contact_name.clone();
+    let sender_pubkey_der = sender.public_key_der.clone();
+    apply_end_session(session, ui_state, from, from_name, payload).await;
+    send_sealed_end_session_ack(session, from, &sender_pubkey_der, &contact_name).await;
 }
 
 /// `on_end_session`'s body once the notice is in the clear, whichever
@@ -2317,7 +2449,6 @@ async fn apply_end_session(
     ui_state: &mut UiState,
     from: UserId,
     from_name: String,
-    sender: &UserInfo,
     payload: crypto::otp::OtpEndSessionPayload,
 ) {
     let had_session = session
@@ -2343,14 +2474,13 @@ async fn apply_end_session(
         );
     }
 
-    queue_end_session_payload(
-        session,
-        from,
-        &sender.public_key_der,
-        &payload.contact_name,
-        Content::OtpEndSessionAck,
-    )
-    .await;
+    // No acknowledgement is sent from here: how the notice is confirmed
+    // depends on the shape it arrived in, which only the caller knows. A
+    // padded notice earns the ordinary proof-carrying `OtpDeliveryAck`
+    // (`apply_otp_message`'s `OtpEndSession` arm - costing this side no
+    // pad and touching nothing of its own that might still be in flight);
+    // the unpadded fallback earns the sealed legacy `OtpEndSessionAck`
+    // (`on_end_session`).
 }
 
 /// Applies an incoming `Content::OtpEndSessionAck` - the initiator's side of
@@ -2385,12 +2515,59 @@ fn apply_end_session_ack(session: &mut SessionState, payload: crypto::otp::OtpEn
     }
 }
 
-/// Re-sends every `/endotp` notice still owed to a reachable peer - the
-/// `/endotp` counterpart of `resend_pending_setups`, driven by the same
-/// `LinkStatusChanged` -> `Active` trigger and for the same reason: a peer
-/// who was offline (or unreachable) when the session ended must still learn
-/// about it, however long that takes, the instant they are reachable again.
-pub(crate) async fn resend_pending_end_notices(
+/// Sends every `/endotp` notice still owed to a reachable peer whose pad
+/// gate is free to carry it - the `/endotp` counterpart of
+/// `resend_pending_setups`, driven by the same `LinkStatusChanged` ->
+/// `Active` trigger and for the same reason: a peer who was offline (or
+/// unreachable) when the session ended must still learn about it, however
+/// long that takes, the instant they are reachable again.
+///
+/// A contact whose gate is armed is skipped outright, whichever spend holds
+/// it. If it is the notice itself (`PendingOtpContent::EndNotice`),
+/// `recover_and_resend` - which `session.rs` always runs *before* this pass
+/// on the same transition - has just resent that exact ciphertext; encoding
+/// a second one here is precisely the double-spend that used to desync the
+/// two sides' pads. If it is an earlier message, that message must land
+/// first (it holds the pad's next range), and its genuine ack is what sends
+/// the notice next (`on_delivery_ack`). Only a contact owing a notice with
+/// nothing in flight at all - `/endotp` deferred it and the app restarted
+/// before the gate cleared, or the earlier send's ack landed on a link that
+/// died in the same breath - gets it encrypted fresh here.
+/// Re-sends every `OtpPadCommit` still unconfirmed to a reachable peer -
+/// the commit-phase counterpart of `resend_pending_setups`, driven by the
+/// same `LinkStatusChanged` -> `Active` trigger. The commit is the one
+/// provisioning payload whose loss splits a fresh pair asymmetrically:
+/// this side has installed and shows the session active, while the peer
+/// still holds only staged bytes it was never authorised to install - so
+/// like every other owed thing, it is retried against the durable contact
+/// name until the peer's `OtpPadCommitAck` genuinely lands
+/// (`on_pad_commit_ack`). The receiving side answers a repeated commit
+/// idempotently - re-acknowledging one already installed, and finding its
+/// staged pad by contact name even under a fresh `UserId` (`on_pad_commit`).
+pub async fn resend_pending_commits(
+    wr: &mut impl crate::control::ControlSink,
+    session: &mut SessionState,
+    ui_state: &mut UiState,
+) -> proto::Result<()> {
+    let owed: Vec<String> = session
+        .otp_store
+        .pending_commits()
+        .map(str::to_string)
+        .collect();
+    for contact_name in owed {
+        let Some((peer, _pubkey_der)) = peer_for_contact_name(session, ui_state, &contact_name)
+        else {
+            continue; // not currently connected - a later transition retries
+        };
+        session.peer_link.ensure_link(wr, peer).await;
+        session
+            .peer_link
+            .send_reliable_or_queue(peer, P2pPayload::OtpPadCommit { contact_name });
+    }
+    Ok(())
+}
+
+pub async fn resend_pending_end_notices(
     wr: &mut impl crate::control::ControlSink,
     session: &mut SessionState,
     ui_state: &mut UiState,
@@ -2405,15 +2582,14 @@ pub(crate) async fn resend_pending_end_notices(
         else {
             continue; // not currently connected - a later transition retries
         };
-        send_end_session_payload(
-            wr,
-            session,
-            peer,
-            &pubkey_der,
-            &contact_name,
-            Content::OtpEndSession,
-        )
-        .await;
+        let gate_armed = session
+            .otp_store
+            .get(&contact_name)
+            .and_then(|s| s.pending_unacked_out_seq)
+            .is_some();
+        if !gate_armed {
+            send_end_notice_now(wr, session, peer, &pubkey_der, &contact_name).await;
+        }
     }
     Ok(())
 }
@@ -2623,7 +2799,8 @@ fn frame_padded(
 /// refused by its signature before a single pad byte is touched. A
 /// `Direct` pair has no seal to check, and `otp --decrypt`'s own refusal
 /// stands in for it - which is why that refusal is reported out loud
-/// (`unwrap_or_notify`) rather than swallowed.
+/// (`finish_opening_otp_envelope`'s rejection notice) rather than
+/// swallowed.
 /// The framing-dependent first half of opening an OTP envelope: recovers
 /// the still-padded bytes, either by unwrapping the outer `pq_hybrid` seal
 /// (`PqWrapped`) or reading the raw block directly (`Direct`).
@@ -2666,15 +2843,29 @@ pub(crate) async fn finish_opening_otp_envelope(
     channel: Option<&str>,
     padded: &[u8],
 ) -> Option<(Vec<u8>, crypto::otp::AckProof)> {
-    let (inner, proof) = unwrap_or_notify(
-        &session.otp_cli_cfg,
-        padded,
-        contact_name,
-        ui_state,
-        from,
-        from_name,
-    )
-    .await?;
+    let (inner, proof) = match unwrap_incoming(&session.otp_cli_cfg, padded, contact_name).await {
+        UnwrapOutcome::Ok(bytes, proof) => (bytes, proof),
+        UnwrapOutcome::Rejected(reason) => {
+            match recover_orphaned_decrypt(session, contact_name).await {
+                Some(healed) => healed,
+                None => {
+                    let reason = reason.trim().replace('\n', "; ");
+                    notify(
+                        ui_state,
+                        from,
+                        from_name,
+                        format!(
+                            "OTP: a message from {from_name} was rejected ({reason}) - keys \
+                             untouched"
+                        ),
+                        false,
+                    );
+                    return None;
+                }
+            }
+        }
+        UnwrapOutcome::Failed => return None,
+    };
     let inner: OtpInner = proto::decode(&inner).ok()?;
     // The check the seal's own binding would have made, moved inside the
     // pad along with the value it is about: a channel message replayed as
@@ -2683,6 +2874,51 @@ pub(crate) async fn finish_opening_otp_envelope(
         return None;
     }
     Some((inner.payload, proof))
+}
+
+/// The one benign shape a pad rejection can take: the process died (or was
+/// killed) in the window between `otp --decrypt` succeeding and the
+/// acceptance being persisted to the aloo store - the tool's decrypt state
+/// advanced, this store's did not, and the sender's retry of that exact
+/// message now decodes against the wrong pad range and is refused as
+/// "corrupted or out of sync". Detected precisely: the tool's decrypt
+/// counter sits exactly one past the number of messages this store has
+/// accepted (the two advance 1:1, both starting at 0, and stop-and-wait
+/// means at most one can ever be orphaned). The message itself is not
+/// lost - the tool keeps a safety copy of the last *received* plaintext -
+/// so the orphaned decrypt is recovered whole (`--recover-last
+/// --received`), nonce included, and handed back as if the decrypt had
+/// just happened: the caller then accepts, displays, and acknowledges it
+/// with its true proof, and the pair is back in lockstep. Anything that
+/// does not match this exact shape is a genuine rejection and reported as
+/// one.
+async fn recover_orphaned_decrypt(
+    session: &mut SessionState,
+    contact_name: &str,
+) -> Option<(Vec<u8>, crypto::otp::AckProof)> {
+    let detail = otp_cli::show_contact(&session.otp_cli_cfg, contact_name)
+        .await
+        .ok()??;
+    let accepted = session
+        .otp_store
+        .get(contact_name)
+        .map(|s| s.next_expected_in_seq)
+        .unwrap_or(0);
+    if detail.dec_sequence != accepted + 1 {
+        return None;
+    }
+    let recovered = otp_cli::recover_last(
+        &session.otp_cli_cfg,
+        contact_name,
+        otp_cli::RecoverDirection::Received,
+    )
+    .await
+    .ok()??;
+    if recovered.len() < crypto::otp::ACK_NONCE_BYTES {
+        return None;
+    }
+    let (nonce, payload) = recovered.split_at(crypto::otp::ACK_NONCE_BYTES);
+    Some((payload.to_vec(), crypto::otp::ack_proof_for(nonce)))
 }
 
 async fn open_otp_envelope(
@@ -2873,6 +3109,16 @@ async fn send_now(
 ) -> proto::Result<()> {
     let send_id = session.next_stream_id;
     session.next_stream_id += 1;
+    // Written ahead of the encrypt, so a kill inside its window leaves a
+    // reconcilable record instead of an orphaned spend
+    // (`OtpContactState::encrypt_intent`).
+    session.otp_store.set_encrypt_intent(
+        contact_name,
+        crate::client::otp_store::PendingOtpContent::Text {
+            channel: channel.clone(),
+        },
+    );
+    let _ = session.otp_store.save();
     // The pad goes on the message, and the seal - if this pair has one -
     // goes around the pad (`build_otp_envelope`). Never a silent fallback
     // to an unpadded send: an `otp` binary that is missing, misconfigured
@@ -2889,6 +3135,8 @@ async fn send_now(
     )
     .await
     else {
+        session.otp_store.clear_encrypt_intent(contact_name);
+        let _ = session.otp_store.save();
         let peer_name = peer_name_for(ui_state, to);
         notify(
             ui_state,
@@ -2961,11 +3209,44 @@ pub async fn send_or_queue(
     log_index: Option<usize>,
     msg_id: Option<u64>,
 ) -> proto::Result<()> {
+    // An end handshake in flight: the session is still nominally active on
+    // this side (it pauses only on the peer's confirmation -
+    // `handle_end_otp_command`'s two-phase design), but nothing new may
+    // enter a pad whose next occupant is the end notice - queueing it would
+    // only have it sent, or silently discarded, after the session the user
+    // just asked to end. Refused out loud instead; `/otp` cancels a pending
+    // end if they change their mind.
+    if session
+        .otp_store
+        .get(contact_name)
+        .is_some_and(|s| s.pending_end_notice)
+    {
+        let peer_name = peer_name_for(ui_state, to);
+        notify(
+            ui_state,
+            to,
+            &peer_name,
+            format!(
+                "OTP: the session with {peer_name} is ending - waiting for their \
+                 confirmation - message not sent"
+            ),
+            false,
+        );
+        if let Some(idx) = log_index {
+            ui_state.mark_dm_message_failed(to, idx);
+        }
+        return Ok(());
+    }
     let unacked = session
         .otp_store
         .get(contact_name)
         .and_then(|s| s.pending_unacked_out_seq)
-        .is_some();
+        .is_some()
+        // An encrypt already mid-flight for this contact counts as the gate
+        // being held: its `record_sent` hasn't run yet, and a second encrypt
+        // interleaving with it would race the tool over one pad
+        // (`OtpContactState::encrypt_intent`'s same-process guard).
+        || session.otp_store.encrypt_in_flight(contact_name);
     // The pad as a second factor, folded into the same gate. Holding the
     // identity key that selects a contact is not the same as holding that
     // contact's pad, and the only way to clear `pending_unacked_out_seq` is
@@ -3080,7 +3361,8 @@ pub async fn send_file_offer(
         .otp_store
         .get(contact_name)
         .and_then(|s| s.pending_unacked_out_seq)
-        .is_some();
+        .is_some()
+        || session.otp_store.encrypt_in_flight(contact_name);
     if unacked {
         notify(
             ui_state,
@@ -3117,6 +3399,18 @@ pub async fn send_file_offer(
         );
         return Ok(());
     };
+    // Written ahead of the encrypt, so a kill inside its window leaves a
+    // reconcilable record instead of an orphaned spend
+    // (`OtpContactState::encrypt_intent`).
+    session.otp_store.set_encrypt_intent(
+        contact_name,
+        crate::client::otp_store::PendingOtpContent::File {
+            stream_id,
+            filename: filename.clone(),
+            size,
+        },
+    );
+    let _ = session.otp_store.save();
     let Some((otp_envelope, ack_proof)) = build_otp_envelope(
         session,
         to,
@@ -3129,6 +3423,8 @@ pub async fn send_file_offer(
     )
     .await
     else {
+        session.otp_store.clear_encrypt_intent(contact_name);
+        let _ = session.otp_store.save();
         notify(
             ui_state,
             to,
@@ -3157,6 +3453,14 @@ pub async fn send_file_offer(
     refresh_otp_key_status(&session.otp_cli_cfg, ui_state, to, contact_name).await;
     let (msg_id, delivery) = ui_state.start_delivery(&[to]);
     ui_state.log_own_file_offer_dm(to, stream_id, filename.clone(), size, Some(delivery));
+    // Staged durably before the offer goes out, so a restart between now
+    // and the peer's acceptance still resumes rather than silently losing
+    // the file (`OtpStore::PendingContentSend`'s doc,
+    // `resume_pending_content_sends`).
+    session
+        .otp_store
+        .stage_content_send(stream_id, contact_name, path.clone());
+    let _ = session.otp_store.save();
     session.own_file_targets.insert(
         stream_id,
         crate::client::file_transfer::OwnFileTarget {
@@ -3214,7 +3518,8 @@ pub async fn send_voice_offer(
         .otp_store
         .get(contact_name)
         .and_then(|s| s.pending_unacked_out_seq)
-        .is_some();
+        .is_some()
+        || session.otp_store.encrypt_in_flight(contact_name);
     if unacked {
         notify(
             ui_state,
@@ -3268,6 +3573,17 @@ pub async fn send_voice_offer(
         );
         return Ok(());
     };
+    // Written ahead of the encrypt, so a kill inside its window leaves a
+    // reconcilable record instead of an orphaned spend
+    // (`OtpContactState::encrypt_intent`).
+    session.otp_store.set_encrypt_intent(
+        contact_name,
+        crate::client::otp_store::PendingOtpContent::Voice {
+            stream_id,
+            duration_ms,
+        },
+    );
+    let _ = session.otp_store.save();
     // The offer goes through the pad exactly like a file's, so
     // `duration_ms` never travels in the clear - under `Direct` there is no
     // envelope to hide it in, and under `PqWrapped` the pad is the layer
@@ -3284,6 +3600,8 @@ pub async fn send_voice_offer(
     )
     .await
     else {
+        session.otp_store.clear_encrypt_intent(contact_name);
+        let _ = session.otp_store.save();
         secure_remove_file(&plain_path);
         notify(
             ui_state,
@@ -3310,6 +3628,14 @@ pub async fn send_voice_offer(
     );
     let _ = session.otp_store.save();
     refresh_otp_key_status(&session.otp_cli_cfg, ui_state, to, contact_name).await;
+    // Staged durably before the offer goes out, so a restart between now
+    // and the peer's acceptance still resumes rather than silently losing
+    // the recording (`OtpStore::PendingContentSend`'s doc,
+    // `resume_pending_content_sends`).
+    session
+        .otp_store
+        .stage_content_send(stream_id, contact_name, plain_path.clone());
+    let _ = session.otp_store.save();
     session.own_file_targets.insert(
         stream_id,
         crate::client::file_transfer::OwnFileTarget {
@@ -3410,12 +3736,22 @@ pub async fn on_message(
     // it fine; only the ack got lost) must never reach the pad a second
     // time. See `OtpStore::is_next_expected`'s doc.
     if !session.otp_store.is_next_expected(&contact_name, seq) {
-        // A repeated `/endotp` notice is the one case where saying nothing
-        // would strand the peer: their retry only stops on an ack, and the
-        // one we already sent is what got lost. Send that same ciphertext
-        // again - recovered, never re-encoded, so no further pad is spent.
-        if envelope.content == Content::OtpEndSession {
-            resend_last_end_session_ack(session, from, &sender.public_key_der, &contact_name).await;
+        // The peer only retries an already-accepted message because the
+        // ack this side already sent for it never arrived - staying silent
+        // would leave their single-outstanding-send gate
+        // (`pending_unacked_out_seq`) wedged forever, since nothing else
+        // will ever unstick it. Re-send the recorded ack instead, at no
+        // further cost: no re-decrypt, no pad. A repeated `/endotp` notice
+        // is answered by the exact same mechanism - it is an ordinary
+        // gated send now, and its acceptance recorded the same durable
+        // `(seq, proof)` every accepted text does
+        // (`OtpStore::ack_to_resend`'s doc).
+        if matches!(envelope.content, Content::Text | Content::OtpEndSession)
+            && let Some(proof) = session.otp_store.ack_to_resend(&contact_name, seq)
+        {
+            session
+                .peer_link
+                .send_reliable_or_queue(from, P2pPayload::OtpDeliveryAck { seq, proof });
         }
         return Ok(());
     }
@@ -3504,15 +3840,40 @@ pub(crate) async fn apply_otp_message(
                     proof: ack_proof,
                 },
             );
+            // Durable so a repeat of this exact message (this ack lost in
+            // transit) can be answered again later without re-decrypting -
+            // see `on_message`'s duplicate branch and `ack_to_resend`'s doc.
+            session
+                .otp_store
+                .record_last_received_ack(contact_name, seq, ack_proof);
+            let _ = session.otp_store.save();
         }
-        // The two session-control payloads are confirmed by each other, not
-        // by an `OtpDeliveryAck` - see `OtpStore::reserve_out_seq`.
         Content::OtpEndSession => {
             let Ok(payload) = proto::decode::<crypto::otp::OtpEndSessionPayload>(&plaintext) else {
                 return Ok(());
             };
-            apply_end_session(session, ui_state, from, from_name, sender, payload).await;
+            apply_end_session(session, ui_state, from, from_name, payload).await;
+            // The notice is an ordinary stop-and-wait send on the peer's
+            // side now (`PendingOtpContent::EndNotice`), so it earns the
+            // ordinary proof-carrying acknowledgement - and the same
+            // durable re-ack record every other accepted message gets, so
+            // a repeat of it (this ack lost) is answered again without a
+            // re-decrypt (`on_message`'s duplicate branch).
+            session.peer_link.send_reliable_or_queue(
+                from,
+                P2pPayload::OtpDeliveryAck {
+                    seq,
+                    proof: ack_proof,
+                },
+            );
+            session
+                .otp_store
+                .record_last_received_ack(contact_name, seq, ack_proof);
+            let _ = session.otp_store.save();
         }
+        // Legacy: the sealed, unpadded fallback's confirmation used to
+        // travel padded too, from peers running the older flow - still
+        // honoured so their retries stop, but never sent padded any more.
         Content::OtpEndSessionAck => {
             let Ok(payload) = proto::decode::<crypto::otp::OtpEndSessionPayload>(&plaintext) else {
                 return Ok(());
@@ -3522,60 +3883,6 @@ pub(crate) async fn apply_otp_message(
         _ => {}
     }
     Ok(())
-}
-
-/// Re-sends the `OtpEndSessionAck` this side already sent for a notice
-/// that has just arrived again, by recovering the very ciphertext that
-/// went out rather than encrypting a fresh one - the same rule every OTP
-/// retry in this file follows, and the reason a lost ack costs no pad.
-///
-/// The recovered blob is this contact's last *sent* message, which is the
-/// ack precisely because the session is paused: nothing else can have been
-/// sent since. Re-framed rather than resent verbatim, since the framing
-/// (the seal, where there is one) sits outside the pad now.
-async fn resend_last_end_session_ack(
-    session: &mut SessionState,
-    to: UserId,
-    pubkey_der: &[u8],
-    contact_name: &str,
-) {
-    let Ok(Some(recovered)) = otp_cli::recover_last(
-        &session.otp_cli_cfg,
-        contact_name,
-        otp_cli::RecoverDirection::Sent,
-    )
-    .await
-    else {
-        return;
-    };
-    let send_id = session.next_stream_id;
-    session.next_stream_id += 1;
-    let Some(envelope) = frame_padded(
-        session,
-        to,
-        pubkey_der,
-        send_id,
-        recovered,
-        Content::OtpEndSessionAck,
-    ) else {
-        return;
-    };
-    // The seq the ack originally carried - `reserve_out_seq` took it and
-    // nothing has advanced the counter since.
-    let seq = session
-        .otp_store
-        .get(contact_name)
-        .map(|s| s.next_out_seq.saturating_sub(1))
-        .unwrap_or(0);
-    session.peer_link.send_reliable_or_queue(
-        to,
-        P2pPayload::OtpEnvelope {
-            channel: None,
-            seq,
-            msg_id: None,
-            envelope,
-        },
-    );
 }
 
 /// `on_message`'s file-offer counterpart, for `P2pEvent::OtpFileOffer` -
@@ -3613,6 +3920,15 @@ pub async fn on_file_offer(
     // guard for why a resend of an already-processed offer must never
     // touch the pad a second time.
     if !session.otp_store.is_next_expected(&contact_name, seq) {
+        // Same reasoning as `on_message`'s duplicate `Content::Text` branch:
+        // the sender's own retry only stops on an ack, so re-send the one
+        // already recorded for this exact seq rather than staying silent.
+        if let Some(proof) = session.otp_store.ack_to_resend(&contact_name, seq) {
+            session.peer_link.send_reliable_or_queue(
+                from,
+                P2pPayload::OtpDeliveryAck { seq, proof },
+            );
+        }
         return;
     }
     let Some((plaintext, ack_proof)) = open_otp_envelope(
@@ -3635,6 +3951,13 @@ pub async fn on_file_offer(
     if !session.otp_store.record_received(&contact_name, seq) {
         return;
     }
+    // Recorded before `contact_name` is moved into `PendingFileOffer` below
+    // - see `on_message`'s identical bookkeeping for why this must survive
+    // a repeat of this exact offer arriving again.
+    session
+        .otp_store
+        .record_last_received_ack(&contact_name, seq, ack_proof);
+    let _ = session.otp_store.save();
     adopt_pad_verified_sender(ui_state, from, &sender);
     refresh_otp_key_status(&session.otp_cli_cfg, ui_state, from, &contact_name).await;
     let Ok(payload) = proto::decode::<crate::client::file_transfer::FileOfferPayload>(&plaintext)
@@ -3703,6 +4026,15 @@ pub async fn on_voice_offer(
     // and `on_file_offer` use, so a resend of an offer this contact's
     // counter already moved past never touches the pad a second time.
     if !session.otp_store.is_next_expected(&contact_name, seq) {
+        // Same reasoning as `on_message`'s duplicate `Content::Text` branch:
+        // the sender's own retry only stops on an ack, so re-send the one
+        // already recorded for this exact seq rather than staying silent.
+        if let Some(proof) = session.otp_store.ack_to_resend(&contact_name, seq) {
+            session.peer_link.send_reliable_or_queue(
+                from,
+                P2pPayload::OtpDeliveryAck { seq, proof },
+            );
+        }
         return;
     }
     let from_name = sender.name.clone();
@@ -3724,6 +4056,12 @@ pub async fn on_voice_offer(
     if !session.otp_store.record_received(&contact_name, seq) {
         return;
     }
+    // Recorded before `contact_name` is moved into `OtpIncomingFileReceive`
+    // below - see `on_message`'s identical bookkeeping for why this must
+    // survive a repeat of this exact offer arriving again.
+    session
+        .otp_store
+        .record_last_received_ack(&contact_name, seq, ack_proof);
     let _ = session.otp_store.save();
     adopt_pad_verified_sender(ui_state, from, &sender);
     refresh_otp_key_status(&session.otp_cli_cfg, ui_state, from, &contact_name).await;
@@ -3796,6 +4134,16 @@ pub async fn on_delivery_ack(
     let Some(contact_name) = contact_name_for_peer(session, &sender.public_key_der) else {
         return Ok(());
     };
+    // Read before `record_acked` clears the gate: whether the send being
+    // acknowledged is the `/endotp` notice itself, whose ack also settles
+    // the durable retry debt below.
+    let acked_end_notice = session.otp_store.get(&contact_name).is_some_and(|s| {
+        s.pending_unacked_out_seq == Some(seq)
+            && matches!(
+                s.pending_content,
+                Some(crate::client::otp_store::PendingOtpContent::EndNotice)
+            )
+    });
     // `record_acked` refuses a `proof` that doesn't match what was buried
     // under the pad of the message `seq` names, which is what keeps the
     // gate closed against anyone who saw the packet but could not open it.
@@ -3817,7 +4165,48 @@ pub async fn on_delivery_ack(
         );
     }
     let _ = session.otp_store.save();
-    flush_one_queued(wr, ui_state, session, &contact_name).await
+    if acked_end_notice {
+        // The peer has provably decrypted the end notice - this is the
+        // moment `/endotp` takes effect on the initiating side, the whole
+        // point of the two-phase design: both sides leave the session in
+        // sync, or neither does. Guarded on the debt still standing, since
+        // an `/otp` resume in the handshake's window cancels the end - the
+        // ack then merely closes the notice's slot like any other.
+        if session.otp_store.clear_end_notice(&contact_name) {
+            discard_pending_setup(&session.otp_cli_cfg, &contact_name);
+            session.otp_incoming_setup.remove(&from);
+            session.otp_out_queue.clear(&contact_name);
+            session.otp_store.pause_after_peer_ended(&contact_name);
+            let _ = session.otp_store.save();
+            ui_state.clear_otp_active(from);
+            let peer_name = peer_name_for(ui_state, from);
+            notify(
+                ui_state,
+                from,
+                &peer_name,
+                format!(
+                    "OTP session ended - confirmed by {peer_name} (the pad is kept - /otp \
+                     with them resumes it)"
+                ),
+                true,
+            );
+        }
+        return Ok(());
+    }
+    flush_one_queued(wr, ui_state, session, &contact_name).await?;
+    // A notice `/endotp` deferred behind the send just acknowledged takes
+    // the gate the moment it is genuinely free - which is *after* the flush
+    // above, so a queued send that just re-armed the gate keeps its turn
+    // (this hook simply fires again on that send's own ack). The peer is
+    // evidently reachable: their ack just arrived on this very link.
+    let owes_notice = session
+        .otp_store
+        .get(&contact_name)
+        .is_some_and(|s| s.pending_end_notice && s.pending_unacked_out_seq.is_none());
+    if owes_notice {
+        send_end_notice_now(wr, session, from, &sender.public_key_der, &contact_name).await;
+    }
+    Ok(())
 }
 
 /// Releases exactly one queued send for `contact_name`, if any - the drain
@@ -3944,16 +4333,42 @@ pub async fn start_outgoing_file_content(
         .and_then(|s| s.pending_unacked_out_seq)
         .is_some();
     if unacked {
-        session
-            .otp_out_queue
-            .enqueue(contact_name, PendingOtpSend::FileContent { stream_id, to });
+        // Deliberately *not* cleared from `pending_content_sends` here:
+        // `otp_out_queue` is in-memory only, so if the process restarts
+        // while this sits queued, the durable record is what lets the next
+        // reconnect's `resume_pending_content_sends` find it again and
+        // re-enter this same function from scratch, exactly as if a fresh
+        // `FileAccepted` had just arrived. That re-entry can coincide with
+        // a genuinely re-delivered `FileAccepted` for this same stream (the
+        // peer's own transport-level retry, if their first send's ack never
+        // reached this side before it restarted) - `has_queued_stream`
+        // guards against both landing here and queueing two copies, which
+        // the drain would otherwise attempt as two separate sends.
+        if !session.otp_out_queue.has_queued_stream(&contact_name, stream_id) {
+            session
+                .otp_out_queue
+                .enqueue(contact_name, PendingOtpSend::FileContent { stream_id, to });
+        }
         return Ok(());
     }
+    // The gate is free and this function is about to reserve it - from
+    // here on, `encrypt_intent` (just below) is what protects this spend
+    // across a restart, so the staged-awaiting-accept record has done its
+    // job.
+    session.otp_store.take_content_send(stream_id);
     let target = session
         .own_file_targets
         .remove(&stream_id)
         .expect("just confirmed present above");
     let temp_path = temp_content_path(&session.otp_cli_cfg, "otp-send");
+    // Written ahead of the encrypt, so a kill inside its window leaves a
+    // reconcilable record instead of an orphaned spend
+    // (`OtpContactState::encrypt_intent`).
+    session.otp_store.set_encrypt_intent(
+        &contact_name,
+        crate::client::otp_store::PendingOtpContent::FileContent { stream_id },
+    );
+    let _ = session.otp_store.save();
     let outcome = otp_cli::encrypt_file_retrying(
         &session.otp_cli_cfg,
         &contact_name,
@@ -4007,6 +4422,8 @@ pub async fn start_outgoing_file_content(
             );
         }
         _ => {
+            session.otp_store.clear_encrypt_intent(&contact_name);
+            let _ = session.otp_store.save();
             secure_remove_file(&temp_path);
             let me = ui_state.own_id.unwrap_or(UserId(0));
             ui_state.set_file_failed(me, stream_id);
@@ -4019,6 +4436,87 @@ pub async fn start_outgoing_file_content(
                 false,
             );
         }
+    }
+    Ok(())
+}
+
+/// `P2pEvent::FileAccepted`'s full response: sends this stream's
+/// chunk-transport key setup - freshly computed every time this runs
+/// (`target.key`, from `otp_stream_key`, is a derivation, never reused
+/// state, so re-running this after a restart is exactly as safe as the
+/// first time - the peer has decrypted nothing yet to invalidate) - then
+/// hands off to `start_outgoing_file_content` for the actual
+/// gate-check-then-encrypt-or-queue decision. Shared by the real
+/// `FileAccepted` handler (`session.rs`) and `resume_pending_content_sends`'s
+/// autoheal below, so a reconstructed accept behaves identically to a live
+/// one.
+pub async fn begin_file_content(
+    session: &mut SessionState,
+    ui_state: &mut UiState,
+    stream_id: u64,
+) -> proto::Result<()> {
+    let Some(target) = session.own_file_targets.get(&stream_id) else {
+        return Ok(());
+    };
+    for (id, setup) in target.key.setups() {
+        session
+            .peer_link
+            .send_reliable_or_queue(id, P2pPayload::StreamKeySetup { stream_id, setup });
+    }
+    start_outgoing_file_content(session, ui_state, stream_id).await
+}
+
+/// Resumes every content send still staged as awaiting the peer's
+/// acceptance (`OtpStore::content_sends` - `send_file_offer`/
+/// `send_voice_offer` stage one the instant their offer is safely out)
+/// whose peer has just become reachable again - the content-phase
+/// counterpart of the other three reconnect passes (`recover_and_resend`,
+/// `resend_pending_setups`, `resend_pending_commits`), driven by the same
+/// `LinkStatusChanged` -> `Active` transition.
+///
+/// Covers the one gap none of those three close: a `FileAccepted` that
+/// arrived - or was already queued behind another send - while this
+/// side's own process was mid-restart, with `own_file_targets` (in-memory
+/// only) gone by the time anything could act on it. Reconstructs the
+/// target fresh and re-enters the exact same accept-handling path a live
+/// `FileAccepted` would (`begin_file_content`) - so a peer who already
+/// accepted before this side ever noticed needs to do nothing at all; the
+/// recording or file still arrives once both sides are reachable again,
+/// with no pad ever at risk either way (the content phase's own spend
+/// only ever happens *after* this resolves, exactly as it would from a
+/// fresh accept). Skips anything `own_file_targets` already has - a resume
+/// already under way this same run.
+pub async fn resume_pending_content_sends(
+    session: &mut SessionState,
+    ui_state: &mut UiState,
+) -> proto::Result<()> {
+    let staged: Vec<(u64, crate::client::otp_store::PendingContentSend)> = session
+        .otp_store
+        .content_sends()
+        .map(|(id, target)| (id, target.clone()))
+        .collect();
+    for (stream_id, target) in staged {
+        if session.own_file_targets.contains_key(&stream_id) {
+            continue;
+        }
+        let Some((to, recipient_pubkey_der)) =
+            peer_for_contact_name(session, ui_state, &target.contact_name)
+        else {
+            continue; // not currently connected - a later transition retries
+        };
+        let Some(key) = otp_stream_key(session, stream_id, to, &recipient_pubkey_der) else {
+            continue;
+        };
+        session.own_file_targets.insert(
+            stream_id,
+            crate::client::file_transfer::OwnFileTarget {
+                to,
+                path: target.path,
+                key,
+                otp: Some(target.contact_name),
+            },
+        );
+        begin_file_content(session, ui_state, stream_id).await?;
     }
     Ok(())
 }
@@ -4050,6 +4548,10 @@ pub async fn finish_incoming_file(
     let decrypt_dest = match &pending.kind {
         OtpIncomingKind::File { final_path } => final_path.clone(),
         OtpIncomingKind::Voice { .. } => temp_content_path(&session.otp_cli_cfg, "otp-recv-voice"),
+        OtpIncomingKind::Recovered => session
+            .otp_cli_cfg
+            .working_dir
+            .join(format!("recovered-{stream_id}")),
     };
     // `final_path` is under `~/.aloo/downloads`, which - unlike the OTP
     // working directory temp files live under - is created lazily, only
@@ -4078,6 +4580,7 @@ pub async fn finish_incoming_file(
         let what = match pending.kind {
             OtpIncomingKind::File { .. } => "file",
             OtpIncomingKind::Voice { .. } => "voice message",
+            OtpIncomingKind::Recovered => "recovered transfer",
         };
         // A rejection - the metadata check refused this exact transfer's
         // content, not merely a transient I/O failure - is worth naming
@@ -4113,16 +4616,118 @@ pub async fn finish_incoming_file(
             );
             crate::client::session::request_rotation(session, from);
         }
+        OtpIncomingKind::Recovered => {
+            let from_name = peer_name_for(ui_state, from);
+            notify(
+                ui_state,
+                from,
+                &from_name,
+                format!(
+                    "OTP: a transfer from {from_name} interrupted by a restart was recovered \
+                     to {}",
+                    decrypt_dest.display()
+                ),
+                true,
+            );
+        }
     }
     // `seq` is `None` only if a file's content genuinely finished
     // decrypting before its own `OtpFileContentSeq` ever arrived - not
     // possible over an ordered reliable link (it's always sent first), but
     // guarded rather than assumed; nothing to ack in that case.
     if let (Some(seq), Some(proof)) = (pending.seq, ack_proof) {
+        // The content spend occupied a slot in the same, single sequence
+        // space every other spend shares - so consuming it must advance
+        // the expectation like every other slot, or the sender's very next
+        // message would be silently dropped as out-of-order, wedging the
+        // pair for good. And its acceptance leaves the same durable
+        // `(seq, proof)` record every accepted message does, so a retry of
+        // the content whose ack was lost is re-answered from it
+        // (`on_content_seq`) rather than re-received.
+        session.otp_store.record_received(&pending.contact_name, seq);
+        session
+            .otp_store
+            .record_last_received_ack(&pending.contact_name, seq, proof);
+        let _ = session.otp_store.save();
         session
             .peer_link
             .send_reliable_or_queue(from, P2pPayload::OtpDeliveryAck { seq, proof });
     }
+}
+
+/// Applies an incoming `P2pEvent::OtpFileContentSeq` - the sender naming
+/// which slot of the shared sequence space a content transfer's pad spend
+/// took. Three cases, in order:
+///
+/// - **Registered** (the ordinary one): the accept-time bookkeeping is
+///   waiting for exactly this; record the slot and let the chunks land.
+/// - **Already consumed**: this side finished and acknowledged the content,
+///   and the sender retries only because that ack was lost - re-answer from
+///   the durable `(seq, proof)` record its acceptance left, at no cost, the
+///   same duplicate machinery every other spend uses.
+/// - **Owed but unregistered**: this side restarted after accepting the
+///   offer, so the in-memory registration died with the process while the
+///   sender's recovery legitimately retries. Rather than dropping the
+///   retries forever - the sender's gate held and this side's expectation
+///   stuck, wedging the pair for good - re-register the transfer
+///   generically (`OtpIncomingKind::Recovered`): the bytes land under the
+///   OTP working directory and are named in a notice, the spend is
+///   acknowledged, and the pads stay in lockstep; only what the content
+///   *was* (a file's name and destination, a voice message's duration) is
+///   beyond recovering, since it died with the process.
+pub async fn on_content_seq(
+    session: &mut SessionState,
+    ui_state: &mut UiState,
+    from: UserId,
+    stream_id: u64,
+    seq: u64,
+) {
+    if let Some(pending) = session
+        .otp_incoming_file_receives
+        .get_mut(&(from, stream_id))
+    {
+        pending.seq = Some(seq);
+        return;
+    }
+    let Some(sender) = otp_sender_of(session, ui_state, from) else {
+        return;
+    };
+    let Some(contact_name) = contact_name_for_peer(session, &sender.public_key_der) else {
+        return;
+    };
+    if !session.otp_store.is_next_expected(&contact_name, seq) {
+        if let Some(proof) = session.otp_store.ack_to_resend(&contact_name, seq) {
+            session
+                .peer_link
+                .send_reliable_or_queue(from, P2pPayload::OtpDeliveryAck { seq, proof });
+        }
+        return;
+    }
+    let temp_path = temp_content_path(&session.otp_cli_cfg, "otp-recv-recovered");
+    session.otp_incoming_file_receives.insert(
+        (from, stream_id),
+        crate::client::file_transfer::OtpIncomingFileReceive {
+            contact_name,
+            seq: Some(seq),
+            temp_path: temp_path.clone(),
+            kind: crate::client::file_transfer::OtpIncomingKind::Recovered,
+        },
+    );
+    let key = otp_incoming_stream_key(session, from, &sender.public_key_der);
+    let job_tx = crate::client::file_transfer::spawn_receive_file_worker(
+        key,
+        temp_path,
+        from,
+        stream_id,
+        session.file_events_tx.clone(),
+    );
+    session.active_file_transfers.insert(
+        (from, stream_id),
+        crate::client::file_transfer::ActiveFileTransfer {
+            job_tx,
+            last_seen: std::time::Instant::now(),
+        },
+    );
 }
 
 /// Reverse of `contact_name_for_peer`: which (if any) currently-known peer's
@@ -4135,10 +4740,8 @@ fn peer_for_contact_name(
     ui_state: &UiState,
     contact_name: &str,
 ) -> Option<(UserId, Vec<u8>)> {
-    let own_fp = session.own_pq_fp;
     ui_state.known_users.iter().find_map(|(id, info)| {
-        let peer_fp = crypto::pq::fingerprint_of_encoded(&info.public_key_der)?;
-        if crypto::otp::contact_name_for(&own_fp, &peer_fp) == contact_name {
+        if contact_name_for_peer(session, &info.public_key_der).as_deref() == Some(contact_name) {
             Some((*id, info.public_key_der.clone()))
         } else {
             None
@@ -4226,7 +4829,65 @@ pub(crate) async fn resend_pending_setups(
 /// own `is_next_expected`/`record_received` check rejects this resend
 /// before it touches their pad at all - a harmless, correct no-op, not a
 /// failure.
-pub(crate) async fn recover_and_resend(
+/// Startup reconciliation for spends the previous process died inside -
+/// the sender-side mirror of `recover_orphaned_decrypt`. A write-ahead
+/// intent (`OtpContactState::encrypt_intent`) found at load time means the
+/// process was killed somewhere between announcing an encrypt and
+/// finalising it; the tool's own encrypt counter says on which side.
+/// Still equal to the store's send count (`next_out_seq`): the encrypt
+/// never ran, nothing was spent, the intent is dropped - the message was
+/// simply never sent, exactly as if the kill had landed a moment earlier.
+/// One ahead: the spend is real but unrecorded - the orphan every later
+/// send would silently leapfrog, poisoning the peer's decoder for good -
+/// so the intent is *promoted* to an ordinary recorded send (proof `None`,
+/// which `record_acked` already tolerates as a record predating its
+/// expectation), and the standard recovery machinery resends the tool's
+/// kept ciphertext under the right framing on the next link-up. Any other
+/// shape drops the intent and touches nothing. Returns what was promoted,
+/// for the one content kind whose retry needs a second store mended
+/// (`Mail` - `client::otp_mail::restore_orphaned_mail_ref`).
+pub async fn reconcile_orphaned_sends(
+    cfg: &otp_cli::OtpCliConfig,
+    store: &mut crate::client::otp_store::OtpStore,
+) -> Vec<(String, u64, crate::client::otp_store::PendingOtpContent)> {
+    let intents: Vec<(String, crate::client::otp_store::PendingOtpContent)> = store
+        .encrypt_intents()
+        .map(|(name, content)| (name.to_string(), content.clone()))
+        .collect();
+    if intents.is_empty() {
+        return Vec::new();
+    }
+    let mut promoted = Vec::new();
+    for (contact_name, content) in intents {
+        store.clear_encrypt_intent(&contact_name);
+        // A fully recorded send already outstanding means the intent is
+        // stale bookkeeping from an older accident - the recorded send's
+        // own recovery takes precedence, and a second promotion would
+        // fabricate a spend that never happened.
+        if store
+            .get(&contact_name)
+            .and_then(|s| s.pending_unacked_out_seq)
+            .is_some()
+        {
+            continue;
+        }
+        let Ok(Some(detail)) = otp_cli::show_contact(cfg, &contact_name).await else {
+            continue;
+        };
+        let next_out = store
+            .get(&contact_name)
+            .map(|s| s.next_out_seq)
+            .unwrap_or(0);
+        if detail.enc_sequence == next_out + 1 {
+            store.record_sent(&contact_name, next_out, content.clone(), None);
+            promoted.push((contact_name, next_out, content));
+        }
+    }
+    let _ = store.save();
+    promoted
+}
+
+pub async fn recover_and_resend(
     wr: &mut impl crate::control::ControlSink,
     session: &mut SessionState,
     ui_state: &mut UiState,
@@ -4248,14 +4909,23 @@ pub(crate) async fn recover_and_resend(
         };
         match content {
             crate::client::otp_store::PendingOtpContent::Text { channel } => {
-                recover_and_resend_text(
+                // The same row the original send named, so a recovery that
+                // finally gets through turns it green rather than leaving
+                // it undelivered forever.
+                let msg_id = session
+                    .otp_ack_rows
+                    .get(&(contact_name.clone(), seq))
+                    .copied();
+                recover_and_resend_envelope(
                     wr,
                     session,
                     &contact_name,
                     seq,
                     to,
                     &recipient_pubkey_der,
+                    Content::Text,
                     channel,
+                    msg_id,
                 )
                 .await?;
             }
@@ -4301,19 +4971,48 @@ pub(crate) async fn recover_and_resend(
                 // P2P link - `client::otp_mail::resend_pending` handles it
                 // once per (re)connect; nothing to do on a link transition.
             }
+            crate::client::otp_store::PendingOtpContent::EndNotice => {
+                recover_and_resend_envelope(
+                    wr,
+                    session,
+                    &contact_name,
+                    seq,
+                    to,
+                    &recipient_pubkey_der,
+                    Content::OtpEndSession,
+                    None,
+                    None,
+                )
+                .await?;
+            }
         }
     }
     Ok(())
 }
 
-async fn recover_and_resend_text(
+/// Envelope-shaped recovery, shared by the two spends that ride
+/// `OtpEnvelope`: an ordinary text message and the `/endotp` notice
+/// (`PendingOtpContent::EndNotice` - an ordinary stop-and-wait spend, so
+/// its retry is this same path, not machinery of its own). Recovers the
+/// very ciphertext the original spend produced - never a fresh encode,
+/// which would spend a second range of the pad for a message the peer's
+/// decoder was never told to expect and desync the pair for good - and
+/// re-frames it (the seal is the outer layer and was never what got
+/// stored) under the same `seq`, with `content` routing it identically to
+/// the original at the far end. `msg_id` is the delivery row the original
+/// named, for a text whose recovery finally getting through should turn
+/// that row green (docs/PROTOCOL.md 7.2.1); `None` for the notice, which
+/// has no row.
+async fn recover_and_resend_envelope(
     wr: &mut impl crate::control::ControlSink,
     session: &mut SessionState,
     contact_name: &str,
     seq: u64,
     to: UserId,
     recipient_pubkey_der: &[u8],
+    content: Content,
     channel: Option<String>,
+    msg_id: Option<u64>,
 ) -> proto::Result<()> {
     let Ok(Some(recovered)) = otp_cli::recover_last(
         &session.otp_cli_cfg,
@@ -4335,17 +5034,10 @@ async fn recover_and_resend_text(
         recipient_pubkey_der,
         send_id,
         recovered,
-        Content::Text,
+        content,
     ) else {
         return Ok(());
     };
-    // The same row the original send named, so a recovery that finally
-    // gets through turns that row green rather than leaving it
-    // undelivered forever (docs/PROTOCOL.md 7.2.1).
-    let msg_id = session
-        .otp_ack_rows
-        .get(&(contact_name.to_string(), seq))
-        .copied();
     session.peer_link.ensure_link(wr, to).await;
     session.peer_link.send_reliable_or_queue(
         to,
@@ -4359,7 +5051,7 @@ async fn recover_and_resend_text(
     Ok(())
 }
 
-/// Offer-phase recovery, mirroring `recover_and_resend_text` exactly: the
+/// Offer-phase recovery, mirroring `recover_and_resend_envelope` exactly: the
 /// offer is a genuine pad spend in its own right (`send_file_offer`'s
 /// doc), so recovering means recovering that same ciphertext, never
 /// re-encoding a fresh one - resent under the *same*
@@ -5211,8 +5903,21 @@ pub(crate) async fn on_pad_verify(
         );
         return;
     }
-    session.otp_store.mark_provisioned(&contact_name);
-    session.otp_store.clear_pending_setup(&contact_name);
+    // A *new* pad was just installed over this contact name, resetting the
+    // tool's own per-contact state - so every aloo-level counter keyed to
+    // the old pad resets with it (`OtpStore::reset_for_new_pad`'s doc), or
+    // the fresh pad would be born desynced at this layer. No digest is
+    // recorded on the generating side, same as before: `installed_pad_digest`
+    // answers "is an *arriving* pad a re-delivery", which only the
+    // receiving side is ever asked.
+    session.otp_store.reset_for_new_pad(&contact_name, None);
+    // The commit below is the one provisioning payload whose loss splits
+    // the pair asymmetrically - this side provisioned and active, the peer
+    // holding only staged bytes - so it is owed durably and re-sent on
+    // every reconnect until `OtpPadCommitAck` confirms the install
+    // (`resend_pending_commits`). Recorded *after* the reset, which starts
+    // the entry from defaults.
+    session.otp_store.mark_commit_owed(&contact_name);
     let _ = session.otp_store.save();
     finish_provisioning(&session.otp_cli_cfg, ui_state, from, &peer_name, &contact_name).await;
     session
@@ -5230,6 +5935,16 @@ pub(crate) async fn on_pad_commit(
     contact_name: String,
 ) {
     let peer_name = peer_name_for(ui_state, from);
+    // The staged pad is looked up by the *contact name* the commit itself
+    // carries, not by the sender's `UserId` alone: a commit retried across
+    // a reconnect (`resend_pending_commits`) arrives from a fresh `UserId`,
+    // while the staging that transfer left behind is still keyed under the
+    // dead one - matching on the durable name is what lets the retry find
+    // it anyway.
+    let staged_key = session
+        .otp_incoming_pads
+        .iter()
+        .find_map(|(key, pad)| (pad.contact_name == contact_name).then_some(*key));
     // Always acknowledged, even if already installed: that is exactly what
     // a retried commit whose first ack was lost looks like from here, and
     // answering again is what lets the sender stop.
@@ -5237,22 +5952,24 @@ pub(crate) async fn on_pad_commit(
     // a *different* pad is the user's accepted replacement, and it has to
     // be installed - returning early there is what left the two sides
     // holding different pads under one name.
-    let already_this_pad = session
-        .otp_incoming_pads
-        .get(&from)
+    let already_this_pad = staged_key
+        .and_then(|key| session.otp_incoming_pads.get(&key))
         .map(|p| crypto::otp::pad_pair_digest(&p.enc_digest, &p.dec_digest))
         .is_some_and(|d| session.otp_store.is_installed_pad(&contact_name, d));
-    if already_this_pad || !session.otp_incoming_pads.contains_key(&from) {
+    if already_this_pad || staged_key.is_none() {
         session
             .peer_link
             .send_reliable_or_queue(from, P2pPayload::OtpPadCommitAck { contact_name });
-        if already_this_pad && let Some(pad) = session.otp_incoming_pads.remove(&from) {
+        if already_this_pad
+            && let Some(key) = staged_key
+            && let Some(pad) = session.otp_incoming_pads.remove(&key)
+        {
             crate::client::otp_staging::secure_remove_dir(&pad.dir);
         }
         return;
     }
-    let Some(pad) = session.otp_incoming_pads.remove(&from) else {
-        // Nothing staged for this peer - a commit for a transfer we no
+    let Some(pad) = staged_key.and_then(|key| session.otp_incoming_pads.remove(&key)) else {
+        // Nothing staged for this contact - a commit for a transfer we no
         // longer have. Acknowledged so the sender stops retrying, but
         // nothing is installed from thin air.
         session
@@ -5276,10 +5993,13 @@ pub(crate) async fn on_pad_commit(
         return;
     }
     // Recorded with the pad it actually is, so a later re-delivery of this
-    // same pad is recognised as one and a different pad is not.
-    session.otp_store.mark_provisioned_with_pad(
+    // same pad is recognised as one and a different pad is not. A full
+    // reset rather than a mark: the new pad replaced the tool's per-contact
+    // state wholesale, so every aloo-level counter and remnant keyed to the
+    // old pad resets with it (`OtpStore::reset_for_new_pad`'s doc).
+    session.otp_store.reset_for_new_pad(
         &contact_name,
-        crypto::otp::pad_pair_digest(&pad.enc_digest, &pad.dec_digest),
+        Some(crypto::otp::pad_pair_digest(&pad.enc_digest, &pad.dec_digest)),
     );
     let _ = session.otp_store.save();
     if let Some(peer) = ui_state.known_users.get(&from).cloned() {
@@ -5292,7 +6012,11 @@ pub(crate) async fn on_pad_commit(
 }
 
 /// The receiver has installed - the exchange is over.
-pub(crate) fn on_pad_commit_ack(session: &mut SessionState, from: UserId, contact_name: String) {
-    let _ = (from, &contact_name);
+pub fn on_pad_commit_ack(session: &mut SessionState, from: UserId, contact_name: String) {
     session.otp_outgoing_pads.remove(&from);
+    // The peer has installed - the durable commit retry
+    // (`resend_pending_commits`) is settled.
+    if session.otp_store.clear_commit_owed(&contact_name) {
+        let _ = session.otp_store.save();
+    }
 }

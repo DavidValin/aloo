@@ -1202,10 +1202,10 @@ fn render_help_popup_shows_expected_content_when_open() {
         rows.iter().any(|r| r.contains("PQH")),
         "expected the encryption tags explained: {rows:?}"
     );
-    let rows = scroll_help_until(&mut state, "Identity pinning");
+    let rows = scroll_help_until(&mut state, "Contacts & Keys");
     assert!(
-        rows.iter().any(|r| r.contains("Identity pinning")),
-        "expected id_store identity pinning explained after scrolling further down: {rows:?}"
+        rows.iter().any(|r| r.contains("Contacts & Keys")),
+        "expected id_store identity pinning and /contacts explained after scrolling further down: {rows:?}"
     );
 }
 
