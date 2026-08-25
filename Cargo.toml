@@ -399,11 +399,20 @@ path = "test/ui_direct_punch_popup_test.rs"
 
 # Behaviour-driven acceptance layer: Gherkin scenarios in `features/` executed
 # by cucumber-rs. `harness = false` because cucumber supplies its own runner
-# instead of libtest's.
+# instead of libtest's. `test = false` excludes it from a bare, unfiltered
+# `cargo test`/`cargo test --no-fail-fast` (`cargo bdd` = `cargo test --test
+# cucumber` still runs it explicitly, unaffected) - otherwise a plain
+# `cargo test --no-fail-fast` implicitly re-runs the whole acceptance layer a
+# second time after the CI workflow's own dedicated `cargo bdd` step already
+# ran it once, and on the Windows CI job that second, implicit run has no way
+# to skip the OTP scenarios' hard dependency on the external `otp` binary the
+# way the Rust-level OTP tests' own `require_otp()` self-skip does (see
+# `.github/workflows/tests.yml`'s `test-windows` job).
 [[test]]
 name = "cucumber"
 path = "test/cucumber/main.rs"
 harness = false
+test = false
 
 # Traceability validation + report generation (docs/TESTING.md).
 # A test target rather than a binary so it needs only dev-dependencies and

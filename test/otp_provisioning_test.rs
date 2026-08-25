@@ -1042,16 +1042,26 @@ fn a_pads_disk_cost_is_four_times_its_per_key_size() {
 }
 
 /// The check must fail *open*: a filesystem it cannot measure is not a
-/// reason to refuse work that would have succeeded.
+/// reason to refuse work that would have succeeded. On Unix that's a real
+/// `statvfs` measurement; everywhere else `free_space_bytes` is `None`
+/// unconditionally, by design (its own `#[cfg(not(unix))]` doc: "`None`
+/// therefore means 'proceed', not 'refuse'") - so only the first assertion
+/// is Unix-specific.
 ///
 /// @requirement AC-254
 #[test]
 fn free_space_is_reported_for_a_real_directory_and_absent_for_a_missing_one() {
     use aloo::client::otp_cli::free_space_bytes;
     let dir = temp_dir("free-space");
+    #[cfg(unix)]
     assert!(
         free_space_bytes(&dir).is_some_and(|free| free > 0),
         "a directory that exists must report something to compare against"
+    );
+    #[cfg(not(unix))]
+    assert!(
+        free_space_bytes(&dir).is_none(),
+        "non-Unix has no measurement at all, by design - None always means proceed here"
     );
     assert!(
         free_space_bytes(&dir.join("no-such-subdirectory")).is_none(),
