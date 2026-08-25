@@ -151,6 +151,15 @@ pub enum ReceiptStage {
     /// do. Implies `Decrypted`, and may arrive much later than it, or
     /// never.
     Consumed,
+    /// A `.txt` file transfer was opened in the in-memory preview popup
+    /// without being saved to disk (`docs/PROTOCOL.md` 7.2.1a). Strictly
+    /// weaker than `Consumed` - a file that has genuinely been saved stays
+    /// `Consumed` even if a `Viewed` for it arrives afterward
+    /// (`UiState::mark_delivered`) - and, unlike `Consumed`, may be
+    /// followed by a later `Consumed` for the same file if the recipient
+    /// goes on to press `d`. Only ever sent for a file transfer; nothing
+    /// else stages content this way.
+    Viewed,
 }
 
 /// Ceiling on a `DirectPing`/`DirectPong` `from` field. These arrive

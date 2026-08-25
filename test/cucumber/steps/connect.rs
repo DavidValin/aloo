@@ -258,10 +258,39 @@ async fn connecting_begins(w: &mut AlooWorld) {
 async fn registering_begins(w: &mut AlooWorld) {
     w.popup_mut().focus = Field::Register;
     let action = w.popup_mut().handle_key(KeyCode::Enter).unwrap();
-    match action {
+    match &action {
         Action::Register(req) => assert_eq!(req.email, "dave@example.com"),
         other => panic!("expected Register, got {other:?}"),
     }
+    w.popup_action = Some(action);
+}
+
+/// Mirrors `connect::run_client_inner`'s `Submission::Register` handling:
+/// on success it builds `ActivationPopupState::new_after_registration`
+/// from the just-submitted nickname, not `::new` - a different, shorter
+/// message than the one a pending-login connect shows.
+#[then(expr = "a successful registration opens the activation popup with {string}")]
+async fn registration_opens_activation_popup_with(w: &mut AlooWorld, message: String) {
+    let nickname = match w.popup_action.as_ref().expect("no Register action recorded") {
+        Action::Register(req) => req.nickname.clone(),
+        other => panic!("expected Register, got {other:?}"),
+    };
+    let popup = aloo::client::tui::ui_connect_popup::ActivationPopupState::new_after_registration(
+        &nickname,
+    );
+    assert_eq!(popup.message, message);
+
+    let backend = TestBackend::new(80, 24);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|f| aloo::client::tui::ui_connect_popup::render_activation(f, &popup))
+        .unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    let rendered: String = (0..buffer.area.height)
+        .map(|y| (0..buffer.area.width).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains(&message), "{rendered}");
 }
 
 #[then(expr = "registering is refused with an error mentioning {string}")]

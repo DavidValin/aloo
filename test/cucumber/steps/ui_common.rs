@@ -278,6 +278,28 @@ async fn type_text(w: &mut AlooWorld, text: String) {
     }
 }
 
+/// A whole paste (`UiState::handle_paste`), delivered atomically the way a
+/// bracketed-paste-enabled terminal's `Event::Paste` would - contrast
+/// `type_text` above, which presses one `KeyCode::Char` per character and
+/// so would fragment on any embedded newline the way plain typing does.
+#[when(expr = "I paste {string}")]
+async fn paste_text(w: &mut AlooWorld, text: String) {
+    let action = w.ui_mut().handle_paste(text);
+    w.action_was_none = action.is_none();
+    if action.is_some() {
+        w.last_action = action;
+    }
+}
+
+/// A Gherkin quoted string can't itself carry a literal newline on one
+/// line, so a multi-line paste is spelled as two lines joined here - still
+/// exercises the exact same `handle_paste` call, with the embedded `\n`
+/// intact in the text it receives.
+#[when(expr = "I paste {string} and {string} as one block")]
+async fn paste_two_lines(w: &mut AlooWorld, first: String, second: String) {
+    paste_text(w, format!("{first}\n{second}")).await;
+}
+
 #[when(expr = "I open a private room with {word}")]
 #[given(expr = "I have opened a private room with {word}")]
 async fn open_private_room(w: &mut AlooWorld, name: String) {
@@ -314,6 +336,26 @@ async fn compose_holds(w: &mut AlooWorld, expected: String) {
 #[then("the compose bar is empty")]
 async fn compose_empty(w: &mut AlooWorld) {
     assert_eq!(w.ui_ref().input, "", "compose bar should be empty");
+}
+
+/// Typed one keystroke at a time, same as `type_text` - a block this long
+/// spelled out literally in a `.feature` file would be unreadable, so it's
+/// generated here instead. Exercises the exact per-keystroke cap
+/// (`UiState::handle_input_key`), not a shortcut around it.
+#[when(expr = "I type a block of {int} characters")]
+async fn type_a_block(w: &mut AlooWorld, count: usize) {
+    for _ in 0..count {
+        press_key(w, KeyCode::Char('a'), KeyModifiers::NONE);
+    }
+}
+
+#[then(expr = "the compose bar holds exactly {int} characters")]
+async fn compose_holds_exactly(w: &mut AlooWorld, count: usize) {
+    assert_eq!(
+        w.ui_ref().input.chars().count(),
+        count,
+        "compose bar character count"
+    );
 }
 
 // ---------------------------------------------------------------------

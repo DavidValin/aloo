@@ -704,7 +704,13 @@ code is given back, one way or another:
   continues the handshake into `Identify`; a wrong one, or one more than
   `ACTIVATION_VALIDITY_SECS` (one hour) past the account's registration
   time, refuses and the server closes the connection - the account must
-  be registered again once its code has expired.
+  be registered again once its code has expired. The client's own
+  activation popup reaches this path two ways: opened automatically the
+  instant `Register` succeeds ("Enter the activation code you received
+  by email"), or opened on a later `Connect` attempt against an account
+  still `activation_pending` ("`<nickname>` is registered but not
+  activated yet..."). Either way it is the same popup, retrying the same
+  `Activate` exchange until it succeeds or the user cancels.
 - **In a browser.** The activation email also names an HTTP(S) endpoint
   (`server_activation_port`, over TLS when `server_ssl` is on) that takes
   the same nickname and code and does the identical check. More than ten
@@ -794,8 +800,8 @@ picks from, not a row of tabs.
 ### 6.1 `JoinChannel { name, kind, password }`
 
 - `name` must pass the channel-name rule: non-empty, at most
-  `CHANNEL_NAME_MAX_LEN` (21) characters, and every character an ASCII
-  letter, digit, or `-`. This is enforced identically by the client (a
+  `CHANNEL_NAME_MAX_LEN` (30) characters, and every character an ASCII
+  letter, digit, `-`, or `_`. This is enforced identically by the client (a
   per-keystroke guard in the Ctrl+J popup that simply refuses to type an
   invalid character or grow past the cap) and, independently, by the
   server (the join path, since the server never trusts the
@@ -1691,6 +1697,24 @@ message; `None` is a DM. A sender is expected to address every other
 current member of the channel itself - there is no server-side membership
 list to expand or validate against anymore.
 
+A text message's plaintext is capped at `proto::TEXT_MESSAGE_MAX_LEN`
+(10,000 `char`s) - client-enforced only, since the plaintext never reaches
+the server (it lives inside `Envelope::blocks`, sealed before it ever
+leaves the sender). `UiState::handle_input_key` refuses further keystrokes
+at the cap; a paste is capped the same way defensively, though the
+5,000-character file-conversion threshold below always diverts a paste
+long enough to actually reach it.
+
+A pasted block is submitted as a single message, embedded newlines
+intact, the instant it arrives - it never lands in the compose bar for
+editing first (`UiState::handle_paste`, fed by `Event::Paste` once
+`tui::terminal::setup` enables bracketed paste). A paste longer than
+`client::file_transfer::PASTE_TO_FILE_CHAR_THRESHOLD` (5,000 characters)
+is written to a `.txt` file under `client::file_transfer::paste_tmp_dir`
+and sent as an ordinary file transfer (§7.6) instead - the same
+`FileOffer`/`FileAccept`/`FileChunk` flow a `/file` send uses, just with
+the file synthesized rather than picked from disk.
+
 #### 7.2.1 Delivery acknowledgment
 
 A sender may want to know that a message it sent actually got through to
@@ -1710,23 +1734,27 @@ has decrypted the content**, and never before. A message that arrives but
 cannot be decrypted is deliberately left unacknowledged; its sender goes on
 showing it as undelivered, which is the truth.
 
-There are two stages, because for a voice message or a file the
+There are three stages, because for a voice message or a file the
 interesting moment comes after decryption - being able to read a file
 offer is not the same as having the file, and decoding audio is not the
 same as having heard it:
 
-| Content | `Decrypted` | `Consumed` |
-|---|---|---|
-| text | the envelope opened | *(never - there is nothing further to do)* |
-| file transfer | the **offer** opened, so the recipient knows what is being sent | the whole file has arrived and been written to disk |
-| voice message | the stream ended having produced decrypted audio | that audio was actually played |
+| Content | `Decrypted` | `Viewed` | `Consumed` |
+|---|---|---|---|
+| text | the envelope opened | *(never used)* | *(never - there is nothing further to do)* |
+| file transfer (`.txt`, staged - §7.6) | the **offer** opened | opened in the preview popup without being saved | the whole file has arrived and been written to disk |
+| file transfer (anything else) | the **offer** opened, so the recipient knows what is being sent | *(never used)* | the whole file has arrived and been written to disk |
+| voice message | the stream ended having produced decrypted audio | *(never used)* | that audio was actually played |
 
 `Consumed` may come long after `Decrypted`, or never: a file offer may be
 rejected or its transfer fail part way, and audio decoded while its sender
 was muted sits unheard until the recipient replays it - which is exactly
 when the receipt is sent. Either way, `Consumed` implies `Decrypted`; a
 sender receiving them out of order (a re-punch can reorder anything) must
-treat the stronger one as covering the weaker.
+treat the stronger one as covering the weaker - `Viewed` is weaker than
+`Consumed` and never overrides it once received, even if a `Viewed` for
+the same message arrives afterward (`UiState::mark_delivered`): a file
+genuinely saved stays reported as saved.
 
 A message decrypted but withheld from the user pending a trust decision
 (§12) still counts as `Decrypted`: the gate decides whether to show it, not
@@ -1993,7 +2021,26 @@ the download directory (`~/.aloo/downloads`) as chunks
 arrive - `safe_filename` (unchanged: reduces a peer-supplied name to just
 its final path component) still guards the on-disk path against a
 maliciously-crafted filename, applied after the length crop above. There is
-no separate save-location prompt; accepting *is* saving.
+no separate save-location prompt; accepting *is* saving - **except for a
+`.txt` offer**, which instead streams into a staging directory
+(`client::file_transfer::incoming_preview_dir`, `~/.aloo/tmp/incoming`) so
+its content can be previewed without yet counting as saved (below).
+
+**`.txt` preview**: `Enter` on a staged `.txt` receive opens a full-width,
+scrollable, read-only popup showing its content, capped at
+`client::file_transfer::PREVIEW_MAX_BYTES` (1 MiB) with a truncation
+notice if the real file is longer - the file on disk is never truncated,
+only what is read into memory for display. Opening the preview sends one
+`Viewed` receipt (above), the first time only. Pressing `d` inside the
+popup does exactly what accepting any other file already does
+automatically: moves the staged file into `~/.aloo/downloads` and sends
+`Consumed`. A staged file never explicitly saved is left where it is,
+cleared at the next session start the same way `~/.aloo/otp/.tmp` is. This
+is scoped to non-OTP transfers only: an OTP-protected receive's own
+acknowledgment already depends on decrypting straight to its final
+destination (§16.2's `ack_proof_for_file`), a materially different,
+proof-based mechanism this staging step does not touch - an OTP-wrapped
+`.txt` file is saved on arrival exactly like any other OTP file.
 
 ### 7.7 Live voice calls
 
@@ -4362,14 +4409,21 @@ that room isn't the one currently open. The notice itself clears; the
 room's own history of how its session got set up (or ended, or why it
 didn't) does not.
 
-While a mutual-consent session is genuinely active with a DM's peer
-(§16.1's "started" moment, on either side, through to §16.6's "ended"
-moment, on whichever side ends it), every real message shown in that room -
-never the app's own lines about the session itself - carries a 🔑 prefix,
-as does the compose bar the next one is typed into, so which conversation
-is currently under the extra pad layer is never something the user has to
-remember or go check. Neither side disconnecting
-and reconnecting affects this window at all - only §16.6 closes it.
+The compose bar carries a 🔑 prefix for exactly as long as a mutual-consent
+session is genuinely active with that DM's peer (§16.1's "started" moment,
+on either side, through to §16.6's "ended" moment, on whichever side ends
+it) - live state, so it appears and disappears with the session itself and
+is unaffected by either side disconnecting and reconnecting in between.
+
+A logged message's own 🔑 prefix is a different, permanent fact about that
+one message rather than a reflection of the bar above it: it is decided
+once, when the message is sent or received, from what actually protected
+it (`MessageCrypto::Otp`, captured alongside the row itself), never from
+whether a session happens to be active right now. A message sent while the
+pad layer was on keeps its prefix in the log forever, `/endotp` included -
+ending the session changes nothing about how that message was already
+encrypted. The app's own lines about the session (never a real message)
+are never given the prefix, session active or not.
 
 A text message is logged the moment it's typed, before the send it
 describes has actually been attempted - the same optimistic-then-corrected

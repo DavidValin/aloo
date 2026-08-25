@@ -46,8 +46,8 @@ evidence = "docs/SPEC.md 'Not connected UI'; tests host_port_and_nickname_are_ea
 
 [[user_story.acceptance_criteria]]
 id = "AC-003"
-description = "A nickname is capped at 10 characters and refuses whitespace; typing past the cap does nothing."
-evidence = "docs/SPEC.md Functionality #5; tests nickname_field_is_capped_at_ten_characters, typing_fills_nickname_field_and_rejects_whitespace"
+description = "A nickname is capped at 11 characters and refuses whitespace; typing past the cap does nothing."
+evidence = "docs/SPEC.md Functionality #5; tests nickname_field_is_capped_at_eleven_characters, typing_fills_nickname_field_and_rejects_whitespace"
 
 [[user_story.acceptance_criteria]]
 id = "AC-004"
@@ -232,7 +232,12 @@ evidence = "docs/SPEC.md 'Server startup'; tests help_advertises_the_documented_
 [[user_story.technical_behavior]]
 id = "TB-238"
 description = "A nickname must be 1-NICKNAME_MAX_LEN ASCII letters, digits, '-' or '_' to be registrable at all - checked before any path under the users registry's directory is built, so a name shaped like a traversal, an empty string, or one over the cap can never register, log in, or touch a file outside that directory."
-evidence = "src/validation.rs NICKNAME_MAX_LEN, nickname_is_registrable; src/server/users_registry.rs UsersRegistry::user_dir; tests an_unregistrable_nickname_touches_no_file_and_is_never_registered, an_unregistrable_nickname_is_refused_without_touching_the_registry"
+evidence = "src/validation.rs NICKNAME_MAX_LEN, nickname_is_registrable; src/server/users_registry.rs UsersRegistry::user_dir; tests an_unregistrable_nickname_touches_no_file_and_is_never_registered, an_unregistrable_nickname_is_refused_without_touching_the_registry, nickname_is_registrable_accepts_letters_digits_hyphen_and_underscore, nickname_is_registrable_rejects_disallowed_characters, nickname_is_registrable_rejects_empty, nickname_is_registrable_rejects_over_the_length_cap"
+
+[[user_story.technical_behavior]]
+id = "TB-251"
+description = "Every settings-file value that names a nickname is parsed through the same nickname_is_registrable rule the server itself enforces - connect_nickname, daemon_nickname, and a direct_punch_to line's nickname component - so a hand-edited settings file cannot configure a nickname that the client would then present to the server, or use in a serverless direct-punch link, in a shape the server would refuse anyway. An invalid value is simply skipped (or, for direct_punch_to, reported as a malformed target) rather than crashing the load. A daemon_channel= line's channel name gets the equivalent channel_name_is_valid check at daemon-start time, once the trailing [:password] is split off (TB-217) - the settings-parse layer itself only guards the line's storability, since the raw value may carry a password with its own charset."
+evidence = "src/validation.rs nickname_is_registrable; src/settings.rs Settings::parse, DirectPunchTarget::parse; tests a_settings_file_skips_an_unregistrable_connect_nickname, a_settings_file_skips_an_unregistrable_daemon_nickname, a_direct_punch_to_nickname_must_be_registrable"
 
 # ============================================================================
 # US-043 - Register a nickname by email
@@ -261,13 +266,13 @@ evidence = "docs/PROTOCOL.md 5.3; src/server/activation.rs AttemptLimiter, MAX_A
 
 [[user_story.acceptance_criteria]]
 id = "AC-270"
-description = "The connect popup always carries an email field and a Register button beside Connect, regardless of registration_available (captured from the local server_allow_registration setting when the popup opens) - a server that takes no registrations is never hidden from, only refused. Pressing Register on such a server is refused immediately, in red (\"this server does not accept registrations right now\"), the same inline-error path every other invalid submission uses, with no network round trip. On a server that does allow it, submitting Register with a plausible email sends Register and, on success, shows a green notice telling the user to check that address for the activation code. Register needs a nickname the registry could hold and a plausible email address; Connect needs neither."
-evidence = "docs/SPEC.md 'Not connected UI'; src/client/tui/ui_connect_popup.rs Field::Email, Field::Register, ConnectPopupState::registration_available, build_register_request, focus_order; src/client/connect.rs register_account, prefill_connect_defaults; tests register_button_and_email_field_always_show_regardless_of_registration_availability, pressing_register_when_unavailable_is_refused_in_red_even_with_a_complete_form, register_needs_an_email_where_connect_does_not, register_refuses_a_nickname_the_registry_could_not_hold, enter_on_register_returns_a_register_action_or_an_error, render_shows_a_registration_notice_in_green_unless_an_error_replaces_it; scenarios features/connecting/connect_form.feature 'The registration fields are always on screen, on any server', 'A server that does not allow registration refuses Register, in red, only when pressed'"
+description = "The connect popup always carries an email field and a Register button beside Connect, regardless of registration_available (captured from the local server_allow_registration setting when the popup opens) - a server that takes no registrations is never hidden from, only refused. Pressing Register on such a server is refused immediately, in red (\"this server does not accept registrations right now\"), the same inline-error path every other invalid submission uses, with no network round trip. On a server that does allow it, submitting Register with a plausible email sends Register and, on success, opens the activation-code popup directly (\"Enter the activation code you received by email\") instead of returning to the form. Register needs a nickname the registry could hold and a plausible email address; Connect needs neither."
+evidence = "docs/SPEC.md 'Not connected UI'; src/client/tui/ui_connect_popup.rs Field::Email, Field::Register, ConnectPopupState::registration_available, build_register_request, focus_order; src/client/connect.rs register_account, prefill_connect_defaults, run_client_inner; tests register_button_and_email_field_always_show_regardless_of_registration_availability, pressing_register_when_unavailable_is_refused_in_red_even_with_a_complete_form, register_needs_an_email_where_connect_does_not, register_refuses_a_nickname_the_registry_could_not_hold, enter_on_register_returns_a_register_action_or_an_error; scenarios features/connecting/connect_form.feature 'The registration fields are always on screen, on any server', 'A server that does not allow registration refuses Register, in red, only when pressed', 'A successful registration opens the activation popup directly'"
 
 [[user_story.acceptance_criteria]]
 id = "AC-271"
-description = "A connect whose credentials are right but whose account is still pending opens a small activation popup asking for the emailed code; submitting it retries the connect with that code attached, as many times as it takes, until it succeeds or the user cancels with Esc. The code field accepts only digits, up to the documented length."
-evidence = "docs/PROTOCOL.md 5.2; src/client/tui/ui_connect_popup.rs ActivationPopupState, run_activation; src/client/connect.rs ActivationRequiredError, run_client_inner; tests activation_popup_takes_exactly_twelve_digits, activation_popup_submits_a_complete_code_and_refuses_a_short_one, activation_popup_renders_the_nickname_the_code_and_the_error"
+description = "The activation popup opens two ways: automatically, right after a successful Register (\"Enter the activation code you received by email\"), or when a later connect's credentials are right but the account is still pending (\"<nickname> is registered but not activated yet...\"). Either way, submitting a code retries the connect with it attached, as many times as it takes, until it succeeds or the user cancels with Esc. The code field accepts only digits, up to the documented length."
+evidence = "docs/PROTOCOL.md 5.2; src/client/tui/ui_connect_popup.rs ActivationPopupState::new, ActivationPopupState::new_after_registration, run_activation; src/client/connect.rs ActivationRequiredError, run_client_inner; tests activation_popup_takes_exactly_twelve_digits, activation_popup_submits_a_complete_code_and_refuses_a_short_one, activation_popup_renders_the_nickname_the_code_and_the_error, activation_popup_after_registration_carries_the_exact_wording"
 
 [[user_story.technical_behavior]]
 id = "TB-242"
@@ -501,8 +506,8 @@ evidence = "docs/PROTOCOL.md 6.1; test join_channel_fails_for_an_unregistered_us
 
 [[user_story.acceptance_criteria]]
 id = "AC-102"
-description = "Ctrl+J's channel-name field refuses to type a character outside letters/digits/'-' or past CHANNEL_NAME_MAX_LEN characters, and the server independently refuses any JoinChannel whose name fails the same rule, naming the problem."
-evidence = "docs/PROTOCOL.md 6.1; src/validation.rs channel_name_is_valid; tests join_channel_rejects_a_name_over_the_length_cap, join_channel_rejects_a_name_with_disallowed_characters, channel_name_is_valid_accepts_letters_digits_and_hyphen, channel_name_is_valid_rejects_over_the_length_cap, channel_name_is_valid_rejects_disallowed_characters, channel_name_is_valid_rejects_empty"
+description = "Ctrl+J's channel-name field refuses to type a character outside letters/digits/'-'/'_' or past CHANNEL_NAME_MAX_LEN characters, and the server independently refuses any JoinChannel whose name fails the same rule, naming the problem."
+evidence = "docs/PROTOCOL.md 6.1; src/validation.rs channel_name_is_valid; tests join_channel_rejects_a_name_over_the_length_cap, join_channel_rejects_a_name_with_disallowed_characters, channel_name_is_valid_accepts_letters_digits_hyphen_and_underscore, channel_name_is_valid_rejects_over_the_length_cap, channel_name_is_valid_rejects_disallowed_characters, channel_name_is_valid_rejects_empty"
 
 [[user_story.acceptance_criteria]]
 id = "AC-103"
@@ -575,6 +580,16 @@ id = "AC-026"
 description = "Nothing is sent before a channel is joined or when the compose bar is empty, and unsent text is never silently discarded."
 evidence = "tests enter_before_channel_is_joined_does_not_send_and_keeps_the_typed_text, enter_with_empty_input_does_not_send"
 
+[[user_story.acceptance_criteria]]
+id = "AC-326"
+description = "Pasting a multi-line block into the compose bar sends it as a single message immediately, embedded newlines preserved and normalized to `\\n` regardless of whether the terminal delivered CRLF or lone-CR line endings, rather than fragmenting into one send per line; the message log then renders that entry as one row per line rather than squishing the newlines onto a single row, while still keeping it exactly one selectable log entry - Up/Down moves by entry, not by rendered row, and `i` opens the details of the one entry regardless of which row is under the cursor."
+evidence = "src/client/tui/ui.rs UiState::handle_paste, submit_text, render_messages; src/client/tui/terminal.rs setup (EnableBracketedPaste); tests a_pasted_multiline_block_sends_as_one_message_with_newlines_preserved, a_pasted_multiline_block_in_a_dm_sends_as_one_message, a_multiline_message_renders_as_several_rows_of_one_selectable_entry, a_paste_with_cr_or_crlf_line_endings_is_normalized_to_lf"
+
+[[user_story.acceptance_criteria]]
+id = "AC-327"
+description = "A paste longer than 5,000 characters is converted to a .txt file and sent as a file transfer instead of a chat message."
+evidence = "src/client/file_transfer.rs PASTE_TO_FILE_CHAR_THRESHOLD, write_pasted_text_file; src/client/tui/ui.rs UiState::handle_paste; test a_paste_over_the_file_threshold_becomes_a_txt_file_transfer_not_a_message"
+
 [[user_story.technical_behavior]]
 id = "TB-028"
 description = "The sender addresses every other current member individually and excludes itself from the recipient list."
@@ -584,6 +599,16 @@ evidence = "docs/PROTOCOL.md 7.2, 8; test typing_and_enter_sends_channel_text_ex
 id = "TB-031"
 description = "An incoming channel message is appended to that channel's own log, attributed to its sender."
 evidence = "test channel_message_is_appended_to_the_right_channel_log"
+
+[[user_story.technical_behavior]]
+id = "TB-252"
+description = "Manually typed compose-bar input stops accepting further characters once it reaches TEXT_MESSAGE_MAX_LEN (10,000); a paste is capped the same way defensively, though the file-conversion threshold always diverts a paste long enough to reach it first."
+evidence = "src/proto.rs TEXT_MESSAGE_MAX_LEN; src/client/tui/ui.rs UiState::handle_input_key, handle_paste; test typed_input_stops_accepting_characters_past_the_text_message_cap"
+
+[[user_story.technical_behavior]]
+id = "TB-253"
+description = "A paste between the file-conversion threshold (5,000 chars) and the typed-character cap (10,000 chars) is always routed to a file, never to a capped text send, since the file threshold is strictly lower and checked first."
+evidence = "src/client/tui/ui.rs UiState::handle_paste; test a_paste_over_the_file_threshold_becomes_a_txt_file_transfer_not_a_message"
 
 # ============================================================================
 # US-006 - Send a private message to a user
@@ -1901,8 +1926,13 @@ evidence = "src/client/tui/ui.rs submit_input (unknown-command guard); tests an_
 
 [[user_story.acceptance_criteria]]
 id = "AC-141"
-description = "The top-right status notice clears on its own 30 seconds after it was pushed (STATUS_NOTICE_TIMEOUT, driven by the session ticker), so a stale outcome never squats on the corner of the screen. Every OTP error/confirmation shown there is also logged as a line in the relevant peer's own DM room, so the history of a session's setup (and any failure) isn't lost the moment that notice clears - marking the room unread exactly like any other DM arrival if it isn't the one currently open. While a mutual-consent OTP session is active with the DM's peer, every real message in that room (not the app's own system lines about the session itself) is shown with a shield prefix, so the user always knows which conversation is currently under the extra pad layer."
-evidence = "src/client/tui/ui.rs MessageBody::System, otp_active_peers, mark_otp_active, is_otp_active, render_messages (shield prefix); src/client/tui/direct_message.rs push_otp_system_message; src/client/otp.rs notify; src/client/tui/ui.rs STATUS_NOTICE_TIMEOUT, tick_status_notice; tests the_status_notice_clears_after_thirty_seconds, an_otp_system_message_is_logged_into_the_named_peers_dm_room, an_otp_system_message_does_not_mark_unread_when_that_room_is_active, otp_active_peers_default_to_inactive_until_marked, messages_in_an_otp_active_dm_get_the_shield_prefix_but_system_lines_never_do, messages_in_a_dm_without_an_active_otp_session_get_no_shield"
+description = "The top-right status notice clears on its own 30 seconds after it was pushed (STATUS_NOTICE_TIMEOUT, driven by the session ticker), so a stale outcome never squats on the corner of the screen. Every OTP error/confirmation shown there is also logged as a line in the relevant peer's own DM room, so the history of a session's setup (and any failure) isn't lost the moment that notice clears - marking the room unread exactly like any other DM arrival if it isn't the one currently open. While a mutual-consent OTP session is active with the DM's peer, every real message in that room (not the app's own system lines about the session itself) is shown with a pad (key icon) prefix, so the user always knows which conversation is currently under the extra pad layer."
+evidence = "src/client/tui/ui.rs MessageBody::System, otp_active_peers, mark_otp_active, is_otp_active, render_messages (pad prefix); src/client/tui/direct_message.rs push_otp_system_message; src/client/otp.rs notify; src/client/tui/ui.rs STATUS_NOTICE_TIMEOUT, tick_status_notice; tests the_status_notice_clears_after_thirty_seconds, an_otp_system_message_is_logged_into_the_named_peers_dm_room, an_otp_system_message_does_not_mark_unread_when_that_room_is_active, otp_active_peers_default_to_inactive_until_marked, messages_in_an_otp_active_dm_get_the_pad_prefix_but_system_lines_never_do, messages_in_a_dm_without_an_active_otp_session_get_no_pad_marker"
+
+[[user_story.acceptance_criteria]]
+id = "AC-325"
+description = "The pad prefix on a logged message reflects what actually protected that specific message (LogEntry.crypto, stamped once at push time), not whatever the room's live OTP session state happens to be right now: a message sent or received while an OTP session was active keeps its pad prefix in the log even after /endotp ends that session, and a message that was never OTP-protected never gains one just because a session later becomes active in the same room."
+evidence = "src/client/tui/ui.rs LogEntry.crypto, MessageCrypto::Otp, UiState::message_crypto, render_messages (per-entry tag); tests an_otp_tagged_message_keeps_its_pad_prefix_after_endotp_ends_the_session"
 
 [[user_story.acceptance_criteria]]
 id = "AC-142"
@@ -2408,7 +2438,7 @@ evidence = "docs/PROTOCOL.md 17.2; src/client/otp_mail.rs handle_send, resend_pe
 [[user_story.acceptance_criteria]]
 id = "AC-160"
 description = "The server stores an undelivered mail's ciphertext on disk and acknowledges storage to the sender; when the recipient connects (OtpMailFetch, or immediately if already connected) every pending mail addressed to their nickname is delivered in per-sender sequence order, and the recipient's OtpMailAck deletes the stored ciphertext from the server's disk."
-evidence = "docs/PROTOCOL.md 17.2, 17.3; src/server/mail.rs MailStore, on_mail_send, on_mail_fetch, on_mail_ack; tests store_and_pending_for_round_trip_on_disk, pending_for_orders_one_senders_mails_by_seq, mark_delivered_deletes_the_pending_file_and_records_a_receipt, on_mail_send_stores_and_acknowledges, on_mail_send_pushes_immediately_to_a_connected_recipient, on_mail_fetch_delivers_pending_and_receipts; scenarios features/messaging/otp_mail.feature 'A mail for an offline recipient waits on the server disk', 'The recipient fetches, acknowledges, and the server copy is deleted'"
+evidence = "docs/PROTOCOL.md 17.2, 17.3; src/server/mail.rs MailStore, on_mail_send, on_mail_fetch, on_mail_ack; tests store_and_pending_for_round_trip_on_disk, pending_for_orders_one_senders_mails_by_seq, mark_delivered_deletes_the_pending_file_and_records_a_receipt, on_mail_send_stores_and_acknowledges, on_mail_send_pushes_immediately_to_a_connected_recipient, on_mail_fetch_delivers_pending_and_receipts; scenarios features/messaging/otp_mail.feature 'A mail for an offline recipient waits on the server disk', 'The recipient fetches, acknowledges, and the server copy is deleted', 'Mails queued out of arrival order are still delivered oldest sequence first'"
 
 [[user_story.acceptance_criteria]]
 id = "AC-161"
@@ -2428,7 +2458,7 @@ evidence = "docs/PROTOCOL.md 17.3; src/client/otp_mail_store.rs store_received_p
 [[user_story.technical_behavior]]
 id = "TB-193"
 description = "A mail spends the same per-contact sequential pad and passes the same stop-and-wait gate as live OTP sends - reserved only after otp --encrypt genuinely succeeds, cleared only by the server's OtpMailResult (or a late OtpMailDelivered), with one queued send drained per clearing. While a mail is unacknowledged nothing else can encrypt for that contact, which is exactly what keeps .last_sent naming the mail; a resend whose gate no longer names its seq is skipped rather than replaying bytes that may belong to a newer send."
-evidence = "docs/PROTOCOL.md 17.2; src/client/otp_mail.rs handle_send, resend_pending, on_mail_result; src/client/otp_store.rs PendingOtpContent::Mail; tests pending_mail_content_round_trips_through_save_and_load, a_mails_last_sent_copy_replays_byte_identically_for_retry"
+evidence = "docs/PROTOCOL.md 17.2; src/client/otp_mail.rs handle_send, resend_pending, on_mail_result; src/client/otp_store.rs PendingOtpContent::Mail; tests pending_mail_content_round_trips_through_save_and_load, a_mails_last_sent_copy_replays_byte_identically_for_retry, a_mails_gate_clears_on_the_storage_ack_alone_never_needing_delivery, a_mails_gate_also_clears_on_a_refused_storage_ack; scenario features/messaging/otp_mail.feature 'A second mail is stored before the first is ever delivered'"
 
 [[user_story.technical_behavior]]
 id = "TB-194"
@@ -2985,6 +3015,26 @@ evidence = "docs/SPEC.md 'Connected UI', Functionality #20; docs/PROTOCOL.md 7.2
 id = "AC-236"
 description = "The details popup, and only the popup, shows what a recipient did with a message beyond being able to read it: DELIVERED+LISTENED in green for a voice message they have actually heard - on arrival, or later if it was muted at the time and they replayed it - and DELIVERED+SAVED in green for a file they have the whole of on disk. A text message never grows either, having nothing further to do, and the log's own arrow is unmoved by any of it: it stays a three-state summary of who has the message, not of what they did with it."
 evidence = "docs/SPEC.md 'Connected UI', Functionality #20; docs/PROTOCOL.md 7.2.1; src/p2p_proto.rs ReceiptStage; src/client/tui/ui.rs LISTENED_LABEL, SAVED_LABEL, recipient_label, DeliveryRecipient.consumed, mark_delivered, owe_replay_receipt, LogEntry.owed_receipt, UiAction::ReplayVoice; src/client/session.rs handle_ui_action's ReplayVoice arm, the stream-finished arm; tests the_details_popup_distinguishes_heard_from_merely_decrypted, the_details_popup_says_saved_for_a_file_the_recipient_has_on_disk, a_text_message_has_no_extra_state_and_the_arrow_is_unchanged_by_one, replaying_a_clip_that_was_never_heard_pays_its_sender, replaying_a_clip_that_was_already_heard_owes_nothing; delivery_acknowledgment.feature"
+
+[[user_story.acceptance_criteria]]
+id = "AC-328"
+description = "A .txt file transfer opened in the in-memory preview popup without being saved reads as DELIVERED+VIEWED in the sender's details popup - a weaker claim than DELIVERED+SAVED. DELIVERED+SAVED always outranks it once true: a file genuinely saved keeps reading as saved even if a Viewed receipt for it arrives afterward (the two receipts can arrive out of order across a re-punch), and VIEWED is never reported once the stronger claim has landed."
+evidence = "docs/PROTOCOL.md 7.2.1; docs/SPEC.md 'Connected UI', Functionality #9, #20; src/p2p_proto.rs ReceiptStage::Viewed; src/client/tui/ui.rs VIEWED_LABEL, DeliveryRecipient.viewed, recipient_label, mark_delivered; tests the_details_popup_says_viewed_for_a_file_the_recipient_previewed, a_later_saved_receipt_outranks_an_earlier_viewed_one, a_viewed_receipt_after_consumed_never_regresses_the_label; delivery_acknowledgment.feature"
+
+[[user_story.acceptance_criteria]]
+id = "AC-329"
+description = "A .txt file offer, once fully accepted, stages into a scratch directory rather than the real download directory, so it can be previewed without being considered saved. Its row reads '(Enter: preview)' instead of settling to the plain filename; Enter opens a full-width, scrollable, read-only popup with the file's content and a bottom hint naming its keys ('d: save', 'Esc: close'). The popup absorbs every other key while open and is the same priority tier as the message-details popup. Opening it sends the sender one Viewed receipt, the first time only - reopening the same preview sends nothing further. A non-.txt file's accept-and-save behaviour is completely unaffected, and an OTP-protected transfer is unaffected regardless of extension, since its own acknowledgement already depends on decrypting straight to its final destination."
+evidence = "docs/PROTOCOL.md 7.6; docs/SPEC.md 'Connected UI', Functionality #9; src/client/file_transfer.rs is_txt_filename, incoming_preview_dir, sweep_incoming_preview_dir; src/client/tui/ui.rs FileTransferStatus::Received, FilePreviewState, UiState::open_file_preview, staged_file, set_file_received_staged, handle_key's file_preview block, handle_messages_key's Enter arm, render_txt_preview_popup; src/client/session.rs accept_file_offer, handle_file_event's ReceiveDone/ReceiveFailed arms, handle_ui_action's RequestFilePreview arm; tests a_staged_receive_row_hints_that_enter_opens_a_preview, enter_on_a_staged_receive_requests_a_preview_not_a_replay, the_preview_popup_shows_content_scrolls_and_flags_truncation, the_preview_popup_absorbs_typing, esc_closes_the_preview_without_any_action, incoming_preview_dir_is_under_aloo_tmp, is_txt_filename_is_case_insensitive_and_requires_the_extension; delivery_acknowledgment.feature"
+
+[[user_story.acceptance_criteria]]
+id = "AC-330"
+description = "The preview popup reads at most PREVIEW_MAX_BYTES (roughly 1 MiB) of a staged file into memory, however large the real file is - there is no size cap on a file transfer, so an unbounded in-memory read would be a memory-exhaustion risk. A file longer than the cap shows a truncation notice at the bottom of the popup; the file on disk is never touched by reading a capped preview of it, and saving it (below) always produces the complete, untruncated file regardless of what the preview showed."
+evidence = "docs/PROTOCOL.md 7.6; docs/SPEC.md Functionality #9; src/client/file_transfer.rs PREVIEW_MAX_BYTES, read_txt_preview; src/client/tui/ui.rs FilePreviewState.truncated, render_txt_preview_popup; tests read_txt_preview_returns_the_whole_file_under_the_cap, read_txt_preview_caps_and_flags_a_file_over_the_limit, an_untruncated_preview_shows_no_truncation_notice, the_preview_popup_shows_content_scrolls_and_flags_truncation"
+
+[[user_story.acceptance_criteria]]
+id = "AC-331"
+description = "Pressing d inside the preview popup does exactly what accepting any other file transfer already does automatically: moves the staged file into the real download directory, keeping its filename and content exactly, settles the row as Completed, and sends the sender a Consumed receipt - reusing the same save-and-acknowledge path an ordinary (non-staged) receive already runs on arrival, just triggered manually instead of automatically. A staged file never explicitly saved is simply left in the scratch directory, cleared at the next session start like every other work-in-progress-only directory this client keeps."
+evidence = "docs/PROTOCOL.md 7.6; docs/SPEC.md Functionality #9; src/client/file_transfer.rs save_staged_file, move_into_dir; src/client/tui/ui.rs handle_key's 'd' arm inside file_preview; src/client/session.rs handle_ui_action's SaveStagedFile arm; tests d_inside_the_preview_requests_a_save_and_closes_it, move_into_dir_keeps_the_filename_and_content_and_removes_the_source"
 
 [[user_story.technical_behavior]]
 id = "TB-233"

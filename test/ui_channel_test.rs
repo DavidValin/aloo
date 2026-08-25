@@ -273,6 +273,159 @@ fn typing_and_enter_sends_channel_text_excluding_self() {
     assert!(state.channels[0].log[0].outgoing);
 }
 
+/// @requirement AC-326
+#[test]
+fn a_pasted_multiline_block_sends_as_one_message_with_newlines_preserved() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    let action = state
+        .handle_paste("line one\nline two\nline three".to_string())
+        .expect("a short paste should produce an action");
+    match action {
+        UiAction::SendChannelText {
+            channel, plaintext, ..
+        } => {
+            assert_eq!(channel, "general");
+            assert_eq!(plaintext, "line one\nline two\nline three");
+        }
+        other => panic!("expected SendChannelText, got {other:?}"),
+    }
+    assert_eq!(state.input, "", "paste never touches the compose buffer");
+    assert_eq!(
+        state.channels[0].log.len(),
+        1,
+        "a pasted block must log as exactly one outgoing message, not one per line"
+    );
+}
+
+/// Real terminals do not reliably deliver `\n` for a pasted line break -
+/// tmux's own bracketed-paste passthrough (confirmed by capturing what
+/// `handle_paste` actually receives from `tmux paste-buffer -p`) sends a
+/// lone `\r` instead, historically what "pressing Enter" sends. A paste
+/// carrying CRLF or lone CR line endings must still come out normalized
+/// to `\n`, so the message-log renderer's own `\n`-only splitting still
+/// draws one row per line instead of silently swallowing the break.
+/// @requirement AC-326
+#[test]
+fn a_paste_with_cr_or_crlf_line_endings_is_normalized_to_lf() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    let action = state
+        .handle_paste("line one\r\nline two\rline three".to_string())
+        .expect("a short paste should produce an action");
+    match action {
+        UiAction::SendChannelText { plaintext, .. } => {
+            assert_eq!(plaintext, "line one\nline two\nline three");
+        }
+        other => panic!("expected SendChannelText, got {other:?}"),
+    }
+}
+
+/// A multiline message must render as multiple visual rows - not one row
+/// with its newlines squished together and unreadable - while staying
+/// exactly one selectable log entry: Up/Down moves by entry, and `i`
+/// opens the details of the one entry regardless of which of its rows
+/// the cursor is drawn on.
+/// @requirement AC-326
+#[test]
+fn a_multiline_message_renders_as_several_rows_of_one_selectable_entry() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state
+        .handle_paste("line one\nline two\nline three".to_string())
+        .expect("a short paste should produce an action");
+    assert_eq!(state.channels[0].log.len(), 1, "still one log entry");
+
+    let rows = rendered_rows(&state);
+    assert!(rows.iter().any(|r| r.contains("line one")), "row 1 visible: {rows:?}");
+    assert!(rows.iter().any(|r| r.contains("line two")), "row 2 visible: {rows:?}");
+    assert!(rows.iter().any(|r| r.contains("line three")), "row 3 visible: {rows:?}");
+    assert!(
+        !rows.iter().any(|r| r.contains("line one") && r.contains("line two")),
+        "the three lines must be on separate rows, not squished onto one: {rows:?}"
+    );
+
+    // The only log entry: Up has nothing older to move to.
+    state.focus = Focus::Messages;
+    state.message_selected = state.channels[0].log.len() - 1;
+    assert_eq!(press(&mut state, KeyCode::Up), None);
+    assert_eq!(
+        state.message_selected, 0,
+        "Up/Down moves by log entry, not by rendered row - a 3-row \
+         message is still one item, so there is nothing above it to select"
+    );
+
+    // `i` on any part of that one entry opens exactly one details popup,
+    // for that one message.
+    assert_eq!(press(&mut state, KeyCode::Char('i')), None);
+    let rows = rendered_rows(&state);
+    assert_eq!(
+        rows.iter().filter(|r| r.contains("Message details")).count(),
+        1,
+        "exactly one details popup opens for the one multiline entry: {rows:?}"
+    );
+}
+
+/// @requirement AC-327, TB-253
+#[test]
+fn a_paste_over_the_file_threshold_becomes_a_txt_file_transfer_not_a_message() {
+    let home = std::env::temp_dir().join(format!(
+        "aloo-paste-file-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&home).unwrap();
+    unsafe { std::env::set_var("ALOO_HOME", &home) };
+
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    // Between the 5,000-char file threshold and the 10,000-char typed cap
+    // (`proto::TEXT_MESSAGE_MAX_LEN`) - proves the file-conversion check
+    // wins over the cap, since it is strictly lower and checked first.
+    let pasted: String = "x".repeat(6_000);
+    let action = state
+        .handle_paste(pasted.clone())
+        .expect("a long paste should still produce an action");
+    match action {
+        UiAction::SendFileChannel {
+            channel,
+            path,
+            filename,
+            size,
+            ..
+        } => {
+            assert_eq!(channel, "general");
+            assert!(filename.ends_with(".txt"), "filename was {filename}");
+            assert_eq!(size, pasted.len() as u64);
+            let saved = std::fs::read_to_string(&path).expect("the synthesized file should exist");
+            assert_eq!(saved, pasted, "the file's content must match the paste byte-for-byte");
+        }
+        other => panic!("expected SendFileChannel, got {other:?}"),
+    }
+    assert_eq!(
+        state.channels[0].log.len(),
+        0,
+        "a file-transfer send logs its row once the stream id is allocated, not here"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// @requirement TB-252
+#[test]
+fn typed_input_stops_accepting_characters_past_the_text_message_cap() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    // One over the cap: `type_str` presses every character, so this
+    // directly exercises the per-keystroke guard rather than pre-filling
+    // `state.input`.
+    let too_long = "a".repeat(aloo::proto::TEXT_MESSAGE_MAX_LEN + 1);
+    type_str(&mut state, &too_long);
+    assert_eq!(
+        state.input.chars().count(),
+        aloo::proto::TEXT_MESSAGE_MAX_LEN,
+        "typing must stop accepting characters once the cap is reached"
+    );
+}
+
 /// @requirement AC-026
 #[test]
 fn enter_before_channel_is_joined_does_not_send_and_keeps_the_typed_text() {

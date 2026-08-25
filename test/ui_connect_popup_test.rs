@@ -126,15 +126,15 @@ fn typing_fills_nickname_field_and_rejects_whitespace() {
 
 /// @requirement AC-003
 #[test]
-fn nickname_field_is_capped_at_ten_characters() {
+fn nickname_field_is_capped_at_eleven_characters() {
     let mut state = ConnectPopupState::new();
     state.focus = Field::Nickname;
     type_str(&mut state, "davethegreatgatsby");
     assert_eq!(state.nickname.chars().count(), NICKNAME_MAX_LEN);
-    assert_eq!(state.nickname, "davethegre");
+    assert_eq!(state.nickname, "davethegrea");
     // once at the cap, further typing is a no-op, not silent truncation elsewhere
     type_str(&mut state, "x");
-    assert_eq!(state.nickname, "davethegre");
+    assert_eq!(state.nickname, "davethegrea");
 }
 
 /// There is no `id_store` field: the store has exactly one home
@@ -530,6 +530,37 @@ fn activation_popup_renders_the_nickname_the_code_and_the_error() {
     assert!(rows.iter().any(|r| r.contains("1234")), "{rows:?}");
     assert!(rows.iter().any(|r| r.contains("wrong activation code")), "{rows:?}");
     assert!(rows.iter().any(|r| r.contains("activation code")), "{rows:?}");
+}
+
+/// A successful Register goes straight into the activation popup with a
+/// different, shorter message than the pending-login path above - it
+/// already knows why it's here, so it doesn't re-explain.
+/// @requirement AC-271
+#[test]
+fn activation_popup_after_registration_carries_the_exact_wording() {
+    let popup = ActivationPopupState::new_after_registration("dave");
+    assert_eq!(popup.message, "Enter the activation code you received by email");
+    assert_ne!(
+        popup.message,
+        ActivationPopupState::new("dave").message,
+        "the post-registration wording must differ from the pending-login wording"
+    );
+
+    let backend = TestBackend::new(80, 24);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| render_activation(f, &popup)).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    let rows: Vec<String> = (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect();
+    assert!(
+        rows.iter().any(|r| r.contains("Enter the activation code you received by email")),
+        "{rows:?}"
+    );
 }
 
 // ---------------------------------------------------------------------

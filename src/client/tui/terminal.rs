@@ -6,7 +6,8 @@
 use std::io::Stdout;
 
 use crossterm::event::{
-    Event, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    DisableBracketedPaste, EnableBracketedPaste, Event, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -32,6 +33,12 @@ pub fn setup() -> Result<(Terminal<CrosstermBackend<Stdout>>, bool), BoxError> {
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     crossterm::execute!(stdout, EnterAlternateScreen)?;
+    // A terminal that honors this delivers a whole paste as one
+    // `Event::Paste(String)` (newlines included) instead of a burst of
+    // individual key events - what lets `session::SessionInput`'s paste
+    // handling (`UiState::handle_paste`) submit a multi-line paste as one
+    // message instead of it fragmenting on every embedded newline.
+    crossterm::execute!(stdout, EnableBracketedPaste)?;
     let keyboard_release_reporting =
         crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
     if keyboard_release_reporting {
@@ -58,6 +65,7 @@ pub fn setup_surface() -> Result<(super::surface::Surface, bool), BoxError> {
 
 pub fn restore(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<(), BoxError> {
     let _ = crossterm::execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
+    let _ = crossterm::execute!(terminal.backend_mut(), DisableBracketedPaste);
     crossterm::execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     disable_raw_mode()?;
     terminal.show_cursor()?;

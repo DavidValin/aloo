@@ -7,7 +7,7 @@ use aloo::proto::UserId;
 use aloo::client::tui::ui::{
     DeliveryProof,
     CallMemberState, CallTarget, DELIVERED_LABEL, DELIVERY_ARROW, DeliveryStatus, Focus,
-    LISTENED_LABEL, SAVED_LABEL,
+    LISTENED_LABEL, SAVED_LABEL, VIEWED_LABEL,
     END_CALL_CONFIRM_TITLE, ENCRYPTION_LABEL, HELP_POPUP_TITLE, HOST_LEFT_NOTICE, IdentityCase,
     KEY_FILE_LABEL,
     KEY_LABEL, KEY_OFFSET_LABEL, KEY_PER_RECIPIENT, KEY_SEQ_LABEL, MessageBody, Mode,
@@ -3484,6 +3484,77 @@ fn the_details_popup_says_saved_for_a_file_the_recipient_has_on_disk() {
         !rows.iter().any(|r| r.contains(LISTENED_LABEL)),
         "a file is saved, not listened to"
     );
+}
+
+/// A `.txt` file previewed without being saved reads as `DELIVERED+VIEWED`
+/// - a weaker claim than `SAVED_LABEL` (`recipient_label`).
+/// @requirement AC-328
+#[test]
+fn the_details_popup_says_viewed_for_a_file_the_recipient_previewed() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    let (msg_id, delivery) = state.start_delivery(&[UserId(2)]);
+    state.log_own_file_offer_channel("general", 8, "notes.txt".into(), 10, Some(delivery));
+    state.focus = Focus::Messages;
+    state.message_selected = 0;
+
+    state.mark_delivered(UserId(2), msg_id, ReceiptStage::Decrypted, DeliveryProof::Receipt);
+    state.mark_delivered(UserId(2), msg_id, ReceiptStage::Viewed, DeliveryProof::Receipt);
+    press(&mut state, KeyCode::Char('i'));
+    let rows = rendered_rows(&state);
+    assert!(
+        rows.iter().any(|r| r.contains(VIEWED_LABEL)),
+        "previewed without saving reads as VIEWED, not just DELIVERED: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|r| r.contains(SAVED_LABEL)),
+        "not actually saved yet"
+    );
+}
+
+/// Saving always outranks a prior view - a stronger receipt must not be
+/// hidden behind a weaker one that merely arrived first.
+/// @requirement AC-328
+#[test]
+fn a_later_saved_receipt_outranks_an_earlier_viewed_one() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    let (msg_id, delivery) = state.start_delivery(&[UserId(2)]);
+    state.log_own_file_offer_channel("general", 8, "notes.txt".into(), 10, Some(delivery));
+    state.focus = Focus::Messages;
+    state.message_selected = 0;
+
+    state.mark_delivered(UserId(2), msg_id, ReceiptStage::Decrypted, DeliveryProof::Receipt);
+    state.mark_delivered(UserId(2), msg_id, ReceiptStage::Viewed, DeliveryProof::Receipt);
+    state.mark_delivered(UserId(2), msg_id, ReceiptStage::Consumed, DeliveryProof::Receipt);
+    press(&mut state, KeyCode::Char('i'));
+    let rows = rendered_rows(&state);
+    assert!(rows.iter().any(|r| r.contains(SAVED_LABEL)));
+    assert!(!rows.iter().any(|r| r.contains(VIEWED_LABEL)));
+}
+
+/// The regression this design exists to prevent: a `Viewed` that arrives
+/// *after* a genuine save must never put the row back behind VIEWED - the
+/// two receipts can arrive out of order (a re-punch, a queued frame
+/// delivered late), and `SAVED_LABEL` is the stronger, truer claim either
+/// way.
+/// @requirement AC-328
+#[test]
+fn a_viewed_receipt_after_consumed_never_regresses_the_label() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    let (msg_id, delivery) = state.start_delivery(&[UserId(2)]);
+    state.log_own_file_offer_channel("general", 8, "notes.txt".into(), 10, Some(delivery));
+    state.focus = Focus::Messages;
+    state.message_selected = 0;
+
+    state.mark_delivered(UserId(2), msg_id, ReceiptStage::Decrypted, DeliveryProof::Receipt);
+    state.mark_delivered(UserId(2), msg_id, ReceiptStage::Consumed, DeliveryProof::Receipt);
+    state.mark_delivered(UserId(2), msg_id, ReceiptStage::Viewed, DeliveryProof::Receipt);
+    press(&mut state, KeyCode::Char('i'));
+    let rows = rendered_rows(&state);
+    assert!(
+        rows.iter().any(|r| r.contains(SAVED_LABEL)),
+        "a late-arriving Viewed must not undo an already-genuine save: {rows:?}"
+    );
+    assert!(!rows.iter().any(|r| r.contains(VIEWED_LABEL)));
 }
 
 /// A text message has no further state to reach, so it never grows one -

@@ -39,6 +39,37 @@ async fn send_requested(w: &mut AlooWorld, body: String, a: String, b: String) {
     }
 }
 
+/// The paste counterpart of `send_requested` above - checks the same
+/// `SendChannelText` action, just for a two-line body (`ui_common::
+/// paste_two_lines`'s join) rather than one Gherkin can't spell as a
+/// single literal newline.
+#[then(
+    expr = "sending {string} and {string} as one message to the channel is requested, addressed to {word} and {word}"
+)]
+async fn paste_send_requested(
+    w: &mut AlooWorld,
+    first: String,
+    second: String,
+    a: String,
+    b: String,
+) {
+    let body = format!("{first}\n{second}");
+    match w.last_action.as_ref().expect("no action was produced") {
+        UiAction::SendChannelText {
+            channel,
+            plaintext,
+            recipients,
+            msg_id: _,
+        } => {
+            assert_eq!(channel, "general");
+            assert_eq!(plaintext, &body, "the pasted newline must survive verbatim");
+            let ids: Vec<UserId> = recipients.iter().map(|(id, _)| *id).collect();
+            assert_eq!(ids, vec![UserId(id_for(&a)), UserId(id_for(&b))]);
+        }
+        other => panic!("expected SendChannelText, got {other:?}"),
+    }
+}
+
 #[then("my message is shown in the channel log as mine")]
 async fn own_message_logged(w: &mut AlooWorld) {
     let state = w.ui_ref();

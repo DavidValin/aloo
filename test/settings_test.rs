@@ -589,6 +589,18 @@ fn a_device_suffix_containing_a_tab_or_newline_is_refused() {
     assert!(DirectPunchTarget::parse("bob+pho\nne,bobpublic.com,every_1m").is_err());
 }
 
+/// The nickname half gets the same `nickname_is_registrable` rule the
+/// server enforces, not just `is_storable` - a hand-edited settings file
+/// cannot name a serverless peer with a nickname the registry would never
+/// accept.
+/// @requirement TB-251
+#[test]
+fn a_direct_punch_to_nickname_must_be_registrable() {
+    assert!(DirectPunchTarget::parse("not a nickname,bobpublic.com,every_1m").is_err());
+    assert!(DirectPunchTarget::parse("way-too-long-a-nickname,bobpublic.com,every_1m").is_err());
+    assert!(DirectPunchTarget::parse("has_under,bobpublic.com,every_1m").is_ok());
+}
+
 /// `to_setting_value` round-trips the device suffix losslessly, the same
 /// property the nickname/host/port/frequency fields already have.
 ///
@@ -658,6 +670,30 @@ fn direct_punch_channels_are_read_one_per_line_and_validated() {
 // ---------------------------------------------------------------------
 // The last connection made from the connect popup (`connect_*`)
 // ---------------------------------------------------------------------
+
+/// A hand-edited settings file cannot set `connect_nickname` to something
+/// the server would refuse - the line is simply skipped, leaving the
+/// field at its default.
+/// @requirement TB-251
+#[test]
+fn a_settings_file_skips_an_unregistrable_connect_nickname() {
+    let path = temp_settings_path();
+    std::fs::write(&path, "connect_nickname=not a valid nickname!\n").unwrap();
+    let settings = Settings::load_or_create(&path).unwrap();
+    assert_eq!(settings.connect_nickname, None);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Same rule for `daemon_nickname`.
+/// @requirement TB-251
+#[test]
+fn a_settings_file_skips_an_unregistrable_daemon_nickname() {
+    let path = temp_settings_path();
+    std::fs::write(&path, "daemon_nickname=way-too-long-a-nickname\n").unwrap();
+    let settings = Settings::load_or_create(&path).unwrap();
+    assert_eq!(settings.daemon_nickname, None);
+    let _ = std::fs::remove_file(&path);
+}
 
 /// @requirement AC-240
 #[test]

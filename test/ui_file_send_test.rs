@@ -637,3 +637,139 @@ fn file_offer_choice_defaults_to_accept() {
     assert_eq!(FileOfferChoice::Accept, FileOfferChoice::Accept);
     let _ = file_transfer::MAX_FILENAME_CHARS;
 }
+
+// ---------------------------------------------------------------------
+// .txt preview popup (AC-329..332): a staged receive's row, Enter opening
+// the preview, scrolling, `d` saving, Esc closing - everything here is
+// `session::handle_ui_action`'s I/O (reading/moving the staged file)
+// dispatched to but not itself run by these tests; see
+// `move_into_dir_keeps_the_filename_and_content_and_removes_the_source`/
+// `read_txt_preview_*` in file_transfer_test.rs for that part.
+// ---------------------------------------------------------------------
+
+fn staged_row(state: &mut aloo::client::tui::ui::UiState, stream_id: u64) {
+    state.on_channel_file_offer_accepted(
+        "general",
+        UserId(2),
+        "bob".into(),
+        stream_id,
+        "notes.txt".into(),
+        10,
+    );
+    state.set_file_received_staged(
+        UserId(2),
+        stream_id,
+        std::path::PathBuf::from("/tmp/staged/notes.txt"),
+    );
+}
+
+/// @requirement AC-329
+#[test]
+fn a_staged_receive_row_hints_that_enter_opens_a_preview() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    staged_row(&mut state, 7);
+    let rows = rendered_rows(&state);
+    assert!(
+        rows.iter().any(|r| r.contains("notes.txt") && r.contains("Enter: preview")),
+        "expected the staged-receive hint on the row: {rows:?}"
+    );
+}
+
+/// @requirement AC-329
+#[test]
+fn enter_on_a_staged_receive_requests_a_preview_not_a_replay() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    staged_row(&mut state, 7);
+    state.focus = Focus::Messages;
+    state.message_selected = 0;
+
+    let action = press(&mut state, KeyCode::Enter);
+    assert_eq!(
+        action,
+        Some(UiAction::RequestFilePreview {
+            from: UserId(2),
+            stream_id: 7
+        })
+    );
+}
+
+/// @requirement AC-329, AC-330
+#[test]
+fn the_preview_popup_shows_content_scrolls_and_flags_truncation() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.open_file_preview(
+        UserId(2),
+        7,
+        "notes.txt".into(),
+        "line one\nline two".into(),
+        true,
+    );
+
+    let rows = rendered_rows(&state);
+    assert!(rows.iter().any(|r| r.contains("line one")));
+    assert!(rows.iter().any(|r| r.contains("d: save")) && rows.iter().any(|r| r.contains("Esc: close")));
+    assert!(
+        rows.iter().any(|r| r.contains("truncated")),
+        "a capped preview says so: {rows:?}"
+    );
+
+    press(&mut state, KeyCode::Down);
+    assert_eq!(state.file_preview.as_ref().unwrap().scroll, 1);
+    press(&mut state, KeyCode::Up);
+    assert_eq!(state.file_preview.as_ref().unwrap().scroll, 0);
+}
+
+/// A preview well under the truncation cap shows no truncation notice.
+/// @requirement AC-330
+#[test]
+fn an_untruncated_preview_shows_no_truncation_notice() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.open_file_preview(UserId(2), 7, "notes.txt".into(), "short".into(), false);
+    let rows = rendered_rows(&state);
+    assert!(!rows.iter().any(|r| r.contains("truncated")));
+}
+
+/// `d` inside the preview does the same thing as any other file's default
+/// save - `UiAction::SaveStagedFile` - and closes the popup immediately
+/// rather than waiting for a round trip.
+/// @requirement AC-331
+#[test]
+fn d_inside_the_preview_requests_a_save_and_closes_it() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.open_file_preview(UserId(2), 7, "notes.txt".into(), "content".into(), false);
+
+    let action = press(&mut state, KeyCode::Char('d'));
+    assert_eq!(
+        action,
+        Some(UiAction::SaveStagedFile {
+            from: UserId(2),
+            stream_id: 7
+        })
+    );
+    assert!(state.file_preview.is_none(), "closes on save");
+}
+
+/// @requirement AC-329
+#[test]
+fn esc_closes_the_preview_without_any_action() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.open_file_preview(UserId(2), 7, "notes.txt".into(), "content".into(), false);
+
+    let action = press(&mut state, KeyCode::Esc);
+    assert_eq!(action, None);
+    assert!(state.file_preview.is_none());
+}
+
+/// The preview popup absorbs everything else while open - same tier as
+/// the message-info popup.
+/// @requirement AC-329
+#[test]
+fn the_preview_popup_absorbs_typing() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.open_file_preview(UserId(2), 7, "notes.txt".into(), "content".into(), false);
+
+    let action = press(&mut state, KeyCode::Char('x'));
+    assert_eq!(action, None);
+    assert!(state.file_preview.is_some(), "still open - 'x' does nothing to it");
+    assert!(state.input.is_empty(), "must not leak into the compose bar");
+}

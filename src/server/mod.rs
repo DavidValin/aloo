@@ -295,7 +295,7 @@ impl Registry {
 
         if !validation::channel_name_is_valid(name) {
             return Err(format!(
-                "channel name must be 1-{} characters of letters, digits, and '-'",
+                "channel name must be 1-{} characters of letters, digits, '-' or '_'",
                 validation::CHANNEL_NAME_MAX_LEN
             ));
         }

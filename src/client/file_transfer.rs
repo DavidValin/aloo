@@ -88,6 +88,162 @@ pub fn default_download_dir() -> PathBuf {
     crate::platform::aloo_dir().join("downloads")
 }
 
+/// A paste longer than this many characters is converted to a `.txt` file
+/// and sent as a file transfer instead of a message (`UiState::handle_paste`)
+/// - well under `proto::TEXT_MESSAGE_MAX_LEN`, so the typed-character cap
+/// on that constant never actually fires against pasted text; only
+/// manually typed text can ever reach it.
+pub const PASTE_TO_FILE_CHAR_THRESHOLD: usize = 5_000;
+
+/// `~/.aloo/tmp` - scratch storage for a `.txt` file synthesized purely to
+/// route a long paste through file transfer
+/// (`write_pasted_text_file`/`UiState::handle_paste`). Distinct from
+/// `default_download_dir` above (received content meant to be kept) and
+/// from OTP's own `.tmp/` (`client::otp_staging` - pad material, held to a
+/// stricter overwrite-before-remove erase since it is one-time-secret key
+/// bytes): this holds ordinary plaintext the user already typed once into
+/// the terminal and is about to send anyway, so a plain remove is enough.
+pub fn paste_tmp_dir() -> PathBuf {
+    crate::platform::aloo_dir().join("tmp")
+}
+
+/// Clears every leftover in `paste_tmp_dir()` - called once at session
+/// start (`client::session::run_connected_session`), same "anything here
+/// is garbage" reasoning as `otp_staging::sweep`: a file only ever lives
+/// here between being synthesized and being handed to the file-transfer
+/// sender, so anything still present didn't make it that far in some
+/// earlier, interrupted run. Best-effort - a leftover that can't be
+/// removed is skipped rather than failing session start.
+pub fn sweep_paste_tmp_dir() {
+    let Ok(entries) = std::fs::read_dir(paste_tmp_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            let _ = std::fs::remove_dir_all(&path);
+        } else {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+/// Writes `text` to a fresh file under `paste_tmp_dir()` (created if
+/// needed) and returns its path - the synthesized `.txt` a long paste
+/// becomes before being handed to the ordinary file-send path
+/// (`UiState::handle_paste`). The pid+timestamp naming matches
+/// `client::otp::temp_content_path`'s collision-free convention.
+pub fn write_pasted_text_file(text: &str) -> std::io::Result<PathBuf> {
+    let dir = paste_tmp_dir();
+    std::fs::create_dir_all(&dir)?;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let path = dir.join(format!("pasted-{}-{nanos}.txt", std::process::id()));
+    std::fs::write(&path, text)?;
+    Ok(path)
+}
+
+/// `~/.aloo/tmp/incoming` - scratch storage for a `.txt` offer's content
+/// once it has fully arrived, staged here rather than in
+/// `default_download_dir()` so it can be previewed
+/// (`UiState::open_file_preview`) without counting as saved
+/// (`docs/PROTOCOL.md` 7.2.1a). Distinct from `paste_tmp_dir` (outgoing,
+/// synthesized locally by this side) and from `default_download_dir` (a
+/// file the user has actually chosen to keep): this holds a peer's
+/// content that may never be kept at all.
+pub fn incoming_preview_dir() -> PathBuf {
+    crate::platform::aloo_dir().join("tmp").join("incoming")
+}
+
+/// Clears every leftover in `incoming_preview_dir()` - called once at
+/// session start (`client::session::run_connected_session`), same
+/// "anything here is garbage" reasoning as `sweep_paste_tmp_dir`: a staged
+/// receive only ever sits here between arriving and being either saved
+/// (moved out, via `d`) or left behind when the process ends - anything
+/// still present didn't make it to either outcome in some earlier,
+/// interrupted run.
+pub fn sweep_incoming_preview_dir() {
+    let Ok(entries) = std::fs::read_dir(incoming_preview_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            let _ = std::fs::remove_dir_all(&path);
+        } else {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+/// Whether `name` (already through `safe_filename`) ends in `.txt`,
+/// case-insensitively - the one extension the preview popup applies to
+/// (`accept_file_offer`).
+pub fn is_txt_filename(name: &str) -> bool {
+    Path::new(name)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("txt"))
+}
+
+/// How much of a staged `.txt` file the preview popup ever reads into
+/// memory, however large the real file is (there is no size cap on a file
+/// transfer - `there_is_no_size_cap_on_a_file_send`) - `d` still saves the
+/// complete, untruncated file regardless; only the in-memory preview is
+/// bounded.
+pub const PREVIEW_MAX_BYTES: u64 = 1_048_576;
+
+/// Reads at most `PREVIEW_MAX_BYTES` of `path` and reports whether the real
+/// file is longer than that - `session::handle_ui_action`'s
+/// `RequestFilePreview` arm, the one caller (`UiState` does no I/O of its
+/// own). Bounded by `metadata().len()` up front rather than reading the
+/// whole file and truncating after, so memory use stays capped regardless
+/// of how large the actual file is. Lossy UTF-8: a `.txt` file is not
+/// guaranteed to be valid UTF-8, and a preview is exactly the place to be
+/// forgiving about that rather than refusing to show anything.
+/// Moves a staged `.txt` receive out of `incoming_preview_dir()` into
+/// `default_download_dir()`, keeping its filename -
+/// `UiAction::SaveStagedFile`'s `d`-in-preview save, identical in effect
+/// to an ordinary (non-staged) receive's save on arrival. `rename` first
+/// (the common case: both live under `platform::aloo_dir()`, ordinarily
+/// one filesystem); falls back to copy-then-remove for the rare case of
+/// `~/.aloo` split across filesystems.
+pub fn save_staged_file(staged_path: &Path) -> std::io::Result<PathBuf> {
+    move_into_dir(staged_path, &default_download_dir())
+}
+
+/// `save_staged_file`'s actual move, taking the destination directory as a
+/// parameter rather than reading `default_download_dir()` itself - keeps
+/// this testable against a scratch directory without touching the real
+/// `~/.aloo/downloads` (mutating `ALOO_HOME` to redirect it would not be
+/// safe under this crate's parallel test execution - see
+/// `platform::aloo_dir`'s doc).
+pub fn move_into_dir(staged_path: &Path, dir: &Path) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(dir)?;
+    let name = staged_path.file_name().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "staged path has no filename")
+    })?;
+    let dest = dir.join(name);
+    if std::fs::rename(staged_path, &dest).is_err() {
+        std::fs::copy(staged_path, &dest)?;
+        std::fs::remove_file(staged_path)?;
+    }
+    Ok(dest)
+}
+
+pub fn read_txt_preview(path: &Path) -> std::io::Result<(String, bool)> {
+    let total_len = std::fs::metadata(path)?.len();
+    let cap = PREVIEW_MAX_BYTES.min(total_len) as usize;
+    let mut file = File::open(path)?;
+    let mut buf = vec![0u8; cap];
+    file.read_exact(&mut buf)?;
+    Ok((
+        String::from_utf8_lossy(&buf).into_owned(),
+        total_len > PREVIEW_MAX_BYTES,
+    ))
+}
+
 /// Crops `name` to `MAX_FILENAME_CHARS` characters, keeping the first
 /// `MAX_FILENAME_CHARS` and discarding the rest - applied sender-side
 /// before a `FileOffer` is built, and independently receiver-side on

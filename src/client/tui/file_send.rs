@@ -72,19 +72,7 @@ impl UiState {
     /// `ConnectPopupState::open_browser`). On any failure, `input` is left
     /// untouched so the user can see what they typed and retry.
     pub(crate) fn start_file_send(&mut self) -> Option<UiAction> {
-        let target = if let Some(peer_id) = self.active_private_room {
-            if self.offline.contains(&peer_id) || self.is_trust_gated(peer_id) {
-                return None;
-            }
-            self.known_users.get(&peer_id)?;
-            FileSendTarget::Direct(peer_id)
-        } else {
-            let channel = self.channels.get(self.selected_channel)?;
-            if !channel.joined {
-                return None;
-            }
-            FileSendTarget::Channel(channel.name.clone())
-        };
+        let target = self.current_file_send_target()?;
         let start_dir = std::env::current_dir().ok()?;
         let browser = FileBrowserState::open(start_dir).ok()?;
         self.input.clear();
@@ -97,6 +85,27 @@ impl UiState {
         });
         self.mode = Mode::FileSend;
         None
+    }
+
+    /// Who a file send from the currently open room would go to, if
+    /// anyone - the same addressability guards `start_file_send` has
+    /// always applied, split out so `UiState::handle_paste`'s long-paste
+    /// diversion can resolve a target without going through the
+    /// interactive browser at all.
+    pub(crate) fn current_file_send_target(&mut self) -> Option<FileSendTarget> {
+        if let Some(peer_id) = self.active_private_room {
+            if self.offline.contains(&peer_id) || self.is_trust_gated(peer_id) {
+                return None;
+            }
+            self.known_users.get(&peer_id)?;
+            Some(FileSendTarget::Direct(peer_id))
+        } else {
+            let channel = self.channels.get(self.selected_channel)?;
+            if !channel.joined {
+                return None;
+            }
+            Some(FileSendTarget::Channel(channel.name.clone()))
+        }
     }
 
     pub(crate) fn handle_file_send_key(&mut self, code: KeyCode) -> Option<UiAction> {
@@ -249,6 +258,54 @@ impl UiState {
         self.file_send = None;
         self.mode = Mode::Normal;
         Some(action)
+    }
+
+    /// The same send-action construction `confirm_file_send` does for a
+    /// file picked from the `/file` browser, but for a path synthesized
+    /// straight from a paste (`UiState::handle_paste`) with no browser
+    /// session involved - there is no `FileSendState` to read `target`/
+    /// `confirm` from, so both are passed in directly. Refuses (rather
+    /// than sending) for the same two reasons the browser-driven path
+    /// would: the file can't be stat'd, or a direct peer is no longer
+    /// reachable.
+    pub(crate) fn confirm_pasted_file_send(
+        &mut self,
+        target: FileSendTarget,
+        path: PathBuf,
+    ) -> Option<UiAction> {
+        let size = std::fs::metadata(&path).ok()?.len();
+        let filename = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "file".to_string());
+        let filename = crate::client::file_transfer::truncate_filename(&filename);
+
+        match target {
+            FileSendTarget::Channel(name) => {
+                let tab = self.channels.iter().find(|c| c.name == name)?;
+                let recipients = self.recipients_for_channel(tab);
+                Some(UiAction::SendFileChannel {
+                    channel: name,
+                    path,
+                    filename,
+                    size,
+                    recipients,
+                })
+            }
+            FileSendTarget::Direct(peer_id) => {
+                if self.offline.contains(&peer_id) || self.is_trust_gated(peer_id) {
+                    return None;
+                }
+                let peer = self.known_users.get(&peer_id)?.clone();
+                Some(UiAction::SendFileDirect {
+                    to: peer_id,
+                    path,
+                    filename,
+                    size,
+                    recipient_pubkey_der: peer.public_key_der,
+                })
+            }
+        }
     }
 }
 

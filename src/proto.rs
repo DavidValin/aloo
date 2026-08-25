@@ -15,6 +15,18 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// enough to stop a corrupt/hostile length prefix from exhausting memory.
 pub const MAX_FRAME_LEN: u32 = 64 * 1024 * 1024;
 
+/// The longest a `Content::Text` body may be, in `char`s. Enforced
+/// client-side only - a text message's plaintext never reaches the server
+/// (it travels inside `Envelope::blocks`, sealed before it ever leaves the
+/// sender), so there is no server-side check to add; this constant is the
+/// p2p-protocol-level convention every client honors before encrypting.
+/// `UiState::handle_input_key` refuses further keystrokes at this length,
+/// and `UiState::handle_paste` applies the same cap defensively (though a
+/// paste long enough to reach it is always diverted to a file transfer
+/// first - see `client::file_transfer::PASTE_TO_FILE_CHAR_THRESHOLD`,
+/// which is well under this).
+pub const TEXT_MESSAGE_MAX_LEN: usize = 10_000;
+
 /// How often a connected client sends `ClientMessage::Heartbeat` on the
 /// control channel (docs/PROTOCOL.md §4.1). Actual message content never
 /// touches the server (it travels peer-to-peer, §7.1), so without this a
@@ -244,6 +256,9 @@ pub struct Envelope {
 /// `Content::File` variant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Content {
+    /// A plain chat message. The text itself lives in `Envelope::blocks`,
+    /// never here - capped client-side at `TEXT_MESSAGE_MAX_LEN` chars
+    /// before it is ever encrypted.
     Text,
     FileOffer,
     /// Carries a bincode-encoded `crypto::otp::OtpKeySetupPayload`: one side

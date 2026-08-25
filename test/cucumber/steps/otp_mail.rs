@@ -337,11 +337,17 @@ async fn send_from(w: &mut AlooWorld, who: &str, msg: &ClientMessage) {
 
 #[when(expr = "{word} uploads an otp mail addressed to {word}")]
 async fn upload_mail(w: &mut AlooWorld, from: String, to: String) {
+    upload_mail_at_seq(w, from, to, 0).await;
+}
+
+#[when(expr = "{word} uploads an otp mail addressed to {word} at sequence {int}")]
+async fn upload_mail_at_seq(w: &mut AlooWorld, from: String, to: String, seq: u64) {
     // Real ciphertext is opaque to the server - what these scenarios prove
     // is storage/routing, so representative bytes stand in for a pad seal.
     let mail_id = new_mail_id();
-    let ciphertext = format!("sealed-for-{to}").into_bytes();
+    let ciphertext = format!("sealed-for-{to}-seq-{seq}").into_bytes();
     w.otp_mail_id = Some(mail_id.clone());
+    w.otp_mail_ids.push((seq, mail_id.clone()));
     w.otp_mail_ciphertext = ciphertext.clone();
     send_from(
         w,
@@ -350,7 +356,7 @@ async fn upload_mail(w: &mut AlooWorld, from: String, to: String) {
             mail_id,
             to,
             contact_name: MAIL_CONTACT.into(),
-            seq: 0,
+            seq,
             sent_at_utc: 1_766_000_000,
             ciphertext,
         },
@@ -407,6 +413,27 @@ async fn bob_handed_mail(w: &mut AlooWorld) {
     assert_eq!(contact_name, MAIL_CONTACT);
     assert_eq!(seq, 0);
     assert_eq!(ciphertext, w.otp_mail_ciphertext, "byte-identical");
+}
+
+#[then("bob receives the mails oldest sequence first")]
+async fn bob_receives_mails_in_order(w: &mut AlooWorld) {
+    let mut expected = w.otp_mail_ids.clone();
+    assert!(expected.len() >= 2, "need at least two uploaded mails to prove order");
+    // Delivery order must be sequence order regardless of the order the
+    // mails were uploaded/stored in - a receiver's pad is sequential, so
+    // this is the property that actually protects its offset.
+    expected.sort_by_key(|(seq, _)| *seq);
+    for (_, expected_id) in expected {
+        let msg = recv_from(w, "bob").await;
+        let ServerMessage::OtpMailDeliver { mail_id, .. } = msg else {
+            panic!("expected OtpMailDeliver, got {msg:?}");
+        };
+        assert_eq!(
+            mail_id, expected_id,
+            "mails must be delivered oldest sequence first regardless of upload order, \
+             or the receiver's sequential pad offset desyncs"
+        );
+    }
 }
 
 #[when("bob acknowledges the mail")]

@@ -346,12 +346,17 @@ pub enum ActivationAction {
 }
 
 /// The popup a first login into an unactivated account opens
-/// (docs/PROTOCOL.md §5.2): one box for the code from the email.
+/// (docs/PROTOCOL.md §5.2), and the popup a successful Register opens
+/// directly: one box for the code from the email. The two paths differ
+/// only in `message` - `new` explains why the popup appeared (a login was
+/// refused), `new_after_registration` doesn't need to, since the user just
+/// registered and knows why.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActivationPopupState {
     pub nickname: String,
     pub code: String,
     pub error: Option<String>,
+    pub message: String,
 }
 
 impl ActivationPopupState {
@@ -360,6 +365,23 @@ impl ActivationPopupState {
             nickname: nickname.to_string(),
             code: String::new(),
             error: None,
+            message: format!(
+                "{nickname} is registered but not activated yet. Enter the \
+                 {ACTIVATION_CODE_LEN}-digit code from the activation email."
+            ),
+        }
+    }
+
+    /// Opened the instant Register succeeds (`connect.rs`'s
+    /// `Submission::Register` handling) - the user just submitted the
+    /// registration form, so the popup states the ask plainly rather than
+    /// re-explaining that the account isn't activated yet.
+    pub fn new_after_registration(nickname: &str) -> Self {
+        Self {
+            nickname: nickname.to_string(),
+            code: String::new(),
+            error: None,
+            message: "Enter the activation code you received by email".to_string(),
         }
     }
 
@@ -434,13 +456,7 @@ pub fn render_activation(frame: &mut Frame, state: &ActivationPopupState) {
             Constraint::Min(1),    // error / hint
         ])
         .split(inner);
-    frame.render_widget(
-        Paragraph::new(format!(
-            "{} is registered but not activated yet. Enter the {ACTIVATION_CODE_LEN}-digit code from the activation email.",
-            state.nickname
-        )),
-        chunks[0],
-    );
+    frame.render_widget(Paragraph::new(state.message.clone()), chunks[0]);
     let code_inner = render_bordered_field(frame, chunks[1], "activation code", &state.code, true);
     place_text_cursor(frame, code_inner, 0, &state.code);
     let (hint, style) = match &state.error {

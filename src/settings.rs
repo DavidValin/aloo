@@ -216,7 +216,7 @@ impl DirectPunchTarget {
             }
             None => (*nick_field, None),
         };
-        if nickname.is_empty() || !crate::validation::is_storable(nickname) {
+        if !crate::validation::nickname_is_registrable(nickname) {
             return Err(format!("not a valid nickname: {nickname:?}"));
         }
         let (host, port) = split_host_port(host)?;
@@ -667,7 +667,7 @@ impl Settings {
                         settings.daemon_port = Some(p);
                     }
                 }
-                "daemon_nickname" if !value.is_empty() => {
+                "daemon_nickname" if crate::validation::nickname_is_registrable(value) => {
                     settings.daemon_nickname = Some(value.to_string())
                 }
                 "daemon_server_password" if !value.is_empty() => {
@@ -722,7 +722,7 @@ impl Settings {
                         settings.connect_port = Some(p);
                     }
                 }
-                "connect_nickname" if !value.is_empty() => {
+                "connect_nickname" if crate::validation::nickname_is_registrable(value) => {
                     settings.connect_nickname = Some(value.to_string())
                 }
                 "connect_ssl" => settings.connect_ssl = parse_switch(value),

@@ -177,21 +177,43 @@ pub async fn run_client_inner(
     }
 
     loop {
+        // Set only when this iteration's `request` came from a Register
+        // that just succeeded - picks the activation popup's wording
+        // below (`ActivationPopupState::new_after_registration` instead
+        // of `::new`) without threading a parameter through every other
+        // path that reaches that popup.
+        let mut just_registered = false;
         let mut request = match ui_connect_popup::run(surface, &mut popup)? {
             ui_connect_popup::Submission::Connect(request) => request,
             ui_connect_popup::Submission::Register(mut register) => {
                 register.ssl_ca = ssl_ca.clone();
                 match register_account(&register).await {
-                    Ok(()) => {
-                        popup.notice = Some(format!(
-                            "registered - check {} for the activation code, then Connect",
-                            register.email
-                        ));
-                        popup.focus = ui_connect_popup::Field::Connect;
+                    Ok(()) => match popup.build_request() {
+                        // Registering and connecting share every field but
+                        // the keybundle, and Register wouldn't have been
+                        // reachable if `my_key` weren't already valid -
+                        // so this reuses the just-submitted form to go
+                        // straight into activation (§5.2/§5.3) instead of
+                        // making the user press Connect a second time.
+                        Ok(request) => {
+                            just_registered = true;
+                            request
+                        }
+                        Err(e) => {
+                            popup.notice = Some(format!(
+                                "registered - check {} for the activation code, then Connect \
+                                 ({e})",
+                                register.email
+                            ));
+                            popup.focus = ui_connect_popup::Field::Connect;
+                            continue;
+                        }
+                    },
+                    Err(e) => {
+                        popup.error = Some(format!("registration failed: {e}"));
+                        continue;
                     }
-                    Err(e) => popup.error = Some(format!("registration failed: {e}")),
                 }
-                continue;
             }
             ui_connect_popup::Submission::Cancel => return Ok(()), // user cancelled
         };
@@ -225,7 +247,11 @@ pub async fn run_client_inner(
         // for it right here, and the connect retried with the answer -
         // as many times as it takes, until the code is right or the user
         // gives up on it with Esc.
-        let mut activation = ui_connect_popup::ActivationPopupState::new(&request.nickname);
+        let mut activation = if just_registered {
+            ui_connect_popup::ActivationPopupState::new_after_registration(&request.nickname)
+        } else {
+            ui_connect_popup::ActivationPopupState::new(&request.nickname)
+        };
         let outcome = loop {
             match connect_with_reconnect(&request).await {
                 Err(e) if e.is::<ActivationRequiredError>() => {

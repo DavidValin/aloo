@@ -536,7 +536,7 @@ pub(crate) fn handle_open_mailbox(session: &SessionState, ui_state: &mut UiState
 /// forward (or to `Failed`) and clears the contact's gate for this spend;
 /// since a cleared gate authorises exactly one more send, it also drains
 /// one queued P2P item if any were waiting behind the mail.
-pub(crate) async fn on_mail_result(
+pub async fn on_mail_result(
     wr: &mut impl crate::control::ControlSink,
     session: &mut SessionState,
     ui_state: &mut UiState,

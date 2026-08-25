@@ -279,6 +279,14 @@ fn run_daemon_entry(cli: Cli) -> Result<(), BoxError> {
 }
 
 fn resolve_daemon_config(cli: &Cli) -> Result<aloo::client::daemon::DaemonConfig, String> {
+    if let Some(nick) = &cli.nick
+        && !validation::nickname_is_registrable(nick)
+    {
+        return Err(format!(
+            "not a valid nickname: {nick:?} - use 1-{} letters, digits, '-' or '_'",
+            validation::NICKNAME_MAX_LEN
+        ));
+    }
     let settings = load_settings();
     let cache = aloo::client::connect::ConnectCache::load(&aloo::client::connect::cache_path())
         .unwrap_or_else(|_| {

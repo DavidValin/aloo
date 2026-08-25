@@ -166,6 +166,26 @@ Feature: Knowing whether the message you sent got there
     When bob reports he saved it
     Then the message details name "bob" as DELIVERED+SAVED
 
+  @AC-328
+  Scenario: A file the recipient previewed without saving reads as VIEWED
+    Given I am connected and viewing a channel
+    And bob is in the channel with me
+    When I offer bob a file
+    And bob reports he decrypted it
+    Then the message details name "bob" as DELIVERED
+    When bob reports he viewed it
+    Then the message details name "bob" as DELIVERED+VIEWED
+
+  @AC-328
+  Scenario: A saved file never regresses to VIEWED, even if a late view report arrives
+    Given I am connected and viewing a channel
+    And bob is in the channel with me
+    When I offer bob a file
+    And bob reports he decrypted it
+    And bob reports he saved it
+    And bob reports he viewed it
+    Then the message details name "bob" as DELIVERED+SAVED
+
   @AC-236
   Scenario: A text message never grows an extra state, and the arrow never shows one
     Given I am connected and viewing a channel

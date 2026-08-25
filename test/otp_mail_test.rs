@@ -297,3 +297,139 @@ async fn a_mails_last_sent_copy_replays_byte_identically_for_retry() {
     };
     assert_eq!(decrypted, sealed_bytes);
 }
+
+// ---------------------------------------------------------------------
+// The send gate opens on the storage ack alone (docs/PROTOCOL.md 17.2)
+// ---------------------------------------------------------------------
+
+/// A bare session with no `otp` binary configured - these tests drive the
+/// gate through `OtpStore`/`OtpMailStore` directly and the real
+/// `on_mail_result`, never through an actual encrypt, so nothing here
+/// needs the CLI at all (unlike every test above this point).
+async fn bare_session(label: &str) -> (aloo::client::session::SessionState, aloo::client::tui::ui::UiState) {
+    let (public, private) = generate_bundle_with_bits(TEST_BITS).expect("own pq keygen");
+    let public_der = proto::encode(&public).expect("own pq der");
+    let session = aloo::client::session::SessionState::for_test(aloo::client::session::TestSessionSpec {
+        identity: aloo::client::connect::ResolvedIdentity { private, public_der },
+        scratch: temp_dir(label),
+        otp: None,
+    })
+    .await;
+    let ui = aloo::client::tui::ui::UiState::new("alice".into());
+    (session, ui)
+}
+
+/// The exact property TB-193 describes: what clears a mail's stop-and-wait
+/// gate is `OtpMailResult` alone - the server's fast storage
+/// acknowledgement - never the recipient actually fetching or decrypting
+/// it. Seeds the same `OtpStore`/`OtpMailStore` state `handle_send` would
+/// have left behind, then drives the real `on_mail_result` (not a stand-in)
+/// and checks the gate with the exact predicate `handle_send`'s own check
+/// uses, so a regression in either function is caught.
+///
+/// @requirement TB-193
+#[tokio::test]
+async fn a_mails_gate_clears_on_the_storage_ack_alone_never_needing_delivery() {
+    let (mut session, mut ui) = bare_session("mail-gate-storage-ack").await;
+    let contact = "alice-bob-mail";
+    let mail_id = new_mail_id();
+
+    session.otp_store_mut().record_sent(
+        contact,
+        0,
+        aloo::client::otp_store::PendingOtpContent::Mail {
+            mail_id: mail_id.clone(),
+        },
+        None,
+    );
+    session.otp_mail_store_mut().record_sent(aloo::client::otp_mail_store::SentMailRef {
+        mail_id: mail_id.clone(),
+        to: "bob".into(),
+        contact_name: contact.into(),
+        seq: 0,
+        sent_at_utc: 0,
+        status: aloo::client::otp_mail_store::SentMailStatus::AwaitingServerAck,
+    });
+
+    // Before any ack: a second send to this contact is refused - the exact
+    // check `otp_mail::handle_send` runs before it will encrypt anything.
+    assert!(
+        session
+            .otp_store_mut()
+            .get(contact)
+            .and_then(|s| s.pending_unacked_out_seq)
+            .is_some(),
+        "a previous send must still be held while unacknowledged"
+    );
+
+    aloo::client::otp_mail::on_mail_result(
+        &mut aloo::control::NullSink,
+        &mut session,
+        &mut ui,
+        mail_id,
+        true,
+        None,
+    )
+    .await
+    .expect("on_mail_result should never error");
+
+    // The server's storage ack alone opened it - nothing here ever touched
+    // `on_mail_delivered`/`OtpMailDeliveredAck`.
+    assert!(
+        session
+            .otp_store_mut()
+            .get(contact)
+            .and_then(|s| s.pending_unacked_out_seq)
+            .is_none(),
+        "OtpMailResult alone must open the gate for the next send"
+    );
+}
+
+/// The failure twin: a refused storage ack must still open the gate (the
+/// pad bytes are spent either way, so the contact must not wedge forever),
+/// even though nothing was actually delivered.
+///
+/// @requirement TB-193
+#[tokio::test]
+async fn a_mails_gate_also_clears_on_a_refused_storage_ack() {
+    let (mut session, mut ui) = bare_session("mail-gate-refused-ack").await;
+    let contact = "alice-carol-mail";
+    let mail_id = new_mail_id();
+
+    session.otp_store_mut().record_sent(
+        contact,
+        0,
+        aloo::client::otp_store::PendingOtpContent::Mail {
+            mail_id: mail_id.clone(),
+        },
+        None,
+    );
+    session.otp_mail_store_mut().record_sent(aloo::client::otp_mail_store::SentMailRef {
+        mail_id: mail_id.clone(),
+        to: "carol".into(),
+        contact_name: contact.into(),
+        seq: 0,
+        sent_at_utc: 0,
+        status: aloo::client::otp_mail_store::SentMailStatus::AwaitingServerAck,
+    });
+
+    aloo::client::otp_mail::on_mail_result(
+        &mut aloo::control::NullSink,
+        &mut session,
+        &mut ui,
+        mail_id,
+        false,
+        Some("disk full".into()),
+    )
+    .await
+    .expect("on_mail_result should never error");
+
+    assert!(
+        session
+            .otp_store_mut()
+            .get(contact)
+            .and_then(|s| s.pending_unacked_out_seq)
+            .is_none(),
+        "a refusal must still open the gate - the pad bytes are spent regardless of outcome"
+    );
+}

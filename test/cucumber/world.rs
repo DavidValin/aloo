@@ -363,6 +363,10 @@ pub struct AlooWorld {
     pub otp_mail_dir: Option<std::path::PathBuf>,
     /// The id of the mail most recently uploaded/handled.
     pub otp_mail_id: Option<String>,
+    /// Every `(seq, mail_id)` uploaded so far this scenario, in upload
+    /// order - lets a scenario assert delivery is by sequence order even
+    /// when mails were uploaded/stored out of that order.
+    pub otp_mail_ids: Vec<(u64, String)>,
     /// The sealed (pre-`otp --encrypt`) bytes of that mail.
     pub otp_mail_sealed: Vec<u8>,
     /// Its ciphertext, exactly as uploaded.

@@ -10,12 +10,13 @@
 /// with `.chars().count()` (not byte length - TB-140's precedent, so a
 /// multi-byte character is never split mid-encoding by a truncation and,
 /// here, so counting matches what a human typing sees).
-pub const CHANNEL_NAME_MAX_LEN: usize = 21;
+pub const CHANNEL_NAME_MAX_LEN: usize = 30;
 
-/// True for an ASCII letter, digit, or '-' - a channel name's entire
-/// allowed charset. No other punctuation, no whitespace, no non-ASCII.
+/// True for an ASCII letter, digit, '-', or '_' - a channel name's entire
+/// allowed charset (the same charset `nickname_is_registrable` uses). No
+/// other punctuation, no whitespace, no non-ASCII.
 pub fn channel_name_char_allowed(c: char) -> bool {
-    c.is_ascii_alphanumeric() || c == '-'
+    c.is_ascii_alphanumeric() || c == '-' || c == '_'
 }
 
 /// The `#` a channel is *shown* with everywhere it is named
@@ -87,7 +88,7 @@ pub fn is_storable(s: &str) -> bool {
 /// A registered nickname is at most this many characters - the same cap
 /// the connect popup enforces while typing
 /// (`client::tui::ui_connect_popup::NICKNAME_MAX_LEN`).
-pub const NICKNAME_MAX_LEN: usize = 10;
+pub const NICKNAME_MAX_LEN: usize = 11;
 
 /// Whether `nickname` can name an account in the server's users registry
 /// (`server::users_registry`): 1 to `NICKNAME_MAX_LEN` ASCII letters,

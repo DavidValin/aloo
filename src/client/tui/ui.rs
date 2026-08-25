@@ -26,7 +26,7 @@ use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
     Block, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
     ScrollbarState,
@@ -476,11 +476,37 @@ pub enum FileTransferStatus {
     /// Every byte sent (outgoing) or written to `~/.aloo/downloads`
     /// (incoming).
     Completed,
+    /// Incoming only: a `.txt` offer whose bytes have fully arrived, but
+    /// staged under `file_transfer::incoming_preview_dir()` rather than
+    /// `~/.aloo/downloads` - previewable (`UiAction::RequestFilePreview`)
+    /// without being considered saved. Becomes `Completed` the moment the
+    /// user actually saves it (`UiAction::SaveStagedFile`, the `d` key
+    /// inside the preview popup) - the only way out of this state besides
+    /// leaving it, which the next startup's sweep quietly cleans up.
+    Received { staged_path: std::path::PathBuf },
     /// The recipient declined the offer - outgoing rows only.
     Rejected,
     /// A local error ended the transfer early (disk/read/write failure) -
     /// surfaced rather than left stuck mid-progress forever.
     Failed,
+}
+
+/// What the `.txt` preview popup is showing (`UiState::file_preview`) -
+/// content already loaded and, if oversized, already capped by
+/// `session::handle_ui_action` before it ever reaches here, so rendering
+/// stays pure (`render_txt_preview_popup`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FilePreviewState {
+    pub from: UserId,
+    pub stream_id: u64,
+    pub filename: String,
+    pub content: String,
+    /// `true` if `content` was cut short of the file's real length
+    /// (`file_transfer::PREVIEW_MAX_BYTES`) - shown as a notice at the
+    /// bottom of the popup. `d` still saves the complete, untruncated
+    /// file regardless: only the in-memory preview is capped.
+    pub truncated: bool,
+    pub scroll: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -616,6 +642,11 @@ pub struct DeliveryRecipient {
     /// popup: the log's own arrow stays a three-state summary of who has
     /// the message, not of what they did with it.
     pub consumed: bool,
+    /// They opened this file in the preview popup without saving it
+    /// (`p2p_proto::ReceiptStage::Viewed`) - a weaker claim than
+    /// `consumed`, which always wins once true (`recipient_label`). File
+    /// rows only.
+    pub viewed: bool,
 }
 
 /// Which acknowledgement is claiming a recipient read a message - the two
@@ -674,6 +705,10 @@ pub const LISTENED_LABEL: &str = "DELIVERED+LISTENED";
 /// What a file transfer reads once the recipient has the whole of it on
 /// disk, rather than merely having been able to read the offer.
 pub const SAVED_LABEL: &str = "DELIVERED+SAVED";
+/// What a `.txt` file transfer reads once the recipient has opened it in
+/// the preview popup without saving it - a weaker claim than `SAVED_LABEL`,
+/// which always wins once true (`recipient_label`).
+pub const VIEWED_LABEL: &str = "DELIVERED+VIEWED";
 
 /// What one recipient's line of the details popup says, and the colour to
 /// say it in. `body` decides the wording of the consumed state: the extra
@@ -685,6 +720,11 @@ pub fn recipient_label(recipient: &DeliveryRecipient, body: &MessageBody) -> (&'
     }
     let green = DeliveryStatus::All.color();
     if !recipient.consumed {
+        // SAVED always outranks VIEWED once it's true, so this branch is
+        // the only place VIEWED can ever be reported.
+        if recipient.viewed && matches!(body, MessageBody::File { .. }) {
+            return (VIEWED_LABEL, green);
+        }
         return (DELIVERED_LABEL, green);
     }
     match body {
@@ -1651,6 +1691,24 @@ pub enum UiAction {
         from: UserId,
         stream_id: u64,
     },
+    /// `Enter` on a staged `.txt` receive (`FileTransferStatus::Received`)
+    /// - `session::handle_ui_action` reads the file (capped, if oversized)
+    /// and hands it back via `UiState::open_file_preview`, and sends a
+    /// `Viewed` receipt the first time this row is opened (`UiState` has
+    /// no disk/network access to do either itself).
+    RequestFilePreview {
+        from: UserId,
+        stream_id: u64,
+    },
+    /// `d` inside the preview popup - identical in effect to accepting any
+    /// other file transfer's default save (`session::handle_ui_action`):
+    /// moves the staged file into `~/.aloo/downloads` and settles delivery
+    /// as `Consumed`, exactly as an ordinary (non-`.txt`) receive already
+    /// does on arrival.
+    SaveStagedFile {
+        from: UserId,
+        stream_id: u64,
+    },
     /// Sent by the `/otp` command (`submit_input`) for the currently open
     /// DM room - the one and only trigger for starting an OTP session
     /// (`client::otp::handle_provisioning_command`). Never sent automatically.
@@ -2263,6 +2321,12 @@ pub struct UiState {
     /// (`render_help_popup`, against the popup's actual visible height,
     /// which `UiState` has no reason to know) - see there.
     help_scroll: usize,
+    /// The staged `.txt` receive currently open in the preview popup
+    /// (`Enter` on a `FileTransferStatus::Received` row -
+    /// `UiAction::RequestFilePreview`), or `None` when it's closed. The
+    /// content itself is loaded by `session::handle_ui_action` (`UiState`
+    /// has no disk access) and handed back via `open_file_preview`.
+    pub file_preview: Option<FilePreviewState>,
     /// Every peer with an outstanding or resolved-as-`Rejected` identity
     /// mismatch this session (`docs/PROTOCOL.md` §12) - absence means
     /// "trusted normally" (never mismatched, or `Accepted`, which removes
@@ -2455,6 +2519,7 @@ impl UiState {
             blink_on: false,
             help_open: false,
             help_scroll: 0,
+            file_preview: None,
             identity_reviews: HashMap::new(),
             identity_review_queue: VecDeque::new(),
             identity_review_focus: IdentityChoice::Reject,
@@ -2772,6 +2837,7 @@ impl UiState {
                 delivered: false,
                 awaits_pad_ack: false,
                 consumed: false,
+                viewed: false,
             })
             .collect();
         (msg_id, MessageDelivery { msg_id, recipients })
@@ -2896,6 +2962,8 @@ impl UiState {
                         // can never be what turns this leg green.
                         recipient.consumed |=
                             recipient.delivered && stage == ReceiptStage::Consumed;
+                        recipient.viewed |=
+                            recipient.delivered && stage == ReceiptStage::Viewed;
                         continue;
                     }
                     // Consuming implies decrypting, and the two receipts
@@ -2904,6 +2972,12 @@ impl UiState {
                     // one landed.
                     recipient.delivered = true;
                     recipient.consumed |= stage == ReceiptStage::Consumed;
+                    // Never regresses: once a file is genuinely saved,
+                    // `viewed` staying true (or a later `Viewed` re-arriving)
+                    // must not put `SAVED_LABEL` back behind `VIEWED_LABEL` -
+                    // `recipient_label` already only ever consults `viewed`
+                    // when `!consumed`, so simply latching it here is safe.
+                    recipient.viewed |= stage == ReceiptStage::Viewed;
                 }
                 return;
             }
@@ -4106,6 +4180,77 @@ impl UiState {
         });
     }
 
+    /// A staged `.txt` receive has fully arrived (`FileEvent::ReceiveDone`,
+    /// staged rather than saved) - bypasses `update_file_row`'s
+    /// `FileRowProgress` aggregation deliberately: that machinery exists
+    /// for an *outgoing* channel send's multiple recipients, and an
+    /// incoming receive is always its own row.
+    pub fn set_file_received_staged(
+        &mut self,
+        from: UserId,
+        stream_id: u64,
+        staged_path: std::path::PathBuf,
+    ) {
+        self.update_file_entry(from, stream_id, |body| {
+            if let MessageBody::File { status, .. } = body {
+                *status = FileTransferStatus::Received { staged_path };
+            }
+        });
+    }
+
+    /// The staged path and offered filename of the `.txt` receive
+    /// `(from, stream_id)`, if its row is currently
+    /// `FileTransferStatus::Received` - what `session::handle_ui_action`'s
+    /// `RequestFilePreview`/`SaveStagedFile` arms read from disk (`UiState`
+    /// does none of its own I/O).
+    pub fn staged_file(
+        &self,
+        from: UserId,
+        stream_id: u64,
+    ) -> Option<(std::path::PathBuf, String)> {
+        let matches = |e: &&LogEntry| {
+            e.from == from
+                && matches!(&e.body, MessageBody::File { stream_id: sid, .. } if *sid == stream_id)
+        };
+        let entry = self
+            .channels
+            .iter()
+            .find_map(|tab| tab.log.iter().find(matches))
+            .or_else(|| {
+                self.private_rooms
+                    .values()
+                    .find_map(|room| room.log.iter().find(matches))
+            })?;
+        match &entry.body {
+            MessageBody::File {
+                filename,
+                status: FileTransferStatus::Received { staged_path },
+                ..
+            } => Some((staged_path.clone(), filename.clone())),
+            _ => None,
+        }
+    }
+
+    /// Opens the preview popup with content `session::handle_ui_action`
+    /// has already read (and, if oversized, capped) from disk.
+    pub fn open_file_preview(
+        &mut self,
+        from: UserId,
+        stream_id: u64,
+        filename: String,
+        content: String,
+        truncated: bool,
+    ) {
+        self.file_preview = Some(FilePreviewState {
+            from,
+            stream_id,
+            filename,
+            content,
+            truncated,
+            scroll: 0,
+        });
+    }
+
     /// Called by the caller (`session`/`channel`/`direct_message`) when
     /// starting the recorder itself failed (e.g. no audio input device).
     /// Turns off the misleading "recording..." indicator immediately
@@ -4526,6 +4671,61 @@ impl UiState {
                 self.message_info = None;
             }
             return None;
+        }
+
+        // The `.txt` preview popup - same "absorb everything, Esc closes
+        // it" tier as message-info above, plus scrolling and `d` to save
+        // (identical effect to any other file transfer's default save;
+        // `session::handle_ui_action` does the actual move + receipt,
+        // since `UiState` has no disk/network access). Closes itself on
+        // `d` rather than waiting for a round trip - the save is a local
+        // move, not something that can meaningfully fail from here.
+        if let Some(preview) = self.file_preview.as_ref() {
+            let (from, stream_id) = (preview.from, preview.stream_id);
+            return match kind {
+                KeyEventKind::Press | KeyEventKind::Repeat => match code {
+                    KeyCode::Esc => {
+                        self.file_preview = None;
+                        None
+                    }
+                    KeyCode::Char('d') | KeyCode::Char('D') => {
+                        self.file_preview = None;
+                        Some(UiAction::SaveStagedFile { from, stream_id })
+                    }
+                    KeyCode::Up => {
+                        if let Some(preview) = self.file_preview.as_mut() {
+                            preview.scroll = preview.scroll.saturating_sub(1);
+                        }
+                        None
+                    }
+                    KeyCode::Down => {
+                        if let Some(preview) = self.file_preview.as_mut() {
+                            preview.scroll += 1;
+                        }
+                        None
+                    }
+                    KeyCode::PageUp => {
+                        if let Some(preview) = self.file_preview.as_mut() {
+                            preview.scroll = preview.scroll.saturating_sub(HELP_SCROLL_PAGE);
+                        }
+                        None
+                    }
+                    KeyCode::PageDown => {
+                        if let Some(preview) = self.file_preview.as_mut() {
+                            preview.scroll += HELP_SCROLL_PAGE;
+                        }
+                        None
+                    }
+                    KeyCode::Home => {
+                        if let Some(preview) = self.file_preview.as_mut() {
+                            preview.scroll = 0;
+                        }
+                        None
+                    }
+                    _ => None,
+                },
+                _ => None,
+            };
         }
 
         // The user-info popup (`i`/`/info`) is the same "absorb every key,
@@ -5201,7 +5401,14 @@ impl UiState {
                 None
             }
             KeyCode::Char(c) => {
-                self.input.push(c);
+                // `proto::TEXT_MESSAGE_MAX_LEN` - same per-keystroke cap
+                // shape as `ui_connect_popup`'s nickname field. A paste
+                // long enough to matter here is always diverted to a file
+                // first (`handle_paste`), so this only ever bites manually
+                // typed text.
+                if self.input.chars().count() < crate::proto::TEXT_MESSAGE_MAX_LEN {
+                    self.input.push(c);
+                }
                 None
             }
             KeyCode::Enter => self.submit_input(),
@@ -5490,6 +5697,44 @@ impl UiState {
             self.push_status_notice(format!("unknown command: {}", attempted.trim()), false);
             return None;
         }
+        // Checked *before* taking `input` - a send that can't actually go
+        // through (channel not joined, DM peer unknown) must leave the
+        // typed text in place rather than silently discarding it (AC-026),
+        // and `submit_text` itself can't tell the difference between "not
+        // sent because unaddressable" and "not sent for some other reason"
+        // from the outside.
+        if !self.can_submit_text() {
+            return None;
+        }
+        let text = std::mem::take(&mut self.input);
+        self.submit_text(text)
+    }
+
+    /// Whether `submit_text` would actually produce a send right now -
+    /// `submit_input`'s guard for AC-026 (see its call site). Mirrors the
+    /// addressability checks `submit_text` makes internally; kept as its
+    /// own read-only check because `submit_input` needs the answer before
+    /// it decides whether to touch `input` at all, and `handle_paste` has
+    /// no equivalent "must preserve unsent text" concern (a paste that
+    /// can't be sent was never staged anywhere to lose).
+    fn can_submit_text(&self) -> bool {
+        if let Some(peer_id) = self.active_private_room {
+            !self.is_trust_gated(peer_id) && self.known_users.contains_key(&peer_id)
+        } else {
+            self.channels
+                .get(self.selected_channel)
+                .is_some_and(|c| c.joined)
+        }
+    }
+
+    /// Shared tail of `submit_input`: send `text` verbatim to whichever
+    /// room is open (the active DM peer, or the selected channel tab if
+    /// none is). Split out so `handle_paste` can reach the exact same send
+    /// path for a full paste's content without going through the
+    /// single-line `input` buffer at all - a paste already arrives as one
+    /// atomic string, embedded newlines included, so there is nothing to
+    /// stage there first.
+    fn submit_text(&mut self, text: String) -> Option<UiAction> {
         if let Some(peer_id) = self.active_private_room {
             // Defensive: normal navigation can no longer reach a compose
             // bar for a Pending/Rejected peer's room (Enter on their
@@ -5500,7 +5745,6 @@ impl UiState {
                 return None;
             }
             let peer = self.known_users.get(&peer_id)?.clone();
-            let text = std::mem::take(&mut self.input);
             // Allocated here, before the row exists, because the row and
             // the send have to agree on it: it is both this row's identity
             // and the tag the wire frame carries (`docs/PROTOCOL.md` 7.2.1).
@@ -5522,7 +5766,6 @@ impl UiState {
             }
             let name = channel.name.clone();
             let recipients = self.recipients_for_channel(channel);
-            let text = std::mem::take(&mut self.input);
             let recipient_ids: Vec<UserId> = recipients.iter().map(|(id, ..)| *id).collect();
             let (msg_id, delivery) = self.start_delivery(&recipient_ids);
             let action = UiAction::SendChannelText {
@@ -5534,6 +5777,84 @@ impl UiState {
             self.push_outgoing_channel(&name, MessageBody::Text(text), Some(delivery));
             Some(action)
         }
+    }
+
+    /// The set of states `handle_key` checks, in priority order, before it
+    /// ever reaches the ordinary compose bar (`handle_input_key`) - reused
+    /// here so a paste event can't be misread as a message send while one
+    /// of these is absorbing every key instead (an open identity review,
+    /// an invite, a popup, the help screen, ...).
+    fn overlay_absorbing_input(&self) -> bool {
+        self.identity_review_queue.front().is_some()
+            || self.unknown_peer_review_queue.front().is_some()
+            || self.otp_invite_queue.front().is_some()
+            || self.otp_keygen.is_some()
+            || self.otp_size_input.is_some()
+            || self.otp_generate_confirm.is_some()
+            || self.file_offer_queue.front().is_some()
+            || self.call_invite_queue.front().is_some()
+            || self.call_confirm.is_some()
+            || self.call_modal_showing()
+            || self.message_info.is_some()
+            || self.file_preview.is_some()
+            || self.user_info.is_some()
+            || self.help_open
+            || self.otp_mail.is_some()
+            || self.mode != Mode::Normal
+            || self.selector_dropdown_open
+    }
+
+    /// A whole paste (`Event::Paste`, delivered atomically by a
+    /// bracketed-paste-enabled terminal - `tui::terminal::setup` - with any
+    /// embedded newlines intact) reaching the ordinary compose bar. Two
+    /// thresholds, in order:
+    ///
+    /// - Longer than `client::file_transfer::PASTE_TO_FILE_CHAR_THRESHOLD`:
+    ///   converted to a `.txt` file and sent as a file transfer instead of
+    ///   a message - the same "this is clearly a document, not a chat
+    ///   line" judgment call, just made automatically rather than asking.
+    /// - Otherwise: sent immediately as a single message, newlines and
+    ///   all, rather than staged in the single-line `input` buffer (which
+    ///   has no way to hold or display one) for a manual Enter.
+    ///
+    /// A no-op while some other overlay is in front of the compose bar, or
+    /// for a peer this side currently can't send to, same as an ordinary
+    /// keystroke would be.
+    pub fn handle_paste(&mut self, text: String) -> Option<UiAction> {
+        if text.is_empty() {
+            return None;
+        }
+        if self.focus != Focus::Input || self.overlay_absorbing_input() {
+            return None;
+        }
+        if self.active_dm_peer_offline() || self.active_dm_peer_trust_gated() {
+            return None;
+        }
+        // Bracketed paste's line endings are not reliably `\n`: many
+        // terminals (tmux's own `paste-buffer -p` included) send a lone
+        // `\r` for each embedded line break, since that is historically
+        // what "pressing Enter" sends. Everything downstream - the
+        // message-log renderer splitting into one row per line, a
+        // receiving peer's own renderer, a `.txt` file's line endings -
+        // only ever recognizes `\n`, so it is normalized exactly once,
+        // here at the paste boundary, rather than every consumer having
+        // to know about `\r` too.
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        if text.chars().count() > crate::client::file_transfer::PASTE_TO_FILE_CHAR_THRESHOLD {
+            let target = self.current_file_send_target()?;
+            let path = crate::client::file_transfer::write_pasted_text_file(&text).ok()?;
+            return self.confirm_pasted_file_send(target, path);
+        }
+        // Never actually trims anything in practice - anything this long
+        // was already diverted to a file above, since
+        // `PASTE_TO_FILE_CHAR_THRESHOLD` is well under `TEXT_MESSAGE_MAX_LEN`
+        // - kept as a defensive second enforcement point rather than
+        // relying on the ordering above never changing silently.
+        let capped: String = text
+            .chars()
+            .take(crate::proto::TEXT_MESSAGE_MAX_LEN)
+            .collect();
+        self.submit_text(capped)
     }
 
     /// Handles `/mute-voice [nickname]` and `/unmute-voice [nickname]`
@@ -5749,12 +6070,31 @@ impl UiState {
                 }
                 None
             }
-            // A file entry has nothing left to do on Enter - it's already
-            // either mid-transfer or saved under `~/.aloo/downloads` (or
-            // rejected/failed); unlike the old whole-file-in-memory
-            // approach, there's no separate save step to trigger here.
+            // A file entry has nothing left to do on Enter once it's
+            // mid-transfer, saved under `~/.aloo/downloads`, rejected, or
+            // failed (unlike the old whole-file-in-memory approach, there's
+            // no separate save step to trigger for those) - except a
+            // staged `.txt` receive, which Enter opens for preview
+            // (`UiAction::RequestFilePreview`; `session::handle_ui_action`
+            // reads the file, since `UiState` has no disk access).
             KeyCode::Enter => {
                 let selected = self.message_selected;
+                if let Some(LogEntry {
+                    body:
+                        MessageBody::File {
+                            status: FileTransferStatus::Received { .. },
+                            stream_id,
+                            ..
+                        },
+                    from,
+                    ..
+                }) = self.current_log().get(selected)
+                {
+                    return Some(UiAction::RequestFilePreview {
+                        from: *from,
+                        stream_id: *stream_id,
+                    });
+                }
                 let replay = match self.current_log().get(selected) {
                     Some(LogEntry {
                         body: MessageBody::Voice { duration_ms, pcm },
@@ -6260,6 +6600,10 @@ pub fn render(frame: &mut Frame, state: &UiState) {
     // absorb keys first.
     if state.message_info.is_some() {
         render_message_info_popup(frame, area, state);
+    }
+    // Same tier as message-info above - a staged `.txt` receive's preview.
+    if state.file_preview.is_some() {
+        render_txt_preview_popup(frame, area, state);
     }
     // Same tier as message-info above - `i`/`/info`'s read-only snapshot.
     if state.user_info.is_some() {
@@ -7619,19 +7963,34 @@ pub(crate) fn render_messages(
         }
     }
 
-    // OTP's own UI surface only exists inside a private room (see
-    // `otp_active_peers`'s doc) - a channel log never gets the pad
-    // prefix, regardless of any individual member's OTP status.
-    let pad_active = dm_peer.is_some_and(|peer| state.is_otp_active(peer));
-
     let items: Vec<ListItem> = log
         .iter()
         .map(|entry| {
-            let mut line = match &entry.body {
+            // One `LogEntry` is always exactly one selectable `ListItem`,
+            // however many visual rows its content takes - a multiline
+            // paste (`MessageBody::Text` containing `\n`) renders as
+            // several rows of the *same* message, not several messages:
+            // Up/Down still moves one log entry at a time (`ListState`
+            // selects by item, not by rendered row) and `i` still opens
+            // the details of the one entry under the cursor regardless of
+            // which of its rows that is.
+            let mut lines: Vec<Line<'static>> = match &entry.body {
                 MessageBody::Text(text) => {
-                    let mut spans = sender_prefix(entry);
-                    push_text_with_links(&mut spans, text);
-                    Line::from(spans)
+                    let mut physical_lines: Vec<Line<'static>> = text
+                        .split('\n')
+                        .map(|part| {
+                            let mut spans = Vec::new();
+                            push_text_with_links(&mut spans, part);
+                            Line::from(spans)
+                        })
+                        .collect();
+                    // The sender prefix belongs on the first row only.
+                    if let Some(first) = physical_lines.first_mut() {
+                        let mut prefix = sender_prefix(entry);
+                        prefix.append(&mut first.spans);
+                        first.spans = prefix;
+                    }
+                    physical_lines
                 }
                 MessageBody::Voice { duration_ms, .. } => {
                     let label = format_duration_label(*duration_ms);
@@ -7640,7 +7999,7 @@ pub(crate) fn render_messages(
                         format!("\u{1F534} {label}"),
                         Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                     ));
-                    Line::from(spans)
+                    vec![Line::from(spans)]
                 }
                 MessageBody::VoiceStreaming { .. } => {
                     let dot = if state.blink_on { "\u{23FA}" } else { " " };
@@ -7649,7 +8008,7 @@ pub(crate) fn render_messages(
                         format!("{dot} voice (streaming...)"),
                         Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                     ));
-                    Line::from(spans)
+                    vec![Line::from(spans)]
                 }
                 MessageBody::File {
                     filename,
@@ -7685,6 +8044,12 @@ pub(crate) fn render_messages(
                                 .fg(Color::Cyan)
                                 .add_modifier(Modifier::BOLD),
                         )),
+                        FileTransferStatus::Received { .. } => spans.push(Span::styled(
+                            format!("\u{1F4CE} {filename} (Enter: preview)"),
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
+                        )),
                         FileTransferStatus::Rejected => spans.push(Span::styled(
                             format!("\u{1F4CE} {filename} (rejected)"),
                             Style::default().fg(Color::DarkGray),
@@ -7694,49 +8059,63 @@ pub(crate) fn render_messages(
                             Style::default().fg(Color::Red),
                         )),
                     }
-                    Line::from(spans)
+                    vec![Line::from(spans)]
                 }
-                MessageBody::System(text) => Line::from(Span::styled(
+                MessageBody::System(text) => vec![Line::from(Span::styled(
                     text.clone(),
                     Style::default()
                         .fg(Color::DarkGray)
                         .add_modifier(Modifier::ITALIC),
-                )),
-                MessageBody::Presence(text) => Line::from(Span::styled(
+                ))],
+                MessageBody::Presence(text) => vec![Line::from(Span::styled(
                     text.clone(),
                     Style::default().fg(Color::Yellow),
-                )),
+                ))],
             };
             // A message that reached nobody is struck through: it is not
             // waiting on anybody's acknowledgement, because it was never
             // addressed to anybody (`docs/SPEC.md` "Delivery
             // acknowledgments"). Applied before the pad prefix below,
-            // so a combining overlay never lands on that emoji.
+            // so a combining overlay never lands on that emoji. Every row
+            // of a multiline message is struck through together, since
+            // they are all the one message that reached nobody.
             if entry.reached_nobody() {
-                for span in line.spans.iter_mut() {
-                    span.content = strike_through(&span.content).into();
+                for line in lines.iter_mut() {
+                    for span in line.spans.iter_mut() {
+                        span.content = strike_through(&span.content).into();
+                    }
                 }
             }
-            if pad_active
+            // The tag reflects what actually protected THIS message
+            // (`entry.crypto`, stamped once at push time by
+            // `UiState::message_crypto`), never the room's current live
+            // OTP session state - a message sent under OTP keeps its key
+            // icon in the log even after `/endotp` ends the session, since
+            // ending the session changes nothing about how that message
+            // was actually encrypted. Only the first row carries it - one
+            // tag per message, not one per row.
+            if matches!(entry.crypto, Some(MessageCrypto::Otp { .. }))
                 && !matches!(
                     entry.body,
                     MessageBody::System(_) | MessageBody::Presence(_)
                 )
             {
-                line.spans.insert(0, Span::raw(format!("{OTP_ICON} ")));
+                if let Some(first) = lines.first_mut() {
+                    first.spans.insert(0, Span::raw(format!("{OTP_ICON} ")));
+                }
             }
             // A row whose async send turned out to have failed
             // (`UiState::mark_dm_message_failed`) is shown in red, same as
             // every other "this needs your attention" red the app already
             // uses - a failed send must never look identical to a
-            // delivered one. The line's own style is a fallback under each
-            // span's, but none of the spans built above (including the
-            // pad prefix) set their own color, so this reliably paints
-            // the whole row.
+            // delivered one. Every row of a multiline message gets it, so
+            // a failed send is never half-red.
             if entry.failed {
-                line.style = Style::default().fg(Color::Red);
+                for line in lines.iter_mut() {
+                    line.style = Style::default().fg(Color::Red);
+                }
             }
-            ListItem::new(line)
+            ListItem::new(Text::from(lines))
         })
         .collect();
 
@@ -8242,6 +8621,59 @@ fn help_rendered_lines(inner_width: u16) -> Vec<Line<'static>> {
 pub fn help_total_lines() -> usize {
     static TOTAL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *TOTAL.get_or_init(|| help_lines_for_column(HELP_MIN_DESC_COL).len())
+}
+
+/// A staged `.txt` receive's content, read-only and scrollable
+/// (`UiState::file_preview`, opened by `Enter` on a
+/// `FileTransferStatus::Received` row). Modeled directly on
+/// `render_help_popup` below: the whole frame rather than a centered box
+/// (plenty of terminals are narrower than one real line of typed text),
+/// a stored scroll offset clamped against the actual rendered height here
+/// rather than in `handle_key` (which has no reason to know the terminal
+/// size), and a bottom hint line rather than a separate status bar.
+fn render_txt_preview_popup(frame: &mut Frame, area: Rect, state: &UiState) {
+    let Some(preview) = state.file_preview.as_ref() else {
+        return;
+    };
+    let popup = area;
+    let block = Block::default()
+        .title(format!("Preview: {}", preview.filename))
+        .borders(Borders::ALL);
+    let inner = block.inner(popup);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(block, popup);
+
+    let width = inner.width as usize;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for line in preview.content.split('\n') {
+        if line.is_empty() {
+            lines.push(Line::from(""));
+            continue;
+        }
+        for chunk in wrap_to_width(line, width) {
+            lines.push(Line::from(chunk));
+        }
+    }
+    if preview.truncated {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "--- preview truncated - the saved file will still be complete ---",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::ITALIC),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "d: save   Esc: close",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    let visible_rows = inner.height as usize;
+    let max_scroll = lines.len().saturating_sub(visible_rows);
+    let scroll = preview.scroll.min(max_scroll);
+
+    frame.render_widget(Paragraph::new(lines).scroll((scroll as u16, 0)), inner);
 }
 
 fn render_help_popup(frame: &mut Frame, area: Rect, state: &UiState) {

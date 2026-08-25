@@ -131,6 +131,30 @@ Feature: OTP mail that waits, encrypted, on the server
     Then the server acknowledges the mail as stored
     And the mail's ciphertext waits on the server's disk
 
+  @AC-160 @TB-193
+  Scenario: A second mail is stored before the first is ever delivered
+    Given a server with otp mail storage
+    And alice has connected
+    When alice uploads an otp mail addressed to bob
+    Then the server acknowledges the mail as stored
+    When alice uploads an otp mail addressed to bob
+    Then the server acknowledges the mail as stored
+    And the mail's ciphertext waits on the server's disk
+
+  @AC-160
+  Scenario: Mails queued out of arrival order are still delivered oldest sequence first
+    Given a server with otp mail storage
+    And alice has connected
+    When alice uploads an otp mail addressed to bob at sequence 2
+    Then the server acknowledges the mail as stored
+    When alice uploads an otp mail addressed to bob at sequence 0
+    Then the server acknowledges the mail as stored
+    When alice uploads an otp mail addressed to bob at sequence 1
+    Then the server acknowledges the mail as stored
+    When bob has connected
+    And bob fetches his otp mail
+    Then bob receives the mails oldest sequence first
+
   @AC-160
   Scenario: The recipient fetches, acknowledges, and the server copy is deleted
     Given a server with otp mail storage

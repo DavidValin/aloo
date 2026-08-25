@@ -136,6 +136,20 @@ pub struct SessionState {
     /// `ReceiveDone`/`ReceiveFailed` finishes handling it.
     pub(crate) otp_incoming_file_receives:
         HashMap<(UserId, u64), file_transfer::OtpIncomingFileReceive>,
+    /// One entry per currently-staged `.txt` receive (`accept_file_offer`) -
+    /// its content has fully arrived under
+    /// `file_transfer::incoming_preview_dir()` rather than
+    /// `default_download_dir()`, previewable without counting as saved.
+    /// Removed the moment `ReceiveDone`/`ReceiveFailed` finishes handling
+    /// it (see there for why that means "started staging", not "the user
+    /// saved it" - `UiAction::SaveStagedFile` is the only thing that moves
+    /// the file itself, and that lookup goes through the log row's own
+    /// `FileTransferStatus::Received`, not this map).
+    pub(crate) staged_text_receives: HashMap<(UserId, u64), std::path::PathBuf>,
+    /// Which staged receives have already earned their one `Viewed`
+    /// receipt (`UiAction::RequestFilePreview`) - reopening the same
+    /// preview must not resend it every time.
+    pub(crate) viewed_previews: std::collections::HashSet<(UserId, u64)>,
     /// The temp ciphertext path a sending OTP transfer is actually
     /// streaming from (`P2pEvent::FileAccepted`'s OTP branch), kept only
     /// long enough to delete it once the send finishes or fails
@@ -604,6 +618,8 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
         own_file_targets: HashMap::new(),
         active_file_transfers: HashMap::new(),
         otp_incoming_file_receives: HashMap::new(),
+        staged_text_receives: HashMap::new(),
+        viewed_previews: std::collections::HashSet::new(),
         otp_send_temp_files: HashMap::new(),
         file_events_tx,
         record_out_tx,
@@ -678,6 +694,16 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
     // so it is garbage by definition and is cleared here rather than left
     // to accumulate. See `client::otp_staging`'s module doc.
     crate::client::otp_staging::sweep(&session.otp_cli_cfg);
+    // `~/.aloo/tmp/` is the same kind of work-in-progress-only directory,
+    // for a long paste's synthesized `.txt` file rather than OTP key
+    // material (`file_transfer::paste_tmp_dir`'s doc) - swept here for the
+    // same reason.
+    crate::client::file_transfer::sweep_paste_tmp_dir();
+    // `~/.aloo/tmp/incoming/` holds a staged `.txt` receive between
+    // arriving and either being saved (moved out) or the process ending -
+    // never a place anything is meant to persist across runs
+    // (`file_transfer::incoming_preview_dir`'s doc), same reasoning again.
+    crate::client::file_transfer::sweep_incoming_preview_dir();
     // `.tmp/` above is only ever work in progress. A `_pending` directory
     // outlives it by design - it holds a pad this side generated and must
     // keep until the peer accepts - so an abandoned handshake leaves four
@@ -839,6 +865,17 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
                     // (`Surface::resize`).
                     SessionInput::Key(Event::Resize(cols, rows)) => {
                         surface.resize(crate::client::tui::surface::TerminalSize::new(cols, rows))?;
+                    }
+                    // A bracketed-paste-enabled terminal (`tui::terminal::setup`)
+                    // delivers a whole paste as one event, newlines included -
+                    // `handle_paste` decides whether it becomes one message or
+                    // a file transfer (docs/PROTOCOL.md's message-length
+                    // section) rather than letting it fragment through the
+                    // ordinary per-keystroke path below.
+                    SessionInput::Key(Event::Paste(text)) => {
+                        if let Some(action) = ui_state.handle_paste(text) {
+                            handle_ui_action(action, &mut wr, &mut ui_state, &mut session).await?;
+                        }
                     }
                     SessionInput::Key(_) => {}
                     SessionInput::Attached { writer, size } => {
@@ -1597,6 +1634,46 @@ async fn handle_ui_action(
                 .peer_link
                 .send_reliable_or_queue(from, P2pPayload::FileReject { stream_id });
         }
+        UiAction::RequestFilePreview { from, stream_id } => {
+            if let Some((staged_path, filename)) = ui_state.staged_file(from, stream_id) {
+                match crate::client::file_transfer::read_txt_preview(&staged_path) {
+                    Ok((content, truncated)) => {
+                        ui_state.open_file_preview(from, stream_id, filename, content, truncated);
+                        // A bare open earns `Viewed` only once per staged
+                        // receive - reopening the same preview (or one
+                        // already fully saved and hence no longer tracked
+                        // by `pending_receipts`) sends nothing further.
+                        if let Some(msg_id) = session.pending_receipts.msg_id_of(from, stream_id)
+                            && session.viewed_previews.insert((from, stream_id))
+                        {
+                            send_delivery_receipt(session, from, Some(msg_id), ReceiptStage::Viewed);
+                        }
+                    }
+                    Err(e) => ui_state.push_status_notice(
+                        format!("could not open {filename} for preview: {e}"),
+                        false,
+                    ),
+                }
+            }
+        }
+        UiAction::SaveStagedFile { from, stream_id } => {
+            if let Some((staged_path, filename)) = ui_state.staged_file(from, stream_id) {
+                match crate::client::file_transfer::save_staged_file(&staged_path) {
+                    // Identical effect to an ordinary (non-staged) file's
+                    // on-arrival save: `Completed`, and the one `Consumed`
+                    // receipt `ReceiveDone` deliberately withheld for a
+                    // staged receive (`pending_receipts` still holds it).
+                    Ok(_) => {
+                        ui_state.set_file_completed(from, stream_id);
+                        settle_delivery_id(session, from, stream_id, true);
+                    }
+                    Err(e) => ui_state.push_status_notice(
+                        format!("could not save {filename}: {e}"),
+                        false,
+                    ),
+                }
+            }
+        }
         UiAction::RequestOtpSession { peer, pubkey_der } => {
             // Snapshotted so a refusal raised by *this* call can be told
             // apart from a notice that was already on screen.
@@ -1864,7 +1941,28 @@ async fn accept_file_offer(
     let dest_name = crate::client::file_transfer::safe_filename(
         &crate::client::file_transfer::truncate_filename(&offer.filename),
     );
-    let final_path = crate::client::file_transfer::default_download_dir().join(dest_name);
+    // A `.txt` offer stages into `incoming_preview_dir()` instead of the
+    // real downloads directory, so it can be previewed
+    // (`UiState::open_file_preview`) without counting as saved
+    // (`docs/PROTOCOL.md` 7.2.1a) - `handle_file_event`'s `ReceiveDone`
+    // leaves it there rather than settling delivery, until
+    // `UiAction::SaveStagedFile` (`d` in the preview) moves it out.
+    // Scoped to non-OTP transfers: an OTP receive's own ack is earned by
+    // successfully decrypting to `final_path` at all (`ack_proof_for_file`
+    // reads it back), a materially different, proof-based mechanism this
+    // item does not touch.
+    let is_staged_preview =
+        offer.otp_contact_name.is_none() && crate::client::file_transfer::is_txt_filename(&dest_name);
+    let final_path = if is_staged_preview {
+        crate::client::file_transfer::incoming_preview_dir().join(&dest_name)
+    } else {
+        crate::client::file_transfer::default_download_dir().join(&dest_name)
+    };
+    if is_staged_preview {
+        session
+            .staged_text_receives
+            .insert((from, stream_id), final_path.clone());
+    }
     // Only the destination differs for an OTP-active offer: a temp file,
     // decrypted whole into `final_path` once `handle_file_event`'s
     // `ReceiveDone` runs `client::otp::finish_incoming_file`.
@@ -4426,6 +4524,13 @@ impl SessionState {
         &mut self.otp_store
     }
 
+    /// The OTP mail layer's sent/received indexes - exposed for tests,
+    /// which need to seed a mail as already sent and awaiting the
+    /// server's storage acknowledgement without driving a real encrypt.
+    pub fn otp_mail_store_mut(&mut self) -> &mut crate::client::otp_mail_store::OtpMailStore {
+        &mut self.otp_mail_store
+    }
+
     /// The OTP ciphertext this side staged for `stream_id`'s content
     /// phase. Exposed for tests, which stand in for the chunked transport
     /// by handing that file to the other session directly.
@@ -4506,6 +4611,8 @@ impl SessionState {
             own_file_targets: HashMap::new(),
             active_file_transfers: HashMap::new(),
             otp_incoming_file_receives: HashMap::new(),
+            staged_text_receives: HashMap::new(),
+            viewed_previews: std::collections::HashSet::new(),
             otp_send_temp_files: HashMap::new(),
             file_events_tx,
             record_out_tx,
@@ -4860,6 +4967,8 @@ async fn handle_file_event(
             from, stream_id, ..
         } => {
             session.active_file_transfers.remove(&(from, stream_id));
+            let staged_path = session.staged_text_receives.remove(&(from, stream_id));
+            let is_staged = staged_path.is_some();
             match session
                 .otp_incoming_file_receives
                 .remove(&(from, stream_id))
@@ -4870,15 +4979,29 @@ async fn handle_file_event(
                     )
                     .await;
                 }
-                None => ui_state.set_file_completed(from, stream_id),
+                None => match staged_path {
+                    // Staged rather than saved - the row shows it as
+                    // previewable, not `Completed`, and no receipt fires
+                    // yet (below): a `.txt` landing in the preview
+                    // directory has not been "used" the way 7.2.1 means it
+                    // until the user actually saves it.
+                    Some(path) => ui_state.set_file_received_staged(from, stream_id, path),
+                    None => ui_state.set_file_completed(from, stream_id),
+                },
             }
-            // The whole file arrived and was written to disk - which for a
-            // file is what "used" means (7.2.1), and is what the sender's
-            // details popup shows as DELIVERED+SAVED.
-            settle_delivery_id(session, from, stream_id, true);
+            // The whole file arrived and was written to disk - which for
+            // an ordinary file is what "used" means (7.2.1), and is what
+            // the sender's details popup shows as DELIVERED+SAVED. A
+            // staged `.txt` receive earns this only once actually saved
+            // (`UiAction::SaveStagedFile`), not on arrival.
+            if !is_staged {
+                settle_delivery_id(session, from, stream_id, true);
+            }
         }
         file_transfer::FileEvent::ReceiveFailed { from, stream_id } => {
             session.active_file_transfers.remove(&(from, stream_id));
+            session.staged_text_receives.remove(&(from, stream_id));
+            session.viewed_previews.remove(&(from, stream_id));
             if let Some(pending) = session
                 .otp_incoming_file_receives
                 .remove(&(from, stream_id))

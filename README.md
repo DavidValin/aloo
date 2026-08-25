@@ -76,7 +76,7 @@ Whatever `--bind`/`--port` you run it with gets saved to `~/.aloo/settings`; a b
 aloo
 ```
 
-This opens a connect screen. Fill in the host/port, a nickname and its password, and press Connect. An email field and a Register button are always there too — no account yet? Fill in an email and press Register instead; check that address for a 12-digit activation code, then Connect with the same nickname and password (aloo asks for the code the first time it logs in on an unactivated account). Pressing Register on a server that has `server_allow_registration` off just refuses, in red, telling you so. Everything else on that screen has sensible defaults — you don't need to touch it to get started (see `docs/SPEC.md` if you want to know what every field does).
+This opens a connect screen. Fill in the host/port, a nickname and its password, and press Connect. An email field and a Register button are always there too — no account yet? Fill in an email and press Register instead; on success aloo asks right there for the 12-digit activation code that was just emailed to you. Pressing Register on a server that has `server_allow_registration` off just refuses, in red, telling you so. Everything else on that screen has sensible defaults — you don't need to touch it to get started (see `docs/SPEC.md` if you want to know what every field does).
 
 Your identity type is already set to `pq_hybrid` (PQ-Hybrid, see "Encryption" below) — no need to generate any keys yourself beforehand, aloo creates them automatically the first time you connect.
 
@@ -319,7 +319,7 @@ There are two separate places encryption shows up: how *you* prove who you are, 
 How you prove you're allowed to connect: a nickname and its password, checked against the server's own users registry (`~/.aloo/users` on the server's machine) — the same login every time, not a mode chosen per connection.
 
 - 🔑 **Nickname + password.** The server operator either registers you directly (`aloo --register-user <nickname> <password>`, active immediately) or turns on self-registration.
-- ✉️ **Self-registration.** With `server_allow_registration=on` and an SMTP relay configured in `~/.aloo/settings` (`server_smtp_host`, `server_smtp_port`, `server_smtp_username`, `server_smtp_password`), anyone can register from the connect screen's Register button and activate with the 12-digit code emailed to them — valid for one hour, and also usable from a browser link if `server_activation_url` is set.
+- ✉️ **Self-registration.** With `server_allow_registration=on` and an SMTP relay configured in `~/.aloo/settings` (`server_smtp_host`, `server_smtp_port`, `server_smtp_username`, `server_smtp_password`), anyone can register from the connect screen's Register button and activate with the 12-digit code emailed to them — valid for one hour, entered right there in aloo's own activation popup, and also usable from a browser link if `server_activation_url` is set.
 - 🔏 **Optional TLS.** `server_ssl=on` plus a certificate pair (`server_ssl_fullchain`/`server_ssl_privkey` — a Let's Encrypt pair works well) serves the control connection, and the activation link, over TLS. On the client side this is settings-only too, not a connect-screen field: set `connect_ssl=on` in `~/.aloo/settings` (or pass `--ssl`/set `daemon_ssl` for a headless start); a self-signed or privately issued certificate needs its root added via `connect_ssl_ca`.
 
 None of this is per-connection: it's how the server itself is configured, in `~/.aloo/settings` on the server's machine.

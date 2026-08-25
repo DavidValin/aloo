@@ -544,17 +544,17 @@ impl UiState {
 
     /// Validates the typed nickname/device_id (same rules
     /// `DirectPunchTarget::parse` already applies to a manually-typed
-    /// nickname+device pair: non-empty, `is_storable`) and that no row
-    /// already pins this exact `(nickname, device_id)`. On success, opens
-    /// the *same* key-details popup Enter-on-a-row does, marked
-    /// `new_contact: true` - nothing is written to `id_store` by this
-    /// step alone, only by actually adding a key from there.
+    /// nickname+device pair: `nickname_is_registrable`, `is_storable`) and
+    /// that no row already pins this exact `(nickname, device_id)`. On
+    /// success, opens the *same* key-details popup Enter-on-a-row does,
+    /// marked `new_contact: true` - nothing is written to `id_store` by
+    /// this step alone, only by actually adding a key from there.
     fn submit_add_contact(&mut self) -> Option<UiAction> {
         let (nickname, device_id) = {
             let add = self.contacts.as_ref()?.add_contact.as_ref()?;
             (add.nickname.clone(), add.device_id.clone())
         };
-        let error = if nickname.is_empty() || !crate::validation::is_storable(&nickname) {
+        let error = if !crate::validation::nickname_is_registrable(&nickname) {
             Some(format!("not a valid nickname: {nickname:?}"))
         } else if device_id.is_empty() || !crate::validation::is_storable(&device_id) {
             Some(format!("not a valid device id: {device_id:?}"))

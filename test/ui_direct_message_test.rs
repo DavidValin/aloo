@@ -35,6 +35,27 @@ fn direct_message_does_not_mark_unread_when_that_room_is_active() {
     assert!(!room.unread);
 }
 
+/// @requirement AC-326
+#[test]
+fn a_pasted_multiline_block_in_a_dm_sends_as_one_message() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.focus = Focus::Sidebar;
+    press(&mut state, KeyCode::Enter); // opens the DM room with bob
+    assert_eq!(state.active_private_room, Some(UserId(2)));
+    let action = state
+        .handle_paste("hi bob\nhow are you".to_string())
+        .expect("a short paste should produce an action");
+    match action {
+        UiAction::SendDirectText { to, plaintext, .. } => {
+            assert_eq!(to, UserId(2));
+            assert_eq!(plaintext, "hi bob\nhow are you");
+        }
+        other => panic!("expected SendDirectText, got {other:?}"),
+    }
+    assert_eq!(state.input, "");
+    assert_eq!(state.private_rooms[&UserId(2)].log.len(), 1);
+}
+
 // ---------------------------------------------------------------------
 // Private messaging
 // ---------------------------------------------------------------------
@@ -1078,9 +1099,25 @@ fn endotp_outside_any_open_dm_room_is_a_no_op() {
 /// @requirement AC-141
 #[test]
 fn messages_in_an_otp_active_dm_get_the_pad_prefix_but_system_lines_never_do() {
+    use aloo::client::otp_cli::ContactDetail;
+
     let mut state = joined_general_with(vec![pq_hybrid_user(2, "bob")]);
     state.active_private_room = Some(UserId(2));
     state.mark_otp_active(UserId(2));
+    // `message_crypto` (what the tag now reads, AC-141/item-3 fix) only
+    // reports `Otp` once a key-status snapshot exists for the peer - an
+    // active session is always followed by one in real use.
+    state.set_otp_key_status(
+        UserId(2),
+        otp_status(ContactDetail {
+            enc_sequence: 0,
+            enc_offset: 0,
+            enc_key_remaining: 2_000_000,
+            dec_sequence: 0,
+            dec_offset: 0,
+            dec_key_remaining: 2_000_000,
+        }),
+    );
     state.push_otp_system_message(UserId(2), "bob", "OTP session started at now".to_string());
     state.on_direct_message(UserId(2), "bob".into(), MessageBody::Text("hello under the pad".into()));
 
@@ -1101,6 +1138,47 @@ fn messages_in_an_otp_active_dm_get_the_pad_prefix_but_system_lines_never_do() {
             r[..system_at].contains(OTP_ICON)
         }),
         "an app system line must never itself get the pad prefix: {rows:?}"
+    );
+}
+
+/// The pad prefix tags what actually protected a given message, not the
+/// room's current live session state - ending the session must not erase
+/// history that was genuinely encrypted under it.
+/// @requirement AC-325
+#[test]
+fn an_otp_tagged_message_keeps_its_pad_prefix_after_endotp_ends_the_session() {
+    use aloo::client::otp_cli::ContactDetail;
+
+    let mut state = joined_general_with(vec![pq_hybrid_user(2, "bob")]);
+    state.active_private_room = Some(UserId(2));
+    state.mark_otp_active(UserId(2));
+    state.set_otp_key_status(
+        UserId(2),
+        otp_status(ContactDetail {
+            enc_sequence: 0,
+            enc_offset: 0,
+            enc_key_remaining: 2_000_000,
+            dec_sequence: 0,
+            dec_offset: 0,
+            dec_key_remaining: 2_000_000,
+        }),
+    );
+    // Sent under the pad, before the session ends.
+    state.on_direct_message(UserId(2), "bob".into(), MessageBody::Text("hello under the pad".into()));
+    // Ends the live session - the compose bar's own prefix disappearing is
+    // covered elsewhere; here we only care about the message log.
+    state.clear_otp_active(UserId(2));
+    // Sent after the session ended, under plain pq_hybrid.
+    state.on_direct_message(UserId(2), "bob".into(), MessageBody::Text("plain hello after".into()));
+
+    let rows = rendered_rows(&state);
+    assert!(
+        rows.iter().any(|r| r.contains("bob: hello under the pad") && r.contains(OTP_ICON)),
+        "a message genuinely sent under OTP must keep its pad prefix even after /endotp: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|r| r.contains("bob: plain hello after") && r.contains(OTP_ICON)),
+        "a message sent after the session ended must never gain a pad prefix: {rows:?}"
     );
 }
 
@@ -1759,8 +1837,29 @@ fn the_arrow_is_coloured_by_how_far_the_message_has_got() {
 /// @requirement AC-230
 #[test]
 fn the_shield_prefix_stays_at_the_start_of_the_row() {
-    let (mut state, _) = send_dm_to_bob("under the pad");
+    use aloo::client::otp_cli::ContactDetail;
+
+    // The session (and its key-status snapshot, what `message_crypto` now
+    // reads) must be live *before* the send, so the outgoing entry is
+    // genuinely stamped as OTP-protected rather than tagged after the fact.
+    let mut state = joined_general_with(vec![pq_hybrid_user(2, "bob")]);
+    state.focus = Focus::Sidebar;
+    press(&mut state, KeyCode::Enter);
     state.mark_otp_active(UserId(2));
+    state.set_otp_key_status(
+        UserId(2),
+        otp_status(ContactDetail {
+            enc_sequence: 0,
+            enc_offset: 0,
+            enc_key_remaining: 2_000_000,
+            dec_sequence: 0,
+            dec_offset: 0,
+            dec_key_remaining: 2_000_000,
+        }),
+    );
+    state.focus = Focus::Input;
+    type_str(&mut state, "under the pad");
+    press(&mut state, KeyCode::Enter);
 
     // Ordering rather than exact columns: the pad marker is a wide glyph,
     // so per-cell reconstruction is only reliable for relative position
@@ -1860,6 +1959,8 @@ fn the_channel_selectors_envelope_is_plain_white() {
 /// @requirement AC-246
 #[test]
 fn a_pad_session_marks_every_surface_of_the_room_it_is_with() {
+    use aloo::client::otp_cli::ContactDetail;
+
     let mut state = joined_general_with(vec![pq_hybrid_user(2, "bob"), pq_hybrid_user(3, "carol")]);
     for row in [0, 1] {
         state.focus = Focus::Sidebar;
@@ -1868,6 +1969,21 @@ fn a_pad_session_marks_every_surface_of_the_room_it_is_with() {
     }
     state.mark_otp_active(UserId(2));
     state.mark_otp_active(UserId(3));
+    // The key-status snapshot must exist before the message is pushed -
+    // `message_crypto` (what the tag now reads, AC-325) only reports `Otp`
+    // once one is present, same as an active session always has in
+    // practice.
+    state.set_otp_key_status(
+        UserId(2),
+        otp_status(ContactDetail {
+            enc_sequence: 0,
+            enc_offset: 0,
+            enc_key_remaining: 2_000_000,
+            dec_sequence: 0,
+            dec_offset: 0,
+            dec_key_remaining: 2_000_000,
+        }),
+    );
     state.on_direct_message(UserId(2), "bob".into(), MessageBody::Text("under the pad".into()));
     open_dm_with(&mut state, 0);
     state.focus = Focus::Input;

@@ -1,14 +1,16 @@
 use aloo::validation::{
-    CHANNEL_NAME_MAX_LEN, CHANNEL_PASSWORD_MAX_LEN, CHANNEL_PASSWORD_SYMBOLS,
-    channel_name_is_valid, channel_password_is_valid, normalize_channel_name,
+    CHANNEL_NAME_MAX_LEN, CHANNEL_PASSWORD_MAX_LEN, CHANNEL_PASSWORD_SYMBOLS, NICKNAME_MAX_LEN,
+    channel_name_is_valid, channel_password_is_valid, nickname_is_registrable,
+    normalize_channel_name,
 };
 
 /// @requirement AC-102, TB-150
 #[test]
-fn channel_name_is_valid_accepts_letters_digits_and_hyphen() {
+fn channel_name_is_valid_accepts_letters_digits_hyphen_and_underscore() {
     assert!(channel_name_is_valid("the-hall"));
     assert!(channel_name_is_valid("Room42"));
     assert!(channel_name_is_valid("a"));
+    assert!(channel_name_is_valid("has_underscore"));
 }
 
 /// @requirement AC-102, TB-150
@@ -24,7 +26,6 @@ fn channel_name_is_valid_rejects_over_the_length_cap() {
 #[test]
 fn channel_name_is_valid_rejects_disallowed_characters() {
     assert!(!channel_name_is_valid("has space"));
-    assert!(!channel_name_is_valid("has_underscore"));
     assert!(!channel_name_is_valid("has/slash"));
     assert!(!channel_name_is_valid("emoji🌍"));
 }
@@ -112,4 +113,43 @@ fn normalize_channel_name_leaves_every_other_hash_alone() {
 fn a_normalized_name_is_one_the_server_accepts() {
     assert!(channel_name_is_valid(normalize_channel_name("#general")));
     assert!(!channel_name_is_valid("#general"));
+}
+
+// ---------------------------------------------------------------------
+// nickname_is_registrable
+// ---------------------------------------------------------------------
+
+/// @requirement TB-238
+#[test]
+fn nickname_is_registrable_accepts_letters_digits_hyphen_and_underscore() {
+    assert!(nickname_is_registrable("dave"));
+    assert!(nickname_is_registrable("Room42"));
+    assert!(nickname_is_registrable("a"));
+    assert!(nickname_is_registrable("has_under"));
+    assert!(nickname_is_registrable("has-hyph"));
+}
+
+/// @requirement TB-238
+#[test]
+fn nickname_is_registrable_rejects_disallowed_characters() {
+    assert!(!nickname_is_registrable("has space"));
+    assert!(!nickname_is_registrable("has/slash"));
+    assert!(!nickname_is_registrable("has.dot"));
+    assert!(!nickname_is_registrable("emoji🌍"));
+    assert!(!nickname_is_registrable(".."));
+}
+
+/// @requirement TB-238
+#[test]
+fn nickname_is_registrable_rejects_empty() {
+    assert!(!nickname_is_registrable(""));
+}
+
+/// @requirement TB-238
+#[test]
+fn nickname_is_registrable_rejects_over_the_length_cap() {
+    let too_long = "a".repeat(NICKNAME_MAX_LEN + 1);
+    assert!(!nickname_is_registrable(&too_long));
+    let exactly = "a".repeat(NICKNAME_MAX_LEN);
+    assert!(nickname_is_registrable(&exactly));
 }

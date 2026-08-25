@@ -385,7 +385,7 @@ fn leave_channel_still_sends_userleft_while_the_user_stays_connected() {
 fn join_channel_rejects_a_name_over_the_length_cap() {
     let mut reg = Registry::new();
     let alice = reg.register("alice".into(), vec![], KeyMode::PqHybrid);
-    let too_long = "a".repeat(22);
+    let too_long = "a".repeat(aloo::validation::CHANNEL_NAME_MAX_LEN + 1);
     let err = reg
         .join_channel(alice, &too_long, ChannelKind::Public, None, TEST_IP)
         .unwrap_err();

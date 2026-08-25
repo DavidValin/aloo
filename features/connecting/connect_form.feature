@@ -38,10 +38,10 @@ Feature: Filling in the connect form
     Given the connect form is open
     When I focus the "nickname" field
     And I type "davethegreatgatsby" into the form
-    Then the nickname is capped at 10 characters
-    And the "nickname" field contains "davethegre"
+    Then the nickname is capped at 11 characters
+    And the "nickname" field contains "davethegrea"
     When I type "x" into the form
-    Then the "nickname" field contains "davethegre"
+    Then the "nickname" field contains "davethegrea"
 
   @AC-004
   Scenario: The port field ignores anything that is not a digit
@@ -125,6 +125,17 @@ Feature: Filling in the connect form
     And I type "dave@example.com" into the form
     And I focus the "Register" field
     Then registering begins with the email I entered
+
+  @AC-270 @AC-271
+  Scenario: A successful registration opens the activation popup directly
+    Given the connect form is open
+    And the server allows registration
+    And the connect form is filled in with valid details
+    When I focus the "email" field
+    And I type "dave@example.com" into the form
+    And I focus the "Register" field
+    Then registering begins with the email I entered
+    And a successful registration opens the activation popup with "Enter the activation code you received by email"
 
   @AC-270
   Scenario: A server that does not allow registration refuses Register, in red, only when pressed

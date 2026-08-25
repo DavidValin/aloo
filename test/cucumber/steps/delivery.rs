@@ -18,6 +18,7 @@ use aloo::client::tui::ui::{
     DELIVERED_LABEL, DELIVERY_ARROW, DeliveryProof, DeliveryStatus, ENCRYPTION_LABEL, Focus,
     KEY_FILE_LABEL, KEY_LABEL, KEY_OFFSET_LABEL, KEY_SEQ_LABEL, LISTENED_LABEL, LogEntry,
     MessageBody, NO_CRYPTO_INFO, SAVED_LABEL, SENT_AT_LABEL, UNDELIVERED_LABEL, UiAction, UiState,
+    VIEWED_LABEL,
     strike_through,
 };
 use aloo::crypto::pq::PqPublicBundle;
@@ -467,14 +468,31 @@ async fn details_saved(w: &mut AlooWorld, name: String) {
     assert_popup_row_pairs(w, &name, SAVED_LABEL);
 }
 
+#[when(expr = "bob reports he viewed it")]
+async fn bob_viewed(w: &mut AlooWorld) {
+    let msg_id = last_msg_id_in_general(w);
+    w.ui_mut().mark_delivered(
+        UserId(id_for("bob")),
+        msg_id,
+        ReceiptStage::Viewed,
+        DeliveryProof::Receipt,
+    );
+    open_details_on_last_row(w);
+}
+
+#[then(expr = "the message details name {string} as DELIVERED+VIEWED")]
+async fn details_viewed(w: &mut AlooWorld, name: String) {
+    assert_popup_row_pairs(w, &name, VIEWED_LABEL);
+}
+
 #[then("the message details show no extra state")]
 async fn details_no_extra_state(w: &mut AlooWorld) {
     let rows = popup_rows(w);
     assert!(
         !rows
             .iter()
-            .any(|r| r.contains(LISTENED_LABEL) || r.contains(SAVED_LABEL)),
-        "there is no such thing as listening to, or saving, a text message; rendered:\n{}",
+            .any(|r| r.contains(LISTENED_LABEL) || r.contains(SAVED_LABEL) || r.contains(VIEWED_LABEL)),
+        "there is no such thing as listening to, saving, or previewing a text message; rendered:\n{}",
         rows.join("\n")
     );
 }

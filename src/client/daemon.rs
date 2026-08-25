@@ -115,7 +115,7 @@ impl DaemonChannel {
         let name = crate::validation::normalize_channel_name(name);
         if !crate::validation::channel_name_is_valid(name) {
             return Err(format!(
-                "{name:?} is not a usable channel name (letters, digits and - only, \
+                "{name:?} is not a usable channel name (letters, digits, '-' and '_' only, \
                  up to {} characters)",
                 crate::validation::CHANNEL_NAME_MAX_LEN
             ));
