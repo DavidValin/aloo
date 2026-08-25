@@ -47,6 +47,43 @@ fn safe_filename_falls_back_to_a_default_for_an_unusable_name() {
     assert_eq!(safe_filename(".."), "file");
     assert_eq!(safe_filename(""), "file");
     assert_eq!(safe_filename("/"), "file");
+    // Entirely dots (not the special `.`/`..` components, but a name
+    // that's still nothing once trailing dots are trimmed for Windows).
+    assert_eq!(safe_filename("..."), "file");
+}
+
+/// A sender on Linux/macOS can freely name a file after a Windows-reserved
+/// device - `File::create` on a Windows receiver would otherwise fail
+/// outright on the untouched name.
+/// @requirement TB-124
+#[test]
+fn safe_filename_neutralizes_windows_reserved_device_names() {
+    assert_eq!(safe_filename("CON"), "_CON");
+    assert_eq!(safe_filename("con"), "_con");
+    assert_eq!(safe_filename("NUL.txt"), "_NUL.txt");
+    assert_eq!(safe_filename("COM1.tar.gz"), "_COM1.tar.gz");
+    assert_eq!(safe_filename("lpt9"), "_lpt9");
+    // Not reserved: a real name that merely starts with one.
+    assert_eq!(safe_filename("console.txt"), "console.txt");
+}
+
+/// @requirement TB-124
+#[test]
+fn safe_filename_replaces_windows_illegal_characters() {
+    assert_eq!(safe_filename("a<b>.txt"), "a_b_.txt");
+    assert_eq!(safe_filename("notes|log.txt"), "notes_log.txt");
+    assert_eq!(safe_filename("what?.txt"), "what_.txt");
+    assert_eq!(safe_filename("quote\"d.txt"), "quote_d.txt");
+}
+
+/// Windows silently strips trailing dots/spaces at file-creation time;
+/// trimming them here means the saved name matches what the offer
+/// displayed instead of a silently-shortened surprise.
+/// @requirement TB-124
+#[test]
+fn safe_filename_trims_trailing_dots_and_spaces() {
+    assert_eq!(safe_filename("trailing. "), "trailing");
+    assert_eq!(safe_filename("report.pdf."), "report.pdf");
 }
 
 #[test]

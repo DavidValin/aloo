@@ -288,6 +288,39 @@ async fn a_running_daemon_is_detected_by_connecting_not_by_the_file() {
 }
 
 // ---------------------------------------------------------------------
+// The pipe (Windows)
+// ---------------------------------------------------------------------
+
+/// Windows' counterpart to `a_running_daemon_is_detected_by_connecting_not_by_the_file`
+/// above, minus that test's stale-*file* case: `bind_listener`/`connect`
+/// on Windows never read or write `_path` at all (see their doc
+/// comments) - the channel is a fixed, username-scoped named pipe, not a
+/// file at that path - so there is nothing analogous to "debris" to test.
+/// This still exercises the DACL `bind_listener` now applies
+/// (`create_owner_only_pipe_instance`) end to end: if it were too
+/// restrictive to admit even this same account, `connect` -
+/// `is_daemon_running` calls internally - would fail here exactly as it
+/// would for a real second, unauthorized account.
+/// @requirement TB-220
+#[cfg(windows)]
+#[tokio::test]
+async fn a_running_daemon_is_detected_by_connecting_windows() {
+    let path = temp_path("pipe-running");
+    assert!(
+        !daemon_ipc::is_daemon_running(&path).await,
+        "nothing is listening yet"
+    );
+
+    let listener = daemon_ipc::bind_listener(&path).unwrap();
+    assert!(
+        daemon_ipc::is_daemon_running(&path).await,
+        "the pipe's own creator must still be able to reach it"
+    );
+
+    drop(listener);
+}
+
+// ---------------------------------------------------------------------
 // Only one daemon at a time
 // ---------------------------------------------------------------------
 
@@ -315,6 +348,36 @@ async fn acquiring_records_the_pid_and_releasing_cleans_up() {
     drop(instance);
     assert!(!socket.exists(), "the socket must not outlive the daemon");
     assert!(!pid.exists(), "nor the pid file");
+}
+
+/// Windows' counterpart to the test above, minus its socket-file
+/// assertion: `SingleInstance`'s pid-file bookkeeping is plain `std::fs`
+/// with no cfg gate of its own (`client::daemon::SingleInstance`), so it
+/// behaves identically here, but Windows' `bind_listener` never creates
+/// anything at `socket` - the daemon's real channel is the named pipe
+/// (`daemon_ipc::pipe_name`), not a file at that path - so there is
+/// nothing there to assert never existed.
+/// @requirement TB-220
+#[cfg(windows)]
+#[tokio::test]
+async fn acquiring_records_the_pid_and_releasing_cleans_up_windows() {
+    let socket = temp_path("pipe-inst-sock");
+    let pid = temp_path("pipe-inst-pid");
+
+    let instance = SingleInstance::acquire(socket.clone(), pid.clone())
+        .await
+        .unwrap();
+    let listener = daemon_ipc::bind_listener(&socket).unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(&pid).unwrap().trim(),
+        std::process::id().to_string(),
+        "the pid file names this process, so a second start can report it"
+    );
+
+    drop(listener);
+    drop(instance);
+    assert!(!pid.exists(), "the pid file must not outlive the daemon");
 }
 
 /// A second daemon must refuse rather than fight over the socket - and

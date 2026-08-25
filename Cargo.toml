@@ -22,10 +22,21 @@ readme = "README.md"
 # the existing sha2 0.10/digest 0.10), so the HKDF combiner step has no version
 # friction with the rest of this file.
 [target.'cfg(target_os = "windows")'.dependencies]
-# Only for the global push-to-talk shortcut's message pump - see
-# `src/client/global_ptt.rs`. Same version `global-hotkey` itself pins, so cargo
-# resolves one copy rather than two.
-windows-sys = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation"] }
+# Win32_UI_WindowsAndMessaging: the global push-to-talk shortcut's message
+# pump (`src/client/global_ptt.rs`). Same version `global-hotkey` itself
+# pins, so cargo resolves one copy rather than two.
+# Win32_Security(_Authorization)/Win32_System_Pipes/Win32_System_Threading:
+# `src/client/daemon_ipc.rs`'s owner-only ACL on the daemon attach pipe and
+# the SID check `connect` makes on it - the Windows counterpart of the Unix
+# side's socket `0600` + uid check (see that module's doc comment).
+windows-sys = { version = "0.59", features = [
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
 
 # `voice_pulse.rs`, used only on musl (see that module's doc comment for why
 # cpal's ALSA/dlopen path can't reach PulseAudio/PipeWire from a fully static

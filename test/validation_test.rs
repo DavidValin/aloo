@@ -1,7 +1,7 @@
 use aloo::validation::{
     CHANNEL_NAME_MAX_LEN, CHANNEL_PASSWORD_MAX_LEN, CHANNEL_PASSWORD_SYMBOLS, NICKNAME_MAX_LEN,
-    channel_name_is_valid, channel_password_is_valid, nickname_is_registrable,
-    normalize_channel_name,
+    channel_name_is_valid, channel_password_is_valid, is_windows_reserved_name,
+    nickname_is_registrable, normalize_channel_name,
 };
 
 /// @requirement AC-102, TB-150
@@ -152,4 +152,41 @@ fn nickname_is_registrable_rejects_over_the_length_cap() {
     assert!(!nickname_is_registrable(&too_long));
     let exactly = "a".repeat(NICKNAME_MAX_LEN);
     assert!(nickname_is_registrable(&exactly));
+}
+
+/// The registry ships for Windows too, and a directory literally named
+/// `con`/`nul` cannot be created there at all - registering as one would
+/// break the account's own directory rather than merely mis-render.
+/// @requirement TB-238
+#[test]
+fn nickname_is_registrable_rejects_windows_reserved_device_names() {
+    assert!(!nickname_is_registrable("CON"));
+    assert!(!nickname_is_registrable("con"));
+    assert!(!nickname_is_registrable("NUL"));
+    assert!(!nickname_is_registrable("COM1"));
+    assert!(!nickname_is_registrable("lpt9"));
+    // Not reserved: a real nickname that merely starts with one.
+    assert!(nickname_is_registrable("console"));
+}
+
+// ---------------------------------------------------------------------
+// is_windows_reserved_name
+// ---------------------------------------------------------------------
+
+/// Shared by `nickname_is_registrable` above and `safe_filename`
+/// (`client::file_transfer`) - matched case-insensitively, and only as a
+/// whole component, never a prefix.
+/// @requirement TB-124, TB-238
+#[test]
+fn is_windows_reserved_name_matches_case_insensitively_and_only_the_whole_name() {
+    assert!(is_windows_reserved_name("CON"));
+    assert!(is_windows_reserved_name("con"));
+    assert!(is_windows_reserved_name("Con"));
+    assert!(is_windows_reserved_name("COM1"));
+    assert!(is_windows_reserved_name("LPT9"));
+    // Not reserved: no such device, or a mere prefix of a real one.
+    assert!(!is_windows_reserved_name("COM"));
+    assert!(!is_windows_reserved_name("COM10"));
+    assert!(!is_windows_reserved_name("console"));
+    assert!(!is_windows_reserved_name(""));
 }

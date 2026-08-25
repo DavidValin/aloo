@@ -93,3 +93,78 @@ jobs:
             echo
             head -n 12 target/traceability/traceability-matrix.md
           } >> "$GITHUB_STEP_SUMMARY"
+
+  test-windows:
+    name: Test suite and traceability (Windows)
+    runs-on: windows-latest
+    # Nearly every step below is bash script (pipefail, tee, head, the
+    # $GITHUB_STEP_SUMMARY redirect) - GitHub's windows-latest runners
+    # default `run:` to pwsh, but do ship Git Bash, so this switches the
+    # whole job rather than annotating each step.
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # No ALSA equivalent needed: cpal uses WASAPI natively on Windows
+      # (docs/BUILDING.md "Windows").
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Traceability gate
+        run: cargo trace
+
+      # otp-toolkit (github.com/DavidValin/otp-toolkit) is only ever built
+      # from source in the `test` job above, on Ubuntu - whether its
+      # Makefile-based build targets Windows at all is unverified, so that
+      # is deliberately not attempted here yet. Every Rust-level test that
+      # needs the real `otp` binary already degrades gracefully without it:
+      # `otp_cli_test.rs`'s `require_otp()` (and the same pattern in
+      # contacts_add_test.rs, contacts_test.rs, contacts_mail_refresh_test.rs,
+      # user_info_test.rs, and every otp_*_test.rs that shells out to it)
+      # checks `otp_cli::binary_available` first and skips rather than
+      # failing. The Gherkin OTP scenarios do not have that guard - their
+      # step definitions (test/cucumber/steps/otp.rs, otp_mail.rs) call the
+      # binary directly via `.expect(...)` - so `cargo bdd` is skipped here
+      # rather than run against a binary that was never installed. Revisit
+      # once otp-toolkit's own Windows support is confirmed.
+      - name: Full test suite
+        run: |
+          set -o pipefail
+          cargo test --no-fail-fast 2>&1 | tee test-output.txt
+
+      - name: Slow key-generation tests
+        run: cargo slow > ignored-output.txt 2>&1 || (cat ignored-output.txt; exit 1)
+
+      # No cucumber-results.txt to pass: cargo bdd did not run above, so
+      # every Gherkin-derived requirement reports NOT RUN here rather than
+      # PASS/FAIL - an honest reflection of what this job actually checked,
+      # not a bug. Rust-test-derived requirements still get real results.
+      - name: Regenerate reports with results
+        if: always()
+        env:
+          ALOO_TEST_RESULTS: test-output.txt:ignored-output.txt
+        run: cargo trace -- --nocapture
+
+      - name: Upload traceability reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: traceability-reports-windows
+          path: |
+            target/traceability/report.html
+            target/traceability/traceability.json
+            target/traceability/traceability-matrix.md
+
+      - name: Summarise
+        if: always()
+        run: |
+          {
+            echo "## Traceability (Windows)"
+            echo
+            head -n 12 target/traceability/traceability-matrix.md
+          } >> "$GITHUB_STEP_SUMMARY"

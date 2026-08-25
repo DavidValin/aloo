@@ -871,19 +871,25 @@ command line once any of those three sources has it.
 
 | Path | |
 |---|---|
-| `~/.aloo/daemon.sock` | the socket a terminal attaches through |
+| `~/.aloo/daemon.sock` | Unix: the socket a terminal attaches through |
 | `~/.aloo/daemon.pid` | the running daemon's process id |
 | `~/.aloo/daemon.log` | its stdout and stderr |
 
-All three are removed when it exits.
+All three are removed when it exits. Windows has no Unix domain sockets,
+so there `daemon.sock` is never created at all — the attach channel is a
+named pipe instead (`\\.\pipe\aloo-daemon-<username>`), which needs no
+file of its own to remove.
 
-> **The socket is the access control.** Anyone who can write to
-> `~/.aloo/daemon.sock` controls the session completely: they can read
-> every message in it and send voice, text and files as you. It is created
-> mode `0600`, and aloo refuses to speak to one that is not owned by the
-> user running it. This is a larger capability than reading
-> `~/.aloo/settings`, which only exposes stored secrets — see
-> `docs/SECURITY.md`.
+> **The transport is the access control.** Anyone who can reach the
+> attach channel controls the session completely: they can read every
+> message in it and send voice, text and files as you. On Unix that
+> channel is `~/.aloo/daemon.sock`, created mode `0600`, and aloo refuses
+> to speak to one that is not owned by the user running it. On Windows
+> it's the named pipe above, created with a DACL granting access to its
+> own creator alone (nobody else can even open it), and aloo likewise
+> refuses to speak to one whose owning process names a different user's
+> SID. This is a larger capability than reading `~/.aloo/settings`, which
+> only exposes stored secrets — see `docs/SECURITY.md`.
 
 ### Full example
 

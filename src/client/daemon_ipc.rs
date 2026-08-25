@@ -9,10 +9,13 @@
 //!
 //! Framing and encoding are reused wholesale from `crate::proto`
 //! (4-byte big-endian length prefix, bincode payload) rather than invented
-//! again. There is no encryption and no authentication: the socket's file
-//! permissions *are* the access control, which is why `bind_listener`
-//! creates it `0600` and `connect` refuses a socket this user does not
-//! own.
+//! again. There is no encryption and no authentication: access control
+//! *is* the transport's own permissions, on both platforms, achieved by
+//! different means - Unix's `bind_listener` creates the socket `0600` and
+//! `connect` refuses one this user does not own; Windows' `bind_listener`
+//! grants the pipe's DACL to its creator alone (SDDL `D:(A;;GA;;;OW)`) and
+//! `connect` refuses a pipe whose owning process's token names a different
+//! user's SID.
 //!
 //! ## Trust boundary
 //!
@@ -357,21 +360,229 @@ pub fn pipe_name() -> String {
     format!(r"\\.\pipe\aloo-daemon-{user}")
 }
 
+/// A security descriptor allocated by
+/// `ConvertStringSecurityDescriptorToSecurityDescriptorW`, released
+/// (`LocalFree`) on drop - the cleanup that function's own docs require of
+/// its caller.
 #[cfg(windows)]
-pub async fn connect(_path: &Path) -> io::Result<ClientStream> {
-    tokio::net::windows::named_pipe::ClientOptions::new().open(pipe_name())
+struct OwnedSecurityDescriptor(windows_sys::Win32::Security::PSECURITY_DESCRIPTOR);
+
+#[cfg(windows)]
+impl Drop for OwnedSecurityDescriptor {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` was allocated by
+        // ConvertStringSecurityDescriptorToSecurityDescriptorW below, whose
+        // docs name LocalFree as the required release.
+        unsafe {
+            windows_sys::Win32::Foundation::LocalFree(
+                self.0 as windows_sys::Win32::Foundation::HLOCAL,
+            );
+        }
+    }
 }
 
-/// The first pipe instance, which is what makes the name exist at all -
-/// `first_pipe_instance` is the flag that refuses a *second* process
-/// claiming the same name, so this is also Windows' half of the
-/// single-instance check the socket file performs on Unix. Every later
-/// instance is created by `Listener::accept`.
+/// A security descriptor whose DACL grants access to nobody but the pipe's
+/// own creator - `bind_listener`'s counterpart to the Unix side's `0600`.
+/// SDDL `"D:(A;;GA;;;OW)"`: a DACL (`D:`) with one ACE granting (`A;;`)
+/// generic-all (`GA`) to `OWNER_RIGHTS` (`OW`), SDDL's alias for "whoever
+/// creates this object" - so no SID lookup is needed to name the current
+/// user explicitly, the same way Unix's `0600` needs no uid named in it
+/// either.
+#[cfg(windows)]
+fn owner_only_security_descriptor() -> io::Result<OwnedSecurityDescriptor> {
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
+
+    let sddl: Vec<u16> = "D:(A;;GA;;;OW)\0".encode_utf16().collect();
+    let mut descriptor = std::ptr::null_mut();
+    // SAFETY: `sddl` is a valid NUL-terminated UTF-16 string for the
+    // duration of this call; `descriptor` is an out-param this API
+    // populates only when it returns nonzero, checked immediately below.
+    let ok = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(OwnedSecurityDescriptor(descriptor))
+}
+
+/// The `Sid` bytes copied out of `process`'s own token (`TOKEN_USER`, via
+/// `OpenProcessToken` + the standard two-call `GetTokenInformation` sizing
+/// dance), so the caller can compare SIDs (`EqualSid`) without keeping the
+/// token buffer itself alive.
+#[cfg(windows)]
+fn process_user_sid(process: windows_sys::Win32::Foundation::HANDLE) -> io::Result<Vec<u8>> {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Security::{
+        GetLengthSid, GetTokenInformation, OpenProcessToken, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    };
+
+    let mut token: HANDLE = std::ptr::null_mut();
+    // SAFETY: `process` is a valid, open handle for the duration of this
+    // call; `token` is an out-param populated only on success.
+    if unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let mut needed = 0u32;
+    // SAFETY: a null buffer with a zero length is the documented way to
+    // ask GetTokenInformation how large a buffer it actually needs; it
+    // always reports failure here (ERROR_INSUFFICIENT_BUFFER) by design -
+    // only the `needed` out-param this call fills in is used.
+    unsafe { GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut needed) };
+    // A `u64`-backed buffer, not `Vec<u8>`: `TOKEN_USER` holds a `PSID`
+    // pointer field, and reading one back through a buffer that isn't
+    // guaranteed pointer-aligned (a `Vec<u8>`'s allocation only promises
+    // 1-byte alignment) is undefined behavior even where it happens to
+    // work in practice.
+    let mut buf: Vec<u64> = vec![0u64; (needed as usize).div_ceil(8)];
+    // SAFETY: `buf` holds at least `needed` bytes, matching what the
+    // sizing call above reported.
+    let ok = unsafe {
+        GetTokenInformation(
+            token,
+            TokenUser,
+            buf.as_mut_ptr() as *mut core::ffi::c_void,
+            needed,
+            &mut needed,
+        )
+    };
+    // SAFETY: `token` was opened above and is closed exactly once, here,
+    // regardless of whether the call below succeeded.
+    unsafe { CloseHandle(token) };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    // SAFETY: `buf` holds a fully-populated TOKEN_USER as of the
+    // successful call above; the `Sid` it names points within that same
+    // allocation, which `buf` still owns.
+    let sid = unsafe { (*(buf.as_ptr() as *const TOKEN_USER)).User.Sid };
+    let len = unsafe { GetLengthSid(sid) };
+    // SAFETY: `sid` is the valid pointer read above (still inside `buf`,
+    // which is not dropped until this function returns), and `len` is
+    // what GetLengthSid itself reports that exact SID occupies.
+    Ok(unsafe { std::slice::from_raw_parts(sid as *const u8, len as usize) }.to_vec())
+}
+
+/// Mirrors the Unix side's `libc::getuid()` comparison in `connect` above:
+/// refuses a pipe this account did not create. Belt-and-suspenders next to
+/// `bind_listener`'s DACL the same way the Unix side keeps its uid check
+/// even though `0600` alone would ordinarily be enough - see that
+/// function's doc for why (a permissive umask can weaken a permissions-only
+/// guarantee); here, the closer analogue is a pipe name some other,
+/// unrelated program claimed first, before this account's own daemon ever
+/// started.
+#[cfg(windows)]
+fn verify_pipe_owner_is_current_user(
+    pipe: &tokio::net::windows::named_pipe::NamedPipeClient,
+) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Security::EqualSid;
+    use windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId;
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    let mut server_pid = 0u32;
+    // SAFETY: `pipe`'s handle is open and valid for the duration of this
+    // call.
+    let handle = pipe.as_raw_handle() as HANDLE;
+    if unsafe { GetNamedPipeServerProcessId(handle, &mut server_pid) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    // SAFETY: enough access to read the token below and nothing more
+    // invasive; a null return is a real failure, checked immediately.
+    let server_process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, server_pid) };
+    if server_process.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let server_sid = process_user_sid(server_process);
+    // SAFETY: closed exactly once, right after the only use of the handle
+    // opened just above.
+    unsafe { CloseHandle(server_process) };
+    let server_sid = server_sid?;
+
+    // SAFETY: GetCurrentProcess returns a pseudo-handle - always valid,
+    // and never closed (it does not name a real handle table entry).
+    let own_sid = process_user_sid(unsafe { GetCurrentProcess() })?;
+
+    // SAFETY: both slices came from a successful
+    // GetTokenInformation(TokenUser) call in process_user_sid and are held
+    // alive by `server_sid`/`own_sid` for the duration of this comparison.
+    let equal = unsafe {
+        EqualSid(
+            server_sid.as_ptr() as *mut core::ffi::c_void,
+            own_sid.as_ptr() as *mut core::ffi::c_void,
+        )
+    };
+    if equal == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "the daemon's pipe is not owned by this user",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+pub async fn connect(_path: &Path) -> io::Result<ClientStream> {
+    let stream = tokio::net::windows::named_pipe::ClientOptions::new().open(pipe_name())?;
+    verify_pipe_owner_is_current_user(&stream)?;
+    Ok(stream)
+}
+
+/// Creates one pipe instance under the DACL `owner_only_security_descriptor`
+/// builds - Windows' counterpart to Unix's `0600` - passed through tokio's
+/// raw hook rather than the plain `create`, which would leave the pipe at
+/// its OS default (Microsoft's own docs: full control to
+/// LocalSystem/Administrators/Creator-Owner, but also *read* access to
+/// Everyone - enough for another local account to observe a live session).
+///
+/// Shared by `bind_listener` (the first instance) and `Listener::accept`
+/// (every replacement instance after it, one per connection) - a named
+/// pipe's security descriptor is per-instance, not inherited from the
+/// first one, so every instance needs this applied for the hardened ACL to
+/// hold for the pipe's whole lifetime rather than only its first
+/// connection.
+#[cfg(windows)]
+fn create_owner_only_pipe_instance(
+    first: bool,
+) -> io::Result<tokio::net::windows::named_pipe::NamedPipeServer> {
+    let descriptor = owner_only_security_descriptor()?;
+    let mut attrs = windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<windows_sys::Win32::Security::SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor.0,
+        bInheritHandle: 0,
+    };
+    // SAFETY: `attrs` is a fully-initialized SECURITY_ATTRIBUTES whose
+    // `lpSecurityDescriptor` (`descriptor`) is not dropped (which would
+    // free it) until after this call returns.
+    unsafe {
+        tokio::net::windows::named_pipe::ServerOptions::new()
+            .first_pipe_instance(first)
+            .create_with_security_attributes_raw(
+                pipe_name(),
+                &mut attrs as *mut _ as *mut core::ffi::c_void,
+            )
+    }
+}
+
+/// `first_pipe_instance(true)` (inside `create_owner_only_pipe_instance`)
+/// is what refuses a *second* process claiming the same name, backstopping
+/// the single-instance check the socket file performs on Unix.
 #[cfg(windows)]
 pub fn bind_listener(_path: &Path) -> io::Result<Listener> {
-    let pending = tokio::net::windows::named_pipe::ServerOptions::new()
-        .first_pipe_instance(true)
-        .create(pipe_name())?;
+    let pending = create_owner_only_pipe_instance(true)?;
     Ok(Listener { pending })
 }
 
@@ -435,7 +646,7 @@ impl Listener {
     #[cfg(windows)]
     pub async fn accept(&mut self) -> io::Result<Stream> {
         self.pending.connect().await?;
-        let next = tokio::net::windows::named_pipe::ServerOptions::new().create(pipe_name())?;
+        let next = create_owner_only_pipe_instance(false)?;
         Ok(std::mem::replace(&mut self.pending, next))
     }
 }

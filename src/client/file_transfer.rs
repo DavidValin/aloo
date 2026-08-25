@@ -258,12 +258,61 @@ pub fn truncate_filename(name: &str) -> String {
 /// download directory (e.g. a sender naming their file `../../.bashrc` or
 /// an absolute path). Falls back to `"file"` if that yields nothing usable
 /// (an empty name, `..`, or a name that's entirely path separators).
+///
+/// Also makes the result safe to create *as a file* on Windows, regardless
+/// of which OS this binary is actually running on: a sender on Linux/macOS
+/// can freely name a file `CON`, `a<b>.txt` or `notes|log.txt` - all legal
+/// there - and without this, a Windows receiver's `File::create` on the
+/// result would simply fail, silently losing the transfer (logged, not a
+/// crash, but no rename fallback exists downstream of this call). Applied
+/// unconditionally rather than behind `#[cfg(windows)]`: a Windows-safe
+/// filename is harmless on every other OS too, and this way the behavior
+/// gets the same test coverage on every platform this suite actually runs
+/// on, rather than adding one more Windows-only path nothing exercises.
 pub fn safe_filename(name: &str) -> String {
-    Path::new(name)
+    let base = Path::new(name)
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "file".to_string())
+        .unwrap_or_else(|| "file".to_string());
+    let sanitized = sanitize_windows_filename(&base);
+    if sanitized.is_empty() {
+        "file".to_string()
+    } else {
+        sanitized
+    }
+}
+
+/// The Windows-unsafe part of `safe_filename`: replaces control bytes and
+/// `< > : " | ? *` (illegal in a Windows filename, beyond the path
+/// separators `file_name()` already stripped above) with `_`, trims
+/// trailing `.`/` ` (which Windows silently strips at creation time -
+/// trimming here up front means the name that lands in the download
+/// directory is the one the offer displayed, not a silently-shortened
+/// surprise), and prefixes a name that collides with a reserved device
+/// name (`validation::is_windows_reserved_name`, checked against the stem
+/// before any extension) with `_` so e.g. `CON.txt` becomes `_CON.txt`
+/// rather than a file Windows refuses to create at all. Can return an
+/// empty string (e.g. input was entirely `.`/space, like `"..."`) - callers
+/// must still fall back to `"file"` in that case.
+fn sanitize_windows_filename(name: &str) -> String {
+    let replaced: String = name
+        .chars()
+        .map(|c| {
+            if c.is_control() || "<>:\"|?*".contains(c) {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let trimmed = replaced.trim_end_matches(['.', ' ']);
+    let stem = trimmed.split('.').next().unwrap_or(trimmed);
+    if crate::validation::is_windows_reserved_name(stem) {
+        format!("_{trimmed}")
+    } else {
+        trimmed.to_string()
+    }
 }
 
 /// What a currently-sending (our own) file transfer is addressed to,

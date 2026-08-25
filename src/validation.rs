@@ -99,12 +99,36 @@ pub const NICKNAME_MAX_LEN: usize = 11;
 /// case-folding and normalisation questions a directory name cannot
 /// answer. The server applies this to `Auth` and `Register` alike, so an
 /// unregistrable name is refused before it ever reaches the filesystem.
+///
+/// Also excludes Windows-reserved device names (`is_windows_reserved_name`):
+/// the registry ships for Windows too (release.yml), and a directory
+/// literally named `con` or `nul` cannot be created there at all - the
+/// nickname would break its own registration rather than merely
+/// mis-rendering, so this is refused up front like every other
+/// filesystem-unsafe shape above.
 pub fn nickname_is_registrable(nickname: &str) -> bool {
     !nickname.is_empty()
         && nickname.len() <= NICKNAME_MAX_LEN
         && nickname
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        && !is_windows_reserved_name(nickname)
+}
+
+/// Windows' reserved device names - matched case-insensitively, and only as
+/// a whole component: `name` is either an entire nickname (which cannot
+/// contain `.`) or a filename's *stem*, the part before its first `.`,
+/// since Windows reserves e.g. `CON.txt` the same way it reserves bare
+/// `CON` (`safe_filename` in `client::file_transfer` passes the stem;
+/// `nickname_is_registrable` above passes the whole nickname). A real name
+/// that merely starts with one of these, e.g. `console`, is unaffected -
+/// only an exact match is reserved.
+pub fn is_windows_reserved_name(name: &str) -> bool {
+    const RESERVED: &[&str] = &[
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
+        "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    RESERVED.iter().any(|reserved| reserved.eq_ignore_ascii_case(name))
 }
 
 /// A deliberately shallow check on a registration email address: one `@`

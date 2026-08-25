@@ -144,28 +144,44 @@ server beyond a per-mail size cap: an *authenticated* client can grow the
 mail directory at will, the same server-operator-trust boundary the relay
 already has - the users registry (§5.1) is the control.
 
-**A running daemon's attach socket is a live handle on the whole session.**
+**A running daemon's attach channel is a live handle on the whole session.**
 Background mode (`aloo --daemon`, `docs/SPEC.md` "Running in background
-mode") leaves a Unix domain socket at `~/.aloo/daemon.sock` for a terminal
-to attach through. Anyone who can write to it does not merely read stored
-secrets the way `~/.aloo/settings` leaks them — they get the *live*
-session: every message in it, and the ability to send text, files and
-voice as you, to anyone you can reach. Local disk access is already out of
-scope above, but this is worth stating separately because it is a strictly
-larger capability than reading files, and because it exists only while a
-daemon is running.
+mode") leaves a local channel for a terminal to attach through: a Unix
+domain socket at `~/.aloo/daemon.sock`, or, on Windows (which has no Unix
+domain sockets), a named pipe scoped by username
+(`\\.\pipe\aloo-daemon-<user>`). Anyone who can reach it does not merely
+read stored secrets the way `~/.aloo/settings` leaks them — they get the
+*live* session: every message in it, and the ability to send text, files
+and voice as you, to anyone you can reach. Local disk/session access is
+already out of scope above, but this is worth stating separately because
+it is a strictly larger capability than reading files, and because it
+exists only while a daemon is running.
 
-What holds that line is file permissions, and nothing else: the socket is
-created `0600`, and aloo refuses to speak to one that is not owned by the
-user running it. There is no authentication on the socket itself and no
-encryption over it. That is a deliberate choice rather than an omission —
-a credential would have to be stored somewhere the same local attacker
-could read, so it would add ceremony without moving the boundary — but it
-does mean the usual caveats apply with more force than usual: another
-process running as your user, a permissive `umask` on a filesystem that
-ignores the `chmod`, or an `ALOO_HOME` pointed somewhere world-writable
-all defeat it. If you do not want that exposure, do not run a daemon; a
-foreground client opens no socket at all.
+What holds that line is the transport's own access control, and nothing
+else — achieved by different means on each platform, since neither Unix
+file permissions nor Windows ACLs exist on the other OS:
+
+- **Unix**: the socket is created `0600`, and `connect` refuses one that
+  is not owned (by uid) by the user running it. The usual caveats apply
+  with more force than usual: another process running as your user, a
+  permissive `umask` on a filesystem that ignores the `chmod`, or an
+  `ALOO_HOME` pointed somewhere world-writable all defeat it.
+- **Windows**: the pipe is created with a DACL (SDDL `D:(A;;GA;;;OW)`)
+  granting access to its own creator alone — the OS default for a named
+  pipe with no explicit security descriptor instead grants *read* access
+  to every local account, which this deliberately overrides — and
+  `connect` refuses a pipe whose owning process's token names a different
+  user's SID. The closer analogue of the Unix caveats above is a pipe
+  name some other, unrelated program claimed first, before this account's
+  own daemon ever started; another process already running as your own
+  user is an equivalent hole on both platforms.
+
+There is no authentication on the channel itself and no encryption over
+it, on either platform. That is a deliberate choice rather than an
+omission — a credential would have to be stored somewhere the same local
+attacker could read, so it would add ceremony without moving the boundary.
+If you do not want that exposure, do not run a daemon; a foreground
+client opens no channel at all.
 
 ## Assurance: how much of this is checked
 
