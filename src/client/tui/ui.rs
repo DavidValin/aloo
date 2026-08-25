@@ -1837,6 +1837,16 @@ pub enum UiAction {
         nickname: String,
         path: std::path::PathBuf,
     },
+    /// The "Add contact" popup's PQH step (`client::tui::contacts::
+    /// AddContactState`, device-pinning plan §3): the same import, but
+    /// binding directly to `device_id` - typed by the user, not learned
+    /// live - rather than the nickname's shared unbound entry
+    /// (`client::contacts::handle_pin_identity_card_for_device`).
+    PinIdentityCardForDevice {
+        nickname: String,
+        device_id: String,
+        path: std::path::PathBuf,
+    },
     /// `/daemon`: stop drawing and hand this session back to the
     /// background, leaving every connection, link and key exactly as they
     /// are (docs/SPEC.md "Running in background mode").

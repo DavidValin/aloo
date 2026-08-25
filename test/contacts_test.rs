@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use aloo::client::contacts::{
     InstallOtpKeyOutcome, OwnIdentity, PinIdentityCardOutcome, delete_contact,
     delete_contact_device, delete_otp_key, gather_contact_rows, install_otp_key,
-    otp_contact_name_for, pin_identity_card,
+    otp_contact_name_for, pin_identity_card, pin_identity_card_for_device,
 };
 use aloo::client::idstore::IdStore;
 use aloo::client::otp_cli::{self, OtpCliConfig};
@@ -817,4 +817,85 @@ fn pinning_a_second_card_overwrites_the_existing_unbound_pq_hybrid_entry_in_plac
     let expected_der = aloo::proto::encode(&second_public).unwrap();
     assert_eq!(id_store.get("alice"), Some(expected_der.as_slice()));
     assert_eq!(id_store.devices_of("alice").count(), 1, "in place, not a second row");
+}
+
+// ---------------------------------------------------------------------
+// pin_identity_card_for_device: the "Add contact" popup's PQH step
+// ---------------------------------------------------------------------
+
+/// @requirement AC-323
+#[test]
+fn pin_identity_card_for_device_binds_directly_to_the_typed_device_not_the_unbound_entry() {
+    let dir = scratch_dir("pin-card-device-ok");
+    let (path, public) = write_identity_card(&dir, "alice");
+    let mut id_store = IdStore::new_empty(dir.join("ids_store"));
+
+    let outcome = pin_identity_card_for_device(&mut id_store, "alice", "laptop", &path);
+    assert_eq!(outcome, PinIdentityCardOutcome::Ok);
+    assert_eq!(
+        id_store.get_for_device("alice", ""),
+        None,
+        "unlike pin_identity_card, this must never touch the unbound entry"
+    );
+    let expected_der = aloo::proto::encode(&public).unwrap();
+    assert_eq!(id_store.get_for_device("alice", "laptop"), Some(expected_der.as_slice()));
+    assert_eq!(id_store.key_mode("alice"), Some(KeyMode::PqHybrid));
+    assert_eq!(id_store.trust_for_device("alice", "laptop"), Some(aloo::client::idstore::Trust::Verified));
+    assert_eq!(id_store.pinned_from("alice"), Some(path.as_path()));
+}
+
+/// Add Contact only ever creates a brand-new entry - it must refuse
+/// rather than silently overwrite a device a live connection, another
+/// card, or an earlier Add Contact already pinned.
+///
+/// @requirement AC-323
+#[test]
+fn pin_identity_card_for_device_refuses_an_already_pinned_device() {
+    let dir = scratch_dir("pin-card-device-dup");
+    let (path, _public) = write_identity_card(&dir, "alice");
+    let mut id_store = IdStore::new_empty(dir.join("ids_store"));
+    id_store.pin_new_device_with_key_mode(
+        "alice",
+        "laptop",
+        b"already-here",
+        aloo::client::idstore::Trust::Tofu,
+        Some(KeyMode::PqHybrid),
+    );
+
+    let outcome = pin_identity_card_for_device(&mut id_store, "alice", "laptop", &path);
+    match outcome {
+        PinIdentityCardOutcome::Invalid(_) => {}
+        other => panic!("expected Invalid, got {other:?}"),
+    }
+    assert_eq!(
+        id_store.get_for_device("alice", "laptop"),
+        Some(b"already-here".as_slice()),
+        "the existing pin for that device must be completely untouched"
+    );
+}
+
+/// A device_id explicitly typed in Add Contact is additive, exactly like
+/// any other new device (device-pinning plan §1) - it must sit alongside
+/// an already-pinned sibling device, never disturb it.
+///
+/// @requirement AC-323
+#[test]
+fn pin_identity_card_for_device_leaves_sibling_devices_untouched() {
+    let dir = scratch_dir("pin-card-device-sibling");
+    let (path, public) = write_identity_card(&dir, "alice");
+    let mut id_store = IdStore::new_empty(dir.join("ids_store"));
+    id_store.pin_new_device_with_key_mode(
+        "alice",
+        "phone",
+        b"phones-own-key",
+        aloo::client::idstore::Trust::Tofu,
+        Some(KeyMode::PqHybrid),
+    );
+
+    let outcome = pin_identity_card_for_device(&mut id_store, "alice", "laptop", &path);
+    assert_eq!(outcome, PinIdentityCardOutcome::Ok);
+    assert_eq!(id_store.get_for_device("alice", "phone"), Some(b"phones-own-key".as_slice()));
+    let expected_der = aloo::proto::encode(&public).unwrap();
+    assert_eq!(id_store.get_for_device("alice", "laptop"), Some(expected_der.as_slice()));
+    assert_eq!(id_store.devices_of("alice").count(), 2);
 }

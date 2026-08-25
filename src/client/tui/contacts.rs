@@ -102,9 +102,11 @@ pub struct InstallOtpState {
 }
 
 /// The three keys `/contacts` tracks per contact - Left/Right on the list
-/// cycles which one is highlighted (`ContactsState::selected_key`,
-/// independent of which *row* the cursor is on), and Enter opens that
-/// row's `ContactKeyDetailState` for whichever key is currently selected.
+/// cycles which one is highlighted (`ContactsState::selected_key`), and
+/// Enter opens the selected row's `ContactKeyDetailState` for whichever key
+/// is currently selected. Selection is a genuine (row, key) grid: only the
+/// button that is both `ContactsState::selected` and `selected_key` is
+/// highlighted, never the same key across every row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContactKeyKind {
     Pqh,
@@ -178,14 +180,45 @@ pub struct ContactKeyDetailState {
     /// An imported card that didn't validate, or named the wrong nickname
     /// - shown inline, same convention as `InstallOtpState::error`.
     pub pqh_error: Option<String>,
+    /// `true` when this popup was opened from "Add contact"
+    /// (`AddContactState`) rather than Enter on an existing row - nothing
+    /// has been pinned for `(nickname, device_id)` yet, so PQH's "Create
+    /// key" must bind directly to `device_id`
+    /// (`UiAction::PinIdentityCardForDevice`) instead of the nickname's
+    /// shared unbound entry the ordinary per-row "Create key" targets,
+    /// and a successful pin must never close this popup - the whole point
+    /// of Add Contact is adding OTP/OTP MAIL right after, in one sitting.
+    pub new_contact: bool,
+}
+
+/// The "Add contact" popup (device-pinning plan §3): lets the user pin a
+/// brand-new nickname+device before ever connecting to them. Nothing is
+/// written to `id_store` just from opening or filling in this form - only
+/// actually adding a key does that (`ContactKeyDetailState::new_contact`
+/// takes over once the fields validate), so cancelling at any point
+/// (`Esc`) leaves nothing behind.
+pub struct AddContactState {
+    pub nickname: String,
+    pub device_id: String,
+    pub focus: AddContactField,
+    /// An empty/invalid field, an already-pinned `(nickname, device_id)`
+    /// pair, or nothing yet - shown inline, same convention as
+    /// `InstallOtpState::error`.
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddContactField {
+    Nickname,
+    DeviceId,
 }
 
 pub struct ContactsState {
     pub rows: Vec<ContactRow>,
     pub selected: usize,
-    /// Which key type Left/Right is currently pointing the whole list at -
-    /// independent of `selected`, so paging through rows keeps comparing
-    /// the same key across contacts.
+    /// Which key column Left/Right currently points at, within whichever
+    /// row `selected` names - together they're a (row, key) grid cursor,
+    /// so only one button in the whole list is ever highlighted at once.
     pub selected_key: ContactKeyKind,
     /// `Some` while the delete-confirmation popup is open, over the row
     /// selected when `d`/Delete was pressed.
@@ -193,6 +226,8 @@ pub struct ContactsState {
     /// `Some` while the "Install OTP key" popup is open, over the row
     /// selected when `o` was pressed.
     pub install: Option<InstallOtpState>,
+    /// `Some` while the "Add contact" popup (`a`) is open.
+    pub add_contact: Option<AddContactState>,
     /// `Some` while a key's details popup (Enter on a row) is open.
     pub detail: Option<ContactKeyDetailState>,
 }
@@ -210,6 +245,7 @@ impl UiState {
             selected_key: ContactKeyKind::Pqh,
             confirm_delete: None,
             install: None,
+            add_contact: None,
             detail: None,
         });
     }
@@ -291,6 +327,10 @@ impl UiState {
         if has_detail {
             return self.handle_contacts_detail_key(code);
         }
+        let has_add_contact = self.contacts.as_ref().map(|c| c.add_contact.is_some()).unwrap_or(false);
+        if has_add_contact {
+            return self.handle_contacts_add_key(code);
+        }
         self.handle_contacts_list_key(code)
     }
 
@@ -357,6 +397,18 @@ impl UiState {
                         confirm: None,
                         pqh_browser: None,
                         pqh_error: None,
+                        new_contact: false,
+                    });
+                }
+                None
+            }
+            KeyCode::Char('a') => {
+                if let Some(state) = self.contacts.as_mut() {
+                    state.add_contact = Some(AddContactState {
+                        nickname: String::new(),
+                        device_id: String::new(),
+                        focus: AddContactField::Nickname,
+                        error: None,
                     });
                 }
                 None
@@ -386,6 +438,100 @@ impl UiState {
             }
             _ => None,
         }
+    }
+
+    fn handle_contacts_add_key(&mut self, code: KeyCode) -> Option<UiAction> {
+        match code {
+            KeyCode::Esc => {
+                if let Some(state) = self.contacts.as_mut() {
+                    state.add_contact = None;
+                }
+                None
+            }
+            KeyCode::Tab | KeyCode::BackTab => {
+                if let Some(add) = self.contacts.as_mut().and_then(|c| c.add_contact.as_mut()) {
+                    add.focus = match add.focus {
+                        AddContactField::Nickname => AddContactField::DeviceId,
+                        AddContactField::DeviceId => AddContactField::Nickname,
+                    };
+                }
+                None
+            }
+            KeyCode::Backspace => {
+                if let Some(add) = self.contacts.as_mut().and_then(|c| c.add_contact.as_mut()) {
+                    match add.focus {
+                        AddContactField::Nickname => {
+                            add.nickname.pop();
+                        }
+                        AddContactField::DeviceId => {
+                            add.device_id.pop();
+                        }
+                    }
+                }
+                None
+            }
+            KeyCode::Char(c) => {
+                if let Some(add) = self.contacts.as_mut().and_then(|c| c.add_contact.as_mut()) {
+                    match add.focus {
+                        AddContactField::Nickname => add.nickname.push(c),
+                        AddContactField::DeviceId => add.device_id.push(c),
+                    }
+                }
+                None
+            }
+            KeyCode::Enter => self.submit_add_contact(),
+            _ => None,
+        }
+    }
+
+    /// Validates the typed nickname/device_id (same rules
+    /// `DirectPunchTarget::parse` already applies to a manually-typed
+    /// nickname+device pair: non-empty, `is_storable`) and that no row
+    /// already pins this exact `(nickname, device_id)`. On success, opens
+    /// the *same* key-details popup Enter-on-a-row does, marked
+    /// `new_contact: true` - nothing is written to `id_store` by this
+    /// step alone, only by actually adding a key from there.
+    fn submit_add_contact(&mut self) -> Option<UiAction> {
+        let (nickname, device_id) = {
+            let add = self.contacts.as_ref()?.add_contact.as_ref()?;
+            (add.nickname.clone(), add.device_id.clone())
+        };
+        let error = if nickname.is_empty() || !crate::validation::is_storable(&nickname) {
+            Some(format!("not a valid nickname: {nickname:?}"))
+        } else if device_id.is_empty() || !crate::validation::is_storable(&device_id) {
+            Some(format!("not a valid device id: {device_id:?}"))
+        } else if self
+            .contacts
+            .as_ref()?
+            .rows
+            .iter()
+            .any(|r| r.nickname == nickname && r.device_id.as_deref() == Some(device_id.as_str()))
+        {
+            Some(format!(
+                "{nickname}'s device {device_id:?} is already pinned - open that row instead"
+            ))
+        } else {
+            None
+        };
+        if let Some(message) = error {
+            if let Some(add) = self.contacts.as_mut().and_then(|c| c.add_contact.as_mut()) {
+                add.error = Some(message);
+            }
+            return None;
+        }
+        if let Some(state) = self.contacts.as_mut() {
+            state.add_contact = None;
+            state.detail = Some(ContactKeyDetailState {
+                nickname,
+                device_id: Some(device_id),
+                kind: ContactKeyKind::Pqh,
+                confirm: None,
+                pqh_browser: None,
+                pqh_error: None,
+                new_contact: true,
+            });
+        }
+        None
     }
 
     fn handle_contacts_detail_key(&mut self, code: KeyCode) -> Option<UiAction> {
@@ -439,13 +585,22 @@ impl UiState {
     /// that ran while this same popup stayed open is reflected the moment
     /// `RefreshContacts` answers, exactly the "takes effect immediately"
     /// requirement this whole popup exists for.
+    /// `None` only when there is no `detail` popup open at all to ask
+    /// about - a genuinely absent row (a brand-new contact from "Add
+    /// Contact", before any key has been pinned for it yet) answers
+    /// `Some(false)`, the same as a real row missing that one key, rather
+    /// than short-circuiting to "nothing to determine": that distinction
+    /// is exactly what lets `activate_contacts_detail_action` reach
+    /// "Create key"/"Install manually" for a contact that does not exist
+    /// in `rows` yet.
     fn contacts_detail_key_present(&self) -> Option<bool> {
         let state = self.contacts.as_ref()?;
         let detail = state.detail.as_ref()?;
-        let row = state
-            .rows
-            .iter()
-            .find(|r| r.nickname == detail.nickname && r.device_id == detail.device_id)?;
+        let Some(row) =
+            state.rows.iter().find(|r| r.nickname == detail.nickname && r.device_id == detail.device_id)
+        else {
+            return Some(false);
+        };
         Some(match detail.kind {
             ContactKeyKind::Pqh => row.key_mode == Some(KeyMode::PqHybrid),
             ContactKeyKind::Otp => row.otp.is_some(),
@@ -538,7 +693,10 @@ impl UiState {
                 None
             }
             KeyCode::Enter => {
-                let nickname = self.contacts.as_ref()?.detail.as_ref()?.nickname.clone();
+                let (nickname, device_id, new_contact) = {
+                    let detail = self.contacts.as_ref()?.detail.as_ref()?;
+                    (detail.nickname.clone(), detail.device_id.clone(), detail.new_contact)
+                };
                 let detail = self.contacts.as_mut()?.detail.as_mut()?;
                 let browser = detail.pqh_browser.as_mut()?;
                 let entry = browser.selected_entry()?;
@@ -548,7 +706,15 @@ impl UiState {
                 }
                 let path = browser.selected_path()?;
                 detail.pqh_browser = None;
-                Some(UiAction::PinIdentityCard { nickname, path })
+                if new_contact {
+                    Some(UiAction::PinIdentityCardForDevice {
+                        nickname,
+                        device_id: device_id.unwrap_or_default(),
+                        path,
+                    })
+                } else {
+                    Some(UiAction::PinIdentityCard { nickname, path })
+                }
             }
             _ => None,
         }
@@ -883,10 +1049,20 @@ struct ContactsColumns {
 /// fixed placeholder for the unbound row (device-pinning plan §3: never
 /// editable from here, only ever learned from a live connection or a
 /// pad's own device claim).
-fn device_label(device_id: &Option<String>) -> &str {
+/// A real device_id (`~/.aloo/d_id`) is a 50-character random string - far
+/// too wide for a list column - so it's cropped here, not just measured
+/// short; a test device's short, human-chosen name (e.g. "laptop") passes
+/// through unchanged.
+const DEVICE_LABEL_MAX_CHARS: usize = 10;
+
+fn device_label(device_id: &Option<String>) -> String {
     match device_id {
-        Some(id) => id,
-        None => "(unbound)",
+        Some(id) if id.chars().count() > DEVICE_LABEL_MAX_CHARS => {
+            let cropped: String = id.chars().take(DEVICE_LABEL_MAX_CHARS).collect();
+            format!("{cropped}...")
+        }
+        Some(id) => id.clone(),
+        None => "(unbound)".to_string(),
     }
 }
 
@@ -900,7 +1076,7 @@ impl ContactsColumns {
             .max(display_width("nickname") as usize);
         let device = rows
             .iter()
-            .map(|r| display_width(device_label(&r.device_id)) as usize)
+            .map(|r| display_width(&device_label(&r.device_id)) as usize)
             .max()
             .unwrap_or(0)
             .max(display_width("device") as usize);
@@ -928,21 +1104,28 @@ impl ContactsColumns {
 /// One column's gap to the next.
 const COL_GAP: usize = 2;
 
-/// The three keys' badge row, e.g. `\u{2705}PQH \u{274c}OTP \u{274c}OTP MAIL` - `selected`
-/// names whichever one `ContactsState::selected_key` currently points at,
-/// with a gray background on *every* row so it reads as "this key, across
-/// the whole list" rather than a per-row selection - deliberately never
-/// reverse-video, so it stays visible independent of the row-selection
-/// highlight (which stops before this column entirely, see
-/// `contact_row_line`).
-const KEY_BADGES_SAMPLE: &str = "\u{2705}PQH \u{2705}OTP \u{2705}OTP MAIL";
+/// Extra breathing room between the encryption column and the keys
+/// buttons, on top of `COL_GAP` - the buttons' own brackets already read
+/// as a boundary, so without this they crowd right up against
+/// "encryption"/its value.
+const KEYS_COL_EXTRA_GAP: usize = 2;
+
+/// The three keys' button row, e.g. `[\u{2705}PQH] [\u{274c}OTP] [\u{274c}OTP MAIL]` -
+/// `selected_key` is `ContactsState::selected_key`, `row_selected` is
+/// whether *this* row is `ContactsState::selected` (`i == selected` at the
+/// call site). Only the one cell that is both this row and this key gets
+/// the gray background - a genuine per-(row, key) grid cursor, `Up`/`Down`
+/// moving between rows and `Left`/`Right` moving between keys, so it's
+/// never ambiguous which device's key `Enter` is about to open.
+const KEY_BADGES_SAMPLE: &str = "[\u{2705}PQH] [\u{2705}OTP] [\u{2705}OTP MAIL]";
 
 fn push_key_badge(
     spans: &mut Vec<Span<'static>>,
     label: &'static str,
     present: bool,
     kind: ContactKeyKind,
-    selected: ContactKeyKind,
+    selected_key: ContactKeyKind,
+    row_selected: bool,
 ) {
     let (icon, color) = if present {
         ("\u{2705}", Color::Green)
@@ -950,18 +1133,23 @@ fn push_key_badge(
         ("\u{274c}", Color::Red)
     };
     let mut style = Style::default().fg(color);
-    if kind == selected {
+    if row_selected && kind == selected_key {
         style = style.bg(Color::Gray);
     }
-    spans.push(Span::styled(format!("{icon}{label}"), style));
+    spans.push(Span::styled(format!("[{icon}{label}]"), style));
 }
 
-fn push_key_badges(spans: &mut Vec<Span<'static>>, row: &ContactRow, selected: ContactKeyKind) {
-    push_key_badge(spans, "PQH", row.key_mode == Some(KeyMode::PqHybrid), ContactKeyKind::Pqh, selected);
+fn push_key_badges(
+    spans: &mut Vec<Span<'static>>,
+    row: &ContactRow,
+    selected_key: ContactKeyKind,
+    row_selected: bool,
+) {
+    push_key_badge(spans, "PQH", row.key_mode == Some(KeyMode::PqHybrid), ContactKeyKind::Pqh, selected_key, row_selected);
     spans.push(Span::raw(" "));
-    push_key_badge(spans, "OTP", row.otp.is_some(), ContactKeyKind::Otp, selected);
+    push_key_badge(spans, "OTP", row.otp.is_some(), ContactKeyKind::Otp, selected_key, row_selected);
     spans.push(Span::raw(" "));
-    push_key_badge(spans, "OTP MAIL", row.otp_mail.is_some(), ContactKeyKind::OtpMail, selected);
+    push_key_badge(spans, "OTP MAIL", row.otp_mail.is_some(), ContactKeyKind::OtpMail, selected_key, row_selected);
 }
 
 fn pad_to(spans: &mut Vec<Span<'static>>, width: usize) {
@@ -998,7 +1186,7 @@ fn header_row(columns: &ContactsColumns) -> Line<'static> {
         Style::default().add_modifier(Modifier::BOLD),
     ));
     pad_to(&mut spans, start + columns.encryption);
-    spans.push(Span::raw(" ".repeat(COL_GAP)));
+    spans.push(Span::raw(" ".repeat(COL_GAP + KEYS_COL_EXTRA_GAP)));
     spans.push(Span::styled("keys", Style::default().add_modifier(Modifier::BOLD)));
     Line::from(spans)
 }
@@ -1006,9 +1194,10 @@ fn header_row(columns: &ContactsColumns) -> Line<'static> {
 /// `row_selected` reverses only the nickname/last-seen/encryption columns -
 /// never the keys column, which is why `push_key_badges` is appended
 /// *after* that reversal is patched on, untouched by it. The keys column
-/// has its own, separate indicator (a gray background on the currently
-/// highlighted key, `push_key_badge`) that has nothing to do with which
-/// row the cursor is on.
+/// carries its own indicator instead: a gray background, but only on the
+/// one button that is both this row (`row_selected`) and the highlighted
+/// key (`selected_key`) - never on the same key in a different row, so
+/// which device's key `Enter` would open is never ambiguous.
 fn contact_row_line(
     row: &ContactRow,
     columns: &ContactsColumns,
@@ -1019,7 +1208,7 @@ fn contact_row_line(
     pad_to(&mut spans, columns.nickname);
     spans.push(Span::raw(" ".repeat(COL_GAP)));
 
-    let device_text = device_label(&row.device_id).to_string();
+    let device_text = device_label(&row.device_id);
     let device_style = if row.device_id.is_some() {
         Style::default()
     } else {
@@ -1053,7 +1242,8 @@ fn contact_row_line(
         }
     }
 
-    push_key_badges(&mut spans, row, selected_key);
+    spans.push(Span::raw(" ".repeat(KEYS_COL_EXTRA_GAP)));
+    push_key_badges(&mut spans, row, selected_key, row_selected);
 
     Line::from(spans)
 }
@@ -1070,6 +1260,10 @@ pub(crate) fn render_contacts_popup(frame: &mut Frame, area: Rect, state: &UiSta
     }
     if let Some(detail) = &contacts.detail {
         render_contact_key_detail_popup(frame, area, contacts, detail);
+        return;
+    }
+    if let Some(add) = &contacts.add_contact {
+        render_add_contact_popup(frame, area, add);
         return;
     }
 
@@ -1092,7 +1286,7 @@ pub(crate) fn render_contacts_popup(frame: &mut Frame, area: Rect, state: &UiSta
         .title(Line::from(vec![
             Span::raw("Contacts "),
             Span::styled(
-                "(\u{2190}/\u{2192}: switch key  Enter: key details  o: install OTP key  d: delete  r: refresh  Esc: close)",
+                "(\u{2190}/\u{2192}: switch key  Enter: key details  a: add contact  o: install OTP key  d: delete  r: refresh  Esc: close)",
                 Style::default().fg(Color::Cyan),
             ),
         ]))
@@ -1103,8 +1297,11 @@ pub(crate) fn render_contacts_popup(frame: &mut Frame, area: Rect, state: &UiSta
 
     if contacts.rows.is_empty() {
         frame.render_widget(
-            Paragraph::new("no contacts pinned yet - one appears the first time you connect to someone")
-                .style(Style::default().fg(Color::DarkGray)),
+            Paragraph::new(
+                "no contacts pinned yet - one appears the first time you connect to someone, \
+                 or press 'a' to add one manually",
+            )
+            .style(Style::default().fg(Color::DarkGray)),
             inner,
         );
         return;
@@ -1247,9 +1444,9 @@ fn render_contact_key_detail_popup(
     let height: u16 = if detail.confirm.is_some() {
         9
     } else if present && kind != ContactKeyKind::Pqh {
-        15
+        16
     } else {
-        11
+        12
     };
     let popup = centered_rect(72, height, area);
     let block = Block::default()
@@ -1282,8 +1479,17 @@ fn render_contact_key_detail_popup(
         return;
     }
 
+    // The list column crops a long device_id for width (`device_label`) -
+    // this popup is exactly where that ambiguity must not follow, since
+    // it is what a destructive action (delete key) or an install actually
+    // targets.
+    let device_display = match &detail.device_id {
+        Some(id) => id.as_str(),
+        None => "(unbound)",
+    };
     let mut lines: Vec<Line> = vec![
         Line::from(Span::styled(kind.explanation(), Style::default().fg(Color::Yellow))),
+        Line::from(format!("device: {device_display}")),
         Line::from(""),
     ];
     if present {
@@ -1346,6 +1552,51 @@ fn key_field_line(label: &str, value: &str, focused: bool) -> Line<'static> {
         ),
         Span::styled(value.to_string(), style),
     ])
+}
+
+fn render_add_contact_popup(frame: &mut Frame, area: Rect, add: &AddContactState) {
+    let popup = centered_rect(60, if add.error.is_some() { 10 } else { 8 }, area);
+    let block = Block::default()
+        .title("Add contact (Tab: switch field  Enter: continue  Esc: cancel)")
+        .borders(Borders::ALL);
+    let inner = block.inner(popup);
+    frame.render_widget(ratatui::widgets::Clear, popup);
+    frame.render_widget(block, popup);
+
+    let mut constraints = vec![
+        ratatui::layout::Constraint::Length(3), // explanation
+        ratatui::layout::Constraint::Length(1), // nickname
+        ratatui::layout::Constraint::Length(1), // device_id
+    ];
+    if add.error.is_some() {
+        constraints.push(ratatui::layout::Constraint::Length(1)); // spacer
+        constraints.push(ratatui::layout::Constraint::Min(1)); // error
+    }
+    let rows = ratatui::layout::Layout::default()
+        .direction(ratatui::layout::Direction::Vertical)
+        .constraints(constraints)
+        .split(inner);
+
+    frame.render_widget(
+        Paragraph::new(
+            "Pin a nickname and device before ever connecting to them, so you can \
+             attach a PQH, OTP or OTP mail key right away.",
+        )
+        .wrap(ratatui::widgets::Wrap { trim: true })
+        .style(Style::default().fg(Color::DarkGray)),
+        rows[0],
+    );
+    frame.render_widget(
+        Paragraph::new(key_field_line("nickname", &add.nickname, add.focus == AddContactField::Nickname)),
+        rows[1],
+    );
+    frame.render_widget(
+        Paragraph::new(key_field_line("device id", &add.device_id, add.focus == AddContactField::DeviceId)),
+        rows[2],
+    );
+    if let Some(err) = &add.error {
+        frame.render_widget(Paragraph::new(err.as_str()).style(Style::default().fg(Color::Red)), rows[4]);
+    }
 }
 
 fn render_install_popup(

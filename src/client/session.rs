@@ -1780,6 +1780,12 @@ async fn handle_ui_action(
             crate::client::contacts::handle_pin_identity_card(session, ui_state, nickname, path)
                 .await;
         }
+        UiAction::PinIdentityCardForDevice { nickname, device_id, path } => {
+            crate::client::contacts::handle_pin_identity_card_for_device(
+                session, ui_state, nickname, device_id, path,
+            )
+            .await;
+        }
         UiAction::Detach => {
             // Intercepted by `run_connected_session`'s input arm, which
             // owns the `Surface` this acts on. A no-op rather than an

@@ -4,7 +4,7 @@ use ui_common::*;
 
 use aloo::client::contacts::ContactRow;
 use aloo::client::file_browser::FileBrowserState;
-use aloo::client::tui::contacts::{ContactKeyKind, DeleteChoice, InstallField};
+use aloo::client::tui::contacts::{AddContactField, ContactKeyKind, DeleteChoice, InstallField};
 use aloo::client::tui::ui::{Mode, UiAction};
 use aloo::crypto::otp::OtpPurpose;
 use aloo::proto::KeyMode;
@@ -374,7 +374,10 @@ fn rendering_shows_the_header_and_every_nicknames_row() {
     let joined = body.join("\n");
     assert!(joined.contains("nickname"));
     assert!(joined.contains("device"));
-    assert!(joined.contains("test-device"), "each row's own device id (device-pinning plan §3)");
+    assert!(
+        joined.contains("test-devic..."),
+        "each row's own device id, cropped to 10 chars plus an ellipsis (device-pinning plan §3)"
+    );
     assert!(joined.contains("alice"));
     assert!(joined.contains("bob"));
     assert!(joined.contains("never"), "bob has never been seen");
@@ -494,6 +497,57 @@ fn key_badges_stay_aligned_regardless_of_nickname_length() {
     assert!(xs.windows(2).all(|w| w[0] == w[1]), "badges must line up: {body:?}");
 }
 
+/// The buffer x of the cell holding `symbol` on row `y`, scanning cells
+/// directly rather than through `popup_body`'s string - a wide emoji like
+/// `\u{2705}`/`\u{274c}` occupies two buffer cells (itself plus an empty
+/// continuation cell ratatui skips when the row is collected into a
+/// `String`), which would otherwise throw off a string-index-based x.
+fn find_cell_x(buffer: &ratatui::buffer::Buffer, y: u16, symbol: &str) -> u16 {
+    (0..buffer.area.width)
+        .find(|&x| buffer[(x, y)].symbol() == symbol)
+        .unwrap_or_else(|| panic!("{symbol:?} not found on row {y}"))
+}
+
+/// Left/Right and Up/Down together move a genuine (device, key) grid
+/// cursor: only the button that is both the selected row *and* the
+/// selected key is highlighted - never the same key across every row,
+/// which is what made it impossible to tell which device `Enter` was
+/// about to open before this fix.
+#[test]
+fn only_the_selected_devices_key_button_is_highlighted_not_the_whole_column() {
+    let mut state = joined_general_with(vec![]);
+    state.open_contacts();
+    state.set_contacts_rows(vec![
+        ContactRow { device_id: Some("laptop".into()), ..row("alice", Some(KeyMode::PqHybrid)) },
+        ContactRow { device_id: Some("phone".into()), ..row("alice", Some(KeyMode::PqHybrid)) },
+    ]);
+    press(&mut state, KeyCode::Down); // row 1 ("phone")
+    press(&mut state, KeyCode::Right); // key: Otp
+
+    let buffer = buffer_at(&state, 220, 30);
+    let (_, popup_y, _, _) = popup_rect(&buffer, "Contacts");
+    // body row 0 is the "nickname device ... keys" header (popup_y + 1);
+    // row 1 is "laptop" (row index 0, not selected); row 2 is "phone"
+    // (row index 1, selected by the `Down` above).
+    let laptop_y = popup_y + 2;
+    let phone_y = popup_y + 3;
+
+    let phone_otp_x = find_cell_x(&buffer, phone_y, "\u{274c}"); // OTP's cross, phone has no OTP key
+    let laptop_otp_x = find_cell_x(&buffer, laptop_y, "\u{274c}");
+    assert_eq!(phone_otp_x, laptop_otp_x, "the OTP badge must line up between rows");
+
+    assert_eq!(
+        buffer[(phone_otp_x, phone_y)].style().bg,
+        Some(ratatui::style::Color::Gray),
+        "the selected (phone) row's OTP button must be highlighted"
+    );
+    assert_ne!(
+        buffer[(laptop_otp_x, laptop_y)].style().bg,
+        Some(ratatui::style::Color::Gray),
+        "the laptop row's OTP button, same key column, must NOT be highlighted - only one row is selected"
+    );
+}
+
 #[test]
 fn an_empty_list_says_so_instead_of_an_empty_box() {
     let mut state = joined_general_with(vec![]);
@@ -610,6 +664,29 @@ fn the_details_popup_yellow_explanation_names_this_keys_purpose() {
     press(&mut state, KeyCode::Right); // OtpMail
     let body = popup_body(&buffer_at(&state, 160, 30), "alice").join("\n");
     assert!(body.contains("deliver Mails"), "OTP mail's own explanation: {body:?}");
+}
+
+/// The list column crops a long device_id for width (`device_label`) - the
+/// key details popup, opened for one exact device, must show it in full,
+/// since that's precisely where a cropped id would leave a destructive
+/// action (delete key) or an install ambiguous about which device it
+/// targets.
+#[test]
+fn the_details_popup_shows_the_full_uncropped_device_id() {
+    let long_device_id = "a-very-long-random-device-id-that-would-be-cropped";
+    let mut state = joined_general_with(vec![]);
+    state.open_contacts();
+    state.set_contacts_rows(vec![ContactRow { device_id: Some(long_device_id.into()), ..row("alice", None) }]);
+
+    let list_body = popup_body(&buffer_at(&state, 160, 30), "Contacts").join("\n");
+    assert!(!list_body.contains(long_device_id), "the list view should still crop it: {list_body:?}");
+
+    press(&mut state, KeyCode::Enter); // Pqh
+    let detail_body = popup_body(&buffer_at(&state, 160, 30), "alice").join("\n");
+    assert!(
+        detail_body.contains(long_device_id),
+        "the details popup must show the device id in full, not cropped: {detail_body:?}"
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -829,4 +906,200 @@ fn esc_on_the_pqh_browser_returns_to_the_details_popup() {
     assert!(state.contacts.as_ref().unwrap().detail.is_some());
 
     std::fs::remove_dir_all(&root).ok();
+}
+
+// ---------------------------------------------------------------------
+// "Add contact" (device-pinning plan §3)
+// ---------------------------------------------------------------------
+
+/// @requirement AC-323
+#[test]
+fn a_opens_the_add_contact_popup_focused_on_nickname() {
+    let mut state = joined_general_with(vec![]);
+    state.open_contacts();
+    state.set_contacts_rows(vec![]);
+    press(&mut state, KeyCode::Char('a'));
+    let add = state.contacts.as_ref().unwrap().add_contact.as_ref().expect("popup open");
+    assert_eq!(add.focus, AddContactField::Nickname);
+    assert_eq!(add.nickname, "");
+    assert_eq!(add.device_id, "");
+}
+
+/// @requirement AC-323
+#[test]
+fn tab_cycles_nickname_and_device_id_and_wraps() {
+    let mut state = joined_general_with(vec![]);
+    state.open_contacts();
+    press(&mut state, KeyCode::Char('a'));
+    assert_eq!(state.contacts.as_ref().unwrap().add_contact.as_ref().unwrap().focus, AddContactField::Nickname);
+    press(&mut state, KeyCode::Tab);
+    assert_eq!(state.contacts.as_ref().unwrap().add_contact.as_ref().unwrap().focus, AddContactField::DeviceId);
+    press(&mut state, KeyCode::Tab);
+    assert_eq!(
+        state.contacts.as_ref().unwrap().add_contact.as_ref().unwrap().focus,
+        AddContactField::Nickname,
+        "Tab from the last field wraps to the first"
+    );
+}
+
+/// @requirement AC-323
+#[test]
+fn typing_fills_in_whichever_field_is_focused() {
+    let mut state = joined_general_with(vec![]);
+    state.open_contacts();
+    press(&mut state, KeyCode::Char('a'));
+    type_str(&mut state, "alice");
+    press(&mut state, KeyCode::Tab);
+    type_str(&mut state, "laptop");
+    let add = state.contacts.as_ref().unwrap().add_contact.as_ref().unwrap();
+    assert_eq!(add.nickname, "alice");
+    assert_eq!(add.device_id, "laptop");
+}
+
+/// @requirement AC-323
+#[test]
+fn submitting_an_empty_nickname_shows_a_validation_error_and_stays_open() {
+    let mut state = joined_general_with(vec![]);
+    state.open_contacts();
+    press(&mut state, KeyCode::Char('a'));
+    let action = press(&mut state, KeyCode::Enter);
+    assert!(action.is_none());
+    let add = state.contacts.as_ref().unwrap().add_contact.as_ref().expect("still open");
+    assert!(add.error.is_some(), "an empty nickname must be refused, not silently accepted");
+}
+
+/// @requirement AC-323
+#[test]
+fn submitting_an_empty_device_id_shows_a_validation_error() {
+    let mut state = joined_general_with(vec![]);
+    state.open_contacts();
+    press(&mut state, KeyCode::Char('a'));
+    type_str(&mut state, "alice");
+    press(&mut state, KeyCode::Enter);
+    let add = state.contacts.as_ref().unwrap().add_contact.as_ref().expect("still open");
+    assert!(add.error.is_some(), "an empty device id must be refused too");
+}
+
+/// Add Contact only ever creates a brand-new entry - trying to reuse a
+/// nickname+device that's already a real row must be refused, not open a
+/// second, colliding way to edit the same pin.
+/// @requirement AC-323
+#[test]
+fn submitting_an_already_pinned_nickname_and_device_is_refused() {
+    let mut state = joined_general_with(vec![]);
+    state.open_contacts();
+    state.set_contacts_rows(vec![ContactRow { device_id: Some("laptop".into()), ..row("alice", None) }]);
+    press(&mut state, KeyCode::Char('a'));
+    type_str(&mut state, "alice");
+    press(&mut state, KeyCode::Tab);
+    type_str(&mut state, "laptop");
+    press(&mut state, KeyCode::Enter);
+    let add = state.contacts.as_ref().unwrap().add_contact.as_ref().expect("still open");
+    assert!(add.error.is_some());
+}
+
+/// Valid nickname+device_id transitions straight into the same
+/// key-details popup Enter-on-a-row opens, marked as a new contact so
+/// PQH's "Create key" knows to bind directly to this device rather than
+/// the nickname's shared unbound entry.
+/// @requirement AC-323
+#[test]
+fn valid_nickname_and_device_id_open_the_key_details_popup_as_a_new_contact() {
+    let mut state = joined_general_with(vec![]);
+    state.open_contacts();
+    press(&mut state, KeyCode::Char('a'));
+    type_str(&mut state, "alice");
+    press(&mut state, KeyCode::Tab);
+    type_str(&mut state, "laptop");
+    press(&mut state, KeyCode::Enter);
+
+    assert!(state.contacts.as_ref().unwrap().add_contact.is_none(), "the add-contact popup itself is gone");
+    let detail = state.contacts.as_ref().unwrap().detail.as_ref().expect("key details popup open");
+    assert_eq!(detail.nickname, "alice");
+    assert_eq!(detail.device_id, Some("laptop".to_string()));
+    assert_eq!(detail.kind, ContactKeyKind::Pqh);
+    assert!(detail.new_contact);
+}
+
+/// Esc at any point before a key is actually added leaves nothing behind
+/// - the whole point of gating creation on a real key, not the form.
+/// @requirement AC-323
+#[test]
+fn esc_on_the_add_contact_popup_cancels_without_creating_anything() {
+    let mut state = joined_general_with(vec![]);
+    state.open_contacts();
+    press(&mut state, KeyCode::Char('a'));
+    type_str(&mut state, "alice");
+    press(&mut state, KeyCode::Tab);
+    type_str(&mut state, "laptop");
+    press(&mut state, KeyCode::Esc);
+
+    assert!(state.contacts.as_ref().unwrap().add_contact.is_none());
+    assert!(state.contacts.as_ref().unwrap().detail.is_none());
+    assert!(state.contacts.as_ref().unwrap().rows.is_empty(), "nothing was ever pinned");
+}
+
+/// Once transitioned into the key-details popup for a new contact,
+/// selecting a card file must dispatch `PinIdentityCardForDevice` (bound
+/// to the typed device), never the ordinary `PinIdentityCard` (unbound) -
+/// otherwise the device the user explicitly typed would be silently
+/// ignored.
+/// @requirement AC-323
+#[test]
+fn selecting_a_card_for_a_new_contact_sends_pinidentitycardfordevice() {
+    let root = make_temp_file_tree();
+    let mut state = joined_general_with(vec![]);
+    state.open_contacts();
+    press(&mut state, KeyCode::Char('a'));
+    type_str(&mut state, "alice");
+    press(&mut state, KeyCode::Tab);
+    type_str(&mut state, "laptop");
+    press(&mut state, KeyCode::Enter); // -> key details, new_contact: true
+    press(&mut state, KeyCode::Enter); // Pqh "Create key" -> opens browser
+
+    {
+        let detail = state.contacts.as_mut().unwrap().detail.as_mut().unwrap();
+        let browser = detail.pqh_browser.as_mut().unwrap();
+        *browser = FileBrowserState::open(root.clone()).unwrap();
+    }
+    press(&mut state, KeyCode::Down); // subdir
+    press(&mut state, KeyCode::Down); // file.txt
+    let action = press(&mut state, KeyCode::Enter);
+
+    assert_eq!(
+        action,
+        Some(UiAction::PinIdentityCardForDevice {
+            nickname: "alice".to_string(),
+            device_id: "laptop".to_string(),
+            path: root.join("file.txt"),
+        })
+    );
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// Trying OTP before PQH exists for a new contact must open the install
+/// form the same as any other row's "not present" key does - the fix for
+/// `contacts_detail_key_present`'s `None`-on-no-row bug applies to every
+/// key kind, not just PQH. It is refused later, at submit time
+/// (`InstallOtpKeyOutcome::NotEligible`), the same as it always was for an
+/// ordinary ineligible row - never silently swallowed here.
+///
+/// @requirement AC-323
+#[test]
+fn attempting_otp_before_pqh_on_a_new_contact_opens_the_install_form_not_nothing() {
+    let mut state = joined_general_with(vec![]);
+    state.open_contacts();
+    press(&mut state, KeyCode::Char('a'));
+    type_str(&mut state, "alice");
+    press(&mut state, KeyCode::Tab);
+    type_str(&mut state, "laptop");
+    press(&mut state, KeyCode::Enter); // -> key details, new_contact: true, kind: Pqh
+    press(&mut state, KeyCode::Right); // kind: Otp
+    press(&mut state, KeyCode::Enter); // "Install manually"
+
+    let install = state.contacts.as_ref().unwrap().install.as_ref().expect("the form must open");
+    assert_eq!(install.nickname, "alice");
+    assert_eq!(install.device_id, Some("laptop".to_string()));
+    assert_eq!(install.purpose, OtpPurpose::Live);
 }

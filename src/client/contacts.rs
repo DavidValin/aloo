@@ -635,6 +635,25 @@ pub enum PinIdentityCardOutcome {
     NicknameMismatch { card_nickname: String },
 }
 
+/// Loads an identity card and checks it vouches for `nickname` - the
+/// validation `pin_identity_card` and `pin_identity_card_for_device` both
+/// need before deciding *where* to file the resulting key.
+fn load_and_verify_identity_card(nickname: &str, path: &Path) -> Result<Vec<u8>, PinIdentityCardOutcome> {
+    let card = crate::crypto::pq::load_identity_card(path)
+        .map_err(|e| PinIdentityCardOutcome::Invalid(format!("{}: {e}", path.display())))?;
+    let Some((card_nickname, bundle)) = crate::crypto::pq::open_identity_card(&card) else {
+        return Err(PinIdentityCardOutcome::Invalid(
+            "card signature does not match its own key - refusing to pin".to_string(),
+        ));
+    };
+    if card_nickname != nickname {
+        return Err(PinIdentityCardOutcome::NicknameMismatch {
+            card_nickname: card_nickname.to_string(),
+        });
+    }
+    crate::proto::encode(bundle).map_err(|e| PinIdentityCardOutcome::Invalid(format!("{e}")))
+}
+
 /// PQH's "Create key": imports an identity card (`crypto::pq::IdentityCard`,
 /// `aloo --export-identity-card`'s output) and pins it as `Verified` -
 /// the one way to attach a real `pq_hybrid` identity to a nickname before
@@ -653,23 +672,9 @@ pub fn pin_identity_card(
     nickname: &str,
     path: &Path,
 ) -> PinIdentityCardOutcome {
-    let card = match crate::crypto::pq::load_identity_card(path) {
-        Ok(card) => card,
-        Err(e) => return PinIdentityCardOutcome::Invalid(format!("{}: {e}", path.display())),
-    };
-    let Some((card_nickname, bundle)) = crate::crypto::pq::open_identity_card(&card) else {
-        return PinIdentityCardOutcome::Invalid(
-            "card signature does not match its own key - refusing to pin".to_string(),
-        );
-    };
-    if card_nickname != nickname {
-        return PinIdentityCardOutcome::NicknameMismatch {
-            card_nickname: card_nickname.to_string(),
-        };
-    }
-    let encoded = match crate::proto::encode(bundle) {
+    let encoded = match load_and_verify_identity_card(nickname, path) {
         Ok(bytes) => bytes,
-        Err(e) => return PinIdentityCardOutcome::Invalid(format!("{e}")),
+        Err(outcome) => return outcome,
     };
     // key_mode-scoped, and set atomically on the one entry it resolves
     // to (not a blind `get_for_device(nickname, "")` followed by several
@@ -678,6 +683,43 @@ pub fn pin_identity_card(
     // both sharing the empty device_id sentinel, and a card must only
     // ever touch the latter.
     id_store.pin_unbound_pq_hybrid_card(nickname, &encoded, path.to_path_buf());
+    if let Err(e) = id_store.save() {
+        crate::log_warn!("failed to save id_store: {e}");
+    }
+    PinIdentityCardOutcome::Ok
+}
+
+/// PQH's "Create key" from the "Add contact" popup (device-pinning plan
+/// §3): unlike `pin_identity_card`, this binds directly to `device_id` -
+/// something the user just typed, not something to be learned from a
+/// live connection later - rather than the nickname's shared unbound
+/// entry. Refuses if `(nickname, device_id)` is already pinned, since Add
+/// Contact only ever creates a brand-new entry and never silently
+/// overwrites one a live connection, another card, or an earlier Add
+/// Contact already produced.
+pub fn pin_identity_card_for_device(
+    id_store: &mut IdStore,
+    nickname: &str,
+    device_id: &str,
+    path: &Path,
+) -> PinIdentityCardOutcome {
+    if id_store.get_for_device(nickname, device_id).is_some() {
+        return PinIdentityCardOutcome::Invalid(format!(
+            "{nickname}'s device {device_id:?} is already pinned - open that row instead"
+        ));
+    }
+    let encoded = match load_and_verify_identity_card(nickname, path) {
+        Ok(bytes) => bytes,
+        Err(outcome) => return outcome,
+    };
+    id_store.pin_new_device_with_key_mode(
+        nickname,
+        device_id,
+        &encoded,
+        crate::client::idstore::Trust::Verified,
+        Some(KeyMode::PqHybrid),
+    );
+    id_store.set_pinned_from(nickname, device_id, path.to_path_buf());
     if let Err(e) = id_store.save() {
         crate::log_warn!("failed to save id_store: {e}");
     }
@@ -695,6 +737,38 @@ pub async fn handle_pin_identity_card(
         PinIdentityCardOutcome::Ok => {
             ui_state.push_status_notice(format!("pinned {nickname} from identity card"), true);
             ui_state.close_contacts_pqh_create();
+            handle_open(session, ui_state).await;
+            refresh_mail_recipient_check_if_open(session, ui_state, &nickname).await;
+        }
+        PinIdentityCardOutcome::Invalid(e) => {
+            ui_state.set_contacts_pqh_create_error(e);
+        }
+        PinIdentityCardOutcome::NicknameMismatch { card_nickname } => {
+            ui_state.set_contacts_pqh_create_error(format!(
+                "this card vouches for '{card_nickname}', not '{nickname}' - refusing to pin it under the wrong name"
+            ));
+        }
+    }
+}
+
+/// `UiAction::PinIdentityCardForDevice`'s handler - the "Add contact"
+/// popup's PQH step. Deliberately never closes the details popup on
+/// success, unlike `handle_pin_identity_card`: Add Contact's whole point
+/// is letting the user keep going to OTP/OTP MAIL right after, in the
+/// same popup, now that this nickname's device actually has a key.
+pub async fn handle_pin_identity_card_for_device(
+    session: &mut SessionState,
+    ui_state: &mut UiState,
+    nickname: String,
+    device_id: String,
+    path: PathBuf,
+) {
+    match pin_identity_card_for_device(&mut session.id_store, &nickname, &device_id, &path) {
+        PinIdentityCardOutcome::Ok => {
+            ui_state.push_status_notice(
+                format!("pinned {nickname}'s device {device_id:?} from identity card"),
+                true,
+            );
             handle_open(session, ui_state).await;
             refresh_mail_recipient_check_if_open(session, ui_state, &nickname).await;
         }
