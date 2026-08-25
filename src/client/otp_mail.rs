@@ -20,7 +20,7 @@ use zeroize::Zeroizing;
 use crate::client::otp_cli;
 use crate::client::otp_mail_store::{ReceivedMailRef, SentMailRef, SentMailStatus};
 use crate::client::session::SessionState;
-use crate::client::tui::otp_mail::{MailAttachment, MailboxRow};
+use crate::client::tui::otp_mail::{MailAttachment, MailDeviceOption, MailboxRow};
 use crate::client::tui::ui::UiState;
 use crate::crypto;
 use crate::crypto::otp::{
@@ -115,29 +115,28 @@ pub fn mail_gate(
     }
 }
 
-/// Runs the recipient checks for `nickname` - see `RecipientCheck`. No
-/// live connection is open at compose time, so - like `/contacts`' own
-/// naming (`client::contacts::otp_contact_name_for`) - this always names
-/// `nickname`'s most-recently-seen (or most recently pinned) device; an
-/// unbound pin (no device confirmed yet) reads as `NotPinned`, since
-/// there is no device-qualified name to derive for it yet.
-pub async fn check_recipient(session: &SessionState, nickname: &str) -> RecipientCheck {
+/// Runs the recipient checks for `(nickname, device_id)` - see
+/// `RecipientCheck`. No live connection is open at compose time, so the
+/// caller must name a device explicitly - the compose view's device
+/// selector (`ComposeState::devices`/`selected_device`,
+/// `enumerate_mail_devices`) is what picks one; this function no longer
+/// resolves "most recently seen" on its own the way it once did. A device
+/// with no pinned key at all (a stale/unknown device_id) reads as
+/// `NotPinned`.
+pub async fn check_recipient(
+    session: &SessionState,
+    nickname: &str,
+    device_id: &str,
+) -> RecipientCheck {
     let own_fp = session.own_pq_fp;
-    let Some(pinned_der) = session.id_store.get(nickname) else {
+    let Some(pinned_der) = session.id_store.get_for_device(nickname, device_id) else {
         return RecipientCheck::NotPinned;
     };
     let Some(peer_fp) = crypto::pq::fingerprint_of_encoded(pinned_der) else {
         return RecipientCheck::NotPinned;
     };
-    let Some(peer_device_id) = session
-        .id_store
-        .most_recent_device_id(nickname)
-        .filter(|d| !d.is_empty())
-    else {
-        return RecipientCheck::NotPinned;
-    };
     let contact_name =
-        crypto::otp::contact_name_for_mail(&own_fp, &session.own_device_id, &peer_fp, peer_device_id);
+        crypto::otp::contact_name_for_mail(&own_fp, &session.own_device_id, &peer_fp, device_id);
     match otp_cli::status(&session.otp_cli_cfg, &contact_name).await {
         Ok(Some(status)) => RecipientCheck::Ok {
             contact_name,
@@ -148,13 +147,85 @@ pub async fn check_recipient(session: &SessionState, nickname: &str) -> Recipien
     }
 }
 
-/// `UiAction::CheckOtpMailRecipient`'s handler.
+/// Every device `nickname` has a pinned identity for, each with whether it
+/// has a mail-purpose otp key - what populates the compose view's device
+/// selector. Skips a device pinned under the empty/unbound device_id: it
+/// can never be a valid mail target, since `contact_name_for_mail` needs a
+/// real device_id to qualify a name under. One `otp_cli::status` call per
+/// candidate device - fine since this only runs once per distinct
+/// nickname (`UiState::otp_mail_set_devices`'s memoization), never per
+/// keystroke.
+pub async fn enumerate_mail_devices(session: &SessionState, nickname: &str) -> Vec<MailDeviceOption> {
+    let own_fp = session.own_pq_fp;
+    let mut out = Vec::new();
+    for device in session.id_store.devices_of(nickname) {
+        if device.device_id.is_empty() {
+            continue;
+        }
+        let Some(peer_fp) = crypto::pq::fingerprint_of_encoded(&device.key) else {
+            continue;
+        };
+        let contact_name = crypto::otp::contact_name_for_mail(
+            &own_fp,
+            &session.own_device_id,
+            &peer_fp,
+            &device.device_id,
+        );
+        let status = otp_cli::status(&session.otp_cli_cfg, &contact_name)
+            .await
+            .ok()
+            .flatten();
+        out.push(MailDeviceOption {
+            device_id: device.device_id.clone(),
+            last_seen_unix: device.last_seen_unix,
+            contact_name,
+            has_mail_key: status.is_some(),
+            enc_key_remaining: status.map(|s| s.enc_key_remaining).unwrap_or(0),
+        });
+    }
+    out
+}
+
+/// `UiAction::CheckOtpMailRecipient`'s handler - fired on every To-field
+/// keystroke. Only re-enumerates the nickname's devices when the compose
+/// view doesn't already have them (`devices_for` mismatch, cleared
+/// alongside `check` on every edit), then re-checks against whichever
+/// device ends up selected.
 pub(crate) async fn handle_check_recipient(
     session: &mut SessionState,
     ui_state: &mut UiState,
     nickname: String,
 ) {
-    let check = check_recipient(session, &nickname).await;
+    let already_have = ui_state
+        .otp_mail
+        .as_ref()
+        .is_some_and(|m| m.compose.devices_for.as_deref() == Some(nickname.as_str()));
+    if !already_have {
+        let devices = enumerate_mail_devices(session, &nickname).await;
+        ui_state.otp_mail_set_devices(&nickname, devices);
+    }
+    let Some(device_id) = ui_state.otp_mail_selected_device_id(&nickname) else {
+        ui_state.otp_mail_set_check(&nickname, RecipientCheck::NotPinned);
+        return;
+    };
+    let check = check_recipient(session, &nickname, &device_id).await;
+    ui_state.otp_mail_set_check(&nickname, check);
+}
+
+/// `UiAction::SelectOtpMailDevice`'s handler - Up/Down inside the device
+/// selector. Only re-runs the recipient check against the newly
+/// highlighted device; the device list itself is already known, so no
+/// re-enumeration.
+pub(crate) async fn handle_select_device(
+    session: &mut SessionState,
+    ui_state: &mut UiState,
+    nickname: String,
+    device_id: String,
+) {
+    if !ui_state.otp_mail_set_selected_device(&nickname, &device_id) {
+        return;
+    }
+    let check = check_recipient(session, &nickname, &device_id).await;
     ui_state.otp_mail_set_check(&nickname, check);
 }
 
@@ -167,7 +238,13 @@ pub(crate) async fn handle_check_recipient(
 /// contact's gate, persist the local reference, and upload. On any
 /// pre-encrypt failure the compose view stays open with a notice; only a
 /// fully-sent mail closes it.
-pub(crate) async fn handle_send(
+///
+/// `pub` (not `pub(crate)`) so a test can drive it directly against a
+/// `RecordingSink` and assert on the exact wire message it produces -
+/// same rationale as `on_mail_deliver`'s own visibility
+/// (`test/otp_mail_device_test.rs`'s device-selection proof needs to see
+/// which device's contact name a send actually sealed under).
+pub async fn handle_send(
     wr: &mut impl crate::control::ControlSink,
     session: &mut SessionState,
     ui_state: &mut UiState,
@@ -191,7 +268,18 @@ pub(crate) async fn handle_send(
         );
         return Ok(());
     }
-    let check = check_recipient(session, &to).await;
+    let Some(device_id) = (mail_view.compose.devices_for.as_deref() == Some(mail_view.compose.to.as_str()))
+        .then(|| mail_view.compose.devices.get(mail_view.compose.selected_device))
+        .flatten()
+        .map(|d| d.device_id.clone())
+    else {
+        fail(
+            ui_state,
+            "OTP mail: no device selected for this recipient".to_string(),
+        );
+        return Ok(());
+    };
+    let check = check_recipient(session, &to, &device_id).await;
     let RecipientCheck::Ok {
         contact_name,
         enc_key_remaining,
@@ -651,7 +739,7 @@ pub(crate) async fn on_mail_delivered(
 /// under fresh local randomness for storage - after which the ack tells
 /// the server to delete its copy.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn on_mail_deliver(
+pub async fn on_mail_deliver(
     wr: &mut impl crate::control::ControlSink,
     session: &mut SessionState,
     ui_state: &mut UiState,
@@ -703,7 +791,7 @@ pub(crate) async fn on_mail_deliver(
         MailGate::RefuseContact => {
             ui_state.push_status_notice(
                 format!(
-                    "OTP mail from '{from}' held: it wasn't sealed for the identity pinned under that nickname"
+                    "An OTP mail from '{from}' is pending in your other device. Log in to receive it"
                 ),
                 false,
             );

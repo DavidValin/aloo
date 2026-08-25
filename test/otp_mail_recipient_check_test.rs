@@ -95,7 +95,7 @@ async fn a_live_otp_key_alone_is_not_enough_to_send_mail() {
     let (enc, dec) = make_key_pair(&cfg).await;
     otp_cli::add_contact(&cfg, &live_name, &enc, &dec).await.expect("add_contact (live)");
 
-    let check = check_recipient(&session, "bob").await;
+    let check = check_recipient(&session, "bob", "test-device").await;
     assert_eq!(
         check,
         RecipientCheck::NoMailKey,
@@ -116,7 +116,7 @@ async fn a_mail_key_installed_under_its_own_name_lets_mail_through() {
     let (enc, dec) = make_key_pair(&cfg).await;
     otp_cli::add_contact(&cfg, &mail_name, &enc, &dec).await.expect("add_contact (mail)");
 
-    let check = check_recipient(&session, "bob").await;
+    let check = check_recipient(&session, "bob", "test-device").await;
     match check {
         RecipientCheck::Ok { contact_name, .. } => assert_eq!(contact_name, mail_name),
         other => panic!("expected Ok against the mail key, got {other:?}"),
@@ -143,7 +143,7 @@ async fn having_both_keys_still_resolves_to_the_mail_key_specifically() {
     let (mail_enc, mail_dec) = make_key_pair(&mail_cfg).await;
     otp_cli::add_contact(&cfg, &mail_name, &mail_enc, &mail_dec).await.expect("add_contact (mail)");
 
-    let check = check_recipient(&session, "bob").await;
+    let check = check_recipient(&session, "bob", "test-device").await;
     match check {
         RecipientCheck::Ok { contact_name, .. } => {
             assert_eq!(contact_name, mail_name, "mail must resolve to its own key, not the live one")

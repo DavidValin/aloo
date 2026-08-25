@@ -83,9 +83,11 @@ async fn installing_and_deleting_the_mail_key_refreshes_an_open_composes_recipie
     ui.otp_mail.as_mut().unwrap().compose.to = "bob".to_string();
 
     // Seeds the initial check exactly as the real `CheckOtpMailRecipient`
-    // wiring would the moment "bob" was typed (`otp_mail::handle_check_recipient`
-    // is `pub(crate)`; this is its exact body, inlined for an external test).
-    let check = check_recipient(&session, "bob").await;
+    // wiring would the moment "bob" was typed and its one pinned device
+    // ("test-device") was selected (`otp_mail::handle_check_recipient` is
+    // `pub(crate)` and additionally enumerates devices, which this test
+    // doesn't need to exercise - it seeds the resulting check directly).
+    let check = check_recipient(&session, "bob", "test-device").await;
     ui.otp_mail_set_check("bob", check);
     assert_eq!(
         ui.otp_mail.as_ref().unwrap().compose.check,
@@ -154,7 +156,7 @@ async fn installing_a_mail_key_does_not_refresh_a_compose_open_for_someone_else(
     let mut ui = UiState::new("me".into());
     ui.open_otp_mail();
     ui.otp_mail.as_mut().unwrap().compose.to = "carol".to_string();
-    let check = check_recipient(&session, "carol").await;
+    let check = check_recipient(&session, "carol", "test-device").await;
     ui.otp_mail_set_check("carol", check);
     assert_eq!(ui.otp_mail.as_ref().unwrap().compose.check, Some(RecipientCheck::NoMailKey));
 

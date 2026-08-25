@@ -311,6 +311,60 @@ fn on_mail_fetch_delivers_pending_and_receipts() {
     );
 }
 
+/// The server has no way to tell which of a nickname's devices a mail was
+/// actually sealed for (`contact_name` is opaque to it) - so it must keep
+/// offering the same still-pending mail on every fetch, whichever device
+/// happens to be connected, until a genuine `OtpMailAck` arrives. A wrong
+/// device that received but could not decrypt/ack it must see the mail
+/// handed straight back out again, not silently dropped or marked-tried.
+/// @requirement AC-335
+#[test]
+fn on_mail_fetch_redelivers_the_same_pending_mail_until_acked() {
+    let t = TempStore::new("redeliver");
+    let mut reg = Registry::new();
+    let bob = reg.register("bob".into(), vec![2], KeyMode::PqHybrid);
+    let m = mail(0x0f, "alice", "bob", 0);
+    t.store.store(&m).unwrap();
+
+    let first = mail::on_mail_fetch(&reg, &t.store, bob);
+    assert!(
+        matches!(&first[0].message, ServerMessage::OtpMailDeliver { mail_id, .. } if *mail_id == m.mail_id),
+        "got {:?}",
+        first
+    );
+
+    // No ack sent in between - simulating a device that received it but
+    // could not decrypt/ack it (a mail sealed for a different device).
+    let second = mail::on_mail_fetch(&reg, &t.store, bob);
+    assert!(
+        matches!(&second[0].message, ServerMessage::OtpMailDeliver { mail_id, .. } if *mail_id == m.mail_id),
+        "the same still-pending mail must be handed out again, got {:?}",
+        second
+    );
+}
+
+/// The direct counterpart of the above: a mere delivery attempt, with no
+/// ack, must never remove the mail from storage - only a genuine
+/// `OtpMailAck` from the registered recipient nickname does
+/// (`on_mail_ack_notifies_a_connected_sender`, below).
+/// @requirement AC-335
+#[test]
+fn a_delivery_attempt_alone_never_removes_a_pending_mail() {
+    let t = TempStore::new("attempt-not-consume");
+    let mut reg = Registry::new();
+    let bob = reg.register("bob".into(), vec![2], KeyMode::PqHybrid);
+    let m = mail(0x10, "alice", "bob", 0);
+    t.store.store(&m).unwrap();
+
+    let _ = mail::on_mail_fetch(&reg, &t.store, bob);
+
+    assert_eq!(
+        t.store.pending_for("bob"),
+        vec![m],
+        "a mere delivery attempt must not remove the mail from storage"
+    );
+}
+
 /// @requirement AC-161
 #[test]
 fn on_mail_ack_notifies_a_connected_sender() {

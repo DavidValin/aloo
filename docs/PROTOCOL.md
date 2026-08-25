@@ -2652,7 +2652,11 @@ to one device's entry rather than the nickname as a whole:
      someone not yet trusted.
    - Their sidebar entry renders red, taking priority over the usual
      green/offline-gray coloring.
-3. On `Accept` (`session.rs::handle_ui_action`'s `AcceptIdentity` arm):
+3. On `Accept` (`session::accept_identity_review` -
+   extracted from `handle_ui_action`'s `AcceptIdentity` arm so it is
+   directly unit-testable against a hand-built session/UI pair, since the
+   live two-daemon test harness cannot model two distinct devices for one
+   nickname in a single run):
    pins the new key **for this connection's specific device only**
    (`IdStore::replace_device_key` if this device already had an entry,
    `pin_new_device` - additive - if it didn't), records the address/device
@@ -2693,6 +2697,33 @@ pinned for that device is likewise silent and writes nothing (nothing
 changed, so there's nothing to persist). Only a genuine byte difference
 against every device sharing this `key_mode` reaches the review flow
 above.
+
+**What `Accept` touches, and what it deliberately leaves alone.**
+`accept_identity_review`'s only state changes are to `id_store` (the
+additive pin above) and the UI's identity-review queue (lifting the trust
+gate) - nothing else needs updating, for two separate reasons:
+
+- **Channel/DM encryption never needed a separate update in the first
+  place.** `known_users`/`channel.members` (`recipients_for_channel:216`)
+  already hold whichever key that connection actually
+  announced, set once at `UserJoined` time - *before* `check_identity` can
+  even open a review - so a send immediately after `Accept` already
+  encrypts to the live new-device key, not because `Accept` changed
+  anything about how sends resolve a key, but because there was never a
+  separate, staler copy of it anywhere to begin with. The same is true of
+  `/info`/`i` (`client::contacts::handle_request_user_info`),
+  which reads the live `session.peer_device_ids` for that exact
+  connection, never `id_store` - it shows a freshly-accepted device
+  correctly whether or not the review has been resolved yet.
+- **An `/otp` session is a disjoint piece of state.** OTP/OTP-mail
+  keychain names are device-qualified (§16.1.2/§17.1, folding in both
+  sides' own `(fingerprint, device_id)`) - an entirely different keyspace
+  from `id_store`'s pinning, computed independently of it. `Accept` never
+  reads or writes `otp_store`, so a session already running under an old
+  device is left completely untouched - same pad, same contact name, same
+  keychain slot - by a new device being accepted for the *same* nickname's
+  `pq_hybrid` identity. A fresh `/otp` is still required for the new
+  device; only the ordinary `pq_hybrid` messaging moves over automatically.
 
 ### 12.5 Store format and location
 
@@ -4746,21 +4777,36 @@ finished live voice message holds), and zero or more file attachments
 (name plus bytes, carried *inside* the sealed blob - unlike a live
 transfer there is no separate streamed phase).
 
-Two preconditions decide whether a recipient nickname is writable at all,
-checked live as the field is typed:
+**The device selector.** A pinned nickname may name more than one device
+(§12's per-`(nickname, device_id)` pinning); rather than silently guessing
+which one to address, the compose view lists every one of the nickname's
+pinned devices in a row below To, each with a check or cross for whether
+it carries a mail key, and lets the user pick explicitly with Up/Down.
+The default is the most-recently-seen device that actually has a mail
+key - falling back to the most-recently-seen device overall only if none
+does, so the hard gate below still explains why - and every check
+(remaining key, attach budget, Send) runs against whichever device is
+currently selected, never an implicit guess. `client::otp_mail::
+enumerate_mail_devices` gathers the list once per distinct nickname
+(never per keystroke); `check_recipient` itself no longer resolves a
+device on its own at all - every call now names one explicitly.
 
-1. **A pinned user with that nickname** (§12) whose pinned key is a
+Two preconditions decide whether the selected `(nickname, device)` pair is
+writable at all, checked live as the field is typed or the selection
+moves:
+
+1. **A pinned device under that nickname** (§12) whose pinned key is a
    `pq_hybrid` bundle - the pin is what the mail's addressing and
    verification anchor to, not the nickname string.
-2. **An `otp` keychain contact under mail's own, independent contact name**
-   (§16.1.1 - never the live session's name, even when both exist for the
-   same pair), whose encryption key has **more bytes remaining than the
-   whole encoded mail**. The compose view shows the remaining key (in MB)
-   and re-derives it continuously as text is typed and
-   recordings/attachments are added or removed; an attachment that would
-   not fit the remaining key is refused at the moment of attaching, and
-   the send path re-measures the real encoded size before any pad is
-   spent.
+2. **An `otp` keychain contact under mail's own, independent, per-device
+   contact name** (§16.1.1 - never the live session's name, even when
+   both exist for the same device pair), whose encryption key has **more
+   bytes remaining than the whole encoded mail**. The compose view shows
+   the remaining key (in MB) and re-derives it continuously as text is
+   typed and recordings/attachments are added or removed; an attachment
+   that would not fit the remaining key is refused at the moment of
+   attaching, and the send path re-measures the real encoded size before
+   any pad is spent.
 
 There is no key-material negotiation here: if no mail key exists for the
 pair, the answer is `/new-otp-mail-key` (§16.1.1), never `/otp` - a live
@@ -4873,6 +4919,19 @@ apply with full force here:
    contact would consume the wrong pad range and corrupt the contact.
    The same holds when `from` isn't pinned at all: the mail waits until
    the identity question is resolved, exactly as §12 holds live traffic.
+   This is also what makes addressing a specific device (§17.1) safe on a
+   nickname connected from a *different* one than the mail was sealed for:
+   the server has no notion of devices at all (`contact_name` is an opaque
+   routing string to it, `StoredMail` carries no `device_id`), so it keeps
+   handing the same still-pending mail back out on every future
+   `OtpMailFetch`/immediate push, whichever device happens to be
+   connected, until the one that actually derives a matching contact name
+   connects and genuinely acknowledges it. (The receiver's own side of
+   this derivation still resolves the *sender's* device as
+   most-recently-seen rather than per-mail - a separate, orthogonal, and
+   for now untouched limitation: §17.1's selector lets the sender choose
+   which of the *recipient's* devices to address, it does not yet let a
+   multi-device sender be disambiguated on receive.)
 3. **The sequence guard**: only the exact next expected `seq` for the
    contact may reach the pad. A lower one re-acknowledges (already
    consumed); a higher one waits - an earlier spend is still in flight

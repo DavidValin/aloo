@@ -33,12 +33,32 @@ use super::ui::{
 };
 
 /// Which part of the compose form has focus - Tab cycles in this order.
+/// `Device` is only ever a stop on that cycle while `ComposeState::devices`
+/// is non-empty (`handle_mail_compose_key`) - an unpinned or
+/// not-yet-checked recipient has nothing to select, so Tab skips straight
+/// from `To` to `Subtext`, exactly as it always has.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MailFocus {
     To,
+    Device,
     Subtext,
     Content,
     Attachments,
+}
+
+/// One device of the To field's resolved nickname, and whether it has a
+/// mail-purpose otp key - what the device selector row lists
+/// (`UiState::otp_mail_set_devices`, `client::otp_mail::enumerate_mail_devices`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct MailDeviceOption {
+    pub device_id: String,
+    pub last_seen_unix: Option<u64>,
+    /// `crypto::otp::contact_name_for_mail`'s output for `(own, this
+    /// device)` - what `check_recipient`/`handle_send` actually seal
+    /// under once this device is selected.
+    pub contact_name: String,
+    pub has_mail_key: bool,
+    pub enc_key_remaining: u64,
 }
 
 /// One attachment on a mail being composed. A file's bytes are *not* read
@@ -97,16 +117,27 @@ impl MailConfirmChoice {
 /// check result lands in `check`) and the live pad budget derived from it.
 pub struct ComposeState {
     pub to: String,
+    /// Every device `to` resolves to that carries a pinned identity -
+    /// gathered once per distinct nickname (`devices_for` is the memo
+    /// key), never re-enumerated per keystroke while it stays the same.
+    /// Empty until `to` resolves to at least one pinned device.
+    pub devices: Vec<MailDeviceOption>,
+    /// The nickname `devices` was last gathered for - `None`, or stale
+    /// (not equal to `to`) after an edit, is what tells
+    /// `UiState::otp_mail_set_devices`'s caller a fresh enumeration is
+    /// actually needed instead of reusing what's already here.
+    pub devices_for: Option<String>,
+    /// Index into `devices` - meaningless while `devices` is empty.
+    pub selected_device: usize,
     pub subtext: String,
     pub content: String,
     pub attachments: Vec<MailAttachment>,
     pub selected_attachment: usize,
     pub focus: MailFocus,
-    /// The latest recipient check for `to` - `None` until the first edit
-    /// (or while `to` is empty). Set by `session` via
-    /// `UiState::otp_mail_set_check` in response to
-    /// `UiAction::CheckOtpMailRecipient`, which every keystroke in the To
-    /// field emits.
+    /// The latest recipient check for `to`, against whichever device is
+    /// currently selected - `None` until the first edit (or while `to` is
+    /// empty). Set by `session` via `UiState::otp_mail_set_check` in
+    /// response to `UiAction::CheckOtpMailRecipient`/`SelectOtpMailDevice`.
     pub check: Option<RecipientCheck>,
     /// `Some` while the attach-a-file browser popup is open.
     pub browser: Option<FileBrowserState>,
@@ -122,6 +153,9 @@ impl ComposeState {
     fn new() -> Self {
         Self {
             to: String::new(),
+            devices: Vec::new(),
+            devices_for: None,
+            selected_device: 0,
             subtext: String::new(),
             content: String::new(),
             attachments: Vec::new(),
@@ -278,6 +312,75 @@ impl UiState {
         {
             mail.compose.check = Some(check);
         }
+    }
+
+    /// Applies a freshly gathered device list - only if the To field still
+    /// holds `nickname` (the same stale-edit guard `otp_mail_set_check`
+    /// uses). Picks the default selection: the most-recently-seen device
+    /// that actually has a mail key, or - if none does - the
+    /// most-recently-seen device overall, so the existing `NoMailKey` gate
+    /// still explains why rather than the selector silently landing on an
+    /// arbitrary row.
+    pub fn otp_mail_set_devices(&mut self, nickname: &str, devices: Vec<MailDeviceOption>) {
+        let Some(mail) = self.otp_mail.as_mut() else {
+            return;
+        };
+        if mail.compose.to != nickname {
+            return;
+        }
+        let default_idx = devices
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d.has_mail_key)
+            .max_by_key(|(_, d)| (d.last_seen_unix.is_some(), d.last_seen_unix.unwrap_or(0)))
+            .map(|(i, _)| i)
+            .or_else(|| {
+                devices
+                    .iter()
+                    .enumerate()
+                    .max_by_key(|(_, d)| (d.last_seen_unix.is_some(), d.last_seen_unix.unwrap_or(0)))
+                    .map(|(i, _)| i)
+            })
+            .unwrap_or(0);
+        mail.compose.devices = devices;
+        mail.compose.devices_for = Some(nickname.to_string());
+        mail.compose.selected_device = default_idx;
+    }
+
+    /// The currently selected device's id for `nickname` - `None` if the
+    /// gathered list is stale (a different/no nickname) or empty.
+    pub fn otp_mail_selected_device_id(&self, nickname: &str) -> Option<String> {
+        let mail = self.otp_mail.as_ref()?;
+        if mail.compose.devices_for.as_deref() != Some(nickname) {
+            return None;
+        }
+        mail.compose
+            .devices
+            .get(mail.compose.selected_device)
+            .map(|d| d.device_id.clone())
+    }
+
+    /// Moves the device selection to `device_id`, if the gathered list is
+    /// current for `nickname` and actually names it. Returns whether it
+    /// did - `false` leaves the selection untouched (the caller then has
+    /// nothing to re-check).
+    pub fn otp_mail_set_selected_device(&mut self, nickname: &str, device_id: &str) -> bool {
+        let Some(mail) = self.otp_mail.as_mut() else {
+            return false;
+        };
+        if mail.compose.devices_for.as_deref() != Some(nickname) {
+            return false;
+        }
+        let Some(idx) = mail
+            .compose
+            .devices
+            .iter()
+            .position(|d| d.device_id == device_id)
+        else {
+            return false;
+        };
+        mail.compose.selected_device = idx;
+        true
     }
 
     /// Adds a finished voice recording as an attachment - `false` (nothing
@@ -664,8 +767,11 @@ impl UiState {
                 return None;
             }
             KeyCode::Tab => {
+                let has_devices = !compose.devices.is_empty();
                 compose.focus = match compose.focus {
+                    MailFocus::To if has_devices => MailFocus::Device,
                     MailFocus::To => MailFocus::Subtext,
+                    MailFocus::Device => MailFocus::Subtext,
                     MailFocus::Subtext => MailFocus::Content,
                     MailFocus::Content => MailFocus::Attachments,
                     MailFocus::Attachments => MailFocus::To,
@@ -673,8 +779,11 @@ impl UiState {
                 return None;
             }
             KeyCode::BackTab => {
+                let has_devices = !compose.devices.is_empty();
                 compose.focus = match compose.focus {
                     MailFocus::To => MailFocus::Attachments,
+                    MailFocus::Device => MailFocus::To,
+                    MailFocus::Subtext if has_devices => MailFocus::Device,
                     MailFocus::Subtext => MailFocus::To,
                     MailFocus::Content => MailFocus::Subtext,
                     MailFocus::Attachments => MailFocus::Content,
@@ -690,17 +799,51 @@ impl UiState {
                     compose.to.push(c);
                     let nickname = compose.to.clone();
                     compose.check = None;
+                    compose.devices.clear();
+                    compose.devices_for = None;
+                    compose.selected_device = 0;
                     Some(UiAction::CheckOtpMailRecipient { nickname })
                 }
                 KeyCode::Backspace => {
                     compose.to.pop();
                     compose.check = None;
+                    compose.devices.clear();
+                    compose.devices_for = None;
+                    compose.selected_device = 0;
                     if compose.to.is_empty() {
                         None
                     } else {
                         let nickname = compose.to.clone();
                         Some(UiAction::CheckOtpMailRecipient { nickname })
                     }
+                }
+                _ => None,
+            },
+            MailFocus::Device => match code {
+                KeyCode::Up => {
+                    let before = compose.selected_device;
+                    compose.selected_device = compose.selected_device.saturating_sub(1);
+                    (compose.selected_device != before)
+                        .then(|| compose.devices.get(compose.selected_device))
+                        .flatten()
+                        .map(|d| UiAction::SelectOtpMailDevice {
+                            nickname: compose.to.clone(),
+                            device_id: d.device_id.clone(),
+                        })
+                }
+                KeyCode::Down => {
+                    let before = compose.selected_device;
+                    if !compose.devices.is_empty() {
+                        compose.selected_device =
+                            (compose.selected_device + 1).min(compose.devices.len() - 1);
+                    }
+                    (compose.selected_device != before)
+                        .then(|| compose.devices.get(compose.selected_device))
+                        .flatten()
+                        .map(|d| UiAction::SelectOtpMailDevice {
+                            nickname: compose.to.clone(),
+                            device_id: d.device_id.clone(),
+                        })
                 }
                 _ => None,
             },
@@ -852,6 +995,17 @@ pub(crate) fn format_mb(bytes: u64) -> String {
     format!("{:.2} MB", bytes as f64 / (1024.0 * 1024.0))
 }
 
+/// Shortens a device id (50 hex characters, `client::device_id::generate`)
+/// to its first 12 for the device selector's compact row - same
+/// "still effectively unique for telling entries apart at a glance"
+/// rationale `session::short_fingerprint` already uses for fingerprints.
+fn short_device_id(id: &str) -> String {
+    match id.get(..12) {
+        Some(prefix) if prefix.len() < id.len() => format!("{prefix}\u{2026}"),
+        _ => id.to_string(),
+    }
+}
+
 /// Short UTC render of a unix timestamp for mailbox rows and the reader
 /// header - always UTC and labeled as such, since `SendAtInUTC` is the
 /// field's own contract.
@@ -896,6 +1050,7 @@ pub(crate) fn render_otp_mail_view(frame: &mut Frame, area: Rect, state: &UiStat
         .constraints([
             Constraint::Length(1), // header
             Constraint::Length(3), // to
+            Constraint::Length(5), // device (up to 3 rows visible)
             Constraint::Length(3), // subtext
             Constraint::Min(5),    // content
             Constraint::Length(6), // attachments
@@ -956,13 +1111,60 @@ pub(crate) fn render_otp_mail_view(frame: &mut Frame, area: Rect, state: &UiStat
     }
     frame.render_widget(Paragraph::new(Line::from(to_line)).block(to_block), rows[1]);
 
+    // Device selector: which of the resolved nickname's pinned devices
+    // the mail is sealed for. Height is always reserved (never collapses
+    // to zero) so the view doesn't jump around while the nickname is
+    // still being typed/checked; before any devices are known it shows a
+    // dim placeholder instead of an empty list.
+    let device_block = Block::default()
+        .title("Device")
+        .borders(Borders::ALL)
+        .border_style(focus_border_style(compose.focus == MailFocus::Device));
+    let device_inner = device_block.inner(rows[2]);
+    frame.render_widget(device_block, rows[2]);
+    if compose.devices.is_empty() {
+        frame.render_widget(
+            Paragraph::new(if compose.to.is_empty() {
+                "(type a recipient above)"
+            } else {
+                "(no pinned devices for this recipient)"
+            })
+            .style(Style::default().fg(Color::DarkGray)),
+            device_inner,
+        );
+    } else {
+        let items: Vec<ListItem> = compose
+            .devices
+            .iter()
+            .map(|d| {
+                let (badge, badge_color) = if d.has_mail_key {
+                    ("\u{2705}", Color::Green)
+                } else {
+                    ("\u{274C}", Color::Red)
+                };
+                let seen = super::contacts::format_last_seen(d.last_seen_unix);
+                ListItem::new(Line::from(vec![
+                    Span::raw(format!("{}  last seen {seen}  ", short_device_id(&d.device_id))),
+                    Span::styled(badge, Style::default().fg(badge_color)),
+                ]))
+            })
+            .collect();
+        let list =
+            List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+        let mut list_state = ListState::default();
+        if compose.focus == MailFocus::Device {
+            list_state.select(Some(compose.selected_device.min(compose.devices.len() - 1)));
+        }
+        frame.render_stateful_widget(list, device_inner, &mut list_state);
+    }
+
     let subtext_block = Block::default()
         .title("Subtext")
         .borders(Borders::ALL)
         .border_style(focus_border_style(compose.focus == MailFocus::Subtext));
     frame.render_widget(
         Paragraph::new(compose.subtext.clone()).block(subtext_block),
-        rows[2],
+        rows[3],
     );
 
     let content_block = Block::default()
@@ -973,7 +1175,7 @@ pub(crate) fn render_otp_mail_view(frame: &mut Frame, area: Rect, state: &UiStat
         Paragraph::new(compose.content.clone())
             .wrap(Wrap { trim: false })
             .block(content_block),
-        rows[3],
+        rows[4],
     );
 
     let attach_title = if state.recording {
@@ -985,8 +1187,8 @@ pub(crate) fn render_otp_mail_view(frame: &mut Frame, area: Rect, state: &UiStat
         .title(attach_title)
         .borders(Borders::ALL)
         .border_style(focus_border_style(compose.focus == MailFocus::Attachments));
-    let inner = attach_block.inner(rows[4]);
-    frame.render_widget(attach_block, rows[4]);
+    let inner = attach_block.inner(rows[5]);
+    frame.render_widget(attach_block, rows[5]);
     let items: Vec<ListItem> = compose
         .attachments
         .iter()
@@ -1006,10 +1208,10 @@ pub(crate) fn render_otp_mail_view(frame: &mut Frame, area: Rect, state: &UiStat
 
     frame.render_widget(
         Paragraph::new(
-            " Tab: next field \u{2502} a: attach file \u{2502} hold Space (in attachments): record voice \u{2502} Enter: play voice \u{2502} d: remove \u{2502} Ctrl+S: send \u{2502} Esc: discard",
+            " Tab: next field \u{2502} a: attach file \u{2502} hold Space (in attachments): record voice \u{2502} Enter: play voice \u{2502} d: remove \u{2502} Up/Down (device): choose which device to address \u{2502} Ctrl+S: send \u{2502} Esc: discard",
         )
         .style(Style::default().fg(Color::DarkGray)),
-        rows[5],
+        rows[6],
     );
 
     if let Some(browser) = &compose.browser {

@@ -499,6 +499,15 @@ async fn refresh_mail_recipient_check_if_open(
         .map(|m| m.compose.to.clone())
         .filter(|to| to == nickname);
     if let Some(to) = composing_to {
+        // Force a fresh device enumeration rather than trusting
+        // `handle_check_recipient`'s per-keystroke memoization
+        // (`devices_for == to` would still match here, since the
+        // nickname itself hasn't changed) - what actually changed is a
+        // device's key availability on disk, exactly what a stale
+        // `devices` list would miss.
+        if let Some(mail) = ui_state.otp_mail.as_mut() {
+            mail.compose.devices_for = None;
+        }
         crate::client::otp_mail::handle_check_recipient(session, ui_state, to).await;
     }
 }

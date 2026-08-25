@@ -1207,6 +1207,79 @@ pub(crate) async fn send_if_server(
     wr.send_control(msg).await
 }
 
+/// `UiAction::AcceptIdentity`'s actual work, pulled out to its own `pub`
+/// function so it is directly unit-testable against a hand-built
+/// `SessionState`/`UiState` (`test/identity_accept_effects_test.rs`)
+/// rather than only reachable end-to-end through a live two-daemon
+/// session, which cannot model two distinct devices for one nickname
+/// within a single test process (both ends resolve their own device_id
+/// from one ambient `~/.aloo/d_id` path). Returns whether a review was
+/// actually resolved (i.e. whether the caller should play the bell
+/// chime), exactly as the old inline match arm did.
+pub async fn accept_identity_review(
+    session: &mut SessionState,
+    ui_state: &mut UiState,
+    peer: UserId,
+) -> bool {
+    if let Some(review) = ui_state.identity_reviews.get(&peer).cloned() {
+        // A static key just needs pinning - `known_users` (and
+        // hence what future sends encrypt with) already holds this
+        // exact key, set unconditionally by `on_user_joined` when
+        // the peer joined (docs/PROTOCOL.md §12.4); nothing else
+        // was withheld from it, only the local pin.
+        let IdentityCase::StaticMismatch {
+            new_public_key_der, ..
+        } = review.case;
+        // The device this connection was actually reviewed under
+        // (docs/PROTOCOL.md §12.7) - known by now in the ordinary
+        // case, since the review was only ever revealed once
+        // punching resolved (`reveal_pending_identity_review`).
+        // Falls back to unbound (`""`) only in the rare case the
+        // device was never learned at all (`Lost` before `Active`,
+        // yet the user chose to `Accept` anyway from fingerprints
+        // alone) - additive, never colliding with another
+        // unclaimed unbound entry rather than overwriting it, per
+        // §1's "additive, never replacing".
+        let device_id = session
+            .peer_device_ids
+            .get(&peer)
+            .cloned()
+            .unwrap_or_default();
+        // Additive (§2): if this exact device is already known
+        // under some other key, this is that device's key
+        // changing - overwrite in place. Otherwise it's a new
+        // device for this nickname - add it, leaving every other
+        // device's entry exactly as it was. Key and key_mode set
+        // atomically together (`accept_identity_review`), so the
+        // rare unbound (`""`) fallback can never land on an
+        // unrelated `Direct` entry sharing that same sentinel.
+        // Always `PqHybrid`: `check_identity` only ever opens a
+        // `StaticMismatch` review for a key that already decoded
+        // as a `pq_hybrid` bundle, never derived from
+        // `known_users` (which the peer may no longer be in by
+        // the time `Accept` is actually pressed).
+        session.id_store.accept_identity_review(
+            &review.nickname,
+            &device_id,
+            &new_public_key_der,
+            KeyMode::PqHybrid,
+            idstore::Trust::Tofu,
+        );
+        // Recorded against the freshly (re-)pinned device so the
+        // *next* mismatch for it has something other than
+        // "unknown" to compare against.
+        if let Some(addr) = session.peer_link.active_addr(peer) {
+            session
+                .id_store
+                .set_last_seen(&review.nickname, &device_id, addr);
+        }
+        if let Err(e) = session.id_store.save() {
+            crate::log_warn!("failed to save id_store: {e}");
+        }
+    }
+    ui_state.resolve_identity_accept(peer)
+}
+
 async fn handle_ui_action(
     action: UiAction,
     wr: &mut impl crate::control::ControlSink,
@@ -1424,63 +1497,7 @@ async fn handle_ui_action(
             }
         }
         UiAction::AcceptIdentity(peer) => {
-            if let Some(review) = ui_state.identity_reviews.get(&peer).cloned() {
-                // A static key just needs pinning - `known_users` (and
-                // hence what future sends encrypt with) already holds this
-                // exact key, set unconditionally by `on_user_joined` when
-                // the peer joined (docs/PROTOCOL.md §12.4); nothing else
-                // was withheld from it, only the local pin.
-                let IdentityCase::StaticMismatch {
-                    new_public_key_der, ..
-                } = review.case;
-                // The device this connection was actually reviewed under
-                // (docs/PROTOCOL.md §12.7) - known by now in the ordinary
-                // case, since the review was only ever revealed once
-                // punching resolved (`reveal_pending_identity_review`).
-                // Falls back to unbound (`""`) only in the rare case the
-                // device was never learned at all (`Lost` before `Active`,
-                // yet the user chose to `Accept` anyway from fingerprints
-                // alone) - additive, never colliding with another
-                // unclaimed unbound entry rather than overwriting it, per
-                // §1's "additive, never replacing".
-                let device_id = session
-                    .peer_device_ids
-                    .get(&peer)
-                    .cloned()
-                    .unwrap_or_default();
-                // Additive (§2): if this exact device is already known
-                // under some other key, this is that device's key
-                // changing - overwrite in place. Otherwise it's a new
-                // device for this nickname - add it, leaving every other
-                // device's entry exactly as it was. Key and key_mode set
-                // atomically together (`accept_identity_review`), so the
-                // rare unbound (`""`) fallback can never land on an
-                // unrelated `Direct` entry sharing that same sentinel.
-                // Always `PqHybrid`: `check_identity` only ever opens a
-                // `StaticMismatch` review for a key that already decoded
-                // as a `pq_hybrid` bundle, never derived from
-                // `known_users` (which the peer may no longer be in by
-                // the time `Accept` is actually pressed).
-                session.id_store.accept_identity_review(
-                    &review.nickname,
-                    &device_id,
-                    &new_public_key_der,
-                    KeyMode::PqHybrid,
-                    idstore::Trust::Tofu,
-                );
-                // Recorded against the freshly (re-)pinned device so the
-                // *next* mismatch for it has something other than
-                // "unknown" to compare against.
-                if let Some(addr) = session.peer_link.active_addr(peer) {
-                    session
-                        .id_store
-                        .set_last_seen(&review.nickname, &device_id, addr);
-                }
-                if let Err(e) = session.id_store.save() {
-                    crate::log_warn!("failed to save id_store: {e}");
-                }
-            }
-            if ui_state.resolve_identity_accept(peer) {
+            if accept_identity_review(session, ui_state, peer).await {
                 voice_stream::play_bell_chime(session);
             }
         }
@@ -1738,6 +1755,10 @@ async fn handle_ui_action(
         }
         UiAction::CheckOtpMailRecipient { nickname } => {
             crate::client::otp_mail::handle_check_recipient(session, ui_state, nickname).await;
+        }
+        UiAction::SelectOtpMailDevice { nickname, device_id } => {
+            crate::client::otp_mail::handle_select_device(session, ui_state, nickname, device_id)
+                .await;
         }
         UiAction::OpenOtpMailbox => {
             crate::client::otp_mail::handle_open_mailbox(session, ui_state);

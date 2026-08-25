@@ -433,3 +433,139 @@ async fn a_mails_gate_also_clears_on_a_refused_storage_ack() {
         "a refusal must still open the gate - the pad bytes are spent regardless of outcome"
     );
 }
+
+// ---------------------------------------------------------------------
+// Wrong-device deliveries are refused before any ack (docs/PROTOCOL.md 17.3)
+// ---------------------------------------------------------------------
+
+/// A `ControlSink` that records what would have gone to the server, so a
+/// test can assert on exactly what `on_mail_deliver` decided to send.
+#[derive(Default)]
+struct RecordingSink {
+    sent: Vec<proto::ClientMessage>,
+}
+
+impl aloo::control::ControlSink for RecordingSink {
+    async fn send_control(&mut self, msg: &proto::ClientMessage) -> proto::Result<()> {
+        self.sent.push(msg.clone());
+        Ok(())
+    }
+}
+
+/// Like `bare_session`, but also hands back this session's own pq
+/// fingerprint - needed to compute the exact device-qualified contact
+/// name `on_mail_deliver` will itself derive, for the matching-contact
+/// counterpart below. Kept separate from `bare_session` rather than
+/// changing its signature, since other tests above already depend on it.
+async fn bare_session_with_own_fp(
+    label: &str,
+) -> (aloo::client::session::SessionState, aloo::client::tui::ui::UiState, [u8; 32]) {
+    let (public, private) = generate_bundle_with_bits(TEST_BITS).expect("own pq keygen");
+    let public_der = proto::encode(&public).expect("own pq der");
+    let own_fp = aloo::crypto::pq::fingerprint_of_encoded(&public_der).expect("own fp");
+    let session = aloo::client::session::SessionState::for_test(aloo::client::session::TestSessionSpec {
+        identity: aloo::client::connect::ResolvedIdentity { private, public_der },
+        scratch: temp_dir(label),
+        otp: None,
+    })
+    .await;
+    let ui = aloo::client::tui::ui::UiState::new("bob".into());
+    (session, ui, own_fp)
+}
+
+/// A mail whose carried `contact_name` does not match what this session
+/// derives for the claimed sender - standing in for a device other than
+/// the one it was actually sealed for currently being connected under
+/// that nickname - must never be acknowledged. No ack means the server
+/// never deletes it and keeps offering it on every future fetch
+/// (`server_mail_test.rs`'s
+/// `on_mail_fetch_redelivers_the_same_pending_mail_until_acked`) until
+/// the device that actually holds the matching pad connects.
+///
+/// @requirement AC-335
+#[tokio::test]
+async fn on_mail_deliver_never_acks_a_mail_sealed_for_a_different_device() {
+    let (mut session, mut ui, _own_fp) = bare_session_with_own_fp("wrong-device").await;
+
+    let (alice_public, _) = generate_bundle_with_bits(TEST_BITS).expect("alice pq keygen");
+    let alice_der = proto::encode(&alice_public).expect("alice pq der");
+    session.id_store_mut().pin_new_device_with_key_mode(
+        "alice",
+        "alice-device",
+        &alice_der,
+        aloo::client::idstore::Trust::Tofu,
+        Some(proto::KeyMode::PqHybrid),
+    );
+
+    let mut sink = RecordingSink::default();
+    aloo::client::otp_mail::on_mail_deliver(
+        &mut sink,
+        &mut session,
+        &mut ui,
+        "aa".repeat(16),
+        "alice".into(),
+        "definitely-not-the-derived-contact-name".into(),
+        0,
+        vec![1, 2, 3],
+    )
+    .await
+    .expect("on_mail_deliver should never error");
+
+    assert!(
+        !sink
+            .sent
+            .iter()
+            .any(|m| matches!(m, proto::ClientMessage::OtpMailAck { .. })),
+        "a contact mismatch must never be acknowledged: {:?}",
+        sink.sent
+    );
+}
+
+/// The positive counterpart: a carried `contact_name` that DOES match
+/// this session's own derivation is acknowledged - here via the
+/// `AckOnly` branch (a sequence already behind `next_expected_in_seq`),
+/// which needs no real pad material to exercise at all.
+///
+/// @requirement AC-335
+#[tokio::test]
+async fn on_mail_deliver_acks_a_mail_matching_the_locally_derived_contact() {
+    let (mut session, mut ui, own_fp) = bare_session_with_own_fp("matching-device").await;
+    let own_device_id = session.own_device_id_for_test().to_string();
+
+    let (alice_public, _) = generate_bundle_with_bits(TEST_BITS).expect("alice pq keygen");
+    let alice_der = proto::encode(&alice_public).expect("alice pq der");
+    let alice_fp = aloo::crypto::pq::fingerprint_of_encoded(&alice_der).expect("alice fp");
+    session.id_store_mut().pin_new_device_with_key_mode(
+        "alice",
+        "alice-device",
+        &alice_der,
+        aloo::client::idstore::Trust::Tofu,
+        Some(proto::KeyMode::PqHybrid),
+    );
+
+    let contact = aloo::crypto::otp::contact_name_for_mail(&own_fp, &own_device_id, &alice_fp, "alice-device");
+    session.otp_store_mut().record_received(&contact, 0);
+
+    let mut sink = RecordingSink::default();
+    let mail_id = "bb".repeat(16);
+    aloo::client::otp_mail::on_mail_deliver(
+        &mut sink,
+        &mut session,
+        &mut ui,
+        mail_id.clone(),
+        "alice".into(),
+        contact,
+        0,
+        vec![1, 2, 3],
+    )
+    .await
+    .expect("on_mail_deliver should never error");
+
+    assert!(
+        sink.sent
+            .iter()
+            .any(|m| matches!(m, proto::ClientMessage::OtpMailAck { mail_id: id } if *id == mail_id)),
+        "a matching contact name must be acknowledged: {:?}",
+        sink.sent
+    );
+}

@@ -1040,7 +1040,10 @@ async fn mail_refuses_a_pure_otp_pair_rather_than_falling_back() {
     let (mut alice, _bob, contact) = pair("mail-pw-pw", Id::Opaque, Id::Opaque).await;
     assert!(
         matches!(
-            aloo::client::otp_mail::check_recipient(&alice.session, "bob").await,
+            // No pq_hybrid pin exists at all for a pure-OTP pair, so which
+            // device_id is named here doesn't matter - every one still
+            // reads as `NotPinned`.
+            aloo::client::otp_mail::check_recipient(&alice.session, "bob", "any-device").await,
             aloo::client::otp_mail::RecipientCheck::NotPinned
         ),
         "a pad alone cannot carry an offline mail's sender binding, and \

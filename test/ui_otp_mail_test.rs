@@ -11,7 +11,7 @@ mod ui_common;
 use aloo::client::file_browser::FileBrowserState;
 use aloo::client::otp_mail::{MAIL_OVERHEAD_ESTIMATE, RecipientCheck};
 use aloo::client::otp_mail_store::{ReceivedMailRef, SentMailRef, SentMailStatus};
-use aloo::client::tui::otp_mail::{MailAttachment, MailboxRow};
+use aloo::client::tui::otp_mail::{MailAttachment, MailDeviceOption, MailFocus, MailboxRow};
 use aloo::client::tui::ui::{UiAction, UiState, VoiceTarget, render};
 use aloo::crypto::otp::{OtpMailFile, OtpMailPayload, OtpMailVoice};
 use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
@@ -268,6 +268,206 @@ fn a_stale_check_result_for_an_edited_nickname_is_ignored() {
         state.otp_mail.as_ref().unwrap().compose.check,
         Some(RecipientCheck::NotPinned)
     );
+}
+
+// ---------------------------------------------------------------------
+// The device selector (AC-336)
+// ---------------------------------------------------------------------
+
+fn device_option(id: &str, last_seen: Option<u64>, has_key: bool) -> MailDeviceOption {
+    MailDeviceOption {
+        device_id: id.into(),
+        last_seen_unix: last_seen,
+        contact_name: format!("contact-{id}"),
+        has_mail_key: has_key,
+        enc_key_remaining: if has_key { 1024 } else { 0 },
+    }
+}
+
+/// @requirement AC-336
+#[test]
+fn otp_mail_set_devices_defaults_to_the_most_recently_seen_device_with_a_mail_key() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    open_mail(&mut state);
+    type_str(&mut state, "bob");
+    state.otp_mail_set_devices(
+        "bob",
+        vec![
+            device_option("newer-no-key", Some(200), false),
+            device_option("older-with-key", Some(100), true),
+        ],
+    );
+    let compose = &state.otp_mail.as_ref().unwrap().compose;
+    assert_eq!(
+        compose.devices[compose.selected_device].device_id, "older-with-key",
+        "a device with a mail key beats a more-recently-seen one with none"
+    );
+}
+
+/// @requirement AC-336
+#[test]
+fn otp_mail_set_devices_falls_back_to_most_recently_seen_when_none_has_a_mail_key() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    open_mail(&mut state);
+    type_str(&mut state, "bob");
+    state.otp_mail_set_devices(
+        "bob",
+        vec![
+            device_option("older", Some(100), false),
+            device_option("newer", Some(200), false),
+        ],
+    );
+    let compose = &state.otp_mail.as_ref().unwrap().compose;
+    assert_eq!(
+        compose.devices[compose.selected_device].device_id, "newer",
+        "with no key anywhere, falls back to most-recently-seen so NoMailKey still explains why"
+    );
+}
+
+/// @requirement AC-336
+#[test]
+fn otp_mail_set_devices_is_a_noop_for_a_stale_nickname() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    open_mail(&mut state);
+    type_str(&mut state, "bob");
+    press(&mut state, KeyCode::Char('x')); // now editing "bobx"
+    // A sentinel standing in for whatever the view held before a late
+    // "bob" result arrives - proves the setter's own guard, not merely
+    // that typing already cleared the list.
+    {
+        let compose = &mut state.otp_mail.as_mut().unwrap().compose;
+        compose.devices = vec![device_option("sentinel", Some(1), true)];
+        compose.devices_for = Some("bobx".into());
+    }
+    state.otp_mail_set_devices("bob", vec![device_option("late", Some(2), true)]);
+    let compose = &state.otp_mail.as_ref().unwrap().compose;
+    assert_eq!(
+        compose.devices,
+        vec![device_option("sentinel", Some(1), true)],
+        "a device list for an outdated nickname must not overwrite the newer edit's"
+    );
+    assert_eq!(compose.devices_for.as_deref(), Some("bobx"));
+}
+
+/// @requirement AC-336
+#[test]
+fn up_and_down_in_the_device_focus_move_selection_and_clamp_at_the_ends() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    open_mail(&mut state);
+    type_str(&mut state, "bob");
+    state.otp_mail_set_devices(
+        "bob",
+        vec![
+            device_option("a", Some(1), true),
+            device_option("b", Some(2), true),
+            device_option("c", Some(3), true),
+        ],
+    );
+    {
+        let compose = &mut state.otp_mail.as_mut().unwrap().compose;
+        compose.focus = MailFocus::Device;
+        compose.selected_device = 0;
+    }
+
+    assert_eq!(
+        press(&mut state, KeyCode::Up),
+        None,
+        "already at the top - clamps without re-checking"
+    );
+    assert_eq!(state.otp_mail.as_ref().unwrap().compose.selected_device, 0);
+
+    assert_eq!(
+        press(&mut state, KeyCode::Down),
+        Some(UiAction::SelectOtpMailDevice {
+            nickname: "bob".into(),
+            device_id: "b".into()
+        })
+    );
+    assert_eq!(state.otp_mail.as_ref().unwrap().compose.selected_device, 1);
+
+    press(&mut state, KeyCode::Down);
+    assert_eq!(state.otp_mail.as_ref().unwrap().compose.selected_device, 2);
+    assert_eq!(
+        press(&mut state, KeyCode::Down),
+        None,
+        "already at the bottom - clamps without wrapping or re-checking"
+    );
+    assert_eq!(state.otp_mail.as_ref().unwrap().compose.selected_device, 2);
+}
+
+/// @requirement AC-336
+#[test]
+fn tab_skips_the_device_row_when_no_devices_are_known_yet() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    open_mail(&mut state);
+    type_str(&mut state, "stranger");
+    state.otp_mail_set_check("stranger", RecipientCheck::NotPinned);
+    assert!(state.otp_mail.as_ref().unwrap().compose.devices.is_empty());
+    press(&mut state, KeyCode::Tab);
+    assert_eq!(
+        state.otp_mail.as_ref().unwrap().compose.focus,
+        MailFocus::Subtext,
+        "Tab goes straight from To to Subtext when nothing was found to select"
+    );
+}
+
+/// @requirement AC-336
+#[test]
+fn tab_stops_at_the_device_row_once_devices_exist() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    open_mail(&mut state);
+    type_str(&mut state, "bob");
+    state.otp_mail_set_devices("bob", vec![device_option("a", Some(1), true)]);
+    press(&mut state, KeyCode::Tab);
+    assert_eq!(
+        state.otp_mail.as_ref().unwrap().compose.focus,
+        MailFocus::Device
+    );
+    press(&mut state, KeyCode::Tab);
+    assert_eq!(
+        state.otp_mail.as_ref().unwrap().compose.focus,
+        MailFocus::Subtext
+    );
+    // BackTab retraces the same stop.
+    press(&mut state, KeyCode::BackTab);
+    assert_eq!(
+        state.otp_mail.as_ref().unwrap().compose.focus,
+        MailFocus::Device
+    );
+}
+
+/// @requirement AC-336
+#[test]
+fn an_empty_device_list_renders_a_placeholder_not_a_panic() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    open_mail(&mut state);
+    type_str(&mut state, "stranger");
+    state.otp_mail_set_check("stranger", RecipientCheck::NotPinned);
+    let rows = rows_of(&state);
+    assert!(
+        rows.iter().any(|r| r.contains("no pinned devices") || r.contains("type a recipient")),
+        "an empty device list shows an explanatory placeholder, not a blank row: {rows:?}"
+    );
+}
+
+/// @requirement AC-336
+#[test]
+fn the_device_rows_render_a_check_or_cross_per_has_mail_key() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    open_mail(&mut state);
+    type_str(&mut state, "bob");
+    state.otp_mail_set_devices(
+        "bob",
+        vec![
+            device_option("has-key", Some(1), true),
+            device_option("no-key", Some(2), false),
+        ],
+    );
+    let rows = rows_of(&state);
+    let ticks = rows.iter().filter(|r| r.contains('\u{2705}')).count();
+    let crosses = rows.iter().filter(|r| r.contains('\u{274C}')).count();
+    assert!(ticks >= 1, "the device with a mail key shows a tick: {rows:?}");
+    assert!(crosses >= 1, "the device without one shows a cross: {rows:?}");
 }
 
 // ---------------------------------------------------------------------

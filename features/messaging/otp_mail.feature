@@ -116,6 +116,30 @@ Feature: OTP mail that waits, encrypted, on the server
     And I press Enter
     Then the send action was produced
 
+  @AC-336
+  Scenario: The device selector defaults to the most-recently-seen device with a mail key
+    Given I am connected and viewing a channel
+    And bob is in the channel with me
+    When I type "/mail"
+    And I press Enter
+    And I type "bob"
+    And "bob" resolves to two devices: "newer-no-key" seen most recently with no mail key, and "older-with-key" seen earlier with a mail key
+    Then the device selector selects "older-with-key"
+
+  @AC-336
+  Scenario: Up and Down move the device selection and re-run the recipient check
+    Given I am connected and viewing a channel
+    And bob is in the channel with me
+    When I type "/mail"
+    And I press Enter
+    And I type "bob"
+    And "bob" resolves to two devices: "device-a" seen most recently with a mail key, and "device-b" seen earlier with a mail key
+    Then the device selector selects "device-a"
+    When I press Tab
+    And I press Down
+    Then the device selector selects "device-b"
+    And a recipient check was requested for "bob" on device "device-b"
+
   @AC-159 @TB-193
   Scenario: A retry re-uploads the recovered ciphertext, never a fresh encode
     Given alice and bob have provisioned an otp contact for each other
@@ -165,6 +189,43 @@ Feature: OTP mail that waits, encrypted, on the server
     And bob fetches his otp mail
     Then bob is handed the stored mail intact
     When bob acknowledges the mail
+    Then the mail's ciphertext is gone from the server's disk
+
+  @AC-335
+  Scenario: A fetch with no acknowledgement is redelivered, never dropped
+    Given a server with otp mail storage
+    And alice has connected
+    When alice uploads an otp mail addressed to bob
+    Then the server acknowledges the mail as stored
+    When bob has connected
+    And bob fetches his otp mail
+    Then bob is handed the stored mail intact
+    When bob fetches his otp mail
+    Then bob is handed the stored mail intact
+    When bob acknowledges the mail
+    Then the mail's ciphertext is gone from the server's disk
+
+  @AC-335
+  Scenario: A mail sealed for a different device is never acknowledged, and stays pending
+    Given a server with otp mail storage
+    And alice has connected
+    When alice uploads an otp mail addressed to bob sealed for a different device
+    Then the server acknowledges the mail as stored
+    When bob has connected
+    And bob fetches his otp mail
+    Then bob is handed the mail, sealed for a different device
+    And the mail's ciphertext waits on the server's disk
+
+  @AC-335
+  Scenario: A mail sealed for bob's own connected device is acknowledged and removed
+    Given a server with otp mail storage
+    And alice has connected
+    When alice uploads an otp mail addressed to bob
+    Then the server acknowledges the mail as stored
+    When bob has connected
+    And bob fetches his otp mail
+    Then bob is handed the stored mail intact
+    When bob acknowledges the mail addressed to his own device key
     Then the mail's ciphertext is gone from the server's disk
 
   @AC-161

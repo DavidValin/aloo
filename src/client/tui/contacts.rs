@@ -1055,7 +1055,7 @@ impl UiState {
 /// `otp_mail::format_utc_short` already makes for UTC, just localized;
 /// falls back to a UTC-labeled rendering if the local offset can't be
 /// determined at all (`time::UtcOffset::current_local_offset`'s doc).
-fn format_last_seen(last_seen_unix: Option<u64>) -> String {
+pub(crate) fn format_last_seen(last_seen_unix: Option<u64>) -> String {
     let Some(ts) = last_seen_unix else {
         return "never".to_string();
     };

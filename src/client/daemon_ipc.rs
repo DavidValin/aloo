@@ -421,8 +421,9 @@ fn owner_only_security_descriptor() -> io::Result<OwnedSecurityDescriptor> {
 fn process_user_sid(process: windows_sys::Win32::Foundation::HANDLE) -> io::Result<Vec<u8>> {
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::Security::{
-        GetLengthSid, GetTokenInformation, OpenProcessToken, TOKEN_QUERY, TOKEN_USER, TokenUser,
+        GetLengthSid, GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser,
     };
+    use windows_sys::Win32::System::Threading::OpenProcessToken;
 
     let mut token: HANDLE = std::ptr::null_mut();
     // SAFETY: `process` is a valid, open handle for the duration of this

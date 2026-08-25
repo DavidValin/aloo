@@ -146,6 +146,10 @@ name = "identity_continuity_test"
 path = "test/identity_continuity_test.rs"
 
 [[test]]
+name = "identity_accept_effects_test"
+path = "test/identity_accept_effects_test.rs"
+
+[[test]]
 name = "pq_rekey_test"
 path = "test/pq_rekey_test.rs"
 
@@ -304,6 +308,10 @@ path = "test/otp_provisioning_concurrency_test.rs"
 [[test]]
 name = "otp_mail_recipient_check_test"
 path = "test/otp_mail_recipient_check_test.rs"
+
+[[test]]
+name = "otp_mail_device_test"
+path = "test/otp_mail_device_test.rs"
 
 [[test]]
 name = "contacts_add_test"

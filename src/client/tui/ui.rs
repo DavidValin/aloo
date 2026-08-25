@@ -1763,6 +1763,14 @@ pub enum UiAction {
     CheckOtpMailRecipient {
         nickname: String,
     },
+    /// Up/Down inside the compose view's device selector
+    /// (`MailFocus::Device`) - re-runs `check_recipient` against the
+    /// newly highlighted device only, never a full re-enumeration
+    /// (`client::otp_mail::handle_select_device`).
+    SelectOtpMailDevice {
+        nickname: String,
+        device_id: String,
+    },
     /// The `/mailbox` command (`submit_input`) - the session snapshots
     /// the mail store into mailbox rows
     /// (`UiState::otp_mail_set_mailbox_rows`), shown over the mail view
@@ -1970,6 +1978,7 @@ impl UiAction {
             // OTP *mail* is stored on the server for an offline recipient;
             // a live OTP session is peer-to-peer and stays available.
             Self::CheckOtpMailRecipient { .. }
+            | Self::SelectOtpMailDevice { .. }
             | Self::OpenOtpMailbox
             | Self::SendOtpMail
             | Self::ReadOtpMail { .. }

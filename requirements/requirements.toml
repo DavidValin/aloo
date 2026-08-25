@@ -1041,6 +1041,26 @@ id = "TB-094"
 description = "Reading a pinned entry does not pin, re-pin, or otherwise mutate the store, and an unknown nickname reads as absent."
 evidence = "docs/PROTOCOL.md 12.2; tests get_reads_without_mutating_anything, get_on_an_unknown_nickname_is_none (idstore_test.rs)"
 
+[[user_story.acceptance_criteria]]
+id = "AC-332"
+description = "Accepting an impersonation review needs no separate step to make channel/DM messaging use the new device's key: known_users/channel.members already hold whichever key that connection actually announced, set at UserJoined time before any review is even shown, so Accept (which only lifts the trust gate) is immediately followed by sends encrypting to the live new-device key - both in a channel and in a DM - with the old device's own pin left untouched and coexisting in id_store."
+evidence = "docs/PROTOCOL.md 12.4; src/client/session.rs accept_identity_review:1219; src/client/tui/channel.rs recipients_for_channel:216; test post_accept_channel_and_dm_sends_use_the_new_devices_key (identity_accept_effects_test.rs)"
+
+[[user_story.acceptance_criteria]]
+id = "AC-333"
+description = "/info and i on a peer always show the device this connection actually is (session.peer_device_ids, set from its own DeviceIdAnnounce), never id_store's pin - so the popup already shows a freshly-accepted device before and after Accept alike, with no gating on review state."
+evidence = "docs/PROTOCOL.md 12.7; src/client/contacts.rs handle_request_user_info:350; test post_accept_user_info_shows_the_new_device (identity_accept_effects_test.rs)"
+
+[[user_story.acceptance_criteria]]
+id = "AC-334"
+description = "An /otp session already running under an old device is left completely untouched by accepting a new device's identity review: OTP/OTP-mail keychain names are device-qualified and keyed independently of id_store's pin, so the old device's pad state survives byte-for-byte and no state is fabricated under the new device's own (different) contact name - a fresh /otp is still required there, matching non-OTP (pq_hybrid) messaging taking over the dm/channel while OTP stays on its own device."
+evidence = "docs/PROTOCOL.md 12.4, 16.1.2; src/client/session.rs accept_identity_review:1219; src/crypto/otp.rs contact_name_for; test an_active_otp_session_under_the_old_device_survives_accept_untouched (identity_accept_effects_test.rs)"
+
+[[user_story.technical_behavior]]
+id = "TB-254"
+description = "accept_identity_review's only touched state is id_store (the additive pin) and the UI's identity-review queue - it never reads or writes otp_store, which is what keeps an old device's live OTP session structurally unreachable from the accept path regardless of future changes to either."
+evidence = "src/client/session.rs accept_identity_review:1219; test an_active_otp_session_under_the_old_device_survives_accept_untouched (identity_accept_effects_test.rs)"
+
 # ============================================================================
 # US-012 - See who is present and how their identity is protected
 # ============================================================================
@@ -2454,6 +2474,21 @@ evidence = "docs/SPEC.md Functionality; src/client/tui/otp_mail.rs handle_mailbo
 id = "AC-163"
 description = "A received mail rests on disk only as a ciphertext file plus the pad used for its decryption (the payload re-encrypted under fresh local randomness the moment it arrived, since the keychain pad that carried it is destroyed by the decrypt); reading XORs the two in memory only, and removing the mail overwrites and deletes both files, making its content unrecoverable."
 evidence = "docs/PROTOCOL.md 17.3; src/client/otp_mail_store.rs store_received_payload, read_received_payload, remove_received; src/crypto/otp.rs repad, xor_pad; tests received_payload_stores_ciphertext_and_pad_and_reads_back_by_xor, stored_blob_files_are_never_the_plaintext, remove_received_destroys_both_files, d_on_a_mailbox_row_requires_confirm_before_delete, repad_round_trips_and_neither_half_alone_is_the_plaintext; scenario features/messaging/otp_mail.feature 'A received mail rests as ciphertext plus pad and dies with them'"
+
+[[user_story.acceptance_criteria]]
+id = "AC-335"
+description = "The server has no way to tell which of a nickname's devices a mail was actually sealed for (contact_name is opaque storage-side, and StoredMail carries no device_id) - so it keeps offering the same still-pending mail on every fetch, whichever device is currently connected under that nickname, rather than consuming or marking it tried on a mere delivery attempt. On the receiving side, a mail whose carried contact_name does not match what this session derives for the claimed sender (device-pinning plan §4) is left untouched and unacknowledged rather than acked or decrypted - only a contact name matching exactly, via MailGate::AckOnly or ::Decrypt, ever produces an OtpMailAck, which is the only thing that ever deletes the mail from the server and tells the sender it was delivered."
+evidence = "docs/PROTOCOL.md 17.3, 17.4; src/server/mail.rs on_mail_fetch:301, MailStore::pending_for:127, on_mail_ack:321; src/client/otp_mail.rs on_mail_deliver:654, mail_gate:98; tests on_mail_fetch_redelivers_the_same_pending_mail_until_acked, a_delivery_attempt_alone_never_removes_a_pending_mail (server_mail_test.rs), on_mail_deliver_never_acks_a_mail_sealed_for_a_different_device, on_mail_deliver_acks_a_mail_matching_the_locally_derived_contact (otp_mail_test.rs); scenarios features/messaging/otp_mail.feature 'A fetch with no acknowledgement is redelivered, never dropped', 'A mail sealed for a different device is never acknowledged, and stays pending', 'A mail sealed for bob's own connected device is acknowledged and removed'"
+
+[[user_story.acceptance_criteria]]
+id = "AC-336"
+description = "The compose view shows a device selector below the To field, listing every device the resolved nickname has a pinned identity for with a check/cross for whether each carries a mail-purpose otp key; it defaults to the most-recently-seen device that has one (falling back to the most-recently-seen device overall only if none does, so the existing NoMailKey gate still explains why), Tab only stops there once at least one device is known, and Up/Down move the selection and re-run the recipient check against whichever device is now highlighted. Sending seals the mail under the explicitly selected device's own key, not an implicit 'most recently seen' guess."
+evidence = "docs/PROTOCOL.md 17.1; src/client/tui/otp_mail.rs MailFocus::Device, ComposeState::devices/selected_device, UiState::otp_mail_set_devices:324, otp_mail_selected_device_id:352, otp_mail_set_selected_device:367, render_otp_mail_view's device row; src/client/otp_mail.rs handle_send; tests otp_mail_set_devices_defaults_to_the_most_recently_seen_device_with_a_mail_key, otp_mail_set_devices_falls_back_to_most_recently_seen_when_none_has_a_mail_key, otp_mail_set_devices_is_a_noop_for_a_stale_nickname, up_and_down_in_the_device_focus_move_selection_and_clamp_at_the_ends, tab_skips_the_device_row_when_no_devices_are_known_yet, tab_stops_at_the_device_row_once_devices_exist, an_empty_device_list_renders_a_placeholder_not_a_panic, the_device_rows_render_a_check_or_cross_per_has_mail_key (ui_otp_mail_test.rs), handle_send_seals_and_uploads_under_the_explicitly_selected_devices_contact_name (otp_mail_device_test.rs); scenarios features/messaging/otp_mail.feature 'The device selector defaults to the most-recently-seen device with a mail key', 'Up and Down move the device selection and re-run the recipient check'"
+
+[[user_story.technical_behavior]]
+id = "TB-255"
+description = "check_recipient no longer resolves a nickname's device on its own (the old 'most recently seen' default) - every call must now name an explicit device_id, resolved via IdStore::get_for_device. enumerate_mail_devices lists every one of a nickname's pinned devices (skipping the unbound/empty device_id, which can never be a valid mail target) with its own mail-key status, and is only ever re-run once per distinct nickname (ComposeState::devices_for's memoization), never per keystroke; Up/Down inside the selector re-checks just the newly highlighted device without a fresh enumeration."
+evidence = "src/client/otp_mail.rs check_recipient:126, enumerate_mail_devices:158, handle_check_recipient, handle_select_device; tests enumerate_mail_devices_lists_every_pinned_device_and_whether_each_has_a_mail_key, enumerate_mail_devices_skips_the_unbound_entry, check_recipient_now_requires_an_explicit_device_and_distinguishes_two_devices (otp_mail_device_test.rs)"
 
 [[user_story.technical_behavior]]
 id = "TB-193"

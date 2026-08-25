@@ -15,7 +15,7 @@ use tokio::net::{TcpListener, TcpStream};
 use aloo::client::otp_cli::{self, OtpCliOutcome, RecoverDirection};
 use aloo::client::otp_mail::{MailGate, RecipientCheck, mail_gate};
 use aloo::client::otp_mail_store::{OtpMailStore, ReceivedMailRef, SentMailRef, SentMailStatus};
-use aloo::client::tui::otp_mail::{MailboxRow, MailFocus};
+use aloo::client::tui::otp_mail::{MailDeviceOption, MailboxRow, MailFocus};
 use aloo::client::tui::ui::UiAction;
 use aloo::control::ControlEndpoint;
 use aloo::crypto::otp::{OtpMailSealed, mail_id_is_valid, new_mail_id, repad};
@@ -28,6 +28,12 @@ use aloo::server::users_registry::UsersRegistry;
 use crate::world::{AlooWorld, pq_bundle_for};
 
 const MAIL_CONTACT: &str = "aabb-ccdd";
+/// A distinct, deliberately different contact name - standing in for a
+/// mail sealed for one of bob's *other* devices (the real client derives
+/// this per-device-pair via `crypto::otp::contact_name_for_mail`; these
+/// wire-level scenarios only need two distinguishable strings, not the
+/// real hash, since routing here is opaque to the server either way).
+const MAIL_CONTACT_OTHER_DEVICE: &str = "aabb-other-device";
 
 /// Polls `cond` for up to a second - disk effects of a message we sent
 /// happen on the server's own task, an instant after the send returns.
@@ -126,6 +132,62 @@ async fn check_ok_spare(w: &mut AlooWorld, nickname: String, spare: u64) {
             contact_name: MAIL_CONTACT.into(),
             enc_key_remaining: aloo::client::otp_mail::MAIL_OVERHEAD_ESTIMATE + spare,
         },
+    );
+}
+
+// ---------------------------------------------------------------------
+// The device selector (AC-336)
+// ---------------------------------------------------------------------
+
+#[when(
+    expr = "{string} resolves to two devices: {string} seen most recently with {word} mail key, and {string} seen earlier with {word} mail key"
+)]
+async fn resolves_to_two_devices(
+    w: &mut AlooWorld,
+    nickname: String,
+    recent_id: String,
+    recent_key_word: String,
+    older_id: String,
+    older_key_word: String,
+) {
+    let recent_has_key = recent_key_word == "a";
+    let older_has_key = older_key_word == "a";
+    w.ui_mut().otp_mail_set_devices(
+        &nickname,
+        vec![
+            MailDeviceOption {
+                device_id: recent_id,
+                last_seen_unix: Some(200),
+                contact_name: "device-contact-recent".into(),
+                has_mail_key: recent_has_key,
+                enc_key_remaining: if recent_has_key { 1024 } else { 0 },
+            },
+            MailDeviceOption {
+                device_id: older_id,
+                last_seen_unix: Some(100),
+                contact_name: "device-contact-older".into(),
+                has_mail_key: older_has_key,
+                enc_key_remaining: if older_has_key { 1024 } else { 0 },
+            },
+        ],
+    );
+}
+
+#[then(expr = "the device selector selects {string}")]
+async fn device_selector_selects(w: &mut AlooWorld, device_id: String) {
+    let compose = compose_of(w);
+    let selected = compose
+        .devices
+        .get(compose.selected_device)
+        .map(|d| d.device_id.clone());
+    assert_eq!(selected.as_deref(), Some(device_id.as_str()));
+}
+
+#[then(expr = "a recipient check was requested for {string} on device {string}")]
+async fn recipient_check_requested_on_device(w: &mut AlooWorld, nickname: String, device_id: String) {
+    assert_eq!(
+        w.last_action,
+        Some(UiAction::SelectOtpMailDevice { nickname, device_id })
     );
 }
 
@@ -364,6 +426,32 @@ async fn upload_mail_at_seq(w: &mut AlooWorld, from: String, to: String, seq: u6
     .await;
 }
 
+/// The device-mismatch counterpart of `upload_mail`: sealed under
+/// `MAIL_CONTACT_OTHER_DEVICE`, not the contact name bob's own connected
+/// device would derive - proving items 2-4 of the device-aware mail
+/// request (a wrong device never acknowledges it, so the server never
+/// deletes/reports it delivered).
+#[when(expr = "{word} uploads an otp mail addressed to {word} sealed for a different device")]
+async fn upload_mail_for_a_different_device(w: &mut AlooWorld, from: String, to: String) {
+    let mail_id = new_mail_id();
+    let ciphertext = format!("sealed-for-{to}-other-device").into_bytes();
+    w.otp_mail_id = Some(mail_id.clone());
+    w.otp_mail_ciphertext = ciphertext.clone();
+    send_from(
+        w,
+        &from,
+        &ClientMessage::OtpMailSend {
+            mail_id,
+            to,
+            contact_name: MAIL_CONTACT_OTHER_DEVICE.into(),
+            seq: 0,
+            sent_at_utc: 1_766_000_000,
+            ciphertext,
+        },
+    )
+    .await;
+}
+
 #[then("the server acknowledges the mail as stored")]
 async fn server_acknowledges(w: &mut AlooWorld) {
     let expected = w.otp_mail_id.clone().unwrap();
@@ -415,6 +503,35 @@ async fn bob_handed_mail(w: &mut AlooWorld) {
     assert_eq!(ciphertext, w.otp_mail_ciphertext, "byte-identical");
 }
 
+/// The counterpart of `bob_handed_mail` for a mail sealed for a different
+/// device: the wire delivery still happens (the server is device-blind
+/// and hands it to whoever is connected as bob), but the carried
+/// `contact_name` is the *other* device's, not bob's own - which is
+/// exactly what makes his real client's own `mail_gate` refuse to
+/// acknowledge it (`on_mail_deliver_never_acks_a_mail_sealed_for_a_different_device`,
+/// `otp_mail_test.rs`, is the unit-level proof of that refusal itself;
+/// this scenario proves the wire/server half stays consistent with it).
+#[then("bob is handed the mail, sealed for a different device")]
+async fn bob_handed_mail_for_a_different_device(w: &mut AlooWorld) {
+    let expected_id = w.otp_mail_id.clone().unwrap();
+    let msg = recv_from(w, "bob").await;
+    let ServerMessage::OtpMailDeliver {
+        mail_id,
+        contact_name,
+        ciphertext,
+        ..
+    } = msg
+    else {
+        panic!("expected OtpMailDeliver, got {msg:?}");
+    };
+    assert_eq!(mail_id, expected_id);
+    assert_eq!(
+        contact_name, MAIL_CONTACT_OTHER_DEVICE,
+        "sealed for a device other than bob's own connected one"
+    );
+    assert_eq!(ciphertext, w.otp_mail_ciphertext, "byte-identical");
+}
+
 #[then("bob receives the mails oldest sequence first")]
 async fn bob_receives_mails_in_order(w: &mut AlooWorld) {
     let mut expected = w.otp_mail_ids.clone();
@@ -440,6 +557,19 @@ async fn bob_receives_mails_in_order(w: &mut AlooWorld) {
 async fn bob_acknowledges(w: &mut AlooWorld) {
     let mail_id = w.otp_mail_id.clone().unwrap();
     send_from(w, "bob", &ClientMessage::OtpMailAck { mail_id }).await;
+}
+
+/// The same acknowledgement as `bob_acknowledges`, worded for scenarios
+/// specifically about device-aware addressing: only ever used where the
+/// mail genuinely was sealed under bob's own connected device's contact
+/// name (`upload_mail`/`MAIL_CONTACT`), never the "different device"
+/// upload above - a mail sealed elsewhere is never something a real
+/// client could correctly derive a matching ack for in the first place
+/// (`mail_gate`'s `RefuseContact`), so no step here should ever call this
+/// for one.
+#[when("bob acknowledges the mail addressed to his own device key")]
+async fn bob_acknowledges_own_device(w: &mut AlooWorld) {
+    bob_acknowledges(w).await;
 }
 
 #[then("the mail's ciphertext is gone from the server's disk")]
