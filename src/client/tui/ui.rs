@@ -1775,11 +1775,24 @@ pub enum UiAction {
     /// `r` on the contacts modal - re-runs the same gather, e.g. after the
     /// remaining OTP key has moved since it was last opened.
     RefreshContacts,
-    /// The user confirmed "delete contact" on the contacts modal - forgets
-    /// `nickname`'s identity pin outright, and its OTP keychain entry too
-    /// if it has one (`client::contacts::handle_delete`).
+    /// The user confirmed "delete contact" on the contacts modal's list -
+    /// forgets `nickname` outright, every device (device-pinning plan §3):
+    /// every device's identity pin, and each one's OTP keychain entries
+    /// too if it had any (`client::contacts::handle_delete`). See
+    /// `DeleteContactDevice` for the per-device counterpart, sent instead
+    /// from a specific row's own PQH key detail popup.
     DeleteContact {
         nickname: String,
+    },
+    /// The contacts modal's PQH key detail popup, "Delete key" - removes
+    /// just the one device that popup was opened for: its identity pin,
+    /// and that device's own OTP/mail keychain entries, leaving every
+    /// sibling device's pin and keys untouched
+    /// (`client::contacts::handle_delete_contact_device`, device-pinning
+    /// plan §3's additive delete). `None` is the unbound row.
+    DeleteContactDevice {
+        nickname: String,
+        device_id: Option<String>,
     },
     /// The user confirmed "Install OTP key" on the contacts modal, having
     /// picked both key files with its own file browser - runs
@@ -1788,6 +1801,11 @@ pub enum UiAction {
     /// counterpart to `/otp`'s handshake-driven provisioning.
     InstallOtpKey {
         nickname: String,
+        /// Which of `nickname`'s devices this installs against - the row
+        /// this was opened from; `None` is the unbound row, filed under
+        /// the not-yet-qualified name and claimed on first use like any
+        /// other unbound entry (device-pinning plan §3).
+        device_id: Option<String>,
         /// Which of the two independent keychain entries this installs -
         /// `Live` for the plain `/otp` key, `Mail` for the OTP-mail-only
         /// key (`crypto::otp::contact_name_for_mail`). The contacts
@@ -1799,13 +1817,16 @@ pub enum UiAction {
         dec_path: std::path::PathBuf,
     },
     /// The contacts modal's OTP or OTP-mail key detail popup, "Delete
-    /// key" - removes just that one purpose's keychain entry
+    /// key" - removes just that one purpose's keychain entry for the
+    /// specific device that popup was opened for
     /// (`client::contacts::handle_delete_otp_key`), leaving the identity
-    /// pin and the *other* purpose's key untouched. `DeleteContact` above
-    /// is what the PQH key's own "Delete key" sends instead, since
-    /// removing the identity pin necessarily takes both purposes with it.
+    /// pin, the *other* purpose's key, and every sibling device untouched.
+    /// `DeleteContactDevice` above is what the PQH key's own "Delete key"
+    /// sends instead, since removing the identity pin necessarily takes
+    /// both purposes with it.
     DeleteContactKey {
         nickname: String,
+        device_id: Option<String>,
         purpose: crate::crypto::otp::OtpPurpose,
     },
     /// The PQH key detail popup's "Create key": imports an identity card

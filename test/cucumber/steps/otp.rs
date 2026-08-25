@@ -55,7 +55,7 @@ async fn provisioned_contact(w: &mut AlooWorld, a: String, b: String) {
     let cfg_a = cfg_at(w.temp_path(&format!("otp-{a}")));
     let cfg_b = cfg_at(w.temp_path(&format!("otp-{b}")));
 
-    let payload = initiate_provisioning(&cfg_a, 1, &fp_a, &fp_b, OtpPurpose::Live)
+    let payload = initiate_provisioning(&cfg_a, 1, &fp_a, "device-a", &fp_b, "device-b", OtpPurpose::Live)
         .await
         .expect("provisioning generation should succeed");
     let ack = apply_incoming_setup(&cfg_b, &payload).await;
@@ -79,7 +79,7 @@ async fn same_contact_name(_w: &mut AlooWorld, a: String, b: String) {
     let (pub_b, _) = pq_bundle_for(&b);
     let fp_a = bundle_fingerprint(&pub_a).expect("fingerprint");
     let fp_b = bundle_fingerprint(&pub_b).expect("fingerprint");
-    assert_eq!(contact_name_for(&fp_a, &fp_b), contact_name_for(&fp_b, &fp_a));
+    assert_eq!(contact_name_for(&fp_a, "device-a", &fp_b, "device-b"), contact_name_for(&fp_b, "device-b", &fp_a, "device-a"));
 }
 
 /// The layer's one rule, in the order it actually happens: the pad goes on
@@ -413,7 +413,7 @@ async fn generate_unaccepted_pad(w: &mut AlooWorld, from: String, to: String) {
     let cfg_a = cfg_at(w.temp_path(&format!("otp-unaccepted-{from}")));
     let cfg_b = cfg_at(w.temp_path(&format!("otp-unaccepted-{to}")));
 
-    let payload = initiate_provisioning(&cfg_a, 1, &fp_a, &fp_b, OtpPurpose::Live)
+    let payload = initiate_provisioning(&cfg_a, 1, &fp_a, "device-a", &fp_b, "device-b", OtpPurpose::Live)
         .await
         .expect("provisioning generation should succeed");
     w.otp_contact_name = Some(payload.contact_name.clone());
@@ -459,7 +459,7 @@ async fn later_invitation_succeeds(w: &mut AlooWorld, from: String, to: String) 
 
     // Whichever direction it runs in, the contact name is the same - which
     // is precisely why a leftover half used to make this impossible.
-    let payload = initiate_provisioning(&cfg_from, 1, &fp_a, &fp_b, OtpPurpose::Live)
+    let payload = initiate_provisioning(&cfg_from, 1, &fp_a, "device-a", &fp_b, "device-b", OtpPurpose::Live)
         .await
         .expect("a later invitation must not be blocked by an abandoned one");
     let ack = apply_incoming_setup(&cfg_to, &payload).await;
@@ -488,10 +488,10 @@ async fn both_generate_at_once(w: &mut AlooWorld) {
     let cfg_a = cfg_at(w.temp_path("otp-glare-alice"));
     let cfg_b = cfg_at(w.temp_path("otp-glare-bob"));
 
-    let pad_a = initiate_provisioning(&cfg_a, 1, &fp_a, &fp_b, OtpPurpose::Live)
+    let pad_a = initiate_provisioning(&cfg_a, 1, &fp_a, "device-a", &fp_b, "device-b", OtpPurpose::Live)
         .await
         .expect("alice's pad");
-    initiate_provisioning(&cfg_b, 1, &fp_b, &fp_a, OtpPurpose::Live)
+    initiate_provisioning(&cfg_b, 1, &fp_b, "device-b", &fp_a, "device-a", OtpPurpose::Live)
         .await
         .expect("bob's pad");
 
@@ -704,9 +704,12 @@ async fn pad_only_peer(
     // Neither side's key reads as a keybundle *to the other*, which is
     // exactly what makes this pair `Direct` from both ends.
     session.set_own_pinned_der_for_test(pad_only_pin(own_name));
-    session
-        .id_store_mut()
-        .check_and_pin(peer_name, &pad_only_pin(peer_name));
+    session.id_store_mut().pin_new_device(
+        peer_name,
+        "test-device",
+        &pad_only_pin(peer_name),
+        aloo::client::idstore::Trust::Tofu,
+    );
     session.otp_store_mut().mark_provisioned(contact);
 
     // No server anywhere: a `direct_punch_to` entry is the only thing that
@@ -716,19 +719,20 @@ async fn pad_only_peer(
         own_name.to_string(),
         vec![aloo::settings::DirectPunchTarget {
             nickname: peer_name.to_string(),
+            device_id: None,
             host: "127.0.0.1".to_string(),
             port: 1,
             frequency: aloo::settings::PunchFrequency::parse("every_1m").expect("valid frequency"),
         }],
         0,
     );
-    let peer = aloo::client::p2p::direct_peer_id(peer_name);
+    let peer = aloo::client::p2p::direct_peer_id(peer_name, None);
     session.peer_link_mut().open_unpunched_link_for_test(peer);
 
     let mut ui = UiState::new(own_name.into());
     // A serverless client is its own `direct_peer_id` too - there is no
     // server to assign one (`client::daemon::run`).
-    ui.set_own_id(aloo::client::p2p::direct_peer_id(own_name));
+    ui.set_own_id(aloo::client::p2p::direct_peer_id(own_name, None));
     // A pair set up already holding a pad for each other is, by
     // definition, currently linked - individual scenarios modeling a peer
     // going unreachable override this explicitly.
@@ -807,7 +811,7 @@ async fn same_pad_contact(w: &mut AlooWorld) {
     let (a, b) = w.pad_only.as_ref().expect("no pad-only pair");
     for (side, who) in [(a, "alice"), (b, "bob")] {
         assert_eq!(
-            contact_name_if_active(&side.session, &side.peer_der).as_deref(),
+            contact_name_if_active(&side.session, side.peer, &side.peer_der).as_deref(),
             Some(contact.as_str()),
             "{who} must find this pair's pad, with nothing negotiated"
         );
@@ -868,7 +872,7 @@ async fn pad_only_send(w: &mut AlooWorld, _a: String, _b: String, message: Strin
 #[then(expr = "{word} reads it, and registers {word} because the pad opened it")]
 async fn pad_only_receive(w: &mut AlooWorld, _b: String, _a: String) {
     let (a, b) = w.pad_only.as_mut().expect("no pad-only pair");
-    let (seq, msg_id, envelope) = a
+    let (seq, msg_id, envelope, sender_device_id) = a
         .session
         .peer_link_mut()
         .pending_payloads(a.peer)
@@ -878,8 +882,9 @@ async fn pad_only_receive(w: &mut AlooWorld, _b: String, _a: String) {
                 seq,
                 msg_id,
                 envelope,
+                sender_device_id,
                 ..
-            } => Some((seq, msg_id, envelope)),
+            } => Some((seq, msg_id, envelope, sender_device_id)),
             _ => None,
         })
         .expect("a pad-wrapped message should have gone out");
@@ -901,6 +906,7 @@ async fn pad_only_receive(w: &mut AlooWorld, _b: String, _a: String) {
         seq,
         msg_id,
         envelope,
+        sender_device_id,
     )
     .await
     .expect("the receive path should not fail");
@@ -917,6 +923,142 @@ async fn pad_only_receive(w: &mut AlooWorld, _b: String, _a: String) {
     );
 }
 
+// ---------------------------------------------------------------------
+// No-server table row 3: cleartext device claim, checked before the pad
+// is ever touched (device-pinning plan §5).
+// ---------------------------------------------------------------------
+
+/// Like `pad_only_send`, but the sender's own device_id is swapped out for
+/// `claimed` just for this one send - simulating a second physical machine
+/// holding a copy of the same pad file, rather than a genuine reconnect
+/// from the bound device.
+#[when(expr = "{word} sends {word} {string} but claims to be device {string}")]
+async fn pad_only_send_claiming_device(
+    w: &mut AlooWorld,
+    _a: String,
+    _b: String,
+    message: String,
+    claimed: String,
+) {
+    let contact = w.otp_contact_name.clone().expect("no contact");
+    let (a, _) = w.pad_only.as_mut().expect("no pad-only pair");
+    let real_device_id = a.session.own_device_id_for_test().to_string();
+    a.session.set_own_device_id_for_test(claimed);
+    let (msg_id, delivery) = a.ui.start_delivery(&[a.peer]);
+    a.ui.push_outgoing_dm(
+        a.peer,
+        aloo::client::tui::ui::MessageBody::Text(message.clone()),
+        Some(delivery),
+    );
+    let peer_der = a.peer_der.clone();
+    send_or_queue(
+        &mut aloo::control::NullSink,
+        &mut a.session,
+        &mut a.ui,
+        a.peer,
+        &contact,
+        &peer_der,
+        message.as_bytes(),
+        aloo::proto::Content::Text,
+        None,
+        None,
+        Some(msg_id),
+    )
+    .await
+    .expect("the pad-only send path should not fail");
+    a.session.set_own_device_id_for_test(real_device_id);
+}
+
+/// Delivers whatever `a` just queued, under the claimed (spoofed)
+/// device_id, and asserts it is refused pre-decrypt: not delivered, and
+/// the pad's own binding untouched. Keeps the envelope so a later step can
+/// redeliver the identical ciphertext honestly.
+#[then(expr = "{word} holds it unread, and the pad stays bound to {word}'s real device")]
+async fn claim_refused_pad_untouched(w: &mut AlooWorld, _b: String, _a: String) {
+    let contact = w.otp_contact_name.clone().expect("no contact");
+    let (a, b) = w.pad_only.as_mut().expect("no pad-only pair");
+    let real_device = a.session.own_device_id_for_test().to_string();
+    // `pending_payloads` is a non-destructive peek, so the priming
+    // message's envelope is still in there too - `pending_payloads`
+    // returns them in queue order, so the claiming send's is the one
+    // with the highest `seq`, exactly `take_second_envelope`'s approach
+    // in `otp_ack_wiring_test.rs`.
+    let (seq, msg_id, envelope, claimed_device_id) = a
+        .session
+        .peer_link_mut()
+        .pending_payloads(a.peer)
+        .into_iter()
+        .filter_map(|p| match p {
+            aloo::p2p_proto::P2pPayload::OtpEnvelope {
+                seq,
+                msg_id,
+                envelope,
+                sender_device_id,
+                ..
+            } => Some((seq, msg_id, envelope, sender_device_id)),
+            _ => None,
+        })
+        .max_by_key(|(seq, ..)| *seq)
+        .expect("the claiming send should have queued a payload");
+    assert_ne!(
+        claimed_device_id, real_device,
+        "the queued payload should carry the spoofed claim, not the real device"
+    );
+    aloo::client::otp::on_message(
+        &mut b.session,
+        &mut b.ui,
+        None,
+        b.peer,
+        "alice".into(),
+        seq,
+        msg_id,
+        envelope.clone(),
+        claimed_device_id,
+    )
+    .await
+    .expect("a refusal is not an error - it's Ok(()), nothing delivered");
+    assert!(
+        !b.ui.private_rooms[&b.peer]
+            .log
+            .iter()
+            .any(|e| matches!(&e.body, aloo::client::tui::ui::MessageBody::Text(t) if t.contains("copied pad"))),
+        "the wrongly-claimed message must not have been delivered"
+    );
+    assert_eq!(
+        b.session.otp_store_mut().bound_peer_device_id(&contact),
+        Some(real_device.as_str()),
+        "the pad's binding must be untouched by a refused claim"
+    );
+    w.held_otp_message = Some((seq, msg_id, envelope));
+}
+
+#[then(expr = "{word} reads it once {word}'s real device claims the same message")]
+async fn claim_recovers_honestly(w: &mut AlooWorld, _b: String, _a: String) {
+    let (seq, msg_id, envelope) = w.held_otp_message.take().expect("no held message to redeliver");
+    let (a, b) = w.pad_only.as_mut().expect("no pad-only pair");
+    let real_device = a.session.own_device_id_for_test().to_string();
+    aloo::client::otp::on_message(
+        &mut b.session,
+        &mut b.ui,
+        None,
+        b.peer,
+        "alice".into(),
+        seq,
+        msg_id,
+        envelope,
+        real_device,
+    )
+    .await
+    .expect("the genuine device's receive path should not fail");
+    assert!(
+        b.ui.private_rooms[&b.peer]
+            .log
+            .iter()
+            .any(|e| matches!(&e.body, aloo::client::tui::ui::MessageBody::Text(t) if t.contains("copied pad"))),
+        "the exact same ciphertext, honestly claimed, must still decrypt and deliver"
+    );
+}
+
 /// Hands whatever pad-wrapped payload one side queued to the other - the
 /// control notices travel in both directions, unlike a text message.
 async fn deliver_pad_envelope(
@@ -924,7 +1066,7 @@ async fn deliver_pad_envelope(
     to: &mut crate::world::PadOnlyPeer,
     from_name: &str,
 ) {
-    let (seq, msg_id, envelope) = from
+    let (seq, msg_id, envelope, sender_device_id) = from
         .session
         .peer_link_mut()
         .pending_payloads(from.peer)
@@ -934,8 +1076,9 @@ async fn deliver_pad_envelope(
                 seq,
                 msg_id,
                 envelope,
+                sender_device_id,
                 ..
-            } => Some((seq, msg_id, envelope)),
+            } => Some((seq, msg_id, envelope, sender_device_id)),
             _ => None,
         })
         .expect("a pad-wrapped payload should have gone out");
@@ -948,6 +1091,7 @@ async fn deliver_pad_envelope(
         seq,
         msg_id,
         envelope,
+        sender_device_id,
     )
     .await
     .expect("the receive path should not fail");
@@ -1068,7 +1212,7 @@ async fn pad_only_end_recovered(w: &mut AlooWorld) {
     let contact = w.otp_contact_name.clone().expect("no contact");
     let (a, b) = w.pad_only.as_mut().expect("no pad-only pair");
     let peer = a.peer;
-    let envelopes: Vec<(u64, Option<u64>, aloo::proto::Envelope)> = a
+    let envelopes: Vec<(u64, Option<u64>, aloo::proto::Envelope, String)> = a
         .session
         .peer_link_mut()
         .pending_payloads(peer)
@@ -1078,8 +1222,9 @@ async fn pad_only_end_recovered(w: &mut AlooWorld) {
                 seq,
                 msg_id,
                 envelope,
+                sender_device_id,
                 ..
-            } => Some((seq, msg_id, envelope)),
+            } => Some((seq, msg_id, envelope, sender_device_id)),
             _ => None,
         })
         .collect();
@@ -1103,7 +1248,7 @@ async fn pad_only_end_recovered(w: &mut AlooWorld) {
     );
 
     // Bob finally receives the recovered copy...
-    let (seq, msg_id, envelope) = envelopes.into_iter().next_back().unwrap();
+    let (seq, msg_id, envelope, sender_device_id) = envelopes.into_iter().next_back().unwrap();
     aloo::client::otp::on_message(
         &mut b.session,
         &mut b.ui,
@@ -1113,6 +1258,7 @@ async fn pad_only_end_recovered(w: &mut AlooWorld) {
         seq,
         msg_id,
         envelope,
+        sender_device_id,
     )
     .await
     .expect("the receive path should not fail");
@@ -1318,7 +1464,7 @@ async fn pad_only_send_voice(w: &mut AlooWorld) {
     .await
     .expect("the voice offer should not fail");
 
-    let (stream_id, seq, envelope) = a
+    let (stream_id, seq, envelope, sender_device_id) = a
         .session
         .peer_link_mut()
         .pending_payloads(peer)
@@ -1328,8 +1474,9 @@ async fn pad_only_send_voice(w: &mut AlooWorld) {
                 stream_id,
                 seq,
                 envelope,
+                sender_device_id,
                 ..
-            } => Some((stream_id, seq, envelope)),
+            } => Some((stream_id, seq, envelope, sender_device_id)),
             _ => None,
         })
         .expect("the offer should have gone out");
@@ -1347,6 +1494,7 @@ async fn pad_only_send_voice(w: &mut AlooWorld) {
         stream_id,
         seq,
         envelope,
+        sender_device_id,
     )
     .await;
 }

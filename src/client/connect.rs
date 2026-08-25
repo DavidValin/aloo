@@ -148,7 +148,7 @@ pub async fn run_client_inner(
             file_priv: PathBuf::from(&popup.my_key.file_priv),
         };
         let identity = resolve_my_keypair(&my_key)?;
-        let you = crate::client::p2p::direct_peer_id(&popup.nickname);
+        let you = crate::client::p2p::direct_peer_id(&popup.nickname, None);
         let id_store = load_id_store(&idstore::default_path());
         // Same reasoning as the connected path below: the popup is done
         // with the terminal (there never was one here), so the stdin

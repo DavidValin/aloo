@@ -76,7 +76,10 @@ fn require_otp() -> bool {
 fn contact_name_is_order_independent() {
     let a = fp(0x01);
     let b = fp(0x02);
-    assert_eq!(contact_name_for(&a, &b), contact_name_for(&b, &a));
+    assert_eq!(
+        contact_name_for(&a, "dev-a", &b, "dev-b"),
+        contact_name_for(&b, "dev-b", &a, "dev-a")
+    );
 }
 
 /// @requirement AC-136
@@ -84,8 +87,8 @@ fn contact_name_is_order_independent() {
 fn contact_name_is_deterministic() {
     let a = fp(0xaa);
     let b = fp(0xbb);
-    let first = contact_name_for(&a, &b);
-    let second = contact_name_for(&a, &b);
+    let first = contact_name_for(&a, "dev-a", &b, "dev-b");
+    let second = contact_name_for(&a, "dev-a", &b, "dev-b");
     assert_eq!(first, second);
 }
 
@@ -95,7 +98,23 @@ fn contact_name_differs_for_different_pairs() {
     let a = fp(0x01);
     let b = fp(0x02);
     let c = fp(0x03);
-    assert_ne!(contact_name_for(&a, &b), contact_name_for(&a, &c));
+    assert_ne!(
+        contact_name_for(&a, "dev-a", &b, "dev-b"),
+        contact_name_for(&a, "dev-a", &c, "dev-c")
+    );
+}
+
+/// Same nickname/keys, different device - a genuinely different contact
+/// name, per the device-pinning plan §4.
+/// @requirement AC-136
+#[test]
+fn contact_name_differs_for_different_devices_of_the_same_pair() {
+    let a = fp(0x01);
+    let b = fp(0x02);
+    assert_ne!(
+        contact_name_for(&a, "dev-a-1", &b, "dev-b"),
+        contact_name_for(&a, "dev-a-2", &b, "dev-b")
+    );
 }
 
 /// @requirement AC-136
@@ -103,7 +122,7 @@ fn contact_name_differs_for_different_pairs() {
 fn contact_name_satisfies_the_otp_cli_naming_rules() {
     // README: a contact name may not be `.`/`..`, contain a path separator,
     // any of `: * ? " < > | =`, or a control character.
-    let name = contact_name_for(&fp(0x00), &fp(0xff));
+    let name = contact_name_for(&fp(0x00), "dev-a", &fp(0xff), "dev-b");
     assert_ne!(name, ".");
     assert_ne!(name, "..");
     let forbidden = ['/', '\\', ':', '*', '?', '"', '<', '>', '|', '='];
@@ -138,10 +157,10 @@ async fn initiate_provisioning_and_apply_incoming_setup_leave_both_sides_usable(
     let alice_cfg = config_at(temp_dir("handshake-alice"));
     let bob_cfg = config_at(temp_dir("handshake-bob"));
 
-    let payload = initiate_provisioning(&alice_cfg, 1, &own_fp, &peer_fp, OtpPurpose::Live)
+    let payload = initiate_provisioning(&alice_cfg, 1, &own_fp, "alice-device", &peer_fp, "bob-device", OtpPurpose::Live)
         .await
         .expect("provisioning generation should succeed");
-    let expected_contact_name = contact_name_for(&own_fp, &peer_fp);
+    let expected_contact_name = contact_name_for(&own_fp, "alice-device", &peer_fp, "bob-device");
     assert_eq!(payload.contact_name, expected_contact_name);
 
     // Alice's own half is staged, deliberately *not* in her keychain yet -
@@ -184,11 +203,11 @@ async fn initiate_provisioning_for_mail_purpose_stages_under_the_mail_contact_na
     let alice_cfg = config_at(temp_dir("mail-handshake-alice"));
     let bob_cfg = config_at(temp_dir("mail-handshake-bob"));
 
-    let payload = initiate_provisioning(&alice_cfg, 1, &own_fp, &peer_fp, OtpPurpose::Mail)
+    let payload = initiate_provisioning(&alice_cfg, 1, &own_fp, "alice-device", &peer_fp, "bob-device", OtpPurpose::Mail)
         .await
         .expect("provisioning generation should succeed");
-    let expected_mail_name = contact_name_for_mail(&own_fp, &peer_fp);
-    let live_name = contact_name_for(&own_fp, &peer_fp);
+    let expected_mail_name = contact_name_for_mail(&own_fp, "alice-device", &peer_fp, "bob-device");
+    let live_name = contact_name_for(&own_fp, "alice-device", &peer_fp, "bob-device");
     assert_eq!(payload.contact_name, expected_mail_name);
     assert_ne!(
         payload.contact_name, live_name,
@@ -275,9 +294,9 @@ async fn an_invitation_that_is_never_accepted_leaves_no_stale_contact() {
     let peer_fp = fp(0x40);
     let alice_cfg = config_at(temp_dir("never-accepted-alice"));
     let bob_cfg = config_at(temp_dir("never-accepted-bob"));
-    let contact_name = contact_name_for(&own_fp, &peer_fp);
+    let contact_name = contact_name_for(&own_fp, "alice-device", &peer_fp, "bob-device");
 
-    let _abandoned = initiate_provisioning(&alice_cfg, 1, &own_fp, &peer_fp, OtpPurpose::Live)
+    let _abandoned = initiate_provisioning(&alice_cfg, 1, &own_fp, "alice-device", &peer_fp, "bob-device", OtpPurpose::Live)
         .await
         .expect("alice's own provisioning should succeed");
     assert!(
@@ -291,7 +310,7 @@ async fn an_invitation_that_is_never_accepted_leaves_no_stale_contact() {
     // The invitation is abandoned, and a second attempt succeeds where it
     // previously deadlocked - all the way to both sides being usable.
     discard_pending_setup(&alice_cfg, &contact_name);
-    let retry = initiate_provisioning(&alice_cfg, 1, &own_fp, &peer_fp, OtpPurpose::Live)
+    let retry = initiate_provisioning(&alice_cfg, 1, &own_fp, "alice-device", &peer_fp, "bob-device", OtpPurpose::Live)
         .await
         .expect("a fresh attempt must succeed after an abandoned one");
     let ack = apply_incoming_setup(&bob_cfg, &retry).await;
@@ -315,9 +334,9 @@ async fn a_pending_setup_is_re_readable_for_retries_and_identical_each_time() {
     let own_fp = fp(0x31);
     let peer_fp = fp(0x41);
     let alice_cfg = config_at(temp_dir("retry-readback-alice"));
-    let contact_name = contact_name_for(&own_fp, &peer_fp);
+    let contact_name = contact_name_for(&own_fp, "alice-device", &peer_fp, "bob-device");
 
-    let first = initiate_provisioning(&alice_cfg, 1, &own_fp, &peer_fp, OtpPurpose::Live)
+    let first = initiate_provisioning(&alice_cfg, 1, &own_fp, "alice-device", &peer_fp, "bob-device", OtpPurpose::Live)
         .await
         .expect("provisioning should succeed");
     let again = read_pending_setup(&alice_cfg, &contact_name, 1)
@@ -349,13 +368,13 @@ async fn asymmetric_provisioning_recovers_once_the_stale_contact_is_removed() {
     let peer_fp = fp(0x60);
     let alice_cfg = config_at(temp_dir("asym-recover-alice"));
     let bob_cfg = config_at(temp_dir("asym-recover-bob"));
-    let contact_name = contact_name_for(&own_fp, &peer_fp);
+    let contact_name = contact_name_for(&own_fp, "alice-device", &peer_fp, "bob-device");
 
     // A stale entry can still arise even though provisioning no longer
     // commits early: this is a contact that genuinely completed once (or was
     // provisioned out of band and adopted by `detect_or_adopt_existing`) and
     // whose counterpart has since lost their half.
-    let _stale_payload = initiate_provisioning(&alice_cfg, 1, &own_fp, &peer_fp, OtpPurpose::Live)
+    let _stale_payload = initiate_provisioning(&alice_cfg, 1, &own_fp, "alice-device", &peer_fp, "bob-device", OtpPurpose::Live)
         .await
         .expect("alice's own (stale) provisioning should succeed");
     assert!(commit_pending_setup(&alice_cfg, &contact_name).await);
@@ -374,7 +393,7 @@ async fn asymmetric_provisioning_recovers_once_the_stale_contact_is_removed() {
     assert!(alice_store.get(&contact_name).is_none());
 
     // Now a fresh handshake for the very same contact name succeeds.
-    let fresh_payload = initiate_provisioning(&alice_cfg, 1, &own_fp, &peer_fp, OtpPurpose::Live)
+    let fresh_payload = initiate_provisioning(&alice_cfg, 1, &own_fp, "alice-device", &peer_fp, "bob-device", OtpPurpose::Live)
         .await
         .expect("provisioning should succeed once the stale entry is gone");
     let ack = apply_incoming_setup(&bob_cfg, &fresh_payload).await;
@@ -631,13 +650,13 @@ async fn a_glare_leaves_both_sides_holding_halves_of_one_pad() {
     let bob_fp = fp(0x71);
     let alice_cfg = config_at(temp_dir("glare-alice"));
     let bob_cfg = config_at(temp_dir("glare-bob"));
-    let contact_name = contact_name_for(&alice_fp, &bob_fp);
+    let contact_name = contact_name_for(&alice_fp, "alice-device", &bob_fp, "bob-device");
 
     // Both generate before either has answered.
-    let pad_a = initiate_provisioning(&alice_cfg, 1, &alice_fp, &bob_fp, OtpPurpose::Live)
+    let pad_a = initiate_provisioning(&alice_cfg, 1, &alice_fp, "alice-device", &bob_fp, "bob-device", OtpPurpose::Live)
         .await
         .expect("alice's pad");
-    let _pad_b = initiate_provisioning(&bob_cfg, 1, &bob_fp, &alice_fp, OtpPurpose::Live)
+    let _pad_b = initiate_provisioning(&bob_cfg, 1, &bob_fp, "bob-device", &alice_fp, "alice-device", OtpPurpose::Live)
         .await
         .expect("bob's pad");
 
@@ -674,12 +693,12 @@ async fn accepting_a_peers_pad_retires_this_sides_own_staged_one() {
     let bob_fp = fp(0x73);
     let alice_cfg = config_at(temp_dir("retire-alice"));
     let bob_cfg = config_at(temp_dir("retire-bob"));
-    let contact_name = contact_name_for(&alice_fp, &bob_fp);
+    let contact_name = contact_name_for(&alice_fp, "alice-device", &bob_fp, "bob-device");
 
-    let _mine = initiate_provisioning(&alice_cfg, 1, &alice_fp, &bob_fp, OtpPurpose::Live)
+    let _mine = initiate_provisioning(&alice_cfg, 1, &alice_fp, "alice-device", &bob_fp, "bob-device", OtpPurpose::Live)
         .await
         .expect("alice's own pad");
-    let theirs = initiate_provisioning(&bob_cfg, 1, &bob_fp, &alice_fp, OtpPurpose::Live)
+    let theirs = initiate_provisioning(&bob_cfg, 1, &bob_fp, "bob-device", &alice_fp, "alice-device", OtpPurpose::Live)
         .await
         .expect("bob's pad");
 

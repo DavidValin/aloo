@@ -958,13 +958,13 @@ so_that = "I can judge whether it is really them"
 
 [[user_story.acceptance_criteria]]
 id = "AC-047"
-description = "A nickname seen for the first time, or seen again with the key it was pinned to, is accepted silently."
-evidence = "docs/PROTOCOL.md 12.4; tests first_sighting_of_a_nickname_is_new, same_nickname_same_key_is_a_match"
+description = "A `(nickname, device_id)` pair seen for the first time is pinned silently; seen again under that exact device with the key it holds, it is accepted silently as a match - `IdStore::compare_key`'s `New`/`Match` outcomes, compared only against that nickname's entries sharing the same `key_mode` (device-pinning plan §1's key_mode-scoped, per-device model)."
+evidence = "docs/PROTOCOL.md 12.4; src/client/idstore.rs IdStore::compare_key, check_key; tests first_sighting_of_a_device_is_retrievable_by_that_exact_device, a_device_with_no_entry_is_none, two_devices_for_one_nickname_are_pinned_independently (idstore_test.rs); scenarios features/identity/device_pinning_reference_table.feature 'A server introduces two peers who already hold an otp-only pin for each other', 'A server introduces two peers where only one already holds an otp-only pin for the other', 'A server introduces two peers where only one already has the other pinned' - reference table server rows 3-5, a fresh key_mode-scoped pq_hybrid first sighting never disturbing a pre-existing otp-only (Direct) pin for the same nickname"
 
 [[user_story.acceptance_criteria]]
 id = "AC-048"
-description = "A nickname returning under a different, unverifiable key opens a blocking Accept/Reject review naming the user - see US-017 for what Accept/Reject actually do."
-evidence = "docs/PROTOCOL.md 12.4; tests same_nickname_different_key_is_a_mismatch, push_identity_review_opens_a_popup_naming_the_peer_in_the_channel_view, identity_review_popup_also_shows_over_an_open_private_room"
+description = "A `(nickname, device_id)` pair returning under a different, unverifiable key opens a blocking Accept/Reject review naming the user - see US-017 for what Accept/Reject actually do. `Accept` replaces only that one device's entry, or adds a brand-new one, leaving every sibling device's own pin untouched (`IdStore::accept_identity_review`, device-pinning plan §2) - key and `key_mode` set atomically on the one resolved entry, which matters specifically for the rare case a review is accepted before this connection's device id was ever learned (`session.rs`'s `AcceptIdentity` arm falls back to the unbound `\"\"` sentinel): that sentinel is shared by *every* unbound entry regardless of `key_mode`, so a nickname that already has an unrelated unbound `Direct` pin (§16.2) must never have it silently corrupted by an unrelated `pq_hybrid` review being accepted."
+evidence = "docs/PROTOCOL.md 12.4; src/client/idstore.rs IdStore::accept_identity_review, pin_new_device_with_key_mode; src/client/session.rs check_identity, finalize_identity_pin, handle_ui_action's AcceptIdentity arm; tests replace_device_key_overwrites_only_the_named_device, accept_identity_review_overwrites_a_known_devices_key_in_place, accept_identity_review_adds_a_new_device_without_touching_a_sibling, accept_identity_review_on_the_unbound_fallback_never_touches_an_unrelated_direct_pin, an_identical_key_already_pinned_under_a_different_device_still_requires_a_review (idstore_test.rs, reference table server row 7), push_identity_review_opens_a_popup_naming_the_peer_in_the_channel_view, identity_review_popup_also_shows_over_an_open_private_room; scenario features/identity/identity_pinning_live.feature 'A live reconnect under a different key is reviewed, and Accept actually persists it' - two real run_daemon_sessions over a real server, the review popup read off a real rendered screen, Accept driven by real key input, and the result reloaded from disk afterward; scenario features/identity/device_pinning_reference_table.feature 'An identical key already pinned under a different device still opens a review' - reference table server row 7"
 
 [[user_story.acceptance_criteria]]
 id = "AC-049"
@@ -973,48 +973,48 @@ evidence = "docs/PROTOCOL.md 12.4; tests no_identity_review_popup_is_shown_when_
 
 [[user_story.technical_behavior]]
 id = "TB-086"
-description = "A mismatch re-pins the nickname to the newly-seen key regardless, and hands the previous key to the caller as the only place it survives."
-evidence = "docs/PROTOCOL.md 12.4; test same_nickname_different_key_is_a_mismatch"
+description = "Comparing a newly-seen key that differs from what a device has pinned reports the mismatch together with the previously-pinned key (`KeyCheck::Mismatch { previous_public_key_der }`), so the caller (`session::check_identity`/`finalize_identity_pin`) has what it needs to show a review without a second lookup - `IdStore::check_key`/`compare_key` never re-pin anything on their own; only `replace_device_key`, `pin_new_device`, `claim_unbound`, or a continuity match ever write."
+evidence = "docs/PROTOCOL.md 12.4; src/client/idstore.rs KeyCheck::Mismatch, IdStore::check_key, compare_key; test replace_device_key_overwrites_only_the_named_device (idstore_test.rs)"
 
 [[user_story.technical_behavior]]
 id = "TB-087"
-description = "Nicknames are pinned independently of one another."
-evidence = "test different_nicknames_are_tracked_independently"
+description = "Nicknames are pinned independently of one another, and - within one nickname - so is each of its devices (device-pinning plan §1's additive rule): pinning one never reads or touches another's entry."
+evidence = "tests different_nicknames_are_tracked_independently, two_devices_for_one_nickname_are_pinned_independently (idstore_test.rs)"
 
 [[user_story.technical_behavior]]
 id = "TB-088"
-description = "The store round-trips the full key bytes through save and load, including arbitrary non-UTF-8 DER."
-evidence = "docs/PROTOCOL.md 12.2, 12.5; test save_then_load_round_trips_the_full_key_bytes"
+description = "The store round-trips the full key bytes through save and load, per device, including arbitrary non-UTF-8 DER."
+evidence = "docs/PROTOCOL.md 12.2, 12.5; test save_then_load_round_trips_the_full_key_bytes_per_device (idstore_test.rs)"
 
 [[user_story.technical_behavior]]
 id = "TB-089"
 description = "Saving the store creates any missing parent directories."
-evidence = "docs/PROTOCOL.md 12.5; test save_creates_missing_parent_directories"
+evidence = "docs/PROTOCOL.md 12.5; test save_creates_missing_parent_directories (idstore_test.rs)"
 
 [[user_story.technical_behavior]]
 id = "TB-090"
-description = "A nickname containing the file's own delimiters is never stored, so a remote peer cannot inject records into a local trust file."
-evidence = "docs/PROTOCOL.md 12.5; test a_nickname_containing_a_tab_is_never_pinned"
+description = "A nickname or device_id containing the file's own delimiters is never stored, so a remote peer cannot inject records into a local trust file - checked wherever either is peer-reported: pinning a new device, and claiming an unbound entry."
+evidence = "docs/PROTOCOL.md 12.5; tests a_nickname_containing_a_tab_is_never_pinned, a_nickname_containing_a_newline_is_never_pinned, a_device_id_containing_a_tab_is_never_pinned, claim_unbound_refuses_an_unstorable_device_id (idstore_test.rs)"
 
 [[user_story.technical_behavior]]
 id = "TB-091"
-description = "The on-disk format is one 'nickname<TAB>lowercase-hex' line per entry, and the default path always resolves under ~/.aloo - never a loose file in the current working directory."
-evidence = "docs/PROTOCOL.md 12.5; tests on_disk_format_is_hex_encoded_not_raw_or_base64, default_path_always_resolves_under_the_dot_aloo_home_directory"
+description = "The on-disk format is one `nickname<TAB>device_id<TAB>lowercase-hex<TAB>trust<TAB>last_addr<TAB>last_seen_unix<TAB>key_mode<TAB>pinned_from` line per device, and the default path always resolves under ~/.aloo - never a loose file in the current working directory."
+evidence = "docs/PROTOCOL.md 12.5; tests on_disk_format_is_hex_encoded_not_raw_or_base64, default_path_always_resolves_under_the_dot_aloo_home_directory (idstore_test.rs)"
 
 [[user_story.technical_behavior]]
 id = "TB-092"
 description = "A line that is malformed, has an undecodable hex half, or is not a real key is skipped on load rather than failing the whole store."
-evidence = "docs/PROTOCOL.md 12.5; test corrupted_lines_in_an_existing_file_are_skipped_not_fatal"
+evidence = "docs/PROTOCOL.md 12.5; test corrupted_lines_in_an_existing_file_are_skipped_not_fatal (idstore_test.rs)"
 
 [[user_story.technical_behavior]]
 id = "TB-093"
-description = "A store file that does not exist yet loads as empty rather than erroring, and an empty in-memory store can still be saved."
-evidence = "docs/PROTOCOL.md 12.5; tests loading_a_missing_file_starts_empty_not_an_error, new_empty_starts_with_nothing_and_can_still_save"
+description = "A store file that does not exist yet loads as empty rather than erroring, an empty in-memory store can still be saved, and a file written in the old, device-less format (predating the device-pinning plan, with no migration path) is unparseable under the new column shape and likewise loads as empty rather than erroring."
+evidence = "docs/PROTOCOL.md 12.5; tests loading_a_missing_file_starts_empty_not_an_error, new_empty_starts_with_nothing_and_can_still_save, an_old_format_file_predating_devices_loads_as_empty_not_an_error (idstore_test.rs)"
 
 [[user_story.technical_behavior]]
 id = "TB-094"
 description = "Reading a pinned entry does not pin, re-pin, or otherwise mutate the store, and an unknown nickname reads as absent."
-evidence = "docs/PROTOCOL.md 12.2; tests get_reads_a_pinned_entry_without_mutating_anything, get_on_an_unknown_nickname_is_none"
+evidence = "docs/PROTOCOL.md 12.2; tests get_reads_without_mutating_anything, get_on_an_unknown_nickname_is_none (idstore_test.rs)"
 
 # ============================================================================
 # US-012 - See who is present and how their identity is protected
@@ -1296,8 +1296,8 @@ evidence = "docs/PROTOCOL.md 12.7; src/client/device_id.rs load_or_create; tests
 
 [[user_story.acceptance_criteria]]
 id = "AC-165"
-description = "A peer's device id is sent encrypted (Content::DeviceIdAnnounce, sealed per-recipient like any other content) once their direct link reaches Active, and, together with the address the link reaches them at, is recorded against their pinned key - refreshed on every later Active transition, not just the first."
-evidence = "docs/PROTOCOL.md 12.7; src/client/session.rs send_device_id_announce, on_device_id_announce, maybe_resolve_p2p_identity_data, src/client/idstore.rs IdStore::set_last_seen; tests device_id_announce_travels_encrypted_and_decrypts_on_arrival, set_last_seen_records_address_and_device_id_for_a_pinned_nickname, last_seen_survives_a_save_and_load_round_trip"
+description = "A peer's device id is sent encrypted (Content::DeviceIdAnnounce, sealed per-recipient like any other content) once their direct link reaches Active, refused if empty or non-UTF-8 (`device_id::accept_announced` - an empty string is the reserved unbound-entry sentinel, and a peer must never be able to plant one), and is load-bearing rather than merely informational (device-pinning plan §1/§2): `finalize_identity_pin` uses it to pin/compare against that exact device's own entry, narrowing which entry is touched without ever granting trust on its own. The address the link reaches them at is recorded against that specific device's entry, refreshed on every later Active transition, not just the first."
+evidence = "docs/PROTOCOL.md 12.7; src/client/session.rs send_device_id_announce, on_device_id_announce, finalize_identity_pin, maybe_resolve_p2p_identity_data; src/client/device_id.rs accept_announced; src/client/idstore.rs IdStore::set_last_seen; tests device_id_announce_travels_encrypted_and_decrypts_on_arrival (p2p_test.rs), a_normal_device_id_is_accepted, an_empty_announced_device_id_is_refused, non_utf8_bytes_are_refused (src/client/device_id.rs), set_last_seen_records_address_for_the_named_device_only, last_seen_survives_a_save_and_load_round_trip (idstore_test.rs); scenario features/identity/identity_pinning_live.feature 'A live connection's address is actually recorded on disk' - two real run_daemon_sessions over a real server, id_store reloaded from disk after the session ends"
 
 [[user_story.acceptance_criteria]]
 id = "AC-166"
@@ -1306,8 +1306,8 @@ evidence = "docs/PROTOCOL.md 12.7; src/client/session.rs check_identity, reveal_
 
 [[user_story.technical_behavior]]
 id = "TB-198"
-description = "IdStore's on-disk format gained two trailing, independently-optional columns (last-seen address, last-seen device id); a file written before they existed still loads correctly, with both read back as None."
-evidence = "test a_store_without_last_seen_columns_still_loads"
+description = "A store row missing its trailing optional columns (key_mode, pinned_from - added after the base per-device format) still loads correctly, each read back as absent/None - the same evolutionary-tolerance convention every optional trailing column in this store follows."
+evidence = "test a_store_without_the_trailing_optional_columns_still_loads (idstore_test.rs)"
 
 # ============================================================================
 # US-018 - See system and connection health at a glance
@@ -3099,8 +3099,8 @@ evidence = "docs/SPEC.md 'Contacts'; src/client/contacts.rs refresh_mail_recipie
 
 [[user_story.acceptance_criteria]]
 id = "AC-301"
-description = "PQH's \"Create key\" imports a self-signed identity card (`crypto::pq::IdentityCard`, `aloo --export-identity-card`'s own output), pinning it as `Verified` and recording the file it came from - but only when the card's own attested nickname matches the contact row this was opened from; a card for a different nickname, or a file that does not load or does not self-verify, is refused and pins nothing."
-evidence = "docs/PROTOCOL.md 12.1 (pq_hybrid identity); src/client/contacts.rs pin_identity_card, PinIdentityCardOutcome; src/client/idstore.rs IdStore::pinned_from, set_pinned_from; tests pinning_a_matching_identity_card_pins_it_as_verified_pq_hybrid, pinning_a_card_for_a_different_nickname_is_refused, pinning_a_missing_file_is_invalid_not_a_panic, pinning_a_card_upgrades_an_existing_direct_framed_pin (contacts_test.rs), set_pinned_from_records_it_for_a_pinned_nickname, pinned_from_survives_a_save_and_load_round_trip, re_pinning_keeps_the_previously_recorded_pinned_from (idstore_test.rs), enter_on_a_missing_pqh_key_opens_a_file_browser, selecting_a_card_file_sends_pinidentitycard_and_closes_the_browser, esc_on_the_pqh_browser_returns_to_the_details_popup (ui_contacts_test.rs)"
+description = "PQH's \"Create key\" imports a self-signed identity card (`crypto::pq::IdentityCard`, `aloo --export-identity-card`'s own output), pinning it as `Verified` and recording the file it came from - but only when the card's own attested nickname matches the contact row this was opened from; a card for a different nickname, or a file that does not load or does not self-verify, is refused and pins nothing. Always targets the nickname's unbound `pq_hybrid` entry specifically (`IdStore::pin_unbound_pq_hybrid_card`, device-pinning plan §1's key_mode scoping) - a nickname can have both an unbound `Direct` pin (§16.2, e.g. from an earlier serverless relationship) and an unbound `pq_hybrid` first sighting at once, both sharing the empty device_id sentinel, and a card import must never overwrite the former: it lands as its own, independent entry, key/trust/pinned_from all set atomically on the one resolved entry rather than through several separately-looked-up writes that could each land on a different one."
+evidence = "docs/PROTOCOL.md 12.1, 12.2 (pq_hybrid identity, key_mode scoping); src/client/contacts.rs pin_identity_card, PinIdentityCardOutcome; src/client/idstore.rs IdStore::pin_unbound_pq_hybrid_card, pinned_from, set_pinned_from; tests pinning_a_matching_identity_card_pins_it_as_verified_pq_hybrid, pinning_a_card_for_a_different_nickname_is_refused, pinning_a_missing_file_is_invalid_not_a_panic, pinning_a_card_never_touches_an_existing_direct_framed_pin, pinning_a_card_creates_a_fresh_unbound_entry_when_nothing_was_pinned, pinning_a_second_card_overwrites_the_existing_unbound_pq_hybrid_entry_in_place (contacts_test.rs), set_pinned_from_records_it_for_a_pinned_nickname, pinned_from_survives_a_save_and_load_round_trip, re_pinning_keeps_the_previously_recorded_pinned_from (idstore_test.rs), enter_on_a_missing_pqh_key_opens_a_file_browser, selecting_a_card_file_sends_pinidentitycard_and_closes_the_browser, esc_on_the_pqh_browser_returns_to_the_details_popup (ui_contacts_test.rs)"
 
 [[user_story.acceptance_criteria]]
 id = "AC-302"
@@ -3116,3 +3116,33 @@ evidence = "docs/PROTOCOL.md 16.6; src/client/otp.rs contact_name_for_sending; s
 id = "AC-305"
 description = "`/otp` against a peer whose live session is already active is refused locally, with no network round trip, showing \"an OTP session with <nick> is already active - use /endotp first\" - re-running it anyway risks the exact desync the gate exists to prevent (re-provisioning or re-confirming a session both sides already agree is running, right as a reconnect or a lost ack could make the two sides' own bookkeeping disagree about that). `/endotp` is the only way to leave this state, same as it is the only way to enter a fresh negotiation afterward. Mail has no such state to conflict with, so this guard never applies to `/new-otp-mail-key`."
 evidence = "src/client/otp.rs handle_provisioning_command's live-already-active check; tests a_live_session_already_active_refuses_a_second_otp_locally, an_active_live_session_does_not_block_new_otp_mail_key (otp_provisioning_concurrency_test.rs)"
+
+# ============================================================================
+# US-049 - Recognise a peer's key across their several devices
+# ============================================================================
+[[user_story]]
+id = "US-049"
+title = "Recognise a peer's key across their several devices"
+as_a = "user who runs aloo on more than one machine, or who talks to peers who do"
+i_want = "a pq_hybrid identity pin and an OTP/pad relationship to be scoped to a specific device rather than to a nickname alone, additively across as many devices as a nickname actually has"
+so_that = "reconnecting from a new device is never confused with an unrelated key change or an impersonator, an old device's pin is never disturbed by trusting a new one, and a one-time pad - which can only ever be safely spent from one place - is never silently corrupted by two devices racing to use the same one"
+
+[[user_story.acceptance_criteria]]
+id = "AC-317"
+description = "A serverless, pad-only (`Direct`-framed) pair's device claim rides as cleartext wire metadata on every message (`sender_device_id`, alongside `channel`/`seq`, never inside the padded payload), checked against `OtpContactState::bound_peer_device_id` strictly *before* the destructive `otp --decrypt` ever runs. Nothing bound yet: the claim is provisionally accepted and, only once decryption genuinely succeeds, binds the pad to it. Already bound to a different device: refused before any pad byte is touched - no decrypt, no offset movement, no ack - and the sender's message stays exactly as outstanding as any other never-acked send, recoverable and undamaged, until the actually-bound device answers. This is what makes rule 3 (\"an OTP-only mismatch cannot communicate; exchange keys via the existing methods\") literal for the case where the pad *is* the whole identity - a copied pad/key file used from two machines at once is refused rather than merged, since a pad has no safe multi-device story."
+evidence = "docs/PROTOCOL.md 16.2; src/client/otp.rs finish_opening_otp_envelope, on_message/on_file_offer/on_voice_offer's sender_device_id threading; src/client/otp_store.rs OtpContactState.bound_peer_device_id, bound_peer_device_id, bind_peer_device; src/p2p_proto.rs P2pPayload::OtpEnvelope/OtpFileOffer/OtpVoiceOffer.sender_device_id; tests a_mismatched_device_claim_is_refused_before_the_pad_is_touched, a_refused_claim_leaves_the_senders_outstanding_send_untouched_and_it_still_delivers, the_pad_binds_to_the_first_device_that_genuinely_decrypts (otp_ack_wiring_test.rs); scenario features/direct_punch/becoming_a_real_peer.feature 'A copied pad claimed from a different device is held, not delivered' - reference table no-server row 3, driven through the real pad-only session harness end to end"
+
+[[user_story.acceptance_criteria]]
+id = "AC-320"
+description = "`direct_punch_to` names a specific device with an optional `+<device_id>` suffix on its nickname field (`<nickname>[+<device_id>],<host>[:<port>],<frequency>`), split at the first `+` in that field; an unsuffixed line is unaffected - `device_id` is simply `None`, exactly as every line behaved before this syntax existed. An empty suffix (`bob+,host,every_1m`) is refused rather than silently becoming the reserved empty-string \"unbound\" sentinel `IdStore` uses internally, and the device half gets the same tab/newline injection guard the nickname half already has. `target_key` - nickname alone when unsuffixed, `nickname+device_id` when suffixed - is what a save/load round trip and the scheduler's own bookkeeping key on, and it round-trips losslessly through `to_setting_value`."
+evidence = "docs/PROTOCOL.md 12.5, §7.1.5; src/settings.rs DirectPunchTarget::parse, to_setting_value, target_key; tests a_plus_suffix_on_the_nickname_names_a_specific_device, a_target_with_no_device_suffix_parses_with_no_device_id, target_key_is_nickname_alone_when_unsuffixed_and_qualified_when_suffixed, an_empty_device_suffix_is_refused, a_device_suffix_containing_a_tab_or_newline_is_refused, a_device_suffixed_target_round_trips_through_to_setting_value (settings_test.rs)"
+
+[[user_story.acceptance_criteria]]
+id = "AC-321"
+description = "Two `direct_punch_to` lines for the same nickname but different devices produce genuinely distinct `UserId`s (`direct_peer_id`'s hash folds in the device id behind a separator byte only when one is given, so an unsuffixed line's id is byte-identical to before this parameter existed), distinct links, and - since each device's raw pairing key already differs (device-pinning plan §1's ordinary additive multi-device flow) - distinct pads; each is independently queryable by its own `target_key`. `PunchDatagram` carries no device id of its own (a wire-format change this plan deliberately avoids), so an incoming `DirectPing`/`DirectPong` naming a shared nickname is disambiguated by the address it actually arrived from against each candidate target's own resolved address - never guessed at when ambiguous, and never touching a sibling device's target. The one-nickname-one-link convergence a server-assigned `UserId` normally triggers (`set_direct_peer_id`) declines rather than guesses when more than one device is configured for that nickname, since nothing at that point says which configured device the server just named; both targets are left exactly as configured, each still independently reachable."
+evidence = "docs/PROTOCOL.md §7.1.5; src/client/p2p.rs direct_peer_id, DirectTarget.nickname/device_id, resolve_incoming_direct_target, set_direct_peer_id, set_target_peer_id, direct_nickname_of, direct_device_id_of; src/client/session.rs direct_peer_identity; tests two_devices_sharing_a_nickname_get_distinct_user_ids_and_are_each_configured, an_incoming_ping_naming_a_shared_nickname_is_routed_by_the_address_it_arrived_from, a_second_device_stays_unreachable_until_a_device_suffixed_line_is_added (direct_punch_test.rs, reference table no-server row 6); scenario features/direct_punch/serverless_punching.feature 'A second device stays unreachable until a device-suffixed line is added' - the same row driven through the real PeerLinkManager"
+
+[[user_story.acceptance_criteria]]
+id = "AC-322"
+description = "`/contacts` shows one row per pinned device, not one per nickname (device-pinning plan §3): a multi-device contact produces one row per device, each with its own non-editable device column (a fixed \"(unbound)\" placeholder for a pin with no device confirmed yet), its own key-mode/last-seen figures, and its own independently-derived OTP/mail keychain name - manual key install (`o`, or a key detail popup's \"Install manually\") stamps whichever device the row it was opened from names. Deletion is additive, at two distinct scopes: the list's own 'd'/Delete still forgets the whole nickname, every device, and - fixed by this plan, since deleting only ever cleaned up whichever single device `IdStore::get`'s most-recently-seen default happened to name - now actually cleans up every device's own OTP/mail keychain entries, not just one. A specific row's own PQH key detail popup \"Delete key\" instead removes just *that* device's identity pin and its own OTP/mail keychain entries, leaving every sibling device's pin and keys untouched."
+evidence = "docs/PROTOCOL.md 12.2, §3; src/client/contacts.rs ContactRow.device_id, gather_contact_rows, otp_contact_name_for, delete_contact, delete_contact_device, remove_device_keychain_entries, install_otp_key, delete_otp_key; src/client/tui/contacts.rs ContactsColumns.device, device_label, InstallOtpState.device_id, ContactKeyDetailState.device_id; src/client/tui/ui.rs UiAction::DeleteContactDevice; tests gather_produces_one_row_per_device, gather_produces_an_unbound_row_for_a_pin_with_no_confirmed_device, delete_contact_removes_every_devices_keychain_entries_not_just_one, delete_contact_device_leaves_sibling_devices_and_their_keys_untouched (contacts_test.rs), deleting_a_present_pqh_key_asks_first_then_sends_deletecontactdevice_and_closes_the_popup, rendering_shows_the_header_and_every_nicknames_row, an_unbound_row_shows_a_placeholder_in_the_device_column (ui_contacts_test.rs)"

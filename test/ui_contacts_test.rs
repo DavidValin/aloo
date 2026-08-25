@@ -18,6 +18,7 @@ fn row(nickname: &str, key_mode: Option<KeyMode>) -> ContactRow {
     };
     ContactRow {
         nickname: nickname.to_string(),
+        device_id: Some("test-device".to_string()),
         last_seen_unix: None,
         key_mode,
         otp_contact_name: None,
@@ -320,6 +321,7 @@ fn install_with_both_paths_set_produces_installotpkey() {
         action,
         Some(UiAction::InstallOtpKey {
             nickname: "alice".to_string(),
+            device_id: Some("test-device".to_string()),
             purpose: aloo::crypto::otp::OtpPurpose::Live,
             enc_path: root.join("file.txt"),
             dec_path: root.join("subdir").join("nested.txt"),
@@ -371,10 +373,26 @@ fn rendering_shows_the_header_and_every_nicknames_row() {
     let body = popup_body(&buffer_at(&state, 140, 30), "Contacts");
     let joined = body.join("\n");
     assert!(joined.contains("nickname"));
+    assert!(joined.contains("device"));
+    assert!(joined.contains("test-device"), "each row's own device id (device-pinning plan §3)");
     assert!(joined.contains("alice"));
     assert!(joined.contains("bob"));
     assert!(joined.contains("never"), "bob has never been seen");
     assert!(joined.contains("unknown"), "bob's encryption method is unrecorded");
+}
+
+/// An unbound row (a pin with no device confirmed yet - device-pinning
+/// plan §3) shows a distinct placeholder in the device column, never an
+/// editable-looking blank.
+#[test]
+fn an_unbound_row_shows_a_placeholder_in_the_device_column() {
+    let mut state = joined_general_with(vec![]);
+    state.open_contacts();
+    state.set_contacts_rows(vec![ContactRow { device_id: None, ..row("alice", None) }]);
+
+    let body = popup_body(&buffer_at(&state, 140, 30), "Contacts");
+    let joined = body.join("\n");
+    assert!(joined.contains("(unbound)"));
 }
 
 /// A single (or empty) contact list must never shrink-wrap the popup down
@@ -600,7 +618,7 @@ fn the_details_popup_yellow_explanation_names_this_keys_purpose() {
 
 /// @requirement AC-299
 #[test]
-fn deleting_a_present_pqh_key_asks_first_then_sends_deletecontact_and_closes_the_popup() {
+fn deleting_a_present_pqh_key_asks_first_then_sends_deletecontactdevice_and_closes_the_popup() {
     let mut state = joined_general_with(vec![]);
     state.open_contacts();
     state.set_contacts_rows(vec![otp_installed_row("alice")]); // key_mode PqHybrid
@@ -610,10 +628,19 @@ fn deleting_a_present_pqh_key_asks_first_then_sends_deletecontact_and_closes_the
 
     press(&mut state, KeyCode::Left); // toggle Cancel -> Delete
     let action = press(&mut state, KeyCode::Enter);
-    assert_eq!(action, Some(UiAction::DeleteContact { nickname: "alice".to_string() }));
+    // Scoped to just this device (device-pinning plan §3), not the whole
+    // nickname - `DeleteContact` is what the list's own top-level 'd' still
+    // sends for that.
+    assert_eq!(
+        action,
+        Some(UiAction::DeleteContactDevice {
+            nickname: "alice".to_string(),
+            device_id: Some("test-device".to_string()),
+        })
+    );
     assert!(
         state.contacts.as_ref().unwrap().detail.is_none(),
-        "nothing left to show once the identity pin itself is gone"
+        "nothing left to show once this device's identity pin itself is gone"
     );
 }
 
@@ -648,7 +675,7 @@ fn deleting_a_present_otp_key_sends_deletecontactkey_live_and_leaves_the_popup_o
     let action = press(&mut state, KeyCode::Enter);
     assert_eq!(
         action,
-        Some(UiAction::DeleteContactKey { nickname: "alice".to_string(), purpose: OtpPurpose::Live })
+        Some(UiAction::DeleteContactKey { nickname: "alice".to_string(), device_id: Some("test-device".to_string()), purpose: OtpPurpose::Live })
     );
     assert!(
         state.contacts.as_ref().unwrap().detail.is_some(),
@@ -685,7 +712,7 @@ fn deleting_a_present_otp_mail_key_sends_deletecontactkey_mail() {
     let action = press(&mut state, KeyCode::Enter);
     assert_eq!(
         action,
-        Some(UiAction::DeleteContactKey { nickname: "alice".to_string(), purpose: OtpPurpose::Mail })
+        Some(UiAction::DeleteContactKey { nickname: "alice".to_string(), device_id: Some("test-device".to_string()), purpose: OtpPurpose::Mail })
     );
 }
 

@@ -13,6 +13,7 @@ use crossterm::event::KeyCode;
 fn target(nickname: &str, host: &str, port: u16, frequency_minutes: u32) -> DirectPunchTarget {
     DirectPunchTarget {
         nickname: nickname.to_string(),
+        device_id: None,
         host: host.to_string(),
         port,
         frequency: PunchFrequency::parse(&format!("every_{frequency_minutes}m")).unwrap(),

@@ -6,8 +6,9 @@
 use std::path::PathBuf;
 
 use aloo::client::contacts::{
-    InstallOtpKeyOutcome, OwnIdentity, PinIdentityCardOutcome, delete_contact, delete_otp_key,
-    gather_contact_rows, install_otp_key, otp_contact_name_for, pin_identity_card,
+    InstallOtpKeyOutcome, OwnIdentity, PinIdentityCardOutcome, delete_contact,
+    delete_contact_device, delete_otp_key, gather_contact_rows, install_otp_key,
+    otp_contact_name_for, pin_identity_card,
 };
 use aloo::client::idstore::IdStore;
 use aloo::client::otp_cli::{self, OtpCliConfig};
@@ -87,13 +88,14 @@ impl Own {
         OwnIdentity {
             pq_fingerprint: &self.fp,
             pinned_public_der: &self.der,
+            own_device_id: "own-test-device",
         }
     }
 }
 
 fn pin(id_store: &mut IdStore, nickname: &str, der: &[u8], key_mode: KeyMode) {
-    id_store.check_and_pin(nickname, der);
-    id_store.set_key_mode(nickname, key_mode);
+    id_store.pin_new_device(nickname, "test-device", der, aloo::client::idstore::Trust::Tofu);
+    id_store.set_key_mode(nickname, "test-device", key_mode);
 }
 
 // ---------------------------------------------------------------------
@@ -111,7 +113,7 @@ fn a_contact_pinned_without_a_readable_bundle_gets_a_key_derived_name() {
     pin(&mut id_store, "alice", b"not-a-bundle", KeyMode::PqHybrid);
     let me = own_identity();
     assert_eq!(
-        otp_contact_name_for(&id_store, "alice", me.as_identity(), OtpPurpose::Live),
+        otp_contact_name_for(&id_store, "alice", "test-device", me.as_identity(), OtpPurpose::Live),
         Some(aloo::crypto::otp::contact_name_for_keys(
             &me.der,
             b"not-a-bundle"
@@ -127,12 +129,14 @@ fn a_pq_hybrid_pinned_contact_is_otp_eligible() {
     let der = pq_public_der();
     pin(&mut id_store, "alice", &der, KeyMode::PqHybrid);
     let me = own_identity();
-    let name = otp_contact_name_for(&id_store, "alice", me.as_identity(), OtpPurpose::Live);
+    let name = otp_contact_name_for(&id_store, "alice", "test-device", me.as_identity(), OtpPurpose::Live);
     assert_eq!(
         name,
         Some(aloo::crypto::otp::contact_name_for(
             &me.fp,
-            &pq_fingerprint(&der)
+            "own-test-device",
+            &pq_fingerprint(&der),
+            "test-device"
         )),
         "two readable bundles are PqWrapped, and PqWrapped names the \
          contact from the two fingerprints"
@@ -144,7 +148,7 @@ fn a_pq_hybrid_pinned_contact_is_otp_eligible() {
 fn an_unpinned_nickname_resolves_to_no_name_at_all() {
     let id_store = IdStore::new_empty(scratch_dir("nickname-unpinned"));
     assert_eq!(
-        otp_contact_name_for(&id_store, "nobody", own_identity().as_identity(), OtpPurpose::Live),
+        otp_contact_name_for(&id_store, "nobody", "test-device", own_identity().as_identity(), OtpPurpose::Live),
         None
     );
 }
@@ -173,6 +177,44 @@ async fn gather_reports_every_pinned_contact_sorted_by_nickname() {
         gather_contact_rows(&id_store, &cfg, own_identity().as_identity()).await;
     let names: Vec<&str> = rows.iter().map(|r| r.nickname.as_str()).collect();
     assert_eq!(names, vec!["alice", "bob", "carol"]);
+}
+
+/// A nickname with several pinned devices produces one row per device
+/// (device-pinning plan §3), not one row for the nickname - each with its
+/// own device id, its own key, and its own keychain name derived from
+/// *that* device specifically.
+/// @requirement AC-322
+#[tokio::test]
+async fn gather_produces_one_row_per_device() {
+    let mut id_store = IdStore::new_empty(scratch_dir("gather-multi-device"));
+    id_store.pin_new_device("alice", "laptop", b"key-laptop", aloo::client::idstore::Trust::Tofu);
+    id_store.pin_new_device("alice", "phone", b"key-phone", aloo::client::idstore::Trust::Tofu);
+    let cfg = otp_cli_config("gather-multi-device");
+    let me = own_identity();
+    let mut rows = gather_contact_rows(&id_store, &cfg, me.as_identity()).await;
+    rows.sort_by(|a, b| a.device_id.cmp(&b.device_id));
+
+    assert_eq!(rows.len(), 2, "one row per device, not one per nickname");
+    assert!(rows.iter().all(|r| r.nickname == "alice"));
+    let device_ids: Vec<Option<String>> = rows.iter().map(|r| r.device_id.clone()).collect();
+    assert_eq!(device_ids, vec![Some("laptop".to_string()), Some("phone".to_string())]);
+    assert_ne!(
+        rows[0].otp_contact_name, rows[1].otp_contact_name,
+        "each device's own keychain name, never shared"
+    );
+}
+
+/// An unbound entry (no device confirmed yet) still produces its own row,
+/// with `device_id: None` - distinct from a row naming an actual device.
+/// @requirement AC-322
+#[tokio::test]
+async fn gather_produces_an_unbound_row_for_a_pin_with_no_confirmed_device() {
+    let mut id_store = IdStore::new_empty(scratch_dir("gather-unbound"));
+    id_store.pin_new_device("alice", "", b"key-a", aloo::client::idstore::Trust::Tofu);
+    let cfg = otp_cli_config("gather-unbound");
+    let rows = gather_contact_rows(&id_store, &cfg, own_identity().as_identity()).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].device_id, None);
 }
 
 /// A contact pinned under a key that is not a readable bundle can hold a
@@ -260,7 +302,7 @@ async fn deleting_a_provisioned_otp_contact_removes_the_keychain_entry_too() {
     pin(&mut id_store, "alice", &der, KeyMode::PqHybrid);
     let me = own_identity();
     let contact_name =
-        otp_contact_name_for(&id_store, "alice", me.as_identity(), OtpPurpose::Live).unwrap();
+        otp_contact_name_for(&id_store, "alice", "test-device", me.as_identity(), OtpPurpose::Live).unwrap();
 
     let (enc, dec) = make_key_pair(&cfg, &contact_name).await;
     otp_cli::add_contact(&cfg, &contact_name, &enc, &dec)
@@ -281,6 +323,110 @@ async fn deleting_a_provisioned_otp_contact_removes_the_keychain_entry_too() {
 
     assert!(!otp_cli::has_contact(&cfg, &contact_name).await.unwrap());
     assert!(otp_store.get(&contact_name).is_none());
+}
+
+/// Forgetting a nickname outright (device-pinning plan §3's "every
+/// device") must clean up *every* device's own keychain entry, not just
+/// whichever one `IdStore`'s ordinary most-recently-seen default would
+/// have picked - a nickname with two devices, each with its own installed
+/// pad, must lose both.
+/// @requirement AC-322
+#[tokio::test]
+async fn delete_contact_removes_every_devices_keychain_entries_not_just_one() {
+    if !require_otp() {
+        return;
+    }
+    let cfg = otp_cli_config("delete-multi");
+    let mut id_store = IdStore::new_empty(scratch_dir("delete-multi-ids"));
+    let laptop_der = pq_public_der();
+    let phone_der = pq_public_der();
+    id_store.pin_new_device("alice", "laptop", &laptop_der, aloo::client::idstore::Trust::Tofu);
+    id_store.pin_new_device("alice", "phone", &phone_der, aloo::client::idstore::Trust::Tofu);
+    let me = own_identity();
+    let laptop_name =
+        otp_contact_name_for(&id_store, "alice", "laptop", me.as_identity(), OtpPurpose::Live).unwrap();
+    let phone_name =
+        otp_contact_name_for(&id_store, "alice", "phone", me.as_identity(), OtpPurpose::Live).unwrap();
+    assert_ne!(laptop_name, phone_name);
+
+    let mut otp_store = OtpStore::new_empty(scratch_dir("delete-multi-store"));
+    for name in [&laptop_name, &phone_name] {
+        // A fresh keygen scratch dir per device - `new_key_pair` always
+        // writes to a fixed path within it, which would otherwise collide
+        // across two devices sharing one directory.
+        let keygen_cfg = otp_cli_config(&format!("delete-multi-keygen-{name}"));
+        let (enc, dec) = make_key_pair(&keygen_cfg, name).await;
+        otp_cli::add_contact(&cfg, name, &enc, &dec)
+            .await
+            .expect("add_contact should succeed with real key files");
+        otp_store.mark_provisioned(name);
+    }
+    assert!(otp_cli::has_contact(&cfg, &laptop_name).await.unwrap());
+    assert!(otp_cli::has_contact(&cfg, &phone_name).await.unwrap());
+
+    delete_contact(&mut id_store, &mut otp_store, &cfg, me.as_identity(), "alice").await;
+
+    assert!(
+        !otp_cli::has_contact(&cfg, &laptop_name).await.unwrap(),
+        "laptop's own keychain entry must be gone too"
+    );
+    assert!(!otp_cli::has_contact(&cfg, &phone_name).await.unwrap());
+    assert!(otp_store.get(&laptop_name).is_none());
+    assert!(otp_store.get(&phone_name).is_none());
+}
+
+/// The additive rule applied to deletion (device-pinning plan §3):
+/// removing just one device's pin and keychain entries must leave every
+/// sibling device's pin and keys exactly as they were.
+/// @requirement AC-322
+#[tokio::test]
+async fn delete_contact_device_leaves_sibling_devices_and_their_keys_untouched() {
+    if !require_otp() {
+        return;
+    }
+    let cfg = otp_cli_config("delete-device");
+    let mut id_store = IdStore::new_empty(scratch_dir("delete-device-ids"));
+    let laptop_der = pq_public_der();
+    let phone_der = pq_public_der();
+    id_store.pin_new_device("alice", "laptop", &laptop_der, aloo::client::idstore::Trust::Tofu);
+    id_store.pin_new_device("alice", "phone", &phone_der, aloo::client::idstore::Trust::Tofu);
+    let me = own_identity();
+    let laptop_name =
+        otp_contact_name_for(&id_store, "alice", "laptop", me.as_identity(), OtpPurpose::Live).unwrap();
+    let phone_name =
+        otp_contact_name_for(&id_store, "alice", "phone", me.as_identity(), OtpPurpose::Live).unwrap();
+
+    let mut otp_store = OtpStore::new_empty(scratch_dir("delete-device-store"));
+    for name in [&laptop_name, &phone_name] {
+        let keygen_cfg = otp_cli_config(&format!("delete-device-keygen-{name}"));
+        let (enc, dec) = make_key_pair(&keygen_cfg, name).await;
+        otp_cli::add_contact(&cfg, name, &enc, &dec)
+            .await
+            .expect("add_contact should succeed with real key files");
+        otp_store.mark_provisioned(name);
+    }
+
+    let removed =
+        delete_contact_device(&mut id_store, &mut otp_store, &cfg, me.as_identity(), "alice", "laptop")
+            .await;
+    assert!(removed);
+
+    assert!(
+        !otp_cli::has_contact(&cfg, &laptop_name).await.unwrap(),
+        "laptop's own keychain entry is gone"
+    );
+    assert_eq!(id_store.get_for_device("alice", "laptop"), None, "laptop's pin is gone");
+
+    assert!(
+        otp_cli::has_contact(&cfg, &phone_name).await.unwrap(),
+        "phone's keychain entry must survive laptop's removal"
+    );
+    assert!(otp_store.get(&phone_name).is_some(), "phone's aloo-side bookkeeping must survive too");
+    assert_eq!(
+        id_store.get_for_device("alice", "phone"),
+        Some(phone_der.as_slice()),
+        "phone's pin must survive laptop's removal"
+    );
 }
 
 /// Generates a real key pair with `otp --new-key-pair` and returns one
@@ -314,7 +460,7 @@ async fn installing_on_a_contact_with_an_unreadable_pin_is_allowed() {
     let mut otp_store = OtpStore::new_empty(scratch_dir("install-nonpq-otp"));
     let cfg = otp_cli_config("install-nonpq");
     let me = own_identity();
-    let contact_name = otp_contact_name_for(&id_store, "alice", me.as_identity(), OtpPurpose::Live).unwrap();
+    let contact_name = otp_contact_name_for(&id_store, "alice", "test-device", me.as_identity(), OtpPurpose::Live).unwrap();
 
     let (enc, dec) = make_key_pair(&cfg, &contact_name).await;
     let outcome = install_otp_key(
@@ -323,6 +469,7 @@ async fn installing_on_a_contact_with_an_unreadable_pin_is_allowed() {
         &cfg,
         me.as_identity(),
         "alice",
+        "test-device",
         OtpPurpose::Live,
         &enc,
         &dec,
@@ -357,6 +504,7 @@ async fn installing_with_a_missing_key_file_is_an_error_and_installs_nothing() {
         &cfg,
         me.as_identity(),
         "alice",
+        "test-device",
         OtpPurpose::Live,
         &cfg.working_dir.join("no-such-enc.key"),
         &cfg.working_dir.join("no-such-dec.key"),
@@ -367,7 +515,7 @@ async fn installing_with_a_missing_key_file_is_an_error_and_installs_nothing() {
         other => panic!("expected Error, got {other:?}"),
     }
     let contact_name =
-        otp_contact_name_for(&id_store, "alice", me.as_identity(), OtpPurpose::Live).unwrap();
+        otp_contact_name_for(&id_store, "alice", "test-device", me.as_identity(), OtpPurpose::Live).unwrap();
     assert!(!otp_cli::has_contact(&cfg, &contact_name).await.unwrap());
 }
 
@@ -383,7 +531,7 @@ async fn installing_with_real_key_files_succeeds_and_marks_the_contact_provision
     let cfg = otp_cli_config("install-ok");
     let me = own_identity();
     let contact_name =
-        otp_contact_name_for(&id_store, "alice", me.as_identity(), OtpPurpose::Live).unwrap();
+        otp_contact_name_for(&id_store, "alice", "test-device", me.as_identity(), OtpPurpose::Live).unwrap();
 
     let (enc, dec) = make_key_pair(&cfg, &contact_name).await;
     let outcome = install_otp_key(
@@ -392,6 +540,7 @@ async fn installing_with_real_key_files_succeeds_and_marks_the_contact_provision
         &cfg,
         me.as_identity(),
         "alice",
+        "test-device",
         OtpPurpose::Live,
         &enc,
         &dec,
@@ -440,8 +589,8 @@ async fn installing_a_mail_key_is_independent_of_the_live_key() {
     let cfg = otp_cli_config("install-mail");
     let me = own_identity();
 
-    let live_name = otp_contact_name_for(&id_store, "alice", me.as_identity(), OtpPurpose::Live).unwrap();
-    let mail_name = otp_contact_name_for(&id_store, "alice", me.as_identity(), OtpPurpose::Mail).unwrap();
+    let live_name = otp_contact_name_for(&id_store, "alice", "test-device", me.as_identity(), OtpPurpose::Live).unwrap();
+    let mail_name = otp_contact_name_for(&id_store, "alice", "test-device", me.as_identity(), OtpPurpose::Mail).unwrap();
     assert_ne!(live_name, mail_name, "the two purposes must never share a keychain name");
 
     let (enc, dec) = make_key_pair(&cfg, &mail_name).await;
@@ -451,6 +600,7 @@ async fn installing_a_mail_key_is_independent_of_the_live_key() {
         &cfg,
         me.as_identity(),
         "alice",
+        "test-device",
         OtpPurpose::Mail,
         &enc,
         &dec,
@@ -493,15 +643,15 @@ async fn delete_otp_key_removes_only_the_named_purpose() {
         let gen_cfg = otp_cli_config(&format!("delete-one-purpose-gen-{}", purpose.label()));
         let (enc, dec) = make_key_pair(&gen_cfg, purpose.label()).await;
         let outcome =
-            install_otp_key(&id_store, &mut otp_store, &cfg, me.as_identity(), "alice", purpose, &enc, &dec)
+            install_otp_key(&id_store, &mut otp_store, &cfg, me.as_identity(), "alice", "test-device", purpose, &enc, &dec)
                 .await;
         assert_eq!(outcome, InstallOtpKeyOutcome::Ok);
     }
-    let live_name = otp_contact_name_for(&id_store, "alice", me.as_identity(), OtpPurpose::Live).unwrap();
-    let mail_name = otp_contact_name_for(&id_store, "alice", me.as_identity(), OtpPurpose::Mail).unwrap();
+    let live_name = otp_contact_name_for(&id_store, "alice", "test-device", me.as_identity(), OtpPurpose::Live).unwrap();
+    let mail_name = otp_contact_name_for(&id_store, "alice", "test-device", me.as_identity(), OtpPurpose::Mail).unwrap();
 
     let removed =
-        delete_otp_key(&id_store, &mut otp_store, &cfg, me.as_identity(), "alice", OtpPurpose::Mail).await;
+        delete_otp_key(&id_store, &mut otp_store, &cfg, me.as_identity(), "alice", "test-device", OtpPurpose::Mail).await;
     assert!(removed);
     assert!(!otp_cli::has_contact(&cfg, &mail_name).await.unwrap(), "the mail key is gone");
     assert!(
@@ -522,7 +672,7 @@ async fn delete_otp_key_on_a_purpose_with_nothing_installed_reports_nothing_remo
     let me = own_identity();
 
     let removed =
-        delete_otp_key(&id_store, &mut otp_store, &cfg, me.as_identity(), "alice", OtpPurpose::Mail).await;
+        delete_otp_key(&id_store, &mut otp_store, &cfg, me.as_identity(), "alice", "test-device", OtpPurpose::Mail).await;
     assert!(!removed);
 }
 
@@ -586,19 +736,85 @@ fn pinning_a_missing_file_is_invalid_not_a_panic() {
     }
 }
 
+/// A card import is key_mode-scoped (device-pinning plan §1): it must
+/// never touch an existing `Direct`-framed pin, even though both an
+/// unbound `Direct` entry and a card-imported `pq_hybrid` entry share the
+/// same empty device_id sentinel. The two are independent trust
+/// dimensions for the same nickname, and importing a card is exactly the
+/// case that would otherwise silently destroy the raw pairing key an
+/// active OTP-only relationship depends on.
+///
 /// @requirement AC-301
 #[test]
-fn pinning_a_card_upgrades_an_existing_direct_framed_pin() {
-    let dir = scratch_dir("pin-card-upgrade");
+fn pinning_a_card_never_touches_an_existing_direct_framed_pin() {
+    let dir = scratch_dir("pin-card-no-touch-direct");
     let (path, public) = write_identity_card(&dir, "alice");
     let mut id_store = IdStore::new_empty(dir.join("ids_store"));
     // Starts out pinned via a raw Direct-framed key, no pq_hybrid at all -
-    // the ❌PQH badge state this action exists to fix.
-    id_store.check_and_pin("alice", b"some-raw-pinned-key");
+    // the ❌PQH badge state this action exists to fix. Unbound (no device
+    // known yet), same as any Direct-framed pin that arrived with no live
+    // connection to attribute it to.
+    id_store.pin_new_device("alice", "", b"some-raw-pinned-key", aloo::client::idstore::Trust::Tofu);
     assert_eq!(id_store.key_mode("alice"), None);
+
+    let outcome = pin_identity_card(&mut id_store, "alice", &path);
+    assert_eq!(outcome, PinIdentityCardOutcome::Ok);
+
+    // The Direct pin survives, byte-for-byte, completely untouched...
+    assert_eq!(
+        id_store.devices_of("alice").find(|d| d.key_mode.is_none()).map(|d| d.key.as_slice()),
+        Some(b"some-raw-pinned-key".as_slice()),
+        "the pre-existing Direct-framed pin must not be overwritten by an unrelated card import"
+    );
+    // ...and the card lands as its own, separate pq_hybrid entry.
+    let expected_der = aloo::proto::encode(&public).unwrap();
+    assert_eq!(
+        id_store
+            .devices_of("alice")
+            .find(|d| d.key_mode == Some(KeyMode::PqHybrid))
+            .map(|d| d.key.as_slice()),
+        Some(expected_der.as_slice())
+    );
+    assert_eq!(id_store.devices_of("alice").count(), 2, "two independent trust dimensions, not one merged entry");
+}
+
+/// The ordinary case: nothing pinned yet at all, so the card simply
+/// creates the nickname's first (and only) entry.
+///
+/// @requirement AC-301
+#[test]
+fn pinning_a_card_creates_a_fresh_unbound_entry_when_nothing_was_pinned() {
+    let dir = scratch_dir("pin-card-fresh");
+    let (path, public) = write_identity_card(&dir, "alice");
+    let mut id_store = IdStore::new_empty(dir.join("ids_store"));
 
     let outcome = pin_identity_card(&mut id_store, "alice", &path);
     assert_eq!(outcome, PinIdentityCardOutcome::Ok);
     let expected_der = aloo::proto::encode(&public).unwrap();
     assert_eq!(id_store.get("alice"), Some(expected_der.as_slice()));
+    assert_eq!(id_store.devices_of("alice").count(), 1);
+}
+
+/// Re-importing a card (or a later, replacement one) for a nickname that
+/// already has an unbound `pq_hybrid` entry updates that entry in place -
+/// still key_mode-scoped, so this is the "upgrade", not "always add a new
+/// row", half of the behaviour.
+///
+/// @requirement AC-301
+#[test]
+fn pinning_a_second_card_overwrites_the_existing_unbound_pq_hybrid_entry_in_place() {
+    let dir = scratch_dir("pin-card-overwrite");
+    let mut id_store = IdStore::new_empty(dir.join("ids_store"));
+
+    // `write_identity_card` always writes to the same `<nickname>.card`
+    // path, so the first card must actually be pinned before the second
+    // one is generated and overwrites that file on disk.
+    let (first_path, _first_public) = write_identity_card(&dir, "alice");
+    assert_eq!(pin_identity_card(&mut id_store, "alice", &first_path), PinIdentityCardOutcome::Ok);
+    let (second_path, second_public) = write_identity_card(&dir, "alice");
+    assert_eq!(pin_identity_card(&mut id_store, "alice", &second_path), PinIdentityCardOutcome::Ok);
+
+    let expected_der = aloo::proto::encode(&second_public).unwrap();
+    assert_eq!(id_store.get("alice"), Some(expected_der.as_slice()));
+    assert_eq!(id_store.devices_of("alice").count(), 1, "in place, not a second row");
 }

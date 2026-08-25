@@ -17,13 +17,13 @@ Feature: Proving an identity is still the same one
   you like, pins someone as verified before you have ever spoken. See
   docs/PROTOCOL.md.
 
-  @AC-120
+  @AC-120 @pqhybrid
   Scenario: The same identity always reads out the same safety phrase
     Given alice has a pq_hybrid identity
     Then alice's safety phrase is the same every time it is read
     And a different identity reads out a different phrase
 
-  @AC-121
+  @AC-121 @pqhybrid
   Scenario: A pin can be raised from trusted-on-sight to verified
     Given a local identity store with nothing pinned yet
     When alice is seen with the key "key-a"
@@ -31,7 +31,7 @@ Feature: Proving an identity is still the same one
     When alice's key is confirmed out of band
     Then alice is pinned and verified
 
-  @AC-122
+  @AC-122 @pqhybrid @with_server @without_reachable_server
   Scenario: A planned key change proves itself and raises no alarm
     Given alice has a pq_hybrid identity
     And alice is pinned under that identity
@@ -39,7 +39,17 @@ Feature: Proving an identity is still the same one
     Then the new identity proves it is still alice
     And the pin moves to the new identity without asking
 
-  @AC-123
+  @AC-122 @pqhybrid @with_server @without_reachable_server
+  Scenario: A continuity certificate still proves itself when the new identity arrives from a different device
+    Given alice has a pq_hybrid identity
+    And alice is pinned on device "laptop" under that identity
+    When alice retires those keys for new ones, carrying a continuity certificate
+    And the new identity connects from device "phone"
+    Then the new identity proves it is still alice
+    And the pin moves to device "phone" without asking
+    And device "laptop" no longer has an entry
+
+  @AC-123 @pqhybrid
   Scenario: A stranger taking the nickname cannot fake continuity
     Given alice has a pq_hybrid identity
     And alice is pinned under that identity
@@ -47,14 +57,14 @@ Feature: Proving an identity is still the same one
     Then the stranger cannot prove continuity
     And the pin is left exactly as it was
 
-  @AC-124
+  @AC-124 @pqhybrid
   Scenario: An identity card pins someone before you ever speak
     Given alice has a pq_hybrid identity
     When alice exports an identity card
     And bob imports that card
     Then bob has alice pinned and verified without having met her
 
-  @AC-125
+  @AC-125 @pqhybrid
   Scenario: A tampered identity card is refused
     Given alice has a pq_hybrid identity
     When alice exports an identity card

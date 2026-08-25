@@ -526,6 +526,80 @@ fn a_malformed_target_is_reported_rather_than_silently_dropped() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// A `+<device_id>` suffix on the nickname field (device-pinning plan §5a)
+/// is split off into its own field, leaving the bare nickname untouched.
+///
+/// @requirement AC-320
+#[test]
+fn a_plus_suffix_on_the_nickname_names_a_specific_device() {
+    let target = DirectPunchTarget::parse("bob+phone,bobpublic.com,every_1m").unwrap();
+    assert_eq!(target.nickname, "bob");
+    assert_eq!(target.device_id.as_deref(), Some("phone"));
+}
+
+/// A line with no `+` is unaffected by the suffix syntax existing at all -
+/// device_id is simply `None`, exactly as every line behaved before this
+/// plan.
+///
+/// @requirement AC-320
+#[test]
+fn a_target_with_no_device_suffix_parses_with_no_device_id() {
+    let target = DirectPunchTarget::parse("bob,bobpublic.com,every_1m").unwrap();
+    assert_eq!(target.nickname, "bob");
+    assert_eq!(target.device_id, None);
+}
+
+/// `target_key` is what two lines for the same nickname but different
+/// devices must never collide on: nickname alone when unsuffixed
+/// (identical to every line's only identity before this field existed),
+/// `nickname+device_id` when suffixed.
+///
+/// @requirement AC-320
+#[test]
+fn target_key_is_nickname_alone_when_unsuffixed_and_qualified_when_suffixed() {
+    let plain = DirectPunchTarget::parse("bob,bobpublic.com,every_1m").unwrap();
+    assert_eq!(plain.target_key(), "bob");
+    let phone = DirectPunchTarget::parse("bob+phone,bobpublic.com,every_1m").unwrap();
+    assert_eq!(phone.target_key(), "bob+phone");
+    let laptop = DirectPunchTarget::parse("bob+laptop,bobpublic.com,every_1m").unwrap();
+    assert_ne!(phone.target_key(), laptop.target_key());
+}
+
+/// An empty device id (`bob+,host,every_1m`) is refused rather than
+/// silently becoming the reserved "unbound" sentinel `IdStore` uses
+/// internally for a device id (`idstore::DeviceEntry`) - a settings line is
+/// never how that sentinel is meant to be reached.
+///
+/// @requirement AC-320
+#[test]
+fn an_empty_device_suffix_is_refused() {
+    assert!(DirectPunchTarget::parse("bob+,bobpublic.com,every_1m").is_err());
+}
+
+/// The device id half of the field gets the same tab/newline injection
+/// guard the nickname half already has (`validation::is_storable`) - a
+/// settings line is user-editable text, and a delimiter smuggled through
+/// either half could otherwise inject a record into a tab-delimited store
+/// downstream (`idstore`).
+///
+/// @requirement AC-320
+#[test]
+fn a_device_suffix_containing_a_tab_or_newline_is_refused() {
+    assert!(DirectPunchTarget::parse("bob+pho\tne,bobpublic.com,every_1m").is_err());
+    assert!(DirectPunchTarget::parse("bob+pho\nne,bobpublic.com,every_1m").is_err());
+}
+
+/// `to_setting_value` round-trips the device suffix losslessly, the same
+/// property the nickname/host/port/frequency fields already have.
+///
+/// @requirement AC-320
+#[test]
+fn a_device_suffixed_target_round_trips_through_to_setting_value() {
+    let target = DirectPunchTarget::parse("bob+phone,bobpublic.com:9000,every_5m").unwrap();
+    let reparsed = DirectPunchTarget::parse(&target.to_setting_value()).unwrap();
+    assert_eq!(reparsed, target);
+}
+
 /// @requirement AC-212
 #[test]
 fn direct_punch_settings_survive_a_save_and_load_round_trip() {

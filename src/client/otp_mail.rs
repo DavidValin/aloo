@@ -115,7 +115,12 @@ pub fn mail_gate(
     }
 }
 
-/// Runs the recipient checks for `nickname` - see `RecipientCheck`.
+/// Runs the recipient checks for `nickname` - see `RecipientCheck`. No
+/// live connection is open at compose time, so - like `/contacts`' own
+/// naming (`client::contacts::otp_contact_name_for`) - this always names
+/// `nickname`'s most-recently-seen (or most recently pinned) device; an
+/// unbound pin (no device confirmed yet) reads as `NotPinned`, since
+/// there is no device-qualified name to derive for it yet.
 pub async fn check_recipient(session: &SessionState, nickname: &str) -> RecipientCheck {
     let own_fp = session.own_pq_fp;
     let Some(pinned_der) = session.id_store.get(nickname) else {
@@ -124,7 +129,15 @@ pub async fn check_recipient(session: &SessionState, nickname: &str) -> Recipien
     let Some(peer_fp) = crypto::pq::fingerprint_of_encoded(pinned_der) else {
         return RecipientCheck::NotPinned;
     };
-    let contact_name = crypto::otp::contact_name_for_mail(&own_fp, &peer_fp);
+    let Some(peer_device_id) = session
+        .id_store
+        .most_recent_device_id(nickname)
+        .filter(|d| !d.is_empty())
+    else {
+        return RecipientCheck::NotPinned;
+    };
+    let contact_name =
+        crypto::otp::contact_name_for_mail(&own_fp, &session.own_device_id, &peer_fp, peer_device_id);
     match otp_cli::status(&session.otp_cli_cfg, &contact_name).await {
         Ok(Some(status)) => RecipientCheck::Ok {
             contact_name,
@@ -385,6 +398,7 @@ pub fn restore_orphaned_mail_ref(
     mail_store: &mut crate::client::otp_mail_store::OtpMailStore,
     id_store: &crate::client::idstore::IdStore,
     own_fp: &[u8; 32],
+    own_device_id: &str,
     contact_name: &str,
     mail_id: String,
     seq: u64,
@@ -393,8 +407,10 @@ pub fn restore_orphaned_mail_ref(
         id_store
             .get(nick)
             .and_then(crate::crypto::pq::fingerprint_of_encoded)
-            .is_some_and(|peer_fp| {
-                crate::crypto::otp::contact_name_for_mail(own_fp, &peer_fp) == contact_name
+            .zip(id_store.most_recent_device_id(nick).filter(|d| !d.is_empty()))
+            .is_some_and(|(peer_fp, peer_device_id)| {
+                crate::crypto::otp::contact_name_for_mail(own_fp, own_device_id, &peer_fp, peer_device_id)
+                    == contact_name
             })
     }) else {
         return;
@@ -655,10 +671,24 @@ pub(crate) async fn on_mail_deliver(
     }
     let pinned_der = session.id_store.get(&from).map(|d| d.to_vec());
     let own_fp = session.own_pq_fp;
+    let own_device_id = session.own_device_id.clone();
+    // Mail is server-relayed and asynchronous - the sender need not be
+    // live right now, so like `check_recipient`'s compose-time check,
+    // this always names `from`'s most-recently-seen (or most recently
+    // pinned) device; an unbound pin can never resolve a name here
+    // either.
+    let peer_device_id = session
+        .id_store
+        .most_recent_device_id(&from)
+        .filter(|d| !d.is_empty())
+        .map(str::to_string);
     let expected_contact = pinned_der
         .as_deref()
         .and_then(crypto::pq::fingerprint_of_encoded)
-        .map(|peer_fp| crypto::otp::contact_name_for_mail(&own_fp, &peer_fp));
+        .zip(peer_device_id)
+        .map(|(peer_fp, peer_device_id)| {
+            crypto::otp::contact_name_for_mail(&own_fp, &own_device_id, &peer_fp, &peer_device_id)
+        });
     let next_expected = expected_contact
         .as_deref()
         .and_then(|c| session.otp_store.get(c))

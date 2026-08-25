@@ -225,13 +225,19 @@ async fn a_mail_key_that_already_exists_is_refused_locally() {
     let (peer_public, _) = aloo::crypto::pq::generate_bundle_with_bits(1024).expect("peer pq keygen");
     let peer_der = aloo::proto::encode(&peer_public).expect("peer pq der");
     let peer_fp = aloo::crypto::pq::fingerprint_of_encoded(&peer_der).expect("peer fp");
-    session.id_store_mut().check_and_pin_with("bob", &peer_der, Trust::Verified);
+    session.id_store_mut().pin_new_device("bob", "test-device", &peer_der, Trust::Verified);
+    session.set_peer_device_id_for_test(PEER, "test-device".to_string());
 
     // Marked provisioned directly - `detect_or_adopt_existing`'s own first
     // check is exactly this in-memory flag, so this reaches the same
     // "already have a key" state a real prior exchange would, without
     // needing one.
-    let mail_name = aloo::crypto::otp::contact_name_for_mail(&own_fp, &peer_fp);
+    let mail_name = aloo::crypto::otp::contact_name_for_mail(
+        &own_fp,
+        session.own_device_id_for_test(),
+        &peer_fp,
+        "test-device",
+    );
     session.otp_store_mut().mark_provisioned(&mail_name);
 
     let mut ui = UiState::new("me".into());
@@ -289,8 +295,14 @@ async fn an_unconfirmed_pad_commit_is_resent_on_reconnect_until_acked() {
     let (peer_public, _) = aloo::crypto::pq::generate_bundle_with_bits(1024).expect("peer keygen");
     let peer_der = aloo::proto::encode(&peer_public).expect("peer pq der");
     let peer_fp = aloo::crypto::pq::fingerprint_of_encoded(&peer_der).expect("peer fp");
-    session.id_store_mut().check_and_pin_with("bob", &peer_der, Trust::Verified);
-    let contact_name = aloo::crypto::otp::contact_name_for(&own_fp, &peer_fp);
+    session.id_store_mut().pin_new_device("bob", "test-device", &peer_der, Trust::Verified);
+    session.set_peer_device_id_for_test(PEER, "test-device".to_string());
+    let contact_name = aloo::crypto::otp::contact_name_for(
+        &own_fp,
+        session.own_device_id_for_test(),
+        &peer_fp,
+        "test-device",
+    );
     session.otp_store_mut().mark_provisioned(&contact_name);
     session.otp_store_mut().mark_commit_owed(&contact_name);
 

@@ -83,6 +83,10 @@ pub enum InstallBrowserTarget {
 /// function below unchanged.
 pub struct InstallOtpState {
     pub nickname: String,
+    /// Which of `nickname`'s devices this installs against - the row this
+    /// was opened from, snapshotted the same way `nickname` is
+    /// (device-pinning plan §3). `None` is the unbound row.
+    pub device_id: Option<String>,
     pub purpose: OtpPurpose,
     pub enc_path: String,
     pub dec_path: String,
@@ -155,10 +159,13 @@ impl ContactKeyKind {
 /// `DeleteContact`/`DeleteContactKey`) for what "Create"/"Install
 /// manually"/"Delete key" actually do.
 pub struct ContactKeyDetailState {
-    /// The row this was opened for - a nickname rather than an index, so
-    /// this still finds the right row (or, if it vanished, notices) across
-    /// a `RefreshContacts` triggered by one of its own actions.
+    /// The row this was opened for - a `(nickname, device_id)` pair rather
+    /// than an index, so this still finds the right row (or, if it
+    /// vanished, notices) across a `RefreshContacts` triggered by one of
+    /// its own actions.
     pub nickname: String,
+    /// `None` is the unbound row (device-pinning plan §3).
+    pub device_id: Option<String>,
     pub kind: ContactKeyKind,
     /// `Some` once "Delete key" is pressed with the key present - the same
     /// "destructive action is never one Enter away" confirm every other
@@ -337,13 +344,15 @@ impl UiState {
                 if len == 0 {
                     return None;
                 }
-                let (nickname, kind) = {
+                let (nickname, device_id, kind) = {
                     let state = self.contacts.as_ref()?;
-                    (state.rows.get(state.selected)?.nickname.clone(), state.selected_key)
+                    let row = state.rows.get(state.selected)?;
+                    (row.nickname.clone(), row.device_id.clone(), state.selected_key)
                 };
                 if let Some(state) = self.contacts.as_mut() {
                     state.detail = Some(ContactKeyDetailState {
                         nickname,
+                        device_id,
                         kind,
                         confirm: None,
                         pqh_browser: None,
@@ -364,6 +373,7 @@ impl UiState {
                 if let Some(state) = self.contacts.as_mut() {
                     state.install = Some(InstallOtpState {
                         nickname: row.nickname,
+                        device_id: row.device_id,
                         purpose: OtpPurpose::Live,
                         enc_path: String::new(),
                         dec_path: String::new(),
@@ -432,7 +442,10 @@ impl UiState {
     fn contacts_detail_key_present(&self) -> Option<bool> {
         let state = self.contacts.as_ref()?;
         let detail = state.detail.as_ref()?;
-        let row = state.rows.iter().find(|r| r.nickname == detail.nickname)?;
+        let row = state
+            .rows
+            .iter()
+            .find(|r| r.nickname == detail.nickname && r.device_id == detail.device_id)?;
         Some(match detail.kind {
             ContactKeyKind::Pqh => row.key_mode == Some(KeyMode::PqHybrid),
             ContactKeyKind::Otp => row.otp.is_some(),
@@ -448,21 +461,29 @@ impl UiState {
             }
             return None;
         }
-        let (nickname, kind) = {
+        let (nickname, device_id, kind) = {
             let detail = self.contacts.as_ref()?.detail.as_ref()?;
-            (detail.nickname.clone(), detail.kind)
+            (detail.nickname.clone(), detail.device_id.clone(), detail.kind)
         };
         match kind {
             ContactKeyKind::Pqh => self.open_contacts_pqh_browser(),
-            ContactKeyKind::Otp => self.open_contacts_detail_install(nickname, OtpPurpose::Live),
-            ContactKeyKind::OtpMail => self.open_contacts_detail_install(nickname, OtpPurpose::Mail),
+            ContactKeyKind::Otp => self.open_contacts_detail_install(nickname, device_id, OtpPurpose::Live),
+            ContactKeyKind::OtpMail => {
+                self.open_contacts_detail_install(nickname, device_id, OtpPurpose::Mail)
+            }
         }
     }
 
-    fn open_contacts_detail_install(&mut self, nickname: String, purpose: OtpPurpose) -> Option<UiAction> {
+    fn open_contacts_detail_install(
+        &mut self,
+        nickname: String,
+        device_id: Option<String>,
+        purpose: OtpPurpose,
+    ) -> Option<UiAction> {
         if let Some(state) = self.contacts.as_mut() {
             state.install = Some(InstallOtpState {
                 nickname,
+                device_id,
                 purpose,
                 enc_path: String::new(),
                 dec_path: String::new(),
@@ -555,9 +576,9 @@ impl UiState {
                 None
             }
             KeyCode::Enter => {
-                let (choice, nickname, kind) = {
+                let (choice, nickname, device_id, kind) = {
                     let detail = self.contacts.as_ref()?.detail.as_ref()?;
-                    (detail.confirm?, detail.nickname.clone(), detail.kind)
+                    (detail.confirm?, detail.nickname.clone(), detail.device_id.clone(), detail.kind)
                 };
                 if let Some(detail) = self.contacts.as_mut().and_then(|c| c.detail.as_mut()) {
                     detail.confirm = None;
@@ -567,21 +588,26 @@ impl UiState {
                 }
                 match kind {
                     ContactKeyKind::Pqh => {
-                        // Deleting the identity pin necessarily takes both
-                        // purposes' keychain entries with it (they become
-                        // unnameable the instant it's gone) - nothing left
-                        // in this popup to show afterward.
+                        // Deleting this device's identity pin necessarily
+                        // takes both purposes' keychain entries *for this
+                        // device* with it (they become unnameable the
+                        // instant it's gone) - but leaves every sibling
+                        // device's own pin and keys untouched
+                        // (device-pinning plan §3's additive delete) -
+                        // nothing left in this popup to show afterward.
                         if let Some(state) = self.contacts.as_mut() {
                             state.detail = None;
                         }
-                        Some(UiAction::DeleteContact { nickname })
+                        Some(UiAction::DeleteContactDevice { nickname, device_id })
                     }
                     ContactKeyKind::Otp => Some(UiAction::DeleteContactKey {
                         nickname,
+                        device_id,
                         purpose: OtpPurpose::Live,
                     }),
                     ContactKeyKind::OtpMail => Some(UiAction::DeleteContactKey {
                         nickname,
+                        device_id,
                         purpose: OtpPurpose::Mail,
                     }),
                 }
@@ -770,10 +796,11 @@ impl UiState {
     /// reach a subprocess), but failing fast here means a typo'd path
     /// never even leaves this process.
     fn confirm_install_otp_key(&mut self) -> Option<UiAction> {
-        let (nickname, purpose, enc_path, dec_path) = {
+        let (nickname, device_id, purpose, enc_path, dec_path) = {
             let install = self.contacts.as_ref()?.install.as_ref()?;
             (
                 install.nickname.clone(),
+                install.device_id.clone(),
                 install.purpose,
                 install.enc_path.trim().to_string(),
                 install.dec_path.trim().to_string(),
@@ -785,6 +812,7 @@ impl UiState {
         }
         Some(UiAction::InstallOtpKey {
             nickname,
+            device_id,
             purpose,
             enc_path: PathBuf::from(enc_path),
             dec_path: PathBuf::from(dec_path),
@@ -846,8 +874,20 @@ fn fmt_mb(remaining_bytes: u64) -> String {
 /// measuring.
 struct ContactsColumns {
     nickname: usize,
+    device: usize,
     last_seen: usize,
     encryption: usize,
+}
+
+/// The device column's text - the device id verbatim for a bound row, or a
+/// fixed placeholder for the unbound row (device-pinning plan §3: never
+/// editable from here, only ever learned from a live connection or a
+/// pad's own device claim).
+fn device_label(device_id: &Option<String>) -> &str {
+    match device_id {
+        Some(id) => id,
+        None => "(unbound)",
+    }
 }
 
 impl ContactsColumns {
@@ -858,6 +898,12 @@ impl ContactsColumns {
             .max()
             .unwrap_or(0)
             .max(display_width("nickname") as usize);
+        let device = rows
+            .iter()
+            .map(|r| display_width(device_label(&r.device_id)) as usize)
+            .max()
+            .unwrap_or(0)
+            .max(display_width("device") as usize);
         let last_seen = rows
             .iter()
             .map(|r| display_width(&format_last_seen(r.last_seen_unix)) as usize)
@@ -872,6 +918,7 @@ impl ContactsColumns {
             .max(display_width("encryption") as usize);
         Self {
             nickname,
+            device,
             last_seen,
             encryption,
         }
@@ -933,6 +980,13 @@ fn header_row(columns: &ContactsColumns) -> Line<'static> {
     spans.push(Span::raw(" ".repeat(COL_GAP)));
     let start = spans.iter().map(|s| display_width(&s.content) as usize).sum::<usize>();
     spans.push(Span::styled(
+        "device",
+        Style::default().add_modifier(Modifier::BOLD),
+    ));
+    pad_to(&mut spans, start + columns.device);
+    spans.push(Span::raw(" ".repeat(COL_GAP)));
+    let start = spans.iter().map(|s| display_width(&s.content) as usize).sum::<usize>();
+    spans.push(Span::styled(
         "last seen",
         Style::default().add_modifier(Modifier::BOLD),
     ));
@@ -963,6 +1017,17 @@ fn contact_row_line(
 ) -> Line<'static> {
     let mut spans = vec![Span::raw(row.nickname.clone())];
     pad_to(&mut spans, columns.nickname);
+    spans.push(Span::raw(" ".repeat(COL_GAP)));
+
+    let device_text = device_label(&row.device_id).to_string();
+    let device_style = if row.device_id.is_some() {
+        Style::default()
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let start = spans.iter().map(|s| display_width(&s.content) as usize).sum::<usize>();
+    spans.push(Span::styled(device_text, device_style));
+    pad_to(&mut spans, start + columns.device);
     spans.push(Span::raw(" ".repeat(COL_GAP)));
 
     let last_seen = format_last_seen(row.last_seen_unix);
@@ -1010,9 +1075,10 @@ pub(crate) fn render_contacts_popup(frame: &mut Frame, area: Rect, state: &UiSta
 
     let columns = ContactsColumns::measure(&contacts.rows);
     let content_width = columns.nickname
+        + columns.device
         + columns.last_seen
         + columns.encryption
-        + COL_GAP * 3
+        + COL_GAP * 4
         + display_width(KEY_BADGES_SAMPLE) as usize;
     let width = (content_width as u16 + 4).clamp(60, area.width.saturating_sub(2));
     // At least 7 lines even with a single (or no) contact - short enough to
@@ -1167,7 +1233,10 @@ fn render_contact_key_detail_popup(
         render_file_browser(frame, area, browser, "Select identity card file");
         return;
     }
-    let row = contacts.rows.iter().find(|r| r.nickname == detail.nickname);
+    let row = contacts
+        .rows
+        .iter()
+        .find(|r| r.nickname == detail.nickname && r.device_id == detail.device_id);
     let kind = detail.kind;
     let present = match kind {
         ContactKeyKind::Pqh => row.is_some_and(|r| r.key_mode == Some(KeyMode::PqHybrid)),

@@ -1189,7 +1189,7 @@ pub async fn run(
         (
             None,
             ServerlessSink::Null(crate::control::NullSink),
-            crate::client::p2p::direct_peer_id(&request.nickname),
+            crate::client::p2p::direct_peer_id(&request.nickname, None),
             identity,
             None,
         )

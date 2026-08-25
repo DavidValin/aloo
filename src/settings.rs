@@ -166,12 +166,21 @@ impl std::fmt::Display for PunchFrequency {
     }
 }
 
-/// One `direct_punch_to=<nickname>,<host>[:<port>],<frequency>` line.
+/// One `direct_punch_to=<nickname>[+<device_id>],<host>[:<port>],<frequency>`
+/// line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirectPunchTarget {
     /// The peer's nickname - the only name a serverless link has, since
     /// there is no server to assign or relay a `UserId` for it.
     pub nickname: String,
+    /// Which of that nickname's devices this line addresses
+    /// (device-pinning plan §5a) - `None` addresses whichever device
+    /// `IdStore`'s ordinary most-recently-seen default resolves to, exactly
+    /// as every line did before this field existed. `Some` lets a second
+    /// line for the same nickname reach a *different* device: each becomes
+    /// its own `UserId` (`direct_peer_id`), its own link, and (since a raw
+    /// pairing key already differs per device) its own pad.
+    pub device_id: Option<String>,
     /// A literal IPv4/IPv6 address or a hostname, resolved fresh at every
     /// slot rather than once at startup (a home connection's address moves).
     pub host: String,
@@ -183,34 +192,70 @@ impl DirectPunchTarget {
     /// Parses one settings value. The host may carry an explicit port
     /// (`bobpublic.com:9000`, `[2001:db8::1]:9000`); a bare IPv6 literal
     /// needs no brackets precisely because it cannot then also carry one.
+    ///
+    /// The nickname component may carry a `+<device_id>` suffix, split at
+    /// the *first* `+` in the field. `+` is therefore reserved once this
+    /// syntax exists: a nickname that itself contains one (`is_storable`
+    /// alone does not forbid it) is not refused, but everything from that
+    /// first `+` onward is read as a device id rather than part of the
+    /// name - the same trade-off the tab/newline field delimiters already
+    /// make for `is_storable` itself.
     pub fn parse(value: &str) -> Result<Self, String> {
         let parts: Vec<&str> = value.split(',').map(str::trim).collect();
-        let [nickname, host, frequency] = parts.as_slice() else {
+        let [nick_field, host, frequency] = parts.as_slice() else {
             return Err(format!(
                 "expected <nickname>,<host>,<frequency>, got {value:?}"
             ));
+        };
+        let (nickname, device_id) = match nick_field.split_once('+') {
+            Some((nickname, device_id)) => {
+                if device_id.is_empty() || !crate::validation::is_storable(device_id) {
+                    return Err(format!("not a valid device id: {device_id:?}"));
+                }
+                (nickname, Some(device_id.to_string()))
+            }
+            None => (*nick_field, None),
         };
         if nickname.is_empty() || !crate::validation::is_storable(nickname) {
             return Err(format!("not a valid nickname: {nickname:?}"));
         }
         let (host, port) = split_host_port(host)?;
         Ok(Self {
-            nickname: (*nickname).to_string(),
+            nickname: nickname.to_string(),
+            device_id,
             host,
             port,
             frequency: PunchFrequency::parse(frequency)?,
         })
     }
 
-    /// `<nickname>,<host>[:<port>],<frequency>` - the exact spelling
-    /// `parse` accepts, so a load/save round trip is lossless.
+    /// `<nickname>[+<device_id>],<host>[:<port>],<frequency>` - the exact
+    /// spelling `parse` accepts, so a load/save round trip is lossless.
     pub fn to_setting_value(&self) -> String {
         let host = if self.host.parse::<std::net::Ipv6Addr>().is_ok() {
             format!("[{}]", self.host)
         } else {
             self.host.clone()
         };
-        format!("{},{host}:{},{}", self.nickname, self.port, self.frequency)
+        match &self.device_id {
+            Some(device_id) => format!(
+                "{}+{device_id},{host}:{},{}",
+                self.nickname, self.port, self.frequency
+            ),
+            None => format!("{},{host}:{},{}", self.nickname, self.port, self.frequency),
+        }
+    }
+
+    /// The key that identifies this line's target uniquely among every
+    /// other configured line - nickname alone when unsuffixed (byte-
+    /// identical to how every line worked before device suffixes existed),
+    /// nickname+device_id when suffixed, so two lines for the same nickname
+    /// but different devices never collide.
+    pub fn target_key(&self) -> String {
+        match &self.device_id {
+            Some(device_id) => format!("{}+{device_id}", self.nickname),
+            None => self.nickname.clone(),
+        }
     }
 }
 

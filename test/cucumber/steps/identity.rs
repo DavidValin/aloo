@@ -4,7 +4,7 @@
 use crossterm::event::{KeyCode, KeyModifiers};
 use cucumber::{given, then, when};
 
-use aloo::client::idstore::{IdCheck, IdStore};
+use aloo::client::idstore::{IdStore, KeyCheck, Trust};
 use aloo::client::rekey::{QueuedOutbound, RemoteKeys};
 use aloo::client::tui::ui::{IdentityCase, MessageBody, UiAction};
 use aloo::proto::UserId;
@@ -120,17 +120,27 @@ async fn empty_store(w: &mut AlooWorld) {
     w.id_store = Some(IdStore::load(&path).expect("a missing store file must not be an error"));
 }
 
+/// Mirrors `session::check_identity`'s device-blind comparison
+/// (`IdStore::check_key`) followed by the same decision it makes: a first
+/// sighting or a match is pinned/left as-is; a mismatch is neither pinned
+/// nor rewritten here (a real mismatch stays unresolved until a device is
+/// known and a human decides - `AcceptIdentity`), so `repinned` below
+/// re-pins by hand exactly the way `AcceptIdentity`'s handler does.
 #[when(expr = "{word} is seen with the key {string}")]
 async fn seen_with_key(w: &mut AlooWorld, name: String, key: String) {
     let store = w.id_store.as_mut().expect("no identity store");
-    w.id_check = Some(store.check_and_pin(&name, key.as_bytes()));
+    let result = store.check_key(&name, key.as_bytes());
+    if matches!(result, KeyCheck::New) {
+        store.pin_new_device(&name, "test-device", key.as_bytes(), Trust::Tofu);
+    }
+    w.id_check = Some(result);
 }
 
 #[then("it is a first sighting")]
 async fn first_sighting(w: &mut AlooWorld) {
     assert_eq!(
         w.id_check,
-        Some(IdCheck::New),
+        Some(KeyCheck::New),
         "a nickname never seen before is simply pinned"
     );
 }
@@ -139,7 +149,7 @@ async fn first_sighting(w: &mut AlooWorld) {
 async fn pin_matches(w: &mut AlooWorld) {
     assert_eq!(
         w.id_check,
-        Some(IdCheck::Match),
+        Some(KeyCheck::Match),
         "the same key as last time is not a warning"
     );
 }
@@ -148,7 +158,7 @@ async fn pin_matches(w: &mut AlooWorld) {
 async fn pin_mismatch(w: &mut AlooWorld, previous: String) {
     assert_eq!(
         w.id_check,
-        Some(IdCheck::Mismatch {
+        Some(KeyCheck::Mismatch {
             previous_public_key_der: previous.into_bytes()
         }),
         "a different key must be reported, carrying the key it replaced"
@@ -158,11 +168,56 @@ async fn pin_mismatch(w: &mut AlooWorld, previous: String) {
 #[then(expr = "{word} is now pinned to the new key")]
 async fn repinned(w: &mut AlooWorld, name: String) {
     let store = w.id_store.as_mut().expect("no identity store");
+    // The real mismatch flow never re-pins on its own (`check_identity`'s
+    // doc: "does not use `IdStore::check_and_pin` on a mismatch") - only
+    // an explicit `Accept` does, which for an already-known device
+    // overwrites its entry in place (`session::handle_ui_action`'s
+    // `AcceptIdentity` arm).
+    store.replace_device_key(&name, "test-device", b"key-b");
     assert_eq!(
-        store.check_and_pin(&name, b"key-b"),
-        IdCheck::Match,
+        store.check_key(&name, b"key-b"),
+        KeyCheck::Match,
         "a mismatch re-pins regardless - the warning is a one-time signal, not a lasting block"
     );
+}
+
+// ---------------------------------------------------------------------
+// Multi-device pinning (device-pinning plan §1/§2): additive, per-device
+// entries. Mirrors `IdStore::pin_new_device`/`replace_device_key` the same
+// way `seen_with_key`/`repinned` above mirror the single-device path.
+// ---------------------------------------------------------------------
+
+#[when(expr = "{word} is seen on device {string} with the key {string}")]
+async fn seen_on_device(w: &mut AlooWorld, name: String, device: String, key: String) {
+    let store = w.id_store.as_mut().expect("no identity store");
+    store.pin_new_device(&name, &device, key.as_bytes(), Trust::Tofu);
+}
+
+#[when(expr = "{word}'s device {string} is re-pinned to the key {string}")]
+async fn repinned_on_device(w: &mut AlooWorld, name: String, device: String, key: String) {
+    let store = w.id_store.as_mut().expect("no identity store");
+    // What `AcceptIdentity` does for a device that already has an entry
+    // (`session::handle_ui_action`) - overwrites just that one device's
+    // key, in place.
+    assert!(
+        store.replace_device_key(&name, &device, key.as_bytes()),
+        "device {device:?} must already have an entry to replace"
+    );
+}
+
+#[then(expr = "{word} on device {string} is pinned to the key {string}")]
+async fn pinned_on_device(w: &mut AlooWorld, name: String, device: String, key: String) {
+    let store = w.id_store.as_ref().expect("no identity store");
+    assert_eq!(
+        store.get_for_device(&name, &device),
+        Some(key.as_bytes()),
+        "expected {name}'s device {device:?} to be pinned to {key:?}"
+    );
+}
+
+#[then(expr = "{word} on device {string} is still pinned to the key {string}")]
+async fn still_pinned_on_device(w: &mut AlooWorld, name: String, device: String, key: String) {
+    pinned_on_device(w, name, device, key).await;
 }
 
 // ---------------------------------------------------------------------

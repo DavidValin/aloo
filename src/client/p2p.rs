@@ -136,6 +136,16 @@ enum DirectState {
 
 /// One `direct_punch_to` peer.
 struct DirectTarget {
+    /// This target's own nickname, kept alongside the map key rather than
+    /// only implied by it - once the key can be `nickname+device_id`
+    /// (device-pinning plan §5a), several sites (`direct_nickname_of`,
+    /// `on_direct_link_dropped`'s `direct_peer_id` recomputation) need the
+    /// bare nickname back and must never parse it out of the key.
+    nickname: String,
+    /// Which device this line addresses, if the settings line named one
+    /// (`crate::settings::DirectPunchTarget::device_id`). `None` behaves
+    /// exactly as every target did before this field existed.
+    device_id: Option<String>,
     host: String,
     port: u16,
     frequency: PunchFrequency,
@@ -164,6 +174,11 @@ struct DirectPunch {
     /// This client's own nickname, as it appears in the peer's
     /// `direct_punch_to` - the only thing that identifies us to them.
     own_nick: String,
+    /// Keyed by `DirectPunchTarget::target_key` - a bare nickname for an
+    /// unsuffixed line, or `nickname+device_id` for a device-suffixed one
+    /// (device-pinning plan §5a), so two lines for the same nickname but
+    /// different devices never collide. Never assume a key equals the
+    /// target's nickname - read `DirectTarget::nickname` for that.
     targets: HashMap<String, DirectTarget>,
     /// Permanent, on-disk IP bans for the unknown-nickname direct-punch flow
     /// (`docs/PROTOCOL.md` §7.1.5) - loaded here rather than at `bind` time
@@ -180,11 +195,24 @@ struct DirectPunch {
 /// hash of the nickname, which makes it stable across restarts - a direct
 /// peer keeps the same identity in the sidebar and in `id_store` whether or
 /// not a server ever names them.
-pub fn direct_peer_id(nickname: &str) -> UserId {
+/// `device_id` is `None` for a line with no device suffix - the hash is
+/// then byte-identical to before this parameter existed, so an existing
+/// `direct_punch_to` line's `UserId` (and everything filed under it -
+/// `id_store`, an open link) is unaffected (device-pinning plan §5a is
+/// purely additive). `Some` folds the device id in behind a separator byte
+/// that cannot occur in a nickname's hash input otherwise, so two lines
+/// for the same nickname naming different devices hash to different ids.
+pub fn direct_peer_id(nickname: &str, device_id: Option<&str>) -> UserId {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in nickname.as_bytes() {
         hash ^= *byte as u64;
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    if let Some(device_id) = device_id {
+        for byte in std::iter::once(b'+').chain(device_id.as_bytes().iter().copied()) {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
     }
     UserId(hash | 0x8000_0000_0000_0000)
 }
@@ -346,7 +374,10 @@ pub enum P2pEvent {
     /// resolves it off-loop and hands the answer back to
     /// `on_direct_resolved`. Same shape, and the same reason, as `Signal`.
     DirectResolve {
-        nickname: String,
+        /// Round-tripped back to `on_direct_resolved` unexamined - a target
+        /// key (`DirectPunchTarget::target_key`), not necessarily a bare
+        /// nickname, once a target can be device-suffixed (§5a).
+        target_key: String,
         host: String,
         port: u16,
     },
@@ -386,6 +417,8 @@ pub enum P2pEvent {
         /// See `Message::msg_id`.
         msg_id: Option<u64>,
         envelope: crate::proto::Envelope,
+        /// See `p2p_proto::P2pPayload::OtpEnvelope::sender_device_id`'s doc.
+        sender_device_id: String,
     },
     /// OTP-wrapped counterpart of `FileOffer`.
     OtpFileOffer {
@@ -396,6 +429,8 @@ pub enum P2pEvent {
         /// See `Message::msg_id`.
         msg_id: Option<u64>,
         envelope: crate::proto::Envelope,
+        /// See `p2p_proto::P2pPayload::OtpEnvelope::sender_device_id`'s doc.
+        sender_device_id: String,
     },
     /// A peer has confirmed successful local decode of the OTP message we
     /// sent as sequence `seq` - the genuine network acknowledgement
@@ -423,6 +458,8 @@ pub enum P2pEvent {
         /// See `Message::msg_id`.
         msg_id: Option<u64>,
         envelope: crate::proto::Envelope,
+        /// See `p2p_proto::P2pPayload::OtpEnvelope::sender_device_id`'s doc.
+        sender_device_id: String,
     },
     /// A peer's signed encryption-key rotation - mirrors
     /// `p2p_proto::P2pPayload::KeyRotation`, and is handled exactly like
@@ -1464,12 +1501,14 @@ impl PeerLinkManager {
                 seq,
                 msg_id,
                 envelope,
+                sender_device_id,
             } => P2pEvent::OtpMessage {
                 channel,
                 from,
                 seq,
                 msg_id,
                 envelope,
+                sender_device_id,
             },
             P2pPayload::OtpFileOffer {
                 channel,
@@ -1477,6 +1516,7 @@ impl PeerLinkManager {
                 seq,
                 msg_id,
                 envelope,
+                sender_device_id,
             } => P2pEvent::OtpFileOffer {
                 channel,
                 from,
@@ -1484,6 +1524,7 @@ impl PeerLinkManager {
                 seq,
                 msg_id,
                 envelope,
+                sender_device_id,
             },
             P2pPayload::OtpDeliveryAck { seq, proof } => {
                 P2pEvent::OtpDeliveryAck { from, seq, proof }
@@ -1496,12 +1537,14 @@ impl PeerLinkManager {
                 seq,
                 msg_id,
                 envelope,
+                sender_device_id,
             } => P2pEvent::OtpVoiceOffer {
                 from,
                 stream_id,
                 seq,
                 msg_id,
                 envelope,
+                sender_device_id,
             },
             P2pPayload::DeviceIdAnnounce { envelope } => {
                 P2pEvent::DeviceIdAnnounce { from, envelope }
@@ -1879,8 +1922,9 @@ impl PeerLinkManager {
         let targets = targets
             .into_iter()
             .map(|t| {
+                let key = t.target_key();
                 let target = DirectTarget {
-                    peer: direct_peer_id(&t.nickname),
+                    peer: direct_peer_id(&t.nickname, t.device_id.as_deref()),
                     // An address literal needs no resolver at all, so it is
                     // usable from the very first slot.
                     addr: t
@@ -1888,6 +1932,8 @@ impl PeerLinkManager {
                         .parse::<std::net::IpAddr>()
                         .ok()
                         .map(|ip| SocketAddr::new(ip, t.port)),
+                    nickname: t.nickname,
+                    device_id: t.device_id,
                     host: t.host,
                     port: t.port,
                     last_slot: Some(t.frequency.slot_of_hour(second_of_hour)),
@@ -1895,7 +1941,7 @@ impl PeerLinkManager {
                     state: DirectState::Idle,
                     reconnects: 0,
                 };
-                (t.nickname, target)
+                (key, target)
             })
             .collect();
         let ip_ban_path = crate::client::ip_ban::default_path();
@@ -1923,10 +1969,39 @@ impl PeerLinkManager {
     /// A link that is already open moves with the target rather than being
     /// left behind or torn down (`rekey_link`), and the previous id is
     /// returned so the caller can drop its now-stale UI row.
+    ///
+    /// A nickname with more than one device configured (§5a) is ambiguous
+    /// here on purpose: the server names one physical connection, but
+    /// nothing at this point says *which* configured device that is (a
+    /// device_id isn't known this early - it only ever arrives later, via
+    /// `DeviceIdAnnounce` or - for a `Direct` pair - §5's first pad claim),
+    /// so converging the wrong device's synthetic link onto the server's id
+    /// would silently misroute its punch state. Rather than guess, this
+    /// simply declines to converge at all when it can't tell - both targets
+    /// stay on their own synthetic ids, each still independently reachable.
     pub fn set_direct_peer_id(&mut self, nickname: &str, peer: Option<UserId>) -> Option<UserId> {
-        let wanted = peer.unwrap_or_else(|| direct_peer_id(nickname));
+        let direct = self.direct.as_ref()?;
+        let mut matching = direct
+            .targets
+            .iter()
+            .filter(|(_, t)| t.nickname == nickname)
+            .map(|(key, _)| key.clone());
+        let key = matching.next()?;
+        if matching.next().is_some() {
+            return None;
+        }
+        self.set_target_peer_id(&key, peer)
+    }
+
+    /// The unambiguous half of `set_direct_peer_id`: moves exactly the
+    /// target named by `target_key` (never re-derived from a possibly-
+    /// shared nickname) onto `peer`, or back onto its own synthetic id when
+    /// `peer` is `None`.
+    fn set_target_peer_id(&mut self, target_key: &str, peer: Option<UserId>) -> Option<UserId> {
         let direct = self.direct.as_mut()?;
-        let target = direct.targets.get_mut(nickname)?;
+        let target = direct.targets.get_mut(target_key)?;
+        let wanted =
+            peer.unwrap_or_else(|| direct_peer_id(&target.nickname, target.device_id.as_deref()));
         let previous = target.peer;
         if previous == wanted {
             return None;
@@ -1998,18 +2073,23 @@ impl PeerLinkManager {
     /// off the server says nothing about whether the direct path to them
     /// still works, and it usually does.
     pub fn release_direct_peer_id(&mut self, peer: UserId) {
-        let Some(direct) = self.direct.as_mut() else {
+        let Some(direct) = self.direct.as_ref() else {
             return;
         };
-        let Some(nickname) = direct
+        // Found by exact `peer` match, so this is always unambiguous even
+        // when several devices share one nickname - goes straight to the
+        // unambiguous half rather than `set_direct_peer_id`, which would
+        // otherwise decline on a shared nickname for a reason that does
+        // not apply here.
+        let Some(key) = direct
             .targets
             .iter()
             .find(|(_, t)| t.peer == peer)
-            .map(|(n, _)| n.clone())
+            .map(|(key, _)| key.clone())
         else {
             return;
         };
-        self.set_direct_peer_id(&nickname, None);
+        self.set_target_peer_id(&key, None);
     }
 
     /// Whether a serverless direct punch currently owns this peer's link -
@@ -2097,15 +2177,15 @@ impl PeerLinkManager {
         }
     }
 
-    /// Starts one attempt at `nickname`: puts the peer's link into a fresh
-    /// punch (the same `restart_attempt` every other establishment path
-    /// uses, so the reliable layer restarts with it) and either probes
+    /// Starts one attempt at `target_key`: puts the peer's link into a
+    /// fresh punch (the same `restart_attempt` every other establishment
+    /// path uses, so the reliable layer restarts with it) and either probes
     /// straight away or asks the caller to resolve the host first.
-    fn begin_direct_attempt(&mut self, nickname: &str, now: Instant) {
+    fn begin_direct_attempt(&mut self, target_key: &str, now: Instant) {
         let Some(direct) = self.direct.as_ref() else {
             return;
         };
-        let Some(target) = direct.targets.get(nickname) else {
+        let Some(target) = direct.targets.get(target_key) else {
             return;
         };
         let (peer, addr, host, port) = (target.peer, target.addr, target.host.clone(), target.port);
@@ -2117,18 +2197,18 @@ impl PeerLinkManager {
         ) {
             return;
         }
-        if let Some(target) = self.direct.as_mut().and_then(|d| d.targets.get_mut(nickname)) {
+        if let Some(target) = self.direct.as_mut().and_then(|d| d.targets.get_mut(target_key)) {
             target.state = DirectState::Punching { started: now };
         }
         self.restart_attempt(peer, now);
         match addr {
             Some(addr) => {
                 self.adopt_candidate(peer, addr);
-                self.send_direct_ping(nickname);
+                self.send_direct_ping(target_key);
             }
             None => {
                 let _ = self.events_tx.send(P2pEvent::DirectResolve {
-                    nickname: nickname.to_string(),
+                    target_key: target_key.to_string(),
                     host,
                     port,
                 });
@@ -2142,14 +2222,14 @@ impl PeerLinkManager {
     /// running with nothing to probe; it simply times out at
     /// `DIRECT_PUNCH_WINDOW` like any other attempt that finds nobody, and
     /// the next slot resolves again.
-    pub fn on_direct_resolved(&mut self, nickname: &str, addr: Option<SocketAddr>) {
+    pub fn on_direct_resolved(&mut self, target_key: &str, addr: Option<SocketAddr>) {
         let Some(addr) = addr else {
             return;
         };
         let Some(direct) = self.direct.as_mut() else {
             return;
         };
-        let Some(target) = direct.targets.get_mut(nickname) else {
+        let Some(target) = direct.targets.get_mut(target_key) else {
             return;
         };
         if !matches!(target.state, DirectState::Punching { .. }) {
@@ -2158,7 +2238,7 @@ impl PeerLinkManager {
         target.addr = Some(addr);
         let peer = target.peer;
         self.adopt_candidate(peer, addr);
-        self.send_direct_ping(nickname);
+        self.send_direct_ping(target_key);
     }
 
     /// Puts a direct target's link back into an establishing state if its
@@ -2257,7 +2337,8 @@ impl PeerLinkManager {
         // who is only ever reachable directly would be handed to a
         // re-signalling path that can never reach them, and the reconnect
         // budget this whole step exists to spend would never be spent.
-        let server_can_reestablish = target.peer != direct_peer_id(nickname);
+        let server_can_reestablish =
+            target.peer != direct_peer_id(&target.nickname, target.device_id.as_deref());
         if server_can_reestablish {
             target.state = DirectState::Idle;
             target.reconnects = 0;
@@ -2266,6 +2347,43 @@ impl PeerLinkManager {
         target.reconnects = 1;
         target.state = DirectState::Idle;
         self.begin_direct_attempt(nickname, now);
+    }
+
+    /// Which configured target a `DirectPing`/`DirectPong` claiming
+    /// `claimed_nickname` actually is, disambiguated by the address it
+    /// arrived from (§5a). `PunchDatagram` predates device suffixes and
+    /// carries no device_id of its own - adding one would be a wire-format
+    /// change - so an incoming datagram names only a nickname. With exactly
+    /// one configured target under that nickname this is exactly what every
+    /// line resolved to before device suffixes existed. With more than one
+    /// (two devices configured for the same nickname), only the one whose
+    /// own resolved `addr` matches where the packet actually came from is
+    /// accepted; guessing wrong would misroute punch state onto the wrong
+    /// device's link, so an ambiguous claim that cannot be resolved this
+    /// way is dropped rather than guessed at. This can still under-resolve
+    /// a genuinely first-ever ping from a hostname-configured (not literal-
+    /// IP) second device before this side has resolved either target's
+    /// address at all; narrow enough, and rare enough given both sides'
+    /// slot grids run in step, not to warrant the wire-format change.
+    fn resolve_incoming_direct_target(
+        &self,
+        addr: SocketAddr,
+        claimed_nickname: &str,
+    ) -> Option<String> {
+        let direct = self.direct.as_ref()?;
+        let candidates: Vec<(&String, &DirectTarget)> = direct
+            .targets
+            .iter()
+            .filter(|(_, t)| t.nickname == claimed_nickname)
+            .collect();
+        match candidates.as_slice() {
+            [] => None,
+            [(key, _)] => Some((*key).clone()),
+            many => many
+                .iter()
+                .find(|(_, t)| t.addr == Some(addr))
+                .map(|(key, _)| (*key).clone()),
+        }
     }
 
     /// Handles a `DirectPing`: a peer punching at us on the same slot grid.
@@ -2282,7 +2400,11 @@ impl PeerLinkManager {
         if direct.ip_bans.is_banned(addr.ip()) {
             return;
         }
-        let (own_nick, peer, idle) = match direct.targets.get(from) {
+        let Some(target_key) = self.resolve_incoming_direct_target(addr, from) else {
+            return;
+        };
+        let direct = self.direct.as_ref().unwrap();
+        let (own_nick, peer, idle) = match direct.targets.get(&target_key) {
             Some(target) => (
                 direct.own_nick.clone(),
                 target.peer,
@@ -2294,10 +2416,10 @@ impl PeerLinkManager {
         // concerned: without answering in kind there is no second direction
         // to punch open, and their clock is as good an alarm as ours.
         if idle {
-            self.begin_direct_attempt(from, now);
+            self.begin_direct_attempt(&target_key, now);
         }
         self.adopt_candidate(peer, addr);
-        if let Some(target) = self.direct.as_mut().and_then(|d| d.targets.get_mut(from)) {
+        if let Some(target) = self.direct.as_mut().and_then(|d| d.targets.get_mut(&target_key)) {
             target.addr = Some(addr);
         }
         self.note_received(peer, now);
@@ -2312,17 +2434,20 @@ impl PeerLinkManager {
         // Probe straight back at the address they actually reached us from
         // rather than the one settings named, for the same reason the
         // server-coordinated path does: it is the path most likely to work.
-        self.send_direct_ping(from);
+        self.send_direct_ping(&target_key);
     }
 
     /// Handles a `DirectPong`: our own attempt answered. Activation is the
     /// ordinary `on_pong` - from here the link is indistinguishable from
     /// one the server helped arrange.
     fn on_direct_pong(&mut self, addr: SocketAddr, link_nonce: u64, from: &str, now: Instant) {
+        let Some(target_key) = self.resolve_incoming_direct_target(addr, from) else {
+            return;
+        };
         let Some(direct) = self.direct.as_ref() else {
             return;
         };
-        let Some(target) = direct.targets.get(from) else {
+        let Some(target) = direct.targets.get(&target_key) else {
             return;
         };
         if !matches!(target.state, DirectState::Punching { .. }) {
@@ -2334,7 +2459,7 @@ impl PeerLinkManager {
         if !self.is_active(peer) {
             return;
         }
-        if let Some(target) = self.direct.as_mut().and_then(|d| d.targets.get_mut(from)) {
+        if let Some(target) = self.direct.as_mut().and_then(|d| d.targets.get_mut(&target_key)) {
             target.state = DirectState::Established;
             target.addr = Some(addr);
             // The budget bounds one outage, not the session: a link that
@@ -2350,9 +2475,22 @@ impl PeerLinkManager {
         self.direct
             .as_ref()?
             .targets
-            .iter()
-            .find(|(_, t)| t.peer == peer)
-            .map(|(nickname, _)| nickname.clone())
+            .values()
+            .find(|t| t.peer == peer)
+            .map(|t| t.nickname.clone())
+    }
+
+    /// Which device the `direct_punch_to` line filing `peer`'s link names,
+    /// if it named one at all (§5a) - lets a caller that already knows
+    /// which physical target this link is prefer `IdStore::get_for_device`
+    /// over the ordinary most-recently-seen default.
+    pub fn direct_device_id_of(&self, peer: UserId) -> Option<String> {
+        self.direct
+            .as_ref()?
+            .targets
+            .values()
+            .find(|t| t.peer == peer)
+            .and_then(|t| t.device_id.clone())
     }
 
     /// Every serverless peer whose link is currently up - who to tell when
@@ -2403,9 +2541,11 @@ impl PeerLinkManager {
     }
 
     /// This target's current state, for tests and diagnostics: `None` when
-    /// direct punching is off or the nickname is not configured.
-    pub fn direct_status(&self, nickname: &str) -> Option<LinkStatus> {
-        let target = self.direct.as_ref()?.targets.get(nickname)?;
+    /// direct punching is off or the target key is not configured. Keyed
+    /// by `DirectPunchTarget::target_key` - a bare nickname for an
+    /// unsuffixed line, `nickname+device_id` for a device-suffixed one.
+    pub fn direct_status(&self, target_key: &str) -> Option<LinkStatus> {
+        let target = self.direct.as_ref()?.targets.get(target_key)?;
         Some(match target.state {
             DirectState::Idle => LinkStatus::Lost,
             DirectState::Punching { .. } => LinkStatus::Connecting,
@@ -2413,15 +2553,17 @@ impl PeerLinkManager {
         })
     }
 
-    /// The `UserId` a configured direct target's link is filed under.
-    pub fn direct_peer(&self, nickname: &str) -> Option<UserId> {
-        Some(self.direct.as_ref()?.targets.get(nickname)?.peer)
+    /// The `UserId` a configured direct target's link is filed under, by
+    /// its `target_key` (see `direct_status`).
+    pub fn direct_peer(&self, target_key: &str) -> Option<UserId> {
+        Some(self.direct.as_ref()?.targets.get(target_key)?.peer)
     }
 
     /// How many reconnect attempts the current outage has spent
-    /// (`DIRECT_MAX_RECONNECTS` is the ceiling) - a test/diagnostic helper.
-    pub fn direct_reconnects(&self, nickname: &str) -> Option<u32> {
-        Some(self.direct.as_ref()?.targets.get(nickname)?.reconnects)
+    /// (`DIRECT_MAX_RECONNECTS` is the ceiling) - a test/diagnostic helper,
+    /// by `target_key` (see `direct_status`).
+    pub fn direct_reconnects(&self, target_key: &str) -> Option<u32> {
+        Some(self.direct.as_ref()?.targets.get(target_key)?.reconnects)
     }
 
     /// Whether the link to `peer` is currently `Active` - a test/diagnostic

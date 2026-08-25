@@ -80,10 +80,10 @@ fn a_single_changed_byte_changes_the_phrase() {
 fn a_pin_starts_trusted_on_sight_and_can_be_raised_to_verified() {
     let mut store = IdStore::new_empty(temp_path("verified"));
 
-    store.check_and_pin("alice", b"key-a");
+    store.pin_new_device("alice", "dev", b"key-a", Trust::Tofu);
     assert_eq!(store.trust("alice"), Some(Trust::Tofu));
 
-    assert!(store.mark_verified("alice"));
+    assert!(store.mark_verified("alice", "dev"));
     assert_eq!(store.trust("alice"), Some(Trust::Verified));
 }
 
@@ -91,7 +91,7 @@ fn a_pin_starts_trusted_on_sight_and_can_be_raised_to_verified() {
 #[test]
 fn marking_an_unknown_nickname_verified_does_nothing() {
     let mut store = IdStore::new_empty(temp_path("unknown"));
-    assert!(!store.mark_verified("nobody"));
+    assert!(!store.mark_verified("nobody", "dev"));
     assert_eq!(store.trust("nobody"), None);
 }
 
@@ -100,10 +100,10 @@ fn marking_an_unknown_nickname_verified_does_nothing() {
 #[test]
 fn re_pinning_does_not_silently_demote_a_verified_pin() {
     let mut store = IdStore::new_empty(temp_path("demote"));
-    store.check_and_pin("alice", b"key-a");
-    store.mark_verified("alice");
+    store.pin_new_device("alice", "dev", b"key-a", Trust::Tofu);
+    store.mark_verified("alice", "dev");
 
-    store.check_and_pin("alice", b"key-b");
+    store.replace_device_key("alice", "dev", b"key-b");
     assert_eq!(
         store.trust("alice"),
         Some(Trust::Verified),
@@ -116,9 +116,9 @@ fn re_pinning_does_not_silently_demote_a_verified_pin() {
 fn trust_survives_a_save_and_load_round_trip() {
     let path = temp_path("roundtrip");
     let mut store = IdStore::new_empty(path.clone());
-    store.check_and_pin("alice", b"key-a");
-    store.mark_verified("alice");
-    store.check_and_pin("bob", b"key-b");
+    store.pin_new_device("alice", "dev", b"key-a", Trust::Tofu);
+    store.mark_verified("alice", "dev");
+    store.pin_new_device("bob", "dev", b"key-b", Trust::Tofu);
     store.save().expect("save");
 
     let loaded = IdStore::load(&path).expect("load");
@@ -129,13 +129,14 @@ fn trust_survives_a_save_and_load_round_trip() {
     std::fs::remove_file(&path).ok();
 }
 
-/// A store written before trust levels existed must keep its pins rather
-/// than being discarded - losing them would cost real security.
+/// A file whose trust column is absent (the trailing-optional-column
+/// tolerance every column past `hex` still has) reads as trusted-on-sight
+/// rather than failing to load.
 /// @requirement AC-121
 #[test]
-fn a_store_without_a_trust_column_loads_as_trusted_on_sight() {
+fn a_line_without_a_trust_column_loads_as_trusted_on_sight() {
     let path = temp_path("legacy");
-    std::fs::write(&path, "alice\t6b65792d61\n").expect("write");
+    std::fs::write(&path, "alice\tdev\t6b65792d61\n").expect("write");
 
     let loaded = IdStore::load(&path).expect("load");
     assert_eq!(loaded.get("alice"), Some(b"key-a".as_slice()));

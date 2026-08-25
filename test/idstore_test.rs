@@ -1,4 +1,5 @@
-use aloo::client::idstore::{IdCheck, IdStore, default_path};
+use aloo::client::idstore::{IdStore, Trust, default_path};
+use aloo::proto::KeyMode;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -18,12 +19,16 @@ fn fastrand_seed() -> u128 {
         .as_nanos()
 }
 
+// ---------------------------------------------------------------------
+// Loading / basic pinning
+// ---------------------------------------------------------------------
+
 /// @requirement AC-047, TB-093
 #[test]
 fn loading_a_missing_file_starts_empty_not_an_error() {
     let path = temp_store_path();
-    let mut store = IdStore::load(&path).expect("missing file should not be an error");
-    assert_eq!(store.check_and_pin("alice", b"key-a"), IdCheck::New);
+    let store = IdStore::load(&path).expect("missing file should not be an error");
+    assert_eq!(store.get("alice"), None);
 }
 
 /// @requirement TB-093
@@ -32,7 +37,7 @@ fn new_empty_starts_with_nothing_and_can_still_save() {
     let path = temp_store_path();
     let mut store = IdStore::new_empty(path.clone());
     assert_eq!(store.get("alice"), None);
-    assert_eq!(store.check_and_pin("alice", b"key-a"), IdCheck::New);
+    store.pin_new_device("alice", "dev-a", b"key-a", Trust::Tofu);
     store
         .save()
         .expect("save should succeed even though the store started as new_empty rather than load");
@@ -40,38 +45,50 @@ fn new_empty_starts_with_nothing_and_can_still_save() {
     std::fs::remove_file(&path).ok();
 }
 
+// ---------------------------------------------------------------------
+// Per-device pinning (§1/§2 of the device-pinning plan)
+// ---------------------------------------------------------------------
+
 /// @requirement AC-047
 #[test]
-fn first_sighting_of_a_nickname_is_new() {
+fn first_sighting_of_a_device_is_retrievable_by_that_exact_device() {
     let path = temp_store_path();
     let mut store = IdStore::load(&path).unwrap();
-    assert_eq!(store.check_and_pin("alice", b"key-a"), IdCheck::New);
+    store.pin_new_device("alice", "laptop", b"key-a", Trust::Tofu);
+    assert_eq!(store.get_for_device("alice", "laptop"), Some(b"key-a".as_slice()));
 }
 
 /// @requirement AC-047
 #[test]
-fn same_nickname_same_key_is_a_match() {
+fn a_device_with_no_entry_is_none() {
     let path = temp_store_path();
-    let mut store = IdStore::load(&path).unwrap();
-    store.check_and_pin("alice", b"key-a");
-    assert_eq!(store.check_and_pin("alice", b"key-a"), IdCheck::Match);
+    let store = IdStore::load(&path).unwrap();
+    assert_eq!(store.get_for_device("alice", "laptop"), None);
 }
 
-/// @requirement AC-048, TB-086
+/// Two devices for the same nickname are independent slots - pinning one
+/// never touches the other. This is the additive rule (§1's "never
+/// replacing") at the storage layer.
+/// @requirement TB-087
 #[test]
-fn same_nickname_different_key_is_a_mismatch() {
+fn two_devices_for_one_nickname_are_pinned_independently() {
     let path = temp_store_path();
     let mut store = IdStore::load(&path).unwrap();
-    store.check_and_pin("alice", b"key-a");
-    let result = store.check_and_pin("alice", b"key-b");
+    store.pin_new_device("alice", "laptop", b"key-laptop", Trust::Tofu);
+    store.pin_new_device("alice", "phone", b"key-phone", Trust::Tofu);
     assert_eq!(
-        result,
-        IdCheck::Mismatch {
-            previous_public_key_der: b"key-a".to_vec()
-        }
+        store.get_for_device("alice", "laptop"),
+        Some(b"key-laptop".as_slice())
     );
-    // the nickname is re-pinned to the new key regardless
-    assert_eq!(store.check_and_pin("alice", b"key-b"), IdCheck::Match);
+    assert_eq!(
+        store.get_for_device("alice", "phone"),
+        Some(b"key-phone".as_slice())
+    );
+    assert_eq!(
+        store.devices_of("alice").count(),
+        2,
+        "both devices coexist"
+    );
 }
 
 /// @requirement TB-087
@@ -79,14 +96,494 @@ fn same_nickname_different_key_is_a_mismatch() {
 fn different_nicknames_are_tracked_independently() {
     let path = temp_store_path();
     let mut store = IdStore::load(&path).unwrap();
-    store.check_and_pin("alice", b"key-a");
-    assert_eq!(store.check_and_pin("bob", b"key-b"), IdCheck::New);
-    assert_eq!(store.check_and_pin("alice", b"key-a"), IdCheck::Match);
+    store.pin_new_device("alice", "dev-a", b"key-a", Trust::Tofu);
+    store.pin_new_device("bob", "dev-b", b"key-b", Trust::Tofu);
+    assert_eq!(store.get_for_device("alice", "dev-a"), Some(b"key-a".as_slice()));
+    assert_eq!(store.get_for_device("bob", "dev-b"), Some(b"key-b".as_slice()));
 }
+
+/// `replace_device_key` overwrites just the named device's key, leaving
+/// every sibling device - and every other field of that same entry -
+/// untouched. This is what `session::finalize_identity_pin`'s continuity
+/// and mismatch-`Accept` paths are built from.
+/// @requirement AC-048, TB-086
+#[test]
+fn replace_device_key_overwrites_only_the_named_device() {
+    let path = temp_store_path();
+    let mut store = IdStore::load(&path).unwrap();
+    store.pin_new_device("alice", "laptop", b"key-a", Trust::Tofu);
+    store.pin_new_device("alice", "phone", b"key-phone", Trust::Tofu);
+    assert!(store.replace_device_key("alice", "laptop", b"key-a-2"));
+    assert_eq!(store.get_for_device("alice", "laptop"), Some(b"key-a-2".as_slice()));
+    assert_eq!(
+        store.get_for_device("alice", "phone"),
+        Some(b"key-phone".as_slice()),
+        "sibling device untouched"
+    );
+}
+
+#[test]
+fn replace_device_key_on_a_nonexistent_device_reports_nothing_updated() {
+    let path = temp_store_path();
+    let mut store = IdStore::load(&path).unwrap();
+    assert!(!store.replace_device_key("alice", "laptop", b"key-a"));
+}
+
+// ---------------------------------------------------------------------
+// Unbound entries and claiming (§1's "filled in on first use")
+// ---------------------------------------------------------------------
+
+/// A key pinned with no device (the empty-string sentinel) is retrievable
+/// under that exact empty device_id - the representation `claim_unbound`
+/// resolves later.
+#[test]
+fn an_unbound_entry_is_stored_under_the_empty_device_id() {
+    let path = temp_store_path();
+    let mut store = IdStore::load(&path).unwrap();
+    store.pin_new_device("alice", "", b"key-a", Trust::Tofu);
+    assert_eq!(store.get_for_device("alice", ""), Some(b"key-a".as_slice()));
+}
+
+/// The core "filled in on first use" behavior: an unbound entry whose key
+/// matches a live connection's announced key is claimed in place - same
+/// key, now attributed to a real device - rather than duplicated.
+#[test]
+fn claim_unbound_rewrites_the_device_id_in_place_on_a_matching_key() {
+    let path = temp_store_path();
+    let mut store = IdStore::load(&path).unwrap();
+    store.pin_new_device("alice", "", b"key-a", Trust::Tofu);
+    assert!(store.claim_unbound("alice", "laptop", b"key-a", None));
+    assert_eq!(store.get_for_device("alice", ""), None, "no longer unbound");
+    assert_eq!(store.get_for_device("alice", "laptop"), Some(b"key-a".as_slice()));
+    assert_eq!(store.devices_of("alice").count(), 1, "rewritten in place, not duplicated");
+}
+
+#[test]
+fn claim_unbound_refuses_a_key_that_does_not_match() {
+    let path = temp_store_path();
+    let mut store = IdStore::load(&path).unwrap();
+    store.pin_new_device("alice", "", b"key-a", Trust::Tofu);
+    assert!(!store.claim_unbound("alice", "laptop", b"key-b", None));
+    assert_eq!(
+        store.get_for_device("alice", ""),
+        Some(b"key-a".as_slice()),
+        "left exactly as it was"
+    );
+}
+
+#[test]
+fn claim_unbound_is_scoped_by_key_mode() {
+    let path = temp_store_path();
+    let mut store = IdStore::load(&path).unwrap();
+    // An unbound Direct-framed pin (key_mode None) must never be claimed
+    // by a search for a pq_hybrid (Some) unbound entry with the same key
+    // bytes, or the two independent trust dimensions (§1) would collide.
+    store.pin_new_device("alice", "", b"key-a", Trust::Tofu);
+    assert!(!store.claim_unbound("alice", "laptop", b"key-a", Some(KeyMode::PqHybrid)));
+}
+
+// ---------------------------------------------------------------------
+// accept_identity_review (AcceptIdentity handler / pin_identity_card):
+// key_mode-scoped so the unbound sentinel, shared by every unbound entry
+// regardless of kind, can never let one dimension corrupt the other.
+// ---------------------------------------------------------------------
+
+/// The ordinary, bound-device case: a device already known under a
+/// different key gets that key overwritten in place.
+#[test]
+fn accept_identity_review_overwrites_a_known_devices_key_in_place() {
+    let path = temp_store_path();
+    let mut store = IdStore::load(&path).unwrap();
+    store.pin_new_device("alice", "laptop", b"key-old", Trust::Tofu);
+    store.set_key_mode("alice", "laptop", KeyMode::PqHybrid);
+    store.accept_identity_review("alice", "laptop", b"key-new", KeyMode::PqHybrid, Trust::Tofu);
+    assert_eq!(store.get_for_device("alice", "laptop"), Some(b"key-new".as_slice()));
+    assert_eq!(store.devices_of("alice").count(), 1, "overwritten, not duplicated");
+}
+
+/// A genuinely new device is added additively, leaving siblings untouched.
+#[test]
+fn accept_identity_review_adds_a_new_device_without_touching_a_sibling() {
+    let path = temp_store_path();
+    let mut store = IdStore::load(&path).unwrap();
+    store.pin_new_device("alice", "laptop", b"key-laptop", Trust::Tofu);
+    store.set_key_mode("alice", "laptop", KeyMode::PqHybrid);
+    store.accept_identity_review("alice", "phone", b"key-phone", KeyMode::PqHybrid, Trust::Tofu);
+    assert_eq!(store.get_for_device("alice", "phone"), Some(b"key-phone".as_slice()));
+    assert_eq!(
+        store.get_for_device("alice", "laptop"),
+        Some(b"key-laptop".as_slice()),
+        "sibling device untouched"
+    );
+}
+
+/// The rare unbound fallback (a review accepted before this connection's
+/// device id was ever learned) must never corrupt an unrelated `Direct`
+/// pin sharing the same empty device_id sentinel - the exact bug this
+/// method exists to close (a blind `get_for_device(nickname, "")` lookup
+/// would have found the `Direct` entry first and overwritten it with the
+/// unrelated `pq_hybrid` key).
+#[test]
+fn accept_identity_review_on_the_unbound_fallback_never_touches_an_unrelated_direct_pin() {
+    let path = temp_store_path();
+    let mut store = IdStore::load(&path).unwrap();
+    // An unbound Direct-framed pin already exists (key_mode None) - e.g.
+    // from the unknown-peer-confirm flow, §7.1.5.
+    store.pin_new_device("alice", "", b"direct-key", Trust::Tofu);
+
+    store.accept_identity_review("alice", "", b"pq-key", KeyMode::PqHybrid, Trust::Tofu);
+
+    assert_eq!(
+        store
+            .devices_of("alice")
+            .find(|d| d.key_mode.is_none())
+            .map(|d| d.key.as_slice()),
+        Some(b"direct-key".as_slice()),
+        "the pre-existing Direct pin must survive untouched"
+    );
+    assert_eq!(
+        store
+            .devices_of("alice")
+            .find(|d| d.key_mode == Some(KeyMode::PqHybrid))
+            .map(|d| d.key.as_slice()),
+        Some(b"pq-key".as_slice()),
+        "the pq_hybrid review lands as its own, separate unbound entry"
+    );
+    assert_eq!(store.devices_of("alice").count(), 2);
+}
+
+/// Device-pinning plan §2/§7's reference table, server row 7: a nickname
+/// pinned under two devices (d1, d2); a third device (d3) announces the
+/// key **already pinned under d1** - identical bytes, copied rather than
+/// regenerated (e.g. a `my_key` file literally copied to a second
+/// machine). This must still open an impersonation review; identical key
+/// bytes never silently merge into a device that never itself proved it
+/// holds them. Mirrors `finalize_identity_pin`'s exact decision sequence
+/// for "no entry for this device": `claim_unbound` first (fails - d1 is
+/// bound, not unbound), then a continuity scan across every other device
+/// (fails - nobody signs a continuity certificate for their own unchanged
+/// key), so the only path left is the ordinary review; only a human
+/// `Accept` (`accept_identity_review`) ever actually adds d3.
+///
+/// @requirement AC-048
+#[test]
+fn an_identical_key_already_pinned_under_a_different_device_still_requires_a_review() {
+    let path = temp_store_path();
+    let mut store = IdStore::load(&path).unwrap();
+    store.pin_new_device("alice", "d1", b"key-a", Trust::Tofu);
+    store.set_key_mode("alice", "d1", KeyMode::PqHybrid);
+    store.pin_new_device("alice", "d2", b"key-b", Trust::Tofu);
+    store.set_key_mode("alice", "d2", KeyMode::PqHybrid);
+
+    // d3 announces exactly d1's key bytes - `claim_unbound` only ever
+    // matches an *unbound* entry, so a bound d1 can never be silently
+    // claimed by a new device_id no matter how exactly its key matches.
+    assert!(
+        !store.claim_unbound("alice", "d3", b"key-a", Some(KeyMode::PqHybrid)),
+        "identical bytes must not let claim_unbound treat d3 as an unbound pin's owner"
+    );
+    assert_eq!(store.get_for_device("alice", "d3"), None, "d3 has no entry yet - nothing auto-added");
+    // d1's and d2's own entries are completely undisturbed by d3's mere
+    // announcement.
+    assert_eq!(store.get_for_device("alice", "d1"), Some(b"key-a".as_slice()));
+    assert_eq!(store.get_for_device("alice", "d2"), Some(b"key-b".as_slice()));
+    assert_eq!(store.devices_of("alice").count(), 2, "still only the two devices a human actually vouched for");
+
+    // Only an explicit Accept adds d3 - additively, leaving d1 and d2
+    // exactly as they were.
+    store.accept_identity_review("alice", "d3", b"key-a", KeyMode::PqHybrid, Trust::Tofu);
+    assert_eq!(store.get_for_device("alice", "d3"), Some(b"key-a".as_slice()));
+    assert_eq!(store.get_for_device("alice", "d1"), Some(b"key-a".as_slice()), "d1 untouched by d3's addition");
+    assert_eq!(store.get_for_device("alice", "d2"), Some(b"key-b".as_slice()), "d2 untouched by d3's addition");
+    assert_eq!(store.devices_of("alice").count(), 3);
+}
+
+#[test]
+fn claim_unbound_on_an_unknown_nickname_reports_nothing_claimed() {
+    let path = temp_store_path();
+    let mut store = IdStore::load(&path).unwrap();
+    assert!(!store.claim_unbound("nobody", "laptop", b"key-a", None));
+}
+
+/// @requirement TB-090
+#[test]
+fn claim_unbound_refuses_an_unstorable_device_id() {
+    let path = temp_store_path();
+    let mut store = IdStore::load(&path).unwrap();
+    store.pin_new_device("alice", "", b"key-a", Trust::Tofu);
+    assert!(!store.claim_unbound("alice", "evil\tdevice", b"key-a", None));
+    assert_eq!(store.get_for_device("alice", ""), Some(b"key-a".as_slice()));
+}
+
+// ---------------------------------------------------------------------
+// Rebinding (continuity certificates moving devices)
+// ---------------------------------------------------------------------
+
+#[test]
+fn rebind_device_moves_an_entry_to_a_new_device_id() {
+    let path = temp_store_path();
+    let mut store = IdStore::load(&path).unwrap();
+    store.pin_new_device("alice", "old-laptop", b"key-a", Trust::Tofu);
+    assert!(store.rebind_device("alice", "old-laptop", "new-laptop"));
+    assert_eq!(store.get_for_device("alice", "old-laptop"), None);
+    assert_eq!(store.get_for_device("alice", "new-laptop"), Some(b"key-a".as_slice()));
+}
+
+#[test]
+fn rebind_device_refuses_to_collide_with_an_existing_device() {
+    let path = temp_store_path();
+    let mut store = IdStore::load(&path).unwrap();
+    store.pin_new_device("alice", "laptop", b"key-laptop", Trust::Tofu);
+    store.pin_new_device("alice", "phone", b"key-phone", Trust::Tofu);
+    assert!(
+        !store.rebind_device("alice", "laptop", "phone"),
+        "would silently merge two distinct devices' history into one row"
+    );
+    assert_eq!(
+        store.get_for_device("alice", "phone"),
+        Some(b"key-phone".as_slice()),
+        "phone's own entry is untouched by the refused rebind"
+    );
+}
+
+#[test]
+fn rebind_device_on_an_unknown_device_reports_nothing_rebound() {
+    let path = temp_store_path();
+    let mut store = IdStore::load(&path).unwrap();
+    store.pin_new_device("alice", "laptop", b"key-a", Trust::Tofu);
+    assert!(!store.rebind_device("alice", "nonexistent", "new-name"));
+}
+
+// ---------------------------------------------------------------------
+// `get`'s "most recently seen, or most recently pinned" default
+// ---------------------------------------------------------------------
+
+/// @requirement TB-094
+#[test]
+fn get_on_an_unknown_nickname_is_none() {
+    let path = temp_store_path();
+    let store = IdStore::load(&path).unwrap();
+    assert_eq!(store.get("nobody"), None);
+}
+
+#[test]
+fn get_returns_the_only_device_when_there_is_just_one() {
+    let path = temp_store_path();
+    let mut store = IdStore::load(&path).unwrap();
+    store.pin_new_device("alice", "laptop", b"key-a", Trust::Tofu);
+    assert_eq!(store.get("alice"), Some(b"key-a".as_slice()));
+}
+
+/// When neither device has ever been confirmed reachable (`last_seen_unix`
+/// unset for both), `get` falls back to whichever was pinned most
+/// recently - the later `pin_new_device` call.
+#[test]
+fn get_prefers_the_most_recently_pinned_device_when_neither_has_been_seen() {
+    let path = temp_store_path();
+    let mut store = IdStore::load(&path).unwrap();
+    store.pin_new_device("alice", "laptop", b"key-laptop", Trust::Tofu);
+    store.pin_new_device("alice", "phone", b"key-phone", Trust::Tofu);
+    assert_eq!(store.get("alice"), Some(b"key-phone".as_slice()));
+}
+
+/// A device confirmed reachable more recently wins over one pinned more
+/// recently but never (or less recently) seen - "most-recently-seen"
+/// takes priority over pin order.
+#[test]
+fn get_prefers_the_most_recently_seen_device_over_pin_order() {
+    let path = temp_store_path();
+    let mut store = IdStore::load(&path).unwrap();
+    store.pin_new_device("alice", "laptop", b"key-laptop", Trust::Tofu);
+    let addr: SocketAddr = "203.0.113.7:9999".parse().unwrap();
+    store.set_last_seen("alice", "laptop", addr);
+    store.pin_new_device("alice", "phone", b"key-phone", Trust::Tofu);
+    assert_eq!(
+        store.get("alice"),
+        Some(b"key-laptop".as_slice()),
+        "laptop was actually confirmed reachable; phone never has been"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Trust
+// ---------------------------------------------------------------------
+
+#[test]
+fn mark_verified_upgrades_a_specific_devices_trust() {
+    let path = temp_store_path();
+    let mut store = IdStore::load(&path).unwrap();
+    store.pin_new_device("alice", "laptop", b"key-a", Trust::Tofu);
+    store.pin_new_device("alice", "phone", b"key-phone", Trust::Tofu);
+    assert!(store.mark_verified("alice", "laptop"));
+    assert_eq!(store.trust_for_device("alice", "laptop"), Some(Trust::Verified));
+    assert_eq!(
+        store.trust_for_device("alice", "phone"),
+        Some(Trust::Tofu),
+        "sibling device's trust is untouched"
+    );
+}
+
+#[test]
+fn mark_verified_on_an_unpinned_device_reports_nothing_marked() {
+    let path = temp_store_path();
+    let mut store = IdStore::load(&path).unwrap();
+    assert!(!store.mark_verified("alice", "laptop"));
+}
+
+// ---------------------------------------------------------------------
+// key_mode / pinned_from (per device)
+// ---------------------------------------------------------------------
+
+#[test]
+fn set_key_mode_records_it_for_the_named_device_only() {
+    let path = temp_store_path();
+    let mut store = IdStore::load(&path).unwrap();
+    store.pin_new_device("alice", "laptop", b"key-a", Trust::Tofu);
+    store.pin_new_device("alice", "phone", b"key-phone", Trust::Tofu);
+    store.set_key_mode("alice", "laptop", KeyMode::PqHybrid);
+    let laptop = store
+        .devices_of("alice")
+        .find(|d| d.device_id == "laptop")
+        .unwrap();
+    let phone = store
+        .devices_of("alice")
+        .find(|d| d.device_id == "phone")
+        .unwrap();
+    assert_eq!(laptop.key_mode, Some(KeyMode::PqHybrid));
+    assert_eq!(phone.key_mode, None);
+}
+
+#[test]
+fn set_pinned_from_records_it_for_the_named_device_only() {
+    let path = temp_store_path();
+    let mut store = IdStore::load(&path).unwrap();
+    store.pin_new_device("alice", "", b"key-a", Trust::Tofu);
+    store.set_pinned_from("alice", "", PathBuf::from("/tmp/alice.card"));
+    assert_eq!(
+        store.pinned_from("alice"),
+        Some(std::path::Path::new("/tmp/alice.card"))
+    );
+}
+
+// ---------------------------------------------------------------------
+// Deletion: whole-nickname vs. per-device (§3's additive delete)
+// ---------------------------------------------------------------------
+
+#[test]
+fn remove_forgets_every_device_of_a_nickname() {
+    let path = temp_store_path();
+    let mut store = IdStore::load(&path).unwrap();
+    store.pin_new_device("alice", "laptop", b"key-a", Trust::Tofu);
+    store.pin_new_device("alice", "phone", b"key-phone", Trust::Tofu);
+    assert!(store.remove("alice"));
+    assert_eq!(store.devices_of("alice").count(), 0);
+    assert!(!store.nicknames().contains(&"alice".to_string()));
+}
+
+#[test]
+fn remove_on_an_unknown_nickname_reports_nothing_removed() {
+    let path = temp_store_path();
+    let mut store = IdStore::load(&path).unwrap();
+    assert!(!store.remove("nobody"));
+}
+
+/// The additive rule applied to deletion: removing one device's entry
+/// never touches its siblings.
+#[test]
+fn remove_device_removes_only_that_device_leaving_siblings_untouched() {
+    let path = temp_store_path();
+    let mut store = IdStore::load(&path).unwrap();
+    store.pin_new_device("alice", "laptop", b"key-a", Trust::Tofu);
+    store.pin_new_device("alice", "phone", b"key-phone", Trust::Tofu);
+    assert!(store.remove_device("alice", "laptop"));
+    assert_eq!(store.get_for_device("alice", "laptop"), None);
+    assert_eq!(
+        store.get_for_device("alice", "phone"),
+        Some(b"key-phone".as_slice()),
+        "sibling untouched"
+    );
+}
+
+#[test]
+fn remove_device_drops_the_nickname_entirely_once_its_last_device_is_gone() {
+    let path = temp_store_path();
+    let mut store = IdStore::load(&path).unwrap();
+    store.pin_new_device("alice", "laptop", b"key-a", Trust::Tofu);
+    assert!(store.remove_device("alice", "laptop"));
+    assert!(
+        !store.nicknames().contains(&"alice".to_string()),
+        "no device left, so nicknames() must not list an empty entry"
+    );
+}
+
+#[test]
+fn remove_device_on_a_nonexistent_device_reports_nothing_removed() {
+    let path = temp_store_path();
+    let mut store = IdStore::load(&path).unwrap();
+    store.pin_new_device("alice", "laptop", b"key-a", Trust::Tofu);
+    assert!(!store.remove_device("alice", "phone"));
+}
+
+// ---------------------------------------------------------------------
+// nicknames()
+// ---------------------------------------------------------------------
+
+#[test]
+fn nicknames_lists_every_pinned_contact_sorted_once_each() {
+    let path = temp_store_path();
+    let mut store = IdStore::load(&path).unwrap();
+    store.pin_new_device("carol", "d1", b"key-c", Trust::Tofu);
+    store.pin_new_device("alice", "d1", b"key-a", Trust::Tofu);
+    store.pin_new_device("alice", "d2", b"key-a2", Trust::Tofu);
+    store.pin_new_device("bob", "d1", b"key-b", Trust::Tofu);
+    assert_eq!(store.nicknames(), vec!["alice", "bob", "carol"]);
+}
+
+#[test]
+fn nicknames_is_empty_for_a_fresh_store() {
+    let path = temp_store_path();
+    let store = IdStore::load(&path).unwrap();
+    assert!(store.nicknames().is_empty());
+}
+
+// ---------------------------------------------------------------------
+// Injection guards
+// ---------------------------------------------------------------------
+
+/// @requirement TB-090
+#[test]
+fn a_nickname_containing_a_tab_is_never_pinned() {
+    let path = temp_store_path();
+    let mut store = IdStore::load(&path).unwrap();
+    store.pin_new_device("alice\tevil", "dev", b"key-a", Trust::Tofu);
+    assert_eq!(store.get_for_device("alice\tevil", "dev"), None, "never actually pinned");
+}
+
+#[test]
+fn a_nickname_containing_a_newline_is_never_pinned() {
+    let path = temp_store_path();
+    let mut store = IdStore::load(&path).unwrap();
+    store.pin_new_device("alice\nevil", "dev", b"key-a", Trust::Tofu);
+    assert_eq!(store.get_for_device("alice\nevil", "dev"), None);
+}
+
+/// A device_id is peer-reported exactly like a nickname, so it gets the
+/// same injection guard.
+#[test]
+fn a_device_id_containing_a_tab_is_never_pinned() {
+    let path = temp_store_path();
+    let mut store = IdStore::load(&path).unwrap();
+    store.pin_new_device("alice", "evil\tdevice", b"key-a", Trust::Tofu);
+    assert_eq!(store.get_for_device("alice", "evil\tdevice"), None);
+}
+
+// ---------------------------------------------------------------------
+// Save / load round trips and on-disk format
+// ---------------------------------------------------------------------
 
 /// @requirement TB-088
 #[test]
-fn save_then_load_round_trips_the_full_key_bytes() {
+fn save_then_load_round_trips_the_full_key_bytes_per_device() {
     let path = temp_store_path();
     // Bytes that aren't valid UTF-8 or printable text - a real DER blob is
     // arbitrary binary, so the round trip needs to survive that, not just
@@ -95,14 +592,14 @@ fn save_then_load_round_trips_the_full_key_bytes() {
     let key_b: Vec<u8> = vec![0x00, 0xff, 0x10, 0xab, 0x00, 0x00];
     {
         let mut store = IdStore::load(&path).unwrap();
-        store.check_and_pin("alice", &key_a);
-        store.check_and_pin("bob", &key_b);
+        store.pin_new_device("alice", "laptop", &key_a, Trust::Tofu);
+        store.pin_new_device("bob", "phone", &key_b, Trust::Tofu);
         store.save().expect("save should succeed");
     }
     {
-        let mut store = IdStore::load(&path).unwrap();
-        assert_eq!(store.check_and_pin("alice", &key_a), IdCheck::Match);
-        assert_eq!(store.check_and_pin("bob", &key_b), IdCheck::Match);
+        let store = IdStore::load(&path).unwrap();
+        assert_eq!(store.get_for_device("alice", "laptop"), Some(key_a.as_slice()));
+        assert_eq!(store.get_for_device("bob", "phone"), Some(key_b.as_slice()));
     }
     std::fs::remove_file(&path).ok();
 }
@@ -117,32 +614,10 @@ fn save_creates_missing_parent_directories() {
     ));
     let path = dir.join("nested").join("ids_store");
     let mut store = IdStore::load(&path).unwrap();
-    store.check_and_pin("alice", b"key-a");
+    store.pin_new_device("alice", "dev", b"key-a", Trust::Tofu);
     store.save().expect("save should create parent dirs");
     assert!(path.is_file());
     std::fs::remove_dir_all(&dir).ok();
-}
-
-/// @requirement TB-090
-#[test]
-fn a_nickname_containing_a_tab_is_never_pinned() {
-    let path = temp_store_path();
-    let mut store = IdStore::load(&path).unwrap();
-    // A malicious display_name could contain a tab/newline, which are the
-    // on-disk delimiters - accepting it would let a remote peer inject
-    // extra records into a purely local trust file.
-    assert_eq!(store.check_and_pin("alice\tevil", b"key-a"), IdCheck::New);
-    assert_eq!(
-        store.check_and_pin("alice\tevil", b"key-a"),
-        IdCheck::New,
-        "never actually pinned"
-    );
-    assert_eq!(store.check_and_pin("alice\nevil", b"key-a"), IdCheck::New);
-    assert_eq!(
-        store.check_and_pin("alice\nevil", b"key-a"),
-        IdCheck::New,
-        "never actually pinned"
-    );
 }
 
 /// @requirement TB-091
@@ -165,43 +640,47 @@ fn default_path_always_resolves_under_the_dot_aloo_home_directory() {
 #[test]
 fn corrupted_lines_in_an_existing_file_are_skipped_not_fatal() {
     let path = temp_store_path();
-    // "alice"/6b6579 61 = hex for "key-a"; "not-a-valid-line" has no tab so
-    // it's skipped; "carol" has an odd-length (invalid) hex half.
+    // "alice\tlaptop\t<hex for key-a>" is a valid line; "not-a-valid-line"
+    // has no tabs so it's skipped; "carol" has an odd-length (invalid)
+    // hex half; "bob\tphone\t<hex for key-b>" is valid again.
     std::fs::write(
         &path,
-        "alice\t6b65792d61\nnot-a-valid-line\ncarol\tabc\nbob\t6b65792d62\n",
+        "alice\tlaptop\t6b65792d61\nnot-a-valid-line\ncarol\tdev\tabc\nbob\tphone\t6b65792d62\n",
     )
     .unwrap();
-    let mut store = IdStore::load(&path).expect("a partially-corrupt file should still load");
-    assert_eq!(store.check_and_pin("alice", b"key-a"), IdCheck::Match);
-    assert_eq!(store.check_and_pin("bob", b"key-b"), IdCheck::Match);
-    assert_eq!(
-        store.check_and_pin("carol", b"anything"),
-        IdCheck::New,
-        "the corrupt line should not have been pinned"
-    );
+    let store = IdStore::load(&path).expect("a partially-corrupt file should still load");
+    assert_eq!(store.get_for_device("alice", "laptop"), Some(b"key-a".as_slice()));
+    assert_eq!(store.get_for_device("bob", "phone"), Some(b"key-b".as_slice()));
+    assert_eq!(store.get_for_device("carol", "dev"), None, "the corrupt line should not have been pinned");
+    std::fs::remove_file(&path).ok();
+}
+
+/// This store's format is a breaking change with no migration path
+/// (deliberate - see the device-pinning plan's §6): a file written by
+/// the old, device-less format simply doesn't parse under the new
+/// `nickname<TAB>device_id<TAB>hex<TAB>...` column shape and loads as
+/// empty, exactly like any other unparseable line.
+#[test]
+fn an_old_format_file_predating_devices_loads_as_empty_not_an_error() {
+    let path = temp_store_path();
+    // Old format: nickname<TAB>hex<TAB>trust<TAB>... - no device_id
+    // column, so `hex` (old column 2) is read as `device_id` here and
+    // fails `is_storable`/parses as garbage hex, and the line is skipped.
+    std::fs::write(&path, "alice\t6b65792d61\ttofu\t\t\t\tpqhybrid\t\n").unwrap();
+    let store = IdStore::load(&path).expect("an unparseable file must still load, just empty");
+    assert_eq!(store.get("alice"), None);
     std::fs::remove_file(&path).ok();
 }
 
 /// @requirement TB-094
 #[test]
-fn get_reads_a_pinned_entry_without_mutating_anything() {
+fn get_reads_without_mutating_anything() {
     let path = temp_store_path();
     let mut store = IdStore::load(&path).unwrap();
     assert_eq!(store.get("alice"), None, "nothing pinned yet");
-    store.check_and_pin("alice", b"key-a");
+    store.pin_new_device("alice", "laptop", b"key-a", Trust::Tofu);
     assert_eq!(store.get("alice"), Some(b"key-a".as_slice()));
-    // calling get again must not change anything a subsequent check_and_pin sees
-    assert_eq!(store.get("alice"), Some(b"key-a".as_slice()));
-    assert_eq!(store.check_and_pin("alice", b"key-a"), IdCheck::Match);
-}
-
-/// @requirement TB-094
-#[test]
-fn get_on_an_unknown_nickname_is_none() {
-    let path = temp_store_path();
-    let store = IdStore::load(&path).unwrap();
-    assert_eq!(store.get("nobody"), None);
+    assert_eq!(store.get("alice"), Some(b"key-a".as_slice()), "calling get again changes nothing");
 }
 
 /// @requirement TB-091
@@ -210,75 +689,53 @@ fn on_disk_format_is_hex_encoded_not_raw_or_base64() {
     let path = temp_store_path();
     {
         let mut store = IdStore::load(&path).unwrap();
-        store.check_and_pin("alice", &[0xde, 0xad, 0xbe, 0xef]);
+        store.pin_new_device("alice", "laptop", &[0xde, 0xad, 0xbe, 0xef], Trust::Tofu);
         store.save().unwrap();
     }
     let contents = std::fs::read_to_string(&path).unwrap();
-    // Third column is how much the pin is worth (docs/PROTOCOL.md 12.6) -
-    // a fresh sighting is trusted-on-first-use until a human says more.
-    // The five trailing (empty) columns are last-seen address/device id
-    // (docs/PROTOCOL.md 12.7), last-seen-unix/key-mode (the contacts
-    // list), and pinned-from (an imported identity card's path) - all
-    // absent until this pin's key has gone `Active` over the direct link
-    // at least once, been recorded via `set_key_mode`, or been imported
-    // from a file.
-    assert_eq!(contents, "alice\tdeadbeef\ttofu\t\t\t\t\t\n");
+    // nickname<TAB>device_id<TAB>hex<TAB>trust<TAB>last_addr<TAB>
+    // last_seen_unix<TAB>key_mode<TAB>pinned_from - trailing five columns
+    // empty until this device's key has gone `Active` at least once, been
+    // recorded via `set_key_mode`, or been imported from a file.
+    assert_eq!(contents, "alice\tlaptop\tdeadbeef\ttofu\t\t\t\t\n");
     std::fs::remove_file(&path).ok();
 }
 
 // ---------------------------------------------------------------------
-// Last-seen address/device id (docs/PROTOCOL.md §12.7)
+// Last-seen address (docs/PROTOCOL.md §12.7), per device
 // ---------------------------------------------------------------------
 
 /// @requirement AC-165
 #[test]
-fn last_addr_and_device_id_are_none_until_set() {
+fn last_addr_is_none_until_set() {
     let path = temp_store_path();
     let mut store = IdStore::load(&path).unwrap();
-    store.check_and_pin("alice", b"key-a");
+    store.pin_new_device("alice", "laptop", b"key-a", Trust::Tofu);
     assert_eq!(store.last_addr("alice"), None);
-    assert_eq!(store.last_device_id("alice"), None);
 }
 
 /// @requirement AC-165
 #[test]
-fn set_last_seen_is_a_no_op_for_an_unpinned_nickname() {
+fn set_last_seen_is_a_no_op_for_an_unpinned_device() {
     let path = temp_store_path();
     let mut store = IdStore::load(&path).unwrap();
     let addr: SocketAddr = "203.0.113.7:9999".parse().unwrap();
-    store.set_last_seen("nobody", addr, "some-device");
+    store.set_last_seen("nobody", "dev", addr);
     assert_eq!(store.last_addr("nobody"), None);
-    assert_eq!(store.last_device_id("nobody"), None);
 }
 
 /// @requirement AC-165
 #[test]
-fn set_last_seen_records_address_and_device_id_for_a_pinned_nickname() {
+fn set_last_seen_records_address_for_the_named_device_only() {
     let path = temp_store_path();
     let mut store = IdStore::load(&path).unwrap();
-    store.check_and_pin("alice", b"key-a");
+    store.pin_new_device("alice", "laptop", b"key-a", Trust::Tofu);
+    store.pin_new_device("alice", "phone", b"key-phone", Trust::Tofu);
     let addr: SocketAddr = "203.0.113.7:9999".parse().unwrap();
-    store.set_last_seen("alice", addr, "alice-device");
-    assert_eq!(store.last_addr("alice"), Some(addr));
-    assert_eq!(store.last_device_id("alice"), Some("alice-device"));
-}
-
-/// @requirement AC-165
-#[test]
-fn set_last_seen_with_an_unstorable_device_id_leaves_it_unset() {
-    let path = temp_store_path();
-    let mut store = IdStore::load(&path).unwrap();
-    store.check_and_pin("alice", b"key-a");
-    let addr: SocketAddr = "203.0.113.7:9999".parse().unwrap();
-    // A tab is the on-disk field delimiter - a hostile peer's self-reported
-    // device id must not be able to inject a record into this local file.
-    store.set_last_seen("alice", addr, "evil\tid");
-    assert_eq!(
-        store.last_addr("alice"),
-        Some(addr),
-        "address is still recorded"
-    );
-    assert_eq!(store.last_device_id("alice"), None);
+    store.set_last_seen("alice", "laptop", addr);
+    assert_eq!(store.last_addr("alice"), Some(addr), "laptop is the most-recently-seen default");
+    let phone = store.devices_of("alice").find(|d| d.device_id == "phone").unwrap();
+    assert_eq!(phone.last_addr, None, "phone untouched");
 }
 
 /// @requirement AC-165
@@ -288,153 +745,30 @@ fn last_seen_survives_a_save_and_load_round_trip() {
     let addr: SocketAddr = "[::1]:4242".parse().unwrap();
     {
         let mut store = IdStore::load(&path).unwrap();
-        store.check_and_pin("alice", b"key-a");
-        store.set_last_seen("alice", addr, "alice-device");
+        store.pin_new_device("alice", "laptop", b"key-a", Trust::Tofu);
+        store.set_last_seen("alice", "laptop", addr);
         store.save().unwrap();
     }
     let store = IdStore::load(&path).unwrap();
     assert_eq!(store.last_addr("alice"), Some(addr));
-    assert_eq!(store.last_device_id("alice"), Some("alice-device"));
     std::fs::remove_file(&path).ok();
 }
 
 /// @requirement AC-165, TB-198
 #[test]
-fn a_store_without_last_seen_columns_still_loads() {
+fn a_store_without_the_trailing_optional_columns_still_loads() {
     let path = temp_store_path();
-    // A file saved before this feature existed - only nickname/hex/trust.
-    std::fs::write(&path, "alice\t6b65792d61\ttofu\n").unwrap();
+    // Only nickname/device_id/hex/trust - every trailing column absent.
+    std::fs::write(&path, "alice\tlaptop\t6b65792d61\ttofu\n").unwrap();
     let store = IdStore::load(&path).expect("must still load");
-    assert_eq!(store.get("alice"), Some(b"key-a".as_slice()));
+    assert_eq!(store.get_for_device("alice", "laptop"), Some(b"key-a".as_slice()));
     assert_eq!(store.last_addr("alice"), None);
-    assert_eq!(store.last_device_id("alice"), None);
     std::fs::remove_file(&path).ok();
 }
 
-/// @requirement AC-165
-#[test]
-fn re_pinning_on_accept_keeps_the_previously_recorded_last_seen() {
-    let path = temp_store_path();
-    let mut store = IdStore::load(&path).unwrap();
-    store.check_and_pin("alice", b"key-a");
-    let addr: SocketAddr = "203.0.113.7:9999".parse().unwrap();
-    store.set_last_seen("alice", addr, "alice-device");
-    // A mismatch's Accept re-pins the new key via check_and_pin - the
-    // address/device id recorded under the old key isn't wiped by that
-    // alone; the caller (`session::handle_ui_action`'s `AcceptIdentity`
-    // arm) calls `set_last_seen` again right after with the connection
-    // it actually just reviewed.
-    store.check_and_pin("alice", b"key-b");
-    assert_eq!(store.last_addr("alice"), Some(addr));
-    assert_eq!(store.last_device_id("alice"), Some("alice-device"));
-}
-
 // ---------------------------------------------------------------------
-// Last-seen wall-clock time / key mode (the contacts list)
+// key_mode / last_seen_unix survive round trips
 // ---------------------------------------------------------------------
-
-#[test]
-fn key_mode_is_none_until_set() {
-    let path = temp_store_path();
-    let mut store = IdStore::load(&path).unwrap();
-    store.check_and_pin("alice", b"key-a");
-    assert_eq!(store.key_mode("alice"), None);
-}
-
-#[test]
-fn set_key_mode_records_it_for_a_pinned_nickname() {
-    let path = temp_store_path();
-    let mut store = IdStore::load(&path).unwrap();
-    store.check_and_pin("alice", b"key-a");
-    store.set_key_mode("alice", aloo::proto::KeyMode::PqHybrid);
-    assert_eq!(
-        store.key_mode("alice"),
-        Some(aloo::proto::KeyMode::PqHybrid)
-    );
-}
-
-#[test]
-fn set_key_mode_is_a_no_op_for_an_unpinned_nickname() {
-    let path = temp_store_path();
-    let mut store = IdStore::load(&path).unwrap();
-    store.set_key_mode("nobody", aloo::proto::KeyMode::PqHybrid);
-    assert_eq!(store.key_mode("nobody"), None);
-}
-
-/// @requirement AC-301
-#[test]
-fn set_pinned_from_records_it_for_a_pinned_nickname() {
-    let path = temp_store_path();
-    let mut store = IdStore::load(&path).unwrap();
-    store.check_and_pin("alice", b"key-a");
-    assert_eq!(store.pinned_from("alice"), None);
-    store.set_pinned_from("alice", std::path::PathBuf::from("/tmp/alice.card"));
-    assert_eq!(store.pinned_from("alice"), Some(std::path::Path::new("/tmp/alice.card")));
-}
-
-/// @requirement AC-301
-#[test]
-fn set_pinned_from_is_a_no_op_for_an_unpinned_nickname() {
-    let path = temp_store_path();
-    let mut store = IdStore::load(&path).unwrap();
-    store.set_pinned_from("nobody", std::path::PathBuf::from("/tmp/nobody.card"));
-    assert_eq!(store.pinned_from("nobody"), None);
-}
-
-/// @requirement AC-301
-#[test]
-fn pinned_from_survives_a_save_and_load_round_trip() {
-    let path = temp_store_path();
-    {
-        let mut store = IdStore::load(&path).unwrap();
-        store.check_and_pin("alice", b"key-a");
-        store.set_pinned_from("alice", std::path::PathBuf::from("/tmp/alice.card"));
-        store.save().unwrap();
-    }
-    let store = IdStore::load(&path).unwrap();
-    assert_eq!(store.pinned_from("alice"), Some(std::path::Path::new("/tmp/alice.card")));
-    std::fs::remove_file(&path).ok();
-}
-
-/// A re-pin (`check_and_pin` again under the same nickname) must not wipe
-/// out a previously recorded card path - the same "metadata describes the
-/// relationship, not any one key" reasoning `re_pinning_keeps_the_previously_recorded_key_mode_and_last_seen`
-/// already establishes for `key_mode`/`last_seen`.
-/// @requirement AC-301
-#[test]
-fn re_pinning_keeps_the_previously_recorded_pinned_from() {
-    let path = temp_store_path();
-    let mut store = IdStore::load(&path).unwrap();
-    store.check_and_pin("alice", b"key-a");
-    store.set_pinned_from("alice", std::path::PathBuf::from("/tmp/alice.card"));
-    store.check_and_pin("alice", b"key-a-2");
-    assert_eq!(store.pinned_from("alice"), Some(std::path::Path::new("/tmp/alice.card")));
-}
-
-#[test]
-fn set_last_seen_stamps_a_wall_clock_time() {
-    let path = temp_store_path();
-    let mut store = IdStore::load(&path).unwrap();
-    store.check_and_pin("alice", b"key-a");
-    assert_eq!(store.last_seen_unix("alice"), None);
-    let before = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let addr: SocketAddr = "203.0.113.7:9999".parse().unwrap();
-    store.set_last_seen("alice", addr, "alice-device");
-    let after = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let seen = store
-        .last_seen_unix("alice")
-        .expect("stamped by set_last_seen");
-    assert!(
-        seen >= before && seen <= after,
-        "{seen} not in [{before}, {after}]"
-    );
-}
 
 #[test]
 fn key_mode_and_last_seen_survive_a_save_and_load_round_trip() {
@@ -442,95 +776,52 @@ fn key_mode_and_last_seen_survive_a_save_and_load_round_trip() {
     let addr: SocketAddr = "[::1]:4242".parse().unwrap();
     {
         let mut store = IdStore::load(&path).unwrap();
-        store.check_and_pin("alice", b"key-a");
-        store.set_key_mode("alice", aloo::proto::KeyMode::PqHybrid);
-        store.set_last_seen("alice", addr, "alice-device");
+        store.pin_new_device("alice", "laptop", b"key-a", Trust::Tofu);
+        store.set_key_mode("alice", "laptop", KeyMode::PqHybrid);
+        store.set_last_seen("alice", "laptop", addr);
         store.save().unwrap();
     }
     let store = IdStore::load(&path).unwrap();
-    assert_eq!(
-        store.key_mode("alice"),
-        Some(aloo::proto::KeyMode::PqHybrid)
-    );
+    assert_eq!(store.key_mode("alice"), Some(KeyMode::PqHybrid));
     assert!(store.last_seen_unix("alice").is_some());
     std::fs::remove_file(&path).ok();
 }
 
 #[test]
-fn a_store_without_last_seen_unix_or_key_mode_columns_still_loads() {
+fn set_last_seen_stamps_a_wall_clock_time() {
     let path = temp_store_path();
-    // A file saved before these two fields existed - only through
-    // last_device_id.
-    std::fs::write(&path, "alice\t6b65792d61\ttofu\t\t\n").unwrap();
-    let store = IdStore::load(&path).expect("must still load");
-    assert_eq!(store.get("alice"), Some(b"key-a".as_slice()));
+    let mut store = IdStore::load(&path).unwrap();
+    store.pin_new_device("alice", "laptop", b"key-a", Trust::Tofu);
     assert_eq!(store.last_seen_unix("alice"), None);
-    assert_eq!(store.key_mode("alice"), None);
-    std::fs::remove_file(&path).ok();
-}
-
-#[test]
-fn re_pinning_keeps_the_previously_recorded_key_mode_and_last_seen() {
-    let path = temp_store_path();
-    let mut store = IdStore::load(&path).unwrap();
-    store.check_and_pin("alice", b"key-a");
-    store.set_key_mode("alice", aloo::proto::KeyMode::PqHybrid);
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
     let addr: SocketAddr = "203.0.113.7:9999".parse().unwrap();
-    store.set_last_seen("alice", addr, "alice-device");
-    store.check_and_pin("alice", b"key-b");
-    assert_eq!(
-        store.key_mode("alice"),
-        Some(aloo::proto::KeyMode::PqHybrid)
-    );
-    assert!(store.last_seen_unix("alice").is_some());
+    store.set_last_seen("alice", "laptop", addr);
+    let after = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let seen = store.last_seen_unix("alice").expect("stamped by set_last_seen");
+    assert!(seen >= before && seen <= after, "{seen} not in [{before}, {after}]");
 }
 
-#[test]
-fn nicknames_lists_every_pinned_contact_sorted() {
-    let path = temp_store_path();
-    let mut store = IdStore::load(&path).unwrap();
-    store.check_and_pin("carol", b"key-c");
-    store.check_and_pin("alice", b"key-a");
-    store.check_and_pin("bob", b"key-b");
-    assert_eq!(store.nicknames(), vec!["alice", "bob", "carol"]);
-}
+// ---------------------------------------------------------------------
+// pinned_from survives round trips
+// ---------------------------------------------------------------------
 
+/// @requirement AC-301
 #[test]
-fn nicknames_is_empty_for_a_fresh_store() {
-    let path = temp_store_path();
-    let store = IdStore::load(&path).unwrap();
-    assert!(store.nicknames().is_empty());
-}
-
-#[test]
-fn remove_forgets_a_pinned_contact_and_reports_it_removed_something() {
-    let path = temp_store_path();
-    let mut store = IdStore::load(&path).unwrap();
-    store.check_and_pin("alice", b"key-a");
-    assert!(store.remove("alice"));
-    assert_eq!(store.get("alice"), None);
-    assert_eq!(store.check_and_pin("alice", b"key-a"), IdCheck::New);
-}
-
-#[test]
-fn remove_on_an_unknown_nickname_reports_nothing_removed() {
-    let path = temp_store_path();
-    let mut store = IdStore::load(&path).unwrap();
-    assert!(!store.remove("nobody"));
-}
-
-#[test]
-fn remove_persists_across_a_save_and_load_round_trip() {
+fn pinned_from_survives_a_save_and_load_round_trip() {
     let path = temp_store_path();
     {
         let mut store = IdStore::load(&path).unwrap();
-        store.check_and_pin("alice", b"key-a");
-        store.check_and_pin("bob", b"key-b");
-        store.remove("alice");
+        store.pin_new_device("alice", "", b"key-a", Trust::Tofu);
+        store.set_pinned_from("alice", "", PathBuf::from("/tmp/alice.card"));
         store.save().unwrap();
     }
     let store = IdStore::load(&path).unwrap();
-    assert_eq!(store.get("alice"), None);
-    assert_eq!(store.get("bob"), Some(b"key-b".as_slice()));
+    assert_eq!(store.pinned_from("alice"), Some(std::path::Path::new("/tmp/alice.card")));
     std::fs::remove_file(&path).ok();
 }

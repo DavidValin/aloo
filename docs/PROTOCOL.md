@@ -76,7 +76,7 @@ falling back to a server relay (§7.1).
   - [12.1 The gap this closes](#121-the-gap-this-closes)
   - [12.2 What gets pinned, and what doesn't](#122-what-gets-pinned-and-what-doesnt)
   - [12.3 When the check happens](#123-when-the-check-happens)
-  - [12.4 What happens on a mismatch](#124-what-happens-on-a-mismatch)
+  - [12.4 What happens on a mismatch, and how a device is resolved](#124-what-happens-on-a-mismatch-and-how-a-device-is-resolved)
   - [12.5 Store format and location](#125-store-format-and-location)
   - [12.6 Making a pin worth more than "these bytes differ"](#126-making-a-pin-worth-more-than-these-bytes-differ)
   - [12.7 Device id and last-seen address](#127-device-id-and-last-seen-address)
@@ -96,8 +96,10 @@ falling back to a server relay (§7.1).
 - [16. One-time-pad layer over `pq_hybrid`](#16-one-time-pad-layer-over-pq_hybrid)
   - [16.1 Turning it on, only once both sides explicitly agree](#161-turning-it-on-only-once-both-sides-explicitly-agree)
   - [16.1.1 A second, independent key for OTP mail: `/new-otp-mail-key`](#1611-a-second-independent-key-for-otp-mail-new-otp-mail-key)
+  - [16.1.2 Device-qualified naming (`PqWrapped` only)](#1612-device-qualified-naming-pqwrapped-only)
   - [16.2 Sending under the pad](#162-sending-under-the-pad)
     - [16.2.1 One conversation end to end: every spend, its acknowledgement, and its retries](#1621-one-conversation-end-to-end-every-spend-its-acknowledgement-and-its-retries)
+    - [16.2.2 A `Direct` pair's device claim: cleartext metadata, checked before the pad is touched](#1622-a-direct-pairs-device-claim-cleartext-metadata-checked-before-the-pad-is-touched)
   - [16.3 Session visibility in the DM log](#163-session-visibility-in-the-dm-log)
   - [16.4 Recovering a send whose ciphertext already left](#164-recovering-a-send-whose-ciphertext-already-left)
   - [16.5 Live key-metadata header](#165-live-key-metadata-header)
@@ -2413,20 +2415,41 @@ the two cases.
 
 `id_store` is a local, per-client record - never transmitted, never
 visible to the server or any peer - that remembers which public key a
-nickname was last seen with (the full DER bytes, not a fingerprint of them;
-§12.2), so a reconnect under a *different* key can be flagged instead of
-silently, indistinguishably trusted. The model is the same one SSH's
-`known_hosts` and Signal's safety numbers use for pinning, but - unlike
-either of those, and unlike this app's own earlier passive-banner
-implementation - a mismatch here is a **blocking** decision, not merely a
-displayed warning: messaging with the mismatched peer stays gated (§12.4)
-until the user explicitly Accepts or Rejects the new key via an on-screen
-popup (`docs/SPEC.md` #9's "Identity review popup"). This is still not a
-*permanent* lockout, which matters precisely because a false positive is
-possible (e.g. a peer legitimately regenerating their `my_key` file): a
-`Reject` is reconsiderable at any time (selecting the peer again reopens
-the same popup), and nothing about the decision is silent or automatic in
-either direction - the human reviewing it decides, the app never guesses.
+`(nickname, device_id)` pair was last seen with (the full DER bytes, not a
+fingerprint of them; §12.2), so a reconnect under a *different* key can be
+flagged instead of silently, indistinguishably trusted. The model is the
+same one SSH's `known_hosts` and Signal's safety numbers use for pinning,
+but - unlike either of those, and unlike this app's own earlier
+passive-banner implementation - a mismatch here is a **blocking**
+decision, not merely a displayed warning: messaging with the mismatched
+peer stays gated (§12.4) until the user explicitly Accepts or Rejects the
+new key via an on-screen popup (`docs/SPEC.md` #9's "Identity review
+popup"). This is still not a *permanent* lockout, which matters precisely
+because a false positive is possible (e.g. a peer legitimately
+regenerating their `my_key` file): a `Reject` is reconsiderable at any
+time (selecting the peer again reopens the same popup), and nothing about
+the decision is silent or automatic in either direction - the human
+reviewing it decides, the app never guesses.
+
+**A nickname's pin is per-device, additive, never silently replacing.**
+Reconnecting from a *second physical machine* is a routine, expected event
+- not automatically distinguishable, from the wire alone, from "an
+unrelated key change" or "an impersonator" - and device id (§12.7) is what
+lets a client actually tell the three apart instead of forcing every
+device switch through the same mismatch review a genuine impersonation
+gets. `id_store` therefore pins one key per `(nickname, device_id)` pair,
+not one per nickname: a nickname with two devices holds two independent
+entries, and pinning a new device's key never touches, replaces, or
+removes another device's existing entry - adding is the only way in short
+of an explicit, per-device delete the user performs themselves
+(`docs/SPEC.md`'s Contacts section). Device id is self-reported and
+therefore untrusted exactly like a nickname (§12.7) - it is never what
+*grants* trust, only what narrows *which* already-pinned entry a byte
+comparison runs against or a keychain slot resolves to; a spoofed device
+id can, at most, cause an unnecessary review or an unnecessary
+re-provisioning prompt, never bypass a key comparison or forge a pad's
+authentication (§16.2), since both of those still rest on cryptographic
+material alone. §12.4 is the full algorithm this enables.
 
 ### 12.2 What gets pinned, and what doesn't
 
@@ -2443,8 +2466,22 @@ changes the encryption half, never the identity pinned here.
 
 That is the whole of it, because `pq_hybrid` is the only `my_key` this
 protocol has. A peer announcing bytes that do not decode as a keybundle
-has no identity to pin at all, and is left untracked rather than
-compared.
+has no identity to pin at all in this dimension - see the next paragraph
+for what happens to those instead.
+
+**A nickname's `pq_hybrid` pin and its `Direct`-framed raw-pad pin
+(§16.2) are independent, non-colliding trust dimensions**, distinguished
+by each device entry's `key_mode` (`PqHybrid` or, for a raw pin, unset).
+Every comparison in §12.4's algorithm, and every naming rule in §16
+(§16.1's OTP contact naming, §16.2's Direct-pair pad binding), only ever
+compares a nickname's entries that share the same `key_mode` as the one in
+hand - a pre-existing Direct-framed raw pairing key for a nickname never
+"mismatches" against that same nickname's first-ever `pq_hybrid` sighting;
+a fresh, `key_mode`-scoped pin is created silently instead, and the
+otp-only entry is left exactly as it was. This is what lets meeting the
+same person once serverless (an otp-only relationship) and later through a
+server (a `pq_hybrid` identity) coexist for one nickname with neither ever
+touching the other.
 
 **The store pins the full `public_key_der` bytes, not a hash of them** -
 the pin-and-compare path compares raw DER byte-for-byte, and saving the store
@@ -2478,16 +2515,52 @@ moment `UserJoined` arrives, which is populated by the very next thing
 that happens to that message (the client) - so the check
 runs before the peer is recorded as known, exactly once.
 
-### 12.4 What happens on a mismatch
+### 12.4 What happens on a mismatch, and how a device is resolved
 
-If the nickname was already pinned to a public key that doesn't
-byte-for-byte match the one just announced, the client
-(the identity check) does **not** re-pin or persist anything yet
-- unlike §12.2-era behavior, a mismatch no longer writes to `id_store` on
-its own; only an explicit `Accept` does (below). Concretely, `check_identity`
-reads the pinned key with a read of the store (which never mutates) rather than
-calling the pin-and-compare path (which always would), compares it by hand,
-and on a byte difference:
+Device id (§12.7) is not known at the moment a peer's `pq_hybrid`
+identity first needs checking - `UserJoined` arrives before
+`DeviceIdAnnounce` ever could - so the algorithm runs in two phases:
+
+**Phase 1, device-blind (`session::check_identity`, at `UserJoined`).**
+Compares the newly-announced key against *every* `pq_hybrid`-scoped entry
+this nickname has, regardless of device (`idstore::compare_key`): an exact
+match against any of them is silent; no match against any of them opens a
+review, coarsely, against the most-recently-seen entry (refined once the
+device resolves, below); nothing pinned at all for this nickname yet is a
+provisional, *unbound* first sighting (`pin_new_device(nickname, "",
+key)`) - deliberately not yet attributed to any device, since none is
+known. Either way, this phase never re-pins or persists a genuine
+mismatch on its own; only an explicit `Accept` does (point 3 below).
+
+**Phase 2, device-aware (`session::finalize_identity_pin`, once this
+connection's device id resolves - §12.7).** Runs the precise, per-device
+version of the same comparison, narrowed now that a specific device id is
+in hand:
+
+1. **`(nickname, device_id)` already has a bound entry, and the key
+   matches it** - silent; last-seen is refreshed (§12.7).
+2. **No entry for this exact device, but the phase-1 provisional entry is
+   still unbound and its key matches** - claimed in place
+   (`IdStore::claim_unbound`): the *same* entry's `device_id` field is
+   rewritten to the one now confirmed, never duplicated. This is "filled
+   in on first use" applied to the identity pin itself.
+3. **A bound entry for this device exists, but its key differs** - or
+   **no entry for this device exists, and the nickname has one or more
+   *other* devices already pinned** - a continuity certificate (§12.6) is
+   tried first, scanned against *every* one of the nickname's device
+   entries sharing this `key_mode`, not just the one that mismatched (a
+   `--rekey-pq-hybrid` cert can legitimately surface on a different device
+   than the one that ran it - e.g. rekeyed, then the new keybundle file
+   moved to a new machine). A match re-pins that one entry silently, no
+   review, its `device_id` updated to the one now announcing it. No match
+   against any entry falls through to the ordinary review (point 3 in the
+   list below), scoped to just this device.
+4. **The nickname has no pinned devices at all** (phase 1's provisional
+   pin never landed, or was since removed) - first sighting, pinned
+   silently, scoped to this device.
+
+Case 3's review and its resolution work exactly as before, just narrowed
+to one device's entry rather than the nickname as a whole:
 
 1. Starts a review (`session::check_identity` calling
    `UiState::begin_identity_review`) that immediately gates messaging (point
@@ -2533,74 +2606,102 @@ and on a byte difference:
    - Their sidebar entry renders red, taking priority over the usual
      green/offline-gray coloring.
 3. On `Accept` (`session.rs::handle_ui_action`'s `AcceptIdentity` arm):
-   pins the new key, records the address/device id this connection was
-   actually reviewed under as its last-seen values (§12.7), and **saves
-   the store to disk immediately, synchronously** (saving the store, same
-   as the old immediate-save policy) - the on-disk file reflects the new
-   pinning the instant the decision is made, not batched or deferred.
-   Every message held per point 2 is then revealed into the real log, in
-   arrival order, and the peer is fully trusted again (sidebar color,
-   sending, everything).
-4. On `Reject`: no `id_store` write at all - the previous pin (if any)
-   is left exactly as it was on disk and in memory. The peer's review
-   stays recorded (not discarded) so selecting them again re-opens the
-   same popup for reconsideration, rather than having nothing left to
-   show - this is what makes `Reject` a *reconsiderable* decision, not a
-   permanent one (§12.1).
+   pins the new key **for this connection's specific device only**
+   (`IdStore::replace_device_key` if this device already had an entry,
+   `pin_new_device` - additive - if it didn't), records the address/device
+   id this connection was actually reviewed under as that device's
+   last-seen values (§12.7), and **saves the store to disk immediately,
+   synchronously** - the on-disk file reflects the new pinning the instant
+   the decision is made, not batched or deferred. Crucially, **every other
+   device this nickname has pinned is left completely untouched** - a
+   second device announcing a new key never overwrites, demotes, or
+   removes the first device's own entry; the two coexist, and an
+   independent `check_identity`/`finalize_identity_pin` pass for the first
+   device's own connection (if it's live) is entirely unaffected by this
+   one's Accept. Every message held per point 2 is then revealed into the
+   real log, in arrival order, and the peer is fully trusted again
+   (sidebar color, sending, everything).
+4. On `Reject`: no `id_store` write at all - the previous pin for this
+   device (if any), and every other device's pin, is left exactly as it
+   was on disk and in memory. The peer's review stays recorded (not
+   discarded) so selecting them again re-opens the same popup for
+   reconsideration, rather than having nothing left to show - this is what
+   makes `Reject` a *reconsiderable* decision, not a permanent one
+   (§12.1).
 
 Multiple peers can have unresolved reviews at once; only one popup is shown
 at a time, front of a small FIFO queue - a peer's mismatch is queued the
 instant it's detected and the popup for it opens automatically as soon as
 whichever review is currently showing gets resolved (`Accept` or `Reject`
-either).
+either). Two different devices of the *same* nickname mismatching at
+around the same time queue and resolve completely independently of one
+another - each is its own device-scoped review.
 
 A first-ever sighting of a nickname (nothing pinned for it yet) still saves
-immediately and silently, exactly as before (so it's durably pinned for the
-*next* reconnect, not just held in memory for the current session) - this
-case never opens a review at all, since there's nothing to compare against.
-A sighting that matches what's already pinned is likewise silent and writes
-nothing (nothing changed, so there's nothing to persist). Only a genuine
-byte difference reaches the review flow above.
+immediately and silently as an *unbound* entry (phase 1, case above) - so
+it's durably pinned for the *next* reconnect, not just held in memory for
+the current session - and this case never opens a review at all, since
+there's nothing to compare against. A sighting that matches what's already
+pinned for that device is likewise silent and writes nothing (nothing
+changed, so there's nothing to persist). Only a genuine byte difference
+against every device sharing this `key_mode` reaches the review flow
+above.
 
 ### 12.5 Store format and location
 
-The store is a small flat file, one line per pinned nickname:
+The store is a small flat file, one line per pinned **device** (not per
+nickname):
 
 ```
-<nickname><TAB><hex-encoded public_key_der><TAB><trust><TAB><last addr><TAB><last device id><TAB><last seen unix><TAB><key mode><TAB><pinned from>\n
+<nickname><TAB><device_id><TAB><hex-encoded public_key_der><TAB><trust><TAB><last addr><TAB><last seen unix><TAB><key mode><TAB><pinned from>\n
 ```
 
-e.g. `alice\t30820122300d06092a864886f70d01010105000382010f00...\ttofu\t203.0.113.7:51820\t3f9a...\t1700000000\tpqhybrid\t\n` -
+e.g. `alice\tlaptop\t30820122300d06092a864886f70d01010105000382010f00...\ttofu\t203.0.113.7:51820\t1700000000\tpqhybrid\t\n` -
 the full DER bytes, lowercase-hex-encoded (lowercase hex, the same
 encoding the fingerprint already uses, not base64 or raw bytes) so
-the file stays plain text no matter what the key bytes are; `trust` is
-`tofu` or `verified` (§12.6); `last addr`/`last device id` are §12.7's
-last-seen values; `last seen unix` is when that pair was last recorded
-(the contacts list's "last seen" column); `key mode` is the pin's
-`KeyMode`, `pqhybrid` or empty; `pinned from` is the identity-card file
-path an imported pin (§12.6's "Importing one") came from, empty for
-every pin that arrived over the wire instead. Every column from `last
-addr` on is independently optional on the way in, so a store written
-before any of them existed still loads correctly. Entries are written in
-sorted-by-nickname order on save so the file diffs cleanly under version
-control or manual inspection.
+the file stays plain text no matter what the key bytes are; `device_id`
+is the primary-key half of `(nickname, device_id)` - empty for an
+*unbound* entry (§12.4's phase-1 provisional pin, or a pin imported from
+an identity card, §12.6, neither of which has a confirmed device yet);
+`trust` is `tofu` or `verified` (§12.6); `last addr` is §12.7's last-seen
+value, scoped to this one device; `last seen unix` is when it was last
+recorded (the contacts list's "last seen" column); `key mode` is this
+device's pin `KeyMode`, `pqhybrid` or empty (§12.2's `key_mode` scoping);
+`pinned from` is the identity-card file path an imported pin (§12.6's
+"Importing one") came from, empty for every pin that arrived over the
+wire instead. Every column from `last addr` on is independently optional
+on the way in, so a store written before any of them existed still loads
+correctly. A nickname with several pinned devices is simply several
+lines sharing the same `nickname` column. Entries are written in
+sorted-by-`(nickname, device_id)` order on save so the file diffs
+cleanly under version control or manual inspection.
 
-A nickname containing a tab, `\n`, or `\r` is never pinned (silently
-treated as if it were a first-ever sighting, with nothing written) - a
-`display_name` is attacker-controlled input (any connected peer chooses
-their own), and accepting one containing the file's own field delimiter
-would let a remote peer inject spurious records into a purely local trust
-file. `device_id` is announced by a peer the same way a nickname is, so
-it gets the same treatment: an unstorable one is silently dropped rather
-than written (§12.7). The key half has no such restriction - hex digits
-can't collide with either delimiter no matter what the underlying bytes
-are, so any DER-encodable key is always storable. A line whose key half
-fails to hex-decode (odd length, non-hex character - e.g. hand-editing
-damage) is skipped on load, same as a line missing the name or key
-column entirely; the trust/address/device-id columns are all
-independently optional on the way in (a store written before one of them
-existed, or with an empty field, still loads correctly) - loading the
-store never fails the whole store over one bad line or an older format.
+**This is a breaking format change from the single-key-per-nickname
+store that predates the device-pinning model, with deliberately no
+migration path.** A file written in the old
+`<nickname><TAB><hex><TAB><trust><TAB>...` shape (no `device_id` column)
+does not parse under the new column positions - its old hex-key column is
+read as `device_id`, fails to look like one, and the line is simply
+skipped - so an old file loads as *empty*, exactly like any other
+unparseable line (below), never as a migration or a half-upgraded state.
+Anyone reconnecting after an upgrade re-pins on first sight, same as any
+other first-ever sighting (§12.4).
+
+A nickname or device_id containing a tab, `\n`, or `\r` is never pinned
+(silently treated as if it were a first-ever sighting, with nothing
+written) - both are attacker-controlled input (any connected peer chooses
+their own nickname; a device id is announced the same way, §12.7), and
+accepting one containing the file's own field delimiter would let a
+remote peer inject spurious records into a purely local trust file. The
+key half has no such restriction - hex digits can't collide with any
+delimiter no matter what the underlying bytes are, so any DER-encodable
+key is always storable. A line whose key half fails to hex-decode (odd
+length, non-hex character - e.g. hand-editing damage) is skipped on load,
+same as a line missing the name, device id, or key column entirely; the
+trust/address/key-mode/pinned-from columns are all independently optional
+on the way in (a store written before one of them existed, or with an
+empty field, still loads correctly) - loading the store never fails the
+whole store over one bad line, an old-format line, or an unparseable one.
 
 The path is set per-connection in the connect popup's `id_store` field
 (`docs/SPEC.md`'s "Not connected UI"), prefilled with `idstore::
@@ -2718,23 +2819,42 @@ and the protocol has no way around it without an anchor outside itself.
 
 ### 12.7 Device id and last-seen address
 
-Two more client-local, informational-only signals, purely to give a human
-more to go on when a mismatch review (§12.4) actually asks them to decide -
-neither one is trusted or checked by anything; they're just displayed. An
-address is never something that can be kept confidential in transit (it's
-the packet's own source, inherent to any IP communication - see §12.1's
-"what remains open" reasoning extended to this), but a device id is real
-payload, and it always travels sealed exactly like ordinary content -
-never in the clear, and never inside the punch handshake itself.
+An address is display-only, purely informational, and cannot be kept
+confidential in transit anyway (it's the packet's own source, inherent to
+any IP communication - see §12.1's "what remains open" reasoning extended
+to this). **Device id is different: since the device-pinning model
+(§12.1-§12.4), it is load-bearing rather than merely displayed** - it
+decides which of a nickname's pinned entries a byte comparison runs
+against, which keychain slot an OTP/mail name resolves to (§16.1), and
+which device a `Direct`-framed pad is currently bound to (§16.2). It is
+still entirely self-reported by whoever holds it - nothing stops a
+modified client from lying about theirs - so its role is bounded exactly
+the way any untrusted input's is: it can *narrow* which already-pinned
+entry is compared or which slot is used, but it can never *grant* trust
+or bypass a byte comparison on its own. A spoofed device id can, at most,
+cause an unnecessary review to open, an unnecessary re-provisioning
+prompt, or (§16.2) a message to be wrongly *held* pending the right
+device - never cause an illegitimate connection to be wrongly accepted,
+since real acceptance still rests on cryptographic material alone (a
+matching pinned key, or - for a `Direct` pad - a genuine decrypt). It
+always travels sealed exactly like ordinary content - never in the clear,
+and never inside the punch handshake itself - with one deliberate
+exception: a serverless, pad-only pair has no `pq_hybrid` envelope to seal
+one to at all, so §16.2 instead carries it as cleartext wire metadata
+alongside each pad-protected message, checked strictly *before* the
+pad-consuming decrypt ever runs - see §16.2 for why that ordering is the
+whole point.
 
 **Device id.** Each installation generates a random 50-character
 lowercase-hex id the first time one is needed and reuses it for that
 machine's whole lifetime: `crypto::random_bytes(25)` hex-encoded, written
 to `~/.aloo/d_id` (`client::device_id::load_or_create`) and read back
-as-is on every later run rather than regenerated. Like a nickname, it is
-entirely self-reported by whoever holds it - nothing stops a modified
-client from lying about theirs - so it carries no security weight on its
-own; it exists only to give a human something else to eyeball.
+as-is on every later run rather than regenerated. An empty string is
+reserved internally as `id_store`'s "unbound" sentinel (§12.4), so an
+announced device id that decodes to empty (or fails to decode as UTF-8 at
+all) is refused outright rather than cached
+(`client::device_id::accept_announced`) - a peer must never be able to
+plant the sentinel value themselves.
 
 **`DeviceIdAnnounce`: sent encrypted, once a link is `Active`.** A new
 `Content::DeviceIdAnnounce` tag and `P2pPayload::DeviceIdAnnounce {
@@ -2761,20 +2881,20 @@ review needs to resolve, not visible chat content subject to §12.4's
 hold-and-reveal) and caches the plaintext. Processed unconditionally on
 both sides regardless of who initiated the mismatch review, if any.
 
-**Last-seen address/device id.** Once *both* a peer's direct link is
-`Active` (the address) and their `DeviceIdAnnounce` has decrypted (the
-device id) - the two arrive independently and may race either way, so
-whichever happens second is what actually acts
-(`session::maybe_resolve_p2p_identity_data`) - they are recorded against
-their *currently pinned* key in `id_store`
-(§12.5's trailing two columns), refreshed on every later `Active`
-transition for that same pin, not just the first. This deliberately does
-**not** happen while a mismatch review for that peer is still outstanding
-(`AwaitingPeerInfo`/`Pending`): the review needs to compare against
-whatever was recorded *before* this connection, so nothing overwrites it
-until the user actually `Accept`s (at which point the newly-reviewed
-connection's address/device id become the new last-seen values, per
-§12.4 point 3).
+**Last-seen address.** Once *both* a peer's direct link is `Active` (the
+address) and their `DeviceIdAnnounce` has decrypted (the device id) - the
+two arrive independently and may race either way, so whichever happens
+second is what actually acts (`session::maybe_resolve_p2p_identity_data`,
+which also runs §12.4's phase 2, `finalize_identity_pin`) - the address is
+recorded against *that specific device's own entry* in `id_store` (§12.5's
+`last addr`/`last seen unix` columns), refreshed on every later `Active`
+transition for that same device, not just the first. This deliberately
+does **not** happen while a mismatch review for that device is still
+outstanding (`AwaitingPeerInfo`/`Pending`): the review needs to compare
+against whatever was recorded *before* this connection, so nothing
+overwrites it until the user actually `Accept`s (at which point the
+newly-reviewed connection's address becomes that device's new last-seen
+value, per §12.4 point 3).
 
 **How this shows up in a mismatch review.** §12.4's mismatch popup message
 gets two more lines, one for each side of the comparison:
@@ -2785,9 +2905,14 @@ Now connecting from <addr> (device <id>).
 ```
 
 The "last known" half is read straight from `id_store` - whatever was
-recorded the last time this nickname's *previous* key went `Active`,
-`unknown` if that never happened (e.g. the pin was set by an
-`--export-identity-card` import, §12.6, rather than a live connection).
+recorded for the *specific device entry* this review was opened against
+(`session::reveal_pending_identity_review` finds it by matching the
+previously-pinned key bytes the review itself carries), `unknown` if that
+never happened (e.g. the pin was set by an `--export-identity-card`
+import, §12.6, rather than a live connection, or there is genuinely no
+prior device to compare against at all - §12.4's phase 2, case 3's
+"no entry for this device, and the nickname has one or more other
+devices").
 The "new" half is this specific connection's own values, which is why the
 review itself is held open a moment before it's shown at all:
 `check_identity` detecting the mismatch only starts the review
@@ -3533,10 +3658,11 @@ only security property comes from being independent, true randomness.
 The initiating side writes nothing to its own keychain when it generates a
 pad. Both halves - its own and the peer's - are staged on disk, and only
 the peer's genuine acceptance moves its half into the keychain. This is
-what stops a failed invitation from poisoning the next one: the contact
-name is derived from both fingerprints, so every attempt between the same
-two people produces the identical name, and `otp --add-contact` refuses to
-overwrite. An invitation that is refused, unanswered, or interrupted by
+what stops a failed invitation from poisoning the next one: for a
+`PqWrapped` pair the contact name is derived from both sides'
+fingerprints *and* device ids (§16.1.2), so every attempt between the same
+two *devices* produces the identical name, and `otp --add-contact` refuses
+to overwrite. An invitation that is refused, unanswered, or interrupted by
 the peer going offline therefore leaves nothing behind, and a later `/otp`
 from *either* side simply generates a fresh pad.
 
@@ -3649,6 +3775,58 @@ is refused outright, with a plain notice naming the peer. Two different
 peers may each provision independently at the same time; only a second
 attempt at the *same* peer is refused, and the existing exchange is left
 completely untouched by the refusal.
+
+### 16.1.2 Device-qualified naming (`PqWrapped` only)
+
+`crypto::otp::contact_name_for`/`contact_name_for_mail` sort and hash two
+`(fingerprint, device_id)` pairs, not two bare fingerprints - each side's
+own device id (`SessionState::own_device_id`, always known locally) and
+the peer's, resolved from `session.peer_device_ids` once their
+`DeviceIdAnnounce` decrypts (§12.7). Both device ids are already known by
+the time any `/otp`/`/new-otp-mail-key` handshake can even start (§12.7's
+"sent automatically... every time a link reaches `Active`" - strictly
+before a user can act on it), so this needs no negotiation: both sides
+independently compute the identical name with nothing sent over the wire
+for it, exactly as the un-qualified naming this replaces always did.
+
+This makes rule 3 of the device-pinning model - "an OTP-only mismatch
+cannot communicate; keys must be exchanged via the existing methods" -
+true with **no dedicated gating code at all**: a pad provisioned on device
+A names a keychain slot that device B's connection can never derive, so
+`contact_name_if_active`/`contact_name_for_sending` simply return nothing
+for device B - OTP reads as "not provisioned on this device", and every
+existing fallback already handles exactly that (`/contacts`'s red ❌
+badges, `/mail`'s hard "no otp mail key" modal, §17.1's
+`RecipientCheck::NoMailKey`). Re-provisioning via `/otp`/
+`/new-otp-mail-key` (which now names device B's own slot) or manually via
+`/contacts` is "the existing methods" the rule refers to.
+
+**This is a breaking naming change from the un-qualified naming that
+predates the device-pinning model, with deliberately no migration path**:
+a pad provisioned under the old two-fingerprint name is simply not found
+under the new device-qualified name and reads as not-provisioned - no
+rename-in-place, no legacy-name fallback lookup. Re-provisioning once via
+either method above is the only path forward, same as any other genuine
+cross-device mismatch.
+
+The unknown-nickname scan (§7.1.5's "who is this" flow,
+`session::scan_pinned_keys_for_match`) runs *before* a connection's device
+id is confirmed - the scan is literally what confirms it - so it tries,
+for each candidate nickname, every one of that nickname's known
+device-qualified names (`IdStore::devices_of`, not just one), the same
+"try several candidates safely, only a genuine decrypt has any effect"
+property the scan already relies on for iterating candidate nicknames.
+
+A `Direct`-framed pair's naming
+(`contact_name_for_keys`/`contact_name_for_keys_mail`) is **not**
+device-qualified, and does not need to be: a raw pad is a single instance
+shared out-of-band between two users, so there is exactly one slot per
+raw-key pair regardless of how many devices either side has - two
+genuinely distinct devices already pin as two distinct raw keys under the
+ordinary additive multi-device flow (§12.1-§12.4), so naming never needs
+qualifying here the way `PqWrapped` naming does. §16.2 covers how a
+`Direct` pair still gets device-aware treatment, just through a different
+mechanism.
 
 ### 16.2 Sending under the pad
 
@@ -4076,6 +4254,102 @@ resolved by resuming the *acceptance*, not the pad:
    |--- FileChunk ... ------------------------->|  encrypted, exactly once
    |<-- OtpDeliveryAck { seq 10, proof } --------|
 ```
+
+### 16.2.2 A `Direct` pair's device claim: cleartext metadata, checked before the pad is touched
+
+A `Direct`-framed (pad-only, serverless or unpinned) pair has no
+`pq_hybrid` envelope to seal a `DeviceIdAnnounce` to at all - §12.1's own
+"what remains open" boundary extended one step further. There is also no
+provisioning handshake to piggyback a negotiation on: a `Direct` pair
+sends neither `OtpSessionRequest` nor `OtpKeySetup` (§16.1's own note -
+"having nothing left to agree"), since both users placed matching pad
+files entirely out of band before ever connecting. So device id instead
+rides inside every ordinary message, checked at decrypt time - no separate
+negotiation step, and communication starts on the very first message
+rather than waiting on one.
+
+Every `P2pPayload::OtpEnvelope`/`OtpFileOffer`/`OtpFileContentSeq`/the
+voice-offer variant carries a `sender_device_id` field alongside `channel`/
+`seq`, **outside `envelope.blocks` - cleartext wire metadata, never inside
+the padded payload.** This is a deliberate, security-critical placement,
+not an incidental one: `otp --decrypt` is destructive the instant it runs
+- it physically consumes that range of the local pad file whether or not
+the caller likes the result - so a check that needs the decrypted payload
+to run at all would spend the pad even on a device it then has to refuse.
+Putting the claim in cleartext instead is what lets the check run
+*strictly before* `unwrap_incoming`/`otp --decrypt` is ever invoked, the
+same reasoning `is_next_expected` (a check against purely local counters)
+already applies to spending a pad slot at all. This is not a new exposure
+for this framing - `Direct`'s own model already sends the sender's
+nickname unauthenticated and in the clear over `DirectPing`/`DirectPong`
+(§7.1.5) - and device id has never carried any security weight of its own
+beyond narrowing (§12.7): a spoofed value can at most cause a legitimate
+message to be wrongly *held*, never cause an illegitimate one to be wrongly
+*accepted*, since acceptance still rests entirely on the pad decrypt
+actually succeeding.
+
+**The gate** (`OtpContactState::bound_peer_device_id`,
+`otp::finish_opening_otp_envelope` - the one place every receive path for
+this framing funnels through):
+
+- `None` (nothing bound yet) - the claimed device id is provisionally
+  accepted and decryption proceeds normally. Only if that decrypt
+  genuinely succeeds does the pad actually bind to it
+  (`OtpStore::bind_peer_device`) - a bare claim with no successful decrypt
+  behind it binds nothing, so a claim from someone with no pad access
+  still can't plant a false binding. This is why the *first* message on a
+  fresh pad always succeeds regardless of what it claims: there is
+  nothing yet to compare against.
+- `Some(id)` matching the claim - ordinary decrypt, unchanged; the
+  binding is a no-op once already bound to this same device.
+- `Some(id)` **not** matching the claim - refused before `otp --decrypt`
+  is called at all: no pad byte touched, no offset moved, no ack sent.
+  From the sender's side this looks exactly like any other never-acked
+  send - the stop-and-wait gate keeps retrying it on every reconnect,
+  unchanged, and it decrypts and acks cleanly the moment the device the
+  pad is actually bound to is the one that answers, since nothing about
+  the pad's position was ever disturbed by the refused attempt. A local
+  status notice on the receiving side distinguishes this from an ordinary
+  transient failure ("claims a different device than this pad is bound
+  to").
+
+A one-time pad has no safe multi-device story - spending the same slot
+from two machines desyncs both sides' offsets and produces silent garbage
+for both - which is exactly why this is a hard, exclusive *binding*, in
+deliberate contrast to the identity pin's own additive, multi-device
+model (§12.1-§12.4): the pin answers "is this really who I think", the
+pad binding answers "is this pad still safe to spend from here", and they
+protect different things. The identity pin for a `Direct`-framed nickname
+still gets the full additive, multi-device treatment - a raw pinned key
+showing up from an inconsistent device still runs the ordinary
+review flow (someone's raw pairing key really can be copied to a second
+machine, even though the *pad* built from it can't safely be spent from
+both) - fed by this same claim, now cryptographically meaningful, since it
+only ever arrives bundled with a genuine successful decrypt rather than a
+bare, self-reported announce.
+
+**`direct_punch_to` addresses one device at a time; the claim confirms it,
+never discovers it.** These are different questions. If a nickname has
+several devices, each with its own independently-generated raw pairing
+key (the ordinary case, §12.1), `direct_punch_to=<nickname>[+<device_id>],
+<host>[:<port>],<frequency>` (§7.1.5) names which one a given line
+addresses - an optional suffix on the nickname field, split at the first
+`+`. An unsuffixed line is unaffected by this syntax existing at all and
+keeps resolving to whichever device `IdStore`'s ordinary most-recently-
+seen default names, exactly as before; two lines for the same nickname but
+different devices produce genuinely distinct synthetic `UserId`s
+(`p2p::direct_peer_id` folds the device id into its hash, only when one is
+given), distinct links, and - since the two devices' raw keys already
+differ - distinct pads. `PunchDatagram` itself carries no device id (a
+wire-format change this deliberately avoids), so an incoming
+`DirectPing`/`DirectPong` naming a shared nickname is disambiguated by the
+address it actually arrived from against each candidate line's own
+resolved address; an ambiguous claim that cannot be resolved this way is
+dropped rather than guessed at. Once a link is up, this section's claim
+does the job it was actually designed for - confirming the address already
+chosen is still being answered by that same device - rather than trying to
+discover or arbitrate between a peer's several devices, which is entirely
+a `direct_punch_to` configuration question.
 
 ### 16.3 Session visibility in the DM log
 

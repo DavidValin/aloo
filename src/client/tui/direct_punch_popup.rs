@@ -285,7 +285,10 @@ fn edit_state_for(index: usize, target: &DirectPunchTarget) -> DirectPunchEditSt
         .unwrap_or(0);
     DirectPunchEditState {
         editing_index: Some(index),
-        nickname: target.nickname.clone(),
+        // `target_key`, not the bare nickname, so re-editing a device-
+        // suffixed row (§5a) round-trips its `+<device_id>` suffix rather
+        // than silently dropping it.
+        nickname: target.target_key(),
         host: target.host.clone(),
         port: target.port.to_string(),
         frequency_index,
@@ -352,7 +355,10 @@ fn render_list(frame: &mut Frame, area: Rect, popup: &DirectPunchPopupState) {
         .map(|t| {
             ListItem::new(Line::from(format!(
                 "{}  {}:{}  {}",
-                t.nickname, t.host, t.port, t.frequency
+                t.target_key(),
+                t.host,
+                t.port,
+                t.frequency
             )))
         })
         .collect();
@@ -389,7 +395,11 @@ fn render_edit_form(frame: &mut Frame, area: Rect, edit: &DirectPunchEditState) 
     let rows = Layout::default().direction(Direction::Vertical).constraints(constraints).split(area);
 
     frame.render_widget(
-        Paragraph::new(field_line("nickname", &edit.nickname, edit.focus == DirectPunchField::Nickname)),
+        Paragraph::new(field_line(
+            "nickname (optionally nick+device_id)",
+            &edit.nickname,
+            edit.focus == DirectPunchField::Nickname,
+        )),
         rows[0],
     );
     frame.render_widget(

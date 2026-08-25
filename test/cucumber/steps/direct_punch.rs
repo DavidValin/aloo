@@ -92,8 +92,8 @@ fn link_of<'a>(w: &'a mut AlooWorld, name: &str) -> &'a mut PeerLinkManager {
 /// Drives both clients' receive loops and the scheduler until the link is
 /// up on both sides, or the deadline passes.
 async fn punch_until_active(w: &mut AlooWorld) {
-    let bob_id = direct_peer_id("bob");
-    let alice_id = direct_peer_id("alice");
+    let bob_id = direct_peer_id("bob", None);
+    let alice_id = direct_peer_id("alice", None);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         let up = link_of(w, "alice").is_active(bob_id) && link_of(w, "bob").is_active(alice_id);
@@ -189,6 +189,22 @@ async fn names_host_port(_w: &mut AlooWorld, value: String, host: String, port: 
     assert_eq!(target.port, port);
 }
 
+/// Device-pinning plan §5a: a `+<device_id>` suffix on the nickname field
+/// names a specific device rather than the nickname's default.
+#[then(expr = "{string} names nickname {string} device {string}")]
+async fn names_nickname_device(_w: &mut AlooWorld, value: String, nickname: String, device: String) {
+    let target = DirectPunchTarget::parse(&value).unwrap_or_else(|e| panic!("{value:?}: {e}"));
+    assert_eq!(target.nickname, nickname);
+    assert_eq!(target.device_id.as_deref(), Some(device.as_str()));
+}
+
+#[then(expr = "{string} names nickname {string} with no device")]
+async fn names_nickname_no_device(_w: &mut AlooWorld, value: String, nickname: String) {
+    let target = DirectPunchTarget::parse(&value).unwrap_or_else(|e| panic!("{value:?}: {e}"));
+    assert_eq!(target.nickname, nickname);
+    assert_eq!(target.device_id, None);
+}
+
 #[then(expr = "{int} direct punch lines are reported as unusable, each with a reason")]
 async fn unusable_lines(w: &mut AlooWorld, count: usize) {
     let invalid = &w.direct_settings.as_ref().unwrap().direct_punch_invalid;
@@ -203,6 +219,72 @@ async fn unusable_lines(w: &mut AlooWorld, count: usize) {
             "{line:?} was rejected with no reason, which is indistinguishable from a peer who never answers"
         );
     }
+}
+
+// ---------------------------------------------------------------------
+// Reference table no-server row 6: a second device stays unreachable
+// until a second, device-suffixed `direct_punch_to` line is added
+// (device-pinning plan §5a). Pure configuration-level reachability - no
+// actual punching needed, since `direct_peer`/`direct_status` are derived
+// the instant `configure_direct_punch` runs.
+// ---------------------------------------------------------------------
+
+fn target_for_device(nickname: &str, device: &str, port: u16) -> DirectPunchTarget {
+    DirectPunchTarget::parse(&format!("{nickname}+{device},127.0.0.1:{port},every_1h")).unwrap()
+}
+
+/// Re-applies `who`'s *whole* accumulated line list, exactly what
+/// `SaveDirectPunchTargets` does live when a settings file is re-saved
+/// with one more line in it - never one line configured in isolation,
+/// since that would silently drop whatever was configured before it.
+async fn list_device(w: &mut AlooWorld, who: &str, nickname: &str, device: &str) {
+    bind_client(w, who).await;
+    let lines = w.direct_punch_lines.entry(who.to_string()).or_default();
+    let port = 65050 + lines.len() as u16;
+    lines.push(target_for_device(nickname, device, port));
+    let lines = lines.clone();
+    link_of(w, who).configure_direct_punch(who.to_string(), lines, CONFIGURED_AT);
+}
+
+#[given(expr = "{word} lists {word}'s device {string} for direct punching")]
+async fn given_lists_device(w: &mut AlooWorld, who: String, nickname: String, device: String) {
+    list_device(w, &who, &nickname, &device).await;
+}
+
+#[when(expr = "{word} also lists {word}'s device {string} for direct punching")]
+async fn also_lists_device(w: &mut AlooWorld, who: String, nickname: String, device: String) {
+    list_device(w, &who, &nickname, &device).await;
+}
+
+#[then(expr = "{word} can reach {word}'s device {string}")]
+async fn can_reach_device(w: &mut AlooWorld, who: String, nickname: String, device: String) {
+    let key = format!("{nickname}+{device}");
+    let expected = direct_peer_id(&nickname, Some(&device));
+    assert_eq!(
+        link_of(w, &who).direct_peer(&key),
+        Some(expected),
+        "{who} should be able to reach {nickname}'s device {device:?} - it has a configured line"
+    );
+}
+
+#[then(expr = "{word} can still reach {word}'s device {string}")]
+async fn can_still_reach_device(w: &mut AlooWorld, who: String, nickname: String, device: String) {
+    can_reach_device(w, who, nickname, device).await;
+}
+
+#[then(expr = "{word} has no line at all for {word}'s device {string}")]
+async fn no_line_for_device(w: &mut AlooWorld, who: String, nickname: String, device: String) {
+    let key = format!("{nickname}+{device}");
+    assert_eq!(
+        link_of(w, &who).direct_status(&key),
+        None,
+        "the device has no target_key configured at all - not merely idle or lost, genuinely absent"
+    );
+    assert_eq!(
+        link_of(w, &who).direct_peer(&key),
+        None,
+        "nothing to punch toward, nothing to have an id for"
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -295,8 +377,8 @@ async fn nothing_relayed(w: &mut AlooWorld) {
 
 #[then(expr = "a message alice sends over that link arrives at bob")]
 async fn message_arrives(w: &mut AlooWorld) {
-    let bob_id = direct_peer_id("bob");
-    let alice_id = direct_peer_id("alice");
+    let bob_id = direct_peer_id("bob", None);
+    let alice_id = direct_peer_id("alice", None);
     link_of(w, "alice").send_reliable_or_queue(
         bob_id,
         P2pPayload::Envelope {
@@ -347,8 +429,8 @@ async fn message_arrives(w: &mut AlooWorld) {
 #[then(expr = "a message alice sends over that link is acknowledged back to her")]
 async fn message_is_acknowledged(w: &mut AlooWorld) {
     const MSG_ID: u64 = 77;
-    let bob_id = direct_peer_id("bob");
-    let alice_id = direct_peer_id("alice");
+    let bob_id = direct_peer_id("bob", None);
+    let alice_id = direct_peer_id("alice", None);
     link_of(w, "alice").send_reliable_or_queue(
         bob_id,
         P2pPayload::Envelope {
@@ -406,7 +488,7 @@ async fn message_is_acknowledged(w: &mut AlooWorld) {
 /// traffic from generating receipts for rows that do not exist (7.2.1).
 #[then(expr = "a message alice sends without naming it is never acknowledged")]
 async fn message_is_not_acknowledged(w: &mut AlooWorld) {
-    let bob_id = direct_peer_id("bob");
+    let bob_id = direct_peer_id("bob", None);
     link_of(w, "alice").send_reliable_or_queue(
         bob_id,
         P2pPayload::Envelope {
@@ -458,7 +540,7 @@ async fn message_is_not_acknowledged(w: &mut AlooWorld) {
 
 #[when(expr = "four more slots come and go")]
 async fn four_more_slots(w: &mut AlooWorld) {
-    let bob_id = direct_peer_id("bob");
+    let bob_id = direct_peer_id("bob", None);
     w.direct_addr = link_of(w, "alice").active_addr(bob_id);
     let now = Instant::now();
     for slot in 2..6u64 {
@@ -468,7 +550,7 @@ async fn four_more_slots(w: &mut AlooWorld) {
 
 #[then(expr = "alice's link to bob is still up on the same address")]
 async fn still_up_same_address(w: &mut AlooWorld) {
-    let bob_id = direct_peer_id("bob");
+    let bob_id = direct_peer_id("bob", None);
     let expected = w.direct_addr;
     let link = link_of(w, "alice");
     assert!(link.is_active(bob_id), "the link was interrupted by a slot");
@@ -555,7 +637,7 @@ async fn gives_up_after(w: &mut AlooWorld, attempts: u32) {
 
 #[when(expr = "alice tries to send bob a message")]
 async fn alice_tries_to_send(w: &mut AlooWorld) {
-    let bob_id = direct_peer_id("bob");
+    let bob_id = direct_peer_id("bob", None);
     let mut sink = RecordingSink::default();
     let readiness = link_of(w, "alice").ensure_link(&mut sink, bob_id).await;
     assert_eq!(
@@ -577,7 +659,7 @@ async fn nothing_sent_to_server(w: &mut AlooWorld) {
 
 #[then(expr = "no retry ever asks the server to relay candidates for bob")]
 async fn no_retry_signals(w: &mut AlooWorld) {
-    let bob_id = direct_peer_id("bob");
+    let bob_id = direct_peer_id("bob", None);
     let mut now = w.direct_now.unwrap_or_else(Instant::now);
     for _ in 0..40 {
         now += Duration::from_secs(5);
@@ -595,7 +677,7 @@ async fn no_retry_signals(w: &mut AlooWorld) {
 #[then(expr = "alice files bob under a peer id no server could have handed out")]
 async fn files_under_synthetic(w: &mut AlooWorld) {
     let peer = link_of(w, "alice").direct_peer("bob").unwrap();
-    assert_eq!(peer, direct_peer_id("bob"));
+    assert_eq!(peer, direct_peer_id("bob", None));
     assert!(is_direct_peer_id(peer));
 }
 
@@ -661,14 +743,19 @@ async fn no_pinned_identity(w: &mut AlooWorld, _name: String) {
 async fn pinned_but_unsigned(w: &mut AlooWorld, name: String) {
     // What a hand-installed pad contact leaves behind: a pin that names
     // someone but carries no keybundle to seal anything to.
-    scratch_id_store(w).check_and_pin(&name, b"a-pad-only-pin-not-a-pq-bundle");
+    scratch_id_store(w).pin_new_device(
+        &name,
+        "test-device",
+        b"a-pad-only-pin-not-a-pq-bundle",
+        aloo::client::idstore::Trust::Tofu,
+    );
 }
 
 #[then(expr = "{string} cannot become an addressable peer")]
 async fn cannot_become_peer(w: &mut AlooWorld, name: String) {
     let store = scratch_id_store(w);
     assert!(
-        direct_peer_identity(store, &name).is_none(),
+        direct_peer_identity(store, &name, None).is_none(),
         "{name} must not be registerable: a nickname on an unauthenticated \
          punch names nobody at all unless something is pinned for it"
     );
@@ -677,7 +764,7 @@ async fn cannot_become_peer(w: &mut AlooWorld, name: String) {
 #[then(expr = "{string} is named by that pin, but nothing is sealed to it")]
 async fn named_but_unsealable(w: &mut AlooWorld, name: String) {
     let store = scratch_id_store(w);
-    let info = direct_peer_identity(store, &name)
+    let info = direct_peer_identity(store, &name, None)
         .unwrap_or_else(|| panic!("{name} is pinned, so the pin names them"));
     assert!(
         aloo::crypto::pq::fingerprint_of_encoded(&info.public_key_der).is_none(),
@@ -688,7 +775,7 @@ async fn named_but_unsealable(w: &mut AlooWorld, name: String) {
 #[then(expr = "only a pad can prove {string} is who the pin says")]
 async fn only_a_pad_proves(w: &mut AlooWorld, name: String) {
     let store = scratch_id_store(w);
-    let info = direct_peer_identity(store, &name).expect("pinned");
+    let info = direct_peer_identity(store, &name, None).expect("pinned");
     // With no keybundle on their side the pair is framed direct, which is
     // the framing whose authentication *is* the pad's decrypt verdict
     // (docs/PROTOCOL.md 16.2).
@@ -783,7 +870,7 @@ async fn bob_still_addressable(w: &mut AlooWorld) {
 
 #[then(expr = "leaving a channel does not forget the link to bob")]
 async fn leaving_keeps_the_link(w: &mut AlooWorld) {
-    let bob = direct_peer_id("bob");
+    let bob = direct_peer_id("bob", None);
     assert!(
         link_of(w, "alice").direct_nickname_of(bob).is_some(),
         "a settings-file peer must stay recognisable as one, which is what \
@@ -922,7 +1009,7 @@ async fn both_punch(w: &mut AlooWorld) {
 
 #[then(expr = "bob has no link to peter")]
 async fn bob_no_link(w: &mut AlooWorld) {
-    let peter = direct_peer_id("peter");
+    let peter = direct_peer_id("peter", None);
     assert!(
         !link_of(w, "bob").is_active(peter),
         "bob's probes must go unanswered: peter never listed him"
@@ -931,13 +1018,13 @@ async fn bob_no_link(w: &mut AlooWorld) {
 
 #[then(expr = "peter has no link to bob")]
 async fn peter_no_link(w: &mut AlooWorld) {
-    let bob = direct_peer_id("bob");
+    let bob = direct_peer_id("bob", None);
     assert!(!link_of(w, "peter").is_active(bob));
 }
 
 #[then(expr = "peter has no record of bob at all")]
 async fn peter_no_record(w: &mut AlooWorld) {
-    let bob = direct_peer_id("bob");
+    let bob = direct_peer_id("bob", None);
     // An unlisted nickname is not a peer: no link state is created for one,
     // so the port gives a stranger nothing by probing it.
     assert_eq!(link_of(w, "peter").status(bob), None);
@@ -964,7 +1051,7 @@ use crate::support::ui_rows;
 /// settings or real link are involved, since the popup itself doesn't care
 /// how the proof arrived.
 fn unknown_peer_id(name: &str) -> aloo::proto::UserId {
-    direct_peer_id(name)
+    direct_peer_id(name, None)
 }
 
 #[given(expr = "{word} is a direct-punch target alice has no key pinned for")]

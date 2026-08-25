@@ -76,7 +76,7 @@ async fn installing_and_deleting_the_mail_key_refreshes_an_open_composes_recipie
     let (peer_public, _peer_private) =
         aloo::crypto::pq::generate_bundle_with_bits(TEST_BITS).expect("peer pq keygen");
     let peer_der = aloo::proto::encode(&peer_public).expect("peer pq der");
-    session.id_store_mut().check_and_pin_with("bob", &peer_der, Trust::Verified);
+    session.id_store_mut().pin_new_device("bob", "test-device", &peer_der, Trust::Verified);
 
     let mut ui = UiState::new("me".into());
     ui.open_otp_mail();
@@ -98,6 +98,7 @@ async fn installing_and_deleting_the_mail_key_refreshes_an_open_composes_recipie
         &mut session,
         &mut ui,
         "bob".to_string(),
+        Some("test-device".to_string()),
         OtpPurpose::Mail,
         enc,
         dec,
@@ -111,7 +112,14 @@ async fn installing_and_deleting_the_mail_key_refreshes_an_open_composes_recipie
         ),
     }
 
-    contacts::handle_delete_otp_key(&mut session, &mut ui, "bob".to_string(), OtpPurpose::Mail).await;
+    contacts::handle_delete_otp_key(
+        &mut session,
+        &mut ui,
+        "bob".to_string(),
+        Some("test-device".to_string()),
+        OtpPurpose::Mail,
+    )
+    .await;
     assert_eq!(
         ui.otp_mail.as_ref().unwrap().compose.check,
         Some(RecipientCheck::NoMailKey),
@@ -137,11 +145,11 @@ async fn installing_a_mail_key_does_not_refresh_a_compose_open_for_someone_else(
     .await;
     let (bob_public, _) = aloo::crypto::pq::generate_bundle_with_bits(TEST_BITS).expect("bob pq keygen");
     let bob_der = aloo::proto::encode(&bob_public).expect("bob pq der");
-    session.id_store_mut().check_and_pin_with("bob", &bob_der, Trust::Verified);
+    session.id_store_mut().pin_new_device("bob", "test-device", &bob_der, Trust::Verified);
     let (carol_public, _) =
         aloo::crypto::pq::generate_bundle_with_bits(TEST_BITS).expect("carol pq keygen");
     let carol_der = aloo::proto::encode(&carol_public).expect("carol pq der");
-    session.id_store_mut().check_and_pin_with("carol", &carol_der, Trust::Verified);
+    session.id_store_mut().pin_new_device("carol", "test-device", &carol_der, Trust::Verified);
 
     let mut ui = UiState::new("me".into());
     ui.open_otp_mail();
@@ -155,6 +163,7 @@ async fn installing_a_mail_key_does_not_refresh_a_compose_open_for_someone_else(
         &mut session,
         &mut ui,
         "bob".to_string(),
+        Some("test-device".to_string()),
         OtpPurpose::Mail,
         enc,
         dec,

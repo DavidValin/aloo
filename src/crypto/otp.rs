@@ -168,7 +168,7 @@ pub fn contact_name_for_keys(own_public_der: &[u8], peer_public_der: &[u8]) -> S
     use sha2::{Digest, Sha256};
     let own: [u8; 32] = Sha256::digest(own_public_der).into();
     let peer: [u8; 32] = Sha256::digest(peer_public_der).into();
-    contact_name_for(&own, &peer)
+    sorted_truncated_join(own, peer)
 }
 
 /// `contact_name_for_keys`'s counterpart for OTP mail - see
@@ -177,7 +177,7 @@ pub fn contact_name_for_keys_mail(own_public_der: &[u8], peer_public_der: &[u8])
     use sha2::{Digest, Sha256};
     let own: [u8; 32] = Sha256::digest(own_public_der).into();
     let peer: [u8; 32] = Sha256::digest(peer_public_der).into();
-    contact_name_for_mail(&own, &peer)
+    format!("mail-{}", sorted_truncated_join(own, peer))
 }
 
 /// Which independent OTP key a provisioning handshake or a piece of UI text
@@ -213,20 +213,34 @@ impl OtpPurpose {
     }
 }
 
-/// Deterministic, order-independent `otp` keychain contact name for a pair
-/// of `pq_hybrid` identities: a truncated prefix of their fingerprints,
-/// sorted, hex-joined with a separator the `otp` CLI's naming rules allow
-/// (no `.`/`..`, no path separators, none of `: * ? " < > | =`, no control
-/// characters - a plain `-` between two lowercase-hex halves satisfies all
-/// of that). Computed independently and identically by both sides from
-/// their own and their peer's fingerprint, so provisioning needs no
-/// separate name-negotiation step.
-pub fn contact_name_for(own_fp: &[u8; 32], peer_fp: &[u8; 32]) -> String {
-    let (a, b) = if own_fp <= peer_fp {
-        (own_fp, peer_fp)
-    } else {
-        (peer_fp, own_fp)
-    };
+/// One side's `(identity fingerprint, device_id)` pair, folded into a
+/// single 32-byte value so `contact_name_for`'s sort/truncate/join stays
+/// exactly the shape and length it was before device_id joined the
+/// equation - `CONTACT_NAME_FP_BYTES`' own doc explains why that length
+/// bound is load-bearing (the real `otp` binary's path-length limit), and
+/// two independently truncated halves (fingerprint *and* device_id) would
+/// have doubled it. Order-independent per side (nothing here depends on
+/// which of the two peers is "own"), so both machines still compute this
+/// identically with nothing negotiated.
+fn device_pair_id(fp: &[u8; 32], device_id: &str) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(fp);
+    hasher.update(device_id.as_bytes());
+    hasher.finalize().into()
+}
+
+/// Sorts two 32-byte values and hex-joins truncated prefixes of each with
+/// a separator the `otp` CLI's naming rules allow (no `.`/`..`, no path
+/// separators, none of `: * ? " < > | =`, no control characters - a plain
+/// `-` between two lowercase-hex halves satisfies all of that). The one
+/// piece `contact_name_for` (device-qualified, `pq_hybrid`) and
+/// `contact_name_for_keys` (unqualified, `Direct`/pad-only - the
+/// device-pinning plan §5's "pad naming stays unqualified") share: both
+/// need an order-independent name computed identically by both sides with
+/// nothing negotiated, they just start from different 32-byte inputs.
+fn sorted_truncated_join(a: [u8; 32], b: [u8; 32]) -> String {
+    let (a, b) = if a <= b { (a, b) } else { (b, a) };
     format!(
         "{}-{}",
         hex_encode(&a[..CONTACT_NAME_FP_BYTES]),
@@ -234,14 +248,35 @@ pub fn contact_name_for(own_fp: &[u8; 32], peer_fp: &[u8; 32]) -> String {
     )
 }
 
-/// OTP *mail*'s own keychain contact name for the same pair - deliberately
-/// distinct from `contact_name_for`'s (a live name is always lowercase hex
-/// plus `-`, so this `mail-` prefix can never collide with one) so a mail
-/// key is never the same pad a live `/otp` session would spend. Wraps
-/// `contact_name_for` rather than reimplementing the sort/truncate, so it
-/// inherits the same order-independence with no separate proof needed.
-pub fn contact_name_for_mail(own_fp: &[u8; 32], peer_fp: &[u8; 32]) -> String {
-    format!("mail-{}", contact_name_for(own_fp, peer_fp))
+/// Deterministic, order-independent `otp` keychain contact name for one
+/// *device* of a `pq_hybrid` identity talking to one device of another.
+/// Computed independently and identically by both sides from their own
+/// and their peer's `(fingerprint, device_id)`, so provisioning needs no
+/// separate name-negotiation step - both device_ids are already known
+/// (via `DeviceIdAnnounce`) before any `/otp` handshake can start.
+///
+/// Device-qualified so that two of *either* side's devices never share a
+/// pad: a pad is provisioned by one specific machine talking to one
+/// specific machine, and this is what gives each such pairing its own
+/// independent keychain slot rather than colliding on whichever device
+/// happened to provision first (docs/PROTOCOL.md §16, the device-pinning
+/// plan §4).
+pub fn contact_name_for(own_fp: &[u8; 32], own_device_id: &str, peer_fp: &[u8; 32], peer_device_id: &str) -> String {
+    sorted_truncated_join(
+        device_pair_id(own_fp, own_device_id),
+        device_pair_id(peer_fp, peer_device_id),
+    )
+}
+
+/// OTP *mail*'s own keychain contact name for the same device pair -
+/// deliberately distinct from `contact_name_for`'s (a live name is always
+/// lowercase hex plus `-`, so this `mail-` prefix can never collide with
+/// one) so a mail key is never the same pad a live `/otp` session would
+/// spend. Wraps `contact_name_for` rather than reimplementing the
+/// sort/truncate, so it inherits the same order-independence with no
+/// separate proof needed.
+pub fn contact_name_for_mail(own_fp: &[u8; 32], own_device_id: &str, peer_fp: &[u8; 32], peer_device_id: &str) -> String {
+    format!("mail-{}", contact_name_for(own_fp, own_device_id, peer_fp, peer_device_id))
 }
 
 /// One peer's half of a freshly generated one-time-pad keypair, sent to the

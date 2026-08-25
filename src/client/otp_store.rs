@@ -200,6 +200,18 @@ pub struct OtpContactState {
     /// message accepted, or whose peer has only ever sent session-control
     /// payloads (which ack each other, not through this field).
     pub last_received_ack: Option<(u64, [u8; 32])>,
+    /// Which device this `Direct`-framed (pad-only) contact's peer has
+    /// been confirmed to be, once known - device-pinning plan §5. Set the
+    /// first time a message from them decrypts successfully (not merely
+    /// on receiving one; a bare claim proves nothing on its own). Once
+    /// set, a later message claiming a *different* device is refused
+    /// before `otp --decrypt` ever runs (`client::otp`'s pre-decrypt
+    /// gate) - a one-time pad has no safe multi-device story, unlike a
+    /// `pq_hybrid` identity. Always `None` for a `PqWrapped` contact,
+    /// which has no use for this field at all (§4's naming is already
+    /// device-qualified, and its device data arrives over the separate
+    /// `DeviceIdAnnounce`).
+    pub bound_peer_device_id: Option<String>,
 }
 
 /// A `contact_name -> OtpContactState` store, backed by a small flat file:
@@ -217,9 +229,10 @@ pub struct OtpContactState {
 /// `pending_ack_proof` and `installed_pad_digest` (both hex, empty when
 /// `None`), a pair, `last_received_ack_seq`/`last_received_ack_proof`
 /// (the latter hex too, both empty or absent together meaning `None`), and
-/// finally `pending_commit` (`1`/empty like `pending_end_notice`) and
+/// finally `pending_commit` (`1`/empty like `pending_end_notice`),
 /// `encrypt_intent` (the same encoding `pending_content` uses, empty when
-/// `None`) follow the same tolerance again.
+/// `None`), and `bound_peer_device_id` (the raw device_id string, empty
+/// when `None` - device-pinning plan §5) follow the same tolerance again.
 pub struct OtpStore {
     path: PathBuf,
     entries: HashMap<String, OtpContactState>,
@@ -388,6 +401,28 @@ impl OtpStore {
             .get(contact_name)
             .and_then(|s| s.installed_pad_digest)
             .is_some_and(|installed| installed == digest)
+    }
+
+    /// Which device `contact_name`'s peer has been confirmed to be, for a
+    /// `Direct`-framed pad-only pair - see `OtpContactState::
+    /// bound_peer_device_id`'s doc. `None` for an unbound (or unknown)
+    /// contact.
+    pub fn bound_peer_device_id(&self, contact_name: &str) -> Option<&str> {
+        self.entries.get(contact_name)?.bound_peer_device_id.as_deref()
+    }
+
+    /// Binds `contact_name`'s pad to `device_id`, the first time a message
+    /// from them has genuinely decrypted (`client::otp`'s pre-decrypt
+    /// gate) - a no-op if it's already bound to this exact device
+    /// (idempotent, since every later message re-confirms rather than
+    /// re-binds), and never overwrites a *different* existing binding:
+    /// that decision belongs to the caller, which must have already
+    /// refused the message before calling this at all.
+    pub fn bind_peer_device(&mut self, contact_name: &str, device_id: &str) {
+        let state = self.entries.entry(contact_name.to_string()).or_default();
+        if state.bound_peer_device_id.is_none() {
+            state.bound_peer_device_id = Some(device_id.to_string());
+        }
     }
 
     pub fn mark_provisioned(&mut self, contact_name: &str) {
@@ -737,6 +772,10 @@ impl OtpStore {
             if let Some(intent) = &state.encrypt_intent {
                 out.push_str(&encode_pending_content(intent));
             }
+            out.push('\t');
+            if let Some(device_id) = &state.bound_peer_device_id {
+                out.push_str(device_id);
+            }
             out.push('\n');
         }
         fs::write(&self.path, out)?;
@@ -900,6 +939,10 @@ fn parse_line(line: &str) -> Option<(String, OtpContactState)> {
     // commit exchange.
     let pending_commit = parts.next() == Some("1");
     let encrypt_intent = parts.next().and_then(decode_pending_content);
+    // Same tolerance again: absent (an older store, or a `PqWrapped`
+    // contact which never sets this at all) reads as "no device bound
+    // yet".
+    let bound_peer_device_id = parts.next().filter(|s| !s.is_empty()).map(str::to_string);
     Some((
         name,
         OtpContactState {
@@ -915,6 +958,7 @@ fn parse_line(line: &str) -> Option<(String, OtpContactState)> {
             last_received_ack,
             pending_commit,
             encrypt_intent,
+            bound_peer_device_id,
         },
     ))
 }

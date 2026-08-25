@@ -45,15 +45,24 @@ pub struct ContactOtpDetail {
     pub dec_key_path: PathBuf,
 }
 
-/// One row of the Contacts modal.
+/// One row of the Contacts modal - one per pinned device of a nickname
+/// (device-pinning plan §3), not one per nickname: a multi-device contact
+/// produces one row per device, so each can be inspected, keyed, and
+/// deleted independently.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContactRow {
     pub nickname: String,
-    /// `idstore::IdStore::last_seen_unix` - `None` if this pin's key has
-    /// never been confirmed reachable over the direct link.
+    /// Which of `nickname`'s devices this row is - `None` for the
+    /// "unbound" row (a key pinned with no device confirmed yet, e.g. from
+    /// an identity card or a manual install with nothing live to attribute
+    /// it to). Never editable from this row; only ever learned from a live
+    /// connection or a pad's own §5 device claim.
+    pub device_id: Option<String>,
+    /// `idstore::DeviceEntry::last_seen_unix` - `None` if this device's key
+    /// has never been confirmed reachable over the direct link.
     pub last_seen_unix: Option<u64>,
-    /// `idstore::IdStore::key_mode` - `None` for a pin recorded before
-    /// that field existed.
+    /// `idstore::DeviceEntry::key_mode` - `None` for a `Direct`-framed pin,
+    /// or an entry recorded before this field existed.
     pub key_mode: Option<KeyMode>,
     /// The contact name `otp --add-contact`/`--show-contact` uses for this
     /// nickname - fingerprint-derived for a `pq_hybrid` pin, pinned-key
@@ -97,27 +106,49 @@ pub struct ContactRow {
 /// impersonator taking a familiar name spend the real contact's pad
 /// (`crypto::otp::contact_name_for_keys`).
 ///
-/// `None` only when `nickname` is not pinned at all. Never touches the
-/// keychain itself; just derives the name `otp_cli::has_contact`/
-/// `show_contact`/`add_contact`/`remove_contact` would all use.
+/// `None` when `(nickname, device_id)` is not pinned at all, or (a
+/// `PqWrapped` pin only) `device_id` is the empty "unbound" sentinel -
+/// device-pinning plan §3, "Install manually" opened against the unbound
+/// row files under the not-yet-qualified name instead, resolved once a
+/// live connection claims the device. Never touches the keychain itself;
+/// just derives the name
+/// `otp_cli::has_contact`/`show_contact`/`add_contact`/`remove_contact`
+/// would all use.
+///
+/// `device_id` names exactly which of the nickname's devices this name is
+/// for - the row it came from in the Contacts modal, or the empty
+/// "unbound" sentinel for a pin with no confirmed device at all. Own
+/// device_id is this machine's own, always known
+/// (`SessionState::own_device_id`).
 pub fn otp_contact_name_for(
     id_store: &IdStore,
     nickname: &str,
+    device_id: &str,
     own_identity: OwnIdentity<'_>,
     purpose: OtpPurpose,
 ) -> Option<String> {
-    let peer_der = id_store.get(nickname)?;
+    let peer_der = id_store.get_for_device(nickname, device_id)?;
     match crate::client::otp::framing_for(own_identity.pinned_public_der, peer_der) {
         crate::client::otp::OtpFraming::PqWrapped => {
             let peer_fp = crate::crypto::pq::fingerprint_of_encoded(peer_der)?;
+            if device_id.is_empty() {
+                // Unbound: no device confirmed for this pin yet, so there
+                // is no device-qualified name to derive - see this
+                // function's own doc.
+                return None;
+            }
             Some(match purpose {
                 OtpPurpose::Live => crate::crypto::otp::contact_name_for(
                     own_identity.pq_fingerprint,
+                    own_identity.own_device_id,
                     &peer_fp,
+                    device_id,
                 ),
                 OtpPurpose::Mail => crate::crypto::otp::contact_name_for_mail(
                     own_identity.pq_fingerprint,
+                    own_identity.own_device_id,
                     &peer_fp,
+                    device_id,
                 ),
             })
         }
@@ -135,20 +166,25 @@ pub fn otp_contact_name_for(
 
 /// This side's own identity, as the contact-naming rules need to see it -
 /// the `pq_hybrid` fingerprint and the pinned public key it was computed
-/// from. Both are always present (`pq_hybrid` is this app's only `my_key`);
-/// which one is used depends on what the *peer* announced.
+/// from, plus this machine's own device_id (device-pinning plan §4 -
+/// always known, `client::device_id::load_or_create`, unlike a peer's).
+/// The two key representations are always present (`pq_hybrid` is this
+/// app's only `my_key`); which one is used depends on what the *peer*
+/// announced.
 #[derive(Debug, Clone, Copy)]
 pub struct OwnIdentity<'a> {
     pub pq_fingerprint: &'a [u8; 32],
     pub pinned_public_der: &'a [u8],
+    pub own_device_id: &'a str,
 }
 
 /// This side's own identity as `SessionState` holds it - the one place the
-/// two representations are read out of a live session.
+/// three representations are read out of a live session.
 pub fn own_identity_of(session: &SessionState) -> OwnIdentity<'_> {
     OwnIdentity {
         pq_fingerprint: &session.own_pq_fp,
         pinned_public_der: &session.otp_own_pinned_der,
+        own_device_id: &session.own_device_id,
     }
 }
 
@@ -170,10 +206,11 @@ async fn otp_detail_for(cfg: &OtpCliConfig, contact_name: &str) -> Option<Contac
     })
 }
 
-/// Every pinned contact, each merged with its live OTP keychain state -
-/// the Contacts modal's row set (`UiAction::OpenContacts`/
-/// `RefreshContacts`). Queries the real `otp` binary once per
-/// `pq_hybrid`-pinned contact, so this is only ever called when the modal
+/// Every pinned device of every nickname, each merged with its live OTP
+/// keychain state - the Contacts modal's row set
+/// (`UiAction::OpenContacts`/`RefreshContacts`), one row per device
+/// (device-pinning plan §3). Queries the real `otp` binary once per
+/// `pq_hybrid`-pinned device, so this is only ever called when the modal
 /// opens or the user asks it to refresh, never on a per-frame tick.
 pub async fn gather_contact_rows(
     id_store: &IdStore,
@@ -182,36 +219,53 @@ pub async fn gather_contact_rows(
 ) -> Vec<ContactRow> {
     let mut rows = Vec::new();
     for nickname in id_store.nicknames() {
-        let last_seen_unix = id_store.last_seen_unix(&nickname);
-        let key_mode = id_store.key_mode(&nickname);
-        let otp_contact_name = otp_contact_name_for(id_store, &nickname, own_identity, OtpPurpose::Live);
-        let otp = match &otp_contact_name {
-            Some(name) => otp_detail_for(otp_cli_cfg, name).await,
-            None => None,
-        };
-        let otp_mail_contact_name =
-            otp_contact_name_for(id_store, &nickname, own_identity, OtpPurpose::Mail);
-        let otp_mail = match &otp_mail_contact_name {
-            Some(name) => otp_detail_for(otp_cli_cfg, name).await,
-            None => None,
-        };
-        let pqh_fingerprint = if key_mode == Some(KeyMode::PqHybrid) {
-            id_store.get(&nickname).map(crate::crypto::short_fingerprint_der)
-        } else {
-            None
-        };
-        let pqh_pinned_from = id_store.pinned_from(&nickname).map(|p| p.to_path_buf());
-        rows.push(ContactRow {
-            nickname,
-            last_seen_unix,
-            key_mode,
-            otp_contact_name,
-            otp,
-            otp_mail_contact_name,
-            otp_mail,
-            pqh_fingerprint,
-            pqh_pinned_from,
-        });
+        let devices: Vec<(String, Option<KeyMode>, Option<u64>, Option<PathBuf>)> = id_store
+            .devices_of(&nickname)
+            .map(|d| (d.device_id.clone(), d.key_mode, d.last_seen_unix, d.pinned_from.clone()))
+            .collect();
+        for (raw_device_id, key_mode, last_seen_unix, pqh_pinned_from) in devices {
+            let otp_contact_name = otp_contact_name_for(
+                id_store,
+                &nickname,
+                &raw_device_id,
+                own_identity,
+                OtpPurpose::Live,
+            );
+            let otp = match &otp_contact_name {
+                Some(name) => otp_detail_for(otp_cli_cfg, name).await,
+                None => None,
+            };
+            let otp_mail_contact_name = otp_contact_name_for(
+                id_store,
+                &nickname,
+                &raw_device_id,
+                own_identity,
+                OtpPurpose::Mail,
+            );
+            let otp_mail = match &otp_mail_contact_name {
+                Some(name) => otp_detail_for(otp_cli_cfg, name).await,
+                None => None,
+            };
+            let pqh_fingerprint = if key_mode == Some(KeyMode::PqHybrid) {
+                id_store
+                    .get_for_device(&nickname, &raw_device_id)
+                    .map(crate::crypto::short_fingerprint_der)
+            } else {
+                None
+            };
+            rows.push(ContactRow {
+                nickname: nickname.clone(),
+                device_id: (!raw_device_id.is_empty()).then_some(raw_device_id),
+                last_seen_unix,
+                key_mode,
+                otp_contact_name,
+                otp,
+                otp_mail_contact_name,
+                otp_mail,
+                pqh_fingerprint,
+                pqh_pinned_from,
+            });
+        }
     }
     rows
 }
@@ -228,14 +282,17 @@ pub async fn handle_open(session: &SessionState, ui_state: &mut UiState) {
     ui_state.set_contacts_rows(rows);
 }
 
-/// Forgets `nickname` outright - its identity pin, and, if it had one, its
-/// OTP keychain entry and local bookkeeping. The OTP name is recomputed
-/// fresh rather than trusted from whatever the modal last rendered, since
-/// a destructive action should never act on a stale snapshot. Best-effort
-/// on the keychain removal itself, same convention `otp_cli::remove_contact`
-/// already documents: a failure there is logged, not fatal, and never
-/// blocks forgetting the pin. Returns whether the identity pin itself was
-/// actually there to remove.
+/// Forgets `nickname` outright - every one of its devices' identity pins,
+/// and, for each, whatever OTP keychain entries it had and local
+/// bookkeeping (device-pinning plan §3: "forget this nickname, every
+/// device"). Every device's own contact names are recomputed fresh, before
+/// any pin is removed, rather than trusted from whatever the modal last
+/// rendered - a destructive action should never act on a stale snapshot,
+/// and once a device's pin is gone its contact name can no longer be
+/// recomputed at all. Best-effort on each keychain removal itself, same
+/// convention `otp_cli::remove_contact` already documents: a failure there
+/// is logged, not fatal, and never blocks forgetting the pin. Returns
+/// whether the identity pin itself was actually there to remove.
 pub async fn delete_contact(
     id_store: &mut IdStore,
     otp_store: &mut OtpStore,
@@ -243,12 +300,36 @@ pub async fn delete_contact(
     own_identity: OwnIdentity<'_>,
     nickname: &str,
 ) -> bool {
-    // Deleting the identity pin orphans both purposes' keychain names at
-    // once (neither can be recomputed once `id_store.get` stops answering
-    // for this nickname), so both are cleaned up here rather than leaving
-    // whichever one the caller didn't think of stranded on disk forever.
+    let device_ids: Vec<String> = id_store
+        .devices_of(nickname)
+        .map(|d| d.device_id.clone())
+        .collect();
+    for device_id in &device_ids {
+        remove_device_keychain_entries(id_store, otp_store, otp_cli_cfg, own_identity, nickname, device_id)
+            .await;
+    }
+    let removed = id_store.remove(nickname);
+    if let Err(e) = id_store.save() {
+        crate::log_warn!("failed to save id_store: {e}");
+    }
+    removed
+}
+
+/// The keychain half of forgetting one device: removes both purposes'
+/// contact names for `(nickname, device_id)`, if either exists. Shared by
+/// whole-nickname delete (`delete_contact`, one call per device) and
+/// per-device delete (`delete_contact_device`) so both clean up identically.
+async fn remove_device_keychain_entries(
+    id_store: &IdStore,
+    otp_store: &mut OtpStore,
+    otp_cli_cfg: &OtpCliConfig,
+    own_identity: OwnIdentity<'_>,
+    nickname: &str,
+    device_id: &str,
+) {
     for purpose in [OtpPurpose::Live, OtpPurpose::Mail] {
-        if let Some(contact_name) = otp_contact_name_for(id_store, nickname, own_identity, purpose)
+        if let Some(contact_name) =
+            otp_contact_name_for(id_store, nickname, device_id, own_identity, purpose)
         {
             if let Err(e) = otp_cli::remove_contact(otp_cli_cfg, &contact_name).await {
                 crate::log_warn!("failed to remove {} keychain entry for {nickname}: {e}", purpose.label());
@@ -258,7 +339,24 @@ pub async fn delete_contact(
             }
         }
     }
-    let removed = id_store.remove(nickname);
+}
+
+/// Forgets just one device of `nickname` - its identity pin plus that
+/// device's own derived OTP/mail keychain entries, leaving every sibling
+/// device's pin and keychain entries exactly as they were (device-pinning
+/// plan §3's additive rule applied to deletion too). Returns whether the
+/// device's pin was actually there to remove.
+pub async fn delete_contact_device(
+    id_store: &mut IdStore,
+    otp_store: &mut OtpStore,
+    otp_cli_cfg: &OtpCliConfig,
+    own_identity: OwnIdentity<'_>,
+    nickname: &str,
+    device_id: &str,
+) -> bool {
+    remove_device_keychain_entries(id_store, otp_store, otp_cli_cfg, own_identity, nickname, device_id)
+        .await;
+    let removed = id_store.remove_device(nickname, device_id);
     if let Err(e) = id_store.save() {
         crate::log_warn!("failed to save id_store: {e}");
     }
@@ -272,6 +370,7 @@ pub async fn handle_delete(session: &mut SessionState, ui_state: &mut UiState, n
     let own_identity = OwnIdentity {
         pq_fingerprint: &own_fp,
         pinned_public_der: &own_der,
+        own_device_id: &session.own_device_id,
     };
     let removed = delete_contact(
         &mut session.id_store,
@@ -352,11 +451,13 @@ pub async fn install_otp_key(
     otp_cli_cfg: &OtpCliConfig,
     own_identity: OwnIdentity<'_>,
     nickname: &str,
+    device_id: &str,
     purpose: OtpPurpose,
     enc_path: &Path,
     dec_path: &Path,
 ) -> InstallOtpKeyOutcome {
-    let Some(contact_name) = otp_contact_name_for(id_store, nickname, own_identity, purpose) else {
+    let Some(contact_name) = otp_contact_name_for(id_store, nickname, device_id, own_identity, purpose)
+    else {
         return InstallOtpKeyOutcome::NotEligible;
     };
     if let Err(e) = validate_key_file(enc_path) {
@@ -385,6 +486,7 @@ pub async fn handle_install_otp_key(
     session: &mut SessionState,
     ui_state: &mut UiState,
     nickname: String,
+    device_id: Option<String>,
     purpose: OtpPurpose,
     enc_path: PathBuf,
     dec_path: PathBuf,
@@ -394,6 +496,7 @@ pub async fn handle_install_otp_key(
     let own_identity = OwnIdentity {
         pq_fingerprint: &own_fp,
         pinned_public_der: &own_der,
+        own_device_id: &session.own_device_id,
     };
     let outcome = install_otp_key(
         &session.id_store,
@@ -401,6 +504,7 @@ pub async fn handle_install_otp_key(
         &session.otp_cli_cfg,
         own_identity,
         &nickname,
+        device_id.as_deref().unwrap_or(""),
         purpose,
         &enc_path,
         &dec_path,
@@ -424,20 +528,24 @@ pub async fn handle_install_otp_key(
     }
 }
 
-/// Deletes just one purpose's keychain entry for `nickname` - the OTP or
-/// OTP-mail key detail popup's own "Delete key", independent of the other
-/// purpose and of the identity pin itself (`delete_contact` is what
-/// removes all three together, reached instead from the PQH key's own
-/// "Delete key"). Returns whether there was anything to delete.
+/// Deletes just one purpose's keychain entry for `(nickname, device_id)` -
+/// the OTP or OTP-mail key detail popup's own "Delete key", independent of
+/// the other purpose and of the identity pin itself (`delete_contact_device`
+/// is what removes the pin and both purposes together, reached instead
+/// from the PQH key's own "Delete key"). Returns whether there was
+/// anything to delete.
 pub async fn delete_otp_key(
     id_store: &IdStore,
     otp_store: &mut OtpStore,
     otp_cli_cfg: &OtpCliConfig,
     own_identity: OwnIdentity<'_>,
     nickname: &str,
+    device_id: &str,
     purpose: OtpPurpose,
 ) -> bool {
-    let Some(contact_name) = otp_contact_name_for(id_store, nickname, own_identity, purpose) else {
+    let Some(contact_name) =
+        otp_contact_name_for(id_store, nickname, device_id, own_identity, purpose)
+    else {
         return false;
     };
     let had_entry = otp_cli::has_contact(otp_cli_cfg, &contact_name)
@@ -457,6 +565,7 @@ pub async fn handle_delete_otp_key(
     session: &mut SessionState,
     ui_state: &mut UiState,
     nickname: String,
+    device_id: Option<String>,
     purpose: OtpPurpose,
 ) {
     let own_fp = session.own_pq_fp;
@@ -464,6 +573,7 @@ pub async fn handle_delete_otp_key(
     let own_identity = OwnIdentity {
         pq_fingerprint: &own_fp,
         pinned_public_der: &own_der,
+        own_device_id: &session.own_device_id,
     };
     let removed = delete_otp_key(
         &session.id_store,
@@ -471,11 +581,42 @@ pub async fn handle_delete_otp_key(
         &session.otp_cli_cfg,
         own_identity,
         &nickname,
+        device_id.as_deref().unwrap_or(""),
         purpose,
     )
     .await;
     if removed {
         ui_state.push_status_notice(format!("removed {} for {nickname}", purpose.label()), true);
+    }
+    handle_open(session, ui_state).await;
+    refresh_mail_recipient_check_if_open(session, ui_state, &nickname).await;
+}
+
+/// `UiAction::DeleteContactDevice`'s handler.
+pub async fn handle_delete_contact_device(
+    session: &mut SessionState,
+    ui_state: &mut UiState,
+    nickname: String,
+    device_id: Option<String>,
+) {
+    let own_fp = session.own_pq_fp;
+    let own_der = session.otp_own_pinned_der.clone();
+    let own_identity = OwnIdentity {
+        pq_fingerprint: &own_fp,
+        pinned_public_der: &own_der,
+        own_device_id: &session.own_device_id,
+    };
+    let removed = delete_contact_device(
+        &mut session.id_store,
+        &mut session.otp_store,
+        &session.otp_cli_cfg,
+        own_identity,
+        &nickname,
+        device_id.as_deref().unwrap_or(""),
+    )
+    .await;
+    if removed {
+        ui_state.push_status_notice(format!("removed {nickname}'s device"), true);
     }
     handle_open(session, ui_state).await;
     refresh_mail_recipient_check_if_open(session, ui_state, &nickname).await;
@@ -499,9 +640,14 @@ pub enum PinIdentityCardOutcome {
 /// the one way to attach a real `pq_hybrid` identity to a nickname before
 /// ever connecting to them, instead of leaving it to trust-on-first-use.
 /// Requires the card's own self-attested nickname to match `nickname`
-/// exactly: a card is a binding of *one specific* nickname to a key, and
-/// this always upgrades the *existing* row it was opened from rather than
-/// ever creating a new one.
+/// exactly: a card is a binding of *one specific* nickname to a key,
+/// never a device (§1 - a card vouches for a key, not a device). This
+/// always upgrades the nickname's existing *unbound* entry (creating one
+/// if there isn't one yet) rather than ever touching an already-bound
+/// device's pin: importing a card says nothing about which of a
+/// multi-device nickname's devices it is, so it's filed the same way a
+/// manually installed key with no confirmed device is, resolved the same
+/// "filled in on first use" way any other unbound entry is (§1).
 pub fn pin_identity_card(
     id_store: &mut IdStore,
     nickname: &str,
@@ -525,9 +671,13 @@ pub fn pin_identity_card(
         Ok(bytes) => bytes,
         Err(e) => return PinIdentityCardOutcome::Invalid(format!("{e}")),
     };
-    id_store.check_and_pin_with(nickname, &encoded, crate::client::idstore::Trust::Verified);
-    id_store.set_key_mode(nickname, KeyMode::PqHybrid);
-    id_store.set_pinned_from(nickname, path.to_path_buf());
+    // key_mode-scoped, and set atomically on the one entry it resolves
+    // to (not a blind `get_for_device(nickname, "")` followed by several
+    // separately-looked-up writes): a nickname can have both an unbound
+    // `Direct` pin and an unbound `pq_hybrid` first sighting at once,
+    // both sharing the empty device_id sentinel, and a card must only
+    // ever touch the latter.
+    id_store.pin_unbound_pq_hybrid_card(nickname, &encoded, path.to_path_buf());
     if let Err(e) = id_store.save() {
         crate::log_warn!("failed to save id_store: {e}");
     }

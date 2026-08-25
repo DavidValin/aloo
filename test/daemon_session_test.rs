@@ -184,7 +184,7 @@ fn start(
     let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel::<SessionInput>();
     let (frame_tx, frames) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
 
-    let you = aloo::client::p2p::direct_peer_id(nickname);
+    let you = aloo::client::p2p::direct_peer_id(nickname, None);
     let name = nickname.to_string();
     let handle = tokio::spawn(async move {
         let mut surface = Surface::Detached;
@@ -428,9 +428,9 @@ async fn two_serverless_sessions_punch_to_each_other_and_each_registers_the_othe
     // Each has met the other before, so each holds the other's key. That
     // pin is the only thing that will let either believe a nickname.
     let mut alice_store = aloo::client::idstore::IdStore::new_empty(home.join("id_store_alice"));
-    alice_store.check_and_pin("bob", &public_der(home, "bob"));
+    alice_store.pin_new_device("bob", "test-device", &public_der(home, "bob"), aloo::client::idstore::Trust::Tofu);
     let mut bob_store = aloo::client::idstore::IdStore::new_empty(home.join("id_store_bob"));
-    bob_store.check_and_pin("alice", &public_der(home, "alice"));
+    bob_store.pin_new_device("alice", "test-device", &public_der(home, "alice"), aloo::client::idstore::Trust::Tofu);
 
     // Both grids restart at the same o'clock, so both fire at the next
     // minute boundary. Started just before one, rather than waiting a whole
@@ -536,10 +536,10 @@ async fn an_unknown_but_matching_nickname_is_offered_and_then_pinned() {
     // the name the punch actually arrives as.
     let mut alice_store =
         aloo::client::idstore::IdStore::new_empty(home.join("id_store_alice_unknown"));
-    alice_store.check_and_pin("dave", &public_der(home, "bob"));
+    alice_store.pin_new_device("dave", "test-device", &public_der(home, "bob"), aloo::client::idstore::Trust::Tofu);
     let mut bob_store =
         aloo::client::idstore::IdStore::new_empty(home.join("id_store_bob_unknown"));
-    bob_store.check_and_pin("alice", &public_der(home, "alice"));
+    bob_store.pin_new_device("alice", "test-device", &public_der(home, "alice"), aloo::client::idstore::Trust::Tofu);
 
     let to_boundary = 60
         - (std::time::SystemTime::now()
@@ -652,7 +652,7 @@ async fn an_unknown_nickname_with_no_matching_key_is_told_its_impossible() {
         aloo::client::idstore::IdStore::new_empty(home.join("id_store_alice_no_match"));
     let mut bob_store =
         aloo::client::idstore::IdStore::new_empty(home.join("id_store_bob_no_match"));
-    bob_store.check_and_pin("alice", &public_der(home, "alice"));
+    bob_store.pin_new_device("alice", "test-device", &public_der(home, "alice"), aloo::client::idstore::Trust::Tofu);
 
     let to_boundary = 60
         - (std::time::SystemTime::now()

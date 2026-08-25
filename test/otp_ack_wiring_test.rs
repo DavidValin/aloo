@@ -252,7 +252,9 @@ async fn pair(label: &str, alice_kind: Id, bob_kind: Id) -> (Side, Side, String)
         (Id::Pq, Id::Pq) => {
             let a_fp = aloo::crypto::pq::fingerprint_of_encoded(&a.der).expect("alice fp");
             let b_fp = aloo::crypto::pq::fingerprint_of_encoded(&b.der).expect("bob fp");
-            aloo::crypto::otp::contact_name_for(&a_fp, &b_fp)
+            // Both sides run under `SessionState::for_test`'s fixed own
+            // device_id, so both halves of this pair use that same literal.
+            aloo::crypto::otp::contact_name_for(&a_fp, "test-device", &b_fp, "test-device")
         }
         _ => aloo::crypto::otp::contact_name_for_keys(&a.der, &b.der),
     };
@@ -275,7 +277,7 @@ async fn pair(label: &str, alice_kind: Id, bob_kind: Id) -> (Side, Side, String)
     // Both sides must find the same contact, with nothing negotiated.
     for (side, who) in [(&alice, "alice"), (&bob, "bob")] {
         assert_eq!(
-            aloo::client::otp::contact_name_if_active(&side.session, &side.peer_der).as_deref(),
+            aloo::client::otp::contact_name_if_active(&side.session, side.peer, &side.peer_der).as_deref(),
             Some(contact.as_str()),
             "{who} must find this pair's provisioned pad, or every send \
              would silently leave without it"
@@ -330,6 +332,11 @@ async fn build_side(
     // Exactly what the real connect path does when a peer becomes known -
     // without it there is no encryption key to seal an inner envelope to.
     aloo::client::session::seed_direct_peer_keys(&mut session, peer_id, &peer);
+    // Stands in for the peer's real `DeviceIdAnnounce` - both sides use
+    // `SessionState::for_test`'s own fixed device_id, so this is simply
+    // that same literal from the peer's point of view (device-pinning
+    // plan §4's `PqWrapped` naming needs both device_ids resolved).
+    session.set_peer_device_id_for_test(peer_id, "test-device".to_string());
     // Opens the link record each side queues against. Nothing is punched,
     // so nothing leaves the machine - but without it a session has nowhere
     // to put what it decides to send, and it is silently dropped.
@@ -413,7 +420,7 @@ async fn send_voice(side: &mut Side, contact: &str, pcm: Vec<u8>) {
 // Reading what went out
 // ---------------------------------------------------------------------
 
-fn take_envelope(side: &mut Side) -> (u64, Option<u64>, Envelope) {
+fn take_envelope(side: &mut Side) -> (u64, Option<u64>, Envelope, String) {
     side.queued()
         .into_iter()
         .find_map(|p| match p {
@@ -421,14 +428,15 @@ fn take_envelope(side: &mut Side) -> (u64, Option<u64>, Envelope) {
                 seq,
                 msg_id,
                 envelope,
+                sender_device_id,
                 ..
-            } => Some((seq, msg_id, envelope)),
+            } => Some((seq, msg_id, envelope, sender_device_id)),
             _ => None,
         })
         .expect("a pad-wrapped message should have gone out")
 }
 
-fn take_file_offer(side: &mut Side) -> (u64, u64, Envelope) {
+fn take_file_offer(side: &mut Side) -> (u64, u64, Envelope, String) {
     side.queued()
         .into_iter()
         .find_map(|p| match p {
@@ -436,14 +444,15 @@ fn take_file_offer(side: &mut Side) -> (u64, u64, Envelope) {
                 stream_id,
                 seq,
                 envelope,
+                sender_device_id,
                 ..
-            } => Some((stream_id, seq, envelope)),
+            } => Some((stream_id, seq, envelope, sender_device_id)),
             _ => None,
         })
         .expect("a pad-wrapped file offer should have gone out")
 }
 
-fn take_voice_offer(side: &mut Side) -> (u64, u64, Envelope) {
+fn take_voice_offer(side: &mut Side) -> (u64, u64, Envelope, String) {
     side.queued()
         .into_iter()
         .find_map(|p| match p {
@@ -451,8 +460,9 @@ fn take_voice_offer(side: &mut Side) -> (u64, u64, Envelope) {
                 stream_id,
                 seq,
                 envelope,
+                sender_device_id,
                 ..
-            } => Some((stream_id, seq, envelope)),
+            } => Some((stream_id, seq, envelope, sender_device_id)),
             _ => None,
         })
         .expect("a pad-wrapped voice offer should have gone out")
@@ -485,7 +495,13 @@ async fn ack(to: &mut Side, from: UserId, seq: u64, proof: [u8; 32]) {
     .expect("the ack path should never be an error, refused or not");
 }
 
-async fn receive_text(bob: &mut Side, seq: u64, msg_id: Option<u64>, envelope: Envelope) {
+async fn receive_text(
+    bob: &mut Side,
+    seq: u64,
+    msg_id: Option<u64>,
+    envelope: Envelope,
+    sender_device_id: String,
+) {
     aloo::client::otp::on_message(
         &mut bob.session,
         &mut bob.ui,
@@ -495,6 +511,7 @@ async fn receive_text(bob: &mut Side, seq: u64, msg_id: Option<u64>, envelope: E
         seq,
         msg_id,
         envelope,
+        sender_device_id,
     )
     .await
     .expect("the receive path should not fail");
@@ -519,7 +536,7 @@ async fn text_round_trip(label: &str, alice_kind: Id, bob_kind: Id, direct: bool
     );
     assert_eq!(alice.arrow(), DeliveryStatus::None);
 
-    let (seq, msg_id, envelope) = take_envelope(&mut alice);
+    let (seq, msg_id, envelope, envelope_device) = take_envelope(&mut alice);
     // The pad goes on the message and the seal goes around the pad, so the
     // pad costs about the length of the line under *both* framings - the
     // ~6.4KB of ML-DSA/ML-KEM/RSA a sealed envelope weighs never touches
@@ -545,7 +562,7 @@ async fn text_round_trip(label: &str, alice_kind: Id, bob_kind: Id, direct: bool
         );
     }
 
-    receive_text(&mut bob, seq, msg_id, envelope).await;
+    receive_text(&mut bob, seq, msg_id, envelope, envelope_device).await;
     assert!(
         bob.ui
             .private_rooms
@@ -654,7 +671,7 @@ async fn file_round_trip(label: &str, alice_kind: Id, bob_kind: Id, direct: bool
     send_file(&mut alice, &contact, source.clone(), body.len() as u64).await;
     assert!(alice.gate_held(&contact), "the offer is a real pad spend");
 
-    let (stream_id, offer_seq, offer_env) = take_file_offer(&mut alice);
+    let (stream_id, offer_seq, offer_env, offer_env_device) = take_file_offer(&mut alice);
     if direct {
         assert_eq!(
             offer_env.blocks.len(),
@@ -672,6 +689,7 @@ async fn file_round_trip(label: &str, alice_kind: Id, bob_kind: Id, direct: bool
         stream_id,
         offer_seq,
         offer_env,
+        offer_env_device,
     )
     .await;
     let (a_seq, a_proof) = last_ack(&mut bob);
@@ -782,7 +800,7 @@ async fn file_round_trip(label: &str, alice_kind: Id, bob_kind: Id, direct: bool
     // past it, the very next ordinary message would be silently dropped as
     // out-of-order, wedging the pair for good.
     send_text(&mut alice, &contact, "did the file make it?").await;
-    let (seq, msg_id, envelope) = alice
+    let (seq, msg_id, envelope, envelope_device) = alice
         .queued()
         .into_iter()
         .filter_map(|p| match p {
@@ -790,13 +808,14 @@ async fn file_round_trip(label: &str, alice_kind: Id, bob_kind: Id, direct: bool
                 seq,
                 msg_id,
                 envelope,
+                sender_device_id,
                 ..
-            } => Some((seq, msg_id, envelope)),
+            } => Some((seq, msg_id, envelope, sender_device_id)),
             _ => None,
         })
         .next_back()
         .expect("the follow-up text should have gone out");
-    receive_text(&mut bob, seq, msg_id, envelope).await;
+    receive_text(&mut bob, seq, msg_id, envelope, envelope_device).await;
     let delivered = bob
         .ui
         .private_rooms
@@ -859,7 +878,7 @@ async fn voice_round_trip(label: &str, alice_kind: Id, bob_kind: Id, direct: boo
     send_voice(&mut alice, &contact, pcm.clone()).await;
     assert!(alice.gate_held(&contact));
 
-    let (stream_id, seq, envelope) = take_voice_offer(&mut alice);
+    let (stream_id, seq, envelope, envelope_device) = take_voice_offer(&mut alice);
     assert_eq!(envelope.blocks.len(), 1);
     if direct {
         // Padded either way, so the duration never travels in the clear -
@@ -878,6 +897,7 @@ async fn voice_round_trip(label: &str, alice_kind: Id, bob_kind: Id, direct: boo
         stream_id,
         seq,
         envelope,
+        envelope_device,
     )
     .await;
     let pending = bob
@@ -1073,9 +1093,12 @@ async fn pad_only_side(
     // neither decodes as a keybundle, which is what makes this pair
     // `Direct` from both sides.
     session.set_own_pinned_der_for_test(opaque_pin(own_name));
-    session
-        .id_store_mut()
-        .check_and_pin(peer_name, &opaque_pin(peer_name));
+    session.id_store_mut().pin_new_device(
+        peer_name,
+        "test-device",
+        &opaque_pin(peer_name),
+        aloo::client::idstore::Trust::Tofu,
+    );
     session.otp_store_mut().mark_provisioned(contact);
 
     // No server anywhere: the only thing that makes this peer addressable
@@ -1085,6 +1108,7 @@ async fn pad_only_side(
         own_name.to_string(),
         vec![aloo::settings::DirectPunchTarget {
             nickname: peer_name.to_string(),
+            device_id: None,
             host: "127.0.0.1".to_string(),
             port: 1,
             frequency: aloo::settings::PunchFrequency::parse("every_1m").expect("valid"),
@@ -1094,7 +1118,7 @@ async fn pad_only_side(
     // Somewhere for a send to queue. Never punched, so nothing leaves the
     // machine and every assertion below reads what this side *decided* to
     // send (`SessionState::for_test`'s own convention).
-    let peer = aloo::client::p2p::direct_peer_id(peer_name);
+    let peer = aloo::client::p2p::direct_peer_id(peer_name, None);
     session.peer_link_mut().open_unpunched_link_for_test(peer);
 
     let mut ui = UiState::new(own_name.into());
@@ -1123,7 +1147,7 @@ async fn a_serverless_pad_only_pair_registers_and_talks_without_any_pq_hybrid_id
     // negotiated - the whole basis of a pad-only pair.
     for (side, who) in [(&alice, "alice"), (&bob, "bob")] {
         assert_eq!(
-            aloo::client::otp::contact_name_if_active(&side.session, &side.peer_der).as_deref(),
+            aloo::client::otp::contact_name_if_active(&side.session, side.peer, &side.peer_der).as_deref(),
             Some(contact.as_str()),
             "{who} must find this pair's pad"
         );
@@ -1147,7 +1171,7 @@ async fn a_serverless_pad_only_pair_registers_and_talks_without_any_pq_hybrid_id
     // --- alice sends, with no pq_hybrid identity of bob anywhere ---
     let msg_id = send_text(&mut alice, &contact, "no server, no keybundle, still private").await;
     assert!(alice.gate_held(&contact), "the send really spent pad");
-    let (seq, _, envelope) = take_envelope(&mut alice);
+    let (seq, _, envelope, envelope_device) = take_envelope(&mut alice);
     assert_eq!(
         envelope.blocks.len(),
         1,
@@ -1168,6 +1192,7 @@ async fn a_serverless_pad_only_pair_registers_and_talks_without_any_pq_hybrid_id
         seq,
         Some(msg_id),
         envelope,
+        envelope_device,
     )
     .await
     .expect("bob's receive path should not fail");
@@ -1214,7 +1239,7 @@ async fn a_serverless_pad_only_pair_registers_and_talks_without_any_pq_hybrid_id
 
     // --- and bob can answer, which needs him registered to address her ---
     let reply = send_text(&mut bob, &contact, "received").await;
-    let (reply_seq, _, reply_env) = take_envelope(&mut bob);
+    let (reply_seq, _, reply_env, reply_env_device) = take_envelope(&mut bob);
     aloo::client::otp::on_message(
         &mut alice.session,
         &mut alice.ui,
@@ -1224,6 +1249,7 @@ async fn a_serverless_pad_only_pair_registers_and_talks_without_any_pq_hybrid_id
         reply_seq,
         Some(reply),
         reply_env,
+        reply_env_device,
     )
     .await
     .expect("alice's receive path should not fail");
@@ -1252,8 +1278,8 @@ async fn an_acknowledgement_for_a_different_sequence_does_not_open_this_gate() {
     }
     let (mut alice, mut bob, contact) = pair("seq", Id::Pq, Id::Pq).await;
     send_text(&mut alice, &contact, "meet me at six").await;
-    let (seq, msg_id, envelope) = take_envelope(&mut alice);
-    receive_text(&mut bob, seq, msg_id, envelope).await;
+    let (seq, msg_id, envelope, envelope_device) = take_envelope(&mut alice);
+    receive_text(&mut bob, seq, msg_id, envelope, envelope_device).await;
     let (_, proof) = last_ack(&mut bob);
 
     ack(&mut alice, BOB, seq + 1, proof).await;
@@ -1274,7 +1300,7 @@ async fn a_queued_message_is_released_only_by_an_ack_that_proves_itself() {
     let (mut alice, mut bob, contact) = pair("queue", Id::Pq, Id::Pq).await;
 
     send_text(&mut alice, &contact, "first").await;
-    let (seq, msg_id, envelope) = take_envelope(&mut alice);
+    let (seq, msg_id, envelope, envelope_device) = take_envelope(&mut alice);
     assert_eq!(alice.envelopes_sent(), 1);
 
     send_text(&mut alice, &contact, "second").await;
@@ -1284,7 +1310,7 @@ async fn a_queued_message_is_released_only_by_an_ack_that_proves_itself() {
         "the second message must wait behind the first rather than spend pad"
     );
 
-    receive_text(&mut bob, seq, msg_id, envelope).await;
+    receive_text(&mut bob, seq, msg_id, envelope, envelope_device).await;
     let (ack_seq, proof) = last_ack(&mut bob);
 
     ack(&mut alice, BOB, ack_seq, [0x11; 32]).await;
@@ -1318,10 +1344,10 @@ async fn each_direction_keeps_its_own_gate() {
     // Crossing in flight: each sends before either has received.
     send_text(&mut alice, &contact, "from alice").await;
     send_text(&mut bob, &contact, "from bob").await;
-    let (a_seq, a_msg, a_env) = take_envelope(&mut alice);
-    let (b_seq, b_msg, b_env) = take_envelope(&mut bob);
+    let (a_seq, a_msg, a_env, a_env_device) = take_envelope(&mut alice);
+    let (b_seq, b_msg, b_env, b_env_device) = take_envelope(&mut bob);
 
-    receive_text(&mut bob, a_seq, a_msg, a_env).await;
+    receive_text(&mut bob, a_seq, a_msg, a_env, a_env_device).await;
     assert!(
         bob.gate_held(&contact),
         "receiving proves who they are, not that bob's own message arrived"
@@ -1337,6 +1363,7 @@ async fn each_direction_keeps_its_own_gate() {
         b_seq,
         b_msg,
         b_env,
+        b_env_device,
     )
     .await
     .expect("the receive path should not fail");
@@ -1359,7 +1386,7 @@ async fn each_direction_keeps_its_own_gate() {
 /// Hands a queued `OtpEnvelope` to the other side, whoever they are - the
 /// control payloads travel in both directions, unlike a text message.
 async fn deliver_envelope(to: &mut Side, from: UserId, from_name: &str, side: &mut Side) {
-    let (seq, msg_id, envelope) = take_envelope(side);
+    let (seq, msg_id, envelope, envelope_device) = take_envelope(side);
     aloo::client::otp::on_message(
         &mut to.session,
         &mut to.ui,
@@ -1369,6 +1396,7 @@ async fn deliver_envelope(to: &mut Side, from: UserId, from_name: &str, side: &m
         seq,
         msg_id,
         envelope,
+        envelope_device,
     )
     .await
     .expect("the receive path should not fail");
@@ -1550,8 +1578,8 @@ async fn a_send_after_endotp_no_longer_rides_the_paused_pad() {
     );
 
     // The peer confirms; only now does the pause take effect.
-    let (seq, msg_id, envelope) = take_envelope(&mut alice);
-    receive_text(&mut bob, seq, msg_id, envelope).await;
+    let (seq, msg_id, envelope, envelope_device) = take_envelope(&mut alice);
+    receive_text(&mut bob, seq, msg_id, envelope, envelope_device).await;
     let (ack_seq, proof) = last_ack(&mut bob);
     ack(&mut alice, BOB, ack_seq, proof).await;
 
@@ -1561,7 +1589,7 @@ async fn a_send_after_endotp_no_longer_rides_the_paused_pad() {
         "a paused session must not route a new send through the pad any more"
     );
     assert_eq!(
-        aloo::client::otp::contact_name_if_active(&alice.session, &alice.peer_der),
+        aloo::client::otp::contact_name_if_active(&alice.session, alice.peer, &alice.peer_der),
         Some(contact),
         "the pad itself is kept, not destroyed - only new sends stop using it"
     );
@@ -1592,8 +1620,8 @@ async fn endotp_on_a_pad_only_pair_never_stops_contact_name_for_sending() {
     )
     .await
     .expect("/endotp should not fail");
-    let (seq, msg_id, envelope) = take_envelope(&mut alice);
-    receive_text(&mut bob, seq, msg_id, envelope).await;
+    let (seq, msg_id, envelope, envelope_device) = take_envelope(&mut alice);
+    receive_text(&mut bob, seq, msg_id, envelope, envelope_device).await;
     let (ack_seq, proof) = last_ack(&mut bob);
     ack(&mut alice, BOB, ack_seq, proof).await;
     assert!(
@@ -1628,8 +1656,8 @@ async fn a_duplicate_text_message_re_acks_the_same_proof_without_reprocessing() 
     let (mut alice, mut bob, contact) = pair("dup-text-reack", Id::Pq, Id::Pq).await;
 
     send_text(&mut alice, &contact, "meet me at six").await;
-    let (seq, msg_id, envelope) = take_envelope(&mut alice);
-    receive_text(&mut bob, seq, msg_id, envelope.clone()).await;
+    let (seq, msg_id, envelope, envelope_device) = take_envelope(&mut alice);
+    receive_text(&mut bob, seq, msg_id, envelope.clone(), envelope_device.clone()).await;
     let first_ack = last_ack(&mut bob);
     let acks_before = bob
         .queued()
@@ -1640,7 +1668,7 @@ async fn a_duplicate_text_message_re_acks_the_same_proof_without_reprocessing() 
     // Alice's retry: the identical ciphertext reappears because her copy of
     // the ack never arrived - this must never touch the pad or the UI a
     // second time, but it must still get a fresh ack back, not silence.
-    receive_text(&mut bob, seq, msg_id, envelope).await;
+    receive_text(&mut bob, seq, msg_id, envelope, envelope_device).await;
     let acks_after = bob
         .queued()
         .into_iter()
@@ -1686,8 +1714,8 @@ async fn a_stale_replay_older_than_the_last_received_message_is_still_silently_d
     let (mut alice, mut bob, contact) = pair("dup-text-stale", Id::Pq, Id::Pq).await;
 
     send_text(&mut alice, &contact, "first").await;
-    let (seq1, msg_id1, envelope1) = take_envelope(&mut alice);
-    receive_text(&mut bob, seq1, msg_id1, envelope1.clone()).await;
+    let (seq1, msg_id1, envelope1, envelope1_device) = take_envelope(&mut alice);
+    receive_text(&mut bob, seq1, msg_id1, envelope1.clone(), envelope1_device.clone()).await;
     let (ack_seq, ack_proof) = last_ack(&mut bob);
     ack(&mut alice, BOB, ack_seq, ack_proof).await;
 
@@ -1696,17 +1724,17 @@ async fn a_stale_replay_older_than_the_last_received_message_is_still_silently_d
     // first envelope is still sitting there too - `take_envelope` would
     // find it again by returning the first match. Pick the one that isn't
     // `seq1` instead, to actually get the new send.
-    let (seq2, msg_id2, envelope2) = alice
+    let (seq2, msg_id2, envelope2, envelope2_device) = alice
         .queued()
         .into_iter()
         .find_map(|p| match p {
             P2pPayload::OtpEnvelope {
-                seq, msg_id, envelope, ..
-            } if seq != seq1 => Some((seq, msg_id, envelope)),
+                seq, msg_id, envelope, sender_device_id, ..
+            } if seq != seq1 => Some((seq, msg_id, envelope, sender_device_id)),
             _ => None,
         })
         .expect("the second send should have queued its own envelope");
-    receive_text(&mut bob, seq2, msg_id2, envelope2).await;
+    receive_text(&mut bob, seq2, msg_id2, envelope2, envelope2_device).await;
 
     let acks_before = bob
         .queued()
@@ -1716,7 +1744,7 @@ async fn a_stale_replay_older_than_the_last_received_message_is_still_silently_d
 
     // A genuinely stale replay of the *first* message, long superseded by
     // the second - must produce no ack at all.
-    receive_text(&mut bob, seq1, msg_id1, envelope1).await;
+    receive_text(&mut bob, seq1, msg_id1, envelope1, envelope1_device).await;
 
     let acks_after = bob
         .queued()
@@ -1747,7 +1775,7 @@ async fn a_duplicate_file_offer_re_acks_the_same_proof_without_reprocessing() {
     std::fs::write(&source, body).unwrap();
 
     send_file(&mut alice, &contact, source, body.len() as u64).await;
-    let (stream_id, offer_seq, offer_env) = take_file_offer(&mut alice);
+    let (stream_id, offer_seq, offer_env, offer_env_device) = take_file_offer(&mut alice);
 
     aloo::client::otp::on_file_offer(
         &mut bob.session,
@@ -1758,6 +1786,7 @@ async fn a_duplicate_file_offer_re_acks_the_same_proof_without_reprocessing() {
         stream_id,
         offer_seq,
         offer_env.clone(),
+        offer_env_device.clone(),
     )
     .await;
     let first_ack = last_ack(&mut bob);
@@ -1778,6 +1807,7 @@ async fn a_duplicate_file_offer_re_acks_the_same_proof_without_reprocessing() {
         stream_id,
         offer_seq,
         offer_env,
+        offer_env_device,
     )
     .await;
     let acks_after = bob
@@ -1875,7 +1905,7 @@ async fn an_end_confirmation_lost_in_the_handshake_window_is_recovered_on_reconn
     // Deliver the *retry* - the last envelope queued - never the original,
     // which went to a dead UserId. It must still be exactly what bob's own
     // decoder expects next: the same pad range, the same sequence number.
-    let (seq, msg_id, envelope) = alice
+    let (seq, msg_id, envelope, envelope_device) = alice
         .queued()
         .into_iter()
         .filter_map(|p| match p {
@@ -1883,13 +1913,14 @@ async fn an_end_confirmation_lost_in_the_handshake_window_is_recovered_on_reconn
                 seq,
                 msg_id,
                 envelope,
+                sender_device_id,
                 ..
-            } => Some((seq, msg_id, envelope)),
+            } => Some((seq, msg_id, envelope, sender_device_id)),
             _ => None,
         })
         .next_back()
         .expect("the recovery pass should have queued the recovered notice");
-    receive_text(&mut bob, seq, msg_id, envelope).await;
+    receive_text(&mut bob, seq, msg_id, envelope, envelope_device).await;
     let (message, success) = bob
         .ui
         .status_notice
@@ -1989,7 +2020,7 @@ async fn endotp_with_an_unacked_message_defers_the_notice_behind_it() {
         "the reconnect passes recover; they never re-encrypt, and never jump the queue"
     );
 
-    let (seq, msg_id, envelope) = alice
+    let (seq, msg_id, envelope, envelope_device) = alice
         .queued()
         .into_iter()
         .filter_map(|p| match p {
@@ -1997,13 +2028,14 @@ async fn endotp_with_an_unacked_message_defers_the_notice_behind_it() {
                 seq,
                 msg_id,
                 envelope,
+                sender_device_id,
                 ..
-            } => Some((seq, msg_id, envelope)),
+            } => Some((seq, msg_id, envelope, sender_device_id)),
             _ => None,
         })
         .next_back()
         .expect("the recovered message should have been queued");
-    receive_text(&mut bob, seq, msg_id, envelope).await;
+    receive_text(&mut bob, seq, msg_id, envelope, envelope_device).await;
     let delivered = bob
         .ui
         .private_rooms
@@ -2021,7 +2053,7 @@ async fn endotp_with_an_unacked_message_defers_the_notice_behind_it() {
         "the notice takes the gate the instant the message's ack frees it"
     );
 
-    let (seq, msg_id, envelope) = alice
+    let (seq, msg_id, envelope, envelope_device) = alice
         .queued()
         .into_iter()
         .filter_map(|p| match p {
@@ -2029,13 +2061,14 @@ async fn endotp_with_an_unacked_message_defers_the_notice_behind_it() {
                 seq,
                 msg_id,
                 envelope,
+                sender_device_id,
                 ..
-            } => Some((seq, msg_id, envelope)),
+            } => Some((seq, msg_id, envelope, sender_device_id)),
             _ => None,
         })
         .next_back()
         .expect("the notice should have followed the ack");
-    receive_text(&mut bob, seq, msg_id, envelope).await;
+    receive_text(&mut bob, seq, msg_id, envelope, envelope_device).await;
     assert!(
         !bob.ui.is_otp_active(ALICE),
         "bob's session ends the moment the notice lands"
@@ -2075,8 +2108,8 @@ async fn a_deferred_notice_converges_even_when_only_the_messages_ack_was_lost() 
     bob.ui.mark_otp_active(ALICE);
 
     send_text(&mut alice, &contact, "made it?").await;
-    let (seq, msg_id, envelope) = take_envelope(&mut alice);
-    receive_text(&mut bob, seq, msg_id, envelope.clone()).await;
+    let (seq, msg_id, envelope, envelope_device) = take_envelope(&mut alice);
+    receive_text(&mut bob, seq, msg_id, envelope.clone(), envelope_device.clone()).await;
     // Bob's ack is never delivered - the link died around it.
 
     let peer_der = alice.peer_der.clone();
@@ -2100,7 +2133,7 @@ async fn a_deferred_notice_converges_even_when_only_the_messages_ack_was_lost() 
     aloo::client::otp::resend_pending_end_notices(&mut NullSink, &mut alice.session, &mut alice.ui)
         .await
         .expect("the notice pass should not fail");
-    receive_text(&mut bob, seq, msg_id, envelope).await;
+    receive_text(&mut bob, seq, msg_id, envelope, envelope_device).await;
 
     let (ack_seq, proof) = last_ack(&mut bob);
     assert_eq!(ack_seq, seq, "the duplicate is answered with the recorded ack");
@@ -2114,7 +2147,7 @@ async fn a_deferred_notice_converges_even_when_only_the_messages_ack_was_lost() 
         "the notice's spend happens only now, after the message's slot genuinely closed"
     );
 
-    let (seq, msg_id, envelope) = alice
+    let (seq, msg_id, envelope, envelope_device) = alice
         .queued()
         .into_iter()
         .filter_map(|p| match p {
@@ -2122,13 +2155,14 @@ async fn a_deferred_notice_converges_even_when_only_the_messages_ack_was_lost() 
                 seq,
                 msg_id,
                 envelope,
+                sender_device_id,
                 ..
-            } => Some((seq, msg_id, envelope)),
+            } => Some((seq, msg_id, envelope, sender_device_id)),
             _ => None,
         })
         .next_back()
         .expect("the notice should have followed the re-ack");
-    receive_text(&mut bob, seq, msg_id, envelope).await;
+    receive_text(&mut bob, seq, msg_id, envelope, envelope_device).await;
     assert!(!bob.ui.is_otp_active(ALICE), "bob converges to ended");
 }
 
@@ -2158,7 +2192,7 @@ async fn a_decrypt_orphaned_by_a_crash_is_healed_from_the_tools_safety_copy() {
     let (mut alice, mut bob, contact) = pair("orphaned-decrypt-heal", Id::Opaque, Id::Opaque).await;
 
     send_text(&mut alice, &contact, "the message the crash orphaned").await;
-    let (seq, msg_id, envelope) = take_envelope(&mut alice);
+    let (seq, msg_id, envelope, envelope_device) = take_envelope(&mut alice);
     let padded = envelope.blocks.first().cloned().expect("direct framing carries the pad block");
     match aloo::client::otp::unwrap_incoming(&bob.otp, &padded, &contact).await {
         aloo::client::otp::UnwrapOutcome::Ok(..) => {}
@@ -2167,7 +2201,7 @@ async fn a_decrypt_orphaned_by_a_crash_is_healed_from_the_tools_safety_copy() {
     // ...process dies here: nothing recorded, nothing shown, no ack sent...
 
     // The sender's retry of the very same ciphertext, after the restart.
-    receive_text(&mut bob, seq, msg_id, envelope).await;
+    receive_text(&mut bob, seq, msg_id, envelope, envelope_device).await;
 
     let delivered = bob
         .ui
@@ -2439,7 +2473,7 @@ async fn a_content_transfer_is_re_registered_from_its_retry_after_a_restart() {
     std::fs::write(&source, body).unwrap();
 
     send_file(&mut alice, &contact, source, body.len() as u64).await;
-    let (stream_id, offer_seq, offer_env) = take_file_offer(&mut alice);
+    let (stream_id, offer_seq, offer_env, offer_env_device) = take_file_offer(&mut alice);
     aloo::client::otp::on_file_offer(
         &mut bob.session,
         &mut bob.ui,
@@ -2449,6 +2483,7 @@ async fn a_content_transfer_is_re_registered_from_its_retry_after_a_restart() {
         stream_id,
         offer_seq,
         offer_env,
+        offer_env_device,
     )
     .await;
     let (a_seq, a_proof) = last_ack(&mut bob);
@@ -2552,7 +2587,7 @@ async fn an_end_notice_survives_the_initiators_own_process_restart() {
 
     // An ordinary message round-trips first, exactly as in the report.
     send_text(&mut bob, &contact, "hello").await;
-    let (seq0, msg_id0, envelope0) = take_envelope(&mut bob);
+    let (seq0, msg_id0, envelope0, envelope0_device) = take_envelope(&mut bob);
     // `receive_text` hardcodes "from alice" - bob is the sender in this
     // scenario, so `on_message` is driven directly with the right sender.
     aloo::client::otp::on_message(
@@ -2564,6 +2599,7 @@ async fn an_end_notice_survives_the_initiators_own_process_restart() {
         seq0,
         msg_id0,
         envelope0,
+        envelope0_device,
     )
     .await
     .expect("the receive path should not fail");
@@ -2631,7 +2667,7 @@ async fn an_end_notice_survives_the_initiators_own_process_restart() {
 
     // What bob queued must still be exactly what alice's own decoder
     // expects next.
-    let (seq, msg_id, envelope) = bob
+    let (seq, msg_id, envelope, envelope_device) = bob
         .queued()
         .into_iter()
         .filter_map(|p| match p {
@@ -2639,8 +2675,9 @@ async fn an_end_notice_survives_the_initiators_own_process_restart() {
                 seq,
                 msg_id,
                 envelope,
+                sender_device_id,
                 ..
-            } => Some((seq, msg_id, envelope)),
+            } => Some((seq, msg_id, envelope, sender_device_id)),
             _ => None,
         })
         .next_back()
@@ -2654,6 +2691,7 @@ async fn an_end_notice_survives_the_initiators_own_process_restart() {
         seq,
         msg_id,
         envelope,
+        envelope_device,
     )
     .await
     .expect("the receive path should not fail");
@@ -2729,7 +2767,7 @@ async fn a_voice_recording_survives_the_senders_own_restart_while_awaiting_accep
     let (stream_id, staged_contact) = staged[0].clone();
     assert_eq!(staged_contact, contact);
 
-    let (offer_stream_id, offer_seq, offer_env) = take_voice_offer(&mut bob);
+    let (offer_stream_id, offer_seq, offer_env, offer_env_device) = take_voice_offer(&mut bob);
     assert_eq!(offer_stream_id, stream_id);
     aloo::client::otp::on_voice_offer(
         &mut NullSink,
@@ -2739,6 +2777,7 @@ async fn a_voice_recording_survives_the_senders_own_restart_while_awaiting_accep
         stream_id,
         offer_seq,
         offer_env,
+        offer_env_device,
     )
     .await;
     // `on_voice_offer` sends FileAccept before the offer's own ack - both
@@ -2893,5 +2932,217 @@ fn otp_out_queue_never_double_queues_the_same_streams_content() {
     assert!(
         queue.pop_front(contact).is_none(),
         "and only the one - the guard refused a second enqueue for the same stream"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Device-pinning plan §5: a `Direct`-framed pad binds to whichever device
+// first successfully decrypts under it, and refuses a different one
+// *before* the pad is ever touched.
+// ---------------------------------------------------------------------
+
+/// Pulls the *second* queued envelope for this contact - the one whose
+/// `seq` isn't `first_seq`. `Side::queued`'s own doc explains why this is
+/// necessary: `pending_payloads` reads rather than drains, so a second
+/// `take_envelope` call would just find the first envelope again.
+fn take_second_envelope(side: &mut Side, first_seq: u64) -> (u64, Option<u64>, Envelope, String) {
+    side.queued()
+        .into_iter()
+        .find_map(|p| match p {
+            P2pPayload::OtpEnvelope {
+                seq,
+                msg_id,
+                envelope,
+                sender_device_id,
+                ..
+            } if seq != first_seq => Some((seq, msg_id, envelope, sender_device_id)),
+            _ => None,
+        })
+        .expect("the second send should have queued its own envelope")
+}
+
+/// The core, security-relevant property: checking a mismatched device
+/// claim must never call `otp --decrypt` at all - the exact bug caught in
+/// review (embedding the claim *inside* the padded payload would have
+/// required decrypting to see it, spending the pad even on a refusal).
+/// Asserted by comparing the receiver's `dec_offset`/`dec_sequence`
+/// before and after a refused attempt: byte-for-byte identical.
+///
+/// The very first message on a pad always binds to whichever device
+/// claims it, since there is nothing yet to compare against - so this
+/// scenario needs the pad genuinely bound first, then a *second* message
+/// claimed by a different device, to actually exercise a mismatch.
+///
+/// @requirement AC-317
+#[tokio::test]
+async fn a_mismatched_device_claim_is_refused_before_the_pad_is_touched() {
+    if !require_otp() {
+        return;
+    }
+    let (mut alice, mut bob, contact) =
+        pair("device-claim-mismatch", Id::Opaque, Id::Opaque).await;
+
+    send_text(&mut alice, &contact, "first").await;
+    let (seq1, msg_id1, envelope1, real_device) = take_envelope(&mut alice);
+    receive_text(&mut bob, seq1, msg_id1, envelope1, real_device).await;
+    let (ack_seq, ack_proof) = last_ack(&mut bob);
+    ack(&mut alice, BOB, ack_seq, ack_proof).await;
+
+    send_text(&mut alice, &contact, "hello from a copied pad").await;
+    let (seq2, msg_id2, envelope2, _real_device2) = take_second_envelope(&mut alice, seq1);
+
+    let before = otp_cli::show_contact(&bob.otp, &contact)
+        .await
+        .expect("show-contact should succeed")
+        .expect("the contact exists");
+
+    // A different physical machine, holding a copy of the same pad file,
+    // claims this exact ciphertext as its own.
+    let outcome = aloo::client::otp::on_message(
+        &mut bob.session,
+        &mut bob.ui,
+        None,
+        ALICE,
+        "alice".into(),
+        seq2,
+        msg_id2,
+        envelope2,
+        "alices-phone-not-her-laptop".to_string(),
+    )
+    .await;
+    assert!(outcome.is_ok(), "a refusal is not an error - it's Ok(()), nothing delivered");
+
+    let after = otp_cli::show_contact(&bob.otp, &contact)
+        .await
+        .expect("show-contact should succeed")
+        .expect("the contact still exists");
+    assert_eq!(
+        before.dec_offset, after.dec_offset,
+        "the pad's decrypt offset must not move on a refused claim"
+    );
+    assert_eq!(
+        before.dec_sequence, after.dec_sequence,
+        "nor the tool's own decrypt counter"
+    );
+    assert!(
+        !bob.ui.private_rooms[&ALICE]
+            .log
+            .iter()
+            .any(|e| matches!(&e.body, MessageBody::Text(t) if t.contains("copied pad"))),
+        "the message must not have been delivered"
+    );
+}
+
+/// The message the mismatched device sent is not lost - it is exactly as
+/// "not yet delivered" as any other unacknowledged send, and the sender's
+/// own retry (unchanged, never a re-encrypt) succeeds once the *actually*
+/// bound device answers.
+///
+/// @requirement AC-317
+#[tokio::test]
+async fn a_refused_claim_leaves_the_senders_outstanding_send_untouched_and_it_still_delivers() {
+    if !require_otp() {
+        return;
+    }
+    let (mut alice, mut bob, contact) = pair("device-claim-recovers", Id::Opaque, Id::Opaque).await;
+
+    // Prime the bind, then clear the gate so the message under test is the
+    // one being tracked.
+    send_text(&mut alice, &contact, "priming").await;
+    let (seq1, msg_id1, envelope1, real_device) = take_envelope(&mut alice);
+    receive_text(&mut bob, seq1, msg_id1, envelope1, real_device.clone()).await;
+    let (ack_seq, ack_proof) = last_ack(&mut bob);
+    ack(&mut alice, BOB, ack_seq, ack_proof).await;
+
+    send_text(&mut alice, &contact, "hello").await;
+    assert!(alice.gate_held(&contact), "the send is still awaiting a genuine ack");
+    let (seq2, msg_id2, envelope2, _real_device2) = take_second_envelope(&mut alice, seq1);
+
+    // The wrong device's claim is refused...
+    aloo::client::otp::on_message(
+        &mut bob.session,
+        &mut bob.ui,
+        None,
+        ALICE,
+        "alice".into(),
+        seq2,
+        msg_id2,
+        envelope2.clone(),
+        "a-third-devices-claim".to_string(),
+    )
+    .await
+    .expect("a refusal is not an error");
+    assert!(
+        !bob.ui.private_rooms[&ALICE]
+            .log
+            .iter()
+            .any(|e| matches!(&e.body, MessageBody::Text(t) if t == "hello")),
+        "the wrongly-claimed attempt must not have delivered the message"
+    );
+    assert!(
+        alice.gate_held(&contact),
+        "no ack could possibly have come back from a message that was never delivered"
+    );
+
+    // ...but the exact same ciphertext, honestly claimed by the device the
+    // pad is actually meant for, still decrypts and delivers cleanly -
+    // nothing about the pad's own position was disturbed by the refusal.
+    aloo::client::otp::on_message(
+        &mut bob.session,
+        &mut bob.ui,
+        None,
+        ALICE,
+        "alice".into(),
+        seq2,
+        msg_id2,
+        envelope2,
+        real_device,
+    )
+    .await
+    .expect("the genuine device's receive path should not fail");
+    assert!(
+        bob.ui.private_rooms[&ALICE]
+            .log
+            .iter()
+            .any(|e| matches!(&e.body, MessageBody::Text(t) if t == "hello")),
+        "the message delivers once the actually-bound device answers"
+    );
+}
+
+/// The pad binds to whichever device's claim is attached to the *first*
+/// message that genuinely decrypts - not to any earlier, merely-claimed
+/// value - and every later message from that same device continues to be
+/// accepted normally.
+///
+/// @requirement AC-317
+#[tokio::test]
+async fn the_pad_binds_to_the_first_device_that_genuinely_decrypts() {
+    if !require_otp() {
+        return;
+    }
+    let (mut alice, mut bob, contact) = pair("device-claim-binds", Id::Opaque, Id::Opaque).await;
+
+    send_text(&mut alice, &contact, "first").await;
+    let (seq1, msg_id1, envelope1, real_device) = take_envelope(&mut alice);
+    receive_text(&mut bob, seq1, msg_id1, envelope1, real_device.clone()).await;
+    assert_eq!(
+        bob.session.otp_store_mut().get(&contact).and_then(|s| s.bound_peer_device_id.clone()),
+        Some(real_device.clone()),
+        "the pad is now bound to the device that actually decrypted it"
+    );
+    let (ack_seq, ack_proof) = last_ack(&mut bob);
+    ack(&mut alice, BOB, ack_seq, ack_proof).await;
+
+    // A genuine second message from the same, now-bound device.
+    send_text(&mut alice, &contact, "second").await;
+    let (seq2, msg_id2, envelope2, real_device2) = take_second_envelope(&mut alice, seq1);
+    assert_eq!(real_device, real_device2, "still the same physical machine");
+    receive_text(&mut bob, seq2, msg_id2, envelope2, real_device2).await;
+    assert!(
+        bob.ui.private_rooms[&ALICE]
+            .log
+            .iter()
+            .any(|e| matches!(&e.body, MessageBody::Text(t) if t == "second")),
+        "and delivers normally"
     );
 }

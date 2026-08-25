@@ -77,7 +77,7 @@ async fn session_with_pinned_peer(
         aloo::crypto::pq::generate_bundle_with_bits(TEST_BITS).expect("peer pq keygen");
     let peer_der = aloo::proto::encode(&peer_public).expect("peer pq der");
     let peer_fp = aloo::crypto::pq::fingerprint_of_encoded(&peer_der).expect("peer fp");
-    session.id_store_mut().check_and_pin_with("bob", &peer_der, Trust::Verified);
+    session.id_store_mut().pin_new_device("bob", "test-device", &peer_der, Trust::Verified);
     (session, own_fp, peer_fp)
 }
 
@@ -91,7 +91,7 @@ async fn a_live_otp_key_alone_is_not_enough_to_send_mail() {
     let (session, own_fp, peer_fp) = session_with_pinned_peer("live-not-mail", cfg.clone()).await;
 
     // Install a key under the *live* contact name only.
-    let live_name = aloo::crypto::otp::contact_name_for(&own_fp, &peer_fp);
+    let live_name = aloo::crypto::otp::contact_name_for(&own_fp, session.own_device_id_for_test(), &peer_fp, "test-device");
     let (enc, dec) = make_key_pair(&cfg).await;
     otp_cli::add_contact(&cfg, &live_name, &enc, &dec).await.expect("add_contact (live)");
 
@@ -112,7 +112,7 @@ async fn a_mail_key_installed_under_its_own_name_lets_mail_through() {
     let cfg = OtpCliConfig { binary_path: "otp".into(), working_dir: scratch("mail-key-ok-otp") };
     let (session, own_fp, peer_fp) = session_with_pinned_peer("mail-key-ok", cfg.clone()).await;
 
-    let mail_name = aloo::crypto::otp::contact_name_for_mail(&own_fp, &peer_fp);
+    let mail_name = aloo::crypto::otp::contact_name_for_mail(&own_fp, session.own_device_id_for_test(), &peer_fp, "test-device");
     let (enc, dec) = make_key_pair(&cfg).await;
     otp_cli::add_contact(&cfg, &mail_name, &enc, &dec).await.expect("add_contact (mail)");
 
@@ -132,8 +132,8 @@ async fn having_both_keys_still_resolves_to_the_mail_key_specifically() {
     let cfg = OtpCliConfig { binary_path: "otp".into(), working_dir: scratch("both-keys-otp") };
     let (session, own_fp, peer_fp) = session_with_pinned_peer("both-keys", cfg.clone()).await;
 
-    let live_name = aloo::crypto::otp::contact_name_for(&own_fp, &peer_fp);
-    let mail_name = aloo::crypto::otp::contact_name_for_mail(&own_fp, &peer_fp);
+    let live_name = aloo::crypto::otp::contact_name_for(&own_fp, session.own_device_id_for_test(), &peer_fp, "test-device");
+    let mail_name = aloo::crypto::otp::contact_name_for_mail(&own_fp, session.own_device_id_for_test(), &peer_fp, "test-device");
     assert_ne!(live_name, mail_name);
     let (live_enc, live_dec) = make_key_pair(&cfg).await;
     otp_cli::add_contact(&cfg, &live_name, &live_enc, &live_dec).await.expect("add_contact (live)");

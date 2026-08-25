@@ -52,6 +52,19 @@ async fn spawn_fake_rendezvous() -> SocketAddr {
 fn target(nickname: &str, port: u16, frequency: &str) -> DirectPunchTarget {
     DirectPunchTarget {
         nickname: nickname.to_string(),
+        device_id: None,
+        host: "127.0.0.1".to_string(),
+        port,
+        frequency: PunchFrequency::parse(frequency).unwrap(),
+    }
+}
+
+/// Like `target`, but naming one of that nickname's several devices
+/// (device-pinning plan §5a).
+fn target_for_device(nickname: &str, device_id: &str, port: u16, frequency: &str) -> DirectPunchTarget {
+    DirectPunchTarget {
+        nickname: nickname.to_string(),
+        device_id: Some(device_id.to_string()),
         host: "127.0.0.1".to_string(),
         port,
         frequency: PunchFrequency::parse(frequency).unwrap(),
@@ -132,9 +145,9 @@ fn the_slot_clock_is_the_utc_second_of_the_hour() {
 /// @requirement TB-223
 #[test]
 fn a_nickname_derived_peer_id_is_stable_and_never_collides_with_a_servers() {
-    assert_eq!(direct_peer_id("bob"), direct_peer_id("bob"));
-    assert_ne!(direct_peer_id("bob"), direct_peer_id("marco"));
-    assert!(is_direct_peer_id(direct_peer_id("bob")));
+    assert_eq!(direct_peer_id("bob", None), direct_peer_id("bob", None));
+    assert_ne!(direct_peer_id("bob", None), direct_peer_id("marco", None));
+    assert!(is_direct_peer_id(direct_peer_id("bob", None)));
     // The server hands ids out from a counter starting at 1.
     for id in 1..1000u64 {
         assert!(!is_direct_peer_id(UserId(id)));
@@ -159,8 +172,8 @@ async fn two_peers_punch_a_link_from_the_schedule_alone_and_carry_a_message() {
     bob.link
         .configure_direct_punch("bob".into(), vec![target("alice", alice.port, "every_1m")], 30);
 
-    let bob_as_alice_sees_him = direct_peer_id("bob");
-    let alice_as_bob_sees_her = direct_peer_id("alice");
+    let bob_as_alice_sees_him = direct_peer_id("bob", None);
+    let alice_as_bob_sees_her = direct_peer_id("alice", None);
 
     // Nothing happens until a slot boundary arrives - which for both of
     // them is the same wall-clock instant, since both grids restart at the
@@ -232,7 +245,7 @@ async fn a_slot_arriving_on_a_link_that_is_already_up_does_not_punch_again() {
         .configure_direct_punch("alice".into(), vec![target("bob", bob.port, "every_1m")], 30);
     bob.link
         .configure_direct_punch("bob".into(), vec![target("alice", alice.port, "every_1m")], 30);
-    let bob_id = direct_peer_id("bob");
+    let bob_id = direct_peer_id("bob", None);
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while !alice.link.is_active(bob_id) {
@@ -315,7 +328,7 @@ async fn a_direct_only_link_that_drops_is_reconnected_up_to_the_reconnect_budget
         .configure_direct_punch("alice".into(), vec![target("bob", bob.port, "every_1m")], 30);
     bob.link
         .configure_direct_punch("bob".into(), vec![target("alice", alice.port, "every_1m")], 30);
-    let bob_id = direct_peer_id("bob");
+    let bob_id = direct_peer_id("bob", None);
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while !alice.link.is_active(bob_id) {
@@ -380,7 +393,7 @@ async fn a_peer_being_punched_directly_is_never_also_signalled_through_the_serve
     alice
         .link
         .configure_direct_punch("alice".into(), vec![target("bob", dead_port, "every_1m")], 30);
-    let bob_id = direct_peer_id("bob");
+    let bob_id = direct_peer_id("bob", None);
     alice.link.tick_with_clock_at(Instant::now(), 60);
 
     // A send while the direct attempt is in flight waits on that attempt
@@ -420,7 +433,7 @@ async fn a_direct_target_moves_onto_the_user_id_the_server_gives_it() {
     alice
         .link
         .configure_direct_punch("alice".into(), vec![target("bob", 65000, "every_1h")], 30);
-    assert_eq!(alice.link.direct_peer("bob"), Some(direct_peer_id("bob")));
+    assert_eq!(alice.link.direct_peer("bob"), Some(direct_peer_id("bob", None)));
 
     // The same person, once a server names them, is one peer with one link
     // - not one per route.
@@ -430,7 +443,7 @@ async fn a_direct_target_moves_onto_the_user_id_the_server_gives_it() {
     // And goes back to being a settings-file peer when they disconnect
     // from it, so the next slot still punches at them.
     alice.link.release_direct_peer_id(UserId(7));
-    assert_eq!(alice.link.direct_peer("bob"), Some(direct_peer_id("bob")));
+    assert_eq!(alice.link.direct_peer("bob"), Some(direct_peer_id("bob", None)));
 }
 
 /// @requirement TB-222, TB-247
@@ -453,7 +466,7 @@ async fn a_direct_ping_naming_a_nickname_that_is_not_configured_is_ignored() {
     // Nothing was started, and nothing was answered - the socket gives a
     // scanner no more than it would without direct punching on.
     assert_eq!(alice.link.direct_status("bob"), Some(LinkStatus::Lost));
-    assert_eq!(alice.link.status(direct_peer_id("mallory")), None);
+    assert_eq!(alice.link.status(direct_peer_id("mallory", None)), None);
 
     // An over-long nickname is dropped before it can be looked up at all.
     alice.link.on_datagram(
@@ -507,6 +520,141 @@ async fn a_peers_probe_is_answered_and_opens_this_sides_attempt_too() {
         PunchDatagram::DirectPing { from, .. } => assert_eq!(from, "alice"),
         other => panic!("unexpected answer to a direct ping: {other:?}"),
     }
+}
+
+/// Two `direct_punch_to` lines for the same nickname but different devices
+/// (device-pinning plan §5a) must never collide: separate `UserId`s (so
+/// separate links, and - since `id_store`/OTP naming are already keyed off
+/// `UserId`/nickname+device_id - separate pins and pads too), each still
+/// independently queryable by its own `target_key`. A line with no suffix
+/// keeps resolving to exactly the `UserId` it always did, byte-identical.
+///
+/// @requirement AC-321
+#[tokio::test]
+async fn two_devices_sharing_a_nickname_get_distinct_user_ids_and_are_each_configured() {
+    let rendezvous = spawn_fake_rendezvous().await;
+    let mut alice = spawn_client(rendezvous).await;
+    let laptop = target_for_device("bob", "laptop", 65030, "every_1h");
+    let phone = target_for_device("bob", "phone", 65031, "every_1h");
+    let plain = target("carol", 65032, "every_1h");
+    alice.link.configure_direct_punch(
+        "alice".into(),
+        vec![laptop.clone(), phone.clone(), plain.clone()],
+        30,
+    );
+
+    let laptop_id = alice.link.direct_peer(&laptop.target_key()).unwrap();
+    let phone_id = alice.link.direct_peer(&phone.target_key()).unwrap();
+    let carol_id = alice.link.direct_peer(&plain.target_key()).unwrap();
+    assert_ne!(
+        laptop_id, phone_id,
+        "two devices for one nickname must never share a UserId"
+    );
+    assert_eq!(laptop_id, direct_peer_id("bob", Some("laptop")));
+    assert_eq!(phone_id, direct_peer_id("bob", Some("phone")));
+    // An unsuffixed line's id is exactly what it always was - purely
+    // additive, no existing config's UserId moves.
+    assert_eq!(carol_id, direct_peer_id("carol", None));
+    assert_eq!(alice.link.direct_status(&laptop.target_key()), Some(LinkStatus::Lost));
+    assert_eq!(alice.link.direct_status(&phone.target_key()), Some(LinkStatus::Lost));
+}
+
+/// `PunchDatagram` carries no device id (it predates §5a, and adding one
+/// would be a wire-format change), so an incoming ping naming a nickname
+/// with several devices configured is disambiguated by the address it
+/// actually arrived from. A ping from one device's configured address must
+/// only ever touch that device's target, never its sibling's.
+///
+/// @requirement AC-321
+#[tokio::test]
+async fn an_incoming_ping_naming_a_shared_nickname_is_routed_by_the_address_it_arrived_from() {
+    let rendezvous = spawn_fake_rendezvous().await;
+    let mut alice = spawn_client(rendezvous).await;
+    let laptop_addr: SocketAddr = "127.0.0.1:65040".parse().unwrap();
+    let phone_addr: SocketAddr = "127.0.0.1:65041".parse().unwrap();
+    let laptop =
+        DirectPunchTarget::parse(&format!("bob+laptop,{laptop_addr},every_1h")).unwrap();
+    let phone = DirectPunchTarget::parse(&format!("bob+phone,{phone_addr},every_1h")).unwrap();
+    alice
+        .link
+        .configure_direct_punch("alice".into(), vec![laptop.clone(), phone.clone()], 30);
+
+    alice.link.on_datagram(
+        laptop_addr,
+        PunchDatagram::DirectPing {
+            link_nonce: 1,
+            from: "bob".into(),
+        },
+    );
+
+    assert_eq!(
+        alice.link.direct_status(&laptop.target_key()),
+        Some(LinkStatus::Connecting),
+        "the device whose configured address the ping actually arrived from starts punching"
+    );
+    assert_eq!(
+        alice.link.direct_status(&phone.target_key()),
+        Some(LinkStatus::Lost),
+        "its sibling device, sharing the same claimed nickname, must be untouched"
+    );
+}
+
+/// Device-pinning plan §5a/§8's reference table, no-server row 6: a peer
+/// with two devices, each independently reachable, but only one named by
+/// a `direct_punch_to` line - the other stays completely unreachable,
+/// with no error and nothing to interact with, until a second,
+/// device-suffixed line is added. A pure configuration gap, not a
+/// refusal: nothing here is disallowed, it simply was never told where to
+/// send anything for that device.
+///
+/// @requirement AC-321
+#[tokio::test]
+async fn a_second_device_stays_unreachable_until_a_device_suffixed_line_is_added() {
+    let rendezvous = spawn_fake_rendezvous().await;
+    let mut bob = spawn_client(rendezvous).await;
+
+    // Only alice's laptop is configured - her phone, a separate device
+    // with its own independently-generated key, has no line at all yet.
+    let laptop_target = target_for_device("alice", "laptop", 65050, "every_1h");
+    bob.link.configure_direct_punch("bob".into(), vec![laptop_target.clone()], 30);
+
+    assert_eq!(
+        bob.link.direct_peer(&laptop_target.target_key()),
+        Some(direct_peer_id("alice", Some("laptop"))),
+        "the configured device is reachable, as ever"
+    );
+    assert_eq!(
+        bob.link.direct_status("alice+phone"),
+        None,
+        "the phone has no target_key configured at all - not merely idle or lost, genuinely absent"
+    );
+    assert_eq!(
+        bob.link.direct_peer("alice+phone"),
+        None,
+        "nothing to punch toward, nothing to have an id for"
+    );
+
+    // Reconfiguring with both lines present - exactly what adding the
+    // second, device-suffixed `direct_punch_to` line to settings and
+    // saving does live (`session.rs`'s `SaveDirectPunchTargets` handler,
+    // which re-runs `configure_direct_punch` from the full, updated list)
+    // - makes the phone reachable too, alongside the untouched laptop.
+    let phone_target = target_for_device("alice", "phone", 65051, "every_1h");
+    bob.link.configure_direct_punch(
+        "bob".into(),
+        vec![laptop_target.clone(), phone_target.clone()],
+        30,
+    );
+    assert_eq!(
+        bob.link.direct_peer(&phone_target.target_key()),
+        Some(direct_peer_id("alice", Some("phone"))),
+        "now configured, now reachable"
+    );
+    assert_eq!(
+        bob.link.direct_peer(&laptop_target.target_key()),
+        Some(direct_peer_id("alice", Some("laptop"))),
+        "adding the second line never disturbs the first"
+    );
 }
 
 /// A `ControlSink` that records what would have gone to the server, so a
@@ -603,7 +751,7 @@ async fn a_peer_who_joins_the_server_after_a_direct_link_is_up_gets_only_one_lin
     bob.link
         .configure_direct_punch("bob".into(), vec![target("alice", alice.port, "every_1m")], 30);
 
-    let synthetic = direct_peer_id("bob");
+    let synthetic = direct_peer_id("bob", None);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while !alice.link.is_active(synthetic) {
         assert!(tokio::time::Instant::now() < deadline, "punch timed out");
@@ -707,14 +855,14 @@ fn a_nickname_names_someone_only_once_something_is_pinned_for_it() {
     let mut store = IdStore::new_empty(path);
 
     // Nobody pinned: there is nothing to encrypt to, so no identity.
-    assert!(direct_peer_identity(&store, "bob").is_none());
+    assert!(direct_peer_identity(&store, "bob", None).is_none());
 
     // Pinned, but not a keybundle - what a hand-installed pad contact
     // leaves. The pin names them, which is what lets a pad-only pair exist
     // at all; nothing is sealed to it, and the pad is what proves the
     // claim (`docs/PROTOCOL.md` §7.1.5 step 7, §16.2).
-    store.check_and_pin("bob", b"not-a-pq-bundle");
-    let info = direct_peer_identity(&store, "bob").expect("a pin names someone");
+    store.pin_new_device("bob", "test-device", b"not-a-pq-bundle", aloo::client::idstore::Trust::Tofu);
+    let info = direct_peer_identity(&store, "bob", None).expect("a pin names someone");
     assert!(
         aloo::crypto::pq::fingerprint_of_encoded(&info.public_key_der).is_none(),
         "no envelope can be built for them - only a pad can carry this pair"
@@ -734,7 +882,7 @@ async fn a_direct_targets_nickname_and_live_peers_are_queryable() {
         .link
         .configure_direct_punch("alice".into(), vec![target("bob", 65000, "every_1h")], 30);
 
-    let bob = direct_peer_id("bob");
+    let bob = direct_peer_id("bob", None);
     assert_eq!(alice.link.direct_nickname_of(bob).as_deref(), Some("bob"));
     assert_eq!(alice.link.direct_nickname_of(UserId(7)), None);
     // Nothing is up yet, so there is nobody to announce membership to.
@@ -836,8 +984,8 @@ async fn listing_a_peer_who_has_not_listed_you_opens_no_link_either_way() {
         .link
         .configure_direct_punch("peter".into(), vec![target("omar", 65000, "every_1m")], 30);
 
-    let peter_as_bob_sees_him = direct_peer_id("peter");
-    let bob_as_peter_sees_him = direct_peer_id("bob");
+    let peter_as_bob_sees_him = direct_peer_id("peter", None);
+    let bob_as_peter_sees_him = direct_peer_id("bob", None);
 
     // Drive both for well past a punch window's worth of slots.
     let start = Instant::now();
@@ -892,7 +1040,7 @@ fn a_rotation_carried_on_the_link_verifies_and_installs_like_a_relayed_one() {
     let (bob_pub, bob_priv) = generate_bundle_with_bits(BITS).unwrap();
     let bob_fp = bundle_fingerprint(&bob_pub).unwrap();
     let bob = UserId(0);
-    let alice = direct_peer_id("alice");
+    let alice = direct_peer_id("alice", None);
 
     // Alice rotates the keys she wants bob to encrypt to from now on.
     let mut alice_own = PqOwnKeys::new(alice_priv.bootstrap_decap().clone());

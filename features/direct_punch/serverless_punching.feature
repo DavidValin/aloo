@@ -25,6 +25,26 @@ Feature: Punching a direct link with no server involved
     And marco is punched at "marcohost.com" every 60 minutes
     And a peer named with no port of its own uses the well-known direct punch port
 
+  @AC-320 @direct_otp @without_reachable_server
+  Scenario: A peer may be named by device, addressing one specific machine
+    Then "bob+laptop,203.0.113.9,every_5m" names nickname "bob" device "laptop"
+    And "bob+phone,203.0.113.9,every_5m" names nickname "bob" device "phone"
+    And "bob,203.0.113.9,every_5m" names nickname "bob" with no device
+
+  # Reference table no-server row 6: alice's two devices each hold their
+  # own independently-generated raw key for bob, but only one is
+  # reachable until a second, device-suffixed line names the other -
+  # a configuration gap, not a refusal (docs/PROTOCOL.md 7.1.5's
+  # continuation, device-pinning plan §5a).
+  @AC-321 @direct_otp @without_reachable_server
+  Scenario: A second device stays unreachable until a device-suffixed line is added
+    Given bob lists alice's device "laptop" for direct punching
+    Then bob can reach alice's device "laptop"
+    And bob has no line at all for alice's device "phone"
+    When bob also lists alice's device "phone" for direct punching
+    Then bob can reach alice's device "phone"
+    And bob can still reach alice's device "laptop"
+
   @AC-212
   Scenario: A peer may be named by address or by name, with a port of its own
     Then "bob,203.0.113.9,every_5m" names host "203.0.113.9" on the well-known port

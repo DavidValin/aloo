@@ -1303,7 +1303,7 @@ fn a_reconnect_drops_what_the_old_connection_said_without_marking_anyone_offline
 /// @requirement AC-227
 #[test]
 fn a_reconnect_leaves_direct_punch_peers_exactly_where_they_are() {
-    let direct = aloo::client::p2p::direct_peer_id("bob");
+    let direct = aloo::client::p2p::direct_peer_id("bob", None);
     let mut state = joined_general_with(vec![user(2, "carol")]);
     state.seed_member("general", user(direct.0, "bob"));
 

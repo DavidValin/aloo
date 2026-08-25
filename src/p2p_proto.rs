@@ -259,6 +259,19 @@ pub enum P2pPayload {
         /// about the pad's own gate rather than about this message.
         msg_id: Option<u64>,
         envelope: Envelope,
+        /// The sender's `client::device_id`, in the clear alongside this
+        /// message rather than under the pad - device-pinning plan §5.
+        /// Only meaningful (checked) for a `Direct`-framed (pad-only)
+        /// contact, which has no other channel to carry one over at all;
+        /// a `PqWrapped` pair already learns each other's device through
+        /// the separate sealed `DeviceIdAnnounce` (§4) and ignores this
+        /// field. Exactly as untrusted as the sender's own nickname
+        /// already is over this framing (`p2p_proto`'s own doc on
+        /// `DirectPing`/`DirectPong`) - it narrows which locally-bound
+        /// device a message is accepted from, but never authenticates
+        /// anything on its own; that's still entirely the pad's decrypt
+        /// verdict, checked *after* this field, never before it.
+        sender_device_id: String,
     },
     /// `OtpEnvelope`'s file-offer counterpart, mirroring `FileOffer` -
     /// `envelope`'s single `blocks` element is, exactly like `OtpEnvelope`'s,
@@ -266,7 +279,9 @@ pub enum P2pPayload {
     /// --encrypt`: the offer (filename + size) is a genuine pad spend in
     /// its own right (docs/PROTOCOL.md 16.2). `seq` names *this* pad slot
     /// alone; the file's actual content, once accepted, reserves and acks
-    /// an independent second slot named by `OtpFileContentSeq`.
+    /// an independent second slot named by `OtpFileContentSeq` - itself
+    /// carrying no `sender_device_id` of its own, since it can only ever
+    /// arrive after this offer's own device check already passed.
     OtpFileOffer {
         channel: Option<String>,
         stream_id: u64,
@@ -274,6 +289,8 @@ pub enum P2pPayload {
         /// See `FileOffer::msg_id`.
         msg_id: Option<u64>,
         envelope: Envelope,
+        /// See `OtpEnvelope::sender_device_id`'s doc.
+        sender_device_id: String,
     },
     /// Sent back once an `OtpEnvelope`/`OtpFileOffer` has been unwrapped
     /// *and* successfully delivered locally - the genuine network
@@ -315,6 +332,8 @@ pub enum P2pPayload {
         /// file's is, on the content arriving decrypted.
         msg_id: Option<u64>,
         envelope: Envelope,
+        /// See `OtpEnvelope::sender_device_id`'s doc.
+        sender_device_id: String,
     },
     /// Announces an incoming one-time-pad transfer, before any of it is
     /// sent. Replaces the old per-chunk `pq_hybrid` envelope scheme, which

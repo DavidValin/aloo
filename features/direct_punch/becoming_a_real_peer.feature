@@ -14,16 +14,32 @@ Feature: A punched peer becomes someone I can actually see and talk to
   registered: the nickname on a punch datagram is unauthenticated and names
   nobody. See docs/PROTOCOL.md 7.1.5.
 
-  @AC-215
+  @AC-215 @direct_otp @without_reachable_server
   Scenario: An unauthenticated punch does not make anyone a peer
     Given alice has no pinned identity for "mallory"
     Then "mallory" cannot become an addressable peer
 
-  @AC-215 @AC-259
+  @AC-215 @AC-259 @direct_otp @without_reachable_server
   Scenario: A pin that is not a keybundle still names someone, for the pad to prove
     Given alice has a pinned identity for "bob" that is not a pq_hybrid one
     Then "bob" is named by that pin, but nothing is sealed to it
     And only a pad can prove "bob" is who the pin says
+
+  # No-server reference table row 3: the sender's device_id rides in the
+  # clear alongside every pad-wrapped message, checked before the pad is
+  # ever touched (docs/PROTOCOL.md 16.2, device-pinning plan §5). A copied
+  # pad file used from a second machine is refused, not merged - the exact
+  # same ciphertext still decrypts cleanly once the genuinely bound device
+  # sends it.
+  @AC-317 @direct_otp @without_reachable_server
+  Scenario: A copied pad claimed from a different device is held, not delivered
+    Given alice and bob reach each other directly and hold a pad for each other
+    When alice sends bob "first"
+    Then bob reads it, and registers alice because the pad opened it
+    And bob's acknowledgement proves he decrypted it
+    When alice sends bob "hello from a copied pad" but claims to be device "alices-phone-not-her-laptop"
+    Then bob holds it unread, and the pad stays bound to alice's real device
+    Then bob reads it once alice's real device claims the same message
 
   @AC-214
   Scenario: A punched peer joins the channels we both are in

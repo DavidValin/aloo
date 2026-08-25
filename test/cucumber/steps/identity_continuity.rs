@@ -25,7 +25,18 @@ async fn pinned_under_identity(w: &mut AlooWorld, who: String) {
     let encoded = aloo::proto::encode(&public).expect("encode bundle");
     let path = w.temp_path("continuity-store");
     let mut store = IdStore::new_empty(path);
-    store.check_and_pin(&who, &encoded);
+    store.pin_new_device(&who, "test-device", &encoded, Trust::Tofu);
+    w.id_store = Some(store);
+    w.pinned_bundle = Some(public);
+}
+
+#[given(expr = "{word} is pinned on device {string} under that identity")]
+async fn pinned_under_identity_on_device(w: &mut AlooWorld, who: String, device: String) {
+    let (public, _) = pq_bundle_for(&who);
+    let encoded = aloo::proto::encode(&public).expect("encode bundle");
+    let path = w.temp_path("continuity-store");
+    let mut store = IdStore::new_empty(path);
+    store.pin_new_device(&who, &device, &encoded, Trust::Tofu);
     w.id_store = Some(store);
     w.pinned_bundle = Some(public);
 }
@@ -38,7 +49,7 @@ async fn pinned_under_identity(w: &mut AlooWorld, who: String) {
 async fn confirmed_out_of_band(w: &mut AlooWorld, who: String) {
     let store = w.id_store.as_mut().expect("no store in this scenario");
     assert!(
-        store.mark_verified(&who),
+        store.mark_verified(&who, "test-device"),
         "there must be something pinned to confirm"
     );
 }
@@ -73,8 +84,8 @@ async fn imports_card(w: &mut AlooWorld, _who: String) {
         Some((nickname, bundle)) => {
             let encoded = aloo::proto::encode(bundle).expect("encode bundle");
             let mut store = IdStore::new_empty(path);
-            store.check_and_pin(nickname, &encoded);
-            store.mark_verified(nickname);
+            store.pin_new_device(nickname, "", &encoded, Trust::Verified);
+            store.mark_verified(nickname, "");
             w.id_store = Some(store);
             w.refused = false;
         }
@@ -145,8 +156,56 @@ async fn pin_moves_silently(w: &mut AlooWorld) {
     // no review opened.
     let encoded = aloo::proto::encode(&replacement).expect("encode");
     let store = w.id_store.as_mut().expect("no store");
-    store.check_and_pin("alice", &encoded);
+    store.replace_device_key("alice", "test-device", &encoded);
     assert_eq!(store.get("alice"), Some(encoded.as_slice()));
+}
+
+/// A continuity certificate proves itself even when the new identity is
+/// announced from a *different* device than the one that retired
+/// (device-pinning plan §2, `finalize_identity_pin`'s "no entry for this
+/// device, scan every other device for continuity" case): the old
+/// device's entry is moved wholesale onto the new device id, key and all,
+/// rather than left behind as a stale row.
+#[when(expr = "the new identity connects from device {string}")]
+async fn new_identity_connects_from_device(w: &mut AlooWorld, device: String) {
+    w.target_device = Some(device);
+}
+
+#[then(expr = "the pin moves to device {string} without asking")]
+async fn pin_moves_to_device(w: &mut AlooWorld, new_device: String) {
+    let pinned = w.pinned_bundle.as_ref().expect("nothing pinned").clone();
+    let replacement = w.replacement_bundle.as_ref().expect("no replacement").clone();
+    assert!(verify_continuity(&pinned, &replacement));
+    assert_eq!(
+        w.target_device.as_deref(),
+        Some(new_device.as_str()),
+        "scenario wiring: which device the new identity connects from"
+    );
+
+    // `finalize_identity_pin`'s exact case-3 sequence for a device with no
+    // entry of its own: find the other device the cert verifies against,
+    // replace its key in place, then move that same entry onto the newly
+    // announcing device id - one row, relocated, not a second one added.
+    let encoded = aloo::proto::encode(&replacement).expect("encode");
+    let store = w.id_store.as_mut().expect("no store");
+    let old_device = store
+        .devices_of("alice")
+        .find(|d| d.key == aloo::proto::encode(&pinned).unwrap())
+        .map(|d| d.device_id.clone())
+        .expect("the originally-pinned device must still be present before the move");
+    assert!(store.replace_device_key("alice", &old_device, &encoded));
+    assert!(store.rebind_device("alice", &old_device, &new_device));
+    assert_eq!(store.get_for_device("alice", &new_device), Some(encoded.as_slice()));
+}
+
+#[then(expr = "device {string} no longer has an entry")]
+async fn device_has_no_entry(w: &mut AlooWorld, device: String) {
+    let store = w.id_store.as_ref().expect("no store");
+    assert_eq!(
+        store.get_for_device("alice", &device),
+        None,
+        "the old device id must not be left behind as a stale row once the pin has moved"
+    );
 }
 
 #[then("the stranger cannot prove continuity")]

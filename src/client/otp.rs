@@ -131,8 +131,8 @@ impl OtpOutQueue {
 /// find it. Deriving the name here from `pq` fingerprints alone would have
 /// left such a session reading as active while every message quietly went
 /// out without the pad.
-pub fn contact_name_if_active(session: &SessionState, peer_pubkey_der: &[u8]) -> Option<String> {
-    let contact_name = contact_name_for_peer(session, peer_pubkey_der)?;
+pub fn contact_name_if_active(session: &SessionState, peer: UserId, peer_pubkey_der: &[u8]) -> Option<String> {
+    let contact_name = contact_name_for_peer(session, peer, peer_pubkey_der)?;
     session
         .otp_store
         .get(&contact_name)
@@ -165,7 +165,7 @@ pub fn contact_name_for_sending(
     peer: UserId,
     peer_pubkey_der: &[u8],
 ) -> Option<String> {
-    let contact_name = contact_name_if_active(session, peer_pubkey_der)?;
+    let contact_name = contact_name_if_active(session, peer, peer_pubkey_der)?;
     if framing_for(&session.otp_own_pinned_der, peer_pubkey_der) == OtpFraming::Direct {
         return Some(contact_name);
     }
@@ -377,14 +377,18 @@ pub async fn initiate_provisioning(
     cfg: &OtpCliConfig,
     size_mb: u32,
     own_fp: &[u8; 32],
+    own_device_id: &str,
     peer_fp: &[u8; 32],
+    peer_device_id: &str,
     purpose: crypto::otp::OtpPurpose,
 ) -> Option<crypto::otp::OtpKeySetupPayload> {
     initiate_provisioning_with_progress(
         cfg,
         size_mb,
         own_fp,
+        own_device_id,
         peer_fp,
+        peer_device_id,
         purpose,
         |_, _| {},
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -396,11 +400,14 @@ pub async fn initiate_provisioning(
 /// what `confirm_generate`'s background task drives the spinner popup
 /// from. Only the `otp --new-key-pair` step reports: it is the one that
 /// scales with `size_mb`, and so the only one worth watching.
+#[allow(clippy::too_many_arguments)]
 pub async fn initiate_provisioning_with_progress(
     cfg: &OtpCliConfig,
     size_mb: u32,
     own_fp: &[u8; 32],
+    own_device_id: &str,
     peer_fp: &[u8; 32],
+    peer_device_id: &str,
     purpose: crypto::otp::OtpPurpose,
     on_progress: impl FnMut(u64, u64),
     cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -411,8 +418,12 @@ pub async fn initiate_provisioning_with_progress(
     // other step here - generation, staging, digesting - has no idea
     // purpose exists at all.
     let contact_name = match purpose {
-        crypto::otp::OtpPurpose::Live => crypto::otp::contact_name_for(own_fp, peer_fp),
-        crypto::otp::OtpPurpose::Mail => crypto::otp::contact_name_for_mail(own_fp, peer_fp),
+        crypto::otp::OtpPurpose::Live => {
+            crypto::otp::contact_name_for(own_fp, own_device_id, peer_fp, peer_device_id)
+        }
+        crypto::otp::OtpPurpose::Mail => {
+            crypto::otp::contact_name_for_mail(own_fp, own_device_id, peer_fp, peer_device_id)
+        }
     };
     let name_a = format!("{contact_name}_a");
     let name_b = format!("{contact_name}_b");
@@ -707,8 +718,8 @@ pub async fn handle_provisioning_command(
     }
 
     let contact_name = match purpose {
-        crypto::otp::OtpPurpose::Live => contact_name_for_peer(session, &peer_pubkey_der),
-        crypto::otp::OtpPurpose::Mail => contact_name_for_peer_mail(session, &peer_pubkey_der),
+        crypto::otp::OtpPurpose::Live => contact_name_for_peer(session, peer, &peer_pubkey_der),
+        crypto::otp::OtpPurpose::Mail => contact_name_for_peer_mail(session, peer, &peer_pubkey_der),
     };
     let Some(contact_name) = contact_name else {
         notify(
@@ -1037,6 +1048,22 @@ pub(crate) async fn confirm_generate(
         );
         return Ok(());
     };
+    // A fresh pad's name is device-qualified (device-pinning plan §4), so
+    // both device_ids must be known before generation can even be named -
+    // their device_id arrives via `DeviceIdAnnounce`, which requires the
+    // same `Active` link this whole handshake already does, so this is
+    // normally already resolved by the time a user can reach this popup.
+    let Some(peer_device_id) = session.peer_device_ids.get(&pending.peer).cloned() else {
+        notify(
+            ui_state,
+            pending.peer,
+            &pending.peer_name,
+            "OTP session failed: this peer's device is not known yet - try again in a moment"
+                .to_string(),
+            false,
+        );
+        return Ok(());
+    };
 
     // Refused before generation, not after. `otp --new-key-pair` writes
     // four files of `size_mb` each (both halves into both correspondents'
@@ -1079,7 +1106,7 @@ pub(crate) async fn confirm_generate(
     // can weigh. Asking once the pad is already on their machine is asking
     // when refusing saves nobody anything. It also stops this side
     // spending the same cost on a pad that is about to be declined.
-    let contact_name = crypto::otp::contact_name_for(&own_fp, &peer_fp);
+    let contact_name = crypto::otp::contact_name_for(&own_fp, &session.own_device_id, &peer_fp, &peer_device_id);
     if !send_session_request(
         wr,
         session,
@@ -1110,7 +1137,11 @@ pub(crate) async fn begin_promised_generation(
     size_mb: u32,
 ) {
     let own_fp = session.own_pq_fp;
+    let own_device_id = session.own_device_id.clone();
     let Some(peer_fp) = crypto::pq::fingerprint_of_encoded(&pending.pubkey_der) else {
+        return;
+    };
+    let Some(peer_device_id) = session.peer_device_ids.get(&pending.peer).cloned() else {
         return;
     };
     ui_state.open_otp_keygen(pending.peer, pending.peer_name.clone(), size_mb, pending.purpose);
@@ -1130,7 +1161,9 @@ pub(crate) async fn begin_promised_generation(
             &cfg,
             size_mb,
             &own_fp,
+            &own_device_id,
             &peer_fp,
+            &peer_device_id,
             pending.purpose,
             move |written, total| {
                 let _ = progress_tx.send(OtpKeygenEvent::Progress {
@@ -2121,7 +2154,7 @@ pub async fn handle_end_otp_command(
         .get(&peer)
         .map(|u| u.name.clone())
         .unwrap_or_default();
-    let Some(contact_name) = contact_name_for_peer(session, &peer_pubkey_der) else {
+    let Some(contact_name) = contact_name_for_peer(session, peer, &peer_pubkey_der) else {
         notify(
             ui_state,
             peer,
@@ -2331,6 +2364,7 @@ async fn send_end_notice_now(
                 seq,
                 msg_id: None,
                 envelope,
+                sender_device_id: session.own_device_id.clone(),
             },
         );
         return;
@@ -2639,28 +2673,51 @@ pub(crate) async fn poll_key_status(session: &SessionState, ui_state: &mut UiSta
     else {
         return;
     };
-    let Some(contact_name) = contact_name_if_active(session, &peer_pubkey) else {
+    let Some(contact_name) = contact_name_if_active(session, peer, &peer_pubkey) else {
         return;
     };
     refresh_otp_key_status(&session.otp_cli_cfg, ui_state, peer, &contact_name).await;
 }
 
 /// The `otp` keychain contact name to file this peer's pad under, derived
-/// from their announced `public_key_der`.
+/// from their announced `public_key_der` and, for a `PqWrapped` pair,
+/// both sides' device_id.
 ///
 /// Two derivations, and which one applies is exactly this pair's
 /// `OtpFraming`: a readable `pq_hybrid` bundle on their side gives a
-/// fingerprint-derived name both machines compute identically, and a peer
-/// without one falls back to the two pinned public keys. Never the
-/// nickname, which proves nothing and would let an impersonator taking a
-/// familiar name spend the real contact's pad - spending pad on the wrong
-/// person destroys it for the right one, since the bytes are gone whether
-/// or not they could read them (`crypto::otp::contact_name_for_keys`).
-pub(crate) fn contact_name_for_peer(session: &SessionState, peer_pubkey_der: &[u8]) -> Option<String> {
+/// fingerprint-and-device-derived name both machines compute identically
+/// (device-pinning plan §4 - own device_id from `SessionState::
+/// own_device_id`, the peer's from `SessionState::peer_device_ids`,
+/// populated by `DeviceIdAnnounce` before any OTP action can reach this
+/// point, since both require the same P2P link `Active`), and a peer
+/// without one falls back to the two pinned public keys, deliberately
+/// left device-unqualified (§5 - a raw pad is a single instance per
+/// key-pair, not per device-pair). Never the nickname, which proves
+/// nothing and would let an impersonator taking a familiar name spend the
+/// real contact's pad - spending pad on the wrong person destroys it for
+/// the right one, since the bytes are gone whether or not they could read
+/// them (`crypto::otp::contact_name_for_keys`).
+///
+/// `None` for a `PqWrapped` pair whose device_id hasn't resolved yet (a
+/// brief window right after the link reaches `Active`, before their
+/// `DeviceIdAnnounce` has decrypted) - OTP simply reads as "not yet
+/// ready" rather than naming a slot that would disagree with what the
+/// peer computes once their announce does arrive.
+pub(crate) fn contact_name_for_peer(
+    session: &SessionState,
+    peer: UserId,
+    peer_pubkey_der: &[u8],
+) -> Option<String> {
     match framing_for(&session.otp_own_pinned_der, peer_pubkey_der) {
         OtpFraming::PqWrapped => {
             let peer_fp = crypto::pq::fingerprint_of_encoded(peer_pubkey_der)?;
-            Some(crypto::otp::contact_name_for(&session.own_pq_fp, &peer_fp))
+            let peer_device_id = session.peer_device_ids.get(&peer)?;
+            Some(crypto::otp::contact_name_for(
+                &session.own_pq_fp,
+                &session.own_device_id,
+                &peer_fp,
+                peer_device_id,
+            ))
         }
         OtpFraming::Direct => Some(crypto::otp::contact_name_for_keys(
             &session.otp_own_pinned_der,
@@ -2675,12 +2732,19 @@ pub(crate) fn contact_name_for_peer(session: &SessionState, peer_pubkey_der: &[u
 /// spends the pad a live `/otp` session would.
 pub(crate) fn contact_name_for_peer_mail(
     session: &SessionState,
+    peer: UserId,
     peer_pubkey_der: &[u8],
 ) -> Option<String> {
     match framing_for(&session.otp_own_pinned_der, peer_pubkey_der) {
         OtpFraming::PqWrapped => {
             let peer_fp = crypto::pq::fingerprint_of_encoded(peer_pubkey_der)?;
-            Some(crypto::otp::contact_name_for_mail(&session.own_pq_fp, &peer_fp))
+            let peer_device_id = session.peer_device_ids.get(&peer)?;
+            Some(crypto::otp::contact_name_for_mail(
+                &session.own_pq_fp,
+                &session.own_device_id,
+                &peer_fp,
+                peer_device_id,
+            ))
         }
         OtpFraming::Direct => Some(crypto::otp::contact_name_for_keys_mail(
             &session.otp_own_pinned_der,
@@ -2834,6 +2898,20 @@ pub(crate) fn recover_padded_otp_bytes(
 /// material is actually spent, only ever for a sender already identified
 /// (the ordinary caller has one from `otp_sender_of`; the unknown-nickname
 /// scan has one because `recover_padded_otp_bytes` already proved it).
+///
+/// `claimed_device_id` is checked against this contact's
+/// `OtpContactState::bound_peer_device_id` *before* `unwrap_incoming` is
+/// ever called (device-pinning plan §5) - the whole reason this lives
+/// here rather than in a caller: `otp --decrypt` is destructive the
+/// instant it runs, so the check has to happen strictly before it, at the
+/// one place every caller of this function funnels through. A mismatch
+/// costs nothing but a wasted network round trip for whoever sent it -
+/// the pad's own offset is never touched, so their retry (unchanged, per
+/// the stop-and-wait gate) will succeed the moment the actually-bound
+/// device answers instead. A `PqWrapped` contact's name is already
+/// device-qualified (§4), so this never has anything to disagree with in
+/// practice for one - binding still runs, harmlessly, rather than adding
+/// a framing-specific branch here.
 pub(crate) async fn finish_opening_otp_envelope(
     session: &mut SessionState,
     ui_state: &mut UiState,
@@ -2842,7 +2920,23 @@ pub(crate) async fn finish_opening_otp_envelope(
     contact_name: &str,
     channel: Option<&str>,
     padded: &[u8],
+    claimed_device_id: &str,
 ) -> Option<(Vec<u8>, crypto::otp::AckProof)> {
+    if let Some(bound) = session.otp_store.bound_peer_device_id(contact_name)
+        && bound != claimed_device_id
+    {
+        notify(
+            ui_state,
+            from,
+            from_name,
+            format!(
+                "OTP: a message from {from_name} claims a different device than this pad is \
+                 bound to - held, not delivered, until the right device answers"
+            ),
+            false,
+        );
+        return None;
+    }
     let (inner, proof) = match unwrap_incoming(&session.otp_cli_cfg, padded, contact_name).await {
         UnwrapOutcome::Ok(bytes, proof) => (bytes, proof),
         UnwrapOutcome::Rejected(reason) => {
@@ -2866,6 +2960,14 @@ pub(crate) async fn finish_opening_otp_envelope(
         }
         UnwrapOutcome::Failed => return None,
     };
+    // A genuine decrypt just succeeded under this contact's pad - proof,
+    // not a bare claim, that `claimed_device_id` really does hold it.
+    // Binds it the first time (a no-op once already bound to this same
+    // device); a mismatch was already refused above, before this ever ran.
+    session
+        .otp_store
+        .bind_peer_device(contact_name, claimed_device_id);
+    let _ = session.otp_store.save();
     let inner: OtpInner = proto::decode(&inner).ok()?;
     // The check the seal's own binding would have made, moved inside the
     // pad along with the value it is about: a channel message replayed as
@@ -2921,6 +3023,7 @@ async fn recover_orphaned_decrypt(
     Some((payload.to_vec(), crypto::otp::ack_proof_for(nonce)))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn open_otp_envelope(
     session: &mut SessionState,
     ui_state: &mut UiState,
@@ -2930,9 +3033,20 @@ async fn open_otp_envelope(
     contact_name: &str,
     channel: Option<&str>,
     envelope: &Envelope,
+    claimed_device_id: &str,
 ) -> Option<(Vec<u8>, crypto::otp::AckProof)> {
     let padded = recover_padded_otp_bytes(session, from, sender, envelope)?;
-    finish_opening_otp_envelope(session, ui_state, from, from_name, contact_name, channel, &padded).await
+    finish_opening_otp_envelope(
+        session,
+        ui_state,
+        from,
+        from_name,
+        contact_name,
+        channel,
+        &padded,
+        claimed_device_id,
+    )
+    .await
 }
 
 /// The chunk-transport key for an OTP content stream - a file's content
@@ -3010,7 +3124,8 @@ pub(crate) fn otp_sender_of(
         return Some(known.clone());
     }
     let nickname = session.peer_link.direct_nickname_of(from)?;
-    crate::client::session::direct_peer_identity(&session.id_store, &nickname)
+    let device_id = session.peer_link.direct_device_id_of(from);
+    crate::client::session::direct_peer_identity(&session.id_store, &nickname, device_id.as_deref())
 }
 
 /// Records a sender the pad has just vouched for, so the rest of the app
@@ -3166,6 +3281,7 @@ async fn send_now(
     let _ = session.otp_store.save();
     refresh_otp_key_status(&session.otp_cli_cfg, ui_state, to, contact_name).await;
     session.peer_link.ensure_link(wr, to).await;
+    let own_device_id = session.own_device_id.clone();
     session.peer_link.send_reliable_or_queue(
         to,
         P2pPayload::OtpEnvelope {
@@ -3173,6 +3289,7 @@ async fn send_now(
             seq,
             msg_id,
             envelope: otp_envelope,
+            sender_device_id: own_device_id,
         },
     );
     if let Some(msg_id) = msg_id {
@@ -3471,6 +3588,7 @@ pub async fn send_file_offer(
         },
     );
     session.peer_link.ensure_link(wr, to).await;
+    let own_device_id = session.own_device_id.clone();
     session.peer_link.send_reliable_or_queue(
         to,
         P2pPayload::OtpFileOffer {
@@ -3479,6 +3597,7 @@ pub async fn send_file_offer(
             seq,
             msg_id: Some(msg_id),
             envelope: otp_envelope,
+            sender_device_id: own_device_id,
         },
     );
     ui_state.mark_awaiting_pad_ack(to, msg_id);
@@ -3647,6 +3766,7 @@ pub async fn send_voice_offer(
     );
     session.peer_link.ensure_link(wr, to).await;
     let msg_id = ui_state.own_stream_msg_id(stream_id);
+    let own_device_id = session.own_device_id.clone();
     session.peer_link.send_reliable_or_queue(
         to,
         P2pPayload::OtpVoiceOffer {
@@ -3654,6 +3774,7 @@ pub async fn send_voice_offer(
             seq,
             msg_id,
             envelope,
+            sender_device_id: own_device_id,
         },
     );
     if let Some(msg_id) = msg_id {
@@ -3691,6 +3812,7 @@ pub async fn on_message(
     // (`client::tui::ui::DeliveryProof`).
     msg_id: Option<u64>,
     envelope: Envelope,
+    sender_device_id: String,
 ) -> proto::Result<()> {
     let Some(sender) = otp_sender_of(session, ui_state, from) else {
         // `otp_sender_of` fails for exactly two reasons: `direct_nickname_of`
@@ -3719,7 +3841,7 @@ pub async fn on_message(
         }
         return Ok(());
     };
-    let Some(contact_name) = contact_name_for_peer(session, &sender.public_key_der) else {
+    let Some(contact_name) = contact_name_for_peer(session, from, &sender.public_key_der) else {
         return Ok(());
     };
     // Text and the two session-control payloads all arrive this way; the
@@ -3770,6 +3892,7 @@ pub async fn on_message(
         &contact_name,
         channel.as_deref(),
         &envelope,
+        &sender_device_id,
     )
     .await
     else {
@@ -3906,11 +4029,12 @@ pub async fn on_file_offer(
     stream_id: u64,
     seq: u64,
     envelope: Envelope,
+    sender_device_id: String,
 ) {
     let Some(sender) = otp_sender_of(session, ui_state, from) else {
         return;
     };
-    let Some(contact_name) = contact_name_for_peer(session, &sender.public_key_der) else {
+    let Some(contact_name) = contact_name_for_peer(session, from, &sender.public_key_der) else {
         return;
     };
     if envelope.content != Content::FileOffer {
@@ -3943,6 +4067,7 @@ pub async fn on_file_offer(
         // binding (`OtpInner`).
         None,
         &envelope,
+        &sender_device_id,
     )
     .await
     else {
@@ -4012,11 +4137,12 @@ pub async fn on_voice_offer(
     stream_id: u64,
     seq: u64,
     envelope: Envelope,
+    sender_device_id: String,
 ) {
     let Some(sender) = otp_sender_of(session, ui_state, from) else {
         return;
     };
-    let Some(contact_name) = contact_name_for_peer(session, &sender.public_key_der) else {
+    let Some(contact_name) = contact_name_for_peer(session, from, &sender.public_key_der) else {
         return;
     };
     if envelope.content != Content::VoiceOffer {
@@ -4048,6 +4174,7 @@ pub async fn on_voice_offer(
         // Always a DM - voice-under-OTP has no channel path.
         None,
         &envelope,
+        &sender_device_id,
     )
     .await
     else {
@@ -4131,7 +4258,7 @@ pub async fn on_delivery_ack(
     let Some(sender) = otp_sender_of(session, ui_state, from) else {
         return Ok(());
     };
-    let Some(contact_name) = contact_name_for_peer(session, &sender.public_key_der) else {
+    let Some(contact_name) = contact_name_for_peer(session, from, &sender.public_key_der) else {
         return Ok(());
     };
     // Read before `record_acked` clears the gate: whether the send being
@@ -4692,7 +4819,7 @@ pub async fn on_content_seq(
     let Some(sender) = otp_sender_of(session, ui_state, from) else {
         return;
     };
-    let Some(contact_name) = contact_name_for_peer(session, &sender.public_key_der) else {
+    let Some(contact_name) = contact_name_for_peer(session, from, &sender.public_key_der) else {
         return;
     };
     if !session.otp_store.is_next_expected(&contact_name, seq) {
@@ -4741,7 +4868,7 @@ fn peer_for_contact_name(
     contact_name: &str,
 ) -> Option<(UserId, Vec<u8>)> {
     ui_state.known_users.iter().find_map(|(id, info)| {
-        if contact_name_for_peer(session, &info.public_key_der).as_deref() == Some(contact_name) {
+        if contact_name_for_peer(session, *id, &info.public_key_der).as_deref() == Some(contact_name) {
             Some((*id, info.public_key_der.clone()))
         } else {
             None
@@ -5039,6 +5166,7 @@ async fn recover_and_resend_envelope(
         return Ok(());
     };
     session.peer_link.ensure_link(wr, to).await;
+    let own_device_id = session.own_device_id.clone();
     session.peer_link.send_reliable_or_queue(
         to,
         P2pPayload::OtpEnvelope {
@@ -5046,6 +5174,7 @@ async fn recover_and_resend_envelope(
             seq,
             msg_id,
             envelope,
+            sender_device_id: own_device_id,
         },
     );
     Ok(())
@@ -5092,6 +5221,7 @@ async fn recover_and_resend_file_offer(
     };
     let msg_id = ui_state.own_stream_msg_id(stream_id);
     session.peer_link.ensure_link(wr, to).await;
+    let own_device_id = session.own_device_id.clone();
     session.peer_link.send_reliable_or_queue(
         to,
         P2pPayload::OtpFileOffer {
@@ -5100,6 +5230,7 @@ async fn recover_and_resend_file_offer(
             seq,
             msg_id,
             envelope,
+            sender_device_id: own_device_id,
         },
     );
     Ok(())
@@ -5200,6 +5331,7 @@ async fn recover_and_resend_voice_offer(
     };
     let msg_id = ui_state.own_stream_msg_id(stream_id);
     session.peer_link.ensure_link(wr, to).await;
+    let own_device_id = session.own_device_id.clone();
     session.peer_link.send_reliable_or_queue(
         to,
         P2pPayload::OtpVoiceOffer {
@@ -5207,6 +5339,7 @@ async fn recover_and_resend_voice_offer(
             seq,
             msg_id,
             envelope,
+            sender_device_id: own_device_id,
         },
     );
     Ok(())
@@ -5541,7 +5674,7 @@ pub(crate) fn cancel_pad(session: &mut SessionState, ui_state: &mut UiState, pee
     }
 
     // The sender's own generated halves, which outlive `.tmp/` by design.
-    if let Some(contact) = contact_name_for_peer(session, &peer_pubkey_der_of(ui_state, peer)) {
+    if let Some(contact) = contact_name_for_peer(session, peer, &peer_pubkey_der_of(ui_state, peer)) {
         if session
             .otp_store
             .get(&contact)
@@ -5556,7 +5689,7 @@ pub(crate) fn cancel_pad(session: &mut SessionState, ui_state: &mut UiState, pee
     }
     session.otp_cancelled.remove(&peer);
     ui_state.close_otp_keygen_for(peer);
-    if let Some(contact) = contact_name_for_peer(session, &peer_pubkey_der_of(ui_state, peer)) {
+    if let Some(contact) = contact_name_for_peer(session, peer, &peer_pubkey_der_of(ui_state, peer)) {
         // A promise still waiting on their answer is abandoned too - the
         // answer, if it ever comes, must not start generating a pad the
         // user has just cancelled.

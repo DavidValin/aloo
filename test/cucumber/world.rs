@@ -166,6 +166,20 @@ pub struct AlooWorld {
     /// Why the last deliberate reconnect attempt was refused.
     pub reconnect_failure: Option<String>,
     pub clients: HashMap<String, ClientState>,
+    /// Real `run_daemon_session`s against a real server, keyed by
+    /// nickname - the multi-session counterpart of `session`/
+    /// `session_input` above, for scenarios that need two real peers
+    /// live at once (device-pinning plan §2's live orchestration,
+    /// docs/TESTING.md's "device id/last-seen orchestration" gap).
+    pub daemons: HashMap<String, crate::steps::identity_live::LiveDaemon>,
+    /// A live daemon's id_store path, seeded before its session starts
+    /// (`identity_live.rs`'s pre-existing-mismatch steps), keyed by whose
+    /// session it belongs to; carries the device_id it was seeded under
+    /// along for reference.
+    pub pending_id_store: HashMap<String, (std::path::PathBuf, String)>,
+    /// A live daemon's id_store, reloaded fresh from disk once its
+    /// session ended, keyed by whose session it was.
+    pub ended_id_stores: HashMap<String, IdStore>,
 
     // -- encryption ----------------------------------------------------
     pub plaintext: Vec<u8>,
@@ -206,6 +220,9 @@ pub struct AlooWorld {
     pub replacement_bundle: Option<aloo::crypto::pq::PqPublicBundle>,
     /// A card being exported, shared and imported.
     pub identity_card: Option<aloo::crypto::pq::IdentityCard>,
+    /// Which device a continuity-proven identity announced from
+    /// (device-pinning plan §2's cross-device continuity case).
+    pub target_device: Option<String>,
 
     // -- serverless direct punch (US-037) ------------------------------
     /// The settings file a scenario just loaded.
@@ -230,6 +247,12 @@ pub struct AlooWorld {
     pub direct_current_channels: Vec<String>,
     /// The last reconciliation's (shared, joining, leaving).
     pub direct_reconciled: Option<(Vec<String>, Vec<String>, Vec<String>)>,
+    /// Each client's accumulated `direct_punch_to` lines, keyed by whose
+    /// config it is - reference table no-server row 6's "adding a second,
+    /// device-suffixed line" needs the *whole* list re-applied each time,
+    /// exactly what `SaveDirectPunchTargets` does live, not one line
+    /// appended in isolation.
+    pub direct_punch_lines: HashMap<String, Vec<aloo::settings::DirectPunchTarget>>,
 
     // -- control channel -----------------------------------------------
     pub control_offer: Option<aloo::control::ControlOffer>,
@@ -270,8 +293,20 @@ pub struct AlooWorld {
 
     // -- identity pinning ----------------------------------------------
     pub id_store: Option<IdStore>,
-    pub id_check: Option<aloo::client::idstore::IdCheck>,
+    pub id_check: Option<aloo::client::idstore::KeyCheck>,
     pub temp_files: Vec<std::path::PathBuf>,
+    /// Per-perspective identity stores for reference-table scenarios that
+    /// need two independent points of view at once (each key here names
+    /// *whose* store it is, not who is pinned in it) - device-pinning plan
+    /// §7's "Server introduces" rows 3-5, kept separate from the single-
+    /// perspective `id_store` above every other identity scenario shares.
+    pub id_stores: HashMap<String, IdStore>,
+
+    /// A pad-only send that was claimed under a spoofed device_id and
+    /// therefore refused pre-decrypt (device-pinning plan §5) - kept so a
+    /// later step can redeliver the identical ciphertext under the real
+    /// device's honest claim and show it still decrypts cleanly.
+    pub held_otp_message: Option<(u64, Option<u64>, aloo::proto::Envelope)>,
 
     // -- IP ban list (US-046) --------------------------------------------
     pub ip_bans: Option<aloo::client::ip_ban::IpBanList>,
