@@ -138,9 +138,93 @@ jobs:
             ${{ matrix.artifact }}.tar.gz
             ${{ matrix.artifact }}.zip
 
+  build-freebsd:
+    name: Build (x86_64-unknown-freebsd)
+    needs: guard
+    if: needs.guard.outputs.ok == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build in FreeBSD VM
+        uses: vmactions/freebsd-vm@v1
+        with:
+          arch: x86_64
+          prepare: |
+            pkg install -y rust pkgconf alsa-lib
+          run: |
+            cd $GITHUB_WORKSPACE
+            cargo build --release --locked
+            mkdir -p staging
+            cp target/release/aloo staging/aloo
+            chmod +x staging/aloo
+            tar -czf aloo-x86_64_freebsd.tar.gz -C staging aloo
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aloo-x86_64_freebsd
+          path: aloo-x86_64_freebsd.tar.gz
+
+  build-netbsd:
+    name: Build (x86_64-unknown-netbsd)
+    needs: guard
+    if: needs.guard.outputs.ok == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build in NetBSD VM
+        uses: vmactions/netbsd-vm@v1
+        with:
+          arch: x86_64
+          prepare: |
+            /usr/sbin/pkg_add -u rust pkgconf alsa-lib
+          run: |
+            cd $GITHUB_WORKSPACE
+            cargo build --release --locked
+            mkdir -p staging
+            cp target/release/aloo staging/aloo
+            chmod +x staging/aloo
+            tar -czf aloo-x86_64_netbsd.tar.gz -C staging aloo
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aloo-x86_64_netbsd
+          path: aloo-x86_64_netbsd.tar.gz
+
+  build-openbsd:
+    name: Build (x86_64-unknown-openbsd)
+    needs: guard
+    if: needs.guard.outputs.ok == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build in OpenBSD VM
+        uses: vmactions/openbsd-vm@v1
+        with:
+          arch: x86_64
+          prepare: |
+            pkg_add rust
+          run: |
+            cd $GITHUB_WORKSPACE
+            cargo build --release --locked
+            mkdir -p staging
+            cp target/release/aloo staging/aloo
+            chmod +x staging/aloo
+            tar -czf aloo-x86_64_openbsd.tar.gz -C staging aloo
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aloo-x86_64_openbsd
+          path: aloo-x86_64_openbsd.tar.gz
+
   release:
     name: Create release & upload assets
-    needs: [guard, build]
+    needs: [guard, build, build-freebsd, build-netbsd, build-openbsd]
     if: always() && needs.guard.result == 'success'
     runs-on: ubuntu-latest
     steps:
