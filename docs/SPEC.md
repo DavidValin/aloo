@@ -109,6 +109,22 @@ remember or re-pass the original flags. `server_ssl`/
 value) on the very first start and never touched by a flag at all - an
 operator edits them in the settings file directly.
 
+Three more settings, all optional and all read only at startup, same as
+the ones above (`docs/PROTOCOL.md` §5.5, §6.7, §6.8):
+
+- **`server_allow_create_public_channels`** (default on) - when off, a
+  user may still join an existing public channel or create/join a
+  private one; only minting a brand-new public channel is refused.
+- **`server_channel_deletion_unactivity_period`** (`30days`, `2weeks`,
+  `1month`, ...; unset by default) - an empty channel is swept away only
+  once nobody has (re)joined it for this whole period. Left unset, an
+  empty channel simply persists forever, the same way the default
+  channel `the-hall` always has.
+- **`server_superadmin`** (one nickname per line, like `muted_voice`) -
+  accounts that may run `/activate`, `/deactivate`, `/remove-account` and
+  `/remove-channel` (Functionality #26) against anyone on this server,
+  over the wire, without shell access to the machine it runs on.
+
 ## UI
 
 ### Not connected UI
@@ -247,7 +263,18 @@ When a channel is joined, the join is broadcast to all users already in the chan
 
 **The channel directory (`/channels`).** Typing `/channels` and pressing Enter opens a modal listing every public channel the server has announced, the ones the user is already in shown in yellow. Up/Down move the selection (wrapping at both ends), Enter joins the selected channel and closes the modal (on one already joined it just brings that channel to the front of the channel selector), Escape closes it without joining anything.
 
-**Leaving a channel.** Typing `/leave` and pressing Enter leaves whichever channel the channel selector currently names (no argument — it's never a different one) and drops it from that selector, public or private alike: the selector holds exactly the channels the user is in. A public channel stays in the `/channels` directory, to rejoin from whenever. Every channel other than the default (`the-hall`) is unregistered from the server the instant its last member leaves it, public or private alike; `the-hall` itself is never removed, even with no members — a later `JoinChannel` for a since-deleted channel simply recreates it fresh (`docs/PROTOCOL.md` §6.2).
+**Leaving a channel.** Typing `/leave` and pressing Enter leaves whichever channel the channel selector currently names (no argument — it's never a different one) and drops it from that selector, public or private alike: the selector holds exactly the channels the user is in. A public channel stays in the `/channels` directory, to rejoin from whenever. Emptying a channel no longer deletes it outright: it persists, with its admin, bans and join-lock all intact, until `server_channel_deletion_unactivity_period` elapses with nobody having (re)joined it in that time — or forever, if that setting is left unconfigured, the same way `the-hall` has always persisted while empty (`docs/PROTOCOL.md` §6.8). A channel does still disappear sooner if its admin runs `/delete-channel`, or a superadmin removes it - see "Channel ownership and moderation" below. Either way, a later `JoinChannel` for a since-removed channel simply recreates it fresh, with whoever joins first as its new admin.
+
+**Channel ownership and moderation.** Whoever's join actually creates a channel - public or private - becomes its admin, shown in the message pane's title as `#name (admin: nickname)`, and marked with a leading ☀️ in that channel's own sidebar. `the-hall` is the one permanent exception: it has no admin, ever. The admin can:
+
+- **`/delete-channel`** (no argument, targets the channel currently selected) - public channels only; a confirmation popup asks first. Every member is told it's gone and its tab disappears; the name is free to recreate immediately.
+- **`/ban <nickname>`** / **`/unban <nickname>`** - force-removes a member and refuses their future joins until unbanned; both the banned person and everyone else in the channel are told.
+- **`/lock-joins`** - opens a popup prefilled with the current members, editable as a specific allowlist or switched to "All users" to clear it. Applying takes effect immediately for *future* joins only: a current member is never evicted just because a narrower list no longer names them, and the admin can always rejoin their own channel regardless of the list.
+- **`/assign-admin <nickname>`** - hands off admin to a fellow current member (who must already be a member) and releases the caller's own admin rights over it, behind a confirmation popup.
+
+Pressing `i` on a channel's admin reports `☀️ admin of #<name>`, in addition to whatever the user-info popup already shows. Full model in `docs/PROTOCOL.md` §6.7.
+
+**Server superadmins.** A short list of trusted accounts (`server_superadmin`) can act on any account or public channel, over the wire, without shell access to the server. Pressing `i` on a superadmin reports `<nickname> is a ⚡ superadmin`, and their name is marked with a leading ⚡ in every channel they're in - not just one they administer. Full model in `docs/PROTOCOL.md` §5.5, and Functionality #26.
 
 ## Functionality
 
@@ -451,6 +478,14 @@ When a channel is joined, the join is broadcast to all users already in the chan
 
 24. **Unread OTP mail in the header.** Every received mail is unread from the moment it arrives until its reader is opened; while at least one still is, the header shows a blinking ✉ followed by `<n> unread OTP Mails`, ahead of the direct-punch/Conn/CPU indicators. Nothing is shown once every received mail has been read. The flag is persisted (`~/.aloo/otp_mail`'s index), so the count survives a restart; a mail stored before this concept existed loads as already read.
 
+25. **Channel ownership and moderation.** Full model in `docs/PROTOCOL.md` §6.7; see "Channel ownership and moderation" under Channels above for `/delete-channel`, `/ban`, `/unban`, `/lock-joins` and `/assign-admin`. Every one of these needs a server - there is nobody to enforce a ban, a lock, or an admin handoff against an uncooperative peer without one - and each is refused with a clear status-line message in `--no-server` mode.
+
+26. **Server superadmins.** Full model in `docs/PROTOCOL.md` §5.5; see "Server superadmins" under Channels above. Whoever is listed in `server_superadmin` can run, over the wire:
+    - **`/deactivate <nickname> <reason>`** - blocks that account's next login (shown to them in red, quoting the reason) and, if they're currently connected, takes over their session immediately with a full-screen red modal - `Your account has been deactivated ("<reason>")` - the only key it answers is Escape, which closes aloo.
+    - **`/activate <nickname>`** - reverses a `/deactivate`, or clears a still-pending email activation code - the same underlying "make this account able to log in right now," reached either way.
+    - **`/remove-account <nickname>`** - deletes the account outright and removes every channel it administers, notifying that channel's members ("the channel has been removed by the admin").
+    - **`/remove-channel <name>`** - removes any public channel regardless of who administers it (`the-hall` excepted, even for a superadmin). There is no equivalent for a private channel: its existence is never advertised outside its own membership, so a superadmin who isn't already in one has no name to act on.
+
 
 ## Running in background mode
 
@@ -652,11 +687,11 @@ Otherwise it reuses whatever you last connected with (`~/.aloo/.cache`).
 ### Logging in
 
 ```sh
-aloo --daemon --server-pwd=SECRET   # the nickname's password on this server
+aloo --daemon --nick-pwd=SECRET   # the nickname's password on this server
 aloo --daemon --ssl                 # dial over TLS (server_ssl=on)
 ```
 
-`--server-pwd` is the one credential a headless start needs; with a
+`--nick-pwd` is the one credential a headless start needs; with a
 server named but no password anywhere (flag or `daemon_server_password`
 in settings), the daemon refuses to start rather than dialling in with an
 empty one - a serverless start (`--no-server`) is the one exception, since
@@ -746,7 +781,7 @@ plays a tone, raises a notification, writes the reason to
 `~/.aloo/daemon.log`, and exits non-zero. It is fatal when:
 
 - the server is unreachable, or the host does not resolve;
-- authentication is rejected (wrong `--server-pwd`, or none given);
+- authentication is rejected (wrong `--nick-pwd`, or none given);
 - the nickname is already taken;
 - the keybundle cannot be read;
 - **every** configured channel failed to join;
@@ -900,7 +935,7 @@ one-time-pad session kept up with alice:
 ```sh
 aloo --daemon \
   --host=chat.example.com \
-  --server-pwd=SECRET \
+  --nick-pwd=SECRET \
   --nick=david \
   --channels=team,ops:hunter2 \
   --initial-focus=alice \
@@ -1190,7 +1225,9 @@ here that implements it. If a name changes on one side, it changes on both.
 | Reconnecting (§4.2) | `client/reconnect.rs` `ServerSink`, `ServerEvent`, `ServerLinkState`, `ReconnectPlan`, `spawn_supervisor`, `delay_after`, `RECONNECT_FIRST_DELAY`, `RECONNECT_MAX_DELAY`, `SERVER_DOWN_AFTER_ATTEMPTS`; `client/connect.rs` `connect_with_reconnect`, `handshake_as`; `client/session.rs` `handle_server_event`, `on_server_reconnected`, `forget_peer` |
 | Registration, nicknames (§5.4) | `server/mod.rs` `Registry::try_register` |
 | Login, activation, self-registration (§5.1-§5.3) | `server/users_registry.rs` `UsersRegistry`, `derive_user_key`, `AuthCheck`, `ActivationOutcome`, `generate_activation_code`, `send_activation_email`; `server/activation.rs` `AttemptLimiter`, `handle`; `client/tui/ui_connect_popup.rs` `ActivationPopupState`; `client/connect.rs` `run_client_inner`; `main.rs` `run_register_user`, `run_change_password` |
-| Channels (§6), password bans (§6.6) | `server/mod.rs` `Registry::{join_channel, leave_channel, unregister, channel_list, channel_password_attempts}`; `validation.rs` |
+| Channels (§6), password bans (§6.6) | `server/channels_registry.rs` `ChannelsRegistry::{join, leave, remove_from_all, list, channel_password_attempts}`; `server/mod.rs` `Registry::{join_channel, leave_channel, unregister, channel_list}`; `validation.rs` |
+| Channel ownership and moderation, inactivity (§6.7, §6.8) | `server/channels_registry.rs` `ChannelRecord`, `ChannelsRegistry::{require_caller_is_admin, delete_channel, ban, unban, set_join_lock, assign_admin, sweep_inactive, channels_administered_by, force_delete_channel}`; `server/mod.rs` `Registry::{delete_channel, ban_from_channel, unban_from_channel, set_channel_join_lock, assign_channel_admin, sweep_inactive_channels}`, `channel_sweep_loop`; `client/tui/ui.rs` `ChannelCommandConfirmAction`; `client/tui/channel_lock_popup.rs` `ChannelLockPopupState` |
+| Superadmin account status (§5.5) | `server/users_registry.rs` `UsersRegistry::{deactivate, deactivation_reason, admin_force_activate}`, `AuthCheck::Deactivated`; `server/mod.rs` `require_superadmin`; `client/tui/ui.rs` `UiState::account_deactivated`; `client/connect.rs` `AccountDeactivatedError` |
 | Direct link, candidates, punching (§7.1) | `client/p2p.rs` `PeerLinkManager`; `p2p_proto.rs` `PunchDatagram`, `RendezvousMessage`, `SAFE_DATAGRAM_BYTES` |
 | Serverless direct punch (§7.1.5) | `settings.rs` `DirectPunchTarget`, `PunchFrequency`, `DEFAULT_DIRECT_PUNCH_PORT`, `PUNCH_FREQUENCIES`; `client/p2p.rs` `configure_direct_punch`, `direct_tick`, `on_direct_ping`, `on_direct_pong`, `direct_peer_id`, `is_direct_peer_id`, `utc_second_of_hour`, `DIRECT_PUNCH_WINDOW`, `DIRECT_MAX_RECONNECTS`; `p2p_proto.rs` `MAX_DIRECT_PUNCH_NICK_LEN` |
 | `ChannelPresence`, becoming an addressable peer (§7.1.5) | `proto.rs` `Content::ChannelPresence`; `p2p_proto.rs` `P2pPayload::ChannelPresence`; `client/session.rs` `direct_peer_identity`, `reconcile_direct_membership`, `on_channel_presence`, `send_channel_presence`, `broadcast_channel_presence`; `client/tui/channel.rs` `channels_containing_member`, `is_member_of_channel` |
@@ -1448,3 +1485,5 @@ PBKDF2-HMAC-SHA256 key it derives from nickname+password
 ## Server responsibilities
 
 The server is only a medium of connection *setup*: it manages client connections, channel membership/broadcast, relays public key exchange (join notifications), and relays the candidate exchange that lets two clients punch a direct peer-to-peer link to each other (`docs/PROTOCOL.md` §7.1). Text, voice, and file content travel only over that direct link once it's established — the server never sees any of it, not even as ciphertext. It does not persist anything — chat/DM history lives only in each client's memory for the session. It does enforce nickname uniqueness, since that's connection bookkeeping rather than message content. It distinguishes a client explicitly leaving one channel from its connection closing entirely (Functionality #7), notifying peers with a different message for each (`docs/PROTOCOL.md` §6.2, §6.4) — but the *decision* of whether to keep an offline user's name around (grayed out) or drop it is made entirely client-side, based on that client's own private-message history, which the server has no visibility into.
+
+It also arbitrates who owns and may moderate a channel (admin, ban/unban, join-lock, admin handoff), when an inactive channel is finally removed, and account-level status (a superadmin's `/activate`/`/deactivate`, or removing an account or a public channel outright) - all signaling the server already sits in the middle of, extended rather than exceeded (`docs/PROTOCOL.md` §6.7, §6.8, §5.5). None of this touches message/voice/file content, still peer-to-peer and invisible to the server; and none of it is persisted - channel ownership, bans and join-locks reset with every restart exactly like membership itself does, while account status (registration, activation, deactivation) is disk-backed because `UsersRegistry` already persists accounts today.

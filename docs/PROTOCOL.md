@@ -43,13 +43,16 @@ falling back to a server relay (§7.1).
   - [5.2 Activation](#52-activation)
   - [5.3 Registration](#53-registration)
   - [5.4 Identify / nicknames](#54-identify-nicknames)
+  - [5.5 Superadmin account status](#55-superadmin-account-status)
 - [6. Channels](#6-channels)
   - [6.1 `JoinChannel { name, kind, password }`](#61-joinchannel-name-kind-password)
   - [6.2 `LeaveChannel { name }`](#62-leavechannel-name)
-  - [6.3 `ChannelList(list<ChannelInfo>)` / `ChannelCreated { channel }`](#63-channellistlistchannelinfo-channelcreated-channel)
+  - [6.3 `ChannelList { channels, superadmins }` / `ChannelCreated { channel }`](#63-channellist-channels-superadmins-channelcreated-channel)
   - [6.4 `UserOffline { user_id }` - full disconnect](#64-useroffline-user_id---full-disconnect)
   - [6.5 Password-protected private channels](#65-password-protected-private-channels)
   - [6.6 Brute-force protection](#66-brute-force-protection)
+  - [6.7 Ownership and moderation](#67-ownership-and-moderation)
+  - [6.8 Inactivity](#68-inactivity)
 - [7. Messaging](#7-messaging)
   - [7.1 Direct peer-to-peer transport](#71-direct-peer-to-peer-transport)
     - [7.1.1 Reliable delivery over the punched link](#711-reliable-delivery-over-the-punched-link)
@@ -171,6 +174,11 @@ the handshake (§1.3).
 | `Identify` | Claims the logged-in nickname, announcing a public key and method (§5.4) |
 | `JoinChannel` | Joins or implicitly creates a channel (§6.1) |
 | `LeaveChannel` | Leaves one channel (§6.2) |
+| `DeleteChannel` | The channel admin deletes a public channel (§6.7) |
+| `BanFromChannel` | The channel admin bans a nickname from a channel (§6.7) |
+| `UnbanFromChannel` | The channel admin reverses a ban (§6.7) |
+| `SetChannelJoinLock` | The channel admin locks or unlocks who may join (§6.7) |
+| `AssignChannelAdmin` | The channel admin hands off admin to a member (§6.7) |
 | `RotateKey` | Offers a peer fresh key material (§7.5, §11, §13.10) |
 | `RequestPeerLink` | Asks the server to pass candidates to a peer (§7.1) |
 | `Heartbeat` | Proves the connection is still alive (§4.1) |
@@ -178,6 +186,10 @@ the handshake (§1.3).
 | `OtpMailFetch` | Asks for pending mail and delivery receipts (§17.3) |
 | `OtpMailAck` | Recipient confirms a delivered mail was decrypted and stored (§17.3) |
 | `OtpMailDeliveredAck` | Sender confirms a delivery receipt was seen (§17.3) |
+| `AdminDeactivate` | A superadmin locks an account out, with a reason (§5.5) |
+| `AdminActivate` | A superadmin clears whatever blocks an account's login (§5.5) |
+| `AdminRemoveAccount` | A superadmin removes an account and what it administers (§5.5) |
+| `AdminRemoveChannel` | A superadmin removes any public channel (§5.5) |
 
 | Server → client | Purpose |
 |---|---|
@@ -185,20 +197,26 @@ the handshake (§1.3).
 | `AuthResult` | Whether login succeeded, or is waiting on activation (§5.1, §5.2) |
 | `RegisterResult` | Whether `Register` created an account (§5.3) |
 | `IdentifyResult` | Whether the nickname was granted, and this client's `UserId` (§5.4) |
-| `ChannelList` | The public channels, once, after identifying (§6.3) |
+| `ChannelList` | The public channels and every current superadmin nickname, once, after identifying (§6.3, §5.5) |
 | `Joined` | Confirms a join, last in the join snapshot (§6.1) |
 | `ChannelJoinFailed` | A join failed for a non-password reason (§6.1) |
-| `ChannelJoinRejected` | A join needs a password, guessed wrong, or is banned (§6.5, §6.6) |
+| `ChannelJoinRejected` | A join needs a password, guessed wrong, is IP-banned, is nickname-banned, or the channel is locked (§6.5, §6.6, §6.7) |
 | `ChannelCreated` | A new public channel now exists (§6.3) |
 | `UserJoined` | A peer is in a shared channel — carries their key (§6.1) |
 | `UserLeft` | A peer left one channel (§6.2) |
 | `UserOffline` | A peer's connection ended entirely (§6.4) |
+| `ChannelRemoved` | The admin deleted a channel, or a superadmin removed it (§6.7, §5.5) |
+| `UserBanned` | The admin banned a nickname from a channel (§6.7) |
+| `UserUnbanned` | The admin reversed a ban (§6.7) |
+| `ChannelJoinLockUpdated` | The admin locked or unlocked who may join (§6.7) |
+| `ChannelAdminChanged` | A channel's admin changed (§6.7) |
 | `KeyRotated` | A peer's relayed key rotation (§7.5, §11, §13.10) |
 | `PeerCandidates` | A peer's relayed addresses, to punch against (§7.1) |
 | `Error` | A soft, recoverable failure; the connection stays open (§7.4) |
 | `OtpMailResult` | Whether an uploaded mail is durably stored (§17.2) |
 | `OtpMailDeliver` | One stored mail, handed to its recipient (§17.3) |
 | `OtpMailDelivered` | A sent mail was genuinely decrypted by its recipient (§17.3) |
+| `AccountDeactivated` | A superadmin just deactivated this currently-connected account (§5.5) |
 
 **Peer connection** — UDP, punched. Two layers: the datagram itself, and
 the payload carried inside a reliable or unreliable one.
@@ -780,6 +798,83 @@ the other connection holding the name goes away. A nickname becomes
 available again as soon as its holder's connection closes - cleanly (§4)
 or because the server's heartbeat check decided it was dead (§4.1).
 
+### 5.5 Superadmin account status
+
+`server_superadmin` names zero or more nicknames (one settings-file line
+each) that may send any of the four messages below. Every one of them is
+checked server-side against that list on every call, regardless of
+anything the client asserts about itself; a sender not on the list gets
+`Error { message }` and nothing else happens. The same list, unchanged for
+the server's uptime, is also sent to *every* client - superadmin or not -
+as `ChannelList`'s own `superadmins` field (§6.3): folded into that
+existing connect-time message rather than a second one sent right after
+it, specifically so the number of messages a fresh connect delivers never
+changes. A nickname's superadmin status is shown to everyone (a marker in
+the sidebar and the user-info popup, `docs/SPEC.md`), not only used to
+gate these four messages.
+
+```
+AdminDeactivate { nickname: string, reason: string }
+AdminActivate { nickname: string }
+AdminRemoveAccount { nickname: string }
+AdminRemoveChannel { name: string }
+```
+
+**Account status is one model, reached two ways.** An account can be
+blocked from logging in by either of two independent conditions: a still-
+pending emailed activation code (§5.2), or a superadmin's deactivation.
+`AdminDeactivate` sets the second condition, recording `reason`.
+`AdminActivate` clears *both* conditions at once, whichever apply - it is
+deliberately the same underlying operation ("make this account able to
+log in right now") whether it is bypassing a code nobody entered yet or
+reversing an earlier deactivation, which is why the two slash commands
+this maps to (`/activate`/`/deactivate`) share their vocabulary with §5.2's
+own activation rather than introducing separate terms.
+
+A deactivated account's login attempt fails exactly like any other
+credentials check up to the point the password is confirmed right - the
+same timing-safety property §5.1's constant-time comparison already
+gives an unactivated or a merely-wrong-password account - but then
+answers with a dedicated signal rather than a generic refusal:
+
+```
+AuthResult { ok: false, activation_pending: false, deactivated: Some(reason), reason: None }
+```
+
+`deactivated` is its own field for the same reason `activation_pending`
+already is one, rather than being folded into the free-text `reason`: a
+client needs to branch on *why* without parsing English. If the account
+being deactivated is currently connected, the server also pushes:
+
+```
+AccountDeactivated { reason: string }
+```
+
+There is no message that forces a connection closed - the server has no
+such mechanism for anything (§4 covers the only two ways a connection
+ever ends: the client closing it, or the heartbeat timeout). A client that
+receives `AccountDeactivated` is expected to end its own session having
+shown `reason`, the same way it would on an ordinary quit; it does not
+wait for anything further from the server, since nothing further is
+coming.
+
+**`AdminRemoveAccount`** deletes the account outright (the same effect
+`aloo --register-user`'s directory removal has, just reachable over the
+wire) and additionally removes every channel it currently administers
+(§6.7) - not reassigning them, removing them, exactly as `/delete-channel`
+does, with every member of each notified via `ChannelRemoved`. If the
+removed account is currently connected it is disconnected, without the
+`AccountDeactivated` treatment - there is no reason to show a removed
+account a specific message, since there is no account left for a
+superadmin to reactivate afterward.
+
+**`AdminRemoveChannel`** removes any channel by name, the same way
+`/delete-channel` does but without requiring the sender to be its admin,
+and without the public-only restriction that command has - except
+`DEFAULT_CHANNEL_NAME`, which no message, superadmin or otherwise, may
+remove. In practice only a public channel is ever reachable this way: a
+private channel is never advertised to anyone outside its own membership
+(§6.3), so a superadmin who isn't already in one has no name to send.
 
 ## 6. Channels
 
@@ -854,11 +949,15 @@ picks from, not a row of tabs.
 Removes the sender from `name`'s membership, if they were a member (a
 no-op, no messages sent, if `name` doesn't exist or they weren't a
 member). Every *remaining* member receives `UserLeft { channel: name,
-user_id }` - the leaver themselves gets no acknowledgment at all. An
-emptied channel is deleted outright - public or private alike - *unless*
-`name` is `DEFAULT_CHANNEL_NAME` (`"the-hall"`), which survives being
-empty forever (until server restart); any other channel's next
-`JoinChannel` recreates it fresh, with no memory of previous membership.
+user_id }` - the leaver themselves gets no acknowledgment at all. Emptying
+a channel this way does not by itself delete it - it, its admin, its ban
+list and its join lock (§6.7) all survive being briefly empty, and only
+`DEFAULT_CHANNEL_NAME` (`"the-hall"`) is ever exempt from being deleted at
+all. What actually removes an emptied channel is either its admin's
+`DeleteChannel` (§6.7), a superadmin's removal (§5.5), or the inactivity
+sweep (§6.8) once configured; any of those - or simply never being
+recreated - leaves the next `JoinChannel` for the same name creating it
+fresh, with no memory of previous membership.
 
 Since there's no server acknowledgment to the leaver, the client applies
 `/leave` optimistically: the moment it's submitted (`UiState::
@@ -870,10 +969,14 @@ private one is never advertised there, and rejoining it means naming it
 again (Ctrl+J). See §7.1.3 for what leaving does to any P2P links that
 were only justified by that channel's membership.
 
-### 6.3 `ChannelList(list<ChannelInfo>)` / `ChannelCreated { channel }`
+### 6.3 `ChannelList { channels, superadmins }` / `ChannelCreated { channel }`
 
-`ChannelList` is sent once, right after `IdentifyResult` (§4) - **public
-channels only**, sorted by name. `ChannelCreated { channel: ChannelInfo }`
+`ChannelList` is sent once, right after `IdentifyResult` (§4) -
+`channels` is **public channels only**, sorted by name; `superadmins` is
+every current `server_superadmin` nickname (§5.5), unrelated to channels
+but carried on this same one-time message rather than a second one, so
+the number of messages a fresh connect delivers stays fixed regardless of
+how many superadmins are configured. `ChannelCreated { channel: ChannelInfo }`
 is the live follow-up: sent to every *other* currently-connected client
 the instant a genuinely new public channel is created (`Registry::
 join_channel`, `!existed_before && kind == Public`), so a channel created
@@ -1005,6 +1108,111 @@ persisted to disk - a server restart clears every ban. The users registry
 itself (§5.1) is the opposite: on disk, so a restart never forgets who is
 registered.
 
+### 6.7 Ownership and moderation
+
+Every channel other than `DEFAULT_CHANNEL_NAME` belongs to whoever
+created it - public or private alike, fixed at creation exactly like
+`kind`. `Joined` carries the current admin alongside the confirmation:
+
+```
+Joined { channel: ChannelInfo, admin: optional<string> }
+```
+
+`admin` is `None` only for `DEFAULT_CHANNEL_NAME`, which belongs to
+nobody and is permanently exempt from every command below - each one
+refuses it outright, naming "no admin" as the reason. A later change of
+admin while already joined arrives instead as `ChannelAdminChanged`
+(below); the directory (`ChannelList`/`ChannelCreated`, §6.3) never
+carries `admin` at all, since the directory has no use for it and every
+client that has actually joined already has it from `Joined`.
+
+Five messages, all admin-only - checked server-side against the
+channel's own recorded admin, never trusted from the client:
+
+```
+DeleteChannel { name: string }
+BanFromChannel { channel: string, nickname: string }
+UnbanFromChannel { channel: string, nickname: string }
+SetChannelJoinLock { channel: string, allowed: optional<list<string>> }
+AssignChannelAdmin { channel: string, nickname: string }
+```
+
+**`DeleteChannel`** removes `name` outright - only for a public channel;
+a private one refuses with a reason. Every current member receives
+`ChannelRemoved { name, reason }` and drops the channel. Recreating it is
+nothing special: the very next `JoinChannel` for the same name creates it
+fresh, exactly as it would for any other not-yet-existing name, and its
+joiner becomes its new admin.
+
+**`BanFromChannel`**/**`UnbanFromChannel`** add or remove `nickname` from
+the channel's ban list. A ban force-removes the nickname from the channel
+if currently a member, and refuses every future `JoinChannel` from it
+against that channel with a new rejection kind:
+
+```
+ChannelJoinRejected { name: string, kind: UserBanned }
+```
+
+distinct from `Banned` (§6.6): that one is an IP-scoped brute-force
+protection against password guessing; this one is a nickname-scoped
+moderation decision, and the two never interact. Whether force-removed or
+not, every member who was in the channel (the banned nickname included)
+receives:
+
+```
+UserBanned { channel: string, user_id: UserId, nickname: string }
+```
+
+so a client can tell its own removal from an ordinary member-left notice
+by comparing `user_id` to itself. `UnbanFromChannel` only reverses list
+membership - it sends `UserUnbanned { channel, nickname }` to current
+members and does not restore anything; the nickname simply may join
+again.
+
+**`SetChannelJoinLock`** replaces the channel's join allowlist outright:
+`allowed: None` is "All users" - clears the lock entirely; `Some(list)`
+restricts *future* joins to that list, plus the admin, always implicitly,
+regardless of whether they're on it. It gates joining only, not
+membership: a currently-joined member left off a narrower list is not
+removed by applying one. A non-admin, non-listed nickname's `JoinChannel`
+against a locked channel is refused as:
+
+```
+ChannelJoinRejected { name: string, kind: NotOnAllowlist }
+```
+
+Applying a lock (of either shape) notifies current members with
+`ChannelJoinLockUpdated { channel, by }`, naming who changed it.
+
+**`AssignChannelAdmin`** requires `nickname` to currently be a member of
+`channel` - refused otherwise, so a channel is never handed to someone
+not even present to accept it. On success the caller's own admin status
+is released in the same stroke (a channel has exactly one admin at a
+time) and every current member receives `ChannelAdminChanged { channel,
+admin: Some(nickname) }`.
+
+### 6.8 Inactivity
+
+`server_channel_deletion_unactivity_period` (a settings-file duration -
+`Ndays`/`Nweeks`/`Nmonths`, a month fixed at 30 days) configures a
+background sweep that destroys a channel - any one but
+`DEFAULT_CHANNEL_NAME`, permanently exempt - once it has **both**
+currently zero members **and** no successful join within the configured
+period. Unset (the default), the sweep never runs at all, and a channel
+persists while empty indefinitely, the same way `DEFAULT_CHANNEL_NAME`
+already does unconditionally.
+
+Join events, not message content, are what this measures: the server
+never sees anything of a channel's actual conversation (§7.1, §10), so a
+join - the one thing it can observe - is the only available signal.
+Membership alone isn't sufficient either: a channel with one long-standing
+member who simply never rejoins must not age out from under them, so
+"zero members" is a necessary condition alongside the elapsed period, not
+a substitute for it. This replaces what earlier revisions of this
+document described as instant deletion of an emptied channel - every
+channel, admin, ban list, and join lock (§6.7) now survives being briefly
+empty, which is what makes moderation state worth having in the first
+place.
 
 ## 7. Messaging
 
@@ -2704,7 +2912,7 @@ additive pin above) and the UI's identity-review queue (lifting the trust
 gate) - nothing else needs updating, for two separate reasons:
 
 - **Channel/DM encryption never needed a separate update in the first
-  place.** `known_users`/`channel.members` (`recipients_for_channel:216`)
+  place.** `known_users`/`channel.members` (`recipients_for_channel:239`)
   already hold whichever key that connection actually
   announced, set once at `UserJoined` time - *before* `check_identity` can
   even open a review - so a send immediately after `Accept` already

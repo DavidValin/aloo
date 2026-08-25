@@ -660,7 +660,7 @@ pub async fn send_control(socket: &Path, message: AttachMessage) -> Result<(), B
 /// What a daemon with a server but no password is refused with
 /// (`run`): the one credential a login needs, and nobody is there to
 /// type it.
-pub const NO_PASSWORD_ERROR: &str = "no password for the server - pass --server-pwd, or set \
+pub const NO_PASSWORD_ERROR: &str = "no password for the server - pass --nick-pwd, or set \
                                      daemon_server_password in ~/.aloo/settings";
 
 /// Everything a daemon needs to connect and place itself, once flags,
@@ -672,7 +672,7 @@ pub struct DaemonConfig {
     pub nickname: String,
     /// The nickname's password (docs/PROTOCOL.md §5.1) - the one
     /// credential a login needs, and a daemon has nobody there to type
-    /// it, so it comes from `--server-pwd` or `daemon_server_password`.
+    /// it, so it comes from `--nick-pwd` or `daemon_server_password`.
     pub password: String,
     /// Dial over TLS (`--ssl` / `daemon_ssl`).
     pub ssl: bool,
@@ -698,7 +698,7 @@ pub struct DaemonFlags {
     pub host: Option<String>,
     pub port: Option<u16>,
     pub nickname: Option<String>,
-    pub server_pwd: Option<String>,
+    pub nick_pwd: Option<String>,
     pub ssl: bool,
     pub my_key_prefix: Option<String>,
     pub channels: Vec<String>,
@@ -772,7 +772,7 @@ impl DaemonConfig {
         // before dialling rather than here, so a configuration can still
         // be resolved and shown without a password.
         let password = flags
-            .server_pwd
+            .nick_pwd
             .clone()
             .or_else(|| settings.daemon_server_password.clone())
             .unwrap_or_default();

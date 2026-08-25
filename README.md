@@ -26,6 +26,8 @@ Just you, your terminal, and the people you're talking to.
 - 📎 **File transfer, with consent** — a built-in file browser, and nothing moves until the recipient accepts. No size cap.
 - 📢 **Public channels** — join what the server advertises; new ones appear live, no reconnect.
 - 🔒 **Private channels** — unadvertised, joined by name, optionally password-protected.
+- ☀️ **Channel ownership and moderation** — whoever creates a channel administers it: `/delete-channel`, `/ban`/`/unban`, `/lock-joins`, and `/assign-admin` to hand it off. An operator can also require `server_allow_create_public_channels=off` so only private channels get made, and set `server_channel_deletion_unactivity_period` to sweep away channels nobody's touched in a while.
+- ⚡ **Server superadmins** — `server_superadmin` nicknames can lock an account out (`/deactivate`, `/activate` to reverse it), or remove an account or any public channel outright.
 - ✉️  **Private messages (DMs)** — a one-on-one room with anyone in the sidebar.
 - 🔐 **Live One Time Pad sessions** — wrap a DM in real one-time-pad encryption, the only cipher with proven perfect secrecy, on top of the quantum-resistant layer you already have. Requires [otp-toolkit](https://github.com/DavidValin/otp-toolkit).
 - 📨 **OTP mail** — a whole mail (subject, text, voice, attachments) that waits pad-sealed on the server, unreadable to it, until the recipient connects.

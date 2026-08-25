@@ -283,3 +283,81 @@ fn activation_link_trims_a_trailing_slash_on_the_base_url() {
         "https://chat.example.com/activate?nickname=alice&code=123456789012"
     );
 }
+
+// ---------------------------------------------------------------------
+// Superadmin account status (docs/PROTOCOL.md §5.5): deactivate/activate
+// ---------------------------------------------------------------------
+
+/// @requirement AC-344
+#[test]
+fn deactivate_and_deactivation_reason_round_trip() {
+    let registry = temp_registry("deactivate");
+    registry.register_manual("eve", "hunter2").unwrap();
+    assert_eq!(registry.deactivation_reason("eve"), None);
+    registry.deactivate("eve", "spamming").unwrap();
+    assert_eq!(registry.deactivation_reason("eve"), Some("spamming".to_string()));
+}
+
+/// @requirement AC-344, TB-263
+#[test]
+fn check_credentials_reports_deactivated_even_over_a_pending_activation() {
+    let registry = temp_registry("deactivate-over-pending");
+    let reg = registry
+        .register("eve", "hunter2", "eve@example.com", 1_000_000)
+        .unwrap();
+    let _ = reg; // still pending - never activated
+    registry.deactivate("eve", "abuse").unwrap();
+    assert_eq!(
+        registry.check_credentials("eve", "hunter2", 1_000_000),
+        AuthCheck::Deactivated { reason: "abuse".to_string() }
+    );
+}
+
+/// @requirement AC-344, TB-263
+#[test]
+fn check_credentials_deactivated_still_requires_the_right_password() {
+    let registry = temp_registry("deactivate-wrong-password");
+    registry.register_manual("eve", "hunter2").unwrap();
+    registry.deactivate("eve", "abuse").unwrap();
+    // The same timing-safety property `ActivationPending` already has:
+    // deactivation is only reported once the password is already known
+    // to be right, so a wrong password stays indistinguishable from an
+    // unknown nickname.
+    assert_eq!(
+        registry.check_credentials("eve", "wrong", 1_000_000),
+        AuthCheck::Rejected
+    );
+}
+
+/// @requirement AC-344
+#[test]
+fn admin_force_activate_clears_both_a_pending_code_and_a_deactivation() {
+    let registry = temp_registry("force-activate");
+    registry
+        .register("eve", "hunter2", "eve@example.com", 1_000_000)
+        .unwrap();
+    registry.deactivate("eve", "abuse").unwrap();
+    assert!(registry.pending_activation("eve").is_some());
+    assert!(registry.deactivation_reason("eve").is_some());
+
+    registry.admin_force_activate("eve").unwrap();
+
+    assert!(registry.pending_activation("eve").is_none());
+    assert!(registry.deactivation_reason("eve").is_none());
+    assert_eq!(
+        registry.check_credentials("eve", "hunter2", 1_000_000),
+        AuthCheck::Ok
+    );
+}
+
+/// @requirement AC-344
+#[test]
+fn admin_force_activate_on_an_ordinary_active_account_is_a_harmless_no_op() {
+    let registry = temp_registry("force-activate-noop");
+    registry.register_manual("eve", "hunter2").unwrap();
+    registry.admin_force_activate("eve").unwrap();
+    assert_eq!(
+        registry.check_credentials("eve", "hunter2", 1_000_000),
+        AuthCheck::Ok
+    );
+}

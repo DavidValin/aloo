@@ -1,4 +1,5 @@
 pub mod channel;
+pub mod channel_lock_popup;
 pub mod contacts;
 pub mod direct_message;
 pub mod direct_punch_popup;

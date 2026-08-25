@@ -5,7 +5,7 @@ use std::net::{IpAddr, Ipv4Addr};
 
 use cucumber::{given, then, when};
 
-use aloo::proto::{ChannelInfo, ChannelJoinRejection, ChannelKind, UserId};
+use aloo::proto::{ChannelInfo, ChannelJoinRejection, ChannelKind, ServerMessage, UserId};
 use aloo::server::CHANNEL_MAX_PASSWORD_ATTEMPTS;
 use aloo::client::tui::ui::{MessageBody, Mode, SelectorFocus, UiAction};
 
@@ -413,7 +413,7 @@ async fn bob_confirmed_joined_to(w: &mut AlooWorld, channel: String) {
     assert!(
         w.emitted
             .iter()
-            .any(|o| o.to == bob && matches!(&o.message, aloo::proto::ServerMessage::Joined { channel: c } if c.name == channel)),
+            .any(|o| o.to == bob && matches!(&o.message, aloo::proto::ServerMessage::Joined { channel: c, .. } if c.name == channel)),
         "expected bob to receive a Joined confirmation for {channel}: {:?}",
         w.emitted
     );
@@ -578,5 +578,229 @@ async fn channel_named_with_hash(w: &mut AlooWorld) {
     assert!(
         header_row(&rows).contains("#general"),
         "a channel is named the way it can be typed back in: {rows:?}"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Channel ownership and moderation (US-051, docs/PROTOCOL.md 6.7) - all
+// `Registry`-level, exactly like the password-protected-channel steps
+// above: the ownership/moderation rules live entirely in
+// `ChannelsRegistry`, with nothing about them specific to the wire.
+// ---------------------------------------------------------------------
+
+#[when(expr = "{word} creates the public channel {string}")]
+async fn creates_public_channel(w: &mut AlooWorld, who: String, channel: String) {
+    let id = ensure_registered(w, &who);
+    let out = w
+        .registry_mut()
+        .join_channel(id, &channel, ChannelKind::Public, None, TEST_IP)
+        .expect("creating a public channel should succeed");
+    w.emitted = out;
+}
+
+#[when(expr = "{word} creates the private channel {string}")]
+async fn creates_private_channel(w: &mut AlooWorld, who: String, channel: String) {
+    let id = ensure_registered(w, &who);
+    let out = w
+        .registry_mut()
+        .join_channel(id, &channel, ChannelKind::Private, None, TEST_IP)
+        .expect("creating a private channel should succeed");
+    w.emitted = out;
+}
+
+#[when(expr = "{word} joins the public channel {string}")]
+async fn joins_public_channel_registry(w: &mut AlooWorld, who: String, channel: String) {
+    let id = ensure_registered(w, &who);
+    let out = w
+        .registry_mut()
+        .join_channel(id, &channel, ChannelKind::Public, None, TEST_IP);
+    match out {
+        Ok(emitted) => {
+            w.emitted = emitted;
+            w.route_error = None;
+        }
+        Err(e) => w.route_error = Some(e),
+    }
+}
+
+#[then(expr = "{word} is confirmed as the admin of {string}")]
+async fn confirmed_as_admin_of(w: &mut AlooWorld, who: String, channel: String) {
+    let id = w.id_of(&who);
+    assert!(
+        w.emitted.iter().any(|o| o.to == id
+            && matches!(&o.message, ServerMessage::Joined { channel: c, admin: Some(a) }
+                if c.name == channel && a == &who)),
+        "expected {who} to be told they administer {channel}: {:?}",
+        w.emitted
+    );
+}
+
+#[then(expr = "{word} is told that {word} administers {string}")]
+async fn told_that_administers(w: &mut AlooWorld, who: String, admin: String, channel: String) {
+    let id = w.id_of(&who);
+    assert!(
+        w.emitted.iter().any(|o| o.to == id
+            && matches!(&o.message, ServerMessage::Joined { channel: c, admin: Some(a) }
+                if c.name == channel && a == &admin)),
+        "expected {who} to be told {admin} administers {channel}: {:?}",
+        w.emitted
+    );
+}
+
+#[then(expr = "{string} has no admin")]
+async fn channel_has_no_admin(w: &mut AlooWorld, channel: String) {
+    assert!(
+        w.emitted.iter().any(|o| matches!(&o.message, ServerMessage::Joined { channel: c, admin: None }
+            if c.name == channel)),
+        "expected {channel} to be joined with no admin: {:?}",
+        w.emitted
+    );
+}
+
+#[when(expr = "{word} tries to delete {string}")]
+async fn tries_to_delete(w: &mut AlooWorld, who: String, channel: String) {
+    let id = w.id_of(&who);
+    match w.registry_mut().delete_channel(id, &channel) {
+        Ok(emitted) => {
+            w.emitted = emitted;
+            w.route_error = None;
+        }
+        Err(e) => w.route_error = Some(e),
+    }
+}
+
+#[then(expr = "the attempt is refused, naming {string}")]
+async fn channel_attempt_refused_naming(w: &mut AlooWorld, needle: String) {
+    let err = w.route_error.take().expect("no refusal was recorded");
+    assert!(
+        err.contains(&needle),
+        "expected {needle:?} in the refusal, got {err:?}"
+    );
+}
+
+#[then(expr = "{word} is told {string} was removed")]
+async fn told_channel_removed(w: &mut AlooWorld, who: String, channel: String) {
+    let id = w.id_of(&who);
+    assert!(
+        w.emitted.iter().any(|o| o.to == id
+            && matches!(&o.message, ServerMessage::ChannelRemoved { name, .. } if name == &channel)),
+        "expected {who} to be told {channel} was removed: {:?}",
+        w.emitted
+    );
+}
+
+#[when(expr = "{word} bans {word} from {string}")]
+async fn bans_from_channel(w: &mut AlooWorld, admin: String, target: String, channel: String) {
+    let admin_id = w.id_of(&admin);
+    match w.registry_mut().ban_from_channel(admin_id, &channel, &target) {
+        Ok(emitted) => {
+            w.emitted = emitted;
+            w.route_error = None;
+        }
+        Err(e) => w.route_error = Some(e),
+    }
+}
+
+#[when(expr = "{word} unbans {word} from {string}")]
+async fn unbans_from_channel(w: &mut AlooWorld, admin: String, target: String, channel: String) {
+    let admin_id = w.id_of(&admin);
+    match w.registry_mut().unban_from_channel(admin_id, &channel, &target) {
+        Ok(emitted) => {
+            w.emitted = emitted;
+            w.route_error = None;
+        }
+        Err(e) => w.route_error = Some(e),
+    }
+}
+
+#[then(expr = "{word} is told they were banned from {string}")]
+async fn told_banned_from(w: &mut AlooWorld, who: String, channel: String) {
+    let id = w.id_of(&who);
+    assert!(
+        w.emitted.iter().any(|o| o.to == id
+            && matches!(&o.message, ServerMessage::UserBanned { channel: c, user_id, .. }
+                if c == &channel && *user_id == id)),
+        "expected {who} to be told they were banned from {channel}: {:?}",
+        w.emitted
+    );
+}
+
+#[then(expr = "{word}'s next attempt to join {string} is refused as banned")]
+async fn next_join_refused_as_banned(w: &mut AlooWorld, who: String, channel: String) {
+    let id = w.id_of(&who);
+    let out = w
+        .registry_mut()
+        .join_channel(id, &channel, ChannelKind::Public, None, TEST_IP)
+        .expect("a rejection is a message, not an error");
+    assert!(
+        out.iter().any(|o| matches!(&o.message,
+            ServerMessage::ChannelJoinRejected { kind: ChannelJoinRejection::UserBanned, .. })),
+        "expected {who}'s join to be rejected as banned: {out:?}"
+    );
+}
+
+#[then(expr = "{word} can join {string}")]
+async fn can_join(w: &mut AlooWorld, who: String, channel: String) {
+    let id = w.id_of(&who);
+    let out = w
+        .registry_mut()
+        .join_channel(id, &channel, ChannelKind::Public, None, TEST_IP)
+        .expect("the join should not error");
+    assert!(
+        out.iter().any(|o| matches!(&o.message, ServerMessage::Joined { .. })),
+        "expected {who} to be able to join {channel}: {out:?}"
+    );
+}
+
+#[when(expr = "{word} locks {string} to just {word}")]
+async fn locks_channel_to_just(w: &mut AlooWorld, admin: String, channel: String, allowed: String) {
+    let admin_id = w.id_of(&admin);
+    w.registry_mut()
+        .set_channel_join_lock(admin_id, &channel, Some(vec![allowed]))
+        .expect("locking should succeed");
+}
+
+#[when(expr = "{word} opens {string} back up to all users")]
+async fn opens_channel_to_all(w: &mut AlooWorld, admin: String, channel: String) {
+    let admin_id = w.id_of(&admin);
+    w.registry_mut()
+        .set_channel_join_lock(admin_id, &channel, None)
+        .expect("clearing the lock should succeed");
+}
+
+#[then(expr = "{word}'s attempt to join {string} is refused, not being on the list")]
+async fn join_refused_not_on_list(w: &mut AlooWorld, who: String, channel: String) {
+    let id = w.id_of(&who);
+    let out = w
+        .registry_mut()
+        .join_channel(id, &channel, ChannelKind::Public, None, TEST_IP)
+        .expect("a rejection is a message, not an error");
+    assert!(
+        out.iter().any(|o| matches!(&o.message,
+            ServerMessage::ChannelJoinRejected { kind: ChannelJoinRejection::NotOnAllowlist, .. })),
+        "expected {who}'s join to be rejected as not on the allowlist: {out:?}"
+    );
+}
+
+#[when(expr = "{word} assigns admin of {string} to {word}")]
+async fn assigns_admin_of_to(w: &mut AlooWorld, admin: String, channel: String, target: String) {
+    let admin_id = w.id_of(&admin);
+    match w.registry_mut().assign_channel_admin(admin_id, &channel, &target) {
+        Ok(emitted) => {
+            w.emitted = emitted;
+            w.route_error = None;
+        }
+        Err(e) => w.route_error = Some(e),
+    }
+}
+
+#[then(expr = "{word} becomes the new admin of {string}")]
+async fn becomes_new_admin_of(w: &mut AlooWorld, who: String, channel: String) {
+    assert!(
+        w.emitted.iter().any(|o| matches!(&o.message,
+            ServerMessage::ChannelAdminChanged { channel: c, admin: Some(a) }
+                if c == &channel && a == &who)),
+        "expected {who} to become {channel}'s new admin: {:?}",
+        w.emitted
     );
 }

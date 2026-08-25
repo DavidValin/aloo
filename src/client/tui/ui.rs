@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
@@ -146,6 +146,39 @@ const HELP_BODY: &[HelpLine] = &[
     HelpLine::Item {
         keys: "/leave",
         text: "leave the selected channel tab (its tab disappears)",
+    },
+    HelpLine::Blank,
+    HelpLine::Heading("Channel administration"),
+    HelpLine::Note(
+        "A channel always belongs to whoever created it (shown as \u{2600}\u{FE0F} in the sidebar \
+         and \"(admin: name)\" in the messages pane) - except the-hall, which belongs to \
+         nobody. Only that channel's own admin may use the commands below in it; \
+         everyone else is refused with a reason.",
+    ),
+    HelpLine::Item {
+        keys: "/delete-channel",
+        text: "delete the selected public channel (with a confirmation popup) - anyone may \
+               recreate it later by joining the name again",
+    },
+    HelpLine::Item {
+        keys: "/ban <nickname>",
+        text: "remove them from the selected channel and refuse their future joins to it",
+    },
+    HelpLine::Item {
+        keys: "/unban <nickname>",
+        text: "reverse a ban - they may join again",
+    },
+    HelpLine::Item {
+        keys: "/lock-joins",
+        text: "open a popup choosing who may join the selected channel from now on: \"All \
+               users\" (Left/Right/u to toggle) or a specific list, prefilled with the \
+               current members - a/n adds a nickname, d deletes one, Enter applies \
+               immediately. Already-joined members are never removed by this.",
+    },
+    HelpLine::Item {
+        keys: "/assign-admin <nickname>",
+        text: "hand your admin rights for the selected channel to a current member (with a \
+               confirmation popup) - you are no longer its admin afterward",
     },
     HelpLine::Blank,
     HelpLine::Heading("Messaging"),
@@ -438,6 +471,32 @@ const HELP_BODY: &[HelpLine] = &[
                the same person. Refused with no network round trip if a mail key \
                already exists for that contact (delete it from /contacts first, or \
                just use /mail).",
+    },
+    HelpLine::Blank,
+    HelpLine::Heading("Server superadmin"),
+    HelpLine::Note(
+        "Only nicknames the server's server_superadmin setting names may use these - \
+         everyone else is refused with a reason. A \u{26A1} marks a superadmin's name in \
+         every channel's sidebar and its own user-info popup.",
+    ),
+    HelpLine::Item {
+        keys: "/activate <nickname>",
+        text: "clear whatever blocks that account's login: a still-pending emailed \
+               activation code, a previous /deactivate, or both",
+    },
+    HelpLine::Item {
+        keys: "/deactivate <nickname> <reason>",
+        text: "lock that account out of logging in, naming why. If they're connected right \
+               now, their own screen takes over with the reason and Escape as its only key.",
+    },
+    HelpLine::Item {
+        keys: "/remove-account <nickname>",
+        text: "delete that account outright, and every channel it administers (their \
+               members are told and removed)",
+    },
+    HelpLine::Item {
+        keys: "/remove-channel <name>",
+        text: "delete any public channel by name, whether or not you administer it",
     },
     HelpLine::Blank,
     HelpLine::Note(
@@ -1199,6 +1258,10 @@ pub enum Mode {
     /// `crate::client::tui::direct_punch_popup`. Data lives in
     /// `UiState::direct_punches`, same split as `FileSend`/`file_send`.
     DirectPunches,
+    /// The channel admin's `/lock-joins` popup is open - see
+    /// `crate::client::tui::channel_lock_popup`. Data lives in
+    /// `UiState::channel_lock`, same split as `FileSend`/`file_send`.
+    ChannelLockPopup,
 }
 
 /// Which field is focused inside the Ctrl+J popup - Tab/BackTab cycles.
@@ -1317,11 +1380,29 @@ pub struct PendingCallConfirm {
 /// Which button is focused in the `/call` confirmation - `Confirm` by
 /// default: the user just typed `/call` themselves, so wanting to proceed
 /// is the common case (same reasoning as `FileOfferChoice`'s
-/// `Accept`-first default).
+/// `Accept`-first default). Reused as-is for `ChannelCommandConfirm` below -
+/// both are a plain Confirm/Cancel over one question, nothing call-specific
+/// baked in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CallConfirmChoice {
     Confirm,
     Cancel,
+}
+
+/// A pending `/delete-channel` or `/assign-admin` confirmation - built
+/// once, right when the command is typed, so the popup itself stays
+/// generic (one title, one question, one action to fire on Confirm).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelCommandConfirm {
+    pub title: &'static str,
+    pub question: String,
+    pub action: ChannelCommandConfirmAction,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChannelCommandConfirmAction {
+    DeleteChannel { name: String },
+    AssignAdmin { channel: String, nickname: String },
 }
 
 /// Where one person stands on a call we are on - the roster label the
@@ -1959,6 +2040,52 @@ pub enum UiAction {
     /// loop owns and the action handler - which is about network sends -
     /// has no business holding.
     Detach,
+    /// Escape on the full-screen account-deactivated modal
+    /// (`UiState::account_deactivated`) - the one key it answers.
+    /// Answered by `session::run_connected_session`'s own input arm, the
+    /// same way `Detach` is: it ends the whole session (the same exit an
+    /// ordinary Ctrl+C already uses), which is a loop-level effect
+    /// `handle_ui_action` - about network sends - has no business having.
+    Quit,
+    /// The channel admin's `/delete-channel` (after its confirmation
+    /// popup), `/ban`, `/unban`, `/lock-joins`' Apply, or `/assign-admin`
+    /// (after its confirmation popup) - see `docs/PROTOCOL.md`'s
+    /// channel-ownership section.
+    DeleteChannel {
+        name: String,
+    },
+    BanFromChannel {
+        channel: String,
+        nickname: String,
+    },
+    UnbanFromChannel {
+        channel: String,
+        nickname: String,
+    },
+    SetChannelJoinLock {
+        channel: String,
+        allowed: Option<Vec<String>>,
+    },
+    AssignChannelAdmin {
+        channel: String,
+        nickname: String,
+    },
+    /// A superadmin's `/activate`/`/deactivate`/`/remove-account`/
+    /// `/remove-channel` (`docs/PROTOCOL.md` §5.5) - see
+    /// `UiState::try_superadmin_command`.
+    AdminActivate {
+        nickname: String,
+    },
+    AdminDeactivate {
+        nickname: String,
+        reason: String,
+    },
+    AdminRemoveAccount {
+        nickname: String,
+    },
+    AdminRemoveChannel {
+        name: String,
+    },
 }
 
 impl UiAction {
@@ -1984,6 +2111,21 @@ impl UiAction {
             | Self::ReadOtpMail { .. }
             | Self::DeleteOtpMail { .. }
             | Self::SaveOtpMailAttachment { .. } => Some("OTP mail"),
+            // Channel ownership/moderation is server-arbitrated state -
+            // there is nobody to enforce a ban, a lock, or an admin
+            // handoff against an uncooperative peer with no server.
+            Self::DeleteChannel { .. } => Some("deleting a channel"),
+            Self::BanFromChannel { .. } | Self::UnbanFromChannel { .. } => {
+                Some("banning or unbanning a channel member")
+            }
+            Self::SetChannelJoinLock { .. } => Some("locking channel joins"),
+            Self::AssignChannelAdmin { .. } => Some("changing a channel's admin"),
+            // Superadmin actions are server-side account/registry state -
+            // there is no "without a server" meaning for any of them.
+            Self::AdminActivate { .. } => Some("activating an account"),
+            Self::AdminDeactivate { .. } => Some("deactivating an account"),
+            Self::AdminRemoveAccount { .. } => Some("removing an account"),
+            Self::AdminRemoveChannel { .. } => Some("removing a channel"),
             // Everything else is peer-to-peer. Leaving is deliberately not
             // here: with no server a channel is a local declaration, so
             // leaving one is a local act that needs nobody's permission.
@@ -2049,6 +2191,12 @@ pub struct UiState {
     /// connect, `ChannelCreated` live) - the rows of the `/channels`
     /// modal, whether or not the user has joined them.
     pub known_channels: Vec<ChannelInfo>,
+    /// Every nickname `server_superadmin` names, from the connect-time
+    /// `ChannelList.superadmins` - fixed for the session, since the
+    /// setting is fixed for the server's uptime. Drives the ⚡ marker
+    /// shown next to a superadmin's name everywhere it appears, and the
+    /// user-info popup's "is a ⚡ superadmin" line.
+    pub superadmins: std::collections::BTreeSet<String>,
     /// Running with no server (`--no-server`, docs/PROTOCOL.md §7.1.5).
     /// Changes what the channel affordances can honestly offer: there is
     /// no directory to browse and nothing to create, so the only channels
@@ -2139,6 +2287,15 @@ pub struct UiState {
     /// `mode == Mode::DirectPunches` - see
     /// `crate::client::tui::direct_punch_popup`.
     pub direct_punches: Option<super::direct_punch_popup::DirectPunchPopupState>,
+    /// The `/lock-joins` popup's state, while
+    /// `mode == Mode::ChannelLockPopup` - see
+    /// `crate::client::tui::channel_lock_popup`.
+    pub channel_lock: Option<super::channel_lock_popup::ChannelLockPopupState>,
+    /// A pending `/delete-channel` or `/assign-admin` confirmation -
+    /// answered the same way `call_confirm` is, reusing `CallConfirmChoice`
+    /// since both are a plain Confirm/Cancel over a one-line question.
+    pub channel_command_confirm: Option<ChannelCommandConfirm>,
+    channel_command_confirm_focus: CallConfirmChoice,
     /// Every incoming file offer currently awaiting a decision, keyed by
     /// `(from, stream_id)` - the popup always shows whichever's at the
     /// front of `file_offer_queue`. Analogous to `identity_reviews`/
@@ -2321,6 +2478,14 @@ pub struct UiState {
     /// to exactly whatever they were underneath, rather than replacing
     /// them.
     pub help_open: bool,
+    /// A superadmin's `/deactivate` just landed against this account,
+    /// carrying the reason - drives the full-screen red takeover modal
+    /// (`render_account_deactivated_modal`), checked as the very top
+    /// priority tier in `handle_key`, above even `identity_review_queue`.
+    /// Independent of `Mode`/`focus` for the same reason `help_open` is:
+    /// it must override *any* view or mode, and there is nothing to
+    /// "return to" once it's shown - Escape ends the whole session.
+    pub account_deactivated: Option<String>,
     /// First visible line index into the overlay's laid-out lines while it is
     /// open - `Up`/`Down`/`PageUp`/`PageDown`/`Home`/`End` adjust it
     /// (`handle_key`), reset to `0` every time the overlay is freshly
@@ -2467,6 +2632,7 @@ impl UiState {
             selector_dropdown_open: false,
             selector_dropdown_since: None,
             known_channels: Vec::new(),
+            superadmins: std::collections::BTreeSet::new(),
             serverless: false,
             channels_popup_selected: 0,
             known_users: HashMap::new(),
@@ -2492,6 +2658,9 @@ impl UiState {
             file_send: None,
             contacts: None,
             direct_punches: None,
+            channel_lock: None,
+            channel_command_confirm: None,
+            channel_command_confirm_focus: CallConfirmChoice::Confirm,
             file_row_of_stream: HashMap::new(),
             file_rows: HashMap::new(),
             file_offers: HashMap::new(),
@@ -2527,6 +2696,7 @@ impl UiState {
             audio_error: None,
             blink_on: false,
             help_open: false,
+            account_deactivated: None,
             help_scroll: 0,
             file_preview: None,
             identity_reviews: HashMap::new(),
@@ -4394,6 +4564,20 @@ impl UiState {
         modifiers: KeyModifiers,
         kind: KeyEventKind,
     ) -> Option<UiAction> {
+        // A live account deactivation outranks everything, including an
+        // outstanding identity review: the account is locked out right
+        // now, so nothing else this session could still do matters.
+        // Absorbs every key but Escape, which ends the whole session (no
+        // `UiAction` can express a loop-level exit, so this is answered
+        // directly by `session::run_connected_session`'s own input arm,
+        // the same way `Detach` already is).
+        if self.account_deactivated.is_some() {
+            return match (kind, code) {
+                (KeyEventKind::Press | KeyEventKind::Repeat, KeyCode::Esc) => Some(UiAction::Quit),
+                _ => None,
+            };
+        }
+
         // An outstanding identity review takes priority over *everything*
         // else, including Ctrl+H - a peer's identity needs an explicit
         // decision before anything else happens, and unlike the help
@@ -4623,6 +4807,42 @@ impl UiState {
                         CallInviteChoice::Accept => self.accept_call_invite(call_id),
                         CallInviteChoice::Reject => Some(UiAction::RejectCallInvite { call_id }),
                     },
+                    _ => None,
+                },
+                _ => None,
+            };
+        }
+
+        // `/delete-channel`/`/assign-admin`'s confirmation - same tier and
+        // shape as `/call`'s just below, reusing `CallConfirmChoice`.
+        if self.channel_command_confirm.is_some() {
+            return match kind {
+                KeyEventKind::Press | KeyEventKind::Repeat => match code {
+                    KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
+                        self.channel_command_confirm_focus = match self.channel_command_confirm_focus {
+                            CallConfirmChoice::Confirm => CallConfirmChoice::Cancel,
+                            CallConfirmChoice::Cancel => CallConfirmChoice::Confirm,
+                        };
+                        None
+                    }
+                    KeyCode::Esc => {
+                        self.channel_command_confirm = None;
+                        None
+                    }
+                    KeyCode::Enter => {
+                        let pending = self.channel_command_confirm.take()?;
+                        match self.channel_command_confirm_focus {
+                            CallConfirmChoice::Confirm => Some(match pending.action {
+                                ChannelCommandConfirmAction::DeleteChannel { name } => {
+                                    UiAction::DeleteChannel { name }
+                                }
+                                ChannelCommandConfirmAction::AssignAdmin { channel, nickname } => {
+                                    UiAction::AssignChannelAdmin { channel, nickname }
+                                }
+                            }),
+                            CallConfirmChoice::Cancel => None,
+                        }
+                    }
                     _ => None,
                 },
                 _ => None,
@@ -4872,6 +5092,9 @@ impl UiState {
         }
         if self.mode == Mode::DirectPunches {
             return self.handle_direct_punches_key(code);
+        }
+        if self.mode == Mode::ChannelLockPopup {
+            return self.handle_channel_lock_popup_key(code);
         }
 
         // The top row's two selectors (`docs/SPEC.md` "Connected UI"):
@@ -5485,7 +5708,7 @@ impl UiState {
                 return None;
             };
             self.input.clear();
-            self.open_user_info(peer_id, peer.name.clone());
+            self.open_user_info(peer_id, peer.name.clone(), None);
             return Some(UiAction::RequestUserInfo { peer: peer_id, nickname: peer.name });
         }
         // Everything below requires the open DM's peer (if any) to actually
@@ -5612,6 +5835,34 @@ impl UiState {
             self.input.clear();
             return Some(UiAction::LeaveChannel { name });
         }
+        if self.input.trim() == "/delete-channel" {
+            // Always the currently selected channel, same "no argument"
+            // convention `/leave` uses - and the same confirmation tier
+            // `/call` uses just below, since deleting a channel is
+            // destructive and not one Enter away.
+            let channel = self.channels.get(self.selected_channel)?;
+            let name = channel.name.clone();
+            self.input.clear();
+            self.channel_command_confirm = Some(ChannelCommandConfirm {
+                title: "Delete channel?",
+                question: format!("Delete #{name}? This cannot be undone."),
+                action: ChannelCommandConfirmAction::DeleteChannel { name },
+            });
+            self.channel_command_confirm_focus = CallConfirmChoice::Cancel;
+            return None;
+        }
+        if self.input.trim() == "/lock-joins" {
+            // Purely local to open (see `channel_lock_popup`'s module
+            // doc) - prefilled with the channel's current members, per
+            // the spec's own "by default the current users joined should
+            // be included".
+            let channel = self.channels.get(self.selected_channel)?;
+            let name = channel.name.clone();
+            let members: Vec<String> = channel.members.iter().map(|m| m.name.clone()).collect();
+            self.input.clear();
+            self.open_channel_lock_popup(name, members);
+            return None;
+        }
         if self.input.trim() == "/call" {
             // Distinct from push-to-talk: a continuous, multi-user call
             // (`docs/PROTOCOL.md` "Live voice calls"), never available under
@@ -5693,6 +5944,12 @@ impl UiState {
         // unknown-command catch-all below, or they'd be swallowed as
         // typos of a real command.
         if let Some(action) = self.try_voice_mute_command() {
+            return action;
+        }
+        if let Some(action) = self.try_channel_moderation_command() {
+            return action;
+        }
+        if let Some(action) = self.try_superadmin_command() {
             return action;
         }
         // Anything else starting with `/` is an attempted command, not a
@@ -5970,6 +6227,133 @@ impl UiState {
         }))
     }
 
+    /// `/ban <nickname>`, `/unban <nickname>`, `/assign-admin <nickname>` -
+    /// admin commands against the currently-selected channel, each taking
+    /// one nickname argument, same shape `try_voice_mute_command`
+    /// establishes above. `/assign-admin` alone doesn't emit its
+    /// `UiAction` directly - it opens the same confirmation tier
+    /// `/delete-channel` uses (`docs/PROTOCOL.md` §6.7's own "with popup
+    /// confirmation"). None of the three is gated on the local user
+    /// actually being this channel's admin - the server is the sole
+    /// authority (`Registry::require_caller_is_admin`), and a non-admin's
+    /// attempt is simply refused with a reason (`ServerMessage::Error`,
+    /// now surfaced as a status notice).
+    fn try_channel_moderation_command(&mut self) -> Option<Option<UiAction>> {
+        let (verb, rest) = {
+            let input = self.input.trim();
+            match input.split_once(char::is_whitespace) {
+                Some((verb, rest)) => (verb.to_string(), rest.trim().to_string()),
+                None => (input.to_string(), String::new()),
+            }
+        };
+        if !matches!(verb.as_str(), "/ban" | "/unban" | "/assign-admin") {
+            return None;
+        }
+        let Some(channel) = self.channels.get(self.selected_channel) else {
+            self.input.clear();
+            return Some(None);
+        };
+        let channel_name = channel.name.clone();
+        if rest.is_empty() || rest.split_whitespace().count() > 1 {
+            self.input.clear();
+            self.push_status_notice(
+                format!("{verb} takes one nickname, with no spaces in it"),
+                false,
+            );
+            return Some(None);
+        }
+        let nickname = rest;
+        self.input.clear();
+        Some(Some(match verb.as_str() {
+            "/ban" => UiAction::BanFromChannel {
+                channel: channel_name,
+                nickname,
+            },
+            "/unban" => UiAction::UnbanFromChannel {
+                channel: channel_name,
+                nickname,
+            },
+            _ => {
+                // "/assign-admin"
+                self.channel_command_confirm = Some(ChannelCommandConfirm {
+                    title: "Assign admin?",
+                    question: format!(
+                        "Make {nickname} the admin of #{channel_name}? You will no longer be its admin."
+                    ),
+                    action: ChannelCommandConfirmAction::AssignAdmin {
+                        channel: channel_name,
+                        nickname,
+                    },
+                });
+                self.channel_command_confirm_focus = CallConfirmChoice::Cancel;
+                return Some(None);
+            }
+        }))
+    }
+
+    /// A superadmin's `/activate <nickname>`, `/deactivate <nickname>
+    /// <reason>`, `/remove-account <nickname>`, `/remove-channel <name>`
+    /// (`docs/PROTOCOL.md` §5.5). Shown and sendable regardless of
+    /// whether the local user actually is one - the server is the sole
+    /// authority (`require_superadmin`), matching this codebase's own
+    /// "the server never trusts the client" principle; a non-superadmin's
+    /// attempt is simply refused with a reason.
+    fn try_superadmin_command(&mut self) -> Option<Option<UiAction>> {
+        let (verb, rest) = {
+            let input = self.input.trim();
+            match input.split_once(char::is_whitespace) {
+                Some((verb, rest)) => (verb.to_string(), rest.trim().to_string()),
+                None => (input.to_string(), String::new()),
+            }
+        };
+        match verb.as_str() {
+            "/activate" | "/remove-account" => {
+                if rest.is_empty() || rest.split_whitespace().count() > 1 {
+                    self.input.clear();
+                    self.push_status_notice(
+                        format!("{verb} takes one nickname, with no spaces in it"),
+                        false,
+                    );
+                    return Some(None);
+                }
+                self.input.clear();
+                Some(Some(if verb == "/activate" {
+                    UiAction::AdminActivate { nickname: rest }
+                } else {
+                    UiAction::AdminRemoveAccount { nickname: rest }
+                }))
+            }
+            "/remove-channel" => {
+                if rest.is_empty() || rest.split_whitespace().count() > 1 {
+                    self.input.clear();
+                    self.push_status_notice(
+                        format!("{verb} takes one channel name, with no spaces in it"),
+                        false,
+                    );
+                    return Some(None);
+                }
+                self.input.clear();
+                Some(Some(UiAction::AdminRemoveChannel { name: rest }))
+            }
+            "/deactivate" => {
+                // The reason may contain spaces - only the nickname
+                // itself is a single word.
+                let (nickname, reason) = match rest.split_once(char::is_whitespace) {
+                    Some((n, r)) => (n.to_string(), r.trim().to_string()),
+                    None => (rest, String::new()),
+                };
+                if nickname.is_empty() || reason.is_empty() {
+                    self.input.clear();
+                    self.push_status_notice("/deactivate <nickname> <reason>".to_string(), false);
+                    return Some(None);
+                }
+                self.input.clear();
+                Some(Some(UiAction::AdminDeactivate { nickname, reason }))
+            }
+            _ => None,
+        }
+    }
+
     /// The last index (`channel.members.len()`) is always our own row
     /// (`channel::render_sidebar`'s synthetic "you" entry, appended after
     /// every real member rather than folded into `channel.members`
@@ -6021,7 +6405,7 @@ impl UiState {
                     return None;
                 }
                 let (id, name) = (member.id, member.name.clone());
-                self.open_user_info(id, name.clone());
+                self.open_user_info(id, name.clone(), Some(channel.name.clone()));
                 Some(UiAction::RequestUserInfo { peer: id, nickname: name })
             }
             _ => None,
@@ -6604,6 +6988,9 @@ pub fn render(frame: &mut Frame, state: &UiState) {
     if state.mode == Mode::DirectPunches {
         super::direct_punch_popup::render_direct_punches_popup(frame, area, state);
     }
+    if state.mode == Mode::ChannelLockPopup {
+        super::channel_lock_popup::render_channel_lock_popup(frame, area, state);
+    }
     // One message's delivery details, drawn under the help overlay and
     // every consent popup for the same reason `handle_key` lets those
     // absorb keys first.
@@ -6646,6 +7033,9 @@ pub fn render(frame: &mut Frame, state: &UiState) {
     if let Some(pending) = &state.call_confirm {
         render_call_confirm_popup(frame, area, pending, state.call_confirm_focus);
     }
+    if let Some(pending) = &state.channel_command_confirm {
+        render_channel_command_confirm_popup(frame, area, pending, state.channel_command_confirm_focus);
+    }
     // The OTP popups sit above the file offer, same tier `handle_key` gives
     // them (below only an identity review).
     if let Some(pending) = &state.otp_generate_confirm {
@@ -6671,6 +7061,12 @@ pub fn render(frame: &mut Frame, state: &UiState) {
     // of what else happened to be open when the mismatch arrived.
     if let Some(review) = state.identity_review_open() {
         render_identity_review_popup(frame, area, review, state.identity_review_focus);
+    }
+    // Outranks even the identity review, same as in `handle_key`: once
+    // the account is deactivated nothing else this session could still do
+    // matters, so this is always what's on screen from here on.
+    if let Some(reason) = &state.account_deactivated {
+        render_account_deactivated_modal(frame, area, reason);
     }
     // The permanent "on a call" indicator (`docs/SPEC.md` "Live voice
     // calls") is drawn in the same top-right corner the status notice
@@ -7595,6 +7991,43 @@ fn render_call_confirm_popup(
     );
 }
 
+/// `/delete-channel`/`/assign-admin`'s confirmation - a red-bordered
+/// mirror of `render_call_confirm_popup`, generic over `pending.question`
+/// rather than building the sentence itself, since the two commands ask
+/// two different questions over the same Confirm/Cancel shape.
+fn render_channel_command_confirm_popup(
+    frame: &mut Frame,
+    area: Rect,
+    pending: &ChannelCommandConfirm,
+    focus: CallConfirmChoice,
+) {
+    let popup = centered_rect(60, 9, area);
+    let block = Block::default()
+        .title(pending.title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Red));
+    let inner = block.inner(popup);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(block, popup);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(3)])
+        .split(inner);
+
+    frame.render_widget(
+        Paragraph::new(pending.question.as_str()).wrap(ratatui::widgets::Wrap { trim: true }),
+        rows[0],
+    );
+
+    let button_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(rows[1]);
+    render_popup_button(frame, button_cols[0], 16, "Confirm", focus == CallConfirmChoice::Confirm);
+    render_popup_button(frame, button_cols[1], 16, "Cancel", focus == CallConfirmChoice::Cancel);
+}
+
 fn render_call_banner(
     frame: &mut Frame,
     area: Rect,
@@ -7923,7 +8356,20 @@ pub(crate) fn render_messages(
             })
             .unwrap_or_else(|| "Private".to_string())
     } else {
-        "Messages".to_string()
+        // The channel's own name, `🔒`-prefixed for a private one, the
+        // same convention the (unbordered) header selector already uses
+        // (`channel_label`) - plus its admin, when it has one (never
+        // `the-hall`, whose `admin` is always `None`).
+        match state.channels.get(state.selected_channel) {
+            Some(c) => {
+                let base = channel_label(c.kind, &c.name);
+                match &c.admin {
+                    Some(admin) => format!("{base} (admin: {admin})"),
+                    None => base,
+                }
+            }
+            None => "Messages".to_string(),
+        }
     };
     let border_style = focus_border_style(state.focus == Focus::Messages);
     let block = Block::default()
@@ -8715,6 +9161,40 @@ fn render_help_popup(frame: &mut Frame, area: Rect, state: &UiState) {
     let scroll = state.help_scroll.min(max_scroll);
 
     frame.render_widget(Paragraph::new(lines).scroll((scroll as u16, 0)), inner);
+}
+
+/// The full-screen, red-bordered takeover shown once a superadmin's
+/// `/deactivate` lands against this account. Structural copy of
+/// `render_help_popup` - the only other place this codebase takes
+/// `frame.area()` directly rather than `centered_rect`, for the same
+/// reason: nothing behind it should be readable, or in this case even
+/// visible, once it's up. Escape is the only key `handle_key`'s matching
+/// top-priority tier answers, which ends the whole session - there is
+/// nothing to "return to" underneath, unlike `help_open`.
+fn render_account_deactivated_modal(frame: &mut Frame, area: Rect, reason: &str) {
+    let popup = area;
+    let block = Block::default()
+        .title("Account deactivated")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Red));
+    let inner = block.inner(popup);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(block, popup);
+
+    let text = format!("Your account has been deactivated (\"{reason}\")\n\nPress ESCAPE to close aloo");
+    let paragraph = Paragraph::new(text)
+        .style(Style::default().fg(Color::Red))
+        .alignment(Alignment::Center)
+        .wrap(ratatui::widgets::Wrap { trim: true });
+    // Vertically centered within the bordered area, the same way a small
+    // confirm popup centers itself in its own box - just at the scale of
+    // the whole screen here.
+    let centered = Rect {
+        y: inner.y + inner.height / 3,
+        height: inner.height.saturating_sub(inner.height / 3),
+        ..inner
+    };
+    frame.render_widget(paragraph, centered);
 }
 
 pub(crate) fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {

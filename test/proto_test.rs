@@ -43,11 +43,13 @@ fn auth_activate_and_register_messages_roundtrip() {
         ServerMessage::AuthResult {
             ok: false,
             activation_pending: true,
+            deactivated: None,
             reason: None,
         },
         ServerMessage::AuthResult {
             ok: true,
             activation_pending: false,
+            deactivated: None,
             reason: None,
         },
         ServerMessage::RegisterResult {
@@ -87,16 +89,19 @@ fn rotate_key_and_key_rotated_roundtrip() {
 /// @requirement AC-043, TB-060
 #[test]
 fn encode_decode_roundtrip_server_message() {
-    let msg = ServerMessage::ChannelList(vec![
-        ChannelInfo {
-            name: "general".into(),
-            kind: ChannelKind::Public,
-        },
-        ChannelInfo {
-            name: "secret-room".into(),
-            kind: ChannelKind::Private,
-        },
-    ]);
+    let msg = ServerMessage::ChannelList {
+        channels: vec![
+            ChannelInfo {
+                name: "general".into(),
+                kind: ChannelKind::Public,
+            },
+            ChannelInfo {
+                name: "secret-room".into(),
+                kind: ChannelKind::Private,
+            },
+        ],
+        superadmins: vec!["alice".into()],
+    };
     let bytes = encode(&msg).expect("encode");
     let decoded: ServerMessage = decode(&bytes).expect("decode");
     assert_eq!(msg, decoded);

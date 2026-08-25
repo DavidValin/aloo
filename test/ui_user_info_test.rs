@@ -124,7 +124,7 @@ fn slash_info_works_even_for_an_offline_peer() {
 #[test]
 fn set_user_info_is_a_no_op_for_the_wrong_peer_or_a_closed_popup() {
     let mut state = joined_general_with(vec![user(2, "bob"), user(3, "carol")]);
-    state.open_user_info(UserId(2), "bob".to_string());
+    state.open_user_info(UserId(2), "bob".to_string(), None);
     state.set_user_info(UserId(3), None, None, vec![]);
     assert_eq!(
         state.user_info.as_ref().unwrap().nickname,
@@ -145,7 +145,7 @@ fn set_user_info_is_a_no_op_for_the_wrong_peer_or_a_closed_popup() {
 #[test]
 fn the_popup_shows_nickname_device_last_seen_and_every_key() {
     let mut state = joined_general_with(vec![user(2, "bob")]);
-    state.open_user_info(UserId(2), "bob".to_string());
+    state.open_user_info(UserId(2), "bob".to_string(), None);
     state.set_user_info(
         UserId(2),
         Some("laptop".to_string()),
@@ -169,7 +169,7 @@ fn the_popup_shows_nickname_device_last_seen_and_every_key() {
 #[test]
 fn an_unbound_peer_shows_the_placeholder_device() {
     let mut state = joined_general_with(vec![user(2, "bob")]);
-    state.open_user_info(UserId(2), "bob".to_string());
+    state.open_user_info(UserId(2), "bob".to_string(), None);
     state.set_user_info(UserId(2), None, None, vec![]);
 
     let body = popup_body(&buffer_at(&state, 140, 30), "bob").join("\n");
@@ -180,7 +180,7 @@ fn an_unbound_peer_shows_the_placeholder_device() {
 #[test]
 fn an_active_otp_session_is_named_at_the_end() {
     let mut state = joined_general_with(vec![user(2, "bob")]);
-    state.open_user_info(UserId(2), "bob".to_string());
+    state.open_user_info(UserId(2), "bob".to_string(), None);
     state.set_user_info(UserId(2), Some("laptop".to_string()), None, vec![]);
     state.mark_otp_active(UserId(2));
 
@@ -192,7 +192,7 @@ fn an_active_otp_session_is_named_at_the_end() {
 #[test]
 fn no_active_otp_session_says_nothing_about_one() {
     let mut state = joined_general_with(vec![user(2, "bob")]);
-    state.open_user_info(UserId(2), "bob".to_string());
+    state.open_user_info(UserId(2), "bob".to_string(), None);
     state.set_user_info(UserId(2), Some("laptop".to_string()), None, vec![]);
 
     let body = popup_body(&buffer_at(&state, 140, 30), "bob").join("\n");

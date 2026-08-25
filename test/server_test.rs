@@ -1,45 +1,14 @@
 #[path = "server_common.rs"]
 mod server_common;
 
-use std::net::{IpAddr, Ipv4Addr};
-
 use aloo::proto::*;
-use aloo::server::{
-    CHANNEL_MAX_PASSWORD_ATTEMPTS, CHANNEL_PASSWORD_BAN_DURATION, DEFAULT_CHANNEL_NAME, Outgoing,
-    Registry,
-};
+use aloo::server::Registry;
 use server_common::{TestServer, login, password_for, test_options, test_users_registry};
 
-const TEST_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
-const OTHER_TEST_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
-
 // ---------------------------------------------------------------------
-// Registry: pure logic, no sockets
+// Registry: pure logic, no sockets (channel-specific tests moved to
+// server_channels_registry_test.rs)
 // ---------------------------------------------------------------------
-
-/// @requirement TB-113
-#[test]
-fn join_channel_fails_for_an_unregistered_user() {
-    let mut reg = Registry::new();
-    let unknown = UserId(999_999); // never registered
-    let err = reg
-        .join_channel(unknown, "general", ChannelKind::Public, None, TEST_IP)
-        .unwrap_err();
-    assert!(
-        err.contains("unknown user"),
-        "unexpected error message: {err}"
-    );
-}
-
-/// @requirement AC-018
-#[test]
-fn fresh_registry_has_default_public_the_hall_channel() {
-    let reg = Registry::new();
-    let list = reg.channel_list();
-    assert_eq!(list.len(), 1);
-    assert_eq!(list[0].name, "the-hall");
-    assert_eq!(list[0].kind, ChannelKind::Public);
-}
 
 /// @requirement TB-017
 #[test]
@@ -93,542 +62,6 @@ fn try_register_allows_the_name_again_once_the_holder_is_gone() {
         .try_register("dave".into(), vec![2], KeyMode::PqHybrid)
         .expect("name freed up after unregister");
     assert_eq!(reg.user_info(second).unwrap().public_key_der, vec![2]);
-}
-
-/// @requirement TB-022
-#[test]
-fn joining_new_channel_sends_confirmation_and_no_peer_events() {
-    let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::PqHybrid);
-    let out = reg
-        .join_channel(alice, "general", ChannelKind::Public, None, TEST_IP)
-        .unwrap();
-    assert_eq!(out.len(), 1);
-    assert!(matches!(
-        &out[0],
-        Outgoing { to, message: ServerMessage::Joined { channel } }
-            if *to == alice && channel.name == "general"
-    ));
-}
-
-/// @requirement AC-019, TB-022
-#[test]
-fn second_joiner_gets_snapshot_and_first_gets_notified() {
-    let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![9], KeyMode::PqHybrid);
-    let bob = reg.register("bob".into(), vec![8], KeyMode::PqHybrid);
-    reg.join_channel(alice, "general", ChannelKind::Public, None, TEST_IP)
-        .unwrap();
-    let out = reg
-        .join_channel(bob, "general", ChannelKind::Public, None, TEST_IP)
-        .unwrap();
-
-    // bob should learn about alice, alice should learn about bob, then bob gets Joined.
-    let bob_learns_alice = out.iter().any(|o| {
-        matches!(&o.message, ServerMessage::UserJoined { channel, user }
-            if *to_id(o) == bob && channel == "general" && user.id == alice)
-    });
-    let alice_learns_bob = out.iter().any(|o| {
-        matches!(&o.message, ServerMessage::UserJoined { channel, user }
-            if *to_id(o) == alice && channel == "general" && user.id == bob)
-    });
-    let bob_confirmed = out.iter().any(|o| {
-        matches!(&o.message, ServerMessage::Joined { channel } if *to_id(o) == bob && channel.name == "general")
-    });
-    assert!(bob_learns_alice, "bob should receive alice's info: {out:?}");
-    assert!(
-        alice_learns_bob,
-        "alice should be notified bob joined: {out:?}"
-    );
-    assert!(
-        bob_confirmed,
-        "bob should get a Joined confirmation: {out:?}"
-    );
-
-    fn to_id(o: &Outgoing) -> &UserId {
-        &o.to
-    }
-}
-
-/// @requirement TB-021
-#[test]
-fn rejoining_a_channel_is_a_noop() {
-    let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::PqHybrid);
-    reg.join_channel(alice, "general", ChannelKind::Public, None, TEST_IP)
-        .unwrap();
-    let out = reg
-        .join_channel(alice, "general", ChannelKind::Public, None, TEST_IP)
-        .unwrap();
-    assert!(out.is_empty());
-}
-
-/// @requirement AC-022
-#[test]
-fn private_channel_is_created_on_join_but_not_listed() {
-    let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::PqHybrid);
-    reg.join_channel(alice, "secret-room", ChannelKind::Private, None, TEST_IP)
-        .unwrap();
-    let list = reg.channel_list();
-    assert!(list.iter().all(|c| c.name != "secret-room"));
-}
-
-/// @requirement AC-023
-#[test]
-fn leaving_notifies_remaining_members() {
-    let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::PqHybrid);
-    let bob = reg.register("bob".into(), vec![], KeyMode::PqHybrid);
-    reg.join_channel(alice, "general", ChannelKind::Public, None, TEST_IP)
-        .unwrap();
-    reg.join_channel(bob, "general", ChannelKind::Public, None, TEST_IP)
-        .unwrap();
-
-    let out = reg.leave_channel(alice, "general");
-    assert_eq!(out.len(), 1);
-    assert_eq!(out[0].to, bob);
-    assert!(
-        matches!(&out[0].message, ServerMessage::UserLeft { channel, user_id }
-        if channel == "general" && *user_id == alice)
-    );
-}
-
-/// @requirement TB-023, AC-107
-#[test]
-fn empty_channel_is_deleted_unless_it_is_the_default_channel() {
-    let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::PqHybrid);
-    reg.join_channel(
-        alice,
-        DEFAULT_CHANNEL_NAME,
-        ChannelKind::Public,
-        None,
-        TEST_IP,
-    )
-    .unwrap();
-    reg.join_channel(
-        alice,
-        "another-public-room",
-        ChannelKind::Public,
-        None,
-        TEST_IP,
-    )
-    .unwrap();
-    reg.join_channel(alice, "secret-room", ChannelKind::Private, None, TEST_IP)
-        .unwrap();
-
-    reg.leave_channel(alice, DEFAULT_CHANNEL_NAME);
-    reg.leave_channel(alice, "another-public-room");
-    reg.leave_channel(alice, "secret-room");
-
-    // The default channel survives being empty forever.
-    assert!(
-        reg.channel_list()
-            .iter()
-            .any(|c| c.name == DEFAULT_CHANNEL_NAME)
-    );
-    // Any other channel - public or private - is unregistered once empty:
-    // re-joining either recreates it fresh, with no memory of prior
-    // membership (just the Joined confirmation, no stale peers).
-    let out = reg
-        .join_channel(
-            alice,
-            "another-public-room",
-            ChannelKind::Public,
-            None,
-            TEST_IP,
-        )
-        .unwrap();
-    assert_eq!(out.len(), 1);
-    let out = reg
-        .join_channel(alice, "secret-room", ChannelKind::Private, None, TEST_IP)
-        .unwrap();
-    assert_eq!(out.len(), 1);
-}
-
-/// @requirement AC-108
-#[test]
-fn a_newly_created_public_channel_is_broadcast_to_other_connected_clients() {
-    let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::PqHybrid);
-    let bob = reg.register("bob".into(), vec![], KeyMode::PqHybrid);
-
-    let out = reg
-        .join_channel(alice, "brand-new-room", ChannelKind::Public, None, TEST_IP)
-        .unwrap();
-    assert!(
-        out.iter().any(|o| o.to == bob
-            && matches!(&o.message, ServerMessage::ChannelCreated { channel }
-                if channel.name == "brand-new-room" && channel.kind == ChannelKind::Public)),
-        "bob should learn about the new public channel without joining it: {out:?}"
-    );
-    // alice (the creator) already has her own `Joined` - no redundant
-    // ChannelCreated addressed to herself.
-    assert!(
-        !out.iter()
-            .any(|o| o.to == alice && matches!(&o.message, ServerMessage::ChannelCreated { .. })),
-        "the creator shouldn't get a redundant ChannelCreated: {out:?}"
-    );
-}
-
-/// @requirement TB-156
-#[test]
-fn creating_a_private_channel_never_broadcasts_channelcreated() {
-    let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::PqHybrid);
-    let _bob = reg.register("bob".into(), vec![], KeyMode::PqHybrid);
-
-    let out = reg
-        .join_channel(alice, "secret-room", ChannelKind::Private, None, TEST_IP)
-        .unwrap();
-    assert!(
-        !out.iter()
-            .any(|o| matches!(&o.message, ServerMessage::ChannelCreated { .. })),
-        "a private channel must never be broadcast: {out:?}"
-    );
-}
-
-/// @requirement AC-108
-#[test]
-fn joining_an_already_existing_public_channel_does_not_rebroadcast_it() {
-    let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::PqHybrid);
-    let bob = reg.register("bob".into(), vec![], KeyMode::PqHybrid);
-    let carol = reg.register("carol".into(), vec![], KeyMode::PqHybrid);
-
-    reg.join_channel(alice, "already-there", ChannelKind::Public, None, TEST_IP)
-        .unwrap();
-    let out = reg
-        .join_channel(bob, "already-there", ChannelKind::Public, None, TEST_IP)
-        .unwrap();
-    assert!(
-        !out.iter()
-            .any(|o| o.to == carol && matches!(&o.message, ServerMessage::ChannelCreated { .. })),
-        "only genuine creation should broadcast, not every later join: {out:?}"
-    );
-}
-
-/// @requirement TB-102
-#[test]
-fn unregister_removes_user_from_every_channel_it_was_in() {
-    let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::PqHybrid);
-    let bob = reg.register("bob".into(), vec![], KeyMode::PqHybrid);
-    reg.join_channel(alice, "general", ChannelKind::Public, None, TEST_IP)
-        .unwrap();
-    reg.join_channel(bob, "general", ChannelKind::Public, None, TEST_IP)
-        .unwrap();
-
-    // A full disconnect notifies remaining peers with `UserOffline`, not
-    // `UserLeft` - that's reserved for an explicit single-channel
-    // `LeaveChannel` while still connected (see `leaving_notifies_remaining_members`).
-    let out = reg.unregister(alice);
-    assert!(out.iter().any(|o| o.to == bob
-        && matches!(&o.message, ServerMessage::UserOffline { user_id } if *user_id == alice)));
-    assert!(reg.user_info(alice).is_none());
-}
-
-/// @requirement TB-103
-#[test]
-fn unregister_sends_exactly_one_useroffline_per_peer_even_if_shared_multiple_channels() {
-    let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::PqHybrid);
-    let bob = reg.register("bob".into(), vec![], KeyMode::PqHybrid);
-    reg.join_channel(alice, "general", ChannelKind::Public, None, TEST_IP)
-        .unwrap();
-    reg.join_channel(bob, "general", ChannelKind::Public, None, TEST_IP)
-        .unwrap();
-    reg.join_channel(alice, "another-room", ChannelKind::Public, None, TEST_IP)
-        .unwrap();
-    reg.join_channel(bob, "another-room", ChannelKind::Public, None, TEST_IP)
-        .unwrap();
-
-    let out = reg.unregister(alice);
-    let to_bob: Vec<_> = out
-        .iter()
-        .filter(|o| o.to == bob && matches!(&o.message, ServerMessage::UserOffline { .. }))
-        .collect();
-    assert_eq!(
-        to_bob.len(),
-        1,
-        "bob shares two channels with alice but should get one UserOffline: {out:?}"
-    );
-}
-
-/// @requirement AC-023, TB-102
-#[test]
-fn leave_channel_still_sends_userleft_while_the_user_stays_connected() {
-    let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::PqHybrid);
-    let bob = reg.register("bob".into(), vec![], KeyMode::PqHybrid);
-    reg.join_channel(alice, "general", ChannelKind::Public, None, TEST_IP)
-        .unwrap();
-    reg.join_channel(bob, "general", ChannelKind::Public, None, TEST_IP)
-        .unwrap();
-
-    let out = reg.leave_channel(alice, "general");
-    assert!(
-        out.iter()
-            .any(|o| o.to == bob && matches!(&o.message, ServerMessage::UserLeft { .. }))
-    );
-    // alice is still a registered client - leaving a channel is not a disconnect.
-    assert!(reg.user_info(alice).is_some());
-}
-
-// ---------------------------------------------------------------------
-// Channel name validation (AC-102)
-// ---------------------------------------------------------------------
-
-/// @requirement AC-102
-#[test]
-fn join_channel_rejects_a_name_over_the_length_cap() {
-    let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::PqHybrid);
-    let too_long = "a".repeat(aloo::validation::CHANNEL_NAME_MAX_LEN + 1);
-    let err = reg
-        .join_channel(alice, &too_long, ChannelKind::Public, None, TEST_IP)
-        .unwrap_err();
-    assert!(
-        err.contains("channel name"),
-        "unexpected error message: {err}"
-    );
-}
-
-/// @requirement AC-102
-#[test]
-fn join_channel_rejects_a_name_with_disallowed_characters() {
-    let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::PqHybrid);
-    let err = reg
-        .join_channel(alice, "has space", ChannelKind::Public, None, TEST_IP)
-        .unwrap_err();
-    assert!(
-        err.contains("channel name"),
-        "unexpected error message: {err}"
-    );
-}
-
-// ---------------------------------------------------------------------
-// Password-protected private channels and brute-force protection (US-025)
-// ---------------------------------------------------------------------
-
-/// @requirement AC-104, TB-151
-#[test]
-fn private_channel_created_with_a_password_can_be_joined_by_a_second_client_with_the_right_one() {
-    let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::PqHybrid);
-    let bob = reg.register("bob".into(), vec![], KeyMode::PqHybrid);
-    reg.join_channel(
-        alice,
-        "vault",
-        ChannelKind::Private,
-        Some("s3cret!"),
-        TEST_IP,
-    )
-    .unwrap();
-    let out = reg
-        .join_channel(bob, "vault", ChannelKind::Private, Some("s3cret!"), TEST_IP)
-        .unwrap();
-    assert!(out.iter().any(|o| o.to == bob
-        && matches!(&o.message, ServerMessage::Joined { channel } if channel.name == "vault")));
-}
-
-/// @requirement AC-105
-#[test]
-fn private_channel_created_with_a_password_rejects_a_join_with_no_password() {
-    let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::PqHybrid);
-    let bob = reg.register("bob".into(), vec![], KeyMode::PqHybrid);
-    reg.join_channel(
-        alice,
-        "vault",
-        ChannelKind::Private,
-        Some("s3cret!"),
-        TEST_IP,
-    )
-    .unwrap();
-    let out = reg
-        .join_channel(bob, "vault", ChannelKind::Private, None, TEST_IP)
-        .unwrap();
-    assert_eq!(out.len(), 1);
-    assert!(matches!(
-        &out[0],
-        Outgoing { to, message: ServerMessage::ChannelJoinRejected { name, kind: ChannelJoinRejection::PasswordRequired } }
-            if *to == bob && name == "vault"
-    ));
-}
-
-/// @requirement AC-105, TB-151
-#[test]
-fn private_channel_created_with_a_password_rejects_a_join_with_the_wrong_password() {
-    let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::PqHybrid);
-    let bob = reg.register("bob".into(), vec![], KeyMode::PqHybrid);
-    reg.join_channel(
-        alice,
-        "vault",
-        ChannelKind::Private,
-        Some("s3cret!"),
-        TEST_IP,
-    )
-    .unwrap();
-    let out = reg
-        .join_channel(bob, "vault", ChannelKind::Private, Some("wrong"), TEST_IP)
-        .unwrap();
-    assert_eq!(out.len(), 1);
-    assert!(matches!(
-        &out[0],
-        Outgoing { to, message: ServerMessage::ChannelJoinRejected { name, kind: ChannelJoinRejection::WrongPassword } }
-            if *to == bob && name == "vault"
-    ));
-}
-
-/// @requirement TB-152
-#[test]
-fn a_successful_password_join_resets_the_attempt_counter() {
-    let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::PqHybrid);
-    let bob = reg.register("bob".into(), vec![], KeyMode::PqHybrid);
-    reg.join_channel(
-        alice,
-        "vault",
-        ChannelKind::Private,
-        Some("s3cret!"),
-        TEST_IP,
-    )
-    .unwrap();
-
-    for _ in 0..CHANNEL_MAX_PASSWORD_ATTEMPTS - 1 {
-        reg.join_channel(bob, "vault", ChannelKind::Private, Some("wrong"), TEST_IP)
-            .unwrap();
-    }
-    // succeed - this must reset the counter
-    reg.join_channel(bob, "vault", ChannelKind::Private, Some("s3cret!"), TEST_IP)
-        .unwrap();
-
-    // now bob leaves and tries again from scratch: one wrong guess must not
-    // be treated as already-near-the-ban-threshold.
-    reg.leave_channel(bob, "vault");
-    let out = reg
-        .join_channel(bob, "vault", ChannelKind::Private, Some("wrong"), TEST_IP)
-        .unwrap();
-    assert!(matches!(
-        &out[0].message,
-        ServerMessage::ChannelJoinRejected {
-            kind: ChannelJoinRejection::WrongPassword,
-            ..
-        }
-    ));
-}
-
-/// @requirement AC-106, TB-153
-#[test]
-fn more_than_seven_wrong_attempts_from_one_ip_bans_that_ip_for_that_channel() {
-    let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::PqHybrid);
-    let bob = reg.register("bob".into(), vec![], KeyMode::PqHybrid);
-    reg.join_channel(
-        alice,
-        "vault",
-        ChannelKind::Private,
-        Some("s3cret!"),
-        TEST_IP,
-    )
-    .unwrap();
-
-    let mut last = None;
-    for _ in 0..CHANNEL_MAX_PASSWORD_ATTEMPTS + 1 {
-        last = Some(
-            reg.join_channel(bob, "vault", ChannelKind::Private, Some("wrong"), TEST_IP)
-                .unwrap(),
-        );
-    }
-    assert!(matches!(
-        &last.unwrap()[0].message,
-        ServerMessage::ChannelJoinRejected {
-            kind: ChannelJoinRejection::Banned,
-            ..
-        }
-    ));
-
-    // even the right password is refused now.
-    let out = reg
-        .join_channel(bob, "vault", ChannelKind::Private, Some("s3cret!"), TEST_IP)
-        .unwrap();
-    assert!(matches!(
-        &out[0].message,
-        ServerMessage::ChannelJoinRejected {
-            kind: ChannelJoinRejection::Banned,
-            ..
-        }
-    ));
-}
-
-/// @requirement TB-153
-#[test]
-fn a_ban_is_scoped_to_ip_and_channel_not_userid() {
-    let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::PqHybrid);
-    let bob = reg.register("bob".into(), vec![], KeyMode::PqHybrid);
-    reg.join_channel(
-        alice,
-        "vault",
-        ChannelKind::Private,
-        Some("s3cret!"),
-        TEST_IP,
-    )
-    .unwrap();
-
-    for _ in 0..CHANNEL_MAX_PASSWORD_ATTEMPTS + 1 {
-        reg.join_channel(bob, "vault", ChannelKind::Private, Some("wrong"), TEST_IP)
-            .unwrap();
-    }
-
-    // a different source address is unaffected by TEST_IP's ban.
-    let out = reg
-        .join_channel(
-            bob,
-            "vault",
-            ChannelKind::Private,
-            Some("wrong"),
-            OTHER_TEST_IP,
-        )
-        .unwrap();
-    assert!(matches!(
-        &out[0].message,
-        ServerMessage::ChannelJoinRejected {
-            kind: ChannelJoinRejection::WrongPassword,
-            ..
-        }
-    ));
-    let _ = CHANNEL_PASSWORD_BAN_DURATION; // exercised via elapsed() inside Registry; referenced here for clarity
-}
-
-/// @requirement TB-154
-#[test]
-fn channel_join_rejected_is_sent_to_the_requester_only() {
-    let mut reg = Registry::new();
-    let alice = reg.register("alice".into(), vec![], KeyMode::PqHybrid);
-    let bob = reg.register("bob".into(), vec![], KeyMode::PqHybrid);
-    reg.join_channel(
-        alice,
-        "vault",
-        ChannelKind::Private,
-        Some("s3cret!"),
-        TEST_IP,
-    )
-    .unwrap();
-
-    let out = reg
-        .join_channel(bob, "vault", ChannelKind::Private, Some("wrong"), TEST_IP)
-        .unwrap();
-    assert_eq!(
-        out.len(),
-        1,
-        "must be sent to bob only, not broadcast: {out:?}"
-    );
-    assert_eq!(out[0].to, bob);
 }
 
 // ---------------------------------------------------------------------
@@ -757,6 +190,7 @@ async fn a_registered_nickname_with_its_password_is_let_in() {
         ServerMessage::AuthResult {
             ok: true,
             activation_pending: false,
+            deactivated: None,
             reason: None
         }
     );
@@ -775,6 +209,7 @@ async fn a_wrong_password_and_an_unknown_nickname_are_refused_alike() {
     let ServerMessage::AuthResult {
         ok: false,
         activation_pending: false,
+        deactivated: None,
         reason: Some(wrong_reason),
     } = wrong
     else {
@@ -788,6 +223,7 @@ async fn a_wrong_password_and_an_unknown_nickname_are_refused_alike() {
     let ServerMessage::AuthResult {
         ok: false,
         activation_pending: false,
+        deactivated: None,
         reason: Some(unknown_reason),
     } = unknown
     else {
@@ -828,6 +264,7 @@ async fn a_pending_account_is_asked_for_its_code_and_activated_by_the_right_one(
         ServerMessage::AuthResult {
             ok: false,
             activation_pending: true,
+            deactivated: None,
             reason: None
         }
     );
@@ -839,7 +276,7 @@ async fn a_pending_account_is_asked_for_its_code_and_activated_by_the_right_one(
         .unwrap();
     let refused: ServerMessage = stream.recv().await.unwrap().unwrap();
     assert!(
-        matches!(refused, ServerMessage::AuthResult { ok: false, activation_pending: false, reason: Some(ref r) } if r.contains("wrong")),
+        matches!(refused, ServerMessage::AuthResult { ok: false, activation_pending: false, deactivated: None, reason: Some(ref r) } if r.contains("wrong")),
         "{refused:?}"
     );
     assert!(stream.recv::<ServerMessage>().await.unwrap().is_none());
@@ -894,6 +331,7 @@ async fn an_expired_activation_is_refused_with_a_reason() {
         ServerMessage::AuthResult {
             ok: false,
             activation_pending: false,
+            deactivated: None,
             reason: Some(reason),
         } => assert!(reason.contains("expired"), "{reason}"),
         other => panic!("expected an expiry refusal, got {other:?}"),
@@ -1367,4 +805,219 @@ async fn ordinary_traffic_resets_the_heartbeat_timeout_clock() {
         ),
         "dave's original connection should still be alive, kept so by its heartbeats: {identify_result:?}"
     );
+}
+
+// ---------------------------------------------------------------------
+// Superadmins (docs/PROTOCOL.md §5.5): Admin* messages, end to end
+// ---------------------------------------------------------------------
+
+/// @requirement AC-344, AC-348, TB-262
+#[tokio::test]
+async fn a_non_superadmin_admin_deactivate_is_refused_and_changes_nothing() {
+    let mut options = test_options("admin-not-superadmin");
+    options.superadmins.insert("alice".to_string());
+    let server = TestServer::spawn(options).await;
+
+    let mut a = server.connect().await; // alice IS the superadmin here
+    server.handshake(&mut a, "alice").await;
+    let mut b = server.connect().await; // mallory is not
+    server.handshake(&mut b, "mallory").await;
+    server.ensure_user("eve");
+
+    b.send(&ClientMessage::AdminDeactivate {
+        nickname: "eve".into(),
+        reason: "not really an admin".into(),
+    })
+    .await
+    .unwrap();
+    let err: ServerMessage = b.recv().await.unwrap().unwrap();
+    assert!(
+        matches!(&err, ServerMessage::Error { message } if message.contains("superadmin")),
+        "expected a superadmin-only refusal, got {err:?}"
+    );
+
+    // eve's account is completely unaffected.
+    let mut c = server.connect().await;
+    let result = login(&mut c, "eve", &password_for("eve")).await;
+    assert!(matches!(result, ServerMessage::AuthResult { ok: true, .. }));
+}
+
+/// @requirement AC-344
+#[tokio::test]
+async fn a_superadmins_deactivate_blocks_the_next_login_with_the_reason() {
+    let mut options = test_options("admin-deactivate-login");
+    options.superadmins.insert("alice".to_string());
+    let server = TestServer::spawn(options).await;
+
+    let mut a = server.connect().await;
+    server.handshake(&mut a, "alice").await;
+    server.ensure_user("eve");
+
+    a.send(&ClientMessage::AdminDeactivate {
+        nickname: "eve".into(),
+        reason: "spamming".into(),
+    })
+    .await
+    .unwrap();
+
+    let mut b = server.connect().await;
+    let result = login(&mut b, "eve", &password_for("eve")).await;
+    assert_eq!(
+        result,
+        ServerMessage::AuthResult {
+            ok: false,
+            activation_pending: false,
+            deactivated: Some("spamming".to_string()),
+            reason: None,
+        }
+    );
+}
+
+/// @requirement AC-345
+#[tokio::test]
+async fn a_superadmins_deactivate_notifies_a_currently_connected_target_live() {
+    let mut options = test_options("admin-deactivate-live");
+    options.superadmins.insert("alice".to_string());
+    let server = TestServer::spawn(options).await;
+
+    let mut a = server.connect().await;
+    server.handshake(&mut a, "alice").await;
+    let mut eve = server.connect().await;
+    server.handshake(&mut eve, "eve").await;
+
+    a.send(&ClientMessage::AdminDeactivate {
+        nickname: "eve".into(),
+        reason: "spamming".into(),
+    })
+    .await
+    .unwrap();
+
+    let pushed: ServerMessage = eve.recv().await.unwrap().unwrap();
+    assert_eq!(
+        pushed,
+        ServerMessage::AccountDeactivated { reason: "spamming".to_string() }
+    );
+}
+
+/// @requirement AC-344
+#[tokio::test]
+async fn a_superadmins_activate_reverses_a_deactivation() {
+    let mut options = test_options("admin-activate");
+    options.superadmins.insert("alice".to_string());
+    let server = TestServer::spawn(options).await;
+
+    let mut a = server.connect().await;
+    server.handshake(&mut a, "alice").await;
+    server.ensure_user("eve");
+
+    // Neither `AdminDeactivate` nor `AdminActivate` acknowledges the
+    // sender (§5.5 - `require_superadmin`'s success path has nothing to
+    // say back), and each is handled by connection `a`'s own task,
+    // entirely independent of the brand-new connection `b` opens right
+    // after - so, unlike the other superadmin tests above (which confirm
+    // each command's effect by reading its own *consequence* off a
+    // connection the command itself pushes to), there is nothing here to
+    // synchronize on except giving both writes - each a blocking
+    // filesystem call - time to actually land before `b` races them.
+    a.send(&ClientMessage::AdminDeactivate {
+        nickname: "eve".into(),
+        reason: "spamming".into(),
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    a.send(&ClientMessage::AdminActivate { nickname: "eve".into() })
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let mut b = server.connect().await;
+    let result = login(&mut b, "eve", &password_for("eve")).await;
+    assert!(matches!(result, ServerMessage::AuthResult { ok: true, .. }));
+}
+
+/// @requirement AC-346
+#[tokio::test]
+async fn a_superadmins_remove_account_cascades_into_channels_it_administers() {
+    let mut options = test_options("admin-remove-account");
+    options.superadmins.insert("alice".to_string());
+    let server = TestServer::spawn(options).await;
+
+    let mut a = server.connect().await;
+    server.handshake(&mut a, "alice").await;
+    let mut eve = server.connect().await;
+    server.handshake(&mut eve, "eve").await;
+    let mut bob = server.connect().await;
+    server.handshake(&mut bob, "bob").await;
+
+    eve.send(&ClientMessage::JoinChannel {
+        name: "eves-room".into(),
+        kind: ChannelKind::Public,
+        password: None,
+    })
+    .await
+    .unwrap();
+    let _: ServerMessage = eve.recv().await.unwrap().unwrap(); // Joined
+    bob.send(&ClientMessage::JoinChannel {
+        name: "eves-room".into(),
+        kind: ChannelKind::Public,
+        password: None,
+    })
+    .await
+    .unwrap();
+    let _: ServerMessage = bob.recv().await.unwrap().unwrap(); // snapshot/Joined may span two
+
+    a.send(&ClientMessage::AdminRemoveAccount { nickname: "eve".into() })
+        .await
+        .unwrap();
+
+    // bob, still connected, is told the channel is gone.
+    let mut saw_removal = false;
+    for _ in 0..4 {
+        let Ok(Some(msg)) = tokio::time::timeout(std::time::Duration::from_secs(2), bob.recv())
+            .await
+            .unwrap_or(Ok(None))
+        else {
+            break;
+        };
+        if matches!(&msg, ServerMessage::ChannelRemoved { name, .. } if name == "eves-room") {
+            saw_removal = true;
+            break;
+        }
+    }
+    assert!(saw_removal, "bob should be told eves-room was removed");
+
+    // eve's account is gone entirely - even her own former password fails.
+    let mut c = server.connect().await;
+    let result = login(&mut c, "eve", &password_for("eve")).await;
+    assert!(matches!(result, ServerMessage::AuthResult { ok: false, .. }));
+}
+
+/// @requirement AC-347
+#[tokio::test]
+async fn a_superadmins_remove_channel_works_on_any_public_channel() {
+    let mut options = test_options("admin-remove-channel");
+    options.superadmins.insert("alice".to_string());
+    let server = TestServer::spawn(options).await;
+
+    let mut a = server.connect().await;
+    server.handshake(&mut a, "alice").await;
+    let mut bob = server.connect().await;
+    server.handshake(&mut bob, "bob").await;
+
+    bob.send(&ClientMessage::JoinChannel {
+        name: "bobs-room".into(),
+        kind: ChannelKind::Public,
+        password: None,
+    })
+    .await
+    .unwrap();
+    let _: ServerMessage = bob.recv().await.unwrap().unwrap();
+
+    a.send(&ClientMessage::AdminRemoveChannel { name: "bobs-room".into() })
+        .await
+        .unwrap();
+
+    let msg: ServerMessage = bob.recv().await.unwrap().unwrap();
+    assert!(matches!(&msg, ServerMessage::ChannelRemoved { name, .. } if name == "bobs-room"));
 }

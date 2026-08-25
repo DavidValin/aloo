@@ -849,9 +849,15 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
                             // loop owns and `handle_ui_action` does not -
                             // so it is answered here rather than threaded
                             // down into a function about network sends.
+                            // `Quit` (Escape on the account-deactivated
+                            // modal) is the same kind of loop-level effect:
+                            // ending the whole session is this loop's own
+                            // business, not a network send.
                             if matches!(action, UiAction::Detach) {
                                 session.viewer_attached = false;
                                 surface.detach();
+                            } else if matches!(action, UiAction::Quit) {
+                                break;
                             } else {
                                 handle_ui_action(action, &mut wr, &mut ui_state, &mut session).await?;
                             }
@@ -1895,6 +1901,45 @@ async fn handle_ui_action(
             // here degrades to "nothing happened" instead of aborting a
             // live session over a UI command.
         }
+        UiAction::Quit => {
+            // Intercepted by `run_connected_session`'s input arm, the same
+            // way `Detach` is - ending the session is that loop's own
+            // business, not a network send. A no-op here for the same
+            // "degrade, don't abort" reason `Detach`'s arm gives.
+        }
+        UiAction::DeleteChannel { name } => {
+            wr.send_control(&ClientMessage::DeleteChannel { name }).await?;
+        }
+        UiAction::BanFromChannel { channel, nickname } => {
+            wr.send_control(&ClientMessage::BanFromChannel { channel, nickname })
+                .await?;
+        }
+        UiAction::UnbanFromChannel { channel, nickname } => {
+            wr.send_control(&ClientMessage::UnbanFromChannel { channel, nickname })
+                .await?;
+        }
+        UiAction::SetChannelJoinLock { channel, allowed } => {
+            wr.send_control(&ClientMessage::SetChannelJoinLock { channel, allowed })
+                .await?;
+        }
+        UiAction::AssignChannelAdmin { channel, nickname } => {
+            wr.send_control(&ClientMessage::AssignChannelAdmin { channel, nickname })
+                .await?;
+        }
+        UiAction::AdminActivate { nickname } => {
+            wr.send_control(&ClientMessage::AdminActivate { nickname }).await?;
+        }
+        UiAction::AdminDeactivate { nickname, reason } => {
+            wr.send_control(&ClientMessage::AdminDeactivate { nickname, reason })
+                .await?;
+        }
+        UiAction::AdminRemoveAccount { nickname } => {
+            wr.send_control(&ClientMessage::AdminRemoveAccount { nickname })
+                .await?;
+        }
+        UiAction::AdminRemoveChannel { name } => {
+            wr.send_control(&ClientMessage::AdminRemoveChannel { name }).await?;
+        }
     }
     Ok(())
 }
@@ -2204,7 +2249,8 @@ async fn handle_server_message(
         | ServerMessage::IdentifyResult { .. } => {
             // only expected during the handshake in connect::connect_and_handshake
         }
-        ServerMessage::ChannelList(list) => {
+        ServerMessage::ChannelList { channels, superadmins } => {
+            ui_state.superadmins = superadmins.into_iter().collect();
             // A daemon joins exactly what it was configured to join, and
             // never `the-hall` unless that was one of them - the whole
             // point of the mode is to be where the user actually wants
@@ -2212,15 +2258,16 @@ async fn handle_server_message(
             // entirely rather than joined-then-left, which would show up
             // to everyone in the hall as a connect/disconnect flicker.
             if session.daemon_plan.is_some() {
-                ui_state.on_channel_list(list);
+                ui_state.on_channel_list(channels);
                 request_daemon_joins(wr, ui_state, session).await?;
-            } else if let Some(action) = crate::client::channel::on_list(ui_state, list) {
+            } else if let Some(action) = crate::client::channel::on_list(ui_state, channels) {
                 return Ok(Some(action));
             }
         }
-        ServerMessage::Joined { channel } => {
+        ServerMessage::Joined { channel, admin } => {
             let name = channel.name.clone();
             crate::client::channel::on_joined(ui_state, channel);
+            ui_state.set_channel_admin(&name, admin);
             apply_daemon_channel_focus(ui_state, session, &name);
             broadcast_channel_presence(session, ui_state);
         }
@@ -2233,6 +2280,41 @@ async fn handle_server_message(
         }
         ServerMessage::ChannelJoinRejected { name, kind } => {
             crate::client::channel::on_join_rejected(ui_state, name, kind)
+        }
+        ServerMessage::ChannelRemoved { name, reason } => {
+            ui_state.on_channel_removed(&name);
+            ui_state.push_status_notice(format!("#{name}: {reason}"), false);
+        }
+        ServerMessage::UserBanned {
+            channel,
+            user_id,
+            nickname,
+        } => {
+            if Some(user_id) == ui_state.own_id {
+                ui_state.on_channel_removed(&channel);
+                ui_state.push_status_notice(
+                    format!("you have been banned from #{channel}"),
+                    false,
+                );
+            } else {
+                ui_state.on_user_banned(&channel, user_id, nickname);
+            }
+            if !ui_state.has_reason_to_keep_link(user_id) {
+                session.peer_link.forget(user_id);
+                ui_state.forget_link_status(user_id);
+            }
+        }
+        ServerMessage::UserUnbanned { channel, nickname } => {
+            ui_state.on_user_unbanned(&channel, nickname);
+        }
+        ServerMessage::ChannelJoinLockUpdated { channel, by } => {
+            ui_state.on_join_lock_updated(&channel, by);
+        }
+        ServerMessage::ChannelAdminChanged { channel, admin } => {
+            ui_state.on_channel_admin_changed(&channel, admin);
+        }
+        ServerMessage::AccountDeactivated { reason } => {
+            ui_state.account_deactivated = Some(reason);
         }
         ServerMessage::UserJoined { channel, user } => {
             // A pq_hybrid peer's bundle carries only their *bootstrap*
@@ -2376,7 +2458,17 @@ async fn handle_server_message(
             } else {
             }
         }
-        ServerMessage::Error { message } => crate::log_warn!("server error: {message}"),
+        ServerMessage::Error { message } => {
+            // Historically a silent log line (RotateKey/RequestPeerLink
+            // failures are internal protocol hiccups nobody typed a
+            // command to trigger), but every new channel-admin/superadmin
+            // command's own rejection ("only this channel's admin may do
+            // that", "only a superadmin may do that", ...) rides this same
+            // generic path and *is* a direct answer to something the user
+            // just typed - so it also needs to actually reach the screen.
+            crate::log_warn!("server error: {message}");
+            ui_state.push_status_notice(message, false);
+        }
         ServerMessage::OtpMailResult {
             mail_id,
             ok,

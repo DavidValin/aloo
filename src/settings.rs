@@ -166,6 +166,58 @@ impl std::fmt::Display for PunchFrequency {
     }
 }
 
+/// A `server_channel_deletion_unactivity_period` value: how long an empty,
+/// unjoined channel survives before the inactivity sweep destroys it
+/// (`docs/PROTOCOL.md` §6.8). A month is fixed at
+/// `CHANNEL_DELETION_MONTH_DAYS` days - no calendar-month arithmetic, so
+/// the setting's meaning never depends on which month it happens to be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChannelDeletionPeriod(std::time::Duration);
+
+/// What a `server_channel_deletion_unactivity_period=Nmonths` line counts
+/// one month as.
+pub const CHANNEL_DELETION_MONTH_DAYS: u64 = 30;
+
+impl ChannelDeletionPeriod {
+    /// Parses `Nday`/`Ndays`, `Nweek`/`Nweeks`, or `Nmonth`/`Nmonths` -
+    /// styled like `PunchFrequency::parse`: trimmed and lowercased first,
+    /// every accepted spelling named in the error.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let s = s.trim().to_ascii_lowercase();
+        let err = || format!("not a valid period: {s:?} - use one of Ndays, Nweeks, Nmonths");
+        let days_per_unit = if s.ends_with("day") || s.ends_with("days") {
+            1
+        } else if s.ends_with("week") || s.ends_with("weeks") {
+            7
+        } else if s.ends_with("month") || s.ends_with("months") {
+            CHANNEL_DELETION_MONTH_DAYS
+        } else {
+            return Err(err());
+        };
+        let digits = s.trim_end_matches(|c: char| c.is_ascii_alphabetic());
+        let count: u64 = digits.parse().map_err(|_| err())?;
+        if count == 0 {
+            return Err(err());
+        }
+        Ok(Self(std::time::Duration::from_secs(
+            count * days_per_unit * 24 * 60 * 60,
+        )))
+    }
+
+    pub fn as_duration(self) -> std::time::Duration {
+        self.0
+    }
+}
+
+impl std::fmt::Display for ChannelDeletionPeriod {
+    /// Canonicalizes to days - a saved `1month` reads back as `30days`,
+    /// numerically identical rather than wording-identical, the same
+    /// normalization `PunchFrequency` already applies to its own spellings.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}days", self.0.as_secs() / (24 * 60 * 60))
+    }
+}
+
 /// One `direct_punch_to=<nickname>[+<device_id>],<host>[:<port>],<frequency>`
 /// line.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -352,6 +404,25 @@ pub struct Settings {
     /// code alone, to be typed into the client's activation popup.
     pub server_activation_port: u16,
     pub server_activation_url: Option<String>,
+    /// Whether a `JoinChannel` for a not-yet-existing name may create it
+    /// as public (`docs/PROTOCOL.md` §6.7's `ChannelsRegistry::join`).
+    /// Joining an *existing* public channel, and creating/joining a
+    /// private one, are unaffected either way. On by default - this is a
+    /// server that wants public channel creation curated, not the norm.
+    pub server_allow_create_public_channels: bool,
+    /// How long a channel (other than `the-hall`) may sit both empty and
+    /// unjoined before the background sweep destroys it (§6.8) - `None`
+    /// (the default, and what an absent key means) turns the sweep off
+    /// entirely, so channels persist while empty indefinitely.
+    pub server_channel_deletion_unactivity_period: Option<ChannelDeletionPeriod>,
+    /// Nicknames that may activate/deactivate any account, remove one (and
+    /// every channel it administers), or remove any public channel (§5.5).
+    /// One `server_superadmin=<nickname>` line per admin, the same
+    /// one-line-per-entry convention `muted_voice`/`daemon_channel` already
+    /// use - never the single bracketed-list form, since a nickname can't
+    /// contain a comma but a joined list still reads worse than repeating
+    /// the key.
+    pub server_superadmin: BTreeSet<String>,
     /// Overrides the `otp` binary aloo spawns for the OTP encryption layer
     /// (`client::otp_cli::OtpCliConfig::resolve`) - `None` resolves against
     /// `PATH` (or `ALOO_OTP_BIN`, which always wins over this). aloo never
@@ -511,6 +582,9 @@ impl Default for Settings {
             server_smtp_password: None,
             server_activation_port: DEFAULT_SERVER_ACTIVATION_PORT,
             server_activation_url: None,
+            server_allow_create_public_channels: true,
+            server_channel_deletion_unactivity_period: None,
+            server_superadmin: BTreeSet::new(),
             otp_binary_path: None,
             otp_keypair_size_mb: DEFAULT_OTP_KEYPAIR_SIZE_MB,
             otp_low_key_warn_pct: DEFAULT_OTP_LOW_KEY_WARN_PCT,
@@ -633,6 +707,21 @@ impl Settings {
                 }
                 "server_activation_url" if !value.is_empty() => {
                     settings.server_activation_url = Some(value.trim_end_matches('/').to_string());
+                }
+                "server_allow_create_public_channels" => {
+                    settings.server_allow_create_public_channels = parse_switch(value);
+                }
+                "server_channel_deletion_unactivity_period" if !value.is_empty() => {
+                    if let Ok(period) = ChannelDeletionPeriod::parse(value) {
+                        settings.server_channel_deletion_unactivity_period = Some(period);
+                    }
+                }
+                // Accumulating, same convention as `muted_voice` - one line
+                // per superadmin, never a bracketed list, and validated the
+                // same way `daemon_nickname` already is: a hand-edited
+                // value that couldn't be a real nickname can't name anyone.
+                "server_superadmin" if crate::validation::nickname_is_registrable(value) => {
+                    settings.server_superadmin.insert(value.to_string());
                 }
                 "otp_binary_path" if !value.is_empty() => {
                     settings.otp_binary_path = Some(value.to_string());
@@ -790,6 +879,19 @@ impl Settings {
             self.server_activation_port,
             self.server_activation_url.as_deref().unwrap_or("")
         ));
+        contents.push_str(&format!(
+            "server_allow_create_public_channels={}\nserver_channel_deletion_unactivity_period={}\n",
+            switch(self.server_allow_create_public_channels),
+            self.server_channel_deletion_unactivity_period
+                .map(|p| p.to_string())
+                .unwrap_or_default()
+        ));
+        // One line per admin, same convention as `muted_voice` just below.
+        for name in &self.server_superadmin {
+            if crate::validation::nickname_is_registrable(name) {
+                contents.push_str(&format!("server_superadmin={name}\n"));
+            }
+        }
         if let Some(bin) = &self.otp_binary_path {
             contents.push_str(&format!("otp_binary_path={bin}\n"));
         }

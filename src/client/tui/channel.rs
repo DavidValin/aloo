@@ -47,6 +47,14 @@ pub struct ChannelTab {
     /// voice, a file arriving), never by presence notices, and cleared the
     /// moment the channel is selected again (`select_channel_at`).
     pub unread: bool,
+    /// This channel's current admin nickname, or `None` (permanently, for
+    /// `the-hall`; as a placeholder until the real value arrives, for a
+    /// tab created early by `seed_member`). Set by `UiState::set_channel_admin`,
+    /// called from `ServerMessage::Joined`'s `admin` field and again on
+    /// every later `ChannelAdminChanged` - never by `on_joined` itself, so
+    /// every existing caller that only cares about kind/membership is
+    /// unaffected.
+    pub admin: Option<String>,
 }
 
 impl UiState {
@@ -192,15 +200,30 @@ impl UiState {
         }
     }
 
-    /// Handles `ServerMessage::ChannelJoinRejected` - opens the password
-    /// popup, pre-filling an error message for a retry (`WrongPassword`/
-    /// `Banned`) or leaving it blank for a first-time `PasswordRequired`.
+    /// Handles `ServerMessage::ChannelJoinRejected`. The three
+    /// password-flow outcomes open the password popup, pre-filling an
+    /// error message for a retry (`WrongPassword`/`Banned`) or leaving it
+    /// blank for a first-time `PasswordRequired` - retyping a password
+    /// can never fix `UserBanned` or `NotOnAllowlist`, so those two are
+    /// just a status notice instead, with no popup at all.
     pub fn on_channel_join_rejected(&mut self, name: String, kind: ChannelJoinRejection) {
-        self.channel_password_error = match kind {
+        let password_error = match kind {
             ChannelJoinRejection::PasswordRequired => None,
             ChannelJoinRejection::WrongPassword => Some("wrong password".to_string()),
             ChannelJoinRejection::Banned => Some("too many attempts - try again later".to_string()),
+            ChannelJoinRejection::UserBanned => {
+                self.push_status_notice(format!("you are banned from #{name}"), false);
+                return;
+            }
+            ChannelJoinRejection::NotOnAllowlist => {
+                self.push_status_notice(
+                    format!("#{name} is locked - you're not on the join list"),
+                    false,
+                );
+                return;
+            }
         };
+        self.channel_password_error = password_error;
         self.channel_password_target = Some(name);
         self.channel_password_input.clear();
         self.mode = Mode::ChannelPasswordPopup;
@@ -461,6 +484,7 @@ impl UiState {
                 members: Vec::new(),
                 log: Vec::new(),
                 unread: false,
+                admin: None,
             });
         }
         // Landing in the channel just joined is the whole point of joining
@@ -506,6 +530,13 @@ impl UiState {
             .any(|c| c.name == channel && c.members.iter().any(|m| m.id == peer))
     }
 
+    /// Whether `nickname` is a server superadmin (`server_superadmin`,
+    /// from the connect-time `ChannelList.superadmins`) - drives the ⚡
+    /// marker shown next to their name everywhere, in any channel.
+    pub fn is_superadmin(&self, nickname: &str) -> bool {
+        self.superadmins.contains(nickname)
+    }
+
     pub fn seed_member(&mut self, channel: &str, user: UserInfo) -> bool {
         // Someone who went offline and is now back takes their own place
         // again rather than appearing beside it
@@ -547,6 +578,7 @@ impl UiState {
                     members: Vec::new(),
                     log: Vec::new(),
                     unread: false,
+                    admin: None,
                 });
                 self.channels.last_mut().expect("just pushed")
             }
@@ -652,6 +684,95 @@ impl UiState {
                         crypto: None,
                     },
                 );
+            }
+        }
+    }
+
+    /// Sets `channel`'s current admin - called from `ServerMessage::Joined`'s
+    /// `admin` field and again on every later `ChannelAdminChanged`. A
+    /// no-op if the tab doesn't exist (there is nothing to correct).
+    pub fn set_channel_admin(&mut self, channel: &str, admin: Option<String>) {
+        if let Some(tab) = self.channels.iter_mut().find(|c| c.name == channel) {
+            tab.admin = admin;
+        }
+    }
+
+    /// The shared shape `on_user_joined`/`on_user_left` already use for a
+    /// yellow presence line, reused for every channel-moderation notice.
+    /// `who`/`who_name` are cosmetic only: a `MessageBody::Presence` line
+    /// renders its `text` alone (`ui.rs`'s `render_messages`), never
+    /// `from`/`from_name` - so an event with no single "about" user (a
+    /// join-lock update, an admin handoff) may pass `UserId(0)` and an
+    /// empty name safely.
+    fn push_presence_notice(&mut self, channel: &str, who: UserId, who_name: String, text: String) {
+        let is_current = self.is_viewing_channel(channel);
+        if let Some(tab) = self.channels.iter_mut().find(|c| c.name == channel) {
+            push_log_entry(
+                &mut tab.log,
+                &mut self.message_selected,
+                is_current,
+                LogEntry {
+                    from: who,
+                    from_name: who_name,
+                    to_name: None,
+                    body: MessageBody::Presence(text),
+                    outgoing: false,
+                    failed: false,
+                    sent_at: local_time_stamp(),
+                    owed_receipt: None,
+                    delivery: None,
+                    crypto: None,
+                },
+            );
+        }
+    }
+
+    /// `ServerMessage::UserBanned` for someone other than ourselves (the
+    /// caller already branches on that): force-removes them from
+    /// `channel`'s member list, mirroring `on_user_left`, and logs a
+    /// distinctly-worded presence line.
+    pub fn on_user_banned(&mut self, channel: &str, user_id: UserId, nickname: String) {
+        if let Some(tab) = self.channels.iter_mut().find(|c| c.name == channel) {
+            tab.members.retain(|m| m.id != user_id);
+        }
+        let text = format!("{} {nickname} was banned from this channel", local_time_short());
+        self.push_presence_notice(channel, user_id, nickname, text);
+    }
+
+    /// `ServerMessage::UserUnbanned` - membership is unaffected; `nickname`
+    /// simply may join again from now on.
+    pub fn on_user_unbanned(&mut self, channel: &str, nickname: String) {
+        let text = format!("{} {nickname} was unbanned", local_time_short());
+        self.push_presence_notice(channel, UserId(0), nickname, text);
+    }
+
+    /// `ServerMessage::ChannelJoinLockUpdated`.
+    pub fn on_join_lock_updated(&mut self, channel: &str, by: String) {
+        let text = format!("{} join list updated by {by}", local_time_short());
+        self.push_presence_notice(channel, UserId(0), by, text);
+    }
+
+    /// `ServerMessage::ChannelAdminChanged` - a *later* change while
+    /// already joined; the admin at join time itself arrives on `Joined`
+    /// and is applied via `set_channel_admin` directly, with no notice
+    /// (there's nobody else in the channel yet to notify).
+    pub fn on_channel_admin_changed(&mut self, channel: &str, admin: Option<String>) {
+        let text = match &admin {
+            Some(name) => format!("{} {name} is now the admin of this channel", local_time_short()),
+            None => format!("{} this channel has no admin", local_time_short()),
+        };
+        self.set_channel_admin(channel, admin);
+        self.push_presence_notice(channel, UserId(0), String::new(), text);
+    }
+
+    /// `ServerMessage::ChannelRemoved` - the tab simply disappears, exactly
+    /// as leaving one already does; `reason` is shown as a status notice
+    /// by the caller, not logged into a tab that's about to be gone.
+    pub fn on_channel_removed(&mut self, name: &str) {
+        if let Some(idx) = self.channels.iter().position(|c| c.name == name) {
+            self.channels.remove(idx);
+            if self.selected_channel >= self.channels.len() {
+                self.selected_channel = self.channels.len().saturating_sub(1);
             }
         }
     }
@@ -1671,6 +1792,19 @@ fn render_sidebar(frame: &mut Frame, area: Rect, state: &UiState) {
             } else {
                 ""
             };
+            // ☀️ marks this channel's admin; ⚡ marks a server superadmin,
+            // in every channel alike - independent markers, both shown
+            // together when they happen to be the same person.
+            let superadmin = if state.is_superadmin(&m.name) {
+                "\u{26A1} "
+            } else {
+                ""
+            };
+            let admin = if channel.admin.as_deref() == Some(m.name.as_str()) {
+                "\u{2600}\u{FE0F} "
+            } else {
+                ""
+            };
             // The person on the left, their encryption tag flush against
             // the sidebar's right edge (`docs/SPEC.md` "Connected UI") -
             // so the tags line up down one column and can be read as a
@@ -1678,7 +1812,7 @@ fn render_sidebar(frame: &mut Frame, area: Rect, state: &UiState) {
             // happened to end. On a sidebar too narrow to hold both the
             // gap floors at one space and the row clips at its right
             // edge, exactly as an overlong entry always has.
-            let name = format!("{muted}{envelope}{}", m.name);
+            let name = format!("{superadmin}{admin}{muted}{envelope}{}", m.name);
             let tag = state.encryption_tag(m.id, m.key_mode);
             let gap = (inner.width as usize)
                 .saturating_sub((display_width(&name) + display_width(tag)) as usize)

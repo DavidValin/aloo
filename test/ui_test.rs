@@ -1695,9 +1695,12 @@ fn enter_on_a_still_awaiting_sidebar_member_does_not_open_anything() {
 fn help_popup_widens_enough_to_show_its_longest_line_without_clipping_it() {
     // The pq_hybrid encryption line is a good proxy for whether the popup
     // widened correctly - on a narrower terminal a fixed popup would clip
-    // it. Rendered at 130 columns (wider than the default 100 `rendered_rows`
-    // uses) so the line's ~98-cell width comfortably clears the popup's own
-    // 90%-of-terminal cap - that cap is exercised deliberately narrow by
+    // it. Rendered at 150 columns (wider than the default 100 `rendered_rows`
+    // uses, and wider than this test used before the keys column grew to
+    // fit the longest command - a wider shared column shrinks every
+    // description's remaining width and so reflows this one too) so the
+    // line's ~98-cell width comfortably clears the popup's own 90%-of-
+    // terminal cap - that cap is exercised deliberately narrow by
     // `help_popup_never_exceeds_90_percent_of_the_terminal_width` instead.
     // Checked without the emoji itself, since a 2-cell-wide emoji leaves a
     // padding cell in ratatui's buffer that would otherwise break a plain
@@ -1709,7 +1712,7 @@ fn help_popup_widens_enough_to_show_its_longest_line_without_clipping_it() {
     let tail = "the only scheme there is: ML-DSA-87+RSA4096/ML-KEM-1024+RSA4096/AES-256-GCM, \
                 loaded from a file";
     let rows_130 = |state: &UiState| -> Vec<String> {
-        let backend = ratatui::backend::TestBackend::new(130, 30);
+        let backend = ratatui::backend::TestBackend::new(150, 30);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal.draw(|f| render(f, state)).unwrap();
         let buffer = terminal.backend().buffer().clone();
@@ -1725,7 +1728,10 @@ fn help_popup_widens_enough_to_show_its_longest_line_without_clipping_it() {
     // `scroll_help_until`'s doc for why the exact distance to this line
     // isn't assumed fixed.
     let mut rows = rows_130(&state);
-    for _ in 0..40 {
+    // The cap here is deliberately generous, not a measured figure - see
+    // `scroll_help_until`'s doc: it only needs to comfortably outlast
+    // however long HELP_BODY happens to be, not track its exact length.
+    for _ in 0..80 {
         if rows.iter().any(|r| r.contains(tail)) {
             break;
         }
@@ -4144,11 +4150,14 @@ fn help_descriptions_all_start_in_one_column_and_wrap_back_into_it() {
 fn the_help_keys_column_is_as_wide_as_the_longest_command() {
     let mut state = joined_general_with(vec![]);
     state.help_open = true;
-    let rows = popup_body(&buffer_at(&state, 120, 60), HELP_POPUP_TITLE);
+    // Tall enough to show the whole page with no scrolling regardless of
+    // how long HELP_BODY happens to be - not a measured figure.
+    let rows = popup_body(&buffer_at(&state, 120, 200), HELP_POPUP_TITLE);
     let joined = rows.join("\n");
 
-    // The longest command in the page, and a short one: both keep their
-    // whole text in the first column, and both descriptions line up.
+    // A long-but-not-necessarily-longest command, and a short one: both
+    // keep their whole text in the first column, and both descriptions
+    // line up.
     assert!(
         joined.contains("/unmute-voice <nickname>"),
         "the longest command is not clipped: {rows:?}"
@@ -4231,4 +4240,100 @@ fn otp_tag_and_icon_are_the_same_marker() {
     // And deliberately not pq_hybrid's own shield, which the pad always
     // runs over.
     assert!(!aloo::client::tui::ui::OTP_ICON.contains('\u{1F6E1}'));
+}
+
+/// A live `/deactivate` from a superadmin outranks even the identity
+/// review queue - once `account_deactivated` is set there is nothing left
+/// this session could still usefully do, so the modal absorbs every key
+/// but Escape (press or repeat; a release event does nothing at all,
+/// matching how every other key-absorbing tier here already treats
+/// Release).
+/// @requirement AC-345, TB-264
+#[test]
+fn the_account_deactivated_modal_absorbs_every_key_but_escape() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.push_identity_review(
+        UserId(2),
+        "bob".into(),
+        "bob's key changed unexpectedly".into(),
+        static_mismatch(),
+    );
+    state.account_deactivated = Some("spamming".into());
+
+    assert_eq!(
+        press(&mut state, KeyCode::Enter),
+        None,
+        "Enter must not confirm the identity review underneath"
+    );
+    assert_eq!(press(&mut state, KeyCode::Char('h')), None);
+    assert_eq!(ctrl(&mut state, KeyCode::Char('h')), None, "not even Ctrl+H opens help");
+    assert_eq!(
+        state.handle_key(KeyCode::Esc, KeyModifiers::NONE, KeyEventKind::Release),
+        None,
+        "a release event does nothing, same as every other absorbing tier"
+    );
+    assert!(
+        state.identity_review_open().is_some(),
+        "the review is still sitting there, untouched, underneath"
+    );
+
+    let rows = rendered_rows(&state);
+    assert!(
+        rows.iter().any(|r| r.contains("Account deactivated")),
+        "expected the modal's title: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|r| r.contains("Your account has been deactivated") && r.contains("spamming")),
+        "expected the reason quoted in the body: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|r| r.contains("Identity review")),
+        "the review popup underneath must not also render: {rows:?}"
+    );
+}
+
+/// Escape is the one key the modal answers, and it answers by ending the
+/// session - the same `UiAction::Quit` mechanism `Detach` already uses,
+/// not a new teardown path (there is still no kick primitive anywhere in
+/// this server).
+/// @requirement AC-345, TB-264
+#[test]
+fn escape_on_the_deactivated_modal_sends_quit() {
+    let mut state = joined_general_with(vec![]);
+    state.account_deactivated = Some("policy violation".into());
+
+    assert_eq!(press(&mut state, KeyCode::Esc), Some(UiAction::Quit));
+    assert_eq!(
+        state.handle_key(KeyCode::Esc, KeyModifiers::NONE, KeyEventKind::Repeat),
+        Some(UiAction::Quit),
+        "a held Escape (repeat) also answers, not just the first press"
+    );
+    assert!(
+        UiAction::Quit.needs_server().is_none(),
+        "quitting is a local act - it needs nobody's permission"
+    );
+}
+
+/// The modal is checked before even the identity review queue - today's
+/// top tier otherwise - since being locked out of the account makes every
+/// other pending decision moot.
+/// @requirement AC-345
+#[test]
+fn the_account_deactivated_modal_outranks_the_identity_review_queue() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.push_identity_review(
+        UserId(2),
+        "bob".into(),
+        "bob's key changed unexpectedly".into(),
+        static_mismatch(),
+    );
+    assert!(state.identity_review_open().is_some());
+
+    state.account_deactivated = Some("spamming".into());
+    let rows = rendered_rows(&state);
+    assert!(
+        rows.iter().any(|r| r.contains("Account deactivated")),
+        "the deactivation modal must win the render, not the review popup: {rows:?}"
+    );
 }

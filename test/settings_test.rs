@@ -160,6 +160,130 @@ fn server_switches_accept_every_documented_spelling() {
     std::fs::remove_file(&path).ok();
 }
 
+/// `server_allow_create_public_channels` defaults on (matches the
+/// pre-existing behavior for any server that never sets it) and is
+/// always written, even unset.
+///
+/// @requirement AC-337
+#[test]
+fn server_allow_create_public_channels_defaults_on_and_is_always_written() {
+    let path = temp_settings_path();
+    let settings = Settings::load_or_create(&path).unwrap();
+    assert!(settings.server_allow_create_public_channels);
+    let contents = std::fs::read_to_string(&path).unwrap();
+    assert!(contents.contains("server_allow_create_public_channels=on"));
+    std::fs::remove_file(&path).ok();
+}
+
+/// @requirement AC-337
+#[test]
+fn server_allow_create_public_channels_round_trips_off() {
+    let path = temp_settings_path();
+    let saved = Settings {
+        server_allow_create_public_channels: false,
+        ..Settings::default()
+    };
+    saved.save(&path).unwrap();
+    let loaded = Settings::load_or_create(&path).unwrap();
+    assert_eq!(loaded, saved);
+    assert!(!loaded.server_allow_create_public_channels);
+    std::fs::remove_file(&path).ok();
+}
+
+/// `ChannelDeletionPeriod::parse` accepts every documented spelling and
+/// canonicalizes to days on save; unset (the default) round-trips as
+/// `None`, meaning the inactivity sweep never runs.
+///
+/// @requirement AC-350
+#[test]
+fn server_channel_deletion_unactivity_period_parses_and_round_trips() {
+    use aloo::settings::ChannelDeletionPeriod;
+
+    assert_eq!(
+        ChannelDeletionPeriod::parse("30days").unwrap().as_duration(),
+        std::time::Duration::from_secs(30 * 24 * 60 * 60)
+    );
+    assert_eq!(
+        ChannelDeletionPeriod::parse("2weeks").unwrap().as_duration(),
+        std::time::Duration::from_secs(14 * 24 * 60 * 60)
+    );
+    assert_eq!(
+        ChannelDeletionPeriod::parse("1month").unwrap().as_duration(),
+        std::time::Duration::from_secs(30 * 24 * 60 * 60)
+    );
+    assert!(ChannelDeletionPeriod::parse("0days").is_err());
+    assert!(ChannelDeletionPeriod::parse("garbage").is_err());
+
+    let path = temp_settings_path();
+    let saved = Settings {
+        server_channel_deletion_unactivity_period: Some(ChannelDeletionPeriod::parse("1month").unwrap()),
+        ..Settings::default()
+    };
+    saved.save(&path).unwrap();
+    let contents = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        contents.contains("server_channel_deletion_unactivity_period=30days"),
+        "a saved '1month' should canonicalize to days, numerically identical: {contents}"
+    );
+    let loaded = Settings::load_or_create(&path).unwrap();
+    assert_eq!(loaded, saved);
+    std::fs::remove_file(&path).ok();
+}
+
+/// @requirement AC-350
+#[test]
+fn server_channel_deletion_unactivity_period_defaults_to_no_sweep() {
+    let path = temp_settings_path();
+    let settings = Settings::load_or_create(&path).unwrap();
+    assert_eq!(settings.server_channel_deletion_unactivity_period, None);
+    let contents = std::fs::read_to_string(&path).unwrap();
+    assert!(contents.contains("server_channel_deletion_unactivity_period="));
+    std::fs::remove_file(&path).ok();
+}
+
+/// `server_superadmin` is one repeated line per admin, like `muted_voice` -
+/// never the bracketed-list form - and an unregistrable value is skipped
+/// the same way `daemon_nickname` already is.
+///
+/// @requirement AC-344
+#[test]
+fn server_superadmin_is_one_line_per_admin_and_skips_unregistrable_values() {
+    let path = temp_settings_path();
+    std::fs::write(
+        &path,
+        "server_superadmin=alice\nserver_superadmin=bob\nserver_superadmin=not a nickname\n",
+    )
+    .unwrap();
+    let settings = Settings::load_or_create(&path).unwrap();
+    assert_eq!(
+        settings.server_superadmin,
+        ["alice", "bob"].into_iter().map(String::from).collect()
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// @requirement AC-344
+#[test]
+fn server_superadmin_round_trips_in_sorted_order() {
+    let path = temp_settings_path();
+    let saved = Settings {
+        server_superadmin: ["carol", "alice", "bob"].into_iter().map(String::from).collect(),
+        ..Settings::default()
+    };
+    saved.save(&path).unwrap();
+    let contents = std::fs::read_to_string(&path).unwrap();
+    let alice_at = contents.find("server_superadmin=alice").unwrap();
+    let bob_at = contents.find("server_superadmin=bob").unwrap();
+    let carol_at = contents.find("server_superadmin=carol").unwrap();
+    assert!(
+        alice_at < bob_at && bob_at < carol_at,
+        "a BTreeSet should write in sorted order: {contents}"
+    );
+    let loaded = Settings::load_or_create(&path).unwrap();
+    assert_eq!(loaded, saved);
+    std::fs::remove_file(&path).ok();
+}
+
 /// @requirement TB-135
 #[test]
 fn load_skips_unparseable_or_unknown_lines_and_keeps_the_rest() {

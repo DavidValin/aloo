@@ -155,16 +155,19 @@ async fn roundtrip_every_message(w: &mut AlooWorld) {
     }
 
     let server: Vec<ServerMessage> = vec![
-        ServerMessage::ChannelList(vec![
-            ChannelInfo {
-                name: "general".into(),
-                kind: ChannelKind::Public,
-            },
-            ChannelInfo {
-                name: "secret-room".into(),
-                kind: ChannelKind::Private,
-            },
-        ]),
+        ServerMessage::ChannelList {
+            channels: vec![
+                ChannelInfo {
+                    name: "general".into(),
+                    kind: ChannelKind::Public,
+                },
+                ChannelInfo {
+                    name: "secret-room".into(),
+                    kind: ChannelKind::Private,
+                },
+            ],
+            superadmins: vec![],
+        },
         ServerMessage::KeyRotated {
             from: UserId(3),
             new_public_key_der: vec![1, 2, 3],

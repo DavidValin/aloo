@@ -135,7 +135,7 @@ struct Cli {
     /// ~/.aloo/settings (daemon_server_password) for the next bare
     /// `aloo --daemon`.
     #[arg(long)]
-    server_pwd: Option<String>,
+    nick_pwd: Option<String>,
 
     /// Daemon-only: connect over TLS, for a server running with
     /// server_ssl=on. Remembered as daemon_ssl.
@@ -296,7 +296,7 @@ fn resolve_daemon_config(cli: &Cli) -> Result<aloo::client::daemon::DaemonConfig
         host: cli.host.clone(),
         port: cli.port,
         nickname: cli.nick.clone(),
-        server_pwd: cli.server_pwd.clone(),
+        nick_pwd: cli.nick_pwd.clone(),
         ssl: cli.ssl,
         my_key_prefix: cli.my_key.clone(),
         channels: cli.channels.clone(),
@@ -528,7 +528,12 @@ async fn run_server(cli: Cli) -> Result<(), BoxError> {
     }
 
     let users = server::users_registry::UsersRegistry::open(server::users_registry::default_dir())?;
-    let mut options = ServerOptions::new(users.clone());
+    let mut options = ServerOptions::new(users.clone())
+        .with_create_public_channels_policy(settings.server_allow_create_public_channels)
+        .with_superadmins(settings.server_superadmin.clone());
+    if let Some(period) = settings.server_channel_deletion_unactivity_period {
+        options = options.with_channel_deletion_unactivity_period(period.as_duration());
+    }
 
     // Refusing to start beats serving plaintext behind an operator's back:
     // `server_ssl=on` with no certificate is a misconfiguration, not a

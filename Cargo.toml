@@ -126,6 +126,10 @@ name = "crypto_test"
 path = "test/crypto_test.rs"
 
 [[test]]
+name = "server_channels_registry_test"
+path = "test/server_channels_registry_test.rs"
+
+[[test]]
 name = "docs_test"
 path = "test/docs_test.rs"
 

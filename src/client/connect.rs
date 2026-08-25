@@ -308,6 +308,9 @@ pub async fn run_client_inner(
                     // Same for a wrong password: the form, not an exit.
                     popup.error = Some(refused.0.clone());
                     popup.focus = ui_connect_popup::Field::Password;
+                } else if let Some(deactivated) = e.downcast_ref::<AccountDeactivatedError>() {
+                    popup.error = Some(deactivated.0.clone());
+                    popup.focus = ui_connect_popup::Field::Password;
                 } else {
                     return Err(e);
                 }
@@ -397,6 +400,23 @@ impl std::fmt::Display for AuthRefusedError {
 
 impl std::error::Error for AuthRefusedError {}
 
+/// The credentials were right, but a superadmin has deactivated this
+/// account. Shown on the connect form exactly like `AuthRefusedError` -
+/// no session exists yet at this point, so there's nothing for the
+/// full-screen takeover modal (shown to an *already-connected* session
+/// that gets deactivated live) to interrupt; an inline reason is both
+/// simpler and consistent with every other login failure here.
+#[derive(Debug)]
+pub struct AccountDeactivatedError(pub String);
+
+impl std::fmt::Display for AccountDeactivatedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for AccountDeactivatedError {}
+
 /// Connects, then runs the auth + identify handshake. On success returns
 /// the split stream halves, the `UserId` the server assigned us, and our
 /// own keybundle (needed to decrypt incoming messages). A taken nickname
@@ -453,6 +473,7 @@ pub async fn handshake_as(
     let Some(ServerMessage::AuthResult {
         ok,
         activation_pending,
+        deactivated,
         reason,
     }) = rd.recv().await?
     else {
@@ -476,6 +497,10 @@ pub async fn handshake_as(
                 reason.unwrap_or_else(|| "activation refused".into()),
             )));
         }
+    } else if !ok && let Some(reason) = deactivated {
+        return Err(Box::new(AccountDeactivatedError(format!(
+            "this account has been deactivated: {reason}"
+        ))));
     } else if !ok {
         return Err(Box::new(AuthRefusedError(format!(
             "authentication failed: {}",

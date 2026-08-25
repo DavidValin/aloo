@@ -9,7 +9,7 @@ use aloo::proto::{ChannelInfo, ChannelKind, UserId};
 use aloo::client::reconnect::ServerLinkState;
 use aloo::client::tui::channel::{HEADER_ROW_HEIGHT, messages_start_col};
 use aloo::client::tui::ui::{
-    DeliveryProof,
+    ChannelCommandConfirmAction, DeliveryProof,
     DeliveryStatus, Focus, IdentityCase, MessageBody, SELECTOR_DROPDOWN_IDLE_TIMEOUT, UiAction,
     UiState, VoiceTarget, render, strike_through,
 };
@@ -3148,6 +3148,380 @@ fn a_pad_session_follows_a_peer_across_a_reconnect() {
 
     assert!(state.is_otp_active(UserId(9)), "the session is still on");
     assert!(!state.is_otp_active(UserId(2)));
+}
+
+// ---------------------------------------------------------------------
+// Channel ownership/moderation rendering: the admin in the message
+// pane's border title, and the ☀️/⚡ markers in the sidebar and the
+// user-info popup (docs/PROTOCOL.md §6.7, §5.5).
+// ---------------------------------------------------------------------
+
+/// @requirement AC-339, TB-257
+#[test]
+fn the_message_pane_title_names_the_channel_and_its_admin() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.set_channel_admin("general", Some("alice".to_string()));
+    let rows = sidebar_rows(&state);
+    row_containing(&rows, "#general (admin: alice)");
+}
+
+/// @requirement AC-339
+#[test]
+fn the_message_pane_title_omits_the_admin_when_there_is_none() {
+    let state = joined_general_with(vec![user(2, "bob")]);
+    let rows = sidebar_rows(&state);
+    row_containing(&rows, "#general");
+    assert!(
+        !rows.iter().any(|r| r.contains("admin:")),
+        "no admin was ever set, so nothing should claim one: {rows:?}"
+    );
+}
+
+/// @requirement AC-339
+#[test]
+fn the_sidebar_marks_the_channel_admin_with_a_sun() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.set_channel_admin("general", Some("bob".to_string()));
+    let rows = sidebar_rows(&state);
+    // Two spaces, not one: ☀️ is a wide glyph, so its cell is followed by a
+    // continuation cell (rendered as a space) before the literal space the
+    // format string itself adds.
+    sidebar_row_containing(&rows, "\u{2600}\u{FE0F}  bob");
+}
+
+/// @requirement AC-339
+#[test]
+fn the_sidebar_does_not_mark_an_ordinary_member() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.set_channel_admin("general", Some("alice".to_string())); // not a member here
+    let rows = sidebar_rows(&state);
+    let row = sidebar_row_containing(&rows, "bob");
+    assert!(!row.contains("\u{2600}\u{FE0F}"), "bob is not the admin: {row:?}");
+}
+
+/// @requirement AC-349
+#[test]
+fn the_sidebar_marks_a_superadmin_with_a_lightning_bolt_in_any_channel() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.superadmins.insert("bob".to_string());
+    let rows = sidebar_rows(&state);
+    sidebar_row_containing(&rows, "\u{26A1}  bob"); // wide-glyph continuation cell, see above
+}
+
+/// @requirement AC-349
+#[test]
+fn the_sidebar_shows_both_markers_together_when_they_apply_to_the_same_person() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.set_channel_admin("general", Some("bob".to_string()));
+    state.superadmins.insert("bob".to_string());
+    let rows = sidebar_rows(&state);
+    sidebar_row_containing(&rows, "\u{26A1}  \u{2600}\u{FE0F}  bob"); // wide-glyph continuation cells
+}
+
+/// @requirement AC-339
+#[test]
+fn the_user_info_popup_names_the_channel_admin() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.set_channel_admin("general", Some("bob".to_string()));
+    state.open_user_info(UserId(2), "bob".to_string(), Some("general".to_string()));
+    let rows = sidebar_rows(&state);
+    row_containing(&rows, "\u{2600}\u{FE0F}  admin of #general"); // wide-glyph continuation cell
+}
+
+/// @requirement AC-339
+#[test]
+fn the_user_info_popup_says_nothing_about_admin_for_an_ordinary_member() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.set_channel_admin("general", Some("alice".to_string()));
+    state.open_user_info(UserId(2), "bob".to_string(), Some("general".to_string()));
+    let rows = sidebar_rows(&state);
+    assert!(
+        !rows.iter().any(|r| r.contains("admin of")),
+        "bob is not the admin of general: {rows:?}"
+    );
+}
+
+/// @requirement AC-349
+#[test]
+fn the_user_info_popup_names_a_superadmin() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.superadmins.insert("bob".to_string());
+    state.open_user_info(UserId(2), "bob".to_string(), Some("general".to_string()));
+    let rows = sidebar_rows(&state);
+    row_containing(&rows, "bob is a \u{26A1}  superadmin"); // wide-glyph continuation cell
+}
+
+/// @requirement AC-339
+#[test]
+fn the_user_info_popup_from_a_dm_has_no_channel_and_so_no_admin_line() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.set_channel_admin("general", Some("bob".to_string()));
+    // Opened with no channel context, as `/info` in a DM room does.
+    state.open_user_info(UserId(2), "bob".to_string(), None);
+    let rows = sidebar_rows(&state);
+    assert!(
+        !rows.iter().any(|r| r.contains("admin of")),
+        "no channel context was given, so no admin claim should render: {rows:?}"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Channel moderation slash commands (docs/PROTOCOL.md §6.7, §5.5)
+// ---------------------------------------------------------------------
+
+/// @requirement AC-341
+#[test]
+fn slash_ban_sends_ban_from_channel_immediately() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    type_str(&mut state, "/ban bob");
+    let action = press(&mut state, KeyCode::Enter);
+    assert_eq!(
+        action,
+        Some(UiAction::BanFromChannel {
+            channel: "general".to_string(),
+            nickname: "bob".to_string()
+        })
+    );
+    assert!(state.input.is_empty());
+}
+
+/// @requirement AC-341
+#[test]
+fn slash_unban_sends_unban_from_channel_immediately() {
+    let mut state = joined_general_with(vec![]);
+    type_str(&mut state, "/unban bob");
+    let action = press(&mut state, KeyCode::Enter);
+    assert_eq!(
+        action,
+        Some(UiAction::UnbanFromChannel {
+            channel: "general".to_string(),
+            nickname: "bob".to_string()
+        })
+    );
+}
+
+#[test]
+fn slash_ban_with_no_nickname_is_refused_locally() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    type_str(&mut state, "/ban");
+    let action = press(&mut state, KeyCode::Enter);
+    assert_eq!(action, None);
+    assert!(state.status_notice.is_some());
+}
+
+/// @requirement AC-340
+#[test]
+fn slash_delete_channel_opens_a_confirmation_defaulting_to_cancel() {
+    let mut state = joined_general_with(vec![]);
+    type_str(&mut state, "/delete-channel");
+    let action = press(&mut state, KeyCode::Enter);
+    assert_eq!(action, None, "the confirmation popup opens, nothing is sent yet");
+    assert!(state.channel_command_confirm.is_some());
+    // Enter with the default focus (Cancel) must not delete anything.
+    let action = press(&mut state, KeyCode::Enter);
+    assert_eq!(action, None);
+    assert!(state.channel_command_confirm.is_none(), "answered, so the popup closes");
+}
+
+/// @requirement AC-340
+#[test]
+fn slash_delete_channel_confirmed_sends_delete_channel() {
+    let mut state = joined_general_with(vec![]);
+    type_str(&mut state, "/delete-channel");
+    press(&mut state, KeyCode::Enter);
+    press(&mut state, KeyCode::Left); // Cancel -> Confirm
+    let action = press(&mut state, KeyCode::Enter);
+    assert_eq!(action, Some(UiAction::DeleteChannel { name: "general".to_string() }));
+}
+
+/// @requirement AC-340
+#[test]
+fn slash_delete_channel_confirmation_absorbs_every_other_key() {
+    let mut state = joined_general_with(vec![]);
+    type_str(&mut state, "/delete-channel");
+    press(&mut state, KeyCode::Enter);
+    let action = press(&mut state, KeyCode::Char('x'));
+    assert_eq!(action, None);
+    assert!(
+        state.channel_command_confirm.is_some(),
+        "an unrelated key must not close or answer the confirmation"
+    );
+}
+
+/// @requirement AC-343
+#[test]
+fn slash_assign_admin_requires_confirmation_before_sending() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    type_str(&mut state, "/assign-admin bob");
+    let action = press(&mut state, KeyCode::Enter);
+    assert_eq!(action, None);
+    let pending = state.channel_command_confirm.as_ref().expect("popup should be open");
+    assert_eq!(
+        pending.action,
+        ChannelCommandConfirmAction::AssignAdmin {
+            channel: "general".to_string(),
+            nickname: "bob".to_string()
+        }
+    );
+    press(&mut state, KeyCode::Left); // Cancel -> Confirm
+    let action = press(&mut state, KeyCode::Enter);
+    assert_eq!(
+        action,
+        Some(UiAction::AssignChannelAdmin {
+            channel: "general".to_string(),
+            nickname: "bob".to_string()
+        })
+    );
+}
+
+/// @requirement AC-342
+#[test]
+fn slash_lock_joins_opens_prefilled_with_current_members() {
+    let mut state = joined_general_with(vec![user(2, "bob"), user(3, "carol")]);
+    type_str(&mut state, "/lock-joins");
+    let action = press(&mut state, KeyCode::Enter);
+    assert_eq!(action, None, "opening the popup is purely local");
+    let popup = state.channel_lock.as_ref().expect("popup should be open");
+    assert_eq!(popup.channel, "general");
+    assert!(popup.locked, "locked to the allowlist by default");
+    assert_eq!(popup.rows, vec!["bob".to_string(), "carol".to_string()]);
+}
+
+/// @requirement AC-342
+#[test]
+fn slash_lock_joins_apply_sends_the_allowlist() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    type_str(&mut state, "/lock-joins");
+    press(&mut state, KeyCode::Enter);
+    let action = press(&mut state, KeyCode::Enter); // Apply, default locked+prefilled
+    assert_eq!(
+        action,
+        Some(UiAction::SetChannelJoinLock {
+            channel: "general".to_string(),
+            allowed: Some(vec!["bob".to_string()])
+        })
+    );
+    assert!(state.channel_lock.is_none(), "applying closes the popup");
+}
+
+/// @requirement AC-342
+#[test]
+fn slash_lock_joins_all_users_clears_the_lock() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    type_str(&mut state, "/lock-joins");
+    press(&mut state, KeyCode::Enter);
+    press(&mut state, KeyCode::Left); // toggle to "All users"
+    let action = press(&mut state, KeyCode::Enter);
+    assert_eq!(
+        action,
+        Some(UiAction::SetChannelJoinLock {
+            channel: "general".to_string(),
+            allowed: None
+        })
+    );
+}
+
+/// @requirement AC-342
+#[test]
+fn slash_lock_joins_can_add_and_remove_nicknames() {
+    let mut state = joined_general_with(vec![]);
+    type_str(&mut state, "/lock-joins");
+    press(&mut state, KeyCode::Enter);
+    press(&mut state, KeyCode::Char('a'));
+    type_str(&mut state, "dave");
+    press(&mut state, KeyCode::Enter); // commit the add
+    assert_eq!(state.channel_lock.as_ref().unwrap().rows, vec!["dave".to_string()]);
+    let action = press(&mut state, KeyCode::Enter); // Apply
+    assert_eq!(
+        action,
+        Some(UiAction::SetChannelJoinLock {
+            channel: "general".to_string(),
+            allowed: Some(vec!["dave".to_string()])
+        })
+    );
+}
+
+/// @requirement AC-344
+#[test]
+fn slash_activate_sends_admin_activate() {
+    let mut state = joined_general_with(vec![]);
+    type_str(&mut state, "/activate eve");
+    let action = press(&mut state, KeyCode::Enter);
+    assert_eq!(action, Some(UiAction::AdminActivate { nickname: "eve".to_string() }));
+}
+
+/// @requirement AC-344
+#[test]
+fn slash_deactivate_takes_a_nickname_and_a_free_text_reason() {
+    let mut state = joined_general_with(vec![]);
+    type_str(&mut state, "/deactivate eve being disruptive");
+    let action = press(&mut state, KeyCode::Enter);
+    assert_eq!(
+        action,
+        Some(UiAction::AdminDeactivate {
+            nickname: "eve".to_string(),
+            reason: "being disruptive".to_string()
+        })
+    );
+}
+
+#[test]
+fn slash_deactivate_with_no_reason_is_refused_locally() {
+    let mut state = joined_general_with(vec![]);
+    type_str(&mut state, "/deactivate eve");
+    let action = press(&mut state, KeyCode::Enter);
+    assert_eq!(action, None);
+    assert!(state.status_notice.is_some());
+}
+
+/// @requirement AC-346, AC-347
+#[test]
+fn slash_remove_account_and_remove_channel_send_their_admin_actions() {
+    let mut state = joined_general_with(vec![]);
+    type_str(&mut state, "/remove-account eve");
+    assert_eq!(
+        press(&mut state, KeyCode::Enter),
+        Some(UiAction::AdminRemoveAccount { nickname: "eve".to_string() })
+    );
+    type_str(&mut state, "/remove-channel watercooler");
+    assert_eq!(
+        press(&mut state, KeyCode::Enter),
+        Some(UiAction::AdminRemoveChannel { name: "watercooler".to_string() })
+    );
+}
+
+/// @requirement TB-261
+#[test]
+fn every_new_admin_action_needs_a_server() {
+    assert!(UiAction::DeleteChannel { name: "x".into() }.needs_server().is_some());
+    assert!(
+        UiAction::BanFromChannel { channel: "x".into(), nickname: "y".into() }
+            .needs_server()
+            .is_some()
+    );
+    assert!(
+        UiAction::UnbanFromChannel { channel: "x".into(), nickname: "y".into() }
+            .needs_server()
+            .is_some()
+    );
+    assert!(
+        UiAction::SetChannelJoinLock { channel: "x".into(), allowed: None }
+            .needs_server()
+            .is_some()
+    );
+    assert!(
+        UiAction::AssignChannelAdmin { channel: "x".into(), nickname: "y".into() }
+            .needs_server()
+            .is_some()
+    );
+    assert!(UiAction::AdminActivate { nickname: "x".into() }.needs_server().is_some());
+    assert!(
+        UiAction::AdminDeactivate { nickname: "x".into(), reason: "y".into() }
+            .needs_server()
+            .is_some()
+    );
+    assert!(UiAction::AdminRemoveAccount { nickname: "x".into() }.needs_server().is_some());
+    assert!(UiAction::AdminRemoveChannel { name: "x".into() }.needs_server().is_some());
 }
 
 /// Two people who were never the same person stay separate - adoption is

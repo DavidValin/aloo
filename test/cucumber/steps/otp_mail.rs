@@ -631,7 +631,7 @@ async fn reconnect_and_fetch(w: &mut AlooWorld, who: String) {
                 // ChannelList follows immediately; consume it so the next
                 // recv is the fetch's answer.
                 let list: ServerMessage = stream.recv().await.unwrap().unwrap();
-                assert!(matches!(list, ServerMessage::ChannelList(_)));
+                assert!(matches!(list, ServerMessage::ChannelList { .. }));
                 granted = Some(stream);
                 break;
             }

@@ -22,7 +22,7 @@ use crate::world::{AlooWorld, ClientState};
 
 /// The password every scenario's registered nicknames get, unless the
 /// scenario explicitly names its own.
-fn password_for(nickname: &str) -> String {
+pub(crate) fn password_for(nickname: &str) -> String {
     format!("pw-{nickname}")
 }
 
@@ -32,7 +32,7 @@ const TEST_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
 // Shared helpers
 // ---------------------------------------------------------------------
 
-fn scratch_users() -> UsersRegistry {
+pub(crate) fn scratch_users() -> UsersRegistry {
     let dir = std::env::temp_dir().join(format!(
         "aloo-cucumber-server-users-{}-{}",
         std::process::id(),
@@ -49,10 +49,21 @@ fn scratch_users() -> UsersRegistry {
 }
 
 async fn spawn_server(users: UsersRegistry) -> std::net::SocketAddr {
+    spawn_server_with_options(users, |o| o).await
+}
+
+/// Same as `spawn_server`, but lets a scenario configure `ServerOptions`
+/// first (superadmins, the public-channel-creation policy, an inactivity
+/// period) - what `administration.rs`'s superadmin scenarios need a plain
+/// `spawn_server` has no way to ask for.
+pub(crate) async fn spawn_server_with_options(
+    users: UsersRegistry,
+    configure: impl FnOnce(ServerOptions) -> ServerOptions,
+) -> std::net::SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let udp = tokio::net::UdpSocket::bind(addr).await.unwrap();
-    let options = ServerOptions::new(users);
+    let options = configure(ServerOptions::new(users));
     tokio::spawn(async move {
         let _ = serve_with_rendezvous(listener, udp, options).await;
     });
@@ -238,7 +249,7 @@ async fn handshake(
     };
     let list: ServerMessage = stream.recv().await.unwrap().unwrap();
     assert!(
-        matches!(list, ServerMessage::ChannelList(_)),
+        matches!(list, ServerMessage::ChannelList { .. }),
         "ChannelList must follow IdentifyResult immediately, got {list:?}"
     );
     you
@@ -356,7 +367,7 @@ async fn join_channel(w: &mut AlooWorld, who: &str, channel: &str) {
         .unwrap();
 }
 
-async fn expect_message(w: &mut AlooWorld, who: &str) -> ServerMessage {
+pub(crate) async fn expect_message(w: &mut AlooWorld, who: &str) -> ServerMessage {
     let client = w.client_mut(who);
     let stream = client.stream.as_mut().expect("client has no socket");
     let msg: ServerMessage = tokio::time::timeout(std::time::Duration::from_secs(5), stream.recv())

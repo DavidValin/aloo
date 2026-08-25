@@ -456,8 +456,8 @@ evidence = "docs/PROTOCOL.md 6.1; tests joining_new_channel_sends_confirmation_a
 
 [[user_story.technical_behavior]]
 id = "TB-023"
-description = "An emptied channel is deleted outright, whether public or private, unless it is DEFAULT_CHANNEL_NAME (the-hall), which survives being empty forever."
-evidence = "docs/PROTOCOL.md 6.2; test empty_channel_is_deleted_unless_it_is_the_default_channel"
+description = "Emptying a channel (public or private) no longer deletes it outright - the old instant-delete-when-empty branch is gone unconditionally, not made conditional. What actually removes a channel now is join-gated inactivity (TB-260), an admin's own /delete-channel (AC-340), or a superadmin's removal (AC-347) - never bare emptiness by itself. DEFAULT_CHANNEL_NAME (the-hall) is hard-exempted from every one of those paths and survives being empty forever, exactly as before."
+evidence = "docs/PROTOCOL.md 6.2, 6.8; src/server/channels_registry.rs ChannelsRegistry::join (no instant-delete branch), sweep_inactive, force_delete_channel, DEFAULT_CHANNEL_NAME; test an_emptied_channel_persists_with_no_configured_deletion_period (server_channels_registry_test.rs)"
 
 [[user_story.technical_behavior]]
 id = "TB-024"
@@ -521,18 +521,18 @@ evidence = "src/validation.rs; tests channel_name_is_valid_counts_unicode_scalar
 
 [[user_story.acceptance_criteria]]
 id = "AC-107"
-description = "A channel other than DEFAULT_CHANNEL_NAME (the-hall) is unregistered from the server the instant its last member leaves, whether public or private; the-hall itself is never removed, even when it has no members."
-evidence = "docs/PROTOCOL.md 6.2; src/server/mod.rs Registry::remove_member, DEFAULT_CHANNEL_NAME; test empty_channel_is_deleted_unless_it_is_the_default_channel"
+description = "An emptied channel is no longer destroyed the instant its last member leaves. It persists, joinable again with its admin/ban/lock state intact, until server_channel_deletion_unactivity_period elapses with it still empty and nobody having (re)joined it in that time (AC-350's inactivity sweep) - or forever if that setting is left unconfigured, exactly like DEFAULT_CHANNEL_NAME (the-hall) has always persisted while empty. The-hall itself remains permanently exempt from removal by this or any other path, even when it has no members."
+evidence = "docs/PROTOCOL.md 6.2, 6.8; src/server/channels_registry.rs ChannelsRegistry::sweep_inactive, DEFAULT_CHANNEL_NAME; test an_emptied_channel_persists_with_no_configured_deletion_period (server_channels_registry_test.rs); scenario features/channels/channel_membership.feature 'An emptied channel survives, with no inactivity period configured'"
 
 [[user_story.acceptance_criteria]]
 id = "AC-108"
 description = "The instant a new public channel is created, every other currently-connected client is told about it and it appears in their channel list, without waiting for a reconnect."
-evidence = "docs/PROTOCOL.md 6.1; src/server/mod.rs Registry::join_channel; src/client/session.rs ChannelCreated arm; tests a_newly_created_public_channel_is_broadcast_to_other_connected_clients, end_to_end_a_second_client_sees_a_newly_created_public_channel"
+evidence = "docs/PROTOCOL.md 6.1; src/server/channels_registry.rs ChannelsRegistry::join; src/client/session.rs ChannelCreated arm; tests a_newly_created_public_channel_is_broadcast_to_other_connected_clients, end_to_end_a_second_client_sees_a_newly_created_public_channel"
 
 [[user_story.technical_behavior]]
 id = "TB-156"
 description = "Creating a private channel never triggers the ChannelCreated broadcast - it stays unadvertised exactly as before, the same guarantee AC-022/TB-154 already give every other channel-membership message."
-evidence = "docs/PROTOCOL.md 6.1, 6.3; src/server/mod.rs Registry::join_channel; test creating_a_private_channel_never_broadcasts_channelcreated"
+evidence = "docs/PROTOCOL.md 6.1, 6.3; src/server/channels_registry.rs ChannelsRegistry::join; test creating_a_private_channel_never_broadcasts_channelcreated"
 
 [[user_story.technical_behavior]]
 id = "TB-159"
@@ -2338,27 +2338,27 @@ evidence = "docs/PROTOCOL.md 6.5; src/client/tui/ui.rs Mode::ChannelPasswordPopu
 [[user_story.acceptance_criteria]]
 id = "AC-106"
 description = "More than CHANNEL_MAX_PASSWORD_ATTEMPTS wrong attempts to join one private channel from one source address bans further attempts against that channel from that address for CHANNEL_PASSWORD_BAN_DURATION, reported distinctly from a plain wrong-password reply."
-evidence = "docs/PROTOCOL.md 6.6; src/server/mod.rs Registry::join_channel, CHANNEL_MAX_PASSWORD_ATTEMPTS, CHANNEL_PASSWORD_BAN_DURATION; test more_than_seven_wrong_attempts_from_one_ip_bans_that_ip_for_that_channel"
+evidence = "docs/PROTOCOL.md 6.6; src/server/channels_registry.rs ChannelsRegistry::join, CHANNEL_MAX_PASSWORD_ATTEMPTS, CHANNEL_PASSWORD_BAN_DURATION; test more_than_seven_wrong_attempts_from_one_ip_bans_that_ip_for_that_channel"
 
 [[user_story.technical_behavior]]
 id = "TB-151"
 description = "Channel password comparison is constant-time, mirroring the credential check TB-015 already requires for server auth."
-evidence = "docs/PROTOCOL.md 5.2, 6.5; src/crypto/mod.rs constant_time_eq; src/server/mod.rs Registry::join_channel"
+evidence = "docs/PROTOCOL.md 5.2, 6.5; src/crypto/mod.rs constant_time_eq; src/server/channels_registry.rs ChannelsRegistry::join"
 
 [[user_story.technical_behavior]]
 id = "TB-152"
 description = "A successful password join resets that (source address, channel) pair's wrong-attempt counter to zero, so an earlier mistake never contributes toward a later, unrelated ban."
-evidence = "src/server/mod.rs Registry::join_channel; test a_successful_password_join_resets_the_attempt_counter"
+evidence = "src/server/channels_registry.rs ChannelsRegistry::join; test a_successful_password_join_resets_the_attempt_counter"
 
 [[user_story.technical_behavior]]
 id = "TB-153"
 description = "The brute-force ban is keyed by (source IP address, channel name), not UserId, and tracked in server memory only with no persistence across a restart - a UserId is never reused (TB-020), so a per-UserId ban would be trivially bypassed by reconnecting."
-evidence = "docs/PROTOCOL.md 6.6; src/server/mod.rs Registry::channel_password_attempts; test a_ban_is_scoped_to_ip_and_channel_not_userid"
+evidence = "docs/PROTOCOL.md 6.6; src/server/channels_registry.rs ChannelsRegistry::channel_password_attempts; test a_ban_is_scoped_to_ip_and_channel_not_userid"
 
 [[user_story.technical_behavior]]
 id = "TB-154"
 description = "A ChannelJoinRejected (password-required, wrong-password, or banned) is sent to the requester only - a private channel's existence, membership, or password state never leaks to anyone else through this flow, the same guarantee TB-113 already gives ChannelJoinFailed."
-evidence = "docs/PROTOCOL.md 6.3, 6.5; src/server/mod.rs Registry::join_channel; test channel_join_rejected_is_sent_to_the_requester_only"
+evidence = "docs/PROTOCOL.md 6.3, 6.5; src/server/channels_registry.rs ChannelsRegistry::join; test channel_join_rejected_is_sent_to_the_requester_only"
 
 # ============================================================================
 # US-026 - Leave a channel
@@ -3241,3 +3241,148 @@ evidence = "docs/SPEC.md 'Connected UI' Contacts description; src/client/tui/con
 id = "AC-324"
 description = "`i` on a channel member in the sidebar (or `/info` inside an open DM room, for that room's peer) opens a read-only user-info popup: nickname, the device this live connection actually announced (`SessionState::peer_device_ids` for a `pq_hybrid` peer, `PeerLinkManager::direct_device_id_of` for a serverless one, `(unbound)` if neither resolves), when they were last seen, and one row per key that genuinely exists for that `(nickname, device_id)` - PQH/OTP/OTP MAIL, each with the same ✅ icon/colour `/contacts`' own badges use and that key's id (PQH's fingerprint, OTP/OTP MAIL's contact name) - never all three with a ✅/❌ badge the way `/contacts`' list does, since a key that doesn't exist gets no row at all. A trailing line names an active `/otp` session, read live (`UiState::is_otp_active`) rather than from the gathered snapshot. Read-only and gated on nothing: works for a trust-gated peer, and never requires them to be reachable, since it is a local `id_store`/keychain lookup (`client::contacts::gather_single_contact_row`, a narrower `gather_contact_rows`). Opened empty (`UiState::open_user_info`) and filled in by the session's answer (`UiAction::RequestUserInfo`, `client::contacts::handle_request_user_info`), the same split `ContactsState::rows` uses; `i`/Esc closes it, absorbing every other key while open, the same tier as the message-details popup."
 evidence = "docs/SPEC.md 'Connected UI' User-info popup description; src/client/contacts.rs gather_single_contact_row, build_contact_row, live_peer_device_id, handle_request_user_info; src/client/tui/contacts.rs UserInfoState, UserInfoKeyRow, key_presence_icon, render_user_info_popup; src/client/tui/ui.rs UiState.user_info, open_user_info, set_user_info, UiAction::RequestUserInfo, handle_sidebar_key's 'i' arm, submit_input's '/info' arm; tests i_on_a_sidebar_member_opens_user_info, i_on_our_own_sidebar_row_does_nothing, esc_closes_the_user_info_popup, i_again_also_closes_it_same_as_message_info, the_popup_absorbs_every_other_key_while_open, slash_info_inside_an_open_dm_opens_the_same_popup, slash_info_with_no_dm_open_does_nothing, slash_info_works_even_for_an_offline_peer, set_user_info_is_a_no_op_for_the_wrong_peer_or_a_closed_popup, the_popup_shows_nickname_device_last_seen_and_every_key, an_unbound_peer_shows_the_placeholder_device, an_active_otp_session_is_named_at_the_end, no_active_otp_session_says_nothing_about_one (ui_user_info_test.rs), a_peer_with_nothing_pinned_gathers_no_keys_and_no_device, only_pqh_present_shows_only_the_pqh_row, a_pinned_and_installed_key_shows_up_with_its_id, a_direct_punch_peers_device_resolves_from_the_link_not_an_announce (user_info_test.rs)"
+
+# ============================================================================
+# US-050 - Restrict who may create new public channels
+# ============================================================================
+[[user_story]]
+id = "US-050"
+title = "Restrict who may create new public channels"
+as_a = "server operator"
+i_want = "to optionally stop ordinary users from minting brand-new public channels"
+so_that = "the public channel directory doesn't fill up with clutter no one asked for"
+
+[[user_story.acceptance_criteria]]
+id = "AC-337"
+description = "server_allow_create_public_channels (default on) gates only the creation of a brand-new public channel. When off: joining an already-existing public channel still works exactly as before, and creating or joining a private channel is entirely unaffected - the switch has no opinion about private channels at all, since nothing about them is ever publicly listed in the first place."
+evidence = "docs/SPEC.md 'Server startup'; src/settings.rs Settings::server_allow_create_public_channels; src/server/mod.rs ServerOptions::with_create_public_channels_policy; src/main.rs run_server; tests creating_a_new_public_channel_is_refused_when_the_policy_is_off, joining_an_existing_public_channel_is_unaffected_by_the_policy, creating_a_private_channel_is_unaffected_by_the_policy (server_channels_registry_test.rs), server_allow_create_public_channels_defaults_on_and_is_always_written, server_allow_create_public_channels_round_trips_off (settings_test.rs)"
+
+[[user_story.technical_behavior]]
+id = "TB-256"
+description = "The policy is enforced once, server-side, inside ChannelsRegistry::join itself - never client-side-only - so a modified or misbehaving client gains nothing by skipping its own check. A refusal is a plain free-text ChannelJoinFailed { name, reason }, the same shape TB-113's unregistered-user refusal already uses, not a new ChannelJoinRejection variant, since there is no retry-with-different-input flow to distinguish it for."
+evidence = "src/server/channels_registry.rs ChannelsRegistry::join; src/server/mod.rs Registry::join_channel_with_policy (the 6-argument form join_channel wraps with allow_create_public_channels: true, so ~20 pre-existing direct callers are unaffected); tests creating_a_new_public_channel_is_refused_when_the_policy_is_off, joining_an_existing_public_channel_is_unaffected_by_the_policy"
+
+# ============================================================================
+# US-051 - Own and moderate a channel I created
+# ============================================================================
+[[user_story]]
+id = "US-051"
+title = "Own and moderate a channel I created"
+as_a = "user who creates a channel"
+i_want = "to be recognised as its owner and able to police who's in it"
+so_that = "a channel I start doesn't drift out of my control or get overrun"
+
+[[user_story.acceptance_criteria]]
+id = "AC-338"
+description = "Whoever's join actually creates a channel - public or private - automatically becomes its admin; a later joiner never becomes admin merely by joining, however many people join afterward. DEFAULT_CHANNEL_NAME (the-hall) is the one permanent exception: it has no admin, ever, so every admin-only command (delete, ban/unban, lock-joins, assign-admin) refuses on it the same way it would on any channel nobody administers."
+evidence = "docs/PROTOCOL.md 6.7; src/server/channels_registry.rs ChannelsRegistry::join's or_insert_with closure, require_caller_is_admin; tests the_creator_of_a_public_channel_becomes_its_admin, the_creator_of_a_private_channel_becomes_its_admin_too, the_hall_has_no_admin, a_second_joiner_does_not_become_admin, the_hall_cannot_be_deleted_even_by_whoever_tries (server_channels_registry_test.rs)"
+
+[[user_story.acceptance_criteria]]
+id = "AC-339"
+description = "The bordered message pane's title names the selected channel and, whenever it has one, its admin - \"#name (admin: nickname)\" - and simply omits the parenthetical for a channel with none (the-hall, or one where nobody has been assigned). In the sidebar, that admin's own row is marked with a leading sun; nobody else's is. Pressing 'i' on a channel member opens the user-info popup with a line reading \"admin of #channel\" whenever that member is that channel's admin - naming no channel and showing no such line when opened from a DM, since a DM carries no channel context at all."
+evidence = "docs/PROTOCOL.md 6.7; src/client/tui/ui.rs render_messages (channel_label + admin suffix), render_sidebar (superadmin/admin icon prefixes); src/client/tui/contacts.rs UserInfoState.channel, render_user_info_popup; src/client/tui/channel.rs ChannelTab.admin, set_channel_admin; tests the_message_pane_title_names_the_channel_and_its_admin, the_message_pane_title_omits_the_admin_when_there_is_none, the_sidebar_marks_the_channel_admin_with_a_sun, the_sidebar_does_not_mark_an_ordinary_member, the_user_info_popup_names_the_channel_admin, the_user_info_popup_says_nothing_about_admin_for_an_ordinary_member, the_user_info_popup_from_a_dm_has_no_channel_and_so_no_admin_line (ui_channel_test.rs)"
+
+[[user_story.technical_behavior]]
+id = "TB-257"
+description = "A channel's admin rides as a sibling field on ServerMessage::Joined { channel, admin } - deliberately not folded into ChannelInfo itself, which stays exactly what it was. ChannelTab mirrors it locally, set once from Joined and kept current afterward only by a later ChannelAdminChanged; the public directory (/channels, ChannelList, ChannelCreated) never carries or needs it."
+evidence = "src/proto.rs ServerMessage::Joined; src/server/channels_registry.rs ChannelsRegistry::join; src/client/tui/channel.rs ChannelTab.admin, on_joined, set_channel_admin, on_channel_admin_changed; tests the_message_pane_title_names_the_channel_and_its_admin, the_message_pane_title_omits_the_admin_when_there_is_none"
+
+[[user_story.acceptance_criteria]]
+id = "AC-340"
+description = "/delete-channel (no argument - it targets the channel currently selected) is admin-only and public-channel-only: a private channel, or one the caller doesn't administer, is refused with a reason naming the problem, and the-hall refuses it the same way every other admin command does (it has no admin to match). Confirmed, every member - the admin included - is told the channel is gone and its tab disappears; the name is immediately free for anyone to recreate from scratch, as its own new channel with its own new admin. Client-side, the command opens a confirmation popup defaulting to Cancel, which absorbs every other key until answered, before anything is ever sent."
+evidence = "docs/PROTOCOL.md 6.7; src/server/channels_registry.rs ChannelsRegistry::delete_channel, force_delete_channel; src/client/tui/ui.rs UiState.channel_command_confirm, ChannelCommandConfirmAction::DeleteChannel, render_channel_command_confirm_popup; src/client/tui/channel.rs on_channel_removed; tests the_admin_can_delete_the_public_channel_they_created, deleting_a_channel_you_do_not_administer_is_refused, deleting_a_private_channel_is_refused, the_hall_cannot_be_deleted_even_by_whoever_tries, a_deleted_channel_can_be_recreated_by_another_user (server_channels_registry_test.rs), slash_delete_channel_opens_a_confirmation_defaulting_to_cancel, slash_delete_channel_confirmed_sends_delete_channel, slash_delete_channel_confirmation_absorbs_every_other_key (ui_channel_test.rs)"
+
+[[user_story.acceptance_criteria]]
+id = "AC-341"
+description = "A channel's admin can /ban <nickname>, force-removing that member from the channel immediately; every remaining member and the banned person themselves are told, in one broadcast (the recipient's own client decides whether that reads as a personal notice or a channel-log line). A banned nickname's every future join attempt to that channel is refused until /unban reverses it, which restores the ability to join again without itself readmitting them. Only that channel's admin may ban or unban; anyone else's attempt is refused."
+evidence = "docs/PROTOCOL.md 6.7; src/server/channels_registry.rs ChannelsRegistry::ban, unban; src/proto.rs ServerMessage::UserBanned, UserUnbanned; src/client/tui/session.rs handle_server_message's UserBanned/UserUnbanned arms; src/client/tui/channel.rs on_user_banned, on_user_unbanned; tests the_admin_can_ban_a_member_who_is_then_force_removed_and_notified, unban_reverses_a_ban_and_a_future_join_succeeds, banning_from_a_channel_you_do_not_administer_is_refused (server_channels_registry_test.rs), slash_ban_sends_ban_from_channel_immediately, slash_unban_sends_unban_from_channel_immediately, slash_ban_with_no_nickname_is_refused_locally (ui_channel_test.rs)"
+
+[[user_story.technical_behavior]]
+id = "TB-258"
+description = "A channel ban (ChannelJoinRejection::UserBanned) is a distinct rejection from the pre-existing IP-scoped brute-force ban (ChannelJoinRejection::Banned, TB-153) - the two are never conflated. One is nickname-scoped moderation with no expiry, reversed only by /unban; the other is an automatic, address-scoped throttle against repeated wrong passwords that expires after CHANNEL_PASSWORD_BAN_DURATION on its own."
+evidence = "src/proto.rs ChannelJoinRejection::UserBanned vs Banned; src/server/channels_registry.rs ChannelsRegistry::join's ban check vs its password-attempt check; tests the_admin_can_ban_a_member_who_is_then_force_removed_and_notified, more_than_seven_wrong_attempts_from_one_ip_bans_that_ip_for_that_channel"
+
+[[user_story.acceptance_criteria]]
+id = "AC-342"
+description = "A channel's admin can /lock-joins, opening a popup prefilled with the channel's current members as a specific, editable allowlist (add/remove nicknames); switching to \"All users\" instead and applying clears any existing lock entirely. Applying takes effect immediately, for future joins only - a member already in the channel is never removed just because a narrower list no longer names them - and the admin is always implicitly allowed into their own channel regardless of what the list says. A nickname the lock refuses gets its own distinct rejection, and every current member is told once the lock actually changes."
+evidence = "docs/PROTOCOL.md 6.7; src/server/channels_registry.rs ChannelsRegistry::set_join_lock, join's lock check; src/proto.rs ClientMessage::SetChannelJoinLock, ServerMessage::ChannelJoinLockUpdated; src/client/tui/channel_lock_popup.rs ChannelLockPopupState, handle_channel_lock_popup_key, open_channel_lock_popup; tests lock_joins_refuses_a_nickname_not_on_the_allowlist_but_always_allows_the_admin, all_users_clears_the_lock, applying_a_narrower_lock_does_not_remove_a_currently_joined_member (server_channels_registry_test.rs), slash_lock_joins_opens_prefilled_with_current_members, slash_lock_joins_apply_sends_the_allowlist, slash_lock_joins_all_users_clears_the_lock, slash_lock_joins_can_add_and_remove_nicknames (ui_channel_test.rs)"
+
+[[user_story.technical_behavior]]
+id = "TB-259"
+description = "A join-lock's allowlist is validated server-side the same way any other settings-file nickname is (validation::nickname_is_registrable), refusing the whole call on the first bad entry. A non-member, non-admin nickname absent from an active lock is refused with ChannelJoinRejection::NotOnAllowlist, distinct from both UserBanned (TB-258) and the password-flow rejections."
+evidence = "src/server/channels_registry.rs ChannelsRegistry::set_join_lock; src/proto.rs ChannelJoinRejection::NotOnAllowlist; test lock_joins_refuses_a_nickname_not_on_the_allowlist_but_always_allows_the_admin"
+
+[[user_story.acceptance_criteria]]
+id = "AC-343"
+description = "A channel's admin can /assign-admin <nickname>, handing off admin rights to a fellow current member and releasing their own, behind a confirmation popup. The target must already be a member - handing a channel to someone not even present to accept it is refused - and every current member is told once the handoff takes effect. Immediately afterward the old admin can no longer run admin-only commands on that channel, and the new admin can."
+evidence = "docs/PROTOCOL.md 6.7; src/server/channels_registry.rs ChannelsRegistry::assign_admin; src/proto.rs ClientMessage::AssignChannelAdmin, ServerMessage::ChannelAdminChanged; src/client/tui/ui.rs ChannelCommandConfirmAction::AssignAdmin; tests assign_admin_requires_the_target_to_already_be_a_member, assign_admin_hands_off_and_releases_the_callers_own_admin_status (server_channels_registry_test.rs), slash_assign_admin_requires_confirmation_before_sending (ui_channel_test.rs)"
+
+[[user_story.acceptance_criteria]]
+id = "AC-350"
+description = "A channel with zero members is no longer removed the instant it empties (that replaces AC-107/TB-023's old behavior). Instead, once server_channel_deletion_unactivity_period is configured, an empty channel is swept away only after that whole period has passed with nobody having (re)joined it - any join, by anyone, at any point during the window, pushes the deadline back out from that moment rather than letting the original emptying's age win. A non-empty channel is never swept regardless of how long ago it was last joined, DEFAULT_CHANNEL_NAME (the-hall) is never swept even when a period is configured, and leaving the setting unconfigured turns the sweep off entirely - empty channels then simply persist forever, the same as the-hall always has."
+evidence = "docs/PROTOCOL.md 6.8; src/settings.rs ChannelDeletionPeriod, Settings::server_channel_deletion_unactivity_period; src/server/channels_registry.rs ChannelRecord.last_join_at, ChannelsRegistry::sweep_inactive; src/server/mod.rs CHANNEL_SWEEP_INTERVAL, channel_sweep_loop; tests sweep_removes_a_channel_empty_and_inactive_past_its_configured_period, sweep_leaves_an_empty_channel_alone_before_its_period_elapses, sweep_never_removes_the_default_channel_even_when_configured, sweep_does_nothing_when_no_period_is_configured, sweep_leaves_a_non_empty_channel_alone_regardless_of_last_join_at, a_rejoin_resets_the_inactivity_clock (server_channels_registry_test.rs), server_channel_deletion_unactivity_period_parses_and_round_trips, server_channel_deletion_unactivity_period_defaults_to_no_sweep (settings_test.rs)"
+
+[[user_story.technical_behavior]]
+id = "TB-260"
+description = "Inactivity is measured by (re-)join events, never by message content - the server has no visibility into P2P channel messages at all, so a join is the only activity signal it can observe. The sweep is a periodic background pass (CHANNEL_SWEEP_INTERVAL, every 5 minutes - plenty of margin for day/week/month-scale periods), not a per-message or per-leave check, and is skipped entirely when no period is configured rather than defaulting to some fallback duration."
+evidence = "docs/PROTOCOL.md 6.8; src/server/channels_registry.rs ChannelsRegistry::sweep_inactive; src/server/mod.rs CHANNEL_SWEEP_INTERVAL, channel_sweep_loop, Registry::with_channel_deletion_period; tests sweep_does_nothing_when_no_period_is_configured, a_rejoin_resets_the_inactivity_clock"
+
+[[user_story.technical_behavior]]
+id = "TB-261"
+description = "Every new channel-moderation UiAction (DeleteChannel, BanFromChannel, UnbanFromChannel, SetChannelJoinLock, AssignChannelAdmin) declares itself in UiAction::needs_server and is refused with a clear status-line message in --no-server mode, through the same central gate every other server-dependent action already uses - channel ownership and moderation need an authority both sides trust, which doesn't exist without a server."
+evidence = "src/client/tui/ui.rs UiAction::needs_server; test every_new_admin_action_needs_a_server (ui_channel_test.rs)"
+
+# ============================================================================
+# US-052 - Server-wide moderation by a superadmin
+# ============================================================================
+[[user_story]]
+id = "US-052"
+title = "Server-wide moderation by a superadmin"
+as_a = "server operator"
+i_want = "a short list of trusted accounts able to lock out or remove a user, or remove a public channel, over the wire"
+so_that = "abuse can be handled without needing shell access to the server's own machine"
+
+[[user_story.acceptance_criteria]]
+id = "AC-344"
+description = "server_superadmin (one nickname per line) names the accounts that may issue any Admin* command. A superadmin's /deactivate <nickname> <reason> blocks that account's next login, reporting the exact reason given; /activate <nickname> reverses it, using the very same underlying mechanism that already clears a still-pending email activation code - one concept (\"make this account able to log in right now\"), reached by either path. A deactivated account's password is still checked before the deactivation is revealed, exactly like a merely-pending registration already is, so a wrong password never distinguishes the two from an unknown nickname."
+evidence = "docs/PROTOCOL.md 5.5; src/server/users_registry.rs UsersRegistry::deactivate, deactivation_reason, admin_force_activate, AuthCheck::Deactivated, check_credentials; src/proto.rs AuthResult.deactivated, ClientMessage::AdminDeactivate/AdminActivate; src/settings.rs Settings::server_superadmin; tests deactivate_and_deactivation_reason_round_trip, check_credentials_reports_deactivated_even_over_a_pending_activation, check_credentials_deactivated_still_requires_the_right_password, admin_force_activate_clears_both_a_pending_code_and_a_deactivation, admin_force_activate_on_an_ordinary_active_account_is_a_harmless_no_op (server_users_registry_test.rs), a_superadmins_deactivate_blocks_the_next_login_with_the_reason, a_superadmins_activate_reverses_a_deactivation, a_non_superadmin_admin_deactivate_is_refused_and_changes_nothing (server_test.rs), slash_activate_sends_admin_activate, slash_deactivate_takes_a_nickname_and_a_free_text_reason, slash_deactivate_with_no_reason_is_refused_locally (ui_channel_test.rs), server_superadmin_is_one_line_per_admin_and_skips_unregistrable_values, server_superadmin_round_trips_in_sorted_order (settings_test.rs)"
+
+[[user_story.acceptance_criteria]]
+id = "AC-345"
+description = "A currently-connected account that gets /deactivate'd is told live - no need to wait for its next login attempt - and its whole session is immediately taken over by a full-screen red modal: \"Your account has been deactivated (\\\"<reason>\\\")\", Escape to close aloo. That modal absorbs every other key, and outranks even an outstanding identity review (today's other top-priority tier) - once the account is locked out, nothing else pending in the session still matters."
+evidence = "docs/PROTOCOL.md 5.5; src/proto.rs ServerMessage::AccountDeactivated; src/client/session.rs handle_server_message's AccountDeactivated arm; src/client/tui/ui.rs UiState.account_deactivated, handle_key's top-priority tier, render_account_deactivated_modal; tests a_superadmins_deactivate_notifies_a_currently_connected_target_live (server_test.rs), the_account_deactivated_modal_absorbs_every_key_but_escape, the_account_deactivated_modal_outranks_the_identity_review_queue (ui_test.rs)"
+
+[[user_story.acceptance_criteria]]
+id = "AC-346"
+description = "A superadmin's /remove-account <nickname> deletes that account outright (the same UsersRegistry::remove a failed-registration rollback already used internally, now reachable over the wire for the first time) and cascades into every channel that account administers: each such channel is removed too, exactly like an admin's own /delete-channel, with every member notified. A channel administered by anyone else is left completely untouched, and the-hall - which never has an admin - is never touched by this cascade regardless of who is removed."
+evidence = "docs/PROTOCOL.md 5.5; src/server/mod.rs client_loop's AdminRemoveAccount arm, require_superadmin; src/server/channels_registry.rs ChannelsRegistry::channels_administered_by; src/server/users_registry.rs UsersRegistry::remove; tests remove_channels_administered_by_deletes_every_channel_that_admin_owns_and_notifies_members, remove_channels_administered_by_never_touches_the_hall (server_channels_registry_test.rs), a_superadmins_remove_account_cascades_into_channels_it_administers (server_test.rs), slash_remove_account_and_remove_channel_send_their_admin_actions (ui_channel_test.rs)"
+
+[[user_story.acceptance_criteria]]
+id = "AC-347"
+description = "A superadmin's /remove-channel <name> removes any public channel by name, regardless of who administers it - the caller's own superadmin status is the only check, not channel ownership. DEFAULT_CHANNEL_NAME (the-hall) refuses even a superadmin's removal, the one channel no removal path can ever touch. A private channel has no such command at all: since its existence is never advertised outside its own membership (AC-022/TB-154), a superadmin who isn't already in one has no name to act on."
+evidence = "docs/PROTOCOL.md 5.5, 6.7; src/server/mod.rs client_loop's AdminRemoveChannel arm; src/server/channels_registry.rs ChannelsRegistry::remove_channel, force_delete_channel (DEFAULT_CHANNEL_NAME exemption); tests superadmin_remove_channel_works_regardless_of_who_administers_it, superadmin_remove_channel_refuses_the_default_channel_even_for_a_superadmin (server_channels_registry_test.rs), a_superadmins_remove_channel_works_on_any_public_channel (server_test.rs)"
+
+[[user_story.acceptance_criteria]]
+id = "AC-348"
+description = "Only nicknames listed in server_superadmin may issue any Admin* command (deactivate, activate, remove-account, remove-channel); anyone else's attempt is refused with a clear reason and changes nothing at all - not the target account, not any channel. The check is server-side and absolute, independent of whatever the client's own UI happens to show or gate."
+evidence = "docs/PROTOCOL.md 5.5; src/server/mod.rs require_superadmin, client_loop's Admin* dispatch arms; test a_non_superadmin_admin_deactivate_is_refused_and_changes_nothing (server_test.rs)"
+
+[[user_story.acceptance_criteria]]
+id = "AC-349"
+description = "A superadmin's name is marked with a leading lightning bolt in the sidebar of every channel they're in, not just one they administer, and pressing 'i' on them reports \"<nickname> is a \\u{26A1} superadmin\" regardless of which channel that popup was opened from. The marker composes with the channel-admin sun (AC-339) when the same person is both, rather than one silently winning over the other."
+evidence = "docs/PROTOCOL.md 5.5; src/client/tui/ui.rs UiState.superadmins, render_sidebar's superadmin prefix; src/client/tui/channel.rs is_superadmin; src/client/tui/contacts.rs render_user_info_popup; tests the_sidebar_marks_a_superadmin_with_a_lightning_bolt_in_any_channel, the_sidebar_shows_both_markers_together_when_they_apply_to_the_same_person, the_user_info_popup_names_a_superadmin (ui_channel_test.rs)"
+
+[[user_story.technical_behavior]]
+id = "TB-262"
+description = "A non-superadmin's Admin* attempt is checked and refused before touching any registry or account state at all - require_superadmin runs first, outside ChannelsRegistry/Registry entirely (mirroring the existing register_account precedent), and every Admin* dispatch arm in client_loop shares it rather than each re-implementing its own check."
+evidence = "src/server/mod.rs require_superadmin; test a_non_superadmin_admin_deactivate_is_refused_and_changes_nothing"
+
+[[user_story.technical_behavior]]
+id = "TB-263"
+description = "AuthResult.deactivated is a dedicated typed Option<String> field, mirroring how activation_pending is already its own bool rather than folded into free-text reason. check_credentials checks deactivation before the pending-activation match, so an account that is both still-pending and deactivated reports Deactivated, not ActivationPending - deactivation always outranks a merely-unfinished registration."
+evidence = "src/proto.rs AuthResult.deactivated; src/server/users_registry.rs UsersRegistry::check_credentials; tests check_credentials_reports_deactivated_even_over_a_pending_activation, check_credentials_deactivated_still_requires_the_right_password"
+
+[[user_story.technical_behavior]]
+id = "TB-264"
+description = "No kick primitive exists anywhere in this server, before or after this feature - a live deactivation is handled entirely by the client's own reaction to AccountDeactivated (the modal), not a server-initiated disconnect. Escape on that modal answers through the same UiAction::Quit mechanism Detach already uses to end the input loop, relying on the same implicit process-exit cleanup that already reclaims the UDP socket and closes the control connection for an ordinary quit - no new teardown path was added."
+evidence = "src/client/tui/ui.rs UiState::handle_key's account_deactivated tier, UiAction::Quit; src/client/session.rs's Quit arm; tests escape_on_the_deactivated_modal_sends_quit, the_account_deactivated_modal_absorbs_every_key_but_escape (ui_test.rs)"

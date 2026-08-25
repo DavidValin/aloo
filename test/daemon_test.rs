@@ -530,7 +530,7 @@ fn a_server_password_from_settings_is_used_when_no_flag_gives_one() {
     assert_eq!(config.password, "hunter2");
 
     let flags = DaemonFlags {
-        server_pwd: Some("from-flag".into()),
+        nick_pwd: Some("from-flag".into()),
         ..flags_with_host()
     };
     let config = DaemonConfig::resolve(&flags, &settings, &empty_cache()).unwrap();
@@ -580,7 +580,7 @@ async fn run_refuses_to_start_with_a_server_and_no_password() {
 #[test]
 fn the_daemon_connects_with_the_resolved_password() {
     let flags = DaemonFlags {
-        server_pwd: Some("hunter2".into()),
+        nick_pwd: Some("hunter2".into()),
         ..flags_with_host()
     };
     let config = DaemonConfig::resolve(&flags, &Settings::default(), &empty_cache()).unwrap();
@@ -701,7 +701,7 @@ fn a_resolved_configuration_round_trips_through_the_settings_file() {
         host: Some("chat.example".into()),
         port: Some(7979),
         nickname: Some("david".into()),
-        server_pwd: Some("hunter2".into()),
+        nick_pwd: Some("hunter2".into()),
         channels: vec!["team,ops:s3cret".into()],
         initial_focus: Some("alice".into()),
         otp: true,

@@ -193,7 +193,7 @@ pub async fn handshake_with_mode<S: AsyncRead + AsyncWrite + Unpin>(
     };
     let list: ServerMessage = stream.recv().await.unwrap().unwrap();
     assert!(
-        matches!(list, ServerMessage::ChannelList(_)),
+        matches!(list, ServerMessage::ChannelList { .. }),
         "ChannelList must follow IdentifyResult immediately, got {list:?}"
     );
     you

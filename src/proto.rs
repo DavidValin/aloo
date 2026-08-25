@@ -230,8 +230,17 @@ pub enum ChannelJoinRejection {
     /// `CHANNEL_MAX_PASSWORD_ATTEMPTS` wrong attempts against this (source
     /// address, channel name) pair already tripped the ban within the last
     /// `CHANNEL_PASSWORD_BAN_DURATION` - further attempts are refused
-    /// without even checking the password given.
+    /// without even checking the password given. Scoped to (source IP,
+    /// channel name), never a nickname - see `UserBanned` for that.
     Banned,
+    /// The channel admin has `/ban`-ed this nickname - distinct from
+    /// `Banned` above, which is the unrelated IP-scoped brute-force
+    /// protection. A future `/unban` reverses this.
+    UserBanned,
+    /// The channel is currently locked to an allowlist (`/lock-joins`)
+    /// and this nickname isn't on it (the admin is always implicitly
+    /// allowed into their own channel, regardless of the list).
+    NotOnAllowlist,
 }
 
 /// One message body (text, file, or voice), encrypted for a single
@@ -386,6 +395,75 @@ pub enum ClientMessage {
         name: String,
     },
 
+    /// The channel admin's `/delete-channel`: `name` must be a public
+    /// channel currently administered by the sender - checked
+    /// server-side regardless of the client's own idea of who's admin.
+    /// Only ever targets the sender's currently-selected channel; there
+    /// is no way to delete one by name alone.
+    DeleteChannel {
+        name: String,
+    },
+    /// The channel admin's `/ban <nickname>`. Force-removes `nickname`
+    /// from `channel` if currently a member, and refuses their future
+    /// joins to it until a matching `UnbanFromChannel`.
+    BanFromChannel {
+        channel: String,
+        nickname: String,
+    },
+    /// The channel admin's `/unban <nickname>` - reverses `BanFromChannel`
+    /// only; the nickname must still rejoin, which will now succeed.
+    UnbanFromChannel {
+        channel: String,
+        nickname: String,
+    },
+    /// The channel admin's `/lock-joins`. `allowed: None` is the "All
+    /// users" option - clears the lock entirely; `Some(list)` restricts
+    /// *future* joins to that list (plus the admin, always implicitly).
+    /// Already-joined members are unaffected either way.
+    SetChannelJoinLock {
+        channel: String,
+        allowed: Option<Vec<String>>,
+    },
+    /// The channel admin's `/assign-admin <nickname>`: `nickname` must
+    /// currently be a member of `channel`. Releases the sender's own
+    /// admin status in the same stroke - a channel has exactly one admin.
+    AssignChannelAdmin {
+        channel: String,
+        nickname: String,
+    },
+
+    /// A superadmin's `/deactivate <nickname> <reason>` - checked against
+    /// `server_superadmin` server-side. Locks the named account out of
+    /// logging in (`AuthCheck::Deactivated`) until a matching
+    /// `AdminActivate`, and, if currently connected, pushes
+    /// `ServerMessage::AccountDeactivated` to it.
+    AdminDeactivate {
+        nickname: String,
+        reason: String,
+    },
+    /// A superadmin's `/activate <nickname>` - clears whatever is
+    /// currently blocking that account's login: a still-pending emailed
+    /// registration code, a prior `AdminDeactivate`, or both. Deliberately
+    /// the same underlying "make this account able to log in right now"
+    /// concept either way.
+    AdminActivate {
+        nickname: String,
+    },
+    /// A superadmin's `/remove-account <nickname>`: deletes the account
+    /// outright and removes every channel it currently administers,
+    /// notifying that channel's members.
+    AdminRemoveAccount {
+        nickname: String,
+    },
+    /// A superadmin's `/remove-channel <name>`: removes any channel
+    /// outright (never `DEFAULT_CHANNEL_NAME`, even for a superadmin).
+    /// Public-only in practice - a private channel's existence is never
+    /// advertised to anyone outside its membership, so a superadmin has
+    /// no name to act on for one it isn't already in.
+    AdminRemoveChannel {
+        name: String,
+    },
+
     /// `pq_hybrid` only (`KeyMode::PqHybrid`, PROTOCOL.md §13.10): tells
     /// `to` to trust a freshly-rotated encryption key from now on.
     /// `new_public_key_der` and `signature` carry a bincode-encoded
@@ -481,13 +559,19 @@ pub enum ServerMessage {
         control: crate::control::ControlOffer,
     },
     /// Answers `Auth` and `Activate`. `ok: false` with
-    /// `activation_pending: false` closes the connection; `ok: false` with
-    /// `activation_pending: true` means the credentials were right but the
-    /// account has not been activated yet - the client may send exactly
-    /// one `Activate` (§5.2), answered with another `AuthResult`.
+    /// `activation_pending: false` and `deactivated: None` closes the
+    /// connection; `ok: false` with `activation_pending: true` means the
+    /// credentials were right but the account has not been activated yet
+    /// - the client may send exactly one `Activate` (§5.2), answered with
+    /// another `AuthResult`. `ok: false` with `deactivated: Some(reason)`
+    /// means the credentials were right but a superadmin has locked the
+    /// account out - a dedicated typed field, not folded into `reason`,
+    /// the same way `activation_pending` already isn't, so the client can
+    /// route to a distinctly-worded refusal rather than a generic one.
     AuthResult {
         ok: bool,
         activation_pending: bool,
+        deactivated: Option<String>,
         reason: Option<String>,
     },
     /// Answers `Register` (§5.3). The connection closes right after either
@@ -507,9 +591,31 @@ pub enum ServerMessage {
         you: Option<UserId>,
         reason: Option<String>,
     },
-    ChannelList(Vec<ChannelInfo>),
+    /// The public channel directory, plus every nickname
+    /// `server_superadmin` names - folded into this one message, rather
+    /// than a second one sent right after it, specifically so the
+    /// connect-time message *count* never changes: several tests and the
+    /// daemon's own connect path read a fixed sequence ending at
+    /// `ChannelList` and start doing other things immediately after,
+    /// so an additional message here would land as an unexpected reply
+    /// to whatever they asked next. `superadmins` is fixed for the
+    /// server's uptime like the setting it comes from, so unlike
+    /// `channels` there is no later live-update message for it - every
+    /// client, superadmin or not, learns the whole list exactly once.
+    ChannelList {
+        channels: Vec<ChannelInfo>,
+        superadmins: Vec<String>,
+    },
+    /// Confirms a successful join. `admin` is the channel's current
+    /// admin nickname at the moment of joining (`None` only for
+    /// `DEFAULT_CHANNEL_NAME`, which belongs to nobody) - carried here
+    /// rather than on `ChannelInfo` itself, since `ChannelInfo` is also
+    /// what the public directory (`ChannelList`/`ChannelCreated`) uses,
+    /// and the directory has no use for it. A later change of admin
+    /// while already joined arrives instead as `ChannelAdminChanged`.
     Joined {
         channel: ChannelInfo,
+        admin: Option<String>,
     },
     ChannelJoinFailed {
         name: String,
@@ -541,6 +647,44 @@ pub enum ServerMessage {
         channel: String,
         user_id: UserId,
     },
+    /// The admin removed `name` outright, via `/delete-channel` or a
+    /// superadmin's removal/account-removal cascade - `reason` names
+    /// which. Sent to every member who was in it; the client drops the
+    /// tab. A later `JoinChannel` for the same name simply recreates it
+    /// fresh, exactly like any other emptied channel.
+    ChannelRemoved {
+        name: String,
+        reason: String,
+    },
+    /// The admin `/ban`-ed `nickname` (whose current `UserId` is
+    /// `user_id`) from `channel`, force-removing them if they were a
+    /// member. Sent to every member who was in the channel, the banned
+    /// one included - a client compares `user_id` to its own to tell a
+    /// personal notice from an ordinary channel-log line.
+    UserBanned {
+        channel: String,
+        user_id: UserId,
+        nickname: String,
+    },
+    /// The admin `/unban`-ed `nickname` from `channel` - membership is
+    /// unaffected either way; this only reverses the future-join refusal.
+    UserUnbanned {
+        channel: String,
+        nickname: String,
+    },
+    /// The admin applied `/lock-joins` - `by` names who, for the
+    /// notification. Carries no list: the effect (locked/unlocked, and to
+    /// whom) is only ever queried by joining.
+    ChannelJoinLockUpdated {
+        channel: String,
+        by: String,
+    },
+    /// `channel`'s admin changed via `/assign-admin` - `admin` is the new
+    /// one. Sent to every current member.
+    ChannelAdminChanged {
+        channel: String,
+        admin: Option<String>,
+    },
     /// Sent once per peer sharing any channel with `user_id` when their
     /// connection closes entirely (vs `UserLeft`: left one channel, still
     /// connected). Unlike `UserLeft`, the recipient does *not* drop
@@ -570,6 +714,16 @@ pub enum ServerMessage {
 
     Error {
         message: String,
+    },
+
+    /// A superadmin's `/deactivate` just took effect against this
+    /// currently-connected account. There is no server-side way to force
+    /// a socket closed, so the client is expected to react to this
+    /// itself: tear down its own session (the same exit path an ordinary
+    /// quit already uses) after showing `reason`, rather than waiting for
+    /// anything further from the server.
+    AccountDeactivated {
+        reason: String,
     },
 
     /// Answers one `OtpMailSend` (docs/PROTOCOL.md §17.2): `ok: true` means

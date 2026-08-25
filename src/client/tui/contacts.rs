@@ -176,6 +176,13 @@ pub struct UserInfoKeyRow {
 pub struct UserInfoState {
     pub peer: UserId,
     pub nickname: String,
+    /// The channel this was opened from (`i` in the sidebar), or `None`
+    /// for `/info` in an open DM room, which has no channel context.
+    /// Drives "☀️ admin of #channel" - re-derived fresh at render time
+    /// from `UiState::channels` rather than snapshotted, so a
+    /// `ChannelAdminChanged` that lands while this happens to be open is
+    /// reflected immediately.
+    pub channel: Option<String>,
     /// `None` until the session-side gather resolves it (device-pinning
     /// plan §5's live-announce for a `pq_hybrid` peer,
     /// `PeerLinkManager::direct_device_id_of` for a serverless one) - also
@@ -303,8 +310,15 @@ impl UiState {
     /// `open_contacts`/`OpenContacts` split. Deliberately does not touch
     /// `mode` - unlike `/contacts`, this is an overlay over whatever view
     /// is already on screen, the same as the message-info popup.
-    pub fn open_user_info(&mut self, peer: UserId, nickname: String) {
-        self.user_info = Some(UserInfoState { peer, nickname, device_id: None, last_seen_unix: None, keys: Vec::new() });
+    pub fn open_user_info(&mut self, peer: UserId, nickname: String, channel: Option<String>) {
+        self.user_info = Some(UserInfoState {
+            peer,
+            nickname,
+            channel,
+            device_id: None,
+            last_seen_unix: None,
+            keys: Vec::new(),
+        });
     }
 
     /// `RequestUserInfo`'s answer. A no-op if the popup was closed (or
@@ -1484,7 +1498,37 @@ fn otp_direction_detail_line(label: &str, seq: u64, offset: u64, remaining_bytes
 pub(crate) fn render_user_info_popup(frame: &mut Frame, area: Rect, state: &UiState) {
     let Some(info) = &state.user_info else { return };
     let otp_active = state.is_otp_active(info.peer);
-    let mut lines: Vec<Line> = vec![
+    let mut lines: Vec<Line> = Vec::new();
+    // ☀️ marks this channel's admin, re-derived fresh (not the gathered
+    // snapshot) so a `ChannelAdminChanged` that lands while this happens
+    // to be open is reflected immediately; ⚡ marks a server superadmin,
+    // true in every channel alike. Independent of each other and both
+    // shown together when they apply to the same person.
+    let channel_admin = info.channel.as_deref().and_then(|name| {
+        state
+            .channels
+            .iter()
+            .find(|c| c.name == name)
+            .and_then(|c| c.admin.as_deref())
+    });
+    if let Some(channel) = &info.channel
+        && channel_admin == Some(info.nickname.as_str())
+    {
+        lines.push(Line::from(Span::styled(
+            format!("\u{2600}\u{FE0F} admin of #{channel}"),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+    if state.is_superadmin(&info.nickname) {
+        lines.push(Line::from(Span::styled(
+            format!("{} is a \u{26A1} superadmin", info.nickname),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+    if !lines.is_empty() {
+        lines.push(Line::from(""));
+    }
+    lines.extend([
         Line::from(vec![
             Span::styled("device: ", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(info.device_id.as_deref().unwrap_or("(unbound)").to_string()),
@@ -1494,7 +1538,7 @@ pub(crate) fn render_user_info_popup(frame: &mut Frame, area: Rect, state: &UiSt
             Span::raw(format_last_seen(info.last_seen_unix)),
         ]),
         Line::from(""),
-    ];
+    ]);
     if info.keys.is_empty() {
         lines.push(Line::from(Span::styled("no keys pinned yet", Style::default().fg(Color::DarkGray))));
     }

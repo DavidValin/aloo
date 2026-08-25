@@ -68,6 +68,11 @@ const USER_KEY_SALT_DOMAIN: &[u8] = b"aloo/users/v1:";
 const KEY_FILE: &str = "key";
 const EMAIL_FILE: &str = "email.txt";
 const ACTIVATE_SUFFIX: &str = "_activate.txt";
+/// A superadmin's `/deactivate` marker - the presence of this file in an
+/// account's directory blocks login, exactly the way an `_activate.txt`
+/// file blocks it for a different reason. No timestamp in the name: a
+/// deactivation has no expiry, unlike a pending activation code.
+const DEACTIVATE_FILE: &str = "deactivated.txt";
 
 /// `~/.aloo/users` - same home resolution as every other store
 /// (`crate::platform::aloo_dir`), and the directory the `--register-user`
@@ -185,10 +190,15 @@ pub struct Registration {
 }
 
 /// The answer to a login attempt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthCheck {
-    /// Right nickname, right password, activated.
+    /// Right nickname, right password, activated, not deactivated.
     Ok,
+    /// Right nickname and password, but a superadmin's `/deactivate` is in
+    /// effect (the `deactivated.txt` marker is present) - outranks
+    /// `ActivationPending` if somehow both apply, since it's the more
+    /// specific, more recent administrative action either way.
+    Deactivated { reason: String },
     /// Right nickname and password, but the `_activate.txt` file is still
     /// there. `expired` when its code is past `ACTIVATION_VALIDITY_SECS`,
     /// in which case the account has to be registered again.
@@ -390,6 +400,13 @@ impl UsersRegistry {
         if !crypto::constant_time_eq(&stored, &derived) {
             return AuthCheck::Rejected;
         }
+        // Checked only once the password is already known to be right -
+        // preserves the same timing-safety property `ActivationPending`
+        // already relies on: only someone who actually knows the password
+        // learns anything about the account's state beyond "wrong".
+        if let Some(reason) = self.deactivation_reason(nickname) {
+            return AuthCheck::Deactivated { reason };
+        }
         match self.pending_activation(nickname) {
             Some(pending) => AuthCheck::ActivationPending {
                 expired: pending.is_expired(now_utc),
@@ -454,6 +471,46 @@ impl UsersRegistry {
             Err(e) if e.kind() == io::ErrorKind::NotFound => ActivationOutcome::Activated,
             Err(_) => ActivationOutcome::WrongCode,
         }
+    }
+
+    /// A superadmin's `/deactivate <nickname> <reason>`: writes the
+    /// `deactivated.txt` marker, blocking every future login until a
+    /// matching `admin_force_activate`. A no-op error (not silently
+    /// ignored) on a nickname the registry could never hold.
+    pub fn deactivate(&self, nickname: &str, reason: &str) -> io::Result<()> {
+        let dir = self
+            .user_dir(nickname)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid nickname"))?;
+        fs::write(dir.join(DEACTIVATE_FILE), format!("{reason}\n"))
+    }
+
+    /// The reason `nickname` was deactivated, if it currently is.
+    pub fn deactivation_reason(&self, nickname: &str) -> Option<String> {
+        let dir = self.user_dir(nickname)?;
+        fs::read_to_string(dir.join(DEACTIVATE_FILE))
+            .ok()
+            .map(|s| s.trim().to_string())
+    }
+
+    /// A superadmin's `/activate <nickname>`: clears *both* markers that
+    /// can block a login, whichever are present - a still-pending emailed
+    /// registration code (bypassing it, without the code) and a prior
+    /// `deactivate` (reversing it). Deliberately named differently from
+    /// the code-checking `activate` above even though both slash commands
+    /// are spelled `/activate`: one underlying concept ("make this
+    /// account able to log in right now"), two call sites. A harmless
+    /// no-op on an account that was never blocked at all.
+    pub fn admin_force_activate(&self, nickname: &str) -> io::Result<()> {
+        let Some(dir) = self.user_dir(nickname) else {
+            return Ok(());
+        };
+        match fs::remove_file(dir.join(DEACTIVATE_FILE)) {
+            Ok(()) | Err(_) => {} // absent is exactly the goal, not an error
+        }
+        if let Some(pending) = self.pending_activation(nickname) {
+            let _ = fs::remove_file(pending.path);
+        }
+        Ok(())
     }
 
     /// Removes an account entirely - what a failed activation email

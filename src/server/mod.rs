@@ -1,24 +1,28 @@
 //! The server: purely a medium of connection setup, never of content. It
-//! authenticates clients, tracks channel membership/presence, relays
-//! `pq_hybrid` key-rotation notices, and relays the candidate exchange
-//! that lets two clients punch a direct UDP link to each other
-//! (`crate::client::p2p`) - but every actual message, voice stream, and file
-//! transfer travels over that direct link, never through here. See
-//! `docs/PROTOCOL.md`'s "Direct peer-to-peer transport" section.
+//! authenticates clients, tracks channel membership/presence (and, per
+//! the channel-ownership/moderation feature, admin/ban/join-lock state -
+//! see `channels_registry`), relays `pq_hybrid` key-rotation notices, and
+//! relays the candidate exchange that lets two clients punch a direct UDP
+//! link to each other (`crate::client::p2p`) - but every actual message,
+//! voice stream, and file transfer travels over that direct link, never
+//! through here. See `docs/PROTOCOL.md`'s "Direct peer-to-peer transport"
+//! section.
 //!
-//! `Registry` holds the pure membership/routing logic and is unit tested
-//! directly, with no sockets involved. `serve`/`run` wire that logic to
-//! real TCP connections (optionally under TLS, `ssl`), plus a stateless
-//! UDP rendezvous socket (`udp_rendezvous_loop`) that helps a client learn
-//! its own public address for hole punching - the one place this module
-//! touches UDP at all, and it never sees anything from the punched links
-//! themselves.
+//! `Registry` holds the pure connection/identity bookkeeping and is unit
+//! tested directly, with no sockets involved; `channels_registry::
+//! ChannelsRegistry` (a field of it) holds the equivalent for channels.
+//! `serve`/`run` wire that logic to real TCP connections (optionally
+//! under TLS, `ssl`), plus a stateless UDP rendezvous socket
+//! (`udp_rendezvous_loop`) that helps a client learn its own public
+//! address for hole punching - the one place this module touches UDP at
+//! all, and it never sees anything from the punched links themselves.
 //!
 //! Who may log in is the `users_registry`'s business (accounts on disk,
 //! each with a nickname and a password); `activation` is the small web
 //! endpoint that turns an emailed code into an activated account.
 
 pub mod activation;
+pub mod channels_registry;
 pub mod mail;
 pub mod ssl;
 pub mod users_registry;
@@ -27,21 +31,20 @@ use std::collections::{BTreeSet, HashMap};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tokio::io::AsyncRead;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::{Mutex, mpsc};
 use tokio_rustls::TlsAcceptor;
 
-use crate::crypto;
 use crate::p2p_proto::RendezvousMessage;
-use crate::proto::{
-    self, ChannelInfo, ChannelJoinRejection, ChannelKind, ClientMessage, KeyMode, ServerMessage,
-    UserId, UserInfo,
-};
-use crate::validation;
+use crate::proto::{self, ChannelKind, ClientMessage, KeyMode, ServerMessage, UserId, UserInfo};
 use users_registry::{AuthCheck, SmtpConfig, UsersRegistry};
+
+pub use channels_registry::{
+    CHANNEL_MAX_PASSWORD_ATTEMPTS, CHANNEL_PASSWORD_BAN_DURATION, DEFAULT_CHANNEL_NAME,
+};
 
 /// Everything `serve` needs besides a socket: who may log in, whether
 /// anyone may register, and how. Built from `~/.aloo/settings` by
@@ -68,11 +71,28 @@ pub struct ServerOptions {
     /// `server_ssl=on`: every accepted socket is TLS-wrapped with this
     /// before the protocol starts.
     pub tls: Option<TlsAcceptor>,
+    /// `server_allow_create_public_channels` - whether a `JoinChannel`
+    /// for a not-yet-existing name may create it as `ChannelKind::Public`.
+    /// Joining an *existing* public channel, and creating a private one,
+    /// are unaffected either way.
+    pub allow_create_public_channels: bool,
+    /// `server_channel_deletion_unactivity_period` - how long a channel
+    /// (other than `DEFAULT_CHANNEL_NAME`) may sit empty with nobody
+    /// rejoining it before the background sweep destroys it. `None`
+    /// (the default) means the sweep never runs at all, so channels
+    /// persist while empty indefinitely.
+    pub channel_deletion_unactivity_period: Option<Duration>,
+    /// `server_superadmin` - nicknames allowed to activate/deactivate any
+    /// account, remove an account (and every channel it administers), or
+    /// remove any public channel. Checked fresh on every admin message;
+    /// never trusted from anything the client asserts about itself.
+    pub superadmins: BTreeSet<String>,
 }
 
 impl ServerOptions {
     /// Production defaults around `users`: no registration, the real mail
-    /// directory, the real heartbeat timeout, no TLS.
+    /// directory, the real heartbeat timeout, no TLS, public channel
+    /// creation allowed, no inactivity sweep, no superadmins.
     pub fn new(users: UsersRegistry) -> Self {
         Self {
             users,
@@ -82,6 +102,9 @@ impl ServerOptions {
             mail_dir: mail::default_mail_dir(),
             heartbeat_timeout: proto::HEARTBEAT_TIMEOUT,
             tls: None,
+            allow_create_public_channels: true,
+            channel_deletion_unactivity_period: None,
+            superadmins: BTreeSet::new(),
         }
     }
 
@@ -106,6 +129,21 @@ impl ServerOptions {
         self.activation_url = url;
         self
     }
+
+    pub fn with_create_public_channels_policy(mut self, allowed: bool) -> Self {
+        self.allow_create_public_channels = allowed;
+        self
+    }
+
+    pub fn with_channel_deletion_unactivity_period(mut self, period: Duration) -> Self {
+        self.channel_deletion_unactivity_period = Some(period);
+        self
+    }
+
+    pub fn with_superadmins(mut self, names: BTreeSet<String>) -> Self {
+        self.superadmins = names;
+        self
+    }
 }
 
 /// One outbound message produced by a `Registry` mutation, to be delivered
@@ -122,55 +160,13 @@ struct ClientRecord {
     key_mode: KeyMode,
 }
 
-struct ChannelRecord {
-    kind: ChannelKind,
-    members: BTreeSet<UserId>,
-    /// Set only for a private channel created with a non-empty password;
-    /// `None` for a public channel (a password sent alongside
-    /// `ChannelKind::Public` is silently ignored) or a private one created
-    /// without one. Fixed at creation like `kind` - there is no message to
-    /// change a channel's password afterward.
-    password: Option<String>,
-}
-
-/// Brute-force tracking for one (source IP, channel name) pair's wrong
-/// private-channel-password attempts (US-025).
-struct PasswordAttemptRecord {
-    /// Consecutive wrong attempts since the last reset (a successful join
-    /// to this channel from this IP, or this record not existing yet).
-    wrong_attempts: u32,
-    /// Set once `wrong_attempts` exceeds `CHANNEL_MAX_PASSWORD_ATTEMPTS`;
-    /// checked via `.elapsed() < CHANNEL_PASSWORD_BAN_DURATION`, mirroring
-    /// `crate::client::p2p`'s `Instant`/`Duration` cooldown style (its
-    /// `FAILURE_COOLDOWN` pattern) - the first use of that style
-    /// server-side.
-    banned_at: Option<Instant>,
-}
-
-/// More than this many wrong-password attempts against one (source IP,
-/// channel name) pair trips `CHANNEL_PASSWORD_BAN_DURATION`.
-/// The one channel `Registry::new()` always seeds and `remove_member` never
-/// deletes, even when empty - every other channel (public or private) is
-/// unregistered the instant its last member leaves.
-pub const DEFAULT_CHANNEL_NAME: &str = "the-hall";
-
-pub const CHANNEL_MAX_PASSWORD_ATTEMPTS: u32 = 7;
-/// How long a brute-force ban (`CHANNEL_MAX_PASSWORD_ATTEMPTS`) lasts.
-pub const CHANNEL_PASSWORD_BAN_DURATION: Duration = Duration::from_secs(2 * 60 * 60);
-
 /// Pure connection/channel bookkeeping, with no I/O of its own. Every
 /// mutation returns the list of messages that need to go out as a result,
 /// leaving delivery to the async layer.
 pub struct Registry {
     clients: HashMap<UserId, ClientRecord>,
-    channels: HashMap<String, ChannelRecord>,
     next_id: u64,
-    /// Brute-force protection for private-channel passwords (US-025):
-    /// keyed by (source IP, channel name) rather than `UserId`, because a
-    /// `UserId` is never reused (TB-020) - a reconnect always gets a fresh
-    /// one, so a per-`UserId` ban would be trivially bypassed by
-    /// reconnecting. In-memory only; lost on server restart.
-    channel_password_attempts: HashMap<(IpAddr, String), PasswordAttemptRecord>,
+    channels: channels_registry::ChannelsRegistry,
 }
 
 impl Default for Registry {
@@ -182,21 +178,23 @@ impl Default for Registry {
 impl Registry {
     /// Starts with one default public channel so a freshly started server
     /// always has something for the first-connected client to auto-join.
+    /// No inactivity sweep configured - use `with_channel_deletion_period`
+    /// for that.
     pub fn new() -> Self {
-        let mut channels = HashMap::new();
-        channels.insert(
-            DEFAULT_CHANNEL_NAME.to_string(),
-            ChannelRecord {
-                kind: ChannelKind::Public,
-                members: BTreeSet::new(),
-                password: None,
-            },
-        );
         Self {
             clients: HashMap::new(),
-            channels,
             next_id: 1,
-            channel_password_attempts: HashMap::new(),
+            channels: channels_registry::ChannelsRegistry::new(None),
+        }
+    }
+
+    /// `new`, with the inactivity sweep's period configured from the
+    /// start - what `serve_tcp` actually builds from `ServerOptions`.
+    pub fn with_channel_deletion_period(period: Option<Duration>) -> Self {
+        Self {
+            clients: HashMap::new(),
+            next_id: 1,
+            channels: channels_registry::ChannelsRegistry::new(period),
         }
     }
 
@@ -258,29 +256,18 @@ impl Registry {
 
     /// Public channels only: private channels are only reachable by
     /// knowing their name (Ctrl+J), never advertised in the tab list.
-    pub fn channel_list(&self) -> Vec<ChannelInfo> {
-        let mut v: Vec<ChannelInfo> = self
-            .channels
-            .iter()
-            .filter(|(_, rec)| rec.kind == ChannelKind::Public)
-            .map(|(name, rec)| ChannelInfo {
-                name: name.clone(),
-                kind: rec.kind,
-            })
-            .collect();
-        v.sort_by(|a, b| a.name.cmp(&b.name));
-        v
+    pub fn channel_list(&self) -> Vec<proto::ChannelInfo> {
+        self.channels.list()
     }
 
     /// Joins `id` to `name`, creating the channel (as `kind`) if needed;
-    /// idempotent for a channel you're already in. On success returns the
-    /// membership snapshot for the joiner, `UserJoined` for every existing
-    /// member, and a `Joined` confirmation. `name` is validated
-    /// server-side regardless of the client's UI - the server never trusts
-    /// the client. `password` sets a new private channel's password or is
-    /// compared (constant-time) against the existing one (§6.5);
-    /// `source_ip` scopes the brute-force ban (§6.6) - either way replies
-    /// go to `id` only, never leaking password state to anyone else.
+    /// idempotent for a channel you're already in. Always allows creating
+    /// a new public channel - see `join_channel_with_policy` for the
+    /// policy-gated version the server's own dispatch loop actually uses.
+    /// `name` is validated server-side regardless of the client's UI - the
+    /// server never trusts the client. `password` sets a new private
+    /// channel's password or is compared (constant-time) against the
+    /// existing one (§6.5); `source_ip` scopes the brute-force ban (§6.6).
     pub fn join_channel(
         &mut self,
         id: UserId,
@@ -289,202 +276,55 @@ impl Registry {
         password: Option<&str>,
         source_ip: IpAddr,
     ) -> Result<Vec<Outgoing>, String> {
+        self.join_channel_with_policy(id, name, kind, password, source_ip, true)
+    }
+
+    /// `join_channel`, additionally refusing to *create* a new public
+    /// channel when `allow_create_public_channels` is `false`
+    /// (`server_allow_create_public_channels`) - joining an existing
+    /// public channel, or creating/joining a private one, is unaffected.
+    pub fn join_channel_with_policy(
+        &mut self,
+        id: UserId,
+        name: &str,
+        kind: ChannelKind,
+        password: Option<&str>,
+        source_ip: IpAddr,
+        allow_create_public_channels: bool,
+    ) -> Result<Vec<Outgoing>, String> {
         let user = self
             .user_info(id)
             .ok_or_else(|| "unknown user".to_string())?;
-
-        if !validation::channel_name_is_valid(name) {
-            return Err(format!(
-                "channel name must be 1-{} characters of letters, digits, '-' or '_'",
-                validation::CHANNEL_NAME_MAX_LEN
-            ));
-        }
-        if !self.channels.contains_key(name)
-            && let Some(pw) = password
-            && !validation::channel_password_is_valid(pw)
-        {
-            return Err(format!(
-                "channel password must be at most {} characters of letters, digits, and the allowed symbols",
-                validation::CHANNEL_PASSWORD_MAX_LEN
-            ));
-        }
-
-        let existed_before = self.channels.contains_key(name);
-
-        let (existing_members, channel_kind, channel_password, already_member) = {
-            let rec = self
-                .channels
-                .entry(name.to_string())
-                .or_insert_with(|| ChannelRecord {
-                    kind,
-                    members: BTreeSet::new(),
-                    password: match kind {
-                        ChannelKind::Private => {
-                            password.filter(|p| !p.is_empty()).map(str::to_owned)
-                        }
-                        ChannelKind::Public => None,
-                    },
-                });
-            let existing: Vec<UserId> = rec.members.iter().copied().collect();
-            let already = rec.members.contains(&id);
-            (existing, rec.kind, rec.password.clone(), already)
-        };
-
-        if !already_member && let Some(expected) = &channel_password {
-            let attempt_key = (source_ip, name.to_string());
-            let banned = self
-                .channel_password_attempts
-                .get(&attempt_key)
-                .and_then(|rec| rec.banned_at)
-                .is_some_and(|t| t.elapsed() < CHANNEL_PASSWORD_BAN_DURATION);
-            if banned {
-                return Ok(vec![Outgoing {
-                    to: id,
-                    message: ServerMessage::ChannelJoinRejected {
-                        name: name.to_string(),
-                        kind: ChannelJoinRejection::Banned,
-                    },
-                }]);
-            }
-            match password {
-                None => {
-                    return Ok(vec![Outgoing {
-                        to: id,
-                        message: ServerMessage::ChannelJoinRejected {
-                            name: name.to_string(),
-                            kind: ChannelJoinRejection::PasswordRequired,
-                        },
-                    }]);
-                }
-                Some(given) if !crypto::constant_time_eq(expected.as_bytes(), given.as_bytes()) => {
-                    let rec = self
-                        .channel_password_attempts
-                        .entry(attempt_key)
-                        .or_insert_with(|| PasswordAttemptRecord {
-                            wrong_attempts: 0,
-                            banned_at: None,
-                        });
-                    rec.wrong_attempts += 1;
-                    let rejection = if rec.wrong_attempts > CHANNEL_MAX_PASSWORD_ATTEMPTS {
-                        rec.banned_at = Some(Instant::now());
-                        ChannelJoinRejection::Banned
-                    } else {
-                        ChannelJoinRejection::WrongPassword
-                    };
-                    return Ok(vec![Outgoing {
-                        to: id,
-                        message: ServerMessage::ChannelJoinRejected {
-                            name: name.to_string(),
-                            kind: rejection,
-                        },
-                    }]);
-                }
-                Some(_) => {
-                    self.channel_password_attempts.remove(&attempt_key);
-                }
-            }
-        }
-
-        if already_member {
-            return Ok(Vec::new());
-        }
-        self.channels
-            .get_mut(name)
-            .expect("just looked up above")
-            .members
-            .insert(id);
-
-        let mut outgoing = Vec::new();
-        for member_id in existing_members {
-            if let Some(info) = self.user_info(member_id) {
-                outgoing.push(Outgoing {
-                    to: id,
-                    message: ServerMessage::UserJoined {
-                        channel: name.to_string(),
-                        user: info,
-                    },
-                });
-            }
-            outgoing.push(Outgoing {
-                to: member_id,
-                message: ServerMessage::UserJoined {
-                    channel: name.to_string(),
-                    user: user.clone(),
-                },
-            });
-        }
-        outgoing.push(Outgoing {
-            to: id,
-            message: ServerMessage::Joined {
-                channel: ChannelInfo {
-                    name: name.to_string(),
-                    kind: channel_kind,
-                },
+        // Only `Registry` knows every connected client - needed solely to
+        // broadcast a genuinely new public channel's creation to everyone
+        // but its creator.
+        let all_ids: Vec<UserId> = self.clients.keys().copied().collect();
+        let clients = &self.clients;
+        self.channels.join(
+            id,
+            &user,
+            name,
+            kind,
+            password,
+            source_ip,
+            allow_create_public_channels,
+            &all_ids,
+            |uid| {
+                clients.get(&uid).map(|c| UserInfo {
+                    id: uid,
+                    name: c.name.clone(),
+                    public_key_der: c.public_key_der.clone(),
+                    key_mode: c.key_mode,
+                })
             },
-        });
-
-        // A brand-new *public* channel is announced to every other client -
-        // the one-time ChannelList snapshot at connect otherwise never
-        // updates, so this is the only way anyone learns it exists
-        // (§6.1/§6.3). A private channel stays unadvertised; the joiner
-        // already has `Joined` above.
-        if !existed_before && channel_kind == ChannelKind::Public {
-            for &other_id in self.clients.keys() {
-                if other_id != id {
-                    outgoing.push(Outgoing {
-                        to: other_id,
-                        message: ServerMessage::ChannelCreated {
-                            channel: ChannelInfo {
-                                name: name.to_string(),
-                                kind: channel_kind,
-                            },
-                        },
-                    });
-                }
-            }
-        }
-
-        Ok(outgoing)
-    }
-
-    /// Removes `id` from `name`'s membership, deleting the channel if that
-    /// empties it - unless `name` is `DEFAULT_CHANNEL_NAME`, which
-    /// survives emptying. Returns the remaining members (who should be
-    /// notified); empty if `name` doesn't exist or `id` wasn't a member.
-    /// Shared by `leave_channel` (`UserLeft`) and `unregister`
-    /// (`UserOffline`), which differ only in the wrapping message.
-    fn remove_member(&mut self, id: UserId, name: &str) -> Vec<UserId> {
-        let (remaining, should_delete) = {
-            let Some(rec) = self.channels.get_mut(name) else {
-                return Vec::new();
-            };
-            if !rec.members.remove(&id) {
-                return Vec::new();
-            }
-            let remaining: Vec<UserId> = rec.members.iter().copied().collect();
-            let should_delete = rec.members.is_empty() && name != DEFAULT_CHANNEL_NAME;
-            (remaining, should_delete)
-        };
-        if should_delete {
-            self.channels.remove(name);
-        }
-        remaining
+        )
     }
 
     /// Removes `id` from `name`, notifying remaining members. Empty
     /// private channels are dropped entirely; empty public channels stay
     /// listed.
     pub fn leave_channel(&mut self, id: UserId, name: &str) -> Vec<Outgoing> {
-        self.remove_member(id, name)
-            .into_iter()
-            .map(|member_id| Outgoing {
-                to: member_id,
-                message: ServerMessage::UserLeft {
-                    channel: name.to_string(),
-                    user_id: id,
-                },
-            })
-            .collect()
+        self.channels.leave(id, name)
     }
 
     /// Removes `id` from every channel and forgets it entirely (on
@@ -493,24 +333,110 @@ impl Registry {
     /// `UserLeft` - see `ServerMessage::UserOffline`), no matter how many
     /// channels they shared.
     pub fn unregister(&mut self, id: UserId) -> Vec<Outgoing> {
-        let channel_names: Vec<String> = self
-            .channels
-            .iter()
-            .filter(|(_, rec)| rec.members.contains(&id))
-            .map(|(name, _)| name.clone())
-            .collect();
-        let mut recipients: BTreeSet<UserId> = BTreeSet::new();
-        for name in &channel_names {
-            recipients.extend(self.remove_member(id, name));
-        }
+        let outgoing = self.channels.remove_from_all(id);
         self.clients.remove(&id);
-        recipients
+        outgoing
+    }
+
+    /// `/delete-channel`: `caller` must currently administer `name`, and
+    /// `name` must be a public channel.
+    pub fn delete_channel(&mut self, caller: UserId, name: &str) -> Result<Vec<Outgoing>, String> {
+        let caller_name = self
+            .user_info(caller)
+            .ok_or_else(|| "unknown user".to_string())?
+            .name;
+        self.channels.delete_channel(&caller_name, name)
+    }
+
+    /// `/ban <nickname>`: `caller` must currently administer `channel`.
+    pub fn ban_from_channel(
+        &mut self,
+        caller: UserId,
+        channel: &str,
+        target_nickname: &str,
+    ) -> Result<Vec<Outgoing>, String> {
+        let caller_name = self
+            .user_info(caller)
+            .ok_or_else(|| "unknown user".to_string())?
+            .name;
+        let target_id = self.id_by_name(target_nickname);
+        self.channels.ban(&caller_name, channel, target_nickname, target_id)
+    }
+
+    /// `/unban <nickname>`: `caller` must currently administer `channel`.
+    pub fn unban_from_channel(
+        &mut self,
+        caller: UserId,
+        channel: &str,
+        target_nickname: &str,
+    ) -> Result<Vec<Outgoing>, String> {
+        let caller_name = self
+            .user_info(caller)
+            .ok_or_else(|| "unknown user".to_string())?
+            .name;
+        self.channels.unban(&caller_name, channel, target_nickname)
+    }
+
+    /// `/lock-joins`: `caller` must currently administer `channel`.
+    /// `allowed: None` is the "All users" option - clears the lock.
+    pub fn set_channel_join_lock(
+        &mut self,
+        caller: UserId,
+        channel: &str,
+        allowed: Option<Vec<String>>,
+    ) -> Result<Vec<Outgoing>, String> {
+        let caller_name = self
+            .user_info(caller)
+            .ok_or_else(|| "unknown user".to_string())?
+            .name;
+        self.channels.set_join_lock(&caller_name, channel, allowed)
+    }
+
+    /// `/assign-admin <nickname>`: `caller` must currently administer
+    /// `channel`, and `target_nickname` must currently be a member of it.
+    pub fn assign_channel_admin(
+        &mut self,
+        caller: UserId,
+        channel: &str,
+        target_nickname: &str,
+    ) -> Result<Vec<Outgoing>, String> {
+        let caller_name = self
+            .user_info(caller)
+            .ok_or_else(|| "unknown user".to_string())?
+            .name;
+        let target_is_member = self
+            .id_by_name(target_nickname)
+            .is_some_and(|tid| self.channels.is_member(channel, tid));
+        self.channels
+            .assign_admin(&caller_name, channel, target_nickname, target_is_member)
+    }
+
+    /// A superadmin's `/remove-account` cascade: every channel `nickname`
+    /// administers is removed outright (never reassigned), its current
+    /// members notified with `reason`.
+    pub fn remove_channels_administered_by(&mut self, nickname: &str, reason: &str) -> Vec<Outgoing> {
+        let names = self.channels.channels_administered_by(nickname);
+        names
             .into_iter()
-            .map(|to| Outgoing {
-                to,
-                message: ServerMessage::UserOffline { user_id: id },
-            })
+            .flat_map(|name| self.channels.force_delete_channel(&name, reason.to_string()))
             .collect()
+    }
+
+    /// A superadmin's `/remove-channel`: removes any channel outright
+    /// (never `DEFAULT_CHANNEL_NAME`, even for a superadmin), notifying
+    /// its current members with `reason`. Public-only in practice: a
+    /// private channel is never advertised to anyone outside its
+    /// membership (AC-022, TB-154), so a superadmin has no name to act on
+    /// for one it isn't already in - nothing further needs to check this
+    /// here.
+    pub fn remove_channel(&mut self, name: &str, reason: &str) -> Vec<Outgoing> {
+        self.channels.force_delete_channel(name, reason.to_string())
+    }
+
+    /// The background inactivity sweep's one entry point - see
+    /// `channels_registry::ChannelsRegistry::sweep_inactive`.
+    pub fn sweep_inactive_channels(&mut self) {
+        self.channels.sweep_inactive();
     }
 
     /// Relays a `pq_hybrid` key rotation (PROTOCOL.md §7.5/§13.10) point to
@@ -606,8 +532,31 @@ pub async fn serve_with_rendezvous(
     serve_tcp(listener, options).await
 }
 
+/// How often the inactivity sweep checks every channel - plenty for the
+/// month-scale periods `server_channel_deletion_unactivity_period`
+/// documents, and a named constant so this doesn't need rewording if that
+/// ever changes.
+const CHANNEL_SWEEP_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+/// Periodically sweeps channels that have been empty and unjoined for too
+/// long (`channels_registry::ChannelsRegistry::sweep_inactive`). Modeled
+/// on `udp_rendezvous_loop`'s "degrade, never take the whole task down"
+/// shape, though there is nothing here that can actually fail.
+async fn channel_sweep_loop(registry: Arc<Mutex<Registry>>) {
+    let mut ticker = tokio::time::interval(CHANNEL_SWEEP_INTERVAL);
+    loop {
+        ticker.tick().await;
+        registry.lock().await.sweep_inactive_channels();
+    }
+}
+
 async fn serve_tcp(listener: TcpListener, options: ServerOptions) -> std::io::Result<()> {
-    let registry = Arc::new(Mutex::new(Registry::new()));
+    let registry = Arc::new(Mutex::new(Registry::with_channel_deletion_period(
+        options.channel_deletion_unactivity_period,
+    )));
+    if options.channel_deletion_unactivity_period.is_some() {
+        tokio::spawn(channel_sweep_loop(registry.clone()));
+    }
     let senders: Senders = Arc::new(Mutex::new(HashMap::new()));
     // Shared without a lock of its own: every method works on one file at a
     // time and the racy interleavings (two connections storing/acking the
@@ -741,6 +690,7 @@ async fn handle_connection(
                 .send(&ServerMessage::AuthResult {
                     ok: false,
                     activation_pending: false,
+                    deactivated: None,
                     reason: Some("expected auth message".into()),
                 })
                 .await;
@@ -765,7 +715,19 @@ async fn handle_connection(
                 .send(&ServerMessage::AuthResult {
                     ok: false,
                     activation_pending: false,
+                    deactivated: None,
                     reason: Some("authentication failed".into()),
+                })
+                .await;
+            return Ok(());
+        }
+        AuthCheck::Deactivated { reason } => {
+            let _ = wr
+                .send(&ServerMessage::AuthResult {
+                    ok: false,
+                    activation_pending: false,
+                    deactivated: Some(reason),
+                    reason: None,
                 })
                 .await;
             return Ok(());
@@ -775,6 +737,7 @@ async fn handle_connection(
                 .send(&ServerMessage::AuthResult {
                     ok: false,
                     activation_pending: false,
+                    deactivated: None,
                     reason: Some(
                         "this account's activation code has expired - register again".into(),
                     ),
@@ -786,6 +749,7 @@ async fn handle_connection(
             wr.send(&ServerMessage::AuthResult {
                 ok: false,
                 activation_pending: true,
+                deactivated: None,
                 reason: None,
             })
             .await?;
@@ -794,6 +758,7 @@ async fn handle_connection(
                     .send(&ServerMessage::AuthResult {
                         ok: false,
                         activation_pending: false,
+                        deactivated: None,
                         reason: Some("expected activation code".into()),
                     })
                     .await;
@@ -817,6 +782,7 @@ async fn handle_connection(
                     .send(&ServerMessage::AuthResult {
                         ok: false,
                         activation_pending: false,
+                        deactivated: None,
                         reason: Some(reason),
                     })
                     .await;
@@ -827,6 +793,7 @@ async fn handle_connection(
     wr.send(&ServerMessage::AuthResult {
         ok: true,
         activation_pending: false,
+        deactivated: None,
         reason: None,
     })
     .await?;
@@ -870,8 +837,11 @@ async fn handle_connection(
         you: Some(id),
         reason: None,
     });
-    let channel_list = registry.lock().await.channel_list();
-    let _ = tx.send(ServerMessage::ChannelList(channel_list));
+    let channels = registry.lock().await.channel_list();
+    let _ = tx.send(ServerMessage::ChannelList {
+        channels,
+        superadmins: options.superadmins.iter().cloned().collect(),
+    });
 
     let writer_task = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
@@ -881,16 +851,7 @@ async fn handle_connection(
         }
     });
 
-    let result = client_loop(
-        id,
-        &mut rd,
-        &registry,
-        &senders,
-        peer_ip,
-        options.heartbeat_timeout,
-        &mail_store,
-    )
-    .await;
+    let result = client_loop(id, &mut rd, &registry, &senders, peer_ip, &options, &mail_store).await;
 
     {
         let mut reg = registry.lock().await;
@@ -903,6 +864,24 @@ async fn handle_connection(
     result
 }
 
+/// `id`'s own nickname, checked against `options.superadmins` - the
+/// authorization gate every `Admin*` message goes through before it
+/// touches anything. Lives beside `register_account` rather than inside
+/// `Registry`/`ChannelsRegistry`, on purpose: neither of those needs to
+/// know `ServerOptions` exists, exactly as `register_account` already
+/// keeps registration policy outside `Registry` today.
+fn require_superadmin(options: &ServerOptions, reg: &Registry, id: UserId) -> Result<String, String> {
+    let name = reg
+        .user_info(id)
+        .ok_or_else(|| "unknown user".to_string())?
+        .name;
+    if options.superadmins.contains(&name) {
+        Ok(name)
+    } else {
+        Err("only a superadmin may do that".to_string())
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn client_loop<R: AsyncRead + Unpin>(
     id: UserId,
@@ -910,7 +889,7 @@ async fn client_loop<R: AsyncRead + Unpin>(
     registry: &Arc<Mutex<Registry>>,
     senders: &Senders,
     source_ip: IpAddr,
-    heartbeat_timeout: Duration,
+    options: &Arc<ServerOptions>,
     mail_store: &mail::MailStore,
 ) -> proto::Result<()> {
     loop {
@@ -920,7 +899,8 @@ async fn client_loop<R: AsyncRead + Unpin>(
         // like the client closing the connection: this simply returns,
         // and the same unregister/cleanup path in `handle_connection` runs
         // either way.
-        let Ok(recv) = tokio::time::timeout(heartbeat_timeout, rd.recv::<ClientMessage>()).await
+        let Ok(recv) =
+            tokio::time::timeout(options.heartbeat_timeout, rd.recv::<ClientMessage>()).await
         else {
             return Ok(());
         };
@@ -936,18 +916,129 @@ async fn client_loop<R: AsyncRead + Unpin>(
                     password,
                 } => {
                     let name_for_err = name.clone();
-                    reg.join_channel(id, &name, kind, password.as_deref(), source_ip)
-                        .unwrap_or_else(|reason| {
-                            vec![Outgoing {
-                                to: id,
-                                message: ServerMessage::ChannelJoinFailed {
-                                    name: name_for_err,
-                                    reason,
-                                },
-                            }]
-                        })
+                    reg.join_channel_with_policy(
+                        id,
+                        &name,
+                        kind,
+                        password.as_deref(),
+                        source_ip,
+                        options.allow_create_public_channels,
+                    )
+                    .unwrap_or_else(|reason| {
+                        vec![Outgoing {
+                            to: id,
+                            message: ServerMessage::ChannelJoinFailed {
+                                name: name_for_err,
+                                reason,
+                            },
+                        }]
+                    })
                 }
                 ClientMessage::LeaveChannel { name } => reg.leave_channel(id, &name),
+                ClientMessage::DeleteChannel { name } => {
+                    reg.delete_channel(id, &name).unwrap_or_else(|reason| {
+                        vec![Outgoing {
+                            to: id,
+                            message: ServerMessage::Error { message: reason },
+                        }]
+                    })
+                }
+                ClientMessage::BanFromChannel { channel, nickname } => reg
+                    .ban_from_channel(id, &channel, &nickname)
+                    .unwrap_or_else(|reason| {
+                        vec![Outgoing {
+                            to: id,
+                            message: ServerMessage::Error { message: reason },
+                        }]
+                    }),
+                ClientMessage::UnbanFromChannel { channel, nickname } => reg
+                    .unban_from_channel(id, &channel, &nickname)
+                    .unwrap_or_else(|reason| {
+                        vec![Outgoing {
+                            to: id,
+                            message: ServerMessage::Error { message: reason },
+                        }]
+                    }),
+                ClientMessage::SetChannelJoinLock { channel, allowed } => reg
+                    .set_channel_join_lock(id, &channel, allowed)
+                    .unwrap_or_else(|reason| {
+                        vec![Outgoing {
+                            to: id,
+                            message: ServerMessage::Error { message: reason },
+                        }]
+                    }),
+                ClientMessage::AssignChannelAdmin { channel, nickname } => reg
+                    .assign_channel_admin(id, &channel, &nickname)
+                    .unwrap_or_else(|reason| {
+                        vec![Outgoing {
+                            to: id,
+                            message: ServerMessage::Error { message: reason },
+                        }]
+                    }),
+                ClientMessage::AdminDeactivate { nickname, reason } => {
+                    match require_superadmin(options, &reg, id) {
+                        Err(e) => vec![Outgoing {
+                            to: id,
+                            message: ServerMessage::Error { message: e },
+                        }],
+                        Ok(_) => {
+                            let _ = options.users.deactivate(&nickname, &reason);
+                            let mut out = Vec::new();
+                            if let Some(target_id) = reg.id_by_name(&nickname) {
+                                out.push(Outgoing {
+                                    to: target_id,
+                                    message: ServerMessage::AccountDeactivated { reason },
+                                });
+                            }
+                            out
+                        }
+                    }
+                }
+                ClientMessage::AdminActivate { nickname } => {
+                    match require_superadmin(options, &reg, id) {
+                        Err(e) => vec![Outgoing {
+                            to: id,
+                            message: ServerMessage::Error { message: e },
+                        }],
+                        Ok(_) => {
+                            let _ = options.users.admin_force_activate(&nickname);
+                            Vec::new()
+                        }
+                    }
+                }
+                ClientMessage::AdminRemoveAccount { nickname } => {
+                    match require_superadmin(options, &reg, id) {
+                        Err(e) => vec![Outgoing {
+                            to: id,
+                            message: ServerMessage::Error { message: e },
+                        }],
+                        Ok(_) => {
+                            let _ = options.users.remove(&nickname);
+                            let mut out = reg.remove_channels_administered_by(
+                                &nickname,
+                                "the channel has been removed by the admin",
+                            );
+                            if let Some(target_id) = reg.id_by_name(&nickname) {
+                                out.push(Outgoing {
+                                    to: target_id,
+                                    message: ServerMessage::Error {
+                                        message: "this account has been removed from the server".into(),
+                                    },
+                                });
+                            }
+                            out
+                        }
+                    }
+                }
+                ClientMessage::AdminRemoveChannel { name } => {
+                    match require_superadmin(options, &reg, id) {
+                        Err(e) => vec![Outgoing {
+                            to: id,
+                            message: ServerMessage::Error { message: e },
+                        }],
+                        Ok(_) => reg.remove_channel(&name, "removed by a superadmin"),
+                    }
+                }
                 ClientMessage::RotateKey {
                     to,
                     new_public_key_der,

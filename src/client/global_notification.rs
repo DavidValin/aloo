@@ -59,7 +59,16 @@ impl Notification {
 /// spawning `notify-send` there would fail once per event, filling the
 /// daemon log with noise for something that was never going to work.
 pub fn is_available() -> bool {
-    if cfg!(target_os = "linux") {
+    if cfg!(any(
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    )) {
+        // Same X11/Wayland-over-D-Bus story as Linux on every one of these
+        // - none of them has a window server the way macOS/Windows do, so
+        // the same "is a real display actually up" check applies.
         has_display(
             std::env::var_os("DISPLAY").is_some(),
             std::env::var_os("WAYLAND_DISPLAY").is_some(),
@@ -122,11 +131,21 @@ fn show(n: &Notification) -> std::io::Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
+/// `notify-send` is part of libnotify, a freedesktop.org desktop
+/// component rather than a Linux-kernel one - any of these BSDs running
+/// the same D-Bus/X11/Wayland desktop stacks Linux does ships it the same
+/// way, and none has a notification command of its own the way macOS and
+/// Windows do.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
 fn build_command(n: &Notification) -> Command {
-    // `notify-send` is part of libnotify, present on essentially every
-    // desktop Linux install. `--` guards against a summary or body that
-    // begins with a dash being read as a flag.
+    // `--` guards against a summary or body that begins with a dash being
+    // read as a flag.
     let mut command = Command::new("notify-send");
     command
         .arg("--app-name=aloo")

@@ -164,6 +164,12 @@ pub struct AlooWorld {
         Option<tokio::sync::mpsc::UnboundedSender<aloo::client::session::SessionInput>>,
     /// Why the last deliberate reconnect attempt was refused.
     pub reconnect_failure: Option<String>,
+    /// The raw `AuthResult` from the last bare login attempt
+    /// (`administration.rs`'s superadmin scenarios - checking a deactivated
+    /// or freshly reactivated account's next login without running the
+    /// rest of the handshake, since a deactivated attempt never gets that
+    /// far).
+    pub last_auth_result: Option<ServerMessage>,
     pub clients: HashMap<String, ClientState>,
     /// Real `run_daemon_session`s against a real server, keyed by
     /// nickname - the multi-session counterpart of `session`/

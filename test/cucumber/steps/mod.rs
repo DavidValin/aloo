@@ -9,6 +9,7 @@
 //! where the pre-migration Rust test checked ten properties, the step that
 //! replaced it checks the same ten.
 
+pub mod administration;
 pub mod channels;
 pub mod connect;
 pub mod control_channel;

@@ -68,7 +68,7 @@ fn find<'a>(kind: ContactKeyKind, keys: &'a [aloo::client::tui::contacts::UserIn
 async fn a_peer_with_nothing_pinned_gathers_no_keys_and_no_device() {
     let session = session_for_test("nothing", None).await;
     let mut ui = UiState::new("me".into());
-    ui.open_user_info(BOB, "bob".to_string());
+    ui.open_user_info(BOB, "bob".to_string(), None);
 
     contacts::handle_request_user_info(&session, &mut ui, BOB, "bob".to_string()).await;
 
@@ -98,7 +98,7 @@ async fn only_pqh_present_shows_only_the_pqh_row() {
     session.set_peer_device_id_for_test(BOB, "laptop".to_string());
 
     let mut ui = UiState::new("me".into());
-    ui.open_user_info(BOB, "bob".to_string());
+    ui.open_user_info(BOB, "bob".to_string(), None);
     contacts::handle_request_user_info(&session, &mut ui, BOB, "bob".to_string()).await;
 
     let info = ui.user_info.as_ref().unwrap();
@@ -144,7 +144,7 @@ async fn a_pinned_and_installed_key_shows_up_with_its_id() {
     )
     .await;
 
-    ui.open_user_info(BOB, "bob".to_string());
+    ui.open_user_info(BOB, "bob".to_string(), None);
     contacts::handle_request_user_info(&session, &mut ui, BOB, "bob".to_string()).await;
 
     let info = ui.user_info.as_ref().unwrap();
@@ -176,7 +176,7 @@ async fn a_direct_punch_peers_device_resolves_from_the_link_not_an_announce() {
     let peer = aloo::client::p2p::direct_peer_id("bob", Some("phone"));
 
     let mut ui = UiState::new("me".into());
-    ui.open_user_info(peer, "bob".to_string());
+    ui.open_user_info(peer, "bob".to_string(), None);
     contacts::handle_request_user_info(&session, &mut ui, peer, "bob".to_string()).await;
 
     assert_eq!(ui.user_info.as_ref().unwrap().device_id, Some("phone".to_string()));

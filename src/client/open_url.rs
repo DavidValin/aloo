@@ -32,7 +32,17 @@ pub fn open(url: String) -> bool {
     }
 }
 
-#[cfg(target_os = "linux")]
+/// `xdg-open` is part of the freedesktop.org `xdg-utils`, not Linux-kernel-
+/// specific - any of these BSDs running the same X11/Wayland desktop
+/// stacks Linux does ships it the same way, and none has a platform
+/// command of its own the way macOS (`open`) and Windows (`start`) do.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
 fn build_command(url: &str) -> Command {
     let mut command = Command::new("xdg-open");
     command.arg(url);

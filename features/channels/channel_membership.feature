@@ -44,7 +44,7 @@ Feature: Joining and leaving channels
     Then alice joining the private channel "secret-room" leaves it unlisted
 
   @AC-107
-  Scenario: An emptied channel is unregistered unless it is the default channel
+  Scenario: An emptied channel survives, with no inactivity period configured
     Given a running server registry
     And alice and bob are registered users
     And alice and bob have both joined "the-hall"
@@ -54,7 +54,7 @@ Feature: Joining and leaving channels
     And alice leaves "watercooler"
     And bob leaves "watercooler"
     Then "the-hall" is still listed
-    And "watercooler" is no longer listed
+    And "watercooler" is still listed
 
   @AC-023 @TB-102
   Scenario: Leaving one channel tells the people still in it

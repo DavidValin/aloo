@@ -176,7 +176,7 @@ async fn post_accept_user_info_shows_the_new_device() {
 
     // Live-connection-derived (`session.peer_device_ids`), never gated by
     // review state at all - already true before Accept.
-    ui.open_user_info(BOB, "bob".into());
+    ui.open_user_info(BOB, "bob".into(), None);
     handle_request_user_info(&session, &mut ui, BOB, "bob".into()).await;
     assert_eq!(
         ui.user_info.as_ref().unwrap().device_id.as_deref(),
@@ -187,7 +187,7 @@ async fn post_accept_user_info_shows_the_new_device() {
     let mut session = session;
     session::accept_identity_review(&mut session, &mut ui, BOB).await;
 
-    ui.open_user_info(BOB, "bob".into());
+    ui.open_user_info(BOB, "bob".into(), None);
     handle_request_user_info(&session, &mut ui, BOB, "bob".into()).await;
     let info = ui.user_info.as_ref().unwrap();
     assert_eq!(info.device_id.as_deref(), Some("new-device"));
