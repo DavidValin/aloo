@@ -1719,6 +1719,10 @@ async fn handle_ui_action(
         UiAction::OpenContacts | UiAction::RefreshContacts => {
             crate::client::contacts::handle_open(session, ui_state).await;
         }
+        UiAction::RequestUserInfo { peer, nickname } => {
+            crate::client::contacts::handle_request_user_info(session, ui_state, peer, nickname)
+                .await;
+        }
         UiAction::OpenDirectPunches => {
             let settings = crate::settings::Settings::load_or_create(&crate::settings::default_path())
                 .unwrap_or_else(|e| {

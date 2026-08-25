@@ -347,6 +347,14 @@ name = "ui_test"
 path = "test/ui_test.rs"
 
 [[test]]
+name = "ui_user_info_test"
+path = "test/ui_user_info_test.rs"
+
+[[test]]
+name = "user_info_test"
+path = "test/user_info_test.rs"
+
+[[test]]
 name = "ui_channel_test"
 path = "test/ui_channel_test.rs"
 

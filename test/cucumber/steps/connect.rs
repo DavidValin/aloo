@@ -7,9 +7,8 @@ use ratatui::backend::TestBackend;
 use ratatui::style::Color;
 
 use aloo::client::connect::{ConnectCache, MyKeySelection, prefill_connect_defaults};
-use aloo::client::file_browser::FileBrowserState;
 use aloo::client::tui::ui_connect_popup::{
-    ALOO_HOME_LABEL, Action, ConnectPopupState, Field, FileBrowserTarget, NICKNAME_MAX_LEN, render,
+    ALOO_HOME_LABEL, Action, ConnectPopupState, Field, NICKNAME_MAX_LEN, render,
 };
 
 use crate::support::popup_rows;
@@ -55,33 +54,13 @@ async fn my_key_points_at_files(w: &mut AlooWorld) {
 }
 
 /// `my_key` has no type selector at all any more: `pq_hybrid` is the only
-/// peer-to-peer scheme, so the group is just its two keybundle paths and
-/// the focus order always offers both.
+/// peer-to-peer scheme, so the group is just its two keybundle paths -
+/// shown read-only now, alongside `ALOO_HOME`, never in the focus order.
 #[then("my_key is pq_hybrid with no type to choose")]
 async fn my_key_is_pq_hybrid(w: &mut AlooWorld) {
-    let order = w.popup_mut().focus_order();
-    assert!(order.contains(&Field::MyKeyValuePub));
-    assert!(order.contains(&Field::MyKeyValuePriv));
-}
-
-#[given("a directory holding one sub-directory and one file")]
-async fn a_directory_tree(w: &mut AlooWorld) {
-    let root = w.temp_path("browser");
-    let sub = root.join("subdir");
-    std::fs::create_dir_all(&sub).unwrap();
-    std::fs::write(root.join("file.txt"), b"hello").unwrap();
-    std::fs::write(sub.join("nested.txt"), b"world").unwrap();
-    w.browser_root = Some(root);
-}
-
-#[given("a directory holding more files than fit in the file browser popup")]
-async fn a_directory_with_many_files(w: &mut AlooWorld) {
-    let root = w.temp_path("browser-scroll");
-    std::fs::create_dir_all(&root).unwrap();
-    for i in 0..30 {
-        std::fs::write(root.join(format!("file{i:02}.txt")), b"x").unwrap();
-    }
-    w.browser_root = Some(root);
+    let rows = popup_rows(w.popup.as_ref().expect("no form"), 80, 30);
+    assert!(rows.iter().any(|r| r.contains("file_pub")), "{rows:?}");
+    assert!(rows.iter().any(|r| r.contains("file_priv")), "{rows:?}");
 }
 
 // ---------------------------------------------------------------------
@@ -124,55 +103,6 @@ async fn submit_form(w: &mut AlooWorld) {
     let action = w.popup_mut().handle_key(KeyCode::Enter).unwrap();
     w.popup_error = w.popup_mut().error.clone();
     w.popup_action = Some(action);
-}
-
-#[when("I open the file browser on that directory and pick the file")]
-async fn browse_and_pick(w: &mut AlooWorld) {
-    let root = w.browser_root.clone().expect("no directory tree");
-    let p = w.popup_mut();
-    p.focus = Field::MyKeyValuePub;
-    p.handle_key(KeyCode::Enter).unwrap();
-    assert!(
-        p.browser.is_some(),
-        "Enter on a my_key file field must open the in-app browser"
-    );
-
-    // Point it at the known tree so the scenario does not depend on the cwd.
-    p.browser = Some((
-        FileBrowserTarget::MyKeyFilePub,
-        FileBrowserState::open(root).unwrap(),
-    ));
-    // entries are "..", "subdir", "file.txt"
-    p.handle_key(KeyCode::Down).unwrap();
-    p.handle_key(KeyCode::Down).unwrap();
-    p.handle_key(KeyCode::Enter).unwrap();
-}
-
-#[when("I open the file browser on that directory and select the last entry")]
-async fn browse_and_select_last(w: &mut AlooWorld) {
-    let root = w.browser_root.clone().expect("no directory tree");
-    let mut browser = FileBrowserState::open(root).unwrap();
-    let last = browser.entries.len() - 1;
-    browser.selected = last;
-    w.popup_mut().browser = Some((FileBrowserTarget::MyKeyFilePub, browser));
-}
-
-#[when("I walk into the sub-directory and back out again")]
-async fn walk_in_and_out(w: &mut AlooWorld) {
-    let root = w.browser_root.clone().expect("no directory tree");
-    let mut browser = FileBrowserState::open(root).unwrap();
-    browser.selected = 1;
-    assert_eq!(
-        browser.selected_entry().unwrap().name,
-        "subdir",
-        "index 1 should be the sub-directory"
-    );
-    browser.navigate_into_selected().unwrap();
-    assert!(
-        browser.entries.iter().any(|e| e.name == "nested.txt"),
-        "walking in should list the sub-directory's contents"
-    );
-    w.popup_mut().browser = Some((FileBrowserTarget::MyKeyFilePub, browser));
 }
 
 // ---------------------------------------------------------------------
@@ -241,24 +171,6 @@ async fn no_ssl_field(w: &mut AlooWorld) {
     assert!(
         !rows.iter().any(|r| r.contains("ssl")),
         "no ssl box or switch on the form: {rows:?}"
-    );
-}
-
-#[then("the form has no email field")]
-async fn no_email_field(w: &mut AlooWorld) {
-    let rows = popup_rows(w.popup.as_ref().expect("no form"), 80, 30);
-    assert!(
-        !rows.iter().any(|r| r.contains("email")),
-        "no email box while registration is unavailable: {rows:?}"
-    );
-}
-
-#[then("no Register button is offered")]
-async fn no_register_button(w: &mut AlooWorld) {
-    let rows = popup_rows(w.popup.as_ref().expect("no form"), 80, 30);
-    assert!(
-        !rows.iter().any(|r| r.contains("Register")),
-        "no Register button while registration is unavailable: {rows:?}"
     );
 }
 
@@ -411,76 +323,6 @@ async fn form_cancelled(w: &mut AlooWorld) {
         Some(Action::Cancel),
         "Esc must cancel the connect popup"
     );
-}
-
-#[then("the picked file fills the my_key field")]
-async fn picked_file_fills(w: &mut AlooWorld) {
-    let root = w.browser_root.clone().expect("no directory tree");
-    let p = w.popup.as_ref().expect("no form");
-    assert!(
-        p.browser.is_none(),
-        "picking a file should close the browser"
-    );
-    assert_eq!(
-        p.my_key.file_pub,
-        root.join("file.txt").display().to_string(),
-        "the chosen path must land in the field that opened the browser"
-    );
-}
-
-#[then("the browser can step back and then forward again")]
-async fn browser_back_forward(w: &mut AlooWorld) {
-    let root = w.browser_root.clone().expect("no directory tree");
-    let p = w.popup_mut();
-    let (_, browser) = p.browser.as_mut().expect("no open browser");
-    assert_eq!(
-        browser.current_dir,
-        root.join("subdir"),
-        "should be inside the sub-directory"
-    );
-
-    assert!(
-        browser.go_back().unwrap(),
-        "back should succeed when there is history"
-    );
-    assert_eq!(browser.current_dir, root, "back should land in the parent");
-
-    assert!(
-        browser.go_forward().unwrap(),
-        "forward should return where we came from"
-    );
-    assert_eq!(browser.current_dir, root.join("subdir"));
-}
-
-#[then("the last entry is visible in the file browser")]
-async fn last_entry_visible(w: &mut AlooWorld) {
-    let state = w.popup.as_ref().expect("no form");
-    let rows = popup_rows(state, 80, 24);
-    assert!(
-        rows.iter().any(|r| r.contains("file29.txt")),
-        "the selected (last) entry must have scrolled into view: {rows:?}"
-    );
-}
-
-#[then("the first entry has scrolled out of view")]
-async fn first_entry_out_of_view(w: &mut AlooWorld) {
-    let state = w.popup.as_ref().expect("no form");
-    let rows = popup_rows(state, 80, 24);
-    assert!(
-        !rows.iter().any(|r| r.contains("file00.txt")),
-        "an entry far from the current scroll position should not still be shown: {rows:?}"
-    );
-}
-
-#[then("a fresh browser has nowhere to step back or forward to")]
-async fn browser_no_history(w: &mut AlooWorld) {
-    let root = w.browser_root.clone().expect("no directory tree");
-    let mut browser = FileBrowserState::open(root).unwrap();
-    assert!(
-        !browser.go_back().unwrap(),
-        "no history means back does nothing, rather than erroring"
-    );
-    assert!(!browser.go_forward().unwrap(), "and neither does forward");
 }
 
 #[then("the focused Connect button is highlighted but its border is not")]

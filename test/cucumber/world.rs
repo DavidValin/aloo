@@ -135,7 +135,6 @@ pub struct AlooWorld {
     pub popup: Option<ConnectPopupState>,
     pub popup_error: Option<String>,
     pub popup_action: Option<aloo::client::tui::ui_connect_popup::Action>,
-    pub browser_root: Option<std::path::PathBuf>,
 
     // -- connected UI --------------------------------------------------
     pub ui: Option<UiState>,

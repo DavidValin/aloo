@@ -1103,3 +1103,51 @@ fn attempting_otp_before_pqh_on_a_new_contact_opens_the_install_form_not_nothing
     assert_eq!(install.device_id, Some("laptop".to_string()));
     assert_eq!(install.purpose, OtpPurpose::Live);
 }
+
+/// The shared file-browser render (`ui::render_file_browser`, `pub(crate)`
+/// so only exercisable through a real consumer) scrolls to keep the
+/// selection visible - proven here through the PQH "Create key" browser
+/// since that is still a live consumer; the connect popup's own former
+/// `my_key` browser, which used to carry this same coverage, was removed
+/// once those fields became read-only.
+///
+/// @requirement AC-093
+#[test]
+fn file_browser_render_scrolls_to_keep_the_selection_visible() {
+    let root = std::env::temp_dir().join(format!(
+        "aloo-contacts-browser-scroll-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    for i in 0..30 {
+        std::fs::write(root.join(format!("file{i:02}.txt")), b"x").unwrap();
+    }
+
+    let mut browser = FileBrowserState::open(root.clone()).unwrap();
+    // entries: "..", file00.txt, ..., file29.txt (31 total) - move
+    // selection all the way to the last one.
+    for _ in 0..30 {
+        browser.select_next();
+    }
+    assert_eq!(browser.selected_entry().unwrap().name, "file29.txt");
+
+    let mut state = joined_general_with(vec![]);
+    state.open_contacts();
+    state.set_contacts_rows(vec![row("alice", None)]);
+    press(&mut state, KeyCode::Enter);
+    press(&mut state, KeyCode::Enter); // Create key -> opens the browser
+    state.contacts.as_mut().unwrap().detail.as_mut().unwrap().pqh_browser = Some(browser);
+
+    let rows_of = rows_of(&buffer_at(&state, 100, 30));
+    assert!(
+        rows_of.iter().any(|r| r.contains("file29.txt")),
+        "the selected entry must have scrolled into view: {rows_of:?}"
+    );
+    assert!(
+        !rows_of.iter().any(|r| r.contains("file00.txt")),
+        "an unselected entry far from the current scroll position should not still be shown: {rows_of:?}"
+    );
+
+    std::fs::remove_dir_all(&root).ok();
+}

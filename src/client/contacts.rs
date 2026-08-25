@@ -25,9 +25,10 @@ use crate::client::idstore::IdStore;
 use crate::client::otp_cli::{self, OtpCliConfig};
 use crate::client::otp_store::OtpStore;
 use crate::client::session::SessionState;
+use crate::client::tui::contacts::{ContactKeyKind, UserInfoKeyRow};
 use crate::client::tui::ui::UiState;
 use crate::crypto::otp::OtpPurpose;
-use crate::proto::KeyMode;
+use crate::proto::{KeyMode, UserId};
 
 /// One contact's live OTP pad figures, in each direction - the same
 /// `<seq> <offset> <remaining>` the `/otp` DM header shows
@@ -212,6 +213,52 @@ async fn otp_detail_for(cfg: &OtpCliConfig, contact_name: &str) -> Option<Contac
 /// (device-pinning plan §3). Queries the real `otp` binary once per
 /// `pq_hybrid`-pinned device, so this is only ever called when the modal
 /// opens or the user asks it to refresh, never on a per-frame tick.
+/// One `(nickname, raw_device_id)` pair's full row - the per-device body
+/// `gather_contact_rows` runs for every device of every nickname, factored
+/// out so `gather_single_contact_row` (the user-info popup, `i`/`/info`)
+/// can compute exactly one without re-deriving the other rows it doesn't
+/// need. `raw_device_id` is the store's own convention: `""` for unbound.
+async fn build_contact_row(
+    id_store: &IdStore,
+    otp_cli_cfg: &OtpCliConfig,
+    own_identity: OwnIdentity<'_>,
+    nickname: &str,
+    raw_device_id: &str,
+    key_mode: Option<KeyMode>,
+    last_seen_unix: Option<u64>,
+    pqh_pinned_from: Option<PathBuf>,
+) -> ContactRow {
+    let otp_contact_name =
+        otp_contact_name_for(id_store, nickname, raw_device_id, own_identity, OtpPurpose::Live);
+    let otp = match &otp_contact_name {
+        Some(name) => otp_detail_for(otp_cli_cfg, name).await,
+        None => None,
+    };
+    let otp_mail_contact_name =
+        otp_contact_name_for(id_store, nickname, raw_device_id, own_identity, OtpPurpose::Mail);
+    let otp_mail = match &otp_mail_contact_name {
+        Some(name) => otp_detail_for(otp_cli_cfg, name).await,
+        None => None,
+    };
+    let pqh_fingerprint = if key_mode == Some(KeyMode::PqHybrid) {
+        id_store.get_for_device(nickname, raw_device_id).map(crate::crypto::short_fingerprint_der)
+    } else {
+        None
+    };
+    ContactRow {
+        nickname: nickname.to_string(),
+        device_id: (!raw_device_id.is_empty()).then(|| raw_device_id.to_string()),
+        last_seen_unix,
+        key_mode,
+        otp_contact_name,
+        otp,
+        otp_mail_contact_name,
+        otp_mail,
+        pqh_fingerprint,
+        pqh_pinned_from,
+    }
+}
+
 pub async fn gather_contact_rows(
     id_store: &IdStore,
     otp_cli_cfg: &OtpCliConfig,
@@ -224,50 +271,52 @@ pub async fn gather_contact_rows(
             .map(|d| (d.device_id.clone(), d.key_mode, d.last_seen_unix, d.pinned_from.clone()))
             .collect();
         for (raw_device_id, key_mode, last_seen_unix, pqh_pinned_from) in devices {
-            let otp_contact_name = otp_contact_name_for(
-                id_store,
-                &nickname,
-                &raw_device_id,
-                own_identity,
-                OtpPurpose::Live,
+            rows.push(
+                build_contact_row(
+                    id_store,
+                    otp_cli_cfg,
+                    own_identity,
+                    &nickname,
+                    &raw_device_id,
+                    key_mode,
+                    last_seen_unix,
+                    pqh_pinned_from,
+                )
+                .await,
             );
-            let otp = match &otp_contact_name {
-                Some(name) => otp_detail_for(otp_cli_cfg, name).await,
-                None => None,
-            };
-            let otp_mail_contact_name = otp_contact_name_for(
-                id_store,
-                &nickname,
-                &raw_device_id,
-                own_identity,
-                OtpPurpose::Mail,
-            );
-            let otp_mail = match &otp_mail_contact_name {
-                Some(name) => otp_detail_for(otp_cli_cfg, name).await,
-                None => None,
-            };
-            let pqh_fingerprint = if key_mode == Some(KeyMode::PqHybrid) {
-                id_store
-                    .get_for_device(&nickname, &raw_device_id)
-                    .map(crate::crypto::short_fingerprint_der)
-            } else {
-                None
-            };
-            rows.push(ContactRow {
-                nickname: nickname.clone(),
-                device_id: (!raw_device_id.is_empty()).then_some(raw_device_id),
-                last_seen_unix,
-                key_mode,
-                otp_contact_name,
-                otp,
-                otp_mail_contact_name,
-                otp_mail,
-                pqh_fingerprint,
-                pqh_pinned_from,
-            });
         }
     }
     rows
+}
+
+/// The user-info popup's data (`i` on a channel member, `/info` in an open
+/// DM): exactly the one row naming `(nickname, device_id)`, or `None` if
+/// nothing is pinned for them at all yet. `device_id` is the store's
+/// "unbound" convention - `None` looks up the unbound (`""`) entry, same
+/// as every other device-aware lookup in this module.
+pub async fn gather_single_contact_row(
+    id_store: &IdStore,
+    otp_cli_cfg: &OtpCliConfig,
+    own_identity: OwnIdentity<'_>,
+    nickname: &str,
+    device_id: Option<&str>,
+) -> Option<ContactRow> {
+    let raw_device_id = device_id.unwrap_or("");
+    let entry = id_store.devices_of(nickname).find(|d| d.device_id == raw_device_id)?;
+    let (key_mode, last_seen_unix, pinned_from) = (entry.key_mode, entry.last_seen_unix, entry.pinned_from.clone());
+    Some(
+        build_contact_row(
+            id_store,
+            otp_cli_cfg,
+            own_identity,
+            nickname,
+            raw_device_id,
+            key_mode,
+            last_seen_unix,
+            pinned_from,
+        )
+        .await,
+    )
 }
 
 /// `UiAction::OpenContacts`/`RefreshContacts`'s shared handler: re-gathers
@@ -280,6 +329,49 @@ pub async fn handle_open(session: &SessionState, ui_state: &mut UiState) {
     )
     .await;
     ui_state.set_contacts_rows(rows);
+}
+
+/// The device this connection actually announced for `peer` - a
+/// `pq_hybrid` peer's live `DeviceIdAnnounce` (`SessionState::
+/// peer_device_ids`), or a serverless peer's own resolution
+/// (`PeerLinkManager::direct_device_id_of`). `None` for either a peer
+/// whose device hasn't been learned yet, or one with no `pq_hybrid`
+/// identity and no direct link at all.
+fn live_peer_device_id(session: &SessionState, peer: UserId) -> Option<String> {
+    session.peer_device_ids.get(&peer).cloned().or_else(|| session.peer_link.direct_device_id_of(peer))
+}
+
+/// `UiAction::RequestUserInfo`'s handler (`i` on a channel member, `/info`
+/// in an open DM): resolves exactly which device this live connection
+/// actually is, gathers that one `(nickname, device_id)` row
+/// (`gather_single_contact_row`), and lists only the keys that genuinely
+/// exist - never the contacts list's always-three ✅/❌ badges, since this
+/// popup has nothing to manage, only to show.
+pub async fn handle_request_user_info(session: &SessionState, ui_state: &mut UiState, peer: UserId, nickname: String) {
+    let device_id = live_peer_device_id(session, peer);
+    let row = gather_single_contact_row(
+        &session.id_store,
+        &session.otp_cli_cfg,
+        own_identity_of(session),
+        &nickname,
+        device_id.as_deref(),
+    )
+    .await;
+    let mut keys = Vec::new();
+    let mut last_seen_unix = None;
+    if let Some(row) = row {
+        last_seen_unix = row.last_seen_unix;
+        if let Some(fp) = row.pqh_fingerprint {
+            keys.push(UserInfoKeyRow { kind: ContactKeyKind::Pqh, id: fp });
+        }
+        if let (Some(name), true) = (row.otp_contact_name, row.otp.is_some()) {
+            keys.push(UserInfoKeyRow { kind: ContactKeyKind::Otp, id: name });
+        }
+        if let (Some(name), true) = (row.otp_mail_contact_name, row.otp_mail.is_some()) {
+            keys.push(UserInfoKeyRow { kind: ContactKeyKind::OtpMail, id: name });
+        }
+    }
+    ui_state.set_user_info(peer, device_id, last_seen_unix, keys);
 }
 
 /// Forgets `nickname` outright - every one of its devices' identity pins,

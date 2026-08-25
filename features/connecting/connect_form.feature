@@ -69,8 +69,8 @@ Feature: Filling in the connect form
     Then ssl is off
     And the form has no ssl field
 
-  @AC-070
-  Scenario: my_key is pq_hybrid, the one peer-to-peer scheme this app has
+  @AC-070 @AC-010
+  Scenario: my_key is pq_hybrid, shown read-only, with no type to choose
     Given the connect form is open
     Then my_key is pq_hybrid with no type to choose
 
@@ -110,11 +110,8 @@ Feature: Filling in the connect form
       | password | password |
 
   @AC-270
-  Scenario: The registration fields are hidden until the server allows registration
+  Scenario: The registration fields are always on screen, on any server
     Given the connect form is open
-    Then the form has no email field
-    And no Register button is offered
-    When the server allows registration
     Then an email field and a Register button are offered
 
   @AC-270
@@ -129,34 +126,20 @@ Feature: Filling in the connect form
     And I focus the "Register" field
     Then registering begins with the email I entered
 
+  @AC-270
+  Scenario: A server that does not allow registration refuses Register, in red, only when pressed
+    Given the connect form is open
+    And the connect form is filled in with valid details
+    When I focus the "email" field
+    And I type "dave@example.com" into the form
+    And I focus the "Register" field
+    Then registering is refused with an error mentioning "does not accept registrations"
+
   @AC-009
   Scenario: Escape abandons the form
     Given the connect form is open
     When I press Escape
     Then the form is cancelled
-
-  @AC-010
-  Scenario: A my_key field is filled from the in-app file browser
-    Given the connect form is open
-    And a directory holding one sub-directory and one file
-    When I open the file browser on that directory and pick the file
-    Then the picked file fills the my_key field
-
-  @AC-011
-  Scenario: The file browser retraces its own steps
-    Given the connect form is open
-    And a directory holding one sub-directory and one file
-    Then a fresh browser has nowhere to step back or forward to
-    When I walk into the sub-directory and back out again
-    Then the browser can step back and then forward again
-
-  @AC-093
-  Scenario: The file browser scrolls to keep the selection visible
-    Given the connect form is open
-    And a directory holding more files than fit in the file browser popup
-    When I open the file browser on that directory and select the last entry
-    Then the last entry is visible in the file browser
-    And the first entry has scrolled out of view
 
   @AC-012
   Scenario: The focused Connect button highlights its label, not its frame

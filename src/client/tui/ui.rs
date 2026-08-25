@@ -193,6 +193,19 @@ const HELP_BODY: &[HelpLine] = &[
         text: "open a private room with the selected user",
     },
     HelpLine::Item {
+        keys: "i",
+        text: "user info (sidebar focused; /info does the same from inside an open DM room): \
+               nickname, the device this connection announced, when they were last seen, \
+               and every PQH/OTP/OTP MAIL key pinned for that device - shown read-only, \
+               never editable here (/contacts is where keys are managed). Names an active \
+               /otp session too, if one is on right now. i or Esc closes it again.",
+    },
+    HelpLine::Item {
+        keys: "/info",
+        text: "inside an open DM room: the same user-info popup as 'i' on a sidebar \
+               member, for whoever the room is with.",
+    },
+    HelpLine::Item {
         keys: "Esc",
         text: "back to the channel selector (the room stays on the DM selector)",
     },
@@ -390,17 +403,33 @@ const HELP_BODY: &[HelpLine] = &[
     ),
     HelpLine::Item {
         keys: "/contacts",
-        text: "every pinned nickname and its three keys - PQH (the pinned identity \
-               itself), OTP (a live /otp session), OTP MAIL (a /mail-only key, entirely \
-               separate from the live one) - each shown as a \u{2705}/\u{274C} badge. \
-               Left/Right cycles which of the three is highlighted across the whole \
-               list; Enter opens that key's own details: what it's for, its path and \
-               live figures if it exists, and a Create (PQH, from an identity card \
-               file) / Install manually (OTP or OTP MAIL, from files you generated \
-               yourself) / Delete action. 'o' still installs an OTP key directly, same \
-               as before; 'd' deletes the whole contact (every key with it); 'r' \
-               refreshes. Every action here takes effect immediately, including on an \
-               already-open /mail compose view.",
+        text: "one row per pinned *device* of a nickname, not one per nickname - a \
+               multi-device contact gets one row each, its device id cropped to 10 \
+               characters for width (never in a details popup, which always shows it \
+               in full). Its three keys - PQH (the pinned identity itself), OTP (a live \
+               /otp session), OTP MAIL (a /mail-only key, entirely separate from the \
+               live one) - render as small buttons, \u{2705}/\u{274C} coloured, \
+               e.g. [\u{2705}PQH]. Up/Down picks the row, Left/Right the key within it - \
+               a genuine grid, so only one button in the whole list is ever highlighted, \
+               never the same key across every row at once. Enter opens that exact \
+               button's own details: what the key is for, its path and live figures if \
+               it exists, and a Create (PQH, from an identity card file) / Install \
+               manually (OTP or OTP MAIL, from files you generated yourself) / Delete \
+               action. 'o' still installs an OTP key directly, same as before; 'd' \
+               deletes the whole contact (every device, every key with it); 'r' \
+               refreshes; 'a' opens Add contact.",
+    },
+    HelpLine::Item {
+        keys: "a",
+        text: "(inside /contacts) Add contact: pin a nickname and device before ever \
+               connecting to them, so keys can be attached ahead of time. Validates both \
+               fields (non-empty, no tab/newline) and refuses a nickname+device that's \
+               already pinned. Confirming opens the same key-details popup Enter does, \
+               where PQH's Create key binds straight to the device just typed - unlike \
+               the ordinary case above - and, once it succeeds, stays open rather than \
+               closing so OTP/OTP MAIL can be added right after in the same sitting. \
+               Nothing is ever pinned from the form alone: Esc at any point, before a \
+               key is actually added, leaves nothing behind.",
     },
     HelpLine::Item {
         keys: "/new-otp-mail-key",
@@ -1775,6 +1804,14 @@ pub enum UiAction {
     /// `r` on the contacts modal - re-runs the same gather, e.g. after the
     /// remaining OTP key has moved since it was last opened.
     RefreshContacts,
+    /// `i` on a channel member, or `/info` in an open DM - gathers exactly
+    /// one `(nickname, device_id)`'s pinned identity
+    /// (`client::contacts::handle_request_user_info`, a narrower
+    /// `gather_contact_rows`) and hands it to the popup `open_user_info`
+    /// already opened empty. `nickname` is carried directly rather than
+    /// re-read from `known_users` session-side, the same reasoning every
+    /// other `UiAction` already follows.
+    RequestUserInfo { peer: UserId, nickname: String },
     /// The user confirmed "delete contact" on the contacts modal's list -
     /// forgets `nickname` outright, every device (device-pinning plan §3):
     /// every device's identity pin, and each one's OTP keychain entries
@@ -2282,6 +2319,11 @@ pub struct UiState {
     /// because logs are append-only and the popup absorbs every key that
     /// could change which conversation is on screen.
     pub(crate) message_info: Option<usize>,
+    /// The user-info popup (`i` on a channel member, `/info` in an open
+    /// DM) - opened empty (`open_user_info`), filled in once
+    /// `client::contacts::handle_request_user_info` has gathered it
+    /// (`set_user_info`), same split `ContactsState::rows` uses.
+    pub user_info: Option<super::contacts::UserInfoState>,
     /// System-wide CPU usage percentage, refreshed roughly every
     /// `sysstats::CPU_HEALTHY_MAX_PCT`-adjacent cadence by
     /// `session::run_connected_session` (`sysstats::CpuMonitor`) and shown
@@ -2422,6 +2464,7 @@ impl UiState {
             pending_messages: HashMap::new(),
             next_msg_id: 0,
             message_info: None,
+            user_info: None,
             cpu_usage_pct: 0.0,
             conn_quality: crate::client::netstats::ConnQuality::Unknown,
             direct_punch_status: None,
@@ -4485,6 +4528,17 @@ impl UiState {
             return None;
         }
 
+        // The user-info popup (`i`/`/info`) is the same "absorb every key,
+        // Esc or `i` closes it" tier as message-info above.
+        if self.user_info.is_some() {
+            if kind == KeyEventKind::Press
+                && matches!(code, KeyCode::Esc | KeyCode::Char('i') | KeyCode::Char('I'))
+            {
+                self.user_info = None;
+            }
+            return None;
+        }
+
         // Ctrl+H toggles the help overlay from any view/mode/focus, taking
         // priority over everything below. Gated on `Press`: on a Kitty
         // terminal the matching `Release` also reaches here, and toggling
@@ -5202,6 +5256,22 @@ impl UiState {
                 pubkey_der: peer.public_key_der,
             });
         }
+        if self.input.trim() == "/info" {
+            // Read-only and purely local (`id_store`/keychain), so - like
+            // `/endotp` above - never gated on the peer being reachable:
+            // there is nothing here that needs them online, and it works
+            // even for a trust-gated peer, same reasoning as `i` in the
+            // sidebar.
+            let Some(peer_id) = self.active_private_room else {
+                return None;
+            };
+            let Some(peer) = self.known_users.get(&peer_id).cloned() else {
+                return None;
+            };
+            self.input.clear();
+            self.open_user_info(peer_id, peer.name.clone());
+            return Some(UiAction::RequestUserInfo { peer: peer_id, nickname: peer.name });
+        }
         // Everything below requires the open DM's peer (if any) to actually
         // be reachable - `/endotp` above is the one deliberate exception.
         // `active_dm_peer_offline` is `false` whenever no DM room is open at
@@ -5609,6 +5679,20 @@ impl UiState {
                 }
                 self.open_private_room(member);
                 None
+            }
+            // Read-only, so unlike Enter this works even for a trust-gated
+            // member - seeing what's already pinned for them can only help
+            // a decision, never leak anything beyond it.
+            KeyCode::Char('i') | KeyCode::Char('I') => {
+                let Some(member) = channel.members.get(self.sidebar_selected) else {
+                    return None;
+                };
+                if Some(member.id) == self.own_id {
+                    return None;
+                }
+                let (id, name) = (member.id, member.name.clone());
+                self.open_user_info(id, name.clone());
+                Some(UiAction::RequestUserInfo { peer: id, nickname: name })
             }
             _ => None,
         }
@@ -6176,6 +6260,10 @@ pub fn render(frame: &mut Frame, state: &UiState) {
     // absorb keys first.
     if state.message_info.is_some() {
         render_message_info_popup(frame, area, state);
+    }
+    // Same tier as message-info above - `i`/`/info`'s read-only snapshot.
+    if state.user_info.is_some() {
+        super::contacts::render_user_info_popup(frame, area, state);
     }
     // Drawn last, and independent of `mode`/the private-vs-channel view
     // above, so it overlays whatever's currently showing rather than

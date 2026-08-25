@@ -22,52 +22,30 @@ fn type_str(state: &mut ConnectPopupState, s: &str) {
 
 /// One way to authenticate and one `my_key` scheme: nothing in the focus
 /// order is conditional any more, and there is no `server_key` or
-/// `id_store` field in it at all. `email`/`Register` only join the order
-/// once the server takes registrations at all.
+/// `id_store` field in it at all. `email`/`Register` are always in it too,
+/// and `my_key`'s own two fields never are - they are read-only
+/// information now, not something to tab to.
 /// @requirement TB-002, TB-003, AC-270
 #[test]
-fn focus_order_lists_every_field_once_with_register_last_when_registration_is_available() {
-    let mut state = ConnectPopupState::new();
-    state.registration_available = true;
-    let order = state.focus_order();
-    assert_eq!(
-        order,
-        vec![
-            Field::Host,
-            Field::Port,
-            Field::Nickname,
-            Field::Password,
-            Field::Email,
-            Field::MyKeyValuePub,
-            Field::MyKeyValuePriv,
-            Field::Connect,
-            Field::Register,
-        ],
-        "my_key always contributes both keybundle paths - there is only one scheme"
-    );
-    assert_eq!(order.last(), Some(&Field::Register), "Register sits at the end");
-}
-
-/// A server that takes no registrations has nothing for `email`/Register
-/// to do, so neither is reachable at all - not shown, not tabbed to.
-/// @requirement AC-270
-#[test]
-fn focus_order_excludes_email_and_register_unless_registration_is_available() {
-    let state = ConnectPopupState::new();
-    assert!(!state.registration_available, "off unless settings say otherwise");
-    let order = state.focus_order();
-    assert!(!order.contains(&Field::Email));
-    assert!(!order.contains(&Field::Register));
-    assert_eq!(order.last(), Some(&Field::Connect), "Connect is the last field with no Register");
-}
-
-/// @requirement AC-084, TB-002
-#[test]
-fn focus_order_includes_both_my_key_files() {
-    let state = ConnectPopupState::new();
-    let order = state.focus_order();
-    assert!(order.contains(&Field::MyKeyValuePub));
-    assert!(order.contains(&Field::MyKeyValuePriv));
+fn focus_order_lists_every_field_once_regardless_of_registration_availability() {
+    for registration_available in [false, true] {
+        let mut state = ConnectPopupState::new();
+        state.registration_available = registration_available;
+        let order = state.focus_order();
+        assert_eq!(
+            order,
+            vec![
+                Field::Host,
+                Field::Port,
+                Field::Nickname,
+                Field::Password,
+                Field::Email,
+                Field::Connect,
+                Field::Register,
+            ],
+            "registration_available ({registration_available}) no longer changes the focus order at all"
+        );
+    }
 }
 
 /// @requirement TB-004
@@ -76,11 +54,7 @@ fn focus_next_and_prev_wrap_around() {
     let mut state = ConnectPopupState::new();
     assert_eq!(state.focus, Field::Host);
     state.focus_prev();
-    assert_eq!(
-        state.focus,
-        Field::Connect,
-        "prev from the first field wraps to the last - Connect, with registration unavailable"
-    );
+    assert_eq!(state.focus, Field::Register, "prev from the first field wraps to the last");
     state.focus_next();
     assert_eq!(state.focus, Field::Host);
 }
@@ -93,18 +67,6 @@ fn tab_key_advances_focus() {
     assert_eq!(state.focus, Field::Port);
     state.handle_key(KeyCode::BackTab).unwrap();
     assert_eq!(state.focus, Field::Host);
-}
-
-/// `my_key` has no type selector to cycle, so its two fields can never be
-/// orphaned - a Left/Right anywhere in the group is simply a no-op.
-/// @requirement TB-002
-#[test]
-fn my_key_fields_are_never_orphaned_by_a_type_change() {
-    let mut state = ConnectPopupState::new();
-    state.focus = Field::MyKeyValuePriv;
-    state.handle_key(KeyCode::Left).unwrap();
-    assert_eq!(state.focus, Field::MyKeyValuePriv);
-    assert!(state.focus_order().contains(&Field::MyKeyValuePriv));
 }
 
 /// `ssl` is not a popup field at all - like `server_ssl` on the server
@@ -349,6 +311,7 @@ fn build_request_maps_the_form_onto_a_connect_request() {
 #[test]
 fn register_needs_an_email_where_connect_does_not() {
     let mut state = ConnectPopupState::new();
+    state.registration_available = true;
     state.host = "localhost".into();
     state.port = "9000".into();
     state.nickname = "dave".into();
@@ -384,6 +347,7 @@ fn register_needs_an_email_where_connect_does_not() {
 #[test]
 fn register_refuses_a_nickname_the_registry_could_not_hold() {
     let mut state = ConnectPopupState::new();
+    state.registration_available = true;
     state.host = "localhost".into();
     state.port = "9000".into();
     state.nickname = "da/ve".into();
@@ -397,6 +361,7 @@ fn register_refuses_a_nickname_the_registry_could_not_hold() {
 #[test]
 fn enter_on_register_returns_a_register_action_or_an_error() {
     let mut state = ConnectPopupState::new();
+    state.registration_available = true;
     state.focus = Field::Register;
     assert_eq!(state.handle_key(KeyCode::Enter).unwrap(), Action::None);
     assert!(state.error.is_some(), "an empty form is refused with a reason");
@@ -410,6 +375,28 @@ fn enter_on_register_returns_a_register_action_or_an_error() {
         Action::Register(req) => assert_eq!(req.email, "dave@example.com"),
         other => panic!("expected Register, got {other:?}"),
     }
+}
+
+/// Register and its email field are always on screen and always
+/// reachable now, regardless of `registration_available` - a server that
+/// refuses registration says so, in red, only when Register is actually
+/// pressed, not by hiding either.
+/// @requirement AC-270
+#[test]
+fn pressing_register_when_unavailable_is_refused_in_red_even_with_a_complete_form() {
+    let mut state = ConnectPopupState::new();
+    assert!(!state.registration_available, "off unless settings said otherwise");
+    state.host = "chat.example.com".into();
+    state.port = "6667".into();
+    state.nickname = "dave".into();
+    state.password = "hunter2".into();
+    state.email = "dave@example.com".into();
+    state.focus = Field::Register;
+
+    let action = state.handle_key(KeyCode::Enter).unwrap();
+    assert_eq!(action, Action::None, "never connects/registers on a server that cannot take it");
+    let err = state.error.as_deref().expect("a reason must be shown");
+    assert!(err.contains("does not accept registrations"), "{err}");
 }
 
 /// @requirement AC-084, TB-006
@@ -484,15 +471,6 @@ fn escape_cancels() {
     let mut state = ConnectPopupState::new();
     let action = state.handle_key(KeyCode::Esc).unwrap();
     assert_eq!(action, Action::Cancel);
-}
-
-/// @requirement AC-010
-#[test]
-fn enter_on_a_my_key_file_field_opens_file_browser() {
-    let mut state = ConnectPopupState::new();
-    state.focus = Field::MyKeyValuePub;
-    state.handle_key(KeyCode::Enter).unwrap();
-    assert!(state.browser.is_some());
 }
 
 // ---------------------------------------------------------------------
@@ -666,36 +644,6 @@ fn file_browser_select_next_prev_wrap_around() {
     std::fs::remove_dir_all(&root).ok();
 }
 
-/// @requirement AC-010
-#[test]
-fn selecting_a_file_in_browser_applies_it_to_the_popup_field() {
-    let root = make_tree();
-    let mut state = ConnectPopupState::new();
-    state.focus = Field::MyKeyValuePub;
-    state.handle_key(KeyCode::Enter).unwrap(); // opens browser at process cwd
-
-    // force the browser into our known temp tree so the test is deterministic
-    state.browser = Some((
-        aloo::client::tui::ui_connect_popup::FileBrowserTarget::MyKeyFilePub,
-        FileBrowserState::open(root.clone()).unwrap(),
-    ));
-    // move selection to "file.txt" (index 2: "..", "subdir", "file.txt")
-    state.handle_key(KeyCode::Down).unwrap();
-    state.handle_key(KeyCode::Down).unwrap();
-    state.handle_key(KeyCode::Enter).unwrap();
-
-    assert!(
-        state.browser.is_none(),
-        "selecting a file should close the browser"
-    );
-    assert_eq!(
-        state.my_key.file_pub,
-        root.join("file.txt").display().to_string()
-    );
-
-    std::fs::remove_dir_all(&root).ok();
-}
-
 // ---------------------------------------------------------------------
 // Rendering smoke tests (no assertions on pixels, just "it doesn't panic
 // and produces a non-blank frame")
@@ -762,27 +710,25 @@ fn rows_of(state: &ConnectPopupState) -> Vec<String> {
         .collect()
 }
 
-/// The Register button (and the email field it needs) only appears once
-/// the server this popup was opened for takes registrations at all.
+/// The Register button and the email field are always rendered now,
+/// regardless of `registration_available` - only pressing Register on a
+/// server that cannot take it is refused (`build_register_request`).
 /// @requirement AC-270
 #[test]
-fn register_button_and_email_field_only_show_when_registration_is_available() {
-    let state = ConnectPopupState::new();
-    let rows = rows_of(&state);
-    assert!(
-        !rows.iter().any(|row| row.contains("Register")),
-        "no Register button while registration is unavailable: {rows:?}"
-    );
-    assert!(
-        !rows.iter().any(|row| row.contains("email")),
-        "no email field while registration is unavailable: {rows:?}"
-    );
-
-    let mut state = ConnectPopupState::new();
-    state.registration_available = true;
-    let rows = rows_of(&state);
-    assert!(rows.iter().any(|row| row.contains("Register")), "{rows:?}");
-    assert!(rows.iter().any(|row| row.contains("email")), "{rows:?}");
+fn register_button_and_email_field_always_show_regardless_of_registration_availability() {
+    for registration_available in [false, true] {
+        let mut state = ConnectPopupState::new();
+        state.registration_available = registration_available;
+        let rows = rows_of(&state);
+        assert!(
+            rows.iter().any(|row| row.contains("Register")),
+            "registration_available={registration_available}: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("email")),
+            "registration_available={registration_available}: {rows:?}"
+        );
+    }
 }
 
 /// The hint line shows an error in red, else a notice in green, else the
@@ -896,16 +842,22 @@ fn render_shows_the_resolved_aloo_home_in_gray() {
     assert!(button_y > y);
 }
 
-/// The line is set apart from the form around it: centered horizontally
-/// rather than flush left, with a blank row of its own directly above and
-/// directly below it.
+/// The whole read-only info block - `file_pub`, `file_priv`, then
+/// `ALOO_HOME` right below it - is set apart from the form around it: the
+/// `ALOO_HOME` line itself is centered horizontally, and there's a blank
+/// row directly above `file_pub` (the block's own top) and directly below
+/// `ALOO_HOME` (the block's own bottom). `file_priv` sits directly above
+/// `ALOO_HOME` with no blank line between them - they read as one block,
+/// not three separate notes.
 /// @requirement AC-258
 #[test]
-fn aloo_home_line_is_centered_with_a_blank_line_above_and_below() {
+fn the_read_only_info_block_is_centered_with_a_blank_line_above_and_below() {
     let backend = TestBackend::new(80, 30);
     let mut terminal = Terminal::new(backend).unwrap();
     let mut state = ConnectPopupState::new();
     state.aloo_home = "/tmp/aloo-bob".to_string();
+    state.my_key.file_pub = "/keys/pq_hybrid.pub".to_string();
+    state.my_key.file_priv = "/keys/pq_hybrid".to_string();
     terminal.draw(|f| render(f, &state)).unwrap();
     let buffer = terminal.backend().buffer().clone();
 
@@ -931,17 +883,16 @@ fn aloo_home_line_is_centered_with_a_blank_line_above_and_below() {
         "the ALOO_HOME line should be centered, not flush left: {row:?}"
     );
 
-    for neighbour_y in [y - 1, y + 1] {
-        let neighbour: String = (0..buffer.area.width)
-            .map(|x| buffer[(x, neighbour_y)].symbol())
-            .collect();
-        // The popup's own left/right border (│) still crosses every
-        // interior row - "blank" means no other visible content beside it.
-        assert!(
-            neighbour.chars().all(|c| c == ' ' || c == '│'),
-            "row {neighbour_y} beside the ALOO_HOME line should be blank: {neighbour:?}"
-        );
-    }
+    let row_at = |yi: u16| -> String { (0..buffer.area.width).map(|x| buffer[(x, yi)].symbol()).collect() };
+    assert!(row_at(y - 1).contains("file_priv"), "file_priv sits directly above ALOO_HOME: {:?}", row_at(y - 1));
+
+    let is_blank =
+        |s: &str| s.chars().all(|c| c == ' ' || c == '│');
+    assert!(is_blank(&row_at(y + 1)), "a blank row directly below ALOO_HOME (the block's bottom): {:?}", row_at(y + 1));
+    // Walk up from file_priv, past file_pub, to the block's own top -
+    // exactly one blank row separates it from the form above.
+    assert!(row_at(y - 2).contains("file_pub"), "file_pub sits directly above file_priv: {:?}", row_at(y - 2));
+    assert!(is_blank(&row_at(y - 3)), "a blank row directly above file_pub (the block's top): {:?}", row_at(y - 3));
 }
 
 /// @requirement AC-258
@@ -1093,69 +1044,14 @@ fn connect_button_highlight_does_not_bleed_into_its_border() {
 
 /// @requirement TB-010
 #[test]
-fn render_with_open_file_browser_does_not_panic() {
-    let root = make_tree();
-    let mut state = ConnectPopupState::new();
-    state.browser = Some((
-        aloo::client::tui::ui_connect_popup::FileBrowserTarget::MyKeyFilePriv,
-        FileBrowserState::open(root.clone()).unwrap(),
-    ));
+fn render_does_not_panic_with_a_notice_or_error_showing() {
     let backend = TestBackend::new(80, 24);
     let mut terminal = Terminal::new(backend).unwrap();
-    terminal.draw(|f| render(f, &state)).unwrap();
-    std::fs::remove_dir_all(&root).ok();
-}
-
-/// @requirement AC-093
-#[test]
-fn file_browser_render_scrolls_to_keep_the_selection_visible() {
-    // More files than fit in the browser popup's visible height, so a
-    // selection near the end starts out scrolled off screen.
-    let root = std::env::temp_dir().join(format!(
-        "aloo-ui-popup-scroll-test-{}-{}",
-        std::process::id(),
-        fastrand_seed()
-    ));
-    std::fs::create_dir_all(&root).unwrap();
-    for i in 0..30 {
-        std::fs::write(root.join(format!("file{i:02}.txt")), b"x").unwrap();
-    }
-
-    let mut browser = FileBrowserState::open(root.clone()).unwrap();
-    // entries: "..", file00.txt, ..., file29.txt (31 total) - move selection
-    // all the way to the last one.
-    for _ in 0..30 {
-        browser.select_next();
-    }
-    assert_eq!(browser.selected_entry().unwrap().name, "file29.txt");
-
     let mut state = ConnectPopupState::new();
-    state.browser = Some((
-        aloo::client::tui::ui_connect_popup::FileBrowserTarget::MyKeyFilePub,
-        browser,
-    ));
-
-    let backend = TestBackend::new(80, 24);
-    let mut terminal = Terminal::new(backend).unwrap();
+    state.notice = Some("registered - check your email".into());
     terminal.draw(|f| render(f, &state)).unwrap();
-    let buffer = terminal.backend().buffer().clone();
-    let rows: Vec<String> = (0..buffer.area.height)
-        .map(|y| {
-            (0..buffer.area.width)
-                .map(|x| buffer[(x, y)].symbol())
-                .collect::<String>()
-        })
-        .collect();
-
-    assert!(
-        rows.iter().any(|r| r.contains("file29.txt")),
-        "the selected entry must have scrolled into view: {rows:?}"
-    );
-    assert!(
-        !rows.iter().any(|r| r.contains("file00.txt")),
-        "an unselected entry far from the current scroll position should not still be shown: {rows:?}"
-    );
-
-    std::fs::remove_dir_all(&root).ok();
+    state.notice = None;
+    state.error = Some("host is required".into());
+    terminal.draw(|f| render(f, &state)).unwrap();
 }
 

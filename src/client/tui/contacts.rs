@@ -34,7 +34,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use crate::client::contacts::ContactRow;
 use crate::client::file_browser::FileBrowserState;
 use crate::crypto::otp::OtpPurpose;
-use crate::proto::KeyMode;
+use crate::proto::{KeyMode, UserId};
 
 use super::direct_message::OTP_KEY_LOW_THRESHOLD_BYTES;
 use super::ui::{
@@ -156,6 +156,36 @@ impl ContactKeyKind {
     }
 }
 
+/// One key's row in the user-info popup (`i` on a channel member, `/info`
+/// in an open DM) - only keys that genuinely exist get a row, unlike
+/// `/contacts`' own list, which always shows all three with a ✅/❌ badge.
+pub struct UserInfoKeyRow {
+    pub kind: ContactKeyKind,
+    /// PQH's short fingerprint, or OTP/OTP MAIL's contact name - the
+    /// closest thing each key kind has to an id of its own.
+    pub id: String,
+}
+
+/// A read-only snapshot of one live peer's pinned identity - nickname,
+/// the device this connection actually announced, when it was last seen,
+/// and every key that exists for that `(nickname, device_id)`. Never
+/// edits anything; `/contacts` is where keys are managed. Opened empty
+/// (`UiState::open_user_info`) and filled in once
+/// `client::contacts::handle_request_user_info` has gathered it, the same
+/// split `ContactsState::rows` uses.
+pub struct UserInfoState {
+    pub peer: UserId,
+    pub nickname: String,
+    /// `None` until the session-side gather resolves it (device-pinning
+    /// plan §5's live-announce for a `pq_hybrid` peer,
+    /// `PeerLinkManager::direct_device_id_of` for a serverless one) - also
+    /// genuinely `None` for a peer met over a server with no `pq_hybrid`
+    /// identity pinned at all.
+    pub device_id: Option<String>,
+    pub last_seen_unix: Option<u64>,
+    pub keys: Vec<UserInfoKeyRow>,
+}
+
 /// The key-details popup, opened with Enter on a row - see the docs on
 /// each field's owning action (`UiAction::PinIdentityCard`/`InstallOtpKey`/
 /// `DeleteContact`/`DeleteContactKey`) for what "Create"/"Install
@@ -265,6 +295,34 @@ impl UiState {
         } else {
             state.selected.min(state.rows.len() - 1)
         };
+    }
+
+    /// Opens the user-info popup (`i` on a channel member, `/info` in an
+    /// open DM) empty, and lets the caller also return
+    /// `UiAction::RequestUserInfo` so the session fills it in - the same
+    /// `open_contacts`/`OpenContacts` split. Deliberately does not touch
+    /// `mode` - unlike `/contacts`, this is an overlay over whatever view
+    /// is already on screen, the same as the message-info popup.
+    pub fn open_user_info(&mut self, peer: UserId, nickname: String) {
+        self.user_info = Some(UserInfoState { peer, nickname, device_id: None, last_seen_unix: None, keys: Vec::new() });
+    }
+
+    /// `RequestUserInfo`'s answer. A no-op if the popup was closed (or
+    /// reopened for someone else) before the session's answer arrived.
+    pub fn set_user_info(
+        &mut self,
+        peer: UserId,
+        device_id: Option<String>,
+        last_seen_unix: Option<u64>,
+        keys: Vec<UserInfoKeyRow>,
+    ) {
+        let Some(info) = self.user_info.as_mut() else { return };
+        if info.peer != peer {
+            return;
+        }
+        info.device_id = device_id;
+        info.last_seen_unix = last_seen_unix;
+        info.keys = keys;
     }
 
     /// The install popup's failure path - shown inline, same convention as
@@ -1119,6 +1177,14 @@ const KEYS_COL_EXTRA_GAP: usize = 2;
 /// never ambiguous which device's key `Enter` is about to open.
 const KEY_BADGES_SAMPLE: &str = "[\u{2705}PQH] [\u{2705}OTP] [\u{2705}OTP MAIL]";
 
+/// The ✅/❌ + color a key badge renders with, whether present or not -
+/// shared by the contacts-list badges and the user-info popup (`i`/
+/// `/info`), which reuses only the "present" half since it lists nothing
+/// but keys that exist.
+fn key_presence_icon(present: bool) -> (&'static str, Color) {
+    if present { ("\u{2705}", Color::Green) } else { ("\u{274c}", Color::Red) }
+}
+
 fn push_key_badge(
     spans: &mut Vec<Span<'static>>,
     label: &'static str,
@@ -1127,11 +1193,7 @@ fn push_key_badge(
     selected_key: ContactKeyKind,
     row_selected: bool,
 ) {
-    let (icon, color) = if present {
-        ("\u{2705}", Color::Green)
-    } else {
-        ("\u{274c}", Color::Red)
-    };
+    let (icon, color) = key_presence_icon(present);
     let mut style = Style::default().fg(color);
     if row_selected && kind == selected_key {
         style = style.bg(Color::Gray);
@@ -1413,6 +1475,53 @@ fn otp_direction_detail_line(label: &str, seq: u64, offset: u64, remaining_bytes
         Span::raw(format!("seq {seq} offset {offset} ")),
         Span::styled(format!("remaining {}", fmt_mb(remaining_bytes)), Style::default().fg(remaining_color)),
     ])
+}
+
+/// The user-info popup (`i` on a channel member, `/info` in an open DM):
+/// nickname, device id, last-seen, one row per key that exists (icon and
+/// color matching the contacts list's own badges), and, live rather than
+/// from the gathered snapshot, whether an OTP session is active right now.
+pub(crate) fn render_user_info_popup(frame: &mut Frame, area: Rect, state: &UiState) {
+    let Some(info) = &state.user_info else { return };
+    let otp_active = state.is_otp_active(info.peer);
+    let mut lines: Vec<Line> = vec![
+        Line::from(vec![
+            Span::styled("device: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(info.device_id.as_deref().unwrap_or("(unbound)").to_string()),
+        ]),
+        Line::from(vec![
+            Span::styled("last seen: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(format_last_seen(info.last_seen_unix)),
+        ]),
+        Line::from(""),
+    ];
+    if info.keys.is_empty() {
+        lines.push(Line::from(Span::styled("no keys pinned yet", Style::default().fg(Color::DarkGray))));
+    }
+    for key in &info.keys {
+        let (icon, color) = key_presence_icon(true);
+        lines.push(Line::from(vec![
+            Span::styled(format!("{icon} {} ", key.kind.label()), Style::default().fg(color)),
+            Span::raw(key.id.clone()),
+        ]));
+    }
+    if otp_active {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "OTP session is currently active",
+            Style::default().fg(Color::Green),
+        )));
+    }
+
+    let height = (lines.len() as u16 + 2).max(7).min(area.height.saturating_sub(2));
+    let popup = centered_rect(64, height, area);
+    let block = Block::default()
+        .title(format!("{} (Esc: close)", info.nickname))
+        .borders(Borders::ALL);
+    let inner = block.inner(popup);
+    frame.render_widget(ratatui::widgets::Clear, popup);
+    frame.render_widget(block, popup);
+    frame.render_widget(Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: true }), inner);
 }
 
 /// The key-details popup (Enter on a row) - the yellow explanation for

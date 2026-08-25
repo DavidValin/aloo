@@ -61,8 +61,8 @@ evidence = "docs/PROTOCOL.md 12.5; src/client/idstore.rs default_path; src/clien
 
 [[user_story.acceptance_criteria]]
 id = "AC-070"
-description = "my_key is pq_hybrid with no type to choose - the only peer-to-peer scheme this app has (quantum-resistant, RSA-4096-hedged). The my_key group is titled with the scheme it uses and holds only its two keybundle paths, both of which are always in the focus order."
-evidence = "docs/SPEC.md 'Not connected UI'; tests focus_order_includes_both_my_key_files, my_key_fields_are_never_orphaned_by_a_type_change; connect_form.feature 'my_key is pq_hybrid, the one peer-to-peer scheme this app has'"
+description = "my_key is pq_hybrid with no type to choose - the only peer-to-peer scheme this app has (quantum-resistant, RSA-4096-hedged). Its two keybundle paths are never in the focus order at all - shown read-only (AC-010), so there is no type selector to spend a focusable row on in the first place."
+evidence = "docs/SPEC.md 'Not connected UI'; src/client/tui/ui_connect_popup.rs focus_order; test focus_order_lists_every_field_once_regardless_of_registration_availability; connect_form.feature 'my_key is pq_hybrid, shown read-only, with no type to choose'"
 
 [[user_story.acceptance_criteria]]
 id = "AC-007"
@@ -81,8 +81,8 @@ evidence = "README.md 'Running the client'; test escape_cancels"
 
 [[user_story.acceptance_criteria]]
 id = "AC-010"
-description = "A my_key file field opens the in-app file browser, and the file picked there fills that field."
-evidence = "docs/SPEC.md 'File browser'; tests enter_on_a_my_key_file_field_opens_file_browser, selecting_a_file_in_browser_applies_it_to_the_popup_field"
+description = "my_key's file_pub/file_priv paths are never editable from the connect popup - shown as plain, read-only text (\"(not yet generated)\" if empty), the same DarkGray/centered treatment as ALOO_HOME right below them, one cohesive info block set apart from the form by a blank line above and below. Populated only by prefill_connect_defaults (the connect cache/settings) or connecting's own auto-generation (crypto::pq::ensure_bundle_at) - never by typing or browsing on this screen."
+evidence = "docs/SPEC.md 'Not connected UI'; src/client/tui/ui_connect_popup.rs MyKeyFields, render (file_pub_idx, file_priv_idx); tests the_read_only_info_block_is_centered_with_a_blank_line_above_and_below, focus_order_lists_every_field_once_regardless_of_registration_availability; connect_form.feature 'my_key is pq_hybrid, shown read-only, with no type to choose'"
 
 [[user_story.acceptance_criteria]]
 id = "AC-269"
@@ -102,7 +102,7 @@ evidence = "docs/SPEC.md 'Not connected UI'; test connect_button_highlight_does_
 [[user_story.acceptance_criteria]]
 id = "AC-093"
 description = "The file browser scrolls its list to keep the selected entry on screen, so pressing Down past the last row that fits in the popup keeps advancing through off-screen entries instead of stalling once the highlight reaches the bottom edge; the same fix applies everywhere this widget is reused, including the /file send flow's browser (US-019)."
-evidence = "docs/SPEC.md 'File browser'; test file_browser_render_scrolls_to_keep_the_selection_visible"
+evidence = "docs/SPEC.md 'File browser'; test file_browser_render_scrolls_to_keep_the_selection_visible (ui_contacts_test.rs, through the PQH \"Create key\" browser - the connect popup's own former my_key browser, which used to carry this same coverage, was removed once those fields became read-only)"
 
 [[user_story.technical_behavior]]
 id = "TB-001"
@@ -111,13 +111,13 @@ evidence = "src/client/tui/ui_connect_popup.rs Field, ConnectPopupState; tests s
 
 [[user_story.technical_behavior]]
 id = "TB-002"
-description = "The connect popup has no my_key type selector at all: MyKeyFields carries only file_pub/file_priv, and the my_key group's own title names the one scheme (pq_hybrid) rather than spending a focusable row on a choice that cannot vary."
-evidence = "docs/SPEC.md 'Not connected UI'; src/client/tui/ui_connect_popup.rs MyKeyFields, render; tests my_key_fields_are_never_orphaned_by_a_type_change, focus_order_includes_both_my_key_files"
+description = "The connect popup has no my_key type selector at all: MyKeyFields carries only file_pub/file_priv, and there is no focusable row for a choice that cannot vary - the group is not focusable at all any more, rendered as read-only text (AC-010) rather than a titled, bordered, browsable group."
+evidence = "docs/SPEC.md 'Not connected UI'; src/client/tui/ui_connect_popup.rs MyKeyFields, render; test focus_order_lists_every_field_once_regardless_of_registration_availability"
 
 [[user_story.technical_behavior]]
 id = "TB-003"
-description = "The focus order lists host, port, nickname, password, the two my_key files and Connect unconditionally; email and Register join it, always last, only while registration_available is true - a server that takes no registrations shows and tabs through neither."
-evidence = "src/client/tui/ui_connect_popup.rs focus_order; tests focus_order_lists_every_field_once_with_register_last_when_registration_is_available, focus_order_excludes_email_and_register_unless_registration_is_available"
+description = "The focus order lists host, port, nickname, password, email, Connect and Register, in that order, unconditionally - registration_available no longer removes email/Register from it (AC-270); my_key's two files are never in it at all, being read-only (AC-010)."
+evidence = "src/client/tui/ui_connect_popup.rs focus_order; test focus_order_lists_every_field_once_regardless_of_registration_availability"
 
 [[user_story.technical_behavior]]
 id = "TB-004"
@@ -151,8 +151,8 @@ evidence = "test file_browser_new_navigation_clears_forward_history"
 
 [[user_story.technical_behavior]]
 id = "TB-010"
-description = "The connect popup renders without panicking with ssl on or off, with a notice showing, and with the file browser open."
-evidence = "tests render_does_not_panic_with_ssl_on_or_off_or_a_notice_showing, render_with_open_file_browser_does_not_panic, render_draws_something_when_popup_is_shown"
+description = "The connect popup renders without panicking with ssl on or off, with a notice showing, and with an error showing."
+evidence = "tests render_does_not_panic_with_ssl_on_or_off_or_a_notice_showing, render_does_not_panic_with_a_notice_or_error_showing, render_draws_something_when_popup_is_shown"
 
 [[user_story.technical_behavior]]
 id = "TB-011"
@@ -161,8 +161,8 @@ evidence = "docs/SPEC.md 'Not connected UI'; test popup_is_wider_than_the_origin
 
 [[user_story.technical_behavior]]
 id = "TB-244"
-description = "The ALOO_HOME line is centered horizontally, with a blank row of its own directly above and directly below it, setting it apart from the form as a note rather than another field; the keyboard-shortcut hint is the last element in the popup's layout and is also centered horizontally, rather than flush left."
-evidence = "src/client/tui/ui_connect_popup.rs render (aloo_home_idx, hint_idx, Alignment::Center); tests aloo_home_line_is_centered_with_a_blank_line_above_and_below, the_shortcut_hint_is_centered"
+description = "The read-only info block - file_pub, file_priv, then the ALOO_HOME line right below them, in that order with no blank lines between the three - is centered horizontally (the ALOO_HOME line itself), with a blank row directly above file_pub (the block's top) and directly below ALOO_HOME (the block's bottom), setting the whole block apart from the form as one note rather than another field; the keyboard-shortcut hint is the last element in the popup's layout and is also centered horizontally, rather than flush left."
+evidence = "src/client/tui/ui_connect_popup.rs render (file_pub_idx, file_priv_idx, aloo_home_idx, hint_idx, Alignment::Center); tests the_read_only_info_block_is_centered_with_a_blank_line_above_and_below, the_shortcut_hint_is_centered"
 
 [[user_story.technical_behavior]]
 id = "TB-012"
@@ -176,7 +176,7 @@ evidence = "docs/SPEC.md 'Not connected UI'; src/settings.rs Settings::remember_
 
 [[user_story.acceptance_criteria]]
 id = "AC-258"
-description = "The connect popup names the ALOO_HOME this client actually resolved, on a read-only gray, centered line set apart from the form by a blank line above and a blank line below it, directly above the buttons, spelled as the environment variable that sets it (ALOO_HOME=<path>). Every piece of local state lives under that directory - id_store, the connect cache, settings, and the OTP layer's own stores - so running a second client on one machine means giving it its own, and the line is where that is visible at the moment it matters rather than only in Ctrl+H and the README. Gray and set apart so it reads as a note about this client rather than as another field to fill in, and captured once when the popup opens so rendering stays a pure function of the popup's state."
+description = "The connect popup names the ALOO_HOME this client actually resolved, on a read-only gray, centered line directly below my_key's own read-only file_pub/file_priv lines (AC-010) - together one info block set apart from the form by a blank line above and below it, directly above the buttons - spelled as the environment variable that sets it (ALOO_HOME=<path>). Every piece of local state lives under that directory - id_store, the connect cache, settings, and the OTP layer's own stores - so running a second client on one machine means giving it its own, and the line is where that is visible at the moment it matters rather than only in Ctrl+H and the README. Gray and set apart so it reads as a note about this client rather than as another field to fill in, and captured once when the popup opens so rendering stays a pure function of the popup's state."
 evidence = "docs/SPEC.md 'Not connected UI'; src/platform.rs aloo_dir; src/client/tui/ui_connect_popup.rs ALOO_HOME_LABEL, ConnectPopupState::aloo_home, render; test render_shows_the_resolved_aloo_home_in_gray; scenario features/connecting/connect_form.feature 'The form names the ALOO_HOME this client is actually using'"
 
 # ============================================================================
@@ -261,8 +261,8 @@ evidence = "docs/PROTOCOL.md 5.3; src/server/activation.rs AttemptLimiter, MAX_A
 
 [[user_story.acceptance_criteria]]
 id = "AC-270"
-description = "The connect popup carries an email field and a Register button beside Connect, but only while registration_available is true (captured from the local server_allow_registration setting when the popup opens) - a server that takes no registrations shows neither. Submitting Register with a plausible email sends Register and, on success, shows a green notice telling the user to check that address for the activation code. Register needs a nickname the registry could hold and a plausible email address; Connect needs neither."
-evidence = "docs/SPEC.md 'Not connected UI'; src/client/tui/ui_connect_popup.rs Field::Email, Field::Register, ConnectPopupState::registration_available, build_register_request; src/client/connect.rs register_account, prefill_connect_defaults; tests register_button_and_email_field_only_show_when_registration_is_available, register_needs_an_email_where_connect_does_not, register_refuses_a_nickname_the_registry_could_not_hold, enter_on_register_returns_a_register_action_or_an_error, render_shows_a_registration_notice_in_green_unless_an_error_replaces_it"
+description = "The connect popup always carries an email field and a Register button beside Connect, regardless of registration_available (captured from the local server_allow_registration setting when the popup opens) - a server that takes no registrations is never hidden from, only refused. Pressing Register on such a server is refused immediately, in red (\"this server does not accept registrations right now\"), the same inline-error path every other invalid submission uses, with no network round trip. On a server that does allow it, submitting Register with a plausible email sends Register and, on success, shows a green notice telling the user to check that address for the activation code. Register needs a nickname the registry could hold and a plausible email address; Connect needs neither."
+evidence = "docs/SPEC.md 'Not connected UI'; src/client/tui/ui_connect_popup.rs Field::Email, Field::Register, ConnectPopupState::registration_available, build_register_request, focus_order; src/client/connect.rs register_account, prefill_connect_defaults; tests register_button_and_email_field_always_show_regardless_of_registration_availability, pressing_register_when_unavailable_is_refused_in_red_even_with_a_complete_form, register_needs_an_email_where_connect_does_not, register_refuses_a_nickname_the_registry_could_not_hold, enter_on_register_returns_a_register_action_or_an_error, render_shows_a_registration_notice_in_green_unless_an_error_replaces_it; scenarios features/connecting/connect_form.feature 'The registration fields are always on screen, on any server', 'A server that does not allow registration refuses Register, in red, only when pressed'"
 
 [[user_story.acceptance_criteria]]
 id = "AC-271"
@@ -3151,3 +3151,8 @@ evidence = "docs/PROTOCOL.md 12.2, §3; src/client/contacts.rs ContactRow.device
 id = "AC-323"
 description = "`/contacts`' `a` opens \"Add contact\": a nickname and device id, each validated the same way `DirectPunchTarget::parse` already validates a manually-typed nickname+device pair (non-empty, `is_storable` - no tab/newline field-injection), refused if that exact `(nickname, device_id)` already names a real row. Nothing is ever written to `id_store` from the form alone - only actually adding a key does, so `Esc` at any point leaves nothing behind. Confirming opens the same key-details popup `Enter` on a real row does, marked `ContactKeyDetailState::new_contact`, which changes exactly two things: PQH's \"Create key\" (`UiAction::PinIdentityCardForDevice`, `contacts::pin_identity_card_for_device`) binds directly to the typed device rather than the nickname's shared unbound entry `pin_identity_card` targets, refusing outright if that device is already pinned; and a successful pin never closes the popup, unlike the ordinary per-row flow, since the whole point is adding OTP/OTP mail right after in the same sitting - both already-eligible the moment PQH lands, through the unmodified `install_otp_key` gate every other row already goes through. Fixed alongside this: `ContactsUi::contacts_detail_key_present` used to return `None` (silently doing nothing on `Enter`) whenever the popup's `(nickname, device_id)` matched no row at all - the exact case a brand-new contact is - instead of `Some(false)` (\"not present\"), which is what actually lets `activate_contacts_detail_action` reach \"Create key\"."
 evidence = "docs/SPEC.md 'Connected UI' Contacts description; src/client/tui/contacts.rs AddContactState, AddContactField, ContactKeyDetailState::new_contact, contacts_detail_key_present, handle_contacts_add_key, submit_add_contact, render_add_contact_popup; src/client/contacts.rs pin_identity_card_for_device, handle_pin_identity_card_for_device, load_and_verify_identity_card; src/client/tui/ui.rs UiAction::PinIdentityCardForDevice; tests pin_identity_card_for_device_binds_directly_to_the_typed_device_not_the_unbound_entry, pin_identity_card_for_device_refuses_an_already_pinned_device, pin_identity_card_for_device_leaves_sibling_devices_untouched (contacts_test.rs), a_opens_the_add_contact_popup_focused_on_nickname, tab_cycles_nickname_and_device_id_and_wraps, typing_fills_in_whichever_field_is_focused, submitting_an_empty_nickname_shows_a_validation_error_and_stays_open, submitting_an_empty_device_id_shows_a_validation_error, submitting_an_already_pinned_nickname_and_device_is_refused, valid_nickname_and_device_id_open_the_key_details_popup_as_a_new_contact, esc_on_the_add_contact_popup_cancels_without_creating_anything, selecting_a_card_for_a_new_contact_sends_pinidentitycardfordevice, attempting_otp_before_pqh_on_a_new_contact_opens_the_install_form_not_nothing (ui_contacts_test.rs), adding_a_pqh_key_from_a_new_contact_leaves_the_popup_open_with_the_new_row_visible, a_mismatched_card_shows_an_inline_error_and_pins_nothing, otp_becomes_installable_right_after_pqh_is_added_from_the_same_popup (contacts_add_test.rs)"
+
+[[user_story.acceptance_criteria]]
+id = "AC-324"
+description = "`i` on a channel member in the sidebar (or `/info` inside an open DM room, for that room's peer) opens a read-only user-info popup: nickname, the device this live connection actually announced (`SessionState::peer_device_ids` for a `pq_hybrid` peer, `PeerLinkManager::direct_device_id_of` for a serverless one, `(unbound)` if neither resolves), when they were last seen, and one row per key that genuinely exists for that `(nickname, device_id)` - PQH/OTP/OTP MAIL, each with the same ✅ icon/colour `/contacts`' own badges use and that key's id (PQH's fingerprint, OTP/OTP MAIL's contact name) - never all three with a ✅/❌ badge the way `/contacts`' list does, since a key that doesn't exist gets no row at all. A trailing line names an active `/otp` session, read live (`UiState::is_otp_active`) rather than from the gathered snapshot. Read-only and gated on nothing: works for a trust-gated peer, and never requires them to be reachable, since it is a local `id_store`/keychain lookup (`client::contacts::gather_single_contact_row`, a narrower `gather_contact_rows`). Opened empty (`UiState::open_user_info`) and filled in by the session's answer (`UiAction::RequestUserInfo`, `client::contacts::handle_request_user_info`), the same split `ContactsState::rows` uses; `i`/Esc closes it, absorbing every other key while open, the same tier as the message-details popup."
+evidence = "docs/SPEC.md 'Connected UI' User-info popup description; src/client/contacts.rs gather_single_contact_row, build_contact_row, live_peer_device_id, handle_request_user_info; src/client/tui/contacts.rs UserInfoState, UserInfoKeyRow, key_presence_icon, render_user_info_popup; src/client/tui/ui.rs UiState.user_info, open_user_info, set_user_info, UiAction::RequestUserInfo, handle_sidebar_key's 'i' arm, submit_input's '/info' arm; tests i_on_a_sidebar_member_opens_user_info, i_on_our_own_sidebar_row_does_nothing, esc_closes_the_user_info_popup, i_again_also_closes_it_same_as_message_info, the_popup_absorbs_every_other_key_while_open, slash_info_inside_an_open_dm_opens_the_same_popup, slash_info_with_no_dm_open_does_nothing, slash_info_works_even_for_an_offline_peer, set_user_info_is_a_no_op_for_the_wrong_peer_or_a_closed_popup, the_popup_shows_nickname_device_last_seen_and_every_key, an_unbound_peer_shows_the_placeholder_device, an_active_otp_session_is_named_at_the_end, no_active_otp_session_says_nothing_about_one (ui_user_info_test.rs), a_peer_with_nothing_pinned_gathers_no_keys_and_no_device, only_pqh_present_shows_only_the_pqh_row, a_pinned_and_installed_key_shows_up_with_its_id, a_direct_punch_peers_device_resolves_from_the_link_not_an_announce (user_info_test.rs)"

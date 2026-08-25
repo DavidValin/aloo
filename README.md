@@ -76,7 +76,7 @@ Whatever `--bind`/`--port` you run it with gets saved to `~/.aloo/settings`; a b
 aloo
 ```
 
-This opens a connect screen. Fill in the host/port, a nickname and its password, and press Connect. If the server takes registrations (`server_allow_registration=on`), an email field and a Register button appear too — no account yet? Fill in an email and press Register instead; check that address for a 12-digit activation code, then Connect with the same nickname and password (aloo asks for the code the first time it logs in on an unactivated account). Everything else on that screen has sensible defaults — you don't need to touch it to get started (see `docs/SPEC.md` if you want to know what every field does).
+This opens a connect screen. Fill in the host/port, a nickname and its password, and press Connect. An email field and a Register button are always there too — no account yet? Fill in an email and press Register instead; check that address for a 12-digit activation code, then Connect with the same nickname and password (aloo asks for the code the first time it logs in on an unactivated account). Pressing Register on a server that has `server_allow_registration` off just refuses, in red, telling you so. Everything else on that screen has sensible defaults — you don't need to touch it to get started (see `docs/SPEC.md` if you want to know what every field does).
 
 Your identity type is already set to `pq_hybrid` (PQ-Hybrid, see "Encryption" below) — no need to generate any keys yourself beforehand, aloo creates them automatically the first time you connect.
 
