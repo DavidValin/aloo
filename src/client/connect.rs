@@ -987,7 +987,6 @@ pub fn prefill_connect_defaults(
         popup.nickname = nickname.clone();
     }
     popup.ssl = settings.connect_using_ssl;
-    popup.registration_available = settings.server_allow_registration;
     if let Some((host, port, file_pub, file_priv)) = cache.most_recent() {
         // Only where settings had nothing to say - a hand-edited
         // `connect_host` is a deliberate answer to the same question, and

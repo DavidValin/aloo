@@ -181,16 +181,6 @@ async fn email_field_and_register_button(w: &mut AlooWorld) {
     assert!(rows.iter().any(|r| r.contains("Register")), "{rows:?}");
 }
 
-/// Simulates what `prefill_connect_defaults` does when
-/// `settings.server_allow_registration` is on - set directly on the
-/// popup rather than through a real settings file, the same way
-/// `my_key_points_at_files` sets fields directly.
-#[given("the server allows registration")]
-#[when("the server allows registration")]
-async fn server_allows_registration(w: &mut AlooWorld) {
-    w.popup_mut().registration_available = true;
-}
-
 #[then("the password field is shown masked")]
 async fn password_shown_masked(w: &mut AlooWorld) {
     let state = w.popup.as_ref().expect("no form");

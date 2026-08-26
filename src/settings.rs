@@ -668,14 +668,16 @@ impl Settings {
     }
 
     /// The full, two-section, every-key-named dump `load_or_create` writes
-    /// on a machine's very first run - unlike `save` (the sparse,
-    /// merge-friendly writer every mid-session update goes through), this
-    /// lists every client option, then every server option, each under its
-    /// own `#`-comment header, so a user opening the file for the first
-    /// time finds every knob already there to read and edit rather than
-    /// having to know it exists. Never called again after the first run:
-    /// `save`/`update` take over from there, and `parse` (comment- and
-    /// order-agnostic) reads either shape identically.
+    /// on a machine's very first run - this lists every client option,
+    /// then every server option, each under its own `#`-comment header,
+    /// so a user opening the file for the first time finds every knob
+    /// already there to read and edit rather than having to know it
+    /// exists. Never called again after the first run: every later write
+    /// goes through `save`, which patches this file's own lines in place
+    /// (`patch_into`) rather than regenerating them, so this shape - and
+    /// whatever a user has since hand-edited into it - survives. `parse`
+    /// (comment- and order-agnostic) reads this or `dense_contents`'
+    /// shape identically either way.
     fn scaffold_contents(&self) -> String {
         let mut c = String::new();
         c.push_str("# client options\n# -----------------------------------------\n");
@@ -997,143 +999,310 @@ impl Settings {
 
     /// Persists these settings to `path`, creating parent directories if
     /// needed (e.g. `~/.aloo/` on first run).
+    ///
+    /// Patches `path`'s own existing lines (`patch_into`) rather than
+    /// re-dumping every field in a fixed order, so `load_or_create`'s
+    /// one-time, commented, sectioned `scaffold_contents` survives every
+    /// later write - a connect, `/mute-voice`, a daemon start, `--server`
+    /// recording its bind/port - instead of being flattened into
+    /// `dense_contents`'s dense form on the very first one. That dense
+    /// form still exists, as the fallback for the one case patching can't
+    /// help: nothing to patch because `path` doesn't exist yet (deleted
+    /// out from under a running process, or `save` called without going
+    /// through `load_or_create` first).
     pub fn save(&self, path: &Path) -> io::Result<()> {
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
             fs::create_dir_all(parent)?;
         }
-        let mut contents = format!(
-            "global_ptt_enabled={}\nglobal_ptt_shortcut={}\nserver_bind={}\nserver_port={}\n",
-            self.global_ptt_enabled, self.global_ptt_shortcut, self.server_bind, self.server_port
-        );
-        // Every server key is written even when unset (`server_smtp_host=`),
-        // so an operator setting the server up finds each one already
-        // named in the file rather than having to know it exists.
-        contents.push_str(&format!(
-            "server_ssl={}\nserver_ssl_fullchain={}\nserver_ssl_privkey={}\n",
-            switch(self.server_ssl),
-            self.server_ssl_fullchain,
-            self.server_ssl_privkey
-        ));
-        contents.push_str(&format!(
-            "server_allow_registration={}\n",
-            switch(self.server_allow_registration)
-        ));
-        contents.push_str(&format!(
-            "server_smtp_host={}\nserver_smtp_port={}\nserver_smtp_username={}\nserver_smtp_password={}\n",
-            self.server_smtp_host.as_deref().unwrap_or(""),
-            self.server_smtp_port.map(|p| p.to_string()).unwrap_or_default(),
-            self.server_smtp_username.as_deref().unwrap_or(""),
-            self.server_smtp_password.as_deref().unwrap_or(""),
-        ));
-        contents.push_str(&format!(
-            "server_activation_port={}\nserver_activation_url={}\n",
-            self.server_activation_port,
-            self.server_activation_url.as_deref().unwrap_or("")
-        ));
-        contents.push_str(&format!(
-            "server_allow_create_public_channels={}\nserver_channel_deletion_unactivity_period={}\n",
-            switch(self.server_allow_create_public_channels),
-            self.server_channel_deletion_unactivity_period
-                .map(|p| p.to_string())
-                .unwrap_or_default()
-        ));
-        // One line per admin, same convention as `muted_voice` just below.
-        for name in &self.server_superadmin {
-            if crate::validation::nickname_is_registrable(name) {
-                contents.push_str(&format!("server_superadmin={name}\n"));
-            }
-        }
-        if let Some(bin) = &self.otp_binary_path {
-            contents.push_str(&format!("otp_binary_path={bin}\n"));
-        }
-        contents.push_str(&format!(
-            "otp_keypair_size_mb={}\notp_low_key_warn_pct={}\notp_status_poll_interval={}\n",
-            self.otp_keypair_size_mb, self.otp_low_key_warn_pct, self.otp_status_poll_interval
-        ));
-        // One line per entry, in `BTreeSet` order - see `muted_voice`'s
-        // doc for why this isn't one comma-separated value. A name that
-        // can't round-trip through a line-oriented file is dropped rather
-        // than written, same rule `IdStore::check_and_pin` applies.
-        for name in &self.muted_voice {
-            if crate::validation::is_storable(name) {
-                contents.push_str(&format!("muted_voice={name}\n"));
-            }
-        }
-        contents.push_str(&format!("autosave_messages={}\n", switch(self.autosave_messages)));
-        contents.push_str(&format!("resume_from_log={}\n", switch(self.resume_from_log)));
-        // Daemon keys. Only written when set, so a machine that has never
-        // run a daemon keeps a settings file with nothing daemon-shaped
-        // in it rather than a block of empty values.
-        let mut optional = |key: &str, value: &Option<String>| {
-            if let Some(value) = value
-                && crate::validation::is_storable(value)
-            {
-                contents.push_str(&format!("{key}={value}\n"));
+        let contents = match fs::read_to_string(path) {
+            Ok(existing) => self.patch_into(&existing),
+            Err(_) => self.dense_contents(),
+        };
+        fs::write(path, contents)
+    }
+
+    /// Every "singular", last-wins key this file manages: its current
+    /// value (the blank/off spelling `scaffold_contents` already gives an
+    /// unset optional field - never absent, since an *existing* line for
+    /// one must stay even while it's unset, only not be freshly added),
+    /// and whether a save should add a brand-new line for it when the
+    /// file has none yet. That second half is `false` for exactly the
+    /// optional fields `dense_contents`'s old `optional` helper used to
+    /// skip entirely while unset (daemon/connect/otp_binary_path) - a
+    /// machine that has never run a daemon still keeps nothing
+    /// daemon-shaped in a freshly-`dense_contents`-written file, and
+    /// `patch_into` doesn't invent one either, but if a line already
+    /// exists (typically from `scaffold_contents`, which pre-writes every
+    /// key blank) it is kept and simply written blank, never deleted.
+    fn scalar_fields(&self) -> Vec<(&'static str, String, bool)> {
+        let opt_str = |v: &Option<String>| -> (String, bool) {
+            match v.clone().filter(|v| crate::validation::is_storable(v)) {
+                Some(v) => (v, true),
+                None => (String::new(), false),
             }
         };
-        optional("daemon_host", &self.daemon_host);
-        optional("daemon_nickname", &self.daemon_nickname);
-        optional("daemon_server_password", &self.daemon_server_password);
-        optional("daemon_my_key_pub", &self.daemon_my_key_pub);
-        optional("daemon_my_key_priv", &self.daemon_my_key_priv);
-        optional("daemon_initial_focus", &self.daemon_initial_focus);
-        if let Some(port) = self.daemon_port {
-            contents.push_str(&format!("daemon_port={port}\n"));
-        }
-        for channel in &self.daemon_channels {
-            if crate::validation::is_storable(channel) {
-                contents.push_str(&format!("daemon_channel={channel}\n"));
+        let opt_num = |v: Option<u16>| -> (String, bool) {
+            match v {
+                Some(p) => (p.to_string(), true),
+                None => (String::new(), false),
             }
-        }
-        if self.daemon_otp {
-            contents.push_str("daemon_otp=true\n");
-        }
-        if self.daemon_no_server {
-            contents.push_str("daemon_no_server=true\n");
-        }
-        contents.push_str(&format!(
-            "direct_punch={}\ndirect_punch_port={}\n",
-            if self.direct_punch { "on" } else { "off" },
-            self.direct_punch_port
-        ));
-        for target in &self.direct_punch_to {
-            contents.push_str(&format!("direct_punch_to={}\n", target.to_setting_value()));
-        }
-        for channel in &self.direct_punch_channels {
-            contents.push_str(&format!("direct_punch_channel={channel}\n"));
-        }
-        contents.push_str(&format!(
-            "noip_when_no_server_and_direct_punch_is_active={}\nnoip_hostname={}\nnoip_username={}\nnoip_password={}\n",
-            switch(self.noip_when_no_server_and_direct_punch_is_active),
-            self.noip_hostname,
-            self.noip_username,
-            self.noip_password,
-        ));
-        // Written by hand rather than through `optional` above: that
-        // closure holds a mutable borrow of `contents` for as long as it
-        // is alive, and everything between it and here writes directly.
-        for (key, value) in [
-            ("connect_host", &self.connect_host),
-            ("connect_nickname", &self.connect_nickname),
-        ] {
-            if let Some(value) = value
-                && crate::validation::is_storable(value)
-            {
+        };
+        let (otp_binary_path, has_otp_binary_path) = opt_str(&self.otp_binary_path);
+        let (daemon_host, has_daemon_host) = opt_str(&self.daemon_host);
+        let (daemon_nickname, has_daemon_nickname) = opt_str(&self.daemon_nickname);
+        let (daemon_server_password, has_daemon_server_password) =
+            opt_str(&self.daemon_server_password);
+        let (daemon_my_key_pub, has_daemon_my_key_pub) = opt_str(&self.daemon_my_key_pub);
+        let (daemon_my_key_priv, has_daemon_my_key_priv) = opt_str(&self.daemon_my_key_priv);
+        let (daemon_initial_focus, has_daemon_initial_focus) = opt_str(&self.daemon_initial_focus);
+        let (daemon_port, has_daemon_port) = opt_num(self.daemon_port);
+        let (connect_host, has_connect_host) = opt_str(&self.connect_host);
+        let (connect_nickname, has_connect_nickname) = opt_str(&self.connect_nickname);
+        let (connect_port, has_connect_port) = opt_num(self.connect_port);
+        let (connect_ssl_ca, has_connect_ssl_ca) = opt_str(&self.connect_ssl_ca);
+        vec![
+            ("global_ptt_enabled", self.global_ptt_enabled.to_string(), true),
+            ("global_ptt_shortcut", self.global_ptt_shortcut.clone(), true),
+            ("server_bind", self.server_bind.clone(), true),
+            ("server_port", self.server_port.to_string(), true),
+            ("server_ssl", switch(self.server_ssl).to_string(), true),
+            ("server_ssl_fullchain", self.server_ssl_fullchain.clone(), true),
+            ("server_ssl_privkey", self.server_ssl_privkey.clone(), true),
+            (
+                "server_allow_registration",
+                switch(self.server_allow_registration).to_string(),
+                true,
+            ),
+            // Every server key is written even when unset, so an operator
+            // setting the server up finds each one already named in the
+            // file rather than having to know it exists.
+            ("server_smtp_host", self.server_smtp_host.clone().unwrap_or_default(), true),
+            (
+                "server_smtp_port",
+                self.server_smtp_port.map(|p| p.to_string()).unwrap_or_default(),
+                true,
+            ),
+            (
+                "server_smtp_username",
+                self.server_smtp_username.clone().unwrap_or_default(),
+                true,
+            ),
+            (
+                "server_smtp_password",
+                self.server_smtp_password.clone().unwrap_or_default(),
+                true,
+            ),
+            ("server_activation_port", self.server_activation_port.to_string(), true),
+            (
+                "server_activation_url",
+                self.server_activation_url.clone().unwrap_or_default(),
+                true,
+            ),
+            (
+                "server_allow_create_public_channels",
+                switch(self.server_allow_create_public_channels).to_string(),
+                true,
+            ),
+            (
+                "server_channel_deletion_unactivity_period",
+                self.server_channel_deletion_unactivity_period
+                    .map(|p| p.to_string())
+                    .unwrap_or_default(),
+                true,
+            ),
+            ("otp_keypair_size_mb", self.otp_keypair_size_mb.to_string(), true),
+            ("otp_low_key_warn_pct", self.otp_low_key_warn_pct.to_string(), true),
+            ("otp_status_poll_interval", self.otp_status_poll_interval.to_string(), true),
+            ("autosave_messages", switch(self.autosave_messages).to_string(), true),
+            ("resume_from_log", switch(self.resume_from_log).to_string(), true),
+            ("direct_punch", switch(self.direct_punch).to_string(), true),
+            ("direct_punch_port", self.direct_punch_port.to_string(), true),
+            (
+                "noip_when_no_server_and_direct_punch_is_active",
+                switch(self.noip_when_no_server_and_direct_punch_is_active).to_string(),
+                true,
+            ),
+            ("noip_hostname", self.noip_hostname.clone(), true),
+            ("noip_username", self.noip_username.clone(), true),
+            ("noip_password", self.noip_password.clone(), true),
+            ("connect_using_ssl", switch(self.connect_using_ssl).to_string(), true),
+            // Optional - only ever added to the file once actually set.
+            ("otp_binary_path", otp_binary_path, has_otp_binary_path),
+            ("daemon_host", daemon_host, has_daemon_host),
+            ("daemon_nickname", daemon_nickname, has_daemon_nickname),
+            ("daemon_server_password", daemon_server_password, has_daemon_server_password),
+            ("daemon_my_key_pub", daemon_my_key_pub, has_daemon_my_key_pub),
+            ("daemon_my_key_priv", daemon_my_key_priv, has_daemon_my_key_priv),
+            ("daemon_initial_focus", daemon_initial_focus, has_daemon_initial_focus),
+            ("daemon_port", daemon_port, has_daemon_port),
+            ("daemon_otp", self.daemon_otp.to_string(), self.daemon_otp),
+            ("daemon_no_server", switch(self.daemon_no_server).to_string(), self.daemon_no_server),
+            ("connect_host", connect_host, has_connect_host),
+            ("connect_nickname", connect_nickname, has_connect_nickname),
+            ("connect_port", connect_port, has_connect_port),
+            ("connect_ssl_ca", connect_ssl_ca, has_connect_ssl_ca),
+        ]
+    }
+
+    /// Every accumulating (one-line-per-entry) key this file manages, and
+    /// the full list of lines it should have right now, in the order
+    /// they should appear - `BTreeSet` order for `server_superadmin` and
+    /// `muted_voice`, file/insertion order for the rest, matching
+    /// `dense_contents`/`parse` exactly. An entry that can't round-trip
+    /// through a line-oriented file is dropped rather than written, same
+    /// rule `IdStore::check_and_pin` applies.
+    fn accumulating_fields(&self) -> Vec<(&'static str, Vec<String>)> {
+        vec![
+            (
+                "server_superadmin",
+                self.server_superadmin
+                    .iter()
+                    .filter(|n| crate::validation::nickname_is_registrable(n))
+                    .cloned()
+                    .collect(),
+            ),
+            (
+                "muted_voice",
+                self.muted_voice
+                    .iter()
+                    .filter(|n| crate::validation::is_storable(n))
+                    .cloned()
+                    .collect(),
+            ),
+            (
+                "daemon_channel",
+                self.daemon_channels
+                    .iter()
+                    .filter(|c| crate::validation::is_storable(c))
+                    .cloned()
+                    .collect(),
+            ),
+            (
+                "direct_punch_to",
+                self.direct_punch_to.iter().map(DirectPunchTarget::to_setting_value).collect(),
+            ),
+            ("direct_punch_channel", self.direct_punch_channels.clone()),
+        ]
+    }
+
+    /// The full, fixed-order, no-comments dump every `save` used to
+    /// write unconditionally - kept as `save`'s fallback for when there
+    /// is no existing file for `patch_into` to work from.
+    fn dense_contents(&self) -> String {
+        let mut contents = String::new();
+        for (key, value, add_when_missing) in self.scalar_fields() {
+            if add_when_missing {
                 contents.push_str(&format!("{key}={value}\n"));
             }
         }
-        if let Some(port) = self.connect_port {
-            contents.push_str(&format!("connect_port={port}\n"));
+        for (key, values) in self.accumulating_fields() {
+            for value in values {
+                contents.push_str(&format!("{key}={value}\n"));
+            }
         }
-        contents.push_str(&format!("connect_using_ssl={}\n", switch(self.connect_using_ssl)));
-        if let Some(ca) = &self.connect_ssl_ca
-            && crate::validation::is_storable(ca)
-        {
-            contents.push_str(&format!("connect_ssl_ca={ca}\n"));
+        contents
+    }
+
+    /// Rewrites `existing`'s own lines in place - preserving every
+    /// comment, blank line, section header and the file's own key order
+    /// - replacing only the value half of a line whose key this struct
+    /// manages (blank/off if that field is now unset - an existing line
+    /// is never deleted just because the value it holds went back to
+    /// nothing, see `scalar_fields`), and appending a line (grouped at
+    /// the end, since there is no section header to slot it under) for a
+    /// managed key that has no line yet *and* currently has a real value
+    /// to write. A key this build doesn't recognize at all - an older or
+    /// newer field, or a typo - is left exactly as found, the same
+    /// tolerance `parse` already gives it.
+    ///
+    /// An accumulating key reuses its existing lines positionally: the
+    /// Nth existing line becomes the Nth desired value, existing lines
+    /// beyond the desired count are dropped, and desired values beyond
+    /// what already had a line are inserted right after the last one
+    /// that did (or appended at the end, same as a scalar, if the key
+    /// had no lines at all).
+    fn patch_into(&self, existing: &str) -> String {
+        let scalars = self.scalar_fields();
+        let accumulating = self.accumulating_fields();
+
+        // How many times each accumulating key already appears, decided
+        // up front so the main pass below can recognize "this is the
+        // last occurrence" without a lookahead.
+        let mut total_occurrences: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        for line in existing.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            if let Some((key, _)) = trimmed.split_once('=') {
+                let key = key.trim();
+                if accumulating.iter().any(|(k, _)| *k == key) {
+                    *total_occurrences.entry(key).or_insert(0) += 1;
+                }
+            }
         }
-        fs::write(path, contents)
+
+        let mut seen_scalar: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut acc_seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        let mut out: Vec<String> = Vec::new();
+
+        for line in existing.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                out.push(line.to_string());
+                continue;
+            }
+            let Some((raw_key, _)) = trimmed.split_once('=') else {
+                out.push(line.to_string());
+                continue;
+            };
+            let key = raw_key.trim();
+
+            if let Some((_, value, _)) = scalars.iter().find(|(k, _, _)| *k == key) {
+                seen_scalar.insert(key);
+                out.push(format!("{key}={value}"));
+                continue;
+            }
+
+            if let Some((_, desired)) = accumulating.iter().find(|(k, _)| *k == key) {
+                let this_idx = *acc_seen.get(key).unwrap_or(&0);
+                acc_seen.insert(key, this_idx + 1);
+                if this_idx < desired.len() {
+                    out.push(format!("{key}={}", desired[this_idx]));
+                }
+                // else: more existing lines than desired values - drop it.
+                let is_last = this_idx + 1 == *total_occurrences.get(key).unwrap_or(&0);
+                if is_last && desired.len() > this_idx + 1 {
+                    for extra in &desired[this_idx + 1..] {
+                        out.push(format!("{key}={extra}"));
+                    }
+                }
+                continue;
+            }
+
+            // Not a key this build manages - left exactly as found.
+            out.push(line.to_string());
+        }
+
+        for (key, value, add_when_missing) in &scalars {
+            if !seen_scalar.contains(key) && *add_when_missing {
+                out.push(format!("{key}={value}"));
+            }
+        }
+        for (key, desired) in &accumulating {
+            if !total_occurrences.contains_key(key) {
+                for v in desired {
+                    out.push(format!("{key}={v}"));
+                }
+            }
+        }
+
+        let mut result = out.join("\n");
+        result.push('\n');
+        result
     }
 
     /// Records the keybundle a daemon connects with, so a later bare

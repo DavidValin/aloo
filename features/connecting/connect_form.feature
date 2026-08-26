@@ -117,7 +117,6 @@ Feature: Filling in the connect form
   @AC-270
   Scenario: Register needs an email that Connect does not
     Given the connect form is open
-    And the server allows registration
     And the connect form is filled in with valid details
     When I focus the "Register" field
     Then registering is refused with an error mentioning "email"
@@ -129,22 +128,12 @@ Feature: Filling in the connect form
   @AC-270 @AC-271
   Scenario: A successful registration opens the activation popup directly
     Given the connect form is open
-    And the server allows registration
     And the connect form is filled in with valid details
     When I focus the "email" field
     And I type "dave@example.com" into the form
     And I focus the "Register" field
     Then registering begins with the email I entered
     And a successful registration opens the activation popup with "Enter the activation code you received by email"
-
-  @AC-270
-  Scenario: A server that does not allow registration refuses Register, in red, only when pressed
-    Given the connect form is open
-    And the connect form is filled in with valid details
-    When I focus the "email" field
-    And I type "dave@example.com" into the form
-    And I focus the "Register" field
-    Then registering is refused with an error mentioning "does not accept registrations"
 
   @AC-009
   Scenario: Escape abandons the form

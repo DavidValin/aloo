@@ -456,22 +456,109 @@ fn a_blank_line_separates_the_client_and_server_sections() {
     std::fs::remove_file(&path).ok();
 }
 
-/// The scaffold is only ever written once, on first run - a mid-session
-/// write (`save`/`update`, used by every ordinary action) must stay the
-/// sparse, unsectioned shape it always was, or every existing caller
-/// (`/mute-voice`, `remember_connection`, ...) would start emitting a full
-/// commented file on every ordinary save.
+/// The scaffold is only ever *written* once, on first run - but a
+/// mid-session write (`save`/`update`, used by every ordinary action)
+/// patches that file's own lines in place rather than regenerating it, so
+/// its section comments, blank lines and key order survive every
+/// ordinary save (`/mute-voice`, `remember_connection`, `--server`
+/// recording its bind/port, ...) instead of being flattened away the
+/// first time any of them runs.
 /// @requirement AC-356
 #[test]
-fn an_ordinary_save_after_the_first_run_does_not_add_section_comments() {
+fn an_ordinary_save_after_the_first_run_preserves_the_scaffolds_comments_and_order() {
     let path = temp_settings_path();
     Settings::load_or_create(&path).unwrap();
+    let before = std::fs::read_to_string(&path).unwrap();
+
     Settings::update(&path, |s| s.global_ptt_enabled = false).unwrap();
+    let after = std::fs::read_to_string(&path).unwrap();
+
+    assert!(
+        after.contains("# client options") && after.contains("# server options"),
+        "an ordinary update must not strip the scaffold's section comments: {after}"
+    );
+    assert!(
+        after.contains("\n\n# server options"),
+        "the blank line between sections must survive too: {after}"
+    );
+    // Every line is byte-identical to the scaffold except the one whose
+    // value actually changed - patched in place, not regenerated.
+    let before_lines: Vec<&str> = before.lines().collect();
+    let after_lines: Vec<&str> = after.lines().collect();
+    assert_eq!(
+        before_lines.len(),
+        after_lines.len(),
+        "no line should be added or removed by this edit: before={before:?} after={after:?}"
+    );
+    let changed: Vec<(&str, &str)> = before_lines
+        .into_iter()
+        .zip(after_lines)
+        .filter(|(b, a)| b != a)
+        .collect();
+    assert_eq!(
+        changed,
+        vec![("global_ptt_enabled=true", "global_ptt_enabled=false")],
+        "only the edited key's line should differ: before={before:?} after={after:?}"
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// The exact sequence a real machine goes through: `--server` starts
+/// (recording its resolved bind/port, `run_server`'s own `settings.save`),
+/// then later a daemon connects and records a real `daemon_host` in what
+/// the scaffold pre-wrote as a blank placeholder line. Both writes must
+/// land as in-place edits of their own existing line - not appended
+/// duplicates, and not a reason to lose the file's structure - which is
+/// what an operator hand-editing `server_superadmin`/`server_ssl_*`
+/// between those two writes needs to survive.
+/// @requirement AC-356
+#[test]
+fn server_start_then_a_daemon_connect_both_patch_in_place_on_the_scaffold() {
+    let path = temp_settings_path();
+    Settings::load_or_create(&path).unwrap();
+
+    // Mirrors `main.rs::run_server`: load, resolve bind/port, save.
+    Settings::update(&path, |s| {
+        s.server_bind = "203.0.113.5".to_string();
+        s.server_port = 6667;
+    })
+    .unwrap();
+    // An operator hand-edits the file in between, exactly the kind of
+    // edit this whole feature exists to protect.
+    {
+        let mut contents = std::fs::read_to_string(&path).unwrap();
+        contents = contents.replace("server_allow_registration=off", "server_allow_registration=on");
+        std::fs::write(&path, contents).unwrap();
+    }
+
+    // Mirrors a daemon start recording its resolved keybundle/host.
+    Settings::update(&path, |s| {
+        s.daemon_host = Some("chat.example.com".to_string());
+    })
+    .unwrap();
+
     let contents = std::fs::read_to_string(&path).unwrap();
     assert!(
-        !contents.contains('#'),
-        "a plain `update`/`save` must not scaffold section comments: {contents}"
+        contents.contains("# client options") && contents.contains("# server options"),
+        "structure must still be there after both writes: {contents}"
     );
+    assert_eq!(
+        contents.matches("daemon_host=").count(),
+        1,
+        "the placeholder line must be reused, not duplicated: {contents}"
+    );
+    assert!(contents.contains("daemon_host=chat.example.com"), "{contents}");
+    assert!(
+        contents.contains("server_allow_registration=on"),
+        "the hand-edit between the two writes must survive: {contents}"
+    );
+
+    let reloaded = Settings::load_or_create(&path).unwrap();
+    assert_eq!(reloaded.server_bind, "203.0.113.5");
+    assert_eq!(reloaded.server_port, 6667);
+    assert!(reloaded.server_allow_registration);
+    assert_eq!(reloaded.daemon_host.as_deref(), Some("chat.example.com"));
+
     std::fs::remove_file(&path).ok();
 }
 

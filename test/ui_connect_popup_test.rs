@@ -27,25 +27,21 @@ fn type_str(state: &mut ConnectPopupState, s: &str) {
 /// information now, not something to tab to.
 /// @requirement TB-002, TB-003, AC-270
 #[test]
-fn focus_order_lists_every_field_once_regardless_of_registration_availability() {
-    for registration_available in [false, true] {
-        let mut state = ConnectPopupState::new();
-        state.registration_available = registration_available;
-        let order = state.focus_order();
-        assert_eq!(
-            order,
-            vec![
-                Field::Host,
-                Field::Port,
-                Field::Nickname,
-                Field::Password,
-                Field::Email,
-                Field::Connect,
-                Field::Register,
-            ],
-            "registration_available ({registration_available}) no longer changes the focus order at all"
-        );
-    }
+fn focus_order_lists_every_field_once() {
+    let state = ConnectPopupState::new();
+    let order = state.focus_order();
+    assert_eq!(
+        order,
+        vec![
+            Field::Host,
+            Field::Port,
+            Field::Nickname,
+            Field::Password,
+            Field::Email,
+            Field::Connect,
+            Field::Register,
+        ],
+    );
 }
 
 /// @requirement TB-004
@@ -312,7 +308,6 @@ fn build_request_maps_the_form_onto_a_connect_request() {
 #[test]
 fn register_needs_an_email_where_connect_does_not() {
     let mut state = ConnectPopupState::new();
-    state.registration_available = true;
     state.host = "localhost".into();
     state.port = "9000".into();
     state.nickname = "dave".into();
@@ -348,7 +343,6 @@ fn register_needs_an_email_where_connect_does_not() {
 #[test]
 fn register_refuses_a_nickname_the_registry_could_not_hold() {
     let mut state = ConnectPopupState::new();
-    state.registration_available = true;
     state.host = "localhost".into();
     state.port = "9000".into();
     state.nickname = "da/ve".into();
@@ -362,7 +356,6 @@ fn register_refuses_a_nickname_the_registry_could_not_hold() {
 #[test]
 fn enter_on_register_returns_a_register_action_or_an_error() {
     let mut state = ConnectPopupState::new();
-    state.registration_available = true;
     state.focus = Field::Register;
     assert_eq!(state.handle_key(KeyCode::Enter).unwrap(), Action::None);
     assert!(state.error.is_some(), "an empty form is refused with a reason");
@@ -376,28 +369,6 @@ fn enter_on_register_returns_a_register_action_or_an_error() {
         Action::Register(req) => assert_eq!(req.email, "dave@example.com"),
         other => panic!("expected Register, got {other:?}"),
     }
-}
-
-/// Register and its email field are always on screen and always
-/// reachable now, regardless of `registration_available` - a server that
-/// refuses registration says so, in red, only when Register is actually
-/// pressed, not by hiding either.
-/// @requirement AC-270
-#[test]
-fn pressing_register_when_unavailable_is_refused_in_red_even_with_a_complete_form() {
-    let mut state = ConnectPopupState::new();
-    assert!(!state.registration_available, "off unless settings said otherwise");
-    state.host = "chat.example.com".into();
-    state.port = "6667".into();
-    state.nickname = "dave".into();
-    state.password = "hunter2".into();
-    state.email = "dave@example.com".into();
-    state.focus = Field::Register;
-
-    let action = state.handle_key(KeyCode::Enter).unwrap();
-    assert_eq!(action, Action::None, "never connects/registers on a server that cannot take it");
-    let err = state.error.as_deref().expect("a reason must be shown");
-    assert!(err.contains("does not accept registrations"), "{err}");
 }
 
 /// @requirement AC-084, TB-006
@@ -742,25 +713,17 @@ fn rows_of(state: &ConnectPopupState) -> Vec<String> {
         .collect()
 }
 
-/// The Register button and the email field are always rendered now,
-/// regardless of `registration_available` - only pressing Register on a
-/// server that cannot take it is refused (`build_register_request`).
+/// The Register button and the email field are always rendered, on every
+/// server - whether registration is actually open is answered by the
+/// server itself when Register is pressed (`register_account`), never by
+/// hiding either field.
 /// @requirement AC-270
 #[test]
-fn register_button_and_email_field_always_show_regardless_of_registration_availability() {
-    for registration_available in [false, true] {
-        let mut state = ConnectPopupState::new();
-        state.registration_available = registration_available;
-        let rows = rows_of(&state);
-        assert!(
-            rows.iter().any(|row| row.contains("Register")),
-            "registration_available={registration_available}: {rows:?}"
-        );
-        assert!(
-            rows.iter().any(|row| row.contains("email")),
-            "registration_available={registration_available}: {rows:?}"
-        );
-    }
+fn register_button_and_email_field_always_show() {
+    let state = ConnectPopupState::new();
+    let rows = rows_of(&state);
+    assert!(rows.iter().any(|row| row.contains("Register")), "{rows:?}");
+    assert!(rows.iter().any(|row| row.contains("email")), "{rows:?}");
 }
 
 /// The hint line shows an error in red, else a notice in green, else the
@@ -789,6 +752,30 @@ fn render_shows_a_registration_notice_in_green_unless_an_error_replaces_it() {
     state.error = Some("registration failed".into());
     assert_eq!(hint_cells(&state, "registration failed"), Some(Color::Red));
     assert_eq!(hint_cells(&state, "registered -"), None, "the error replaces the notice");
+}
+
+/// An SSL-mismatch diagnosis (`connect::with_ssl_diagnosis`) composes the
+/// connect failure with a second sentence naming the exact setting to
+/// flip, well past what one 64-column row can hold - it must wrap onto
+/// the hint area's later rows rather than being silently clipped, or the
+/// one piece of text that actually explains the failure never reaches
+/// the user.
+/// @requirement AC-270
+#[test]
+fn a_long_ssl_mismatch_error_wraps_instead_of_being_clipped() {
+    let mut state = ConnectPopupState::new();
+    state.error = Some(
+        "connect to chat.example.com:7878 timed out after 15s - this server appears to \
+         require SSL - turn connect_using_ssl=on in ~/.aloo/settings"
+            .to_string(),
+    );
+    let rows = rows_of(&state).join("\n");
+    // Checked as separate substrings, not one contiguous string: word-wrap
+    // is free to break the line anywhere between them, and only *that* -
+    // not the exact break point - is what a real terminal would also do.
+    for needle in ["require SSL", "connect_using_ssl=on", "~/.aloo/settings"] {
+        assert!(rows.contains(needle), "{needle:?} missing from wrapped hint: {rows:?}");
+    }
 }
 
 /// The keyboard-shortcut hint is the last thing in the popup's own layout
@@ -996,8 +983,7 @@ fn popup_opens_with_the_cursor_focused_in_the_host_box() {
 /// @requirement AC-002
 #[test]
 fn host_port_and_nickname_are_each_individually_bordered() {
-    let mut state = ConnectPopupState::new();
-    state.registration_available = true; // so the email box is on screen too
+    let state = ConnectPopupState::new();
     let backend = TestBackend::new(80, 30);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal.draw(|f| render(f, &state)).unwrap();

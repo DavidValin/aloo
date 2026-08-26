@@ -15,7 +15,7 @@ use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::widgets::{Block, Borders, Paragraph, Widget};
+use ratatui::widgets::{Block, Borders, Paragraph, Widget, Wrap};
 
 use super::ui::{centered_rect, focus_border_style};
 use crate::client::connect::{ConnectRequest, MyKeySelection, RegisterRequest};
@@ -95,13 +95,6 @@ pub struct ConnectPopupState {
     /// captured once when the popup opens and carried silently into the
     /// built request, the same way `ssl_ca` already is.
     pub ssl: bool,
-    /// Whether this server takes registrations at all
-    /// (`server_allow_registration`), captured once from local settings
-    /// when the popup opens. The email field and the Register button are
-    /// always shown and always focusable regardless - only pressing
-    /// Register while this is false is refused, in red, the same way any
-    /// other invalid submission is (`build_register_request`).
-    pub registration_available: bool,
     /// Never editable here - shown read-only, alongside `aloo_home` below.
     pub my_key: MyKeyFields,
     /// The `ALOO_HOME` this process actually resolved
@@ -140,7 +133,6 @@ impl ConnectPopupState {
             password: String::new(),
             email: String::new(),
             ssl: false,
-            registration_available: false,
             my_key: MyKeyFields::default(),
             aloo_home: crate::platform::aloo_dir().display().to_string(),
             focus: Field::Host,
@@ -151,8 +143,9 @@ impl ConnectPopupState {
     }
 
     /// Every focusable field, in Tab order. `email`/`Register` are always
-    /// included - `registration_available` no longer hides either; it only
-    /// decides what pressing Register actually does.
+    /// included, on every server - whether registration is actually open
+    /// is the server's answer to the `Register` attempt itself, not
+    /// something this form hides fields over.
     pub fn focus_order(&self) -> Vec<Field> {
         vec![
             Field::Host,
@@ -302,18 +295,16 @@ impl ConnectPopupState {
     }
 
     /// Register needs everything Connect does except the keybundle, plus
-    /// a plausible email to send the activation code to. Checked first,
-    /// ahead of every field validation below: the email/Register field and
-    /// button are always on screen now regardless of
-    /// `registration_available` (`server_allow_registration`), so this is
-    /// the one place left that actually refuses a registration this
-    /// server won't accept - in red, the same as any other invalid
-    /// submission, rather than a network round trip that would only fail
-    /// the same way server-side.
+    /// a plausible email to send the activation code to. Whether *this*
+    /// server actually takes registrations is deliberately not checked
+    /// here: `server_allow_registration` lives in `~/.aloo/settings` on
+    /// whichever machine runs `--server`, which has nothing to do with
+    /// the machine running this popup - the two are almost always
+    /// different computers. The server's `Hello.registration_open`
+    /// (`crate::client::connect::register_account`) is the only thing
+    /// that actually knows the answer, so this only validates the form's
+    /// own fields and lets the real attempt fail server-side when it must.
     pub fn build_register_request(&self) -> Result<RegisterRequest, String> {
-        if !self.registration_available {
-            return Err("this server does not accept registrations right now".to_string());
-        }
         let port = self.validate_common()?;
         if self.email.trim().is_empty() {
             return Err("email is required to register".to_string());
@@ -600,9 +591,10 @@ pub fn render(frame: &mut Frame, state: &ConnectPopupState) {
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
-    // A fixed layout now - the email field and both buttons are always on
-    // screen, regardless of `registration_available` (only pressing
-    // Register on an unavailable server is refused, not the field hidden).
+    // A fixed layout - the email field and both buttons are always on
+    // screen, on every server: whether registration is actually open is
+    // for the server to answer when Register is pressed, not something
+    // this form knows in advance.
     let constraints = [
         Constraint::Length(3), // host + port (same row)
         Constraint::Length(3), // nickname
@@ -618,7 +610,11 @@ pub fn render(frame: &mut Frame, state: &ConnectPopupState) {
         Constraint::Min(0),    // flexible spacer - absorbs whatever room is left, so
                                 // the hint row below lands flush on the popup's last
                                 // line instead of floating right under the buttons
-        Constraint::Length(1), // error / hint
+        // 3 rows and wrapped (below): an SSL-mismatch diagnosis
+        // (`with_ssl_diagnosis`) composes the connect failure with a
+        // second sentence naming the exact setting to flip, easily past
+        // 100 characters - one unwrapped row silently clipped it.
+        Constraint::Length(3), // error / hint
     ];
     let email_idx = 3;
     let file_pub_idx = 6;
@@ -746,7 +742,8 @@ pub fn render(frame: &mut Frame, state: &ConnectPopupState) {
     frame.render_widget(
         Paragraph::new(hint)
             .style(hint_style)
-            .alignment(Alignment::Center),
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true }),
         chunks[hint_idx],
     );
 }
