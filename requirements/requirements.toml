@@ -86,7 +86,7 @@ evidence = "docs/SPEC.md 'Not connected UI'; src/client/tui/ui_connect_popup.rs 
 
 [[user_story.acceptance_criteria]]
 id = "AC-269"
-description = "The connect popup carries a password field, masked as asterisks, accepting any character, never remembered between runs - login is always a nickname and its password. ssl is not a popup field at all - like server_ssl on the server side, it is settings-only (connect_ssl); the popup only ever captures whatever that setting said when it opened and carries it silently into the built request, with no key anywhere in the popup able to change it."
+description = "The connect popup carries a password field, masked as asterisks, accepting any character, never remembered between runs - login is always a nickname and its password. ssl is not a popup field at all - like server_ssl on the server side, it is settings-only (connect_using_ssl); the popup only ever captures whatever that setting said when it opened and carries it silently into the built request, with no key anywhere in the popup able to change it."
 evidence = "docs/SPEC.md 'Not connected UI'; src/client/tui/ui_connect_popup.rs Field::Password, ConnectPopupState::ssl; tests password_field_takes_any_character_and_backspaces, the_password_is_rendered_masked, ssl_is_settings_only_and_cannot_be_toggled_from_the_popup, build_request_rejects_a_missing_password"
 
 [[user_story.acceptance_criteria]]
@@ -301,13 +301,18 @@ evidence = "docs/PROTOCOL.md 1.4; src/server/ssl.rs SslFiles, load_acceptor, acc
 
 [[user_story.acceptance_criteria]]
 id = "AC-263"
-description = "A client trusts the public roots it ships with plus, optionally, one PEM file of extra roots (connect_ssl_ca) for a self-signed or privately issued server certificate; the certificate is checked against the host the user typed. The daemon (--ssl / daemon_ssl) and the connect popup (its ssl switch, remembered as connect_ssl) each carry this choice through to the same connect path."
-evidence = "docs/PROTOCOL.md 1.4; src/server/ssl.rs client_connector, connector_from_roots, server_name; src/client/connect.rs open_control_channel; src/client/daemon.rs DaemonConfig; tests connector_from_roots_rejects_an_unparsable_extra_ca_file, server_name_accepts_a_hostname_and_an_ip_and_refuses_the_empty_string, ssl_switch_defaults_off_and_flips_with_left_right_or_enter"
+description = "A client trusts the public roots it ships with plus, optionally, one PEM file of extra roots (connect_ssl_ca) for a self-signed or privately issued server certificate; the certificate is checked against the host the user typed. `connect_using_ssl` - the one setting for this, shared by a normal connect and a daemon start, with no popup field and no CLI flag able to override it - carries this choice through to the same connect path either way."
+evidence = "docs/PROTOCOL.md 1.4; src/server/ssl.rs client_connector, connector_from_roots, server_name; src/client/connect.rs open_control_channel; src/client/daemon.rs DaemonConfig; tests connector_from_roots_rejects_an_unparsable_extra_ca_file, server_name_accepts_a_hostname_and_an_ip_and_refuses_the_empty_string, ssl_is_settings_only_and_cannot_be_toggled_from_the_popup (ui_connect_popup_test.rs), ssl_comes_only_from_the_settings_file (daemon_test.rs)"
 
 [[user_story.acceptance_criteria]]
 id = "AC-261"
-description = "A daemon connects over TLS when told to (--ssl, or daemon_ssl=on remembered from a previous run) and otherwise over plain TCP; either way the choice is carried into the same ConnectRequest a foreground client builds, so the handshake itself is shared rather than reimplemented for headless use."
-evidence = "src/client/daemon.rs DaemonConfig::resolve, to_connect_request; tests ssl_comes_from_the_flag_or_the_settings_file, the_daemon_connects_with_the_resolved_password"
+description = "A daemon connects over TLS when `connect_using_ssl=on` and otherwise over plain TCP - the only place this is decided for a daemon start, with no `--ssl` flag able to override it; either way the choice is carried into the same ConnectRequest a foreground client builds, so the handshake itself is shared rather than reimplemented for headless use."
+evidence = "src/client/daemon.rs DaemonConfig::resolve, to_connect_request; tests ssl_comes_only_from_the_settings_file, the_daemon_connects_with_the_resolved_password"
+
+[[user_story.acceptance_criteria]]
+id = "AC-365"
+description = "`connect_with_reconnect`'s own first connect attempt (never a later automatic reconnect) is bounded by `CONNECT_TIMEOUT` (15s) - a client that skips TLS against an SSL-only server, or the reverse, does not fail cleanly on its own, it deadlocks (the server's TLS accept waits for a `ClientHello` that never comes; the client waits for a `Hello` that never comes either), so this is what actually resolves it. Whether the attempt fails outright or times out, and the reason is not already meaningful on its own (not a wrong password, a taken nickname, a deactivated account, or a pending activation code - reaching any of those already proves the transport mode was right), `with_ssl_diagnosis` makes one further bounded-time (~4s, `SSL_DIAGNOSIS_TIMEOUT`) diagnostic attempt at the same host/port with the opposite of `connect_using_ssl`, purely to explain the failure - never to actually connect that way. If that opposite attempt gets a real `Hello` back, the original error is wrapped in a distinct `SslMismatchError` naming a specific reason (\"this server appears to require SSL\" / \"...appears to reject SSL\", naming `connect_using_ssl`) - the connect popup catches it by type and loops back into the form with the reason shown in red (the same way a wrong password already does), rather than exiting the client the way an unclassified connect failure still does; a daemon start just propagates it and fails with the same reason. If the opposite attempt also fails, the original error is returned unchanged. The real session that follows, if any, always uses exactly what `connect_using_ssl` said - never the probed alternative."
+evidence = "src/client/connect.rs connect_with_reconnect, with_ssl_diagnosis, diagnose_ssl_mismatch, SslMismatchError, CONNECT_TIMEOUT, SSL_DIAGNOSIS_TIMEOUT; tests a_plain_attempt_against_an_ssl_only_server_is_diagnosed, an_ssl_attempt_against_a_plain_server_is_diagnosed, a_password_failure_is_never_probed_for_an_ssl_mismatch (reconnect_test.rs)"
 
 [[user_story.technical_behavior]]
 id = "TB-241"
@@ -3386,3 +3391,118 @@ evidence = "src/proto.rs AuthResult.deactivated; src/server/users_registry.rs Us
 id = "TB-264"
 description = "No kick primitive exists anywhere in this server, before or after this feature - a live deactivation is handled entirely by the client's own reaction to AccountDeactivated (the modal), not a server-initiated disconnect. Escape on that modal answers through the same UiAction::Quit mechanism Detach already uses to end the input loop, relying on the same implicit process-exit cleanup that already reclaims the UDP socket and closes the control connection for an ordinary quit - no new teardown path was added."
 evidence = "src/client/tui/ui.rs UiState::handle_key's account_deactivated tier, UiAction::Quit; src/client/session.rs's Quit arm; tests escape_on_the_deactivated_modal_sends_quit, the_account_deactivated_modal_absorbs_every_key_but_escape (ui_test.rs)"
+
+# ============================================================================
+# US-053 - Autosaving chat/voice history to disk
+# ============================================================================
+[[user_story]]
+id = "US-053"
+title = "Autosaving chat/voice history to disk"
+as_a = "user who wants a durable record of their conversations"
+i_want = "aloo to keep appending every channel/DM message, including voice, to a plain-text log on disk as it happens"
+so_that = "the history survives past this one session without me having to do anything"
+
+[[user_story.acceptance_criteria]]
+id = "AC-352"
+description = "Every export path lives under `~/.aloo/exports/<server>/{channels,dms}/`, `<server>` being `sanitize(host)_port` for a real connection or the literal `DIRECT` for a `--no-server` session - set once, for the whole session, in `UiState.server_label` (`session::run_connected_session`/`run_daemon_session`, threaded from `connect.rs`'s two connect paths and `daemon.rs`'s serverless branch). A DM peer's nickname (unlike a channel name) is not already filesystem-safe, so it - and the host - are sanitized (ASCII alnum/`-`/`_`/`.` kept, everything else replaced with `_`) before becoming a path component."
+evidence = "src/client/export.rs server_label, sanitize_component, exports_root, Surface, surface_dir; src/client/tui/ui.rs UiState.server_label; src/client/session.rs run_connected_session/run_daemon_session; src/client/connect.rs, src/client/daemon.rs call sites; tests server_label_combines_a_sanitized_host_and_the_port, a_dm_peer_name_with_unsafe_characters_is_sanitized_into_the_filename (export_test.rs)"
+
+[[user_story.acceptance_criteria]]
+id = "AC-353"
+description = "With `autosave_messages=on`, every log entry that reaches a channel/DM's visible scrollback (text, voice, file-transfer notices, system/presence lines - not just chat text) is appended, as it happens, as one line to that surface's `.log` file: `[<utc timestamp>] <arrow> <name>: <content>` for a directed entry (`->`/`<-` by direction) or `[<utc timestamp>] <text>` for a system/presence notice whose own text already names who and what. A finished voice entry additionally gets a `<utc>_<nickname>.wav` file (colliding names disambiguated with a `-2`/`-3`... suffix) written alongside the `.log`, referenced from its line by filename - a still-streaming `VoiceStreaming` placeholder has no audio yet and is silently skipped, autosaved only once `finalize_stream_entry` swaps in the real `Voice` body. Repeated autosaving only ever appends - an existing log is never replaced, across sessions or launches. A write failure is logged (`log_warn!`) and never panics or blocks the UI."
+evidence = "src/client/export.rs format_line, write_wav, autosave_entry, append_line; hooked at every `push_log_entry` call site (src/client/tui/channel.rs, direct_message.rs, ui.rs) and at `finalize_stream_entry`'s two call sites (channel.rs on_channel_stream_finished, direct_message.rs on_direct_stream_finished); tests autosave_entry_appends_a_text_line_naming_the_utc_timestamp_and_direction, autosave_entry_marks_an_outgoing_line_with_the_other_arrow, autosave_entry_keeps_adding_never_replacing, autosave_entry_is_a_no_op_for_a_still_streaming_placeholder, autosave_entry_writes_a_wav_that_decodes_back_to_the_same_samples_and_references_it_by_name (export_test.rs)"
+
+[[user_story.acceptance_criteria]]
+id = "AC-355"
+description = "`autosave_messages` (on/off, default off) is the one switch gating all of AC-353 - unset or off, nothing is ever written to `~/.aloo/exports`. Read once at session start into `UiState.autosave_messages`, like every other settings value this app reads at startup: a change to the file mid-session takes effect on the next run, not live."
+evidence = "src/settings.rs Settings::autosave_messages; src/client/tui/ui.rs UiState.autosave_messages; src/client/session.rs run_connected_session; tests autosave_messages_defaults_off_and_is_always_written, autosave_messages_round_trips_on (settings_test.rs)"
+
+# ============================================================================
+# US-054 - Exporting specific channels/DMs on demand
+# ============================================================================
+[[user_story]]
+id = "US-054"
+title = "Exporting specific channels/DMs on demand"
+as_a = "user who wants a snapshot of particular conversations right now"
+i_want = "a popup, reachable at any time, to pick exactly which joined channels and open DMs to dump to disk"
+so_that = "I don't have to turn on continuous autosave just to save a copy of what's already on screen"
+
+[[user_story.acceptance_criteria]]
+id = "AC-354"
+description = "`export::export_log` dumps a whole in-memory log at once into `<prefix>_<surface name>.log`, plus one `<prefix>_<utc>_<nickname>.wav` per finished voice entry - `prefix` is one `export::short_uuid()` (8 lowercase hex characters, `hex_encode(random_bytes(4))`, this crate's existing id-generation convention) shared by every file one export produces, so it never collides with the continuous autosave log beside it (AC-353) or with an earlier export. A still-streaming `VoiceStreaming` entry has nothing to snapshot and is skipped, same as autosave."
+evidence = "src/client/export.rs export_log, short_uuid; tests export_log_prefixes_every_file_it_writes_with_the_given_shortuuid, export_log_skips_voice_streaming_entries, export_log_and_autosave_never_collide_on_the_same_file, short_uuid_is_eight_hex_characters_and_not_constant (export_test.rs)"
+
+[[user_story.acceptance_criteria]]
+id = "AC-358"
+description = "`Ctrl+E` opens a popup listing every joined channel and every open DM as an unchecked `[ ]` row, `Up`/`Down` moving a cursor through them (past the last row reaching a Confirm/Cancel button row, `Up` from there returning to the last row), `Enter` toggling the row under the cursor, and `Tab`/`Left`/`Right` toggling which button is focused once there - `Cancel` focused by default, the same destructive-action-default convention `ChannelCommandConfirm` already uses. `Esc` always backs out with no export, from either tier. `Enter` on `Cancel`, or on `Confirm` with nothing checked, closes the popup with no export at all; `Enter` on `Confirm` with at least one row checked emits `UiAction::ExportSelected` (every checked channel name and DM `UserId`, one fresh `short_uuid()`), which `session::handle_ui_action` turns into one `export::export_log` call per selected surface (AC-354) - independent of whether continuous autosave (AC-355) is on."
+evidence = "src/client/tui/export_popup.rs ExportPopupState, open_export_popup, handle_export_popup_key, render_export_popup; src/client/tui/ui.rs Mode::ExportPopup, UiAction::ExportSelected, the Ctrl+E key binding; src/client/session.rs handle_ui_action's ExportSelected arm; tests ctrl_e_opens_the_popup_listing_every_joined_channel_and_open_dm, enter_toggles_the_row_under_the_cursor_without_moving_focus, down_moves_through_channels_then_dms_then_onto_the_button_row, up_from_the_button_row_returns_to_the_last_list_row, left_right_and_tab_all_toggle_between_confirm_and_cancel, enter_on_cancel_closes_with_no_action, enter_on_confirm_with_nothing_checked_closes_with_no_action, enter_on_confirm_exports_every_checked_channel_and_dm, esc_from_the_list_closes_with_no_action, esc_from_the_buttons_closes_with_no_action (ui_export_popup_test.rs)"
+
+# ============================================================================
+# US-055 - Voice only autoplays where you're actually looking
+# ============================================================================
+[[user_story]]
+id = "US-055"
+title = "Voice only autoplays where you're actually looking"
+as_a = "user with more than one channel or DM active at once"
+i_want = "an incoming voice message to only play itself automatically in the channel/DM I currently have open"
+so_that = "voice from a conversation I'm not looking at doesn't play over whatever I'm actually doing, and I can still tell it arrived"
+
+[[user_story.acceptance_criteria]]
+id = "AC-357"
+description = "A voice stream's autoplay is suppressed - in addition to the existing muted/trust-gated reasons (`suppress_playback_from`) - whenever the channel/DM it arrived in is not the one currently on screen (`is_viewing_channel`/`is_viewing_dm`), checked at `channel::on_stream_start`/`direct_message::on_stream_start`. Whatever that combined `suppress_playback` was at arrival sets the row's `LogEntry.listened` (`false` if suppressed, `true` if it autoplayed live) - our own sent voice always starts `listened: true`, since the marker below only ever means something received. A row's log line ends with a red \"not listened\" marker, flush to the right edge, for exactly as long as `!entry.outgoing && !entry.listened` - cleared (`listened = true`) the moment the row is manually replayed (`Enter` in `handle_messages_key`, alongside the existing `owed_receipt` payoff)."
+evidence = "src/client/channel.rs, direct_message.rs on_stream_start (widened suppress_playback); src/client/tui/channel.rs, direct_message.rs on_channel_stream_start/on_direct_stream_start (suppress_playback param -> listened); src/client/tui/ui.rs LogEntry.listened, render_messages's MessageBody::Voice arm (the marker), handle_messages_key's Enter arm; tests on_channel_stream_start_sets_listened_from_suppress_playback, log_own_voice_stream_start_channel_always_starts_listened, a_received_unlistened_voice_row_shows_a_red_not_listened_marker, a_listened_voice_row_shows_no_marker, an_outgoing_voice_row_never_shows_the_marker_even_if_listened_were_somehow_false (ui_channel_test.rs), replaying_a_clip_marks_it_listened (ui_test.rs)"
+
+# ============================================================================
+# US-056 - A settings file that documents its own options
+# ============================================================================
+[[user_story]]
+id = "US-056"
+title = "A settings file that documents its own options"
+as_a = "user setting up aloo for the first time"
+i_want = "~/.aloo/settings, the moment it's created, to already list every option there is"
+so_that = "I can find and edit any of them by hand without having to know they exist or go read the source"
+
+[[user_story.acceptance_criteria]]
+id = "AC-356"
+description = "The very first time `~/.aloo/settings` is created (`Settings::load_or_create`'s not-found branch), it is written as two `#`-commented sections in order - `# client options` then, after a blank line, `# server options` - listing every option that exists in the app, scalar or accumulating. A scalar option gets one real, live line (unset written blank/off rather than omitted, the same \"always written\" precedent `server_smtp_host=` already set). An accumulating, one-line-per-entry option (`muted_voice`, `daemon_channel`, `direct_punch_to`, `direct_punch_channel`, `server_superadmin`) has nothing real to pre-populate, so it gets one `#`-commented example line instead, showing its exact syntax (a fake nickname/host for `direct_punch_to`) without taking effect - `Settings::parse` already skips `#`-prefixed lines, so these examples never populate anything on reload. Every ordinary write after that first run (`Settings::save`, via `update`/`remember_connection`/`update_muted_voice`) is untouched by this and stays the sparse, unsectioned, merge-friendly shape it always was - `Settings::parse` reads either shape identically, since it already ignores blank lines and `#` comments and matches purely by key."
+evidence = "src/settings.rs Settings::scaffold_contents, load_or_create; tests the_first_run_scaffold_is_split_into_client_and_server_sections_in_order, a_blank_line_separates_the_client_and_server_sections, an_ordinary_save_after_the_first_run_does_not_add_section_comments, the_scaffold_shows_every_accumulating_key_as_a_commented_example_that_never_loads (settings_test.rs)"
+
+# ============================================================================
+# US-057 - Resuming a channel/DM's history from the on-disk export log
+# ============================================================================
+[[user_story]]
+id = "US-057"
+title = "Resuming a channel/DM's history from the on-disk export log"
+as_a = "user who has been autosaving a channel or DM's history"
+i_want = "scrolling up (or just opening it again) to pull that older history back in from disk, without having to eagerly load every voice message's audio"
+so_that = "a fresh session doesn't start with an empty log even though the conversation has a real past on disk"
+
+[[user_story.acceptance_criteria]]
+id = "AC-359"
+description = "`resume_from_log` (on/off, default off) is the one switch gating history-resuming - unset or off, opening a channel/DM or scrolling within it never touches `~/.aloo/exports`. Read once at session start into `UiState.resume_from_log`, like every other settings value this app reads at startup: a change to the file mid-session takes effect on the next run, not live. Independent of `autosave_messages`: this only ever *reads* a `.log` file, which may have been written in an earlier session, this one, or not exist at all."
+evidence = "src/settings.rs Settings::resume_from_log; src/client/tui/ui.rs UiState.resume_from_log; src/client/session.rs run_connected_session; tests resume_from_log_defaults_off_and_is_always_written, resume_from_log_round_trips_on (settings_test.rs); resume_from_log_off_never_loads_anything (ui_channel_test.rs)"
+
+[[user_story.acceptance_criteria]]
+id = "AC-360"
+description = "`export::LogHistoryCursor` reads a surface's `.log` file back-to-front, one chunk at a time: `open` reads the whole file's text once (never the audio any `.wav` reference points at), reassembling a pasted multi-line message's unprefixed continuation lines back into the one record they belong to; `next_chunk` returns records oldest-first, skipping (not failing on) anything unparseable. `parse_log_entry` is `format_line`'s inverse, with necessarily lossy reconstruction where the two directions aren't symmetric: `System`/`Presence` are textually identical on disk and both come back as `System`; a `[file] <name>` reference comes back as plain `Text`, not a re-offered `MessageBody::File` (there is no live stream/size/status left to attach to it); a voice line becomes `MessageBody::VoiceOnDisk { duration_ms, wav_path }`, `wav_path` being `None` when the original autosave never managed to write the `.wav`; every reconstructed row's `sent_at` equals its `sent_at_utc`, and it starts `listened: true` regardless of voice content (the not-listened marker is about this session's live arrivals, not a verdict on old history)."
+evidence = "src/client/export.rs group_into_records, parse_log_entry, LogHistoryCursor; src/client/tui/ui.rs MessageBody::VoiceOnDisk; tests history_cursor_reads_back_a_text_entry_written_by_autosave, history_cursor_reads_a_voice_entry_as_voice_on_disk_with_a_resolvable_wav_path, history_cursor_reads_a_voice_line_with_no_wav_reference_as_wav_path_none, history_cursor_reads_a_file_reference_as_plain_text, history_cursor_collapses_system_and_presence_into_system, history_cursor_reassembles_a_multiline_pasted_text_entry, history_cursor_skips_unparseable_lines, history_cursor_chunks_across_multiple_calls_newest_chunk_first, history_cursor_open_skips_already_loaded_records_from_the_end, history_cursor_on_a_missing_file_has_nothing_to_load (export_test.rs)"
+
+[[user_story.acceptance_criteria]]
+id = "AC-361"
+description = "The moment a channel/DM with `resume_from_log` on genuinely becomes the view - the channel selector reaching it (`select_channel_at`/`select_dm`), or landing straight in a channel just joined (`on_joined`, which bypasses `select_channel_at` entirely) - a first chunk of history loads automatically, sized to the message log's last-rendered height (`UiState.last_messages_area_height`, `history_chunk_size`, floored at 5) if a frame has rendered yet, else a fixed default. Loaded entries are prepended onto the front of the surface's live log, oldest-first, and the selection lands on the newest entry overall, exactly like opening any chat app."
+evidence = "src/client/tui/channel.rs select_channel_at, on_joined; src/client/tui/direct_message.rs select_dm; src/client/tui/ui.rs UiState.load_history_chunk, history_chunk_size, DEFAULT_HISTORY_CHUNK_LINES, render_messages (height capture); tests resume_from_log_seeds_the_initial_chunk_on_first_view (ui_channel_test.rs)"
+
+[[user_story.acceptance_criteria]]
+id = "AC-362"
+description = "Revisiting an already-seeded surface (switching tabs away and back) never loads another chunk on top of what's there - only reaching the top of what's currently loaded does that, and only on `Up`/`PageUp`/`Home` while `message_selected` is already `0` (landing on `0` via a large jump doesn't itself cascade into a load; pressing the key again does). Exhausting the file (`LogHistoryCursor::has_more` false) makes further presses at the top a no-op again, same as before the feature existed."
+evidence = "src/client/tui/ui.rs handle_messages_key's Up/PageUp/Home arms, UiState.load_history_chunk (the history_cursor.is_none() vs. message_selected == 0 guards); tests resume_from_log_does_not_reload_on_a_plain_revisit, scrolling_to_the_top_loads_another_chunk (ui_channel_test.rs)"
+
+[[user_story.acceptance_criteria]]
+id = "AC-363"
+description = "A `MessageBody::VoiceOnDisk` row's audio is only ever read from disk the moment `Enter` replays that specific row - never up front. With a resolvable `wav_path`, `voice::decode_wav_to_mono` decodes it there, the row mutates into an ordinary `Voice { duration_ms, pcm }` in place (so a second replay of the same row is instant and it then participates in the ordinary listened/receipt machinery), and playback proceeds exactly like a `Voice` row that arrived live. With `wav_path: None` (the original autosave never wrote the `.wav`) or a file that no longer decodes, nothing plays and a status notice explains why instead of a silent no-op."
+evidence = "src/client/tui/ui.rs handle_messages_key's Enter arm (the VoiceOnDisk branch), MessageBody::VoiceOnDisk's render arm; tests entering_on_a_voice_on_disk_row_with_a_wav_decodes_and_plays_it, entering_on_a_voice_on_disk_row_with_no_wav_shows_a_status_notice_and_does_nothing (ui_test.rs)"
+
+[[user_story.acceptance_criteria]]
+id = "AC-364"
+description = "When a surface's history reader first opens, it skips exactly `log.len()` of the file's newest records only if `autosave_messages` is on for this session - that many, and no more, are guaranteed to be this session's own live entries already mirrored to the file's tail (every append this session was hooked through `export::autosave_entry`). With `autosave_messages` off, nothing this session reached disk, so no records are skipped regardless of how many entries a surface's live log already holds when history-reading starts - skipping unconditionally would silently drop that many genuine, never-seen historical records instead."
+evidence = "src/client/tui/ui.rs UiState.load_history_chunk (the autosave_messages-gated already_loaded); tests resuming_history_does_not_skip_real_history_when_autosave_was_off (ui_channel_test.rs)"

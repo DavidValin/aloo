@@ -7,6 +7,7 @@ pub mod delivery;
 pub mod device_id;
 pub mod direct_message;
 pub mod envelope;
+pub mod export;
 pub mod file_browser;
 pub mod file_transfer;
 pub mod global_notification;

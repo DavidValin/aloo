@@ -537,28 +537,23 @@ fn a_server_password_from_settings_is_used_when_no_flag_gives_one() {
     assert_eq!(config.password, "from-flag", "a flag given this run wins");
 }
 
-/// `--ssl` (or `daemon_ssl`) is carried into the request the daemon
-/// connects with; it is the one TLS decision a headless start can make.
+/// `connect_using_ssl` is carried into the request the daemon connects
+/// with, and is the *only* thing that decides it - there is no flag to
+/// override it (unlike host/port/nickname, which still cascade through a
+/// flag first).
 /// @requirement AC-201, AC-261
 #[test]
-fn ssl_comes_from_the_flag_or_the_settings_file() {
+fn ssl_comes_only_from_the_settings_file() {
     let config =
         DaemonConfig::resolve(&flags_with_host(), &Settings::default(), &empty_cache()).unwrap();
     assert!(!config.ssl, "plain TCP unless asked");
     assert!(!config.to_connect_request().ssl);
 
-    let flags = DaemonFlags {
-        ssl: true,
-        ..flags_with_host()
-    };
-    let config = DaemonConfig::resolve(&flags, &Settings::default(), &empty_cache()).unwrap();
-    assert!(config.ssl);
-    assert!(config.to_connect_request().ssl);
-
     let mut settings = Settings::default();
-    settings.daemon_ssl = true;
+    settings.connect_using_ssl = true;
     let config = DaemonConfig::resolve(&flags_with_host(), &settings, &empty_cache()).unwrap();
-    assert!(config.ssl, "daemon_ssl=on is what a bare start reads back");
+    assert!(config.ssl, "connect_using_ssl=on is what a bare start reads back");
+    assert!(config.to_connect_request().ssl);
 }
 
 /// A daemon with a server but no password anywhere refuses to start

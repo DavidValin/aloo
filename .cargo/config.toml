@@ -14,4 +14,8 @@ trace = "test --test traceability"
 # `daemon_session_test` has one ignored test of its own: two whole
 # serverless sessions punching to each other, which waits for a real
 # wall-clock slot boundary (docs/PROTOCOL.md 7.1.5).
-slow = ["test", "--test", "crypto_test", "--test", "hybrid_crypto_test", "--test", "connect_test", "--test", "daemon_session_test", "--", "--ignored"]
+# `reconnect_test` has one too: a plain connect against an SSL-only
+# server genuinely deadlocks rather than failing cleanly, and proving the
+# CONNECT_TIMEOUT bound (connect.rs) that resolves it means waiting out
+# the whole thing.
+slow = ["test", "--test", "crypto_test", "--test", "hybrid_crypto_test", "--test", "connect_test", "--test", "daemon_session_test", "--test", "reconnect_test", "--", "--ignored"]

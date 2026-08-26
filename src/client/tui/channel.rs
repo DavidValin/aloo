@@ -55,6 +55,11 @@ pub struct ChannelTab {
     /// every existing caller that only cares about kind/membership is
     /// unaffected.
     pub admin: Option<String>,
+    /// `resume_from_log`'s reader for this channel's `.log` file - `None`
+    /// until the first history load (either the initial one on first
+    /// viewing, or a scroll-triggered one), and forever `None` if the
+    /// setting is off. See `UiState::load_history_chunk`.
+    pub history_cursor: Option<crate::client::export::LogHistoryCursor>,
 }
 
 impl UiState {
@@ -340,12 +345,20 @@ impl UiState {
     /// newest message rather than wherever the last visit left off. Out of
     /// range (no channels joined at all) is a no-op.
     pub fn select_channel_at(&mut self, idx: usize) {
-        let Some(tab) = self.channels.get_mut(idx) else {
+        if self.channels.get(idx).is_none() {
             return;
-        };
-        tab.unread = false;
-        let log_len = tab.log.len();
+        }
+        self.channels[idx].unread = false;
         self.selected_channel = idx;
+        // Seed this channel with its first `resume_from_log` chunk the
+        // very first time it's viewed - guarded on `history_cursor` still
+        // being `None` so revisiting an already-seeded tab doesn't load
+        // another chunk every time (that's what scrolling up is for,
+        // `handle_messages_key`).
+        if self.resume_from_log && self.channels[idx].history_cursor.is_none() {
+            self.load_history_chunk();
+        }
+        let log_len = self.channels[idx].log.len();
         self.message_selected = log_len.saturating_sub(1);
     }
 
@@ -485,6 +498,7 @@ impl UiState {
                 log: Vec::new(),
                 unread: false,
                 admin: None,
+                history_cursor: None,
             });
         }
         // Landing in the channel just joined is the whole point of joining
@@ -495,6 +509,16 @@ impl UiState {
         if let Some(idx) = self.channels.iter().position(|c| c.name == name) {
             self.selected_channel = idx;
             self.focus_channel_selector();
+            // A genuine "this surface just became the view" moment - same
+            // `resume_from_log` seed `select_channel_at` gives a channel
+            // reached through the selector, needed here too since landing
+            // straight in a freshly-joined channel never goes through that
+            // function at all.
+            if self.resume_from_log && self.channels[idx].history_cursor.is_none() {
+                self.load_history_chunk();
+                let log_len = self.channels[idx].log.len();
+                self.message_selected = log_len.saturating_sub(1);
+            }
         }
     }
 
@@ -579,6 +603,7 @@ impl UiState {
                     log: Vec::new(),
                     unread: false,
                     admin: None,
+                    history_cursor: None,
                 });
                 self.channels.last_mut().expect("just pushed")
             }
@@ -622,6 +647,7 @@ impl UiState {
         if already_joined && is_new {
             let text = format!("{} {name} joined", local_time_short());
             let is_current = self.is_viewing_channel(channel);
+            let autosave = self.autosave_messages.then(|| self.server_label.clone());
             if let Some(tab) = self.channels.iter_mut().find(|c| c.name == channel) {
                 push_log_entry(
                     &mut tab.log,
@@ -635,13 +661,22 @@ impl UiState {
                         outgoing: false,
                         failed: false,
                         sent_at: local_time_stamp(),
+                        sent_at_utc: crate::client::export::utc_time_stamp(),
                         owed_receipt: None,
+                        listened: true,
                         delivery: None,
                         // This client wrote the line itself out of a
                         // `UserJoined`; nothing about it was encrypted.
                         crypto: None,
                     },
                 );
+                if let Some(server_label) = &autosave {
+                    crate::client::export::autosave_entry(
+                        server_label,
+                        crate::client::export::Surface::Channel(channel),
+                        tab.log.last().unwrap(),
+                    );
+                }
             }
         }
     }
@@ -666,6 +701,7 @@ impl UiState {
         if let Some(name) = name {
             let text = format!("{} {name} left", local_time_short());
             let is_current = self.is_viewing_channel(channel);
+            let autosave = self.autosave_messages.then(|| self.server_label.clone());
             if let Some(tab) = self.channels.iter_mut().find(|c| c.name == channel) {
                 push_log_entry(
                     &mut tab.log,
@@ -679,11 +715,20 @@ impl UiState {
                         outgoing: false,
                         failed: false,
                         sent_at: local_time_stamp(),
+                        sent_at_utc: crate::client::export::utc_time_stamp(),
                         owed_receipt: None,
+                        listened: true,
                         delivery: None,
                         crypto: None,
                     },
                 );
+                if let Some(server_label) = &autosave {
+                    crate::client::export::autosave_entry(
+                        server_label,
+                        crate::client::export::Surface::Channel(channel),
+                        tab.log.last().unwrap(),
+                    );
+                }
             }
         }
     }
@@ -706,6 +751,7 @@ impl UiState {
     /// empty name safely.
     fn push_presence_notice(&mut self, channel: &str, who: UserId, who_name: String, text: String) {
         let is_current = self.is_viewing_channel(channel);
+        let autosave = self.autosave_messages.then(|| self.server_label.clone());
         if let Some(tab) = self.channels.iter_mut().find(|c| c.name == channel) {
             push_log_entry(
                 &mut tab.log,
@@ -719,11 +765,20 @@ impl UiState {
                     outgoing: false,
                     failed: false,
                     sent_at: local_time_stamp(),
+                    sent_at_utc: crate::client::export::utc_time_stamp(),
                     owed_receipt: None,
+                    listened: true,
                     delivery: None,
                     crypto: None,
                 },
             );
+            if let Some(server_label) = &autosave {
+                crate::client::export::autosave_entry(
+                    server_label,
+                    crate::client::export::Surface::Channel(channel),
+                    tab.log.last().unwrap(),
+                );
+            }
         }
     }
 
@@ -792,7 +847,9 @@ impl UiState {
             outgoing: false,
             failed: false,
             sent_at: local_time_stamp(),
+            sent_at_utc: crate::client::export::utc_time_stamp(),
             owed_receipt: None,
+            listened: true,
             delivery: None,
             crypto: self.message_crypto(from, false),
         };
@@ -804,10 +861,18 @@ impl UiState {
             return;
         }
         let is_current = self.is_viewing_channel(channel);
+        let autosave = self.autosave_messages.then(|| self.server_label.clone());
         if let Some(tab) = self.channels.iter_mut().find(|c| c.name == channel) {
             push_log_entry(&mut tab.log, &mut self.message_selected, is_current, entry);
             if !is_current {
                 tab.unread = true;
+            }
+            if let Some(server_label) = &autosave {
+                crate::client::export::autosave_entry(
+                    server_label,
+                    crate::client::export::Surface::Channel(channel),
+                    tab.log.last().unwrap(),
+                );
             }
         }
     }
@@ -817,6 +882,7 @@ impl UiState {
         let from_name = self.own_name.clone();
         let is_current = self.is_viewing_channel(channel);
         let crypto = self.channel_send_crypto(channel);
+        let autosave = self.autosave_messages.then(|| self.server_label.clone());
         if let Some(tab) = self.channels.iter_mut().find(|c| c.name == channel) {
             push_log_entry(
                 &mut tab.log,
@@ -830,11 +896,20 @@ impl UiState {
                     outgoing: true,
                     failed: false,
                     sent_at: local_time_stamp(),
+                    sent_at_utc: crate::client::export::utc_time_stamp(),
                     owed_receipt: None,
+                    listened: true,
                     delivery: None,
                     crypto,
                 },
             );
+            if let Some(server_label) = &autosave {
+                crate::client::export::autosave_entry(
+                    server_label,
+                    crate::client::export::Surface::Channel(channel),
+                    tab.log.last().unwrap(),
+                );
+            }
         }
     }
 
@@ -853,6 +928,10 @@ impl UiState {
         let is_current = self.is_viewing_channel(channel);
         let crypto = self.channel_send_crypto(channel);
         if let Some(tab) = self.channels.iter_mut().find(|c| c.name == channel) {
+            // No autosave hook here: a `VoiceStreaming` placeholder has no
+            // audio yet, and `autosave_entry` is a no-op for one anyway -
+            // `on_channel_stream_finished`'s `finalize_stream_entry` call
+            // is where this same row gets autosaved, once it is real.
             push_log_entry(
                 &mut tab.log,
                 &mut self.message_selected,
@@ -865,7 +944,9 @@ impl UiState {
                     outgoing: true,
                     failed: false,
                     sent_at: local_time_stamp(),
+                    sent_at_utc: crate::client::export::utc_time_stamp(),
                     owed_receipt: None,
+                    listened: true,
                     delivery,
                     crypto,
                 },
@@ -886,6 +967,7 @@ impl UiState {
         from: UserId,
         from_name: String,
         stream_id: u64,
+        suppress_playback: bool,
     ) {
         let entry = LogEntry {
             from,
@@ -895,7 +977,9 @@ impl UiState {
             outgoing: false,
             failed: false,
             sent_at: local_time_stamp(),
+            sent_at_utc: crate::client::export::utc_time_stamp(),
             owed_receipt: None,
+            listened: !suppress_playback,
             delivery: None,
             crypto: self.message_crypto(from, false),
         };
@@ -905,6 +989,8 @@ impl UiState {
         }
         let is_current = self.is_viewing_channel(channel);
         if let Some(tab) = self.channels.iter_mut().find(|c| c.name == channel) {
+            // No autosave hook here either - see the sibling comment in
+            // `log_own_voice_stream_start_channel` above.
             push_log_entry(&mut tab.log, &mut self.message_selected, is_current, entry);
             if !is_current {
                 tab.unread = true;
@@ -927,10 +1013,18 @@ impl UiState {
         duration_ms: u32,
         pcm: Vec<u8>,
     ) {
-        if let Some(tab) = self.channels.iter_mut().find(|c| c.name == channel)
-            && finalize_stream_entry(&mut tab.log, from, stream_id, duration_ms, pcm.clone())
-        {
-            return;
+        let autosave = self.autosave_messages.then(|| self.server_label.clone());
+        if let Some(tab) = self.channels.iter_mut().find(|c| c.name == channel) {
+            if let Some(entry) = finalize_stream_entry(&mut tab.log, from, stream_id, duration_ms, pcm.clone()) {
+                if let Some(server_label) = &autosave {
+                    crate::client::export::autosave_entry(
+                        server_label,
+                        crate::client::export::Surface::Channel(channel),
+                        entry,
+                    );
+                }
+                return;
+            }
         }
         if let Some(held) = self.pending_messages.get_mut(&from) {
             finalize_held_stream(held, from, stream_id, duration_ms, pcm);
@@ -959,6 +1053,7 @@ impl UiState {
         let from_name = self.own_name.clone();
         let is_current = self.is_viewing_channel(channel);
         let crypto = self.channel_send_crypto(channel);
+        let autosave = self.autosave_messages.then(|| self.server_label.clone());
         if let Some(tab) = self.channels.iter_mut().find(|c| c.name == channel) {
             push_log_entry(
                 &mut tab.log,
@@ -972,11 +1067,20 @@ impl UiState {
                     outgoing: true,
                     failed: false,
                     sent_at: local_time_stamp(),
+                    sent_at_utc: crate::client::export::utc_time_stamp(),
                     owed_receipt: None,
+                    listened: true,
                     delivery,
                     crypto,
                 },
             );
+            if let Some(server_label) = &autosave {
+                crate::client::export::autosave_entry(
+                    server_label,
+                    crate::client::export::Surface::Channel(channel),
+                    tab.log.last().unwrap(),
+                );
+            }
         }
     }
 
@@ -1001,6 +1105,7 @@ impl UiState {
         let from_name = self.own_name.clone();
         let is_current = self.is_viewing_channel(channel);
         let crypto = self.channel_send_crypto(channel);
+        let autosave = self.autosave_messages.then(|| self.server_label.clone());
         if let Some(tab) = self.channels.iter_mut().find(|c| c.name == channel) {
             push_log_entry(
                 &mut tab.log,
@@ -1021,11 +1126,20 @@ impl UiState {
                     outgoing: true,
                     failed: false,
                     sent_at: local_time_stamp(),
+                    sent_at_utc: crate::client::export::utc_time_stamp(),
                     owed_receipt: None,
+                    listened: true,
                     delivery,
                     crypto,
                 },
             );
+            if let Some(server_label) = &autosave {
+                crate::client::export::autosave_entry(
+                    server_label,
+                    crate::client::export::Surface::Channel(channel),
+                    tab.log.last().unwrap(),
+                );
+            }
         }
     }
 
@@ -1043,6 +1157,7 @@ impl UiState {
     ) {
         let is_current = self.is_viewing_channel(channel);
         let crypto = self.message_crypto(from, false);
+        let autosave = self.autosave_messages.then(|| self.server_label.clone());
         if let Some(tab) = self.channels.iter_mut().find(|c| c.name == channel) {
             push_log_entry(
                 &mut tab.log,
@@ -1061,13 +1176,22 @@ impl UiState {
                     outgoing: false,
                     failed: false,
                     sent_at: local_time_stamp(),
+                    sent_at_utc: crate::client::export::utc_time_stamp(),
                     owed_receipt: None,
+                    listened: true,
                     delivery: None,
                     crypto,
                 },
             );
             if !is_current {
                 tab.unread = true;
+            }
+            if let Some(server_label) = &autosave {
+                crate::client::export::autosave_entry(
+                    server_label,
+                    crate::client::export::Surface::Channel(channel),
+                    tab.log.last().unwrap(),
+                );
             }
         }
     }

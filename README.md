@@ -14,7 +14,7 @@ Walky talky in your terminal! aloo is a terminal chat app for talking with peopl
 
 Just you, your terminal, and the people you're talking to.
 
-* [⬇️ Download](https://github.com/DavidValin/aloo/releases) (⭐ MacOS ⭐ Linux and ⭐ Windows supported)
+* [⬇️ Download](https://github.com/DavidValin/aloo/releases) (⭐ MacOS ⭐ Linux ⭐ Windows supported)
 
 ## Features
 
@@ -105,6 +105,7 @@ thing in-app at any time.
 | `Home` / `End` | Jump to the oldest / newest message (log focused) |
 | `Ctrl+O` | Open the focused message's link in your default browser — presses again cycle through more than one |
 | `Ctrl+S` | Open the "Direct Punches" popup (shown only once you've configured one — see "Punching straight to someone") |
+| `Ctrl+E` | Export specific channels/DMs to disk — see "Exporting your chat history" |
 | `Ctrl+H` | Help — `Esc` or `Ctrl+H` closes |
 | `Ctrl+C` | Quit |
 
@@ -165,6 +166,40 @@ Not a block: their messages still arrive and still show in the log, so
 sidebar, so a channel that went quiet explains itself. Kept in
 `~/.aloo/settings`, so it survives reconnecting — you can even mute someone
 who has never connected. Never affects a live call.
+
+A muted voice message — or one that simply arrived in a channel/DM you
+weren't looking at — never autoplays, and its line ends with a red "not
+listened" marker until you replay it (`Enter`) or it arrives somewhere
+you're actually viewing.
+
+### Exporting your chat history
+
+Two ways to get a channel or DM's history onto disk as a plain-text log,
+both writing under `~/.aloo/exports/<server>/{channels,dms}/` (`<server>`
+is the host and port you're connected to, or `DIRECT` with `--no-server`):
+
+- **Continuous, automatic:** set `autosave_messages=on` in
+  `~/.aloo/settings`, and every message — text, voice, file notices,
+  presence lines — is appended as it happens, `[<UTC timestamp>] <- name:
+  text` per line, never replacing what's already there. Off by default.
+- **Manual, on demand, any time:** **`Ctrl+E`** opens a popup listing every
+  joined channel and open DM as a checkbox — `Up`/`Down` to move, `Enter`
+  to check one, `Tab` onto Confirm/Cancel (`Cancel` focused by default).
+  Confirming dumps each checked one's *current* history, files prefixed
+  with a fresh short id so they never collide with the autosave log beside
+  them. Works whether or not `autosave_messages` is on.
+
+Either way, a voice message also gets a `.wav` file next to its `.log`,
+named `<UTC time>_<nickname>.wav` and referenced from the log line by name.
+
+**Reading it back:** set `resume_from_log=on` and a channel/DM pulls its own
+history back in from that `.log` file (whichever session wrote it) instead
+of starting empty — a screen's worth loads the moment you open it, and
+scrolling `Up`/`PageUp`/`Home` past the top loads another screen's worth at
+a time. Voice audio isn't decoded until you actually replay a row (`Enter`)
+— until then it just shows as an unloaded reference. Off by default, and
+independent of `autosave_messages` — it only ever reads what's already
+there.
 
 ### Channels
 
@@ -322,7 +357,7 @@ How you prove you're allowed to connect: a nickname and its password, checked ag
 
 - 🔑 **Nickname + password.** The server operator either registers you directly (`aloo --register-user <nickname> <password>`, active immediately) or turns on self-registration.
 - ✉️ **Self-registration.** With `server_allow_registration=on` and an SMTP relay configured in `~/.aloo/settings` (`server_smtp_host`, `server_smtp_port`, `server_smtp_username`, `server_smtp_password`), anyone can register from the connect screen's Register button and activate with the 12-digit code emailed to them — valid for one hour, entered right there in aloo's own activation popup, and also usable from a browser link if `server_activation_url` is set.
-- 🔏 **Optional TLS.** `server_ssl=on` plus a certificate pair (`server_ssl_fullchain`/`server_ssl_privkey` — a Let's Encrypt pair works well) serves the control connection, and the activation link, over TLS. On the client side this is settings-only too, not a connect-screen field: set `connect_ssl=on` in `~/.aloo/settings` (or pass `--ssl`/set `daemon_ssl` for a headless start); a self-signed or privately issued certificate needs its root added via `connect_ssl_ca`.
+- 🔏 **Optional TLS.** `server_ssl=on` plus a certificate pair (`server_ssl_fullchain`/`server_ssl_privkey` — a Let's Encrypt pair works well) serves the control connection, and the activation link, over TLS. On the client side this is settings-only too, not a connect-screen field, and there's no flag either — set `connect_using_ssl=on` in `~/.aloo/settings`, the one switch shared by a normal connect and a daemon start alike; a self-signed or privately issued certificate needs its root added via `connect_ssl_ca`. Get it wrong and a failed connect says so specifically ("this server appears to require/reject SSL") rather than a bare connection error — aloo never auto-negotiates or silently falls back to the other mode, it just tells you which one to flip.
 
 None of this is per-connection: it's how the server itself is configured, in `~/.aloo/settings` on the server's machine.
 
@@ -401,6 +436,7 @@ Your PQ-Hybrid identity is what gets pinned, and it stays the same across reconn
 | `Up` / `Down` | Move the selection |
 | `Left` / `Right` | Cycle which of the three keys is highlighted — across the whole list at once, so paging up/down keeps comparing the same key |
 | `Enter` | Open the highlighted key's details popup |
+| `a` | Add a contact by hand — nickname and device id — for someone you haven't connected with yet; submitting pins them and opens their PQH key popup to install a key |
 | `d` | Delete the selected contact outright — forgets their pin and both other keys (confirms first) |
 | `o` | Install an OTP key for the selected contact, from files you generated yourself (shortcut for the OTP key's own details-popup action) |
 | `r` | Refresh the list (e.g. after the remaining key has moved) |

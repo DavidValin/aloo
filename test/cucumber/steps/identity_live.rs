@@ -236,6 +236,7 @@ async fn start_daemon(
             Some(server_addr),
             input_rx,
             plan,
+            "test-server_0".to_string(),
         )
         .await;
     });

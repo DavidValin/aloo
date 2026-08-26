@@ -259,6 +259,7 @@ async fn press_named(w: &mut AlooWorld, key: String) {
         "Ctrl+O" => (KeyCode::Char('o'), KeyModifiers::CONTROL),
         "Ctrl+R" => (KeyCode::Char('r'), KeyModifiers::CONTROL),
         "Ctrl+S" => (KeyCode::Char('s'), KeyModifiers::CONTROL),
+        "Ctrl+E" => (KeyCode::Char('e'), KeyModifiers::CONTROL),
         other => panic!("unknown key {other:?}"),
     };
     press_key(w, code, mods);

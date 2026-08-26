@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 #[path = "server_common.rs"]
 mod server_common;
 
-use aloo::client::connect::{ConnectRequest, MyKeySelection};
+use aloo::client::connect::{AuthRefusedError, ConnectRequest, MyKeySelection, SslMismatchError};
 use aloo::client::reconnect::{
     Backoff, RECONNECT_FIRST_DELAY, RECONNECT_MAX_DELAY, SERVER_DOWN_AFTER_ATTEMPTS, ServerEvent,
     ServerLinkState, ServerSink, delay_after, seconds_left,
@@ -20,8 +20,9 @@ use aloo::client::reconnect::{
 use aloo::control::ControlSink;
 use aloo::proto::{ChannelKind, ClientMessage, ServerMessage};
 use aloo::server::ServerOptions;
+use aloo::server::ssl;
 use aloo::server::users_registry::UsersRegistry;
-use server_common::{password_for, test_users_registry};
+use server_common::{TestServer, password_for, test_options, test_users_registry};
 use tokio::net::{TcpListener, TcpStream};
 
 // ---------------------------------------------------------------------
@@ -539,6 +540,7 @@ async fn a_session_reaped_by_the_server_reappears_in_a_later_arrival_s_member_li
             Some(server_addr),
             input_rx,
             plan,
+            "test-server_0".to_string(),
         )
         .await
     });
@@ -627,4 +629,137 @@ async fn join(stream: &mut aloo::control::ControlEndpoint<TcpStream>, channel: &
         })
         .await
         .unwrap();
+}
+
+// ---------------------------------------------------------------------
+// Diagnosing a connect_using_ssl mismatch (connect_with_reconnect)
+// ---------------------------------------------------------------------
+
+/// A self-signed certificate for `localhost` - the same `rcgen` idiom
+/// `server_ssl_test.rs`'s own `localhost_cert` uses, duplicated rather
+/// than shared across two independent test binaries (there is no common
+/// module either already imports).
+fn localhost_cert() -> (Vec<u8>, Vec<u8>) {
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    (cert.cert.pem().into_bytes(), cert.key_pair.serialize_pem().into_bytes())
+}
+
+/// Writes `chain` to a fresh temp file and returns its path - `ssl_ca` is
+/// a path, not in-memory PEM, so a `ConnectRequest` that wants to trust a
+/// self-signed test certificate needs one on disk.
+fn ca_file(chain: &[u8]) -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "aloo-reconnect-test-ca-{}-{}.pem",
+        std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+    ));
+    std::fs::write(&path, chain).unwrap();
+    path
+}
+
+/// A plain connect against a server that only speaks TLS doesn't fail
+/// cleanly - it deadlocks (the server's TLS accept waits for a
+/// `ClientHello` that never comes; this client, having skipped TLS
+/// entirely, waits for a `Hello` that never comes either), which is
+/// exactly what `CONNECT_TIMEOUT` (`connect.rs`) exists to bound. `#[ignore]`
+/// (see `cargo slow` in `.cargo/config.toml`): this one genuinely takes the
+/// full `CONNECT_TIMEOUT` to prove the timeout path itself, not just the
+/// diagnosis - a plain `cargo test` shouldn't pay that on every run.
+/// @requirement AC-365
+#[tokio::test]
+#[ignore]
+async fn a_plain_attempt_against_an_ssl_only_server_is_diagnosed() {
+    let (chain, key) = localhost_cert();
+    let acceptor = ssl::acceptor_from_pem(&chain, &key).unwrap();
+    let server = TestServer::spawn(test_options("ssl-diag-plain").with_tls(acceptor)).await;
+    server.ensure_user("alice");
+
+    let (file_pub, file_priv) = scenario_keybundle("alice");
+    let request = ConnectRequest {
+        host: "localhost".to_string(),
+        port: server.addr.port(),
+        ssl: false,
+        ssl_ca: Some(ca_file(&chain)),
+        nickname: "alice".to_string(),
+        password: password_for("alice"),
+        my_key: MyKeySelection { file_pub, file_priv },
+        activation_code: None,
+    };
+    let Err(err) = aloo::client::connect::connect_with_reconnect(&request).await else {
+        panic!("expected the connect attempt to fail");
+    };
+    let mismatch = err
+        .downcast_ref::<SslMismatchError>()
+        .unwrap_or_else(|| panic!("expected SslMismatchError, got {err}"));
+    assert!(
+        mismatch.0.contains("appears to require SSL") && mismatch.0.contains("connect_using_ssl"),
+        "{}",
+        mismatch.0
+    );
+}
+
+/// The mirror image: an SSL attempt against a server that only speaks
+/// plain TCP is diagnosed the other way.
+/// @requirement AC-365
+#[tokio::test]
+async fn an_ssl_attempt_against_a_plain_server_is_diagnosed() {
+    let server = TestServer::spawn(test_options("ssl-diag-ssl")).await;
+    server.ensure_user("alice");
+
+    let (file_pub, file_priv) = scenario_keybundle("alice");
+    let request = ConnectRequest {
+        host: "localhost".to_string(),
+        port: server.addr.port(),
+        ssl: true,
+        ssl_ca: None,
+        nickname: "alice".to_string(),
+        password: password_for("alice"),
+        my_key: MyKeySelection { file_pub, file_priv },
+        activation_code: None,
+    };
+    let Err(err) = aloo::client::connect::connect_with_reconnect(&request).await else {
+        panic!("expected the connect attempt to fail");
+    };
+    let mismatch = err
+        .downcast_ref::<SslMismatchError>()
+        .unwrap_or_else(|| panic!("expected SslMismatchError, got {err}"));
+    assert!(
+        mismatch.0.contains("appears to reject SSL") && mismatch.0.contains("connect_using_ssl"),
+        "{}",
+        mismatch.0
+    );
+}
+
+/// A wrong password against a server whose `connect_using_ssl` was
+/// already right comes back exactly as `AuthRefusedError` always has -
+/// reaching a real, meaningful refusal proves the transport mode was
+/// correct, so no diagnosis is ever attached on top of it.
+/// @requirement AC-365
+#[tokio::test]
+async fn a_password_failure_is_never_probed_for_an_ssl_mismatch() {
+    let server = TestServer::spawn(test_options("ssl-diag-password")).await;
+    server.ensure_user("alice");
+
+    let (file_pub, file_priv) = scenario_keybundle("alice");
+    let request = ConnectRequest {
+        host: "localhost".to_string(),
+        port: server.addr.port(),
+        ssl: false,
+        ssl_ca: None,
+        nickname: "alice".to_string(),
+        password: "wrong-password".to_string(),
+        my_key: MyKeySelection { file_pub, file_priv },
+        activation_code: None,
+    };
+    let Err(err) = aloo::client::connect::connect_with_reconnect(&request).await else {
+        panic!("expected the connect attempt to fail");
+    };
+    let refused = err
+        .downcast_ref::<AuthRefusedError>()
+        .unwrap_or_else(|| panic!("expected AuthRefusedError, got {err}"));
+    assert!(
+        !refused.0.contains("connect_using_ssl"),
+        "a plain auth refusal must never carry an SSL diagnosis: {}",
+        refused.0
+    );
 }

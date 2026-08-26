@@ -321,6 +321,7 @@ async fn session_joined(w: &mut AlooWorld, nickname: String, channel: String) {
             Some(server_addr),
             input_rx,
             plan,
+            "test-server_0".to_string(),
         )
         .await;
     });

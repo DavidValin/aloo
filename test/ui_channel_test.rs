@@ -2,6 +2,7 @@
 mod ui_common;
 use ui_common::*;
 
+use aloo::client::export::{self, Surface};
 use aloo::client::netstats::ConnQuality;
 use aloo::client::p2p::LinkStatus;
 use aloo::p2p_proto::ReceiptStage;
@@ -16,6 +17,54 @@ use aloo::client::tui::ui::{
 use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
+
+/// One `ALOO_HOME` shared by every test in this file that needs one -
+/// `std::env::set_var` mutates process-wide state, and Rust's default test
+/// harness runs tests in parallel *threads* within one process, so calling
+/// it once per test (as this file used to, for the one earlier test that
+/// needed it) races the moment a second such test exists. Set exactly
+/// once (`OnceLock`, same idiom `export_test.rs::shared_home` already
+/// uses); every test that writes real files under it uses its own
+/// `server_label`/subdirectory so they still never collide with each
+/// other on content.
+fn shared_aloo_home() -> &'static std::path::Path {
+    static HOME: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    HOME.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!(
+            "aloo-ui-channel-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        unsafe { std::env::set_var("ALOO_HOME", &dir) };
+        dir
+    })
+}
+
+/// Writes `texts` to `general`'s on-disk log, in order (oldest first) -
+/// the shape `resume_from_log` reads back.
+fn autosave_texts(server_label: &str, texts: &[&str]) {
+    for (n, text) in texts.iter().enumerate() {
+        export::autosave_entry(
+            server_label,
+            Surface::Channel("general"),
+            &aloo::client::tui::ui::LogEntry {
+                from: UserId(2),
+                from_name: "bob".into(),
+                to_name: None,
+                body: MessageBody::Text(text.to_string()),
+                outgoing: false,
+                failed: false,
+                sent_at: format!("2026-08-26T12:00:{n:02}Z"),
+                sent_at_utc: format!("2026-08-26T12:00:{n:02}Z"),
+                owed_receipt: None,
+                listened: true,
+                delivery: None,
+                crypto: None,
+            },
+        );
+    }
+}
 
 
 fn sidebar_rows(state: &UiState) -> Vec<String> {
@@ -366,16 +415,7 @@ fn a_multiline_message_renders_as_several_rows_of_one_selectable_entry() {
 /// @requirement AC-327, TB-253
 #[test]
 fn a_paste_over_the_file_threshold_becomes_a_txt_file_transfer_not_a_message() {
-    let home = std::env::temp_dir().join(format!(
-        "aloo-paste-file-test-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&home).unwrap();
-    unsafe { std::env::set_var("ALOO_HOME", &home) };
+    let _home = shared_aloo_home();
 
     let mut state = joined_general_with(vec![user(2, "bob")]);
     // Between the 5,000-char file threshold and the 10,000-char typed cap
@@ -406,8 +446,6 @@ fn a_paste_over_the_file_threshold_becomes_a_txt_file_transfer_not_a_message() {
         0,
         "a file-transfer send logs its row once the stream id is allocated, not here"
     );
-
-    let _ = std::fs::remove_dir_all(&home);
 }
 
 /// @requirement TB-252
@@ -813,7 +851,7 @@ fn focusing_the_channel_selector_closes_any_open_private_room() {
 #[test]
 fn on_channel_stream_start_and_finished_swap_the_placeholder_body_in_place() {
     let mut state = joined_general_with(vec![user(2, "bob")]);
-    state.on_channel_stream_start("general", UserId(2), "bob".into(), 42);
+    state.on_channel_stream_start("general", UserId(2), "bob".into(), 42, false);
     assert_eq!(state.channels[0].log.len(), 1);
     assert_eq!(
         state.channels[0].log[0].body,
@@ -863,8 +901,8 @@ fn finalize_matches_by_from_and_stream_id_not_stream_id_alone() {
     // Two different senders happen to reuse the same numeric stream_id -
     // each one's is only unique per-connection, so this can genuinely
     // happen.
-    state.on_channel_stream_start("general", UserId(2), "bob".into(), 1);
-    state.on_channel_stream_start("general", UserId(3), "carol".into(), 1);
+    state.on_channel_stream_start("general", UserId(2), "bob".into(), 1, false);
+    state.on_channel_stream_start("general", UserId(3), "carol".into(), 1, false);
     assert_eq!(state.channels[0].log.len(), 2);
 
     state.on_channel_stream_finished("general", UserId(3), 1, 2000, vec![7, 7]);
@@ -891,6 +929,81 @@ fn finalize_matches_by_from_and_stream_id_not_stream_id_alone() {
             pcm: vec![7, 7]
         }
     );
+}
+
+// ---------------------------------------------------------------------
+// Focus-gated autoplay and the "not listened" marker (docs/SPEC.md
+// Functionality #4/#15's neighbor - see requirements.toml US-055)
+// ---------------------------------------------------------------------
+
+/// `on_channel_stream_start`'s `suppress_playback` parameter (set by its
+/// caller, `channel::on_stream_start`, from `suppress_playback_from(...)
+/// || !is_viewing_channel(...)`) is what a fresh placeholder's `listened`
+/// starts as - suppressed audio (muted, trust-gated, or simply not the
+/// channel on screen) starts life unheard; audio that autoplays starts
+/// life heard.
+/// @requirement AC-357
+#[test]
+fn on_channel_stream_start_sets_listened_from_suppress_playback() {
+    let mut suppressed = joined_general_with(vec![user(2, "bob")]);
+    suppressed.on_channel_stream_start("general", UserId(2), "bob".into(), 1, true);
+    assert!(!suppressed.channels[0].log[0].listened);
+
+    let mut autoplayed = joined_general_with(vec![user(2, "bob")]);
+    autoplayed.on_channel_stream_start("general", UserId(2), "bob".into(), 1, false);
+    assert!(autoplayed.channels[0].log[0].listened);
+}
+
+/// Our own recording is never "unlistened" - the marker only ever applies
+/// to something received.
+/// @requirement AC-357
+#[test]
+fn log_own_voice_stream_start_channel_always_starts_listened() {
+    let mut state = joined_general_with(vec![]);
+    state.log_own_voice_stream_start_channel("general", 7, None);
+    assert!(state.channels[0].log[0].listened);
+}
+
+/// @requirement AC-357
+#[test]
+fn a_received_unlistened_voice_row_shows_a_red_not_listened_marker() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.on_channel_stream_start("general", UserId(2), "bob".into(), 1, true);
+    state.on_channel_stream_finished("general", UserId(2), 1, 1000, vec![1, 2]);
+    assert!(!state.channels[0].log[0].listened);
+
+    let backend = TestBackend::new(100, 15);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| render(f, &state)).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    let (x, y) = find_text_start(&buffer, "not listened");
+    assert_eq!(buffer[(x, y)].fg, ratatui::style::Color::Red);
+}
+
+/// @requirement AC-357
+#[test]
+fn a_listened_voice_row_shows_no_marker() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.on_channel_stream_start("general", UserId(2), "bob".into(), 1, false);
+    state.on_channel_stream_finished("general", UserId(2), 1, 1000, vec![1, 2]);
+    assert!(state.channels[0].log[0].listened);
+
+    let rows = sidebar_rows(&state);
+    assert!(!rows.iter().any(|r| r.contains("not listened")), "{rows:?}");
+}
+
+/// An unlistened row we sent ourselves never gets the marker either - it
+/// is a received-only concept.
+/// @requirement AC-357
+#[test]
+fn an_outgoing_voice_row_never_shows_the_marker_even_if_listened_were_somehow_false() {
+    let mut state = joined_general_with(vec![]);
+    state.log_own_voice_stream_start_channel("general", 7, None);
+    state.channels[0].log[0].listened = false; // shouldn't happen in practice; belt-and-suspenders
+    state.on_channel_stream_finished("general", UserId(1), 7, 900, vec![9, 9]);
+
+    let rows = sidebar_rows(&state);
+    assert!(!rows.iter().any(|r| r.contains("not listened")), "{rows:?}");
 }
 
 // ---------------------------------------------------------------------
@@ -3550,4 +3663,182 @@ fn a_different_nickname_is_never_adopted_and_neither_is_a_peer_still_online() {
         2,
         "nothing was offline, so nothing was taken over"
     );
+}
+
+// ---------------------------------------------------------------------
+// `resume_from_log` - lazily resuming a channel's history from disk.
+// ---------------------------------------------------------------------
+
+/// @requirement AC-361
+#[test]
+fn resume_from_log_off_never_loads_anything() {
+    let _home = shared_aloo_home();
+    let server_label = "resume-off_1";
+    autosave_texts(server_label, &["msg0", "msg1", "msg2"]);
+
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.server_label = server_label.to_string();
+    state.resume_from_log = false;
+    state.select_channel_at(0);
+
+    assert!(state.channels[0].log.is_empty(), "off means off: {:?}", state.channels[0].log);
+    assert!(state.channels[0].history_cursor.is_none());
+}
+
+/// The first time a channel with existing history is viewed, a chunk
+/// loads automatically - no key has to be pressed for it to show up.
+/// @requirement AC-361
+#[test]
+fn resume_from_log_seeds_the_initial_chunk_on_first_view() {
+    let _home = shared_aloo_home();
+    let server_label = "resume-seed_1";
+    autosave_texts(server_label, &["msg0", "msg1", "msg2"]);
+
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.server_label = server_label.to_string();
+    state.resume_from_log = true;
+    // A small height keeps this test's chunk small without needing dozens
+    // of lines - `history_chunk_size` floors at 5, and there are only 3
+    // records on disk, so all of them load in the one chunk.
+    state
+        .last_messages_area_height
+        .store(5, std::sync::atomic::Ordering::Relaxed);
+    state.select_channel_at(0);
+
+    let bodies: Vec<&MessageBody> = state.channels[0].log.iter().map(|e| &e.body).collect();
+    assert_eq!(
+        bodies,
+        vec![
+            &MessageBody::Text("msg0".to_string()),
+            &MessageBody::Text("msg1".to_string()),
+            &MessageBody::Text("msg2".to_string()),
+        ],
+        "oldest first, exactly what was on disk"
+    );
+    assert_eq!(state.message_selected, 2, "scrolled to the newest entry, like opening any chat");
+    assert!(!state.channels[0].history_cursor.as_ref().unwrap().has_more());
+}
+
+/// With `autosave_messages` off, nothing this session ever reached disk -
+/// so a channel that already holds live entries (received before its
+/// first view) must not have that count skipped against the file's own
+/// history, or genuine never-seen records would be silently dropped.
+/// Reverting the `autosave_messages`-gated skip in `load_history_chunk`
+/// back to an unconditional `log.len()` makes this fail: with 2 live
+/// entries already in the channel, it would skip the last 2 of the 3
+/// on-disk records and load only "msg0".
+/// @requirement AC-364
+#[test]
+fn resuming_history_does_not_skip_real_history_when_autosave_was_off() {
+    let _home = shared_aloo_home();
+    let server_label = "resume-no-autosave-overlap_1";
+    autosave_texts(server_label, &["msg0", "msg1", "msg2"]);
+
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.server_label = server_label.to_string();
+    state.resume_from_log = true;
+    assert!(!state.autosave_messages, "this session never wrote anything to disk");
+    state
+        .last_messages_area_height
+        .store(5, std::sync::atomic::Ordering::Relaxed);
+    // Two live entries already in the channel - as if received this
+    // session before it was ever viewed - with autosave off, so nothing
+    // among them was ever mirrored to `server_label`'s file.
+    for text in ["live0", "live1"] {
+        state.channels[0].log.push(aloo::client::tui::ui::LogEntry {
+            from: UserId(2),
+            from_name: "bob".into(),
+            to_name: None,
+            body: MessageBody::Text(text.to_string()),
+            outgoing: false,
+            failed: false,
+            sent_at: "12:00".into(),
+            sent_at_utc: "2026-08-26T12:00:00Z".into(),
+            owed_receipt: None,
+            listened: true,
+            delivery: None,
+            crypto: None,
+        });
+    }
+
+    state.select_channel_at(0);
+
+    let bodies: Vec<&MessageBody> = state.channels[0].log.iter().map(|e| &e.body).collect();
+    assert_eq!(
+        bodies,
+        vec![
+            &MessageBody::Text("msg0".to_string()),
+            &MessageBody::Text("msg1".to_string()),
+            &MessageBody::Text("msg2".to_string()),
+            &MessageBody::Text("live0".to_string()),
+            &MessageBody::Text("live1".to_string()),
+        ],
+        "every on-disk record, none skipped, ahead of the two live ones"
+    );
+}
+
+/// Revisiting an already-seeded channel (switching away and back) must not
+/// load another chunk on top of what's already there - only scrolling to
+/// the top does that (the next test).
+/// @requirement AC-362
+#[test]
+fn resume_from_log_does_not_reload_on_a_plain_revisit() {
+    let _home = shared_aloo_home();
+    let server_label = "resume-no-double-load_1";
+    autosave_texts(server_label, &["msg0", "msg1", "msg2"]);
+
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.on_joined(ChannelInfo { name: "second".into(), kind: ChannelKind::Public });
+    state.server_label = server_label.to_string();
+    state.resume_from_log = true;
+    state.last_messages_area_height.store(5, std::sync::atomic::Ordering::Relaxed);
+
+    state.select_channel_at(0); // "general" - seeds 3 entries
+    assert_eq!(state.channels[0].log.len(), 3);
+    state.select_channel_at(1); // "second" - nothing on disk for it
+    state.select_channel_at(0); // back to "general"
+    assert_eq!(state.channels[0].log.len(), 3, "revisiting must not duplicate the already-loaded chunk");
+}
+
+/// Scrolling `Up` past the top of what's loaded pulls in another chunk -
+/// the mechanism the initial-seed test above doesn't exercise (there,
+/// everything fit in one chunk).
+/// @requirement AC-362
+#[test]
+fn scrolling_to_the_top_loads_another_chunk() {
+    let _home = shared_aloo_home();
+    let server_label = "resume-scroll-more_1";
+    let all: Vec<String> = (0..8).map(|n| format!("msg{n}")).collect();
+    autosave_texts(server_label, &all.iter().map(String::as_str).collect::<Vec<_>>());
+
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.server_label = server_label.to_string();
+    state.resume_from_log = true;
+    state.last_messages_area_height.store(5, std::sync::atomic::Ordering::Relaxed);
+    state.select_channel_at(0);
+
+    // The floor-of-5 chunk pulled in the 5 newest (msg3..msg7); 3 remain.
+    assert_eq!(state.channels[0].log.len(), 5);
+    assert!(state.channels[0].history_cursor.as_ref().unwrap().has_more());
+
+    state.focus = Focus::Messages;
+    state.message_selected = 0; // already at the top of what's loaded
+    press(&mut state, KeyCode::Up);
+
+    let bodies: Vec<&MessageBody> = state.channels[0].log.iter().map(|e| &e.body).collect();
+    assert_eq!(
+        bodies,
+        vec![
+            &MessageBody::Text("msg0".to_string()),
+            &MessageBody::Text("msg1".to_string()),
+            &MessageBody::Text("msg2".to_string()),
+            &MessageBody::Text("msg3".to_string()),
+            &MessageBody::Text("msg4".to_string()),
+            &MessageBody::Text("msg5".to_string()),
+            &MessageBody::Text("msg6".to_string()),
+            &MessageBody::Text("msg7".to_string()),
+        ],
+        "all 8 now loaded, still oldest-first"
+    );
+    assert!(!state.channels[0].history_cursor.as_ref().unwrap().has_more(), "nothing left on disk");
 }

@@ -295,7 +295,7 @@ fn space_press_with_an_offline_dm_peer_is_ignored_and_does_not_start_recording()
 #[test]
 fn on_direct_stream_start_and_finished_swap_the_placeholder_body_in_place() {
     let mut state = joined_general_with(vec![user(2, "bob")]);
-    state.on_direct_stream_start(UserId(2), UserId(2), "bob".into(), 5);
+    state.on_direct_stream_start(UserId(2), UserId(2), "bob".into(), 5, false);
     let room = state.private_rooms.get(&UserId(2)).unwrap();
     assert_eq!(
         room.log[0].body,

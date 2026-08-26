@@ -500,14 +500,18 @@ pub(crate) fn on_stream_start(
 ) {
     // Snapshotted once, same as the decrypt key set itself (PROTOCOL.md
     // §11.2/§12): a Pending/Rejected sender's stream is never played live,
-    // and neither is a `/mute-voice`d one (docs/SPEC.md Functionality #15).
-    let suppress_playback = ui_state.suppress_playback_from(from);
+    // neither is a `/mute-voice`d one (docs/SPEC.md Functionality #15), and
+    // now neither is one arriving in a channel that isn't the one currently
+    // on screen - autoplay only ever happens where the user is actually
+    // looking.
+    let suppress_playback =
+        ui_state.suppress_playback_from(from) || !ui_state.is_viewing_channel(&channel);
     let sender_public_key_der = ui_state
         .known_users
         .get(&from)
         .map(|u| u.public_key_der.clone())
         .unwrap_or_default();
-    ui_state.on_channel_stream_start(&channel, from, from_name, stream_id);
+    ui_state.on_channel_stream_start(&channel, from, from_name, stream_id, suppress_playback);
     voice_stream::start_incoming_stream(
         session,
         from,

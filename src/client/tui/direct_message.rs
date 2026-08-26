@@ -27,6 +27,9 @@ pub struct PrivateRoom {
     /// sidebar's next to the peer (`docs/SPEC.md` "Connected UI").
     /// Cleared the moment the room is selected again (`select_dm`).
     pub unread: bool,
+    /// `resume_from_log`'s reader for this DM's `.log` file - see
+    /// `ChannelTab::history_cursor`'s doc, same lifetime/meaning.
+    pub history_cursor: Option<crate::client::export::LogHistoryCursor>,
 }
 
 impl UiState {
@@ -68,6 +71,7 @@ impl UiState {
                 peer: fallback,
                 log: Vec::new(),
                 unread: false,
+                history_cursor: None,
             },
         );
         self.dm_order.push(peer);
@@ -89,13 +93,17 @@ impl UiState {
         self.selected_dm = Some(peer);
         self.active_private_room = Some(peer);
         self.focus = Focus::Input;
-        let log_len = match self.private_rooms.get_mut(&peer) {
-            Some(room) => {
-                room.unread = false;
-                room.log.len()
-            }
-            None => 0,
-        };
+        let needs_initial_history = self.resume_from_log
+            && self.private_rooms.get(&peer).is_some_and(|r| r.history_cursor.is_none());
+        if let Some(room) = self.private_rooms.get_mut(&peer) {
+            room.unread = false;
+        }
+        // Same "first viewing only" guard as `select_channel_at` - see its
+        // doc for why a plain revisit must not trigger this too.
+        if needs_initial_history {
+            self.load_history_chunk();
+        }
+        let log_len = self.private_rooms.get(&peer).map(|r| r.log.len()).unwrap_or(0);
         self.message_selected = log_len.saturating_sub(1);
     }
 
@@ -115,7 +123,7 @@ impl UiState {
     }
 
     /// Whether the private room with `peer` is the one currently open.
-    fn is_viewing_dm(&self, peer: UserId) -> bool {
+    pub(crate) fn is_viewing_dm(&self, peer: UserId) -> bool {
         self.active_private_room == Some(peer)
     }
 
@@ -128,7 +136,9 @@ impl UiState {
             outgoing: false,
             failed: false,
             sent_at: local_time_stamp(),
+            sent_at_utc: crate::client::export::utc_time_stamp(),
             owed_receipt: None,
+            listened: true,
             delivery: None,
             crypto: self.message_crypto(from, false),
         };
@@ -154,12 +164,20 @@ impl UiState {
                 key_mode: KeyMode::PqHybrid,
             });
         self.ensure_private_room(from, fallback_peer);
+        let autosave = self.autosave_messages.then(|| self.server_label.clone());
         let Some(room) = self.private_rooms.get_mut(&from) else {
             return;
         };
         push_log_entry(&mut room.log, &mut self.message_selected, is_current, entry);
         if unread {
             room.unread = true;
+        }
+        if let Some(server_label) = &autosave {
+            crate::client::export::autosave_entry(
+                server_label,
+                crate::client::export::Surface::Dm(&from_name),
+                room.log.last().unwrap(),
+            );
         }
     }
 
@@ -168,7 +186,9 @@ impl UiState {
         let from_name = self.own_name.clone();
         let is_current = self.is_viewing_dm(to);
         let crypto = self.message_crypto(to, true);
+        let autosave = self.autosave_messages.then(|| self.server_label.clone());
         if let Some(room) = self.private_rooms.get_mut(&to) {
+            let peer_name = room.peer.name.clone();
             push_log_entry(
                 &mut room.log,
                 &mut self.message_selected,
@@ -181,11 +201,20 @@ impl UiState {
                     outgoing: true,
                     failed: false,
                     sent_at: local_time_stamp(),
+                    sent_at_utc: crate::client::export::utc_time_stamp(),
                     owed_receipt: None,
+                    listened: true,
                     delivery: None,
                     crypto,
                 },
             );
+            if let Some(server_label) = &autosave {
+                crate::client::export::autosave_entry(
+                    server_label,
+                    crate::client::export::Surface::Dm(&peer_name),
+                    room.log.last().unwrap(),
+                );
+            }
         }
     }
 
@@ -200,6 +229,8 @@ impl UiState {
         let is_current = self.is_viewing_dm(to);
         let crypto = self.message_crypto(to, true);
         if let Some(room) = self.private_rooms.get_mut(&to) {
+            // No autosave hook here - see the sibling comment in
+            // `channel::log_own_voice_stream_start_channel`.
             push_log_entry(
                 &mut room.log,
                 &mut self.message_selected,
@@ -212,7 +243,9 @@ impl UiState {
                     outgoing: true,
                     failed: false,
                     sent_at: local_time_stamp(),
+                    sent_at_utc: crate::client::export::utc_time_stamp(),
                     owed_receipt: None,
+                    listened: true,
                     delivery,
                     crypto,
                 },
@@ -226,6 +259,7 @@ impl UiState {
         from: UserId,
         from_name: String,
         stream_id: u64,
+        suppress_playback: bool,
     ) {
         let entry = LogEntry {
             from,
@@ -235,7 +269,9 @@ impl UiState {
             outgoing: false,
             failed: false,
             sent_at: local_time_stamp(),
+            sent_at_utc: crate::client::export::utc_time_stamp(),
             owed_receipt: None,
+            listened: !suppress_playback,
             delivery: None,
             crypto: self.message_crypto(from, false),
         };
@@ -259,6 +295,8 @@ impl UiState {
         let Some(room) = self.private_rooms.get_mut(&peer_id) else {
             return;
         };
+        // No autosave hook here - see the sibling comment in
+        // `channel::log_own_voice_stream_start_channel`.
         push_log_entry(&mut room.log, &mut self.message_selected, is_current, entry);
         if unread {
             room.unread = true;
@@ -277,10 +315,19 @@ impl UiState {
         duration_ms: u32,
         pcm: Vec<u8>,
     ) {
-        if let Some(room) = self.private_rooms.get_mut(&peer_id)
-            && finalize_stream_entry(&mut room.log, from, stream_id, duration_ms, pcm.clone())
-        {
-            return;
+        let autosave = self.autosave_messages.then(|| self.server_label.clone());
+        if let Some(room) = self.private_rooms.get_mut(&peer_id) {
+            let peer_name = room.peer.name.clone();
+            if let Some(entry) = finalize_stream_entry(&mut room.log, from, stream_id, duration_ms, pcm.clone()) {
+                if let Some(server_label) = &autosave {
+                    crate::client::export::autosave_entry(
+                        server_label,
+                        crate::client::export::Surface::Dm(&peer_name),
+                        entry,
+                    );
+                }
+                return;
+            }
         }
         if let Some(held) = self.pending_messages.get_mut(&peer_id) {
             finalize_held_stream(held, from, stream_id, duration_ms, pcm);
@@ -309,6 +356,7 @@ impl UiState {
                 key_mode: KeyMode::PqHybrid,
             });
         self.ensure_private_room(peer, fallback_peer);
+        let autosave = self.autosave_messages.then(|| self.server_label.clone());
         let Some(room) = self.private_rooms.get_mut(&peer) else {
             return;
         };
@@ -324,7 +372,9 @@ impl UiState {
                 outgoing: false,
                 failed: false,
                 sent_at: local_time_stamp(),
+                sent_at_utc: crate::client::export::utc_time_stamp(),
                 owed_receipt: None,
+                listened: true,
                 delivery: None,
                 // The app narrating its own OTP setup, not a message that
                 // travelled - there is no encryption to report on it.
@@ -333,6 +383,13 @@ impl UiState {
         );
         if unread {
             room.unread = true;
+        }
+        if let Some(server_label) = &autosave {
+            crate::client::export::autosave_entry(
+                server_label,
+                crate::client::export::Surface::Dm(peer_name),
+                room.log.last().unwrap(),
+            );
         }
     }
 
@@ -360,8 +417,10 @@ impl UiState {
         let from_name = self.own_name.clone();
         let is_current = self.is_viewing_dm(to);
         let crypto = self.message_crypto(to, true);
+        let autosave = self.autosave_messages.then(|| self.server_label.clone());
         let room = self.private_rooms.get_mut(&to)?;
         let index = room.log.len();
+        let peer_name = room.peer.name.clone();
         push_log_entry(
             &mut room.log,
             &mut self.message_selected,
@@ -374,11 +433,20 @@ impl UiState {
                 outgoing: true,
                 failed: false,
                 sent_at: local_time_stamp(),
+                sent_at_utc: crate::client::export::utc_time_stamp(),
                 owed_receipt: None,
+                listened: true,
                 delivery,
                 crypto,
             },
         );
+        if let Some(server_label) = &autosave {
+            crate::client::export::autosave_entry(
+                server_label,
+                crate::client::export::Surface::Dm(&peer_name),
+                room.log.last().unwrap(),
+            );
+        }
         Some(index)
     }
 
@@ -410,7 +478,9 @@ impl UiState {
         let from_name = self.own_name.clone();
         let is_current = self.is_viewing_dm(to);
         let crypto = self.message_crypto(to, true);
+        let autosave = self.autosave_messages.then(|| self.server_label.clone());
         if let Some(room) = self.private_rooms.get_mut(&to) {
+            let peer_name = room.peer.name.clone();
             push_log_entry(
                 &mut room.log,
                 &mut self.message_selected,
@@ -428,11 +498,20 @@ impl UiState {
                     outgoing: true,
                     failed: false,
                     sent_at: local_time_stamp(),
+                    sent_at_utc: crate::client::export::utc_time_stamp(),
                     owed_receipt: None,
+                    listened: true,
                     delivery,
                     crypto,
                 },
             );
+            if let Some(server_label) = &autosave {
+                crate::client::export::autosave_entry(
+                    server_label,
+                    crate::client::export::Surface::Dm(&peer_name),
+                    room.log.last().unwrap(),
+                );
+            }
         }
     }
 
@@ -459,6 +538,7 @@ impl UiState {
                 key_mode: KeyMode::PqHybrid,
             });
         self.ensure_private_room(from, fallback_peer);
+        let autosave = self.autosave_messages.then(|| self.server_label.clone());
         let Some(room) = self.private_rooms.get_mut(&from) else {
             return;
         };
@@ -468,7 +548,7 @@ impl UiState {
             is_current,
             LogEntry {
                 from,
-                from_name,
+                from_name: from_name.clone(),
                 to_name: None,
                 body: MessageBody::File {
                     filename,
@@ -479,13 +559,22 @@ impl UiState {
                 outgoing: false,
                 failed: false,
                 sent_at: local_time_stamp(),
+                sent_at_utc: crate::client::export::utc_time_stamp(),
                 owed_receipt: None,
+                listened: true,
                 delivery: None,
                 crypto,
             },
         );
         if unread {
             room.unread = true;
+        }
+        if let Some(server_label) = &autosave {
+            crate::client::export::autosave_entry(
+                server_label,
+                crate::client::export::Surface::Dm(&from_name),
+                room.log.last().unwrap(),
+            );
         }
     }
 }

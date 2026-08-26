@@ -68,15 +68,40 @@ async fn release_global_shortcut(w: &mut AlooWorld) {
 #[given(expr = "{word} starts streaming a voice message into the channel")]
 async fn peer_starts_stream(w: &mut AlooWorld, name: String) {
     let id = UserId(id_for(&name));
-    w.ui_mut().on_channel_stream_start("general", id, name, 42);
+    w.ui_mut().on_channel_stream_start("general", id, name, 42, false);
 }
 
 #[given(expr = "{word} starts streaming a voice message into our private room")]
 async fn peer_starts_dm_stream(w: &mut AlooWorld, name: String) {
     let id = UserId(id_for(&name));
-    w.ui_mut().on_direct_stream_start(id, id, name, 5);
+    w.ui_mut().on_direct_stream_start(id, id, name, 5, false);
 }
 
+/// The autoplay-focus-gating counterpart of `peer_starts_stream` above -
+/// `true` here stands in for what `channel::on_stream_start` computes
+/// itself (`suppress_playback_from(...) || !is_viewing_channel(...)`) when
+/// the channel a stream arrives in is not the one on screen.
+#[given(expr = "{word} starts streaming a voice message into a channel I am not viewing")]
+async fn peer_starts_stream_unfocused(w: &mut AlooWorld, name: String) {
+    let id = UserId(id_for(&name));
+    w.ui_mut().on_channel_stream_start("general", id, name, 42, true);
+}
+
+/// The DM counterpart of `peer_starts_stream_unfocused` above - `true`
+/// stands in for what `direct_message::on_stream_start` computes itself
+/// (`suppress_playback_from(...) || !is_viewing_dm(...)`) when the peer a
+/// stream arrives from is not the private room on screen.
+#[given(expr = "{word} starts streaming a voice message into a private room I am not viewing")]
+async fn peer_starts_dm_stream_unfocused(w: &mut AlooWorld, name: String) {
+    let id = UserId(id_for(&name));
+    w.ui_mut().on_direct_stream_start(id, id, name, 5, true);
+}
+
+// Both keywords: used as a `When` (the event under test) in most
+// scenarios, but as a `Given`-chain `And` in "Replaying an unlistened
+// voice message clears the marker" (`voice_listened_marker.feature`),
+// which sets the message up before the real `When I press Enter`.
+#[given(expr = "{word}'s voice message finishes after {int} milliseconds")]
 #[when(expr = "{word}'s voice message finishes after {int} milliseconds")]
 async fn peer_stream_finishes(w: &mut AlooWorld, name: String, duration: u32) {
     let id = UserId(id_for(&name));
@@ -84,6 +109,10 @@ async fn peer_stream_finishes(w: &mut AlooWorld, name: String, duration: u32) {
         .on_channel_stream_finished("general", id, 42, duration, vec![1, 2, 3, 4]);
 }
 
+// Both keywords, same reason as `peer_stream_finishes` above: used as a
+// `Given`-chain `And` in "Replaying an unlistened DM voice message clears
+// the marker" (`voice_listened_marker.feature`).
+#[given(expr = "{word}'s private voice message finishes after {int} milliseconds")]
 #[when(expr = "{word}'s private voice message finishes after {int} milliseconds")]
 async fn peer_dm_stream_finishes(w: &mut AlooWorld, name: String, duration: u32) {
     let id = UserId(id_for(&name));
@@ -742,6 +771,50 @@ async fn then_playback_not_suppressed(w: &mut AlooWorld, name: String) {
     assert!(
         !w.ui_ref().suppress_playback_from(id),
         "audio from {name} should play as usual"
+    );
+}
+
+#[then("the row shows a red not listened marker")]
+async fn shows_not_listened_marker(w: &mut AlooWorld) {
+    let rows = ui_rows(w.ui_ref());
+    assert!(
+        rows.iter().any(|r| r.contains("not listened")),
+        "expected a \"not listened\" marker: {rows:?}"
+    );
+}
+
+#[then("the row shows no not listened marker")]
+async fn shows_no_not_listened_marker(w: &mut AlooWorld) {
+    let rows = ui_rows(w.ui_ref());
+    assert!(
+        !rows.iter().any(|r| r.contains("not listened")),
+        "expected no \"not listened\" marker: {rows:?}"
+    );
+}
+
+// The two steps above render the currently active view (`ui_rows`), which
+// only works while the surface under test is actually on screen - not true
+// for a DM scenario's "not viewing" case, where the private room is
+// deliberately never opened. These check the room's own `LogEntry` state
+// directly instead, the same condition `render_messages` gates the marker
+// on (`!entry.outgoing && !entry.listened`).
+#[then("the private room shows a red not listened marker")]
+async fn dm_shows_not_listened_marker(w: &mut AlooWorld) {
+    let room = w.ui_ref().private_rooms.get(&UserId(2)).expect("no private room");
+    let entry = room.log.last().expect("no message in the private room");
+    assert!(
+        !entry.outgoing && !entry.listened,
+        "expected the row to be unlistened: {entry:?}"
+    );
+}
+
+#[then("the private room shows no not listened marker")]
+async fn dm_shows_no_not_listened_marker(w: &mut AlooWorld) {
+    let room = w.ui_ref().private_rooms.get(&UserId(2)).expect("no private room");
+    let entry = room.log.last().expect("no message in the private room");
+    assert!(
+        entry.outgoing || entry.listened,
+        "expected the row to be listened: {entry:?}"
     );
 }
 

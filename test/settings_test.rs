@@ -323,6 +323,158 @@ fn an_empty_shortcut_value_is_ignored_in_favor_of_the_default() {
     std::fs::remove_file(&path).ok();
 }
 
+/// @requirement AC-355
+#[test]
+fn autosave_messages_defaults_off_and_is_always_written() {
+    let path = temp_settings_path();
+    let settings = Settings::load_or_create(&path).unwrap();
+    assert!(!settings.autosave_messages);
+    let contents = std::fs::read_to_string(&path).unwrap();
+    assert!(contents.contains("autosave_messages=off"));
+    std::fs::remove_file(&path).ok();
+}
+
+/// @requirement AC-355
+#[test]
+fn autosave_messages_round_trips_on() {
+    let path = temp_settings_path();
+    let saved = Settings {
+        autosave_messages: true,
+        ..Settings::default()
+    };
+    saved.save(&path).unwrap();
+    let loaded = Settings::load_or_create(&path).unwrap();
+    assert_eq!(loaded, saved);
+    assert!(loaded.autosave_messages);
+    std::fs::remove_file(&path).ok();
+}
+
+/// @requirement AC-359
+#[test]
+fn resume_from_log_defaults_off_and_is_always_written() {
+    let path = temp_settings_path();
+    let settings = Settings::load_or_create(&path).unwrap();
+    assert!(!settings.resume_from_log);
+    let contents = std::fs::read_to_string(&path).unwrap();
+    assert!(contents.contains("resume_from_log=off"));
+    std::fs::remove_file(&path).ok();
+}
+
+/// @requirement AC-359
+#[test]
+fn resume_from_log_round_trips_on() {
+    let path = temp_settings_path();
+    let saved = Settings {
+        resume_from_log: true,
+        ..Settings::default()
+    };
+    saved.save(&path).unwrap();
+    let loaded = Settings::load_or_create(&path).unwrap();
+    assert_eq!(loaded, saved);
+    assert!(loaded.resume_from_log);
+    std::fs::remove_file(&path).ok();
+}
+
+// ---------------------------------------------------------------------
+// The scaffold `load_or_create` writes for a machine's very first run:
+// two `#`-commented sections, client options then server options.
+// ---------------------------------------------------------------------
+
+/// @requirement AC-356
+#[test]
+fn the_first_run_scaffold_is_split_into_client_and_server_sections_in_order() {
+    let path = temp_settings_path();
+    Settings::load_or_create(&path).unwrap();
+    let contents = std::fs::read_to_string(&path).unwrap();
+
+    let client_at = contents.find("# client options").expect("missing client section header");
+    let server_at = contents.find("# server options").expect("missing server section header");
+    assert!(client_at < server_at, "client options must come first: {contents}");
+
+    // Every client-side key appears before the server section starts...
+    for key in [
+        "global_ptt_enabled=",
+        "autosave_messages=",
+        "resume_from_log=",
+        "daemon_host=",
+        "connect_using_ssl=",
+    ] {
+        let at = contents.find(key).unwrap_or_else(|| panic!("missing {key:?} in:\n{contents}"));
+        assert!(at < server_at, "{key:?} should be in the client section: {contents}");
+    }
+    // ...and every server-side key appears after it starts.
+    for key in ["server_bind=", "server_ssl=", "server_allow_create_public_channels="] {
+        let at = contents.find(key).unwrap_or_else(|| panic!("missing {key:?} in:\n{contents}"));
+        assert!(at > server_at, "{key:?} should be in the server section: {contents}");
+    }
+    std::fs::remove_file(&path).ok();
+}
+
+/// Every accumulating (one-line-per-entry) setting - which has nothing
+/// real to pre-populate on a fresh file - still shows up as a commented
+/// example, so a user editing the file by hand can discover its syntax
+/// without reading the docs. Commented means inert: reloading the freshly
+/// scaffolded file must not actually populate any of them.
+/// @requirement AC-356
+#[test]
+fn the_scaffold_shows_every_accumulating_key_as_a_commented_example_that_never_loads() {
+    let path = temp_settings_path();
+    let settings = Settings::load_or_create(&path).unwrap();
+    let contents = std::fs::read_to_string(&path).unwrap();
+
+    for example in [
+        "# muted_voice=somenickname",
+        "# daemon_channel=otherchannel",
+        "# direct_punch_to=alice,alicehost.com:7879,every_1m",
+        "# direct_punch_channel=the-hall",
+        "# server_superadmin=somenickname",
+    ] {
+        assert!(
+            contents.contains(example),
+            "missing commented example {example:?} in:\n{contents}"
+        );
+    }
+    assert!(settings.muted_voice.is_empty());
+    assert!(settings.daemon_channels.is_empty());
+    assert!(settings.direct_punch_to.is_empty());
+    assert!(settings.direct_punch_channels.is_empty());
+    assert!(settings.server_superadmin.is_empty());
+    std::fs::remove_file(&path).ok();
+}
+
+/// A blank line separates the two sections - not just the header comment.
+/// @requirement AC-356
+#[test]
+fn a_blank_line_separates_the_client_and_server_sections() {
+    let path = temp_settings_path();
+    Settings::load_or_create(&path).unwrap();
+    let contents = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        contents.contains("\n\n# server options"),
+        "expected a blank line right before the server section header: {contents}"
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// The scaffold is only ever written once, on first run - a mid-session
+/// write (`save`/`update`, used by every ordinary action) must stay the
+/// sparse, unsectioned shape it always was, or every existing caller
+/// (`/mute-voice`, `remember_connection`, ...) would start emitting a full
+/// commented file on every ordinary save.
+/// @requirement AC-356
+#[test]
+fn an_ordinary_save_after_the_first_run_does_not_add_section_comments() {
+    let path = temp_settings_path();
+    Settings::load_or_create(&path).unwrap();
+    Settings::update(&path, |s| s.global_ptt_enabled = false).unwrap();
+    let contents = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        !contents.contains('#'),
+        "a plain `update`/`save` must not scaffold section comments: {contents}"
+    );
+    std::fs::remove_file(&path).ok();
+}
+
 // ---------------------------------------------------------------------
 // muted_voice (`/mute-voice`, docs/SPEC.md Functionality #15)
 // ---------------------------------------------------------------------
@@ -830,11 +982,11 @@ fn the_last_connection_is_remembered_and_read_back() {
     assert_eq!(settings.connect_host.as_deref(), Some("chat.example.com"));
     assert_eq!(settings.connect_port, Some(6667));
     assert_eq!(settings.connect_nickname.as_deref(), Some("dave"));
-    assert!(!settings.connect_ssl);
+    assert!(!settings.connect_using_ssl);
 
     let contents = std::fs::read_to_string(&path).unwrap();
     assert!(contents.contains("connect_nickname=dave"), "{contents}");
-    assert!(contents.contains("connect_ssl=off"), "{contents}");
+    assert!(contents.contains("connect_using_ssl=off"), "{contents}");
     assert!(
         !contents.contains("connect_password"),
         "there is no connect_password key at all: {contents}"
@@ -857,7 +1009,7 @@ fn a_second_connection_replaces_what_the_first_recorded() {
     assert_eq!(settings.connect_host.as_deref(), Some("second.example.com"));
     assert_eq!(settings.connect_port, Some(2222));
     assert_eq!(settings.connect_nickname.as_deref(), Some("erin"));
-    assert!(!settings.connect_ssl, "the second connection was plain");
+    assert!(!settings.connect_using_ssl, "the second connection was plain");
     let _ = std::fs::remove_file(&path);
 }
 

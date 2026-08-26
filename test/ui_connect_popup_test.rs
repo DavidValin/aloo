@@ -70,14 +70,15 @@ fn tab_key_advances_focus() {
 }
 
 /// `ssl` is not a popup field at all - like `server_ssl` on the server
-/// side, it is settings-only (`connect_ssl`). The popup only ever carries
+/// side, it is settings-only (`connect_using_ssl`, shared with daemon
+/// mode, with no CLI override either). The popup only ever carries
 /// whatever value was captured from settings when it opened, silently,
 /// into the request it builds; no key anywhere in the popup can change it.
 /// @requirement AC-269, TB-001
 #[test]
 fn ssl_is_settings_only_and_cannot_be_toggled_from_the_popup() {
     let mut state = ConnectPopupState::new();
-    assert!(!state.ssl, "plain TCP unless connect_ssl said otherwise");
+    assert!(!state.ssl, "plain TCP unless connect_using_ssl said otherwise");
     // Every key a user could press, on every field, leaves it alone.
     for field in state.focus_order() {
         state.focus = field;
@@ -917,13 +918,31 @@ fn the_read_only_info_block_is_centered_with_a_blank_line_above_and_below() {
     let row_at = |yi: u16| -> String { (0..buffer.area.width).map(|x| buffer[(x, yi)].symbol()).collect() };
     assert!(row_at(y - 1).contains("file_priv"), "file_priv sits directly above ALOO_HOME: {:?}", row_at(y - 1));
 
-    let is_blank =
-        |s: &str| s.chars().all(|c| c == ' ' || c == '│');
-    assert!(is_blank(&row_at(y + 1)), "a blank row directly below ALOO_HOME (the block's bottom): {:?}", row_at(y + 1));
+    // Only the popup's own interior (strictly between its left and right
+    // border) needs to be blank here - outside it is the background
+    // animation's territory (`DigitalRain`), which this test isn't about.
+    let is_blank_inside_popup = |s: &str| {
+        let chars: Vec<char> = s.chars().collect();
+        match (chars.iter().position(|&c| c == '│'), chars.iter().rposition(|&c| c == '│')) {
+            (Some(left), Some(right)) if left < right => {
+                chars[left + 1..right].iter().all(|&c| c == ' ')
+            }
+            _ => false,
+        }
+    };
+    assert!(
+        is_blank_inside_popup(&row_at(y + 1)),
+        "a blank row directly below ALOO_HOME (the block's bottom): {:?}",
+        row_at(y + 1)
+    );
     // Walk up from file_priv, past file_pub, to the block's own top -
     // exactly one blank row separates it from the form above.
     assert!(row_at(y - 2).contains("file_pub"), "file_pub sits directly above file_priv: {:?}", row_at(y - 2));
-    assert!(is_blank(&row_at(y - 3)), "a blank row directly above file_pub (the block's top): {:?}", row_at(y - 3));
+    assert!(
+        is_blank_inside_popup(&row_at(y - 3)),
+        "a blank row directly above file_pub (the block's top): {:?}",
+        row_at(y - 3)
+    );
 }
 
 /// @requirement AC-258

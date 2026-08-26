@@ -172,6 +172,7 @@ pub async fn run_client_inner(
             None,
             input_rx,
             None,
+            crate::client::export::DIRECT_LABEL.to_string(),
         )
         .await;
     }
@@ -278,6 +279,7 @@ pub async fn run_client_inner(
                 // blocking `event::read()`, and two readers on one tty
                 // would race for every keystroke.
                 let input_rx = crate::client::tui::terminal::spawn_session_input();
+                let server_label = crate::client::export::server_label(&request.host, request.port);
                 return session::run_connected_session(
                     surface,
                     Some(server_events),
@@ -294,6 +296,7 @@ pub async fn run_client_inner(
                     // popup, joins the-hall, and goes where the user
                     // takes it.
                     None,
+                    server_label,
                 )
                 .await;
             }
@@ -311,6 +314,11 @@ pub async fn run_client_inner(
                 } else if let Some(deactivated) = e.downcast_ref::<AccountDeactivatedError>() {
                     popup.error = Some(deactivated.0.clone());
                     popup.focus = ui_connect_popup::Field::Password;
+                } else if let Some(mismatch) = e.downcast_ref::<SslMismatchError>() {
+                    // Not a field-level problem - nothing in the form can
+                    // fix this, only the settings file can - so no focus
+                    // change, just the reason shown.
+                    popup.error = Some(mismatch.0.clone());
                 } else {
                     return Err(e);
                 }
@@ -345,6 +353,77 @@ pub async fn register_account(request: &RegisterRequest) -> Result<(), BoxError>
     }
 }
 
+/// The initial connect attempt failed for a reason `diagnose_ssl_mismatch`
+/// traced to `connect_using_ssl` being set wrong for this server, not a
+/// wrong host, password, or anything else. Downcast for specifically in
+/// the connect popup's loop, so this one - and only this one - loops back
+/// into the form with the reason shown, the same way a wrong password
+/// already does, rather than ending the client the way an unclassified
+/// connect failure still does.
+#[derive(Debug)]
+pub struct SslMismatchError(pub String);
+
+impl std::fmt::Display for SslMismatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for SslMismatchError {}
+
+/// After `request`'s own connect attempt has already failed, tries once
+/// more at the same host/port with the *opposite* `ssl` - never to
+/// actually connect that way (the result is always discarded), only to
+/// tell a genuine transport-mode mismatch apart from every other kind of
+/// failure. Bounded to `SSL_DIAGNOSIS_TIMEOUT` so a server that is simply
+/// down doesn't turn one failed connect into two slow ones.
+const SSL_DIAGNOSIS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
+
+async fn diagnose_ssl_mismatch(request: &ConnectRequest) -> Option<String> {
+    let opposite_ssl = !request.ssl;
+    let probed = tokio::time::timeout(
+        SSL_DIAGNOSIS_TIMEOUT,
+        open_control_channel(&request.host, request.port, opposite_ssl, request.ssl_ca.as_deref()),
+    )
+    .await;
+    if !matches!(probed, Ok(Ok(_))) {
+        return None;
+    }
+    Some(if opposite_ssl {
+        "this server appears to require SSL - turn connect_using_ssl=on in ~/.aloo/settings"
+            .to_string()
+    } else {
+        "this server appears to reject SSL - turn connect_using_ssl=off in ~/.aloo/settings"
+            .to_string()
+    })
+}
+
+/// How long the very first connect attempt (`connect_with_reconnect`'s own
+/// `connect_and_handshake`, never a later automatic reconnect) is given
+/// before it's treated as failed. Generous next to `SSL_DIAGNOSIS_TIMEOUT`
+/// because this one also has to cover DNS, TCP, and the whole login
+/// handshake - not just reaching `Hello`.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// `e` (a real error, or already a synthetic "timed out" one) becomes a
+/// `SslMismatchError` when `diagnose_ssl_mismatch` finds the opposite mode
+/// works, unless `e` already proves the transport mode was fine (a wrong
+/// password, a taken nickname, a deactivated account, or a pending
+/// activation code) - probing an unrelated failure would only add latency.
+async fn with_ssl_diagnosis(request: &ConnectRequest, e: BoxError) -> BoxError {
+    let already_explained = e.downcast_ref::<NicknameTakenError>().is_some()
+        || e.downcast_ref::<AuthRefusedError>().is_some()
+        || e.downcast_ref::<AccountDeactivatedError>().is_some()
+        || e.downcast_ref::<ActivationRequiredError>().is_some();
+    if already_explained {
+        return e;
+    }
+    match diagnose_ssl_mismatch(request).await {
+        Some(diagnosis) => Box::new(SslMismatchError(format!("{e} - {diagnosis}"))),
+        None => e,
+    }
+}
+
 /// Connects, then hands the connection straight to the reconnect
 /// supervisor (`crate::client::reconnect`) - what every session that has a
 /// server starts from.
@@ -368,7 +447,31 @@ pub async fn connect_with_reconnect(
     ),
     BoxError,
 > {
-    let (rd, wr, you, identity, server_addr) = connect_and_handshake(request).await?;
+    // Bounded rather than left to hang: a client that skips TLS against a
+    // `connect_using_ssl`-required server (or the other way around) is not
+    // a slow connection, it is a mutual stall neither rustls nor this
+    // app's own framing ever resolves on its own - the server sits inside
+    // its TLS accept waiting for a ClientHello that is never coming, the
+    // client sits waiting for a `Hello` that is never coming either,
+    // forever, with nothing to time either side out. `CONNECT_TIMEOUT` is
+    // generous enough for a real, working, merely slow connection; a
+    // timeout is itself already a strong signal worth feeding into the
+    // same diagnosis, not just a bare "connect timed out".
+    let attempt = tokio::time::timeout(CONNECT_TIMEOUT, connect_and_handshake(request)).await;
+    let (rd, wr, you, identity, server_addr) = match attempt {
+        Ok(Ok(ok)) => ok,
+        Ok(Err(e)) => return Err(with_ssl_diagnosis(request, e).await),
+        Err(_elapsed) => {
+            let timeout_err: BoxError = format!(
+                "connect to {}:{} timed out after {}s",
+                request.host,
+                request.port,
+                CONNECT_TIMEOUT.as_secs()
+            )
+            .into();
+            return Err(with_ssl_diagnosis(request, timeout_err).await);
+        }
+    };
     let public_key_der = identity.public_der.clone();
     let (sink, lost_rx) = reconnect::ServerSink::new(wr);
     let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -883,7 +986,7 @@ pub fn prefill_connect_defaults(
     if let Some(nickname) = &settings.connect_nickname {
         popup.nickname = nickname.clone();
     }
-    popup.ssl = settings.connect_ssl;
+    popup.ssl = settings.connect_using_ssl;
     popup.registration_available = settings.server_allow_registration;
     if let Some((host, port, file_pub, file_priv)) = cache.most_recent() {
         // Only where settings had nothing to say - a hand-edited

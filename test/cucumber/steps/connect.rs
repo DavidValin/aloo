@@ -164,7 +164,7 @@ async fn no_id_store_field(w: &mut AlooWorld) {
 }
 
 /// `ssl` is not a popup field at all - like `server_ssl` on the server
-/// side, it is settings-only (`connect_ssl`).
+/// side, it is settings-only (`connect_using_ssl`).
 #[then("the form has no ssl field")]
 async fn no_ssl_field(w: &mut AlooWorld) {
     let rows = popup_rows(w.popup.as_ref().expect("no form"), 80, 30);

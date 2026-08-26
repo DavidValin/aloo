@@ -395,3 +395,38 @@ async fn viewport_at_bottom(w: &mut AlooWorld) {
         "the oldest should have scrolled out of view: {rows:?}"
     );
 }
+
+// ---------------------------------------------------------------------
+// Exporting channels/DMs on demand (Ctrl+E, US-054)
+// ---------------------------------------------------------------------
+
+#[then(expr = "the export popup is open with channel {word} unchecked")]
+async fn export_popup_open_with_channel_unchecked(w: &mut AlooWorld, channel: String) {
+    let state = w.ui_ref();
+    assert_eq!(state.mode, aloo::client::tui::ui::Mode::ExportPopup);
+    let popup = state.export_popup.as_ref().expect("export popup should be open");
+    assert!(
+        popup.channels.iter().any(|(name, checked)| name == &channel && !checked),
+        "expected an unchecked row for #{channel}: {:?}",
+        popup.channels
+    );
+}
+
+#[then("the export popup is closed")]
+async fn export_popup_closed(w: &mut AlooWorld) {
+    let state = w.ui_ref();
+    assert_eq!(state.mode, aloo::client::tui::ui::Mode::Normal);
+    assert!(state.export_popup.is_none());
+}
+
+#[then(expr = "exporting channel {word} is requested")]
+async fn exporting_channel_requested(w: &mut AlooWorld, channel: String) {
+    match w.last_action.as_ref().expect("no action was produced") {
+        UiAction::ExportSelected { channels, dms, prefix } => {
+            assert_eq!(channels, &vec![channel]);
+            assert!(dms.is_empty());
+            assert_eq!(prefix.len(), 8);
+        }
+        other => panic!("expected ExportSelected, got {other:?}"),
+    }
+}

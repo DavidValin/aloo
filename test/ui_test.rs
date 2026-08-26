@@ -2,12 +2,13 @@
 mod ui_common;
 use ui_common::*;
 
+use aloo::client::export::{self, Surface};
 use aloo::p2p_proto::ReceiptStage;
 use aloo::proto::UserId;
 use aloo::client::tui::ui::{
     DeliveryProof,
     CallMemberState, CallTarget, DELIVERED_LABEL, DELIVERY_ARROW, DeliveryStatus, Focus,
-    LISTENED_LABEL, SAVED_LABEL, VIEWED_LABEL,
+    LISTENED_LABEL, LogEntry, SAVED_LABEL, VIEWED_LABEL,
     END_CALL_CONFIRM_TITLE, ENCRYPTION_LABEL, HELP_POPUP_TITLE, HOST_LEFT_NOTICE, IdentityCase,
     KEY_FILE_LABEL,
     KEY_LABEL, KEY_OFFSET_LABEL, KEY_PER_RECIPIENT, KEY_SEQ_LABEL, MessageBody, Mode,
@@ -2945,7 +2946,7 @@ fn a_muted_peer_suppresses_playback_but_not_logging() {
 
     // The stream still opens a row and still finalizes into a replayable
     // Voice entry - muting is only ever about live playback.
-    state.on_channel_stream_start("general", UserId(2), "bob".into(), 7);
+    state.on_channel_stream_start("general", UserId(2), "bob".into(), 7, false);
     state.on_channel_stream_finished("general", UserId(2), 7, 1200, vec![0u8; 64]);
 
     let log = &state.channels[state.selected_channel].log;
@@ -3598,7 +3599,7 @@ fn a_text_message_has_no_extra_state_and_the_arrow_is_unchanged_by_one() {
 #[test]
 fn replaying_a_clip_that_was_never_heard_pays_its_sender() {
     let mut state = joined_general_with(vec![user(2, "bob")]);
-    state.on_channel_stream_start("general", UserId(2), "bob".into(), 7);
+    state.on_channel_stream_start("general", UserId(2), "bob".into(), 7, false);
     state.owe_replay_receipt(UserId(2), 7, Some(99));
     state.on_channel_stream_finished("general", UserId(2), 7, 1200, vec![0; 8]);
     state.focus = Focus::Messages;
@@ -3629,7 +3630,7 @@ fn replaying_a_clip_that_was_never_heard_pays_its_sender() {
 #[test]
 fn replaying_a_clip_that_was_already_heard_owes_nothing() {
     let mut state = joined_general_with(vec![user(2, "bob")]);
-    state.on_channel_stream_start("general", UserId(2), "bob".into(), 7);
+    state.on_channel_stream_start("general", UserId(2), "bob".into(), 7, false);
     state.on_channel_stream_finished("general", UserId(2), 7, 1200, vec![0; 8]);
     state.focus = Focus::Messages;
     state.message_selected = 0;
@@ -3638,6 +3639,24 @@ fn replaying_a_clip_that_was_already_heard_owes_nothing() {
         UiAction::ReplayVoice { owed_receipt, .. } => assert_eq!(owed_receipt, None),
         other => panic!("expected ReplayVoice, got {other:?}"),
     }
+}
+
+/// Manually replaying a row that never autoplayed (e.g. it arrived in a
+/// channel that wasn't focused) is exactly what the red "not listened"
+/// marker is for - and Enter is what clears it, same lifecycle as
+/// `owed_receipt`.
+/// @requirement AC-357
+#[test]
+fn replaying_a_clip_marks_it_listened() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.on_channel_stream_start("general", UserId(2), "bob".into(), 7, true);
+    state.on_channel_stream_finished("general", UserId(2), 7, 1200, vec![0; 8]);
+    assert!(!state.channels[0].log[0].listened);
+    state.focus = Focus::Messages;
+    state.message_selected = 0;
+
+    press(&mut state, KeyCode::Enter).expect("Enter replays a voice row");
+    assert!(state.channels[0].log[0].listened);
 }
 
 // ---------------------------------------------------------------------
@@ -4335,5 +4354,128 @@ fn the_account_deactivated_modal_outranks_the_identity_review_queue() {
     assert!(
         rows.iter().any(|r| r.contains("Account deactivated")),
         "the deactivation modal must win the render, not the review popup: {rows:?}"
+    );
+}
+
+// ---------------------------------------------------------------------
+// `resume_from_log` - replaying a `MessageBody::VoiceOnDisk` row.
+// ---------------------------------------------------------------------
+
+fn shared_voice_on_disk_home() -> &'static std::path::Path {
+    static HOME: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    HOME.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!(
+            "aloo-voice-on-disk-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        unsafe { std::env::set_var("ALOO_HOME", &dir) };
+        dir
+    })
+}
+
+/// Enter on a real `resume_from_log`-loaded `VoiceOnDisk` row decodes its
+/// `.wav` from disk on the spot, mutates the row into an ordinary `Voice`
+/// in place, and plays it exactly like one that arrived live.
+/// @requirement AC-363
+#[test]
+fn entering_on_a_voice_on_disk_row_with_a_wav_decodes_and_plays_it() {
+    let _home = shared_voice_on_disk_home();
+    let server_label = "voice-on-disk-play_1";
+    let samples = vec![0i16; 32_000]; // 2000ms at 16kHz - a round number
+    export::autosave_entry(
+        server_label,
+        Surface::Channel("general"),
+        &LogEntry {
+            from: UserId(2),
+            from_name: "bob".into(),
+            to_name: None,
+            body: MessageBody::Voice {
+                duration_ms: 2000,
+                pcm: aloo::client::voice::pcm_to_bytes(&samples),
+            },
+            outgoing: false,
+            failed: false,
+            sent_at: "2026-08-26T12:00:00Z".into(),
+            sent_at_utc: "2026-08-26T12:00:00Z".into(),
+            owed_receipt: None,
+            listened: false,
+            delivery: None,
+            crypto: None,
+        },
+    );
+
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.server_label = server_label.to_string();
+    state.resume_from_log = true;
+    state.last_messages_area_height.store(5, std::sync::atomic::Ordering::Relaxed);
+    state.select_channel_at(0);
+
+    assert!(
+        matches!(state.channels[0].log[0].body, MessageBody::VoiceOnDisk { wav_path: Some(_), .. }),
+        "should have loaded as an unloaded reference first: {:?}",
+        state.channels[0].log[0].body
+    );
+    // Reconstructed from disk, so `from` is a synthetic id (nothing on
+    // disk names a real `UserId`) - not the original `UserId(2)` used
+    // when writing this entry. The row's own reconstructed id is still
+    // the right thing for the replay action to carry, though, so check
+    // consistency with it rather than the pre-reconstruction value.
+    let reconstructed_from = state.channels[0].log[0].from;
+
+    state.focus = Focus::Messages;
+    state.message_selected = 0;
+    let action = press(&mut state, KeyCode::Enter).expect("a wav on disk should produce a replay action");
+    match action {
+        UiAction::ReplayVoice { duration_ms, pcm, from, .. } => {
+            assert_eq!(duration_ms, 2000);
+            assert_eq!(from, reconstructed_from);
+            assert_eq!(aloo::client::voice::pcm_from_bytes(&pcm), samples);
+        }
+        other => panic!("expected ReplayVoice, got {other:?}"),
+    }
+    assert_eq!(
+        state.channels[0].log[0].body,
+        MessageBody::Voice {
+            duration_ms: 2000,
+            pcm: aloo::client::voice::pcm_to_bytes(&samples)
+        },
+        "the row should have mutated into an ordinary Voice entry, so a second replay is instant"
+    );
+    assert!(state.channels[0].log[0].listened, "playing it clears the not-listened state");
+}
+
+/// A `VoiceOnDisk` row whose autosave never managed to write a `.wav`
+/// (`wav_path: None`) has nothing to play - Enter reports why instead of
+/// silently doing nothing.
+/// @requirement AC-363
+#[test]
+fn entering_on_a_voice_on_disk_row_with_no_wav_shows_a_status_notice_and_does_nothing() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.channels[0].log.push(LogEntry {
+        from: UserId(2),
+        from_name: "bob".into(),
+        to_name: None,
+        body: MessageBody::VoiceOnDisk { duration_ms: 2000, wav_path: None },
+        outgoing: false,
+        failed: false,
+        sent_at: "2026-08-26T12:00:00Z".into(),
+        sent_at_utc: "2026-08-26T12:00:00Z".into(),
+        owed_receipt: None,
+        listened: true,
+        delivery: None,
+        crypto: None,
+    });
+    state.select_channel_at(0);
+    state.focus = Focus::Messages;
+    state.message_selected = 0;
+
+    let action = press(&mut state, KeyCode::Enter);
+    assert_eq!(action, None, "nothing to replay - no action should be produced");
+    assert!(
+        state.status_notice.as_ref().is_some_and(|(msg, success)| !success && msg.contains("no audio")),
+        "expected a failure status notice explaining why: {:?}",
+        state.status_notice
     );
 }

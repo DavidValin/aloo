@@ -201,6 +201,7 @@ fn start(
             None,
             input_rx,
             plan,
+            "DIRECT".to_string(),
         )
         .await
     });

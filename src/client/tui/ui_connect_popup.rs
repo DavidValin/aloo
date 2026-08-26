@@ -12,9 +12,10 @@ use std::path::PathBuf;
 
 use crossterm::event::{Event, KeyCode, KeyEventKind};
 use ratatui::Frame;
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 
 use super::ui::{centered_rect, focus_border_style};
 use crate::client::connect::{ConnectRequest, MyKeySelection, RegisterRequest};
@@ -89,9 +90,10 @@ pub struct ConnectPopupState {
     /// by Register only; Connect never reads it.
     pub email: String,
     /// Dial over TLS (§1.4). Not a popup field at all - like `server_ssl`
-    /// on the server side, this is settings-only (`connect_ssl` in
-    /// `~/.aloo/settings`); captured once when the popup opens and carried
-    /// silently into the built request, the same way `ssl_ca` already is.
+    /// on the server side, this is settings-only (`connect_using_ssl` in
+    /// `~/.aloo/settings`, the same one setting a daemon start reads too);
+    /// captured once when the popup opens and carried silently into the
+    /// built request, the same way `ssl_ca` already is.
     pub ssl: bool,
     /// Whether this server takes registrations at all
     /// (`server_allow_registration`), captured once from local settings
@@ -116,6 +118,11 @@ pub struct ConnectPopupState {
     /// email" - shown in green where an error would be red. An error set
     /// later replaces it.
     pub notice: Option<String>,
+    /// Advances by one every animation tick (`run`'s event-poll timeout,
+    /// not a key press), purely to drive `DigitalRain`'s background
+    /// animation - has no bearing on anything else, and wraps rather than
+    /// ever needing to be bounded.
+    pub animation_frame: u64,
 }
 
 impl Default for ConnectPopupState {
@@ -139,6 +146,7 @@ impl ConnectPopupState {
             focus: Field::Host,
             error: None,
             notice: None,
+            animation_frame: 0,
         }
     }
 
@@ -507,15 +515,28 @@ fn place_text_cursor(frame: &mut Frame, inner: Rect, offset: u16, value: &str) {
     frame.set_cursor_position((cursor_x, inner.y));
 }
 
-/// Drives the popup to completion: render, block on the next key event,
-/// dispatch to `ConnectPopupState::handle_key`, repeat - until the user
-/// either submits a complete request (Connect or Register) or cancels.
+/// How long `run` waits for a real event before giving up and advancing
+/// the background animation by one frame instead - short enough that
+/// `DigitalRain` reads as continuous motion, long enough not to burn CPU
+/// redrawing an idle screen needlessly.
+const ANIMATION_TICK: std::time::Duration = std::time::Duration::from_millis(80);
+
+/// Drives the popup to completion: render, wait for the next key event or
+/// `ANIMATION_TICK` (whichever comes first - a timeout just advances
+/// `animation_frame` and redraws, so the background animation moves even
+/// with nobody touching a key), dispatch to `ConnectPopupState::handle_key`,
+/// repeat - until the user either submits a complete request (Connect or
+/// Register) or cancels.
 pub fn run(
     surface: &mut super::surface::Surface,
     popup: &mut ConnectPopupState,
 ) -> Result<Submission, crate::BoxError> {
     loop {
         surface.draw(|f| render(f, popup))?;
+        if !crossterm::event::poll(ANIMATION_TICK)? {
+            popup.animation_frame = popup.animation_frame.wrapping_add(1);
+            continue;
+        }
         let key = match crossterm::event::read()? {
             Event::Key(key) => key,
             // Same handling the connected session gives its own resize
@@ -544,6 +565,37 @@ pub fn run(
 pub fn render(frame: &mut Frame, state: &ConnectPopupState) {
     let area = frame.area();
     let popup = centered_rect(64, 30, area);
+    // A one-line title strip above the modal itself, not inside its
+    // border - a blank row of actual terminal space separates the two, so
+    // this reads as a banner the popup sits under rather than a squeezed
+    // extra header row. Skipped rather than underflowing/panicking if the
+    // terminal is too short to fit both above the popup.
+    let version_rect =
+        (popup.y >= 2).then(|| Rect { x: popup.x, y: popup.y - 2, width: popup.width, height: 1 });
+    // Drawn first, everything else on top of it. `popup` itself is
+    // excluded outright rather than relied on to be overwritten: several
+    // rows inside it (the spacer lines, the blank line around the
+    // read-only info block) are never painted by any other widget, so
+    // anything drawn under them would otherwise show straight through.
+    // `version_rect` (padded 2 cells every direction) is excluded the
+    // same way, since it sits outside the popup with nothing else to
+    // cover it either.
+    frame.render_widget(
+        DigitalRain {
+            frame: state.animation_frame,
+            avoid_popup: popup,
+            keep_clear: version_rect.map(|r| padded(r, 2, area)),
+        },
+        area,
+    );
+    if let Some(version_rect) = version_rect {
+        frame.render_widget(
+            Paragraph::new(format!("aloo {} - secure link", env!("CARGO_PKG_VERSION")))
+                .style(Style::default().fg(Color::Yellow))
+                .alignment(Alignment::Center),
+            version_rect,
+        );
+    }
     let block = Block::default().title("Connect").borders(Borders::ALL);
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
@@ -552,8 +604,7 @@ pub fn render(frame: &mut Frame, state: &ConnectPopupState) {
     // screen, regardless of `registration_available` (only pressing
     // Register on an unavailable server is refused, not the field hidden).
     let constraints = [
-        Constraint::Length(3), // host
-        Constraint::Length(3), // port
+        Constraint::Length(3), // host + port (same row)
         Constraint::Length(3), // nickname
         Constraint::Length(3), // password
         Constraint::Length(3), // email
@@ -564,13 +615,16 @@ pub fn render(frame: &mut Frame, state: &ConnectPopupState) {
         Constraint::Length(1), // ALOO_HOME
         Constraint::Length(1), // blank line below the read-only info block
         Constraint::Length(3), // buttons
-        Constraint::Min(1),    // error / hint
+        Constraint::Min(0),    // flexible spacer - absorbs whatever room is left, so
+                                // the hint row below lands flush on the popup's last
+                                // line instead of floating right under the buttons
+        Constraint::Length(1), // error / hint
     ];
-    let email_idx = 4;
-    let file_pub_idx = 7;
-    let file_priv_idx = 8;
-    let aloo_home_idx = 9;
-    let buttons_idx = 11;
+    let email_idx = 3;
+    let file_pub_idx = 6;
+    let file_priv_idx = 7;
+    let aloo_home_idx = 8;
+    let buttons_idx = 10;
     let hint_idx = 12;
 
     let chunks = Layout::default()
@@ -578,23 +632,30 @@ pub fn render(frame: &mut Frame, state: &ConnectPopupState) {
         .constraints(constraints)
         .split(inner);
 
+    // Port never needs more than 6 columns (`65535` plus a spare digit),
+    // so it takes a fixed-width slice on the right of the shared row and
+    // host gets whatever's left rather than the usual full-width field.
+    let host_port_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(10), Constraint::Length(8)])
+        .split(chunks[0]);
     let host_inner = render_bordered_field(
         frame,
-        chunks[0],
+        host_port_cols[0],
         "host",
         &state.host,
         state.focus == Field::Host,
     );
     let port_inner = render_bordered_field(
         frame,
-        chunks[1],
+        host_port_cols[1],
         "port",
         &state.port,
         state.focus == Field::Port,
     );
     let nickname_inner = render_bordered_field(
         frame,
-        chunks[2],
+        chunks[1],
         "nickname",
         &state.nickname,
         state.focus == Field::Nickname,
@@ -602,7 +663,7 @@ pub fn render(frame: &mut Frame, state: &ConnectPopupState) {
     let password_masked = "*".repeat(state.password.chars().count());
     let password_inner = render_bordered_field(
         frame,
-        chunks[3],
+        chunks[2],
         "password",
         &password_masked,
         state.focus == Field::Password,
@@ -688,6 +749,84 @@ pub fn render(frame: &mut Frame, state: &ConnectPopupState) {
             .alignment(Alignment::Center),
         chunks[hint_idx],
     );
+}
+
+/// `r` expanded by `margin` cells on every side, clamped to stay inside
+/// `bounds` - used to carve a no-draw zone around the version banner
+/// wider than the banner's own text so `DigitalRain` never crowds it.
+fn padded(r: Rect, margin: u16, bounds: Rect) -> Rect {
+    let x = r.x.saturating_sub(margin).max(bounds.x);
+    let y = r.y.saturating_sub(margin).max(bounds.y);
+    let right = (r.x + r.width + margin).min(bounds.x + bounds.width);
+    let bottom = (r.y + r.height + margin).min(bounds.y + bounds.height);
+    Rect {
+        x,
+        y,
+        width: right.saturating_sub(x),
+        height: bottom.saturating_sub(y),
+    }
+}
+
+/// A sparse "digital rain" animation filling the screen behind the
+/// connect popup - purely decorative, themed to "secure link" the same
+/// way the version banner above the popup is. Reads `frame` (advanced
+/// once per tick by `run`'s event-poll timeout, not by a key press, so it
+/// moves on its own) and draws nothing inside `keep_clear`, which
+/// `render` sets to the version banner's own area padded 2 cells wider on
+/// every side.
+struct DigitalRain {
+    frame: u64,
+    /// The popup's own footprint - excluded outright, not just relied on
+    /// to be painted over, since several rows inside it are never touched
+    /// by any other widget (see `render`'s call site).
+    avoid_popup: Rect,
+    keep_clear: Option<Rect>,
+}
+
+impl DigitalRain {
+    /// How many rows a column's falling trail spans, brightest at the
+    /// head and fading out over the rest.
+    const TRAIL_LEN: i64 = 6;
+
+    fn in_rect(r: Rect, x: u16, y: u16) -> bool {
+        x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
+    }
+
+    fn excluded(&self, x: u16, y: u16) -> bool {
+        Self::in_rect(self.avoid_popup, x, y) || self.keep_clear.is_some_and(|r| Self::in_rect(r, x, y))
+    }
+}
+
+impl Widget for DigitalRain {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        for x in area.left()..area.right() {
+            // A cheap multiplicative hash of the column index, not real
+            // randomness - decoration has no need for a `rand` call, and
+            // a deterministic pattern renders identically for the same
+            // `frame`, which is what makes this paintable in a test.
+            let hash = (x as u64).wrapping_mul(2_654_435_761);
+            let speed = 1 + (hash % 3) as i64; // rows per tick, 1..=3
+            let phase = (hash / 3 % 251) as i64;
+            let cycle = area.height as i64 + Self::TRAIL_LEN;
+            let head = (self.frame as i64 * speed + phase).rem_euclid(cycle) - Self::TRAIL_LEN;
+            for y in area.top()..area.bottom() {
+                let dist = head - (y - area.top()) as i64;
+                if !(0..Self::TRAIL_LEN).contains(&dist) || self.excluded(x, y) {
+                    continue;
+                }
+                let glyph = if (x as i64 + dist) % 2 == 0 { '0' } else { '1' };
+                let style = match dist {
+                    0 => Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                    1 | 2 => Style::default().fg(Color::LightGreen),
+                    _ => Style::default().fg(Color::Green).add_modifier(Modifier::DIM),
+                };
+                buf.set_string(x, y, glyph.to_string(), style);
+            }
+        }
+    }
 }
 
 /// One of the two buttons under the form - Connect, Register - centered

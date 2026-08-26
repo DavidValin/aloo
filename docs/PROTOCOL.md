@@ -387,12 +387,13 @@ private key included - still does not decrypt it.
 `server_ssl=on` in `~/.aloo/settings` serves the control connection (and
 the account-activation web endpoint, §5.3) under a certificate pair named
 by `server_ssl_fullchain`/`server_ssl_privkey` - a Let's Encrypt pair,
-typically. A client opts in with its own `ssl` switch (the connect popup's
-toggle, `--ssl`/`daemon_ssl` for a daemon), trusting the public roots it
-ships with plus, optionally, one PEM file of extra roots
-(`connect_ssl_ca`) for a self-signed or privately issued certificate. The
-certificate is checked against the host the user typed, standard TLS
-server-name verification.
+typically. A client opts in with `connect_using_ssl` in its own
+`~/.aloo/settings` - the one setting for this, shared identically by a
+normal (interactive) connect and a daemon start, with no popup field and
+no CLI flag able to override it - trusting the public roots it ships with
+plus, optionally, one PEM file of extra roots (`connect_ssl_ca`) for a
+self-signed or privately issued certificate. The certificate is checked
+against the host the user typed, standard TLS server-name verification.
 
 This is the identity §1.3's own offer cannot provide, layered underneath
 everything else unchanged: the control channel's own sealing (its
@@ -401,6 +402,20 @@ top of plain TCP, so TLS here is what authenticates the server, not what
 keeps the conversation confidential. A certificate that does not load, or
 does not match its key, refuses the server's startup outright rather than
 falling back to plaintext.
+
+When a connect attempt fails for a reason that isn't already meaningful on
+its own (not a wrong password, a taken nickname, a deactivated account, or
+a pending activation code), the client makes one bounded, diagnostic-only
+attempt at the same address with the opposite of `connect_using_ssl` -
+never to actually connect that way, only to tell a genuine transport-mode
+mismatch apart from every other kind of failure. If that attempt reaches a
+real `Hello`, the error is enriched with a specific reason ("this server
+appears to require SSL" / "...appears to reject SSL") instead of a bare,
+unexplained failure - shown in red on the connect form, or failing a
+daemon start outright with the same reason. The real session that
+follows, if any, always uses exactly what `connect_using_ssl` says -
+never the probed alternative; this never auto-negotiates or silently
+degrades.
 
 ## 2. Serialization
 
@@ -2912,7 +2927,7 @@ additive pin above) and the UI's identity-review queue (lifting the trust
 gate) - nothing else needs updating, for two separate reasons:
 
 - **Channel/DM encryption never needed a separate update in the first
-  place.** `known_users`/`channel.members` (`recipients_for_channel:239`)
+  place.** `known_users`/`channel.members` (`recipients_for_channel:244`)
   already hold whichever key that connection actually
   announced, set once at `UserJoined` time - *before* `check_identity` can
   even open a review - so a send immediately after `Accept` already

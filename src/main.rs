@@ -137,11 +137,6 @@ struct Cli {
     #[arg(long)]
     nick_pwd: Option<String>,
 
-    /// Daemon-only: connect over TLS, for a server running with
-    /// server_ssl=on. Remembered as daemon_ssl.
-    #[arg(long)]
-    ssl: bool,
-
     /// Daemon-only: the `pq_hybrid` keybundle prefix to connect with -
     /// `<PREFIX>` and `<PREFIX>.pub`. Generated on first use if missing.
     #[arg(long, value_name = "PREFIX")]
@@ -297,7 +292,6 @@ fn resolve_daemon_config(cli: &Cli) -> Result<aloo::client::daemon::DaemonConfig
         port: cli.port,
         nickname: cli.nick.clone(),
         nick_pwd: cli.nick_pwd.clone(),
-        ssl: cli.ssl,
         my_key_prefix: cli.my_key.clone(),
         channels: cli.channels.clone(),
         initial_focus: cli.initial_focus.clone(),

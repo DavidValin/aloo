@@ -1,6 +1,6 @@
 [package]
 name = "aloo"
-version = "0.3.0-alpha.4"
+version = "0.3.0-alpha.5"
 edition = "2024"
 
 authors = ["David Valin <hola@davidvalin.com>"]
@@ -124,6 +124,14 @@ path = "src/main.rs"
 [[test]]
 name = "crypto_test"
 path = "test/crypto_test.rs"
+
+[[test]]
+name = "export_test"
+path = "test/export_test.rs"
+
+[[test]]
+name = "ui_export_popup_test"
+path = "test/ui_export_popup_test.rs"
 
 [[test]]
 name = "server_channels_registry_test"

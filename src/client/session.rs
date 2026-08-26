@@ -400,6 +400,7 @@ pub async fn run_daemon_session<W: crate::control::ControlSink>(
     server_addr: Option<SocketAddr>,
     input_rx: tokio::sync::mpsc::UnboundedReceiver<SessionInput>,
     plan: crate::client::daemon::DaemonPlan,
+    server_label: String,
 ) -> Result<(), BoxError> {
     run_connected_session(
         surface,
@@ -414,6 +415,7 @@ pub async fn run_daemon_session<W: crate::control::ControlSink>(
         server_addr,
         input_rx,
         Some(plan),
+        server_label,
     )
     .await
 }
@@ -437,6 +439,7 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
     server_addr: Option<SocketAddr>,
     mut input_rx: tokio::sync::mpsc::UnboundedReceiver<SessionInput>,
     daemon_plan: Option<crate::client::daemon::DaemonPlan>,
+    server_label: String,
 ) -> Result<(), BoxError> {
     // With no server there is nothing to hear from one: a channel is
     // created all the same, its sender parked here for the life of the
@@ -755,6 +758,9 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
     // finds its channel already there, and so the first `ChannelPresence`
     // we send a peer is already correct.
     ui_state.serverless = server_state.is_serverless();
+    ui_state.server_label = server_label;
+    ui_state.autosave_messages = settings.autosave_messages;
+    ui_state.resume_from_log = settings.resume_from_log;
     // Fixed for the whole session: a `--no-server` start has no supervisor
     // and nothing it could ever reconnect to, so this is the one header
     // state that is never driven by an event.
@@ -1834,6 +1840,34 @@ async fn handle_ui_action(
                     crate::settings::Settings::default()
                 });
             ui_state.set_direct_punch_rows(settings.direct_punch_to);
+        }
+        UiAction::ExportSelected { prefix, channels, dms } => {
+            for channel in &channels {
+                let Some(tab) = ui_state.channels.iter().find(|c| &c.name == channel) else {
+                    continue;
+                };
+                if let Err(e) = crate::client::export::export_log(
+                    &ui_state.server_label,
+                    crate::client::export::Surface::Channel(channel),
+                    &prefix,
+                    &tab.log,
+                ) {
+                    crate::log_warn!("could not export #{channel} ({e})");
+                }
+            }
+            for peer in &dms {
+                let Some(room) = ui_state.private_rooms.get(peer) else {
+                    continue;
+                };
+                if let Err(e) = crate::client::export::export_log(
+                    &ui_state.server_label,
+                    crate::client::export::Surface::Dm(&room.peer.name),
+                    &prefix,
+                    &room.log,
+                ) {
+                    crate::log_warn!("could not export DM with {} ({e})", room.peer.name);
+                }
+            }
         }
         UiAction::SaveDirectPunchTargets(targets) => {
             let path = crate::settings::default_path();

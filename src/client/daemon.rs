@@ -674,7 +674,8 @@ pub struct DaemonConfig {
     /// credential a login needs, and a daemon has nobody there to type
     /// it, so it comes from `--nick-pwd` or `daemon_server_password`.
     pub password: String,
-    /// Dial over TLS (`--ssl` / `daemon_ssl`).
+    /// Dial over TLS (`connect_using_ssl` - the only place this is
+    /// decided, no CLI override).
     pub ssl: bool,
     pub my_key: crate::client::connect::MyKeySelection,
     /// The channels to join, in order. Never includes `the-hall` unless
@@ -699,7 +700,6 @@ pub struct DaemonFlags {
     pub port: Option<u16>,
     pub nickname: Option<String>,
     pub nick_pwd: Option<String>,
-    pub ssl: bool,
     pub my_key_prefix: Option<String>,
     pub channels: Vec<String>,
     pub initial_focus: Option<String>,
@@ -776,7 +776,7 @@ impl DaemonConfig {
             .clone()
             .or_else(|| settings.daemon_server_password.clone())
             .unwrap_or_default();
-        let ssl = flags.ssl || settings.daemon_ssl;
+        let ssl = settings.connect_using_ssl;
 
         let my_key = resolve_my_key(flags, settings, cached)?;
 
@@ -900,7 +900,12 @@ impl DaemonConfig {
             if !self.password.is_empty() {
                 s.daemon_server_password = Some(self.password.clone());
             }
-            s.daemon_ssl = self.ssl;
+            // No `s.connect_using_ssl = self.ssl` here: `self.ssl` was
+            // read straight from `connect_using_ssl` in `resolve` (no flag
+            // can diverge it anymore), so writing it back would only ever
+            // restate what's already there - or, worse, clobber a
+            // concurrent edit to that one shared setting with the value
+            // this run happened to read earlier.
             s.set_daemon_my_key(&self.my_key);
         })
     }
@@ -1251,6 +1256,11 @@ pub async fn run(
 
     let mut surface = crate::client::tui::surface::Surface::Detached;
     let plan = DaemonPlan::new(config.channels.clone(), config.initial_focus.clone());
+    let server_label = if serverless {
+        crate::client::export::DIRECT_LABEL.to_string()
+    } else {
+        crate::client::export::server_label(&config.host, config.port)
+    };
     let result = crate::client::session::run_daemon_session(
         &mut surface,
         server_events,
@@ -1263,6 +1273,7 @@ pub async fn run(
         server_addr,
         input_rx,
         plan,
+        server_label,
     )
     .await;
 

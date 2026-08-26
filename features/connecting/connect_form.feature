@@ -64,7 +64,7 @@ Feature: Filling in the connect form
     But the password field is shown masked
 
   @AC-269
-  Scenario: ssl is not a popup field - it defaults off, as connect_ssl settings say
+  Scenario: ssl is not a popup field - it defaults off, as connect_using_ssl settings say
     Given the connect form is open
     Then ssl is off
     And the form has no ssl field

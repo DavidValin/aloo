@@ -448,6 +448,22 @@ pub struct Settings {
     /// whole reason `client::idstore` exists), so a mute can in principle
     /// land on a different person who later takes that name.
     pub muted_voice: BTreeSet<String>,
+    /// Append every channel/DM message (and its voice `.wav`, if any) to
+    /// `~/.aloo/exports/<server>/{channels,dms}/*.log` as it arrives or is
+    /// sent (`client::export`). Off by default - this writes an
+    /// ever-growing plaintext transcript to disk, which nobody should get
+    /// without asking for it. Independent of the manual `Ctrl+E` export
+    /// popup, which works either way.
+    pub autosave_messages: bool,
+    /// Lazily pull older history for a channel/DM back in from its
+    /// `autosave_messages` `.log` file (`client::export::LogHistoryCursor`)
+    /// as the user scrolls up - a screen's worth on first opening it, and
+    /// another screen's worth each time they scroll to the top of what's
+    /// loaded. Off by default, and independent of `autosave_messages`
+    /// itself: this only ever *reads* a `.log` file that may have been
+    /// written in an earlier session (or not exist at all, in which case
+    /// this is a no-op either way).
+    pub resume_from_log: bool,
 
     // -----------------------------------------------------------------
     // Daemon mode (`aloo --daemon`, docs/SPEC.md "Running in background mode")
@@ -464,9 +480,6 @@ pub struct Settings {
     /// The password `daemon_nickname` logs in with - the one credential a
     /// daemon needs, and it connects with nobody there to type it.
     pub daemon_server_password: Option<String>,
-    /// Connect to the daemon's server over TLS (`connect_ssl`'s daemon
-    /// counterpart).
-    pub daemon_ssl: bool,
     pub daemon_my_key_pub: Option<String>,
     pub daemon_my_key_priv: Option<String>,
     /// One `daemon_channel=<name>[,<password>]` line per entry, in the
@@ -546,11 +559,15 @@ pub struct Settings {
     pub connect_host: Option<String>,
     pub connect_port: Option<u16>,
     pub connect_nickname: Option<String>,
-    /// Whether the last connection was made over TLS - the popup's `ssl`
-    /// toggle, remembered like the host beside it. The password typed
-    /// there is deliberately *not* remembered: it is the one field whose
-    /// loss costs nothing to retype and whose leak costs an account.
-    pub connect_ssl: bool,
+    /// Whether to connect over TLS - shared by both a normal (interactive)
+    /// connect and a daemon start, and the only place this is decided:
+    /// there is no popup field for it (the connect form silently reads
+    /// this at open time and carries it into the request, per
+    /// `docs/PROTOCOL.md` §1.4) and no CLI flag either. Edit this file by
+    /// hand to change it. A connect that fails because this doesn't match
+    /// what the server actually wants gets a specific diagnosis rather
+    /// than a bare connection error (`connect::connect_with_reconnect`).
+    pub connect_using_ssl: bool,
     /// A PEM file of extra root certificates the client trusts on top of
     /// the public roots it ships with - for a server whose certificate
     /// is self-signed or issued by a private CA. Hand-edited only; there
@@ -590,11 +607,12 @@ impl Default for Settings {
             otp_low_key_warn_pct: DEFAULT_OTP_LOW_KEY_WARN_PCT,
             otp_status_poll_interval: DEFAULT_OTP_STATUS_POLL_INTERVAL,
             muted_voice: BTreeSet::new(),
+            autosave_messages: false,
+            resume_from_log: false,
             daemon_host: None,
             daemon_port: None,
             daemon_nickname: None,
             daemon_server_password: None,
-            daemon_ssl: false,
             daemon_my_key_pub: None,
             daemon_my_key_priv: None,
             daemon_channels: Vec::new(),
@@ -612,7 +630,7 @@ impl Default for Settings {
             connect_host: None,
             connect_port: None,
             connect_nickname: None,
-            connect_ssl: false,
+            connect_using_ssl: false,
             connect_ssl_ca: None,
             direct_punch_invalid: Vec::new(),
         }
@@ -637,11 +655,145 @@ impl Settings {
             Ok(contents) => Ok(Self::parse(&contents)),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 let settings = Self::default();
-                settings.save(path)?;
+                if let Some(parent) = path.parent()
+                    && !parent.as_os_str().is_empty()
+                {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(path, settings.scaffold_contents())?;
                 Ok(settings)
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// The full, two-section, every-key-named dump `load_or_create` writes
+    /// on a machine's very first run - unlike `save` (the sparse,
+    /// merge-friendly writer every mid-session update goes through), this
+    /// lists every client option, then every server option, each under its
+    /// own `#`-comment header, so a user opening the file for the first
+    /// time finds every knob already there to read and edit rather than
+    /// having to know it exists. Never called again after the first run:
+    /// `save`/`update` take over from there, and `parse` (comment- and
+    /// order-agnostic) reads either shape identically.
+    fn scaffold_contents(&self) -> String {
+        let mut c = String::new();
+        c.push_str("# client options\n# -----------------------------------------\n");
+        c.push_str(&format!("global_ptt_enabled={}\n", self.global_ptt_enabled));
+        c.push_str(&format!("global_ptt_shortcut={}\n", self.global_ptt_shortcut));
+        c.push_str(&format!("autosave_messages={}\n", switch(self.autosave_messages)));
+        c.push_str(&format!("resume_from_log={}\n", switch(self.resume_from_log)));
+        c.push_str(&format!("daemon_host={}\n", self.daemon_host.as_deref().unwrap_or("")));
+        c.push_str(&format!(
+            "daemon_port={}\n",
+            self.daemon_port.map(|p| p.to_string()).unwrap_or_default()
+        ));
+        c.push_str(&format!(
+            "daemon_nickname={}\n",
+            self.daemon_nickname.as_deref().unwrap_or("")
+        ));
+        c.push_str(&format!(
+            "daemon_server_password={}\n",
+            self.daemon_server_password.as_deref().unwrap_or("")
+        ));
+        c.push_str(&format!(
+            "daemon_my_key_pub={}\n",
+            self.daemon_my_key_pub.as_deref().unwrap_or("")
+        ));
+        c.push_str(&format!(
+            "daemon_my_key_priv={}\n",
+            self.daemon_my_key_priv.as_deref().unwrap_or("")
+        ));
+        c.push_str(&format!(
+            "daemon_initial_focus={}\n",
+            self.daemon_initial_focus.as_deref().unwrap_or("")
+        ));
+        c.push_str("# daemon_channel=otherchannel\n");
+        c.push_str(&format!("daemon_otp={}\n", self.daemon_otp));
+        c.push_str(&format!("daemon_no_server={}\n", switch(self.daemon_no_server)));
+        c.push_str(&format!("direct_punch={}\n", switch(self.direct_punch)));
+        c.push_str(&format!("direct_punch_port={}\n", self.direct_punch_port));
+        c.push_str("# direct_punch_to=alice,alicehost.com:7879,every_1m\n");
+        c.push_str("# direct_punch_channel=the-hall\n");
+        c.push_str(&format!(
+            "noip_when_no_server_and_direct_punch_is_active={}\n",
+            switch(self.noip_when_no_server_and_direct_punch_is_active)
+        ));
+        c.push_str(&format!("noip_hostname={}\n", self.noip_hostname));
+        c.push_str(&format!("noip_username={}\n", self.noip_username));
+        c.push_str(&format!("noip_password={}\n", self.noip_password));
+        c.push_str(&format!("connect_host={}\n", self.connect_host.as_deref().unwrap_or("")));
+        c.push_str(&format!(
+            "connect_nickname={}\n",
+            self.connect_nickname.as_deref().unwrap_or("")
+        ));
+        c.push_str(&format!(
+            "connect_port={}\n",
+            self.connect_port.map(|p| p.to_string()).unwrap_or_default()
+        ));
+        c.push_str(&format!("connect_using_ssl={}\n", switch(self.connect_using_ssl)));
+        c.push_str(&format!(
+            "connect_ssl_ca={}\n",
+            self.connect_ssl_ca.as_deref().unwrap_or("")
+        ));
+        c.push_str(&format!(
+            "otp_binary_path={}\n",
+            self.otp_binary_path.as_deref().unwrap_or("")
+        ));
+        c.push_str(&format!("otp_keypair_size_mb={}\n", self.otp_keypair_size_mb));
+        c.push_str(&format!("otp_low_key_warn_pct={}\n", self.otp_low_key_warn_pct));
+        c.push_str(&format!(
+            "otp_status_poll_interval={}\n",
+            self.otp_status_poll_interval
+        ));
+        // Accumulating keys (one line per entry, `muted_voice`'s own doc
+        // explains why) have nothing real to pre-populate on a fresh file -
+        // a commented-out example shows the syntax without taking effect.
+        c.push_str("# muted_voice=somenickname\n");
+
+        c.push_str("\n# server options\n# -----------------------------------------\n");
+        c.push_str(&format!("server_bind={}\n", self.server_bind));
+        c.push_str(&format!("server_port={}\n", self.server_port));
+        c.push_str(&format!("server_ssl={}\n", switch(self.server_ssl)));
+        c.push_str(&format!("server_ssl_fullchain={}\n", self.server_ssl_fullchain));
+        c.push_str(&format!("server_ssl_privkey={}\n", self.server_ssl_privkey));
+        c.push_str(&format!(
+            "server_allow_registration={}\n",
+            switch(self.server_allow_registration)
+        ));
+        c.push_str(&format!(
+            "server_smtp_host={}\n",
+            self.server_smtp_host.as_deref().unwrap_or("")
+        ));
+        c.push_str(&format!(
+            "server_smtp_port={}\n",
+            self.server_smtp_port.map(|p| p.to_string()).unwrap_or_default()
+        ));
+        c.push_str(&format!(
+            "server_smtp_username={}\n",
+            self.server_smtp_username.as_deref().unwrap_or("")
+        ));
+        c.push_str(&format!(
+            "server_smtp_password={}\n",
+            self.server_smtp_password.as_deref().unwrap_or("")
+        ));
+        c.push_str(&format!("server_activation_port={}\n", self.server_activation_port));
+        c.push_str(&format!(
+            "server_activation_url={}\n",
+            self.server_activation_url.as_deref().unwrap_or("")
+        ));
+        c.push_str(&format!(
+            "server_allow_create_public_channels={}\n",
+            switch(self.server_allow_create_public_channels)
+        ));
+        c.push_str(&format!(
+            "server_channel_deletion_unactivity_period={}\n",
+            self.server_channel_deletion_unactivity_period
+                .map(|p| p.to_string())
+                .unwrap_or_default()
+        ));
+        c.push_str("# server_superadmin=somenickname\n");
+        c
     }
 
     fn parse(contents: &str) -> Self {
@@ -748,6 +900,8 @@ impl Settings {
                 "muted_voice" if !value.is_empty() && crate::validation::is_storable(value) => {
                     settings.muted_voice.insert(value.to_string());
                 }
+                "autosave_messages" => settings.autosave_messages = parse_switch(value),
+                "resume_from_log" => settings.resume_from_log = parse_switch(value),
                 "daemon_host" if !value.is_empty() => {
                     settings.daemon_host = Some(value.to_string())
                 }
@@ -762,7 +916,6 @@ impl Settings {
                 "daemon_server_password" if !value.is_empty() => {
                     settings.daemon_server_password = Some(value.to_string())
                 }
-                "daemon_ssl" => settings.daemon_ssl = parse_switch(value),
                 "daemon_my_key_pub" if !value.is_empty() => {
                     settings.daemon_my_key_pub = Some(value.to_string())
                 }
@@ -814,7 +967,7 @@ impl Settings {
                 "connect_nickname" if crate::validation::nickname_is_registrable(value) => {
                     settings.connect_nickname = Some(value.to_string())
                 }
-                "connect_ssl" => settings.connect_ssl = parse_switch(value),
+                "connect_using_ssl" => settings.connect_using_ssl = parse_switch(value),
                 "connect_ssl_ca" if !value.is_empty() => {
                     settings.connect_ssl_ca = Some(value.to_string())
                 }
@@ -908,6 +1061,8 @@ impl Settings {
                 contents.push_str(&format!("muted_voice={name}\n"));
             }
         }
+        contents.push_str(&format!("autosave_messages={}\n", switch(self.autosave_messages)));
+        contents.push_str(&format!("resume_from_log={}\n", switch(self.resume_from_log)));
         // Daemon keys. Only written when set, so a machine that has never
         // run a daemon keeps a settings file with nothing daemon-shaped
         // in it rather than a block of empty values.
@@ -934,9 +1089,6 @@ impl Settings {
         }
         if self.daemon_otp {
             contents.push_str("daemon_otp=true\n");
-        }
-        if self.daemon_ssl {
-            contents.push_str("daemon_ssl=on\n");
         }
         if self.daemon_no_server {
             contents.push_str("daemon_no_server=true\n");
@@ -975,7 +1127,7 @@ impl Settings {
         if let Some(port) = self.connect_port {
             contents.push_str(&format!("connect_port={port}\n"));
         }
-        contents.push_str(&format!("connect_ssl={}\n", switch(self.connect_ssl)));
+        contents.push_str(&format!("connect_using_ssl={}\n", switch(self.connect_using_ssl)));
         if let Some(ca) = &self.connect_ssl_ca
             && crate::validation::is_storable(ca)
         {
@@ -1022,7 +1174,7 @@ impl Settings {
         ssl: bool,
     ) -> io::Result<()> {
         Self::update(path, |s| {
-            s.connect_ssl = ssl;
+            s.connect_using_ssl = ssl;
             // An empty host is what a `--no-server` start stands in for
             // (`client::daemon::DaemonConfig::resolve`), not an address -
             // recording it would leave the next start resolving a host

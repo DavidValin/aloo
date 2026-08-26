@@ -20,6 +20,8 @@
 //! agnostic key handling, and rendering helpers used by both views.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
@@ -54,6 +56,11 @@ pub const RECORD_HOLD_TIMEOUT: Duration = Duration::from_millis(900);
 /// How many entries `PageUp`/`PageDown` move the message-log selection by
 /// in one press, while focus is on the message log.
 pub const MESSAGE_PAGE_JUMP: usize = 10;
+
+/// `UiState::last_messages_area_height`'s value before any frame has ever
+/// rendered - a reasonable-sized initial `resume_from_log` chunk rather
+/// than loading nothing at all.
+pub const DEFAULT_HISTORY_CHUNK_LINES: u16 = 24;
 
 /// How many lines `PageUp`/`PageDown` scroll the help overlay by in one
 /// press - see `UiState::help_scroll`.
@@ -507,6 +514,24 @@ const HELP_BODY: &[HelpLine] = &[
     ),
     HelpLine::Blank,
     HelpLine::Item {
+        keys: "Ctrl+S",
+        text: "reach someone with no server involved: opens the \"Direct Punches\" popup - \
+               'a' adds a target with their nickname, and where their client is (an IPv4/ \
+               IPv6 address or hostname, optionally :port), and how often to try - \
+               every_1m, every_5m, ... every_55m or every_1h. Every schedule restarts at \
+               the top of the hour, so every_1m tries at :00, :01, :02... and every_1h at \
+               :00 only - both sides trying at the same clock moments, with nothing \
+               coordinating it but that. It only works if they've added you back the same \
+               way - your nickname, your public host/IP, and the *same* frequency - \
+               otherwise your two attempts never land at the same moment. Shown only once \
+               you've configured at least one. If your own address moves (an ordinary \
+               home connection), set noip_when_no_server_and_direct_punch_is_active=on plus \
+               noip_hostname/noip_username/noip_password (a No-IP account) in \
+               ~/.aloo/settings - aloo keeps that hostname pointed at wherever you \
+               currently are, so you can give the other person a fixed hostname to punch \
+               at instead of a raw address that might change.",
+    },
+    HelpLine::Item {
         keys: "Ctrl+C",
         text: "quit",
     },
@@ -586,6 +611,20 @@ pub enum MessageBody {
     /// per-connection counters can coincidentally collide.
     VoiceStreaming {
         stream_id: u64,
+    },
+    /// A voice row reconstructed from `resume_from_log` history that
+    /// hasn't been loaded into memory yet - `client::export`'s reader
+    /// deliberately never decodes the referenced `.wav` up front (see its
+    /// own module doc). `wav_path` is `None` when the original autosave
+    /// couldn't write the audio at the time (its `.log` line names a
+    /// duration but no file) - replaying that row can only report that
+    /// nothing was saved, not play anything. Replaying a `Some` row
+    /// (`handle_messages_key`'s `Enter`) decodes it on the spot and
+    /// mutates this entry into an ordinary `Voice` in place, so a second
+    /// replay of the same row is instant.
+    VoiceOnDisk {
+        duration_ms: u32,
+        wav_path: Option<PathBuf>,
     },
     /// One file transfer, consent-gated and streamed
     /// (`docs/PROTOCOL.md`'s file transfer section) - `stream_id` identifies
@@ -887,6 +926,11 @@ pub struct LogEntry {
     /// creation (`local_time_stamp`) rather than stored as an instant, the
     /// same way presence notices already carry their own formatted time.
     pub sent_at: String,
+    /// The same instant as `sent_at`, in UTC (`export::utc_time_stamp`) -
+    /// `sent_at` is local-time-only, and `client::export`'s autosave/manual
+    /// export log lines need real UTC rather than whatever timezone this
+    /// machine happens to be in.
+    pub sent_at_utc: String,
     /// Set only on an outgoing message whose delivery this client tracks
     /// (`docs/PROTOCOL.md` 7.2.1). `None` everywhere else, including
     /// everything incoming (which was delivered to us by the fact of being
@@ -905,6 +949,16 @@ pub struct LogEntry {
     /// about: a system or presence line this client wrote itself, or a
     /// channel send whose members do not share one scheme.
     pub crypto: Option<MessageCrypto>,
+    /// Whether this row's voice has actually been heard - either it
+    /// autoplayed live (the sending channel/DM was the one on screen when
+    /// it arrived), or it was later replayed manually (`Enter` in
+    /// `handle_messages_key`). `true` on every non-voice row, and on every
+    /// outgoing voice row (the marker below only ever applies to something
+    /// received - `render_messages` also gates on `!entry.outgoing` as a
+    /// second safeguard). Drives the red "not listened" end-of-line
+    /// marker for a received `MessageBody::Voice` row that never got
+    /// either.
+    pub listened: bool,
 }
 
 /// One outgoing message's delivery state: who it was addressed to, and
@@ -1262,6 +1316,10 @@ pub enum Mode {
     /// `crate::client::tui::channel_lock_popup`. Data lives in
     /// `UiState::channel_lock`, same split as `FileSend`/`file_send`.
     ChannelLockPopup,
+    /// The `Ctrl+E` export popup is open - see
+    /// `crate::client::tui::export_popup`. Data lives in
+    /// `UiState::export_popup`, same split as `FileSend`/`file_send`.
+    ExportPopup,
 }
 
 /// Which field is focused inside the Ctrl+J popup - Tab/BackTab cycles.
@@ -1943,6 +2001,15 @@ pub enum UiAction {
     /// hands the rows to the modal `open_direct_punches` already opened
     /// empty, same split as `OpenContacts`.
     OpenDirectPunches,
+    /// `Ctrl+E`'s popup was confirmed with at least one channel/DM
+    /// checked - dumps each one's current in-memory log to
+    /// `~/.aloo/exports/<server>/...` (`client::export::export_log`),
+    /// every file from this one export sharing the `prefix` shortuuid.
+    ExportSelected {
+        prefix: String,
+        channels: Vec<String>,
+        dms: Vec<UserId>,
+    },
     /// An add, edit or delete on the "Direct Punches" popup - persists the
     /// whole replacement list to `~/.aloo/settings` (a merging write, so a
     /// concurrent daemon's own keys are untouched) and immediately
@@ -2202,6 +2269,40 @@ pub struct UiState {
     /// no directory to browse and nothing to create, so the only channels
     /// that exist are the ones `direct_punch_channel` names.
     pub serverless: bool,
+    /// `<server>` component of `~/.aloo/exports/<server>/...`
+    /// (`client::export`) - `export::DIRECT_LABEL` for a `--no-server`
+    /// session, else `export::server_label(host, port)`. Set once at
+    /// session start (`session::run_connected_session`) and never changed
+    /// afterward, same lifetime as `serverless` above.
+    pub server_label: String,
+    /// `Settings::autosave_messages`, read once at session start
+    /// (`session::run_connected_session`) - whether every arriving/sent
+    /// log entry gets appended to `~/.aloo/exports/<server>/...` as it
+    /// happens (`client::export::autosave_entry`). Like every other
+    /// settings value this app reads at startup, a change to the file
+    /// mid-session takes effect on the next run, not live.
+    pub autosave_messages: bool,
+    /// `Settings::resume_from_log`, read once at session start
+    /// (`session::run_connected_session`) - whether opening a channel/DM,
+    /// or scrolling to the top of what's currently loaded, pulls another
+    /// chunk of older history back in from that surface's
+    /// `autosave_messages` `.log` file (`UiState::load_history_chunk`,
+    /// `client::export::LogHistoryCursor`).
+    pub resume_from_log: bool,
+    /// The message log's rendered height as of the last frame
+    /// (`render_messages`, where `inner.height` is already computed) -
+    /// interior mutability because `render` only ever receives `&UiState`,
+    /// never `&mut`, so this is the one way key-handling code (which never
+    /// sees a `Frame`) learns how many rows a history chunk should be
+    /// sized to (`history_chunk_size`). `AtomicU16`, not `Cell`: a daemon
+    /// session runs `run_daemon_session` inside `tokio::spawn`
+    /// (`daemon.rs`), which needs the whole future - and so `UiState` -
+    /// `Send`, which for a type held behind `&UiState` across an `.await`
+    /// also needs it `Sync`; `Cell` isn't. `Ordering::Relaxed` throughout:
+    /// this is a best-effort sizing hint, not a synchronization point.
+    /// Starts at `DEFAULT_HISTORY_CHUNK_LINES` before the first frame has
+    /// ever rendered.
+    pub last_messages_area_height: AtomicU16,
     /// Selected row of the `/channels` modal, into `known_channels`.
     pub channels_popup_selected: usize,
     pub known_users: HashMap<UserId, UserInfo>,
@@ -2291,6 +2392,9 @@ pub struct UiState {
     /// `mode == Mode::ChannelLockPopup` - see
     /// `crate::client::tui::channel_lock_popup`.
     pub channel_lock: Option<super::channel_lock_popup::ChannelLockPopupState>,
+    /// The `Ctrl+E` export popup's state, while `mode == Mode::ExportPopup`
+    /// - see `crate::client::tui::export_popup`.
+    pub export_popup: Option<super::export_popup::ExportPopupState>,
     /// A pending `/delete-channel` or `/assign-admin` confirmation -
     /// answered the same way `call_confirm` is, reusing `CallConfirmChoice`
     /// since both are a plain Confirm/Cancel over a one-line question.
@@ -2634,6 +2738,10 @@ impl UiState {
             known_channels: Vec::new(),
             superadmins: std::collections::BTreeSet::new(),
             serverless: false,
+            server_label: crate::client::export::DIRECT_LABEL.to_string(),
+            autosave_messages: false,
+            resume_from_log: false,
+            last_messages_area_height: AtomicU16::new(DEFAULT_HISTORY_CHUNK_LINES),
             channels_popup_selected: 0,
             known_users: HashMap::new(),
             offline: HashSet::new(),
@@ -2659,6 +2767,7 @@ impl UiState {
             contacts: None,
             direct_punches: None,
             channel_lock: None,
+            export_popup: None,
             channel_command_confirm: None,
             channel_command_confirm_focus: CallConfirmChoice::Confirm,
             file_row_of_stream: HashMap::new(),
@@ -2977,6 +3086,83 @@ impl UiState {
             .is_some_and(|u| self.muted_voice.contains(&u.name))
     }
 
+    /// How many records a `resume_from_log` chunk should pull in at a
+    /// time - the message log's last-rendered height (`Cell`, set every
+    /// frame by `render_messages`), floored at a small minimum so a
+    /// not-yet-rendered or pathologically short terminal still loads
+    /// something meaningful rather than nothing.
+    pub fn history_chunk_size(&self) -> usize {
+        self.last_messages_area_height.load(Ordering::Relaxed).max(5) as usize
+    }
+
+    /// `resume_from_log`'s one entry point for pulling more history in -
+    /// used both to seed a surface with its first chunk the moment it's
+    /// opened (`select_channel_at`/`select_dm`, only while its
+    /// `history_cursor` is still `None`) and to pull another chunk once
+    /// scrolling reaches the top of what's already loaded
+    /// (`handle_messages_key`'s `Up`/`PageUp`/`Home`, every time). Prepends
+    /// straight onto the front of the surface's live `log` and returns how
+    /// many entries were added - `0` if the feature is off, there's
+    /// nothing left on disk, or there's no surface to load into at all
+    /// (`CurrentFocus::Nowhere`).
+    pub fn load_history_chunk(&mut self) -> usize {
+        if !self.resume_from_log {
+            return 0;
+        }
+        let server_label = self.server_label.clone();
+        let chunk_size = self.history_chunk_size();
+        // Only entries this *session* actually wrote to disk (via
+        // `autosave_messages`) can already be sitting at the tail of the
+        // file - skipping `log.len()` regardless of that would, with
+        // autosave off, silently drop that many genuine never-seen records
+        // instead of pre-existing live ones that were never mirrored.
+        let autosave_messages = self.autosave_messages;
+        match self.current_focus() {
+            CurrentFocus::Channel(name) => {
+                let Some(tab) = self.channels.iter_mut().find(|c| c.name == name) else {
+                    return 0;
+                };
+                let already_loaded = if autosave_messages { tab.log.len() } else { 0 };
+                let cursor = tab.history_cursor.get_or_insert_with(|| {
+                    crate::client::export::LogHistoryCursor::open(
+                        &server_label,
+                        crate::client::export::Surface::Channel(&name),
+                        already_loaded,
+                    )
+                });
+                if !cursor.has_more() {
+                    return 0;
+                }
+                let entries = cursor.next_chunk(chunk_size);
+                let n = entries.len();
+                tab.log.splice(0..0, entries);
+                n
+            }
+            CurrentFocus::Dm(peer) => {
+                let Some(room) = self.private_rooms.get_mut(&peer) else {
+                    return 0;
+                };
+                let already_loaded = if autosave_messages { room.log.len() } else { 0 };
+                let peer_name = room.peer.name.clone();
+                let cursor = room.history_cursor.get_or_insert_with(|| {
+                    crate::client::export::LogHistoryCursor::open(
+                        &server_label,
+                        crate::client::export::Surface::Dm(&peer_name),
+                        already_loaded,
+                    )
+                });
+                if !cursor.has_more() {
+                    return 0;
+                }
+                let entries = cursor.next_chunk(chunk_size);
+                let n = entries.len();
+                room.log.splice(0..0, entries);
+                n
+            }
+            CurrentFocus::Nowhere => 0,
+        }
+    }
+
     /// Whether audio arriving from `peer` right now must be kept off the
     /// mixer - the single predicate both reasons funnel through, so a
     /// caller can never remember one and forget the other. Snapshotted
@@ -3251,6 +3437,7 @@ impl UiState {
     pub fn resolve_identity_accept(&mut self, peer: UserId) -> bool {
         self.identity_reviews.remove(&peer);
         self.remove_from_identity_review_queue(peer);
+        let autosave = self.autosave_messages.then(|| self.server_label.clone());
         if let Some(held) = self.pending_messages.remove(&peer) {
             for HeldMessage { channel, entry } in held {
                 match channel {
@@ -3265,6 +3452,13 @@ impl UiState {
                             );
                             if !is_current {
                                 tab.unread = true;
+                            }
+                            if let Some(server_label) = &autosave {
+                                crate::client::export::autosave_entry(
+                                    server_label,
+                                    crate::client::export::Surface::Channel(&name),
+                                    tab.log.last().unwrap(),
+                                );
                             }
                         }
                     }
@@ -3287,6 +3481,7 @@ impl UiState {
                         let Some(room) = self.private_rooms.get_mut(&peer) else {
                             continue;
                         };
+                        let peer_name = room.peer.name.clone();
                         push_log_entry(
                             &mut room.log,
                             &mut self.message_selected,
@@ -3295,6 +3490,13 @@ impl UiState {
                         );
                         if !is_current {
                             room.unread = true;
+                        }
+                        if let Some(server_label) = &autosave {
+                            crate::client::export::autosave_entry(
+                                server_label,
+                                crate::client::export::Surface::Dm(&peer_name),
+                                room.log.last().unwrap(),
+                            );
                         }
                     }
                 }
@@ -5096,6 +5298,9 @@ impl UiState {
         if self.mode == Mode::ChannelLockPopup {
             return self.handle_channel_lock_popup_key(code);
         }
+        if self.mode == Mode::ExportPopup {
+            return self.handle_export_popup_key(code);
+        }
 
         // The top row's two selectors (`docs/SPEC.md` "Connected UI"):
         // `[` walks left, `]` walks right, and the outermost press on
@@ -5187,6 +5392,16 @@ impl UiState {
                 KeyCode::Char('s') | KeyCode::Char('S') => {
                     self.open_direct_punches();
                     return Some(UiAction::OpenDirectPunches);
+                }
+                // Opens the export popup - checkbox-pick any joined
+                // channel or open DM, Confirm to dump each one's current
+                // log to `~/.aloo/exports/<server>/...`
+                // (`client::export::export_log`). Purely local, so unlike
+                // `Ctrl+S` this never needs a `UiAction` just to populate
+                // itself.
+                KeyCode::Char('e') | KeyCode::Char('E') => {
+                    self.open_export_popup();
+                    return None;
                 }
                 _ => {}
             }
@@ -6421,6 +6636,14 @@ impl UiState {
         let len = self.current_log().len();
         match code {
             KeyCode::Up => {
+                // Reaching the top of what's loaded, with `resume_from_log`
+                // on, pulls one more chunk in first - `load_history_chunk`
+                // is a no-op (returns 0) when the setting is off or there's
+                // nothing left on disk, so `message_selected` then just
+                // clamps at 0 exactly as it always did.
+                if self.message_selected == 0 {
+                    self.message_selected += self.load_history_chunk();
+                }
                 self.message_selected = self.message_selected.saturating_sub(1);
                 None
             }
@@ -6431,6 +6654,9 @@ impl UiState {
                 None
             }
             KeyCode::PageUp => {
+                if self.message_selected == 0 {
+                    self.message_selected += self.load_history_chunk();
+                }
                 self.message_selected = self.message_selected.saturating_sub(MESSAGE_PAGE_JUMP);
                 None
             }
@@ -6442,6 +6668,12 @@ impl UiState {
                 None
             }
             KeyCode::Home => {
+                // Jumps straight to the top of what's loaded - if that
+                // triggers a load, the new top (index 0) is still the
+                // right landing spot, so `= 0` below is unconditional.
+                if self.message_selected == 0 {
+                    self.load_history_chunk();
+                }
                 self.message_selected = 0;
                 None
             }
@@ -6488,6 +6720,50 @@ impl UiState {
                         stream_id: *stream_id,
                     });
                 }
+                // A `resume_from_log` row nobody has asked to hear yet -
+                // load it from disk right here (a rare, user-initiated,
+                // bounded-size read, not a hot path) and mutate it into an
+                // ordinary `Voice` in place, so a second replay of the same
+                // row is instant and the row otherwise behaves exactly
+                // like any other from then on. `wav_path: None` (the
+                // original autosave couldn't write the audio) or a file
+                // that no longer decodes both report the reason and stop -
+                // there's nothing to fall through into.
+                if let Some(LogEntry {
+                    body: MessageBody::VoiceOnDisk { duration_ms, wav_path },
+                    ..
+                }) = self.current_log().get(selected)
+                {
+                    let duration_ms = *duration_ms;
+                    match wav_path.clone() {
+                        Some(path) => {
+                            let loaded = std::fs::read(&path)
+                                .ok()
+                                .and_then(|bytes| crate::client::voice::decode_wav_to_mono(&bytes));
+                            match loaded {
+                                Some(samples) => {
+                                    let pcm = crate::client::voice::pcm_to_bytes(&samples);
+                                    if let Some(entry) =
+                                        self.current_log_mut().and_then(|log| log.get_mut(selected))
+                                    {
+                                        entry.body = MessageBody::Voice { duration_ms, pcm };
+                                    }
+                                }
+                                None => {
+                                    self.push_status_notice(
+                                        "could not load this voice message's audio".to_string(),
+                                        false,
+                                    );
+                                    return None;
+                                }
+                            }
+                        }
+                        None => {
+                            self.push_status_notice("no audio was saved for this message".to_string(), false);
+                            return None;
+                        }
+                    }
+                }
                 let replay = match self.current_log().get(selected) {
                     Some(LogEntry {
                         body: MessageBody::Voice { duration_ms, pcm },
@@ -6514,10 +6790,12 @@ impl UiState {
                 self.replaying = true;
                 // Taken, not read: hearing it twice is still hearing it
                 // once, and the sender has already been told.
-                let owed_receipt = self
-                    .current_log_mut()
-                    .and_then(|log| log.get_mut(selected))
-                    .and_then(|entry| entry.owed_receipt.take());
+                let owed_receipt = self.current_log_mut().and_then(|log| log.get_mut(selected)).and_then(
+                    |entry| {
+                        entry.listened = true;
+                        entry.owed_receipt.take()
+                    },
+                );
                 Some(UiAction::ReplayVoice {
                     duration_ms,
                     pcm,
@@ -6783,6 +7061,7 @@ impl UiState {
                 .filter(|c| c.members.iter().any(|m| m.id == user_id))
                 .map(|c| c.name.clone())
                 .collect();
+            let autosave = self.autosave_messages.then(|| self.server_label.clone());
             for channel in member_channels {
                 let is_current = self.is_viewing_channel(&channel);
                 if let Some(tab) = self.channels.iter_mut().find(|c| c.name == channel) {
@@ -6798,11 +7077,20 @@ impl UiState {
                             outgoing: false,
                             failed: false,
                             sent_at: local_time_stamp(),
+                            sent_at_utc: crate::client::export::utc_time_stamp(),
                             owed_receipt: None,
+                            listened: true,
                             delivery: None,
                             crypto: None,
                         },
                     );
+                    if let Some(server_label) = &autosave {
+                        crate::client::export::autosave_entry(
+                            server_label,
+                            crate::client::export::Surface::Channel(&channel),
+                            tab.log.last().unwrap(),
+                        );
+                    }
                 }
             }
             if self.private_rooms.contains_key(&user_id) {
@@ -6814,17 +7102,26 @@ impl UiState {
                         is_current,
                         LogEntry {
                             from: user_id,
-                            from_name: name,
+                            from_name: name.clone(),
                             to_name: None,
                             body: MessageBody::Presence(text),
                             outgoing: false,
                             failed: false,
                             sent_at: local_time_stamp(),
+                            sent_at_utc: crate::client::export::utc_time_stamp(),
                             owed_receipt: None,
+                            listened: true,
                             delivery: None,
                             crypto: None,
                         },
                     );
+                    if let Some(server_label) = &autosave {
+                        crate::client::export::autosave_entry(
+                            server_label,
+                            crate::client::export::Surface::Dm(&name),
+                            room.log.last().unwrap(),
+                        );
+                    }
                 }
             }
         }
@@ -6908,26 +7205,26 @@ pub(crate) fn push_log_entry(
 /// Shared by `channel::on_channel_stream_finished`/
 /// `direct_message::on_direct_stream_finished`: finds the `VoiceStreaming`
 /// placeholder matching both `from` and `stream_id` in `log` and swaps it
-/// for a finished `Voice` entry. Returns whether a matching placeholder was
-/// actually found - callers that also maintain a held-message buffer
-/// (`finalize_held_stream`) use this to fall through to it when the
-/// placeholder isn't in the visible log.
+/// for a finished `Voice` entry. Returns the finalized entry when a
+/// matching placeholder was found - callers that also maintain a
+/// held-message buffer (`finalize_held_stream`) use a `None` return to
+/// fall through to it when the placeholder isn't in the visible log; a
+/// `Some` return is also `client::export::autosave_entry`'s hook for a
+/// freshly-completed voice message (it has no audio to write before this
+/// point - see that function's doc).
 pub(crate) fn finalize_stream_entry(
     log: &mut [LogEntry],
     from: UserId,
     stream_id: u64,
     duration_ms: u32,
     pcm: Vec<u8>,
-) -> bool {
-    if let Some(entry) = log.iter_mut().find(|e| {
+) -> Option<&LogEntry> {
+    let entry = log.iter_mut().find(|e| {
         e.from == from
             && matches!(e.body, MessageBody::VoiceStreaming { stream_id: sid } if sid == stream_id)
-    }) {
-        entry.body = MessageBody::Voice { duration_ms, pcm };
-        true
-    } else {
-        false
-    }
+    })?;
+    entry.body = MessageBody::Voice { duration_ms, pcm };
+    Some(&*entry)
 }
 
 /// `finalize_stream_entry`'s counterpart for the held-message buffer
@@ -6990,6 +7287,9 @@ pub fn render(frame: &mut Frame, state: &UiState) {
     }
     if state.mode == Mode::ChannelLockPopup {
         super::channel_lock_popup::render_channel_lock_popup(frame, area, state);
+    }
+    if state.mode == Mode::ExportPopup {
+        super::export_popup::render_export_popup(frame, area, state);
     }
     // One message's delivery details, drawn under the help overlay and
     // every consent popup for the same reason `handle_key` lets those
@@ -8454,6 +8754,45 @@ pub(crate) fn render_messages(
                         format!("\u{1F534} {label}"),
                         Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                     ));
+                    // A received voice message nobody has actually heard
+                    // yet - never autoplayed (muted, trust-gated, or this
+                    // wasn't the focused channel/DM when it arrived) and
+                    // never manually replayed either (`handle_messages_key`'s
+                    // Enter, which is the only other place `listened` is
+                    // ever set). Right-padded to the row's own width so the
+                    // marker lands flush with the right edge.
+                    if !entry.outgoing && !entry.listened {
+                        const NOT_LISTENED: &str = "not listened";
+                        let used: u16 = spans.iter().map(|s| display_width(s.content.as_ref())).sum();
+                        let marker_width = display_width(NOT_LISTENED);
+                        let pad = inner.width.saturating_sub(used + marker_width);
+                        if pad > 0 {
+                            spans.push(Span::raw(" ".repeat(pad as usize)));
+                        }
+                        spans.push(Span::styled(
+                            NOT_LISTENED,
+                            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                        ));
+                    }
+                    vec![Line::from(spans)]
+                }
+                // A `resume_from_log` history row nobody has asked to hear
+                // yet - dimmed rather than the solid red `Voice` circle,
+                // to read at a glance as "not loaded" rather than "not
+                // listened" (no marker either: `listened` is always `true`
+                // here, see `export::parse_log_entry`'s doc for why).
+                MessageBody::VoiceOnDisk { duration_ms, wav_path } => {
+                    let label = format_duration_label(*duration_ms);
+                    let mut spans = sender_prefix(entry);
+                    let hint = if wav_path.is_some() {
+                        "(Enter to load)"
+                    } else {
+                        "(no audio saved)"
+                    };
+                    spans.push(Span::styled(
+                        format!("\u{25CB} {label} {hint}"),
+                        Style::default().fg(Color::DarkGray),
+                    ));
                     vec![Line::from(spans)]
                 }
                 MessageBody::VoiceStreaming { .. } => {
@@ -8589,6 +8928,9 @@ pub(crate) fn render_messages(
     // log actually overflows - an unscrollable pane shouldn't lose a column
     // of text to a bar that would be full-height anyway.
     let visible = inner.height as usize;
+    // Cached for `UiState::history_chunk_size` - key-handling code (Up/
+    // PageUp/Home, tab switches) never sees a `Frame`/`Rect` of its own.
+    state.last_messages_area_height.store(inner.height, Ordering::Relaxed);
     let overflows = log.len() > visible && inner.width > 1;
     let list_area = if overflows {
         Rect {
