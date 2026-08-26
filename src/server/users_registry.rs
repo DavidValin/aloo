@@ -448,6 +448,32 @@ impl UsersRegistry {
         best
     }
 
+    /// A login attempt against an account whose activation code has
+    /// expired: replaces the stale `<old_ts>_activate.txt` with a fresh
+    /// `<now_utc>_activate.txt` carrying a new code, exactly what
+    /// `register` already does when the same expired-pending account is
+    /// registered again - except this leaves `key`/`email.txt` untouched,
+    /// since a login attempt (unlike a register attempt) carries no new
+    /// password or email to replace them with. `None` if there is no
+    /// expired pending activation to reissue against (nothing pending at
+    /// all, or a code that hasn't expired yet - `activate` is the answer
+    /// for that case).
+    pub fn reissue_activation(&self, nickname: &str, now_utc: u64) -> io::Result<Option<Registration>> {
+        let Some(pending) = self.pending_activation(nickname) else {
+            return Ok(None);
+        };
+        if !pending.is_expired(now_utc) {
+            return Ok(None);
+        }
+        let dir = self
+            .user_dir(nickname)
+            .expect("pending_activation already resolved this nickname to a directory");
+        fs::remove_file(&pending.path)?;
+        let code = generate_activation_code();
+        fs::write(dir.join(format!("{now_utc}{ACTIVATE_SUFFIX}")), format!("{code}\n"))?;
+        Ok(Some(Registration { code, created_at_utc: now_utc }))
+    }
+
     /// Activates `nickname` if `code` is the pending one and still valid -
     /// by removing the `_activate.txt` file, which is all activation is.
     /// An expired code is reported as such and left in place; `register`

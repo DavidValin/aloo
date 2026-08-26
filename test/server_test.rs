@@ -338,6 +338,127 @@ async fn an_expired_activation_is_refused_with_a_reason() {
     }
 }
 
+/// The resend-on-login path (`reissue_and_resend_activation`): when the
+/// relay itself is unreachable, the login attempt must still end in
+/// exactly the same expiry refusal as when no SMTP is configured at all -
+/// the fresh code `reissue_activation` writes is worthless if it can
+/// never be delivered, so nothing about the failure mode should leak
+/// through as a different, more confusing message. `reissue_activation`'s
+/// own data-mutation half (a fresh code actually replacing the stale one)
+/// is proven directly in `server_users_registry_test.rs`, since there is
+/// no mock SMTP relay in this test harness to prove delivery end to end.
+/// @requirement AC-367
+#[tokio::test]
+async fn an_expired_activation_still_refuses_when_the_configured_relay_is_unreachable() {
+    // A real ephemeral port, bound then immediately dropped, so nothing is
+    // listening there and the resend's connection attempt fails fast and
+    // deterministically rather than timing out.
+    let closed_port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    };
+    let options = test_options("login-expired-unreachable-smtp").with_registration(
+        Some(aloo::server::users_registry::SmtpConfig {
+            host: "127.0.0.1".to_string(),
+            port: closed_port,
+            username: String::new(),
+            password: String::new(),
+        }),
+        None,
+    );
+    let long_ago = aloo::server::users_registry::now_utc()
+        - aloo::server::users_registry::ACTIVATION_VALIDITY_SECS
+        - 60;
+    options
+        .users
+        .register("dan", "pw-dan", "dan@example.com", long_ago)
+        .unwrap();
+    let server = TestServer::spawn(options).await;
+    let mut stream = server.connect().await;
+    let result = login(&mut stream, "dan", "pw-dan").await;
+    match result {
+        ServerMessage::AuthResult {
+            ok: false,
+            activation_pending: false,
+            deactivated: None,
+            reason: Some(reason),
+        } => assert!(reason.contains("expired"), "{reason}"),
+        other => panic!("expected an expiry refusal, got {other:?}"),
+    }
+}
+
+/// `/password`'s live round trip end to end: the right current password
+/// changes it, the connection stays open, and the new password (not the
+/// old one) is what a later login actually needs.
+/// @requirement AC-368
+#[tokio::test]
+async fn change_password_with_the_right_old_password_takes_effect_immediately() {
+    let server = TestServer::spawn(test_options("change-password-ok")).await;
+    let mut stream = server.connect().await;
+    server.handshake(&mut stream, "alice").await;
+
+    stream
+        .send(&ClientMessage::ChangePassword {
+            old_password: password_for("alice"),
+            new_password: "a-new-password".to_string(),
+        })
+        .await
+        .unwrap();
+    let result: ServerMessage = stream.recv().await.unwrap().unwrap();
+    assert_eq!(result, ServerMessage::ChangePasswordResult { ok: true, reason: None });
+
+    // The connection itself is unaffected - a further message still
+    // works, proving the server didn't close it the way a failed Auth
+    // would.
+    stream.send(&ClientMessage::Heartbeat).await.unwrap();
+
+    let mut second = server.connect().await;
+    let old_password_result = login(&mut second, "alice", &password_for("alice")).await;
+    assert!(
+        matches!(old_password_result, ServerMessage::AuthResult { ok: false, .. }),
+        "the old password must no longer work: {old_password_result:?}"
+    );
+
+    let mut third = server.connect().await;
+    let new_password_result = login(&mut third, "alice", "a-new-password").await;
+    assert!(
+        matches!(new_password_result, ServerMessage::AuthResult { ok: true, .. }),
+        "the new password must work: {new_password_result:?}"
+    );
+}
+
+/// A wrong current password refuses, and - unlike a successful change -
+/// leaves the real password exactly as it was.
+/// @requirement AC-368
+#[tokio::test]
+async fn change_password_with_the_wrong_old_password_is_refused_and_changes_nothing() {
+    let server = TestServer::spawn(test_options("change-password-wrong")).await;
+    let mut stream = server.connect().await;
+    server.handshake(&mut stream, "alice").await;
+
+    stream
+        .send(&ClientMessage::ChangePassword {
+            old_password: "not-alices-password".to_string(),
+            new_password: "a-new-password".to_string(),
+        })
+        .await
+        .unwrap();
+    let result: ServerMessage = stream.recv().await.unwrap().unwrap();
+    match result {
+        ServerMessage::ChangePasswordResult { ok: false, reason: Some(reason) } => {
+            assert!(reason.contains("wrong"), "{reason}");
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+
+    let mut second = server.connect().await;
+    let still_the_old_one = login(&mut second, "alice", &password_for("alice")).await;
+    assert!(
+        matches!(still_the_old_one, ServerMessage::AuthResult { ok: true, .. }),
+        "the original password must still work: {still_the_old_one:?}"
+    );
+}
+
 /// `Hello` says whether registrations are taken, and a `Register` on a
 /// server that does not take them is refused and hung up on.
 /// @requirement AC-264
@@ -1020,4 +1141,65 @@ async fn a_superadmins_remove_channel_works_on_any_public_channel() {
 
     let msg: ServerMessage = bob.recv().await.unwrap().unwrap();
     assert!(matches!(&msg, ServerMessage::ChannelRemoved { name, .. } if name == "bobs-room"));
+}
+
+/// `/users`: every registered nickname, each with the channels it
+/// currently administers - `bob` (who created and so administers
+/// `bobs-room`) and `alice` (who administers nothing).
+/// @requirement AC-369
+#[tokio::test]
+async fn a_superadmins_users_list_names_every_registered_user_and_their_admin_channels() {
+    let mut options = test_options("admin-users-list");
+    options.superadmins.insert("alice".to_string());
+    let server = TestServer::spawn(options).await;
+
+    let mut a = server.connect().await;
+    server.handshake(&mut a, "alice").await;
+    let mut bob = server.connect().await;
+    server.handshake(&mut bob, "bob").await;
+
+    bob.send(&ClientMessage::JoinChannel {
+        name: "bobs-room".into(),
+        kind: ChannelKind::Public,
+        password: None,
+    })
+    .await
+    .unwrap();
+    let _: ServerMessage = bob.recv().await.unwrap().unwrap();
+    // Creating a public channel is broadcast to every connected client,
+    // alice included - drained here so it isn't mistaken for the
+    // `UsersList` requested next.
+    let broadcast: ServerMessage = a.recv().await.unwrap().unwrap();
+    assert!(matches!(broadcast, ServerMessage::ChannelCreated { .. }));
+
+    a.send(&ClientMessage::RequestUsersList).await.unwrap();
+    let msg: ServerMessage = a.recv().await.unwrap().unwrap();
+    let ServerMessage::UsersList { users } = msg else {
+        panic!("expected a UsersList, got {msg:?}");
+    };
+    let bob_row = users.iter().find(|u| u.nickname == "bob").expect("bob is registered");
+    assert_eq!(bob_row.admin_of, vec!["bobs-room".to_string()]);
+    let alice_row = users.iter().find(|u| u.nickname == "alice").expect("alice is registered");
+    assert!(alice_row.admin_of.is_empty());
+}
+
+/// Only a superadmin may run `/users` - anyone else is refused, the same
+/// `require_superadmin` gate every other `Admin*` message already goes
+/// through.
+/// @requirement AC-369
+#[tokio::test]
+async fn a_non_superadmins_users_list_is_refused() {
+    let mut options = test_options("users-list-not-superadmin");
+    options.superadmins.insert("alice".to_string());
+    let server = TestServer::spawn(options).await;
+
+    let mut bob = server.connect().await;
+    server.handshake(&mut bob, "bob").await;
+
+    bob.send(&ClientMessage::RequestUsersList).await.unwrap();
+    let msg: ServerMessage = bob.recv().await.unwrap().unwrap();
+    assert!(
+        matches!(&msg, ServerMessage::Error { message } if message.contains("superadmin")),
+        "expected a superadmin-only refusal, got {msg:?}"
+    );
 }

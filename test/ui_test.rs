@@ -1208,6 +1208,21 @@ fn render_help_popup_shows_expected_content_when_open() {
         rows.iter().any(|r| r.contains("Contacts & Keys")),
         "expected id_store identity pinning and /contacts explained after scrolling further down: {rows:?}"
     );
+    let rows = scroll_help_until(&mut state, "export your own identity card");
+    assert!(
+        rows.iter().any(|r| r.contains("export your own identity card")),
+        "expected /contacts' x (export own identity card) explained: {rows:?}"
+    );
+    let rows = scroll_help_until(&mut state, "/users");
+    assert!(
+        rows.iter().any(|r| r.contains("/users")),
+        "expected the superadmin /users popup explained: {rows:?}"
+    );
+    let rows = scroll_help_until(&mut state, "Your password");
+    assert!(
+        rows.iter().any(|r| r.contains("/password")),
+        "expected /password <old> <new> explained: {rows:?}"
+    );
 }
 
 /// @requirement AC-056

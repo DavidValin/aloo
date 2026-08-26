@@ -297,11 +297,12 @@ impl UiState {
             return;
         };
         state.rows = rows;
-        state.selected = if state.rows.is_empty() {
-            0
-        } else {
-            state.selected.min(state.rows.len() - 1)
-        };
+        // `rows.len()` itself is always a valid index too - the "Export
+        // identity card" button, one past the last real row - so this
+        // must not clamp it away the way clamping to `rows.len() - 1`
+        // would (silently landing back on the last real row instead of
+        // preserving "the button is selected" across a refresh).
+        state.selected = state.selected.min(state.rows.len());
     }
 
     /// Opens the user-info popup (`i` on a channel member, `/info` in an
@@ -319,6 +320,21 @@ impl UiState {
             last_seen_unix: None,
             keys: Vec::new(),
         });
+    }
+
+    /// Opens the superadmin `/users` popup empty, and lets the caller also
+    /// return `UiAction::RequestUsersList` so the session fills it in -
+    /// the same `open_contacts`/`OpenContacts` split.
+    pub fn open_users_admin(&mut self) {
+        self.users_admin = Some(Vec::new());
+    }
+
+    /// `RequestUsersList`'s answer. A no-op if the popup was closed before
+    /// the session's answer arrived.
+    pub fn set_users_admin(&mut self, users: Vec<crate::proto::UserAdminInfo>) {
+        if self.users_admin.is_some() {
+            self.users_admin = Some(users);
+        }
     }
 
     /// `RequestUserInfo`'s answer. A no-op if the popup was closed (or
@@ -408,6 +424,12 @@ impl UiState {
 
     fn handle_contacts_list_key(&mut self, code: KeyCode) -> Option<UiAction> {
         let len = self.contacts.as_ref()?.rows.len();
+        // The "Export identity card" button lives one past the last real
+        // row - `selected == len` is never a row index, it's the button.
+        // Always present (`total` is never 0) so the button is reachable
+        // even with no contacts pinned yet.
+        let total = len + 1;
+        let on_button = self.contacts.as_ref()?.selected == len;
         match code {
             KeyCode::Esc => {
                 self.contacts = None;
@@ -415,24 +437,21 @@ impl UiState {
                 None
             }
             KeyCode::Up => {
-                if len > 0
-                    && let Some(state) = self.contacts.as_mut()
-                {
-                    state.selected = (state.selected + len - 1) % len;
+                if let Some(state) = self.contacts.as_mut() {
+                    state.selected = (state.selected + total - 1) % total;
                 }
                 None
             }
             KeyCode::Down => {
-                if len > 0
-                    && let Some(state) = self.contacts.as_mut()
-                {
-                    state.selected = (state.selected + 1) % len;
+                if let Some(state) = self.contacts.as_mut() {
+                    state.selected = (state.selected + 1) % total;
                 }
                 None
             }
             KeyCode::Char('r') => Some(UiAction::RefreshContacts),
+            KeyCode::Char('x') => Some(UiAction::ExportOwnIdentityCard),
             KeyCode::Char('d') | KeyCode::Delete => {
-                if len == 0 {
+                if len == 0 || on_button {
                     return None;
                 }
                 if let Some(state) = self.contacts.as_mut() {
@@ -441,18 +460,21 @@ impl UiState {
                 None
             }
             KeyCode::Left => {
-                if let Some(state) = self.contacts.as_mut() {
+                if !on_button && let Some(state) = self.contacts.as_mut() {
                     state.selected_key = state.selected_key.prev();
                 }
                 None
             }
             KeyCode::Right => {
-                if let Some(state) = self.contacts.as_mut() {
+                if !on_button && let Some(state) = self.contacts.as_mut() {
                     state.selected_key = state.selected_key.next();
                 }
                 None
             }
             KeyCode::Enter => {
+                if on_button {
+                    return Some(UiAction::ExportOwnIdentityCard);
+                }
                 if len == 0 {
                     return None;
                 }
@@ -480,29 +502,6 @@ impl UiState {
                         nickname: String::new(),
                         device_id: String::new(),
                         focus: AddContactField::Nickname,
-                        error: None,
-                    });
-                }
-                None
-            }
-            KeyCode::Char('o') => {
-                let row = self.contacts.as_ref()?.rows.get(self.contacts.as_ref()?.selected)?.clone();
-                if row.otp_contact_name.is_none() {
-                    self.push_status_notice(
-                        "no keychain name could be derived for this contact".to_string(),
-                        false,
-                    );
-                    return None;
-                }
-                if let Some(state) = self.contacts.as_mut() {
-                    state.install = Some(InstallOtpState {
-                        nickname: row.nickname,
-                        device_id: row.device_id,
-                        purpose: OtpPurpose::Live,
-                        enc_path: String::new(),
-                        dec_path: String::new(),
-                        focus: InstallField::EncPath,
-                        browser: None,
                         error: None,
                     });
                 }
@@ -556,13 +555,19 @@ impl UiState {
         }
     }
 
-    /// Validates the typed nickname/device_id (same rules
-    /// `DirectPunchTarget::parse` already applies to a manually-typed
-    /// nickname+device pair: `nickname_is_registrable`, `is_storable`) and
-    /// that no row already pins this exact `(nickname, device_id)`. On
-    /// success, opens the *same* key-details popup Enter-on-a-row does,
-    /// marked `new_contact: true` - nothing is written to `id_store` by
-    /// this step alone, only by actually adding a key from there.
+    /// Validates the typed nickname (same rule `DirectPunchTarget::parse`
+    /// already applies: `nickname_is_registrable`) and, if a device_id was
+    /// typed, that it's `is_storable` and no row already pins this exact
+    /// `(nickname, device_id)`. The device_id is optional - the identity
+    /// card this flow can go on to import is too (device-pinning plan §3):
+    /// left blank, the contact claims the nickname's shared unbound slot
+    /// instead of one specific device, refused only if that slot is
+    /// already taken by an unbound row of its own. On success, reserves
+    /// the contact as a bare, keyless placeholder right away
+    /// (`UiAction::AddBareContact` - `client::contacts::handle_add_bare_contact`)
+    /// so it exists and shows in the list even if the key-details popup
+    /// that opens next, marked `new_contact: true`, is left without ever
+    /// adding a key.
     fn submit_add_contact(&mut self) -> Option<UiAction> {
         let (nickname, device_id) = {
             let add = self.contacts.as_ref()?.add_contact.as_ref()?;
@@ -570,17 +575,29 @@ impl UiState {
         };
         let error = if !crate::validation::nickname_is_registrable(&nickname) {
             Some(format!("not a valid nickname: {nickname:?}"))
-        } else if device_id.is_empty() || !crate::validation::is_storable(&device_id) {
+        } else if !device_id.is_empty() && !crate::validation::is_storable(&device_id) {
             Some(format!("not a valid device id: {device_id:?}"))
-        } else if self
-            .contacts
-            .as_ref()?
-            .rows
-            .iter()
-            .any(|r| r.nickname == nickname && r.device_id.as_deref() == Some(device_id.as_str()))
+        } else if !device_id.is_empty()
+            && self
+                .contacts
+                .as_ref()?
+                .rows
+                .iter()
+                .any(|r| r.nickname == nickname && r.device_id.as_deref() == Some(device_id.as_str()))
         {
             Some(format!(
                 "{nickname}'s device {device_id:?} is already pinned - open that row instead"
+            ))
+        } else if device_id.is_empty()
+            && self
+                .contacts
+                .as_ref()?
+                .rows
+                .iter()
+                .any(|r| r.nickname == nickname && r.device_id.is_none() && r.key_mode.is_none())
+        {
+            Some(format!(
+                "{nickname} already has an unbound entry - open that row instead"
             ))
         } else {
             None
@@ -594,8 +611,8 @@ impl UiState {
         if let Some(state) = self.contacts.as_mut() {
             state.add_contact = None;
             state.detail = Some(ContactKeyDetailState {
-                nickname,
-                device_id: Some(device_id),
+                nickname: nickname.clone(),
+                device_id: (!device_id.is_empty()).then(|| device_id.clone()),
                 kind: ContactKeyKind::Pqh,
                 confirm: None,
                 pqh_browser: None,
@@ -603,7 +620,7 @@ impl UiState {
                 new_contact: true,
             });
         }
-        None
+        Some(UiAction::AddBareContact { nickname, device_id })
     }
 
     fn handle_contacts_detail_key(&mut self, code: KeyCode) -> Option<UiAction> {
@@ -1121,10 +1138,10 @@ struct ContactsColumns {
 /// fixed placeholder for the unbound row (device-pinning plan §3: never
 /// editable from here, only ever learned from a live connection or a
 /// pad's own device claim).
-/// A real device_id (`~/.aloo/d_id`) is a 50-character random string - far
-/// too wide for a list column - so it's cropped here, not just measured
-/// short; a test device's short, human-chosen name (e.g. "laptop") passes
-/// through unchanged.
+/// A real device_id (`~/.aloo/d_id`) is an 8-character random string, so
+/// this crop is a defensive cap rather than something real ids normally
+/// hit; a test or hand-picked device label longer than that (e.g. some
+/// human-chosen name) is still cropped rather than widening the column.
 const DEVICE_LABEL_MAX_CHARS: usize = 10;
 
 fn device_label(device_id: &Option<String>) -> String {
@@ -1350,19 +1367,24 @@ pub(crate) fn render_contacts_popup(frame: &mut Frame, area: Rect, state: &UiSta
         + columns.encryption
         + COL_GAP * 4
         + display_width(KEY_BADGES_SAMPLE) as usize;
-    let width = (content_width as u16 + 4).clamp(60, area.width.saturating_sub(2));
-    // At least 7 lines even with a single (or no) contact - short enough to
-    // still shrink-wrap a long list, tall enough that the popup never reads
-    // as a cramped sliver.
-    let height = (contacts.rows.len().max(1) as u16 + 4)
-        .max(7)
+    let width = (content_width as u16 + 4)
+        .max(display_width(EXPORT_BUTTON_LABEL) as u16 + 6)
+        .clamp(60, area.width.saturating_sub(2));
+    // The hint text (no contacts yet) wraps onto 2 lines at this popup's
+    // minimum width; the column header is always exactly 1.
+    let header_height: u16 = if contacts.rows.is_empty() { 2 } else { 1 };
+    // The "Export identity card" button is always the list's last entry
+    // (`+1`), so this popup is never shorter than the header/hint plus
+    // that one entry.
+    let height = (contacts.rows.len() as u16 + 1 + header_height + 3)
+        .max(8)
         .min(area.height.saturating_sub(2));
     let popup = centered_rect(width, height, area);
     let block = Block::default()
         .title(Line::from(vec![
             Span::raw("Contacts "),
             Span::styled(
-                "(\u{2190}/\u{2192}: switch key  Enter: key details  a: add contact  o: install OTP key  d: delete  r: refresh  Esc: close)",
+                "(\u{2190}/\u{2192}: switch key  Enter: key details  a: add contact  d: delete  r: refresh  x/Enter on Export: export identity card  Esc: close)",
                 Style::default().fg(Color::Cyan),
             ),
         ]))
@@ -1371,31 +1393,33 @@ pub(crate) fn render_contacts_popup(frame: &mut Frame, area: Rect, state: &UiSta
     frame.render_widget(ratatui::widgets::Clear, popup);
     frame.render_widget(block, popup);
 
+    // The button is one past the last real row - always present, so
+    // `total` (and every index into it) is never 0.
+    let total = contacts.rows.len() + 1;
+    let selected = contacts.selected.min(total - 1);
+    let on_button = selected == contacts.rows.len();
+
+    let header_area = Rect { height: header_height.min(inner.height), ..inner };
     if contacts.rows.is_empty() {
         frame.render_widget(
             Paragraph::new(
-                "no contacts pinned yet - one appears the first time you connect to someone, \
-                 or press 'a' to add one manually",
+                "no contacts pinned yet - one appears the first time you connect to \
+                 someone, or press 'a' to add one manually",
             )
-            .style(Style::default().fg(Color::DarkGray)),
-            inner,
+            .style(Style::default().fg(Color::DarkGray))
+            .wrap(ratatui::widgets::Wrap { trim: true }),
+            header_area,
         );
-        return;
+    } else {
+        frame.render_widget(Paragraph::new(header_row(&columns)), header_area);
     }
-
-    let header_area = Rect {
-        height: 1.min(inner.height),
-        ..inner
-    };
-    frame.render_widget(Paragraph::new(header_row(&columns)), header_area);
     let list_area = Rect {
-        y: inner.y.saturating_add(1),
-        height: inner.height.saturating_sub(1),
+        y: inner.y.saturating_add(header_height),
+        height: inner.height.saturating_sub(header_height),
         ..inner
     };
 
-    let selected = contacts.selected.min(contacts.rows.len() - 1);
-    let items: Vec<ListItem> = contacts
+    let mut items: Vec<ListItem> = contacts
         .rows
         .iter()
         .enumerate()
@@ -1403,13 +1427,28 @@ pub(crate) fn render_contacts_popup(frame: &mut Frame, area: Rect, state: &UiSta
             ListItem::new(contact_row_line(row, &columns, contacts.selected_key, i == selected))
         })
         .collect();
+    items.push(ListItem::new(export_button_line(on_button)));
     // No `highlight_style` - the selected row's reverse-video is already
-    // patched onto its own spans above (stopping before the keys column),
-    // and `list_state` only drives auto-scroll-to-selection here.
+    // patched onto its own spans above (stopping before the keys column,
+    // and the button's own line is styled the same way), and `list_state`
+    // only drives auto-scroll-to-selection here.
     let list = List::new(items);
     let mut list_state = ListState::default();
     list_state.select(Some(selected));
     frame.render_stateful_widget(list, list_area, &mut list_state);
+}
+
+const EXPORT_BUTTON_LABEL: &str = "\u{25B6} Export identity card (own pqhybrid key)";
+
+/// The list's own last entry - `/contacts`' `x` shortcut, also reachable
+/// by moving the selection past the last real row and pressing Enter.
+fn export_button_line(selected: bool) -> Line<'static> {
+    let style = if selected {
+        Style::default().add_modifier(Modifier::REVERSED)
+    } else {
+        Style::default().fg(Color::Yellow)
+    };
+    Line::from(Span::styled(EXPORT_BUTTON_LABEL, style))
 }
 
 fn render_delete_confirm(frame: &mut Frame, area: Rect, contacts: &ContactsState) {
@@ -1561,6 +1600,39 @@ pub(crate) fn render_user_info_popup(frame: &mut Frame, area: Rect, state: &UiSt
     let popup = centered_rect(64, height, area);
     let block = Block::default()
         .title(format!("{} (Esc: close)", info.nickname))
+        .borders(Borders::ALL);
+    let inner = block.inner(popup);
+    frame.render_widget(ratatui::widgets::Clear, popup);
+    frame.render_widget(block, popup);
+    frame.render_widget(Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: true }), inner);
+}
+
+/// The superadmin `/users` popup: one line per registered user, naming
+/// every channel they currently administer (or "no channels" for one
+/// administering none) - `docs/SPEC.md` "Server superadmins".
+pub(crate) fn render_users_admin_popup(frame: &mut Frame, area: Rect, state: &UiState) {
+    let Some(users) = &state.users_admin else { return };
+    let mut lines: Vec<Line> = Vec::new();
+    if users.is_empty() {
+        lines.push(Line::from(Span::styled("no registered users", Style::default().fg(Color::DarkGray))));
+    }
+    for user in users {
+        let channels = if user.admin_of.is_empty() {
+            "no channels".to_string()
+        } else {
+            user.admin_of.iter().map(|c| format!("#{c}")).collect::<Vec<_>>().join(", ")
+        };
+        lines.push(Line::from(vec![
+            Span::styled(user.nickname.clone(), Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(": "),
+            Span::raw(channels),
+        ]));
+    }
+
+    let height = (lines.len() as u16 + 2).max(7).min(area.height.saturating_sub(2));
+    let popup = centered_rect(64, height, area);
+    let block = Block::default()
+        .title("Registered users (Esc: close)")
         .borders(Borders::ALL);
     let inner = block.inner(popup);
     frame.render_widget(ratatui::widgets::Clear, popup);
@@ -1732,8 +1804,9 @@ fn render_add_contact_popup(frame: &mut Frame, area: Rect, add: &AddContactState
 
     frame.render_widget(
         Paragraph::new(
-            "Pin a nickname and device before ever connecting to them, so you can \
-             attach a PQH, OTP or OTP mail key right away.",
+            "Pin a nickname before ever connecting to them. Device id and identity \
+             card are both optional - leave them blank and add PQH, OTP or OTP mail \
+             keys later; the contact is created either way.",
         )
         .wrap(ratatui::widgets::Wrap { trim: true })
         .style(Style::default().fg(Color::DarkGray)),
@@ -1744,7 +1817,11 @@ fn render_add_contact_popup(frame: &mut Frame, area: Rect, add: &AddContactState
         rows[1],
     );
     frame.render_widget(
-        Paragraph::new(key_field_line("device id", &add.device_id, add.focus == AddContactField::DeviceId)),
+        Paragraph::new(key_field_line(
+            "device id (optional)",
+            &add.device_id,
+            add.focus == AddContactField::DeviceId,
+        )),
         rows[2],
     );
     if let Some(err) = &add.error {

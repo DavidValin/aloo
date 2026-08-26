@@ -1,6 +1,6 @@
 [package]
 name = "aloo"
-version = "0.3.0-alpha.6"
+version = "0.3.0-alpha.7"
 edition = "2024"
 
 authors = ["David Valin <hola@davidvalin.com>"]
@@ -190,6 +190,10 @@ name = "connect_test"
 path = "test/connect_test.rs"
 
 [[test]]
+name = "connect_processing_screen_test"
+path = "test/connect_processing_screen_test.rs"
+
+[[test]]
 name = "idstore_test"
 path = "test/idstore_test.rs"
 
@@ -332,6 +336,10 @@ path = "test/contacts_add_test.rs"
 [[test]]
 name = "contacts_mail_refresh_test"
 path = "test/contacts_mail_refresh_test.rs"
+
+[[test]]
+name = "contacts_delete_immediate_test"
+path = "test/contacts_delete_immediate_test.rs"
 
 [[test]]
 name = "otp_pad_test"

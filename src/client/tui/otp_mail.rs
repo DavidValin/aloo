@@ -995,9 +995,10 @@ pub(crate) fn format_mb(bytes: u64) -> String {
     format!("{:.2} MB", bytes as f64 / (1024.0 * 1024.0))
 }
 
-/// Shortens a device id (50 hex characters, `client::device_id::generate`)
-/// to its first 12 for the device selector's compact row - same
-/// "still effectively unique for telling entries apart at a glance"
+/// Shortens a device id (8 hex characters, `client::device_id::load_or_create`)
+/// to its first 12 for the device selector's compact row - a no-op for a
+/// real one, but still cropped for a longer hand-picked test/device label,
+/// same "still effectively unique for telling entries apart at a glance"
 /// rationale `session::short_fingerprint` already uses for fingerprints.
 fn short_device_id(id: &str) -> String {
     match id.get(..12) {

@@ -444,32 +444,46 @@ const HELP_BODY: &[HelpLine] = &[
     HelpLine::Item {
         keys: "/contacts",
         text: "one row per pinned *device* of a nickname, not one per nickname - a \
-               multi-device contact gets one row each, its device id cropped to 10 \
-               characters for width (never in a details popup, which always shows it \
-               in full). Its three keys - PQH (the pinned identity itself), OTP (a live \
-               /otp session), OTP MAIL (a /mail-only key, entirely separate from the \
-               live one) - render as small buttons, \u{2705}/\u{274C} coloured, \
-               e.g. [\u{2705}PQH]. Up/Down picks the row, Left/Right the key within it - \
-               a genuine grid, so only one button in the whole list is ever highlighted, \
-               never the same key across every row at once. Enter opens that exact \
-               button's own details: what the key is for, its path and live figures if \
-               it exists, and a Create (PQH, from an identity card file) / Install \
-               manually (OTP or OTP MAIL, from files you generated yourself) / Delete \
-               action. 'o' still installs an OTP key directly, same as before; 'd' \
-               deletes the whole contact (every device, every key with it); 'r' \
-               refreshes; 'a' opens Add contact.",
+               multi-device contact gets one row each, its device id (8 characters, so \
+               this rarely crops in practice) cropped to 10 characters for width if \
+               longer (never in a details popup, which always shows it in full). Its \
+               three keys - PQH (the pinned identity itself), OTP (a live /otp session), \
+               OTP MAIL (a /mail-only key, entirely separate from the live one) - render \
+               as small buttons, \u{2705}/\u{274C} coloured, e.g. [\u{2705}PQH]. Up/Down \
+               picks the row, Left/Right the key within it - a genuine grid, so only one \
+               button in the whole list is ever highlighted, never the same key across \
+               every row at once. Enter opens that exact button's own details: what the \
+               key is for, its path and live figures if it exists, and a Create (PQH, \
+               from an identity card file) / Install manually (OTP or OTP MAIL, from \
+               files you generated yourself) / Delete action, taking effect immediately \
+               in the list. 'd' deletes the whole contact (every device, every key with \
+               it); 'r' refreshes; 'a' opens Add contact; 'x', or the Export identity card \
+               button that is always the list's own last entry, exports your own identity \
+               card.",
     },
     HelpLine::Item {
         keys: "a",
-        text: "(inside /contacts) Add contact: pin a nickname and device before ever \
-               connecting to them, so keys can be attached ahead of time. Validates both \
-               fields (non-empty, no tab/newline) and refuses a nickname+device that's \
-               already pinned. Confirming opens the same key-details popup Enter does, \
-               where PQH's Create key binds straight to the device just typed - unlike \
+        text: "(inside /contacts) Add contact: pin a nickname before ever connecting to \
+               them, so keys can be attached ahead of time. Device id and identity card \
+               are both optional - leave the device id blank for the nickname's shared \
+               unbound slot. Confirming pins the contact right away, even with no key at \
+               all yet (all three badges show \u{274C} until you add one), and opens the \
+               same key-details popup Enter does, where PQH's Create key binds straight \
+               to the device just typed (or the unbound slot, if left blank) - unlike \
                the ordinary case above - and, once it succeeds, stays open rather than \
-               closing so OTP/OTP MAIL can be added right after in the same sitting. \
-               Nothing is ever pinned from the form alone: Esc at any point, before a \
-               key is actually added, leaves nothing behind.",
+               closing so OTP/OTP MAIL can be added right after in the same sitting. Esc \
+               at any point just leaves the contact keyless for now - add a key from this \
+               same row whenever you're ready.",
+    },
+    HelpLine::Item {
+        keys: "x",
+        text: "(inside /contacts) export your own identity card (own pqhybrid key) - the \
+               live equivalent of 'aloo --export-identity-card', no arguments needed. The \
+               same action is also always the list's own last entry, an Export identity \
+               card button reachable by Up/Down and Enter even with no contacts pinned \
+               yet. Writes ~/.aloo/exports/<your-nickname>.aloo-card and shows its safety \
+               phrase; send the file to someone by any means and they have you pinned \
+               and verified before you've ever spoken.",
     },
     HelpLine::Item {
         keys: "/new-otp-mail-key",
@@ -504,6 +518,21 @@ const HELP_BODY: &[HelpLine] = &[
     HelpLine::Item {
         keys: "/remove-channel <name>",
         text: "delete any public channel by name, whether or not you administer it",
+    },
+    HelpLine::Item {
+        keys: "/users",
+        text: "open a popup listing every registered user and which channels each \
+               currently administers (\"no channels\" for one administering none). \
+               Read-only; Esc closes it.",
+    },
+    HelpLine::Blank,
+    HelpLine::Heading("Your password"),
+    HelpLine::Item {
+        keys: "/password <old> <new>",
+        text: "change your own password - no superadmin needed. The server re-checks \
+               <old> exactly like logging in would before accepting <new>; a wrong one \
+               is refused and nothing changes. Both are exactly one word each - a \
+               password containing a space isn't supported here.",
     },
     HelpLine::Blank,
     HelpLine::Note(
@@ -2098,6 +2127,40 @@ pub enum UiAction {
         device_id: String,
         path: std::path::PathBuf,
     },
+    /// The "Add contact" popup's own submit, before any key is ever
+    /// chosen: reserves `(nickname, device_id)` (`device_id` empty for the
+    /// nickname's shared unbound slot) as a bare placeholder with no key
+    /// at all - `client::contacts::handle_add_bare_contact` - so the
+    /// contact already exists and shows in the list even if the user
+    /// leaves the key-details popup that opens right after without ever
+    /// adding one; the identity card import that popup still offers is
+    /// optional, not a precondition for creating the contact.
+    AddBareContact {
+        nickname: String,
+        device_id: String,
+    },
+    /// `/contacts`' `x`: writes this client's own identity card - the
+    /// live-session equivalent of `aloo --export-identity-card`
+    /// (`client::contacts::handle_export_own_identity_card`), signed with
+    /// the same `pq_hybrid` keybundle already loaded for this session,
+    /// no separate prefix/nickname arguments needed. Purely local - never
+    /// reaches the server.
+    ExportOwnIdentityCard,
+    /// A superadmin's `/users` (`UiState::try_superadmin_command`): sends
+    /// `ClientMessage::RequestUsersList`, answered with
+    /// `ServerMessage::UsersList` (`session::handle_server_message` ->
+    /// `UiState::set_users_admin`).
+    RequestUsersList,
+    /// `/password <old> <new>` (`UiState::try_password_command`): sends
+    /// `ClientMessage::ChangePassword`. The result comes back as
+    /// `ServerMessage::ChangePasswordResult`, surfaced as a status notice
+    /// (`session::handle_server_message`) - there is no local validation
+    /// of `old` to skip a round trip, since only the server holds
+    /// anything to check it against.
+    ChangePassword {
+        old_password: String,
+        new_password: String,
+    },
     /// `/daemon`: stop drawing and hand this session back to the
     /// background, leaving every connection, link and key exactly as they
     /// are (docs/SPEC.md "Running in background mode").
@@ -2193,6 +2256,10 @@ impl UiAction {
             Self::AdminDeactivate { .. } => Some("deactivating an account"),
             Self::AdminRemoveAccount { .. } => Some("removing an account"),
             Self::AdminRemoveChannel { .. } => Some("removing a channel"),
+            Self::RequestUsersList => Some("listing registered users"),
+            // A password is server-registry state (`server::users_registry`)
+            // - there is no account, and so nothing to change, without one.
+            Self::ChangePassword { .. } => Some("changing your password"),
             // Everything else is peer-to-peer. Leaving is deliberately not
             // here: with no server a channel is a local declaration, so
             // leaving one is a local act that needs nobody's permission.
@@ -2666,6 +2733,14 @@ pub struct UiState {
     /// `client::contacts::handle_request_user_info` has gathered it
     /// (`set_user_info`), same split `ContactsState::rows` uses.
     pub user_info: Option<super::contacts::UserInfoState>,
+    /// The superadmin `/users` popup - every registered user and the
+    /// channels each administers. Opened empty (`open_users_admin`),
+    /// filled in once `ServerMessage::UsersList` answers
+    /// (`set_users_admin`), same split `ContactsState::rows` uses. `None`
+    /// for anyone who never ran `/users` - there is nothing to gate on
+    /// client-side beyond that, since the server refuses the request
+    /// itself for a non-superadmin (`server::mod::require_superadmin`).
+    pub users_admin: Option<Vec<crate::proto::UserAdminInfo>>,
     /// System-wide CPU usage percentage, refreshed roughly every
     /// `sysstats::CPU_HEALTHY_MAX_PCT`-adjacent cadence by
     /// `session::run_connected_session` (`sysstats::CpuMonitor`) and shown
@@ -2818,6 +2893,7 @@ impl UiState {
             next_msg_id: 0,
             message_info: None,
             user_info: None,
+            users_admin: None,
             cpu_usage_pct: 0.0,
             conn_quality: crate::client::netstats::ConnQuality::Unknown,
             direct_punch_status: None,
@@ -5170,6 +5246,16 @@ impl UiState {
             return None;
         }
 
+        // The superadmin `/users` popup - same tier, but Esc-only, since
+        // there is no single letter shortcut that opened it the way `i`
+        // did above.
+        if self.users_admin.is_some() {
+            if kind == KeyEventKind::Press && code == KeyCode::Esc {
+                self.users_admin = None;
+            }
+            return None;
+        }
+
         // Ctrl+H toggles the help overlay from any view/mode/focus, taking
         // priority over everything below. Gated on `Press`: on a Kitty
         // terminal the matching `Release` also reaches here, and toggling
@@ -6167,6 +6253,9 @@ impl UiState {
         if let Some(action) = self.try_superadmin_command() {
             return action;
         }
+        if let Some(action) = self.try_password_command() {
+            return action;
+        }
         // Anything else starting with `/` is an attempted command, not a
         // message - even one this build doesn't recognize, or a typo of a
         // real one. It must never leak into a channel or DM as literal
@@ -6279,6 +6368,7 @@ impl UiState {
             || self.message_info.is_some()
             || self.file_preview.is_some()
             || self.user_info.is_some()
+            || self.users_admin.is_some()
             || self.help_open
             || self.otp_mail.is_some()
             || self.mode != Mode::Normal
@@ -6550,6 +6640,16 @@ impl UiState {
                 self.input.clear();
                 Some(Some(UiAction::AdminRemoveChannel { name: rest }))
             }
+            "/users" => {
+                if !rest.is_empty() {
+                    self.input.clear();
+                    self.push_status_notice("/users takes no arguments".to_string(), false);
+                    return Some(None);
+                }
+                self.input.clear();
+                self.open_users_admin();
+                Some(Some(UiAction::RequestUsersList))
+            }
             "/deactivate" => {
                 // The reason may contain spaces - only the nickname
                 // itself is a single word.
@@ -6567,6 +6667,38 @@ impl UiState {
             }
             _ => None,
         }
+    }
+
+    /// `/password <old> <new>`: unlike `try_superadmin_command`, available
+    /// to every user, gated on nothing client-side - the server is what
+    /// actually re-checks `old` (`ClientMessage::ChangePassword`,
+    /// `server::mod::client_loop`), so a wrong one is refused there, not
+    /// silently swallowed here. Both fields are exactly one word each,
+    /// the same limitation `/deactivate`'s nickname (not its reason) and
+    /// every other space-delimited argument in this app already has - a
+    /// password containing a space has no way to disambiguate where it
+    /// ends and the other one begins.
+    fn try_password_command(&mut self) -> Option<Option<UiAction>> {
+        let (verb, rest) = {
+            let input = self.input.trim();
+            match input.split_once(char::is_whitespace) {
+                Some((verb, rest)) => (verb.to_string(), rest.trim().to_string()),
+                None => (input.to_string(), String::new()),
+            }
+        };
+        if verb != "/password" {
+            return None;
+        }
+        let parts: Vec<&str> = rest.split_whitespace().collect();
+        if parts.len() != 2 {
+            self.input.clear();
+            self.push_status_notice("/password <old> <new>".to_string(), false);
+            return Some(None);
+        }
+        let old_password = parts[0].to_string();
+        let new_password = parts[1].to_string();
+        self.input.clear();
+        Some(Some(UiAction::ChangePassword { old_password, new_password }))
     }
 
     /// The last index (`channel.members.len()`) is always our own row
@@ -7304,6 +7436,10 @@ pub fn render(frame: &mut Frame, state: &UiState) {
     // Same tier as message-info above - `i`/`/info`'s read-only snapshot.
     if state.user_info.is_some() {
         super::contacts::render_user_info_popup(frame, area, state);
+    }
+    // Same tier as user-info above - the superadmin `/users` popup.
+    if state.users_admin.is_some() {
+        super::contacts::render_users_admin_popup(frame, area, state);
     }
     // Drawn last, and independent of `mode`/the private-vs-channel view
     // above, so it overlays whatever's currently showing rather than

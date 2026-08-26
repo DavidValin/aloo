@@ -825,3 +825,137 @@ fn pinned_from_survives_a_save_and_load_round_trip() {
     assert_eq!(store.pinned_from("alice"), Some(std::path::Path::new("/tmp/alice.card")));
     std::fs::remove_file(&path).ok();
 }
+
+// ---------------------------------------------------------------------
+// Bare contacts (Add Contact with no identity card - device-pinning
+// plan §3's "the identity card is optional")
+// ---------------------------------------------------------------------
+
+/// A bound placeholder shows up as a device of its nickname (so it's a
+/// real row in the Contacts list) but is invisible to `get_for_device` -
+/// it has no key, so there is nothing to "get".
+/// @requirement AC-366
+#[test]
+fn pin_bare_contact_reserves_a_bound_device_with_no_key() {
+    let path = temp_store_path();
+    let mut store = IdStore::load(&path).unwrap();
+    assert!(store.pin_bare_contact("alice", "laptop"));
+    assert_eq!(store.get_for_device("alice", "laptop"), None);
+    assert_eq!(store.devices_of("alice").count(), 1, "the placeholder is still a real row");
+    std::fs::remove_file(&path).ok();
+}
+
+/// A blank device_id reserves the nickname's shared unbound slot instead.
+/// @requirement AC-366
+#[test]
+fn pin_bare_contact_with_no_device_id_reserves_the_unbound_slot() {
+    let path = temp_store_path();
+    let mut store = IdStore::load(&path).unwrap();
+    assert!(store.pin_bare_contact("alice", ""));
+    assert_eq!(store.get_for_device("alice", ""), None);
+    assert_eq!(store.devices_of("alice").count(), 1);
+    std::fs::remove_file(&path).ok();
+}
+
+/// Reserving the same bound device_id twice must not produce two rows.
+/// @requirement AC-366
+#[test]
+fn pin_bare_contact_refuses_a_device_already_pinned_bare_or_real() {
+    let path = temp_store_path();
+    let mut store = IdStore::load(&path).unwrap();
+    assert!(store.pin_bare_contact("alice", "laptop"));
+    assert!(!store.pin_bare_contact("alice", "laptop"), "already reserved - not a second placeholder");
+    store.pin_new_device("bob", "phone", b"key-b", Trust::Tofu);
+    assert!(!store.pin_bare_contact("bob", "phone"), "a real pin refuses a bare placeholder over it too");
+    std::fs::remove_file(&path).ok();
+}
+
+/// A nickname that already has an unbound `Direct`-framed pin (key_mode
+/// `None`, a real key) must refuse a bare unbound placeholder too - the
+/// two would share the same slot and be indistinguishable.
+/// @requirement AC-366
+#[test]
+fn pin_bare_contact_with_no_device_id_refuses_when_an_unbound_direct_pin_already_exists() {
+    let path = temp_store_path();
+    let mut store = IdStore::load(&path).unwrap();
+    store.pin_new_device("alice", "", b"direct-key", Trust::Tofu);
+    assert!(!store.pin_bare_contact("alice", ""));
+    assert_eq!(store.devices_of("alice").count(), 1, "no second unbound entry was pushed");
+    std::fs::remove_file(&path).ok();
+}
+
+/// The core invariant a bare placeholder exists to uphold: pinning a real
+/// key at the exact same `(nickname, device_id)` later - whether via a
+/// live TOFU sighting or an explicit card import, both go through
+/// `pin_new_device_with_key_mode` - fills the placeholder in place rather
+/// than leaving it behind as a second, ghost row.
+/// @requirement AC-366
+#[test]
+fn pinning_a_real_key_over_a_bound_placeholder_fills_it_in_place_not_a_duplicate() {
+    let path = temp_store_path();
+    let mut store = IdStore::load(&path).unwrap();
+    store.pin_bare_contact("alice", "laptop");
+    store.pin_new_device_with_key_mode(
+        "alice",
+        "laptop",
+        b"real-key",
+        Trust::Tofu,
+        Some(KeyMode::PqHybrid),
+    );
+    assert_eq!(store.devices_of("alice").count(), 1, "the placeholder must be filled, not duplicated");
+    assert_eq!(store.get_for_device("alice", "laptop"), Some(b"real-key".as_slice()));
+    std::fs::remove_file(&path).ok();
+}
+
+/// Same invariant for the unbound slot: importing a card (or any other
+/// unbound pin) over a bare unbound placeholder must resolve it in place.
+/// @requirement AC-366
+#[test]
+fn pinning_a_real_key_over_an_unbound_placeholder_fills_it_in_place_not_a_duplicate() {
+    let path = temp_store_path();
+    let mut store = IdStore::load(&path).unwrap();
+    store.pin_bare_contact("alice", "");
+    store.pin_new_device_with_key_mode("alice", "", b"card-key", Trust::Verified, Some(KeyMode::PqHybrid));
+    assert_eq!(store.devices_of("alice").count(), 1);
+    assert_eq!(store.get_for_device("alice", ""), Some(b"card-key".as_slice()));
+    std::fs::remove_file(&path).ok();
+}
+
+/// A nickname whose only entry is a bare placeholder must read as "no
+/// candidates yet" (`New`), not `Mismatch` - a placeholder is not a real
+/// key to compare a live connection's announced key against.
+/// @requirement AC-366
+#[test]
+fn check_key_treats_a_nickname_with_only_a_bare_placeholder_as_new() {
+    let path = temp_store_path();
+    let mut store = IdStore::load(&path).unwrap();
+    store.pin_bare_contact("alice", "laptop");
+    assert_eq!(store.check_key("alice", b"anything"), aloo::client::idstore::KeyCheck::New);
+    std::fs::remove_file(&path).ok();
+}
+
+/// `get`/`most_recent_device_id` must skip a bare placeholder too - it
+/// has no key, so it can never be "the" key for a nickname.
+/// @requirement AC-366
+#[test]
+fn get_skips_a_bare_placeholder_and_falls_back_to_a_real_device() {
+    let path = temp_store_path();
+    let mut store = IdStore::load(&path).unwrap();
+    store.pin_bare_contact("alice", "phone");
+    store.pin_new_device("alice", "laptop", b"real-key", Trust::Tofu);
+    assert_eq!(store.get("alice"), Some(b"real-key".as_slice()));
+    assert_eq!(store.most_recent_device_id("alice"), Some("laptop"));
+    std::fs::remove_file(&path).ok();
+}
+
+/// If every device of a nickname is a bare placeholder, `get` must report
+/// nothing rather than an empty slice.
+/// @requirement AC-366
+#[test]
+fn get_returns_none_when_every_device_is_a_bare_placeholder() {
+    let path = temp_store_path();
+    let mut store = IdStore::load(&path).unwrap();
+    store.pin_bare_contact("alice", "phone");
+    assert_eq!(store.get("alice"), None);
+    std::fs::remove_file(&path).ok();
+}

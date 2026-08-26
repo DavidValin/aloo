@@ -107,6 +107,43 @@ impl std::fmt::Display for ActivationRequiredError {
 
 impl std::error::Error for ActivationRequiredError {}
 
+/// Runs `fut` to completion while keeping the screen alive: the connect
+/// popup and its title banner are hidden, the background animation keeps
+/// moving, and a centered yellow `label` (`ui_connect_popup::
+/// render_processing`) takes their place for however long the network
+/// round-trip (`register_account`/`connect_with_reconnect`, each up to
+/// `CONNECT_TIMEOUT`) actually takes. Restored the moment `fut` resolves,
+/// success or failure alike: the caller's own error handling puts the
+/// popup back with the reason shown - this only ever changes what's on
+/// screen *while waiting*, never the outcome.
+///
+/// This only keeps the screen alive across genuine `.await` suspension
+/// points inside `fut` - it cannot preempt a synchronous, CPU-bound
+/// stretch with no `.await` in it (a `tokio::select!` only ever gets a
+/// chance to poll its other branch, this loop's redraw+sleep, when the
+/// executor regains control, which a long synchronous call never yields).
+/// Every call site's own `fut` must already break up any such work with
+/// `tokio::task::spawn_blocking` (see `connect_and_handshake`'s own
+/// keypair resolution) for the animation to actually keep moving through
+/// it, not just through real I/O waits.
+pub async fn run_with_processing_screen<T>(
+    surface: &mut crate::client::tui::surface::Surface,
+    fut: impl std::future::Future<Output = T>,
+    label: &str,
+) -> T {
+    let mut animation_frame: u64 = 0;
+    tokio::pin!(fut);
+    loop {
+        let _ = surface.draw(|f| ui_connect_popup::render_processing(f, animation_frame, label));
+        tokio::select! {
+            result = &mut fut => return result,
+            _ = tokio::time::sleep(ui_connect_popup::ANIMATION_TICK) => {
+                animation_frame = animation_frame.wrapping_add(1);
+            }
+        }
+    }
+}
+
 pub async fn run_client_inner(
     surface: &mut crate::client::tui::surface::Surface,
     port: u16,
@@ -188,7 +225,9 @@ pub async fn run_client_inner(
             ui_connect_popup::Submission::Connect(request) => request,
             ui_connect_popup::Submission::Register(mut register) => {
                 register.ssl_ca = ssl_ca.clone();
-                match register_account(&register).await {
+                match run_with_processing_screen(surface, register_account(&register), "one moment...")
+                    .await
+                {
                     Ok(()) => match popup.build_request() {
                         // Registering and connecting share every field but
                         // the keybundle, and Register wouldn't have been
@@ -254,7 +293,9 @@ pub async fn run_client_inner(
             ui_connect_popup::ActivationPopupState::new(&request.nickname)
         };
         let outcome = loop {
-            match connect_with_reconnect(&request).await {
+            match run_with_processing_screen(surface, connect_with_reconnect(&request), "connecting...")
+                .await
+            {
                 Err(e) if e.is::<ActivationRequiredError>() => {
                     activation.error = request.activation_code.as_ref().map(|_| e.to_string());
                     let Some(code) = ui_connect_popup::run_activation(surface, &mut activation)?
@@ -537,7 +578,21 @@ pub(crate) async fn connect_and_handshake(
     ),
     BoxError,
 > {
-    let identity = resolve_my_keypair(&request.my_key)?;
+    // `resolve_my_keypair` is not `.await`-friendly on its own: loading an
+    // existing keybundle is fast, but a missing one is auto-generated on
+    // the spot (`crypto::pq::ensure_bundle_at`) - real ML-DSA-87/ML-KEM-
+    // 1024/RSA-4096 keygen, seconds of pure CPU work with no yield point
+    // in it. Called directly, that would freeze `run_with_processing_
+    // screen`'s own redraw+animation loop for the whole duration - a
+    // `tokio::select!` only ever gets to poll its other branch when the
+    // executor regains control, which a synchronous stretch this long
+    // never gives it. `spawn_blocking` moves it off this task entirely so
+    // the animation keeps moving while it runs.
+    let my_key = request.my_key.clone();
+    let identity = match tokio::task::spawn_blocking(move || resolve_my_keypair(&my_key)).await {
+        Ok(result) => result?,
+        Err(e) => return Err(format!("resolving this client's keypair panicked: {e}").into()),
+    };
     let public_key_der = identity.public_der.clone();
     let (rd, wr, you, server_addr) = handshake_as(request, public_key_der).await?;
     Ok((rd, wr, you, identity, server_addr))

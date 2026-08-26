@@ -6,7 +6,7 @@ use aloo::client::export::{self, Surface};
 use aloo::client::netstats::ConnQuality;
 use aloo::client::p2p::LinkStatus;
 use aloo::p2p_proto::ReceiptStage;
-use aloo::proto::{ChannelInfo, ChannelKind, UserId};
+use aloo::proto::{ChannelInfo, ChannelKind, UserAdminInfo, UserId};
 use aloo::client::reconnect::ServerLinkState;
 use aloo::client::tui::channel::{HEADER_ROW_HEIGHT, messages_start_col};
 use aloo::client::tui::ui::{
@@ -1364,6 +1364,21 @@ fn render_channel_view_does_not_panic() {
     terminal.draw(|f| render(f, &state)).unwrap();
     let buffer = terminal.backend().buffer().clone();
     assert!(buffer.content().iter().any(|c| c.symbol() != " "));
+}
+
+/// @requirement AC-369
+#[test]
+fn render_users_admin_popup_does_not_panic_empty_or_filled() {
+    let mut state = joined_general_with(vec![]);
+    state.open_users_admin();
+    let _ = rendered_rows(&state);
+
+    state.set_users_admin(vec![
+        UserAdminInfo { nickname: "alice".to_string(), admin_of: vec![] },
+        UserAdminInfo { nickname: "bob".to_string(), admin_of: vec!["bobs-room".to_string()] },
+    ]);
+    let rows = rendered_rows(&state);
+    assert!(rows.iter().any(|r| r.contains("bob") && r.contains("bobs-room")));
 }
 
 /// @requirement AC-058
@@ -3603,6 +3618,90 @@ fn slash_remove_account_and_remove_channel_send_their_admin_actions() {
     );
 }
 
+/// @requirement AC-368
+#[test]
+fn slash_password_sends_change_password() {
+    let mut state = joined_general_with(vec![]);
+    type_str(&mut state, "/password oldpw newpw");
+    let action = press(&mut state, KeyCode::Enter);
+    assert_eq!(
+        action,
+        Some(UiAction::ChangePassword {
+            old_password: "oldpw".to_string(),
+            new_password: "newpw".to_string(),
+        })
+    );
+}
+
+/// @requirement AC-368
+#[test]
+fn slash_password_with_wrong_arg_count_is_refused_locally() {
+    let mut state = joined_general_with(vec![]);
+    type_str(&mut state, "/password oldpw");
+    assert_eq!(press(&mut state, KeyCode::Enter), None);
+    assert!(state.status_notice.is_some());
+
+    type_str(&mut state, "/password a b c");
+    assert_eq!(press(&mut state, KeyCode::Enter), None);
+    assert!(state.status_notice.is_some());
+}
+
+/// @requirement AC-369
+#[test]
+fn slash_users_opens_the_popup_and_sends_requestuserslist() {
+    let mut state = joined_general_with(vec![]);
+    type_str(&mut state, "/users");
+    let action = press(&mut state, KeyCode::Enter);
+    assert_eq!(action, Some(UiAction::RequestUsersList));
+    assert!(state.users_admin.is_some(), "the popup must open right away, before the answer arrives");
+}
+
+/// @requirement AC-369
+#[test]
+fn slash_users_takes_no_arguments() {
+    let mut state = joined_general_with(vec![]);
+    type_str(&mut state, "/users eve");
+    let action = press(&mut state, KeyCode::Enter);
+    assert_eq!(action, None);
+    assert!(state.users_admin.is_none(), "a refused submission must not open anything");
+    assert!(state.status_notice.is_some());
+}
+
+/// @requirement AC-369
+#[test]
+fn set_users_admin_fills_the_open_popup() {
+    let mut state = joined_general_with(vec![]);
+    state.open_users_admin();
+    state.set_users_admin(vec![
+        UserAdminInfo { nickname: "alice".to_string(), admin_of: vec![] },
+        UserAdminInfo { nickname: "bob".to_string(), admin_of: vec!["bobs-room".to_string()] },
+    ]);
+    let users = state.users_admin.as_ref().unwrap();
+    assert_eq!(users.len(), 2);
+    assert_eq!(users[1].admin_of, vec!["bobs-room".to_string()]);
+}
+
+/// A no-op if the popup was closed before the session's answer arrived -
+/// same convention `set_contacts_rows`/`set_user_info` already follow.
+/// @requirement AC-369
+#[test]
+fn set_users_admin_is_a_no_op_once_the_popup_is_closed() {
+    let mut state = joined_general_with(vec![]);
+    state.set_users_admin(vec![UserAdminInfo { nickname: "alice".to_string(), admin_of: vec![] }]);
+    assert!(state.users_admin.is_none());
+}
+
+/// Esc closes the popup and absorbs the keystroke - same tier as the
+/// user-info popup.
+/// @requirement AC-369
+#[test]
+fn esc_closes_the_users_admin_popup() {
+    let mut state = joined_general_with(vec![]);
+    state.open_users_admin();
+    press(&mut state, KeyCode::Esc);
+    assert!(state.users_admin.is_none());
+}
+
 /// @requirement TB-261
 #[test]
 fn every_new_admin_action_needs_a_server() {
@@ -3633,6 +3732,12 @@ fn every_new_admin_action_needs_a_server() {
             .needs_server()
             .is_some()
     );
+    assert!(
+        UiAction::ChangePassword { old_password: "a".into(), new_password: "b".into() }
+            .needs_server()
+            .is_some()
+    );
+    assert!(UiAction::RequestUsersList.needs_server().is_some());
     assert!(UiAction::AdminRemoveAccount { nickname: "x".into() }.needs_server().is_some());
     assert!(UiAction::AdminRemoveChannel { name: "x".into() }.needs_server().is_some());
 }

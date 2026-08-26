@@ -119,6 +119,88 @@ async fn adding_a_pqh_key_from_a_new_contact_leaves_the_popup_open_with_the_new_
     assert!(ui.status_notice.is_some(), "a success notice, same convention as the ordinary flow");
 }
 
+/// The identity card is optional: submitting Add Contact with no card
+/// imported still creates the contact, visible in the list with all
+/// three key badges showing "no key" - the whole point of
+/// `esc_on_the_add_contact_popup_cancels_without_creating_anything`
+/// (`ui_contacts_test.rs`) being scoped to the pure-UI layer only.
+/// @requirement AC-366
+#[tokio::test]
+async fn esc_after_submitting_with_no_card_still_leaves_a_bare_contact_pinned() {
+    let mut session = session_for_test("bare-bound").await;
+    let mut ui = UiState::new("me".into());
+    ui.open_contacts();
+
+    contacts::handle_add_bare_contact(&mut session, &mut ui, "alice".to_string(), "laptop".to_string())
+        .await;
+
+    let row = ui
+        .contacts
+        .as_ref()
+        .unwrap()
+        .rows
+        .iter()
+        .find(|r| r.nickname == "alice" && r.device_id.as_deref() == Some("laptop"))
+        .expect("the bare contact must already be a real row");
+    assert_eq!(row.key_mode, None);
+    assert!(row.otp.is_none());
+    assert!(row.otp_mail.is_none());
+    assert!(row.pqh_fingerprint.is_none());
+}
+
+/// A blank device_id claims the nickname's shared unbound slot instead of
+/// one specific device - same "no keys yet" outcome.
+/// @requirement AC-366
+#[tokio::test]
+async fn a_blank_device_id_creates_an_unbound_bare_contact() {
+    let mut session = session_for_test("bare-unbound").await;
+    let mut ui = UiState::new("me".into());
+    ui.open_contacts();
+
+    contacts::handle_add_bare_contact(&mut session, &mut ui, "alice".to_string(), String::new()).await;
+
+    let row = ui
+        .contacts
+        .as_ref()
+        .unwrap()
+        .rows
+        .iter()
+        .find(|r| r.nickname == "alice")
+        .expect("the bare contact must already be a real row");
+    assert_eq!(row.device_id, None, "a blank device_id pins the unbound slot");
+    assert_eq!(row.key_mode, None);
+}
+
+/// The invariant `pin_bare_contact`/`pin_new_device_with_key_mode` exist
+/// to uphold, proven end to end: importing a card for the exact device a
+/// bare placeholder already reserved must fill it in place, not leave the
+/// placeholder behind as a second, ghost "(unbound)"-style row.
+/// @requirement AC-366
+#[tokio::test]
+async fn importing_a_card_over_a_bare_placeholder_does_not_leave_a_duplicate_row() {
+    let dir = scratch("card-over-bare");
+    let path = write_identity_card(&dir, "alice");
+    let mut session = session_for_test("bare-then-card").await;
+    let mut ui = UiState::new("me".into());
+    ui.open_contacts();
+
+    contacts::handle_add_bare_contact(&mut session, &mut ui, "alice".to_string(), "laptop".to_string())
+        .await;
+    contacts::handle_pin_identity_card_for_device(
+        &mut session,
+        &mut ui,
+        "alice".to_string(),
+        "laptop".to_string(),
+        path,
+    )
+    .await;
+
+    let rows: Vec<_> =
+        ui.contacts.as_ref().unwrap().rows.iter().filter(|r| r.nickname == "alice").collect();
+    assert_eq!(rows.len(), 1, "the placeholder must be filled in place, not duplicated");
+    assert_eq!(rows[0].key_mode, Some(KeyMode::PqHybrid));
+}
+
 /// A nickname mismatch (the card vouches for someone else) must show
 /// inline, exactly like the ordinary per-row flow's own error path - and
 /// nothing must be pinned.

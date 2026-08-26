@@ -8,8 +8,9 @@ use std::path::PathBuf;
 use aloo::client::connect::MyKeySelection;
 use aloo::client::connect::{
     ConnectCache, cache_path, fresh_pq_hybrid_paths_in, prefill_connect_defaults,
-    random_prefix, resolve_my_keypair,
+    random_prefix, resolve_my_keypair, run_with_processing_screen,
 };
+use aloo::client::tui::surface::Surface;
 use aloo::client::tui::ui_connect_popup::ConnectPopupState;
 use aloo::settings::Settings;
 
@@ -429,4 +430,105 @@ fn an_empty_settings_file_leaves_the_proposed_nickname_alone() {
     prefill_connect_defaults(&mut popup, &Settings::default(), &cache, &dir);
 
     assert_eq!(popup.nickname, "whoami");
+}
+
+// ---------------------------------------------------------------------
+// run_with_processing_screen: keeps the screen animating (instead of
+// frozen on the popup's last frame) while a Connect/Register attempt is
+// actually in flight. Generic over any future - no live socket needed to
+// exercise the screen-driving/return-value behavior itself, so this
+// stays within this file's "no live socket" scope even though it lives
+// in `connect.rs` alongside the socket-touching code that calls it.
+// ---------------------------------------------------------------------
+
+/// The wrapper must hand back exactly what the wrapped future resolved
+/// to - it only changes what's on screen while waiting, never the
+/// outcome.
+/// @requirement AC-371
+#[tokio::test]
+async fn run_with_processing_screen_returns_the_futures_own_output() {
+    let mut surface = Surface::Detached;
+    let result = run_with_processing_screen(&mut surface, async { 42 }, "connecting...").await;
+    assert_eq!(result, 42);
+}
+
+/// Proves it actually waits for the future rather than racing ahead of
+/// it: a future that takes noticeably longer than one animation tick
+/// must still make the wrapper take at least that long.
+/// @requirement AC-371
+#[tokio::test]
+async fn run_with_processing_screen_waits_for_a_slow_future() {
+    let mut surface = Surface::Detached;
+    let started = std::time::Instant::now();
+    run_with_processing_screen(
+        &mut surface,
+        tokio::time::sleep(std::time::Duration::from_millis(250)),
+        "connecting...",
+    )
+    .await;
+    assert!(
+        started.elapsed() >= std::time::Duration::from_millis(250),
+        "must not return before the wrapped future actually resolves"
+    );
+}
+
+/// A `Detached` surface (a daemon with nobody watching, `Surface`'s own
+/// doc) makes every `draw` a no-op - the wrapper must not care, and must
+/// neither panic nor hang.
+/// @requirement AC-371
+#[tokio::test]
+async fn run_with_processing_screen_tolerates_a_detached_surface() {
+    let mut surface = Surface::Detached;
+    let result = run_with_processing_screen(&mut surface, async { "done" }, "one moment...").await;
+    assert_eq!(result, "done");
+}
+
+/// `run_with_processing_screen` only ever gets a chance to poll its own
+/// redraw+sleep branch at a genuine `.await` suspension point inside the
+/// wrapped future - it cannot preempt a long *synchronous* stretch with
+/// no such point in it (the shape `resolve_my_keypair`'s auto-keygen has,
+/// `connect_and_handshake`'s own doc). Proven by racing an independent
+/// `tokio::spawn`'d ticker against two shapes of the same 200ms of
+/// synchronous work: left in-task, it starves the ticker (and would
+/// starve the animation exactly the same way); moved off-task via
+/// `spawn_blocking` - `connect_and_handshake`'s own handling of
+/// `resolve_my_keypair` - the ticker keeps advancing throughout.
+/// @requirement AC-373
+#[tokio::test]
+async fn a_long_synchronous_stretch_must_be_moved_off_task_or_it_still_freezes() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    async fn ticks_during<T>(fut: impl std::future::Future<Output = T>) -> u32 {
+        let counter = Arc::new(AtomicU32::new(0));
+        let c = counter.clone();
+        let ticker = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                c.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        let mut surface = Surface::Detached;
+        run_with_processing_screen(&mut surface, fut, "connecting...").await;
+        ticker.abort();
+        counter.load(Ordering::Relaxed)
+    }
+
+    let unmoved = ticks_during(async {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    })
+    .await;
+
+    let moved = ticks_during(async {
+        tokio::task::spawn_blocking(|| std::thread::sleep(std::time::Duration::from_millis(200)))
+            .await
+            .unwrap();
+    })
+    .await;
+
+    assert!(
+        moved > unmoved,
+        "moving synchronous work off-task via spawn_blocking must let other tokio tasks \
+         keep making progress while it runs; unmoved={unmoved} moved={moved}"
+    );
 }

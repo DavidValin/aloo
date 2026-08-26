@@ -147,6 +147,66 @@ fn a_second_registration_while_pending_is_refused_but_an_expired_one_is_replaced
     let _ = fresh;
 }
 
+/// The login-time counterpart to `a_second_registration_while_pending_is_refused_but_an_expired_one_is_replaced`
+/// above: a login attempt against an expired pending activation gets the
+/// exact same fresh-code treatment `register` already gives a second
+/// registration, without needing a whole new `Register` round trip -
+/// `key`/`email.txt` are untouched since a login attempt carries neither.
+/// @requirement AC-367
+#[test]
+fn reissue_activation_replaces_an_expired_pending_code_leaving_credentials_untouched() {
+    let registry = temp_registry("reissue");
+    let first = registry.register("alice", "hunter2", "alice@example.com", 1_000).unwrap();
+
+    let expired_at = 1_000 + ACTIVATION_VALIDITY_SECS + 1;
+    let reissued = registry
+        .reissue_activation("alice", expired_at)
+        .unwrap()
+        .expect("an expired pending activation must be reissued");
+    assert_ne!(reissued.code, first.code, "a fresh code, not the stale one reused");
+    assert_eq!(reissued.created_at_utc, expired_at);
+    assert_eq!(
+        registry.email_of("alice").as_deref(),
+        Some("alice@example.com"),
+        "a login attempt carries no new email to replace it with"
+    );
+    assert!(matches!(
+        registry.check_credentials("alice", "hunter2", expired_at),
+        AuthCheck::ActivationPending { expired: false }
+    ), "the reissued code must not itself read as already expired");
+    assert_eq!(
+        registry.activate("alice", &reissued.code, expired_at),
+        ActivationOutcome::Activated,
+        "the reissued code, not the original stale one, must be what activates the account"
+    );
+}
+
+/// `reissue_activation` must never fabricate a fresh code out of thin
+/// air: a not-yet-expired pending activation, or no pending activation at
+/// all, must be left completely untouched.
+/// @requirement AC-367
+#[test]
+fn reissue_activation_is_a_no_op_unless_the_pending_code_has_actually_expired() {
+    let registry = temp_registry("reissue-noop");
+    assert_eq!(
+        registry.reissue_activation("nobody", 0).unwrap(),
+        None,
+        "no pending activation at all"
+    );
+
+    let first = registry.register("alice", "hunter2", "alice@example.com", 1_000).unwrap();
+    assert_eq!(
+        registry.reissue_activation("alice", 1_001).unwrap(),
+        None,
+        "not expired yet"
+    );
+    assert_eq!(
+        registry.pending_activation("alice").unwrap().code,
+        first.code,
+        "the original, still-valid code must be left in place"
+    );
+}
+
 /// @requirement AC-265
 #[test]
 fn activate_accepts_the_right_code_once_and_refuses_a_wrong_or_expired_one() {

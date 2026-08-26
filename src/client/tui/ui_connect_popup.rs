@@ -509,8 +509,10 @@ fn place_text_cursor(frame: &mut Frame, inner: Rect, offset: u16, value: &str) {
 /// How long `run` waits for a real event before giving up and advancing
 /// the background animation by one frame instead - short enough that
 /// `DigitalRain` reads as continuous motion, long enough not to burn CPU
-/// redrawing an idle screen needlessly.
-const ANIMATION_TICK: std::time::Duration = std::time::Duration::from_millis(80);
+/// redrawing an idle screen needlessly. Slightly longer than a snappier
+/// tick would use, since a slower-paced fall (combined with
+/// `DigitalRain`'s own reduced per-tick row speed) reads calmer.
+pub(crate) const ANIMATION_TICK: std::time::Duration = std::time::Duration::from_millis(110);
 
 /// Drives the popup to completion: render, wait for the next key event or
 /// `ANIMATION_TICK` (whichever comes first - a timeout just advances
@@ -748,6 +750,52 @@ pub fn render(frame: &mut Frame, state: &ConnectPopupState) {
     );
 }
 
+/// `render_processing`'s clearing around `label` on every side - blank
+/// rows above and below, blank columns left and right, with no rain drawn
+/// through any of it at all. 3 cells each direction.
+const PROCESSING_PAD: u16 = 3;
+
+/// The screen shown in place of `render` while a `Connect`/`Register`
+/// attempt is actually in flight (`connect::run_with_processing_screen`):
+/// the popup and version title are hidden entirely - there is nothing
+/// left to edit or read while the network is being waited on - but the
+/// background animation keeps running exactly as it does behind the
+/// popup, so the screen never simply freezes on its last frame for
+/// however long the round-trip takes. A single centered line naming
+/// what's happening, in the same yellow the version banner already uses
+/// for status-adjacent text, surrounded by `PROCESSING_PAD` blank
+/// rows/columns on every side where `DigitalRain` draws nothing at all.
+/// `connect::run_with_processing_screen`'s two call sites each pass
+/// their own label ("connecting..." / "one moment...").
+pub fn render_processing(frame: &mut Frame, animation_frame: u64, label: &str) {
+    let area = frame.area();
+    let label_width = label.chars().count() as u16;
+    let clearing = centered_rect(
+        label_width.saturating_add(PROCESSING_PAD * 2),
+        1 + PROCESSING_PAD * 2,
+        area,
+    );
+    frame.render_widget(
+        DigitalRain { frame: animation_frame, avoid_popup: clearing, keep_clear: None },
+        area,
+    );
+    if clearing.height == 0 {
+        return;
+    }
+    let row = Rect {
+        x: clearing.x,
+        y: clearing.y + (clearing.height / 2),
+        width: clearing.width,
+        height: 1,
+    };
+    frame.render_widget(
+        Paragraph::new(label)
+            .style(Style::default().fg(Color::Yellow))
+            .alignment(Alignment::Center),
+        row,
+    );
+}
+
 /// `r` expanded by `margin` cells on every side, clamped to stay inside
 /// `bounds` - used to carve a no-draw zone around the version banner
 /// wider than the banner's own text so `DigitalRain` never crowds it.
@@ -764,13 +812,17 @@ fn padded(r: Rect, margin: u16, bounds: Rect) -> Rect {
     }
 }
 
-/// A sparse "digital rain" animation filling the screen behind the
+/// A dense "digital rain" animation filling the screen behind the
 /// connect popup - purely decorative, themed to "secure link" the same
 /// way the version banner above the popup is. Reads `frame` (advanced
 /// once per tick by `run`'s event-poll timeout, not by a key press, so it
 /// moves on its own) and draws nothing inside `keep_clear`, which
 /// `render` sets to the version banner's own area padded 2 cells wider on
-/// every side.
+/// every side. Every column always carries a falling trail (below), and
+/// - unlike a plainer rain effect where everything *not* falling is
+/// blank - the cells between trails are their own sparse, independently
+/// flickering field of `0`/`1` glyphs, closer to a real "matrix screen"
+/// than falling streaks over empty space.
 struct DigitalRain {
     frame: u64,
     /// The popup's own footprint - excluded outright, not just relied on
@@ -782,8 +834,29 @@ struct DigitalRain {
 
 impl DigitalRain {
     /// How many rows a column's falling trail spans, brightest at the
-    /// head and fading out over the rest.
-    const TRAIL_LEN: i64 = 6;
+    /// head and fading out over the rest - longer than a sparser rain
+    /// effect would use, so more of each column is lit at any given
+    /// moment.
+    const TRAIL_LEN: i64 = 10;
+    /// How many ticks a background glyph (outside every column's active
+    /// trail) holds its state before a fresh hash decides its next one -
+    /// independent per cell, not tied to any column's falling head, so
+    /// the background flickers on its own rather than merely trailing
+    /// the streaks. Small enough to read as "alive," large enough not to
+    /// strobe.
+    const BACKGROUND_FLICKER_TICKS: u64 = 6;
+    /// 1-in-this-many background cells (outside a trail) is lit on a
+    /// given flicker tick - sparse enough that the falling trails still
+    /// read as the main motion, dense enough that the background is
+    /// visibly textured rather than empty.
+    const BACKGROUND_DENSITY: u64 = 5;
+    /// How many ticks a column's own fall speed and trail length hold
+    /// steady before a fresh hash reseeds them - each column staggered by
+    /// its own offset (`render`'s `stagger`) so columns reseed at
+    /// different times instead of every one twitching together on the
+    /// same tick. Keeps every column's rhythm drifting over time instead
+    /// of settling into one fixed, spottable loop.
+    const RESEED_PERIOD: u64 = 45;
 
     fn in_rect(r: Rect, x: u16, y: u16) -> bool {
         x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
@@ -791,6 +864,34 @@ impl DigitalRain {
 
     fn excluded(&self, x: u16, y: u16) -> bool {
         Self::in_rect(self.avoid_popup, x, y) || self.keep_clear.is_some_and(|r| Self::in_rect(r, x, y))
+    }
+
+    /// A cheap but well-mixed hash (SplitMix64's own finalizer), not real
+    /// randomness - decoration has no need for a `rand` call, and a
+    /// deterministic pattern renders identically for the same `frame`,
+    /// which is what makes this paintable in a test. The three
+    /// xor-shift/multiply rounds give every output bit, low ones
+    /// included, a genuine avalanche from every input bit, so two
+    /// adjacent `x` (or `x`, `epoch`) values land nowhere near each
+    /// other - neighbouring columns end up with independent-looking fall
+    /// speeds and phases rather than any visible correlation with `x`.
+    fn hash(n: u64) -> u64 {
+        let mut n = n.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        n = (n ^ (n >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        n = (n ^ (n >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        n ^ (n >> 31)
+    }
+
+    /// One independently-flickering background glyph, or `None` for a
+    /// cell that happens to be dark this tick - checked only for cells a
+    /// column's own falling trail doesn't already cover.
+    fn background_glyph(&self, x: u16, y: u16) -> Option<char> {
+        let epoch = self.frame / Self::BACKGROUND_FLICKER_TICKS;
+        let h = Self::hash((x as u64).wrapping_mul(97).wrapping_add((y as u64).wrapping_mul(31)).wrapping_add(epoch));
+        if h % Self::BACKGROUND_DENSITY != 0 {
+            return None;
+        }
+        Some(if (h / Self::BACKGROUND_DENSITY) % 2 == 0 { '0' } else { '1' })
     }
 }
 
@@ -800,18 +901,32 @@ impl Widget for DigitalRain {
             return;
         }
         for x in area.left()..area.right() {
-            // A cheap multiplicative hash of the column index, not real
-            // randomness - decoration has no need for a `rand` call, and
-            // a deterministic pattern renders identically for the same
-            // `frame`, which is what makes this paintable in a test.
-            let hash = (x as u64).wrapping_mul(2_654_435_761);
-            let speed = 1 + (hash % 3) as i64; // rows per tick, 1..=3
-            let phase = (hash / 3 % 251) as i64;
-            let cycle = area.height as i64 + Self::TRAIL_LEN;
-            let head = (self.frame as i64 * speed + phase).rem_euclid(cycle) - Self::TRAIL_LEN;
+            // Staggered per column (`stagger`, 0..RESEED_PERIOD) so every
+            // column reseeds its own speed/trail length at its own tick
+            // rather than the whole screen twitching in sync every
+            // RESEED_PERIOD ticks.
+            let stagger = Self::hash(x as u64) % Self::RESEED_PERIOD;
+            let epoch = (self.frame + stagger) / Self::RESEED_PERIOD;
+            let seed = Self::hash((x as u64).wrapping_mul(97).wrapping_add(epoch.wrapping_mul(7_919)));
+            let speed = 1 + (seed % 2) as i64; // rows per tick, 1..=2 - a bit slower than a faster rain would use
+            let phase = (seed / 2 % 251) as i64;
+            let trail_len = Self::TRAIL_LEN - 2 + ((seed / 253) % 5) as i64; // 8..=12, varies per reseed
+            let cycle = area.height as i64 + trail_len;
+            let head = (self.frame as i64 * speed + phase).rem_euclid(cycle) - trail_len;
             for y in area.top()..area.bottom() {
+                if self.excluded(x, y) {
+                    continue;
+                }
                 let dist = head - (y - area.top()) as i64;
-                if !(0..Self::TRAIL_LEN).contains(&dist) || self.excluded(x, y) {
+                if !(0..trail_len).contains(&dist) {
+                    if let Some(glyph) = self.background_glyph(x, y) {
+                        buf.set_string(
+                            x,
+                            y,
+                            glyph.to_string(),
+                            Style::default().fg(Color::Green).add_modifier(Modifier::DIM),
+                        );
+                    }
                     continue;
                 }
                 let glyph = if (x as i64 + dist) % 2 == 0 { '0' } else { '1' };

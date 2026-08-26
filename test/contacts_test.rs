@@ -7,8 +7,8 @@ use std::path::PathBuf;
 
 use aloo::client::contacts::{
     InstallOtpKeyOutcome, OwnIdentity, PinIdentityCardOutcome, delete_contact,
-    delete_contact_device, delete_otp_key, gather_contact_rows, install_otp_key,
-    otp_contact_name_for, pin_identity_card, pin_identity_card_for_device,
+    delete_contact_device, delete_otp_key, export_own_identity_card_to, gather_contact_rows,
+    install_otp_key, otp_contact_name_for, pin_identity_card, pin_identity_card_for_device,
 };
 use aloo::client::idstore::IdStore;
 use aloo::client::otp_cli::{self, OtpCliConfig};
@@ -898,4 +898,78 @@ fn pin_identity_card_for_device_leaves_sibling_devices_untouched() {
     let expected_der = aloo::proto::encode(&public).unwrap();
     assert_eq!(id_store.get_for_device("alice", "laptop"), Some(expected_der.as_slice()));
     assert_eq!(id_store.devices_of("alice").count(), 2);
+}
+
+// ---------------------------------------------------------------------
+// export_own_identity_card_to: /contacts' `x` - the live-session
+// equivalent of `aloo --export-identity-card`
+// ---------------------------------------------------------------------
+
+/// The card `export_own_identity_card_to` writes must be the genuine
+/// article: importable by `pin_identity_card` (the same path a recipient
+/// who receives this file takes) and verified under exactly the
+/// nickname it was exported for.
+/// @requirement AC-370
+#[test]
+fn export_own_identity_card_to_writes_a_card_a_recipient_can_import_and_verify() {
+    let dir = scratch_dir("export-own-card");
+    let (public, private) =
+        aloo::crypto::pq::generate_bundle_with_bits(TEST_BITS).expect("generating a pq_hybrid bundle");
+    let public_der = aloo::proto::encode(&public).unwrap();
+
+    let (path, phrase) = export_own_identity_card_to(&private, &public_der, "alice", &dir)
+        .expect("exporting this client's own card");
+    assert_eq!(path, dir.join("alice.aloo-card"));
+    assert!(path.is_file());
+    assert!(!phrase.is_empty());
+
+    let mut id_store = IdStore::new_empty(dir.join("ids_store"));
+    let outcome = pin_identity_card(&mut id_store, "alice", &path);
+    assert_eq!(outcome, PinIdentityCardOutcome::Ok, "a recipient must be able to import the exported card");
+    assert_eq!(id_store.get("alice"), Some(public_der.as_slice()));
+}
+
+/// Exporting again for a different nickname must not collide with, or
+/// overwrite, an earlier export - each is its own file.
+/// @requirement AC-370
+#[test]
+fn export_own_identity_card_to_names_the_file_after_the_nickname() {
+    let dir = scratch_dir("export-own-card-two-names");
+    let (public, private) =
+        aloo::crypto::pq::generate_bundle_with_bits(TEST_BITS).expect("generating a pq_hybrid bundle");
+    let public_der = aloo::proto::encode(&public).unwrap();
+
+    let (alice_path, _) = export_own_identity_card_to(&private, &public_der, "alice", &dir).unwrap();
+    let (bob_path, _) = export_own_identity_card_to(&private, &public_der, "bob", &dir).unwrap();
+    assert_ne!(alice_path, bob_path);
+    assert!(alice_path.is_file());
+    assert!(bob_path.is_file());
+}
+
+/// The destination directory is created if it doesn't exist yet - a
+/// fresh install's `~/.aloo/exports` never existing until the first
+/// export of any kind.
+/// @requirement AC-370
+#[test]
+fn export_own_identity_card_to_creates_missing_destination_directories() {
+    let dir = scratch_dir("export-own-card-nested").join("exports");
+    let (public, private) =
+        aloo::crypto::pq::generate_bundle_with_bits(TEST_BITS).expect("generating a pq_hybrid bundle");
+    let public_der = aloo::proto::encode(&public).unwrap();
+
+    assert!(!dir.exists());
+    export_own_identity_card_to(&private, &public_der, "alice", &dir).unwrap();
+    assert!(dir.join("alice.aloo-card").is_file());
+}
+
+/// A `public_der` that doesn't decode must be reported, not panicked on.
+/// @requirement AC-370
+#[test]
+fn export_own_identity_card_to_reports_an_undecodable_public_bundle() {
+    let dir = scratch_dir("export-own-card-bad-der");
+    let (_, private) =
+        aloo::crypto::pq::generate_bundle_with_bits(TEST_BITS).expect("generating a pq_hybrid bundle");
+
+    let result = export_own_identity_card_to(&private, b"not a valid bundle", "alice", &dir);
+    assert!(result.is_err());
 }

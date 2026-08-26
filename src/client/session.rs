@@ -552,19 +552,22 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
             0
         },
     );
-    // `~/.aloo/d_id` - generated once, on whichever session first needs it,
-    // and reused for the machine's whole lifetime (`docs/PROTOCOL.md`
-    // §12.7). A failure to load/create it is not fatal - the direct link
-    // itself doesn't depend on it at all, it just leaves an impersonation
-    // review with less to compare against - so this falls back to an
-    // empty string (`display_device_id` renders that as "unknown") rather
-    // than refusing to connect.
-    let own_device_id =
-        crate::client::device_id::load_or_create(&crate::client::device_id::default_path())
-            .unwrap_or_else(|e| {
-                crate::log_warn!("failed to load/create device id: {e} (continuing without one)");
-                String::new()
-            });
+    // `~/.aloo/d_id` - generated once per nickname, the first session that
+    // connects as `display_name` on this machine, and reused for that
+    // nickname's whole lifetime (`docs/PROTOCOL.md` §12.7). A failure to
+    // load/create it is not fatal - the direct link itself doesn't depend
+    // on it at all, it just leaves an impersonation review with less to
+    // compare against - so this falls back to an empty string
+    // (`display_device_id` renders that as "unknown") rather than
+    // refusing to connect.
+    let own_device_id = crate::client::device_id::load_or_create(
+        &crate::client::device_id::default_path(),
+        &display_name,
+    )
+    .unwrap_or_else(|e| {
+        crate::log_warn!("failed to load/create device id: {e} (continuing without one)");
+        String::new()
+    });
     let (p2p_events_tx, mut p2p_events_rx) = tokio::sync::mpsc::unbounded_channel::<P2pEvent>();
     let (mut peer_link, p2p_socket) = match PeerLinkManager::bind(
         bind_addr,
@@ -1928,6 +1931,10 @@ async fn handle_ui_action(
             )
             .await;
         }
+        UiAction::AddBareContact { nickname, device_id } => {
+            crate::client::contacts::handle_add_bare_contact(session, ui_state, nickname, device_id)
+                .await;
+        }
         UiAction::Detach => {
             // Intercepted by `run_connected_session`'s input arm, which
             // owns the `Surface` this acts on. A no-op rather than an
@@ -1973,6 +1980,16 @@ async fn handle_ui_action(
         }
         UiAction::AdminRemoveChannel { name } => {
             wr.send_control(&ClientMessage::AdminRemoveChannel { name }).await?;
+        }
+        UiAction::ChangePassword { old_password, new_password } => {
+            wr.send_control(&ClientMessage::ChangePassword { old_password, new_password })
+                .await?;
+        }
+        UiAction::RequestUsersList => {
+            wr.send_control(&ClientMessage::RequestUsersList).await?;
+        }
+        UiAction::ExportOwnIdentityCard => {
+            crate::client::contacts::handle_export_own_identity_card(session, ui_state).await;
         }
     }
     Ok(())
@@ -2349,6 +2366,19 @@ async fn handle_server_message(
         }
         ServerMessage::AccountDeactivated { reason } => {
             ui_state.account_deactivated = Some(reason);
+        }
+        ServerMessage::UsersList { users } => {
+            ui_state.set_users_admin(users);
+        }
+        ServerMessage::ChangePasswordResult { ok, reason } => {
+            if ok {
+                ui_state.push_status_notice("password changed".to_string(), true);
+            } else {
+                ui_state.push_status_notice(
+                    format!("password not changed: {}", reason.unwrap_or_default()),
+                    false,
+                );
+            }
         }
         ServerMessage::UserJoined { channel, user } => {
             // A pq_hybrid peer's bundle carries only their *bootstrap*

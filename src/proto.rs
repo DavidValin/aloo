@@ -217,6 +217,15 @@ pub struct ChannelInfo {
     pub kind: ChannelKind,
 }
 
+/// One row of `ServerMessage::UsersList` - a registered nickname and
+/// which channels it currently administers, empty for one that
+/// administers none.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserAdminInfo {
+    pub nickname: String,
+    pub admin_of: Vec<String>,
+}
+
 /// Why a password-protected private channel's `JoinChannel` was rejected
 /// (see `ServerMessage::ChannelJoinRejected`, docs/PROTOCOL.md §6.5/§6.6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -382,6 +391,20 @@ pub enum ClientMessage {
         public_key_der: Vec<u8>,
         key_mode: KeyMode,
     },
+    /// `/password <old> <new>`: changes the sender's own password
+    /// (`server::users_registry::UsersRegistry::change_password`). Only
+    /// reachable once already fully connected (past `Auth`/`Identify`),
+    /// so the account is necessarily active already - `old_password` is
+    /// re-checked anyway, exactly like `Auth` would, rather than trusting
+    /// that this connection once authenticated with the current one; this
+    /// is a fresh proof, not an admin override. Answered with
+    /// `ChangePasswordResult`; the connection is otherwise unaffected
+    /// either way - not even the credentials it originally authenticated
+    /// with, since a live connection is never re-checked after `Auth`.
+    ChangePassword {
+        old_password: String,
+        new_password: String,
+    },
     /// Joins `name`, creating it first if needed. `kind` only matters for
     /// creation. `password` is `Some` only for a private join/create with
     /// a password typed - it either sets a new private channel's password
@@ -463,6 +486,13 @@ pub enum ClientMessage {
     AdminRemoveChannel {
         name: String,
     },
+    /// A superadmin's `/users`: every registered nickname on the server
+    /// (`server::users_registry::UsersRegistry::nicknames`) and which
+    /// channels each currently administers
+    /// (`server::channels_registry::ChannelsRegistry::channels_administered_by`).
+    /// Checked against `server_superadmin` server-side exactly like every
+    /// other `Admin*` message; answered with `UsersList`.
+    RequestUsersList,
 
     /// `pq_hybrid` only (`KeyMode::PqHybrid`, PROTOCOL.md §13.10): tells
     /// `to` to trust a freshly-rotated encryption key from now on.
@@ -580,6 +610,19 @@ pub enum ServerMessage {
     RegisterResult {
         ok: bool,
         reason: Option<String>,
+    },
+    /// Answers `ChangePassword`. `ok: false` names why in `reason` -
+    /// "wrong current password" or an empty new one; the connection stays
+    /// open either way, unlike `RegisterResult`.
+    ChangePasswordResult {
+        ok: bool,
+        reason: Option<String>,
+    },
+    /// Answers a superadmin's `RequestUsersList` - every registered
+    /// nickname and which channels each administers. Refused (`Error`,
+    /// not this) for anyone else.
+    UsersList {
+        users: Vec<UserAdminInfo>,
     },
     /// Answers `Identify`. Nicknames must be unique among connected
     /// clients; `ok: false` means the server closes the connection right

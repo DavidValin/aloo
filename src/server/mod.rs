@@ -732,20 +732,30 @@ async fn handle_connection(
                 .await;
             return Ok(());
         }
-        AuthCheck::ActivationPending { expired: true } => {
-            let _ = wr
-                .send(&ServerMessage::AuthResult {
-                    ok: false,
-                    activation_pending: false,
-                    deactivated: None,
-                    reason: Some(
-                        "this account's activation code has expired - register again".into(),
-                    ),
-                })
-                .await;
-            return Ok(());
-        }
-        AuthCheck::ActivationPending { expired: false } => {
+        AuthCheck::ActivationPending { expired } => {
+            // An expired pending activation gets exactly one more chance:
+            // a fresh code, resent to the same email already on file, the
+            // same way registering again with the same data already
+            // works (`register_account`) - so a login attempt never has
+            // to become a whole separate re-registration round trip. Only
+            // an outright refusal (no SMTP configured, no email on file -
+            // `register_manual` - or the relay itself failing) still ends
+            // the connection here; everything else falls through into the
+            // same "wait for Activate" flow an unexpired pending
+            // activation already uses.
+            if expired && !reissue_and_resend_activation(&options, &nickname).await {
+                let _ = wr
+                    .send(&ServerMessage::AuthResult {
+                        ok: false,
+                        activation_pending: false,
+                        deactivated: None,
+                        reason: Some(
+                            "this account's activation code has expired - register again".into(),
+                        ),
+                    })
+                    .await;
+                return Ok(());
+            }
             wr.send(&ServerMessage::AuthResult {
                 ok: false,
                 activation_pending: true,
@@ -975,6 +985,44 @@ async fn client_loop<R: AsyncRead + Unpin>(
                             message: ServerMessage::Error { message: reason },
                         }]
                     }),
+                ClientMessage::ChangePassword { old_password, new_password } => {
+                    match reg.clients.get(&id).map(|c| c.name.clone()) {
+                        None => vec![Outgoing {
+                            to: id,
+                            message: ServerMessage::ChangePasswordResult {
+                                ok: false,
+                                reason: Some("not connected".to_string()),
+                            },
+                        }],
+                        Some(nickname) => {
+                            // Deliberately synchronous PBKDF2, unlike
+                            // `Auth`'s own check: this connection already
+                            // holds `reg`'s lock for every other arm here,
+                            // and needs nothing further from it beyond the
+                            // caller's own nickname just resolved above, so
+                            // a `spawn_blocking` hop would only add latency
+                            // without releasing anything else could use in
+                            // the meantime - the same one-request-at-a-time
+                            // cost every other arm here already accepts,
+                            // just a slower one.
+                            let now = users_registry::now_utc();
+                            let message = match options.users.check_credentials(&nickname, &old_password, now) {
+                                AuthCheck::Ok => match options.users.change_password(&nickname, &new_password) {
+                                    Ok(()) => ServerMessage::ChangePasswordResult { ok: true, reason: None },
+                                    Err(e) => ServerMessage::ChangePasswordResult {
+                                        ok: false,
+                                        reason: Some(e.to_string()),
+                                    },
+                                },
+                                _ => ServerMessage::ChangePasswordResult {
+                                    ok: false,
+                                    reason: Some("wrong current password".to_string()),
+                                },
+                            };
+                            vec![Outgoing { to: id, message }]
+                        }
+                    }
+                }
                 ClientMessage::AdminDeactivate { nickname, reason } => {
                     match require_superadmin(options, &reg, id) {
                         Err(e) => vec![Outgoing {
@@ -1039,6 +1087,24 @@ async fn client_loop<R: AsyncRead + Unpin>(
                         Ok(_) => reg.remove_channel(&name, "removed by a superadmin"),
                     }
                 }
+                ClientMessage::RequestUsersList => match require_superadmin(options, &reg, id) {
+                    Err(e) => vec![Outgoing {
+                        to: id,
+                        message: ServerMessage::Error { message: e },
+                    }],
+                    Ok(_) => {
+                        let users = options
+                            .users
+                            .nicknames()
+                            .into_iter()
+                            .map(|nickname| {
+                                let admin_of = reg.channels.channels_administered_by(&nickname);
+                                proto::UserAdminInfo { nickname, admin_of }
+                            })
+                            .collect();
+                        vec![Outgoing { to: id, message: ServerMessage::UsersList { users } }]
+                    }
+                },
                 ClientMessage::RotateKey {
                     to,
                     new_public_key_der,
@@ -1146,6 +1212,59 @@ async fn register_account(
         return Err("the activation email could not be sent - try again later".into());
     }
     Ok(())
+}
+
+/// A login attempt against an account whose activation code has expired
+/// (§5.1): reissues a fresh code (`UsersRegistry::reissue_activation`) and
+/// re-sends the activation email with the data already on file, exactly
+/// as `register_account` does when the same account is registered again
+/// while expired - so `handle_connection`'s `ActivationPending { expired:
+/// true }` arm never has to end in an outright refusal when there's
+/// somewhere to actually send a fresh code. `false` (nothing changed, the
+/// caller falls back to refusing) when there's no SMTP relay configured,
+/// no email on file for this account (`register_manual` has none), no
+/// expired pending activation to reissue against after all, or the relay
+/// itself fails to accept the email.
+async fn reissue_and_resend_activation(options: &ServerOptions, nickname: &str) -> bool {
+    let Some(smtp) = &options.smtp else {
+        return false;
+    };
+    let Some(email) = options.users.email_of(nickname) else {
+        return false;
+    };
+    let registration = {
+        let users = options.users.clone();
+        let owned_nickname = nickname.to_string();
+        let result = tokio::task::spawn_blocking(move || {
+            users.reissue_activation(&owned_nickname, users_registry::now_utc())
+        })
+        .await;
+        match result {
+            Ok(Ok(Some(registration))) => registration,
+            Ok(Ok(None)) => return false,
+            Ok(Err(e)) => {
+                crate::log_warn!("reissuing activation for {nickname}: {e}");
+                return false;
+            }
+            Err(e) => {
+                crate::log_warn!("reissuing activation for {nickname}: {e}");
+                return false;
+            }
+        }
+    };
+    if let Err(e) = users_registry::send_activation_email(
+        smtp,
+        &email,
+        nickname,
+        &registration.code,
+        options.activation_url.as_deref(),
+    )
+    .await
+    {
+        crate::log_warn!("resent activation email for {nickname} could not be sent: {e}");
+        return false;
+    }
+    true
 }
 
 async fn dispatch(senders: &Senders, outgoing: Vec<Outgoing>) {

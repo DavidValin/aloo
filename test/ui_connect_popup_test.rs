@@ -2,7 +2,7 @@ use aloo::client::connect::{ConnectRequest, MyKeySelection, RegisterRequest};
 use aloo::client::file_browser::FileBrowserState;
 use aloo::client::tui::ui_connect_popup::{
     ACTIVATION_CODE_LEN, ALOO_HOME_LABEL, Action, ActivationAction, ActivationPopupState,
-    ConnectPopupState, Field, NICKNAME_MAX_LEN, render, render_activation,
+    ConnectPopupState, Field, NICKNAME_MAX_LEN, render, render_activation, render_processing,
 };
 use crossterm::event::KeyCode;
 use ratatui::Terminal;
@@ -1089,5 +1089,184 @@ fn render_does_not_panic_with_a_notice_or_error_showing() {
     state.notice = None;
     state.error = Some("host is required".into());
     terminal.draw(|f| render(f, &state)).unwrap();
+}
+
+// ---------------------------------------------------------------------
+// The "processing..." screen (shown in place of `render` while a
+// Connect/Register attempt is in flight) and the digital-rain background
+// it shares with `render`
+// ---------------------------------------------------------------------
+
+fn non_blank_fraction(buffer: &ratatui::buffer::Buffer) -> f64 {
+    let total = buffer.content().len();
+    let non_blank = buffer.content().iter().filter(|c| c.symbol() != " ").count();
+    non_blank as f64 / total as f64
+}
+
+/// @requirement AC-371
+#[test]
+fn render_processing_does_not_panic_and_shows_the_label() {
+    let backend = TestBackend::new(80, 24);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| render_processing(f, 0, "connecting...")).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    let rows: Vec<String> = (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol().chars().next().unwrap_or(' '))
+                .collect()
+        })
+        .collect();
+    assert!(
+        rows.iter().any(|r| r.contains("connecting...")),
+        "expected a centered \"connecting...\" line: {rows:?}"
+    );
+}
+
+/// `run_with_processing_screen`'s two call sites each pass their own
+/// label - Connect's own attempt (`connect_with_reconnect`) says
+/// "connecting...", Register's (`register_account`) says "one moment...".
+/// Padded with 3 blank columns on each side either way.
+/// @requirement AC-371
+#[test]
+fn render_processing_shows_whichever_label_it_was_given_padded_by_three() {
+    let backend = TestBackend::new(80, 24);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| render_processing(f, 0, "one moment...")).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    let rows: Vec<String> = (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol().chars().next().unwrap_or(' '))
+                .collect()
+        })
+        .collect();
+    let line = rows
+        .iter()
+        .find(|r| r.contains("one moment..."))
+        .expect("expected a centered \"one moment...\" line");
+    let padded = "   one moment...   ";
+    assert!(
+        line.contains(padded),
+        "expected exactly 3 blank columns on each side of the label: {line:?}"
+    );
+}
+
+/// The 3-cell clearing is a real box, not just 3 literal space characters
+/// sharing the label's own row: 3 whole blank rows above the label and 3
+/// below it too, with no rain drawn through any of them - `DigitalRain`
+/// draws nothing at all inside the clearing (`avoid_popup`), rather than
+/// the label merely overwriting one row of whatever rain was already
+/// there.
+/// @requirement AC-371
+#[test]
+fn render_processing_clears_blank_rows_above_and_below_the_label_too() {
+    let backend = TestBackend::new(80, 24);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| render_processing(f, 3, "connecting...")).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    let rows: Vec<String> = (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol().chars().next().unwrap_or(' '))
+                .collect()
+        })
+        .collect();
+    let label_row = rows
+        .iter()
+        .position(|r| r.contains("connecting..."))
+        .expect("expected a centered \"connecting...\" line");
+    // Same horizontal span the clearing box occupies on the label's own
+    // row (found via its leading/trailing runs of blanks either side of
+    // the label text) - checked on the 3 rows directly above and below
+    // too, where nothing but blanks is expected at all.
+    let line = &rows[label_row];
+    let start = line.find("connecting...").unwrap() - 3;
+    let end = start + "   connecting...   ".chars().count();
+    for offset in 1..=3 {
+        for (name, row) in [("above", &rows[label_row - offset]), ("below", &rows[label_row + offset])] {
+            let span: String = row.chars().skip(start).take(end - start).collect();
+            assert!(
+                span.chars().all(|c| c == ' '),
+                "expected a blank row {offset} cell(s) {name} the label, got {span:?}"
+            );
+        }
+    }
+}
+
+/// Each column's own fall speed and trail length are periodically
+/// reseeded, staggered so columns don't all reseed on the same tick -
+/// the animation should keep producing a fresh pattern over an extended
+/// stretch of frames rather than settling into a short repeating loop.
+/// @requirement AC-372
+#[test]
+fn the_background_animation_does_not_settle_into_a_short_repeating_cycle() {
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let buffers: Vec<_> = (0..60u64)
+        .map(|frame| {
+            terminal.draw(|f| render_processing(f, frame, "connecting...")).unwrap();
+            terminal.backend().buffer().clone()
+        })
+        .collect();
+    for i in 0..buffers.len() {
+        for j in (i + 1)..buffers.len() {
+            assert_ne!(
+                buffers[i], buffers[j],
+                "frames {i} and {j} rendered identically - the animation has settled into \
+                 a repeating cycle within just {} frames",
+                buffers.len()
+            );
+        }
+    }
+}
+
+/// Degenerate terminal sizes must not panic - the same guard `render`
+/// itself already relies on via `centered_rect`/layout clamping.
+/// @requirement AC-371
+#[test]
+fn render_processing_does_not_panic_on_a_zero_sized_or_tiny_terminal() {
+    let backend = TestBackend::new(1, 1);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| render_processing(f, 5, "connecting...")).unwrap();
+
+    let backend = TestBackend::new(80, 1);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| render_processing(f, 5, "connecting...")).unwrap();
+}
+
+/// The processing screen's animation must still advance frame to frame,
+/// same as the popup's own background does.
+/// @requirement AC-371
+#[test]
+fn render_processing_animates_across_frames() {
+    let backend = TestBackend::new(80, 24);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| render_processing(f, 0, "connecting...")).unwrap();
+    let first = terminal.backend().buffer().clone();
+    terminal.draw(|f| render_processing(f, 20, "connecting...")).unwrap();
+    let second = terminal.backend().buffer().clone();
+    assert_ne!(first, second, "the animation must visibly move between frames");
+}
+
+/// The digital-rain background (shared by `render` and `render_processing`)
+/// must be dense - not just sparse falling streaks over empty space - and
+/// include glyphs scattered independently of any column's own falling
+/// trail, closer to a real "matrix screen."
+/// @requirement AC-372
+#[test]
+fn the_background_animation_is_dense_with_scattered_glyphs_not_just_thin_streaks() {
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| render_processing(f, 37, "connecting...")).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    let fraction = non_blank_fraction(&buffer);
+    assert!(
+        fraction > 0.35,
+        "expected a dense background (>35% of cells lit, including scattered background \
+         glyphs outside the falling trails), got {:.1}%",
+        fraction * 100.0
+    );
+    assert!(fraction < 1.0, "still sparse enough to read as \"rain,\" not a solid fill");
 }
 

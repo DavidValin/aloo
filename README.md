@@ -27,7 +27,8 @@ Just you, your terminal, and the people you're talking to.
 - 📢 **Public channels** — join what the server advertises; new ones appear live, no reconnect.
 - 🔒 **Private channels** — unadvertised, joined by name, optionally password-protected.
 - ☀️ **Channel ownership and moderation** — whoever creates a channel administers it: `/delete-channel`, `/ban`/`/unban`, `/lock-joins`, and `/assign-admin` to hand it off. An operator can also require `server_allow_create_public_channels=off` so only private channels get made, and set `server_channel_deletion_unactivity_period` to sweep away channels nobody's touched in a while.
-- ⚡ **Server superadmins** — `server_superadmin` nicknames can lock an account out (`/deactivate`, `/activate` to reverse it), or remove an account or any public channel outright.
+- ⚡ **Server superadmins** — `server_superadmin` nicknames can lock an account out (`/deactivate`, `/activate` to reverse it), remove an account or any public channel outright, or list every registered user and what they administer with `/users`.
+- 🔑 **Change your password live** — `/password <old> <new>` rotates your own password without a superadmin, taking effect immediately.
 - ✉️  **Private messages (DMs)** — a one-on-one room with anyone in the sidebar.
 - 🔐 **Live One Time Pad sessions** — wrap a DM in real one-time-pad encryption, the only cipher with proven perfect secrecy, on top of the quantum-resistant layer you already have. Requires [otp-toolkit](https://github.com/DavidValin/otp-toolkit).
 - 📨 **OTP mail** — a whole mail (subject, text, voice, attachments) that waits pad-sealed on the server, unreadable to it, until the recipient connects.
@@ -80,7 +81,7 @@ aloo
 
 This opens a connect screen. Fill in the host/port, a nickname and its password, and press Connect. An email field and a Register button are always there too — no account yet? Fill in an email and press Register instead; on success aloo asks right there for the 12-digit activation code that was just emailed to you. Pressing Register on a server that has `server_allow_registration` off just refuses, in red, telling you so. Everything else on that screen has sensible defaults — you don't need to touch it to get started (see `docs/SPEC.md` if you want to know what every field does).
 
-Your identity type is already set to `pq_hybrid` (PQ-Hybrid, see "Encryption" below) — no need to generate any keys yourself beforehand, aloo creates them automatically the first time you connect.
+Your identity type is already set to `pq_hybrid` (PQ-Hybrid, see "Encryption" below) — no need to generate any keys yourself beforehand, aloo creates them automatically the first time you connect. While Connect/Register is working — key generation included, the first time — the popup gives way to the animated background and a centered "connecting..."/"one moment...".
 
 aloo remembers the host, port and nickname you connected with and proposes them again next time, so connecting a second time is usually just pressing Connect. They live in `~/.aloo/settings` (`connect_host`, `connect_port`, `connect_nickname`) if you ever want to change them by hand — and they're also what a flag-free `aloo --daemon` falls back to (see "Running in the background").
 
@@ -423,7 +424,7 @@ Nicknames aren't proof of identity — anyone could reconnect as "alice" the mom
 - **Next time** they show up with the *same* key, nothing happens — it's silently confirmed as the same person.
 - If that nickname ever comes back with a **different, unrecognized key**, aloo blocks messaging with them right away and, a moment later — as soon as it knows how to reach this new connection — asks you: an identity review popup shows up with **Accept** or **Reject**, naming not just both keys' fingerprints but also where each connection came from: `Last known from <address> (device <id>)` next to `Now connecting from <address> (device <id>)`, so you have more than two fingerprints to judge a key change by. Until you decide, you can't send them anything, and any messages they send stay hidden instead of appearing in your log.
 - **Accept** if you've confirmed it's really them (new device, lost their old key, etc.) — the new key is pinned from then on. **Reject** if you're not sure — nothing is trusted, and you can revisit the decision later by opening a chat with them again.
-- The "device" shown above is a random id aloo generates once per machine (`~/.aloo/d_id`) and reuses forever — purely informational, sent to peers only so it can show up in this popup.
+- The "device" shown above is a random 8-character id aloo generates once per nickname it connects as (`~/.aloo/d_id`) and reuses forever for that nickname — purely informational, sent to peers only so it can show up in this popup.
 
 Your PQ-Hybrid identity is what gets pinned, and it stays the same across reconnects — which is exactly what makes a changed key worth asking about.
 
@@ -436,10 +437,10 @@ Your PQ-Hybrid identity is what gets pinned, and it stays the same across reconn
 | `Up` / `Down` | Move the selection |
 | `Left` / `Right` | Cycle which of the three keys is highlighted — across the whole list at once, so paging up/down keeps comparing the same key |
 | `Enter` | Open the highlighted key's details popup |
-| `a` | Add a contact by hand — nickname and device id — for someone you haven't connected with yet; submitting pins them and opens their PQH key popup to install a key |
+| `a` | Add a contact by hand — nickname (device id and identity card both optional) — for someone you haven't connected with yet; submitting pins them right away, even with no keys, and opens their PQH key popup to install one now or later |
 | `d` | Delete the selected contact outright — forgets their pin and both other keys (confirms first) |
-| `o` | Install an OTP key for the selected contact, from files you generated yourself (shortcut for the OTP key's own details-popup action) |
 | `r` | Refresh the list (e.g. after the remaining key has moved) |
+| `x` (or select the **Export identity card** button at the end of the list, `Enter`) | Export your own identity card (own pqhybrid key) — the live equivalent of `aloo --export-identity-card`, writing `~/.aloo/exports/<your-nickname>.aloo-card` |
 | `Esc` | Close |
 
 **A key's details popup** (`Enter`) explains what that key is for, then shows either its path on disk and live figures (seq/offset/remaining-MB, same as the `/otp` session header) with a **Delete key** action, or, if it doesn't exist yet, a **Create key** (PQH) / **Install manually** (OTP/OTP MAIL) action. Never both at once. `Left`/`Right` inside the popup switches which key it's showing.

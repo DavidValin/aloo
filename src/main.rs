@@ -40,14 +40,130 @@ const HELP_STYLES: Styles = Styles::styled()
     styles = HELP_STYLES
 )]
 struct Cli {
+    /// Generate a fresh PQ-hybrid (`my_key` type `pq_hybrid`) keybundle and
+    /// exit - writes `<PREFIX>` (private) and `<PREFIX>.pub` (public),
+    /// mirroring `openssl genpkey ... -out my_key` / `my_key.pub` for `rsa`
+    /// keys (see README "Generating PQ-hybrid keys"). There is no
+    /// `openssl`-equivalent for ML-DSA-87/ML-KEM-1024, hence this flag.
+    #[arg(long, value_name = "PREFIX", help_heading = "Client Commands")]
+    keygen_pq_hybrid: Option<String>,
+
+    /// Retire an existing PQ-hybrid keybundle for a fresh one, carrying a
+    /// continuity certificate signed by the old keys - so contacts who
+    /// already pinned you move their pin across silently instead of being
+    /// asked whether you might be an impostor. Takes the old prefix and the
+    /// new one. Keep the old files until your contacts have reconnected.
+    #[arg(
+        long,
+        value_names = ["OLD_PREFIX", "NEW_PREFIX"],
+        num_args = 2,
+        help_heading = "Client Commands"
+    )]
+    rekey_pq_hybrid: Option<Vec<String>>,
+
+    /// Run in the background, connected, so the global push-to-talk
+    /// shortcut works without aloo being open. Joins only the channels
+    /// given with `--channels` (never `the-hall` unless you name it) and
+    /// puts the focus where `--initial-focus` says, so a held shortcut goes
+    /// straight there. Type `aloo` in any terminal to take the session
+    /// over, `/daemon` to hand it back.
+    #[arg(long, help_heading = "Client Commands")]
+    daemon: bool,
+
+    /// Daemon-only: stay in the foreground instead of re-launching
+    /// detached. What a service manager wants (systemd `Type=simple`),
+    /// since it does its own supervising.
+    #[arg(long, help_heading = "Client Commands")]
+    foreground: bool,
+
+    /// Print whether a daemon is running, and exit.
+    #[arg(long, help_heading = "Client Commands")]
+    daemon_status: bool,
+
+    /// Ask a running daemon to shut down, and exit.
+    #[arg(long, help_heading = "Client Commands")]
+    daemon_stop: bool,
+
+    /// Run with no server at all: reachable only by the direct_punch_to
+    /// peers in ~/.aloo/settings. Anything needing a server is refused,
+    /// by name, when asked for.
+    #[arg(long, help_heading = "Client Commands")]
+    no_server: bool,
+
+    /// Start a fresh session even if a daemon is running, instead of
+    /// attaching to it.
+    #[arg(long, help_heading = "Client Commands")]
+    no_attach: bool,
+
+    /// Daemon/client: the server to connect to. Defaults to whatever was
+    /// last connected to (`~/.aloo/.cache`).
+    #[arg(long, help_heading = "Client Commands")]
+    host: Option<String>,
+
+    /// Daemon-only: the nickname to connect as. Defaults to $USER.
+    #[arg(long, help_heading = "Client Commands")]
+    nick: Option<String>,
+
+    /// Daemon-only: the password the nickname logs in with. Remembered in
+    /// ~/.aloo/settings (daemon_server_password) for the next bare
+    /// `aloo --daemon`.
+    #[arg(long, help_heading = "Client Commands")]
+    nick_pwd: Option<String>,
+
+    /// Daemon-only: the `pq_hybrid` keybundle prefix to connect with -
+    /// `<PREFIX>` and `<PREFIX>.pub`. Generated on first use if missing.
+    #[arg(long, value_name = "PREFIX", help_heading = "Client Commands")]
+    my_key: Option<String>,
+
+    /// Daemon-only: the channels to join, comma separated, each
+    /// optionally with its password after a colon -
+    /// `--channels=team,ops:hunter2`. A colon is legal in neither a
+    /// channel name nor a password, which is what keeps it unambiguous;
+    /// a password containing a comma can only be set in
+    /// `~/.aloo/settings`, where each channel has a line of its own.
+    #[arg(
+        long,
+        value_name = "NAME[:PASSWORD],...",
+        help_heading = "Client Commands"
+    )]
+    channels: Vec<String>,
+
+    /// Daemon-only: where a held push-to-talk shortcut sends its voice, the
+    /// first time it opens. `channel:<name>` for a channel, or a bare
+    /// nickname for a DM, which opens as soon as that person appears. Only
+    /// places it once, at startup - not a standing instruction that keeps
+    /// steering focus afterward.
+    #[arg(long, value_name = "TARGET", help_heading = "Client Commands")]
+    initial_focus: Option<String>,
+
+    /// Daemon-only: with a nickname `--initial-focus`, make sure an OTP
+    /// session is running with them. One that is already active - they
+    /// survive disconnects and restarts, only `/endotp` ends one - is simply
+    /// continued, with no invitation sent and no popup on their side; only
+    /// a peer with no live session is invited, once.
+    #[arg(long, help_heading = "Client Commands")]
+    otp: bool,
+
+    /// Write an identity card for a PQ-hybrid keybundle: a small signed
+    /// file pairing your nickname with your identity, shareable by any
+    /// means. Whoever imports it has you pinned and verified before you
+    /// ever speak. Takes the keybundle prefix and the nickname.
+    #[arg(
+        long,
+        value_names = ["PREFIX", "NICKNAME"],
+        num_args = 2,
+        help_heading = "Client Commands"
+    )]
+    export_identity_card: Option<Vec<String>>,
+
     /// Run as the server instead of the client.
-    #[arg(long)]
+    #[arg(long, help_heading = "Server Commands")]
     server: bool,
 
     /// Port to bind (server) / default-fill in the connect popup (client).
     /// Defaults to 7878 - server mode falls back to whatever
     /// `~/.aloo/settings` last recorded if this flag is omitted.
-    #[arg(long)]
+    #[arg(long, help_heading = "Server Commands")]
     port: Option<u16>,
 
     /// Server-only: address to bind to, IPv4 or IPv6 (e.g. 0.0.0.0, ::, or
@@ -57,122 +173,30 @@ struct Cli {
     /// omitted. Both the TCP control port and the UDP rendezvous port that
     /// direct peer-to-peer punching needs are bound here, so a family left
     /// out here is a family that cannot punch.
-    #[arg(long)]
+    #[arg(long, help_heading = "Server Commands")]
     bind: Option<String>,
 
     /// Server-side registry: create an account that can log in right
     /// away - no email, no activation. Edits ~/.aloo/users directly, so
     /// run it on the server's machine; a running server sees it on the
     /// next login.
-    #[arg(long, value_names = ["NICKNAME", "PASSWORD"], num_args = 2)]
+    #[arg(
+        long,
+        value_names = ["NICKNAME", "PASSWORD"],
+        num_args = 2,
+        help_heading = "Server Commands"
+    )]
     register_user: Option<Vec<String>>,
 
     /// Server-side registry: set a registered nickname's password. Takes
     /// effect on that nickname's next login; sends no email.
-    #[arg(long, value_names = ["NICKNAME", "PASSWORD"], num_args = 2)]
+    #[arg(
+        long,
+        value_names = ["NICKNAME", "PASSWORD"],
+        num_args = 2,
+        help_heading = "Server Commands"
+    )]
     change_password: Option<Vec<String>>,
-
-    /// Generate a fresh PQ-hybrid (`my_key` type `pq_hybrid`) keybundle and
-    /// exit - writes `<PREFIX>` (private) and `<PREFIX>.pub` (public),
-    /// mirroring `openssl genpkey ... -out my_key` / `my_key.pub` for `rsa`
-    /// keys (see README "Generating PQ-hybrid keys"). There is no
-    /// `openssl`-equivalent for ML-DSA-87/ML-KEM-1024, hence this flag.
-    #[arg(long, value_name = "PREFIX")]
-    keygen_pq_hybrid: Option<String>,
-
-    /// Retire an existing PQ-hybrid keybundle for a fresh one, carrying a
-    /// continuity certificate signed by the old keys - so contacts who
-    /// already pinned you move their pin across silently instead of being
-    /// asked whether you might be an impostor. Takes the old prefix and the
-    /// new one. Keep the old files until your contacts have reconnected.
-    #[arg(long, value_names = ["OLD_PREFIX", "NEW_PREFIX"], num_args = 2)]
-    rekey_pq_hybrid: Option<Vec<String>>,
-
-    /// Run in the background, connected, so the global push-to-talk
-    /// shortcut works without aloo being open. Joins only the channels
-    /// given with `--channels` (never `the-hall` unless you name it) and
-    /// puts the focus where `--initial-focus` says, so a held shortcut goes
-    /// straight there. Type `aloo` in any terminal to take the session
-    /// over, `/daemon` to hand it back.
-    #[arg(long)]
-    daemon: bool,
-
-    /// Daemon-only: stay in the foreground instead of re-launching
-    /// detached. What a service manager wants (systemd `Type=simple`),
-    /// since it does its own supervising.
-    #[arg(long)]
-    foreground: bool,
-
-    /// Print whether a daemon is running, and exit.
-    #[arg(long)]
-    daemon_status: bool,
-
-    /// Ask a running daemon to shut down, and exit.
-    #[arg(long)]
-    daemon_stop: bool,
-
-    /// Run with no server at all: reachable only by the direct_punch_to
-    /// peers in ~/.aloo/settings. Anything needing a server is refused,
-    /// by name, when asked for.
-    #[arg(long)]
-    no_server: bool,
-
-    /// Start a fresh session even if a daemon is running, instead of
-    /// attaching to it.
-    #[arg(long)]
-    no_attach: bool,
-
-    /// Daemon/client: the server to connect to. Defaults to whatever was
-    /// last connected to (`~/.aloo/.cache`).
-    #[arg(long)]
-    host: Option<String>,
-
-    /// Daemon-only: the nickname to connect as. Defaults to $USER.
-    #[arg(long)]
-    nick: Option<String>,
-
-    /// Daemon-only: the password the nickname logs in with. Remembered in
-    /// ~/.aloo/settings (daemon_server_password) for the next bare
-    /// `aloo --daemon`.
-    #[arg(long)]
-    nick_pwd: Option<String>,
-
-    /// Daemon-only: the `pq_hybrid` keybundle prefix to connect with -
-    /// `<PREFIX>` and `<PREFIX>.pub`. Generated on first use if missing.
-    #[arg(long, value_name = "PREFIX")]
-    my_key: Option<String>,
-
-    /// Daemon-only: the channels to join, comma separated, each
-    /// optionally with its password after a colon -
-    /// `--channels=team,ops:hunter2`. A colon is legal in neither a
-    /// channel name nor a password, which is what keeps it unambiguous;
-    /// a password containing a comma can only be set in
-    /// `~/.aloo/settings`, where each channel has a line of its own.
-    #[arg(long, value_name = "NAME[:PASSWORD],...")]
-    channels: Vec<String>,
-
-    /// Daemon-only: where a held push-to-talk shortcut sends its voice, the
-    /// first time it opens. `channel:<name>` for a channel, or a bare
-    /// nickname for a DM, which opens as soon as that person appears. Only
-    /// places it once, at startup - not a standing instruction that keeps
-    /// steering focus afterward.
-    #[arg(long, value_name = "TARGET")]
-    initial_focus: Option<String>,
-
-    /// Daemon-only: with a nickname `--initial-focus`, make sure an OTP
-    /// session is running with them. One that is already active - they
-    /// survive disconnects and restarts, only `/endotp` ends one - is simply
-    /// continued, with no invitation sent and no popup on their side; only
-    /// a peer with no live session is invited, once.
-    #[arg(long)]
-    otp: bool,
-
-    /// Write an identity card for a PQ-hybrid keybundle: a small signed
-    /// file pairing your nickname with your identity, shareable by any
-    /// means. Whoever imports it has you pinned and verified before you
-    /// ever speak. Takes the keybundle prefix and the nickname.
-    #[arg(long, value_names = ["PREFIX", "NICKNAME"], num_args = 2)]
-    export_identity_card: Option<Vec<String>>,
 }
 
 /// Not `#[tokio::main]`: on macOS, delivering the global push-to-talk

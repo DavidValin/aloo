@@ -74,6 +74,41 @@ fn help_advertises_the_documented_bind_and_port_defaults() {
     );
 }
 
+/// @requirement TB-266
+#[test]
+fn help_groups_flags_under_client_commands_before_server_commands() {
+    let output = Command::new(bin())
+        .arg("--help")
+        .output()
+        .expect("run --help");
+    assert!(output.status.success());
+    let text = String::from_utf8_lossy(&output.stdout);
+    let client_pos = text
+        .find("Client Commands:")
+        .expect("expected a 'Client Commands:' heading in --help output");
+    let server_pos = text
+        .find("Server Commands:")
+        .expect("expected a 'Server Commands:' heading in --help output");
+    assert!(
+        client_pos < server_pos,
+        "Client Commands must be listed before Server Commands:\n{text}"
+    );
+    let client_section = &text[client_pos..server_pos];
+    let server_section = &text[server_pos..];
+    for flag in ["--daemon", "--host", "--nick", "--export-identity-card"] {
+        assert!(
+            client_section.contains(flag),
+            "expected {flag} under Client Commands:\n{text}"
+        );
+    }
+    for flag in ["--server", "--bind", "--register-user", "--change-password"] {
+        assert!(
+            server_section.contains(flag),
+            "expected {flag} under Server Commands:\n{text}"
+        );
+    }
+}
+
 /// @requirement TB-114
 #[test]
 fn server_bind_and_port_flags_are_parsed_into_the_listen_address() {

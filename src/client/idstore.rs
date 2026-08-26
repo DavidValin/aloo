@@ -34,8 +34,9 @@
 //! (`client::contacts::install_otp_key`) or an imported identity card
 //! (`client::contacts::pin_identity_card`), neither of which have a live
 //! connection to learn a device_id from. Represented as `device_id
-//! == ""`, a reserved sentinel a real device_id (25 random bytes,
-//! hex-encoded - `client::device_id::generate`) can never collide with.
+//! == ""`, a reserved sentinel a real device_id (8 hex characters, unique
+//! per nickname - `client::device_id::load_or_create`) can never collide
+//! with.
 //! At most one unbound entry exists per `(nickname, key_mode)` at a time;
 //! `claim_unbound` is what resolves it into a bound one, the first time a
 //! live connection's key matches it exactly.
@@ -275,12 +276,16 @@ impl IdStore {
         self.entries.get(nickname).into_iter().flatten()
     }
 
-    /// The key pinned for `(nickname, device_id)` exactly, if any.
+    /// The key pinned for `(nickname, device_id)` exactly, if any. An
+    /// entry with an empty key is a bare contact placeholder
+    /// (`pin_bare_contact` - Add Contact with no identity card, "the
+    /// contact is created with no keys") rather than a real pin, so it is
+    /// treated the same as no entry at all here.
     pub fn get_for_device(&self, nickname: &str, device_id: &str) -> Option<&[u8]> {
         self.entries
             .get(nickname)?
             .iter()
-            .find(|e| e.device_id == device_id)
+            .find(|e| e.device_id == device_id && !e.key.is_empty())
             .map(|e| e.key.as_slice())
     }
 
@@ -310,6 +315,7 @@ impl IdStore {
         let devices = self.entries.get(nickname)?;
         devices
             .iter()
+            .filter(|e| !e.key.is_empty())
             .max_by_key(|e| (e.last_seen_unix.is_some(), e.last_seen_unix.unwrap_or(0)))
     }
 
@@ -325,7 +331,10 @@ impl IdStore {
     /// display, the same coarse approximation `session::check_identity`
     /// would otherwise compute by hand.
     pub fn check_key(&self, nickname: &str, key: &[u8]) -> KeyCheck {
-        match compare_key(self.devices_of(nickname).map(|d| d.key.as_slice()), key) {
+        match compare_key(
+            self.devices_of(nickname).filter(|d| !d.key.is_empty()).map(|d| d.key.as_slice()),
+            key,
+        ) {
             KeyCheck::Mismatch { .. } => KeyCheck::Mismatch {
                 previous_public_key_der: self.get(nickname).unwrap_or_default().to_vec(),
             },
@@ -368,18 +377,76 @@ impl IdStore {
         if !is_storable(nickname) || (!device_id.is_empty() && !is_storable(device_id)) {
             return;
         }
-        self.entries
-            .entry(nickname.to_string())
-            .or_default()
-            .push(DeviceEntry {
-                device_id: device_id.to_string(),
-                key: key.to_vec(),
-                trust,
-                last_addr: None,
-                last_seen_unix: None,
-                key_mode,
-                pinned_from: None,
-            });
+        let devices = self.entries.entry(nickname.to_string()).or_default();
+        // A bare contact placeholder (`pin_bare_contact` - empty key, no
+        // device confirmed to have a key at all yet) reserves exactly this
+        // `(nickname, device_id)` slot ahead of time; the first real key
+        // pinned to it fills it in place rather than pushing a sibling
+        // entry that would leave the placeholder behind as a permanent
+        // ghost row. A placeholder with a genuinely different device_id,
+        // or a real (non-empty-key) entry sharing this one, is untouched.
+        if let Some(placeholder) = devices.iter_mut().find(|e| e.device_id == device_id && e.key.is_empty())
+        {
+            placeholder.key = key.to_vec();
+            placeholder.trust = trust;
+            placeholder.key_mode = key_mode;
+            return;
+        }
+        devices.push(DeviceEntry {
+            device_id: device_id.to_string(),
+            key: key.to_vec(),
+            trust,
+            last_addr: None,
+            last_seen_unix: None,
+            key_mode,
+            pinned_from: None,
+        });
+    }
+
+    /// Adds `nickname` as a contact with no key at all yet - Add Contact
+    /// with no identity card imported (`client::tui::contacts`' "the
+    /// identity card is optional" flow): a placeholder entry, empty key
+    /// and `key_mode: None`, that shows up as an ordinary row (all three
+    /// key badges red) and is silently filled in place - never left behind
+    /// as a duplicate - the moment a real key is pinned to it the normal
+    /// way (`pin_new_device_with_key_mode`'s placeholder handling above),
+    /// whether that is this same device_id being TOFU-pinned by a live
+    /// connection or a card/OTP key added later from this exact row.
+    ///
+    /// `device_id` empty reserves the nickname's shared unbound slot -
+    /// refused if it already has an unbound entry with `key_mode: None`
+    /// (a real `Direct`-framed pin or an earlier bare contact; the two
+    /// would otherwise be indistinguishable, and this module's own "at
+    /// most one unbound entry per key_mode" invariant would break).
+    /// `device_id` non-empty reserves that exact device - refused if
+    /// `(nickname, device_id)` already names a real, keyed pin. Returns
+    /// whether a placeholder was actually reserved.
+    pub fn pin_bare_contact(&mut self, nickname: &str, device_id: &str) -> bool {
+        if !is_storable(nickname) || (!device_id.is_empty() && !is_storable(device_id)) {
+            return false;
+        }
+        if device_id.is_empty() {
+            let already_unbound_none = self
+                .entries
+                .get(nickname)
+                .is_some_and(|devices| devices.iter().any(|e| e.is_unbound() && e.key_mode.is_none()));
+            if already_unbound_none {
+                return false;
+            }
+        } else if self
+            .entries
+            .get(nickname)
+            .is_some_and(|devices| devices.iter().any(|e| e.device_id == device_id))
+        {
+            // Already reserved, bare or real alike - `get_for_device`
+            // alone would miss an existing placeholder (invisible to it
+            // by design), silently "succeeding" a second time with no
+            // actual second row, which is harmless but not the refusal a
+            // caller checking this return value expects.
+            return false;
+        }
+        self.pin_new_device_with_key_mode(nickname, device_id, &[], Trust::Tofu, None);
+        true
     }
 
     /// Overwrites the key already pinned for `(nickname, device_id)` in

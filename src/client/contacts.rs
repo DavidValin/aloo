@@ -883,3 +883,77 @@ pub async fn handle_pin_identity_card_for_device(
         }
     }
 }
+
+/// Signs `nickname`'s own already-loaded `pq_hybrid` keybundle into an
+/// identity card and writes it to `<dir>/<nickname>.aloo-card` - the pure
+/// half of `handle_export_own_identity_card`, taking the destination
+/// directory explicitly (rather than reaching for `platform::aloo_dir()`
+/// itself) so it's exercisable against a scratch directory in tests. `Ok`
+/// carries the path written and this bundle's safety phrase.
+pub fn export_own_identity_card_to(
+    private: &crate::crypto::pq::PqPrivateBundle,
+    public_der: &[u8],
+    nickname: &str,
+    dir: &Path,
+) -> Result<(PathBuf, String), String> {
+    let public = crate::proto::decode::<crate::crypto::pq::PqPublicBundle>(public_der)
+        .map_err(|_| "this session's own keybundle does not decode".to_string())?;
+    let card = crate::crypto::pq::make_identity_card(private, &public, nickname)
+        .map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let path = dir.join(format!("{nickname}.aloo-card"));
+    crate::crypto::pq::save_identity_card(&card, &path).map_err(|e| e.to_string())?;
+    let fp = crate::crypto::pq::bundle_fingerprint(&public).map_err(|e| e.to_string())?;
+    Ok((path, crate::crypto::safety::phrase(&fp)))
+}
+
+/// `UiAction::ExportOwnIdentityCard`'s handler - `/contacts`' `x`, the
+/// live-session equivalent of `aloo --export-identity-card <prefix>
+/// <nickname>`: no separate prefix/nickname arguments needed, since a
+/// live session already has both loaded. Writes to
+/// `~/.aloo/exports/<nickname>.aloo-card` (the same `~/.aloo/exports`
+/// root every other export already writes under, `client::export`) -
+/// never the server, never anywhere the CLI form's own working directory
+/// would put it, since a live session has no natural "current directory"
+/// notion. Purely local; never touches the network.
+pub async fn handle_export_own_identity_card(session: &SessionState, ui_state: &mut UiState) {
+    let dir = crate::platform::aloo_dir().join("exports");
+    match export_own_identity_card_to(
+        &session.own_pq_private,
+        &session.otp_own_pinned_der,
+        &ui_state.own_name,
+        &dir,
+    ) {
+        Ok((path, phrase)) => ui_state.push_status_notice(
+            format!(
+                "exported identity card (own pqhybrid key) to {} - safety phrase: {phrase}",
+                path.display()
+            ),
+            true,
+        ),
+        Err(e) => ui_state.push_status_notice(format!("could not export identity card: {e}"), false),
+    }
+}
+
+/// `UiAction::AddBareContact`'s handler - "Add contact" submitted with no
+/// identity card imported (yet). Reserves the placeholder
+/// (`IdStore::pin_bare_contact`) and refreshes the list right away, so the
+/// contact already shows - with all three key badges red - the moment
+/// this returns, whether or not the key-details popup that opens
+/// alongside it (`tui::contacts::submit_add_contact`) ever adds a key.
+/// `pin_bare_contact` refusing (a race with another action pinning the
+/// same slot between this popup opening and Enter) is silent here: the
+/// popup's own pre-submit duplicate check is what a user actually sees,
+/// and a lost race just leaves the real, already-pinned entry as it was.
+pub async fn handle_add_bare_contact(
+    session: &mut SessionState,
+    ui_state: &mut UiState,
+    nickname: String,
+    device_id: String,
+) {
+    session.id_store.pin_bare_contact(&nickname, &device_id);
+    if let Err(e) = session.id_store.save() {
+        crate::log_warn!("failed to save id_store: {e}");
+    }
+    handle_open(session, ui_state).await;
+}

@@ -172,6 +172,7 @@ the handshake (§1.3).
 | `Activate` | Answers a pending account's emailed activation code (§5.2) |
 | `Register` | Creates an account, if this server takes registrations (§5.3) |
 | `Identify` | Claims the logged-in nickname, announcing a public key and method (§5.4) |
+| `ChangePassword` | Changes the sender's own password, re-checking the old one (§5.1) |
 | `JoinChannel` | Joins or implicitly creates a channel (§6.1) |
 | `LeaveChannel` | Leaves one channel (§6.2) |
 | `DeleteChannel` | The channel admin deletes a public channel (§6.7) |
@@ -190,6 +191,7 @@ the handshake (§1.3).
 | `AdminActivate` | A superadmin clears whatever blocks an account's login (§5.5) |
 | `AdminRemoveAccount` | A superadmin removes an account and what it administers (§5.5) |
 | `AdminRemoveChannel` | A superadmin removes any public channel (§5.5) |
+| `RequestUsersList` | A superadmin asks for every registered user and what they administer (§5.5) |
 
 | Server → client | Purpose |
 |---|---|
@@ -197,6 +199,8 @@ the handshake (§1.3).
 | `AuthResult` | Whether login succeeded, or is waiting on activation (§5.1, §5.2) |
 | `RegisterResult` | Whether `Register` created an account (§5.3) |
 | `IdentifyResult` | Whether the nickname was granted, and this client's `UserId` (§5.4) |
+| `ChangePasswordResult` | Whether `ChangePassword` succeeded (§5.1) |
+| `UsersList` | Answers `RequestUsersList`: every registered user and what they administer (§5.5) |
 | `ChannelList` | The public channels and every current superadmin nickname, once, after identifying (§6.3, §5.5) |
 | `Joined` | Confirms a join, last in the join snapshot (§6.1) |
 | `ChannelJoinFailed` | A join failed for a non-password reason (§6.1) |
@@ -726,6 +730,23 @@ true, activation_pending: false, reason: None }`, and the client's next
 message must be `Identify` (§5.4). One still awaiting activation answers
 `ok: false, activation_pending: true` instead - see §5.2.
 
+**Changing your own password.** Once fully connected (past `Identify`,
+§5.4), either side of the pair can be rotated:
+
+```
+ChangePassword { old_password: string, new_password: string }
+ChangePasswordResult { ok: bool, reason: string? }
+```
+
+`old_password` is re-derived and compared exactly like `Auth` would - the
+connection having once authenticated is not itself trusted as ongoing
+proof of the current password, since it may have been changed by another
+session since. A wrong `old_password`, or an empty `new_password`,
+answers `ok: false` with a reason and changes nothing; success answers
+`ok: true`. Unlike `AuthResult { ok: false }`, the connection is never
+closed either way - this is an ordinary authenticated request, not part
+of the handshake.
+
 ### 5.2 Activation
 
 An account created by `Register` (§5.3) is not usable until its emailed
@@ -734,16 +755,26 @@ code is given back, one way or another:
 - **In the client.** A login whose credentials are right but whose
   account is `activation_pending` may send exactly one `Activate {
   code }` in reply, answered with another `AuthResult`. The right code
-  continues the handshake into `Identify`; a wrong one, or one more than
-  `ACTIVATION_VALIDITY_SECS` (one hour) past the account's registration
-  time, refuses and the server closes the connection - the account must
-  be registered again once its code has expired. The client's own
-  activation popup reaches this path two ways: opened automatically the
-  instant `Register` succeeds ("Enter the activation code you received
-  by email"), or opened on a later `Connect` attempt against an account
-  still `activation_pending` ("`<nickname>` is registered but not
-  activated yet..."). Either way it is the same popup, retrying the same
-  `Activate` exchange until it succeeds or the user cancels.
+  continues the handshake into `Identify`; a wrong one refuses and the
+  server closes the connection. A code more than `ACTIVATION_VALIDITY_SECS`
+  (one hour) past the account's registration time is expired - rather
+  than an outright refusal, the server first tries to reissue a fresh
+  code and email it to the same address on file, exactly as registering
+  the same nickname again already does (§5.3); this succeeds whenever
+  there is an SMTP relay configured and an email on file to send to (a
+  `register_manual` account, with no email at all, never has a pending
+  activation to reissue in the first place), in which case the login
+  attempt proceeds into the same "send `Activate`" exchange as an
+  unexpired pending activation, now against the fresh code. Only when a
+  fresh code cannot be sent does the connection close on the unchanged
+  expiry refusal, the account still needing a fresh `Register` to recover.
+  The client's own activation popup reaches this path two ways: opened
+  automatically the instant `Register` succeeds ("Enter the activation
+  code you received by email"), or opened on a later `Connect` attempt
+  against an account still `activation_pending` ("`<nickname>` is
+  registered but not activated yet..."). Either way it is the same
+  popup, retrying the same `Activate` exchange until it succeeds or the
+  user cancels.
 - **In a browser.** The activation email also names an HTTP(S) endpoint
   (`server_activation_port`, over TLS when `server_ssl` is on) that takes
   the same nickname and code and does the identical check. More than ten
@@ -816,7 +847,7 @@ or because the server's heartbeat check decided it was dead (§4.1).
 ### 5.5 Superadmin account status
 
 `server_superadmin` names zero or more nicknames (one settings-file line
-each) that may send any of the four messages below. Every one of them is
+each) that may send any of the five messages below. Every one of them is
 checked server-side against that list on every call, regardless of
 anything the client asserts about itself; a sender not on the list gets
 `Error { message }` and nothing else happens. The same list, unchanged for
@@ -826,14 +857,22 @@ existing connect-time message rather than a second one sent right after
 it, specifically so the number of messages a fresh connect delivers never
 changes. A nickname's superadmin status is shown to everyone (a marker in
 the sidebar and the user-info popup, `docs/SPEC.md`), not only used to
-gate these four messages.
+gate these five messages.
 
 ```
 AdminDeactivate { nickname: string, reason: string }
 AdminActivate { nickname: string }
 AdminRemoveAccount { nickname: string }
 AdminRemoveChannel { name: string }
+RequestUsersList
 ```
+
+**`RequestUsersList`, read-only.** Answered with `UsersList { users:
+[{ nickname: string, admin_of: [string] }] }` - every registered
+nickname, each with the public channels it currently administers (empty
+for one administering none). Unlike the other four, this changes nothing
+- it exists so a superadmin can see the whole registry's shape (who
+exists, who administers what) without reading server-side files by hand.
 
 **Account status is one model, reached two ways.** An account can be
 blocked from logging in by either of two independent conditions: a still-
@@ -2960,7 +2999,13 @@ nickname):
 e.g. `alice\tlaptop\t30820122300d06092a864886f70d01010105000382010f00...\ttofu\t203.0.113.7:51820\t1700000000\tpqhybrid\t\n` -
 the full DER bytes, lowercase-hex-encoded (lowercase hex, the same
 encoding the fingerprint already uses, not base64 or raw bytes) so
-the file stays plain text no matter what the key bytes are; `device_id`
+the file stays plain text no matter what the key bytes are, unless it is
+itself empty - a *bare contact* placeholder (`IdStore::pin_bare_contact`,
+`/contacts`' "Add contact" with no identity card): a reserved
+`(nickname, device_id)` slot with no key at all yet, invisible to every
+reader of "the pinned key" (`get_for_device`, `get`, `check_key` all skip
+it), that the first real key later pinned to the same slot silently fills
+in place rather than sitting beside as a second entry; `device_id`
 is the primary-key half of `(nickname, device_id)` - empty for an
 *unbound* entry (§12.4's phase-1 provisional pin, or a pin imported from
 an identity card, §12.6, neither of which has a confirmed device yet);
@@ -3146,14 +3191,19 @@ alongside each pad-protected message, checked strictly *before* the
 pad-consuming decrypt ever runs - see §16.2 for why that ordering is the
 whole point.
 
-**Device id.** Each installation generates a random 50-character
-lowercase-hex id the first time one is needed and reuses it for that
-machine's whole lifetime: `crypto::random_bytes(25)` hex-encoded, written
-to `~/.aloo/d_id` (`client::device_id::load_or_create`) and read back
-as-is on every later run rather than regenerated. An empty string is
-reserved internally as `id_store`'s "unbound" sentinel (§12.4), so an
-announced device id that decodes to empty (or fails to decode as UTF-8 at
-all) is refused outright rather than cached
+**Device id.** Each installation generates a random 8-character
+lowercase-hex id the first time it connects as a given nickname, and
+reuses it for that nickname's whole lifetime: `crypto::random_bytes(4)`
+hex-encoded, checked against every id already on file (any nickname) so
+one machine never assigns the same id twice, then written alongside that
+nickname to `~/.aloo/d_id` (`client::device_id::load_or_create`, one
+`nickname\tdevice_id` line per nickname this machine has used) and read
+back as-is on every later run rather than regenerated. A machine used
+under several nicknames gets a distinct id per nickname. An empty string
+is reserved internally as `id_store`'s "unbound" sentinel (§12.4), so an
+announced device id that decodes to empty, fails to decode as UTF-8, or
+contains a tab/newline (which would corrupt this file's own line format)
+is refused outright rather than cached
 (`client::device_id::accept_announced`) - a peer must never be able to
 plant the sentinel value themselves.
 

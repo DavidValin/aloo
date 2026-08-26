@@ -356,15 +356,18 @@ async fn pins_the_new_key(w: &mut AlooWorld, holder: String, subject: String, su
     let new_der = aloo::client::connect::resolve_my_keypair(&new_identity)
         .expect("new identity should resolve")
         .public_der;
-    // The real device_id this test process's own session actually
-    // announces - the same ambient `~/.aloo/d_id` every live session in
-    // this run reads (`client::device_id::load_or_create`), not the
-    // arbitrary label the pre-existing pin was seeded under: `Accept`
-    // files the new key under whichever device the connection actually
-    // announced, additively, never reusing the old device's own entry.
-    let real_device_id =
-        aloo::client::device_id::load_or_create(&aloo::client::device_id::default_path())
-            .expect("this process's own device id should resolve");
+    // The real device_id `subject`'s own live session actually announces
+    // - the same ambient `~/.aloo/d_id` every live session in this run
+    // reads (`client::device_id::load_or_create`), keyed to `subject`'s
+    // own nickname - not the arbitrary label the pre-existing pin was
+    // seeded under: `Accept` files the new key under whichever device the
+    // connection actually announced, additively, never reusing the old
+    // device's own entry.
+    let real_device_id = aloo::client::device_id::load_or_create(
+        &aloo::client::device_id::default_path(),
+        &subject,
+    )
+    .expect("this process's own device id should resolve");
     assert_eq!(
         store.get_for_device(&subject, &real_device_id),
         Some(new_der.as_slice()),

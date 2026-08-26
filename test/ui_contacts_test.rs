@@ -77,6 +77,48 @@ fn set_contacts_rows_populates_the_modal_and_clamps_selection() {
     assert_eq!(state.contacts.as_ref().unwrap().selected, 0);
 }
 
+/// `rows.len()` is itself a valid selection - the Export identity card
+/// button, one past the last real row - so a refresh that leaves the row
+/// count unchanged must not clamp the selection away from it and land
+/// back on the last real row instead.
+/// @requirement AC-370
+#[test]
+fn set_contacts_rows_preserves_the_button_selection_across_a_same_size_refresh() {
+    let mut state = joined_general_with(vec![]);
+    state.open_contacts();
+    state.set_contacts_rows(vec![row("alice", None), row("bob", None)]);
+    press(&mut state, KeyCode::Up); // -> the button, index 2
+    assert_eq!(state.contacts.as_ref().unwrap().selected, 2);
+
+    // A refresh with the same two rows (e.g. after `r`, or any action
+    // that re-gathers the list without actually changing its length).
+    state.set_contacts_rows(vec![row("alice", None), row("bob", None)]);
+    assert_eq!(
+        state.contacts.as_ref().unwrap().selected,
+        2,
+        "the button selection must survive a refresh that doesn't change the row count"
+    );
+}
+
+/// A refresh that actually shrinks the list still clamps a stale
+/// selection sensibly - to the button, the new last valid index, not an
+/// out-of-bounds row.
+/// @requirement AC-370
+#[test]
+fn set_contacts_rows_clamps_a_stale_selection_to_the_button_when_rows_shrink() {
+    let mut state = joined_general_with(vec![]);
+    state.open_contacts();
+    state.set_contacts_rows(vec![row("alice", None), row("bob", None), row("carol", None)]);
+    press(&mut state, KeyCode::Up);
+    press(&mut state, KeyCode::Up);
+    assert_eq!(state.contacts.as_ref().unwrap().selected, 2, "on carol");
+
+    // carol is gone now - only one row left, so the highest valid index
+    // is 1 (the button).
+    state.set_contacts_rows(vec![row("alice", None)]);
+    assert_eq!(state.contacts.as_ref().unwrap().selected, 1);
+}
+
 #[test]
 fn set_contacts_rows_is_a_no_op_once_the_modal_is_closed() {
     let mut state = joined_general_with(vec![]);
@@ -103,8 +145,15 @@ fn up_and_down_wrap_around_the_row_list() {
     press(&mut state, KeyCode::Up);
     assert_eq!(
         state.contacts.as_ref().unwrap().selected,
+        3,
+        "Up from the first row wraps to the Export identity card button, \
+         one past the last real row"
+    );
+    press(&mut state, KeyCode::Up);
+    assert_eq!(
+        state.contacts.as_ref().unwrap().selected,
         2,
-        "Up from the first row wraps to the last"
+        "Up from the button wraps to the last real row"
     );
 }
 
@@ -182,34 +231,9 @@ fn esc_on_the_delete_confirmation_returns_to_the_list() {
 // ---------------------------------------------------------------------
 
 #[test]
-fn o_on_an_ineligible_contact_refuses_and_shows_a_status_notice() {
-    let mut state = joined_general_with(vec![]);
-    state.open_contacts();
-    state.set_contacts_rows(vec![row("alice", Some(KeyMode::PqHybrid))]);
-    let action = press(&mut state, KeyCode::Char('o'));
-    assert!(action.is_none());
-    assert!(state.contacts.as_ref().unwrap().install.is_none());
-    assert!(state.status_notice.is_some());
-}
-
-#[test]
-fn o_on_an_eligible_contact_opens_the_install_popup_focused_on_enc_path() {
-    let mut state = joined_general_with(vec![]);
-    state.open_contacts();
-    state.set_contacts_rows(vec![otp_eligible_row("alice")]);
-    press(&mut state, KeyCode::Char('o'));
-    let install = state.contacts.as_ref().unwrap().install.as_ref().expect("popup open");
-    assert_eq!(install.focus, InstallField::EncPath);
-    assert_eq!(install.enc_path, "");
-    assert_eq!(install.dec_path, "");
-}
-
-#[test]
 fn tab_cycles_enc_dec_install_and_wraps() {
     let mut state = joined_general_with(vec![]);
-    state.open_contacts();
-    state.set_contacts_rows(vec![otp_eligible_row("alice")]);
-    press(&mut state, KeyCode::Char('o'));
+    open_install_popup(&mut state, "alice");
 
     press(&mut state, KeyCode::Tab);
     assert_eq!(
@@ -242,7 +266,13 @@ fn tab_cycles_enc_dec_install_and_wraps() {
 fn open_install_popup(state: &mut aloo::client::tui::ui::UiState, nickname: &str) {
     state.open_contacts();
     state.set_contacts_rows(vec![otp_eligible_row(nickname)]);
-    press(state, KeyCode::Char('o'));
+    // Right: Pqh -> Otp. Enter opens the OTP badge's own details popup;
+    // Enter again, with no key present yet, opens "Install manually"
+    // directly - the only way to reach this popup now that `/contacts`'
+    // own `o` shortcut is gone.
+    press(state, KeyCode::Right);
+    press(state, KeyCode::Enter);
+    press(state, KeyCode::Enter);
 }
 
 fn overwrite_browser(state: &mut aloo::client::tui::ui::UiState, root: &std::path::Path) {
@@ -554,6 +584,91 @@ fn an_empty_list_says_so_instead_of_an_empty_box() {
     state.open_contacts();
     let body = popup_body(&buffer_at(&state, 140, 30), "Contacts").join("\n");
     assert!(body.contains("no contacts pinned yet"));
+    assert!(
+        body.contains("Export identity card"),
+        "the export button must still show with no contacts pinned yet: {body}"
+    );
+}
+
+/// The button is one past the last real row - always present, reachable
+/// even with an empty list, and Enter on it exports rather than opening
+/// a key-details popup.
+/// @requirement AC-370
+#[test]
+fn enter_on_the_export_button_sends_exportownidentitycard() {
+    let mut state = joined_general_with(vec![]);
+    state.open_contacts();
+    state.set_contacts_rows(vec![row("alice", None), row("bob", None)]);
+    assert_eq!(state.contacts.as_ref().unwrap().selected, 0);
+
+    press(&mut state, KeyCode::Up);
+    assert_eq!(
+        state.contacts.as_ref().unwrap().selected,
+        2,
+        "Up from the first row lands on the button (index 2, one past the last row)"
+    );
+    let action = press(&mut state, KeyCode::Enter);
+    assert_eq!(action, Some(UiAction::ExportOwnIdentityCard));
+    assert!(
+        state.contacts.as_ref().unwrap().detail.is_none(),
+        "Enter on the button must not open a key-details popup"
+    );
+}
+
+/// Even with zero contacts, the only selectable entry is the button, and
+/// Enter on it still exports - the export doesn't depend on having any
+/// contacts pinned.
+/// @requirement AC-370
+#[test]
+fn enter_on_the_export_button_works_with_no_contacts_at_all() {
+    let mut state = joined_general_with(vec![]);
+    state.open_contacts();
+    let action = press(&mut state, KeyCode::Enter);
+    assert_eq!(action, Some(UiAction::ExportOwnIdentityCard));
+}
+
+/// Down from the last real row lands on the button, not back on the
+/// first row - the button genuinely sits at the end of the list.
+/// @requirement AC-370
+#[test]
+fn down_from_the_last_row_reaches_the_button() {
+    let mut state = joined_general_with(vec![]);
+    state.open_contacts();
+    state.set_contacts_rows(vec![row("alice", None), row("bob", None)]);
+    press(&mut state, KeyCode::Down);
+    assert_eq!(state.contacts.as_ref().unwrap().selected, 1);
+    press(&mut state, KeyCode::Down);
+    assert_eq!(state.contacts.as_ref().unwrap().selected, 2, "one past the last row");
+    let action = press(&mut state, KeyCode::Enter);
+    assert_eq!(action, Some(UiAction::ExportOwnIdentityCard));
+}
+
+/// `d`/Delete and Left/Right all target a specific contact's row or key
+/// column - neither makes sense on the button, and neither should do
+/// anything when it's selected.
+/// @requirement AC-370
+#[test]
+fn row_specific_keys_are_no_ops_on_the_export_button() {
+    let mut state = joined_general_with(vec![]);
+    state.open_contacts();
+    state.set_contacts_rows(vec![row("alice", None)]);
+    press(&mut state, KeyCode::Up); // -> the button (index 1)
+    assert_eq!(state.contacts.as_ref().unwrap().selected, 1);
+
+    let before_key = state.contacts.as_ref().unwrap().selected_key;
+    assert_eq!(press(&mut state, KeyCode::Left), None);
+    assert_eq!(press(&mut state, KeyCode::Right), None);
+    assert_eq!(
+        state.contacts.as_ref().unwrap().selected_key,
+        before_key,
+        "Left/Right must not change the key cursor while the button is selected"
+    );
+
+    assert_eq!(press(&mut state, KeyCode::Char('d')), None);
+    assert!(
+        state.contacts.as_ref().unwrap().confirm_delete.is_none(),
+        "'d' on the button must not open a delete confirmation"
+    );
 }
 
 #[test]
@@ -912,6 +1027,19 @@ fn esc_on_the_pqh_browser_returns_to_the_details_popup() {
 // "Add contact" (device-pinning plan §3)
 // ---------------------------------------------------------------------
 
+/// `x` on the contacts list exports this client's own identity card -
+/// available even with an empty list, since it names nothing about who
+/// else is pinned.
+/// @requirement AC-370
+#[test]
+fn x_on_the_contacts_list_sends_exportownidentitycard() {
+    let mut state = joined_general_with(vec![]);
+    state.open_contacts();
+    state.set_contacts_rows(vec![]);
+    let action = press(&mut state, KeyCode::Char('x'));
+    assert_eq!(action, Some(UiAction::ExportOwnIdentityCard));
+}
+
 /// @requirement AC-323
 #[test]
 fn a_opens_the_add_contact_popup_focused_on_nickname() {
@@ -968,16 +1096,27 @@ fn submitting_an_empty_nickname_shows_a_validation_error_and_stays_open() {
     assert!(add.error.is_some(), "an empty nickname must be refused, not silently accepted");
 }
 
+/// The identity card is optional (task: "if not set, the contact is
+/// created with no keys ... he can do that later"), and a device_id isn't
+/// needed to reach it - a blank one just means the nickname's shared
+/// unbound slot rather than one specific device.
 /// @requirement AC-323
 #[test]
-fn submitting_an_empty_device_id_shows_a_validation_error() {
+fn submitting_a_blank_device_id_is_accepted_and_opens_the_unbound_key_details_popup() {
     let mut state = joined_general_with(vec![]);
     state.open_contacts();
     press(&mut state, KeyCode::Char('a'));
     type_str(&mut state, "alice");
-    press(&mut state, KeyCode::Enter);
-    let add = state.contacts.as_ref().unwrap().add_contact.as_ref().expect("still open");
-    assert!(add.error.is_some(), "an empty device id must be refused too");
+    let action = press(&mut state, KeyCode::Enter);
+    assert_eq!(
+        action,
+        Some(UiAction::AddBareContact { nickname: "alice".to_string(), device_id: String::new() }),
+        "submit must reserve the bare placeholder even with no device_id typed"
+    );
+    let detail = state.contacts.as_ref().unwrap().detail.as_ref().expect("key details popup open");
+    assert_eq!(detail.nickname, "alice");
+    assert_eq!(detail.device_id, None, "a blank device_id opens the unbound row, not a bound one");
+    assert!(detail.new_contact);
 }
 
 /// Add Contact only ever creates a brand-new entry - trying to reuse a
@@ -998,10 +1137,29 @@ fn submitting_an_already_pinned_nickname_and_device_is_refused() {
     assert!(add.error.is_some());
 }
 
+/// A blank device_id claims the nickname's shared unbound slot - refused
+/// the same way if that slot is already taken by a row of its own,
+/// mirroring the bound-device_id duplicate check above.
+/// @requirement AC-323
+#[test]
+fn submitting_a_blank_device_id_when_an_unbound_row_already_exists_is_refused() {
+    let mut state = joined_general_with(vec![]);
+    state.open_contacts();
+    state.set_contacts_rows(vec![ContactRow { device_id: None, ..row("alice", None) }]);
+    press(&mut state, KeyCode::Char('a'));
+    type_str(&mut state, "alice");
+    let action = press(&mut state, KeyCode::Enter);
+    assert!(action.is_none(), "a refused submission must not reserve anything");
+    let add = state.contacts.as_ref().unwrap().add_contact.as_ref().expect("still open");
+    assert!(add.error.is_some());
+}
+
 /// Valid nickname+device_id transitions straight into the same
 /// key-details popup Enter-on-a-row opens, marked as a new contact so
 /// PQH's "Create key" knows to bind directly to this device rather than
-/// the nickname's shared unbound entry.
+/// the nickname's shared unbound entry - and reserves the bare placeholder
+/// right away (`UiAction::AddBareContact`), so the contact exists even if
+/// this popup is left without ever adding a key.
 /// @requirement AC-323
 #[test]
 fn valid_nickname_and_device_id_open_the_key_details_popup_as_a_new_contact() {
@@ -1011,8 +1169,12 @@ fn valid_nickname_and_device_id_open_the_key_details_popup_as_a_new_contact() {
     type_str(&mut state, "alice");
     press(&mut state, KeyCode::Tab);
     type_str(&mut state, "laptop");
-    press(&mut state, KeyCode::Enter);
+    let action = press(&mut state, KeyCode::Enter);
 
+    assert_eq!(
+        action,
+        Some(UiAction::AddBareContact { nickname: "alice".to_string(), device_id: "laptop".to_string() })
+    );
     assert!(state.contacts.as_ref().unwrap().add_contact.is_none(), "the add-contact popup itself is gone");
     let detail = state.contacts.as_ref().unwrap().detail.as_ref().expect("key details popup open");
     assert_eq!(detail.nickname, "alice");
@@ -1021,8 +1183,11 @@ fn valid_nickname_and_device_id_open_the_key_details_popup_as_a_new_contact() {
     assert!(detail.new_contact);
 }
 
-/// Esc at any point before a key is actually added leaves nothing behind
-/// - the whole point of gating creation on a real key, not the form.
+/// Esc at any point after submit leaves the popup layer itself with
+/// nothing further to show - the actual bare-contact persistence
+/// `AddBareContact` triggers lives in `SessionState`/`IdStore`, outside
+/// this pure `UiState` harness (proven end to end in
+/// `contacts_add_test.rs`'s `esc_after_submitting_with_no_card_still_leaves_a_bare_contact_pinned`).
 /// @requirement AC-323
 #[test]
 fn esc_on_the_add_contact_popup_cancels_without_creating_anything() {
