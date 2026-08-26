@@ -6,7 +6,7 @@ edition = "2024"
 authors = ["David Valin <hola@davidvalin.com>"]
 homepage = "https://crates.io/crates/aloo"
 repository = "https://github.com/DavidValin/aloo"
-description = "secure terminal walky-talky / chat / file transfer"
+description = "ultra secure terminal walky-talky / chat / file transfer"
 license-file = "LICENSE"
 readme = "README.md"
 
