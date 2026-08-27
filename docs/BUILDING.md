@@ -61,7 +61,11 @@ cross build --release --target <target-triple>
 for what each step does and why. This needs a working local Docker
 install; the containers it spins up download and compile several C
 libraries from source, so expect real CPU/disk/network use and a build
-that takes noticeably longer than a native one.
+that takes noticeably longer than a native one. Those downloads are the
+main flaky part: each is retried and checksummed, and every pre-build
+script starts with `set -e` so a step that still fails aborts the build
+right there, naming itself, rather than letting a later step fail for a
+reason that looks unrelated.
 
 ## Linux (musl, static)
 

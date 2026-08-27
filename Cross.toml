@@ -3,6 +3,10 @@
 # target-arch package inside the build container before cargo runs.
 [target.aarch64-unknown-linux-gnu]
 pre-build = [
+    # See [target.x86_64-unknown-linux-musl] below for why `set -e` is
+    # the first entry of every pre-build script here.
+    "set -e",
+
     "dpkg --add-architecture arm64",
     "apt-get update && apt-get install --assume-yes libasound2-dev:arm64",
 ]
@@ -50,7 +54,18 @@ passthrough = ["PKG_CONFIG_ALLOW_CROSS", "PKG_CONFIG_ALL_STATIC"]
 
 [target.x86_64-unknown-linux-musl]
 pre-build = [
-    "curl -sSL -o /tmp/alsa-lib-1.2.16.1.tar.bz2 https://www.alsa-project.org/files/pub/lib/alsa-lib-1.2.16.1.tar.bz2",
+    # `cross` concatenates these entries into a single /bin/sh script run by
+    # one `RUN eval "${CROSS_CMD}"` Dockerfile layer, and sh only reports the
+    # *last* command's status, so without this a failing step midway through
+    # is silently ignored and the build limps on to fail later somewhere
+    # unrelated. (A transient `curl` timeout on the libtool download once
+    # surfaced 10 steps downstream as PulseAudio's configure reporting
+    # "Unable to find libltdl version 2".) `set -e` runs first so any step
+    # that fails stops the layer right there, with that step's own error as
+    # the last thing in the log.
+    "set -e",
+
+    "curl -fsSL --retry 5 --retry-delay 2 --retry-connrefused --connect-timeout 30 -o /tmp/alsa-lib-1.2.16.1.tar.bz2 https://www.alsa-project.org/files/pub/lib/alsa-lib-1.2.16.1.tar.bz2",
     "echo 'f740db7f488255944ffd4428416ee3390a96742856916433df468c281436480e  /tmp/alsa-lib-1.2.16.1.tar.bz2' | sha256sum -c -",
     "tar xjf /tmp/alsa-lib-1.2.16.1.tar.bz2 -C /tmp",
     "cd /tmp/alsa-lib-1.2.16.1 && CC=x86_64-linux-musl-gcc AR=x86_64-linux-musl-ar RANLIB=x86_64-linux-musl-ranlib CFLAGS=-fPIE ./configure --host=x86_64-linux-musl --disable-shared --enable-static --disable-python --with-configdir=/usr/share/alsa --with-plugindir=/usr/lib/alsa-lib && make -j$(nproc) && make install",
@@ -79,7 +94,7 @@ pre-build = [
     # .tar.xz only, and this image has no `xz` binary (only `tar`, which
     # shells out to one). The GitHub tag archive has no pre-generated
     # `./configure`, so it's regenerated below with autoreconf.
-    "curl -sSL https://github.com/pulseaudio/pulseaudio/archive/refs/tags/v14.2.tar.gz -o /tmp/pulseaudio.tar.gz",
+    "curl -fsSL --retry 5 --retry-delay 2 --retry-connrefused --connect-timeout 30 https://github.com/pulseaudio/pulseaudio/archive/refs/tags/v14.2.tar.gz -o /tmp/pulseaudio.tar.gz",
     "echo '5368b7a7e1dd7b0bd7734611309e46f6b3685c4213a3b72fc88d38b4b00ce62c  /tmp/pulseaudio.tar.gz' | sha256sum -c -",
     "tar xzf /tmp/pulseaudio.tar.gz -C /tmp",
 
@@ -93,7 +108,7 @@ pre-build = [
     # libsndfile's own format support is ever exercised here either -
     # PulseAudio only needs the library to link against, not to decode
     # anything through it.
-    "curl -sSL https://github.com/libsndfile/libsndfile/archive/refs/tags/1.2.2.tar.gz -o /tmp/libsndfile.tar.gz",
+    "curl -fsSL --retry 5 --retry-delay 2 --retry-connrefused --connect-timeout 30 https://github.com/libsndfile/libsndfile/archive/refs/tags/1.2.2.tar.gz -o /tmp/libsndfile.tar.gz",
     "echo 'ffe12ef8add3eaca876f04087734e6e8e029350082f3251f565fa9da55b52121  /tmp/libsndfile.tar.gz' | sha256sum -c -",
     "tar xzf /tmp/libsndfile.tar.gz -C /tmp",
     "mkdir -p /tmp/libsndfile-1.2.2/build && cd /tmp/libsndfile-1.2.2/build && cmake .. -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=x86_64 -DCMAKE_C_COMPILER=x86_64-linux-musl-gcc -DCMAKE_AR=/usr/local/bin/x86_64-linux-musl-ar -DCMAKE_RANLIB=/usr/local/bin/x86_64-linux-musl-ranlib -DCMAKE_C_FLAGS=-fPIE -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local -DBUILD_SHARED_LIBS=OFF -DENABLE_EXTERNAL_LIBS=OFF -DENABLE_MPEG=OFF -DBUILD_PROGRAMS=OFF -DBUILD_EXAMPLES=OFF -DBUILD_TESTING=OFF -DENABLE_CPACK=OFF && make -j$(nproc) && make install",
@@ -108,7 +123,13 @@ pre-build = [
     # from that directory installs nothing usable) - `--enable-ltdl-install`
     # is what tells its build system this is a real standalone install
     # rather than an in-tree convenience library.
-    "curl -sSL https://ftp.gnu.org/gnu/libtool/libtool-2.4.7.tar.gz -o /tmp/libtool.tar.gz",
+    #
+    # ftp.gnu.org is the least reliable host of the sources fetched here
+    # (it has timed out mid-release before), so ftpmirror.gnu.org - GNU's
+    # own redirector to a nearby mirror - is tried first, with ftp.gnu.org
+    # as the fallback. Whichever answers, the pinned sha256 below is what
+    # actually decides the bytes are the right ones.
+    "curl -fsSL --retry 5 --retry-delay 2 --retry-connrefused --connect-timeout 30 https://ftpmirror.gnu.org/gnu/libtool/libtool-2.4.7.tar.gz -o /tmp/libtool.tar.gz || curl -fsSL --retry 5 --retry-delay 2 --retry-connrefused --connect-timeout 30 https://ftp.gnu.org/gnu/libtool/libtool-2.4.7.tar.gz -o /tmp/libtool.tar.gz",
     "echo '04e96c2404ea70c590c546eba4202a4e12722c640016c12b9b2f1ce3d481e9a8  /tmp/libtool.tar.gz' | sha256sum -c -",
     "tar xzf /tmp/libtool.tar.gz -C /tmp",
     "cd /tmp/libtool-2.4.7/libltdl && CC=x86_64-linux-musl-gcc AR=x86_64-linux-musl-ar RANLIB=x86_64-linux-musl-ranlib CFLAGS=-fPIE ./configure --host=x86_64-linux-musl --prefix=/usr/local --disable-shared --enable-static --enable-ltdl-install && make -j$(nproc) && make install",
@@ -128,7 +149,7 @@ pre-build = [
     # `src/pulsecore/i18n.h` never defines ENABLE_NLS and so falls back to
     # its own no-op `#define dgettext(Domain,String) (String)` etc - no
     # libintl needed either way.
-    "curl -sSL https://codeload.github.com/sabotage-linux/gettext-tiny/tar.gz/refs/tags/v0.3.3 -o /tmp/gettext-tiny.tar.gz",
+    "curl -fsSL --retry 5 --retry-delay 2 --retry-connrefused --connect-timeout 30 https://codeload.github.com/sabotage-linux/gettext-tiny/tar.gz/refs/tags/v0.3.3 -o /tmp/gettext-tiny.tar.gz",
     "echo 'daff8b4a7863745710ec0b02657fd20bda2d90398f54945751259bb94d6ebffd  /tmp/gettext-tiny.tar.gz' | sha256sum -c -",
     "tar xzf /tmp/gettext-tiny.tar.gz -C /tmp",
     "cp /tmp/gettext-tiny-0.3.3/m4/*.m4 /tmp/pulseaudio-14.2/m4/",
@@ -146,7 +167,7 @@ pre-build = [
     # rather than relying on `curl -o` to create the parent directory,
     # which it doesn't.
     "mkdir -p /tmp/pulseaudio-14.2/build-aux",
-    "curl -sSL https://raw.githubusercontent.com/coreutils/gnulib/9388edc18a2c1de1ae9f58cef2446e1c1116bf36/build-aux/config.rpath -o /tmp/pulseaudio-14.2/build-aux/config.rpath",
+    "curl -fsSL --retry 5 --retry-delay 2 --retry-connrefused --connect-timeout 30 https://raw.githubusercontent.com/coreutils/gnulib/9388edc18a2c1de1ae9f58cef2446e1c1116bf36/build-aux/config.rpath -o /tmp/pulseaudio-14.2/build-aux/config.rpath",
     "echo 'fc70d6138bc62e8ea8080602b607f38d56c4def03ec4d523d516b338cff41df9  /tmp/pulseaudio-14.2/build-aux/config.rpath' | sha256sum -c -",
 
     # Drop the po/ (translations) subdirectory and the AM_GNU_GETTEXT*
@@ -205,32 +226,43 @@ passthrough = ["PKG_CONFIG_ALLOW_CROSS", "PKG_CONFIG_ALL_STATIC"]
 
 [target.aarch64-unknown-linux-musl]
 pre-build = [
-    "curl -sSL -o /tmp/alsa-lib-1.2.16.1.tar.bz2 https://www.alsa-project.org/files/pub/lib/alsa-lib-1.2.16.1.tar.bz2",
+    # `cross` concatenates these entries into a single /bin/sh script run by
+    # one `RUN eval "${CROSS_CMD}"` Dockerfile layer, and sh only reports the
+    # *last* command's status, so without this a failing step midway through
+    # is silently ignored and the build limps on to fail later somewhere
+    # unrelated. (A transient `curl` timeout on the libtool download once
+    # surfaced 10 steps downstream as PulseAudio's configure reporting
+    # "Unable to find libltdl version 2".) `set -e` runs first so any step
+    # that fails stops the layer right there, with that step's own error as
+    # the last thing in the log.
+    "set -e",
+
+    "curl -fsSL --retry 5 --retry-delay 2 --retry-connrefused --connect-timeout 30 -o /tmp/alsa-lib-1.2.16.1.tar.bz2 https://www.alsa-project.org/files/pub/lib/alsa-lib-1.2.16.1.tar.bz2",
     "echo 'f740db7f488255944ffd4428416ee3390a96742856916433df468c281436480e  /tmp/alsa-lib-1.2.16.1.tar.bz2' | sha256sum -c -",
     "tar xjf /tmp/alsa-lib-1.2.16.1.tar.bz2 -C /tmp",
     "cd /tmp/alsa-lib-1.2.16.1 && CC=aarch64-linux-musl-gcc AR=aarch64-linux-musl-ar RANLIB=aarch64-linux-musl-ranlib CFLAGS=-fPIE ./configure --host=aarch64-linux-musl --disable-shared --enable-static --disable-python --with-configdir=/usr/share/alsa --with-plugindir=/usr/lib/alsa-lib && make -j$(nproc) && make install",
 
-    "curl -sSL https://github.com/pulseaudio/pulseaudio/archive/refs/tags/v14.2.tar.gz -o /tmp/pulseaudio.tar.gz",
+    "curl -fsSL --retry 5 --retry-delay 2 --retry-connrefused --connect-timeout 30 https://github.com/pulseaudio/pulseaudio/archive/refs/tags/v14.2.tar.gz -o /tmp/pulseaudio.tar.gz",
     "echo '5368b7a7e1dd7b0bd7734611309e46f6b3685c4213a3b72fc88d38b4b00ce62c  /tmp/pulseaudio.tar.gz' | sha256sum -c -",
     "tar xzf /tmp/pulseaudio.tar.gz -C /tmp",
 
-    "curl -sSL https://github.com/libsndfile/libsndfile/archive/refs/tags/1.2.2.tar.gz -o /tmp/libsndfile.tar.gz",
+    "curl -fsSL --retry 5 --retry-delay 2 --retry-connrefused --connect-timeout 30 https://github.com/libsndfile/libsndfile/archive/refs/tags/1.2.2.tar.gz -o /tmp/libsndfile.tar.gz",
     "echo 'ffe12ef8add3eaca876f04087734e6e8e029350082f3251f565fa9da55b52121  /tmp/libsndfile.tar.gz' | sha256sum -c -",
     "tar xzf /tmp/libsndfile.tar.gz -C /tmp",
     "mkdir -p /tmp/libsndfile-1.2.2/build && cd /tmp/libsndfile-1.2.2/build && cmake .. -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=aarch64 -DCMAKE_C_COMPILER=aarch64-linux-musl-gcc -DCMAKE_AR=/usr/local/bin/aarch64-linux-musl-ar -DCMAKE_RANLIB=/usr/local/bin/aarch64-linux-musl-ranlib -DCMAKE_C_FLAGS=-fPIE -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local -DBUILD_SHARED_LIBS=OFF -DENABLE_EXTERNAL_LIBS=OFF -DENABLE_MPEG=OFF -DBUILD_PROGRAMS=OFF -DBUILD_EXAMPLES=OFF -DBUILD_TESTING=OFF -DENABLE_CPACK=OFF && make -j$(nproc) && make install",
 
-    "curl -sSL https://ftp.gnu.org/gnu/libtool/libtool-2.4.7.tar.gz -o /tmp/libtool.tar.gz",
+    "curl -fsSL --retry 5 --retry-delay 2 --retry-connrefused --connect-timeout 30 https://ftpmirror.gnu.org/gnu/libtool/libtool-2.4.7.tar.gz -o /tmp/libtool.tar.gz || curl -fsSL --retry 5 --retry-delay 2 --retry-connrefused --connect-timeout 30 https://ftp.gnu.org/gnu/libtool/libtool-2.4.7.tar.gz -o /tmp/libtool.tar.gz",
     "echo '04e96c2404ea70c590c546eba4202a4e12722c640016c12b9b2f1ce3d481e9a8  /tmp/libtool.tar.gz' | sha256sum -c -",
     "tar xzf /tmp/libtool.tar.gz -C /tmp",
     "cd /tmp/libtool-2.4.7/libltdl && CC=aarch64-linux-musl-gcc AR=aarch64-linux-musl-ar RANLIB=aarch64-linux-musl-ranlib CFLAGS=-fPIE ./configure --host=aarch64-linux-musl --prefix=/usr/local --disable-shared --enable-static --enable-ltdl-install && make -j$(nproc) && make install",
 
-    "curl -sSL https://codeload.github.com/sabotage-linux/gettext-tiny/tar.gz/refs/tags/v0.3.3 -o /tmp/gettext-tiny.tar.gz",
+    "curl -fsSL --retry 5 --retry-delay 2 --retry-connrefused --connect-timeout 30 https://codeload.github.com/sabotage-linux/gettext-tiny/tar.gz/refs/tags/v0.3.3 -o /tmp/gettext-tiny.tar.gz",
     "echo 'daff8b4a7863745710ec0b02657fd20bda2d90398f54945751259bb94d6ebffd  /tmp/gettext-tiny.tar.gz' | sha256sum -c -",
     "tar xzf /tmp/gettext-tiny.tar.gz -C /tmp",
     "cp /tmp/gettext-tiny-0.3.3/m4/*.m4 /tmp/pulseaudio-14.2/m4/",
 
     "mkdir -p /tmp/pulseaudio-14.2/build-aux",
-    "curl -sSL https://raw.githubusercontent.com/coreutils/gnulib/9388edc18a2c1de1ae9f58cef2446e1c1116bf36/build-aux/config.rpath -o /tmp/pulseaudio-14.2/build-aux/config.rpath",
+    "curl -fsSL --retry 5 --retry-delay 2 --retry-connrefused --connect-timeout 30 https://raw.githubusercontent.com/coreutils/gnulib/9388edc18a2c1de1ae9f58cef2446e1c1116bf36/build-aux/config.rpath -o /tmp/pulseaudio-14.2/build-aux/config.rpath",
     "echo 'fc70d6138bc62e8ea8080602b607f38d56c4def03ec4d523d516b338cff41df9  /tmp/pulseaudio-14.2/build-aux/config.rpath' | sha256sum -c -",
 
     "sed -i 's/^SUBDIRS = src doxygen man po$/SUBDIRS = src doxygen man/' /tmp/pulseaudio-14.2/Makefile.am",
