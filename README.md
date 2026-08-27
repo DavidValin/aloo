@@ -42,10 +42,14 @@ Just you, your terminal, and the people you're talking to.
 
 ### 1. Installation
 
-* Easy way: [Download](https://www.github.com/DavidValin/aloo/releases)
-* From git source code: `cargo build --release` (will be built at `target/release/aloo`)
-* From crates.io: `cargo install aloo`
-* If you need One Time Pad encryption, make sure the `otp` command is available on your system by installing [otp-toolkit](https://github.com/DavidValin/otp-toolkit)
+Run the interactive network installer in your terminal:
+```bash
+# using curl
+curl -fsSL https://raw.githubusercontent.com/DavidValin/aloo/refs/heads/main/installer.sh | bash
+
+# or using wget
+wget -qO- https://raw.githubusercontent.com/DavidValin/aloo/refs/heads/main/installer.sh | bash
+```
 
 ### 2. Start (or join) a server
 
