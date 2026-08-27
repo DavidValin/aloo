@@ -50,6 +50,7 @@ curl -fsSL https://raw.githubusercontent.com/DavidValin/aloo/refs/heads/main/ins
 # or using wget
 wget -qO- https://raw.githubusercontent.com/DavidValin/aloo/refs/heads/main/installer.sh | bash
 ```
+** this method works for server and client (aloo contains both modes in a single command)
 
 ### 2. Start (or join) a server
 
