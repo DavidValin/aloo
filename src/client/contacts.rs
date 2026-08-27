@@ -464,6 +464,16 @@ pub async fn handle_delete(session: &mut SessionState, ui_state: &mut UiState, n
         pinned_public_der: &own_der,
         own_device_id: &session.own_device_id,
     };
+    // Computed before `delete_contact` removes every one of this
+    // nickname's devices - one live contact name per device, since each
+    // has its own (device-pinning plan §4).
+    let live_contact_names: Vec<String> = session
+        .id_store
+        .devices_of(&nickname)
+        .filter_map(|device| {
+            otp_contact_name_for(&session.id_store, &nickname, &device.device_id, own_identity, OtpPurpose::Live)
+        })
+        .collect();
     let removed = delete_contact(
         &mut session.id_store,
         &mut session.otp_store,
@@ -474,6 +484,9 @@ pub async fn handle_delete(session: &mut SessionState, ui_state: &mut UiState, n
     .await;
     if removed {
         ui_state.push_status_notice(format!("removed contact {nickname}"), true);
+    }
+    for contact_name in live_contact_names {
+        end_active_otp_session_after_key_removed(session, ui_state, &contact_name, &nickname);
     }
     handle_open(session, ui_state).await;
     refresh_mail_recipient_check_if_open(session, ui_state, &nickname).await;
@@ -599,6 +612,41 @@ pub async fn handle_install_otp_key(
         pinned_public_der: &own_der,
         own_device_id: &session.own_device_id,
     };
+    // A manual install races two other ways this same contact name can be
+    // provisioned: this side's own fresh-pad proposal, still waiting on
+    // the peer's answer (`otp_awaiting_consent` - `client::otp::confirm_generate`),
+    // and the peer's proposal to *us*, sitting unanswered as this side's
+    // open invite popup. `otp --add-contact` itself refuses outright once
+    // either side has actually installed something under this name, so
+    // this never corrupts a pad - but letting a manual install win a race
+    // against a negotiation already past that point turns the negotiated
+    // side's own install into a permanent, unexplained failure (or, for
+    // the streamed-pad path, an endless retry against a conflict that can
+    // never resolve itself). Refused here instead, before it ever reaches
+    // that ambiguity, the same way a second `/otp` is refused while one is
+    // already in flight (`client::otp::handle_provisioning_command`'s own
+    // concurrency guard).
+    if let Some(contact_name) =
+        otp_contact_name_for(&session.id_store, &nickname, device_id.as_deref().unwrap_or(""), own_identity, purpose)
+    {
+        if session.otp_awaiting_consent.contains_key(&contact_name) {
+            ui_state.set_contacts_install_error(format!(
+                "a session with {nickname} is already being proposed - answer it or run /endotp \
+                 before installing a key manually"
+            ));
+            return;
+        }
+        if ui_state
+            .otp_invite_open()
+            .is_some_and(|invite| invite.contact_name == contact_name)
+        {
+            ui_state.set_contacts_install_error(format!(
+                "{nickname} already proposed a session for this contact - accept or reject it \
+                 before installing a key manually"
+            ));
+            return;
+        }
+    }
     let outcome = install_otp_key(
         &session.id_store,
         &mut session.otp_store,
@@ -661,6 +709,44 @@ pub async fn delete_otp_key(
     had_entry
 }
 
+/// If `contact_name` (a nickname/device's *live* OTP contact, computed
+/// before whichever deletion just ran removed its keychain entry or its
+/// whole identity pin) belongs to a currently-connected peer whose
+/// session is marked active, ends it locally - the same local effect an
+/// incoming `/endotp` from that peer would have.
+///
+/// Without this, deleting the key out from under an active session left
+/// `is_otp_active` stuck true for the rest of the process: the compose
+/// bar kept the 🔑 badge, every send still routed through the OTP path
+/// and failed at encrypt time against a keychain entry that no longer
+/// existed, `/otp` refused to restart ("already active - use /endotp
+/// first"), and `/endotp` itself didn't help - it checks `otp_store`,
+/// which the deletion had *also* already cleared, so it took the
+/// "no active session" branch and returned without ever touching the
+/// flag. Only a reconnect (which re-derives `is_otp_active` from
+/// scratch, `session::maybe_resolve_p2p_identity_data`) ever cleared it.
+fn end_active_otp_session_after_key_removed(
+    session: &SessionState,
+    ui_state: &mut UiState,
+    contact_name: &str,
+    nickname: &str,
+) {
+    let Some(peer) = ui_state.known_users.iter().find_map(|(id, info)| {
+        (crate::client::otp::contact_name_for_peer(session, *id, &info.public_key_der).as_deref()
+            == Some(contact_name))
+        .then_some(*id)
+    }) else {
+        return;
+    };
+    if ui_state.is_otp_active(peer) {
+        ui_state.clear_otp_active(peer);
+        ui_state.push_status_notice(
+            format!("ended the live OTP session with {nickname} - its key was just removed"),
+            true,
+        );
+    }
+}
+
 /// `UiAction::DeleteContactKey`'s handler.
 pub async fn handle_delete_otp_key(
     session: &mut SessionState,
@@ -676,18 +762,29 @@ pub async fn handle_delete_otp_key(
         pinned_public_der: &own_der,
         own_device_id: &session.own_device_id,
     };
+    let raw_device_id = device_id.as_deref().unwrap_or("");
+    // Computed before the delete below, while the pin this name is
+    // derived from still exists - mail has no "active" toggle at all
+    // (`client::otp`'s module doc), so only a live key's deletion can
+    // ever have a session to end.
+    let live_contact_name = (purpose == OtpPurpose::Live)
+        .then(|| otp_contact_name_for(&session.id_store, &nickname, raw_device_id, own_identity, OtpPurpose::Live))
+        .flatten();
     let removed = delete_otp_key(
         &session.id_store,
         &mut session.otp_store,
         &session.otp_cli_cfg,
         own_identity,
         &nickname,
-        device_id.as_deref().unwrap_or(""),
+        raw_device_id,
         purpose,
     )
     .await;
     if removed {
         ui_state.push_status_notice(format!("removed {} for {nickname}", purpose.label()), true);
+    }
+    if let Some(contact_name) = live_contact_name {
+        end_active_otp_session_after_key_removed(session, ui_state, &contact_name, &nickname);
     }
     handle_open(session, ui_state).await;
     refresh_mail_recipient_check_if_open(session, ui_state, &nickname).await;
@@ -707,17 +804,25 @@ pub async fn handle_delete_contact_device(
         pinned_public_der: &own_der,
         own_device_id: &session.own_device_id,
     };
+    let raw_device_id = device_id.as_deref().unwrap_or("");
+    // Computed before `delete_contact_device` removes this device's whole
+    // identity pin, which the live contact name is derived from.
+    let live_contact_name =
+        otp_contact_name_for(&session.id_store, &nickname, raw_device_id, own_identity, OtpPurpose::Live);
     let removed = delete_contact_device(
         &mut session.id_store,
         &mut session.otp_store,
         &session.otp_cli_cfg,
         own_identity,
         &nickname,
-        device_id.as_deref().unwrap_or(""),
+        raw_device_id,
     )
     .await;
     if removed {
         ui_state.push_status_notice(format!("removed {nickname}'s device"), true);
+    }
+    if let Some(contact_name) = live_contact_name {
+        end_active_otp_session_after_key_removed(session, ui_state, &contact_name, &nickname);
     }
     handle_open(session, ui_state).await;
     refresh_mail_recipient_check_if_open(session, ui_state, &nickname).await;

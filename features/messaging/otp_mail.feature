@@ -31,6 +31,17 @@ Feature: OTP mail that waits, encrypted, on the server
     And I press Escape
     Then the mail compose view is not open
 
+  @AC-374
+  Scenario: The /mail command refuses to open without the local otp binary
+    Given I am connected and viewing a channel
+    And bob is in the channel with me
+    And the local otp binary is not installed
+    Then the mail compose view is not open
+    When I type "/mail"
+    And I press Enter
+    Then the mail compose view is not open
+    And a status notice says "OTP mail failed: the 'otp' command isn't installed - see github.com/DavidValin/otp-toolkit"
+
   @AC-155
   Scenario: An unpinned recipient renders invalid with a cross
     Given I am connected and viewing a channel

@@ -271,7 +271,9 @@ live header showing both directions' remaining key.
 It survives either of you disconnecting and coming back — only `/endotp`
 ever ends one, and the other side is told even if that means waiting until
 they're next online. Requires
-[otp-toolkit](https://github.com/DavidValin/otp-toolkit).
+[otp-toolkit](https://github.com/DavidValin/otp-toolkit) installed
+locally — `/otp` (and `/new-otp-mail-key` below) refuses immediately, with
+a clear message, if it isn't.
 
 ### OTP mail
 
@@ -282,6 +284,10 @@ they're next online. Requires
 | `Ctrl+S` | Send |
 | `/mailbox` | Your mailbox: each sent mail's delivery status, and what arrived |
 | `/new-otp-mail-key` | Provision a mail-only key with an open DM's peer, both online right now |
+
+`/mail` itself refuses the same way `/otp` does if
+[otp-toolkit](https://github.com/DavidValin/otp-toolkit) isn't installed
+locally — never opens the compose view only to fail once you try to send.
 
 While anything you've received is still unread, the header shows a blinking
 ✉ and `<n> unread OTP Mails` — gone the moment you open it in the mailbox.

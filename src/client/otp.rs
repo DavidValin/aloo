@@ -245,7 +245,19 @@ pub enum UnwrapOutcome {
     /// `otp`'s own metadata validation refused this message; `reason` is
     /// its `stderr` explanation of which field(s) didn't match.
     Rejected(String),
-    Failed,
+    /// Anything else that kept the message from being read: the `otp`
+    /// binary could not even be launched (moved, uninstalled, a bad
+    /// `ALOO_OTP_BIN`/`otp_binary_path` setting - `io::Error::to_string()`),
+    /// it exited with a generic error (`OtpCliOutcome::Error`'s doc - a
+    /// missing contact, a full disk, a corrupt keychain, redelivery retries
+    /// exhausted), or the decrypted bytes were too short to be a real
+    /// message. Distinct from `Rejected`: that is `otp` itself, working
+    /// correctly, refusing one specific message on its own metadata: this
+    /// is every case where no such verdict was ever reached at all. Both
+    /// are shown to the user (`finish_opening_otp_envelope`) - silently
+    /// dropping this one used to be indistinguishable from the message
+    /// simply never arriving.
+    Failed(String),
 }
 
 /// Unwraps wire bytes back to the `pq_hybrid` blob: `otp -c <contact_name>
@@ -263,13 +275,23 @@ pub async fn unwrap_incoming(
             // Every message begins with the sender's ack nonce; anything
             // shorter than one cannot be a message this build produced.
             if bytes.len() < crypto::otp::ACK_NONCE_BYTES {
-                return UnwrapOutcome::Failed;
+                return UnwrapOutcome::Failed(
+                    "decrypted payload shorter than the ack nonce".to_string(),
+                );
             }
             let (nonce, payload) = bytes.split_at(crypto::otp::ACK_NONCE_BYTES);
             UnwrapOutcome::Ok(payload.to_vec(), crypto::otp::ack_proof_for(nonce))
         }
         Ok(OtpCliOutcome::Rejected(reason)) => UnwrapOutcome::Rejected(reason),
-        _ => UnwrapOutcome::Failed,
+        Ok(OtpCliOutcome::Error(reason)) => UnwrapOutcome::Failed(reason),
+        Ok(OtpCliOutcome::Redelivered) => {
+            // `decrypt_retrying` only ever returns this to its own caller
+            // after resolving every `Redelivered` it saw internally into
+            // something else (`MAX_REDELIVER_RETRIES`'s doc) - reachable
+            // only if that contract changes underneath this.
+            UnwrapOutcome::Failed("otp: unexpected redelivery marker".to_string())
+        }
+        Err(e) => UnwrapOutcome::Failed(e.to_string()),
     }
 }
 
@@ -543,6 +565,15 @@ pub async fn commit_pending_setup(cfg: &OtpCliConfig, contact_name: &str) -> boo
     let dir = pending_setup_dir(cfg, contact_name);
     let (own_enc, own_dec, _, _) = pending_paths(&dir);
     let committed = if own_enc.exists() && own_dec.exists() {
+        // A contact under this name may already exist - a previous pad
+        // being replaced (`/new-otp-mail-key` always proposes a fresh one
+        // even over an existing key, and a live pair can reach the same
+        // shape if one side deleted its own copy and re-ran `/otp`) - and
+        // `otp --add-contact` refuses to overwrite one outright. Best
+        // effort: a name that never held a contact simply has nothing to
+        // remove, and any other removal failure only leaves `add_contact`
+        // to fail exactly as it already would have.
+        let _ = otp_cli::remove_contact(cfg, contact_name).await;
         otp_cli::add_contact(cfg, contact_name, &own_enc, &own_dec)
             .await
             .is_ok()
@@ -762,35 +793,29 @@ pub async fn handle_provisioning_command(
     let already_have_key =
         detect_or_adopt_existing(&session.otp_cli_cfg, &mut session.otp_store, &contact_name).await;
 
-    // Mail has no "session" to resume or reconfirm - unlike `/otp`, which
-    // legitimately re-sends `OtpSessionRequest` even when a key already
-    // exists (that round trip is what turns the *session* on again after
-    // `/endotp`), a mail key is either usable or it isn't, and one call to
-    // `check_recipient` at compose time already answers that. So once one
-    // exists, `/new-otp-mail-key` has nothing left to do - refused locally,
-    // no network involved, before either the pad-only or resume branches
-    // below get a chance to send anything.
-    if purpose == crypto::otp::OtpPurpose::Mail && already_have_key {
-        notify(
-            ui_state,
-            peer,
-            &peer_name,
-            "otp mail key already exists. use /mail or delete existing in /contacts".to_string(),
-            false,
-        );
-        return Ok(());
-    }
+    // Unlike `/otp`, which legitimately resumes an already-provisioned
+    // contact (that round trip is what turns the *session* back on after
+    // `/endotp`, over the identical pad), `/new-otp-mail-key` always means
+    // "get me a fresh one" - resuming isn't a thing it can mean at all,
+    // since mail has no session to resume in the first place, only a key
+    // that is either usable or isn't (`check_recipient` at compose time).
+    // So `already_have_key` never gates Mail's branch below the way it
+    // gates Live's: Mail always takes the fresh-generate path, and the
+    // commit step (`commit_pending_setup`/`on_pad_commit`) replaces
+    // whatever was there before rather than refusing to touch it.
+    let resuming = purpose == crypto::otp::OtpPurpose::Live && already_have_key;
 
     // Under `Direct` framing there is no channel to share a freshly
     // generated pad over - the handshake that carries one is itself an
     // ordinary `pq_hybrid` send, and this peer announced no bundle to seal
     // it to (a `--no-server` direct-punch peer, `docs/PROTOCOL.md` §7.1.5).
-    // A pad *already* installed on both sides needs no such channel,
-    // though, so this refuses only the generate-and-share path, never the
-    // resume path.
-    if framing_for(&session.otp_own_pinned_der, &peer_pubkey_der) == OtpFraming::Direct
-        && !already_have_key
-    {
+    // A pad *already* installed on both sides needs no such channel for
+    // `/otp` to resume it, though - so this refuses only the
+    // generate-and-share path. Mail can never resume (above), so for Mail
+    // this refuses unconditionally: a pad-only pair's mail key can only
+    // ever be replaced by installing a fresh one manually from /contacts,
+    // the same as it was first provisioned.
+    if framing_for(&session.otp_own_pinned_der, &peer_pubkey_der) == OtpFraming::Direct && !resuming {
         notify(
             ui_state,
             peer,
@@ -810,28 +835,23 @@ pub async fn handle_provisioning_command(
     // left to agree. `/otp` turns it on locally and the first message goes
     // straight under the pad - the peer's own `otp --decrypt` is what
     // accepts it, and their acknowledgement (§16.2) is the only consent a
-    // pad-only pair can express or needs to.
+    // pad-only pair can express or needs to. Only ever reached for Live
+    // (`resuming` implies `purpose == Live`) - Mail already returned above.
     if framing_for(&session.otp_own_pinned_der, &peer_pubkey_der) == OtpFraming::Direct {
-        let message = match purpose {
-            // `mark_otp_active`/the key-status header are live-session
-            // concepts (the shield prefix, the seq/offset header) - mail
-            // has no "active" toggle at all, it just checks the key exists
-            // (`check_recipient`) whenever a mail is composed.
-            crypto::otp::OtpPurpose::Live => {
-                ui_state.mark_otp_active(peer);
-                refresh_otp_key_status(&session.otp_cli_cfg, ui_state, peer, &contact_name).await;
-                "OTP session started (pad-only pair - every message to them now rides the pad)"
-                    .to_string()
-            }
-            crypto::otp::OtpPurpose::Mail => {
-                format!("{label} ready (pad-only pair) - mail to {peer_name} now uses it")
-            }
-        };
-        notify(ui_state, peer, &peer_name, message, true);
+        ui_state.mark_otp_active(peer);
+        refresh_otp_key_status(&session.otp_cli_cfg, ui_state, peer, &contact_name).await;
+        notify(
+            ui_state,
+            peer,
+            &peer_name,
+            "OTP session started (pad-only pair - every message to them now rides the pad)"
+                .to_string(),
+            true,
+        );
         return Ok(());
     }
 
-    if already_have_key {
+    if resuming {
         let payload = crypto::otp::OtpSessionRequestPayload {
             contact_name: contact_name.clone(),
             // A resume asks for no new pad, so there is no size to weigh.
@@ -1010,7 +1030,11 @@ async fn send_session_request(
     true
 }
 
-pub(crate) async fn confirm_generate(
+/// `pub` (not `pub(crate)`): `test/otp_pad_glare_test.rs` drives this
+/// directly, on both sides of a simulated pair, to produce the two real
+/// `OtpSessionRequest` envelopes a genuine glare needs - the same reason
+/// `on_session_request` is `pub` too.
+pub async fn confirm_generate(
     wr: &mut impl crate::control::ControlSink,
     session: &mut SessionState,
     ui_state: &mut UiState,
@@ -1547,7 +1571,12 @@ pub(crate) fn on_key_setup(
 /// invitation carrying no key material, since the receiving side is
 /// expected to already have a matching keychain contact (verified only if
 /// the user actually accepts - see `accept_invite`).
-pub(crate) fn on_session_request(
+///
+/// `pub` (not `pub(crate)`) so `test/otp_pad_glare_test.rs` can drive a
+/// real, independently-generated request straight at this function,
+/// exercising the glare check against a genuinely encrypted envelope
+/// rather than a hand-built payload.
+pub fn on_session_request(
     ui_state: &mut UiState,
     session: &mut SessionState,
     from: UserId,
@@ -1577,6 +1606,56 @@ pub(crate) fn on_session_request(
         );
         return;
     };
+    // Glare: this side *also* proposed a fresh pad to the same contact and
+    // is waiting on its own answer (`confirm_generate`'s `otp_awaiting_consent`
+    // insert) - both users ran `/otp` with each other before either request
+    // arrived. Resolved here, before either side has generated or streamed
+    // a single byte, the same way the small-key path's `on_key_setup_chunk`
+    // already resolves it for a pad small enough to send inline
+    // (`own_pad_wins_glare`'s own doc: the numerically smaller fingerprint
+    // wins, both sides compare the same two values and so reach the same
+    // answer with no round trip to negotiate it). A resume request
+    // (`pad_size_mb: None`) never reaches here: adopting the same
+    // already-installed pad twice is a no-op on both sides, so there is
+    // nothing to resolve.
+    if payload.pad_size_mb.is_some()
+        && session.otp_awaiting_consent.contains_key(&payload.contact_name)
+    {
+        let own_fp = session.own_pq_fp;
+        if let Some(peer_fp) = crypto::pq::fingerprint_of_encoded(&sender.public_key_der) {
+            if own_pad_wins_glare(&own_fp, &peer_fp) {
+                // Ours wins: refuse theirs outright, before it ever becomes
+                // a decision popup - our own proposal, already on its way
+                // to them, is the one they will answer instead.
+                queue_key_setup_ack(
+                    session,
+                    ui_state,
+                    from,
+                    &payload.contact_name,
+                    false,
+                    Some(GLARE_REASON.to_string()),
+                );
+                notify(
+                    ui_state,
+                    from,
+                    &from_name,
+                    format!(
+                        "OTP: {from_name} proposed a session at the same moment - keeping our \
+                         own proposal"
+                    ),
+                    true,
+                );
+                return;
+            }
+            // Theirs wins: our own proposal is withdrawn - nothing was ever
+            // generated for it (that only starts once an acceptance comes
+            // back, `on_key_setup_ack`), so there is nothing on disk to
+            // discard, only this in-memory record of having asked. Falls
+            // through to show their invitation exactly as it would have
+            // without any glare at all.
+            session.otp_awaiting_consent.remove(&payload.contact_name);
+        }
+    }
     ui_state.push_otp_invite(
         from,
         from_name.clone(),
@@ -1962,7 +2041,10 @@ pub(crate) async fn reject_invite(
 /// usable half of a pad if the other half doesn't exist) and offering the
 /// normal "generate and share a fresh one" confirmation again, the same
 /// popup a first-ever `/otp` would have shown.
-pub(crate) async fn on_key_setup_ack(
+///
+/// `pub` (not `pub(crate)`) so `test/otp_pad_glare_test.rs` can drive the
+/// losing side's own receipt of its glare refusal directly.
+pub async fn on_key_setup_ack(
     ui_state: &mut UiState,
     session: &mut SessionState,
     from: UserId,
@@ -2055,8 +2137,15 @@ pub(crate) async fn on_key_setup_ack(
         // debt cleared, so nothing retries it and - since the keychain was
         // never written - the next `/otp` from either side starts cleanly
         // with a freshly generated pad rather than meeting a stale entry.
+        // A still-open proposal (`otp_awaiting_consent` - this side asked
+        // to generate a fresh pad and hadn't heard back yet, most notably
+        // the losing half of a glare resolution, `on_session_request`'s own
+        // check) is withdrawn the same way: a refusal answers it either
+        // way, so nothing is left waiting on a reply that already arrived,
+        // just refusing something else.
         discard_pending_setup(&session.otp_cli_cfg, &ack.contact_name);
         session.otp_store.clear_pending_setup(&ack.contact_name);
+        session.otp_awaiting_consent.remove(&ack.contact_name);
         let _ = session.otp_store.save();
         let reason = ack.reason.map(|r| format!(": {r}")).unwrap_or_default();
         notify(
@@ -2453,7 +2542,11 @@ async fn send_sealed_end_session_ack(
 /// initiator's own retry only stops once one genuinely arrives. (A *padded*
 /// notice is acknowledged with the ordinary proof-carrying `OtpDeliveryAck`
 /// instead - `apply_otp_message`'s `OtpEndSession` arm.)
-pub(crate) async fn on_end_session(
+/// `pub` (not `pub(crate)`) so `test/otp_missing_key_test.rs` can deliver
+/// the sealed, unpadded notice `end_session_for_missing_contact` sends
+/// directly to it, the same reason several other otp.rs internals became
+/// `pub` earlier this session.
+pub async fn on_end_session(
     session: &mut SessionState,
     ui_state: &mut UiState,
     from: UserId,
@@ -2475,6 +2568,41 @@ pub(crate) async fn on_end_session(
     send_sealed_end_session_ack(session, from, &sender_pubkey_der, &contact_name).await;
 }
 
+/// The state mutation behind ending a session locally, shared by every
+/// path that does it: an incoming `/endotp` notice from the peer
+/// (`apply_end_session`), and this side discovering on its own that the
+/// pair can never talk again - the peer's message referenced a contact
+/// this side no longer has any keychain entry for at all
+/// (`end_session_for_missing_contact`). Returns whether there was a
+/// session to end at all, so each caller can decide whether its own
+/// notice is worth showing.
+fn pause_session_locally(
+    session: &mut SessionState,
+    ui_state: &mut UiState,
+    from: UserId,
+    contact_name: &str,
+) -> bool {
+    let had_session = session.otp_store.get(contact_name).is_some_and(|s| s.provisioned);
+
+    discard_pending_setup(&session.otp_cli_cfg, contact_name);
+    session.otp_incoming_setup.remove(&from);
+    session.otp_out_queue.clear(contact_name);
+    session.otp_store.pause_after_peer_ended(contact_name);
+    // Being told the session is ending - by whatever shape the notice took
+    // - settles this side's own end-notice bookkeeping too, if any is
+    // outstanding for the same contact: this side may have run its own
+    // `/endotp` (or `end_session_for_missing_contact` may have sent its own
+    // substitute notice) and still be waiting on an acknowledgement that,
+    // now, will never specifically arrive for it - the peer's notice here
+    // is the news that answer would have carried anyway.
+    // `OtpStore::clear_own_pending_end_notice_send`'s doc.
+    session.otp_store.clear_end_notice(contact_name);
+    session.otp_store.clear_own_pending_end_notice_send(contact_name);
+    let _ = session.otp_store.save();
+    ui_state.clear_otp_active(from);
+    had_session
+}
+
 /// `on_end_session`'s body once the notice is in the clear, whichever
 /// layer got it there - the sealed-only path above, or the padded one
 /// `on_message` dispatches (`Content::OtpEndSession`).
@@ -2485,19 +2613,7 @@ async fn apply_end_session(
     from_name: String,
     payload: crypto::otp::OtpEndSessionPayload,
 ) {
-    let had_session = session
-        .otp_store
-        .get(&payload.contact_name)
-        .is_some_and(|s| s.provisioned);
-
-    discard_pending_setup(&session.otp_cli_cfg, &payload.contact_name);
-    session.otp_incoming_setup.remove(&from);
-    session.otp_out_queue.clear(&payload.contact_name);
-    session
-        .otp_store
-        .pause_after_peer_ended(&payload.contact_name);
-    let _ = session.otp_store.save();
-    ui_state.clear_otp_active(from);
+    let had_session = pause_session_locally(session, ui_state, from, &payload.contact_name);
     if had_session {
         notify(
             ui_state,
@@ -2515,6 +2631,105 @@ async fn apply_end_session(
     // pad and touching nothing of its own that might still be in flight);
     // the unpadded fallback earns the sealed legacy `OtpEndSessionAck`
     // (`on_end_session`).
+}
+
+/// This side just discovered, from a message it could not decrypt, that
+/// it has no keychain entry at all for `contact_name` any more - deleted
+/// (`contacts::handle_delete_otp_key` and friends), or never genuinely
+/// installed. There is nothing left to protect anything with, in either
+/// direction, so the session is over for real: paused locally exactly as
+/// an incoming `/endotp` would (the durable state - sequences, the
+/// last-received-ack record, any owed end notice - is meaningless once
+/// the keychain entry it was tracking is gone, and `pause_after_peer_ended`
+/// clears it the same way), and this side tries to tell the sender
+/// directly with a real `OtpEndSession` notice - sealed and unpadded,
+/// since there is no pad left here to protect it with.
+///
+/// That notice needs *some* channel to travel over, though, and a pair
+/// with no readable `pq_hybrid` identity for each other (`OtpFraming::Direct`
+/// - a pad-only pair, whose one and only shared secret was the very pad
+/// that is now gone) has none left at all: no pad, no identity to seal a
+/// plain envelope to, and by design no server relay either (that framing
+/// exists specifically for peers who may have no server connection in
+/// common). For that pairing this side still ends cleanly on its own, but
+/// the sender is never told through this path - she finds out only
+/// because her own messages here now go forever unacknowledged, exactly
+/// as an undelivered send to an unreachable peer already looked before
+/// this fix existed, not worse. A `PqWrapped` pair always has the
+/// fallback envelope this needs, so it converges both sides in practice.
+async fn end_session_for_missing_contact(
+    session: &mut SessionState,
+    ui_state: &mut UiState,
+    from: UserId,
+    from_name: &str,
+    contact_name: &str,
+) {
+    let had_session = pause_session_locally(session, ui_state, from, contact_name);
+
+    let told_sender = try_notify_peer_session_ended(session, ui_state, from, contact_name).await;
+    if had_session {
+        let reachable_note = if told_sender {
+            format!("{from_name} was told")
+        } else {
+            format!("{from_name} could not be reached to tell")
+        };
+        notify(
+            ui_state,
+            from,
+            from_name,
+            format!(
+                "OTP: a message from {from_name} could not be decrypted - this side has no \
+                 matching key for it any more, ending the session ({reachable_note})"
+            ),
+            false,
+        );
+    }
+}
+
+/// The outgoing half of `end_session_for_missing_contact` and
+/// `end_live_session_if_exhausted`: a sealed, unpadded `OtpEndSession`
+/// notice to `from`, the same shape `Content::OtpEndSession`'s own doc
+/// gives for a pad that cannot encrypt at all. Returns whether it could
+/// even be built and queued - `false` for a pair with no readable
+/// identity for each other to seal it to (`OtpFraming::Direct`), which
+/// each caller explains for its own trigger.
+async fn try_notify_peer_session_ended(
+    session: &mut SessionState,
+    ui_state: &UiState,
+    from: UserId,
+    contact_name: &str,
+) -> bool {
+    let Some(sender) = ui_state.known_users.get(&from).cloned() else {
+        return false;
+    };
+    let payload = crypto::otp::OtpEndSessionPayload {
+        contact_name: contact_name.to_string(),
+    };
+    let Ok(plaintext) = proto::encode(&payload) else {
+        return false;
+    };
+    let send_id = session.next_stream_id;
+    session.next_stream_id += 1;
+    let Some(envelope) = crate::client::envelope::encrypt_envelope_for(
+        &session.own_pq_private,
+        session.pq_peer_keys.encap_for(from),
+        &sender.public_key_der,
+        None,
+        send_id,
+        &plaintext,
+        Content::OtpEndSession,
+    ) else {
+        return false;
+    };
+    session.peer_link.send_reliable_or_queue(
+        from,
+        P2pPayload::Envelope {
+            channel: None,
+            msg_id: None,
+            envelope,
+        },
+    );
+    true
 }
 
 /// Applies an incoming `Content::OtpEndSessionAck` - the initiator's side of
@@ -2642,17 +2857,95 @@ pub async fn resend_pending_end_notices(
 /// call just leaves whatever snapshot was already there rather than
 /// clearing it - a stale-but-real figure beats a blank one for a display
 /// that's cosmetic, not a security decision.
-/// `pub(crate)`: OTP mail's own pad spends (`client::otp_mail`) refresh
-/// through here too, when the mail's counterpart happens to be connected.
-pub(crate) async fn refresh_otp_key_status(
+/// `pub` (not `pub(crate)`): OTP mail's own pad spends (`client::otp_mail`)
+/// refresh through here too, when the mail's counterpart happens to be
+/// connected - and a test simulating `mark_otp_active` alone (without the
+/// refresh production code always pairs it with) would leave
+/// `otp_key_status_for` empty, silently defeating `message_crypto`'s OTP
+/// branch (`test/otp_ack_wiring_test.rs`'s send/receive-crypto-race tests).
+/// Returns the fetched detail (`None` on a failed/erroring call, or a
+/// contact that doesn't exist), so a caller right after a genuine spend can
+/// check for exhaustion (`end_live_session_if_exhausted`) without a second
+/// `show_contact` subprocess call for the same figures this one already
+/// fetched.
+pub async fn refresh_otp_key_status(
     cfg: &otp_cli::OtpCliConfig,
     ui_state: &mut UiState,
     peer: UserId,
     contact_name: &str,
+) -> Option<otp_cli::ContactDetail> {
+    let detail = otp_cli::show_contact(cfg, contact_name).await.ok().flatten()?;
+    ui_state.set_otp_key_status(peer, otp_cli::OtpKeyStatus::new(cfg, contact_name, detail.clone()));
+    Some(detail)
+}
+
+/// Whether `detail` shows nothing left in *either* direction - a pad that
+/// can no longer encrypt or decrypt a single byte. A pure check with no
+/// side effects: the contact's keychain entry, and aloo's own bookkeeping
+/// for it, are never touched just because it emptied out - only the
+/// *session* riding on it (for a live contact) reacts, and only by
+/// pausing, the same as any other way a session ends. A later `/otp`/
+/// `/new-otp-mail-key` still replaces it correctly regardless:
+/// `commit_pending_setup`/`on_pad_commit` already remove whatever
+/// keychain entry is there before installing a fresh one (AC-384),
+/// exhausted or not.
+///
+/// `pub` (not `pub(crate)`) so `test/otp_key_exhaustion_test.rs` can drive
+/// it directly with a synthetic `ContactDetail`, proving the check
+/// deterministically without engineering a real message whose exact
+/// encrypted size happens to land on precisely zero bytes remaining.
+pub fn is_contact_exhausted(detail: &otp_cli::ContactDetail) -> bool {
+    detail.enc_key_remaining == 0 && detail.dec_key_remaining == 0
+}
+
+/// Reacts to a live contact found exhausted right after a genuine spend:
+/// pauses the session locally exactly as discovering the peer's key is
+/// *missing* already does (`end_session_for_missing_contact`, AC-380) - a
+/// pad with nothing left in either direction can protect nothing further
+/// either way - and tries to tell the peer directly too, with the same
+/// sealed, unpadded `OtpEndSession` and the same limits: only a
+/// `PqWrapped` pair has a readable identity to seal it to, so a pad-only
+/// pair's key running out converges only on the discovering side, exactly
+/// like its missing-contact case. Neither the keychain entry nor aloo's
+/// own per-contact bookkeeping is removed - only the session riding on it
+/// pauses (`is_contact_exhausted`'s doc). A no-op whenever no session was
+/// actually active, so this never fires spuriously against a mail-purpose
+/// contact (which has no `is_otp_active` state at all) or an
+/// already-paused live one.
+///
+/// `pub` (not `pub(crate)`) so `test/otp_key_exhaustion_test.rs` can drive
+/// it directly, the same reason `is_contact_exhausted` is.
+pub async fn end_live_session_if_exhausted(
+    session: &mut SessionState,
+    ui_state: &mut UiState,
+    peer: UserId,
+    detail: &otp_cli::ContactDetail,
+    contact_name: &str,
 ) {
-    if let Ok(Some(detail)) = otp_cli::show_contact(cfg, contact_name).await {
-        ui_state.set_otp_key_status(peer, otp_cli::OtpKeyStatus::new(cfg, contact_name, detail));
+    if !is_contact_exhausted(detail) || !ui_state.is_otp_active(peer) {
+        return;
     }
+    let peer_name = ui_state
+        .known_users
+        .get(&peer)
+        .map(|u| u.name.clone())
+        .unwrap_or_default();
+    pause_session_locally(session, ui_state, peer, contact_name);
+    let told_peer = try_notify_peer_session_ended(session, ui_state, peer, contact_name).await;
+    notify(
+        ui_state,
+        peer,
+        &peer_name,
+        format!(
+            "OTP key for {peer_name} is fully used up - the session has ended ({})",
+            if told_peer {
+                format!("{peer_name} was told")
+            } else {
+                format!("{peer_name} could not be reached to tell")
+            }
+        ),
+        false,
+    );
 }
 
 /// `session.rs`'s tick loop calls this roughly once a second for whichever
@@ -2958,7 +3251,34 @@ pub(crate) async fn finish_opening_otp_envelope(
                 }
             }
         }
-        UnwrapOutcome::Failed => return None,
+        UnwrapOutcome::Failed(reason) => {
+            // Distinguished from every other decrypt failure: if this side
+            // has no keychain entry for this contact at all any more (the
+            // key was deleted, here or by a prior crash/edit, or was never
+            // genuinely installed), there is nothing transient about
+            // it - retrying, or waiting for `otp`/the disk/whatever else
+            // `reason` names to recover, can never succeed. Ends the
+            // session on both sides instead of leaving the sender to keep
+            // believing it is still alive (`end_session_for_missing_contact`'s
+            // own doc).
+            if !otp_cli::has_contact(&session.otp_cli_cfg, contact_name)
+                .await
+                .unwrap_or(true)
+            {
+                end_session_for_missing_contact(session, ui_state, from, from_name, contact_name)
+                    .await;
+                return None;
+            }
+            let reason = reason.trim().replace('\n', "; ");
+            notify(
+                ui_state,
+                from,
+                from_name,
+                format!("OTP: a message from {from_name} could not be decrypted ({reason})"),
+                false,
+            );
+            return None;
+        }
     };
     // A genuine decrypt just succeeded under this contact's pad - proof,
     // not a bare claim, that `claimed_device_id` really does hold it.
@@ -3222,6 +3542,18 @@ async fn send_now(
     log_index: Option<usize>,
     msg_id: Option<u64>,
 ) -> proto::Result<()> {
+    // Corrects the row `push_outgoing_dm` already logged (UI thread, at
+    // submit time) to match what is genuinely about to happen here: that
+    // earlier snapshot and this send both read `is_otp_active`, but at two
+    // different moments, and a session starting or ending in between
+    // leaves them disagreeing - see `UiState::set_dm_message_crypto`'s doc.
+    // Computed before the spend below, matching `message_crypto`'s own
+    // pre-spend convention (seq/offset describe the message about to be
+    // sent, not the one before it).
+    if let Some(idx) = log_index {
+        let crypto = ui_state.message_crypto(to, true);
+        ui_state.set_dm_message_crypto(to, idx, crypto);
+    }
     let send_id = session.next_stream_id;
     session.next_stream_id += 1;
     // Written ahead of the encrypt, so a kill inside its window leaves a
@@ -3279,7 +3611,9 @@ async fn send_now(
         Some(ack_proof),
     );
     let _ = session.otp_store.save();
-    refresh_otp_key_status(&session.otp_cli_cfg, ui_state, to, contact_name).await;
+    if let Some(detail) = refresh_otp_key_status(&session.otp_cli_cfg, ui_state, to, contact_name).await {
+        end_live_session_if_exhausted(session, ui_state, to, &detail, contact_name).await;
+    }
     session.peer_link.ensure_link(wr, to).await;
     let own_device_id = session.own_device_id.clone();
     session.peer_link.send_reliable_or_queue(
@@ -3567,7 +3901,9 @@ pub async fn send_file_offer(
         Some(ack_proof),
     );
     let _ = session.otp_store.save();
-    refresh_otp_key_status(&session.otp_cli_cfg, ui_state, to, contact_name).await;
+    if let Some(detail) = refresh_otp_key_status(&session.otp_cli_cfg, ui_state, to, contact_name).await {
+        end_live_session_if_exhausted(session, ui_state, to, &detail, contact_name).await;
+    }
     let (msg_id, delivery) = ui_state.start_delivery(&[to]);
     ui_state.log_own_file_offer_dm(to, stream_id, filename.clone(), size, Some(delivery));
     // Staged durably before the offer goes out, so a restart between now
@@ -3746,7 +4082,9 @@ pub async fn send_voice_offer(
         Some(ack_proof),
     );
     let _ = session.otp_store.save();
-    refresh_otp_key_status(&session.otp_cli_cfg, ui_state, to, contact_name).await;
+    if let Some(detail) = refresh_otp_key_status(&session.otp_cli_cfg, ui_state, to, contact_name).await {
+        end_live_session_if_exhausted(session, ui_state, to, &detail, contact_name).await;
+    }
     // Staged durably before the offer goes out, so a restart between now
     // and the peer's acceptance still resumes rather than silently losing
     // the recording (`OtpStore::PendingContentSend`'s doc,
@@ -4084,7 +4422,9 @@ pub async fn on_file_offer(
         .record_last_received_ack(&contact_name, seq, ack_proof);
     let _ = session.otp_store.save();
     adopt_pad_verified_sender(ui_state, from, &sender);
-    refresh_otp_key_status(&session.otp_cli_cfg, ui_state, from, &contact_name).await;
+    if let Some(detail) = refresh_otp_key_status(&session.otp_cli_cfg, ui_state, from, &contact_name).await {
+        end_live_session_if_exhausted(session, ui_state, from, &detail, &contact_name).await;
+    }
     let Ok(payload) = proto::decode::<crate::client::file_transfer::FileOfferPayload>(&plaintext)
     else {
         return;
@@ -4191,7 +4531,9 @@ pub async fn on_voice_offer(
         .record_last_received_ack(&contact_name, seq, ack_proof);
     let _ = session.otp_store.save();
     adopt_pad_verified_sender(ui_state, from, &sender);
-    refresh_otp_key_status(&session.otp_cli_cfg, ui_state, from, &contact_name).await;
+    if let Some(detail) = refresh_otp_key_status(&session.otp_cli_cfg, ui_state, from, &contact_name).await {
+        end_live_session_if_exhausted(session, ui_state, from, &detail, &contact_name).await;
+    }
     let Ok(payload) = proto::decode::<crate::client::file_transfer::VoiceOfferPayload>(&plaintext)
     else {
         return;
@@ -4525,7 +4867,9 @@ pub async fn start_outgoing_file_content(
                 ack_proof,
             );
             let _ = session.otp_store.save();
-            refresh_otp_key_status(&session.otp_cli_cfg, ui_state, to, &contact_name).await;
+            if let Some(detail) = refresh_otp_key_status(&session.otp_cli_cfg, ui_state, to, &contact_name).await {
+                end_live_session_if_exhausted(session, ui_state, to, &detail, &contact_name).await;
+            }
             session
                 .peer_link
                 .send_reliable_or_queue(to, P2pPayload::OtpFileContentSeq { stream_id, seq });
@@ -6061,7 +6405,14 @@ pub(crate) async fn on_pad_verify(
 /// The sender's digests matched and it has installed - so this side may
 /// install too. The only path by which a received pad reaches the
 /// keychain.
-pub(crate) async fn on_pad_commit(
+///
+/// `pub` (not `pub(crate)`) for the same reason `on_pad_commit_ack` already
+/// is: driving the install-failure/retry path directly needs a genuinely
+/// staged pad and a real `otp` invocation, which only an integration test
+/// outside this crate can set up realistically
+/// (`SessionState::stage_incoming_pad_for_test`,
+/// `test/otp_pad_commit_test.rs`).
+pub async fn on_pad_commit(
     session: &mut SessionState,
     ui_state: &mut UiState,
     from: UserId,
@@ -6101,7 +6452,7 @@ pub(crate) async fn on_pad_commit(
         }
         return;
     }
-    let Some(pad) = staged_key.and_then(|key| session.otp_incoming_pads.remove(&key)) else {
+    let Some(key) = staged_key else {
         // Nothing staged for this contact - a commit for a transfer we no
         // longer have. Acknowledged so the sender stops retrying, but
         // nothing is installed from thin air.
@@ -6110,21 +6461,50 @@ pub(crate) async fn on_pad_commit(
             .send_reliable_or_queue(from, P2pPayload::OtpPadCommitAck { contact_name });
         return;
     };
+    // Borrowed, not removed: an install failure below (`otp` unreachable
+    // right now, a full disk, ...) must leave the staged bytes exactly as
+    // they were, so the next retried commit (`resend_pending_commits`, on
+    // every reconnect) finds this same pad and genuinely tries the install
+    // again - the self-healing this function's own doc above already
+    // promises ("finding its staged pad by contact name"). Removing it
+    // unconditionally here used to break that promise: the retry then hit
+    // the "nothing staged" branch above, which acknowledges - a false
+    // "installed" told to a sender that already believes the session is
+    // live, while this side silently has nothing.
+    let pad = session
+        .otp_incoming_pads
+        .get(&key)
+        .expect("key was just found in this same map");
     let (enc_path, dec_path) = otp_pad::incoming_paths(&pad.dir);
+    // Same reasoning as `commit_pending_setup`'s own removal: this exact
+    // branch is reached for "a commit for a *different* pad ... the user's
+    // accepted replacement" (this function's doc above), which
+    // `add_contact` alone can never install over an existing entry -
+    // without this, that replacement would fail every retry forever,
+    // always reporting the misleading "will retry once the local otp
+    // command works" below for a failure retrying can never fix.
+    let _ = otp_cli::remove_contact(&session.otp_cli_cfg, &contact_name).await;
     let installed = otp_cli::add_contact(&session.otp_cli_cfg, &contact_name, &enc_path, &dec_path)
         .await
         .is_ok();
-    crate::client::otp_staging::secure_remove_dir(&pad.dir);
     if !installed {
         notify(
             ui_state,
             from,
             &peer_name,
-            "OTP session failed: could not install the received pad".to_string(),
+            format!(
+                "OTP: could not install the pad received from {peer_name} yet - will retry \
+                 automatically once the local 'otp' command works"
+            ),
             false,
         );
         return;
     }
+    let pad = session
+        .otp_incoming_pads
+        .remove(&key)
+        .expect("key was just found in this same map");
+    crate::client::otp_staging::secure_remove_dir(&pad.dir);
     // Recorded with the pad it actually is, so a later re-delivery of this
     // same pad is recognised as one and a different pad is not. A full
     // reset rather than a mark: the new pad replaced the tool's per-contact

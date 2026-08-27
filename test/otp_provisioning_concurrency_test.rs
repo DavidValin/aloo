@@ -199,14 +199,20 @@ async fn an_active_live_session_does_not_block_new_otp_mail_key() {
 /// `/new-otp-mail-key` on a contact that already has a mail key: unlike
 /// `/otp`, which legitimately re-sends `OtpSessionRequest` even when a key
 /// already exists (that is what resumes a session after `/endotp`), mail
-/// has no session to resume - one call to `check_recipient` at compose
-/// time already answers whether it's usable. So this must be refused
-/// locally, with the exact wording asked for, before anything reaches the
-/// network.
+/// has no session to *resume* - one call to `check_recipient` at compose
+/// time already answers whether it's usable. But that does not mean
+/// nothing is left to do: a mail key running low is exactly the situation
+/// a user runs `/new-otp-mail-key` in, and refusing it outright (this
+/// test's old behaviour, AC-302) left no way back except a manual
+/// `/contacts` delete first. So this must proceed to the same
+/// fresh-generate confirmation a first-ever request would, never refuse
+/// just because a key already exists (AC-384) - the actual install step
+/// (`commit_pending_setup`/`on_pad_commit`) is what replaces the old key
+/// once the peer accepts.
 ///
-/// @requirement AC-302
+/// @requirement AC-384, AC-302
 #[tokio::test]
-async fn a_mail_key_that_already_exists_is_refused_locally() {
+async fn a_mail_key_that_already_exists_still_proceeds_to_a_fresh_generate() {
     if !require_otp() {
         return;
     }
@@ -262,12 +268,18 @@ async fn a_mail_key_that_already_exists_is_refused_locally() {
     .await
     .expect("the function itself does not fail");
 
-    let (message, success) = ui.status_notice.expect("a notice must explain the refusal");
-    assert_eq!(
-        message, "otp mail key already exists. use /mail or delete existing in /contacts",
-        "the exact wording asked for"
+    assert!(
+        ui.otp_generate_confirm_open().is_some(),
+        "an already-existing mail key must not refuse /new-otp-mail-key any more - it must open \
+         the same fresh-generate confirmation a first-ever request would"
     );
-    assert!(!success);
+    assert!(
+        !ui.status_notice
+            .as_ref()
+            .is_some_and(|(m, _)| m.contains("already exists")),
+        "the old outright-refusal wording must be gone: {:?}",
+        ui.status_notice
+    );
 }
 
 /// The commit is the one provisioning payload whose loss splits a fresh

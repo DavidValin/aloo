@@ -254,6 +254,38 @@ Feature: How a message is encrypted, at every layer
     Then bob reads it, and registers alice because the pad opened it
     And bob's acknowledgement proves he decrypted it
 
+  @US-033 @AC-381 @direct_otp
+  Scenario: Deleting a key with no active session shows no ended notice
+    Given alice and bob reach each other directly and hold a pad for each other
+    And alice and bob are both registered, with otp active
+    When alice deletes the otp key for bob
+    Then alice no longer shows an active otp session with bob
+    And bob still shows an active otp session with alice
+
+  @US-033 @AC-381 @direct_otp
+  Scenario: Deleting an active session's own key ends it locally, not just the keychain
+    Given alice and bob reach each other directly and hold a pad for each other
+    And alice and bob are both registered, with otp active
+    When bob deletes the otp key for alice
+    Then bob no longer shows an active otp session with alice
+    And bob's otp status notice says "ended"
+
+  @US-033 @AC-380 @direct_otp
+  Scenario: A message decrypts normally while both sides still hold the key
+    Given alice and bob reach each other directly and hold a pad for each other
+    And alice and bob are both registered, with otp active
+    When alice sends bob "still shared, still readable"
+    Then bob decrypts it normally and the session stays active for both
+
+  @US-033 @AC-380 @direct_otp
+  Scenario: A message the recipient can no longer decrypt ends his own side of the session
+    Given alice and bob reach each other directly and hold a pad for each other
+    And alice and bob are both registered, with otp active
+    And bob's otp keychain entry for alice is gone, without the app knowing yet
+    When alice sends bob "are you still there"
+    Then bob cannot decrypt it, and ends his own side of the session
+    And bob's otp status notice says "ending the session"
+
   @US-033 @AC-259 @direct_otp
   Scenario: A pad-only pair needs no /otp round trip to start
     Given alice and bob reach each other directly and hold a pad for each other

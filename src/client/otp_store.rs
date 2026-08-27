@@ -577,6 +577,37 @@ impl OtpStore {
         }
     }
 
+    /// Drops this side's own outstanding end-notice *send* -
+    /// `pending_unacked_out_seq`/`pending_content`/`pending_ack_proof` - but
+    /// only when what is actually pending is the end notice itself
+    /// (`PendingOtpContent::EndNotice`); an ordinary message still in
+    /// flight for this contact has its own, unrelated resolution path
+    /// (`client::otp::recover_and_resend`/the peer's real
+    /// `OtpDeliveryAck`) and must not be silently discarded just because
+    /// the session happens to be ending too.
+    ///
+    /// Used when a peer's own end-of-session notice arrives for this
+    /// contact - whether a genuine `/endotp` or the substitute notice
+    /// `client::otp::end_session_for_missing_contact` sends when it
+    /// discovers this side's contact is gone - instead of the
+    /// acknowledgement this side's own notice was waiting for: that ack
+    /// (`client::otp::on_end_session_ack`/`apply_otp_message`'s
+    /// `OtpEndSession` arm) will now never come for this exact send, since
+    /// the peer answered with a fresh notice of their own rather than
+    /// acknowledging this side's. Without this, `pending_end_notice` and
+    /// the gate it armed would stay set forever, refusing every further
+    /// send to this contact with "the session is ending" until the next
+    /// `/otp` happened to reset it.
+    pub fn clear_own_pending_end_notice_send(&mut self, contact_name: &str) {
+        if let Some(state) = self.entries.get_mut(contact_name)
+            && matches!(state.pending_content, Some(PendingOtpContent::EndNotice))
+        {
+            state.pending_unacked_out_seq = None;
+            state.pending_content = None;
+            state.pending_ack_proof = None;
+        }
+    }
+
     /// Replaces `contact_name`'s entry for a genuinely *new* pad just
     /// installed over it (`otp_cli::add_contact` ran): the tool's own
     /// per-contact state - sequence numbers, offsets, the recover-last

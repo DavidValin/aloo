@@ -3,6 +3,7 @@
 //! (`crate::client::channel`/`crate::client::direct_message` only add the thin "which log
 //! entry does this stream belong to" bookkeeping on top of this).
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use crate::client::session::SessionState;
@@ -17,6 +18,22 @@ use crate::proto::{self, UserId};
 /// the server keeps no per-stream state to notify from (by design), so
 /// abandonment has to be detected client-side.
 pub(crate) const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How many chunks a stream with no `StreamStart` yet may buffer before
+/// further ones are simply dropped - mirrors `ChunkDecryptor`'s own
+/// `MAX_PENDING_CHUNKS` bounded-buffer rule for the same reason: a
+/// `StreamStart` that never arrives (lost, or a hostile peer that never
+/// sends one) must not let this grow without bound.
+const MAX_EARLY_CHUNKS: usize = 128;
+/// How many distinct `(from, stream_id)` streams may have chunks waiting
+/// on a `StreamStart` at once - bounds total memory one peer could occupy
+/// by racing chunks for many stream_ids that never start, not just one.
+const MAX_EARLY_STREAMS: usize = 8;
+/// How long a stream's early chunks are held before being dropped - well
+/// beyond any plausible `StreamStart` delivery delay (one network round
+/// trip, plus retransmit), so this only ever fires for a `StreamStart`
+/// that is genuinely never coming.
+const EARLY_CHUNK_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// What a currently-recording (our own) stream is addressed to, remembered
 /// from `VoiceRecordStart` so the eventual "recording finished" report
@@ -202,6 +219,94 @@ pub(crate) struct ActiveStream {
     /// that took it reports back and the entry goes with it, so a stream
     /// still here afterwards is one whose worker is not answering.
     pub(crate) end_requested: bool,
+}
+
+pub(crate) struct PendingChunks {
+    chunks: Vec<(u32, Vec<Vec<u8>>)>,
+    first_seen: Instant,
+}
+
+/// Holds voice chunks that outran their own `StreamStart` - `Chunk` travels
+/// unreliable UDP while `StreamStart` travels the reliable channel
+/// (`docs/PROTOCOL.md` §7.3), and both cross the same socket, so nothing
+/// guarantees the reliable one is *processed* first even though it is
+/// always sent first. For an ordinary multi-second recording this is
+/// harmless - the stream self-heals once `StreamStart` catches up a moment
+/// later - but a recording short enough to finish (and send `StreamEnd`)
+/// before `StreamStart` is processed would otherwise lose every chunk it
+/// ever sent, since `StreamEnd` is on the same reliable, in-order channel
+/// as `StreamStart` and so is guaranteed to finalize the stream
+/// immediately after it starts. `take` replays whatever is held, in
+/// arrival order, the moment that `StreamStart` lands.
+///
+/// Keyed by `(from, stream_id)` exactly like `active_streams` - never by
+/// `stream_id` alone, since it is only unique per sender - so one peer's
+/// buffered chunks can never be released by another peer's `StreamStart`:
+/// `from` here is always the already-authenticated peer a punched link
+/// resolved the datagram to, never a claim read out of the datagram
+/// itself. Bounded two ways (`MAX_EARLY_CHUNKS` per stream,
+/// `MAX_EARLY_STREAMS` distinct streams at once) and aged out by `sweep`
+/// on `EARLY_CHUNK_TIMEOUT`, so a `StreamStart` that never arrives - lost,
+/// or a hostile peer that never sends one - cannot grow this without
+/// limit.
+pub struct PendingChunkBuffer {
+    streams: HashMap<(UserId, u64), PendingChunks>,
+}
+
+impl Default for PendingChunkBuffer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PendingChunkBuffer {
+    pub fn new() -> Self {
+        Self {
+            streams: HashMap::new(),
+        }
+    }
+
+    /// Buffers one chunk for `(from, stream_id)` - dropped instead if
+    /// that stream is already at `MAX_EARLY_CHUNKS`, or starting it would
+    /// exceed `MAX_EARLY_STREAMS` distinct streams waiting at once.
+    pub fn push(&mut self, from: UserId, stream_id: u64, seq: u32, blocks: Vec<Vec<u8>>) {
+        let key = (from, stream_id);
+        if !self.streams.contains_key(&key) {
+            if self.streams.len() >= MAX_EARLY_STREAMS {
+                return;
+            }
+            self.streams.insert(
+                key,
+                PendingChunks {
+                    chunks: Vec::new(),
+                    first_seen: Instant::now(),
+                },
+            );
+        }
+        if let Some(pending) = self.streams.get_mut(&key) {
+            if pending.chunks.len() < MAX_EARLY_CHUNKS {
+                pending.chunks.push((seq, blocks));
+            }
+        }
+    }
+
+    /// Removes and returns whatever is buffered for `(from, stream_id)`,
+    /// in arrival order - empty if nothing was waiting. Called once when
+    /// that stream's `StreamStart` lands.
+    pub fn take(&mut self, from: UserId, stream_id: u64) -> Vec<(u32, Vec<Vec<u8>>)> {
+        self.streams
+            .remove(&(from, stream_id))
+            .map(|p| p.chunks)
+            .unwrap_or_default()
+    }
+
+    /// Drops any buffer that has waited longer than `EARLY_CHUNK_TIMEOUT`
+    /// for a `StreamStart` that never came.
+    pub fn sweep(&mut self, now: Instant) {
+        self.streams.retain(|_, pending| {
+            now.saturating_duration_since(pending.first_seen) < EARLY_CHUNK_TIMEOUT
+        });
+    }
 }
 
 /// What the idle sweep should do about one incoming stream that has gone
@@ -736,12 +841,17 @@ pub(crate) fn start_incoming_stream(
     session.active_streams.insert(
         (from, stream_id),
         ActiveStream {
-            job_tx,
+            job_tx: job_tx.clone(),
             channel,
             last_seen: Instant::now(),
             end_requested: false,
         },
     );
+    // Replay, in arrival order, anything that outran this `StreamStart` -
+    // see `PendingChunkBuffer`'s doc for why that can happen at all.
+    for (seq, blocks) in session.pending_stream_chunks.take(from, stream_id) {
+        let _ = job_tx.send(DecryptJob::Chunk(seq, blocks));
+    }
 }
 
 pub(crate) fn forward_chunk(
@@ -754,7 +864,11 @@ pub(crate) fn forward_chunk(
     if let Some(s) = session.active_streams.get_mut(&(from, stream_id)) {
         s.last_seen = Instant::now();
         let _ = s.job_tx.send(DecryptJob::Chunk(seq, blocks));
+        return;
     }
+    session
+        .pending_stream_chunks
+        .push(from, stream_id, seq, blocks);
 }
 
 /// Hands a `pq_hybrid` stream's key setup to its decrypt worker. Like

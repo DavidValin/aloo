@@ -77,6 +77,16 @@ fn rendered_rows(w: &AlooWorld) -> Vec<String> {
 // Compose view (AC-154..AC-159) - UiState-driven
 // ---------------------------------------------------------------------
 
+/// `steps::ui_common::press_key`'s stand-in for a real session's answer to
+/// `RequestOpenOtpMail` (`client::otp_mail::handle_open_otp_mail`) - this
+/// `UiState`-only World has no session to genuinely check against, so
+/// every other scenario gets the happy default (the binary is there) and
+/// only this step overrides it.
+#[given("the local otp binary is not installed")]
+async fn otp_binary_not_installed(w: &mut AlooWorld) {
+    w.otp_binary_unavailable = true;
+}
+
 #[then("the mail compose view is open")]
 async fn compose_open(w: &mut AlooWorld) {
     assert!(w.ui_ref().otp_mail.is_some());

@@ -13,7 +13,7 @@ use ratatui::widgets::Paragraph;
 use crate::proto::{KeyMode, UserId, UserInfo};
 
 use super::ui::{
-    FileTransferStatus, Focus, LogEntry, MessageBody, MessageDelivery, UiState,
+    FileTransferStatus, Focus, LogEntry, MessageBody, MessageCrypto, MessageDelivery, UiState,
     finalize_held_stream, finalize_stream_entry, local_time_stamp, push_log_entry,
     render_input_bar, render_messages,
 };
@@ -460,6 +460,38 @@ impl UiState {
             && let Some(entry) = room.log.get_mut(log_index)
         {
             entry.failed = true;
+        }
+    }
+
+    /// Corrects the log row at `log_index` in `peer`'s room to the crypto
+    /// scheme actually used, once the send path has genuinely decided and
+    /// performed it (`client::otp::send_now`, `client::direct_message::handle_send_text`'s
+    /// plain-envelope branch) - the async-decision counterpart of
+    /// `mark_dm_message_failed`.
+    ///
+    /// `push_outgoing_dm` stamps a row's `crypto` synchronously, on the UI
+    /// thread, the instant Enter is pressed - from `is_otp_active` *at that
+    /// exact moment*. The real encryption path is decided later, once the
+    /// queued send action actually reaches the session task
+    /// (`otp::contact_name_for_sending`, re-checking `is_otp_active` fresh).
+    /// Between those two moments a session can genuinely start or end, so
+    /// the two checks can disagree: a message typed the instant a session
+    /// resumes could be logged as sent under `pq_hybrid` while actually
+    /// sent, correctly, under the pad - or the reverse. Real remote round
+    /// trips (the confirmation that flips `is_otp_active`) widen this
+    /// window far past what a loopback test ever shows; this call is what
+    /// makes the row's own label agree with what genuinely went out, no
+    /// matter which way the race fell.
+    pub fn set_dm_message_crypto(
+        &mut self,
+        peer: UserId,
+        log_index: usize,
+        crypto: Option<MessageCrypto>,
+    ) {
+        if let Some(room) = self.private_rooms.get_mut(&peer)
+            && let Some(entry) = room.log.get_mut(log_index)
+        {
+            entry.crypto = crypto;
         }
     }
 

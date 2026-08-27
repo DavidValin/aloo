@@ -6,7 +6,7 @@
 use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 use cucumber::{given, then, when};
 
-use aloo::client::tui::ui::{Focus, MessageBody, UiState};
+use aloo::client::tui::ui::{Focus, MessageBody, UiAction, UiState};
 use aloo::proto::{ChannelInfo, ChannelKind, KeyMode, UserId, UserInfo};
 
 use crate::support::{popup_body, ui_buffer};
@@ -228,6 +228,29 @@ pub fn press_key(w: &mut AlooWorld, code: KeyCode, mods: KeyModifiers) {
     }
     let action = w.ui_mut().handle_key(code, mods, KeyEventKind::Press);
     w.action_was_none = action.is_none();
+    // `RequestOpenOtpMail` (`/mail`) only ever asks the session to check the
+    // local `otp` binary before opening the compose view
+    // (`client::otp_mail::handle_open_otp_mail`) - this `UiState`-only World
+    // has no session to answer it for real. Every `otp_mail.feature`
+    // scenario predates that guard and assumes the binary is simply there,
+    // so the default here is the same happy answer a real session would
+    // give when it genuinely is - the one scenario about the binary being
+    // missing (`features/messaging/otp_mail.feature`, "no local otp
+    // binary") answers this itself instead, before pressing Enter.
+    if matches!(action, Some(UiAction::RequestOpenOtpMail)) {
+        if w.otp_binary_unavailable {
+            // The exact wording `client::otp_mail::handle_open_otp_mail`
+            // produces for a real session's refusal.
+            w.ui_mut().push_status_notice(
+                "OTP mail failed: the 'otp' command isn't installed - see \
+                 github.com/DavidValin/otp-toolkit"
+                    .to_string(),
+                false,
+            );
+        } else {
+            w.ui_mut().open_otp_mail();
+        }
+    }
     if action.is_some() {
         w.last_action = action;
     }

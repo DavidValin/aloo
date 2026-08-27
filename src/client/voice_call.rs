@@ -130,6 +130,14 @@ pub(crate) struct ActiveCall {
     /// Setups from participants we have not added yet - see
     /// `PendingCallSetups`.
     pending_setups: PendingCallSetups,
+    /// Audio chunks from participants we have not added yet - the same
+    /// ordinary-order race `PendingCallSetups` exists for (`add_participant`
+    /// still needs their `CallAccept` before we can add them, but nothing
+    /// stops their audio from reaching us first), except a stream of chunks
+    /// rather than the single setup a `pq_hybrid` peer sends once. Reuses
+    /// `voice_stream::PendingChunkBuffer` verbatim - `call_id` stands in for
+    /// `stream_id` here exactly as it does everywhere else in this module.
+    pending_chunks: voice_stream::PendingChunkBuffer,
     muted: bool,
     /// Silenced by the host (`P2pPayload::CallMute`) - unlike `muted`,
     /// only the host can lift it, and every participant is told.
@@ -224,6 +232,7 @@ pub(crate) fn begin_own_call(
         host,
         participants: HashMap::new(),
         pending_setups: PendingCallSetups::default(),
+        pending_chunks: voice_stream::PendingChunkBuffer::new(),
         muted: false,
         host_muted: false,
         cmd_tx,
@@ -413,18 +422,34 @@ pub(crate) fn forward_key_setup(
     }
 }
 
+/// A chunk from a participant already on our roster is handed straight to
+/// their decrypt worker; one from a `from` we have not added yet - the
+/// normal order, not an edge case, see `PendingCallSetups`'s doc for why -
+/// is held in `pending_chunks` for `add_participant` to replay once they
+/// actually join, rather than lost: unlike a short push-to-talk message
+/// this doesn't cost a whole clip, but it would otherwise mean a
+/// participant's first moment of audio is silently missing every time they
+/// join a call already in progress.
 pub(crate) fn forward_chunk(
-    session: &SessionState,
+    session: &mut SessionState,
     from: UserId,
     stream_id: u64,
     seq: u32,
     blocks: Vec<Vec<u8>>,
 ) {
-    if let Some(call) = session.active_call.as_ref()
-        && call.call_id == stream_id
-        && let Some(peer) = call.participants.get(&from)
-    {
-        let _ = peer.job_tx.send(DecryptJob::Chunk(seq, blocks));
+    let Some(call) = session.active_call.as_mut() else {
+        return;
+    };
+    if call.call_id != stream_id {
+        return;
+    }
+    match call.participants.get(&from) {
+        Some(peer) => {
+            let _ = peer.job_tx.send(DecryptJob::Chunk(seq, blocks));
+        }
+        None => {
+            call.pending_chunks.push(from, stream_id, seq, blocks);
+        }
     }
 }
 
@@ -484,11 +509,15 @@ async fn add_participant(
     let _ = call
         .cmd_tx
         .send(CallRecorderCmd::AddRecipient(peer, Box::new(key)));
-    // Anything this peer sent before we could add them - in practice their
-    // one `pq_hybrid` key setup - goes in first, ahead of any chunk the
-    // worker is about to be handed. See `forward_key_setup`.
+    // Anything this peer sent before we could add them - their one
+    // `pq_hybrid` key setup, then whatever audio chunks followed it - goes
+    // in first, in that order, ahead of any live chunk the worker is about
+    // to be handed next. See `forward_key_setup`/`forward_chunk`.
     if let Some(setup) = call.pending_setups.take(peer) {
         let _ = job_tx.send(DecryptJob::KeySetup(setup));
+    }
+    for (seq, blocks) in call.pending_chunks.take(peer, call_id) {
+        let _ = job_tx.send(DecryptJob::Chunk(seq, blocks));
     }
     call.participants
         .insert(peer, ActiveCallPeer { job_tx, mixer_id });

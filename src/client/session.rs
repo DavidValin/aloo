@@ -125,6 +125,10 @@ pub struct SessionState {
     pub(crate) next_mixer_id: u64,
     pub(crate) own_stream_targets: HashMap<u64, voice_stream::OwnStreamTarget>,
     pub(crate) active_streams: HashMap<(UserId, u64), voice_stream::ActiveStream>,
+    /// Voice chunks that outran their own `StreamStart` - see
+    /// `voice_stream::PendingChunkBuffer`'s doc for why that race exists at
+    /// all.
+    pub(crate) pending_stream_chunks: voice_stream::PendingChunkBuffer,
     /// File-transfer counterparts of the two maps above - see
     /// `file_transfer::OwnFileTarget`/`ActiveFileTransfer`. Keyed the same
     /// way: `own_file_targets` by our own `stream_id` alone (it's always
@@ -621,6 +625,7 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
         next_mixer_id: 1,
         own_stream_targets: HashMap::new(),
         active_streams: HashMap::new(),
+        pending_stream_chunks: voice_stream::PendingChunkBuffer::new(),
         own_file_targets: HashMap::new(),
         active_file_transfers: HashMap::new(),
         otp_incoming_file_receives: HashMap::new(),
@@ -1191,6 +1196,7 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
                 ui_state.tick_status_notice(Instant::now());
                 ui_state.tick_selector_dropdown(Instant::now());
                 sweep_idle_streams(&mut ui_state, &mut session, Instant::now());
+                session.pending_stream_chunks.sweep(Instant::now());
                 session.peer_link.tick_with_clock(crate::client::p2p::utc_second_of_hour());
             }
             Some((nickname, addr)) = direct_resolved_rx.recv() => {
@@ -1774,6 +1780,9 @@ async fn handle_ui_action(
         UiAction::SelectOtpMailDevice { nickname, device_id } => {
             crate::client::otp_mail::handle_select_device(session, ui_state, nickname, device_id)
                 .await;
+        }
+        UiAction::RequestOpenOtpMail => {
+            crate::client::otp_mail::handle_open_otp_mail(session, ui_state);
         }
         UiAction::OpenOtpMailbox => {
             crate::client::otp_mail::handle_open_mailbox(session, ui_state);
@@ -4686,11 +4695,123 @@ impl SessionState {
         self.own_device_id = device_id;
     }
 
+    /// Overrides the `otp` binary this session shells out to - exposed for
+    /// tests that need to simulate the binary becoming unreachable (a bad
+    /// `ALOO_OTP_BIN`, one uninstalled mid-session, a moved path) partway
+    /// through a scenario, then becoming reachable again, without tearing
+    /// down and rebuilding the whole session in between (which would lose
+    /// exactly the in-memory state - `otp_incoming_pads`, `otp_store` - the
+    /// scenario is trying to hold constant across the change).
+    pub fn set_otp_binary_path_for_test(&mut self, path: std::path::PathBuf) {
+        self.otp_cli_cfg.binary_path = path;
+    }
+
+    /// Reads back this session's `otp` binary/keychain config - exposed for
+    /// tests that need to call `otp_cli` functions directly (`show_contact`,
+    /// `status`, ...) against the exact same keychain the session itself
+    /// installed into, to verify an install actually happened rather than
+    /// only that the session's own in-memory bookkeeping believes it did.
+    pub fn otp_cli_cfg_for_test(&self) -> crate::client::otp_cli::OtpCliConfig {
+        self.otp_cli_cfg.clone()
+    }
+
+    /// Stages a pad under `from` exactly as `otp_pad`'s real streaming
+    /// reassembly would have left it - `on_pad_commit` expects to find it at
+    /// `otp_pad::incoming_paths` inside a staging directory, keyed by
+    /// `contact_name` - so a test can drive `on_pad_commit`'s install/retry
+    /// logic directly without standing up two peers and a full P2P pad
+    /// transfer (`otp::on_pad_start`/`on_pad_chunk`/`on_pad_end`, all
+    /// crate-private). The bytes themselves need no relation to any real
+    /// peer's half: `on_pad_commit` never re-verifies them against
+    /// anything (that already happened in `on_pad_verify`, before a commit
+    /// is ever sent) - only `otp_cli::add_contact` reads them, to install
+    /// them as this contact's pad.
+    pub fn stage_incoming_pad_for_test(&mut self, from: UserId, contact_name: String) {
+        let dir = self
+            .otp_cli_cfg
+            .working_dir
+            .join(".tmp")
+            .join(format!("test-incoming-{}-{contact_name}", from.0));
+        std::fs::create_dir_all(&dir).expect("test staging dir");
+        let (enc_path, dec_path) = crate::client::otp_pad::incoming_paths(&dir);
+        std::fs::write(&enc_path, vec![0xAB; 4096]).expect("write test enc pad");
+        std::fs::write(&dec_path, vec![0xCD; 4096]).expect("write test dec pad");
+        let enc_digest =
+            crate::crypto::otp::digest_key_file(&enc_path).expect("digest test enc pad");
+        let dec_digest =
+            crate::crypto::otp::digest_key_file(&dec_path).expect("digest test dec pad");
+        let (job_tx, _job_rx) = tokio::sync::mpsc::unbounded_channel();
+        self.otp_incoming_pads.insert(
+            from,
+            crate::client::otp_pad::IncomingPad {
+                stream_id: 0,
+                contact_name,
+                keypair_size_mb: 1,
+                enc_digest,
+                dec_digest,
+                dir,
+                job_tx,
+                received_bytes: 8192,
+                started_at: std::time::Instant::now(),
+            },
+        );
+    }
+
+    /// Whether a pad is still staged under `from`, for whatever contact
+    /// name - the other half of `stage_incoming_pad_for_test`'s test seam,
+    /// letting a test confirm a failed `on_pad_commit` install left the
+    /// staged bytes alone rather than checking their absence only
+    /// indirectly (a successful later retry).
+    pub fn has_staged_incoming_pad_for_test(&self, from: UserId) -> bool {
+        self.otp_incoming_pads.contains_key(&from)
+    }
+
+    /// Whether this side is still waiting on the peer's answer to its own
+    /// "generate a fresh pad?" proposal for `contact_name`
+    /// (`confirm_generate`'s `otp_awaiting_consent` insert) - exposed for
+    /// tests confirming glare resolution (`on_session_request`) withdraws
+    /// the losing side's proposal and leaves the winning side's untouched.
+    pub fn has_awaiting_otp_consent_for_test(&self, contact_name: &str) -> bool {
+        self.otp_awaiting_consent.contains_key(contact_name)
+    }
+
+    /// This session's rotating pq_hybrid peer keys - exposed for tests
+    /// that send an ordinary (non-OTP) sealed envelope without a real
+    /// connection's `UserJoined`/`KeyRotated` traffic to bootstrap it,
+    /// most notably a fresh `OtpSessionRequest`/`OtpKeySetupAck` exchange
+    /// (`test/otp_pad_glare_test.rs`), which `client::envelope::encrypt_envelope_for`
+    /// refuses outright with no rotating key on file for the recipient.
+    pub fn pq_peer_keys_mut(&mut self) -> &mut crate::client::pq_rekey::PqPeerKeys {
+        &mut self.pq_peer_keys
+    }
+
     /// This session's identity-pinning store - exposed for tests, which
     /// need to pin a serverless peer's key the way a previous connection
     /// (or a hand-installed contact) would have.
     pub fn id_store_mut(&mut self) -> &mut idstore::IdStore {
         &mut self.id_store
+    }
+
+    /// Read-only counterpart of `id_store_mut` - exposed for tests that
+    /// only need to derive a contact name (`contacts::otp_contact_name_for`)
+    /// against an already-pinned device, not to pin one themselves.
+    pub fn id_store_ref(&self) -> &idstore::IdStore {
+        &self.id_store
+    }
+
+    /// Stages this side's own "generate a fresh pad?" proposal as already
+    /// awaiting the peer's answer, exactly as `client::otp::confirm_generate`
+    /// leaves it right after sending the real request - exposed for tests
+    /// that need to simulate that in-flight state directly
+    /// (`test/otp_install_race_test.rs`) without driving the whole
+    /// popup/consent round trip to reach it.
+    pub fn stage_awaiting_otp_consent_for_test(
+        &mut self,
+        contact_name: String,
+        pending: crate::client::tui::ui::PendingOtpGenerate,
+        size_mb: u32,
+    ) {
+        self.otp_awaiting_consent.insert(contact_name, (pending, size_mb));
     }
 
     /// The OTP layer's per-contact state - exposed for tests, which need
@@ -4785,6 +4906,7 @@ impl SessionState {
             next_mixer_id: 1,
             own_stream_targets: HashMap::new(),
             active_streams: HashMap::new(),
+            pending_stream_chunks: voice_stream::PendingChunkBuffer::new(),
             own_file_targets: HashMap::new(),
             active_file_transfers: HashMap::new(),
             otp_incoming_file_receives: HashMap::new(),

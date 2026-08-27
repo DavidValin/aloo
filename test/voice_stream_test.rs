@@ -1,7 +1,10 @@
 //! Tests for the parts of `client::voice_stream` that are pure data
 //! transformation - specifically `ChunkDecryptor`, which decides what an
 //! incoming stream's chunks decrypt to and what happens to chunks that
-//! arrive before the setup they depend on (`docs/PROTOCOL.md`, US-027).
+//! arrive before the setup they depend on (`docs/PROTOCOL.md`, US-027), and
+//! `PendingChunkBuffer`, the same idea one layer up: chunks that arrive
+//! before the stream itself has even started (`docs/PROTOCOL.md` 7.3,
+//! US-007/TB-037).
 //!
 //! The rest of the module needs a live audio device or socket and is
 //! covered at the acceptance layer instead (see `docs/TESTING.md`).
@@ -12,13 +15,14 @@
 //! enough to skip. `hybrid_crypto_test.rs` covers the real sizes.
 
 use aloo::client::voice_stream::{
-    ChunkDecryptor, DirectStreamKey, IdleStreamAction, IncomingStreamKey, encrypt_direct_chunk,
-    idle_stream_action,
+    ChunkDecryptor, DirectStreamKey, IdleStreamAction, IncomingStreamKey, PendingChunkBuffer,
+    encrypt_direct_chunk, idle_stream_action,
 };
 use aloo::crypto::pq::{
     PqPublicBundle, bundle_fingerprint, generate_bundle_with_bits, seal_chunk, seal_setup,
 };
 use aloo::proto;
+use aloo::proto::UserId;
 use std::time::{Duration, Instant};
 
 const TEST_BITS: usize = 1024;
@@ -258,5 +262,154 @@ fn a_stream_whose_worker_is_gone_is_given_up_on() {
     assert_eq!(
         idle_stream_action(now, now, true, false),
         IdleStreamAction::Wait
+    );
+}
+
+// ---------------------------------------------------------------------
+// Chunks that outrun their own StreamStart (docs/PROTOCOL.md 7.3)
+// ---------------------------------------------------------------------
+//
+// `Chunk` travels unreliable UDP while `StreamStart` travels the reliable
+// channel, so nothing guarantees the receiver *processes* `StreamStart`
+// before the chunks that follow it - only that it was *sent* first. A
+// recording short enough to finish (and send `StreamEnd`, itself reliable
+// and therefore guaranteed to land only after `StreamStart`) before
+// `StreamStart` is processed would otherwise lose every chunk it ever
+// sent, since there would be no `active_streams` entry yet for any of
+// them to attach to. `PendingChunkBuffer` is what a real session holds
+// them in until that happens.
+
+fn alice() -> UserId {
+    UserId(1)
+}
+
+fn bob() -> UserId {
+    UserId(2)
+}
+
+/// The chunks a short recording sent before `StreamStart` was processed
+/// must all come back, in the order they arrived, once it is. The same
+/// buffer is reused verbatim by `voice_call.rs` for a call participant's
+/// audio arriving before their `CallAccept` is processed (TB-268).
+/// @requirement TB-267, TB-268
+#[test]
+fn chunks_arriving_before_stream_start_are_replayed_in_arrival_order() {
+    let mut pending = PendingChunkBuffer::new();
+
+    for seq in 0..5u32 {
+        pending.push(alice(), 1, seq, vec![format!("chunk {seq}").into_bytes()]);
+    }
+
+    let replayed = pending.take(alice(), 1);
+    assert_eq!(replayed.len(), 5, "every buffered chunk must come back");
+    for (i, (seq, blocks)) in replayed.iter().enumerate() {
+        assert_eq!(*seq, i as u32, "chunks must be replayed in arrival order");
+        assert_eq!(blocks, &vec![format!("chunk {i}").into_bytes()]);
+    }
+
+    // Taken once, not left behind for a second `StreamStart` (a
+    // retransmitted one, say) to double-replay.
+    assert!(pending.take(alice(), 1).is_empty());
+}
+
+/// A stream with nothing buffered for it - the ordinary case, since this
+/// race is rare - replays as simply nothing, not an error.
+/// @requirement TB-267
+#[test]
+fn taking_a_stream_with_nothing_buffered_is_empty_not_an_error() {
+    let mut pending = PendingChunkBuffer::new();
+    assert!(pending.take(alice(), 1).is_empty());
+}
+
+/// `stream_id` is only unique per sender (docs/PROTOCOL.md 7.3 "Stream
+/// identity"), so the buffer must key by `(from, stream_id)` - never
+/// `stream_id` alone - or one peer's `StreamStart` could release another
+/// peer's buffered audio - the same reason `voice_call.rs` can key its own
+/// use of this buffer by `(from, call_id)` and never worry about two
+/// participants colliding (TB-268).
+/// @requirement TB-267, TB-268
+#[test]
+fn pending_chunks_are_isolated_by_both_sender_and_stream_id() {
+    let mut pending = PendingChunkBuffer::new();
+
+    pending.push(alice(), 1, 0, vec![b"alice's stream 1".to_vec()]);
+    pending.push(bob(), 1, 0, vec![b"bob's stream 1, same id".to_vec()]);
+    pending.push(alice(), 2, 0, vec![b"alice's stream 2".to_vec()]);
+
+    assert_eq!(
+        pending.take(alice(), 1),
+        vec![(0, vec![b"alice's stream 1".to_vec()])]
+    );
+    // Taking alice's stream 1 must not have touched bob's stream 1, nor
+    // alice's own stream 2.
+    assert_eq!(
+        pending.take(bob(), 1),
+        vec![(0, vec![b"bob's stream 1, same id".to_vec()])]
+    );
+    assert_eq!(
+        pending.take(alice(), 2),
+        vec![(0, vec![b"alice's stream 2".to_vec()])]
+    );
+}
+
+/// A `StreamStart` that never arrives at all - lost, or a peer that
+/// simply never sends one - must not let buffered chunks sit forever. A
+/// call participant who never actually joins (invited but the call ends
+/// first, say) leans on this same sweep to age their audio out (TB-268).
+/// @requirement TB-267, TB-268
+#[test]
+fn a_stream_start_that_never_arrives_is_swept_after_its_timeout() {
+    let mut pending = PendingChunkBuffer::new();
+    let t0 = Instant::now();
+    pending.push(alice(), 1, 0, vec![b"never claimed".to_vec()]);
+
+    // Well under any reasonable timeout: still there.
+    pending.sweep(t0 + Duration::from_secs(1));
+    assert_eq!(
+        pending.take(alice(), 1),
+        vec![(0, vec![b"never claimed".to_vec()])],
+        "a fresh buffer must not be swept away early"
+    );
+
+    // Re-buffer, then sweep well past any reasonable timeout.
+    pending.push(alice(), 1, 0, vec![b"never claimed".to_vec()]);
+    pending.sweep(t0 + Duration::from_secs(30));
+    assert!(
+        pending.take(alice(), 1).is_empty(),
+        "a StreamStart that never came must not hold its chunks forever"
+    );
+}
+
+/// A hostile or buggy peer racing chunks for many stream_ids that never
+/// start, or flooding one stream_id with chunks that never get claimed,
+/// must not grow this buffer without limit while waiting - including a
+/// call participant flooding audio for a `call_id` under a host who never
+/// actually adds them (TB-268).
+/// @requirement TB-267, TB-268
+#[test]
+fn pending_chunks_stay_bounded_under_a_flood() {
+    let mut pending = PendingChunkBuffer::new();
+
+    // Far more chunks for one never-started stream than any real
+    // recording would send before a `StreamStart` could plausibly land.
+    for seq in 0..10_000u32 {
+        pending.push(alice(), 1, seq, vec![vec![0u8]]);
+    }
+    assert!(
+        pending.take(alice(), 1).len() < 10_000,
+        "one stream's buffer must not grow to match an unbounded flood"
+    );
+
+    // Far more distinct never-started stream_ids than a real client would
+    // ever have open at once.
+    for stream_id in 0..1_000u64 {
+        pending.push(alice(), stream_id, 0, vec![vec![0u8]]);
+    }
+    let claimed: usize = (0..1_000u64)
+        .map(|stream_id| pending.take(alice(), stream_id).len())
+        .sum();
+    assert!(
+        claimed < 1_000,
+        "the number of distinct streams waiting at once must also stay bounded"
     );
 }

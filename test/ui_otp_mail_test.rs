@@ -19,11 +19,26 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ui_common::{ctrl, joined_general_with, press, type_str, user};
 
+/// `/mail` only asks the session to open the view
+/// (`UiAction::RequestOpenOtpMail`) - only it can check the local `otp`
+/// binary is available (`client::otp_mail::handle_open_otp_mail`), which
+/// `UiState` alone has no way to do. The call here simulates that session
+/// answering with the binary present, the same way these UI-level tests
+/// simulate every other session-side answer (module doc).
 fn open_mail(state: &mut UiState) {
     type_str(state, "/mail");
-    assert!(press(state, KeyCode::Enter).is_none());
-    assert!(state.otp_mail.is_some(), "/mail should open the mail view");
+    assert_eq!(
+        press(state, KeyCode::Enter),
+        Some(UiAction::RequestOpenOtpMail),
+        "/mail asks the session to check the binary before opening"
+    );
     assert!(state.input.is_empty(), "the command is consumed");
+    assert!(
+        state.otp_mail.is_none(),
+        "not open yet - only the session's answer opens it"
+    );
+    state.open_otp_mail();
+    assert!(state.otp_mail.is_some(), "/mail should open the mail view");
 }
 
 fn open_mailbox(state: &mut UiState) {

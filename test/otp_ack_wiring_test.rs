@@ -36,7 +36,7 @@ use aloo::client::connect::ResolvedIdentity;
 use aloo::client::file_transfer::{OtpIncomingFileReceive, OtpIncomingKind};
 use aloo::client::otp_cli::{self, OtpCliConfig};
 use aloo::client::session::{SessionState, TestSessionSpec};
-use aloo::client::tui::ui::{DeliveryStatus, MessageBody, UiState};
+use aloo::client::tui::ui::{DeliveryStatus, MessageBody, MessageCrypto, UiState};
 use aloo::control::NullSink;
 use aloo::p2p_proto::P2pPayload;
 use aloo::proto::{Content, Envelope, KeyMode, UserId, UserInfo};
@@ -1757,6 +1757,418 @@ async fn a_stale_replay_older_than_the_last_received_message_is_still_silently_d
     assert_eq!(
         acks_after, acks_before,
         "a stale, non-latest duplicate must not be re-acked"
+    );
+}
+
+/// A decrypt that fails for any reason other than `otp`'s own metadata
+/// rejection - here, the contact was never actually installed on this
+/// side's keychain, exactly what a failed/interrupted pad-commit install
+/// leaves behind (`client::otp::on_pad_commit`) - must never be silent.
+/// Before this was fixed, `unwrap_incoming`'s catch-all collapsed every
+/// such case into a bare `UnwrapOutcome::Failed` with no reason, and
+/// `finish_opening_otp_envelope` turned that into a plain `return None`:
+/// the message vanished with nothing on screen, indistinguishable from it
+/// never having arrived at all - which is exactly what real users reported
+/// ("the other side could not decrypt the messages").
+///
+/// @requirement AC-375
+#[tokio::test]
+async fn a_message_for_a_contact_never_installed_produces_a_visible_notice_not_silence() {
+    if !require_otp() {
+        return;
+    }
+    let (mut alice, mut bob, contact) = pair("missing-contact", Id::Pq, Id::Pq).await;
+
+    send_text(&mut alice, &contact, "hello").await;
+    let (seq, msg_id, envelope, sender_device_id) = take_envelope(&mut alice);
+
+    // Simulate the exact state a failed pad-commit install leaves bob in:
+    // alice believes the pair is fully provisioned (she already installed
+    // her own half), but bob's keychain never actually got its half.
+    otp_cli::remove_contact(&bob.otp, &contact)
+        .await
+        .expect("removing the contact to simulate a failed install");
+
+    assert!(
+        bob.ui.status_notice.is_none(),
+        "sanity: nothing shown yet before the message arrives"
+    );
+    receive_text(&mut bob, seq, msg_id, envelope, sender_device_id).await;
+
+    let (message, success) = bob
+        .ui
+        .status_notice
+        .clone()
+        .expect("a decrypt failure that is not otp's own rejection must still be shown");
+    assert!(!success, "a decrypt failure is never a success notice");
+    assert!(
+        message.contains("could not be decrypted") && message.contains("alice"),
+        "the notice must say what happened and who it was from: {message:?}"
+    );
+
+    // Nothing was acknowledged - the sender must not be told this arrived.
+    let acks = bob
+        .queued()
+        .into_iter()
+        .filter(|p| matches!(p, P2pPayload::OtpDeliveryAck { .. }))
+        .count();
+    assert_eq!(acks, 0, "a message that could not be decrypted must not be acked");
+}
+
+/// The contact-missing case above, taken all the way through: bob's
+/// keychain entry is genuinely gone (deleted, exactly as
+/// `contacts::handle_delete_otp_key` would leave it), so there is nothing
+/// transient about the decrypt failure - retrying can never succeed.
+/// Ends the session locally on bob's side and tells alice directly (a
+/// sealed, unpadded `OtpEndSession` - there is no pad left on bob's side
+/// to protect it with), so both sides converge to "ended" instead of
+/// alice being left to believe the session is still alive while every
+/// message she sends here keeps failing to decrypt with nothing on her
+/// side ever explaining why.
+///
+/// @requirement AC-380
+#[tokio::test]
+async fn a_missing_contact_on_receipt_ends_the_session_on_both_sides() {
+    if !require_otp() {
+        return;
+    }
+    let (mut alice, mut bob, contact) = pair("missing-contact-ends-both", Id::Pq, Id::Pq).await;
+    alice.ui.mark_otp_active(BOB);
+    bob.ui.mark_otp_active(ALICE);
+
+    send_text(&mut alice, &contact, "hello").await;
+    let (seq, msg_id, envelope, sender_device_id) = take_envelope(&mut alice);
+    otp_cli::remove_contact(&bob.otp, &contact)
+        .await
+        .expect("removing the contact to simulate bob having deleted his key");
+
+    receive_text(&mut bob, seq, msg_id, envelope, sender_device_id).await;
+
+    assert!(
+        !bob.ui.is_otp_active(ALICE),
+        "bob's own side must end the moment he discovers the key is gone"
+    );
+    let (bob_message, bob_success) = bob
+        .ui
+        .status_notice
+        .clone()
+        .expect("bob must be told his own side ended");
+    assert!(!bob_success);
+    assert!(
+        bob_message.contains("ending the session") && bob_message.contains("alice"),
+        "bob's notice must say the session is ending and who it was from: {bob_message:?}"
+    );
+
+    // Bob's sealed, unpadded notice to alice - never `OtpEnvelope` (padded),
+    // since bob has no pad left at all to wrap it with.
+    let notice_envelope = bob
+        .queued()
+        .into_iter()
+        .find_map(|p| match p {
+            P2pPayload::Envelope { envelope, .. } if envelope.content == Content::OtpEndSession => {
+                Some(envelope)
+            }
+            _ => None,
+        })
+        .expect("bob must tell alice directly, not just end silently on his own side");
+
+    let bob_info = UserInfo {
+        id: BOB,
+        name: "bob".to_string(),
+        public_key_der: alice.peer_der.clone(),
+        key_mode: KeyMode::PqHybrid,
+    };
+    aloo::client::otp::on_end_session(
+        &mut alice.session,
+        &mut alice.ui,
+        BOB,
+        "bob".to_string(),
+        &bob_info,
+        notice_envelope,
+    )
+    .await;
+
+    assert!(
+        !alice.ui.is_otp_active(BOB),
+        "alice's side must converge to ended too, once bob's notice reaches her"
+    );
+    let (alice_message, alice_success) = alice
+        .ui
+        .status_notice
+        .clone()
+        .expect("alice must be told her side ended as well");
+    assert!(!alice_success);
+    assert!(
+        alice_message.contains("ended by bob"),
+        "alice's notice must name who ended it: {alice_message:?}"
+    );
+}
+
+/// The same trigger as above, but for a decrypt failure that is *not*
+/// about a missing contact - the contact still genuinely exists, `otp`
+/// itself just could not run this one time (a stand-in for a transient
+/// binary/disk hiccup). Must fall through to the ordinary "could not be
+/// decrypted" notice (AC-375) rather than escalating to ending the
+/// session: unlike a deleted key, there is nothing here that retrying
+/// could not fix.
+///
+/// @requirement AC-380
+#[tokio::test]
+async fn a_transient_decrypt_failure_with_the_contact_still_present_does_not_end_the_session() {
+    if !require_otp() {
+        return;
+    }
+    let (mut alice, mut bob, contact) = pair("transient-failure-stays-active", Id::Pq, Id::Pq).await;
+    alice.ui.mark_otp_active(BOB);
+    bob.ui.mark_otp_active(ALICE);
+
+    send_text(&mut alice, &contact, "hello").await;
+    let (seq, msg_id, envelope, sender_device_id) = take_envelope(&mut alice);
+
+    // Bob's contact is untouched; only his binary becomes unreachable for
+    // this one decrypt attempt - `has_contact` itself now also fails, so
+    // the missing-contact escalation must not fire (`unwrap_or(true)`).
+    bob.session
+        .set_otp_binary_path_for_test(std::path::PathBuf::from("aloo-test-otp-does-not-exist-xyz"));
+
+    receive_text(&mut bob, seq, msg_id, envelope, sender_device_id).await;
+
+    assert!(
+        bob.ui.is_otp_active(ALICE),
+        "a transient failure must never end the session - only a genuinely missing contact does"
+    );
+    let (message, success) = bob
+        .ui
+        .status_notice
+        .clone()
+        .expect("the failure must still be shown");
+    assert!(!success);
+    assert!(
+        message.contains("could not be decrypted") && !message.contains("ending the session"),
+        "must be the ordinary decrypt-failure notice, not the ends-the-session one: {message:?}"
+    );
+}
+
+/// The `/endotp` counterpart of
+/// `a_missing_contact_on_receipt_ends_the_session_on_both_sides`: this time
+/// it is alice's own real `/endotp` notice that bob cannot decrypt (his key
+/// for the contact is gone), so bob's substitute `OtpEndSession`
+/// (`end_session_for_missing_contact`) is what reaches alice - not the
+/// `OtpDeliveryAck`/`OtpEndSessionAck` her own send was actually waiting
+/// for. Without `OtpStore::clear_own_pending_end_notice_send`, alice's own
+/// `pending_end_notice` and the gate her notice armed would stay set
+/// forever: nothing else ever answers that specific send, so every later
+/// send to this contact would keep refusing with "the session is ending"
+/// and a repeated `/endotp` would keep saying "already ending" even though
+/// her UI already shows the session ended.
+///
+/// @requirement AC-382
+#[tokio::test]
+async fn a_substitute_end_notice_also_settles_this_sides_own_pending_end_notice() {
+    if !require_otp() {
+        return;
+    }
+    let (mut alice, mut bob, contact) = pair("endotp-vs-missing-key", Id::Pq, Id::Pq).await;
+    alice.ui.mark_otp_active(BOB);
+    bob.ui.mark_otp_active(ALICE);
+
+    let peer_der = alice.peer_der.clone();
+    aloo::client::otp::handle_end_otp_command(
+        &mut NullSink,
+        &mut alice.ui,
+        &mut alice.session,
+        BOB,
+        peer_der,
+    )
+    .await
+    .expect("/endotp should not fail");
+
+    assert!(
+        alice
+            .session
+            .otp_store_mut()
+            .get(&contact)
+            .is_some_and(|s| s.pending_end_notice),
+        "sanity: alice's own notice is now pending"
+    );
+    assert!(alice.gate_held(&contact), "sanity: the gate is armed behind it");
+
+    let (seq, msg_id, envelope, sender_device_id) = take_envelope(&mut alice);
+    otp_cli::remove_contact(&bob.otp, &contact)
+        .await
+        .expect("removing the contact to simulate bob having deleted his key");
+
+    receive_text(&mut bob, seq, msg_id, envelope, sender_device_id).await;
+    assert!(
+        !bob.ui.is_otp_active(ALICE),
+        "sanity: bob's own side ends on discovering the key is gone"
+    );
+
+    let notice_envelope = bob
+        .queued()
+        .into_iter()
+        .find_map(|p| match p {
+            P2pPayload::Envelope { envelope, .. } if envelope.content == Content::OtpEndSession => {
+                Some(envelope)
+            }
+            _ => None,
+        })
+        .expect("bob must tell alice directly with his own substitute notice");
+
+    let bob_info = UserInfo {
+        id: BOB,
+        name: "bob".to_string(),
+        public_key_der: alice.peer_der.clone(),
+        key_mode: KeyMode::PqHybrid,
+    };
+    aloo::client::otp::on_end_session(
+        &mut alice.session,
+        &mut alice.ui,
+        BOB,
+        "bob".to_string(),
+        &bob_info,
+        notice_envelope,
+    )
+    .await;
+
+    assert!(
+        !alice.ui.is_otp_active(BOB),
+        "alice's side converges to ended (already covered by AC-380)"
+    );
+    assert!(
+        alice
+            .session
+            .otp_store_mut()
+            .get(&contact)
+            .is_some_and(|s| !s.pending_end_notice),
+        "bob's substitute notice must also settle alice's own outstanding end-notice bookkeeping, \
+         since no ack will ever come for it now"
+    );
+    assert!(
+        !alice.gate_held(&contact),
+        "the gate alice's own notice armed must not stay closed forever with nothing left to open it"
+    );
+}
+
+/// `push_outgoing_dm` (UI thread, at submit time) and the send path
+/// (session task, once the queued action is actually processed) both read
+/// `is_otp_active` - but at two different moments. A session starting in
+/// the gap between them - exactly the window a real network round trip
+/// (the peer's resume confirmation) widens far past what a loopback test
+/// ever shows - must not leave the row permanently misdescribing what it
+/// actually sent under.
+///
+/// @requirement AC-377
+#[tokio::test]
+async fn a_message_logged_before_the_session_activates_is_corrected_to_otp_once_actually_sent() {
+    if !require_otp() {
+        return;
+    }
+    let (mut alice, _bob, contact) = pair("race-inactive-to-active", Id::Pq, Id::Pq).await;
+    assert!(
+        !alice.ui.is_otp_active(BOB),
+        "sanity: pair() provisions a pad but never marks a session active on its own"
+    );
+
+    // The row is logged while the local session still believes OTP is not
+    // active - `push_outgoing_dm`'s snapshot exactly as `submit_text` would
+    // take it at this instant.
+    let (msg_id, delivery) = alice.ui.start_delivery(&[BOB]);
+    let log_index = alice
+        .ui
+        .push_outgoing_dm(BOB, MessageBody::Text("racing message".into()), Some(delivery))
+        .expect("the room exists");
+    assert!(
+        matches!(
+            alice.ui.private_rooms[&BOB].log[log_index].crypto,
+            Some(MessageCrypto::Envelope { .. })
+        ),
+        "logged before activation: stamped as an ordinary envelope"
+    );
+
+    // The peer's confirmation arrives in the gap before the queued send is
+    // actually processed - the real session-side trigger for
+    // `is_otp_active` flipping true mid-flight. Production always pairs
+    // this with a status refresh (`finish_provisioning`'s doc); the two
+    // together are what actually flips `message_crypto`'s OTP branch on.
+    alice.ui.mark_otp_active(BOB);
+    aloo::client::otp::refresh_otp_key_status(&alice.otp, &mut alice.ui, BOB, &contact).await;
+
+    aloo::client::otp::send_or_queue(
+        &mut NullSink,
+        &mut alice.session,
+        &mut alice.ui,
+        BOB,
+        &contact,
+        &alice.peer_der,
+        b"racing message",
+        Content::Text,
+        None,
+        Some(log_index),
+        Some(msg_id),
+    )
+    .await
+    .expect("the send path should not fail");
+
+    assert!(
+        matches!(
+            alice.ui.private_rooms[&BOB].log[log_index].crypto,
+            Some(MessageCrypto::Otp { .. })
+        ),
+        "the row must be corrected to what actually went out: the pad, not a plain envelope"
+    );
+}
+
+/// The mirror race: logged while a session is active, but it ends (or was
+/// never really usable any more) before the send is actually processed -
+/// the row must not go on claiming a pad spend that never happened.
+///
+/// @requirement AC-377
+#[tokio::test]
+async fn a_message_logged_while_active_is_corrected_to_plain_once_the_session_has_ended() {
+    if !require_otp() {
+        return;
+    }
+    let (mut alice, _bob, contact) = pair("race-active-to-inactive", Id::Pq, Id::Pq).await;
+    alice.ui.mark_otp_active(BOB);
+    aloo::client::otp::refresh_otp_key_status(&alice.otp, &mut alice.ui, BOB, &contact).await;
+
+    let (msg_id, delivery) = alice.ui.start_delivery(&[BOB]);
+    let log_index = alice
+        .ui
+        .push_outgoing_dm(BOB, MessageBody::Text("racing message".into()), Some(delivery))
+        .expect("the room exists");
+    assert!(
+        matches!(
+            alice.ui.private_rooms[&BOB].log[log_index].crypto,
+            Some(MessageCrypto::Otp { .. })
+        ),
+        "logged while active: stamped as an otp spend"
+    );
+
+    // The session ends (or the peer's end-notice lands) in the gap before
+    // the queued send is actually processed.
+    alice.ui.clear_otp_active(BOB);
+
+    aloo::client::direct_message::handle_send_text(
+        &mut NullSink,
+        &mut alice.ui,
+        &mut alice.session,
+        BOB,
+        "racing message".to_string(),
+        alice.peer_der.clone(),
+        Some(log_index),
+        msg_id,
+    )
+    .await
+    .expect("the send path should not fail");
+
+    assert!(
+        matches!(
+            alice.ui.private_rooms[&BOB].log[log_index].crypto,
+            Some(MessageCrypto::Envelope { .. })
+        ),
+        "the row must be corrected to what actually went out: a plain envelope, not a pad spend"
     );
 }
 

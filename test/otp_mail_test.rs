@@ -385,13 +385,21 @@ async fn a_mails_gate_clears_on_the_storage_ack_alone_never_needing_delivery() {
     );
 }
 
-/// The failure twin: a refused storage ack must still open the gate (the
-/// pad bytes are spent either way, so the contact must not wedge forever),
-/// even though nothing was actually delivered.
+/// The failure twin, now the opposite of what it once was (AC-383): a
+/// refused storage ack must *not* open the gate. Clearing it used to be
+/// justified as "the pad bytes are spent either way, so the contact must
+/// not wedge forever" - but that let the *next* mail spend past the
+/// refused one, which the receiver could then never decrypt (their
+/// `next_expected_in_seq` can only ever be satisfied by this exact
+/// ciphertext, docs/PROTOCOL.md 17.3's oldest-first rule) - trading a
+/// sender-side wedge for a permanent, silent receiver-side one. Instead the
+/// mail stays exactly `AwaitingServerAck` and the gate stays closed on this
+/// seq, so the mail can be retried (immediately, or on the next reconnect)
+/// until the server genuinely stores it.
 ///
-/// @requirement TB-193
+/// @requirement TB-193, AC-383
 #[tokio::test]
-async fn a_mails_gate_also_clears_on_a_refused_storage_ack() {
+async fn a_refused_storage_ack_leaves_the_mail_pending_and_the_gate_closed() {
     let (mut session, mut ui) = bare_session("mail-gate-refused-ack").await;
     let contact = "alice-carol-mail";
     let mail_id = new_mail_id();
@@ -417,29 +425,31 @@ async fn a_mails_gate_also_clears_on_a_refused_storage_ack() {
         &mut aloo::control::NullSink,
         &mut session,
         &mut ui,
-        mail_id,
+        mail_id.clone(),
         false,
         Some("disk full".into()),
     )
     .await
     .expect("on_mail_result should never error");
 
-    assert!(
+    assert_eq!(
         session
             .otp_store_mut()
             .get(contact)
-            .and_then(|s| s.pending_unacked_out_seq)
-            .is_none(),
-        "a refusal must still open the gate - the pad bytes are spent regardless of outcome"
+            .and_then(|s| s.pending_unacked_out_seq),
+        Some(0),
+        "a refusal must not open the gate - nothing may spend past a mail that was never durably stored"
+    );
+    assert_eq!(
+        session.otp_mail_store_mut().sent_ref(&mail_id).map(|r| r.status),
+        Some(aloo::client::otp_mail_store::SentMailStatus::AwaitingServerAck),
+        "the mail must not be marked Failed - it stays live locally until the server genuinely \
+         acknowledges it, exactly like any other still-unacknowledged send"
     );
 }
 
-// ---------------------------------------------------------------------
-// Wrong-device deliveries are refused before any ack (docs/PROTOCOL.md 17.3)
-// ---------------------------------------------------------------------
-
 /// A `ControlSink` that records what would have gone to the server, so a
-/// test can assert on exactly what `on_mail_deliver` decided to send.
+/// test can assert on exactly what a handler decided to send.
 #[derive(Default)]
 struct RecordingSink {
     sent: Vec<proto::ClientMessage>,
@@ -451,6 +461,101 @@ impl aloo::control::ControlSink for RecordingSink {
         Ok(())
     }
 }
+
+/// The immediate-retry half of AC-383, against the real `otp` binary: not
+/// just that the gate stays closed and the mail stays pending (the test
+/// above), but that a genuine resend goes out right away, replaying the
+/// exact ciphertext `otp --recover-last --sent` holds - proving
+/// `resend_one` is really wired into `on_mail_result`'s failure branch,
+/// never a fresh re-encode (which would spend a second range of pad for
+/// one mail).
+///
+/// @requirement AC-383
+#[tokio::test]
+async fn a_refused_storage_ack_immediately_retries_the_exact_same_ciphertext() {
+    if !require_otp() {
+        return;
+    }
+    let (alice_cfg, _bob_cfg) = provision_pair("mail-refusal-retries").await;
+    let contact = "bob";
+    let mail_id = new_mail_id();
+
+    let encoded = proto::encode(&payload()).unwrap();
+    let (_public, signing_key) = generate_bundle_with_bits(TEST_BITS).expect("bundle");
+    let signature = sign_mail(&signing_key, &encoded).expect("sign");
+    let sealed_bytes =
+        proto::encode(&OtpMailSealed { payload: encoded, signature }).unwrap();
+    let Ok(OtpCliOutcome::Ok(ciphertext)) =
+        otp_cli::encrypt_retrying(&alice_cfg, contact, &sealed_bytes, true).await
+    else {
+        panic!("mail encrypt should succeed");
+    };
+
+    let (own_public, own_private) = generate_bundle_with_bits(TEST_BITS).expect("own pq keygen");
+    let own_public_der = proto::encode(&own_public).expect("own pq der");
+    let mut session = aloo::client::session::SessionState::for_test(
+        aloo::client::session::TestSessionSpec {
+            identity: aloo::client::connect::ResolvedIdentity {
+                private: own_private,
+                public_der: own_public_der,
+            },
+            scratch: temp_dir("mail-refusal-retries-session"),
+            otp: Some(alice_cfg.clone()),
+        },
+    )
+    .await;
+    let mut ui = aloo::client::tui::ui::UiState::new("alice".into());
+
+    session.otp_store_mut().record_sent(
+        contact,
+        0,
+        aloo::client::otp_store::PendingOtpContent::Mail {
+            mail_id: mail_id.clone(),
+        },
+        None,
+    );
+    session.otp_mail_store_mut().record_sent(aloo::client::otp_mail_store::SentMailRef {
+        mail_id: mail_id.clone(),
+        to: "bob".into(),
+        contact_name: contact.into(),
+        seq: 0,
+        sent_at_utc: 0,
+        status: aloo::client::otp_mail_store::SentMailStatus::AwaitingServerAck,
+    });
+
+    let mut sink = RecordingSink::default();
+    aloo::client::otp_mail::on_mail_result(
+        &mut sink,
+        &mut session,
+        &mut ui,
+        mail_id.clone(),
+        false,
+        Some("disk full".into()),
+    )
+    .await
+    .expect("on_mail_result should never error");
+
+    let resent = sink
+        .sent
+        .iter()
+        .find_map(|m| match m {
+            proto::ClientMessage::OtpMailSend {
+                mail_id: id,
+                ciphertext: ct,
+                ..
+            } if *id == mail_id => Some(ct.clone()),
+            _ => None,
+        })
+        .expect("a refused mail must be retried immediately, not just left pending");
+    assert_eq!(
+        resent, ciphertext,
+        "the retry must replay the exact same ciphertext, never a fresh encode"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Wrong-device deliveries are refused before any ack (docs/PROTOCOL.md 17.3)
+// ---------------------------------------------------------------------
 
 /// Like `bare_session`, but also hands back this session's own pq
 /// fingerprint - needed to compute the exact device-qualified contact

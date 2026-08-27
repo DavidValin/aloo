@@ -1,6 +1,6 @@
 [package]
 name = "aloo"
-version = "0.3.0-alpha.7"
+version = "0.3.0-alpha.8"
 edition = "2024"
 
 authors = ["David Valin <hola@davidvalin.com>"]
@@ -322,6 +322,26 @@ name = "otp_provisioning_concurrency_test"
 path = "test/otp_provisioning_concurrency_test.rs"
 
 [[test]]
+name = "otp_pad_commit_test"
+path = "test/otp_pad_commit_test.rs"
+
+[[test]]
+name = "otp_binary_guard_test"
+path = "test/otp_binary_guard_test.rs"
+
+[[test]]
+name = "otp_pad_glare_test"
+path = "test/otp_pad_glare_test.rs"
+
+[[test]]
+name = "otp_install_race_test"
+path = "test/otp_install_race_test.rs"
+
+[[test]]
+name = "otp_delete_while_active_test"
+path = "test/otp_delete_while_active_test.rs"
+
+[[test]]
 name = "otp_mail_recipient_check_test"
 path = "test/otp_mail_recipient_check_test.rs"
 
@@ -364,6 +384,14 @@ path = "test/otp_cli_test.rs"
 [[test]]
 name = "otp_mail_test"
 path = "test/otp_mail_test.rs"
+
+[[test]]
+name = "otp_mail_key_replace_test"
+path = "test/otp_mail_key_replace_test.rs"
+
+[[test]]
+name = "otp_key_exhaustion_test"
+path = "test/otp_key_exhaustion_test.rs"
 
 [[test]]
 name = "otp_mail_store_test"

@@ -140,6 +140,13 @@ pub struct AlooWorld {
     pub ui: Option<UiState>,
     pub last_action: Option<UiAction>,
     pub action_was_none: bool,
+    /// `false` (the default every scenario gets unless it says otherwise)
+    /// simulates a session that would answer `RequestOpenOtpMail`
+    /// (`/mail`) by confirming the local `otp` binary is available -
+    /// `steps::ui_common::press_key`'s stand-in for the real session-side
+    /// check (`client::otp_mail::handle_open_otp_mail`), which this
+    /// `UiState`-only World has no session to perform for real.
+    pub otp_binary_unavailable: bool,
 
     // -- server registry (in-process, no sockets) ----------------------
     pub registry: Option<Registry>,

@@ -819,13 +819,17 @@ async fn same_pad_contact(w: &mut AlooWorld) {
 }
 
 #[when(expr = "{word}'s link to {word} comes up")]
-async fn link_comes_up(w: &mut AlooWorld, _a: String, _b: String) {
-    let (a, _) = w.pad_only.as_mut().expect("no pad-only pair");
+async fn link_comes_up(w: &mut AlooWorld, who: String, _b: String) {
+    let (side_a, side_b) = w.pad_only.as_mut().expect("no pad-only pair");
+    // `pad_only_pair`'s own two names are always alice, then bob - "bob's
+    // link..." is the one phrasing that means the second side rather than
+    // the first.
+    let side = if who == "bob" { side_b } else { side_a };
     assert!(
-        !a.ui.known_users.contains_key(&a.peer),
+        !side.ui.known_users.contains_key(&side.peer),
         "nobody has introduced them yet"
     );
-    aloo::client::session::register_pad_only_peer(&mut a.session, &mut a.ui, a.peer);
+    aloo::client::session::register_pad_only_peer(&mut side.session, &mut side.ui, side.peer);
 }
 
 #[then(expr = "{word} is registered from the pad alone, with otp already active")]
@@ -920,6 +924,212 @@ async fn pad_only_receive(w: &mut AlooWorld, _b: String, _a: String) {
             .iter()
             .any(|e| matches!(&e.body, aloo::client::tui::ui::MessageBody::Text(_))),
         "and the message itself lands in their room"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Deleting a key out from under an active session (AC-381), and a peer
+// discovering on receipt that the other side's key is genuinely gone
+// (AC-380).
+// ---------------------------------------------------------------------
+
+/// `pad_only_pair` provisions the pad but never marks either side
+/// registered/active on its own (that is `link_comes_up`'s job) - so a
+/// scenario about deleting an *active* session's key drives both in one
+/// step, the same way `pad_only_pair` itself bundles its own setup.
+#[given(expr = "{word} and {word} are both registered, with otp active")]
+async fn pad_only_both_registered(w: &mut AlooWorld, _a: String, _b: String) {
+    let (side_a, side_b) = w.pad_only.as_mut().expect("no pad-only pair");
+    let peer_a = side_a.peer;
+    aloo::client::session::register_pad_only_peer(&mut side_a.session, &mut side_a.ui, peer_a);
+    let peer_b = side_b.peer;
+    aloo::client::session::register_pad_only_peer(&mut side_b.session, &mut side_b.ui, peer_b);
+    assert!(side_a.ui.is_otp_active(peer_a));
+    assert!(side_b.ui.is_otp_active(peer_b));
+}
+
+/// Removes the real keychain entry directly (`otp --remove-contact`),
+/// without going through `contacts::handle_delete_otp_key` at all - unlike
+/// that step, this leaves `is_otp_active`/`otp_store` still believing the
+/// session is alive, exactly what a key vanishing by some means outside
+/// the app (a manual keychain edit, corruption) would leave behind, and
+/// what `end_session_for_missing_contact` (AC-380) exists to discover on
+/// the *next message*, not before.
+#[given(expr = "{word}'s otp keychain entry for {word} is gone, without the app knowing yet")]
+async fn pad_only_keychain_entry_vanishes(w: &mut AlooWorld, deleter: String, other: String) {
+    let contact = w.otp_contact_name.clone().expect("no contact");
+    let (side_a, side_b) = w.pad_only.as_ref().expect("no pad-only pair");
+    let (side, other_name) = if deleter == "bob" {
+        (side_b, "alice")
+    } else {
+        (side_a, "bob")
+    };
+    assert_eq!(&other, other_name, "the scenario names whoever the other side actually is");
+    otp_cli::remove_contact(&side.session.otp_cli_cfg_for_test(), &contact)
+        .await
+        .expect("removing the contact directly");
+}
+
+#[given(expr = "{word} has deleted the otp key for {word}")]
+#[when(expr = "{word} deletes the otp key for {word}")]
+async fn pad_only_delete_key(w: &mut AlooWorld, deleter: String, other: String) {
+    let (side_a, side_b) = w.pad_only.as_mut().expect("no pad-only pair");
+    let (side, other_name) = if deleter == "bob" {
+        (side_b, "alice")
+    } else {
+        (side_a, "bob")
+    };
+    assert_eq!(&other, other_name, "the scenario names whoever the other side actually is");
+    aloo::client::contacts::handle_delete_otp_key(
+        &mut side.session,
+        &mut side.ui,
+        other_name.to_string(),
+        Some("test-device".to_string()),
+        OtpPurpose::Live,
+    )
+    .await;
+}
+
+#[then(expr = "{word} no longer shows an active otp session with {word}")]
+async fn pad_only_no_longer_active(w: &mut AlooWorld, who: String, _peer: String) {
+    let (side_a, side_b) = w.pad_only.as_ref().expect("no pad-only pair");
+    let side = if who == "bob" { side_b } else { side_a };
+    assert!(!side.ui.is_otp_active(side.peer));
+}
+
+#[then(expr = "{word} still shows an active otp session with {word}")]
+async fn pad_only_still_active(w: &mut AlooWorld, who: String, _peer: String) {
+    let (side_a, side_b) = w.pad_only.as_ref().expect("no pad-only pair");
+    let side = if who == "bob" { side_b } else { side_a };
+    assert!(side.ui.is_otp_active(side.peer));
+}
+
+/// `status_notice_says`'s counterpart for a `pad_only` side specifically -
+/// that step reads the World's single, generic `ui`, which these
+/// two-real-session scenarios never populate.
+#[then(expr = "{word}'s otp status notice says {string}")]
+async fn pad_only_status_notice_says(w: &mut AlooWorld, who: String, expected: String) {
+    let (side_a, side_b) = w.pad_only.as_ref().expect("no pad-only pair");
+    let side = if who == "bob" { side_b } else { side_a };
+    let (text, _) = side.ui.status_notice.as_ref().expect("no status notice is shown");
+    assert!(text.contains(&expected), "expected {expected:?} within {text:?}");
+}
+
+/// Like `pad_only_receive`, but for a scenario that already registered
+/// both sides up front (`pad_only_both_registered`) - `pad_only_receive`'s
+/// own "nobody has introduced them yet" precondition would not hold here,
+/// since that is exactly what this step's own `Given` already did.
+#[then(expr = "{word} decrypts it normally and the session stays active for both")]
+async fn pad_only_receive_succeeds(w: &mut AlooWorld, _b: String) {
+    let (a, b) = w.pad_only.as_mut().expect("no pad-only pair");
+    let (seq, msg_id, envelope, sender_device_id) = a
+        .session
+        .peer_link_mut()
+        .pending_payloads(a.peer)
+        .into_iter()
+        .find_map(|p| match p {
+            aloo::p2p_proto::P2pPayload::OtpEnvelope {
+                seq,
+                msg_id,
+                envelope,
+                sender_device_id,
+                ..
+            } => Some((seq, msg_id, envelope, sender_device_id)),
+            _ => None,
+        })
+        .expect("a pad-wrapped message should have gone out");
+    aloo::client::otp::on_message(
+        &mut b.session,
+        &mut b.ui,
+        None,
+        b.peer,
+        "alice".into(),
+        seq,
+        msg_id,
+        envelope,
+        sender_device_id,
+    )
+    .await
+    .expect("the receive path should not fail");
+    assert!(
+        b.ui.private_rooms[&b.peer]
+            .log
+            .iter()
+            .any(|e| matches!(&e.body, aloo::client::tui::ui::MessageBody::Text(_))),
+        "the message itself must land in bob's room"
+    );
+    assert!(b.ui.is_otp_active(b.peer), "a normal decrypt must never end the session");
+    assert!(a.ui.is_otp_active(a.peer));
+}
+
+/// Delivers whatever `a` (alice) last sent to `b` (bob), exactly like
+/// `pad_only_receive`, but for the case that message can never be
+/// decrypted at all - `b`'s own keychain contact for it is genuinely
+/// gone. Bob's own side must end there and then.
+///
+/// A pad-only pair's *only* shared secret was the very pad that is now
+/// gone - unlike a `pq_hybrid` pair (`test/otp_ack_wiring_test.rs`'s
+/// `a_missing_contact_on_receipt_ends_the_session_on_both_sides`, where a
+/// plain sealed envelope is always still possible), there is no identity
+/// left to seal a notice to and, by design, no server relay either
+/// (`end_session_for_missing_contact`'s own doc). So only bob's own side
+/// converges here - alice is never told through this path, exactly as an
+/// undelivered send to an unreachable peer already looked before this fix
+/// existed, not worse.
+#[then(expr = "{word} cannot decrypt it, and ends his own side of the session")]
+async fn pad_only_receive_fails_and_ends_locally(w: &mut AlooWorld, _b: String) {
+    let (a, b) = w.pad_only.as_mut().expect("no pad-only pair");
+    let (seq, msg_id, envelope, sender_device_id) = a
+        .session
+        .peer_link_mut()
+        .pending_payloads(a.peer)
+        .into_iter()
+        .find_map(|p| match p {
+            aloo::p2p_proto::P2pPayload::OtpEnvelope {
+                seq,
+                msg_id,
+                envelope,
+                sender_device_id,
+                ..
+            } => Some((seq, msg_id, envelope, sender_device_id)),
+            _ => None,
+        })
+        .expect("a pad-wrapped message should have gone out");
+
+    aloo::client::otp::on_message(
+        &mut b.session,
+        &mut b.ui,
+        None,
+        b.peer,
+        "alice".into(),
+        seq,
+        msg_id,
+        envelope,
+        sender_device_id,
+    )
+    .await
+    .expect("the receive path should not fail even though the decrypt itself does");
+
+    assert!(
+        !b.ui.is_otp_active(b.peer),
+        "bob's own side must end the moment he discovers the key is gone"
+    );
+
+    // No identity left to seal a notice to alice with, and no server
+    // relay for a pad-only pair by design - nothing should even attempt
+    // to reach her.
+    let notice_queued = b.session.peer_link_mut().pending_payloads(b.peer).into_iter().any(|p| {
+        matches!(p, aloo::p2p_proto::P2pPayload::Envelope { envelope, .. }
+            if envelope.content == aloo::proto::Content::OtpEndSession)
+    });
+    assert!(
+        !notice_queued,
+        "a pad-only pair has no channel left to tell alice through - nothing should be queued"
+    );
+    assert!(
+        a.ui.is_otp_active(a.peer),
+        "alice has no way to learn of this yet - her own side is unaffected until she notices \
+         her own sends here never get acknowledged"
     );
 }
 

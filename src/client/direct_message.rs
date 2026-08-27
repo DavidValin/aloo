@@ -82,6 +82,18 @@ pub async fn handle_send_text(
             plaintext.as_bytes(),
             Content::Text,
         ) {
+            // Corrects the row `push_outgoing_dm` already logged to match
+            // what is genuinely about to happen: its snapshot and the
+            // `contact_name_for_sending` check just above both read
+            // `is_otp_active`, but at two different moments (UI submit time
+            // vs. now, once the session task actually processes the send) -
+            // a session ending in between leaves the row still claiming the
+            // pad for a message that is actually about to go out plain. See
+            // `UiState::set_dm_message_crypto`'s doc.
+            if let Some(idx) = log_index {
+                let crypto = ui_state.message_crypto(to, true);
+                ui_state.set_dm_message_crypto(to, idx, crypto);
+            }
             session.peer_link.ensure_link(wr, to).await;
             session.peer_link.send_reliable_or_queue(
                 to,

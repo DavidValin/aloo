@@ -458,6 +458,7 @@ pub async fn handle_send(
         true,
     );
     refresh_key_header_if_connected(session, ui_state, &to, &contact_name).await;
+    notify_if_mail_key_exhausted(session, ui_state, &to, &contact_name).await;
     Ok(())
 }
 
@@ -518,38 +519,55 @@ pub fn restore_orphaned_mail_ref(
     let _ = mail_store.save();
 }
 
+/// Re-uploads one still-`AwaitingServerAck` sent mail using the exact
+/// ciphertext `otp --recover-last --sent` replays - never a fresh encode.
+/// `false` when nothing was actually resent: either the contact's gate no
+/// longer names this mail's seq (its acknowledgement already arrived, or a
+/// concurrent resend already went out for it), or `.last_sent` has nothing
+/// recoverable. Shared by the reconnect pass (`resend_pending`) and by
+/// `on_mail_result`'s immediate retry the moment a storage failure comes
+/// back, so a mail never needs a reconnect just to try again.
+async fn resend_one(
+    wr: &mut impl crate::control::ControlSink,
+    session: &SessionState,
+    mail_ref: &SentMailRef,
+) -> proto::Result<bool> {
+    let gate_holds_this = session
+        .otp_store
+        .get(&mail_ref.contact_name)
+        .and_then(|s| s.pending_unacked_out_seq)
+        == Some(mail_ref.seq);
+    if !gate_holds_this {
+        return Ok(false);
+    }
+    let Ok(Some(recovered)) = otp_cli::recover_last(
+        &session.otp_cli_cfg,
+        &mail_ref.contact_name,
+        otp_cli::RecoverDirection::Sent,
+    )
+    .await
+    else {
+        return Ok(false);
+    };
+    wr.send_control(&ClientMessage::OtpMailSend {
+        mail_id: mail_ref.mail_id.clone(),
+        to: mail_ref.to.clone(),
+        contact_name: mail_ref.contact_name.clone(),
+        seq: mail_ref.seq,
+        sent_at_utc: mail_ref.sent_at_utc,
+        ciphertext: recovered,
+    })
+    .await?;
+    Ok(true)
+}
+
 pub(crate) async fn resend_pending(
     wr: &mut impl crate::control::ControlSink,
     session: &mut SessionState,
 ) -> proto::Result<()> {
     let awaiting = session.otp_mail_store.awaiting_server_ack();
     for mail_ref in awaiting {
-        let gate_holds_this = session
-            .otp_store
-            .get(&mail_ref.contact_name)
-            .and_then(|s| s.pending_unacked_out_seq)
-            == Some(mail_ref.seq);
-        if !gate_holds_this {
-            continue;
-        }
-        let Ok(Some(recovered)) = otp_cli::recover_last(
-            &session.otp_cli_cfg,
-            &mail_ref.contact_name,
-            otp_cli::RecoverDirection::Sent,
-        )
-        .await
-        else {
-            continue;
-        };
-        wr.send_control(&ClientMessage::OtpMailSend {
-            mail_id: mail_ref.mail_id,
-            to: mail_ref.to,
-            contact_name: mail_ref.contact_name,
-            seq: mail_ref.seq,
-            sent_at_utc: mail_ref.sent_at_utc,
-            ciphertext: recovered,
-        })
-        .await?;
+        resend_one(wr, session, &mail_ref).await?;
     }
     Ok(())
 }
@@ -615,15 +633,93 @@ async fn refresh_key_header_if_connected(
     }
 }
 
+/// After a genuine mail encrypt/decrypt spend, tells the user once
+/// `contact_name`'s mail key has nothing left in either direction - mail
+/// has no session to end (unlike a live contact, `client::otp::
+/// end_live_session_if_exhausted`), only the key itself, so this is purely
+/// informational: neither the keychain entry nor aloo's own bookkeeping
+/// for it is touched (`client::otp::is_contact_exhausted`'s doc) - a later
+/// `/new-otp-mail-key` still replaces it correctly regardless. Unlike
+/// `refresh_key_header_if_connected`, this runs regardless of whether the
+/// mail's counterpart happens to be connected right now - mail is
+/// store-and-forward, so exhaustion must be caught even while they're
+/// offline.
+///
+/// `pub` (not `pub(crate)`) so `test/otp_key_exhaustion_test.rs` can drive
+/// it directly against a real installed mail contact, the same reason
+/// `client::otp::is_contact_exhausted` is.
+pub async fn notify_if_mail_key_exhausted(
+    session: &SessionState,
+    ui_state: &mut UiState,
+    nickname: &str,
+    contact_name: &str,
+) {
+    let Ok(Some(detail)) = otp_cli::show_contact(&session.otp_cli_cfg, contact_name).await else {
+        return;
+    };
+    if !crate::client::otp::is_contact_exhausted(&detail) {
+        return;
+    }
+    ui_state.push_status_notice(
+        format!(
+            "OTP mail key for {nickname} is fully used up. Run /new-otp-mail-key for a fresh one."
+        ),
+        false,
+    );
+}
+
+/// `UiAction::RequestOpenOtpMail`'s handler - the `/mail` command
+/// (`submit_input`). Refuses to open the compose view at all without the
+/// `otp` binary: every mail this view could send needs it (`handle_send`
+/// spends a real pad through it), so opening anyway would only defer the
+/// same failure to send time - or worse, past it silently, the exact
+/// class of bug `client::otp::on_pad_commit`/`finish_opening_otp_envelope`
+/// were hardened against. Freshly checked rather than cached, the same as
+/// `client::otp::handle_provisioning_command`'s identical guard for
+/// `/otp`/`/new-otp-mail-key`: a binary installed or removed mid-session
+/// must be reflected immediately, not through a stale flag.
+///
+/// `pub` (not `pub(crate)`) so `test/otp_binary_guard_test.rs` can drive it
+/// directly - the same reason `client::otp::handle_provisioning_command`
+/// is already `pub`.
+pub fn handle_open_otp_mail(session: &SessionState, ui_state: &mut UiState) {
+    if !otp_cli::binary_available(&session.otp_cli_cfg) {
+        ui_state.push_status_notice(
+            "OTP mail failed: the 'otp' command isn't installed - see \
+             github.com/DavidValin/otp-toolkit"
+                .to_string(),
+            false,
+        );
+        return;
+    }
+    ui_state.open_otp_mail();
+}
+
 /// `UiAction::OpenOtpMailbox`'s handler.
 pub(crate) fn handle_open_mailbox(session: &SessionState, ui_state: &mut UiState) {
     ui_state.otp_mail_set_mailbox_rows(mailbox_rows(session));
 }
 
-/// Applies `ServerMessage::OtpMailResult`: moves the sent reference
-/// forward (or to `Failed`) and clears the contact's gate for this spend;
-/// since a cleared gate authorises exactly one more send, it also drains
-/// one queued P2P item if any were waiting behind the mail.
+/// Applies `ServerMessage::OtpMailResult`. On success, moves the sent
+/// reference to `StoredOnServer` and clears the contact's gate for this
+/// spend - since a cleared gate authorises exactly one more send, this also
+/// drains one queued P2P item if any were waiting behind the mail.
+///
+/// On failure the mail stays exactly `AwaitingServerAck`, and the gate
+/// stays closed on this exact seq: unlike a peer's `OtpDeliveryAck`, no
+/// third party could ever separately prove this mail was stored, so there
+/// is no such thing as "the spend happened but the acknowledgement was
+/// lost" here - a storage failure means the spend genuinely never landed
+/// anywhere durable, and the receiver's `next_expected_in_seq` for this
+/// contact will never move past it either way. Clearing the gate and
+/// giving up (the old behaviour) would let the *next* mail spend past this
+/// one, which the receiver could then never decrypt - every mail after it
+/// would sit forever behind a sequence number that can only ever be filled
+/// by this exact ciphertext (docs/PROTOCOL.md §17.3's oldest-first rule).
+/// So instead this retries immediately with the same recovered ciphertext
+/// (`resend_one`), and falls back to the ordinary reconnect pass
+/// (`resend_pending`) if that attempt also fails - both durable, since
+/// nothing here is cleared until a `ok: true` genuinely arrives.
 pub async fn on_mail_result(
     wr: &mut impl crate::control::ControlSink,
     session: &mut SessionState,
@@ -635,36 +731,37 @@ pub async fn on_mail_result(
     let Some(mail_ref) = session.otp_mail_store.sent_ref(&mail_id).cloned() else {
         return Ok(());
     };
-    let status = if ok {
-        SentMailStatus::StoredOnServer
-    } else {
-        SentMailStatus::Failed
-    };
-    if session.otp_mail_store.set_sent_status(&mail_id, status) {
-        let _ = session.otp_mail_store.save();
-    }
-    // Either way the gate clears: on `ok` the spend reached its
-    // destination; on failure no acknowledgement will ever come and the
-    // contact must not stay wedged forever. The failure notice is loud
-    // about what a refused-after-spend mail means for the pad.
-    if session
-        .otp_store
-        .record_acked(&mail_ref.contact_name, mail_ref.seq, None)
-    {
-        let _ = session.otp_store.save();
-        crate::client::otp::flush_one_queued(wr, ui_state, session, &mail_ref.contact_name).await?;
-    }
     if ok {
+        if session
+            .otp_mail_store
+            .set_sent_status(&mail_id, SentMailStatus::StoredOnServer)
+        {
+            let _ = session.otp_mail_store.save();
+        }
+        if session
+            .otp_store
+            .record_acked(&mail_ref.contact_name, mail_ref.seq, None)
+        {
+            let _ = session.otp_store.save();
+            crate::client::otp::flush_one_queued(wr, ui_state, session, &mail_ref.contact_name)
+                .await?;
+        }
         ui_state.push_status_notice(
             format!("OTP mail to {} is stored on the server", mail_ref.to),
             true,
         );
     } else {
+        let resent = resend_one(wr, session, &mail_ref).await?;
         ui_state.push_status_notice(
             format!(
-                "OTP mail to {} was refused by the server{} - its pad bytes are spent; the contact may need re-keying (/otp)",
+                "OTP mail to {} was not stored by the server yet{} - {}",
                 mail_ref.to,
-                reason.map(|r| format!(": {r}")).unwrap_or_default()
+                reason.map(|r| format!(": {r}")).unwrap_or_default(),
+                if resent {
+                    "retrying now"
+                } else {
+                    "will retry once reachable again"
+                }
             ),
             false,
         );
@@ -921,6 +1018,7 @@ pub async fn on_mail_deliver(
     );
     crate::client::voice_stream::play_bell_chime(session);
     refresh_key_header_if_connected(session, ui_state, &from, &expected_contact).await;
+    notify_if_mail_key_exhausted(session, ui_state, &from, &expected_contact).await;
     refresh_mailbox_if_open(session, ui_state);
     refresh_unread_mail_count(session, ui_state);
     Ok(())

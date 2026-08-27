@@ -1939,6 +1939,13 @@ pub enum UiAction {
         nickname: String,
         device_id: String,
     },
+    /// The `/mail` command (`submit_input`) - checks the local `otp`
+    /// binary is actually available before opening the compose view at all
+    /// (`client::otp_mail::handle_open_otp_mail`), the same guard
+    /// `RequestOtpSession`/`RequestOtpMailKey` already apply for
+    /// `/otp`/`/new-otp-mail-key`. Never opens `UiState::open_otp_mail`
+    /// directly from the UI layer, which has no way to check for itself.
+    RequestOpenOtpMail,
     /// The `/mailbox` command (`submit_input`) - the session snapshots
     /// the mail store into mailbox rows
     /// (`UiState::otp_mail_set_mailbox_rows`), shown over the mail view
@@ -2236,6 +2243,7 @@ impl UiAction {
             // a live OTP session is peer-to-peer and stays available.
             Self::CheckOtpMailRecipient { .. }
             | Self::SelectOtpMailDevice { .. }
+            | Self::RequestOpenOtpMail
             | Self::OpenOtpMailbox
             | Self::SendOtpMail
             | Self::ReadOtpMail { .. }
@@ -6062,10 +6070,13 @@ impl UiState {
             // The one way to compose an OTP mail (docs/PROTOCOL.md §17.1) -
             // a command rather than a key chord, since the natural chord
             // (Ctrl+M) is indistinguishable from Enter on terminals
-            // without the kitty keyboard protocol (both are 0x0D).
+            // without the kitty keyboard protocol (both are 0x0D). Routed
+            // through the session rather than opening the compose view
+            // directly - only it can check the local `otp` binary is
+            // actually available (`client::otp_mail::handle_open_otp_mail`),
+            // which `UiState` has no way to do for itself.
             self.input.clear();
-            self.open_otp_mail();
-            return None;
+            return Some(UiAction::RequestOpenOtpMail);
         }
         if self.input.trim() == "/mailbox" {
             // The one way to open the mailbox: opens the mail view with
