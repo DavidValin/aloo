@@ -467,31 +467,56 @@ pub fn playback_level() -> u8 {
 
 /// Playback level above which remote audio is treated as audible in the
 /// room, and so as something the microphone is about to pick up again.
-/// Just above the mixer's idle reading rather than at it, so dither and a
-/// source's trailing silence don't hold the duck open indefinitely.
-pub const ECHO_DUCK_TRIGGER_LEVEL: u8 = 3;
+///
+/// As low as it can be without being zero. The mixer writes exact zeros
+/// when nothing is playing, so anything above zero really is audio - and
+/// audio quiet enough to read 2 or 3 on a meter scaled for speech is still
+/// perfectly audible as an echo on the far end. An earlier value of 3 left
+/// quiet playback un-ducked entirely.
+pub const ECHO_DUCK_TRIGGER_LEVEL: u8 = 1;
 
 /// What the microphone is attenuated to while remote audio is playing:
-/// -18dB. Attenuation rather than a hard gate, deliberately - the room has
+/// -24dB. Attenuation rather than a hard gate, deliberately - the room has
 /// already attenuated what it echoes back, so this puts the echo under the
 /// noise floor, while someone who actually talks over the other side is
 /// still audible instead of being cut out entirely.
-pub const ECHO_DUCK_GAIN: f32 = 0.12;
+pub const ECHO_DUCK_GAIN: f32 = 0.06;
 
-/// Per-chunk fraction of the remaining distance to the target gain. Ducking
-/// in is several times faster than coming back out: arriving late means
-/// leaking a burst of echo, while leaving late costs only a slightly quiet
-/// first syllable. At `CHUNK_INTERVAL` these are roughly 75ms down and
-/// 750ms back up.
-pub const ECHO_DUCK_ATTACK: f32 = 0.35;
+/// Per-chunk fraction of the remaining distance to the target gain.
+///
+/// Attack is deliberately near-immediate - roughly 15ms to -12dB and 45ms
+/// to full attenuation. The cost of arriving late is not subtle: the
+/// microphone is at nearly full gain for the *opening* of every far-end
+/// phrase, which is precisely the part with the sharpest onset, so a slow
+/// attack leaks an echo burst at the start of every single utterance and
+/// sounds like no ducking at all. The cost of arriving early is nothing,
+/// because there is nothing to capture yet.
+///
+/// Release stays slow (roughly 750ms) for the opposite reason: leaving late
+/// costs one slightly quiet syllable, and leaving early re-opens the
+/// microphone into the tail of the far end's own speech.
+pub const ECHO_DUCK_ATTACK: f32 = 0.8;
 pub const ECHO_DUCK_RELEASE: f32 = 0.06;
 
 /// How much louder the microphone must read while the far end is talking
 /// than while they are not, before the difference is judged to be the
 /// speakers rather than coincidence. Two thresholds rather than one so the
 /// decision has hysteresis and cannot flap chunk to chunk.
-pub const ECHO_EVIDENCE_ENGAGE: f32 = 4.0;
-pub const ECHO_EVIDENCE_RELEASE: f32 = 2.0;
+///
+/// A *ratio* rather than a fixed number of meter points, because the meter
+/// is scaled for displaying speech: one point is already a substantial
+/// amount of sound, so an absolute margin only caught echo loud enough to
+/// be obnoxious and released ducking for every quieter room - which still
+/// echoes, just politely. A ratio is also what makes the same thresholds
+/// work in a noisy room and a silent one.
+pub const ECHO_EVIDENCE_ENGAGE_RATIO: f32 = 1.25;
+pub const ECHO_EVIDENCE_RELEASE_RATIO: f32 = 1.08;
+
+/// Floor on the quiet-side average when forming that ratio, so a silent
+/// room (a headphone user in a quiet house, where both averages sit near
+/// zero) divides by something stable instead of amplifying its own noise
+/// into a verdict.
+pub const ECHO_EVIDENCE_FLOOR: f32 = 1.0;
 
 /// How many chunks of *each* kind (far end talking, far end quiet) must be
 /// observed before the probe will conclude anything. Roughly a second of
@@ -573,11 +598,11 @@ impl EchoProbe {
         {
             return;
         }
-        let excess = self.loud - self.quiet;
+        let ratio = self.loud / self.quiet.max(ECHO_EVIDENCE_FLOOR);
         if self.ducking {
-            self.ducking = excess >= ECHO_EVIDENCE_RELEASE;
+            self.ducking = ratio >= ECHO_EVIDENCE_RELEASE_RATIO;
         } else {
-            self.ducking = excess > ECHO_EVIDENCE_ENGAGE;
+            self.ducking = ratio > ECHO_EVIDENCE_ENGAGE_RATIO;
         }
     }
 
@@ -586,9 +611,16 @@ impl EchoProbe {
         self.ducking
     }
 
-    /// How much louder the microphone reads while the far end is talking -
-    /// the quantity the decision is made on, exposed for tests and for
-    /// anyone diagnosing a room this gets wrong.
+    /// How much louder the microphone reads while the far end is talking,
+    /// as a ratio - the quantity the decision is made on, exposed for tests
+    /// and for anyone diagnosing a room this gets wrong. 1.0 means the
+    /// microphone hears nothing of the speakers.
+    pub fn excess_ratio(&self) -> f32 {
+        self.loud / self.quiet.max(ECHO_EVIDENCE_FLOOR)
+    }
+
+    /// The same evidence as a plain level difference, for a reading that is
+    /// easier to compare against a voice meter.
     pub fn excess_level(&self) -> f32 {
         self.loud - self.quiet
     }
@@ -1078,11 +1110,19 @@ impl Recorder {
 //     case, so a clean path pays a small delay and only a path that
 //     actually stutters pays a large one.
 //
-// A `finished` source - a whole received voice message being replayed, or a
-// live stream whose `StreamEnd` already arrived - is exempt from all of it.
-// It is a recording, not a real-time stream: there is no "late" to be, its
-// queue is the message itself rather than accumulated delay, and trimming
-// it would silently cut audio out of a message the user asked to hear.
+// None of this applies to a *recording* - a chime, a replayed voice
+// message, an OTP clip: anything delivered by `MixerCmd::Push` rather than
+// `MixerCmd::PushLive`. A recording has no "late" to be, its queue is the
+// message itself rather than accumulated delay, and it is played in full,
+// immediately, however long or short it is. Trimming one cut audio out of a
+// message the user asked to hear; making one wait for a prebuffer stalled
+// clips shorter than the target.
+//
+// Which kind a source is cannot be inferred from `finished`, because a
+// recording is pushed whole *before* its `Finish` arrives - see
+// `MixerCmd::PushLive`. A live stream whose `StreamEnd` already arrived is
+// `finished` too, and from that point wants the same treatment as a
+// recording: its queue is now a fixed, complete tail.
 
 /// Where a live source's prebuffer target starts, and the floor it decays
 /// back to. Small enough that a clean path (a LAN, or two peers a few
@@ -1181,7 +1221,22 @@ pub fn overflow_drop_samples(queued: usize, rate: u32, prebuffer_ms: u64) -> usi
 pub enum MixerCmd {
     /// `samples` are mono PCM16 at `SAMPLE_RATE_HZ`; the mixer resamples
     /// to the output device's actual rate before queuing.
+    ///
+    /// A *recording*: a whole clip handed over at once (a chime, a replayed
+    /// voice message, an OTP clip), which the mixer plays in full. None of
+    /// the real-time latency management applies to one - see `PushLive`.
     Push { id: u64, samples: Vec<i16> },
+    /// One chunk of a stream arriving in real time - a call participant, or
+    /// a push-to-talk message still being spoken.
+    ///
+    /// The distinction from `Push` is what decides whether a source's
+    /// backlog is trimmed, and it cannot be inferred from `finished`:
+    /// a whole clip is pushed *before* its `Finish` arrives, so for that
+    /// moment it is indistinguishable from a live source sitting on a large
+    /// backlog - and trimming it there silently cut every chime and every
+    /// replayed voice message down to its last few milliseconds. Only the
+    /// sender knows which kind it is, so only the sender can say.
+    PushLive { id: u64, samples: Vec<i16> },
     /// No more `Push`es will come for `id` - once its queue drains, drop it
     /// instead of waiting on a jitter prebuffer that will never fill.
     Finish { id: u64 },
@@ -1208,6 +1263,11 @@ pub struct MixSource {
     /// underrun, not just at creation, since each talk spurt gets its own
     /// wait (see `note_underrun`).
     waiting_since: Instant,
+    /// Whether this is a real-time stream (`MixerCmd::PushLive`) rather
+    /// than a recording. Only a live source is latency-managed: a recording
+    /// has no "late" to be, and every millisecond of its queue is audio the
+    /// user asked to hear.
+    live: bool,
     /// This source's own current prebuffer target, adapted to the path it
     /// is actually seeing rather than fixed at a worst case.
     prebuffer_ms: u64,
@@ -1223,6 +1283,7 @@ impl MixSource {
             queue: VecDeque::new(),
             finished: false,
             started: false,
+            live: false,
             waiting_since: now,
             prebuffer_ms: JITTER_PREBUFFER_MIN_MS,
             last_underrun: now,
@@ -1241,6 +1302,17 @@ impl MixSource {
 
     pub fn extend(&mut self, samples: &[i16]) {
         self.queue.extend(samples);
+    }
+
+    /// Marks this source as a real-time stream. Set from the first
+    /// `MixerCmd::PushLive` rather than at creation, because a source is
+    /// created by whichever command arrives first.
+    pub fn mark_live(&mut self) {
+        self.live = true;
+    }
+
+    pub fn is_live(&self) -> bool {
+        self.live
     }
 
     pub fn mark_finished(&mut self) {
@@ -1272,9 +1344,10 @@ impl MixSource {
     /// realtime output callback never pays for it: a push happens a few
     /// dozen times a second, an output frame tens of thousands of times.
     ///
-    /// A `finished` source is left entirely alone - see the policy section.
+    /// A recording, or an already-`finished` source, is left entirely alone
+    /// - see the policy section.
     pub fn on_push(&mut self, out_rate: u32) -> usize {
-        if self.finished {
+        if !self.live || self.finished {
             return 0;
         }
         if let Some(relaxed) = decayed_prebuffer(self.prebuffer_ms, self.last_underrun.elapsed()) {
@@ -1293,15 +1366,19 @@ impl MixSource {
     /// frame from the realtime callback, so it does no more than the
     /// comparison it has to.
     fn ready(&mut self, out_rate: u32) -> bool {
-        if !self.started
-            && jitter_ready_to_start(
-                samples_to_ms(self.queue.len(), out_rate),
-                self.waiting_since.elapsed(),
-                self.finished,
-                self.prebuffer_ms,
-            )
-        {
-            self.started = true;
+        if !self.started {
+            // A recording never waits for a prebuffer. It is not real time,
+            // so there is nothing to smooth against - and a clip shorter
+            // than the target would otherwise sit unplayed until the
+            // `JITTER_MAX_WAIT_MS` backstop fired, which is exactly what a
+            // short chime is.
+            self.started = !self.live
+                || jitter_ready_to_start(
+                    samples_to_ms(self.queue.len(), out_rate),
+                    self.waiting_since.elapsed(),
+                    self.finished,
+                    self.prebuffer_ms,
+                );
         }
         self.started
     }
@@ -1344,8 +1421,18 @@ pub fn apply_mixer_cmd(
     match cmd {
         MixerCmd::Push { id, samples } => {
             let resampled = resample(&samples, SAMPLE_RATE_HZ, out_rate);
+            sources
+                .lock()
+                .unwrap()
+                .entry(id)
+                .or_default()
+                .extend(&resampled);
+        }
+        MixerCmd::PushLive { id, samples } => {
+            let resampled = resample(&samples, SAMPLE_RATE_HZ, out_rate);
             let mut map = sources.lock().unwrap();
             let src = map.entry(id).or_default();
+            src.mark_live();
             src.extend(&resampled);
             // Where a live source's backlog - and so the delay the listener
             // hears - is bounded. See the jitter buffer policy section.
@@ -1522,8 +1609,10 @@ pub fn mix_output<T: Copy>(
                 Some(s) => sum += s as i32,
                 // A started live source with nothing left to play has
                 // fallen behind its sender: rebuild a prebuffer before the
-                // next talk spurt rather than stuttering through it.
-                None if !src.finished => src.note_underrun(),
+                // next talk spurt rather than stuttering through it. A
+                // recording that runs dry is simply waiting for its
+                // `Finish`, and must not be made to re-prebuffer.
+                None if src.live && !src.finished => src.note_underrun(),
                 None => {}
             }
         }

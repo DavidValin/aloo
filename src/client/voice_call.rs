@@ -399,7 +399,7 @@ fn spawn_call_decrypt_worker(
                     return;
                 };
                 let _ = level_tx.send((peer, voice::level_from_pcm(&samples)));
-                let _ = mixer_tx.send(voice::MixerCmd::Push {
+                let _ = mixer_tx.send(voice::MixerCmd::PushLive {
                     id: mixer_id,
                     samples,
                 });

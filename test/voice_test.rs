@@ -478,6 +478,7 @@ fn a_live_sources_backlog_is_trimmed_back_to_its_prebuffer_target() {
     // (a network stall clearing, a sender running fast) stays grown, and
     // every sample behind it is played late for the rest of the call.
     let mut src = MixSource::new();
+    src.mark_live();
     src.extend(&vec![0i16; (SAMPLE_RATE_HZ * 2) as usize]);
     let dropped = src.on_push(SAMPLE_RATE_HZ);
     assert!(dropped > 0, "two seconds of backlog must be trimmed");
@@ -495,6 +496,7 @@ fn ordinary_burstiness_under_the_ceiling_is_left_alone() {
     // Several chunks arriving in one scheduling slice is normal. Trimming
     // that would chop audio continuously rather than bound a backlog.
     let mut src = MixSource::new();
+    src.mark_live();
     let under = JITTER_PREBUFFER_MIN_MS + JITTER_QUEUE_SLACK_MS;
     src.extend(&vec![0i16; ms_to_samples(under, SAMPLE_RATE_HZ)]);
     assert_eq!(src.on_push(SAMPLE_RATE_HZ), 0);
@@ -503,16 +505,69 @@ fn ordinary_burstiness_under_the_ceiling_is_left_alone() {
 
 /// @requirement TB-274
 #[test]
-fn a_finished_clip_is_never_trimmed_however_long_it_is() {
-    // A received voice message is a recording, not a real-time stream: its
-    // queue is the message itself, so trimming it would cut audio out of
-    // something the user asked to hear.
-    let mut src = MixSource::new();
-    let whole = (SAMPLE_RATE_HZ * 30) as usize;
-    src.extend(&vec![0i16; whole]);
-    src.mark_finished();
-    assert_eq!(src.on_push(SAMPLE_RATE_HZ), 0);
-    assert_eq!(src.queued_samples(), whole);
+fn a_whole_clip_survives_intact_through_the_real_push_then_finish_order() {
+    // The order that matters, and the one an earlier version of this test
+    // got wrong by marking the source finished up front: every chime and
+    // every replayed voice message is pushed whole and only *then*
+    // finished, so for that moment it is indistinguishable from a live
+    // source carrying a large backlog. Inferring "recording" from
+    // `finished` therefore trimmed all of them down to their last few
+    // milliseconds - clips that audibly cut themselves off.
+    let sources: Arc<Mutex<HashMap<u64, MixSource>>> = Arc::new(Mutex::new(HashMap::new()));
+    let clip = tone(300.0, 6000.0, (SAMPLE_RATE_HZ * 3) as usize);
+    apply_mixer_cmd(&sources, SAMPLE_RATE_HZ, MixerCmd::Push { id: 1, samples: clip.clone() });
+    assert_eq!(
+        sources.lock().unwrap().get(&1).unwrap().queued_samples(),
+        clip.len(),
+        "a recording must never be trimmed, finished or not"
+    );
+    apply_mixer_cmd(&sources, SAMPLE_RATE_HZ, MixerCmd::Finish { id: 1 });
+
+    // And it plays back in full, sample for sample.
+    let mut out = vec![0i16; clip.len()];
+    mix_output(&mut out, 1, SAMPLE_RATE_HZ, &sources, &|_| {}, |s| s);
+    assert_eq!(out, clip);
+}
+
+/// @requirement TB-274
+#[test]
+fn only_a_live_source_is_latency_managed() {
+    // Same oversized backlog, same push order - the only difference is
+    // which command delivered it, which is the only thing that can tell a
+    // real-time stream from a recording.
+    let big = vec![0i16; (SAMPLE_RATE_HZ * 2) as usize];
+
+    let recording: Arc<Mutex<HashMap<u64, MixSource>>> = Arc::new(Mutex::new(HashMap::new()));
+    apply_mixer_cmd(&recording, SAMPLE_RATE_HZ, MixerCmd::Push { id: 1, samples: big.clone() });
+    let map = recording.lock().unwrap();
+    let src = map.get(&1).unwrap();
+    assert!(!src.is_live());
+    assert_eq!(src.queued_samples(), big.len());
+    drop(map);
+
+    let live: Arc<Mutex<HashMap<u64, MixSource>>> = Arc::new(Mutex::new(HashMap::new()));
+    apply_mixer_cmd(&live, SAMPLE_RATE_HZ, MixerCmd::PushLive { id: 1, samples: big.clone() });
+    let map = live.lock().unwrap();
+    let src = map.get(&1).unwrap();
+    assert!(src.is_live());
+    assert!(src.queued_samples() < big.len(), "a live backlog must be trimmed");
+    assert_eq!(samples_to_ms(src.queued_samples(), SAMPLE_RATE_HZ), src.prebuffer_ms());
+}
+
+/// @requirement TB-274
+#[test]
+fn a_recording_that_runs_dry_before_its_finish_does_not_re_prebuffer() {
+    // A clip whose `Finish` has not arrived yet must simply wait, not be
+    // treated as a live source that fell behind its sender.
+    let sources: Arc<Mutex<HashMap<u64, MixSource>>> = Arc::new(Mutex::new(HashMap::new()));
+    let clip = tone(300.0, 6000.0, 400);
+    apply_mixer_cmd(&sources, SAMPLE_RATE_HZ, MixerCmd::Push { id: 1, samples: clip.clone() });
+    pump(&sources, clip.len() + 200);
+
+    let map = sources.lock().unwrap();
+    let src = map.get(&1).expect("still waiting for its Finish");
+    assert!(src.started(), "a recording that ran dry stays started");
+    assert_eq!(src.prebuffer_ms(), JITTER_PREBUFFER_MIN_MS, "and grows no prebuffer");
 }
 
 /// @requirement TB-275
@@ -567,7 +622,7 @@ fn a_starved_live_source_rebuilds_a_larger_prebuffer_before_it_plays_again() {
     apply_mixer_cmd(
         &sources,
         SAMPLE_RATE_HZ,
-        MixerCmd::Push { id: 1, samples: vec![1000; filled] },
+        MixerCmd::PushLive { id: 1, samples: vec![1000; filled] },
     );
     // Ask for more than it has: it plays what there is, then starves.
     pump(&sources, filled + 64);
@@ -601,6 +656,25 @@ fn a_finished_source_drains_completely_and_is_then_retired() {
 // ---------------------------------------------------------------------
 // Echo ducking and silence suppression
 // ---------------------------------------------------------------------
+
+/// @requirement TB-278
+#[test]
+fn the_ducker_reaches_useful_attenuation_within_the_first_chunks() {
+    // The failure this pins: an attack slow enough to leave the microphone
+    // near full gain through the *opening* of every far-end phrase leaks a
+    // burst of echo on every utterance, which is indistinguishable from no
+    // ducking at all.
+    let mut ducker = EchoDucker::new();
+    ducker.process(&mut vec![0i16; 240], 80);
+    assert!(ducker.gain() < 0.3, "one chunk in, gain was still {}", ducker.gain());
+    ducker.process(&mut vec![0i16; 240], 80);
+    ducker.process(&mut vec![0i16; 240], 80);
+    assert!(
+        ducker.gain() < ECHO_DUCK_GAIN * 1.5,
+        "three chunks in, gain was still {}",
+        ducker.gain()
+    );
+}
 
 /// @requirement TB-278
 #[test]
@@ -789,7 +863,23 @@ fn the_probe_releases_on_headphones_where_the_microphone_hears_nothing() {
         "no echo leak should release ducking, excess was {}",
         probe.excess_level()
     );
-    assert!(probe.excess_level().abs() < 2.0);
+    assert!(probe.excess_ratio() < 1.08, "ratio {}", probe.excess_ratio());
+}
+
+/// @requirement TB-282
+#[test]
+fn a_quiet_but_audible_echo_still_holds_ducking_on() {
+    // The case an absolute margin got wrong: a room whose echo raises the
+    // microphone by only a couple of meter points is still a room the far
+    // end hears themselves in. Judged as a ratio, it is unambiguous.
+    let mut probe = EchoProbe::new();
+    observe_conversation(&mut probe, 12, 2, 0);
+    assert!(
+        probe.should_duck(),
+        "a {:.2}x rise must still count as an echo path",
+        probe.excess_ratio()
+    );
+    assert!(probe.excess_level() < 4.0, "and it is well under the old absolute threshold");
 }
 
 /// @requirement TB-282

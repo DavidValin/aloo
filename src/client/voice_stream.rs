@@ -723,7 +723,7 @@ pub(crate) fn spawn_stream_decrypt_worker(
             };
             plaintext_accum.extend_from_slice(&voice::pcm_to_bytes(&samples));
             if !suppress_playback {
-                let _ = mixer_tx.send(voice::MixerCmd::Push {
+                let _ = mixer_tx.send(voice::MixerCmd::PushLive {
                     id: mixer_id,
                     samples,
                 });
