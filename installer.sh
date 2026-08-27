@@ -676,7 +676,7 @@ backup_aloo_home() {
   if [ -e "$dest" ]; then
     dest="${dest}-$(date +%Y%m%d%H%M%S)"
   fi
-  cp -a "$src" "$dest"
+  mv "$src" "$dest"
   warn "Existing ~/.aloo directory found and backed up to: $dest"
   warn "You can manually migrate your keys and settings back into ~/.aloo if needed."
 }
