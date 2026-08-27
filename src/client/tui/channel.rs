@@ -1883,6 +1883,9 @@ fn render_sidebar(frame: &mut Frame, area: Rect, state: &UiState) {
         .border_style(border_style);
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    state
+        .last_sidebar_area
+        .store(super::ui::pack_rect(inner), std::sync::atomic::Ordering::Relaxed);
 
     let Some(channel) = state.channels.get(state.selected_channel) else {
         return;

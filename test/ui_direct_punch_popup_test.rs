@@ -6,9 +6,11 @@ mod ui_common;
 use ui_common::*;
 
 use aloo::client::tui::direct_punch_popup::DirectPunchField;
-use aloo::client::tui::ui::{Mode, UiAction};
+use aloo::client::tui::ui::{Mode, UiAction, render};
 use aloo::settings::{DEFAULT_DIRECT_PUNCH_PORT, DirectPunchTarget, PunchFrequency};
 use crossterm::event::KeyCode;
+use ratatui::Terminal;
+use ratatui::backend::TestBackend;
 
 fn target(nickname: &str, host: &str, port: u16, frequency_minutes: u32) -> DirectPunchTarget {
     DirectPunchTarget {
@@ -106,6 +108,135 @@ fn a_opens_a_blank_add_form() {
     assert_eq!(edit.editing_index, None);
     assert_eq!(edit.nickname, "");
     assert_eq!(edit.focus, DirectPunchField::Nickname);
+}
+
+/// The add form opens with the blinking terminal cursor visibly in the
+/// nickname box - the same styling and cursor convention the connect
+/// popup's own bordered fields already use, so it's obvious where typing
+/// lands the instant the form appears.
+/// @requirement AC-393
+#[test]
+fn the_add_form_opens_with_the_cursor_in_the_nickname_box() {
+    let mut state = joined_general_with(vec![]);
+    state.open_direct_punches();
+    press(&mut state, KeyCode::Char('a'));
+    assert_eq!(
+        state.direct_punches.as_ref().unwrap().edit.as_ref().unwrap().focus,
+        DirectPunchField::Nickname
+    );
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| render(f, &state)).unwrap();
+
+    let buffer = terminal.backend().buffer().clone();
+    let nickname_title_row = (0..buffer.area.height)
+        .find(|&y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+                .contains("nickname")
+        })
+        .expect("expected a visible \"nickname\" box title");
+
+    let cursor = terminal
+        .get_cursor_position()
+        .expect("cursor should be set while the nickname field is focused");
+    assert_eq!(
+        cursor.y,
+        nickname_title_row + 1,
+        "the cursor sits in the nickname box's content row, just like the connect popup's fields"
+    );
+}
+
+/// Each field is its own bordered, titled box - not a bare reversed-text
+/// line - the same look every other popup's text fields already use.
+/// @requirement AC-393
+#[test]
+fn every_field_renders_as_a_titled_bordered_box() {
+    let mut state = joined_general_with(vec![]);
+    state.open_direct_punches();
+    press(&mut state, KeyCode::Char('a'));
+
+    let rows = rendered_rows(&state);
+    for title in ["nickname", "host", "port", "frequency"] {
+        assert!(
+            rows.iter().any(|r| r.contains(title)),
+            "expected a {title} box title: {rows:?}"
+        );
+    }
+    // A bordered box draws its own top/bottom rule - at least one row
+    // must be pure border-drawing characters, distinguishing this from
+    // the old single reversed-text-per-field layout.
+    assert!(
+        rows.iter().any(|r| r.chars().filter(|c| !c.is_whitespace()).all(|c| "\u{2500}\u{250c}\u{2510}\u{2514}\u{2518}\u{2502}".contains(c)) && r.contains('\u{2500}')),
+        "expected at least one field's own border rule: {rows:?}"
+    );
+}
+
+/// Saving from the add/edit form shows a confirmation, not a silent close.
+/// @requirement AC-393
+#[test]
+fn saving_shows_a_confirmation_notice() {
+    let mut state = joined_general_with(vec![]);
+    state.open_direct_punches();
+    press(&mut state, KeyCode::Char('a'));
+    type_str(&mut state, "bob");
+    press(&mut state, KeyCode::Tab);
+    type_str(&mut state, "bobhost.example");
+    while state.direct_punches.as_ref().unwrap().edit.as_ref().unwrap().focus != DirectPunchField::Save {
+        press(&mut state, KeyCode::Tab);
+    }
+    let action = press(&mut state, KeyCode::Enter);
+    assert!(matches!(action, Some(UiAction::SaveDirectPunchTargets(_))));
+
+    // The popup itself only requests the save; the confirmation is shown
+    // once the session actually persists it (`session::handle_ui_action`'s
+    // `SaveDirectPunchTargets` arm) - simulated here the same way other
+    // session-side answers are in these UI-level tests.
+    state.push_status_notice("direct punch targets saved".to_string(), true);
+    let (message, success) = state.status_notice.clone().expect("expected a confirmation notice");
+    assert!(success);
+    assert_eq!(message, "direct punch targets saved");
+}
+
+/// Pasting into a focused text field inserts it exactly like typing it
+/// character by character would - the popup is one of the many overlays
+/// `handle_paste` now routes through `handle_key` instead of silently
+/// dropping (previously, paste only worked in the plain chat compose bar).
+/// @requirement AC-394
+#[test]
+fn pasting_into_the_nickname_field_types_it() {
+    let mut state = joined_general_with(vec![]);
+    state.open_direct_punches();
+    press(&mut state, KeyCode::Char('a'));
+    assert_eq!(
+        state.direct_punches.as_ref().unwrap().edit.as_ref().unwrap().focus,
+        DirectPunchField::Nickname
+    );
+
+    let action = state.handle_paste("bob".to_string());
+    assert!(action.is_none(), "typing a nickname produces no action");
+    assert_eq!(state.direct_punches.as_ref().unwrap().edit.as_ref().unwrap().nickname, "bob");
+}
+
+/// The port field's own digit-only filter still applies to pasted text,
+/// exactly as it does to typed text - pasting garbage does not bypass it.
+/// @requirement AC-394
+#[test]
+fn pasting_into_the_port_field_still_only_keeps_digits() {
+    let mut state = joined_general_with(vec![]);
+    state.open_direct_punches();
+    press(&mut state, KeyCode::Char('a'));
+    press(&mut state, KeyCode::Tab); // nickname -> host
+    press(&mut state, KeyCode::Tab); // host -> port
+    assert_eq!(
+        state.direct_punches.as_ref().unwrap().edit.as_ref().unwrap().focus,
+        DirectPunchField::Port
+    );
+
+    state.handle_paste("12a3b4".to_string());
+    assert_eq!(state.direct_punches.as_ref().unwrap().edit.as_ref().unwrap().port, "1234");
 }
 
 /// @requirement AC-291

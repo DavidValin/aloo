@@ -358,7 +358,11 @@ async fn reconnect_loop(
         // `delay_after(0)` is zero, so the first attempt happens the
         // moment the connection is noticed gone.
         events_tx.send(ServerEvent::Attempting).ok()?;
-        match crate::client::connect::handshake_as(&plan.request, plan.public_key_der.clone()).await
+        match crate::client::connect::handshake_as_bounded_and_diagnosed(
+            &plan.request,
+            plan.public_key_der.clone(),
+        )
+        .await
         {
             Ok((reader, writer, you, _server_addr)) => {
                 sink.install(writer).await;

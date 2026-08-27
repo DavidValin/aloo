@@ -439,12 +439,14 @@ async fn diagnose_ssl_mismatch(request: &ConnectRequest) -> Option<String> {
     })
 }
 
-/// How long the very first connect attempt (`connect_with_reconnect`'s own
-/// `connect_and_handshake`, never a later automatic reconnect) is given
-/// before it's treated as failed. Generous next to `SSL_DIAGNOSIS_TIMEOUT`
+/// How long one connect attempt - the very first one
+/// (`connect_with_reconnect`'s own `connect_and_handshake`) or a later
+/// automatic reconnect (`reconnect::reconnect_loop`, via
+/// `handshake_as_bounded_and_diagnosed` below) alike - is given before
+/// it's treated as failed. Generous next to `SSL_DIAGNOSIS_TIMEOUT`
 /// because this one also has to cover DNS, TCP, and the whole login
 /// handshake - not just reaching `Hello`.
-const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+pub(crate) const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// `e` (a real error, or already a synthetic "timed out" one) becomes a
 /// `SslMismatchError` when `diagnose_ssl_mismatch` finds the opposite mode
@@ -462,6 +464,42 @@ async fn with_ssl_diagnosis(request: &ConnectRequest, e: BoxError) -> BoxError {
     match diagnose_ssl_mismatch(request).await {
         Some(diagnosis) => Box::new(SslMismatchError(format!("{e} - {diagnosis}"))),
         None => e,
+    }
+}
+
+/// `handshake_as`, bounded by `CONNECT_TIMEOUT` and diagnosed for an
+/// SSL/plaintext mismatch exactly the way `connect_with_reconnect`'s own
+/// first attempt already is (see its comment on `CONNECT_TIMEOUT` above)
+/// - what `reconnect::reconnect_loop` uses so an automatic reconnect that
+/// hits a transport-mode mismatch (the server's `server_ssl` flipped, or
+/// `connect_using_ssl` edited, out from under an already-running session)
+/// fails cleanly with a specific reason instead of the mutual TLS-accept/
+/// `Hello`-read stall neither side ever times out on its own.
+pub(crate) async fn handshake_as_bounded_and_diagnosed(
+    request: &ConnectRequest,
+    public_key_der: Vec<u8>,
+) -> Result<
+    (
+        crate::control::ControlReader<tokio::io::ReadHalf<BoxedStream>>,
+        crate::control::ControlWriter<tokio::io::WriteHalf<BoxedStream>>,
+        proto::UserId,
+        std::net::SocketAddr,
+    ),
+    BoxError,
+> {
+    match tokio::time::timeout(CONNECT_TIMEOUT, handshake_as(request, public_key_der)).await {
+        Ok(Ok(ok)) => Ok(ok),
+        Ok(Err(e)) => Err(with_ssl_diagnosis(request, e).await),
+        Err(_elapsed) => {
+            let timeout_err: BoxError = format!(
+                "connect to {}:{} timed out after {}s",
+                request.host,
+                request.port,
+                CONNECT_TIMEOUT.as_secs()
+            )
+            .into();
+            Err(with_ssl_diagnosis(request, timeout_err).await)
+        }
     }
 }
 
@@ -651,6 +689,16 @@ pub async fn handshake_as(
             return Err("server closed the connection during activation".into());
         };
         if !ok {
+            // A wrong code that just crossed `ACTIVATION_FAIL_LIMIT`
+            // removed the account outright - there is nothing left to
+            // retry against, so this must not reopen the activation
+            // popup for yet another code the way an ordinary wrong one
+            // does.
+            if reason.as_deref() == Some(crate::server::users_registry::ACCOUNT_REMOVED_ACTIVATION_REASON) {
+                return Err(Box::new(AuthRefusedError(
+                    reason.unwrap_or_default(),
+                )));
+            }
             return Err(Box::new(ActivationRequiredError(
                 reason.unwrap_or_else(|| "activation refused".into()),
             )));

@@ -311,6 +311,63 @@ async fn a_pending_account_is_asked_for_its_code_and_activated_by_the_right_one(
     assert!(matches!(result, ServerMessage::AuthResult { ok: true, activation_pending: false, .. }));
 }
 
+/// The 5th wrong activation code in a row (each costing its own reconnect
+/// - §5.2) removes the account outright: the connection is told so with a
+/// distinct reason, and the very next login attempt for that nickname
+/// finds no account at all rather than one still pending.
+/// @requirement AC-388
+#[tokio::test]
+async fn five_wrong_activation_codes_remove_the_account() {
+    let options = test_options("login-activate-fail-limit");
+    options
+        .users
+        .register("carol", "pw-carol", "carol@example.com", aloo::server::users_registry::now_utc())
+        .unwrap();
+    let server = TestServer::spawn(options).await;
+
+    for _ in 0..4 {
+        let mut stream = server.connect().await;
+        login(&mut stream, "carol", "pw-carol").await;
+        stream
+            .send(&ClientMessage::Activate {
+                code: "000000000000".into(),
+            })
+            .await
+            .unwrap();
+        let refused: ServerMessage = stream.recv().await.unwrap().unwrap();
+        assert!(
+            matches!(refused, ServerMessage::AuthResult { ok: false, reason: Some(ref r), .. } if r.contains("wrong")),
+            "{refused:?}"
+        );
+    }
+    assert!(server.options.users.is_registered("carol"), "still short of the limit");
+
+    let mut stream = server.connect().await;
+    login(&mut stream, "carol", "pw-carol").await;
+    stream
+        .send(&ClientMessage::Activate {
+            code: "000000000000".into(),
+        })
+        .await
+        .unwrap();
+    let removed: ServerMessage = stream.recv().await.unwrap().unwrap();
+    assert!(
+        matches!(
+            removed,
+            ServerMessage::AuthResult { ok: false, reason: Some(ref r), .. }
+                if r == "too many wrong activation codes - this account has been removed"
+        ),
+        "{removed:?}"
+    );
+    assert!(!server.options.users.is_registered("carol"), "the account is gone");
+
+    // The nickname is free again - the next login attempt is an ordinary
+    // "no such account", not "still pending".
+    let mut stream = server.connect().await;
+    let next = login(&mut stream, "carol", "pw-carol").await;
+    assert!(matches!(next, ServerMessage::AuthResult { ok: false, activation_pending: false, .. }));
+}
+
 /// A code older than `ACTIVATION_VALIDITY_SECS` cannot activate anything;
 /// the user is told to register again.
 /// @requirement AC-265
@@ -357,15 +414,13 @@ async fn an_expired_activation_still_refuses_when_the_configured_relay_is_unreac
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.local_addr().unwrap().port()
     };
-    let options = test_options("login-expired-unreachable-smtp").with_registration(
-        Some(aloo::server::users_registry::SmtpConfig {
+    let options =
+        test_options("login-expired-unreachable-smtp").with_registration(Some(aloo::server::users_registry::SmtpConfig {
             host: "127.0.0.1".to_string(),
             port: closed_port,
             username: String::new(),
             password: String::new(),
-        }),
-        None,
-    );
+        }));
     let long_ago = aloo::server::users_registry::now_utc()
         - aloo::server::users_registry::ACTIVATION_VALIDITY_SECS
         - 60;
@@ -490,7 +545,7 @@ async fn registration_is_advertised_in_hello_and_refused_when_off() {
 /// @requirement AC-264
 #[tokio::test]
 async fn registration_without_a_relay_is_refused_and_creates_nothing() {
-    let server = TestServer::spawn(test_options("register-no-smtp").with_registration(None, None)).await;
+    let server = TestServer::spawn(test_options("register-no-smtp").with_registration(None)).await;
     let mut stream = server.connect().await;
     let open = stream.client_handshake().await.unwrap().unwrap();
     assert!(open);
@@ -508,6 +563,43 @@ async fn registration_without_a_relay_is_refused_and_creates_nothing() {
         "{result:?}"
     );
     assert!(!server.options.users.is_registered("eve"));
+}
+
+/// A second nickname cannot register under an email already backing a
+/// different account, end to end.
+/// @requirement AC-389
+#[tokio::test]
+async fn registering_under_an_already_used_email_is_refused_over_the_wire() {
+    let options = test_options("register-dup-email-wire").with_registration(Some(
+        aloo::server::users_registry::SmtpConfig {
+            host: "127.0.0.1".to_string(),
+            port: 1, // never dialed - `users.register` fails before smtp_submit runs
+            username: String::new(),
+            password: String::new(),
+        },
+    ));
+    options
+        .users
+        .register("alice", "pw-alice", "shared@example.com", aloo::server::users_registry::now_utc())
+        .unwrap();
+    let server = TestServer::spawn(options).await;
+
+    let mut stream = server.connect().await;
+    stream.client_handshake().await.unwrap().unwrap();
+    stream
+        .send(&ClientMessage::Register {
+            nickname: "mallory".into(),
+            password: "pw".into(),
+            email: "shared@example.com".into(),
+        })
+        .await
+        .unwrap();
+    let result: ServerMessage = stream.recv().await.unwrap().unwrap();
+    assert!(
+        matches!(result, ServerMessage::RegisterResult { ok: false, reason: Some(ref r) } if r.contains("email")),
+        "{result:?}"
+    );
+    assert!(!server.options.users.is_registered("mallory"));
 }
 
 /// The registry a server reads is the directory on disk, re-read per
@@ -543,6 +635,101 @@ async fn registry_edits_take_effect_on_the_next_login_without_a_restart() {
         login(&mut stream, "fay", "second").await,
         ServerMessage::AuthResult { ok: true, .. }
     ));
+}
+
+// ---------------------------------------------------------------------
+// Login-failure and registration-abuse IP bans
+// ---------------------------------------------------------------------
+
+/// The 7th wrong password from one address bans that address outright -
+/// even a subsequent attempt with the *right* password is refused, named
+/// distinctly from an ordinary "authentication failed" so a client (and a
+/// human reading logs) can tell the two apart.
+/// @requirement AC-386
+#[tokio::test]
+async fn seven_wrong_passwords_ban_the_address_for_logins() {
+    let server = TestServer::spawn(test_options("login-ban")).await;
+    server.ensure_user("alice");
+    for _ in 0..7 {
+        let mut stream = server.connect().await;
+        let refused = login(&mut stream, "alice", "not-her-password").await;
+        assert!(matches!(refused, ServerMessage::AuthResult { ok: false, .. }));
+    }
+    let mut stream = server.connect().await;
+    let result = login(&mut stream, "alice", &password_for("alice")).await;
+    let ServerMessage::AuthResult {
+        ok: false,
+        reason: Some(reason),
+        ..
+    } = result
+    else {
+        panic!("expected the banned address to be refused even with the right password, got {result:?}");
+    };
+    assert!(
+        reason.contains("too many failed login attempts"),
+        "{reason}"
+    );
+}
+
+/// Fewer than 7 wrong passwords leaves the address free to log in with the
+/// right one.
+/// @requirement AC-386
+#[tokio::test]
+async fn six_wrong_passwords_do_not_yet_ban_the_address() {
+    let server = TestServer::spawn(test_options("login-ban-not-yet")).await;
+    server.ensure_user("alice");
+    for _ in 0..6 {
+        let mut stream = server.connect().await;
+        let _ = login(&mut stream, "alice", "not-her-password").await;
+    }
+    let mut stream = server.connect().await;
+    let result = login(&mut stream, "alice", &password_for("alice")).await;
+    assert!(matches!(result, ServerMessage::AuthResult { ok: true, .. }));
+}
+
+/// More than 3 registrations from one address within 2 days - the 4th -
+/// refuses that one and every further attempt from the same address, so
+/// registration spam cannot keep creating accounts indefinitely.
+/// @requirement AC-387
+#[tokio::test]
+async fn more_than_three_registrations_ban_the_address() {
+    let server = TestServer::spawn(test_options("register-ban").with_registration(None)).await;
+    for i in 0..3 {
+        let mut stream = server.connect().await;
+        stream.client_handshake().await.unwrap().unwrap();
+        stream
+            .send(&ClientMessage::Register {
+                nickname: format!("user{i}"),
+                password: "pw".into(),
+                email: format!("user{i}@example.com"),
+            })
+            .await
+            .unwrap();
+        let result: ServerMessage = stream.recv().await.unwrap().unwrap();
+        // Every one of these fails for the *unrelated* reason that no SMTP
+        // relay is configured - proving the ban gate itself hasn't fired
+        // yet, distinct from the 4th attempt's own refusal below.
+        assert!(
+            matches!(result, ServerMessage::RegisterResult { ok: false, reason: Some(ref r) } if r.contains("email")),
+            "{result:?}"
+        );
+    }
+    let mut stream = server.connect().await;
+    stream.client_handshake().await.unwrap().unwrap();
+    stream
+        .send(&ClientMessage::Register {
+            nickname: "user3".into(),
+            password: "pw".into(),
+            email: "user3@example.com".into(),
+        })
+        .await
+        .unwrap();
+    let result: ServerMessage = stream.recv().await.unwrap().unwrap();
+    assert!(
+        matches!(result, ServerMessage::RegisterResult { ok: false, reason: Some(ref r) } if r.contains("too many registrations")),
+        "{result:?}"
+    );
+    assert!(!server.options.users.is_registered("user3"));
 }
 
 // ---------------------------------------------------------------------

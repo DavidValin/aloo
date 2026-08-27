@@ -6115,8 +6115,10 @@ pub(crate) fn refresh_pad_send_progress(
 }
 
 /// Applies one `PadEvent` - the session loop's `otp_pad_rx` arm, and where
-/// the two-phase commit's *first* phase completes on each side.
-pub(crate) async fn on_pad_event(
+/// the two-phase commit's *first* phase completes on each side. `pub` so a
+/// test can drive it with a synthetic `PadEvent::Received` against a pad
+/// staged via `SessionState::stage_incoming_pad_for_test`.
+pub async fn on_pad_event(
     wr: &mut impl crate::control::ControlSink,
     session: &mut SessionState,
     ui_state: &mut UiState,
@@ -6235,10 +6237,20 @@ pub(crate) async fn on_pad_event(
             // Or one the user already agreed to before it was generated,
             // knowing its size - the decision was made then, at the point
             // where declining still saved both sides the whole cost.
+            // `contains`, not the `remove` this used to be: a pad this size
+            // can take a long time, and any interruption between this
+            // side's `OtpPadVerify` and the sender's matching `OtpPadCommit`
+            // makes the sender re-offer the *whole* pad from scratch
+            // (docs/PROTOCOL.md's reconnect-resend note), landing back here
+            // a second time for the very same accepted proposal. Consuming
+            // the consent on the first pass used to turn that ordinary
+            // reconnect into a second decision popup for something already
+            // agreed to; `on_pad_commit` clears it for real once the
+            // exchange actually finishes installing.
             if session
                 .otp_store
                 .is_installed_pad(&contact_name, pad_digest)
-                || session.otp_consented.remove(&contact_name)
+                || session.otp_consented.contains(&contact_name)
             {
                 send_pad_verify(session, from, &contact_name, true, enc_digest, dec_digest);
                 return Ok(());
@@ -6505,6 +6517,10 @@ pub async fn on_pad_commit(
         .remove(&key)
         .expect("key was just found in this same map");
     crate::client::otp_staging::secure_remove_dir(&pad.dir);
+    // The exchange is genuinely over now - nothing left to re-verify
+    // without asking again, so the consent `on_pad_event`'s `Received`
+    // arm checks no longer needs to (or should) outlive this pad.
+    session.otp_consented.remove(&contact_name);
     // Recorded with the pad it actually is, so a later re-delivery of this
     // same pad is recognised as one and a different pad is not. A full
     // reset rather than a mark: the new pad replaced the tool's per-contact

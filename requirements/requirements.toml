@@ -285,14 +285,19 @@ description = "If a registered account's activation code has expired, both loggi
 evidence = "docs/PROTOCOL.md 5.1; src/server/mod.rs reissue_and_resend_activation, handle_connection's ActivationPending arm; src/server/users_registry.rs UsersRegistry::reissue_activation; tests reissue_activation_replaces_an_expired_pending_code_leaving_credentials_untouched, reissue_activation_is_a_no_op_unless_the_pending_code_has_actually_expired (server_users_registry_test.rs), an_expired_activation_still_refuses_when_the_configured_relay_is_unreachable (server_test.rs)"
 
 [[user_story.acceptance_criteria]]
+id = "AC-388"
+description = "ACTIVATION_FAIL_LIMIT (5) wrong activation codes in a row against one still-pending account remove the account outright (UsersRegistry::remove) rather than leaving it open to indefinite guessing - the client's own popup retries with no limit of its own (AC-271), so this is what actually bounds it. The removing attempt's AuthResult names ACCOUNT_REMOVED_ACTIVATION_REASON specifically, distinct from an ordinary wrong-code refusal; connect::handshake_as matches that exact reason to stop reopening the activation popup for a code that can never work again, surfacing it as an ordinary refusal on the connect form instead (the same path a wrong password already takes). The count is per pending activation, cleared by a successful activation - it does not carry into whatever gets registered next under the same name."
+evidence = "docs/PROTOCOL.md 5.2; src/server/users_registry.rs UsersRegistry::activate, record_wrong_activation_code, ACTIVATION_FAIL_LIMIT, ACCOUNT_REMOVED_ACTIVATION_REASON, ActivationOutcome::TooManyWrongCodesAccountRemoved; src/server/mod.rs handle_connection's Activate arm; src/client/connect.rs handshake_as; tests five_wrong_activation_codes_in_a_row_remove_the_account, fewer_than_the_limit_of_wrong_codes_does_not_remove_the_account, a_successful_activation_clears_the_wrong_code_count, the_account_removed_reason_constant_is_the_documented_wording (server_users_registry_test.rs), five_wrong_activation_codes_remove_the_account (server_test.rs)"
+
+[[user_story.acceptance_criteria]]
+id = "AC-389"
+description = "One email address cannot back two different nicknames: Register (and the server's own registration path) refuses RegisterError::EmailAlreadyRegistered whenever the given email already belongs to a different registered nickname (active or still pending activation), case-insensitively. Re-registering the *same* nickname under the email it already has (e.g. replacing an expired pending activation) is unaffected, and an email frees up again once the account holding it is removed."
+evidence = "docs/PROTOCOL.md 5.3; src/server/users_registry.rs UsersRegistry::register, email_taken_by_another_nickname, RegisterError::EmailAlreadyRegistered; tests a_second_nickname_cannot_register_under_an_email_already_in_use, reregistering_the_same_nickname_under_its_own_email_is_unaffected, an_emails_slot_frees_up_once_its_account_is_removed (server_users_registry_test.rs), registering_under_an_already_used_email_is_refused_over_the_wire (server_test.rs)"
+
+[[user_story.acceptance_criteria]]
 id = "AC-368"
 description = "A logged-in user changes their own password with `/password <old> <new>` (ClientMessage::ChangePassword) - reachable for any connected account, gated on nothing client-side. The server re-checks `old` exactly like Auth would (never trusting the credentials this same connection originally authenticated with) before calling UsersRegistry::change_password; a wrong `old` refuses with ChangePasswordResult { ok: false } and leaves the real password untouched, and the connection itself is unaffected either way - unlike a failed Auth, it stays open. Needs a server (UiAction::needs_server) - there is no meaning for a password without a registry to hold one."
 evidence = "src/proto.rs ClientMessage::ChangePassword, ServerMessage::ChangePasswordResult; src/server/mod.rs client_loop's ChangePassword arm; src/client/tui/ui.rs UiState::try_password_command, UiAction::ChangePassword, needs_server; src/client/session.rs handle_ui_action's ChangePassword arm, handle_server_message's ChangePasswordResult arm; tests slash_password_sends_change_password, slash_password_with_wrong_arg_count_is_refused_locally, every_new_admin_action_needs_a_server (ui_channel_test.rs), change_password_with_the_right_old_password_takes_effect_immediately, change_password_with_the_wrong_old_password_is_refused_and_changes_nothing (server_test.rs)"
-
-[[user_story.acceptance_criteria]]
-id = "AC-266"
-description = "The activation web endpoint (activation.rs), reachable only while server_allow_registration is on, answers a correct code with a success page and a wrong one with a refusal page; more than MAX_ATTEMPTS_PER_HOUR attempts from one source address within an hour bans that address from the endpoint for BAN_DURATION - a ban scoped to this endpoint alone, never to logging in as a client."
-evidence = "docs/PROTOCOL.md 5.3; src/server/activation.rs AttemptLimiter, MAX_ATTEMPTS_PER_HOUR, BAN_DURATION, handle; tests the_eleventh_attempt_within_an_hour_is_banned, a_ban_lasts_the_full_day_and_then_lifts, the_window_restarts_once_it_has_fully_elapsed, the_limiter_is_scoped_per_address, repeated_wrong_codes_from_one_address_trip_the_endpoints_own_ban"
 
 [[user_story.acceptance_criteria]]
 id = "AC-270"
@@ -306,13 +311,8 @@ evidence = "docs/PROTOCOL.md 5.2; src/client/tui/ui_connect_popup.rs ActivationP
 
 [[user_story.technical_behavior]]
 id = "TB-242"
-description = "The activation email names the nickname it is for and carries the raw code; when the server has a public activation_url configured, it also carries the equivalent link, and never does when there is none. Building the message never touches the network - only sending it does."
-evidence = "src/server/users_registry.rs activation_email, activation_link, send_activation_email; tests activation_email_carries_the_code_and_names_the_nickname_and_recipient, activation_email_includes_a_link_when_a_base_url_is_configured, activation_link_trims_a_trailing_slash_on_the_base_url"
-
-[[user_story.technical_behavior]]
-id = "TB-243"
-description = "The activation endpoint's hand-rolled HTTP layer parses a request line's method, path and percent-decoded query into a well-typed request, and renders a response as a status line plus a Content-Length matching its body - the two properties any client speaking ordinary HTTP/1.1 needs from it."
-evidence = "src/server/activation.rs parse_request, percent_decode, HttpResponse::to_bytes; tests parse_request_reads_the_method_path_and_decoded_query, parse_request_rejects_a_line_with_no_method_or_target, percent_decode_handles_plus_and_hex_escapes_and_keeps_invalid_ones_literal, to_bytes_carries_a_correct_content_length"
+description = "The activation email names the nickname it is for, carries the raw code, and tells a recipient who never registered that they can ignore it. Building the message never touches the network - only sending it does."
+evidence = "src/server/users_registry.rs activation_email, send_activation_email; tests activation_email_carries_the_code_and_names_the_nickname_and_recipient, activation_email_tells_a_non_registrant_to_ignore_it"
 
 # ============================================================================
 # US-044 - Encrypt the connection to the server with TLS
@@ -321,12 +321,12 @@ evidence = "src/server/activation.rs parse_request, percent_decode, HttpResponse
 id = "US-044"
 title = "Encrypt the connection to the server with TLS"
 as_a = "user or operator on a network I do not fully trust"
-i_want = "the option to run the control connection, and the activation endpoint, over TLS"
+i_want = "the option to run the control connection over TLS"
 so_that = "a certificate - not just the sealed control channel's own ephemeral offer - vouches for the server I am actually talking to"
 
 [[user_story.acceptance_criteria]]
 id = "AC-262"
-description = "server_ssl=on serves both the control connection and the activation endpoint under the certificate pair named by server_ssl_fullchain/server_ssl_privkey; a certificate and key that do not load or do not match each other refuse the server's startup outright, naming the problem, rather than falling back to plaintext. A client with ssl on and the certificate's own root trusted completes a real TLS handshake and exchanges bytes over it; one that does not trust the root refuses the handshake."
+description = "server_ssl=on serves the control connection under the certificate pair named by server_ssl_fullchain/server_ssl_privkey; a certificate and key that do not load or do not match each other refuse the server's startup outright, naming the problem, rather than falling back to plaintext. A client with ssl on and the certificate's own root trusted completes a real TLS handshake and exchanges bytes over it; one that does not trust the root refuses the handshake."
 evidence = "docs/PROTOCOL.md 1.4; src/server/ssl.rs SslFiles, load_acceptor, accept, connect; src/main.rs run_server; tests server_ssl_on_without_a_certificate_refuses_to_start, a_real_tls_handshake_carries_bytes_both_ways, a_client_with_the_wrong_trust_root_refuses_the_handshake, load_acceptor_reports_which_file_is_missing, ssl_files_from_settings_is_none_unless_server_ssl_is_on"
 
 [[user_story.acceptance_criteria]]
@@ -341,8 +341,13 @@ evidence = "src/client/daemon.rs DaemonConfig::resolve, to_connect_request; test
 
 [[user_story.acceptance_criteria]]
 id = "AC-365"
-description = "`connect_with_reconnect`'s own first connect attempt (never a later automatic reconnect) is bounded by `CONNECT_TIMEOUT` (15s) - a client that skips TLS against an SSL-only server, or the reverse, does not fail cleanly on its own, it deadlocks (the server's TLS accept waits for a `ClientHello` that never comes; the client waits for a `Hello` that never comes either), so this is what actually resolves it. Whether the attempt fails outright or times out, and the reason is not already meaningful on its own (not a wrong password, a taken nickname, a deactivated account, or a pending activation code - reaching any of those already proves the transport mode was right), `with_ssl_diagnosis` makes one further bounded-time (~4s, `SSL_DIAGNOSIS_TIMEOUT`) diagnostic attempt at the same host/port with the opposite of `connect_using_ssl`, purely to explain the failure - never to actually connect that way. If that opposite attempt gets a real `Hello` back, the original error is wrapped in a distinct `SslMismatchError` naming a specific reason (\"this server appears to require SSL\" / \"...appears to reject SSL\", naming `connect_using_ssl`) - the connect popup catches it by type and loops back into the form with the reason shown in red (the same way a wrong password already does), rather than exiting the client the way an unclassified connect failure still does; a daemon start just propagates it and fails with the same reason. If the opposite attempt also fails, the original error is returned unchanged. The real session that follows, if any, always uses exactly what `connect_using_ssl` said - never the probed alternative."
+description = "`connect_with_reconnect`'s own first connect attempt is bounded by `CONNECT_TIMEOUT` (15s) - a client that skips TLS against an SSL-only server, or the reverse, does not fail cleanly on its own, it deadlocks (the server's TLS accept waits for a `ClientHello` that never comes; the client waits for a `Hello` that never comes either), so this is what actually resolves it. Whether the attempt fails outright or times out, and the reason is not already meaningful on its own (not a wrong password, a taken nickname, a deactivated account, or a pending activation code - reaching any of those already proves the transport mode was right), `with_ssl_diagnosis` makes one further bounded-time (~4s, `SSL_DIAGNOSIS_TIMEOUT`) diagnostic attempt at the same host/port with the opposite of `connect_using_ssl`, purely to explain the failure - never to actually connect that way. If that opposite attempt gets a real `Hello` back, the original error is wrapped in a distinct `SslMismatchError` naming a specific reason (\"this server appears to require SSL\" / \"...appears to reject SSL\", naming `connect_using_ssl`) - the connect popup catches it by type and loops back into the form with the reason shown in red (the same way a wrong password already does), rather than exiting the client the way an unclassified connect failure still does; a daemon start just propagates it and fails with the same reason. If the opposite attempt also fails, the original error is returned unchanged. The real session that follows, if any, always uses exactly what `connect_using_ssl` said - never the probed alternative. A later automatic reconnect hitting the same kind of mismatch is AC-390's, not this one's."
 evidence = "src/client/connect.rs connect_with_reconnect, with_ssl_diagnosis, diagnose_ssl_mismatch, SslMismatchError, CONNECT_TIMEOUT, SSL_DIAGNOSIS_TIMEOUT; tests a_plain_attempt_against_an_ssl_only_server_is_diagnosed, an_ssl_attempt_against_a_plain_server_is_diagnosed, a_password_failure_is_never_probed_for_an_ssl_mismatch (reconnect_test.rs)"
+
+[[user_story.acceptance_criteria]]
+id = "AC-390"
+description = "An *automatic* reconnect (`reconnect::reconnect_loop`, after the first connection already succeeded) is bounded and diagnosed exactly like the first connect attempt (AC-365), not left to hang: `handshake_as_bounded_and_diagnosed` wraps `handshake_as` in the same `CONNECT_TIMEOUT` and runs it through the same `with_ssl_diagnosis`. Before this, a transport-mode mismatch discovered mid-session (the operator flips `server_ssl`, or a client's `connect_using_ssl` disagrees with a server it reconnects to) parked the supervisor task on that one `.await` forever - no `ServerEvent::Waiting`, no status notice, no further retries, nothing short of killing the process. Now the mismatch surfaces the same specific reason a first connect would, on the very next `ServerEvent::Waiting`, and retries continue on the ordinary backoff schedule afterward."
+evidence = "docs/PROTOCOL.md 1.4; src/client/connect.rs handshake_as_bounded_and_diagnosed; src/client/reconnect.rs reconnect_loop; tests a_reconnect_across_a_plain_to_ssl_only_flip_is_diagnosed_not_hung, a_reconnect_across_an_ssl_to_plain_flip_is_diagnosed_not_hung (reconnect_test.rs)"
 
 [[user_story.technical_behavior]]
 id = "TB-241"
@@ -2531,6 +2536,11 @@ description = "The /mail command opens a full-screen compose view - a command ra
 evidence = "docs/PROTOCOL.md 17.1; docs/SPEC.md Functionality; src/client/tui/otp_mail.rs UiState::open_otp_mail, handle_mail_compose_key; src/client/tui/ui.rs handle_key's otp_mail routing, submit_input's /mail branch; tests slash_mail_opens_the_full_screen_compose_view, esc_discards_the_compose_view, fields_are_entered_independently_in_any_order; scenarios features/messaging/otp_mail.feature 'The /mail command opens a full-screen mail compose view', 'Escape discards the compose view'"
 
 [[user_story.acceptance_criteria]]
+id = "AC-392"
+description = "The compose view's terminal cursor visibly blinks in whichever single-line field (To/Subtext) currently has focus, starting in To the instant the view opens (ComposeState::new's default focus) - not just accepting keystrokes with no visual sign of where they land. The cursor sits right after the field's own text and moves as more is typed, and jumps to the newly-focused field's own position on Tab."
+evidence = "src/client/tui/otp_mail.rs render_otp_mail_view, place_text_cursor; tests compose_opens_with_the_cursor_focused_in_the_to_field, the_cursor_tracks_typing_and_moves_with_focus (ui_otp_mail_test.rs)"
+
+[[user_story.acceptance_criteria]]
 id = "AC-155"
 description = "Recipient validation runs as the To field is filled, on every keystroke: valid for composing (a pinned user with that nickname, an otp keychain contact for the pair, and a key longer than the whole mail) renders the field green with a tick emoji; invalid renders it red with a cross emoji and the specific reason."
 evidence = "docs/PROTOCOL.md 17.1; src/client/otp_mail.rs check_recipient, RecipientCheck; src/client/tui/otp_mail.rs render_otp_mail_view's To field, check_failure_label; tests typing_in_to_emits_a_recipient_check_per_keystroke, a_failed_check_renders_the_to_field_red_with_a_cross, a_passing_check_renders_green_with_a_tick, a_stale_check_result_for_an_edited_nickname_is_ignored; scenarios features/messaging/otp_mail.feature 'An unpinned recipient renders invalid with a cross', 'A pinned recipient with enough key renders valid with a tick'"
@@ -3033,6 +3043,11 @@ id = "AC-291"
 description = "Control+S opens a \"Direct Punches\" popup listing every configured direct_punch_to target; 'a' opens a blank add form, Enter/'e' opens the selected row prefilled for editing, 'd' deletes it, Esc backs out one level at a time (form, then popup). The form's nickname/host/port fields are free text, its frequency is a bounded Left/Right selector over the same 13 values the settings file accepts, and an invalid entry (e.g. an empty nickname) is refused with an inline error rather than silently accepted or crashing. Saving (an add, an edit or a delete) persists the whole updated list to ~/.aloo/settings and immediately reconfigures the direct-punch scheduler with it, so the change is live the same tick rather than waiting for a restart."
 evidence = "docs/SPEC.md 'Connected UI'; src/client/tui/direct_punch_popup.rs (popup itself, fully tested below); src/client/session.rs handle_ui_action's OpenDirectPunches/SaveDirectPunchTargets arms (persist + reconfigure - see docs/TESTING.md 'Known coverage gaps' for why this half needs a live session and isn't directly tested, the same reason every other handle_ui_action arm there gives); tests (test/ui_direct_punch_popup_test.rs) ctrl_s_opens_the_modal_empty_and_requests_a_load, up_and_down_wrap_around_the_row_list, esc_on_the_list_closes_the_whole_modal, a_opens_a_blank_add_form, enter_on_a_row_opens_it_prefilled_for_editing, esc_on_the_edit_form_returns_to_the_list_without_losing_other_rows, tab_cycles_focus_through_every_field_and_wraps, typing_fills_the_focused_text_field, the_port_field_only_accepts_digits, left_right_cycle_the_frequency_selector_and_wrap, enter_on_a_non_save_field_does_nothing, saving_a_valid_new_target_appends_it_and_requests_a_save, saving_edits_an_existing_target_in_place_rather_than_appending, an_invalid_nickname_shows_an_inline_error_and_does_not_save, d_deletes_the_selected_row_and_requests_a_save, d_on_an_empty_list_does_nothing"
 
+[[user_story.acceptance_criteria]]
+id = "AC-393"
+description = "The add/edit form's fields render as titled, bordered boxes - the same style ui_connect_popup's own fields use, not a bare reversed-text line - with the terminal's own blinking cursor in whichever free-text field (nickname/host/port) has focus, starting in the nickname box the instant the form opens (its default focus). Frequency, a bounded selector rather than free text, gets the bordered-box styling but no cursor. Saving (from either the add/edit form's Save, or the list's 'd' delete) shows a confirmation status notice once the session actually persists it, rather than the popup just closing silently."
+evidence = "docs/SPEC.md 'Connected UI'; src/client/tui/direct_punch_popup.rs render_bordered_field, place_text_cursor, render_edit_form; src/client/session.rs handle_ui_action's SaveDirectPunchTargets arm; tests the_add_form_opens_with_the_cursor_in_the_nickname_box, every_field_renders_as_a_titled_bordered_box, saving_shows_a_confirmation_notice (ui_direct_punch_popup_test.rs)"
+
 
 [[user_story]]
 id = "US-046"
@@ -3060,6 +3075,37 @@ evidence = "src/client/ip_ban.rs IpBanList::load/save, default_path; tests a_ban
 id = "TB-248"
 description = "The file's entry lines are the one source of truth; the header count is a best-effort display value recomputed on every save and never trusted on load, so a hand-edited removal of a line takes effect immediately even though the header may briefly disagree until the next ban. A line that does not parse as date/ip/reason, or whose ip does not parse, is skipped rather than failing the whole load."
 evidence = "src/client/ip_ban.rs IpBanList::load, save; tests a_hand_edited_removal_of_an_entry_is_trusted_over_a_stale_header, an_unparseable_ban_line_is_skipped_rather_than_failing_the_whole_load; scenarios features/direct_punch/ip_banning.feature 'Removing a line by hand lifts that ban immediately', 'A corrupted line in the file is skipped, not fatal'"
+
+[[user_story.technical_behavior]]
+id = "TB-269"
+description = "IpBanList::record_strike/is_banned_at generalize record_failed_check/is_banned into a config-driven (StrikeConfig) rolling-window strike counter whose ban can expire (ban_duration) rather than only ever being permanent - reused as-is (not reimplemented) by server::mod's login-failure and registration-abuse gates, each with their own threshold/window/duration/reason. The on-disk format grows an optional fourth expires_at field; a line with none (every ban recorded before this existed, or hand-edited without it) reads back as permanent, so the direct-punch gate's own bans and its file format are unaffected."
+evidence = "src/client/ip_ban.rs StrikeConfig, record_strike, is_banned_at, LOGIN_FAILURE_STRIKES, REGISTRATION_ABUSE_STRIKES; tests a_time_limited_ban_lifts_once_its_duration_has_elapsed, a_permanent_ban_never_expires, an_already_banned_address_stays_banned_without_a_fresh_strike_or_a_later_expiry, a_time_limited_bans_expiry_survives_a_reload, a_pre_existing_three_field_ban_line_loads_as_permanent (ip_ban_test.rs)"
+
+
+[[user_story]]
+id = "US-058"
+title = "Stop repeated wrong passwords from turning into free guessing"
+as_a = "server operator"
+i_want = "an address that keeps sending the wrong password to be temporarily refused logins altogether"
+so_that = "a credential-stuffing script cannot keep trying passwords against my users forever"
+
+[[user_story.acceptance_criteria]]
+id = "AC-386"
+description = "7 wrong-password (or unknown-nickname - AuthCheck::Rejected covers both, deliberately indistinguishable per AC-013) attempts from one address ban that address's logins for the next 24h, checked before the slow credential derivation runs so a banned address cannot burn server CPU either; the refusal names the reason distinctly (\"too many failed login attempts...\") so it reads differently from an ordinary wrong password. Fewer than 7 leaves the address free to log in normally, including with the right password."
+evidence = "docs/PROTOCOL.md 5.1; src/server/mod.rs handle_connection (the login_bans check and AuthCheck::Rejected arm), ServerOptions::login_bans; src/client/ip_ban.rs LOGIN_FAILURE_STRIKES; tests seven_wrong_passwords_ban_the_address_for_logins, six_wrong_passwords_do_not_yet_ban_the_address (server_test.rs); scenario features/connecting/authentication.feature 'Seven wrong passwords in a row ban that address's logins'"
+
+
+[[user_story]]
+id = "US-059"
+title = "Stop registration spam from one address"
+as_a = "server operator who allows self-registration"
+i_want = "an address that registers too many accounts too quickly to be temporarily refused"
+so_that = "one source cannot flood my server (and my SMTP relay) with throwaway accounts"
+
+[[user_story.acceptance_criteria]]
+id = "AC-387"
+description = "More than 3 registration attempts from one address within 2 days - the 4th, counted whether or not each attempt itself would have succeeded - refuses that one and every further attempt from the same address for the next 7 days, naming the reason (\"too many registrations...\") distinctly from any other Register refusal."
+evidence = "docs/PROTOCOL.md 5.3; src/server/mod.rs register_account (the registration_bans gate), ServerOptions::registration_bans; src/client/ip_ban.rs REGISTRATION_ABUSE_STRIKES; tests more_than_three_registrations_ban_the_address (server_test.rs)"
 
 
 [[user_story]]
@@ -3261,6 +3307,11 @@ evidence = "docs/PROTOCOL.md 17.1; src/client/otp.rs handle_provisioning_command
 id = "AC-296"
 description = "A second provisioning handshake - of either purpose - with a peer who already has one in flight (a queued invite from them, or an in-flight incoming/outgoing pad transfer on this side) is refused outright with a plain notice naming the peer, rather than starting a second, colliding exchange. Two different peers may each provision independently at the same time; only the same peer twice is refused."
 evidence = "docs/PROTOCOL.md 17.1; src/client/otp.rs handle_provisioning_command's concurrency guard; src/client/tui/ui.rs UiState::has_otp_invite_from; tests a_second_handshake_with_a_peer_who_already_has_a_queued_invite_is_refused, a_handshake_with_a_peer_who_has_nothing_queued_is_not_refused_by_the_guard (otp_provisioning_concurrency_test.rs)"
+
+[[user_story.acceptance_criteria]]
+id = "AC-391"
+description = "A pad's arrival (`otp::on_pad_event`'s `Received` arm) asks the receiver's user only when nothing was already agreed to for that contact - a proposal accepted earlier (`accept_invite`'s \"agreeing to a fresh pad\" branch, `SessionState::otp_consented`) re-verifies silently on arrival, including a second (or later) arrival of the very same pad after the sender re-offers it whole following a reconnect that lost the receiver's `OtpPadVerify`/the sender's matching `OtpPadCommit` (docs/PROTOCOL.md 16.1's reconnect-resend note) - consent is checked by membership, not consumed on first use, so it survives exactly that. It is retired for real only once the exchange installs (`on_pad_commit`) or is cancelled (`on_pad_cancel`). A pad that arrives with no prior proposal accepted at all still shows exactly one decision popup - `on_pad_start` stages and streams unconditionally with no popup of its own, so this remains the only consent gate for that case."
+evidence = "docs/PROTOCOL.md 16.1; src/client/otp.rs on_pad_event, accept_invite, on_pad_commit, on_pad_cancel; src/client/session.rs SessionState::otp_consented; tests an_already_consented_pad_reverifies_silently_even_on_a_resend, a_pad_with_no_prior_consent_still_shows_one_popup, a_successful_install_clears_the_recorded_consent (otp_pad_reverify_test.rs)"
 
 [[user_story.acceptance_criteria]]
 id = "AC-297"
@@ -3621,3 +3672,21 @@ evidence = "src/client/tui/ui.rs handle_messages_key's Enter arm (the VoiceOnDis
 id = "AC-364"
 description = "When a surface's history reader first opens, it skips exactly `log.len()` of the file's newest records only if `autosave_messages` is on for this session - that many, and no more, are guaranteed to be this session's own live entries already mirrored to the file's tail (every append this session was hooked through `export::autosave_entry`). With `autosave_messages` off, nothing this session reached disk, so no records are skipped regardless of how many entries a surface's live log already holds when history-reading starts - skipping unconditionally would silently drop that many genuine, never-seen historical records instead."
 evidence = "src/client/tui/ui.rs UiState.load_history_chunk (the autosave_messages-gated already_loaded); tests resuming_history_does_not_skip_real_history_when_autosave_was_off (ui_channel_test.rs)"
+
+
+[[user_story]]
+id = "US-060"
+title = "Type and click anywhere in the TUI, not just in the plain compose bar"
+as_a = "user"
+i_want = "paste and mouse clicks to work throughout the app, not only in the chat compose bar"
+so_that = "I can paste a password or address into a popup field and click a channel member instead of being limited to the keyboard everywhere but ordinary chat"
+
+[[user_story.acceptance_criteria]]
+id = "AC-394"
+description = "A paste reaching any overlay (a popup, /mail, a non-Normal mode, or one of the decision queues handle_key absorbs everything for) is inserted into whichever field currently has focus, one character at a time through the exact same handle_key path a real keystroke takes - so a field's own validation (e.g. the direct-punch port field's digits-only filter) still applies, and a field that re-validates on every keystroke (e.g. the mail compose To field's recipient check) still does. Harmless for a decision overlay with no text field at all, since those match only specific non-Char KeyCodes. The two pre-session popups that run their own event loop before a session exists (the connect/register form, the activation-code popup) handle Event::Paste the same way, character by character through their own handle_key. Reaching the plain chat compose bar itself (Focus::Input, Mode::Normal, no overlay), paste keeps its existing specialized behavior unchanged: a short paste sends as one message, newlines included; a long one converts to a .txt file transfer instead."
+evidence = "docs/SPEC.md 'Connected UI'; src/client/tui/ui.rs UiState::handle_paste, overlay_absorbing_input; src/client/tui/ui_connect_popup.rs run, run_activation (their own Event::Paste arms); tests pasting_into_the_nickname_field_types_it, pasting_into_the_port_field_still_only_keeps_digits (ui_direct_punch_popup_test.rs), pasting_into_the_to_field_types_it_and_checks_the_recipient (ui_otp_mail_test.rs), a_pasted_multiline_block_sends_as_one_message_with_newlines_preserved, a_paste_with_cr_or_crlf_line_endings_is_normalized_to_lf, a_paste_over_the_file_threshold_becomes_a_txt_file_transfer_not_a_message (ui_channel_test.rs, unaffected by this change)"
+
+[[user_story.acceptance_criteria]]
+id = "AC-395"
+description = "Mouse capture is enabled for the whole connected-session terminal (tui::terminal::setup); a left click is hit-tested against wherever the input bar and (only while actually viewing a channel, never a DM) the member sidebar were last drawn, moving focus there - a sidebar click also selects whichever member row it landed on. A click is a no-op while any overlay is in front of the view (a popup, /mail, an open decision queue, any non-Normal mode) - clicking through it to whatever it covers would be indistinguishable from actually answering it - and while viewing a DM, the sidebar's last-recorded position (stale, left over from the channel view, since render_private_room draws no sidebar) is never honored. Only a left button press is handled; right clicks, releases, drags and scroll are not yet. Never reaches a daemon session over the attach IPC wire, which has no mouse variant (daemon_ipc::KeyWire)."
+evidence = "docs/SPEC.md 'Connected UI'; src/client/tui/terminal.rs setup, restore (EnableMouseCapture/DisableMouseCapture); src/client/tui/ui.rs UiState::handle_mouse, pack_rect, unpack_rect, last_input_bar_area, last_sidebar_area, render_input_bar; src/client/tui/channel.rs render_sidebar; src/client/session.rs run_connected_session's Event::Mouse arm; tests clicking_the_input_bar_focuses_it, clicking_a_sidebar_row_selects_that_member_and_focuses_the_sidebar, clicking_empty_space_does_nothing, a_click_is_ignored_while_an_overlay_is_open, only_a_left_button_press_is_handled, a_stale_sidebar_position_is_ignored_while_viewing_a_dm (ui_mouse_test.rs)"

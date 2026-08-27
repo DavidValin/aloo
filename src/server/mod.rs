@@ -18,10 +18,9 @@
 //! all, and it never sees anything from the punched links themselves.
 //!
 //! Who may log in is the `users_registry`'s business (accounts on disk,
-//! each with a nickname and a password); `activation` is the small web
-//! endpoint that turns an emailed code into an activated account.
+//! each with a nickname and a password); activation codes are emailed
+//! and typed back into the client's own activation popup.
 
-pub mod activation;
 pub mod channels_registry;
 pub mod mail;
 pub mod ssl;
@@ -38,6 +37,7 @@ use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::{Mutex, mpsc};
 use tokio_rustls::TlsAcceptor;
 
+use crate::client::ip_ban::{BanOutcome, IpBanList, LOGIN_FAILURE_STRIKES, REGISTRATION_ABUSE_STRIKES};
 use crate::p2p_proto::RendezvousMessage;
 use crate::proto::{self, ChannelKind, ClientMessage, KeyMode, ServerMessage, UserId, UserInfo};
 use users_registry::{AuthCheck, SmtpConfig, UsersRegistry};
@@ -60,8 +60,6 @@ pub struct ServerOptions {
     /// is refused with a reason rather than creating an account whose
     /// code nobody will ever receive.
     pub smtp: Option<SmtpConfig>,
-    /// `server_activation_url`, for the link in the activation email.
-    pub activation_url: Option<String>,
     /// The OTP mail store's directory (`mail::default_mail_dir` in
     /// production; a scratch dir in tests).
     pub mail_dir: PathBuf,
@@ -87,6 +85,17 @@ pub struct ServerOptions {
     /// remove any public channel. Checked fresh on every admin message;
     /// never trusted from anything the client asserts about itself.
     pub superadmins: BTreeSet<String>,
+    /// 7 wrong passwords for one address within 24h refuses that address's
+    /// logins for the next 24h (`client::ip_ban::LOGIN_FAILURE_STRIKES`).
+    /// Shared and mutable across every concurrently-handled connection,
+    /// unlike the rest of `ServerOptions` - a `tokio::sync::Mutex` around
+    /// the same `IpBanList` type `PeerLinkManager` uses for direct-punch
+    /// bans, persisted the same way.
+    pub login_bans: Arc<Mutex<IpBanList>>,
+    /// More than 3 registrations from one address within 2 days refuses
+    /// that address's registrations for the next 7 days
+    /// (`client::ip_ban::REGISTRATION_ABUSE_STRIKES`).
+    pub registration_bans: Arc<Mutex<IpBanList>>,
 }
 
 impl ServerOptions {
@@ -98,13 +107,18 @@ impl ServerOptions {
             users,
             allow_registration: false,
             smtp: None,
-            activation_url: None,
             mail_dir: mail::default_mail_dir(),
             heartbeat_timeout: proto::HEARTBEAT_TIMEOUT,
             tls: None,
             allow_create_public_channels: true,
             channel_deletion_unactivity_period: None,
             superadmins: BTreeSet::new(),
+            login_bans: Arc::new(Mutex::new(load_ip_bans(
+                crate::client::ip_ban::login_ban_default_path(),
+            ))),
+            registration_bans: Arc::new(Mutex::new(load_ip_bans(
+                crate::client::ip_ban::registration_ban_default_path(),
+            ))),
         }
     }
 
@@ -123,10 +137,9 @@ impl ServerOptions {
         self
     }
 
-    pub fn with_registration(mut self, smtp: Option<SmtpConfig>, url: Option<String>) -> Self {
+    pub fn with_registration(mut self, smtp: Option<SmtpConfig>) -> Self {
         self.allow_registration = true;
         self.smtp = smtp;
-        self.activation_url = url;
         self
     }
 
@@ -144,6 +157,36 @@ impl ServerOptions {
         self.superadmins = names;
         self
     }
+
+    /// Points the login-failure ban list at `path` instead of the
+    /// production default - what test scaffolding uses to keep scratch
+    /// runs out of the real `~/.aloo` (`load_ip_bans` still loads it, so a
+    /// test that pre-seeds the file, or reopens `ServerOptions` mid-test,
+    /// sees a consistent list).
+    pub fn with_login_bans_path(mut self, path: PathBuf) -> Self {
+        self.login_bans = Arc::new(Mutex::new(load_ip_bans(path)));
+        self
+    }
+
+    /// `with_login_bans_path`'s counterpart for the registration-abuse
+    /// list.
+    pub fn with_registration_bans_path(mut self, path: PathBuf) -> Self {
+        self.registration_bans = Arc::new(Mutex::new(load_ip_bans(path)));
+        self
+    }
+}
+
+/// Loads an `IpBanList` from `path`, falling back to an empty one bound to
+/// the same path on any error other than "not there yet" (already what
+/// `load` itself treats as empty) - a corrupt or unreadable ban file
+/// should never stop the server from starting. Mirrors
+/// `client::p2p::PeerLinkManager`'s own load-or-empty fallback for its
+/// direct-punch `IpBanList`.
+fn load_ip_bans(path: PathBuf) -> IpBanList {
+    IpBanList::load(&path).unwrap_or_else(|e| {
+        crate::log_warn!("could not load ban list at {}: {e}", path.display());
+        IpBanList::new_empty(path)
+    })
 }
 
 /// One outbound message produced by a `Registry` mutation, to be delivered
@@ -677,11 +720,11 @@ async fn handle_connection(
             password,
             email,
         }) => {
-            let (ok, reason) = match register_account(&options, &nickname, &password, &email).await
-            {
-                Ok(()) => (true, None),
-                Err(reason) => (false, Some(reason)),
-            };
+            let (ok, reason) =
+                match register_account(&options, &nickname, &password, &email, peer_ip).await {
+                    Ok(()) => (true, None),
+                    Err(reason) => (false, Some(reason)),
+                };
             let _ = wr.send(&ServerMessage::RegisterResult { ok, reason }).await;
             return Ok(());
         }
@@ -697,6 +740,26 @@ async fn handle_connection(
             return Ok(());
         }
     };
+    // 7 wrong passwords from one address within 24h refuse that address's
+    // logins outright for the next 24h - checked before the slow
+    // credential derivation below, not just before answering, so a banned
+    // address can't use login attempts to burn server CPU either.
+    if options
+        .login_bans
+        .lock()
+        .await
+        .is_banned_at(peer_ip, users_registry::now_utc())
+    {
+        let _ = wr
+            .send(&ServerMessage::AuthResult {
+                ok: false,
+                activation_pending: false,
+                deactivated: None,
+                reason: Some("too many failed login attempts from this address - try again later".into()),
+            })
+            .await;
+        return Ok(());
+    }
     // The derivation is deliberately slow (§5.1) and the check reads the
     // registry's files - neither belongs on the async executor.
     let check = {
@@ -711,6 +774,11 @@ async fn handle_connection(
     match check {
         AuthCheck::Ok => {}
         AuthCheck::Rejected => {
+            options
+                .login_bans
+                .lock()
+                .await
+                .record_strike(peer_ip, users_registry::now_utc(), &LOGIN_FAILURE_STRIKES);
             let _ = wr
                 .send(&ServerMessage::AuthResult {
                     ok: false,
@@ -785,6 +853,9 @@ async fn handle_connection(
                 }
                 users_registry::ActivationOutcome::Expired => {
                     Some("this account's activation code has expired - register again".to_string())
+                }
+                users_registry::ActivationOutcome::TooManyWrongCodesAccountRemoved => {
+                    Some(users_registry::ACCOUNT_REMOVED_ACTIVATION_REASON.to_string())
                 }
             };
             if let Some(reason) = reason {
@@ -1167,19 +1238,41 @@ async fn client_loop<R: AsyncRead + Unpin>(
     }
 }
 
-/// `Register` (§5.3) end to end: the policy checks, the registry write,
-/// and the activation email - with the registration rolled back if the
-/// email cannot be handed to the relay, so a name is never left taken by
-/// an account whose code nobody received. `Err` carries the reason the
-/// client is shown.
+/// `Register` (§5.3) end to end: the abuse gate, the policy checks, the
+/// registry write, and the activation email - with the registration
+/// rolled back if the email cannot be handed to the relay, so a name is
+/// never left taken by an account whose code nobody received. `Err`
+/// carries the reason the client is shown.
 async fn register_account(
     options: &ServerOptions,
     nickname: &str,
     password: &str,
     email: &str,
+    peer_ip: IpAddr,
 ) -> Result<(), String> {
     if !options.allow_registration {
         return Err("this server does not take registrations".into());
+    }
+    // More than 3 registration attempts from one address within 2 days -
+    // i.e. this, the 4th - refuses this one and every other for the next
+    // 7 days. Counted on every attempt (not just ones that go on to
+    // succeed), same as `login_bans` counts every wrong password: the
+    // thing being rate-limited is load on this endpoint, not successful
+    // account creation specifically.
+    if options
+        .registration_bans
+        .lock()
+        .await
+        .record_strike(
+            peer_ip,
+            users_registry::now_utc(),
+            &REGISTRATION_ABUSE_STRIKES,
+        )
+        == BanOutcome::Banned
+    {
+        return Err(
+            "too many registrations from this address recently - try again later".into(),
+        );
     }
     let Some(smtp) = &options.smtp else {
         return Err("this server has no email delivery configured for registrations".into());
@@ -1198,14 +1291,8 @@ async fn register_account(
         .map_err(|e| e.to_string())?
         .map_err(|e| e.to_string())?
     };
-    if let Err(e) = users_registry::send_activation_email(
-        smtp,
-        email,
-        nickname,
-        &registration.code,
-        options.activation_url.as_deref(),
-    )
-    .await
+    if let Err(e) =
+        users_registry::send_activation_email(smtp, email, nickname, &registration.code).await
     {
         crate::log_warn!("activation email for {nickname} could not be sent: {e}");
         let _ = options.users.remove(nickname);
@@ -1252,14 +1339,8 @@ async fn reissue_and_resend_activation(options: &ServerOptions, nickname: &str) 
             }
         }
     };
-    if let Err(e) = users_registry::send_activation_email(
-        smtp,
-        &email,
-        nickname,
-        &registration.code,
-        options.activation_url.as_deref(),
-    )
-    .await
+    if let Err(e) =
+        users_registry::send_activation_email(smtp, &email, nickname, &registration.code).await
     {
         crate::log_warn!("resent activation email for {nickname} could not be sent: {e}");
         return false;

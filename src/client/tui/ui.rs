@@ -21,10 +21,10 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -2378,6 +2378,26 @@ pub struct UiState {
     /// Starts at `DEFAULT_HISTORY_CHUNK_LINES` before the first frame has
     /// ever rendered.
     pub last_messages_area_height: AtomicU16,
+    /// Where the input bar was last drawn, packed as a `Rect` (see
+    /// `pack_rect`) - `AtomicU64` for the same `Sync`-without-`Cell`
+    /// reason `last_messages_area_height` is an atomic, not a plain
+    /// field. `UiState::handle_mouse` hit-tests a click against this
+    /// instead of every popup's rendering code separately recording
+    /// where it drew each clickable thing - recomputing from the actual
+    /// last-drawn position rather than re-deriving the layout math by
+    /// hand a second time, which would drift the moment one changed
+    /// without the other. `u64::MAX` (never a real `Rect`, `height`
+    /// alone already exceeds any real terminal) before the first frame.
+    pub last_input_bar_area: AtomicU64,
+    /// Where the channel view's member sidebar's *inner* area (inside its
+    /// border) was last drawn - `handle_mouse` derives which row a click
+    /// landed on from this alone, since every row is exactly one line
+    /// tall in top-to-bottom order. Stale (the channel view's last
+    /// position) while a DM or the mail view is showing instead, which
+    /// render nothing here - `handle_mouse` only ever consults this while
+    /// actually viewing a channel, the same guard that keeps it from
+    /// honoring a click that landed on a popup drawn on top of it.
+    pub last_sidebar_area: AtomicU64,
     /// Selected row of the `/channels` modal, into `known_channels`.
     pub channels_popup_selected: usize,
     pub known_users: HashMap<UserId, UserInfo>,
@@ -2825,6 +2845,8 @@ impl UiState {
             autosave_messages: false,
             resume_from_log: false,
             last_messages_area_height: AtomicU16::new(DEFAULT_HISTORY_CHUNK_LINES),
+            last_input_bar_area: AtomicU64::new(u64::MAX),
+            last_sidebar_area: AtomicU64::new(u64::MAX),
             channels_popup_selected: 0,
             known_users: HashMap::new(),
             offline: HashSet::new(),
@@ -6362,9 +6384,11 @@ impl UiState {
 
     /// The set of states `handle_key` checks, in priority order, before it
     /// ever reaches the ordinary compose bar (`handle_input_key`) - reused
-    /// here so a paste event can't be misread as a message send while one
-    /// of these is absorbing every key instead (an open identity review,
-    /// an invite, a popup, the help screen, ...).
+    /// by `handle_paste` to route a paste through `handle_key` itself
+    /// (into whichever field one of these is actually offering, if any)
+    /// rather than misreading it as a message send while one of these is
+    /// absorbing every key instead (an open identity review, an invite, a
+    /// popup, the help screen, ...).
     fn overlay_absorbing_input(&self) -> bool {
         self.identity_review_queue.front().is_some()
             || self.unknown_peer_review_queue.front().is_some()
@@ -6388,8 +6412,11 @@ impl UiState {
 
     /// A whole paste (`Event::Paste`, delivered atomically by a
     /// bracketed-paste-enabled terminal - `tui::terminal::setup` - with any
-    /// embedded newlines intact) reaching the ordinary compose bar. Two
-    /// thresholds, in order:
+    /// embedded newlines intact). While some overlay (a popup, `/mail`, a
+    /// decision queue, any non-`Normal` mode) is in front of the compose
+    /// bar, it is instead forwarded character-by-character through
+    /// `handle_key` - see `overlay_absorbing_input`'s doc. Reaching the
+    /// ordinary compose bar itself, two thresholds apply, in order:
     ///
     /// - Longer than `client::file_transfer::PASTE_TO_FILE_CHAR_THRESHOLD`:
     ///   converted to a `.txt` file and sent as a file transfer instead of
@@ -6399,14 +6426,39 @@ impl UiState {
     ///   all, rather than staged in the single-line `input` buffer (which
     ///   has no way to hold or display one) for a manual Enter.
     ///
-    /// A no-op while some other overlay is in front of the compose bar, or
-    /// for a peer this side currently can't send to, same as an ordinary
-    /// keystroke would be.
+    /// Reaching the compose bar, a no-op for a peer this side currently
+    /// can't send to, same as an ordinary keystroke would be.
     pub fn handle_paste(&mut self, text: String) -> Option<UiAction> {
         if text.is_empty() {
             return None;
         }
-        if self.focus != Focus::Input || self.overlay_absorbing_input() {
+        // Something other than the plain compose bar owns every keystroke
+        // right now - a popup, `/mail`, any non-`Normal` mode, or one of
+        // the decision overlays `handle_key` absorbs everything for. Fed
+        // through the very same per-character path a real keystroke takes
+        // (`handle_key`, one `KeyCode::Char` per pasted character), so it
+        // lands in whichever field currently has focus with that field's
+        // own validation applied - a digits-only port field still refuses
+        // non-digits, for instance - exactly as if it had been typed one
+        // key at a time. Harmless for a decision overlay with no text
+        // field at all (an identity review, an invite, ...): those match
+        // only specific non-`Char` `KeyCode`s (`Left`/`Enter`/...), so an
+        // arbitrary pasted character never has anything to accidentally
+        // trigger there. Only the last of possibly several actions
+        // produced along the way is returned, matching `handle_key`'s own
+        // one-event-one-action shape and the "final state wins" semantics
+        // already correct for a field that re-validates on every
+        // keystroke (e.g. the mail compose `To` field's recipient check).
+        if self.overlay_absorbing_input() {
+            let mut action = None;
+            for c in text.chars().filter(|c| *c != '\r') {
+                if let Some(a) = self.handle_key(KeyCode::Char(c), KeyModifiers::NONE, KeyEventKind::Press) {
+                    action = Some(a);
+                }
+            }
+            return action;
+        }
+        if self.focus != Focus::Input {
             return None;
         }
         if self.active_dm_peer_offline() || self.active_dm_peer_trust_gated() {
@@ -6437,6 +6489,52 @@ impl UiState {
             .take(crate::proto::TEXT_MESSAGE_MAX_LEN)
             .collect();
         self.submit_text(capped)
+    }
+
+    /// A left click, hit-tested against wherever the input bar and (while
+    /// actually viewing a channel) the member sidebar were last drawn
+    /// (`render_input_bar`/`render_sidebar`, via `last_input_bar_area`/
+    /// `last_sidebar_area`) - clicking either moves focus there, and a
+    /// sidebar click also selects whichever member row it landed on, the
+    /// same one line per member every row already is. A no-op while some
+    /// overlay is in front of the view (a popup, `/mail`, an open decision
+    /// queue, ...) - clicking through it to whatever it's covering would
+    /// be indistinguishable from actually answering it - or while viewing
+    /// a DM (`render_private_room` draws no sidebar, so the stored area is
+    /// stale, left over from the channel view).
+    ///
+    /// Right clicks, scrolling, and drags do nothing yet - this covers the
+    /// two targets a click most obviously means "go here", not every
+    /// clickable thing in the app.
+    pub fn handle_mouse(&mut self, event: MouseEvent) -> Option<UiAction> {
+        if !matches!(event.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return None;
+        }
+        if self.overlay_absorbing_input() {
+            return None;
+        }
+        let (x, y) = (event.column, event.row);
+        let input_area = unpack_rect(self.last_input_bar_area.load(Ordering::Relaxed));
+        if rect_contains(input_area, x, y) {
+            self.focus = Focus::Input;
+            return None;
+        }
+        if self.active_private_room.is_none() {
+            let sidebar_area = unpack_rect(self.last_sidebar_area.load(Ordering::Relaxed));
+            if rect_contains(sidebar_area, x, y) {
+                let member_count = self
+                    .channels
+                    .get(self.selected_channel)
+                    .map(|c| c.members.len())
+                    .unwrap_or(0);
+                let clicked_row = y.saturating_sub(sidebar_area.y) as usize;
+                if clicked_row < member_count {
+                    self.focus = Focus::Sidebar;
+                    self.sidebar_selected = clicked_row;
+                }
+            }
+        }
+        None
     }
 
     /// Handles `/mute-voice [nickname]` and `/unmute-voice [nickname]`
@@ -9124,7 +9222,36 @@ pub(crate) fn render_messages(
     }
 }
 
+/// Packs a `Rect` into one `u64` (16 bits per field, `x`/`y`/`width`/
+/// `height` from the high end down) - what lets a rendered position be
+/// recorded in a plain `AtomicU64` field (`Sync`-friendly, unlike `Cell`;
+/// see `UiState::last_input_bar_area`'s doc) rather than four separate
+/// `AtomicU16`s.
+pub(crate) fn pack_rect(r: Rect) -> u64 {
+    ((r.x as u64) << 48) | ((r.y as u64) << 32) | ((r.width as u64) << 16) | (r.height as u64)
+}
+
+/// `pack_rect`'s inverse.
+pub(crate) fn unpack_rect(v: u64) -> Rect {
+    Rect {
+        x: (v >> 48) as u16,
+        y: (v >> 32) as u16,
+        width: (v >> 16) as u16,
+        height: v as u16,
+    }
+}
+
+/// Whether `(x, y)` falls inside `r` - `u64::MAX`'s unpacked sentinel
+/// (`{65535, 65535, 65535, 65535}`, before any frame has stored a real
+/// area, or one this session's terminal will never actually be) contains
+/// nothing a real click can ever land on, so callers need no separate
+/// "not drawn yet" check.
+fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
+    x >= r.x && x < r.x.saturating_add(r.width) && y >= r.y && y < r.y.saturating_add(r.height)
+}
+
 pub(crate) fn render_input_bar(frame: &mut Frame, area: Rect, state: &UiState) {
+    state.last_input_bar_area.store(pack_rect(area), Ordering::Relaxed);
     let dm_peer_offline = state.active_dm_peer_offline();
     let dm_peer_trust_gated = state.active_dm_peer_trust_gated();
     let title = if state.recording {

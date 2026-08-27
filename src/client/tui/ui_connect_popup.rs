@@ -422,6 +422,20 @@ pub fn run_activation(
         surface.draw(|f| render_activation(f, popup))?;
         let key = match crossterm::event::read()? {
             Event::Key(key) => key,
+            // A pasted code, fed through the same per-character path a
+            // typed one takes - `handle_key` already only keeps digits up
+            // to `ACTIVATION_CODE_LEN`, so anything else pasted alongside
+            // it (whitespace, a trailing newline) is simply ignored.
+            Event::Paste(text) => {
+                for c in text.chars() {
+                    match popup.handle_key(KeyCode::Char(c)) {
+                        ActivationAction::Submit(code) => return Ok(Some(code)),
+                        ActivationAction::Cancel => return Ok(None),
+                        ActivationAction::None => {}
+                    }
+                }
+                continue;
+            }
             Event::Resize(cols, rows) => {
                 surface.resize(super::surface::TerminalSize::new(cols, rows))?;
                 continue;
@@ -532,6 +546,23 @@ pub fn run(
         }
         let key = match crossterm::event::read()? {
             Event::Key(key) => key,
+            // A whole paste, delivered atomically by the bracketed-paste-
+            // enabled terminal (`tui::terminal::setup`) - fed through the
+            // same per-character path a real keystroke takes, into
+            // whichever field currently has focus, so a pasted password
+            // or hostname lands exactly like typing it would. Embedded
+            // line breaks are dropped: every field here is single-line.
+            Event::Paste(text) => {
+                for c in text.chars().filter(|c| *c != '\n' && *c != '\r') {
+                    match popup.handle_key(KeyCode::Char(c))? {
+                        Action::Connect(req) => return Ok(Submission::Connect(req)),
+                        Action::Register(req) => return Ok(Submission::Register(req)),
+                        Action::Cancel => return Ok(Submission::Cancel),
+                        Action::None => {}
+                    }
+                }
+                continue;
+            }
             // Same handling the connected session gives its own resize
             // (`session::run_connected_session`): discard the buffer laid
             // out for the old size, so the redraw at the top of the next

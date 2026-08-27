@@ -1097,6 +1097,7 @@ pub(crate) fn render_otp_mail_view(frame: &mut Frame, area: Rect, state: &UiStat
             focus_border_style(compose.focus == MailFocus::To)
                 .patch(Style::default().fg(to_color)),
         );
+    let to_inner = to_block.inner(rows[1]);
     let mut to_line = vec![Span::styled(
         compose.to.clone(),
         Style::default().fg(to_color),
@@ -1111,6 +1112,9 @@ pub(crate) fn render_otp_mail_view(frame: &mut Frame, area: Rect, state: &UiStat
         ));
     }
     frame.render_widget(Paragraph::new(Line::from(to_line)).block(to_block), rows[1]);
+    if compose.focus == MailFocus::To {
+        place_text_cursor(frame, to_inner, &compose.to);
+    }
 
     // Device selector: which of the resolved nickname's pinned devices
     // the mail is sealed for. Height is always reserved (never collapses
@@ -1163,10 +1167,14 @@ pub(crate) fn render_otp_mail_view(frame: &mut Frame, area: Rect, state: &UiStat
         .title("Subtext")
         .borders(Borders::ALL)
         .border_style(focus_border_style(compose.focus == MailFocus::Subtext));
+    let subtext_inner = subtext_block.inner(rows[3]);
     frame.render_widget(
         Paragraph::new(compose.subtext.clone()).block(subtext_block),
         rows[3],
     );
+    if compose.focus == MailFocus::Subtext {
+        place_text_cursor(frame, subtext_inner, &compose.subtext);
+    }
 
     let content_block = Block::default()
         .title("Content")
@@ -1281,6 +1289,18 @@ pub(crate) fn render_otp_mail_view(frame: &mut Frame, area: Rect, state: &UiStat
     {
         render_mail_key_blocked_modal(frame, area, &compose.to);
     }
+}
+
+/// Places the terminal's own blinking cursor right after `value`'s text
+/// inside `inner`, the same convention `ui_connect_popup`'s own
+/// `place_text_cursor` uses - what makes it obvious which single-line
+/// field (`To`/`Subtext`) is about to receive typed characters, the same
+/// way the connect popup's fields already do. `Content` wraps across
+/// multiple lines and is not covered by this simple offset-from-start
+/// placement.
+fn place_text_cursor(frame: &mut Frame, inner: Rect, value: &str) {
+    let cursor_x = inner.x + (value.chars().count() as u16).min(inner.width.saturating_sub(1));
+    frame.set_cursor_position((cursor_x, inner.y));
 }
 
 /// The hard stop for composing to a recipient with no OTP mail key -

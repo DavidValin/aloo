@@ -45,8 +45,6 @@ if [ -n "${ALOO_ALLOW_REGISTRATION:-}" ]; then
     [ -n "${ALOO_SMTP_PORT:-}" ] && set_setting server_smtp_port "$ALOO_SMTP_PORT"
     [ -n "${ALOO_SMTP_USERNAME:-}" ] && set_setting server_smtp_username "$ALOO_SMTP_USERNAME"
     [ -n "${ALOO_SMTP_PASSWORD:-}" ] && set_setting server_smtp_password "$ALOO_SMTP_PASSWORD"
-    [ -n "${ALOO_ACTIVATION_PORT:-}" ] && set_setting server_activation_port "$ALOO_ACTIVATION_PORT"
-    [ -n "${ALOO_ACTIVATION_URL:-}" ] && set_setting server_activation_url "$ALOO_ACTIVATION_URL"
 fi
 
 # One-off accounts, active immediately with no email: "alice:s3cret,bob:hunter2".

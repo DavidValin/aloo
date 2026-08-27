@@ -59,6 +59,8 @@ pub fn test_options(tag: &str) -> ServerOptions {
     let root = scratch_dir(tag);
     ServerOptions::new(test_users_registry(root.join("users")))
         .with_mail_dir(root.join("server_otp_mail"))
+        .with_login_bans_path(root.join("login_banned_ips.log"))
+        .with_registration_bans_path(root.join("registration_banned_ips.log"))
 }
 
 /// Registers `nickname` with `password_for(nickname)` if it is not there

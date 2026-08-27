@@ -63,7 +63,22 @@ pub(crate) async fn spawn_server_with_options(
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let udp = tokio::net::UdpSocket::bind(addr).await.unwrap();
-    let options = configure(ServerOptions::new(users));
+    // Scratch-pathed like `scratch_users()` - a scenario that drives enough
+    // failed logins/registrations to actually ban 127.0.0.1 must never
+    // touch the real `~/.aloo/login_banned_ips.log`/
+    // `registration_banned_ips.log` on whatever machine runs `cargo bdd`.
+    let scratch = std::env::temp_dir().join(format!(
+        "aloo-cucumber-server-bans-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let options = ServerOptions::new(users)
+        .with_login_bans_path(scratch.join("login_banned_ips.log"))
+        .with_registration_bans_path(scratch.join("registration_banned_ips.log"));
+    let options = configure(options);
     tokio::spawn(async move {
         let _ = serve_with_rendezvous(listener, udp, options).await;
     });
@@ -536,6 +551,30 @@ async fn logs_in_with_password(w: &mut AlooWorld, nickname: String, password: St
     );
 }
 
+/// `count` throwaway wrong-password attempts, each its own connection (the
+/// server hangs up after every refusal) - what feeds a strike-threshold
+/// scenario without a Gherkin loop construct.
+#[when(expr = "{word} fails {int} login attempts in a row")]
+async fn fails_n_login_attempts(w: &mut AlooWorld, nickname: String, count: u32) {
+    let addr = w.addr.expect("no server running");
+    for _ in 0..count {
+        let mut stream = ControlEndpoint::new(TcpStream::connect(addr).await.unwrap());
+        stream
+            .client_handshake()
+            .await
+            .unwrap()
+            .expect("server closed during handshake");
+        stream
+            .send(&ClientMessage::Auth {
+                nickname: nickname.clone(),
+                password: "definitely-the-wrong-password".into(),
+            })
+            .await
+            .unwrap();
+        let _: ServerMessage = stream.recv().await.unwrap().unwrap();
+    }
+}
+
 #[when(expr = "{word} leaves {string}")]
 async fn registry_leave(w: &mut AlooWorld, who: String, channel: String) {
     let id = w.id_of(&who);
@@ -702,6 +741,24 @@ async fn connection_refused(w: &mut AlooWorld) {
     match client.received.first().expect("no auth result") {
         ServerMessage::AuthResult { ok: false, .. } => {}
         other => panic!("expected the connection to be refused, got {other:?}"),
+    }
+}
+
+#[then(expr = "the connection is refused, naming {string}")]
+async fn connection_refused_naming(w: &mut AlooWorld, needle: String) {
+    let client = w.clients.get("candidate").expect("nobody tried to connect");
+    match client.received.first().expect("no auth result") {
+        ServerMessage::AuthResult {
+            ok: false,
+            reason: Some(reason),
+            ..
+        } => {
+            assert!(
+                reason.contains(&needle),
+                "reason {reason:?} does not mention {needle:?}"
+            );
+        }
+        other => panic!("expected a refusal naming {needle:?}, got {other:?}"),
     }
 }
 

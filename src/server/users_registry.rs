@@ -17,9 +17,8 @@
 //! `<timestamp_utc>_activate.txt` file - the timestamp in its name is the
 //! registration time in Unix seconds (UTC), and the code inside it stops
 //! being accepted `ACTIVATION_VALIDITY_SECS` after that. Activating an
-//! account is simply removing that file, whichever of the two paths does
-//! it: the client's activation popup (`ClientMessage::Activate`) or the web
-//! endpoint the activation email links to (`crate::server::activation`).
+//! account is simply removing that file, via the client's activation
+//! popup (`ClientMessage::Activate`) after the code arrives by email.
 //!
 //! Everything here is plain synchronous file I/O on a handful of small
 //! files. The one async thing is `send_activation_email`, a deliberately
@@ -73,6 +72,26 @@ const ACTIVATE_SUFFIX: &str = "_activate.txt";
 /// file blocks it for a different reason. No timestamp in the name: a
 /// deactivation has no expiry, unlike a pending activation code.
 const DEACTIVATE_FILE: &str = "deactivated.txt";
+/// Counts consecutive wrong activation codes against one still-pending
+/// account - cleared the moment the right one arrives, never carried
+/// across into a different account (removing the account removes this
+/// file with everything else).
+const ACTIVATE_FAILS_FILE: &str = "activate_fails.txt";
+/// The wrong-code count (`ACTIVATE_FAILS_FILE`) that removes an inactive
+/// account outright, closing off indefinite guessing against one
+/// twelve-digit code (§5.2's client popup retries with no limit of its
+/// own - this is what actually bounds it).
+pub const ACTIVATION_FAIL_LIMIT: u32 = 5;
+
+/// The exact `AuthResult.reason` text `handle_connection` sends for
+/// `ActivationOutcome::TooManyWrongCodesAccountRemoved` - a shared
+/// constant rather than a new wire field (unlike `deactivated`, nothing
+/// else about handling this outcome differs from an ordinary refusal), so
+/// `connect::handshake_as` can tell "keep retrying" apart from "nothing
+/// left to retry against" by matching this exact string rather than
+/// guessing at arbitrary prose.
+pub const ACCOUNT_REMOVED_ACTIVATION_REASON: &str =
+    "too many wrong activation codes - this account has been removed";
 
 /// `~/.aloo/users` - same home resolution as every other store
 /// (`crate::platform::aloo_dir`), and the directory the `--register-user`
@@ -141,6 +160,9 @@ pub enum RegisterError {
     InvalidEmail,
     /// An account of that name exists and is active.
     AlreadyRegistered,
+    /// `email` already names a different, still-registered nickname - one
+    /// address may back only one account.
+    EmailAlreadyRegistered,
     /// An account of that name exists with an activation code that is
     /// still valid - it can be activated, not replaced, until the code
     /// expires.
@@ -162,6 +184,9 @@ impl std::fmt::Display for RegisterError {
             ),
             RegisterError::InvalidEmail => write!(f, "that does not look like an email address"),
             RegisterError::AlreadyRegistered => write!(f, "that nickname is already registered"),
+            RegisterError::EmailAlreadyRegistered => {
+                write!(f, "that email address is already registered under another nickname")
+            }
             RegisterError::ActivationPending => write!(
                 f,
                 "that nickname is registered and waiting for its activation code"
@@ -231,6 +256,13 @@ pub enum ActivationOutcome {
     /// No such account, or nothing pending on it. One answer for both, for
     /// the same reason `AuthCheck::Rejected` is one answer.
     NothingPending,
+    /// This was the `ACTIVATION_FAIL_LIMIT`th wrong code in a row against
+    /// this still-inactive account - it has just been removed outright
+    /// (`remove`), the same as a failed activation-email delivery already
+    /// does to a registration nobody can ever finish. There is nothing
+    /// left to retry against; a further `Register` starts over from
+    /// scratch.
+    TooManyWrongCodesAccountRemoved,
 }
 
 /// The registry itself: a directory, and the rules for what is in it.
@@ -303,6 +335,23 @@ impl UsersRegistry {
         names
     }
 
+    /// Whether `email` is already on file for some *other* registered
+    /// nickname - active or still pending activation, either way an
+    /// account that exists - so one address cannot back two separate
+    /// accounts. Case-insensitive, matching how mail addressing itself
+    /// treats the domain (and, in practice, most mailbox-local parts).
+    /// Re-registering the same nickname under the same email it already
+    /// has is unaffected, since that nickname is excluded from its own
+    /// check.
+    fn email_taken_by_another_nickname(&self, nickname: &str, email: &str) -> bool {
+        self.nicknames().iter().any(|other| {
+            other != nickname
+                && self
+                    .email_of(other)
+                    .is_some_and(|on_file| on_file.eq_ignore_ascii_case(email))
+        })
+    }
+
     /// Creates an account awaiting activation (docs/PROTOCOL.md §5.3):
     /// writes the derived key, the email, and a fresh code in
     /// `<now_utc>_activate.txt`. A name whose previous registration was
@@ -324,6 +373,9 @@ impl UsersRegistry {
         }
         if password.is_empty() {
             return Err(RegisterError::EmptyPassword);
+        }
+        if self.email_taken_by_another_nickname(nickname, email) {
+            return Err(RegisterError::EmailAlreadyRegistered);
         }
         if dir.join(KEY_FILE).is_file() {
             match self.pending_activation(nickname) {
@@ -485,17 +537,50 @@ impl UsersRegistry {
         if !activation_code_is_well_formed(code)
             || !crypto::constant_time_eq(pending.code.as_bytes(), code.as_bytes())
         {
-            return ActivationOutcome::WrongCode;
+            return self.record_wrong_activation_code(nickname);
         }
         if pending.is_expired(now_utc) {
             return ActivationOutcome::Expired;
         }
         match fs::remove_file(&pending.path) {
-            Ok(()) => ActivationOutcome::Activated,
+            Ok(()) => {
+                self.clear_activation_fails(nickname);
+                ActivationOutcome::Activated
+            }
             // Already gone: someone activated it between our read and
             // our remove. That is the outcome asked for.
-            Err(e) if e.kind() == io::ErrorKind::NotFound => ActivationOutcome::Activated,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                self.clear_activation_fails(nickname);
+                ActivationOutcome::Activated
+            }
             Err(_) => ActivationOutcome::WrongCode,
+        }
+    }
+
+    /// One more wrong code against `nickname`'s pending activation -
+    /// `ACTIVATION_FAIL_LIMIT` of them in a row removes the account
+    /// outright rather than leaving it open to indefinite guessing.
+    fn record_wrong_activation_code(&self, nickname: &str) -> ActivationOutcome {
+        let Some(dir) = self.user_dir(nickname) else {
+            return ActivationOutcome::WrongCode;
+        };
+        let path = dir.join(ACTIVATE_FAILS_FILE);
+        let count = fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .unwrap_or(0)
+            + 1;
+        if count >= ACTIVATION_FAIL_LIMIT {
+            let _ = self.remove(nickname);
+            return ActivationOutcome::TooManyWrongCodesAccountRemoved;
+        }
+        let _ = fs::write(&path, count.to_string());
+        ActivationOutcome::WrongCode
+    }
+
+    fn clear_activation_fails(&self, nickname: &str) {
+        if let Some(dir) = self.user_dir(nickname) {
+            let _ = fs::remove_file(dir.join(ACTIVATE_FAILS_FILE));
         }
     }
 
@@ -597,26 +682,11 @@ impl SmtpConfig {
     }
 }
 
-/// The URL an activation email links to, for a server that has a public
-/// `server_activation_url`: `<base>/activate?nickname=<n>&code=<c>`.
-pub fn activation_link(base_url: &str, nickname: &str, code: &str) -> String {
-    format!(
-        "{}/activate?nickname={nickname}&code={code}",
-        base_url.trim_end_matches('/')
-    )
-}
-
 /// The full RFC 5322 message for one activation, ready for `DATA`.
 /// `nickname` and `code` are registry-validated (letters/digits/`-`/`_`
 /// and digits respectively) and `to` passed `validation::email_is_plausible`,
 /// so none of them can break out of a header line.
-pub fn activation_email(
-    from: &str,
-    to: &str,
-    nickname: &str,
-    code: &str,
-    activation_url: Option<&str>,
-) -> String {
+pub fn activation_email(from: &str, to: &str, nickname: &str, code: &str) -> String {
     let date = time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc2822)
         .unwrap_or_default();
@@ -627,13 +697,7 @@ pub fn activation_email(
          It is valid for {hours} hour(s) from now. The first time you connect as \
          {nickname}, aloo will ask for it.\r\n"
     );
-    if let Some(base) = activation_url {
-        body.push_str(&format!(
-            "\r\nOr activate your account in a browser:\r\n{}\r\n",
-            activation_link(base, nickname, code)
-        ));
-    }
-    body.push_str("\r\nIf you did not register, ignore this message.\r\n");
+    body.push_str("\r\nIf you haven't registered you can ignore this message.\r\n");
     format!(
         "From: aloo <{from}>\r\nTo: <{to}>\r\nSubject: aloo: activate your account \"{nickname}\"\r\n\
          Date: {date}\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\
@@ -651,10 +715,9 @@ pub async fn send_activation_email(
     to: &str,
     nickname: &str,
     code: &str,
-    activation_url: Option<&str>,
 ) -> Result<(), String> {
     let from = smtp.from_address();
-    let message = activation_email(&from, to, nickname, code, activation_url);
+    let message = activation_email(&from, to, nickname, code);
     tokio::time::timeout(SMTP_TIMEOUT, smtp_submit(smtp, &from, to, &message))
         .await
         .map_err(|_| format!("timed out talking to {}:{}", smtp.host, smtp.port))?

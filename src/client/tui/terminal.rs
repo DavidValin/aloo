@@ -6,8 +6,8 @@
 use std::io::Stdout;
 
 use crossterm::event::{
-    DisableBracketedPaste, EnableBracketedPaste, Event, KeyboardEnhancementFlags,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -39,6 +39,12 @@ pub fn setup() -> Result<(Terminal<CrosstermBackend<Stdout>>, bool), BoxError> {
     // handling (`UiState::handle_paste`) submit a multi-line paste as one
     // message instead of it fragmenting on every embedded newline.
     crossterm::execute!(stdout, EnableBracketedPaste)?;
+    // Lets the app see clicks/scroll as `Event::Mouse` instead of the
+    // terminal handling them entirely on its own - most terminal
+    // emulators still let a modifier key (commonly Shift) bypass this for
+    // native text selection/copy, the same trade-off every other
+    // mouse-aware TUI (vim's `mouse=a`, htop, ...) makes.
+    crossterm::execute!(stdout, EnableMouseCapture)?;
     let keyboard_release_reporting =
         crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
     if keyboard_release_reporting {
@@ -65,6 +71,7 @@ pub fn setup_surface() -> Result<(super::surface::Surface, bool), BoxError> {
 
 pub fn restore(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<(), BoxError> {
     let _ = crossterm::execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
+    let _ = crossterm::execute!(terminal.backend_mut(), DisableMouseCapture);
     let _ = crossterm::execute!(terminal.backend_mut(), DisableBracketedPaste);
     crossterm::execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     disable_raw_mode()?;

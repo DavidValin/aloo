@@ -279,6 +279,19 @@ impl StoppableServer {
     /// only channel membership (`Registry`) resets, since that lives in
     /// memory.
     fn start(port: u16, users: UsersRegistry) -> Self {
+        Self::start_with_options(port, users, |o| o)
+    }
+
+    /// `start`, letting a test configure `ServerOptions` first - what a
+    /// reconnect-across-an-SSL-flip test needs to bring a `StoppableServer`
+    /// back up with (or without) TLS on the *same* port a plain (or TLS)
+    /// one just left, proving `reconnect_loop` no longer hangs on the
+    /// mismatch (see the SSL-diagnosis tests below).
+    fn start_with_options(
+        port: u16,
+        users: UsersRegistry,
+        configure: impl FnOnce(ServerOptions) -> ServerOptions + Send + 'static,
+    ) -> Self {
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
         let users_for_thread = users.clone();
@@ -290,7 +303,7 @@ impl StoppableServer {
             rt.block_on(async move {
                 let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
                 ready_tx.send(listener.local_addr().unwrap()).unwrap();
-                let options = ServerOptions::new(users_for_thread);
+                let options = configure(ServerOptions::new(users_for_thread));
                 tokio::select! {
                     _ = aloo::server::serve(listener, options) => {}
                     _ = stop_rx => {}
@@ -728,6 +741,140 @@ async fn an_ssl_attempt_against_a_plain_server_is_diagnosed() {
         "{}",
         mismatch.0
     );
+}
+
+// ---------------------------------------------------------------------
+// The same diagnosis, on an *automatic* reconnect (AC-390) - the gap
+// AC-365 documented as unaddressed: `reconnect_loop` used to call
+// `handshake_as` with no timeout at all, so a transport-mode mismatch hit
+// mid-session hung the supervisor task forever instead of failing.
+// ---------------------------------------------------------------------
+
+/// A session already running plain hits an SSL-only server on the very
+/// next reconnect (the operator turned `server_ssl` on, or restarted it
+/// under new settings, while this client was between connections) - this
+/// used to hang the supervisor forever; now it times out and reports the
+/// same diagnosis a first connect would. `#[ignore]`'d like its
+/// first-connect sibling above: this one genuinely spends the full
+/// `CONNECT_TIMEOUT` proving the bound itself, not just the diagnosis.
+/// @requirement AC-390
+#[tokio::test]
+#[ignore]
+async fn a_reconnect_across_a_plain_to_ssl_only_flip_is_diagnosed_not_hung() {
+    let (chain, key) = localhost_cert();
+    let acceptor = ssl::acceptor_from_pem(&chain, &key).unwrap();
+
+    let mut server = StoppableServer::start(0, registry_with(&["alice"]));
+    let addr = server.addr;
+    let mut request = request_for(addr, "alice");
+    // The primary connect stays plain (`ssl: false`), but the diagnosis
+    // probe that follows a failed attempt dials the *opposite* mode
+    // against this same host/CA - needs both set up front, exactly like
+    // the first-connect sibling test above, even though the happy path
+    // never touches either.
+    request.host = "localhost".to_string();
+    request.ssl_ca = Some(ca_file(&chain));
+
+    let (mut events, _sink, _first_id, _identity, _addr) =
+        aloo::client::connect::connect_with_reconnect(&request)
+            .await
+            .expect("the first connection is an ordinary one");
+
+    server.stop();
+    loop {
+        match next_event(&mut events).await {
+            ServerEvent::Message(_) => {}
+            ServerEvent::Lost => break,
+            other => panic!("expected the loss to be reported, got {other:?}"),
+        }
+    }
+
+    // `reconnect_loop`'s first attempt (zero backoff) fires the instant
+    // `Lost` is sent, which can easily race ahead of standing the new
+    // server back up - exactly like `a_session_whose_server_disappears_
+    // gets_itself_back_on` above, the restart is triggered reactively by
+    // the first `Waiting`, and an ordinary "connection refused" from a
+    // leg that raced the restart is expected and skipped; only a later
+    // attempt against the now-actually-up SSL-only server carries the
+    // mismatch this test is proving. Each such leg spends the full
+    // `CONNECT_TIMEOUT` (plus `SSL_DIAGNOSIS_TIMEOUT`) before reporting -
+    // `next_event`'s own 10s budget is too tight for it.
+    let mut restarted: Option<StoppableServer> = None;
+    let reason = loop {
+        match tokio::time::timeout(Duration::from_secs(25), events.recv())
+            .await
+            .expect("the reconnect attempt must not hang past its own bounded timeout")
+            .expect("the supervisor must not stop while the session holds its receiver")
+        {
+            ServerEvent::Attempting => {}
+            ServerEvent::Waiting { reason, .. } => {
+                if reason.contains("appears to require SSL") {
+                    break reason;
+                }
+                if restarted.is_none() {
+                    let acceptor = acceptor.clone();
+                    restarted = Some(StoppableServer::start_with_options(
+                        addr.port(),
+                        server.users.clone(),
+                        move |o| o.with_tls(acceptor),
+                    ));
+                }
+            }
+            other => panic!("unexpected event while reconnecting: {other:?}"),
+        }
+    };
+    assert!(reason.contains("connect_using_ssl"), "{reason}");
+    drop(restarted);
+}
+
+/// The mirror image, and fast: a session running with SSL hits a plain
+/// server on the next reconnect. An SSL attempt against a plain listener
+/// fails its handshake immediately rather than hanging, so this one needs
+/// no `#[ignore]`.
+/// @requirement AC-390
+#[tokio::test]
+async fn a_reconnect_across_an_ssl_to_plain_flip_is_diagnosed_not_hung() {
+    let (chain, key) = localhost_cert();
+    let acceptor = ssl::acceptor_from_pem(&chain, &key).unwrap();
+    let mut server =
+        StoppableServer::start_with_options(0, registry_with(&["alice"]), move |o| o.with_tls(acceptor));
+    let addr = server.addr;
+    let mut request = request_for(addr, "alice");
+    request.host = "localhost".to_string();
+    request.ssl = true;
+    request.ssl_ca = Some(ca_file(&chain));
+
+    let (mut events, _sink, _first_id, _identity, _addr) =
+        aloo::client::connect::connect_with_reconnect(&request)
+            .await
+            .expect("the first connection is an ordinary one");
+
+    server.stop();
+    loop {
+        match next_event(&mut events).await {
+            ServerEvent::Message(_) => {}
+            ServerEvent::Lost => break,
+            other => panic!("expected the loss to be reported, got {other:?}"),
+        }
+    }
+
+    let restarted = StoppableServer::start(addr.port(), server.users.clone());
+
+    let waiting = loop {
+        match next_event(&mut events).await {
+            ServerEvent::Attempting => {}
+            waiting @ ServerEvent::Waiting { .. } => break waiting,
+            other => panic!("unexpected event while reconnecting: {other:?}"),
+        }
+    };
+    let ServerEvent::Waiting { reason, .. } = waiting else {
+        unreachable!()
+    };
+    assert!(
+        reason.contains("appears to reject SSL") && reason.contains("connect_using_ssl"),
+        "{reason}"
+    );
+    drop(restarted);
 }
 
 /// A wrong password against a server whose `connect_using_ssl` was

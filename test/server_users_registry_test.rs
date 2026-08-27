@@ -3,9 +3,9 @@
 //! socket.
 
 use aloo::server::users_registry::{
-    ACTIVATION_CODE_LEN, ACTIVATION_VALIDITY_SECS, ActivationOutcome, AuthCheck, RegisterError,
-    UsersRegistry, activation_code_is_well_formed, activation_email, activation_link,
-    derive_user_key, generate_activation_code,
+    ACCOUNT_REMOVED_ACTIVATION_REASON, ACTIVATION_CODE_LEN, ACTIVATION_FAIL_LIMIT,
+    ACTIVATION_VALIDITY_SECS, ActivationOutcome, AuthCheck, RegisterError, UsersRegistry,
+    activation_code_is_well_formed, activation_email, derive_user_key, generate_activation_code,
 };
 
 fn temp_registry(tag: &str) -> UsersRegistry {
@@ -118,6 +118,52 @@ fn register_writes_a_key_an_email_and_a_pending_activation() {
         registry.check_credentials("alice", "hunter2", 1_000),
         AuthCheck::ActivationPending { expired: false }
     ));
+}
+
+/// One email address cannot back two different nicknames.
+/// @requirement AC-389
+#[test]
+fn a_second_nickname_cannot_register_under_an_email_already_in_use() {
+    let registry = temp_registry("register-dup-email");
+    registry.register("alice", "hunter2", "shared@example.com", 1_000).unwrap();
+    assert_eq!(
+        registry.register("mallory", "pw", "shared@example.com", 1_001).unwrap_err(),
+        RegisterError::EmailAlreadyRegistered
+    );
+    assert!(!registry.is_registered("mallory"), "a rejected registration writes nothing");
+
+    // Case differences do not open a loophole.
+    assert_eq!(
+        registry.register("mallory", "pw", "SHARED@EXAMPLE.COM", 1_002).unwrap_err(),
+        RegisterError::EmailAlreadyRegistered
+    );
+}
+
+/// The check is scoped to *other* nicknames: replacing an expired pending
+/// registration under the *same* name and the *same* email it already had
+/// is unaffected.
+/// @requirement AC-389
+#[test]
+fn reregistering_the_same_nickname_under_its_own_email_is_unaffected() {
+    let registry = temp_registry("register-dup-email-self");
+    registry.register("alice", "first", "alice@example.com", 1_000).unwrap();
+    let expired_at = 1_000 + ACTIVATION_VALIDITY_SECS + 1;
+    registry
+        .register("alice", "second", "alice@example.com", expired_at)
+        .expect("the same nickname re-registering under its own email is not a collision");
+}
+
+/// A registered account's email becomes free again once the account is
+/// gone (rather than the email being reserved forever).
+/// @requirement AC-389
+#[test]
+fn an_emails_slot_frees_up_once_its_account_is_removed() {
+    let registry = temp_registry("register-dup-email-freed");
+    registry.register("alice", "hunter2", "shared@example.com", 1_000).unwrap();
+    registry.remove("alice").unwrap();
+    registry
+        .register("bob", "pw", "shared@example.com", 1_001)
+        .expect("the email is free again once the account that held it is gone");
 }
 
 /// Registering the same name again while a still-valid code is pending is
@@ -238,6 +284,84 @@ fn activate_accepts_the_right_code_once_and_refuses_a_wrong_or_expired_one() {
     );
 }
 
+/// The `ACTIVATION_FAIL_LIMIT`th (5th) wrong code in a row removes the
+/// account outright rather than leaving it open to indefinite guessing.
+/// @requirement AC-388
+#[test]
+fn five_wrong_activation_codes_in_a_row_remove_the_account() {
+    let registry = temp_registry("activate-fail-limit");
+    let registration = registry.register("alice", "pw", "alice@example.com", 0).unwrap();
+    assert_eq!(ACTIVATION_FAIL_LIMIT, 5, "test assumes the documented limit");
+
+    for _ in 0..ACTIVATION_FAIL_LIMIT - 1 {
+        assert_eq!(
+            registry.activate("alice", "000000000000", 0),
+            ActivationOutcome::WrongCode
+        );
+    }
+    assert!(registry.is_registered("alice"), "still short of the limit");
+
+    assert_eq!(
+        registry.activate("alice", "000000000000", 0),
+        ActivationOutcome::TooManyWrongCodesAccountRemoved
+    );
+    assert!(!registry.is_registered("alice"), "the account is gone");
+    assert_eq!(
+        registry.activate("alice", &registration.code, 0),
+        ActivationOutcome::NothingPending,
+        "even the right code finds nothing left to activate"
+    );
+}
+
+/// Fewer than the limit leaves the account intact, and a fresh (right or
+/// wrong) attempt is still checked normally.
+/// @requirement AC-388
+#[test]
+fn fewer_than_the_limit_of_wrong_codes_does_not_remove_the_account() {
+    let registry = temp_registry("activate-fail-limit-not-yet");
+    let registration = registry.register("bob", "pw", "bob@example.com", 0).unwrap();
+
+    for _ in 0..ACTIVATION_FAIL_LIMIT - 1 {
+        registry.activate("bob", "000000000000", 0);
+    }
+    assert_eq!(
+        registry.activate("bob", &registration.code, 0),
+        ActivationOutcome::Activated,
+        "the right code still works one short of the limit"
+    );
+    assert!(registry.is_registered("bob"));
+}
+
+/// A successful activation clears the wrong-code count, so it does not
+/// carry over and (say) remove the account on some unrelated later
+/// mistake - there is nothing left to guess against once it's active.
+/// @requirement AC-388
+#[test]
+fn a_successful_activation_clears_the_wrong_code_count() {
+    let registry = temp_registry("activate-fail-limit-clears");
+    let registration = registry.register("carol", "pw", "carol@example.com", 0).unwrap();
+    registry.activate("carol", "000000000000", 0);
+    registry.activate("carol", "000000000000", 0);
+    assert_eq!(
+        registry.activate("carol", &registration.code, 0),
+        ActivationOutcome::Activated
+    );
+    assert!(registry.is_registered("carol"));
+}
+
+/// The reason text `handle_connection` sends for this outcome is the exact
+/// constant `connect::handshake_as` matches on to stop retrying - a
+/// regression here would silently turn back into an infinite activation-
+/// popup loop against a nonexistent account, so it is pinned directly.
+/// @requirement AC-388
+#[test]
+fn the_account_removed_reason_constant_is_the_documented_wording() {
+    assert_eq!(
+        ACCOUNT_REMOVED_ACTIVATION_REASON,
+        "too many wrong activation codes - this account has been removed"
+    );
+}
+
 /// A login attempt against an unknown nickname and one against a real,
 /// wrong password get the identical answer - a login cannot be used to
 /// discover which names exist.
@@ -308,40 +432,18 @@ fn activation_code_is_well_formed_rejects_anything_but_the_exact_digit_shape() {
 /// @requirement AC-264
 #[test]
 fn activation_email_carries_the_code_and_names_the_nickname_and_recipient() {
-    let msg = activation_email(
-        "aloo@example.com",
-        "alice@example.com",
-        "alice",
-        "123456789012",
-        None,
-    );
+    let msg = activation_email("aloo@example.com", "alice@example.com", "alice", "123456789012");
     assert!(msg.contains("To: <alice@example.com>"));
     assert!(msg.contains("From: aloo <aloo@example.com>"));
     assert!(msg.contains("123456789012"));
     assert!(msg.contains("alice"));
-    assert!(!msg.contains("http"), "no link when no activation_url is configured");
 }
 
 /// @requirement AC-264
 #[test]
-fn activation_email_includes_a_link_when_a_base_url_is_configured() {
-    let msg = activation_email(
-        "aloo@example.com",
-        "alice@example.com",
-        "alice",
-        "123456789012",
-        Some("https://chat.example.com:7880"),
-    );
-    assert!(msg.contains("https://chat.example.com:7880/activate?nickname=alice&code=123456789012"));
-}
-
-/// @requirement AC-264
-#[test]
-fn activation_link_trims_a_trailing_slash_on_the_base_url() {
-    assert_eq!(
-        activation_link("https://chat.example.com/", "alice", "123456789012"),
-        "https://chat.example.com/activate?nickname=alice&code=123456789012"
-    );
+fn activation_email_tells_a_non_registrant_to_ignore_it() {
+    let msg = activation_email("aloo@example.com", "alice@example.com", "alice", "123456789012");
+    assert!(msg.contains("If you haven't registered you can ignore this message."));
 }
 
 // ---------------------------------------------------------------------

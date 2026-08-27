@@ -279,7 +279,11 @@ pub struct SessionState {
     pub(crate) otp_awaiting_consent:
         std::collections::HashMap<String, (crate::client::tui::ui::PendingOtpGenerate, u32)>,
     /// Contacts whose peer has already agreed to a fresh pad, so its
-    /// arrival needs no second decision from them.
+    /// arrival needs no second decision from them - including a full
+    /// re-arrival after a reconnect resends the whole pad unchanged
+    /// (`otp::on_pad_event`'s `Received` arm checks membership, not
+    /// consumes it). Cleared once the exchange actually installs
+    /// (`otp::on_pad_commit`) or is cancelled (`otp::on_pad_cancel`).
     pub(crate) otp_consented: std::collections::HashSet<String>,
     pub(crate) otp_cancelled:
         std::collections::HashMap<UserId, std::sync::Arc<std::sync::atomic::AtomicBool>>,
@@ -894,6 +898,16 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
                     // ordinary per-keystroke path below.
                     SessionInput::Key(Event::Paste(text)) => {
                         if let Some(action) = ui_state.handle_paste(text) {
+                            handle_ui_action(action, &mut wr, &mut ui_state, &mut session).await?;
+                        }
+                    }
+                    // Only ever arrives from a terminal this process owns
+                    // (`tui::terminal::setup` enables mouse capture) - the
+                    // daemon-attach wire protocol (`daemon_ipc::KeyWire`)
+                    // has no mouse variant, so an attached viewer's own
+                    // clicks never reach here at all.
+                    SessionInput::Key(Event::Mouse(mouse)) => {
+                        if let Some(action) = ui_state.handle_mouse(mouse) {
                             handle_ui_action(action, &mut wr, &mut ui_state, &mut session).await?;
                         }
                     }
@@ -1902,6 +1916,7 @@ async fn handle_ui_action(
                 crate::client::p2p::utc_second_of_hour(),
             );
             ui_state.set_direct_punch_rows(targets);
+            ui_state.push_status_notice("direct punch targets saved".to_string(), true);
         }
         UiAction::DeleteContact { nickname } => {
             crate::client::contacts::handle_delete(session, ui_state, nickname).await;
@@ -4766,6 +4781,19 @@ impl SessionState {
         self.otp_incoming_pads.contains_key(&from)
     }
 
+    /// The `(stream_id, enc_digest, dec_digest)` a pad staged by
+    /// `stage_incoming_pad_for_test` actually has - what a test builds a
+    /// matching `otp_pad::PadEvent::Received` from, since `on_pad_event`
+    /// only proceeds when it agrees with the staged pad it names.
+    pub fn staged_incoming_pad_identity_for_test(
+        &self,
+        from: UserId,
+    ) -> Option<(u64, crate::crypto::otp::KeyDigest, crate::crypto::otp::KeyDigest)> {
+        self.otp_incoming_pads
+            .get(&from)
+            .map(|pad| (pad.stream_id, pad.enc_digest, pad.dec_digest))
+    }
+
     /// Whether this side is still waiting on the peer's answer to its own
     /// "generate a fresh pad?" proposal for `contact_name`
     /// (`confirm_generate`'s `otp_awaiting_consent` insert) - exposed for
@@ -4812,6 +4840,23 @@ impl SessionState {
         size_mb: u32,
     ) {
         self.otp_awaiting_consent.insert(contact_name, (pending, size_mb));
+    }
+
+    /// Records `contact_name` as already agreed to a fresh pad, exactly as
+    /// `accept_invite`'s "agreeing to a fresh pad" branch leaves it -
+    /// exposed for tests proving `otp::on_pad_event`'s `Received` arm no
+    /// longer re-prompts for a pad this side already accepted, without
+    /// driving the whole popup round trip to reach that state.
+    pub fn stage_otp_consented_for_test(&mut self, contact_name: String) {
+        self.otp_consented.insert(contact_name);
+    }
+
+    /// Whether `contact_name` is still recorded as consented - the other
+    /// half of `stage_otp_consented_for_test`, confirming a genuine install
+    /// (`on_pad_commit`) or cancellation actually clears it rather than
+    /// leaking it past the exchange it was for.
+    pub fn has_otp_consented_for_test(&self, contact_name: &str) -> bool {
+        self.otp_consented.contains(contact_name)
     }
 
     /// The OTP layer's per-contact state - exposed for tests, which need

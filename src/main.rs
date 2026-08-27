@@ -529,8 +529,8 @@ fn run_export_identity_card(prefix: &str, nickname: &str) -> Result<(), BoxError
 /// re-saves the merged result before starting - so a flag actually passed
 /// this run becomes what the next flag-less run (e.g. a supervisor
 /// restarting the server after a crash) inherits. Everything else the
-/// server runs with - TLS, registration, SMTP, the activation endpoint -
-/// is settings-only (docs/SPEC.md "Server startup").
+/// server runs with - TLS, registration, SMTP - is settings-only
+/// (docs/SPEC.md "Server startup").
 async fn run_server(cli: Cli) -> Result<(), BoxError> {
     let mut settings = load_settings();
     let bind = cli
@@ -570,27 +570,8 @@ async fn run_server(cli: Cli) -> Result<(), BoxError> {
                 "server_allow_registration is on but server_smtp_host/server_smtp_port are not set - registrations will be refused"
             );
         }
-        options = options.with_registration(smtp, settings.server_activation_url.clone());
-
-        let activation_addr =
-            validation::parse_bind_addr(&bind, settings.server_activation_port)?;
-        let listener = tokio::net::TcpListener::bind(activation_addr).await?;
-        let tls = options.tls.clone();
-        let registry = std::sync::Arc::new(users);
-        tokio::spawn(async move {
-            if let Err(e) = server::activation::run(listener, tls, registry).await {
-                aloo::log_warn!("activation endpoint stopped: {e}");
-            }
-        });
-        println!(
-            "aloo: registration open, activation endpoint on {}{activation_addr}",
-            if settings.server_ssl { "https://" } else { "http://" }
-        );
-        if !settings.server_ssl {
-            aloo::log_warn!(
-                "the activation endpoint is plain http - set server_ssl=on to serve it over https"
-            );
-        }
+        options = options.with_registration(smtp);
+        println!("aloo: registration open");
     }
 
     let addr: SocketAddr = validation::parse_bind_addr(&bind, port)?;

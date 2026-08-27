@@ -92,8 +92,6 @@ ENV ALOO_SMTP_HOST=""
 ENV ALOO_SMTP_PORT=""
 ENV ALOO_SMTP_USERNAME=""
 ENV ALOO_SMTP_PASSWORD=""
-ENV ALOO_ACTIVATION_PORT=""
-ENV ALOO_ACTIVATION_URL=""
 
 # TCP carries client connections; UDP is the rendezvous socket clients use
 # to discover their own public address for hole punching (docs/PROTOCOL.md

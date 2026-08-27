@@ -118,11 +118,10 @@ the server starts (`docker-server/aloo-server-entrypoint.sh`), all optional:
 | `ALOO_PORT` | `--port` | Defaults to whatever `~/.aloo/settings` last recorded, or `7878` on first run. |
 | `ALOO_BIND` | `--bind` | Defaults to whatever `~/.aloo/settings` last recorded, or `0.0.0.0` on first run. You'll rarely need to change this inside a container — it's already listening on all interfaces by default so `-p` can reach it. |
 | `ALOO_REGISTER_USERS` | `aloo --register-user <n> <p>` per pair | Comma-separated `nickname:password` pairs, run once via the CLI before the server starts - active immediately, no email. Re-running a container that already has these in the mounted `~/.aloo/users` is a no-op: the "already registered" refusal is expected and ignored. |
-| `ALOO_SSL` | `server_ssl` setting | `on` to serve the control connection (and the activation endpoint) over TLS. |
+| `ALOO_SSL` | `server_ssl` setting | `on` to serve the control connection over TLS. |
 | `ALOO_SSL_FULLCHAIN` / `ALOO_SSL_PRIVKEY` | `server_ssl_fullchain` / `server_ssl_privkey` settings | Paths *inside the container* to the certificate pair - put them in the mounted volume so they survive recreation. |
 | `ALOO_ALLOW_REGISTRATION` | `server_allow_registration` setting | `on` to let anyone register themselves from the connect screen. |
 | `ALOO_SMTP_HOST` / `ALOO_SMTP_PORT` / `ALOO_SMTP_USERNAME` / `ALOO_SMTP_PASSWORD` | `server_smtp_*` settings | The relay activation emails go out through - required for `ALOO_ALLOW_REGISTRATION` to do anything but refuse every registration. |
-| `ALOO_ACTIVATION_PORT` / `ALOO_ACTIVATION_URL` | `server_activation_port` / `server_activation_url` settings | Where the activation web endpoint listens, and the public URL its emails link to. Publish `ALOO_ACTIVATION_PORT` (default `7880`) alongside the main port if you set it. |
 
 If you omit port/bind, on a *second* run the container picks up whatever
 was last saved to `~/.aloo/settings` on the mounted volume — same
@@ -139,7 +138,7 @@ then:
 
 ```sh
 docker run -d --name aloo-server --restart unless-stopped \
-  -p 7878:7878/tcp -p 7878:7878/udp -p 7880:7880/tcp \
+  -p 7878:7878/tcp -p 7878:7878/udp \
   -v aloo-data:/home/aloo/.aloo \
   -e ALOO_SSL=on \
   -e ALOO_SSL_FULLCHAIN=/home/aloo/.aloo/certs/fullchain.pem \
@@ -149,7 +148,6 @@ docker run -d --name aloo-server --restart unless-stopped \
   -e ALOO_SMTP_PORT=587 \
   -e ALOO_SMTP_USERNAME=aloo@example.com \
   -e ALOO_SMTP_PASSWORD=s3cret \
-  -e ALOO_ACTIVATION_URL=https://chat.example.com:7880 \
   aloo-server
 ```
 

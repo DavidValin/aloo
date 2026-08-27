@@ -16,12 +16,12 @@ use crossterm::event::KeyCode;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Tabs};
 
 use crate::settings::{DirectPunchTarget, PUNCH_FREQUENCIES, PunchFrequency};
 
-use super::ui::{Mode, UiAction, UiState, centered_rect, render_popup_button};
+use super::ui::{Mode, UiAction, UiState, centered_rect, focus_border_style, render_popup_button};
 
 // ---------------------------------------------------------------------
 // State
@@ -304,7 +304,7 @@ fn edit_state_for(index: usize, target: &DirectPunchTarget) -> DirectPunchEditSt
 pub(crate) fn render_direct_punches_popup(frame: &mut Frame, area: Rect, state: &UiState) {
     let Some(popup) = &state.direct_punches else { return };
 
-    let outer = centered_rect(70, 16, area);
+    let outer = centered_rect(70, 22, area);
     let block = Block::default().borders(Borders::ALL);
     let inner = block.inner(outer);
     frame.render_widget(ratatui::widgets::Clear, outer);
@@ -368,25 +368,36 @@ fn render_list(frame: &mut Frame, area: Rect, popup: &DirectPunchPopupState) {
     frame.render_stateful_widget(list, list_area, &mut list_state);
 }
 
-fn field_line(label: &str, value: &str, focused: bool) -> Line<'static> {
-    let style = if focused {
-        Style::default().add_modifier(Modifier::REVERSED)
-    } else {
-        Style::default()
-    };
-    Line::from(vec![
-        Span::styled(format!("{label}: "), Style::default().add_modifier(Modifier::BOLD)),
-        Span::styled(value.to_string(), style),
-    ])
+/// A bordered field, styled exactly like `ui_connect_popup`'s own
+/// `render_bordered_field` - the focused one's border highlighted, its
+/// value drawn inside - so every popup's text fields read the same way.
+/// Returns the inner `Rect`, for placing the blinking cursor in it.
+fn render_bordered_field(frame: &mut Frame, area: Rect, label: &str, value: &str, focused: bool) -> Rect {
+    let block = Block::default()
+        .title(label)
+        .borders(Borders::ALL)
+        .border_style(focus_border_style(focused));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    frame.render_widget(Paragraph::new(value), inner);
+    inner
+}
+
+/// Places the blinking terminal cursor right after the typed text in
+/// `inner` - `ui_connect_popup::place_text_cursor`'s same convention,
+/// duplicated rather than shared across two independent popup modules
+/// with no common one already importing both.
+fn place_text_cursor(frame: &mut Frame, inner: Rect, value: &str) {
+    let cursor_x = inner.x + (value.chars().count() as u16).min(inner.width.saturating_sub(1));
+    frame.set_cursor_position((cursor_x, inner.y));
 }
 
 fn render_edit_form(frame: &mut Frame, area: Rect, edit: &DirectPunchEditState) {
     let mut constraints = vec![
-        Constraint::Length(1), // nickname
-        Constraint::Length(1), // host
-        Constraint::Length(1), // port
-        Constraint::Length(1), // frequency
-        Constraint::Length(1), // spacer
+        Constraint::Length(3), // nickname
+        Constraint::Length(3), // host
+        Constraint::Length(3), // port
+        Constraint::Length(3), // frequency
         Constraint::Length(3), // save button
     ];
     if edit.error.is_some() {
@@ -394,41 +405,44 @@ fn render_edit_form(frame: &mut Frame, area: Rect, edit: &DirectPunchEditState) 
     }
     let rows = Layout::default().direction(Direction::Vertical).constraints(constraints).split(area);
 
-    frame.render_widget(
-        Paragraph::new(field_line(
-            "nickname (optionally nick+device_id)",
-            &edit.nickname,
-            edit.focus == DirectPunchField::Nickname,
-        )),
+    let nickname_inner = render_bordered_field(
+        frame,
         rows[0],
+        "nickname (optionally nick+device_id)",
+        &edit.nickname,
+        edit.focus == DirectPunchField::Nickname,
     );
-    frame.render_widget(
-        Paragraph::new(field_line("host", &edit.host, edit.focus == DirectPunchField::Host)),
-        rows[1],
-    );
+    let host_inner =
+        render_bordered_field(frame, rows[1], "host", &edit.host, edit.focus == DirectPunchField::Host);
     let port_display = if edit.port.is_empty() {
         format!("<default {}>", crate::settings::DEFAULT_DIRECT_PUNCH_PORT)
     } else {
         edit.port.clone()
     };
-    frame.render_widget(
-        Paragraph::new(field_line("port", &port_display, edit.focus == DirectPunchField::Port)),
-        rows[2],
-    );
+    let port_inner =
+        render_bordered_field(frame, rows[2], "port", &port_display, edit.focus == DirectPunchField::Port);
     let frequency = PunchFrequency::parse(&format!("every_{}m", PUNCH_FREQUENCIES[edit.frequency_index]))
         .expect("every PUNCH_FREQUENCIES entry parses");
-    frame.render_widget(
-        Paragraph::new(field_line(
-            "frequency (\u{2190}/\u{2192})",
-            &frequency.to_string(),
-            edit.focus == DirectPunchField::Frequency,
-        )),
+    render_bordered_field(
+        frame,
         rows[3],
+        "frequency (\u{2190}/\u{2192})",
+        &frequency.to_string(),
+        edit.focus == DirectPunchField::Frequency,
     );
 
-    render_popup_button(frame, rows[5], 16, "Save", edit.focus == DirectPunchField::Save);
+    // Only the free-text fields get a blinking cursor - frequency is a
+    // bounded Left/Right selector, not something typed into.
+    match edit.focus {
+        DirectPunchField::Nickname => place_text_cursor(frame, nickname_inner, &edit.nickname),
+        DirectPunchField::Host => place_text_cursor(frame, host_inner, &edit.host),
+        DirectPunchField::Port => place_text_cursor(frame, port_inner, &edit.port),
+        DirectPunchField::Frequency | DirectPunchField::Save => {}
+    }
+
+    render_popup_button(frame, rows[4], 16, "Save", edit.focus == DirectPunchField::Save);
 
     if let Some(err) = &edit.error {
-        frame.render_widget(Paragraph::new(err.as_str()).style(Style::default().fg(Color::Red)), rows[6]);
+        frame.render_widget(Paragraph::new(err.as_str()).style(Style::default().fg(Color::Red)), rows[5]);
     }
 }

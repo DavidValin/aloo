@@ -25,3 +25,10 @@ Feature: Logging in with a nickname and its password
     Given a server that anyone may connect to
     When alice logs in with the password "whatever"
     Then the connection is refused
+
+  @AC-386
+  Scenario: Seven wrong passwords in a row ban that address's logins
+    Given a server with alice registered under the password "s3cret"
+    When alice fails 7 login attempts in a row
+    And alice logs in with the password "s3cret"
+    Then the connection is refused, naming "too many failed login attempts"

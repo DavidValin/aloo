@@ -3,8 +3,9 @@
 //! `on_direct_ping` gate that actually consults it.
 
 use std::net::IpAddr;
+use std::time::Duration;
 
-use aloo::client::ip_ban::{BanOutcome, IpBanList};
+use aloo::client::ip_ban::{BanOutcome, IpBanList, StrikeConfig};
 
 fn addr() -> IpAddr {
     "203.0.113.5".parse().unwrap()
@@ -160,4 +161,119 @@ fn loading_a_missing_file_starts_empty_rather_than_erroring() {
     let list = IpBanList::load(&path).unwrap();
     assert_eq!(list.ban_count(), 0);
     assert!(!list.is_banned(addr()));
+}
+
+// ---------------------------------------------------------------------
+// `record_strike`/`is_banned_at`: the general, expiry-aware pair
+// `server::mod`'s login- and registration-abuse gates use instead of
+// `record_failed_check`/`is_banned` - see `client::ip_ban`'s module doc.
+// ---------------------------------------------------------------------
+
+const TEST_STRIKES: StrikeConfig = StrikeConfig {
+    strikes_to_ban: 3,
+    window_secs: 60 * 60,
+    min_distinct_minutes: 1,
+    ban_duration: Some(Duration::from_secs(100)),
+    reason: "test strikes",
+};
+
+/// @requirement AC-386, AC-387, TB-269
+#[test]
+fn a_time_limited_ban_lifts_once_its_duration_has_elapsed() {
+    let path = temp_path();
+    let mut list = IpBanList::new_empty(path.clone());
+    let ip = addr();
+    let base = 1_000_000u64;
+    assert_eq!(list.record_strike(ip, base, &TEST_STRIKES), BanOutcome::NotYet);
+    assert_eq!(list.record_strike(ip, base + 1, &TEST_STRIKES), BanOutcome::NotYet);
+    assert_eq!(
+        list.record_strike(ip, base + 2, &TEST_STRIKES),
+        BanOutcome::Banned
+    );
+    // Banned at base+2, for 100s: expires_at = base+102.
+    assert!(list.is_banned_at(ip, base + 101));
+    assert!(!list.is_banned_at(ip, base + 102), "the ban has just expired");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A permanent (`ban_duration: None`) ban, e.g. direct-punch's own, never
+/// lifts no matter how far `now_unix` moves.
+/// @requirement AC-280
+#[test]
+fn a_permanent_ban_never_expires() {
+    let path = temp_path();
+    let mut list = IpBanList::new_empty(path.clone());
+    let ip = addr();
+    let base = 1_000_000u64;
+    list.record_failed_check(ip, base);
+    list.record_failed_check(ip, base + 60);
+    assert_eq!(list.record_failed_check(ip, base + 61), BanOutcome::Banned);
+    assert!(list.is_banned_at(ip, base + 1_000_000_000));
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Once banned, a further call short-circuits without recording another
+/// strike or resetting the ban's own expiry.
+/// @requirement AC-386
+#[test]
+fn an_already_banned_address_stays_banned_without_a_fresh_strike_or_a_later_expiry() {
+    let path = temp_path();
+    let mut list = IpBanList::new_empty(path.clone());
+    let ip = addr();
+    let base = 1_000_000u64;
+    list.record_strike(ip, base, &TEST_STRIKES);
+    list.record_strike(ip, base + 1, &TEST_STRIKES);
+    assert_eq!(
+        list.record_strike(ip, base + 2, &TEST_STRIKES),
+        BanOutcome::Banned
+    );
+    // Called again long after, as if another qualifying event arrived
+    // while still banned - still just `Banned`, and the ban still expires
+    // relative to when it was *first* imposed, not this later call.
+    assert_eq!(
+        list.record_strike(ip, base + 50, &TEST_STRIKES),
+        BanOutcome::Banned
+    );
+    assert!(!list.is_banned_at(ip, base + 2 + 100));
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A ban's `expires_at` round-trips through a save/reload, so a time-
+/// limited ban actually lifts after a server restart rather than becoming
+/// permanent because the deadline was lost.
+/// @requirement AC-386, AC-387
+#[test]
+fn a_time_limited_bans_expiry_survives_a_reload() {
+    let path = temp_path();
+    let ip = addr();
+    let base = 1_000_000u64;
+    {
+        let mut list = IpBanList::new_empty(path.clone());
+        list.record_strike(ip, base, &TEST_STRIKES);
+        list.record_strike(ip, base + 1, &TEST_STRIKES);
+        assert_eq!(
+            list.record_strike(ip, base + 2, &TEST_STRIKES),
+            BanOutcome::Banned
+        );
+    }
+    let reloaded = IpBanList::load(&path).unwrap();
+    assert!(reloaded.is_banned_at(ip, base + 101));
+    assert!(!reloaded.is_banned_at(ip, base + 102));
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A ban line written before `expires_at` existed (three tab-separated
+/// fields, no fourth) still loads, read back as permanent.
+/// @requirement AC-386, TB-248
+#[test]
+fn a_pre_existing_three_field_ban_line_loads_as_permanent() {
+    let path = temp_path();
+    std::fs::write(
+        &path,
+        "1 banned\n2026-08-24T00:00:00Z\t203.0.113.5\trepeated unproven direct-punch checks\n",
+    )
+    .unwrap();
+    let list = IpBanList::load(&path).unwrap();
+    assert!(list.is_banned_at(addr(), u64::MAX));
+    let _ = std::fs::remove_file(&path);
 }

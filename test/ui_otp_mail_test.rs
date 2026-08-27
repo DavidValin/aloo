@@ -138,6 +138,95 @@ fn slash_mail_opens_the_full_screen_compose_view() {
     );
 }
 
+/// The compose view opens with focus on `To` (`ComposeState::new`) - the
+/// terminal's own cursor must be visibly blinking there too, not merely
+/// "the field that gets keystrokes" with no visual sign of it. Before this,
+/// typing worked but nothing on screen showed where.
+/// @requirement AC-392
+#[test]
+fn compose_opens_with_the_cursor_focused_in_the_to_field() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    open_mail(&mut state);
+    assert_eq!(
+        state.otp_mail.as_ref().unwrap().compose.focus,
+        MailFocus::To,
+        "To must be the default focus when the compose view opens"
+    );
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| render(f, &state)).unwrap();
+
+    let buffer = terminal.backend().buffer().clone();
+    let to_title_row = (0..buffer.area.height)
+        .find(|&y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+                .contains("To")
+        })
+        .expect("expected a visible \"To\" box title");
+
+    let cursor = terminal
+        .get_cursor_position()
+        .expect("cursor should be set while the To field is focused");
+    assert_eq!(cursor.y, to_title_row + 1, "the cursor sits in the To box's content row");
+}
+
+/// Typing into `To` moves the cursor along with it, and tabbing to
+/// `Subtext` moves the cursor there instead - it always tracks whichever
+/// field currently has focus and how much is typed into it, the same as
+/// the connect popup's own fields already do.
+/// @requirement AC-392
+#[test]
+fn the_cursor_tracks_typing_and_moves_with_focus() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    open_mail(&mut state);
+
+    let backend = TestBackend::new(100, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| render(f, &state)).unwrap();
+    let before = terminal.get_cursor_position().unwrap();
+
+    type_str(&mut state, "bob");
+    terminal.draw(|f| render(f, &state)).unwrap();
+    let after_typing = terminal.get_cursor_position().unwrap();
+    assert_eq!(after_typing.y, before.y, "still in the To row");
+    assert_eq!(
+        after_typing.x,
+        before.x + 3,
+        "the cursor should have advanced by the 3 typed characters"
+    );
+
+    press(&mut state, KeyCode::Tab);
+    assert_eq!(state.otp_mail.as_ref().unwrap().compose.focus, MailFocus::Subtext);
+    terminal.draw(|f| render(f, &state)).unwrap();
+    let after_tab = terminal.get_cursor_position().unwrap();
+    assert!(
+        after_tab.y > after_typing.y,
+        "the cursor must move down into the Subtext field"
+    );
+}
+
+/// Pasting into the focused `To` field types it character by character,
+/// including the live recipient check every real keystroke there
+/// triggers - one of the many overlays `handle_paste` now routes through
+/// `handle_key` instead of silently dropping.
+/// @requirement AC-394
+#[test]
+fn pasting_into_the_to_field_types_it_and_checks_the_recipient() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    open_mail(&mut state);
+
+    let action = state.handle_paste("bob".to_string());
+    assert_eq!(state.otp_mail.as_ref().unwrap().compose.to, "bob");
+    assert_eq!(
+        action,
+        Some(UiAction::CheckOtpMailRecipient { nickname: "bob".to_string() }),
+        "the final character's keystroke still fires the same check typing it would"
+    );
+}
+
 /// @requirement AC-154
 #[test]
 fn esc_discards_the_compose_view() {

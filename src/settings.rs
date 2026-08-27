@@ -20,8 +20,7 @@
 //! certificate pair (`server_ssl*`, `crate::server::ssl`), whether
 //! registrations are taken and the SMTP account the activation emails go
 //! out through (`server_allow_registration`, `server_smtp_*`,
-//! `crate::server::users_registry`), and where the activation endpoint
-//! listens (`server_activation_*`, `crate::server::activation`). The SMTP
+//! `crate::server::users_registry`). The SMTP
 //! password and a daemon's login password are persisted as plaintext like
 //! every other field - anyone who can read `~/.aloo/settings` already
 //! controls this user's account on this machine.
@@ -53,14 +52,6 @@ pub fn default_path() -> PathBuf {
 /// `crate::platform::expand_tilde` resolves it at load time.
 pub const DEFAULT_SERVER_SSL_FULLCHAIN: &str = "~/.aloo/certs/fullchain.pem";
 pub const DEFAULT_SERVER_SSL_PRIVKEY: &str = "~/.aloo/certs/privkey.pem";
-
-/// The TCP port the account-activation web endpoint listens on when
-/// `server_allow_registration` is on (`crate::server::activation`) - on
-/// the same `server_bind` address as the server itself. Its own port
-/// because the server's port speaks the framed control protocol and
-/// answers with `Hello` before reading a byte, so a browser could never
-/// be told apart from a client there.
-pub const DEFAULT_SERVER_ACTIVATION_PORT: u16 = 7880;
 
 /// `on`/`true`/`yes`/`1` - the spelling every `on`/`off` setting in this
 /// file accepts, so no spelling is a silent no-op.
@@ -392,18 +383,12 @@ pub struct Settings {
     /// registration on and no SMTP host refuses registrations with a
     /// reason rather than creating accounts nobody can activate. Port 465
     /// is spoken as implicit TLS, any other port as STARTTLS when the
-    /// server offers it.
+    /// server offers it. The email carries the code alone, to be typed
+    /// into the client's activation popup.
     pub server_smtp_host: Option<String>,
     pub server_smtp_port: Option<u16>,
     pub server_smtp_username: Option<String>,
     pub server_smtp_password: Option<String>,
-    /// Where the activation web endpoint listens
-    /// (`DEFAULT_SERVER_ACTIVATION_PORT`), and the public base URL of it
-    /// that the activation email links to - e.g.
-    /// `https://chat.example.com:7880`. With no URL the email carries the
-    /// code alone, to be typed into the client's activation popup.
-    pub server_activation_port: u16,
-    pub server_activation_url: Option<String>,
     /// Whether a `JoinChannel` for a not-yet-existing name may create it
     /// as public (`docs/PROTOCOL.md` §6.7's `ChannelsRegistry::join`).
     /// Joining an *existing* public channel, and creating/joining a
@@ -597,8 +582,6 @@ impl Default for Settings {
             server_smtp_port: None,
             server_smtp_username: None,
             server_smtp_password: None,
-            server_activation_port: DEFAULT_SERVER_ACTIVATION_PORT,
-            server_activation_url: None,
             server_allow_create_public_channels: true,
             server_channel_deletion_unactivity_period: None,
             server_superadmin: BTreeSet::new(),
@@ -779,11 +762,6 @@ impl Settings {
             "server_smtp_password={}\n",
             self.server_smtp_password.as_deref().unwrap_or("")
         ));
-        c.push_str(&format!("server_activation_port={}\n", self.server_activation_port));
-        c.push_str(&format!(
-            "server_activation_url={}\n",
-            self.server_activation_url.as_deref().unwrap_or("")
-        ));
         c.push_str(&format!(
             "server_allow_create_public_channels={}\n",
             switch(self.server_allow_create_public_channels)
@@ -851,16 +829,6 @@ impl Settings {
                 }
                 "server_smtp_password" if !value.is_empty() => {
                     settings.server_smtp_password = Some(value.to_string());
-                }
-                "server_activation_port" => {
-                    if let Ok(p) = value.parse::<u16>()
-                        && p != 0
-                    {
-                        settings.server_activation_port = p;
-                    }
-                }
-                "server_activation_url" if !value.is_empty() => {
-                    settings.server_activation_url = Some(value.trim_end_matches('/').to_string());
                 }
                 "server_allow_create_public_channels" => {
                     settings.server_allow_create_public_channels = parse_switch(value);
@@ -1092,12 +1060,6 @@ impl Settings {
             (
                 "server_smtp_password",
                 self.server_smtp_password.clone().unwrap_or_default(),
-                true,
-            ),
-            ("server_activation_port", self.server_activation_port.to_string(), true),
-            (
-                "server_activation_url",
-                self.server_activation_url.clone().unwrap_or_default(),
                 true,
             ),
             (

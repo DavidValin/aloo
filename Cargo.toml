@@ -1,6 +1,6 @@
 [package]
 name = "aloo"
-version = "0.3.0-alpha.8"
+version = "0.3.0-alpha.9"
 edition = "2024"
 
 authors = ["David Valin <hola@davidvalin.com>"]
@@ -270,10 +270,6 @@ name = "server_ssl_test"
 path = "test/server_ssl_test.rs"
 
 [[test]]
-name = "server_activation_test"
-path = "test/server_activation_test.rs"
-
-[[test]]
 name = "reconnect_test"
 path = "test/reconnect_test.rs"
 
@@ -324,6 +320,10 @@ path = "test/otp_provisioning_concurrency_test.rs"
 [[test]]
 name = "otp_pad_commit_test"
 path = "test/otp_pad_commit_test.rs"
+
+[[test]]
+name = "otp_pad_reverify_test"
+path = "test/otp_pad_reverify_test.rs"
 
 [[test]]
 name = "otp_binary_guard_test"
@@ -444,6 +444,10 @@ path = "test/ui_contacts_test.rs"
 [[test]]
 name = "ui_direct_punch_popup_test"
 path = "test/ui_direct_punch_popup_test.rs"
+
+[[test]]
+name = "ui_mouse_test"
+path = "test/ui_mouse_test.rs"
 
 # Behaviour-driven acceptance layer: Gherkin scenarios in `features/` executed
 # by cucumber-rs. `harness = false` because cucumber supplies its own runner

@@ -389,9 +389,9 @@ private key included - still does not decrypt it.
 
 ### 1.4 Optional TLS
 
-`server_ssl=on` in `~/.aloo/settings` serves the control connection (and
-the account-activation web endpoint, §5.3) under a certificate pair named
-by `server_ssl_fullchain`/`server_ssl_privkey` - a Let's Encrypt pair,
+`server_ssl=on` in `~/.aloo/settings` serves the control connection under a
+certificate pair named by `server_ssl_fullchain`/`server_ssl_privkey` - a
+Let's Encrypt pair,
 typically. A client opts in with `connect_using_ssl` in its own
 `~/.aloo/settings` - the one setting for this, shared identically by a
 normal (interactive) connect and a daemon start, with no popup field and
@@ -421,6 +421,12 @@ daemon start outright with the same reason. The real session that
 follows, if any, always uses exactly what `connect_using_ssl` says -
 never the probed alternative; this never auto-negotiates or silently
 degrades.
+
+An automatic reconnect (§4.2) that hits the same kind of mismatch - the
+operator flips `server_ssl`, or a client's own setting disagrees with a
+server it is reconnecting to mid-session - is bounded and diagnosed the
+same way, not left to hang: without this, the supervisor task parks on
+that one attempt forever, with no further retries and nothing shown.
 
 ## 2. Serialization
 
@@ -731,6 +737,12 @@ true, activation_pending: false, reason: None }`, and the client's next
 message must be `Identify` (§5.4). One still awaiting activation answers
 `ok: false, activation_pending: true` instead - see §5.2.
 
+Seven wrong-password (or unknown-nickname - the same one answer either
+way) attempts from one source address within 24h refuse every further
+login from that address, with a distinctly-worded reason, for the next
+24h - checked before the slow key derivation runs, so a banned address
+cannot burn server work either.
+
 **Changing your own password.** Once fully connected (past `Identify`,
 §5.4), either side of the pair can be rotated:
 
@@ -776,12 +788,13 @@ code is given back, one way or another:
   registered but not activated yet..."). Either way it is the same
   popup, retrying the same `Activate` exchange until it succeeds or the
   user cancels.
-- **In a browser.** The activation email also names an HTTP(S) endpoint
-  (`server_activation_port`, over TLS when `server_ssl` is on) that takes
-  the same nickname and code and does the identical check. More than ten
-  attempts from one source address within an hour bans that address from
-  *this endpoint* for a day - a ban that has no effect on logging in as a
-  client, which costs a full reconnect per wrong code instead.
+Five wrong codes in a row against one still-pending account remove the
+account outright, rather than leaving it open to indefinite guessing - the
+popup itself retries with no limit of its own, so this is what actually
+bounds it. That fifth answer names the removal specifically, distinct from
+an ordinary wrong-code refusal, so the popup surfaces it as a plain
+refusal (the nickname is free to register again) instead of asking for
+still another code that can never work.
 
 Activating an account is nothing more than deleting the pending code file
 - there is no separate "activated" flag to fall out of sync with it.
@@ -800,7 +813,13 @@ with a pending activation and emails a fresh code to `email`, answering
 `RegisterResult { ok: true, reason: None }`; the account cannot log in
 until that code comes back (§5.2). Registering a nickname whose previous
 registration is still within its activation window is refused outright;
-one whose window has expired may be registered again from scratch.
+one whose window has expired may be registered again from scratch. `email`
+must not already belong to a different registered nickname (active or
+still pending) - one address cannot back two separate accounts; it frees
+up again once the account holding it is removed. More than three
+registration attempts from one source address within two days refuse that
+one and every further attempt from the same address for the next seven
+days.
 
 This is a separate path from logging in - a client never sends `Auth`
 and `Register` on the same connection - and from the server's own
@@ -3979,15 +3998,23 @@ inherent to the cipher - so two sides whose copies differ by a single byte
 produce ciphertext that decodes to plausible-looking garbage, with nothing
 anywhere reporting an error. The exchange therefore commits in two phases.
 `OtpPadStart` declares a digest of each half up front. The receiver
-reassembles to a staging area, checks that it received exactly `2 *
-key_len` bytes and that both halves hash to what was declared, and only
-then asks its user. Accepting produces `OtpPadVerify` carrying the digests
-the receiver actually computed - it installs nothing. The sender compares
-those against its own staged files, and only on a match installs its own
-half and sends `OtpPadCommit`; receiving that commit is the sole
-authorisation for the receiver to install. A mismatch at either point ends
-the attempt with nothing installed anywhere, rather than leaving a pair
-that would silently produce garbage.
+reassembles to a staging area and checks that it received exactly `2 *
+key_len` bytes and that both halves hash to what was declared. Only a pad
+the receiver's user has not already agreed to - nothing was proposed and
+accepted for this contact beforehand - asks then; one already accepted
+when the exchange was first proposed re-verifies on arrival with no
+further prompt, including a second (or later) arrival of the very same
+pad after a full resend (below) - the decision was already made once, at
+the point where declining still saved both sides the whole transfer.
+Accepting (whichever way it happened) produces `OtpPadVerify` carrying the
+digests the receiver actually computed - it installs nothing. The sender
+compares those against its own staged files, and only on a match installs
+its own half and sends `OtpPadCommit`; receiving that commit is the sole
+authorisation for the receiver to install, and is also what finally
+retires the recorded acceptance - there is nothing left to re-verify once
+installed. A mismatch at either point ends the attempt with nothing
+installed anywhere, rather than leaving a pair that would silently produce
+garbage.
 
 Because a commit means the sender has already installed, the receiver can
 never end up holding a pad the sender does not - and the receiver's

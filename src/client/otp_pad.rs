@@ -167,8 +167,14 @@ pub(crate) struct IncomingPad {
 }
 
 /// What the receiving worker reports back when a pad transfer finishes.
+///
+/// `pub` (not `pub(crate)`) so a test can drive `otp::on_pad_event`
+/// directly with a synthetic `Received` - what a real transfer's worker
+/// thread would otherwise take real I/O and time to produce - the same
+/// seam `SessionState::stage_incoming_pad_for_test` exists for on the
+/// state side.
 #[derive(Debug)]
-pub(crate) enum PadEvent {
+pub enum PadEvent {
     /// Every byte arrived and both halves hashed to what the sender
     /// declared. `dir` holds `enc.key`/`dec.key`, still inside `.tmp/`.
     Received {

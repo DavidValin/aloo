@@ -1,7 +1,7 @@
 use aloo::settings::{
     DEFAULT_BIND, DEFAULT_DIRECT_PUNCH_PORT, DEFAULT_GLOBAL_PTT_SHORTCUT, DEFAULT_PORT,
-    DEFAULT_SERVER_ACTIVATION_PORT, DEFAULT_SERVER_SSL_FULLCHAIN, DEFAULT_SERVER_SSL_PRIVKEY,
-    DirectPunchTarget, PunchFrequency, Settings, default_path,
+    DEFAULT_SERVER_SSL_FULLCHAIN, DEFAULT_SERVER_SSL_PRIVKEY, DirectPunchTarget, PunchFrequency,
+    Settings, default_path,
 };
 use std::path::PathBuf;
 
@@ -88,7 +88,6 @@ fn server_ssl_registration_and_smtp_keys_are_written_even_when_unset() {
     let settings = Settings::load_or_create(&path).unwrap();
     assert_eq!(settings.server_ssl_fullchain, DEFAULT_SERVER_SSL_FULLCHAIN);
     assert_eq!(settings.server_ssl_privkey, DEFAULT_SERVER_SSL_PRIVKEY);
-    assert_eq!(settings.server_activation_port, DEFAULT_SERVER_ACTIVATION_PORT);
     assert_eq!(settings.server_smtp_host, None);
     assert_eq!(settings.server_smtp_port, None);
 
@@ -102,8 +101,6 @@ fn server_ssl_registration_and_smtp_keys_are_written_even_when_unset() {
         "server_smtp_port=",
         "server_smtp_username=",
         "server_smtp_password=",
-        &format!("server_activation_port={DEFAULT_SERVER_ACTIVATION_PORT}"),
-        "server_activation_url=",
     ] {
         assert!(contents.contains(line), "missing {line:?} in:\n{contents}");
     }
@@ -123,8 +120,6 @@ fn server_ssl_registration_and_smtp_keys_round_trip() {
         server_smtp_port: Some(587),
         server_smtp_username: Some("aloo@example.com".to_string()),
         server_smtp_password: Some("s3cret".to_string()),
-        server_activation_port: 8443,
-        server_activation_url: Some("https://chat.example.com:8443".to_string()),
         ..Settings::default()
     };
     saved.save(&path).unwrap();
@@ -133,8 +128,7 @@ fn server_ssl_registration_and_smtp_keys_round_trip() {
     std::fs::remove_file(&path).ok();
 }
 
-/// `on`/`true`/`yes`/`1` all switch a server flag on; a trailing slash on
-/// the activation URL is dropped so the link built from it is clean.
+/// `on`/`true`/`yes`/`1` all switch a server flag on.
 /// @requirement TB-241
 #[test]
 fn server_switches_accept_every_documented_spelling() {
@@ -142,16 +136,12 @@ fn server_switches_accept_every_documented_spelling() {
     for spelling in ["on", "true", "yes", "1"] {
         std::fs::write(
             &path,
-            format!("server_ssl={spelling}\nserver_allow_registration={spelling}\nserver_activation_url=https://x.example/\n"),
+            format!("server_ssl={spelling}\nserver_allow_registration={spelling}\n"),
         )
         .unwrap();
         let settings = Settings::load_or_create(&path).unwrap();
         assert!(settings.server_ssl, "server_ssl={spelling}");
         assert!(settings.server_allow_registration, "server_allow_registration={spelling}");
-        assert_eq!(
-            settings.server_activation_url.as_deref(),
-            Some("https://x.example")
-        );
     }
     std::fs::write(&path, "server_ssl=off\nserver_smtp_port=0\n").unwrap();
     let settings = Settings::load_or_create(&path).unwrap();
