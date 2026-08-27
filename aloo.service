@@ -14,7 +14,10 @@
 # This unit deliberately carries no configuration of its own. Set the
 # daemon up once by hand with the flags you want -
 #
-#   aloo --daemon --host=chat.example.com --channels=team,ops --focus=alice
+#   aloo --daemon --host=chat.example.com --channels=team,ops --initial-focus=the-hall --host=yourserver.com --nick bob --nick-pwd=bobpass
+#  
+# If you are not using a server:
+#   aloo --daemon --no-server --channels=team --initial-focus=team --nick bob
 #
 # - and it writes that back to ~/.aloo/settings, so the bare `aloo --daemon`
 # below reproduces it on every boot. Keeping the host, channels, focus and
@@ -43,7 +46,7 @@ PartOf=graphical-session.target
 # the daemon would re-launch detached and exit, and systemd would see the
 # start as having failed.
 Type=simple
-ExecStart=%h/.local/bin/aloo --daemon --foreground
+ExecStart=/usr/local/bin/aloo --daemon --foreground --host=aloserver.com --channels=the-hall,team --initial-focus=the-hall --nick bob --nick-pwd=bobpass
 Restart=on-failure
 RestartSec=5
 
