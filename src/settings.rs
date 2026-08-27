@@ -55,6 +55,50 @@ pub const DEFAULT_SERVER_SSL_PRIVKEY: &str = "~/.aloo/certs/privkey.pem";
 
 /// `on`/`true`/`yes`/`1` - the spelling every `on`/`off` setting in this
 /// file accepts, so no spelling is a silent no-op.
+/// Whether the microphone is attenuated while other people's audio is
+/// coming out of the speakers (`client::voice::EchoDucker`).
+///
+/// Three states rather than two because the right answer depends on
+/// something the app can observe better than the user can state it: whether
+/// the microphone can actually hear the speakers. `Auto` lets
+/// `client::voice::EchoProbe` decide that from the audio, and re-decide it
+/// when someone plugs headphones in mid-call. `On`/`Off` are for the rooms
+/// it gets wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EchoDucking {
+    #[default]
+    Auto,
+    On,
+    Off,
+}
+
+impl EchoDucking {
+    /// Anything unrecognised reads as `Auto` rather than as off - an
+    /// unreadable value should land on the default, and the default here is
+    /// the one that decides for itself.
+    fn parse(value: &str) -> Self {
+        match value.to_ascii_lowercase().as_str() {
+            "on" | "true" | "yes" | "1" => Self::On,
+            "off" | "false" | "no" | "0" => Self::Off,
+            _ => Self::Auto,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::On => "on",
+            Self::Off => "off",
+        }
+    }
+}
+
+impl std::fmt::Display for EchoDucking {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 fn parse_switch(value: &str) -> bool {
     matches!(
         value.to_ascii_lowercase().as_str(),
@@ -362,6 +406,18 @@ fn host_is_valid(host: &str) -> bool {
 pub struct Settings {
     pub global_ptt_enabled: bool,
     pub global_ptt_shortcut: String,
+    /// Attenuate the microphone while the other side's audio is coming out
+    /// of the speakers, so it is not captured and sent straight back to
+    /// them as an echo (`client::voice::EchoDucker`).
+    ///
+    /// `auto` (the default) works it out from the audio rather than being
+    /// told - see `EchoDucking` and `client::voice::EchoProbe`. `on`/`off`
+    /// force it either way. A capture device that cancels echo itself
+    /// overrides all three (`client::voice::Recorder::echo_cancelled`).
+    ///
+    /// Applies to live calls and to push-to-talk voice messages alike; both
+    /// capture through the same microphone while the same speakers play.
+    pub voice_echo_ducking: EchoDucking,
     pub server_bind: String,
     pub server_port: u16,
     /// Serve the control connection (and the activation endpoint) over
@@ -572,6 +628,7 @@ impl Default for Settings {
         Self {
             global_ptt_enabled: true,
             global_ptt_shortcut: DEFAULT_GLOBAL_PTT_SHORTCUT.to_string(),
+            voice_echo_ducking: EchoDucking::default(),
             server_bind: DEFAULT_BIND.to_string(),
             server_port: DEFAULT_PORT,
             server_ssl: false,
@@ -666,6 +723,10 @@ impl Settings {
         c.push_str("# client options\n# -----------------------------------------\n");
         c.push_str(&format!("global_ptt_enabled={}\n", self.global_ptt_enabled));
         c.push_str(&format!("global_ptt_shortcut={}\n", self.global_ptt_shortcut));
+        // The only tri-state switch in the file, and `auto` on its own gives
+        // no hint that the other two exist - so the scaffold names them.
+        c.push_str("# voice_echo_ducking: auto (decide from the audio), on, off\n");
+        c.push_str(&format!("voice_echo_ducking={}\n", self.voice_echo_ducking));
         c.push_str(&format!("autosave_messages={}\n", switch(self.autosave_messages)));
         c.push_str(&format!("resume_from_log={}\n", switch(self.resume_from_log)));
         c.push_str(&format!("daemon_host={}\n", self.daemon_host.as_deref().unwrap_or("")));
@@ -795,6 +856,9 @@ impl Settings {
                 }
                 "global_ptt_shortcut" if !value.is_empty() => {
                     settings.global_ptt_shortcut = value.to_string();
+                }
+                "voice_echo_ducking" => {
+                    settings.voice_echo_ducking = EchoDucking::parse(value);
                 }
                 "server_bind" if !value.is_empty() => {
                     settings.server_bind = value.to_string();
@@ -1033,6 +1097,11 @@ impl Settings {
         vec![
             ("global_ptt_enabled", self.global_ptt_enabled.to_string(), true),
             ("global_ptt_shortcut", self.global_ptt_shortcut.clone(), true),
+            (
+                "voice_echo_ducking",
+                self.voice_echo_ducking.to_string(),
+                true,
+            ),
             ("server_bind", self.server_bind.clone(), true),
             ("server_port", self.server_port.to_string(), true),
             ("server_ssl", switch(self.server_ssl).to_string(), true),

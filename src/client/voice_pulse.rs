@@ -18,14 +18,15 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use libpulse_binding::def::BufferAttr;
 use libpulse_binding::sample::{Format, Spec};
 use libpulse_binding::stream::Direction;
 use libpulse_simple_binding::Simple;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::client::voice::{
-    MixSource, MixerCmd, Result, SAMPLE_RATE_HZ, VoiceError, apply_mixer_cmd, mix_output,
-    pcm_from_bytes, pcm_to_bytes,
+    DEVICE_BUFFER_MS, MixSource, MixerCmd, PULSE_ECHO_CANCEL_SOURCE, Result, SAMPLE_RATE_HZ,
+    VoiceError, apply_mixer_cmd, mix_output, pcm_from_bytes, pcm_to_bytes,
 };
 
 /// Every stream this module opens is mono PCM16 at `SAMPLE_RATE_HZ` -
@@ -42,13 +43,59 @@ fn spec() -> Spec {
     }
 }
 
+/// Bytes one millisecond of this module's format occupies - mono PCM16 at
+/// `SAMPLE_RATE_HZ`, so two bytes a frame.
+const fn bytes_per_ms() -> u32 {
+    (SAMPLE_RATE_HZ / 1000) * 2
+}
+
+/// Playback buffering, stated explicitly rather than left to the server's
+/// default.
+///
+/// This matters more here than anywhere else in the audio path. `pa_simple`
+/// with a null `BufferAttr` inherits the server's default target latency,
+/// which is sized for gapless music playback and is routinely hundreds of
+/// milliseconds - on a call it is pure delay between one person speaking
+/// and another hearing it, and it dwarfed every other term in the budget.
+/// `tlength` is the one that decides that: it is how much audio the server
+/// tries to keep buffered ahead of the sink.
+///
+/// `NO_CHANGE` (`u32::MAX`) leaves a field at the server's default;
+/// `maxlength` is left there deliberately, since capping it buys nothing
+/// once `tlength` is set and only risks the write loop stalling.
+fn playback_attr() -> BufferAttr {
+    let period = bytes_per_ms() * DEVICE_BUFFER_MS;
+    BufferAttr {
+        maxlength: u32::MAX,
+        tlength: period,
+        // Start playing as soon as one period is in hand rather than
+        // waiting for the buffer to fill.
+        prebuf: period,
+        minreq: period,
+        fragsize: u32::MAX,
+    }
+}
+
+/// Capture buffering: `fragsize` is the record-side counterpart of
+/// `tlength`, deciding how much audio the server accumulates before handing
+/// any of it over. Matched to `chunk_frames`, the amount one `read` moves.
+fn capture_attr() -> BufferAttr {
+    BufferAttr {
+        maxlength: u32::MAX,
+        tlength: u32::MAX,
+        prebuf: u32::MAX,
+        minreq: u32::MAX,
+        fragsize: bytes_per_ms() * DEVICE_BUFFER_MS,
+    }
+}
+
 /// How many mono PCM16 frames one `Simple::read`/`write` call moves - 20ms
 /// worth. Small enough that `Recorder`'s `Drop` (which only sets a flag,
 /// see below) is noticed promptly by the capture thread; there is no way
 /// to cancel a blocked `pa_simple` call directly, so bounding each call's
 /// duration is what keeps stop latency low instead.
 fn chunk_frames() -> usize {
-    (SAMPLE_RATE_HZ as usize) / 50
+    ((SAMPLE_RATE_HZ * DEVICE_BUFFER_MS) / 1000) as usize
 }
 
 /// Captures microphone audio into an in-memory buffer while alive, the
@@ -57,6 +104,7 @@ fn chunk_frames() -> usize {
 pub struct Recorder {
     buffer: Arc<Mutex<Vec<i16>>>,
     stop: Arc<AtomicBool>,
+    echo_cancelled: bool,
 }
 
 impl Recorder {
@@ -64,18 +112,38 @@ impl Recorder {
     /// if the connection to the server fails while already recording -
     /// mirroring the cpal backend's contract (see its `Recorder::start`
     /// doc comment for why this can't just be an `eprintln!`).
-    pub fn start(on_stream_error: impl Fn(String) + Send + 'static) -> Result<Self> {
-        let simple = Simple::new(
+    pub fn start(on_stream_error: impl Fn(String) + Send + Sync + 'static) -> Result<Self> {
+        // `module-echo-cancel`'s source if the server has it loaded, the
+        // default source otherwise. Real cancellation beats `EchoDucker`'s
+        // attenuation outright, and asking costs one failed connect - the
+        // module is not loaded by default anywhere, so the fallback is the
+        // common path rather than the exception.
+        let (simple, echo_cancelled) = match Simple::new(
             None,
             "aloo",
             Direction::Record,
-            None,
+            Some(PULSE_ECHO_CANCEL_SOURCE),
             "voice capture",
             &spec(),
             None,
-            None,
-        )
-        .map_err(|e| VoiceError::Device(format!("{e}")))?;
+            Some(&capture_attr()),
+        ) {
+            Ok(simple) => (simple, true),
+            Err(_) => (
+                Simple::new(
+                    None,
+                    "aloo",
+                    Direction::Record,
+                    None,
+                    "voice capture",
+                    &spec(),
+                    None,
+                    Some(&capture_attr()),
+                )
+                .map_err(|e| VoiceError::Device(format!("{e}")))?,
+                false,
+            ),
+        };
 
         let buffer = Arc::new(Mutex::new(Vec::new()));
         let buf = buffer.clone();
@@ -95,7 +163,18 @@ impl Recorder {
             }
         });
 
-        Ok(Self { buffer, stop })
+        Ok(Self {
+            buffer,
+            stop,
+            echo_cancelled,
+        })
+    }
+
+    /// Whether capture is coming from `module-echo-cancel`'s source - the
+    /// musl backend's counterpart of the cpal `Recorder`'s own
+    /// `echo_cancelled`, with the same meaning for `EchoDucker`.
+    pub fn echo_cancelled(&self) -> bool {
+        self.echo_cancelled
     }
 
     /// Drains everything captured since the last call (or since `start`).
@@ -141,7 +220,7 @@ pub fn spawn_mixer(
             "voice playback",
             &spec(),
             None,
-            None,
+            Some(&playback_attr()),
         ) {
             Ok(s) => s,
             Err(e) => {

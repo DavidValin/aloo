@@ -2155,17 +2155,50 @@ whatever partial data arrived (the reference client's is 5 seconds of
 silence per stream - an implementation detail, not part of the wire
 protocol).
 
-**No content/rate/format field.** Unlike `Envelope`, chunk payloads carry
+**No rate/format field.** Unlike `Envelope`, chunk payloads carry
 no `Content` tag and no sample-rate/channel-count metadata - the
 plaintext recovered by decrypting `blocks` is understood, by convention
-between this app's own client implementations, to be raw signed 16-bit
-little-endian mono PCM at a fixed rate (`voice::SAMPLE_RATE_HZ = 16000`
-in the reference client). The wire protocol itself does not encode or
-enforce this; it is purely a convention two cooperating clients must
+between this app's own client implementations, to be one coded chunk of
+mono audio at a fixed rate (16000Hz in the reference client). The wire
+protocol itself does not encode or
+enforce the rate; it is purely a convention two cooperating clients must
 already agree on out of band. An implementation using a different
-sample-format convention would not be interoperable with clients using
+sample-rate convention would not be interoperable with clients using
 this one, and the protocol gives a receiver no way to detect that
 mismatch from the bytes alone.
+
+**Chunk coding.** The plaintext of one chunk is:
+
+| Offset | Size | Meaning |
+| --- | --- | --- |
+| 0 | 1 | Codec tag. `1` is the IMA/DVI ADPCM coding described here; a receiver rejects a chunk carrying any other value rather than guessing |
+| 1 | 1 | Low 7 bits: the ADPCM step index this chunk starts from, 0-88. Top bit: set when the final payload byte holds one sample rather than two |
+| 2 | 2 | The chunk's first sample, signed 16-bit little-endian. Reproduced exactly on decode |
+| 4 | .. | 4 bits per remaining sample, low nibble of each byte first |
+
+Every chunk decodes **standalone** - it carries the predictor and step
+index it begins from rather than continuing the previous chunk's. This is
+required, not an optimisation: chunks travel unreliably, so one that is
+lost or arrives out of order must not corrupt every chunk after it. The
+cost is the four-byte header and a slightly worse first sample per chunk.
+
+Because each chunk restarts, the step index it starts from matters: a
+chunk that began at the bottom of the step table would spend its first
+samples climbing, which at one chunk every 15ms is a continuous buzz
+rather than an occasional artefact. A sender therefore chooses the
+starting index to match the chunk's own average sample-to-sample
+movement, and states it in the header - which is why the header carries
+the index at all.
+
+Coding rather than raw PCM is what makes a multi-party call practical: a
+live call is a full mesh (§7.7) with no server in the middle, so each
+participant sends separately to every other, and raw 16kHz PCM16 would be
+256kbit/s per direction per peer. At 4 bits a sample that is 64kbit/s.
+
+A chunk's *accumulated* form - what a receiver reassembles a finished
+recording into, and what the reference client replays, exports and sends
+under one-time-pad framing - is decoded PCM, not this coding. The coding
+exists only between `*Start` and `*End`, on the wire.
 
 **Length cap, enforced on both ends independently.** The reference client
 caps one recording at `MAX_RECORDING_SECS` (4 minutes,

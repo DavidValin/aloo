@@ -20,6 +20,7 @@
 //! jitter-buffer/multi-source-summing behavior is identical either way.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -66,6 +67,50 @@ pub fn recording_at_max(total_samples: u64) -> bool {
     total_samples >= MAX_RECORDING_SAMPLES
 }
 
+/// Whether a capture device's name says it is an echo-cancelling source -
+/// PulseAudio/PipeWire's `module-echo-cancel` source, or a driver that
+/// exposes a hardware-cancelled endpoint.
+///
+/// Preferring one of these is the best echo fix available, because it is
+/// real cancellation: it subtracts the known playback signal out of the
+/// capture instead of merely attenuating everything
+/// (`EchoDucker`), so the call stays full duplex. Matched by name because
+/// no audio API here reports the property directly, and narrowly enough
+/// ("echo cancel", however spelled) that it cannot plausibly select a
+/// device the user did not mean.
+pub fn is_echo_cancelling_device(name: &str) -> bool {
+    let name: String = name
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
+    name.contains("echocancel")
+}
+
+/// The `module-echo-cancel` source name to try before falling back to the
+/// default one. PulseAudio's own default for the module, and what
+/// PipeWire's pulse shim uses too.
+pub const PULSE_ECHO_CANCEL_SOURCE: &str = "echo-cancel-source";
+
+/// How much audio one device period should hold, capture and playback
+/// alike. Every backend here asks for this explicitly rather than taking
+/// what the device offers by default: a default ALSA period is commonly
+/// tens of milliseconds and a default `pa_simple` playback target latency
+/// far more than that, and both sit directly in the path between someone
+/// speaking and someone hearing it. Small enough to keep that cost down,
+/// comfortably above the point where an ordinary desktop starts underrunning.
+pub const DEVICE_BUFFER_MS: u32 = 20;
+
+/// How many frames `DEVICE_BUFFER_MS` is at `rate`, clamped into the range
+/// the device actually supports. `None` when the device publishes no range
+/// at all, which means the caller should leave the backend on its own
+/// default rather than guess a number the device may reject.
+pub fn device_buffer_frames(rate: u32, range: Option<(u32, u32)>) -> Option<u32> {
+    let (min, max) = range?;
+    let (lo, hi) = (min.min(max), min.max(max));
+    Some(((rate * DEVICE_BUFFER_MS) / 1000).clamp(lo, hi))
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum VoiceError {
     #[error("no default audio device available")]
@@ -103,10 +148,51 @@ fn prefer_pulse(
     }
 }
 
+/// `device_buffer_frames` for a cpal device, translating its reported
+/// support into the plain range that function takes.
 #[cfg(not(target_env = "musl"))]
-fn preferred_input_device(host: &cpal::Host) -> Option<cpal::Device> {
-    let devices = host.input_devices().ok().into_iter().flatten();
-    prefer_pulse(devices, host.default_input_device())
+fn requested_buffer_size(supported: &cpal::SupportedBufferSize, rate: u32) -> Option<u32> {
+    let range = match supported {
+        cpal::SupportedBufferSize::Range { min, max } => Some((*min, *max)),
+        cpal::SupportedBufferSize::Unknown => None,
+    };
+    device_buffer_frames(rate, range)
+}
+
+/// Builds a stream at `DEVICE_BUFFER_MS`, falling back to the device's own
+/// default period if that is refused. `build` is called at most twice and
+/// must therefore make its own copies of whatever it captures.
+#[cfg(not(target_env = "musl"))]
+fn build_with_buffer_fallback(
+    base: &StreamConfig,
+    frames: Option<u32>,
+    mut build: impl FnMut(StreamConfig) -> std::result::Result<cpal::Stream, cpal::Error>,
+) -> std::result::Result<cpal::Stream, cpal::Error> {
+    if let Some(frames) = frames {
+        let mut cfg = *base;
+        cfg.buffer_size = cpal::BufferSize::Fixed(frames);
+        if let Ok(stream) = build(cfg) {
+            return Ok(stream);
+        }
+    }
+    build(*base)
+}
+
+/// The capture device to use, and whether it cancels echo itself. An
+/// echo-cancelling source wins over the `prefer_pulse` choice: it solves
+/// the problem `EchoDucker` only mitigates, and solves it without costing
+/// full duplex.
+#[cfg(not(target_env = "musl"))]
+fn preferred_input_device(host: &cpal::Host) -> Option<(cpal::Device, bool)> {
+    let mut devices: Vec<cpal::Device> = host.input_devices().ok().into_iter().flatten().collect();
+    let cancelling = devices.iter().position(|d| {
+        d.description()
+            .is_ok_and(|desc| is_echo_cancelling_device(desc.name()))
+    });
+    if let Some(pos) = cancelling {
+        return Some((devices.swap_remove(pos), true));
+    }
+    prefer_pulse(devices.into_iter(), host.default_input_device()).map(|d| (d, false))
 }
 
 #[cfg(not(target_env = "musl"))]
@@ -134,6 +220,199 @@ pub fn pcm_from_bytes(bytes: &[u8]) -> Vec<i16> {
         .collect()
 }
 
+// ---------------------------------------------------------------------
+// Live chunk codec (IMA ADPCM, 4:1)
+// ---------------------------------------------------------------------
+//
+// Raw PCM at `SAMPLE_RATE_HZ` is 256kbit/s in each direction. A live call
+// is a full mesh with no server in the middle (`docs/PROTOCOL.md` 7.7), so
+// one participant sends that separately to every other participant: four
+// other people is a megabit per second of upstream, continuously. Typical
+// home upstream does not have it, and what happens when it does not is not
+// a clean failure - the bottleneck queues instead, which is delay, and the
+// delay grows for as long as the call lasts.
+//
+// So live chunks travel compressed. IMA ADPCM is 4 bits per sample - a flat
+// 4:1, 256kbit/s down to 64 - and is chosen over a modern speech codec
+// (Opus would manage 24kbit/s at better quality) for one specific reason:
+// every Opus binding is a wrapper around libopus, and a native library here
+// is not one dependency line. It is a hand-written static cross-build per
+// target in `Cross.toml`, which is what libasound, libpulse, libsndfile and
+// libltdl each already cost, and the reason `Cargo.toml` picks rustls'
+// `ring` provider over `aws-lc-rs`. ADPCM is forty lines of arithmetic with
+// no dependency at all, and 4:1 is the difference between a four-person
+// call fitting in an ordinary uplink and not.
+//
+// Each chunk is decoded standalone - it carries its own predictor and step
+// index rather than continuing the previous chunk's - because chunks travel
+// unreliably (`p2p::send_unreliable_voice`) and one that is lost or
+// reordered must not corrupt every chunk after it. The cost is the 4-byte
+// header below and a slightly worse first sample per chunk; the benefit is
+// that packet loss stays a moment of loss instead of a broken stream.
+
+/// Codec tag in byte 0 of every live voice chunk. Present so a chunk is
+/// self-describing on the wire, and so a future codec can be told apart
+/// from this one rather than decoded as garbage.
+pub const VOICE_CODEC_ADPCM: u8 = 1;
+
+/// tag (1) + step index and odd-length flag (1) + initial predictor (2).
+pub const VOICE_CHUNK_HEADER_BYTES: usize = 4;
+
+/// Step sizes IMA ADPCM's index walks, and how each 4-bit code moves that
+/// index. Both are the fixed tables from the IMA/DVI specification - they
+/// are the format, not a tuning choice.
+const IMA_STEP_TABLE: [i32; 89] = [
+    7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31, 34, 37, 41, 45, 50, 55, 60, 66,
+    73, 80, 88, 97, 107, 118, 130, 143, 157, 173, 190, 209, 230, 253, 279, 307, 337, 371, 408, 449,
+    494, 544, 598, 658, 724, 796, 876, 963, 1060, 1166, 1282, 1411, 1552, 1707, 1878, 2066, 2272,
+    2499, 2749, 3024, 3327, 3660, 4026, 4428, 4871, 5358, 5894, 6484, 7132, 7845, 8630, 9493,
+    10442, 11487, 12635, 13899, 15289, 16818, 18500, 20350, 22385, 24623, 27086, 29794, 32767,
+];
+
+const IMA_INDEX_TABLE: [i32; 16] = [
+    -1, -1, -1, -1, 2, 4, 6, 8, -1, -1, -1, -1, 2, 4, 6, 8,
+];
+
+/// Applies one 4-bit code to the running state, returning the sample it
+/// reconstructs. The single source of truth for what a code means: the
+/// encoder advances its own state by calling this too, so encoder and
+/// decoder predictors cannot drift apart no matter what the input is.
+fn ima_apply(code: u8, predictor: &mut i32, index: &mut i32) -> i16 {
+    let step = IMA_STEP_TABLE[*index as usize];
+    let mut diff = step >> 3;
+    if code & 4 != 0 {
+        diff += step;
+    }
+    if code & 2 != 0 {
+        diff += step >> 1;
+    }
+    if code & 1 != 0 {
+        diff += step >> 2;
+    }
+    if code & 8 != 0 {
+        *predictor -= diff;
+    } else {
+        *predictor += diff;
+    }
+    *predictor = (*predictor).clamp(i16::MIN as i32, i16::MAX as i32);
+    *index = (*index + IMA_INDEX_TABLE[(code & 15) as usize]).clamp(0, 88);
+    *predictor as i16
+}
+
+/// Chooses the 4-bit code that best approximates `sample`, then advances
+/// the state through `ima_apply` exactly as the decoder will.
+fn ima_encode(sample: i16, predictor: &mut i32, index: &mut i32) -> u8 {
+    let step = IMA_STEP_TABLE[*index as usize];
+    let mut diff = sample as i32 - *predictor;
+    let mut code: u8 = 0;
+    if diff < 0 {
+        code = 8;
+        diff = -diff;
+    }
+    let mut threshold = step;
+    let mut bit: u8 = 4;
+    for _ in 0..3 {
+        if diff >= threshold {
+            code |= bit;
+            diff -= threshold;
+        }
+        threshold >>= 1;
+        bit >>= 1;
+    }
+    ima_apply(code, predictor, index);
+    code
+}
+
+/// The step index to start a chunk at, chosen from the chunk's own average
+/// sample-to-sample movement.
+///
+/// This matters far more than it looks. ADPCM's step index normally adapts
+/// over a continuous stream, but every chunk here decodes standalone, so
+/// each one would otherwise restart from the smallest step in the table and
+/// spend its first samples climbing - a burst of distortion at the start of
+/// every chunk, 66 times a second, which is a buzz rather than an
+/// occasional artefact. Starting where the chunk actually is worth roughly
+/// 16dB of signal-to-noise on speech-like input, and costs nothing on the
+/// wire: the header already carries the index, because the decoder always
+/// had to be told where to start.
+fn seed_step_index(samples: &[i16]) -> i32 {
+    if samples.len() < 2 {
+        return 0;
+    }
+    let total: i64 = samples
+        .windows(2)
+        .map(|w| (w[1] as i64 - w[0] as i64).abs())
+        .sum();
+    let mean = total / (samples.len() - 1) as i64;
+    IMA_STEP_TABLE
+        .iter()
+        .position(|step| *step as i64 >= mean)
+        .unwrap_or(IMA_STEP_TABLE.len() - 1) as i32
+}
+
+/// Encodes one chunk of mono PCM16 for the wire. The first sample is
+/// carried verbatim in the header and is reproduced exactly; every sample
+/// after it costs 4 bits.
+pub fn encode_voice_chunk(samples: &[i16]) -> Vec<u8> {
+    if samples.is_empty() {
+        return Vec::new();
+    }
+    let mut predictor = samples[0] as i32;
+    let seed = seed_step_index(samples);
+    let mut index = seed;
+    let coded = &samples[1..];
+    let odd = coded.len() % 2 == 1;
+    let mut out = Vec::with_capacity(VOICE_CHUNK_HEADER_BYTES + coded.len().div_ceil(2));
+    out.push(VOICE_CODEC_ADPCM);
+    // The step index is 0-88, so its byte has a spare top bit; it carries
+    // whether the final byte holds one sample or two, which is otherwise
+    // unrecoverable from a nibble count.
+    out.push(seed as u8 | if odd { 0x80 } else { 0 });
+    out.extend_from_slice(&samples[0].to_le_bytes());
+    for pair in coded.chunks(2) {
+        let lo = ima_encode(pair[0], &mut predictor, &mut index);
+        let hi = match pair.get(1) {
+            Some(&s) => ima_encode(s, &mut predictor, &mut index),
+            None => 0,
+        };
+        out.push(lo | (hi << 4));
+    }
+    out
+}
+
+/// Decodes a chunk produced by `encode_voice_chunk` back to mono PCM16.
+///
+/// `None` for anything this does not recognise - a truncated payload, an
+/// unknown codec tag, an out-of-range step index. This decodes attacker-
+/// controlled network input, so every field is checked before it is used
+/// (`IMA_STEP_TABLE` is indexed by it) rather than trusted.
+pub fn decode_voice_chunk(bytes: &[u8]) -> Option<Vec<i16>> {
+    if bytes.is_empty() {
+        return Some(Vec::new());
+    }
+    if bytes.len() < VOICE_CHUNK_HEADER_BYTES || bytes[0] != VOICE_CODEC_ADPCM {
+        return None;
+    }
+    let odd = bytes[1] & 0x80 != 0;
+    let mut index = (bytes[1] & 0x7f) as i32;
+    if index > 88 {
+        return None;
+    }
+    let first = i16::from_le_bytes([bytes[2], bytes[3]]);
+    let payload = &bytes[VOICE_CHUNK_HEADER_BYTES..];
+    let mut predictor = first as i32;
+    let mut out = Vec::with_capacity(1 + payload.len() * 2);
+    out.push(first);
+    for (i, byte) in payload.iter().enumerate() {
+        out.push(ima_apply(byte & 0x0f, &mut predictor, &mut index));
+        let last = i + 1 == payload.len();
+        if !(last && odd) {
+            out.push(ima_apply(byte >> 4, &mut predictor, &mut index));
+        }
+    }
+    Some(out)
+}
+
 /// The loudness of one captured/decoded chunk as a 0-100 meter reading -
 /// what the live call modal draws next to each participant
 /// (`crate::client::tui::ui::CallMember::level`). Root-mean-square rather
@@ -148,6 +427,305 @@ pub fn level_from_pcm(samples: &[i16]) -> u8 {
     let sum_sq: f64 = samples.iter().map(|s| (*s as f64) * (*s as f64)).sum();
     let rms = (sum_sq / samples.len() as f64).sqrt();
     ((rms / LEVEL_FULL_SCALE_RMS) * 100.0).round().clamp(0.0, 100.0) as u8
+}
+
+/// `level_from_pcm` from an already-accumulated sum of squares - what the
+/// realtime mix callback can afford, since it is summing samples anyway
+/// and must not walk them a second time.
+pub fn level_from_sum_sq(sum_sq: u64, count: u64) -> u8 {
+    if count == 0 {
+        return 0;
+    }
+    let rms = (sum_sq as f64 / count as f64).sqrt();
+    ((rms / LEVEL_FULL_SCALE_RMS) * 100.0).round().clamp(0.0, 100.0) as u8
+}
+
+// ---------------------------------------------------------------------
+// Echo control
+// ---------------------------------------------------------------------
+
+/// How loud the speakers are right now, as a `level_from_pcm` reading,
+/// published by whichever mixer backend is running and read by the capture
+/// workers for echo ducking.
+///
+/// A process-wide static rather than a value threaded through, because the
+/// thing it describes is process-wide: there is exactly one output stream
+/// for the whole session by construction (see `spawn_mixer`), and the
+/// capture side does not care which sources it is made of. Relaxed ordering
+/// throughout - this is an advisory level meter feeding a smoothed gain,
+/// and a reader that sees a value one chunk stale is indistinguishable from
+/// one that read a chunk earlier.
+static PLAYBACK_LEVEL: AtomicU8 = AtomicU8::new(0);
+
+pub fn publish_playback_level(level: u8) {
+    PLAYBACK_LEVEL.store(level, Ordering::Relaxed);
+}
+
+pub fn playback_level() -> u8 {
+    PLAYBACK_LEVEL.load(Ordering::Relaxed)
+}
+
+/// Playback level above which remote audio is treated as audible in the
+/// room, and so as something the microphone is about to pick up again.
+/// Just above the mixer's idle reading rather than at it, so dither and a
+/// source's trailing silence don't hold the duck open indefinitely.
+pub const ECHO_DUCK_TRIGGER_LEVEL: u8 = 3;
+
+/// What the microphone is attenuated to while remote audio is playing:
+/// -18dB. Attenuation rather than a hard gate, deliberately - the room has
+/// already attenuated what it echoes back, so this puts the echo under the
+/// noise floor, while someone who actually talks over the other side is
+/// still audible instead of being cut out entirely.
+pub const ECHO_DUCK_GAIN: f32 = 0.12;
+
+/// Per-chunk fraction of the remaining distance to the target gain. Ducking
+/// in is several times faster than coming back out: arriving late means
+/// leaking a burst of echo, while leaving late costs only a slightly quiet
+/// first syllable. At `CHUNK_INTERVAL` these are roughly 75ms down and
+/// 750ms back up.
+pub const ECHO_DUCK_ATTACK: f32 = 0.35;
+pub const ECHO_DUCK_RELEASE: f32 = 0.06;
+
+/// How much louder the microphone must read while the far end is talking
+/// than while they are not, before the difference is judged to be the
+/// speakers rather than coincidence. Two thresholds rather than one so the
+/// decision has hysteresis and cannot flap chunk to chunk.
+pub const ECHO_EVIDENCE_ENGAGE: f32 = 4.0;
+pub const ECHO_EVIDENCE_RELEASE: f32 = 2.0;
+
+/// How many chunks of *each* kind (far end talking, far end quiet) must be
+/// observed before the probe will conclude anything. Roughly a second of
+/// each at `CHUNK_INTERVAL`.
+pub const ECHO_EVIDENCE_MIN_OBSERVATIONS: u32 = 64;
+
+/// Weight of one new observation against the running average - a time
+/// constant of roughly 50 chunks, long enough to average over whole talk
+/// spurts rather than react to one loud syllable.
+pub const ECHO_PROBE_SMOOTHING: f32 = 0.02;
+
+/// Decides, from the audio itself, whether the microphone can actually hear
+/// the speakers - so nobody has to tell the app whether they are wearing
+/// headphones.
+///
+/// The trick is that *detecting* an echo path is a far smaller problem than
+/// cancelling one. Cancellation needs the playback signal aligned to the
+/// capture sample by sample, across two devices with independent clocks,
+/// which is what makes it a native-library job. Detection only needs the
+/// two loudness envelopes at chunk resolution, where alignment does not
+/// matter at all: a talk spurt lasts seconds and the echo of it arrives
+/// within a fraction of one.
+///
+/// So the microphone's own level is averaged separately over the chunks
+/// where the far end is talking and the chunks where they are not. On
+/// speakers the first average sits above the second, because the microphone
+/// is picking their voice up. On headphones the two match. Our *own* speech
+/// lands in both populations equally - we do not arrange our talking around
+/// theirs - so it contributes to both averages and drops out of the
+/// difference.
+///
+/// Two properties matter for this not to fool itself:
+///
+///   * it must observe the capture level from *before* `EchoDucker` has
+///     attenuated it, or ducking would suppress the very evidence it is
+///     judged by, the difference would collapse, ducking would release, and
+///     the echo would come back - forever, at whatever period the loop
+///     settles into; and
+///   * it starts out ducking. The safe assumption before there is evidence
+///     is the one whose failure is heard by everybody else in the call
+///     rather than only by us, so headphones cost a second or two of
+///     unnecessary ducking at the start and speakers cost nothing.
+///
+/// Its blind spot is someone who only ever talks at the same time as the
+/// far end, which stops the two populations separating. That is what
+/// `settings::EchoDucking::On`/`Off` are for.
+pub struct EchoProbe {
+    /// Mean capture level while the far end is talking, and while not.
+    loud: f32,
+    quiet: f32,
+    loud_n: u32,
+    quiet_n: u32,
+    ducking: bool,
+}
+
+impl EchoProbe {
+    pub fn new() -> Self {
+        Self {
+            loud: 0.0,
+            quiet: 0.0,
+            loud_n: 0,
+            quiet_n: 0,
+            // Ducking until the audio says otherwise - see the doc above.
+            ducking: true,
+        }
+    }
+
+    /// Feeds one chunk in. `capture_level` must be the level *before* any
+    /// ducking was applied to it.
+    pub fn observe(&mut self, capture_level: u8, playback_level: u8) {
+        let capture = capture_level as f32;
+        if playback_level > ECHO_DUCK_TRIGGER_LEVEL {
+            accumulate(&mut self.loud, &mut self.loud_n, capture);
+        } else {
+            accumulate(&mut self.quiet, &mut self.quiet_n, capture);
+        }
+        if self.loud_n < ECHO_EVIDENCE_MIN_OBSERVATIONS
+            || self.quiet_n < ECHO_EVIDENCE_MIN_OBSERVATIONS
+        {
+            return;
+        }
+        let excess = self.loud - self.quiet;
+        if self.ducking {
+            self.ducking = excess >= ECHO_EVIDENCE_RELEASE;
+        } else {
+            self.ducking = excess > ECHO_EVIDENCE_ENGAGE;
+        }
+    }
+
+    /// Whether the microphone currently appears to be hearing the speakers.
+    pub fn should_duck(&self) -> bool {
+        self.ducking
+    }
+
+    /// How much louder the microphone reads while the far end is talking -
+    /// the quantity the decision is made on, exposed for tests and for
+    /// anyone diagnosing a room this gets wrong.
+    pub fn excess_level(&self) -> f32 {
+        self.loud - self.quiet
+    }
+}
+
+impl Default for EchoProbe {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Running mean that takes its first observation whole rather than easing
+/// up from zero - without it the first `1/ECHO_PROBE_SMOOTHING` chunks of
+/// each population read far too low, and the two populations warm up at
+/// different rates depending on who happened to talk first.
+fn accumulate(mean: &mut f32, count: &mut u32, value: f32) {
+    if *count == 0 {
+        *mean = value;
+    } else {
+        *mean += (value - *mean) * ECHO_PROBE_SMOOTHING;
+    }
+    *count = count.saturating_add(1);
+}
+
+/// Attenuates captured audio while the speakers are playing remote audio,
+/// so the microphone does not send the other side their own voice back.
+///
+/// This is ducking, not cancellation: it does not model the room, and it
+/// cannot subtract a known signal out of the capture the way a real
+/// acoustic echo canceller does. What it does do is make the echo path lose
+/// far more than it gains, which is what stops the loop - and it needs no
+/// clock alignment between capture and playback, no adaptive filter, and no
+/// native dependency. Headphones remain strictly better, and the setting
+/// that turns this off (`voice_echo_ducking`) is there for people using
+/// them.
+pub struct EchoDucker {
+    gain: f32,
+}
+
+impl EchoDucker {
+    pub fn new() -> Self {
+        Self { gain: 1.0 }
+    }
+
+    pub fn gain(&self) -> f32 {
+        self.gain
+    }
+
+    /// Advances the gain one chunk towards what `playback_level` calls for
+    /// and applies it across `samples` in place, ramping from the previous
+    /// chunk's gain to this one's rather than stepping - a step between
+    /// chunks is a discontinuity, and a discontinuity 66 times a second is
+    /// an audible buzz.
+    pub fn process(&mut self, samples: &mut [i16], playback_level: u8) {
+        let target = if playback_level > ECHO_DUCK_TRIGGER_LEVEL {
+            ECHO_DUCK_GAIN
+        } else {
+            1.0
+        };
+        let step = if target < self.gain {
+            ECHO_DUCK_ATTACK
+        } else {
+            ECHO_DUCK_RELEASE
+        };
+        let from = self.gain;
+        let to = from + (target - from) * step;
+        self.gain = to;
+        if samples.is_empty() || (from >= 1.0 && to >= 1.0) {
+            return;
+        }
+        let n = samples.len() as f32;
+        for (i, s) in samples.iter_mut().enumerate() {
+            let g = from + (to - from) * (i as f32 / n);
+            *s = ((*s as f32) * g).clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+        }
+    }
+}
+
+impl Default for EchoDucker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------
+// Silence suppression
+// ---------------------------------------------------------------------
+
+/// Level at or below which a captured chunk is treated as silence worth not
+/// sending at all.
+pub const SILENCE_LEVEL: u8 = 2;
+
+/// How long sending continues after the last chunk that was above
+/// `SILENCE_LEVEL`. Without it, the quiet moments *inside* speech - the
+/// closure before a plosive, the gap between words - would each cut the
+/// stream, and the receiver would spend the whole conversation rebuilding
+/// its prebuffer instead of playing.
+pub const SILENCE_HANGOVER: Duration = Duration::from_millis(240);
+
+/// Decides which captured chunks are worth putting on the wire at all.
+///
+/// Used on a *call* only, and deliberately not on a push-to-talk voice
+/// message: a call is a real-time stream where an unsent chunk is simply a
+/// moment nobody was speaking, while a voice message is a recording that
+/// the receiver reassembles chunk by chunk into something replayable, so
+/// dropping its silence would shorten the message and pull the audio either
+/// side of a pause together.
+pub struct SilenceGate {
+    hangover_left: Duration,
+}
+
+impl SilenceGate {
+    pub fn new() -> Self {
+        Self {
+            hangover_left: Duration::ZERO,
+        }
+    }
+
+    /// Whether a chunk covering `chunk` of audio, measuring `level`, should
+    /// be sent.
+    pub fn should_send(&mut self, level: u8, chunk: Duration) -> bool {
+        if level > SILENCE_LEVEL {
+            self.hangover_left = SILENCE_HANGOVER;
+            return true;
+        }
+        if self.hangover_left.is_zero() {
+            return false;
+        }
+        self.hangover_left = self.hangover_left.saturating_sub(chunk);
+        true
+    }
+}
+
+impl Default for SilenceGate {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// The RMS amplitude `level_from_pcm` treats as a full meter. Chosen from
@@ -371,6 +949,7 @@ pub struct Recorder {
     stream: cpal::Stream,
     buffer: Arc<Mutex<Vec<i16>>>,
     sample_rate: u32,
+    echo_cancelled: bool,
 }
 
 #[cfg(not(target_env = "musl"))]
@@ -385,9 +964,9 @@ impl Recorder {
     /// crate that has only a terminal to report to goes through
     /// `crate::log_warn!`, which is silenced for exactly as long as the TUI
     /// owns the screen.
-    pub fn start(on_stream_error: impl Fn(String) + Send + 'static) -> Result<Self> {
+    pub fn start(on_stream_error: impl Fn(String) + Send + Sync + 'static) -> Result<Self> {
         let host = cpal::default_host();
-        let device = preferred_input_device(&host).ok_or(VoiceError::NoDevice)?;
+        let (device, echo_cancelled) = preferred_input_device(&host).ok_or(VoiceError::NoDevice)?;
         let config = device
             .default_input_config()
             .map_err(|e| VoiceError::Device(e.to_string()))?;
@@ -396,34 +975,48 @@ impl Recorder {
         // Interleaved frames must be averaged down to mono right here -
         // see `downmix_i16_to_mono`'s doc for what goes wrong otherwise.
         let channels = config.channels();
+        let requested = requested_buffer_size(config.buffer_size(), sample_rate);
         let stream_config: StreamConfig = config.into();
 
         let buffer = Arc::new(Mutex::new(Vec::new()));
         let buf = buffer.clone();
 
-        let stream = match sample_format {
-            SampleFormat::I16 => device.build_input_stream(
-                stream_config,
-                move |data: &[i16], _| {
-                    buf.lock()
-                        .unwrap()
-                        .extend(downmix_i16_to_mono(data, channels));
-                },
-                move |err| on_stream_error(err.to_string()),
-                None,
-            ),
-            SampleFormat::F32 => device.build_input_stream(
-                stream_config,
-                move |data: &[f32], _| {
-                    buf.lock()
-                        .unwrap()
-                        .extend(downmix_f32_to_mono_i16(data, channels));
-                },
-                move |err| on_stream_error(err.to_string()),
-                None,
-            ),
-            _ => return Err(VoiceError::UnsupportedFormat),
+        if !matches!(sample_format, SampleFormat::I16 | SampleFormat::F32) {
+            return Err(VoiceError::UnsupportedFormat);
         }
+        let on_stream_error = Arc::new(on_stream_error);
+
+        // Tried with an explicit period first and again on the device's own
+        // default if that is refused: a fixed size is not universally
+        // honoured (some ALSA devices, and every host that reports
+        // `SupportedBufferSize::Unknown`), and capture working at a worse
+        // latency beats capture not starting.
+        let stream = build_with_buffer_fallback(&stream_config, requested, |cfg: StreamConfig| {
+            let buf = buf.clone();
+            let on_err = on_stream_error.clone();
+            match sample_format {
+                SampleFormat::F32 => device.build_input_stream(
+                    cfg,
+                    move |data: &[f32], _| {
+                        buf.lock()
+                            .unwrap()
+                            .extend(downmix_f32_to_mono_i16(data, channels));
+                    },
+                    move |err| on_err(err.to_string()),
+                    None,
+                ),
+                _ => device.build_input_stream(
+                    cfg,
+                    move |data: &[i16], _| {
+                        buf.lock()
+                            .unwrap()
+                            .extend(downmix_i16_to_mono(data, channels));
+                    },
+                    move |err| on_err(err.to_string()),
+                    None,
+                ),
+            }
+        })
         .map_err(|e| VoiceError::Device(e.to_string()))?;
 
         stream
@@ -434,7 +1027,15 @@ impl Recorder {
             stream,
             buffer,
             sample_rate,
+            echo_cancelled,
         })
+    }
+
+    /// Whether this recorder's device cancels echo itself, in which case
+    /// `EchoDucker` is redundant and its cost to full duplex is not worth
+    /// paying (see `is_echo_cancelling_device`).
+    pub fn echo_cancelled(&self) -> bool {
+        self.echo_cancelled
     }
 
     /// Drains everything captured since the last call, resampled to
@@ -452,14 +1053,130 @@ impl Recorder {
 // Playback: a single persistent mixer for the whole session
 // ---------------------------------------------------------------------
 
-/// How much audio (in ms) a source must have queued - or how long to wait
-/// regardless - before the mixer starts consuming it, so ordinary
-/// network/decrypt-CPU jitter between chunk arrivals doesn't produce an
-/// audible gap. A source that's already `finished` (a whole clip, or a
-/// live stream that already ended) skips this wait entirely - there's no
-/// more audio coming to wait for.
-pub(crate) const JITTER_PREBUFFER_MS: u64 = 150;
-pub(crate) const JITTER_MAX_WAIT_MS: u64 = 300;
+// ---------------------------------------------------------------------
+// Jitter buffer policy
+// ---------------------------------------------------------------------
+//
+// A live source (a call participant, or a push-to-talk stream still being
+// spoken) is played out against the *output device's* clock, while it is
+// filled from the network against the *sender's* capture clock. Nothing
+// synchronises the two, so the queue between them is where every timing
+// difference in the system accumulates: a network stall, a scheduling
+// hiccup on either end, or plain crystal drift between two sound cards all
+// leave audio sitting in it. Whatever sits in that queue *is* the delay the
+// listener hears, and without the two rules below it is monotonic - every
+// hiccup adds to it and nothing ever takes it away, which is what made a
+// long call drift steadily further behind.
+//
+// So the queue is managed from both ends:
+//
+//   * it may not grow past `overflow_drop_samples` (the ceiling), and audio
+//     beyond that is dropped rather than played late - a momentary artefact
+//     instead of a permanent delay; and
+//   * the prebuffer each source waits for before it starts is adaptive
+//     (`grown_prebuffer`/`decayed_prebuffer`) rather than a fixed worst
+//     case, so a clean path pays a small delay and only a path that
+//     actually stutters pays a large one.
+//
+// A `finished` source - a whole received voice message being replayed, or a
+// live stream whose `StreamEnd` already arrived - is exempt from all of it.
+// It is a recording, not a real-time stream: there is no "late" to be, its
+// queue is the message itself rather than accumulated delay, and trimming
+// it would silently cut audio out of a message the user asked to hear.
+
+/// Where a live source's prebuffer target starts, and the floor it decays
+/// back to. Small enough that a clean path (a LAN, or two peers a few
+/// milliseconds apart) is not made to sound distant for nothing; a path
+/// that genuinely stutters grows its own target from here.
+pub const JITTER_PREBUFFER_MIN_MS: u64 = 60;
+
+/// Ceiling on the adaptive prebuffer target. Past this the delay is worse
+/// than the gap it is buying, so a source that keeps underrunning is left
+/// to underrun rather than pushed further and further behind.
+pub const JITTER_PREBUFFER_MAX_MS: u64 = 400;
+
+/// How much a source's prebuffer target grows on each underrun, and how
+/// much it gives back after `JITTER_DECAY_INTERVAL` of clean playback.
+/// Growth is deliberately several times the decay: the cost of growing too
+/// slowly is an audible gap, the cost of decaying too slowly is a few tens
+/// of milliseconds of delay for a few more seconds.
+pub const JITTER_PREBUFFER_GROWTH_MS: u64 = 40;
+pub const JITTER_PREBUFFER_DECAY_MS: u64 = 20;
+
+/// How long a source must play without underrunning before it gives back
+/// one `JITTER_PREBUFFER_DECAY_MS` step of prebuffer.
+pub const JITTER_DECAY_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How long a source waits for its prebuffer target before starting
+/// anyway. Bounds the damage when a sender stops talking mid-fill (with
+/// silence suppression on a call, an ordinary event) - the queue would
+/// otherwise sit unplayed until they spoke again.
+pub const JITTER_MAX_WAIT_MS: u64 = 300;
+
+/// How far past its prebuffer target a live source's queue may run before
+/// `overflow_drop_samples` trims it back. Has to be well clear of the
+/// target itself, or ordinary burstiness (several chunks arriving in one
+/// scheduling slice, which is normal) would trim on every push and chop
+/// audio continuously.
+pub const JITTER_QUEUE_SLACK_MS: u64 = 120;
+
+/// Duration of `samples` mono samples at `rate`, in whole milliseconds.
+pub fn samples_to_ms(samples: usize, rate: u32) -> u64 {
+    (samples as u64 * 1000) / rate.max(1) as u64
+}
+
+/// How many mono samples at `rate` make up `ms` of audio.
+pub fn ms_to_samples(ms: u64, rate: u32) -> usize {
+    ((ms * rate as u64) / 1000) as usize
+}
+
+/// Whether a source holding `queued_ms` of audio, having waited `waited`
+/// since it started filling, may begin playing. A `finished` source never
+/// waits: its queue is a whole recording, and there is no more audio coming
+/// for a prebuffer to fill with.
+pub fn jitter_ready_to_start(
+    queued_ms: u64,
+    waited: Duration,
+    finished: bool,
+    prebuffer_ms: u64,
+) -> bool {
+    finished || queued_ms >= prebuffer_ms || waited.as_millis() as u64 >= JITTER_MAX_WAIT_MS
+}
+
+/// The prebuffer target after an underrun - one growth step, capped.
+pub fn grown_prebuffer(current_ms: u64) -> u64 {
+    (current_ms + JITTER_PREBUFFER_GROWTH_MS).min(JITTER_PREBUFFER_MAX_MS)
+}
+
+/// The prebuffer target after `since_underrun` of playback with nothing
+/// going wrong, or `None` when it is not yet time to give anything back
+/// (or there is nothing left to give). Returning `None` rather than an
+/// unchanged value is what lets the caller know whether to restart its
+/// decay clock, so a source at the floor doesn't spin.
+pub fn decayed_prebuffer(current_ms: u64, since_underrun: Duration) -> Option<u64> {
+    if since_underrun < JITTER_DECAY_INTERVAL || current_ms <= JITTER_PREBUFFER_MIN_MS {
+        return None;
+    }
+    Some(current_ms.saturating_sub(JITTER_PREBUFFER_DECAY_MS).max(JITTER_PREBUFFER_MIN_MS))
+}
+
+/// How many samples to drop off the front of a live source's queue holding
+/// `queued` samples at `rate`. Zero until the queue passes its prebuffer
+/// target plus `JITTER_QUEUE_SLACK_MS`; past that, enough to bring it back
+/// to the target exactly.
+///
+/// Dropping is deliberate, and dropping from the *front* especially so.
+/// Audio that has fallen this far behind is audio the listener would hear
+/// late, and every later sample behind it later still - keeping it trades a
+/// moment's artefact for a delay that never goes away. The front is what is
+/// oldest and therefore most stale.
+pub fn overflow_drop_samples(queued: usize, rate: u32, prebuffer_ms: u64) -> usize {
+    let queued_ms = samples_to_ms(queued, rate);
+    if queued_ms <= prebuffer_ms + JITTER_QUEUE_SLACK_MS {
+        return 0;
+    }
+    queued.saturating_sub(ms_to_samples(prebuffer_ms, rate))
+}
 
 pub enum MixerCmd {
     /// `samples` are mono PCM16 at `SAMPLE_RATE_HZ`; the mixer resamples
@@ -474,39 +1191,141 @@ pub enum MixerCmd {
     Stop { id: u64 },
 }
 
-pub(crate) struct MixSource {
+/// One playback source's jitter buffer: the audio queued for it, and the
+/// adaptive state that decides when it starts and how much of a backlog it
+/// is allowed to carry (see the jitter buffer policy section above).
+///
+/// `pub` rather than crate-private purely so the mixing behaviour built on
+/// it is reachable from the test suite: `mix_output` and `apply_mixer_cmd`
+/// are pure over a source map, so everything except the device itself can
+/// be driven directly (`test/voice_test.rs`), which is what stops the
+/// latency management here from silently regressing.
+pub struct MixSource {
     queue: VecDeque<i16>,
     finished: bool,
     started: bool,
-    first_seen: Instant,
+    /// When the current wait for a prebuffer began - reset on every
+    /// underrun, not just at creation, since each talk spurt gets its own
+    /// wait (see `note_underrun`).
+    waiting_since: Instant,
+    /// This source's own current prebuffer target, adapted to the path it
+    /// is actually seeing rather than fixed at a worst case.
+    prebuffer_ms: u64,
+    /// When this source last underran (or was created), which is what
+    /// `decayed_prebuffer` measures "clean playback" from.
+    last_underrun: Instant,
 }
 
 impl MixSource {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
+        let now = Instant::now();
         Self {
             queue: VecDeque::new(),
             finished: false,
             started: false,
-            first_seen: Instant::now(),
+            waiting_since: now,
+            prebuffer_ms: JITTER_PREBUFFER_MIN_MS,
+            last_underrun: now,
         }
     }
 
     /// A `Finish` with no prior `Push` (an empty clip, or a stream that
     /// ended before its first chunk) - already-finished and empty, so
     /// `mix_output` drops it on the next tick.
-    pub(crate) fn new_finished() -> Self {
+    pub fn new_finished() -> Self {
         Self {
             finished: true,
             ..Self::new()
         }
     }
 
-    pub(crate) fn extend(&mut self, samples: &[i16]) {
+    pub fn extend(&mut self, samples: &[i16]) {
         self.queue.extend(samples);
     }
 
-    pub(crate) fn mark_finished(&mut self) {
+    pub fn mark_finished(&mut self) {
         self.finished = true;
+    }
+
+    pub fn queued_samples(&self) -> usize {
+        self.queue.len()
+    }
+
+    pub fn prebuffer_ms(&self) -> u64 {
+        self.prebuffer_ms
+    }
+
+    pub fn started(&self) -> bool {
+        self.started
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.finished
+    }
+
+    /// Everything that happens to a live source when audio is added to it:
+    /// give back a step of prebuffer if it has been playing cleanly for
+    /// long enough, then trim any backlog past the ceiling. Returns how
+    /// many samples were dropped, which is zero in the ordinary case.
+    ///
+    /// Runs on the *command* side rather than in `mix_output`, so the
+    /// realtime output callback never pays for it: a push happens a few
+    /// dozen times a second, an output frame tens of thousands of times.
+    ///
+    /// A `finished` source is left entirely alone - see the policy section.
+    pub fn on_push(&mut self, out_rate: u32) -> usize {
+        if self.finished {
+            return 0;
+        }
+        if let Some(relaxed) = decayed_prebuffer(self.prebuffer_ms, self.last_underrun.elapsed()) {
+            self.prebuffer_ms = relaxed;
+            self.last_underrun = Instant::now();
+        }
+        let drop = overflow_drop_samples(self.queue.len(), out_rate, self.prebuffer_ms);
+        if drop > 0 {
+            self.queue.drain(..drop);
+        }
+        drop
+    }
+
+    /// Whether this source may hand out a sample on this output frame,
+    /// starting it if its prebuffer is ready. Called once per source per
+    /// frame from the realtime callback, so it does no more than the
+    /// comparison it has to.
+    fn ready(&mut self, out_rate: u32) -> bool {
+        if !self.started
+            && jitter_ready_to_start(
+                samples_to_ms(self.queue.len(), out_rate),
+                self.waiting_since.elapsed(),
+                self.finished,
+                self.prebuffer_ms,
+            )
+        {
+            self.started = true;
+        }
+        self.started
+    }
+
+    /// A started live source ran out of audio: grow its prebuffer target
+    /// and put it back to waiting, so the next talk spurt refills before it
+    /// plays instead of stuttering its way through.
+    ///
+    /// Self-limiting despite running on the realtime thread - it clears
+    /// `started`, so the frames that follow take the `ready` path instead
+    /// and cannot grow the target again until the source has actually
+    /// played and starved a second time.
+    fn note_underrun(&mut self) {
+        self.prebuffer_ms = grown_prebuffer(self.prebuffer_ms);
+        self.started = false;
+        let now = Instant::now();
+        self.waiting_since = now;
+        self.last_underrun = now;
+    }
+}
+
+impl Default for MixSource {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -517,7 +1336,7 @@ impl MixSource {
 /// cpal, always `SAMPLE_RATE_HZ` for `voice_pulse` since that backend asks
 /// PulseAudio for `SAMPLE_RATE_HZ` directly), used to resample `Push`ed
 /// audio once here rather than in every caller.
-pub(crate) fn apply_mixer_cmd(
+pub fn apply_mixer_cmd(
     sources: &Mutex<HashMap<u64, MixSource>>,
     out_rate: u32,
     cmd: MixerCmd,
@@ -525,12 +1344,12 @@ pub(crate) fn apply_mixer_cmd(
     match cmd {
         MixerCmd::Push { id, samples } => {
             let resampled = resample(&samples, SAMPLE_RATE_HZ, out_rate);
-            sources
-                .lock()
-                .unwrap()
-                .entry(id)
-                .or_insert_with(MixSource::new)
-                .extend(&resampled);
+            let mut map = sources.lock().unwrap();
+            let src = map.entry(id).or_default();
+            src.extend(&resampled);
+            // Where a live source's backlog - and so the delay the listener
+            // hears - is bounded. See the jitter buffer policy section.
+            src.on_push(out_rate);
         }
         MixerCmd::Finish { id } => {
             let mut map = sources.lock().unwrap();
@@ -605,8 +1424,8 @@ pub fn spawn_mixer(
 #[cfg(not(target_env = "musl"))]
 fn try_open_mixer_stream(
     sources: Arc<Mutex<HashMap<u64, MixSource>>>,
-    on_stream_error: impl Fn(String) + Send + 'static,
-    on_finished: impl Fn(u64) + Send + 'static,
+    on_stream_error: impl Fn(String) + Send + Clone + 'static,
+    on_finished: impl Fn(u64) + Send + Clone + 'static,
 ) -> Result<(cpal::Stream, u32)> {
     let host = cpal::default_host();
     let device = preferred_output_device(&host).ok_or(VoiceError::NoDevice)?;
@@ -620,33 +1439,22 @@ fn try_open_mixer_stream(
     let out_rate = supported.sample_rate();
     let out_channels = supported.channels().max(1);
     let sample_format = supported.sample_format();
+    if !matches!(sample_format, SampleFormat::I16 | SampleFormat::F32) {
+        return Err(VoiceError::UnsupportedFormat);
+    }
+    let requested = requested_buffer_size(supported.buffer_size(), out_rate);
     let stream_config: StreamConfig = supported.into();
 
-    let stream = match sample_format {
-        SampleFormat::I16 => {
-            let sources_cb = sources.clone();
-            let on_finished_cb = on_finished;
-            device.build_output_stream(
-                stream_config,
-                move |data: &mut [i16], _| {
-                    mix_output(
-                        data,
-                        out_channels,
-                        out_rate,
-                        &sources_cb,
-                        &on_finished_cb,
-                        |s| s,
-                    )
-                },
-                move |err| on_stream_error(err.to_string()),
-                None,
-            )
-        }
-        SampleFormat::F32 => {
-            let sources_cb = sources.clone();
-            let on_finished_cb = on_finished;
-            device.build_output_stream(
-                stream_config,
+    // Same explicit-period-then-fall-back handling the capture side uses,
+    // and it matters at least as much here: the output buffer is the last
+    // thing between a decoded chunk and the speaker.
+    let stream = build_with_buffer_fallback(&stream_config, requested, |cfg: StreamConfig| {
+        let sources_cb = sources.clone();
+        let on_finished_cb = on_finished.clone();
+        let on_err = on_stream_error.clone();
+        match sample_format {
+            SampleFormat::F32 => device.build_output_stream(
+                cfg,
                 move |data: &mut [f32], _| {
                     mix_output(
                         data,
@@ -657,12 +1465,26 @@ fn try_open_mixer_stream(
                         |s| s as f32 / i16::MAX as f32,
                     )
                 },
-                move |err| on_stream_error(err.to_string()),
+                move |err| on_err(err.to_string()),
                 None,
-            )
+            ),
+            _ => device.build_output_stream(
+                cfg,
+                move |data: &mut [i16], _| {
+                    mix_output(
+                        data,
+                        out_channels,
+                        out_rate,
+                        &sources_cb,
+                        &on_finished_cb,
+                        |s| s,
+                    )
+                },
+                move |err| on_err(err.to_string()),
+                None,
+            ),
         }
-        _ => return Err(VoiceError::UnsupportedFormat),
-    }
+    })
     .map_err(|e| VoiceError::Device(e.to_string()))?;
 
     stream
@@ -679,7 +1501,7 @@ fn try_open_mixer_stream(
 /// callback thread, or `voice_pulse`'s dedicated writer thread), so it
 /// only pops pre-resampled samples and sums - no allocation, no
 /// resampling here.
-pub(crate) fn mix_output<T: Copy>(
+pub fn mix_output<T: Copy>(
     data: &mut [T],
     out_channels: u16,
     out_rate: u32,
@@ -688,21 +1510,21 @@ pub(crate) fn mix_output<T: Copy>(
     convert: impl Fn(i16) -> T,
 ) {
     let mut map = sources.lock().unwrap();
+    let mut level_sum_sq: u64 = 0;
+    let mut frames: u64 = 0;
     for frame in data.chunks_mut(out_channels as usize) {
         let mut sum: i32 = 0;
         for src in map.values_mut() {
-            if !src.started {
-                let queued_ms = (src.queue.len() as u64 * 1000) / out_rate.max(1) as u64;
-                let waited_enough =
-                    src.first_seen.elapsed().as_millis() as u64 >= JITTER_MAX_WAIT_MS;
-                if src.finished || queued_ms >= JITTER_PREBUFFER_MS || waited_enough {
-                    src.started = true;
-                }
+            if !src.ready(out_rate) {
+                continue;
             }
-            if src.started
-                && let Some(s) = src.queue.pop_front()
-            {
-                sum += s as i32;
+            match src.queue.pop_front() {
+                Some(s) => sum += s as i32,
+                // A started live source with nothing left to play has
+                // fallen behind its sender: rebuild a prebuffer before the
+                // next talk spurt rather than stuttering through it.
+                None if !src.finished => src.note_underrun(),
+                None => {}
             }
         }
         // A source retired here drained naturally (as opposed to
@@ -717,11 +1539,19 @@ pub(crate) fn mix_output<T: Copy>(
             }
             !done
         });
-        let s = convert(sum.clamp(i16::MIN as i32, i16::MAX as i32) as i16);
+        let mixed = sum.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+        level_sum_sq += (mixed as i64 * mixed as i64) as u64;
+        frames += 1;
+        let s = convert(mixed);
         for out in frame.iter_mut() {
             *out = s;
         }
     }
+    // What the speakers are about to emit, published for the capture side's
+    // echo ducking (`EchoDucker`). One multiply-add per frame here and one
+    // atomic store per callback, rather than anything that could block the
+    // realtime thread.
+    publish_playback_level(level_from_sum_sq(level_sum_sq, frames));
 }
 
 #[cfg(target_env = "musl")]

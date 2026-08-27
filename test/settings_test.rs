@@ -1,7 +1,7 @@
 use aloo::settings::{
     DEFAULT_BIND, DEFAULT_DIRECT_PUNCH_PORT, DEFAULT_GLOBAL_PTT_SHORTCUT, DEFAULT_PORT,
-    DEFAULT_SERVER_SSL_FULLCHAIN, DEFAULT_SERVER_SSL_PRIVKEY, DirectPunchTarget, PunchFrequency,
-    Settings, default_path,
+    DEFAULT_SERVER_SSL_FULLCHAIN, DEFAULT_SERVER_SSL_PRIVKEY, DirectPunchTarget, EchoDucking,
+    PunchFrequency, Settings, default_path,
 };
 use std::path::PathBuf;
 
@@ -55,6 +55,60 @@ fn missing_file_is_created_with_documented_defaults() {
     assert!(contents.contains(&format!("server_port={DEFAULT_PORT}")));
     assert!(contents.contains("server_ssl=off"));
     assert!(contents.contains("server_allow_registration=off"));
+    assert!(contents.contains("voice_echo_ducking=auto"));
+    // `auto` alone doesn't reveal that the other two states exist, so the
+    // scaffold has to name them.
+    assert!(contents.contains("# voice_echo_ducking: auto (decide from the audio), on, off"));
+
+    std::fs::remove_file(&path).ok();
+}
+
+/// @requirement AC-396
+#[test]
+fn echo_ducking_decides_for_itself_by_default_and_can_be_forced_either_way() {
+    let path = temp_settings_path();
+    // Auto by default: whether the microphone can hear the speakers is
+    // something the app observes better than the user can state it.
+    assert_eq!(Settings::default().voice_echo_ducking, EchoDucking::Auto);
+    assert_eq!(
+        Settings::load_or_create(&path).unwrap().voice_echo_ducking,
+        EchoDucking::Auto
+    );
+
+    for (written, expected) in [
+        ("auto", EchoDucking::Auto),
+        ("AUTO", EchoDucking::Auto),
+        ("on", EchoDucking::On),
+        ("true", EchoDucking::On),
+        ("yes", EchoDucking::On),
+        ("1", EchoDucking::On),
+        ("off", EchoDucking::Off),
+        ("false", EchoDucking::Off),
+        ("no", EchoDucking::Off),
+        ("0", EchoDucking::Off),
+        // An unreadable value lands on the default, and the default is the
+        // one that works it out for itself - not silently "off", which
+        // would leak echo to everyone else in the call.
+        ("sometimes", EchoDucking::Auto),
+        ("", EchoDucking::Auto),
+    ] {
+        std::fs::write(&path, format!("voice_echo_ducking={written}\n")).unwrap();
+        assert_eq!(
+            Settings::load_or_create(&path).unwrap().voice_echo_ducking,
+            expected,
+            "voice_echo_ducking={written}"
+        );
+    }
+
+    // And each state survives a save/load round trip as itself.
+    for mode in [EchoDucking::Auto, EchoDucking::On, EchoDucking::Off] {
+        let saved = Settings {
+            voice_echo_ducking: mode,
+            ..Settings::default()
+        };
+        saved.save(&path).unwrap();
+        assert_eq!(Settings::load_or_create(&path).unwrap(), saved);
+    }
 
     std::fs::remove_file(&path).ok();
 }

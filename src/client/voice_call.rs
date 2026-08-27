@@ -218,6 +218,12 @@ pub(crate) fn begin_own_call(
             return false;
         }
     };
+    // See the identical note in `channel::handle_voice_record_start`.
+    let echo_ducking = if recorder.echo_cancelled() {
+        crate::settings::EchoDucking::Off
+    } else {
+        session.echo_ducking
+    };
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
     spawn_call_audio_worker(
         recorder,
@@ -226,6 +232,7 @@ pub(crate) fn begin_own_call(
         session.record_out_tx.clone(),
         ui_state.own_id,
         session.call_level_tx.clone(),
+        echo_ducking,
     );
     session.active_call = Some(ActiveCall {
         call_id,
@@ -260,12 +267,18 @@ fn spawn_call_audio_worker(
     // realistically reach.
     own_id: Option<UserId>,
     level_tx: tokio::sync::mpsc::UnboundedSender<(UserId, u8)>,
+    // `settings::Settings::voice_echo_ducking` - see `voice::EchoDucker`
+    // and, under `Auto`, `voice::EchoProbe`.
+    echo_ducking: crate::settings::EchoDucking,
 ) {
     std::thread::spawn(move || {
         let mut recipients: HashMap<UserId, DirectStreamKey> = HashMap::new();
         let mut muted = false;
         let mut host_muted = false;
         let mut seq: u32 = 0;
+        let mut ducker = voice::EchoDucker::new();
+        let mut probe = voice::EchoProbe::new();
+        let mut silence = voice::SilenceGate::new();
         'outer: loop {
             let mut pending_cmds = match cmd_rx.recv_timeout(voice::CHUNK_INTERVAL) {
                 Ok(cmd) => vec![cmd],
@@ -289,26 +302,57 @@ fn spawn_call_audio_worker(
                 }
             }
 
-            let pending = recorder.take_pending();
+            let mut pending = recorder.take_pending();
+            // Attenuated before anything else looks at it, so the meter,
+            // the silence gate and the wire all agree on what was
+            // captured - and so what the other side hears back from their
+            // own speakers is pushed under the noise floor
+            // (`voice::EchoDucker`).
+            if !pending.is_empty() {
+                let playback = voice::playback_level();
+                // Deliberately the *undicked* level, and deliberately not
+                // fed while muted: `voice::EchoProbe`'s doc explains why
+                // both would otherwise corrupt its evidence.
+                let duck = match echo_ducking {
+                    crate::settings::EchoDucking::Off => false,
+                    crate::settings::EchoDucking::On => true,
+                    crate::settings::EchoDucking::Auto => {
+                        if !muted && !host_muted {
+                            probe.observe(voice::level_from_pcm(&pending), playback);
+                        }
+                        probe.should_duck()
+                    }
+                };
+                if duck {
+                    ducker.process(&mut pending, playback);
+                }
+            }
+            let level = voice::level_from_pcm(&pending);
             // The meter reads what we are actually sending, so a muted
             // microphone reads flat zero rather than freezing at whatever
             // it happened to show when mute was pressed.
             if let Some(own_id) = own_id {
-                let level = if muted || host_muted {
-                    0
-                } else {
-                    voice::level_from_pcm(&pending)
-                };
-                let _ = level_tx.send((own_id, level));
+                let _ = level_tx.send((own_id, if muted || host_muted { 0 } else { level }));
             }
             if muted || host_muted || pending.is_empty() || recipients.is_empty() {
                 continue;
             }
-            let pcm = voice::pcm_to_bytes(&pending);
+            // Silence is not worth a packet to every participant. Unlike a
+            // voice message - which is a recording, and whose pauses are
+            // part of it - a call is a live stream, so a gap here is simply
+            // a moment nobody spoke (`voice::SilenceGate`).
+            let covered = std::time::Duration::from_millis(voice::samples_to_ms(
+                pending.len(),
+                voice::SAMPLE_RATE_HZ,
+            ));
+            if !silence.should_send(level, covered) {
+                continue;
+            }
+            let coded = voice::encode_voice_chunk(&pending);
             let per_recipient: Vec<(UserId, Vec<Vec<u8>>)> = recipients
                 .iter()
                 .filter_map(|(id, key)| {
-                    voice_stream::encrypt_direct_chunk(key, call_id, seq, &pcm).map(|b| (*id, b))
+                    voice_stream::encrypt_direct_chunk(key, call_id, seq, &coded).map(|b| (*id, b))
                 })
                 .collect();
             if !per_recipient.is_empty() {
@@ -347,8 +391,13 @@ fn spawn_call_decrypt_worker(
     std::thread::spawn(move || {
         let mut decryptor = ChunkDecryptor::new(key);
         let push =
-            |pcm: Vec<u8>, mixer_tx: &tokio::sync::mpsc::UnboundedSender<voice::MixerCmd>| {
-                let samples = voice::pcm_from_bytes(&pcm);
+            |chunk: Vec<u8>, mixer_tx: &tokio::sync::mpsc::UnboundedSender<voice::MixerCmd>| {
+                // Coded on the wire (`voice::VOICE_CODEC_ADPCM`); an
+                // undecodable chunk is dropped rather than metered or
+                // played, since this is network input.
+                let Some(samples) = voice::decode_voice_chunk(&chunk) else {
+                    return;
+                };
                 let _ = level_tx.send((peer, voice::level_from_pcm(&samples)));
                 let _ = mixer_tx.send(voice::MixerCmd::Push {
                     id: mixer_id,

@@ -235,12 +235,18 @@ pub(crate) async fn handle_voice_record_start(
                 recipient_pubkey_der,
             },
         );
+        let echo_ducking = if recorder.echo_cancelled() {
+        crate::settings::EchoDucking::Off
+    } else {
+        session.echo_ducking
+    };
         voice_stream::spawn_record_accumulate_worker(
             recorder,
             stream_id,
             session.own_stream_done_tx.clone(),
             stop_rx,
             session.auto_stop_tx.clone(),
+            echo_ducking,
         );
         return Ok(());
     }
@@ -283,6 +289,13 @@ pub(crate) async fn handle_voice_record_start(
     session
         .own_stream_targets
         .insert(stream_id, voice_stream::OwnStreamTarget::Direct(to));
+    // A device that cancels echo itself makes `voice::EchoDucker`
+    // redundant, and its attenuation is then pure cost to full duplex.
+    let echo_ducking = if recorder.echo_cancelled() {
+        crate::settings::EchoDucking::Off
+    } else {
+        session.echo_ducking
+    };
     voice_stream::spawn_record_stream_worker(
         recorder,
         voice_stream::StreamRecipients::Direct { to, key },
@@ -291,6 +304,7 @@ pub(crate) async fn handle_voice_record_start(
         session.own_stream_done_tx.clone(),
         stop_rx,
         session.auto_stop_tx.clone(),
+        echo_ducking,
     );
     Ok(())
 }

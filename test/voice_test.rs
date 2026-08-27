@@ -1,11 +1,51 @@
 use aloo::client::tui::ui::format_duration_label;
 use aloo::client::voice::{
-    CHUNK_INTERVAL, MAX_RECORDING_SAMPLES, MAX_RECORDING_SECS, SAMPLE_RATE_HZ, decode_wav_to_mono,
-    downmix_f32_to_mono_i16, downmix_i16_to_mono, end_chime_samples, level_from_pcm,
-    pcm_from_bytes, pcm_to_bytes,
-    recording_at_max, resample,
+    CHUNK_INTERVAL, DEVICE_BUFFER_MS, ECHO_DUCK_GAIN, ECHO_EVIDENCE_MIN_OBSERVATIONS, EchoDucker,
+    EchoProbe, JITTER_PREBUFFER_MAX_MS,
+    JITTER_PREBUFFER_MIN_MS, JITTER_QUEUE_SLACK_MS, MAX_RECORDING_SAMPLES, MAX_RECORDING_SECS,
+    MixSource, MixerCmd, SAMPLE_RATE_HZ, SILENCE_HANGOVER, SilenceGate, VOICE_CHUNK_HEADER_BYTES,
+    VOICE_CODEC_ADPCM, apply_mixer_cmd, decode_voice_chunk, decode_wav_to_mono, device_buffer_frames,
+    downmix_f32_to_mono_i16, downmix_i16_to_mono, encode_voice_chunk, end_chime_samples,
+    grown_prebuffer, is_echo_cancelling_device, jitter_ready_to_start, level_from_pcm,
+    level_from_sum_sq, mix_output,
+    ms_to_samples, overflow_drop_samples, pcm_from_bytes, pcm_to_bytes, recording_at_max, resample,
+    samples_to_ms,
 };
 use aloo::p2p_proto::SAFE_DATAGRAM_BYTES;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+/// A speech-like test signal: a tone at `freq` that a real capture could
+/// plausibly produce, used wherever a test needs audio with actual
+/// structure rather than silence or a constant.
+fn tone(freq: f64, amplitude: f64, samples: usize) -> Vec<i16> {
+    (0..samples)
+        .map(|k| {
+            (amplitude
+                * (2.0 * std::f64::consts::PI * freq * k as f64 / SAMPLE_RATE_HZ as f64).sin())
+                as i16
+        })
+        .collect()
+}
+
+/// Signal-to-noise ratio, in dB, of `coded` against `original`.
+fn snr_db(original: &[i16], coded: &[i16]) -> f64 {
+    let power: f64 = original.iter().map(|s| (*s as f64).powi(2)).sum();
+    let noise: f64 = original
+        .iter()
+        .zip(coded)
+        .map(|(a, b)| (*a as f64 - *b as f64).powi(2))
+        .sum();
+    10.0 * (power / noise.max(1.0)).log10()
+}
+
+/// Drives the mixer's realtime side for `frames` output frames, mono, at
+/// `SAMPLE_RATE_HZ` - everything `mix_output` does except owning a device.
+fn pump(sources: &Arc<Mutex<HashMap<u64, MixSource>>>, frames: usize) {
+    let mut out = vec![0i16; frames];
+    mix_output(&mut out, 1, SAMPLE_RATE_HZ, sources, &|_| {}, |s| s);
+}
 
 /// @requirement TB-148
 #[test]
@@ -342,4 +382,466 @@ fn level_from_pcm_reads_rms_loudness_clamped_to_a_hundred() {
         level_from_pcm(&spike) < full / 3,
         "a single spike reads far below the same amplitude held throughout"
     );
+}
+
+// ---------------------------------------------------------------------
+// Live chunk codec
+// ---------------------------------------------------------------------
+
+/// @requirement TB-270
+#[test]
+fn a_coded_chunk_round_trips_to_the_same_length_with_the_first_sample_exact() {
+    for count in [1usize, 2, 3, 240, 241] {
+        let samples = tone(300.0, 6000.0, count);
+        let coded = encode_voice_chunk(&samples);
+        let back = decode_voice_chunk(&coded).expect("our own encoder's output decodes");
+        assert_eq!(back.len(), samples.len(), "length must survive {count} samples");
+        // The first sample travels verbatim in the header, so it is the one
+        // sample per chunk that is never approximated.
+        assert_eq!(back[0], samples[0]);
+    }
+}
+
+/// @requirement TB-270
+#[test]
+fn a_coded_chunk_is_about_a_quarter_the_size_of_the_pcm_it_replaces() {
+    let samples = tone(300.0, 6000.0, ms_to_samples(15, SAMPLE_RATE_HZ));
+    let pcm = pcm_to_bytes(&samples);
+    let coded = encode_voice_chunk(&samples);
+    // 4 bits a sample plus a fixed header, against 16 bits a sample.
+    assert_eq!(coded.len(), VOICE_CHUNK_HEADER_BYTES + (samples.len() - 1).div_ceil(2));
+    assert!(
+        (pcm.len() as f64 / coded.len() as f64) > 3.5,
+        "{} bytes of PCM must code to under a third of it, got {}",
+        pcm.len(),
+        coded.len()
+    );
+}
+
+/// @requirement TB-271
+#[test]
+fn a_coded_chunk_reconstructs_speech_like_audio_faithfully() {
+    // Each chunk decodes standalone, so what matters is the quality of a
+    // chunk on its own - with no previous chunk's adaptation to inherit.
+    // Well above the ~15dB an unseeded start index produces (see
+    // `seed_step_index`), which is what this is really pinning.
+    for (freq, amplitude) in [(200.0, 8000.0), (400.0, 3000.0), (1000.0, 12000.0)] {
+        let samples = tone(freq, amplitude, ms_to_samples(15, SAMPLE_RATE_HZ));
+        let back = decode_voice_chunk(&encode_voice_chunk(&samples)).expect("decodes");
+        let snr = snr_db(&samples, &back);
+        assert!(snr > 25.0, "{freq}Hz at {amplitude} coded at only {snr:.1}dB SNR");
+    }
+}
+
+/// @requirement TB-272
+#[test]
+fn decoding_rejects_malformed_input_instead_of_panicking_or_inventing_audio() {
+    // Every one of these is something a hostile or broken peer can put on
+    // the wire once it holds the stream key.
+    assert_eq!(decode_voice_chunk(&[]), Some(Vec::new()));
+    assert_eq!(decode_voice_chunk(&[VOICE_CODEC_ADPCM]), None, "truncated header");
+    assert_eq!(decode_voice_chunk(&[VOICE_CODEC_ADPCM, 0, 1]), None, "truncated header");
+    assert_eq!(decode_voice_chunk(&[99, 0, 0, 0]), None, "unknown codec tag");
+    // A step index past the end of the step table - the field is used to
+    // index it, so an unchecked one would be an out-of-bounds panic.
+    assert_eq!(decode_voice_chunk(&[VOICE_CODEC_ADPCM, 89, 0, 0, 0x11]), None);
+    assert_eq!(decode_voice_chunk(&[VOICE_CODEC_ADPCM, 0x7f, 0, 0, 0x11]), None);
+    // A well-formed header with a body of arbitrary bytes is audio, however
+    // bad - every 4-bit code is a valid one - and must decode rather than fail.
+    assert!(decode_voice_chunk(&[VOICE_CODEC_ADPCM, 40, 0, 0, 0xff, 0x0a]).is_some());
+}
+
+/// @requirement TB-148
+#[test]
+fn a_coded_chunk_stays_far_inside_the_p2p_safe_datagram_budget() {
+    // TB-148's budget, recomputed for what actually goes on the wire now
+    // that chunks are coded rather than raw PCM (docs/PROTOCOL.md 7.3).
+    let samples = ms_to_samples(CHUNK_INTERVAL.as_millis() as usize as u64, SAMPLE_RATE_HZ);
+    let coded = encode_voice_chunk(&tone(300.0, 6000.0, samples));
+    // AES-256-GCM adds a fixed tag, not per-block expansion; 300 bytes of
+    // framing margin, the same allowance TB-148 makes.
+    assert!(
+        coded.len() + 16 + 300 < SAFE_DATAGRAM_BYTES,
+        "a {}-byte coded chunk must fit SAFE_DATAGRAM_BYTES {SAFE_DATAGRAM_BYTES}",
+        coded.len()
+    );
+}
+
+// ---------------------------------------------------------------------
+// Jitter buffer
+// ---------------------------------------------------------------------
+
+/// @requirement TB-273
+#[test]
+fn a_live_sources_backlog_is_trimmed_back_to_its_prebuffer_target() {
+    // The regression this exists for: without a ceiling, a queue that grows
+    // (a network stall clearing, a sender running fast) stays grown, and
+    // every sample behind it is played late for the rest of the call.
+    let mut src = MixSource::new();
+    src.extend(&vec![0i16; (SAMPLE_RATE_HZ * 2) as usize]);
+    let dropped = src.on_push(SAMPLE_RATE_HZ);
+    assert!(dropped > 0, "two seconds of backlog must be trimmed");
+    assert_eq!(
+        samples_to_ms(src.queued_samples(), SAMPLE_RATE_HZ),
+        src.prebuffer_ms(),
+        "what is left must be exactly the prebuffer target"
+    );
+    assert!(src.prebuffer_ms() <= JITTER_PREBUFFER_MAX_MS);
+}
+
+/// @requirement TB-273
+#[test]
+fn ordinary_burstiness_under_the_ceiling_is_left_alone() {
+    // Several chunks arriving in one scheduling slice is normal. Trimming
+    // that would chop audio continuously rather than bound a backlog.
+    let mut src = MixSource::new();
+    let under = JITTER_PREBUFFER_MIN_MS + JITTER_QUEUE_SLACK_MS;
+    src.extend(&vec![0i16; ms_to_samples(under, SAMPLE_RATE_HZ)]);
+    assert_eq!(src.on_push(SAMPLE_RATE_HZ), 0);
+    assert_eq!(src.queued_samples(), ms_to_samples(under, SAMPLE_RATE_HZ));
+}
+
+/// @requirement TB-274
+#[test]
+fn a_finished_clip_is_never_trimmed_however_long_it_is() {
+    // A received voice message is a recording, not a real-time stream: its
+    // queue is the message itself, so trimming it would cut audio out of
+    // something the user asked to hear.
+    let mut src = MixSource::new();
+    let whole = (SAMPLE_RATE_HZ * 30) as usize;
+    src.extend(&vec![0i16; whole]);
+    src.mark_finished();
+    assert_eq!(src.on_push(SAMPLE_RATE_HZ), 0);
+    assert_eq!(src.queued_samples(), whole);
+}
+
+/// @requirement TB-275
+#[test]
+fn overflow_is_measured_against_the_target_plus_slack_and_trims_to_the_target() {
+    let rate = SAMPLE_RATE_HZ;
+    let target = JITTER_PREBUFFER_MIN_MS;
+    let ceiling = target + JITTER_QUEUE_SLACK_MS;
+    assert_eq!(overflow_drop_samples(ms_to_samples(ceiling, rate), rate, target), 0);
+    let over = ms_to_samples(ceiling + 100, rate);
+    let dropped = overflow_drop_samples(over, rate, target);
+    assert_eq!(samples_to_ms(over - dropped, rate), target);
+}
+
+/// @requirement TB-276
+#[test]
+fn a_prebuffer_grows_on_an_underrun_and_stops_at_the_ceiling() {
+    let mut at = JITTER_PREBUFFER_MIN_MS;
+    let mut steps = 0;
+    while at < JITTER_PREBUFFER_MAX_MS {
+        at = grown_prebuffer(at);
+        steps += 1;
+        assert!(steps < 100, "growth must terminate");
+    }
+    assert_eq!(at, JITTER_PREBUFFER_MAX_MS);
+    assert_eq!(grown_prebuffer(JITTER_PREBUFFER_MAX_MS), JITTER_PREBUFFER_MAX_MS);
+}
+
+/// @requirement TB-276
+#[test]
+fn a_finished_source_never_waits_for_a_prebuffer_it_will_never_fill() {
+    // A whole clip, or a live stream whose end already arrived: there is no
+    // more audio coming, so waiting for more is waiting forever.
+    assert!(jitter_ready_to_start(0, Duration::ZERO, true, JITTER_PREBUFFER_MAX_MS));
+    assert!(!jitter_ready_to_start(0, Duration::ZERO, false, JITTER_PREBUFFER_MIN_MS));
+    assert!(jitter_ready_to_start(
+        JITTER_PREBUFFER_MIN_MS,
+        Duration::ZERO,
+        false,
+        JITTER_PREBUFFER_MIN_MS
+    ));
+    // ... and a live one starts anyway rather than sitting on audio forever
+    // if its sender went quiet mid-fill.
+    assert!(jitter_ready_to_start(1, Duration::from_secs(1), false, JITTER_PREBUFFER_MAX_MS));
+}
+
+/// @requirement TB-277
+#[test]
+fn a_starved_live_source_rebuilds_a_larger_prebuffer_before_it_plays_again() {
+    let sources: Arc<Mutex<HashMap<u64, MixSource>>> = Arc::new(Mutex::new(HashMap::new()));
+    let filled = ms_to_samples(JITTER_PREBUFFER_MIN_MS, SAMPLE_RATE_HZ);
+    apply_mixer_cmd(
+        &sources,
+        SAMPLE_RATE_HZ,
+        MixerCmd::Push { id: 1, samples: vec![1000; filled] },
+    );
+    // Ask for more than it has: it plays what there is, then starves.
+    pump(&sources, filled + 64);
+
+    let map = sources.lock().unwrap();
+    let src = map.get(&1).expect("a live source is never retired by starving");
+    assert!(!src.started(), "a starved source goes back to waiting");
+    assert_eq!(
+        src.prebuffer_ms(),
+        grown_prebuffer(JITTER_PREBUFFER_MIN_MS),
+        "and asks for more headroom before the next talk spurt"
+    );
+}
+
+/// @requirement TB-277
+#[test]
+fn a_finished_source_drains_completely_and_is_then_retired() {
+    let sources: Arc<Mutex<HashMap<u64, MixSource>>> = Arc::new(Mutex::new(HashMap::new()));
+    let clip = tone(300.0, 6000.0, 800);
+    apply_mixer_cmd(&sources, SAMPLE_RATE_HZ, MixerCmd::Push { id: 7, samples: clip.clone() });
+    apply_mixer_cmd(&sources, SAMPLE_RATE_HZ, MixerCmd::Finish { id: 7 });
+
+    let mut out = vec![0i16; clip.len()];
+    mix_output(&mut out, 1, SAMPLE_RATE_HZ, &sources, &|_| {}, |s| s);
+    // Every sample of the clip came out, in order, none trimmed.
+    assert_eq!(out, clip);
+    pump(&sources, 1);
+    assert!(sources.lock().unwrap().is_empty(), "a drained clip is retired");
+}
+
+// ---------------------------------------------------------------------
+// Echo ducking and silence suppression
+// ---------------------------------------------------------------------
+
+/// @requirement TB-278
+#[test]
+fn the_ducker_attenuates_capture_while_the_speakers_are_playing() {
+    let mut ducker = EchoDucker::new();
+    for _ in 0..60 {
+        ducker.process(&mut vec![10_000i16; 240], 80);
+    }
+    assert!(
+        (ducker.gain() - ECHO_DUCK_GAIN).abs() < 0.01,
+        "settled gain {} should be ECHO_DUCK_GAIN",
+        ducker.gain()
+    );
+    let mut captured = vec![10_000i16; 240];
+    ducker.process(&mut captured, 80);
+    assert!(
+        captured.iter().all(|s| *s < 2_000),
+        "captured audio must actually be attenuated, not merely tracked"
+    );
+}
+
+/// @requirement TB-278
+#[test]
+fn the_ducker_leaves_capture_untouched_when_nothing_is_playing() {
+    let mut ducker = EchoDucker::new();
+    let mut captured = vec![10_000i16; 240];
+    ducker.process(&mut captured, 0);
+    assert_eq!(captured, vec![10_000i16; 240]);
+    assert_eq!(ducker.gain(), 1.0);
+}
+
+/// @requirement TB-278
+#[test]
+fn the_ducker_comes_back_to_full_gain_once_the_speakers_go_quiet() {
+    let mut ducker = EchoDucker::new();
+    for _ in 0..60 {
+        ducker.process(&mut vec![10_000i16; 240], 80);
+    }
+    for _ in 0..400 {
+        ducker.process(&mut vec![10_000i16; 240], 0);
+    }
+    assert!(ducker.gain() > 0.99, "gain stuck at {}", ducker.gain());
+    // Release is deliberately slower than attack - arriving late costs a
+    // burst of echo, leaving late costs a quiet syllable.
+    let mut attack = EchoDucker::new();
+    attack.process(&mut vec![0i16; 240], 80);
+    let ducked = 1.0 - attack.gain();
+    let mut release = EchoDucker::new();
+    for _ in 0..60 {
+        release.process(&mut vec![0i16; 240], 80);
+    }
+    let before = release.gain();
+    release.process(&mut vec![0i16; 240], 0);
+    assert!(release.gain() - before < ducked);
+}
+
+/// @requirement TB-279
+#[test]
+fn the_silence_gate_sends_speech_holds_through_a_pause_and_then_stops() {
+    let mut gate = SilenceGate::new();
+    // Nothing has been said yet: nothing to send.
+    assert!(!gate.should_send(0, CHUNK_INTERVAL));
+    assert!(gate.should_send(50, CHUNK_INTERVAL));
+    // The quiet moments inside speech must not cut the stream, or the
+    // receiver spends the conversation rebuilding its prebuffer.
+    let mut held = 0;
+    while gate.should_send(0, CHUNK_INTERVAL) {
+        held += 1;
+        assert!(held < 1000, "the hangover must expire");
+    }
+    assert_eq!(
+        held as u128,
+        SILENCE_HANGOVER.as_millis() / CHUNK_INTERVAL.as_millis()
+    );
+    // Speaking again re-arms it in full.
+    assert!(gate.should_send(50, CHUNK_INTERVAL));
+    assert!(gate.should_send(0, CHUNK_INTERVAL));
+}
+
+// ---------------------------------------------------------------------
+// Device buffering
+// ---------------------------------------------------------------------
+
+/// @requirement TB-280
+#[test]
+fn a_device_period_is_asked_for_explicitly_and_clamped_to_what_it_supports() {
+    // 20ms at the device's own rate, which is the whole point: the default
+    // period is what put tens to hundreds of milliseconds in the path.
+    assert_eq!(device_buffer_frames(48_000, Some((64, 4096))), Some(960));
+    assert_eq!(device_buffer_frames(SAMPLE_RATE_HZ, Some((64, 4096))), Some(320));
+    assert_eq!(
+        device_buffer_frames(48_000, Some((64, 4096))),
+        Some(48_000 * DEVICE_BUFFER_MS / 1000)
+    );
+    // Clamped rather than refused, either way.
+    assert_eq!(device_buffer_frames(48_000, Some((2048, 4096))), Some(2048));
+    assert_eq!(device_buffer_frames(48_000, Some((64, 256))), Some(256));
+    // A device that publishes no range at all is left on its own default
+    // rather than handed a number it may reject.
+    assert_eq!(device_buffer_frames(48_000, None), None);
+}
+
+/// @requirement TB-208
+#[test]
+fn a_level_read_from_a_running_sum_matches_one_read_from_the_samples() {
+    for samples in [tone(300.0, 6000.0, 240), tone(120.0, 500.0, 240), vec![0i16; 240]] {
+        let sum_sq: u64 = samples.iter().map(|s| (*s as i64 * *s as i64) as u64).sum();
+        assert_eq!(
+            level_from_sum_sq(sum_sq, samples.len() as u64),
+            level_from_pcm(&samples)
+        );
+    }
+    assert_eq!(level_from_sum_sq(0, 0), 0);
+}
+
+/// @requirement TB-281
+#[test]
+fn an_echo_cancelling_capture_device_is_recognised_by_name_and_nothing_else_is() {
+    // What PulseAudio/PipeWire's module-echo-cancel and the drivers that
+    // expose a cancelled endpoint actually call themselves.
+    assert!(is_echo_cancelling_device("echo-cancel-source"));
+    assert!(is_echo_cancelling_device("Echo-Cancel Source"));
+    assert!(is_echo_cancelling_device("echocancel"));
+    assert!(is_echo_cancelling_device("Built-in Audio (echo cancelled)"));
+    // Narrow enough that it cannot select a device the user did not mean.
+    assert!(!is_echo_cancelling_device("Built-in Audio Analog Stereo"));
+    assert!(!is_echo_cancelling_device("HD Webcam C920"));
+    assert!(!is_echo_cancelling_device("default"));
+    assert!(!is_echo_cancelling_device(""));
+}
+
+// ---------------------------------------------------------------------
+// Deciding whether there is an echo path at all
+// ---------------------------------------------------------------------
+
+/// Feeds the probe `rounds` alternating talk spurts: the far end talking
+/// (during which our microphone also reads `echo_leak` louder, if there is
+/// an echo path), then quiet.
+///
+/// `own_speech` is spread evenly across both kinds of spurt, which is the
+/// assumption the whole design rests on - we talk without regard to whose
+/// turn it is, so our own voice raises both averages and drops out of the
+/// difference between them. A test that put it disproportionately in one
+/// population would be measuring the helper, not the probe.
+fn observe_conversation(probe: &mut EchoProbe, rounds: usize, echo_leak: u8, own_speech: u8) {
+    let spurt = ECHO_EVIDENCE_MIN_OBSERVATIONS as usize / 4 + 1;
+    for _ in 0..rounds {
+        for i in 0..spurt {
+            let mine = if i % 2 == 0 { own_speech } else { 0 };
+            probe.observe(20 + mine + echo_leak, 60);
+        }
+        for i in 0..spurt {
+            let mine = if i % 2 == 0 { own_speech } else { 0 };
+            probe.observe(20 + mine, 0);
+        }
+    }
+}
+
+/// @requirement TB-282
+#[test]
+fn the_probe_ducks_until_it_has_evidence_either_way() {
+    // The safe assumption before there is evidence is the one whose failure
+    // everyone else in the call hears, rather than only us.
+    let mut probe = EchoProbe::new();
+    assert!(probe.should_duck());
+    // A handful of chunks is not evidence, whatever they say.
+    for _ in 0..8 {
+        probe.observe(20, 0);
+    }
+    assert!(probe.should_duck());
+    // Nor is a long run of only one of the two populations - a call where
+    // the far end has not spoken yet says nothing about the room.
+    for _ in 0..(ECHO_EVIDENCE_MIN_OBSERVATIONS * 4) {
+        probe.observe(20, 0);
+    }
+    assert!(probe.should_duck());
+}
+
+/// @requirement TB-282
+#[test]
+fn the_probe_releases_on_headphones_where_the_microphone_hears_nothing() {
+    let mut probe = EchoProbe::new();
+    observe_conversation(&mut probe, 12, 0, 25);
+    assert!(
+        !probe.should_duck(),
+        "no echo leak should release ducking, excess was {}",
+        probe.excess_level()
+    );
+    assert!(probe.excess_level().abs() < 2.0);
+}
+
+/// @requirement TB-282
+#[test]
+fn the_probe_keeps_ducking_on_speakers_where_the_microphone_hears_them() {
+    let mut probe = EchoProbe::new();
+    observe_conversation(&mut probe, 12, 15, 25);
+    assert!(
+        probe.should_duck(),
+        "an audible echo path must hold ducking on, excess was {}",
+        probe.excess_level()
+    );
+    assert!(probe.excess_level() > 4.0);
+}
+
+/// @requirement TB-282
+#[test]
+fn the_probe_re_engages_when_headphones_come_out_mid_call() {
+    // The case no setting can handle: the room changes while the call runs.
+    let mut probe = EchoProbe::new();
+    observe_conversation(&mut probe, 12, 0, 25);
+    assert!(!probe.should_duck());
+    observe_conversation(&mut probe, 30, 20, 25);
+    assert!(
+        probe.should_duck(),
+        "unplugging headphones must bring ducking back, excess was {}",
+        probe.excess_level()
+    );
+}
+
+/// @requirement TB-282
+#[test]
+fn the_probes_decision_has_hysteresis_so_it_cannot_flap() {
+    // Between the release and engage thresholds the answer must be whatever
+    // it already was, or a room sitting near the boundary would toggle the
+    // microphone's gain every chunk.
+    let mut ducking = EchoProbe::new();
+    observe_conversation(&mut ducking, 12, 15, 0);
+    assert!(ducking.should_duck());
+
+    let mut released = EchoProbe::new();
+    observe_conversation(&mut released, 12, 0, 0);
+    assert!(!released.should_duck());
+
+    // Same borderline evidence fed to both - they must disagree, each
+    // keeping its own prior answer.
+    for _ in 0..(ECHO_EVIDENCE_MIN_OBSERVATIONS * 4) {
+        ducking.observe(23, 60);
+        ducking.observe(20, 0);
+        released.observe(23, 60);
+        released.observe(20, 0);
+    }
+    assert!(ducking.should_duck(), "excess {}", ducking.excess_level());
+    assert!(!released.should_duck(), "excess {}", released.excess_level());
 }

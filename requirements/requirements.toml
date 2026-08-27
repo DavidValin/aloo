@@ -831,6 +831,66 @@ description = "An incoming voice stream is independently force-finalized with wh
 evidence = "docs/PROTOCOL.md 7.3; src/client/voice_stream.rs spawn_stream_decrypt_worker; test recording_at_max_triggers_exactly_at_the_boundary_not_before"
 
 [[user_story.technical_behavior]]
+id = "TB-270"
+description = "A live voice chunk travels coded (voice::VOICE_CODEC_ADPCM, IMA ADPCM at 4 bits a sample) rather than as raw PCM, decoding back to the same sample count with the chunk's first sample reproduced exactly, at roughly a quarter the bytes. Each chunk carries its own predictor and step index so it decodes standalone - chunks travel unreliably, and one that is lost or reordered must not corrupt every chunk after it."
+evidence = "docs/PROTOCOL.md 7.3; src/client/voice.rs encode_voice_chunk, decode_voice_chunk, VOICE_CHUNK_HEADER_BYTES; tests a_coded_chunk_round_trips_to_the_same_length_with_the_first_sample_exact, a_coded_chunk_is_about_a_quarter_the_size_of_the_pcm_it_replaces"
+
+[[user_story.technical_behavior]]
+id = "TB-271"
+description = "A chunk's ADPCM step index starts from the chunk's own average sample-to-sample movement rather than from the bottom of the step table, so a standalone chunk does not spend its first samples climbing - worth roughly 16dB of SNR on speech-like input, and free, since the header already had to carry the index for the decoder."
+evidence = "src/client/voice.rs seed_step_index; test a_coded_chunk_reconstructs_speech_like_audio_faithfully"
+
+[[user_story.technical_behavior]]
+id = "TB-272"
+description = "Chunk decoding rejects malformed input - a truncated header, an unknown codec tag, a step index past the end of the step table - rather than panicking or producing audio from it, since a peer holding the stream key can put any of it on the wire. A well-formed header with an arbitrary body is audio, however bad, and decodes."
+evidence = "src/client/voice.rs decode_voice_chunk; test decoding_rejects_malformed_input_instead_of_panicking_or_inventing_audio"
+
+[[user_story.technical_behavior]]
+id = "TB-273"
+description = "A live playback source's queue is trimmed back to its prebuffer target once it passes that target plus JITTER_QUEUE_SLACK_MS, dropping the oldest audio. Whatever sits in that queue is the delay the listener hears, and without a ceiling it only ever grows: every network stall, scheduling hiccup or crystal drift between two sound cards adds to it and nothing takes it away. Burstiness under the ceiling - several chunks arriving in one scheduling slice, which is normal - is left alone rather than trimmed continuously."
+evidence = "src/client/voice.rs MixSource::on_push, overflow_drop_samples, apply_mixer_cmd; tests a_live_sources_backlog_is_trimmed_back_to_its_prebuffer_target, ordinary_burstiness_under_the_ceiling_is_left_alone"
+
+[[user_story.technical_behavior]]
+id = "TB-274"
+description = "A finished source - a received voice message being replayed, or a live stream whose StreamEnd already arrived - is exempt from every part of the jitter buffer's latency management: never trimmed however long it is, and never made to wait for a prebuffer. It is a recording rather than a real-time stream, so its queue is the message itself and not accumulated delay, and trimming it would cut audio out of something the user asked to hear."
+evidence = "src/client/voice.rs MixSource::on_push's finished guard, jitter_ready_to_start; tests a_finished_clip_is_never_trimmed_however_long_it_is, a_finished_source_never_waits_for_a_prebuffer_it_will_never_fill, a_finished_source_drains_completely_and_is_then_retired"
+
+[[user_story.technical_behavior]]
+id = "TB-275"
+description = "overflow_drop_samples drops nothing at or below the prebuffer target plus JITTER_QUEUE_SLACK_MS, and above it drops exactly enough to bring the queue back to the target."
+evidence = "src/client/voice.rs overflow_drop_samples; test overflow_is_measured_against_the_target_plus_slack_and_trims_to_the_target"
+
+[[user_story.technical_behavior]]
+id = "TB-276"
+description = "A source's prebuffer target is adaptive rather than a fixed worst case: it starts at JITTER_PREBUFFER_MIN_MS, grows by JITTER_PREBUFFER_GROWTH_MS on each underrun up to JITTER_PREBUFFER_MAX_MS and no further, and gives back JITTER_PREBUFFER_DECAY_MS after each JITTER_DECAY_INTERVAL of clean playback. A live source that has waited JITTER_MAX_WAIT_MS starts anyway rather than sitting on audio whose sender went quiet mid-fill."
+evidence = "src/client/voice.rs JITTER_PREBUFFER_MIN_MS/MAX_MS, grown_prebuffer, decayed_prebuffer, jitter_ready_to_start; tests a_prebuffer_grows_on_an_underrun_and_stops_at_the_ceiling, a_finished_source_never_waits_for_a_prebuffer_it_will_never_fill"
+
+[[user_story.technical_behavior]]
+id = "TB-277"
+description = "A started live source that runs out of audio is put back to waiting with a grown prebuffer target rather than left started, so the next talk spurt refills before it plays instead of stuttering through - and is never retired for it, unlike a finished source, which drains completely, in order, and is then retired."
+evidence = "src/client/voice.rs MixSource::note_underrun, mix_output; tests a_starved_live_source_rebuilds_a_larger_prebuffer_before_it_plays_again, a_finished_source_drains_completely_and_is_then_retired"
+
+[[user_story.technical_behavior]]
+id = "TB-278"
+description = "When ducking is in force (TB-282 decides that under auto), captured audio is attenuated to ECHO_DUCK_GAIN while the speakers are playing above ECHO_DUCK_TRIGGER_LEVEL and left untouched otherwise, ramped across each chunk rather than stepped between them, ducking in several times faster than it comes back out. Attenuation rather than a gate, so someone talking over the other side is still audible; applied to live calls and push-to-talk voice messages alike, since both capture through the same microphone while the same speakers play."
+evidence = "docs/SPEC.md Functionality #4 'Echo'; src/client/voice.rs EchoDucker, publish_playback_level, mix_output; src/client/voice_call.rs spawn_call_audio_worker; src/client/voice_stream.rs spawn_record_stream_worker; tests the_ducker_attenuates_capture_while_the_speakers_are_playing, the_ducker_leaves_capture_untouched_when_nothing_is_playing, the_ducker_comes_back_to_full_gain_once_the_speakers_go_quiet"
+
+[[user_story.technical_behavior]]
+id = "TB-282"
+description = "Under voice_echo_ducking=auto, whether an echo path exists is measured rather than declared: the microphone's own level is averaged separately over the chunks where the far end is talking and the chunks where it is not, and the difference between those two averages is what decides. Our own speech lands in both populations (we do not arrange our talking around theirs) and so drops out of the difference. Detection works on envelopes at chunk resolution, where no sample alignment between the two device clocks is needed - which is why detecting an echo path is tractable in pure Rust while cancelling one is not. The probe starts out ducking and needs ECHO_EVIDENCE_MIN_OBSERVATIONS of each kind before it will conclude anything, so a call where the far end has not spoken yet decides nothing; the engage and release thresholds differ, so a room sitting near the boundary keeps its previous answer instead of toggling every chunk; and it re-engages by itself when the room changes mid-call, which no setting can do. It must be fed the capture level from before EchoDucker attenuated it and not fed at all while muted - either would let ducking suppress the evidence it is judged by and turn the decision into a feedback loop."
+evidence = "docs/SPEC.md Functionality #4 'Echo'; src/client/voice.rs EchoProbe, ECHO_EVIDENCE_ENGAGE/RELEASE/MIN_OBSERVATIONS; src/client/voice_stream.rs duck_capture; src/client/voice_call.rs spawn_call_audio_worker; tests the_probe_ducks_until_it_has_evidence_either_way, the_probe_releases_on_headphones_where_the_microphone_hears_nothing, the_probe_keeps_ducking_on_speakers_where_the_microphone_hears_them, the_probe_re_engages_when_headphones_come_out_mid_call, the_probes_decision_has_hysteresis_so_it_cannot_flap"
+
+[[user_story.technical_behavior]]
+id = "TB-280"
+description = "Both audio backends ask for a DEVICE_BUFFER_MS period explicitly instead of taking the device's default - a default ALSA period is commonly tens of milliseconds and a default pa_simple playback target latency far more, and both sit directly between someone speaking and someone hearing it. The frame count is clamped into the range the device supports; a device publishing no range at all is left on its own default rather than handed a number it may reject, and cpal falls back to that default if a fixed size is refused."
+evidence = "src/client/voice.rs DEVICE_BUFFER_MS, device_buffer_frames, build_with_buffer_fallback; src/client/voice_pulse.rs playback_attr, capture_attr; test a_device_period_is_asked_for_explicitly_and_clamped_to_what_it_supports"
+
+[[user_story.technical_behavior]]
+id = "TB-281"
+description = "A capture device whose name says it cancels echo (module-echo-cancel's source, or a driver exposing a cancelled endpoint) is preferred over the ordinary device choice, and turns EchoDucker off for that recording - real cancellation solves what ducking only mitigates, and solves it without costing full duplex. The name match is narrow enough that it cannot select a device the user did not mean."
+evidence = "src/client/voice.rs is_echo_cancelling_device, preferred_input_device, Recorder::echo_cancelled; src/client/voice_pulse.rs PULSE_ECHO_CANCEL_SOURCE fallback; test an_echo_cancelling_capture_device_is_recognised_by_name_and_nothing_else_is"
+
+[[user_story.technical_behavior]]
 id = "TB-236"
 description = "An incoming voice stream that has gone quiet past STREAM_IDLE_TIMEOUT is asked to end exactly once (its worker then finalizes the row from whatever partial audio arrived and its report removes the entry). A stream still there after that ask, whose worker has gone without answering, is given up on: the sweep closes the row itself, so a placeholder can never blink 'streaming...' for the rest of the session and the entry cannot leak. A stream still receiving, or one already asked whose worker is still there, is left alone."
 evidence = "docs/PROTOCOL.md 7.3; src/client/voice_stream.rs IdleStreamAction, idle_stream_action, ActiveStream::end_requested; src/client/session.rs sweep_idle_streams; tests a_stream_that_is_still_arriving_is_never_swept, a_quiet_stream_is_asked_to_end_exactly_once, a_stream_whose_worker_is_gone_is_given_up_on"
@@ -2226,6 +2286,11 @@ description = "On first run, ~/.aloo/settings doesn't exist yet - aloo creates i
 evidence = "docs/SPEC.md Functionality #4; tests default_path_resolves_under_the_aloo_dir, missing_file_is_created_with_documented_defaults, round_trips_through_save_and_load"
 
 [[user_story.acceptance_criteria]]
+id = "AC-396"
+description = "voice_echo_ducking is auto by default, with on/off forcing it either way; on/off accept the same spellings as every other switch in the file, and an unreadable value falls back to auto rather than silently to off. Under auto, whether the microphone is attenuated is decided from the audio itself (TB-282) rather than from what the user declared, so it is right on speakers and on headphones without being told which. A capture device that cancels echo itself overrides all three (TB-281)."
+evidence = "docs/SPEC.md Functionality #4 'Echo'; src/settings.rs EchoDucking, Settings::voice_echo_ducking; src/client/session.rs SessionState::echo_ducking; src/client/voice_stream.rs duck_capture; test echo_ducking_decides_for_itself_by_default_and_can_be_forced_either_way"
+
+[[user_story.acceptance_criteria]]
 id = "AC-089"
 description = "Holding the global shortcut starts streaming a voice message to whatever is currently active - the selected channel, or an open private room - the same as holding Space; releasing it stops. Works regardless of this app's own terminal focus."
 evidence = "docs/SPEC.md Functionality #4; tests global_record_start_and_stop_streams_to_the_active_channel, global_record_start_targets_the_active_private_room; scenarios in features/voice/global_push_to_talk.feature"
@@ -2726,6 +2791,11 @@ evidence = "docs/SPEC.md 'Live voice calls'; src/client/tui/ui.rs CALL_ALREADY_E
 id = "TB-199"
 description = "CallInvite, CallAccept, CallReject and CallEnd (the live-call signaling family) round-trip through bincode encode/decode intact, addressed point-to-point like the file-transfer message family."
 evidence = "docs/PROTOCOL.md 'Live voice calls'; src/p2p_proto.rs P2pPayload::CallInvite/CallAccept/CallReject/CallEnd; test live_call_message_family_roundtrips"
+
+[[user_story.technical_behavior]]
+id = "TB-279"
+description = "A call's capture stops sending once it has been below SILENCE_LEVEL for SILENCE_HANGOVER, and resumes the moment it is not - silence is not worth a packet to every participant of a mesh call. The hangover is what keeps the quiet moments inside speech (the closure before a plosive, the gap between words) from cutting the stream and making the receiver rebuild its prebuffer repeatedly. Deliberately not applied to a push-to-talk voice message: that is a recording the receiver reassembles chunk by chunk, so dropping its silence would shorten the message and pull the audio either side of a pause together."
+evidence = "docs/SPEC.md 'Live voice calls'; src/client/voice.rs SilenceGate, SILENCE_LEVEL, SILENCE_HANGOVER; src/client/voice_call.rs spawn_call_audio_worker; test the_silence_gate_sends_speech_holds_through_a_pause_and_then_stops"
 
 [[user_story.technical_behavior]]
 id = "TB-207"

@@ -123,6 +123,12 @@ pub struct SessionState {
     /// local concept with no wire meaning - shared by history replay and
     /// every incoming stream's decrypt worker.
     pub(crate) next_mixer_id: u64,
+    /// `settings::Settings::voice_echo_ducking`, read once at startup and
+    /// handed to every capture worker started afterwards
+    /// (`voice_stream::spawn_record_stream_worker`,
+    /// `voice_call::spawn_call_audio_worker`) - the setting file is not
+    /// re-read per recording.
+    pub(crate) echo_ducking: crate::settings::EchoDucking,
     pub(crate) own_stream_targets: HashMap<u64, voice_stream::OwnStreamTarget>,
     pub(crate) active_streams: HashMap<(UserId, u64), voice_stream::ActiveStream>,
     /// Voice chunks that outran their own `StreamStart` - see
@@ -627,6 +633,7 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
         active_recording: None,
         next_stream_id: 1,
         next_mixer_id: 1,
+        echo_ducking: settings.voice_echo_ducking,
         own_stream_targets: HashMap::new(),
         active_streams: HashMap::new(),
         pending_stream_chunks: voice_stream::PendingChunkBuffer::new(),
@@ -1482,12 +1489,18 @@ async fn handle_ui_action(
                             session
                                 .own_stream_targets
                                 .insert(stream_id, voice_stream::OwnStreamTarget::MailAttachment);
+                            let echo_ducking = if recorder.echo_cancelled() {
+                                crate::settings::EchoDucking::Off
+                            } else {
+                                session.echo_ducking
+                            };
                             voice_stream::spawn_record_accumulate_worker(
                                 recorder,
                                 stream_id,
                                 session.own_stream_done_tx.clone(),
                                 stop_rx,
                                 session.auto_stop_tx.clone(),
+                                echo_ducking,
                             );
                         }
                     }
@@ -4949,6 +4962,7 @@ impl SessionState {
             active_recording: None,
             next_stream_id: 1,
             next_mixer_id: 1,
+            echo_ducking: crate::settings::EchoDucking::default(),
             own_stream_targets: HashMap::new(),
             active_streams: HashMap::new(),
             pending_stream_chunks: voice_stream::PendingChunkBuffer::new(),

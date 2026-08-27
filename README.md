@@ -20,7 +20,7 @@ Just you, your terminal, and the people you're talking to.
 
 - 🎙️ **Walkie-talkie voice messages** — hold a key, talk, release. It plays live on the other end as you speak, and stays in the log to replay.
 - 🔇 **Mute one person's voice** — stop one person's clips playing themselves, without blocking them or losing anything.
-- 📞 **Live voice calls** — continuous, multi-user calls with a roster, per-person voice meters and host mute — distinct from a walkie-talkie clip.
+- 📞 **Live voice calls** — continuous, multi-user calls with a roster, per-person voice meters and host mute — distinct from a walkie-talkie clip. Echo is handled without you configuring anything: aloo uses your system's echo-cancelling microphone if it has one, and otherwise works out from the audio itself whether your microphone can hear your speakers — ducking it only if it can, so headphones stay full duplex and get it right even if you plug them in mid-call.
 - 💬 **Text chat** — type and hit Enter, just like any chat app.
 - ✅ **Delivery acknowledgments** — the arrow in `you -> message` says how far it got: grey, orange, green. `i` shows who has it, and who has heard or saved it.
 - 📎 **File transfer, with consent** — a built-in file browser, and nothing moves until the recipient accepts. No size cap.

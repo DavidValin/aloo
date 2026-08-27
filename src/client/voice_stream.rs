@@ -418,6 +418,36 @@ fn stream_recipient_ids(target: &StreamRecipients) -> Vec<UserId> {
 /// doubles as sleep and wake-on-release signal (tokio channels have no
 /// blocking-with-timeout usable from a plain thread), which also means
 /// release is reflected almost instantly.
+/// Applies `mode` to one captured chunk, in place. Shared by both record
+/// workers so a voice message ducks exactly the way a call does.
+///
+/// Under `Auto` the probe is fed the level of what was captured *before*
+/// any attenuation - see `voice::EchoProbe`, where getting that backwards
+/// is the difference between a decision and a feedback loop.
+fn duck_capture(
+    pending: &mut [i16],
+    mode: crate::settings::EchoDucking,
+    ducker: &mut voice::EchoDucker,
+    probe: &mut voice::EchoProbe,
+) {
+    if pending.is_empty() {
+        return;
+    }
+    let playback = voice::playback_level();
+    let duck = match mode {
+        crate::settings::EchoDucking::Off => false,
+        crate::settings::EchoDucking::On => true,
+        crate::settings::EchoDucking::Auto => {
+            probe.observe(voice::level_from_pcm(pending), playback);
+            probe.should_duck()
+        }
+    };
+    if duck {
+        ducker.process(pending, playback);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_record_stream_worker(
     recorder: voice::Recorder,
     target: StreamRecipients,
@@ -432,11 +462,16 @@ pub(crate) fn spawn_record_stream_worker(
     // any other stop, instead of leaving the UI claiming to still be
     // recording until the next release event.
     auto_stop_tx: tokio::sync::mpsc::UnboundedSender<()>,
+    // `settings::Settings::voice_echo_ducking` - see `voice::EchoDucker`
+    // and, under `Auto`, `voice::EchoProbe`.
+    echo_ducking: crate::settings::EchoDucking,
 ) {
     std::thread::spawn(move || {
         let mut seq: u32 = 0;
         let mut total_samples: u64 = 0;
         let mut plaintext_accum: Vec<u8> = Vec::new();
+        let mut ducker = voice::EchoDucker::new();
+        let mut probe = voice::EchoProbe::new();
 
         loop {
             let mut stopped = match stop_rx.recv_timeout(voice::CHUNK_INTERVAL) {
@@ -445,13 +480,20 @@ pub(crate) fn spawn_record_stream_worker(
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => true,
             };
 
-            let pending = recorder.take_pending();
+            let mut pending = recorder.take_pending();
             if !pending.is_empty() {
+                // Recording a voice message while someone else's audio is
+                // coming out of the speakers otherwise captures it and
+                // sends it back to them - the same echo path a call has,
+                // for the same reason.
+                duck_capture(&mut pending, echo_ducking, &mut ducker, &mut probe);
                 total_samples += pending.len() as u64;
-                let pcm = voice::pcm_to_bytes(&pending);
-                plaintext_accum.extend_from_slice(&pcm);
+                // The accumulated clip stays PCM (it becomes the replayable
+                // message); only what goes on the wire is coded.
+                plaintext_accum.extend_from_slice(&voice::pcm_to_bytes(&pending));
 
-                let per_recipient = build_chunk_recipients(&target, stream_id, seq, &pcm);
+                let coded = voice::encode_voice_chunk(&pending);
+                let per_recipient = build_chunk_recipients(&target, stream_id, seq, &coded);
                 let msg = match &target {
                     StreamRecipients::Channel { .. } => {
                         Some(crate::client::p2p::P2pOutbound::ChannelVoiceChunk {
@@ -514,10 +556,16 @@ pub(crate) fn spawn_record_accumulate_worker(
     done_tx: tokio::sync::mpsc::UnboundedSender<(u64, u32, Vec<u8>)>,
     stop_rx: std::sync::mpsc::Receiver<()>,
     auto_stop_tx: tokio::sync::mpsc::UnboundedSender<()>,
+    // As `spawn_record_stream_worker` - a recording made under OTP, or for
+    // a mail attachment, is captured through the same microphone while the
+    // same speakers are playing.
+    echo_ducking: crate::settings::EchoDucking,
 ) {
     std::thread::spawn(move || {
         let mut total_samples: u64 = 0;
         let mut plaintext_accum: Vec<u8> = Vec::new();
+        let mut ducker = voice::EchoDucker::new();
+        let mut probe = voice::EchoProbe::new();
 
         loop {
             let mut stopped = match stop_rx.recv_timeout(voice::CHUNK_INTERVAL) {
@@ -526,8 +574,9 @@ pub(crate) fn spawn_record_accumulate_worker(
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => true,
             };
 
-            let pending = recorder.take_pending();
+            let mut pending = recorder.take_pending();
             if !pending.is_empty() {
+                duck_capture(&mut pending, echo_ducking, &mut ducker, &mut probe);
                 total_samples += pending.len() as u64;
                 plaintext_accum.extend_from_slice(&voice::pcm_to_bytes(&pending));
             }
@@ -661,10 +710,19 @@ pub(crate) fn spawn_stream_decrypt_worker(
         // hit its own length cap. Shared by chunks that decrypt on arrival
         // and chunks replayed out of `install_setup`'s backlog, so both
         // paths enforce the cap identically.
-        let accept_pcm = |pcm: Vec<u8>, plaintext_accum: &mut Vec<u8>| -> bool {
-            plaintext_accum.extend_from_slice(&pcm);
+        let accept_pcm = |chunk: Vec<u8>, plaintext_accum: &mut Vec<u8>| -> bool {
+            // Wire chunks are `voice::VOICE_CODEC_ADPCM`, not raw PCM
+            // (docs/PROTOCOL.md 7.3). Decoded once here, before either
+            // consumer: the accumulated clip is PCM, the same as every
+            // other recording this app keeps, so replay/export/OTP voice
+            // stay untouched by how a live chunk happens to travel. An
+            // undecodable chunk is dropped rather than treated as audio -
+            // this is network input.
+            let Some(samples) = voice::decode_voice_chunk(&chunk) else {
+                return false;
+            };
+            plaintext_accum.extend_from_slice(&voice::pcm_to_bytes(&samples));
             if !suppress_playback {
-                let samples = voice::pcm_from_bytes(&pcm);
                 let _ = mixer_tx.send(voice::MixerCmd::Push {
                     id: mixer_id,
                     samples,
