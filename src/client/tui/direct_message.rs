@@ -128,6 +128,41 @@ impl UiState {
     }
 
     pub fn on_direct_message(&mut self, from: UserId, from_name: String, body: MessageBody) {
+        self.push_incoming_dm(from, from_name, body, true);
+    }
+
+    /// `on_direct_message`'s counterpart for a `MessageBody::Voice` that
+    /// arrived already fully decrypted rather than through
+    /// `on_direct_stream_start`/`on_direct_stream_finished` - OTP voice
+    /// never live-streams (docs/PROTOCOL.md §16), so there is no per-chunk
+    /// mixer push to gate; the caller (`otp::finish_incoming_file`) decides
+    /// `listened` up front the same way `on_direct_stream_start` derives it
+    /// from `suppress_playback` for a live pq_hybrid stream, and has
+    /// already pushed the clip to the mixer itself when `listened` is
+    /// `true`.
+    pub fn on_direct_voice_message(
+        &mut self,
+        from: UserId,
+        from_name: String,
+        duration_ms: u32,
+        pcm: Vec<u8>,
+        listened: bool,
+    ) {
+        self.push_incoming_dm(
+            from,
+            from_name,
+            MessageBody::Voice { duration_ms, pcm },
+            listened,
+        );
+    }
+
+    fn push_incoming_dm(
+        &mut self,
+        from: UserId,
+        from_name: String,
+        body: MessageBody,
+        listened: bool,
+    ) {
         let entry = LogEntry {
             from,
             from_name: from_name.clone(),
@@ -138,7 +173,7 @@ impl UiState {
             sent_at: local_time_stamp(),
             sent_at_utc: crate::client::export::utc_time_stamp(),
             owed_receipt: None,
-            listened: true,
+            listened,
             delivery: None,
             crypto: self.message_crypto(from, false),
         };

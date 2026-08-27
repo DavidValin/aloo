@@ -4592,6 +4592,17 @@ have left behind - so replaying it (Enter, §7.3) works identically either
 way; the only difference this layer makes is that it arrives all at once
 once fully received, rather than becoming playable partway through.
 
+It autoplays exactly like a live `pq_hybrid` stream does, too - muted or
+trust-gated (`suppress_playback_from`), or simply not the DM currently on
+screen (`is_viewing_dm`), and it plays itself the instant it's fully
+decrypted; a row that skipped autoplay for any of those reasons still ends
+in the same red "not listened" marker until replayed. The only difference
+is *when* that decision is made: a live stream decides once at
+`StreamStart` and then pushes each chunk to the mixer as it decrypts,
+where an OTP voice message has no chunks to gate - the decision is made
+once, the moment the whole clip finishes decrypting, and either the entire
+thing goes to the mixer at once or none of it does.
+
 ### 16.2.1 One conversation end to end: every spend, its acknowledgement, and its retries
 
 Everything above describes the shapes one at a time; this is the timeline

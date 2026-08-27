@@ -67,3 +67,34 @@ Feature: Voice only autoplays where you're actually looking
     And I move focus to the messages
     And I press Enter
     Then the private room shows no not listened marker
+
+  # An OTP voice message never live-streams (docs/PROTOCOL.md §16.2) - it
+  # arrives already fully decrypted, all at once - so the same focus gate
+  # above is decided once for the whole clip instead of at a
+  # `*StreamStart`, but the outcome is identical either way.
+
+  @AC-357
+  Scenario: An OTP voice message that arrives while viewing a different surface shows a not listened marker
+    Given I am connected and viewing a channel
+    And bob is in the channel with me
+    When bob sends me a finished otp voice message while I am not viewing our private room
+    Then the private room shows a red not listened marker
+
+  @AC-357
+  Scenario: An OTP voice message that arrives in the private room I'm viewing shows no marker
+    Given I am connected and viewing a channel
+    And bob is in the channel with me
+    And I have opened a private room with bob
+    When bob sends me a finished otp voice message into our private room
+    Then the private room shows no not listened marker
+
+  @AC-357
+  Scenario: Replaying an unlistened OTP voice message clears the marker
+    Given I am connected and viewing a channel
+    And bob is in the channel with me
+    And bob sends me a finished otp voice message while I am not viewing our private room
+    Then the private room shows a red not listened marker
+    When I open a private room with bob
+    And I move focus to the messages
+    And I press Enter
+    Then the private room shows no not listened marker

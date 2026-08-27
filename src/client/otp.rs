@@ -5080,11 +5080,28 @@ pub async fn finish_incoming_file(
             let pcm = std::fs::read(&decrypt_dest).unwrap_or_default();
             secure_remove_file(&decrypt_dest);
             let from_name = peer_name_for(ui_state, from);
-            ui_state.on_direct_message(
-                from,
-                from_name,
-                crate::client::tui::ui::MessageBody::Voice { duration_ms, pcm },
-            );
+            // The same autoplay gate `channel::on_stream_start`/
+            // `direct_message::on_stream_start` snapshot for a live
+            // pq_hybrid stream (muted/trust-gated, or this isn't the DM
+            // currently on screen), just applied once to the whole clip
+            // instead of per chunk - an OTP voice message never live-
+            // streams (docs/PROTOCOL.md §16), it only ever shows up fully
+            // decrypted, right here.
+            let suppress_playback =
+                ui_state.suppress_playback_from(from) || !ui_state.is_viewing_dm(from);
+            let samples = crate::client::voice::pcm_from_bytes(&pcm);
+            let played = !suppress_playback && !samples.is_empty();
+            if played {
+                let id = session.next_mixer_id;
+                session.next_mixer_id += 1;
+                let _ = session
+                    .mixer_tx
+                    .send(crate::client::voice::MixerCmd::Push { id, samples });
+                let _ = session
+                    .mixer_tx
+                    .send(crate::client::voice::MixerCmd::Finish { id });
+            }
+            ui_state.on_direct_voice_message(from, from_name, duration_ms, pcm, played);
             crate::client::session::request_rotation(session, from);
         }
         OtpIncomingKind::Recovered => {

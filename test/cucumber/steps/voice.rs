@@ -97,6 +97,30 @@ async fn peer_starts_dm_stream_unfocused(w: &mut AlooWorld, name: String) {
     w.ui_mut().on_direct_stream_start(id, id, name, 5, true);
 }
 
+// An OTP voice message never live-streams (docs/PROTOCOL.md §16.2) - it
+// only ever shows up already fully decrypted, so there is no separate
+// `*StreamStart`/`*StreamFinished` pair for it: `on_direct_voice_message`
+// is the one call `otp::finish_incoming_file` makes, `listened` standing
+// in for what it computes itself
+// (`!suppress_playback_from(...) && is_viewing_dm(...)`) the same way
+// `peer_starts_dm_stream`/`peer_starts_dm_stream_unfocused` stand in for
+// `on_direct_stream_start`'s own `suppress_playback` above.
+#[given(expr = "{word} sends me a finished otp voice message into our private room")]
+#[when(expr = "{word} sends me a finished otp voice message into our private room")]
+async fn otp_voice_arrives_focused(w: &mut AlooWorld, name: String) {
+    let id = UserId(id_for(&name));
+    w.ui_mut()
+        .on_direct_voice_message(id, name, 2000, vec![1, 2, 3, 4], true);
+}
+
+#[given(expr = "{word} sends me a finished otp voice message while I am not viewing our private room")]
+#[when(expr = "{word} sends me a finished otp voice message while I am not viewing our private room")]
+async fn otp_voice_arrives_unfocused(w: &mut AlooWorld, name: String) {
+    let id = UserId(id_for(&name));
+    w.ui_mut()
+        .on_direct_voice_message(id, name, 2000, vec![1, 2, 3, 4], false);
+}
+
 // Both keywords: used as a `When` (the event under test) in most
 // scenarios, but as a `Given`-chain `And` in "Replaying an unlistened
 // voice message clears the marker" (`voice_listened_marker.feature`),

@@ -314,6 +314,60 @@ fn on_direct_stream_start_and_finished_swap_the_placeholder_body_in_place() {
 }
 
 // ---------------------------------------------------------------------
+// OTP voice: arrives already fully decrypted (no live stream, §16.2),
+// so autoplay is decided once for the whole clip instead of at
+// `*StreamStart` - `on_direct_voice_message` is what
+// `otp::finish_incoming_file` calls with that pre-computed decision.
+// ---------------------------------------------------------------------
+
+/// @requirement AC-357
+#[test]
+fn on_direct_voice_message_sets_listened_from_the_caller() {
+    let mut suppressed = joined_general_with(vec![user(2, "bob")]);
+    suppressed.on_direct_voice_message(UserId(2), "bob".into(), 1000, vec![1, 2], false);
+    let room = suppressed.private_rooms.get(&UserId(2)).unwrap();
+    assert!(!room.log[0].listened);
+    assert_eq!(
+        room.log[0].body,
+        MessageBody::Voice {
+            duration_ms: 1000,
+            pcm: vec![1, 2]
+        }
+    );
+
+    let mut autoplayed = joined_general_with(vec![user(2, "bob")]);
+    autoplayed.on_direct_voice_message(UserId(2), "bob".into(), 1000, vec![1, 2], true);
+    let room = autoplayed.private_rooms.get(&UserId(2)).unwrap();
+    assert!(room.log[0].listened);
+}
+
+/// @requirement AC-357
+#[test]
+fn an_unlistened_otp_voice_row_shows_a_red_not_listened_marker() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.on_direct_voice_message(UserId(2), "bob".into(), 1000, vec![1, 2], false);
+    state.active_private_room = Some(UserId(2));
+
+    let backend = TestBackend::new(100, 15);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| render(f, &state)).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    let (x, y) = find_text_start(&buffer, "not listened");
+    assert_eq!(buffer[(x, y)].fg, ratatui::style::Color::Red);
+}
+
+/// @requirement AC-357
+#[test]
+fn a_listened_otp_voice_row_shows_no_marker() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.on_direct_voice_message(UserId(2), "bob".into(), 1000, vec![1, 2], true);
+    state.active_private_room = Some(UserId(2));
+
+    let rows = rendered_rows(&state);
+    assert!(!rows.iter().any(|r| r.contains("not listened")), "{rows:?}");
+}
+
+// ---------------------------------------------------------------------
 // Message log scrolling
 // ---------------------------------------------------------------------
 
