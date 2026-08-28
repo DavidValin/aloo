@@ -94,7 +94,7 @@ impl Confirm {
 /// Accept/Reject on an incoming offer, Send file/Discard on an outgoing
 /// one, and Delete/Cancel on something destructive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ConfirmLabels<'a> {
+pub(crate) struct ConfirmLabels<'a> {
     pub yes: &'a str,
     pub no: &'a str,
 }
@@ -118,10 +118,10 @@ impl<'a> ConfirmLabels<'a> {
 /// The button width every confirmation in this app draws at, except the
 /// three whose affirmative label is long enough to need
 /// [`WIDE_BUTTON_WIDTH`] ("Send file", "Delete").
-pub const BUTTON_WIDTH: u16 = 16;
+pub(crate) const BUTTON_WIDTH: u16 = 16;
 
 /// The wider button the file-send and contacts-delete confirmations use.
-pub const WIDE_BUTTON_WIDTH: u16 = 18;
+pub(crate) const WIDE_BUTTON_WIDTH: u16 = 18;
 
 /// One popup button - the affirmative and declining halves of every
 /// confirmation, and the standalone `Save` the direct-punch editor draws.
@@ -132,7 +132,7 @@ pub const WIDE_BUTTON_WIDTH: u16 = 18;
 /// the solid highlight fill when focused, via the `Paragraph`'s own
 /// `.style()` rather than a separate widget underneath it. `width` is the
 /// button's fixed width, centered in `area`.
-pub fn render_popup_button(frame: &mut Frame, area: Rect, width: u16, label: &str, focused: bool) {
+pub(crate) fn render_popup_button(frame: &mut Frame, area: Rect, width: u16, label: &str, focused: bool) {
     let popup = centered_rect(width, 3, area);
     let block = Block::default()
         .borders(Borders::ALL)
@@ -161,7 +161,7 @@ pub fn render_popup_button(frame: &mut Frame, area: Rect, width: u16, label: &st
 ///
 /// `focus` of `None` draws both unfocused; see the module doc for the two
 /// popups that need that.
-pub fn render_confirm_row(
+pub(crate) fn render_confirm_row(
     frame: &mut Frame,
     area: Rect,
     labels: ConfirmLabels<'_>,
@@ -197,7 +197,7 @@ pub fn render_confirm_row(
 /// common call, with `size`/`border_style`/`button_width`/`body_min_height`
 /// set only where a popup genuinely differs.
 #[derive(Debug, Clone)]
-pub struct ConfirmPopup<'a> {
+pub(crate) struct ConfirmPopup<'a> {
     /// Drawn on the border. Empty means an untitled box.
     pub title: &'a str,
     pub labels: ConfirmLabels<'a>,

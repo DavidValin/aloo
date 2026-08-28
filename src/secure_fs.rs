@@ -89,12 +89,12 @@ fn overwrite_with_zeros(path: &Path) -> std::io::Result<()> {
 /// `0o600` - owner read/write, nothing else. For a file holding key
 /// material or content that only this user should ever see.
 #[cfg(unix)]
-pub fn restrict_file_permissions(path: &Path) {
+pub(crate) fn restrict_file_permissions(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
     let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
 }
 #[cfg(not(unix))]
-pub fn restrict_file_permissions(_path: &Path) {}
+pub(crate) fn restrict_file_permissions(_path: &Path) {}
 
 /// `0o700` - the directory counterpart. A directory needs its executable
 /// bit to be traversable and writable into at all, so `0o600` (no `x`)
@@ -102,9 +102,9 @@ pub fn restrict_file_permissions(_path: &Path) {}
 /// where `0o600` is exactly "owner read/write, nothing else"
 /// (`restrict_file_permissions`).
 #[cfg(unix)]
-pub fn restrict_dir_permissions(path: &Path) {
+pub(crate) fn restrict_dir_permissions(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
     let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
 }
 #[cfg(not(unix))]
-pub fn restrict_dir_permissions(_path: &Path) {}
+pub(crate) fn restrict_dir_permissions(_path: &Path) {}

@@ -251,7 +251,7 @@ pub fn read_txt_preview(path: &Path) -> std::io::Result<(String, bool)> {
 /// this side is about to build from a path the user chose in a browser, so
 /// there is nothing hostile to sanitize - the crop (`truncate_filename`)
 /// stays a separate call at each site, exactly as before.
-pub fn display_filename(path: &Path) -> String {
+pub(crate) fn display_filename(path: &Path) -> String {
     path.file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "file".to_string())

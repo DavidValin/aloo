@@ -21,7 +21,7 @@ use crate::client::tui::ui::focus_border_style;
 /// with a border around the box"). Returns the inner `Rect` the value was
 /// drawn into, so the caller can hand it straight to
 /// [`place_text_cursor`].
-pub fn render_bordered_field(
+pub(crate) fn render_bordered_field(
     frame: &mut Frame,
     area: Rect,
     label: &str,
@@ -45,7 +45,7 @@ pub fn render_bordered_field(
 ///
 /// Clamped to the box: a value longer than `inner` is wide leaves the
 /// cursor on the last column rather than drawing it outside the border.
-pub fn place_text_cursor(frame: &mut Frame, inner: Rect, value: &str) {
+pub(crate) fn place_text_cursor(frame: &mut Frame, inner: Rect, value: &str) {
     let cursor_x = inner.x + (value.chars().count() as u16).min(inner.width.saturating_sub(1));
     frame.set_cursor_position((cursor_x, inner.y));
 }

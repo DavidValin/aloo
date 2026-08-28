@@ -1173,7 +1173,7 @@ pub fn samples_to_ms(samples: usize, rate: u32) -> u64 {
 /// any-rate form: this one fixes the rate and returns the `u32` the
 /// `StreamEnd`/`MessageBody::Voice` types actually carry, which is what
 /// the call sites were open-coding.
-pub fn duration_ms_of(samples: u64) -> u32 {
+pub(crate) fn duration_ms_of(samples: u64) -> u32 {
     ((samples * 1000) / SAMPLE_RATE_HZ as u64) as u32
 }
 

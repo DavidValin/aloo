@@ -198,7 +198,7 @@ pub fn own_identity_of(session: &SessionState) -> OwnIdentity<'_> {
 /// registry writes the identity is being read *for*. Four of them were
 /// writing the same copy out by hand for exactly that reason; this is
 /// that copy, named.
-pub struct OwnIdentitySnapshot {
+pub(crate) struct OwnIdentitySnapshot {
     pq_fingerprint: [u8; 32],
     pinned_public_der: Vec<u8>,
     own_device_id: String,

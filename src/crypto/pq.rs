@@ -732,14 +732,14 @@ pub fn save_public_bundle(bundle: &PqPublicBundle, path: &Path) -> Result<()> {
 
 /// The suffix the public half of a keybundle always carries, under every
 /// spelling below.
-pub const PUBLIC_SUFFIX: &str = ".pub";
+pub(crate) const PUBLIC_SUFFIX: &str = ".pub";
 
 /// The suffix an auto-generated private half carries.
 ///
 /// Still read (`resolve_bundle_paths`), and still what
 /// `client::connect::fresh_pq_hybrid_paths_in` generates, but never what a
 /// prefix given on the command line is *written* to - see `bundle_paths`.
-pub const PRIVATE_SUFFIX: &str = ".priv";
+pub(crate) const PRIVATE_SUFFIX: &str = ".priv";
 
 /// Where a keybundle prefix's two files are **written**: `<prefix>` holds
 /// the private bundle, `<prefix>.pub` the public one.

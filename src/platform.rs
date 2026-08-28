@@ -108,7 +108,7 @@ pub fn expand_tilde_with(path: &str, home: Option<PathBuf>) -> PathBuf {
 /// `create_dir_all("")` fails. Every flat-file store here (`idstore`,
 /// `otp_store`, `ip_ban`, `device_id`, the connect cache, `settings`)
 /// opened its `save` with exactly this block.
-pub fn ensure_parent_dir(path: &std::path::Path) -> std::io::Result<()> {
+pub(crate) fn ensure_parent_dir(path: &std::path::Path) -> std::io::Result<()> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -124,7 +124,7 @@ pub fn ensure_parent_dir(path: &std::path::Path) -> std::io::Result<()> {
 /// permissions problem or a bad disk must not be read as "no data", which
 /// would silently start a store from scratch over a file that is really
 /// still there.
-pub fn read_to_string_optional(path: &std::path::Path) -> std::io::Result<Option<String>> {
+pub(crate) fn read_to_string_optional(path: &std::path::Path) -> std::io::Result<Option<String>> {
     match std::fs::read_to_string(path) {
         Ok(contents) => Ok(Some(contents)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
