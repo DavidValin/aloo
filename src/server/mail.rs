@@ -218,9 +218,9 @@ impl MailStore {
 // ---------------------------------------------------------------------
 
 fn deliver_message(to: UserId, m: StoredMail) -> Outgoing {
-    Outgoing {
+    Outgoing::new(
         to,
-        message: ServerMessage::OtpMailDeliver {
+        ServerMessage::OtpMailDeliver {
             mail_id: m.mail_id,
             from: m.from,
             contact_name: m.contact_name,
@@ -228,7 +228,7 @@ fn deliver_message(to: UserId, m: StoredMail) -> Outgoing {
             sent_at_utc: m.sent_at_utc,
             ciphertext: m.ciphertext,
         },
-    }
+    )
 }
 
 /// Applies one `ClientMessage::OtpMailSend` from `sender` (docs/PROTOCOL.md
@@ -254,10 +254,10 @@ pub fn on_mail_send(
         return Vec::new();
     };
     if store.is_delivered(&mail_id) {
-        return vec![Outgoing {
-            to: sender,
-            message: ServerMessage::OtpMailDelivered { mail_id },
-        }];
+        return vec![Outgoing::new(
+            sender,
+            ServerMessage::OtpMailDelivered { mail_id },
+        )];
     }
     let mail = StoredMail {
         mail_id: mail_id.clone(),
@@ -270,27 +270,27 @@ pub fn on_mail_send(
     };
     match store.store(&mail) {
         Ok(()) => {
-            let mut out = vec![Outgoing {
-                to: sender,
-                message: ServerMessage::OtpMailResult {
+            let mut out = vec![Outgoing::new(
+                sender,
+                ServerMessage::OtpMailResult {
                     mail_id,
                     ok: true,
                     reason: None,
                 },
-            }];
+            )];
             if let Some(recipient_id) = reg.id_by_name(&to) {
                 out.push(deliver_message(recipient_id, mail));
             }
             out
         }
-        Err(reason) => vec![Outgoing {
-            to: sender,
-            message: ServerMessage::OtpMailResult {
+        Err(reason) => vec![Outgoing::new(
+            sender,
+            ServerMessage::OtpMailResult {
                 mail_id,
                 ok: false,
                 reason: Some(reason),
             },
-        }],
+        )],
     }
 }
 
@@ -307,10 +307,12 @@ pub fn on_mail_fetch(reg: &Registry, store: &MailStore, requester: UserId) -> Ve
         .into_iter()
         .map(|m| deliver_message(requester, m))
         .collect();
-    out.extend(store.receipts_from(&info.name).into_iter().map(|r| Outgoing {
-        to: requester,
-        message: ServerMessage::OtpMailDelivered { mail_id: r.mail_id },
-    }));
+    out.extend(
+        store
+            .receipts_from(&info.name)
+            .into_iter()
+            .map(|r| Outgoing::new(requester, ServerMessage::OtpMailDelivered { mail_id: r.mail_id })),
+    );
     out
 }
 
@@ -331,10 +333,10 @@ pub fn on_mail_ack(
         return Vec::new();
     };
     match reg.id_by_name(&from) {
-        Some(sender_id) => vec![Outgoing {
-            to: sender_id,
-            message: ServerMessage::OtpMailDelivered { mail_id },
-        }],
+        Some(sender_id) => vec![Outgoing::new(
+            sender_id,
+            ServerMessage::OtpMailDelivered { mail_id },
+        )],
         None => Vec::new(),
     }
 }
