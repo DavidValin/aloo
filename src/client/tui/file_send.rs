@@ -210,10 +210,7 @@ impl UiState {
             }
         };
 
-        let filename = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "file".to_string());
+        let filename = crate::client::file_transfer::display_filename(&path);
         let filename = crate::client::file_transfer::truncate_filename(&filename);
 
         let target = self.file_send.as_ref()?.target.clone();
@@ -265,10 +262,7 @@ impl UiState {
         path: PathBuf,
     ) -> Option<UiAction> {
         let size = std::fs::metadata(&path).ok()?.len();
-        let filename = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "file".to_string());
+        let filename = crate::client::file_transfer::display_filename(&path);
         let filename = crate::client::file_transfer::truncate_filename(&filename);
 
         match target {
@@ -319,10 +313,7 @@ fn render_confirm(
     fs: &FileSendState,
     path: &std::path::Path,
 ) {
-    let filename = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "file".to_string());
+    let filename = crate::client::file_transfer::display_filename(path);
     let target_label = match &fs.target {
         FileSendTarget::Channel(name) => format!("#{name}"),
         FileSendTarget::Direct(peer_id) => state

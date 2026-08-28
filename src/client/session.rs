@@ -1489,11 +1489,10 @@ async fn handle_ui_action(
                             session
                                 .own_stream_targets
                                 .insert(stream_id, voice_stream::OwnStreamTarget::MailAttachment);
-                            let echo_ducking = if recorder.echo_cancelled() {
-                                crate::settings::EchoDucking::Off
-                            } else {
-                                session.echo_ducking
-                            };
+                            let echo_ducking = voice_stream::effective_echo_ducking(
+                                &recorder,
+                                session.echo_ducking,
+                            );
                             voice_stream::spawn_record_accumulate_worker(
                                 recorder,
                                 stream_id,

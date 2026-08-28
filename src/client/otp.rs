@@ -305,7 +305,7 @@ pub async fn unwrap_incoming(
 /// rather than allocating one the size of the file - the difference
 /// between erasing a 1TB pad and aborting the process trying to.
 fn secure_remove_dir(dir: &Path) {
-    crate::client::otp_staging::secure_remove_dir(dir);
+    crate::secure_fs::secure_remove_dir(dir);
 }
 
 /// Best-effort overwrite-then-remove of one temp content file created via
@@ -314,7 +314,7 @@ fn secure_remove_dir(dir: &Path) {
 /// through `otp --encrypt`/`--decrypt` on disk (never buffered whole in
 /// memory - see `otp_cli::encrypt_file`/`decrypt_file`).
 pub(crate) fn secure_remove_file(path: &Path) {
-    crate::client::otp_staging::secure_remove_file(path);
+    crate::secure_fs::secure_remove_file(path);
 }
 
 /// A fresh, collision-free path under the OTP working directory for a
@@ -332,25 +332,7 @@ pub(crate) fn temp_content_path(cfg: &OtpCliConfig, label: &str) -> std::path::P
         .join(format!("{label}-{}-{nanos}", std::process::id()))
 }
 
-#[cfg(unix)]
-fn restrict_file_permissions(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-}
-#[cfg(not(unix))]
-fn restrict_file_permissions(_path: &Path) {}
-
-/// A directory needs its executable bit to be traversable/writable-into at
-/// all - `0o600` (no `x`) would make it impossible to create files inside,
-/// unlike a plain file where `0o600` is exactly "owner read/write, nothing
-/// else" (see `restrict_file_permissions`).
-#[cfg(unix)]
-fn restrict_dir_permissions(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
-}
-#[cfg(not(unix))]
-fn restrict_dir_permissions(_path: &Path) {}
+use crate::secure_fs::{restrict_dir_permissions, restrict_file_permissions};
 
 /// Where a generated-but-not-yet-accepted pad waits. Both halves live here
 /// - this side's own and the peer's - until the peer actually accepts, at

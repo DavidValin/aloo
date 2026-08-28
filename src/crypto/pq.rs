@@ -24,7 +24,7 @@
 //! they are superseded (`client::pq_rekey`, §13.10) - the signing keys of
 //! step 3 are the durable identity and do not.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, Key as AesKey, KeyInit as AesKeyInit, Nonce as AesNonce};
@@ -728,6 +728,27 @@ pub fn generate_bundle_with_bits(bits: usize) -> Result<(PqPublicBundle, PqPriva
 pub fn save_public_bundle(bundle: &PqPublicBundle, path: &Path) -> Result<()> {
     std::fs::write(path, bincode_encode(bundle)?)?;
     Ok(())
+}
+
+/// The two files a keybundle prefix names **for the CLI key commands**:
+/// `<prefix>` holds the private bundle and `<prefix>.pub` the public one.
+///
+/// Previously re-spelled at each of `--keygen-pq-hybrid`,
+/// `--rekey-pq-hybrid` and `--export-identity-card` - four places that had
+/// to agree for a keybundle written by one to be loadable by another.
+///
+/// **This is not the only prefix convention in the tree**, which is why it
+/// is scoped to those commands rather than offered as the general rule:
+/// `client::daemon::resolve_my_key` and
+/// `client::connect::fresh_pq_hybrid_paths_in` both read the private half
+/// as `<prefix>.priv`, not as the bare `<prefix>` this returns. The two
+/// disagree today; unifying them would change which files an existing
+/// install reads, so it is left alone here and noted instead.
+pub fn bundle_paths(prefix: &str) -> (PathBuf, PathBuf) {
+    (
+        PathBuf::from(prefix),
+        PathBuf::from(format!("{prefix}.pub")),
+    )
 }
 
 pub fn load_public_bundle(path: &Path) -> Result<PqPublicBundle> {

@@ -185,11 +185,59 @@ pub async fn decrypt(
     encrypt_decrypt(cfg, contact, ciphertext, assume_delivered, "--decrypt").await
 }
 
+/// How many passes `retrying` makes before giving up.
+const MAX_REDELIVER_RETRIES: u32 = 3;
+
+/// What a `*_retrying` call reports once `MAX_REDELIVER_RETRIES` passes
+/// have all come back `Redelivered`.
+const REDELIVERY_EXHAUSTED: &str = "otp: exceeded redelivery retries";
+
+/// The two outcome types' shared "was this a redelivery, and what does
+/// giving up look like" - the whole of what `retrying` below needs to know
+/// about either of them.
+trait Redeliverable: Sized {
+    fn is_redelivered(&self) -> bool;
+    fn exhausted() -> Self;
+}
+
+impl Redeliverable for OtpCliOutcome {
+    fn is_redelivered(&self) -> bool {
+        matches!(self, OtpCliOutcome::Redelivered)
+    }
+    fn exhausted() -> Self {
+        OtpCliOutcome::Error(REDELIVERY_EXHAUSTED.to_string())
+    }
+}
+
+impl Redeliverable for FileCliOutcome {
+    fn is_redelivered(&self) -> bool {
+        matches!(self, FileCliOutcome::Redelivered)
+    }
+    fn exhausted() -> Self {
+        FileCliOutcome::Error(REDELIVERY_EXHAUSTED.to_string())
+    }
+}
+
+/// Re-runs `attempt` while it keeps reporting a redelivery.
+///
 /// A redelivered result means no new key was consumed and today's real
 /// input was never processed - see `README.md`/`--help`: "re-run to send
-/// it". Bounded so a repeatedly-crash-looping keychain can't hang the
-/// caller forever.
-const MAX_REDELIVER_RETRIES: u32 = 3;
+/// it". Bounded by `MAX_REDELIVER_RETRIES` so a repeatedly-crash-looping
+/// keychain can't hang the caller forever.
+async fn retrying<T, F, Fut>(mut attempt: F) -> io::Result<T>
+where
+    T: Redeliverable,
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = io::Result<T>>,
+{
+    for _ in 0..MAX_REDELIVER_RETRIES {
+        let outcome = attempt().await?;
+        if !outcome.is_redelivered() {
+            return Ok(outcome);
+        }
+    }
+    Ok(T::exhausted())
+}
 
 pub async fn encrypt_retrying(
     cfg: &OtpCliConfig,
@@ -197,15 +245,7 @@ pub async fn encrypt_retrying(
     plaintext: &[u8],
     assume_delivered: bool,
 ) -> io::Result<OtpCliOutcome> {
-    for _ in 0..MAX_REDELIVER_RETRIES {
-        match encrypt(cfg, contact, plaintext, assume_delivered).await? {
-            OtpCliOutcome::Redelivered => continue,
-            other => return Ok(other),
-        }
-    }
-    Ok(OtpCliOutcome::Error(
-        "otp: exceeded redelivery retries".to_string(),
-    ))
+    retrying(|| encrypt(cfg, contact, plaintext, assume_delivered)).await
 }
 
 pub async fn decrypt_retrying(
@@ -214,15 +254,19 @@ pub async fn decrypt_retrying(
     ciphertext: &[u8],
     assume_delivered: bool,
 ) -> io::Result<OtpCliOutcome> {
-    for _ in 0..MAX_REDELIVER_RETRIES {
-        match decrypt(cfg, contact, ciphertext, assume_delivered).await? {
-            OtpCliOutcome::Redelivered => continue,
-            other => return Ok(other),
-        }
+    retrying(|| decrypt(cfg, contact, ciphertext, assume_delivered)).await
+}
+
+/// `Ok(())` on exit `0`, otherwise the subprocess's own stderr as the
+/// error - the answer for every `otp` call whose only outcome is
+/// success-or-failure (`add_contact`, `remove_contact`, `new_key_pair`),
+/// as opposed to the ones that classify an exit code.
+fn ok_or_stderr(code: i32, stderr: Vec<u8>) -> io::Result<()> {
+    if code == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::other(String::from_utf8_lossy(&stderr).into_owned()))
     }
-    Ok(OtpCliOutcome::Error(
-        "otp: exceeded redelivery retries".to_string(),
-    ))
 }
 
 fn path_to_arg(path: &Path) -> io::Result<&str> {
@@ -327,15 +371,7 @@ pub async fn encrypt_file_retrying(
     dst: &Path,
     assume_delivered: bool,
 ) -> io::Result<FileCliOutcome> {
-    for _ in 0..MAX_REDELIVER_RETRIES {
-        match encrypt_file(cfg, contact, src, dst, assume_delivered).await? {
-            FileCliOutcome::Redelivered => continue,
-            other => return Ok(other),
-        }
-    }
-    Ok(FileCliOutcome::Error(
-        "otp: exceeded redelivery retries".to_string(),
-    ))
+    retrying(|| encrypt_file(cfg, contact, src, dst, assume_delivered)).await
 }
 
 pub async fn decrypt_file_retrying(
@@ -345,15 +381,7 @@ pub async fn decrypt_file_retrying(
     dst: &Path,
     assume_delivered: bool,
 ) -> io::Result<FileCliOutcome> {
-    for _ in 0..MAX_REDELIVER_RETRIES {
-        match decrypt_file(cfg, contact, src, dst, assume_delivered).await? {
-            FileCliOutcome::Redelivered => continue,
-            other => return Ok(other),
-        }
-    }
-    Ok(FileCliOutcome::Error(
-        "otp: exceeded redelivery retries".to_string(),
-    ))
+    retrying(|| decrypt_file(cfg, contact, src, dst, assume_delivered)).await
 }
 
 /// How much randomness is generated and written to the subprocess's stdin
@@ -485,11 +513,7 @@ pub async fn new_key_pair_with_progress(
     };
     let (_, output) = tokio::join!(write, child.wait_with_output());
     let output = output?;
-    if output.status.code() == Some(0) {
-        Ok(())
-    } else {
-        Err(io::Error::other(String::from_utf8_lossy(&output.stderr).into_owned()))
-    }
+    ok_or_stderr(output.status.code().unwrap_or(-1), output.stderr)
 }
 
 pub async fn add_contact(
@@ -502,11 +526,7 @@ pub async fn add_contact(
     let dec = path_to_arg(dec_key_file)?;
     let args = ["--add-contact", name, enc, dec];
     let (code, _stdout, stderr) = run(cfg, &args, &[]).await?;
-    if code == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::other(String::from_utf8_lossy(&stderr).into_owned()))
-    }
+    ok_or_stderr(code, stderr)
 }
 
 /// `otp --remove-contact <name>`: deletes a contact's keychain entry
@@ -520,11 +540,7 @@ pub async fn add_contact(
 /// was, not corrupt anything.
 pub async fn remove_contact(cfg: &OtpCliConfig, name: &str) -> io::Result<()> {
     let (code, _stdout, stderr) = run(cfg, &["--remove-contact", name], &[]).await?;
-    if code == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::other(String::from_utf8_lossy(&stderr).into_owned()))
-    }
+    ok_or_stderr(code, stderr)
 }
 
 /// `otp --has-contact <name>` (exit 0 exists, 1 doesn't) - the check that

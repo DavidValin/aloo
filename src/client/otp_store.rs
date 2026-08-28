@@ -335,28 +335,22 @@ impl OtpStore {
     /// load, same tolerance as `idstore::IdStore::load`.
     pub fn load(path: &Path) -> io::Result<Self> {
         let mut entries = HashMap::new();
-        match fs::read_to_string(path) {
-            Ok(contents) => {
-                for line in contents.lines() {
-                    if let Some((name, state)) = parse_line(line) {
-                        entries.insert(name, state);
-                    }
+        if let Some(contents) = crate::platform::read_to_string_optional(path)? {
+            for line in contents.lines() {
+                if let Some((name, state)) = parse_line(line) {
+                    entries.insert(name, state);
                 }
             }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
         }
         let mut pending_content_sends = HashMap::new();
-        match fs::read_to_string(Self::content_sends_path(path)) {
-            Ok(contents) => {
-                for line in contents.lines() {
-                    if let Some((id, target)) = parse_content_send_line(line) {
-                        pending_content_sends.insert(id, target);
-                    }
+        if let Some(contents) =
+            crate::platform::read_to_string_optional(&Self::content_sends_path(path))?
+        {
+            for line in contents.lines() {
+                if let Some((id, target)) = parse_content_send_line(line) {
+                    pending_content_sends.insert(id, target);
                 }
             }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
         }
         Ok(Self {
             path: path.to_path_buf(),
@@ -746,11 +740,7 @@ impl OtpStore {
     /// the module doc for why this file's cadence is stricter than
     /// `idstore.rs`'s.
     pub fn save(&self) -> io::Result<()> {
-        if let Some(parent) = self.path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            fs::create_dir_all(parent)?;
-        }
+        crate::platform::ensure_parent_dir(&self.path)?;
         let mut names: Vec<&String> = self.entries.keys().collect();
         names.sort();
         let mut out = String::new();
@@ -920,6 +910,21 @@ fn decode_pending_content(s: &str) -> Option<PendingOtpContent> {
     }
 }
 
+/// The next tab-separated field as a 32-byte value, `None` for an absent,
+/// empty or malformed one.
+///
+/// Every hex column in this file is a `[u8; 32]` (an ack proof, a pad
+/// digest) and every one of them is optional the same way - absent in a
+/// store written before that column existed, empty when the value is not
+/// set. Written out four times before this, identically.
+fn next_hex32<'a>(parts: &mut impl Iterator<Item = &'a str>) -> Option<[u8; 32]> {
+    parts
+        .next()
+        .filter(|s| !s.is_empty())
+        .and_then(crate::crypto::hex_decode)
+        .and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok())
+}
+
 fn parse_line(line: &str) -> Option<(String, OtpContactState)> {
     let mut parts = line.split('\t');
     let name = parts.next()?.to_string();
@@ -941,26 +946,14 @@ fn parse_line(line: &str) -> Option<(String, OtpContactState)> {
     // Same evolutionary tolerance every trailing field here gets: absent or
     // empty reads as "no proof recorded", which `record_acked` treats as a
     // message predating the check rather than one to refuse.
-    let pending_ack_proof = parts
-        .next()
-        .filter(|s| !s.is_empty())
-        .and_then(crate::crypto::hex_decode)
-        .and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok());
-    let installed_pad_digest = parts
-        .next()
-        .filter(|s| !s.is_empty())
-        .and_then(crate::crypto::hex_decode)
-        .and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok());
+    let pending_ack_proof = next_hex32(&mut parts);
+    let installed_pad_digest = next_hex32(&mut parts);
     // Same evolutionary tolerance as every other trailing field: absent (an
     // older store, or a contact that has never had a message accepted)
     // reads as "nothing to re-ack", never as a store to reject.
     let last_received_ack_seq: Option<u64> =
         parts.next().filter(|s| !s.is_empty()).and_then(|s| s.parse().ok());
-    let last_received_ack_proof = parts
-        .next()
-        .filter(|s| !s.is_empty())
-        .and_then(crate::crypto::hex_decode)
-        .and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok());
+    let last_received_ack_proof = next_hex32(&mut parts);
     let last_received_ack = match (last_received_ack_seq, last_received_ack_proof) {
         (Some(seq), Some(proof)) => Some((seq, proof)),
         _ => None,

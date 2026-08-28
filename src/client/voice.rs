@@ -1165,6 +1165,18 @@ pub fn samples_to_ms(samples: usize, rate: u32) -> u64 {
     (samples as u64 * 1000) / rate.max(1) as u64
 }
 
+/// A recording of `samples` mono samples at `SAMPLE_RATE_HZ`, in whole
+/// milliseconds - the length every finished voice message and incoming
+/// stream reports (`voice_stream`'s record and decrypt workers).
+///
+/// Distinct from `samples_to_ms` above, which is the general
+/// any-rate form: this one fixes the rate and returns the `u32` the
+/// `StreamEnd`/`MessageBody::Voice` types actually carry, which is what
+/// the call sites were open-coding.
+pub fn duration_ms_of(samples: u64) -> u32 {
+    ((samples * 1000) / SAMPLE_RATE_HZ as u64) as u32
+}
+
 /// How many mono samples at `rate` make up `ms` of audio.
 pub fn ms_to_samples(ms: u64, rate: u32) -> usize {
     ((ms * rate as u64) / 1000) as usize

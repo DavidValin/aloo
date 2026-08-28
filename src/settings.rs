@@ -695,11 +695,7 @@ impl Settings {
             Ok(contents) => Ok(Self::parse(&contents)),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 let settings = Self::default();
-                if let Some(parent) = path.parent()
-                    && !parent.as_os_str().is_empty()
-                {
-                    fs::create_dir_all(parent)?;
-                }
+                crate::platform::ensure_parent_dir(path)?;
                 fs::write(path, settings.scaffold_contents())?;
                 Ok(settings)
             }
@@ -1043,11 +1039,7 @@ impl Settings {
     /// out from under a running process, or `save` called without going
     /// through `load_or_create` first).
     pub fn save(&self, path: &Path) -> io::Result<()> {
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            fs::create_dir_all(parent)?;
-        }
+        crate::platform::ensure_parent_dir(path)?;
         let contents = match fs::read_to_string(path) {
             Ok(existing) => self.patch_into(&existing),
             Err(_) => self.dense_contents(),

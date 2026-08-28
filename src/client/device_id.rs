@@ -85,10 +85,8 @@ pub fn load_or_create(path: &Path, nickname: &str) -> io::Result<String> {
 /// nickname, which has no nickname field to key it by and so cannot be
 /// carried forward; a fresh id is generated per nickname instead.
 fn read_entries(path: &Path) -> io::Result<Vec<(String, String)>> {
-    let contents = match fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e),
+    let Some(contents) = crate::platform::read_to_string_optional(path)? else {
+        return Ok(Vec::new());
     };
     Ok(contents
         .lines()
@@ -103,11 +101,7 @@ fn read_entries(path: &Path) -> io::Result<Vec<(String, String)>> {
 }
 
 fn write_entries(path: &Path, entries: &[(String, String)]) -> io::Result<()> {
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        fs::create_dir_all(parent)?;
-    }
+    crate::platform::ensure_parent_dir(path)?;
     let mut contents = String::new();
     for (nickname, id) in entries {
         contents.push_str(nickname);

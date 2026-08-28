@@ -218,12 +218,7 @@ pub(crate) fn begin_own_call(
             return false;
         }
     };
-    // See the identical note in `channel::handle_voice_record_start`.
-    let echo_ducking = if recorder.echo_cancelled() {
-        crate::settings::EchoDucking::Off
-    } else {
-        session.echo_ducking
-    };
+    let echo_ducking = voice_stream::effective_echo_ducking(&recorder, session.echo_ducking);
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
     spawn_call_audio_worker(
         recorder,

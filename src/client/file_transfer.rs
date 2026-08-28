@@ -115,7 +115,15 @@ pub fn paste_tmp_dir() -> PathBuf {
 /// earlier, interrupted run. Best-effort - a leftover that can't be
 /// removed is skipped rather than failing session start.
 pub fn sweep_paste_tmp_dir() {
-    let Ok(entries) = std::fs::read_dir(paste_tmp_dir()) else {
+    sweep_scratch_dir(&paste_tmp_dir());
+}
+
+/// Removes everything directly inside `dir`, best-effort - the shared body
+/// of the two sweeps above and below. A plain remove, deliberately: unlike
+/// `otp_staging`'s own sweep these directories hold ordinary content, never
+/// one-time-pad key bytes, so there is nothing here to overwrite first.
+fn sweep_scratch_dir(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
@@ -165,17 +173,7 @@ pub fn incoming_preview_dir() -> PathBuf {
 /// still present didn't make it to either outcome in some earlier,
 /// interrupted run.
 pub fn sweep_incoming_preview_dir() {
-    let Ok(entries) = std::fs::read_dir(incoming_preview_dir()) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            let _ = std::fs::remove_dir_all(&path);
-        } else {
-            let _ = std::fs::remove_file(&path);
-        }
-    }
+    sweep_scratch_dir(&incoming_preview_dir());
 }
 
 /// Whether `name` (already through `safe_filename`) ends in `.txt`,
@@ -242,6 +240,21 @@ pub fn read_txt_preview(path: &Path) -> std::io::Result<(String, bool)> {
         String::from_utf8_lossy(&buf).into_owned(),
         total_len > PREVIEW_MAX_BYTES,
     ))
+}
+
+/// The name to show for a file the *user* picked, falling back to `"file"`
+/// for a path with no final component at all.
+///
+/// Deliberately not `safe_filename` below: that one is for a filename a
+/// *peer* supplied, and additionally strips path traversal and
+/// Windows-illegal characters. This is only for display, and for the offer
+/// this side is about to build from a path the user chose in a browser, so
+/// there is nothing hostile to sanitize - the crop (`truncate_filename`)
+/// stays a separate call at each site, exactly as before.
+pub fn display_filename(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".to_string())
 }
 
 /// Crops `name` to `MAX_FILENAME_CHARS` characters, keeping the first

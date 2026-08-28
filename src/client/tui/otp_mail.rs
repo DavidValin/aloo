@@ -947,10 +947,7 @@ impl UiState {
                         );
                         return None;
                     }
-                    let filename = path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| "file".to_string());
+                    let filename = crate::client::file_transfer::display_filename(&path);
                     let filename = crate::client::file_transfer::truncate_filename(&filename);
                     compose.attachments.push(MailAttachment::File {
                         filename,
