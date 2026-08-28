@@ -41,21 +41,11 @@ use super::ui::{
     Mode, UiAction, UiState, centered_rect, display_width, render_file_browser,
     render_popup_button,
 };
+use super::widgets::confirm_popup::{Confirm, ConfirmLabels, WIDE_BUTTON_WIDTH, render_confirm_row};
 
 // ---------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------
-
-/// Which button is focused on the delete-confirmation popup - `Cancel` by
-/// default, the same "a destructive action is never one accidental Enter
-/// away" reasoning as `file_send::FileConfirmChoice`'s `Discard` default
-/// and `ui::IdentityChoice`'s `Reject` default.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum DeleteChoice {
-    Delete,
-    #[default]
-    Cancel,
-}
 
 /// Which field is focused inside the "Install OTP key" popup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -209,7 +199,7 @@ pub struct ContactKeyDetailState {
     /// `Some` once "Delete key" is pressed with the key present - the same
     /// "destructive action is never one Enter away" confirm every other
     /// delete in this app uses.
-    pub confirm: Option<DeleteChoice>,
+    pub confirm: Option<Confirm>,
     /// `Some` while picking an identity-card file for PQH's "Create key" -
     /// `pub` for the same test-determinism reason `InstallOtpState::browser`
     /// is.
@@ -259,7 +249,7 @@ pub struct ContactsState {
     pub selected_key: ContactKeyKind,
     /// `Some` while the delete-confirmation popup is open, over the row
     /// selected when `d`/Delete was pressed.
-    pub confirm_delete: Option<DeleteChoice>,
+    pub confirm_delete: Option<Confirm>,
     /// `Some` while the "Install OTP key" popup is open, over the row
     /// selected when `o` was pressed.
     pub install: Option<InstallOtpState>,
@@ -455,7 +445,7 @@ impl UiState {
                     return None;
                 }
                 if let Some(state) = self.contacts.as_mut() {
-                    state.confirm_delete = Some(DeleteChoice::default());
+                    state.confirm_delete = Some(Confirm::default());
                 }
                 None
             }
@@ -701,7 +691,7 @@ impl UiState {
         let present = self.contacts_detail_key_present()?;
         if present {
             if let Some(detail) = self.contacts.as_mut().and_then(|c| c.detail.as_mut()) {
-                detail.confirm = Some(DeleteChoice::default());
+                detail.confirm = Some(Confirm::default());
             }
             return None;
         }
@@ -824,8 +814,8 @@ impl UiState {
             KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
                 if let Some(detail) = self.contacts.as_mut().and_then(|c| c.detail.as_mut()) {
                     detail.confirm = Some(match detail.confirm {
-                        Some(DeleteChoice::Delete) => DeleteChoice::Cancel,
-                        _ => DeleteChoice::Delete,
+                        Some(Confirm::Yes) => Confirm::No,
+                        _ => Confirm::Yes,
                     });
                 }
                 None
@@ -838,7 +828,7 @@ impl UiState {
                 if let Some(detail) = self.contacts.as_mut().and_then(|c| c.detail.as_mut()) {
                     detail.confirm = None;
                 }
-                if choice != DeleteChoice::Delete {
+                if choice != Confirm::Yes {
                     return None;
                 }
                 match kind {
@@ -882,8 +872,8 @@ impl UiState {
             KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
                 if let Some(state) = self.contacts.as_mut() {
                     state.confirm_delete = Some(match state.confirm_delete {
-                        Some(DeleteChoice::Delete) => DeleteChoice::Cancel,
-                        _ => DeleteChoice::Delete,
+                        Some(Confirm::Yes) => Confirm::No,
+                        _ => Confirm::Yes,
                     });
                 }
                 None
@@ -897,8 +887,8 @@ impl UiState {
                     state.confirm_delete = None;
                 }
                 match choice {
-                    DeleteChoice::Cancel => None,
-                    DeleteChoice::Delete => Some(UiAction::DeleteContact { nickname }),
+                    Confirm::No => None,
+                    Confirm::Yes => Some(UiAction::DeleteContact { nickname }),
                 }
             }
             _ => None,
@@ -1491,26 +1481,15 @@ fn render_delete_confirm(frame: &mut Frame, area: Rect, contacts: &ContactsState
         rows[0],
     );
 
-    let button_cols = ratatui::layout::Layout::default()
-        .direction(ratatui::layout::Direction::Horizontal)
-        .constraints([
-            ratatui::layout::Constraint::Percentage(50),
-            ratatui::layout::Constraint::Percentage(50),
-        ])
-        .split(rows[1]);
-    render_popup_button(
+    // `confirm_delete` is already an `Option` - `None` (no confirmation
+    // open) draws both buttons unfocused, exactly as the gated comparison
+    // it replaces did.
+    render_confirm_row(
         frame,
-        button_cols[0],
-        18,
-        "Delete",
-        contacts.confirm_delete == Some(DeleteChoice::Delete),
-    );
-    render_popup_button(
-        frame,
-        button_cols[1],
-        18,
-        "Cancel",
-        contacts.confirm_delete == Some(DeleteChoice::Cancel),
+        rows[1],
+        ConfirmLabels::new("Delete", "Cancel"),
+        contacts.confirm_delete,
+        WIDE_BUTTON_WIDTH,
     );
 }
 
@@ -1695,12 +1674,13 @@ fn render_contact_key_detail_popup(
                 .wrap(ratatui::widgets::Wrap { trim: true }),
             rows[0],
         );
-        let button_cols = ratatui::layout::Layout::default()
-            .direction(ratatui::layout::Direction::Horizontal)
-            .constraints([ratatui::layout::Constraint::Percentage(50), ratatui::layout::Constraint::Percentage(50)])
-            .split(rows[1]);
-        render_popup_button(frame, button_cols[0], 18, "Delete", detail.confirm == Some(DeleteChoice::Delete));
-        render_popup_button(frame, button_cols[1], 18, "Cancel", detail.confirm == Some(DeleteChoice::Cancel));
+        render_confirm_row(
+            frame,
+            rows[1],
+            ConfirmLabels::new("Delete", "Cancel"),
+            detail.confirm,
+            WIDE_BUTTON_WIDTH,
+        );
         return;
     }
 

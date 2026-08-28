@@ -10,3 +10,4 @@ pub mod surface;
 pub mod terminal;
 pub mod ui;
 pub mod ui_connect_popup;
+pub mod widgets;

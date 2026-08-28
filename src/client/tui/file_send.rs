@@ -13,14 +13,17 @@ use std::path::PathBuf;
 
 use crossterm::event::KeyCode;
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Paragraph, Wrap};
 
 use crate::proto::UserId;
 
-use super::ui::{Mode, UiAction, UiState, centered_rect, render_file_browser, render_popup_button};
+use super::ui::{Mode, UiAction, UiState, render_file_browser};
+use super::widgets::confirm_popup::{
+    Confirm, ConfirmLabels, ConfirmPopup, WIDE_BUTTON_WIDTH,
+};
 use crate::client::file_browser::FileBrowserState;
 
 /// Who a file send is addressed to - just the identity, not a frozen
@@ -34,17 +37,6 @@ pub enum FileSendTarget {
     Direct(UserId),
 }
 
-/// Which button is focused in the Send file/Discard confirmation box -
-/// `Discard` by default, same reasoning as `ui::IdentityChoice`'s
-/// `Reject`-first default: the safer action should never be a single
-/// accidental Enter away.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum FileConfirmChoice {
-    Send,
-    #[default]
-    Discard,
-}
-
 pub struct FileSendState {
     pub target: FileSendTarget,
     pub browser: FileBrowserState,
@@ -54,7 +46,9 @@ pub struct FileSendState {
     /// this field, returning to the browser at the same directory rather
     /// than closing the whole flow.
     pub confirm: Option<PathBuf>,
-    pub confirm_focus: FileConfirmChoice,
+    /// `Confirm::No` (Discard) by default - the safer action should never
+    /// be a single accidental Enter away.
+    pub confirm_focus: Confirm,
     /// Set when the selected file can't even be stat'd (e.g. removed or
     /// permissions changed between being picked in the browser and Send
     /// being confirmed) - shown inline on the confirmation box, same
@@ -80,7 +74,7 @@ impl UiState {
             target,
             browser,
             confirm: None,
-            confirm_focus: FileConfirmChoice::Discard,
+            confirm_focus: Confirm::No,
             error: None,
         });
         self.mode = Mode::FileSend;
@@ -154,7 +148,7 @@ impl UiState {
                     let _ = state.browser.navigate_into_selected();
                 } else if let Some(path) = state.browser.selected_path() {
                     state.confirm = Some(path);
-                    state.confirm_focus = FileConfirmChoice::Discard;
+                    state.confirm_focus = Confirm::No;
                     state.error = None;
                 }
                 None
@@ -174,24 +168,21 @@ impl UiState {
             }
             KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
                 if let Some(state) = self.file_send.as_mut() {
-                    state.confirm_focus = match state.confirm_focus {
-                        FileConfirmChoice::Send => FileConfirmChoice::Discard,
-                        FileConfirmChoice::Discard => FileConfirmChoice::Send,
-                    };
+                    state.confirm_focus.toggle();
                 }
                 None
             }
             KeyCode::Enter => {
                 let focus = self.file_send.as_ref()?.confirm_focus;
                 match focus {
-                    FileConfirmChoice::Discard => {
+                    Confirm::No => {
                         if let Some(state) = self.file_send.as_mut() {
                             state.confirm = None;
                             state.error = None;
                         }
                         None
                     }
-                    FileConfirmChoice::Send => self.confirm_file_send(),
+                    Confirm::Yes => self.confirm_file_send(),
                 }
             }
             _ => None,
@@ -341,17 +332,8 @@ fn render_confirm(
             .unwrap_or_else(|| "?".to_string()),
     };
 
-    let popup = centered_rect(64, 9, area);
-    let block = Block::default().title("Send file").borders(Borders::ALL);
-    let inner = block.inner(popup);
-    frame.render_widget(ratatui::widgets::Clear, popup);
-    frame.render_widget(block, popup);
-
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(3)])
-        .split(inner);
-
+    // The error line, when there is one, makes this a multi-line body
+    // rather than the single message `render_message` takes.
     let mut lines = vec![Line::from(format!(
         "Send \"{filename}\" to {target_label}?"
     ))];
@@ -362,24 +344,14 @@ fn render_confirm(
             Style::default().fg(Color::Red),
         )));
     }
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), rows[0]);
-
-    let button_cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(rows[1]);
-    render_popup_button(
-        frame,
-        button_cols[0],
-        18,
-        "Send file",
-        fs.confirm_focus == FileConfirmChoice::Send,
-    );
-    render_popup_button(
-        frame,
-        button_cols[1],
-        18,
-        "Discard",
-        fs.confirm_focus == FileConfirmChoice::Discard,
-    );
+    ConfirmPopup {
+        title: "Send file",
+        labels: ConfirmLabels::new("Send file", "Discard"),
+        focus: Some(fs.confirm_focus),
+        button_width: WIDE_BUTTON_WIDTH,
+        ..Default::default()
+    }
+    .render(frame, area, |frame, body| {
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), body);
+    });
 }

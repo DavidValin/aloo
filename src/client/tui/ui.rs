@@ -38,6 +38,14 @@ use crate::client::p2p::LinkStatus;
 use crate::p2p_proto::ReceiptStage;
 use crate::proto::{ChannelInfo, ChannelKind, Envelope, KeyMode, UserId, UserInfo};
 
+use super::widgets::confirm_popup::{Confirm, ConfirmLabels, ConfirmPopup};
+
+/// Re-exported so the popup modules that already reach for it through
+/// `super::ui` keep doing so - it lives in
+/// `super::widgets::confirm_popup` now, beside the confirmation row it is
+/// the building block of.
+pub(crate) use super::widgets::confirm_popup::render_popup_button;
+
 use super::channel::ChannelTab;
 use super::direct_message::PrivateRoom;
 
@@ -1111,12 +1119,6 @@ pub struct IdentityReview {
     pub status: IdentityStatus,
 }
 
-/// Which button currently has focus in the identity review popup.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IdentityChoice {
-    Accept,
-    Reject,
-}
 
 /// Whatever a `direct_punch_to` nickname with no pinned key sent that would
 /// normally have proved who they are - captured instead of being silently
@@ -1196,12 +1198,6 @@ pub struct UnknownPeerReview {
     pub source_addr: std::net::SocketAddr,
 }
 
-/// Which button currently has focus in the unknown-peer review popup.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UnknownPeerChoice {
-    Yes,
-    No,
-}
 
 /// A message received from a peer whose identity is `Pending`/`Rejected` at
 /// the moment it arrived - held here instead of the visible channel/DM log
@@ -1387,25 +1383,7 @@ pub struct PendingFileOffer {
     pub otp_contact_name: Option<String>,
 }
 
-/// Which button is focused in the file-offer popup - `Accept` by default
-/// (the opposite of the identity review popup's `Reject`-first default),
-/// per the file transfer spec: accepting an offer is the common case and
-/// shouldn't need an extra keystroke past Enter.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FileOfferChoice {
-    Accept,
-    Reject,
-}
 
-/// Which button is focused in either OTP popup below - `Accept` by
-/// default, same reasoning as `FileOfferChoice`: you either just typed
-/// `/otp` yourself (wanting to proceed is the common case) or a peer is
-/// asking for something you'd typically grant.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OtpChoice {
-    Accept,
-    Reject,
-}
 
 /// One incoming live-call invite awaiting an Accept/Reject decision
 /// (`docs/PROTOCOL.md` "Live voice calls") - mirrors `PendingFileOffer`'s
@@ -1424,13 +1402,6 @@ pub struct PendingCallInvite {
     pub ended: bool,
 }
 
-/// Which button is focused in the call-invite popup - `Accept` by default,
-/// same reasoning as `FileOfferChoice`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CallInviteChoice {
-    Accept,
-    Reject,
-}
 
 /// Where `/call` should be addressed, resolved at command-submit time (same
 /// "known now, not deferred" reasoning as `VoiceTarget`) - `session::
@@ -1464,17 +1435,6 @@ pub struct PendingCallConfirm {
     pub invitee_count: usize,
 }
 
-/// Which button is focused in the `/call` confirmation - `Confirm` by
-/// default: the user just typed `/call` themselves, so wanting to proceed
-/// is the common case (same reasoning as `FileOfferChoice`'s
-/// `Accept`-first default). Reused as-is for `ChannelCommandConfirm` below -
-/// both are a plain Confirm/Cancel over one question, nothing call-specific
-/// baked in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CallConfirmChoice {
-    Confirm,
-    Cancel,
-}
 
 /// A pending `/delete-channel` or `/assign-admin` confirmation - built
 /// once, right when the command is typed, so the popup itself stays
@@ -1583,9 +1543,9 @@ pub struct CallUiState {
     /// (`docs/SPEC.md` "Live voice calls"). The button is focused from the
     /// moment the modal opens and Enter is the modal's most reachable key,
     /// so without this a stray Enter leaves a call with no way back into
-    /// it. `CallConfirmChoice::Cancel` is the default answer, same as the
+    /// it. `Confirm::No` is the default answer, same as the
     /// identity review's `Reject`: the safe one.
-    pub end_confirm: Option<CallConfirmChoice>,
+    pub end_confirm: Option<Confirm>,
 }
 
 impl CallUiState {
@@ -2491,10 +2451,10 @@ pub struct UiState {
     /// - see `crate::client::tui::export_popup`.
     pub export_popup: Option<super::export_popup::ExportPopupState>,
     /// A pending `/delete-channel` or `/assign-admin` confirmation -
-    /// answered the same way `call_confirm` is, reusing `CallConfirmChoice`
+    /// answered the same way `call_confirm` is, reusing `Confirm`
     /// since both are a plain Confirm/Cancel over a one-line question.
     pub channel_command_confirm: Option<ChannelCommandConfirm>,
-    channel_command_confirm_focus: CallConfirmChoice,
+    channel_command_confirm_focus: Confirm,
     /// Every incoming file offer currently awaiting a decision, keyed by
     /// `(from, stream_id)` - the popup always shows whichever's at the
     /// front of `file_offer_queue`. Analogous to `identity_reviews`/
@@ -2513,7 +2473,7 @@ pub struct UiState {
     /// shown, same "always starts on the safe/common default" precedent
     /// `identity_review_focus` sets (there, `Reject`; here, `Accept` - see
     /// `PendingFileOffer`'s doc for why the default flips).
-    file_offer_focus: FileOfferChoice,
+    file_offer_focus: Confirm,
     /// File offers received from a `Pending`/`Rejected` identity-review
     /// sender (`docs/PROTOCOL.md` §12), held back the same way
     /// `pending_messages` holds ordinary messages - queued for real
@@ -2525,7 +2485,7 @@ pub struct UiState {
     /// (queued-popup idiom, `Accept`-first default).
     pub call_invites: HashMap<u64, PendingCallInvite>,
     call_invite_queue: VecDeque<u64>,
-    call_invite_focus: CallInviteChoice,
+    call_invite_focus: Confirm,
     /// Call invites received from a `Pending`/`Rejected` identity-review
     /// sender, held back the same way `pending_file_offers` holds a file
     /// offer - queued for real (`push_call_invite`, popup + bell) only once
@@ -2542,14 +2502,14 @@ pub struct UiState {
     /// `/call` before a single invite is sent. `None` when nothing is
     /// pending; only ever one at a time, same as every other popup here.
     pub call_confirm: Option<PendingCallConfirm>,
-    call_confirm_focus: CallConfirmChoice,
+    call_confirm_focus: Confirm,
     /// The local "generate and share a fresh OTP pad?" confirmation opened
     /// by `/otp` when no keychain entry exists yet
     /// (`client::otp::handle_otp_command`) - `None` when nothing is
     /// pending. Only ever one at a time: `/otp` itself is unreachable while
     /// any modal popup (including this one) is already absorbing input.
     otp_generate_confirm: Option<PendingOtpGenerate>,
-    otp_generate_focus: OtpChoice,
+    otp_generate_focus: Confirm,
     /// The pad-size prompt shown right after accepting `otp_generate_confirm`
     /// - carries the same peer info forward (nothing about who/what was
     /// asked changes, only whether a size has been chosen yet). `None`
@@ -2576,7 +2536,7 @@ pub struct UiState {
     /// exactly (queued-popup idiom, `Accept`-first default).
     otp_invites: HashMap<UserId, PendingOtpInvite>,
     otp_invite_queue: VecDeque<UserId>,
-    otp_invite_focus: OtpChoice,
+    otp_invite_focus: Confirm,
     /// The most recent OTP session outcome ("OTP session started at ..."
     /// in green, or a cancellation/failure in red) - a small always-visible
     /// notice, independent of `audio_error`'s suppressed-by-design banner
@@ -2720,7 +2680,7 @@ pub struct UiState {
     /// `Reject` (the non-trusting default) every time a different peer's
     /// review becomes the one shown, so accepting always takes a deliberate
     /// move off the safe default rather than an accidental double-Enter.
-    identity_review_focus: IdentityChoice,
+    identity_review_focus: Confirm,
     /// One outstanding "an unknown direct-punch nickname sent proof" review
     /// per peer (`docs/PROTOCOL.md` §7.1.5) - a different question from
     /// `identity_reviews` (no identity at all, rather than one that
@@ -2738,7 +2698,7 @@ pub struct UiState {
     /// Which button is focused in the currently-open popup. Reset to `No`
     /// every time a different peer's review becomes the one shown, for the
     /// same reason `identity_review_focus` resets to `Reject`.
-    unknown_peer_review_focus: UnknownPeerChoice,
+    unknown_peer_review_focus: Confirm,
     /// Messages/streams received from a `Pending`/`Rejected` peer, held
     /// back from the visible channel/DM log until they're `Accepted`
     /// (`docs/PROTOCOL.md` §12 "hold and reveal") - see `HeldMessage`.
@@ -2874,29 +2834,29 @@ impl UiState {
             channel_lock: None,
             export_popup: None,
             channel_command_confirm: None,
-            channel_command_confirm_focus: CallConfirmChoice::Confirm,
+            channel_command_confirm_focus: Confirm::Yes,
             file_row_of_stream: HashMap::new(),
             file_rows: HashMap::new(),
             file_offers: HashMap::new(),
             file_offer_queue: VecDeque::new(),
-            file_offer_focus: FileOfferChoice::Accept,
+            file_offer_focus: Confirm::Yes,
             pending_file_offers: HashMap::new(),
             call_invites: HashMap::new(),
             call_invite_queue: VecDeque::new(),
-            call_invite_focus: CallInviteChoice::Accept,
+            call_invite_focus: Confirm::Yes,
             pending_call_invites: HashMap::new(),
             call: None,
             call_confirm: None,
-            call_confirm_focus: CallConfirmChoice::Confirm,
+            call_confirm_focus: Confirm::Yes,
             otp_generate_confirm: None,
-            otp_generate_focus: OtpChoice::Accept,
+            otp_generate_focus: Confirm::Yes,
             otp_size_input: None,
             otp_size_text: String::new(),
             otp_size_error: None,
             otp_keygen: None,
             otp_invites: HashMap::new(),
             otp_invite_queue: VecDeque::new(),
-            otp_invite_focus: OtpChoice::Accept,
+            otp_invite_focus: Confirm::Yes,
             status_notice: None,
             status_notice_since: None,
             otp_active_peers: HashSet::new(),
@@ -2915,10 +2875,10 @@ impl UiState {
             file_preview: None,
             identity_reviews: HashMap::new(),
             identity_review_queue: VecDeque::new(),
-            identity_review_focus: IdentityChoice::Reject,
+            identity_review_focus: Confirm::No,
             unknown_peer_reviews: HashMap::new(),
             unknown_peer_review_queue: VecDeque::new(),
-            unknown_peer_review_focus: UnknownPeerChoice::No,
+            unknown_peer_review_focus: Confirm::No,
             pending_messages: HashMap::new(),
             next_msg_id: 0,
             message_info: None,
@@ -3027,7 +2987,7 @@ impl UiState {
             self.identity_review_queue.push_back(peer);
         }
         if self.identity_review_queue.front() == Some(&peer) {
-            self.identity_review_focus = IdentityChoice::Reject;
+            self.identity_review_focus = Confirm::No;
         }
     }
 
@@ -3071,7 +3031,7 @@ impl UiState {
             self.identity_review_queue.push_back(peer);
         }
         if self.identity_review_queue.front() == Some(&peer) {
-            self.identity_review_focus = IdentityChoice::Reject;
+            self.identity_review_focus = Confirm::No;
         }
         true
     }
@@ -3118,7 +3078,7 @@ impl UiState {
         );
         self.unknown_peer_review_queue.push_back(peer);
         if self.unknown_peer_review_queue.front() == Some(&peer) {
-            self.unknown_peer_review_focus = UnknownPeerChoice::No;
+            self.unknown_peer_review_focus = Confirm::No;
         }
         true
     }
@@ -3145,7 +3105,7 @@ impl UiState {
                 matched_key_der,
                 recovered,
             };
-            self.unknown_peer_review_focus = UnknownPeerChoice::No;
+            self.unknown_peer_review_focus = Confirm::No;
         }
     }
 
@@ -3527,7 +3487,7 @@ impl UiState {
         let was_front = self.identity_review_queue.front() == Some(&peer);
         self.identity_review_queue.retain(|p| *p != peer);
         if was_front {
-            self.identity_review_focus = IdentityChoice::Reject;
+            self.identity_review_focus = Confirm::No;
         }
     }
 
@@ -3652,7 +3612,7 @@ impl UiState {
         }
         self.identity_review_queue.retain(|p| *p != peer);
         self.identity_review_queue.push_front(peer);
-        self.identity_review_focus = IdentityChoice::Reject;
+        self.identity_review_focus = Confirm::No;
     }
 
     // -------------------------------------------------------------
@@ -3671,7 +3631,7 @@ impl UiState {
         self.file_offer_queue.push_back(key);
         let is_front = self.file_offer_queue.front() == Some(&key);
         if is_front {
-            self.file_offer_focus = FileOfferChoice::Accept;
+            self.file_offer_focus = Confirm::Yes;
         }
         is_front
     }
@@ -3689,7 +3649,7 @@ impl UiState {
     pub fn take_file_offer(&mut self, from: UserId, stream_id: u64) -> Option<PendingFileOffer> {
         let key = (from, stream_id);
         self.file_offer_queue.retain(|k| *k != key);
-        self.file_offer_focus = FileOfferChoice::Accept;
+        self.file_offer_focus = Confirm::Yes;
         self.file_offers.remove(&key)
     }
 
@@ -3708,7 +3668,7 @@ impl UiState {
         self.call_invite_queue.push_back(key);
         let is_front = self.call_invite_queue.front() == Some(&key);
         if is_front {
-            self.call_invite_focus = CallInviteChoice::Accept;
+            self.call_invite_focus = Confirm::Yes;
         }
         is_front
     }
@@ -3778,7 +3738,7 @@ impl UiState {
     /// always final, same as a file offer's.
     pub fn take_call_invite(&mut self, call_id: u64) -> Option<PendingCallInvite> {
         self.call_invite_queue.retain(|k| *k != call_id);
-        self.call_invite_focus = CallInviteChoice::Accept;
+        self.call_invite_focus = Confirm::Yes;
         self.call_invites.remove(&call_id)
     }
 
@@ -4053,11 +4013,11 @@ impl UiState {
             pubkey_der,
             purpose,
         });
-        self.otp_generate_focus = OtpChoice::Accept;
+        self.otp_generate_focus = Confirm::Yes;
     }
 
     pub fn take_otp_generate_confirm(&mut self) -> Option<PendingOtpGenerate> {
-        self.otp_generate_focus = OtpChoice::Accept;
+        self.otp_generate_focus = Confirm::Yes;
         self.otp_generate_confirm.take()
     }
 
@@ -4224,7 +4184,7 @@ impl UiState {
             self.otp_invite_queue.push_back(from);
         }
         if self.otp_invite_queue.front() == Some(&from) {
-            self.otp_invite_focus = OtpChoice::Accept;
+            self.otp_invite_focus = Confirm::Yes;
         }
     }
 
@@ -4235,7 +4195,7 @@ impl UiState {
 
     pub fn take_otp_invite(&mut self) -> Option<PendingOtpInvite> {
         let from = self.otp_invite_queue.pop_front()?;
-        self.otp_invite_focus = OtpChoice::Accept;
+        self.otp_invite_focus = Confirm::Yes;
         self.otp_invites.remove(&from)
     }
 
@@ -4253,7 +4213,7 @@ impl UiState {
     pub fn take_otp_invite_from(&mut self, from: UserId) -> bool {
         self.otp_invite_queue.retain(|queued| *queued != from);
         if self.otp_invites.remove(&from).is_some() {
-            self.otp_invite_focus = OtpChoice::Accept;
+            self.otp_invite_focus = Confirm::Yes;
             return true;
         }
         false
@@ -4896,15 +4856,12 @@ impl UiState {
             return match kind {
                 KeyEventKind::Press | KeyEventKind::Repeat => match code {
                     KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
-                        self.identity_review_focus = match self.identity_review_focus {
-                            IdentityChoice::Accept => IdentityChoice::Reject,
-                            IdentityChoice::Reject => IdentityChoice::Accept,
-                        };
+                        self.identity_review_focus.toggle();
                         None
                     }
                     KeyCode::Enter => match self.identity_review_focus {
-                        IdentityChoice::Accept => Some(UiAction::AcceptIdentity(peer)),
-                        IdentityChoice::Reject => Some(UiAction::RejectIdentity(peer)),
+                        Confirm::Yes => Some(UiAction::AcceptIdentity(peer)),
+                        Confirm::No => Some(UiAction::RejectIdentity(peer)),
                     },
                     _ => None,
                 },
@@ -4921,25 +4878,22 @@ impl UiState {
             return match kind {
                 KeyEventKind::Press | KeyEventKind::Repeat => match code {
                     KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
-                        self.unknown_peer_review_focus = match self.unknown_peer_review_focus {
-                            UnknownPeerChoice::Yes => UnknownPeerChoice::No,
-                            UnknownPeerChoice::No => UnknownPeerChoice::Yes,
-                        };
+                        self.unknown_peer_review_focus.toggle();
                         None
                     }
                     KeyCode::Enter => {
                         let stage = self.unknown_peer_reviews.get(&peer).map(|r| &r.stage);
                         match (stage, self.unknown_peer_review_focus) {
-                            (Some(UnknownPeerStage::Initial), UnknownPeerChoice::Yes) => {
+                            (Some(UnknownPeerStage::Initial), Confirm::Yes) => {
                                 Some(UiAction::CheckUnknownPeerIdentity(peer))
                             }
-                            (Some(UnknownPeerStage::Initial), UnknownPeerChoice::No) => {
+                            (Some(UnknownPeerStage::Initial), Confirm::No) => {
                                 Some(UiAction::DeclineUnknownPeerIdentity(peer))
                             }
-                            (Some(UnknownPeerStage::ConfirmMatch { .. }), UnknownPeerChoice::Yes) => {
+                            (Some(UnknownPeerStage::ConfirmMatch { .. }), Confirm::Yes) => {
                                 Some(UiAction::ConfirmUnknownPeerKey(peer))
                             }
-                            (Some(UnknownPeerStage::ConfirmMatch { .. }), UnknownPeerChoice::No) => {
+                            (Some(UnknownPeerStage::ConfirmMatch { .. }), Confirm::No) => {
                                 Some(UiAction::DeclineUnknownPeerKey(peer))
                             }
                             (None, _) => None,
@@ -4959,15 +4913,12 @@ impl UiState {
             return match kind {
                 KeyEventKind::Press | KeyEventKind::Repeat => match code {
                     KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
-                        self.otp_invite_focus = match self.otp_invite_focus {
-                            OtpChoice::Accept => OtpChoice::Reject,
-                            OtpChoice::Reject => OtpChoice::Accept,
-                        };
+                        self.otp_invite_focus.toggle();
                         None
                     }
                     KeyCode::Enter => match self.otp_invite_focus {
-                        OtpChoice::Accept => Some(UiAction::AcceptOtpInvite),
-                        OtpChoice::Reject => Some(UiAction::RejectOtpInvite),
+                        Confirm::Yes => Some(UiAction::AcceptOtpInvite),
+                        Confirm::No => Some(UiAction::RejectOtpInvite),
                     },
                     _ => None,
                 },
@@ -5044,14 +4995,11 @@ impl UiState {
             return match kind {
                 KeyEventKind::Press | KeyEventKind::Repeat => match code {
                     KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
-                        self.otp_generate_focus = match self.otp_generate_focus {
-                            OtpChoice::Accept => OtpChoice::Reject,
-                            OtpChoice::Reject => OtpChoice::Accept,
-                        };
+                        self.otp_generate_focus.toggle();
                         None
                     }
                     KeyCode::Enter => match self.otp_generate_focus {
-                        OtpChoice::Accept => {
+                        Confirm::Yes => {
                             // Confirming only decides "yes, generate one" -
                             // the size prompt above is the next step, not
                             // an immediate `ConfirmOtpGenerate`.
@@ -5061,7 +5009,7 @@ impl UiState {
                             self.open_otp_size_input(pending);
                             None
                         }
-                        OtpChoice::Reject => Some(UiAction::CancelOtpGenerate),
+                        Confirm::No => Some(UiAction::CancelOtpGenerate),
                     },
                     _ => None,
                 },
@@ -5078,17 +5026,14 @@ impl UiState {
             return match kind {
                 KeyEventKind::Press | KeyEventKind::Repeat => match code {
                     KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
-                        self.file_offer_focus = match self.file_offer_focus {
-                            FileOfferChoice::Accept => FileOfferChoice::Reject,
-                            FileOfferChoice::Reject => FileOfferChoice::Accept,
-                        };
+                        self.file_offer_focus.toggle();
                         None
                     }
                     KeyCode::Enter => match self.file_offer_focus {
-                        FileOfferChoice::Accept => {
+                        Confirm::Yes => {
                             Some(UiAction::AcceptFileOffer { from, stream_id })
                         }
-                        FileOfferChoice::Reject => {
+                        Confirm::No => {
                             Some(UiAction::RejectFileOffer { from, stream_id })
                         }
                     },
@@ -5105,15 +5050,12 @@ impl UiState {
             return match kind {
                 KeyEventKind::Press | KeyEventKind::Repeat => match code {
                     KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
-                        self.call_invite_focus = match self.call_invite_focus {
-                            CallInviteChoice::Accept => CallInviteChoice::Reject,
-                            CallInviteChoice::Reject => CallInviteChoice::Accept,
-                        };
+                        self.call_invite_focus.toggle();
                         None
                     }
                     KeyCode::Enter => match self.call_invite_focus {
-                        CallInviteChoice::Accept => self.accept_call_invite(call_id),
-                        CallInviteChoice::Reject => Some(UiAction::RejectCallInvite { call_id }),
+                        Confirm::Yes => self.accept_call_invite(call_id),
+                        Confirm::No => Some(UiAction::RejectCallInvite { call_id }),
                     },
                     _ => None,
                 },
@@ -5122,15 +5064,12 @@ impl UiState {
         }
 
         // `/delete-channel`/`/assign-admin`'s confirmation - same tier and
-        // shape as `/call`'s just below, reusing `CallConfirmChoice`.
+        // shape as `/call`'s just below, reusing `Confirm`.
         if self.channel_command_confirm.is_some() {
             return match kind {
                 KeyEventKind::Press | KeyEventKind::Repeat => match code {
                     KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
-                        self.channel_command_confirm_focus = match self.channel_command_confirm_focus {
-                            CallConfirmChoice::Confirm => CallConfirmChoice::Cancel,
-                            CallConfirmChoice::Cancel => CallConfirmChoice::Confirm,
-                        };
+                        self.channel_command_confirm_focus.toggle();
                         None
                     }
                     KeyCode::Esc => {
@@ -5140,7 +5079,7 @@ impl UiState {
                     KeyCode::Enter => {
                         let pending = self.channel_command_confirm.take()?;
                         match self.channel_command_confirm_focus {
-                            CallConfirmChoice::Confirm => Some(match pending.action {
+                            Confirm::Yes => Some(match pending.action {
                                 ChannelCommandConfirmAction::DeleteChannel { name } => {
                                     UiAction::DeleteChannel { name }
                                 }
@@ -5148,7 +5087,7 @@ impl UiState {
                                     UiAction::AssignChannelAdmin { channel, nickname }
                                 }
                             }),
-                            CallConfirmChoice::Cancel => None,
+                            Confirm::No => None,
                         }
                     }
                     _ => None,
@@ -5164,10 +5103,7 @@ impl UiState {
             return match kind {
                 KeyEventKind::Press | KeyEventKind::Repeat => match code {
                     KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
-                        self.call_confirm_focus = match self.call_confirm_focus {
-                            CallConfirmChoice::Confirm => CallConfirmChoice::Cancel,
-                            CallConfirmChoice::Cancel => CallConfirmChoice::Confirm,
-                        };
+                        self.call_confirm_focus.toggle();
                         None
                     }
                     KeyCode::Esc => {
@@ -5177,8 +5113,8 @@ impl UiState {
                     KeyCode::Enter => {
                         let pending = self.call_confirm.take()?;
                         match self.call_confirm_focus {
-                            CallConfirmChoice::Confirm => Some(UiAction::StartCall(pending.target)),
-                            CallConfirmChoice::Cancel => None,
+                            Confirm::Yes => Some(UiAction::StartCall(pending.target)),
+                            Confirm::No => None,
                         }
                     }
                     _ => None,
@@ -5618,7 +5554,7 @@ impl UiState {
             // END CALL asks first (see `CallUiState::end_confirm`); the
             // answer is what actually leaves.
             KeyCode::Enter | KeyCode::Char('e') | KeyCode::Char('E') => {
-                self.call.as_mut()?.end_confirm = Some(CallConfirmChoice::Cancel);
+                self.call.as_mut()?.end_confirm = Some(Confirm::No);
                 None
             }
             // Selector navigation keeps working through the modal - it is
@@ -5656,10 +5592,7 @@ impl UiState {
         let focus = call.end_confirm?;
         match code {
             KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
-                call.end_confirm = Some(match focus {
-                    CallConfirmChoice::Confirm => CallConfirmChoice::Cancel,
-                    CallConfirmChoice::Cancel => CallConfirmChoice::Confirm,
-                });
+                call.end_confirm = Some(focus.toggled());
                 None
             }
             KeyCode::Esc => {
@@ -5669,8 +5602,8 @@ impl UiState {
             KeyCode::Enter => {
                 call.end_confirm = None;
                 match focus {
-                    CallConfirmChoice::Confirm => Some(UiAction::EndCall),
-                    CallConfirmChoice::Cancel => None,
+                    Confirm::Yes => Some(UiAction::EndCall),
+                    Confirm::No => None,
                 }
             }
             _ => None,
@@ -6182,7 +6115,7 @@ impl UiState {
                 question: format!("Delete #{name}? This cannot be undone."),
                 action: ChannelCommandConfirmAction::DeleteChannel { name },
             });
-            self.channel_command_confirm_focus = CallConfirmChoice::Cancel;
+            self.channel_command_confirm_focus = Confirm::No;
             return None;
         }
         if self.input.trim() == "/lock-joins" {
@@ -6249,7 +6182,7 @@ impl UiState {
                 target,
                 invitee_count,
             });
-            self.call_confirm_focus = CallConfirmChoice::Confirm;
+            self.call_confirm_focus = Confirm::Yes;
             return None;
         }
         if self.input.trim() == "/daemon" {
@@ -6699,7 +6632,7 @@ impl UiState {
                         nickname,
                     },
                 });
-                self.channel_command_confirm_focus = CallConfirmChoice::Cancel;
+                self.channel_command_confirm_focus = Confirm::No;
                 return Some(None);
             }
         }))
@@ -7635,26 +7568,15 @@ pub fn render(frame: &mut Frame, state: &UiState) {
 /// The Accept/Reject popup for one incoming file offer
 /// (`docs/PROTOCOL.md`'s file transfer section) - visual shape mirrors
 /// `render_identity_review_popup`, `Accept` focused by default (see
-/// `FileOfferChoice`'s doc for why the default flips from the identity
+/// `Confirm`'s doc for why the default flips from the identity
 /// review's `Reject`-first one).
 fn render_file_offer_popup(
     frame: &mut Frame,
     area: Rect,
     offer: &PendingFileOffer,
-    focus: FileOfferChoice,
+    focus: Confirm,
 ) {
     let title = format!("Incoming file from {}", offer.from_name);
-    let popup = centered_rect(64, 9, area);
-    let block = Block::default().title(title).borders(Borders::ALL);
-    let inner = block.inner(popup);
-    frame.render_widget(Clear, popup);
-    frame.render_widget(block, popup);
-
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(3)])
-        .split(inner);
-
     let location = match &offer.channel {
         Some(name) => format!("#{name}"),
         None => "a private message".to_string(),
@@ -7665,29 +7587,13 @@ fn render_file_offer_popup(
         offer.filename,
         format_file_size(offer.size)
     );
-    frame.render_widget(
-        Paragraph::new(message).wrap(ratatui::widgets::Wrap { trim: true }),
-        rows[0],
-    );
-
-    let button_cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(rows[1]);
-    render_popup_button(
-        frame,
-        button_cols[0],
-        16,
-        "Accept",
-        focus == FileOfferChoice::Accept,
-    );
-    render_popup_button(
-        frame,
-        button_cols[1],
-        16,
-        "Reject",
-        focus == FileOfferChoice::Reject,
-    );
+    ConfirmPopup {
+        title: &title,
+        labels: ConfirmLabels::ACCEPT_REJECT,
+        focus: Some(focus),
+        ..Default::default()
+    }
+    .render_message(frame, area, &message);
 }
 
 /// The Accept/Reject popup for one incoming call invite
@@ -7697,20 +7603,9 @@ fn render_call_invite_popup(
     frame: &mut Frame,
     area: Rect,
     invite: &PendingCallInvite,
-    focus: CallInviteChoice,
+    focus: Confirm,
 ) {
     let title = format!("Voice call incoming from {}", invite.from_name);
-    let popup = centered_rect(64, 9, area);
-    let block = Block::default().title(title).borders(Borders::ALL);
-    let inner = block.inner(popup);
-    frame.render_widget(Clear, popup);
-    frame.render_widget(block, popup);
-
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(3)])
-        .split(inner);
-
     let location = match &invite.channel {
         Some(name) => format!("#{name}"),
         None => "a private message".to_string(),
@@ -7719,50 +7614,23 @@ fn render_call_invite_popup(
         "{} is calling via {location}. Do you accept?",
         invite.from_name
     );
-    frame.render_widget(
-        Paragraph::new(message).wrap(ratatui::widgets::Wrap { trim: true }),
-        rows[0],
-    );
-
-    let button_cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(rows[1]);
-    render_popup_button(
-        frame,
-        button_cols[0],
-        16,
-        "Accept",
-        focus == CallInviteChoice::Accept,
-    );
-    render_popup_button(
-        frame,
-        button_cols[1],
-        16,
-        "Reject",
-        focus == CallInviteChoice::Reject,
-    );
+    ConfirmPopup {
+        title: &title,
+        labels: ConfirmLabels::ACCEPT_REJECT,
+        focus: Some(focus),
+        ..Default::default()
+    }
+    .render_message(frame, area, &message);
 }
 
 fn render_otp_generate_popup(
     frame: &mut Frame,
     area: Rect,
     pending: &PendingOtpGenerate,
-    focus: OtpChoice,
+    focus: Confirm,
 ) {
     let label = pending.purpose.label();
-    let popup = centered_rect(64, 11, area);
-    let block = Block::default()
-        .title(format!("Start an {label}"))
-        .borders(Borders::ALL);
-    let inner = block.inner(popup);
-    frame.render_widget(Clear, popup);
-    frame.render_widget(block, popup);
-
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(6), Constraint::Length(3)])
-        .split(inner);
+    let title = format!("Start an {label}");
 
     let retry_command = match pending.purpose {
         crate::crypto::otp::OtpPurpose::Live => "/otp",
@@ -7775,51 +7643,26 @@ fn render_otp_generate_popup(
          then try {retry_command} again.",
         pending.peer_name
     );
-    frame.render_widget(
-        Paragraph::new(message).wrap(ratatui::widgets::Wrap { trim: true }),
-        rows[0],
-    );
-
-    let button_cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(rows[1]);
-    render_popup_button(
-        frame,
-        button_cols[0],
-        16,
-        "Accept",
-        focus == OtpChoice::Accept,
-    );
-    render_popup_button(
-        frame,
-        button_cols[1],
-        16,
-        "Reject",
-        focus == OtpChoice::Reject,
-    );
+    ConfirmPopup {
+        title: &title,
+        labels: ConfirmLabels::ACCEPT_REJECT,
+        focus: Some(focus),
+        size: (64, 11),
+        body_min_height: 6,
+        ..Default::default()
+    }
+    .render_message(frame, area, &message);
 }
 
 fn render_otp_invite_popup(
     frame: &mut Frame,
     area: Rect,
     invite: &PendingOtpInvite,
-    focus: OtpChoice,
+    focus: Confirm,
 ) {
     let purpose = crate::crypto::otp::OtpPurpose::of_contact_name(&invite.contact_name);
     let label = purpose.label();
-    let popup = centered_rect(64, 9, area);
-    let block = Block::default()
-        .title(format!("{label} request from {}", invite.from_name))
-        .borders(Borders::ALL);
-    let inner = block.inner(popup);
-    frame.render_widget(Clear, popup);
-    frame.render_widget(block, popup);
-
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(3)])
-        .split(inner);
+    let title = format!("{label} request from {}", invite.from_name);
 
     // The size, when there is one (a fresh-key invitation, not a bare
     // resume request), is exactly what the sender chose in their own size
@@ -7846,29 +7689,13 @@ fn render_otp_invite_popup(
             invite.from_name
         ),
     };
-    frame.render_widget(
-        Paragraph::new(message).wrap(ratatui::widgets::Wrap { trim: true }),
-        rows[0],
-    );
-
-    let button_cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(rows[1]);
-    render_popup_button(
-        frame,
-        button_cols[0],
-        16,
-        "Accept",
-        focus == OtpChoice::Accept,
-    );
-    render_popup_button(
-        frame,
-        button_cols[1],
-        16,
-        "Reject",
-        focus == OtpChoice::Reject,
-    );
+    ConfirmPopup {
+        title: &title,
+        labels: ConfirmLabels::ACCEPT_REJECT,
+        focus: Some(focus),
+        ..Default::default()
+    }
+    .render_message(frame, area, &message);
 }
 
 /// Follows `render_otp_generate_popup`'s Accept - asks how large a pad to
@@ -8343,45 +8170,27 @@ pub(crate) fn render_call_modal(
 /// What END CALL asks before it leaves a call
 /// (`CallUiState::end_confirm`). Drawn over the modal it was pressed on,
 /// like the invite picker, so the roster it is about stays in view.
-fn render_end_call_confirm_popup(frame: &mut Frame, area: Rect, focus: CallConfirmChoice) {
-    let popup = centered_rect(48, 6, area);
-    let block = Block::default()
-        .title(END_CALL_CONFIRM_TITLE)
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Red));
-    let inner = block.inner(popup);
-    frame.render_widget(Clear, popup);
-    frame.render_widget(block, popup);
-
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(3)])
-        .split(inner);
-    frame.render_widget(
-        Paragraph::new(END_CALL_CONFIRM_QUESTION)
-            .wrap(ratatui::widgets::Wrap { trim: true })
-            .alignment(ratatui::layout::Alignment::Center),
-        rows[0],
-    );
-
-    let button_cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(rows[1]);
-    render_popup_button(
-        frame,
-        button_cols[0],
-        16,
-        "END CALL",
-        focus == CallConfirmChoice::Confirm,
-    );
-    render_popup_button(
-        frame,
-        button_cols[1],
-        16,
-        "Cancel",
-        focus == CallConfirmChoice::Cancel,
-    );
+fn render_end_call_confirm_popup(frame: &mut Frame, area: Rect, focus: Confirm) {
+    // The one confirmation whose question is centered rather than
+    // left-aligned, so it renders its own body rather than using
+    // `render_message`.
+    ConfirmPopup {
+        title: END_CALL_CONFIRM_TITLE,
+        labels: ConfirmLabels::new("END CALL", "Cancel"),
+        focus: Some(focus),
+        size: (48, 6),
+        border_style: Some(Style::default().fg(Color::Red)),
+        body_min_height: 1,
+        ..Default::default()
+    }
+    .render(frame, area, |frame, body| {
+        frame.render_widget(
+            Paragraph::new(END_CALL_CONFIRM_QUESTION)
+                .wrap(ratatui::widgets::Wrap { trim: true })
+                .alignment(ratatui::layout::Alignment::Center),
+            body,
+        );
+    });
 }
 
 /// The confirmation's title and question, named so a test reads the same
@@ -8479,19 +8288,8 @@ fn render_call_confirm_popup(
     frame: &mut Frame,
     area: Rect,
     pending: &PendingCallConfirm,
-    focus: CallConfirmChoice,
+    focus: Confirm,
 ) {
-    let popup = centered_rect(60, 9, area);
-    let block = Block::default().title("Start a call").borders(Borders::ALL);
-    let inner = block.inner(popup);
-    frame.render_widget(Clear, popup);
-    frame.render_widget(block, popup);
-
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(3)])
-        .split(inner);
-
     let where_clause = match &pending.target {
         CallTarget::Channel { channel } => format!("in #{channel}"),
         CallTarget::Direct { .. } => "in this private room".to_string(),
@@ -8501,39 +8299,31 @@ fn render_call_confirm_popup(
     } else {
         "users"
     };
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::raw("This will invite "),
-            Span::styled(
-                format!("{} {plural}", pending.invitee_count),
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(format!(" {where_clause} to a live call. Go ahead?")),
-        ]))
-        .wrap(ratatui::widgets::Wrap { trim: true }),
-        rows[0],
-    );
-
-    let button_cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(rows[1]);
-    render_popup_button(
-        frame,
-        button_cols[0],
-        16,
-        "Call",
-        focus == CallConfirmChoice::Confirm,
-    );
-    render_popup_button(
-        frame,
-        button_cols[1],
-        16,
-        "Cancel",
-        focus == CallConfirmChoice::Cancel,
-    );
+    // The invitee count is highlighted, so this is a styled `Line` rather
+    // than the plain message `render_message` takes.
+    ConfirmPopup {
+        title: "Start a call",
+        labels: ConfirmLabels::new("Call", "Cancel"),
+        focus: Some(focus),
+        size: (60, 9),
+        ..Default::default()
+    }
+    .render(frame, area, |frame, body| {
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::raw("This will invite "),
+                Span::styled(
+                    format!("{} {plural}", pending.invitee_count),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(format!(" {where_clause} to a live call. Go ahead?")),
+            ]))
+            .wrap(ratatui::widgets::Wrap { trim: true }),
+            body,
+        );
+    });
 }
 
 /// `/delete-channel`/`/assign-admin`'s confirmation - a red-bordered
@@ -8544,33 +8334,17 @@ fn render_channel_command_confirm_popup(
     frame: &mut Frame,
     area: Rect,
     pending: &ChannelCommandConfirm,
-    focus: CallConfirmChoice,
+    focus: Confirm,
 ) {
-    let popup = centered_rect(60, 9, area);
-    let block = Block::default()
-        .title(pending.title)
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Red));
-    let inner = block.inner(popup);
-    frame.render_widget(Clear, popup);
-    frame.render_widget(block, popup);
-
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(3)])
-        .split(inner);
-
-    frame.render_widget(
-        Paragraph::new(pending.question.as_str()).wrap(ratatui::widgets::Wrap { trim: true }),
-        rows[0],
-    );
-
-    let button_cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(rows[1]);
-    render_popup_button(frame, button_cols[0], 16, "Confirm", focus == CallConfirmChoice::Confirm);
-    render_popup_button(frame, button_cols[1], 16, "Cancel", focus == CallConfirmChoice::Cancel);
+    ConfirmPopup {
+        title: pending.title,
+        labels: ConfirmLabels::CONFIRM_CANCEL,
+        focus: Some(focus),
+        size: (60, 9),
+        border_style: Some(Style::default().fg(Color::Red)),
+        ..Default::default()
+    }
+    .render_message(frame, area, pending.question.as_str());
 }
 
 fn render_call_banner(
@@ -8664,24 +8438,13 @@ fn render_identity_review_popup(
     frame: &mut Frame,
     area: Rect,
     review: &IdentityReview,
-    focus: IdentityChoice,
+    focus: Confirm,
 ) {
     let title = format!("Identity review: {}", review.nickname);
     // Taller than the other single-button popups (64x9): the message now
     // also carries the last-known vs. new address/device id
     // (docs/PROTOCOL.md §12.7), several lines longer than the original
     // one-line fingerprint warning.
-    let popup = centered_rect(70, 13, area);
-    let block = Block::default().title(title).borders(Borders::ALL);
-    let inner = block.inner(popup);
-    frame.render_widget(Clear, popup);
-    frame.render_widget(block, popup);
-
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(3)])
-        .split(inner);
-
     let mut lines = vec![Line::from(review.message.as_str())];
     if review.status == IdentityStatus::Rejected {
         lines.push(Line::from(""));
@@ -8690,29 +8453,19 @@ fn render_identity_review_popup(
             Style::default().fg(Color::Red),
         )));
     }
-    frame.render_widget(
-        Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: true }),
-        rows[0],
-    );
-
-    let button_cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(rows[1]);
-    render_popup_button(
-        frame,
-        button_cols[0],
-        16,
-        "Accept",
-        focus == IdentityChoice::Accept,
-    );
-    render_popup_button(
-        frame,
-        button_cols[1],
-        16,
-        "Reject",
-        focus == IdentityChoice::Reject,
-    );
+    ConfirmPopup {
+        title: &title,
+        labels: ConfirmLabels::ACCEPT_REJECT,
+        focus: Some(focus),
+        size: (70, 13),
+        ..Default::default()
+    }
+    .render(frame, area, |frame, body| {
+        frame.render_widget(
+            Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: true }),
+            body,
+        );
+    });
 }
 
 /// The Yes/No popup for a `direct_punch_to` nickname with no pinned key
@@ -8725,20 +8478,9 @@ fn render_unknown_peer_popup(
     frame: &mut Frame,
     area: Rect,
     review: &UnknownPeerReview,
-    focus: UnknownPeerChoice,
+    focus: Confirm,
 ) {
     let title = format!("Unknown direct connection: {}", review.requested_nickname);
-    let popup = centered_rect(70, 11, area);
-    let block = Block::default().title(title).borders(Borders::ALL);
-    let inner = block.inner(popup);
-    frame.render_widget(Clear, popup);
-    frame.render_widget(block, popup);
-
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(3)])
-        .split(inner);
-
     let message = match &review.stage {
         UnknownPeerStage::Initial => format!(
             "A connection was received directly to your public ip from an unknown \
@@ -8754,65 +8496,14 @@ fn render_unknown_peer_popup(
             review.requested_nickname, matched_nickname, matched_nickname, review.requested_nickname
         ),
     };
-    frame.render_widget(
-        Paragraph::new(message).wrap(ratatui::widgets::Wrap { trim: true }),
-        rows[0],
-    );
-
-    let button_cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(rows[1]);
-    render_popup_button(
-        frame,
-        button_cols[0],
-        16,
-        "Yes",
-        focus == UnknownPeerChoice::Yes,
-    );
-    render_popup_button(
-        frame,
-        button_cols[1],
-        16,
-        "No",
-        focus == UnknownPeerChoice::No,
-    );
-}
-
-/// One popup button (identity review's and the file offer's Accept/Reject,
-/// file send's Send/Discard) - same border-vs-fill focus convention as
-/// `ui_connect_popup::render_connect_button`: the border (block) always
-/// keeps its own plain/yellow-focus style, and only the *inner* area gets
-/// the solid highlight fill when focused, via the `Paragraph`'s own
-/// `.style()` rather than a separate widget underneath it. `width` is the
-/// button's fixed width, centered in `area`.
-pub(crate) fn render_popup_button(
-    frame: &mut Frame,
-    area: Rect,
-    width: u16,
-    label: &str,
-    focused: bool,
-) {
-    let popup = centered_rect(width, 3, area);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(focus_border_style(focused));
-    let text_style = if focused {
-        Style::default()
-            .fg(Color::Black)
-            .bg(Color::Yellow)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().add_modifier(Modifier::BOLD)
-    };
-    let inner = block.inner(popup);
-    frame.render_widget(block, popup);
-    frame.render_widget(
-        Paragraph::new(label)
-            .alignment(ratatui::layout::Alignment::Center)
-            .style(text_style),
-        inner,
-    );
+    ConfirmPopup {
+        title: &title,
+        labels: ConfirmLabels::YES_NO,
+        focus: Some(focus),
+        size: (70, 11),
+        ..Default::default()
+    }
+    .render_message(frame, area, &message);
 }
 
 /// The `<nickname><separator> ` a user-content row opens with. On a row

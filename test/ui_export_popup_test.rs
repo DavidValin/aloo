@@ -6,7 +6,8 @@
 mod ui_common;
 use ui_common::*;
 
-use aloo::client::tui::ui::{CallConfirmChoice, Mode, UiAction};
+use aloo::client::tui::ui::{Mode, UiAction};
+use aloo::client::tui::widgets::confirm_popup::Confirm;
 use aloo::proto::UserId;
 use crossterm::event::KeyCode;
 
@@ -27,7 +28,7 @@ fn ctrl_e_opens_the_popup_listing_every_joined_channel_and_open_dm() {
     assert_eq!(popup.channels, vec![("general".to_string(), false)]);
     assert_eq!(popup.dms, vec![(UserId(2), "bob".to_string(), false)]);
     assert!(!popup.on_buttons);
-    assert_eq!(popup.confirm_focus, CallConfirmChoice::Cancel, "Cancel is focused by default");
+    assert_eq!(popup.confirm_focus, Confirm::No, "Cancel is focused by default");
 }
 
 /// @requirement AC-358
@@ -100,16 +101,16 @@ fn left_right_and_tab_all_toggle_between_confirm_and_cancel() {
     let mut state = joined_general_with(vec![]);
     ctrl(&mut state, KeyCode::Char('e'));
     press(&mut state, KeyCode::Tab);
-    assert_eq!(state.export_popup.as_ref().unwrap().confirm_focus, CallConfirmChoice::Cancel);
+    assert_eq!(state.export_popup.as_ref().unwrap().confirm_focus, Confirm::No);
 
     press(&mut state, KeyCode::Left);
-    assert_eq!(state.export_popup.as_ref().unwrap().confirm_focus, CallConfirmChoice::Confirm);
+    assert_eq!(state.export_popup.as_ref().unwrap().confirm_focus, Confirm::Yes);
 
     press(&mut state, KeyCode::Right);
-    assert_eq!(state.export_popup.as_ref().unwrap().confirm_focus, CallConfirmChoice::Cancel);
+    assert_eq!(state.export_popup.as_ref().unwrap().confirm_focus, Confirm::No);
 
     press(&mut state, KeyCode::Tab);
-    assert_eq!(state.export_popup.as_ref().unwrap().confirm_focus, CallConfirmChoice::Confirm);
+    assert_eq!(state.export_popup.as_ref().unwrap().confirm_focus, Confirm::Yes);
 }
 
 /// @requirement AC-358

@@ -4,7 +4,8 @@ use ui_common::*;
 
 use aloo::client::contacts::ContactRow;
 use aloo::client::file_browser::FileBrowserState;
-use aloo::client::tui::contacts::{AddContactField, ContactKeyKind, DeleteChoice, InstallField};
+use aloo::client::tui::contacts::{AddContactField, ContactKeyKind, InstallField};
+use aloo::client::tui::widgets::confirm_popup::Confirm;
 use aloo::client::tui::ui::{Mode, UiAction};
 use aloo::crypto::otp::OtpPurpose;
 use aloo::proto::KeyMode;
@@ -181,7 +182,7 @@ fn d_opens_delete_confirmation_defaulting_to_cancel() {
     press(&mut state, KeyCode::Char('d'));
     assert_eq!(
         state.contacts.as_ref().unwrap().confirm_delete,
-        Some(DeleteChoice::Cancel)
+        Some(Confirm::No)
     );
 }
 

@@ -5,7 +5,8 @@ use cucumber::{given, then, when};
 
 use aloo::client::file_browser::FileBrowserState;
 use aloo::client::file_transfer::MAX_FILENAME_CHARS;
-use aloo::client::tui::file_send::{FileConfirmChoice, FileSendState, FileSendTarget};
+use aloo::client::tui::file_send::{FileSendState, FileSendTarget};
+use aloo::client::tui::widgets::confirm_popup::Confirm;
 use aloo::client::tui::ui::{FileTransferStatus, MessageBody, Mode, PendingFileOffer, UiAction};
 use aloo::proto::UserId;
 use crossterm::event::{KeyCode, KeyModifiers};
@@ -45,7 +46,7 @@ fn open_confirm(w: &mut AlooWorld, target: FileSendTarget, path: std::path::Path
         target,
         browser,
         confirm: Some(path),
-        confirm_focus: FileConfirmChoice::Discard,
+        confirm_focus: Confirm::No,
         error: None,
     });
     w.ui_mut().mode = Mode::FileSend;

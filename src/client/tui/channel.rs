@@ -65,7 +65,7 @@ pub struct ChannelTab {
 impl UiState {
     /// Handles Ctrl+J's popup: a channel name, a Public/Private selector
     /// (Tab/BackTab cycles focus among the fields; Left/Right toggles the
-    /// selector while it's focused, mirroring `file_send::FileConfirmChoice`'s
+    /// selector while it's focused, mirroring `confirm_popup::Confirm`'s
     /// toggle convention), and - only while Private is selected - an
     /// optional password field. Per-keystroke charset/length guards mirror
     /// `ui_connect_popup`'s `NICKNAME_MAX_LEN` guard-clause style.
