@@ -32,6 +32,7 @@ use super::ui::{
     format_duration_label, format_file_size, render_file_browser,
 };
 use super::widgets::confirm_popup::{BUTTON_WIDTH, Confirm, ConfirmLabels, render_confirm_row};
+use super::widgets::field::place_text_cursor;
 
 /// Which part of the compose form has focus - Tab cycles in this order.
 /// `Device` is only ever a stop on that cycle while `ComposeState::devices`
@@ -1267,18 +1268,6 @@ pub(crate) fn render_otp_mail_view(frame: &mut Frame, area: Rect, state: &UiStat
     {
         render_mail_key_blocked_modal(frame, area, &compose.to);
     }
-}
-
-/// Places the terminal's own blinking cursor right after `value`'s text
-/// inside `inner`, the same convention `ui_connect_popup`'s own
-/// `place_text_cursor` uses - what makes it obvious which single-line
-/// field (`To`/`Subtext`) is about to receive typed characters, the same
-/// way the connect popup's fields already do. `Content` wraps across
-/// multiple lines and is not covered by this simple offset-from-start
-/// placement.
-fn place_text_cursor(frame: &mut Frame, inner: Rect, value: &str) {
-    let cursor_x = inner.x + (value.chars().count() as u16).min(inner.width.saturating_sub(1));
-    frame.set_cursor_position((cursor_x, inner.y));
 }
 
 /// The hard stop for composing to a recipient with no OTP mail key -

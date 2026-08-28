@@ -178,8 +178,16 @@ impl UiState {
         self.append_to_dm(from, &from_name, entry, Unread::Mark);
     }
 
+    /// The name of the peer whose DM room `to` names, if that room is
+    /// open. `None` when it is not - and every `log_own_*_dm` below
+    /// returns silently on that, because a row for a room that does not
+    /// exist has nowhere to be shown.
+    fn dm_peer_name(&self, to: UserId) -> Option<String> {
+        self.private_rooms.get(&to).map(|r| r.peer.name.clone())
+    }
+
     pub fn log_own_voice_dm(&mut self, to: UserId, duration_ms: u32, pcm: Vec<u8>) {
-        let Some(peer_name) = self.private_rooms.get(&to).map(|r| r.peer.name.clone()) else {
+        let Some(peer_name) = self.dm_peer_name(to) else {
             return;
         };
         let entry = LogEntry::outgoing(
@@ -198,7 +206,7 @@ impl UiState {
         stream_id: u64,
         delivery: Option<MessageDelivery>,
     ) {
-        let Some(peer_name) = self.private_rooms.get(&to).map(|r| r.peer.name.clone()) else {
+        let Some(peer_name) = self.dm_peer_name(to) else {
             return;
         };
         // The autosave is a no-op for a `VoiceStreaming` placeholder - see
@@ -367,8 +375,7 @@ impl UiState {
     }
 
     /// DM counterpart of `channel::log_own_file_offer_channel` - a DM room
-    /// only ever has one recipient, so there's nothing for `to_name` to
-    /// name (the room itself already does).
+    /// only ever has one recipient, which the room itself already names.
     pub fn log_own_file_offer_dm(
         &mut self,
         to: UserId,
@@ -377,7 +384,7 @@ impl UiState {
         total: u64,
         delivery: Option<MessageDelivery>,
     ) {
-        let Some(peer_name) = self.private_rooms.get(&to).map(|r| r.peer.name.clone()) else {
+        let Some(peer_name) = self.dm_peer_name(to) else {
             return;
         };
         let entry = LogEntry::outgoing(

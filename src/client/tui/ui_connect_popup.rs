@@ -19,6 +19,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Widget, Wrap};
 
 use super::ui::{centered_rect, focus_border_style};
 use crate::client::connect::{ConnectRequest, MyKeySelection, RegisterRequest};
+use super::widgets::field::{place_text_cursor, render_bordered_field};
 
 /// `my_key` has no type selector: `pq_hybrid` (ML-DSA-87+RSA4096 signing,
 /// ML-KEM-1024+RSA4096 key-wrap, AES-256-GCM bulk encryption - §13) is the
@@ -471,7 +472,7 @@ pub fn render_activation(frame: &mut Frame, state: &ActivationPopupState) {
         .split(inner);
     frame.render_widget(Paragraph::new(state.message.clone()), chunks[0]);
     let code_inner = render_bordered_field(frame, chunks[1], "activation code", &state.code, true);
-    place_text_cursor(frame, code_inner, 0, &state.code);
+    place_text_cursor(frame, code_inner, &state.code);
     let (hint, style) = match &state.error {
         Some(e) => (e.clone(), Style::default().fg(Color::Red)),
         None => (
@@ -485,40 +486,6 @@ pub fn render_activation(frame: &mut Frame, state: &ActivationPopupState) {
 // ---------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------
-
-/// Renders `value` in its own titled, bordered box - used for the
-/// top-level `host`/`port`/`nickname` inputs (SPEC.md: "styled with a
-/// border around the box"). Returns the box's inner `Rect`, which the
-/// caller uses to place the text cursor when this field is focused.
-fn render_bordered_field(
-    frame: &mut Frame,
-    area: Rect,
-    label: &str,
-    value: &str,
-    focused: bool,
-) -> Rect {
-    let block = Block::default()
-        .title(label)
-        .borders(Borders::ALL)
-        .border_style(focus_border_style(focused));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    frame.render_widget(Paragraph::new(value), inner);
-    inner
-}
-
-/// Places the blinking terminal cursor at the end of the currently typed
-/// text in `inner`, `offset` columns in (non-zero for the `server_key`
-/// password field, which shares its line with a `"value: "` label rather
-/// than living in its own bordered box) - mirroring
-/// `ui::render_input_bar`'s cursor logic. Without this, a focused text
-/// field only *looks* focused (reversed value) but never actually shows
-/// where typing lands.
-fn place_text_cursor(frame: &mut Frame, inner: Rect, offset: u16, value: &str) {
-    let cursor_x =
-        inner.x + (offset + value.chars().count() as u16).min(inner.width.saturating_sub(1));
-    frame.set_cursor_position((cursor_x, inner.y));
-}
 
 /// How long `run` waits for a real event before giving up and advancing
 /// the background animation by one frame instead - short enough that
@@ -735,11 +702,11 @@ pub fn render(frame: &mut Frame, state: &ConnectPopupState) {
     // The cursor always follows whichever text field currently has focus,
     // starting on `host` the moment the popup opens (its default focus).
     match state.focus {
-        Field::Host => place_text_cursor(frame, host_inner, 0, &state.host),
-        Field::Port => place_text_cursor(frame, port_inner, 0, &state.port),
-        Field::Nickname => place_text_cursor(frame, nickname_inner, 0, &state.nickname),
-        Field::Password => place_text_cursor(frame, password_inner, 0, &password_masked),
-        Field::Email => place_text_cursor(frame, email_inner, 0, &state.email),
+        Field::Host => place_text_cursor(frame, host_inner, &state.host),
+        Field::Port => place_text_cursor(frame, port_inner, &state.port),
+        Field::Nickname => place_text_cursor(frame, nickname_inner, &state.nickname),
+        Field::Password => place_text_cursor(frame, password_inner, &password_masked),
+        Field::Email => place_text_cursor(frame, email_inner, &state.email),
         _ => {}
     }
 

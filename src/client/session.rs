@@ -1315,9 +1315,7 @@ pub async fn accept_identity_review(
                 .id_store
                 .set_last_seen(&review.nickname, &device_id, addr);
         }
-        if let Err(e) = session.id_store.save() {
-            crate::log_warn!("failed to save id_store: {e}");
-        }
+        session.id_store.save_or_warn();
     }
     ui_state.resolve_identity_accept(peer)
 }
@@ -1628,9 +1626,7 @@ async fn handle_ui_action(
                 &matched_key_der,
                 idstore::Trust::Tofu,
             );
-            if let Err(e) = session.id_store.save() {
-                crate::log_warn!("failed to save id_store: {e}");
-            }
+            session.id_store.save_or_warn();
             ui_state.resolve_unknown_peer_review(peer);
             match recovered {
                 RecoveredProof::ChannelPresence { plaintext } => {
@@ -3526,9 +3522,7 @@ fn check_identity(session: &mut SessionState, ui_state: &mut UiState, user: &Use
             idstore::Trust::Tofu,
             Some(user.key_mode),
         );
-        if let Err(e) = session.id_store.save() {
-            crate::log_warn!("failed to save id_store: {e}");
-        }
+        session.id_store.save_or_warn();
         return;
     }
     match idstore::compare_key(pq_devices.iter().map(|k| k.as_slice()), &user.public_key_der) {
@@ -3612,9 +3606,7 @@ fn finalize_identity_pin(
         // Ordinary reconnect: this exact device already holds this exact
         // key. Refresh last-seen and stop - nothing else to decide.
         session.id_store.set_last_seen(nickname, device_id, addr);
-        if let Err(e) = session.id_store.save() {
-            crate::log_warn!("failed to save id_store: {e}");
-        }
+        session.id_store.save_or_warn();
         return;
     }
 
@@ -3631,9 +3623,7 @@ fn finalize_identity_pin(
             .id_store
             .set_key_mode(nickname, device_id, KeyMode::PqHybrid);
         session.id_store.set_last_seen(nickname, device_id, addr);
-        if let Err(e) = session.id_store.save() {
-            crate::log_warn!("failed to save id_store: {e}");
-        }
+        session.id_store.save_or_warn();
         return;
     }
 
@@ -3644,9 +3634,7 @@ fn finalize_identity_pin(
             session
                 .id_store
                 .replace_device_key(nickname, device_id, &user.public_key_der);
-            if let Err(e) = session.id_store.save() {
-                crate::log_warn!("failed to save id_store: {e}");
-            }
+            session.id_store.save_or_warn();
             ui_state.push_notice(format!(
                 "{nickname} moved to a new identity and proved it - pin updated"
             ));
@@ -3675,9 +3663,7 @@ fn finalize_identity_pin(
             session
                 .id_store
                 .rebind_device(nickname, &other.device_id, device_id);
-            if let Err(e) = session.id_store.save() {
-                crate::log_warn!("failed to save id_store: {e}");
-            }
+            session.id_store.save_or_warn();
             ui_state.push_notice(format!(
                 "{nickname} moved to a new identity and proved it - pin updated"
             ));
@@ -3696,9 +3682,7 @@ fn finalize_identity_pin(
             .id_store
             .set_key_mode(nickname, device_id, KeyMode::PqHybrid);
         session.id_store.set_last_seen(nickname, device_id, addr);
-        if let Err(e) = session.id_store.save() {
-            crate::log_warn!("failed to save id_store: {e}");
-        }
+        session.id_store.save_or_warn();
         return;
     }
     // A genuinely new device presenting an unexplained key - whether it

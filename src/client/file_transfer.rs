@@ -192,14 +192,6 @@ pub fn is_txt_filename(name: &str) -> bool {
 /// bounded.
 pub const PREVIEW_MAX_BYTES: u64 = 1_048_576;
 
-/// Reads at most `PREVIEW_MAX_BYTES` of `path` and reports whether the real
-/// file is longer than that - `session::handle_ui_action`'s
-/// `RequestFilePreview` arm, the one caller (`UiState` does no I/O of its
-/// own). Bounded by `metadata().len()` up front rather than reading the
-/// whole file and truncating after, so memory use stays capped regardless
-/// of how large the actual file is. Lossy UTF-8: a `.txt` file is not
-/// guaranteed to be valid UTF-8, and a preview is exactly the place to be
-/// forgiving about that rather than refusing to show anything.
 /// Moves a staged `.txt` receive out of `incoming_preview_dir()` into
 /// `default_download_dir()`, keeping its filename -
 /// `UiAction::SaveStagedFile`'s `d`-in-preview save, identical in effect
@@ -230,6 +222,14 @@ pub fn move_into_dir(staged_path: &Path, dir: &Path) -> std::io::Result<PathBuf>
     Ok(dest)
 }
 
+/// Reads at most `PREVIEW_MAX_BYTES` of `path` and reports whether the real
+/// file is longer than that - `session::handle_ui_action`'s
+/// `RequestFilePreview` arm, the one caller (`UiState` does no I/O of its
+/// own). Bounded by `metadata().len()` up front rather than reading the
+/// whole file and truncating after, so memory use stays capped regardless
+/// of how large the actual file is. Lossy UTF-8: a `.txt` file is not
+/// guaranteed to be valid UTF-8, and a preview is exactly the place to be
+/// forgiving about that rather than refusing to show anything.
 pub fn read_txt_preview(path: &Path) -> std::io::Result<(String, bool)> {
     let total_len = std::fs::metadata(path)?.len();
     let cap = PREVIEW_MAX_BYTES.min(total_len) as usize;

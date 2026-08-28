@@ -284,10 +284,8 @@ fn a_channel_file_send_logs_one_row_addressed_to_every_recipient() {
     );
     let entry = &state.channels[0].log[0];
     assert!(entry.outgoing);
-    assert_eq!(
-        entry.to_name, None,
-        "it is addressed to the channel; the popup names the people"
-    );
+    // One row addressed to the channel; the popup, not the row, names the
+    // individual people - which is what `delivery.recipients` below holds.
     let recipients = &entry
         .delivery
         .as_ref()

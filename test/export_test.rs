@@ -40,7 +40,6 @@ fn text_entry(outgoing: bool, from_name: &str, text: &str) -> LogEntry {
     LogEntry {
         from: UserId(1),
         from_name: from_name.to_string(),
-        to_name: None,
         body: MessageBody::Text(text.to_string()),
         outgoing,
         failed: false,
@@ -58,7 +57,6 @@ fn voice_entry(from_name: &str, samples: &[i16]) -> LogEntry {
     LogEntry {
         from: UserId(2),
         from_name: from_name.to_string(),
-        to_name: None,
         body: MessageBody::Voice {
             duration_ms: (samples.len() as u32 * 1000) / voice::SAMPLE_RATE_HZ,
             pcm,
@@ -78,7 +76,6 @@ fn file_entry(from_name: &str, filename: &str) -> LogEntry {
     LogEntry {
         from: UserId(4),
         from_name: from_name.to_string(),
-        to_name: None,
         body: MessageBody::File {
             filename: filename.to_string(),
             total: 100,
@@ -100,7 +97,6 @@ fn presence_entry(text: &str) -> LogEntry {
     LogEntry {
         from: UserId(5),
         from_name: "carol".to_string(),
-        to_name: None,
         body: MessageBody::Presence(text.to_string()),
         outgoing: false,
         failed: false,
@@ -117,7 +113,6 @@ fn voice_streaming_entry(from_name: &str) -> LogEntry {
     LogEntry {
         from: UserId(3),
         from_name: from_name.to_string(),
-        to_name: None,
         body: MessageBody::VoiceStreaming { stream_id: 1 },
         outgoing: false,
         failed: false,

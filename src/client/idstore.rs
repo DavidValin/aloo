@@ -777,6 +777,19 @@ impl IdStore {
         }
         fs::write(&self.path, out)
     }
+
+    /// `save`, with the one thing every caller in this app does about a
+    /// failure: log it and carry on. Losing a pin write is bad, but not
+    /// worth abandoning the action that prompted it - the entry is still
+    /// live in memory for this session, and the next successful save
+    /// writes it. Thirteen call sites spelled this out identically; the
+    /// point of naming it is that they cannot drift into handling it
+    /// three different ways.
+    pub fn save_or_warn(&self) {
+        if let Err(e) = self.save() {
+            crate::log_warn!("failed to save id_store: {e}");
+        }
+    }
 }
 
 /// One line: `nickname<TAB>device_id<TAB>hex<TAB>trust<TAB>last addr<TAB>

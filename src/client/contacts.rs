@@ -189,6 +189,40 @@ pub fn own_identity_of(session: &SessionState) -> OwnIdentity<'_> {
     }
 }
 
+/// This side's own identity, copied out of the session rather than
+/// borrowed from it.
+///
+/// `own_identity_of` hands back an `OwnIdentity<'_>` that borrows the
+/// session for as long as it lives, which the `handle_*` entry points
+/// below cannot afford - they go on to take `&mut session` for the very
+/// registry writes the identity is being read *for*. Four of them were
+/// writing the same copy out by hand for exactly that reason; this is
+/// that copy, named.
+pub struct OwnIdentitySnapshot {
+    pq_fingerprint: [u8; 32],
+    pinned_public_der: Vec<u8>,
+    own_device_id: String,
+}
+
+impl OwnIdentitySnapshot {
+    pub fn of(session: &SessionState) -> Self {
+        Self {
+            pq_fingerprint: session.own_pq_fp,
+            pinned_public_der: session.otp_own_pinned_der.clone(),
+            own_device_id: session.own_device_id.clone(),
+        }
+    }
+
+    /// The borrowed form every contact helper takes.
+    pub fn as_identity(&self) -> OwnIdentity<'_> {
+        OwnIdentity {
+            pq_fingerprint: &self.pq_fingerprint,
+            pinned_public_der: &self.pinned_public_der,
+            own_device_id: &self.own_device_id,
+        }
+    }
+}
+
 async fn otp_detail_for(cfg: &OtpCliConfig, contact_name: &str) -> Option<ContactOtpDetail> {
     let detail = otp_cli::show_contact(cfg, contact_name)
         .await
@@ -401,9 +435,7 @@ pub async fn delete_contact(
             .await;
     }
     let removed = id_store.remove(nickname);
-    if let Err(e) = id_store.save() {
-        crate::log_warn!("failed to save id_store: {e}");
-    }
+    id_store.save_or_warn();
     removed
 }
 
@@ -449,21 +481,14 @@ pub async fn delete_contact_device(
     remove_device_keychain_entries(id_store, otp_store, otp_cli_cfg, own_identity, nickname, device_id)
         .await;
     let removed = id_store.remove_device(nickname, device_id);
-    if let Err(e) = id_store.save() {
-        crate::log_warn!("failed to save id_store: {e}");
-    }
+    id_store.save_or_warn();
     removed
 }
 
 /// `UiAction::DeleteContact`'s handler.
 pub async fn handle_delete(session: &mut SessionState, ui_state: &mut UiState, nickname: String) {
-    let own_fp = session.own_pq_fp;
-    let own_der = session.otp_own_pinned_der.clone();
-    let own_identity = OwnIdentity {
-        pq_fingerprint: &own_fp,
-        pinned_public_der: &own_der,
-        own_device_id: &session.own_device_id,
-    };
+    let own = OwnIdentitySnapshot::of(session);
+    let own_identity = own.as_identity();
     // Computed before `delete_contact` removes every one of this
     // nickname's devices - one live contact name per device, since each
     // has its own (device-pinning plan §4).
@@ -605,13 +630,8 @@ pub async fn handle_install_otp_key(
     enc_path: PathBuf,
     dec_path: PathBuf,
 ) {
-    let own_fp = session.own_pq_fp;
-    let own_der = session.otp_own_pinned_der.clone();
-    let own_identity = OwnIdentity {
-        pq_fingerprint: &own_fp,
-        pinned_public_der: &own_der,
-        own_device_id: &session.own_device_id,
-    };
+    let own = OwnIdentitySnapshot::of(session);
+    let own_identity = own.as_identity();
     // A manual install races two other ways this same contact name can be
     // provisioned: this side's own fresh-pad proposal, still waiting on
     // the peer's answer (`otp_awaiting_consent` - `client::otp::confirm_generate`),
@@ -755,13 +775,8 @@ pub async fn handle_delete_otp_key(
     device_id: Option<String>,
     purpose: OtpPurpose,
 ) {
-    let own_fp = session.own_pq_fp;
-    let own_der = session.otp_own_pinned_der.clone();
-    let own_identity = OwnIdentity {
-        pq_fingerprint: &own_fp,
-        pinned_public_der: &own_der,
-        own_device_id: &session.own_device_id,
-    };
+    let own = OwnIdentitySnapshot::of(session);
+    let own_identity = own.as_identity();
     let raw_device_id = device_id.as_deref().unwrap_or("");
     // Computed before the delete below, while the pin this name is
     // derived from still exists - mail has no "active" toggle at all
@@ -797,13 +812,8 @@ pub async fn handle_delete_contact_device(
     nickname: String,
     device_id: Option<String>,
 ) {
-    let own_fp = session.own_pq_fp;
-    let own_der = session.otp_own_pinned_der.clone();
-    let own_identity = OwnIdentity {
-        pq_fingerprint: &own_fp,
-        pinned_public_der: &own_der,
-        own_device_id: &session.own_device_id,
-    };
+    let own = OwnIdentitySnapshot::of(session);
+    let own_identity = own.as_identity();
     let raw_device_id = device_id.as_deref().unwrap_or("");
     // Computed before `delete_contact_device` removes this device's whole
     // identity pin, which the live contact name is derived from.
@@ -889,9 +899,7 @@ pub fn pin_identity_card(
     // both sharing the empty device_id sentinel, and a card must only
     // ever touch the latter.
     id_store.pin_unbound_pq_hybrid_card(nickname, &encoded, path.to_path_buf());
-    if let Err(e) = id_store.save() {
-        crate::log_warn!("failed to save id_store: {e}");
-    }
+    id_store.save_or_warn();
     PinIdentityCardOutcome::Ok
 }
 
@@ -926,9 +934,7 @@ pub fn pin_identity_card_for_device(
         Some(KeyMode::PqHybrid),
     );
     id_store.set_pinned_from(nickname, device_id, path.to_path_buf());
-    if let Err(e) = id_store.save() {
-        crate::log_warn!("failed to save id_store: {e}");
-    }
+    id_store.save_or_warn();
     PinIdentityCardOutcome::Ok
 }
 
@@ -1057,8 +1063,6 @@ pub async fn handle_add_bare_contact(
     device_id: String,
 ) {
     session.id_store.pin_bare_contact(&nickname, &device_id);
-    if let Err(e) = session.id_store.save() {
-        crate::log_warn!("failed to save id_store: {e}");
-    }
+    session.id_store.save_or_warn();
     handle_open(session, ui_state).await;
 }

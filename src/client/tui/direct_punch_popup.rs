@@ -21,7 +21,8 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Tab
 
 use crate::settings::{DirectPunchTarget, PUNCH_FREQUENCIES, PunchFrequency};
 
-use super::ui::{Mode, UiAction, UiState, centered_rect, focus_border_style, render_popup_button};
+use super::ui::{Mode, UiAction, UiState, centered_rect, render_popup_button};
+use super::widgets::field::{place_text_cursor, render_bordered_field};
 
 // ---------------------------------------------------------------------
 // State
@@ -372,26 +373,6 @@ fn render_list(frame: &mut Frame, area: Rect, popup: &DirectPunchPopupState) {
 /// `render_bordered_field` - the focused one's border highlighted, its
 /// value drawn inside - so every popup's text fields read the same way.
 /// Returns the inner `Rect`, for placing the blinking cursor in it.
-fn render_bordered_field(frame: &mut Frame, area: Rect, label: &str, value: &str, focused: bool) -> Rect {
-    let block = Block::default()
-        .title(label)
-        .borders(Borders::ALL)
-        .border_style(focus_border_style(focused));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    frame.render_widget(Paragraph::new(value), inner);
-    inner
-}
-
-/// Places the blinking terminal cursor right after the typed text in
-/// `inner` - `ui_connect_popup::place_text_cursor`'s same convention,
-/// duplicated rather than shared across two independent popup modules
-/// with no common one already importing both.
-fn place_text_cursor(frame: &mut Frame, inner: Rect, value: &str) {
-    let cursor_x = inner.x + (value.chars().count() as u16).min(inner.width.saturating_sub(1));
-    frame.set_cursor_position((cursor_x, inner.y));
-}
-
 fn render_edit_form(frame: &mut Frame, area: Rect, edit: &DirectPunchEditState) {
     let mut constraints = vec![
         Constraint::Length(3), // nickname

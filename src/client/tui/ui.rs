@@ -943,12 +943,6 @@ impl MessageCrypto {
 pub struct LogEntry {
     pub from: UserId,
     pub from_name: String,
-    /// Set only for an outgoing file-transfer row addressed to one specific
-    /// recipient (a channel file send creates one row per recipient - see
-    /// `docs/PROTOCOL.md`'s file transfer section) - lets that row render
-    /// who it's addressed to. `None` for every other kind of entry,
-    /// including a DM file send (the room itself already names the peer).
-    pub to_name: Option<String>,
     pub body: MessageBody,
     pub outgoing: bool,
     /// Set after the fact, once an async send this row was optimistically
@@ -1045,15 +1039,12 @@ pub(crate) enum Unread {
 }
 
 impl LogEntry {
-    /// The six fields every row in this app sets the same way, plus the
+    /// The five fields every row in this app sets the same way, plus the
     /// seven that vary - the shape twenty call sites were writing out by
     /// hand.
     ///
     /// `sent_at`/`sent_at_utc` are stamped here rather than passed in, so
     /// a row's two timestamps can never come from two different instants.
-    /// `to_name` is `None` because nothing in this app has ever set it
-    /// (see its field doc); the constructors below are the only way a row
-    /// is built, so that stays true by construction.
     fn now(
         from: UserId,
         from_name: String,
@@ -1065,7 +1056,6 @@ impl LogEntry {
         Self {
             from,
             from_name,
-            to_name: None,
             body,
             outgoing,
             failed: false,
@@ -6635,16 +6625,24 @@ impl UiState {
     /// produced. Without that, a recognized-but-actionless command - a
     /// bare `/mute-voice`, which only prints the current list - would fall
     /// through to the unknown-command notice and then to the send paths.
+    /// The input line split into its command word and everything after
+    /// it, both trimmed. A line with no whitespace is all verb and an
+    /// empty rest, so `/mute-voice` and `/mute-voice bob` parse through
+    /// the same two bindings.
+    ///
+    /// Both halves are owned rather than borrowed: every `try_*_command`
+    /// below reads the parsed pieces *and* clears `self.input`, which it
+    /// could not do while still borrowing from it.
+    fn verb_and_rest(&self) -> (String, String) {
+        let input = self.input.trim();
+        match input.split_once(char::is_whitespace) {
+            Some((verb, rest)) => (verb.to_string(), rest.trim().to_string()),
+            None => (input.to_string(), String::new()),
+        }
+    }
+
     fn try_voice_mute_command(&mut self) -> Option<Option<UiAction>> {
-        // Owned up front: everything below both reads the parsed pieces
-        // and clears `self.input`, which cannot borrow from it at once.
-        let (verb, rest) = {
-            let input = self.input.trim();
-            match input.split_once(char::is_whitespace) {
-                Some((verb, rest)) => (verb.to_string(), rest.trim().to_string()),
-                None => (input.to_string(), String::new()),
-            }
-        };
+        let (verb, rest) = self.verb_and_rest();
         let muted = match verb.as_str() {
             "/mute-voice" => true,
             "/unmute-voice" => false,
@@ -6742,13 +6740,7 @@ impl UiState {
     /// attempt is simply refused with a reason (`ServerMessage::Error`,
     /// now surfaced as a status notice).
     fn try_channel_moderation_command(&mut self) -> Option<Option<UiAction>> {
-        let (verb, rest) = {
-            let input = self.input.trim();
-            match input.split_once(char::is_whitespace) {
-                Some((verb, rest)) => (verb.to_string(), rest.trim().to_string()),
-                None => (input.to_string(), String::new()),
-            }
-        };
+        let (verb, rest) = self.verb_and_rest();
         if !matches!(verb.as_str(), "/ban" | "/unban" | "/assign-admin") {
             return None;
         }
@@ -6802,13 +6794,7 @@ impl UiState {
     /// "the server never trusts the client" principle; a non-superadmin's
     /// attempt is simply refused with a reason.
     fn try_superadmin_command(&mut self) -> Option<Option<UiAction>> {
-        let (verb, rest) = {
-            let input = self.input.trim();
-            match input.split_once(char::is_whitespace) {
-                Some((verb, rest)) => (verb.to_string(), rest.trim().to_string()),
-                None => (input.to_string(), String::new()),
-            }
-        };
+        let (verb, rest) = self.verb_and_rest();
         match verb.as_str() {
             "/activate" | "/remove-account" => {
                 if rest.is_empty() || rest.split_whitespace().count() > 1 {
@@ -6877,13 +6863,7 @@ impl UiState {
     /// password containing a space has no way to disambiguate where it
     /// ends and the other one begins.
     fn try_password_command(&mut self) -> Option<Option<UiAction>> {
-        let (verb, rest) = {
-            let input = self.input.trim();
-            match input.split_once(char::is_whitespace) {
-                Some((verb, rest)) => (verb.to_string(), rest.trim().to_string()),
-                None => (input.to_string(), String::new()),
-            }
-        };
+        let (verb, rest) = self.verb_and_rest();
         if verb != "/password" {
             return None;
         }
@@ -8848,9 +8828,6 @@ pub(crate) fn render_messages(
                     ..
                 } => {
                     let mut spans = sender_prefix(entry);
-                    if let Some(to_name) = &entry.to_name {
-                        spans.push(Span::raw(format!("\u{2192} {to_name} ")));
-                    }
                     match status {
                         FileTransferStatus::Pending => spans.push(Span::styled(
                             format!("\u{1F4CE} {filename} (waiting for accept...)"),

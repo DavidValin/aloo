@@ -402,7 +402,6 @@ fn parse_log_entry(record: &str, log_dir: &Path) -> Option<LogEntry> {
         return Some(LogEntry {
             from: UserId(0),
             from_name: String::new(),
-            to_name: None,
             body: MessageBody::System(rest.to_string()),
             outgoing: false,
             failed: false,
@@ -428,7 +427,6 @@ fn parse_log_entry(record: &str, log_dir: &Path) -> Option<LogEntry> {
     Some(LogEntry {
         from: synthetic_user_id(from_name),
         from_name: from_name.to_string(),
-        to_name: None,
         body,
         outgoing,
         failed: false,
