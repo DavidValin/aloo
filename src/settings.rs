@@ -110,6 +110,75 @@ fn switch(on: bool) -> &'static str {
     if on { "on" } else { "off" }
 }
 
+/// Reads `value` into `slot`, leaving whatever was already there if it
+/// doesn't parse. This is the tolerance `load_or_create` documents - an
+/// unreadable line is skipped, not fatal - written once instead of
+/// re-spelled at every numeric and boolean key in `Settings::parse`.
+fn set_parsed<T: std::str::FromStr>(slot: &mut T, value: &str) {
+    if let Ok(parsed) = value.parse::<T>() {
+        *slot = parsed;
+    }
+}
+
+/// `set_parsed` for a key whose field is optional: a value that doesn't
+/// parse leaves the field unset rather than setting it to something
+/// wrong.
+fn set_parsed_some<T: std::str::FromStr>(slot: &mut Option<T>, value: &str) {
+    if let Ok(parsed) = value.parse::<T>() {
+        *slot = Some(parsed);
+    }
+}
+
+/// One managed "singular" (last-wins) key, as both `save` and the
+/// first-run scaffold see it: the key, the value it should hold right
+/// now, and whether a save may add a brand-new line for it to a file
+/// that has none yet. Built by the five constructors below, which is
+/// what keeps a key's spelling the same wherever it is written -
+/// `scaffold_contents` reads its values from `scalar_fields` rather than
+/// formatting its own second copy of them.
+type ScalarField = (&'static str, String, bool);
+
+/// A key that always has a line, whatever it currently holds.
+fn always(key: &'static str, value: impl std::fmt::Display) -> ScalarField {
+    (key, value.to_string(), true)
+}
+
+/// `always`, for a field spelled `on`/`off` rather than `true`/`false`.
+fn always_switch(key: &'static str, on: bool) -> ScalarField {
+    (key, switch(on).to_string(), true)
+}
+
+/// An optional that keeps its line and simply goes blank while unset.
+/// Every server key takes this shape, set or not, so an operator setting
+/// a server up finds each one already named in the file rather than
+/// having to know it exists.
+fn always_optional(key: &'static str, value: Option<impl std::fmt::Display>) -> ScalarField {
+    (key, value.map(|v| v.to_string()).unwrap_or_default(), true)
+}
+
+/// An optional whose line is only ever *added* once it holds a real
+/// value, so a machine that has never run a daemon keeps nothing
+/// daemon-shaped in its file. An existing line is still kept and written
+/// blank - that is what the `false` means; see `patch_into`. The
+/// storability filter is the same rule `accumulating_fields` applies to
+/// its own entries: a value that could not be read back out of a
+/// line-oriented file is not written into one.
+fn optional_text(key: &'static str, value: &Option<String>) -> ScalarField {
+    match value.clone().filter(|v| crate::validation::is_storable(v)) {
+        Some(v) => (key, v, true),
+        None => (key, String::new(), false),
+    }
+}
+
+/// `optional_text` for a port, which needs no storability filter - a
+/// `u16` cannot spell anything a line-oriented file would lose.
+fn optional_port(key: &'static str, value: Option<u16>) -> ScalarField {
+    match value {
+        Some(port) => (key, port.to_string(), true),
+        None => (key, String::new(), false),
+    }
+}
+
 /// Default size (in megabytes) of a freshly generated OTP keypair
 /// (`client::otp::initiate_provisioning`'s `otp --new-key-pair` call).
 pub const DEFAULT_OTP_KEYPAIR_SIZE_MB: u32 = 1;
@@ -677,6 +746,91 @@ impl Default for Settings {
     }
 }
 
+/// One line of the first-run scaffold: either a literal line written as
+/// it stands, or a managed key whose value `scaffold_contents` looks up
+/// in `scalar_fields`.
+enum ScaffoldLine {
+    /// A comment header, a commented-out example, or the blank line
+    /// between the two sections. Written verbatim.
+    Literal(&'static str),
+    /// A `scalar_fields` key. Written as `<key>=<its current value>`.
+    Key(&'static str),
+}
+
+/// The first-run file's own shape: which keys appear, in which order,
+/// under which headers, and where the commented examples for the
+/// accumulating keys sit. Client options first, then server options,
+/// each under a `#` header - see `Settings::scaffold_contents` for why
+/// this exists and why it is only ever written once.
+///
+/// Every `Key` here must name a `scalar_fields` key; `scaffold_contents`
+/// panics rather than writing a blank line for one that doesn't, and
+/// every test that calls `load_or_create` exercises that.
+const SCAFFOLD_LAYOUT: &[ScaffoldLine] = {
+    use ScaffoldLine::{Key, Literal};
+    &[
+        Literal("# client options"),
+        Literal("# -----------------------------------------"),
+        Key("global_ptt_enabled"),
+        Key("global_ptt_shortcut"),
+        // The only tri-state switch in the file, and `auto` on its own
+        // gives no hint that the other two exist - so the scaffold names
+        // them.
+        Literal("# voice_echo_ducking: auto (decide from the audio), on, off"),
+        Key("voice_echo_ducking"),
+        Key("autosave_messages"),
+        Key("resume_from_log"),
+        Key("daemon_host"),
+        Key("daemon_port"),
+        Key("daemon_nickname"),
+        Key("daemon_server_password"),
+        Key("daemon_my_key_pub"),
+        Key("daemon_my_key_priv"),
+        Key("daemon_initial_focus"),
+        // Accumulating keys (one line per entry, `muted_voice`'s own doc
+        // explains why) have nothing real to pre-populate on a fresh
+        // file - a commented-out example shows the syntax without taking
+        // effect.
+        Literal("# daemon_channel=otherchannel"),
+        Key("daemon_otp"),
+        Key("daemon_no_server"),
+        Key("direct_punch"),
+        Key("direct_punch_port"),
+        Literal("# direct_punch_to=alice,alicehost.com:7879,every_1m"),
+        Literal("# direct_punch_channel=the-hall"),
+        Key("noip_when_no_server_and_direct_punch_is_active"),
+        Key("noip_hostname"),
+        Key("noip_username"),
+        Key("noip_password"),
+        Key("connect_host"),
+        Key("connect_nickname"),
+        Key("connect_port"),
+        Key("connect_using_ssl"),
+        Key("connect_ssl_ca"),
+        Key("otp_binary_path"),
+        Key("otp_keypair_size_mb"),
+        Key("otp_low_key_warn_pct"),
+        Key("otp_status_poll_interval"),
+        Literal("# muted_voice=somenickname"),
+        Literal(""),
+        Literal("# server options"),
+        Literal("# -----------------------------------------"),
+        Key("server_bind"),
+        Key("server_port"),
+        Key("server_ssl"),
+        Key("server_ssl_fullchain"),
+        Key("server_ssl_privkey"),
+        Key("server_allow_registration"),
+        Key("server_smtp_host"),
+        Key("server_smtp_port"),
+        Key("server_smtp_username"),
+        Key("server_smtp_password"),
+        Key("server_allow_create_public_channels"),
+        Key("server_channel_deletion_unactivity_period"),
+        Literal("# server_superadmin=somenickname"),
+    ]
+};
+
 impl Settings {
     /// Whether this settings file actually names anyone to direct-punch -
     /// the master switch on *and* at least one target, together
@@ -714,122 +868,33 @@ impl Settings {
     /// whatever a user has since hand-edited into it - survives. `parse`
     /// (comment- and order-agnostic) reads this or `dense_contents`'
     /// shape identically either way.
+    ///
+    /// Split in two: `SCAFFOLD_LAYOUT` is the shape - which keys, in
+    /// which order, under which headers - and `scalar_fields` is the
+    /// values. A key therefore cannot be scaffolded with a different
+    /// spelling than a later `save` would write it in, which is exactly
+    /// what a second hand-written copy of the formatting used to allow.
     fn scaffold_contents(&self) -> String {
+        let values: std::collections::HashMap<&'static str, String> = self
+            .scalar_fields()
+            .into_iter()
+            .map(|(key, value, _)| (key, value))
+            .collect();
         let mut c = String::new();
-        c.push_str("# client options\n# -----------------------------------------\n");
-        c.push_str(&format!("global_ptt_enabled={}\n", self.global_ptt_enabled));
-        c.push_str(&format!("global_ptt_shortcut={}\n", self.global_ptt_shortcut));
-        // The only tri-state switch in the file, and `auto` on its own gives
-        // no hint that the other two exist - so the scaffold names them.
-        c.push_str("# voice_echo_ducking: auto (decide from the audio), on, off\n");
-        c.push_str(&format!("voice_echo_ducking={}\n", self.voice_echo_ducking));
-        c.push_str(&format!("autosave_messages={}\n", switch(self.autosave_messages)));
-        c.push_str(&format!("resume_from_log={}\n", switch(self.resume_from_log)));
-        c.push_str(&format!("daemon_host={}\n", self.daemon_host.as_deref().unwrap_or("")));
-        c.push_str(&format!(
-            "daemon_port={}\n",
-            self.daemon_port.map(|p| p.to_string()).unwrap_or_default()
-        ));
-        c.push_str(&format!(
-            "daemon_nickname={}\n",
-            self.daemon_nickname.as_deref().unwrap_or("")
-        ));
-        c.push_str(&format!(
-            "daemon_server_password={}\n",
-            self.daemon_server_password.as_deref().unwrap_or("")
-        ));
-        c.push_str(&format!(
-            "daemon_my_key_pub={}\n",
-            self.daemon_my_key_pub.as_deref().unwrap_or("")
-        ));
-        c.push_str(&format!(
-            "daemon_my_key_priv={}\n",
-            self.daemon_my_key_priv.as_deref().unwrap_or("")
-        ));
-        c.push_str(&format!(
-            "daemon_initial_focus={}\n",
-            self.daemon_initial_focus.as_deref().unwrap_or("")
-        ));
-        c.push_str("# daemon_channel=otherchannel\n");
-        c.push_str(&format!("daemon_otp={}\n", self.daemon_otp));
-        c.push_str(&format!("daemon_no_server={}\n", switch(self.daemon_no_server)));
-        c.push_str(&format!("direct_punch={}\n", switch(self.direct_punch)));
-        c.push_str(&format!("direct_punch_port={}\n", self.direct_punch_port));
-        c.push_str("# direct_punch_to=alice,alicehost.com:7879,every_1m\n");
-        c.push_str("# direct_punch_channel=the-hall\n");
-        c.push_str(&format!(
-            "noip_when_no_server_and_direct_punch_is_active={}\n",
-            switch(self.noip_when_no_server_and_direct_punch_is_active)
-        ));
-        c.push_str(&format!("noip_hostname={}\n", self.noip_hostname));
-        c.push_str(&format!("noip_username={}\n", self.noip_username));
-        c.push_str(&format!("noip_password={}\n", self.noip_password));
-        c.push_str(&format!("connect_host={}\n", self.connect_host.as_deref().unwrap_or("")));
-        c.push_str(&format!(
-            "connect_nickname={}\n",
-            self.connect_nickname.as_deref().unwrap_or("")
-        ));
-        c.push_str(&format!(
-            "connect_port={}\n",
-            self.connect_port.map(|p| p.to_string()).unwrap_or_default()
-        ));
-        c.push_str(&format!("connect_using_ssl={}\n", switch(self.connect_using_ssl)));
-        c.push_str(&format!(
-            "connect_ssl_ca={}\n",
-            self.connect_ssl_ca.as_deref().unwrap_or("")
-        ));
-        c.push_str(&format!(
-            "otp_binary_path={}\n",
-            self.otp_binary_path.as_deref().unwrap_or("")
-        ));
-        c.push_str(&format!("otp_keypair_size_mb={}\n", self.otp_keypair_size_mb));
-        c.push_str(&format!("otp_low_key_warn_pct={}\n", self.otp_low_key_warn_pct));
-        c.push_str(&format!(
-            "otp_status_poll_interval={}\n",
-            self.otp_status_poll_interval
-        ));
-        // Accumulating keys (one line per entry, `muted_voice`'s own doc
-        // explains why) have nothing real to pre-populate on a fresh file -
-        // a commented-out example shows the syntax without taking effect.
-        c.push_str("# muted_voice=somenickname\n");
-
-        c.push_str("\n# server options\n# -----------------------------------------\n");
-        c.push_str(&format!("server_bind={}\n", self.server_bind));
-        c.push_str(&format!("server_port={}\n", self.server_port));
-        c.push_str(&format!("server_ssl={}\n", switch(self.server_ssl)));
-        c.push_str(&format!("server_ssl_fullchain={}\n", self.server_ssl_fullchain));
-        c.push_str(&format!("server_ssl_privkey={}\n", self.server_ssl_privkey));
-        c.push_str(&format!(
-            "server_allow_registration={}\n",
-            switch(self.server_allow_registration)
-        ));
-        c.push_str(&format!(
-            "server_smtp_host={}\n",
-            self.server_smtp_host.as_deref().unwrap_or("")
-        ));
-        c.push_str(&format!(
-            "server_smtp_port={}\n",
-            self.server_smtp_port.map(|p| p.to_string()).unwrap_or_default()
-        ));
-        c.push_str(&format!(
-            "server_smtp_username={}\n",
-            self.server_smtp_username.as_deref().unwrap_or("")
-        ));
-        c.push_str(&format!(
-            "server_smtp_password={}\n",
-            self.server_smtp_password.as_deref().unwrap_or("")
-        ));
-        c.push_str(&format!(
-            "server_allow_create_public_channels={}\n",
-            switch(self.server_allow_create_public_channels)
-        ));
-        c.push_str(&format!(
-            "server_channel_deletion_unactivity_period={}\n",
-            self.server_channel_deletion_unactivity_period
-                .map(|p| p.to_string())
-                .unwrap_or_default()
-        ));
-        c.push_str("# server_superadmin=somenickname\n");
+        for line in SCAFFOLD_LAYOUT {
+            match line {
+                ScaffoldLine::Literal(text) => c.push_str(text),
+                ScaffoldLine::Key(key) => {
+                    let value = values.get(key).unwrap_or_else(|| {
+                        panic!("scaffold names {key:?}, which `scalar_fields` does not manage")
+                    });
+                    c.push_str(key);
+                    c.push('=');
+                    c.push_str(value);
+                }
+            }
+            c.push('\n');
+        }
         c
     }
 
@@ -845,11 +910,7 @@ impl Settings {
             };
             let value = value.trim();
             match key.trim() {
-                "global_ptt_enabled" => {
-                    if let Ok(b) = value.parse::<bool>() {
-                        settings.global_ptt_enabled = b;
-                    }
-                }
+                "global_ptt_enabled" => set_parsed(&mut settings.global_ptt_enabled, value),
                 "global_ptt_shortcut" if !value.is_empty() => {
                     settings.global_ptt_shortcut = value.to_string();
                 }
@@ -859,11 +920,7 @@ impl Settings {
                 "server_bind" if !value.is_empty() => {
                     settings.server_bind = value.to_string();
                 }
-                "server_port" => {
-                    if let Ok(p) = value.parse::<u16>() {
-                        settings.server_port = p;
-                    }
-                }
+                "server_port" => set_parsed(&mut settings.server_port, value),
                 "server_ssl" => settings.server_ssl = parse_switch(value),
                 "server_ssl_fullchain" if !value.is_empty() => {
                     settings.server_ssl_fullchain = value.to_string();
@@ -908,20 +965,10 @@ impl Settings {
                 "otp_binary_path" if !value.is_empty() => {
                     settings.otp_binary_path = Some(value.to_string());
                 }
-                "otp_keypair_size_mb" => {
-                    if let Ok(v) = value.parse::<u32>() {
-                        settings.otp_keypair_size_mb = v;
-                    }
-                }
-                "otp_low_key_warn_pct" => {
-                    if let Ok(v) = value.parse::<u8>() {
-                        settings.otp_low_key_warn_pct = v;
-                    }
-                }
+                "otp_keypair_size_mb" => set_parsed(&mut settings.otp_keypair_size_mb, value),
+                "otp_low_key_warn_pct" => set_parsed(&mut settings.otp_low_key_warn_pct, value),
                 "otp_status_poll_interval" => {
-                    if let Ok(v) = value.parse::<u32>() {
-                        settings.otp_status_poll_interval = v;
-                    }
+                    set_parsed(&mut settings.otp_status_poll_interval, value)
                 }
                 // The one *accumulating* key in this file - every other
                 // one is last-wins. Deliberately not `.trim()`-sensitive
@@ -935,11 +982,7 @@ impl Settings {
                 "daemon_host" if !value.is_empty() => {
                     settings.daemon_host = Some(value.to_string())
                 }
-                "daemon_port" => {
-                    if let Ok(p) = value.parse::<u16>() {
-                        settings.daemon_port = Some(p);
-                    }
-                }
+                "daemon_port" => set_parsed_some(&mut settings.daemon_port, value),
                 "daemon_nickname" if crate::validation::nickname_is_registrable(value) => {
                     settings.daemon_nickname = Some(value.to_string())
                 }
@@ -962,11 +1005,7 @@ impl Settings {
                 "daemon_initial_focus" if !value.is_empty() => {
                     settings.daemon_initial_focus = Some(value.to_string())
                 }
-                "daemon_otp" => {
-                    if let Ok(b) = value.parse::<bool>() {
-                        settings.daemon_otp = b;
-                    }
-                }
+                "daemon_otp" => set_parsed(&mut settings.daemon_otp, value),
                 // `on`/`off` rather than `true`/`false`, matching how the
                 // setting is spelled in every example and in the README -
                 // both are accepted so neither spelling is a silent no-op.
@@ -989,11 +1028,7 @@ impl Settings {
                 "connect_host" if !value.is_empty() => {
                     settings.connect_host = Some(value.to_string())
                 }
-                "connect_port" => {
-                    if let Ok(p) = value.parse::<u16>() {
-                        settings.connect_port = Some(p);
-                    }
-                }
+                "connect_port" => set_parsed_some(&mut settings.connect_port, value),
                 "connect_nickname" if crate::validation::nickname_is_registrable(value) => {
                     settings.connect_nickname = Some(value.to_string())
                 }
@@ -1053,119 +1088,73 @@ impl Settings {
     /// one must stay even while it's unset, only not be freshly added),
     /// and whether a save should add a brand-new line for it when the
     /// file has none yet. That second half is `false` for exactly the
-    /// optional fields `dense_contents`'s old `optional` helper used to
-    /// skip entirely while unset (daemon/connect/otp_binary_path) - a
+    /// optional fields `optional_text`/`optional_port` build (the daemon
+    /// and connect keys, and `otp_binary_path`) - a
     /// machine that has never run a daemon still keeps nothing
     /// daemon-shaped in a freshly-`dense_contents`-written file, and
     /// `patch_into` doesn't invent one either, but if a line already
     /// exists (typically from `scaffold_contents`, which pre-writes every
     /// key blank) it is kept and simply written blank, never deleted.
-    fn scalar_fields(&self) -> Vec<(&'static str, String, bool)> {
-        let opt_str = |v: &Option<String>| -> (String, bool) {
-            match v.clone().filter(|v| crate::validation::is_storable(v)) {
-                Some(v) => (v, true),
-                None => (String::new(), false),
-            }
-        };
-        let opt_num = |v: Option<u16>| -> (String, bool) {
-            match v {
-                Some(p) => (p.to_string(), true),
-                None => (String::new(), false),
-            }
-        };
-        let (otp_binary_path, has_otp_binary_path) = opt_str(&self.otp_binary_path);
-        let (daemon_host, has_daemon_host) = opt_str(&self.daemon_host);
-        let (daemon_nickname, has_daemon_nickname) = opt_str(&self.daemon_nickname);
-        let (daemon_server_password, has_daemon_server_password) =
-            opt_str(&self.daemon_server_password);
-        let (daemon_my_key_pub, has_daemon_my_key_pub) = opt_str(&self.daemon_my_key_pub);
-        let (daemon_my_key_priv, has_daemon_my_key_priv) = opt_str(&self.daemon_my_key_priv);
-        let (daemon_initial_focus, has_daemon_initial_focus) = opt_str(&self.daemon_initial_focus);
-        let (daemon_port, has_daemon_port) = opt_num(self.daemon_port);
-        let (connect_host, has_connect_host) = opt_str(&self.connect_host);
-        let (connect_nickname, has_connect_nickname) = opt_str(&self.connect_nickname);
-        let (connect_port, has_connect_port) = opt_num(self.connect_port);
-        let (connect_ssl_ca, has_connect_ssl_ca) = opt_str(&self.connect_ssl_ca);
+    fn scalar_fields(&self) -> Vec<ScalarField> {
         vec![
-            ("global_ptt_enabled", self.global_ptt_enabled.to_string(), true),
-            ("global_ptt_shortcut", self.global_ptt_shortcut.clone(), true),
-            (
-                "voice_echo_ducking",
-                self.voice_echo_ducking.to_string(),
-                true,
-            ),
-            ("server_bind", self.server_bind.clone(), true),
-            ("server_port", self.server_port.to_string(), true),
-            ("server_ssl", switch(self.server_ssl).to_string(), true),
-            ("server_ssl_fullchain", self.server_ssl_fullchain.clone(), true),
-            ("server_ssl_privkey", self.server_ssl_privkey.clone(), true),
-            (
-                "server_allow_registration",
-                switch(self.server_allow_registration).to_string(),
-                true,
-            ),
-            // Every server key is written even when unset, so an operator
-            // setting the server up finds each one already named in the
-            // file rather than having to know it exists.
-            ("server_smtp_host", self.server_smtp_host.clone().unwrap_or_default(), true),
-            (
-                "server_smtp_port",
-                self.server_smtp_port.map(|p| p.to_string()).unwrap_or_default(),
-                true,
-            ),
-            (
-                "server_smtp_username",
-                self.server_smtp_username.clone().unwrap_or_default(),
-                true,
-            ),
-            (
-                "server_smtp_password",
-                self.server_smtp_password.clone().unwrap_or_default(),
-                true,
-            ),
-            (
+            always("global_ptt_enabled", self.global_ptt_enabled),
+            always("global_ptt_shortcut", &self.global_ptt_shortcut),
+            always("voice_echo_ducking", self.voice_echo_ducking),
+            always("server_bind", &self.server_bind),
+            always("server_port", self.server_port),
+            always_switch("server_ssl", self.server_ssl),
+            always("server_ssl_fullchain", &self.server_ssl_fullchain),
+            always("server_ssl_privkey", &self.server_ssl_privkey),
+            always_switch("server_allow_registration", self.server_allow_registration),
+            always_optional("server_smtp_host", self.server_smtp_host.as_deref()),
+            always_optional("server_smtp_port", self.server_smtp_port),
+            always_optional("server_smtp_username", self.server_smtp_username.as_deref()),
+            always_optional("server_smtp_password", self.server_smtp_password.as_deref()),
+            always_switch(
                 "server_allow_create_public_channels",
-                switch(self.server_allow_create_public_channels).to_string(),
-                true,
+                self.server_allow_create_public_channels,
             ),
-            (
+            always_optional(
                 "server_channel_deletion_unactivity_period",
-                self.server_channel_deletion_unactivity_period
-                    .map(|p| p.to_string())
-                    .unwrap_or_default(),
-                true,
+                self.server_channel_deletion_unactivity_period,
             ),
-            ("otp_keypair_size_mb", self.otp_keypair_size_mb.to_string(), true),
-            ("otp_low_key_warn_pct", self.otp_low_key_warn_pct.to_string(), true),
-            ("otp_status_poll_interval", self.otp_status_poll_interval.to_string(), true),
-            ("autosave_messages", switch(self.autosave_messages).to_string(), true),
-            ("resume_from_log", switch(self.resume_from_log).to_string(), true),
-            ("direct_punch", switch(self.direct_punch).to_string(), true),
-            ("direct_punch_port", self.direct_punch_port.to_string(), true),
-            (
+            always("otp_keypair_size_mb", self.otp_keypair_size_mb),
+            always("otp_low_key_warn_pct", self.otp_low_key_warn_pct),
+            always("otp_status_poll_interval", self.otp_status_poll_interval),
+            always_switch("autosave_messages", self.autosave_messages),
+            always_switch("resume_from_log", self.resume_from_log),
+            always_switch("direct_punch", self.direct_punch),
+            always("direct_punch_port", self.direct_punch_port),
+            always_switch(
                 "noip_when_no_server_and_direct_punch_is_active",
-                switch(self.noip_when_no_server_and_direct_punch_is_active).to_string(),
-                true,
+                self.noip_when_no_server_and_direct_punch_is_active,
             ),
-            ("noip_hostname", self.noip_hostname.clone(), true),
-            ("noip_username", self.noip_username.clone(), true),
-            ("noip_password", self.noip_password.clone(), true),
-            ("connect_using_ssl", switch(self.connect_using_ssl).to_string(), true),
+            always("noip_hostname", &self.noip_hostname),
+            always("noip_username", &self.noip_username),
+            always("noip_password", &self.noip_password),
+            always_switch("connect_using_ssl", self.connect_using_ssl),
             // Optional - only ever added to the file once actually set.
-            ("otp_binary_path", otp_binary_path, has_otp_binary_path),
-            ("daemon_host", daemon_host, has_daemon_host),
-            ("daemon_nickname", daemon_nickname, has_daemon_nickname),
-            ("daemon_server_password", daemon_server_password, has_daemon_server_password),
-            ("daemon_my_key_pub", daemon_my_key_pub, has_daemon_my_key_pub),
-            ("daemon_my_key_priv", daemon_my_key_priv, has_daemon_my_key_priv),
-            ("daemon_initial_focus", daemon_initial_focus, has_daemon_initial_focus),
-            ("daemon_port", daemon_port, has_daemon_port),
+            optional_text("otp_binary_path", &self.otp_binary_path),
+            optional_text("daemon_host", &self.daemon_host),
+            optional_text("daemon_nickname", &self.daemon_nickname),
+            optional_text("daemon_server_password", &self.daemon_server_password),
+            optional_text("daemon_my_key_pub", &self.daemon_my_key_pub),
+            optional_text("daemon_my_key_priv", &self.daemon_my_key_priv),
+            optional_text("daemon_initial_focus", &self.daemon_initial_focus),
+            optional_port("daemon_port", self.daemon_port),
+            // The two daemon switches earn a line the same way the
+            // optionals above do - once they are actually on - but each
+            // in its own documented spelling.
             ("daemon_otp", self.daemon_otp.to_string(), self.daemon_otp),
-            ("daemon_no_server", switch(self.daemon_no_server).to_string(), self.daemon_no_server),
-            ("connect_host", connect_host, has_connect_host),
-            ("connect_nickname", connect_nickname, has_connect_nickname),
-            ("connect_port", connect_port, has_connect_port),
-            ("connect_ssl_ca", connect_ssl_ca, has_connect_ssl_ca),
+            (
+                "daemon_no_server",
+                switch(self.daemon_no_server).to_string(),
+                self.daemon_no_server,
+            ),
+            optional_text("connect_host", &self.connect_host),
+            optional_text("connect_nickname", &self.connect_nickname),
+            optional_port("connect_port", self.connect_port),
+            optional_text("connect_ssl_ca", &self.connect_ssl_ca),
         ]
     }
 
