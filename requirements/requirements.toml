@@ -2270,6 +2270,16 @@ id = "TB-134"
 description = "crypto::pq::ensure_bundle_at treats either file missing as neither being usable and (re)generates both together, never salvaging a lone surviving half, so a partially-deleted keybundle is never loaded as a mismatched pub/priv pair."
 evidence = "src/crypto/pq.rs ensure_bundle_at; tests ensure_bundle_at_regenerates_both_when_only_one_file_exists, ensure_bundle_at_is_a_no_op_when_both_files_already_exist"
 
+[[user_story.technical_behavior]]
+id = "TB-283"
+description = "Every keybundle prefix on the command line is turned into a (private, public) path pair by crypto::pq alone - bundle_paths for writing (<prefix> and <prefix>.pub, the documented layout) and resolve_bundle_paths for reading, which also accepts the <prefix>.priv spelling auto-generated bundles carry and prefers it when both are present. No caller derives the suffixes itself, so a reader can never disagree with the writer about where a half lives and report an intact bundle as half-present."
+evidence = "src/crypto/pq.rs PUBLIC_SUFFIX, PRIVATE_SUFFIX, bundle_paths, resolve_bundle_paths; src/client/daemon.rs resolve_my_key; src/main.rs run_rekey_pq_hybrid, run_export_identity_card; tests a_my_key_prefix_resolves_a_keygen_written_bundle_rather_than_regenerating_it, a_my_key_prefix_still_resolves_an_auto_generated_bundle, a_prefix_carrying_both_spellings_resolves_the_pair_that_matches, a_my_key_prefix_with_nothing_on_disk_names_the_documented_layout, a_keygen_written_bundle_survives_being_opened_by_prefix"
+
+[[user_story.technical_behavior]]
+id = "TB-284"
+description = "resolve_my_keypair refuses a pub/priv pair whose halves are not from the same keybundle (crypto::pq::bundle_pair_matches, comparing the public RSA signing key derived from the private half against the one the public half carries) rather than connecting with it. TB-134 only guards the half-missing case; two files that both exist can still be a mismatched pair, and such an identity has no local symptom - it signs everything with a key no peer can verify against, and make_identity_card will emit a card that fails its own signature check."
+evidence = "src/crypto/pq.rs bundle_pair_matches; src/client/connect.rs resolve_my_keypair; tests bundle_pair_matches_accepts_a_real_pair_and_rejects_a_crossed_one, resolve_my_keypair_refuses_a_mismatched_pair"
+
 # ============================================================================
 # US-022 - Send a voice message from anywhere
 # ============================================================================

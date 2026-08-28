@@ -703,8 +703,14 @@ and no prompt: if the keybundle does not exist yet, it is generated on
 first connect. Point at a specific one with:
 
 ```sh
-aloo --daemon --my-key=/home/you/.aloo/mykeys      # mykeys.pub + mykeys.priv
+aloo --daemon --my-key=/home/you/.aloo/mykeys      # mykeys + mykeys.pub
 ```
+
+That is the pair `aloo --keygen-pq-hybrid /home/you/.aloo/mykeys` writes, so
+a keybundle you generated yourself can be pointed at directly. A
+`mykeys.priv` left by an earlier auto-generated bundle is still accepted,
+and preferred when both are present; a fresh one is written as
+`mykeys` + `mykeys.pub`.
 
 Otherwise it reuses whatever you last connected with (`~/.aloo/.cache`).
 
@@ -1498,6 +1504,8 @@ the DM recording is refused outright (`direct_message.rs`).
 | Who can be addressed | anyone who announced a keybundle that decodes; one who did not is reachable only under an already-installed pad (`otp.rs` `framing_for`) |
 | `id_store` pinning | `session.rs` `check_identity` - a file-loaded identity is the same bytes every connect, so a plain byte comparison against the pin is the whole check |
 | Auto-generate keys if missing | `crypto/pq.rs` `ensure_bundle_at`, called from `connect.rs` `resolve_my_keypair` (`docs/PROTOCOL.md` §13.9) |
+| Resolve a keybundle prefix to its two files | `crypto/pq.rs` `bundle_paths` (writing), `resolve_bundle_paths` (reading, accepts both layouts); `daemon.rs` `resolve_my_key` (`docs/PROTOCOL.md` §13.9) |
+| Refuse a mismatched pub/priv pair | `crypto/pq.rs` `bundle_pair_matches`, checked by `connect.rs` `resolve_my_keypair` (`docs/PROTOCOL.md` §13.9) |
 | Connect-popup cache (`~/.aloo/.cache`) | `connect.rs` `ConnectCache`, `cache_path`, `random_prefix`, `fresh_pq_hybrid_paths_in`, `prefill_connect_defaults` |
 
 ### Logging in — a separate axis

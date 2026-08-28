@@ -265,6 +265,55 @@ fn prefill_connect_defaults_restores_the_most_recent_cache_entry() {
 // resolve_my_keypair - auto-generation (real keygen, #[ignore]d)
 // ---------------------------------------------------------------------
 
+/// Two halves that both exist but come from different keybundles are
+/// refused rather than connected with.
+///
+/// `ensure_bundle_at` only guards the half-*missing* case (TB-134), so
+/// nothing before this caught a crossed pair - and a crossed pair has no
+/// local symptom at all: it signs every send, rotation and identity card
+/// with a key no peer can verify against.
+/// @requirement TB-284
+#[test]
+#[ignore = "real ML-DSA-87/ML-KEM-1024/RSA-4096 x2 keygen, several seconds - run with cargo slow"]
+fn resolve_my_keypair_refuses_a_mismatched_pair() {
+    let dir = temp_path("resolve-mismatched-dir");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file_pub = dir.join("crossed.pub");
+    let file_priv = dir.join("crossed.priv");
+
+    // Two independent bundles; keep A's private half beside B's public one.
+    let (pub_a, priv_a) = aloo::crypto::pq::generate_bundle().unwrap();
+    let (pub_b, _priv_b) = aloo::crypto::pq::generate_bundle().unwrap();
+    aloo::crypto::pq::save_private_bundle(&priv_a, &file_priv).unwrap();
+    aloo::crypto::pq::save_public_bundle(&pub_b, &file_pub).unwrap();
+    assert_ne!(
+        aloo::crypto::pq::bundle_fingerprint(&pub_a).unwrap(),
+        aloo::crypto::pq::bundle_fingerprint(&pub_b).unwrap()
+    );
+
+    // `let ... else` rather than `expect_err`: `ResolvedIdentity` carries a
+    // private bundle and deliberately does not implement `Debug`, so the
+    // Ok half must never be formatted.
+    let Err(err) = resolve_my_keypair(&MyKeySelection {
+        file_pub: file_pub.clone(),
+        file_priv: file_priv.clone(),
+    }) else {
+        panic!("a mismatched pair must not resolve");
+    };
+    let message = err.to_string();
+    assert!(
+        message.contains("not two halves of the same keybundle"),
+        "the refusal must say what is actually wrong, got: {message}"
+    );
+    assert!(
+        message.contains(&file_priv.display().to_string())
+            && message.contains(&file_pub.display().to_string()),
+        "and name both files, got: {message}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// @requirement AC-086
 #[test]
 #[ignore = "real ML-DSA-87/ML-KEM-1024/RSA-4096 x2 keygen, several seconds - run with cargo slow"]

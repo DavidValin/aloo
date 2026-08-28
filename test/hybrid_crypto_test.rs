@@ -9,9 +9,10 @@
 //! `[u8; 32]` key), so they stay fast and ungated.
 
 use aloo::crypto::pq::{
-    PqPrivateBundle, PqPublicBundle, bundle_fingerprint, ensure_bundle_at, generate_bundle,
-    load_private_bundle, load_public_bundle, open_chunk, open_send, open_setup,
-    save_private_bundle, save_public_bundle, seal_chunk, seal_send, seal_setup,
+    PqPrivateBundle, PqPublicBundle, bundle_fingerprint, bundle_pair_matches, bundle_paths,
+    ensure_bundle_at, generate_bundle, load_private_bundle, load_public_bundle, open_chunk,
+    open_send, open_setup, resolve_bundle_paths, save_private_bundle, save_public_bundle,
+    seal_chunk, seal_send, seal_setup,
 };
 use aloo::proto::{self, KeyMode};
 
@@ -519,6 +520,63 @@ fn ensure_bundle_at_is_a_no_op_when_both_files_already_exist() {
     assert_eq!(std::fs::read(&priv_path).unwrap(), priv_bytes_before);
 
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The end-to-end shape of the bug TB-283 exists to prevent: a keybundle
+/// `--keygen-pq-hybrid <prefix>` wrote, opened by prefix, must still be
+/// the same identity afterwards.
+///
+/// It was not. `--my-key` looked for the private half at `<prefix>.priv`,
+/// which keygen never writes, so the intact pair read as half-present and
+/// `ensure_bundle_at` correctly (TB-134) regenerated both - overwriting
+/// the public half and silently swapping the identity, with no continuity
+/// certificate for anyone who had pinned it.
+/// @requirement TB-283
+#[test]
+#[ignore = "real keygen - see module doc, run with cargo slow"]
+fn a_keygen_written_bundle_survives_being_opened_by_prefix() {
+    let dir = std::env::temp_dir().join(format!("aloo-prefix-survives-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let prefix = dir.join("mykey").display().to_string();
+
+    // `--keygen-pq-hybrid <prefix>`
+    let (priv_path, pub_path) = bundle_paths(&prefix);
+    let (public, private) = generate_bundle().unwrap();
+    save_private_bundle(&private, &priv_path).unwrap();
+    save_public_bundle(&public, &pub_path).unwrap();
+    let before = bundle_fingerprint(&public).unwrap();
+
+    // `--daemon --my-key <prefix>`, then the connect path's own step.
+    let (resolved_priv, resolved_pub) = resolve_bundle_paths(&prefix);
+    ensure_bundle_at(&resolved_pub, &resolved_priv).expect("nothing to generate");
+
+    let after = bundle_fingerprint(&load_public_bundle(&pub_path).unwrap()).unwrap();
+    assert_eq!(before, after, "the keygen'd identity must survive intact");
+    assert!(
+        bundle_pair_matches(
+            &load_private_bundle(&resolved_priv).unwrap(),
+            &load_public_bundle(&resolved_pub).unwrap()
+        ),
+        "and the halves it resolved to must belong together"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// @requirement TB-284
+#[test]
+#[ignore = "real keygen - see module doc, run with cargo slow"]
+fn bundle_pair_matches_accepts_a_real_pair_and_rejects_a_crossed_one() {
+    let (pub_a, priv_a) = generate_bundle().unwrap();
+    let (pub_b, priv_b) = generate_bundle().unwrap();
+
+    assert!(bundle_pair_matches(&priv_a, &pub_a));
+    assert!(bundle_pair_matches(&priv_b, &pub_b));
+    assert!(
+        !bundle_pair_matches(&priv_a, &pub_b),
+        "halves from two different bundles are not a pair"
+    );
+    assert!(!bundle_pair_matches(&priv_b, &pub_a));
 }
 
 /// @requirement TB-134

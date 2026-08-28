@@ -803,6 +803,21 @@ pub fn resolve_my_keypair(sel: &MyKeySelection) -> Result<ResolvedIdentity, BoxE
     crypto::pq::ensure_bundle_at(&sel.file_pub, &sel.file_priv)?;
     let private = crypto::pq::load_private_bundle(&sel.file_priv)?;
     let public = crypto::pq::load_public_bundle(&sel.file_pub)?;
+    // Two files that both exist are not necessarily two halves of one
+    // bundle - `ensure_bundle_at` only guards the half-*missing* case
+    // (TB-134). A mismatched pair has no local symptom at all: it signs
+    // everything with a key no peer can verify against, so refusing it
+    // here is the only place it is still explicable.
+    if !crypto::pq::bundle_pair_matches(&private, &public) {
+        return Err(format!(
+            "{} and {} are not two halves of the same keybundle - refusing to \
+             connect with a mismatched identity. Point at a matching pair, or \
+             move both aside and let a fresh one be generated.",
+            sel.file_priv.display(),
+            sel.file_pub.display()
+        )
+        .into());
+    }
     let public_der = proto::encode(&public)?;
     Ok(ResolvedIdentity {
         private,
@@ -999,16 +1014,16 @@ pub fn random_prefix() -> String {
 pub fn fresh_pq_hybrid_paths_in(dir: &Path) -> (PathBuf, PathBuf) {
     for _ in 0..20 {
         let prefix = random_prefix();
-        let file_pub = dir.join(format!("{prefix}.pub"));
-        let file_priv = dir.join(format!("{prefix}.priv"));
+        let file_pub = dir.join(format!("{prefix}{}", crypto::pq::PUBLIC_SUFFIX));
+        let file_priv = dir.join(format!("{prefix}{}", crypto::pq::PRIVATE_SUFFIX));
         if !file_pub.exists() && !file_priv.exists() {
             return (file_pub, file_priv);
         }
     }
     let prefix = random_prefix();
     (
-        dir.join(format!("{prefix}.pub")),
-        dir.join(format!("{prefix}.priv")),
+        dir.join(format!("{prefix}{}", crypto::pq::PUBLIC_SUFFIX)),
+        dir.join(format!("{prefix}{}", crypto::pq::PRIVATE_SUFFIX)),
     )
 }
 
