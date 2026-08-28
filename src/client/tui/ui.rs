@@ -1050,7 +1050,7 @@ pub struct UiState {
     /// Every incoming OTP session proposal currently awaiting a decision,
     /// keyed by the sender - mirrors `file_offers`/`file_offer_queue`
     /// exactly (queued-popup idiom, `Accept`-first default).
-    otp_invites: HashMap<UserId, PendingOtpInvite>,
+    pub(crate) otp_invites: HashMap<UserId, PendingOtpInvite>,
     pub(crate) otp_invite_queue: VecDeque<UserId>,
     pub(crate) otp_invite_focus: Confirm,
     /// The most recent OTP session outcome ("OTP session started at ..."
@@ -1065,7 +1065,7 @@ pub struct UiState {
     pub status_notice: Option<(String, bool)>,
     /// When `status_notice` was last pushed - what `tick_status_notice`
     /// measures the timeout from. `None` whenever `status_notice` is.
-    status_notice_since: Option<Instant>,
+    pub(crate) status_notice_since: Option<Instant>,
     /// Peers a mutual-consent OTP session has genuinely started with in
     /// this connection (set alongside the "OTP session started" notice,
     /// `client::otp::accept_invite`/`on_key_setup_ack`) - drives the pad
@@ -1088,7 +1088,7 @@ pub struct UiState {
     /// makes this set track the persistent session rather than the
     /// connection. The only thing that ever removes an entry is `/endotp`
     /// (`clear_otp_active`), on either side - never a disconnect.
-    otp_active_peers: HashSet<UserId>,
+    pub(crate) otp_active_peers: HashSet<UserId>,
     /// Live `otp --show-contact` snapshots for peers in `otp_active_peers`,
     /// driving the OTP session header's Seq/Offset/remaining figures
     /// (`direct_message::render_otp_header`). Populated once immediately
@@ -1102,7 +1102,7 @@ pub struct UiState {
     /// app's own send/receive. Never cleared once set: a stale-but-correct
     /// figure for a peer navigated away from and back to is a better first
     /// frame than a blank one while the next update is in flight.
-    otp_key_status: HashMap<UserId, crate::client::otp_cli::OtpKeyStatus>,
+    pub(crate) otp_key_status: HashMap<UserId, crate::client::otp_cli::OtpKeyStatus>,
     /// Whether a previously-received voice message is currently being
     /// replayed (Enter on a `MessageBody::Voice` log entry) - while `true`,
     /// Escape stops that playback instead of its usual meaning (closing the
@@ -1135,7 +1135,7 @@ pub struct UiState {
     /// from silence. Defaults to `false` (the safe assumption) so a
     /// terminal that can't report release at all still has some way to
     /// stop a recording.
-    keyboard_release_reporting: bool,
+    pub(crate) keyboard_release_reporting: bool,
     /// Set when the last recording attempt or an incoming/replayed voice
     /// playback failed (e.g. no microphone/speaker). Tracked internally
     /// (e.g. so `recording_failed` still turns off the misleading
@@ -1465,172 +1465,19 @@ impl UiState {
         self.direct_punch_status = status;
     }
 
-    /// Called by `client::otp_mail::refresh_unread_mail_count` whenever the
-    /// received set can have changed.
-    pub fn set_unread_otp_mail_count(&mut self, count: usize) {
-        self.unread_otp_mail_count = count;
-    }
 
     // -------------------------------------------------------------
     // Identity review (docs/PROTOCOL.md §12): manual Accept/Reject
     // -------------------------------------------------------------
 
-    /// Records a newly-detected identity mismatch for `peer` and, if no
-    /// review is currently on screen, opens this one immediately (auto-pop
-    /// on detection). If `peer` already had a review pending or rejected
-    /// (e.g. another mismatched rotation attempt arrives before the first
-    /// was decided), its case/message are updated in place and it's
-    /// re-queued as `Pending` rather than duplicated - always reflects the
-    /// *latest* attempt.
-    pub fn push_identity_review(
-        &mut self,
-        peer: UserId,
-        nickname: String,
-        message: String,
-        case: IdentityCase,
-    ) {
-        let already_queued = self.identity_review_queue.contains(&peer);
-        self.identity_reviews.insert(
-            peer,
-            IdentityReview {
-                nickname,
-                message,
-                case,
-                status: IdentityStatus::Pending,
-            },
-        );
-        if !already_queued {
-            self.identity_review_queue.push_back(peer);
-        }
-        if self.identity_review_queue.front() == Some(&peer) {
-            self.identity_review_focus = Confirm::No;
-        }
-    }
 
-    /// Starts a mismatch review the instant it's detected, without
-    /// showing anything yet (`session::check_identity`'s mismatch arm) -
-    /// gates messaging with `peer` immediately (`is_trust_gated`), same as
-    /// `push_identity_review` does, but leaves the popup itself for
-    /// `reveal_identity_review` once this connection's address/device id
-    /// are known (docs/PROTOCOL.md §12.7). Never queued: `identity_review_open`
-    /// only ever shows the queue front, and this is deliberately kept out
-    /// of it until revealed.
-    pub fn begin_identity_review(&mut self, peer: UserId, nickname: String, case: IdentityCase) {
-        self.identity_reviews.insert(
-            peer,
-            IdentityReview {
-                nickname,
-                message: String::new(),
-                case,
-                status: IdentityStatus::AwaitingPeerInfo,
-            },
-        );
-    }
 
-    /// Finishes a review `begin_identity_review` started, once its caller
-    /// has a `message` worth showing (old vs. new address/device id
-    /// filled in) - moves it to `Pending`, queues it, and chimes exactly
-    /// as `push_identity_review` would have. Returns whether there was
-    /// actually an `AwaitingPeerInfo` review to reveal (`false` if `peer`
-    /// has no review, or it was already revealed/resolved) - a caller
-    /// only plays the chime on `true`, so this never re-alerts on a
-    /// second, later transition for the same peer.
-    pub fn reveal_identity_review(&mut self, peer: UserId, message: String) -> bool {
-        match self.identity_reviews.get_mut(&peer) {
-            Some(review) if review.status == IdentityStatus::AwaitingPeerInfo => {
-                review.message = message;
-                review.status = IdentityStatus::Pending;
-            }
-            _ => return false,
-        }
-        if !self.identity_review_queue.contains(&peer) {
-            self.identity_review_queue.push_back(peer);
-        }
-        if self.identity_review_queue.front() == Some(&peer) {
-            self.identity_review_focus = Confirm::No;
-        }
-        true
-    }
 
-    /// The review currently shown in the popup, if any.
-    pub fn identity_review_open(&self) -> Option<&IdentityReview> {
-        let peer = self.identity_review_queue.front()?;
-        self.identity_reviews.get(peer)
-    }
 
-    /// Whether `peer` currently has an unresolved-trust review (`Pending`
-    /// or `Rejected` - both gate messaging identically, see `docs/PROTOCOL.md`
-    /// §12). Absence (`None`/normal peer) is the common case.
-    pub fn is_trust_gated(&self, peer: UserId) -> bool {
-        self.identity_reviews.contains_key(&peer)
-    }
 
-    /// Opens a review for a `direct_punch_to` nickname with no pinned key
-    /// that just sent proof of an identity (`docs/PROTOCOL.md` §7.1.5) -
-    /// called from `session::on_channel_presence`/`client::otp::on_message`
-    /// the moment that gap is detected. Refuses a second review for a
-    /// `peer` that already has one outstanding: a retried proof arriving
-    /// while the first popup is still up is simply dropped, the same
-    /// "silently drop" convention already used everywhere on this path.
-    /// Returns whether it was actually queued.
-    pub fn push_unknown_peer_review(
-        &mut self,
-        peer: UserId,
-        requested_nickname: String,
-        proof: UnverifiedDirectProof,
-        source_addr: std::net::SocketAddr,
-    ) -> bool {
-        if self.unknown_peer_reviews.contains_key(&peer) {
-            return false;
-        }
-        self.unknown_peer_reviews.insert(
-            peer,
-            UnknownPeerReview {
-                requested_nickname,
-                stage: UnknownPeerStage::Initial,
-                proof,
-                source_addr,
-            },
-        );
-        self.unknown_peer_review_queue.push_back(peer);
-        if self.unknown_peer_review_queue.front() == Some(&peer) {
-            self.unknown_peer_review_focus = Confirm::No;
-        }
-        true
-    }
 
-    /// The review currently shown in the popup, if any.
-    pub fn unknown_peer_review_open(&self) -> Option<&UnknownPeerReview> {
-        let peer = self.unknown_peer_review_queue.front()?;
-        self.unknown_peer_reviews.get(peer)
-    }
 
-    /// Moves a review from `Initial` to `ConfirmMatch` in place - same
-    /// queue position, so it stays exactly where it was rather than being
-    /// re-queued behind anything that arrived in the meantime.
-    pub fn advance_to_confirm_match(
-        &mut self,
-        peer: UserId,
-        matched_nickname: String,
-        matched_key_der: Vec<u8>,
-        recovered: RecoveredProof,
-    ) {
-        if let Some(review) = self.unknown_peer_reviews.get_mut(&peer) {
-            review.stage = UnknownPeerStage::ConfirmMatch {
-                matched_nickname,
-                matched_key_der,
-                recovered,
-            };
-            self.unknown_peer_review_focus = Confirm::No;
-        }
-    }
 
-    /// Removes a review on every terminal outcome: declining either popup,
-    /// confirming a match, or a completed scan finding nothing to offer.
-    pub fn resolve_unknown_peer_review(&mut self, peer: UserId) {
-        self.unknown_peer_reviews.remove(&peer);
-        self.unknown_peer_review_queue.retain(|&p| p != peer);
-    }
 
     /// Where the session is pointed *right now* - the open private room if
     /// there is one, otherwise the selected channel tab.
@@ -1653,20 +1500,6 @@ impl UiState {
         }
     }
 
-    /// Whether `peer`'s voice messages are muted (`/mute-voice`,
-    /// docs/SPEC.md Functionality #15) - resolved through their *current*
-    /// nickname, since that is what the user muted and what persists.
-    /// A peer we hold no `UserInfo` for is never muted: there is no name
-    /// to have matched.
-    ///
-    /// Paired with `is_trust_gated` at every incoming-audio decision:
-    /// either being true means the stream is still decrypted and still
-    /// logged, but never reaches the mixer.
-    pub fn is_voice_muted(&self, peer: UserId) -> bool {
-        self.known_users
-            .get(&peer)
-            .is_some_and(|u| self.muted_voice.contains(&u.name))
-    }
 
     /// How many records a `resume_from_log` chunk should pull in at a
     /// time - the message log's last-rendered height (`Cell`, set every
@@ -1754,11 +1587,6 @@ impl UiState {
         self.is_trust_gated(peer) || self.is_voice_muted(peer)
     }
 
-    /// Replaces the muted-voice set - used once at session start to seed
-    /// it from `~/.aloo/settings`.
-    pub fn set_muted_voice(&mut self, muted: std::collections::BTreeSet<String>) {
-        self.muted_voice = muted;
-    }
 
     /// Hands out the next `MessageDelivery::msg_id`. Called once per
     /// outgoing text message, just before the row is logged, so the id can
@@ -2088,18 +1916,6 @@ impl UiState {
             .push(offer);
     }
 
-    /// Removes `peer` from the review queue wherever it is - not
-    /// necessarily the front - resetting focus if the popup on screen
-    /// changed. Removing by identity rather than a plain `pop_front` keeps
-    /// this correct even if a future resolution path ever resolves
-    /// something other than the front entry.
-    fn remove_from_identity_review_queue(&mut self, peer: UserId) {
-        let was_front = self.identity_review_queue.front() == Some(&peer);
-        self.identity_review_queue.retain(|p| *p != peer);
-        if was_front {
-            self.identity_review_focus = Confirm::No;
-        }
-    }
 
     /// Applies an Accept decision already carried out by the caller
     /// (`session::handle_ui_action`'s `AcceptIdentity` arm has already
@@ -2150,34 +1966,7 @@ impl UiState {
         play_bell
     }
 
-    /// Applies a Reject decision: flips `peer`'s review to `Rejected` (kept,
-    /// not removed - stays red, re-openable via Enter) and opens the next
-    /// queued review if any. Held messages stay held.
-    pub fn resolve_identity_reject(&mut self, peer: UserId) {
-        if let Some(review) = self.identity_reviews.get_mut(&peer) {
-            review.status = IdentityStatus::Rejected;
-        }
-        self.remove_from_identity_review_queue(peer);
-    }
 
-    /// Re-opens the popup for an already-`Rejected` peer (Enter on their
-    /// red sidebar entry) - a no-op if they're not actually in review,
-    /// already the one showing, or still `AwaitingPeerInfo` (there is
-    /// nothing to show yet; `is_trust_gated` already blocks messaging with
-    /// them in the meantime, and `reveal_identity_review` is what will
-    /// actually open this once it has something to display).
-    pub(crate) fn reopen_identity_review(&mut self, peer: UserId) {
-        match self.identity_reviews.get(&peer) {
-            Some(review) if review.status != IdentityStatus::AwaitingPeerInfo => {}
-            _ => return,
-        }
-        if self.identity_review_queue.front() == Some(&peer) {
-            return;
-        }
-        self.identity_review_queue.retain(|p| *p != peer);
-        self.identity_review_queue.push_front(peer);
-        self.identity_review_focus = Confirm::No;
-    }
 
     // -------------------------------------------------------------
     // File transfer (`docs/PROTOCOL.md`'s file transfer section):
@@ -2235,290 +2024,29 @@ impl UiState {
             .unwrap_or_else(|| self.own_name.clone())
     }
 
-    /// Opens the local "generate and share a fresh OTP pad?" confirmation
-    /// (`/otp` found no existing keychain entry) - see
-    /// `client::otp::handle_otp_command`.
-    pub fn open_otp_generate_confirm(
-        &mut self,
-        peer: UserId,
-        peer_name: String,
-        pubkey_der: Vec<u8>,
-        purpose: crate::crypto::otp::OtpPurpose,
-    ) {
-        self.otp_generate_confirm = Some(PendingOtpGenerate {
-            peer,
-            peer_name,
-            pubkey_der,
-            purpose,
-        });
-        self.otp_generate_focus = Confirm::Yes;
-    }
 
-    pub fn take_otp_generate_confirm(&mut self) -> Option<PendingOtpGenerate> {
-        self.otp_generate_focus = Confirm::Yes;
-        self.otp_generate_confirm.take()
-    }
 
-    /// Read-only counterpart of `take_otp_generate_confirm`, for a caller
-    /// that only wants to observe whether the prompt is showing (and who it
-    /// names) without answering it - mirrors `otp_invite_open`.
-    pub fn otp_generate_confirm_open(&self) -> Option<&PendingOtpGenerate> {
-        self.otp_generate_confirm.as_ref()
-    }
 
-    /// Opens the pad-size prompt (`handle_key`'s Accept branch for
-    /// `otp_generate_confirm`) - carries `pending`'s peer info forward
-    /// unchanged, since accepting only decided *that* a pad gets
-    /// generated, not how big.
-    pub fn open_otp_size_input(&mut self, pending: PendingOtpGenerate) {
-        self.otp_size_input = Some(pending);
-        self.otp_size_text.clear();
-        self.otp_size_error = None;
-    }
 
-    pub fn take_otp_size_input(&mut self) -> Option<PendingOtpGenerate> {
-        self.otp_size_text.clear();
-        self.otp_size_error = None;
-        self.otp_size_input.take()
-    }
 
-    /// Read-only counterpart of `take_otp_size_input`, mirroring
-    /// `otp_generate_confirm_open`.
-    pub fn otp_size_input_open(&self) -> Option<&PendingOtpGenerate> {
-        self.otp_size_input.as_ref()
-    }
 
-    /// Opens the generation spinner for `peer`'s pad, at 0 of
-    /// `2 * size_mb` MB - called by `client::otp::confirm_generate` the
-    /// moment it hands generation to its background task.
-    pub fn open_otp_keygen(
-        &mut self,
-        peer: UserId,
-        peer_name: String,
-        size_mb: u32,
-        purpose: crate::crypto::otp::OtpPurpose,
-    ) {
-        self.otp_keygen = Some(OtpKeygenProgress {
-            phase: OtpPadPhase::Generating,
-            peer,
-            peer_name,
-            purpose,
-            size_mb,
-            written_bytes: 0,
-            total_bytes: size_mb as u64 * 1024 * 1024 * 2,
-            frame: 0,
-        });
-    }
 
-    /// Moves the spinner's bar - one `otp_keygen_tx` progress report. A
-    /// no-op once the popup is closed (a late report arriving after the
-    /// generation was already resolved), and equally once it has moved on
-    /// to the transfer: generation reports are counted against a different
-    /// total, so applying one there would rewind a bar that has genuinely
-    /// advanced.
-    pub fn set_otp_keygen_progress(&mut self, written_bytes: u64, total_bytes: u64) {
-        if let Some(progress) = self.otp_keygen.as_mut()
-            && progress.phase == OtpPadPhase::Generating
-        {
-            progress.written_bytes = written_bytes;
-            progress.total_bytes = total_bytes;
-        }
-    }
 
-    /// Switches the popup to the transfer phase, bar back to zero.
-    ///
-    /// Generating a pad and pushing it across a link are both slow, for
-    /// unrelated reasons, and this is the moment between them. Without it
-    /// the popup vanished the instant generation finished and the peer's
-    /// invitation appeared minutes later with nothing in between - which
-    /// read as the handshake having silently failed.
-    ///
-    /// `size_mb` is per key; the transfer is both halves, so the total is
-    /// twice it (`otp_pad::spawn_send_pad_worker` sends enc then dec).
-    pub fn begin_otp_pad_transfer(
-        &mut self,
-        peer: UserId,
-        peer_name: String,
-        size_mb: u32,
-        phase: OtpPadPhase,
-        purpose: crate::crypto::otp::OtpPurpose,
-    ) {
-        self.otp_keygen = Some(OtpKeygenProgress {
-            phase,
-            peer,
-            peer_name,
-            purpose,
-            size_mb,
-            written_bytes: 0,
-            total_bytes: size_mb as u64 * 1024 * 1024 * 2,
-            frame: 0,
-        });
-    }
 
-    /// Closes the spinner - generation finished, failed, or was abandoned.
-    pub fn close_otp_keygen(&mut self) {
-        self.otp_keygen = None;
-    }
 
-    /// Closes it only if it is reporting on `peer` - so a stale transfer
-    /// ending cannot tear down a popup that has since moved on to another
-    /// contact.
-    pub fn close_otp_keygen_for(&mut self, peer: UserId) {
-        if self.otp_keygen.as_ref().is_some_and(|p| p.peer == peer) {
-            self.otp_keygen = None;
-        }
-    }
 
-    /// Moves the transfer bar, if the popup is still reporting on `peer`.
-    pub fn set_otp_pad_transfer_progress(&mut self, peer: UserId, sent_bytes: u64) {
-        if let Some(progress) = self.otp_keygen.as_mut()
-            && progress.peer == peer
-            && progress.phase != OtpPadPhase::Generating
-        {
-            progress.written_bytes = sent_bytes.min(progress.total_bytes);
-        }
-    }
 
-    pub fn otp_keygen_open(&self) -> Option<&OtpKeygenProgress> {
-        self.otp_keygen.as_ref()
-    }
 
-    /// Advances the spinner one frame - driven by the session ticker, the
-    /// same cadence `toggle_blink` rides, so the animation keeps moving
-    /// even while no progress report has arrived (which is exactly when a
-    /// user most needs to see it is still alive).
-    pub fn tick_otp_keygen_spinner(&mut self) {
-        if let Some(progress) = self.otp_keygen.as_mut() {
-            progress.frame = (progress.frame + 1) % SPINNER_FRAMES.len();
-        }
-    }
 
-    /// Queues an incoming OTP session proposal - mirrors `push_file_offer`
-    /// exactly, one sender at a time (a second proposal from the same
-    /// sender while one is already queued simply replaces it, since only
-    /// the latest is still meaningful).
-    #[allow(clippy::too_many_arguments)]
-    pub fn push_otp_invite(
-        &mut self,
-        from: UserId,
-        from_name: String,
-        contact_name: String,
-        peer_encryption_key: Option<Vec<u8>>,
-        peer_decryption_key: Option<Vec<u8>>,
-        pad_size_mb: Option<u32>,
-    ) {
-        self.otp_invites.insert(
-            from,
-            PendingOtpInvite {
-                from,
-                from_name,
-                contact_name,
-                peer_encryption_key,
-                peer_decryption_key,
-                pad_size_mb,
-            },
-        );
-        if !self.otp_invite_queue.contains(&from) {
-            self.otp_invite_queue.push_back(from);
-        }
-        if self.otp_invite_queue.front() == Some(&from) {
-            self.otp_invite_focus = Confirm::Yes;
-        }
-    }
 
-    pub fn otp_invite_open(&self) -> Option<&PendingOtpInvite> {
-        let from = self.otp_invite_queue.front()?;
-        self.otp_invites.get(from)
-    }
 
-    pub fn take_otp_invite(&mut self) -> Option<PendingOtpInvite> {
-        let from = self.otp_invite_queue.pop_front()?;
-        self.otp_invite_focus = Confirm::Yes;
-        self.otp_invites.remove(&from)
-    }
 
-    /// Drops one specific peer's unanswered invitation, wherever it sits in
-    /// the queue - unlike `take_otp_invite`, which only ever takes the one
-    /// currently showing.
-    ///
-    /// Used when a fresh `/otp` to that same peer supersedes it
-    /// (`client::otp::handle_otp_command`): answering their proposal and
-    /// making our own at once would leave two live proposals for one
-    /// contact name. Returns whether there was anything to drop. The
-    /// returned invite is dropped here rather than handed back, so its key
-    /// material is zeroized immediately (`PendingOtpInvite` is
-    /// `ZeroizeOnDrop`).
-    pub fn take_otp_invite_from(&mut self, from: UserId) -> bool {
-        self.otp_invite_queue.retain(|queued| *queued != from);
-        if self.otp_invites.remove(&from).is_some() {
-            self.otp_invite_focus = Confirm::Yes;
-            return true;
-        }
-        false
-    }
 
-    /// Whether `from` has an invite queued at all, at any position - not
-    /// just the one on top (`otp_invite_open`). Used to refuse starting a
-    /// second provisioning handshake (of either purpose) with a peer who
-    /// already has one outstanding.
-    pub fn has_otp_invite_from(&self, from: UserId) -> bool {
-        self.otp_invites.contains_key(&from)
-    }
 
-    /// Sets the always-visible OTP/command status line - see
-    /// `status_notice`'s field doc for why this is a separate, actually-
-    /// rendered surface rather than reusing `audio_error`/`push_notice`.
-    pub fn push_status_notice(&mut self, message: String, success: bool) {
-        self.status_notice = Some((message, success));
-        self.status_notice_since = Some(Instant::now());
-    }
 
-    /// Clears a status notice that has been showing for
-    /// `STATUS_NOTICE_TIMEOUT` - called from the session's ticker, the
-    /// same cadence `tick_recording_timeout` rides. A notice whose
-    /// timestamp is missing (set by writing the pub field directly, as
-    /// tests do) is adopted from `now` rather than left immortal.
-    pub fn tick_status_notice(&mut self, now: Instant) {
-        if self.status_notice.is_none() {
-            self.status_notice_since = None;
-            return;
-        }
-        match self.status_notice_since {
-            Some(since) if now.duration_since(since) >= STATUS_NOTICE_TIMEOUT => {
-                self.status_notice = None;
-                self.status_notice_since = None;
-            }
-            None => self.status_notice_since = Some(now),
-            _ => {}
-        }
-    }
 
-    /// Records that a mutual-consent OTP session has genuinely started with
-    /// `peer` - see `otp_active_peers`'s doc. Also (re-)called, idempotently,
-    /// the moment a peer we already have a provisioned OTP contact for
-    /// reconnects under a fresh `UserId` (`session::handle_server_message`'s
-    /// `UserJoined` arm) - this per-connection flag would otherwise forget
-    /// an otherwise still-active session across every reconnect, which is
-    /// exactly what `/endotp` (and nothing else) is supposed to end.
-    pub fn mark_otp_active(&mut self, peer: UserId) {
-        self.otp_active_peers.insert(peer);
-    }
 
-    /// The reverse of `mark_otp_active` - `/endotp` ending the session, on
-    /// either side (`client::otp::handle_end_otp_command`/`on_end_session`).
-    /// Also drops any stale key-metadata snapshot (`otp_key_status`) for
-    /// this peer, so a session started fresh with them afterward shows only
-    /// its own figures, never a leftover reading from the one just ended.
-    pub fn clear_otp_active(&mut self, peer: UserId) {
-        self.otp_active_peers.remove(&peer);
-        self.otp_key_status.remove(&peer);
-    }
 
-    /// Whether `peer`'s messages should carry the `OTP_ICON` prefix right
-    /// now.
-    pub fn is_otp_active(&self, peer: UserId) -> bool {
-        self.otp_active_peers.contains(&peer)
-    }
 
     /// The id this session last knew `user` by, if they are someone who
     /// went offline and has now come back.
@@ -2546,49 +2074,6 @@ impl UiState {
             .map(|known| known.id)
     }
 
-    /// Moves everything this session holds about `previous` onto the id
-    /// `user` has now, so a peer who reconnects continues in the very same
-    /// DM room rather than opening a second one beside it
-    /// (`docs/SPEC.md` "Connected UI").
-    ///
-    /// Only what is genuinely *about the person* moves: their room and its
-    /// history, where it sits on the DM selector, and any one-time-pad
-    /// session, which by design outlives a disconnect and only `/endotp`
-    /// ever ends (`docs/PROTOCOL.md` §16.6). Everything that belongs to the
-    /// connection that just closed - an unanswered identity review, held
-    /// messages, a file offer or call invite in flight - is deliberately
-    /// left behind: those are transactions with a session that is over,
-    /// and the new connection gets its own, including its own identity
-    /// check.
-    pub(crate) fn adopt_returning_peer(&mut self, previous: UserId, user: &UserInfo) {
-        let id = user.id;
-        self.offline.remove(&previous);
-        self.link_status.remove(&previous);
-        self.known_users.remove(&previous);
-        if let Some(mut room) = self.private_rooms.remove(&previous) {
-            // The room keeps its whole log; only who it is *with* is
-            // restated, since their key material and id are both new.
-            room.peer = user.clone();
-            self.private_rooms.insert(id, room);
-        }
-        for entry in &mut self.dm_order {
-            if *entry == previous {
-                *entry = id;
-            }
-        }
-        if self.selected_dm == Some(previous) {
-            self.selected_dm = Some(id);
-        }
-        if self.active_private_room == Some(previous) {
-            self.active_private_room = Some(id);
-        }
-        if self.otp_active_peers.remove(&previous) {
-            self.otp_active_peers.insert(id);
-        }
-        if let Some(status) = self.otp_key_status.remove(&previous) {
-            self.otp_key_status.insert(id, status);
-        }
-    }
 
     /// A pad session has just been agreed with `peer` - what both sides
     /// call the moment their handshake completes
@@ -2628,26 +2113,7 @@ impl UiState {
         }
     }
 
-    /// Records `peer`'s latest `otp --show-contact` snapshot - see
-    /// `otp_key_status`'s doc for who calls this and how often.
-    pub fn set_otp_key_status(
-        &mut self,
-        peer: UserId,
-        status: crate::client::otp_cli::OtpKeyStatus,
-    ) {
-        self.otp_key_status.insert(peer, status);
-    }
 
-    /// `peer`'s most recently fetched key-metadata snapshot, if any -
-    /// `render_otp_header` falls back to `OtpKeyStatus::default()` (all
-    /// zeros) when `None`, e.g. the brief window before a session's own
-    /// first fetch completes.
-    pub fn otp_key_status_for(
-        &self,
-        peer: UserId,
-    ) -> Option<&crate::client::otp_cli::OtpKeyStatus> {
-        self.otp_key_status.get(&peer)
-    }
 
     /// How a message logged for `peer` right now is protected, as the
     /// details popup reports it (`render_message_info_popup`).
@@ -2934,16 +2400,6 @@ impl UiState {
         });
     }
 
-    /// Called by the caller (`session`/`channel`/`direct_message`) when
-    /// starting the recorder itself failed (e.g. no audio input device).
-    /// Turns off the misleading "recording..." indicator immediately
-    /// instead of waiting for the user to release Space, and surfaces why.
-    pub fn recording_failed(&mut self, reason: String) {
-        self.recording = false;
-        self.recording_source = None;
-        self.recording_last_seen = None;
-        self.audio_error = Some(reason);
-    }
 
     /// Called when playing back an incoming or replayed voice message
     /// failed (e.g. no speaker/output device). Doesn't touch recording
@@ -3044,12 +2500,6 @@ impl UiState {
         self.blink_on = !self.blink_on;
     }
 
-    /// The help overlay's current scroll offset (first visible line index
-    /// into the overlay's laid-out lines) - loosely clamped here, precisely at render time
-    /// against the popup's actual visible height (`render_help_popup`).
-    pub fn help_scroll(&self) -> usize {
-        self.help_scroll
-    }
 
     // -------------------------------------------------------------
     // Key handling
@@ -3092,61 +2542,8 @@ impl UiState {
         }
     }
 
-    /// Starts a recording from the global Ctrl+Alt+P shortcut. Deliberately
-    /// mirrors `handle_key`'s Space branch (same target resolution, same
-    /// "nowhere to send it" bail-out) rather than sharing code: they
-    /// differ only in `RecordSource` tagging, and Space's branch
-    /// interleaves with focus/mode handling that's meaningless for a
-    /// shortcut fired while the app isn't focused. A no-op while any
-    /// recording is in progress.
-    pub fn global_record_start(&mut self) -> Option<UiAction> {
-        if self.recording {
-            return None;
-        }
-        match self.current_voice_target() {
-            Some(target) => {
-                self.recording = true;
-                self.recording_source = Some(RecordSource::Global);
-                self.audio_error = None;
-                Some(UiAction::VoiceRecordStart(target))
-            }
-            None => {
-                self.audio_error = Some("not joined to a channel yet".to_string());
-                None
-            }
-        }
-    }
 
-    /// Stops a recording the global shortcut itself started - a no-op if
-    /// nothing is recording, or if the current recording was started by
-    /// Space instead (that one only ever ends on Space's own release; see
-    /// `handle_key`).
-    pub fn global_record_stop(&mut self) -> Option<UiAction> {
-        if !self.recording || self.recording_source != Some(RecordSource::Global) {
-            return None;
-        }
-        self.recording = false;
-        self.recording_source = None;
-        self.recording_last_seen = None;
-        Some(UiAction::VoiceRecordStop)
-    }
 
-    /// Stops whatever recording is currently in progress, regardless of
-    /// which trigger started it (unlike `global_record_stop`, which only
-    /// ever stops one it itself started) or whether the physical key is
-    /// still held. Used when the recording worker hits
-    /// `voice::MAX_RECORDING_SAMPLES` and needs to end on its own instead
-    /// of waiting for a release event that may not come for a while yet -
-    /// see `session::run_connected_session`'s `auto_stop_rx` arm.
-    pub fn force_stop_recording(&mut self) -> Option<UiAction> {
-        if !self.recording {
-            return None;
-        }
-        self.recording = false;
-        self.recording_source = None;
-        self.recording_last_seen = None;
-        Some(UiAction::VoiceRecordStop)
-    }
 
     /// `current_log`'s mutable twin, for the one thing that writes back
     /// into the row under the cursor: paying off an incoming voice
@@ -3200,30 +2597,6 @@ impl UiState {
         Some(url.1)
     }
 
-    /// Call periodically; auto-stops a recording once Space has been quiet
-    /// for `RECORD_HOLD_TIMEOUT`, for terminals that never send `Release`
-    /// (see `handle_key`). A no-op when `keyboard_release_reporting` is
-    /// `true` - a real `Release` is guaranteed there, so the guess must
-    /// never fire. Also a no-op for a `Global`-sourced recording: a held
-    /// OS hotkey has no repeat heartbeat to go quiet, and its backends all
-    /// deliver a real release - the idle guess would wrongly auto-stop
-    /// every global recording after ~`RECORD_HOLD_TIMEOUT`.
-    pub fn tick_recording_timeout(&mut self, now: Instant) -> Option<UiAction> {
-        if !self.recording
-            || self.keyboard_release_reporting
-            || self.recording_source != Some(RecordSource::Space)
-        {
-            return None;
-        }
-        let last = self.recording_last_seen?;
-        if now.duration_since(last) < RECORD_HOLD_TIMEOUT {
-            return None;
-        }
-        self.recording = false;
-        self.recording_source = None;
-        self.recording_last_seen = None;
-        Some(UiAction::VoiceRecordStop)
-    }
 
     // -------------------------------------------------------------
     // Applying incoming server events (already decrypted by the caller)
