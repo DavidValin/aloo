@@ -25,8 +25,8 @@ use crate::validation;
 use super::ui::{
     DM_ICON, FileTransferStatus, JoinPopupFocus, LogEntry, MessageBody,
     MessageDelivery, Mode, OTP_TAG, OTP_TAG_COLOR, SelectorFocus, UNREAD_ENVELOPE, UiAction,
-    UiState, channel_label, display_width, finalize_held_stream, finalize_stream_entry,
-    focus_border_style, local_time_short, local_time_stamp, push_log_entry, render_input_bar,
+    UiState, Unread, channel_label, display_width, finalize_held_stream, finalize_stream_entry,
+    focus_border_style, local_time_short, render_input_bar,
     render_messages, unread_envelope,
 };
 
@@ -582,9 +582,7 @@ impl UiState {
         // (`docs/PROTOCOL.md` §5.4), so one still known is somebody else's
         // live row and not ours to take.
         let stale_row = self
-            .channels
-            .iter()
-            .find(|c| c.name == channel)
+            .channel_tab(channel)
             .and_then(|c| {
                 c.members
                     .iter()
@@ -635,49 +633,13 @@ impl UiState {
     /// (`test/ui_channel_test.rs`) pins down. This is the only entry point
     /// `session.rs` calls for `ServerMessage::UserJoined`.
     pub fn on_user_joined(&mut self, channel: &str, user: UserInfo) {
-        let already_joined = self
-            .channels
-            .iter()
-            .find(|c| c.name == channel)
-            .map(|c| c.joined)
-            .unwrap_or(false);
+        let already_joined = self.channel_tab(channel).map(|c| c.joined).unwrap_or(false);
         let id = user.id;
         let name = user.name.clone();
         let is_new = self.seed_member(channel, user);
         if already_joined && is_new {
             let text = format!("{} {name} joined", local_time_short());
-            let is_current = self.is_viewing_channel(channel);
-            let autosave = self.autosave_messages.then(|| self.server_label.clone());
-            if let Some(tab) = self.channels.iter_mut().find(|c| c.name == channel) {
-                push_log_entry(
-                    &mut tab.log,
-                    &mut self.message_selected,
-                    is_current,
-                    LogEntry {
-                        from: id,
-                        from_name: name,
-                        to_name: None,
-                        body: MessageBody::Presence(text),
-                        outgoing: false,
-                        failed: false,
-                        sent_at: local_time_stamp(),
-                        sent_at_utc: crate::client::export::utc_time_stamp(),
-                        owed_receipt: None,
-                        listened: true,
-                        delivery: None,
-                        // This client wrote the line itself out of a
-                        // `UserJoined`; nothing about it was encrypted.
-                        crypto: None,
-                    },
-                );
-                if let Some(server_label) = &autosave {
-                    crate::client::export::autosave_entry(
-                        server_label,
-                        crate::client::export::Surface::Channel(channel),
-                        tab.log.last().unwrap(),
-                    );
-                }
-            }
+            self.append_to_channel(channel, LogEntry::presence(id, name, text), Unread::Leave);
         }
     }
 
@@ -689,47 +651,16 @@ impl UiState {
     /// case to exclude here).
     pub fn on_user_left(&mut self, channel: &str, user_id: UserId) {
         let name = self
-            .channels
-            .iter()
-            .find(|c| c.name == channel)
+            .channel_tab(channel)
             .and_then(|c| c.members.iter().find(|m| m.id == user_id))
             .map(|m| m.name.clone())
             .or_else(|| self.known_users.get(&user_id).map(|u| u.name.clone()));
-        if let Some(tab) = self.channels.iter_mut().find(|c| c.name == channel) {
+        if let Some(tab) = self.channel_tab_mut(channel) {
             tab.members.retain(|m| m.id != user_id);
         }
         if let Some(name) = name {
             let text = format!("{} {name} left", local_time_short());
-            let is_current = self.is_viewing_channel(channel);
-            let autosave = self.autosave_messages.then(|| self.server_label.clone());
-            if let Some(tab) = self.channels.iter_mut().find(|c| c.name == channel) {
-                push_log_entry(
-                    &mut tab.log,
-                    &mut self.message_selected,
-                    is_current,
-                    LogEntry {
-                        from: user_id,
-                        from_name: name,
-                        to_name: None,
-                        body: MessageBody::Presence(text),
-                        outgoing: false,
-                        failed: false,
-                        sent_at: local_time_stamp(),
-                        sent_at_utc: crate::client::export::utc_time_stamp(),
-                        owed_receipt: None,
-                        listened: true,
-                        delivery: None,
-                        crypto: None,
-                    },
-                );
-                if let Some(server_label) = &autosave {
-                    crate::client::export::autosave_entry(
-                        server_label,
-                        crate::client::export::Surface::Channel(channel),
-                        tab.log.last().unwrap(),
-                    );
-                }
-            }
+            self.append_to_channel(channel, LogEntry::presence(user_id, name, text), Unread::Leave);
         }
     }
 
@@ -737,49 +668,15 @@ impl UiState {
     /// `admin` field and again on every later `ChannelAdminChanged`. A
     /// no-op if the tab doesn't exist (there is nothing to correct).
     pub fn set_channel_admin(&mut self, channel: &str, admin: Option<String>) {
-        if let Some(tab) = self.channels.iter_mut().find(|c| c.name == channel) {
+        if let Some(tab) = self.channel_tab_mut(channel) {
             tab.admin = admin;
         }
     }
 
-    /// The shared shape `on_user_joined`/`on_user_left` already use for a
-    /// yellow presence line, reused for every channel-moderation notice.
-    /// `who`/`who_name` are cosmetic only: a `MessageBody::Presence` line
-    /// renders its `text` alone (`ui.rs`'s `render_messages`), never
-    /// `from`/`from_name` - so an event with no single "about" user (a
-    /// join-lock update, an admin handoff) may pass `UserId(0)` and an
-    /// empty name safely.
+    /// A yellow presence line for a channel-moderation notice.
+    /// `who`/`who_name` are cosmetic only - see `LogEntry::presence`.
     fn push_presence_notice(&mut self, channel: &str, who: UserId, who_name: String, text: String) {
-        let is_current = self.is_viewing_channel(channel);
-        let autosave = self.autosave_messages.then(|| self.server_label.clone());
-        if let Some(tab) = self.channels.iter_mut().find(|c| c.name == channel) {
-            push_log_entry(
-                &mut tab.log,
-                &mut self.message_selected,
-                is_current,
-                LogEntry {
-                    from: who,
-                    from_name: who_name,
-                    to_name: None,
-                    body: MessageBody::Presence(text),
-                    outgoing: false,
-                    failed: false,
-                    sent_at: local_time_stamp(),
-                    sent_at_utc: crate::client::export::utc_time_stamp(),
-                    owed_receipt: None,
-                    listened: true,
-                    delivery: None,
-                    crypto: None,
-                },
-            );
-            if let Some(server_label) = &autosave {
-                crate::client::export::autosave_entry(
-                    server_label,
-                    crate::client::export::Surface::Channel(channel),
-                    tab.log.last().unwrap(),
-                );
-            }
-        }
+        self.append_to_channel(channel, LogEntry::presence(who, who_name, text), Unread::Leave);
     }
 
     /// `ServerMessage::UserBanned` for someone other than ourselves (the
@@ -787,7 +684,7 @@ impl UiState {
     /// `channel`'s member list, mirroring `on_user_left`, and logs a
     /// distinctly-worded presence line.
     pub fn on_user_banned(&mut self, channel: &str, user_id: UserId, nickname: String) {
-        if let Some(tab) = self.channels.iter_mut().find(|c| c.name == channel) {
+        if let Some(tab) = self.channel_tab_mut(channel) {
             tab.members.retain(|m| m.id != user_id);
         }
         let text = format!("{} {nickname} was banned from this channel", local_time_short());
@@ -839,20 +736,7 @@ impl UiState {
         from_name: String,
         body: MessageBody,
     ) {
-        let entry = LogEntry {
-            from,
-            from_name,
-            to_name: None,
-            body,
-            outgoing: false,
-            failed: false,
-            sent_at: local_time_stamp(),
-            sent_at_utc: crate::client::export::utc_time_stamp(),
-            owed_receipt: None,
-            listened: true,
-            delivery: None,
-            crypto: self.message_crypto(from, false),
-        };
+        let entry = LogEntry::incoming(from, from_name, body, self.message_crypto(from, false));
         // A Pending/Rejected sender's message decrypts fine (it's encrypted
         // with *our* key, not theirs) but is held back rather than shown -
         // docs/PROTOCOL.md §12 "hold and reveal" - until they're Accepted.
@@ -860,57 +744,18 @@ impl UiState {
             self.hold_message(from, Some(channel.to_string()), entry);
             return;
         }
-        let is_current = self.is_viewing_channel(channel);
-        let autosave = self.autosave_messages.then(|| self.server_label.clone());
-        if let Some(tab) = self.channels.iter_mut().find(|c| c.name == channel) {
-            push_log_entry(&mut tab.log, &mut self.message_selected, is_current, entry);
-            if !is_current {
-                tab.unread = true;
-            }
-            if let Some(server_label) = &autosave {
-                crate::client::export::autosave_entry(
-                    server_label,
-                    crate::client::export::Surface::Channel(channel),
-                    tab.log.last().unwrap(),
-                );
-            }
-        }
+        self.append_to_channel(channel, entry, Unread::Mark);
     }
 
     pub fn log_own_voice_channel(&mut self, channel: &str, duration_ms: u32, pcm: Vec<u8>) {
-        let from = self.own_id.unwrap_or(UserId(0));
-        let from_name = self.own_name.clone();
-        let is_current = self.is_viewing_channel(channel);
-        let crypto = self.channel_send_crypto(channel);
-        let autosave = self.autosave_messages.then(|| self.server_label.clone());
-        if let Some(tab) = self.channels.iter_mut().find(|c| c.name == channel) {
-            push_log_entry(
-                &mut tab.log,
-                &mut self.message_selected,
-                is_current,
-                LogEntry {
-                    from,
-                    from_name,
-                    to_name: None,
-                    body: MessageBody::Voice { duration_ms, pcm },
-                    outgoing: true,
-                    failed: false,
-                    sent_at: local_time_stamp(),
-                    sent_at_utc: crate::client::export::utc_time_stamp(),
-                    owed_receipt: None,
-                    listened: true,
-                    delivery: None,
-                    crypto,
-                },
-            );
-            if let Some(server_label) = &autosave {
-                crate::client::export::autosave_entry(
-                    server_label,
-                    crate::client::export::Surface::Channel(channel),
-                    tab.log.last().unwrap(),
-                );
-            }
-        }
+        let entry = LogEntry::outgoing(
+            self.own_id.unwrap_or(UserId(0)),
+            self.own_name.clone(),
+            MessageBody::Voice { duration_ms, pcm },
+            None,
+            self.channel_send_crypto(channel),
+        );
+        self.append_to_channel(channel, entry, Unread::Leave);
     }
 
     /// Called the instant our own recording starts (before we know its
@@ -923,35 +768,19 @@ impl UiState {
         stream_id: u64,
         delivery: Option<MessageDelivery>,
     ) {
-        let from = self.own_id.unwrap_or(UserId(0));
-        let from_name = self.own_name.clone();
-        let is_current = self.is_viewing_channel(channel);
-        let crypto = self.channel_send_crypto(channel);
-        if let Some(tab) = self.channels.iter_mut().find(|c| c.name == channel) {
-            // No autosave hook here: a `VoiceStreaming` placeholder has no
-            // audio yet, and `autosave_entry` is a no-op for one anyway -
-            // `on_channel_stream_finished`'s `finalize_stream_entry` call
-            // is where this same row gets autosaved, once it is real.
-            push_log_entry(
-                &mut tab.log,
-                &mut self.message_selected,
-                is_current,
-                LogEntry {
-                    from,
-                    from_name,
-                    to_name: None,
-                    body: MessageBody::VoiceStreaming { stream_id },
-                    outgoing: true,
-                    failed: false,
-                    sent_at: local_time_stamp(),
-                    sent_at_utc: crate::client::export::utc_time_stamp(),
-                    owed_receipt: None,
-                    listened: true,
-                    delivery,
-                    crypto,
-                },
-            );
-        }
+        // The autosave `append_to_channel` performs is a no-op for a
+        // `VoiceStreaming` placeholder, which has no audio yet
+        // (`export::autosave_entry` returns early on one) -
+        // `on_channel_stream_finished` is where this same row is saved,
+        // once it is real.
+        let entry = LogEntry::outgoing(
+            self.own_id.unwrap_or(UserId(0)),
+            self.own_name.clone(),
+            MessageBody::VoiceStreaming { stream_id },
+            delivery,
+            self.channel_send_crypto(channel),
+        );
+        self.append_to_channel(channel, entry, Unread::Leave);
     }
 
     /// Called when another user starts a live voice stream to the
@@ -969,33 +798,20 @@ impl UiState {
         stream_id: u64,
         suppress_playback: bool,
     ) {
-        let entry = LogEntry {
+        let entry = LogEntry::incoming(
             from,
             from_name,
-            to_name: None,
-            body: MessageBody::VoiceStreaming { stream_id },
-            outgoing: false,
-            failed: false,
-            sent_at: local_time_stamp(),
-            sent_at_utc: crate::client::export::utc_time_stamp(),
-            owed_receipt: None,
-            listened: !suppress_playback,
-            delivery: None,
-            crypto: self.message_crypto(from, false),
-        };
+            MessageBody::VoiceStreaming { stream_id },
+            self.message_crypto(from, false),
+        )
+        .with_listened(!suppress_playback);
         if self.is_trust_gated(from) {
             self.hold_message(from, Some(channel.to_string()), entry);
             return;
         }
-        let is_current = self.is_viewing_channel(channel);
-        if let Some(tab) = self.channels.iter_mut().find(|c| c.name == channel) {
-            // No autosave hook here either - see the sibling comment in
-            // `log_own_voice_stream_start_channel` above.
-            push_log_entry(&mut tab.log, &mut self.message_selected, is_current, entry);
-            if !is_current {
-                tab.unread = true;
-            }
-        }
+        // Saved when it finishes, not now - see the sibling note in
+        // `log_own_voice_stream_start_channel` above.
+        self.append_to_channel(channel, entry, Unread::Mark);
     }
 
     /// Swaps the `VoiceStreaming{stream_id}` placeholder for a finished
@@ -1014,7 +830,7 @@ impl UiState {
         pcm: Vec<u8>,
     ) {
         let autosave = self.autosave_messages.then(|| self.server_label.clone());
-        if let Some(tab) = self.channels.iter_mut().find(|c| c.name == channel) {
+        if let Some(tab) = self.channel_tab_mut(channel) {
             if let Some(entry) = finalize_stream_entry(&mut tab.log, from, stream_id, duration_ms, pcm.clone()) {
                 if let Some(server_label) = &autosave {
                     crate::client::export::autosave_entry(
@@ -1049,39 +865,14 @@ impl UiState {
         body: MessageBody,
         delivery: Option<MessageDelivery>,
     ) {
-        let from = self.own_id.unwrap_or(UserId(0));
-        let from_name = self.own_name.clone();
-        let is_current = self.is_viewing_channel(channel);
-        let crypto = self.channel_send_crypto(channel);
-        let autosave = self.autosave_messages.then(|| self.server_label.clone());
-        if let Some(tab) = self.channels.iter_mut().find(|c| c.name == channel) {
-            push_log_entry(
-                &mut tab.log,
-                &mut self.message_selected,
-                is_current,
-                LogEntry {
-                    from,
-                    from_name,
-                    to_name: None,
-                    body,
-                    outgoing: true,
-                    failed: false,
-                    sent_at: local_time_stamp(),
-                    sent_at_utc: crate::client::export::utc_time_stamp(),
-                    owed_receipt: None,
-                    listened: true,
-                    delivery,
-                    crypto,
-                },
-            );
-            if let Some(server_label) = &autosave {
-                crate::client::export::autosave_entry(
-                    server_label,
-                    crate::client::export::Surface::Channel(channel),
-                    tab.log.last().unwrap(),
-                );
-            }
-        }
+        let entry = LogEntry::outgoing(
+            self.own_id.unwrap_or(UserId(0)),
+            self.own_name.clone(),
+            body,
+            delivery,
+            self.channel_send_crypto(channel),
+        );
+        self.append_to_channel(channel, entry, Unread::Leave);
     }
 
     /// Creates the pending outgoing file-transfer row in the channel log,
@@ -1101,46 +892,21 @@ impl UiState {
         total: u64,
         delivery: Option<MessageDelivery>,
     ) {
-        let from = self.own_id.unwrap_or(UserId(0));
-        let from_name = self.own_name.clone();
-        let is_current = self.is_viewing_channel(channel);
-        let crypto = self.channel_send_crypto(channel);
-        let autosave = self.autosave_messages.then(|| self.server_label.clone());
-        if let Some(tab) = self.channels.iter_mut().find(|c| c.name == channel) {
-            push_log_entry(
-                &mut tab.log,
-                &mut self.message_selected,
-                is_current,
-                LogEntry {
-                    from,
-                    from_name,
-                    // Addressed to the channel, not to one person - the
-                    // details popup is where the recipients are named.
-                    to_name: None,
-                    body: MessageBody::File {
-                        filename,
-                        total,
-                        stream_id,
-                        status: FileTransferStatus::Pending,
-                    },
-                    outgoing: true,
-                    failed: false,
-                    sent_at: local_time_stamp(),
-                    sent_at_utc: crate::client::export::utc_time_stamp(),
-                    owed_receipt: None,
-                    listened: true,
-                    delivery,
-                    crypto,
-                },
-            );
-            if let Some(server_label) = &autosave {
-                crate::client::export::autosave_entry(
-                    server_label,
-                    crate::client::export::Surface::Channel(channel),
-                    tab.log.last().unwrap(),
-                );
-            }
-        }
+        // Addressed to the channel, not to one person - the details popup
+        // is where the recipients are named.
+        let entry = LogEntry::outgoing(
+            self.own_id.unwrap_or(UserId(0)),
+            self.own_name.clone(),
+            MessageBody::File {
+                filename,
+                total,
+                stream_id,
+                status: FileTransferStatus::Pending,
+            },
+            delivery,
+            self.channel_send_crypto(channel),
+        );
+        self.append_to_channel(channel, entry, Unread::Leave);
     }
 
     /// Creates the receiving side's row the moment a file offer is
@@ -1155,45 +921,18 @@ impl UiState {
         filename: String,
         total: u64,
     ) {
-        let is_current = self.is_viewing_channel(channel);
-        let crypto = self.message_crypto(from, false);
-        let autosave = self.autosave_messages.then(|| self.server_label.clone());
-        if let Some(tab) = self.channels.iter_mut().find(|c| c.name == channel) {
-            push_log_entry(
-                &mut tab.log,
-                &mut self.message_selected,
-                is_current,
-                LogEntry {
-                    from,
-                    from_name,
-                    to_name: None,
-                    body: MessageBody::File {
-                        filename,
-                        total,
-                        stream_id,
-                        status: FileTransferStatus::InProgress { bytes: 0 },
-                    },
-                    outgoing: false,
-                    failed: false,
-                    sent_at: local_time_stamp(),
-                    sent_at_utc: crate::client::export::utc_time_stamp(),
-                    owed_receipt: None,
-                    listened: true,
-                    delivery: None,
-                    crypto,
-                },
-            );
-            if !is_current {
-                tab.unread = true;
-            }
-            if let Some(server_label) = &autosave {
-                crate::client::export::autosave_entry(
-                    server_label,
-                    crate::client::export::Surface::Channel(channel),
-                    tab.log.last().unwrap(),
-                );
-            }
-        }
+        let entry = LogEntry::incoming(
+            from,
+            from_name,
+            MessageBody::File {
+                filename,
+                total,
+                stream_id,
+                status: FileTransferStatus::InProgress { bytes: 0 },
+            },
+            self.message_crypto(from, false),
+        );
+        self.append_to_channel(channel, entry, Unread::Mark);
     }
 }
 

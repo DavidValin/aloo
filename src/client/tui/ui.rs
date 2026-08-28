@@ -1029,7 +1029,107 @@ impl MessageDelivery {
     }
 }
 
+/// Whether appending a row should raise its surface's unread flag.
+///
+/// A `bool` at twenty call sites reads as nothing at all - `true` could
+/// as easily mean "this row is unread" as "this surface now is". Only
+/// ever *sets* the flag, never clears it: reading a surface is what
+/// clears it (`select_channel_at`/`select_dm`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Unread {
+    /// Someone else's content arriving somewhere the user is not looking.
+    Mark,
+    /// This client's own row, or a notice it wrote itself - neither is
+    /// news to the person who caused it.
+    Leave,
+}
+
 impl LogEntry {
+    /// The six fields every row in this app sets the same way, plus the
+    /// seven that vary - the shape twenty call sites were writing out by
+    /// hand.
+    ///
+    /// `sent_at`/`sent_at_utc` are stamped here rather than passed in, so
+    /// a row's two timestamps can never come from two different instants.
+    /// `to_name` is `None` because nothing in this app has ever set it
+    /// (see its field doc); the constructors below are the only way a row
+    /// is built, so that stays true by construction.
+    fn now(
+        from: UserId,
+        from_name: String,
+        body: MessageBody,
+        outgoing: bool,
+        delivery: Option<MessageDelivery>,
+        crypto: Option<MessageCrypto>,
+    ) -> Self {
+        Self {
+            from,
+            from_name,
+            to_name: None,
+            body,
+            outgoing,
+            failed: false,
+            sent_at: local_time_stamp(),
+            sent_at_utc: crate::client::export::utc_time_stamp(),
+            owed_receipt: None,
+            listened: true,
+            delivery,
+            crypto,
+        }
+    }
+
+    /// A row that arrived from someone else. Never carries a `delivery`:
+    /// that is an *outgoing* row's record of who has acknowledged it, and
+    /// an incoming one was delivered by the fact of being here.
+    pub(crate) fn incoming(
+        from: UserId,
+        from_name: String,
+        body: MessageBody,
+        crypto: Option<MessageCrypto>,
+    ) -> Self {
+        Self::now(from, from_name, body, false, None, crypto)
+    }
+
+    /// A row this client is sending, logged optimistically before the
+    /// wire says anything (`docs/PROTOCOL.md` 7.2.1). `delivery` is what
+    /// gives it an indicator; `None` leaves the row untracked.
+    pub(crate) fn outgoing(
+        from: UserId,
+        from_name: String,
+        body: MessageBody,
+        delivery: Option<MessageDelivery>,
+        crypto: Option<MessageCrypto>,
+    ) -> Self {
+        Self::now(from, from_name, body, true, delivery, crypto)
+    }
+
+    /// A yellow presence notice this client wrote itself - someone joined,
+    /// left, was banned, a channel's admin changed.
+    ///
+    /// `crypto` is `None` because there is nothing to report: no message
+    /// travelled. `from`/`from_name` are cosmetic, since a `Presence` row
+    /// renders its text alone (`render_messages`) - an event about nobody
+    /// in particular may pass `UserId(0)` and an empty name.
+    pub(crate) fn presence(from: UserId, from_name: String, text: String) -> Self {
+        Self::now(from, from_name, MessageBody::Presence(text), false, None, None)
+    }
+
+    /// An app-generated line - the OTP layer narrating its own setup
+    /// (`client::otp::notify`). Same "nothing travelled, so nothing to
+    /// report" reasoning as `presence`.
+    pub(crate) fn system(from: UserId, from_name: String, text: String) -> Self {
+        Self::now(from, from_name, MessageBody::System(text), false, None, None)
+    }
+
+    /// Overrides the default `listened: true` - for an incoming voice row
+    /// whose audio was suppressed on arrival (a muted sender, a
+    /// trust-gated one, or a room that was not on screen), which is what
+    /// earns it the red "not listened" marker until it is replayed.
+    pub(crate) fn with_listened(mut self, listened: bool) -> Self {
+        self.listened = listened;
+        self
+    }
+
     /// This row's delivery status, or `None` for a row that tracks no
     /// delivery at all - such a row shows no indicator.
     pub fn delivery_status(&self) -> Option<DeliveryStatus> {
@@ -3451,6 +3551,110 @@ impl UiState {
     /// instead of it going into the visible log - called by
     /// `on_channel_message`/`on_direct_message` and their stream
     /// counterparts whenever `is_trust_gated(from)`.
+    /// `channel`'s tab, read-only.
+    pub(crate) fn channel_tab(&self, channel: &str) -> Option<&ChannelTab> {
+        self.channels.iter().find(|c| c.name == channel)
+    }
+
+    /// `channel`'s tab, if it is one this client has open.
+    ///
+    /// The `.find(|c| c.name == ..)` this replaces appeared seventeen
+    /// times in `tui::channel` alone - `channels` is a `Vec` because the
+    /// tab order is the selector's order, so a lookup by name is a scan
+    /// and every caller was writing it out.
+    pub(crate) fn channel_tab_mut(&mut self, channel: &str) -> Option<&mut ChannelTab> {
+        self.channels.iter_mut().find(|c| c.name == channel)
+    }
+
+    /// What is known about `peer`, or a placeholder standing in for them.
+    ///
+    /// A room has to be openable for someone who is not in `known_users`
+    /// yet - a peer whose `Identify` has not arrived, or one reached with
+    /// no server at all (`docs/PROTOCOL.md` §7.1.5). The placeholder
+    /// carries no key, which is exactly what it means: nothing is known
+    /// beyond the name they announced.
+    pub(crate) fn peer_or_fallback(&self, peer: UserId, name: &str) -> UserInfo {
+        self.known_users
+            .get(&peer)
+            .cloned()
+            .unwrap_or_else(|| UserInfo {
+                id: peer,
+                name: name.to_string(),
+                public_key_der: Vec::new(),
+                key_mode: KeyMode::PqHybrid,
+            })
+    }
+
+    /// Appends `entry` to `channel`'s log, following the selection if the
+    /// user is looking at it, and autosaving the row if that is on.
+    ///
+    /// This is the whole of what writing a row into a channel involves,
+    /// and it was open-coded at every site: snapshot whether the channel
+    /// is on screen, snapshot the autosave label, find the tab, push,
+    /// maybe raise unread, maybe autosave. The snapshots have to happen
+    /// before the tab is borrowed mutably, which is the detail that made
+    /// each copy look unavoidable.
+    ///
+    /// A channel with no tab open is a no-op, matching the `if let Some`
+    /// every call site already guarded with.
+    pub(crate) fn append_to_channel(&mut self, channel: &str, entry: LogEntry, unread: Unread) {
+        let is_current = self.is_viewing_channel(channel);
+        let autosave = self.autosave_messages.then(|| self.server_label.clone());
+        let Some(tab) = self.channels.iter_mut().find(|c| c.name == channel) else {
+            return;
+        };
+        push_log_entry(&mut tab.log, &mut self.message_selected, is_current, entry);
+        if unread == Unread::Mark && !is_current {
+            tab.unread = true;
+        }
+        if let Some(server_label) = &autosave {
+            crate::client::export::autosave_entry(
+                server_label,
+                crate::client::export::Surface::Channel(channel),
+                tab.log.last().expect("just pushed"),
+            );
+        }
+    }
+
+    /// `append_to_channel`'s DM counterpart, returning where the row
+    /// landed - the log is append-only, so that index stays a stable
+    /// handle for marking the row failed or correcting its crypto later
+    /// (`mark_dm_message_failed`, `set_dm_message_crypto`).
+    ///
+    /// `surface_name` names the `.log` file the row is autosaved to and is
+    /// passed rather than read off the room, because the call sites do not
+    /// agree on it: an incoming row files under the name its *sender*
+    /// announced, an outgoing one under the room's peer. Making that a
+    /// parameter keeps each site's existing choice visible instead of
+    /// silently picking one.
+    ///
+    /// A peer with no room open is a no-op returning `None` - callers that
+    /// need one call `ensure_private_room` first.
+    pub(crate) fn append_to_dm(
+        &mut self,
+        peer: UserId,
+        surface_name: &str,
+        entry: LogEntry,
+        unread: Unread,
+    ) -> Option<usize> {
+        let is_current = self.is_viewing_dm(peer);
+        let autosave = self.autosave_messages.then(|| self.server_label.clone());
+        let room = self.private_rooms.get_mut(&peer)?;
+        let index = room.log.len();
+        push_log_entry(&mut room.log, &mut self.message_selected, is_current, entry);
+        if unread == Unread::Mark && !is_current {
+            room.unread = true;
+        }
+        if let Some(server_label) = &autosave {
+            crate::client::export::autosave_entry(
+                server_label,
+                crate::client::export::Surface::Dm(surface_name),
+                room.log.last().expect("just pushed"),
+            );
+        }
+        Some(index)
+    }
+
     pub(crate) fn hold_message(&mut self, from: UserId, channel: Option<String>, entry: LogEntry) {
         self.pending_messages
             .entry(from)
@@ -3503,67 +3707,21 @@ impl UiState {
     pub fn resolve_identity_accept(&mut self, peer: UserId) -> bool {
         self.identity_reviews.remove(&peer);
         self.remove_from_identity_review_queue(peer);
-        let autosave = self.autosave_messages.then(|| self.server_label.clone());
         if let Some(held) = self.pending_messages.remove(&peer) {
             for HeldMessage { channel, entry } in held {
                 match channel {
-                    Some(name) => {
-                        let is_current = self.is_viewing_channel(&name);
-                        if let Some(tab) = self.channels.iter_mut().find(|c| c.name == name) {
-                            push_log_entry(
-                                &mut tab.log,
-                                &mut self.message_selected,
-                                is_current,
-                                entry,
-                            );
-                            if !is_current {
-                                tab.unread = true;
-                            }
-                            if let Some(server_label) = &autosave {
-                                crate::client::export::autosave_entry(
-                                    server_label,
-                                    crate::client::export::Surface::Channel(&name),
-                                    tab.log.last().unwrap(),
-                                );
-                            }
-                        }
-                    }
+                    Some(name) => self.append_to_channel(&name, entry, Unread::Mark),
                     None => {
                         // The room may not exist yet - a held DM never creates
                         // one (mirrors `on_direct_message`'s trust-gated path).
-                        let is_current = self.active_private_room == Some(peer);
-                        let from_name = entry.from_name.clone();
-                        let fallback_peer =
-                            self.known_users
-                                .get(&peer)
-                                .cloned()
-                                .unwrap_or_else(|| UserInfo {
-                                    id: peer,
-                                    name: from_name,
-                                    public_key_der: Vec::new(),
-                                    key_mode: crate::proto::KeyMode::PqHybrid,
-                                });
+                        let fallback_peer = self.peer_or_fallback(peer, &entry.from_name);
                         self.ensure_private_room(peer, fallback_peer);
-                        let Some(room) = self.private_rooms.get_mut(&peer) else {
+                        let Some(peer_name) =
+                            self.private_rooms.get(&peer).map(|r| r.peer.name.clone())
+                        else {
                             continue;
                         };
-                        let peer_name = room.peer.name.clone();
-                        push_log_entry(
-                            &mut room.log,
-                            &mut self.message_selected,
-                            is_current,
-                            entry,
-                        );
-                        if !is_current {
-                            room.unread = true;
-                        }
-                        if let Some(server_label) = &autosave {
-                            crate::client::export::autosave_entry(
-                                server_label,
-                                crate::client::export::Surface::Dm(&peer_name),
-                                room.log.last().unwrap(),
-                            );
-                        }
+                        self.append_to_dm(peer, &peer_name, entry, Unread::Mark);
                     }
                 }
             }
@@ -4472,9 +4630,7 @@ impl UiState {
     /// except ourselves, which is exactly the tab's own roster.
     pub fn channel_send_crypto(&self, channel: &str) -> Option<MessageCrypto> {
         let recipients: Vec<UserId> = self
-            .channels
-            .iter()
-            .find(|c| c.name == channel)
+            .channel_tab(channel)
             .map(|c| {
                 c.members
                     .iter()
@@ -7235,68 +7391,13 @@ impl UiState {
                 .filter(|c| c.members.iter().any(|m| m.id == user_id))
                 .map(|c| c.name.clone())
                 .collect();
-            let autosave = self.autosave_messages.then(|| self.server_label.clone());
             for channel in member_channels {
-                let is_current = self.is_viewing_channel(&channel);
-                if let Some(tab) = self.channels.iter_mut().find(|c| c.name == channel) {
-                    push_log_entry(
-                        &mut tab.log,
-                        &mut self.message_selected,
-                        is_current,
-                        LogEntry {
-                            from: user_id,
-                            from_name: name.clone(),
-                            to_name: None,
-                            body: MessageBody::Presence(text.clone()),
-                            outgoing: false,
-                            failed: false,
-                            sent_at: local_time_stamp(),
-                            sent_at_utc: crate::client::export::utc_time_stamp(),
-                            owed_receipt: None,
-                            listened: true,
-                            delivery: None,
-                            crypto: None,
-                        },
-                    );
-                    if let Some(server_label) = &autosave {
-                        crate::client::export::autosave_entry(
-                            server_label,
-                            crate::client::export::Surface::Channel(&channel),
-                            tab.log.last().unwrap(),
-                        );
-                    }
-                }
+                let entry = LogEntry::presence(user_id, name.clone(), text.clone());
+                self.append_to_channel(&channel, entry, Unread::Leave);
             }
             if self.private_rooms.contains_key(&user_id) {
-                let is_current = self.active_private_room == Some(user_id);
-                if let Some(room) = self.private_rooms.get_mut(&user_id) {
-                    push_log_entry(
-                        &mut room.log,
-                        &mut self.message_selected,
-                        is_current,
-                        LogEntry {
-                            from: user_id,
-                            from_name: name.clone(),
-                            to_name: None,
-                            body: MessageBody::Presence(text),
-                            outgoing: false,
-                            failed: false,
-                            sent_at: local_time_stamp(),
-                            sent_at_utc: crate::client::export::utc_time_stamp(),
-                            owed_receipt: None,
-                            listened: true,
-                            delivery: None,
-                            crypto: None,
-                        },
-                    );
-                    if let Some(server_label) = &autosave {
-                        crate::client::export::autosave_entry(
-                            server_label,
-                            crate::client::export::Surface::Dm(&name),
-                            room.log.last().unwrap(),
-                        );
-                    }
-                }
+                let entry = LogEntry::presence(user_id, name.clone(), text);
+                self.append_to_dm(user_id, &name, entry, Unread::Leave);
             }
         }
         if !has_dm_history {
