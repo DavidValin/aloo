@@ -493,6 +493,15 @@ impl UiState {
             return self.handle_otp_mail_key(code, modifiers, kind);
         }
 
+        // The settings popup owns every key while open, Space included -
+        // it is that popup's "flip this switch", and push-to-talk below
+        // would otherwise swallow it and start recording instead. Placed
+        // here, above Space, for exactly the reason the OTP mail view is:
+        // a surface whose own meaning for Space outranks the global one.
+        if self.mode == Mode::Settings {
+            return self.handle_settings_key(code);
+        }
+
         if code == KeyCode::Char(' ') && self.focus != Focus::Input {
             return match kind {
                 KeyEventKind::Press | KeyEventKind::Repeat => {
@@ -552,9 +561,6 @@ impl UiState {
         }
         if self.mode == Mode::Contacts {
             return self.handle_contacts_key(code);
-        }
-        if self.mode == Mode::DirectPunches {
-            return self.handle_direct_punches_key(code);
         }
         if self.mode == Mode::ChannelLockPopup {
             return self.handle_channel_lock_popup_key(code);
@@ -645,14 +651,35 @@ impl UiState {
                 KeyCode::Char('o') | KeyCode::Char('O') => {
                     return self.next_url_in_focused_message().map(UiAction::OpenUrl);
                 }
-                // Opens the "Direct Punches" popup - only worth reaching
-                // for once direct punching is at least worth looking at,
-                // but the popup itself (`open_direct_punches`) is where
-                // adding the very first one from scratch happens too, so
-                // it's never gated on any already being configured.
+                // Opens the "Settings" popup - the in-app editor for the
+                // client half of `~/.aloo/settings`, including the direct
+                // punch targets that were once all this key opened
+                // (`settings_popup`).
                 KeyCode::Char('s') | KeyCode::Char('S') => {
-                    self.open_direct_punches();
-                    return Some(UiAction::OpenDirectPunches);
+                    self.open_settings();
+                    return Some(UiAction::OpenSettings);
+                }
+                // Mutes/unmutes our own microphone while on a call, from
+                // wherever the cursor happens to be in the app - the call
+                // modal's own `m` needs the modal open and our own row
+                // selected, which is not much use when someone starts
+                // talking about us and the modal is closed. Does nothing
+                // when not on a call: there is no microphone to mute.
+                //
+                // An ordinary key of this app's own, deliberately *not*
+                // an OS-level shortcut: `global_ptt` is the one thing
+                // here that registers a combo with the window system, and
+                // it does so for push-to-talk alone. This one is read off
+                // the terminal like every other key, so it does nothing
+                // while another window has focus.
+                //
+                // Only reaches us on a terminal that disambiguates it
+                // from Enter (both are 0x0D otherwise) - which is why
+                // `tui::terminal::setup` asks for
+                // `DISAMBIGUATE_ESCAPE_CODES`, and why `m` on the roster
+                // stays as the way that always works.
+                KeyCode::Char('m') | KeyCode::Char('M') => {
+                    return self.call.is_some().then_some(UiAction::ToggleCallMute);
                 }
                 // Opens the export popup - checkbox-pick any joined
                 // channel or open DM, Confirm to dump each one's current
@@ -1178,10 +1205,12 @@ impl UiState {
             return Some(UiAction::RequestUserInfo { peer: peer_id, nickname: peer.name });
         }
         // Everything below requires the open DM's peer (if any) to actually
-        // be reachable - `/endotp` above is the one deliberate exception.
+        // be reachable - `/endotp` above is the one deliberate exception,
+        // and an ordinary message is the other one whenever there is a
+        // durable queue to hold it (`offline_blocks_send`).
         // `active_dm_peer_offline` is `false` whenever no DM room is open at
         // all, so this never touches a channel send.
-        if self.active_dm_peer_offline() || self.active_dm_peer_trust_gated() {
+        if self.offline_blocks_send(&self.input.clone()) || self.active_dm_peer_trust_gated() {
             return None;
         }
         if self.input.trim() == "/file" {
@@ -1596,7 +1625,16 @@ impl UiState {
         if self.focus != Focus::Input {
             return None;
         }
-        if self.active_dm_peer_offline() || self.active_dm_peer_trust_gated() {
+        // A paste is an ordinary message, so an offline peer no longer
+        // refuses it outright while there is a queue to hold it - except
+        // when it is long enough to become a file transfer instead, which
+        // is never queued (`outbox::is_queueable`) and does need them
+        // there to accept it.
+        let becomes_a_file =
+            text.chars().count() > crate::client::file_transfer::PASTE_TO_FILE_CHAR_THRESHOLD;
+        if self.active_dm_peer_trust_gated()
+            || (self.active_dm_peer_offline() && (becomes_a_file || !self.queue_send_messages))
+        {
             return None;
         }
         // Bracketed paste's line endings are not reliably `\n`: many

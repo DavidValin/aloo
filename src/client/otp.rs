@@ -4305,9 +4305,15 @@ pub(crate) async fn apply_otp_message(
             let body = crate::client::tui::ui::MessageBody::Text(
                 String::from_utf8_lossy(&plaintext).into_owned(),
             );
+            // The pad layer carries ordinary text, so it earns the same
+            // `@<nickname>` ping the pq_hybrid path gets (`channel::on_message`).
+            let mentions_me = ui_state.message_mentions_me(&body);
             match &channel {
                 Some(ch) => ui_state.on_channel_message(ch, from, from_name, body),
                 None => ui_state.on_direct_message(from, from_name, body),
+            }
+            if mentions_me {
+                crate::client::voice_stream::play_ping_chime(session);
             }
             refresh_otp_key_status(&session.otp_cli_cfg, ui_state, from, contact_name).await;
             // No ordinary `DeliveryReceipt` here. It would say exactly what

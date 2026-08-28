@@ -48,9 +48,18 @@ pub fn setup() -> Result<(Terminal<CrosstermBackend<Stdout>>, bool), BoxError> {
     let keyboard_release_reporting =
         crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
     if keyboard_release_reporting {
+        // `DISAMBIGUATE_ESCAPE_CODES` alongside the release reporting:
+        // without it a terminal sends Ctrl+M as 0x0D, byte-identical to
+        // Enter, so `Ctrl+M` (mute my own microphone on a call) could not
+        // exist without breaking Enter. With it, the two arrive as
+        // different key events. Everything else keeps arriving as the
+        // same `KeyCode` crossterm already reported.
         crossterm::execute!(
             stdout,
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::REPORT_EVENT_TYPES)
+            PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                    | KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+            )
         )?;
     }
     let backend = CrosstermBackend::new(stdout);

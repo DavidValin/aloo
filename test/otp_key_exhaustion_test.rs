@@ -215,8 +215,8 @@ async fn an_exhausted_active_session_ends_on_both_sides_when_the_peer_is_reachab
     );
 
     let told_peer = session
-        .peer_link_mut()
-        .pending_payloads(PEER)
+        
+        .sent_or_queued_payloads(PEER)
         .into_iter()
         .any(|p| matches!(p, P2pPayload::Envelope { envelope, .. } if envelope.content == Content::OtpEndSession));
     assert!(told_peer, "a real end-of-session notice must genuinely be sent to the peer");
@@ -311,8 +311,8 @@ async fn an_exhausted_contact_with_no_active_session_is_left_alone() {
         "nothing was active, so nothing should be announced or sent"
     );
     let attempted_notice = session
-        .peer_link_mut()
-        .pending_payloads(PEER)
+        
+        .sent_or_queued_payloads(PEER)
         .into_iter()
         .any(|p| matches!(p, P2pPayload::Envelope { envelope, .. } if envelope.content == Content::OtpEndSession));
     assert!(!attempted_notice, "no session was ending, so nothing should be sent to the peer");

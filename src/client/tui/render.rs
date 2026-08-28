@@ -64,8 +64,8 @@ pub fn render(frame: &mut Frame, state: &UiState) {
     if state.mode == Mode::Contacts {
         super::contacts::render_contacts_popup(frame, area, state);
     }
-    if state.mode == Mode::DirectPunches {
-        super::direct_punch_popup::render_direct_punches_popup(frame, area, state);
+    if state.mode == Mode::Settings {
+        super::settings_popup::render_settings_popup(frame, area, state);
     }
     if state.mode == Mode::ChannelLockPopup {
         super::channel_lock_popup::render_channel_lock_popup(frame, area, state);
@@ -1763,6 +1763,7 @@ fn render_message_info_popup(frame: &mut Frame, area: Rect, state: &UiState) {
     // sized by the longest name so nothing is truncated that fits.
     let status_width = [
         UNDELIVERED_LABEL,
+        QUEUED_LABEL,
         DELIVERED_LABEL,
         LISTENED_LABEL,
         SAVED_LABEL,

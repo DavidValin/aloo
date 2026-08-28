@@ -10,8 +10,10 @@
 //!
 //! Nothing here needs a peer: the link to the "sender" is only ever
 //! `ensure_link`-ed, never punched, so anything the session decides to
-//! send waits in that link's pending queue where the assertions can read
-//! it (`PeerLinkManager::pending_payloads`).
+//! send is still waiting where the assertions can read it
+//! (`SessionState::sent_or_queued_payloads`, which looks on both sides of
+//! the `queue_send_messages` switch - a receipt waits in the link's own
+//! queue, a message in the durable one).
 
 use aloo::client::connect::ResolvedIdentity;
 use aloo::client::session::{SessionState, TestSessionSpec};
@@ -162,7 +164,7 @@ fn sealed_to_someone_else(peers: &Peers, channel: Option<&str>, send_id: u64) ->
 /// Anything the session decided to send alice, still queued because her
 /// link was never punched.
 fn queued_for_alice(session: &mut SessionState) -> Vec<P2pPayload> {
-    session.peer_link_mut().pending_payloads(ALICE)
+    session.sent_or_queued_payloads(ALICE)
 }
 
 fn receipts(session: &mut SessionState) -> Vec<(u64, ReceiptStage)> {

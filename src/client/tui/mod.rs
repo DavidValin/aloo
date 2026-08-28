@@ -14,6 +14,7 @@ pub mod notice;
 pub mod otp;
 pub mod otp_mail;
 pub mod render;
+pub mod settings_popup;
 pub mod surface;
 pub mod terminal;
 pub mod ui;

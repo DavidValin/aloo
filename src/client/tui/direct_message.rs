@@ -36,6 +36,24 @@ impl UiState {
     /// the compose bar (`handle_input_key`) and its rendering
     /// (`render_input_bar`). `false` whenever no private room is open, so
     /// callers don't need to check `active_private_room` separately.
+    /// Whether the open DM room's peer being offline should refuse
+    /// `what` outright.
+    ///
+    /// It always did. With a durable queue behind us
+    /// (`queue_send_messages`, `client::outbox`) it no longer does for an
+    /// ordinary message: "they are not here" is precisely the case that
+    /// queue exists for, so the send is accepted, sealed, and held until
+    /// they are. Everything that genuinely needs them present is still
+    /// refused - a slash command here means `/file`, `/otp`, `/call` and
+    /// friends, each a live exchange with a peer who has to answer, and
+    /// none of them something a queue could stand in for.
+    pub(crate) fn offline_blocks_send(&self, what: &str) -> bool {
+        if !self.active_dm_peer_offline() {
+            return false;
+        }
+        !self.queue_send_messages || what.trim_start().starts_with('/')
+    }
+
     pub(crate) fn active_dm_peer_offline(&self) -> bool {
         self.active_private_room
             .map(|id| self.offline.contains(&id))

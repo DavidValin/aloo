@@ -185,6 +185,14 @@ pub struct DeliveryRecipient {
     pub name: String,
     /// They could read it (`p2p_proto::ReceiptStage::Decrypted`).
     pub delivered: bool,
+    /// This leg is not on the wire at all: it is waiting on disk for them
+    /// to become reachable (`queue_send_messages`, `client::outbox`).
+    ///
+    /// Only ever read while `delivered` is false - once they have it, how
+    /// it got to them is not what the popup is reporting. Cleared when the
+    /// queue is flushed to them, so a leg that is genuinely in flight
+    /// again stops claiming to be waiting.
+    pub queued: bool,
     /// Whether this leg went out under the one-time-pad layer, and so
     /// answers to the pad's own acknowledgement rather than to an ordinary
     /// delivery receipt (`DeliveryProof`).

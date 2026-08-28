@@ -2,10 +2,20 @@
 //! `~/.aloo/settings`, same plain-text convention as the other stores
 //! rather than a config-format crate for a handful of fields.
 //!
-//! Holds the global push-to-talk preferences (`crate::client::global_ptt`).
+//! Holds the global push-to-talk preferences (`crate::client::global_ptt`)
+//! and the three sound switches (`voice_autoplay`, `roger_beep`,
+//! `sound_notifications` - `docs/SPEC.md` Functionality #32, read by
+//! `crate::client::tui::ui::UiState::suppress_playback_from` and
+//! `crate::client::voice_stream`'s chime players).
 //! Unlike `IdStore` this file is written proactively - `load_or_create`
 //! writes the defaults on first run so a user can find and edit the file
 //! before ever changing anything.
+//!
+//! Hand-editing is no longer the only way in: the client half of this file
+//! is also editable from inside the app (`Ctrl+S`,
+//! `crate::client::tui::settings_popup`), which writes each change through
+//! `update`'s merging write as it is made. The server and daemon keys stay
+//! hand-edited - they belong to a process that popup is not part of.
 //!
 //! Also holds the serverless direct-punch configuration (`direct_punch`,
 //! `direct_punch_port`, and one `direct_punch_to` line per peer) that
@@ -487,6 +497,27 @@ pub struct Settings {
     /// Applies to live calls and to push-to-talk voice messages alike; both
     /// capture through the same microphone while the same speakers play.
     pub voice_echo_ducking: EchoDucking,
+    /// Play an incoming voice message's audio as it arrives (`docs/SPEC.md`
+    /// Functionality #15). On by default. Off silences *every* arriving
+    /// stream, whatever layering carried it (`pq_hybrid` or an OTP
+    /// session), without touching what is logged: the row still appears
+    /// and Enter still replays it on demand. The blanket counterpart to
+    /// `muted_voice`, which silences named people only - both funnel
+    /// through `UiState::suppress_playback_from`.
+    pub voice_autoplay: bool,
+    /// Play `assets/end.wav` at the end of a voice recording and at the
+    /// end of an arriving voice message - the "over" tone of a two-way
+    /// radio. On by default; off silences it at both ends. Deliberately
+    /// separate from `sound_notifications`: this one punctuates speech
+    /// rather than announcing an event, so someone who wants a quiet
+    /// client usually wants exactly one of the two.
+    pub roger_beep: bool,
+    /// Play the bundled event sounds - `assets/bell.wav` (a file offer, an
+    /// OTP prompt, an identity to review), `assets/joined.wav` (a daemon's
+    /// focused contact appearing) and `assets/ping.wav` (being `@`-
+    /// mentioned). On by default; off silences all three. `end.wav` is
+    /// **not** covered here - it belongs to `roger_beep`.
+    pub sound_notifications: bool,
     pub server_bind: String,
     pub server_port: u16,
     /// Serve the control connection (and the activation endpoint) over
@@ -574,6 +605,25 @@ pub struct Settings {
     /// written in an earlier session (or not exist at all, in which case
     /// this is a no-op either way).
     pub resume_from_log: bool,
+    /// Hold a message addressed to someone unreachable on disk
+    /// (`client::outbox`) and deliver it, in the order it was written, as
+    /// soon as a link to them opens - across restarts, not just across a
+    /// blink. On by default.
+    ///
+    /// The transport already keeps a short in-memory queue per link
+    /// (`p2p::PENDING_MAX_AGE`, one minute); this is what survives longer
+    /// than that, and what survives this process. Text and voice only:
+    /// a file transfer is a live, consent-gated, chunked conversation
+    /// with the receiver (`docs/PROTOCOL.md` §9), not a payload that can
+    /// be handed over an hour later on its own.
+    ///
+    /// What is queued is the *already-sealed* payload, so a message keeps
+    /// whatever layering it was sent under - `pq_hybrid`, or the pad if an
+    /// OTP session was open with that peer at the time. Nothing ages out
+    /// of that queue: the only thing that removes a held message is this
+    /// machine no longer holding key material for the contact it was
+    /// sealed for (`outbox::retain_contacts`).
+    pub queue_send_messages: bool,
 
     // -----------------------------------------------------------------
     // Daemon mode (`aloo --daemon`, docs/SPEC.md "Running in background mode")
@@ -698,6 +748,9 @@ impl Default for Settings {
             global_ptt_enabled: true,
             global_ptt_shortcut: DEFAULT_GLOBAL_PTT_SHORTCUT.to_string(),
             voice_echo_ducking: EchoDucking::default(),
+            voice_autoplay: true,
+            roger_beep: true,
+            sound_notifications: true,
             server_bind: DEFAULT_BIND.to_string(),
             server_port: DEFAULT_PORT,
             server_ssl: false,
@@ -718,6 +771,7 @@ impl Default for Settings {
             muted_voice: BTreeSet::new(),
             autosave_messages: false,
             resume_from_log: false,
+            queue_send_messages: true,
             daemon_host: None,
             daemon_port: None,
             daemon_nickname: None,
@@ -778,8 +832,12 @@ const SCAFFOLD_LAYOUT: &[ScaffoldLine] = {
         // them.
         Literal("# voice_echo_ducking: auto (decide from the audio), on, off"),
         Key("voice_echo_ducking"),
+        Key("voice_autoplay"),
+        Key("roger_beep"),
+        Key("sound_notifications"),
         Key("autosave_messages"),
         Key("resume_from_log"),
+        Key("queue_send_messages"),
         Key("daemon_host"),
         Key("daemon_port"),
         Key("daemon_nickname"),
@@ -917,6 +975,11 @@ impl Settings {
                 "voice_echo_ducking" => {
                     settings.voice_echo_ducking = EchoDucking::parse(value);
                 }
+                "voice_autoplay" => settings.voice_autoplay = parse_switch(value),
+                "roger_beep" => settings.roger_beep = parse_switch(value),
+                "sound_notifications" => {
+                    settings.sound_notifications = parse_switch(value);
+                }
                 "server_bind" if !value.is_empty() => {
                     settings.server_bind = value.to_string();
                 }
@@ -979,6 +1042,9 @@ impl Settings {
                 }
                 "autosave_messages" => settings.autosave_messages = parse_switch(value),
                 "resume_from_log" => settings.resume_from_log = parse_switch(value),
+                "queue_send_messages" => {
+                    settings.queue_send_messages = parse_switch(value);
+                }
                 "daemon_host" if !value.is_empty() => {
                     settings.daemon_host = Some(value.to_string())
                 }
@@ -1100,6 +1166,9 @@ impl Settings {
             always("global_ptt_enabled", self.global_ptt_enabled),
             always("global_ptt_shortcut", &self.global_ptt_shortcut),
             always("voice_echo_ducking", self.voice_echo_ducking),
+            always_switch("voice_autoplay", self.voice_autoplay),
+            always_switch("roger_beep", self.roger_beep),
+            always_switch("sound_notifications", self.sound_notifications),
             always("server_bind", &self.server_bind),
             always("server_port", self.server_port),
             always_switch("server_ssl", self.server_ssl),
@@ -1123,6 +1192,7 @@ impl Settings {
             always("otp_status_poll_interval", self.otp_status_poll_interval),
             always_switch("autosave_messages", self.autosave_messages),
             always_switch("resume_from_log", self.resume_from_log),
+            always_switch("queue_send_messages", self.queue_send_messages),
             always_switch("direct_punch", self.direct_punch),
             always("direct_punch_port", self.direct_punch_port),
             always_switch(

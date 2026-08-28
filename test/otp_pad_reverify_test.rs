@@ -120,8 +120,8 @@ async fn an_already_consented_pad_reverifies_silently_even_on_a_resend() {
         "consent must survive being used - it is not a single-use token"
     );
     let verifies = session
-        .peer_link_mut()
-        .pending_payloads(PEER)
+        
+        .sent_or_queued_payloads(PEER)
         .into_iter()
         .filter(|p| matches!(p, P2pPayload::OtpPadVerify { accepted: true, .. }))
         .count();
@@ -141,8 +141,8 @@ async fn an_already_consented_pad_reverifies_silently_even_on_a_resend() {
         "a resend of an already-accepted pad must not prompt again either"
     );
     let verifies = session
-        .peer_link_mut()
-        .pending_payloads(PEER)
+        
+        .sent_or_queued_payloads(PEER)
         .into_iter()
         .filter(|p| matches!(p, P2pPayload::OtpPadVerify { accepted: true, .. }))
         .count();
@@ -173,8 +173,8 @@ async fn a_pad_with_no_prior_consent_still_shows_one_popup() {
         "a pad nobody agreed to must still be a decision, not an automatic yes"
     );
     let verifies = session
-        .peer_link_mut()
-        .pending_payloads(PEER)
+        
+        .sent_or_queued_payloads(PEER)
         .into_iter()
         .filter(|p| matches!(p, P2pPayload::OtpPadVerify { .. }))
         .count();

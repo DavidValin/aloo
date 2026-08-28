@@ -878,8 +878,7 @@ async fn pad_only_receive(w: &mut AlooWorld, _b: String, _a: String) {
     let (a, b) = w.pad_only.as_mut().expect("no pad-only pair");
     let (seq, msg_id, envelope, sender_device_id) = a
         .session
-        .peer_link_mut()
-        .pending_payloads(a.peer)
+        .sent_or_queued_payloads(a.peer)
         .into_iter()
         .find_map(|p| match p {
             aloo::p2p_proto::P2pPayload::OtpEnvelope {
@@ -1024,8 +1023,7 @@ async fn pad_only_receive_succeeds(w: &mut AlooWorld, _b: String) {
     let (a, b) = w.pad_only.as_mut().expect("no pad-only pair");
     let (seq, msg_id, envelope, sender_device_id) = a
         .session
-        .peer_link_mut()
-        .pending_payloads(a.peer)
+        .sent_or_queued_payloads(a.peer)
         .into_iter()
         .find_map(|p| match p {
             aloo::p2p_proto::P2pPayload::OtpEnvelope {
@@ -1081,8 +1079,7 @@ async fn pad_only_receive_fails_and_ends_locally(w: &mut AlooWorld, _b: String) 
     let (a, b) = w.pad_only.as_mut().expect("no pad-only pair");
     let (seq, msg_id, envelope, sender_device_id) = a
         .session
-        .peer_link_mut()
-        .pending_payloads(a.peer)
+        .sent_or_queued_payloads(a.peer)
         .into_iter()
         .find_map(|p| match p {
             aloo::p2p_proto::P2pPayload::OtpEnvelope {
@@ -1118,7 +1115,7 @@ async fn pad_only_receive_fails_and_ends_locally(w: &mut AlooWorld, _b: String) 
     // No identity left to seal a notice to alice with, and no server
     // relay for a pad-only pair by design - nothing should even attempt
     // to reach her.
-    let notice_queued = b.session.peer_link_mut().pending_payloads(b.peer).into_iter().any(|p| {
+    let notice_queued = b.session.sent_or_queued_payloads(b.peer).into_iter().any(|p| {
         matches!(p, aloo::p2p_proto::P2pPayload::Envelope { envelope, .. }
             if envelope.content == aloo::proto::Content::OtpEndSession)
     });
@@ -1188,15 +1185,14 @@ async fn claim_refused_pad_untouched(w: &mut AlooWorld, _b: String, _a: String) 
     let contact = w.otp_contact_name.clone().expect("no contact");
     let (a, b) = w.pad_only.as_mut().expect("no pad-only pair");
     let real_device = a.session.own_device_id_for_test().to_string();
-    // `pending_payloads` is a non-destructive peek, so the priming
-    // message's envelope is still in there too - `pending_payloads`
+    // `sent_or_queued_payloads` is a non-destructive peek, so the priming
+    // message's envelope is still in there too - that helper
     // returns them in queue order, so the claiming send's is the one
     // with the highest `seq`, exactly `take_second_envelope`'s approach
     // in `otp_ack_wiring_test.rs`.
     let (seq, msg_id, envelope, claimed_device_id) = a
         .session
-        .peer_link_mut()
-        .pending_payloads(a.peer)
+        .sent_or_queued_payloads(a.peer)
         .into_iter()
         .filter_map(|p| match p {
             aloo::p2p_proto::P2pPayload::OtpEnvelope {
@@ -1278,8 +1274,7 @@ async fn deliver_pad_envelope(
 ) {
     let (seq, msg_id, envelope, sender_device_id) = from
         .session
-        .peer_link_mut()
-        .pending_payloads(from.peer)
+        .sent_or_queued_payloads(from.peer)
         .into_iter()
         .find_map(|p| match p {
             aloo::p2p_proto::P2pPayload::OtpEnvelope {
@@ -1361,8 +1356,7 @@ async fn pad_only_end_refused(w: &mut AlooWorld) {
     let peer = a.peer;
     let envelopes = a
         .session
-        .peer_link_mut()
-        .pending_payloads(peer)
+        .sent_or_queued_payloads(peer)
         .into_iter()
         .filter(|p| matches!(p, aloo::p2p_proto::P2pPayload::OtpEnvelope { .. }))
         .count();
@@ -1424,8 +1418,7 @@ async fn pad_only_end_recovered(w: &mut AlooWorld) {
     let peer = a.peer;
     let envelopes: Vec<(u64, Option<u64>, aloo::proto::Envelope, String)> = a
         .session
-        .peer_link_mut()
-        .pending_payloads(peer)
+        .sent_or_queued_payloads(peer)
         .into_iter()
         .filter_map(|p| match p {
             aloo::p2p_proto::P2pPayload::OtpEnvelope {
@@ -1477,8 +1470,7 @@ async fn pad_only_end_recovered(w: &mut AlooWorld) {
     // ...and his proof-carrying confirmation ends it on alice's side too.
     let (ack_seq, proof) = b
         .session
-        .peer_link_mut()
-        .pending_payloads(b.peer)
+        .sent_or_queued_payloads(b.peer)
         .into_iter()
         .filter_map(|p| match p {
             aloo::p2p_proto::P2pPayload::OtpDeliveryAck { seq, proof } => Some((seq, proof)),
@@ -1535,8 +1527,7 @@ async fn pad_only_end_notice(w: &mut AlooWorld) {
     // gate and the durable retry.
     let (seq, proof) = b
         .session
-        .peer_link_mut()
-        .pending_payloads(b.peer)
+        .sent_or_queued_payloads(b.peer)
         .into_iter()
         .filter_map(|p| match p {
             aloo::p2p_proto::P2pPayload::OtpDeliveryAck { seq, proof } => Some((seq, proof)),
@@ -1577,8 +1568,7 @@ async fn pad_only_ack(w: &mut AlooWorld, _b: String) {
     let (a, b) = w.pad_only.as_mut().expect("no pad-only pair");
     let (seq, proof) = b
         .session
-        .peer_link_mut()
-        .pending_payloads(b.peer)
+        .sent_or_queued_payloads(b.peer)
         .into_iter()
         .find_map(|p| match p {
             aloo::p2p_proto::P2pPayload::OtpDeliveryAck { seq, proof } => Some((seq, proof)),
@@ -1639,8 +1629,7 @@ async fn otp_active_with_nothing_sent(w: &mut AlooWorld, _b: String) {
     let peer = a.peer;
     assert!(
         a.session
-            .peer_link_mut()
-            .pending_payloads(peer)
+            .sent_or_queued_payloads(peer)
             .iter()
             .all(|p| !matches!(
                 p,
@@ -1676,8 +1665,7 @@ async fn pad_only_send_voice(w: &mut AlooWorld) {
 
     let (stream_id, seq, envelope, sender_device_id) = a
         .session
-        .peer_link_mut()
-        .pending_payloads(peer)
+        .sent_or_queued_payloads(peer)
         .into_iter()
         .find_map(|p| match p {
             aloo::p2p_proto::P2pPayload::OtpVoiceOffer {
@@ -1741,8 +1729,7 @@ async fn pad_only_resume_and_ack(w: &mut AlooWorld) {
 
     let (ack_seq, proof) = b
         .session
-        .peer_link_mut()
-        .pending_payloads(b.peer)
+        .sent_or_queued_payloads(b.peer)
         .into_iter()
         .filter_map(|p| match p {
             aloo::p2p_proto::P2pPayload::OtpDeliveryAck { seq, proof } => Some((seq, proof)),
@@ -1773,8 +1760,7 @@ async fn pad_only_recording_arrives_once(w: &mut AlooWorld) {
     let peer = a.peer;
     let content_announcements: Vec<u64> = a
         .session
-        .peer_link_mut()
-        .pending_payloads(peer)
+        .sent_or_queued_payloads(peer)
         .into_iter()
         .filter_map(|p| match p {
             aloo::p2p_proto::P2pPayload::OtpFileContentSeq {

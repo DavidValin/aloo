@@ -152,8 +152,8 @@ async fn propose_fresh_pad(side: &mut Side, peer: UserId, peer_der: Vec<u8>, pee
 /// `otp_ack_wiring_test.rs`'s `take_envelope`.
 fn take_session_request(side: &mut Side, peer: UserId) -> Envelope {
     side.session
-        .peer_link_mut()
-        .pending_payloads(peer)
+        
+        .sent_or_queued_payloads(peer)
         .into_iter()
         .find_map(|p| match p {
             P2pPayload::Envelope { envelope, .. } if envelope.content == Content::OtpSessionRequest => {
@@ -291,8 +291,8 @@ async fn the_losers_refusal_ack_is_handled_cleanly_after_the_early_withdrawal() 
     // eventually would.
     let ack_envelope = winner
         .session
-        .peer_link_mut()
-        .pending_payloads(loser_info)
+        
+        .sent_or_queued_payloads(loser_info)
         .into_iter()
         .find_map(|p| match p {
             P2pPayload::Envelope { envelope, .. } if envelope.content == Content::OtpKeySetupAck => {

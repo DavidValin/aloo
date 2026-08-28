@@ -1,12 +1,15 @@
-//! The Ctrl+S "Direct Punches" popup (US-039): opening it, navigating and
-//! editing the list, and what saving/deleting a row actually produces.
+//! The "configured punches" list on the Ctrl+S settings popup's Direct
+//! Punch tab (US-039): reaching it, navigating and editing the list, and
+//! what saving/deleting a row actually produces. The tabs and the rest of
+//! the settings around it are `ui_settings_popup_test.rs`.
 
 #[path = "ui_common.rs"]
 mod ui_common;
 use ui_common::*;
 
 use aloo::client::tui::direct_punch_popup::DirectPunchField;
-use aloo::client::tui::ui::{Mode, UiAction, render};
+use aloo::client::tui::settings_popup::SettingsField;
+use aloo::client::tui::ui::{Mode, UiAction, UiState, render};
 use aloo::settings::{DEFAULT_DIRECT_PUNCH_PORT, DirectPunchTarget, PunchFrequency};
 use crossterm::event::KeyCode;
 use ratatui::Terminal;
@@ -22,31 +25,40 @@ fn target(nickname: &str, host: &str, port: u16, frequency_minutes: u32) -> Dire
     }
 }
 
+/// Opens the Ctrl+S popup and puts the focus on the Direct Punch tab's
+/// punch list, which is where every key below is pressed. The list is the
+/// second field on that tab, under the `direct_punch` master switch.
+fn open_punches(state: &mut UiState) {
+    state.open_settings();
+    press(state, KeyCode::Tab);
+    press(state, KeyCode::Down);
+}
+
 // ---------------------------------------------------------------------
 // Opening the popup
 // ---------------------------------------------------------------------
 
 /// @requirement AC-291
 #[test]
-fn ctrl_s_opens_the_modal_empty_and_requests_a_load() {
+fn ctrl_s_opens_the_modal_with_an_empty_punch_list_and_requests_a_load() {
     let mut state = joined_general_with(vec![]);
     let action = ctrl(&mut state, KeyCode::Char('s'));
-    assert_eq!(action, Some(UiAction::OpenDirectPunches));
-    assert_eq!(state.mode, Mode::DirectPunches);
-    assert!(state.direct_punches.as_ref().unwrap().rows.is_empty());
+    assert_eq!(action, Some(UiAction::OpenSettings));
+    assert_eq!(state.mode, Mode::Settings);
+    assert!(state.settings_popup.as_ref().unwrap().punches.rows.is_empty());
 }
 
 /// @requirement AC-291
 #[test]
 fn set_direct_punch_rows_populates_the_modal_and_clamps_selection() {
     let mut state = joined_general_with(vec![]);
-    state.open_direct_punches();
+    state.open_settings();
     state.set_direct_punch_rows(vec![
         target("bob", "bobhost.example", DEFAULT_DIRECT_PUNCH_PORT, 1),
         target("carol", "carolhost.example", DEFAULT_DIRECT_PUNCH_PORT, 5),
     ]);
-    assert_eq!(state.direct_punches.as_ref().unwrap().rows.len(), 2);
-    assert_eq!(state.direct_punches.as_ref().unwrap().selected, 0);
+    assert_eq!(state.settings_popup.as_ref().unwrap().punches.rows.len(), 2);
+    assert_eq!(state.settings_popup.as_ref().unwrap().punches.selected, 0);
 }
 
 /// @requirement AC-291
@@ -54,18 +66,21 @@ fn set_direct_punch_rows_populates_the_modal_and_clamps_selection() {
 fn set_direct_punch_rows_is_a_no_op_once_the_modal_is_closed() {
     let mut state = joined_general_with(vec![]);
     state.set_direct_punch_rows(vec![target("bob", "bobhost.example", DEFAULT_DIRECT_PUNCH_PORT, 1)]);
-    assert!(state.direct_punches.is_none());
+    assert!(state.settings_popup.is_none());
 }
 
 // ---------------------------------------------------------------------
 // Navigating and closing the list
 // ---------------------------------------------------------------------
 
-/// @requirement AC-291
+/// Up/Down walk the rows while there is another one to move onto, and
+/// hand the key back to the tab at either end - one set of arrows drives
+/// both the field column and the list inside it, with no mode to enter.
+/// @requirement AC-291, AC-397
 #[test]
-fn up_and_down_wrap_around_the_row_list() {
+fn up_and_down_walk_the_row_list_and_then_leave_it() {
     let mut state = joined_general_with(vec![]);
-    state.open_direct_punches();
+    open_punches(&mut state);
     state.set_direct_punch_rows(vec![
         target("bob", "h1", DEFAULT_DIRECT_PUNCH_PORT, 1),
         target("carol", "h2", DEFAULT_DIRECT_PUNCH_PORT, 1),
@@ -73,14 +88,26 @@ fn up_and_down_wrap_around_the_row_list() {
     ]);
 
     press(&mut state, KeyCode::Down);
-    assert_eq!(state.direct_punches.as_ref().unwrap().selected, 1);
+    assert_eq!(state.settings_popup.as_ref().unwrap().punches.selected, 1);
     press(&mut state, KeyCode::Up);
-    assert_eq!(state.direct_punches.as_ref().unwrap().selected, 0);
+    assert_eq!(state.settings_popup.as_ref().unwrap().punches.selected, 0);
+
     press(&mut state, KeyCode::Up);
     assert_eq!(
-        state.direct_punches.as_ref().unwrap().selected,
-        2,
-        "Up from the first row wraps to the last"
+        state.settings_popup.as_ref().unwrap().focused_field(),
+        SettingsField::DirectPunchEnabled,
+        "Up from the first row leaves the list for the field above it"
+    );
+    press(&mut state, KeyCode::Down);
+    assert_eq!(
+        state.settings_popup.as_ref().unwrap().focused_field(),
+        SettingsField::Punches,
+        "and Down comes straight back into it"
+    );
+    assert_eq!(
+        state.settings_popup.as_ref().unwrap().punches.selected,
+        0,
+        "entering from above starts at the first row"
     );
 }
 
@@ -88,10 +115,10 @@ fn up_and_down_wrap_around_the_row_list() {
 #[test]
 fn esc_on_the_list_closes_the_whole_modal() {
     let mut state = joined_general_with(vec![]);
-    state.open_direct_punches();
+    open_punches(&mut state);
     press(&mut state, KeyCode::Esc);
     assert_eq!(state.mode, Mode::Normal);
-    assert!(state.direct_punches.is_none());
+    assert!(state.settings_popup.is_none());
 }
 
 // ---------------------------------------------------------------------
@@ -102,9 +129,9 @@ fn esc_on_the_list_closes_the_whole_modal() {
 #[test]
 fn a_opens_a_blank_add_form() {
     let mut state = joined_general_with(vec![]);
-    state.open_direct_punches();
+    open_punches(&mut state);
     press(&mut state, KeyCode::Char('a'));
-    let edit = state.direct_punches.as_ref().unwrap().edit.as_ref().unwrap();
+    let edit = state.settings_popup.as_ref().unwrap().punches.edit.as_ref().unwrap();
     assert_eq!(edit.editing_index, None);
     assert_eq!(edit.nickname, "");
     assert_eq!(edit.focus, DirectPunchField::Nickname);
@@ -118,10 +145,10 @@ fn a_opens_a_blank_add_form() {
 #[test]
 fn the_add_form_opens_with_the_cursor_in_the_nickname_box() {
     let mut state = joined_general_with(vec![]);
-    state.open_direct_punches();
+    open_punches(&mut state);
     press(&mut state, KeyCode::Char('a'));
     assert_eq!(
-        state.direct_punches.as_ref().unwrap().edit.as_ref().unwrap().focus,
+        state.settings_popup.as_ref().unwrap().punches.edit.as_ref().unwrap().focus,
         DirectPunchField::Nickname
     );
 
@@ -155,7 +182,7 @@ fn the_add_form_opens_with_the_cursor_in_the_nickname_box() {
 #[test]
 fn every_field_renders_as_a_titled_bordered_box() {
     let mut state = joined_general_with(vec![]);
-    state.open_direct_punches();
+    open_punches(&mut state);
     press(&mut state, KeyCode::Char('a'));
 
     let rows = rendered_rows(&state);
@@ -179,12 +206,12 @@ fn every_field_renders_as_a_titled_bordered_box() {
 #[test]
 fn saving_shows_a_confirmation_notice() {
     let mut state = joined_general_with(vec![]);
-    state.open_direct_punches();
+    open_punches(&mut state);
     press(&mut state, KeyCode::Char('a'));
     type_str(&mut state, "bob");
     press(&mut state, KeyCode::Tab);
     type_str(&mut state, "bobhost.example");
-    while state.direct_punches.as_ref().unwrap().edit.as_ref().unwrap().focus != DirectPunchField::Save {
+    while state.settings_popup.as_ref().unwrap().punches.edit.as_ref().unwrap().focus != DirectPunchField::Save {
         press(&mut state, KeyCode::Tab);
     }
     let action = press(&mut state, KeyCode::Enter);
@@ -208,16 +235,16 @@ fn saving_shows_a_confirmation_notice() {
 #[test]
 fn pasting_into_the_nickname_field_types_it() {
     let mut state = joined_general_with(vec![]);
-    state.open_direct_punches();
+    open_punches(&mut state);
     press(&mut state, KeyCode::Char('a'));
     assert_eq!(
-        state.direct_punches.as_ref().unwrap().edit.as_ref().unwrap().focus,
+        state.settings_popup.as_ref().unwrap().punches.edit.as_ref().unwrap().focus,
         DirectPunchField::Nickname
     );
 
     let action = state.handle_paste("bob".to_string());
     assert!(action.is_none(), "typing a nickname produces no action");
-    assert_eq!(state.direct_punches.as_ref().unwrap().edit.as_ref().unwrap().nickname, "bob");
+    assert_eq!(state.settings_popup.as_ref().unwrap().punches.edit.as_ref().unwrap().nickname, "bob");
 }
 
 /// The port field's own digit-only filter still applies to pasted text,
@@ -226,28 +253,28 @@ fn pasting_into_the_nickname_field_types_it() {
 #[test]
 fn pasting_into_the_port_field_still_only_keeps_digits() {
     let mut state = joined_general_with(vec![]);
-    state.open_direct_punches();
+    open_punches(&mut state);
     press(&mut state, KeyCode::Char('a'));
     press(&mut state, KeyCode::Tab); // nickname -> host
     press(&mut state, KeyCode::Tab); // host -> port
     assert_eq!(
-        state.direct_punches.as_ref().unwrap().edit.as_ref().unwrap().focus,
+        state.settings_popup.as_ref().unwrap().punches.edit.as_ref().unwrap().focus,
         DirectPunchField::Port
     );
 
     state.handle_paste("12a3b4".to_string());
-    assert_eq!(state.direct_punches.as_ref().unwrap().edit.as_ref().unwrap().port, "1234");
+    assert_eq!(state.settings_popup.as_ref().unwrap().punches.edit.as_ref().unwrap().port, "1234");
 }
 
 /// @requirement AC-291
 #[test]
 fn enter_on_a_row_opens_it_prefilled_for_editing() {
     let mut state = joined_general_with(vec![]);
-    state.open_direct_punches();
+    open_punches(&mut state);
     state.set_direct_punch_rows(vec![target("bob", "bobhost.example", 9000, 5)]);
 
     press(&mut state, KeyCode::Enter);
-    let edit = state.direct_punches.as_ref().unwrap().edit.as_ref().unwrap();
+    let edit = state.settings_popup.as_ref().unwrap().punches.edit.as_ref().unwrap();
     assert_eq!(edit.editing_index, Some(0));
     assert_eq!(edit.nickname, "bob");
     assert_eq!(edit.host, "bobhost.example");
@@ -258,22 +285,22 @@ fn enter_on_a_row_opens_it_prefilled_for_editing() {
 #[test]
 fn esc_on_the_edit_form_returns_to_the_list_without_losing_other_rows() {
     let mut state = joined_general_with(vec![]);
-    state.open_direct_punches();
+    open_punches(&mut state);
     state.set_direct_punch_rows(vec![target("bob", "h", DEFAULT_DIRECT_PUNCH_PORT, 1)]);
     press(&mut state, KeyCode::Char('a'));
-    assert!(state.direct_punches.as_ref().unwrap().edit.is_some());
+    assert!(state.settings_popup.as_ref().unwrap().punches.edit.is_some());
 
     press(&mut state, KeyCode::Esc);
-    assert_eq!(state.mode, Mode::DirectPunches, "Esc on the form must not close the whole popup");
-    assert!(state.direct_punches.as_ref().unwrap().edit.is_none());
-    assert_eq!(state.direct_punches.as_ref().unwrap().rows.len(), 1);
+    assert_eq!(state.mode, Mode::Settings, "Esc on the form must not close the whole popup");
+    assert!(state.settings_popup.as_ref().unwrap().punches.edit.is_none());
+    assert_eq!(state.settings_popup.as_ref().unwrap().punches.rows.len(), 1);
 }
 
 /// @requirement AC-291
 #[test]
 fn tab_cycles_focus_through_every_field_and_wraps() {
     let mut state = joined_general_with(vec![]);
-    state.open_direct_punches();
+    open_punches(&mut state);
     press(&mut state, KeyCode::Char('a'));
 
     let expect = [
@@ -285,7 +312,7 @@ fn tab_cycles_focus_through_every_field_and_wraps() {
     ];
     for want in expect {
         press(&mut state, KeyCode::Tab);
-        assert_eq!(state.direct_punches.as_ref().unwrap().edit.as_ref().unwrap().focus, want);
+        assert_eq!(state.settings_popup.as_ref().unwrap().punches.edit.as_ref().unwrap().focus, want);
     }
 }
 
@@ -293,13 +320,13 @@ fn tab_cycles_focus_through_every_field_and_wraps() {
 #[test]
 fn typing_fills_the_focused_text_field() {
     let mut state = joined_general_with(vec![]);
-    state.open_direct_punches();
+    open_punches(&mut state);
     press(&mut state, KeyCode::Char('a'));
     type_str(&mut state, "bob");
     press(&mut state, KeyCode::Tab);
     type_str(&mut state, "bobhost.example");
 
-    let edit = state.direct_punches.as_ref().unwrap().edit.as_ref().unwrap();
+    let edit = state.settings_popup.as_ref().unwrap().punches.edit.as_ref().unwrap();
     assert_eq!(edit.nickname, "bob");
     assert_eq!(edit.host, "bobhost.example");
 }
@@ -308,19 +335,19 @@ fn typing_fills_the_focused_text_field() {
 #[test]
 fn the_port_field_only_accepts_digits() {
     let mut state = joined_general_with(vec![]);
-    state.open_direct_punches();
+    open_punches(&mut state);
     press(&mut state, KeyCode::Char('a'));
     press(&mut state, KeyCode::Tab); // -> Host
     press(&mut state, KeyCode::Tab); // -> Port
     type_str(&mut state, "90a00");
-    assert_eq!(state.direct_punches.as_ref().unwrap().edit.as_ref().unwrap().port, "9000");
+    assert_eq!(state.settings_popup.as_ref().unwrap().punches.edit.as_ref().unwrap().port, "9000");
 }
 
 /// @requirement AC-291
 #[test]
 fn left_right_cycle_the_frequency_selector_and_wrap() {
     let mut state = joined_general_with(vec![]);
-    state.open_direct_punches();
+    open_punches(&mut state);
     press(&mut state, KeyCode::Char('a'));
     press(&mut state, KeyCode::Tab);
     press(&mut state, KeyCode::Tab);
@@ -328,24 +355,24 @@ fn left_right_cycle_the_frequency_selector_and_wrap() {
 
     press(&mut state, KeyCode::Left);
     assert_eq!(
-        state.direct_punches.as_ref().unwrap().edit.as_ref().unwrap().frequency_index,
+        state.settings_popup.as_ref().unwrap().punches.edit.as_ref().unwrap().frequency_index,
         12,
         "Left from the first frequency wraps to the last"
     );
     press(&mut state, KeyCode::Right);
-    assert_eq!(state.direct_punches.as_ref().unwrap().edit.as_ref().unwrap().frequency_index, 0);
+    assert_eq!(state.settings_popup.as_ref().unwrap().punches.edit.as_ref().unwrap().frequency_index, 0);
 }
 
 /// @requirement AC-291
 #[test]
 fn enter_on_a_non_save_field_does_nothing() {
     let mut state = joined_general_with(vec![]);
-    state.open_direct_punches();
+    open_punches(&mut state);
     press(&mut state, KeyCode::Char('a'));
     type_str(&mut state, "bob");
     let action = press(&mut state, KeyCode::Enter);
     assert_eq!(action, None);
-    assert!(state.direct_punches.as_ref().unwrap().edit.is_some(), "the form must still be open");
+    assert!(state.settings_popup.as_ref().unwrap().punches.edit.is_some(), "the form must still be open");
 }
 
 // ---------------------------------------------------------------------
@@ -356,7 +383,7 @@ fn enter_on_a_non_save_field_does_nothing() {
 #[test]
 fn saving_a_valid_new_target_appends_it_and_requests_a_save() {
     let mut state = joined_general_with(vec![]);
-    state.open_direct_punches();
+    open_punches(&mut state);
     press(&mut state, KeyCode::Char('a'));
     type_str(&mut state, "bob");
     press(&mut state, KeyCode::Tab);
@@ -375,15 +402,15 @@ fn saving_a_valid_new_target_appends_it_and_requests_a_save() {
         }
         other => panic!("expected SaveDirectPunchTargets, got {other:?}"),
     }
-    assert!(state.direct_punches.as_ref().unwrap().edit.is_none(), "the form closes on a successful save");
-    assert_eq!(state.direct_punches.as_ref().unwrap().rows.len(), 1);
+    assert!(state.settings_popup.as_ref().unwrap().punches.edit.is_none(), "the form closes on a successful save");
+    assert_eq!(state.settings_popup.as_ref().unwrap().punches.rows.len(), 1);
 }
 
 /// @requirement AC-291
 #[test]
 fn saving_edits_an_existing_target_in_place_rather_than_appending() {
     let mut state = joined_general_with(vec![]);
-    state.open_direct_punches();
+    open_punches(&mut state);
     state.set_direct_punch_rows(vec![
         target("bob", "oldhost", DEFAULT_DIRECT_PUNCH_PORT, 1),
         target("carol", "carolhost", DEFAULT_DIRECT_PUNCH_PORT, 5),
@@ -415,7 +442,7 @@ fn saving_edits_an_existing_target_in_place_rather_than_appending() {
 #[test]
 fn an_invalid_nickname_shows_an_inline_error_and_does_not_save() {
     let mut state = joined_general_with(vec![]);
-    state.open_direct_punches();
+    open_punches(&mut state);
     press(&mut state, KeyCode::Char('a'));
     // Left empty - not a storable nickname - then straight to Save.
     press(&mut state, KeyCode::Tab);
@@ -426,7 +453,7 @@ fn an_invalid_nickname_shows_an_inline_error_and_does_not_save() {
 
     let action = press(&mut state, KeyCode::Enter);
     assert_eq!(action, None);
-    let edit = state.direct_punches.as_ref().unwrap().edit.as_ref().unwrap();
+    let edit = state.settings_popup.as_ref().unwrap().punches.edit.as_ref().unwrap();
     assert!(edit.error.is_some(), "an empty nickname must be refused with an inline error");
 }
 
@@ -434,7 +461,7 @@ fn an_invalid_nickname_shows_an_inline_error_and_does_not_save() {
 #[test]
 fn d_deletes_the_selected_row_and_requests_a_save() {
     let mut state = joined_general_with(vec![]);
-    state.open_direct_punches();
+    open_punches(&mut state);
     state.set_direct_punch_rows(vec![
         target("bob", "h1", DEFAULT_DIRECT_PUNCH_PORT, 1),
         target("carol", "h2", DEFAULT_DIRECT_PUNCH_PORT, 5),
@@ -448,14 +475,14 @@ fn d_deletes_the_selected_row_and_requests_a_save() {
         }
         other => panic!("expected SaveDirectPunchTargets, got {other:?}"),
     }
-    assert_eq!(state.direct_punches.as_ref().unwrap().rows.len(), 1);
+    assert_eq!(state.settings_popup.as_ref().unwrap().punches.rows.len(), 1);
 }
 
 /// @requirement AC-291
 #[test]
 fn d_on_an_empty_list_does_nothing() {
     let mut state = joined_general_with(vec![]);
-    state.open_direct_punches();
+    open_punches(&mut state);
     let action = press(&mut state, KeyCode::Char('d'));
     assert_eq!(action, None);
 }

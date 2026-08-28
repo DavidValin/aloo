@@ -54,6 +54,75 @@ pub fn is_wayland_session(xdg_session_type: Option<&str>, wayland_display_set: b
         || wayland_display_set
 }
 
+/// Whether the global shortcut is allowed to do anything right now
+/// (`settings::Settings::global_ptt_enabled`).
+///
+/// Separate from whether a hotkey was *registered*, which happens once
+/// before the runtime starts (`main.rs`) and cannot be redone from a
+/// session: the OS-level grab has to live on a specific thread on every
+/// platform this supports (see the module doc), and on macOS that thread
+/// is the process's real main thread. So turning the setting off mid-
+/// session is honoured here instead, where every event passes: the combo
+/// stays grabbed until the next run, but it stops starting recordings the
+/// instant the switch flips - which is what "off" means to the person who
+/// flipped it.
+///
+/// Turning it back *on* works the same way, as long as this run had
+/// registered a hotkey at all. A run that started with the setting off
+/// registered none, and nothing short of a restart can conjure one - the
+/// settings popup says so rather than pretending otherwise.
+static ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Applies `global_ptt_enabled`. Called at session start and on every
+/// change made in the Ctrl+S settings popup.
+pub fn set_enabled(enabled: bool) {
+    ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether a `GlobalPttEvent` arriving right now should be acted on.
+pub fn enabled() -> bool {
+    ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A shortcut change asked for since the last time the thread that owns
+/// the `GlobalHotKeyManager` looked - see `set_shortcut`.
+static REBIND: std::sync::Mutex<Option<HotKey>> = std::sync::Mutex::new(None);
+
+/// Asks for the registered combo to become whatever `settings` now names
+/// (`global_ptt_shortcut`), without waiting for a restart.
+///
+/// The OS-level grab belongs to one specific thread on every platform
+/// this supports (see the module doc), so this cannot register anything
+/// itself - it leaves the request where that thread will find it, within
+/// `REBIND_POLL_INTERVAL`.
+///
+/// **Linux only, for now.** That is the one platform whose owner thread
+/// sits in a loop of this module's own (`spawn`); Windows' owner is
+/// blocked in `GetMessage` inside the crate's pump, and macOS's is the
+/// process's real main thread running a `CFRunLoop` in `main.rs`. On
+/// both, the shortcut *string* still takes effect at the next start -
+/// `global_ptt_enabled` is live everywhere regardless, since that is
+/// answered per event rather than by the registration.
+pub fn set_shortcut(settings: &crate::settings::Settings) {
+    if is_wayland() {
+        return;
+    }
+    let wanted = resolve_hotkey(&settings.global_ptt_shortcut);
+    if let Ok(mut slot) = REBIND.lock() {
+        *slot = Some(wanted);
+    }
+}
+
+/// How often the thread owning the manager checks for a `set_shortcut`
+/// request. Short enough to feel immediate, long enough that an idle
+/// client is not waking up for nothing.
+const REBIND_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Takes a pending request, if there is one.
+fn take_rebind() -> Option<HotKey> {
+    REBIND.lock().ok().and_then(|mut slot| slot.take())
+}
+
 /// Parses `configured` (as stored in `~/.aloo/settings`) into a `HotKey`,
 /// falling back to the compiled-in default and printing a one-line warning
 /// if it doesn't parse - a typo'd shortcut should never stop the app from
@@ -140,9 +209,36 @@ pub fn spawn(hotkey: HotKey) -> Option<UnboundedReceiver<GlobalPttEvent>> {
         // in the module doc for what each branch is actually waiting on.
         #[cfg(target_os = "windows")]
         windows_pump::pump_forever();
+        // Linux: a poll rather than a `park()`, so a shortcut changed in
+        // the Ctrl+S settings popup can be re-registered here - on the
+        // one thread allowed to - instead of waiting for the next run.
+        // The manager is still what is being kept alive; this just gives
+        // it something to do occasionally.
         #[cfg(not(target_os = "windows"))]
-        loop {
-            std::thread::park();
+        {
+            let mut registered = hotkey;
+            loop {
+                std::thread::sleep(REBIND_POLL_INTERVAL);
+                let Some(wanted) = take_rebind() else { continue };
+                if wanted == registered {
+                    continue;
+                }
+                if let Err(e) = manager.unregister(registered) {
+                    crate::log_warn!("could not release the old push-to-talk shortcut: {e}");
+                    continue;
+                }
+                match manager.register(wanted) {
+                    Ok(()) => registered = wanted,
+                    Err(e) => {
+                        crate::log_warn!(
+                            "could not register the new push-to-talk shortcut ({wanted}): {e}"
+                        );
+                        // Put the working one back rather than leaving
+                        // the feature silently dead until a restart.
+                        let _ = manager.register(registered);
+                    }
+                }
+            }
         }
     });
 

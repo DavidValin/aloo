@@ -405,22 +405,37 @@ async fn room_untouched(w: &mut AlooWorld) {
 /// jumping straight to End: exactly how far down this line sits shifts
 /// whenever `HELP_BODY` grows elsewhere, so a fixed "scroll all the way,
 /// then check" no longer reliably lands on a screenful containing it.
+///
+/// One line at a time rather than a page at a time, for the same reason
+/// taken one step further: a page jump can step *over* the screenful the
+/// line is on, which is exactly what happened once `HELP_BODY` grew past
+/// a certain length. Bounded by the scroll position no longer moving, so
+/// it still terminates at the bottom whatever the text does next.
 #[then("the help popup shows its longest line unclipped")]
 async fn help_unclipped(w: &mut AlooWorld) {
     let tail =
         "the only scheme there is: ML-DSA-87+RSA4096/ML-KEM-1024+RSA4096/AES-256-GCM, loaded from a file";
+    // Back to the top first: the step before this one scrolls looking for
+    // its own lines, and scrolling only ever goes down from wherever it
+    // left off - so without this the scan can start already past the line
+    // it is looking for.
+    press_key(w, KeyCode::Home, KeyModifiers::NONE);
     let mut rows = ui_rows_wide(w.ui_ref());
-    for _ in 0..40 {
-        if rows.iter().any(|r| r.contains(tail)) {
-            break;
-        }
+    let mut seen = rows.clone();
+    while !seen.iter().any(|r| r.contains(tail)) {
         let before = w.ui_ref().help_scroll();
-        press_key(w, KeyCode::PageDown, KeyModifiers::NONE);
+        press_key(w, KeyCode::Down, KeyModifiers::NONE);
         if w.ui_ref().help_scroll() == before {
             break;
         }
         rows = ui_rows_wide(w.ui_ref());
+        seen.extend(rows.iter().cloned());
     }
+    // Every row seen on the way down, not just the last screenful: which
+    // screenful this line lands on moves whenever `HELP_BODY` grows, and
+    // what is being proven is that it renders in full *somewhere*, not
+    // where it happens to sit today.
+    let rows = seen;
     assert!(
         rows.iter().any(|r| r.contains(tail)),
         "expected the longest help line in full: {rows:?}"

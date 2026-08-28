@@ -247,6 +247,16 @@ pub enum LinkStatus {
 /// from which link the datagram arrived on, never carried on the wire
 /// itself.
 pub enum P2pEvent {
+    /// Content addressed to `peer` that could not go out now, handed
+    /// over intact instead of being held here or dropped - emitted only
+    /// while `set_spill_undeliverable(true)` is in effect
+    /// (`queue_send_messages`). The session decides whether to keep it
+    /// (`client::outbox`) and re-sends it through this manager once the
+    /// link is `Active` again.
+    Undeliverable {
+        peer: UserId,
+        item: crate::client::outbox::OutboxItem,
+    },
     /// `channel: Some(name)` is a channel message, `None` a DM - mirrors
     /// `p2p_proto::P2pPayload::Envelope`.
     Message {
@@ -745,6 +755,28 @@ pub struct PeerLinkManager {
     /// The serverless direct-punch scheduler, present only once
     /// `configure_direct_punch` has been called (`direct_punch=on`).
     direct: Option<DirectPunch>,
+    /// Whether content that cannot go out right now is handed to the
+    /// session as `P2pEvent::Undeliverable` instead of being held in this
+    /// manager's own short, in-memory queue (`queue_send_messages`,
+    /// `client::outbox`).
+    ///
+    /// A plain flag, not the queue itself: this module does no I/O and
+    /// knows nothing about settings or nicknames. It only decides *that*
+    /// something could not be sent; what happens to it then belongs to
+    /// the session, which is also where a durable queue can be read back
+    /// on the next run.
+    spill_undeliverable: bool,
+    /// Peers with something already waiting in the durable queue
+    /// (`client::outbox`), kept in step by the session.
+    ///
+    /// While a peer is in here, content for them is handed over even
+    /// though their link is `Active`: it has to go on the *end* of what
+    /// is already queued for them, not past it. A message that overtook
+    /// the queue would arrive ahead of ones sealed before it, which for a
+    /// pad-wrapped run is not a reordering but a break - the receiver's
+    /// pad expects exactly the sequence it was given
+    /// (`docs/PROTOCOL.md` §16.4).
+    queue_held: HashSet<UserId>,
     events_tx: UnboundedSender<P2pEvent>,
 }
 
@@ -783,6 +815,8 @@ impl PeerLinkManager {
                 links: HashMap::new(),
                 addr_index: HashMap::new(),
                 direct: None,
+                spill_undeliverable: false,
+                queue_held: HashSet::new(),
                 events_tx,
             },
             socket,
@@ -1050,13 +1084,36 @@ impl PeerLinkManager {
     /// simply dropped, since there is nothing to flush it later.
     pub fn send_reliable_or_queue(&mut self, peer: UserId, payload: P2pPayload) {
         let socket = self.socket.clone();
-        let Some(link) = self.links.get_mut(&peer) else {
+        if !self.links.contains_key(&peer) {
             return;
-        };
-        if matches!(link.state, PeerLinkState::Active { .. }) {
+        }
+        let active = matches!(
+            self.links.get(&peer).map(|l| &l.state),
+            Some(PeerLinkState::Active { .. })
+        ) && !self.queue_held.contains(&peer);
+        if active {
+            let link = self.links.get_mut(&peer).expect("checked just above");
             Self::transmit_reliable(&socket, link, &payload);
             return;
         }
+        // Content the durable queue would keep does not wait here at all:
+        // that queue outlives this process and this manager's does not,
+        // and holding a copy in both places would deliver it twice.
+        //
+        // Only content it would keep, though. A receipt, a file chunk, an
+        // ack - anything `outbox::is_queueable` refuses - still waits
+        // here exactly as it always did, because "not worth keeping for
+        // an hour" is not the same as "not worth keeping for the minute
+        // this link is being punched".
+        let item = crate::client::outbox::OutboxItem::Reliable(payload);
+        if self.spill_undeliverable && crate::client::outbox::is_queueable(&item) {
+            let _ = self.events_tx.send(P2pEvent::Undeliverable { peer, item });
+            return;
+        }
+        let crate::client::outbox::OutboxItem::Reliable(payload) = item else {
+            unreachable!("built as Reliable just above")
+        };
+        let link = self.links.get_mut(&peer).expect("checked just above");
         // Queued rather than dropped even on a `Lost` link: it is being
         // retried, and `PENDING_MAX_AGE` - not the state right now - is
         // what decides this was undeliverable.
@@ -1067,13 +1124,21 @@ impl PeerLinkManager {
                 reason: "too much unsent content queued for this peer".to_string(),
             });
         }
+        let link = self.links.get_mut(&peer).expect("checked just above");
         link.pending.push_back((Instant::now(), payload));
     }
 
-    /// Sends `blocks` unreliably (no ack, no retransmit) - only ever called
-    /// once a caller has already confirmed `LinkReadiness::Active` via
-    /// `ensure_link` (voice is never queued, see `LinkReadiness`'s doc), so
-    /// a link that isn't `Active` here simply drops the chunk.
+    /// Sends `blocks` unreliably (no ack, no retransmit). Historically
+    /// only ever called once a caller had already confirmed
+    /// `LinkReadiness::Active` via `ensure_link` (voice was never queued,
+    /// see `LinkReadiness`'s doc), so a link that isn't `Active` simply
+    /// drops the chunk.
+    ///
+    /// With `set_spill_undeliverable` in effect that chunk is handed to
+    /// the session instead (`queue_send_messages`), which is what lets a
+    /// voice message be recorded for someone who is not there yet: the
+    /// chunk is already sealed for them by the time it reaches here, so
+    /// keeping it costs no plaintext and changes no encryption.
     pub fn send_unreliable_voice(
         &mut self,
         peer: UserId,
@@ -1081,6 +1146,23 @@ impl PeerLinkManager {
         seq: u32,
         blocks: Vec<Vec<u8>>,
     ) {
+        if self.spill_undeliverable
+            && (self.queue_held.contains(&peer)
+                || !matches!(
+                    self.links.get(&peer).map(|l| &l.state),
+                    Some(PeerLinkState::Active { .. })
+                ))
+        {
+            let _ = self.events_tx.send(P2pEvent::Undeliverable {
+                peer,
+                item: crate::client::outbox::OutboxItem::VoiceChunk {
+                    stream_id,
+                    seq,
+                    blocks,
+                },
+            });
+            return;
+        }
         let Some(link) = self.links.get_mut(&peer) else {
             return;
         };
@@ -1812,6 +1894,28 @@ impl PeerLinkManager {
                     .events_tx
                     .send(P2pEvent::LinkStatusChanged { peer, status });
             }
+        }
+    }
+
+    /// Turns the durable-queue hand-off on or off for the rest of the
+    /// session (`settings::Settings::queue_send_messages`, applied live
+    /// by the Ctrl+S settings popup). Off is the historical behaviour:
+    /// content waits in this manager's own bounded in-memory queue and is
+    /// reported lost once it ages out.
+    pub fn set_spill_undeliverable(&mut self, spill: bool) {
+        self.spill_undeliverable = spill;
+    }
+
+    /// Records whether `peer` has anything waiting in the durable queue,
+    /// so a later send joins the back of it rather than overtaking it -
+    /// see `queue_held`. Set by the session as it queues, and cleared as
+    /// it drains (before the drain itself sends, so the drained content
+    /// goes on the wire rather than straight back into the queue).
+    pub fn set_queue_held(&mut self, peer: UserId, held: bool) {
+        if held {
+            self.queue_held.insert(peer);
+        } else {
+            self.queue_held.remove(&peer);
         }
     }
 

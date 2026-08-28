@@ -32,6 +32,7 @@ pub mod pq_hybrid;
 pub mod presence;
 pub mod reconnect;
 pub mod server;
+pub mod settings;
 pub mod status;
 pub mod ui_common;
 pub mod voice;

@@ -28,7 +28,7 @@ use ui_action::handle_ui_action;
 pub use identity::{
     accept_identity_review, direct_peer_identity, register_pad_only_peer, seed_direct_peer_keys,
 };
-pub use link_events::reconcile_direct_membership;
+pub use link_events::{drain_p2p_events, reconcile_direct_membership, sweep_outbox};
 pub(crate) use link_events::broadcast_channel_presence;
 
 use std::collections::HashMap;
@@ -155,6 +155,38 @@ pub struct SessionState {
     /// `voice_call::spawn_call_audio_worker`) - the setting file is not
     /// re-read per recording.
     pub(crate) echo_ducking: crate::settings::EchoDucking,
+    /// `settings::Settings::roger_beep`, mirrored here so
+    /// `voice_stream::play_end_chime` can answer "should this sound at
+    /// all" without a filesystem read per chime. Unlike `echo_ducking`
+    /// this one is *not* fixed for the session: the Ctrl+S settings popup
+    /// writes it through live (`ui_action`'s `SaveSettings` arm), so a
+    /// user who turns it off hears the difference on the next voice
+    /// message rather than the next run.
+    pub(crate) roger_beep: bool,
+    /// `settings::Settings::sound_notifications`, mirrored and kept live
+    /// the same way `roger_beep` is - the switch every *event* sound
+    /// (`play_bell_chime`, `play_joined_chime`, `play_ping_chime`) asks
+    /// before playing.
+    pub(crate) sound_notifications: bool,
+    /// The durable send queue (`settings::Settings::queue_send_messages`,
+    /// `client::outbox`), or `None` while that setting is off.
+    ///
+    /// Loaded once at session start - anything a previous run left behind
+    /// is still there, which is the point - and turned on or off live by
+    /// the Ctrl+S settings popup, which also flips the transport's own
+    /// `set_spill_undeliverable` so the two can never disagree about
+    /// whether content waits here or in the link's short in-memory queue.
+    pub(crate) outbox: Option<crate::client::outbox::Outbox>,
+    /// The `P2pEvent` receiver, held only by a `for_test` session so a
+    /// test can play the session loop's part and hand each event back
+    /// (`drain_p2p_events`). `None` in a real session, where the loop
+    /// itself owns it.
+    pub(crate) test_p2p_events:
+        Option<tokio::sync::mpsc::UnboundedReceiver<crate::client::p2p::P2pEvent>>,
+    /// The matching sender, so `sent_or_queued_payloads` can put back
+    /// what it read - see its doc.
+    pub(crate) test_p2p_events_tx:
+        Option<tokio::sync::mpsc::UnboundedSender<crate::client::p2p::P2pEvent>>,
     pub(crate) own_stream_targets: HashMap<u64, voice_stream::OwnStreamTarget>,
     pub(crate) active_streams: HashMap<(UserId, u64), voice_stream::ActiveStream>,
     /// Voice chunks that outran their own `StreamStart` - see
@@ -660,6 +692,13 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
         next_stream_id: 1,
         next_mixer_id: 1,
         echo_ducking: settings.voice_echo_ducking,
+        roger_beep: settings.roger_beep,
+        sound_notifications: settings.sound_notifications,
+        outbox: settings
+            .queue_send_messages
+            .then(|| crate::client::outbox::Outbox::load(&crate::client::outbox::default_dir())),
+        test_p2p_events: None,
+        test_p2p_events_tx: None,
         own_stream_targets: HashMap::new(),
         active_streams: HashMap::new(),
         pending_stream_chunks: voice_stream::PendingChunkBuffer::new(),
@@ -733,6 +772,29 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
         noip_config,
         noip_task: None,
     };
+    // The transport hands content it cannot send to the session
+    // (`P2pEvent::Undeliverable`) only while there is somewhere durable
+    // to put it, so the two are switched on together - here at start, and
+    // again on every change made in the Ctrl+S popup.
+    session
+        .peer_link
+        .set_spill_undeliverable(session.outbox.is_some());
+    // Anything queued for a contact this machine no longer holds keys for
+    // can never be delivered or read back, so it goes - once here at
+    // start, and every `SWEEP_INTERVAL` for as long as the session runs.
+    let swept = link_events::sweep_outbox(&mut session);
+    if swept > 0 {
+        crate::log_warn!(
+            "dropped {swept} queued message(s) for contacts this machine no longer holds keys for"
+        );
+    }
+    if let Some(waiting) = session.outbox.as_ref().map(|o| o.total())
+        && waiting > 0
+    {
+        crate::log_warn!(
+            "{waiting} message(s) queued from an earlier run will be delivered as their recipients become reachable"
+        );
+    }
     session.sync_noip_job();
 
     // Anything still in `~/.aloo/otp/.tmp/` is key material some earlier
@@ -806,6 +868,9 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
     ui_state.server_label = server_label;
     ui_state.autosave_messages = settings.autosave_messages;
     ui_state.resume_from_log = settings.resume_from_log;
+    ui_state.voice_autoplay = settings.voice_autoplay;
+    ui_state.queue_send_messages = settings.queue_send_messages;
+    crate::client::global_ptt::set_enabled(settings.global_ptt_enabled);
     // Fixed for the whole session: a `--no-server` start has no supervisor
     // and nothing it could ever reconnect to, so this is the one header
     // state that is never driven by an event.
@@ -842,6 +907,9 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
     // released Space key within one `RECORD_HOLD_TIMEOUT` window without
     // adding much latency; also drives the idle-stream sweep below.
     let mut ticker = tokio::time::interval(Duration::from_millis(150));
+    // The durable queue's key sweep has already run once by now (just
+    // below the settings load), so the next one is a full interval away.
+    let mut last_outbox_sweep = Instant::now();
     let mut tick_count: u32 = 0;
     // Keeps the server able to tell this session is still alive
     // (docs/PROTOCOL.md §4.1) even across a long stretch where the user
@@ -1133,6 +1201,14 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
                     hotkey_rx = None;
                     continue;
                 };
+                // `global_ptt_enabled` is asked here, per event, rather
+                // than only at registration: the OS-level grab cannot be
+                // undone from this thread (see `global_ptt::set_enabled`),
+                // so this is where turning the switch off in the Ctrl+S
+                // popup actually stops the shortcut doing anything.
+                if !crate::client::global_ptt::enabled() {
+                    continue;
+                }
                 match hotkey_ev {
                     crate::client::global_ptt::GlobalPttEvent::Pressed => {
                         if let Some(action @ UiAction::VoiceRecordStart(_)) = ui_state.global_record_start() {
@@ -1192,6 +1268,16 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
                 if now.duration_since(last_cpu_sample) >= Duration::from_millis(300) {
                     ui_state.set_cpu_usage(cpu_monitor.refresh());
                     last_cpu_sample = now;
+                }
+                // The one thing that ever removes a queued message:
+                // the contact it was sealed for is no longer on this
+                // machine (`outbox::retain_contacts`). Driven off elapsed
+                // wall time for the same reason the two samples above
+                // are, and cheap when there is nothing queued - which is
+                // almost always.
+                if now.duration_since(last_outbox_sweep) >= crate::client::outbox::SWEEP_INTERVAL {
+                    link_events::sweep_outbox(&mut session);
+                    last_outbox_sweep = now;
                 }
                 // Conn:<quality> refreshes once a second, same reasoning.
                 if now.duration_since(last_conn_sample) >= Duration::from_secs(1) {
@@ -1636,6 +1722,138 @@ impl SessionState {
         }
     }
 
+    /// Rebuilds the No-IP updater's configuration from `settings` and
+    /// starts or stops it to match, without waiting for a restart - what
+    /// makes the Ctrl+S popup's `noip_*` fields take effect when they are
+    /// changed rather than on the next run.
+    ///
+    /// The same three-way check `run_connected_session` makes at start:
+    /// the switch on, direct punch actually naming someone, and all three
+    /// credentials filled in. Anything missing means no updater, and an
+    /// already-running one is stopped.
+    pub fn resync_noip(&mut self, settings: &crate::settings::Settings) {
+        let wanted = settings.noip_when_no_server_and_direct_punch_is_active
+            && settings.direct_punch
+            && !settings.direct_punch_to.is_empty();
+        let config = wanted
+            .then(|| crate::client::noip::NoipConfig::from_settings(settings))
+            .flatten();
+        if config == self.noip_config {
+            return;
+        }
+        // Whatever is running now was built from the old configuration,
+        // so it goes regardless of whether a new one replaces it.
+        if let Some(handle) = self.noip_task.take() {
+            handle.abort();
+        }
+        self.noip_config = config;
+        self.sync_noip_job();
+    }
+
+    /// Re-resolves which `otp` binary to run
+    /// (`settings::Settings::otp_binary_path`), so a path corrected in the
+    /// Ctrl+S popup is used by the very next OTP command rather than the
+    /// next run. Reads the settings file itself, the same way
+    /// `OtpCliConfig::resolve` does at start - by this point the popup's
+    /// change is already written to it.
+    pub(crate) fn resync_otp_binary(&mut self) {
+        self.otp_cli_cfg = crate::client::otp_cli::OtpCliConfig::resolve();
+    }
+
+    /// Applies the two sound switches (`settings::Settings::roger_beep`,
+    /// `sound_notifications`) - the pair every chime asks before playing.
+    /// Called at session start and again on every change made in the
+    /// Ctrl+S settings popup, which is what makes those two live rather
+    /// than next-run.
+    pub fn set_sound_switches(&mut self, roger_beep: bool, sound_notifications: bool) {
+        self.roger_beep = roger_beep;
+        self.sound_notifications = sound_notifications;
+    }
+
+    /// Everything this side decided to send `peer` and has not managed
+    /// to yet - the transport's own queue plus anything the durable queue
+    /// took off it (`P2pEvent::Undeliverable`, not yet drained).
+    ///
+    /// Exposed for tests the same way `peer_link_mut` is. It exists
+    /// because *where* an unsent payload waits is a policy that
+    /// `queue_send_messages` moves, and no test asserting "this side sent
+    /// that" should have to care which side of that switch it is on.
+    pub fn sent_or_queued_payloads(&mut self, peer: UserId) -> Vec<crate::p2p_proto::P2pPayload> {
+        let mut out = Vec::new();
+        if let Some(rx) = self.test_p2p_events.as_mut() {
+            let mut replay = Vec::new();
+            while let Ok(event) = rx.try_recv() {
+                if let crate::client::p2p::P2pEvent::Undeliverable {
+                    peer: to,
+                    item: crate::client::outbox::OutboxItem::Reliable(payload),
+                } = &event
+                    && *to == peer
+                {
+                    out.push(payload.clone());
+                }
+                replay.push(event);
+            }
+            // Read, not consumed: a later `drain_p2p_events` in the same
+            // test must still see everything this one looked at.
+            if let Some(tx) = self.test_p2p_events_tx.as_ref() {
+                for event in replay {
+                    let _ = tx.send(event);
+                }
+            }
+        }
+        out.extend(self.peer_link.pending_payloads(peer));
+        out
+    }
+
+    /// Pins `nickname`'s device as a bare contact - exposed for tests the
+    /// same way `peer_link_mut` is, so one can put a contact into the
+    /// `id_store` that `sweep_outbox` reads without going through a live
+    /// identity exchange to do it.
+    pub fn pin_bare_contact_for_test(&mut self, nickname: &str, device_id: &str) {
+        self.id_store.pin_bare_contact(nickname, device_id);
+    }
+
+    /// Whether the No-IP updater is configured right now - exposed for
+    /// tests the same way `queued_for` is, so `resync_noip`'s decision is
+    /// observable without a network.
+    pub fn noip_is_configured(&self) -> bool {
+        self.noip_config.is_some()
+    }
+
+    /// How many messages are waiting on disk for `nickname`
+    /// (`client::outbox`) - exposed the same way `peer_link_mut` is, so a
+    /// test can see what a send path decided without a second peer to
+    /// receive it. Zero while `queue_send_messages` is off.
+    pub fn queued_for(&self, nickname: &str) -> usize {
+        self.outbox.as_ref().map(|o| o.len_for(nickname)).unwrap_or(0)
+    }
+
+    /// Turns the durable send queue on or off, the way the Ctrl+S popup
+    /// does - the session-level half of `queue_send_messages`, with the
+    /// transport's own hand-off kept in step so the two can never
+    /// disagree about where content waits.
+    pub fn set_queue_send_messages(&mut self, enabled: bool) {
+        if enabled && self.outbox.is_none() {
+            self.outbox = Some(crate::client::outbox::Outbox::load(
+                &crate::client::outbox::default_dir(),
+            ));
+        } else if !enabled {
+            self.outbox = None;
+        }
+        self.peer_link
+            .set_spill_undeliverable(self.outbox.is_some());
+    }
+
+    /// How many sources this session has pushed onto its mixer - exposed
+    /// for tests the same way `peer_link_mut` is, and for the same
+    /// reason: `for_test` drops the mixer's receiver, so a sound that was
+    /// played leaves no other trace. Every chime and every replay takes
+    /// one id from this counter (`voice_stream::play_chime`), so a rise
+    /// here is exactly "something was played".
+    pub fn mixer_sources_started(&self) -> u64 {
+        self.next_mixer_id - 1
+    }
+
     /// The session's direct transport (`crate::client::p2p`) - exposed for
     /// tests, which need it to open a link a receive path can then answer
     /// over, and to read back what that path decided to send
@@ -1913,7 +2131,12 @@ impl SessionState {
         let (rotate_out_tx, _) = tokio::sync::mpsc::unbounded_channel();
         let (direct_resolved_tx, _) = tokio::sync::mpsc::unbounded_channel();
         let (auto_stop_tx, _) = tokio::sync::mpsc::unbounded_channel();
-        let (p2p_events_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        // Kept, not dropped like the worker channels above: this is the
+        // one channel a test needs to read back, since it carries the
+        // decisions a send path made (`P2pEvent::Undeliverable`) rather
+        // than audio nobody is listening to. See `drain_p2p_events`.
+        let (p2p_events_tx, p2p_events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let p2p_events_tx_for_test = p2p_events_tx.clone();
         let (peer_link, _socket) = PeerLinkManager::bind(
             "127.0.0.1:0".parse().expect("loopback"),
             None,
@@ -1932,11 +2155,19 @@ impl SessionState {
         let own_pq_keys =
             crate::client::pq_rekey::PqOwnKeys::new(own_pq_private.bootstrap_decap().clone());
 
-        Self {
+        let mut session = Self {
             active_recording: None,
             next_stream_id: 1,
             next_mixer_id: 1,
             echo_ducking: crate::settings::EchoDucking::default(),
+            roger_beep: true,
+            sound_notifications: true,
+            // A scratch directory per test session, so a test never
+            // reads or writes the real `~/.aloo/outbox` - same rule every
+            // other store `for_test` points somewhere harmless follows.
+            outbox: Some(crate::client::outbox::Outbox::load(&spec.scratch.join("outbox"))),
+            test_p2p_events: Some(p2p_events_rx),
+            test_p2p_events_tx: Some(p2p_events_tx_for_test),
             own_stream_targets: HashMap::new(),
             active_streams: HashMap::new(),
             pending_stream_chunks: voice_stream::PendingChunkBuffer::new(),
@@ -2000,7 +2231,14 @@ impl SessionState {
             daemon_awaiting_otp: None,
             noip_config: None,
             noip_task: None,
-        }
+        };
+        // `for_test` starts with the durable queue on, so a test sees
+        // what a default settings file gives. Set directly rather than
+        // through `set_queue_send_messages`, whose "turn it on" branch
+        // loads the *real* `~/.aloo/outbox` - the scratch one above is
+        // the whole point of this constructor.
+        session.peer_link.set_spill_undeliverable(true);
+        session
     }
 }
 

@@ -356,6 +356,17 @@ fn end_chime_samples_decodes_the_bundled_asset_and_is_non_empty() {
     assert_eq!(end_chime_samples(), samples);
 }
 
+/// `assets/ping.wav` is the fourth bundled sound, converted once from the
+/// original `ping.mp3` to a metadata-free 16 kHz mono WAV so it decodes
+/// through the same path as the other three, with no MP3 crate.
+/// @requirement AC-403
+#[test]
+fn ping_chime_samples_decodes_the_bundled_asset_and_is_non_empty() {
+    let samples = aloo::client::voice::ping_chime_samples();
+    assert!(!samples.is_empty(), "assets/ping.wav should decode to a non-empty chime");
+    assert_eq!(aloo::client::voice::ping_chime_samples(), samples, "cached after the first decode");
+}
+
 /// The call modal's voice meter (`docs/SPEC.md` "Live voice calls") reads
 /// RMS, not peak: silence is 0, a loud constant tone saturates, and one
 /// stray spike in an otherwise quiet chunk barely moves it.

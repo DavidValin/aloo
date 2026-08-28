@@ -333,8 +333,8 @@ async fn an_unconfirmed_pad_commit_is_resent_on_reconnect_until_acked() {
         .await
         .expect("the retry pass should not fail");
     let commits = session
-        .peer_link_mut()
-        .pending_payloads(PEER)
+        
+        .sent_or_queued_payloads(PEER)
         .into_iter()
         .filter(|p| {
             matches!(p, aloo::p2p_proto::P2pPayload::OtpPadCommit { contact_name: c }
@@ -349,8 +349,8 @@ async fn an_unconfirmed_pad_commit_is_resent_on_reconnect_until_acked() {
         .await
         .expect("the retry pass should not fail");
     let commits_after = session
-        .peer_link_mut()
-        .pending_payloads(PEER)
+        
+        .sent_or_queued_payloads(PEER)
         .into_iter()
         .filter(|p| matches!(p, aloo::p2p_proto::P2pPayload::OtpPadCommit { .. }))
         .count();

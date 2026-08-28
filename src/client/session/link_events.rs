@@ -202,6 +202,9 @@ pub(super) async fn handle_p2p_event(
             .unwrap_or_default()
     };
     match event {
+        P2pEvent::Undeliverable { peer, item } => {
+            queue_undeliverable(session, ui_state, peer, item);
+        }
         P2pEvent::Message {
             channel: Some(channel),
             from,
@@ -526,6 +529,14 @@ pub(super) async fn handle_p2p_event(
                         handle_ui_action(action, wr, ui_state, session).await?;
                     }
                     maybe_resolve_p2p_identity_data(session, ui_state, peer).await;
+                    // Anything this peer missed while they were away
+                    // (`queue_send_messages`) goes out now, in the order
+                    // it was written - which is what a pad-wrapped
+                    // message's sequence depends on. Last of the resend
+                    // passes above deliberately: those recover *their*
+                    // own half-finished exchanges, and a queued message
+                    // is ordinary content that should follow them.
+                    flush_outbox(session, ui_state, peer);
                 }
                 p2p::LinkStatus::Lost => {
                     // Bounded by `PUNCH_TIMEOUT`/`SIGNAL_TIMEOUT` (`p2p.rs`'s
@@ -1053,4 +1064,211 @@ pub(super) async fn flush_queued_outbound(
         request_rotation(session, peer);
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------
+// The durable send queue (`queue_send_messages`, `client::outbox`)
+// ---------------------------------------------------------------------
+
+/// Plays the session loop's part for a `for_test` session: hands every
+/// `P2pEvent` the transport has produced so far to `handle_p2p_event`,
+/// exactly as `run_connected_session` would.
+///
+/// Exposed for tests the same way `SessionState::peer_link_mut` is, and
+/// for the same reason: what a send path decided is only observable once
+/// something consumes the events it raised.
+pub async fn drain_p2p_events(
+    wr: &mut impl crate::control::ControlSink,
+    ui_state: &mut UiState,
+    session: &mut SessionState,
+) -> proto::Result<()> {
+    let mut events = Vec::new();
+    if let Some(rx) = session.test_p2p_events.as_mut() {
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+    }
+    for event in events {
+        handle_p2p_event(event, ui_state, wr, session).await?;
+    }
+    Ok(())
+}
+
+/// Keeps one thing the transport could not send, if it is a kind worth
+/// keeping (`outbox::is_queueable` - text and voice, never a file).
+///
+/// Keyed by the peer's *nickname*, which is what survives the reconnect
+/// this queue is for; a peer we hold no name for cannot be queued against
+/// and their content is let go exactly as it was before.
+///
+/// Deliberately silent. Every first message to anyone passes through
+/// here - a link takes a second or two to punch, and everything queues
+/// while it does - so saying so would put a notice on screen for the
+/// most ordinary thing the app does. The message row already reads
+/// undelivered until it lands, which is the honest signal;
+/// `flush_outbox` is where something worth reporting gets reported.
+fn queue_undeliverable(
+    session: &mut SessionState,
+    ui_state: &mut UiState,
+    peer: UserId,
+    item: crate::client::outbox::OutboxItem,
+) {
+    let Some(outbox) = session.outbox.as_mut() else {
+        return;
+    };
+    if !crate::client::outbox::is_queueable(&item) {
+        return;
+    }
+    let Some(nickname) = ui_state.known_users.get(&peer).map(|u| u.name.clone()) else {
+        return;
+    };
+    let msg_id = message_row_of(&item);
+    if let Err(e) = outbox.queue(&nickname, item) {
+        crate::log_warn!("could not queue a message for {nickname} ({e})");
+        return;
+    }
+    // From here until this peer's queue is drained, everything for them
+    // joins the back of it - including once their link is up again. See
+    // `PeerLinkManager::queue_held`.
+    session.peer_link.set_queue_held(peer, true);
+    // The row this leg belongs to now reads QUEUED rather than
+    // UNDELIVERED under `i` - held for them, not merely unacknowledged.
+    if let Some(msg_id) = msg_id {
+        ui_state.mark_queued(peer, msg_id, true);
+    }
+}
+
+/// Which logged row an outgoing item belongs to, if it names one.
+///
+/// A voice message's chunks and its `StreamEnd` do not - only the
+/// `StreamStart` that opened the stream carries the `msg_id`, and it is
+/// queued first, so the row is already marked by the time they follow.
+fn message_row_of(item: &crate::client::outbox::OutboxItem) -> Option<u64> {
+    match item {
+        crate::client::outbox::OutboxItem::Reliable(payload) => match payload {
+            crate::p2p_proto::P2pPayload::Envelope { msg_id, .. }
+            | crate::p2p_proto::P2pPayload::OtpEnvelope { msg_id, .. }
+            | crate::p2p_proto::P2pPayload::OtpVoiceOffer { msg_id, .. }
+            | crate::p2p_proto::P2pPayload::StreamStart { msg_id, .. } => *msg_id,
+            _ => None,
+        },
+        crate::client::outbox::OutboxItem::VoiceChunk { .. } => None,
+    }
+}
+
+/// Sends everything queued for `peer`, oldest first, now that their link
+/// is `Active`.
+///
+/// Order is the whole contract: a pad-wrapped message spends its sequence
+/// position when it is queued, so the receiver's pad expects exactly this
+/// order back. Each entry goes through the ordinary send path, which at
+/// this point transmits rather than re-queues - and if the link drops
+/// again mid-drain, what is left re-enters the queue through the same
+/// `Undeliverable` path that put it there.
+fn flush_outbox(session: &mut SessionState, ui_state: &mut UiState, peer: UserId) {
+    let Some(nickname) = ui_state.known_users.get(&peer).map(|u| u.name.clone()) else {
+        return;
+    };
+    let entries = match session.outbox.as_mut() {
+        Some(outbox) if outbox.len_for(&nickname) > 0 => outbox.take(&nickname),
+        _ => return,
+    };
+    // Cleared *before* anything is sent: the drain itself must reach the
+    // wire, not fall straight back into the queue it just came out of.
+    session.peer_link.set_queue_held(peer, false);
+    if entries.is_empty() {
+        return;
+    }
+    let count = entries.len();
+    // Every row this queue was holding a leg of is genuinely back on the
+    // wire, so none of them still reads QUEUED.
+    for entry in &entries {
+        if let Some(msg_id) = message_row_of(&entry.item) {
+            ui_state.mark_queued(peer, msg_id, false);
+        }
+    }
+    // Only a wait long enough that the old, transport-only behaviour
+    // would have given up on it is worth telling the user about: below
+    // that this is just a link finishing its punch, which is what happens
+    // before every first message to anyone and is not news.
+    let held_for = entries
+        .first()
+        .map(|e| now_secs().saturating_sub(e.queued_at))
+        .unwrap_or(0);
+    let worth_reporting = held_for >= crate::client::p2p::PENDING_MAX_AGE.as_secs();
+    for entry in entries {
+        match entry.item {
+            crate::client::outbox::OutboxItem::Reliable(payload) => {
+                session.peer_link.send_reliable_or_queue(peer, payload);
+            }
+            crate::client::outbox::OutboxItem::VoiceChunk {
+                stream_id,
+                seq,
+                blocks,
+            } => {
+                session
+                    .peer_link
+                    .send_unreliable_voice(peer, stream_id, seq, blocks);
+            }
+        }
+    }
+    if worth_reporting {
+        ui_state.push_status_notice(
+            format!(
+                "delivered {count} message{} that had been waiting for {nickname}",
+                if count == 1 { "" } else { "s" }
+            ),
+            true,
+        );
+    }
+}
+
+/// Wall-clock seconds, matching what `outbox` stamps an entry with.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Drops everything queued for a contact this machine no longer holds key
+/// material for, and reports how many entries went.
+///
+/// This is the only thing that ever removes a queued message. An entry is
+/// ciphertext sealed for one specific contact; while that contact is
+/// still pinned here it can still be delivered, and how long it has
+/// waited says nothing about whether it should be. Once they are gone -
+/// deleted from `/contacts`, which takes every device's identity pin and
+/// each one's OTP keychain entries with it (`contacts::handle_delete`) -
+/// nothing queued for them can be delivered, and nothing here could read
+/// it back either.
+///
+/// The pin is the test for both layerings: a `pq_hybrid` message was
+/// sealed against that pin, and a pad-only peer is pinned too
+/// (`IdStore::pin_bare_contact`) precisely so they are nameable. Any
+/// device still pinned under the nickname keeps that whole queue.
+///
+/// Run at session start and every `outbox::SWEEP_INTERVAL` after it.
+pub fn sweep_outbox(session: &mut SessionState) -> usize {
+    let Some(peers) = session.outbox.as_ref().map(|o| o.peers()) else {
+        return 0;
+    };
+    if peers.is_empty() {
+        return 0;
+    }
+    // Decided up front rather than inside `retain_contacts`, so the
+    // closure it takes borrows nothing of the session the outbox is part
+    // of.
+    let gone: std::collections::HashSet<String> = peers
+        .into_iter()
+        .filter(|nickname| session.id_store.devices_of(nickname).next().is_none())
+        .collect();
+    if gone.is_empty() {
+        return 0;
+    }
+    session
+        .outbox
+        .as_mut()
+        .map(|outbox| outbox.retain_contacts(|nickname| !gone.contains(nickname)))
+        .unwrap_or(0)
 }

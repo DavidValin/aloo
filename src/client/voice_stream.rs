@@ -819,21 +819,51 @@ fn play_chime(session: &mut SessionState, samples: Vec<i16>) {
 /// The "message ended" chime - on the sender's release of Space and on an
 /// incoming stream's completion, so both ends of a voice message get the
 /// same audible cue.
+///
+/// Silent while `roger_beep=off` (`settings::Settings::roger_beep`). That
+/// switch, not `sound_notifications`, is the one that owns this sound:
+/// it punctuates speech rather than announcing an event.
 pub(crate) fn play_end_chime(session: &mut SessionState) {
+    if !session.roger_beep {
+        return;
+    }
     play_chime(session, voice::end_chime_samples());
 }
 
 /// The incoming-file-offer notification sound - played whenever a new
 /// file-offer popup becomes the one shown (`docs/PROTOCOL.md`'s file
 /// transfer section).
+///
+/// Silent while `sound_notifications=off`, like every other event sound.
 pub(crate) fn play_bell_chime(session: &mut SessionState) {
+    if !session.sound_notifications {
+        return;
+    }
     play_chime(session, voice::bell_chime_samples());
 }
 
 /// The daemon's "someone you are focused on is here" sound (`docs/SPEC.md`
 /// "Daemon mode"). Only ever called with a daemon plan in effect.
+///
+/// Silent while `sound_notifications=off`, like every other event sound.
 pub(crate) fn play_joined_chime(session: &mut SessionState) {
+    if !session.sound_notifications {
+        return;
+    }
     play_chime(session, voice::joined_chime_samples());
+}
+
+/// The "someone wrote `@<your nickname>`" sound (`docs/SPEC.md`
+/// Functionality #33) - played once per arriving channel/DM text message
+/// that mentions this client's own nickname
+/// (`UiState::message_mentions_me`).
+///
+/// Silent while `sound_notifications=off`, like every other event sound.
+pub(crate) fn play_ping_chime(session: &mut SessionState) {
+    if !session.sound_notifications {
+        return;
+    }
+    play_chime(session, voice::ping_chime_samples());
 }
 
 /// Resolves one recipient's outgoing key material for a point-to-point

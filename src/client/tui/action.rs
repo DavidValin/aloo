@@ -303,10 +303,19 @@ pub enum UiAction {
     /// (`client::contacts::gather_contact_rows`), and hands the rows to
     /// the modal `open_contacts` already opened empty.
     OpenContacts,
-    /// Ctrl+S - reads `direct_punch_to` fresh from `~/.aloo/settings` and
-    /// hands the rows to the modal `open_direct_punches` already opened
-    /// empty, same split as `OpenContacts`.
-    OpenDirectPunches,
+    /// Ctrl+S - reads `~/.aloo/settings` fresh and hands both the
+    /// editable values and the `direct_punch_to` rows to the modal
+    /// `open_settings` already opened empty, same split as
+    /// `OpenContacts`.
+    OpenSettings,
+    /// Any change on the settings popup's General/Direct Punch/OTP tabs
+    /// (a toggle flipped, a character typed) - persists that draft over
+    /// `~/.aloo/settings` through the same merging `Settings::update`
+    /// write `SaveDirectPunchTargets` uses, and applies live the values
+    /// that can be (the sound switches, `voice_autoplay`, the log
+    /// switches, the direct-punch master switch). There is no Save
+    /// button: the change is the save.
+    SaveSettings(crate::client::tui::settings_popup::SettingsDraft),
     /// `Ctrl+E`'s popup was confirmed with at least one channel/DM
     /// checked - dumps each one's current in-memory log to
     /// `~/.aloo/exports/<server>/...` (`client::export::export_log`),

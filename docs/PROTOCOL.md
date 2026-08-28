@@ -1449,6 +1449,21 @@ been queued undeliverably for `PENDING_MAX_AGE` (60 seconds) it is
 dropped and reported, naming why. There is deliberately no
 relay-of-last-resort through the server - see the top of this document.
 
+That minute is the transport's whole memory: it is bounded, and it dies
+with the process. A client may additionally keep a *durable* queue on
+disk for the content worth it - text and voice, never a file or anything
+that only states something about right now (`queue_send_messages`,
+`docs/SPEC.md` Functionality #34). That is entirely a local matter: what
+it stores is the already-sealed payload, byte for byte, appended in the
+order it was sealed and never overtaken by a later one, so a message
+delivered from it is indistinguishable on the wire from one sent the
+moment it was written, and a peer implementation needs to know nothing
+about it. Two of this protocol's own properties are what make it sound:
+delivery is ordered per link (§7.1.1), so a pad-wrapped run arrives in
+the sequence its pad expects (§16.4); and an envelope is sealed against
+the recipient's key as it was at that moment (§12.4), so one held across
+a rotation fails to open exactly as any other stale envelope would.
+
 **5. Keeping our own address true.** The server-reflexive candidate is
 re-learned every `REFLEXIVE_REFRESH_INTERVAL` (15 seconds) for the whole
 session, not once at startup. This does two jobs: it keeps the NAT
@@ -1859,6 +1874,12 @@ All four are off/empty by default, and all three of the latter must be
 filled in for anything to run - a toggle left on with one missing, or with
 `direct_punch` naming no target, is reported once at session start and the
 updater never starts (`client::noip::NoipConfig::from_settings`).
+
+All four, like the `direct_punch` keys above them, are editable from inside
+the client as well as by hand - `Ctrl+S`'s Direct Punch tab (`docs/SPEC.md`
+Functionality #23). Unlike the punch schedule, which is reconfigured on the
+spot, these take effect on the next start: the updater is resolved once,
+from one settings snapshot, when the session begins.
 
 The updater tracks whether there is a server to hear from, not merely
 whether its own setting is on: it runs only while `--no-server` or the

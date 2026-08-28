@@ -25,9 +25,9 @@ use crate::validation;
 use super::ui::{
     DM_ICON, FileTransferStatus, JoinPopupFocus, LogEntry, MessageBody,
     MessageDelivery, Mode, OTP_TAG, OTP_TAG_COLOR, SelectorFocus, UNREAD_ENVELOPE, UiAction,
-    UiState, Unread, channel_label, display_width, finalize_held_stream, finalize_stream_entry,
-    focus_border_style, local_time_short, render_input_bar,
-    render_messages, unread_envelope,
+    UiState, Unread, VOICE_MUTED_MARKER, channel_label, display_width, finalize_held_stream,
+    finalize_stream_entry,
+    focus_border_style, local_time_short, render_input_bar, render_messages, unread_envelope,
 };
 
 #[derive(Debug, Clone)]
@@ -1281,6 +1281,20 @@ pub(crate) fn server_link_color(state: ServerLinkState) -> Color {
 /// punching is actually configured.
 fn status_line(state: &UiState) -> Line<'static> {
     let mut spans = Vec::new();
+    // `voice_autoplay=off` silences *everyone's* arriving voice, which is
+    // otherwise completely invisible: messages still arrive and still
+    // log, they just never play. The sidebar's own \u{1F507} marks one
+    // person `/mute-voice` silenced (Functionality #16) and would be
+    // actively misleading here - it singles someone out while in fact
+    // nobody is being played - so the blanket state says so once, up
+    // here, where it belongs.
+    if !state.voice_autoplay {
+        spans.push(Span::styled(
+            format!("{VOICE_MUTED_MARKER} playback off"),
+            Style::default().fg(Color::Red),
+        ));
+        spans.push(Span::raw("  "));
+    }
     if state.unread_otp_mail_count > 0 {
         spans.push(Span::styled(
             format!(
@@ -1297,7 +1311,7 @@ fn status_line(state: &UiState) -> Line<'static> {
             .map(human_duration)
             .unwrap_or_else(|| "-".to_string());
         spans.push(Span::styled(
-            format!("{active}/{total} direct punches, next try in {next} (Control+s)"),
+            format!("{active}/{total} (next: {next})"),
             Style::default().fg(if active == total {
                 Color::Green
             } else {
@@ -1653,8 +1667,12 @@ fn render_sidebar(frame: &mut Frame, area: Rect, state: &UiState) {
             // arrive and still log, they just never play. Without a marker
             // here, a channel that has gone quiet is indistinguishable
             // from one where nobody is talking.
-            let muted = if state.is_voice_muted(m.id) {
-                "\u{1F507} "
+            // Only ever the per-person mute. With `voice_autoplay` off
+            // nobody's voice plays at all, and marking one name would
+            // claim something about them that is true of everyone - the
+            // header carries that state instead (`status_line`).
+            let muted = if state.voice_autoplay && state.is_voice_muted(m.id) {
+                concat!("\u{1F507}", " ")
             } else {
                 ""
             };

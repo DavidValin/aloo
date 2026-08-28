@@ -430,3 +430,34 @@ async fn exporting_channel_requested(w: &mut AlooWorld, channel: String) {
         other => panic!("expected ExportSelected, got {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------------
+// Being named with an `@` (US-063)
+// ---------------------------------------------------------------------
+
+#[then(expr = "{string} mentions me")]
+async fn text_mentions_me(w: &mut AlooWorld, text: String) {
+    assert!(
+        w.ui_ref()
+            .message_mentions_me(&aloo::client::tui::ui::MessageBody::Text(text.clone())),
+        "{text:?} names this client and should sound assets/ping.wav"
+    );
+}
+
+#[then(expr = "{string} does not mention me")]
+async fn text_does_not_mention_me(w: &mut AlooWorld, text: String) {
+    assert!(
+        !w.ui_ref()
+            .message_mentions_me(&aloo::client::tui::ui::MessageBody::Text(text.clone())),
+        "{text:?} does not name this client and must stay silent"
+    );
+}
+
+/// Only words can name anyone - a voice row carries none.
+#[then("an arriving voice message never mentions me")]
+async fn voice_never_mentions_me(w: &mut AlooWorld) {
+    assert!(!w.ui_ref().message_mentions_me(&aloo::client::tui::ui::MessageBody::Voice {
+        duration_ms: 1000,
+        pcm: Vec::new(),
+    }));
+}

@@ -110,7 +110,8 @@ thing in-app at any time.
 | `PgUp` / `PgDn` | Scroll ten at a time |
 | `Home` / `End` | Jump to the oldest / newest message (log focused) |
 | `Ctrl+O` | Open the focused message's link in your default browser — presses again cycle through more than one |
-| `Ctrl+S` | Open the "Direct Punches" popup (shown only once you've configured one — see "Punching straight to someone") |
+| `Ctrl+S` | Settings — see "Settings, without leaving aloo" |
+| `Ctrl+M` | Mute/unmute your own microphone while on a call, from anywhere in aloo (not an OS-wide shortcut — only push-to-talk is) |
 | `Ctrl+E` | Export specific channels/DMs to disk — see "Exporting your chat history" |
 | `Ctrl+H` | Help — `Esc` or `Ctrl+H` closes |
 | `Ctrl+C` | Quit |
@@ -177,6 +178,96 @@ A muted voice message — or one that simply arrived in a channel/DM you
 weren't looking at — never autoplays, and its line ends with a red "not
 listened" marker until you replay it (`Enter`) or it arrives somewhere
 you're actually viewing.
+
+### Settings, without leaving aloo
+
+**`Ctrl+S`** opens the settings — the same `~/.aloo/settings` file aloo
+reads at startup, in three tabs. `Tab` moves between them, `Up`/`Down`
+between the fields of the one you're on, `Space` flips a switch, typing
+fills a box, `Esc` closes. The open tab is filled in, and each bordered
+area is separated from the next by a blank line. **There's no Save
+button:** every change is written the moment you make it, and **takes
+effect there and then** — no restart. Each tab ends with a gray line per
+field saying what it does.
+
+The one thing a restart still decides: turning `global_ptt_enabled` back
+*on* needs one if aloo started with it off, because the OS-level shortcut
+was never grabbed. Turning it off is instant. (Changing the combo itself
+re-registers live on Linux; on macOS and Windows it waits for the next
+start.)
+
+| Tab | What's on it |
+|---|---|
+| **General** | `global_ptt_enabled` / `global_ptt_shortcut` (see "Voice messages"), `voice_autoplay`, `roger_beep`, `sound_notifications` (see "Turning the sounds off"), `autosave_messages` / `resume_from_log` (see "Exporting your chat history"), `queue_send_messages` (see "Talking to someone who isn't there") |
+| **Direct Punch** | The `direct_punch` switch, the list of people to punch at, and the No-IP account that keeps a moving address reachable — see "Punching straight to someone" |
+| **OTP** | `otp_low_key_warn_pct` and `otp_binary_path` |
+
+Server options (`server_*`), daemon options (`daemon_*`) and the connect
+cache (`connect_*`) aren't here: the first two belong to a different
+process, and the third is written by connecting rather than typed. Edit
+those in the file, which lists every one of them from the first run.
+
+### Turning the sounds off
+
+Three switches, all on out of the box, each silencing one thing and
+nothing else. All three are live — flip one in `Ctrl+S` and it takes
+effect on the next sound, not the next run.
+
+| Setting | Off means |
+|---|---|
+| `voice_autoplay` | No arriving voice message plays itself, from anyone. Everything is still logged, and `Enter` still replays it — the blanket version of `/mute-voice` |
+| `roger_beep` | No "over" tone at the end of a voice message, sent or received |
+| `sound_notifications` | No event sounds at all: incoming file offers, OTP prompts, identities to review, a daemon's contact appearing, and `@`-mentions |
+
+`roger_beep` is deliberately separate from `sound_notifications` — it
+punctuates speech rather than announcing something, so people usually want
+exactly one of the two.
+
+### Being mentioned
+
+Someone writing **`@<your nickname>`** in a channel or a DM makes a sound
+as the message lands, so you notice it without watching every channel go
+by. It has to be your whole nickname — `bob@me.example` is an address, and
+`@meredith` isn't `@me` — and it's case-sensitive, since the server treats
+`bob` and `Bob` as two different people. Silenced with
+`sound_notifications` above.
+
+### Talking to someone who isn't there
+
+`queue_send_messages` is on by default: a message you send to someone
+who isn't reachable is written to `~/.aloo/outbox/` and delivered the
+moment their link opens — **in the order you sent it**, and across a
+restart of aloo, not just across a blink.
+
+- **Text and voice**, both. You can record a voice message for someone
+  who isn't online yet and it waits for them; normally a recording just
+  leaves out anyone who isn't reachable right then.
+- **Not files.** A transfer is a live conversation — an offer they have to
+  accept before a byte is sent — so replaying half of one an hour later
+  isn't a delivery.
+- **It keeps the encryption you sent it with.** What's stored is what
+  would have gone on the wire, still sealed: `pq_hybrid`, or the
+  one-time pad if an `/otp` session was open with them. Nothing readable
+  ever touches the disk, and nothing is re-encrypted behind your back.
+- **It survives closing aloo.** What's on disk is read back next time you
+  start and goes out as each person becomes reachable.
+- **`i` on a held message says `QUEUED`** rather than `UNDELIVERED` — it's
+  being kept and it will go, not merely unacknowledged.
+
+- **Nothing expires.** A held message waits as long as it has to. The one
+  thing that ever removes one is deleting that contact — with their keys
+  gone, nothing held for them could be delivered or read back anyway. aloo
+  checks at startup and every 12 hours.
+- **A new message goes on the end of the queue**, never ahead of it, so a
+  pad-wrapped conversation stays in the sequence its pad expects.
+
+Two things worth knowing: a pad-wrapped message uses up its place in the
+pad when you *write* it, which is why the order is kept exactly; and if
+they rotate their identity while away, what was held for them can't be
+opened any more and says so, rather than being quietly re-sealed.
+
+Because nothing expires, a contact you keep but never reach again will
+keep accumulating on disk — `~/.aloo/outbox/` is where to look.
 
 ### Exporting your chat history
 
@@ -487,7 +578,7 @@ direct_punch_to=marco,marcohost.com,every_1h
 
 One line per person: their nickname, where their client is (an IPv4 address, an IPv6 address, or a hostname — add `:9000` for a port other than the default 7879), and how often to try. The frequency can be `every_1m`, `every_5m`, `every_10m`, `every_15m`, `every_20m`, `every_25m`, `every_30m`, `every_35m`, `every_40m`, `every_45m`, `every_50m`, `every_55m` or `every_1h`.
 
-You don't have to hand-edit the file: **`Ctrl+S`** opens a "Direct Punches" popup listing every configured target — `a` adds one, `Enter`/`e` edits the selected one, `d` deletes it, `Esc` backs out. Saving writes straight back to `~/.aloo/settings` and reconfigures the schedule immediately, no restart needed. Once at least one is configured, the header shows `<active>/<total> direct punches, next try in <time> (Control+s)` to its left, in green once every configured peer is connected and yellow otherwise.
+You don't have to hand-edit the file: **`Ctrl+S`**'s **Direct Punch** tab lists every configured target — `a` adds one, `Enter`/`e` edits the selected one, `d` deletes it, `Up`/`Down` walk the list and carry on to the next field at either end. Saving writes straight back to `~/.aloo/settings` and reconfigures the schedule immediately, no restart needed; so does the `direct_punch` switch above the list, and the No-IP fields below it. Once at least one target is configured, the header shows `<active>/<total> (next: <time>)` to its left — how many of your configured targets currently have a link, and how long until the soonest attempt — in green once every configured peer is connected and yellow otherwise.
 
 Every schedule restarts at the top of the hour — `every_1m` tries at :00, :01, :02, and so on; `every_1h` at :00 only — which is exactly what makes it work: you're both trying at the same moments, so your two routers open up to each other at the same time. That's also why you both need the same frequency for a given person.
 

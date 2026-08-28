@@ -120,4 +120,4 @@ Feature: Punching a direct link with no server involved
   Scenario: The status line reports how many direct punches are active
     Given I am connected and viewing a channel
     And direct punching has 1 of 2 peers active, next try in 37 seconds
-    Then the header shows "1/2 direct punches, next try in 37s (Control+s)" right before "Conn:"
+    Then the header shows "1/2 (next: 37s)" right before "Conn:"

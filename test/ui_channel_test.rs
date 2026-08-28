@@ -1483,7 +1483,7 @@ fn header_shows_nothing_about_direct_punching_when_it_is_not_configured() {
     let rows = rendered_rows(&state);
     let header = &rows[HEADER_TEXT_ROW];
     assert!(
-        !header.contains("direct punches"),
+        !header.contains("(next:"),
         "nothing should be shown when direct punching is not set up: {header:?}"
     );
 }
@@ -1497,7 +1497,7 @@ fn header_shows_the_direct_punch_summary_right_before_conn_quality() {
     let rows = rendered_rows(&state);
     let header = &rows[HEADER_TEXT_ROW];
     assert!(
-        header.contains("1/2 direct punches, next try in 37s (Control+s)  Conn:GOOD"),
+        header.contains("1/2 (next: 37s)  Conn:GOOD"),
         "expected the direct-punch summary right before Conn: {header:?}"
     );
 }
@@ -1513,7 +1513,7 @@ fn the_direct_punch_summary_is_green_when_everything_is_active_and_yellow_otherw
         terminal.draw(|f| render(f, &state)).unwrap();
         terminal.backend().buffer().clone()
     };
-    let (x, y) = find_text_start(&buffer, "2/2 direct punches");
+    let (x, y) = find_text_start(&buffer, "2/2 (next: -)");
     assert_eq!(buffer[(x, y)].fg, ratatui::style::Color::Green);
 
     state.set_direct_punch_status(Some((1, 2, Some(std::time::Duration::from_secs(5)))));
@@ -1521,7 +1521,7 @@ fn the_direct_punch_summary_is_green_when_everything_is_active_and_yellow_otherw
     let mut terminal = Terminal::new(backend).unwrap();
     terminal.draw(|f| render(f, &state)).unwrap();
     let buffer = terminal.backend().buffer().clone();
-    let (x, y) = find_text_start(&buffer, "1/2 direct punches");
+    let (x, y) = find_text_start(&buffer, "1/2 (next: 5s)");
     assert_eq!(buffer[(x, y)].fg, ratatui::style::Color::Yellow);
 }
 

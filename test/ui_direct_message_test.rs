@@ -122,9 +122,8 @@ fn reopening_dm_clears_unread_flag() {
     assert!(!state.private_rooms[&UserId(2)].unread);
 }
 
-/// @requirement AC-053
-#[test]
-fn compose_bar_refuses_to_send_a_plain_message_to_an_offline_dm_peer() {
+/// An offline peer's room, with bob having DM history so he stays listed.
+fn offline_dm_room_with_bob() -> UiState {
     let mut state = joined_general_with(vec![user(2, "bob")]);
     state.on_direct_message(UserId(2), "bob".into(), MessageBody::Text("hi".into())); // gives bob DM history
     state.on_user_offline(UserId(2));
@@ -132,6 +131,51 @@ fn compose_bar_refuses_to_send_a_plain_message_to_an_offline_dm_peer() {
     press(&mut state, KeyCode::Enter); // reopen bob's (offline) room
     assert_eq!(state.active_private_room, Some(UserId(2)));
     assert_eq!(state.focus, Focus::Input);
+    state
+}
+
+/// "They are not here" is exactly what the durable queue exists for, so
+/// with it on an ordinary message to an offline peer is accepted and sent
+/// - the session holds it for them (`client::outbox`) rather than the
+/// compose bar refusing it.
+/// @requirement AC-053, AC-410
+#[test]
+fn a_plain_message_to_an_offline_dm_peer_is_queued_when_queueing_is_on() {
+    let mut state = offline_dm_room_with_bob();
+    assert!(state.queue_send_messages, "on by default, like the setting itself");
+
+    type_str(&mut state, "are you there");
+    let action = press(&mut state, KeyCode::Enter);
+    assert!(
+        matches!(action, Some(UiAction::SendDirectText { to, .. }) if to == UserId(2)),
+        "expected the send to go ahead and be held for bob, got {action:?}"
+    );
+    assert_eq!(state.input, "", "and the compose bar clears, like any accepted send");
+}
+
+/// A command needs the peer actually there - a queue cannot stand in for
+/// one - so it stays refused whichever way the setting is set.
+/// @requirement AC-053
+#[test]
+fn a_command_to_an_offline_dm_peer_is_refused_whatever_the_queue_setting() {
+    for queueing in [true, false] {
+        let mut state = offline_dm_room_with_bob();
+        state.queue_send_messages = queueing;
+        type_str(&mut state, "/file");
+        assert_eq!(
+            press(&mut state, KeyCode::Enter),
+            None,
+            "/file must not be accepted for an offline peer (queueing on: {queueing})"
+        );
+        assert_eq!(state.input, "/file", "and the typed text is left in place");
+    }
+}
+
+/// @requirement AC-053
+#[test]
+fn compose_bar_refuses_to_send_a_plain_message_to_an_offline_dm_peer_when_queueing_is_off() {
+    let mut state = offline_dm_room_with_bob();
+    state.queue_send_messages = false;
 
     type_str(&mut state, "are you there");
     assert_eq!(
@@ -143,7 +187,7 @@ fn compose_bar_refuses_to_send_a_plain_message_to_an_offline_dm_peer() {
     let action = press(&mut state, KeyCode::Enter);
     assert_eq!(
         action, None,
-        "Enter must not send a plain message while the DM peer is offline"
+        "with nothing to hold it, Enter must not send a plain message to an offline peer"
     );
     assert_eq!(
         state.input, "are you there",

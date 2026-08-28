@@ -36,9 +36,15 @@ Feature: When someone's connection closes
     When bob goes offline
     Then bob is dropped from the channel list
 
+  # What may actually be submitted here depends on queue_send_messages
+  # (US-064): an ordinary message is held for them while it is on, and
+  # refused while it is off. Both are in
+  # features/messaging/queued_sends.feature; what this one pins is the
+  # room itself - the red notice, and that typing is never blocked.
   @AC-053
-  Scenario: An offline peer's room refuses to send, though it can still be typed into
-    Given I am connected and viewing a channel
+  Scenario: An offline peer's room shows a red notice but can still be typed into
+    Given queueing sends is off
+    And I am connected and viewing a channel
     And bob is in the channel with me
     And bob has sent me the private message "hi"
     And bob has gone offline

@@ -50,3 +50,20 @@ fn is_wayland_session_false_for_a_plain_x11_session() {
     assert!(!is_wayland_session(Some("x11"), false));
     assert!(!is_wayland_session(None, false));
 }
+
+/// `global_ptt_enabled` is answered per event rather than by the
+/// registration, which is what lets turning it off in the Ctrl+S popup
+/// stop the shortcut doing anything without waiting for a restart - the
+/// OS-level grab belongs to a thread the session cannot reach.
+/// @requirement AC-411
+#[test]
+fn the_enabled_gate_is_flipped_live_and_read_per_event() {
+    // On out of the box, matching the setting's own default.
+    assert!(aloo::client::global_ptt::enabled());
+
+    aloo::client::global_ptt::set_enabled(false);
+    assert!(!aloo::client::global_ptt::enabled(), "off stops it now");
+
+    aloo::client::global_ptt::set_enabled(true);
+    assert!(aloo::client::global_ptt::enabled(), "and on lets it through again");
+}

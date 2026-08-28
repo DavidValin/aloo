@@ -246,10 +246,20 @@ pub(crate) async fn handle_voice_record_start(
         );
         return Ok(());
     }
-    // Voice is never queued (PROTOCOL.md §11.2) - a link that isn't already
-    // `Active` right now (no relay fallback, and punching can take several
-    // seconds) fails this recording outright, same as an unready key above.
-    if session.peer_link.ensure_link(wr, to).await != LinkReadiness::Active {
+    // Voice is never queued *by the transport* (PROTOCOL.md §11.2) - a
+    // link that isn't already `Active` right now (no relay fallback, and
+    // punching can take several seconds) fails this recording outright,
+    // same as an unready key above.
+    //
+    // Unless there is a durable queue to put it in (`queue_send_messages`,
+    // `client::outbox`): then the recording goes ahead and is sealed for
+    // them exactly as it would have been, and every chunk waits on disk
+    // until their link opens. "Record it and they get it when they are
+    // back" is the whole point of that setting, and a voice message is
+    // the half of it a walkie-talkie cares most about.
+    if session.peer_link.ensure_link(wr, to).await != LinkReadiness::Active
+        && session.outbox.is_none()
+    {
         ui_state.recording_failed("no direct connection to recipient yet".to_string());
         return Ok(());
     }
@@ -392,7 +402,13 @@ pub async fn on_message(
     if let Some(body) =
         crate::client::session::decrypt_envelope_for(envelope, from, &sender, None, session)
     {
+        // Same `@<nickname>` ping a channel message gets - see
+        // `channel::on_message`.
+        let mentions_me = ui_state.message_mentions_me(&body);
         ui_state.on_direct_message(from, from_name, body);
+        if mentions_me {
+            crate::client::voice_stream::play_ping_chime(session);
+        }
         crate::client::session::send_delivery_receipt(
             session,
             from,

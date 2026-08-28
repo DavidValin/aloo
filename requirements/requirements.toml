@@ -1224,8 +1224,8 @@ evidence = "docs/SPEC.md Functionality #8; tests user_offline_with_dm_history_ke
 
 [[user_story.acceptance_criteria]]
 id = "AC-053"
-description = "An offline peer's private room replaces the compose bar with '(user offline)' in red while nothing is typed, and refuses to send anything typed there - /endotp included: it is still typeable, but submitting it is refused with an explanatory notice rather than silently swallowed, since ending is a synchronised two-party operation the offline peer cannot confirm (AC-310). The moment something is typed, it's shown in place of the red notice rather than hidden behind it."
-evidence = "docs/SPEC.md Functionality #8; docs/PROTOCOL.md 16.6; tests compose_bar_refuses_to_send_a_plain_message_to_an_offline_dm_peer, endotp_while_the_open_dm_peer_is_offline_is_refused_with_a_notice, private_room_input_bar_shows_a_red_offline_notice_instead_of_the_compose_bar; offline_users.feature, message_encryption.feature"
+description = "An offline peer's private room replaces the compose bar with '(user offline)' in red while nothing is typed, and the moment something is typed it is shown in place of that notice rather than hidden behind it. What may then be submitted depends on queue_send_messages (US-064): an ordinary message is accepted and held for them while it is on, since 'they are not here' is exactly what that queue exists for, and refused while it is off. Everything that needs the peer actually present is refused either way - every slash command in the room (/file, /otp, /call and the rest are live exchanges a queue cannot stand in for), and a paste long enough to become a file transfer instead of a message. /endotp is the documented exception among the commands: it is still typeable and submitting it is refused with an explanatory notice rather than silently swallowed, since ending is a synchronised two-party operation the offline peer cannot confirm (AC-310)."
+evidence = "docs/SPEC.md Functionality #8; docs/PROTOCOL.md 16.6; src/client/tui/direct_message.rs UiState::offline_blocks_send; tests a_plain_message_to_an_offline_dm_peer_is_queued_when_queueing_is_on, compose_bar_refuses_to_send_a_plain_message_to_an_offline_dm_peer_when_queueing_is_off, a_command_to_an_offline_dm_peer_is_refused_whatever_the_queue_setting, endotp_while_the_open_dm_peer_is_offline_is_refused_with_a_notice, private_room_input_bar_shows_a_red_offline_notice_instead_of_the_compose_bar; offline_users.feature, message_encryption.feature"
 
 [[user_story.acceptance_criteria]]
 id = "AC-054"
@@ -3115,7 +3115,7 @@ evidence = "docs/PROTOCOL.md 7.1.5; src/settings.rs Settings::has_direct_punch_c
 
 [[user_story.acceptance_criteria]]
 id = "AC-290"
-description = "Direct punching, once configured, reports itself on the status line as \"<active>/<total> direct punches, next try in <time> (Control+s)\" - how many configured targets currently have an established link, how many are configured in total, and how long until the soonest one not already established comes due, in seconds/minutes/hours as appropriate. Nothing is shown at all when direct punching is not configured (AC-287)."
+description = "Direct punching, once configured, reports itself on the status line as \"<active>/<total> (next: <time>)\" - how many configured targets currently have an established link, how many are configured in total, and how long until the soonest one not already established comes due, in seconds/minutes/hours as appropriate. Deliberately terse: it sits in a row already carrying the call marker, unread mail, playback state, Conn and CPU, so it spends its width on the two figures that change rather than on words repeating what Ctrl+H explains. Nothing is shown at all when direct punching is not configured (AC-287)."
 evidence = "docs/SPEC.md 'Connected UI'; src/client/p2p.rs PeerLinkManager::direct_punch_summary; src/client/tui/channel.rs status_line; tests direct_punch_summary_is_none_when_nothing_is_configured, direct_punch_summary_reports_total_and_active_counts, direct_punch_summary_reports_time_until_the_next_attempt, direct_punch_summary_caps_the_next_attempt_at_the_top_of_the_hour"
 
 [[user_story.acceptance_criteria]]
@@ -3770,3 +3770,141 @@ evidence = "docs/SPEC.md 'Connected UI'; src/client/tui/ui.rs UiState::handle_pa
 id = "AC-395"
 description = "Mouse capture is enabled for the whole connected-session terminal (tui::terminal::setup); a left click is hit-tested against wherever the input bar and (only while actually viewing a channel, never a DM) the member sidebar were last drawn, moving focus there - a sidebar click also selects whichever member row it landed on. A click is a no-op while any overlay is in front of the view (a popup, /mail, an open decision queue, any non-Normal mode) - clicking through it to whatever it covers would be indistinguishable from actually answering it - and while viewing a DM, the sidebar's last-recorded position (stale, left over from the channel view, since render_private_room draws no sidebar) is never honored. Only a left button press is handled; right clicks, releases, drags and scroll are not yet. Never reaches a daemon session over the attach IPC wire, which has no mouse variant (daemon_ipc::KeyWire)."
 evidence = "docs/SPEC.md 'Connected UI'; src/client/tui/terminal.rs setup, restore (EnableMouseCapture/DisableMouseCapture); src/client/tui/ui.rs UiState::handle_mouse, pack_rect, unpack_rect, last_input_bar_area, last_sidebar_area, render_input_bar; src/client/tui/channel.rs render_sidebar; src/client/session.rs run_connected_session's Event::Mouse arm; tests clicking_the_input_bar_focuses_it, clicking_a_sidebar_row_selects_that_member_and_focuses_the_sidebar, clicking_empty_space_does_nothing, a_click_is_ignored_while_an_overlay_is_open, only_a_left_button_press_is_handled, a_stale_sidebar_position_is_ignored_while_viewing_a_dm (ui_mouse_test.rs)"
+
+
+[[user_story]]
+id = "US-061"
+title = "Change settings without leaving the app"
+as_a = "user who wants a different shortcut, a quieter client, or a peer to punch at"
+i_want = "to edit ~/.aloo/settings from inside aloo, grouped and explained"
+so_that = "I do not have to quit, find a file, remember a key's exact spelling, and start again to change my mind"
+
+[[user_story.acceptance_criteria]]
+id = "AC-397"
+description = "Control+S opens a \"Settings\" popup over the connected UI with three tabs - General, Direct Punch, OTP - opening on General with its first field focused. Tab/BackTab cycle the tabs (wrapping, and always landing on the new tab's own first field, since the focus is an index into that tab's own field list); Up/Down move between the focused tab's fields, wrapping; Esc closes the popup. It opens showing the compiled-in defaults and asks the session for the file's real contents (UiAction::OpenSettings -> set_settings_draft + set_direct_punch_rows), the same open-empty-then-fill split /contacts uses, since UiState never touches the filesystem itself."
+evidence = "docs/SPEC.md Functionality #23; src/client/tui/settings_popup.rs (SettingsTab, SettingsPopupState, UiState::open_settings/handle_settings_key/set_settings_draft); src/client/session.rs handle_ui_action's OpenSettings arm (see docs/TESTING.md 'Known coverage gaps' for why the load half needs a live session and isn't directly tested); tests ctrl_s_opens_the_settings_popup_on_its_first_tab_and_requests_a_load, tab_and_backtab_cycle_the_three_tabs_and_wrap, switching_tabs_puts_the_focus_on_the_new_tabs_first_field, up_and_down_wrap_around_the_fields_of_a_tab, esc_closes_the_popup, every_tab_names_itself_and_the_open_one_is_marked, the_general_tab_draws_its_three_bordered_areas, the_session_can_replace_the_draft_with_what_is_on_disk, set_settings_draft_is_a_no_op_once_the_popup_is_closed (ui_settings_popup_test.rs); scenario features/settings/settings_popup.feature"
+
+[[user_story.acceptance_criteria]]
+id = "AC-398"
+description = "The General tab holds four bordered areas, each separated from the next by a blank row: \"voice / ptt\" (global_ptt_enabled, then the global_ptt_shortcut box with a blank row under it, then voice_autoplay and roger_beep), \"notifications\" (sound_notifications), \"logs\" (autosave_messages, resume_from_log) and \"delivery\" (queue_send_messages). A switch draws its state as a filled block - the word ON on green, OFF on red, both centred in the same columns so they line up down the tab - and Space or Enter flips it; a value is typed into a bordered box, which refuses the one character that would break its key=value line. Every change - a flip or a single keystroke - is persisted immediately as UiAction::SaveSettings carrying the whole draft: there is no Save button, so nothing can be typed and then silently lost on Esc. Turning a draft back into settings never writes a value that is not one: an emptied shortcut box leaves the stored shortcut alone, exactly as Settings::parse ignores an empty value for that key."
+evidence = "docs/SPEC.md Functionality #23; src/client/tui/settings_popup.rs (SettingsField, SettingsDraft::apply_to, UiState::handle_settings_field_key); src/client/session.rs handle_ui_action's SaveSettings arm -> save_settings_draft (see docs/TESTING.md 'Known coverage gaps' for why the persist half isn't directly tested); tests the_defaults_the_popup_opens_with_are_the_settings_files_own, space_flips_the_focused_toggle_and_asks_for_a_save, enter_flips_a_toggle_the_same_way_space_does, each_toggle_changes_only_itself, the_log_switches_are_on_the_general_tab_and_flip_too, typing_into_a_text_field_fills_it_and_asks_for_a_save_per_keystroke, a_text_field_refuses_the_one_character_that_would_break_its_line, backspace_on_an_empty_field_asks_for_nothing, applying_a_draft_writes_every_field_it_owns, an_empty_shortcut_box_leaves_the_stored_shortcut_alone, a_toggle_draws_its_state_in_words (ui_settings_popup_test.rs); scenario features/settings/settings_popup.feature"
+
+[[user_story.acceptance_criteria]]
+id = "AC-399"
+description = "The Direct Punch tab holds the direct_punch master switch over the \"configured punches\" list (AC-291's rows, add/edit/delete unchanged), and a \"noip\" area with noip_when_no_server_and_direct_punch_is_active plus the noip_hostname/noip_username/noip_password boxes. The punch list is one focus stop that behaves like a list: Up/Down walk its rows while there is another row to move onto and hand the key back to the tab at either end, so one set of arrows drives both the field column and the list inside it with no mode to enter and leave. The No-IP password is the one value drawn as dots unless it is the box being typed into. Flipping the master switch off reconfigures the scheduler with no targets that same tick, and on restores exactly the rows the list is showing - it is not a next-restart setting."
+evidence = "docs/PROTOCOL.md 7.1.5; docs/SPEC.md Functionality #23; src/client/tui/settings_popup.rs (render_direct_punch_tab, UiState::move_settings_focus/handle_punches_key), src/client/tui/direct_punch_popup.rs DirectPunchPopupState::step_selection; src/client/session.rs save_settings_draft (the configure_direct_punch call - see docs/TESTING.md 'Known coverage gaps'); tests the_direct_punch_and_noip_switches_live_on_the_direct_punch_tab, the_noip_boxes_are_three_independent_text_fields, the_direct_punch_tab_draws_its_two_bordered_areas_and_the_punch_list, the_noip_password_is_hidden_unless_it_is_the_focused_box (ui_settings_popup_test.rs), up_and_down_walk_the_row_list_and_then_leave_it (ui_direct_punch_popup_test.rs); scenario features/settings/settings_popup.feature"
+
+[[user_story.acceptance_criteria]]
+id = "AC-400"
+description = "The OTP tab holds otp_low_key_warn_pct and otp_binary_path as bordered boxes. The percentage box takes digits only and at most three of them, and a value that is not a percentage - an empty box mid-edit, or one outside 1..=100 - leaves the stored setting exactly as it was rather than writing a nonsense one. An emptied otp_binary_path box means \"resolve it on PATH\" (None), never an empty string that would be looked for as a filename."
+evidence = "docs/SPEC.md Functionality #23; src/client/tui/settings_popup.rs (FieldKind::Digits, SettingsDraft::apply_to); src/client/otp_cli.rs OtpCliConfig::resolve (what an absent otp_binary_path means); tests the_otp_tab_holds_the_warning_threshold_and_the_binary_path, the_percentage_field_takes_digits_only_and_no_more_than_three, a_percentage_that_is_not_one_leaves_the_stored_value_alone, an_empty_binary_path_box_means_no_override_at_all (ui_settings_popup_test.rs); scenario features/settings/settings_popup.feature"
+
+[[user_story.acceptance_criteria]]
+id = "AC-401"
+description = "Each tab ends with a short gray line per field on it, naming the settings-file key and what it does in one sentence - including whether it takes effect now or on the next start, which differs per field (the sound switches and the direct-punch master switch are live; the global shortcut, registered once at startup, is not). Wrapped rather than clipped, so the longest key's sentence is not cut off mid-word, and dropped first when the terminal is too short for the whole popup."
+evidence = "docs/SPEC.md Functionality #23; src/client/tui/settings_popup.rs SettingsField::description, render_descriptions, Stack; test each_tab_ends_with_a_short_description_of_every_field_on_it (ui_settings_popup_test.rs); scenario features/settings/settings_popup.feature"
+
+
+[[user_story]]
+id = "US-062"
+title = "Silence any part of aloo that makes noise"
+as_a = "user in an open-plan office, or on a call, or simply not wanting to be startled"
+i_want = "to turn off arriving voice, the end-of-message tone, and the event sounds independently"
+so_that = "I can keep using aloo where a sound would be unwelcome without giving up the features behind it"
+
+[[user_story.acceptance_criteria]]
+id = "AC-402"
+description = "Three switches, all on by default, each silencing exactly one thing and saying nothing about the other two. voice_autoplay off keeps every arriving voice message off the mixer whoever sent it and whatever layering carried it - the blanket form of /mute-voice, asked through the same one predicate (UiState::suppress_playback_from) so no call site can honour the mute list and forget this - while the row is still logged and Enter still replays it. roger_beep off silences assets/end.wav at both ends of a voice message. sound_notifications off silences every event sound - assets/bell.wav (a file offer, an OTP prompt, an identity to review), assets/joined.wav (a daemon's focused contact appearing), assets/ping.wav (being @-mentioned) - and end.wav is deliberately not among them, since roger_beep owns it. All three are live: changing one in the Ctrl+S popup takes effect on the next sound, not the next run."
+evidence = "docs/SPEC.md Functionality #32; src/settings.rs Settings::voice_autoplay/roger_beep/sound_notifications; src/client/tui/ui.rs UiState::suppress_playback_from; src/client/voice_stream.rs play_end_chime/play_bell_chime/play_joined_chime/play_ping_chime; src/client/session.rs SessionState::set_sound_switches, save_settings_draft; src/client/daemon.rs report_startup_failure; tests the_three_sound_switches_default_on_and_are_always_written, the_three_sound_switches_round_trip_off, each_sound_switch_is_read_independently (settings_test.rs), voice_autoplay_off_suppresses_playback_from_everyone (ui_test.rs), sound_notifications_off_silences_the_mention_ping (session_paths_test.rs); scenario features/voice/sounds.feature"
+
+
+[[user_story.acceptance_criteria]]
+id = "AC-415"
+description = "Where a silenced voice is reported depends on how many people it silences. voice_autoplay off is a state of the whole client, so the header carries it - a red \"🔇 playback off\", ahead of the unread-mail/direct-punch/Conn/CPU indicators - since nothing else on screen would show it: messages still arrive and still log, they just never play. /mute-voice is one person, so the sidebar's own 🔇 beside their name carries that (AC-196), and only while voice_autoplay is on: with nobody's voice playing at all, marking one name would claim something about them that is equally true of everyone. The mute list itself is untouched either way - it is simply not what the sidebar is reporting in that state, and it takes effect again the moment autoplay comes back."
+evidence = "docs/SPEC.md Functionality #32; src/client/tui/ui.rs VOICE_MUTED_MARKER; src/client/tui/channel.rs status_line, render_sidebar's muted marker; tests the_header_reports_voice_autoplay_being_off, the_sidebar_marks_one_muted_person_only_while_autoplay_is_on (ui_test.rs); scenario features/voice/sounds.feature"
+
+
+[[user_story]]
+id = "US-063"
+title = "Hear it when someone writes your name"
+as_a = "user with a channel open in a terminal I am not looking at"
+i_want = "a sound when someone writes @<my nickname>"
+so_that = "I notice a message meant for me without having to watch every channel go by"
+
+[[user_story.acceptance_criteria]]
+id = "AC-403"
+description = "An arriving text message that names this client's own nickname as @<nickname> - in a shared channel or in a DM, over pq_hybrid or under an OTP pad alike - plays assets/ping.wav once, alongside being logged as usual. A mention is a whole word at both ends: the @ may not follow a nickname character (so an address like bob@me.example is not one) and the nickname may not be followed by one (so @meredith is not @me). It is case-sensitive, because the server tells bob and Bob apart, and a case-folded match would sound one person's ping for a message addressed to another. Only a text body can mention anyone; a voice or file row never does. This client's own sends never take the receive path, so writing your own name cannot ping you."
+evidence = "docs/SPEC.md Functionality #33; src/client/tui/ui.rs text_mentions, UiState::message_mentions_me; src/client/channel.rs on_message, src/client/direct_message.rs on_message, src/client/otp.rs apply_otp_message (the three receive paths); src/client/voice.rs ping_chime_samples, src/client/voice_stream.rs play_ping_chime; tests a_text_message_naming_you_is_a_mention, a_mention_is_bounded_at_both_ends, a_mention_is_case_sensitive_because_nicknames_are, a_voice_row_is_never_a_mention (ui_test.rs), ping_chime_samples_decodes_the_bundled_asset_and_is_non_empty (voice_test.rs), a_channel_message_naming_you_plays_a_sound_and_one_that_does_not_is_silent, a_dm_naming_you_plays_the_same_sound, the_sound_follows_your_own_nickname (session_paths_test.rs); scenario features/messaging/mentions.feature"
+
+[[user_story.acceptance_criteria]]
+id = "AC-404"
+description = "Space flips the focused switch while the settings popup is open, rather than starting a push-to-talk recording. handle_key's modal precedence is what decides this: the popup's dispatch sits above the global Space branch, the same place the OTP mail view's own Space handling sits and for the same reason - a surface whose own meaning for Space outranks the global one."
+evidence = "docs/SPEC.md Functionality #23; src/client/tui/input.rs handle_key (the Mode::Settings dispatch, above the Space/push-to-talk branch); test space_in_the_popup_flips_a_switch_rather_than_starting_a_recording (ui_settings_popup_test.rs); scenario features/settings/settings_popup.feature"
+
+[[user_story.acceptance_criteria]]
+id = "AC-405"
+description = "The open tab is drawn as a filled tab - a background colour of its own that the other two do not have - rather than as one of three words that happens to be bold, and the fill follows whichever tab is open. Every switch is drawn as a filled block too, green for ON and red for OFF, so a tab's state reads at a glance rather than word by word. Inside a tab, each bordered area is separated from the next by a blank row, and the global_ptt_shortcut box from the switches under it, so the grouping reads without having to read a single label. The popup is wide enough that every field's own description sits on one line, wrapping only on a terminal too narrow for it."
+evidence = "docs/SPEC.md Functionality #23; src/client/tui/settings_popup.rs render_settings_popup's Tabs styling, Stack::gap, render_general_tab/render_direct_punch_tab/render_otp_tab; tests the_open_tab_is_drawn_with_a_background_of_its_own, a_toggle_draws_its_state_in_words_and_in_colour, a_blank_row_separates_each_area_and_follows_the_shortcut_box, every_description_fits_on_one_line (ui_settings_popup_test.rs)"
+
+[[user_story.acceptance_criteria]]
+id = "AC-406"
+description = "queue_send_messages is the last switch on the General tab, in a \"delivery\" area of its own rather than filed under logs, and is on by default, written into the first-run scaffold like every other client option and round-tripping through save/load."
+evidence = "docs/SPEC.md Functionality #34; src/settings.rs Settings::queue_send_messages, SCAFFOLD_LAYOUT, scalar_fields, parse; src/client/tui/settings_popup.rs SettingsField::QueueSendMessages; tests queue_send_messages_defaults_on_and_is_always_written, queue_send_messages_round_trips_off, the_first_run_scaffold_is_written_exactly_like_this (settings_test.rs), the_queue_switch_is_the_last_field_on_the_general_tab_and_defaults_on (ui_settings_popup_test.rs); scenario features/messaging/queued_sends.feature"
+
+[[user_story.acceptance_criteria]]
+id = "AC-411"
+description = "Every field on the settings popup takes effect when it is changed, not at the next start: the sound switches and voice_autoplay are mirrored onto the session and the UI, the two log switches are read per message anyway, the direct-punch scheduler is reconfigured, the No-IP updater is rebuilt and started or stopped to match, the otp binary is re-resolved, queue_send_messages switches the transport's hand-off with it, and global_ptt_enabled is answered per hotkey event rather than by the registration. The one documented exception, stated in the field's own description on screen: turning global_ptt_enabled back on in a run that started with it off has no OS-level shortcut to re-enable, because none was registered - the grab has to happen on a specific thread on every supported platform, before the runtime starts."
+evidence = "docs/SPEC.md Functionality #23; src/client/session.rs save_settings_draft, SessionState::resync_noip/resync_otp_binary/set_sound_switches/set_queue_send_messages; src/client/global_ptt.rs set_enabled/enabled/set_shortcut (see docs/TESTING.md 'Known coverage gaps' for why the live-apply half needs a live session and isn't directly tested); tests space_flips_the_focused_toggle_and_asks_for_a_save, applying_a_draft_writes_every_field_it_owns (ui_settings_popup_test.rs), nothing_is_queued_while_the_setting_is_off (session_paths_test.rs); scenario features/settings/settings_popup.feature"
+
+
+[[user_story]]
+id = "US-064"
+title = "Say something to someone who is not there"
+as_a = "user talking to one person who is offline as often as not"
+i_want = "what I send them held until they are reachable, and delivered in the order I sent it"
+so_that = "a walkie-talkie to one other person works without both of us being online at the same moment"
+
+[[user_story.acceptance_criteria]]
+id = "AC-408"
+description = "Text (either layering) and voice are held for an unreachable peer; files are not. A file transfer is a live, consent-gated, chunked conversation with the receiver (docs/PROTOCOL.md 9) - an offer they must accept before a single chunk is sent - so replaying half of one an hour later is not a delivery and it fails the way it always did. Neither is anything that states something about right now: receipts, acks, pad-provisioning chunks and call control are all let go rather than delivered as a lie later."
+evidence = "docs/SPEC.md Functionality #34; src/client/outbox.rs is_queueable; tests text_and_voice_are_queueable_and_files_are_not, a_receipt_is_never_queued (outbox_test.rs), a_file_payload_is_never_queued (session_paths_test.rs); scenario features/messaging/queued_sends.feature"
+
+[[user_story.acceptance_criteria]]
+id = "AC-409"
+description = "The queue is per peer, keyed by nickname (a UserId is per connection and never survives the reconnect this outlives, docs/PROTOCOL.md 3), strictly ordered, and survives the process that wrote it: entries written by one run are read back by the next, byte for byte and in order. A message is always appended to the *end* of what is already waiting - including one written by a later run onto the same file - because that is the order the receiver's pad expects (docs/PROTOCOL.md 16.4); nothing is ever inserted ahead of what is queued, aged out, or evicted to make room. Taking a peer's queue empties it on disk too, since a copy left behind would be sent twice; one peer's queue is independent of another's; a nickname that could not round-trip through a filename is refused; and a half-written final line costs that one entry rather than the file, which is the reason the format is one line per entry."
+evidence = "docs/SPEC.md Functionality #34; src/client/outbox.rs Outbox::load/queue/take/clear, entry_line, parse_entries; tests entries_come_back_in_the_order_they_were_written, what_was_queued_is_still_there_after_a_restart, taking_a_peers_queue_empties_it_on_disk_too, taking_an_empty_queue_is_not_an_error, nothing_is_dropped_for_age_or_for_room, a_new_message_joins_the_back_of_an_existing_queue, one_peers_queue_is_independent_of_anothers, a_nickname_that_is_not_storable_is_refused, a_truncated_file_loses_one_entry_and_keeps_the_rest (outbox_test.rs); scenarios features/messaging/queued_sends.feature"
+
+[[user_story.acceptance_criteria]]
+id = "AC-410"
+description = "What is queued is the already-sealed payload, byte for byte, so a held message keeps the layering it was sent under - pq_hybrid, or the one-time pad if an OTP session was open with that peer when it was written. It is never re-sealed on the way out, which is what keeps plaintext off the disk, and a voice message's chunks are sealed before they reach the transport for the same reason. The transport hands over what it could not send (P2pEvent::Undeliverable) and keeps no second copy, so nothing is delivered twice; with the setting off it keeps its own short in-memory queue instead, exactly as before. A peer this client holds no nickname for is not queued against at all."
+evidence = "docs/SPEC.md Functionality #34; docs/PROTOCOL.md 7.1.1, 16.4; src/client/p2p.rs PeerLinkManager::set_spill_undeliverable/send_reliable_or_queue/send_unreliable_voice, P2pEvent::Undeliverable; src/client/session.rs queue_undeliverable, flush_outbox; tests a_message_to_an_unreachable_peer_is_queued_rather_than_lost, nothing_is_queued_while_the_setting_is_off, messages_queue_in_the_order_they_were_sent, a_voice_chunk_for_an_unreachable_peer_is_queued_too, an_unnamed_peer_is_not_queued_against (session_paths_test.rs); scenario features/messaging/queued_sends.feature"
+
+
+[[user_story.acceptance_criteria]]
+id = "AC-412"
+description = "A leg of a message that is waiting on disk for its recipient reads QUEUED in that row's details popup ('i'), in the same partway-there colour a channel send wears while only some of its recipients have it - a stronger claim than UNDELIVERED, which says only that nothing has come back yet. It reverts to UNDELIVERED the moment that queue is flushed and the leg is genuinely on the wire again, and says nothing at all once the recipient has it: DELIVERED and what it grew into always win. A voice message's row is marked from its StreamStart, the one part of it that names a msg_id; the chunks that follow are queued behind it."
+evidence = "docs/SPEC.md Functionality #34; src/client/tui/ui.rs QUEUED_LABEL, recipient_label, UiState::mark_queued; src/client/tui/log_entry.rs DeliveryRecipient::queued; src/client/session.rs queue_undeliverable/flush_outbox/message_row_of; tests a_queued_leg_reads_queued_in_the_details_popup, the_details_popup_shows_queued_beside_the_recipient (ui_test.rs); scenario features/messaging/queued_sends.feature"
+
+
+[[user_story.acceptance_criteria]]
+id = "AC-413"
+description = "The one and only thing that ever removes a queued message is this machine no longer holding key material for the contact it was sealed for. While that contact is still pinned here (IdStore::devices_of naming any device under the nickname - which covers a pq_hybrid pin and a pad-only peer's bare pin alike), everything queued for them is kept however long it has waited: age is not a reason, and neither is a newer message needing room. Once they are gone - deleted from /contacts, which takes every device's pin and each one's OTP keychain entries with it - nothing queued for them could be delivered or read back, so it is dropped and their queue file with it. Swept once at session start and every SWEEP_INTERVAL after it."
+evidence = "docs/SPEC.md Functionality #34; src/client/outbox.rs Outbox::retain_contacts, SWEEP_INTERVAL; src/client/session.rs sweep_outbox (called from run_connected_session's start and its ticker); tests a_sweep_drops_only_the_contacts_whose_keys_are_gone, a_sweep_removes_nothing_while_every_key_is_still_here, nothing_is_dropped_for_age_or_for_room (outbox_test.rs), the_sweep_drops_a_deleted_contacts_queue_and_keeps_a_pinned_ones (session_paths_test.rs); scenarios features/messaging/queued_sends.feature"
+
+[[user_story.acceptance_criteria]]
+id = "AC-414"
+description = "Once anything is queued for a peer, everything sent to them afterwards joins the back of that queue rather than going out ahead of it - including after their link is `Active` again, right up until the queue is actually drained. A message that overtook the queue would arrive before ones sealed earlier, which for a pad-wrapped run is not a reordering but a break: the receiver's pad expects exactly the sequence it was given. The transport is told which peers are in that state (PeerLinkManager::set_queue_held) and the session keeps it in step, clearing it before a drain sends so the drained content reaches the wire rather than falling back into the queue it came from. With queue_send_messages off none of this applies: a send goes straight at the transport, whose own in-memory queue keeps its order the same way."
+evidence = "docs/PROTOCOL.md 7.1.1, 16.4; src/client/p2p.rs PeerLinkManager::queue_held/set_queue_held, send_reliable_or_queue, send_unreliable_voice; src/client/session.rs queue_undeliverable, flush_outbox; test a_later_send_never_overtakes_what_is_already_queued (session_paths_test.rs); scenarios features/messaging/queued_sends.feature"
+
+
+[[user_story]]
+id = "US-065"
+title = "Mute my own microphone on a call without hunting for it"
+as_a = "user on a call when someone walks into the room"
+i_want = "one shortcut that mutes me from wherever I am in the app"
+so_that = "I do not have to open the call modal and find my own row first"
+
+[[user_story.acceptance_criteria]]
+id = "AC-407"
+description = "Control+M mutes and unmutes this client's own microphone while on a call, from anywhere in the app - no call modal open, no row selected - producing the same ToggleCallMute the modal's own 'm' on our own row does, so the roster is told either way. It is an ordinary key of this app's, handled in UiState::handle_key like every other, and deliberately not an OS-level shortcut: it is never registered with the window system, so it does nothing while another window has focus. The global push-to-talk combo (US-022) remains the only thing this app registers globally. It does nothing at all when not on a call: there is no microphone to mute. It only reaches the app on a terminal that can tell Ctrl+M apart from Enter (both are 0x0D otherwise), which is why tui::terminal::setup asks for DISAMBIGUATE_ESCAPE_CODES alongside the release reporting, and why 'm' on the roster stays as the way that always works."
+evidence = "docs/SPEC.md Functionality #14; src/client/tui/input.rs handle_key's Ctrl+M arm; src/client/tui/terminal.rs setup (KeyboardEnhancementFlags); src/client/voice_call.rs toggle_own_mute; tests ctrl_m_mutes_our_own_microphone_from_anywhere_on_a_call, ctrl_m_does_nothing_when_not_on_a_call (ui_test.rs); scenario features/voice/live_call.feature"

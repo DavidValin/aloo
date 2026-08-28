@@ -367,6 +367,57 @@ fn an_empty_shortcut_value_is_ignored_in_favor_of_the_default() {
     std::fs::remove_file(&path).ok();
 }
 
+// ---------------------------------------------------------------------
+// The three sound switches (`docs/SPEC.md` "Settings"): all on out of the
+// box, since each one silences something a user asked for by using the
+// feature it belongs to.
+// ---------------------------------------------------------------------
+
+/// @requirement AC-402
+#[test]
+fn the_three_sound_switches_default_on_and_are_always_written() {
+    let path = temp_settings_path();
+    let settings = Settings::load_or_create(&path).unwrap();
+    assert!(settings.voice_autoplay);
+    assert!(settings.roger_beep);
+    assert!(settings.sound_notifications);
+    let contents = std::fs::read_to_string(&path).unwrap();
+    for line in ["voice_autoplay=on", "roger_beep=on", "sound_notifications=on"] {
+        assert!(contents.contains(line), "missing {line:?} in:\n{contents}");
+    }
+    std::fs::remove_file(&path).ok();
+}
+
+/// @requirement AC-402
+#[test]
+fn the_three_sound_switches_round_trip_off() {
+    let path = temp_settings_path();
+    let saved = Settings {
+        voice_autoplay: false,
+        roger_beep: false,
+        sound_notifications: false,
+        ..Settings::default()
+    };
+    saved.save(&path).unwrap();
+    let loaded = Settings::load_or_create(&path).unwrap();
+    assert_eq!(loaded, saved);
+    std::fs::remove_file(&path).ok();
+}
+
+/// Each one is its own switch: turning one off says nothing about the
+/// other two, which is the whole reason there are three of them.
+/// @requirement AC-402
+#[test]
+fn each_sound_switch_is_read_independently() {
+    let path = temp_settings_path();
+    std::fs::write(&path, "roger_beep=off\n").unwrap();
+    let loaded = Settings::load_or_create(&path).unwrap();
+    assert!(!loaded.roger_beep);
+    assert!(loaded.voice_autoplay, "the other two keep their defaults");
+    assert!(loaded.sound_notifications);
+    std::fs::remove_file(&path).ok();
+}
+
 /// @requirement AC-355
 #[test]
 fn autosave_messages_defaults_off_and_is_always_written() {
@@ -390,6 +441,35 @@ fn autosave_messages_round_trips_on() {
     let loaded = Settings::load_or_create(&path).unwrap();
     assert_eq!(loaded, saved);
     assert!(loaded.autosave_messages);
+    std::fs::remove_file(&path).ok();
+}
+
+/// @requirement AC-406
+#[test]
+fn queue_send_messages_defaults_on_and_is_always_written() {
+    let path = temp_settings_path();
+    let settings = Settings::load_or_create(&path).unwrap();
+    assert!(settings.queue_send_messages);
+    let contents = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        contents.contains("queue_send_messages=on"),
+        "the first-run scaffold must name it: {contents}"
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// @requirement AC-406
+#[test]
+fn queue_send_messages_round_trips_off() {
+    let path = temp_settings_path();
+    let saved = Settings {
+        queue_send_messages: false,
+        ..Settings::default()
+    };
+    saved.save(&path).unwrap();
+    let loaded = Settings::load_or_create(&path).unwrap();
+    assert_eq!(loaded, saved);
+    assert!(!loaded.queue_send_messages);
     std::fs::remove_file(&path).ok();
 }
 
@@ -530,8 +610,12 @@ global_ptt_enabled=true\n\
 global_ptt_shortcut=ctrl+alt+p\n\
 # voice_echo_ducking: auto (decide from the audio), on, off\n\
 voice_echo_ducking=auto\n\
+voice_autoplay=on\n\
+roger_beep=on\n\
+sound_notifications=on\n\
 autosave_messages=off\n\
 resume_from_log=off\n\
+queue_send_messages=on\n\
 daemon_host=\n\
 daemon_port=\n\
 daemon_nickname=\n\

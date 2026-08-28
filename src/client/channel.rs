@@ -289,7 +289,14 @@ pub(crate) async fn handle_voice_record_start(
         if !session.remote_keys.try_use(id) {
             continue;
         }
-        if session.peer_link.ensure_link(wr, id).await == LinkReadiness::Active {
+        // ...unless there is a durable queue to hold it for them
+        // (`queue_send_messages`): then they stay in the stream, their
+        // chunks are sealed for them like everyone else's, and those
+        // chunks wait on disk until their link opens
+        // (`client::outbox`).
+        if session.peer_link.ensure_link(wr, id).await == LinkReadiness::Active
+            || session.outbox.is_some()
+        {
             ready.push((id, der));
         }
     }
@@ -481,7 +488,14 @@ pub fn on_message(
         Some(&channel),
         session,
     ) {
+        // `docs/SPEC.md` Functionality #4: being named is the one thing
+        // an arriving text message can be worth hearing about, so it is
+        // checked before the body is handed over and consumed.
+        let mentions_me = ui_state.message_mentions_me(&body);
         ui_state.on_channel_message(&channel, from, from_name, body);
+        if mentions_me {
+            crate::client::voice_stream::play_ping_chime(session);
+        }
         crate::client::session::send_delivery_receipt(
             session,
             from,

@@ -122,7 +122,7 @@ impl Side {
     /// the link was never punched.
     fn queued(&mut self) -> Vec<P2pPayload> {
         let peer = self.peer;
-        self.session.peer_link_mut().pending_payloads(peer)
+        self.session.sent_or_queued_payloads(peer)
     }
 
     /// This side's one outgoing row's delivery state - what the `->` arrow
@@ -146,7 +146,7 @@ impl Side {
             .is_some()
     }
 
-    /// How many pad-wrapped sends have genuinely left. `pending_payloads`
+    /// How many pad-wrapped sends have genuinely left. `Side::queued`
     /// reads rather than drains, so counting is what says whether anything
     /// *more* went out.
     fn envelopes_sent(&mut self) -> usize {
@@ -3512,7 +3512,7 @@ fn otp_out_queue_never_double_queues_the_same_streams_content() {
 
 /// Pulls the *second* queued envelope for this contact - the one whose
 /// `seq` isn't `first_seq`. `Side::queued`'s own doc explains why this is
-/// necessary: `pending_payloads` reads rather than drains, so a second
+/// necessary: `Side::queued` reads rather than drains, so a second
 /// `take_envelope` call would just find the first envelope again.
 fn take_second_envelope(side: &mut Side, first_seq: u64) -> (u64, Option<u64>, Envelope, String) {
     side.queued()

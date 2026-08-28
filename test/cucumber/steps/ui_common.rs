@@ -49,6 +49,12 @@ fn key_mode_named(mode: &str) -> KeyMode {
 #[given("I am connected and viewing a channel")]
 async fn connected_viewing(w: &mut AlooWorld) {
     let mut state = UiState::new("me".into());
+    // A scenario may have named the durable queue's switch before there
+    // was a UI to put it on (`features/messaging/queued_sends.feature`),
+    // the same way a real session seeds it from the settings file.
+    if let Some(queueing) = w.queueing_on {
+        state.queue_send_messages = queueing;
+    }
     state.set_own_id(UserId(1));
     state.on_channel_list(vec![ChannelInfo {
         name: "general".into(),
@@ -267,6 +273,9 @@ async fn press_named(w: &mut AlooWorld, key: String) {
         "Enter" => (KeyCode::Enter, KeyModifiers::NONE),
         "Escape" | "Esc" => (KeyCode::Esc, KeyModifiers::NONE),
         "Tab" => (KeyCode::Tab, KeyModifiers::NONE),
+        // Spelled out rather than left to `press_char` below, which would
+        // read "space" as the letter s.
+        "Space" | "space" => (KeyCode::Char(' '), KeyModifiers::NONE),
         "Backspace" => (KeyCode::Backspace, KeyModifiers::NONE),
         "Up" => (KeyCode::Up, KeyModifiers::NONE),
         "Down" => (KeyCode::Down, KeyModifiers::NONE),
@@ -283,6 +292,10 @@ async fn press_named(w: &mut AlooWorld, key: String) {
         "Ctrl+R" => (KeyCode::Char('r'), KeyModifiers::CONTROL),
         "Ctrl+S" => (KeyCode::Char('s'), KeyModifiers::CONTROL),
         "Ctrl+E" => (KeyCode::Char('e'), KeyModifiers::CONTROL),
+        // Only ever reaches a real terminal that disambiguates it from
+        // Enter (`tui::terminal::setup`); a scenario drives `handle_key`
+        // directly, so it always arrives here as itself.
+        "Ctrl+M" => (KeyCode::Char('m'), KeyModifiers::CONTROL),
         other => panic!("unknown key {other:?}"),
     };
     press_key(w, code, mods);

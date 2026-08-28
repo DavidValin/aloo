@@ -54,6 +54,23 @@ Feature: Live voice calls
     And I press the m key
     Then muting is requested
 
+  # An ordinary key of this app's, not an OS-wide shortcut - the global
+  # push-to-talk combo is the only thing aloo registers with the window
+  # system (features/voice/global_push_to_talk.feature).
+  @AC-407
+  Scenario: Control+M mutes my microphone from wherever I am in the app
+    Given I am connected and viewing a channel
+    When I open a call in the channel
+    And I move focus to the compose
+    And I press Ctrl+M
+    Then muting is requested
+
+  @AC-407
+  Scenario: Control+M does nothing when I am not on a call
+    Given I am connected and viewing a channel
+    When I press Ctrl+M
+    Then nothing happens
+
   @AC-188
   Scenario: Accepting an invite to a call that has already ended joins nothing
     Given I am connected and viewing a channel

@@ -239,6 +239,39 @@ pub struct AlooWorld {
     // -- serverless direct punch (US-037) ------------------------------
     /// The settings file a scenario just loaded.
     pub direct_settings: Option<Settings>,
+
+    // -- the durable send queue (US-064) --------------------------------
+    /// Where this scenario's `client::outbox` lives - its own directory,
+    /// so scenarios running concurrently never share a queue.
+    pub outbox_dir: Option<std::path::PathBuf>,
+    /// What the last "queue N messages" step actually wrote, so a later
+    /// step can compare what came back out against it byte for byte.
+    pub queued_payloads: Vec<aloo::client::outbox::OutboxItem>,
+    /// What the last `take` handed back.
+    pub taken_entries: Vec<aloo::client::outbox::OutboxEntry>,
+    /// The `msg_id` of the message a scenario is holding for someone, so
+    /// a later step can release it again.
+    pub held_msg_id: Option<u64>,
+    /// Whether this scenario has `queue_send_messages` on - the switch
+    /// every queued-send scenario opens by naming, since with it off
+    /// there is no queue at all and a send goes straight at the
+    /// transport.
+    ///
+    /// `None` when a scenario never names it, which is every scenario
+    /// that predates the setting: those keep the app's own default rather
+    /// than being silently switched by a field they say nothing about.
+    pub queueing_on: Option<bool>,
+    /// A real, unpunched `SessionState` for the scenarios that drive a
+    /// send through the transport rather than through the store - built
+    /// lazily, since generating its identity is the expensive part.
+    pub queue_session: Option<(aloo::client::session::SessionState, aloo::client::tui::ui::UiState)>,
+    /// Which nicknames this scenario says are still contacts on this
+    /// machine, for `sweep_outbox`'s own question.
+    pub still_contacts: std::collections::HashSet<String>,
+    /// How many payloads this scenario has sent through the transport,
+    /// so each one is distinguishable and an ordering assertion can name
+    /// them.
+    pub sent_payload_count: usize,
     /// The stand-in rendezvous socket every direct-punch client binds
     /// against, spawned once per scenario that needs one.
     pub direct_rendezvous: Option<SocketAddr>,

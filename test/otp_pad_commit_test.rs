@@ -124,8 +124,8 @@ async fn a_failed_install_keeps_the_staged_pad_and_sends_no_ack() {
         "a failed install must never mark the session live"
     );
     let acks = session
-        .peer_link_mut()
-        .pending_payloads(PEER)
+        
+        .sent_or_queued_payloads(PEER)
         .into_iter()
         .filter(|p| matches!(p, P2pPayload::OtpPadCommitAck { .. }))
         .count();
@@ -188,8 +188,8 @@ async fn a_retried_commit_after_the_binary_recovers_installs_for_real() {
         "a successful install must mark the session live"
     );
     let acks = session
-        .peer_link_mut()
-        .pending_payloads(PEER)
+        
+        .sent_or_queued_payloads(PEER)
         .into_iter()
         .filter(|p| matches!(p, P2pPayload::OtpPadCommitAck { .. }))
         .count();

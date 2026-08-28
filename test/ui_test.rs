@@ -13,8 +13,9 @@ use aloo::client::tui::ui::{
     KEY_FILE_LABEL,
     KEY_LABEL, KEY_OFFSET_LABEL, KEY_PER_RECIPIENT, KEY_SEQ_LABEL, MessageBody, Mode,
     NO_CRYPTO_INFO, NO_DELIVERY_INFO, NO_ONE_INVITED_NOTICE, PendingFileOffer,
-    OTP_CALL_REFUSAL, PendingCallInvite, RECEIVED_AT_LABEL, RECORD_HOLD_TIMEOUT, SENT_AT_LABEL,
-    UNDELIVERED_LABEL, UiAction, UiState, render,
+    OTP_CALL_REFUSAL, PendingCallInvite, QUEUED_LABEL, RECEIVED_AT_LABEL, RECORD_HOLD_TIMEOUT,
+    SENT_AT_LABEL, UNDELIVERED_LABEL, UiAction, UiState, VOICE_MUTED_MARKER,
+    recipient_label, render,
 };
 use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::Terminal;
@@ -2056,6 +2057,36 @@ fn m_on_our_own_row_toggles_our_own_microphone() {
     );
 }
 
+/// `Ctrl+M` does the same thing from wherever the cursor is in the app -
+/// the point being that it does not need the call modal open, or our own
+/// row selected, which is exactly the state you are in when someone
+/// starts talking about you. An ordinary key of this app's, not an
+/// OS-level shortcut: it is read off the terminal like every other, so
+/// it is only ever seen while aloo has focus.
+/// @requirement AC-407
+#[test]
+fn ctrl_m_mutes_our_own_microphone_from_anywhere_on_a_call() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.begin_call(1, Some("general".into()), UserId(1));
+    state.on_call_participant_joined(UserId(2), "bob".into());
+    // Not on the roster, not even on the call modal - the compose bar.
+    state.focus = Focus::Input;
+    assert_eq!(
+        ctrl(&mut state, KeyCode::Char('m')),
+        Some(UiAction::ToggleCallMute)
+    );
+}
+
+/// There is no microphone to mute when there is no call, so it does
+/// nothing rather than half-answering.
+/// @requirement AC-407
+#[test]
+fn ctrl_m_does_nothing_when_not_on_a_call() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    assert_eq!(ctrl(&mut state, KeyCode::Char('m')), None);
+    assert!(state.call.is_none());
+}
+
 /// @requirement AC-171
 #[test]
 fn slash_endcall_is_refused_off_a_call_and_works_on_one() {
@@ -2931,6 +2962,71 @@ fn the_mute_commands_are_not_swallowed_as_unknown_commands() {
     assert_eq!(press(&mut state, KeyCode::Enter), None);
     let (notice, _) = state.status_notice.clone().unwrap();
     assert!(notice.contains("unknown command"), "{notice}");
+}
+
+/// `voice_autoplay=off` is the blanket version of `/mute-voice`: nobody's
+/// arriving audio reaches the mixer, whoever they are and whatever
+/// layering carried it. It funnels through the same one predicate, so a
+/// call site can never honour the mute list and forget this.
+/// @requirement AC-402
+#[test]
+fn voice_autoplay_off_suppresses_playback_from_everyone() {
+    let mut state = joined_general_with(vec![user(2, "bob"), user(3, "carol")]);
+    assert!(!state.suppress_playback_from(UserId(2)));
+
+    state.voice_autoplay = false;
+    assert!(state.suppress_playback_from(UserId(2)));
+    assert!(state.suppress_playback_from(UserId(3)), "and everyone else");
+
+    state.voice_autoplay = true;
+    assert!(!state.suppress_playback_from(UserId(2)), "and back on again");
+}
+
+// ---------------------------------------------------------------------
+// Being named with an `@` (docs/SPEC.md Functionality #4)
+// ---------------------------------------------------------------------
+
+/// @requirement AC-403
+#[test]
+fn a_text_message_naming_you_is_a_mention() {
+    let state = joined_general_with(vec![]);
+    assert!(state.message_mentions_me(&MessageBody::Text("@me are you there?".into())));
+    assert!(state.message_mentions_me(&MessageBody::Text("hey @me".into())));
+    assert!(state.message_mentions_me(&MessageBody::Text("well, @me, no".into())));
+    assert!(!state.message_mentions_me(&MessageBody::Text("nobody in particular".into())));
+    assert!(!state.message_mentions_me(&MessageBody::Text("me without the at".into())));
+}
+
+/// A mention is a whole word at both ends: an address is not a mention,
+/// and a longer nickname that merely starts with yours is someone else.
+/// @requirement AC-403
+#[test]
+fn a_mention_is_bounded_at_both_ends() {
+    let state = joined_general_with(vec![]);
+    assert!(!state.message_mentions_me(&MessageBody::Text("write to bob@me.example".into())));
+    assert!(!state.message_mentions_me(&MessageBody::Text("@meredith said so".into())));
+    assert!(!state.message_mentions_me(&MessageBody::Text("@me-too is someone else".into())));
+    assert!(state.message_mentions_me(&MessageBody::Text("(@me)".into())));
+}
+
+/// The server tells `me` and `Me` apart, so this must too - a case-folded
+/// match would sound one person's ping for another person's message.
+/// @requirement AC-403
+#[test]
+fn a_mention_is_case_sensitive_because_nicknames_are() {
+    let state = joined_general_with(vec![]);
+    assert!(!state.message_mentions_me(&MessageBody::Text("@Me hello".into())));
+    assert!(!state.message_mentions_me(&MessageBody::Text("@ME hello".into())));
+}
+
+/// Only a text body can name anyone - a voice or file row carries no
+/// words to be named in.
+/// @requirement AC-403
+#[test]
+fn a_voice_row_is_never_a_mention() {
+    let state = joined_general_with(vec![]);
+    assert!(!state.message_mentions_me(&MessageBody::Voice { duration_ms: 100, pcm: Vec::new() }));
+    assert!(!state.message_mentions_me(&MessageBody::VoiceStreaming { stream_id: 1 }));
 }
 
 /// @requirement AC-196
@@ -4492,3 +4588,154 @@ fn entering_on_a_voice_on_disk_row_with_no_wav_shows_a_status_notice_and_does_no
         state.status_notice
     );
 }
+
+// ---------------------------------------------------------------------
+// A leg held on disk reads QUEUED, not UNDELIVERED (US-064)
+// ---------------------------------------------------------------------
+
+/// `i` on a message being held for someone unreachable says so - a
+/// stronger claim than UNDELIVERED, which says only that nothing has come
+/// back yet.
+/// @requirement AC-412
+#[test]
+fn a_queued_leg_reads_queued_in_the_details_popup() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    let (msg_id, delivery) = state.start_delivery(&[UserId(2)]);
+    state.channels[0].log.push(LogEntry {
+        from: UserId(1),
+        from_name: "me".into(),
+        body: MessageBody::Text("waiting for you".into()),
+        outgoing: true,
+        failed: false,
+        sent_at: "2026-08-28T12:00:00Z".into(),
+        sent_at_utc: "2026-08-28T12:00:00Z".into(),
+        owed_receipt: None,
+        listened: true,
+        delivery: Some(delivery),
+        crypto: None,
+    });
+
+    let label_now = |state: &UiState| {
+        let entry = &state.channels[0].log[0];
+        let delivery = entry.delivery.as_ref().unwrap();
+        recipient_label(&delivery.recipients[0], &entry.body).0
+    };
+    assert_eq!(label_now(&state), UNDELIVERED_LABEL, "nothing has happened yet");
+
+    state.mark_queued(UserId(2), msg_id, true);
+    assert_eq!(label_now(&state), QUEUED_LABEL, "held for them, not merely unacknowledged");
+
+    // Flushed back onto the wire: waiting again, not still queued.
+    state.mark_queued(UserId(2), msg_id, false);
+    assert_eq!(label_now(&state), UNDELIVERED_LABEL);
+
+    // And once they genuinely have it, how it got there is not what the
+    // popup is reporting.
+    state.mark_queued(UserId(2), msg_id, true);
+    state.mark_delivered(
+        UserId(2),
+        msg_id,
+        aloo::p2p_proto::ReceiptStage::Decrypted,
+        DeliveryProof::Receipt,
+    );
+    assert_eq!(label_now(&state), DELIVERED_LABEL);
+}
+
+/// The popup draws it, not just the label function.
+/// @requirement AC-412
+#[test]
+fn the_details_popup_shows_queued_beside_the_recipient() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    let (msg_id, delivery) = state.start_delivery(&[UserId(2)]);
+    state.channels[0].log.push(LogEntry {
+        from: UserId(1),
+        from_name: "me".into(),
+        body: MessageBody::Text("waiting for you".into()),
+        outgoing: true,
+        failed: false,
+        sent_at: "2026-08-28T12:00:00Z".into(),
+        sent_at_utc: "2026-08-28T12:00:00Z".into(),
+        owed_receipt: None,
+        listened: true,
+        delivery: Some(delivery),
+        crypto: None,
+    });
+    state.mark_queued(UserId(2), msg_id, true);
+    state.select_channel_at(0);
+    state.focus = Focus::Messages;
+    state.message_selected = 0;
+    press(&mut state, KeyCode::Char('i'));
+
+    let rows = rendered_rows(&state);
+    assert!(
+        rows.iter().any(|r| r.contains("bob") && r.contains(QUEUED_LABEL)),
+        "expected bob's line to read {QUEUED_LABEL}: {rows:?}"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Where a mute is reported: one person vs everyone (US-062)
+// ---------------------------------------------------------------------
+
+/// `voice_autoplay=off` silences everyone, which is otherwise invisible -
+/// messages still arrive and still log, they just never play. The header
+/// says so once.
+/// @requirement AC-415
+#[test]
+fn the_header_reports_voice_autoplay_being_off() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    let header_has_marker = |state: &UiState| {
+        rendered_rows(state)
+            .iter()
+            .take(3)
+            .any(|r| r.contains(VOICE_MUTED_MARKER))
+    };
+    assert!(!header_has_marker(&state), "nothing to say while it is on");
+
+    state.voice_autoplay = false;
+    assert!(header_has_marker(&state), "the header carries the blanket state");
+    assert!(
+        rendered_rows(&state).iter().any(|r| r.contains("playback off")),
+        "and names it, rather than leaving a bare glyph to be guessed at"
+    );
+    // Red, like every other "something is switched off that you would
+    // normally expect on" state this header reports.
+    let buffer = buffer_at(&state, 100, 30);
+    let (x, y) = find_text_start(&buffer, "playback off");
+    assert_eq!(buffer[(x, y)].style().fg, Some(ratatui::style::Color::Red));
+
+    state.voice_autoplay = true;
+    assert!(!header_has_marker(&state));
+}
+
+/// The sidebar's own marker is the *per-person* mute and nothing else.
+/// With autoplay off it would single someone out for something true of
+/// everyone, so it steps aside and lets the header speak.
+/// @requirement AC-415
+#[test]
+fn the_sidebar_marks_one_muted_person_only_while_autoplay_is_on() {
+    let mut state = joined_general_with(vec![user(2, "bob"), user(3, "carol")]);
+    state.set_muted_voice(["bob".to_string()].into_iter().collect());
+
+    let sidebar_marks = |state: &UiState| {
+        rendered_rows(state)
+            .iter()
+            .any(|r| r.contains("bob") && r.contains(VOICE_MUTED_MARKER))
+    };
+    assert!(sidebar_marks(&state), "bob alone is muted, and is marked");
+
+    state.voice_autoplay = false;
+    assert!(
+        !sidebar_marks(&state),
+        "with nobody's voice playing, marking bob would claim something about him \
+         that is true of carol too"
+    );
+    assert!(
+        state.is_voice_muted(UserId(2)),
+        "the mute itself is untouched - it simply is not what the sidebar is reporting"
+    );
+
+    state.voice_autoplay = true;
+    assert!(sidebar_marks(&state), "and it comes back with autoplay");
+}
+

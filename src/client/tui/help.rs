@@ -116,7 +116,10 @@ pub(crate) const HELP_BODY: &[HelpLine] = &[
         text: "message details: when it was sent, how it was encrypted (the scheme, and a \
                short id of the key it was sealed to - or, under /otp, that message's own \
                pad sequence, offset and key file), and every user it went to with their \
-               own DELIVERED / UNDELIVERED state (log focused). i or Esc closes it again.",
+               own DELIVERED / UNDELIVERED state (log focused). QUEUED there means it is \
+               being held on disk until that person is reachable again, rather than \
+               merely unacknowledged (queue_send_messages, Ctrl+S). i or Esc closes it \
+               again.",
     },
     HelpLine::Item {
         keys: "->",
@@ -127,6 +130,21 @@ pub(crate) const HELP_BODY: &[HelpLine] = &[
                arrived decrypted on their side. A message that reached nobody is struck \
                through. Messages from other people keep a plain `name: message`.",
     },
+    HelpLine::Item {
+        keys: "@nickname",
+        text: "writing @<someone's nickname> in a channel or a DM makes their client play \
+               a sound as it lands, so they notice a message meant for them without \
+               watching every channel. It has to be their whole nickname - bob@host is an \
+               address, and @bobby is not @bob - and it is case-sensitive, since the \
+               server tells bob and Bob apart. Silence it with sound_notifications \
+               (Ctrl+S, General).",
+    },
+    HelpLine::Note(
+        "Someone unreachable does not cost you the message: it is held on disk and sent \
+         the moment they are back, in the order you wrote it, surviving a restart of aloo \
+         (queue_send_messages, on by default - press i on the row to see QUEUED). Text and \
+         voice only; a file transfer needs them there to accept it.",
+    ),
     HelpLine::Blank,
     HelpLine::Heading("Private messages"),
     HelpLine::Item {
@@ -169,7 +187,9 @@ pub(crate) const HELP_BODY: &[HelpLine] = &[
     },
     HelpLine::Item {
         keys: "Ctrl+Alt+P",
-        text: "same, from anywhere - edit/disable in ~/.aloo/settings",
+        text: "same, from anywhere - this one really is OS-wide, working while another \
+               window has focus. Change the combo or turn it off under Ctrl+S (General), \
+               or in ~/.aloo/settings.",
     },
     HelpLine::Item {
         keys: "Enter",
@@ -187,11 +207,24 @@ pub(crate) const HELP_BODY: &[HelpLine] = &[
         keys: "/mute-voice <nickname>",
         text: "stop their voice messages playing themselves on arrival - they still arrive \
                and still show in the log, so Enter replays them; muted users are marked \
-               \u{1F507} in the sidebar. Kept in ~/.aloo/settings. Never affects a call.",
+               \u{1F507} in the sidebar. Kept in ~/.aloo/settings. Never affects a call. \
+               voice_autoplay (Ctrl+S, General) is the blanket version of this: with it \
+               off nobody's voice plays itself, so a per-person mute only decides \
+               anything while it is on.",
     },
     HelpLine::Item {
         keys: "/unmute-voice <nickname>",
         text: "undo it; either, with no nickname, lists who is currently muted.",
+    },
+    HelpLine::Item {
+        keys: "\u{1F507}",
+        text: "beside a name in the sidebar, that one person's voice is muted. On its own \
+               in the header, red, followed by 'playback off': voice_autoplay is off \
+               (Ctrl+S, General) and *nobody's* voice is playing - messages still arrive \
+               and still log, Enter still replays them. Only one of the two ever shows: \
+               with playback off there is no point singling anyone out, so the sidebar \
+               marks nobody and the header speaks instead. Your mute list is untouched \
+               either way and applies again the moment playback comes back.",
     },
     HelpLine::Blank,
     HelpLine::Heading("File transfer"),
@@ -449,21 +482,46 @@ pub(crate) const HELP_BODY: &[HelpLine] = &[
     HelpLine::Blank,
     HelpLine::Item {
         keys: "Ctrl+S",
-        text: "reach someone with no server involved: opens the \"Direct Punches\" popup - \
-               'a' adds a target with their nickname, and where their client is (an IPv4/ \
-               IPv6 address or hostname, optionally :port), and how often to try - \
-               every_1m, every_5m, ... every_55m or every_1h. Every schedule restarts at \
+        text: "settings, in three tabs (Tab switches, \u{2191}/\u{2193} pick a field, Space \
+               flips a switch, typing fills a box, Esc closes). Every change is saved to \
+               ~/.aloo/settings the moment you make it - there is no Save button, and a \
+               gray line under each tab says what every field does, including whether it \
+               takes effect now or on the next start. General: whether push-to-talk works \
+               while another window has focus and with which shortcut, whether arriving \
+               voice messages play themselves, whether the end-of-message tone sounds, \
+               whether event sounds do, whether messages are written to (and read back \
+               from) ~/.aloo/exports, and whether a message for someone unreachable is \
+               held on disk until they are back (queue_send_messages, on by default - \
+               text and voice, in the order you sent them; files are not queued). OTP: \
+               the low-key warning threshold \
+               and which otp binary to run. Direct Punch: reach someone with no server \
+               involved - 'a' adds a target with their nickname, and where their client is \
+               (an IPv4/IPv6 address or hostname, optionally :port), and how often to try \
+               - every_1m, every_5m, ... every_55m or every_1h. Every schedule restarts at \
                the top of the hour, so every_1m tries at :00, :01, :02... and every_1h at \
                :00 only - both sides trying at the same clock moments, with nothing \
                coordinating it but that. It only works if they've added you back the same \
                way - your nickname, your public host/IP, and the *same* frequency - \
-               otherwise your two attempts never land at the same moment. Shown only once \
-               you've configured at least one. If your own address moves (an ordinary \
-               home connection), set noip_when_no_server_and_direct_punch_is_active=on plus \
-               noip_hostname/noip_username/noip_password (a No-IP account) in \
-               ~/.aloo/settings - aloo keeps that hostname pointed at wherever you \
-               currently are, so you can give the other person a fixed hostname to punch \
-               at instead of a raw address that might change.",
+               otherwise your two attempts never land at the same moment. If your own \
+               address moves (an ordinary home connection), turn on \
+               noip_when_no_server_and_direct_punch_is_active on that same tab and fill in \
+               the No-IP hostname/username/password - aloo keeps that hostname pointed at \
+               wherever you currently are, so you can give the other person a fixed \
+               hostname to punch at instead of a raw address that might change. Once at \
+               least one target is configured the header shows <active>/<total> (next: \
+               <time>) - how many of them have a link right now, out of how many you \
+               configured, and how long until the next attempt - green once every one is \
+               connected, yellow otherwise. Nothing is shown when none are configured.",
+    },
+    HelpLine::Item {
+        keys: "Ctrl+M",
+        text: "mute/unmute your own microphone while on a call, from wherever you are in \
+               aloo - no need to open the call modal and find your own row first. Unlike \
+               the push-to-talk shortcut this is not an OS-wide one: it only works while \
+               aloo has focus. Does nothing when you are not on a call. Needs a terminal \
+               that can tell Ctrl+M apart from Enter (the two are the same byte \
+               otherwise); where it can't, 'm' on your own row in the call roster does \
+               the same thing and always works.",
     },
     HelpLine::Item {
         keys: "Ctrl+C",

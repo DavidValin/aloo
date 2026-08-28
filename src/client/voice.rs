@@ -886,6 +886,24 @@ pub fn joined_chime_samples() -> Vec<i16> {
         .clone()
 }
 
+/// Bundled the same way as the other three chimes - `assets/ping.mp3`
+/// converted once to a plain, metadata-free 16 kHz mono WAV, so no
+/// MP3-decoding crate is needed to read it.
+const PING_CHIME_WAV: &[u8] = include_bytes!("../../assets/ping.wav");
+
+static PING_CHIME_SAMPLES: OnceLock<Vec<i16>> = OnceLock::new();
+
+/// Mono PCM16 samples for the sound played when someone writes
+/// `@<your nickname>` in a channel or DM (`docs/SPEC.md` Functionality
+/// #33) - the one incoming *text* message that is worth hearing about
+/// while you are looking somewhere else. Empty if the bundled asset is
+/// ever missing/malformed, same fallback as the other three.
+pub fn ping_chime_samples() -> Vec<i16> {
+    PING_CHIME_SAMPLES
+        .get_or_init(|| decode_wav_to_mono(PING_CHIME_WAV).unwrap_or_default())
+        .clone()
+}
+
 /// Plays `samples` and waits for them to finish, on a mixer of its own.
 ///
 /// The chime helpers in `voice_stream` all push into the session's

@@ -1321,5 +1321,16 @@ pub fn report_startup_failure(error: &dyn std::fmt::Display) {
     // through a mixer of its own - there is no session to borrow one from,
     // and the process is about to exit, so this has to wait for the sound
     // to actually be audible (`play_samples_blocking`).
-    crate::client::voice::play_samples_blocking(crate::client::voice::bell_chime_samples());
+    //
+    // Read straight from the file rather than from a `SessionState`
+    // mirror of it, for the same reason: this runs before any session
+    // exists. A settings file that cannot be read leaves the default on -
+    // failing to warn about a failed start is the worse outcome of the
+    // two.
+    let sound_notifications = crate::settings::Settings::load_or_create(&crate::settings::default_path())
+        .map(|s| s.sound_notifications)
+        .unwrap_or(true);
+    if sound_notifications {
+        crate::client::voice::play_samples_blocking(crate::client::voice::bell_chime_samples());
+    }
 }

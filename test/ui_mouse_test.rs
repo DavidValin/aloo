@@ -77,19 +77,19 @@ fn clicking_empty_space_does_nothing() {
 }
 
 /// Something else is absorbing every key right now (a popup, here Ctrl+S's
-/// Direct Punches modal) - a click must not reach through it to whatever
+/// settings modal) - a click must not reach through it to whatever
 /// it's covering.
 /// @requirement AC-395
 #[test]
 fn a_click_is_ignored_while_an_overlay_is_open() {
     let mut state = joined_general_with(vec![user(2, "bob")]);
     state.focus = Focus::Sidebar;
-    state.open_direct_punches();
+    state.open_settings();
     let rows = rendered_rows(&state);
     // Whatever cell the compose bar's own label would occupy behind the
     // popup - the popup covers the whole screen, so any coordinate works;
     // pick one from inside the rendered popup itself.
-    let (x, y) = find_text(&rows, "Direct Punches");
+    let (x, y) = find_text(&rows, "Direct Punch");
 
     let action = state.handle_mouse(left_click(x, y));
     assert!(action.is_none());

@@ -560,13 +560,19 @@ pub(super) async fn handle_ui_action(
             crate::client::contacts::handle_request_user_info(session, ui_state, peer, nickname)
                 .await;
         }
-        UiAction::OpenDirectPunches => {
+        UiAction::OpenSettings => {
             let settings = crate::settings::Settings::load_or_create(&crate::settings::default_path())
                 .unwrap_or_else(|e| {
                     crate::log_warn!("could not read ~/.aloo/settings ({e}); using defaults");
                     crate::settings::Settings::default()
                 });
+            ui_state.set_settings_draft(
+                crate::client::tui::settings_popup::SettingsDraft::from_settings(&settings),
+            );
             ui_state.set_direct_punch_rows(settings.direct_punch_to);
+        }
+        UiAction::SaveSettings(draft) => {
+            save_settings_draft(session, ui_state, draft);
         }
         UiAction::ExportSelected { prefix, channels, dms } => {
             for channel in &channels {
@@ -718,6 +724,81 @@ pub(super) async fn handle_ui_action(
         }
     }
     Ok(())
+}
+
+/// Persists one change made on the Ctrl+S settings popup and applies the
+/// half of it that can take effect without a restart.
+///
+/// Written through `Settings::update`'s merging write, never a plain
+/// `save`, for exactly the reason `set_voice_muted` gives below: a
+/// concurrently running `aloo --server` or daemon owns keys this process
+/// has no business rewriting from its own in-memory copy.
+///
+/// Live: the two chime switches and `voice_autoplay` (mirrored onto
+/// `SessionState`/`UiState`, which is what every play decision reads),
+/// the two log switches, and `direct_punch` - turning that one off
+/// reconfigures the scheduler with no targets, which stops the punching
+/// this same tick rather than at the next start. Not live, and each said
+/// so in its own description on screen: the global shortcut, registered
+/// once at startup (`client::global_ptt`), and the No-IP updater, started
+/// once for the session (`sync_noip_job`).
+///
+/// A write failure keeps the in-memory effect and says so, the same
+/// policy `set_voice_muted` applies.
+fn save_settings_draft(
+    session: &mut SessionState,
+    ui_state: &mut UiState,
+    draft: crate::client::tui::settings_popup::SettingsDraft,
+) {
+    session.set_sound_switches(draft.roger_beep, draft.sound_notifications);
+    // The durable queue and the transport's hand-off are one switch:
+    // turning it on starts keeping what cannot go out, turning it off
+    // hands the transport back its own short in-memory queue. Whatever a
+    // previous run left on disk is picked up when it is turned on, not
+    // discarded - a queued message is not this session's to throw away.
+    session.set_queue_send_messages(draft.queue_send_messages);
+    // `global_ptt_enabled` off silences the OS-level shortcut on the
+    // spot; see `client::global_ptt::set_enabled` for what "on" can and
+    // cannot do mid-session.
+    crate::client::global_ptt::set_enabled(draft.global_ptt_enabled);
+    ui_state.voice_autoplay = draft.voice_autoplay;
+    ui_state.autosave_messages = draft.autosave_messages;
+    ui_state.resume_from_log = draft.resume_from_log;
+    ui_state.queue_send_messages = draft.queue_send_messages;
+    // The scheduler is reconfigured from the master switch and the rows
+    // the popup is showing: off means no targets at all, on means exactly
+    // the list under it - so flipping it either way takes effect now.
+    let targets = if draft.direct_punch {
+        ui_state
+            .settings_popup
+            .as_ref()
+            .map(|p| p.punches.rows.clone())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    session.peer_link.configure_direct_punch(
+        ui_state.own_name.clone(),
+        targets,
+        crate::client::p2p::utc_second_of_hour(),
+    );
+    let path = crate::settings::default_path();
+    match crate::settings::Settings::update(&path, |s| draft.apply_to(s)) {
+        // The file is the source of truth for the two settings that are
+        // applied by re-reading it rather than by being mirrored into
+        // memory, so they are re-applied from what actually landed there.
+        Ok(()) => {
+            let stored = crate::settings::Settings::load_or_create(&path)
+                .unwrap_or_else(|_| crate::settings::Settings::default());
+            session.resync_noip(&stored);
+            session.resync_otp_binary();
+            crate::client::global_ptt::set_shortcut(&stored);
+        }
+        Err(e) => ui_state.push_status_notice(
+            format!("changed for this session only - could not write ~/.aloo/settings ({e})"),
+            false,
+        ),
+    }
 }
 
 /// Persists a `/mute-voice` / `/unmute-voice` decision to

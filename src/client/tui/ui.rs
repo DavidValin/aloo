@@ -198,6 +198,17 @@ pub const PLAIN_SEPARATOR: &str = ":";
 /// recipient's own arrow (`render_message_info_popup`).
 pub const DELIVERED_LABEL: &str = "DELIVERED";
 pub const UNDELIVERED_LABEL: &str = "UNDELIVERED";
+/// What a leg reads while it is waiting on disk for that recipient to
+/// become reachable (`queue_send_messages`, `client::outbox`) - a
+/// stronger claim than `UNDELIVERED_LABEL`, which says only that nothing
+/// has come back yet: this one says it is being kept and will go.
+pub const QUEUED_LABEL: &str = "QUEUED";
+
+/// The speaker-with-no-waves glyph both mute indicators use: beside one
+/// name in the sidebar for a `/mute-voice`d person (`docs/SPEC.md`
+/// Functionality #16), and once in the header while `voice_autoplay` is
+/// off and nobody's voice is playing at all (Functionality #32).
+pub const VOICE_MUTED_MARKER: &str = "\u{1F507}";
 /// What a voice message reads once the recipient has actually heard it -
 /// on arrival, or later if it was muted at the time and they replayed it.
 pub const LISTENED_LABEL: &str = "DELIVERED+LISTENED";
@@ -215,6 +226,12 @@ pub const VIEWED_LABEL: &str = "DELIVERED+VIEWED";
 /// text message has no further state at all.
 pub fn recipient_label(recipient: &DeliveryRecipient, body: &MessageBody) -> (&'static str, Color) {
     if !recipient.delivered {
+        // Held for them rather than merely unacknowledged - the same
+        // "partway there" colour a channel send wears while only some of
+        // its recipients have it, since this one really is on its way.
+        if recipient.queued {
+            return (QUEUED_LABEL, DeliveryStatus::Some.color());
+        }
         return (UNDELIVERED_LABEL, DeliveryStatus::None.color());
     }
     let green = DeliveryStatus::All.color();
@@ -519,6 +536,41 @@ pub struct SelectorEntry {
     pub presence: Option<crate::client::presence::Presence>,
 }
 
+/// Whether `text` mentions `nickname` as `@<nickname>`.
+///
+/// **Case-sensitive**, deliberately: the server treats `bob` and `Bob` as
+/// two different people (`users_registry` compares nicknames exactly, and
+/// only email addresses case-insensitively), so a case-folded match would
+/// sound one person's ping for a message addressed to another.
+///
+/// Both ends of the match are bounded so a mention is a whole word:
+/// the `@` may not follow a nickname character (`alice@bob` is an address,
+/// not a mention), and the nickname may not be followed by one
+/// (`@bobby` is not `@bob`). Nickname characters are exactly what
+/// `validation::nickname_is_registrable` allows - ASCII alphanumerics,
+/// `-` and `_`.
+pub fn text_mentions(text: &str, nickname: &str) -> bool {
+    if nickname.is_empty() {
+        return false;
+    }
+    let is_nick_char = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_';
+    let needle_len = nickname.len();
+    for (at, _) in text.match_indices('@') {
+        if text[..at].chars().next_back().is_some_and(is_nick_char) {
+            continue;
+        }
+        let rest = &text[at + 1..];
+        if !rest.starts_with(nickname) {
+            continue;
+        }
+        if rest[needle_len..].chars().next().is_some_and(is_nick_char) {
+            continue;
+        }
+        return true;
+    }
+    false
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Normal,
@@ -542,10 +594,10 @@ pub enum Mode {
     /// Data lives in `UiState::contacts`, same split as `FileSend`/
     /// `file_send`.
     Contacts,
-    /// The Ctrl+S "Direct Punches" popup is open - see
-    /// `crate::client::tui::direct_punch_popup`. Data lives in
-    /// `UiState::direct_punches`, same split as `FileSend`/`file_send`.
-    DirectPunches,
+    /// The Ctrl+S "Settings" popup is open - see
+    /// `crate::client::tui::settings_popup`. Data lives in
+    /// `UiState::settings_popup`, same split as `FileSend`/`file_send`.
+    Settings,
     /// The channel admin's `/lock-joins` popup is open - see
     /// `crate::client::tui::channel_lock_popup`. Data lives in
     /// `UiState::channel_lock`, same split as `FileSend`/`file_send`.
@@ -840,6 +892,24 @@ pub struct UiState {
     /// `autosave_messages` `.log` file (`UiState::load_history_chunk`,
     /// `client::export::LogHistoryCursor`).
     pub resume_from_log: bool,
+    /// `Settings::voice_autoplay`, seeded at session start and written
+    /// through live by the Ctrl+S settings popup - whether an arriving
+    /// voice message plays itself at all. Off is a blanket version of
+    /// `muted_voice`: it suppresses every sender rather than named ones,
+    /// which is why both are asked through the one predicate
+    /// (`suppress_playback_from`) rather than at each call site.
+    pub voice_autoplay: bool,
+    /// `Settings::queue_send_messages`, seeded at session start and
+    /// written through live by the Ctrl+S settings popup.
+    ///
+    /// Read here for one decision only: whether a plain message to a DM
+    /// peer who is currently offline may be composed and sent at all.
+    /// With a durable queue behind it, "they are not here" stops being a
+    /// reason to refuse the send - it is exactly the case the queue
+    /// exists for (`client::outbox`). Everything that genuinely needs
+    /// them present - a file transfer, `/otp`, a call - stays refused
+    /// either way.
+    pub queue_send_messages: bool,
     /// The message log's rendered height as of the last frame
     /// (`render_messages`, where `inner.height` is already computed) -
     /// interior mutability because `render` only ever receives `&UiState`,
@@ -955,10 +1025,11 @@ pub struct UiState {
     /// sub-popup needs to overwrite its file browser with a deterministic
     /// temp directory.
     pub contacts: Option<super::contacts::ContactsState>,
-    /// The Ctrl+S "Direct Punches" popup's state, while
-    /// `mode == Mode::DirectPunches` - see
-    /// `crate::client::tui::direct_punch_popup`.
-    pub direct_punches: Option<super::direct_punch_popup::DirectPunchPopupState>,
+    /// The Ctrl+S "Settings" popup's state, while
+    /// `mode == Mode::Settings` - see
+    /// `crate::client::tui::settings_popup`. Carries the direct-punch
+    /// target list too, as that popup's Direct Punch tab.
+    pub settings_popup: Option<super::settings_popup::SettingsPopupState>,
     /// The `/lock-joins` popup's state, while
     /// `mode == Mode::ChannelLockPopup` - see
     /// `crate::client::tui::channel_lock_popup`.
@@ -1263,7 +1334,7 @@ pub struct UiState {
     /// `(active, total, next attempt in)` from `PeerLinkManager::direct_punch_summary`,
     /// refreshed once a second by `session::run_connected_session` the same
     /// way `conn_quality` is, and shown at the left of the status line as
-    /// "<active>/<total> direct punches, next try in <time> (Control+s)".
+    /// "<active>/<total> (next: <time>)".
     /// `None` when direct punching is not configured at all - nothing is
     /// shown, rather than a permanent "0/0".
     pub direct_punch_status: Option<(usize, usize, Option<std::time::Duration>)>,
@@ -1320,6 +1391,8 @@ impl UiState {
             server_label: crate::client::export::DIRECT_LABEL.to_string(),
             autosave_messages: false,
             resume_from_log: false,
+            voice_autoplay: true,
+            queue_send_messages: true,
             last_messages_area_height: AtomicU16::new(DEFAULT_HISTORY_CHUNK_LINES),
             last_input_bar_area: AtomicU64::new(u64::MAX),
             last_sidebar_area: AtomicU64::new(u64::MAX),
@@ -1346,7 +1419,7 @@ impl UiState {
             channel_password_error: None,
             file_send: None,
             contacts: None,
-            direct_punches: None,
+            settings_popup: None,
             channel_lock: None,
             export_popup: None,
             channel_command_confirm: None,
@@ -1579,12 +1652,28 @@ impl UiState {
     }
 
     /// Whether audio arriving from `peer` right now must be kept off the
-    /// mixer - the single predicate both reasons funnel through, so a
-    /// caller can never remember one and forget the other. Snapshotted
-    /// once per stream at `*Start` (docs/PROTOCOL.md §11.2), so a decision
-    /// made when a stream opens holds for the whole of it.
+    /// mixer - the single predicate every reason funnels through, so a
+    /// caller can never remember one and forget another: `voice_autoplay`
+    /// off (everyone), an unresolved identity, or a `/mute-voice`d sender.
+    /// Snapshotted once per stream at `*Start` (docs/PROTOCOL.md §11.2),
+    /// so a decision made when a stream opens holds for the whole of it.
     pub fn suppress_playback_from(&self, peer: UserId) -> bool {
-        self.is_trust_gated(peer) || self.is_voice_muted(peer)
+        !self.voice_autoplay || self.is_trust_gated(peer) || self.is_voice_muted(peer)
+    }
+
+    /// Whether an arriving message names this client's own nickname with
+    /// an `@` (`docs/SPEC.md` Functionality #33) - what makes
+    /// `assets/ping.wav` sound. Only a text body can mention anyone; a
+    /// voice or file row never does.
+    ///
+    /// Asked of *incoming* messages only. This client's own sends never
+    /// reach `on_channel_message`/`on_direct_message`, so writing
+    /// `@yourself` cannot ping you.
+    pub fn message_mentions_me(&self, body: &MessageBody) -> bool {
+        match body {
+            MessageBody::Text(text) => text_mentions(text, &self.own_name),
+            _ => false,
+        }
     }
 
 
@@ -1610,6 +1699,7 @@ impl UiState {
                 id: *id,
                 name: self.peer_display_name(*id),
                 delivered: false,
+                queued: false,
                 awaits_pad_ack: false,
                 consumed: false,
                 viewed: false,
@@ -1753,6 +1843,41 @@ impl UiState {
                     // `recipient_label` already only ever consults `viewed`
                     // when `!consumed`, so simply latching it here is safe.
                     recipient.viewed |= stage == ReceiptStage::Viewed;
+                }
+                return;
+            }
+        }
+    }
+
+    /// Records that this client's send to `peer` on row `msg_id` is
+    /// waiting on disk for them rather than in flight
+    /// (`queue_send_messages`, `client::outbox`), so `i` on that row
+    /// reads `QUEUED` instead of `UNDELIVERED`.
+    ///
+    /// `queued` of `false` is the same call in reverse, made when that
+    /// queue is flushed to them - a leg genuinely back on the wire must
+    /// stop claiming to be waiting. Searches every log for the same
+    /// reason `mark_delivered` does: a `msg_id` is unique across all of
+    /// them, and nothing about the queue says which conversation it came
+    /// from. Idempotent, and an id that matches nothing is a no-op.
+    pub fn mark_queued(&mut self, peer: UserId, msg_id: u64, queued: bool) {
+        let logs = self
+            .channels
+            .iter_mut()
+            .map(|c| &mut c.log)
+            .chain(self.private_rooms.values_mut().map(|r| &mut r.log));
+        for log in logs {
+            for entry in log.iter_mut() {
+                let Some(delivery) = entry.delivery.as_mut() else {
+                    continue;
+                };
+                if delivery.msg_id != msg_id {
+                    continue;
+                }
+                for recipient in delivery.recipients.iter_mut() {
+                    if recipient.id == peer {
+                        recipient.queued = queued;
+                    }
                 }
                 return;
             }

@@ -1,14 +1,19 @@
-//! The Ctrl+S "Direct Punches" popup: every configured `direct_punch_to`
-//! peer, one row each, with add/edit/delete - the in-app counterpart to
-//! hand-editing `~/.aloo/settings` (`docs/PROTOCOL.md` §7.1.5). Saving
-//! (or deleting) persists the whole list back to that file and reconfigures
+//! The "configured punches" list on the Ctrl+S settings popup's Direct
+//! Punch tab: every configured `direct_punch_to` peer, one row each, with
+//! add/edit/delete - the in-app counterpart to hand-editing
+//! `~/.aloo/settings` (`docs/PROTOCOL.md` §7.1.5). Saving (or deleting)
+//! persists the whole list back to that file and reconfigures
 //! `PeerLinkManager`'s scheduler immediately, so a change takes effect the
 //! same tick it's made rather than waiting for a restart.
+//!
+//! This module is a row and its editor. Where the list sits, when it has
+//! focus, and the tab around it belong to `super::settings_popup`, which
+//! was Ctrl+S in its entirety until the rest of the settings joined it.
 //!
 //! Mirrors `crate::client::tui::contacts`'s split: state/handling here as
 //! `impl UiState`, rendering as free functions taking `&UiState`. Unlike
 //! contacts, the row data *is* just settings already loaded elsewhere - the
-//! popup asks for a fresh copy on open (`UiAction::OpenDirectPunches`) the
+//! popup asks for a fresh copy on open (`UiAction::OpenSettings`) the
 //! same way `/contacts` asks the session to gather its rows, since
 //! `UiState` itself never touches the filesystem.
 
@@ -17,11 +22,11 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Tabs};
+use ratatui::widgets::{List, ListItem, ListState, Paragraph};
 
 use crate::settings::{DirectPunchTarget, PUNCH_FREQUENCIES, PunchFrequency};
 
-use super::ui::{Mode, UiAction, UiState, centered_rect, render_popup_button};
+use super::ui::{UiAction, UiState, focus_border_style, render_popup_button};
 use super::widgets::field::{place_text_cursor, render_bordered_field};
 
 // ---------------------------------------------------------------------
@@ -58,128 +63,74 @@ pub struct DirectPunchEditState {
 pub struct DirectPunchPopupState {
     pub rows: Vec<DirectPunchTarget>,
     pub selected: usize,
-    /// `Some` while the add/edit form is open over the list.
+    /// `Some` while the add/edit form is open over the settings popup.
     pub edit: Option<DirectPunchEditState>,
 }
 
-impl UiState {
-    /// Opens the modal empty and returns `UiAction::OpenDirectPunches` so
-    /// the session fills it in from `~/.aloo/settings` - mirrors
-    /// `open_contacts` + `OpenContacts`'s same split.
-    pub fn open_direct_punches(&mut self) {
-        self.mode = Mode::DirectPunches;
-        self.direct_punches = Some(DirectPunchPopupState {
-            rows: Vec::new(),
-            selected: 0,
-            edit: None,
-        });
+impl DirectPunchPopupState {
+    /// Moves the selection one row towards the top (`up`) or the bottom,
+    /// reporting whether there was a row to move onto.
+    ///
+    /// `false` at either end is what lets the settings popup's Up/Down
+    /// walk *out* of the list and on to the next field without the list
+    /// needing a mode to enter and leave - see
+    /// `UiState::move_settings_focus`.
+    pub fn step_selection(&mut self, up: bool) -> bool {
+        if up {
+            if self.selected == 0 {
+                return false;
+            }
+            self.selected -= 1;
+        } else {
+            if self.selected + 1 >= self.rows.len() {
+                return false;
+            }
+            self.selected += 1;
+        }
+        true
     }
+}
 
-    /// `OpenDirectPunches`/a completed save's answer: replaces the row set
+impl UiState {
+    /// `OpenSettings`/a completed save's answer: replaces the row set
     /// in place, clamping the selection rather than resetting it. A no-op
     /// if the modal was closed in the meantime.
     pub fn set_direct_punch_rows(&mut self, rows: Vec<DirectPunchTarget>) {
-        let Some(state) = self.direct_punches.as_mut() else {
+        let Some(state) = self.settings_popup.as_mut() else {
             return;
         };
-        state.rows = rows;
-        state.selected = if state.rows.is_empty() {
+        state.punches.rows = rows;
+        state.punches.selected = if state.punches.rows.is_empty() {
             0
         } else {
-            state.selected.min(state.rows.len() - 1)
+            state.punches.selected.min(state.punches.rows.len() - 1)
         };
     }
 
     /// The save form's failure path - shown inline, same convention as
     /// `contacts::InstallOtpState::error`.
     pub fn set_direct_punch_error(&mut self, message: String) {
-        if let Some(edit) = self.direct_punches.as_mut().and_then(|d| d.edit.as_mut()) {
+        if let Some(edit) = self.settings_popup.as_mut().and_then(|s| s.punches.edit.as_mut()) {
             edit.error = Some(message);
         }
     }
 
-    pub(crate) fn handle_direct_punches_key(&mut self, code: KeyCode) -> Option<UiAction> {
-        let has_edit = self
-            .direct_punches
-            .as_ref()
-            .map(|d| d.edit.is_some())
-            .unwrap_or(false);
-        if has_edit {
-            return self.handle_direct_punches_edit_key(code);
-        }
-        self.handle_direct_punches_list_key(code)
-    }
-
-    fn handle_direct_punches_list_key(&mut self, code: KeyCode) -> Option<UiAction> {
-        let len = self.direct_punches.as_ref()?.rows.len();
+    pub(crate) fn handle_direct_punches_edit_key(&mut self, code: KeyCode) -> Option<UiAction> {
         match code {
             KeyCode::Esc => {
-                self.direct_punches = None;
-                self.mode = Mode::Normal;
-                None
-            }
-            KeyCode::Up => {
-                if len > 0
-                    && let Some(state) = self.direct_punches.as_mut()
-                {
-                    state.selected = (state.selected + len - 1) % len;
-                }
-                None
-            }
-            KeyCode::Down => {
-                if len > 0
-                    && let Some(state) = self.direct_punches.as_mut()
-                {
-                    state.selected = (state.selected + 1) % len;
-                }
-                None
-            }
-            KeyCode::Char('a') | KeyCode::Char('n') => {
-                if let Some(state) = self.direct_punches.as_mut() {
-                    state.edit = Some(blank_edit_state());
-                }
-                None
-            }
-            KeyCode::Enter | KeyCode::Char('e') => {
-                let target = {
-                    let state = self.direct_punches.as_ref()?;
-                    state.rows.get(state.selected)?.clone()
-                };
-                if let Some(state) = self.direct_punches.as_mut() {
-                    state.edit = Some(edit_state_for(state.selected, &target));
-                }
-                None
-            }
-            KeyCode::Char('d') | KeyCode::Delete => {
-                if len == 0 {
-                    return None;
-                }
-                let state = self.direct_punches.as_mut()?;
-                let removed = state.selected;
-                state.rows.remove(removed);
-                state.selected = state.selected.min(state.rows.len().saturating_sub(1));
-                Some(UiAction::SaveDirectPunchTargets(state.rows.clone()))
-            }
-            _ => None,
-        }
-    }
-
-    fn handle_direct_punches_edit_key(&mut self, code: KeyCode) -> Option<UiAction> {
-        match code {
-            KeyCode::Esc => {
-                if let Some(state) = self.direct_punches.as_mut() {
-                    state.edit = None;
+                if let Some(state) = self.settings_popup.as_mut() {
+                    state.punches.edit = None;
                 }
                 None
             }
             KeyCode::Tab | KeyCode::BackTab => {
-                if let Some(edit) = self.direct_punches.as_mut().and_then(|d| d.edit.as_mut()) {
+                if let Some(edit) = self.settings_popup.as_mut().and_then(|s| s.punches.edit.as_mut()) {
                     edit.focus = next_field(edit.focus, code == KeyCode::BackTab);
                 }
                 None
             }
             KeyCode::Left | KeyCode::Right => {
-                if let Some(edit) = self.direct_punches.as_mut().and_then(|d| d.edit.as_mut())
+                if let Some(edit) = self.settings_popup.as_mut().and_then(|s| s.punches.edit.as_mut())
                     && edit.focus == DirectPunchField::Frequency
                 {
                     let len = PUNCH_FREQUENCIES.len();
@@ -192,7 +143,7 @@ impl UiState {
                 None
             }
             KeyCode::Backspace => {
-                if let Some(edit) = self.direct_punches.as_mut().and_then(|d| d.edit.as_mut()) {
+                if let Some(edit) = self.settings_popup.as_mut().and_then(|s| s.punches.edit.as_mut()) {
                     match edit.focus {
                         DirectPunchField::Nickname => {
                             edit.nickname.pop();
@@ -209,7 +160,7 @@ impl UiState {
                 None
             }
             KeyCode::Char(c) => {
-                if let Some(edit) = self.direct_punches.as_mut().and_then(|d| d.edit.as_mut()) {
+                if let Some(edit) = self.settings_popup.as_mut().and_then(|s| s.punches.edit.as_mut()) {
                     match edit.focus {
                         DirectPunchField::Nickname => edit.nickname.push(c),
                         DirectPunchField::Host => edit.host.push(c),
@@ -228,8 +179,8 @@ impl UiState {
     /// no activation of their own, same as `contacts::InstallOtpState`'s
     /// path/browser fields being the only ones Enter acts on there.
     fn submit_direct_punch_edit(&mut self) -> Option<UiAction> {
-        let state = self.direct_punches.as_ref()?;
-        let edit = state.edit.as_ref()?;
+        let state = self.settings_popup.as_ref()?;
+        let edit = state.punches.edit.as_ref()?;
         if edit.focus != DirectPunchField::Save {
             return None;
         }
@@ -248,13 +199,19 @@ impl UiState {
             }
         };
 
-        let state = self.direct_punches.as_mut()?;
-        match state.edit.as_ref()?.editing_index {
-            Some(i) => state.rows[i] = target,
-            None => state.rows.push(target),
+        let state = self.settings_popup.as_mut()?;
+        match state.punches.edit.as_ref()?.editing_index {
+            Some(i) => state.punches.rows[i] = target,
+            None => state.punches.rows.push(target),
         }
-        state.edit = None;
-        Some(UiAction::SaveDirectPunchTargets(state.rows.clone()))
+        state.punches.edit = None;
+        // Naming someone to punch at is asking to punch at them: the
+        // session's own `SaveDirectPunchTargets` handler turns
+        // `direct_punch` on with the list, so the toggle above the list
+        // has to agree or the popup would show `off` over a scheduler
+        // that is running.
+        state.draft.direct_punch = true;
+        Some(UiAction::SaveDirectPunchTargets(state.punches.rows.clone()))
     }
 }
 
@@ -267,7 +224,7 @@ fn next_field(focus: DirectPunchField, backwards: bool) -> DirectPunchField {
     order[next]
 }
 
-fn blank_edit_state() -> DirectPunchEditState {
+pub(crate) fn blank_edit_state() -> DirectPunchEditState {
     DirectPunchEditState {
         editing_index: None,
         nickname: String::new(),
@@ -279,7 +236,7 @@ fn blank_edit_state() -> DirectPunchEditState {
     }
 }
 
-fn edit_state_for(index: usize, target: &DirectPunchTarget) -> DirectPunchEditState {
+pub(crate) fn edit_state_for(index: usize, target: &DirectPunchTarget) -> DirectPunchEditState {
     let frequency_index = PUNCH_FREQUENCIES
         .iter()
         .position(|m| *m == target.frequency.minutes())
@@ -302,37 +259,19 @@ fn edit_state_for(index: usize, target: &DirectPunchTarget) -> DirectPunchEditSt
 // Rendering
 // ---------------------------------------------------------------------
 
-pub(crate) fn render_direct_punches_popup(frame: &mut Frame, area: Rect, state: &UiState) {
-    let Some(popup) = &state.direct_punches else { return };
-
-    let outer = centered_rect(70, 22, area);
-    let block = Block::default().borders(Borders::ALL);
-    let inner = block.inner(outer);
-    frame.render_widget(ratatui::widgets::Clear, outer);
-    frame.render_widget(block, outer);
-
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(2), Constraint::Min(1)])
-        .split(inner);
-
-    let tabs = Tabs::new(vec!["Direct Punches"])
-        .select(0)
-        .highlight_style(Style::default().add_modifier(Modifier::BOLD));
-    frame.render_widget(tabs, rows[0]);
-
-    if let Some(edit) = &popup.edit {
-        render_edit_form(frame, rows[1], edit);
-    } else {
-        render_list(frame, rows[1], popup);
-    }
-}
-
-fn render_list(frame: &mut Frame, area: Rect, popup: &DirectPunchPopupState) {
+/// The list of configured targets, inside whatever area the Direct Punch
+/// tab gave it. `focused` is whether the list is the tab's focused field,
+/// which is what decides whether its keys (a/e/d) are live - so it also
+/// decides whether the selection is drawn as a selection.
+pub(crate) fn render_punch_list(
+    frame: &mut Frame,
+    area: Rect,
+    popup: &DirectPunchPopupState,
+    focused: bool,
+) {
     let help = Rect { height: 1.min(area.height), ..area };
     frame.render_widget(
-        Paragraph::new("a: add  Enter/e: edit  d: delete  Esc: close")
-            .style(Style::default().fg(Color::DarkGray)),
+        Paragraph::new("a: add  Enter/e: edit  d: delete").style(focus_border_style(focused)),
         help,
     );
     let list_area = Rect {
@@ -363,7 +302,12 @@ fn render_list(frame: &mut Frame, area: Rect, popup: &DirectPunchPopupState) {
             )))
         })
         .collect();
-    let list = List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    let highlight = if focused {
+        Style::default().add_modifier(Modifier::REVERSED)
+    } else {
+        Style::default()
+    };
+    let list = List::new(items).highlight_style(highlight);
     let mut list_state = ListState::default();
     list_state.select(Some(popup.selected.min(popup.rows.len() - 1)));
     frame.render_stateful_widget(list, list_area, &mut list_state);
@@ -373,7 +317,7 @@ fn render_list(frame: &mut Frame, area: Rect, popup: &DirectPunchPopupState) {
 /// `render_bordered_field` - the focused one's border highlighted, its
 /// value drawn inside - so every popup's text fields read the same way.
 /// Returns the inner `Rect`, for placing the blinking cursor in it.
-fn render_edit_form(frame: &mut Frame, area: Rect, edit: &DirectPunchEditState) {
+pub(crate) fn render_edit_form(frame: &mut Frame, area: Rect, edit: &DirectPunchEditState) {
     let mut constraints = vec![
         Constraint::Length(3), // nickname
         Constraint::Length(3), // host
