@@ -2269,6 +2269,160 @@ async fn a_duplicate_file_offer_re_acks_the_same_proof_without_reprocessing() {
 /// after - and delivers to bob only what those passes queued *last*, since
 /// the original send went to a dead `UserId` and can never arrive.
 ///
+/// A file's offer and a voice message's offer recover through one
+/// function told which it is (`recover_and_resend_offer`, `OfferKind`),
+/// so the two things that kind decides - the `Content` the recovered blob
+/// is framed under, and the payload variant it goes back out in - are the
+/// whole of what separates the two paths. Cross either and the offer
+/// still goes out, but the peer's handler drops it on the floor with no
+/// diagnostic at all, so nothing short of this notices.
+///
+/// Also pins what makes a recovery a recovery rather than a fresh send:
+/// AC-147's "never by re-encoding" - no further pad is spent - and its
+/// "under the exact same sequence number", checked the only way that
+/// really counts, by handing the recovered offer to the peer and watching
+/// their decoder accept it and ack that same slot.
+///
+/// Everything here reads the payloads queued *after* the recovery pass:
+/// `Side::queued` reports the whole backlog rather than draining it, so
+/// the original offer - the one that never arrived - is still sitting in
+/// front of the resend.
+/// @requirement AC-147
+#[tokio::test]
+async fn a_lost_file_offer_and_a_lost_voice_offer_each_recover_as_their_own_kind() {
+    if !require_otp() {
+        return;
+    }
+
+    // --- a file offer that never arrived ---
+    let (mut alice, mut bob, contact) = pair("recover-file-offer", Id::Pq, Id::Pq).await;
+    let dir = scratch("recover-file-offer-payload");
+    let source = dir.join("notes.txt");
+    let body = b"a file whose offer never made it across";
+    std::fs::write(&source, body).unwrap();
+
+    send_file(&mut alice, &contact, source, body.len() as u64).await;
+    let (stream_id, seq, _, _) = take_file_offer(&mut alice);
+    assert!(
+        alice.gate_held(&contact),
+        "the offer is a real pad spend, so it stays outstanding until acked"
+    );
+    let already_queued = alice.queued().len();
+    let spent_before = alice.pad_spent(&contact).await;
+
+    aloo::client::otp::recover_and_resend(&mut NullSink, &mut alice.session, &mut alice.ui)
+        .await
+        .expect("the recovery pass should not fail");
+
+    assert_eq!(
+        alice.pad_spent(&contact).await,
+        spent_before,
+        "recovery replays the kept ciphertext; it must not spend more pad"
+    );
+    let resent: Vec<P2pPayload> = alice.queued().into_iter().skip(already_queued).collect();
+    assert!(
+        !resent
+            .iter()
+            .any(|p| matches!(p, P2pPayload::OtpVoiceOffer { .. })),
+        "a file offer must never come back as a voice offer: {resent:?}"
+    );
+    let (again_stream, again_seq, envelope, envelope_device) = resent
+        .into_iter()
+        .find_map(|p| match p {
+            P2pPayload::OtpFileOffer {
+                stream_id,
+                seq,
+                envelope,
+                sender_device_id,
+                ..
+            } => Some((stream_id, seq, envelope, sender_device_id)),
+            _ => None,
+        })
+        .expect("the outstanding file offer should have been resent");
+    assert_eq!(
+        (again_stream, again_seq),
+        (stream_id, seq),
+        "resent under the original stream and slot, never a fresh pair"
+    );
+
+    aloo::client::otp::on_file_offer(
+        &mut bob.session,
+        &mut bob.ui,
+        None,
+        ALICE,
+        "alice".into(),
+        again_stream,
+        again_seq,
+        envelope,
+        envelope_device,
+    )
+    .await;
+    let (acked_seq, _) = last_ack(&mut bob);
+    assert_eq!(
+        acked_seq, seq,
+        "the recovered offer must open on bob's side - framed as the file offer it is, \
+         under the slot his decoder was waiting for"
+    );
+
+    // --- a voice offer that never arrived ---
+    let (mut alice, mut bob, contact) = pair("recover-voice-offer", Id::Pq, Id::Pq).await;
+    let pcm: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+
+    send_voice(&mut alice, &contact, pcm).await;
+    let (stream_id, seq, _, _) = take_voice_offer(&mut alice);
+    assert!(alice.gate_held(&contact));
+    let already_queued = alice.queued().len();
+    let spent_before = alice.pad_spent(&contact).await;
+
+    aloo::client::otp::recover_and_resend(&mut NullSink, &mut alice.session, &mut alice.ui)
+        .await
+        .expect("the recovery pass should not fail");
+
+    assert_eq!(
+        alice.pad_spent(&contact).await,
+        spent_before,
+        "the same rule holds for a voice offer: replay, never re-encode"
+    );
+    let resent: Vec<P2pPayload> = alice.queued().into_iter().skip(already_queued).collect();
+    assert!(
+        !resent
+            .iter()
+            .any(|p| matches!(p, P2pPayload::OtpFileOffer { .. })),
+        "a voice offer must never come back as a file offer: {resent:?}"
+    );
+    let (again_stream, again_seq, envelope, envelope_device) = resent
+        .into_iter()
+        .find_map(|p| match p {
+            P2pPayload::OtpVoiceOffer {
+                stream_id,
+                seq,
+                envelope,
+                sender_device_id,
+                ..
+            } => Some((stream_id, seq, envelope, sender_device_id)),
+            _ => None,
+        })
+        .expect("the outstanding voice offer should have been resent");
+    assert_eq!((again_stream, again_seq), (stream_id, seq));
+
+    aloo::client::otp::on_voice_offer(
+        &mut NullSink,
+        &mut bob.session,
+        &mut bob.ui,
+        ALICE,
+        again_stream,
+        again_seq,
+        envelope,
+        envelope_device,
+    )
+    .await;
+    let (acked_seq, _) = last_ack(&mut bob);
+    assert_eq!(
+        acked_seq, seq,
+        "and the voice offer's recovered ciphertext still opens on bob's side too"
+    );
+}
+
 /// @requirement AC-307
 #[tokio::test]
 async fn an_end_confirmation_lost_in_the_handshake_window_is_recovered_on_reconnect() {
