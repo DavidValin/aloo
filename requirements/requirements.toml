@@ -3051,7 +3051,7 @@ evidence = "docs/SPEC.md 'Running without a server'; src/client/tui/channel.rs W
 [[user_story.technical_behavior]]
 id = "TB-225"
 description = "An encryption-key rotation (13.10) is carried over the direct link when no server can relay it - either because there is none, or because the peer is one no server has ever named. The payload is exactly what the relayed form carries and the recipient verifies its signature itself, so the transport changes nothing about trust; without this, forward secrecy would silently stop for precisely the peers 7.1.5 exists for, while messages continued to encrypt and decrypt fine against the un-rotated bootstrap keys."
-evidence = "docs/PROTOCOL.md 13.10, 7.1.5; src/p2p_proto.rs P2pPayload::KeyRotation; src/client/p2p.rs P2pEvent::KeyRotation; src/client/session.rs rotate_out_rx's dispatch and the KeyRotation arm (handle_pq_key_rotated, shared with ServerMessage::KeyRotated); test punch_datagrams_roundtrip and the existing rotation tests it reuses unchanged"
+evidence = "docs/PROTOCOL.md 13.10, 7.1.5; src/p2p_proto.rs P2pPayload::KeyRotation; src/client/p2p.rs P2pEvent::KeyRotation; src/client/session.rs rotation_rides_the_link and rotate_out_rx's dispatch, and the KeyRotation arm (handle_pq_key_rotated, shared with ServerMessage::KeyRotated); tests a_rotation_rides_the_link_exactly_when_no_server_can_relay_it (direct_punch_test.rs), a_key_rotation_for_a_down_link_is_held_and_sent_when_it_recovers (p2p_test.rs), key_rotation_over_the_link_carries_the_same_payload_as_the_relayed_form (proto_test.rs), punch_datagrams_roundtrip and the existing rotation tests it reuses unchanged"
 
 [[user_story.acceptance_criteria]]
 id = "AC-221"

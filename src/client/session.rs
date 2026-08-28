@@ -955,18 +955,12 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
             }
             msg = rotate_out_rx.recv() => {
                 let Some(msg) = msg else { break };
-                // A rotation for a peer the server has never named cannot
-                // be relayed by it, and with no server at all none can.
-                // The link is already authenticated and the rotation
-                // carries its own signature, so it rides the link instead
-                // - the alternative is forward secrecy silently stopping
-                // (§13.10) for precisely the peers §7.1.5 exists for.
                 if let ClientMessage::RotateKey {
                     to,
                     new_public_key_der,
                     signature,
                 } = &msg
-                    && (session.server.is_absent() || p2p::is_direct_peer_id(*to))
+                    && rotation_rides_the_link(session.server, *to)
                 {
                     session.peer_link.send_reliable_or_queue(
                         *to,
@@ -5063,6 +5057,25 @@ pub(crate) fn settle_delivery_id(
 ) {
     let msg_id = session.pending_receipts.settle(from, stream_id, consumed);
     send_delivery_receipt(session, from, msg_id, ReceiptStage::Consumed);
+}
+
+/// Whether an encryption-key rotation (`docs/PROTOCOL.md` §13.10) has to
+/// travel over the direct link rather than being relayed by the server.
+///
+/// True in two cases, and they are different: no server can relay
+/// anything right now (`--no-server`, or one that is merely away), or the
+/// peer is one of `p2p::direct_peer_id`'s synthetic ids that no server has
+/// ever heard of (§7.1.5) - which stays true even while a server *is*
+/// connected. Otherwise the rotation goes on the control channel like
+/// every other `RotateKey`.
+///
+/// The link is already authenticated and the rotation carries its own
+/// signature, so the transport changes nothing about trust. Getting this
+/// wrong is quiet rather than loud: messages keep encrypting and
+/// decrypting fine against the un-rotated bootstrap keys, and forward
+/// secrecy simply stops - for precisely the peers §7.1.5 exists for.
+pub fn rotation_rides_the_link(server: ServerState, to: UserId) -> bool {
+    server.is_absent() || p2p::is_direct_peer_id(to)
 }
 
 /// Rotates our own key material for `peer` - the single trigger every send

@@ -896,6 +896,72 @@ async fn content_queued_while_the_link_is_down_is_flushed_when_it_recovers() {
     );
 }
 
+/// The other half of `rotate_out_rx`'s dispatch: once the routing
+/// decision says "the link", the rotation is handed to
+/// `send_reliable_or_queue` with no `ensure_link` of its own - because
+/// every path that queues a rotation has already established the link
+/// (`request_rotation_if_pq_hybrid` fires only after a send, a receive, or
+/// a link reaching Active). This pins what that reliance is worth: a
+/// rotation for a link that has since gone down is *held*, not dropped,
+/// and goes out when it recovers.
+///
+/// The failure this rules out is invisible from the outside. A dropped
+/// rotation stops forward secrecy for that peer while every message keeps
+/// encrypting and decrypting perfectly against the un-rotated bootstrap
+/// keys - nothing fails, nothing is logged, and the only symptom is a
+/// property that quietly no longer holds.
+///
+/// @requirement TB-225
+#[tokio::test]
+async fn a_key_rotation_for_a_down_link_is_held_and_sent_when_it_recovers() {
+    let server_addr = spawn_test_server().await;
+    let (mut alice, mut events, mut a, _b, bob_id) = one_manager(server_addr).await;
+
+    alice.ensure_link(&mut a, bob_id).await;
+    let t0 = tokio::time::Instant::now().into_std();
+    alice.tick_at(t0 + SIGNAL_TIMEOUT + Duration::from_millis(100));
+    assert_eq!(
+        alice.status(bob_id),
+        Some(LinkStatus::Lost),
+        "precondition: the link this rotation is owed to is down"
+    );
+
+    // Exactly what `run_connected_session`'s `rotate_out_rx` arm sends
+    // once `rotation_rides_the_link` has answered yes - no `ensure_link`,
+    // the same as there.
+    alice.send_reliable_or_queue(
+        bob_id,
+        P2pPayload::KeyRotation {
+            rotation: vec![0xAB; 32],
+            signature: vec![0xCD; 16],
+        },
+    );
+    assert_eq!(
+        alice.pending_count(bob_id),
+        1,
+        "a rotation for a down link must be held - dropping it stops forward \
+         secrecy with nothing to show for it"
+    );
+    assert!(
+        !had_link_failure(&mut events, bob_id),
+        "holding a rotation is not a failure and must not be reported as one"
+    );
+
+    let link_nonce = 0x5555_5555;
+    alice
+        .on_peer_candidates(&mut a, bob_id, vec![], link_nonce)
+        .await;
+    let addr: SocketAddr = "203.0.113.12:8888".parse().unwrap();
+    alice.on_datagram(addr, PunchDatagram::Pong { link_nonce });
+
+    assert!(alice.is_active(bob_id));
+    assert_eq!(
+        alice.pending_count(bob_id),
+        0,
+        "the rotation must go out the moment the link is back"
+    );
+}
+
 /// Our own public address can change under us (a NAT dropping the mapping
 /// while we sit idle is the common one). Re-probing keeps the candidate we
 /// advertise true, and a change re-signals every link that isn't up so the
