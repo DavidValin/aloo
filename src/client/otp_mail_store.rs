@@ -23,7 +23,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::validation::is_storable;
 
@@ -125,14 +125,10 @@ impl OtpMailStore {
     /// tolerance as every other flat-file store here.
     pub fn load(dir: PathBuf) -> io::Result<Self> {
         let mut store = Self::new_empty(dir);
-        match fs::read_to_string(store.index_path()) {
-            Ok(contents) => {
-                for line in contents.lines() {
-                    store.parse_line(line);
-                }
+        if let Some(contents) = crate::platform::read_to_string_optional(&store.index_path())? {
+            for line in contents.lines() {
+                store.parse_line(line);
             }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
         }
         Ok(store)
     }
@@ -395,20 +391,4 @@ impl OtpMailStore {
     }
 }
 
-/// Best-effort overwrite-then-remove, mirroring
-/// `client::otp::secure_remove_file` (not reused directly: that one is
-/// `pub(crate)` in a module this store deliberately doesn't depend on).
-fn secure_remove(path: &Path) {
-    if let Ok(len) = fs::metadata(path).map(|m| m.len()) {
-        let _ = fs::write(path, vec![0u8; len as usize]);
-    }
-    let _ = fs::remove_file(path);
-}
-
-#[cfg(unix)]
-fn restrict_file_permissions(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
-}
-#[cfg(not(unix))]
-fn restrict_file_permissions(_path: &Path) {}
+use crate::secure_fs::{restrict_file_permissions, secure_remove_file as secure_remove};

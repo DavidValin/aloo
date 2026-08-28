@@ -197,6 +197,34 @@ pub struct Outgoing {
     pub message: ServerMessage,
 }
 
+impl Outgoing {
+    /// One message for one client - the only way an `Outgoing` is built,
+    /// here and in `channels_registry`/`mail`, so the pair always reads
+    /// in the order it means: to whom, then what.
+    pub fn new(to: UserId, message: ServerMessage) -> Self {
+        Self { to, message }
+    }
+
+    /// The one shape a refused request is answered in: a
+    /// `ServerMessage::Error` carrying the reason back to whoever asked.
+    /// The wording is always the registry's - `Registry` and
+    /// `ChannelsRegistry` return an `Err(String)` that says why - so this
+    /// only ever forwards it, never invents one.
+    pub fn error(to: UserId, message: impl Into<String>) -> Self {
+        Self::new(
+            to,
+            ServerMessage::Error {
+                message: message.into(),
+            },
+        )
+    }
+
+    /// `error` as the single-message list a `client_loop` arm returns.
+    pub fn refuse(to: UserId, message: impl Into<String>) -> Vec<Self> {
+        vec![Self::error(to, message)]
+    }
+}
+
 struct ClientRecord {
     name: String,
     public_key_der: Vec<u8>,
@@ -504,14 +532,14 @@ impl Registry {
         if !self.clients.contains_key(&to) {
             return Err("unknown recipient".to_string());
         }
-        Ok(Outgoing {
+        Ok(Outgoing::new(
             to,
-            message: ServerMessage::KeyRotated {
+            ServerMessage::KeyRotated {
                 from,
                 new_public_key_der,
                 signature,
             },
-        })
+        ))
     }
 
     /// Relays a direct-link candidate proposal (or reply) to `to` -
@@ -528,14 +556,14 @@ impl Registry {
         if !self.clients.contains_key(&to) {
             return Err("unknown recipient".to_string());
         }
-        Ok(Outgoing {
+        Ok(Outgoing::new(
             to,
-            message: ServerMessage::PeerCandidates {
+            ServerMessage::PeerCandidates {
                 from,
                 candidates,
                 link_nonce,
             },
-        })
+        ))
     }
 }
 
@@ -729,14 +757,7 @@ async fn handle_connection(
             return Ok(());
         }
         _ => {
-            let _ = wr
-                .send(&ServerMessage::AuthResult {
-                    ok: false,
-                    activation_pending: false,
-                    deactivated: None,
-                    reason: Some("expected auth message".into()),
-                })
-                .await;
+            refuse_auth(&mut wr, "expected auth message").await;
             return Ok(());
         }
     };
@@ -750,14 +771,11 @@ async fn handle_connection(
         .await
         .is_banned_at(peer_ip, users_registry::now_utc())
     {
-        let _ = wr
-            .send(&ServerMessage::AuthResult {
-                ok: false,
-                activation_pending: false,
-                deactivated: None,
-                reason: Some("too many failed login attempts from this address - try again later".into()),
-            })
-            .await;
+        refuse_auth(
+            &mut wr,
+            "too many failed login attempts from this address - try again later",
+        )
+        .await;
         return Ok(());
     }
     // The derivation is deliberately slow (§5.1) and the check reads the
@@ -779,14 +797,7 @@ async fn handle_connection(
                 .lock()
                 .await
                 .record_strike(peer_ip, users_registry::now_utc(), &LOGIN_FAILURE_STRIKES);
-            let _ = wr
-                .send(&ServerMessage::AuthResult {
-                    ok: false,
-                    activation_pending: false,
-                    deactivated: None,
-                    reason: Some("authentication failed".into()),
-                })
-                .await;
+            refuse_auth(&mut wr, "authentication failed").await;
             return Ok(());
         }
         AuthCheck::Deactivated { reason } => {
@@ -812,16 +823,11 @@ async fn handle_connection(
             // same "wait for Activate" flow an unexpired pending
             // activation already uses.
             if expired && !reissue_and_resend_activation(&options, &nickname).await {
-                let _ = wr
-                    .send(&ServerMessage::AuthResult {
-                        ok: false,
-                        activation_pending: false,
-                        deactivated: None,
-                        reason: Some(
-                            "this account's activation code has expired - register again".into(),
-                        ),
-                    })
-                    .await;
+                refuse_auth(
+                    &mut wr,
+                    "this account's activation code has expired - register again",
+                )
+                .await;
                 return Ok(());
             }
             wr.send(&ServerMessage::AuthResult {
@@ -832,14 +838,7 @@ async fn handle_connection(
             })
             .await?;
             let Some(ClientMessage::Activate { code }) = rd.recv().await? else {
-                let _ = wr
-                    .send(&ServerMessage::AuthResult {
-                        ok: false,
-                        activation_pending: false,
-                        deactivated: None,
-                        reason: Some("expected activation code".into()),
-                    })
-                    .await;
+                refuse_auth(&mut wr, "expected activation code").await;
                 return Ok(());
             };
             let outcome = options
@@ -859,14 +858,7 @@ async fn handle_connection(
                 }
             };
             if let Some(reason) = reason {
-                let _ = wr
-                    .send(&ServerMessage::AuthResult {
-                        ok: false,
-                        activation_pending: false,
-                        deactivated: None,
-                        reason: Some(reason),
-                    })
-                    .await;
+                refuse_auth(&mut wr, reason).await;
                 return Ok(());
             }
         }
@@ -963,6 +955,36 @@ fn require_superadmin(options: &ServerOptions, reg: &Registry, id: UserId) -> Re
     }
 }
 
+/// A registry mutation's outgoing messages, or - if it refused - the one
+/// `Error` reply carrying its reason back to `id`. Every `client_loop`
+/// arm that calls a fallible `Registry` method answers this way, which is
+/// what keeps those arms one line each and keeps a refusal from being
+/// dropped on the floor.
+fn or_refuse(id: UserId, result: Result<Vec<Outgoing>, String>) -> Vec<Outgoing> {
+    result.unwrap_or_else(|reason| Outgoing::refuse(id, reason))
+}
+
+/// Every way `handle_connection` turns a login down before the session
+/// starts: one `AuthResult` naming the reason, with the other three
+/// fields at the "plain refusal" values that distinguish it from the
+/// deactivated and activation-pending answers beside it.
+///
+/// Best-effort on purpose - the caller returns immediately afterwards, so
+/// a write that fails changes nothing about what happens next.
+async fn refuse_auth<W: tokio::io::AsyncWrite + Unpin>(
+    wr: &mut crate::control::ControlWriter<W>,
+    reason: impl Into<String>,
+) {
+    let _ = wr
+        .send(&ServerMessage::AuthResult {
+            ok: false,
+            activation_pending: false,
+            deactivated: None,
+            reason: Some(reason.into()),
+        })
+        .await;
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn client_loop<R: AsyncRead + Unpin>(
     id: UserId,
@@ -1006,65 +1028,40 @@ async fn client_loop<R: AsyncRead + Unpin>(
                         options.allow_create_public_channels,
                     )
                     .unwrap_or_else(|reason| {
-                        vec![Outgoing {
-                            to: id,
-                            message: ServerMessage::ChannelJoinFailed {
+                        vec![Outgoing::new(
+                            id,
+                            ServerMessage::ChannelJoinFailed {
                                 name: name_for_err,
                                 reason,
                             },
-                        }]
+                        )]
                     })
                 }
                 ClientMessage::LeaveChannel { name } => reg.leave_channel(id, &name),
                 ClientMessage::DeleteChannel { name } => {
-                    reg.delete_channel(id, &name).unwrap_or_else(|reason| {
-                        vec![Outgoing {
-                            to: id,
-                            message: ServerMessage::Error { message: reason },
-                        }]
-                    })
+                    or_refuse(id, reg.delete_channel(id, &name))
                 }
-                ClientMessage::BanFromChannel { channel, nickname } => reg
-                    .ban_from_channel(id, &channel, &nickname)
-                    .unwrap_or_else(|reason| {
-                        vec![Outgoing {
-                            to: id,
-                            message: ServerMessage::Error { message: reason },
-                        }]
-                    }),
-                ClientMessage::UnbanFromChannel { channel, nickname } => reg
-                    .unban_from_channel(id, &channel, &nickname)
-                    .unwrap_or_else(|reason| {
-                        vec![Outgoing {
-                            to: id,
-                            message: ServerMessage::Error { message: reason },
-                        }]
-                    }),
-                ClientMessage::SetChannelJoinLock { channel, allowed } => reg
-                    .set_channel_join_lock(id, &channel, allowed)
-                    .unwrap_or_else(|reason| {
-                        vec![Outgoing {
-                            to: id,
-                            message: ServerMessage::Error { message: reason },
-                        }]
-                    }),
-                ClientMessage::AssignChannelAdmin { channel, nickname } => reg
-                    .assign_channel_admin(id, &channel, &nickname)
-                    .unwrap_or_else(|reason| {
-                        vec![Outgoing {
-                            to: id,
-                            message: ServerMessage::Error { message: reason },
-                        }]
-                    }),
+                ClientMessage::BanFromChannel { channel, nickname } => {
+                    or_refuse(id, reg.ban_from_channel(id, &channel, &nickname))
+                }
+                ClientMessage::UnbanFromChannel { channel, nickname } => {
+                    or_refuse(id, reg.unban_from_channel(id, &channel, &nickname))
+                }
+                ClientMessage::SetChannelJoinLock { channel, allowed } => {
+                    or_refuse(id, reg.set_channel_join_lock(id, &channel, allowed))
+                }
+                ClientMessage::AssignChannelAdmin { channel, nickname } => {
+                    or_refuse(id, reg.assign_channel_admin(id, &channel, &nickname))
+                }
                 ClientMessage::ChangePassword { old_password, new_password } => {
                     match reg.clients.get(&id).map(|c| c.name.clone()) {
-                        None => vec![Outgoing {
-                            to: id,
-                            message: ServerMessage::ChangePasswordResult {
+                        None => vec![Outgoing::new(
+                            id,
+                            ServerMessage::ChangePasswordResult {
                                 ok: false,
                                 reason: Some("not connected".to_string()),
                             },
-                        }],
+                        )],
                         Some(nickname) => {
                             // Deliberately synchronous PBKDF2, unlike
                             // `Auth`'s own check: this connection already
@@ -1090,24 +1087,21 @@ async fn client_loop<R: AsyncRead + Unpin>(
                                     reason: Some("wrong current password".to_string()),
                                 },
                             };
-                            vec![Outgoing { to: id, message }]
+                            vec![Outgoing::new(id, message)]
                         }
                     }
                 }
                 ClientMessage::AdminDeactivate { nickname, reason } => {
                     match require_superadmin(options, &reg, id) {
-                        Err(e) => vec![Outgoing {
-                            to: id,
-                            message: ServerMessage::Error { message: e },
-                        }],
+                        Err(e) => Outgoing::refuse(id, e),
                         Ok(_) => {
                             let _ = options.users.deactivate(&nickname, &reason);
                             let mut out = Vec::new();
                             if let Some(target_id) = reg.id_by_name(&nickname) {
-                                out.push(Outgoing {
-                                    to: target_id,
-                                    message: ServerMessage::AccountDeactivated { reason },
-                                });
+                                out.push(Outgoing::new(
+                                    target_id,
+                                    ServerMessage::AccountDeactivated { reason },
+                                ));
                             }
                             out
                         }
@@ -1115,10 +1109,7 @@ async fn client_loop<R: AsyncRead + Unpin>(
                 }
                 ClientMessage::AdminActivate { nickname } => {
                     match require_superadmin(options, &reg, id) {
-                        Err(e) => vec![Outgoing {
-                            to: id,
-                            message: ServerMessage::Error { message: e },
-                        }],
+                        Err(e) => Outgoing::refuse(id, e),
                         Ok(_) => {
                             let _ = options.users.admin_force_activate(&nickname);
                             Vec::new()
@@ -1127,10 +1118,7 @@ async fn client_loop<R: AsyncRead + Unpin>(
                 }
                 ClientMessage::AdminRemoveAccount { nickname } => {
                     match require_superadmin(options, &reg, id) {
-                        Err(e) => vec![Outgoing {
-                            to: id,
-                            message: ServerMessage::Error { message: e },
-                        }],
+                        Err(e) => Outgoing::refuse(id, e),
                         Ok(_) => {
                             let _ = options.users.remove(&nickname);
                             let mut out = reg.remove_channels_administered_by(
@@ -1138,12 +1126,10 @@ async fn client_loop<R: AsyncRead + Unpin>(
                                 "the channel has been removed by the admin",
                             );
                             if let Some(target_id) = reg.id_by_name(&nickname) {
-                                out.push(Outgoing {
-                                    to: target_id,
-                                    message: ServerMessage::Error {
-                                        message: "this account has been removed from the server".into(),
-                                    },
-                                });
+                                out.push(Outgoing::error(
+                                    target_id,
+                                    "this account has been removed from the server",
+                                ));
                             }
                             out
                         }
@@ -1151,18 +1137,12 @@ async fn client_loop<R: AsyncRead + Unpin>(
                 }
                 ClientMessage::AdminRemoveChannel { name } => {
                     match require_superadmin(options, &reg, id) {
-                        Err(e) => vec![Outgoing {
-                            to: id,
-                            message: ServerMessage::Error { message: e },
-                        }],
+                        Err(e) => Outgoing::refuse(id, e),
                         Ok(_) => reg.remove_channel(&name, "removed by a superadmin"),
                     }
                 }
                 ClientMessage::RequestUsersList => match require_superadmin(options, &reg, id) {
-                    Err(e) => vec![Outgoing {
-                        to: id,
-                        message: ServerMessage::Error { message: e },
-                    }],
+                    Err(e) => Outgoing::refuse(id, e),
                     Ok(_) => {
                         let users = options
                             .users
@@ -1173,7 +1153,7 @@ async fn client_loop<R: AsyncRead + Unpin>(
                                 proto::UserAdminInfo { nickname, admin_of }
                             })
                             .collect();
-                        vec![Outgoing { to: id, message: ServerMessage::UsersList { users } }]
+                        vec![Outgoing::new(id, ServerMessage::UsersList { users })]
                     }
                 },
                 ClientMessage::RotateKey {
@@ -1182,12 +1162,7 @@ async fn client_loop<R: AsyncRead + Unpin>(
                     signature,
                 } => match reg.route_key_rotation(id, to, new_public_key_der, signature) {
                     Ok(o) => vec![o],
-                    Err(reason) => {
-                        vec![Outgoing {
-                            to: id,
-                            message: ServerMessage::Error { message: reason },
-                        }]
-                    }
+                    Err(reason) => Outgoing::refuse(id, reason),
                 },
                 ClientMessage::RequestPeerLink {
                     peer,
@@ -1195,12 +1170,7 @@ async fn client_loop<R: AsyncRead + Unpin>(
                     link_nonce,
                 } => match reg.route_peer_link_request(id, peer, candidates, link_nonce) {
                     Ok(o) => vec![o],
-                    Err(reason) => {
-                        vec![Outgoing {
-                            to: id,
-                            message: ServerMessage::Error { message: reason },
-                        }]
-                    }
+                    Err(reason) => Outgoing::refuse(id, reason),
                 },
                 // Purely a liveness signal - already did its job just by
                 // arriving and resetting the timeout above.
@@ -1226,12 +1196,9 @@ async fn client_loop<R: AsyncRead + Unpin>(
                 | ClientMessage::Auth { .. }
                 | ClientMessage::Activate { .. }
                 | ClientMessage::Register { .. }
-                | ClientMessage::Identify { .. } => vec![Outgoing {
-                    to: id,
-                    message: ServerMessage::Error {
-                        message: "unexpected message after handshake".into(),
-                    },
-                }],
+                | ClientMessage::Identify { .. } => {
+                    Outgoing::refuse(id, "unexpected message after handshake")
+                }
             }
         };
         dispatch(senders, outgoing).await;

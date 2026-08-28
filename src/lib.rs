@@ -5,6 +5,7 @@ pub mod log;
 pub mod p2p_proto;
 pub mod platform;
 pub mod proto;
+pub mod secure_fs;
 pub mod server;
 pub mod settings;
 pub mod validation;

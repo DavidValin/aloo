@@ -75,6 +75,21 @@ struct PasswordAttemptRecord {
     banned_at: Option<Instant>,
 }
 
+/// A join turned down, in the one shape every refusal here takes: a
+/// single `ChannelJoinRejected` back to whoever tried, naming the channel
+/// they tried and which of `ChannelJoinRejection`'s reasons applied. All
+/// five refusals in `join` differ only in that reason, and this is what
+/// keeps them saying so and nothing else.
+fn reject_join(id: UserId, name: &str, kind: ChannelJoinRejection) -> Vec<Outgoing> {
+    vec![Outgoing::new(
+        id,
+        ServerMessage::ChannelJoinRejected {
+            name: name.to_string(),
+            kind,
+        },
+    )]
+}
+
 /// Pure channel bookkeeping - existence, kind, password, membership,
 /// admin, bans, join-locks, and inactivity - with no connection identity
 /// (that stays in `Registry`) and no I/O of its own. Every mutation
@@ -210,25 +225,13 @@ impl ChannelsRegistry {
         if !already_member {
             let rec = self.channels.get(name).expect("just looked up above");
             if rec.banned.contains(&joiner.name) {
-                return Ok(vec![Outgoing {
-                    to: id,
-                    message: ServerMessage::ChannelJoinRejected {
-                        name: name.to_string(),
-                        kind: ChannelJoinRejection::UserBanned,
-                    },
-                }]);
+                return Ok(reject_join(id, name, ChannelJoinRejection::UserBanned));
             }
             if let Some(allowed) = &rec.join_lock
                 && rec.admin.as_deref() != Some(joiner.name.as_str())
                 && !allowed.contains(&joiner.name)
             {
-                return Ok(vec![Outgoing {
-                    to: id,
-                    message: ServerMessage::ChannelJoinRejected {
-                        name: name.to_string(),
-                        kind: ChannelJoinRejection::NotOnAllowlist,
-                    },
-                }]);
+                return Ok(reject_join(id, name, ChannelJoinRejection::NotOnAllowlist));
             }
         }
 
@@ -240,23 +243,11 @@ impl ChannelsRegistry {
                 .and_then(|rec| rec.banned_at)
                 .is_some_and(|t| t.elapsed() < CHANNEL_PASSWORD_BAN_DURATION);
             if banned {
-                return Ok(vec![Outgoing {
-                    to: id,
-                    message: ServerMessage::ChannelJoinRejected {
-                        name: name.to_string(),
-                        kind: ChannelJoinRejection::Banned,
-                    },
-                }]);
+                return Ok(reject_join(id, name, ChannelJoinRejection::Banned));
             }
             match password {
                 None => {
-                    return Ok(vec![Outgoing {
-                        to: id,
-                        message: ServerMessage::ChannelJoinRejected {
-                            name: name.to_string(),
-                            kind: ChannelJoinRejection::PasswordRequired,
-                        },
-                    }]);
+                    return Ok(reject_join(id, name, ChannelJoinRejection::PasswordRequired));
                 }
                 Some(given) if !crypto::constant_time_eq(expected.as_bytes(), given.as_bytes()) => {
                     let rec = self
@@ -273,13 +264,7 @@ impl ChannelsRegistry {
                     } else {
                         ChannelJoinRejection::WrongPassword
                     };
-                    return Ok(vec![Outgoing {
-                        to: id,
-                        message: ServerMessage::ChannelJoinRejected {
-                            name: name.to_string(),
-                            kind: rejection,
-                        },
-                    }]);
+                    return Ok(reject_join(id, name, rejection));
                 }
                 Some(_) => {
                     self.channel_password_attempts.remove(&attempt_key);
@@ -300,32 +285,32 @@ impl ChannelsRegistry {
         let mut outgoing = Vec::new();
         for member_id in existing_members {
             if let Some(info) = user_info_of(member_id) {
-                outgoing.push(Outgoing {
-                    to: id,
-                    message: ServerMessage::UserJoined {
+                outgoing.push(Outgoing::new(
+                    id,
+                    ServerMessage::UserJoined {
                         channel: name.to_string(),
                         user: info,
                     },
-                });
+                ));
             }
-            outgoing.push(Outgoing {
-                to: member_id,
-                message: ServerMessage::UserJoined {
+            outgoing.push(Outgoing::new(
+                member_id,
+                ServerMessage::UserJoined {
                     channel: name.to_string(),
                     user: joiner.clone(),
                 },
-            });
+            ));
         }
-        outgoing.push(Outgoing {
-            to: id,
-            message: ServerMessage::Joined {
+        outgoing.push(Outgoing::new(
+            id,
+            ServerMessage::Joined {
                 channel: ChannelInfo {
                     name: name.to_string(),
                     kind: channel_kind,
                 },
                 admin,
             },
-        });
+        ));
 
         // A brand-new *public* channel is announced to every other client -
         // the one-time ChannelList snapshot at connect otherwise never
@@ -335,15 +320,15 @@ impl ChannelsRegistry {
         if !existed_before && channel_kind == ChannelKind::Public {
             for &other_id in all_client_ids {
                 if other_id != id {
-                    outgoing.push(Outgoing {
-                        to: other_id,
-                        message: ServerMessage::ChannelCreated {
+                    outgoing.push(Outgoing::new(
+                        other_id,
+                        ServerMessage::ChannelCreated {
                             channel: ChannelInfo {
                                 name: name.to_string(),
                                 kind: channel_kind,
                             },
                         },
-                    });
+                    ));
                 }
             }
         }
@@ -371,12 +356,14 @@ impl ChannelsRegistry {
     pub fn leave(&mut self, id: UserId, name: &str) -> Vec<Outgoing> {
         self.remove_member(id, name)
             .into_iter()
-            .map(|member_id| Outgoing {
-                to: member_id,
-                message: ServerMessage::UserLeft {
-                    channel: name.to_string(),
-                    user_id: id,
-                },
+            .map(|member_id| {
+                Outgoing::new(
+                    member_id,
+                    ServerMessage::UserLeft {
+                        channel: name.to_string(),
+                        user_id: id,
+                    },
+                )
             })
             .collect()
     }
@@ -397,10 +384,7 @@ impl ChannelsRegistry {
         }
         recipients
             .into_iter()
-            .map(|to| Outgoing {
-                to,
-                message: ServerMessage::UserOffline { user_id: id },
-            })
+            .map(|to| Outgoing::new(to, ServerMessage::UserOffline { user_id: id }))
             .collect()
     }
 
@@ -446,12 +430,14 @@ impl ChannelsRegistry {
         };
         rec.members
             .into_iter()
-            .map(|to| Outgoing {
-                to,
-                message: ServerMessage::ChannelRemoved {
-                    name: name.to_string(),
-                    reason: reason.clone(),
-                },
+            .map(|to| {
+                Outgoing::new(
+                    to,
+                    ServerMessage::ChannelRemoved {
+                        name: name.to_string(),
+                        reason: reason.clone(),
+                    },
+                )
             })
             .collect()
     }
@@ -486,14 +472,14 @@ impl ChannelsRegistry {
         if let Some(id) = target_id.filter(|id| rec.members.contains(id)) {
             let remaining = self.remove_member(id, channel);
             for to in remaining.into_iter().chain(std::iter::once(id)) {
-                out.push(Outgoing {
+                out.push(Outgoing::new(
                     to,
-                    message: ServerMessage::UserBanned {
+                    ServerMessage::UserBanned {
                         channel: channel.to_string(),
                         user_id: id,
                         nickname: target_nickname.to_string(),
                     },
-                });
+                ));
             }
         }
         Ok(out)
@@ -512,12 +498,14 @@ impl ChannelsRegistry {
         Ok(rec
             .members
             .iter()
-            .map(|&to| Outgoing {
-                to,
-                message: ServerMessage::UserUnbanned {
-                    channel: channel.to_string(),
-                    nickname: target_nickname.to_string(),
-                },
+            .map(|&to| {
+                Outgoing::new(
+                    to,
+                    ServerMessage::UserUnbanned {
+                        channel: channel.to_string(),
+                        nickname: target_nickname.to_string(),
+                    },
+                )
             })
             .collect())
     }
@@ -543,12 +531,14 @@ impl ChannelsRegistry {
         Ok(rec
             .members
             .iter()
-            .map(|&to| Outgoing {
-                to,
-                message: ServerMessage::ChannelJoinLockUpdated {
-                    channel: channel.to_string(),
-                    by: caller_name.to_string(),
-                },
+            .map(|&to| {
+                Outgoing::new(
+                    to,
+                    ServerMessage::ChannelJoinLockUpdated {
+                        channel: channel.to_string(),
+                        by: caller_name.to_string(),
+                    },
+                )
             })
             .collect())
     }
@@ -573,12 +563,14 @@ impl ChannelsRegistry {
         Ok(rec
             .members
             .iter()
-            .map(|&to| Outgoing {
-                to,
-                message: ServerMessage::ChannelAdminChanged {
-                    channel: channel.to_string(),
-                    admin: Some(target_nickname.to_string()),
-                },
+            .map(|&to| {
+                Outgoing::new(
+                    to,
+                    ServerMessage::ChannelAdminChanged {
+                        channel: channel.to_string(),
+                        admin: Some(target_nickname.to_string()),
+                    },
+                )
             })
             .collect())
     }

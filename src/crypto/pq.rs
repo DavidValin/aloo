@@ -24,7 +24,7 @@
 //! they are superseded (`client::pq_rekey`, §13.10) - the signing keys of
 //! step 3 are the durable identity and do not.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, Key as AesKey, KeyInit as AesKeyInit, Nonce as AesNonce};
@@ -728,6 +728,84 @@ pub fn generate_bundle_with_bits(bits: usize) -> Result<(PqPublicBundle, PqPriva
 pub fn save_public_bundle(bundle: &PqPublicBundle, path: &Path) -> Result<()> {
     std::fs::write(path, bincode_encode(bundle)?)?;
     Ok(())
+}
+
+/// The suffix the public half of a keybundle always carries, under every
+/// spelling below.
+pub(crate) const PUBLIC_SUFFIX: &str = ".pub";
+
+/// The suffix an auto-generated private half carries.
+///
+/// Still read (`resolve_bundle_paths`), and still what
+/// `client::connect::fresh_pq_hybrid_paths_in` generates, but never what a
+/// prefix given on the command line is *written* to - see `bundle_paths`.
+pub(crate) const PRIVATE_SUFFIX: &str = ".priv";
+
+/// Where a keybundle prefix's two files are **written**: `<prefix>` holds
+/// the private bundle, `<prefix>.pub` the public one.
+///
+/// This is the spelling `--keygen-pq-hybrid` has always produced and that
+/// `docs/SPEC.md` and `docs/PROTOCOL.md` §13.9 document, so it is the one
+/// a freshly written bundle gets. Reading is deliberately more permissive
+/// - see `resolve_bundle_paths`.
+pub fn bundle_paths(prefix: &str) -> (PathBuf, PathBuf) {
+    (
+        PathBuf::from(prefix),
+        PathBuf::from(format!("{prefix}{PUBLIC_SUFFIX}")),
+    )
+}
+
+/// Where a keybundle prefix's two files are **read from**, tolerating both
+/// layouts that exist on disk in the wild.
+///
+/// Two spellings of "the private half of `<prefix>`" got written by
+/// different parts of this app: `--keygen-pq-hybrid` writes the bare
+/// `<prefix>` (`bundle_paths`), while everything that auto-generates one
+/// writes `<prefix>.priv` (`PRIVATE_SUFFIX`,
+/// `client::connect::fresh_pq_hybrid_paths_in`). A reader that knows only
+/// one of them does not merely fail to find the other - it reports a
+/// *half-present* pair, and `ensure_bundle_at` then does exactly what
+/// TB-134 requires of it and regenerates both, destroying the public half
+/// that was sitting right there. That is the whole of the bug this
+/// function exists to make unrepresentable.
+///
+/// `.priv` wins when both are present, and the order matters: an install
+/// that already went through the failure above has an orphaned bare
+/// `<prefix>` beside a *consistent* `.priv`/`.pub` pair, and picking the
+/// orphan would hand back a mismatched pair. Preferring `.priv` keeps the
+/// working pair and leaves the orphan alone.
+pub fn resolve_bundle_paths(prefix: &str) -> (PathBuf, PathBuf) {
+    let (private, public) = bundle_paths(prefix);
+    let generated_private = PathBuf::from(format!("{prefix}{PRIVATE_SUFFIX}"));
+    if generated_private.exists() {
+        return (generated_private, public);
+    }
+    (private, public)
+}
+
+/// Whether `private` and `public` are genuinely two halves of one
+/// keybundle, by deriving the RSA signing key's public half from the
+/// private one and comparing it with what the public bundle carries.
+///
+/// A bundle is always generated as a unit, so any mismatch mismatches
+/// every key in it - checking the RSA half is enough to catch the whole
+/// class, and unlike a signature round trip it costs no signing.
+///
+/// Why check at all: a mismatched pair is not loudly broken, it is
+/// *quietly* broken. Everything it signs (a send binding, a rotation, an
+/// identity card) verifies against a public half nobody else holds, so
+/// peers see a stream of failures with no local symptom -
+/// `make_identity_card` will happily emit a card that fails its own
+/// signature check. Refusing to load one is what turns that into an error
+/// at the moment it can still be understood.
+pub fn bundle_pair_matches(private: &PqPrivateBundle, public: &PqPublicBundle) -> bool {
+    let Ok(sk) = super::private_key_from_der(&private.rsa_sign_private_der) else {
+        return false;
+    };
+    let Ok(derived) = super::public_key_to_der(&sk.to_public_key()) else {
+        return false;
+    };
+    derived == public.rsa_sign_public_der
 }
 
 pub fn load_public_bundle(path: &Path) -> Result<PqPublicBundle> {

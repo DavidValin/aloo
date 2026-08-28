@@ -10,12 +10,11 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::proto::{KeyMode, UserId, UserInfo};
+use crate::proto::{UserId, UserInfo};
 
 use super::ui::{
     FileTransferStatus, Focus, LogEntry, MessageBody, MessageCrypto, MessageDelivery, UiState,
-    finalize_held_stream, finalize_stream_entry, local_time_stamp, push_log_entry,
-    render_input_bar, render_messages,
+    Unread, finalize_held_stream, finalize_stream_entry, render_input_bar, render_messages,
 };
 
 #[derive(Debug, Clone)]
@@ -163,20 +162,8 @@ impl UiState {
         body: MessageBody,
         listened: bool,
     ) {
-        let entry = LogEntry {
-            from,
-            from_name: from_name.clone(),
-            to_name: None,
-            body,
-            outgoing: false,
-            failed: false,
-            sent_at: local_time_stamp(),
-            sent_at_utc: crate::client::export::utc_time_stamp(),
-            owed_receipt: None,
-            listened,
-            delivery: None,
-            crypto: self.message_crypto(from, false),
-        };
+        let entry = LogEntry::incoming(from, from_name.clone(), body, self.message_crypto(from, false))
+            .with_listened(listened);
         // Same hold-and-reveal treatment as a channel message
         // (docs/PROTOCOL.md §12) - decrypts fine (our own key), but not
         // shown until `from` is Accepted. The room still isn't created yet
@@ -186,71 +173,31 @@ impl UiState {
             self.hold_message(from, None, entry);
             return;
         }
-        let unread = self.active_private_room != Some(from);
-        let is_current = self.is_viewing_dm(from);
-        let fallback_peer = self
-            .known_users
-            .get(&from)
-            .cloned()
-            .unwrap_or_else(|| UserInfo {
-                id: from,
-                name: from_name.clone(),
-                public_key_der: Vec::new(),
-                key_mode: KeyMode::PqHybrid,
-            });
+        let fallback_peer = self.peer_or_fallback(from, &from_name);
         self.ensure_private_room(from, fallback_peer);
-        let autosave = self.autosave_messages.then(|| self.server_label.clone());
-        let Some(room) = self.private_rooms.get_mut(&from) else {
-            return;
-        };
-        push_log_entry(&mut room.log, &mut self.message_selected, is_current, entry);
-        if unread {
-            room.unread = true;
-        }
-        if let Some(server_label) = &autosave {
-            crate::client::export::autosave_entry(
-                server_label,
-                crate::client::export::Surface::Dm(&from_name),
-                room.log.last().unwrap(),
-            );
-        }
+        self.append_to_dm(from, &from_name, entry, Unread::Mark);
+    }
+
+    /// The name of the peer whose DM room `to` names, if that room is
+    /// open. `None` when it is not - and every `log_own_*_dm` below
+    /// returns silently on that, because a row for a room that does not
+    /// exist has nowhere to be shown.
+    fn dm_peer_name(&self, to: UserId) -> Option<String> {
+        self.private_rooms.get(&to).map(|r| r.peer.name.clone())
     }
 
     pub fn log_own_voice_dm(&mut self, to: UserId, duration_ms: u32, pcm: Vec<u8>) {
-        let from = self.own_id.unwrap_or(UserId(0));
-        let from_name = self.own_name.clone();
-        let is_current = self.is_viewing_dm(to);
-        let crypto = self.message_crypto(to, true);
-        let autosave = self.autosave_messages.then(|| self.server_label.clone());
-        if let Some(room) = self.private_rooms.get_mut(&to) {
-            let peer_name = room.peer.name.clone();
-            push_log_entry(
-                &mut room.log,
-                &mut self.message_selected,
-                is_current,
-                LogEntry {
-                    from,
-                    from_name,
-                    to_name: None,
-                    body: MessageBody::Voice { duration_ms, pcm },
-                    outgoing: true,
-                    failed: false,
-                    sent_at: local_time_stamp(),
-                    sent_at_utc: crate::client::export::utc_time_stamp(),
-                    owed_receipt: None,
-                    listened: true,
-                    delivery: None,
-                    crypto,
-                },
-            );
-            if let Some(server_label) = &autosave {
-                crate::client::export::autosave_entry(
-                    server_label,
-                    crate::client::export::Surface::Dm(&peer_name),
-                    room.log.last().unwrap(),
-                );
-            }
-        }
+        let Some(peer_name) = self.dm_peer_name(to) else {
+            return;
+        };
+        let entry = LogEntry::outgoing(
+            self.own_id.unwrap_or(UserId(0)),
+            self.own_name.clone(),
+            MessageBody::Voice { duration_ms, pcm },
+            None,
+            self.message_crypto(to, true),
+        );
+        self.append_to_dm(to, &peer_name, entry, Unread::Leave);
     }
 
     pub fn log_own_voice_stream_start_dm(
@@ -259,33 +206,19 @@ impl UiState {
         stream_id: u64,
         delivery: Option<MessageDelivery>,
     ) {
-        let from = self.own_id.unwrap_or(UserId(0));
-        let from_name = self.own_name.clone();
-        let is_current = self.is_viewing_dm(to);
-        let crypto = self.message_crypto(to, true);
-        if let Some(room) = self.private_rooms.get_mut(&to) {
-            // No autosave hook here - see the sibling comment in
-            // `channel::log_own_voice_stream_start_channel`.
-            push_log_entry(
-                &mut room.log,
-                &mut self.message_selected,
-                is_current,
-                LogEntry {
-                    from,
-                    from_name,
-                    to_name: None,
-                    body: MessageBody::VoiceStreaming { stream_id },
-                    outgoing: true,
-                    failed: false,
-                    sent_at: local_time_stamp(),
-                    sent_at_utc: crate::client::export::utc_time_stamp(),
-                    owed_receipt: None,
-                    listened: true,
-                    delivery,
-                    crypto,
-                },
-            );
-        }
+        let Some(peer_name) = self.dm_peer_name(to) else {
+            return;
+        };
+        // The autosave is a no-op for a `VoiceStreaming` placeholder - see
+        // the sibling note in `channel::log_own_voice_stream_start_channel`.
+        let entry = LogEntry::outgoing(
+            self.own_id.unwrap_or(UserId(0)),
+            self.own_name.clone(),
+            MessageBody::VoiceStreaming { stream_id },
+            delivery,
+            self.message_crypto(to, true),
+        );
+        self.append_to_dm(to, &peer_name, entry, Unread::Leave);
     }
 
     pub fn on_direct_stream_start(
@@ -296,46 +229,27 @@ impl UiState {
         stream_id: u64,
         suppress_playback: bool,
     ) {
-        let entry = LogEntry {
+        let entry = LogEntry::incoming(
             from,
-            from_name: from_name.clone(),
-            to_name: None,
-            body: MessageBody::VoiceStreaming { stream_id },
-            outgoing: false,
-            failed: false,
-            sent_at: local_time_stamp(),
-            sent_at_utc: crate::client::export::utc_time_stamp(),
-            owed_receipt: None,
-            listened: !suppress_playback,
-            delivery: None,
-            crypto: self.message_crypto(from, false),
-        };
+            from_name.clone(),
+            MessageBody::VoiceStreaming { stream_id },
+            self.message_crypto(from, false),
+        )
+        .with_listened(!suppress_playback);
         if self.is_trust_gated(peer_id) {
             self.hold_message(peer_id, None, entry);
             return;
         }
-        let unread = self.active_private_room != Some(peer_id);
-        let is_current = self.is_viewing_dm(peer_id);
-        let fallback_peer = self
-            .known_users
-            .get(&peer_id)
-            .cloned()
-            .unwrap_or_else(|| UserInfo {
-                id: peer_id,
-                name: from_name.clone(),
-                public_key_der: Vec::new(),
-                key_mode: KeyMode::PqHybrid,
-            });
+        let fallback_peer = self.peer_or_fallback(peer_id, &from_name);
         self.ensure_private_room(peer_id, fallback_peer);
-        let Some(room) = self.private_rooms.get_mut(&peer_id) else {
-            return;
-        };
-        // No autosave hook here - see the sibling comment in
-        // `channel::log_own_voice_stream_start_channel`.
-        push_log_entry(&mut room.log, &mut self.message_selected, is_current, entry);
-        if unread {
-            room.unread = true;
-        }
+        // The autosave is a no-op for a `VoiceStreaming` placeholder - see
+        // the sibling note in `channel::log_own_voice_stream_start_channel`.
+        let peer_name = self
+            .private_rooms
+            .get(&peer_id)
+            .map(|r| r.peer.name.clone())
+            .unwrap_or_default();
+        self.append_to_dm(peer_id, &peer_name, entry, Unread::Mark);
     }
 
     /// Checks the visible room's log first, then the held buffer
@@ -378,54 +292,10 @@ impl UiState {
     /// session before the user has ever opened a DM with them), same as
     /// `on_direct_message`.
     pub fn push_otp_system_message(&mut self, peer: UserId, peer_name: &str, text: String) {
-        let unread = self.active_private_room != Some(peer);
-        let is_current = self.is_viewing_dm(peer);
-        let fallback_peer = self
-            .known_users
-            .get(&peer)
-            .cloned()
-            .unwrap_or_else(|| UserInfo {
-                id: peer,
-                name: peer_name.to_string(),
-                public_key_der: Vec::new(),
-                key_mode: KeyMode::PqHybrid,
-            });
+        let fallback_peer = self.peer_or_fallback(peer, peer_name);
         self.ensure_private_room(peer, fallback_peer);
-        let autosave = self.autosave_messages.then(|| self.server_label.clone());
-        let Some(room) = self.private_rooms.get_mut(&peer) else {
-            return;
-        };
-        push_log_entry(
-            &mut room.log,
-            &mut self.message_selected,
-            is_current,
-            LogEntry {
-                from: peer,
-                from_name: peer_name.to_string(),
-                to_name: None,
-                body: MessageBody::System(text),
-                outgoing: false,
-                failed: false,
-                sent_at: local_time_stamp(),
-                sent_at_utc: crate::client::export::utc_time_stamp(),
-                owed_receipt: None,
-                listened: true,
-                delivery: None,
-                // The app narrating its own OTP setup, not a message that
-                // travelled - there is no encryption to report on it.
-                crypto: None,
-            },
-        );
-        if unread {
-            room.unread = true;
-        }
-        if let Some(server_label) = &autosave {
-            crate::client::export::autosave_entry(
-                server_label,
-                crate::client::export::Surface::Dm(peer_name),
-                room.log.last().unwrap(),
-            );
-        }
+        let entry = LogEntry::system(peer, peer_name.to_string(), text);
+        self.append_to_dm(peer, peer_name, entry, Unread::Mark);
     }
 
     /// `push_outgoing_channel`'s DM counterpart - see there for why this
@@ -448,41 +318,15 @@ impl UiState {
         body: MessageBody,
         delivery: Option<MessageDelivery>,
     ) -> Option<usize> {
-        let from = self.own_id.unwrap_or(UserId(0));
-        let from_name = self.own_name.clone();
-        let is_current = self.is_viewing_dm(to);
-        let crypto = self.message_crypto(to, true);
-        let autosave = self.autosave_messages.then(|| self.server_label.clone());
-        let room = self.private_rooms.get_mut(&to)?;
-        let index = room.log.len();
-        let peer_name = room.peer.name.clone();
-        push_log_entry(
-            &mut room.log,
-            &mut self.message_selected,
-            is_current,
-            LogEntry {
-                from,
-                from_name,
-                to_name: None,
-                body,
-                outgoing: true,
-                failed: false,
-                sent_at: local_time_stamp(),
-                sent_at_utc: crate::client::export::utc_time_stamp(),
-                owed_receipt: None,
-                listened: true,
-                delivery,
-                crypto,
-            },
+        let peer_name = self.private_rooms.get(&to)?.peer.name.clone();
+        let entry = LogEntry::outgoing(
+            self.own_id.unwrap_or(UserId(0)),
+            self.own_name.clone(),
+            body,
+            delivery,
+            self.message_crypto(to, true),
         );
-        if let Some(server_label) = &autosave {
-            crate::client::export::autosave_entry(
-                server_label,
-                crate::client::export::Surface::Dm(&peer_name),
-                room.log.last().unwrap(),
-            );
-        }
-        Some(index)
+        self.append_to_dm(to, &peer_name, entry, Unread::Leave)
     }
 
     /// Marks the log row at `log_index` in `peer`'s room failed (rendered
@@ -531,8 +375,7 @@ impl UiState {
     }
 
     /// DM counterpart of `channel::log_own_file_offer_channel` - a DM room
-    /// only ever has one recipient, so there's nothing for `to_name` to
-    /// name (the room itself already does).
+    /// only ever has one recipient, which the room itself already names.
     pub fn log_own_file_offer_dm(
         &mut self,
         to: UserId,
@@ -541,45 +384,22 @@ impl UiState {
         total: u64,
         delivery: Option<MessageDelivery>,
     ) {
-        let from = self.own_id.unwrap_or(UserId(0));
-        let from_name = self.own_name.clone();
-        let is_current = self.is_viewing_dm(to);
-        let crypto = self.message_crypto(to, true);
-        let autosave = self.autosave_messages.then(|| self.server_label.clone());
-        if let Some(room) = self.private_rooms.get_mut(&to) {
-            let peer_name = room.peer.name.clone();
-            push_log_entry(
-                &mut room.log,
-                &mut self.message_selected,
-                is_current,
-                LogEntry {
-                    from,
-                    from_name,
-                    to_name: None,
-                    body: MessageBody::File {
-                        filename,
-                        total,
-                        stream_id,
-                        status: FileTransferStatus::Pending,
-                    },
-                    outgoing: true,
-                    failed: false,
-                    sent_at: local_time_stamp(),
-                    sent_at_utc: crate::client::export::utc_time_stamp(),
-                    owed_receipt: None,
-                    listened: true,
-                    delivery,
-                    crypto,
-                },
-            );
-            if let Some(server_label) = &autosave {
-                crate::client::export::autosave_entry(
-                    server_label,
-                    crate::client::export::Surface::Dm(&peer_name),
-                    room.log.last().unwrap(),
-                );
-            }
-        }
+        let Some(peer_name) = self.dm_peer_name(to) else {
+            return;
+        };
+        let entry = LogEntry::outgoing(
+            self.own_id.unwrap_or(UserId(0)),
+            self.own_name.clone(),
+            MessageBody::File {
+                filename,
+                total,
+                stream_id,
+                status: FileTransferStatus::Pending,
+            },
+            delivery,
+            self.message_crypto(to, true),
+        );
+        self.append_to_dm(to, &peer_name, entry, Unread::Leave);
     }
 
     /// DM counterpart of `channel::on_channel_file_offer_accepted`.
@@ -591,58 +411,20 @@ impl UiState {
         filename: String,
         total: u64,
     ) {
-        let unread = self.active_private_room != Some(from);
-        let is_current = self.is_viewing_dm(from);
-        let crypto = self.message_crypto(from, false);
-        let fallback_peer = self
-            .known_users
-            .get(&from)
-            .cloned()
-            .unwrap_or_else(|| UserInfo {
-                id: from,
-                name: from_name.clone(),
-                public_key_der: Vec::new(),
-                key_mode: KeyMode::PqHybrid,
-            });
-        self.ensure_private_room(from, fallback_peer);
-        let autosave = self.autosave_messages.then(|| self.server_label.clone());
-        let Some(room) = self.private_rooms.get_mut(&from) else {
-            return;
-        };
-        push_log_entry(
-            &mut room.log,
-            &mut self.message_selected,
-            is_current,
-            LogEntry {
-                from,
-                from_name: from_name.clone(),
-                to_name: None,
-                body: MessageBody::File {
-                    filename,
-                    total,
-                    stream_id,
-                    status: FileTransferStatus::InProgress { bytes: 0 },
-                },
-                outgoing: false,
-                failed: false,
-                sent_at: local_time_stamp(),
-                sent_at_utc: crate::client::export::utc_time_stamp(),
-                owed_receipt: None,
-                listened: true,
-                delivery: None,
-                crypto,
+        let entry = LogEntry::incoming(
+            from,
+            from_name.clone(),
+            MessageBody::File {
+                filename,
+                total,
+                stream_id,
+                status: FileTransferStatus::InProgress { bytes: 0 },
             },
+            self.message_crypto(from, false),
         );
-        if unread {
-            room.unread = true;
-        }
-        if let Some(server_label) = &autosave {
-            crate::client::export::autosave_entry(
-                server_label,
-                crate::client::export::Surface::Dm(&from_name),
-                room.log.last().unwrap(),
-            );
-        }
+        let fallback_peer = self.peer_or_fallback(from, &from_name);
+        self.ensure_private_room(from, fallback_peer);
+        self.append_to_dm(from, &from_name, entry, Unread::Mark);
     }
 }
 

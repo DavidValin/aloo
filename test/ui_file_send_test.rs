@@ -4,9 +4,10 @@ use ui_common::*;
 
 use aloo::client::file_browser::FileBrowserState;
 use aloo::client::file_transfer::{self, MAX_FILENAME_CHARS};
-use aloo::client::tui::file_send::{FileConfirmChoice, FileSendTarget};
+use aloo::client::tui::file_send::FileSendTarget;
+use aloo::client::tui::widgets::confirm_popup::Confirm;
 use aloo::client::tui::ui::{
-    FileOfferChoice, FileTransferStatus, Focus, IdentityCase, MessageBody, Mode, PendingFileOffer,
+    FileTransferStatus, Focus, IdentityCase, MessageBody, Mode, PendingFileOffer,
     UiAction,
 };
 use aloo::proto::UserId;
@@ -88,7 +89,7 @@ fn selecting_a_file_in_the_browser_opens_a_send_confirmation_defaulting_to_disca
         fs.confirm.as_deref(),
         Some(root.join("file.txt")).as_deref()
     );
-    assert_eq!(fs.confirm_focus, FileConfirmChoice::Discard);
+    assert_eq!(fs.confirm_focus, Confirm::No);
 
     std::fs::remove_dir_all(&root).ok();
 }
@@ -283,10 +284,8 @@ fn a_channel_file_send_logs_one_row_addressed_to_every_recipient() {
     );
     let entry = &state.channels[0].log[0];
     assert!(entry.outgoing);
-    assert_eq!(
-        entry.to_name, None,
-        "it is addressed to the channel; the popup names the people"
-    );
+    // One row addressed to the channel; the popup, not the row, names the
+    // individual people - which is what `delivery.recipients` below holds.
     let recipients = &entry
         .delivery
         .as_ref()
@@ -634,7 +633,7 @@ fn file_send_target_is_equality_comparable() {
 
 #[test]
 fn file_offer_choice_defaults_to_accept() {
-    assert_eq!(FileOfferChoice::Accept, FileOfferChoice::Accept);
+    assert_eq!(Confirm::Yes, Confirm::Yes);
     let _ = file_transfer::MAX_FILENAME_CHARS;
 }
 

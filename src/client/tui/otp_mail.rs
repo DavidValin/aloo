@@ -29,8 +29,10 @@ use crate::crypto::otp::{OTP_MAIL_MAX_BYTES, OtpMailPayload};
 
 use super::ui::{
     RecordSource, UiAction, UiState, VoiceTarget, centered_rect, focus_border_style,
-    format_duration_label, format_file_size, render_file_browser, render_popup_button,
+    format_duration_label, format_file_size, render_file_browser,
 };
+use super::widgets::confirm_popup::{BUTTON_WIDTH, Confirm, ConfirmLabels, render_confirm_row};
+use super::widgets::field::place_text_cursor;
 
 /// Which part of the compose form has focus - Tab cycles in this order.
 /// `Device` is only ever a stop on that cycle while `ComposeState::devices`
@@ -92,26 +94,6 @@ impl MailAttachment {
     }
 }
 
-/// The two-button confirmation shape all three mail confirms share
-/// (send, remove-attachment, remove-mail) - `Cancel` focused by default,
-/// the same "the irreversible action is never one accidental Enter away"
-/// rule every other destructive confirm here follows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum MailConfirmChoice {
-    Proceed,
-    #[default]
-    Cancel,
-}
-
-impl MailConfirmChoice {
-    fn toggled(self) -> Self {
-        match self {
-            MailConfirmChoice::Proceed => MailConfirmChoice::Cancel,
-            MailConfirmChoice::Cancel => MailConfirmChoice::Proceed,
-        }
-    }
-}
-
 /// The compose form's state. Fields are entered independently, in any
 /// order; nothing is validated at typing time except the recipient (whose
 /// check result lands in `check`) and the live pad budget derived from it.
@@ -143,10 +125,10 @@ pub struct ComposeState {
     pub browser: Option<FileBrowserState>,
     /// `Some(index)` while the remove-attachment confirm popup is open.
     pub delete_confirm: Option<usize>,
-    pub delete_confirm_focus: MailConfirmChoice,
+    pub delete_confirm_focus: Confirm,
     /// Whether the send confirm popup is open.
     pub send_confirm: bool,
-    pub send_confirm_focus: MailConfirmChoice,
+    pub send_confirm_focus: Confirm,
 }
 
 impl ComposeState {
@@ -164,9 +146,9 @@ impl ComposeState {
             check: None,
             browser: None,
             delete_confirm: None,
-            delete_confirm_focus: MailConfirmChoice::Cancel,
+            delete_confirm_focus: Confirm::No,
             send_confirm: false,
-            send_confirm_focus: MailConfirmChoice::Cancel,
+            send_confirm_focus: Confirm::No,
         }
     }
 
@@ -263,7 +245,7 @@ pub struct MailboxState {
     pub selected: usize,
     /// `Some(mail_id)` while the remove-mail confirm popup is open.
     pub delete_confirm: Option<String>,
-    pub delete_confirm_focus: MailConfirmChoice,
+    pub delete_confirm_focus: Confirm,
 }
 
 /// A received mail opened for reading: its payload, decrypted in memory by
@@ -415,7 +397,7 @@ impl UiState {
                     rows,
                     selected: 0,
                     delete_confirm: None,
-                    delete_confirm_focus: MailConfirmChoice::Cancel,
+                    delete_confirm_focus: Confirm::No,
                 });
             }
         }
@@ -566,13 +548,13 @@ impl UiState {
                 }
                 KeyCode::Esc => {
                     mb.delete_confirm = None;
-                    mb.delete_confirm_focus = MailConfirmChoice::Cancel;
+                    mb.delete_confirm_focus = Confirm::No;
                 }
                 KeyCode::Enter => {
                     let choice = mb.delete_confirm_focus;
                     mb.delete_confirm = None;
-                    mb.delete_confirm_focus = MailConfirmChoice::Cancel;
-                    if choice == MailConfirmChoice::Proceed {
+                    mb.delete_confirm_focus = Confirm::No;
+                    if choice == Confirm::Yes {
                         return Some(UiAction::DeleteOtpMail { mail_id });
                     }
                 }
@@ -613,7 +595,7 @@ impl UiState {
             KeyCode::Char('d') => {
                 if let Some(row) = mb.rows.get(mb.selected) {
                     mb.delete_confirm = Some(row.mail_id().to_string());
-                    mb.delete_confirm_focus = MailConfirmChoice::Cancel;
+                    mb.delete_confirm_focus = Confirm::No;
                 }
                 None
             }
@@ -700,13 +682,13 @@ impl UiState {
                 }
                 KeyCode::Esc => {
                     compose.delete_confirm = None;
-                    compose.delete_confirm_focus = MailConfirmChoice::Cancel;
+                    compose.delete_confirm_focus = Confirm::No;
                 }
                 KeyCode::Enter => {
                     let choice = compose.delete_confirm_focus;
                     let index = compose.delete_confirm.take();
-                    compose.delete_confirm_focus = MailConfirmChoice::Cancel;
-                    if choice == MailConfirmChoice::Proceed
+                    compose.delete_confirm_focus = Confirm::No;
+                    if choice == Confirm::Yes
                         && let Some(index) = index
                         && index < compose.attachments.len()
                     {
@@ -727,13 +709,13 @@ impl UiState {
                 }
                 KeyCode::Esc => {
                     compose.send_confirm = false;
-                    compose.send_confirm_focus = MailConfirmChoice::Cancel;
+                    compose.send_confirm_focus = Confirm::No;
                 }
                 KeyCode::Enter => {
                     let choice = compose.send_confirm_focus;
                     compose.send_confirm = false;
-                    compose.send_confirm_focus = MailConfirmChoice::Cancel;
-                    if choice == MailConfirmChoice::Proceed {
+                    compose.send_confirm_focus = Confirm::No;
+                    if choice == Confirm::Yes {
                         return Some(UiAction::SendOtpMail);
                     }
                 }
@@ -748,7 +730,7 @@ impl UiState {
                 KeyCode::Char('s') | KeyCode::Char('S') => {
                     if compose.valid_for_composing() {
                         compose.send_confirm = true;
-                        compose.send_confirm_focus = MailConfirmChoice::Cancel;
+                        compose.send_confirm_focus = Confirm::No;
                     } else {
                         self.push_status_notice(
                             "OTP mail: recipient must be valid and the mail must fit the remaining key".to_string(),
@@ -923,7 +905,7 @@ impl UiState {
                 KeyCode::Char('d') => {
                     if !compose.attachments.is_empty() {
                         compose.delete_confirm = Some(compose.selected_attachment);
-                        compose.delete_confirm_focus = MailConfirmChoice::Cancel;
+                        compose.delete_confirm_focus = Confirm::No;
                     }
                     None
                 }
@@ -966,10 +948,7 @@ impl UiState {
                         );
                         return None;
                     }
-                    let filename = path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| "file".to_string());
+                    let filename = crate::client::file_transfer::display_filename(&path);
                     let filename = crate::client::file_transfer::truncate_filename(&filename);
                     compose.attachments.push(MailAttachment::File {
                         filename,
@@ -1291,18 +1270,6 @@ pub(crate) fn render_otp_mail_view(frame: &mut Frame, area: Rect, state: &UiStat
     }
 }
 
-/// Places the terminal's own blinking cursor right after `value`'s text
-/// inside `inner`, the same convention `ui_connect_popup`'s own
-/// `place_text_cursor` uses - what makes it obvious which single-line
-/// field (`To`/`Subtext`) is about to receive typed characters, the same
-/// way the connect popup's fields already do. `Content` wraps across
-/// multiple lines and is not covered by this simple offset-from-start
-/// placement.
-fn place_text_cursor(frame: &mut Frame, inner: Rect, value: &str) {
-    let cursor_x = inner.x + (value.chars().count() as u16).min(inner.width.saturating_sub(1));
-    frame.set_cursor_position((cursor_x, inner.y));
-}
-
 /// The hard stop for composing to a recipient with no OTP mail key -
 /// renders over the whole compose view (mirroring `render_help_popup`'s
 /// full-frame `Clear` convention) in red, per the exact wording asked for.
@@ -1362,7 +1329,7 @@ fn render_mail_confirm(
     title: &str,
     message: &str,
     proceed_label: &str,
-    focus: MailConfirmChoice,
+    focus: Confirm,
 ) {
     let popup = centered_rect(64, 9, area);
     let block = Block::default().title(title.to_string()).borders(Borders::ALL);
@@ -1377,18 +1344,13 @@ fn render_mail_confirm(
         Paragraph::new(message.to_string()).wrap(Wrap { trim: true }),
         rows[0],
     );
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(rows[1]);
-    render_popup_button(
+    render_confirm_row(
         frame,
-        cols[0],
-        16,
-        proceed_label,
-        focus == MailConfirmChoice::Proceed,
+        rows[1],
+        ConfirmLabels::new(proceed_label, "Cancel"),
+        Some(focus),
+        BUTTON_WIDTH,
     );
-    render_popup_button(frame, cols[1], 16, "Cancel", focus == MailConfirmChoice::Cancel);
 }
 
 fn render_mailbox(frame: &mut Frame, area: Rect, mb: &MailboxState) {

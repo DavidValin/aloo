@@ -500,6 +500,83 @@ fn a_blank_line_separates_the_client_and_server_sections() {
     std::fs::remove_file(&path).ok();
 }
 
+/// The first-run file is assembled from two tables that share no text:
+/// `SCAFFOLD_LAYOUT` names the keys and the comment lines, `scalar_fields`
+/// supplies every value - which is what stops a key from being scaffolded
+/// in one spelling and saved in another. This locks the result of putting
+/// them together, byte for byte, so a key added to one table and not the
+/// other cannot pass unnoticed. (A layout entry naming a key
+/// `scalar_fields` doesn't manage panics outright, which every test here
+/// that calls `load_or_create` already exercises.)
+///
+/// Adding a setting is expected to change this text - deliberately, in
+/// the same commit that adds it.
+/// @requirement AC-356
+#[test]
+fn the_first_run_scaffold_is_written_exactly_like_this() {
+    let path = temp_settings_path();
+    Settings::load_or_create(&path).unwrap();
+    let contents = std::fs::read_to_string(&path).unwrap();
+    std::fs::remove_file(&path).ok();
+    assert_eq!(contents, EXPECTED_FIRST_RUN_SCAFFOLD);
+}
+
+/// Every line `Settings::load_or_create` writes on a machine's very first
+/// run - see `the_first_run_scaffold_is_written_exactly_like_this`.
+const EXPECTED_FIRST_RUN_SCAFFOLD: &str = "\
+# client options\n\
+# -----------------------------------------\n\
+global_ptt_enabled=true\n\
+global_ptt_shortcut=ctrl+alt+p\n\
+# voice_echo_ducking: auto (decide from the audio), on, off\n\
+voice_echo_ducking=auto\n\
+autosave_messages=off\n\
+resume_from_log=off\n\
+daemon_host=\n\
+daemon_port=\n\
+daemon_nickname=\n\
+daemon_server_password=\n\
+daemon_my_key_pub=\n\
+daemon_my_key_priv=\n\
+daemon_initial_focus=\n\
+# daemon_channel=otherchannel\n\
+daemon_otp=false\n\
+daemon_no_server=off\n\
+direct_punch=off\n\
+direct_punch_port=7879\n\
+# direct_punch_to=alice,alicehost.com:7879,every_1m\n\
+# direct_punch_channel=the-hall\n\
+noip_when_no_server_and_direct_punch_is_active=off\n\
+noip_hostname=\n\
+noip_username=\n\
+noip_password=\n\
+connect_host=\n\
+connect_nickname=\n\
+connect_port=\n\
+connect_using_ssl=off\n\
+connect_ssl_ca=\n\
+otp_binary_path=\n\
+otp_keypair_size_mb=1\n\
+otp_low_key_warn_pct=10\n\
+otp_status_poll_interval=20\n\
+# muted_voice=somenickname\n\
+\n\
+# server options\n\
+# -----------------------------------------\n\
+server_bind=0.0.0.0\n\
+server_port=7878\n\
+server_ssl=off\n\
+server_ssl_fullchain=~/.aloo/certs/fullchain.pem\n\
+server_ssl_privkey=~/.aloo/certs/privkey.pem\n\
+server_allow_registration=off\n\
+server_smtp_host=\n\
+server_smtp_port=\n\
+server_smtp_username=\n\
+server_smtp_password=\n\
+server_allow_create_public_channels=on\n\
+server_channel_deletion_unactivity_period=\n\
+# server_superadmin=somenickname\n";
+
 /// The scaffold is only ever *written* once, on first run - but a
 /// mid-session write (`save`/`update`, used by every ordinary action)
 /// patches that file's own lines in place rather than regenerating it, so

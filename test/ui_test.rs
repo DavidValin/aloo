@@ -4405,7 +4405,6 @@ fn entering_on_a_voice_on_disk_row_with_a_wav_decodes_and_plays_it() {
         &LogEntry {
             from: UserId(2),
             from_name: "bob".into(),
-            to_name: None,
             body: MessageBody::Voice {
                 duration_ms: 2000,
                 pcm: aloo::client::voice::pcm_to_bytes(&samples),
@@ -4471,7 +4470,6 @@ fn entering_on_a_voice_on_disk_row_with_no_wav_shows_a_status_notice_and_does_no
     state.channels[0].log.push(LogEntry {
         from: UserId(2),
         from_name: "bob".into(),
-        to_name: None,
         body: MessageBody::VoiceOnDisk { duration_ms: 2000, wav_path: None },
         outgoing: false,
         failed: false,

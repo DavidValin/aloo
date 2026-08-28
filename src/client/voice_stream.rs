@@ -447,6 +447,26 @@ fn duck_capture(
     }
 }
 
+/// Which ducking mode a recording should actually run under, given the
+/// device it is being captured from.
+///
+/// A capture device that cancels echo itself makes `voice::EchoDucker`
+/// redundant, and its attenuation is then pure cost to full duplex - so a
+/// cancelling device always wins over whatever the setting says. Every
+/// place that opens a `Recorder` asks this rather than re-deriving it:
+/// voice messages (channel and DM), the OTP accumulate path, and live
+/// calls all capture through the same microphone under the same rule.
+pub(crate) fn effective_echo_ducking(
+    recorder: &voice::Recorder,
+    configured: crate::settings::EchoDucking,
+) -> crate::settings::EchoDucking {
+    if recorder.echo_cancelled() {
+        crate::settings::EchoDucking::Off
+    } else {
+        configured
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_record_stream_worker(
     recorder: voice::Recorder,
@@ -529,7 +549,7 @@ pub(crate) fn spawn_record_stream_worker(
             }
 
             if stopped {
-                let duration_ms = ((total_samples * 1000) / voice::SAMPLE_RATE_HZ as u64) as u32;
+                let duration_ms = voice::duration_ms_of(total_samples);
                 let recipients = stream_recipient_ids(&target);
                 let _ = out_tx.send(crate::client::p2p::P2pOutbound::VoiceEnd {
                     stream_id,
@@ -587,7 +607,7 @@ pub(crate) fn spawn_record_accumulate_worker(
             }
 
             if stopped {
-                let duration_ms = ((total_samples * 1000) / voice::SAMPLE_RATE_HZ as u64) as u32;
+                let duration_ms = voice::duration_ms_of(total_samples);
                 let _ = done_tx.send((stream_id, duration_ms, plaintext_accum));
                 break; // `recorder` drops here, closing the input stream.
             }
@@ -747,9 +767,8 @@ pub(crate) fn spawn_stream_decrypt_worker(
                         }
                     }
                     if at_max {
-                        let sample_count = (plaintext_accum.len() / 2) as u64;
                         let duration_ms =
-                            ((sample_count * 1000) / voice::SAMPLE_RATE_HZ as u64) as u32;
+                            voice::duration_ms_of((plaintext_accum.len() / 2) as u64);
                         let _ = mixer_tx.send(voice::MixerCmd::Finish { id: mixer_id });
                         let _ = finished_tx.send((from, stream_id, duration_ms, plaintext_accum));
                         break;
@@ -759,9 +778,8 @@ pub(crate) fn spawn_stream_decrypt_worker(
                     let pcm = decryptor.decrypt(stream_id, seq, &blocks);
                     if let Some(pcm) = pcm {
                         if accept_pcm(pcm, &mut plaintext_accum) {
-                            let sample_count = (plaintext_accum.len() / 2) as u64;
                             let duration_ms =
-                                ((sample_count * 1000) / voice::SAMPLE_RATE_HZ as u64) as u32;
+                                voice::duration_ms_of((plaintext_accum.len() / 2) as u64);
                             let _ = mixer_tx.send(voice::MixerCmd::Finish { id: mixer_id });
                             let _ =
                                 finished_tx.send((from, stream_id, duration_ms, plaintext_accum));
@@ -770,8 +788,7 @@ pub(crate) fn spawn_stream_decrypt_worker(
                     }
                 }
                 DecryptJob::End => {
-                    let sample_count = (plaintext_accum.len() / 2) as u64;
-                    let duration_ms = ((sample_count * 1000) / voice::SAMPLE_RATE_HZ as u64) as u32;
+                    let duration_ms = voice::duration_ms_of((plaintext_accum.len() / 2) as u64);
                     let _ = mixer_tx.send(voice::MixerCmd::Finish { id: mixer_id });
                     let _ = finished_tx.send((from, stream_id, duration_ms, plaintext_accum));
                     break;
@@ -782,47 +799,41 @@ pub(crate) fn spawn_stream_decrypt_worker(
     tx
 }
 
-/// Plays the "message ended" chime through the mixer, same as any other
-/// source (`ReplayVoice` does the identical Push+Finish pair) - on the
-/// sender's release of Space and on an incoming stream's completion, so
-/// both ends of a voice message get the same audible cue.
+/// Plays one bundled chime through the mixer under a fresh source id -
+/// the same `Push`+`Finish` pair `ReplayVoice` uses for a recording, since
+/// a chime is just a very short one. Silent (and free) when the asset
+/// failed to decode, which is what an empty sample set means.
+///
+/// The three named chimes below are the whole call surface; this exists so
+/// they differ in nothing but which asset they play.
+fn play_chime(session: &mut SessionState, samples: Vec<i16>) {
+    if samples.is_empty() {
+        return;
+    }
+    let id = session.next_mixer_id;
+    session.next_mixer_id += 1;
+    let _ = session.mixer_tx.send(voice::MixerCmd::Push { id, samples });
+    let _ = session.mixer_tx.send(voice::MixerCmd::Finish { id });
+}
+
+/// The "message ended" chime - on the sender's release of Space and on an
+/// incoming stream's completion, so both ends of a voice message get the
+/// same audible cue.
 pub(crate) fn play_end_chime(session: &mut SessionState) {
-    let samples = voice::end_chime_samples();
-    if samples.is_empty() {
-        return;
-    }
-    let id = session.next_mixer_id;
-    session.next_mixer_id += 1;
-    let _ = session.mixer_tx.send(voice::MixerCmd::Push { id, samples });
-    let _ = session.mixer_tx.send(voice::MixerCmd::Finish { id });
+    play_chime(session, voice::end_chime_samples());
 }
 
-/// Plays the incoming-file-offer notification sound, same `Push`/`Finish`
-/// pattern as `play_end_chime` - called whenever a new file-offer popup
-/// becomes the one shown (`docs/PROTOCOL.md`'s file transfer section).
+/// The incoming-file-offer notification sound - played whenever a new
+/// file-offer popup becomes the one shown (`docs/PROTOCOL.md`'s file
+/// transfer section).
 pub(crate) fn play_bell_chime(session: &mut SessionState) {
-    let samples = voice::bell_chime_samples();
-    if samples.is_empty() {
-        return;
-    }
-    let id = session.next_mixer_id;
-    session.next_mixer_id += 1;
-    let _ = session.mixer_tx.send(voice::MixerCmd::Push { id, samples });
-    let _ = session.mixer_tx.send(voice::MixerCmd::Finish { id });
+    play_chime(session, voice::bell_chime_samples());
 }
 
-/// Plays the daemon's "someone you are focused on is here" sound, same
-/// `Push`/`Finish` pattern as the other two chimes (`docs/SPEC.md`
+/// The daemon's "someone you are focused on is here" sound (`docs/SPEC.md`
 /// "Daemon mode"). Only ever called with a daemon plan in effect.
 pub(crate) fn play_joined_chime(session: &mut SessionState) {
-    let samples = voice::joined_chime_samples();
-    if samples.is_empty() {
-        return;
-    }
-    let id = session.next_mixer_id;
-    session.next_mixer_id += 1;
-    let _ = session.mixer_tx.send(voice::MixerCmd::Push { id, samples });
-    let _ = session.mixer_tx.send(voice::MixerCmd::Finish { id });
+    play_chime(session, voice::joined_chime_samples());
 }
 
 /// Resolves one recipient's outgoing key material for a point-to-point

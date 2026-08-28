@@ -926,10 +926,13 @@ fn resolve_my_key(
     cached: Option<(&str, u16, &str, &str)>,
 ) -> Result<crate::client::connect::MyKeySelection, String> {
     if let Some(prefix) = &flags.my_key_prefix {
-        return Ok(crate::client::connect::MyKeySelection {
-            file_pub: PathBuf::from(format!("{prefix}.pub")),
-            file_priv: PathBuf::from(format!("{prefix}.priv")),
-        });
+        // Through `crypto::pq` rather than spelled out here: this used to
+        // assume `<prefix>.priv`, which meant a keybundle written by
+        // `aloo --keygen-pq-hybrid <prefix>` (bare `<prefix>`) looked
+        // half-present and was silently regenerated over - see
+        // `resolve_bundle_paths`.
+        let (file_priv, file_pub) = crate::crypto::pq::resolve_bundle_paths(prefix);
+        return Ok(crate::client::connect::MyKeySelection { file_pub, file_priv });
     }
     if let (Some(file_pub), Some(file_priv)) =
         (&settings.daemon_my_key_pub, &settings.daemon_my_key_priv)

@@ -10,10 +10,11 @@
 //!
 //! Modeled on `direct_punch_popup`'s `Mode`-based shape (state behind
 //! `Option<T>` on `UiState`, `open_x`/`handle_x_key`/`render_x_popup`),
-//! with the Confirm/Cancel row reusing `CallConfirmChoice`/
-//! `render_popup_button` exactly as `render_channel_command_confirm_popup`
-//! does. The checkbox list itself is new - nothing else in this app lets
-//! more than one row be selected at once.
+//! with the Confirm/Cancel row drawn by the shared
+//! `widgets::confirm_popup::render_confirm_row`, exactly as
+//! `render_channel_command_confirm_popup` does. The checkbox list itself
+//! is new - nothing else in this app lets more than one row be selected
+//! at once.
 
 use crossterm::event::KeyCode;
 use ratatui::Frame;
@@ -24,7 +25,8 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState};
 
 use crate::proto::UserId;
 
-use super::ui::{CallConfirmChoice, Mode, UiAction, UiState, centered_rect, focus_border_style, render_popup_button};
+use super::ui::{Mode, UiAction, UiState, centered_rect, focus_border_style};
+use super::widgets::confirm_popup::{BUTTON_WIDTH, Confirm, ConfirmLabels, render_confirm_row};
 
 pub struct ExportPopupState {
     /// Every joined channel, checked state initially off.
@@ -37,7 +39,7 @@ pub struct ExportPopupState {
     /// `false` while the checkbox list has focus, `true` once it's moved
     /// onto the Confirm/Cancel row.
     pub on_buttons: bool,
-    pub confirm_focus: CallConfirmChoice,
+    pub confirm_focus: Confirm,
 }
 
 impl ExportPopupState {
@@ -71,7 +73,7 @@ impl UiState {
             dms,
             cursor: 0,
             on_buttons: false,
-            confirm_focus: CallConfirmChoice::Cancel,
+            confirm_focus: Confirm::No,
         });
     }
 
@@ -85,10 +87,7 @@ impl UiState {
         if state.on_buttons {
             return match code {
                 KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
-                    state.confirm_focus = match state.confirm_focus {
-                        CallConfirmChoice::Confirm => CallConfirmChoice::Cancel,
-                        CallConfirmChoice::Cancel => CallConfirmChoice::Confirm,
-                    };
+                    state.confirm_focus.toggle();
                     None
                 }
                 KeyCode::Up => {
@@ -100,7 +99,7 @@ impl UiState {
                 }
                 KeyCode::Enter => {
                     let confirm_focus = state.confirm_focus;
-                    if confirm_focus == CallConfirmChoice::Cancel {
+                    if confirm_focus == Confirm::No {
                         self.export_popup = None;
                         self.mode = Mode::Normal;
                         return None;
@@ -211,22 +210,14 @@ pub(crate) fn render_export_popup(frame: &mut Frame, area: Rect, state: &UiState
     let list = List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     frame.render_stateful_widget(list, rows[0], &mut list_state);
 
-    let button_cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(rows[1]);
-    render_popup_button(
+    // Neither button is focused while the checkbox list still has the
+    // cursor - `None`, rather than a focus that would highlight a button
+    // the user has not moved to yet.
+    render_confirm_row(
         frame,
-        button_cols[0],
-        16,
-        "Confirm",
-        popup_state.on_buttons && popup_state.confirm_focus == CallConfirmChoice::Confirm,
-    );
-    render_popup_button(
-        frame,
-        button_cols[1],
-        16,
-        "Cancel",
-        popup_state.on_buttons && popup_state.confirm_focus == CallConfirmChoice::Cancel,
+        rows[1],
+        ConfirmLabels::CONFIRM_CANCEL,
+        popup_state.on_buttons.then_some(popup_state.confirm_focus),
+        BUTTON_WIDTH,
     );
 }

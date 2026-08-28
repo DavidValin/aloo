@@ -305,7 +305,7 @@ pub async fn unwrap_incoming(
 /// rather than allocating one the size of the file - the difference
 /// between erasing a 1TB pad and aborting the process trying to.
 fn secure_remove_dir(dir: &Path) {
-    crate::client::otp_staging::secure_remove_dir(dir);
+    crate::secure_fs::secure_remove_dir(dir);
 }
 
 /// Best-effort overwrite-then-remove of one temp content file created via
@@ -314,7 +314,7 @@ fn secure_remove_dir(dir: &Path) {
 /// through `otp --encrypt`/`--decrypt` on disk (never buffered whole in
 /// memory - see `otp_cli::encrypt_file`/`decrypt_file`).
 pub(crate) fn secure_remove_file(path: &Path) {
-    crate::client::otp_staging::secure_remove_file(path);
+    crate::secure_fs::secure_remove_file(path);
 }
 
 /// A fresh, collision-free path under the OTP working directory for a
@@ -332,25 +332,7 @@ pub(crate) fn temp_content_path(cfg: &OtpCliConfig, label: &str) -> std::path::P
         .join(format!("{label}-{}-{nanos}", std::process::id()))
 }
 
-#[cfg(unix)]
-fn restrict_file_permissions(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-}
-#[cfg(not(unix))]
-fn restrict_file_permissions(_path: &Path) {}
-
-/// A directory needs its executable bit to be traversable/writable-into at
-/// all - `0o600` (no `x`) would make it impossible to create files inside,
-/// unlike a plain file where `0o600` is exactly "owner read/write, nothing
-/// else" (see `restrict_file_permissions`).
-#[cfg(unix)]
-fn restrict_dir_permissions(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
-}
-#[cfg(not(unix))]
-fn restrict_dir_permissions(_path: &Path) {}
+use crate::secure_fs::{restrict_dir_permissions, restrict_file_permissions};
 
 /// Where a generated-but-not-yet-accepted pad waits. Both halves live here
 /// - this side's own and the peer's - until the peer actually accepts, at
@@ -3448,6 +3430,49 @@ pub(crate) fn otp_sender_of(
     crate::client::session::direct_peer_identity(&session.id_store, &nickname, device_id.as_deref())
 }
 
+/// The two questions every inbound pad-protected frame opens with: who
+/// sent it (`otp_sender_of`) and which pad contact that makes them
+/// (`contact_name_for_peer`).
+///
+/// `None` when either half doesn't resolve, and every caller treats that
+/// the same way - drop the frame in silence. Both halves fail for
+/// ordinary, transient reasons (a peer whose `DeviceIdAnnounce` hasn't
+/// decrypted yet, a `direct_punch_to` target with no key pinned), so
+/// neither is an error worth telling anyone about; the frame is simply
+/// not yet openable, and the sender's own retry brings it back.
+///
+/// `on_message` deliberately does *not* use this: it is the one caller
+/// that reacts differently to the two failures, offering an unknown-peer
+/// review when the sender is the half that didn't resolve.
+pub(crate) fn otp_sender_and_contact(
+    session: &SessionState,
+    ui_state: &UiState,
+    from: UserId,
+) -> Option<(UserInfo, String)> {
+    let sender = otp_sender_of(session, ui_state, from)?;
+    let contact_name = contact_name_for_peer(session, from, &sender.public_key_der)?;
+    Some((sender, contact_name))
+}
+
+/// Re-sends the `(seq, proof)` already recorded for a message this side
+/// accepted before, and does nothing if there is none.
+///
+/// Reached when `OtpStore::is_next_expected` says no: the peer is
+/// retrying something this contact's counter has already moved past,
+/// because the ack for it never arrived. Their single-outstanding-send
+/// gate (`pending_unacked_out_seq`) only ever opens on an ack, so staying
+/// silent would wedge it forever - and re-sending the recorded ack costs
+/// nothing, since it means no re-decrypt and, above all, no second pass
+/// over the pad. That is also why the check happens *before*
+/// `otp --decrypt` runs at every call site.
+fn resend_recorded_ack(session: &mut SessionState, from: UserId, contact_name: &str, seq: u64) {
+    if let Some(proof) = session.otp_store.ack_to_resend(contact_name, seq) {
+        session
+            .peer_link
+            .send_reliable_or_queue(from, P2pPayload::OtpDeliveryAck { seq, proof });
+    }
+}
+
 /// Records a sender the pad has just vouched for, so the rest of the app
 /// can treat them like any other peer - the sidebar, the DM room, and
 /// above all the *send* path, which needs them in `known_users` to address
@@ -4206,12 +4231,8 @@ pub async fn on_message(
         // gated send now, and its acceptance recorded the same durable
         // `(seq, proof)` every accepted text does
         // (`OtpStore::ack_to_resend`'s doc).
-        if matches!(envelope.content, Content::Text | Content::OtpEndSession)
-            && let Some(proof) = session.otp_store.ack_to_resend(&contact_name, seq)
-        {
-            session
-                .peer_link
-                .send_reliable_or_queue(from, P2pPayload::OtpDeliveryAck { seq, proof });
+        if matches!(envelope.content, Content::Text | Content::OtpEndSession) {
+            resend_recorded_ack(session, from, &contact_name, seq);
         }
         return Ok(());
     }
@@ -4369,28 +4390,17 @@ pub async fn on_file_offer(
     envelope: Envelope,
     sender_device_id: String,
 ) {
-    let Some(sender) = otp_sender_of(session, ui_state, from) else {
-        return;
-    };
-    let Some(contact_name) = contact_name_for_peer(session, from, &sender.public_key_der) else {
+    let Some((sender, contact_name)) = otp_sender_and_contact(session, ui_state, from) else {
         return;
     };
     if envelope.content != Content::FileOffer {
         return;
     }
-    // Checked *before* `otp --decrypt` runs - see `on_message`'s identical
-    // guard for why a resend of an already-processed offer must never
-    // touch the pad a second time.
+    // Checked *before* `otp --decrypt` runs, so a resend of an
+    // already-processed offer never touches the pad a second time - see
+    // `resend_recorded_ack`.
     if !session.otp_store.is_next_expected(&contact_name, seq) {
-        // Same reasoning as `on_message`'s duplicate `Content::Text` branch:
-        // the sender's own retry only stops on an ack, so re-send the one
-        // already recorded for this exact seq rather than staying silent.
-        if let Some(proof) = session.otp_store.ack_to_resend(&contact_name, seq) {
-            session.peer_link.send_reliable_or_queue(
-                from,
-                P2pPayload::OtpDeliveryAck { seq, proof },
-            );
-        }
+        resend_recorded_ack(session, from, &contact_name, seq);
         return;
     }
     let Some((plaintext, ack_proof)) = open_otp_envelope(
@@ -4479,28 +4489,16 @@ pub async fn on_voice_offer(
     envelope: Envelope,
     sender_device_id: String,
 ) {
-    let Some(sender) = otp_sender_of(session, ui_state, from) else {
-        return;
-    };
-    let Some(contact_name) = contact_name_for_peer(session, from, &sender.public_key_der) else {
+    let Some((sender, contact_name)) = otp_sender_and_contact(session, ui_state, from) else {
         return;
     };
     if envelope.content != Content::VoiceOffer {
         return;
     }
-    // Checked *before* `otp --decrypt` runs - the same guard `on_message`
-    // and `on_file_offer` use, so a resend of an offer this contact's
-    // counter already moved past never touches the pad a second time.
+    // The same guard `on_message` and `on_file_offer` use, and before the
+    // decrypt for the same reason - see `resend_recorded_ack`.
     if !session.otp_store.is_next_expected(&contact_name, seq) {
-        // Same reasoning as `on_message`'s duplicate `Content::Text` branch:
-        // the sender's own retry only stops on an ack, so re-send the one
-        // already recorded for this exact seq rather than staying silent.
-        if let Some(proof) = session.otp_store.ack_to_resend(&contact_name, seq) {
-            session.peer_link.send_reliable_or_queue(
-                from,
-                P2pPayload::OtpDeliveryAck { seq, proof },
-            );
-        }
+        resend_recorded_ack(session, from, &contact_name, seq);
         return;
     }
     let from_name = sender.name.clone();
@@ -4597,10 +4595,7 @@ pub async fn on_delivery_ack(
     seq: u64,
     proof: crate::crypto::otp::AckProof,
 ) -> proto::Result<()> {
-    let Some(sender) = otp_sender_of(session, ui_state, from) else {
-        return Ok(());
-    };
-    let Some(contact_name) = contact_name_for_peer(session, from, &sender.public_key_der) else {
+    let Some((sender, contact_name)) = otp_sender_and_contact(session, ui_state, from) else {
         return Ok(());
     };
     // Read before `record_acked` clears the gate: whether the send being
@@ -5177,18 +5172,11 @@ pub async fn on_content_seq(
         pending.seq = Some(seq);
         return;
     }
-    let Some(sender) = otp_sender_of(session, ui_state, from) else {
-        return;
-    };
-    let Some(contact_name) = contact_name_for_peer(session, from, &sender.public_key_der) else {
+    let Some((sender, contact_name)) = otp_sender_and_contact(session, ui_state, from) else {
         return;
     };
     if !session.otp_store.is_next_expected(&contact_name, seq) {
-        if let Some(proof) = session.otp_store.ack_to_resend(&contact_name, seq) {
-            session
-                .peer_link
-                .send_reliable_or_queue(from, P2pPayload::OtpDeliveryAck { seq, proof });
-        }
+        resend_recorded_ack(session, from, &contact_name, seq);
         return;
     }
     let temp_path = temp_content_path(&session.otp_cli_cfg, "otp-recv-recovered");
@@ -5418,7 +5406,7 @@ pub async fn recover_and_resend(
                 .await?;
             }
             crate::client::otp_store::PendingOtpContent::File { stream_id, .. } => {
-                recover_and_resend_file_offer(
+                recover_and_resend_offer(
                     wr,
                     session,
                     ui_state,
@@ -5427,6 +5415,7 @@ pub async fn recover_and_resend(
                     to,
                     &recipient_pubkey_der,
                     stream_id,
+                    OfferKind::File,
                 )
                 .await?;
             }
@@ -5442,7 +5431,7 @@ pub async fn recover_and_resend(
                 .await?;
             }
             crate::client::otp_store::PendingOtpContent::Voice { stream_id, .. } => {
-                recover_and_resend_voice_offer(
+                recover_and_resend_offer(
                     wr,
                     session,
                     ui_state,
@@ -5451,6 +5440,7 @@ pub async fn recover_and_resend(
                     to,
                     &recipient_pubkey_der,
                     stream_id,
+                    OfferKind::Voice,
                 )
                 .await?;
             }
@@ -5491,6 +5481,26 @@ pub async fn recover_and_resend(
 /// named, for a text whose recovery finally getting through should turn
 /// that row green (docs/PROTOCOL.md 7.2.1); `None` for the notice, which
 /// has no row.
+/// The kept safety copy of the last payload sent to `contact_name`, if
+/// there is one (`otp --recover-last --sent`).
+///
+/// Every recovery below opens with this, and every one of them treats a
+/// miss the same way: `None` covers both "nothing awaits confirmation"
+/// and "the CLI failed", and the answer to either is to leave the gate
+/// exactly as it stands - never to fall back on a fresh encode, which
+/// would spend pad a second time for a message already spent for - and
+/// try again on the next reconnect.
+async fn recover_last_sent(session: &SessionState, contact_name: &str) -> Option<Vec<u8>> {
+    otp_cli::recover_last(
+        &session.otp_cli_cfg,
+        contact_name,
+        otp_cli::RecoverDirection::Sent,
+    )
+    .await
+    .ok()
+    .flatten()
+}
+
 async fn recover_and_resend_envelope(
     wr: &mut impl crate::control::ControlSink,
     session: &mut SessionState,
@@ -5502,16 +5512,7 @@ async fn recover_and_resend_envelope(
     channel: Option<String>,
     msg_id: Option<u64>,
 ) -> proto::Result<()> {
-    let Ok(Some(recovered)) = otp_cli::recover_last(
-        &session.otp_cli_cfg,
-        contact_name,
-        otp_cli::RecoverDirection::Sent,
-    )
-    .await
-    else {
-        // Nothing to recover, or the CLI failed - leave the gate exactly as
-        // it is (never fall back to a fresh encode) and try again on the
-        // next reconnect.
+    let Some(recovered) = recover_last_sent(session, contact_name).await else {
         return Ok(());
     };
     let send_id = session.next_stream_id;
@@ -5541,17 +5542,34 @@ async fn recover_and_resend_envelope(
     Ok(())
 }
 
-/// Offer-phase recovery, mirroring `recover_and_resend_envelope` exactly: the
-/// offer is a genuine pad spend in its own right (`send_file_offer`'s
-/// doc), so recovering means recovering that same ciphertext, never
-/// re-encoding a fresh one - resent under the *same*
-/// `stream_id` the original offer used, so an eventual `FileAccepted` for
-/// it still finds the matching `OwnFileTarget` entry (only ever missing if
-/// this process itself restarted mid-transfer, since that map is
-/// in-memory only - a rarer, best-effort-only case this doesn't try to
-/// solve).
+/// Which of the two offers a recovery is replaying. They differ in
+/// exactly two places - the `Content` the blob was sealed under and the
+/// payload it goes back out in - and in nothing else, which is why
+/// `recover_and_resend_offer` is one function rather than the two
+/// near-identical ones it used to be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OfferKind {
+    File,
+    Voice,
+}
+
+/// Offer-phase recovery, mirroring `recover_and_resend_envelope` exactly:
+/// the offer is a genuine pad spend in its own right (`send_file_offer`'s
+/// doc, and `send_voice_offer` alongside it), so recovering means
+/// recovering that same ciphertext, never re-encoding a fresh one -
+/// resent under the *same* `stream_id` the original offer used.
+///
+/// For a file, that same `stream_id` is what lets an eventual
+/// `FileAccepted` still find the matching `OwnFileTarget` entry (only
+/// ever missing if this process itself restarted mid-transfer, since that
+/// map is in-memory only - a rarer, best-effort-only case this doesn't
+/// try to solve).
+///
+/// For a voice message, this covers the offer alone. The recording itself
+/// is a separate spend and recovers through
+/// `recover_and_resend_file_content`.
 #[allow(clippy::too_many_arguments)]
-async fn recover_and_resend_file_offer(
+async fn recover_and_resend_offer(
     wr: &mut impl crate::control::ControlSink,
     session: &mut SessionState,
     ui_state: &UiState,
@@ -5560,14 +5578,9 @@ async fn recover_and_resend_file_offer(
     to: UserId,
     recipient_pubkey_der: &[u8],
     stream_id: u64,
+    kind: OfferKind,
 ) -> proto::Result<()> {
-    let Ok(Some(recovered)) = otp_cli::recover_last(
-        &session.otp_cli_cfg,
-        contact_name,
-        otp_cli::RecoverDirection::Sent,
-    )
-    .await
-    else {
+    let Some(recovered) = recover_last_sent(session, contact_name).await else {
         return Ok(());
     };
     let Some(envelope) = frame_padded(
@@ -5576,24 +5589,37 @@ async fn recover_and_resend_file_offer(
         recipient_pubkey_der,
         stream_id,
         recovered,
-        Content::FileOffer,
+        match kind {
+            OfferKind::File => Content::FileOffer,
+            OfferKind::Voice => Content::VoiceOffer,
+        },
     ) else {
         return Ok(());
     };
     let msg_id = ui_state.own_stream_msg_id(stream_id);
     session.peer_link.ensure_link(wr, to).await;
-    let own_device_id = session.own_device_id.clone();
-    session.peer_link.send_reliable_or_queue(
-        to,
-        P2pPayload::OtpFileOffer {
+    let sender_device_id = session.own_device_id.clone();
+    let payload = match kind {
+        OfferKind::File => P2pPayload::OtpFileOffer {
+            // Sealed with no channel and offered as a DM either way: an
+            // OTP file offer names its room in `PendingFileOffer`, not in
+            // the binding - see `on_file_offer`.
             channel: None,
             stream_id,
             seq,
             msg_id,
             envelope,
-            sender_device_id: own_device_id,
+            sender_device_id,
         },
-    );
+        OfferKind::Voice => P2pPayload::OtpVoiceOffer {
+            stream_id,
+            seq,
+            msg_id,
+            envelope,
+            sender_device_id,
+        },
+    };
+    session.peer_link.send_reliable_or_queue(to, payload);
     Ok(())
 }
 
@@ -5650,58 +5676,6 @@ async fn recover_and_resend_file_content(
         stream_id,
         session.record_out_tx.clone(),
         session.file_events_tx.clone(),
-    );
-    Ok(())
-}
-
-/// Offer-phase recovery for a voice message - the exact counterpart of
-/// `recover_and_resend_file_offer`, and for the same reason: the offer was
-/// already genuinely OTP-encrypted before the connection dropped, so the
-/// blob is recovered (`recover_last`, never a fresh encrypt) and resent
-/// under the same `stream_id`. The recording itself is a separate spend
-/// and recovers through `recover_and_resend_file_content`.
-#[allow(clippy::too_many_arguments)]
-async fn recover_and_resend_voice_offer(
-    wr: &mut impl crate::control::ControlSink,
-    session: &mut SessionState,
-    ui_state: &UiState,
-    contact_name: &str,
-    seq: u64,
-    to: UserId,
-    recipient_pubkey_der: &[u8],
-    stream_id: u64,
-) -> proto::Result<()> {
-    let Ok(Some(recovered)) = otp_cli::recover_last(
-        &session.otp_cli_cfg,
-        contact_name,
-        otp_cli::RecoverDirection::Sent,
-    )
-    .await
-    else {
-        return Ok(());
-    };
-    let Some(envelope) = frame_padded(
-        session,
-        to,
-        recipient_pubkey_der,
-        stream_id,
-        recovered,
-        Content::VoiceOffer,
-    ) else {
-        return Ok(());
-    };
-    let msg_id = ui_state.own_stream_msg_id(stream_id);
-    session.peer_link.ensure_link(wr, to).await;
-    let own_device_id = session.own_device_id.clone();
-    session.peer_link.send_reliable_or_queue(
-        to,
-        P2pPayload::OtpVoiceOffer {
-            stream_id,
-            seq,
-            msg_id,
-            envelope,
-            sender_device_id: own_device_id,
-        },
     );
     Ok(())
 }

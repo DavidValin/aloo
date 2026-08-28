@@ -38,7 +38,6 @@ fn encrypt_for_recipient(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 /// `msg_id` is the delivery tag this send's frame carries, and the id of
 /// the log row already showing it (docs/PROTOCOL.md 7.2.1) - the peer's
 /// acknowledgement of that frame is what turns the row's indicator green.
@@ -235,11 +234,8 @@ pub(crate) async fn handle_voice_record_start(
                 recipient_pubkey_der,
             },
         );
-        let echo_ducking = if recorder.echo_cancelled() {
-        crate::settings::EchoDucking::Off
-    } else {
-        session.echo_ducking
-    };
+        let echo_ducking =
+            voice_stream::effective_echo_ducking(&recorder, session.echo_ducking);
         voice_stream::spawn_record_accumulate_worker(
             recorder,
             stream_id,
@@ -289,13 +285,7 @@ pub(crate) async fn handle_voice_record_start(
     session
         .own_stream_targets
         .insert(stream_id, voice_stream::OwnStreamTarget::Direct(to));
-    // A device that cancels echo itself makes `voice::EchoDucker`
-    // redundant, and its attenuation is then pure cost to full duplex.
-    let echo_ducking = if recorder.echo_cancelled() {
-        crate::settings::EchoDucking::Off
-    } else {
-        session.echo_ducking
-    };
+    let echo_ducking = voice_stream::effective_echo_ducking(&recorder, session.echo_ducking);
     voice_stream::spawn_record_stream_worker(
         recorder,
         voice_stream::StreamRecipients::Direct { to, key },

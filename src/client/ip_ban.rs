@@ -167,42 +167,38 @@ impl IpBanList {
     /// starts empty.
     pub fn load(path: &Path) -> io::Result<Self> {
         let mut banned = HashMap::new();
-        match fs::read_to_string(path) {
-            Ok(contents) => {
-                for line in contents.lines() {
-                    let mut fields = line.splitn(4, '\t');
-                    let Some(date) = fields.next() else {
-                        continue;
-                    };
-                    let Some(ip) = fields.next() else {
-                        continue;
-                    };
-                    let Some(reason) = fields.next() else {
-                        continue;
-                    };
-                    // Absent (older/hand-edited files) or unparseable reads
-                    // back as permanent rather than failing the line.
-                    let expires_at = fields.next().and_then(|s| {
-                        if s.is_empty() {
-                            None
-                        } else {
-                            s.parse::<u64>().ok()
-                        }
-                    });
-                    if let Ok(ip) = ip.parse::<IpAddr>() {
-                        banned.insert(
-                            ip,
-                            BanRecord {
-                                date: date.to_string(),
-                                reason: reason.to_string(),
-                                expires_at,
-                            },
-                        );
+        if let Some(contents) = crate::platform::read_to_string_optional(path)? {
+            for line in contents.lines() {
+                let mut fields = line.splitn(4, '\t');
+                let Some(date) = fields.next() else {
+                    continue;
+                };
+                let Some(ip) = fields.next() else {
+                    continue;
+                };
+                let Some(reason) = fields.next() else {
+                    continue;
+                };
+                // Absent (older/hand-edited files) or unparseable reads
+                // back as permanent rather than failing the line.
+                let expires_at = fields.next().and_then(|s| {
+                    if s.is_empty() {
+                        None
+                    } else {
+                        s.parse::<u64>().ok()
                     }
+                });
+                if let Ok(ip) = ip.parse::<IpAddr>() {
+                    banned.insert(
+                        ip,
+                        BanRecord {
+                            date: date.to_string(),
+                            reason: reason.to_string(),
+                            expires_at,
+                        },
+                    );
                 }
             }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
         }
         Ok(Self {
             path: path.to_path_buf(),
@@ -297,11 +293,7 @@ impl IpBanList {
     }
 
     fn save(&self) -> io::Result<()> {
-        if let Some(parent) = self.path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            fs::create_dir_all(parent)?;
-        }
+        crate::platform::ensure_parent_dir(&self.path)?;
         let mut ips: Vec<&IpAddr> = self.banned.keys().collect();
         ips.sort();
         let mut out = format!("{} banned\n", self.banned.len());

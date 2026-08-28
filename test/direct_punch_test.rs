@@ -891,6 +891,48 @@ async fn a_direct_targets_nickname_and_live_peers_are_queryable() {
 
 // ---- Running with no server at all (--no-server) ------------------------
 
+/// Which way a key rotation leaves this machine (`docs/PROTOCOL.md`
+/// §13.10, §7.1.5). `run_connected_session`'s `rotate_out_rx` arm asks
+/// exactly this before choosing between the direct link and the control
+/// channel, and the answer has to be right in two independent ways -
+/// hence the whole truth table rather than the two obvious cases.
+///
+/// Worth pinning because getting it wrong is *silent*: a rotation sent
+/// the wrong way is simply never applied, messages keep encrypting and
+/// decrypting against the un-rotated bootstrap keys, and forward secrecy
+/// stops with nothing on screen to say so.
+/// @requirement TB-225
+#[test]
+fn a_rotation_rides_the_link_exactly_when_no_server_can_relay_it() {
+    use aloo::client::p2p::direct_peer_id;
+    use aloo::client::session::{ServerState, rotation_rides_the_link};
+
+    let server_peer = UserId(7);
+    let direct_peer = direct_peer_id("bob", None);
+
+    // With a server on the line, an ordinary peer's rotation is relayed -
+    // the one case that must *not* take the link.
+    assert!(!rotation_rides_the_link(ServerState::Connected, server_peer));
+
+    // A serverless peer has no relay even in principle: no server has ever
+    // named them, so this holds even while a server is connected.
+    assert!(rotation_rides_the_link(ServerState::Connected, direct_peer));
+
+    // And with no server able to relay right now, everything takes the
+    // link - whether the server is gone for good or merely away, since
+    // either way the rotation cannot wait for it.
+    for state in [ServerState::Absent, ServerState::Unreachable] {
+        assert!(
+            rotation_rides_the_link(state, server_peer),
+            "{state:?}: an ordinary peer's rotation must fall back to the link"
+        );
+        assert!(
+            rotation_rides_the_link(state, direct_peer),
+            "{state:?}: a serverless peer's rotation always takes the link"
+        );
+    }
+}
+
 /// @requirement AC-218, TB-245
 #[test]
 fn server_state_distinguishes_no_server_from_an_unreachable_one() {

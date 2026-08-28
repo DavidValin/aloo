@@ -152,54 +152,38 @@ pub fn activation_code_is_well_formed(code: &str) -> bool {
 }
 
 /// Why a registration (or a CLI edit) was refused.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RegisterError {
     /// See `validation::nickname_is_registrable`.
+    #[error("nickname must be 1-{} letters, digits, '-' or '_'", validation::NICKNAME_MAX_LEN)]
     InvalidNickname,
     /// See `validation::email_is_plausible`.
+    #[error("that does not look like an email address")]
     InvalidEmail,
     /// An account of that name exists and is active.
+    #[error("that nickname is already registered")]
     AlreadyRegistered,
     /// `email` already names a different, still-registered nickname - one
     /// address may back only one account.
+    #[error("that email address is already registered under another nickname")]
     EmailAlreadyRegistered,
     /// An account of that name exists with an activation code that is
     /// still valid - it can be activated, not replaced, until the code
     /// expires.
+    #[error("that nickname is registered and waiting for its activation code")]
     ActivationPending,
     /// `change_password` on a name nobody registered.
+    #[error("no such registered nickname")]
     NotRegistered,
     /// The password is empty.
+    #[error("password must not be empty")]
     EmptyPassword,
+    #[error("users registry error: {0}")]
     Io(String),
 }
 
-impl std::fmt::Display for RegisterError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            RegisterError::InvalidNickname => write!(
-                f,
-                "nickname must be 1-{} letters, digits, '-' or '_'",
-                validation::NICKNAME_MAX_LEN
-            ),
-            RegisterError::InvalidEmail => write!(f, "that does not look like an email address"),
-            RegisterError::AlreadyRegistered => write!(f, "that nickname is already registered"),
-            RegisterError::EmailAlreadyRegistered => {
-                write!(f, "that email address is already registered under another nickname")
-            }
-            RegisterError::ActivationPending => write!(
-                f,
-                "that nickname is registered and waiting for its activation code"
-            ),
-            RegisterError::NotRegistered => write!(f, "no such registered nickname"),
-            RegisterError::EmptyPassword => write!(f, "password must not be empty"),
-            RegisterError::Io(e) => write!(f, "users registry error: {e}"),
-        }
-    }
-}
-
-impl std::error::Error for RegisterError {}
-
+/// Not `#[from]` on the variant above: it carries a `String`, because this
+/// enum derives `PartialEq`/`Eq` and `io::Error` implements neither.
 impl From<io::Error> for RegisterError {
     fn from(e: io::Error) -> Self {
         RegisterError::Io(e.to_string())

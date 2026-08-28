@@ -51,7 +51,6 @@ fn autosave_texts(server_label: &str, texts: &[&str]) {
             &aloo::client::tui::ui::LogEntry {
                 from: UserId(2),
                 from_name: "bob".into(),
-                to_name: None,
                 body: MessageBody::Text(text.to_string()),
                 outgoing: false,
                 failed: false,
@@ -3853,7 +3852,6 @@ fn resuming_history_does_not_skip_real_history_when_autosave_was_off() {
         state.channels[0].log.push(aloo::client::tui::ui::LogEntry {
             from: UserId(2),
             from_name: "bob".into(),
-            to_name: None,
             body: MessageBody::Text(text.to_string()),
             outgoing: false,
             failed: false,

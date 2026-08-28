@@ -251,16 +251,12 @@ impl IdStore {
     /// partially-corrupted file doesn't block connecting.
     pub fn load(path: &Path) -> io::Result<Self> {
         let mut entries: HashMap<String, Vec<DeviceEntry>> = HashMap::new();
-        match fs::read_to_string(path) {
-            Ok(contents) => {
-                for line in contents.lines() {
-                    if let Some((name, entry)) = parse_line(line) {
-                        entries.entry(name).or_default().push(entry);
-                    }
+        if let Some(contents) = crate::platform::read_to_string_optional(path)? {
+            for line in contents.lines() {
+                if let Some((name, entry)) = parse_line(line) {
+                    entries.entry(name).or_default().push(entry);
                 }
             }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
         }
         Ok(Self {
             path: path.to_path_buf(),
@@ -747,11 +743,7 @@ impl IdStore {
     /// so the file diffs reasonably cleanly and `get`'s "most recently
     /// pinned" fallback stays meaningful across a save/load round trip.
     pub fn save(&self) -> io::Result<()> {
-        if let Some(parent) = self.path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            fs::create_dir_all(parent)?;
-        }
+        crate::platform::ensure_parent_dir(&self.path)?;
         let mut names: Vec<&String> = self.entries.keys().collect();
         names.sort();
         let mut out = String::new();
@@ -784,6 +776,19 @@ impl IdStore {
             }
         }
         fs::write(&self.path, out)
+    }
+
+    /// `save`, with the one thing every caller in this app does about a
+    /// failure: log it and carry on. Losing a pin write is bad, but not
+    /// worth abandoning the action that prompted it - the entry is still
+    /// live in memory for this session, and the next successful save
+    /// writes it. Thirteen call sites spelled this out identically; the
+    /// point of naming it is that they cannot drift into handling it
+    /// three different ways.
+    pub fn save_or_warn(&self) {
+        if let Err(e) = self.save() {
+            crate::log_warn!("failed to save id_store: {e}");
+        }
     }
 }
 

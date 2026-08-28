@@ -3715,6 +3715,27 @@ bundle that doesn't actually pair with the private one would silently
 produce an identity that can't decrypt its own incoming messages, a worse
 outcome than just regenerating.
 
+**Resolving a prefix to that pair** (`crypto::pq::resolve_bundle_paths`),
+for the one entry point that names a keybundle by prefix rather than by its
+two paths: `aloo --daemon --my-key <prefix>`. Two spellings of the private
+half exist on disk in the wild - `aloo --keygen-pq-hybrid <prefix>` writes
+the bare `<prefix>`, while anything auto-generated (below) writes
+`<prefix>.priv` - so both are accepted, `.priv` winning when both are
+present, and a freshly written one takes the documented `<prefix>` form.
+This matters more than it looks: a reader that knew only one spelling did
+not merely fail to find the other, it reported an *intact* keybundle as
+half-present, and the auto-generation above then did exactly what it is
+specified to do and regenerated both - destroying the public half and
+silently swapping the identity, with no §12.6 continuity certificate for
+the contacts who had pinned it.
+
+**Refusing a mismatched pair** (`crypto::pq::bundle_pair_matches`, checked
+by `resolve_my_keypair` after loading): two files that both exist are not
+necessarily two halves of one bundle, which the "either missing regenerates
+both" rule above does not cover. Such an identity has no local symptom - it
+signs every send, rotation and identity card with a key no peer holds the
+counterpart to - so it is refused at load time rather than connected with.
+
 **A fresh, not-yet-generated default location** the moment the connect
 popup opens for the very first time (`connect.rs::fresh_pq_hybrid_paths_in`):
 a random 4-character lowercase-alphanumeric prefix (`random_prefix`,

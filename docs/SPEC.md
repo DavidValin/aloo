@@ -703,8 +703,14 @@ and no prompt: if the keybundle does not exist yet, it is generated on
 first connect. Point at a specific one with:
 
 ```sh
-aloo --daemon --my-key=/home/you/.aloo/mykeys      # mykeys.pub + mykeys.priv
+aloo --daemon --my-key=/home/you/.aloo/mykeys      # mykeys + mykeys.pub
 ```
+
+That is the pair `aloo --keygen-pq-hybrid /home/you/.aloo/mykeys` writes, so
+a keybundle you generated yourself can be pointed at directly. A
+`mykeys.priv` left by an earlier auto-generated bundle is still accepted,
+and preferred when both are present; a fresh one is written as
+`mykeys` + `mykeys.pub`.
 
 Otherwise it reuses whatever you last connected with (`~/.aloo/.cache`).
 
@@ -1295,7 +1301,7 @@ here that implements it. If a name changes on one side, it changes on both.
 | Crash-safe staging: nothing half-written can ever be installed (§16.1) | `client/otp_staging.rs` `tmp_root`, `sweep`, `new_dir`, `promote`, `secure_remove_file`, `secure_remove_dir`; `client/otp.rs` `stage_pending_setup`, `apply_incoming_setup` |
 | Streamed pad generation and its progress spinner (§16.1) | `client/otp_cli.rs` `new_key_pair`, `new_key_pair_with_progress`; `client/otp.rs` `initiate_provisioning`, `initiate_provisioning_with_progress`, `OtpKeygenEvent`, `on_keygen_event`; `client/tui/ui.rs` `OtpKeygenProgress`, `SPINNER_FRAMES`, `open_otp_keygen`, `set_otp_keygen_progress`, `close_otp_keygen`, `otp_keygen_open`, `tick_otp_keygen_spinner`, `render_otp_keygen_popup`; `client/session.rs` `otp_keygen_tx` |
 | Origin/order verification refusing a message before any key is spent | `client/otp_cli.rs` `OtpCliOutcome::Rejected`, `FileCliOutcome::Rejected`; `client/otp.rs` `UnwrapOutcome`, `unwrap_incoming`, `finish_opening_otp_envelope`, `recover_orphaned_decrypt`, `finish_incoming_file`; `client/otp_mail.rs` `on_mail_deliver` |
-| Recovering a stuck send via `otp --recover-last`, never re-encoding (§16.4) | `client/otp_cli.rs` `recover_last`, `recover_last_file`, `RecoverDirection`; `client/otp_store.rs` `OtpContactState.pending_content`, `PendingOtpContent`, `OtpStore::pending_sends`; `client/otp.rs` `recover_and_resend`, `recover_and_resend_envelope`, `recover_and_resend_file_offer`, `recover_and_resend_file_content`, `recover_and_resend_voice_offer`, `peer_for_contact_name`; `client/session.rs` `handle_p2p_event`'s `LinkStatusChanged` arm |
+| Recovering a stuck send via `otp --recover-last`, never re-encoding (§16.4) | `client/otp_cli.rs` `recover_last`, `recover_last_file`, `RecoverDirection`; `client/otp_store.rs` `OtpContactState.pending_content`, `PendingOtpContent`, `OtpStore::pending_sends`; `client/otp.rs` `recover_and_resend`, `recover_and_resend_envelope`, `recover_and_resend_offer`, `OfferKind`, `recover_and_resend_file_content`, `peer_for_contact_name`; `client/session.rs` `handle_p2p_event`'s `LinkStatusChanged` arm |
 | Rejecting a resent ciphertext before it touches the pad a second time (§16.4) | `client/otp_store.rs` `OtpStore::is_next_expected`; `client/otp.rs` `on_message` |
 | Live key-metadata header (§16.5) | `client/otp_cli.rs` `ContactDetail`, `show_contact`, `parse_show_contact`; `client/otp.rs` `refresh_otp_key_status`, `poll_key_status`; `client/tui/ui.rs` `UiState.otp_key_status`, `set_otp_key_status`, `otp_key_status_for`; `client/tui/direct_message.rs` `render_private_room`, `render_otp_header`, `push_otp_key_spans`, `OTP_KEY_LOW_THRESHOLD_BYTES`; `client/session.rs` tick loop |
 | `/endotp`: local pause, notice, and the mail/multi-session guards (§16.6) | `client/otp.rs` `handle_end_otp_command`, `decide_end_otp`, `EndOtpDecision`, `on_end_session`, `on_end_session_ack`, `send_end_notice_now`, `recover_and_resend_envelope`, `send_sealed_end_session_ack`; `client/otp_store.rs` `OtpStore::mark_end_requested`, `pause_after_peer_ended`, `PendingOtpContent::EndNotice`; `client/tui/ui.rs` `UiAction::EndOtpSession`, `submit_input` (`/endotp`); `proto.rs` `Content::OtpEndSession`/`OtpEndSessionAck` |
@@ -1498,6 +1504,8 @@ the DM recording is refused outright (`direct_message.rs`).
 | Who can be addressed | anyone who announced a keybundle that decodes; one who did not is reachable only under an already-installed pad (`otp.rs` `framing_for`) |
 | `id_store` pinning | `session.rs` `check_identity` - a file-loaded identity is the same bytes every connect, so a plain byte comparison against the pin is the whole check |
 | Auto-generate keys if missing | `crypto/pq.rs` `ensure_bundle_at`, called from `connect.rs` `resolve_my_keypair` (`docs/PROTOCOL.md` §13.9) |
+| Resolve a keybundle prefix to its two files | `crypto/pq.rs` `bundle_paths` (writing), `resolve_bundle_paths` (reading, accepts both layouts); `daemon.rs` `resolve_my_key` (`docs/PROTOCOL.md` §13.9) |
+| Refuse a mismatched pub/priv pair | `crypto/pq.rs` `bundle_pair_matches`, checked by `connect.rs` `resolve_my_keypair` (`docs/PROTOCOL.md` §13.9) |
 | Connect-popup cache (`~/.aloo/.cache`) | `connect.rs` `ConnectCache`, `cache_path`, `random_prefix`, `fresh_pq_hybrid_paths_in`, `prefill_connect_defaults` |
 
 ### Logging in — a separate axis

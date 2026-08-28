@@ -111,7 +111,9 @@ struct Cli {
     nick_pwd: Option<String>,
 
     /// Daemon-only: the `pq_hybrid` keybundle prefix to connect with -
-    /// `<PREFIX>` and `<PREFIX>.pub`. Generated on first use if missing.
+    /// `<PREFIX>` and `<PREFIX>.pub`, the pair `--keygen-pq-hybrid` writes.
+    /// A `<PREFIX>.priv` from an auto-generated bundle is accepted too.
+    /// Generated on first use if neither is there.
     #[arg(long, value_name = "PREFIX", help_heading = "Client Commands")]
     my_key: Option<String>,
 
@@ -447,8 +449,7 @@ fn run_keygen_pq_hybrid(prefix: &str) -> Result<(), BoxError> {
     println!("this involves real 4096-bit RSA keygen twice and can take a while.");
     let (public, private) = crypto::pq::generate_bundle()?;
 
-    let priv_path = PathBuf::from(prefix);
-    let pub_path = PathBuf::from(format!("{prefix}.pub"));
+    let (priv_path, pub_path) = crypto::pq::bundle_paths(prefix);
     crypto::pq::save_private_bundle(&private, &priv_path)?;
     crypto::pq::save_public_bundle(&public, &pub_path)?;
 
@@ -468,8 +469,7 @@ fn run_keygen_pq_hybrid(prefix: &str) -> Result<(), BoxError> {
 /// someone who actually holds them can produce it - which is exactly what
 /// distinguishes a planned key change from someone taking your nickname.
 fn run_rekey_pq_hybrid(old_prefix: &str, new_prefix: &str) -> Result<(), BoxError> {
-    let old_priv = PathBuf::from(old_prefix);
-    let old_pub = PathBuf::from(format!("{old_prefix}.pub"));
+    let (old_priv, old_pub) = crypto::pq::resolve_bundle_paths(old_prefix);
     let old_private = crypto::pq::load_private_bundle(&old_priv)?;
     let old_public = crypto::pq::load_public_bundle(&old_pub)?;
 
@@ -480,8 +480,7 @@ fn run_rekey_pq_hybrid(old_prefix: &str, new_prefix: &str) -> Result<(), BoxErro
     let cert = crypto::pq::sign_continuity(&old_private, &old_public, &new_public)?;
     let new_public = new_public.with_continuity(cert);
 
-    let new_priv_path = PathBuf::from(new_prefix);
-    let new_pub_path = PathBuf::from(format!("{new_prefix}.pub"));
+    let (new_priv_path, new_pub_path) = crypto::pq::bundle_paths(new_prefix);
     crypto::pq::save_private_bundle(&new_private, &new_priv_path)?;
     crypto::pq::save_public_bundle(&new_public, &new_pub_path)?;
 
@@ -503,8 +502,9 @@ fn run_rekey_pq_hybrid(old_prefix: &str, new_prefix: &str) -> Result<(), BoxErro
 /// it proves whoever holds these keys asked to be known by this name. What
 /// makes it worth anything is the channel you send it over.
 fn run_export_identity_card(prefix: &str, nickname: &str) -> Result<(), BoxError> {
-    let private = crypto::pq::load_private_bundle(&PathBuf::from(prefix))?;
-    let public = crypto::pq::load_public_bundle(&PathBuf::from(format!("{prefix}.pub")))?;
+    let (priv_path, pub_path) = crypto::pq::resolve_bundle_paths(prefix);
+    let private = crypto::pq::load_private_bundle(&priv_path)?;
+    let public = crypto::pq::load_public_bundle(&pub_path)?;
 
     let card = crypto::pq::make_identity_card(&private, &public, nickname)?;
     let path = PathBuf::from(format!("{nickname}.aloo-card"));

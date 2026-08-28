@@ -444,6 +444,151 @@ fn the_connect_cache_is_the_last_resort_before_defaults() {
     );
 }
 
+/// A `--my-key <prefix>` naming a keybundle that
+/// `aloo --keygen-pq-hybrid <prefix>` produced must resolve to *that*
+/// bundle.
+///
+/// It did not: `resolve_my_key` assumed the private half was always
+/// `<prefix>.priv`, which keygen never writes. The pair then looked
+/// half-present to `crypto::pq::ensure_bundle_at`, which did what TB-134
+/// requires and regenerated both - overwriting the public half of a
+/// perfectly intact keybundle and silently connecting as a different
+/// identity, with no continuity certificate for the contacts who had
+/// pinned the old one.
+///
+/// Only the paths are asserted here; the destruction that followed from
+/// getting them wrong is pinned in `hybrid_crypto_test`.
+/// @requirement TB-283
+#[test]
+fn a_my_key_prefix_resolves_a_keygen_written_bundle_rather_than_regenerating_it() {
+    let dir = std::env::temp_dir().join(format!("aloo-mykey-keygen-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let prefix = dir.join("mykey").display().to_string();
+
+    // Exactly what `--keygen-pq-hybrid <prefix>` leaves on disk: the bare
+    // prefix and its `.pub`, and no `.priv` at all.
+    std::fs::write(&prefix, b"private").unwrap();
+    std::fs::write(format!("{prefix}.pub"), b"public").unwrap();
+
+    let config = DaemonConfig::resolve(
+        &DaemonFlags {
+            my_key_prefix: Some(prefix.clone()),
+            ..flags_with_host()
+        },
+        &Settings::default(),
+        &ConnectCache::new_empty("/nonexistent".into()),
+    )
+    .unwrap();
+
+    assert_eq!(
+        config.my_key,
+        MyKeySelection {
+            file_pub: format!("{prefix}.pub").into(),
+            file_priv: prefix.clone().into(),
+        },
+        "the private half is the bare prefix keygen actually wrote"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The other layout on disk: a keybundle some earlier run auto-generated,
+/// whose private half is `<prefix>.priv`. Still resolved, so fixing the
+/// case above does not break the installs that were working.
+/// @requirement TB-283
+#[test]
+fn a_my_key_prefix_still_resolves_an_auto_generated_bundle() {
+    let dir = std::env::temp_dir().join(format!("aloo-mykey-generated-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let prefix = dir.join("mykey").display().to_string();
+
+    std::fs::write(format!("{prefix}.priv"), b"private").unwrap();
+    std::fs::write(format!("{prefix}.pub"), b"public").unwrap();
+
+    let config = DaemonConfig::resolve(
+        &DaemonFlags {
+            my_key_prefix: Some(prefix.clone()),
+            ..flags_with_host()
+        },
+        &Settings::default(),
+        &ConnectCache::new_empty("/nonexistent".into()),
+    )
+    .unwrap();
+
+    assert_eq!(
+        config.my_key,
+        MyKeySelection {
+            file_pub: format!("{prefix}.pub").into(),
+            file_priv: format!("{prefix}.priv").into(),
+        }
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// An install that already went through the failure keeps three files: an
+/// orphaned bare `<prefix>` from the original keygen, plus the consistent
+/// `.priv`/`.pub` pair that replaced it. Resolution must pick the pair
+/// that actually works, not the orphan - which is why `.priv` wins when
+/// both spellings are present.
+/// @requirement TB-283
+#[test]
+fn a_prefix_carrying_both_spellings_resolves_the_pair_that_matches() {
+    let dir = std::env::temp_dir().join(format!("aloo-mykey-both-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let prefix = dir.join("mykey").display().to_string();
+
+    std::fs::write(&prefix, b"orphaned private from the original keygen").unwrap();
+    std::fs::write(format!("{prefix}.priv"), b"private that matches .pub").unwrap();
+    std::fs::write(format!("{prefix}.pub"), b"public").unwrap();
+
+    let config = DaemonConfig::resolve(
+        &DaemonFlags {
+            my_key_prefix: Some(prefix.clone()),
+            ..flags_with_host()
+        },
+        &Settings::default(),
+        &ConnectCache::new_empty("/nonexistent".into()),
+    )
+    .unwrap();
+
+    assert_eq!(
+        config.my_key.file_priv,
+        std::path::PathBuf::from(format!("{prefix}.priv")),
+        "the orphan must not be preferred over the working pair"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// With neither spelling on disk there is nothing to be compatible with,
+/// so a fresh bundle is generated at the documented location - the same
+/// `<prefix>` + `<prefix>.pub` `--keygen-pq-hybrid` writes and
+/// `--my-key`'s own help promises.
+/// @requirement TB-283
+#[test]
+fn a_my_key_prefix_with_nothing_on_disk_names_the_documented_layout() {
+    let dir = std::env::temp_dir().join(format!("aloo-mykey-fresh-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let prefix = dir.join("mykey").display().to_string();
+
+    let config = DaemonConfig::resolve(
+        &DaemonFlags {
+            my_key_prefix: Some(prefix.clone()),
+            ..flags_with_host()
+        },
+        &Settings::default(),
+        &ConnectCache::new_empty("/nonexistent".into()),
+    )
+    .unwrap();
+
+    assert_eq!(
+        config.my_key,
+        MyKeySelection {
+            file_pub: format!("{prefix}.pub").into(),
+            file_priv: prefix.clone().into(),
+        }
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// What the connect screen last recorded (`Settings::remember_connection`)
 /// is consulted after the `daemon_*` keys and before the cache - which is
 /// what makes a first `--daemon` on a machine that has only ever been used

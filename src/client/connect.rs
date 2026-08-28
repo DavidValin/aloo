@@ -81,31 +81,17 @@ pub struct ResolvedIdentity {
 /// A distinct error type so `run_client_inner` can tell "the server
 /// rejected this nickname" apart from other, fatal handshake failures via
 /// `downcast_ref` and loop back to the popup instead of exiting.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
 struct NicknameTakenError(String);
-
-impl std::fmt::Display for NicknameTakenError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl std::error::Error for NicknameTakenError {}
 
 /// The credentials were right but the account is not activated yet
 /// (`AuthResult { activation_pending: true }`, §5.2) - or the code this
 /// connect carried was refused. Either way the caller's next move is the
 /// activation popup, not an error screen; the string is what it shows.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
 pub struct ActivationRequiredError(pub String);
-
-impl std::fmt::Display for ActivationRequiredError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl std::error::Error for ActivationRequiredError {}
 
 /// Runs `fut` to completion while keeping the screen alive: the connect
 /// popup and its title banner are hidden, the background animation keeps
@@ -401,16 +387,9 @@ pub async fn register_account(request: &RegisterRequest) -> Result<(), BoxError>
 /// into the form with the reason shown, the same way a wrong password
 /// already does, rather than ending the client the way an unclassified
 /// connect failure still does.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
 pub struct SslMismatchError(pub String);
-
-impl std::fmt::Display for SslMismatchError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl std::error::Error for SslMismatchError {}
 
 /// After `request`'s own connect attempt has already failed, tries once
 /// more at the same host/port with the *opposite* `ssl` - never to
@@ -453,6 +432,22 @@ pub(crate) const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::fro
 /// works, unless `e` already proves the transport mode was fine (a wrong
 /// password, a taken nickname, a deactivated account, or a pending
 /// activation code) - probing an unrelated failure would only add latency.
+/// The error a connect attempt that ran past `CONNECT_TIMEOUT` reports -
+/// itself fed through `with_ssl_diagnosis`, since a timeout is one of the
+/// strongest signals of a transport-mode mismatch there is (see
+/// `connect_with_reconnect`'s own comment on why neither side ever
+/// resolves that stall on its own).
+async fn timed_out(request: &ConnectRequest) -> BoxError {
+    let timeout_err: BoxError = format!(
+        "connect to {}:{} timed out after {}s",
+        request.host,
+        request.port,
+        CONNECT_TIMEOUT.as_secs()
+    )
+    .into();
+    with_ssl_diagnosis(request, timeout_err).await
+}
+
 async fn with_ssl_diagnosis(request: &ConnectRequest, e: BoxError) -> BoxError {
     let already_explained = e.downcast_ref::<NicknameTakenError>().is_some()
         || e.downcast_ref::<AuthRefusedError>().is_some()
@@ -490,16 +485,7 @@ pub(crate) async fn handshake_as_bounded_and_diagnosed(
     match tokio::time::timeout(CONNECT_TIMEOUT, handshake_as(request, public_key_der)).await {
         Ok(Ok(ok)) => Ok(ok),
         Ok(Err(e)) => Err(with_ssl_diagnosis(request, e).await),
-        Err(_elapsed) => {
-            let timeout_err: BoxError = format!(
-                "connect to {}:{} timed out after {}s",
-                request.host,
-                request.port,
-                CONNECT_TIMEOUT.as_secs()
-            )
-            .into();
-            Err(with_ssl_diagnosis(request, timeout_err).await)
-        }
+        Err(_elapsed) => Err(timed_out(request).await),
     }
 }
 
@@ -540,16 +526,7 @@ pub async fn connect_with_reconnect(
     let (rd, wr, you, identity, server_addr) = match attempt {
         Ok(Ok(ok)) => ok,
         Ok(Err(e)) => return Err(with_ssl_diagnosis(request, e).await),
-        Err(_elapsed) => {
-            let timeout_err: BoxError = format!(
-                "connect to {}:{} timed out after {}s",
-                request.host,
-                request.port,
-                CONNECT_TIMEOUT.as_secs()
-            )
-            .into();
-            return Err(with_ssl_diagnosis(request, timeout_err).await);
-        }
+        Err(_elapsed) => return Err(timed_out(request).await),
     };
     let public_key_der = identity.public_der.clone();
     let (sink, lost_rx) = reconnect::ServerSink::new(wr);
@@ -571,16 +548,9 @@ pub async fn connect_with_reconnect(
 /// The server refused the nickname/password pair (§5.1) - shown on the
 /// connect form rather than ending the client, since a typo in a password
 /// is the likeliest cause by far.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
 pub struct AuthRefusedError(pub String);
-
-impl std::fmt::Display for AuthRefusedError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl std::error::Error for AuthRefusedError {}
 
 /// The credentials were right, but a superadmin has deactivated this
 /// account. Shown on the connect form exactly like `AuthRefusedError` -
@@ -588,16 +558,9 @@ impl std::error::Error for AuthRefusedError {}
 /// full-screen takeover modal (shown to an *already-connected* session
 /// that gets deactivated live) to interrupt; an inline reason is both
 /// simpler and consistent with every other login failure here.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
 pub struct AccountDeactivatedError(pub String);
-
-impl std::fmt::Display for AccountDeactivatedError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl std::error::Error for AccountDeactivatedError {}
 
 /// Connects, then runs the auth + identify handshake. On success returns
 /// the split stream halves, the `UserId` the server assigned us, and our
@@ -840,6 +803,21 @@ pub fn resolve_my_keypair(sel: &MyKeySelection) -> Result<ResolvedIdentity, BoxE
     crypto::pq::ensure_bundle_at(&sel.file_pub, &sel.file_priv)?;
     let private = crypto::pq::load_private_bundle(&sel.file_priv)?;
     let public = crypto::pq::load_public_bundle(&sel.file_pub)?;
+    // Two files that both exist are not necessarily two halves of one
+    // bundle - `ensure_bundle_at` only guards the half-*missing* case
+    // (TB-134). A mismatched pair has no local symptom at all: it signs
+    // everything with a key no peer can verify against, so refusing it
+    // here is the only place it is still explicable.
+    if !crypto::pq::bundle_pair_matches(&private, &public) {
+        return Err(format!(
+            "{} and {} are not two halves of the same keybundle - refusing to \
+             connect with a mismatched identity. Point at a matching pair, or \
+             move both aside and let a fresh one be generated.",
+            sel.file_priv.display(),
+            sel.file_pub.display()
+        )
+        .into());
+    }
     let public_der = proto::encode(&public)?;
     Ok(ResolvedIdentity {
         private,
@@ -927,24 +905,20 @@ impl ConnectCache {
     /// valid `u16`, is skipped rather than failing the whole load.
     pub fn load(path: &Path) -> io::Result<Self> {
         let mut entries = Vec::new();
-        match fs::read_to_string(path) {
-            Ok(contents) => {
-                for line in contents.lines() {
-                    let parts: Vec<&str> = line.split('\t').collect();
-                    if let [host, port, file_pub, file_priv] = parts[..]
-                        && let Ok(port) = port.parse::<u16>()
-                    {
-                        entries.push(CachedConnection {
-                            host: host.to_string(),
-                            port,
-                            pq_file_pub: file_pub.to_string(),
-                            pq_file_priv: file_priv.to_string(),
-                        });
-                    }
+        if let Some(contents) = crate::platform::read_to_string_optional(path)? {
+            for line in contents.lines() {
+                let parts: Vec<&str> = line.split('\t').collect();
+                if let [host, port, file_pub, file_priv] = parts[..]
+                    && let Ok(port) = port.parse::<u16>()
+                {
+                    entries.push(CachedConnection {
+                        host: host.to_string(),
+                        port,
+                        pq_file_pub: file_pub.to_string(),
+                        pq_file_priv: file_priv.to_string(),
+                    });
                 }
             }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
         }
         Ok(Self {
             path: path.to_path_buf(),
@@ -985,11 +959,7 @@ impl ConnectCache {
     /// Persists all entries to `path`, creating parent directories if
     /// needed - same conventions as `idstore::IdStore::save`.
     pub fn save(&self) -> io::Result<()> {
-        if let Some(parent) = self.path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            fs::create_dir_all(parent)?;
-        }
+        crate::platform::ensure_parent_dir(&self.path)?;
         let mut out = String::new();
         for e in &self.entries {
             out.push_str(&e.host);
@@ -1044,16 +1014,16 @@ pub fn random_prefix() -> String {
 pub fn fresh_pq_hybrid_paths_in(dir: &Path) -> (PathBuf, PathBuf) {
     for _ in 0..20 {
         let prefix = random_prefix();
-        let file_pub = dir.join(format!("{prefix}.pub"));
-        let file_priv = dir.join(format!("{prefix}.priv"));
+        let file_pub = dir.join(format!("{prefix}{}", crypto::pq::PUBLIC_SUFFIX));
+        let file_priv = dir.join(format!("{prefix}{}", crypto::pq::PRIVATE_SUFFIX));
         if !file_pub.exists() && !file_priv.exists() {
             return (file_pub, file_priv);
         }
     }
     let prefix = random_prefix();
     (
-        dir.join(format!("{prefix}.pub")),
-        dir.join(format!("{prefix}.priv")),
+        dir.join(format!("{prefix}{}", crypto::pq::PUBLIC_SUFFIX)),
+        dir.join(format!("{prefix}{}", crypto::pq::PRIVATE_SUFFIX)),
     )
 }
 
