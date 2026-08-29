@@ -384,13 +384,19 @@ pub async fn handle_send(
     // (`OtpContactState::encrypt_intent`) - the mail id is fixed now so the
     // promoted record still names the same mail.
     let mail_id = new_mail_id();
-    session.otp_store.set_encrypt_intent(
+    if !crate::client::otp::stage_encrypt_intent(
+        session,
         &contact_name,
         crate::client::otp_store::PendingOtpContent::Mail {
             mail_id: mail_id.clone(),
         },
-    );
-    let _ = session.otp_store.save();
+    ) {
+        fail(
+            ui_state,
+            "OTP mail: could not record this send before encrypting - not sent".to_string(),
+        );
+        return Ok(());
+    }
     let outcome =
         otp_cli::encrypt_retrying(&session.otp_cli_cfg, &contact_name, &plaintext, true).await;
     let ciphertext = match outcome {

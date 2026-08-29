@@ -1321,10 +1321,19 @@ impl UiState {
             return Some(UiAction::OpenContacts);
         }
         if self.input.trim() == "/leave" {
-            // Always the currently selected channel tab - `/leave` takes
-            // no argument. A no-op if that tab isn't actually joined yet
-            // (its `Joined` confirmation still in flight) - nothing to
-            // leave.
+            // Whatever is actually in view. In a private room it closes
+            // that conversation and forgets it (`leave_private_room`);
+            // otherwise it is the selected channel tab, which is what it
+            // has always been. Either way it takes no argument, and
+            // either way the messages go with it - a channel's whole tab
+            // is dropped, a room's whole log is.
+            if let Some(peer) = self.active_private_room {
+                self.input.clear();
+                self.leave_private_room(peer);
+                return None;
+            }
+            // A no-op if that tab isn't actually joined yet (its `Joined`
+            // confirmation still in flight) - nothing to leave.
             let channel = self.channels.get(self.selected_channel)?;
             if !channel.joined {
                 return None;

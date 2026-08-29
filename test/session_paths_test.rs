@@ -22,6 +22,7 @@ use aloo::control::NullSink;
 use aloo::crypto::pq::{
     PqPrivateBundle, PqPublicBundle, bundle_fingerprint, generate_bundle_with_bits, seal_send,
 };
+use aloo::client::tui::ui::MessageBody;
 use aloo::proto::{self, ChannelInfo, ChannelKind, Content, Envelope, KeyMode, UserId, UserInfo};
 
 /// Small enough to keep the suite quick - key *size* is not what any of
@@ -514,4 +515,374 @@ async fn a_half_filled_noip_account_configures_nothing() {
         ..aloo::settings::Settings::default()
     });
     assert!(!session.noip_is_configured());
+}
+
+/// The whole reported flow, end to end: an open DM, the peer goes
+/// offline, a message is sent to them, and they come back **under a new
+/// `UserId`** - which is what every reconnect gives them
+/// (`docs/PROTOCOL.md` §3), and the reason this queue is keyed by
+/// nickname at all.
+/// @requirement AC-410
+#[tokio::test]
+async fn a_message_queued_while_a_peer_was_away_goes_out_when_they_reconnect() {
+    let (mut session, mut ui, _peers) = session_and_ui("reconnect", "me").await;
+
+    // Sent while she is unreachable.
+    session
+        .peer_link_mut()
+        .send_reliable_or_queue(ALICE, sealed_text(b"while you were out"));
+    drain(&mut ui, &mut session).await;
+    assert_eq!(session.queued_for("alice"), 1);
+
+    // She disconnects: the server frees her id and the client forgets
+    // everything that id named.
+    aloo::client::session::forget_peer_for_test(&mut ui, &mut session, ALICE);
+    assert_eq!(
+        session.queued_for("alice"),
+        1,
+        "the queue outlives the connection it was written during"
+    );
+
+    // ...and comes back as somebody new, as far as the server is
+    // concerned: same person, same nickname, different `UserId`.
+    let reconnected = UserId(99);
+    let alice = aloo::proto::UserInfo {
+        id: reconnected,
+        name: "alice".into(),
+        public_key_der: vec![1, 2, 3, 4],
+        key_mode: aloo::proto::KeyMode::PqHybrid,
+    };
+    ui.known_users.insert(reconnected, alice);
+    session
+        .peer_link_mut()
+        .open_unpunched_link_for_test(reconnected);
+
+    // Her link comes up, which is what the session acts on.
+    session.inject_p2p_event(aloo::client::p2p::P2pEvent::LinkStatusChanged {
+        peer: reconnected,
+        status: aloo::client::p2p::LinkStatus::Active,
+    });
+    drain(&mut ui, &mut session).await;
+
+    assert_eq!(
+        session.queued_for("alice"),
+        1,
+        "handed to the transport, but still held: nothing may be deleted \
+         on the strength of having been sent, only on her acknowledging it"
+    );
+    let sent = session.sent_or_queued_payloads(reconnected);
+    assert!(
+        sent.iter().any(|p| matches!(
+            p,
+            aloo::p2p_proto::P2pPayload::Envelope { envelope, .. }
+                if envelope.blocks == vec![b"while you were out".to_vec()]
+        )),
+        "the message should have gone out to her new id: {sent:?}"
+    );
+
+    // Her acknowledgement is what finally retires it - and the only thing
+    // that does.
+    session.inject_p2p_event(aloo::client::p2p::P2pEvent::FrameAcked {
+        peer: reconnected,
+        tag: 0,
+    });
+    drain(&mut ui, &mut session).await;
+    assert_eq!(
+        session.queued_for("alice"),
+        0,
+        "acknowledged, so the copy on disk is finally redundant"
+    );
+}
+
+/// The window this closes: a flushed message whose link dies before the
+/// peer acknowledges it. The transport gives up on the frame
+/// (`expire_pending`) and nothing else would ever re-send it, so the
+/// on-disk copy has to still be there - and it is offered again the next
+/// time the link opens.
+/// @requirement AC-422
+#[tokio::test]
+async fn a_flushed_message_that_is_never_acknowledged_stays_held() {
+    let (mut session, mut ui, peers) = session_and_ui("no-ack", "me").await;
+    let _ = &peers;
+    session
+        .outbox_mut()
+        .expect("the queue is on in a test session")
+        .queue(
+            "alice",
+            aloo::client::outbox::OutboxItem::Reliable(aloo::p2p_proto::P2pPayload::Envelope {
+                channel: None,
+                msg_id: Some(1),
+                envelope: aloo::proto::Envelope {
+                    content: aloo::proto::Content::Text,
+                    blocks: vec![b"never acknowledged".to_vec()],
+                },
+            }),
+        )
+        .expect("queueing should succeed");
+
+    session.peer_link_mut().mark_active_for_test(ALICE);
+    session.inject_p2p_event(aloo::client::p2p::P2pEvent::LinkStatusChanged {
+        peer: ALICE,
+        status: aloo::client::p2p::LinkStatus::Active,
+    });
+    drain(&mut ui, &mut session).await;
+
+    assert_eq!(
+        session.queued_for("alice"),
+        1,
+        "no acknowledgement came back, so it is still held and will be offered again"
+    );
+}
+
+/// The reported flow through the *real* DM send path, not the transport
+/// directly: an open DM with someone who has gone offline, a message
+/// typed and sent. It has to reach the durable queue.
+/// @requirement AC-410
+#[tokio::test]
+async fn a_dm_sent_through_the_real_path_while_offline_is_queued() {
+    let (mut session, mut ui, peers) = session_and_ui("real-dm", "me").await;
+    ui.on_direct_message(ALICE, "alice".into(), MessageBody::Text("hi".into()));
+    ui.on_user_offline(ALICE);
+
+    aloo::client::direct_message::handle_send_text(
+        &mut aloo::control::NullSink,
+        &mut ui,
+        &mut session,
+        ALICE,
+        "while you were out".into(),
+        peers.alice.der.clone(),
+        None,
+        1,
+    )
+    .await
+    .expect("sending should not fail because they are away");
+    drain(&mut ui, &mut session).await;
+
+    assert_eq!(
+        session.queued_for("alice"),
+        1,
+        "the real send path must reach the durable queue, not stop short of it"
+    );
+}
+
+/// Sealing a message no longer depends on holding the peer's *rotating*
+/// key - which is discarded the moment they disconnect
+/// (`session::drop_peer_state`). Without the fallback to their bundle's
+/// bootstrap key, every send to someone who had gone offline sealed to
+/// nothing and was dropped before the queue ever saw it: the reported
+/// break.
+/// @requirement AC-410
+#[tokio::test]
+async fn a_message_seals_for_a_peer_whose_rotating_key_is_gone() {
+    let (mut session, mut ui, peers) = session_and_ui("no-rotating-key", "me").await;
+    // Exactly what a disconnect leaves behind: known, pinned, no
+    // rotating key.
+    aloo::client::session::forget_peer_for_test(&mut ui, &mut session, ALICE);
+    ui.known_users.insert(
+        ALICE,
+        UserInfo {
+            id: ALICE,
+            name: "alice".into(),
+            public_key_der: peers.alice.der.clone(),
+            key_mode: KeyMode::PqHybrid,
+        },
+    );
+
+    aloo::client::direct_message::handle_send_text(
+        &mut aloo::control::NullSink,
+        &mut ui,
+        &mut session,
+        ALICE,
+        "sealed to your bootstrap key".into(),
+        peers.alice.der.clone(),
+        None,
+        1,
+    )
+    .await
+    .expect("sending must not fail for want of a key they took with them");
+    drain(&mut ui, &mut session).await;
+
+    assert_eq!(
+        session.queued_for("alice"),
+        1,
+        "it must be sealed and held, not silently dropped"
+    );
+}
+
+/// A punched peer's first payload can beat the server's word that they
+/// exist. There is then no key to decrypt it with and no name to render it
+/// under - but it *arrived*, so losing it is not an option available to us.
+/// @requirement AC-420
+#[tokio::test]
+async fn a_message_from_a_sender_we_do_not_know_yet_is_held_not_dropped() {
+    let (mut session, mut ui, peers) = session_and_ui("unknown-sender", "me").await;
+    ui.known_users.remove(&ALICE);
+
+    aloo::client::direct_message::on_message(
+        &mut ui,
+        &mut session,
+        ALICE,
+        String::new(),
+        None,
+        sealed_to(&peers, None, 1, "sent before you had heard of me"),
+    )
+    .await;
+
+    assert_eq!(
+        session.deferred_dm_count(),
+        1,
+        "it must be held rather than discarded for arriving early"
+    );
+    assert!(
+        ui.private_rooms.get(&ALICE).is_none(),
+        "and nothing can be rendered for a sender with no name yet"
+    );
+}
+
+/// The other half of the guarantee: held is only worth anything if it is
+/// then shown. Once the sender is known the message is offered again and
+/// lands in the room, which opening the DM displays.
+/// @requirement AC-420
+#[tokio::test]
+async fn a_held_message_is_shown_once_its_sender_becomes_known() {
+    let (mut session, mut ui, peers) = session_and_ui("late-sender", "me").await;
+    let alice = ui.known_users.remove(&ALICE).expect("seeded");
+
+    aloo::client::direct_message::on_message(
+        &mut ui,
+        &mut session,
+        ALICE,
+        String::new(),
+        None,
+        sealed_to(&peers, None, 1, "while you were still learning my name"),
+    )
+    .await;
+    assert_eq!(session.deferred_dm_count(), 1);
+
+    // What the server's roster does when it finally arrives.
+    ui.known_users.insert(ALICE, alice);
+    aloo::client::session::retry_deferred_dms(&mut ui, &mut session).await;
+
+    assert_eq!(session.deferred_dm_count(), 0, "nothing is left waiting");
+    let room = ui.private_rooms.get(&ALICE).expect("the room now exists");
+    assert!(
+        room.log.iter().any(|entry| matches!(
+            &entry.body,
+            MessageBody::Text(text) if text == "while you were still learning my name"
+        )),
+        "and the message that arrived is in it, ready for the DM to be opened"
+    );
+}
+
+/// A sender who never turns up must not cost the message either: it stays
+/// held, still offered on every turn, rather than being given up on.
+/// @requirement AC-420
+#[tokio::test]
+async fn a_held_message_whose_sender_never_arrives_stays_held() {
+    let (mut session, mut ui, peers) = session_and_ui("never-known", "me").await;
+    ui.known_users.remove(&ALICE);
+
+    aloo::client::direct_message::on_message(
+        &mut ui,
+        &mut session,
+        ALICE,
+        String::new(),
+        None,
+        sealed_to(&peers, None, 1, "nobody knows who I am"),
+    )
+    .await;
+
+    for _ in 0..5 {
+        aloo::client::session::retry_deferred_dms(&mut ui, &mut session).await;
+    }
+    assert_eq!(
+        session.deferred_dm_count(),
+        1,
+        "still held, not consumed by the attempts to deliver it"
+    );
+}
+
+/// Turning the queue off must not abandon pad positions that are already
+/// spent: they would never be delivered, while the next send went out
+/// under a later sequence number and left the peer's pad behind for good.
+/// @requirement AC-421
+#[tokio::test]
+async fn turning_the_queue_off_leaves_sealed_pad_messages_to_drain() {
+    let (mut session, _ui, _peers) = session_and_ui("pad-drain", "me").await;
+    assert!(
+        session.queue_sealed_otp_for_test("alice-bob", 0),
+        "the pad queue is on by default in a test session"
+    );
+
+    session.set_queue_send_messages(false);
+    assert_eq!(
+        session.otp_queued_total(),
+        1,
+        "a spent pad position is kept and allowed to drain, not dropped"
+    );
+}
+
+/// Once there is nothing spent left waiting, the switch is free to take
+/// effect fully.
+/// @requirement AC-421
+#[tokio::test]
+async fn turning_the_queue_off_takes_full_effect_once_nothing_is_waiting() {
+    let (mut session, _ui, _peers) = session_and_ui("pad-empty", "me").await;
+    assert_eq!(session.otp_queued_total(), 0);
+
+    session.set_queue_send_messages(false);
+    assert_eq!(session.otp_queued_total(), 0);
+    assert!(
+        !session.queue_sealed_otp_for_test("alice-bob", 0),
+        "with nothing left to desynchronize the queue is gone, and nothing new is sealed into it"
+    );
+}
+
+/// The gate only ever opens on an acknowledgement, and it is durable - so
+/// a message that left and was never answered (killed between the send and
+/// the ack, or a frame the transport gave up on while the peer was away)
+/// would wedge this contact's queue for good. A link coming up puts it
+/// back on the wire.
+/// @requirement AC-421
+#[tokio::test]
+async fn an_outstanding_pad_send_goes_back_on_the_wire_when_the_link_returns() {
+    let (mut session, mut ui, _peers) = session_and_ui("pad-retry", "me").await;
+    assert!(session.queue_sealed_otp_for_test("alice-bob", 0));
+
+    assert!(
+        !session
+            .retry_outstanding_otp_send_for_test(&mut ui, ALICE, "alice-bob")
+            .await,
+        "nothing is outstanding yet, so there is nothing to put back"
+    );
+
+    session.arm_otp_ack_gate_for_test("alice-bob", 0);
+    assert!(
+        session
+            .retry_outstanding_otp_send_for_test(&mut ui, ALICE, "alice-bob")
+            .await,
+        "the message the gate is waiting on is re-sent rather than left stuck"
+    );
+    assert_eq!(
+        session.otp_queued_total(),
+        1,
+        "and it stays at the front until its own acknowledgement retires it"
+    );
+}
+
+/// Only the message the gate actually names is re-sent: anything else
+/// would put a pad position on the wire out of turn.
+/// @requirement AC-421
+#[tokio::test]
+async fn a_gate_naming_something_other_than_the_front_re_sends_nothing() {
+    let (mut session, mut ui, _peers) = session_and_ui("pad-retry-other", "me").await;
+    assert!(session.queue_sealed_otp_for_test("alice-bob", 0));
+    session.arm_otp_ack_gate_for_test("alice-bob", 7);
+
+    assert!(
+        !session
+            .retry_outstanding_otp_send_for_test(&mut ui, ALICE, "alice-bob")
+            .await,
+        "the gate belongs to a send this queue is not responsible for"
+    );
 }

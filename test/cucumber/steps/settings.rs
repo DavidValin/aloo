@@ -434,9 +434,12 @@ async fn text_is_held(_w: &mut AlooWorld) {
     assert!(aloo::client::outbox::is_queueable(&sealed_text("hi")));
 }
 
-#[then("a pad-wrapped text message is held for someone unreachable")]
+/// Anything under the pad belongs to `client::otp_outbox`, which sends
+/// one message per acknowledgement in order - so the general queue, which
+/// flushes everything at once, deliberately refuses it.
+#[then("a pad-wrapped message is held in the pad queue instead")]
 async fn otp_text_is_held(_w: &mut AlooWorld) {
-    assert!(aloo::client::outbox::is_queueable(
+    assert!(!aloo::client::outbox::is_queueable(
         &aloo::client::outbox::OutboxItem::Reliable(aloo::p2p_proto::P2pPayload::OtpEnvelope {
             channel: None,
             msg_id: Some(1),
@@ -627,6 +630,144 @@ async fn send_n_while_unreachable(w: &mut AlooWorld, count: usize, _unused: Stri
     w.sent_payload_count += count;
 }
 
+// ---------------------------------------------------------------------
+// The matrix: queueing on/off x receiver online/offline x layering.
+// The server dimension is a tag rather than a step on purpose - none of
+// this consults a server. A punched link is what a send travels on, and
+// whether a server happens to be reachable changes only how the two found
+// each other, which is exactly the claim the @with_server /
+// @without_reachable_server pairs below are asserting.
+// ---------------------------------------------------------------------
+
+/// Marks bob's link up, so a send finds a live transport rather than
+/// falling through to whichever queue is configured.
+#[cucumber::given(expr = "{word} is reachable")]
+async fn peer_is_reachable(w: &mut AlooWorld, _nickname: String) {
+    let peer = UserId(crate::steps::ui_common::id_for("bob"));
+    let (session, _) = queue_session(w).await;
+    session.peer_link_mut().mark_active_for_test(peer);
+}
+
+/// The default state of the harness, named so a scenario says which half
+/// of the matrix it is in rather than relying on a silent default.
+#[cucumber::given(expr = "{word} is not reachable")]
+async fn peer_is_not_reachable(w: &mut AlooWorld, _nickname: String) {
+    let _ = queue_session(w).await;
+}
+
+#[when(expr = "I send {word} a message")]
+async fn send_a_message(w: &mut AlooWorld, _nickname: String) {
+    send_n_while_unreachable(w, 1, String::new()).await;
+}
+
+#[then(expr = "it went straight out to {word}, held nowhere")]
+async fn went_straight_out(w: &mut AlooWorld, nickname: String) {
+    assert_eq!(
+        outbox(w).len_for(&nickname),
+        0,
+        "a reachable peer's message has no reason to be held"
+    );
+    let peer = UserId(crate::steps::ui_common::id_for("bob"));
+    let (session, _) = queue_session(w).await;
+    assert!(
+        session.peer_link_mut().pending_payloads(peer).is_empty(),
+        "nor to be waiting in the transport's own queue"
+    );
+}
+
+/// Seals one pad message for `contact`, which spends its pad position
+/// there and then - the step the pad half of the matrix is built on.
+#[when(expr = "I write a pad message for {string}")]
+async fn write_a_pad_message(w: &mut AlooWorld, contact: String) {
+    let peer = UserId(crate::steps::ui_common::id_for("bob"));
+    let seq = w.sealed_pad_count;
+    let (session, _) = queue_session(w).await;
+    assert!(
+        session.queue_sealed_otp_for_test(&contact, seq),
+        "sealing is what spends the pad; it must be taken by the queue"
+    );
+    let _ = peer;
+    w.sealed_pad_count += 1;
+}
+
+#[when(expr = "the queue for {string} is pumped")]
+async fn pump_the_pad_queue(w: &mut AlooWorld, contact: String) {
+    let peer = UserId(crate::steps::ui_common::id_for("bob"));
+    let _ = queue_session(w).await;
+    let (session, ui) = w.queue_session.as_mut().expect("built above");
+    w.pad_queue_released = session.pump_otp_queue_for_test(ui, peer, &contact).await;
+}
+
+#[then("the front of it went out, and only the front")]
+async fn front_went_out(w: &mut AlooWorld) {
+    assert!(
+        w.pad_queue_released,
+        "a reachable peer's queue releases its front message"
+    );
+}
+
+#[then(expr = "{int} sealed pad message is still waiting for its acknowledgement")]
+#[then(expr = "{int} sealed pad messages are still waiting for its acknowledgement")]
+async fn sealed_still_waiting(w: &mut AlooWorld, count: usize) {
+    let (session, _) = queue_session(w).await;
+    assert_eq!(
+        session.otp_queued_total(),
+        count,
+        "the front stays until its own ack retires it"
+    );
+}
+
+#[then(expr = "an offline peer's send is refused before anything is encrypted")]
+async fn refused_before_encrypt(w: &mut AlooWorld) {
+    let ui = w.ui_mut();
+    assert!(
+        ui.offline_blocks_send("are you there"),
+        "with nothing to hold it, the send is stopped before any pad is spent"
+    );
+}
+
+#[then(expr = "an offline peer's send is accepted for holding")]
+async fn accepted_for_holding(w: &mut AlooWorld) {
+    let ui = w.ui_mut();
+    assert!(
+        !ui.offline_blocks_send("are you there"),
+        "with somewhere to hold it, writing to someone away is allowed"
+    );
+}
+
+/// The drain: the link opens and everything held for him is offered.
+#[when(expr = "{word}'s link comes up and his queue is drained")]
+async fn link_up_and_drained(w: &mut AlooWorld, _nickname: String) {
+    let peer = UserId(crate::steps::ui_common::id_for("bob"));
+    {
+        let (session, _) = queue_session(w).await;
+        session.peer_link_mut().mark_active_for_test(peer);
+        session.inject_p2p_event(aloo::client::p2p::P2pEvent::LinkStatusChanged {
+            peer,
+            status: aloo::client::p2p::LinkStatus::Active,
+        });
+    }
+    let (session, ui) = w.queue_session.as_mut().expect("built above");
+    aloo::client::session::drain_p2p_events(&mut aloo::control::NullSink, ui, session)
+        .await
+        .expect("draining should not fail");
+}
+
+/// His acknowledgement of the entry `id` names - the only thing that ever
+/// removes a message that was actually sent.
+#[when(expr = "{word} acknowledges the held message {int}")]
+async fn peer_acknowledges(w: &mut AlooWorld, _nickname: String, id: u64) {
+    let peer = UserId(crate::steps::ui_common::id_for("bob"));
+    {
+        let (session, _) = queue_session(w).await;
+        session.inject_p2p_event(aloo::client::p2p::P2pEvent::FrameAcked { peer, tag: id });
+    }
+    let (session, ui) = w.queue_session.as_mut().expect("built above");
+    aloo::client::session::drain_p2p_events(&mut aloo::control::NullSink, ui, session)
+        .await
+        .expect("draining should not fail");
+}
+
 #[when(expr = "{word}'s link comes up but his queue has not been drained yet")]
 async fn link_up_queue_not_drained(w: &mut AlooWorld, _nickname: String) {
     let peer = UserId(crate::steps::ui_common::id_for("bob"));
@@ -766,4 +907,267 @@ async fn header_silent_about_playback(w: &mut AlooWorld) {
         !screen_rows(w).iter().any(|r| r.contains("playback off")),
         "nothing to report while arriving voice plays"
     );
+}
+
+// ---------------------------------------------------------------------
+// The pad session's own durable queue (US-064, AC-418/419)
+// ---------------------------------------------------------------------
+
+/// A sealed pad-wrapped message. Opaque on purpose: sealing is spending,
+/// and what the queue keeps is ciphertext it never looks inside.
+fn sealed_pad(seq: u64) -> aloo::p2p_proto::P2pPayload {
+    aloo::p2p_proto::P2pPayload::OtpEnvelope {
+        channel: None,
+        msg_id: Some(seq),
+        seq,
+        envelope: aloo::proto::Envelope {
+            content: aloo::proto::Content::Text,
+            blocks: vec![vec![seq as u8; 48]],
+        },
+        sender_device_id: "laptop".into(),
+    }
+}
+
+fn otp_outbox(w: &mut AlooWorld) -> aloo::client::otp_outbox::OtpOutbox {
+    let dir = scenario_dir(w).join("otp_outbox");
+    aloo::client::otp_outbox::OtpOutbox::load(&dir)
+}
+
+#[cucumber::given(expr = "nothing is queued for the contact {string}")]
+#[then(expr = "nothing is queued for the contact {string}")]
+async fn nothing_queued_for_contact(w: &mut AlooWorld, contact: String) {
+    assert_eq!(otp_outbox(w).len_for(&contact), 0);
+}
+
+#[when(expr = "I seal {int} pad message for {string}")]
+#[when(expr = "I seal {int} pad messages for {string}")]
+async fn seal_pad_messages(w: &mut AlooWorld, count: u64, contact: String) {
+    let mut store = otp_outbox(w);
+    let first = w.sealed_pad_count;
+    for i in 0..count {
+        let seq = first + i;
+        store
+            .queue(&contact, &sealed_pad(seq), seq, Some(seq), None, [seq as u8; 32])
+            .unwrap();
+        w.sealed_payloads.push(sealed_pad(seq));
+    }
+    w.sealed_pad_count += count;
+}
+
+/// The pad is already spent by the time the queue is asked, so its answer
+/// is what decides whether the sealed bytes still have somewhere to go.
+#[when(expr = "I try to queue a sealed pad message for the contact {string}")]
+async fn try_queue_for_contact(w: &mut AlooWorld, contact: String) {
+    let mut store = otp_outbox(w);
+    let seq = w.sealed_pad_count;
+    w.pad_queue_accepted = store
+        .queue(&contact, &sealed_pad(seq), seq, Some(seq), None, [seq as u8; 32])
+        .expect("refusing a name is not an I/O failure");
+}
+
+#[then("the queue says it took it")]
+async fn queue_took_it(w: &mut AlooWorld) {
+    assert!(
+        w.pad_queue_accepted,
+        "a storable contact's message is taken, and the caller is told so"
+    );
+}
+
+#[then("the queue says it did not take it, so the caller can send it instead")]
+async fn queue_refused_it(w: &mut AlooWorld) {
+    assert!(
+        !w.pad_queue_accepted,
+        "a refusal reported as success would lose a message whose pad is spent"
+    );
+}
+
+#[then(expr = "{int} pad message is queued for {string}")]
+#[then(expr = "{int} pad messages are queued for {string}")]
+async fn n_pad_queued(w: &mut AlooWorld, count: usize, contact: String) {
+    assert_eq!(otp_outbox(w).len_for(&contact), count);
+}
+
+#[then("they come back in the order they were sealed")]
+async fn pad_order_preserved(w: &mut AlooWorld) {
+    let mut store = otp_outbox(w);
+    for (i, expected) in w.sealed_payloads.clone().into_iter().enumerate() {
+        let front = store.front("alice-bob").expect("a message is waiting");
+        assert_eq!(front.seq(), Some(i as u64), "strictly in order");
+        assert_eq!(front.payload(), Some(expected));
+        store.take_front("alice-bob").unwrap();
+    }
+}
+
+#[then(expr = "the next pad message for {string} is sequence {int}")]
+async fn next_pad_seq(w: &mut AlooWorld, contact: String, seq: u64) {
+    let store = otp_outbox(w);
+    let front = store.front(&contact).expect("a message is waiting");
+    assert_eq!(front.seq(), Some(seq));
+}
+
+#[then("reading it again does not consume it")]
+async fn peek_does_not_consume(w: &mut AlooWorld) {
+    let store = otp_outbox(w);
+    let before = store.len_for("alice-bob");
+    let _ = store.front("alice-bob");
+    assert_eq!(store.len_for("alice-bob"), before);
+}
+
+/// The one thing that retires a sealed message: its own proof-carrying
+/// acknowledgement came back.
+#[when("that message is acknowledged")]
+async fn pad_message_acked(w: &mut AlooWorld) {
+    let mut store = otp_outbox(w);
+    store.take_front("alice-bob").unwrap();
+}
+
+#[then(expr = "after a restart {int} pad messages are queued for {string}")]
+async fn after_restart_count(w: &mut AlooWorld, count: usize, contact: String) {
+    // A brand-new reader over the same directory is what the next run of
+    // the app does.
+    assert_eq!(otp_outbox(w).len_for(&contact), count);
+}
+
+#[then(expr = "after a restart the next pad message for {string} is sequence {int}")]
+async fn after_restart_next(w: &mut AlooWorld, contact: String, seq: u64) {
+    let store = otp_outbox(w);
+    assert_eq!(store.front(&contact).and_then(|e| e.seq()), Some(seq));
+}
+
+#[then(expr = "what is queued for {string} is byte-identical to what was sealed")]
+async fn pad_byte_identical(w: &mut AlooWorld, contact: String) {
+    let store = otp_outbox(w);
+    let front = store.front(&contact).expect("a message is waiting");
+    assert_eq!(
+        front.payload().as_ref(),
+        w.sealed_payloads.first(),
+        "ciphertext is kept as it was - never re-sealed, never opened"
+    );
+}
+
+#[when(expr = "the contact {string} is still on this machine")]
+async fn contact_still_here(w: &mut AlooWorld, contact: String) {
+    w.still_contacts.insert(contact);
+}
+
+#[when(expr = "the contact {string} is no longer on this machine")]
+async fn contact_gone(w: &mut AlooWorld, contact: String) {
+    w.still_contacts.remove(&contact);
+}
+
+#[when("the pad queue is swept")]
+async fn pad_queue_swept(w: &mut AlooWorld) {
+    let still = w.still_contacts.clone();
+    let mut store = otp_outbox(w);
+    store.retain_contacts(|contact| still.contains(contact));
+}
+
+#[then(expr = "no queue file is left for {string}")]
+async fn no_queue_file(w: &mut AlooWorld, contact: String) {
+    let path = scenario_dir(w).join("otp_outbox").join(format!("{contact}.q"));
+    assert!(!path.exists(), "a file that held pad output must not be left behind");
+}
+
+// ---------------------------------------------------------------------
+// A change that takes effect now (AC-411), and one spelling for every
+// switch in the file (AC-416)
+// ---------------------------------------------------------------------
+
+/// The popup writes the value straight onto the running `UiState`, which
+/// is what every playback decision reads - so "it took effect" is
+/// observable without a restart or a session.
+#[then("arriving voice is kept off the speakers for everyone")]
+async fn autoplay_took_effect(w: &mut AlooWorld) {
+    let draft = &w
+        .ui_ref()
+        .settings_popup
+        .as_ref()
+        .expect("popup open")
+        .draft;
+    assert!(!draft.voice_autoplay, "the draft the session is handed says off");
+
+    // What the session does with it, applied here the same way
+    // `save_settings_draft` does, so the effect itself is asserted rather
+    // than assumed.
+    let queueing = w.ui_ref().queue_send_messages;
+    w.ui_mut().voice_autoplay = false;
+    w.ui_mut().queue_send_messages = queueing;
+    for name in ["bob", "carol"] {
+        let id = UserId(crate::steps::ui_common::id_for(name));
+        assert!(
+            w.ui_ref().suppress_playback_from(id),
+            "{name}'s arriving voice must be kept off the speakers"
+        );
+    }
+}
+
+#[then("the global push-to-talk switch is off")]
+async fn ptt_switch_off(w: &mut AlooWorld) {
+    assert!(
+        !w.direct_settings
+            .as_ref()
+            .expect("a loaded settings file")
+            .global_ptt_enabled,
+        "`false` from a file written before the spellings were unified must still read as off"
+    );
+}
+
+#[then("the daemon otp switch is on")]
+async fn daemon_otp_on(w: &mut AlooWorld) {
+    assert!(w.direct_settings.as_ref().expect("a loaded file").daemon_otp);
+}
+
+#[when("those settings are written back out")]
+async fn settings_written_back(w: &mut AlooWorld) {
+    let path = scenario_dir(w).join("settings-roundtrip");
+    let settings = w.direct_settings.clone().expect("a loaded settings file");
+    settings.save(&path).expect("writing the settings back");
+    w.written_settings = Some(std::fs::read_to_string(&path).expect("reading them back"));
+}
+
+#[then("no switch is written as true or false")]
+async fn no_true_false(w: &mut AlooWorld) {
+    let contents = w
+        .written_settings
+        .as_ref()
+        .expect("nothing has been written back yet");
+    for line in contents.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        assert!(
+            !matches!(value, "true" | "false"),
+            "{key} is a switch written the old way: {line:?}"
+        );
+    }
+}
+
+/// A pad-only pair's message: the pad and nothing else, with no
+/// `pqhybrid` envelope around it (`OtpFraming::Direct`) - queued on
+/// exactly the same terms as a wrapped one.
+#[when(expr = "I seal {int} pad-only messages for {string}")]
+#[when(expr = "I seal {int} pad-only message for {string}")]
+async fn seal_pad_only_messages(w: &mut AlooWorld, count: u64, contact: String) {
+    let mut store = otp_outbox(w);
+    let first = w.sealed_pad_count;
+    for i in 0..count {
+        let seq = first + i;
+        // `Direct` framing carries the padded bytes as the envelope's own
+        // single block, with nothing sealed around them.
+        let payload = aloo::p2p_proto::P2pPayload::OtpEnvelope {
+            channel: None,
+            msg_id: Some(seq),
+            seq,
+            envelope: aloo::proto::Envelope {
+                content: aloo::proto::Content::Text,
+                blocks: vec![vec![0xAB; 64]],
+            },
+            sender_device_id: "laptop".into(),
+        };
+        store
+            .queue(&contact, &payload, seq, Some(seq), None, [seq as u8; 32])
+            .unwrap();
+        w.sealed_payloads.push(payload);
+    }
+    w.sealed_pad_count += count;
 }

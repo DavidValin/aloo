@@ -95,7 +95,7 @@ fn ensure_registered(w: &mut AlooWorld, nickname: &str) {
 /// through - the cucumber-world counterpart of `daemon_session_test.rs`'s
 /// `Running`.
 pub struct LiveDaemon {
-    input_tx: tokio::sync::mpsc::UnboundedSender<SessionInput>,
+    pub(crate) input_tx: tokio::sync::mpsc::UnboundedSender<SessionInput>,
     frames: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
     handle: tokio::task::JoinHandle<()>,
     screen: String,
@@ -103,6 +103,11 @@ pub struct LiveDaemon {
     /// the session ends, to inspect exactly what it persisted, never
     /// trusted from the in-memory value the session started with.
     id_store_path: PathBuf,
+    /// Whose private room this session currently has open, so a second
+    /// send into the same room does not re-navigate - and so a stale
+    /// "Private: x" left in the transcript from an earlier room can never
+    /// be mistaken for the room being open now.
+    open_room: Option<String>,
 }
 
 impl LiveDaemon {
@@ -127,6 +132,28 @@ impl LiveDaemon {
                 _ => return squash(&self.screen).contains(&needle),
             }
         }
+    }
+
+    /// Types `text` one keystroke at a time, exactly as a person would -
+    /// the compose bar has a per-keystroke filter, so a bulk insert
+    /// would not be the same thing.
+    fn type_text(&self, text: &str) {
+        for c in text.chars() {
+            self.key(KeyCode::Char(c));
+        }
+    }
+
+    /// Whether the screen has ever shown `needle` - a plain look at what
+    /// has already arrived, for asserting something is *absent*.
+    fn has_shown(&self, needle: &str) -> bool {
+        squash(&self.screen).contains(&squash(needle))
+    }
+
+    /// Ends the session without reading anything back - "this person
+    /// goes offline", which is what the server sees when a client stops.
+    async fn stop(self) {
+        drop(self.input_tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), self.handle).await;
     }
 
     fn key(&self, code: KeyCode) {
@@ -211,9 +238,21 @@ async fn start_daemon(
         my_key,
         activation_code: None,
     };
-    let (events, sink, you, identity, server_addr) = connect_with_reconnect(&request)
-        .await
-        .expect("the first connection is an ordinary one");
+    // Retried, not assumed: a nickname is freed when the server notices
+    // that connection has gone, which is not instantaneous, so somebody
+    // coming straight back after leaving can genuinely race it and be
+    // told the name is taken. That is the server behaving correctly, and
+    // waiting it out is the harness's business.
+    let mut attempt = connect_with_reconnect(&request).await;
+    for _ in 0..40 {
+        if attempt.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        attempt = connect_with_reconnect(&request).await;
+    }
+    let (events, sink, you, identity, server_addr) =
+        attempt.expect("the connection should succeed once the old one has been reaped");
 
     let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel();
     let (frame_tx, frames) = tokio::sync::mpsc::unbounded_channel();
@@ -252,7 +291,14 @@ async fn start_daemon(
 
     w.daemons.insert(
         nickname.to_string(),
-        LiveDaemon { input_tx, frames, handle, screen: String::new(), id_store_path },
+        LiveDaemon {
+            input_tx,
+            frames,
+            handle,
+            screen: String::new(),
+            id_store_path,
+            open_room: None,
+        },
     );
 }
 
@@ -328,11 +374,32 @@ async fn accepts_pending_review(w: &mut AlooWorld, holder: String) {
     daemon.key(KeyCode::Enter);
 }
 
+#[given(expr = "{word}'s screen shows {string} within {int} seconds")]
 #[then(expr = "{word}'s screen shows {string} within {int} seconds")]
 async fn screen_shows(w: &mut AlooWorld, holder: String, needle: String, seconds: u64) {
     let daemon = daemon_of(w, &holder);
     let found = daemon.wait_for(&needle, Duration::from_secs(seconds)).await;
     assert!(found, "{holder} never showed {needle:?}: {}", daemon.screen);
+}
+
+/// Order is the queue's whole contract, and the screen is where it is
+/// finally observable: the row written first must sit above the row
+/// written second. Reads the screen the previous `shows ... within` step
+/// already waited for, so both are known to be on it.
+#[then(expr = "{word}'s screen shows {string} above {string}")]
+async fn screen_shows_above(w: &mut AlooWorld, holder: String, first: String, second: String) {
+    let daemon = daemon_of(w, &holder);
+    let screen = daemon.screen.clone();
+    let above = screen
+        .find(&first)
+        .unwrap_or_else(|| panic!("{holder} never showed {first:?}: {screen}"));
+    let below = screen
+        .find(&second)
+        .unwrap_or_else(|| panic!("{holder} never showed {second:?}: {screen}"));
+    assert!(
+        above < below,
+        "{first:?} was written first and must be shown above {second:?}: {screen}"
+    );
 }
 
 /// Ends every live daemon session this scenario started and hands back
@@ -415,4 +482,146 @@ async fn records_last_seen(w: &mut AlooWorld, holder: String, subject: String) {
     end_all(w).await;
     let store = w.ended_id_stores.get(&holder).expect("session was never ended");
     assert!(store.last_addr(&subject).is_some());
+}
+
+// ---------------------------------------------------------------------
+// Live coverage for the durable send queue (US-064)
+// ---------------------------------------------------------------------
+
+/// Ends one side's session for real - the server sees the connection go,
+/// frees the nickname, and tells everyone else. This is "they went
+/// offline", not a simulation of it.
+#[when(expr = "{word} goes offline for real")]
+#[given(expr = "{word} has gone offline for real")]
+async fn goes_offline_for_real(w: &mut AlooWorld, nickname: String) {
+    let daemon = w
+        .daemons
+        .remove(&nickname)
+        .unwrap_or_else(|| panic!("{nickname} has no live daemon session"));
+    daemon.stop().await;
+    // Their departure has to have *reached* the other side before a send
+    // to them means anything: until it does, that side still holds a
+    // live link to them and the message goes out over it into nothing.
+    // Asserted rather than merely waited on - a silent timeout here made
+    // a queueing test pass through a path that never queued.
+    for other in w.daemons.keys().cloned().collect::<Vec<_>>() {
+        let holder = daemon_of(w, &other);
+        let seen = holder
+            .wait_for(&format!("{nickname} disconnected"), Duration::from_secs(40))
+            .await;
+        assert!(
+            seen,
+            "{other} never learned that {nickname} had gone - nothing after this would \
+             be testing what it claims to"
+        );
+    }
+}
+
+/// Opens `subject`'s private room and sends one message, driving the real
+/// compose bar - the whole point being that this is the path a user
+/// takes, refusals and all.
+#[given(expr = "{word} sends {word} the private message {string} for real")]
+#[when(expr = "{word} sends {word} the private message {string} for real")]
+async fn sends_private_for_real(
+    w: &mut AlooWorld,
+    sender: String,
+    subject: String,
+    text: String,
+) {
+    open_room_for_real(w, &sender, &subject).await;
+    let daemon = daemon_of(w, &sender);
+    daemon.type_text(&text);
+    daemon.key(KeyCode::Enter);
+    // Give the session a moment to actually process the send before the
+    // scenario asserts on what it produced.
+    let _ = daemon.wait_for(&text, Duration::from_secs(5)).await;
+}
+
+/// Opens `subject`'s private room from `holder`'s sidebar, exactly as a
+/// person does: onto the sidebar, then Enter on a row, walking down until
+/// one of them actually opens a room.
+///
+/// Walked rather than counted because the sidebar is sorted by nickname,
+/// so which row is whose depends on the names a scenario chose - and
+/// Enter on your own row is a no-op, which is precisely the case this has
+/// to step past. A private room draws no member sidebar, so a frame
+/// arriving without one is what says a room genuinely opened.
+async fn open_room_for_real(w: &mut AlooWorld, holder: &str, subject: &str) {
+    if daemon_of(w, holder).open_room.as_deref() == Some(subject) {
+        return;
+    }
+    // The room's own pane title, which nothing else on screen draws -
+    // a positive signal, unlike "the member sidebar is gone", which any
+    // partial redraw (a CPU figure ticking over) satisfies by accident.
+    let title = format!("Private: {subject}");
+    daemon_of(w, holder).key(KeyCode::Tab);
+    for _ in 0..6 {
+        daemon_of(w, holder).key(KeyCode::Enter);
+        if daemon_of(w, holder)
+            .wait_for(&title, Duration::from_secs(2))
+            .await
+        {
+            daemon_of(w, holder).open_room = Some(subject.to_string());
+            return;
+        }
+        daemon_of(w, holder).key(KeyCode::Down);
+    }
+    panic!(
+        "{holder} could not open a private room with {subject}: {}",
+        daemon_of(w, holder).screen
+    );
+}
+
+#[given(expr = "{word} opens the private room with {word} for real")]
+#[when(expr = "{word} opens the private room with {word} for real")]
+async fn opens_room_for_real(w: &mut AlooWorld, holder: String, subject: String) {
+    open_room_for_real(w, &holder, &subject).await;
+}
+
+#[then(expr = "{word}'s screen never showed {string}")]
+async fn screen_never_showed(w: &mut AlooWorld, holder: String, needle: String) {
+    let daemon = daemon_of(w, &holder);
+    assert!(
+        !daemon.has_shown(&needle),
+        "{holder}'s screen should never have shown {needle:?}: {}",
+        daemon.screen
+    );
+}
+
+/// Reconnects somebody who went offline, with the same nickname - which
+/// the server gives a brand-new `UserId`, the case a queue keyed by
+/// nickname exists to survive.
+#[when(expr = "{word} comes back for real, into {string}")]
+async fn comes_back_for_real(w: &mut AlooWorld, nickname: String, channel: String) {
+    let my_key = keybundle(&nickname, "own");
+    let id_store = IdStore::new_empty(scratch_dir(&format!("idstore-{nickname}-again")).join("ids_store"));
+    start_daemon(w, &nickname, my_key, id_store, &channel).await;
+}
+
+#[then(expr = "dump {word}'s screen")]
+async fn dump_screen(w: &mut AlooWorld, holder: String) {
+    let daemon = daemon_of(w, &holder);
+    let _ = daemon.wait_for("~~never~~", Duration::from_millis(400)).await;
+    eprintln!("=== {holder} ===\n{}\n=== end ===", daemon.screen);
+}
+
+/// What this session actually wrote to its own queue - read off disk,
+/// beside its `id_store`, never from memory.
+#[then(expr = "{word} has {int} message held for {word}")]
+#[then(expr = "{word} has {int} messages held for {word}")]
+async fn holds_queued_for(w: &mut AlooWorld, holder: String, count: usize, subject: String) {
+    let dir = aloo::client::outbox::dir_beside(daemon_of(w, &holder).id_store_path.as_path());
+    // Queueing is what the session does *after* the send returns - the
+    // transport raises "could not deliver this" and the session loop
+    // acts on it - so this waits for the write rather than assuming it
+    // has already happened.
+    let mut held = 0;
+    for _ in 0..40 {
+        held = aloo::client::outbox::Outbox::load(&dir).len_for(&subject);
+        if held == count {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    panic!("{holder} should be holding {count} message(s) for {subject} in {dir:?}, holds {held}");
 }

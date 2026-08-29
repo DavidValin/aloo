@@ -2631,7 +2631,7 @@ impl UiState {
     // -------------------------------------------------------------
 
 
-    pub(crate) fn current_voice_target(&self) -> Option<VoiceTarget> {
+    pub fn current_voice_target(&self) -> Option<VoiceTarget> {
         // The microphone is already spoken for by the live call - push-to-
         // talk and a call both ultimately open the same `voice::Recorder`,
         // and layering a bounded recording's own send path on top of a
@@ -2642,12 +2642,23 @@ impl UiState {
             return None;
         }
         if let Some(peer_id) = self.active_private_room {
-            // An offline peer can't receive a live stream either - ignore
-            // Space entirely rather than starting a recording with nowhere
-            // to deliver it (SPEC.md). Same for a Pending/Rejected identity
-            // (docs/PROTOCOL.md §12) - we won't encrypt to a key we haven't
-            // verified.
-            if self.offline.contains(&peer_id) || self.is_trust_gated(peer_id) {
+            // Being offline only stops a recording when there is nowhere
+            // to put it. With `queue_send_messages` on there is: a
+            // pq_hybrid stream's chunks are sealed and held like any other
+            // content, and a pad-wrapped recording is sealed when it is
+            // recorded and held in the pad queue (`docs/SPEC.md`
+            // Functionality #34). Refusing Space in that case was the old
+            // rule outliving the reason for it - the user records
+            // something for a person who is away, which is precisely what
+            // the queue exists for, and nothing happened.
+            //
+            // A Pending/Rejected identity still refuses outright
+            // (docs/PROTOCOL.md §12): no queue makes it acceptable to
+            // encrypt to a key we have not verified.
+            if self.is_trust_gated(peer_id) {
+                return None;
+            }
+            if self.offline.contains(&peer_id) && !self.queue_send_messages {
                 return None;
             }
             let peer = self.known_users.get(&peer_id)?;

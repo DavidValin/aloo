@@ -527,10 +527,10 @@ impl Registry {
         // notion of which senders rotate: every client runs the one mode
         // that does (§13.10).
         if !self.clients.contains_key(&from) {
-            return Err("unknown sender".to_string());
+            return Err(crate::proto::UNKNOWN_SENDER.to_string());
         }
         if !self.clients.contains_key(&to) {
-            return Err("unknown recipient".to_string());
+            return Err(crate::proto::UNKNOWN_RECIPIENT.to_string());
         }
         Ok(Outgoing::new(
             to,
@@ -554,7 +554,7 @@ impl Registry {
         link_nonce: u64,
     ) -> Result<Outgoing, String> {
         if !self.clients.contains_key(&to) {
-            return Err("unknown recipient".to_string());
+            return Err(crate::proto::UNKNOWN_RECIPIENT.to_string());
         }
         Ok(Outgoing::new(
             to,

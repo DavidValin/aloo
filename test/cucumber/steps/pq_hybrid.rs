@@ -134,6 +134,47 @@ async fn arrives_again(w: &mut AlooWorld) {
     };
 }
 
+/// The straggler a durable send queue produces: sealed with the `send_id`
+/// it had when it was written, and delivered only once the peer is back -
+/// by which time the sender has sealed newer ones.
+#[when(expr = "{word} seals {string} for {word} with send id {int}")]
+async fn seal_with_send_id(w: &mut AlooWorld, from: String, message: String, to: String, send_id: u64) {
+    w.sealed = seal_to(&from, &to, None, send_id, message.as_bytes());
+    w.plaintext = message.into_bytes();
+    w.held_send_id = send_id;
+}
+
+#[when(expr = "it waits undelivered while {int} newer sends reach {word}")]
+async fn newer_sends_arrive_first(w: &mut AlooWorld, newer: u64, _who: String) {
+    for step in 1..=newer {
+        assert!(
+            w.replay.accept(SENDER, w.held_send_id + step),
+            "each newer send is itself a first arrival"
+        );
+    }
+}
+
+#[when("it is finally delivered")]
+async fn finally_delivered(w: &mut AlooWorld) {
+    let reopened = open_as("bob", "alice", &w.sealed);
+    w.refused = match reopened {
+        Some((binding, plaintext)) => {
+            let accepted = w.replay.accept(SENDER, binding.send_id);
+            w.opened = accepted.then_some(plaintext);
+            !accepted
+        }
+        None => true,
+    };
+}
+
+#[then(expr = "{word} accepts it")]
+async fn accepts_it_then(w: &mut AlooWorld, _who: String) {
+    assert!(
+        !w.refused,
+        "arriving out of order is not a replay - it had never been seen"
+    );
+}
+
 #[when(expr = "{word} seals a stream of {int} chunks for {word}")]
 async fn seal_stream(w: &mut AlooWorld, from: String, count: u32, to: String) {
     let (_, from_private) = pq_bundle_for(&from);

@@ -165,6 +165,11 @@ pub(super) fn drop_peer_state(ui_state: &mut UiState, session: &mut SessionState
     session.pq_peer_keys.forget(user_id);
     session.own_pq_keys.forget(user_id);
     session.replay.forget(user_id);
+    // Anything still waiting for this `UserId` to become known never
+    // will: they reconnect as a different one, and the keys that could
+    // have opened it have just been forgotten above. Held ciphertext with
+    // no future is dead weight.
+    session.deferred_dms.retain(|dm| dm.from != user_id);
     // A half-received pad from this connection can never be
     // continued: the rest of it would arrive under the fresh
     // `UserId` they reconnect with, which starts its own
@@ -204,6 +209,9 @@ pub(super) async fn handle_p2p_event(
     match event {
         P2pEvent::Undeliverable { peer, item } => {
             queue_undeliverable(session, ui_state, peer, item);
+        }
+        P2pEvent::FrameAcked { peer, tag } => {
+            on_frame_acked(session, ui_state, peer, tag);
         }
         P2pEvent::Message {
             channel: Some(channel),
@@ -537,6 +545,12 @@ pub(super) async fn handle_p2p_event(
                     // own half-finished exchanges, and a queued message
                     // is ordinary content that should follow them.
                     flush_outbox(session, ui_state, peer);
+                    // A pad session's own queue drains one message per
+                    // acknowledgement rather than all at once, so a link
+                    // coming up only ever releases the front of it - the
+                    // rest follow as their acks come back
+                    // (`otp::pump_otp_queue`).
+                    drain_otp_queue_for(wr, ui_state, session, peer).await;
                 }
                 p2p::LinkStatus::Lost => {
                     // Bounded by `PUNCH_TIMEOUT`/`SIGNAL_TIMEOUT` (`p2p.rs`'s
@@ -578,6 +592,11 @@ pub(super) async fn handle_p2p_event(
         P2pEvent::DeviceIdAnnounce { from, envelope } => {
             on_device_id_announce(session, ui_state, from, envelope);
             maybe_resolve_p2p_identity_data(session, ui_state, from).await;
+            // Their device id is what finally names the pad contact for a
+            // `PqWrapped` pair, and it only lands here - after the link
+            // came up. For a peer who has returned under a new `UserId`
+            // this is the first moment their queue can be drained at all.
+            drain_otp_queue_for(wr, ui_state, session, from).await;
         }
         P2pEvent::OtpMessage {
             channel,
@@ -1091,7 +1110,39 @@ pub async fn drain_p2p_events(
     for event in events {
         handle_p2p_event(event, ui_state, wr, session).await?;
     }
+    retry_deferred_dms(ui_state, session).await;
     Ok(())
+}
+
+/// Re-offers every DM that arrived before its sender was known
+/// (`session::defer_dm`), now that this pump may have made them known.
+///
+/// The guarantee this exists for is that a message which arrived is never
+/// silently lost: one that still has no sender goes straight back on the
+/// list and is offered again next time round, so it is held rather than
+/// dropped for as long as it takes them to appear.
+pub async fn retry_deferred_dms(ui_state: &mut UiState, session: &mut SessionState) {
+    if session.deferred_dms.is_empty() {
+        return;
+    }
+    // Taken out first: `on_message` re-defers anything still unknown, and
+    // that must land on a fresh list rather than the one being walked.
+    let held = std::mem::take(&mut session.deferred_dms);
+    for dm in held {
+        let Some(name) = ui_state.known_users.get(&dm.from).map(|u| u.name.clone()) else {
+            session.deferred_dms.push(dm);
+            continue;
+        };
+        crate::client::direct_message::on_message(
+            ui_state,
+            session,
+            dm.from,
+            name,
+            dm.msg_id,
+            dm.envelope,
+        )
+        .await;
+    }
 }
 
 /// Keeps one thing the transport could not send, if it is a kind worth
@@ -1169,8 +1220,15 @@ fn flush_outbox(session: &mut SessionState, ui_state: &mut UiState, peer: UserId
     let Some(nickname) = ui_state.known_users.get(&peer).map(|u| u.name.clone()) else {
         return;
     };
-    let entries = match session.outbox.as_mut() {
-        Some(outbox) if outbox.len_for(&nickname) > 0 => outbox.take(&nickname),
+    // Peeked, not taken. Handing content to the transport is not
+    // delivering it: the link can die mid-flight (in which case the frame
+    // is dropped by `p2p`'s `expire_pending` and nothing else would
+    // re-send it) and the process can be killed. Until the peer
+    // acknowledges a frame, the copy on disk is the only one that
+    // survives either, so it stays there and `on_frame_acked` is what
+    // finally deletes it.
+    let entries: Vec<crate::client::outbox::OutboxEntry> = match session.outbox.as_ref() {
+        Some(outbox) if outbox.len_for(&nickname) > 0 => outbox.peek(&nickname).to_vec(),
         _ => return,
     };
     // Cleared *before* anything is sent: the drain itself must reach the
@@ -1199,27 +1257,93 @@ fn flush_outbox(session: &mut SessionState, ui_state: &mut UiState, peer: UserId
     for entry in entries {
         match entry.item {
             crate::client::outbox::OutboxItem::Reliable(payload) => {
-                session.peer_link.send_reliable_or_queue(peer, payload);
+                // Tagged with the entry's own id, which is what comes
+                // back on the acknowledgement that lets it be deleted.
+                session
+                    .peer_link
+                    .send_reliable_tagged(peer, payload, entry.id);
             }
             crate::client::outbox::OutboxItem::VoiceChunk {
                 stream_id,
                 seq,
                 blocks,
             } => {
+                // Voice is unreliable by construction - there is no ack to
+                // wait for and nothing would ever retire it - so this one
+                // is released on handover, exactly as it always was.
                 session
                     .peer_link
                     .send_unreliable_voice(peer, stream_id, seq, blocks);
+                if let Some(outbox) = session.outbox.as_mut() {
+                    outbox.remove(&nickname, entry.id);
+                }
             }
         }
     }
     if worth_reporting {
+        // "sent", not "delivered": under the ack-retires rule this side
+        // has put them on the wire and nothing more - what makes them
+        // genuinely delivered is the acknowledgement that later removes
+        // them (`on_frame_acked`).
         ui_state.push_status_notice(
             format!(
-                "delivered {count} message{} that had been waiting for {nickname}",
+                "sent {count} message{} that had been waiting for {nickname}",
                 if count == 1 { "" } else { "s" }
             ),
             true,
         );
+    }
+}
+
+/// Puts whatever this peer's pad queue is holding back on the wire, if
+/// their contact can be named yet.
+///
+/// Called at both moments that can newly make it possible, because for a
+/// peer who has *returned* only the second one ever does. A `PqWrapped`
+/// pair's contact name is device-qualified (`otp::contact_name_for_peer`),
+/// and the device id is keyed by `UserId` and learned from a
+/// `DeviceIdAnnounce` that arrives only after the link is up - so at
+/// link-up a returning peer, who holds a brand new `UserId`, has no device
+/// id yet and names no contact at all. Draining only there meant the
+/// pq_hybrid queue (keyed by nickname, which survives) flushed while the
+/// pad queue silently did not, and nothing ever came back to it: the pump
+/// runs on a seal, on an acknowledgement, and on a link-up, and all three
+/// had already passed.
+async fn drain_otp_queue_for(
+    wr: &mut impl crate::control::ControlSink,
+    ui_state: &mut UiState,
+    session: &mut SessionState,
+    peer: UserId,
+) {
+    let Some(contact) = crate::client::otp::active_contact_name(session, ui_state, peer) else {
+        return;
+    };
+    // First anything the gate is still waiting on: a send that left but
+    // was never acknowledged (a kill between the two, or a frame the
+    // transport gave up on) would otherwise wedge this contact's queue for
+    // good, since the gate only opens on an ack and nothing else re-sends
+    // it.
+    let _ =
+        crate::client::otp::retry_outstanding_otp_send(wr, session, ui_state, peer, &contact).await;
+    crate::client::otp::pump_otp_queue(wr, session, ui_state, peer, &contact).await;
+}
+
+/// Retires the queued entry a peer has just acknowledged.
+///
+/// This is the only thing that deletes a held message that was actually
+/// sent, and it runs on the peer's own acknowledgement rather than on this
+/// side having handed the content to the transport - which proves
+/// nothing. Everything still on disk when a link dies, or when the process
+/// does, is offered again by `flush_outbox` the next time that link opens.
+/// A duplicate that results is dropped by the receiver's replay window
+/// (`client::replay`), so at-least-once here is once as far as the user
+/// is concerned.
+fn on_frame_acked(session: &mut SessionState, ui_state: &UiState, peer: UserId, tag: u64) {
+    let Some(nickname) = ui_state.known_users.get(&peer).map(|u| u.name.clone()) else {
+        return;
+    };
+    if let Some(outbox) = session.outbox.as_mut() {
+        outbox.remove(&nickname, tag);
     }
 }
 
@@ -1249,6 +1373,48 @@ fn now_secs() -> u64 {
 /// device still pinned under the nickname keeps that whole queue.
 ///
 /// Run at session start and every `outbox::SWEEP_INTERVAL` after it.
+/// `forget_peer` under a name a test may call - what a `UserOffline`
+/// does, exposed the same way `peer_link_mut` is so a reconnect can be
+/// played out without a server.
+pub fn forget_peer_for_test(ui_state: &mut UiState, session: &mut SessionState, peer: UserId) {
+    forget_peer(ui_state, session, peer);
+}
+
+/// The pad-session counterpart of `sweep_outbox`: drops every sealed
+/// message queued for a contact whose keychain entry is gone.
+///
+/// Same rule, different key. This queue is keyed by contact name, so what
+/// it asks is whether `otp` still holds that contact at all - deleting an
+/// OTP key from `/contacts` removes it, and nothing sealed under it could
+/// ever be decrypted by anyone afterwards. Each queue file is securely
+/// erased rather than merely unlinked: it held pad output.
+///
+/// Synchronous and local, reading this app's own record of which contacts
+/// are provisioned rather than spawning the `otp` binary - a sweep must
+/// not depend on a tool that may be missing, since "the binary is not
+/// here" would then look exactly like "every key is gone" and take the
+/// whole queue with it.
+pub fn sweep_otp_outbox(session: &mut SessionState) -> usize {
+    let Some(contacts) = session.otp_outbox.as_ref().map(|o| o.contacts()) else {
+        return 0;
+    };
+    if contacts.is_empty() {
+        return 0;
+    }
+    let gone: std::collections::HashSet<String> = contacts
+        .into_iter()
+        .filter(|contact| session.otp_store.get(contact).is_none())
+        .collect();
+    if gone.is_empty() {
+        return 0;
+    }
+    session
+        .otp_outbox
+        .as_mut()
+        .map(|outbox| outbox.retain_contacts(|contact| !gone.contains(contact)))
+        .unwrap_or(0)
+}
+
 pub fn sweep_outbox(session: &mut SessionState) -> usize {
     let Some(peers) = session.outbox.as_ref().map(|o| o.peers()) else {
         return 0;

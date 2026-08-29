@@ -251,9 +251,22 @@ restart of aloo, not just across a blink.
   ever touches the disk, and nothing is re-encrypted behind your back.
 - **It survives closing aloo.** What's on disk is read back next time you
   start and goes out as each person becomes reachable.
+- **Voice messages under `/otp` wait too.** A recording uses far more key
+  than a line of text, so aloo refuses it up front if what's left won't
+  cover it.
+- **In an `/otp` session, writing a message spends its pad** — right then,
+  whether or not they're there. The sealed message waits in its own queue
+  and they go out **one at a time, in order, each waiting for the
+  previous one's acknowledgement**, which is what the pad on their side
+  expects. Turn queueing off and a message to someone unreachable is
+  refused instead, so no pad is spent on something that can't be
+  delivered.
 - **`i` on a held message says `QUEUED`** rather than `UNDELIVERED` — it's
   being kept and it will go, not merely unacknowledged.
-
+- **It's kept until they actually have it**, not just until it's sent, so
+  a dropped link or closing aloo mid-send doesn't lose it.
+- **They'll see it when they open the conversation** — including a DM you
+  had `/leave`d.
 - **Nothing expires.** A held message waits as long as it has to. The one
   thing that ever removes one is deleting that contact — with their keys
   gone, nothing held for them could be delivered or read back anyway. aloo
@@ -304,7 +317,7 @@ there.
 |---|---|
 | `/channels` | List every public channel — yours in yellow. `Enter` joins, `Esc` closes |
 | `Ctrl+J` | Join or create by name: Public/Private with `Left`/`Right`, optional password |
-| `/leave` | Leave the selected channel — its tab disappears |
+| `/leave` | Leave the selected channel — its tab disappears, and its messages go with it |
 
 Channels are shown as `#name`. The `#` is just how they're written — typing
 it back in (`#general`, `--channels=#team`) is fine, it's ignored.
@@ -319,6 +332,16 @@ one needs its name (and password, if the creator set one).
 | `Enter` on a user | Open a private room with them (sidebar focused) |
 | `Esc` | Back to the channel view — the room stays on the DM selector |
 | `]` / `[` | Return to it later / go back to your channels |
+| `/leave` | Close the conversation and forget it — see below |
+
+**`/leave` in a room** closes that conversation and drops everything said
+in it, the same way `/leave` in a channel drops the channel's tab and its
+messages. Message history lives in memory only, so that really is the end
+of it — save anything you want to keep first (`autosave_messages`, or
+`Ctrl+E`).
+
+It is not a block and not an unfriending: the room simply comes off the
+DM selector, and their next message opens it again, empty.
 
 ### Sending a file
 

@@ -115,7 +115,40 @@ pub enum OtpCliOutcome {
     Error(String),
 }
 
+/// An exclusive, cross-process lock on the keychain directory, held for
+/// the duration of one CLI invocation.
+///
+/// The binary reads a contact's current offset, spends key, and writes the
+/// new state back - so two *processes* running it concurrently against one
+/// keychain could both read the same offset and emit the same keystream
+/// for two different plaintexts, which is the one failure a one-time pad
+/// cannot survive. Within one aloo process every call is already
+/// serialized by the session loop; this closes the two-instances case (a
+/// daemon plus a terminal launch is all it takes) by making each call own
+/// the keychain while its subprocess runs. OS-advisory (`File::lock`), so
+/// it evaporates with a dead process rather than wedging the next start.
+///
+/// Deliberately not taken by `new_key_pair_with_progress`: generation
+/// writes fresh key directories rather than spending an existing pad, and
+/// can legitimately run for a very long time - holding this across it
+/// would stall every send in another instance for the duration.
+async fn keychain_lock(cfg: &OtpCliConfig) -> io::Result<std::fs::File> {
+    let dir = cfg.working_dir.clone();
+    tokio::task::spawn_blocking(move || {
+        std::fs::create_dir_all(&dir)?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(dir.join(".keychain.lock"))?;
+        file.lock()?;
+        Ok(file)
+    })
+    .await
+    .map_err(io::Error::other)?
+}
+
 async fn run(cfg: &OtpCliConfig, args: &[&str], stdin_data: &[u8]) -> io::Result<(i32, Vec<u8>, Vec<u8>)> {
+    let _keychain = keychain_lock(cfg).await?;
     let mut child = Command::new(&cfg.binary_path)
         .args(args)
         .current_dir(&cfg.working_dir)
@@ -305,6 +338,7 @@ async fn run_file_to_file(
 ) -> io::Result<(i32, Vec<u8>)> {
     let stdin_file = std::fs::File::open(src)?;
     let stdout_file = std::fs::File::create(dst)?;
+    let _keychain = keychain_lock(cfg).await?;
     let child = Command::new(&cfg.binary_path)
         .args(args)
         .current_dir(&cfg.working_dir)
@@ -759,6 +793,7 @@ pub async fn recover_last_file(
         RecoverDirection::Sent => "--sent",
         RecoverDirection::Received => "--received",
     };
+    let _keychain = keychain_lock(cfg).await?;
     let stdout_file = std::fs::File::create(dst)?;
     let child = Command::new(&cfg.binary_path)
         .args(["--recover-last", contact, flag])

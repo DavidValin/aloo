@@ -973,3 +973,4 @@ fn export_own_identity_card_to_reports_an_undecodable_public_bundle() {
     let result = export_own_identity_card_to(&private, b"not a valid bundle", "alice", &dir);
     assert!(result.is_err());
 }
+

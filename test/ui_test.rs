@@ -4246,7 +4246,7 @@ fn help_descriptions_all_start_in_one_column_and_wrap_back_into_it() {
     };
 
     let ctrl_j = column("join/create");
-    for description in ["list every public channel", "leave the selected channel tab"] {
+    for description in ["list every public channel", "leave the selected channel: its tab disappears"] {
         assert_eq!(
             column(description),
             ctrl_j,

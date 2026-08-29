@@ -222,6 +222,64 @@ async fn delivery_ack_arrives(w: &mut AlooWorld, _who: String, text: String) {
     }
 }
 
+// ---------------------------------------------------------------------
+// A pad position is spent once, and read once, in order (AC-304)
+// ---------------------------------------------------------------------
+
+/// Bob accepting a padded message: his counter moves past `seq` and the
+/// proof he computed for it is recorded, which is what a repeat is
+/// answered from later.
+#[when(expr = "bob accepts the padded message at sequence {int}")]
+async fn bob_accepts_at_seq(w: &mut AlooWorld, seq: u64) {
+    let contact = w.otp_contact_name.clone().expect("no otp contact provisioned yet");
+    assert!(
+        w.otp_store_mut().is_next_expected(&contact, seq),
+        "sequence {seq} must be the one his pad is expecting"
+    );
+    assert!(w.otp_store_mut().record_received(&contact, seq));
+    w.otp_store_mut()
+        .record_last_received_ack(&contact, seq, [seq as u8; 32]);
+    w.otp_last_accepted_seq = seq;
+}
+
+#[then(expr = "the padded message at sequence {int} is not let near the pad again")]
+async fn not_let_near_the_pad(w: &mut AlooWorld, seq: u64) {
+    let contact = w.otp_contact_name.clone().expect("no otp contact provisioned yet");
+    assert!(
+        !w.otp_store_mut().is_next_expected(&contact, seq),
+        "a sequence his counter has already passed must never reach otp --decrypt a second time"
+    );
+}
+
+#[then(expr = "bob answers it with the acknowledgement he already recorded")]
+async fn answers_from_the_record(w: &mut AlooWorld) {
+    let contact = w.otp_contact_name.clone().expect("no otp contact provisioned yet");
+    let seq = w.otp_last_accepted_seq;
+    assert_eq!(
+        w.otp_store_mut().ack_to_resend(&contact, seq),
+        Some([seq as u8; 32]),
+        "silence would wedge the sender's gate forever; the recorded proof answers it for free"
+    );
+}
+
+#[then(expr = "the padded message at sequence {int} is refused as out of turn")]
+async fn refused_out_of_turn(w: &mut AlooWorld, seq: u64) {
+    let contact = w.otp_contact_name.clone().expect("no otp contact provisioned yet");
+    assert!(
+        !w.otp_store_mut().is_next_expected(&contact, seq),
+        "the pad is a sequence, not a set - {seq} is not the position it is at"
+    );
+}
+
+#[then(expr = "the padded message at sequence {int} is the one it will read next")]
+async fn is_next_to_read(w: &mut AlooWorld, seq: u64) {
+    let contact = w.otp_contact_name.clone().expect("no otp contact provisioned yet");
+    assert!(
+        w.otp_store_mut().is_next_expected(&contact, seq),
+        "{seq} is exactly where this pad is"
+    );
+}
+
 #[then(expr = "the held message {string} is sent")]
 async fn held_message_is_sent(w: &mut AlooWorld, text: String) {
     assert_eq!(w.otp_sent.last(), Some(&text), "expected the held message to have been sent");
@@ -1323,6 +1381,257 @@ async fn pad_only_endotp(w: &mut AlooWorld, _a: String, _b: String) {
     .expect("/endotp should not fail");
 }
 
+// ---------------------------------------------------------------------
+// A voice message held for someone who is away (AC-423)
+// ---------------------------------------------------------------------
+
+#[given("queued sends are on for that pair")]
+async fn pad_only_queueing_on(w: &mut AlooWorld) {
+    let (a, b) = w.pad_only.as_mut().expect("no pad-only pair");
+    a.session.set_queue_send_messages(true);
+    b.session.set_queue_send_messages(true);
+}
+
+/// Records and hands over a voice message, which with the queue on seals
+/// it there and then - both the offer that announces it and the recording
+/// itself.
+#[when(expr = "{word} records a voice message for {word}")]
+async fn pad_only_records_voice(w: &mut AlooWorld, _from: String, _to: String) {
+    pad_only_record(w, 4096).await;
+}
+
+/// A recording the pad cannot cover: the pair's key is 1MB, so this is
+/// comfortably past it.
+#[when(expr = "{word} records a voice message larger than the key she has left")]
+async fn pad_only_records_oversized_voice(w: &mut AlooWorld, _from: String) {
+    pad_only_record(w, 4 * 1024 * 1024).await;
+}
+
+async fn pad_only_record(w: &mut AlooWorld, bytes: usize) {
+    let contact = aloo::crypto::otp::contact_name_for_keys(
+        &pad_only_pin("alice"),
+        &pad_only_pin("bob"),
+    );
+    w.otp_contact_name = Some(contact.clone());
+    let (a, _) = w.pad_only.as_mut().expect("no pad-only pair");
+    w.pad_spent_before = pad_offset(a, &contact).await;
+    let peer_der = a.peer_der.clone();
+    let peer = a.peer;
+    let pcm: Vec<u8> = (0..bytes).map(|i| (i % 251) as u8).collect();
+    w.otp_recorded_pcm = pcm.clone();
+    aloo::client::otp::send_voice_offer(
+        &mut aloo::control::NullSink,
+        &mut a.session,
+        &mut a.ui,
+        peer,
+        &contact,
+        &peer_der,
+        pcm,
+        1500,
+    )
+    .await
+    .expect("the voice offer path should not fail");
+}
+
+async fn pad_offset(side: &crate::world::PadOnlyPeer, contact: &str) -> u64 {
+    otp_cli::show_contact(&side.session.otp_cli_cfg_for_test(), contact)
+        .await
+        .ok()
+        .flatten()
+        .map(|d| d.enc_offset)
+        .unwrap_or(0)
+}
+
+#[then("both of that voice message's pad positions are already spent")]
+async fn both_positions_spent(w: &mut AlooWorld) {
+    let contact = w.otp_contact_name.clone().expect("no contact");
+    let before = w.pad_spent_before;
+    let recorded = w.otp_recorded_pcm.len() as u64;
+    let (a, _) = w.pad_only.as_mut().expect("no pad-only pair");
+    let after = pad_offset(a, &contact).await;
+    assert!(
+        after >= before + recorded,
+        "the recording must have been sealed at record time, not deferred to their accept: \
+         {before} -> {after}, recording is {recorded} bytes"
+    );
+}
+
+#[then(expr = "what waits on disk for {word} is ciphertext, not the recording")]
+async fn staged_is_ciphertext(w: &mut AlooWorld, _to: String) {
+    let contact = w.otp_contact_name.clone().expect("no contact");
+    let pcm = w.otp_recorded_pcm.clone();
+    let (a, _) = w.pad_only.as_mut().expect("no pad-only pair");
+    let path = a
+        .session
+        .otp_outbox_ref()
+        .expect("the queue is on")
+        .entries_for(&contact)
+        .iter()
+        .find_map(|e| e.recording().map(|(path, _)| path))
+        .expect("the sealed recording waits as its own queue entry");
+    let on_disk = std::fs::read(&path).expect("the sealed recording is on disk");
+    assert_ne!(
+        on_disk, pcm,
+        "nothing readable may wait on disk while they are away"
+    );
+}
+
+#[then("the offer's position comes before the recording's")]
+async fn offer_before_recording(w: &mut AlooWorld) {
+    let contact = w.otp_contact_name.clone().expect("no contact");
+    let (a, _) = w.pad_only.as_mut().expect("no pad-only pair");
+    let peer = a.peer;
+    let offer_seq = a
+        .session
+        .sent_or_queued_payloads(peer)
+        .into_iter()
+        .find_map(|p| match p {
+            aloo::p2p_proto::P2pPayload::OtpVoiceOffer { seq, .. } => Some(seq),
+            _ => None,
+        })
+        .expect("the offer went out");
+    let recording_seq = a
+        .session
+        .otp_outbox_ref()
+        .expect("the queue is on")
+        .entries_for(&contact)
+        .iter()
+        .find(|e| e.recording().is_some())
+        .and_then(|e| e.seq())
+        .expect("the recording waits as its own queue entry");
+    assert!(
+        offer_seq < recording_seq,
+        "they read the offer before the recording it announces: {offer_seq} < {recording_seq}"
+    );
+}
+
+#[then("six entries wait, offers and recordings alternating in order")]
+async fn six_entries_alternate(w: &mut AlooWorld) {
+    let contact = w.otp_contact_name.clone().expect("no contact");
+    let (a, _) = w.pad_only.as_mut().expect("no pad-only pair");
+    let outbox = a.session.otp_outbox_ref().expect("the queue is on");
+    let kinds: Vec<bool> = outbox
+        .entries_for(&contact)
+        .iter()
+        .map(|e| e.recording().is_some())
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![false, true, false, true, false, true],
+        "offer then recording, three times, in the order they were written"
+    );
+    let seqs: Vec<u64> = outbox
+        .entries_for(&contact)
+        .iter()
+        .filter_map(|e| e.seq())
+        .collect();
+    assert!(
+        seqs.windows(2).all(|w| w[0] < w[1]),
+        "six pad positions, strictly in order: {seqs:?}"
+    );
+}
+
+#[then("each recording waits as its own ciphertext file")]
+async fn each_recording_its_own_file(w: &mut AlooWorld) {
+    let contact = w.otp_contact_name.clone().expect("no contact");
+    let (a, _) = w.pad_only.as_mut().expect("no pad-only pair");
+    let paths: Vec<std::path::PathBuf> = a
+        .session
+        .otp_outbox_ref()
+        .expect("the queue is on")
+        .entries_for(&contact)
+        .iter()
+        .filter_map(|e| e.recording().map(|(path, _)| path))
+        .collect();
+    assert_eq!(paths.len(), 3);
+    let distinct: std::collections::BTreeSet<_> = paths.iter().collect();
+    assert_eq!(distinct.len(), 3, "no two recordings share a file: {paths:?}");
+    for path in &paths {
+        assert!(path.exists(), "each ciphertext is on disk: {}", path.display());
+    }
+}
+
+#[then("the recording waits its turn in the queue")]
+async fn recording_position_reserved(w: &mut AlooWorld) {
+    let contact = w.otp_contact_name.clone().expect("no contact");
+    let (a, _) = w.pad_only.as_mut().expect("no pad-only pair");
+    assert!(
+        a.session
+            .otp_outbox_ref()
+            .expect("the queue is on")
+            .entries_for(&contact)
+            .iter()
+            .any(|e| e.recording().is_some()),
+        "the sealed recording is an ordinary queue entry, waiting its turn"
+    );
+}
+
+#[then("a message written after it does not go out ahead of it")]
+async fn later_message_waits(w: &mut AlooWorld) {
+    let contact = w.otp_contact_name.clone().expect("no contact");
+    let (a, _) = w.pad_only.as_mut().expect("no pad-only pair");
+    let peer = a.peer;
+    let count = |side: &mut crate::world::PadOnlyPeer| {
+        side.session
+            .sent_or_queued_payloads(peer)
+            .into_iter()
+            .filter(|p| matches!(p, aloo::p2p_proto::P2pPayload::OtpEnvelope { .. }))
+            .count()
+    };
+    let before = count(a);
+    // The offer's acknowledgement clears the gate - what the queue
+    // releases next is the recording, never the text behind it.
+    let (offer_seq, offer_proof) = {
+        let state = a.session.otp_store_mut().get(&contact).expect("armed");
+        (
+            state
+                .pending_unacked_out_seq
+                .expect("the offer is outstanding"),
+            state.pending_ack_proof,
+        )
+    };
+    a.session
+        .otp_store_mut()
+        .record_acked(&contact, offer_seq, offer_proof);
+    aloo::client::otp::pump_otp_queue(
+        &mut aloo::control::NullSink,
+        &mut a.session,
+        &mut a.ui,
+        peer,
+        &contact,
+    )
+    .await;
+    assert_eq!(
+        count(a),
+        before,
+        "nothing may step over a position they have not been given yet"
+    );
+}
+
+#[then("the recording is refused, naming what is left")]
+async fn recording_refused(w: &mut AlooWorld) {
+    let (a, _) = w.pad_only.as_mut().expect("no pad-only pair");
+    let notice = a.ui.status_notice.clone();
+    assert!(
+        notice
+            .as_ref()
+            .is_some_and(|(text, _)| text.contains("not enough key left")),
+        "the refusal must say so, and say what is left: {notice:?}"
+    );
+}
+
+#[then("no pad was spent on it")]
+async fn no_pad_spent(w: &mut AlooWorld) {
+    let contact = w.otp_contact_name.clone().expect("no contact");
+    let before = w.pad_spent_before;
+    let (a, _) = w.pad_only.as_mut().expect("no pad-only pair");
+    assert_eq!(
+        pad_offset(a, &contact).await,
+        before,
+        "refused before anything was spent, which is the whole point of asking first"
+    );
+}
+
 #[given("bob has become unreachable for alice")]
 async fn pad_only_peer_unreachable(w: &mut AlooWorld) {
     let (a, _) = w.pad_only.as_mut().expect("no pad-only pair");
@@ -1647,6 +1956,13 @@ async fn otp_active_with_nothing_sent(w: &mut AlooWorld, _b: String) {
 async fn pad_only_send_voice(w: &mut AlooWorld) {
     let contact = w.otp_contact_name.clone().expect("no contact");
     let (a, b) = w.pad_only.as_mut().expect("no pad-only pair");
+    // This scenario pins the *unqueued* two-phase shape - staged awaiting
+    // acceptance, encrypted on accept - and the restart recovery that
+    // protects it. With the queue on the recording is sealed at record
+    // time and held as its own queue entry instead; queued_sends.feature
+    // covers that shape.
+    a.session.set_queue_send_messages(false);
+    b.session.set_queue_send_messages(false);
     let pcm = b"the recording a restart must not lose".to_vec();
     let peer = a.peer;
     let peer_der = a.peer_der.clone();

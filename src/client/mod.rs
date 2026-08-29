@@ -16,6 +16,7 @@ pub mod idstore;
 pub mod ip_ban;
 pub mod netstats;
 pub mod noip;
+pub mod otp_outbox;
 pub mod outbox;
 pub mod open_url;
 pub mod otp;

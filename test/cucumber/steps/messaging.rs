@@ -461,3 +461,51 @@ async fn voice_never_mentions_me(w: &mut AlooWorld) {
         pcm: Vec::new(),
     }));
 }
+
+// ---------------------------------------------------------------------
+// `/leave`, for either kind of conversation (US-006)
+// ---------------------------------------------------------------------
+
+#[then(expr = "no private room with {word} is open")]
+async fn no_room_open(w: &mut AlooWorld, name: String) {
+    let peer = UserId(id_for(&name));
+    let state = w.ui_ref();
+    assert_ne!(state.active_private_room, Some(peer));
+    assert!(!state.private_rooms.contains_key(&peer));
+}
+
+#[then(expr = "nothing said with {word} is left in memory")]
+async fn nothing_left_in_memory(w: &mut AlooWorld, name: String) {
+    let peer = UserId(id_for(&name));
+    assert!(
+        !w.ui_ref().private_rooms.contains_key(&peer),
+        "the room and its whole log go together"
+    );
+}
+
+#[then(expr = "{word} is not on the DM selector")]
+async fn not_on_dm_selector(w: &mut AlooWorld, name: String) {
+    assert!(!w.ui_ref().dm_order.contains(&UserId(id_for(&name))));
+}
+
+#[then(expr = "{word} is on the DM selector")]
+async fn on_dm_selector(w: &mut AlooWorld, name: String) {
+    assert!(w.ui_ref().dm_order.contains(&UserId(id_for(&name))));
+}
+
+#[then(expr = "the private room with {word} holds {int} message")]
+#[then(expr = "the private room with {word} holds {int} messages")]
+async fn room_holds(w: &mut AlooWorld, name: String, count: usize) {
+    let peer = UserId(id_for(&name));
+    let room = w
+        .ui_ref()
+        .private_rooms
+        .get(&peer)
+        .unwrap_or_else(|| panic!("no private room with {name}"));
+    assert_eq!(room.log.len(), count, "a fresh room, not the old history back");
+}
+
+#[then(expr = "leaving the channel {string} is requested")]
+async fn leaving_channel_requested(w: &mut AlooWorld, name: String) {
+    assert_eq!(w.last_action, Some(UiAction::LeaveChannel { name }));
+}

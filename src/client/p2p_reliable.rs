@@ -92,9 +92,29 @@ pub const SEND_WINDOW_BYTES: usize = 256 * 1024;
 
 struct Unacked {
     payload: Vec<u8>,
+    /// An opaque, caller-chosen correlation id, carried locally and never
+    /// put on the wire. It is how a caller that is holding the only
+    /// durable copy of this content (`client::outbox`) learns which entry
+    /// an ack has just made safe to delete - see `AckOutcome::delivered`.
+    tag: Option<u64>,
     sent_at: Instant,
     backoff: Duration,
     retries: u32,
+}
+
+/// What an ack freed: frames the window now admits (which the caller must
+/// transmit), and the tags of frames the peer has confirmed.
+///
+/// `delivered` is the whole reason tags exist. Until an ack arrives, the
+/// only copy of a queued message that survives this process is the one on
+/// disk, so nothing may delete it on the strength of having merely handed
+/// it to the transport - a crash in between would lose content that was
+/// accepted from the user and never sent. An ack is the first moment that
+/// copy is genuinely redundant.
+#[derive(Default)]
+pub struct AckOutcome {
+    pub released: Vec<(u32, Vec<u8>)>,
+    pub delivered: Vec<u64>,
 }
 
 /// One peer link's outgoing reliable frames.
@@ -111,7 +131,7 @@ pub struct ArqSender {
     /// were handed over. Sequence numbers are assigned on the way *out* of
     /// here, not on the way in, so what the peer sees is still one gapless
     /// ascending run.
-    backlog: VecDeque<Vec<u8>>,
+    backlog: VecDeque<(Vec<u8>, Option<u64>)>,
     /// Diagnostic-only counters, read by `PeerLinkManager::link_diagnostics`
     /// - never consulted by anything that decides what to send: how many
     /// frames have ever been retransmitted on this link (a loss/stall
@@ -148,12 +168,12 @@ impl ArqSender {
     /// already full - in which case this one is held in the backlog and
     /// comes back out of `on_ack` later. Nothing is ever dropped here;
     /// `None` means "not yet", never "lost".
-    pub fn send(&mut self, payload: Vec<u8>) -> Option<(u32, Vec<u8>)> {
+    pub fn send(&mut self, payload: Vec<u8>, tag: Option<u64>) -> Option<(u32, Vec<u8>)> {
         if !self.window_admits(payload.len()) {
-            self.backlog.push_back(payload);
+            self.backlog.push_back((payload, tag));
             return None;
         }
-        Some(self.admit(payload))
+        Some(self.admit(payload, tag))
     }
 
     /// Whether a frame of `len` bytes fits the window right now - both
@@ -171,7 +191,7 @@ impl ArqSender {
 
     /// Assigns the next sequence number to `payload` and records it as
     /// awaiting an ack, handing back what to put on the wire.
-    fn admit(&mut self, payload: Vec<u8>) -> (u32, Vec<u8>) {
+    fn admit(&mut self, payload: Vec<u8>, tag: Option<u64>) -> (u32, Vec<u8>) {
         let seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1);
         self.unacked_bytes += payload.len();
@@ -179,6 +199,7 @@ impl ArqSender {
             seq,
             Unacked {
                 payload: payload.clone(),
+                tag,
                 sent_at: Instant::now(),
                 backoff: self.rto(),
                 retries: 0,
@@ -245,7 +266,7 @@ impl ArqSender {
     /// most recent frame this ack actually retires, and only if that frame
     /// was never retransmitted (Karn's algorithm: an ack for a
     /// retransmitted frame can't say which transmission it belongs to).
-    pub fn on_ack(&mut self, seq: u32, now: Instant) -> Vec<(u32, Vec<u8>)> {
+    pub fn on_ack(&mut self, seq: u32, now: Instant) -> AckOutcome {
         let retired: Vec<u32> = self
             .unacked
             .range(..=seq)
@@ -257,20 +278,23 @@ impl ArqSender {
         {
             self.record_rtt_sample(now.saturating_duration_since(frame.sent_at));
         }
+        let mut outcome = AckOutcome::default();
         for s in &retired {
             if let Some(frame) = self.unacked.remove(s) {
                 self.unacked_bytes = self.unacked_bytes.saturating_sub(frame.payload.len());
+                if let Some(tag) = frame.tag {
+                    outcome.delivered.push(tag);
+                }
             }
         }
-        let mut released = Vec::new();
-        while let Some(next) = self.backlog.front() {
+        while let Some((next, _)) = self.backlog.front() {
             if !self.window_admits(next.len()) {
                 break;
             }
-            let next = self.backlog.pop_front().expect("just checked the front");
-            released.push(self.admit(next));
+            let (next, tag) = self.backlog.pop_front().expect("just checked the front");
+            outcome.released.push(self.admit(next, tag));
         }
-        released
+        outcome
     }
 
     /// Frames due for retransmission right now, in ascending `seq` order.
@@ -332,7 +356,7 @@ impl ArqSender {
     /// start from zero on both sides - but the content that was in flight
     /// when the old one died was never delivered and must not be lost with
     /// it (`p2p::PeerLinkManager::reset_transport`).
-    pub fn reset(&mut self) -> Vec<Vec<u8>> {
+    pub fn reset(&mut self) -> Vec<(Vec<u8>, Option<u64>)> {
         self.next_seq = 0;
         self.unacked_bytes = 0;
         // A re-punched link may be a genuinely different path (a new
@@ -346,7 +370,7 @@ impl ArqSender {
         // chunked payload has to be re-sent in to reassemble.
         std::mem::take(&mut self.unacked)
             .into_values()
-            .map(|u| u.payload)
+            .map(|u| (u.payload, u.tag))
             .chain(std::mem::take(&mut self.backlog))
             .collect()
     }

@@ -1547,6 +1547,36 @@ datagram reached the peer's client, never that the peer could read what
 was inside it - which is why delivery is reported separately, by the
 recipient itself (§7.2.1).
 
+**A queued frame is retired by the peer, not by the sender.** Content
+released from a durable queue (§7.1) goes out carrying a local
+correlation tag, and the sender's copy is deleted only when the ack for
+that tag comes back. Handing a frame to this layer proves nothing about
+its arrival: the link can die mid-flight, in which case the frame is given
+up on above and nothing else would re-send it, and the process can be
+killed between the two. In both cases the durable copy is still there and
+is offered again the next time the link opens. A duplicate produced that
+way is refused by the receiver's replay window (§13.4), so at-least-once
+here is exactly once as far as the user is concerned. Unreliable frames
+(§7.3) are the exception in the obvious way: there is no ack to wait for,
+so they are released on handover.
+
+**A frame that is delivered is never silently dropped.** Once the reliable
+layer hands a payload up, the application owes the user a visible outcome
+for it. Two cases used to fall short of that and no longer do. A payload
+can arrive from a peer the client has not yet been *told about* - a
+punched link carries content the moment it opens, which can beat the
+server's word that the sender exists, leaving no public key to decrypt
+with and no name to render under; such a message is held (bounded, the
+same rule as the reorder buffer above) and re-offered on every turn of the
+session loop, so it is shown as soon as the sender is known rather than
+discarded for arriving early. And a payload can arrive *out of the order
+it was sealed in*, which the durable queue (§7.1) makes ordinary; §13.4's
+window is what keeps that from reading as a replay. Beyond those, where a
+message is shown follows the ordinary rules: the room is created if it
+does not exist, so a conversation closed with `/leave` reappears carrying
+it, and a sender still under identity review has it held and revealed on
+Accept (§12) rather than lost.
+
 **Datagram size.** A `Reliable`/`Unreliable` frame is one raw UDP datagram
 - there's no length-prefixed framing to split an oversized payload across
 multiple sends the way TCP's own segmentation would (§1.1's `MAX_FRAME_LEN`
@@ -3550,8 +3580,8 @@ stop:
 - **Moving a message between rooms.** `channel` binds a send to the room
   it belongs to, so a private message cannot be replayed into a channel,
   or the reverse.
-- **Replay onto the same link.** `send_id` must strictly exceed everything
-  already accepted from that peer (§13.4).
+- **Replay onto the same link.** each `send_id` is accepted at most once
+  from a given peer (§13.4).
 
 `recipient_fp` is an *identity* fingerprint, not a connection one - stable
 across reconnects, unlike a `UserId`. Gaps in `send_id` are ordinary and
@@ -3615,11 +3645,25 @@ layer, because only it knows the context:
 
 - **Channel**: `binding.channel` must equal the channel the payload
   actually arrived on (`None` for a DM).
-- **Replay**: `binding.send_id` must strictly exceed the highest already
-  accepted from that peer. State is kept per live `UserId` and only for the
-  life of the session - deliberately, since a peer who reconnects gets a
-  fresh `UserId` and restarts their counter, and keying this by identity
-  instead would reject everything they sent after reconnecting.
+- **Replay**: `binding.send_id` must not already have been accepted from
+  that peer. This is a *sliding window*, not a high-water mark: the last
+  `replay::WINDOW` ids below the newest accepted are tracked individually,
+  and an unused one among them is accepted. Anything that has fallen
+  further behind than the window is refused.
+
+  A window rather than a high-water mark because sends no longer
+  necessarily arrive in the order they were sealed. A message written to
+  somebody offline is sealed - `send_id` and all - when it is written, then
+  waits in the durable queue (§7.1.1) until they return; by then the sender
+  has sealed newer things, so the one that waited arrives *after* ids above
+  it. A high-water mark reads that as a replay and drops it silently, which
+  is the one outcome the queue exists to prevent. Re-injecting a captured
+  send still fails, because its id is already marked as taken.
+
+  State is kept per live `UserId` and only for the life of the session -
+  deliberately, since a peer who reconnects gets a fresh `UserId` and
+  restarts their counter, and keying this by identity instead would reject
+  everything they sent after reconnecting.
 
 Any failure at any step - bad AEAD tag, either signature, a binding naming
 someone else or the wrong room, a replayed `send_id`, malformed bytes -
@@ -4387,7 +4431,14 @@ from - which is exactly what `last_received_ack` durably records.
 
 The same discipline survives the process itself dying mid-step, on either
 side. Every encrypt writes ahead what it is about to be
-(`encrypt_intent`), so a kill between the tool's encrypt succeeding and
+(`encrypt_intent`), and that write is *checked* before anything is spent:
+a record that never reached the disk - a full disk being the realistic way
+that happens, since setting it in memory still succeeds - protects
+nothing, so the send is refused rather than spending a position nothing
+could later account for. Because the receiving counter admits no gaps
+(§16.2), a position spent and then lost track of is not a delayed message
+but every later message being refused. With the record safely down, a kill
+between the tool's encrypt succeeding and
 the spend being recorded is reconciled at the next startup: the tool's
 own counter says whether anything was spent, and a real orphan is promoted
 to an ordinary recorded send that recovery then resends - never silently

@@ -968,7 +968,12 @@ impl Settings {
             };
             let value = value.trim();
             match key.trim() {
-                "global_ptt_enabled" => set_parsed(&mut settings.global_ptt_enabled, value),
+                // `parse_switch`, not `set_parsed`: this key is written
+                // as `on`/`off` like every other switch here, and
+                // `bool::from_str` reads neither. It still accepts the
+                // `true`/`false` a file written before they were
+                // normalized holds.
+                "global_ptt_enabled" => settings.global_ptt_enabled = parse_switch(value),
                 "global_ptt_shortcut" if !value.is_empty() => {
                     settings.global_ptt_shortcut = value.to_string();
                 }
@@ -1071,7 +1076,9 @@ impl Settings {
                 "daemon_initial_focus" if !value.is_empty() => {
                     settings.daemon_initial_focus = Some(value.to_string())
                 }
-                "daemon_otp" => set_parsed(&mut settings.daemon_otp, value),
+                // Same as `global_ptt_enabled` above - `on`/`off` now,
+                // `true`/`false` still read.
+                "daemon_otp" => settings.daemon_otp = parse_switch(value),
                 // `on`/`off` rather than `true`/`false`, matching how the
                 // setting is spelled in every example and in the README -
                 // both are accepted so neither spelling is a silent no-op.
@@ -1163,7 +1170,7 @@ impl Settings {
     /// key blank) it is kept and simply written blank, never deleted.
     fn scalar_fields(&self) -> Vec<ScalarField> {
         vec![
-            always("global_ptt_enabled", self.global_ptt_enabled),
+            always_switch("global_ptt_enabled", self.global_ptt_enabled),
             always("global_ptt_shortcut", &self.global_ptt_shortcut),
             always("voice_echo_ducking", self.voice_echo_ducking),
             always_switch("voice_autoplay", self.voice_autoplay),
@@ -1213,9 +1220,16 @@ impl Settings {
             optional_text("daemon_initial_focus", &self.daemon_initial_focus),
             optional_port("daemon_port", self.daemon_port),
             // The two daemon switches earn a line the same way the
-            // optionals above do - once they are actually on - but each
-            // in its own documented spelling.
-            ("daemon_otp", self.daemon_otp.to_string(), self.daemon_otp),
+            // optionals above do - once they are actually on - and both
+            // in the `on`/`off` spelling every other switch in this file
+            // uses. `parse_switch` still reads `true`/`yes`/`1` as well,
+            // so a file written before they were normalized loads
+            // unchanged.
+            (
+                "daemon_otp",
+                switch(self.daemon_otp).to_string(),
+                self.daemon_otp,
+            ),
             (
                 "daemon_no_server",
                 switch(self.daemon_no_server).to_string(),

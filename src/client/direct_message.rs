@@ -70,7 +70,17 @@ pub async fn handle_send_text(
         )
         .await;
     }
-    if session.remote_keys.try_use(to) {
+    // A rotation that cannot come must not hold a message hostage. The
+    // gate exists so consecutive sends do not reuse one key
+    // (`rekey::RemoteKeys`) - but its queue waits for the peer's *next*
+    // key, and a peer who is not there will never send one. Worse, that
+    // queue is keyed by a `UserId` they will never hold again, so the
+    // message would sit there past their return, invisible and unsent.
+    // With somewhere durable to put it instead, the queue is the right
+    // answer and the wait is not.
+    let waiting_for_a_key_is_pointless =
+        session.outbox.is_some() && !session.peer_link.is_active(to);
+    if session.remote_keys.try_use(to) || waiting_for_a_key_is_pointless {
         let send_id = session.next_stream_id;
         session.next_stream_id += 1;
         if let Some(envelope) = encrypt_for_recipient(
@@ -199,6 +209,23 @@ pub(crate) async fn handle_send_file(
     Ok(())
 }
 
+/// Whether a recording for `to` may begin - the rotating-key gate, and
+/// the one case that overrides it.
+///
+/// That gate exists so consecutive sends never reuse one key, and it works
+/// by consuming a permit that the peer's *next* rotation replaces. A peer
+/// who is not there will never send one, so for them the wait cannot end:
+/// with a durable queue to hold the recording the user was recording
+/// something for someone who is away - exactly what the queue is for - and
+/// being told their key "isn't ready", which would not become true until
+/// they came back. The same reasoning `handle_send_text` already applies
+/// to a typed message.
+pub(crate) fn recording_may_start(session: &mut SessionState, to: UserId) -> bool {
+    let waiting_for_a_key_is_pointless =
+        session.outbox.is_some() && !session.peer_link.is_active(to);
+    session.remote_keys.try_use(to) || waiting_for_a_key_is_pointless
+}
+
 pub(crate) async fn handle_voice_record_start(
     wr: &mut impl crate::control::ControlSink,
     ui_state: &mut UiState,
@@ -208,7 +235,7 @@ pub(crate) async fn handle_voice_record_start(
     to: UserId,
     recipient_pubkey_der: Vec<u8>,
 ) -> proto::Result<()> {
-    if !session.remote_keys.try_use(to) {
+    if !recording_may_start(session, to) {
         ui_state.recording_failed("recipient's key isn't ready yet".to_string());
         return Ok(());
     }
@@ -365,6 +392,12 @@ pub async fn on_message(
     envelope: Envelope,
 ) {
     let Some(sender) = ui_state.known_users.get(&from).cloned() else {
+        // It arrived, so it must be shown. We just cannot show it *yet*:
+        // decrypting needs their public key and the row needs their name,
+        // and a punched peer's first payload can beat the server's word
+        // that they exist. Held until it does - see
+        // `session::link_events::retry_deferred_dms`.
+        crate::client::session::defer_dm(session, from, msg_id, envelope);
         return;
     };
     // The OTP-layer provisioning handshake rides ordinary (non-OTP)

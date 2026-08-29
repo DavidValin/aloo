@@ -164,6 +164,19 @@ pub fn pad_pair_digest(enc: &KeyDigest, dec: &KeyDigest) -> KeyDigest {
 /// key with nothing negotiated. Used under `Direct` framing
 /// (`client::otp::OtpFraming`), where one side's announced key does not
 /// decode as a keybundle and so has no fingerprint to name a contact by.
+///
+/// Not device-qualified, unlike `contact_name_for` - and deliberately so.
+/// A pad has no safe multi-device story either way; the two framings just
+/// enforce it in different places. A `PqWrapped` pair puts the device in
+/// the *name* (§4), because its device data arrives over the separate
+/// `DeviceIdAnnounce`. A `Direct` pair has no such channel - a
+/// `PunchDatagram` carries no device id, and adding one would be a wire
+/// format change - so it binds the device on the *contact* instead
+/// (`OtpContactState::bound_peer_device_id`, §5): the first message that
+/// genuinely decrypts fixes which device this pad belongs to, and any
+/// later one claiming a different device is refused before `otp --decrypt`
+/// runs. Naming by keys alone is therefore safe here, and keeps the name
+/// derivable from what both sides already hold with nothing configured.
 pub fn contact_name_for_keys(own_public_der: &[u8], peer_public_der: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let own: [u8; 32] = Sha256::digest(own_public_der).into();

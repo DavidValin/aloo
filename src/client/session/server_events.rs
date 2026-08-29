@@ -394,7 +394,18 @@ pub(super) async fn handle_server_message(
             // generic path and *is* a direct answer to something the user
             // just typed - so it also needs to actually reach the screen.
             crate::log_warn!("server error: {message}");
-            ui_state.push_status_notice(message, false);
+            // ...but not the two that answer nothing the user typed.
+            // Signalling a link to a peer who has gone offline, or
+            // offering them a key rotation, both fail this way as a
+            // matter of course - the link simply retries - and putting a
+            // red "unknown recipient" on screen for it makes an ordinary
+            // absence look like a broken send. Named constants, shared
+            // with the server, so the two cannot drift apart.
+            if message != crate::proto::UNKNOWN_RECIPIENT
+                && message != crate::proto::UNKNOWN_SENDER
+            {
+                ui_state.push_status_notice(message, false);
+            }
         }
         ServerMessage::OtpMailResult {
             mail_id,

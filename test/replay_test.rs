@@ -17,18 +17,63 @@ fn a_repeated_send_id_is_refused() {
     );
 }
 
+/// The straggler a durable queue produces: sealed early, delivered after
+/// ids above it. It is not a replay and must not be read as one.
 /// @requirement AC-114
 #[test]
-fn an_older_send_id_is_refused() {
+fn a_send_that_arrives_out_of_order_is_still_accepted() {
     let mut guard = ReplayGuard::new();
     let alice = UserId(1);
 
     assert!(guard.accept(alice, 5));
     assert!(
-        !guard.accept(alice, 4),
-        "anything at or below what was already accepted is a replay"
+        guard.accept(alice, 4),
+        "an earlier id nobody has used yet is a late arrival, not a replay"
     );
+    assert!(!guard.accept(alice, 4), "but only once");
     assert!(!guard.accept(alice, 5));
+    assert_eq!(
+        guard.highest(alice),
+        Some(5),
+        "arriving late does not move the window backwards"
+    );
+}
+
+/// The window is what bounds the memory, so there is a distance beyond
+/// which a straggler is refused rather than risked.
+/// @requirement AC-114
+#[test]
+fn a_send_that_has_fallen_out_of_the_window_is_refused() {
+    let mut guard = ReplayGuard::new();
+    let alice = UserId(1);
+
+    assert!(guard.accept(alice, 1));
+    assert!(guard.accept(alice, aloo::client::replay::WINDOW + 1));
+    assert!(
+        !guard.accept(alice, 1),
+        "exactly WINDOW behind the newest is out"
+    );
+    assert!(
+        guard.accept(alice, 2),
+        "and one place nearer is still in"
+    );
+}
+
+/// Advancing must not let a straggler inherit the bit of the id that
+/// previously occupied its slot in the bitmap.
+/// @requirement AC-114
+#[test]
+fn advancing_the_window_frees_the_slots_it_moves_onto() {
+    let mut guard = ReplayGuard::new();
+    let alice = UserId(1);
+    let window = aloo::client::replay::WINDOW;
+
+    assert!(guard.accept(alice, 3));
+    assert!(guard.accept(alice, window + 4), "a full lap of the bitmap");
+    assert!(
+        guard.accept(alice, window + 3),
+        "the slot 3 used to hold must have been freed on the way past"
+    );
 }
 
 /// Gaps are ordinary: the counter is per connection, so a channel message

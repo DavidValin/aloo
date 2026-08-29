@@ -17,6 +17,35 @@ use crate::proto::{Content, Envelope};
 /// `channel`/`send_id` are what the signature is bound to
 /// (`crypto::pq::SendBinding`), so one member's copy of a channel message
 /// cannot be re-wrapped and passed off to another.
+/// The encapsulation key to seal to for `peer`: their current *rotating*
+/// one if this connection has it, else the bootstrap key carried in their
+/// own keybundle - the very key a first-ever message to them is sealed
+/// under, before either side has rotated anything.
+///
+/// The fallback is not a rare path. A peer's rotating keys belong to one
+/// connection and are forgotten the moment they disconnect
+/// (`session::drop_peer_state`, `docs/PROTOCOL.md` §13.10), so without it
+/// every send to someone who has gone offline sealed to nothing and was
+/// dropped on the floor - no send, no queue, no failure reported, just a
+/// row that stayed undelivered forever. Holding a message *for* an absent
+/// peer (`queue_send_messages`, `client::outbox`) is impossible if it
+/// cannot be sealed for them in the first place.
+///
+/// Cloned rather than borrowed because the fallback's key lives inside a
+/// bundle decoded here: one ML-KEM/X25519 public key pair, per send, only
+/// on the path that would otherwise have failed outright.
+pub(crate) fn encap_to_seal_to(
+    rotating: Option<&crypto::pq::PqEncapKeys>,
+    pubkey_der: &[u8],
+) -> Option<crypto::pq::PqEncapKeys> {
+    match rotating {
+        Some(encap) => Some(encap.clone()),
+        None => crate::proto::decode::<crypto::pq::PqPublicBundle>(pubkey_der)
+            .ok()
+            .map(|bundle| bundle.bootstrap_encap().clone()),
+    }
+}
+
 pub(crate) fn encrypt_envelope_for(
     own_pq_private: &crypto::pq::PqPrivateBundle,
     recipient_encap: Option<&crypto::pq::PqEncapKeys>,
@@ -26,9 +55,10 @@ pub(crate) fn encrypt_envelope_for(
     plaintext: &[u8],
     content: Content,
 ) -> Option<Envelope> {
+    let encap = encap_to_seal_to(recipient_encap, pubkey_der)?;
     encrypt_hybrid_envelope_for(
         own_pq_private,
-        recipient_encap?,
+        &encap,
         pubkey_der,
         channel,
         send_id,
@@ -87,9 +117,15 @@ pub(crate) fn encrypt_blinded_envelope_for(
     content: Content,
 ) -> Option<Envelope> {
     let recipient_fp = crypto::pq::fingerprint_of_encoded(recipient_pubkey_der)?;
+    // Same fallback `encrypt_envelope_for` uses, and it matters more
+    // here: this is the outer seal around pad ciphertext that has
+    // *already been produced*, so failing at this point would leave the
+    // sender's pad advanced and the receiver's not - the two ends out of
+    // step over a message that was never sent. See `encap_to_seal_to`.
+    let encap = encap_to_seal_to(recipient_encap, recipient_pubkey_der)?;
     let block = crypto::pq::seal_send_blinded(
         own_pq_private,
-        recipient_encap?,
+        &encap,
         recipient_fp,
         send_id,
         plaintext,

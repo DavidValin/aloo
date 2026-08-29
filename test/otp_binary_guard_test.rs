@@ -264,3 +264,4 @@ async fn new_otp_mail_key_reaches_the_next_guard_when_the_binary_is_available() 
          rather than refusing outright"
     );
 }
+

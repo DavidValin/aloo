@@ -47,11 +47,43 @@ impl UiState {
     /// refused - a slash command here means `/file`, `/otp`, `/call` and
     /// friends, each a live exchange with a peer who has to answer, and
     /// none of them something a queue could stand in for.
-    pub(crate) fn offline_blocks_send(&self, what: &str) -> bool {
+    pub fn offline_blocks_send(&self, what: &str) -> bool {
         if !self.active_dm_peer_offline() {
             return false;
         }
         !self.queue_send_messages || what.trim_start().starts_with('/')
+    }
+
+    /// `/leave` inside an open private room: closes it, forgets what was
+    /// said in it, and takes it off the DM selector until that person
+    /// writes again (`docs/SPEC.md` Functionality #8).
+    ///
+    /// The channel counterpart drops the whole `ChannelTab`, log included
+    /// (`leave_channel_locally`); this is the same act for the other kind
+    /// of conversation. History is in memory only, so dropping the room
+    /// really is the end of it - the one place it may still exist is the
+    /// on-disk export `autosave_messages` writes, which is a file the
+    /// user asked for and this does not touch.
+    ///
+    /// A new message from them opens a fresh, empty room
+    /// (`on_direct_message`), which is what "until a new message arrives"
+    /// means: nothing here blocks them, and nothing is unfriended.
+    ///
+    /// Returns whether a room was actually open to leave.
+    pub(crate) fn leave_private_room(&mut self, peer: UserId) -> bool {
+        if self.private_rooms.remove(&peer).is_none() {
+            return false;
+        }
+        self.dm_order.retain(|id| *id != peer);
+        if self.selected_dm == Some(peer) {
+            self.selected_dm = self.dm_order.first().copied();
+        }
+        if self.active_private_room == Some(peer) {
+            // Back to the channel view, exactly where Escape from a room
+            // lands - there is no room here to stay in any more.
+            self.focus_channel_selector();
+        }
+        true
     }
 
     pub(crate) fn active_dm_peer_offline(&self) -> bool {

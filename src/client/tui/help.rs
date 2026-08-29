@@ -57,7 +57,12 @@ pub(crate) const HELP_BODY: &[HelpLine] = &[
     },
     HelpLine::Item {
         keys: "/leave",
-        text: "leave the selected channel tab (its tab disappears)",
+        text: "leave the selected channel: its tab disappears, and everything said in it \
+               goes with it - message history lives in memory only. Inside a private room \
+               it closes that conversation instead, on the same terms: the room is \
+               forgotten and drops off the DM selector. That is not a block and not an \
+               unfriending - their next message opens the room again, empty. Anything you \
+               want to keep, keep with autosave_messages or Ctrl+E before leaving.",
     },
     HelpLine::Blank,
     HelpLine::Heading("Channel administration"),
@@ -492,7 +497,11 @@ pub(crate) const HELP_BODY: &[HelpLine] = &[
                whether event sounds do, whether messages are written to (and read back \
                from) ~/.aloo/exports, and whether a message for someone unreachable is \
                held on disk until they are back (queue_send_messages, on by default - \
-               text and voice, in the order you sent them; files are not queued). OTP: \
+               text and voice, in the order you sent them; files are not queued). In an \
+               /otp session writing a message spends its pad there and then, and the \
+               sealed messages go out one at a time in order, each waiting for the \
+               previous one's acknowledgement; with queueing off a message to someone \
+               unreachable is refused instead, so no pad is spent. OTP: \
                the low-key warning threshold \
                and which otp binary to run. Direct Punch: reach someone with no server \
                involved - 'a' adds a target with their nickname, and where their client is \

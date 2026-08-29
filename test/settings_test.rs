@@ -47,7 +47,7 @@ fn missing_file_is_created_with_documented_defaults() {
     );
 
     let contents = std::fs::read_to_string(&path).unwrap();
-    assert!(contents.contains("global_ptt_enabled=true"));
+    assert!(contents.contains("global_ptt_enabled=on"));
     assert!(contents.contains(&format!(
         "global_ptt_shortcut={DEFAULT_GLOBAL_PTT_SHORTCUT}"
     )));
@@ -606,7 +606,7 @@ fn the_first_run_scaffold_is_written_exactly_like_this() {
 const EXPECTED_FIRST_RUN_SCAFFOLD: &str = "\
 # client options\n\
 # -----------------------------------------\n\
-global_ptt_enabled=true\n\
+global_ptt_enabled=on\n\
 global_ptt_shortcut=ctrl+alt+p\n\
 # voice_echo_ducking: auto (decide from the audio), on, off\n\
 voice_echo_ducking=auto\n\
@@ -624,7 +624,7 @@ daemon_my_key_pub=\n\
 daemon_my_key_priv=\n\
 daemon_initial_focus=\n\
 # daemon_channel=otherchannel\n\
-daemon_otp=false\n\
+daemon_otp=off\n\
 daemon_no_server=off\n\
 direct_punch=off\n\
 direct_punch_port=7879\n\
@@ -702,7 +702,7 @@ fn an_ordinary_save_after_the_first_run_preserves_the_scaffolds_comments_and_ord
         .collect();
     assert_eq!(
         changed,
-        vec![("global_ptt_enabled=true", "global_ptt_enabled=false")],
+        vec![("global_ptt_enabled=on", "global_ptt_enabled=off")],
         "only the edited key's line should differ: before={before:?} after={after:?}"
     );
     std::fs::remove_file(&path).ok();
@@ -1343,4 +1343,41 @@ fn a_connection_with_no_host_leaves_the_recorded_host_alone() {
     let settings = Settings::load_or_create(&path).unwrap();
     assert_eq!(settings.connect_host.as_deref(), Some("chat.example.com"));
     let _ = std::fs::remove_file(&path);
+}
+
+/// Every switch in the file is written `on`/`off`, and every one of them
+/// still reads the `true`/`false` a file written before they were
+/// normalized holds - so upgrading never silently changes a setting.
+/// @requirement AC-416
+#[test]
+fn every_switch_is_written_on_or_off_and_still_reads_the_old_spelling() {
+    let path = temp_settings_path();
+    Settings::load_or_create(&path).unwrap();
+    let contents = std::fs::read_to_string(&path).unwrap();
+    for line in contents.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        assert!(
+            !matches!(value, "true" | "false"),
+            "{key} is a switch written the old way: {line:?}"
+        );
+    }
+    std::fs::remove_file(&path).ok();
+
+    // A file from before the normalization still turns things off.
+    let old = temp_settings_path();
+    std::fs::write(&old, "global_ptt_enabled=false\ndaemon_otp=true\n").unwrap();
+    let loaded = Settings::load_or_create(&old).unwrap();
+    assert!(!loaded.global_ptt_enabled, "`false` must still switch it off");
+    assert!(loaded.daemon_otp, "`true` must still switch it on");
+    std::fs::remove_file(&old).ok();
+
+    // ...and so does the new one.
+    let new = temp_settings_path();
+    std::fs::write(&new, "global_ptt_enabled=off\ndaemon_otp=on\n").unwrap();
+    let loaded = Settings::load_or_create(&new).unwrap();
+    assert!(!loaded.global_ptt_enabled);
+    assert!(loaded.daemon_otp);
+    std::fs::remove_file(&new).ok();
 }

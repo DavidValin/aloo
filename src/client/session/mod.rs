@@ -28,7 +28,11 @@ use ui_action::handle_ui_action;
 pub use identity::{
     accept_identity_review, direct_peer_identity, register_pad_only_peer, seed_direct_peer_keys,
 };
-pub use link_events::{drain_p2p_events, reconcile_direct_membership, sweep_outbox};
+pub use link_events::{
+    drain_p2p_events, forget_peer_for_test, reconcile_direct_membership, retry_deferred_dms,
+    sweep_otp_outbox,
+    sweep_outbox,
+};
 pub(crate) use link_events::broadcast_channel_presence;
 
 use std::collections::HashMap;
@@ -277,6 +281,9 @@ pub struct SessionState {
     pub(crate) rotate_out_tx: tokio::sync::mpsc::UnboundedSender<ClientMessage>,
     /// Refuses a send that already arrived once - see `replay::ReplayGuard`.
     pub(crate) replay: crate::client::replay::ReplayGuard,
+    /// DM sends that reached us before we knew who sent them, held so
+    /// that they are shown rather than lost - see `direct_message::on_message`.
+    pub(crate) deferred_dms: Vec<DeferredDm>,
     /// Freshness/queueing for peers whose key rotates during the session
     /// (currently `pq_hybrid` only), independent of our own `key_mode`.
     pub(crate) remote_keys: rekey::RemoteKeys,
@@ -353,6 +360,11 @@ pub struct SessionState {
         std::collections::HashMap<UserId, std::sync::Arc<std::sync::atomic::AtomicBool>>,
     pub(crate) otp_ack_rows: std::collections::HashMap<(String, u64), u64>,
     pub(crate) otp_out_queue: crate::client::otp::OtpOutQueue,
+    /// The durable, sealed, per-contact send queue for pad sessions
+    /// (`client::otp_outbox`), or `None` while `queue_send_messages` is
+    /// off. Loaded once at session start, so anything a previous run
+    /// sealed but never delivered is still there.
+    pub(crate) otp_outbox: Option<crate::client::otp_outbox::OtpOutbox>,
     /// Voice messages and file transfers that still owe their sender a
     /// delivery receipt (`client::delivery`, docs/PROTOCOL.md 7.2.1).
     pub(crate) pending_receipts: crate::client::delivery::PendingReceipts,
@@ -687,6 +699,10 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
         tokio::sync::mpsc::unbounded_channel::<ClientMessage>();
 
     let is_daemon = daemon_plan.is_some();
+    // Read before the struct literal takes ownership of `id_store`:
+    // every one of this client's stores lives beside it, which is what
+    // keeps two clients in one process from sharing a queue.
+    let client_home = id_store.path().to_path_buf();
     let mut session = SessionState {
         active_recording: None,
         next_stream_id: 1,
@@ -694,9 +710,15 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
         echo_ducking: settings.voice_echo_ducking,
         roger_beep: settings.roger_beep,
         sound_notifications: settings.sound_notifications,
-        outbox: settings
-            .queue_send_messages
-            .then(|| crate::client::outbox::Outbox::load(&crate::client::outbox::default_dir())),
+        // Beside this client's own `id_store`, not at a fixed path: two
+        // clients in one process share `ALOO_HOME` but not their stores,
+        // and a queue at a shared path would have each of them sweeping
+        // away the other's messages (`outbox::dir_beside`).
+        outbox: settings.queue_send_messages.then(|| {
+            crate::client::outbox::Outbox::load(&crate::client::outbox::dir_beside(
+                &client_home,
+            ))
+        }),
         test_p2p_events: None,
         test_p2p_events_tx: None,
         own_stream_targets: HashMap::new(),
@@ -724,6 +746,7 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
         pq_peer_keys: crate::client::pq_rekey::PqPeerKeys::new(),
         rotate_out_tx: rotate_out_tx.clone(),
         replay: crate::client::replay::ReplayGuard::new(),
+        deferred_dms: Vec::new(),
         remote_keys: rekey::RemoteKeys::new(),
         id_store,
         conn_stats: netstats::ConnStats::new(),
@@ -748,6 +771,11 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
         otp_cancelled: std::collections::HashMap::new(),
         otp_ack_rows: std::collections::HashMap::new(),
         otp_out_queue: crate::client::otp::OtpOutQueue::new(),
+        otp_outbox: settings.queue_send_messages.then(|| {
+            crate::client::otp_outbox::OtpOutbox::load(
+                &crate::client::otp_outbox::dir_beside(&client_home),
+            )
+        }),
         pending_receipts: crate::client::delivery::PendingReceipts::new(),
         otp_incoming_setup: HashMap::new(),
         otp_incoming_pads: HashMap::new(),
@@ -782,7 +810,7 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
     // Anything queued for a contact this machine no longer holds keys for
     // can never be delivered or read back, so it goes - once here at
     // start, and every `SWEEP_INTERVAL` for as long as the session runs.
-    let swept = link_events::sweep_outbox(&mut session);
+    let swept = link_events::sweep_outbox(&mut session) + link_events::sweep_otp_outbox(&mut session);
     if swept > 0 {
         crate::log_warn!(
             "dropped {swept} queued message(s) for contacts this machine no longer holds keys for"
@@ -1277,6 +1305,7 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
                 // almost always.
                 if now.duration_since(last_outbox_sweep) >= crate::client::outbox::SWEEP_INTERVAL {
                     link_events::sweep_outbox(&mut session);
+                    link_events::sweep_otp_outbox(&mut session);
                     last_outbox_sweep = now;
                 }
                 // Conn:<quality> refreshes once a second, same reasoning.
@@ -1330,6 +1359,11 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
                 session.peer_link.on_direct_resolved(&nickname, addr);
             }
         }
+        // Once per turn of the loop, whatever woke it: any message that
+        // arrived before we knew who sent it is offered again now that
+        // this turn may have introduced them. Cheap when there is
+        // nothing held, which is almost always.
+        link_events::retry_deferred_dms(&mut ui_state, &mut session).await;
         surface.draw(|f| ui::render(f, &ui_state))?;
     }
 
@@ -1805,6 +1839,36 @@ impl SessionState {
         out
     }
 
+    /// Puts one `P2pEvent` where the session loop would have found it -
+    /// exposed for tests the same way `peer_link_mut` is, so a test can
+    /// drive an event the transport only produces after a real punch
+    /// (`LinkStatusChanged { Active }`) and then hand it to
+    /// `drain_p2p_events` exactly as the loop does.
+    /// The durable send queue itself, for a test that needs to set one up
+    /// directly rather than through a send path.
+    pub fn outbox_mut(&mut self) -> Option<&mut crate::client::outbox::Outbox> {
+        self.outbox.as_mut()
+    }
+
+    /// The rotating-key gate a recording has to pass
+    /// (`direct_message::recording_may_start`) - exposed because the path
+    /// itself needs a live microphone, which a test has no way to build.
+    pub fn recording_may_start_for_test(&mut self, to: UserId) -> bool {
+        crate::client::direct_message::recording_may_start(self, to)
+    }
+
+    /// The pad session's durable queue itself, read-only - what a test
+    /// inspects to see entry order and kind without draining anything.
+    pub fn otp_outbox_ref(&self) -> Option<&crate::client::otp_outbox::OtpOutbox> {
+        self.otp_outbox.as_ref()
+    }
+
+    pub fn inject_p2p_event(&mut self, event: crate::client::p2p::P2pEvent) {
+        if let Some(tx) = self.test_p2p_events_tx.as_ref() {
+            let _ = tx.send(event);
+        }
+    }
+
     /// Pins `nickname`'s device as a bare contact - exposed for tests the
     /// same way `peer_link_mut` is, so one can put a contact into the
     /// `id_store` that `sweep_outbox` reads without going through a live
@@ -1820,12 +1884,112 @@ impl SessionState {
         self.noip_config.is_some()
     }
 
+    /// How many sealed messages are waiting on disk for the pad contact
+    /// `contact_name` (`client::otp_outbox`) - exposed for tests the same
+    /// way `queued_for` is.
+    pub fn otp_queued_for(&self, contact_name: &str) -> usize {
+        self.otp_outbox
+            .as_ref()
+            .map(|o| o.len_for(contact_name))
+            .unwrap_or(0)
+    }
+
     /// How many messages are waiting on disk for `nickname`
     /// (`client::outbox`) - exposed the same way `peer_link_mut` is, so a
     /// test can see what a send path decided without a second peer to
     /// receive it. Zero while `queue_send_messages` is off.
     pub fn queued_for(&self, nickname: &str) -> usize {
         self.outbox.as_ref().map(|o| o.len_for(nickname)).unwrap_or(0)
+    }
+
+    /// How many sealed pad messages are waiting across every contact.
+    /// Each one is a spent pad position, which is why it is observable:
+    /// whether the queue may be torn down turns on this being zero.
+    pub fn otp_queued_total(&self) -> usize {
+        self.otp_outbox.as_ref().map(|o| o.total()).unwrap_or(0)
+    }
+
+    /// Puts one sealed entry in the pad queue, so a test can set up a
+    /// queue that still holds spent pad positions without driving a real
+    /// `otp --encrypt`. Same role as `mark_active_for_test`.
+    pub fn queue_sealed_otp_for_test(&mut self, contact_name: &str, seq: u64) -> bool {
+        let payload = P2pPayload::OtpEnvelope {
+            channel: None,
+            msg_id: Some(seq),
+            seq,
+            envelope: proto::Envelope {
+                content: proto::Content::Text,
+                blocks: vec![vec![seq as u8; 32]],
+            },
+            sender_device_id: "test".into(),
+        };
+        self.otp_outbox
+            .as_mut()
+            .map(|outbox| {
+                outbox
+                    .queue(contact_name, &payload, seq, Some(seq), None, [seq as u8; 32])
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false)
+    }
+
+    /// Arms the pad session's single-outstanding-send gate, so a test can
+    /// set up the "sent but never acknowledged" state a kill or a dropped
+    /// frame leaves behind. Same role as `queue_sealed_otp_for_test`.
+    pub fn arm_otp_ack_gate_for_test(&mut self, contact_name: &str, seq: u64) {
+        self.otp_store.record_sent(
+            contact_name,
+            seq,
+            crate::client::otp_store::PendingOtpContent::Text { channel: None },
+            Some([seq as u8; 32]),
+        );
+    }
+
+    /// Re-sends whatever the pad gate is still waiting on, reporting
+    /// whether anything went out - the link-up recovery, reachable from a
+    /// test without a second live peer.
+    pub async fn retry_outstanding_otp_send_for_test(
+        &mut self,
+        ui_state: &mut crate::client::tui::ui::UiState,
+        to: UserId,
+        contact_name: &str,
+    ) -> bool {
+        crate::client::otp::retry_outstanding_otp_send(
+            &mut crate::control::NullSink,
+            self,
+            ui_state,
+            to,
+            contact_name,
+        )
+        .await
+    }
+
+    /// Releases the front of a contact's pad queue if the gate allows,
+    /// reporting whether anything went out - the link-up drain, reachable
+    /// from a test without a second live peer.
+    pub async fn pump_otp_queue_for_test(
+        &mut self,
+        ui_state: &mut crate::client::tui::ui::UiState,
+        to: UserId,
+        contact_name: &str,
+    ) -> bool {
+        let before = self
+            .otp_store
+            .get(contact_name)
+            .and_then(|s| s.pending_unacked_out_seq);
+        crate::client::otp::pump_otp_queue(
+            &mut crate::control::NullSink,
+            self,
+            ui_state,
+            to,
+            contact_name,
+        )
+        .await;
+        let after = self
+            .otp_store
+            .get(contact_name)
+            .and_then(|s| s.pending_unacked_out_seq);
+        before.is_none() && after.is_some()
     }
 
     /// Turns the durable send queue on or off, the way the Ctrl+S popup
@@ -1840,6 +2004,33 @@ impl SessionState {
         } else if !enabled {
             self.outbox = None;
         }
+        // The pad session's own queue is the same switch - a sealed
+        // message has to have somewhere durable to wait, or it must not
+        // be sealed at all - with one asymmetry, because a pad position
+        // cannot be un-spent.
+        //
+        // Turning the setting off stops anything *new* being sealed for
+        // an unreachable peer (`otp::send_or_queue` refuses before
+        // `otp --encrypt` runs), but it must not abandon what is already
+        // sealed and waiting. Those pad positions are spent; dropping the
+        // queue would leave them undelivered while the next send went out
+        // under a later sequence number, and the peer's pad, which
+        // expects exactly the sequence it was given, would be left behind
+        // for good. So a non-empty pad queue is kept and allowed to
+        // drain; it goes only once it is empty and there is nothing left
+        // to desynchronize.
+        if enabled && self.otp_outbox.is_none() {
+            self.otp_outbox = Some(crate::client::otp_outbox::OtpOutbox::load(
+                &crate::client::otp_outbox::default_dir(),
+            ));
+        } else if !enabled
+            && self
+                .otp_outbox
+                .as_ref()
+                .is_some_and(|outbox| outbox.total() == 0)
+        {
+            self.otp_outbox = None;
+        }
         self.peer_link
             .set_spill_undeliverable(self.outbox.is_some());
     }
@@ -1850,6 +2041,13 @@ impl SessionState {
     /// played leaves no other trace. Every chime and every replay takes
     /// one id from this counter (`voice_stream::play_chime`), so a rise
     /// here is exactly "something was played".
+    /// How many arrived messages are waiting for their sender to become
+    /// known (`defer_dm`). Observable so a test can tell "held" apart from
+    /// "dropped", which is the whole distinction AC-420 draws.
+    pub fn deferred_dm_count(&self) -> usize {
+        self.deferred_dms.len()
+    }
+
     pub fn mixer_sources_started(&self) -> u64 {
         self.next_mixer_id - 1
     }
@@ -2193,6 +2391,7 @@ impl SessionState {
             pq_peer_keys: crate::client::pq_rekey::PqPeerKeys::new(),
             rotate_out_tx,
             replay: crate::client::replay::ReplayGuard::new(),
+            deferred_dms: Vec::new(),
             remote_keys: rekey::RemoteKeys::new(),
             id_store: idstore::IdStore::new_empty(spec.scratch.join("id_store")),
             conn_stats: netstats::ConnStats::new(),
@@ -2215,6 +2414,9 @@ impl SessionState {
             otp_cancelled: std::collections::HashMap::new(),
             otp_ack_rows: std::collections::HashMap::new(),
             otp_out_queue: crate::client::otp::OtpOutQueue::new(),
+            otp_outbox: Some(crate::client::otp_outbox::OtpOutbox::load(
+                &spec.scratch.join("otp_outbox"),
+            )),
             pending_receipts: crate::client::delivery::PendingReceipts::new(),
             otp_incoming_setup: HashMap::new(),
             otp_incoming_pads: HashMap::new(),
@@ -2324,6 +2526,44 @@ pub(crate) fn request_rotation(session: &mut SessionState, peer: UserId) {
 /// against the key material *we* announced, so the decryption keys are our
 /// own rotating ones; `sender`'s `UserInfo` is needed only to verify their
 /// signature over it (`docs/PROTOCOL.md` §13).
+/// A DM that arrived before its sender was in `known_users`, kept until
+/// they are (`link_events::retry_deferred_dms`).
+///
+/// Nothing can be done with one at the time it lands: decrypting needs the
+/// sender's public key, and rendering needs their name, and neither exists
+/// yet. Dropping it was the old behaviour and it is the one outcome that
+/// cannot be recovered from - the message is gone, having been both sent
+/// and received. So it waits instead.
+/// How many undeliverable-yet DMs are held. A peer who never becomes
+/// known never drains, so this is bounded; the bound is generous because
+/// the wait is normally milliseconds.
+pub(crate) const DEFERRED_DM_MAX: usize = 256;
+
+/// Holds a DM whose sender is not known yet, dropping the *oldest* if the
+/// bound is reached - the newest is the one most likely still to have a
+/// sender arriving for it.
+pub(crate) fn defer_dm(
+    session: &mut SessionState,
+    from: UserId,
+    msg_id: Option<u64>,
+    envelope: Envelope,
+) {
+    if session.deferred_dms.len() >= DEFERRED_DM_MAX {
+        session.deferred_dms.remove(0);
+    }
+    session.deferred_dms.push(DeferredDm {
+        from,
+        msg_id,
+        envelope,
+    });
+}
+
+pub(crate) struct DeferredDm {
+    pub(crate) from: UserId,
+    pub(crate) msg_id: Option<u64>,
+    pub(crate) envelope: Envelope,
+}
+
 pub(crate) fn decrypt_envelope_for(
     envelope: Envelope,
     from: UserId,

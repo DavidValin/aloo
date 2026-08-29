@@ -313,10 +313,16 @@ fn global_record_start_targets_the_active_private_room() {
     assert_eq!(stop, Some(UiAction::VoiceRecordStop));
 }
 
+/// With `queue_send_messages` off there is nowhere to hold a recording,
+/// so Space is still ignored - the case this has always covered. With it
+/// on the recording is held for them instead, which is
+/// `space_records_for_an_offline_peer_when_queueing_is_on`.
 /// @requirement AC-054
+/// @requirement AC-426
 #[test]
-fn space_press_with_an_offline_dm_peer_is_ignored_and_does_not_start_recording() {
+fn space_press_with_an_offline_dm_peer_is_ignored_when_there_is_no_queue() {
     let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.queue_send_messages = false;
     state.on_direct_message(UserId(2), "bob".into(), MessageBody::Text("hi".into())); // gives bob DM history
     state.on_user_offline(UserId(2));
     state.focus = Focus::Sidebar;
@@ -2242,5 +2248,183 @@ fn retiring_a_peers_proposal_removes_it_from_the_queue() {
     assert!(
         !state.take_otp_invite_from(UserId(2)),
         "retiring one that is already gone reports nothing to retire"
+    );
+}
+
+// ---------------------------------------------------------------------
+// `/leave` in a private room (US-006)
+// ---------------------------------------------------------------------
+
+/// `/leave` inside a room closes it, forgets what was said, and takes it
+/// off the DM selector - the same act `/leave` performs on a channel,
+/// whose whole tab (log included) is dropped.
+/// @requirement AC-417
+#[test]
+fn leave_in_a_dm_closes_the_room_and_forgets_it() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.on_direct_message(UserId(2), "bob".into(), MessageBody::Text("hi".into()));
+    state.focus = Focus::Sidebar;
+    press(&mut state, KeyCode::Enter); // open bob's room
+    assert_eq!(state.active_private_room, Some(UserId(2)));
+    assert!(!state.private_rooms[&UserId(2)].log.is_empty());
+
+    state.focus = Focus::Input;
+    type_str(&mut state, "/leave");
+    assert_eq!(press(&mut state, KeyCode::Enter), None, "purely local - nothing to send");
+
+    assert!(
+        !state.private_rooms.contains_key(&UserId(2)),
+        "the room and everything said in it are gone from memory"
+    );
+    assert!(!state.dm_order.contains(&UserId(2)), "and off the DM selector");
+    assert_eq!(state.active_private_room, None, "the view falls back to the channel");
+    assert_eq!(state.input, "", "the command itself is consumed");
+}
+
+/// Hidden until they write again - not blocked, not unfriended. Their
+/// next message opens a fresh room with only that message in it.
+/// @requirement AC-417
+#[test]
+fn a_left_dm_comes_back_empty_when_they_write_again() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.on_direct_message(UserId(2), "bob".into(), MessageBody::Text("first".into()));
+    state.focus = Focus::Sidebar;
+    press(&mut state, KeyCode::Enter);
+    state.focus = Focus::Input;
+    type_str(&mut state, "/leave");
+    press(&mut state, KeyCode::Enter);
+    assert!(!state.private_rooms.contains_key(&UserId(2)));
+
+    state.on_direct_message(UserId(2), "bob".into(), MessageBody::Text("again".into()));
+    let room = state
+        .private_rooms
+        .get(&UserId(2))
+        .expect("their next message opens the room again");
+    assert_eq!(room.log.len(), 1, "a fresh room, not the old history back");
+    assert!(state.dm_order.contains(&UserId(2)), "and back on the selector");
+}
+
+/// Outside a room `/leave` is still the channel command it always was.
+/// @requirement AC-417
+#[test]
+fn leave_outside_a_room_still_leaves_the_channel() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.focus = Focus::Input;
+    type_str(&mut state, "/leave");
+    assert_eq!(
+        press(&mut state, KeyCode::Enter),
+        Some(UiAction::LeaveChannel { name: "general".into() })
+    );
+}
+
+/// Leaving a channel drops its whole tab, so nothing said in it is still
+/// in memory either - the property `/leave` in a room mirrors.
+/// @requirement AC-417
+#[test]
+fn leaving_a_channel_forgets_what_was_said_in_it() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.on_channel_message("general", UserId(2), "bob".into(), MessageBody::Text("hi".into()));
+    assert!(!state.channels[0].log.is_empty());
+
+    state.leave_channel_locally("general");
+    assert!(
+        !state.channels.iter().any(|c| c.name == "general"),
+        "the tab is gone, and its log with it"
+    );
+}
+
+/// Recording for someone who is away is exactly what the queue exists for,
+/// so Space must start a recording rather than doing nothing. The refusal
+/// predated the queue and outlived the reason for it.
+/// @requirement AC-426
+#[test]
+fn space_records_for_an_offline_peer_when_queueing_is_on() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.active_private_room = Some(UserId(2));
+    state.on_user_offline(UserId(2));
+
+    state.queue_send_messages = true;
+    assert!(
+        matches!(
+            state.current_voice_target(),
+            Some(VoiceTarget::Direct { to, .. }) if to == UserId(2)
+        ),
+        "with somewhere to hold it, a recording for someone away is allowed"
+    );
+
+    state.queue_send_messages = false;
+    assert!(
+        state.current_voice_target().is_none(),
+        "with nothing to hold it, there is still nowhere for the recording to go"
+    );
+}
+
+/// A trust-gated peer is refused whatever the queue says: no queue makes
+/// it acceptable to encrypt to a key that has not been verified.
+/// @requirement AC-426
+#[test]
+fn space_still_refuses_a_peer_under_identity_review() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    state.active_private_room = Some(UserId(2));
+    state.queue_send_messages = true;
+    state.begin_identity_review(
+        UserId(2),
+        "bob".into(),
+        IdentityCase::StaticMismatch {
+            new_public_key_der: vec![9, 9, 9],
+            previous_public_key_der: vec![1, 2, 3],
+        },
+    );
+
+    assert!(
+        state.current_voice_target().is_none(),
+        "an unverified key is refused however much room there is to hold it"
+    );
+}
+
+/// A held message's row names the id its recipient had when it was
+/// written - and for a held message that is precisely the id that never
+/// comes back. Unless it moves with them, the message arrives, they read
+/// it, and the sender's row still says it never got there.
+/// @requirement AC-427
+#[test]
+fn a_returning_peers_row_still_takes_their_acknowledgement() {
+    let mut state = joined_general_with(vec![user(2, "bob")]);
+    let (msg_id, delivery) = state.start_delivery(&[UserId(2)]);
+    state.on_direct_message(UserId(2), "bob".into(), MessageBody::Text("hi".into()));
+    state.push_outgoing_dm(
+        UserId(2),
+        MessageBody::Text("while you were out".into()),
+        Some(delivery),
+    );
+
+    // He returns as somebody new, which is what a reconnect always is.
+    let returned = UserId(77);
+    let him = aloo::proto::UserInfo {
+        id: returned,
+        name: "bob".into(),
+        public_key_der: vec![1, 2, 3],
+        key_mode: aloo::proto::KeyMode::PqHybrid,
+    };
+    state.known_users.insert(returned, him.clone());
+    state.adopt_returning_peer(UserId(2), &him);
+
+    state.mark_delivered(
+        returned,
+        msg_id,
+        ReceiptStage::Decrypted,
+        DeliveryProof::Receipt,
+    );
+
+    let room = state.private_rooms.get(&returned).expect("the room moved with him");
+    let delivered = room.log.iter().any(|entry| {
+        entry
+            .delivery
+            .as_ref()
+            .is_some_and(|d| d.msg_id == msg_id && d.recipients.iter().all(|r| r.delivered))
+    });
+    assert!(
+        delivered,
+        "his acknowledgement must reach the row that was held for him"
     );
 }

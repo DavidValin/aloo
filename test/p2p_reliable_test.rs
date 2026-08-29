@@ -85,7 +85,7 @@ fn reorder_buffer_bound_fails_the_link_rather_than_growing_unbounded() {
 #[test]
 fn unacked_frame_is_not_retransmitted_before_its_backoff_elapses() {
     let mut tx = ArqSender::new();
-    tx.send(vec![1, 2, 3]).expect("first frame goes out immediately");
+    tx.send(vec![1, 2, 3], None).expect("first frame goes out immediately");
     let due = tx.due_for_retransmit(Instant::now()).unwrap();
     assert!(
         due.is_empty(),
@@ -97,7 +97,7 @@ fn unacked_frame_is_not_retransmitted_before_its_backoff_elapses() {
 #[test]
 fn acked_frame_is_never_retransmitted() {
     let mut tx = ArqSender::new();
-    let (seq, _) = tx.send(vec![9]).expect("first frame goes out immediately");
+    let (seq, _) = tx.send(vec![9], None).expect("first frame goes out immediately");
     tx.on_ack(seq, Instant::now());
     assert!(!tx.has_pending());
     let far_future = Instant::now() + Duration::from_secs(60);
@@ -108,7 +108,7 @@ fn acked_frame_is_never_retransmitted() {
 #[test]
 fn unacked_frame_is_retransmitted_after_its_backoff_elapses() {
     let mut tx = ArqSender::new();
-    let (seq, _) = tx.send(vec![7, 7]).expect("first frame goes out immediately");
+    let (seq, _) = tx.send(vec![7, 7], None).expect("first frame goes out immediately");
     // Simulate time passing by checking well past the initial backoff.
     let later = Instant::now() + Duration::from_millis(500);
     let due = tx.due_for_retransmit(later).unwrap();
@@ -119,7 +119,7 @@ fn unacked_frame_is_retransmitted_after_its_backoff_elapses() {
 #[test]
 fn frame_exceeding_max_retries_fails_the_sender() {
     let mut tx = ArqSender::new();
-    tx.send(vec![1]).expect("first frame goes out immediately");
+    tx.send(vec![1], None).expect("first frame goes out immediately");
     let mut now = Instant::now();
     for _ in 0..MAX_RETRIES {
         now += Duration::from_secs(10); // comfortably past any backoff
@@ -143,7 +143,7 @@ fn frame_exceeding_max_retries_fails_the_sender() {
 fn only_send_window_frames_go_out_at_once() {
     let mut tx = ArqSender::new();
     let sent: Vec<_> = (0..SEND_WINDOW + 20)
-        .map(|i| tx.send(vec![i as u8]))
+        .map(|i| tx.send(vec![i as u8], None))
         .collect();
     assert!(
         sent[..SEND_WINDOW].iter().all(Option::is_some),
@@ -160,18 +160,18 @@ fn only_send_window_frames_go_out_at_once() {
 fn an_ack_releases_the_next_backlogged_frame_in_order() {
     let mut tx = ArqSender::new();
     let mut on_wire: Vec<(u32, Vec<u8>)> = (0..SEND_WINDOW + 3)
-        .filter_map(|i| tx.send(vec![i as u8]))
+        .filter_map(|i| tx.send(vec![i as u8], None))
         .collect();
     // Ack the in-flight frames oldest-first; each retires one and releases
     // exactly one backlogged frame.
     for i in 0..3u32 {
         let released = tx.on_ack(i, Instant::now());
         assert_eq!(
-            released.len(),
+            released.released.len(),
             1,
             "each cumulative ack advancing the frontier by one frees exactly one slot"
         );
-        on_wire.extend(released);
+        on_wire.extend(released.released);
     }
     let order: Vec<u8> = on_wire.iter().map(|(_, p)| p[0]).collect();
     let expected: Vec<u8> = (0..SEND_WINDOW as u8 + 3).collect();
@@ -192,11 +192,11 @@ fn an_ack_releases_the_next_backlogged_frame_in_order() {
 fn a_duplicate_ack_does_not_pull_the_backlog_forward() {
     let mut tx = ArqSender::new();
     for i in 0..SEND_WINDOW + 2 {
-        tx.send(vec![i as u8]);
+        tx.send(vec![i as u8], None);
     }
-    assert_eq!(tx.on_ack(0, Instant::now()).len(), 1, "the first ack releases a frame");
+    assert_eq!(tx.on_ack(0, Instant::now()).released.len(), 1, "the first ack releases a frame");
     assert!(
-        tx.on_ack(0, Instant::now()).is_empty(),
+        tx.on_ack(0, Instant::now()).released.is_empty(),
         "a replayed ack for an already-retired frame releases nothing"
     );
 }
@@ -206,9 +206,9 @@ fn a_duplicate_ack_does_not_pull_the_backlog_forward() {
 fn reset_hands_back_in_flight_and_backlogged_frames_in_order() {
     let mut tx = ArqSender::new();
     for i in 0..SEND_WINDOW + 5 {
-        tx.send(vec![i as u8]);
+        tx.send(vec![i as u8], None);
     }
-    let requeued: Vec<u8> = tx.reset().into_iter().map(|p| p[0]).collect();
+    let requeued: Vec<u8> = tx.reset().into_iter().map(|(p, _)| p[0]).collect();
     let expected: Vec<u8> = (0..SEND_WINDOW as u8 + 5).collect();
     assert_eq!(
         requeued, expected,
@@ -222,7 +222,7 @@ fn reset_hands_back_in_flight_and_backlogged_frames_in_order() {
 fn a_backlogged_frame_still_counts_as_pending() {
     let mut tx = ArqSender::new();
     for i in 0..SEND_WINDOW + 1 {
-        tx.send(vec![i as u8]);
+        tx.send(vec![i as u8], None);
     }
     // Retire every in-flight frame; the one still backlogged is released by
     // the first of those acks, so something is always outstanding.
@@ -242,7 +242,7 @@ fn a_backlogged_frame_still_counts_as_pending() {
 #[test]
 fn a_full_window_lost_in_flight_stays_within_the_receivers_reorder_bound() {
     let mut tx = ArqSender::new();
-    let frames: Vec<_> = (0..SEND_WINDOW).filter_map(|i| tx.send(vec![i as u8])).collect();
+    let frames: Vec<_> = (0..SEND_WINDOW).filter_map(|i| tx.send(vec![i as u8], None)).collect();
     let mut rx = ArqReceiver::new();
     // Worst case: the very first frame is lost and every other frame of the
     // window arrives, so all of them have to be buffered.
@@ -268,7 +268,7 @@ fn the_window_bounds_bytes_in_flight_not_only_frames() {
     let big = 32 * 1024;
     let mut on_wire = 0usize;
     for _ in 0..SEND_WINDOW {
-        if tx.send(vec![0u8; big]).is_some() {
+        if tx.send(vec![0u8; big], None).is_some() {
             on_wire += big;
         }
     }
@@ -292,7 +292,7 @@ fn small_frames_still_get_the_full_frame_window() {
     let mut tx = ArqSender::new();
     let pad_chunk = 1024 + 16; // `otp_pad::PAD_CHUNK_BYTES` plus its GCM tag
     let sent = (0..SEND_WINDOW * 2)
-        .filter(|_| tx.send(vec![0u8; pad_chunk]).is_some())
+        .filter(|_| tx.send(vec![0u8; pad_chunk], None).is_some())
         .count();
     assert_eq!(
         sent, SEND_WINDOW,
@@ -310,7 +310,7 @@ fn small_frames_still_get_the_full_frame_window() {
 fn a_frame_larger_than_the_whole_budget_is_still_sent() {
     let mut tx = ArqSender::new();
     assert!(
-        tx.send(vec![0u8; SEND_WINDOW_BYTES * 2]).is_some(),
+        tx.send(vec![0u8; SEND_WINDOW_BYTES * 2], None).is_some(),
         "an oversized frame on an empty window must be admitted, not stalled forever"
     );
 }
@@ -324,7 +324,7 @@ fn acking_returns_bytes_to_the_budget() {
     let mut tx = ArqSender::new();
     let big = 32 * 1024;
     let mut admitted = 0;
-    while tx.send(vec![0u8; big]).is_some() {
+    while tx.send(vec![0u8; big], None).is_some() {
         admitted += 1;
         if admitted > SEND_WINDOW {
             panic!("the byte budget should have closed the window well before this");
@@ -333,7 +333,7 @@ fn acking_returns_bytes_to_the_budget() {
     // Everything in flight is acked, so the backlog must flow again.
     let released = tx.on_ack(admitted as u32 - 1, Instant::now());
     assert!(
-        !released.is_empty(),
+        !released.released.is_empty(),
         "acking the whole window must free its bytes and release the backlog"
     );
 }
@@ -359,7 +359,7 @@ fn rto_adapts_below_the_initial_guess_once_samples_arrive() {
     let mut tx = ArqSender::new();
     let t0 = Instant::now();
     for _ in 0..4 {
-        let (seq, _) = tx.send(vec![0u8]).expect("window has room");
+        let (seq, _) = tx.send(vec![0u8], None).expect("window has room");
         tx.on_ack(seq, t0 + Duration::from_millis(30));
     }
     let rto = tx.current_rto();
@@ -377,7 +377,7 @@ fn rto_adapts_below_the_initial_guess_once_samples_arrive() {
 #[test]
 fn a_retransmitted_frames_ack_is_never_used_as_a_sample() {
     let mut tx = ArqSender::new();
-    let (seq, _) = tx.send(vec![0u8]).expect("first frame goes out immediately");
+    let (seq, _) = tx.send(vec![0u8], None).expect("first frame goes out immediately");
     // Force a retransmit before it is ever acked.
     let far_future = Instant::now() + Duration::from_secs(60);
     tx.due_for_retransmit(far_future).unwrap();
@@ -397,7 +397,7 @@ fn a_retransmitted_frames_ack_is_never_used_as_a_sample() {
 fn reset_clears_the_rtt_estimate() {
     let mut tx = ArqSender::new();
     let t0 = Instant::now();
-    let (seq, _) = tx.send(vec![0u8]).unwrap();
+    let (seq, _) = tx.send(vec![0u8], None).unwrap();
     tx.on_ack(seq, t0 + Duration::from_millis(30));
     assert!(
         tx.current_rto() < Duration::from_millis(400),

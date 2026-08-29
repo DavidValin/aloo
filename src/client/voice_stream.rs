@@ -111,9 +111,19 @@ pub(crate) fn build_pq_stream_out(
     let per_recipient: Vec<(UserId, [u8; 32], crypto::pq::SendSetup)> = recipients
         .iter()
         .filter_map(|(id, public_der)| {
-            let encap = session.pq_peer_keys.encap_for(*id)?;
+            // Their rotating key if this connection has it, else the
+            // bootstrap one from their own bundle - the same fallback
+            // text sends use, and for the same reason: a peer who has
+            // gone offline has no rotating key left here, and without
+            // this their voice message could not be sealed for them at
+            // all, so they were silently dropped from the stream
+            // (`envelope::encap_to_seal_to`).
+            let encap = crate::client::envelope::encap_to_seal_to(
+                session.pq_peer_keys.encap_for(*id),
+                public_der,
+            )?;
             let fp = crypto::pq::fingerprint_of_encoded(public_der)?;
-            crypto::pq::seal_setup(signing, encap, fp, channel.clone(), stream_id)
+            crypto::pq::seal_setup(signing, &encap, fp, channel.clone(), stream_id)
                 .ok()
                 .map(|(setup, k_data)| (*id, k_data, setup))
         })

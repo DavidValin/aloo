@@ -55,7 +55,6 @@ fn otp_text(seq: u64) -> OutboxItem {
 #[test]
 fn text_and_voice_are_queueable_and_files_are_not() {
     assert!(is_queueable(&text(b"hello")));
-    assert!(is_queueable(&otp_text(1)));
     assert!(is_queueable(&OutboxItem::Reliable(P2pPayload::StreamStart {
         channel: None,
         stream_id: 1,
@@ -70,6 +69,22 @@ fn text_and_voice_are_queueable_and_files_are_not() {
         seq: 0,
         blocks: vec![vec![1, 2, 3]],
     }));
+
+    // Anything under the pad belongs to `client::otp_outbox`, which
+    // sends one message per acknowledgement in order. This queue flushes
+    // everything at once, so keeping a pad message here would break that
+    // order and risk sending it from two places.
+    assert!(!is_queueable(&otp_text(1)));
+    assert!(!is_queueable(&OutboxItem::Reliable(P2pPayload::OtpVoiceOffer {
+        stream_id: 1,
+        seq: 1,
+        msg_id: Some(1),
+        envelope: Envelope {
+            content: Content::Text,
+            blocks: vec![vec![0u8; 4]],
+        },
+        sender_device_id: "laptop".into(),
+    })));
 
     // A file transfer is a live, consent-gated conversation - replaying
     // half of one an hour later is not a delivery.
@@ -315,5 +330,121 @@ fn a_truncated_file_loses_one_entry_and_keeps_the_rest() {
 
     let reopened = Outbox::load(&dir);
     assert_eq!(reopened.len_for("bob"), 1, "the intact entry survives");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The contract the whole store turns on: handing content to the
+/// transport is not delivering it, so nothing is removed until the peer
+/// says it arrived.
+/// @requirement AC-422
+#[test]
+fn an_acknowledgement_is_what_removes_an_entry() {
+    let dir = scratch_dir("ack-removes");
+    let mut outbox = Outbox::load(&dir);
+    for i in 0..3 {
+        outbox.queue("bob", text(format!("message {i}").as_bytes())).unwrap();
+    }
+    let ids: Vec<u64> = outbox.peek("bob").iter().map(|e| e.id).collect();
+    assert_eq!(ids, vec![0, 1, 2], "ids are assigned in order, from zero");
+
+    assert!(outbox.remove("bob", 1), "the acknowledged one goes");
+    assert_eq!(
+        outbox.peek("bob").iter().map(|e| e.id).collect::<Vec<_>>(),
+        vec![0, 2],
+        "and only it - the rest are still held"
+    );
+    assert!(
+        !outbox.remove("bob", 1),
+        "a repeated acknowledgement is not an error and removes nothing"
+    );
+
+    // What was removed is gone from disk too, not just from memory.
+    let reopened = Outbox::load(&dir);
+    assert_eq!(
+        reopened.peek("bob").iter().map(|e| e.id).collect::<Vec<_>>(),
+        vec![0, 2]
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A peek is what a drain uses, and it must leave the queue exactly as it
+/// found it - that is the difference between this and `take`.
+/// @requirement AC-422
+#[test]
+fn a_peek_leaves_everything_where_it_is() {
+    let dir = scratch_dir("peek");
+    let mut outbox = Outbox::load(&dir);
+    outbox.queue("bob", text(format!("message {}", 0).as_bytes())).unwrap();
+    outbox.queue("bob", text(format!("message {}", 1).as_bytes())).unwrap();
+
+    assert_eq!(outbox.peek("bob").len(), 2);
+    assert_eq!(outbox.peek("bob").len(), 2, "reading it does not consume it");
+    assert_eq!(outbox.len_for("bob"), 2);
+    assert_eq!(Outbox::load(&dir).len_for("bob"), 2, "nor touch the file");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// An id has to survive the restart the queue itself survives, or an
+/// acknowledgement arriving afterwards would name the wrong entry.
+/// @requirement AC-422
+#[test]
+fn ids_are_stable_across_a_restart() {
+    let dir = scratch_dir("stable-ids");
+    {
+        let mut outbox = Outbox::load(&dir);
+        outbox.queue("bob", text(format!("message {}", 0).as_bytes())).unwrap();
+        outbox.queue("bob", text(format!("message {}", 1).as_bytes())).unwrap();
+        outbox.remove("bob", 0);
+    }
+    let mut reopened = Outbox::load(&dir);
+    assert_eq!(
+        reopened.peek("bob").iter().map(|e| e.id).collect::<Vec<_>>(),
+        vec![1],
+        "the surviving entry keeps the id it was written with"
+    );
+    reopened.queue("bob", text(format!("message {}", 2).as_bytes())).unwrap();
+    assert_eq!(
+        reopened.peek("bob").iter().map(|e| e.id).collect::<Vec<_>>(),
+        vec![1, 2],
+        "and a new one never reuses an id already in the queue"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A queue written before ids existed is still a queue of real messages.
+/// Losing it over a missing field would be precisely the data loss this
+/// store exists to prevent, so those entries are numbered by position.
+/// @requirement AC-422
+#[test]
+fn a_file_written_before_ids_existed_still_loads() {
+    let dir = scratch_dir("legacy");
+    {
+        let mut outbox = Outbox::load(&dir);
+        outbox.queue("bob", text(format!("message {}", 0).as_bytes())).unwrap();
+        outbox.queue("bob", text(format!("message {}", 1).as_bytes())).unwrap();
+    }
+    // Strip the trailing id from every line, leaving the old two-field form.
+    let path = dir.join("bob.q");
+    let legacy: String = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let mut fields = line.split_whitespace();
+            format!(
+                "{} {}\n",
+                fields.next().unwrap_or_default(),
+                fields.next().unwrap_or_default()
+            )
+        })
+        .collect();
+    std::fs::write(&path, legacy).unwrap();
+
+    let outbox = Outbox::load(&dir);
+    assert_eq!(outbox.len_for("bob"), 2, "nothing is lost");
+    assert_eq!(
+        outbox.peek("bob").iter().map(|e| e.id).collect::<Vec<_>>(),
+        vec![0, 1],
+        "and they are numbered by position, which is unique within the queue"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }

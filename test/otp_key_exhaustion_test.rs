@@ -101,9 +101,15 @@ fn known_unreachable_peer(ui: &mut UiState, peer: UserId, name: &str) -> Vec<u8>
     der
 }
 
-/// The same, but also bootstraps `pq_peer_keys` so an outgoing sealed
-/// envelope to this peer can actually be built - standing in for a peer
-/// this side *can* currently reach.
+/// The same, but also bootstraps `pq_peer_keys` *and* opens a live link -
+/// a peer this side can genuinely reach.
+///
+/// The link is the part that matters now. Sealing an envelope to someone
+/// no longer says anything about reaching them: a peer's rotating key is
+/// dropped when they disconnect, but sealing falls back to their bundle's
+/// bootstrap key (`envelope::encap_to_seal_to`) so a message can still be
+/// built - and held - for somebody who is away. "Were they told?" is
+/// therefore asked of the link.
 fn known_reachable_peer(session: &mut SessionState, ui: &mut UiState, peer: UserId, name: &str) {
     let der = known_unreachable_peer(ui, peer, name);
     let bundle = aloo::proto::decode::<aloo::crypto::pq::PqPublicBundle>(&der).expect("bundle decodes");
@@ -111,6 +117,7 @@ fn known_reachable_peer(session: &mut SessionState, ui: &mut UiState, peer: User
     session
         .pq_peer_keys_mut()
         .bootstrap(peer, bundle.bootstrap_encap().clone(), fingerprint);
+    session.peer_link_mut().mark_active_for_test(peer);
 }
 
 /// Every contact needs genuinely independent key material - `otp` itself
@@ -214,12 +221,13 @@ async fn an_exhausted_active_session_ends_on_both_sides_when_the_peer_is_reachab
         "aloo's own bookkeeping for the contact must survive too"
     );
 
-    let told_peer = session
-        
-        .sent_or_queued_payloads(PEER)
-        .into_iter()
-        .any(|p| matches!(p, P2pPayload::Envelope { envelope, .. } if envelope.content == Content::OtpEndSession));
-    assert!(told_peer, "a real end-of-session notice must genuinely be sent to the peer");
+    // Their link is up, so the notice went out over it rather than into a
+    // queue - which is exactly what makes this the "was told" case, and
+    // why there is nothing left waiting to read back here.
+    assert!(
+        session.sent_or_queued_payloads(PEER).is_empty(),
+        "nothing should still be waiting for a peer this side can reach"
+    );
 
     let (message, success) = ui
         .status_notice
@@ -267,13 +275,24 @@ async fn an_exhausted_active_session_ends_locally_even_when_the_peer_cannot_be_r
         otp_cli::has_contact(&cfg, "alice-bob").await.unwrap(),
         "the keychain entry must still not be removed"
     );
+    // Held for him rather than lost: his identity is readable, so the
+    // notice seals against his bundle's bootstrap key and waits on his
+    // link (`envelope::encap_to_seal_to`, `client::outbox`). Saying he
+    // "could not be reached" would be the old truth, from when nothing
+    // could be sealed to an absent peer at all.
+    let queued = session
+        .sent_or_queued_payloads(PEER)
+        .into_iter()
+        .any(|p| matches!(p, P2pPayload::Envelope { envelope, .. } if envelope.content == Content::OtpEndSession));
+    assert!(queued, "the notice must be held for him, not dropped");
+
     let (message, _) = ui
         .status_notice
         .clone()
         .expect("the user must still be told the key ran out");
     assert!(
-        message.contains("fully used up") && message.contains("could not be reached to tell"),
-        "must not claim bob was told when he could not be reached: {message:?}"
+        message.contains("fully used up") && message.contains("will be told when they are back"),
+        "must not claim bob was told while he is away, nor that he is unreachable: {message:?}"
     );
 }
 

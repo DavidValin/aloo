@@ -873,6 +873,13 @@ async fn file_no_pq_hybrid_anywhere_proves_both_of_its_spends() {
 /// phase uses one.
 async fn voice_round_trip(label: &str, alice_kind: Id, bob_kind: Id, direct: bool) {
     let (mut alice, mut bob, contact) = pair(label, alice_kind, bob_kind).await;
+    // Queueing off: this drives the *unqueued* two-phase protocol by hand
+    // (offer, accept, then `start_outgoing_file_content`'s own encrypt).
+    // With the queue on the recording is sealed at record time and
+    // released by the pump instead - the queued tests below cover that
+    // shape.
+    alice.session.set_queue_send_messages(false);
+    bob.session.set_queue_send_messages(false);
     let pcm: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
 
     send_voice(&mut alice, &contact, pcm.clone()).await;
@@ -2366,6 +2373,12 @@ async fn a_lost_file_offer_and_a_lost_voice_offer_each_recover_as_their_own_kind
 
     // --- a voice offer that never arrived ---
     let (mut alice, mut bob, contact) = pair("recover-voice-offer", Id::Pq, Id::Pq).await;
+    // Queueing off: this is the unqueued voice path, whose outstanding
+    // offer is recovered by `recover_and_resend`. With the queue on the
+    // offer lives in it instead and `retry_outstanding_otp_send` is what
+    // puts it back on the wire - covered separately.
+    alice.session.set_queue_send_messages(false);
+    bob.session.set_queue_send_messages(false);
     let pcm: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
 
     send_voice(&mut alice, &contact, pcm).await;
@@ -3318,6 +3331,12 @@ async fn a_voice_recording_survives_the_senders_own_restart_while_awaiting_accep
         return;
     }
     let (mut alice, mut bob, contact) = pair("content-send-restart", Id::Pq, Id::Pq).await;
+    // Queueing off: this pins the *unqueued* two-phase shape, where the
+    // recording is staged as plaintext and encrypted only once the peer
+    // accepts. With the queue on it is sealed when it is recorded
+    // instead - a different contract, covered separately.
+    alice.session.set_queue_send_messages(false);
+    bob.session.set_queue_send_messages(false);
     alice.ui.mark_otp_active(BOB);
     bob.ui.mark_otp_active(ALICE);
 
@@ -3713,5 +3732,584 @@ async fn the_pad_binds_to_the_first_device_that_genuinely_decrypts() {
             .iter()
             .any(|e| matches!(&e.body, MessageBody::Text(t) if t == "second")),
         "and delivers normally"
+    );
+}
+
+/// A voice message recorded for someone who is not there, with the durable
+/// queue on: the whole thing is sealed *now* - the offer that announces it
+/// and the recording itself - and both wait in the one queue, the
+/// recording as its own entry referencing its own ciphertext file.
+///
+/// This is the queued counterpart of
+/// `a_voice_recording_survives_the_senders_own_restart_while_awaiting_accept`,
+/// which pins the unqueued shape. The difference is where the pad is spent:
+/// there, when the peer accepts; here, when the user finishes recording,
+/// which is what lets it be written to someone who is offline at all.
+/// @requirement AC-423
+#[tokio::test]
+async fn a_queued_voice_message_is_sealed_when_it_is_recorded_not_when_it_is_accepted() {
+    if !require_otp() {
+        return;
+    }
+    let (mut alice, mut bob, contact) = pair("queued-voice-seal", Id::Pq, Id::Pq).await;
+    let _ = &mut alice;
+    bob.ui.mark_otp_active(ALICE);
+    bob.ui.on_user_offline(ALICE);
+    aloo::client::session::forget_peer_for_test(&mut bob.ui, &mut bob.session, ALICE);
+
+    let spent_before = bob.pad_spent(&contact).await;
+    let pcm: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+    send_voice(&mut bob, &contact, pcm.clone()).await;
+
+    // Both positions are gone already - the offer's and the recording's -
+    // even though alice has not seen, let alone opened, anything.
+    let spent_after = bob.pad_spent(&contact).await;
+    assert!(
+        spent_after >= spent_before + pcm.len() as u64,
+        "the recording itself must have been encrypted at record time, not deferred: \
+         {spent_before} -> {spent_after}"
+    );
+
+    // Two entries wait, in the order the peer will read them: the offer,
+    // then the recording - the recording as a reference to a ciphertext
+    // file the queue owns.
+    assert_eq!(bob.session.otp_queued_total(), 2);
+    let offer_seq = {
+        let outbox = bob.session.otp_outbox_ref().expect("the queue is on");
+        let front = outbox.front(&contact).expect("the offer waits first");
+        assert!(
+            matches!(front.payload(), Some(P2pPayload::OtpVoiceOffer { .. })),
+            "the front is the offer that announces the recording"
+        );
+        assert!(front.recording().is_none());
+        front.seq().expect("the offer owns a position")
+    };
+
+    // What waits on disk for them is ciphertext, not the recording.
+    let (rec_path, rec_seq) = {
+        let outbox = bob.session.otp_outbox_ref().expect("on");
+        let rec = outbox
+            .entries_for(&contact)
+            .iter()
+            .find_map(|e| e.recording().map(|(path, _)| (path, e.seq())))
+            .expect("the recording waits as its own entry");
+        (rec.0, rec.1.expect("and owns a position"))
+    };
+    assert!(
+        offer_seq < rec_seq,
+        "the peer reads the offer before the recording it announces: {offer_seq} < {rec_seq}"
+    );
+    let on_disk = std::fs::read(&rec_path).expect("the sealed recording is on disk");
+    assert_ne!(
+        on_disk, pcm,
+        "nothing readable may wait on disk while they are away"
+    );
+}
+
+/// A text written after a queued voice message waits its turn behind it -
+/// which under one queue is nothing special to enforce: the recording is
+/// an ordinary entry, and order is what the queue *is*. Pinned anyway,
+/// because it is the property the old two-store shape broke.
+/// @requirement AC-423
+#[tokio::test]
+async fn a_message_written_after_a_queued_voice_never_overtakes_it() {
+    if !require_otp() {
+        return;
+    }
+    let (mut alice, mut bob, contact) = pair("queued-voice-order", Id::Pq, Id::Pq).await;
+    let _ = &mut alice;
+    bob.ui.mark_otp_active(ALICE);
+    bob.ui.on_user_offline(ALICE);
+    aloo::client::session::forget_peer_for_test(&mut bob.ui, &mut bob.session, ALICE);
+
+    send_voice(&mut bob, &contact, b"the recording that must go first".to_vec()).await;
+    send_text(&mut bob, &contact, "written after the voice message").await;
+
+    // One queue, strictly ordered: offer, recording, text.
+    let outbox = bob.session.otp_outbox_ref().expect("the queue is on");
+    let kinds: Vec<&str> = outbox
+        .entries_for(&contact)
+        .iter()
+        .map(|e| {
+            if e.recording().is_some() {
+                "recording"
+            } else if matches!(e.payload(), Some(P2pPayload::OtpVoiceOffer { .. })) {
+                "offer"
+            } else {
+                "text"
+            }
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        vec!["offer", "recording", "text"],
+        "written order is delivery order, the recording included"
+    );
+    let seqs: Vec<u64> = outbox
+        .entries_for(&contact)
+        .iter()
+        .filter_map(|e| e.seq())
+        .collect();
+    assert!(
+        seqs.windows(2).all(|w| w[0] < w[1]),
+        "and the pad positions agree with it: {seqs:?}"
+    );
+}
+
+/// The write-ahead record that protects a pad spend is only worth
+/// anything if it actually reached the disk. On a full disk it does not -
+/// setting it in memory still succeeds and only the save fails - and
+/// spending a position nothing can account for turns a recoverable
+/// accident into an unrecoverable one: the process dies, nothing says the
+/// position went, and the receiver's gap-free counter refuses everything
+/// after it.
+///
+/// Simulated the only way that is deterministic: make the store's own path
+/// unwritable, which is what a full disk amounts to from here.
+/// @requirement AC-424
+#[tokio::test]
+async fn a_send_whose_write_ahead_record_cannot_be_written_spends_no_pad() {
+    if !require_otp() {
+        return;
+    }
+    let (mut alice, mut bob, contact) = pair("intent-unwritable", Id::Pq, Id::Pq).await;
+    let _ = &mut alice;
+    bob.ui.mark_otp_active(ALICE);
+
+    // A directory where the store's file belongs: every save now fails.
+    let store_path = bob.session.otp_store_mut().path().to_path_buf();
+    std::fs::remove_file(&store_path).ok();
+    std::fs::create_dir_all(&store_path).expect("stand a directory in the file's place");
+    assert!(
+        bob.session.otp_store_mut().save().is_err(),
+        "the store must genuinely be unable to save for this test to mean anything"
+    );
+
+    let spent_before = bob.pad_spent(&contact).await;
+    let sent_before = bob.envelopes_sent();
+    send_text(&mut bob, &contact, "this must not spend a position").await;
+
+    assert_eq!(
+        bob.pad_spent(&contact).await,
+        spent_before,
+        "no position may be spent when nothing could record that it was"
+    );
+    assert_eq!(
+        bob.envelopes_sent(),
+        sent_before,
+        "and nothing goes on the wire either"
+    );
+    assert!(
+        !bob.gate_held(&contact),
+        "nor is the acknowledgement gate left armed for a send that never happened"
+    );
+}
+
+/// The reported failure: an `/otp` session open, the peer goes away, a
+/// message is written and queued, and when they come back nothing arrives.
+///
+/// They come back under a *new* `UserId` - which is the whole reason the
+/// queues are keyed by nickname and contact name rather than by id - so
+/// this drives the reconnect the way the session really does: the old id
+/// is forgotten, the returning peer is adopted onto a fresh one, and their
+/// link comes up.
+/// @requirement AC-425
+#[tokio::test]
+async fn a_queued_pad_message_goes_out_when_the_peer_returns_under_a_new_id() {
+    if !require_otp() {
+        return;
+    }
+    let (mut alice, mut bob, contact) = pair("otp-queue-reconnect", Id::Pq, Id::Pq).await;
+    let _ = &mut alice;
+    bob.ui.mark_otp_active(ALICE);
+
+    // She goes away: her link is lost and the session forgets what
+    // belonged to that connection.
+    bob.ui.on_user_offline(ALICE);
+    aloo::client::session::forget_peer_for_test(&mut bob.ui, &mut bob.session, ALICE);
+
+    send_text(&mut bob, &contact, "while you were out").await;
+    assert_eq!(
+        bob.session.otp_queued_total(),
+        1,
+        "with her unreachable the sealed message is held"
+    );
+
+    // She returns as somebody new, as far as this connection is concerned.
+    let returned = UserId(4242);
+    let her = aloo::proto::UserInfo {
+        id: returned,
+        name: "alice".into(),
+        public_key_der: bob.peer_der.clone(),
+        key_mode: aloo::proto::KeyMode::PqHybrid,
+    };
+    bob.ui.known_users.insert(returned, her.clone());
+    bob.ui.adopt_returning_peer(ALICE, &her);
+    bob.session
+        .peer_link_mut()
+        .open_unpunched_link_for_test(returned);
+    bob.session
+        .inject_p2p_event(aloo::client::p2p::P2pEvent::LinkStatusChanged {
+            peer: returned,
+            status: aloo::client::p2p::LinkStatus::Active,
+        });
+    aloo::client::session::drain_p2p_events(&mut NullSink, &mut bob.ui, &mut bob.session)
+        .await
+        .expect("draining should not fail");
+
+    // Her device id has not arrived yet, so her pad contact cannot even be
+    // named (`otp::contact_name_for_peer` is device-qualified for a
+    // PqWrapped pair) - the link-up drain finds nothing to drain. This is
+    // the state the bug left the queue in permanently.
+    assert!(
+        !bob.session
+            .sent_or_queued_payloads(returned)
+            .iter()
+            .any(|p| matches!(p, P2pPayload::OtpEnvelope { .. })),
+        "nothing can go out before her contact can be named"
+    );
+    assert_eq!(bob.session.otp_queued_total(), 1, "and it is still held");
+
+    // Her `DeviceIdAnnounce` lands. That is what names the contact, and so
+    // the first - and for a returning peer the only - moment her queue can
+    // be drained at all.
+    bob.session
+        .set_peer_device_id_for_test(returned, "test-device".to_string());
+    bob.session
+        .inject_p2p_event(aloo::client::p2p::P2pEvent::DeviceIdAnnounce {
+            from: returned,
+            envelope: Envelope {
+                content: Content::DeviceIdAnnounce,
+                blocks: vec![vec![0u8; 8]],
+            },
+        });
+    aloo::client::session::drain_p2p_events(&mut NullSink, &mut bob.ui, &mut bob.session)
+        .await
+        .expect("draining should not fail");
+
+    let sent = bob.session.sent_or_queued_payloads(returned);
+    assert!(
+        sent.iter()
+            .any(|p| matches!(p, P2pPayload::OtpEnvelope { .. })),
+        "the held pad message must go out to the id she has now: {sent:?}"
+    );
+}
+
+/// The reported pad desync: a voice message queued for someone away, and
+/// on their return the announcement arrived but the recording never did -
+/// then nothing in that direction worked again.
+///
+/// The recording is released by the queue's own pump, and the pump
+/// resolves the recipient and the chunk-transport key from the contact
+/// name at release time (`release_queued_recording`) - never from
+/// anything captured at record time, which for a held recording names the
+/// id the peer will never hold again.
+/// @requirement AC-428
+#[tokio::test]
+async fn a_queued_recording_follows_its_peer_to_the_id_they_return_under() {
+    if !require_otp() {
+        return;
+    }
+    let (mut alice, mut bob, contact) = pair("voice-queue-reconnect", Id::Pq, Id::Pq).await;
+    let _ = &mut alice;
+    bob.ui.mark_otp_active(ALICE);
+
+    bob.ui.on_user_offline(ALICE);
+    aloo::client::session::forget_peer_for_test(&mut bob.ui, &mut bob.session, ALICE);
+    send_voice(&mut bob, &contact, b"the recording that must follow her".to_vec()).await;
+    assert_eq!(
+        bob.session.otp_queued_total(),
+        2,
+        "offer and recording both wait in the one queue"
+    );
+
+    // She returns as somebody new.
+    let returned = UserId(4243);
+    let her = aloo::proto::UserInfo {
+        id: returned,
+        name: "alice".into(),
+        public_key_der: bob.peer_der.clone(),
+        key_mode: aloo::proto::KeyMode::PqHybrid,
+    };
+    bob.ui.known_users.insert(returned, her.clone());
+    bob.ui.adopt_returning_peer(ALICE, &her);
+    bob.session
+        .set_peer_device_id_for_test(returned, "test-device".to_string());
+    bob.session
+        .peer_link_mut()
+        .open_unpunched_link_for_test(returned);
+
+    // Her link coming up re-offers what the gate is still waiting on -
+    // the offer went to the transport while she was away and was dropped
+    // with her old link - and then pumps: the exact pair the production
+    // link-up drain runs (`drain_otp_queue_for`).
+    let mut bob_ui = std::mem::replace(&mut bob.ui, UiState::new("swap".into()));
+    bob.session
+        .retry_outstanding_otp_send_for_test(&mut bob_ui, returned, &contact)
+        .await;
+    bob.ui = bob_ui;
+    let mut bob_ui = std::mem::replace(&mut bob.ui, UiState::new("swap".into()));
+    bob.session
+        .pump_otp_queue_for_test(&mut bob_ui, returned, &contact)
+        .await;
+    bob.ui = bob_ui;
+    let sent = bob.session.sent_or_queued_payloads(returned);
+    assert!(
+        sent.iter()
+            .any(|p| matches!(p, P2pPayload::OtpVoiceOffer { .. })),
+        "the offer goes to the id she has now: {sent:?}"
+    );
+
+    // ...and her acknowledgement of it - the real ack path, which retires
+    // the offer's entry and pumps - releases the recording, addressed and
+    // keyed for the same current id.
+    let (offer_seq, offer_proof) = {
+        let state = bob.session.otp_store_mut().get(&contact).expect("armed");
+        (
+            state.pending_unacked_out_seq.expect("the offer is outstanding"),
+            state.pending_ack_proof.expect("the offer's proof is recorded"),
+        )
+    };
+    aloo::client::otp::on_delivery_ack(
+        &mut NullSink,
+        &mut bob.ui,
+        &mut bob.session,
+        returned,
+        offer_seq,
+        offer_proof,
+    )
+    .await
+    .expect("the ack path should not fail");
+
+    let sent = bob.session.sent_or_queued_payloads(returned);
+    assert!(
+        sent.iter()
+            .any(|p| matches!(p, P2pPayload::OtpFileContentSeq { .. })),
+        "the recording's sequence announcement goes to the id she has now: {sent:?}"
+    );
+    assert!(
+        sent.iter()
+            .any(|p| matches!(p, P2pPayload::StreamKeySetup { .. })),
+        "and so does its chunk-transport key setup: {sent:?}"
+    );
+    assert!(
+        !bob
+            .session
+            .sent_or_queued_payloads(ALICE)
+            .iter()
+            .any(|p| matches!(p, P2pPayload::OtpFileContentSeq { .. } | P2pPayload::StreamKeySetup { .. })),
+        "nothing of the recording is addressed to the id she no longer holds"
+    );
+}
+
+/// The same return, for a pad-only pair. Their contact is named from the
+/// keys alone (`contact_name_for_keys`), with no device id in it, so the
+/// link coming up is enough on its own - no `DeviceIdAnnounce` needed.
+/// Asserted separately rather than assumed: the fix for the `PqWrapped`
+/// case turned on a device id this framing does not have, and "it should
+/// therefore already work" is exactly the kind of reasoning worth checking.
+/// @requirement AC-425
+#[tokio::test]
+async fn a_pad_only_pairs_queue_drains_on_the_link_alone_when_they_return() {
+    if !require_otp() {
+        return;
+    }
+    let (mut alice, mut bob, contact) =
+        pair("otp-queue-reconnect-direct", Id::Opaque, Id::Pq).await;
+    let _ = &mut alice;
+    bob.ui.mark_otp_active(ALICE);
+
+    bob.ui.on_user_offline(ALICE);
+    aloo::client::session::forget_peer_for_test(&mut bob.ui, &mut bob.session, ALICE);
+    send_text(&mut bob, &contact, "while you were out").await;
+    assert_eq!(bob.session.otp_queued_total(), 1, "held while she is away");
+
+    // She comes back under the *same* id, which is the whole difference: a
+    // direct peer's `UserId` is derived from their nickname and device id
+    // (`p2p::direct_peer_id`), so unlike a server-assigned one it is
+    // deterministic and survives the reconnect. There is no new id to
+    // learn and no device announce to wait for - the link is enough.
+    let her = aloo::proto::UserInfo {
+        id: ALICE,
+        name: "alice".into(),
+        public_key_der: bob.peer_der.clone(),
+        key_mode: aloo::proto::KeyMode::PqHybrid,
+    };
+    bob.ui.known_users.insert(ALICE, her.clone());
+    bob.session
+        .peer_link_mut()
+        .open_unpunched_link_for_test(ALICE);
+    // Deliberately no `DeviceIdAnnounce`: this framing must not need one.
+    bob.session
+        .inject_p2p_event(aloo::client::p2p::P2pEvent::LinkStatusChanged {
+            peer: ALICE,
+            status: aloo::client::p2p::LinkStatus::Active,
+        });
+    aloo::client::session::drain_p2p_events(&mut NullSink, &mut bob.ui, &mut bob.session)
+        .await
+        .expect("draining should not fail");
+
+    let sent = bob.session.sent_or_queued_payloads(ALICE);
+    assert!(
+        sent.iter()
+            .any(|p| matches!(p, P2pPayload::OtpEnvelope { .. })),
+        "a pad-only pair's held message needs only the link: {sent:?}"
+    );
+}
+
+/// An acknowledgement retires the queue's front only when the front is
+/// the message it names. With the recording an ordinary entry this is the
+/// common case by construction, but the check is what protects the queue
+/// from an ack arriving for anything *outside* it - a file's content
+/// phase, or a send that raced a just-enabled queue - which used to
+/// discard the next queued message unsent and desync the pad for good.
+/// @requirement AC-430
+#[tokio::test]
+async fn an_acknowledgement_never_retires_a_message_it_does_not_name() {
+    if !require_otp() {
+        return;
+    }
+    let (mut alice, mut bob, contact) = pair("ack-retires-only-its-own", Id::Pq, Id::Pq).await;
+    let _ = &mut alice;
+    bob.ui.mark_otp_active(ALICE);
+    bob.ui.on_user_offline(ALICE);
+    aloo::client::session::forget_peer_for_test(&mut bob.ui, &mut bob.session, ALICE);
+
+    send_text(&mut bob, &contact, "the line that must not vanish").await;
+    let held_before = bob.session.otp_queued_total();
+    assert_eq!(held_before, 1);
+
+    // An acknowledgement for a position the queue does not hold - a
+    // file-content spend, say. The gate is armed with it, and its ack
+    // must clear that gate without touching the queue.
+    let outside_seq = 90;
+    bob.session
+        .otp_store_mut()
+        .arm_gate_for_test(&contact, outside_seq);
+    aloo::client::otp::on_delivery_ack(
+        &mut NullSink,
+        &mut bob.ui,
+        &mut bob.session,
+        ALICE,
+        outside_seq,
+        [outside_seq as u8; 32],
+    )
+    .await
+    .expect("the ack path should not fail");
+
+    assert_eq!(
+        bob.session.otp_queued_total(),
+        held_before,
+        "an ack for something outside the queue must not discard a queued text"
+    );
+}
+
+/// The three-voice-messages question: with several seals stacked in the
+/// queue, the CLI's `.last_sent` safety copy holds only the newest, so
+/// the recovery pass must never touch it for anything the queue still
+/// holds - it would resend the wrong ciphertext under the right sequence.
+/// The queue's own bytes are the retry.
+/// @requirement AC-431
+#[tokio::test]
+async fn recovery_never_resends_a_queued_message_from_the_cli_copy() {
+    if !require_otp() {
+        return;
+    }
+    let (mut alice, mut bob, contact) = pair("recovery-skips-queued", Id::Pq, Id::Pq).await;
+    let _ = &mut alice;
+    bob.ui.mark_otp_active(ALICE);
+
+    // Three seals stack up: `.last_sent` now holds only the third.
+    send_text(&mut bob, &contact, "first").await;
+    send_text(&mut bob, &contact, "second").await;
+    send_text(&mut bob, &contact, "third").await;
+
+    // The first is outstanding (the pump released it and armed the gate);
+    // the queue still holds all three.
+    assert_eq!(bob.session.otp_queued_total(), 3);
+    let outstanding = bob
+        .session
+        .otp_store_mut()
+        .get(&contact)
+        .and_then(|s| s.pending_unacked_out_seq)
+        .expect("the front is on the wire");
+    let sent_before = bob.envelopes_sent();
+
+    // A link flap runs the recovery pass. It must leave this contact
+    // alone: the queue owns the retry.
+    aloo::client::otp::recover_and_resend(&mut NullSink, &mut bob.session, &mut bob.ui)
+        .await
+        .expect("the recovery pass should not fail");
+
+    assert_eq!(
+        bob.envelopes_sent(),
+        sent_before,
+        "nothing recovered from `.last_sent` for a message the queue still holds"
+    );
+    assert_eq!(
+        bob.session
+            .otp_store_mut()
+            .get(&contact)
+            .and_then(|s| s.pending_unacked_out_seq),
+        Some(outstanding),
+        "and the outstanding send is left to the queue's own retry"
+    );
+}
+
+/// The queue-owned retry for a recording: put back on the wire from its
+/// own ciphertext file, never from `.last_sent`.
+/// @requirement AC-431
+#[tokio::test]
+async fn a_recording_front_is_retried_from_its_own_file() {
+    if !require_otp() {
+        return;
+    }
+    let (mut alice, mut bob, contact) = pair("recording-retry-file", Id::Pq, Id::Pq).await;
+    let _ = &mut alice;
+    bob.ui.mark_otp_active(ALICE);
+
+    send_voice(&mut bob, &contact, b"retried from my own file".to_vec()).await;
+    // The pump released the offer; bob acknowledges it, which releases the
+    // recording and arms the gate with its sequence.
+    let (offer_seq, offer_proof) = {
+        let state = bob.session.otp_store_mut().get(&contact).expect("armed");
+        (
+            state.pending_unacked_out_seq.expect("the offer is outstanding"),
+            state.pending_ack_proof.expect("recorded"),
+        )
+    };
+    aloo::client::otp::on_delivery_ack(
+        &mut NullSink,
+        &mut bob.ui,
+        &mut bob.session,
+        ALICE,
+        offer_seq,
+        offer_proof,
+    )
+    .await
+    .expect("the ack path should not fail");
+
+    let setups_before = bob
+        .queued()
+        .iter()
+        .filter(|p| matches!(p, P2pPayload::StreamKeySetup { .. }))
+        .count();
+
+    // Its acknowledgement never arrives; the link comes back and the
+    // retry re-runs the release from the `.rec` file.
+    let mut bob_ui = std::mem::replace(&mut bob.ui, UiState::new("swap".into()));
+    let retried = bob
+        .session
+        .retry_outstanding_otp_send_for_test(&mut bob_ui, ALICE, &contact)
+        .await;
+    bob.ui = bob_ui;
+    assert!(retried, "a recording front is the retry's to make");
+    assert!(
+        bob.queued()
+            .iter()
+            .filter(|p| matches!(p, P2pPayload::StreamKeySetup { .. }))
+            .count()
+            > setups_before,
+        "the release ran again - key setup and chunks from the queue's own file"
     );
 }

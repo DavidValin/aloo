@@ -232,6 +232,14 @@ async fn no_recording(w: &mut AlooWorld) {
     );
 }
 
+#[then("a recording starts")]
+async fn a_recording_starts(w: &mut AlooWorld) {
+    assert!(
+        w.ui_ref().recording,
+        "with somewhere to hold it, recording for someone away must begin"
+    );
+}
+
 #[then("a recording indicator is shown")]
 async fn indicator_shown(w: &mut AlooWorld) {
     let rows = ui_rows(w.ui_ref());

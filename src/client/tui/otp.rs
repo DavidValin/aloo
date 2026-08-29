@@ -291,7 +291,7 @@ impl UiState {
     /// left behind: those are transactions with a session that is over,
     /// and the new connection gets its own, including its own identity
     /// check.
-    pub(crate) fn adopt_returning_peer(&mut self, previous: UserId, user: &UserInfo) {
+    pub fn adopt_returning_peer(&mut self, previous: UserId, user: &UserInfo) {
         let id = user.id;
         self.offline.remove(&previous);
         self.link_status.remove(&previous);
@@ -300,6 +300,24 @@ impl UiState {
             // The room keeps its whole log; only who it is *with* is
             // restated, since their key material and id are both new.
             room.peer = user.clone();
+            // Every row's delivery record names the id this person had
+            // when that message was written, and acknowledgements are
+            // matched against it (`mark_delivered`). For anything that was
+            // *held* for them that id is precisely the one that never
+            // comes back - the durable queue is keyed by nickname for
+            // exactly that reason - so leaving these behind means the
+            // message arrives, they read it, and the sender's row still
+            // says it never got there. Only the id moves; the name is left
+            // as it was at send time, which is what it is snapshotted for.
+            for entry in &mut room.log {
+                if let Some(delivery) = entry.delivery.as_mut() {
+                    for recipient in &mut delivery.recipients {
+                        if recipient.id == previous {
+                            recipient.id = id;
+                        }
+                    }
+                }
+            }
             self.private_rooms.insert(id, room);
         }
         for entry in &mut self.dm_order {

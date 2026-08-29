@@ -70,9 +70,13 @@ Feature: When someone's connection closes
     And I press Enter
     Then sending the private message "hey carol" to carol is requested
 
-  @AC-054
-  Scenario: Holding Space at an offline peer does nothing
-    Given I am connected and viewing a channel
+  # Only when there is nowhere to hold the recording. With
+  # `queue_send_messages` on it is held for them like anything else, which
+  # is what that switch is for - see features/messaging/queued_sends.feature.
+  @AC-054 @AC-426
+  Scenario: Holding Space at an offline peer does nothing when there is no queue
+    Given queueing sends is off
+    And I am connected and viewing a channel
     And bob is in the channel with me
     And bob has sent me the private message "hi"
     And bob has gone offline
@@ -80,6 +84,18 @@ Feature: When someone's connection closes
     And focus is on the log
     When I hold Space
     Then no recording starts
+
+  @AC-426
+  Scenario: Holding Space at an offline peer records for them when there is
+    Given queueing sends is on
+    And I am connected and viewing a channel
+    And bob is in the channel with me
+    And bob has sent me the private message "hi"
+    And bob has gone offline
+    And I have opened a private room with bob
+    And focus is on the log
+    When I hold Space
+    Then a recording starts
 
   @AC-055 @TB-020
   Scenario: Going offline is permanent for the session

@@ -888,3 +888,55 @@ async fn a_recovered_resend_still_proves_itself_with_the_original_nonce() {
         other => panic!("expected Ok, got {other:?}"),
     }
 }
+
+/// Two concurrent invocations against one keychain must never read the
+/// same offset - that would be two plaintexts under one keystream, the
+/// one failure a pad cannot survive. The per-call keychain lock
+/// serializes them; this drives the real binary from both sides at once
+/// and proves the offsets never collided: both messages decrypt, in
+/// order, and exactly two positions were spent.
+/// @requirement AC-432
+#[tokio::test]
+async fn concurrent_encrypts_on_one_keychain_never_share_an_offset() {
+    if !require_otp() {
+        return;
+    }
+    let (alice_cfg, bob_cfg) = provision_pair("concurrent-encrypts").await;
+    let before = otp_cli::status(&alice_cfg, "bob").await.unwrap().unwrap();
+
+    let a = otp_cli::encrypt_retrying(&alice_cfg, "bob", b"first of two at once", true);
+    let b = otp_cli::encrypt_retrying(&alice_cfg, "bob", b"second of two at once", true);
+    let (a, b) = tokio::join!(a, b);
+    let (OtpCliOutcome::Ok(cipher_a), OtpCliOutcome::Ok(cipher_b)) = (a.unwrap(), b.unwrap())
+    else {
+        panic!("both concurrent encrypts must succeed");
+    };
+
+    let after = otp_cli::status(&alice_cfg, "bob").await.unwrap().unwrap();
+    assert_eq!(
+        after.enc_sequence,
+        before.enc_sequence + 2,
+        "two sends, two positions - never one shared"
+    );
+
+    // Both decrypt, in the order their offsets were handed out - which is
+    // only possible if the offsets were distinct and consecutive.
+    let mut plains = Vec::new();
+    for cipher in [&cipher_a, &cipher_b] {
+        match otp_cli::decrypt_retrying(&bob_cfg, "alice", cipher, true).await.unwrap() {
+            OtpCliOutcome::Ok(p) => plains.push(p),
+            OtpCliOutcome::Rejected(_) => plains.push(Vec::new()),
+            other => panic!("unexpected outcome {other:?}"),
+        }
+    }
+    // join! gives no ordering guarantee over which encrypt ran first, so
+    // accept either delivery order - what matters is that both open.
+    let mut got: Vec<Vec<u8>> = plains;
+    got.sort();
+    let mut want = vec![
+        b"first of two at once".to_vec(),
+        b"second of two at once".to_vec(),
+    ];
+    want.sort();
+    assert_eq!(got, want, "both plaintexts come back intact");
+}

@@ -84,35 +84,43 @@ pub struct OutboxEntry {
     /// Seconds since the Unix epoch. Wall-clock rather than an `Instant`
     /// because this outlives the process that wrote it.
     pub queued_at: u64,
+    /// Unique within this nickname's queue and stable across restarts:
+    /// it is what an acknowledgement names when it says this particular
+    /// entry has reached the peer and may finally be deleted
+    /// (`p2p::P2pEvent::FrameAcked`, `Outbox::remove`).
+    pub id: u64,
     pub item: OutboxItem,
 }
 
 /// Whether `item` is a kind this queue keeps.
 ///
-/// Text (`Envelope`, `OtpEnvelope`) and a whole voice message - its
+/// pq_hybrid text (`Envelope`) and a whole pq_hybrid voice message - its
 /// reliable `StreamStart`/`StreamKeySetup`/`StreamEnd` plus its sealed
-/// chunks - are. Everything else is not: files (see the module doc),
-/// and every receipt, ack, pad-provisioning chunk and call-control
-/// payload, each of which is either a live conversation with the peer
-/// that cannot be replayed out of its moment, or a statement about right
-/// now that would be a lie an hour later.
+/// chunks - are.
+///
+/// **Anything under the pad is not**, though it is queued: `OtpEnvelope`
+/// and `OtpVoiceOffer` belong to `client::otp_outbox`, which owns their
+/// delivery discipline. This queue flushes everything it holds the moment
+/// a link opens; a pad session must send one message per acknowledgement,
+/// in order, so putting a sealed pad message here would both break that
+/// order and risk sending it from two queues at once.
+///
+/// Neither are files (see the module doc), nor any receipt, ack,
+/// pad-provisioning chunk or call-control payload - each is either a live
+/// conversation with the peer that cannot be replayed out of its moment,
+/// or a statement about right now that would be a lie an hour later.
 pub fn is_queueable(item: &OutboxItem) -> bool {
     match item {
         OutboxItem::VoiceChunk { .. } => true,
         OutboxItem::Reliable(payload) => matches!(
             payload,
-            // Text, either layering (`docs/PROTOCOL.md` §7.2, §16.4).
+            // Plain pq_hybrid text (`docs/PROTOCOL.md` §7.2).
             P2pPayload::Envelope { .. }
-                | P2pPayload::OtpEnvelope { .. }
                 // A pq_hybrid voice message: the reliable frame around
                 // its chunks.
                 | P2pPayload::StreamStart { .. }
                 | P2pPayload::StreamKeySetup { .. }
                 | P2pPayload::StreamEnd { .. }
-                // A pad-wrapped voice message is recorded whole and sent
-                // as one payload rather than streamed (§16.5), so this
-                // single entry is the entire message.
-                | P2pPayload::OtpVoiceOffer { .. }
         ),
     }
 }
@@ -128,6 +136,26 @@ pub const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1
 /// Where the queue lives by default: `~/.aloo/outbox/`.
 pub fn default_dir() -> PathBuf {
     crate::platform::aloo_dir().join("outbox")
+}
+
+/// The queue directory belonging to the client whose `id_store` is at
+/// `id_store_path` - its sibling, so all of one client's local state
+/// stays together.
+///
+/// In an ordinary run that is `~/.aloo/id_store`, so this is exactly
+/// `default_dir`. It differs only where a client's state has been pointed
+/// somewhere else, which is what makes two clients in one process
+/// separable at all: `ALOO_HOME` is a process-wide environment variable,
+/// so it cannot give them a home each, but their stores can be. Without
+/// this, a second client sweeping *its* queue would find the first
+/// client's contacts unrecognisable and delete their messages - which is
+/// exactly what a co-located pair sharing one `~/.aloo` already risks for
+/// the OTP layer (see docs/TESTING.md's tmux note), made worse.
+pub fn dir_beside(id_store_path: &Path) -> PathBuf {
+    id_store_path
+        .parent()
+        .map(|home| home.join("outbox"))
+        .unwrap_or_else(default_dir)
 }
 
 /// One file per peer, every entry in the order it was written.
@@ -212,6 +240,7 @@ impl Outbox {
         }
         let entry = OutboxEntry {
             queued_at: now_secs(),
+            id: self.next_id(nickname),
             item,
         };
         self.queues
@@ -282,6 +311,86 @@ impl Outbox {
         queue
     }
 
+    /// Everything waiting for `nickname`, oldest first, *without*
+    /// removing it - the counterpart to `take`, and what a drain uses.
+    ///
+    /// A drain must not delete on the strength of having handed content
+    /// to the transport: until the peer acknowledges it, this copy is the
+    /// only one that survives either a crash or the link dying mid-flight
+    /// (in which case the frame is dropped by `p2p`'s `expire_pending`
+    /// and nothing else would ever re-send it). `remove` is what deletes,
+    /// and only an acknowledgement calls it.
+    pub fn peek(&self, nickname: &str) -> &[OutboxEntry] {
+        self.queues.get(nickname).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// Deletes the entry `id` names, rewriting `nickname`'s file without
+    /// it. Reports whether there was one - a repeat, or an id belonging
+    /// to a queue that has since been swept, is not an error.
+    ///
+    /// Rewrites rather than appends because this is a removal from the
+    /// middle of a append-only log; queues are short (a conversation's
+    /// worth of held messages), so this stays cheap.
+    pub fn remove(&mut self, nickname: &str, id: u64) -> bool {
+        let Some(queue) = self.queues.get_mut(nickname) else {
+            return false;
+        };
+        let before = queue.len();
+        queue.retain(|entry| entry.id != id);
+        if queue.len() == before {
+            return false;
+        }
+        if queue.is_empty() {
+            self.queues.remove(nickname);
+            let _ = fs::remove_file(self.path_for(nickname));
+        } else {
+            let _ = self.rewrite(nickname);
+        }
+        true
+    }
+
+    /// The next unused id for `nickname`'s queue. Ids only ever go up
+    /// within a queue, including across a restart, because they are read
+    /// back off disk.
+    fn next_id(&self, nickname: &str) -> u64 {
+        self.queues
+            .get(nickname)
+            .and_then(|q| q.iter().map(|e| e.id).max())
+            .map_or(0, |highest| highest + 1)
+    }
+
+    /// Writes `nickname`'s queue out in full, replacing whatever was
+    /// there. Used only by `remove`, which cannot express itself as an
+    /// append.
+    ///
+    /// Staged beside the file and renamed over it, never truncated in
+    /// place: `fs::write` empties the file before refilling it, so a
+    /// process killed inside that call lost the entire queue - every held
+    /// message, silently. The rename is atomic, so every crash instant
+    /// leaves either the old contents (the removed entry comes back,
+    /// which its next acknowledgement removes again) or the new.
+    fn rewrite(&self, nickname: &str) -> io::Result<()> {
+        let path = self.path_for(nickname);
+        let Some(queue) = self.queues.get(nickname) else {
+            let _ = fs::remove_file(&path);
+            return Ok(());
+        };
+        crate::platform::ensure_parent_dir(&path)?;
+        let mut body = String::new();
+        for entry in queue {
+            if let Some(line) = entry_line(entry) {
+                body.push_str(&line);
+            }
+        }
+        let staged = {
+            let mut staged = path.as_os_str().to_owned();
+            staged.push(".new");
+            PathBuf::from(staged)
+        };
+        fs::write(&staged, body)?;
+        fs::rename(&staged, &path)
+    }
+
     /// Drops everything waiting for `nickname` without sending it.
     pub fn clear(&mut self, nickname: &str) {
         self.queues.remove(nickname);
@@ -300,36 +409,57 @@ impl Outbox {
 fn entry_line(entry: &OutboxEntry) -> Option<String> {
     let bytes = crate::proto::encode(&entry.item).ok()?;
     Some(format!(
-        "{} {}\n",
+        "{} {} {}\n",
         entry.queued_at,
-        crate::crypto::hex_encode(&bytes)
+        crate::crypto::hex_encode(&bytes),
+        entry.id
     ))
 }
 
-/// One `<queued_at> <hex payload>` line per entry, in order. Hex rather
-/// than raw bytes so the file stays line-oriented like every other store
-/// this app writes, and so a truncated final write costs one entry rather
-/// than the whole file.
+/// One `<queued_at> <hex payload> <id>` line per entry, in order. Hex
+/// rather than raw bytes so the file stays line-oriented like every other
+/// store this app writes, and so a truncated final write costs one entry
+/// rather than the whole file.
+///
+/// The trailing id is optional on the way *in*: a file written before ids
+/// existed is still a queue of real messages, and losing it over a
+/// missing field would be exactly the data loss this whole store exists
+/// to prevent. Those entries are numbered by position instead, which is
+/// unique within the queue - all an id has to be.
 fn parse_entries(contents: &str) -> Vec<OutboxEntry> {
-    let mut entries = Vec::new();
+    let mut entries: Vec<OutboxEntry> = Vec::new();
     for line in contents.lines() {
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
-        let Some((queued_at, hex)) = line.split_once(' ') else {
+        let mut fields = line.split_whitespace();
+        let (Some(queued_at), Some(hex)) = (fields.next(), fields.next()) else {
             continue;
         };
         let Ok(queued_at) = queued_at.parse::<u64>() else {
             continue;
         };
-        let Some(bytes) = crate::crypto::hex_decode(hex.trim()) else {
+        let Some(bytes) = crate::crypto::hex_decode(hex) else {
             continue;
         };
         let Ok(item) = crate::proto::decode::<OutboxItem>(&bytes) else {
             continue;
         };
-        entries.push(OutboxEntry { queued_at, item });
+        // Never a *lower* id than one already read, so a file mixing
+        // numbered and unnumbered lines still comes back strictly
+        // increasing and collision-free.
+        let floor = entries.last().map_or(0, |e: &OutboxEntry| e.id + 1);
+        let id = fields
+            .next()
+            .and_then(|f| f.parse::<u64>().ok())
+            .filter(|id| *id >= floor)
+            .unwrap_or(floor);
+        entries.push(OutboxEntry {
+            queued_at,
+            id,
+            item,
+        });
     }
     entries
 }

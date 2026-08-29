@@ -135,7 +135,8 @@ pub fn otp_contact_name_for(
             if device_id.is_empty() {
                 // Unbound: no device confirmed for this pin yet, so there
                 // is no device-qualified name to derive - see this
-                // function's own doc.
+                // function's own doc. A `Direct` pin needs no such check:
+                // it binds the device on the contact instead (§5).
                 return None;
             }
             Some(match purpose {

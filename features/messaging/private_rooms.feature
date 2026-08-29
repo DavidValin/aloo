@@ -89,3 +89,38 @@ Feature: Talking to one person privately
     And bob is in the channel with me
     When I open a private room with me
     Then no private room opens
+
+  # `/leave` is the same act for a conversation of either kind: the
+  # channel one drops its whole tab, this drops the room. Messages live
+  # only in memory, so either way they are gone with it - what is on disk
+  # is the export `autosave_messages` writes, which this never touches.
+  @AC-417
+  Scenario: /leave in a room closes it and forgets what was said
+    Given I am connected and viewing a channel
+    And bob is in the channel with me
+    And bob has sent me the private message "hi"
+    When I open a private room with bob
+    And I type "/leave"
+    And I press Enter
+    Then no private room with bob is open
+    And nothing said with bob is left in memory
+    And bob is not on the DM selector
+
+  @AC-417
+  Scenario: A left room comes back empty when they write again
+    Given I am connected and viewing a channel
+    And bob is in the channel with me
+    And bob has sent me the private message "hi"
+    When I open a private room with bob
+    And I type "/leave"
+    And I press Enter
+    And bob has sent me the private message "are you there"
+    Then the private room with bob holds 1 message
+    And bob is on the DM selector
+
+  @AC-417
+  Scenario: Outside a room /leave is still the channel command
+    Given I am connected and viewing a channel
+    When I type "/leave"
+    And I press Enter
+    Then leaving the channel "general" is requested

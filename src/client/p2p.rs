@@ -257,6 +257,16 @@ pub enum P2pEvent {
         peer: UserId,
         item: crate::client::outbox::OutboxItem,
     },
+    /// A reliable frame sent with a correlation `tag` has been
+    /// acknowledged by `peer`. Only ever emitted for a tagged send, which
+    /// in practice means one released from the durable queue
+    /// (`client::outbox`): it is what says that entry may now be deleted,
+    /// and nothing else does. Until it arrives the on-disk copy is the
+    /// only one that survives this process.
+    FrameAcked {
+        peer: UserId,
+        tag: u64,
+    },
     /// `channel: Some(name)` is a channel message, `None` a DM - mirrors
     /// `p2p_proto::P2pPayload::Envelope`.
     Message {
@@ -675,7 +685,7 @@ struct PeerLink {
     /// Survives a failed attempt on purpose - a message typed while the
     /// link is flapping should arrive when it recovers, not vanish. Voice
     /// never populates this (see `LinkReadiness`'s doc).
-    pending: VecDeque<(Instant, P2pPayload)>,
+    pending: VecDeque<(Instant, P2pPayload, Option<u64>)>,
     /// Consecutive failed establishment attempts, driving `retry_delay`.
     /// Reset the moment the link goes `Active`.
     attempts: u32,
@@ -918,9 +928,9 @@ impl PeerLinkManager {
     fn reset_transport(link: &mut PeerLink, now: Instant) -> usize {
         let unacked = link.arq_tx.reset();
         link.arq_rx.reset();
-        for bytes in unacked.into_iter().rev() {
+        for (bytes, tag) in unacked.into_iter().rev() {
             if let Ok(payload) = proto::decode::<P2pPayload>(&bytes) {
-                link.pending.push_front((now, payload));
+                link.pending.push_front((now, payload, tag));
             }
         }
         let mut dropped = 0;
@@ -1083,7 +1093,52 @@ impl PeerLinkManager {
     /// link itself) - a `payload` for a peer with no link state at all is
     /// simply dropped, since there is nothing to flush it later.
     pub fn send_reliable_or_queue(&mut self, peer: UserId, payload: P2pPayload) {
+        self.send_reliable_inner(peer, payload, None);
+    }
+
+    /// `send_reliable_or_queue` for content the caller is still holding a
+    /// durable copy of (`client::outbox`), which changes two things.
+    ///
+    /// It is never spilled back as `Undeliverable`: it is already on disk,
+    /// and handing it over again would queue a second copy of it. It still
+    /// waits in this manager's own pending queue if the link is not up
+    /// yet, exactly like an untagged send - that queue is transient
+    /// memory, so it cannot duplicate the durable copy, and it is what
+    /// gets the content onto the wire the moment the link opens.
+    ///
+    /// When the peer acknowledges it, `P2pEvent::FrameAcked` names `tag`,
+    /// which is what finally allows the on-disk copy to be deleted.
+    /// Nothing else does: if this frame is instead given up on
+    /// (`expire_pending`) or lost with the process, that copy is still
+    /// there and `session::flush_outbox` offers it again next time.
+    pub fn send_reliable_tagged(&mut self, peer: UserId, payload: P2pPayload, tag: u64) {
+        self.send_reliable_inner(peer, payload, Some(tag));
+    }
+
+    fn send_reliable_inner(&mut self, peer: UserId, payload: P2pPayload, tag: Option<u64>) {
         let socket = self.socket.clone();
+        // The durable queue is asked *before* "is there a link record",
+        // not after: a peer who disconnected has had theirs forgotten
+        // (`session::drop_peer_state`), and content for them would
+        // otherwise be dropped here without ever being offered to the
+        // queue that exists precisely to hold it. A caller that has run
+        // `ensure_link` first is unaffected - that link is not `Active`
+        // either.
+        let item = crate::client::outbox::OutboxItem::Reliable(payload);
+        if tag.is_none()
+            && self.spill_undeliverable
+            && crate::client::outbox::is_queueable(&item)
+            && !matches!(
+                self.links.get(&peer).map(|l| &l.state),
+                Some(PeerLinkState::Active { .. })
+            )
+        {
+            let _ = self.events_tx.send(P2pEvent::Undeliverable { peer, item });
+            return;
+        }
+        let crate::client::outbox::OutboxItem::Reliable(payload) = item else {
+            unreachable!("built as Reliable just above")
+        };
         if !self.links.contains_key(&peer) {
             return;
         }
@@ -1093,26 +1148,15 @@ impl PeerLinkManager {
         ) && !self.queue_held.contains(&peer);
         if active {
             let link = self.links.get_mut(&peer).expect("checked just above");
-            Self::transmit_reliable(&socket, link, &payload);
+            Self::transmit_reliable(&socket, link, &payload, tag);
             return;
         }
-        // Content the durable queue would keep does not wait here at all:
-        // that queue outlives this process and this manager's does not,
-        // and holding a copy in both places would deliver it twice.
-        //
-        // Only content it would keep, though. A receipt, a file chunk, an
-        // ack - anything `outbox::is_queueable` refuses - still waits
-        // here exactly as it always did, because "not worth keeping for
-        // an hour" is not the same as "not worth keeping for the minute
-        // this link is being punched".
-        let item = crate::client::outbox::OutboxItem::Reliable(payload);
-        if self.spill_undeliverable && crate::client::outbox::is_queueable(&item) {
-            let _ = self.events_tx.send(P2pEvent::Undeliverable { peer, item });
-            return;
-        }
-        let crate::client::outbox::OutboxItem::Reliable(payload) = item else {
-            unreachable!("built as Reliable just above")
-        };
+        // Anything reaching here is content the durable queue would not
+        // keep - a receipt, a file chunk, an ack (`outbox::is_queueable`
+        // refuses them) - or a send made with that queue switched off.
+        // Either way it waits here exactly as it always did, because "not
+        // worth keeping for an hour" is not the same as "not worth
+        // keeping for the minute this link is being punched".
         let link = self.links.get_mut(&peer).expect("checked just above");
         // Queued rather than dropped even on a `Lost` link: it is being
         // retried, and `PENDING_MAX_AGE` - not the state right now - is
@@ -1125,7 +1169,7 @@ impl PeerLinkManager {
             });
         }
         let link = self.links.get_mut(&peer).expect("checked just above");
-        link.pending.push_back((Instant::now(), payload));
+        link.pending.push_back((Instant::now(), payload, tag));
     }
 
     /// Sends `blocks` unreliably (no ack, no retransmit). Historically
@@ -1178,7 +1222,12 @@ impl PeerLinkManager {
         *last_sent = Instant::now();
     }
 
-    fn transmit_reliable(socket: &UdpSocket, link: &mut PeerLink, payload: &P2pPayload) {
+    fn transmit_reliable(
+        socket: &UdpSocket,
+        link: &mut PeerLink,
+        payload: &P2pPayload,
+        tag: Option<u64>,
+    ) {
         if !matches!(link.state, PeerLinkState::Active { .. }) {
             return;
         }
@@ -1186,7 +1235,7 @@ impl PeerLinkManager {
         // `None` means the ARQ send window is full: the frame is held and
         // goes out of `on_ack` once a slot frees up, so there is nothing to
         // put on the wire here (see `p2p_reliable::SEND_WINDOW`).
-        let Some((seq, bytes)) = link.arq_tx.send(bytes) else {
+        let Some((seq, bytes)) = link.arq_tx.send(bytes, tag) else {
             return;
         };
         Self::transmit_frame(socket, link, seq, bytes);
@@ -1281,13 +1330,23 @@ impl PeerLinkManager {
                 };
                 self.note_received(peer, now);
                 let socket = self.socket.clone();
+                let mut delivered = Vec::new();
                 if let Some(link) = self.links.get_mut(&peer) {
                     // Retiring this frame may release the next one waiting
                     // on the send window - that release is the only thing
                     // that keeps a windowed backlog moving.
-                    for (seq, payload) in link.arq_tx.on_ack(seq, now) {
+                    let outcome = link.arq_tx.on_ack(seq, now);
+                    for (seq, payload) in outcome.released {
                         Self::transmit_frame(&socket, link, seq, payload);
                     }
+                    delivered = outcome.delivered;
+                }
+                // Reported after the link borrow ends. This is the peer
+                // confirming receipt, and so the first moment the durable
+                // copy of a flushed message is genuinely redundant - see
+                // `p2p_reliable::AckOutcome`.
+                for tag in delivered {
+                    let _ = self.events_tx.send(P2pEvent::FrameAcked { peer, tag });
                 }
             }
             PunchDatagram::Reliable { seq, payload } => {
@@ -1440,8 +1499,8 @@ impl PeerLinkManager {
             return;
         };
         let pending = std::mem::take(&mut link.pending);
-        for (_, payload) in pending {
-            Self::transmit_reliable(&socket, link, &payload);
+        for (_, payload, tag) in pending {
+            Self::transmit_reliable(&socket, link, &payload, tag);
         }
     }
 
@@ -1829,7 +1888,7 @@ impl PeerLinkManager {
         let mut expired: Vec<(UserId, usize)> = Vec::new();
         for (&peer, link) in self.links.iter_mut() {
             let mut count = 0;
-            while let Some((queued_at, _)) = link.pending.front() {
+            while let Some((queued_at, _, _)) = link.pending.front() {
                 if now.duration_since(*queued_at) < PENDING_MAX_AGE {
                     break;
                 }
@@ -2709,10 +2768,31 @@ impl PeerLinkManager {
         self.start_attempt(peer, Instant::now());
     }
 
+    /// Puts `peer`'s link straight into `Active` - exposed for tests that
+    /// need a peer this side can genuinely reach, without a real punch
+    /// between two real sockets to get there.
+    ///
+    /// The address is loopback and nothing is ever sent to it: what a
+    /// test using this asks about is whether the *client* believes it can
+    /// reach them (`is_active`), which is what decisions like "were they
+    /// told, or only queued for" now turn on.
+    pub fn mark_active_for_test(&mut self, peer: UserId) {
+        self.start_attempt(peer, Instant::now());
+        let now = Instant::now();
+        if let Some(link) = self.links.get_mut(&peer) {
+            link.state = PeerLinkState::Active {
+                addr: "127.0.0.1:1".parse().expect("loopback literal"),
+                last_sent: now,
+                last_received: now,
+            };
+        }
+        self.sync_statuses();
+    }
+
     pub fn pending_payloads(&self, peer: UserId) -> Vec<P2pPayload> {
         self.links
             .get(&peer)
-            .map(|l| l.pending.iter().map(|(_, p)| p.clone()).collect())
+            .map(|l| l.pending.iter().map(|(_, p, _)| p.clone()).collect())
             .unwrap_or_default()
     }
 

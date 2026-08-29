@@ -132,6 +132,32 @@ Feature: Changing settings without leaving the app
     And I type "2x5" into the focused setting
     Then the setting "otp_low_key_warn_pct" reads "25"
 
+  # Every field applies when it is changed, not at the next start. What
+  # that costs per field is `session::save_settings_draft`; what a
+  # scenario can see from here is that the change is both kept and
+  # handed on for the session to apply.
+  @AC-411
+  Scenario: A change takes effect rather than waiting for a restart
+    Given I am connected and viewing a channel
+    And I press Ctrl+S
+    When I move the focus to "voice_autoplay"
+    And I press Space
+    Then the setting "voice_autoplay" is off
+    And the settings popup asked the session to save
+    And arriving voice is kept off the speakers for everyone
+
+  @AC-416
+  Scenario: Every switch in the file is written the same way
+    Given a settings file that says
+      """
+      global_ptt_enabled=false
+      daemon_otp=true
+      """
+    Then the global push-to-talk switch is off
+    And the daemon otp switch is on
+    When those settings are written back out
+    Then no switch is written as true or false
+
   @AC-401
   Scenario: Every field on a tab explains itself in a line
     Given I am connected and viewing a channel

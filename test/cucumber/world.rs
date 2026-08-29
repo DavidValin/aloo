@@ -204,6 +204,8 @@ pub struct AlooWorld {
     // -- pq_hybrid sealed sends ----------------------------------------
     /// The most recently sealed send, as it would sit on the wire.
     pub sealed: Vec<u8>,
+    /// The `send_id` of a send left waiting while newer ones go past it.
+    pub held_send_id: u64,
     /// Each chunk of a sealed stream, in order.
     pub sealed_chunks: Vec<Vec<u8>>,
     /// The stream setup that authorises `sealed_chunks`.
@@ -272,6 +274,13 @@ pub struct AlooWorld {
     /// so each one is distinguishable and an ordering assertion can name
     /// them.
     pub sent_payload_count: usize,
+    /// How many pad messages this scenario has sealed, so each carries a
+    /// distinct sequence number.
+    pub sealed_pad_count: u64,
+    /// What was sealed, in order, for the byte-identity assertions.
+    pub sealed_payloads: Vec<aloo::p2p_proto::P2pPayload>,
+    /// A settings file written back out, for asserting how it is spelled.
+    pub written_settings: Option<String>,
     /// The stand-in rendezvous socket every direct-punch client binds
     /// against, spawned once per scenario that needs one.
     pub direct_rendezvous: Option<SocketAddr>,
@@ -413,6 +422,18 @@ pub struct AlooWorld {
     /// order - lets a scenario assert delivery is by sequence order even
     /// when mails were uploaded/stored out of that order.
     pub otp_mail_ids: Vec<(u64, String)>,
+    /// Whether the durable pad queue accepted the last entry offered to
+    /// it - what tells the caller a spent pad position still has a
+    /// message behind it.
+    pub pad_queue_accepted: bool,
+    /// Whether the last pump released the front of a pad queue.
+    pub pad_queue_released: bool,
+    /// The sequence bob last accepted under the pad.
+    pub otp_last_accepted_seq: u64,
+    /// The pad offset before a voice message was recorded, and the PCM
+    /// that was recorded - what "was anything spent?" is measured against.
+    pub pad_spent_before: u64,
+    pub otp_recorded_pcm: Vec<u8>,
     /// The sealed (pre-`otp --encrypt`) bytes of that mail.
     pub otp_mail_sealed: Vec<u8>,
     /// Its ciphertext, exactly as uploaded.

@@ -27,6 +27,23 @@ pub const MAX_FRAME_LEN: u32 = 64 * 1024 * 1024;
 /// which is well under this).
 pub const TEXT_MESSAGE_MAX_LEN: usize = 10_000;
 
+/// What the server answers a relay whose target is not connected
+/// (`server::route_peer_link_request`, `route_key_rotation`).
+///
+/// A shared constant rather than two independent strings because the
+/// client matches on it: these two relays are internal protocol
+/// plumbing - a link being signalled, a key rotation being offered - that
+/// nobody typed a command to trigger, so their failure is logged but must
+/// never reach the screen as if it answered something the user did. Every
+/// other `ServerMessage::Error` does reach it (a channel-admin refusal,
+/// a superadmin refusal), which is exactly why the two need telling
+/// apart. See `client::session`'s `ServerMessage::Error` arm.
+pub const UNKNOWN_RECIPIENT: &str = "unknown recipient";
+/// The counterpart for a relay whose *sender* the server no longer knows,
+/// which reaches the screen for the same reason: it never answered
+/// anything the user typed.
+pub const UNKNOWN_SENDER: &str = "unknown sender";
+
 /// How often a connected client sends `ClientMessage::Heartbeat` on the
 /// control channel (docs/PROTOCOL.md §4.1). Actual message content never
 /// touches the server (it travels peer-to-peer, §7.1), so without this a

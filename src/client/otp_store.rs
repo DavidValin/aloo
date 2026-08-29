@@ -307,6 +307,17 @@ impl OtpStore {
         );
     }
 
+    /// The pad position a staged, already-sealed content payload is
+    /// waiting to go out under, if there is one for `contact_name`.
+    ///
+    /// This is what stops the send queue running ahead of it. That
+    /// payload's position was spent when it was sealed, but it does not
+    /// reach the wire until the peer accepts the offer announcing it - and
+    /// in that window the acknowledgement gate is clear, so without this
+    /// the next queued message would go out under a *later* position than
+    /// one the peer has not been given yet, which their pad cannot take
+    /// out of order (`client::otp::pump_otp_queue`).
+
     /// Takes (and clears) the staged record for `stream_id` - called the
     /// moment something else (an immediate encrypt, or the ordinary
     /// in-memory send queue) becomes the authoritative tracker of this
@@ -630,6 +641,34 @@ impl OtpStore {
         self.entries
             .iter()
             .filter_map(|(name, state)| state.pending_end_notice.then_some(name.as_str()))
+    }
+
+    /// Records that `seq` has been **sealed** - its pad position is spent
+    /// and it is now on the durable queue (`client::otp_outbox`) - without
+    /// arming the acknowledgement gate, which belongs to whichever message
+    /// is actually on the wire.
+    ///
+    /// The split exists because encrypting and sending stopped being the
+    /// same moment: a message is sealed the instant it is written, so the
+    /// pad spend is never left waiting on a peer who may be away, while
+    /// delivery stays strictly one message per acknowledgement. `record_sent`
+    /// below is the transmit half.
+    pub fn record_sealed(&mut self, contact_name: &str, seq: u64) {
+        let state = self.entries.entry(contact_name.to_string()).or_default();
+        state.next_out_seq = state.next_out_seq.max(seq + 1);
+        // The spend this intent announced is now fully recorded, exactly
+        // as in `record_sent` (`encrypt_intent`'s doc).
+        state.encrypt_intent = None;
+    }
+
+    /// Arms the single-outstanding-send gate for a position whose message
+    /// this queue never held - a recording sent from its staged record -
+    /// so a test can drive the acknowledgement that used to retire the
+    /// wrong entry. Same role as the other `_for_test` hooks.
+    pub fn arm_gate_for_test(&mut self, contact_name: &str, seq: u64) {
+        let state = self.entries.entry(contact_name.to_string()).or_default();
+        state.pending_unacked_out_seq = Some(seq);
+        state.pending_ack_proof = Some([seq as u8; 32]);
     }
 
     pub fn record_sent(

@@ -82,6 +82,15 @@ Feature: How a message is encrypted, at every layer
     And the very same sealed message arrives again
     Then bob refuses it
 
+  @US-027 @AC-114 @AC-420 @pqhybrid
+  Scenario: A queued message that arrives after newer ones is not mistaken for a replay
+    Given alice and bob each have a pq_hybrid identity
+    When alice seals "while you were out" for bob with send id 7
+    And it waits undelivered while 3 newer sends reach bob
+    And it is finally delivered
+    Then bob accepts it
+    And bob reads back exactly what was sealed
+
   @US-027 @AC-115 @TB-160 @pqhybrid
   Scenario: Streamed content is sealed exactly like a text message
     Given alice and bob each have a pq_hybrid identity
@@ -193,6 +202,29 @@ Feature: How a message is encrypted, at every layer
     Then "second" is held back, not sent
     When bob's delivery ack for "first" arrives
     Then the held message "second" is sent
+
+  # A pad is a sequence, not a set: every position is read exactly once and
+  # strictly in turn. Both halves matter - a repeat must not reach the pad
+  # a second time (it would be read with the wrong bytes and would spend
+  # what cannot be replaced), and it must not be met with silence either,
+  # since the sender's gate only ever opens on an acknowledgement.
+  @US-033 @AC-304 @pqhybrid_otp
+  Scenario: A pad message that arrives twice is answered from the record, never from the pad
+    Given alice and bob each have a pq_hybrid identity
+    And alice and bob have provisioned an otp contact for each other
+    When bob accepts the padded message at sequence 0
+    Then the padded message at sequence 0 is not let near the pad again
+    And bob answers it with the acknowledgement he already recorded
+
+  @US-033 @AC-304 @pqhybrid_otp
+  Scenario: Padded messages are read in the order they were sealed, never out of turn
+    Given alice and bob each have a pq_hybrid identity
+    And alice and bob have provisioned an otp contact for each other
+    Then the padded message at sequence 0 is the one it will read next
+    And the padded message at sequence 1 is refused as out of turn
+    When bob accepts the padded message at sequence 0
+    Then the padded message at sequence 1 is the one it will read next
+    And the padded message at sequence 0 is refused as out of turn
 
   @US-033 @TB-186 @pqhybrid_otp
   Scenario: A pad far larger than one network datagram still arrives whole
