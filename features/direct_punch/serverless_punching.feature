@@ -48,10 +48,69 @@ Feature: Punching a direct link with no server involved
   @AC-212
   Scenario: A peer may be named by address or by name, with a port of its own
     Then "bob,203.0.113.9,every_5m" names host "203.0.113.9" on the well-known port
-    And "bob,203.0.113.9:9000,every_5m" names host "203.0.113.9" on port 9000
+    And "bob,203.0.113.9:19000,every_5m" names host "203.0.113.9" on port 19000
     And "bob,2001:db8::1,every_5m" names host "2001:db8::1" on the well-known port
-    And "bob,[2001:db8::1]:9000,every_5m" names host "2001:db8::1" on port 9000
-    And "bob,bobpublic.com:9000,every_5m" names host "bobpublic.com" on port 9000
+    And "bob,[2001:db8::1]:19000,every_5m" names host "2001:db8::1" on port 19000
+    And "bob,bobpublic.com:19000,every_5m" names host "bobpublic.com" on port 19000
+
+  # A NAT that rewrites the source port - most of them do - leaves both
+  # ends aiming at a port neither router ever mapped, and no single agreed
+  # number can fix that, because the number that survives is the router's
+  # choice, not either peer's. Naming several and probing them all on the
+  # same slot only needs one of them to get through.
+  @AC-434
+  Scenario: A peer may be named with several ports at once
+    Then "bob,203.0.113.9:[18000,19000,21000],every_5m" names host "203.0.113.9" on ports "18000,19000,21000"
+    And "bob,bobpublic.com:[18000, 19000],every_5m" names host "bobpublic.com" on ports "18000,19000"
+    And "bob,[2001:db8::1]:[18000,19000],every_5m" names host "2001:db8::1" on ports "18000,19000"
+    And "bob,bobpublic.com:19000,every_5m" names host "bobpublic.com" on ports "19000"
+    And "bob,bobpublic.com:[19000,18000,19000],every_5m" names host "bobpublic.com" on ports "19000,18000"
+
+  # The other half of naming several ports. What a peer can reach you on is
+  # the set of ports you send *from*, never the ones you aim at - so being
+  # reachable on three means binding three, and each probes the peer's
+  # matching port so both sides end up reachable on all of them.
+  @AC-438
+  Scenario: Punching listens on every configured local port
+    Given a settings file that says
+      """
+      direct_punch=on
+      direct_punch_port=18000,19000,21000
+      direct_punch_to=bob,bobpublic.com:[18000,19000,21000],every_1m
+      """
+    Then direct punching is on
+    And this client punches from ports "18000,19000,21000"
+
+  @AC-438
+  Scenario: One local port is still the ordinary case
+    Given a settings file that says
+      """
+      direct_punch=on
+      direct_punch_port=18000
+      """
+    Then this client punches from ports "18000"
+
+  @AC-434
+  Scenario: Every named port is probed on the same slot
+    Given alice lists bob on three ports, only one of which reaches him
+    When the next slot on their shared grid comes round
+    Then alice and bob have a direct link to each other
+
+  @AC-435
+  Scenario: A port outside the allowed range is refused with a reason
+    Then "bob,203.0.113.9:9000,every_5m" is refused, naming the allowed port range
+    And "bob,203.0.113.9:[18000,70000],every_5m" is refused, naming the allowed port range
+    And "bob,203.0.113.9:[],every_5m" is refused for naming no port at all
+    And "bob,203.0.113.9,every_5m" names host "203.0.113.9" on the well-known port
+
+  @AC-436
+  Scenario: The port that answered is the only one probed until the link is lost
+    Given alice lists bob on three ports, only one of which reaches him
+    When the next slot on their shared grid comes round
+    Then alice and bob have a direct link to each other
+    And alice probes bob on only the port he answered from
+    When bob disappears and the link goes quiet
+    Then alice probes bob on all three ports again
 
   @AC-213
   Scenario: A line with a typo says so instead of quietly doing nothing

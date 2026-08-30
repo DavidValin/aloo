@@ -1731,8 +1731,11 @@ direct_punch_to=marco,marcohost.com,every_1h
 ```
 
 The host may be an IPv4 address, an IPv6 address or a hostname, and may
-carry its own port (`bobpublic.com:9000`, `[2001:db8::1]:9000`); with no
-port, both sides assume one well-known default. The frequency is one of
+carry its own port (`bobpublic.com:19000`, `[2001:db8::1]:19000`) or a
+bracketed list of them (`bobpublic.com:[18000,19000,21000]`); with no port
+at all, both sides assume one well-known default. A written port must fall
+between `DIRECT_PUNCH_PORT_MIN` and `DIRECT_PUNCH_PORT_MAX`, and one that
+does not is refused with the range in the reason. The frequency is one of
 `every_1m`, `every_5m`, `every_10m`, `every_15m`, `every_20m`, `every_25m`,
 `every_30m`, `every_35m`, `every_40m`, `every_45m`, `every_50m`, `every_55m`,
 `every_1h`.
@@ -1741,6 +1744,39 @@ Unlike §7.1's UDP socket, whose port is ephemeral because the server
 relays whatever it happened to be given, this one is fixed: with nothing
 relaying it, a port both sides agreed on in advance is the only thing a
 peer can aim at.
+
+**Why a line may name several ports.** Agreeing on a port is not the same
+as arriving on it. Many NATs rewrite the source port of an outgoing
+datagram whether or not the one asked for is free, so a peer aiming at the
+agreed number reaches a port their router never mapped, and nothing
+connects however well the two clocks agree. Which port survives is the
+router's choice, not either peer's, so no single agreed number fixes it.
+
+Being reachable on several ports is the other half of it, and it is not
+the same thing as aiming at several: what a peer can reach this client on
+is exactly the set of ports it sends **from**, never the ones it sends
+**to**. So `direct_punch_port` takes a list too, one UDP socket is bound
+per port, and probes are **paired** - the socket bound to 18000 probes the
+peer's 18000. Two clients running the same list are then reachable on all
+of it, and a router leaving any single port unrewritten is enough. A peer
+port with no matching local socket is still probed, from the primary, so
+two settings files that disagree punch with fewer chances rather than
+none; a local port already in use is reported and skipped, and only all of
+them failing falls back to an ephemeral socket.
+
+Every datagram to a peer leaves from the socket that peer's own traffic
+arrived on - the only one their NAT holds a mapping for - including the
+probes of an attempt their own probe opened.
+
+Naming several and probing them all on the same slot only needs *one* to
+get through. Every named port is probed with the same `DirectPing`, and
+the first reply settles it: the address a peer actually answers from is
+locked in and becomes the only one probed thereafter, because the port
+that answered is the port that survived both routers' rewriting. Losing
+the link clears that lock and the next attempt sweeps the whole list
+again - a NAT that reassigns its mappings makes the port that worked no
+longer the port that works - re-resolving a named host with it, an address
+having moved being the other reason a link drops for good.
 
 **1. The slot grid, in place of signaling.** Hole punching only works if
 both sides send at roughly the same moment - that is what the candidate

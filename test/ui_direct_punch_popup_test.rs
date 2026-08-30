@@ -20,7 +20,7 @@ fn target(nickname: &str, host: &str, port: u16, frequency_minutes: u32) -> Dire
         nickname: nickname.to_string(),
         device_id: None,
         host: host.to_string(),
-        port,
+        ports: vec![port],
         frequency: PunchFrequency::parse(&format!("every_{frequency_minutes}m")).unwrap(),
     }
 }
@@ -379,6 +379,101 @@ fn enter_on_a_non_save_field_does_nothing() {
 // Saving and deleting
 // ---------------------------------------------------------------------
 
+/// The file spells a port list in brackets only because there its commas
+/// would collide with the commas between the line's own fields; a field of
+/// its own has no such collision, so it reads the way a list reads.
+/// @requirement AC-437
+#[test]
+fn the_port_field_takes_a_comma_separated_list() {
+    let mut state = joined_general_with(vec![]);
+    open_punches(&mut state);
+    press(&mut state, KeyCode::Char('a'));
+    type_str(&mut state, "bob");
+    press(&mut state, KeyCode::Tab);
+    type_str(&mut state, "bobhost.example");
+    press(&mut state, KeyCode::Tab);
+    type_str(&mut state, "18000, 19000");
+    press(&mut state, KeyCode::Tab);
+    press(&mut state, KeyCode::Tab); // -> Save
+
+    match press(&mut state, KeyCode::Enter) {
+        Some(UiAction::SaveDirectPunchTargets(targets)) => {
+            assert_eq!(targets.len(), 1);
+            assert_eq!(targets[0].host, "bobhost.example");
+            assert_eq!(targets[0].ports, [18000, 19000]);
+        }
+        other => panic!("expected SaveDirectPunchTargets, got {other:?}"),
+    }
+}
+
+/// The range check has to reach the person typing, not just the file
+/// parser - a port silently dropped here would look exactly like a peer who
+/// never answers, which is the failure AC-213 exists to prevent.
+/// @requirement AC-437
+#[test]
+fn a_port_outside_the_range_is_refused_inline_and_nothing_is_saved() {
+    let mut state = joined_general_with(vec![]);
+    open_punches(&mut state);
+    press(&mut state, KeyCode::Char('a'));
+    type_str(&mut state, "bob");
+    press(&mut state, KeyCode::Tab);
+    type_str(&mut state, "bobhost.example");
+    press(&mut state, KeyCode::Tab);
+    type_str(&mut state, "18000, 9000");
+    press(&mut state, KeyCode::Tab);
+    press(&mut state, KeyCode::Tab); // -> Save
+
+    assert_eq!(press(&mut state, KeyCode::Enter), None, "nothing is saved");
+    let punches = &state.settings_popup.as_ref().unwrap().punches;
+    assert!(punches.rows.is_empty(), "the bad row must not be added");
+    let edit = punches.edit.as_ref().expect("the form stays open to be corrected");
+    let error = edit.error.as_ref().expect("the reason is shown inline");
+    assert!(
+        error.contains("10000") && error.contains("65000"),
+        "the inline reason must name the range, got {error:?}"
+    );
+}
+
+/// @requirement AC-437
+#[test]
+fn an_existing_rows_ports_come_back_comma_separated() {
+    let mut state = joined_general_with(vec![]);
+    open_punches(&mut state);
+    state.set_direct_punch_rows(vec![
+        DirectPunchTarget::parse("bob,bobhost.example:[18000,19000,21000],every_1m").unwrap(),
+    ]);
+    press(&mut state, KeyCode::Char('e'));
+    let edit = state.settings_popup.as_ref().unwrap().punches.edit.as_ref().unwrap();
+    assert_eq!(edit.port, "18000, 19000, 21000");
+}
+
+/// Offering the default back as a number would put a port outside the
+/// accepted range into a field that then refuses to save it.
+/// @requirement AC-437
+#[test]
+fn a_row_on_the_default_port_comes_back_with_an_empty_port_field() {
+    let mut state = joined_general_with(vec![]);
+    open_punches(&mut state);
+    state.set_direct_punch_rows(vec![
+        DirectPunchTarget::parse("bob,bobhost.example,every_1m").unwrap(),
+    ]);
+    press(&mut state, KeyCode::Char('e'));
+    let edit = state.settings_popup.as_ref().unwrap().punches.edit.as_ref().unwrap();
+    assert_eq!(edit.port, "");
+
+    // And saving it untouched keeps the default rather than being refused.
+    press(&mut state, KeyCode::Tab);
+    press(&mut state, KeyCode::Tab);
+    press(&mut state, KeyCode::Tab);
+    press(&mut state, KeyCode::Tab); // -> Save
+    match press(&mut state, KeyCode::Enter) {
+        Some(UiAction::SaveDirectPunchTargets(targets)) => {
+            assert_eq!(targets[0].ports, [DEFAULT_DIRECT_PUNCH_PORT]);
+        }
+        other => panic!("expected SaveDirectPunchTargets, got {other:?}"),
+    }
+}
+
 /// @requirement AC-291
 #[test]
 fn saving_a_valid_new_target_appends_it_and_requests_a_save() {
@@ -398,7 +493,7 @@ fn saving_a_valid_new_target_appends_it_and_requests_a_save() {
             assert_eq!(targets.len(), 1);
             assert_eq!(targets[0].nickname, "bob");
             assert_eq!(targets[0].host, "bobhost.example");
-            assert_eq!(targets[0].port, DEFAULT_DIRECT_PUNCH_PORT);
+            assert_eq!(targets[0].ports, [DEFAULT_DIRECT_PUNCH_PORT]);
         }
         other => panic!("expected SaveDirectPunchTargets, got {other:?}"),
     }

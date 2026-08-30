@@ -168,7 +168,7 @@ async fn a_direct_punch_peers_device_resolves_from_the_link_not_an_announce() {
             nickname: "bob".into(),
             device_id: Some("phone".into()),
             host: "127.0.0.1".into(),
-            port: 1,
+            ports: vec![19000],
             frequency: aloo::settings::PunchFrequency::parse("every_1h").unwrap(),
         }],
         0,

@@ -115,6 +115,69 @@ pub fn sweep_abandoned_setups(cfg: &OtpCliConfig, still_owed: &[String]) -> u64 
     reclaimed
 }
 
+/// The filename prefixes `client::otp::temp_content_path` hands out.
+///
+/// These are working files - a recording on its way in or out of `otp
+/// --encrypt`/`--decrypt`, a recovered payload being re-sent - written
+/// directly in `working_dir` rather than in `.tmp/`, because some of them
+/// have to outlive the process deliberately (a staged voice recording
+/// awaiting its peer's acceptance is exactly that, and its restart
+/// recovery depends on still finding it). So they cannot simply be swept
+/// with `.tmp/`, and until now nothing swept them at all.
+const CONTENT_TEMP_PREFIXES: &[&str] = &[
+    "otp-voice-plain-",
+    "otp-send-",
+    "otp-recv-voice-",
+    "otp-recv-voice-cipher-",
+    "otp-recover-send-",
+    "otp-recv-recovered-",
+];
+
+/// Removes working files left behind by a process that died mid-operation,
+/// keeping any that something durable still points at.
+///
+/// Two of these prefixes name *plaintext*: the PCM staged on its way into
+/// `otp --encrypt`, and a recording decrypted on the way in. On the happy
+/// path each is wiped the instant it has served its purpose, but a process
+/// killed in between left it sitting in `~/.aloo/otp/` indefinitely, with
+/// nothing that ever looked at it again - the one sweep next door only
+/// clears `.tmp/`, and the setup sweep only considers directories. Scrubbed
+/// rather than unlinked, since that is what they may hold.
+///
+/// `keep` is every path the store still references (`OtpStore::
+/// content_sends` - a staged recording waiting for its peer to accept,
+/// which is *supposed* to outlive the process and whose recovery would
+/// break if this removed it). Anything else under these prefixes belongs
+/// to nobody: the operation that made it is over, and no code path can
+/// reach it again.
+pub fn sweep_orphaned_content(cfg: &OtpCliConfig, keep: &[PathBuf]) -> usize {
+    let Ok(entries) = std::fs::read_dir(&cfg.working_dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !CONTENT_TEMP_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+        {
+            continue;
+        }
+        if keep.iter().any(|kept| kept == &path) {
+            continue;
+        }
+        secure_remove_file(&path);
+        removed += 1;
+    }
+    removed
+}
+
 /// Total size of the files directly inside `dir` - for reporting how much
 /// an abandoned setup gave back, nothing more.
 fn dir_bytes(dir: &Path) -> u64 {

@@ -103,6 +103,35 @@ async fn two_targets(w: &mut AlooWorld) {
     w.ui_mut().set_direct_punch_rows(rows);
 }
 
+/// Drives the Direct Punch tab's add form the way a person does: 'a' to
+/// open it, then Tab between nickname, host and ports, then on to Save.
+#[when(expr = "I add a punch for {string} at {string} with ports {string}")]
+async fn add_punch_with_ports(w: &mut AlooWorld, nickname: String, host: String, ports: String) {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    use crate::steps::ui_common::press_key;
+    press_key(w, KeyCode::Char('a'), KeyModifiers::NONE);
+    for (text, next) in [(nickname, true), (host, true), (ports, true)] {
+        for c in text.chars() {
+            press_key(w, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        if next {
+            press_key(w, KeyCode::Tab, KeyModifiers::NONE);
+        }
+    }
+    // Past the frequency selector and onto Save.
+    press_key(w, KeyCode::Tab, KeyModifiers::NONE);
+    press_key(w, KeyCode::Enter, KeyModifiers::NONE);
+}
+
+#[then(expr = "the saved punch names host {string} on ports {string}")]
+async fn saved_punch_ports(w: &mut AlooWorld, host: String, ports: String) {
+    let expected: Vec<u16> = ports.split(',').map(|p| p.trim().parse().unwrap()).collect();
+    let popup = w.ui_mut().settings_popup.as_ref().expect("the settings popup is open");
+    let row = popup.punches.rows.last().expect("a punch was saved");
+    assert_eq!(row.host, host);
+    assert_eq!(row.ports, expected);
+}
+
 #[when("arriving voice is turned off")]
 async fn autoplay_off(w: &mut AlooWorld) {
     w.ui_mut().voice_autoplay = false;

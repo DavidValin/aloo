@@ -785,7 +785,7 @@ async fn an_active_link_that_goes_quiet_is_lost_and_re_established() {
         .await;
     let addr: SocketAddr = "203.0.113.8:6666".parse().unwrap();
     let t0 = tokio::time::Instant::now().into_std();
-    alice.on_datagram_at(addr, PunchDatagram::Pong { link_nonce }, t0);
+    alice.on_datagram_at(0, addr, PunchDatagram::Pong { link_nonce }, t0);
     assert!(alice.is_active(bob_id));
 
     // Still within the window: nothing has been heard, but not for long
@@ -821,11 +821,11 @@ async fn a_peers_keepalive_keeps_an_otherwise_idle_link_alive() {
         .await;
     let addr: SocketAddr = "203.0.113.9:7777".parse().unwrap();
     let t0 = tokio::time::Instant::now().into_std();
-    alice.on_datagram_at(addr, PunchDatagram::Pong { link_nonce }, t0);
+    alice.on_datagram_at(0, addr, PunchDatagram::Pong { link_nonce }, t0);
 
     // A beat arrives well into the idle window, resetting it.
     let beat_at = t0 + LINK_IDLE_TIMEOUT - Duration::from_secs(5);
-    alice.on_datagram_at(addr, PunchDatagram::Keepalive { link_nonce }, beat_at);
+    alice.on_datagram_at(0, addr, PunchDatagram::Keepalive { link_nonce }, beat_at);
 
     // A moment that would have been past the deadline without that beat.
     alice.tick_at(t0 + LINK_IDLE_TIMEOUT + Duration::from_secs(1));

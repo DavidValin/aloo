@@ -164,7 +164,11 @@ impl UiState {
                     match edit.focus {
                         DirectPunchField::Nickname => edit.nickname.push(c),
                         DirectPunchField::Host => edit.host.push(c),
-                        DirectPunchField::Port if c.is_ascii_digit() => edit.port.push(c),
+                        // Commas and the space people naturally type after
+                        // one, so a list can be entered as it reads.
+                        DirectPunchField::Port if c.is_ascii_digit() || c == ',' || c == ' ' => {
+                            edit.port.push(c)
+                        }
                         DirectPunchField::Port | DirectPunchField::Frequency | DirectPunchField::Save => {}
                     }
                 }
@@ -185,10 +189,20 @@ impl UiState {
             return None;
         }
         let frequency = PUNCH_FREQUENCIES[edit.frequency_index];
-        let host = if edit.port.trim().is_empty() {
-            edit.host.clone()
-        } else {
-            format!("{}:{}", edit.host, edit.port.trim())
+        // The field is comma-separated because that is how a list of
+        // anything reads; the settings line spells the same list in
+        // brackets, because there its commas would collide with the
+        // commas separating the line's own fields.
+        let typed: Vec<&str> = edit
+            .port
+            .split(',')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .collect();
+        let host = match typed.as_slice() {
+            [] => edit.host.clone(),
+            [only] => format!("{}:{}", edit.host, only),
+            many => format!("{}:[{}]", edit.host, many.join(",")),
         };
         let line = format!("{},{},every_{}m", edit.nickname.trim(), host, frequency);
         let target = match DirectPunchTarget::parse(&line) {
@@ -248,7 +262,19 @@ pub(crate) fn edit_state_for(index: usize, target: &DirectPunchTarget) -> Direct
         // than silently dropping it.
         nickname: target.target_key(),
         host: target.host.clone(),
-        port: target.port.to_string(),
+        // The implicit default is shown as an empty field, the way it was
+        // entered - offering it back as a number would put a port outside
+        // the accepted range into a field that then refuses to save.
+        port: if target.ports == [crate::settings::DEFAULT_DIRECT_PUNCH_PORT] {
+            String::new()
+        } else {
+            target
+                .ports
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        },
         frequency_index,
         focus: DirectPunchField::Nickname,
         error: None,
@@ -294,10 +320,9 @@ pub(crate) fn render_punch_list(
         .iter()
         .map(|t| {
             ListItem::new(Line::from(format!(
-                "{}  {}:{}  {}",
+                "{}  {}  {}",
                 t.target_key(),
-                t.host,
-                t.port,
+                host_display(t),
                 t.frequency
             )))
         })
@@ -311,6 +336,19 @@ pub(crate) fn render_punch_list(
     let mut list_state = ListState::default();
     list_state.select(Some(popup.selected.min(popup.rows.len() - 1)));
     frame.render_stateful_widget(list, list_area, &mut list_state);
+}
+
+/// One row's host and ports, spelled the way the settings line spells
+/// them so the list reads the same in both places.
+fn host_display(t: &DirectPunchTarget) -> String {
+    match t.ports.as_slice() {
+        [only] => format!("{}:{only}", t.host),
+        many => format!(
+            "{}:[{}]",
+            t.host,
+            many.iter().map(u16::to_string).collect::<Vec<_>>().join(",")
+        ),
+    }
 }
 
 /// A bordered field, styled exactly like `ui_connect_popup`'s own
@@ -344,8 +382,13 @@ pub(crate) fn render_edit_form(frame: &mut Frame, area: Rect, edit: &DirectPunch
     } else {
         edit.port.clone()
     };
-    let port_inner =
-        render_bordered_field(frame, rows[2], "port", &port_display, edit.focus == DirectPunchField::Port);
+    let port_inner = render_bordered_field(
+        frame,
+        rows[2],
+        "ports (comma-separated)",
+        &port_display,
+        edit.focus == DirectPunchField::Port,
+    );
     let frequency = PunchFrequency::parse(&format!("every_{}m", PUNCH_FREQUENCIES[edit.frequency_index]))
         .expect("every PUNCH_FREQUENCIES entry parses");
     render_bordered_field(

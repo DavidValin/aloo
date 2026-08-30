@@ -188,3 +188,54 @@ fn secure_remove_dir_recurses_into_generated_key_subdirectories() {
          cleaned out too, not left holding raw pad bytes"
     );
 }
+
+/// Working files from a process that died mid-operation are collected at
+/// the next start - two of these prefixes name plaintext (PCM on the way
+/// into the encrypt, a recording decrypted on the way in), and nothing
+/// used to sweep them at all: `sweep` only clears `.tmp/`, and the setup
+/// sweep only considers directories.
+/// @requirement AC-433
+#[test]
+fn orphaned_working_files_are_scrubbed_at_startup() {
+    let cfg = config_at(temp_dir("orphan-content"));
+    std::fs::create_dir_all(&cfg.working_dir).unwrap();
+    let plain = cfg.working_dir.join("otp-voice-plain-123-456");
+    let sealed = cfg.working_dir.join("otp-send-123-456");
+    let decrypted = cfg.working_dir.join("otp-recv-voice-123-456");
+    for path in [&plain, &sealed, &decrypted] {
+        std::fs::write(path, b"leftover").unwrap();
+    }
+    // Something that is none of ours, and a real keychain dir: untouched.
+    let unrelated = cfg.working_dir.join("otp_store");
+    std::fs::write(&unrelated, b"not mine").unwrap();
+    std::fs::create_dir_all(cfg.working_dir.join(".keychain")).unwrap();
+
+    let removed = otp_staging::sweep_orphaned_content(&cfg, &[]);
+
+    assert_eq!(removed, 3);
+    assert!(!plain.exists(), "plaintext PCM must not survive");
+    assert!(!sealed.exists());
+    assert!(!decrypted.exists(), "decrypted audio must not survive");
+    assert!(unrelated.exists(), "an unrelated file is left alone");
+    assert!(cfg.working_dir.join(".keychain").exists(), "and so is the keychain");
+}
+
+/// The exception that makes the sweep safe: a recording staged awaiting
+/// its peer's acceptance is *supposed* to outlive the process, and its
+/// restart recovery depends on still finding it.
+/// @requirement AC-433
+#[test]
+fn a_staged_recording_still_awaiting_acceptance_is_kept() {
+    let cfg = config_at(temp_dir("orphan-keep"));
+    std::fs::create_dir_all(&cfg.working_dir).unwrap();
+    let awaiting = cfg.working_dir.join("otp-voice-plain-999-111");
+    let orphan = cfg.working_dir.join("otp-voice-plain-999-222");
+    std::fs::write(&awaiting, b"still owed").unwrap();
+    std::fs::write(&orphan, b"nobody's").unwrap();
+
+    let removed = otp_staging::sweep_orphaned_content(&cfg, &[awaiting.clone()]);
+
+    assert_eq!(removed, 1);
+    assert!(awaiting.exists(), "what the store still points at survives");
+    assert!(!orphan.exists());
+}

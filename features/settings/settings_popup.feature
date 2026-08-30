@@ -18,6 +18,19 @@ Feature: Changing settings without leaving the app
     And the settings popup asked the session to load the file
     And the focused setting is "global_ptt_enabled"
 
+  # The settings line spells a port list in brackets, because there its
+  # commas would collide with the commas between the line's own fields.
+  # In the editor there is no such collision, so the field reads the way a
+  # list of anything reads.
+  @AC-437
+  Scenario: The punch editor takes several ports separated by commas
+    Given I am connected and viewing a channel
+    And I press Ctrl+S
+    And I press Tab
+    And I press Down
+    When I add a punch for "bob" at "bobhost.example" with ports "18000, 19000"
+    Then the saved punch names host "bobhost.example" on ports "18000,19000"
+
   @AC-397
   Scenario: Tab walks the three tabs and comes back round
     Given I am connected and viewing a channel

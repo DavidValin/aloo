@@ -1120,7 +1120,7 @@ async fn pad_only_side(
             nickname: peer_name.to_string(),
             device_id: None,
             host: "127.0.0.1".to_string(),
-            port: 1,
+            ports: vec![19000],
             frequency: aloo::settings::PunchFrequency::parse("every_1m").expect("valid"),
         }],
         0,

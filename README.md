@@ -599,7 +599,23 @@ direct_punch_to=bob,bobpublic.com,every_1m
 direct_punch_to=marco,marcohost.com,every_1h
 ```
 
-One line per person: their nickname, where their client is (an IPv4 address, an IPv6 address, or a hostname — add `:9000` for a port other than the default 7879), and how often to try. The frequency can be `every_1m`, `every_5m`, `every_10m`, `every_15m`, `every_20m`, `every_25m`, `every_30m`, `every_35m`, `every_40m`, `every_45m`, `every_50m`, `every_55m` or `every_1h`.
+One line per person: their nickname, where their client is (an IPv4 address, an IPv6 address, or a hostname — add `:19000` for a port other than the default 7879), and how often to try. A port you write has to be between 10000 and 65000. The frequency can be `every_1m`, `every_5m`, `every_10m`, `every_15m`, `every_20m`, `every_25m`, `every_30m`, `every_35m`, `every_40m`, `every_45m`, `every_50m`, `every_55m` or `every_1h`.
+
+**If it never connects, name several ports.** Most routers change the port your client sends from, so a single agreed number often arrives nowhere — and which one your router picks isn't up to you. List a few and aloo tries them all at once; only one has to get through:
+
+```
+direct_punch_to=bob,bobpublic.com:[18000,19000,21000],every_1m
+```
+
+For this to work both ways, listen on those ports as well — someone can only reach you on a port you *send from*, never one you merely aim at:
+
+```
+direct_punch_port=18000,19000,21000
+```
+
+Give each other the same list and you're both reachable on all of it, so a router that leaves any single one of them alone is enough to connect. A port already taken on your machine is skipped with a note and the rest carry on.
+
+The moment one answers, that's the only one it uses from then on. If the connection later drops, it goes back to trying all of them. In `Ctrl+S` you type the same list separated by commas.
 
 You don't have to hand-edit the file: **`Ctrl+S`**'s **Direct Punch** tab lists every configured target — `a` adds one, `Enter`/`e` edits the selected one, `d` deletes it, `Up`/`Down` walk the list and carry on to the next field at either end. Saving writes straight back to `~/.aloo/settings` and reconfigures the schedule immediately, no restart needed; so does the `direct_punch` switch above the list, and the No-IP fields below it. Once at least one target is configured, the header shows `<active>/<total> (next: <time>)` to its left — how many of your configured targets currently have a link, and how long until the soonest attempt — in green once every configured peer is connected and yellow otherwise.
 
@@ -613,7 +629,7 @@ Opening that note is also what proves who they are — it's checked against the 
 
 **If a punch succeeds but you have no key pinned for that name at all**, aloo asks before doing anything: "A connection was received directly to your public ip from an unknown nickname... Do you want to check which of your local keys matches this request?" Say yes and it runs a real check against every other `pq_hybrid` key you already hold — including one with an OTP session layered on top — never a guess, and if exactly one matches, offers to use it for the new name too. It never checks a pad-only pin this way, since that would mean running every one-time pad you hold against an unverified message. Nothing matching says so plainly, and declining either question costs nothing. Three genuinely failed checks from the same address, spread over at least two minutes within 10 hours, permanently blocks it — lift that yourself by editing `~/.aloo/banned_ips.log`. Never triggered for someone you never listed, or for anyone a server introduces.
 
-Two caveats. **Your client punches out from UDP port 7879 while this is on** — it's actively pinging the other side from that port, not just passively listening on it, and that's what gets through NAT with nothing to configure on your router: both of you punching at the same moment is what opens the path, not a forwarding rule. It can still fail against a stricter (symmetric) NAT or firewall, in which case forwarding that port — or picking a `direct_punch_port` you can forward — is the fallback. And **this opens a path, not a conversation**: aloo still needs to have learned that person's keys through a server at some point to encrypt anything to them.
+Two caveats. **Your client punches out from UDP port 7879 while this is on** (or whatever `direct_punch_port` says) — it's actively pinging the other side from that port, not just passively listening on it, and that's what gets through NAT with nothing to configure on your router: both of you punching at the same moment is what opens the path, not a forwarding rule. It can still fail if your router rewrites the port unpredictably for every destination (a symmetric NAT) or if either of you is behind carrier-grade NAT — listing several ports won't help there, and a server is the answer. And **this opens a path, not a conversation**: aloo still needs to have learned that person's keys through a server at some point to encrypt anything to them.
 
 **If your own address moves** (an ordinary home connection) or you connect from different locations, give a No-IP hostname to the peers punching at you instead of a raw address, and let aloo keep it updated:
 
