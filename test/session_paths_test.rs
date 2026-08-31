@@ -822,19 +822,33 @@ async fn turning_the_queue_off_leaves_sealed_pad_messages_to_drain() {
     );
 }
 
-/// Once there is nothing spent left waiting, the switch is free to take
-/// effect fully.
+/// What the switch governs is whether messages are held for someone who is
+/// not there - not whether the pad has a queue at all.
+///
+/// A stop-and-wait send has to wait somewhere whenever a previous message
+/// is still unacknowledged, and waiting is exactly when a crash loses it.
+/// So it waits sealed and on disk in both positions of the switch; held in
+/// memory as plaintext instead, as it once was, a restart lost it silently
+/// and it sat unencrypted on the way there.
 /// @requirement AC-421
 #[tokio::test]
-async fn turning_the_queue_off_takes_full_effect_once_nothing_is_waiting() {
+async fn the_pad_queue_outlives_the_switch_being_turned_off() {
     let (mut session, _ui, _peers) = session_and_ui("pad-empty", "me").await;
     assert_eq!(session.otp_queued_total(), 0);
 
     session.set_queue_send_messages(false);
-    assert_eq!(session.otp_queued_total(), 0);
     assert!(
-        !session.queue_sealed_otp_for_test("alice-bob", 0),
-        "with nothing left to desynchronize the queue is gone, and nothing new is sealed into it"
+        !session.queue_send_messages_enabled(),
+        "the policy really is off"
+    );
+    assert!(
+        session.queue_sealed_otp_for_test("alice-bob", 0),
+        "a pad send still has somewhere sealed and durable to wait its turn"
+    );
+    assert_eq!(
+        session.otp_queued_total(),
+        1,
+        "and what is waiting is on disk, where a restart cannot lose it"
     );
 }
 
@@ -884,5 +898,43 @@ async fn a_gate_naming_something_other_than_the_front_re_sends_nothing() {
             .retry_outstanding_otp_send_for_test(&mut ui, ALICE, "alice-bob")
             .await,
         "the gate belongs to a send this queue is not responsible for"
+    );
+}
+
+/// Deriving the pad keychain and store from the client's own home is what
+/// lets two sessions in one process hold separate pads. It must not move
+/// anything for a real client: their `id_store` sits in `aloo_dir`, so
+/// "beside it" has to resolve to exactly where these already were.
+/// @requirement AC-440
+#[test]
+fn a_real_clients_pad_paths_are_unchanged_by_deriving_them_from_its_home() {
+    let real_id_store = aloo::client::idstore::default_path();
+    assert_eq!(
+        aloo::client::otp_store::OtpStore::path_beside(&real_id_store),
+        aloo::client::otp_store::OtpStore::default_path(),
+        "an installed pad store must not move"
+    );
+    assert_eq!(
+        aloo::client::otp_cli::OtpCliConfig::resolve_beside(&real_id_store).working_dir,
+        aloo::client::otp_cli::OtpCliConfig::resolve().working_dir,
+        "nor an installed keychain - moving it would strand every pad in it"
+    );
+}
+
+/// And two clients with homes of their own get keychains of their own,
+/// which is the whole point: one shared keychain cannot hold both halves
+/// of a pad pair, since they share a contact name.
+/// @requirement AC-440
+#[test]
+fn two_clients_with_separate_homes_get_separate_pad_paths() {
+    let a = std::env::temp_dir().join("aloo-paths-a/ids_store");
+    let b = std::env::temp_dir().join("aloo-paths-b/ids_store");
+    assert_ne!(
+        aloo::client::otp_store::OtpStore::path_beside(&a),
+        aloo::client::otp_store::OtpStore::path_beside(&b),
+    );
+    assert_ne!(
+        aloo::client::otp_cli::OtpCliConfig::resolve_beside(&a).working_dir,
+        aloo::client::otp_cli::OtpCliConfig::resolve_beside(&b).working_dir,
     );
 }

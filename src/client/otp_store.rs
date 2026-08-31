@@ -268,6 +268,16 @@ pub struct PendingContentSend {
 
 impl OtpStore {
     /// `~/.aloo/otp_store` (`crate::platform::aloo_dir`).
+    /// `default_path`, taken from the client's own home - see
+    /// `otp_cli::OtpCliConfig::resolve_beside` for why, and for why a real
+    /// client's path is unchanged by it.
+    pub fn path_beside(id_store_path: &Path) -> PathBuf {
+        id_store_path
+            .parent()
+            .map(|home| home.join("otp_store"))
+            .unwrap_or_else(Self::default_path)
+    }
+
     pub fn default_path() -> PathBuf {
         crate::platform::aloo_dir().join("otp_store")
     }

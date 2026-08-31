@@ -1200,3 +1200,22 @@ async fn seal_pad_only_messages(w: &mut AlooWorld, count: u64, contact: String) 
     }
     w.sealed_pad_count += count;
 }
+
+
+/// AC-440: the wait before an unacknowledged pad send is repeated. That
+/// the retry re-sends sealed bytes rather than encrypting new ones, and
+/// leaves a recording still streaming alone, are measured properties -
+/// pinned by `an_unacknowledged_send_is_retried_once_its_wait_runs_out`
+/// and `the_retry_timer_never_disturbs_a_recording_still_being_sent`,
+/// which count pad positions and inspect the in-flight stream set. Neither
+/// is restated here as an assertion this step could not actually make.
+#[then("a pad send waits a bounded time for its acknowledgement before retrying")]
+async fn retry_wait_is_bounded(_w: &mut AlooWorld) {
+    let first = aloo::client::otp::OTP_RETRY_DELAY;
+    let ceiling = aloo::client::otp::OTP_RETRY_MAX_DELAY;
+    assert!(
+        !first.is_zero(),
+        "a retry that fired immediately would repeat a send still in flight"
+    );
+    assert!(first <= ceiling, "the backoff climbs towards its ceiling, not past it");
+}

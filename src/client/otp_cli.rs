@@ -52,6 +52,25 @@ impl OtpCliConfig {
     /// detection path. Loads settings itself (rather than taking a
     /// `&Settings`) since the client connect path doesn't otherwise thread
     /// `Settings` down to session construction.
+    /// `resolve`, but with the keychain taken from the client's own home
+    /// rather than the process-global one - the same derivation
+    /// `otp_outbox::dir_beside` uses, and for the same reason: two
+    /// sessions in one process (a live two-client test) must not share one
+    /// keychain, since a pad pair's two halves would then overwrite each
+    /// other under the one contact name.
+    ///
+    /// For a real client `id_store_path` is `<aloo_dir>/ids_store`, whose
+    /// parent is `aloo_dir` - so this resolves to exactly what `resolve`
+    /// does and no installed keychain moves.
+    pub fn resolve_beside(id_store_path: &Path) -> Self {
+        let mut cfg = Self::resolve();
+        if let Some(home) = id_store_path.parent() {
+            cfg.working_dir = home.join("otp");
+            let _ = std::fs::create_dir_all(&cfg.working_dir);
+        }
+        cfg
+    }
+
     pub fn resolve() -> Self {
         let settings =
             crate::settings::Settings::load_or_create(&crate::settings::default_path())

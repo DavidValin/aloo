@@ -4313,3 +4313,1481 @@ async fn a_recording_front_is_retried_from_its_own_file() {
         "the release ran again - key setup and chunks from the queue's own file"
     );
 }
+
+/// The reported failure: a voice message queued while the peer is away
+/// does arrive when they come back, and every text written *afterwards* -
+/// with them plainly online - then never leaves.
+///
+/// Nothing about being online makes a send skip the queue, so a text
+/// written then is an ordinary entry behind the recording, and the only
+/// thing that can release it is the recording's own acknowledgement. This
+/// walks the whole sequence with the real ack path: offer out, offer
+/// acked, recording released, text written while they are online,
+/// recording acked. The text has to be on the wire at the end of it.
+/// @requirement AC-423
+/// @requirement AC-430
+#[tokio::test]
+async fn a_text_written_after_a_queued_voice_is_released_still_goes_out() {
+    if !require_otp() {
+        return;
+    }
+    let (mut alice, mut bob, contact) = pair("queued-voice-then-text", Id::Pq, Id::Pq).await;
+    let _ = &mut alice;
+    bob.ui.mark_otp_active(ALICE);
+    bob.ui.on_user_offline(ALICE);
+    aloo::client::session::forget_peer_for_test(&mut bob.ui, &mut bob.session, ALICE);
+
+    send_voice(&mut bob, &contact, b"the voice that arrives just fine".to_vec()).await;
+    assert_eq!(
+        bob.session.otp_queued_total(),
+        2,
+        "a queued voice is an offer plus its recording"
+    );
+
+    // She comes back.
+    let her = aloo::proto::UserInfo {
+        id: ALICE,
+        name: "alice".into(),
+        public_key_der: bob.peer_der.clone(),
+        key_mode: aloo::proto::KeyMode::PqHybrid,
+    };
+    bob.ui.known_users.insert(ALICE, her);
+    bob.session
+        .peer_link_mut()
+        .open_unpunched_link_for_test(ALICE);
+    bob.session
+        .inject_p2p_event(aloo::client::p2p::P2pEvent::LinkStatusChanged {
+            peer: ALICE,
+            status: aloo::client::p2p::LinkStatus::Active,
+        });
+    aloo::client::session::drain_p2p_events(&mut NullSink, &mut bob.ui, &mut bob.session)
+        .await
+        .expect("draining should not fail");
+
+    // The offer goes, and her acknowledgement of it releases the recording.
+    let (offer_seq, offer_proof) = {
+        let state = bob.session.otp_store_mut().get(&contact).expect("armed");
+        (
+            state.pending_unacked_out_seq.expect("the offer is outstanding"),
+            state.pending_ack_proof.expect("its proof is recorded"),
+        )
+    };
+    ack(&mut bob, ALICE, offer_seq, offer_proof).await;
+
+    let (content_seq, content_proof) = {
+        let state = bob.session.otp_store_mut().get(&contact).expect("armed again");
+        (
+            state
+                .pending_unacked_out_seq
+                .expect("the recording takes the gate next"),
+            state.pending_ack_proof.expect("with its own proof"),
+        )
+    };
+    assert_ne!(content_seq, offer_seq, "the recording has its own position");
+
+    // She is online now. This is the text that went missing.
+    send_text(&mut bob, &contact, "written after she came back").await;
+
+    // Her acknowledgement of the recording, which is what should let it go.
+    ack(&mut bob, ALICE, content_seq, content_proof).await;
+
+    let sent = bob.session.sent_or_queued_payloads(ALICE);
+    assert!(
+        sent.iter()
+            .any(|p| matches!(p, P2pPayload::OtpEnvelope { .. })),
+        "the text written while she was online has to leave once the recording is \
+         acknowledged: {sent:?}"
+    );
+    // It having *left* is the gate now standing on the text's own
+    // position: the queue holds a sent entry until its acknowledgement, so
+    // it still being there says nothing either way.
+    let gate = bob
+        .session
+        .otp_store_mut()
+        .get(&contact)
+        .and_then(|s| s.pending_unacked_out_seq);
+    assert!(
+        gate.is_some_and(|s| s > content_seq),
+        "the text has to take the gate once the recording is acknowledged, \
+         instead of sitting behind a gate that never opened: {gate:?}"
+    );
+}
+
+/// The same sequence as above, but with the *receiving* side really run
+/// instead of its acknowledgement assumed: the queued voice is delivered,
+/// unwrapped, its content decrypted and finished. What that has to produce
+/// is an acknowledgement naming the recording's own slot - the one thing
+/// that reopens the sender's gate, and so the only thing that lets a text
+/// written after the peer came back ever leave.
+/// @requirement AC-423
+#[tokio::test]
+async fn a_released_recording_is_acknowledged_by_the_receiver() {
+    if !require_otp() {
+        return;
+    }
+    let dir = scratch("released-recording-ack");
+    let (mut alice, mut bob, contact) = pair("released-recording-ack", Id::Pq, Id::Pq).await;
+    bob.ui.mark_otp_active(ALICE);
+    alice.ui.mark_otp_active(BOB);
+    bob.ui.on_user_offline(ALICE);
+    aloo::client::session::forget_peer_for_test(&mut bob.ui, &mut bob.session, ALICE);
+
+    let pcm = b"a recording queued while she was away".to_vec();
+    send_voice(&mut bob, &contact, pcm.clone()).await;
+
+    // The recording's sealed copy, captured before its release consumes
+    // the entry - it stands in for the chunked transport below.
+    let (cipher_path, rec_stream_id) = bob
+        .session
+        .otp_outbox_ref()
+        .expect("the queue is on")
+        .entries_for(&contact)
+        .iter()
+        .find_map(|e| e.recording())
+        .expect("the recording is queued as its own entry");
+
+    // She comes back and the offer goes out.
+    let her = aloo::proto::UserInfo {
+        id: ALICE,
+        name: "alice".into(),
+        public_key_der: bob.peer_der.clone(),
+        key_mode: aloo::proto::KeyMode::PqHybrid,
+    };
+    bob.ui.known_users.insert(ALICE, her);
+    bob.session
+        .peer_link_mut()
+        .open_unpunched_link_for_test(ALICE);
+    bob.session
+        .inject_p2p_event(aloo::client::p2p::P2pEvent::LinkStatusChanged {
+            peer: ALICE,
+            status: aloo::client::p2p::LinkStatus::Active,
+        });
+    aloo::client::session::drain_p2p_events(&mut NullSink, &mut bob.ui, &mut bob.session)
+        .await
+        .expect("draining should not fail");
+
+    let (stream_id, offer_seq, envelope, sender_device_id) = bob
+        .session
+        .sent_or_queued_payloads(ALICE)
+        .into_iter()
+        .find_map(|p| match p {
+            P2pPayload::OtpVoiceOffer {
+                stream_id,
+                seq,
+                envelope,
+                sender_device_id,
+                ..
+            } => Some((stream_id, seq, envelope, sender_device_id)),
+            _ => None,
+        })
+        .expect("the offer goes out when she returns");
+    assert_eq!(stream_id, rec_stream_id, "offer and recording are one stream");
+
+    // She unwraps the offer and acknowledges it; that releases the recording.
+    aloo::client::otp::on_voice_offer(
+        &mut NullSink,
+        &mut alice.session,
+        &mut alice.ui,
+        BOB,
+        stream_id,
+        offer_seq,
+        envelope,
+        sender_device_id,
+    )
+    .await;
+    let (a_seq, a_proof) = last_ack(&mut alice);
+    assert_eq!(a_seq, offer_seq, "she acknowledges the offer's own slot");
+    ack(&mut bob, ALICE, a_seq, a_proof).await;
+
+    let content_seq = bob
+        .session
+        .sent_or_queued_payloads(ALICE)
+        .into_iter()
+        .find_map(|p| match p {
+            P2pPayload::OtpFileContentSeq { seq, .. } => Some(seq),
+            _ => None,
+        })
+        .expect("the recording is released with a slot of its own");
+
+    // The content arrives: announcement first, then the bytes.
+    aloo::client::otp::on_content_seq(&mut alice.session, &mut alice.ui, BOB, stream_id, content_seq)
+        .await;
+    let mut pending = alice
+        .session
+        .take_otp_incoming_receive(BOB, stream_id)
+        .expect("the offer registered the receive");
+    assert_eq!(
+        pending.seq,
+        Some(content_seq),
+        "the announcement names the slot the content spent"
+    );
+    let arrived = dir.join("arrived.otp");
+    std::fs::copy(&cipher_path, &arrived).expect("the sealed recording is still on disk");
+    pending.temp_path = arrived;
+    aloo::client::otp::finish_incoming_file(
+        &mut alice.session,
+        &mut alice.ui,
+        BOB,
+        stream_id,
+        pending,
+    )
+    .await;
+
+    // This is the whole point: without it the sender's gate never reopens
+    // and every later message sits behind it forever.
+    let (b_seq, b_proof) = last_ack(&mut alice);
+    assert_eq!(
+        b_seq, content_seq,
+        "the released recording has to be acknowledged on its own slot"
+    );
+
+    ack(&mut bob, ALICE, b_seq, b_proof).await;
+    assert!(
+        !bob.gate_held(&contact),
+        "and that acknowledgement reopens the gate for everything written after"
+    );
+}
+
+/// Whether a row is claiming to be waiting on the queue.
+fn row_queued(side: &mut Side, peer: UserId, msg_id: u64) -> Option<bool> {
+    side.ui
+        .private_rooms
+        .values()
+        .flat_map(|r| r.log.iter())
+        .chain(side.ui.channels.iter().flat_map(|c| c.log.iter()))
+        .find_map(|e| {
+            let d = e.delivery.as_ref()?;
+            if d.msg_id != msg_id {
+                return None;
+            }
+            d.recipients.iter().find(|r| r.id == peer).map(|r| r.queued)
+        })
+}
+
+/// A message the durable queue holds behind an un-acknowledged send has to
+/// say so on its row.
+///
+/// Held silently it looks exactly like one that went out, which is what
+/// makes a genuinely stuck gate indistinguishable from a healthy round
+/// trip - the reason the in-memory path this replaced always surfaced a
+/// held message. That surfacing was lost when the queue became durable:
+/// its notice sits behind `otp_outbox.is_none()`, so with queueing on
+/// nothing said anything at all.
+/// @requirement AC-439
+#[tokio::test]
+async fn a_message_the_queue_holds_says_so_on_its_row() {
+    if !require_otp() {
+        return;
+    }
+    let (mut alice, mut bob, contact) = pair("queued-row-visible", Id::Pq, Id::Pq).await;
+    let _ = &mut alice;
+    bob.ui.mark_otp_active(ALICE);
+
+    // The first goes straight out and takes the gate.
+    let first = send_text(&mut bob, &contact, "the one holding the gate").await;
+    assert_eq!(
+        row_queued(&mut bob, ALICE, first),
+        Some(false),
+        "a message that reached the wire is not waiting on anything"
+    );
+    assert!(bob.gate_held(&contact), "and it holds the gate");
+
+    // The second can only wait, and has to say so.
+    let second = send_text(&mut bob, &contact, "the one that waits").await;
+    assert_eq!(
+        row_queued(&mut bob, ALICE, second),
+        Some(true),
+        "a message held behind the gate must not look identical to a sent one"
+    );
+
+    // The first is acknowledged, which releases the second.
+    let (seq, proof) = {
+        let state = bob.session.otp_store_mut().get(&contact).expect("armed");
+        (
+            state.pending_unacked_out_seq.expect("outstanding"),
+            state.pending_ack_proof.expect("recorded"),
+        )
+    };
+    ack(&mut bob, ALICE, seq, proof).await;
+    assert_eq!(
+        row_queued(&mut bob, ALICE, second),
+        Some(false),
+        "released onto the wire, so it must stop claiming to wait"
+    );
+}
+
+/// A lost acknowledgement on a link that never drops used to wedge a
+/// contact's queue for good: the gate opens only on an ack, and the only
+/// retry fired on a link-up that was never coming. The timer closes that,
+/// and re-sends the bytes already sealed rather than encrypting anything
+/// new - so it can neither spend a second pad position nor deliver twice.
+/// @requirement AC-440
+#[tokio::test]
+async fn an_unacknowledged_send_is_retried_once_its_wait_runs_out() {
+    if !require_otp() {
+        return;
+    }
+    let (mut alice, mut bob, contact) = pair("retry-on-timer", Id::Pq, Id::Pq).await;
+    let _ = &mut alice;
+    bob.ui.mark_otp_active(ALICE);
+    // Genuinely reachable, not merely attempted: the timer deliberately
+    // leaves a peer whose link is not up to the queue, so a half-open link
+    // would make this pass or fail on timing rather than on the property.
+    bob.session.peer_link_mut().mark_active_for_test(ALICE);
+    // The sweep finds its candidates through `known_users`, so she has to
+    // be someone this side knows, not merely someone it has a link to.
+    bob.ui.known_users.insert(
+        ALICE,
+        aloo::proto::UserInfo {
+            id: ALICE,
+            name: "alice".into(),
+            public_key_der: bob.peer_der.clone(),
+            key_mode: aloo::proto::KeyMode::PqHybrid,
+        },
+    );
+
+    send_text(&mut bob, &contact, "the one whose ack goes missing").await;
+    assert!(bob.gate_held(&contact), "it is outstanding");
+    // Measured after the send, so what this pins is that *retrying* costs
+    // nothing - the send's own spend is not what is in question.
+    let spent_before = bob.pad_spent(&contact).await;
+
+    // Each precondition the sweep depends on, so a failure below names
+    // which one is not holding rather than just "nothing was sent".
+    assert_eq!(
+        aloo::client::otp::active_contact_name(&bob.session, &bob.ui, ALICE).as_deref(),
+        Some(contact.as_str()),
+        "the sweep resolves its contact through known_users"
+    );
+    let gate = bob
+        .session
+        .otp_store_mut()
+        .get(&contact)
+        .and_then(|s| s.pending_unacked_out_seq);
+    let front = bob
+        .session
+        .otp_outbox_ref()
+        .and_then(|o| o.front(&contact))
+        .and_then(|e| e.seq());
+    assert_eq!(front, gate, "the queue front is the message the gate names");
+
+    // Before the wait is up, the sweep only starts the clock.
+    let t0 = std::time::Instant::now();
+    aloo::client::otp::tick_otp_retries(&mut NullSink, &mut bob.session, &mut bob.ui, t0).await;
+    assert_eq!(
+        bob.session.otp_retry_attempts_for_test(ALICE),
+        Some(0),
+        "a send that is merely young must not be repeated"
+    );
+
+    // Once it runs out, the same bytes go again.
+    let later = t0 + aloo::client::otp::OTP_RETRY_DELAY + std::time::Duration::from_secs(1);
+    aloo::client::otp::tick_otp_retries(&mut NullSink, &mut bob.session, &mut bob.ui, later).await;
+    assert_eq!(
+        bob.session.otp_retry_attempts_for_test(ALICE),
+        Some(1),
+        "an acknowledgement that never came has to put the send back on the wire"
+    );
+    assert_eq!(
+        bob.pad_spent(&contact).await,
+        spent_before,
+        "and it must re-send what was sealed, never seal anything new"
+    );
+    // The re-send really is the queue front going out again, not a no-op.
+    assert!(
+        bob.session
+            .retry_outstanding_otp_send_for_test(&mut bob.ui, ALICE, &contact)
+            .await,
+        "the gate's own message is what goes back on the wire"
+    );
+    assert_eq!(
+        bob.pad_spent(&contact).await,
+        spent_before,
+        "still nothing newly sealed"
+    );
+
+    // And an acknowledgement puts the wait away entirely.
+    let (seq, proof) = {
+        let state = bob.session.otp_store_mut().get(&contact).expect("armed");
+        (
+            state.pending_unacked_out_seq.expect("outstanding"),
+            state.pending_ack_proof.expect("recorded"),
+        )
+    };
+    ack(&mut bob, ALICE, seq, proof).await;
+    aloo::client::otp::tick_otp_retries(&mut NullSink, &mut bob.session, &mut bob.ui, later).await;
+    assert_eq!(
+        bob.session.otp_retry_attempts_for_test(ALICE),
+        None,
+        "nothing is owed, so nothing is waiting on anything"
+    );
+}
+
+/// The guard that matters most. Re-releasing a recording whose worker is
+/// still streaming would put two workers on one `stream_id`; their
+/// interleaved chunks decrypt to something neither side's `ack_proof`
+/// matches, which turns a lost acknowledgement - recoverable - into a gate
+/// that can never open. The timer must leave a live transfer alone.
+/// @requirement AC-440
+#[tokio::test]
+async fn the_retry_timer_never_disturbs_a_recording_still_being_sent() {
+    if !require_otp() {
+        return;
+    }
+    let (mut alice, mut bob, contact) = pair("retry-skips-live-stream", Id::Pq, Id::Pq).await;
+    let _ = &mut alice;
+    bob.ui.mark_otp_active(ALICE);
+    bob.ui.on_user_offline(ALICE);
+    aloo::client::session::forget_peer_for_test(&mut bob.ui, &mut bob.session, ALICE);
+    send_voice(&mut bob, &contact, b"still going out".to_vec()).await;
+
+    let her = aloo::proto::UserInfo {
+        id: ALICE,
+        name: "alice".into(),
+        public_key_der: bob.peer_der.clone(),
+        key_mode: aloo::proto::KeyMode::PqHybrid,
+    };
+    bob.ui.known_users.insert(ALICE, her);
+    bob.session
+        .peer_link_mut()
+        .open_unpunched_link_for_test(ALICE);
+    bob.session
+        .inject_p2p_event(aloo::client::p2p::P2pEvent::LinkStatusChanged {
+            peer: ALICE,
+            status: aloo::client::p2p::LinkStatus::Active,
+        });
+    aloo::client::session::drain_p2p_events(&mut NullSink, &mut bob.ui, &mut bob.session)
+        .await
+        .expect("draining should not fail");
+
+    // Release the recording, then declare its worker still running.
+    let (offer_seq, offer_proof) = {
+        let state = bob.session.otp_store_mut().get(&contact).expect("armed");
+        (
+            state.pending_unacked_out_seq.expect("outstanding"),
+            state.pending_ack_proof.expect("recorded"),
+        )
+    };
+    ack(&mut bob, ALICE, offer_seq, offer_proof).await;
+    let streaming = bob
+        .session
+        .otp_outbox_ref()
+        .expect("the queue is on")
+        .front(&contact)
+        .and_then(|e| e.recording())
+        .map(|(_, stream_id)| stream_id)
+        .expect("the recording is the front now");
+    assert!(
+        bob.session.otp_sending_streams_contains_for_test(streaming),
+        "releasing a recording registers its worker as running"
+    );
+
+    // Genuinely reachable. Injecting a `LinkStatusChanged` event only
+    // feeds the handler - it does not put the link into `Active` - and the
+    // sweep skips a peer it cannot reach, so without this the tick would
+    // turn back before any guard was even consulted and this test would
+    // pass whether or not the guard exists.
+    bob.session.peer_link_mut().mark_active_for_test(ALICE);
+    assert!(bob.session.peer_link_mut().is_active(ALICE));
+
+    let sent_before = bob.session.sent_or_queued_payloads(ALICE).len();
+    let spent_before = bob.pad_spent(&contact).await;
+    let (next_out_before, gate_before) = {
+        let s = bob.session.otp_store_mut().get(&contact).expect("armed");
+        (s.next_out_seq, s.pending_unacked_out_seq)
+    };
+
+    // Hammered while the worker is still alive. A second release here is
+    // what would put two workers on one stream_id, whose interleaved
+    // chunks decrypt to something no ack_proof matches - the gate could
+    // then never open again.
+    let t0 = std::time::Instant::now();
+    for step in [0u64, 1, 5, 6, 29, 30, 60, 600] {
+        let at = t0 + std::time::Duration::from_secs(step);
+        // Still alive: a worker proves that by making progress, and one
+        // mid-stream keeps doing so.
+        bob.session.register_sending_stream_for_test(streaming, at);
+        aloo::client::otp::tick_otp_retries(&mut NullSink, &mut bob.session, &mut bob.ui, at).await;
+        // The schedule is only created *after* the guards, so its absence
+        // is what says the sweep turned back. Deliberately not the queued
+        // payload count: on a live link a re-released recording leaves
+        // immediately, so that count is unchanged either way and would
+        // pass with the guard deleted.
+        assert_eq!(
+            bob.session.otp_retry_attempts_for_test(ALICE),
+            None,
+            "a recording still being streamed must not be released again (at +{step}s)"
+        );
+        assert_eq!(
+            bob.session.sent_or_queued_payloads(ALICE).len(),
+            sent_before,
+            "and nothing was queued for her either (at +{step}s)"
+        );
+    }
+
+    assert_eq!(
+        bob.pad_spent(&contact).await,
+        spent_before,
+        "and no pad is spent by any of it"
+    );
+    let s = bob.session.otp_store_mut().get(&contact).expect("still armed");
+    assert_eq!(s.next_out_seq, next_out_before, "no position reserved");
+    assert_eq!(
+        s.pending_unacked_out_seq, gate_before,
+        "the gate still names the recording, not something new"
+    );
+    assert!(
+        bob.session.otp_sending_streams_contains_for_test(streaming),
+        "and the one live worker is still the only one"
+    );
+}
+
+/// A retry must never cut across a seal that is mid-operation: the store's
+/// write-ahead intent is standing, `record_sent` has not run, and a second
+/// pass would race the tool over one pad.
+/// @requirement AC-440
+#[tokio::test]
+async fn the_retry_timer_stands_off_while_an_encrypt_is_in_flight() {
+    if !require_otp() {
+        return;
+    }
+    let (mut alice, mut bob, contact) = pair("retry-skips-encrypt", Id::Pq, Id::Pq).await;
+    let _ = &mut alice;
+    bob.ui.mark_otp_active(ALICE);
+    bob.session.peer_link_mut().mark_active_for_test(ALICE);
+    bob.ui.known_users.insert(
+        ALICE,
+        aloo::proto::UserInfo {
+            id: ALICE,
+            name: "alice".into(),
+            public_key_der: bob.peer_der.clone(),
+            key_mode: aloo::proto::KeyMode::PqHybrid,
+        },
+    );
+    send_text(&mut bob, &contact, "outstanding").await;
+    assert!(bob.gate_held(&contact));
+
+    // A seal in progress for this contact.
+    bob.session.otp_store_mut().set_encrypt_intent(
+        &contact,
+        aloo::client::otp_store::PendingOtpContent::Text { channel: None },
+    );
+    assert!(bob.session.otp_store_mut().encrypt_in_flight(&contact));
+
+    // Everything the pad's integrity rests on, before the sweep runs.
+    let spent_before = bob.pad_spent(&contact).await;
+    let (next_out_before, gate_before, intent_before) = {
+        let s = bob.session.otp_store_mut().get(&contact).expect("armed");
+        (s.next_out_seq, s.pending_unacked_out_seq, s.encrypt_intent.clone())
+    };
+    let front_before = bob
+        .session
+        .otp_outbox_ref()
+        .and_then(|o| o.front(&contact))
+        .and_then(|e| e.seq());
+
+    // Hammered, not sampled: every moment the timer could plausibly fire,
+    // repeatedly, while the seal is still in flight.
+    let t0 = std::time::Instant::now();
+    for step in [0u64, 1, 5, 6, 30, 60, 61, 600] {
+        let at = t0 + std::time::Duration::from_secs(step);
+        aloo::client::otp::tick_otp_retries(&mut NullSink, &mut bob.session, &mut bob.ui, at).await;
+        assert_eq!(
+            bob.session.otp_retry_attempts_for_test(ALICE),
+            None,
+            "an encrypt in flight must hold the retry off entirely (at +{step}s)"
+        );
+    }
+
+    // And nothing about the pad moved: no position spent, no position
+    // reserved, the gate still naming the same message, the write-ahead
+    // intent still standing for the encrypt that owns it.
+    assert_eq!(
+        bob.pad_spent(&contact).await,
+        spent_before,
+        "no pad may be spent while a seal is in flight"
+    );
+    let s = bob.session.otp_store_mut().get(&contact).expect("still armed");
+    assert_eq!(s.next_out_seq, next_out_before, "no position may be reserved either");
+    assert_eq!(s.pending_unacked_out_seq, gate_before, "the gate still names its message");
+    assert_eq!(
+        s.encrypt_intent, intent_before,
+        "the intent belongs to the encrypt in flight - the sweep must not clear it"
+    );
+    assert_eq!(
+        bob.session
+            .otp_outbox_ref()
+            .and_then(|o| o.front(&contact))
+            .and_then(|e| e.seq()),
+        front_before,
+        "and the queue is exactly as it was"
+    );
+}
+
+/// A peer who is not reachable is the queue's business. Retrying at them
+/// would spend nothing and prove nothing.
+/// @requirement AC-440
+#[tokio::test]
+async fn the_retry_timer_ignores_a_peer_whose_link_is_down() {
+    if !require_otp() {
+        return;
+    }
+    let (mut alice, mut bob, contact) = pair("retry-skips-offline", Id::Pq, Id::Pq).await;
+    let _ = &mut alice;
+    bob.ui.mark_otp_active(ALICE);
+    bob.ui.known_users.insert(
+        ALICE,
+        aloo::proto::UserInfo {
+            id: ALICE,
+            name: "alice".into(),
+            public_key_der: bob.peer_der.clone(),
+            key_mode: aloo::proto::KeyMode::PqHybrid,
+        },
+    );
+    send_text(&mut bob, &contact, "outstanding").await;
+    assert!(bob.gate_held(&contact));
+    // Deliberately no link at all.
+    assert!(!bob.session.peer_link_mut().is_active(ALICE));
+
+    let late = std::time::Instant::now()
+        + aloo::client::otp::OTP_RETRY_MAX_DELAY
+        + std::time::Duration::from_secs(1);
+    aloo::client::otp::tick_otp_retries(&mut NullSink, &mut bob.session, &mut bob.ui, late).await;
+    assert_eq!(
+        bob.session.otp_retry_attempts_for_test(ALICE),
+        None,
+        "a peer this side cannot reach is not someone to retry at"
+    );
+}
+
+/// The guard must not become a stall of its own. A worker that dies
+/// without saying so leaves its stream registered; believed forever, it
+/// would block this contact's retries for the rest of the session.
+/// @requirement AC-440
+#[tokio::test]
+async fn a_send_worker_that_dies_silently_stops_blocking_retries() {
+    if !require_otp() {
+        return;
+    }
+    let (mut alice, mut bob, _contact) = pair("stalled-worker", Id::Pq, Id::Pq).await;
+    let _ = &mut alice;
+    let stream_id = 4242;
+    bob.session
+        .register_sending_stream_for_test(stream_id, std::time::Instant::now());
+    assert!(
+        bob.session.otp_sending_streams_contains_for_test(stream_id),
+        "a freshly spawned worker counts as sending"
+    );
+
+    // Silence past the grace period is taken as gone, so the retry that
+    // this guard was holding back may proceed.
+    let stalled = std::time::Instant::now()
+        + aloo::client::session::SEND_STALL_GRACE
+        + std::time::Duration::from_secs(1);
+    assert!(
+        !bob.session.is_stream_sending_for_test(stream_id, stalled),
+        "a worker that has shown no sign of life must stop being believed"
+    );
+}
+
+/// The sweep is only worth anything if the session loop actually runs it,
+/// and no unit test here can reach that call site: `run_connected_session`
+/// needs a server, sockets and an identity before it turns once.
+///
+/// Asserted against the source instead, the way `docs_test` checks its own
+/// mappings. Crude, and it proves only that the call is written - not that
+/// it fires. But the failure it catches is the one this feature is most
+/// exposed to: the wiring being dropped while every other test here keeps
+/// passing and a lost acknowledgement silently wedges the queue again.
+/// @requirement AC-440
+#[test]
+fn the_session_loop_runs_the_retry_sweep() {
+    let source = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/client/session/mod.rs"),
+    )
+    .expect("the session loop's source");
+    assert!(
+        source.contains("tick_otp_retries("),
+        "the retry sweep has to be called from the session loop, or an \
+         acknowledgement that never comes wedges the queue forever again"
+    );
+    assert!(
+        source.contains("last_otp_retry_sweep"),
+        "and throttled rather than run on every turn of a 150ms loop"
+    );
+}
+
+/// How many rows in this side's logs carry `text`.
+fn rows_saying(side: &mut Side, text: &str) -> usize {
+    let ui = &side.ui;
+    ui.private_rooms
+        .values()
+        .flat_map(|r| r.log.iter())
+        .chain(ui.channels.iter().flat_map(|c| c.log.iter()))
+        .filter(|e| match &e.body {
+            aloo::client::tui::ui::MessageBody::Text(t) => t.contains(text),
+            _ => false,
+        })
+        .count()
+}
+
+/// The whole loop, with a real peer on the other end and a genuinely lost
+/// acknowledgement: bob sends, alice receives and answers, her answer never
+/// arrives, bob re-sends what he sealed, and alice - who has already spent
+/// that position - answers again from her record instead of decrypting it
+/// a second time. Her second answer reaches him, the gate opens, and the
+/// message written behind it goes.
+///
+/// This is the failure the retry exists for, end to end: without it bob
+/// waits on an acknowledgement that already came and was lost, and
+/// everything behind it stops for good.
+/// @requirement AC-440
+#[tokio::test]
+async fn a_lost_acknowledgement_recovers_without_resealing_or_duplicating() {
+    if !require_otp() {
+        return;
+    }
+    let (mut alice, mut bob, contact) = pair("lost-ack-recovery", Id::Pq, Id::Pq).await;
+    alice.ui.mark_otp_active(BOB);
+    bob.ui.mark_otp_active(ALICE);
+
+    send_text(&mut bob, &contact, "the message whose ack goes missing").await;
+    let sealed_after_send = bob.pad_spent(&contact).await;
+
+    // She receives it and answers - and her answer is thrown away, exactly
+    // as a dropped frame on a link that never went down would be.
+    deliver_envelope(&mut alice, BOB, "bob", &mut bob).await;
+    assert_eq!(
+        rows_saying(&mut alice, "the message whose ack goes missing"),
+        1,
+        "she has it once"
+    );
+    let (lost_seq, _lost_proof) = last_ack(&mut alice);
+    assert!(
+        bob.gate_held(&contact),
+        "his gate stays shut, since nothing reached him"
+    );
+
+    // He puts the same sealed bytes back on the wire - the retry the timer
+    // drives, called here directly so the resend is observable.
+    assert!(
+        bob.session
+            .retry_outstanding_otp_send_for_test(&mut bob.ui, ALICE, &contact)
+            .await,
+        "the outstanding message is re-sent"
+    );
+    assert_eq!(
+        bob.pad_spent(&contact).await,
+        sealed_after_send,
+        "re-sending must seal nothing new"
+    );
+
+    // She sees a position she has already spent: answered from her record,
+    // never decrypted twice, and no second row.
+    deliver_envelope(&mut alice, BOB, "bob", &mut bob).await;
+    assert_eq!(
+        rows_saying(&mut alice, "the message whose ack goes missing"),
+        1,
+        "a re-sent message must not arrive twice"
+    );
+    let (again_seq, again_proof) = last_ack(&mut alice);
+    assert_eq!(
+        again_seq, lost_seq,
+        "she re-answers the same position rather than a new one"
+    );
+
+    // This time it gets through.
+    ack(&mut bob, ALICE, again_seq, again_proof).await;
+    assert!(
+        !bob.gate_held(&contact),
+        "the recovered acknowledgement opens the gate"
+    );
+
+    // And what was written behind it now goes. Taken from the end of his
+    // queue rather than the front: `queued` reads without draining, so the
+    // front is still the message just recovered.
+    send_text(&mut bob, &contact, "the one that was stuck behind it").await;
+    let (seq, msg_id, envelope, device) = bob
+        .queued()
+        .into_iter()
+        .filter_map(|p| match p {
+            P2pPayload::OtpEnvelope {
+                seq,
+                msg_id,
+                envelope,
+                sender_device_id,
+                ..
+            } => Some((seq, msg_id, envelope, sender_device_id)),
+            _ => None,
+        })
+        .next_back()
+        .expect("the message behind the gate goes out once it opens");
+    assert!(seq > again_seq, "and it takes the next position, not a repeat");
+    aloo::client::otp::on_message(
+        &mut alice.session,
+        &mut alice.ui,
+        None,
+        BOB,
+        "bob".into(),
+        seq,
+        msg_id,
+        envelope,
+        device,
+    )
+    .await
+    .expect("the receive path should not fail");
+    assert_eq!(
+        rows_saying(&mut alice, "the one that was stuck behind it"),
+        1,
+        "the queue moves again once the lost acknowledgement is recovered"
+    );
+}
+
+/// The retry's own state is deliberately in-memory: after a restart no
+/// worker is running and nothing is owed a schedule, so both start empty.
+/// What must not happen is the gate outliving the machinery that reopens
+/// it - a send left outstanding by a crash has to be retried by the
+/// restarted process, from the bytes on disk, without sealing anything.
+/// @requirement AC-440
+#[tokio::test]
+async fn an_outstanding_send_is_still_retried_after_the_sender_restarts() {
+    if !require_otp() {
+        return;
+    }
+    let (mut alice, mut bob, contact) = pair("retry-after-restart", Id::Pq, Id::Pq).await;
+    let _ = &mut alice;
+    bob.ui.mark_otp_active(ALICE);
+    bob.ui.known_users.insert(
+        ALICE,
+        aloo::proto::UserInfo {
+            id: ALICE,
+            name: "alice".into(),
+            public_key_der: bob.peer_der.clone(),
+            key_mode: aloo::proto::KeyMode::PqHybrid,
+        },
+    );
+    send_text(&mut bob, &contact, "outstanding when the process died").await;
+    let sealed = bob.pad_spent(&contact).await;
+
+    // The process restarts: the store comes back off disk, and the
+    // transient retry state does not come back at all.
+    let store_path = bob.session.otp_store_mut().path().to_path_buf();
+    let reloaded = aloo::client::otp_store::OtpStore::load(&store_path)
+        .expect("the store must reload");
+    *bob.session.otp_store_mut() = reloaded;
+    bob.session.forget_transient_otp_state_for_test();
+    bob.session.peer_link_mut().mark_active_for_test(ALICE);
+
+    assert!(
+        bob.gate_held(&contact),
+        "the gate survived the restart, as it must - it is on disk"
+    );
+    assert_eq!(
+        bob.session.otp_retry_attempts_for_test(ALICE),
+        None,
+        "and nothing is owed a schedule yet"
+    );
+
+    // The restarted process waits its turn, then re-sends what is on disk.
+    let t0 = std::time::Instant::now();
+    aloo::client::otp::tick_otp_retries(&mut NullSink, &mut bob.session, &mut bob.ui, t0).await;
+    let later = t0 + aloo::client::otp::OTP_RETRY_DELAY + std::time::Duration::from_secs(1);
+    aloo::client::otp::tick_otp_retries(&mut NullSink, &mut bob.session, &mut bob.ui, later).await;
+    assert_eq!(
+        bob.session.otp_retry_attempts_for_test(ALICE),
+        Some(1),
+        "a crash must not leave a send outstanding with nothing to reopen it"
+    );
+    assert_eq!(
+        bob.pad_spent(&contact).await,
+        sealed,
+        "and the restarted process re-sends what was sealed, never re-seals"
+    );
+}
+
+/// A crash mid-stream leaves no worker behind, so the guard that protects
+/// a live transfer must not keep protecting a dead one. The registry is
+/// in-memory precisely so a restart clears it.
+/// @requirement AC-440
+#[tokio::test]
+async fn a_stream_interrupted_by_a_crash_no_longer_blocks_its_retry() {
+    if !require_otp() {
+        return;
+    }
+    let (mut alice, mut bob, _contact) = pair("stream-crash-restart", Id::Pq, Id::Pq).await;
+    let _ = &mut alice;
+    let stream_id = 909;
+    bob.session
+        .register_sending_stream_for_test(stream_id, std::time::Instant::now());
+    assert!(bob.session.otp_sending_streams_contains_for_test(stream_id));
+
+    bob.session.forget_transient_otp_state_for_test();
+    assert!(
+        !bob.session.otp_sending_streams_contains_for_test(stream_id),
+        "a worker cannot outlive the process it ran in, so nothing may still \
+         be treated as streaming after a restart"
+    );
+}
+
+/// Network delay, not loss: an acknowledgement that arrives after the gate
+/// has already moved on. It names a position that is settled, so it must
+/// do nothing at all - not open the gate the next message is holding, and
+/// not retire that message from the queue unsent.
+/// @requirement AC-440
+#[tokio::test]
+async fn an_acknowledgement_delayed_past_its_own_message_changes_nothing() {
+    if !require_otp() {
+        return;
+    }
+    let (mut alice, mut bob, contact) = pair("late-ack", Id::Pq, Id::Pq).await;
+    let _ = &mut alice;
+    bob.ui.mark_otp_active(ALICE);
+
+    send_text(&mut bob, &contact, "first").await;
+    let (first_seq, first_proof) = {
+        let s = bob.session.otp_store_mut().get(&contact).expect("armed");
+        (
+            s.pending_unacked_out_seq.expect("outstanding"),
+            s.pending_ack_proof.expect("recorded"),
+        )
+    };
+    ack(&mut bob, ALICE, first_seq, first_proof).await;
+
+    // The next message takes the gate.
+    send_text(&mut bob, &contact, "second").await;
+    let (gate_before, front_before, spent_before, held_before) = {
+        let front = bob
+            .session
+            .otp_outbox_ref()
+            .and_then(|o| o.front(&contact))
+            .and_then(|e| e.seq());
+        let s = bob.session.otp_store_mut().get(&contact).expect("armed again");
+        (
+            s.pending_unacked_out_seq,
+            front,
+            bob.pad_spent(&contact).await,
+            bob.session.otp_queued_total(),
+        )
+    };
+    assert_ne!(gate_before, Some(first_seq), "the gate has moved on");
+
+    // The first message's acknowledgement finally turns up, twice over.
+    ack(&mut bob, ALICE, first_seq, first_proof).await;
+    ack(&mut bob, ALICE, first_seq, first_proof).await;
+
+    let s = bob.session.otp_store_mut().get(&contact).expect("still armed");
+    assert_eq!(
+        s.pending_unacked_out_seq, gate_before,
+        "a settled position's acknowledgement must not open the gate the next \
+         message is holding"
+    );
+    assert_eq!(
+        bob.session
+            .otp_outbox_ref()
+            .and_then(|o| o.front(&contact))
+            .and_then(|e| e.seq()),
+        front_before,
+        "nor retire the queued message it does not name"
+    );
+    assert_eq!(bob.session.otp_queued_total(), held_before, "the queue is intact");
+    assert_eq!(bob.pad_spent(&contact).await, spent_before, "and no pad moved");
+}
+
+/// The unqueued mode's version of the same failure. With
+/// `queue_send_messages` off there is no queue to retry from - the retry
+/// comes from the CLI's own one-deep `.last_sent` copy - and that recovery
+/// only ever ran on a link coming up. So a send whose acknowledgement was
+/// lost while the link stayed healthy wedged the contact exactly as the
+/// queued one used to, and the sweep has to reach this path too.
+/// @requirement AC-440
+#[tokio::test]
+async fn an_unqueued_send_whose_ack_is_lost_is_also_retried_on_the_timer() {
+    if !require_otp() {
+        return;
+    }
+    let (mut alice, mut bob, contact) = pair("unqueued-timer-retry", Id::Pq, Id::Pq).await;
+    // No queue at all: this is the mode the whole test is about.
+    bob.session.set_queue_send_messages(false);
+    assert!(
+        !bob.session.queue_send_messages_enabled(),
+        "this is the mode that does not hold messages for an absent peer"
+    );
+    bob.ui.mark_otp_active(ALICE);
+    bob.ui.known_users.insert(
+        ALICE,
+        aloo::proto::UserInfo {
+            id: ALICE,
+            name: "alice".into(),
+            public_key_der: bob.peer_der.clone(),
+            key_mode: aloo::proto::KeyMode::PqHybrid,
+        },
+    );
+
+    send_text(&mut bob, &contact, "unqueued, and never acknowledged").await;
+    assert!(bob.gate_held(&contact), "it is outstanding");
+    let sealed = bob.pad_spent(&contact).await;
+
+    // She is there - the link never went down, which is precisely why the
+    // link-up recovery never fires.
+    bob.session.peer_link_mut().mark_active_for_test(ALICE);
+    // Frames genuinely in flight to her, which is what moves when a
+    // recovery really sends. Deliberately not the *unsent* queue: on a
+    // live link a recovered send leaves at once, so that count would sit
+    // still whether or not anything was recovered.
+    let in_flight_before = bob.session.peer_link_mut().outbound_depth(ALICE);
+
+    let t0 = std::time::Instant::now();
+    aloo::client::otp::tick_otp_retries(&mut NullSink, &mut bob.session, &mut bob.ui, t0).await;
+    assert_eq!(
+        bob.session.peer_link_mut().outbound_depth(ALICE),
+        in_flight_before,
+        "nothing before the wait is up"
+    );
+
+    let later = t0 + aloo::client::otp::OTP_RETRY_DELAY + std::time::Duration::from_secs(1);
+    aloo::client::otp::tick_otp_retries(&mut NullSink, &mut bob.session, &mut bob.ui, later).await;
+    assert!(
+        bob.session.peer_link_mut().outbound_depth(ALICE) > in_flight_before,
+        "an unqueued send has to be recovered and re-sent too, or a lost \
+         acknowledgement wedges this contact for good"
+    );
+    assert_eq!(
+        bob.pad_spent(&contact).await,
+        sealed,
+        "recovered from the recorded ciphertext, never encrypted again"
+    );
+    assert!(
+        bob.gate_held(&contact),
+        "and it is still outstanding until she actually answers"
+    );
+    let _ = &mut alice;
+}
+
+/// The live scenario's exact shape, isolated: bob consumes the message and
+/// answers, his answer is lost, and he then comes back under a *different*
+/// `UserId` - which is what a server hands out on every reconnect. The
+/// retry has to follow him to the id he has now, or the gate stays shut
+/// against a peer who is plainly there and everything behind it stops.
+/// @requirement AC-440
+#[tokio::test]
+async fn a_lost_ack_still_recovers_when_the_peer_returns_under_a_new_id() {
+    if !require_otp() {
+        return;
+    }
+    let (mut alice, mut bob, contact) = pair("lost-ack-new-id", Id::Pq, Id::Pq).await;
+    alice.ui.mark_otp_active(BOB);
+    bob.ui.mark_otp_active(ALICE);
+
+    send_text(&mut bob, &contact, "answered, but the answer was lost").await;
+    deliver_envelope(&mut alice, BOB, "bob", &mut bob).await;
+    let _ = last_ack(&mut alice); // thrown away: this is the lost ack
+    assert!(bob.gate_held(&contact), "his gate is shut");
+
+    // She reconnects and the server gives her a new id.
+    let returned = UserId(4242);
+    aloo::client::session::forget_peer_for_test(&mut bob.ui, &mut bob.session, ALICE);
+    bob.ui.known_users.insert(
+        returned,
+        aloo::proto::UserInfo {
+            id: returned,
+            name: "alice".into(),
+            public_key_der: bob.peer_der.clone(),
+            key_mode: aloo::proto::KeyMode::PqHybrid,
+        },
+    );
+    bob.session
+        .peer_link_mut()
+        .mark_active_for_test(returned);
+    // Her `DeviceIdAnnounce`, which is what names the contact for a peer
+    // under an id this side has not seen before. A real reconnect always
+    // brings one; leaving it out would test a state that never occurs.
+    bob.session
+        .set_peer_device_id_for_test(returned, "test-device".to_string());
+
+    let t0 = std::time::Instant::now();
+    aloo::client::otp::tick_otp_retries(&mut NullSink, &mut bob.session, &mut bob.ui, t0).await;
+    let later = t0 + aloo::client::otp::OTP_RETRY_DELAY + std::time::Duration::from_secs(1);
+    aloo::client::otp::tick_otp_retries(&mut NullSink, &mut bob.session, &mut bob.ui, later).await;
+
+    assert_eq!(
+        bob.session.otp_retry_attempts_for_test(returned),
+        Some(1),
+        "the retry has to find her under the id she has now - keyed to the old \
+         one it never fires, and the gate never reopens"
+    );
+}
+
+/// The `msg_id` of the newest row carrying a delivery, whichever log it
+/// landed in.
+fn latest_row_msg_id(side: &mut Side) -> Option<u64> {
+    let ui = &side.ui;
+    ui.private_rooms
+        .values()
+        .flat_map(|r| r.log.iter())
+        .chain(ui.channels.iter().flat_map(|c| c.log.iter()))
+        .filter_map(|e| e.delivery.as_ref().map(|d| d.msg_id))
+        .last()
+}
+
+/// A voice message the queue holds has to say so too. It never passes
+/// through `send_now`, so the marking there does not reach it - and a
+/// queued recording that looked identical to one already sent is exactly
+/// the confusion this indicator exists to remove.
+/// @requirement AC-439
+#[tokio::test]
+async fn a_queued_voice_message_says_so_on_its_row_as_well() {
+    if !require_otp() {
+        return;
+    }
+    let (mut alice, mut bob, contact) = pair("queued-voice-row", Id::Pq, Id::Pq).await;
+    let _ = &mut alice;
+    bob.ui.mark_otp_active(ALICE);
+    bob.ui.on_user_offline(ALICE);
+    aloo::client::session::forget_peer_for_test(&mut bob.ui, &mut bob.session, ALICE);
+
+    // Something ahead of it holding the gate - which is what makes the
+    // voice message wait at all. The front of the queue is handed to the
+    // transport as soon as the gate is free, absent peer or not, so a
+    // voice message with nothing in front of it is genuinely not queued.
+    send_text(&mut bob, &contact, "the one holding the gate").await;
+    assert!(bob.gate_held(&contact), "the gate is held by the text");
+
+    // The row the send will attach itself to, keyed by the stream id it is
+    // about to use - the same shape the UI lays down when recording starts,
+    // and where `own_stream_msg_id` finds the `msg_id`.
+    let stream_id = bob.session.next_stream_id_for_test();
+    let (msg_id, delivery) = bob.ui.start_delivery(&[ALICE]);
+    bob.ui.push_outgoing_dm(
+        ALICE,
+        aloo::client::tui::ui::MessageBody::VoiceStreaming { stream_id },
+        Some(delivery),
+    );
+
+    send_voice(&mut bob, &contact, b"a recording nobody can take yet".to_vec()).await;
+
+    assert_eq!(
+        row_queued(&mut bob, ALICE, msg_id),
+        Some(true),
+        "a held voice message must not look identical to one already sent"
+    );
+}
+
+/// The write-ahead record is the only evidence that a position may have
+/// been spent without being recorded. Reconciliation used to discard it
+/// before it had read the pad, so one unreadable pad - a keychain briefly
+/// unavailable at startup - stranded that spend for good: not on that
+/// start, and not on any later one, leaving this side permanently a
+/// position behind the pad it is encrypting against.
+/// @requirement AC-424
+#[tokio::test]
+async fn an_unreadable_pad_does_not_discard_the_record_of_an_interrupted_send() {
+    if !require_otp() {
+        return;
+    }
+    let (mut alice, _bob, contact) = pair("intent-survives-unreadable", Id::Pq, Id::Pq).await;
+
+    alice.session.otp_store_mut().set_encrypt_intent(
+        &contact,
+        aloo::client::otp_store::PendingOtpContent::Text { channel: None },
+    );
+    let spent = aloo::client::otp::wrap_outgoing(&alice.otp, b"orphaned".to_vec(), &contact)
+        .await
+        .expect("the simulated pre-crash encrypt should succeed");
+    drop(spent);
+
+    // The pad cannot be read this once: the binary is not where it was.
+    let unreadable = aloo::client::otp_cli::OtpCliConfig {
+        binary_path: std::path::PathBuf::from("/nonexistent/otp"),
+        working_dir: alice.otp.working_dir.clone(),
+    };
+    let promoted =
+        aloo::client::otp::reconcile_orphaned_sends(&unreadable, alice.session.otp_store_mut())
+            .await;
+    assert!(promoted.is_empty(), "nothing can be promoted without reading the pad");
+    assert!(
+        alice
+            .session
+            .otp_store_mut()
+            .encrypt_in_flight(&contact),
+        "the record has to survive, or the spend it accounts for is stranded \
+         on every future start too"
+    );
+
+    // With the pad readable again, the very same record heals it.
+    let promoted =
+        aloo::client::otp::reconcile_orphaned_sends(&alice.otp, alice.session.otp_store_mut())
+            .await;
+    assert_eq!(promoted.len(), 1, "the kept record is what makes the later start work");
+    assert!(
+        !alice.session.otp_store_mut().encrypt_in_flight(&contact),
+        "and it is cleared once it has actually been acted on"
+    );
+}
+
+/// A send promoted from its write-ahead record has to keep the proof
+/// requirement every other send carries. Recorded with no proof,
+/// `record_acked` accepts *any* value for that position - so anyone who
+/// merely saw the packet could open the gate, which is exactly what the
+/// proof exists to prevent.
+/// @requirement AC-424
+#[tokio::test]
+async fn a_promoted_send_still_demands_a_real_acknowledgement() {
+    if !require_otp() {
+        return;
+    }
+    let (mut alice, _bob, contact) = pair("promoted-keeps-proof", Id::Pq, Id::Pq).await;
+
+    alice.session.otp_store_mut().set_encrypt_intent(
+        &contact,
+        aloo::client::otp_store::PendingOtpContent::Text { channel: None },
+    );
+    let sealed = aloo::client::otp::wrap_outgoing(&alice.otp, b"orphaned".to_vec(), &contact)
+        .await
+        .expect("the simulated pre-crash encrypt should succeed");
+    drop(sealed);
+
+    let promoted =
+        aloo::client::otp::reconcile_orphaned_sends(&alice.otp, alice.session.otp_store_mut())
+            .await;
+    assert_eq!(promoted.len(), 1, "the orphan is promoted");
+    let (seq, recorded) = {
+        let s = alice.session.otp_store_mut().get(&contact).expect("armed");
+        (
+            s.pending_unacked_out_seq.expect("outstanding"),
+            s.pending_ack_proof,
+        )
+    };
+    let proof = recorded.expect(
+        "a promoted send must carry the proof its acknowledgement will have to \
+         match, recovered from the tool's own kept copy",
+    );
+
+    // A wrong proof must not open it...
+    assert!(
+        !alice
+            .session
+            .otp_store_mut()
+            .record_acked(&contact, seq, Some([0xEE; 32])),
+        "an unproven acknowledgement must be refused, exactly as for any other send"
+    );
+    // ...and the real one must.
+    assert!(
+        alice
+            .session
+            .otp_store_mut()
+            .record_acked(&contact, seq, Some(proof)),
+        "and the genuine proof still opens it"
+    );
+}
+
+/// With queueing off, a message waiting on the gate is held in memory for
+/// ordering rather than durability - that much is the mode working as
+/// asked. What it must not do is look identical to a message already on
+/// the wire, which is the one kind of held send that used to say nothing
+/// at all.
+/// @requirement AC-439
+#[tokio::test]
+async fn an_unqueued_message_waiting_on_the_gate_says_so_on_its_row() {
+    if !require_otp() {
+        return;
+    }
+    let (mut alice, mut bob, contact) = pair("unqueued-row", Id::Pq, Id::Pq).await;
+    let _ = &mut alice;
+    bob.session.set_queue_send_messages(false);
+    assert!(
+        !bob.session.queue_send_messages_enabled(),
+        "this is the mode that does not hold messages for an absent peer"
+    );
+    bob.ui.mark_otp_active(ALICE);
+
+    let first = send_text(&mut bob, &contact, "the one holding the gate").await;
+    assert!(bob.gate_held(&contact));
+    assert_eq!(
+        row_queued(&mut bob, ALICE, first),
+        Some(false),
+        "the first went straight out"
+    );
+
+    let second = send_text(&mut bob, &contact, "the one waiting its turn").await;
+    assert_eq!(
+        row_queued(&mut bob, ALICE, second),
+        Some(true),
+        "a message waiting on the gate must not look like one already sent"
+    );
+
+    // Its turn comes and it stops claiming to wait.
+    let (seq, proof) = {
+        let s = bob.session.otp_store_mut().get(&contact).expect("armed");
+        (
+            s.pending_unacked_out_seq.expect("outstanding"),
+            s.pending_ack_proof.expect("recorded"),
+        )
+    };
+    ack(&mut bob, ALICE, seq, proof).await;
+    assert_eq!(
+        row_queued(&mut bob, ALICE, second),
+        Some(false),
+        "released, so no longer waiting"
+    );
+}
+
+/// What comes out of a decrypt is plaintext, and the tool writes it under
+/// the process umask - 0644 on a typical machine. Everything this side
+/// *writes* in the clear is already restricted; what it *receives* was
+/// not, which left a decoded voice message and a downloaded file readable
+/// by any other account on the machine until they were erased.
+/// @requirement AC-433
+#[cfg(unix)]
+#[tokio::test]
+async fn what_comes_out_of_a_decrypt_is_not_left_world_readable() {
+    use std::os::unix::fs::PermissionsExt;
+    if !require_otp() {
+        return;
+    }
+    let dir = scratch("decrypt-perms");
+    let (mut alice, mut bob, contact) = pair("decrypt-perms", Id::Pq, Id::Pq).await;
+    alice.ui.mark_otp_active(BOB);
+    bob.ui.mark_otp_active(ALICE);
+
+    // A file sealed by alice, delivered to bob as the content phase does.
+    let body = b"plaintext nobody else on this machine may read".to_vec();
+    let source = dir.join("source.bin");
+    std::fs::write(&source, &body).unwrap();
+    let sealed = dir.join("sealed.otp");
+    aloo::client::otp_cli::encrypt_file(&alice.otp, &contact, &source, &sealed, true)
+        .await
+        .expect("sealing the content");
+
+    let final_path = dir.join("downloaded.bin");
+    aloo::client::otp::finish_incoming_file(
+        &mut bob.session,
+        &mut bob.ui,
+        ALICE,
+        7,
+        OtpIncomingFileReceive {
+            contact_name: contact.clone(),
+            seq: None,
+            temp_path: sealed,
+            kind: OtpIncomingKind::File {
+                final_path: final_path.clone(),
+            },
+        },
+    )
+    .await;
+
+    assert_eq!(
+        std::fs::read(&final_path).unwrap(),
+        body,
+        "it decrypted, so there is something to protect"
+    );
+    let mode = std::fs::metadata(&final_path).unwrap().permissions().mode() & 0o077;
+    assert_eq!(
+        mode, 0,
+        "decrypted plaintext must not be readable by group or others \
+         (mode was {:o})",
+        std::fs::metadata(&final_path).unwrap().permissions().mode()
+    );
+}
+
+/// The failure the retry timer exists for, with the acknowledgement
+/// genuinely lost rather than the state constructed by hand.
+///
+/// Every other test of this drops the ack by simply not delivering it.
+/// Here the receiver really sends one and the transport really discards it
+/// (`drop_next_delivery_acks_for_test`), so what is exercised is her whole
+/// send path - and what the timer then recovers is a real loss, not a
+/// staged one.
+/// @requirement AC-440
+#[tokio::test]
+async fn a_genuinely_lost_acknowledgement_is_recovered_by_the_timer() {
+    if !require_otp() {
+        return;
+    }
+    let (mut alice, mut bob, contact) = pair("really-lost-ack", Id::Pq, Id::Pq).await;
+    alice.ui.mark_otp_active(BOB);
+    bob.ui.mark_otp_active(ALICE);
+    bob.ui.known_users.insert(
+        ALICE,
+        aloo::proto::UserInfo {
+            id: ALICE,
+            name: "alice".into(),
+            public_key_der: bob.peer_der.clone(),
+            key_mode: aloo::proto::KeyMode::PqHybrid,
+        },
+    );
+
+    // Her side will really lose the next acknowledgement it sends.
+    alice
+        .session
+        .peer_link_mut()
+        .drop_next_delivery_acks_for_test(1);
+
+    send_text(&mut bob, &contact, "the message whose ack is really lost").await;
+    let sealed = bob.pad_spent(&contact).await;
+    let envelope = take_envelope(&mut bob);
+    let first_seq = envelope.0;
+    aloo::client::otp::on_message(
+        &mut alice.session,
+        &mut alice.ui,
+        None,
+        BOB,
+        "bob".into(),
+        envelope.0,
+        envelope.1,
+        envelope.2.clone(),
+        envelope.3.clone(),
+    )
+    .await
+    .expect("the receive path should not fail");
+    assert!(
+        !alice
+            .queued()
+            .iter()
+            .any(|p| matches!(p, P2pPayload::OtpDeliveryAck { .. })),
+        "her acknowledgement was really discarded on the way out, not merely \
+         left undelivered by the test"
+    );
+    assert!(bob.gate_held(&contact), "so his gate stays shut");
+
+    // The timer's turn. She is reachable now, which is what makes the
+    // stall pathological: the link is fine, the ack simply never came.
+    bob.session.peer_link_mut().mark_active_for_test(ALICE);
+    let t0 = std::time::Instant::now();
+    let later = t0 + aloo::client::otp::OTP_RETRY_DELAY + std::time::Duration::from_secs(1);
+    aloo::client::otp::tick_otp_retries(&mut NullSink, &mut bob.session, &mut bob.ui, t0).await;
+    aloo::client::otp::tick_otp_retries(&mut NullSink, &mut bob.session, &mut bob.ui, later).await;
+    assert_eq!(
+        bob.session.otp_retry_attempts_for_test(ALICE),
+        Some(1),
+        "the timer has to put it back on the wire"
+    );
+    assert_eq!(
+        bob.pad_spent(&contact).await,
+        sealed,
+        "and re-send what was sealed, never seal again"
+    );
+
+    // The retried datagram is the same bytes, so this is what she receives.
+    // She has already spent that position, and answers from her record.
+    aloo::client::otp::on_message(
+        &mut alice.session,
+        &mut alice.ui,
+        None,
+        BOB,
+        "bob".into(),
+        envelope.0,
+        envelope.1,
+        envelope.2,
+        envelope.3,
+    )
+    .await
+    .expect("the receive path should not fail");
+    let (seq, proof) = last_ack(&mut alice);
+    assert_eq!(seq, first_seq, "she re-answers the same position");
+    ack(&mut bob, ALICE, seq, proof).await;
+    assert!(
+        !bob.gate_held(&contact),
+        "a genuinely lost acknowledgement has to be recoverable, or everything \
+         written after it stops for good"
+    );
+}

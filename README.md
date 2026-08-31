@@ -245,6 +245,13 @@ restart of aloo, not just across a blink.
 - **Not files.** A transfer is a live conversation — an offer they have to
   accept before a byte is sent — so replaying half of one an hour later
   isn't a delivery.
+- **Turning it off doesn't risk losing a pad message.** Under `/otp` only
+  one message is on the wire at a time, so anything you write while the
+  previous one is still unacknowledged has to wait its turn. It waits
+  sealed and on disk either way, and shows as `QUEUED` until it goes — so
+  closing aloo while something is waiting can't lose it. What the switch
+  turns off is holding messages for someone who isn't there at all: those
+  are refused up front, before any pad is spent.
 - **It keeps the encryption you sent it with.** What's stored is what
   would have gone on the wire, still sealed: `pq_hybrid`, or the
   one-time pad if an `/otp` session was open with them. Nothing readable

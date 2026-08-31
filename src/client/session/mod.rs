@@ -39,6 +39,12 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
+/// How long a send worker may go without a sign of life before the retry
+/// timer stops treating its stream as still going out. Generous next to a
+/// chunk interval, short next to a session: a worker that died silently
+/// must not block a contact's retries for the rest of one.
+pub const SEND_STALL_GRACE: Duration = Duration::from_secs(30);
+
 use crossterm::event::{Event, KeyCode, KeyModifiers};
 
 use crate::BoxError;
@@ -359,7 +365,37 @@ pub struct SessionState {
     pub(crate) otp_cancelled:
         std::collections::HashMap<UserId, std::sync::Arc<std::sync::atomic::AtomicBool>>,
     pub(crate) otp_ack_rows: std::collections::HashMap<(String, u64), u64>,
+    /// Streams a send worker is currently pushing out, so nothing starts a
+    /// second worker on one the first has not finished.
+    ///
+    /// The retry timer is what needs this, and needs it badly: re-releasing
+    /// a recording that is still streaming would put two workers on one
+    /// `stream_id`, and their interleaved chunks would decrypt to something
+    /// neither side's `ack_proof` matches - turning a lost acknowledgement,
+    /// which is recoverable, into a gate that can never open.
+    ///
+    /// Keyed by when the stream last showed a sign of life - its spawn, or
+    /// its most recent chunk - rather than by mere membership. A worker
+    /// that dies without saying so (a cancelled task, a panic) would
+    /// otherwise sit here forever and block this contact's retries for the
+    /// rest of the session, turning a guard against one stall into another
+    /// stall. Silence past `SEND_STALL_GRACE` is taken as gone.
+    pub(crate) otp_sending_streams: std::collections::HashMap<u64, Instant>,
+    /// When each peer's outstanding pad send may next be retried, and how
+    /// many attempts it has already had (which sets the backoff).
+    pub(crate) otp_retry: std::collections::HashMap<UserId, (Instant, u32)>,
     pub(crate) otp_out_queue: crate::client::otp::OtpOutQueue,
+    /// `settings::Settings::queue_send_messages`, held explicitly.
+    ///
+    /// The pad queue's *existence* used to stand in for this, which
+    /// conflated two separate things: where a message waits, and whether
+    /// this client holds messages at all. The queue is now always there -
+    /// a stop-and-wait send has to wait somewhere, and it waits sealed and
+    /// on disk so a restart cannot lose it - so the policy needs a home of
+    /// its own. Read by the decisions that genuinely are about the switch,
+    /// such as whether a recording is sealed when it is made or staged
+    /// until the peer accepts it.
+    pub(crate) queue_send_messages: bool,
     /// The durable, sealed, per-contact send queue for pad sessions
     /// (`client::otp_outbox`), or `None` while `queue_send_messages` is
     /// off. Loaded once at session start, so anything a previous run
@@ -780,25 +816,34 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
         auto_stop_tx,
         active_replay_id: None,
         peer_link,
-        otp_cli_cfg: crate::client::otp_cli::OtpCliConfig::resolve(),
+        otp_cli_cfg: crate::client::otp_cli::OtpCliConfig::resolve_beside(&client_home),
         otp_store: crate::client::otp_store::OtpStore::load(
-            &crate::client::otp_store::OtpStore::default_path(),
+            &crate::client::otp_store::OtpStore::path_beside(&client_home),
         )
         .unwrap_or_else(|_| {
             crate::client::otp_store::OtpStore::new_empty(
-                crate::client::otp_store::OtpStore::default_path(),
+                crate::client::otp_store::OtpStore::path_beside(&client_home),
             )
         }),
         otp_awaiting_consent: std::collections::HashMap::new(),
         otp_consented: std::collections::HashSet::new(),
         otp_cancelled: std::collections::HashMap::new(),
         otp_ack_rows: std::collections::HashMap::new(),
+        otp_sending_streams: std::collections::HashMap::new(),
+        otp_retry: std::collections::HashMap::new(),
         otp_out_queue: crate::client::otp::OtpOutQueue::new(),
-        otp_outbox: settings.queue_send_messages.then(|| {
-            crate::client::otp_outbox::OtpOutbox::load(
-                &crate::client::otp_outbox::dir_beside(&client_home),
-            )
-        }),
+        queue_send_messages: settings.queue_send_messages,
+        // Always present, unlike the ordinary outbox above. A pad send is
+        // stop-and-wait: anything written while a previous message is
+        // unacknowledged has to wait its turn, and waiting is exactly when
+        // a crash loses it. Held here it is sealed on write and on disk, so
+        // it survives - rather than sitting in memory as plaintext and
+        // vanishing. `queue_send_messages` still governs the ordinary
+        // outbox; for the pad the queue is what makes ordering possible at
+        // all, so there is nothing meaningful to switch off.
+        otp_outbox: Some(crate::client::otp_outbox::OtpOutbox::load(
+            &crate::client::otp_outbox::dir_beside(&client_home),
+        )),
         pending_receipts: crate::client::delivery::PendingReceipts::new(),
         otp_incoming_setup: HashMap::new(),
         otp_incoming_pads: HashMap::new(),
@@ -991,6 +1036,7 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
     let mut last_cpu_sample = Instant::now();
     let mut last_conn_sample = Instant::now();
     let mut last_otp_key_status_sample = Instant::now();
+    let mut last_otp_retry_sweep = Instant::now();
 
     // OTP mail (docs/PROTOCOL.md §17.3): a client with a local OTP
     // keychain immediately asks for everything the server holds for it -
@@ -1382,6 +1428,11 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
                 // for whichever DM is actually open right now - see
                 // `otp::poll_key_status`'s doc for why nothing else is
                 // polled.
+                if now.duration_since(last_otp_retry_sweep) >= Duration::from_secs(1) {
+                    crate::client::otp::tick_otp_retries(&mut wr, &mut session, &mut ui_state, now)
+                        .await;
+                    last_otp_retry_sweep = now;
+                }
                 if now.duration_since(last_otp_key_status_sample) >= Duration::from_secs(1) {
                     if let Some(peer) = ui_state.active_private_room {
                         crate::client::otp::poll_key_status(&session, &mut ui_state, peer).await;
@@ -1975,6 +2026,17 @@ impl SessionState {
             .unwrap_or(false)
     }
 
+    /// How many times the retry sweep has put this peer's outstanding pad
+    /// send back on the wire. `None` when nothing is owed.
+    ///
+    /// The sweep only runs against a live link, and on a live link the
+    /// re-sent payload leaves immediately - so it is not visible in
+    /// `sent_or_queued_payloads`, which reports only what has *not* gone.
+    /// This is what a test watches instead.
+    pub fn otp_retry_attempts_for_test(&self, peer: UserId) -> Option<u32> {
+        self.otp_retry.get(&peer).map(|(_, attempts)| *attempts)
+    }
+
     /// Arms the pad session's single-outstanding-send gate, so a test can
     /// set up the "sent but never acknowledged" state a kill or a dropped
     /// frame leaves behind. Same role as `queue_sealed_otp_for_test`.
@@ -2038,6 +2100,12 @@ impl SessionState {
     /// does - the session-level half of `queue_send_messages`, with the
     /// transport's own hand-off kept in step so the two can never
     /// disagree about where content waits.
+    /// Whether this client holds messages for someone who is not there.
+    /// Distinct from whether the pad queue exists - it always does.
+    pub fn queue_send_messages_enabled(&self) -> bool {
+        self.queue_send_messages
+    }
+
     pub fn set_queue_send_messages(&mut self, enabled: bool) {
         if enabled && self.outbox.is_none() {
             self.outbox = Some(crate::client::outbox::Outbox::load(
@@ -2061,17 +2129,15 @@ impl SessionState {
         // for good. So a non-empty pad queue is kept and allowed to
         // drain; it goes only once it is empty and there is nothing left
         // to desynchronize.
-        if enabled && self.otp_outbox.is_none() {
+        self.queue_send_messages = enabled;
+        // The pad queue is not one of the things this switch governs: a
+        // stop-and-wait send has to wait somewhere, and it waits sealed and
+        // on disk so a restart cannot lose it. Kept in both positions of
+        // the switch.
+        if self.otp_outbox.is_none() {
             self.otp_outbox = Some(crate::client::otp_outbox::OtpOutbox::load(
                 &crate::client::otp_outbox::default_dir(),
             ));
-        } else if !enabled
-            && self
-                .otp_outbox
-                .as_ref()
-                .is_some_and(|outbox| outbox.total() == 0)
-        {
-            self.otp_outbox = None;
         }
         self.peer_link
             .set_spill_undeliverable(self.outbox.is_some());
@@ -2322,6 +2388,45 @@ impl SessionState {
     /// The OTP ciphertext this side staged for `stream_id`'s content
     /// phase. Exposed for tests, which stand in for the chunked transport
     /// by handing that file to the other session directly.
+    /// Whether a send worker is still pushing `stream_id` out.
+    pub fn otp_sending_streams_contains_for_test(&self, stream_id: u64) -> bool {
+        self.is_stream_sending(stream_id, Instant::now())
+    }
+
+    /// The stream id the next voice or file send will use - so a test can
+    /// lay down the row that send will look for (`own_stream_msg_id`),
+    /// which is where its `msg_id` comes from.
+    pub fn next_stream_id_for_test(&self) -> u64 {
+        self.next_stream_id
+    }
+
+    /// Drops the transient half of the pad-retry state, as a process
+    /// restart does: no worker is running after one, and no schedule is
+    /// owed. Both are deliberately in-memory, so a restart is the one
+    /// event that always clears them.
+    pub fn forget_transient_otp_state_for_test(&mut self) {
+        self.otp_sending_streams.clear();
+        self.otp_retry.clear();
+    }
+
+    /// Registers a stream as being sent, as a spawn does.
+    pub fn register_sending_stream_for_test(&mut self, stream_id: u64, at: Instant) {
+        self.otp_sending_streams.insert(stream_id, at);
+    }
+
+    /// `is_stream_sending`, at a time a test chooses.
+    pub fn is_stream_sending_for_test(&self, stream_id: u64, now: Instant) -> bool {
+        self.is_stream_sending(stream_id, now)
+    }
+
+    /// Whether a send worker still looks alive for `stream_id`: registered,
+    /// and having shown a sign of life within `SEND_STALL_GRACE`.
+    pub(crate) fn is_stream_sending(&self, stream_id: u64, now: Instant) -> bool {
+        self.otp_sending_streams
+            .get(&stream_id)
+            .is_some_and(|seen| now.duration_since(*seen) < SEND_STALL_GRACE)
+    }
+
     pub fn otp_send_temp_file(&self, stream_id: u64) -> Option<&std::path::PathBuf> {
         self.otp_send_temp_files.get(&stream_id)
     }
@@ -2455,7 +2560,10 @@ impl SessionState {
             otp_consented: std::collections::HashSet::new(),
             otp_cancelled: std::collections::HashMap::new(),
             otp_ack_rows: std::collections::HashMap::new(),
+        otp_sending_streams: std::collections::HashMap::new(),
+        otp_retry: std::collections::HashMap::new(),
             otp_out_queue: crate::client::otp::OtpOutQueue::new(),
+            queue_send_messages: true,
             otp_outbox: Some(crate::client::otp_outbox::OtpOutbox::load(
                 &spec.scratch.join("otp_outbox"),
             )),
@@ -2815,15 +2923,21 @@ async fn handle_file_event(
     let me = ui_state.own_id.unwrap_or(UserId(0));
     match event {
         file_transfer::FileEvent::SendProgress { stream_id, bytes } => {
+            // A chunk went out, so this worker is demonstrably alive.
+            if let Some(seen) = session.otp_sending_streams.get_mut(&stream_id) {
+                *seen = Instant::now();
+            }
             ui_state.set_file_progress(me, stream_id, bytes)
         }
         file_transfer::FileEvent::SendDone { stream_id } => {
+            session.otp_sending_streams.remove(&stream_id);
             if let Some(temp) = session.otp_send_temp_files.remove(&stream_id) {
                 crate::client::otp::secure_remove_file(&temp);
             }
             ui_state.set_file_completed(me, stream_id)
         }
         file_transfer::FileEvent::SendFailed { stream_id } => {
+            session.otp_sending_streams.remove(&stream_id);
             if let Some(temp) = session.otp_send_temp_files.remove(&stream_id) {
                 crate::client::otp::secure_remove_file(&temp);
             }

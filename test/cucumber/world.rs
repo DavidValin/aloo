@@ -291,6 +291,10 @@ pub struct AlooWorld {
     pub direct_now: Option<std::time::Instant>,
     /// Every port a multi-port punch scenario named, and the one of them
     /// the peer is actually reachable on (AC-434/AC-436).
+    /// Homes pre-created for a live pad scenario, so the pad can be seeded
+    /// into them before either session starts (AC-440).
+    pub live_pad_homes: std::collections::HashMap<String, std::path::PathBuf>,
+    pub live_pad_contact: Option<String>,
     pub direct_swept_ports: Option<Vec<u16>>,
     pub direct_answered_port: Option<u16>,
     /// The address a link was established on, for a scenario asserting a

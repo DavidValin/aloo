@@ -810,6 +810,18 @@ pub struct PeerLinkManager {
     /// The serverless direct-punch scheduler, present only once
     /// `configure_direct_punch` has been called (`direct_punch=on`).
     direct: Option<DirectPunch>,
+    /// How many outgoing `OtpDeliveryAck`s to silently discard - test-only,
+    /// and zero in every other circumstance since nothing but
+    /// `drop_next_delivery_acks_for_test` ever sets it.
+    ///
+    /// It buys the one failure the reliable layer cannot represent by
+    /// itself: an acknowledgement that never arrives *and never will*. The
+    /// ARQ retransmits until it succeeds, so dropping a datagram beneath it
+    /// only delays delivery - whereas the pad's gate opens on nothing but
+    /// that acknowledgement, so losing it for good is precisely the state
+    /// the retry timer exists to escape. Every other test of that state
+    /// constructs it; this loses a real one.
+    test_drop_delivery_acks: usize,
     /// Whether content that cannot go out right now is handed to the
     /// session as `P2pEvent::Undeliverable` instead of being held in this
     /// manager's own short, in-memory queue (`queue_send_messages`,
@@ -916,6 +928,7 @@ impl PeerLinkManager {
                 links: HashMap::new(),
                 addr_index: HashMap::new(),
                 direct: None,
+                test_drop_delivery_acks: 0,
                 spill_undeliverable: false,
                 queue_held: HashSet::new(),
                 events_tx,
@@ -1221,6 +1234,15 @@ impl PeerLinkManager {
     }
 
     fn send_reliable_inner(&mut self, peer: UserId, payload: P2pPayload, tag: Option<u64>) {
+        // Dropped before it reaches the reliable layer, so it is never
+        // retransmitted either - a genuinely lost acknowledgement rather
+        // than a delayed one. Only ever non-zero under a test.
+        if self.test_drop_delivery_acks > 0
+            && matches!(payload, P2pPayload::OtpDeliveryAck { .. })
+        {
+            self.test_drop_delivery_acks -= 1;
+            return;
+        }
         let socket = self.socket_for(peer).clone();
         // The durable queue is asked *before* "is there a link record",
         // not after: a peer who disconnected has had theirs forgotten
@@ -3061,6 +3083,13 @@ impl PeerLinkManager {
     /// test using this asks about is whether the *client* believes it can
     /// reach them (`is_active`), which is what decisions like "were they
     /// told, or only queued for" now turn on.
+    /// Silently discards the next `n` acknowledgements this side sends,
+    /// as a network that loses them would. See
+    /// `test_drop_delivery_acks` for why this is worth having at all.
+    pub fn drop_next_delivery_acks_for_test(&mut self, n: usize) {
+        self.test_drop_delivery_acks = n;
+    }
+
     pub fn mark_active_for_test(&mut self, peer: UserId) {
         self.start_attempt(peer, Instant::now());
         let now = Instant::now();

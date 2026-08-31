@@ -314,8 +314,97 @@ fn daemon_of<'w>(w: &'w mut AlooWorld, nickname: &str) -> &'w mut LiveDaemon {
 #[when(expr = "{word} joins the server for real, into {string}")]
 async fn joins_for_real(w: &mut AlooWorld, nickname: String, channel: String) {
     let my_key = keybundle(&nickname, "own");
-    let id_store = IdStore::new_empty(scratch_dir(&format!("idstore-{nickname}")).join("ids_store"));
+    // A home prepared earlier when the scenario seeded a pad into it -
+    // the session's own keychain and pad store hang off this directory
+    // (`otp_cli::OtpCliConfig::resolve_beside`), which is what lets two
+    // clients in one process hold the two halves of one pad.
+    let home = w
+        .live_pad_homes
+        .get(&nickname)
+        .cloned()
+        .unwrap_or_else(|| scratch_dir(&format!("idstore-{nickname}")));
+    let id_store = IdStore::new_empty(home.join("ids_store"));
     start_daemon(w, &nickname, my_key, id_store, &channel).await;
+}
+
+/// Gives alice and bob the two halves of one real pad, on disk, before
+/// either session starts - the state a completed provisioning handshake
+/// leaves behind, without spending the handshake itself in every scenario.
+///
+/// Each half goes into that client's own home, which is the whole reason
+/// the paths are derived per client: one shared keychain cannot hold both
+/// halves, since a pair's two sides share one contact name.
+#[given(expr = "{word} and {word} have a shared pad, for real")]
+async fn share_a_pad_for_real(w: &mut AlooWorld, a: String, b: String) {
+    use aloo::client::otp_cli::{self, OtpCliConfig};
+    use aloo::client::otp_store::OtpStore;
+
+    let a_home = scratch_dir(&format!("padhome-{a}"));
+    let b_home = scratch_dir(&format!("padhome-{b}"));
+    // The pinned bytes are the encoded public bundle, exactly as
+    // `connect::resolve_identity` produces them.
+    let pinned = |sel: MyKeySelection| -> Vec<u8> {
+        let public =
+            aloo::crypto::pq::load_public_bundle(&sel.file_pub).expect("the generated bundle");
+        aloo::proto::encode(&public).expect("encoding the bundle")
+    };
+    let a_der = pinned(keybundle(&a, "own"));
+    let b_der = pinned(keybundle(&b, "own"));
+    let a_fp = aloo::crypto::pq::fingerprint_of_encoded(&a_der).expect("alice fp");
+    let b_fp = aloo::crypto::pq::fingerprint_of_encoded(&b_der).expect("bob fp");
+    // Device-qualified, the way a real pq_hybrid pair's contact is - and
+    // with the *actual* device ids the sessions will use, not blanks. They
+    // live in one file keyed by nickname, so resolving them here both
+    // learns them and fixes them for the sessions that follow.
+    let d_path = aloo::client::device_id::default_path();
+    let a_dev = aloo::client::device_id::load_or_create(&d_path, &a).expect("alice device id");
+    let b_dev = aloo::client::device_id::load_or_create(&d_path, &b).expect("bob device id");
+    let contact = aloo::crypto::otp::contact_name_for(&a_fp, &a_dev, &b_fp, &b_dev);
+
+    let a_cfg = OtpCliConfig {
+        binary_path: OtpCliConfig::resolve().binary_path,
+        working_dir: a_home.join("otp"),
+    };
+    let b_cfg = OtpCliConfig {
+        binary_path: OtpCliConfig::resolve().binary_path,
+        working_dir: b_home.join("otp"),
+    };
+    std::fs::create_dir_all(&a_cfg.working_dir).expect("alice keychain dir");
+    std::fs::create_dir_all(&b_cfg.working_dir).expect("bob keychain dir");
+
+    otp_cli::new_key_pair(&a_cfg, 1, "a", "b")
+        .await
+        .expect("generating one real pad");
+    let a_keys = a_cfg.working_dir.join("a_keys");
+    let b_keys = a_cfg.working_dir.join("b_keys");
+    otp_cli::add_contact(
+        &a_cfg,
+        &contact,
+        &a_keys.join("encryption_for_b.key"),
+        &a_keys.join("decryption_from_b.key"),
+    )
+    .await
+    .expect("alice's half");
+    otp_cli::add_contact(
+        &b_cfg,
+        &contact,
+        &b_keys.join("encryption_for_a.key"),
+        &b_keys.join("decryption_from_a.key"),
+    )
+    .await
+    .expect("bob's half");
+
+    // And the store each session will load, saying the pad is installed -
+    // without which `contact_name_if_active` refuses to use it.
+    for home in [&a_home, &b_home] {
+        let mut store = OtpStore::new_empty(home.join("otp_store"));
+        store.mark_provisioned(&contact);
+        store.save().expect("seeded pad store");
+    }
+
+    w.live_pad_homes.insert(a, a_home);
+    w.live_pad_homes.insert(b, b_home);
+    w.live_pad_contact = Some(contact);
 }
 
 /// Seeds `holder`'s id_store with a *different*, genuinely distinct
@@ -594,7 +683,18 @@ async fn screen_never_showed(w: &mut AlooWorld, holder: String, needle: String) 
 #[when(expr = "{word} comes back for real, into {string}")]
 async fn comes_back_for_real(w: &mut AlooWorld, nickname: String, channel: String) {
     let my_key = keybundle(&nickname, "own");
-    let id_store = IdStore::new_empty(scratch_dir(&format!("idstore-{nickname}-again")).join("ids_store"));
+    // The same home they left, when this scenario gave them one: a client
+    // coming back does not come back to an empty machine. It matters far
+    // more for a pad than for a keybundle - the keys are files named by
+    // the identity, but the pad, its store and its queue all live in the
+    // home, so a fresh directory means a peer who provably cannot decrypt
+    // a single thing that was sent while they were away.
+    let home = w
+        .live_pad_homes
+        .get(&nickname)
+        .cloned()
+        .unwrap_or_else(|| scratch_dir(&format!("idstore-{nickname}-again")));
+    let id_store = IdStore::new_empty(home.join("ids_store"));
     start_daemon(w, &nickname, my_key, id_store, &channel).await;
 }
 
@@ -624,4 +724,64 @@ async fn holds_queued_for(w: &mut AlooWorld, holder: String, count: usize, subje
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
     panic!("{holder} should be holding {count} message(s) for {subject} in {dir:?}, holds {held}");
+}
+
+/// Proof that a live send genuinely went *under the pad* rather than
+/// falling back to the ordinary sealed path - which it silently does
+/// whenever the contact cannot be resolved, and which would make every
+/// scenario above pass while testing nothing about pads at all.
+///
+/// Read from the pad store on disk, which the session writes as it spends
+/// each position, and polled because that write races the assertion.
+#[given(expr = "{word} really sent it under the pad")]
+#[then(expr = "{word} really sent it under the pad")]
+async fn really_sent_under_the_pad(w: &mut AlooWorld, who: String) {
+    use aloo::client::otp_store::OtpStore;
+    let home = w
+        .live_pad_homes
+        .get(&who)
+        .cloned()
+        .expect("this scenario seeded a pad for them");
+    let contact = w.live_pad_contact.clone().expect("a seeded contact");
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Ok(store) = OtpStore::load(&home.join("otp_store"))
+            && store.get(&contact).is_some_and(|s| s.next_out_seq > 0)
+        {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{who}'s pad was never spent, so the message did not go under it - a \
+             contact that will not resolve makes the send fall back silently"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Whether the peer's acknowledgement actually made it back. The pad's
+/// gate opens on nothing else, so a send that is delivered and read but
+/// never acknowledged stops every message written after it.
+#[given(expr = "{word}'s pad send was acknowledged")]
+#[then(expr = "{word}'s pad send was acknowledged")]
+async fn pad_send_was_acknowledged(w: &mut AlooWorld, who: String) {
+    use aloo::client::otp_store::OtpStore;
+    let home = w.live_pad_homes.get(&who).cloned().expect("a seeded pad home");
+    let contact = w.live_pad_contact.clone().expect("a seeded contact");
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Ok(store) = OtpStore::load(&home.join("otp_store"))
+            && store
+                .get(&contact)
+                .is_some_and(|s| s.pending_unacked_out_seq.is_none())
+        {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{who}'s pad gate never opened - the message was delivered but its \
+             acknowledgement never came back, so nothing written after it can go"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
 }

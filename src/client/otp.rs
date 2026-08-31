@@ -3848,6 +3848,18 @@ async fn send_now(
                 .insert((contact_name.to_string(), seq), msg_id);
         }
     }
+    // Held by the queue, so its row says so until the pump releases it.
+    // The in-memory path this replaced always surfaced a held message, for
+    // a reason that did not stop being true when the queue became durable:
+    // held back silently, a message looks exactly like one that was sent,
+    // which is what makes a genuinely stuck gate indistinguishable from a
+    // healthy round trip. `pump_otp_queue` clears it again the moment this
+    // message actually reaches the wire, which is usually immediately.
+    if held_by_the_queue
+        && let Some(msg_id) = msg_id
+    {
+        ui_state.mark_queued(to, msg_id, true);
+    }
     if let Some(detail) = refresh_otp_key_status(&session.otp_cli_cfg, ui_state, to, contact_name).await {
         end_live_session_if_exhausted(session, ui_state, to, &detail, contact_name).await;
     }
@@ -3889,6 +3901,17 @@ pub async fn pump_otp_queue(
         return;
     };
     let (Some(seq), Some(ack_proof)) = (entry.seq(), entry.ack_proof()) else {
+        // The entry cannot be read back - a truncated or corrupted queue
+        // file. Left where it is rather than dropped: its pad position was
+        // spent when it was sealed, and discarding it would put this side
+        // permanently ahead of the peer's. But said out loud, because
+        // returning here quietly is a queue that never moves again for this
+        // contact, with nothing anywhere to say why.
+        crate::log_warn!(
+            "the OTP queue's front entry for {contact_name} cannot be decoded, so \
+             nothing behind it can be sent; the file in ~/.aloo/otp-outbox is \
+             damaged and needs removing by hand (its pad position is already spent)"
+        );
         return;
     };
     let (msg_id, channel) = (entry.msg_id(), entry.channel());
@@ -3912,6 +3935,14 @@ pub async fn pump_otp_queue(
         return;
     }
     let Some(payload) = entry.payload() else {
+        // A recording is the one entry with no inline payload, and that
+        // branch returned above - so reaching here means the bytes are
+        // damaged. Same reasoning as above: kept, and reported.
+        crate::log_warn!(
+            "the OTP queue's front entry for {contact_name} (position {seq}) carries \
+             no readable payload, so nothing behind it can be sent; the file in \
+             ~/.aloo/otp-outbox is damaged and needs removing by hand"
+        );
         return;
     };
     // Armed before the send, not after: the gate is what stops a second
@@ -3939,6 +3970,8 @@ pub async fn pump_otp_queue(
     session.peer_link.ensure_link(wr, to).await;
     session.peer_link.send_reliable_or_queue(to, payload);
     if let Some(msg_id) = msg_id {
+        // On the wire now, so it has stopped waiting.
+        ui_state.mark_queued(to, msg_id, false);
         ui_state.mark_awaiting_pad_ack(to, msg_id);
         session
             .otp_ack_rows
@@ -4005,11 +4038,13 @@ async fn release_queued_recording(
         .peer_link
         .send_reliable_or_queue(to, P2pPayload::OtpFileContentSeq { stream_id, seq });
     if let Some(msg_id) = msg_id {
+        ui_state.mark_queued(to, msg_id, false);
         ui_state.mark_awaiting_pad_ack(to, msg_id);
         session
             .otp_ack_rows
             .insert((contact_name.to_string(), seq), msg_id);
     }
+    session.otp_sending_streams.insert(stream_id, std::time::Instant::now());
     crate::client::file_transfer::spawn_send_file_worker(
         cipher_path,
         key,
@@ -4043,6 +4078,106 @@ async fn release_queued_recording(
 /// newly become unstuck, and deliberately not on every pump: within a
 /// live session the reliable layer is already retransmitting.
 /// Returns whether anything was actually put back on the wire.
+/// How long an outstanding pad send waits for its acknowledgement before
+/// it is put back on the wire, and the ceiling the backoff climbs to.
+///
+/// The gate only ever opens on an acknowledgement, so an acknowledgement
+/// that is lost while the link stays up wedges a contact's queue for good
+/// - the link-up retry never fires, because the link never went down.
+pub const OTP_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+pub const OTP_RETRY_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Puts an un-acknowledged pad send back on the wire once its wait has run
+/// out, for every peer whose link is up.
+///
+/// Safe to repeat because nothing here re-encrypts: `retry_outstanding_otp_send`
+/// re-sends the bytes already sealed, under the position they were sealed
+/// at, and a receiver that has consumed that position answers it from its
+/// durable record rather than decrypting it twice
+/// (`resend_recorded_ack`). So a retry can neither spend a second pad
+/// position nor deliver a message twice.
+///
+/// Three things hold it back, each of which could turn a recoverable lost
+/// acknowledgement into an unrecoverable desync:
+///
+/// - **an encrypt in flight** - a seal is mid-operation and the store's
+///   write-ahead intent is standing; retrying across it would race the tool
+///   over one pad.
+/// - **a send worker still running for the front's stream** - re-releasing
+///   a recording mid-stream would put two workers on one `stream_id`, and
+///   their interleaved chunks decrypt to something neither side's
+///   `ack_proof` matches, so the gate would never open again.
+/// - **a link that is not up** - a peer who is simply away is the queue's
+///   business, not the retry's.
+pub async fn tick_otp_retries(
+    wr: &mut impl crate::control::ControlSink,
+    session: &mut SessionState,
+    ui_state: &mut UiState,
+    now: std::time::Instant,
+) {
+    let peers: Vec<UserId> = ui_state
+        .known_users
+        .keys()
+        .copied()
+        .filter(|peer| session.peer_link.is_active(*peer))
+        .collect();
+    let mut needs_recovery = false;
+    for peer in peers {
+        let Some(contact) = active_contact_name(session, ui_state, peer) else {
+            session.otp_retry.remove(&peer);
+            continue;
+        };
+        let outstanding = session
+            .otp_store
+            .get(&contact)
+            .and_then(|s| s.pending_unacked_out_seq);
+        if outstanding.is_none() {
+            // Nothing owed, so nothing to wait on - and the next thing that
+            // is owed starts its wait from scratch.
+            session.otp_retry.remove(&peer);
+            continue;
+        }
+        if session.otp_store.encrypt_in_flight(&contact) {
+            continue;
+        }
+        // A recording whose worker has not finished is still being
+        // delivered; its acknowledgement is not late yet.
+        let front_stream = session
+            .otp_outbox
+            .as_ref()
+            .and_then(|outbox| outbox.front(&contact))
+            .and_then(|entry| entry.recording())
+            .map(|(_, stream_id)| stream_id);
+        if front_stream.is_some_and(|id| session.is_stream_sending(id, now)) {
+            continue;
+        }
+        let (due, attempts) = *session
+            .otp_retry
+            .entry(peer)
+            .or_insert((now + OTP_RETRY_DELAY, 0));
+        if now < due {
+            continue;
+        }
+        let next = OTP_RETRY_DELAY
+            .saturating_mul(1u32 << attempts.min(4))
+            .min(OTP_RETRY_MAX_DELAY);
+        session.otp_retry.insert(peer, (now + next, attempts.saturating_add(1)));
+        // The queue's own bytes first. With `queue_send_messages` off there
+        // is no queue at all and this does nothing, which is what the
+        // `.last_sent` recovery below is for - without it, an unqueued send
+        // whose acknowledgement is lost while the link stays up would wedge
+        // that contact exactly as the queued one used to.
+        if !retry_outstanding_otp_send(wr, session, ui_state, peer, &contact).await {
+            needs_recovery = true;
+        }
+        pump_otp_queue(wr, session, ui_state, peer, &contact).await;
+    }
+    if needs_recovery {
+        // Skips anything the queue holds, and anything still streaming.
+        let _ = recover_and_resend(wr, session, ui_state).await;
+    }
+}
+
 pub(crate) async fn retry_outstanding_otp_send(
     wr: &mut impl crate::control::ControlSink,
     session: &mut SessionState,
@@ -4179,6 +4314,10 @@ pub async fn send_or_queue(
     // decides only which sealed message may be on the wire. That is what
     // lets a whole conversation be written to somebody who is not there
     // without any of it waiting around as plaintext.
+    // Never taken for a text any more: the pad queue is always there, so
+    // `send_now` seals it and puts it on disk rather than holding the
+    // plaintext in memory where a restart loses it. Kept for the content
+    // phase, which still queues in memory by its own two-phase design.
     if unacked && session.otp_outbox.is_none() {
         let item = match channel {
             Some(ch) => PendingOtpSend::Channel {
@@ -4199,6 +4338,13 @@ pub async fn send_or_queue(
         session
             .otp_out_queue
             .enqueue(contact_name.to_string(), item);
+        // The row says so too, the same as a message the durable queue
+        // holds (AC-439) and the same as one the ordinary outbox holds.
+        // Without it this is the only kind of held message that looks
+        // exactly like one already on the wire.
+        if let Some(msg_id) = msg_id {
+            ui_state.mark_queued(to, msg_id, true);
+        }
         // Always surfaced, even though the common case (a fast, healthy
         // round trip) clears almost immediately: held back silently, a
         // message looks identical to one that was never sent, which is
@@ -4705,6 +4851,14 @@ async fn send_voice_offer_queued(
             }
         }
     }
+    // A voice message the queue is holding says so on its row, exactly as
+    // a text does. It never passes through `send_now`, so it would
+    // otherwise be the one queued thing that looks identical to a message
+    // already on the wire. `pump_otp_queue` clears it below the moment the
+    // offer actually goes out.
+    if let Some(msg_id) = msg_id {
+        ui_state.mark_queued(to, msg_id, true);
+    }
     if let Some(detail) =
         refresh_otp_key_status(&session.otp_cli_cfg, ui_state, to, contact_name).await
     {
@@ -4731,7 +4885,7 @@ pub async fn send_voice_offer(
     // write order one acknowledgement at a time - so being unable to
     // reach them, or having something still unacknowledged, is no longer
     // a reason to refuse it.
-    if session.otp_outbox.is_some() {
+    if session.queue_send_messages {
         return send_voice_offer_queued(
             wr,
             session,
@@ -5383,6 +5537,9 @@ pub async fn on_delivery_ack(
     {
         return Ok(());
     }
+    // The wait this contact was serving is over; whatever goes out next
+    // starts its own from scratch rather than inheriting a long backoff.
+    session.otp_retry.remove(&from);
     // The proof held, so this is also the strongest statement available
     // that the peer read the message - and on a pad-protected leg it is
     // the *only* one the row will accept (`DeliveryProof`).
@@ -5489,6 +5646,10 @@ pub(crate) async fn flush_one_queued(
             let Some(recipient) = ui_state.known_users.get(&to).cloned() else {
                 return Ok(());
             };
+            // Its turn has come, so it stops claiming to wait.
+            if let Some(msg_id) = msg_id {
+                ui_state.mark_queued(to, msg_id, false);
+            }
             send_now(
                 wr,
                 session,
@@ -5514,6 +5675,10 @@ pub(crate) async fn flush_one_queued(
             let Some(recipient) = ui_state.known_users.get(&to).cloned() else {
                 return Ok(());
             };
+            // Its turn has come, so it stops claiming to wait.
+            if let Some(msg_id) = msg_id {
+                ui_state.mark_queued(to, msg_id, false);
+            }
             send_now(
                 wr,
                 session,
@@ -5572,6 +5737,7 @@ pub async fn start_outgoing_file_content(
             .own_file_targets
             .remove(&stream_id)
             .expect("just confirmed present above");
+        session.otp_sending_streams.insert(stream_id, std::time::Instant::now());
         crate::client::file_transfer::spawn_send_file_worker(
             target.path,
             target.key,
@@ -5685,6 +5851,7 @@ pub async fn start_outgoing_file_content(
                     .otp_ack_rows
                     .insert((contact_name.to_string(), seq), msg_id);
             }
+            session.otp_sending_streams.insert(stream_id, std::time::Instant::now());
             crate::client::file_transfer::spawn_send_file_worker(
                 temp_path,
                 target.key,
@@ -5887,6 +6054,17 @@ pub async fn finish_incoming_file(
         true,
     )
     .await;
+    // What comes out of a decrypt is plaintext, and the tool writes it
+    // under the process umask - 0644 on a typical machine - into a working
+    // directory that is not itself private. Every plaintext this side
+    // *writes* is already restricted (`otp-voice-plain`, `otp-send`,
+    // `otp-recover-send`); the ones it *receives* were not, which left a
+    // decoded voice message and a recovered transfer briefly readable by
+    // any other account on the machine. Narrow, since both are erased
+    // moments later - but a crash in between is exactly why the orphan
+    // sweep exists, and "briefly world-readable" is the wrong default for
+    // a tool whose whole premise is that plaintext does not rest on disk.
+    restrict_file_permissions(&decrypt_dest);
     secure_remove_file(&pending.temp_path);
     if !matches!(outcome, Ok(otp_cli::FileCliOutcome::Ok)) {
         let _ = std::fs::remove_file(&decrypt_dest);
@@ -6173,6 +6351,33 @@ pub(crate) async fn resend_pending_setups(
 /// shape drops the intent and touches nothing. Returns what was promoted,
 /// for the one content kind whose retry needs a second store mended
 /// (`Mail` - `client::otp_mail::restore_orphaned_mail_ref`).
+/// The acknowledgement proof for a send being promoted from its
+/// write-ahead record, recovered from the tool's own kept copy.
+///
+/// Only for the kinds framed with a nonce (`wrap_outgoing`) - a text, an
+/// end notice, or a file/voice *offer* - where the proof is the hash of
+/// that nonce. A content transfer's proof is a hash of the plaintext file
+/// instead (`ack_proof_for_file`), which the kept copy of the ciphertext
+/// cannot yield, so those keep today's `None`.
+async fn recovered_ack_proof(
+    cfg: &otp_cli::OtpCliConfig,
+    contact_name: &str,
+    content: &crate::client::otp_store::PendingOtpContent,
+) -> Option<crypto::otp::AckProof> {
+    use crate::client::otp_store::PendingOtpContent as Kind;
+    if matches!(content, Kind::FileContent { .. }) {
+        return None;
+    }
+    let recovered = otp_cli::recover_last(cfg, contact_name, otp_cli::RecoverDirection::Sent)
+        .await
+        .ok()??;
+    if recovered.len() < crypto::otp::ACK_NONCE_BYTES {
+        return None;
+    }
+    let (nonce, _payload) = recovered.split_at(crypto::otp::ACK_NONCE_BYTES);
+    Some(crypto::otp::ack_proof_for(nonce))
+}
+
 pub async fn reconcile_orphaned_sends(
     cfg: &otp_cli::OtpCliConfig,
     store: &mut crate::client::otp_store::OtpStore,
@@ -6186,7 +6391,6 @@ pub async fn reconcile_orphaned_sends(
     }
     let mut promoted = Vec::new();
     for (contact_name, content) in intents {
-        store.clear_encrypt_intent(&contact_name);
         // A fully recorded send already outstanding means the intent is
         // stale bookkeeping from an older accident - the recorded send's
         // own recovery takes precedence, and a second promotion would
@@ -6196,18 +6400,57 @@ pub async fn reconcile_orphaned_sends(
             .and_then(|s| s.pending_unacked_out_seq)
             .is_some()
         {
+            store.clear_encrypt_intent(&contact_name);
             continue;
         }
+        // Asked *before* the intent is cleared. The intent is the only
+        // record that a position may have been spent without being
+        // recorded; discarding it because the pad could not be read this
+        // once would strand that spend for good, on this start and every
+        // later one, with the store permanently a position behind the pad.
+        // Kept instead, so the next start reconciles it - and sends for
+        // this contact stay blocked meanwhile (`encrypt_in_flight`), which
+        // is the safe way to be wrong: nothing new is spent against a pad
+        // whose position is in doubt.
         let Ok(Some(detail)) = otp_cli::show_contact(cfg, &contact_name).await else {
+            crate::log_warn!(
+                "could not read the pad for {contact_name} while reconciling an \
+                 interrupted send; keeping the record and leaving this contact's \
+                 sends held until it can be read"
+            );
             continue;
         };
         let next_out = store
             .get(&contact_name)
             .map(|s| s.next_out_seq)
             .unwrap_or(0);
+        store.clear_encrypt_intent(&contact_name);
         if detail.enc_sequence == next_out + 1 {
-            store.record_sent(&contact_name, next_out, content.clone(), None);
+            // Recovered so the promoted send keeps the proof requirement
+            // every other send carries. Without one, `record_acked` accepts
+            // *any* proof for this position - so anybody who merely saw the
+            // packet could open the gate, which is the one thing the proof
+            // exists to prevent. `--recover-last --sent` re-streams the
+            // copy the tool already kept and consumes no key, so asking
+            // costs nothing; a spend whose copy is genuinely gone falls
+            // back to `None` rather than being left unrecoverable.
+            let proof = recovered_ack_proof(cfg, &contact_name, &content).await;
+            store.record_sent(&contact_name, next_out, content.clone(), proof);
             promoted.push((contact_name, next_out, content));
+        } else if detail.enc_sequence != next_out {
+            // Neither "spent once, unrecorded" nor "never spent" - the two
+            // states an interrupted send can leave. Anything else means the
+            // pad and this side's counter have already diverged by more
+            // than one position, which nothing here can reconstruct: said
+            // out loud rather than passed over, since this is the one place
+            // positioned to notice it at all.
+            crate::log_warn!(
+                "the pad for {contact_name} is at position {} while this side \
+                 recorded {next_out}; an interrupted send can only ever leave a \
+                 difference of one, so these have diverged and messages to this \
+                 contact will not decrypt until the pad is re-provisioned",
+                detail.enc_sequence
+            );
         }
     }
     let _ = store.save();
@@ -6248,6 +6491,23 @@ pub async fn recover_and_resend(
             .and_then(|entry| entry.seq())
             == Some(seq);
         if queue_holds_it {
+            continue;
+        }
+        // A transfer whose worker is still pushing chunks must not be
+        // started again: two workers on one `stream_id` interleave into a
+        // decrypt whose `ack_proof` matches nothing, and the gate could
+        // then never open. Harmless on the link-up path that has always
+        // called this - a dropped link kills its transfers - but this now
+        // also runs on a timer, with the link perfectly healthy.
+        let streaming = match &content {
+            crate::client::otp_store::PendingOtpContent::File { stream_id, .. }
+            | crate::client::otp_store::PendingOtpContent::FileContent { stream_id }
+            | crate::client::otp_store::PendingOtpContent::Voice { stream_id, .. } => {
+                Some(*stream_id)
+            }
+            _ => None,
+        };
+        if streaming.is_some_and(|id| session.is_stream_sending(id, std::time::Instant::now())) {
             continue;
         }
         let Some((to, recipient_pubkey_der)) =
@@ -6541,6 +6801,7 @@ async fn recover_and_resend_file_content(
     session
         .peer_link
         .send_reliable_or_queue(to, P2pPayload::OtpFileContentSeq { stream_id, seq });
+    session.otp_sending_streams.insert(stream_id, std::time::Instant::now());
     crate::client::file_transfer::spawn_send_file_worker(
         temp_path,
         key,

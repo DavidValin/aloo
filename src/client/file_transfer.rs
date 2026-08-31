@@ -484,6 +484,11 @@ pub(crate) fn spawn_send_file_worker(
                 })
                 .is_err()
             {
+                // The session is gone, so this send is over - said out
+                // loud rather than by falling silent, because whoever is
+                // tracking this stream as in-flight would otherwise wait
+                // on a worker that no longer exists.
+                let _ = events_tx.send(FileEvent::SendFailed { stream_id });
                 return;
             }
             sent += n as u64;

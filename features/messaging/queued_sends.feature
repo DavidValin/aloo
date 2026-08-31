@@ -257,6 +257,17 @@ Feature: Saying something to someone who is not there
   # What is held, and what is not
   # ------------------------------------------------------------------
 
+  # The gate opens only on an acknowledgement, so one lost while the link
+  # stays up used to wedge a contact's queue for good - the other retry
+  # fires on a link-up that never comes. Retrying is safe because nothing
+  # is re-encrypted: the same sealed bytes go again under the same
+  # position, and a receiver that already consumed it answers from its
+  # record instead of decrypting twice.
+  @AC-440 @pqhybrid_otp
+  Scenario: An acknowledgement that never comes is not waited on forever
+    Given queueing sends is on
+    Then a pad send waits a bounded time for its acknowledgement before retrying
+
   @AC-408 @pqhybrid
   Scenario: Text and voice are held, files are not
     Given queueing sends is on
@@ -641,6 +652,28 @@ Feature: Saying something to someone who is not there
     # And his acknowledgement is what finally clears it from her disk -
     # nothing before that point was allowed to (AC-422).
     And alice has 0 messages held for bob
+
+  # The pad version of the scenario above, over the same real sockets. The
+  # simulated coverage constructs the stuck state; this one actually takes
+  # a peer off the network and puts them back, with a real pad between the
+  # two sessions.
+  @AC-440 @pqhybrid_otp @with_server
+  Scenario: A pad-wrapped message written while they are away reaches them for real
+    Given a server that anyone may connect to
+    And alice and bob have a shared pad, for real
+    And alice joins the server for real, into "general"
+    And bob joins the server for real, into "general"
+    And bob opens the private room with alice for real
+    And alice sends bob the private message "hello under the pad" for real
+    And bob's screen shows "hello under the pad" within 30 seconds
+    And alice really sent it under the pad
+    And alice's pad send was acknowledged
+    And bob has gone offline for real
+    When alice sends bob the private message "under the pad while out" for real
+    Then alice's screen never showed "failed"
+    When bob comes back for real, into "general"
+    And bob opens the private room with alice for real
+    Then bob's screen shows "under the pad while out" within 40 seconds
 
   @AC-410 @AC-420 @AC-422 @pqhybrid @with_server
   Scenario: Several messages written while they are away are all kept
