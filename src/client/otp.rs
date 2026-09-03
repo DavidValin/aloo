@@ -3446,29 +3446,79 @@ async fn recover_orphaned_decrypt(
     session: &mut SessionState,
     contact_name: &str,
 ) -> Option<(Vec<u8>, crypto::otp::AckProof)> {
-    let detail = otp_cli::show_contact(&session.otp_cli_cfg, contact_name)
-        .await
-        .ok()??;
-    let accepted = session
-        .otp_store
-        .get(contact_name)
-        .map(|s| s.next_expected_in_seq)
-        .unwrap_or(0);
-    if detail.dec_sequence != accepted + 1 {
-        return None;
-    }
-    let recovered = otp_cli::recover_last(
-        &session.otp_cli_cfg,
-        contact_name,
-        otp_cli::RecoverDirection::Received,
-    )
-    .await
-    .ok()??;
+    let recovered = recover_orphaned_decrypt_raw(session, contact_name).await?;
     if recovered.len() < crypto::otp::ACK_NONCE_BYTES {
         return None;
     }
     let (nonce, payload) = recovered.split_at(crypto::otp::ACK_NONCE_BYTES);
     Some((payload.to_vec(), crypto::otp::ack_proof_for(nonce)))
+}
+
+/// Whether `contact_name`'s tool-side decrypt counter sits exactly one
+/// past what this store has accepted - the one shape a crash between a
+/// decrypt and its record leaves (`recover_orphaned_decrypt`'s doc), and
+/// the precondition every heal below shares. Anything else - equal, or
+/// further apart - is not that crash, and nothing here may touch the
+/// tool's kept copy on the strength of it.
+async fn decrypt_was_orphaned(session: &SessionState, contact_name: &str) -> bool {
+    let Ok(Some(detail)) = otp_cli::show_contact(&session.otp_cli_cfg, contact_name).await else {
+        return false;
+    };
+    let accepted = session
+        .otp_store
+        .get(contact_name)
+        .map(|s| s.next_expected_in_seq)
+        .unwrap_or(0);
+    detail.dec_sequence == accepted + 1
+}
+
+/// `recover_orphaned_decrypt` for a payload framed without a nonce: the
+/// tool's kept received-side copy, whole, when and only when the crash
+/// shape holds. OTP mail is sealed as `(payload, signature)` with no nonce
+/// in front (`client::otp_mail::on_mail_deliver`), so it heals through
+/// this rather than the nonce-splitting form above.
+pub(crate) async fn recover_orphaned_decrypt_raw(
+    session: &SessionState,
+    contact_name: &str,
+) -> Option<Vec<u8>> {
+    if !decrypt_was_orphaned(session, contact_name).await {
+        return None;
+    }
+    otp_cli::recover_last(
+        &session.otp_cli_cfg,
+        contact_name,
+        otp_cli::RecoverDirection::Received,
+    )
+    .await
+    .ok()?
+}
+
+/// `recover_orphaned_decrypt` for a file's or voice message's content
+/// phase, whose plaintext is a file: the tool's kept received-side copy is
+/// streamed to `dst` (`recover_last_file`), and `true` means `dst` now
+/// holds exactly what the interrupted decrypt produced. Without this the
+/// content path had no heal at all: a receiver killed between
+/// `otp --decrypt` and the record refused the sender's retry forever
+/// ("rejected - keys untouched"), never acknowledged it, and the pair
+/// wedged on a spend both sides had in fact completed.
+async fn recover_orphaned_decrypt_file(
+    session: &SessionState,
+    contact_name: &str,
+    dst: &Path,
+) -> bool {
+    if !decrypt_was_orphaned(session, contact_name).await {
+        return false;
+    }
+    matches!(
+        otp_cli::recover_last_file(
+            &session.otp_cli_cfg,
+            contact_name,
+            otp_cli::RecoverDirection::Received,
+            dst,
+        )
+        .await,
+        Ok(Some(()))
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6070,6 +6120,36 @@ pub async fn finish_incoming_file(
     pending: crate::client::file_transfer::OtpIncomingFileReceive,
 ) {
     use crate::client::file_transfer::OtpIncomingKind;
+    // The same guard every other spend runs *before* `otp --decrypt`
+    // (`on_message`, `on_file_offer`, `on_content_seq`'s unregistered
+    // branch): only the exact next position may reach the pad. A content
+    // transfer was the one path that decrypted first and asked afterwards -
+    // so a retried stream for a position already consumed, or one whose
+    // cleartext `OtpFileContentSeq` was garbled in transit, spent a pad
+    // range the store then refused to record, leaving the tool a position
+    // ahead for good. A consumed position is re-answered from its record
+    // at no cost, exactly as a repeated text is; a stream that never named
+    // its position at all is refused rather than spent on blindly.
+    let Some(seq) = pending.seq else {
+        secure_remove_file(&pending.temp_path);
+        let from_name = peer_name_for(ui_state, from);
+        notify(
+            ui_state,
+            from,
+            &from_name,
+            format!(
+                "OTP: a transfer from {from_name} arrived without naming its pad position - \
+                 not decrypted, keys untouched"
+            ),
+            false,
+        );
+        return;
+    };
+    if !session.otp_store.is_next_expected(&pending.contact_name, seq) {
+        secure_remove_file(&pending.temp_path);
+        resend_recorded_ack(session, from, &pending.contact_name, seq);
+        return;
+    }
     // A file decrypts straight to its real download location; a voice
     // message has no destination file at all, so it decrypts to a second
     // (plaintext) temp file that's read back into memory and deleted
@@ -6113,6 +6193,24 @@ pub async fn finish_incoming_file(
     // a tool whose whole premise is that plaintext does not rest on disk.
     restrict_file_permissions(&decrypt_dest);
     secure_remove_file(&pending.temp_path);
+    // A rejection may be the receiver's own crash talking: the decrypt
+    // already ran in a previous life of this process and only the record
+    // was lost, so the sender's faithful retry is now one position behind
+    // the tool. Recognised by the exact off-by-one and healed from the
+    // tool's kept copy, the same way `finish_opening_otp_envelope` heals a
+    // text - the plaintext lands in `decrypt_dest` as if the decrypt had
+    // just happened, and everything below proceeds normally.
+    let outcome = match outcome {
+        Ok(otp_cli::FileCliOutcome::Rejected(reason)) => {
+            if recover_orphaned_decrypt_file(session, &pending.contact_name, &decrypt_dest).await {
+                restrict_file_permissions(&decrypt_dest);
+                Ok(otp_cli::FileCliOutcome::Ok)
+            } else {
+                Ok(otp_cli::FileCliOutcome::Rejected(reason))
+            }
+        }
+        other => other,
+    };
     if !matches!(outcome, Ok(otp_cli::FileCliOutcome::Ok)) {
         let _ = std::fs::remove_file(&decrypt_dest);
         if matches!(pending.kind, OtpIncomingKind::File { .. }) {
@@ -6194,7 +6292,7 @@ pub async fn finish_incoming_file(
     // decrypting before its own `OtpFileContentSeq` ever arrived - not
     // possible over an ordered reliable link (it's always sent first), but
     // guarded rather than assumed; nothing to ack in that case.
-    if let (Some(seq), Some(proof)) = (pending.seq, ack_proof) {
+    if let Some(proof) = ack_proof {
         // The content spend occupied a slot in the same, single sequence
         // space every other spend shares - so consuming it must advance
         // the expectation like every other slot, or the sender's very next
@@ -6202,8 +6300,15 @@ pub async fn finish_incoming_file(
         // pair for good. And its acceptance leaves the same durable
         // `(seq, proof)` record every accepted message does, so a retry of
         // the content whose ack was lost is re-answered from it
-        // (`on_content_seq`) rather than re-received.
-        session.otp_store.record_received(&pending.contact_name, seq);
+        // (`on_content_seq`) rather than re-received. The guard above
+        // already proved `seq` is the next expected, so this cannot refuse.
+        if !session.otp_store.record_received(&pending.contact_name, seq) {
+            crate::log_warn!(
+                "a content spend at position {seq} for {} decrypted but could not be \
+                 recorded - the pair's counters may now disagree",
+                pending.contact_name
+            );
+        }
         session
             .otp_store
             .record_last_received_ack(&pending.contact_name, seq, proof);

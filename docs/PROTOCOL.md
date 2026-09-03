@@ -4500,12 +4500,19 @@ its acceptance being recorded is healed at the moment the sender's retry
 is refused: the exact off-by-one between the tool's counter and the
 store's identifies the crash shape, and the orphaned plaintext - nonce
 included - is recovered whole from the tool's received-side safety copy
-and processed as if the decrypt had just happened. And a file's or voice
-message's *content* spend advances the receiver's expectation and records
-its `(seq, proof)` exactly like every other slot; a receiver who restarted
-after accepting re-registers the retried transfer from its announcement
-alone, landing the bytes generically rather than dropping the retries and
-wedging the pair.
+and processed as if the decrypt had just happened. A file's or voice
+message's *content* spend is held to the same two rules: its named
+position is checked against the receiver's counter *before* the assembled
+ciphertext is decrypted (a consumed position is re-answered from its
+record, a wrong or unnamed one is refused with nothing spent), and a
+rejection that turns out to be this side's own crash between the decrypt
+and its record is healed from the same received-side copy, streamed
+straight to the destination. Consuming the slot then advances the
+receiver's expectation and records its `(seq, proof)` exactly like every
+other slot; a receiver who restarted after accepting re-registers the
+retried transfer from its announcement alone, landing the bytes
+generically rather than dropping the retries and wedging the pair. OTP
+mail's single decrypt (§17.3) heals through the identical check.
 
 A decrypt that fails for any reason other than the crash shape just
 described, or `otp`'s own metadata rejection (a replayed, reordered,

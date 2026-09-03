@@ -5666,7 +5666,10 @@ async fn what_comes_out_of_a_decrypt_is_not_left_world_readable() {
         7,
         OtpIncomingFileReceive {
             contact_name: contact.clone(),
-            seq: None,
+            // The stream's own position - a transfer that names none is
+            // refused before the pad is touched (TB-288), so this test of
+            // what *lands* has to name the one bob expects.
+            seq: Some(0),
             temp_path: sealed,
             kind: OtpIncomingKind::File {
                 final_path: final_path.clone(),
@@ -5995,4 +5998,179 @@ async fn installing_a_replacement_pad_drops_what_was_queued_under_the_old_one() 
         .expect("sent");
     assert_eq!(seq, 0);
     assert!(bob.pad_spent(&contact).await > 0);
+}
+
+// ---------------------------------------------------------------------
+// The content phase is guarded and healed like every other spend (TB-288)
+// ---------------------------------------------------------------------
+
+impl Side {
+    /// How far this side's *decryption* half has been consumed - what a
+    /// receive-side "nothing was spent" assertion reads.
+    async fn pad_received(&self, contact: &str) -> u64 {
+        otp_cli::show_contact(&self.otp, contact)
+            .await
+            .expect("show-contact")
+            .expect("the pair's contact exists")
+            .dec_offset
+    }
+}
+
+/// Runs a file transfer up to the point where bob holds the content
+/// ciphertext, returning `(content_seq, staged ciphertext path, body, dir)`.
+async fn file_content_in_bobs_hands(
+    label: &str,
+    alice: &mut Side,
+    bob: &mut Side,
+    contact: &str,
+) -> (u64, std::path::PathBuf, Vec<u8>, std::path::PathBuf) {
+    let dir = scratch(&format!("{label}-payload"));
+    let source = dir.join("notes.txt");
+    let body = b"content that lands exactly once, whatever the receiver survives".to_vec();
+    std::fs::write(&source, &body).unwrap();
+    send_file(alice, contact, source, body.len() as u64).await;
+    let (stream_id, offer_seq, offer_env, offer_device) = take_file_offer(alice);
+    aloo::client::otp::on_file_offer(
+        &mut bob.session,
+        &mut bob.ui,
+        None,
+        ALICE,
+        "alice".into(),
+        stream_id,
+        offer_seq,
+        offer_env,
+        offer_device,
+    )
+    .await;
+    let (a_seq, a_proof) = last_ack(bob);
+    ack(alice, BOB, a_seq, a_proof).await;
+    aloo::client::otp::start_outgoing_file_content(&mut alice.session, &mut alice.ui, stream_id)
+        .await
+        .expect("content phase");
+    let content_seq = alice
+        .queued()
+        .into_iter()
+        .find_map(|p| match p {
+            P2pPayload::OtpFileContentSeq { seq, .. } => Some(seq),
+            _ => None,
+        })
+        .expect("the content slot is named");
+    let staged = alice
+        .session
+        .otp_send_temp_file(stream_id)
+        .expect("staged ciphertext")
+        .clone();
+    (content_seq, staged, body, dir)
+}
+
+/// A content stream whose named position is not the next expected must
+/// never reach `otp --decrypt`: a retry of content already consumed is
+/// re-answered from the record, and a stream that names a wrong or no
+/// position is refused - in every case without a single pad byte spent.
+///
+/// @requirement TB-288
+#[tokio::test]
+async fn a_content_stream_out_of_sequence_is_refused_before_the_pad_is_touched() {
+    if !require_otp() {
+        return;
+    }
+    let (mut alice, mut bob, contact) = pair("content-guard", Id::Pq, Id::Pq).await;
+    let (content_seq, staged, _body, dir) =
+        file_content_in_bobs_hands("content-guard", &mut alice, &mut bob, &contact).await;
+    let received_before = bob.pad_received(&contact).await;
+    let acks_before = bob.queued().len();
+
+    for (label, seq) in [("a position from the future", Some(content_seq + 3)), ("no position", None)] {
+        let arrived = dir.join(format!("arrived-{}.otp", seq.unwrap_or(0)));
+        std::fs::copy(&staged, &arrived).unwrap();
+        let final_path = dir.join(format!("downloaded-{}.txt", seq.unwrap_or(0)));
+        aloo::client::otp::finish_incoming_file(
+            &mut bob.session,
+            &mut bob.ui,
+            ALICE,
+            77,
+            OtpIncomingFileReceive {
+                contact_name: contact.clone(),
+                seq,
+                temp_path: arrived.clone(),
+                kind: OtpIncomingKind::File { final_path: final_path.clone() },
+            },
+        )
+        .await;
+        assert_eq!(
+            bob.pad_received(&contact).await,
+            received_before,
+            "{label}: nothing may be spent on a stream the store cannot record"
+        );
+        assert!(!final_path.exists(), "{label}: nothing lands");
+        assert!(!arrived.exists(), "{label}: the arrived ciphertext is cleaned up");
+        assert_eq!(bob.queued().len(), acks_before, "{label}: and nothing is acknowledged");
+    }
+}
+
+/// The receiver's crash between a content decrypt and its record - the
+/// tool one ahead of the store, the plaintext already produced - is healed
+/// from the tool's kept received-side copy when the sender's faithful
+/// retry is refused: the content lands, the position is recorded, and the
+/// acknowledgement carries the plaintext's true digest. Before, that
+/// retry was refused forever and the pair wedged on a spend both sides had
+/// in fact completed.
+///
+/// @requirement TB-288
+#[tokio::test]
+async fn a_content_decrypt_orphaned_by_a_crash_is_healed_from_the_tools_safety_copy() {
+    if !require_otp() {
+        return;
+    }
+    let (mut alice, mut bob, contact) = pair("content-heal", Id::Pq, Id::Pq).await;
+    let (content_seq, staged, body, dir) =
+        file_content_in_bobs_hands("content-heal", &mut alice, &mut bob, &contact).await;
+
+    // The pre-crash decrypt: the tool's state advances, and the process
+    // dies before anything is recorded or acknowledged.
+    let pre_crash_in = dir.join("arrived-first.otp");
+    std::fs::copy(&staged, &pre_crash_in).unwrap();
+    let pre_crash_out = dir.join("lost-with-the-process.txt");
+    let outcome = otp_cli::decrypt_file_retrying(&bob.otp, &contact, &pre_crash_in, &pre_crash_out, true)
+        .await
+        .expect("decrypt runs");
+    assert!(matches!(outcome, otp_cli::FileCliOutcome::Ok), "{outcome:?}");
+    std::fs::remove_file(&pre_crash_out).unwrap();
+
+    // ...restart; the sender's retry of the very same content arrives.
+    let arrived = dir.join("arrived-retry.otp");
+    std::fs::copy(&staged, &arrived).unwrap();
+    let final_path = dir.join("downloaded.txt");
+    let acks_before = bob.queued().len();
+    aloo::client::otp::finish_incoming_file(
+        &mut bob.session,
+        &mut bob.ui,
+        ALICE,
+        78,
+        OtpIncomingFileReceive {
+            contact_name: contact.clone(),
+            seq: Some(content_seq),
+            temp_path: arrived,
+            kind: OtpIncomingKind::File { final_path: final_path.clone() },
+        },
+    )
+    .await;
+
+    assert_eq!(
+        std::fs::read(&final_path).expect("the orphaned content is recovered and lands"),
+        body
+    );
+    assert!(
+        bob.ui.status_notice.clone().is_none_or(|(m, _)| !m.contains("rejected")),
+        "no rejection notice - the heal recognised the crash shape"
+    );
+    assert!(bob.queued().len() > acks_before, "the spend is acknowledged");
+    let (ack_seq, proof) = last_ack(&mut bob);
+    assert_eq!(ack_seq, content_seq);
+    ack(&mut alice, BOB, ack_seq, proof).await;
+    assert!(!alice.gate_held(&contact), "the true digest opens the sender's gate");
+    assert!(
+        bob.session.otp_store_mut().is_next_expected(&contact, content_seq + 1),
+        "and the receiver's expectation moved past the healed position"
+    );
 }
