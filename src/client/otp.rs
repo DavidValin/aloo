@@ -129,6 +129,11 @@ impl OtpOutQueue {
         self.queue.get_mut(contact_name)?.pop_front()
     }
 
+    /// How many plaintext sends are held for `contact_name`.
+    pub fn len_for(&self, contact_name: &str) -> usize {
+        self.queue.get(contact_name).map(VecDeque::len).unwrap_or(0)
+    }
+
     /// Whether `stream_id`'s content-phase encrypt is already queued for
     /// `contact_name` - checked before enqueueing another copy
     /// (`start_outgoing_file_content`'s doc): a resumed accept
@@ -4235,7 +4240,38 @@ pub(crate) async fn retry_outstanding_otp_send(
     true
 }
 
-/// Entry point for `direct_message::handle_send_text`/`channel::handle_send_text`/// Entry point for `direct_message::handle_send_text`/`channel::handle_send_text`
+/// Whether a new spend for `contact_name` must wait as plaintext rather
+/// than be sealed now (`send_or_queue`'s doc explains the why at length):
+///
+/// - an encrypt is mid-flight for the contact (`encrypt_intent` standing -
+///   a same-process second seal would race the tool over one pad), or a
+///   reconciled spend is parked awaiting promotion (`deferred_spend`);
+/// - or a send is outstanding that the durable queue does *not* hold at
+///   its front, so its only retry copy is the tool's one-deep `.last_sent`,
+///   which the next seal would overwrite.
+///
+/// A send the queue front *is* imposes nothing: the queue owns its retry
+/// bytes, so sealing more behind it is exactly what the queue is for.
+pub(crate) fn must_hold_plaintext(session: &SessionState, contact_name: &str) -> bool {
+    if session.otp_store.encrypt_in_flight(contact_name) {
+        return true;
+    }
+    let Some(outstanding) = session
+        .otp_store
+        .get(contact_name)
+        .and_then(|s| s.pending_unacked_out_seq)
+    else {
+        return false;
+    };
+    let queue_front = session
+        .otp_outbox
+        .as_ref()
+        .and_then(|outbox| outbox.front(contact_name))
+        .and_then(|entry| entry.seq());
+    queue_front != Some(outstanding)
+}
+
+/// Entry point for `direct_message::handle_send_text`/`channel::handle_send_text`
 /// once they've established `contact_name_if_active` returns `Some` for a
 /// recipient: sends immediately if the contact's previous OTP message has
 /// already been acked, otherwise queues it for `on_delivery_ack` to flush.
@@ -4287,16 +4323,6 @@ pub async fn send_or_queue(
         }
         return Ok(());
     }
-    let unacked = session
-        .otp_store
-        .get(contact_name)
-        .and_then(|s| s.pending_unacked_out_seq)
-        .is_some()
-        // An encrypt already mid-flight for this contact counts as the gate
-        // being held: its `record_sent` hasn't run yet, and a second encrypt
-        // interleaving with it would race the tool over one pad
-        // (`OtpContactState::encrypt_intent`'s same-process guard).
-        || session.otp_store.encrypt_in_flight(contact_name);
     // The pad as a second factor, folded into the same gate. Holding the
     // identity key that selects a contact is not the same as holding that
     // contact's pad, and the only way to clear `pending_unacked_out_seq` is
@@ -4308,17 +4334,23 @@ pub async fn send_or_queue(
     // pad extracts exactly one message, and even that is not lost - nothing
     // overwrites its `.last_sent` copy while this gate holds, so it is
     // still deliverable to the genuine contact afterwards.
-    // With a durable queue behind us, the gate no longer decides whether
-    // to *encrypt*. A message is sealed the moment it is written - its
-    // pad position spent there and then, recorded on disk - and the gate
-    // decides only which sealed message may be on the wire. That is what
-    // lets a whole conversation be written to somebody who is not there
-    // without any of it waiting around as plaintext.
-    // Never taken for a text any more: the pad queue is always there, so
-    // `send_now` seals it and puts it on disk rather than holding the
-    // plaintext in memory where a restart loses it. Kept for the content
-    // phase, which still queues in memory by its own two-phase design.
-    if unacked && session.otp_outbox.is_none() {
+    //
+    // With the durable queue behind us, the gate no longer decides whether
+    // to *encrypt* - a message is sealed the moment it is written, its pad
+    // position spent there and then, and the gate decides only which
+    // sealed message may be on the wire. With one exception, and it is the
+    // whole of `must_hold_plaintext`: sealing ahead is only safe while the
+    // outstanding message is one the queue holds, because the queue is
+    // what retries it. A spend the queue never held - a file offer, a
+    // file's content, the end notice, a text sent before the queue existed
+    // - is retried from the tool's `.last_sent` copy, which is one deep and
+    // overwritten by every seal; a text sealed behind it would replace the
+    // only recoverable copy of a message the peer's decoder is still
+    // waiting on, and recovery would then replay the text's bytes under
+    // the offer's sequence forever. So while such a spend is outstanding
+    // the text waits here as plaintext, in memory, and `flush_one_queued`
+    // seals it the moment that spend's genuine acknowledgement arrives.
+    if must_hold_plaintext(session, contact_name) {
         let item = match channel {
             Some(ch) => PendingOtpSend::Channel {
                 channel: ch,
@@ -4621,6 +4653,21 @@ async fn send_voice_offer_queued(
     let fail = |ui_state: &mut UiState, message: String| {
         notify(ui_state, to, &peer_name, message, false);
     };
+
+    // Sealing ahead is only safe behind a spend the queue itself holds
+    // (`must_hold_plaintext`'s doc): behind a file offer, a file's content
+    // or an end notice still awaiting its acknowledgement, these two seals
+    // would overwrite the tool's one-deep `.last_sent` copy - the only bytes
+    // that spend can be recovered from. Refused rather than held: unlike a
+    // text there is no in-memory plaintext queue shaped for a recording,
+    // and the user can simply record again once that send is acknowledged.
+    if must_hold_plaintext(session, contact_name) {
+        fail(
+            ui_state,
+            "OTP: a previous send to this contact hasn't been acknowledged yet - this voice message wasn't sent".to_string(),
+        );
+        return Ok(());
+    }
 
     let payload = crate::client::file_transfer::VoiceOfferPayload { duration_ms };
     let Ok(offer_plaintext) = proto::encode(&payload) else {

@@ -5791,3 +5791,149 @@ async fn a_genuinely_lost_acknowledgement_is_recovered_by_the_timer() {
          written after it stops for good"
     );
 }
+
+// ---------------------------------------------------------------------
+// Sealing ahead is only safe behind a spend the queue holds (TB-286)
+// ---------------------------------------------------------------------
+
+/// A file offer is a spend the durable queue never holds: its only retry
+/// copy is the tool's one-deep `.last_sent`. A text typed while that offer
+/// is still unacknowledged must therefore *not* be sealed - sealing would
+/// overwrite that copy, and recovery would then replay the text's bytes
+/// under the offer's sequence forever. It waits as plaintext, recovery
+/// still replays the offer's own bytes, and the text seals the moment the
+/// offer's genuine acknowledgement arrives.
+///
+/// A `Direct` pair, so the envelope's single block *is* the pad ciphertext
+/// and the recovered bytes can be compared to the original byte for byte.
+///
+/// @requirement TB-286
+#[tokio::test]
+async fn a_text_behind_an_unacknowledged_file_offer_waits_rather_than_overwriting_its_recovery_copy() {
+    if !require_otp() {
+        return;
+    }
+    let (mut alice, mut bob, contact) = pair("hold-behind-offer", Id::Opaque, Id::Opaque).await;
+    alice.ui.mark_otp_active(BOB);
+
+    let dir = scratch("hold-behind-offer-payload");
+    let source = dir.join("notes.txt");
+    std::fs::write(&source, b"the offered file").unwrap();
+    send_file(&mut alice, &contact, source, 16).await;
+    assert!(alice.gate_held(&contact), "the offer is a real, non-queued spend");
+    let (stream_id, offer_seq, offer_env, offer_device) = take_file_offer(&mut alice);
+    let spent_after_offer = alice.pad_spent(&contact).await;
+
+    let msg_id = send_text(&mut alice, &contact, "typed while the offer is out").await;
+
+    assert_eq!(
+        alice.pad_spent(&contact).await,
+        spent_after_offer,
+        "the text must not be sealed while the offer's .last_sent copy is the only one"
+    );
+    assert_eq!(alice.session.otp_queued_total(), 0, "nothing sealed, so nothing durably queued");
+    assert_eq!(alice.session.otp_held_plaintext_for(&contact), 1, "it waits as plaintext");
+    assert!(
+        alice.ui.status_notice.clone().is_some_and(|(m, _)| m.contains("queued")),
+        "and the user is told it is waiting"
+    );
+
+    // A link flap's recovery pass replays the *offer* - byte-identical.
+    let sent_before = alice.queued().len();
+    aloo::client::otp::recover_and_resend(&mut NullSink, &mut alice.session, &mut alice.ui)
+        .await
+        .expect("recovery should not fail");
+    let recovered = alice
+        .queued()
+        .into_iter()
+        .skip(sent_before)
+        .find_map(|p| match p {
+            P2pPayload::OtpFileOffer { seq, envelope, .. } => Some((seq, envelope)),
+            _ => None,
+        })
+        .expect("the outstanding offer is what recovery resends");
+    assert_eq!(recovered.0, offer_seq);
+    assert_eq!(
+        recovered.1.blocks, offer_env.blocks,
+        "recovery replays the offer's own ciphertext, not the text's"
+    );
+
+    // The offer lands and is acknowledged; only now does the text seal.
+    aloo::client::otp::on_file_offer(
+        &mut bob.session,
+        &mut bob.ui,
+        None,
+        ALICE,
+        "alice".into(),
+        stream_id,
+        offer_seq,
+        offer_env,
+        offer_device,
+    )
+    .await;
+    let (a_seq, a_proof) = last_ack(&mut bob);
+    ack(&mut alice, BOB, a_seq, a_proof).await;
+
+    assert!(
+        alice.pad_spent(&contact).await > spent_after_offer,
+        "the held text is sealed once the offer's acknowledgement frees the gate"
+    );
+    assert_eq!(alice.session.otp_held_plaintext_for(&contact), 0);
+    let (seq, sent_msg_id, envelope, device) = alice
+        .queued()
+        .into_iter()
+        .filter_map(|p| match p {
+            P2pPayload::OtpEnvelope {
+                seq,
+                msg_id,
+                envelope,
+                sender_device_id,
+                ..
+            } => Some((seq, msg_id, envelope, sender_device_id)),
+            _ => None,
+        })
+        .next_back()
+        .expect("the text goes out after the offer");
+    assert_eq!(seq, offer_seq + 1, "in sequence, right behind the offer");
+    assert_eq!(sent_msg_id, Some(msg_id));
+    receive_text(&mut bob, seq, sent_msg_id, envelope, device).await;
+    let delivered = bob
+        .ui
+        .private_rooms
+        .values()
+        .flat_map(|r| r.log.iter())
+        .any(|e| matches!(&e.body, MessageBody::Text(t) if t == "typed while the offer is out"));
+    assert!(delivered, "and decrypts in order on the other side");
+}
+
+/// The queued voice path seals two positions on the spot, so it is held to
+/// the same rule: behind a non-queued spend it is refused outright, with
+/// nothing spent.
+///
+/// @requirement TB-286
+#[tokio::test]
+async fn a_voice_message_behind_an_unacknowledged_file_offer_is_refused_with_nothing_spent() {
+    if !require_otp() {
+        return;
+    }
+    let (mut alice, _bob, contact) = pair("voice-behind-offer", Id::Pq, Id::Pq).await;
+    alice.ui.mark_otp_active(BOB);
+
+    let dir = scratch("voice-behind-offer-payload");
+    let source = dir.join("notes.txt");
+    std::fs::write(&source, b"the offered file").unwrap();
+    send_file(&mut alice, &contact, source, 16).await;
+    let spent_after_offer = alice.pad_spent(&contact).await;
+
+    send_voice(&mut alice, &contact, b"recorded while the offer is out".to_vec()).await;
+
+    assert_eq!(
+        alice.pad_spent(&contact).await,
+        spent_after_offer,
+        "neither of the recording's two positions may be spent behind the offer"
+    );
+    assert_eq!(alice.session.otp_queued_total(), 0);
+    let (message, success) = alice.ui.status_notice.clone().expect("the refusal is explained");
+    assert!(!success);
+    assert!(message.contains("hasn't been acknowledged yet"), "{message:?}");
+}

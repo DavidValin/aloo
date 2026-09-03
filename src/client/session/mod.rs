@@ -1998,6 +1998,14 @@ impl SessionState {
     /// How many sealed pad messages are waiting across every contact.
     /// Each one is a spent pad position, which is why it is observable:
     /// whether the queue may be torn down turns on this being zero.
+    /// How many sends for `contact_name` are held back as plaintext, in
+    /// memory, waiting for a non-queued spend's acknowledgement
+    /// (`otp::must_hold_plaintext`) - a test's window onto the hold that
+    /// keeps `.last_sent` from being overwritten.
+    pub fn otp_held_plaintext_for(&self, contact_name: &str) -> usize {
+        self.otp_out_queue.len_for(contact_name)
+    }
+
     pub fn otp_queued_total(&self) -> usize {
         self.otp_outbox.as_ref().map(|o| o.total()).unwrap_or(0)
     }
