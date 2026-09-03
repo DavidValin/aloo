@@ -4465,6 +4465,18 @@ recovered and resent; here, it never had a ciphertext of its own to
 recover, only the raw `(seq, proof)` pair a plain `OtpDeliveryAck` is built
 from - which is exactly what `last_received_ack` durably records.
 
+Every one of these records lives in the per-contact store (`otp_store`,
+alongside its content-staging sibling and the OTP mail index), and the
+store itself is written the only way a crash cannot corrupt it: to a
+`.new` sibling, synced, then renamed over the old file. Truncating in
+place would let a kill or a power cut between the truncate and the write
+leave an empty store - every counter at zero, no gate armed - and the very
+next send would then spend a real pad position under a sequence number the
+peer's counter has long passed, while overwriting the previous message's
+only recovery copy. With the rename, a crash costs at most the single most
+recent mutation, which is exactly the window the write-ahead record below
+already reconciles.
+
 The same discipline survives the process itself dying mid-step, on either
 side. Every encrypt writes ahead what it is about to be
 (`encrypt_intent`), and that write is *checked* before anything is spent:

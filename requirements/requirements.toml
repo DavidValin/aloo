@@ -2230,6 +2230,11 @@ description = "Agreeing a pad session opens the room it is with, on both sides, 
 evidence = "docs/SPEC.md Functionality #15; docs/PROTOCOL.md 16.3, 16.6; src/client/tui/ui.rs UiState::open_otp_session, mark_otp_active; src/client/otp.rs on_session_request's accept, on_key_setup_ack; src/client/session.rs handle_server_message's UserJoined arm; tests agreeing_a_pad_session_opens_the_room_it_is_with, a_session_resumed_on_reconnect_does_not_steal_the_view"
 
 
+[[user_story.technical_behavior]]
+id = "TB-285"
+description = "Every OTP flat-file store - otp_store, its .pending_content sibling, and the OTP mail index - is saved by writing a `.new` sibling, syncing it, and renaming it over the old file (platform::write_atomic), never by truncating the file in place. An in-place truncate that a crash or power loss interrupts leaves an empty store, which loads as every counter at zero with no gate armed: the next send then passes -y to otp --encrypt, labels a genuinely later pad position as seq 0, and overwrites the still-unacknowledged message's only .last_sent recovery copy - a permanent desync with nothing left to recover from. With the rename, a crash costs at most the single most recent mutation, which is exactly the window the write-ahead encrypt intent (AC-313) already reconciles."
+evidence = "src/platform.rs write_atomic; src/client/otp_store.rs OtpStore::save, save_content_sends; src/client/otp_mail_store.rs OtpMailStore::save; tests save_replaces_the_store_by_rename_never_truncating_it_in_place (otp_store_test.rs), the_index_is_replaced_by_rename_never_truncated_in_place (otp_mail_store_test.rs)"
+
 # ============================================================================
 # US-021 - Connect with pq_hybrid without any manual key preparation
 # ============================================================================

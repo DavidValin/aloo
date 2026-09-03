@@ -905,3 +905,43 @@ fn a_store_with_no_pending_content_sibling_file_loads_with_nothing_staged() {
     assert_eq!(store.content_sends().count(), 0);
     std::fs::remove_file(&path).ok();
 }
+
+/// The store is replaced by rename, never truncated and refilled in place:
+/// a crash between those two steps used to leave an empty file, which
+/// loads as "every counter at zero, no gate armed" - the one state that
+/// makes the very next send permanently desync the pair. A rename swaps
+/// the inode; an in-place truncate keeps it.
+///
+/// @requirement TB-285
+#[cfg(unix)]
+#[test]
+fn save_replaces_the_store_by_rename_never_truncating_it_in_place() {
+    use std::os::unix::fs::MetadataExt;
+    let path = temp_store_path();
+    let mut store = OtpStore::new_empty(path.clone());
+    store.mark_provisioned("alice-bob");
+    store.save().unwrap();
+    let before = std::fs::metadata(&path).unwrap().ino();
+
+    store.record_sent("alice-bob", 4, PendingOtpContent::Text { channel: None }, None);
+    store.stage_content_send(7, "alice-bob", PathBuf::from("/tmp/staged.pcm"));
+    store.save().unwrap();
+
+    let after = std::fs::metadata(&path).unwrap().ino();
+    assert_ne!(
+        before, after,
+        "a save must land as a fresh file renamed into place, so the old contents \
+         stay whole until the new ones are entirely on disk"
+    );
+    let staged = PathBuf::from(format!("{}.new", path.display()));
+    assert!(!staged.exists(), "the staging sibling is consumed by the rename");
+    let sibling_staged = PathBuf::from(format!("{}.pending_content.new", path.display()));
+    assert!(!sibling_staged.exists(), "and so is the content-sends file's");
+
+    let loaded = OtpStore::load(&path).unwrap();
+    assert_eq!(loaded.get("alice-bob").unwrap().pending_unacked_out_seq, Some(4));
+    assert_eq!(loaded.content_sends().count(), 1);
+
+    std::fs::remove_file(&path).ok();
+    std::fs::remove_file(format!("{}.pending_content", path.display())).ok();
+}

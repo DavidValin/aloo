@@ -238,7 +238,10 @@ impl OtpMailStore {
                 r.mail_id, r.from, r.sent_at_utc, r.received_at_utc, r.size, r.read as u8
             ));
         }
-        fs::write(self.index_path(), out)
+        // Same staged write every OTP store uses (`platform::write_atomic`):
+        // a mail acknowledged to the server but missing from a truncated
+        // index would be gone for good.
+        crate::platform::write_atomic(&self.index_path(), out.as_bytes())
     }
 
     // ---------------------------------------------------------------

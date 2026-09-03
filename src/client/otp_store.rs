@@ -28,7 +28,6 @@
 //! `client::otp`'s send-path gating.
 
 use std::collections::HashMap;
-use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -848,7 +847,10 @@ impl OtpStore {
             }
             out.push('\n');
         }
-        fs::write(&self.path, out)?;
+        // Staged and renamed, never truncated in place: a crash mid-write
+        // must not turn every counter in here into zero
+        // (`platform::write_atomic`).
+        crate::platform::write_atomic(&self.path, out.as_bytes())?;
         self.save_content_sends()
     }
 
@@ -865,7 +867,7 @@ impl OtpStore {
             out.push_str(&target.path.to_string_lossy());
             out.push('\n');
         }
-        fs::write(Self::content_sends_path(&self.path), out)
+        crate::platform::write_atomic(&Self::content_sends_path(&self.path), out.as_bytes())
     }
 }
 

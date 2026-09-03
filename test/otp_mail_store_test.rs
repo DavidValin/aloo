@@ -264,3 +264,32 @@ fn a_line_written_before_read_existed_loads_as_read() {
     assert_eq!(store.unread_received_count(), 0);
     assert!(store.received_ref("id0000").unwrap().read);
 }
+
+/// The index is replaced by rename, never truncated in place - the same
+/// guarantee `otp_store` gives, for the same reason: a mail already
+/// acknowledged to the server but lost from a half-written index is gone
+/// for good.
+///
+/// @requirement TB-285
+#[cfg(unix)]
+#[test]
+fn the_index_is_replaced_by_rename_never_truncated_in_place() {
+    use std::os::unix::fs::MetadataExt;
+    let temp = TempStore::new("atomic-index");
+    let mut store = temp.store();
+    store.record_sent(sent(1, SentMailStatus::AwaitingServerAck));
+    store.save().unwrap();
+    let index = temp.dir.join("index");
+    let before = std::fs::metadata(&index).unwrap().ino();
+
+    store.record_sent(sent(2, SentMailStatus::StoredOnServer));
+    store.save().unwrap();
+
+    assert_ne!(
+        before,
+        std::fs::metadata(&index).unwrap().ino(),
+        "each save is a fresh file renamed over the index"
+    );
+    assert!(!temp.dir.join("index.new").exists());
+    assert_eq!(OtpMailStore::load(temp.dir.clone()).unwrap().sent_refs().len(), 2);
+}

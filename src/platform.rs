@@ -117,6 +117,33 @@ pub(crate) fn ensure_parent_dir(path: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Replaces `path`'s contents in one step: written to a `.new` sibling,
+/// flushed to disk, then renamed over `path`.
+///
+/// `fs::write` truncates first and fills in afterwards, so a process that
+/// dies (or loses power) between the two leaves an empty or half-written
+/// file - and for a store like `otp_store`, whose every line is a pad
+/// position or an acknowledgement gate, "empty" reads as "start every
+/// counter from zero", which is a permanent desync at the next send. With
+/// the rename the old contents stay intact until the new ones are wholly
+/// on disk, and a crash costs at most the single most recent mutation -
+/// exactly the window the OTP layer's write-ahead intent already
+/// tolerates. A leftover `.new` is simply overwritten by the next save;
+/// nothing reads it.
+pub(crate) fn write_atomic(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    ensure_parent_dir(path)?;
+    let mut staged = path.as_os_str().to_owned();
+    staged.push(".new");
+    let staged = std::path::PathBuf::from(staged);
+    {
+        let mut file = std::fs::File::create(&staged)?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+    }
+    std::fs::rename(&staged, path)
+}
+
 /// `path`'s contents, or `None` if it does not exist yet.
 ///
 /// A store that has never been written is not an error - it is an empty
