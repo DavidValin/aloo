@@ -79,6 +79,17 @@ pub fn ack_proof_for(nonce: &[u8]) -> AckProof {
     Sha256::digest(nonce).into()
 }
 
+/// A fresh ack nonce and the proof it will be answered with, drawn
+/// *before* the encrypt that buries it - so the proof can be written ahead
+/// with the spend's intent (`client::otp_store::OtpContactState::
+/// encrypt_intent_proof`) and a spend orphaned by a crash still knows what
+/// acknowledgement to insist on.
+pub fn fresh_ack_nonce() -> (Vec<u8>, AckProof) {
+    let nonce = crate::crypto::random_bytes(ACK_NONCE_BYTES);
+    let proof = ack_proof_for(&nonce);
+    (nonce, proof)
+}
+
 /// A SHA-256 digest of one key half, used to prove both sides ended up
 /// holding byte-identical pad material before either installs it.
 ///

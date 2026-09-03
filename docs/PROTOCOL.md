@@ -4495,7 +4495,18 @@ between the tool's encrypt succeeding and
 the spend being recorded is reconciled at the next startup: the tool's
 own counter says whether anything was spent, and a real orphan is promoted
 to an ordinary recorded send that recovery then resends - never silently
-leapfrogged by the next message. A kill between a *decrypt* succeeding and
+leapfrogged by the next message. The record carries the acknowledgement
+proof too: the nonce is drawn before the encrypt and its hash written
+ahead alongside the intent, since afterwards it is under the pad and the
+tool's kept copy is ciphertext - so a promoted send insists on the same
+proof any other send does rather than opening its gate to anyone who saw
+the packet. When such an orphan is found behind a
+queue that was still draining (the pad queue seals ahead of an armed
+gate, so the orphan is sequenced after everything queued), its record is
+left standing instead: every new seal for that contact waits, the queue
+drains, and the moment the gate clears with nothing queued the orphan is
+promoted onto it and recovered from the tool's kept copy, which nothing
+could have overwritten in between. A kill between a *decrypt* succeeding and
 its acceptance being recorded is healed at the moment the sender's retry
 is refused: the exact off-by-one between the tool's counter and the
 store's identifies the crash shape, and the orphaned plaintext - nonce

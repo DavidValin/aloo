@@ -177,6 +177,16 @@ pub struct OtpContactState {
     /// entering while an encrypt is mid-flight queues behind it exactly as
     /// it would behind an armed gate (`client::otp::send_or_queue`).
     pub encrypt_intent: Option<PendingOtpContent>,
+    /// The acknowledgement proof the spend `encrypt_intent` announces will
+    /// have to be answered with - `sha256` of the nonce chosen *before* the
+    /// encrypt (`crypto::otp::fresh_ack_nonce`), or the plaintext digest of
+    /// a content transfer. Recorded alongside the intent because it is the
+    /// one thing a promoted orphan cannot recover afterwards: the tool's
+    /// kept `.last_sent` copy is ciphertext, and the nonce is under the pad.
+    /// A promoted send without it would have to accept *any* proof for its
+    /// position - which is exactly what the proof exists to prevent. `None`
+    /// for a mail, acknowledged by the server rather than a pad proof.
+    pub encrypt_intent_proof: Option<[u8; 32]>,
     /// `true` from the moment this side - the pad's *generator* - installs
     /// its half and sends `OtpPadCommit`, until the peer's
     /// `OtpPadCommitAck` confirms they installed theirs. The commit is the
@@ -211,6 +221,21 @@ pub struct OtpContactState {
     /// device-qualified, and its device data arrives over the separate
     /// `DeviceIdAnnounce`).
     pub bound_peer_device_id: Option<String>,
+    /// A spend `encrypt_intent` announced that startup reconciliation
+    /// found real (the tool one position ahead of `next_out_seq`) but
+    /// could not promote, because another send still held the gate - the
+    /// pad queue seals ahead of an armed gate, so the orphan is sequenced
+    /// behind everything queued (`client::otp::reconcile_orphaned_sends`).
+    /// Parked here rather than left in `encrypt_intent`, which every
+    /// `record_sent`/`record_sealed` retires as its own: the pump releasing
+    /// the next queued entry would otherwise wipe the only record of the
+    /// orphan. Counts as an encrypt in flight (`encrypt_in_flight`), so no
+    /// new seal can overwrite the orphan's `.last_sent` copy or leapfrog its
+    /// position; `client::otp::settle_deferred_orphan` promotes it onto the
+    /// gate once the queue has drained.
+    pub deferred_spend: Option<PendingOtpContent>,
+    /// `encrypt_intent_proof`, parked alongside `deferred_spend`.
+    pub deferred_spend_proof: Option<[u8; 32]>,
 }
 
 /// A `contact_name -> OtpContactState` store, backed by a small flat file:
@@ -230,8 +255,11 @@ pub struct OtpContactState {
 /// (the latter hex too, both empty or absent together meaning `None`), and
 /// finally `pending_commit` (`1`/empty like `pending_end_notice`),
 /// `encrypt_intent` (the same encoding `pending_content` uses, empty when
-/// `None`), and `bound_peer_device_id` (the raw device_id string, empty
-/// when `None` - device-pinning plan §5) follow the same tolerance again.
+/// `None`), `bound_peer_device_id` (the raw device_id string, empty
+/// when `None` - device-pinning plan §5), `deferred_spend` (the same
+/// encoding `pending_content` uses, empty when `None`), and the two hex
+/// proof columns `encrypt_intent_proof`/`deferred_spend_proof` follow the
+/// same tolerance again.
 pub struct OtpStore {
     path: PathBuf,
     entries: HashMap<String, OtpContactState>,
@@ -524,28 +552,72 @@ impl OtpStore {
     /// The caller must save before running the encrypt, or the record
     /// protects nothing.
     pub fn set_encrypt_intent(&mut self, contact_name: &str, content: PendingOtpContent) {
-        self.entries
-            .entry(contact_name.to_string())
-            .or_default()
-            .encrypt_intent = Some(content);
+        self.set_encrypt_intent_with_proof(contact_name, content, None);
+    }
+
+    /// `set_encrypt_intent`, also recording the proof the announced spend
+    /// will be acknowledged with (`encrypt_intent_proof`'s doc).
+    pub fn set_encrypt_intent_with_proof(
+        &mut self,
+        contact_name: &str,
+        content: PendingOtpContent,
+        proof: Option<[u8; 32]>,
+    ) {
+        let state = self.entries.entry(contact_name.to_string()).or_default();
+        state.encrypt_intent = Some(content);
+        state.encrypt_intent_proof = proof;
     }
 
     /// Drops a write-ahead intent whose encrypt never ran (it failed, or
     /// reconciliation found the tool's counter unmoved). Returns what was
     /// recorded, for a caller cleaning up whatever else the intent staged.
     pub fn clear_encrypt_intent(&mut self, contact_name: &str) -> Option<PendingOtpContent> {
-        self.entries
-            .get_mut(contact_name)?
-            .encrypt_intent
-            .take()
+        let state = self.entries.get_mut(contact_name)?;
+        state.encrypt_intent_proof = None;
+        state.encrypt_intent.take()
+    }
+
+    /// The proof recorded with `contact_name`'s standing intent, if any.
+    pub fn encrypt_intent_proof(&self, contact_name: &str) -> Option<[u8; 32]> {
+        self.entries.get(contact_name)?.encrypt_intent_proof
     }
 
     /// Whether an encrypt is mid-flight for `contact_name` right now - the
-    /// same-process half of `encrypt_intent`'s guard.
+    /// same-process half of `encrypt_intent`'s guard - or a reconciled
+    /// spend is still parked awaiting promotion (`deferred_spend`), which
+    /// holds new seals for exactly the same reason.
     pub fn encrypt_in_flight(&self, contact_name: &str) -> bool {
         self.entries
             .get(contact_name)
-            .is_some_and(|s| s.encrypt_intent.is_some())
+            .is_some_and(|s| s.encrypt_intent.is_some() || s.deferred_spend.is_some())
+    }
+
+    /// Moves `contact_name`'s write-ahead intent into `deferred_spend` -
+    /// reconciliation's answer to an orphan it has proven real but cannot
+    /// yet promote (`deferred_spend`'s doc).
+    pub fn defer_encrypt_intent(&mut self, contact_name: &str) {
+        if let Some(state) = self.entries.get_mut(contact_name)
+            && let Some(intent) = state.encrypt_intent.take()
+        {
+            state.deferred_spend = Some(intent);
+            state.deferred_spend_proof = state.encrypt_intent_proof.take();
+        }
+    }
+
+    /// Takes the parked spend for `contact_name` and its proof, if any -
+    /// for `settle_deferred_orphan`, which either promotes it or drops it.
+    pub fn take_deferred_spend(
+        &mut self,
+        contact_name: &str,
+    ) -> Option<(PendingOtpContent, Option<[u8; 32]>)> {
+        let state = self.entries.get_mut(contact_name)?;
+        let spend = state.deferred_spend.take()?;
+        Some((spend, state.deferred_spend_proof.take()))
+    }
+
+    /// The parked spend for `contact_name`, if any - read-only.
+    pub fn deferred_spend(&self, contact_name: &str) -> Option<&PendingOtpContent> {
+        self.entries.get(contact_name)?.deferred_spend.as_ref()
     }
 
     /// Every contact holding a write-ahead intent - at startup, each one is
@@ -684,6 +756,7 @@ impl OtpStore {
         // The spend this intent announced is now fully recorded, exactly
         // as in `record_sent` (`encrypt_intent`'s doc).
         state.encrypt_intent = None;
+        state.encrypt_intent_proof = None;
     }
 
     /// Arms the single-outstanding-send gate for a position whose message
@@ -711,6 +784,7 @@ impl OtpStore {
         // The spend this intent announced is now fully recorded - the
         // write-ahead record has done its job (`encrypt_intent`'s doc).
         state.encrypt_intent = None;
+        state.encrypt_intent_proof = None;
     }
 
     /// Clears `pending_unacked_out_seq` iff it currently equals `seq` -
@@ -860,6 +934,18 @@ impl OtpStore {
             out.push('\t');
             if let Some(device_id) = &state.bound_peer_device_id {
                 out.push_str(device_id);
+            }
+            out.push('\t');
+            if let Some(spend) = &state.deferred_spend {
+                out.push_str(&encode_pending_content(spend));
+            }
+            out.push('\t');
+            if let Some(proof) = state.encrypt_intent_proof {
+                out.push_str(&crate::crypto::hex_encode(&proof));
+            }
+            out.push('\t');
+            if let Some(proof) = state.deferred_spend_proof {
+                out.push_str(&crate::crypto::hex_encode(&proof));
             }
             out.push('\n');
         }
@@ -1034,6 +1120,11 @@ fn parse_line(line: &str) -> Option<(String, OtpContactState)> {
     // contact which never sets this at all) reads as "no device bound
     // yet".
     let bound_peer_device_id = parts.next().filter(|s| !s.is_empty()).map(str::to_string);
+    // Same tolerance again: absent (an older store) reads as "nothing
+    // parked" - a store written before deferral existed never had one.
+    let deferred_spend = parts.next().and_then(decode_pending_content);
+    let encrypt_intent_proof = next_hex32(&mut parts);
+    let deferred_spend_proof = next_hex32(&mut parts);
     Some((
         name,
         OtpContactState {
@@ -1050,6 +1141,9 @@ fn parse_line(line: &str) -> Option<(String, OtpContactState)> {
             pending_commit,
             encrypt_intent,
             bound_peer_device_id,
+            deferred_spend,
+            encrypt_intent_proof,
+            deferred_spend_proof,
         },
     ))
 }

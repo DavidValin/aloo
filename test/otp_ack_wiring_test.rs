@@ -2941,14 +2941,17 @@ async fn a_spend_orphaned_by_a_crash_is_promoted_from_its_write_ahead_intent() {
     }
     let (mut alice, _bob, contact) = pair("orphaned-encrypt-promote", Id::Pq, Id::Pq).await;
 
-    // The write-ahead record, exactly as `send_now` writes it...
-    alice.session.otp_store_mut().set_encrypt_intent(
+    // The write-ahead record, exactly as `send_now` writes it - the nonce
+    // drawn first so its proof is recorded with the intent...
+    let (nonce, proof) = aloo::crypto::otp::fresh_ack_nonce();
+    alice.session.otp_store_mut().set_encrypt_intent_with_proof(
         &contact,
         aloo::client::otp_store::PendingOtpContent::Text { channel: None },
+        Some(proof),
     );
     // ...then the encrypt itself - the tool advances - and the process
     // dies before `record_sent` ever runs.
-    let spent = aloo::client::otp::wrap_outgoing(&alice.otp, b"orphaned".to_vec(), &contact)
+    let spent = aloo::client::otp::wrap_outgoing_with_nonce(&alice.otp, b"orphaned".to_vec(), &contact, nonce)
         .await
         .expect("the simulated pre-crash encrypt should succeed");
     drop(spent);
@@ -2975,6 +2978,12 @@ async fn a_spend_orphaned_by_a_crash_is_promoted_from_its_write_ahead_intent() {
         "under the framing the intent announced"
     );
     assert_eq!(state.encrypt_intent, None, "the intent has done its job");
+    assert_eq!(
+        state.pending_ack_proof,
+        Some(proof),
+        "the promoted send insists on the very proof its intent recorded - the tool's kept \
+         copy is ciphertext, so nothing else could have supplied it"
+    );
 
     // The standard recovery pass resends the tool's kept ciphertext -
     // spending nothing further.
@@ -5528,7 +5537,10 @@ async fn an_unreadable_pad_does_not_discard_the_record_of_an_interrupted_send() 
 /// requirement every other send carries. Recorded with no proof,
 /// `record_acked` accepts *any* value for that position - so anyone who
 /// merely saw the packet could open the gate, which is exactly what the
-/// proof exists to prevent.
+/// proof exists to prevent. The proof cannot be recovered after the fact -
+/// the tool's kept `.last_sent` copy is ciphertext and the nonce is under
+/// the pad - so it is written ahead with the intent, and promotion carries
+/// that recorded value.
 /// @requirement AC-424
 #[tokio::test]
 async fn a_promoted_send_still_demands_a_real_acknowledgement() {
@@ -5537,11 +5549,13 @@ async fn a_promoted_send_still_demands_a_real_acknowledgement() {
     }
     let (mut alice, _bob, contact) = pair("promoted-keeps-proof", Id::Pq, Id::Pq).await;
 
-    alice.session.otp_store_mut().set_encrypt_intent(
+    let (nonce, expected_proof) = aloo::crypto::otp::fresh_ack_nonce();
+    alice.session.otp_store_mut().set_encrypt_intent_with_proof(
         &contact,
         aloo::client::otp_store::PendingOtpContent::Text { channel: None },
+        Some(expected_proof),
     );
-    let sealed = aloo::client::otp::wrap_outgoing(&alice.otp, b"orphaned".to_vec(), &contact)
+    let sealed = aloo::client::otp::wrap_outgoing_with_nonce(&alice.otp, b"orphaned".to_vec(), &contact, nonce)
         .await
         .expect("the simulated pre-crash encrypt should succeed");
     drop(sealed);
@@ -5559,8 +5573,9 @@ async fn a_promoted_send_still_demands_a_real_acknowledgement() {
     };
     let proof = recorded.expect(
         "a promoted send must carry the proof its acknowledgement will have to \
-         match, recovered from the tool's own kept copy",
+         match, written ahead with its intent",
     );
+    assert_eq!(proof, expected_proof, "and it is the one the intent recorded");
 
     // A wrong proof must not open it...
     assert!(
@@ -6173,4 +6188,142 @@ async fn a_content_decrypt_orphaned_by_a_crash_is_healed_from_the_tools_safety_c
         bob.session.otp_store_mut().is_next_expected(&contact, content_seq + 1),
         "and the receiver's expectation moved past the healed position"
     );
+}
+
+// ---------------------------------------------------------------------
+// An orphaned spend behind a draining queue is promoted, not dropped (TB-290)
+// ---------------------------------------------------------------------
+
+/// The pad queue seals ahead of an armed gate, so a kill between an
+/// encrypt and its `record_sealed` leaves a real spend that is sequenced
+/// *after* everything queued while an earlier send still holds the gate.
+/// Startup reconciliation used to read that armed gate as "stale intent"
+/// and drop the record - the next seal then leapfrogged the orphan, and
+/// the peer's tool refused its bytes at the orphan's position for good.
+/// Now the intent stands: every new seal for the contact waits, the queue
+/// drains, and the moment the gate clears the orphan is promoted onto it
+/// and recovered from `.last_sent`, which nothing could overwrite meanwhile.
+///
+/// @requirement TB-290
+#[tokio::test]
+async fn an_orphaned_spend_behind_a_draining_queue_is_promoted_once_the_gate_clears() {
+    if !require_otp() {
+        return;
+    }
+    let (mut alice, mut bob, contact) = pair("deferred-orphan", Id::Opaque, Id::Opaque).await;
+    alice.ui.mark_otp_active(BOB);
+
+    send_text(&mut alice, &contact, "first").await;
+    send_text(&mut alice, &contact, "second").await;
+    assert_eq!(alice.session.otp_queued_for(&contact), 2);
+    let front_seq = alice
+        .session
+        .otp_store_mut()
+        .get(&contact)
+        .and_then(|s| s.pending_unacked_out_seq)
+        .expect("the front is on the wire");
+
+    // The interrupted third seal: intent written, tool advanced, process
+    // dead before `record_sealed`.
+    let (orphan_nonce, orphan_proof) = aloo::crypto::otp::fresh_ack_nonce();
+    alice.session.otp_store_mut().set_encrypt_intent_with_proof(
+        &contact,
+        aloo::client::otp_store::PendingOtpContent::Text { channel: None },
+        Some(orphan_proof),
+    );
+    // What goes under the pad is the routing header plus the text
+    // (`otp::OtpInner`, private - mirrored here field for field, since
+    // bincode encodes by position), exactly as `build_otp_envelope` frames
+    // it, so bob's receive path opens it like any other message.
+    #[derive(serde::Serialize)]
+    struct Inner {
+        channel: Option<String>,
+        payload: Vec<u8>,
+    }
+    let inner = aloo::proto::encode(&Inner {
+        channel: None,
+        payload: b"third, orphaned".to_vec(),
+    })
+    .unwrap();
+    let orphan_bytes = aloo::client::otp::wrap_outgoing_with_nonce(&alice.otp, inner, &contact, orphan_nonce)
+        .await
+        .expect("the pre-crash encrypt succeeds");
+    let orphan_seq = alice.session.otp_store_mut().get(&contact).unwrap().next_out_seq;
+    let spent_at_crash = alice.pad_spent(&contact).await;
+
+    // Restart: reconciliation must neither drop the record nor promote it
+    // over the queued front.
+    let promoted = aloo::client::otp::reconcile_orphaned_sends(&alice.otp, alice.session.otp_store_mut()).await;
+    assert!(promoted.is_empty(), "nothing is promoted while the queue front holds the gate");
+    let state = alice.session.otp_store_mut().get(&contact).cloned().unwrap();
+    assert!(state.encrypt_intent.is_none(), "the write-ahead slot is free for the next seal's own record");
+    assert!(state.deferred_spend.is_some(), "the record of the orphaned spend stands, parked");
+    assert!(alice.session.otp_store_mut().encrypt_in_flight(&contact), "and it holds every new seal");
+    assert_eq!(state.pending_unacked_out_seq, Some(front_seq), "the front keeps the gate");
+
+    // Anything written meanwhile waits - a seal now would overwrite the
+    // orphan's only copy and leapfrog its position.
+    send_text(&mut alice, &contact, "fourth, written after the restart").await;
+    assert_eq!(alice.pad_spent(&contact).await, spent_at_crash, "held, not sealed");
+    assert_eq!(alice.session.otp_held_plaintext_for(&contact), 1);
+
+    // The queue drains: first, then second, each acknowledged for real.
+    for _ in 0..2 {
+        let (seq, msg_id, envelope, device) = alice
+            .queued()
+            .into_iter()
+            .filter_map(|p| match p {
+                P2pPayload::OtpEnvelope { seq, msg_id, envelope, sender_device_id, .. } => {
+                    Some((seq, msg_id, envelope, sender_device_id))
+                }
+                _ => None,
+            })
+            .next_back()
+            .expect("the front is on the wire");
+        receive_text(&mut bob, seq, msg_id, envelope, device).await;
+        let (ack_seq, proof) = last_ack(&mut bob);
+        ack(&mut alice, BOB, ack_seq, proof).await;
+    }
+    assert_eq!(alice.session.otp_queued_for(&contact), 0, "the queue has drained");
+
+    // The gate clearing with nothing queued is what promotes the orphan.
+    let state = alice.session.otp_store_mut().get(&contact).cloned().unwrap();
+    assert_eq!(state.pending_unacked_out_seq, Some(orphan_seq), "the orphan now holds the gate");
+    assert!(state.deferred_spend.is_none(), "and its parked record is retired");
+    assert_eq!(state.pending_ack_proof, Some(orphan_proof), "insisting on the proof its intent recorded");
+    assert_eq!(alice.session.otp_held_plaintext_for(&contact), 1, "the fourth still waits behind it");
+    assert_eq!(alice.pad_spent(&contact).await, spent_at_crash, "nothing new was sealed");
+
+    // Recovery carries it - the very bytes the interrupted encrypt made.
+    let sent_before = alice.queued().len();
+    aloo::client::otp::recover_and_resend(&mut NullSink, &mut alice.session, &mut alice.ui)
+        .await
+        .expect("recovery");
+    let (seq, msg_id, envelope, device) = alice
+        .queued()
+        .into_iter()
+        .skip(sent_before)
+        .find_map(|p| match p {
+            P2pPayload::OtpEnvelope { seq, msg_id, envelope, sender_device_id, .. } => {
+                Some((seq, msg_id, envelope, sender_device_id))
+            }
+            _ => None,
+        })
+        .expect("the orphan is resent");
+    assert_eq!(seq, orphan_seq);
+    assert_eq!(envelope.blocks, vec![orphan_bytes], "byte-identical to the interrupted encrypt");
+
+    // It lands in order, its ack opens the gate, and the fourth finally seals.
+    receive_text(&mut bob, seq, msg_id, envelope, device).await;
+    let delivered = bob
+        .ui
+        .private_rooms
+        .values()
+        .flat_map(|r| r.log.iter())
+        .any(|e| matches!(&e.body, MessageBody::Text(t) if t == "third, orphaned"));
+    assert!(delivered);
+    let (ack_seq, proof) = last_ack(&mut bob);
+    ack(&mut alice, BOB, ack_seq, proof).await;
+    assert_eq!(alice.session.otp_held_plaintext_for(&contact), 0);
+    assert!(alice.pad_spent(&contact).await > spent_at_crash, "the fourth sealed behind it");
 }

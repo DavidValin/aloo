@@ -391,6 +391,8 @@ pub async fn handle_send(
         crate::client::otp_store::PendingOtpContent::Mail {
             mail_id: mail_id.clone(),
         },
+        // Acknowledged by the server's storage, never by a pad proof.
+        None,
     ) {
         fail(
             ui_state,

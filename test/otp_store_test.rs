@@ -945,3 +945,40 @@ fn save_replaces_the_store_by_rename_never_truncating_it_in_place() {
     std::fs::remove_file(&path).ok();
     std::fs::remove_file(format!("{}.pending_content", path.display())).ok();
 }
+
+/// The proof written ahead with an intent, and a spend parked for later
+/// promotion with its own, both survive a restart - they are the only
+/// record of what a promoted orphan's acknowledgement must match.
+///
+/// @requirement TB-291
+#[test]
+fn an_intent_proof_and_a_parked_spend_round_trip_through_save_and_load() {
+    let path = temp_store_path();
+    let mut store = OtpStore::new_empty(path.clone());
+    store.mark_provisioned("alice-bob");
+    store.set_encrypt_intent_with_proof(
+        "alice-bob",
+        PendingOtpContent::Text { channel: None },
+        Some([7; 32]),
+    );
+    store.save().unwrap();
+    let loaded = OtpStore::load(&path).unwrap();
+    assert_eq!(loaded.encrypt_intent_proof("alice-bob"), Some([7; 32]));
+
+    // Parked: the intent and its proof move together, and hold new seals.
+    store.defer_encrypt_intent("alice-bob");
+    assert!(store.encrypt_in_flight("alice-bob"), "a parked spend holds every new seal");
+    assert_eq!(store.encrypt_intent_proof("alice-bob"), None, "the intent slot is free again");
+    store.save().unwrap();
+    let mut loaded = OtpStore::load(&path).unwrap();
+    assert!(loaded.encrypt_in_flight("alice-bob"));
+    assert_eq!(
+        loaded.take_deferred_spend("alice-bob"),
+        Some((PendingOtpContent::Text { channel: None }, Some([7; 32]))),
+        "promotion gets the very proof the intent recorded"
+    );
+    assert!(!loaded.encrypt_in_flight("alice-bob"));
+
+    std::fs::remove_file(&path).ok();
+    std::fs::remove_file(format!("{}.pending_content", path.display())).ok();
+}

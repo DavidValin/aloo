@@ -46,13 +46,22 @@ fn notify(ui_state: &mut UiState, peer: UserId, peer_name: &str, message: String
 /// is a full disk: setting the intent in memory still succeeds and only the
 /// save does not. The intent is rolled back on failure so nothing is left
 /// claiming a spend that never happened.
+///
+/// `proof` is what the spend will be acknowledged with, chosen before the
+/// encrypt (`crypto::otp::fresh_ack_nonce`, or a content file's digest) so
+/// it survives alongside the intent: a promoted orphan cannot recover it
+/// afterwards - the tool's kept copy is ciphertext - and without it would
+/// have to accept any proof at all for its position.
 #[must_use]
 pub(crate) fn stage_encrypt_intent(
     session: &mut SessionState,
     contact_name: &str,
     content: crate::client::otp_store::PendingOtpContent,
+    proof: Option<crypto::otp::AckProof>,
 ) -> bool {
-    session.otp_store.set_encrypt_intent(contact_name, content);
+    session
+        .otp_store
+        .set_encrypt_intent_with_proof(contact_name, content, proof);
     match session.otp_store.save() {
         Ok(()) => true,
         Err(e) => {
@@ -272,17 +281,30 @@ pub async fn wrap_outgoing(
     pq_blob: Vec<u8>,
     contact_name: &str,
 ) -> Option<(Vec<u8>, crypto::otp::AckProof)> {
-    // A fresh nonce rides inside every message, under the pad, so that its
-    // acknowledgement can be bound to *this* message rather than to a
-    // sequence number anyone could quote back. The sender keeps only the
-    // proof (`ack_proof_for`), which is all it needs to check the ack
-    // against - see `crypto::otp::AckProof`.
-    let nonce = crate::crypto::random_bytes(crypto::otp::ACK_NONCE_BYTES);
-    let proof = crypto::otp::ack_proof_for(&nonce);
+    let (nonce, proof) = crypto::otp::fresh_ack_nonce();
+    let bytes = wrap_outgoing_with_nonce(cfg, pq_blob, contact_name, nonce).await?;
+    Some((bytes, proof))
+}
+
+/// `wrap_outgoing` with the ack nonce chosen by the caller - the send
+/// paths draw it first (`crypto::otp::fresh_ack_nonce`) so its proof can be
+/// written ahead with the spend's intent (`stage_encrypt_intent`).
+///
+/// A fresh nonce rides inside every message, under the pad, so that its
+/// acknowledgement can be bound to *this* message rather than to a sequence
+/// number anyone could quote back. The sender keeps only the proof
+/// (`ack_proof_for`), which is all it needs to check the ack against - see
+/// `crypto::otp::AckProof`.
+pub async fn wrap_outgoing_with_nonce(
+    cfg: &OtpCliConfig,
+    pq_blob: Vec<u8>,
+    contact_name: &str,
+    nonce: Vec<u8>,
+) -> Option<Vec<u8>> {
     let mut framed = nonce;
     framed.extend_from_slice(&pq_blob);
     match otp_cli::encrypt_retrying(cfg, contact_name, &framed, true).await {
-        Ok(OtpCliOutcome::Ok(bytes)) => Some((bytes, proof)),
+        Ok(OtpCliOutcome::Ok(bytes)) => Some(bytes),
         _ => None,
     }
 }
@@ -2454,16 +2476,25 @@ async fn send_end_notice_now(
     let Ok(plaintext) = proto::encode(&payload) else {
         return;
     };
+    // An intent already standing is a spend awaiting reconciliation
+    // (`settle_deferred_orphan`); writing the notice's own over it would
+    // lose the only record of that position. The end stays owed
+    // (`pending_end_notice`) and is re-driven once the contact clears.
+    if session.otp_store.encrypt_in_flight(contact_name) {
+        return;
+    }
     let send_id = session.next_stream_id;
     session.next_stream_id += 1;
     session.peer_link.ensure_link(wr, to).await;
     // Written ahead of the encrypt, so a kill inside its window leaves a
     // reconcilable record instead of an orphaned spend
     // (`OtpContactState::encrypt_intent`).
+    let (nonce, proof) = crypto::otp::fresh_ack_nonce();
     let staged = stage_encrypt_intent(
         session,
         contact_name,
         crate::client::otp_store::PendingOtpContent::EndNotice,
+        Some(proof),
     );
     // No breadcrumb, no spend: the padded attempt is skipped entirely and
     // this falls through to the unpadded notice below, exactly as it does
@@ -2478,12 +2509,13 @@ async fn send_end_notice_now(
             send_id,
             &plaintext,
             Content::OtpEndSession,
+            nonce,
         )
         .await
     } else {
         None
     };
-    if let Some((envelope, proof)) = sealed {
+    if let Some(envelope) = sealed {
         let seq = session
             .otp_store
             .get(contact_name)
@@ -3187,8 +3219,10 @@ struct OtpInner {
 /// (`start_outgoing_file_content`), which is the same nesting arrived at a
 /// different way.
 ///
-/// Returns the envelope and the proof this side keeps to check the peer's
-/// acknowledgement against (`crypto::otp::AckProof`).
+/// `nonce` is the ack nonce the caller already drew and wrote ahead with
+/// the spend's intent (`crypto::otp::fresh_ack_nonce`,
+/// `stage_encrypt_intent`); the caller keeps its proof.
+#[allow(clippy::too_many_arguments)]
 async fn build_otp_envelope(
     session: &SessionState,
     to: UserId,
@@ -3198,7 +3232,8 @@ async fn build_otp_envelope(
     send_id: u64,
     plaintext: &[u8],
     content: Content,
-) -> Option<(Envelope, crypto::otp::AckProof)> {
+    nonce: Vec<u8>,
+) -> Option<Envelope> {
     let inner = proto::encode(&OtpInner {
         channel,
         payload: plaintext.to_vec(),
@@ -3213,9 +3248,8 @@ async fn build_otp_envelope(
     if !can_frame_padded(session, to, recipient_pubkey_der) {
         return None;
     }
-    let (padded, proof) = wrap_outgoing(&session.otp_cli_cfg, inner, contact_name).await?;
-    let envelope = frame_padded(session, to, recipient_pubkey_der, send_id, padded, content)?;
-    Some((envelope, proof))
+    let padded = wrap_outgoing_with_nonce(&session.otp_cli_cfg, inner, contact_name, nonce).await?;
+    frame_padded(session, to, recipient_pubkey_der, send_id, padded, content)
 }
 
 /// `build_otp_envelope`'s outer half on its own: puts this pair's framing
@@ -3780,12 +3814,14 @@ async fn send_now(
     // Written ahead of the encrypt, so a kill inside its window leaves a
     // reconcilable record instead of an orphaned spend
     // (`OtpContactState::encrypt_intent`).
+    let (nonce, ack_proof) = crypto::otp::fresh_ack_nonce();
     if !stage_encrypt_intent(
         session,
         contact_name,
         crate::client::otp_store::PendingOtpContent::Text {
             channel: channel.clone(),
         },
+        Some(ack_proof),
     ) {
         let peer_name = peer_name_for(ui_state, to);
         notify(
@@ -3804,7 +3840,7 @@ async fn send_now(
     // goes around the pad (`build_otp_envelope`). Never a silent fallback
     // to an unpadded send: an `otp` binary that is missing, misconfigured
     // or exhausted is a hard error here.
-    let Some((otp_envelope, ack_proof)) = build_otp_envelope(
+    let Some(otp_envelope) = build_otp_envelope(
         session,
         to,
         recipient_pubkey_der,
@@ -3813,6 +3849,7 @@ async fn send_now(
         send_id,
         plaintext,
         content,
+        nonce,
     )
     .await
     else {
@@ -4551,6 +4588,7 @@ pub async fn send_file_offer(
     // Written ahead of the encrypt, so a kill inside its window leaves a
     // reconcilable record instead of an orphaned spend
     // (`OtpContactState::encrypt_intent`).
+    let (nonce, ack_proof) = crypto::otp::fresh_ack_nonce();
     if !stage_encrypt_intent(
         session,
         contact_name,
@@ -4559,6 +4597,7 @@ pub async fn send_file_offer(
             filename: filename.clone(),
             size,
         },
+        Some(ack_proof),
     ) {
         notify(
             ui_state,
@@ -4570,7 +4609,7 @@ pub async fn send_file_offer(
         );
         return Ok(());
     }
-    let Some((otp_envelope, ack_proof)) = build_otp_envelope(
+    let Some(otp_envelope) = build_otp_envelope(
         session,
         to,
         recipient_pubkey_der,
@@ -4579,6 +4618,7 @@ pub async fn send_file_offer(
         stream_id,
         &plaintext,
         Content::FileOffer,
+        nonce,
     )
     .await
     else {
@@ -4756,6 +4796,7 @@ async fn send_voice_offer_queued(
     // held across their absence reach the id they return under.
 
     // --- the offer's position -------------------------------------------
+    let (offer_nonce, offer_proof) = crypto::otp::fresh_ack_nonce();
     if !stage_encrypt_intent(
         session,
         contact_name,
@@ -4763,6 +4804,7 @@ async fn send_voice_offer_queued(
             stream_id,
             duration_ms,
         },
+        Some(offer_proof),
     ) {
         fail(
             ui_state,
@@ -4770,7 +4812,7 @@ async fn send_voice_offer_queued(
         );
         return Ok(());
     }
-    let Some((envelope, offer_proof)) = build_otp_envelope(
+    let Some(envelope) = build_otp_envelope(
         session,
         to,
         recipient_pubkey_der,
@@ -4779,6 +4821,7 @@ async fn send_voice_offer_queued(
         stream_id,
         &offer_plaintext,
         Content::VoiceOffer,
+        offer_nonce,
     )
     .await
     else {
@@ -4840,6 +4883,7 @@ async fn send_voice_offer_queued(
         session,
         contact_name,
         crate::client::otp_store::PendingOtpContent::FileContent { stream_id },
+        Some(content_proof),
     ) {
         secure_remove_file(&plain_path);
         fail(
@@ -5057,6 +5101,7 @@ pub async fn send_voice_offer(
     // Written ahead of the encrypt, so a kill inside its window leaves a
     // reconcilable record instead of an orphaned spend
     // (`OtpContactState::encrypt_intent`).
+    let (nonce, ack_proof) = crypto::otp::fresh_ack_nonce();
     if !stage_encrypt_intent(
         session,
         contact_name,
@@ -5064,6 +5109,7 @@ pub async fn send_voice_offer(
             stream_id,
             duration_ms,
         },
+        Some(ack_proof),
     ) {
         secure_remove_file(&plain_path);
         notify(
@@ -5079,7 +5125,7 @@ pub async fn send_voice_offer(
     // `duration_ms` never travels in the clear - under `Direct` there is no
     // envelope to hide it in, and under `PqWrapped` the pad is the layer
     // that actually protects what is said to this contact anyway.
-    let Some((envelope, ack_proof)) = build_otp_envelope(
+    let Some(envelope) = build_otp_envelope(
         session,
         to,
         recipient_pubkey_der,
@@ -5088,6 +5134,7 @@ pub async fn send_voice_offer(
         stream_id,
         &plaintext,
         Content::VoiceOffer,
+        nonce,
     )
     .await
     else {
@@ -5732,6 +5779,19 @@ pub(crate) async fn flush_one_queued(
     session: &mut SessionState,
     contact_name: &str,
 ) -> proto::Result<()> {
+    // The same hold `send_or_queue` applies on the way in, re-checked on
+    // the way out: the acknowledgement that freed this drain may have left
+    // an encrypt intent standing (a spend awaiting reconciliation,
+    // `settle_deferred_orphan`) or another non-queued spend outstanding,
+    // and sealing across either would overwrite its `.last_sent` copy or
+    // race the tool. The item keeps its place; the next clearing tries again.
+    // A spend an earlier run left standing behind the queue takes the gate
+    // first, now that nothing is ahead of it (`settle_deferred_orphan`);
+    // the hold below then keeps the plaintext waiting behind it in turn.
+    settle_deferred_orphan(session, contact_name).await;
+    if must_hold_plaintext(session, contact_name) {
+        return Ok(());
+    }
     match session.otp_out_queue.pop_front(contact_name) {
         Some(PendingOtpSend::Direct {
             to,
@@ -5852,7 +5912,8 @@ pub async fn start_outgoing_file_content(
         .otp_store
         .get(&contact_name)
         .and_then(|s| s.pending_unacked_out_seq)
-        .is_some();
+        .is_some()
+        || session.otp_store.encrypt_in_flight(&contact_name);
     if unacked {
         // Deliberately *not* cleared from `pending_content_sends` here:
         // `otp_out_queue` is in-memory only, so if the process restarts
@@ -5882,6 +5943,10 @@ pub async fn start_outgoing_file_content(
         .remove(&stream_id)
         .expect("just confirmed present above");
     let temp_path = temp_content_path(&session.otp_cli_cfg, "otp-send");
+    // Same substitute as a voice message's, for the same reason: the file's
+    // own bytes are the pad plaintext, so there is no room to bury a nonce.
+    // Taken before the intent is written, so the proof travels with it.
+    let ack_proof = crate::crypto::otp::ack_proof_for_file(&target.path).ok();
     // Written ahead of the encrypt, so a kill inside its window leaves a
     // reconcilable record instead of an orphaned spend
     // (`OtpContactState::encrypt_intent`).
@@ -5889,6 +5954,7 @@ pub async fn start_outgoing_file_content(
         session,
         &contact_name,
         crate::client::otp_store::PendingOtpContent::FileContent { stream_id },
+        ack_proof,
     ) {
         secure_remove_file(&temp_path);
         let me = ui_state.own_id.unwrap_or(UserId(0));
@@ -5911,9 +5977,6 @@ pub async fn start_outgoing_file_content(
         true,
     )
     .await;
-    // Same substitute as a voice message's, for the same reason: the file's
-    // own bytes are the pad plaintext, so there is no room to bury a nonce.
-    let ack_proof = crate::crypto::otp::ack_proof_for_file(&target.path).ok();
     match outcome {
         Ok(otp_cli::FileCliOutcome::Ok) => {
             restrict_file_permissions(&temp_path);
@@ -6503,33 +6566,6 @@ pub(crate) async fn resend_pending_setups(
 /// shape drops the intent and touches nothing. Returns what was promoted,
 /// for the one content kind whose retry needs a second store mended
 /// (`Mail` - `client::otp_mail::restore_orphaned_mail_ref`).
-/// The acknowledgement proof for a send being promoted from its
-/// write-ahead record, recovered from the tool's own kept copy.
-///
-/// Only for the kinds framed with a nonce (`wrap_outgoing`) - a text, an
-/// end notice, or a file/voice *offer* - where the proof is the hash of
-/// that nonce. A content transfer's proof is a hash of the plaintext file
-/// instead (`ack_proof_for_file`), which the kept copy of the ciphertext
-/// cannot yield, so those keep today's `None`.
-async fn recovered_ack_proof(
-    cfg: &otp_cli::OtpCliConfig,
-    contact_name: &str,
-    content: &crate::client::otp_store::PendingOtpContent,
-) -> Option<crypto::otp::AckProof> {
-    use crate::client::otp_store::PendingOtpContent as Kind;
-    if matches!(content, Kind::FileContent { .. }) {
-        return None;
-    }
-    let recovered = otp_cli::recover_last(cfg, contact_name, otp_cli::RecoverDirection::Sent)
-        .await
-        .ok()??;
-    if recovered.len() < crypto::otp::ACK_NONCE_BYTES {
-        return None;
-    }
-    let (nonce, _payload) = recovered.split_at(crypto::otp::ACK_NONCE_BYTES);
-    Some(crypto::otp::ack_proof_for(nonce))
-}
-
 pub async fn reconcile_orphaned_sends(
     cfg: &otp_cli::OtpCliConfig,
     store: &mut crate::client::otp_store::OtpStore,
@@ -6543,18 +6579,6 @@ pub async fn reconcile_orphaned_sends(
     }
     let mut promoted = Vec::new();
     for (contact_name, content) in intents {
-        // A fully recorded send already outstanding means the intent is
-        // stale bookkeeping from an older accident - the recorded send's
-        // own recovery takes precedence, and a second promotion would
-        // fabricate a spend that never happened.
-        if store
-            .get(&contact_name)
-            .and_then(|s| s.pending_unacked_out_seq)
-            .is_some()
-        {
-            store.clear_encrypt_intent(&contact_name);
-            continue;
-        }
         // Asked *before* the intent is cleared. The intent is the only
         // record that a position may have been spent without being
         // recorded; discarding it because the pad could not be read this
@@ -6576,17 +6600,39 @@ pub async fn reconcile_orphaned_sends(
             .get(&contact_name)
             .map(|s| s.next_out_seq)
             .unwrap_or(0);
+        // A spend that is real but unrecorded while *another* send is still
+        // outstanding - the pad queue seals ahead of an armed gate, so a
+        // kill between the encrypt and `record_sealed` leaves exactly this.
+        // It cannot be promoted onto the gate (that belongs to the queued
+        // front, and the orphan is sequenced *after* everything queued),
+        // and it must not be dropped (the next seal would leapfrog it, and
+        // the peer's tool would refuse that seal's bytes at the orphan's
+        // position for good). So the intent stays standing: `encrypt_in_
+        // flight` holds every new seal for this contact, and the moment the
+        // queue drains and the gate clears, `settle_deferred_orphan`
+        // promotes it - `.last_sent` still names it, since nothing could
+        // seal in between.
+        let gate_armed = store
+            .get(&contact_name)
+            .and_then(|s| s.pending_unacked_out_seq)
+            .is_some();
+        let proof = store.encrypt_intent_proof(&contact_name);
+        if gate_armed && detail.enc_sequence == next_out + 1 {
+            crate::log_warn!(
+                "an interrupted send for {contact_name} spent position {next_out} while an \
+                 earlier send is still outstanding; new sends to this contact are held until \
+                 that clears and the orphan is promoted"
+            );
+            store.defer_encrypt_intent(&contact_name);
+            continue;
+        }
         store.clear_encrypt_intent(&contact_name);
         if detail.enc_sequence == next_out + 1 {
-            // Recovered so the promoted send keeps the proof requirement
-            // every other send carries. Without one, `record_acked` accepts
-            // *any* proof for this position - so anybody who merely saw the
-            // packet could open the gate, which is the one thing the proof
-            // exists to prevent. `--recover-last --sent` re-streams the
-            // copy the tool already kept and consumes no key, so asking
-            // costs nothing; a spend whose copy is genuinely gone falls
-            // back to `None` rather than being left unrecoverable.
-            let proof = recovered_ack_proof(cfg, &contact_name, &content).await;
+            // Promoted with the proof written ahead alongside the intent
+            // (`encrypt_intent_proof`), so the orphan keeps the proof
+            // requirement every other send carries. It cannot be recovered
+            // any other way: the tool's kept `.last_sent` copy is
+            // ciphertext, and the nonce it would take is under the pad.
             store.record_sent(&contact_name, next_out, content.clone(), proof);
             promoted.push((contact_name, next_out, content));
         } else if detail.enc_sequence != next_out {
@@ -6607,6 +6653,54 @@ pub async fn reconcile_orphaned_sends(
     }
     let _ = store.save();
     promoted
+}
+
+/// Promotes a spend `reconcile_orphaned_sends` had to leave standing -
+/// real, unrecorded, and sequenced behind a queue that was still draining
+/// - once nothing is ahead of it any more: the gate is clear and the
+/// durable queue holds nothing for the contact. The tool's counter is
+/// re-read rather than remembered, so a copy of this side's state that has
+/// meanwhile moved on is never promoted twice; an intent whose encrypt
+/// turns out never to have run is simply dropped. Returns whether a send
+/// was promoted - the standard recovery (`recover_and_resend`, the retry
+/// timer) then carries it from `.last_sent`, which still holds it because
+/// `encrypt_in_flight` kept every seal away in the meantime.
+pub(crate) async fn settle_deferred_orphan(session: &mut SessionState, contact_name: &str) -> bool {
+    let Some(state) = session.otp_store.get(contact_name) else {
+        return false;
+    };
+    let Some(content) = state.deferred_spend.clone() else {
+        return false;
+    };
+    let proof = state.deferred_spend_proof;
+    if state.pending_unacked_out_seq.is_some() {
+        return false;
+    }
+    let next_out = state.next_out_seq;
+    if session
+        .otp_outbox
+        .as_ref()
+        .is_some_and(|outbox| outbox.front(contact_name).is_some())
+    {
+        return false;
+    }
+    let Ok(Some(detail)) = otp_cli::show_contact(&session.otp_cli_cfg, contact_name).await else {
+        return false;
+    };
+    if detail.enc_sequence == next_out {
+        // Never spent after all - the intent was written and the process
+        // died before the tool ran.
+        session.otp_store.take_deferred_spend(contact_name);
+        let _ = session.otp_store.save();
+        return false;
+    }
+    if detail.enc_sequence != next_out + 1 {
+        return false;
+    }
+    session.otp_store.take_deferred_spend(contact_name);
+    session.otp_store.record_sent(contact_name, next_out, content, proof);
+    let _ = session.otp_store.save();
+    true
 }
 
 pub async fn recover_and_resend(
