@@ -4358,7 +4358,12 @@ old key - both `commit_pending_setup` (the proposing side's own half) and
 the streamed pad's receive-side install remove any existing contact under
 that name immediately before `otp --add-contact` (which otherwise refuses
 to overwrite one outright), so the old key and the new one never coexist
-even momentarily. A pad-only (`Direct`-framed) mail contact is the one
+even momentarily. Every install over an existing name also drops whatever
+this side still held under the old pad - sealed messages waiting in the
+contact's queue, a text held behind an old spend, content staged for an
+offer the old pad carried - since none of it can be read under the new
+one, and pumping it there would wedge the new pad at position zero before
+it carried a single message. A pad-only (`Direct`-framed) mail contact is the one
 exception: there is no channel to share a freshly generated pad over
 regardless of whether one already exists, so `/new-otp-mail-key` there
 still refuses unconditionally, the same as first provisioning it - only a

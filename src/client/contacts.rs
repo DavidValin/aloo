@@ -682,6 +682,19 @@ pub async fn handle_install_otp_key(
     .await;
     match outcome {
         InstallOtpKeyOutcome::Ok => {
+            // A manual install replaced whatever pad this name held, so
+            // everything still queued or staged under the old one goes
+            // with it (`otp::purge_contact_for_new_pad`).
+            if let Some(contact_name) = otp_contact_name_for(
+                &session.id_store,
+                &nickname,
+                device_id.as_deref().unwrap_or(""),
+                own_identity,
+                purpose,
+            ) {
+                crate::client::otp::purge_contact_for_new_pad(session, &contact_name);
+                let _ = session.otp_store.save();
+            }
             ui_state.push_status_notice(format!("installed {} for {nickname}", purpose.label()), true);
             ui_state.close_contacts_install();
             handle_open(session, ui_state).await;

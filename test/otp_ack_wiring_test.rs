@@ -5937,3 +5937,62 @@ async fn a_voice_message_behind_an_unacknowledged_file_offer_is_refused_with_not
     assert!(!success);
     assert!(message.contains("hasn't been acknowledged yet"), "{message:?}");
 }
+
+// ---------------------------------------------------------------------
+// A replaced pad takes the old pad's queue with it (TB-287)
+// ---------------------------------------------------------------------
+
+/// Messages sealed under a pad are useless under its replacement: pumped
+/// after the counters reset they would go out as the new pad's first
+/// positions, be refused on metadata by the peer's tool, and never be
+/// acknowledged - the new pad wedged at position zero before carrying a
+/// word. Installing a replacement therefore drops everything still queued
+/// for that contact, and the first message written afterwards is the new
+/// pad's genuine position zero.
+///
+/// @requirement TB-287
+#[tokio::test]
+async fn installing_a_replacement_pad_drops_what_was_queued_under_the_old_one() {
+    if !require_otp() {
+        return;
+    }
+    let (mut alice, mut bob, contact) = pair("replace-purges-queue", Id::Pq, Id::Pq).await;
+    let _ = &mut alice;
+    bob.ui.mark_otp_active(ALICE);
+
+    send_text(&mut bob, &contact, "sealed under the old pad").await;
+    send_text(&mut bob, &contact, "and so was this").await;
+    assert_eq!(bob.session.otp_queued_for(&contact), 2);
+    assert!(bob.gate_held(&contact));
+
+    // Alice re-provisions (her keychain was lost); bob accepted and her
+    // commit now authorises the install of the replacement.
+    bob.session.stage_incoming_pad_for_test(ALICE, contact.clone());
+    aloo::client::otp::on_pad_commit(&mut bob.session, &mut bob.ui, ALICE, contact.clone()).await;
+
+    assert_eq!(
+        bob.session.otp_queued_for(&contact),
+        0,
+        "nothing sealed under the old pad may be pumped under the new one"
+    );
+    let state = bob.session.otp_store_mut().get(&contact).cloned().expect("the new pad's entry");
+    assert_eq!(state.pending_unacked_out_seq, None, "no gate carried over");
+    assert_eq!(state.next_out_seq, 0);
+    assert_eq!(bob.pad_spent(&contact).await, 0, "a fresh pad, untouched");
+
+    // The next message is the new pad's position zero, and it is sealed.
+    send_text(&mut bob, &contact, "the first word under the new pad").await;
+    let (seq, ..) = bob
+        .queued()
+        .into_iter()
+        .filter_map(|p| match p {
+            P2pPayload::OtpEnvelope { seq, msg_id, envelope, sender_device_id, .. } => {
+                Some((seq, msg_id, envelope, sender_device_id))
+            }
+            _ => None,
+        })
+        .next_back()
+        .expect("sent");
+    assert_eq!(seq, 0);
+    assert!(bob.pad_spent(&contact).await > 0);
+}

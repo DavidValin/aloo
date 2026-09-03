@@ -7571,6 +7571,7 @@ pub(crate) async fn on_pad_verify(
     // answers "is an *arriving* pad a re-delivery", which only the
     // receiving side is ever asked.
     session.otp_store.reset_for_new_pad(&contact_name, None);
+    purge_contact_for_new_pad(session, &contact_name);
     // The commit below is the one provisioning payload whose loss splits
     // the pair asymmetrically - this side provisioned and active, the peer
     // holding only staged bytes - so it is owed durably and re-sent on
@@ -7583,6 +7584,46 @@ pub(crate) async fn on_pad_verify(
     session
         .peer_link
         .send_reliable_or_queue(from, P2pPayload::OtpPadCommit { contact_name });
+}
+
+/// Drops everything this side still holds for `contact_name` that was
+/// produced under the pad a *replacement* has just been installed over -
+/// the companion of `OtpStore::reset_for_new_pad`, run right after it by
+/// every path that installs a new pad under an existing name
+/// (`on_pad_verify`, `on_pad_commit`, `contacts::handle_install_otp_key`).
+///
+/// The reset zeroes the counters, but a queue is not a counter. Sealed
+/// messages still waiting in the durable queue were spent on the old pad;
+/// pumped after the reset they would go out as the new pad's first
+/// positions, the peer's tool would refuse every one of them on its
+/// metadata (right sequence, wrong key), nothing would ever be
+/// acknowledged, and the new pad would be wedged at position zero before
+/// it carried a single message. The same holds for a text held as
+/// plaintext behind a spend of the old pad, a content send staged for an
+/// offer the old pad carried, and the delivery rows waiting on old
+/// acknowledgements. None of it can be delivered under the new pad, so all
+/// of it goes - the positions it occupied belonged to a pad that no longer
+/// exists on either side, which is the one case discarding a spent
+/// position is correct.
+pub(crate) fn purge_contact_for_new_pad(session: &mut SessionState, contact_name: &str) {
+    if let Some(outbox) = session.otp_outbox.as_mut() {
+        let dropped = outbox.retain_contacts(|c| c != contact_name);
+        if dropped > 0 {
+            crate::log_warn!(
+                "{dropped} message(s) sealed under the pad being replaced for {contact_name} \
+                 were dropped - they cannot be read under the new one"
+            );
+        }
+    }
+    session.otp_out_queue.clear(contact_name);
+    session.otp_ack_rows.retain(|(c, _), _| c != contact_name);
+    for staged in session.otp_store.take_content_sends_for(contact_name) {
+        // Only a staged *recording* is this side's own working copy
+        // (`temp_content_path`); a file offer points at the user's file.
+        if staged.path.starts_with(&session.otp_cli_cfg.working_dir) {
+            secure_remove_file(&staged.path);
+        }
+    }
 }
 
 /// The sender's digests matched and it has installed - so this side may
@@ -7701,6 +7742,7 @@ pub async fn on_pad_commit(
         &contact_name,
         Some(crypto::otp::pad_pair_digest(&pad.enc_digest, &pad.dec_digest)),
     );
+    purge_contact_for_new_pad(session, &contact_name);
     let _ = session.otp_store.save();
     if let Some(peer) = ui_state.known_users.get(&from).cloned() {
         ui_state.open_private_room(peer);

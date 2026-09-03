@@ -335,6 +335,22 @@ impl OtpStore {
         self.pending_content_sends.remove(&stream_id)
     }
 
+    /// Takes every staged content send that belongs to `contact_name` -
+    /// for a pad being replaced under that name (`reset_for_new_pad`), whose
+    /// offers were spent on a pad that no longer exists. Returns them so the
+    /// caller can erase the plaintext each one still points at.
+    pub fn take_content_sends_for(&mut self, contact_name: &str) -> Vec<PendingContentSend> {
+        let ids: Vec<u64> = self
+            .pending_content_sends
+            .iter()
+            .filter(|(_, staged)| staged.contact_name == contact_name)
+            .map(|(id, _)| *id)
+            .collect();
+        ids.into_iter()
+            .filter_map(|id| self.pending_content_sends.remove(&id))
+            .collect()
+    }
+
     /// Every content send still staged - what a reconnect's autoheal pass
     /// (`client::otp::resume_pending_content_sends`) resumes.
     pub fn content_sends(&self) -> impl Iterator<Item = (u64, &PendingContentSend)> {
