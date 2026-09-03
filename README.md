@@ -467,7 +467,7 @@ With a daemon running, a bare `aloo` attaches instead of opening the connect scr
 
 Type **`/daemon`** in the compose bar to hand it back: the session keeps running, your terminal is released. **`Ctrl+C` does the same thing** — it's answered by the attaching program itself and never reaches the daemon, so quitting your viewer can never kill the session behind it. Stopping it for real is `aloo --daemon-stop`, deliberately a separate command.
 
-One terminal at a time: a second `aloo` while someone is attached says so and exits rather than fighting over the cursor. If you want a genuinely separate session alongside the daemon, `aloo --no-attach` — though the server will refuse it if it's the same nickname, since nicknames are unique among connected clients.
+One terminal at a time: a second `aloo` while someone is attached says so and exits rather than fighting over the cursor. One session per home, too: a second session started against the same `~/.aloo` (or `ALOO_HOME`) is refused outright, because two sessions writing one set of pad counters would desync every one-time pad in it. If you want a genuinely separate session alongside the daemon, give it its own home — `ALOO_HOME=/tmp/aloo-second aloo --no-attach` — though the server will refuse it if it's the same nickname, since nicknames are unique among connected clients.
 
 ### How voice is handled with nobody watching
 

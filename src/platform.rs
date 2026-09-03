@@ -158,3 +158,62 @@ pub(crate) fn read_to_string_optional(path: &std::path::Path) -> std::io::Result
         Err(e) => Err(e),
     }
 }
+
+/// An exclusive, process-lifetime claim on one aloo home directory
+/// (`aloo_dir`), so at most one session ever runs against it.
+///
+/// Every piece of local state under that directory - the identity pins,
+/// the settings, and above all the OTP layer's `otp_store` and its
+/// keychain - is written by the session that owns it as if it were the only
+/// writer. Two sessions on one home (a daemon plus an `aloo --no-attach`,
+/// or two terminals) each keep their own in-memory copy of the pad
+/// counters and overwrite the same file in turn: both believe the next
+/// position is theirs, both seal against the same keychain (the per-call
+/// keychain lock only stops them from doing so *simultaneously*), and the
+/// tool's one-deep `.last_sent` copy is clobbered across the two - a
+/// permanent desync with nothing left to recover from. The lock turns that
+/// into a refusal at startup instead: a second session needs a second
+/// home (`ALOO_HOME=... aloo`), which is the only arrangement under which
+/// two sessions can hold two consistent views.
+///
+/// OS-advisory (`File::try_lock`), so a session killed with no chance to
+/// clean up leaves nothing behind that blocks the next start.
+#[derive(Debug)]
+pub struct HomeLock {
+    _file: std::fs::File,
+}
+
+/// Where `HomeLock` lives inside a home: a sibling of every store, never
+/// inside `otp/` (the keychain tool treats that directory as its own).
+pub fn home_lock_path(home: &std::path::Path) -> std::path::PathBuf {
+    home.join(".session.lock")
+}
+
+impl HomeLock {
+    /// Claims `home`. `Ok(None)` means another live process already holds
+    /// it - the caller refuses to start; an `Err` is a genuine I/O failure
+    /// (an unwritable home), which the caller reports the same way.
+    pub fn acquire(home: &std::path::Path) -> std::io::Result<Option<Self>> {
+        std::fs::create_dir_all(home)?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(home_lock_path(home))?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(Self { _file: file })),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(e)) => Err(e),
+        }
+    }
+
+    /// The refusal a second session is shown - one sentence naming the
+    /// directory and the way out.
+    pub fn busy_message(home: &std::path::Path) -> String {
+        format!(
+            "another aloo session is already running against {} - attach to it with a bare \
+             'aloo', stop it, or run a separate session under its own home: ALOO_HOME=<dir> aloo",
+            home.display()
+        )
+    }
+}

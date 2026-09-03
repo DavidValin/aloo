@@ -126,6 +126,13 @@ pub struct ClientState {
 #[derive(World, Default)]
 #[world(init = Self::default)]
 pub struct AlooWorld {
+    // -- one session per home (AC-441) ---------------------------------
+    /// The home a scenario's first session claimed, and every claim made
+    /// since (`None` where the claim was refused) - see steps/home_lock.rs.
+    pub session_home: Option<std::path::PathBuf>,
+    pub home_claims: Vec<Option<aloo::platform::HomeLock>>,
+    pub last_home_refusal: Option<String>,
+
     // -- diagnostics (US-042) ------------------------------------------
     /// What the silenced sink had collected when a scenario last looked
     /// (`log::take_collected`).

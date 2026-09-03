@@ -650,10 +650,18 @@ deliberately a different command.
 One terminal at a time. A second `aloo` while someone is attached is told
 so and exits rather than fighting over the cursor.
 
-If you want a separate, independent session while a daemon is running:
+Only one session ever runs against one aloo home (`ALOO_HOME`, or
+`~/.aloo`): the session claims `<home>/.session.lock` for as long as it
+runs, and a second `aloo` or `aloo --daemon` started against the same home
+is refused with a message naming the directory. Every store in that home -
+the pad counters above all - is written by the session that owns it, and
+two sessions writing the same pad counters from two copies of them would
+desync every pad in the home for good. `aloo --no-attach` only says "do not
+attach to the running daemon"; a genuinely separate session takes its own
+home:
 
 ```sh
-aloo --no-attach
+ALOO_HOME=/tmp/aloo-second aloo --no-attach
 ```
 
 Be aware the server will refuse it if it is using the same nickname —

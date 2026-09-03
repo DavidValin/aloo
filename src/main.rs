@@ -276,6 +276,9 @@ fn run_daemon_entry(cli: Cli) -> Result<(), BoxError> {
         return Ok(());
     }
 
+    // The daemon owns its home exactly as a foreground client does
+    // (`claim_home`); the session it runs is the one that writes there.
+    let _home = claim_home()?;
     let config = match resolve_daemon_config(&cli) {
         Ok(config) => config,
         Err(e) => {
@@ -369,10 +372,25 @@ fn run_client_entry(cli: Cli) -> Result<(), BoxError> {
         }
     }
 
+    // One session per home, for the whole run: a second one - a daemon
+    // still up, or another terminal that also asked for `--no-attach` -
+    // would write the same pad counters and keychain from a second copy of
+    // the state and desync every pad in it (`platform::HomeLock`).
+    let _home = claim_home()?;
     let hotkey = global_ptt::hotkey_to_register(&load_settings());
     with_global_ptt(hotkey, move |hotkey_rx| {
         build_runtime()?.block_on(run_client(cli, hotkey_rx))
     })
+}
+
+/// Claims this process's aloo home for the rest of its life, or explains
+/// why it cannot - see `platform::HomeLock`. Held by the caller until exit.
+fn claim_home() -> Result<aloo::platform::HomeLock, BoxError> {
+    let home = aloo::platform::aloo_dir();
+    match aloo::platform::HomeLock::acquire(&home)? {
+        Some(lock) => Ok(lock),
+        None => Err(aloo::platform::HomeLock::busy_message(&home).into()),
+    }
 }
 
 /// Registers the global push-to-talk shortcut, then runs `body` with the

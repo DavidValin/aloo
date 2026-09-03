@@ -382,6 +382,10 @@ name = "otp_store_test"
 path = "test/otp_store_test.rs"
 
 [[test]]
+name = "home_lock_test"
+path = "test/home_lock_test.rs"
+
+[[test]]
 name = "otp_cli_test"
 path = "test/otp_cli_test.rs"
 
