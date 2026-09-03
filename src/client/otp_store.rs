@@ -822,14 +822,17 @@ impl OtpStore {
     }
 
     /// Whether `seq` is the exact next sequence expected from
-    /// `contact_name` - read-only, no mutation. `otp` itself has no way to
-    /// detect a duplicate input on `--decrypt` - feeding it the same
-    /// ciphertext twice silently advances past the correct pad range and
-    /// returns garbage the second time, rather than erroring (verified
-    /// directly against the real binary). So a resent/duplicate ciphertext
-    /// must be rejected *before* `otp --decrypt` ever runs, using this
-    /// check - `record_received`'s own check happens too late for that,
-    /// since by the time it runs the decrypt has already happened.
+    /// `contact_name` - read-only, no mutation. The first line of defence
+    /// against a resent or duplicate ciphertext reaching the pad a second
+    /// time: checked *before* `otp --decrypt` ever runs, so a duplicate is
+    /// answered from the recorded ack without a subprocess at all. The
+    /// tool's own origin/order metadata check (`otp_cli::OtpCliOutcome::
+    /// Rejected`, v1.5.1+) refuses a replay too, before spending - but that
+    /// verdict costs a decrypt attempt and, for this store, has to be told
+    /// apart from a genuine crash orphan (`client::otp::recover_orphaned_
+    /// decrypt`), so the cheap local check comes first. `record_received`'s
+    /// own check happens too late for that, since by the time it runs the
+    /// decrypt has already happened.
     pub fn is_next_expected(&self, contact_name: &str, seq: u64) -> bool {
         self.entries
             .get(contact_name)

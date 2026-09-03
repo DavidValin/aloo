@@ -112,7 +112,7 @@ falling back to a server relay (§7.1).
   - [17.1 Composing: what a mail is, and who can be written to](#171-composing-what-a-mail-is-and-who-can-be-written-to)
   - [17.2 Uploading: the mail's pad spend, and the storage acknowledgement](#172-uploading-the-mails-pad-spend-and-the-storage-acknowledgement)
   - [17.3 Delivery: fetch, decrypt, acknowledge, notify](#173-delivery-fetch-decrypt-acknowledge-notify)
-  - [17.4 One pad, two transports: ordering across mail and live sends](#174-one-pad-two-transports-ordering-across-mail-and-live-sends)
+  - [17.4 Two pads, two transports: mail and live sends never interleave](#174-two-pads-two-transports-mail-and-live-sends-never-interleave)
 
 ## Overview: the connections, and what travels on each
 
@@ -5550,8 +5550,10 @@ The upload:
   retry carries the same id and the server deduplicates instead of
   storing twice. Both sides validate its exact shape before ever building
   a filesystem path from it.
-- `seq` is the contact's **same** §16.2 send counter - a mail spends the
-  same sequential pad as a live send, see §17.4.
+- `seq` is the mail contact's own §16.2-style send counter. A mail key is
+  a separate keychain contact from the live session's (`mail-` prefixed,
+  §16.1.1), so a mail never shares a pad, a counter, or a gate with a live
+  send - see §17.4.
 - The mail spend passes through the same stop-and-wait gate as every
   other spend for that contact. What acknowledges it is
   `OtpMailResult { ok: true }` - durable storage on the server - rather
@@ -5674,19 +5676,18 @@ and records a delivery receipt for the sender, re-notified on every
 future fetch until the sender's `OtpMailDeliveredAck` confirms it was
 seen.
 
-### 17.4 One pad, two transports: ordering across mail and live sends
+### 17.4 Two pads, two transports: mail and live sends never interleave
 
-A mail and a live §16 send to the same contact spend the **same**
-sequential pad, and the receiving side may only ever consume them in
-spend order - but they travel different transports at different speeds,
-so one interleaving needs naming. The sender's gate clears on the
-*server's* storage acknowledgement, not the recipient's decrypt: a live
-send can therefore be encrypted (spend N+1) and reach the recipient over
-the direct link *before* the mail (spend N) has been fetched from the
-server. The recipient's §16.2 sequence guard rejects the early arrival
-without touching the pad, exactly as designed - and the moment the mail
-is fetched, decrypted, and acknowledged, the server's `OtpMailDelivered`
-tells the sender the recipient's counter has advanced, which triggers the
-sender's normal §16.4 recovery scan: the refused live send is replayed
-from its kept ciphertext and now lands in order. No fresh pad is spent
-anywhere in that resolution, and neither message is lost.
+A mail and a live §16 send to the same person spend **different** pads:
+the live session's contact and the mail contact are two independent
+keychain entries (§16.1.1), each with its own sequence counter, its own
+stop-and-wait gate, and its own `.last_sent` recovery copy. So the two
+transports never have to be ordered against each other - a mail waiting
+on the server's storage acknowledgement blocks only the next *mail* to
+that contact, and a live send waiting on the peer's `OtpDeliveryAck`
+blocks only the next *live* send. The one point where the two meet is
+`/endotp`, which is refused while a mail to that person is still awaiting
+its storage acknowledgement (§16.6) - not because the pads are shared, but
+because the mail's confirmation arrives from the server on its own
+schedule and the user is asked to wait for it rather than end a session
+with a mail of theirs still in flight.

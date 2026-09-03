@@ -113,6 +113,24 @@ came from, and only from, the intended peer - the same limit §12
 describes for a first contact, applied a second time to this layer's own
 setup message.
 
+**The pad layer's framing rides the punched link in the clear.** The
+direct UDP link carries its reliable frames as plain encodings (§7.1.1):
+what is protected is what travels *inside* them - a sealed `pq_hybrid`
+envelope, pad ciphertext - never the frame itself. So an on-path party can
+read and alter a pad-wrapped message's `seq`, `channel`, `stream_id`, the
+`sender_device_id` a `Direct` pair claims (§16.2.2), and the position a
+content transfer announces (`OtpFileContentSeq`). None of that buys them
+a byte of plaintext or a byte of pad, and none of it can make a message
+be *accepted*: acceptance rests on the pad decrypt, whose own encrypted
+metadata carries the genuine sequence and offset, and every field that
+decides how a message is routed is checked again under the pad (§16.2's
+`channel`). What it can buy is a wasted round trip - a frame refused
+before the pad is touched, or a decrypt whose result is dropped and then
+recovered from the tool's kept copy when the sender's untampered retry
+arrives (§16.2's crash heal, applied to text, content and mail alike) -
+never a spent position with no message behind it. Authenticating the frame
+itself would close even that, and is not done today.
+
 **Ending a session (§16.6) is unilateral by design, unlike starting one.**
 Either participant may run `/endotp` alone, with no consent from the other
 side - deliberately asymmetric with the mutual-accept required to turn the

@@ -5,15 +5,16 @@
 //! of - so the UI emits `UiAction`s and these functions answer through
 //! `UiState` setters.
 //!
-//! A mail spends the *same* sequential pad as the live P2P layer for that
-//! contact, and passes through the same stop-and-wait gate
-//! (`otp_store::OtpContactState::pending_unacked_out_seq`) - the only
-//! difference is who acknowledges the spend: the server's durable-storage
-//! `OtpMailResult` instead of the peer's `OtpDeliveryAck`. That sharing is
-//! what makes the retry rule sound: while a mail is unacknowledged nothing
-//! else can encrypt for that contact, so the `otp` CLI's `.last_sent`
-//! safety copy is always exactly the mail, and `resend_pending` can replay
-//! it byte-identically without ever spending fresh pad.
+//! A mail spends its *own* pad - the `mail-` prefixed keychain contact
+//! `crypto::otp::contact_name_for_mail` names, never the live session's -
+//! and passes through that contact's own stop-and-wait gate
+//! (`otp_store::OtpContactState::pending_unacked_out_seq`), acknowledged by
+//! the server's durable-storage `OtpMailResult` rather than a peer's
+//! `OtpDeliveryAck`. The gate is what makes the retry rule sound: while a
+//! mail is unacknowledged nothing else can encrypt for that contact, so the
+//! `otp` CLI's `.last_sent` safety copy is always exactly the mail, and
+//! `resend_pending` can replay it byte-identically without ever spending
+//! fresh pad.
 
 use zeroize::Zeroizing;
 
