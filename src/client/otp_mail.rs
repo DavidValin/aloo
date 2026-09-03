@@ -299,7 +299,8 @@ pub async fn handle_send(
         .otp_store
         .get(&contact_name)
         .and_then(|s| s.pending_unacked_out_seq)
-        .is_some();
+        .is_some()
+        || session.otp_store.encrypt_in_flight(&contact_name);
     if unacked {
         fail(
             ui_state,
@@ -927,15 +928,28 @@ pub async fn on_mail_deliver(
         // A rejection - the metadata check refused this exact mail, not a
         // transient failure - is worth naming specifically; see
         // `otp_cli::OtpCliOutcome::Rejected`'s doc.
+        // A rejection with the tool's decrypt counter exactly one past this
+        // store's is this side's own crash talking: the mail was decrypted
+        // in a previous life of the process and only the record and the
+        // ack were lost, so the server's faithful redelivery is refused as
+        // already consumed. Healed from the tool's kept received-side copy
+        // (`otp::recover_orphaned_decrypt_raw`), exactly as a live text is
+        // - otherwise this mail was left on the server forever and every
+        // later one from this sender waited behind it (§17.3).
         Ok(otp_cli::OtpCliOutcome::Rejected(reason)) => {
-            ui_state.push_status_notice(
-                format!(
-                    "OTP mail from {from} was rejected ({}) - left on the server, keys untouched",
-                    reason.trim().replace('\n', "; ")
-                ),
-                false,
-            );
-            return Ok(());
+            match crate::client::otp::recover_orphaned_decrypt_raw(session, &expected_contact).await {
+                Some(bytes) => Zeroizing::new(bytes),
+                None => {
+                    ui_state.push_status_notice(
+                        format!(
+                            "OTP mail from {from} was rejected ({}) - left on the server, keys untouched",
+                            reason.trim().replace('\n', "; ")
+                        ),
+                        false,
+                    );
+                    return Ok(());
+                }
+            }
         }
         _ => {
             ui_state.push_status_notice(

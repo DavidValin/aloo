@@ -674,3 +674,125 @@ async fn on_mail_deliver_acks_a_mail_matching_the_locally_derived_contact() {
         sink.sent
     );
 }
+
+// ---------------------------------------------------------------------
+// A mail decrypt orphaned by a crash heals from the tool's copy (TB-289)
+// ---------------------------------------------------------------------
+
+/// A session whose `otp` configuration is the real, provisioned `cfg` -
+/// the receiving half of `provision_pair` - so `on_mail_deliver` runs a
+/// genuine decrypt against it.
+async fn session_with_otp(
+    label: &str,
+    cfg: OtpCliConfig,
+) -> (aloo::client::session::SessionState, aloo::client::tui::ui::UiState, [u8; 32]) {
+    let (public, private) = generate_bundle_with_bits(TEST_BITS).expect("own pq keygen");
+    let public_der = proto::encode(&public).expect("own pq der");
+    let own_fp = aloo::crypto::pq::fingerprint_of_encoded(&public_der).expect("own fp");
+    let session = aloo::client::session::SessionState::for_test(aloo::client::session::TestSessionSpec {
+        identity: aloo::client::connect::ResolvedIdentity { private, public_der },
+        scratch: temp_dir(label),
+        otp: Some(cfg),
+    })
+    .await;
+    let ui = aloo::client::tui::ui::UiState::new("bob".into());
+    (session, ui, own_fp)
+}
+
+/// The receiver killed between `otp --decrypt` and recording the mail: the
+/// tool's counter is one past the store's, and the server's faithful
+/// redelivery of the very same ciphertext is refused by the tool as already
+/// consumed. Recognised by that exact off-by-one and healed from the tool's
+/// kept received-side copy - the mail is stored, read back intact, and
+/// acknowledged. Before, it was "left on the server" forever, and every
+/// later mail from that sender waited behind it.
+///
+/// @requirement TB-289
+#[tokio::test]
+async fn a_mail_decrypt_orphaned_by_a_crash_is_healed_from_the_tools_safety_copy() {
+    if !require_otp() {
+        return;
+    }
+    // The pair is filed under the exact mail contact name bob's session
+    // will derive for alice, so `on_mail_deliver`'s own contact check
+    // passes and the decrypt genuinely runs against this keychain.
+    let (alice_public, alice_private) = generate_bundle_with_bits(TEST_BITS).expect("alice pq keygen");
+    let alice_der = proto::encode(&alice_public).expect("alice pq der");
+    let alice_fp = aloo::crypto::pq::fingerprint_of_encoded(&alice_der).expect("alice fp");
+    let bob_cfg = config_at(temp_dir("mail-heal-bob"));
+    let (mut session, mut ui, own_fp) = session_with_otp("mail-heal", bob_cfg.clone()).await;
+    let own_device_id = session.own_device_id_for_test().to_string();
+    session.id_store_mut().pin_new_device_with_key_mode(
+        "alice",
+        "alice-device",
+        &alice_der,
+        aloo::client::idstore::Trust::Tofu,
+        Some(proto::KeyMode::PqHybrid),
+    );
+    let contact = aloo::crypto::otp::contact_name_for_mail(&own_fp, &own_device_id, &alice_fp, "alice-device");
+
+    let alice_cfg = config_at(temp_dir("mail-heal-alice"));
+    otp_cli::new_key_pair(&alice_cfg, 1, "a", "b").await.expect("key generation");
+    let a_keys = alice_cfg.working_dir.join("a_keys");
+    let b_keys = alice_cfg.working_dir.join("b_keys");
+    otp_cli::add_contact(&alice_cfg, &contact, &a_keys.join("encryption_for_b.key"), &a_keys.join("decryption_from_b.key"))
+        .await
+        .expect("alice add-contact");
+    otp_cli::add_contact(&bob_cfg, &contact, &b_keys.join("encryption_for_a.key"), &b_keys.join("decryption_from_a.key"))
+        .await
+        .expect("bob add-contact");
+
+    // A real mail, sealed by alice for bob.
+    let mut mail = payload();
+    mail.from = "alice".into();
+    mail.to = "bob".into();
+    let encoded = proto::encode(&mail).unwrap();
+    let signature = sign_mail(&alice_private, &encoded).expect("sign");
+    let sealed_bytes = proto::encode(&OtpMailSealed { payload: encoded, signature }).unwrap();
+    let Ok(OtpCliOutcome::Ok(ciphertext)) = otp_cli::encrypt_retrying(&alice_cfg, &contact, &sealed_bytes, true).await
+    else {
+        panic!("mail encrypt should succeed");
+    };
+
+    // The pre-crash decrypt: the tool advances, nothing is recorded.
+    let Ok(OtpCliOutcome::Ok(_)) = otp_cli::decrypt_retrying(&bob_cfg, &contact, &ciphertext, true).await else {
+        panic!("the simulated pre-crash decrypt should succeed");
+    };
+
+    // Restart; the server redelivers the same mail.
+    let mut sink = RecordingSink::default();
+    let mail_id = "cd".repeat(16);
+    aloo::client::otp_mail::on_mail_deliver(
+        &mut sink,
+        &mut session,
+        &mut ui,
+        mail_id.clone(),
+        "alice".into(),
+        contact.clone(),
+        0,
+        ciphertext,
+    )
+    .await
+    .expect("on_mail_deliver should never error");
+
+    assert!(
+        sink.sent
+            .iter()
+            .any(|m| matches!(m, proto::ClientMessage::OtpMailAck { mail_id: id } if *id == mail_id)),
+        "the healed mail is acknowledged: {:?}",
+        sink.sent
+    );
+    let stored = session
+        .otp_mail_store_mut()
+        .read_received_payload(&mail_id)
+        .expect("the mail is stored, recovered whole from the tool's copy");
+    assert_eq!(proto::decode::<OtpMailPayload>(&stored).unwrap(), mail);
+    assert!(
+        session.otp_store_mut().is_next_expected(&contact, 1),
+        "and the receive counter caught up with the tool's"
+    );
+    assert!(
+        ui.status_notice.clone().is_none_or(|(m, _)| !m.contains("rejected")),
+        "no rejection notice - the heal recognised the crash shape"
+    );
+}

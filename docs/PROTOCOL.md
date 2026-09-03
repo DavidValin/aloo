@@ -5635,10 +5635,15 @@ apply with full force here:
    multi-device sender be disambiguated on receive.)
 3. **The sequence guard**: only the exact next expected `seq` for the
    contact may reach the pad. A lower one re-acknowledges (already
-   consumed); a higher one waits - an earlier spend is still in flight
-   (§17.4).
+   consumed); a higher one waits - an earlier mail from the same sender
+   is still on its way.
 
-Only then does the one genuine `otp --decrypt` run. The recovered
+Only then does the one genuine `otp --decrypt` run. A refusal from the
+tool with its decrypt counter exactly one past this store's is the
+receiver's own crash between that decrypt and its record (§16.2's crash
+shape), and the sealed payload is recovered whole from the tool's
+received-side copy rather than left on the server forever with every
+later mail queued behind it. The recovered
 `(payload, signature)` is verified against the pinned bundle, and the
 payload's own sealed `from`/`to` must match the server's claimed routing -
 a mismatch on any of these discards the mail (with an acknowledgement:
