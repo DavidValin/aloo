@@ -500,6 +500,66 @@ fn pause_after_peer_ended_keeps_the_inflight_send_and_owes_no_notice_of_its_own(
         !state.pending_end_notice,
         "the receiving side was told, not the one telling - it owes no notice of its own"
     );
+    assert!(
+        state.paused,
+        "and the pause itself is recorded, so nothing re-deriving 'in use' from \
+         'provisioned' can switch the session back on"
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// The pause is durable and distinct from provisioning: it survives a
+/// save/load, `provisioned` stays true underneath it, and only a genuine
+/// (re)start lifts it - the resume handshake (`mark_provisioned`) or a
+/// pad-only pair's local `/otp` (`resume_session`). A reconnect that
+/// re-derived "active" from `provisioned` alone used to switch a
+/// confirmed-ended session back on, on the one side that saw the other
+/// reconnect.
+///
+/// @requirement AC-443
+#[test]
+fn a_confirmed_pause_survives_save_and_load_until_a_resume_lifts_it() {
+    let path = temp_store_path();
+    let mut store = OtpStore::new_empty(path.clone());
+    store.mark_provisioned("alice-bob");
+    assert!(!store.is_paused("alice-bob"), "a fresh session is in use");
+
+    store.pause_after_peer_ended("alice-bob");
+    store.save().unwrap();
+    let mut loaded = OtpStore::load(&path).unwrap();
+    assert!(loaded.is_paused("alice-bob"), "the pause survives a restart");
+    assert!(
+        loaded.get("alice-bob").unwrap().provisioned,
+        "paused is not un-provisioned: the pad is still there to resume"
+    );
+
+    // The resume handshake completing, on either side of it.
+    loaded.mark_provisioned("alice-bob");
+    assert!(!loaded.is_paused("alice-bob"), "a session just agreed to is in use again");
+
+    // A pad-only pair's local resume, which runs no handshake.
+    loaded.pause_after_peer_ended("alice-bob");
+    assert!(loaded.resume_session("alice-bob"), "reports the pause it lifted");
+    assert!(!loaded.is_paused("alice-bob"));
+    assert!(!loaded.resume_session("alice-bob"), "nothing to lift twice");
+    assert!(!loaded.is_paused("nobody"), "an unknown contact is not paused, just absent");
+
+    std::fs::remove_file(&path).ok();
+    std::fs::remove_file(format!("{}.pending_content", path.display())).ok();
+}
+
+/// @requirement AC-443
+#[test]
+fn a_line_written_before_the_pause_was_durable_still_loads_as_in_use() {
+    let path = temp_store_path();
+    // Every column up to and including the two proof columns, none for
+    // `paused` - a store written by the build before it.
+    std::fs::write(&path, "alice-bob\t1\t\t3\t2\t\t\t\t\t\t\t\t\t\t\t\t\t\n").unwrap();
+    let store = OtpStore::load(&path).unwrap();
+    let state = store.get("alice-bob").expect("the line still parses");
+    assert!(state.provisioned);
+    assert_eq!(state.next_out_seq, 3);
+    assert!(!state.paused, "an older store never recorded a pause, so it never meant one");
     std::fs::remove_file(&path).ok();
 }
 

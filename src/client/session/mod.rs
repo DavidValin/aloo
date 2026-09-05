@@ -30,8 +30,7 @@ pub use identity::{
 };
 pub use link_events::{
     drain_p2p_events, forget_peer_for_test, reconcile_direct_membership, retry_deferred_dms,
-    sweep_otp_outbox,
-    sweep_outbox,
+    send_device_id_announce_for_test, sweep_otp_outbox, sweep_outbox,
 };
 pub(crate) use link_events::broadcast_channel_presence;
 

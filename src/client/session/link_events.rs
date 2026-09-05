@@ -486,37 +486,15 @@ pub(super) async fn handle_p2p_event(
             ui_state.set_link_status(peer, status);
             match status {
                 p2p::LinkStatus::Active => {
-                    // A send whose ciphertext already left the machine is
-                    // recovered via `otp --recover-last`, never re-encoded -
-                    // this is the one place that retry gets triggered, on every
-                    // genuine reachability transition (reconnect, link flap,
-                    // this app's own restart once the link comes back up).
-                    // Scans every OTP contact with something outstanding, not
-                    // just `peer` - cheap (a handful of contacts at most) and
-                    // opportunistically recovers anyone else reachable too.
-                    crate::client::otp::recover_and_resend(wr, session, ui_state).await?;
-                    // Same trigger, same reasoning, for a pad still owed to
-                    // this peer: an invitation whose delivery was never
-                    // confirmed is re-offered rather than regenerated, so a
-                    // peer who went offline mid-provisioning resumes instead
-                    // of stranding both sides.
-                    crate::client::otp::resend_pending_setups(wr, session, ui_state).await?;
-                    // Same trigger again, for a fresh pair's `OtpPadCommit`
-                    // whose acknowledgement never made it back - the one
-                    // provisioning payload whose loss leaves the two sides
-                    // asymmetric (docs/PROTOCOL.md §16.1).
-                    crate::client::otp::resend_pending_commits(wr, session, ui_state).await?;
-                    // Same trigger again, for a `/endotp` notice this side
-                    // still owes a peer who was unreachable when it ran (or
-                    // whose acknowledgement never made it back) - see
-                    // `docs/PROTOCOL.md` §16.6.
-                    crate::client::otp::resend_pending_end_notices(wr, session, ui_state).await?;
-                    // Same trigger again, for a file or voice send whose
-                    // offer already left but whose *content* is still
-                    // waiting on the peer's acceptance - covers this side's
-                    // own restart in that exact window, which the three
-                    // passes above do not (docs/PROTOCOL.md §16.2).
-                    crate::client::otp::resume_pending_content_sends(session, ui_state).await?;
+                    // Everything the pad layer still owes anyone reachable
+                    // - see `retry_owed_otp_exchanges`. Here, on every
+                    // genuine reachability transition (reconnect, link
+                    // flap, this app's own restart once the link comes
+                    // back up); and again the moment a returning peer's
+                    // device id lands (`DeviceIdAnnounce` below), which
+                    // for a `PqWrapped` pair is the first moment their
+                    // contact can be named at all.
+                    retry_owed_otp_exchanges(wr, session, ui_state).await?;
 
                     // Tells `peer` our own device id, encrypted, every time
                     // the link reaches Active (idempotent - harmless on a
@@ -590,12 +568,25 @@ pub(super) async fn handle_p2p_event(
             }
         }
         P2pEvent::DeviceIdAnnounce { from, envelope } => {
+            let known_before = session.peer_device_ids.get(&from).cloned();
             on_device_id_announce(session, ui_state, from, envelope);
             maybe_resolve_p2p_identity_data(session, ui_state, from).await;
             // Their device id is what finally names the pad contact for a
             // `PqWrapped` pair, and it only lands here - after the link
             // came up. For a peer who has returned under a new `UserId`
-            // this is the first moment their queue can be drained at all.
+            // this is the first moment their contact can be named at all,
+            // so everything the link-up passes could not address to them
+            // - an unacknowledged send outside the queue, a pad or commit
+            // still owed, a `/endotp` notice deferred with nothing in
+            // flight, a content send awaiting acceptance - runs again
+            // now. Only when the id is genuinely new for this `UserId`:
+            // the announce is re-sent on every link flap, and the link-up
+            // arm has already covered a peer whose id was known.
+            let newly_named = session.peer_device_ids.get(&from).cloned() != known_before;
+            if newly_named {
+                retry_owed_otp_exchanges(wr, session, ui_state).await?;
+            }
+            // And their queue can be drained at all.
             drain_otp_queue_for(wr, ui_state, session, from).await;
         }
         P2pEvent::OtpMessage {
@@ -1207,6 +1198,54 @@ fn message_row_of(item: &crate::client::outbox::OutboxItem) -> Option<u64> {
     }
 }
 
+/// Every retry pass for something the pad layer still owes a reachable
+/// peer, in the order `session.rs` has always run them on a link becoming
+/// `Active`:
+///
+/// - a send whose ciphertext already left the machine, recovered via
+///   `otp --recover-last` and never re-encoded (`otp::recover_and_resend`);
+/// - a pad still owed from an invitation whose delivery was never
+///   confirmed, re-offered rather than regenerated
+///   (`otp::resend_pending_setups`);
+/// - a fresh pair's `OtpPadCommit` whose acknowledgement never made it
+///   back - the one provisioning payload whose loss leaves the two sides
+///   asymmetric (`otp::resend_pending_commits`, docs/PROTOCOL.md §16.1);
+/// - a `/endotp` notice still owed to a peer who was unreachable when it
+///   ran, or whose acknowledgement never made it back
+///   (`otp::resend_pending_end_notices`, §16.6);
+/// - a file or voice send whose offer already left but whose *content* is
+///   still waiting on the peer's acceptance - this side's own restart in
+///   that exact window (`otp::resume_pending_content_sends`, §16.2).
+///
+/// Each scans every OTP contact with something outstanding rather than
+/// one peer - cheap (a handful of contacts at most) - and each resolves
+/// the peer fresh from the contact name (`otp::peer_for_contact_name`),
+/// which is why running them at link-up alone was not enough: a
+/// `PqWrapped` contact's name is device-qualified, and a peer returning
+/// under a new `UserId` has no device id until their `DeviceIdAnnounce`
+/// lands *after* the link is up. At link-up every pass found nobody to
+/// address, and nothing ran them again until the link next flapped - a
+/// deferred `/endotp` notice, for one, sat owed indefinitely while every
+/// send to that contact was refused as "ending", and the peer, never
+/// told, kept talking. So the same passes run from the `DeviceIdAnnounce`
+/// arm too, the moment the id is genuinely learned. Every pass is
+/// idempotent against a repeat: a recovered ciphertext arriving twice is
+/// answered from the receiver's recorded ack, a re-offered pad by a fresh
+/// ack instead of a second popup, a repeated commit re-acknowledged, and
+/// the notice is gated on the pad's state rather than on the trigger.
+pub(super) async fn retry_owed_otp_exchanges(
+    wr: &mut impl crate::control::ControlSink,
+    session: &mut SessionState,
+    ui_state: &mut UiState,
+) -> proto::Result<()> {
+    crate::client::otp::recover_and_resend(wr, session, ui_state).await?;
+    crate::client::otp::resend_pending_setups(wr, session, ui_state).await?;
+    crate::client::otp::resend_pending_commits(wr, session, ui_state).await?;
+    crate::client::otp::resend_pending_end_notices(wr, session, ui_state).await?;
+    crate::client::otp::resume_pending_content_sends(session, ui_state).await?;
+    Ok(())
+}
+
 /// Sends everything queued for `peer`, oldest first, now that their link
 /// is `Active`.
 ///
@@ -1378,6 +1417,16 @@ fn now_secs() -> u64 {
 /// played out without a server.
 pub fn forget_peer_for_test(ui_state: &mut UiState, session: &mut SessionState, peer: UserId) {
     forget_peer(ui_state, session, peer);
+}
+
+/// Queues this side's real, sealed `DeviceIdAnnounce` for `peer`
+/// (`send_device_id_announce`) - exposed the same way `forget_peer_for_test`
+/// is, so a test can hand a *returning* peer's genuine announce to the
+/// other side and drive exactly the arm that first names their pad
+/// contact (`handle_p2p_event`'s `DeviceIdAnnounce`), rather than presetting
+/// the device id and skipping the moment it lands.
+pub fn send_device_id_announce_for_test(session: &mut SessionState, ui_state: &UiState, peer: UserId) {
+    send_device_id_announce(session, ui_state, peer);
 }
 
 /// The pad-session counterpart of `sweep_outbox`: drops every sealed

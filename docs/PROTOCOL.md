@@ -5305,7 +5305,14 @@ against the contact name (not the connection, which does not survive a
 reconnect), persisted to the same on-disk store every other per-contact
 OTP record lives in. Every time
 a direct link to that peer next becomes reachable - a reconnect, a link
-flap, this app's own restart once the link comes back up - the notice is
+flap, this app's own restart once the link comes back up - and again the
+moment a returning peer's device id lands (a `PqWrapped` contact is named
+by device id, §16.1.2, and a peer back under a fresh `UserId` announces
+theirs only *after* the link is up, §12.7 - so at link-up itself they
+cannot yet be addressed at all, and every owed exchange - this notice, an
+unacknowledged send, a pad or commit still owed, a content send awaiting
+acceptance - is re-driven from that announce as well, rather than waiting
+for the link to next flap) - the notice is
 re-driven: already encrypted, it is recovered and resent by the same
 `--recover-last` pass every unacknowledged spend takes (§16.2's recovery
 rule - never a second encrypt, which would consume a second pad range for
@@ -5316,7 +5323,17 @@ that message is what the recovery pass resends, and its ack is what sends
 the notice; deferred with nothing in flight any more (the gate cleared but
 the app restarted, or the link died in the same breath as the ack), it is
 encrypted fresh, which is safe exactly because no notice ciphertext exists
-yet and nothing is ahead of it. Only the notice's own proof-carrying
+yet and nothing is ahead of it. "Nothing ahead of it" includes the durable
+send queue (§16.2.2): every entry there was sealed - its position spent -
+the moment it was written, and the gate names only the one on the wire,
+so the gate can stand clear with entries still queued (a process killed
+between an acknowledgement clearing it and the pump re-arming it with the
+next entry). A notice encrypted then would take position `n+k` while the
+peer's decoder waits at `n` - refused silently as out of turn, its own
+gate holding every queued message and every later send behind it for
+good. So the notice is deferred until the queue for that contact is empty
+too, and goes out as the gate's next occupant once the last entry's
+acknowledgement arrives. Only the notice's own proof-carrying
 acknowledgement clears the debt; a link transition with nothing
 acknowledged yet simply retries again next time.
 
@@ -5339,12 +5356,22 @@ their contact is still provisioned - that fact lives entirely in the
 fingerprint-derived, contact-name-keyed store (§16.1), which a reconnect
 never touches. The one thing that is naturally connection-scoped is which
 UI surface currently shows the session as active (the 🔑 prefix and the
-key-metadata header, §16.5); that is re-established the moment a peer who
-is already provisioned is seen again under a fresh `UserId`, so it never
-lags behind the underlying, persistent fact for long. Re-establishing it
-that way never moves the view - unlike agreeing a session in the first
-place, which opens the room it is with, since that is a thing both people
-just asked for.
+key-metadata header, §16.5); that is re-established the moment a peer
+whose session is *in use* is seen again under a fresh `UserId`, so it
+never lags behind the underlying, persistent fact for long. "In use" is
+itself a persistent fact, and a narrower one than "provisioned": a
+confirmed `/endotp` records the pause in that same contact-name-keyed
+store (`paused`), on both sides, and a reconnect - theirs, or this app's
+own restart - re-derives the marker from that. Re-deriving it from
+"provisioned" alone used to switch a confirmed-ended session silently
+back on for whichever side saw the other reconnect, and only for that
+side: from then on one side padded every send while the other sent
+plain, each believing the pair agreed. Only `/otp` lifts a pause (the
+resume handshake completing on either side, or a pad-only pair's local
+turn-on); a peer coming back is not a peer agreeing to a session.
+Re-establishing the marker never moves the view - unlike agreeing a
+session in the first place, which opens the room it is with, since that
+is a thing both people just asked for.
 
 Ending a session never ends the underlying `pq_hybrid` conversation itself:
 the DM room stays open and usable exactly as it was before OTP was ever
@@ -5387,24 +5414,36 @@ the contact still genuinely present - a transient `otp`/disk hiccup -
 never triggers either of these; only a confirmed-missing contact does.
 
 **Receiving any end-of-session notice also settles this side's own
-end-notice bookkeeping for the same contact, if any is outstanding.** A
-side can end up with its own `/endotp` still pending (waiting on an
-acknowledgement) at the exact moment the peer's notice - a genuine
-`/endotp`, or the substitute one above - arrives instead of that
-acknowledgement: most notably when the peer discovers their contact is
-gone and answers with their own fresh `OtpEndSession` rather than the
-`OtpDeliveryAck`/`OtpEndSessionAck` this side's send was actually waiting
-for. Without settling it there, `pending_end_notice` and the gate that
-side's own notice armed would stay set forever - every further send to
-that contact refusing with "the session is ending", and a repeated
-`/endotp` reporting "already ending" - even though the UI already shows
-the session as over. So the local pause that answers *any* incoming
-end-of-session notice clears both: the peer's notice (`clear_end_notice`)
-and, if this side had one outstanding for the same contact,
-its own send's gate too (only when what is actually pending is the end
-notice itself - an ordinary message still in flight for the contact has
-its own, unrelated resolution path and is never discarded just because the
-session happens to be ending too).
+end-notice *debt* for the same contact, if any is outstanding.** A side
+can end up with its own `/endotp` still pending at the exact moment the
+peer's notice - a genuine `/endotp` crossing it, or the substitute one
+above - arrives instead of the acknowledgement it was waiting for. The
+peer's notice is the news this side's would have carried, so the local
+pause that answers *any* incoming notice clears `pending_end_notice`: no
+fresh notice is ever encrypted for that contact again, and a repeated
+`/endotp` no longer reports "already ending".
+
+What happens to this side's own notice *already spent and on the wire*
+depends on the shape the peer's notice took, because it says whether the
+pad is still alive. A **padded** notice crossing ours means it is: the
+peer's decoder is waiting at exactly the position our notice took, and
+they will open it and answer it with the ordinary proof-carrying
+`OtpDeliveryAck` the moment it - or its recovered copy - reaches them.
+Its gate is therefore kept, like any other spent position's: recovered
+and resent on reconnect, cleared only by that acknowledgement. Clearing
+it on the crossing instead, as this side once did, threw away the only
+record of a spent position: if the peer dropped before our notice
+arrived, nothing resent it, our counter stood one ahead of theirs for
+good, and after a resume every message from here was refused as out of
+turn, silently, forever - the one direction dead while the other still
+worked. An **unpadded** notice (the substitute shape, or a pair whose
+pad can no longer encrypt) means the opposite: nothing this side spent
+will ever be opened, so the gate is released along with the debt rather
+than left refusing every future send with "the session is ending" -
+and only when what is actually pending is the end notice itself; an
+ordinary message still in flight for the contact has its own, unrelated
+resolution path and is never discarded just because the session happens
+to be ending too.
 
 ### 16.7 A session ends on both sides once its key is fully spent
 

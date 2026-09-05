@@ -205,6 +205,32 @@ pub fn contact_name_if_active(session: &SessionState, peer: UserId, peer_pubkey_
         .map(|_| contact_name)
 }
 
+/// `contact_name_if_active` narrowed to a session that is genuinely *in
+/// use*: provisioned and not paused by a confirmed `/endotp`
+/// (`OtpContactState::paused`). This - never `contact_name_if_active` on
+/// its own - is what every reconnect-time re-derivation of the UI's
+/// "active" marker must ask (`UserJoined`'s handler, the device-id
+/// resolution for a returning `PqWrapped` peer, a pad-only peer's
+/// registration): "provisioned" answers whether a pad exists for the
+/// pair, and a paused pad exists exactly as much as a live one. Asking
+/// the wider question there was how a confirmed-ended session switched
+/// itself back on the moment its peer reconnected - on that side alone.
+///
+/// `contact_name_if_active` itself keeps its wider meaning for the paths
+/// that must keep working across a pause: an unacknowledged send of a
+/// paused contact is still retried (`tick_otp_retries`), and sealed
+/// messages still queued for it are still drained (`drain_otp_queue_for`)
+/// - their pad positions were spent before the pause, and the peer's
+/// decoder is waiting on exactly them.
+pub fn contact_name_if_session_live(
+    session: &SessionState,
+    peer: UserId,
+    peer_pubkey_der: &[u8],
+) -> Option<String> {
+    let contact_name = contact_name_if_active(session, peer, peer_pubkey_der)?;
+    (!session.otp_store.is_paused(&contact_name)).then_some(contact_name)
+}
+
 /// What every *new* outgoing send (text, a voice recording, a file, a
 /// call's own eligibility) must check before riding the pad -
 /// `contact_name_if_active` alone answers "is a pad provisioned for this
@@ -234,7 +260,12 @@ pub fn contact_name_for_sending(
     if framing_for(&session.otp_own_pinned_der, peer_pubkey_der) == OtpFraming::Direct {
         return Some(contact_name);
     }
-    ui_state.is_otp_active(peer).then_some(contact_name)
+    // Both the live marker and the durable pause: the marker is what
+    // `/endotp` flips, the pause is what survives a reconnect
+    // (`contact_name_if_session_live`'s doc), and a new spend against a
+    // paused pad is wrong whichever of the two happens to be stale.
+    (ui_state.is_otp_active(peer) && !session.otp_store.is_paused(&contact_name))
+        .then_some(contact_name)
 }
 
 /// Checks `otp --has-contact <contact_name>` when `/otp` runs - if a
@@ -903,6 +934,11 @@ pub async fn handle_provisioning_command(
     // pad-only pair can express or needs to. Only ever reached for Live
     // (`resuming` implies `purpose == Live`) - Mail already returned above.
     if framing_for(&session.otp_own_pinned_der, &peer_pubkey_der) == OtpFraming::Direct {
+        // The one resume that runs no handshake, so the one that has to
+        // lift the durable pause itself (`OtpStore::resume_session`).
+        if session.otp_store.resume_session(&contact_name) {
+            let _ = session.otp_store.save();
+        }
         ui_state.mark_otp_active(peer);
         refresh_otp_key_status(&session.otp_cli_cfg, ui_state, peer, &contact_name).await;
         notify(
@@ -1887,7 +1923,10 @@ async fn finish_provisioning(
     }
 }
 
-pub(crate) async fn accept_invite(
+/// `pub` (not `pub(crate)`) so `test/otp_ack_wiring_test.rs` can drive a
+/// paused pair's `/otp` resume end to end, the same reason `on_message`
+/// and `on_end_session` are.
+pub async fn accept_invite(
     wr: &mut impl crate::control::ControlSink,
     session: &mut SessionState,
     ui_state: &mut UiState,
@@ -2423,12 +2462,7 @@ pub async fn handle_end_otp_command(
         true,
     );
 
-    let gate_armed = session
-        .otp_store
-        .get(&contact_name)
-        .and_then(|s| s.pending_unacked_out_seq)
-        .is_some();
-    if !gate_armed {
+    if end_notice_may_go_now(session, &contact_name) {
         send_end_notice_now(wr, session, peer, &peer_pubkey_der, &contact_name).await;
     }
     // else: deferred. An in-flight spend is still awaiting the peer's
@@ -2441,6 +2475,45 @@ pub async fn handle_end_otp_command(
     // any later reconnect - `on_delivery_ack` sends this notice as the
     // gate's next occupant.
     Ok(())
+}
+
+/// Whether the `/endotp` notice may be encrypted for `contact_name` *right
+/// now* - the one question all three places that drive it ask
+/// (`handle_end_otp_command`, `on_delivery_ack`, `resend_pending_end_notices`).
+///
+/// The notice is an ordinary spend, so it takes the pad's next position;
+/// what it must never do is take a position *ahead of* anything already
+/// spent and not yet on the wire. Three things can be:
+///
+/// - the send the gate names (`pending_unacked_out_seq`) - its ack is what
+///   sends the notice next;
+/// - an encrypt still standing or a reconciled spend parked behind the
+///   queue (`encrypt_in_flight`) - `send_end_notice_now` also refuses
+///   these, but asking here keeps the deferral visible to the callers;
+/// - anything the durable queue still holds (`client::otp_outbox`). Every
+///   entry there was sealed - its position spent - the moment it was
+///   written, and the gate belongs only to the one currently on the wire.
+///   The gate can stand clear with the queue non-empty: a process killed
+///   between an acknowledgement clearing it and the pump re-arming it
+///   with the next entry, or the next entry being unreadable. Encrypting
+///   the notice then would put it at position `n+k` while the peer's
+///   decoder waits at `n`, refusing it silently as out of turn - and
+///   nothing behind the notice's own armed gate could ever move again:
+///   every queued message, and every later send, wedged for good on a
+///   confirmation that cannot come.
+fn end_notice_may_go_now(session: &SessionState, contact_name: &str) -> bool {
+    let state = session.otp_store.get(contact_name);
+    if state.is_some_and(|s| s.pending_unacked_out_seq.is_some()) {
+        return false;
+    }
+    if session.otp_store.encrypt_in_flight(contact_name) {
+        return false;
+    }
+    session
+        .otp_outbox
+        .as_ref()
+        .and_then(|outbox| outbox.front(contact_name))
+        .is_none()
 }
 
 /// Encrypts and sends the `/endotp` notice as the ordinary stop-and-wait
@@ -2646,7 +2719,10 @@ pub async fn on_end_session(
     };
     let contact_name = payload.contact_name.clone();
     let sender_pubkey_der = sender.public_key_der.clone();
-    apply_end_session(session, ui_state, from, from_name, payload).await;
+    // Sealed and unpadded is the shape a pair takes only once its pad is
+    // unusable (`send_end_notice_now`'s fallback,
+    // `end_session_for_missing_contact`) - see `pause_session_locally`.
+    apply_end_session(session, ui_state, from, from_name, payload, true).await;
     send_sealed_end_session_ack(session, from, &sender_pubkey_der, &contact_name).await;
 }
 
@@ -2663,6 +2739,7 @@ fn pause_session_locally(
     ui_state: &mut UiState,
     from: UserId,
     contact_name: &str,
+    peer_pad_is_gone: bool,
 ) -> bool {
     let had_session = session.otp_store.get(contact_name).is_some_and(|s| s.provisioned);
 
@@ -2670,16 +2747,31 @@ fn pause_session_locally(
     session.otp_incoming_setup.remove(&from);
     session.otp_out_queue.clear(contact_name);
     session.otp_store.pause_after_peer_ended(contact_name);
-    // Being told the session is ending - by whatever shape the notice took
-    // - settles this side's own end-notice bookkeeping too, if any is
-    // outstanding for the same contact: this side may have run its own
-    // `/endotp` (or `end_session_for_missing_contact` may have sent its own
-    // substitute notice) and still be waiting on an acknowledgement that,
-    // now, will never specifically arrive for it - the peer's notice here
-    // is the news that answer would have carried anyway.
-    // `OtpStore::clear_own_pending_end_notice_send`'s doc.
+    // Being told the session is ending settles this side's own *debt* to
+    // say so, if it has one (`pending_end_notice`): the peer's notice is
+    // the news this side's would have carried, so no fresh notice is ever
+    // encrypted for it again.
     session.otp_store.clear_end_notice(contact_name);
-    session.otp_store.clear_own_pending_end_notice_send(contact_name);
+    // This side's own notice *already spent and on the wire* is another
+    // matter, and which way it goes depends on the shape the peer's notice
+    // took. Padded (`peer_pad_is_gone == false`): the pair's pad is alive,
+    // the peer's decoder is waiting at exactly that position, and they
+    // will open it and acknowledge it like any other message - the moment
+    // it (or its recovered copy, `recover_and_resend`) reaches them. It
+    // keeps its gate until then. Clearing it here instead, as the old
+    // "answered with a notice of their own rather than an ack" reasoning
+    // did, threw away the only record of a spent position: if the peer
+    // dropped before that notice arrived, nothing resent it, this side's
+    // counter stood one ahead of theirs for good, and after a resume every
+    // message from here was refused as out of turn, silently, forever.
+    // Unpadded (`true`): the peer sealed it that way precisely because
+    // there is no usable pad between them any more (their entry is gone,
+    // or a side cannot encrypt at all), so nothing this side spent will
+    // ever be opened, and the gate is released rather than left refusing
+    // every future send with "the session is ending".
+    if peer_pad_is_gone {
+        session.otp_store.clear_own_pending_end_notice_send(contact_name);
+    }
     let _ = session.otp_store.save();
     ui_state.clear_otp_active(from);
     had_session
@@ -2694,8 +2786,10 @@ async fn apply_end_session(
     from: UserId,
     from_name: String,
     payload: crypto::otp::OtpEndSessionPayload,
+    peer_pad_is_gone: bool,
 ) {
-    let had_session = pause_session_locally(session, ui_state, from, &payload.contact_name);
+    let had_session =
+        pause_session_locally(session, ui_state, from, &payload.contact_name, peer_pad_is_gone);
     if had_session {
         notify(
             ui_state,
@@ -2746,7 +2840,7 @@ async fn end_session_for_missing_contact(
     from_name: &str,
     contact_name: &str,
 ) {
-    let had_session = pause_session_locally(session, ui_state, from, contact_name);
+    let had_session = pause_session_locally(session, ui_state, from, contact_name, true);
 
     let told_sender = try_notify_peer_session_ended(session, ui_state, from, contact_name).await;
     if had_session {
@@ -2963,12 +3057,7 @@ pub async fn resend_pending_end_notices(
         else {
             continue; // not currently connected - a later transition retries
         };
-        let gate_armed = session
-            .otp_store
-            .get(&contact_name)
-            .and_then(|s| s.pending_unacked_out_seq)
-            .is_some();
-        if !gate_armed {
+        if end_notice_may_go_now(session, &contact_name) {
             send_end_notice_now(wr, session, peer, &pubkey_der, &contact_name).await;
         }
     }
@@ -3062,7 +3151,9 @@ pub async fn end_live_session_if_exhausted(
         .get(&peer)
         .map(|u| u.name.clone())
         .unwrap_or_default();
-    pause_session_locally(session, ui_state, peer, contact_name);
+    // Fully spent in one direction or the other: nothing this side has
+    // in flight under it will ever be opened again (`pause_session_locally`).
+    pause_session_locally(session, ui_state, peer, contact_name, true);
     let told_peer = try_notify_peer_session_ended(session, ui_state, peer, contact_name).await;
     notify(
         ui_state,
@@ -5398,7 +5489,9 @@ pub(crate) async fn apply_otp_message(
             let Ok(payload) = proto::decode::<crypto::otp::OtpEndSessionPayload>(&plaintext) else {
                 return Ok(());
             };
-            apply_end_session(session, ui_state, from, from_name, payload).await;
+            // Padded: the pad just opened it, so it is alive on both sides
+            // (`pause_session_locally`'s doc on what that keeps).
+            apply_end_session(session, ui_state, from, from_name, payload, false).await;
             // The notice is an ordinary stop-and-wait send on the peer's
             // side now (`PendingOtpContent::EndNotice`), so it earns the
             // ordinary proof-carrying acknowledgement - and the same
@@ -5758,7 +5851,8 @@ pub async fn on_delivery_ack(
     let owes_notice = session
         .otp_store
         .get(&contact_name)
-        .is_some_and(|s| s.pending_end_notice && s.pending_unacked_out_seq.is_none());
+        .is_some_and(|s| s.pending_end_notice)
+        && end_notice_may_go_now(session, &contact_name);
     if owes_notice {
         send_end_notice_now(wr, session, from, &sender.public_key_der, &contact_name).await;
     }

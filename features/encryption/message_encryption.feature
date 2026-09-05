@@ -344,6 +344,38 @@ Feature: How a message is encrypted, at every layer
     And bob drops before confirming, and later reconnects
     Then the very same notice is re-sent from recovery, and his confirmation ends it for both
 
+  # A confirmed end is a durable fact of the contact, not of the connection
+  # that carried it: neither side coming back, nor an app restart, may
+  # switch it back on for one side only. Only /otp does, on both sides.
+  @US-033 @AC-443 @direct_otp
+  Scenario: A confirmed end stays ended across a restart
+    Given alice and bob reach each other directly and hold a pad for each other
+    When alice runs /endotp with bob
+    And bob confirms the end
+    And alice's app restarts and bob's link comes up again
+    Then alice still shows the session with bob as ended
+    When alice runs /otp with bob
+    Then otp is active for bob immediately, with nothing sent to negotiate it
+
+  @US-033 @AC-444 @direct_otp
+  Scenario: Two ends crossing keep every spent position accounted for
+    Given alice and bob reach each other directly and hold a pad for each other
+    When alice runs /endotp with bob
+    And bob runs /endotp with alice at the same moment
+    And bob's notice reaches alice first
+    Then alice's own notice keeps its slot, is re-sent from recovery, and bob's confirmation settles it
+
+  @US-033 @AC-445 @direct_otp
+  Scenario: An end asked for while sealed messages still wait goes out after them
+    Given alice and bob reach each other directly and hold a pad for each other
+    And queued sends are on for that pair
+    When alice sends bob "one"
+    And alice sends bob "two"
+    And bob has acknowledged both, but alice's queue has not moved on from the second
+    And alice runs /endotp with bob
+    Then the end is owed, but nothing is spent on it while the queue still holds a message
+    And once the queue drains, the notice goes out and ends it for both
+
   @US-033 @AC-316 @direct_otp
   Scenario: A voice recording survives the sender's own restart while awaiting acceptance
     Given alice and bob reach each other directly and hold a pad for each other

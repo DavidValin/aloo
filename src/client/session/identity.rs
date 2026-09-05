@@ -525,11 +525,14 @@ pub fn register_pad_only_peer(
     // what makes that visible - unless this side deliberately ended the
     // session and still owes them the notice: re-marking it active would
     // announce as running the very session the reconnect is about to
-    // deliver the end of (`otp::resend_pending_end_notices`).
+    // deliver the end of (`otp::resend_pending_end_notices`) - or the end
+    // was already confirmed and the pad stands paused
+    // (`OtpStore::is_paused`), which `/otp` alone turns back on.
     if !session
         .otp_store
         .get(&contact_name)
         .is_some_and(|s| s.pending_end_notice)
+        && !session.otp_store.is_paused(&contact_name)
     {
         ui_state.mark_otp_active(peer);
     }
@@ -740,10 +743,11 @@ pub(super) async fn maybe_resolve_p2p_identity_data(
     // naming needs no device_id and so never had to wait); without this, a
     // still-live `pq_hybrid` OTP session would show "inactive" from the
     // moment its peer reconnects until the next unrelated event happened
-    // to refresh it.
+    // to refresh it. Only a session genuinely in use - a paused one stays
+    // paused across their reconnect (`otp::contact_name_if_session_live`).
     if let Some(user) = ui_state.known_users.get(&peer).cloned()
         && let Some(contact_name) =
-            crate::client::otp::contact_name_if_active(session, peer, &user.public_key_der)
+            crate::client::otp::contact_name_if_session_live(session, peer, &user.public_key_der)
     {
         ui_state.mark_otp_active(peer);
         crate::client::otp::refresh_otp_key_status(&session.otp_cli_cfg, ui_state, peer, &contact_name)

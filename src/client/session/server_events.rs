@@ -277,10 +277,17 @@ pub(super) async fn handle_server_message(
                 // pad marker/header/call-blocking would wrongly show "inactive"
                 // the moment a still-live session's peer reconnects, even
                 // though nothing about the session itself ended - only
-                // `/endotp` may do that (`docs/PROTOCOL.md` §16.6).
-                if let Some(contact_name) =
-                    crate::client::otp::contact_name_if_active(session, user.id, &user.public_key_der)
-                {
+                // `/endotp` may do that (`docs/PROTOCOL.md` §16.6). And
+                // only a session that is genuinely in use: one `/endotp`
+                // has paused stays paused across their reconnect
+                // (`otp::contact_name_if_session_live`'s doc) - re-deriving
+                // from "provisioned" alone switched it back on here, on
+                // this side only.
+                if let Some(contact_name) = crate::client::otp::contact_name_if_session_live(
+                    session,
+                    user.id,
+                    &user.public_key_der,
+                ) {
                     ui_state.mark_otp_active(user.id);
                     crate::client::otp::refresh_otp_key_status(
                         &session.otp_cli_cfg,

@@ -135,6 +135,27 @@ pub struct OtpContactState {
     /// contact this side has stopped actively using for now, resumable with
     /// its existing pad via `/otp`.
     pub pending_end_notice: bool,
+    /// `true` while the session with this contact stands *paused*: still
+    /// provisioned - the keychain entry and both counters are exactly as
+    /// they were - but deliberately not in use, because a `/endotp` was
+    /// confirmed (`pause_after_peer_ended`, run by whichever side's turn it
+    /// was: the told side the moment the notice lands, the initiator the
+    /// moment the confirmation does). Cleared only by a session genuinely
+    /// (re)starting: the resume handshake completing on either side
+    /// (`mark_provisioned`), a pad-only pair's local `/otp`
+    /// (`resume_session`), or a fresh pad replacing the old one
+    /// (`reset_for_new_pad`).
+    ///
+    /// Persisted, unlike the UI-facing "active" marker
+    /// (`UiState::otp_active_peers`, keyed by a connection-lifetime
+    /// `UserId`), because the two used to be the *same* fact seen from two
+    /// places, and they are not: every reconnect re-derives that marker
+    /// from this store, and with nothing here saying "paused", re-deriving
+    /// it from `provisioned` alone silently switched a confirmed-ended
+    /// session back on - on whichever side happened to see the other
+    /// reconnect or restarted itself, and only on that side. The two
+    /// sides then disagreed about whether the pad was in use at all.
+    pub paused: bool,
     /// What the peer's acknowledgement of `pending_unacked_out_seq` must
     /// carry to be believed: `sha256` of the nonce buried inside that
     /// message (`crypto::otp::AckProof`).
@@ -257,8 +278,9 @@ pub struct OtpContactState {
 /// `encrypt_intent` (the same encoding `pending_content` uses, empty when
 /// `None`), `bound_peer_device_id` (the raw device_id string, empty
 /// when `None` - device-pinning plan §5), `deferred_spend` (the same
-/// encoding `pending_content` uses, empty when `None`), and the two hex
-/// proof columns `encrypt_intent_proof`/`deferred_spend_proof` follow the
+/// encoding `pending_content` uses, empty when `None`), the two hex
+/// proof columns `encrypt_intent_proof`/`deferred_spend_proof`, and
+/// finally `paused` (`1`/empty like `pending_end_notice`) follow the
 /// same tolerance again.
 pub struct OtpStore {
     path: PathBuf,
@@ -483,11 +505,15 @@ impl OtpStore {
         }
     }
 
+    /// Marks `contact_name`'s keychain entry ready to use. Reached by every
+    /// path that (re)starts a session - a fresh handshake completing, and
+    /// the resume handshake completing over an already-installed pad, on
+    /// either side of it - so it also lifts a pause (`paused`'s doc): a
+    /// session the two sides just agreed to run is in use by definition.
     pub fn mark_provisioned(&mut self, contact_name: &str) {
-        self.entries
-            .entry(contact_name.to_string())
-            .or_default()
-            .provisioned = true;
+        let state = self.entries.entry(contact_name.to_string()).or_default();
+        state.provisioned = true;
+        state.paused = false;
     }
 
     /// Records that a pad of `size_mb` per key has been generated for
@@ -545,6 +571,29 @@ impl OtpStore {
     pub fn pause_after_peer_ended(&mut self, contact_name: &str) {
         let state = self.entries.entry(contact_name.to_string()).or_default();
         state.pending_setup_size_mb = None;
+        // Durable, so no reconnect - theirs or this app's own restart -
+        // can mistake "provisioned" for "in use" again (`paused`'s doc).
+        state.paused = true;
+    }
+
+    /// The session with `contact_name` is in use again - the reverse of
+    /// `pause_after_peer_ended`, for the one path that turns a paused pad
+    /// back on without re-running provisioning at all (a pad-only pair's
+    /// local `/otp`, `client::otp::handle_provisioning_command`). Every
+    /// other resume passes through `mark_provisioned`, which clears it
+    /// too. Returns whether the contact was actually paused.
+    pub fn resume_session(&mut self, contact_name: &str) -> bool {
+        match self.entries.get_mut(contact_name) {
+            Some(state) => std::mem::take(&mut state.paused),
+            None => false,
+        }
+    }
+
+    /// Whether `contact_name` stands provisioned but paused - see
+    /// `OtpContactState::paused`. `false` for an unknown contact, which is
+    /// simply not provisioned rather than paused.
+    pub fn is_paused(&self, contact_name: &str) -> bool {
+        self.entries.get(contact_name).is_some_and(|s| s.paused)
     }
 
     /// Records what the next `otp --encrypt` for `contact_name` is about
@@ -950,6 +999,10 @@ impl OtpStore {
             if let Some(proof) = state.deferred_spend_proof {
                 out.push_str(&crate::crypto::hex_encode(&proof));
             }
+            out.push('\t');
+            if state.paused {
+                out.push('1');
+            }
             out.push('\n');
         }
         // Staged and renamed, never truncated in place: a crash mid-write
@@ -1128,6 +1181,10 @@ fn parse_line(line: &str) -> Option<(String, OtpContactState)> {
     let deferred_spend = parts.next().and_then(decode_pending_content);
     let encrypt_intent_proof = next_hex32(&mut parts);
     let deferred_spend_proof = next_hex32(&mut parts);
+    // Same tolerance again: absent (a store written before a pause was
+    // durable) reads as "in use" - the only reading an older store could
+    // ever have meant, since nothing in it recorded a pause at all.
+    let paused = parts.next() == Some("1");
     Some((
         name,
         OtpContactState {
@@ -1147,6 +1204,7 @@ fn parse_line(line: &str) -> Option<(String, OtpContactState)> {
             deferred_spend,
             encrypt_intent_proof,
             deferred_spend_proof,
+            paused,
         },
     ))
 }

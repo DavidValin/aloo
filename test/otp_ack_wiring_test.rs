@@ -6327,3 +6327,671 @@ async fn an_orphaned_spend_behind_a_draining_queue_is_promoted_once_the_gate_cle
     assert_eq!(alice.session.otp_held_plaintext_for(&contact), 0);
     assert!(alice.pad_spent(&contact).await > spent_at_crash, "the fourth sealed behind it");
 }
+
+// ---------------------------------------------------------------------
+// A confirmed end stays ended (AC-443..AC-446)
+// ---------------------------------------------------------------------
+
+/// Runs `/endotp` on alice all the way to bob's confirmation, leaving both
+/// sides paused with nothing in flight - the state every scenario below
+/// starts from or passes through.
+async fn end_and_confirm(alice: &mut Side, bob: &mut Side, contact: &str) {
+    let peer_der = alice.peer_der.clone();
+    aloo::client::otp::handle_end_otp_command(
+        &mut NullSink,
+        &mut alice.ui,
+        &mut alice.session,
+        BOB,
+        peer_der,
+    )
+    .await
+    .expect("/endotp should not fail");
+    deliver_envelope(bob, ALICE, "alice", alice).await;
+    let (ack_seq, proof) = last_ack(bob);
+    ack(alice, BOB, ack_seq, proof).await;
+    assert!(!alice.ui.is_otp_active(BOB) && !bob.ui.is_otp_active(ALICE));
+    assert!(!alice.gate_held(contact) && !bob.gate_held(contact));
+}
+
+/// Whether `text` has landed in any of this side's private rooms.
+fn saw_text(side: &Side, text: &str) -> bool {
+    side.ui
+        .private_rooms
+        .values()
+        .flat_map(|r| r.log.iter())
+        .any(|e| matches!(&e.body, MessageBody::Text(t) if t == text))
+}
+
+/// Bob leaves and comes back under a fresh `UserId`, exactly as
+/// `session.rs` sees it: the old id is forgotten, the returning peer is
+/// adopted onto the new one, their link comes up, and their device id
+/// lands - which for a `PqWrapped` pair is what first names the pad
+/// contact again. Returns the id he came back as.
+async fn bob_returns_under_a_new_id(alice: &mut Side) -> UserId {
+    alice.ui.on_user_offline(BOB);
+    aloo::client::session::forget_peer_for_test(&mut alice.ui, &mut alice.session, BOB);
+    let returned = UserId(4242);
+    let him = UserInfo {
+        id: returned,
+        name: "bob".into(),
+        public_key_der: alice.peer_der.clone(),
+        key_mode: KeyMode::PqHybrid,
+    };
+    alice.ui.known_users.insert(returned, him.clone());
+    alice.ui.adopt_returning_peer(BOB, &him);
+    aloo::client::session::seed_direct_peer_keys(&mut alice.session, returned, &him);
+    // Genuinely reachable, with an address: the device-id arm re-derives
+    // the session marker only for a link it can actually place
+    // (`maybe_resolve_p2p_identity_data`), which is exactly the site that
+    // used to switch a paused session back on.
+    alice.session.peer_link_mut().mark_active_for_test(returned);
+    alice
+        .session
+        .inject_p2p_event(aloo::client::p2p::P2pEvent::LinkStatusChanged {
+            peer: returned,
+            status: aloo::client::p2p::LinkStatus::Active,
+        });
+    aloo::client::session::drain_p2p_events(&mut NullSink, &mut alice.ui, &mut alice.session)
+        .await
+        .expect("draining should not fail");
+    alice
+        .session
+        .set_peer_device_id_for_test(returned, "test-device".to_string());
+    alice
+        .session
+        .inject_p2p_event(aloo::client::p2p::P2pEvent::DeviceIdAnnounce {
+            from: returned,
+            envelope: Envelope {
+                content: Content::DeviceIdAnnounce,
+                blocks: vec![vec![0u8; 8]],
+            },
+        });
+    aloo::client::session::drain_p2p_events(&mut NullSink, &mut alice.ui, &mut alice.session)
+        .await
+        .expect("draining should not fail");
+    returned
+}
+
+/// The reported desync: both sides in a session, `/endotp` run and
+/// confirmed, then one peer drops and comes back - and the session
+/// silently switched itself back on for the side that saw them return,
+/// while the other side stayed paused. From then on one side padded every
+/// send and the other sent plain, each believing the other agreed.
+///
+/// The pause has to be a durable fact of the contact, not a marker keyed
+/// by a connection that a reconnect discards: a returning peer's link
+/// coming up and their device id landing must re-derive "in use" from a
+/// store that actually says paused, and `/otp` - the one thing documented
+/// to resume a paused pad - must still do exactly that, on both sides.
+///
+/// @requirement AC-443
+#[tokio::test]
+async fn a_confirmed_end_stays_paused_when_the_peer_reconnects() {
+    if !require_otp() {
+        return;
+    }
+    let (mut alice, mut bob, contact) = pair("endotp-reconnect-stays-paused", Id::Pq, Id::Pq).await;
+    alice.ui.mark_otp_active(BOB);
+    bob.ui.mark_otp_active(ALICE);
+    end_and_confirm(&mut alice, &mut bob, &contact).await;
+    assert!(
+        alice.session.otp_store_mut().is_paused(&contact)
+            && bob.session.otp_store_mut().is_paused(&contact),
+        "a confirmed end is recorded as a pause on both sides"
+    );
+
+    let returned = bob_returns_under_a_new_id(&mut alice).await;
+    // From here every send and read on alice's side addresses the id he
+    // came back as.
+    alice.peer = returned;
+    assert!(
+        !alice.ui.is_otp_active(returned),
+        "bob coming back is not bob agreeing to a session: the pause survives his reconnect \
+         on alice's side exactly as it does on his"
+    );
+    assert!(
+        aloo::client::otp::contact_name_for_sending(
+            &alice.session,
+            &alice.ui,
+            returned,
+            &alice.peer_der
+        )
+        .is_none(),
+        "and nothing new rides the paused pad"
+    );
+    assert!(
+        aloo::client::otp::contact_name_if_active(&alice.session, returned, &alice.peer_der)
+            .is_some(),
+        "the pad itself is still provisioned underneath - paused, not gone"
+    );
+    // Back to a link the harness can read from: an `Active` test link
+    // transmits, an unpunched one keeps what it is handed
+    // (`Side::queued`'s doc).
+    alice
+        .session
+        .peer_link_mut()
+        .open_unpunched_link_for_test(returned);
+
+    // `/otp` resumes it: the request goes out, bob accepts, his acceptance
+    // comes back, and only then is the session in use again - on both
+    // sides, over the very same pad, with the counters exactly where the
+    // end left them.
+    let peer_der = alice.peer_der.clone();
+    aloo::client::otp::handle_provisioning_command(
+        &mut NullSink,
+        &mut alice.ui,
+        &mut alice.session,
+        returned,
+        peer_der,
+        aloo::crypto::otp::OtpPurpose::Live,
+    )
+    .await
+    .expect("/otp should not fail");
+    let request = alice
+        .session
+        .sent_or_queued_payloads(returned)
+        .into_iter()
+        .find_map(|p| match p {
+            P2pPayload::Envelope { envelope, .. }
+                if envelope.content == Content::OtpSessionRequest =>
+            {
+                Some(envelope)
+            }
+            _ => None,
+        })
+        .expect("/otp over an installed pad proposes resuming it");
+    let alice_info = bob.ui.known_users[&ALICE].clone();
+    aloo::client::otp::on_session_request(
+        &mut bob.ui,
+        &mut bob.session,
+        ALICE,
+        "alice".into(),
+        &alice_info,
+        request,
+    );
+    aloo::client::otp::accept_invite(&mut NullSink, &mut bob.session, &mut bob.ui)
+        .await
+        .expect("accepting should not fail");
+    assert!(bob.ui.is_otp_active(ALICE), "bob's side resumes on accepting");
+    assert!(!bob.session.otp_store_mut().is_paused(&contact));
+    let setup_ack = bob
+        .queued()
+        .into_iter()
+        .find_map(|p| match p {
+            P2pPayload::Envelope { envelope, .. }
+                if envelope.content == Content::OtpKeySetupAck =>
+            {
+                Some(envelope)
+            }
+            _ => None,
+        })
+        .expect("accepting answers with a setup ack");
+    let bob_info = alice.ui.known_users[&returned].clone();
+    aloo::client::otp::on_key_setup_ack(&mut alice.ui, &mut alice.session, returned, &bob_info, setup_ack)
+        .await;
+    assert!(alice.ui.is_otp_active(returned), "alice's side resumes on his acceptance");
+    assert!(!alice.session.otp_store_mut().is_paused(&contact));
+
+    // The resumed pad picks up where it left off: the next message is
+    // exactly the one bob's decoder expects.
+    send_text(&mut alice, &contact, "back on the pad").await;
+    let (seq, msg_id, envelope, device) = alice
+        .session
+        .sent_or_queued_payloads(returned)
+        .into_iter()
+        .filter_map(|p| match p {
+            P2pPayload::OtpEnvelope {
+                seq,
+                msg_id,
+                envelope,
+                sender_device_id,
+                ..
+            } => Some((seq, msg_id, envelope, sender_device_id)),
+            _ => None,
+        })
+        .next_back()
+        .expect("the resumed send goes out padded");
+    receive_text(&mut bob, seq, msg_id, envelope, device).await;
+    assert!(saw_text(&bob, "back on the pad"), "the resumed pad decrypts in lockstep");
+}
+
+/// The same pause across this side's *own* restart: the store is dropped
+/// and reloaded from disk, the UI starts empty, and the peer being seen
+/// again must not turn a confirmed-ended session back on.
+///
+/// @requirement AC-443
+#[tokio::test]
+async fn a_confirmed_end_stays_paused_across_this_sides_own_restart() {
+    if !require_otp() {
+        return;
+    }
+    let (mut alice, mut bob, contact) = pair("endotp-restart-stays-paused", Id::Pq, Id::Pq).await;
+    alice.ui.mark_otp_active(BOB);
+    bob.ui.mark_otp_active(ALICE);
+    end_and_confirm(&mut alice, &mut bob, &contact).await;
+
+    // Alice's process restarts: her store comes back from the file the
+    // confirmation wrote, and her UI knows nothing yet.
+    let store_path = alice.session.otp_store_mut().path().to_path_buf();
+    *alice.session.otp_store_mut() =
+        aloo::client::otp_store::OtpStore::load(&store_path).expect("the store reloads");
+    let bob_info = alice.ui.known_users[&BOB].clone();
+    alice.ui = UiState::new("alice".into());
+    alice.ui.set_own_id(ALICE);
+    alice.ui.known_users.insert(BOB, bob_info);
+    alice.ui.set_link_status(BOB, aloo::client::p2p::LinkStatus::Active);
+    // Reachable with an address, so the device-id arm actually reaches the
+    // re-derivation (`bob_returns_under_a_new_id`'s note).
+    alice.session.peer_link_mut().mark_active_for_test(BOB);
+
+    // Bob is seen again - his device id landing is the moment a
+    // `PqWrapped` contact is re-derived after a restart.
+    alice
+        .session
+        .inject_p2p_event(aloo::client::p2p::P2pEvent::DeviceIdAnnounce {
+            from: BOB,
+            envelope: Envelope {
+                content: Content::DeviceIdAnnounce,
+                blocks: vec![vec![0u8; 8]],
+            },
+        });
+    aloo::client::session::drain_p2p_events(&mut NullSink, &mut alice.ui, &mut alice.session)
+        .await
+        .expect("draining should not fail");
+    assert!(
+        !alice.ui.is_otp_active(BOB),
+        "a restart is not a resume: the pause was written to disk with the confirmation"
+    );
+    assert!(alice.session.otp_store_mut().is_paused(&contact));
+}
+
+/// Both users run `/endotp` at the same moment, and bob's notice reaches
+/// alice before hers reaches him. Her notice is a real spend already on
+/// the wire; receiving his must not throw its gate away. If bob drops
+/// before it arrives, the recovery pass still has to re-send that exact
+/// ciphertext, and his acknowledgement of it is what finally clears it -
+/// so that after a resume, the next thing alice says is exactly what his
+/// decoder expects, rather than a position he never saw.
+///
+/// @requirement AC-444
+#[tokio::test]
+async fn a_padded_end_notice_crossing_the_peers_own_keeps_its_gate() {
+    if !require_otp() {
+        return;
+    }
+    let (mut alice, mut bob, contact) = pair("endotp-crossing-notices", Id::Pq, Id::Pq).await;
+    alice.ui.mark_otp_active(BOB);
+    bob.ui.mark_otp_active(ALICE);
+
+    let peer_der = alice.peer_der.clone();
+    aloo::client::otp::handle_end_otp_command(
+        &mut NullSink,
+        &mut alice.ui,
+        &mut alice.session,
+        BOB,
+        peer_der,
+    )
+    .await
+    .expect("/endotp should not fail");
+    let peer_der = bob.peer_der.clone();
+    aloo::client::otp::handle_end_otp_command(
+        &mut NullSink,
+        &mut bob.ui,
+        &mut bob.session,
+        ALICE,
+        peer_der,
+    )
+    .await
+    .expect("/endotp should not fail");
+    let spent = alice.pad_spent(&contact).await;
+
+    // Bob's notice lands on alice first.
+    deliver_envelope(&mut alice, BOB, "bob", &mut bob).await;
+    assert!(!alice.ui.is_otp_active(BOB), "alice pauses on his notice");
+    assert!(
+        alice.gate_held(&contact),
+        "her own notice is a spent position bob's decoder is waiting on - its gate stays"
+    );
+    assert!(
+        !alice
+            .session
+            .otp_store_mut()
+            .get(&contact)
+            .is_some_and(|s| s.pending_end_notice),
+        "but she owes no *fresh* notice: his is the news hers would have carried"
+    );
+
+    // Bob dropped before her notice reached him; on his return the
+    // recovery pass re-sends the very same ciphertext.
+    aloo::client::otp::recover_and_resend(&mut NullSink, &mut alice.session, &mut alice.ui)
+        .await
+        .expect("the recovery pass should not fail");
+    let envelopes: Vec<(u64, Option<u64>, Envelope, String)> = alice
+        .queued()
+        .into_iter()
+        .filter_map(|p| match p {
+            P2pPayload::OtpEnvelope {
+                seq,
+                msg_id,
+                envelope,
+                sender_device_id,
+                ..
+            } => Some((seq, msg_id, envelope, sender_device_id)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(envelopes.len(), 2, "the original and exactly one recovered copy");
+    assert_eq!(envelopes[0].0, envelopes[1].0, "under the same slot");
+    assert_eq!(alice.pad_spent(&contact).await, spent, "recovered, never re-encrypted");
+
+    let (seq, msg_id, envelope, device) = envelopes.into_iter().next_back().unwrap();
+    receive_text(&mut bob, seq, msg_id, envelope, device).await;
+    let (ack_seq, proof) = last_ack(&mut bob);
+    ack(&mut alice, BOB, ack_seq, proof).await;
+    assert!(!alice.gate_held(&contact), "his acknowledgement of it is what clears the gate");
+    assert_eq!(
+        alice.session.otp_store_mut().get(&contact).unwrap().next_out_seq,
+        bob.session.otp_store_mut().get(&contact).unwrap().next_expected_in_seq,
+        "every spent position accounted for on both sides"
+    );
+
+    // Resumed, the pair still decrypts in lockstep.
+    alice.session.otp_store_mut().mark_provisioned(&contact);
+    bob.session.otp_store_mut().mark_provisioned(&contact);
+    alice.ui.mark_otp_active(BOB);
+    bob.ui.mark_otp_active(ALICE);
+    send_text(&mut alice, &contact, "after both ended").await;
+    let (seq, msg_id, envelope, device) = alice
+        .queued()
+        .into_iter()
+        .filter_map(|p| match p {
+            P2pPayload::OtpEnvelope {
+                seq,
+                msg_id,
+                envelope,
+                sender_device_id,
+                ..
+            } => Some((seq, msg_id, envelope, sender_device_id)),
+            _ => None,
+        })
+        .next_back()
+        .unwrap();
+    receive_text(&mut bob, seq, msg_id, envelope, device).await;
+    assert!(
+        saw_text(&bob, "after both ended"),
+        "a gate thrown away here left alice one position ahead of bob for good"
+    );
+}
+
+/// With the durable queue on, an acknowledgement can clear the gate before
+/// the pump re-arms it with the next sealed entry - a process killed in
+/// between, or the next entry unreadable. `/endotp` run then must not
+/// encrypt its notice ahead of what the queue still holds: those entries
+/// are spent positions the peer's decoder is waiting on, and a notice
+/// leapfrogging them would be refused as out of turn, its own gate then
+/// holding everything behind it for good. The notice waits, and goes out
+/// as the gate's next occupant once the queue has drained.
+///
+/// @requirement AC-445
+#[tokio::test]
+async fn an_owed_end_notice_waits_behind_a_sealed_queue() {
+    if !require_otp() {
+        return;
+    }
+    let (mut alice, mut bob, contact) = pair("endotp-behind-queue", Id::Pq, Id::Pq).await;
+    alice.ui.mark_otp_active(BOB);
+    bob.ui.mark_otp_active(ALICE);
+    alice.session.set_queue_send_messages(true);
+
+    send_text(&mut alice, &contact, "first").await;
+    send_text(&mut alice, &contact, "second").await;
+    assert_eq!(alice.session.otp_queued_for(&contact), 2, "both sealed into the queue");
+    // The first round-trips normally, which releases the second.
+    deliver_envelope(&mut bob, ALICE, "alice", &mut alice).await;
+    let (s1, p1) = last_ack(&mut bob);
+    ack(&mut alice, BOB, s1, p1).await;
+    assert!(alice.gate_held(&contact), "the second is on the wire now");
+    let (s2, m2, e2, d2) = alice
+        .queued()
+        .into_iter()
+        .filter_map(|p| match p {
+            P2pPayload::OtpEnvelope {
+                seq,
+                msg_id,
+                envelope,
+                sender_device_id,
+                ..
+            } => Some((seq, msg_id, envelope, sender_device_id)),
+            _ => None,
+        })
+        .next_back()
+        .unwrap();
+    receive_text(&mut bob, s2, m2, e2, d2).await;
+    let (s2, p2) = last_ack(&mut bob);
+    // The crash window: the acknowledgement is recorded, the process dies
+    // before the pump retires the entry it acknowledged.
+    assert!(alice.session.otp_store_mut().record_acked(&contact, s2, Some(p2)));
+    alice.session.otp_store_mut().save().unwrap();
+    assert!(!alice.gate_held(&contact) && alice.session.otp_queued_for(&contact) == 1);
+
+    let spent = alice.pad_spent(&contact).await;
+    let peer_der = alice.peer_der.clone();
+    aloo::client::otp::handle_end_otp_command(
+        &mut NullSink,
+        &mut alice.ui,
+        &mut alice.session,
+        BOB,
+        peer_der,
+    )
+    .await
+    .expect("/endotp should not fail");
+    let notices = |side: &mut Side| {
+        side.queued()
+            .into_iter()
+            .filter(|p| {
+                matches!(p, P2pPayload::OtpEnvelope { envelope, .. }
+                    if envelope.content == Content::OtpEndSession)
+            })
+            .count()
+    };
+    assert!(
+        alice
+            .session
+            .otp_store_mut()
+            .get(&contact)
+            .is_some_and(|s| s.pending_end_notice),
+        "the end is recorded as owed"
+    );
+    assert_eq!(alice.pad_spent(&contact).await, spent, "but nothing is spent on it yet");
+    assert_eq!(notices(&mut alice), 0, "and no notice leaves ahead of the queue");
+    assert!(!alice.gate_held(&contact));
+    // Nor does the reconnect pass, which asks the same question.
+    aloo::client::otp::resend_pending_end_notices(&mut NullSink, &mut alice.session, &mut alice.ui)
+        .await
+        .expect("the notice pass should not fail");
+    assert_eq!(alice.pad_spent(&contact).await, spent);
+    assert_eq!(notices(&mut alice), 0);
+
+    // The queue drains: the entry is re-sent, bob answers from the ack he
+    // already recorded, and that acknowledgement retires it - the gate is
+    // free with nothing queued, and the notice takes it.
+    assert!(
+        alice
+            .session
+            .pump_otp_queue_for_test(&mut alice.ui, BOB, &contact)
+            .await
+    );
+    let (s, m, e, d) = alice
+        .queued()
+        .into_iter()
+        .filter_map(|p| match p {
+            P2pPayload::OtpEnvelope {
+                seq,
+                msg_id,
+                envelope,
+                sender_device_id,
+                ..
+            } => Some((seq, msg_id, envelope, sender_device_id)),
+            _ => None,
+        })
+        .next_back()
+        .unwrap();
+    assert_eq!(s, s2, "the queue re-sends the entry the gate was cleared for");
+    receive_text(&mut bob, s, m, e, d).await;
+    let (again, proof_again) = last_ack(&mut bob);
+    assert_eq!((again, proof_again), (s2, p2), "answered from the record, not the pad");
+    ack(&mut alice, BOB, again, proof_again).await;
+    assert_eq!(alice.session.otp_queued_for(&contact), 0, "the queue is drained");
+    assert_eq!(notices(&mut alice), 1, "and only now does the notice go out");
+    assert!(alice.gate_held(&contact), "as the gate's next occupant");
+    assert!(alice.pad_spent(&contact).await > spent);
+
+    // It lands in order and ends the session for both.
+    let (s, m, e, d) = alice
+        .queued()
+        .into_iter()
+        .filter_map(|p| match p {
+            P2pPayload::OtpEnvelope {
+                seq,
+                msg_id,
+                envelope,
+                sender_device_id,
+                ..
+            } => Some((seq, msg_id, envelope, sender_device_id)),
+            _ => None,
+        })
+        .next_back()
+        .unwrap();
+    receive_text(&mut bob, s, m, e, d).await;
+    assert!(!bob.ui.is_otp_active(ALICE), "bob's decoder took it as the next in turn");
+    let (ack_seq, proof) = last_ack(&mut bob);
+    ack(&mut alice, BOB, ack_seq, proof).await;
+    assert!(!alice.ui.is_otp_active(BOB) && !alice.gate_held(&contact));
+}
+
+/// A `/endotp` notice deferred with nothing in flight - the app restarted
+/// in the window, or the link died with the acknowledgement that freed the
+/// gate - is owed to a peer who is away. When they return under a fresh
+/// `UserId`, the link-up passes cannot address them: a `PqWrapped`
+/// contact is named by device id, and theirs lands only afterwards, in
+/// their `DeviceIdAnnounce`. That is the moment the owed notice must go
+/// out - before this, nothing re-drove it until the link next flapped,
+/// and meanwhile every send to that contact was refused as "ending" while
+/// the peer, never told, kept talking.
+///
+/// @requirement AC-446
+#[tokio::test]
+async fn an_owed_end_notice_goes_out_when_a_returning_peers_device_id_lands() {
+    if !require_otp() {
+        return;
+    }
+    let (mut alice, mut bob, contact) = pair("endotp-owed-device-id", Id::Pq, Id::Pq).await;
+    alice.ui.mark_otp_active(BOB);
+    bob.ui.mark_otp_active(ALICE);
+
+    // Bob goes away, and the end is owed with nothing in flight.
+    alice.ui.on_user_offline(BOB);
+    aloo::client::session::forget_peer_for_test(&mut alice.ui, &mut alice.session, BOB);
+    alice.session.otp_store_mut().mark_end_requested(&contact);
+    alice.session.otp_store_mut().save().unwrap();
+    let spent = alice.pad_spent(&contact).await;
+
+    // He returns as somebody new, and his link comes up.
+    let returned = UserId(4242);
+    let him = UserInfo {
+        id: returned,
+        name: "bob".into(),
+        public_key_der: alice.peer_der.clone(),
+        key_mode: KeyMode::PqHybrid,
+    };
+    alice.ui.known_users.insert(returned, him.clone());
+    alice.ui.adopt_returning_peer(BOB, &him);
+    aloo::client::session::seed_direct_peer_keys(&mut alice.session, returned, &him);
+    alice
+        .session
+        .peer_link_mut()
+        .open_unpunched_link_for_test(returned);
+    alice
+        .session
+        .inject_p2p_event(aloo::client::p2p::P2pEvent::LinkStatusChanged {
+            peer: returned,
+            status: aloo::client::p2p::LinkStatus::Active,
+        });
+    aloo::client::session::drain_p2p_events(&mut NullSink, &mut alice.ui, &mut alice.session)
+        .await
+        .expect("draining should not fail");
+    let notices_to = |side: &mut Side, peer: UserId| {
+        side.session
+            .sent_or_queued_payloads(peer)
+            .into_iter()
+            .filter(|p| {
+                matches!(p, P2pPayload::OtpEnvelope { envelope, .. }
+                    if envelope.content == Content::OtpEndSession)
+            })
+            .count()
+    };
+    assert_eq!(
+        notices_to(&mut alice, returned),
+        0,
+        "at link-up his contact cannot be named yet, so nothing can be addressed to him"
+    );
+    assert_eq!(alice.pad_spent(&contact).await, spent);
+
+    // His real, sealed announce lands - the first moment his pad contact
+    // can be named under the new id.
+    aloo::client::session::send_device_id_announce_for_test(&mut bob.session, &bob.ui, ALICE);
+    let announce = bob
+        .queued()
+        .into_iter()
+        .find_map(|p| match p {
+            P2pPayload::DeviceIdAnnounce { envelope } => Some(envelope),
+            _ => None,
+        })
+        .expect("a link coming up announces the device id");
+    alice
+        .session
+        .inject_p2p_event(aloo::client::p2p::P2pEvent::DeviceIdAnnounce {
+            from: returned,
+            envelope: announce,
+        });
+    aloo::client::session::drain_p2p_events(&mut NullSink, &mut alice.ui, &mut alice.session)
+        .await
+        .expect("draining should not fail");
+    assert_eq!(
+        notices_to(&mut alice, returned),
+        1,
+        "the owed notice goes out the moment he can be addressed"
+    );
+    assert!(alice.gate_held(&contact), "as an ordinary gated spend");
+    assert!(alice.pad_spent(&contact).await > spent);
+
+    // And it ends the session for both, exactly as if he had never left.
+    let (seq, msg_id, envelope, device) = alice
+        .session
+        .sent_or_queued_payloads(returned)
+        .into_iter()
+        .filter_map(|p| match p {
+            P2pPayload::OtpEnvelope {
+                seq,
+                msg_id,
+                envelope,
+                sender_device_id,
+                ..
+            } => Some((seq, msg_id, envelope, sender_device_id)),
+            _ => None,
+        })
+        .next_back()
+        .unwrap();
+    receive_text(&mut bob, seq, msg_id, envelope, device).await;
+    assert!(!bob.ui.is_otp_active(ALICE));
+    let (ack_seq, proof) = last_ack(&mut bob);
+    ack(&mut alice, returned, ack_seq, proof).await;
+    assert!(!alice.ui.is_otp_active(returned) && !alice.gate_held(&contact));
+    assert!(
+        !alice
+            .session
+            .otp_store_mut()
+            .get(&contact)
+            .is_some_and(|s| s.pending_end_notice)
+    );
+}
