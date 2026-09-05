@@ -29,6 +29,13 @@ use server_common::{TestServer, password_for, test_options};
 /// tests are about the wait, never about key strength (the same trade
 /// `reconnect_test.rs` makes).
 fn scenario_keybundle(nickname: &str) -> MyKeySelection {
+    // Every test in this process shares one bundle per nickname, and the
+    // tests run in parallel: without this lock two of them can both see
+    // no bundle, both generate one, and one of them then reads a file the
+    // other is still halfway through writing (seen on CI as a decode
+    // error resolving the bundle).
+    static KEYGEN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one_at_a_time = KEYGEN.lock().unwrap_or_else(|e| e.into_inner());
     let dir = std::env::temp_dir().join(format!(
         "aloo-daemon-wait-test-keys-{}-{nickname}",
         std::process::id()

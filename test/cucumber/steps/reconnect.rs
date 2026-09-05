@@ -174,6 +174,13 @@ async fn selectors_moved(w: &mut AlooWorld) {
 /// as the *same* person, which is exactly what re-resolving these two
 /// paths proves.
 fn scenario_keybundle(nickname: &str) -> aloo::client::connect::MyKeySelection {
+    // Every test in this process shares one bundle per nickname, and the
+    // tests run in parallel: without this lock two of them can both see
+    // no bundle, both generate one, and one of them then reads a file the
+    // other is still halfway through writing (seen on CI as a decode
+    // error resolving the bundle).
+    static KEYGEN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one_at_a_time = KEYGEN.lock().unwrap_or_else(|e| e.into_inner());
     let dir = std::env::temp_dir().join(format!(
         "aloo-cucumber-reconnect-keys-{}-{nickname}",
         std::process::id()

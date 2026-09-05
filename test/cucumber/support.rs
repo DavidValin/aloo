@@ -188,3 +188,25 @@ pub fn popup_body(buffer: &Buffer, title: &str) -> Vec<String> {
         })
         .collect()
 }
+
+/// A loopback TCP listener plus a UDP socket on the *same* port - the
+/// shape `serve_with_rendezvous` wants. The cucumber crate's copy of
+/// `test/server_common.rs`'s `bind_tcp_with_udp`, which explains the
+/// retry: an ephemeral TCP port is no promise the same UDP port is
+/// bindable - on Windows an excluded port range makes the UDP bind fail
+/// with `PermissionDenied` although the TCP bind just succeeded.
+pub async fn bind_tcp_with_udp() -> (tokio::net::TcpListener, tokio::net::UdpSocket) {
+    let mut last_error = None;
+    for _ in 0..16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        match tokio::net::UdpSocket::bind(addr).await {
+            Ok(udp) => return (listener, udp),
+            Err(e) => last_error = Some(e),
+        }
+    }
+    panic!(
+        "no loopback port would take both a TCP listener and a UDP socket: {}",
+        last_error.expect("at least one attempt")
+    );
+}

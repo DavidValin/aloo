@@ -74,6 +74,33 @@ pub fn ensure_user(options: &ServerOptions, nickname: &str) {
     }
 }
 
+/// A loopback TCP listener plus a UDP socket on the *same* port - the
+/// shape `serve_with_rendezvous` wants (the control connection and the
+/// rendezvous socket share one advertised port).
+///
+/// Retried rather than bound once: an ephemeral TCP port is no promise
+/// that the same UDP port is free, and on Windows it need not even be
+/// bindable - the OS keeps excluded port ranges (Hyper-V/WinNAT
+/// reservations) inside which a UDP bind fails with `WSAEACCES`
+/// (`PermissionDenied`) although the TCP bind just succeeded. Seen on CI
+/// as a one-in-many flake; another draw from the ephemeral range is the
+/// whole fix.
+pub async fn bind_tcp_with_udp() -> (TcpListener, tokio::net::UdpSocket) {
+    let mut last_error = None;
+    for _ in 0..16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        match tokio::net::UdpSocket::bind(addr).await {
+            Ok(udp) => return (listener, udp),
+            Err(e) => last_error = Some(e),
+        }
+    }
+    panic!(
+        "no loopback port would take both a TCP listener and a UDP socket: {}",
+        last_error.expect("at least one attempt")
+    );
+}
+
 /// A running server and the registry it reads, so a test can register
 /// people and then connect them.
 pub struct TestServer {
@@ -110,9 +137,8 @@ impl TestServer {
     /// `spawn`, with the UDP rendezvous socket bound alongside - what the
     /// direct-link tests need.
     pub async fn spawn_with_rendezvous(options: ServerOptions) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (listener, udp) = bind_tcp_with_udp().await;
         let addr = listener.local_addr().unwrap();
-        let udp = tokio::net::UdpSocket::bind(addr).await.unwrap();
         let served = options.clone();
         tokio::spawn(async move {
             let _ = serve_with_rendezvous(listener, udp, served).await;

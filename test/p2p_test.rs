@@ -23,7 +23,7 @@ use aloo::server::ServerOptions;
 use aloo::server::users_registry::UsersRegistry;
 use aloo::server::serve_with_rendezvous;
 use aloo::control::ControlEndpoint;
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::net::{TcpStream, UdpSocket};
 
 #[path = "server_common.rs"]
 mod server_common;
@@ -47,9 +47,8 @@ fn shared_users() -> UsersRegistry {
 }
 
 async fn spawn_test_server() -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (listener, udp) = server_common::bind_tcp_with_udp().await;
     let addr = listener.local_addr().unwrap();
-    let udp = UdpSocket::bind(addr).await.unwrap();
     let options = ServerOptions::new(shared_users());
     tokio::spawn(async move {
         let _ = serve_with_rendezvous(listener, udp, options).await;

@@ -343,6 +343,13 @@ impl Drop for StoppableServer {
 /// for the same trade). Written up front rather than left to
 /// `ensure_bundle_at` so nothing here pays full keygen.
 fn scenario_keybundle(nickname: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    // Every test in this process shares one bundle per nickname, and the
+    // tests run in parallel: without this lock two of them can both see
+    // no bundle, both generate one, and one of them then reads a file the
+    // other is still halfway through writing (seen on CI as a decode
+    // error resolving the bundle).
+    static KEYGEN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one_at_a_time = KEYGEN.lock().unwrap_or_else(|e| e.into_inner());
     let dir = std::env::temp_dir().join(format!(
         "aloo-reconnect-test-keys-{}-{nickname}",
         std::process::id()

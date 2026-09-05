@@ -10,7 +10,7 @@ use std::net::{IpAddr, Ipv4Addr};
 
 use aloo::control::ControlEndpoint;
 use cucumber::{given, then, when};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 
 use aloo::client::p2p::{P2pEvent, PeerLinkManager};
 use aloo::p2p_proto::P2pPayload;
@@ -60,9 +60,11 @@ pub(crate) async fn spawn_server_with_options(
     users: UsersRegistry,
     configure: impl FnOnce(ServerOptions) -> ServerOptions,
 ) -> std::net::SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    // The TCP listener and the UDP rendezvous socket share one port, and
+    // a port that took the first need not take the second - see
+    // `bind_tcp_with_udp` (`test/server_common.rs`) for the Windows case.
+    let (listener, udp) = crate::support::bind_tcp_with_udp().await;
     let addr = listener.local_addr().unwrap();
-    let udp = tokio::net::UdpSocket::bind(addr).await.unwrap();
     // Scratch-pathed like `scratch_users()` - a scenario that drives enough
     // failed logins/registrations to actually ban 127.0.0.1 must never
     // touch the real `~/.aloo/login_banned_ips.log`/
