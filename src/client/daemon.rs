@@ -11,9 +11,16 @@
 //!    out of the launching terminal's process group so closing that
 //!    terminal cannot take the session with it, and making sure there is
 //!    only ever one.
-//! 3. **Serving viewers** (`serve_attachments`) - turning a connected
+//! 3. **Waiting for the server** (`connect_until_reachable`) - a daemon
+//!    started before the network is up, or with the wifi off, keeps
+//!    dialling on the reconnect supervisor's own schedule rather than
+//!    exiting; only an answer from the server (a wrong password, a taken
+//!    nickname) is a startup failure.
+//! 4. **Serving viewers** (`serve_attachments`) - turning a connected
 //!    socket into the `SessionInput` stream the ordinary session loop
-//!    already consumes, and its frames back into bytes on that socket.
+//!    already consumes, and its frames back into bytes on that socket -
+//!    from before the first connection, so a daemon still waiting can be
+//!    asked about and stopped.
 //!
 //! What is deliberately *not* here: anything about how the session itself
 //! works. A daemon runs the same `session::run_connected_session` a
@@ -22,10 +29,13 @@
 
 use std::path::{Path, PathBuf};
 
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
 use crate::BoxError;
 use crate::client::daemon_ipc::{self, AttachMessage, DaemonMessage};
 use crate::client::session::SessionInput;
-use crate::client::tui::surface::{AttachWriter, TerminalSize};
+use crate::client::tui::surface::{AttachWriter, Surface, TerminalSize};
 
 /// Environment marker set on the re-executed child so it knows not to
 /// background itself a second time. An env var rather than a flag so the
@@ -286,6 +296,262 @@ pub fn is_daemon_child() -> bool {
 }
 
 // ---------------------------------------------------------------------
+// Waiting for the server
+// ---------------------------------------------------------------------
+
+/// What `--daemon-status` is answered with, shared between the attach
+/// listener that answers it and the code that knows what the daemon is
+/// doing.
+///
+/// Two states only: connected (the fixed "running" line) and *not yet*,
+/// with the detail `connect_until_reachable` sets on every failed attempt.
+/// A daemon that is waiting for a network that has not come up looks, from
+/// outside, exactly like one that is working - `aloo --daemon-status` is
+/// the one place that can say otherwise without attaching.
+#[derive(Clone, Default)]
+pub struct StatusLine(Arc<Mutex<Option<String>>>);
+
+impl StatusLine {
+    /// Connected - the fixed line every query got before the wait existed.
+    pub fn set_connected(&self) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// Not connected yet, and this is where things stand.
+    pub fn set_waiting(&self, detail: impl Into<String>) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(detail.into());
+    }
+
+    /// Whether the daemon is still waiting for its first connection.
+    pub fn is_waiting(&self) -> bool {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+    }
+
+    /// The one-line answer to `--daemon-status`.
+    pub fn render(&self) -> String {
+        let pid = std::process::id();
+        match self.0.lock().unwrap_or_else(|e| e.into_inner()).as_deref() {
+            None => format!("aloo daemon running (pid {pid})"),
+            Some(detail) => format!("aloo daemon running (pid {pid}), {detail}"),
+        }
+    }
+}
+
+/// Everything a daemon's first successful dial hands the session.
+pub struct FirstConnection {
+    pub events: tokio::sync::mpsc::UnboundedReceiver<crate::client::reconnect::ServerEvent>,
+    pub sink: crate::client::reconnect::ServerSink,
+    pub you: crate::proto::UserId,
+    pub server_addr: std::net::SocketAddr,
+}
+
+/// How `connect_until_reachable` paces itself and what it does at the
+/// point where a wait stops looking like a hiccup.
+#[derive(Debug, Clone, Copy)]
+pub struct WaitPlan {
+    /// `Backoff::default()` everywhere but in tests.
+    pub backoff: crate::client::reconnect::Backoff,
+    /// Raise one desktop notification once `SERVER_DOWN_AFTER_ATTEMPTS`
+    /// attempts have failed. Off in tests, which have no desktop to
+    /// bother and no way to see the toast anyway.
+    pub desktop_notification: bool,
+}
+
+impl Default for WaitPlan {
+    fn default() -> Self {
+        Self {
+            backoff: crate::client::reconnect::Backoff::default(),
+            desktop_notification: true,
+        }
+    }
+}
+
+/// Dials until the server lets it in, or answers no.
+///
+/// A daemon's commonest first failure is not a wrong host: it is being
+/// started at login before the network is, or on a laptop whose wifi is
+/// off. Ending the process there - the tone, the notification, the
+/// non-zero exit - turns "the network was not up yet" into "the daemon is
+/// gone", and the shortcut into nothing until someone notices. So a
+/// server that cannot be reached is waited for on the same schedule the
+/// in-session supervisor uses (`reconnect::Backoff`: at once, then 5s,
+/// 10s, 20s, then every 30s), for as long as it takes.
+///
+/// Only *unreachable* is waited for. An answer from the server - a wrong
+/// password, a taken nickname, a deactivated account, a transport-mode
+/// mismatch (`connect::is_server_refusal`) - is returned at once as the
+/// startup failure it always was: retrying it would get the same answer
+/// forever, indistinguishable from working. The keybundle is resolved by
+/// the caller *before* the wait for the same reason: an unreadable one is
+/// settled on the spot, not re-read on every attempt.
+///
+/// The daemon is fully reachable while it waits. `input_rx` is the attach
+/// listener's stream, served here exactly as the session would: a
+/// terminal that attaches sees where the wait is up to (`render_processing`
+/// with a countdown, the same screen a foreground connect shows), a
+/// `--daemon-stop` ends the wait cleanly (`Ok(None)`), and `status` keeps
+/// `--daemon-status` truthful throughout. After `SERVER_DOWN_AFTER_ATTEMPTS`
+/// failures one desktop notification says the daemon is up but the server
+/// is not - once per wait, since a wait of hours must not become a toast
+/// every 30 seconds.
+pub async fn connect_until_reachable(
+    request: &crate::client::connect::ConnectRequest,
+    identity: &crate::client::connect::ResolvedIdentity,
+    plan: WaitPlan,
+    input_rx: &mut tokio::sync::mpsc::UnboundedReceiver<SessionInput>,
+    status: &StatusLine,
+    surface: &mut Surface,
+) -> Result<Option<FirstConnection>, BoxError> {
+    use crate::client::reconnect::SERVER_DOWN_AFTER_ATTEMPTS;
+
+    let server = format!("{}:{}", request.host, request.port);
+    let mut failed_attempts: u32 = 0;
+    let mut screen = WaitScreen::default();
+    loop {
+        // The attempt and the wait after it are both served for input:
+        // an attempt can take `CONNECT_TIMEOUT` plus the SSL diagnosis
+        // (`connect_with_reconnect_as`), and a viewer attaching during
+        // either must not sit on a blank screen until it ends.
+        let attempt = crate::client::connect::connect_with_reconnect_as(request, identity);
+        tokio::pin!(attempt);
+        let label = format!("connecting to {server}...");
+        let outcome = loop {
+            screen.draw(surface, &label);
+            tokio::select! {
+                result = &mut attempt => break result,
+                _ = tokio::time::sleep(WaitScreen::TICK), if surface.is_visible() => {}
+                input = input_rx.recv() => {
+                    if screen.on_input(input, surface) == WaitInput::Stop {
+                        return Ok(None);
+                    }
+                }
+            }
+        };
+
+        let error = match outcome {
+            Ok((events, sink, you, server_addr)) => {
+                status.set_connected();
+                return Ok(Some(FirstConnection {
+                    events,
+                    sink,
+                    you,
+                    server_addr,
+                }));
+            }
+            Err(e) if crate::client::connect::is_server_refusal(&e) => return Err(e),
+            Err(e) => e,
+        };
+
+        failed_attempts = failed_attempts.saturating_add(1);
+        let delay = plan.backoff.delay_after(failed_attempts);
+        let until = Instant::now() + delay;
+        crate::log_warn!(
+            "cannot reach the server at {server} ({error}) - trying again in {}s (attempt {failed_attempts} failed)",
+            delay.as_secs()
+        );
+        status.set_waiting(format!(
+            "waiting for the server at {server}: {error} - trying again in {}s (attempt {failed_attempts} failed)",
+            delay.as_secs()
+        ));
+        if failed_attempts == SERVER_DOWN_AFTER_ATTEMPTS && plan.desktop_notification {
+            crate::client::global_notification::notify(
+                crate::client::global_notification::Notification::new(
+                    "aloo daemon: server unreachable",
+                    format!(
+                        "The daemon is running but cannot reach {server} ({error}). \
+                         It keeps trying - `aloo --daemon-status` says where it is up to."
+                    ),
+                ),
+            );
+        }
+
+        loop {
+            let seconds_left = crate::client::reconnect::seconds_left(Instant::now(), until);
+            let label = format!(
+                "cannot reach {server} - trying again in {seconds_left}s (attempt {failed_attempts} failed)"
+            );
+            screen.draw(surface, &label);
+            tokio::select! {
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(until)) => break,
+                _ = tokio::time::sleep(WaitScreen::TICK), if surface.is_visible() => {}
+                input = input_rx.recv() => {
+                    if screen.on_input(input, surface) == WaitInput::Stop {
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// What a `SessionInput` arriving during the wait means for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaitInput {
+    Continue,
+    /// `--daemon-stop`: end the wait, and the daemon with it.
+    Stop,
+}
+
+/// The screen an attached terminal sees while the daemon waits: the
+/// foreground connect's own processing screen (`render_processing`), with
+/// the wait's label in place of "connecting...".
+#[derive(Default)]
+struct WaitScreen {
+    animation_frame: u64,
+}
+
+impl WaitScreen {
+    /// How often the screen is redrawn while a terminal is attached -
+    /// the processing screen's own animation tick, so the two look the
+    /// same. Nothing is drawn, and nothing ticks, with nobody attached.
+    const TICK: std::time::Duration = crate::client::tui::ui_connect_popup::ANIMATION_TICK;
+
+    fn draw(&mut self, surface: &mut Surface, label: &str) {
+        if !surface.is_visible() {
+            return;
+        }
+        let frame = self.animation_frame;
+        if surface
+            .draw(|f| crate::client::tui::ui_connect_popup::render_processing(f, frame, label))
+            .is_err()
+        {
+            // The viewer's socket is gone; its `Detach` follows on
+            // `input_rx` anyway, but there is no point drawing to it
+            // until then.
+            surface.detach();
+        }
+        self.animation_frame = self.animation_frame.wrapping_add(1);
+    }
+
+    /// Serves one input the way the session loop would, minus everything
+    /// that needs a session: keys have nothing to act on yet (Ctrl+C is
+    /// answered by the attaching client itself, never forwarded).
+    fn on_input(&mut self, input: Option<SessionInput>, surface: &mut Surface) -> WaitInput {
+        match input {
+            Some(SessionInput::Attached { writer, size }) => {
+                if surface.attach(writer, size).is_err() {
+                    surface.detach();
+                }
+            }
+            Some(SessionInput::Resized(size)) => {
+                if surface.resize(size).is_err() {
+                    surface.detach();
+                }
+            }
+            Some(SessionInput::Detach) => surface.detach(),
+            Some(SessionInput::Key(_)) => {}
+            Some(SessionInput::Shutdown) => return WaitInput::Stop,
+            // The listener task is gone: nobody can attach or stop this
+            // daemon over the socket any more, but the wait itself is
+            // unaffected - and `run` never lets the task die (its accept
+            // loop swallows every error), so this is theoretical.
+            None => {}
+        }
+        WaitInput::Continue
+    }
+}
+
+// ---------------------------------------------------------------------
 // Serving viewers
 // ---------------------------------------------------------------------
 
@@ -302,8 +568,19 @@ pub fn is_daemon_child() -> bool {
 /// than any single failed connection - so a bad connection is dropped and
 /// the loop continues.
 pub async fn serve_attachments(
+    listener: daemon_ipc::Listener,
+    input_tx: tokio::sync::mpsc::UnboundedSender<SessionInput>,
+) {
+    serve_attachments_reporting(listener, input_tx, StatusLine::default()).await
+}
+
+/// `serve_attachments`, answering `--daemon-status` from `status` rather
+/// than with the fixed "running" line - what `run` uses, so a daemon still
+/// waiting for its server says so (`connect_until_reachable`).
+pub async fn serve_attachments_reporting(
     mut listener: daemon_ipc::Listener,
     input_tx: tokio::sync::mpsc::UnboundedSender<SessionInput>,
+    status: StatusLine,
 ) {
     loop {
         let Ok(stream) = listener.accept().await else {
@@ -314,7 +591,7 @@ pub async fn serve_attachments(
         // waits in the accept backlog until the first finishes, which is
         // indistinguishable from being served and told `Busy` a moment
         // later, and needs no shared "is someone attached" state.
-        if serve_one(stream, &input_tx).await.is_err() {
+        if serve_one(stream, &input_tx, &status).await.is_err() {
             // The viewer went away mid-conversation. Nothing to clean up
             // beyond what dropping the stream already did - the session
             // notices through its own `Detach`.
@@ -329,6 +606,7 @@ pub async fn serve_attachments(
 async fn serve_one(
     stream: daemon_ipc::Stream,
     input_tx: &tokio::sync::mpsc::UnboundedSender<SessionInput>,
+    status: &StatusLine,
 ) -> Result<(), BoxError> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -455,10 +733,7 @@ async fn serve_one(
                     return Ok(());
                 }
                 AttachMessage::Status => {
-                    let _ = reply_tx.send(DaemonMessage::Status(format!(
-                        "aloo daemon running (pid {})",
-                        std::process::id()
-                    )));
+                    let _ = reply_tx.send(DaemonMessage::Status(status.render()));
                 }
                 AttachMessage::Shutdown => {
                     let _ = reply_tx.send(DaemonMessage::Detached {
@@ -1145,7 +1420,8 @@ impl DaemonPlan {
 // Running
 // ---------------------------------------------------------------------
 
-/// Connects and runs the session, detached, until it ends.
+/// Connects - waiting for the server if it has to - and runs the session,
+/// detached, until it ends.
 ///
 /// The whole of daemon mode's difference from an ordinary client lives in
 /// the three arguments this passes on: a `Detached` surface instead of a
@@ -1186,38 +1462,63 @@ pub async fn run(
         .and_then(|s| s.connect_ssl_ca)
         .as_deref()
         .map(crate::platform::expand_tilde);
+
+    // Served from here on rather than only once connected: the wait for a
+    // server below can last as long as the network is down, and a
+    // `--daemon-status`, a `--daemon-stop` or a bare `aloo` in that time
+    // must be answered, not left hanging on a socket nobody accepts.
+    let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel();
+    let status = StatusLine::default();
+    tokio::spawn(serve_attachments_reporting(listener, input_tx, status.clone()));
+    let mut surface = Surface::Detached;
+
+    // The identity resolution is the very same one a connecting client
+    // does, done once and up front: an unreadable keybundle is a startup
+    // failure whether or not there is a network, and a wait for one must
+    // not re-read the files on every attempt.
+    let identity = crate::client::connect::resolve_identity(&request.my_key).await?;
+
     // With `--no-server` there is nobody to hand us a `UserId`, no control
     // channel to open and no rendezvous to ask - only local key material
-    // and the peers `direct_punch_to` names (docs/PROTOCOL.md §7.1.5). The
-    // identity resolution is the very same one a connecting client does;
-    // all that is skipped is the part that needed somewhere to connect to.
+    // and the peers `direct_punch_to` names (docs/PROTOCOL.md §7.1.5). All
+    // that is skipped is the part that needed somewhere to connect to.
     let serverless = config.no_server;
-    let (server_events, wr, you, identity, server_addr) = if serverless {
-        let identity = crate::client::connect::resolve_my_keypair(&request.my_key)?;
+    let (server_events, wr, you, server_addr) = if serverless {
         (
             None,
             ServerlessSink::Null(crate::control::NullSink),
             crate::client::p2p::direct_peer_id(&request.nickname, None),
-            identity,
             None,
         )
     } else {
         // A daemon is the start that most needs reconnecting: nobody is
         // watching it, and the session it would otherwise sit out is one
-        // whose peers can still hear it (`docs/PROTOCOL.md` §4.2).
-        let (events, sink, you, identity, server_addr) =
-            crate::client::connect::connect_with_reconnect(&request).await?;
+        // whose peers can still hear it (`docs/PROTOCOL.md` §4.2). That
+        // starts with the first connection: a server that is not
+        // reachable yet is waited for, not given up on.
+        let Some(first) = connect_until_reachable(
+            &request,
+            &identity,
+            WaitPlan::default(),
+            &mut input_rx,
+            &status,
+            &mut surface,
+        )
+        .await?
+        else {
+            // `--daemon-stop` while still waiting: as clean an end as one
+            // after a session.
+            crate::log_warn!("daemon stopped while waiting for the server");
+            drop(instance);
+            return Ok(());
+        };
         (
-            Some(events),
-            ServerlessSink::Server(sink),
-            you,
-            identity,
-            Some(server_addr),
+            Some(first.events),
+            ServerlessSink::Server(first.sink),
+            first.you,
+            Some(first.server_addr),
         )
     };
-
-    let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel();
-    tokio::spawn(serve_attachments(listener, input_tx));
 
     if serverless {
         crate::log_warn!(
@@ -1257,7 +1558,6 @@ pub async fn run(
         );
     }
 
-    let mut surface = crate::client::tui::surface::Surface::Detached;
     let plan = DaemonPlan::new(config.channels.clone(), config.initial_focus.clone());
     let server_label = if serverless {
         crate::client::export::DIRECT_LABEL.to_string()

@@ -47,6 +47,9 @@ PartOf=graphical-session.target
 # start as having failed.
 Type=simple
 ExecStart=/usr/local/bin/aloo --daemon --foreground --host=aloserver.com --channels=the-hall,team --initial-focus=the-hall --nick bob --nick-pwd=bobpass
+# A server that is not reachable yet (the network coming up after this
+# unit does) is not a failure: the daemon waits for it itself, so this
+# only ever restarts a daemon that genuinely died or refused to start.
 Restart=on-failure
 RestartSec=5
 

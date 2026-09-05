@@ -193,13 +193,13 @@ fn scenario_keybundle(nickname: &str) -> aloo::client::connect::MyKeySelection {
     }
 }
 
-fn password_for(nickname: &str) -> String {
+pub(crate) fn password_for(nickname: &str) -> String {
     format!("pw-{nickname}")
 }
 
 /// Registers `nickname` in `w`'s server registry (creating a scratch one
 /// if this is the scenario's first) if it is not there yet.
-fn ensure_registered(w: &mut AlooWorld, nickname: &str) {
+pub(crate) fn ensure_registered(w: &mut AlooWorld, nickname: &str) {
     let users = w.server_users.get_or_insert_with(|| {
         let dir = std::env::temp_dir().join(format!(
             "aloo-cucumber-reconnect-users-{}-{}",
@@ -216,7 +216,7 @@ fn ensure_registered(w: &mut AlooWorld, nickname: &str) {
     }
 }
 
-fn request_for(
+pub(crate) fn request_for(
     addr: std::net::SocketAddr,
     nickname: &str,
 ) -> aloo::client::connect::ConnectRequest {

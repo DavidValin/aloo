@@ -93,6 +93,20 @@ impl TestServer {
         Self { addr, options }
     }
 
+    /// `spawn` on a port the test chose - how "the server came up where
+    /// the daemon was already looking" is staged (`daemon_wait_test.rs`):
+    /// the port is picked and released first, dialled while closed, then
+    /// served here.
+    pub async fn spawn_at(port: u16, options: ServerOptions) -> Self {
+        let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let served = options.clone();
+        tokio::spawn(async move {
+            let _ = serve(listener, served).await;
+        });
+        Self { addr, options }
+    }
+
     /// `spawn`, with the UDP rendezvous socket bound alongside - what the
     /// direct-link tests need.
     pub async fn spawn_with_rendezvous(options: ServerOptions) -> Self {

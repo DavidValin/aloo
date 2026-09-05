@@ -566,6 +566,233 @@ async fn answer_says_running(w: &mut AlooWorld) {
 }
 
 // ---------------------------------------------------------------------
+// Waiting for the server
+//
+// A real `connect_until_reachable` against a loopback port with nothing
+// on it, then a real server brought up on that same port - the same
+// plumbing `daemon::run` uses, minus the socket listener (its
+// `SessionInput`s are fed directly, exactly as `serve_attachments` would).
+// The backoff runs in milliseconds rather than seconds so a whole wait
+// fits in a scenario. See `test/daemon_wait_test.rs` for the same thing
+// at the unit level.
+// ---------------------------------------------------------------------
+
+use aloo::client::daemon::{StatusLine, WaitPlan, connect_until_reachable};
+use aloo::client::tui::surface::{AttachWriter, Surface, TerminalSize};
+
+use crate::steps::reconnect::{ensure_registered, password_for, request_for};
+
+fn fast_wait() -> WaitPlan {
+    WaitPlan {
+        backoff: aloo::client::reconnect::Backoff {
+            first: std::time::Duration::from_millis(20),
+            max: std::time::Duration::from_millis(60),
+        },
+        desktop_notification: false,
+    }
+}
+
+/// Starts the wait against `addr` as `nickname`, with `password`, and
+/// parks everything a later step needs on the world.
+async fn start_wait(w: &mut AlooWorld, addr: std::net::SocketAddr, nickname: &str, password: &str) {
+    let mut request = request_for(addr, nickname);
+    request.password = password.to_string();
+    let identity = aloo::client::connect::resolve_identity(&request.my_key)
+        .await
+        .expect("the scenario keybundle resolves");
+    let status = StatusLine::default();
+    let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel();
+    let task_status = status.clone();
+    let task = tokio::spawn(async move {
+        let mut surface = Surface::Detached;
+        connect_until_reachable(
+            &request,
+            &identity,
+            fast_wait(),
+            &mut input_rx,
+            &task_status,
+            &mut surface,
+        )
+        .await
+    });
+    w.daemon_wait = Some(task);
+    w.daemon_wait_port = Some(addr.port());
+    w.daemon_wait_input = Some(input_tx);
+    w.daemon_wait_status = Some(status);
+    w.daemon_wait_outcome = None;
+}
+
+/// Waits for the wait to end and records how, for the `Then` steps.
+async fn finish_wait(w: &mut AlooWorld) {
+    let task = w.daemon_wait.take().expect("no daemon is waiting in this scenario");
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), task)
+        .await
+        .expect("the wait should have ended by now")
+        .expect("the wait task must not panic");
+    w.daemon_wait_outcome = Some(match outcome {
+        Ok(first) => Ok(first.is_some()),
+        Err(e) => Err(e.to_string()),
+    });
+}
+
+#[given("nothing is listening where the daemon expects its server")]
+async fn nothing_listening(w: &mut AlooWorld) {
+    // Bound to learn a free port, then released: the daemon dials a port
+    // with nothing on it, which is what a network that is down looks
+    // like from a connect call.
+    let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    w.addr = Some(probe.local_addr().unwrap());
+}
+
+#[given(expr = "a server that knows {word}")]
+async fn server_that_knows(w: &mut AlooWorld, nickname: String) {
+    ensure_registered(w, &nickname);
+    let users = w.server_users.clone().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    w.addr = Some(listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let _ = aloo::server::serve(listener, aloo::server::ServerOptions::new(users)).await;
+    });
+}
+
+#[when("the daemon starts against it")]
+async fn daemon_starts_against_it(w: &mut AlooWorld) {
+    let addr = w.addr.expect("no server address in this scenario");
+    ensure_registered(w, "alice");
+    start_wait(w, addr, "alice", &password_for("alice")).await;
+}
+
+#[when("the daemon starts against it with the wrong password")]
+async fn daemon_starts_with_wrong_password(w: &mut AlooWorld) {
+    let addr = w.addr.expect("no server address in this scenario");
+    start_wait(w, addr, "alice", "not-alices-password").await;
+    finish_wait(w).await;
+    w.daemon_error = match &w.daemon_wait_outcome {
+        Some(Err(e)) => Some(e.clone()),
+        _ => None,
+    };
+}
+
+#[then(expr = "it is still trying a moment later, with its status saying {string}")]
+async fn still_trying(w: &mut AlooWorld, expected: String) {
+    let status = w.daemon_wait_status.clone().expect("no daemon is waiting");
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !status.is_waiting() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("an attempt should have failed by now");
+    let line = status.render();
+    assert!(line.contains(&expected), "status {line:?} should say {expected:?}");
+    assert!(
+        !w.daemon_wait.as_ref().unwrap().is_finished(),
+        "an unreachable server must be waited for, not returned as a failure"
+    );
+}
+
+#[when("the server comes up there")]
+async fn server_comes_up(w: &mut AlooWorld) {
+    let port = w.daemon_wait_port.expect("no daemon is waiting");
+    let users = w.server_users.clone().expect("nobody was registered");
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await.unwrap();
+    tokio::spawn(async move {
+        let _ = aloo::server::serve(listener, aloo::server::ServerOptions::new(users)).await;
+    });
+}
+
+#[then("the daemon connects to it")]
+async fn daemon_connects(w: &mut AlooWorld) {
+    finish_wait(w).await;
+    assert_eq!(
+        w.daemon_wait_outcome,
+        Some(Ok(true)),
+        "the wait should have ended in a connection"
+    );
+}
+
+#[then("its status goes back to saying it is running")]
+async fn status_back_to_running(w: &mut AlooWorld) {
+    let status = w.daemon_wait_status.as_ref().expect("no daemon was waiting");
+    assert!(!status.is_waiting(), "{}", status.render());
+    assert_eq!(
+        status.render(),
+        format!("aloo daemon running (pid {})", std::process::id())
+    );
+}
+
+#[when("it is asked to stop while still waiting")]
+async fn asked_to_stop_while_waiting(w: &mut AlooWorld) {
+    let status = w.daemon_wait_status.clone().expect("no daemon is waiting");
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !status.is_waiting() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("an attempt should have failed by now");
+    w.daemon_wait_input
+        .as_ref()
+        .unwrap()
+        .send(SessionInput::Shutdown)
+        .unwrap();
+}
+
+#[then("it exits cleanly, never having connected")]
+async fn exits_cleanly(w: &mut AlooWorld) {
+    finish_wait(w).await;
+    assert_eq!(w.daemon_wait_outcome, Some(Ok(false)));
+}
+
+#[when("a terminal attaches while it is still waiting")]
+async fn terminal_attaches_while_waiting(w: &mut AlooWorld) {
+    let status = w.daemon_wait_status.clone().expect("no daemon is waiting");
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !status.is_waiting() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("an attempt should have failed by now");
+    let (frame_tx, frame_rx) = tokio::sync::mpsc::unbounded_channel();
+    w.daemon_wait_input
+        .as_ref()
+        .unwrap()
+        .send(SessionInput::Attached {
+            writer: AttachWriter::new(frame_tx),
+            size: TerminalSize::new(120, 40),
+        })
+        .unwrap();
+    w.daemon_wait_frames = Some(frame_rx);
+}
+
+#[then(expr = "that terminal is shown {string} and {string}")]
+async fn terminal_is_shown(w: &mut AlooWorld, first: String, second: String) {
+    let frames = w.daemon_wait_frames.as_mut().expect("no terminal attached");
+    let mut seen = String::new();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let bytes = frames.recv().await.expect("the viewer should be drawn to");
+            seen.push_str(&crate::steps::identity_live::strip_ansi(&String::from_utf8_lossy(&bytes)));
+            if seen.contains(&first) && seen.contains(&second) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("the terminal never saw {first:?} and {second:?}; it saw {seen:?}"));
+    // Leave nothing running past the scenario.
+    let _ = w.daemon_wait_input.as_ref().unwrap().send(SessionInput::Shutdown);
+    finish_wait(w).await;
+}
+
+#[then("it never waited")]
+async fn never_waited(w: &mut AlooWorld) {
+    let status = w.daemon_wait_status.as_ref().expect("no daemon was started");
+    assert!(!status.is_waiting(), "a refusal is a failure, never a wait: {}", status.render());
+}
+
+// ---------------------------------------------------------------------
 // The join sound
 //
 // Driven through the same pure decision the session uses

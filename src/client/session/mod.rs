@@ -860,9 +860,12 @@ pub async fn run_connected_session<W: crate::control::ControlSink>(
         peer_device_ids: HashMap::new(),
         active_call: None,
         daemon_plan,
-        // A foreground session is always watched; a daemon starts with
-        // nobody attached and learns otherwise from its IPC listener.
-        viewer_attached: !is_daemon,
+        // A foreground session is always watched. A daemon usually starts
+        // with nobody attached and learns otherwise from its IPC listener -
+        // but a viewer that attached while the daemon was still waiting
+        // for its server (`daemon::connect_until_reachable`) is already on
+        // the surface, and is watching from the first frame.
+        viewer_attached: surface.is_visible(),
         announced_online: std::collections::HashSet::new(),
         daemon_awaiting_otp: None,
         noip_config,

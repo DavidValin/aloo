@@ -602,9 +602,9 @@ threads, and forking a threaded process gives you a child holding locks no
 thread will ever release.
 
 Its stdout and stderr go to `~/.aloo/daemon.log` — a daemon has nowhere
-else to report, and the things worth reporting (server unreachable,
-nickname taken, no keybundle) all happen before anyone could attach to
-watch.
+else to report, and the things worth reporting (each attempt at a server
+that is not reachable yet, a nickname taken, no keybundle) all happen
+before anyone could attach to watch.
 
 #### Foreground
 
@@ -622,6 +622,12 @@ what a service manager wants, since it does its own supervising — see
 aloo --daemon-status      # aloo: aloo daemon running (pid 20481)
 aloo --daemon-stop        # ends the session and exits
 ```
+
+A daemon that is still waiting for its server (see "Waiting for the
+server" below) says so in the same line — `aloo daemon running (pid 20481),
+waiting for the server at chat.example.com:7878: connection refused -
+trying again in 20s (attempt 3 failed)` — and `--daemon-stop` ends that
+wait as cleanly as it ends a session.
 
 Only one daemon runs at a time. A second `aloo --daemon` refuses and tells
 you the pid of the one already there. "Already there" is decided by
@@ -854,6 +860,41 @@ skipped rather than failing once per event.
 
 Sounds can be turned off in `~/.aloo/settings`; see below.
 
+### Waiting for the server
+
+A daemon's commonest first failure is not a wrong host. It is being started
+at login before the network is, or on a laptop whose wifi is off — and a
+daemon that exited there would turn "the network was not up yet" into "the
+daemon is gone" until you noticed the shortcut doing nothing. So a server
+that cannot be reached — nothing listening, the host not resolving, the
+network unreachable, the attempt timing out — is **waited for, not given up
+on**: the daemon keeps dialling on the same schedule a live session already
+reconnects on (at once, then 5s, 10s, 20s, then every 30s), for as long as
+it takes, and the moment the server is reachable it is connected, with
+nothing restarted.
+
+It stays reachable while it waits:
+
+- `aloo --daemon-status` says it is running *and* waiting, with the last
+  attempt's reason and the seconds to the next one;
+- a bare `aloo` attaches and is shown the connect screen's own animation
+  with that countdown, rather than a blank terminal; `/daemon` or `Ctrl+C`
+  hands it back without disturbing the wait;
+- `aloo --daemon-stop` ends the wait cleanly — a normal exit, not a failure.
+
+Every failed attempt is written to `~/.aloo/daemon.log`. After three, one
+desktop notification says the daemon is up but the server is not — once
+per wait, never a toast every 30 seconds.
+
+Only *unreachable* is waited for. An answer from the server is not an
+outage: a wrong password, a taken nickname, a deactivated account, a
+transport-mode mismatch (`connect_using_ssl` the wrong way round) all come
+back at once as the startup failures below — retrying them would get the
+same answer forever, and a daemon doing so would be indistinguishable from
+one that is working. The keybundle is read once, before the first attempt,
+for the same reason: one that cannot be read is settled on the spot, not
+re-read every 30 seconds.
+
 ### When it fails to start
 
 A daemon that quietly failed at login is indistinguishable from one that
@@ -861,7 +902,6 @@ worked — until you hold the shortcut and nothing happens. So a failed start
 plays a tone, raises a notification, writes the reason to
 `~/.aloo/daemon.log`, and exits non-zero. It is fatal when:
 
-- the server is unreachable, or the host does not resolve;
 - authentication is rejected (wrong `--nick-pwd`, or none given);
 - the nickname is already taken;
 - the keybundle cannot be read;
@@ -875,6 +915,9 @@ Some things are warnings instead — the session is still worth having:
   hold `Space`);
 - the focused person is not online yet — that is the normal case;
 - notifications are unavailable.
+
+And an unreachable server is neither: it is waited for (see "Waiting for
+the server" above).
 
 > **Linux: the global shortcut needs X11.** aloo's hotkey backend has no
 > Wayland support, and no application-level workaround exists — a Wayland
@@ -1301,7 +1344,7 @@ here that implements it. If a name changes on one side, it changes on both.
 | Encoding rules (§2) | `proto.rs` `encode`, `decode`, `bincode_config` (capped at `MAX_FRAME_LEN` — see TB-172) |
 | `ClientMessage`, `ServerMessage`, `Envelope`, `UserInfo`, `KeyMode` | `proto.rs` |
 | Control channel (§1.3) | `control.rs` `ControlOffer`, `ControlAccept`, `accept_offer`, `open_accept`, `derive`, `ControlWriter`/`ControlReader`/`ControlEndpoint`, `ControlSink` |
-| Connection lifecycle (§4), auth (§5), TLS (§1.4) | `server/mod.rs` `handle_connection`, `ServerOptions`; `server/users_registry.rs` `UsersRegistry`; `server/ssl.rs`; `client/connect.rs` `connect_and_handshake`, `open_control_channel` |
+| Connection lifecycle (§4), auth (§5), TLS (§1.4) | `server/mod.rs` `handle_connection`, `ServerOptions`; `server/users_registry.rs` `UsersRegistry`; `server/ssl.rs`; `client/connect.rs` `handshake_as`, `open_control_channel` |
 | Liveness, `Heartbeat` (§4.1) | `proto.rs` `HEARTBEAT_INTERVAL`, `HEARTBEAT_TIMEOUT`, `ClientMessage::Heartbeat`; `server/mod.rs` `client_loop`; `client/session.rs` `run_connected_session` |
 | Reconnecting (§4.2) | `client/reconnect.rs` `ServerSink`, `ServerEvent`, `ServerLinkState`, `ReconnectPlan`, `spawn_supervisor`, `delay_after`, `RECONNECT_FIRST_DELAY`, `RECONNECT_MAX_DELAY`, `SERVER_DOWN_AFTER_ATTEMPTS`; `client/connect.rs` `connect_with_reconnect`, `handshake_as`; `client/session.rs` `handle_server_event`, `on_server_reconnected`, `forget_peer` |
 | Registration, nicknames (§5.4) | `server/mod.rs` `Registry::try_register` |

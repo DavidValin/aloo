@@ -109,7 +109,7 @@ pub struct ActivationRequiredError(pub String);
 /// chance to poll its other branch, this loop's redraw+sleep, when the
 /// executor regains control, which a long synchronous call never yields).
 /// Every call site's own `fut` must already break up any such work with
-/// `tokio::task::spawn_blocking` (see `connect_and_handshake`'s own
+/// `tokio::task::spawn_blocking` (see `resolve_identity`'s own
 /// keypair resolution) for the animation to actually keep moving through
 /// it, not just through real I/O waits.
 pub async fn run_with_processing_screen<T>(
@@ -419,7 +419,7 @@ async fn diagnose_ssl_mismatch(request: &ConnectRequest) -> Option<String> {
 }
 
 /// How long one connect attempt - the very first one
-/// (`connect_with_reconnect`'s own `connect_and_handshake`) or a later
+/// (`connect_with_reconnect`'s own `handshake_as`) or a later
 /// automatic reconnect (`reconnect::reconnect_loop`, via
 /// `handshake_as_bounded_and_diagnosed` below) alike - is given before
 /// it's treated as failed. Generous next to `SSL_DIAGNOSIS_TIMEOUT`
@@ -496,10 +496,14 @@ pub(crate) async fn handshake_as_bounded_and_diagnosed(
 /// The session never sees the socket itself: it gets the supervisor's
 /// event stream in place of the read half, and a sink whose write half the
 /// supervisor replaces on every reconnect (`docs/PROTOCOL.md` §4.2). The
-/// first connection is still made here, and still fails here - a server
-/// that cannot be reached *at all* is a wrong host or a wrong password far
-/// more often than a server that is briefly down, and saying so beats
-/// retrying forever against a typo.
+/// first connection is still made here, and still fails here - for a
+/// foreground client, a server that cannot be reached *at all* is a wrong
+/// host or a wrong password far more often than a server that is briefly
+/// down, and saying so on the connect form beats retrying forever against
+/// a typo. A daemon has nobody at a form, and a network that is not up
+/// yet at login is its commonest first failure, so it wraps
+/// `connect_with_reconnect_as` in a retry of its own
+/// (`daemon::connect_until_reachable`).
 pub async fn connect_with_reconnect(
     request: &ConnectRequest,
 ) -> Result<
@@ -512,23 +516,44 @@ pub async fn connect_with_reconnect(
     ),
     BoxError,
 > {
-    // Bounded rather than left to hang: a client that skips TLS against a
-    // `connect_using_ssl`-required server (or the other way around) is not
-    // a slow connection, it is a mutual stall neither rustls nor this
-    // app's own framing ever resolves on its own - the server sits inside
-    // its TLS accept waiting for a ClientHello that is never coming, the
-    // client sits waiting for a `Hello` that is never coming either,
-    // forever, with nothing to time either side out. `CONNECT_TIMEOUT` is
-    // generous enough for a real, working, merely slow connection; a
-    // timeout is itself already a strong signal worth feeding into the
-    // same diagnosis, not just a bare "connect timed out".
-    let attempt = tokio::time::timeout(CONNECT_TIMEOUT, connect_and_handshake(request)).await;
-    let (rd, wr, you, identity, server_addr) = match attempt {
-        Ok(Ok(ok)) => ok,
-        Ok(Err(e)) => return Err(with_ssl_diagnosis(request, e).await),
-        Err(_elapsed) => return Err(timed_out(request).await),
-    };
+    let identity = resolve_identity(&request.my_key).await?;
+    let (events_rx, sink, you, server_addr) = connect_with_reconnect_as(request, &identity).await?;
+    Ok((events_rx, sink, you, identity, server_addr))
+}
+
+/// `connect_with_reconnect` for an identity already resolved - what a
+/// daemon dials with, once per attempt, while it waits for a server that
+/// is not there yet (`daemon::connect_until_reachable`). The keybundle is
+/// read once by the caller, not once per attempt: a network that is down
+/// for an hour must not re-read (or, on a first run, re-generate) the
+/// files behind every retry.
+///
+/// Bounded rather than left to hang: a client that skips TLS against a
+/// `connect_using_ssl`-required server (or the other way around) is not a
+/// slow connection, it is a mutual stall neither rustls nor this app's own
+/// framing ever resolves on its own - the server sits inside its TLS
+/// accept waiting for a ClientHello that is never coming, the client sits
+/// waiting for a `Hello` that is never coming either, forever, with
+/// nothing to time either side out. `CONNECT_TIMEOUT` is generous enough
+/// for a real, working, merely slow connection; a timeout is itself
+/// already a strong signal worth feeding into the same diagnosis
+/// (`handshake_as_bounded_and_diagnosed`), not just a bare "connect timed
+/// out".
+pub async fn connect_with_reconnect_as(
+    request: &ConnectRequest,
+    identity: &ResolvedIdentity,
+) -> Result<
+    (
+        tokio::sync::mpsc::UnboundedReceiver<reconnect::ServerEvent>,
+        reconnect::ServerSink,
+        proto::UserId,
+        std::net::SocketAddr,
+    ),
+    BoxError,
+> {
     let public_key_der = identity.public_der.clone();
+    let (rd, wr, you, server_addr) =
+        handshake_as_bounded_and_diagnosed(request, public_key_der.clone()).await?;
     let (sink, lost_rx) = reconnect::ServerSink::new(wr);
     let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
     reconnect::spawn_supervisor(
@@ -542,7 +567,28 @@ pub async fn connect_with_reconnect(
         lost_rx,
         events_tx,
     );
-    Ok((events_rx, sink, you, identity, server_addr))
+    Ok((events_rx, sink, you, server_addr))
+}
+
+/// Whether a failed connect is the server's *answer* rather than its
+/// absence.
+///
+/// A wrong password, a taken nickname, a deactivated account, an
+/// activation still pending, or a transport mode that does not match the
+/// server's (`SslMismatchError`) all mean the server was reached and said
+/// no - trying again with the same request gets the same no. Everything
+/// else (the host does not resolve, the network is down, nothing is
+/// listening, the attempt timed out) says nothing about the request and
+/// only ever gets settled by trying again. `daemon::connect_until_reachable`
+/// is the caller: it retries the second kind for as long as it takes and
+/// stops on the first kind at once, since a daemon retrying a wrong
+/// password forever would look exactly like one that is working.
+pub fn is_server_refusal(error: &BoxError) -> bool {
+    error.downcast_ref::<NicknameTakenError>().is_some()
+        || error.downcast_ref::<AuthRefusedError>().is_some()
+        || error.downcast_ref::<AccountDeactivatedError>().is_some()
+        || error.downcast_ref::<ActivationRequiredError>().is_some()
+        || error.downcast_ref::<SslMismatchError>().is_some()
 }
 
 /// The server refused the nickname/password pair (§5.1) - shown on the
@@ -562,52 +608,38 @@ pub struct AuthRefusedError(pub String);
 #[error("{0}")]
 pub struct AccountDeactivatedError(pub String);
 
-/// Connects, then runs the auth + identify handshake. On success returns
-/// the split stream halves, the `UserId` the server assigned us, and our
-/// own keybundle (needed to decrypt incoming messages). A taken nickname
-/// comes back as `NicknameTakenError` so the caller can retry instead of
-/// treating it as fatal.
-pub(crate) async fn connect_and_handshake(
-    request: &ConnectRequest,
-) -> Result<
-    (
-        crate::control::ControlReader<tokio::io::ReadHalf<BoxedStream>>,
-        crate::control::ControlWriter<tokio::io::WriteHalf<BoxedStream>>,
-        proto::UserId,
-        ResolvedIdentity,
-        std::net::SocketAddr,
-    ),
-    BoxError,
-> {
-    // `resolve_my_keypair` is not `.await`-friendly on its own: loading an
-    // existing keybundle is fast, but a missing one is auto-generated on
-    // the spot (`crypto::pq::ensure_bundle_at`) - real ML-DSA-87/ML-KEM-
-    // 1024/RSA-4096 keygen, seconds of pure CPU work with no yield point
-    // in it. Called directly, that would freeze `run_with_processing_
-    // screen`'s own redraw+animation loop for the whole duration - a
-    // `tokio::select!` only ever gets to poll its other branch when the
-    // executor regains control, which a synchronous stretch this long
-    // never gives it. `spawn_blocking` moves it off this task entirely so
-    // the animation keeps moving while it runs.
-    let my_key = request.my_key.clone();
-    let identity = match tokio::task::spawn_blocking(move || resolve_my_keypair(&my_key)).await {
-        Ok(result) => result?,
-        Err(e) => return Err(format!("resolving this client's keypair panicked: {e}").into()),
-    };
-    let public_key_der = identity.public_der.clone();
-    let (rd, wr, you, server_addr) = handshake_as(request, public_key_der).await?;
-    Ok((rd, wr, you, identity, server_addr))
+/// `resolve_my_keypair`, off the async executor.
+///
+/// `resolve_my_keypair` is not `.await`-friendly on its own: loading an
+/// existing keybundle is fast, but a missing one is auto-generated on the
+/// spot (`crypto::pq::ensure_bundle_at`) - real ML-DSA-87/ML-KEM-1024/
+/// RSA-4096 keygen, seconds of pure CPU work with no yield point in it.
+/// Called directly, that would freeze `run_with_processing_screen`'s own
+/// redraw+animation loop for the whole duration - a `tokio::select!` only
+/// ever gets to poll its other branch when the executor regains control,
+/// which a synchronous stretch this long never gives it. `spawn_blocking`
+/// moves it off this task entirely so the animation keeps moving while it
+/// runs. A daemon resolves once through here, *before* its first dial
+/// (`daemon::connect_until_reachable`): an unreadable keybundle is settled
+/// on the spot, and a network that is down never re-reads the files.
+pub async fn resolve_identity(my_key: &MyKeySelection) -> Result<ResolvedIdentity, BoxError> {
+    let my_key = my_key.clone();
+    match tokio::task::spawn_blocking(move || resolve_my_keypair(&my_key)).await {
+        Ok(result) => result,
+        Err(e) => Err(format!("resolving this client's keypair panicked: {e}").into()),
+    }
 }
 
 /// The handshake itself, for an identity that has already been resolved.
 ///
-/// Split out from `connect_and_handshake` for reconnects
-/// (`crate::client::reconnect`), which must come back as the *same*
-/// identity: re-resolving would re-read (or, on a first run, re-generate)
-/// the keybundle files behind this client's back. Everything a reconnect
-/// can safely redo - the TCP (and TLS) connect, the sealed control
-/// channel, auth, and identify - is here; everything it must not redo is
-/// in the caller.
+/// Kept apart from `resolve_identity` for reconnects
+/// (`crate::client::reconnect`) and a daemon's retried first connection
+/// (`daemon::connect_until_reachable`), which must come back as the
+/// *same* identity: re-resolving would re-read (or, on a first run,
+/// re-generate) the keybundle files behind this client's back.
+/// Everything a retry can safely redo - the TCP (and TLS) connect, the
+/// sealed control channel, auth, and identify - is here; everything it
+/// must not redo is in the caller.
 pub async fn handshake_as(
     request: &ConnectRequest,
     public_key_der: Vec<u8>,

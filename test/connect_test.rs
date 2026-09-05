@@ -536,11 +536,11 @@ async fn run_with_processing_screen_tolerates_a_detached_surface() {
 /// redraw+sleep branch at a genuine `.await` suspension point inside the
 /// wrapped future - it cannot preempt a long *synchronous* stretch with
 /// no such point in it (the shape `resolve_my_keypair`'s auto-keygen has,
-/// `connect_and_handshake`'s own doc). Proven by racing an independent
+/// `resolve_identity`'s own doc). Proven by racing an independent
 /// `tokio::spawn`'d ticker against two shapes of the same 200ms of
 /// synchronous work: left in-task, it starves the ticker (and would
 /// starve the animation exactly the same way); moved off-task via
-/// `spawn_blocking` - `connect_and_handshake`'s own handling of
+/// `spawn_blocking` - `resolve_identity`'s own handling of
 /// `resolve_my_keypair` - the ticker keeps advancing throughout.
 /// @requirement AC-373
 #[tokio::test]

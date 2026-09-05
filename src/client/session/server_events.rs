@@ -161,7 +161,7 @@ pub(super) async fn handle_server_message(
         | ServerMessage::AuthResult { .. }
         | ServerMessage::RegisterResult { .. }
         | ServerMessage::IdentifyResult { .. } => {
-            // only expected during the handshake in connect::connect_and_handshake
+            // only expected during the handshake in connect::handshake_as
         }
         ServerMessage::ChannelList { channels, superadmins } => {
             ui_state.superadmins = superadmins.into_iter().collect();

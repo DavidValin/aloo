@@ -30,7 +30,7 @@ fn temp_dir(label: &str) -> std::path::PathBuf {
 }
 
 /// Binds a real listener that accepts connections and then says nothing
-/// at all - `connect_and_handshake` sits genuinely `.await`-ing `Hello`
+/// at all - `handshake_as` sits genuinely `.await`-ing `Hello`
 /// past that point, which is exactly the kind of wait
 /// `run_with_processing_screen` is supposed to animate straight through.
 async fn silent_listener() -> std::net::SocketAddr {
@@ -69,7 +69,7 @@ async fn ticks_during<T>(fut: impl std::future::Future<Output = T>, budget_ms: u
 }
 
 /// The exact scenario `resolve_my_keypair`'s `spawn_blocking` fix targets
-/// (`connect_and_handshake`'s own doc): no keybundle on disk yet, so real
+/// (`resolve_identity`'s own doc): no keybundle on disk yet, so real
 /// ML-DSA-87/ML-KEM-1024/RSA-4096 keygen runs mid-connect - several
 /// seconds of pure synchronous CPU work. Proves the ticker keeps
 /// advancing while that keygen is genuinely still running, not merely

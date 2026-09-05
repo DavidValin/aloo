@@ -1,6 +1,6 @@
 [package]
 name = "aloo"
-version = "0.4.0-alpha.9"
+version = "0.4.1-alpha.1"
 edition = "2024"
 
 authors = ["David Valin <hola@davidvalin.com>"]
@@ -216,6 +216,10 @@ path = "test/daemon_ipc_test.rs"
 [[test]]
 name = "daemon_test"
 path = "test/daemon_test.rs"
+
+[[test]]
+name = "daemon_wait_test"
+path = "test/daemon_wait_test.rs"
 
 [[test]]
 name = "surface_test"

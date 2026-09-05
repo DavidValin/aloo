@@ -495,6 +495,22 @@ pub struct AlooWorld {
         Option<tokio::sync::mpsc::UnboundedReceiver<aloo::client::session::SessionInput>>,
     pub daemon_read_buf: Vec<u8>,
     pub daemon_status: Option<String>,
+    /// A real `connect_until_reachable` in flight against a server that
+    /// is not there yet (`features/daemon/waiting_for_the_server.feature`),
+    /// with the ends of the plumbing a scenario pokes: the port it dials,
+    /// the input the attach listener would feed it, the status line it
+    /// keeps, and what came of it once it ended.
+    pub daemon_wait: Option<
+        tokio::task::JoinHandle<
+            Result<Option<aloo::client::daemon::FirstConnection>, aloo::BoxError>,
+        >,
+    >,
+    pub daemon_wait_port: Option<u16>,
+    pub daemon_wait_input:
+        Option<tokio::sync::mpsc::UnboundedSender<aloo::client::session::SessionInput>>,
+    pub daemon_wait_status: Option<aloo::client::daemon::StatusLine>,
+    pub daemon_wait_frames: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>>,
+    pub daemon_wait_outcome: Option<Result<bool, String>>,
     /// The situation a join-sound scenario is describing, and what came
     /// of it.
     pub chime_daemon_mode: bool,

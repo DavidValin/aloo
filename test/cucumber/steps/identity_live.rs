@@ -181,7 +181,7 @@ fn squash(s: &str) -> String {
     s.chars().filter(|c| !c.is_whitespace() && !"│─┌┐└┘├┤┬┴┼".contains(*c)).collect()
 }
 
-fn strip_ansi(s: &str) -> String {
+pub(crate) fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
